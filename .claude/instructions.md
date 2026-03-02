@@ -154,8 +154,7 @@ These mirror the exact CI steps. A commit that fails any of these checks will br
 ## Git Workflow
 
 - Commit messages follow conventional commits: `feat(scraping): implement OC PDF link scraper (#42)`
-- During initial bringup (before CI exists): push directly to `main` is fine.
-- Once CI is established: branch from `main` (`feat/issue-{N}-short-description`), open a PR, wait for CI to pass, then request human review. Never merge your own PRs.
+- Always branch from `main` (`feat/issue-{N}-short-description`), open a PR, wait for CI to pass, then request human review. Never merge your own PRs. Never push directly to `main`.
 - **A PR is not done until it has no conflicts and CI is green.**
   - After opening a PR, check for merge conflicts: `gh pr view <N> --repo judgemind/judgemind --json mergeable,mergeStateStatus`
   - If `mergeable` is `CONFLICTING`, rebase onto main and resolve conflicts before doing anything else:
