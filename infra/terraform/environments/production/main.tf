@@ -16,6 +16,13 @@ module "document_archive" {
   object_lock_retention_years = 7
 }
 
+module "iam_scraper" {
+  source = "../../modules/iam_scraper"
+
+  environment                 = "production"
+  document_archive_bucket_arn = module.document_archive.bucket_arn
+}
+
 output "document_archive_bucket" {
   description = "Production document archive bucket name"
   value       = module.document_archive.bucket_id
@@ -24,4 +31,14 @@ output "document_archive_bucket" {
 output "document_archive_arn" {
   description = "Production document archive bucket ARN"
   value       = module.document_archive.bucket_arn
+}
+
+output "scraper_role_arn" {
+  description = "Production scraper IAM role ARN"
+  value       = module.iam_scraper.role_arn
+}
+
+output "scraper_instance_profile_arn" {
+  description = "Production scraper EC2 instance profile ARN"
+  value       = module.iam_scraper.instance_profile_arn
 }
