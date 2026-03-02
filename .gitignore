@@ -52,3 +52,6 @@ logs/
 data/
 *.html.raw
 *.pdf.raw
+
+# Agent temp files (per-worktree scratch space)
+tmp/

@@ -1,16 +1,5 @@
 {
   "permissions": {
-    "additionalDirectories": [
-      "/tmp/judgemind-worker-1",
-      "/tmp/judgemind-worker-2",
-      "/tmp/judgemind-worker-3",
-      "/tmp/judgemind-worker-4",
-      "/tmp/judgemind-worker-5",
-      "/tmp/judgemind-worker-6",
-      "/tmp/judgemind-worker-7",
-      "/tmp/judgemind-worker-8",
-      "/tmp/judgemind-worker-9"
-    ],
     "allow": [
       "Bash(git commit*)",
       "Bash(git push*)",

@@ -19,28 +19,27 @@ Do these steps in order at the start of every session. Do not wait for the user 
 
 Run:
 ```
-git -C /Users/drewthaler/judgemind/judgemind-bootstrap worktree list
+git -C ~/judgemind/judgemind-bootstrap worktree list
 ```
 Examine the output. Worker paths follow the pattern `judgemind-worker-N`. Pick the **lowest integer N ≥ 1 not already present** in the list. That is your worker number for this session.
 
 Example: if the list shows `judgemind-worker-1` and `judgemind-worker-3`, claim **worker-2**.
 
-### Step 2 — Create your worktree and tmp directory (always, no exceptions)
+### Step 2 — Create your worktree (always, no exceptions)
 
 Every agent session must work in an isolated git worktree, never directly in `judgemind-bootstrap`. Run these sequentially (split to avoid `$()` prompts):
 ```
-date +%Y%m%d
-git -C /Users/drewthaler/judgemind/judgemind-bootstrap worktree add \
-    /Users/drewthaler/judgemind/judgemind-worker-N -b worker-N/session-YYYYMMDD
-mkdir -p /tmp/judgemind-worker-N
+date +%Y%m%d-%H%M
+git -C ~/judgemind/judgemind-bootstrap worktree add \
+    ~/judgemind/judgemind-worker-N -b worker-N/session-YYYYMMDD-HHMM
+mkdir -p ~/judgemind/judgemind-worker-N/tmp
 ```
-All subsequent work happens inside `/Users/drewthaler/judgemind/judgemind-worker-N`.
-Use `/tmp/judgemind-worker-N/` for **all** temporary files (scripts, PR bodies, etc.) — never write to `/tmp/` directly, as other workers may be using the same filenames.
+All subsequent work happens inside `~/judgemind/judgemind-worker-N`.
+Use `{worktree}/tmp/` for **all** temporary files (scripts, PR bodies, etc.) — this directory is gitignored and scoped to your worker, so there are no permission prompts and no collisions between workers.
 
-When the session is done, remove the worktree and tmp dir:
+When the session is done, remove the worktree:
 ```
-git -C /Users/drewthaler/judgemind/judgemind-bootstrap worktree remove /Users/drewthaler/judgemind/judgemind-worker-N
-rm -rf /tmp/judgemind-worker-N
+git -C ~/judgemind/judgemind-bootstrap worktree remove ~/judgemind/judgemind-worker-N
 ```
 
 ### Step 3 — Pick the next task
@@ -153,8 +152,8 @@ These mirror the exact CI steps. A commit that fails any of these checks will br
   - After opening a PR, check for merge conflicts: `gh pr view <N> --repo judgemind/judgemind --json mergeable,mergeStateStatus`
   - If `mergeable` is `CONFLICTING`, rebase onto main and resolve conflicts before doing anything else:
     ```
-    git -C /Users/drewthaler/judgemind/judgemind-worker-N fetch origin main
-    git -C /Users/drewthaler/judgemind/judgemind-worker-N rebase origin/main
+    git -C ~/judgemind/judgemind-worker-N fetch origin main
+    git -C ~/judgemind/judgemind-worker-N rebase origin/main
     ```
     Resolve any conflicts, then `git rebase --continue`, then push with `--force-with-lease`.
   - After pushing, watch CI: `gh run watch <run-id> --repo judgemind/judgemind --exit-status --compact`
@@ -215,12 +214,12 @@ Before marking a Terraform PR ready, complete ALL of the following locally:
 These patterns avoid permission prompts and allow the agent to run without interruption:
 
 - **Git outside the working directory:** use `git -C /absolute/path <subcommand>` instead of `cd /path && git <subcommand>`. Compound commands with `cd` trigger a safety prompt.
-- **Multi-line content for `gh` commands:** write to a temp file and use `--body-file /tmp/judgemind-worker-N/file.txt`. Never use backticks or command substitution inside quoted strings passed to `gh`.
-- **Multi-line Python scripts:** write to `/tmp/judgemind-worker-N/script.py`, then run with `.venv/bin/python3 /tmp/judgemind-worker-N/script.py`. Embedding multi-line code in `-c "..."` breaks pattern matching and triggers a prompt.
-- **Tmp directory isolation:** always use `/tmp/judgemind-worker-N/` (your worker's subdirectory) for all temp files, never `/tmp/` directly. Multiple workers share the same `/tmp` and will collide on common filenames like `script.py` or `pr_body.txt`.
-- **Dynamic values in shell commands:** never embed `$(...)` command substitution inside a command that needs approval. Run the inner command first to get the value, then use the literal value in the next command. Example: run `date +%Y%m%d` first, then use the printed date string in the subsequent command.
+- **Multi-line content for `gh` commands:** write to a temp file and use `--body-file {worktree}/tmp/file.txt`. Never use backticks or command substitution inside quoted strings passed to `gh`.
+- **Multi-line Python scripts:** write to `{worktree}/tmp/script.py`, then run with `.venv/bin/python3 {worktree}/tmp/script.py`. Embedding multi-line code in `-c "..."` breaks pattern matching and triggers a prompt.
+- **Tmp directory isolation:** always use `{worktree}/tmp/` for all temp files — it is gitignored, scoped to your worker, and requires no special permissions. Never use `/tmp/` directly; multiple workers share it and collide on common filenames.
+- **Dynamic values in shell commands:** never embed `$(...)` command substitution inside a command that needs approval. Run the inner command first to get the value, then use the literal value in the next command. Example: run `date +%Y%m%d-%H%M` first, then use the printed date string in the subsequent command.
 - **No quoted strings in compound shell commands:** a hook rejects commands that contain quoted characters (e.g. `"text"` or `'text'`) combined with `&&` or `;`. Instead of `cmd1 && echo "label" && cmd2`, make two separate tool calls — one per command.
-- **Commit messages and multi-line strings:** use the Write tool to write content to a file, then reference it — never use `$(cat <<EOF ...)` or heredoc in a shell command. For commits: `git commit -F /tmp/judgemind-worker-N/commit_msg.txt`. For PR bodies: `gh pr create --body-file /tmp/judgemind-worker-N/pr_body.txt`.
+- **Commit messages and multi-line strings:** use the Write tool to write content to a file, then reference it — never use `$(cat <<EOF ...)` or heredoc in a shell command. For commits: `git commit -F {worktree}/tmp/commit_msg.txt`. For PR bodies: `gh pr create --body-file {worktree}/tmp/pr_body.txt`.
 
 ## Improving the Agent Workflow
 
