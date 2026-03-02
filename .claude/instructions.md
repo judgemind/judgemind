@@ -49,8 +49,18 @@ git -C $REPO_ROOT worktree add \
     $REPO_ROOT/worktrees/worker-N -b worker-N/session-YYYYMMDD-HHMM
 mkdir -p $REPO_ROOT/worktrees/worker-N/tmp
 ```
+
+**If `git worktree add` fails** (exit code non-zero, e.g. "fatal: '<path>' already exists"), another instance raced you to that number. Do not proceed. Re-run Step 1 (`worktree prune` then `worktree list`) to get a fresh snapshot, pick a new N, and retry Step 2. Repeat until `git worktree add` succeeds.
+
 All subsequent work happens inside `$REPO_ROOT/worktrees/worker-N`.
 Use `{worktree}/tmp/` for **all** temporary files (scripts, PR bodies, etc.) — this directory is gitignored and scoped to your worker, so there are no permission prompts and no collisions between workers.
+
+**Venv isolation:** each agent must create its own venv inside the worktree for every Python package it works in. Never use the venv from the main repo or another worktree — multiple agents on the same machine will stomp on each other if they share a venv. After creating the worktree, set up a venv for each package you need:
+```
+python3.12 -m venv $REPO_ROOT/worktrees/worker-N/packages/<pkg>/.venv
+cd $REPO_ROOT/worktrees/worker-N/packages/<pkg> && .venv/bin/pip install -e ".[dev]" --quiet
+```
+Only install venvs for packages you actually work in during the session.
 
 When the session is done, remove the worktree:
 ```
