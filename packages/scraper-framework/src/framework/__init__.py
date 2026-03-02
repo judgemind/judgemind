@@ -7,10 +7,10 @@ from .models import (
     CapturedDocument,
     ContentFormat,
     DocumentCapturedEvent,
+    ScheduleWindow,
     ScraperConfig,
     ScraperHealthEvent,
     ScraperPhase,
-    ScheduleWindow,
     ValidationStatus,
 )
 from .retry import retry_async, retry_sync

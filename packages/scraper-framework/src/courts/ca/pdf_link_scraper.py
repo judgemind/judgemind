@@ -21,16 +21,15 @@ from __future__ import annotations
 
 import re
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import datetime
-from typing import Callable
+from typing import Any
 from urllib.parse import urljoin
 
 import httpx
 import pdfplumber
 import structlog
 from bs4 import BeautifulSoup
-
 from framework import BaseScraper, CapturedDocument, ContentFormat, ScraperConfig
 
 logger = structlog.get_logger(__name__)
@@ -45,7 +44,7 @@ class PdfLinkConfig:
 
     # Index page
     index_url: str
-    pdf_base_url: str             # for resolving relative PDF hrefs
+    pdf_base_url: str  # for resolving relative PDF hrefs
 
     # Link parsing: regex applied to the <a> link text.
     # Must capture named groups: 'department' and 'judge_name'.
@@ -59,9 +58,7 @@ class PdfLinkConfig:
     verify_ssl: bool = True
 
     # Case number regex applied to extracted PDF text
-    case_number_re: re.Pattern = field(
-        default_factory=lambda: re.compile(r"\b\d{2}-\d{8}\b")
-    )
+    case_number_re: re.Pattern = field(default_factory=lambda: re.compile(r"\b\d{2}-\d{8}\b"))
 
 
 class PdfLinkScraper(BaseScraper):
@@ -71,7 +68,7 @@ class PdfLinkScraper(BaseScraper):
         self,
         config: ScraperConfig,
         pdf_config: PdfLinkConfig,
-        **kwargs,
+        **kwargs: Any,
     ) -> None:
         super().__init__(config, **kwargs)
         self._pdf_config = pdf_config
@@ -128,9 +125,7 @@ class PdfLinkScraper(BaseScraper):
             self._log.warning("PDF parse error", error=str(exc))
         return doc
 
-    def _fetch_one_pdf(
-        self, client: httpx.Client, href: str, link_text: str
-    ) -> CapturedDocument:
+    def _fetch_one_pdf(self, client: httpx.Client, href: str, link_text: str) -> CapturedDocument:
         pc = self._pdf_config
 
         # Parse judge name and department from link text
@@ -168,9 +163,7 @@ class PdfLinkScraper(BaseScraper):
 # ---------------------------------------------------------------------------
 
 
-def _extract_pdf_links(
-    html: str, index_url: str, pdf_base_url: str
-) -> list[tuple[str, str]]:
+def _extract_pdf_links(html: str, index_url: str, pdf_base_url: str) -> list[tuple[str, str]]:
     """Return list of (absolute_pdf_url, link_text) for all PDF links on the page."""
     soup = BeautifulSoup(html, "lxml")
     results = []

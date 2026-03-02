@@ -7,15 +7,13 @@ Fixtures captured from live site 2026-03-02:
 
 from __future__ import annotations
 
+from datetime import datetime
 from pathlib import Path
 
 import httpx
-import pytest
 import respx
-
 from courts.ca.la_tentatives import (
     CIVIL_URL,
-    SELECT_NAME,
     LATentativeRulingsScraper,
     _extract_aspnet_tokens,
     _extract_ruling_fields,
@@ -25,7 +23,6 @@ from courts.ca.la_tentatives import (
 )
 from framework import ContentFormat
 from framework.models import CapturedDocument
-from datetime import datetime
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -37,6 +34,7 @@ def _load(name: str) -> str:
 # ---------------------------------------------------------------------------
 # _extract_aspnet_tokens — against real main page
 # ---------------------------------------------------------------------------
+
 
 def test_extract_tokens_finds_viewstate() -> None:
     html = _load("la_main_page.html")
@@ -57,6 +55,7 @@ def test_extract_tokens_finds_all_three() -> None:
 # ---------------------------------------------------------------------------
 # _parse_dropdown_options — against real main page
 # ---------------------------------------------------------------------------
+
 
 def test_parse_dropdown_finds_97_options() -> None:
     html = _load("la_main_page.html")
@@ -96,6 +95,7 @@ def test_parse_dropdown_pomona_future_dates() -> None:
 # _parse_option — unit tests for value parsing
 # ---------------------------------------------------------------------------
 
+
 def test_parse_option_standard() -> None:
     opt = _parse_option("ALH,3,03/02/2026", "(Alhambra Courthouse:  Dept. 3) March 2, 2026")
     assert opt is not None
@@ -107,7 +107,10 @@ def test_parse_option_standard() -> None:
 
 def test_parse_option_with_space_in_code() -> None:
     # "BH ,205,03/02/2026" — courthouse code has trailing space
-    opt = _parse_option("BH ,205,03/02/2026", "(Beverly Hills Courthouse:  Dept. 205) March 2, 2026")
+    opt = _parse_option(
+        "BH ,205,03/02/2026",
+        "(Beverly Hills Courthouse:  Dept. 205) March 2, 2026",
+    )
     assert opt is not None
     assert opt.courthouse_code == "BH"
     assert opt.department == "205"
@@ -127,6 +130,7 @@ def test_parse_option_invalid_value_returns_none() -> None:
 # ---------------------------------------------------------------------------
 # _extract_ruling_fields — against real ruling response
 # ---------------------------------------------------------------------------
+
 
 def _make_ruling_doc() -> CapturedDocument:
     raw = _load("la_ruling_response.html").encode("utf-8")
@@ -148,6 +152,7 @@ def _make_ruling_doc() -> CapturedDocument:
 
 def test_extract_fields_case_number() -> None:
     from bs4 import BeautifulSoup
+
     doc = _make_ruling_doc()
     soup = BeautifulSoup(doc.raw_content, "lxml")
     _extract_ruling_fields(soup, doc)
@@ -156,6 +161,7 @@ def test_extract_fields_case_number() -> None:
 
 def test_extract_fields_all_case_numbers() -> None:
     from bs4 import BeautifulSoup
+
     doc = _make_ruling_doc()
     soup = BeautifulSoup(doc.raw_content, "lxml")
     _extract_ruling_fields(soup, doc)
@@ -166,6 +172,7 @@ def test_extract_fields_all_case_numbers() -> None:
 
 def test_extract_fields_judge_name() -> None:
     from bs4 import BeautifulSoup
+
     doc = _make_ruling_doc()
     soup = BeautifulSoup(doc.raw_content, "lxml")
     _extract_ruling_fields(soup, doc)
@@ -175,6 +182,7 @@ def test_extract_fields_judge_name() -> None:
 
 def test_extract_fields_ruling_text_contains_tentative() -> None:
     from bs4 import BeautifulSoup
+
     doc = _make_ruling_doc()
     soup = BeautifulSoup(doc.raw_content, "lxml")
     _extract_ruling_fields(soup, doc)
@@ -185,6 +193,7 @@ def test_extract_fields_ruling_text_contains_tentative() -> None:
 def test_extract_fields_uses_speech_synthesis_div() -> None:
     """Verify we're extracting from div#speechSynthesis, not the whole page."""
     from bs4 import BeautifulSoup
+
     doc = _make_ruling_doc()
     soup = BeautifulSoup(doc.raw_content, "lxml")
     _extract_ruling_fields(soup, doc)
@@ -195,6 +204,7 @@ def test_extract_fields_uses_speech_synthesis_div() -> None:
 # ---------------------------------------------------------------------------
 # Full scraper run — mocked HTTP using real fixture content
 # ---------------------------------------------------------------------------
+
 
 @respx.mock
 def test_full_run_with_real_fixtures() -> None:

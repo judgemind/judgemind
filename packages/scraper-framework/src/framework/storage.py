@@ -68,6 +68,6 @@ def _content_type(fmt: ContentFormat) -> str:
     return {
         ContentFormat.HTML: "text/html",
         ContentFormat.PDF: "application/pdf",
-        ContentFormat.DOCX: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        ContentFormat.DOCX: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",  # noqa: E501
         ContentFormat.TEXT: "text/plain",
     }.get(fmt, "application/octet-stream")

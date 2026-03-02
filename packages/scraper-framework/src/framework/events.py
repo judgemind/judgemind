@@ -54,12 +54,16 @@ class EventBus:
             capture_timestamp=doc.capture_timestamp,
         )
         payload = json.loads(event.model_dump_json())
-        msg_id = self._redis.xadd(STREAM_DOCUMENT_CAPTURED, {"data": json.dumps(payload, default=_serialize)})
+        msg_id = self._redis.xadd(
+            STREAM_DOCUMENT_CAPTURED, {"data": json.dumps(payload, default=_serialize)}
+        )
         logger.debug("Emitted %s → %s", STREAM_DOCUMENT_CAPTURED, msg_id)
         return msg_id
 
     def emit_health(self, event: ScraperHealthEvent) -> str:
         payload = json.loads(event.model_dump_json())
-        msg_id = self._redis.xadd(STREAM_SCRAPER_HEALTH, {"data": json.dumps(payload, default=_serialize)})
+        msg_id = self._redis.xadd(
+            STREAM_SCRAPER_HEALTH, {"data": json.dumps(payload, default=_serialize)}
+        )
         logger.debug("Emitted %s → %s", STREAM_SCRAPER_HEALTH, msg_id)
         return msg_id

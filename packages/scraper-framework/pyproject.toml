@@ -40,6 +40,7 @@ line-length = 100
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "N", "UP", "ANN"]
+ignore = ["ANN401"]  # ANN401 conflicts with **kwargs: Any, which is the correct annotation
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

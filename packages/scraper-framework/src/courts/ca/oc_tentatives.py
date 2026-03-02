@@ -28,8 +28,10 @@ Courthouse mapping (derived from dept code prefix):
 from __future__ import annotations
 
 import re
+from typing import Any
 
-from framework import ScraperConfig, ScheduleWindow
+import httpx
+from framework import CapturedDocument, ScheduleWindow, ScraperConfig
 
 from .pdf_link_scraper import PdfLinkConfig, PdfLinkScraper
 
@@ -79,7 +81,7 @@ def _oc_courthouse(dept: str) -> str:
 class OCTentativeRulingsScraper(PdfLinkScraper):
     """Orange County civil tentative rulings — PDF-link pattern."""
 
-    def __init__(self, config: ScraperConfig, **kwargs) -> None:
+    def __init__(self, config: ScraperConfig, **kwargs: Any) -> None:
         pdf_config = PdfLinkConfig(
             index_url=INDEX_URL,
             pdf_base_url=BASE_URL,
@@ -90,7 +92,7 @@ class OCTentativeRulingsScraper(PdfLinkScraper):
         )
         super().__init__(config, pdf_config=pdf_config, **kwargs)
 
-    def _fetch_one_pdf(self, client, href: str, link_text: str):
+    def _fetch_one_pdf(self, client: httpx.Client, href: str, link_text: str) -> CapturedDocument:
         """Override to reconstruct judge name as 'Firstname Lastname'."""
         doc = super()._fetch_one_pdf(client, href, link_text)
 

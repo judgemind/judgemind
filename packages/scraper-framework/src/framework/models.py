@@ -4,18 +4,17 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime, time
-from enum import Enum
+from enum import StrEnum
 from typing import Any
 
 from pydantic import BaseModel, Field
-
 
 # ---------------------------------------------------------------------------
 # Enums
 # ---------------------------------------------------------------------------
 
 
-class ScraperPhase(str, Enum):
+class ScraperPhase(StrEnum):
     """Lifecycle phase of a scraper per Architecture Spec §3.5.1."""
 
     DEVELOPMENT = "development"
@@ -24,14 +23,14 @@ class ScraperPhase(str, Enum):
     STEADY_STATE = "steady_state"
 
 
-class ValidationStatus(str, Enum):
+class ValidationStatus(StrEnum):
     PENDING = "pending"
     PASSED = "passed"
     FAILED = "failed"
     FLAGGED = "flagged"
 
 
-class ContentFormat(str, Enum):
+class ContentFormat(StrEnum):
     HTML = "html"
     PDF = "pdf"
     DOCX = "docx"
