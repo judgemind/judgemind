@@ -53,6 +53,11 @@ _CASE_NUMBER_RE = re.compile(r"Case Number:\s*(\w+)")
 # Judge name: "<div>William A. Crowfoot Judge of the Superior Court</div>"
 _JUDGE_DIV_RE = re.compile(r"(.+?)\s+Judge of the Superior Court", re.DOTALL)
 
+# Marker present in the LA Court stale-ViewState error page (HTTP 200, ~8KB).
+# When the POST uses an expired ViewState or a dropdown option that no longer
+# exists, the server returns this error page instead of ruling content.
+_LA_ERROR_MARKER = "We're sorry"
+
 
 @dataclass
 class DropdownOption:
@@ -85,6 +90,14 @@ class LATentativeRulingsScraper(BaseScraper):
                 time.sleep(self.config.request_delay_seconds)
                 try:
                     ruling_html = _post_for_ruling(client, tokens, opt)
+                    if _is_stale_viewstate_response(ruling_html):
+                        self._log.warning(
+                            "Stale ViewState error page; skipping",
+                            courthouse=opt.courthouse,
+                            dept=opt.department,
+                            context="stale_viewstate",
+                        )
+                        continue
                     doc = self._make_base_doc(
                         source_url=CIVIL_URL,
                         raw_content=ruling_html.encode("utf-8"),
@@ -214,6 +227,16 @@ def _post_for_ruling(
 # ---------------------------------------------------------------------------
 # HTML parsing
 # ---------------------------------------------------------------------------
+
+
+def _is_stale_viewstate_response(html: str) -> bool:
+    """Return True if the response is a stale-ViewState error page.
+
+    LA Court returns HTTP 200 with this error page when the posted ViewState
+    or dropdown option no longer matches the live page state. The page contains
+    no div#speechSynthesis and is ~8KB of boilerplate error HTML.
+    """
+    return _LA_ERROR_MARKER in html
 
 
 def _extract_ruling_fields(soup: BeautifulSoup, doc: CapturedDocument) -> None:
