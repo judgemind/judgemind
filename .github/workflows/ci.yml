@@ -83,6 +83,22 @@ jobs:
     defaults:
       run:
         working-directory: packages/api
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: judgemind
+          POSTGRES_PASSWORD: localdev
+          POSTGRES_DB: judgemind
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DATABASE_URL: postgresql://judgemind:localdev@localhost:5432/judgemind
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -138,3 +154,20 @@ jobs:
         run: |
           terraform init -backend=false
           terraform validate
+
+  # Always runs. Reports success only when every applicable job passed or was
+  # skipped (path filter did not match). Branch protection requires this check.
+  ci-passed:
+    needs: [scraper-tests, nlp-tests, api-tests, web-tests, infra-validate]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check all jobs passed or were skipped
+        run: |
+          results='${{ toJSON(needs) }}'
+          echo "Job results: $results"
+          if echo "$results" | grep -q '"result": "failure"'; then
+            echo "One or more jobs failed."
+            exit 1
+          fi
+          echo "All jobs passed or were skipped."
