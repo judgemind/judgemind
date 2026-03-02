@@ -6,14 +6,11 @@ import asyncio
 import logging
 import time
 from collections.abc import Callable
-from typing import TypeVar
 
 logger = logging.getLogger(__name__)
 
-T = TypeVar("T")
 
-
-def retry_sync(
+def retry_sync[T](
     fn: Callable[[], T],
     *,
     max_attempts: int = 3,
@@ -32,7 +29,13 @@ def retry_sync(
             if attempt == max_attempts:
                 break
             wait = min(delay, max_delay)
-            logger.warning("Attempt %d/%d failed (%s). Retrying in %.1fs.", attempt, max_attempts, exc, wait)
+            logger.warning(
+                "Attempt %d/%d failed (%s). Retrying in %.1fs.",
+                attempt,
+                max_attempts,
+                exc,
+                wait,
+            )
             time.sleep(wait)
             delay *= 2
     raise last_exc  # type: ignore[misc]
@@ -57,7 +60,13 @@ async def retry_async(
             if attempt == max_attempts:
                 break
             wait = min(delay, max_delay)
-            logger.warning("Attempt %d/%d failed (%s). Retrying in %.1fs.", attempt, max_attempts, exc, wait)
+            logger.warning(
+                "Attempt %d/%d failed (%s). Retrying in %.1fs.",
+                attempt,
+                max_attempts,
+                exc,
+                wait,
+            )
             await asyncio.sleep(wait)
             delay *= 2
     raise last_exc  # type: ignore[misc]

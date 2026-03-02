@@ -41,6 +41,31 @@ Judgemind is a free, open-source legal research platform replacing Trellis.law. 
 - Never commit large binary files. Use `.gitignore`.
 - Write clear docstrings/comments for non-obvious logic. Court data has many edge cases — document them.
 
+## Pre-Commit Checks (Required Before Every Commit)
+
+Run these checks locally before committing to catch CI failures early.
+
+**Python packages** (from the package directory, e.g. `packages/scraper-framework/`):
+```
+.venv/bin/ruff check src/ tests/
+.venv/bin/ruff format --check src/ tests/
+```
+If either fails, fix the errors before committing. Auto-fix most lint issues with `ruff check --fix`.
+
+**TypeScript packages** (from the package directory):
+```
+npm run lint
+npm run typecheck
+```
+
+**Terraform** (from `infra/terraform/`):
+```
+terraform fmt -check -recursive
+terraform validate
+```
+
+These mirror the exact CI steps. A commit that fails any of these checks will break CI.
+
 ## Git Workflow
 
 - Commit messages follow conventional commits: `feat(scraping): implement OC PDF link scraper (#42)`

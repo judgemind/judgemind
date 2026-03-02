@@ -12,27 +12,35 @@ from __future__ import annotations
 from pathlib import Path
 
 import httpx
-import pytest
 import respx
-
-from courts.ca.pdf_link_scraper import (
-    PdfLinkConfig,
-    PdfLinkScraper,
-    _extract_pdf_links,
-    _extract_pdf_text,
+from courts.ca.oc_tentatives import (
+    BASE_URL as OC_BASE_URL,
 )
 from courts.ca.oc_tentatives import (
     INDEX_URL as OC_INDEX_URL,
-    BASE_URL as OC_BASE_URL,
+)
+from courts.ca.oc_tentatives import (
     OCTentativeRulingsScraper,
     _oc_courthouse,
+)
+from courts.ca.oc_tentatives import (
     default_config as oc_default_config,
+)
+from courts.ca.pdf_link_scraper import (
+    _extract_pdf_links,
+    _extract_pdf_text,
+)
+from courts.ca.riverside_tentatives import (
+    BASE_URL as RIV_BASE_URL,
 )
 from courts.ca.riverside_tentatives import (
     INDEX_URL as RIV_INDEX_URL,
-    BASE_URL as RIV_BASE_URL,
+)
+from courts.ca.riverside_tentatives import (
     RiversideTentativeRulingsScraper,
     _riv_courthouse,
+)
+from courts.ca.riverside_tentatives import (
     default_config as riv_default_config,
 )
 
@@ -127,6 +135,7 @@ def test_oc_pdf_text_extraction() -> None:
 
 def test_oc_pdf_text_contains_case_numbers() -> None:
     import re
+
     pdf_bytes = _load_bytes("oc_apkarian_c25.pdf")
     text = _extract_pdf_text(pdf_bytes)
     # OC case number format: DD-DDDDDDDD
@@ -143,6 +152,7 @@ def test_riv_pdf_text_extraction() -> None:
 
 def test_riv_pdf_text_contains_case_number() -> None:
     import re
+
     pdf_bytes = _load_bytes("riv_ps1.pdf")
     text = _extract_pdf_text(pdf_bytes)
     # Riverside case format: CV + letters + digits

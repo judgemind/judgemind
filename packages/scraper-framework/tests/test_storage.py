@@ -6,7 +6,6 @@ from datetime import datetime
 from unittest.mock import MagicMock
 
 import pytest
-
 from framework.models import CapturedDocument, ContentFormat
 from framework.storage import S3Archiver, build_s3_key
 

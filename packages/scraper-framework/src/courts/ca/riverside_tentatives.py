@@ -28,8 +28,9 @@ Courthouse mapping (best-effort — Riverside has many locations):
 from __future__ import annotations
 
 import re
+from typing import Any
 
-from framework import ScraperConfig, ScheduleWindow
+from framework import ScheduleWindow, ScraperConfig
 
 from .pdf_link_scraper import PdfLinkConfig, PdfLinkScraper
 
@@ -65,7 +66,7 @@ def _riv_courthouse(dept: str) -> str | None:
 class RiversideTentativeRulingsScraper(PdfLinkScraper):
     """Riverside County civil tentative rulings — PDF-link pattern."""
 
-    def __init__(self, config: ScraperConfig, **kwargs) -> None:
+    def __init__(self, config: ScraperConfig, **kwargs: Any) -> None:
         pdf_config = PdfLinkConfig(
             index_url=INDEX_URL,
             pdf_base_url=BASE_URL,

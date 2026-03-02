@@ -7,10 +7,8 @@ and is used as a reference when building per-court scrapers.
 from __future__ import annotations
 
 import time
-from datetime import datetime
 
 import httpx
-
 from framework import BaseScraper, CapturedDocument, ContentFormat, ScraperConfig
 
 

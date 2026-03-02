@@ -26,7 +26,6 @@ from datetime import datetime
 import httpx
 import structlog
 from bs4 import BeautifulSoup
-
 from framework import BaseScraper, CapturedDocument, ContentFormat, ScraperConfig
 
 logger = structlog.get_logger(__name__)
@@ -56,10 +55,10 @@ _JUDGE_DIV_RE = re.compile(r"(.+?)\s+Judge of the Superior Court", re.DOTALL)
 
 @dataclass
 class DropdownOption:
-    value: str              # raw option value, used in POST
-    courthouse_code: str    # e.g. "ALH"
-    courthouse: str         # e.g. "Alhambra Courthouse"
-    department: str         # e.g. "3"
+    value: str  # raw option value, used in POST
+    courthouse_code: str  # e.g. "ALH"
+    courthouse: str  # e.g. "Alhambra Courthouse"
+    department: str  # e.g. "3"
     hearing_date: datetime | None
 
 
@@ -123,6 +122,7 @@ class LATentativeRulingsScraper(BaseScraper):
 # ---------------------------------------------------------------------------
 # ASP.NET helpers
 # ---------------------------------------------------------------------------
+
 
 def _extract_aspnet_tokens(html: str) -> dict[str, str]:
     """Extract __VIEWSTATE, __VIEWSTATEGENERATOR, __EVENTVALIDATION."""
@@ -214,6 +214,7 @@ def _post_for_ruling(
 # HTML parsing
 # ---------------------------------------------------------------------------
 
+
 def _extract_ruling_fields(soup: BeautifulSoup, doc: CapturedDocument) -> None:
     """Extract structured fields from the ruling response HTML.
 
@@ -250,8 +251,10 @@ def _extract_ruling_fields(soup: BeautifulSoup, doc: CapturedDocument) -> None:
 # Config factory
 # ---------------------------------------------------------------------------
 
+
 def default_config(s3_bucket: str = "") -> ScraperConfig:
     from datetime import time as dtime
+
     from framework import ScheduleWindow
 
     return ScraperConfig(
@@ -263,7 +266,7 @@ def default_config(s3_bucket: str = "") -> ScraperConfig:
         poll_interval_seconds=43200,  # twice daily
         schedule_windows=[
             ScheduleWindow(start=dtime(18, 0), end=dtime(19, 0)),  # 6 PM sweep
-            ScheduleWindow(start=dtime(2, 0), end=dtime(3, 0)),    # 2 AM catch-up
+            ScheduleWindow(start=dtime(2, 0), end=dtime(3, 0)),  # 2 AM catch-up
         ],
         request_delay_seconds=1.5,
         request_timeout_seconds=30.0,

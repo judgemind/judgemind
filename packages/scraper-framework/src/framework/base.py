@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import abc
-import logging
 import time
 from datetime import datetime
 
@@ -94,7 +93,11 @@ class BaseScraper(abc.ABC):
                     self._process_document(doc)
                     records_captured += 1
                 except Exception as exc:
-                    self._log.error("Failed to process document", source_url=doc.source_url, error=str(exc))
+                    self._log.error(
+                        "Failed to process document",
+                        source_url=doc.source_url,
+                        error=str(exc),
+                    )
 
             success = True
             self._log.info("Run complete", records=records_captured)
@@ -139,9 +142,10 @@ class BaseScraper(abc.ABC):
         if self._event_bus:
             self._event_bus.emit_document_captured(doc, producer_id=self.config.scraper_id)
 
-    def _make_base_doc(self, source_url: str, raw_content: bytes, content_format: object) -> CapturedDocument:
+    def _make_base_doc(
+        self, source_url: str, raw_content: bytes, content_format: object
+    ) -> CapturedDocument:
         """Convenience method for subclasses to create a partially-populated CapturedDocument."""
-        from .models import ContentFormat
 
         return CapturedDocument(
             scraper_id=self.config.scraper_id,
