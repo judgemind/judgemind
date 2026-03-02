@@ -71,6 +71,7 @@ These mirror the exact CI steps. A commit that fails any of these checks will br
 - Commit messages follow conventional commits: `feat(scraping): implement OC PDF link scraper (#42)`
 - During initial bringup (before CI exists): push directly to `main` is fine.
 - Once CI is established: branch from `main` (`feat/issue-{N}-short-description`), open a PR, wait for CI to pass, then request human review. Never merge your own PRs.
+- **A PR is not ready until CI is green.** After pushing, always run `gh run watch <run-id> --repo judgemind/judgemind --exit-status --compact` and confirm the run passes before reporting the PR as complete. If CI fails, fix it and push again — repeat until green.
 
 ## Creating Sub-Tasks
 
