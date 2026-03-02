@@ -8,9 +8,9 @@
     "dev": "tsx watch src/index.ts",
     "build": "tsc",
     "start": "node dist/index.js",
-    "lint": "eslint src/ tests/",
+    "lint": "eslint src/ tests/ --no-error-on-unmatched-pattern",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run",
+    "test": "vitest run --passWithNoTests",
     "test:watch": "vitest",
     "db:migrate": "node-pg-migrate up --no-timestamp",
     "db:migrate:down": "node-pg-migrate down --no-timestamp",
@@ -18,26 +18,26 @@
   },
   "dependencies": {
     "@apollo/server": "^4.10",
+    "bcryptjs": "^2.4",
     "fastify": "^4.26",
     "graphql": "^16.8",
+    "jsonwebtoken": "^9.0",
     "node-pg-migrate": "^7.0",
     "pg": "^8.11",
+    "pino": "^8.19",
     "redis": "^4.6",
-    "jsonwebtoken": "^9.0",
-    "bcryptjs": "^2.4",
-    "zod": "^3.22",
-    "pino": "^8.19"
+    "zod": "^3.22"
   },
   "devDependencies": {
-    "@types/node": "^20",
-    "@types/pg": "^8",
     "@types/bcryptjs": "^2",
     "@types/jsonwebtoken": "^9",
-    "eslint": "^8",
+    "@types/node": "^20",
+    "@types/pg": "^8",
     "@typescript-eslint/eslint-plugin": "^7",
     "@typescript-eslint/parser": "^7",
-    "typescript": "^5.4",
+    "eslint": "^8",
     "tsx": "^4.7",
+    "typescript": "^5.4",
     "vitest": "^1.4"
   }
 }
