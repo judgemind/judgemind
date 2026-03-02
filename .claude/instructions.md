@@ -11,20 +11,98 @@ Judgemind is a free, open-source legal research platform replacing Trellis.law. 
 - **Self-funded and free.** Every architecture decision must consider cost. Prefer fixed-cost over usage-based. Never assume unlimited budget.
 - **API-first.** The web app is a client of the API. Every UI feature has an API endpoint.
 
-## Before Starting Any Task
+## Starting a New Session
 
-1. Read the GitHub Issue thoroughly, including linked issues and documents.
-2. Check `docs/specs/` for relevant guidance (product spec, architecture spec, investigation reports).
-3. Look at existing code for patterns. Be consistent with what's already there.
-4. If the task is unclear or you need a decision from the maintainer, comment on the issue explaining what you need, label it `status/blocked`, and move to another task. Do not guess on ambiguous requirements.
+Do these steps in order at the start of every session. Do not wait for the user to tell you which worker number to use or which task to work on.
+
+### Step 1 — Claim your worker number
+
+Run:
+```
+git -C /Users/drewthaler/judgemind/judgemind-bootstrap worktree list
+```
+Examine the output. Worker paths follow the pattern `judgemind-worker-N`. Pick the **lowest integer N ≥ 1 not already present** in the list. That is your worker number for this session.
+
+Example: if the list shows `judgemind-worker-1` and `judgemind-worker-3`, claim **worker-2**.
+
+### Step 2 — Create your worktree and tmp directory (always, no exceptions)
+
+Every agent session must work in an isolated git worktree, never directly in `judgemind-bootstrap`. Run these sequentially (split to avoid `$()` prompts):
+```
+date +%Y%m%d
+git -C /Users/drewthaler/judgemind/judgemind-bootstrap worktree add \
+    /Users/drewthaler/judgemind/judgemind-worker-N -b worker-N/session-YYYYMMDD
+mkdir -p /tmp/judgemind-worker-N
+```
+All subsequent work happens inside `/Users/drewthaler/judgemind/judgemind-worker-N`.
+Use `/tmp/judgemind-worker-N/` for **all** temporary files (scripts, PR bodies, etc.) — never write to `/tmp/` directly, as other workers may be using the same filenames.
+
+When the session is done, remove the worktree and tmp dir:
+```
+git -C /Users/drewthaler/judgemind/judgemind-bootstrap worktree remove /Users/drewthaler/judgemind/judgemind-worker-N
+rm -rf /tmp/judgemind-worker-N
+```
+
+### Step 3 — Pick the next task
+
+List open issues ready for an agent:
+```
+gh issue list --repo judgemind/judgemind \
+    --label agent/ready --state open \
+    --json number,title,assignees,labels \
+    --limit 20
+```
+
+Pick the highest-priority unassigned issue. Priority order:
+1. `priority/critical` → `priority/high` → `priority/medium` → `priority/low`
+2. Within the same priority, prefer lower issue numbers (older issues).
+3. Skip issues already assigned to another agent unless their worktree no longer exists in the `worktree list` output.
+
+Then claim it:
+```
+gh issue edit <N> --repo judgemind/judgemind --add-assignee @me
+gh issue comment <N> --repo judgemind/judgemind --body "Picking this up in worker-N."
+```
+
+### Step 4 — Work autonomously until the PR is green
+
+- Read the issue thoroughly, including linked issues.
+- Check `docs/specs/` for relevant guidance (product spec, architecture spec, investigation reports).
+- Look at existing code for patterns. Be consistent with what's already there.
+- If the issue is large or ambiguous, break it into sub-tasks first (see **Creating Sub-Tasks**), label them `agent/ready`, then pick up the first sub-task.
+- If you need a decision from the maintainer, comment on the issue, label it `status/blocked`, and pick up a different task. Do not guess on ambiguous requirements.
+- Implement, run pre-commit checks, commit, push, and open a PR.
+- After pushing, watch CI and iterate until green (see **Git Workflow**).
+- Do not ask the user for confirmation during any of these steps.
+
+## Tool Use Rules
+
+When operating as an agent in this repo:
+
+- **Use dedicated tools for file operations** — never use Bash for `cat`, `ls`, `grep`, `find`. Use Read, Glob, and Grep instead.
+- **Use Bash only for shell-only operations** — git, gh CLI, running tests, pip install, terraform, etc.
+- **Bash commands prompt for confirmation** — this is intentional. Do not try to circumvent it. Work around prompts using the patterns in "Unattended Operation Patterns" below.
+- `sudo` and `rm` always prompt; split commands to avoid triggering prompts unnecessarily.
+
+## Accounts & Deployed Infrastructure
+
+**GitHub:** org `judgemind/judgemind`, active account `judgeminder` (scopes: gist, project, read:org, repo, workflow).
+
+**AWS:** account `155326049300`, user `admin`, region `us-west-2`. This is the Judgemind AWS account, not a personal account.
+
+**Deployed resources (dev):**
+- Terraform state: S3 bucket `judgemind-terraform-state`, DynamoDB lock table `judgemind-terraform-locks`
+- Document archive: S3 bucket `judgemind-document-archive-dev`
+- Assets: S3 bucket `judgemind-assets-dev`
 
 ## Code Standards
 
 ### Python (scrapers, NLP pipeline)
-- Python 3.12+
+- Python 3.12+, using `.venv` in each package directory
+- Run tests: `.venv/bin/pytest tests/ -v`
+- Install deps: `.venv/bin/pip install -e ".[dev]"`
 - Type hints on all function signatures
-- pytest for testing
-- ruff for linting and formatting
+- pytest for testing; ruff for linting and formatting
 - Dependencies managed via pyproject.toml
 - Async where appropriate (httpx for HTTP, playwright for browser automation)
 
@@ -71,7 +149,16 @@ These mirror the exact CI steps. A commit that fails any of these checks will br
 - Commit messages follow conventional commits: `feat(scraping): implement OC PDF link scraper (#42)`
 - During initial bringup (before CI exists): push directly to `main` is fine.
 - Once CI is established: branch from `main` (`feat/issue-{N}-short-description`), open a PR, wait for CI to pass, then request human review. Never merge your own PRs.
-- **A PR is not ready until CI is green.** After pushing, always run `gh run watch <run-id> --repo judgemind/judgemind --exit-status --compact` and confirm the run passes before reporting the PR as complete. If CI fails, fix it and push again — repeat until green.
+- **A PR is not done until it has no conflicts and CI is green.**
+  - After opening a PR, check for merge conflicts: `gh pr view <N> --repo judgemind/judgemind --json mergeable,mergeStateStatus`
+  - If `mergeable` is `CONFLICTING`, rebase onto main and resolve conflicts before doing anything else:
+    ```
+    git -C /Users/drewthaler/judgemind/judgemind-worker-N fetch origin main
+    git -C /Users/drewthaler/judgemind/judgemind-worker-N rebase origin/main
+    ```
+    Resolve any conflicts, then `git rebase --continue`, then push with `--force-with-lease`.
+  - After pushing, watch CI: `gh run watch <run-id> --repo judgemind/judgemind --exit-status --compact`
+  - If CI fails, diagnose the failure, fix it, push again, and repeat until green. Only then comment on the issue linking the PR and add the `status/review` label.
 
 ## Creating Sub-Tasks
 
@@ -93,6 +180,10 @@ Investigation tasks produce documentation, not code:
 
 ## Scraper Development Rules
 
+Key paths:
+- Framework base classes: `packages/scraper-framework/src/framework/`
+- California courts: `packages/scraper-framework/src/courts/ca/`
+
 - **Never run production scraping from your development environment.** Production scraping runs only from deployed infrastructure. However, fetching a page or PDF from a live court site to understand its structure and create real test fixtures is required and expected — never build scrapers against fake or synthetic data.
 - Every scraper must implement the base `Scraper` class from the framework.
 - Every scraper must report health metrics after each run.
@@ -113,8 +204,24 @@ Investigation tasks produce documentation, not code:
 These patterns avoid permission prompts and allow the agent to run without interruption:
 
 - **Git outside the working directory:** use `git -C /absolute/path <subcommand>` instead of `cd /path && git <subcommand>`. Compound commands with `cd` trigger a safety prompt.
-- **Multi-line content for `gh` commands:** write to a temp file and use `--body-file /tmp/file.txt`. Never use backticks or command substitution inside quoted strings passed to `gh`.
-- **Multi-line Python scripts:** write to `/tmp/script.py`, then run with `.venv/bin/python3 /tmp/script.py`. Embedding multi-line code in `-c "..."` breaks pattern matching and triggers a prompt.
+- **Multi-line content for `gh` commands:** write to a temp file and use `--body-file /tmp/judgemind-worker-N/file.txt`. Never use backticks or command substitution inside quoted strings passed to `gh`.
+- **Multi-line Python scripts:** write to `/tmp/judgemind-worker-N/script.py`, then run with `.venv/bin/python3 /tmp/judgemind-worker-N/script.py`. Embedding multi-line code in `-c "..."` breaks pattern matching and triggers a prompt.
+- **Tmp directory isolation:** always use `/tmp/judgemind-worker-N/` (your worker's subdirectory) for all temp files, never `/tmp/` directly. Multiple workers share the same `/tmp` and will collide on common filenames like `script.py` or `pr_body.txt`.
+- **Dynamic values in shell commands:** never embed `$(...)` command substitution inside a command that needs approval. Run the inner command first to get the value, then use the literal value in the next command. Example: run `date +%Y%m%d` first, then use the printed date string in the subsequent command.
+- **No quoted strings in compound shell commands:** a hook rejects commands that contain quoted characters (e.g. `"text"` or `'text'`) combined with `&&` or `;`. Instead of `cmd1 && echo "label" && cmd2`, make two separate tool calls — one per command.
+- **Commit messages and multi-line strings:** use the Write tool to write content to a file, then reference it — never use `$(cat <<EOF ...)` or heredoc in a shell command. For commits: `git commit -F /tmp/judgemind-worker-N/commit_msg.txt`. For PR bodies: `gh pr create --body-file /tmp/judgemind-worker-N/pr_body.txt`.
+
+## Improving the Agent Workflow
+
+When you encounter a permission prompt for a command that is **clearly safe and non-destructive** (read-only operations, local file writes, running tests, formatting tools, creating branches), and the prompt could be avoided with a better command pattern:
+
+1. **Work around it immediately** using the patterns above or by splitting the command.
+2. **File a GitHub issue** to track the improvement:
+   - Title: `[DX] Agent workflow: avoid prompt for <description>`
+   - Label: `type/dx` (create it if it doesn't exist)
+   - Body: describe what triggered the prompt, the workaround used, and the specific line to add to the "Unattended Operation Patterns" section of `.claude/instructions.md`.
+
+Do **not** file issues for prompts that exist for good reason — pushing to remote, opening PRs, merging, deploying, deleting branches, or any action that affects shared state. Those prompts are intentional.
 
 ## Things You Must Not Do
 
