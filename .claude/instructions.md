@@ -49,6 +49,9 @@ git -C $REPO_ROOT worktree add \
     $REPO_ROOT/worktrees/worker-N -b worker-N/session-YYYYMMDD-HHMM
 mkdir -p $REPO_ROOT/worktrees/worker-N/tmp
 ```
+
+**If `git worktree add` fails** (exit code non-zero, e.g. "fatal: '<path>' already exists"), another instance raced you to that number. Do not proceed. Re-run Step 1 (`worktree prune` then `worktree list`) to get a fresh snapshot, pick a new N, and retry Step 2. Repeat until `git worktree add` succeeds.
+
 All subsequent work happens inside `$REPO_ROOT/worktrees/worker-N`.
 Use `{worktree}/tmp/` for **all** temporary files (scripts, PR bodies, etc.) — this directory is gitignored and scoped to your worker, so there are no permission prompts and no collisions between workers.
 
