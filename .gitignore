@@ -58,3 +58,6 @@ data/
 
 # Agent temp files (per-worktree scratch space)
 tmp/
+
+# Agent worktrees (isolated git worktrees, never committed)
+worktrees/

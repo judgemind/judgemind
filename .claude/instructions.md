@@ -15,31 +15,39 @@ Judgemind is a free, open-source legal research platform replacing Trellis.law. 
 
 Do these steps in order at the start of every session. Do not wait for the user to tell you which worker number to use or which task to work on.
 
+### Step 0 — Resolve the repo root
+
+Claude Code is always invoked from the repo root. Run:
+```
+git rev-parse --show-toplevel
+```
+Note the output — this is your **REPO_ROOT** (e.g. `/home/user/myproject`). Substitute this literal value everywhere `$REPO_ROOT` appears in these instructions. Never hardcode a path; always resolve it fresh each session.
+
 ### Step 1 — Claim your worker number
 
 Run:
 ```
-git -C ~/judgemind/judgemind-bootstrap worktree list
+git -C $REPO_ROOT worktree list
 ```
-Examine the output. Worker paths follow the pattern `judgemind-worker-N`. Pick the **lowest integer N ≥ 1 not already present** in the list. That is your worker number for this session.
+Examine the output. Worker paths follow the pattern `worktrees/worker-N`. Pick the **lowest integer N ≥ 1 not already present** in the list. That is your worker number for this session.
 
-Example: if the list shows `judgemind-worker-1` and `judgemind-worker-3`, claim **worker-2**.
+Example: if the list shows `worktrees/worker-1` and `worktrees/worker-3`, claim **worker-2**.
 
 ### Step 2 — Create your worktree (always, no exceptions)
 
-Every agent session must work in an isolated git worktree, never directly in `judgemind-bootstrap`. Run these sequentially (split to avoid `$()` prompts):
+Every agent session must work in an isolated git worktree, never directly in the main repo. Run these sequentially (split to avoid `$()` prompts):
 ```
 date +%Y%m%d-%H%M
-git -C ~/judgemind/judgemind-bootstrap worktree add \
-    ~/judgemind/judgemind-worker-N -b worker-N/session-YYYYMMDD-HHMM
-mkdir -p ~/judgemind/judgemind-worker-N/tmp
+git -C $REPO_ROOT worktree add \
+    $REPO_ROOT/worktrees/worker-N -b worker-N/session-YYYYMMDD-HHMM
+mkdir -p $REPO_ROOT/worktrees/worker-N/tmp
 ```
-All subsequent work happens inside `~/judgemind/judgemind-worker-N`.
+All subsequent work happens inside `$REPO_ROOT/worktrees/worker-N`.
 Use `{worktree}/tmp/` for **all** temporary files (scripts, PR bodies, etc.) — this directory is gitignored and scoped to your worker, so there are no permission prompts and no collisions between workers.
 
 When the session is done, remove the worktree:
 ```
-git -C ~/judgemind/judgemind-bootstrap worktree remove ~/judgemind/judgemind-worker-N
+git -C $REPO_ROOT worktree remove $REPO_ROOT/worktrees/worker-N
 ```
 
 ### Step 3 — Pick the next task
@@ -152,8 +160,8 @@ These mirror the exact CI steps. A commit that fails any of these checks will br
   - After opening a PR, check for merge conflicts: `gh pr view <N> --repo judgemind/judgemind --json mergeable,mergeStateStatus`
   - If `mergeable` is `CONFLICTING`, rebase onto main and resolve conflicts before doing anything else:
     ```
-    git -C ~/judgemind/judgemind-worker-N fetch origin main
-    git -C ~/judgemind/judgemind-worker-N rebase origin/main
+    git -C $REPO_ROOT/worktrees/worker-N fetch origin main
+    git -C $REPO_ROOT/worktrees/worker-N rebase origin/main
     ```
     Resolve any conflicts, then `git rebase --continue`, then push with `--force-with-lease`.
   - After pushing, watch CI: `gh run watch <run-id> --repo judgemind/judgemind --exit-status --compact`
@@ -170,10 +178,10 @@ After CI passes, **always** update the PR test plan checkboxes before considerin
 2. Check off each automated step that passed in CI (typecheck, lint, test). Leave manual steps unchecked until you run them.
 3. For manual smoke tests (e.g. `npm run dev` + `curl /health`): the PR branch isn't on `main` yet, so create a temporary detached worktree from the branch:
    ```
-   git -C ~/judgemind/judgemind-bootstrap fetch origin <branch>
-   git -C ~/judgemind/judgemind-bootstrap worktree add ~/judgemind/judgemind-smoketest FETCH_HEAD
+   git -C $REPO_ROOT fetch origin <branch>
+   git -C $REPO_ROOT worktree add $REPO_ROOT/worktrees/smoketest FETCH_HEAD
    # run smoke test...
-   git -C ~/judgemind/judgemind-bootstrap worktree remove ~/judgemind/judgemind-smoketest
+   git -C $REPO_ROOT worktree remove $REPO_ROOT/worktrees/smoketest
    ```
 4. Write the updated body to `{worktree}/tmp/pr_body.txt` and update the PR:
    ```
