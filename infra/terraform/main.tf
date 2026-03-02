@@ -45,6 +45,7 @@ variable "environment" {
 
 module "storage" {
   source      = "./modules/storage"
+  bucket_name = "judgemind-document-archive-${var.environment}"
   environment = var.environment
 }
 
