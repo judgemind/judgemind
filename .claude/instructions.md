@@ -107,7 +107,7 @@ When operating as an agent in this repo:
 
 ### TypeScript (API, frontend)
 - Strict mode always
-- Node.js 20+ for API
+- Node.js 20+ for API; activate with `source ~/.nvm/nvm.sh && nvm install 20 --no-progress` (nvm is the version manager; `nvm install` is idempotent if already installed)
 - Next.js 14+ for frontend
 - ESLint + Prettier
 - Jest or Vitest for testing
@@ -158,6 +158,50 @@ These mirror the exact CI steps. A commit that fails any of these checks will br
     Resolve any conflicts, then `git rebase --continue`, then push with `--force-with-lease`.
   - After pushing, watch CI: `gh run watch <run-id> --repo judgemind/judgemind --exit-status --compact`
   - If CI fails, diagnose the failure, fix it, push again, and repeat until green. Only then comment on the issue linking the PR and add the `status/review` label.
+
+### Updating the PR Test Plan
+
+After CI passes, **always** update the PR test plan checkboxes before considering a task done:
+
+1. Fetch the current PR body:
+   ```
+   gh pr view <N> --repo judgemind/judgemind --json body -q .body
+   ```
+2. Check off each automated step that passed in CI (typecheck, lint, test). Leave manual steps unchecked until you run them.
+3. For manual smoke tests (e.g. `npm run dev` + `curl /health`): the PR branch isn't on `main` yet, so create a temporary detached worktree from the branch:
+   ```
+   git -C ~/judgemind/judgemind-bootstrap fetch origin <branch>
+   git -C ~/judgemind/judgemind-bootstrap worktree add ~/judgemind/judgemind-smoketest FETCH_HEAD
+   # run smoke test...
+   git -C ~/judgemind/judgemind-bootstrap worktree remove ~/judgemind/judgemind-smoketest
+   ```
+4. Write the updated body to `{worktree}/tmp/pr_body.txt` and update the PR:
+   ```
+   gh pr edit <N> --repo judgemind/judgemind --body-file {worktree}/tmp/pr_body.txt
+   ```
+
+## Task Dependencies
+
+Issues can be blocked on other issues. The system uses these conventions:
+
+- Blocked issues carry `status/blocked` and do **not** have `agent/ready`. Agents skip them.
+- A dependency is listed in the issue body as `Blocked by #N` (one line per blocker) under a `## Dependencies` heading.
+
+### When you finish a task
+
+Search for open issues that were waiting on yours:
+```
+gh issue list --repo judgemind/judgemind --state open \
+    --search "Blocked by #<your-issue>" \
+    --json number,title,body
+```
+
+For each result, re-read its body and check every `Blocked by #X` line. If **all** referenced issues are now closed:
+1. Remove the `status/blocked` label.
+2. Add the `agent/ready` label.
+3. Remove the resolved `Blocked by #N` lines from the issue body (write updated body to a temp file and use `gh issue edit <N> --body-file`).
+
+If any blocker is still open, leave the issue as blocked.
 
 ## Creating Sub-Tasks
 
