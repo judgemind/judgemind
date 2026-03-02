@@ -103,6 +103,7 @@ class CapturedDocument(BaseModel):
 
     # Parsed fields (populated by the scraper, may be partial)
     case_number: str | None = None
+    courthouse: str | None = None
     department: str | None = None
     judge_name: str | None = None
     hearing_date: datetime | None = None
@@ -145,6 +146,7 @@ class DocumentCapturedEvent(EventEnvelope):
     content_hash: str
     s3_key: str | None
     case_number: str | None
+    courthouse: str | None
     department: str | None
     judge_name: str | None
     hearing_date: datetime | None
