@@ -57,5 +57,18 @@
       "Bash(find*)",
       "Bash(echo*)"
     ]
+  },
+  "hooks": {
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash .claude/hooks/session-end.sh",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
   }
 }
