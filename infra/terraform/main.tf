@@ -8,14 +8,13 @@ terraform {
     }
   }
 
-  # Remote state — uncomment after creating the state bucket
-  # backend "s3" {
-  #   bucket         = "judgemind-terraform-state"
-  #   key            = "terraform.tfstate"
-  #   region         = "us-west-2"
-  #   dynamodb_table = "judgemind-terraform-locks"
-  #   encrypt        = true
-  # }
+  backend "s3" {
+    bucket         = "judgemind-terraform-state"
+    key            = "terraform.tfstate"
+    region         = "us-west-2"
+    dynamodb_table = "judgemind-terraform-locks"
+    encrypt        = true
+  }
 }
 
 provider "aws" {
