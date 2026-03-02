@@ -73,6 +73,36 @@ These mirror the exact CI steps. A commit that fails any of these checks will br
 - Once CI is established: branch from `main` (`feat/issue-{N}-short-description`), open a PR, wait for CI to pass, then request human review. Never merge your own PRs.
 - **A PR is not ready until CI is green.** After pushing, always run `gh run watch <run-id> --repo judgemind/judgemind --exit-status --compact` and confirm the run passes before reporting the PR as complete. If CI fails, fix it and push again — repeat until green.
 
+## Task Dependencies
+
+### Marking an issue as blocked
+
+When creating or updating an issue that cannot start until another is merged, add a `## Dependencies` section at the bottom of the body with one line per blocker:
+
+```
+## Dependencies
+Blocked by #10
+Blocked by #23
+```
+
+Also apply the `status/blocked` label and remove `agent/ready`. Agents skip any issue with `status/blocked`.
+
+### Unblocking dependent issues when you finish
+
+When your PR is merged (or when you close an issue as done), check whether any open issues were waiting on yours:
+
+```
+gh issue list --repo judgemind/judgemind --state open --search "Blocked by #N" --json number,title,body --limit 50
+```
+
+Replace `N` with your issue number. For each result:
+
+1. Collect every `Blocked by #X` line from its body.
+2. For each blocker X, check whether it is closed: `gh issue view X --repo judgemind/judgemind --json state -q .state`
+3. **Only if every blocker is now closed:** remove `status/blocked`, add `agent/ready`, and delete the resolved `Blocked by #X` lines from the body (leave any still-open blockers in place).
+
+A task blocked by multiple issues must not be unblocked until **all** of them are resolved.
+
 ## Creating Sub-Tasks
 
 If a task naturally breaks into 2+ independent pieces of work, create child issues:
