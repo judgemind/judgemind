@@ -4,19 +4,20 @@ Work through this list in order. Each item should take 5-30 minutes.
 
 ## 1. Accounts & Services
 
-- [ ] **Register domain** — judgemind.org (or your preference). Use Cloudflare for DNS.
-- [ ] **Create AWS account** — New account, not your personal one.
-  - [ ] Enable MFA on root
-  - [ ] Create IAM admin user (not root) for daily use
-  - [ ] Set billing alerts: $50, $150, $500
-  - [ ] Note your preferred region (us-west-2 is the Terraform default)
-- [ ] **Create GitHub organization** — `judgemind` (or your preference)
-- [ ] **Install GitHub CLI** — `brew install gh` then `gh auth login`
-- [ ] **Install Claude Code** — Your primary development tool
+- [x] **Register domain** — judgemind.org (or your preference). Use Cloudflare for DNS.
+- [x] **Create AWS account** — New account, not your personal one.
+  - [x] Enable MFA on root
+  - [x] Create IAM admin user (not root) for daily use
+  - [x] Set billing alerts: $50, $150, $500
+  - [x] Note your preferred region (us-west-2 is the Terraform default)
+- [x] **Create GitHub organization** — `judgemind` (or your preference)
+- [x] **Install GitHub CLI** — `brew install gh` then `gh auth login`
+- [x] **Install Claude Code** — Your primary development tool
 
 ## 2. Repository Setup
 
-- [ ] **Create repo** from this bootstrap:
+- [x] **Create repo** from this bootstrap:
+
   ```bash
   # From the bootstrap directory
   cd judgemind-bootstrap
@@ -28,7 +29,8 @@ Work through this list in order. Each item should take 5-30 minutes.
   gh repo create judgemind/judgemind --public --source=. --push
   ```
 
-- [ ] **Set up branch protection** on `main`:
+- [x] **Set up branch protection** on `main`:
+
   ```bash
   gh api repos/judgemind/judgemind/branches/main/protection \
     -X PUT \
@@ -38,9 +40,10 @@ Work through this list in order. Each item should take 5-30 minutes.
     -f "restrictions=null"
   ```
 
-- [ ] **Update CODEOWNERS** — Replace `YOUR_GITHUB_USERNAME` in `.github/CODEOWNERS`
+- [x] **Update CODEOWNERS** — Replace `YOUR_GITHUB_USERNAME` in `.github/CODEOWNERS`
 
 - [ ] **Create labels**:
+
   ```bash
   # Run the label creation commands from scripts/seed-issues.md
   ```
@@ -54,6 +57,7 @@ Work through this list in order. Each item should take 5-30 minutes.
 ## 3. AWS Bootstrap
 
 - [ ] **Create Terraform state bucket** (this one is manual — Terraform can't manage its own state bucket):
+
   ```bash
   aws s3api create-bucket \
     --bucket judgemind-terraform-state \
@@ -75,6 +79,7 @@ Work through this list in order. Each item should take 5-30 minutes.
 - [ ] **Uncomment backend config** in `infra/terraform/main.tf`
 
 - [ ] **Store AWS credentials in GitHub Secrets**:
+
   ```bash
   gh secret set AWS_ACCESS_KEY_ID
   gh secret set AWS_SECRET_ACCESS_KEY
