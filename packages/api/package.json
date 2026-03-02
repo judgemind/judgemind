@@ -11,12 +11,16 @@
     "lint": "eslint src/ tests/",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "db:migrate": "node-pg-migrate up --no-timestamp",
+    "db:migrate:down": "node-pg-migrate down --no-timestamp",
+    "db:migrate:create": "node-pg-migrate create --migration-file-language sql --no-timestamp"
   },
   "dependencies": {
     "@apollo/server": "^4.10",
     "fastify": "^4.26",
     "graphql": "^16.8",
+    "node-pg-migrate": "^7.0",
     "pg": "^8.11",
     "redis": "^4.6",
     "jsonwebtoken": "^9.0",
