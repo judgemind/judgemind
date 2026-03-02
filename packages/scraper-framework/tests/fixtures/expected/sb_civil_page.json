@@ -1,0 +1,13 @@
+{
+  "_fixture": "sb_civil_page.html",
+  "_description": "SB civil tentative rulings page — returns 'Access denied' to automated requests.",
+  "_captured": "2026-03-02",
+  "_status": "ACCESS_DENIED",
+  "page_title": "Access denied | Superior Court of California | County of San Bernardino",
+  "pdf_link_count": 0,
+  "useful_pdf_links": 0,
+  "iframes": 1,
+  "has_google_tag_manager": true,
+  "_edge_case": "access_denied",
+  "_notes": "CRITICAL: The SB civil tentative rulings URL (https://sanbernardino.courts.ca.gov/online-services/civil-tentative-rulings) returns 'Access denied' to automated HTTP requests. This is a Drupal/Pantheon site that appears to block non-browser requests. Possible causes: (1) missing cookies/session, (2) JavaScript required to load content, (3) Cloudflare/bot protection, (4) IP rate limiting. The phone roster PDF is the only PDF link visible to the scraper. REQUIRES INVESTIGATION: Use Playwright (browser automation) to load the page and extract links, or investigate whether a different URL structure provides direct access."
+}

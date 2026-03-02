@@ -1,0 +1,22 @@
+{
+  "_fixture": "la_ruling_com_a.html",
+  "_description": "POST response for COM,A (Compton Courthouse, Dept A). Single case with submission instructions.",
+  "_captured": "2026-03-02",
+  "_courthouse_code": "COM",
+  "_option_value": "COM,A,03/02/2026",
+  "has_speech_synthesis_div": true,
+  "case_count": 1,
+  "primary_case_number": "23CMCV01566",
+  "all_case_numbers": [
+    "23CMCV01566"
+  ],
+  "judge_name": null,
+  "hearing_date": "2026-03-02",
+  "courthouse": "Compton Courthouse",
+  "department": "A",
+  "ruling_text_contains": [
+    "DEPARTMENT A LAW AND MOTION RULINGS",
+    "submit on the tentative"
+  ],
+  "_notes": "Compton courthouse. Department A (letter-only). Includes submission instructions."
+}

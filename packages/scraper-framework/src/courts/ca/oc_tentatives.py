@@ -31,6 +31,7 @@ import re
 from typing import Any
 
 import httpx
+
 from framework import CapturedDocument, ScheduleWindow, ScraperConfig
 
 from .pdf_link_scraper import PdfLinkConfig, PdfLinkScraper

@@ -1,0 +1,22 @@
+{
+  "_fixture": "la_ruling_cha_f46.html",
+  "_description": "POST response for CHA,F46 (Chatsworth Courthouse, Dept F46). Two rulings for same case number (same case, two motions).",
+  "_captured": "2026-03-02",
+  "_courthouse_code": "CHA",
+  "_option_value": "CHA,F46,03/02/2026",
+  "has_speech_synthesis_div": true,
+  "case_count": 2,
+  "primary_case_number": "21CHCV00539",
+  "all_case_numbers": [
+    "21CHCV00539"
+  ],
+  "judge_name": null,
+  "hearing_date": "2026-03-02",
+  "courthouse": "Chatsworth Courthouse",
+  "department": "F46",
+  "ruling_text_contains": [
+    "DEPARTMENT F46 LAW AND MOTION RULINGS",
+    "818-576-8430"
+  ],
+  "_notes": "Department F46 — alphanumeric code (letter+number). Same case number appears twice: two different motions for same case. Case count=2 raw, unique_case_count=1."
+}

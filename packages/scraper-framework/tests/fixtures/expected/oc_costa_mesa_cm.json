@@ -1,0 +1,19 @@
+{
+  "_fixture": "oc_costa_mesa_cm.pdf",
+  "_description": "OC Costa Mesa Justice Center — Dept CM02 (Judge Andre De La Cruz). 33-page PDF, 0 case numbers matched.",
+  "_link_text": "DE LA CRUZ, Andre - Dept CM02",
+  "_captured": "2026-03-02",
+  "courthouse": "Costa Mesa Justice Center",
+  "department": "CM02",
+  "judge_name": "Andre De La Cruz",
+  "page_count": 33,
+  "case_count": 0,
+  "hearing_date": "February 19, 2026",
+  "ruling_text_contains": [
+    "TENTATIVE RULINGS",
+    "DEPT CM2",
+    "Judge Andre De La Cruz"
+  ],
+  "_edge_case": "no_standard_case_numbers",
+  "_notes": "Costa Mesa format uses 'DEPT CM2' (not CM02) in text. DD-DDDDDDDD regex finds 0 case numbers. Stale date (Feb 19 — fixture captured March 2). Known gap: CM case number format."
+}

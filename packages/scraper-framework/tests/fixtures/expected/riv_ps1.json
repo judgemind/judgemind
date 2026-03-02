@@ -1,0 +1,19 @@
+{
+  "_fixture": "riv_ps1.pdf",
+  "_description": "Riverside Palm Springs Courthouse — Dept PS1 (Judge Arthur Hester III). 4-page PDF with 4 current rulings.",
+  "_link_text": "Department PS1 - Honorable Arthur Hester III",
+  "_captured": "2026-03-02",
+  "courthouse": "Palm Springs Courthouse",
+  "department": "PS1",
+  "judge_name": "Arthur Hester III",
+  "page_count": 4,
+  "case_count": 4,
+  "primary_case_number": "CVPS2306157",
+  "case_number_format": "CV{LOCATION}{YY}{NNNNNN}",
+  "hearing_date": "March 2, 2026",
+  "ruling_text_contains": [
+    "Tentative Rulings for March 2, 2026",
+    "Department PS1"
+  ],
+  "_notes": "Standard Riverside format. Case numbers: CV + 2-letter location code (PS=Palm Springs) + 2-digit year + 6-digit seq. Judge suffix (III) included. Oral argument instructions present."
+}

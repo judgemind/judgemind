@@ -12,6 +12,7 @@ from pathlib import Path
 
 import httpx
 import respx
+
 from courts.ca.la_tentatives import (
     CIVIL_URL,
     LATentativeRulingsScraper,
