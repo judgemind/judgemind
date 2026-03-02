@@ -75,13 +75,34 @@ gh issue comment <N> --repo judgemind/judgemind --body "Picking this up in worke
 - After pushing, watch CI and iterate until green (see **Git Workflow**).
 - Do not ask the user for confirmation during any of these steps.
 
+## Tool Use Rules
+
+When operating as an agent in this repo:
+
+- **Use dedicated tools for file operations** — never use Bash for `cat`, `ls`, `grep`, `find`. Use Read, Glob, and Grep instead.
+- **Use Bash only for shell-only operations** — git, gh CLI, running tests, pip install, terraform, etc.
+- **Bash commands prompt for confirmation** — this is intentional. Do not try to circumvent it. Work around prompts using the patterns in "Unattended Operation Patterns" below.
+- `sudo` and `rm` always prompt; split commands to avoid triggering prompts unnecessarily.
+
+## Accounts & Deployed Infrastructure
+
+**GitHub:** org `judgemind/judgemind`, active account `judgeminder` (scopes: gist, project, read:org, repo, workflow).
+
+**AWS:** account `155326049300`, user `admin`, region `us-west-2`. This is the Judgemind AWS account, not a personal account.
+
+**Deployed resources (dev):**
+- Terraform state: S3 bucket `judgemind-terraform-state`, DynamoDB lock table `judgemind-terraform-locks`
+- Document archive: S3 bucket `judgemind-document-archive-dev`
+- Assets: S3 bucket `judgemind-assets-dev`
+
 ## Code Standards
 
 ### Python (scrapers, NLP pipeline)
-- Python 3.12+
+- Python 3.12+, using `.venv` in each package directory
+- Run tests: `.venv/bin/pytest tests/ -v`
+- Install deps: `.venv/bin/pip install -e ".[dev]"`
 - Type hints on all function signatures
-- pytest for testing
-- ruff for linting and formatting
+- pytest for testing; ruff for linting and formatting
 - Dependencies managed via pyproject.toml
 - Async where appropriate (httpx for HTTP, playwright for browser automation)
 
@@ -128,11 +149,16 @@ These mirror the exact CI steps. A commit that fails any of these checks will br
 - Commit messages follow conventional commits: `feat(scraping): implement OC PDF link scraper (#42)`
 - During initial bringup (before CI exists): push directly to `main` is fine.
 - Once CI is established: branch from `main` (`feat/issue-{N}-short-description`), open a PR, wait for CI to pass, then request human review. Never merge your own PRs.
-- **A PR is not done until CI is green.** After pushing, watch the run:
-  ```
-  gh run watch <run-id> --repo judgemind/judgemind --exit-status --compact
-  ```
-  If CI fails, diagnose the failure, fix it, push again, and repeat until green. Only then comment on the issue linking the PR and add the `status/review` label.
+- **A PR is not done until it has no conflicts and CI is green.**
+  - After opening a PR, check for merge conflicts: `gh pr view <N> --repo judgemind/judgemind --json mergeable,mergeStateStatus`
+  - If `mergeable` is `CONFLICTING`, rebase onto main and resolve conflicts before doing anything else:
+    ```
+    git -C /Users/drewthaler/judgemind/judgemind-worker-N fetch origin main
+    git -C /Users/drewthaler/judgemind/judgemind-worker-N rebase origin/main
+    ```
+    Resolve any conflicts, then `git rebase --continue`, then push with `--force-with-lease`.
+  - After pushing, watch CI: `gh run watch <run-id> --repo judgemind/judgemind --exit-status --compact`
+  - If CI fails, diagnose the failure, fix it, push again, and repeat until green. Only then comment on the issue linking the PR and add the `status/review` label.
 
 ## Creating Sub-Tasks
 
@@ -153,6 +179,10 @@ Investigation tasks produce documentation, not code:
 - Be specific about what you found and what you couldn't determine.
 
 ## Scraper Development Rules
+
+Key paths:
+- Framework base classes: `packages/scraper-framework/src/framework/`
+- California courts: `packages/scraper-framework/src/courts/ca/`
 
 - **Never run production scraping from your development environment.** Production scraping runs only from deployed infrastructure. However, fetching a page or PDF from a live court site to understand its structure and create real test fixtures is required and expected — never build scrapers against fake or synthetic data.
 - Every scraper must implement the base `Scraper` class from the framework.
@@ -178,6 +208,8 @@ These patterns avoid permission prompts and allow the agent to run without inter
 - **Multi-line Python scripts:** write to `/tmp/judgemind-worker-N/script.py`, then run with `.venv/bin/python3 /tmp/judgemind-worker-N/script.py`. Embedding multi-line code in `-c "..."` breaks pattern matching and triggers a prompt.
 - **Tmp directory isolation:** always use `/tmp/judgemind-worker-N/` (your worker's subdirectory) for all temp files, never `/tmp/` directly. Multiple workers share the same `/tmp` and will collide on common filenames like `script.py` or `pr_body.txt`.
 - **Dynamic values in shell commands:** never embed `$(...)` command substitution inside a command that needs approval. Run the inner command first to get the value, then use the literal value in the next command. Example: run `date +%Y%m%d` first, then use the printed date string in the subsequent command.
+- **No quoted strings in compound shell commands:** a hook rejects commands that contain quoted characters (e.g. `"text"` or `'text'`) combined with `&&` or `;`. Instead of `cmd1 && echo "label" && cmd2`, make two separate tool calls — one per command.
+- **Commit messages and multi-line strings:** use the Write tool to write content to a file, then reference it — never use `$(cat <<EOF ...)` or heredoc in a shell command. For commits: `git commit -F /tmp/judgemind-worker-N/commit_msg.txt`. For PR bodies: `gh pr create --body-file /tmp/judgemind-worker-N/pr_body.txt`.
 
 ## Improving the Agent Workflow
 
