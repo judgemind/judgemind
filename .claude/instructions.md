@@ -17,15 +17,22 @@ Do these steps in order at the start of every session. Do not wait for the user 
 
 ### Step 0 — Resolve the repo root
 
-Claude Code is always invoked from the repo root. Run:
+The shell may be invoked from inside a previous session's worktree. Always resolve the **main** repo root (not a worktree root) by stripping the worktree suffix from the git common dir:
 ```
-git rev-parse --show-toplevel
+git rev-parse --absolute-git-dir
 ```
-Note the output — this is your **REPO_ROOT** (e.g. `/home/user/myproject`). Substitute this literal value everywhere `$REPO_ROOT` appears in these instructions. Never hardcode a path; always resolve it fresh each session.
+If the output ends with `/.git` (e.g. `/home/user/myproject/.git`), strip `/.git` — that is **REPO_ROOT**.
+If the output contains `/worktrees/` (e.g. `/home/user/myproject/.git/worktrees/worker-2`), strip from `/.git` onward — the prefix is **REPO_ROOT**.
+
+Substitute this literal value everywhere `$REPO_ROOT` appears in these instructions. Never hardcode a path; always resolve it fresh each session.
 
 ### Step 1 — Claim your worker number
 
-Run:
+First prune stale worktree references (idempotent, safe to always run):
+```
+git -C $REPO_ROOT worktree prune
+```
+Then list active worktrees:
 ```
 git -C $REPO_ROOT worktree list
 ```
