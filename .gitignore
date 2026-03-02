@@ -48,6 +48,9 @@ docker-compose.override.yml
 *.log
 logs/
 
+# Agent worker temp files
+tmp/
+
 # Scraped data (never commit raw court data)
 data/
 *.html.raw
