@@ -18,6 +18,7 @@ from courts.ca.la_tentatives import (
     LATentativeRulingsScraper,
     _extract_aspnet_tokens,
     _extract_ruling_fields,
+    _is_stale_viewstate_response,
     _parse_dropdown_options,
     _parse_option,
     default_config,
@@ -273,3 +274,82 @@ def test_default_config() -> None:
     assert config.county == "Los Angeles"
     assert config.s3_bucket == "judgemind-document-archive-dev"
     assert len(config.schedule_windows) == 2
+
+
+# ---------------------------------------------------------------------------
+# Stale ViewState detection — regression tests against real error fixtures
+# ---------------------------------------------------------------------------
+
+
+def test_is_stale_viewstate_response_detects_error_page() -> None:
+    """la_ruling_smc49.html is a real stale-ViewState error page and must be detected."""
+    html = _load("la_ruling_smc49.html")
+    assert _is_stale_viewstate_response(html)
+
+
+def test_is_stale_viewstate_response_all_error_fixtures() -> None:
+    """All six known stale-ViewState fixtures are detected as error pages."""
+    error_fixtures = [
+        "la_ruling_smc49.html",
+        "la_ruling_smc56.html",
+        "la_ruling_smc1.html",
+        "la_ruling_van_a.html",
+        "la_ruling_tor_b.html",
+        "la_ruling_ea_h.html",
+    ]
+    for name in error_fixtures:
+        assert _is_stale_viewstate_response(_load(name)), f"{name} should be detected as error"
+
+
+def test_is_stale_viewstate_response_does_not_match_real_ruling() -> None:
+    """Normal ruling HTML is not mistaken for a stale-ViewState error page."""
+    html = _load("la_ruling_response.html")
+    assert not _is_stale_viewstate_response(html)
+
+
+@respx.mock
+def test_full_run_stale_viewstate_not_counted() -> None:
+    """Full run: when every POST returns a stale-ViewState error, records_captured == 0."""
+    main_html = _load("la_main_page.html")
+    stale_html = _load("la_ruling_smc49.html")
+
+    respx.get(CIVIL_URL).mock(return_value=httpx.Response(200, text=main_html))
+    respx.post(CIVIL_URL).mock(return_value=httpx.Response(200, text=stale_html))
+
+    config = default_config()
+    config.request_delay_seconds = 0
+    scraper = LATentativeRulingsScraper(config=config)
+    health = scraper.run()
+
+    assert health.success is True
+    assert health.records_captured == 0
+
+
+@respx.mock
+def test_full_run_stale_viewstate_mixed_with_real() -> None:
+    """Full run: stale-ViewState responses are skipped; valid rulings still count."""
+    main_html = _load("la_main_page.html")
+    stale_html = _load("la_ruling_smc49.html")
+    ruling_html = _load("la_ruling_response.html")
+
+    respx.get(CIVIL_URL).mock(return_value=httpx.Response(200, text=main_html))
+
+    call_count = 0
+
+    def post_side_effect(request: httpx.Request) -> httpx.Response:
+        nonlocal call_count
+        call_count += 1
+        # First two calls return the error page; rest return a valid ruling
+        if call_count <= 2:
+            return httpx.Response(200, text=stale_html)
+        return httpx.Response(200, text=ruling_html)
+
+    respx.post(CIVIL_URL).mock(side_effect=post_side_effect)
+
+    config = default_config()
+    config.request_delay_seconds = 0
+    scraper = LATentativeRulingsScraper(config=config)
+    health = scraper.run()
+
+    assert health.success is True
+    assert health.records_captured == 95  # 97 options - 2 stale-ViewState skips
