@@ -1,19 +1,19 @@
 """LA County Superior Court — Civil Tentative Rulings Scraper (Pattern 1).
 
-Implements the dropdown-enumeration strategy documented in the LA Court
-Scraping Investigation. Fetches every published civil tentative ruling
-by enumerating all (courthouse, department, date) combinations from the
-ASP.NET dropdown, then POSTing for each one.
+Strategy: enumerate all (courthouse, department, date) combinations from the
+ASP.NET dropdown, POST for each, archive the raw HTML per-department response.
 
-URL: https://www.lacourt.ca.gov/tentativeRulingNet/ui/main.aspx?casetype=civil
-
-Key implementation notes (from investigation):
-- Server-rendered ASP.NET WebForms — simple HTTP only, no Playwright needed
-- ViewState + EventValidation tokens required for each POST
-- ~100 dropdown entries on a typical day
-- No CAPTCHA on civil tentatives
-- Each department formats rulings differently — parser is best-effort
-- Recommended schedule: primary at 6 PM, catch-up at 2 AM
+Verified against live site 2026-03-02:
+- URL: https://www.lacourt.ca.gov/tentativeRulingNet/ui/main.aspx?casetype=civil
+- Select name: ctl00$ctl00$siteMasterHolder$basicBodyHolder$List2DeptDate
+- Select id:   siteMasterHolder_basicBodyHolder_List2DeptDate
+- Option value format: "ALH,3,03/02/2026"  (courthouse_code,dept,MM/DD/YYYY)
+- Option text format:  "(Alhambra Courthouse:  Dept. 3) March 2, 2026"
+- Ruling content:      div#speechSynthesis
+- Multiple cases may appear in a single department response
+- Judge name in: <div>...Name Judge of the Superior Court</div>
+- No CAPTCHA on civil tentatives; simple HTTP sufficient (no Playwright needed)
+- Recommended schedule: 6 PM primary, 2 AM catch-up
 """
 
 from __future__ import annotations
@@ -31,73 +31,56 @@ from framework import BaseScraper, CapturedDocument, ContentFormat, ScraperConfi
 
 logger = structlog.get_logger(__name__)
 
-BASE_URL = "https://www.lacourt.ca.gov/tentativeRulingNet/ui/main.aspx"
-CIVIL_URL = f"{BASE_URL}?casetype=civil"
+CIVIL_URL = "https://www.lacourt.ca.gov/tentativeRulingNet/ui/main.aspx?casetype=civil"
 
-# Dropdown option format: "(Courthouse Name: Dept. XX) Month Day, Year"
-# e.g. "(Stanley Mosk: Dept. 52) March 3, 2026"
-_DROPDOWN_RE = re.compile(
-    r"\((?P<courthouse>[^:]+):\s*Dept\.?\s*(?P<department>[^)]+)\)\s*(?P<date>.+)"
+# Verified field names from live site
+SELECT_NAME = "ctl00$ctl00$siteMasterHolder$basicBodyHolder$List2DeptDate"
+SELECT_ID = "siteMasterHolder_basicBodyHolder_List2DeptDate"
+
+# Option value: "ALH,3,03/02/2026" — courthouse_code, dept, MM/DD/YYYY
+_OPTION_VALUE_RE = re.compile(
+    r"^(?P<courthouse_code>[^,]+),(?P<department>[^,]+),(?P<date>\d{2}/\d{2}/\d{4})$"
 )
 
-# LA County case number formats:
-# New: 25STCV13276  (YYLLCC#####)
-# Old: BC123456  (district+type+number)
-_CASE_NUMBER_RE = re.compile(
-    r"\b(?:\d{2}[A-Z]{2,4}\d{4,6}|[A-Z]{2}\d{5,7})\b"
+# Option text: "(Alhambra Courthouse:  Dept. 3) March 2, 2026"
+_OPTION_TEXT_RE = re.compile(
+    r"\((?P<courthouse>[^:]+):\s+Dept\.\s+(?P<dept>[^)]+)\)\s+(?P<date>.+)"
 )
 
-# Common judge name patterns in ruling text
-_JUDGE_RE = re.compile(
-    r"(?:Judge|Hon\.?|Honorable)\s+([A-Z][a-z]+(?:\s+[A-Z]\.?)?\s+[A-Z][a-z]+)",
-    re.IGNORECASE,
-)
+# Case numbers in ruling text: "Case Number:24NNCV02551" (no space)
+_CASE_NUMBER_RE = re.compile(r"Case Number:\s*(\w+)")
+
+# Judge name: "<div>William A. Crowfoot Judge of the Superior Court</div>"
+_JUDGE_DIV_RE = re.compile(r"(.+?)\s+Judge of the Superior Court", re.DOTALL)
 
 
 @dataclass
 class DropdownOption:
-    value: str          # the <option> value attribute (used in POST)
-    courthouse: str
-    department: str
+    value: str              # raw option value, used in POST
+    courthouse_code: str    # e.g. "ALH"
+    courthouse: str         # e.g. "Alhambra Courthouse"
+    department: str         # e.g. "3"
     hearing_date: datetime | None
-    raw_text: str
 
 
 class LATentativeRulingsScraper(BaseScraper):
-    """Scrapes all published LA County civil tentative rulings via dropdown enumeration.
-
-    Usage:
-        config = ScraperConfig(
-            scraper_id="ca-la-tentatives-civil",
-            state="CA",
-            county="Los Angeles",
-            court="Superior Court",
-            target_urls=[CIVIL_URL],
-            s3_bucket="judgemind-document-archive-dev",
-        )
-        scraper = LATentativeRulingsScraper(config=config, archiver=..., event_bus=...)
-        health = scraper.run()
-    """
+    """Scrapes all published LA County civil tentative rulings via dropdown enumeration."""
 
     def fetch_documents(self) -> list[CapturedDocument]:
-        """Enumerate dropdown, POST for each option, return raw HTML docs."""
         docs = []
         with httpx.Client(
             timeout=self.config.request_timeout_seconds,
             follow_redirects=True,
             headers={"User-Agent": "Judgemind/1.0 (+https://judgemind.org/scraper)"},
         ) as client:
-            # Step 1: GET the page to obtain tokens and dropdown options
-            self._log.info("Fetching main tentative rulings page", url=CIVIL_URL)
+            self._log.info("Fetching main page", url=CIVIL_URL)
             response = client.get(CIVIL_URL)
             response.raise_for_status()
-            main_html = response.text
 
-            tokens = _extract_aspnet_tokens(main_html)
-            options = _parse_dropdown_options(main_html)
+            tokens = _extract_aspnet_tokens(response.text)
+            options = _parse_dropdown_options(response.text)
             self._log.info("Found dropdown options", count=len(options))
 
-            # Step 2: POST for each dropdown option
             for opt in options:
                 time.sleep(self.config.request_delay_seconds)
                 try:
@@ -110,113 +93,101 @@ class LATentativeRulingsScraper(BaseScraper):
                     doc.courthouse = opt.courthouse
                     doc.department = opt.department
                     doc.hearing_date = opt.hearing_date
+                    doc.extra["courthouse_code"] = opt.courthouse_code
                     doc.extra["dropdown_value"] = opt.value
-                    doc.extra["dropdown_raw"] = opt.raw_text
                     docs.append(doc)
                     self._log.debug(
                         "Fetched ruling",
                         courthouse=opt.courthouse,
                         dept=opt.department,
-                        date=opt.hearing_date,
+                        date=str(opt.hearing_date),
                     )
                 except Exception as exc:
                     self._log.error(
-                        "Failed to fetch ruling for option",
+                        "Failed to fetch ruling",
                         courthouse=opt.courthouse,
                         dept=opt.department,
                         error=str(exc),
                     )
-
         return docs
 
     def parse_document(self, doc: CapturedDocument) -> CapturedDocument:
-        """Extract structured fields from the ruling HTML response."""
         try:
             soup = BeautifulSoup(doc.raw_content, "lxml")
             _extract_ruling_fields(soup, doc)
         except Exception as exc:
-            self._log.warning("Parse error — returning partial doc", error=str(exc))
+            self._log.warning("Parse error", error=str(exc))
         return doc
 
 
 # ---------------------------------------------------------------------------
-# ASP.NET WebForms helpers
+# ASP.NET helpers
 # ---------------------------------------------------------------------------
 
-
 def _extract_aspnet_tokens(html: str) -> dict[str, str]:
-    """Extract __VIEWSTATE, __VIEWSTATEGENERATOR, __EVENTVALIDATION from HTML."""
+    """Extract __VIEWSTATE, __VIEWSTATEGENERATOR, __EVENTVALIDATION."""
     soup = BeautifulSoup(html, "lxml")
     tokens: dict[str, str] = {}
     for field in ("__VIEWSTATE", "__VIEWSTATEGENERATOR", "__EVENTVALIDATION"):
         el = soup.find("input", {"name": field})
         if el:
             tokens[field] = el.get("value", "")
-    if not tokens.get("__VIEWSTATE"):
-        logger.warning("No __VIEWSTATE found — POST will likely fail")
     return tokens
 
 
 def _parse_dropdown_options(html: str) -> list[DropdownOption]:
-    """Parse all (courthouse, department, date) options from the dropdown."""
+    """Parse all dropdown options. Returns one DropdownOption per (courthouse, dept, date)."""
     soup = BeautifulSoup(html, "lxml")
-
-    # The dropdown is a <select> — find by common name patterns
-    select = (
-        soup.find("select", {"name": re.compile(r"ddlHearingDate", re.I)})
-        or soup.find("select", {"id": re.compile(r"ddlHearingDate", re.I)})
-        or soup.find("select")  # fallback: first select
-    )
+    select = soup.find("select", {"id": SELECT_ID}) or soup.find("select", {"name": SELECT_NAME})
     if not select:
-        logger.warning("Dropdown not found in page HTML")
+        logger.warning("Dropdown select not found")
         return []
 
     options = []
     for opt_el in select.find_all("option"):
         value = opt_el.get("value", "").strip()
         text = opt_el.get_text(strip=True)
-        if not value or value == "0":  # skip the placeholder option
+        if not value:
             continue
-        options.append(_parse_option_text(value, text))
+        opt = _parse_option(value, text)
+        if opt:
+            options.append(opt)
+    return options
 
-    return [o for o in options if o is not None]
 
+def _parse_option(value: str, text: str) -> DropdownOption | None:
+    """Parse a single dropdown option from its value and display text.
 
-def _parse_option_text(value: str, text: str) -> DropdownOption | None:
-    """Parse a dropdown option string into structured fields.
-
-    Expected format: "(Courthouse Name: Dept. XX) Month Day, Year"
-    e.g.: "(Stanley Mosk: Dept. 52) March 3, 2026"
+    Value format: "ALH,3,03/02/2026"
+    Text format:  "(Alhambra Courthouse:  Dept. 3) March 2, 2026"
     """
-    m = _DROPDOWN_RE.match(text)
-    if not m:
-        logger.debug("Could not parse dropdown option", text=text)
-        return DropdownOption(
-            value=value,
-            courthouse="Unknown",
-            department="Unknown",
-            hearing_date=None,
-            raw_text=text,
-        )
+    vm = _OPTION_VALUE_RE.match(value)
+    if not vm:
+        logger.debug("Unparseable option value", value=value)
+        return None
 
-    courthouse = m.group("courthouse").strip()
-    department = m.group("department").strip()
-    date_str = m.group("date").strip()
+    courthouse_code = vm.group("courthouse_code").strip()
+    department = vm.group("department").strip()
+    date_str = vm.group("date")  # MM/DD/YYYY
 
     hearing_date: datetime | None = None
-    for fmt in ("%B %d, %Y", "%b %d, %Y", "%m/%d/%Y"):
-        try:
-            hearing_date = datetime.strptime(date_str, fmt)
-            break
-        except ValueError:
-            continue
+    try:
+        hearing_date = datetime.strptime(date_str, "%m/%d/%Y")
+    except ValueError:
+        pass
+
+    # Courthouse name from display text (more readable than code)
+    courthouse = courthouse_code
+    tm = _OPTION_TEXT_RE.match(text)
+    if tm:
+        courthouse = tm.group("courthouse").strip()
 
     return DropdownOption(
         value=value,
+        courthouse_code=courthouse_code,
         courthouse=courthouse,
         department=department,
         hearing_date=hearing_date,
-        raw_text=text,
     )
 
 
@@ -225,15 +196,14 @@ def _post_for_ruling(
     tokens: dict[str, str],
     option: DropdownOption,
 ) -> str:
-    """Submit the ASP.NET form for a single dropdown option and return the response HTML."""
+    """POST the ASP.NET form for one dropdown selection and return response HTML."""
     form_data = {
-        "__EVENTTARGET": "",
-        "__EVENTARGUMENT": "",
         "__VIEWSTATE": tokens.get("__VIEWSTATE", ""),
         "__VIEWSTATEGENERATOR": tokens.get("__VIEWSTATEGENERATOR", ""),
         "__EVENTVALIDATION": tokens.get("__EVENTVALIDATION", ""),
-        "ddlHearingDate": option.value,
-        "btnSearch": "Search",  # the submit button
+        SELECT_NAME: option.value,
+        # submit2 is the named submit button on the page; server accepts it for both searches
+        "submit2": "Search",
     }
     response = client.post(CIVIL_URL, data=form_data)
     response.raise_for_status()
@@ -241,46 +211,47 @@ def _post_for_ruling(
 
 
 # ---------------------------------------------------------------------------
-# HTML parsing helpers
+# HTML parsing
 # ---------------------------------------------------------------------------
 
-
 def _extract_ruling_fields(soup: BeautifulSoup, doc: CapturedDocument) -> None:
-    """Populate structured fields on doc from the ruling response HTML.
+    """Extract structured fields from the ruling response HTML.
 
-    The page structure varies by department. We use heuristics that work
-    across most departments, and store unparseable content in ruling_text
-    for downstream NLP processing.
+    The ruling content lives in div#speechSynthesis.
+    A single response may contain rulings for multiple cases.
     """
-    # Full text for NLP fallback
-    full_text = soup.get_text(separator="\n", strip=True)
+    content = soup.find("div", id="speechSynthesis")
+    if not content:
+        # Fallback: use full body text
+        doc.ruling_text = soup.get_text(separator="\n", strip=True)
+        return
+
+    full_text = content.get_text(separator="\n", strip=True)
     doc.ruling_text = full_text
 
-    # Case numbers — find all matches and store the first as primary
+    # All case numbers in this response
     case_numbers = _CASE_NUMBER_RE.findall(full_text)
     if case_numbers:
         doc.case_number = case_numbers[0]
         if len(case_numbers) > 1:
-            doc.extra["additional_case_numbers"] = case_numbers[1:]
+            doc.extra["all_case_numbers"] = case_numbers
 
-    # Judge name
-    judge_match = _JUDGE_RE.search(full_text)
-    if judge_match:
-        doc.judge_name = judge_match.group(1).strip()
-
-    # Department and courthouse are already set from the dropdown option
-    # (passed in by fetch_documents via doc.extra)
+    # Judge name from the signature div
+    for div in content.find_all("div"):
+        div_text = div.get_text(separator=" ", strip=True)
+        m = _JUDGE_DIV_RE.match(div_text)
+        if m:
+            # Normalize whitespace in name
+            doc.judge_name = " ".join(m.group(1).split())
+            break
 
 
 # ---------------------------------------------------------------------------
-# Default config factory
+# Config factory
 # ---------------------------------------------------------------------------
-
 
 def default_config(s3_bucket: str = "") -> ScraperConfig:
-    """Return a ready-to-use ScraperConfig for the LA civil tentatives scraper."""
     from datetime import time as dtime
-
     from framework import ScheduleWindow
 
     return ScraperConfig(
@@ -291,10 +262,10 @@ def default_config(s3_bucket: str = "") -> ScraperConfig:
         target_urls=[CIVIL_URL],
         poll_interval_seconds=43200,  # twice daily
         schedule_windows=[
-            ScheduleWindow(start=dtime(18, 0), end=dtime(19, 0)),   # 6 PM sweep
-            ScheduleWindow(start=dtime(2, 0), end=dtime(3, 0)),     # 2 AM catch-up
+            ScheduleWindow(start=dtime(18, 0), end=dtime(19, 0)),  # 6 PM sweep
+            ScheduleWindow(start=dtime(2, 0), end=dtime(3, 0)),    # 2 AM catch-up
         ],
-        request_delay_seconds=1.5,    # be a good citizen
+        request_delay_seconds=1.5,
         request_timeout_seconds=30.0,
         max_retries=3,
         s3_bucket=s3_bucket,

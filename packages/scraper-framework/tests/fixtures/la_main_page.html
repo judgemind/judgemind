@@ -1,19 +1,447 @@
+
 <!DOCTYPE html>
-<html>
-<head><title>Tentative Rulings</title></head>
+
+<html xmlns="http://www.w3.org/1999/xhtml" lang="en">
+<head id="head1"><title>
+	Tentative Rulings - Online Services - LA Court
+</title><meta http-equiv="Content-Type" content="text/html; charset=utf-8" /><link rel="icon" type="image/png" href="../commonv4/images/favicon-16x16.png" sizes="16x16" /><link rel="icon" type="image/png" href="../commonv4/images/favicon-32x32.png" sizes="32x32" />
+
+<!-- Stylesheet -->
+<link id="Link5" rel="stylesheet" type="text/css" href="../commonv4/styles/sitemaster.css" media="all" /><link id="Link4" rel="stylesheet" type="text/css" href="../commonv4/styles/fonts.css" media="all" /><link id="Link3" rel="stylesheet" type="text/css" href="../commonv4/styles/common.css" media="all" /><link id="Link10" rel="stylesheet" type="text/css" href="../commonv4/styles/home.css" media="all" /><link id="Link6" rel="stylesheet" type="text/css" href="../commonv4/styles/wrapper.css" media="all" /><link id="Link7" rel="stylesheet" type="text/css" href="../commonv4/styles/breadcrumb.css" media="all" /><link id="Link8" rel="stylesheet" type="text/css" href="../commonv4/styles/screen.css" media="all" /><link id="Link9" rel="stylesheet" type="text/css" href="../commonv4/styles/pending.css" media="all" /><link rel="stylesheet" type="text/css" href="../commonv4/styles/styles3.css" media="all" /><link rel="stylesheet" type="text/css" href="../commonv4/styles/template.css" media="all" /><link href="../commonv4/styles/jquery-ui.css" rel="stylesheet" /><link href="../commonv4/styles/jquery-ui-smoothness.css" rel="stylesheet" /><link id="Link1" rel="stylesheet" type="text/css" href="../commonv4/styles/tooltip.css" media="all" /><link id="Link2" rel="stylesheet" type="text/css" href="../commonv4/styles/global508.css" media="all" />
+    
+    
+		<SCRIPT language="JavaScript">
+<!-- 
+    function checkFields2(thisForm) {
+        if (thisForm.CaseNumber.value == "" & thisForm.List2DeptDate.selectedIndex < 0) {
+            alert("You must enter a case number or select a department");
+            return false;
+        }
+
+        if (thisForm.CaseNumber.value != "" & thisForm.List2DeptDate.selectedIndex >= 0) {
+            alert("You may search for a case number or a department, not both.");
+            return false;
+        }
+        return true;
+    }
+
+    function checkFields1(thisForm) {
+
+        if (thisForm.List1DeptDate.selectedIndex == -1) {
+            alert("You must select a Hearing Date.");
+            return false;
+        }
+
+        return true;
+    }
+
+    function displayNewWindow(thisObj) {
+        newwindow = window.open(thisObj.href, 'offworld', 'width=630,height=500,directories=yes,resizable=yes,status=yes,menubar=yes,location=yes,scrollbars=yes');
+        newwindow.focus();
+        return false;
+    }
+
+
+    // -->
+		</SCRIPT>
+
+</head>
+
+
 <body>
-<form method="post" action="/tentativeRulingNet/ui/main.aspx?casetype=civil">
-  <input type="hidden" name="__VIEWSTATE" value="abc123viewstate" />
-  <input type="hidden" name="__VIEWSTATEGENERATOR" value="gen456" />
-  <input type="hidden" name="__EVENTVALIDATION" value="ev789validation" />
-  <select name="ddlHearingDate" id="ddlHearingDate">
-    <option value="0">-- Select --</option>
-    <option value="1">(Stanley Mosk: Dept. 52) March 3, 2026</option>
-    <option value="2">(Santa Monica: Dept. M) March 3, 2026</option>
-    <option value="3">(Pomona South: Dept. H) March 12, 2026</option>
-    <option value="4">(Beverly Hills: Dept. 205) March 3, 2026</option>
-  </select>
-  <input type="submit" name="btnSearch" value="Search" />
-</form>
+    <!--JQuery-->
+    <script src="/TentativeRulingNet/commonv4/scripts/jquery-1.11.1.min.js" type="text/javascript"></script>
+ 
+
+    <div id="mainContainer">
+
+        <div id="headerWrap" style="display:none">
+            <!-- Start Translate -->
+            <!-- End Translate -->
+
+            
+            
+
+            <!-- Font Size -->
+            
+
+            <!-- Start Logo -->
+            <div class="logo">
+                <a href="/page/HO0000" onclick="return processLink(this)"><img src="../commonv4/images/logo.gif" id="Img1" alt="Banner Image - The Superior Court of California County of Los Angeles " /></a>
+            </div>
+            <!-- End Logo -->
+
+   	        <!-- Start Search -->
+            <div class="searchWrap"  role="search" >
+            <form name="searchForm" method="get" onsubmit="doSearch(); return false;">
+    
+    	        <div id="searchfieldWrap">
+    		        <input aria-label="Enter Search Criteria" id="searchfield" type="text" name="search" value="Search" onclick="selectSearchText()" onkeydown=""/>
+    	        </div>
+        
+            <div id="btngoWrap">
+                    <a id="searchLink" href="#" onclick="return doSearch(this)"><img src="../commonv4/images/blank.gif" id="Img2" style="margin-left:1px;margin-top:1px" alt="Start Site Search" width="33" height="33" /></a>
+            </div>
+        
+            </form>
+	        </div> 
+            
+            <!-- Survey -->
+              
+        </div>
+
+        <!-- Start MainMenu -->
+        <!---#include virtual="includes/menu2aa.html" --->
+        <!-- End MainMenu -->
+
+        <form method="post" action="./main.aspx?casetype=civil" id="lascwebform">
+<input type="hidden" name="__VIEWSTATE" id="__VIEWSTATE" value="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" />
+
+<input type="hidden" name="__VIEWSTATEGENERATOR" id="__VIEWSTATEGENERATOR" value="65B48B29" />
+<input type="hidden" name="__EVENTVALIDATION" id="__EVENTVALIDATION" value="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" />
+            <!--<h1><span style="display:none" role="heading">Main Content</span></h1>-->
+            <div class="pageWrap">
+                
+    <div style="display:none">
+    
+    <div id="siteMasterHolder_breadcrumbHolder_breadcrumb_breadcrumbBarContainer" class="breadcrumbBarContainer" display="none" style="display:none;">
+    <div id="siteMasterHolder_breadcrumbHolder_breadcrumb_enabledLink" display="none" class="breadcrumbBar">
+        <a href="#" class="topBreadcrumb" onclick="return processLink(this)"><span class="glyphicon glyphicon-menu-right"></span></a>
+    </div>    
+    <div id="siteMasterHolder_breadcrumbHolder_breadcrumb_disabledLink" class="breadcrumbBar">
+        <div class="topBreadcrumb"><span class="glyphicon glyphicon-menu-right"></span></div>
+    </div>
+</div>
+<div style="height:30px">
+    <div id="siteMasterHolder_breadcrumbHolder_breadcrumb_returnLinkContainer" style="text-align:right; display:none">
+        <a type="button" class="btn btn-default btn-sm" href="#" onclick="return processLink(this);">
+            <span class="glyphicon glyphicon-screenshot"></span>  Home </a>
+    </div>
+</div>
+
+<script type='text/javascript'>$("#navBarTab2").addClass("navWhiteBox selectedTab");</script>
+                
+            
+
+
+    </div>
+    
+    <div class="mainContentWrap" id="divMainContent">
+        <div class="basicWrap">
+            <div class="contentCategory" style="padding-top: 28px; padding-bottom: 10px; display:none">
+                
+    Online Services
+
+            </div>
+            <div class="contentTitle" style="display:none">
+                
+    Tentative Rulings
+
+
+            </div>
+            <div class="contentText">
+                
+    
+     
+
+    <!-- begin content -->
+											
+
+			                
+            <!--	' Civil division and appellate division display this page differently.
+				' appellate division does not include the location and department
+				' in the drop down box since there's only only location and department.
+				' The drop down box displays Hearing date only.
+			-->
+									<table id="siteMasterHolder_basicBodyHolder_CivilRuling" cellspacing="0" cellpadding="0" width="95%" border="0">
+	<tr>
+		<td>
+											<p>Courtrooms that are publishing their tentative rulings, can be selected from 
+																				the Location, Department and Hearing Date drop down list.</p>
+
+                                            <br />
+											<FORM id="Form2" name="FORM2" onsubmit="return checkFields2(this);" method="post">
+																					<!-- double deck mod -->
+											<div class="contentText" style="border:2PX solid red; width:100%; padding:10px">
+                                            <p>
+                                                <div style="padding-bottom:10px;">CHOICE 1: search by the Case Number</div>
+																							<TABLE class="FCLtbl_part2" cellSpacing="0" cellPadding="0">
+																								<TR>
+																									<TD colSpan="3">
+																										<div class="spacer5"></div>
+																									</TD>
+																								</TR>
+																								<TR>
+																									<TD></TD>
+																									<TD width="9"></TD>
+																									<TD>Enter a Case Number and click search.</TD>
+																								</TR>
+																								<TR>
+																									<TD colSpan="3">
+																										<div class="spacer9"><br /></div> <!--[if IE]>
+                              <DIV 
+                          class=marginMinusTop1></DIV><![endif] --></TD>
+																								</TR>
+																								<TR>
+																									<TD class="inputFieldDescription" align="right" width="126">Case Number:
+																									</TD>
+																									<TD width="9"></TD>
+																									<TD><INPUT class="textInput" maxLength="16" size="16" name="CaseNumber" aria-label="Input Case Number Here">
+																									</TD>
+																								</TR>
+																								<TR>
+																									<TD colSpan="3">
+																										<div class="spacer11"></div><br /></TD>
+																								</TR>
+																								<TR>
+																									<TD>&nbsp;</TD>
+																									<TD width="9"></TD>
+																									<TD><INPUT class="button" id="submit2" type="submit" value="Search" name="submit2">&nbsp;&nbsp;
+																										<INPUT class="button" onclick="CaseNumber.value = ''; " type="button" value="Clear">
+																									</TD>
+																								</TR>
+																								<TR>
+																									<TD colSpan="3" height="6"></TD>
+																								</TR>
+																							</TABLE>
+																						
+																						    <br />
+																							<div style="padding-bottom:10px;">CHOICE 2: search by Location, Department and Hearing Date.</div>
+																							<TABLE class="tbl_part2" cellSpacing="0" cellPadding="0" border="0">
+																								<TR>
+																									<TD></TD>
+																									<TD width="9"></TD>
+																									<TD>Select a Court Location, Department, Hearing Date and click search.</TD>
+																								</TR>
+																								<TR>
+																									<TD colSpan="3">
+																										<div class="spacer9"><br /></div>
+																									</TD>
+																								</TR>
+																								<TR>
+																									<TD class="inputFieldDescription" align="right" width="126">Location, Department / 
+																										Hearing Date:
+																									</TD>
+																									<TD width="9"></TD>
+																									<TD><select size="4" name="ctl00$ctl00$siteMasterHolder$basicBodyHolder$List2DeptDate" id="siteMasterHolder_basicBodyHolder_List2DeptDate" aria-label="Select a Courthouse, Deparment or Hearing Date">
+			<option value="ALH,3,03/02/2026">(Alhambra Courthouse:  Dept. 3) March 2, 2026</option>
+			<option value="ALH,V,03/02/2026">(Alhambra Courthouse:  Dept. V) March 2, 2026</option>
+			<option value="ALH,X,03/02/2026">(Alhambra Courthouse:  Dept. X) March 2, 2026</option>
+			<option value="ALH,X,03/03/2026">(Alhambra Courthouse:  Dept. X) March 3, 2026</option>
+			<option value="BH ,205,03/02/2026">(Beverly Hills Courthouse:  Dept. 205) March 2, 2026</option>
+			<option value="BH ,205,03/03/2026">(Beverly Hills Courthouse:  Dept. 205) March 3, 2026</option>
+			<option value="BH ,207,03/02/2026">(Beverly Hills Courthouse:  Dept. 207) March 2, 2026</option>
+			<option value="BH ,207,03/03/2026">(Beverly Hills Courthouse:  Dept. 207) March 3, 2026</option>
+			<option value="CHA,F46,03/02/2026">(Chatsworth Courthouse:  Dept. F46) March 2, 2026</option>
+			<option value="CHA,F47,03/02/2026">(Chatsworth Courthouse:  Dept. F47) March 2, 2026</option>
+			<option value="CHA,F49,03/02/2026">(Chatsworth Courthouse:  Dept. F49) March 2, 2026</option>
+			<option value="CHA,F51,03/02/2026">(Chatsworth Courthouse:  Dept. F51) March 2, 2026</option>
+			<option value="COM,A,03/02/2026">(Compton Courthouse:  Dept. A) March 2, 2026</option>
+			<option value="COM,E,03/02/2026">(Compton Courthouse:  Dept. E) March 2, 2026</option>
+			<option value="COM,E,03/03/2026">(Compton Courthouse:  Dept. E) March 3, 2026</option>
+			<option value="COM,E,03/04/2026">(Compton Courthouse:  Dept. E) March 4, 2026</option>
+			<option value="LB ,S27,03/03/2026">(Governor George Deukmejian Courthouse:  Dept. S27) March 3, 2026</option>
+			<option value="ING,5,03/02/2026">(Inglewood Courthouse:  Dept. 5) March 2, 2026</option>
+			<option value="ATP,A14,03/03/2026">(Michael Antonovich Antelope Valley Courthouse:  Dept. A14) March 3, 2026</option>
+			<option value="SE ,C,03/02/2026">(Norwalk Courthouse:  Dept. C) March 2, 2026</option>
+			<option value="SE ,Y,03/02/2026">(Norwalk Courthouse:  Dept. Y) March 2, 2026</option>
+			<option value="PAS,P,03/02/2026">(Pasadena Courthouse:  Dept. P) March 2, 2026</option>
+			<option value="PAS,P,03/05/2026">(Pasadena Courthouse:  Dept. P) March 5, 2026</option>
+			<option value="PAS,P,03/06/2026">(Pasadena Courthouse:  Dept. P) March 6, 2026</option>
+			<option value="EA ,G,03/02/2026">(Pomona Courthouse South:  Dept. G) March 2, 2026</option>
+			<option value="EA ,H,03/02/2026">(Pomona Courthouse South:  Dept. H) March 2, 2026</option>
+			<option value="EA ,H,03/03/2026">(Pomona Courthouse South:  Dept. H) March 3, 2026</option>
+			<option value="EA ,H,03/04/2026">(Pomona Courthouse South:  Dept. H) March 4, 2026</option>
+			<option value="EA ,H,03/05/2026">(Pomona Courthouse South:  Dept. H) March 5, 2026</option>
+			<option value="EA ,H,03/11/2026">(Pomona Courthouse South:  Dept. H) March 11, 2026</option>
+			<option value="EA ,H,03/12/2026">(Pomona Courthouse South:  Dept. H) March 12, 2026</option>
+			<option value="EA ,O,03/02/2026">(Pomona Courthouse South:  Dept. O) March 2, 2026</option>
+			<option value="EA ,O,03/03/2026">(Pomona Courthouse South:  Dept. O) March 3, 2026</option>
+			<option value="SM ,I,03/02/2026">(Santa Monica Courthouse:  Dept. I) March 2, 2026</option>
+			<option value="SM ,M,03/02/2026">(Santa Monica Courthouse:  Dept. M) March 2, 2026</option>
+			<option value="SM ,O,03/02/2026">(Santa Monica Courthouse:  Dept. O) March 2, 2026</option>
+			<option value="SS ,1,03/02/2026">(Spring Street Courthouse:  Dept. 1) March 2, 2026</option>
+			<option value="SS ,11,03/02/2026">(Spring Street Courthouse:  Dept. 11) March 2, 2026</option>
+			<option value="SS ,25,03/02/2026">(Spring Street Courthouse:  Dept. 25) March 2, 2026</option>
+			<option value="SS ,26,03/02/2026">(Spring Street Courthouse:  Dept. 26) March 2, 2026</option>
+			<option value="SS ,26,03/26/2026">(Spring Street Courthouse:  Dept. 26) March 26, 2026</option>
+			<option value="SS ,28,03/02/2026">(Spring Street Courthouse:  Dept. 28) March 2, 2026</option>
+			<option value="SS ,9,03/02/2026">(Spring Street Courthouse:  Dept. 9) March 2, 2026</option>
+			<option value="SS ,9,03/03/2026">(Spring Street Courthouse:  Dept. 9) March 3, 2026</option>
+			<option value="SS ,9,03/04/2026">(Spring Street Courthouse:  Dept. 9) March 4, 2026</option>
+			<option value="SS ,9,03/11/2026">(Spring Street Courthouse:  Dept. 9) March 11, 2026</option>
+			<option value="LAM,15,03/26/2026">(Stanley Mosk Courthouse:  Dept. 15) March 26, 2026</option>
+			<option value="LAM,17,03/02/2026">(Stanley Mosk Courthouse:  Dept. 17) March 2, 2026</option>
+			<option value="LAM,17,03/03/2026">(Stanley Mosk Courthouse:  Dept. 17) March 3, 2026</option>
+			<option value="LAM,17,03/04/2026">(Stanley Mosk Courthouse:  Dept. 17) March 4, 2026</option>
+			<option value="LAM,19,03/02/2026">(Stanley Mosk Courthouse:  Dept. 19) March 2, 2026</option>
+			<option value="LAM,2,03/02/2026">(Stanley Mosk Courthouse:  Dept. 2) March 2, 2026</option>
+			<option value="LAM,20,03/02/2026">(Stanley Mosk Courthouse:  Dept. 20) March 2, 2026</option>
+			<option value="LAM,20,03/03/2026">(Stanley Mosk Courthouse:  Dept. 20) March 3, 2026</option>
+			<option value="LAM,20,03/04/2026">(Stanley Mosk Courthouse:  Dept. 20) March 4, 2026</option>
+			<option value="LAM,26,03/02/2026">(Stanley Mosk Courthouse:  Dept. 26) March 2, 2026</option>
+			<option value="LAM,3,03/02/2026">(Stanley Mosk Courthouse:  Dept. 3) March 2, 2026</option>
+			<option value="LAM,30,03/02/2026">(Stanley Mosk Courthouse:  Dept. 30) March 2, 2026</option>
+			<option value="LAM,31,03/02/2026">(Stanley Mosk Courthouse:  Dept. 31) March 2, 2026</option>
+			<option value="LAM,32,03/02/2026">(Stanley Mosk Courthouse:  Dept. 32) March 2, 2026</option>
+			<option value="LAM,32,03/04/2026">(Stanley Mosk Courthouse:  Dept. 32) March 4, 2026</option>
+			<option value="LAM,34,03/02/2026">(Stanley Mosk Courthouse:  Dept. 34) March 2, 2026</option>
+			<option value="LAM,34,03/04/2026">(Stanley Mosk Courthouse:  Dept. 34) March 4, 2026</option>
+			<option value="LAM,37,03/02/2026">(Stanley Mosk Courthouse:  Dept. 37) March 2, 2026</option>
+			<option value="LAM,39,03/02/2026">(Stanley Mosk Courthouse:  Dept. 39) March 2, 2026</option>
+			<option value="LAM,45,03/02/2026">(Stanley Mosk Courthouse:  Dept. 45) March 2, 2026</option>
+			<option value="LAM,45,03/03/2026">(Stanley Mosk Courthouse:  Dept. 45) March 3, 2026</option>
+			<option value="LAM,47,03/02/2026">(Stanley Mosk Courthouse:  Dept. 47) March 2, 2026</option>
+			<option value="LAM,48,03/03/2026">(Stanley Mosk Courthouse:  Dept. 48) March 3, 2026</option>
+			<option value="LAM,49,03/02/2026">(Stanley Mosk Courthouse:  Dept. 49) March 2, 2026</option>
+			<option value="LAM,50,03/02/2026">(Stanley Mosk Courthouse:  Dept. 50) March 2, 2026</option>
+			<option value="LAM,50,03/03/2026">(Stanley Mosk Courthouse:  Dept. 50) March 3, 2026</option>
+			<option value="LAM,51,03/02/2026">(Stanley Mosk Courthouse:  Dept. 51) March 2, 2026</option>
+			<option value="LAM,52,03/02/2026">(Stanley Mosk Courthouse:  Dept. 52) March 2, 2026</option>
+			<option value="LAM,53,03/02/2026">(Stanley Mosk Courthouse:  Dept. 53) March 2, 2026</option>
+			<option value="LAM,54,03/02/2026">(Stanley Mosk Courthouse:  Dept. 54) March 2, 2026</option>
+			<option value="LAM,54,03/03/2026">(Stanley Mosk Courthouse:  Dept. 54) March 3, 2026</option>
+			<option value="LAM,55,03/02/2026">(Stanley Mosk Courthouse:  Dept. 55) March 2, 2026</option>
+			<option value="LAM,56,03/02/2026">(Stanley Mosk Courthouse:  Dept. 56) March 2, 2026</option>
+			<option value="LAM,57,03/02/2026">(Stanley Mosk Courthouse:  Dept. 57) March 2, 2026</option>
+			<option value="LAM,58,03/02/2026">(Stanley Mosk Courthouse:  Dept. 58) March 2, 2026</option>
+			<option value="LAM,68,03/02/2026">(Stanley Mosk Courthouse:  Dept. 68) March 2, 2026</option>
+			<option value="LAM,71,03/02/2026">(Stanley Mosk Courthouse:  Dept. 71) March 2, 2026</option>
+			<option value="LAM,71,03/03/2026">(Stanley Mosk Courthouse:  Dept. 71) March 3, 2026</option>
+			<option value="LAM,72,03/02/2026">(Stanley Mosk Courthouse:  Dept. 72) March 2, 2026</option>
+			<option value="LAM,74,03/03/2026">(Stanley Mosk Courthouse:  Dept. 74) March 3, 2026</option>
+			<option value="LAM,78,03/02/2026">(Stanley Mosk Courthouse:  Dept. 78) March 2, 2026</option>
+			<option value="SBA,E,03/02/2026">(Torrance Courthouse:  Dept. E) March 2, 2026</option>
+			<option value="SBA,M,03/02/2026">(Torrance Courthouse:  Dept. M) March 2, 2026</option>
+			<option value="NW ,B,03/02/2026">(Van Nuys Courthouse East:  Dept. B) March 2, 2026</option>
+			<option value="NW ,B,03/03/2026">(Van Nuys Courthouse East:  Dept. B) March 3, 2026</option>
+			<option value="NW ,I,03/02/2026">(Van Nuys Courthouse East:  Dept. I) March 2, 2026</option>
+			<option value="NW ,O,03/02/2026">(Van Nuys Courthouse East:  Dept. O) March 2, 2026</option>
+			<option value="NW ,T,03/12/2026">(Van Nuys Courthouse East:  Dept. T) March 12, 2026</option>
+			<option value="LAV,107,03/02/2026">(Van Nuys Courthouse West:  Dept. 107) March 2, 2026</option>
+			<option value="CIT,6,03/02/2026">(West Covina Courthouse:  Dept. 6) March 2, 2026</option>
+			<option value="CIT,6,03/03/2026">(West Covina Courthouse:  Dept. 6) March 3, 2026</option>
+
+		</select></TD>
+																								</TR>
+                                                                                                	<TR>
+																									<TD colSpan="3">
+																										<div class="spacer9"><br /></div>
+																									</TD>
+																								</TR>
+																								<TR>
+																									<TD>&nbsp;</TD>
+																									<TD width="9"></TD>
+																									<TD><INPUT class="button" type="submit" value="Search">&nbsp;&nbsp; <INPUT class="button" onclick="List2DeptDate.selectedIndex = -1;" type="button" value="Clear">
+																									</TD>
+																								</TR>
+																								
+																							</TABLE>
+                                            </p>
+                                            </div>
+								
+																							
+											</FORM>
+										</td>
+	</tr>
+</table>
+							
+																
+
+							<!-- display appellate division table -->
+                                    
+									<!-- end appellate division table -->
+							
+			
+
+            </div>
+        </div>
+        <script>var contentArea = "#divMainContent";</script>
+    </div>
+    <div class="moreContentWrap" style="display:none">
+        <div class="moreLeftWrap">
+            
+            
+        </div>
+        <div class="moreMidWrap">
+            
+            
+        </div>
+        <div class="moreRightWrap">
+            
+                <!--<div id="siteMasterHolder_rightMoreHolder_returnLink_returnLinkContainer" style="text-align:right; display:none">
+    <a href="../commonv4/source/uc/x" id="siteMasterHolder_rightMoreHolder_returnLink_homeButtonLink" type="button" class="btn btn-default btn-sm" onclick="return processLink(this);">
+        <span class="glyphicon glyphicon-screenshot"></span>  Home
+    </a>
+
+</div>
+-->
+            
+        </div>
+    </div>
+
+    <div class="lastContentWrap" style="display:none">
+        <div class="lastLeftWrap">
+            
+
+        </div>
+        <div class="lastRightWrap">
+
+            
+
+        </div>
+    </div>
+    
+
+            </div>
+        </form>
+        <div id="footerWrap" style="display:none">
+                <!-- Start MainMenu -->
+                <!-- End MainMenu -->
+        </div>
+    </div>
+
+    <!-- Scripts Loaded at End -->
+    <!-- Provides performance benefit. Also fix for Asp.Net error, "The Controls collection cannot be modified because the control contains code blocks (i.e. < % ... % >)" -->
+    <!-- See http://www.aspdotnet-suresh.com/2011/12/aspnet-controls-collection-cannot-be.html -->
+
+    <!--JQuery-->
+    
+    <script src="/TentativeRulingNet/commonv4/scripts/jquery-ui.min.js" type="text/javascript"></script>
+    <script src="/TentativeRulingNet/commonv4/scripts/jquery.cookie.js" type="text/javascript"></script>
+
+    <!--Google Analytics-->
+    <script src="/TentativeRulingNet/commonv4/scripts/analytics.js" type="text/javascript"></script>
+
+    <!-- lascweb -->   
+    <script src="/TentativeRulingNet/commonv4/scripts/config.js" type="text/javascript" ></script>
+    <script src="/TentativeRulingNet/commonv4/scripts/common.js" type="text/javascript" ></script>
+    <script src="/TentativeRulingNet/commonv4/scripts/tooltip.js" type="text/javascript"></script>
+    <script src="/TentativeRulingNet/commonv4/scripts/linkredirect.js" type="text/javascript"></script>
+    <script src="/TentativeRulingNet/commonv4/scripts/globaljs.js" type="text/javascript" ></script>  <!-- Nav Menu -->
+
+    <!-- text-2-speech -->
+    <!--script src="/TentativeRulingNet/commonv4/scripts/text2speech.js" type="text/javascript" ></!--script-->
+
+    <!-- ajax control toolkit extension -->
+    <script src="/TentativeRulingNet/commonv4/scripts/ajaxcontroltoolkit.js" type="text/javascript"></script>
+
+    <script type="text/javascript">
+        <!-- Executes OnFocus. Highlights the text in the search box. -->
+        function selectSearchText() {
+            $("#searchfield").select();
+        }
+        function doSearch() {
+            $("#searchLink").attr("href", "/page/ho0100/" + escape($("#searchfield").val().trim()));
+            return processLink($("#searchLink"));
+        }
+    </script>
+    <!-- End Lascweb -->
+
+    
+    
+    
+            
 </body>
 </html>
+
