@@ -73,6 +73,12 @@ module "database" {
   subnet_ids  = data.aws_subnets.default.ids
 }
 
+module "iam_scraper" {
+  source                      = "./modules/iam_scraper"
+  environment                 = var.environment
+  document_archive_bucket_arn = module.storage.bucket_arn
+}
+
 # module "networking" {
 #   source      = "./modules/networking"
 #   environment = var.environment

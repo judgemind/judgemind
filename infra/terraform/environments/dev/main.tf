@@ -16,6 +16,13 @@ module "document_archive" {
   enable_object_lock = false
 }
 
+module "iam_scraper" {
+  source = "../../modules/iam_scraper"
+
+  environment                 = "dev"
+  document_archive_bucket_arn = module.document_archive.bucket_arn
+}
+
 output "document_archive_bucket" {
   description = "Dev document archive bucket name"
   value       = module.document_archive.bucket_id
@@ -24,4 +31,14 @@ output "document_archive_bucket" {
 output "document_archive_arn" {
   description = "Dev document archive bucket ARN"
   value       = module.document_archive.bucket_arn
+}
+
+output "scraper_role_arn" {
+  description = "Dev scraper IAM role ARN"
+  value       = module.iam_scraper.role_arn
+}
+
+output "scraper_instance_profile_arn" {
+  description = "Dev scraper EC2 instance profile ARN"
+  value       = module.iam_scraper.instance_profile_arn
 }
