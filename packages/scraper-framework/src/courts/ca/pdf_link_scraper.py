@@ -30,6 +30,7 @@ import httpx
 import pdfplumber
 import structlog
 from bs4 import BeautifulSoup
+
 from framework import BaseScraper, CapturedDocument, ContentFormat, ScraperConfig
 
 logger = structlog.get_logger(__name__)

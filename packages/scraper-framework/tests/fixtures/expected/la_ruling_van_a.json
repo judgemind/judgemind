@@ -1,0 +1,16 @@
+{
+  "_fixture": "la_ruling_van_a.html",
+  "_description": "POST response for VAN,A (Van Nuys Dept A) using STALE ViewState from 03/02/2026. Returns error page.",
+  "_captured": "2026-03-02",
+  "_courthouse_code": "VAN",
+  "has_speech_synthesis_div": false,
+  "case_count": 0,
+  "primary_case_number": null,
+  "judge_name": null,
+  "ruling_text_contains": [
+    "We're sorry",
+    "website error"
+  ],
+  "_edge_case": "stale_viewstate",
+  "_notes": "Returned when POSTing with a ViewState/option from a previous session. The scraper must always GET a fresh main page before POSTing. This is the expected error HTML (~8KB) when the dropdown option no longer exists."
+}

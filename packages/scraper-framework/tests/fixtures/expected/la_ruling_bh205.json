@@ -1,0 +1,22 @@
+{
+  "_fixture": "la_ruling_bh205.html",
+  "_description": "POST response for BH ,205 (Beverly Hills Courthouse, Dept 205). Future hearing date (03/03/2026).",
+  "_captured": "2026-03-02",
+  "_courthouse_code": "BH",
+  "_option_value": "BH ,205,03/03/2026",
+  "has_speech_synthesis_div": true,
+  "case_count": 2,
+  "primary_case_number": "22SMCV01940",
+  "all_case_numbers": [
+    "22SMCV01940",
+    "25SMCV01132"
+  ],
+  "judge_name": null,
+  "hearing_date": "2026-03-03",
+  "courthouse": "Beverly Hills Courthouse",
+  "department": "205",
+  "ruling_text_contains": [
+    "DEPARTMENT 205 LAW AND MOTION RULINGS"
+  ],
+  "_notes": "Beverly Hills uses 'BH ' (with trailing space) as courthouse code. Judge name not in standard format for this dept. Future date (posted day before hearing)."
+}

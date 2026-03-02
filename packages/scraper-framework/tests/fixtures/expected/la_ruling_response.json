@@ -1,0 +1,24 @@
+{
+  "_fixture": "la_ruling_response.html",
+  "_description": "POST response for ALH,3 (Alhambra Courthouse, Dept 3). Two civil cases with rulings.",
+  "_captured": "2026-03-02",
+  "_courthouse_code": "ALH",
+  "_option_value": "ALH,3,03/02/2026",
+  "has_speech_synthesis_div": true,
+  "case_count": 2,
+  "primary_case_number": "24NNCV02551",
+  "all_case_numbers": [
+    "24NNCV02551",
+    "26NNCP00062"
+  ],
+  "judge_name": "William A. Crowfoot",
+  "hearing_date": "2026-03-02",
+  "courthouse": "Alhambra Courthouse",
+  "department": "3",
+  "ruling_text_contains": [
+    "DEPARTMENT 3 LAW AND MOTION RULINGS",
+    "GRANTED",
+    "Case Number"
+  ],
+  "_notes": "Multi-case response. Both NNCV (civil) and NNCP (probate/complex?) case types present. Judge name in 'X Judge of the Superior Court' div."
+}

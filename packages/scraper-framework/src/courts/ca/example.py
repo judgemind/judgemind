@@ -9,6 +9,7 @@ from __future__ import annotations
 import time
 
 import httpx
+
 from framework import BaseScraper, CapturedDocument, ContentFormat, ScraperConfig
 
 

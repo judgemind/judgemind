@@ -1,0 +1,19 @@
+{
+  "_fixture": "riv_moreno_valley.pdf",
+  "_description": "Riverside Moreno Valley Courthouse — Dept MV1 (Judge David E. Gregory). 2-page PDF with 3 rulings.",
+  "_link_text": "Department MV1 - Honorable David E. Gregory",
+  "_captured": "2026-03-02",
+  "courthouse": "Moreno Valley Courthouse",
+  "department": "MV1",
+  "judge_name": "David E. Gregory",
+  "page_count": 2,
+  "case_count": 3,
+  "primary_case_number": "CVMV2507098",
+  "case_number_format": "CV{LOCATION}{YY}{NNNNNN}",
+  "hearing_date": "March 2, 2026",
+  "ruling_text_contains": [
+    "Tentative Rulings for March 2, 2026",
+    "Department MV1"
+  ],
+  "_notes": "Moreno Valley format. MV location prefix in case numbers. Judge has middle initial."
+}

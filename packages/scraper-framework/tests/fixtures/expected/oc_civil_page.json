@@ -1,0 +1,20 @@
+{
+  "_fixture": "oc_civil_page.html",
+  "_description": "OC civil tentative rulings index page. Lists all judges with PDF links.",
+  "_captured": "2026-03-02",
+  "pdf_link_count": 33,
+  "courthouse_distribution": {
+    "Complex Civil (CX)": 4,
+    "Central Justice Center (C)": 21,
+    "North Justice Center (N)": 5,
+    "West Justice Center (W)": 2,
+    "Costa Mesa (CM)": 1
+  },
+  "first_link": {
+    "link_text": "CLASTER, William D. - Dept CX101",
+    "href_contains": "claster",
+    "courthouse": "Complex Civil Department"
+  },
+  "link_text_format": "LASTNAME, Firstname [M.] - Dept CODE",
+  "_notes": "33 links on 2026-03-02. Mix of PDF hosts: occourts.org and Pantheon CDN (live-jcc-oc.pantheonsite.io). Non-breaking spaces in link text require normalization."
+}

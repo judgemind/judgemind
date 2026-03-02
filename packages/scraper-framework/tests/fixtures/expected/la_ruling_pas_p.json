@@ -1,0 +1,22 @@
+{
+  "_fixture": "la_ruling_pas_p.html",
+  "_description": "POST response for PAS,P (Pasadena Courthouse, Dept P). Single case with DENIED ruling.",
+  "_captured": "2026-03-02",
+  "_courthouse_code": "PAS",
+  "_option_value": "PAS,P,03/02/2026",
+  "has_speech_synthesis_div": true,
+  "case_count": 1,
+  "primary_case_number": "25NNCV00140",
+  "all_case_numbers": [
+    "25NNCV00140"
+  ],
+  "judge_name": null,
+  "hearing_date": "2026-03-02",
+  "courthouse": "Pasadena Courthouse",
+  "department": "P",
+  "ruling_text_contains": [
+    "DEPARTMENT P LAW AND MOTION RULINGS",
+    "DENIED"
+  ],
+  "_notes": "Alphanumeric department code (letter only). Single case. Motion for Reconsideration denied."
+}

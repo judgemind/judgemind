@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pytest
+
 from framework.retry import retry_sync
 
 
