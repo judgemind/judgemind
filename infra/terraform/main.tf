@@ -6,6 +6,10 @@ terraform {
       source  = "hashicorp/aws"
       version = "~> 5.0"
     }
+    random = {
+      source  = "hashicorp/random"
+      version = "~> 3.0"
+    }
   }
 
   backend "s3" {
@@ -41,6 +45,19 @@ variable "environment" {
   default     = "dev"
 }
 
+# ─── Data Sources ──────────────────────────────────────────
+
+data "aws_vpc" "default" {
+  default = true
+}
+
+data "aws_subnets" "default" {
+  filter {
+    name   = "vpc-id"
+    values = [data.aws_vpc.default.id]
+  }
+}
+
 # ─── Modules ───────────────────────────────────────────────
 
 module "storage" {
@@ -48,12 +65,12 @@ module "storage" {
   environment = var.environment
 }
 
-# Uncomment as you're ready to deploy each component:
-
-# module "database" {
-#   source      = "./modules/database"
-#   environment = var.environment
-# }
+module "database" {
+  source      = "./modules/database"
+  environment = var.environment
+  vpc_id      = data.aws_vpc.default.id
+  subnet_ids  = data.aws_subnets.default.ids
+}
 
 # module "networking" {
 #   source      = "./modules/networking"
