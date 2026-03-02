@@ -115,6 +115,19 @@ These patterns avoid permission prompts and allow the agent to run without inter
 - **Git outside the working directory:** use `git -C /absolute/path <subcommand>` instead of `cd /path && git <subcommand>`. Compound commands with `cd` trigger a safety prompt.
 - **Multi-line content for `gh` commands:** write to a temp file and use `--body-file /tmp/file.txt`. Never use backticks or command substitution inside quoted strings passed to `gh`.
 - **Multi-line Python scripts:** write to `/tmp/script.py`, then run with `.venv/bin/python3 /tmp/script.py`. Embedding multi-line code in `-c "..."` breaks pattern matching and triggers a prompt.
+- **Dynamic values in shell commands:** never embed `$(...)` command substitution inside a command that needs approval. Run the inner command first to get the value, then use the literal value in the next command. Example: run `date +%Y%m%d` first, then use the printed date string in the subsequent command.
+
+## Improving the Agent Workflow
+
+When you encounter a permission prompt for a command that is **clearly safe and non-destructive** (read-only operations, local file writes, running tests, formatting tools, creating branches), and the prompt could be avoided with a better command pattern:
+
+1. **Work around it immediately** using the patterns above or by splitting the command.
+2. **File a GitHub issue** to track the improvement:
+   - Title: `[DX] Agent workflow: avoid prompt for <description>`
+   - Label: `type/dx` (create it if it doesn't exist)
+   - Body: describe what triggered the prompt, the workaround used, and the specific line to add to the "Unattended Operation Patterns" section of `.claude/instructions.md`.
+
+Do **not** file issues for prompts that exist for good reason — pushing to remote, opening PRs, merging, deploying, deleting branches, or any action that affects shared state. Those prompts are intentional.
 
 ## Things You Must Not Do
 
