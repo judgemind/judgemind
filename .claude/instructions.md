@@ -13,18 +13,21 @@ Judgemind is a free, open-source legal research platform replacing Trellis.law. 
 
 ## Before Starting Any Task
 
-**Step 0 — Set up a worktree (always, no exceptions):**
+**Step 0 — Set up a worktree and tmp directory (always, no exceptions):**
 Every agent session must work in an isolated git worktree, never directly in `judgemind-bootstrap`. Do this before reading issues or touching any code:
 ```
 git -C /Users/drewthaler/judgemind/judgemind-bootstrap worktree list   # find next free slot (worker-2, worker-3, …)
 date +%Y%m%d                                                            # get today's date as a literal (avoid $() prompts)
 git -C /Users/drewthaler/judgemind/judgemind-bootstrap worktree add \
     /Users/drewthaler/judgemind/judgemind-worker-N -b worker-N/session-YYYYMMDD
+mkdir -p /tmp/judgemind-worker-N                                        # isolated tmp for this worker
 ```
 All subsequent work happens inside `/Users/drewthaler/judgemind/judgemind-worker-N`.
-When the session is done, remove the worktree:
+Use `/tmp/judgemind-worker-N/` for **all** temporary files (scripts, PR bodies, etc.) — never write to `/tmp/` directly, as other workers may be using the same filenames.
+When the session is done, remove the worktree and tmp dir:
 ```
 git -C /Users/drewthaler/judgemind/judgemind-bootstrap worktree remove /Users/drewthaler/judgemind/judgemind-worker-N
+rm -rf /tmp/judgemind-worker-N
 ```
 
 1. Read the GitHub Issue thoroughly, including linked issues and documents.
@@ -127,8 +130,9 @@ Investigation tasks produce documentation, not code:
 These patterns avoid permission prompts and allow the agent to run without interruption:
 
 - **Git outside the working directory:** use `git -C /absolute/path <subcommand>` instead of `cd /path && git <subcommand>`. Compound commands with `cd` trigger a safety prompt.
-- **Multi-line content for `gh` commands:** write to a temp file and use `--body-file /tmp/file.txt`. Never use backticks or command substitution inside quoted strings passed to `gh`.
-- **Multi-line Python scripts:** write to `/tmp/script.py`, then run with `.venv/bin/python3 /tmp/script.py`. Embedding multi-line code in `-c "..."` breaks pattern matching and triggers a prompt.
+- **Multi-line content for `gh` commands:** write to a temp file and use `--body-file /tmp/judgemind-worker-N/file.txt`. Never use backticks or command substitution inside quoted strings passed to `gh`.
+- **Multi-line Python scripts:** write to `/tmp/judgemind-worker-N/script.py`, then run with `.venv/bin/python3 /tmp/judgemind-worker-N/script.py`. Embedding multi-line code in `-c "..."` breaks pattern matching and triggers a prompt.
+- **Tmp directory isolation:** always use `/tmp/judgemind-worker-N/` (your worker's subdirectory) for all temp files, never `/tmp/` directly. Multiple workers share the same `/tmp` and will collide on common filenames like `script.py` or `pr_body.txt`.
 - **Dynamic values in shell commands:** never embed `$(...)` command substitution inside a command that needs approval. Run the inner command first to get the value, then use the literal value in the next command. Example: run `date +%Y%m%d` first, then use the printed date string in the subsequent command.
 
 ## Improving the Agent Workflow
