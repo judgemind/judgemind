@@ -13,6 +13,20 @@ Judgemind is a free, open-source legal research platform replacing Trellis.law. 
 
 ## Before Starting Any Task
 
+**Step 0 — Set up a worktree (always, no exceptions):**
+Every agent session must work in an isolated git worktree, never directly in `judgemind-bootstrap`. Do this before reading issues or touching any code:
+```
+git -C /Users/drewthaler/judgemind/judgemind-bootstrap worktree list   # find next free slot (worker-2, worker-3, …)
+date +%Y%m%d                                                            # get today's date as a literal (avoid $() prompts)
+git -C /Users/drewthaler/judgemind/judgemind-bootstrap worktree add \
+    /Users/drewthaler/judgemind/judgemind-worker-N -b worker-N/session-YYYYMMDD
+```
+All subsequent work happens inside `/Users/drewthaler/judgemind/judgemind-worker-N`.
+When the session is done, remove the worktree:
+```
+git -C /Users/drewthaler/judgemind/judgemind-bootstrap worktree remove /Users/drewthaler/judgemind/judgemind-worker-N
+```
+
 1. Read the GitHub Issue thoroughly, including linked issues and documents.
 2. Check `docs/specs/` for relevant guidance (product spec, architecture spec, investigation reports).
 3. Look at existing code for patterns. Be consistent with what's already there.
