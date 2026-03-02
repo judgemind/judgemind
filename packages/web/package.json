@@ -1,0 +1,35 @@
+{
+  "name": "judgemind-web",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Judgemind web application",
+  "license": "Apache-2.0",
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "next lint",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "next": "^14.1",
+    "react": "^18.2",
+    "react-dom": "^18.2",
+    "@apollo/client": "^3.9",
+    "graphql": "^16.8"
+  },
+  "devDependencies": {
+    "@types/node": "^20",
+    "@types/react": "^18",
+    "@types/react-dom": "^18",
+    "eslint": "^8",
+    "eslint-config-next": "^14.1",
+    "typescript": "^5.4",
+    "vitest": "^1.4",
+    "tailwindcss": "^3.4",
+    "postcss": "^8",
+    "autoprefixer": "^10"
+  }
+}
