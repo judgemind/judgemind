@@ -265,6 +265,10 @@ These patterns avoid permission prompts and allow the agent to run without inter
 - **No quoted strings in compound shell commands:** a hook rejects commands that contain quoted characters (e.g. `"text"` or `'text'`) combined with `&&` or `;`. Instead of `cmd1 && echo "label" && cmd2`, make two separate tool calls — one per command.
 - **Commit messages and multi-line strings:** use the Write tool to write content to a file, then reference it — never use `$(cat <<EOF ...)` or heredoc in a shell command. For commits: `git commit -F {worktree}/tmp/commit_msg.txt`. For PR bodies: `gh pr create --body-file {worktree}/tmp/pr_body.txt`.
 
+## Session Triggers
+
+- When the user says "let's go" or an equivalent phrase, immediately execute Steps 1–3 of "Starting a New Session" (claim worker number, create worktree, pick next task), then work autonomously without waiting for further instruction.
+
 ## Improving the Agent Workflow
 
 When you encounter a permission prompt for a command that is **clearly safe and non-destructive** (read-only operations, local file writes, running tests, formatting tools, creating branches), and the prompt could be avoided with a better command pattern:
@@ -276,6 +280,11 @@ When you encounter a permission prompt for a command that is **clearly safe and 
    - Body: describe what triggered the prompt, the workaround used, and the specific line to add to the "Unattended Operation Patterns" section of `.claude/instructions.md`.
 
 Do **not** file issues for prompts that exist for good reason — pushing to remote, opening PRs, merging, deploying, deleting branches, or any action that affects shared state. Those prompts are intentional.
+
+## Memory and Instructions Updates
+
+- Prefer updating `.claude/instructions.md` in the repo over writing to `~/.claude` project memory.
+- Only use local `~/.claude` memory for things that cannot go in the repo (e.g. cross-repo or cross-project preferences).
 
 ## Things You Must Not Do
 

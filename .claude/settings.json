@@ -25,6 +25,7 @@
       "Bash(git -C* merge*)",
       "Bash(git -C* tag*)",
       "Bash(git -C* stash*)",
+      "Bash(git -C* worktree*)",
       "Bash(gh issue*)",
       "Bash(gh pr*)",
       "Bash(gh api*)",
