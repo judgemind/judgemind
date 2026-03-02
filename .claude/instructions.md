@@ -11,29 +11,69 @@ Judgemind is a free, open-source legal research platform replacing Trellis.law. 
 - **Self-funded and free.** Every architecture decision must consider cost. Prefer fixed-cost over usage-based. Never assume unlimited budget.
 - **API-first.** The web app is a client of the API. Every UI feature has an API endpoint.
 
-## Before Starting Any Task
+## Starting a New Session
 
-**Step 0 — Set up a worktree and tmp directory (always, no exceptions):**
-Every agent session must work in an isolated git worktree, never directly in `judgemind-bootstrap`. Do this before reading issues or touching any code:
+Do these steps in order at the start of every session. Do not wait for the user to tell you which worker number to use or which task to work on.
+
+### Step 1 — Claim your worker number
+
+Run:
 ```
-git -C /Users/drewthaler/judgemind/judgemind-bootstrap worktree list   # find next free slot (worker-2, worker-3, …)
-date +%Y%m%d                                                            # get today's date as a literal (avoid $() prompts)
+git -C /Users/drewthaler/judgemind/judgemind-bootstrap worktree list
+```
+Examine the output. Worker paths follow the pattern `judgemind-worker-N`. Pick the **lowest integer N ≥ 1 not already present** in the list. That is your worker number for this session.
+
+Example: if the list shows `judgemind-worker-1` and `judgemind-worker-3`, claim **worker-2**.
+
+### Step 2 — Create your worktree and tmp directory (always, no exceptions)
+
+Every agent session must work in an isolated git worktree, never directly in `judgemind-bootstrap`. Run these sequentially (split to avoid `$()` prompts):
+```
+date +%Y%m%d
 git -C /Users/drewthaler/judgemind/judgemind-bootstrap worktree add \
     /Users/drewthaler/judgemind/judgemind-worker-N -b worker-N/session-YYYYMMDD
-mkdir -p /tmp/judgemind-worker-N                                        # isolated tmp for this worker
+mkdir -p /tmp/judgemind-worker-N
 ```
 All subsequent work happens inside `/Users/drewthaler/judgemind/judgemind-worker-N`.
 Use `/tmp/judgemind-worker-N/` for **all** temporary files (scripts, PR bodies, etc.) — never write to `/tmp/` directly, as other workers may be using the same filenames.
+
 When the session is done, remove the worktree and tmp dir:
 ```
 git -C /Users/drewthaler/judgemind/judgemind-bootstrap worktree remove /Users/drewthaler/judgemind/judgemind-worker-N
 rm -rf /tmp/judgemind-worker-N
 ```
 
-1. Read the GitHub Issue thoroughly, including linked issues and documents.
-2. Check `docs/specs/` for relevant guidance (product spec, architecture spec, investigation reports).
-3. Look at existing code for patterns. Be consistent with what's already there.
-4. If the task is unclear or you need a decision from the maintainer, comment on the issue explaining what you need, label it `status/blocked`, and move to another task. Do not guess on ambiguous requirements.
+### Step 3 — Pick the next task
+
+List open issues ready for an agent:
+```
+gh issue list --repo judgemind/judgemind \
+    --label agent/ready --state open \
+    --json number,title,assignees,labels \
+    --limit 20
+```
+
+Pick the highest-priority unassigned issue. Priority order:
+1. `priority/critical` → `priority/high` → `priority/medium` → `priority/low`
+2. Within the same priority, prefer lower issue numbers (older issues).
+3. Skip issues already assigned to another agent unless their worktree no longer exists in the `worktree list` output.
+
+Then claim it:
+```
+gh issue edit <N> --repo judgemind/judgemind --add-assignee @me
+gh issue comment <N> --repo judgemind/judgemind --body "Picking this up in worker-N."
+```
+
+### Step 4 — Work autonomously until the PR is green
+
+- Read the issue thoroughly, including linked issues.
+- Check `docs/specs/` for relevant guidance (product spec, architecture spec, investigation reports).
+- Look at existing code for patterns. Be consistent with what's already there.
+- If the issue is large or ambiguous, break it into sub-tasks first (see **Creating Sub-Tasks**), label them `agent/ready`, then pick up the first sub-task.
+- If you need a decision from the maintainer, comment on the issue, label it `status/blocked`, and pick up a different task. Do not guess on ambiguous requirements.
+- Implement, run pre-commit checks, commit, push, and open a PR.
+- After pushing, watch CI and iterate until green (see **Git Workflow**).
+- Do not ask the user for confirmation during any of these steps.
 
 ## Code Standards
 
@@ -88,7 +128,11 @@ These mirror the exact CI steps. A commit that fails any of these checks will br
 - Commit messages follow conventional commits: `feat(scraping): implement OC PDF link scraper (#42)`
 - During initial bringup (before CI exists): push directly to `main` is fine.
 - Once CI is established: branch from `main` (`feat/issue-{N}-short-description`), open a PR, wait for CI to pass, then request human review. Never merge your own PRs.
-- **A PR is not ready until CI is green.** After pushing, always run `gh run watch <run-id> --repo judgemind/judgemind --exit-status --compact` and confirm the run passes before reporting the PR as complete. If CI fails, fix it and push again — repeat until green.
+- **A PR is not done until CI is green.** After pushing, watch the run:
+  ```
+  gh run watch <run-id> --repo judgemind/judgemind --exit-status --compact
+  ```
+  If CI fails, diagnose the failure, fix it, push again, and repeat until green. Only then comment on the issue linking the PR and add the `status/review` label.
 
 ## Creating Sub-Tasks
 
