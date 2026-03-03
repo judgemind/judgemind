@@ -17,6 +17,11 @@ module "networking" {
   environment = "dev"
 }
 
+module "ecr" {
+  source      = "../../modules/ecr"
+  environment = "dev"
+}
+
 module "document_archive" {
   source = "../../modules/storage"
 
@@ -37,6 +42,11 @@ module "ses" {
 
   environment    = "dev"
   sending_domain = "judgemind.org"
+}
+
+output "ecr_repository_url" {
+  description = "Dev ECR repository URL for scraper images"
+  value       = module.ecr.repository_url
 }
 
 output "vpc_id" {
