@@ -13,3 +13,9 @@ variable "ecs_task_execution_role_arn" {
   type        = string
   default     = null
 }
+
+variable "enable_pull_policy" {
+  description = "Whether to create the ECR repository pull policy for ECS. Use this instead of checking the role ARN to avoid unknown-at-plan-time count errors."
+  type        = bool
+  default     = false
+}
