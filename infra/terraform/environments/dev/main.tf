@@ -1,12 +1,21 @@
-# Dev environment — document archive S3 bucket.
+# Dev environment infrastructure.
 #
-# The dev bucket (judgemind-document-archive-dev) was initially created manually.
-# To bring it under Terraform management, import it once:
+# Manages networking, storage, IAM, and email for the dev environment.
+# ECS (compute) and Redis (cache) modules will be added here once those
+# modules are implemented.
+#
+# The dev S3 bucket (judgemind-document-archive-dev) was initially created
+# manually. To bring it under Terraform management, import it once:
 #
 #   terraform import module.document_archive.aws_s3_bucket.document_archive \
 #     judgemind-document-archive-dev
 #
 # Object lock is intentionally disabled for dev so test objects can be deleted.
+
+module "networking" {
+  source      = "../../modules/networking"
+  environment = "dev"
+}
 
 module "document_archive" {
   source = "../../modules/storage"
@@ -28,6 +37,31 @@ module "ses" {
 
   environment    = "dev"
   sending_domain = "judgemind.org"
+}
+
+output "vpc_id" {
+  description = "Dev VPC ID"
+  value       = module.networking.vpc_id
+}
+
+output "private_subnet_ids" {
+  description = "Dev private subnet IDs (ECS tasks, RDS, ElastiCache)"
+  value       = module.networking.private_subnet_ids
+}
+
+output "public_subnet_ids" {
+  description = "Dev public subnet IDs (NAT gateway, future ALB)"
+  value       = module.networking.public_subnet_ids
+}
+
+output "nat_gateway_public_ip" {
+  description = "Dev NAT gateway public IP (whitelist on court websites if needed)"
+  value       = module.networking.nat_gateway_public_ip
+}
+
+output "ses_domain_verification_token" {
+  description = "Dev SES domain verification TXT record value"
+  value       = module.ses.domain_verification_token
 }
 
 output "ses_configuration_set_name" {
