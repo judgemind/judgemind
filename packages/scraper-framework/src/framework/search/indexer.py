@@ -30,7 +30,7 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 from .mapping import TENTATIVE_RULINGS_ALIAS, create_index
@@ -113,7 +113,7 @@ class IndexingConsumer:
             "document_id": document_id,
             "s3_key": s3_key,
             "content_hash": content_hash,
-            "indexed_at": datetime.now(datetime.UTC).isoformat(),
+            "indexed_at": datetime.now(UTC).isoformat(),
         }
 
         self._os.index(
