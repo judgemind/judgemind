@@ -1,0 +1,181 @@
+#!/usr/bin/env bash
+# pre-push hook: run lint/format checks on changed packages before pushing.
+#
+# Prevents pushes that would fail CI on issues that take <1 second to check
+# locally (missing ruff format, unused imports, terraform fmt, etc.).
+#
+# Detects which packages have changes being pushed and runs the appropriate
+# checks for each package type (Python, TypeScript, Terraform).
+#
+# Ref: https://github.com/judgemind/judgemind/issues/81
+
+set -uo pipefail
+
+# -------------------------------------------------------------------
+# Determine the range of commits being pushed
+# -------------------------------------------------------------------
+# Git passes the remote name and URL as positional args.
+# Stdin contains lines of the form:
+#   <local ref> <local sha> <remote ref> <remote sha>
+# We diff between remote sha and local sha to find changed files.
+
+remote="$1"
+# url="$2"  # unused
+
+failures=0
+
+while read -r local_ref local_sha remote_sha _rest; do
+    # Skip delete pushes
+    if [ "$local_sha" = "0000000000000000000000000000000000000000" ]; then
+        continue
+    fi
+
+    # If this is a new branch (remote_sha is all zeros), diff against the
+    # merge-base with origin/main so we check all new commits.
+    if [ "$remote_sha" = "0000000000000000000000000000000000000000" ]; then
+        # Fetch main to make sure we have it
+        git fetch "$remote" main --quiet 2>/dev/null || true
+        merge_base=$(git merge-base "$local_sha" "$remote/main" 2>/dev/null || echo "")
+        if [ -z "$merge_base" ]; then
+            echo "pre-push: could not determine merge-base with $remote/main; skipping checks" >&2
+            continue
+        fi
+        remote_sha="$merge_base"
+    fi
+
+    # Get list of changed files
+    changed_files=$(git diff --name-only "$remote_sha" "$local_sha" 2>/dev/null)
+    if [ -z "$changed_files" ]; then
+        continue
+    fi
+
+    # ---------------------------------------------------------------
+    # Detect changed packages
+    # ---------------------------------------------------------------
+    changed_python_pkgs=""
+    changed_ts_pkgs=""
+    changed_terraform=false
+
+    while IFS= read -r file; do
+        # Python packages: packages/<pkg>/ with a pyproject.toml
+        if [[ "$file" =~ ^packages/([^/]+)/ ]]; then
+            pkg="${BASH_REMATCH[1]}"
+            if [ -f "packages/$pkg/pyproject.toml" ]; then
+                if ! echo "$changed_python_pkgs" | grep -qw "$pkg" 2>/dev/null; then
+                    changed_python_pkgs="$changed_python_pkgs $pkg"
+                fi
+            elif [ -f "packages/$pkg/package.json" ]; then
+                if ! echo "$changed_ts_pkgs" | grep -qw "$pkg" 2>/dev/null; then
+                    changed_ts_pkgs="$changed_ts_pkgs $pkg"
+                fi
+            fi
+        fi
+
+        # Terraform: infra/terraform/
+        if [[ "$file" =~ ^infra/terraform/ ]]; then
+            changed_terraform=true
+        fi
+    done <<< "$changed_files"
+
+    # ---------------------------------------------------------------
+    # Run checks for Python packages
+    # ---------------------------------------------------------------
+    for pkg in $changed_python_pkgs; do
+        pkg_dir="packages/$pkg"
+        echo "pre-push: checking Python package '$pkg'..." >&2
+
+        # Prefer the package's own venv ruff, fall back to global
+        if [ -x "$pkg_dir/.venv/bin/ruff" ]; then
+            ruff_cmd="$pkg_dir/.venv/bin/ruff"
+        elif command -v ruff &>/dev/null; then
+            ruff_cmd="ruff"
+        else
+            echo "  WARNING: ruff not found for $pkg — skipping lint/format checks" >&2
+            echo "  Install with: pip install ruff" >&2
+            continue
+        fi
+
+        # Determine check directories (src/ and tests/ if they exist)
+        check_dirs=""
+        [ -d "$pkg_dir/src" ] && check_dirs="$check_dirs $pkg_dir/src"
+        [ -d "$pkg_dir/tests" ] && check_dirs="$check_dirs $pkg_dir/tests"
+        if [ -z "$check_dirs" ]; then
+            check_dirs="$pkg_dir"
+        fi
+
+        # ruff check (lint)
+        if ! $ruff_cmd check $check_dirs 2>&1; then
+            echo "" >&2
+            echo "  FAILED: ruff check for $pkg" >&2
+            echo "  Fix with: $ruff_cmd check --fix $check_dirs && $ruff_cmd format $check_dirs" >&2
+            failures=$((failures + 1))
+        fi
+
+        # ruff format --check
+        if ! $ruff_cmd format --check $check_dirs 2>&1; then
+            echo "" >&2
+            echo "  FAILED: ruff format for $pkg" >&2
+            echo "  Fix with: $ruff_cmd format $check_dirs" >&2
+            failures=$((failures + 1))
+        fi
+    done
+
+    # ---------------------------------------------------------------
+    # Run checks for TypeScript packages
+    # ---------------------------------------------------------------
+    for pkg in $changed_ts_pkgs; do
+        pkg_dir="packages/$pkg"
+        echo "pre-push: checking TypeScript package '$pkg'..." >&2
+
+        if [ ! -f "$pkg_dir/package.json" ]; then
+            continue
+        fi
+
+        # Check if npm run lint is available
+        if (cd "$pkg_dir" && npm run lint --if-present 2>&1) | grep -q "Missing script"; then
+            echo "  No lint script found for $pkg — skipping" >&2
+        else
+            if ! (cd "$pkg_dir" && npm run lint 2>&1); then
+                echo "" >&2
+                echo "  FAILED: npm run lint for $pkg" >&2
+                echo "  Fix lint issues in $pkg_dir before pushing." >&2
+                failures=$((failures + 1))
+            fi
+        fi
+    done
+
+    # ---------------------------------------------------------------
+    # Run checks for Terraform
+    # ---------------------------------------------------------------
+    if [ "$changed_terraform" = true ]; then
+        echo "pre-push: checking Terraform formatting..." >&2
+
+        if command -v terraform &>/dev/null; then
+            if ! terraform fmt -check -recursive infra/terraform/ 2>&1; then
+                echo "" >&2
+                echo "  FAILED: terraform fmt" >&2
+                echo "  Fix with: terraform fmt -recursive infra/terraform/" >&2
+                failures=$((failures + 1))
+            fi
+        else
+            echo "  WARNING: terraform not found — skipping fmt check" >&2
+        fi
+    fi
+
+done
+
+# -------------------------------------------------------------------
+# Report results
+# -------------------------------------------------------------------
+if [ "$failures" -gt 0 ]; then
+    echo "" >&2
+    echo "====================================================================" >&2
+    echo "pre-push: $failures check(s) failed. Push aborted." >&2
+    echo "" >&2
+    echo "Fix the issues above and try again. These are the same checks" >&2
+    echo "that CI runs — catching them locally saves time and CI minutes." >&2
+    echo "====================================================================" >&2
+    exit 1
+fi
+
+exit 0

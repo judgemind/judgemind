@@ -58,6 +58,11 @@ mkdir -p $REPO_ROOT/worktrees/worker-N/tmp
 
 **If `git worktree add` fails** (exit code non-zero, e.g. "fatal: '<path>' already exists"), another instance raced you to that number. Do not proceed. Re-run Step 1 (`worktree prune` then `worktree list`) to get a fresh snapshot, pick a new N, and retry Step 2. Repeat until `git worktree add` succeeds.
 
+Then configure the repo to use the shared git hooks (enables the pre-push lint gate):
+```
+git -C $REPO_ROOT/worktrees/worker-N config core.hooksPath .githooks
+```
+
 All subsequent work happens inside `$REPO_ROOT/worktrees/worker-N`.
 Use `{worktree}/tmp/` for **all** temporary files (scripts, PR bodies, etc.) — this directory is gitignored and scoped to your worker, so there are no permission prompts and no collisions between workers.
 
@@ -153,6 +158,8 @@ When operating as an agent in this repo:
 
 **Every agent (including subagents) MUST run ALL applicable checks locally and verify they pass BEFORE pushing a branch or creating a PR.** Skipping these wastes CI minutes and blocks merges. A PR that fails CI is not done — it's broken.
 
+> **Note:** The `.githooks/pre-push` hook automatically runs ruff, eslint, and terraform fmt on changed packages before every push. If you configured `core.hooksPath` during worktree setup (Step 2), common lint and format issues will be caught automatically and the push will be blocked until they are fixed. This does **not** replace running the full check suite (including tests) — it only gates on fast, deterministic checks.
+
 Run checks from each package directory you modified. If any check fails, fix it before pushing.
 
 **Python packages** (from the package directory, e.g. `packages/scraper-framework/`):
@@ -185,6 +192,24 @@ terraform validate
 ```
 
 ### Subagent Responsibilities
+
+#### Worktree Isolation (mandatory for branch work)
+
+When spawning subagents that will work on **different branches** (e.g. fixing multiple PRs in parallel, implementing features on separate branches), the parent agent **MUST** pass `isolation: "worktree"` in the Agent tool call. Without this, subagents share the parent's working directory and will cause branch checkout conflicts, stash races, and leave the parent on the wrong branch.
+
+Rules:
+- **Never run `git checkout` or `git switch` in the parent's working directory from a subagent.** This changes the branch for the parent and every other subagent sharing that directory.
+- If the `isolation: "worktree"` parameter is not available (e.g. the subagent is doing non-git work like API calls or documentation generation), the subagent must **not** check out a different branch in the shared working directory.
+- A subagent that needs to work on a specific branch but is not already worktree-isolated must create its own worktree before doing any branch-specific work:
+  ```
+  git -C $REPO_ROOT worktree add $REPO_ROOT/worktrees/sub-<task> <branch>
+  ```
+  and clean it up when finished:
+  ```
+  git -C $REPO_ROOT worktree remove $REPO_ROOT/worktrees/sub-<task>
+  ```
+
+#### Pre-PR Checks
 
 When you spawn a subagent to implement a feature or fix, the subagent MUST:
 1. Install dependencies and set up the venv/node_modules.
