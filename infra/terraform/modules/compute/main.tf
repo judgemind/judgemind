@@ -88,6 +88,14 @@ resource "aws_security_group" "scraper" {
     cidr_blocks = ["0.0.0.0/0"]
   }
 
+  egress {
+    description = "Redis event bus"
+    from_port   = 6379
+    to_port     = 6379
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
   tags = {
     project     = "judgemind"
     environment = var.environment
@@ -114,9 +122,10 @@ resource "aws_ecs_task_definition" "scraper" {
       image     = "${var.ecr_repository_url}:${var.scraper_image_tag}"
       essential = true
 
-      environment = [
-        { name = "ENVIRONMENT", value = var.environment }
-      ]
+      environment = concat(
+        [{ name = "ENVIRONMENT", value = var.environment }],
+        var.redis_url != "" ? [{ name = "REDIS_URL", value = var.redis_url }] : []
+      )
 
       logConfiguration = {
         logDriver = "awslogs"

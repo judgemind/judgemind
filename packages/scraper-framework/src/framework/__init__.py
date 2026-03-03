@@ -1,6 +1,7 @@
 """Judgemind scraper framework — public API."""
 
 from .base import BaseScraper
+from .event_bus import RedisEventBus
 from .events import EventBus
 from .hashing import content_changed, sha256_hex
 from .models import (
@@ -23,6 +24,7 @@ __all__ = [
     "ContentFormat",
     "DocumentCapturedEvent",
     "EventBus",
+    "RedisEventBus",
     "S3Archiver",
     "ScraperConfig",
     "ScraperHealthEvent",

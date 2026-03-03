@@ -1,8 +1,13 @@
-"""Scraper runner — CLI entrypoint that runs scrapers with S3 archival wired in.
+"""Scraper runner — CLI entrypoint that runs scrapers with S3 archival and
+Redis event bus wired in.
 
 Reads JUDGEMIND_ARCHIVE_BUCKET from the environment. When set, every captured
 document is archived to S3 via S3Archiver. When unset, scrapers run in
 local-only mode (no archival) for development.
+
+Reads REDIS_URL from the environment. When set, document.captured and
+scraper.health events are emitted to Redis Streams. When unset, event
+emission is silently skipped.
 
 Usage:
     python -m framework.runner                  # run all registered scrapers
@@ -16,6 +21,7 @@ import sys
 
 import structlog
 
+from .event_bus import RedisEventBus
 from .models import ScraperConfig
 from .storage import S3Archiver
 
@@ -80,6 +86,8 @@ def run_scrapers(scraper_ids: list[str] | None = None) -> int:
     else:
         logger.info("S3 archival disabled (JUDGEMIND_ARCHIVE_BUCKET not set)")
 
+    event_bus = RedisEventBus.from_env()
+
     registry = _build_registry()
 
     # Filter to requested scrapers
@@ -102,7 +110,7 @@ def run_scrapers(scraper_ids: list[str] | None = None) -> int:
         log.info("Running scraper")
 
         config: ScraperConfig = config_factory(s3_bucket=bucket)
-        scraper = scraper_cls(config=config, archiver=archiver)
+        scraper = scraper_cls(config=config, archiver=archiver, event_bus=event_bus)
 
         try:
             health = scraper.run()
