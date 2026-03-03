@@ -15,7 +15,8 @@ PDF filename pattern: CV{LOC}{DEPT}{MMDDYY}.pdf
 
 Judge/dept extraction from PDF page 1 text (two observed formats):
   Primary:  "Department R12 - Judge Kory Mathewson"
-            (handles regular dash, em-dash, and no-space before dash like "R17- Judge")
+            (handles regular dash, en-dash U+2013, em-dash U+2014, and
+            no-space before dash like "R17- Judge")
   Fallback: "BEFORE THE HONORABLE JOSEPH WIDMAN"
             (title-cased on extraction; used by Dept S36)
 
@@ -44,9 +45,9 @@ _LINK_TEXT_RE = re.compile(r"CV(?P<department>[A-Z]\d+)\d{6}\.pdf", re.IGNORECAS
 
 # PDF header primary format: "Department R12 - Judge Kory Mathewson"
 # \S+? (non-greedy) handles "R17-" (dash attached) as well as "R12 -" (spaced)
-# Character class [-\u2013] covers ASCII hyphen and Unicode en-dash
+# Character class [-\u2013\u2014] covers ASCII hyphen, en-dash, and em-dash
 _DEPT_JUDGE_RE = re.compile(
-    r"Department\s+\S+?\s*[-\u2013]\s*Judge\s+(?P<judge_name>[^\n]+)",
+    r"Department\s+\S+?\s*[-\u2013\u2014]\s*Judge\s+(?P<judge_name>[^\n]+)",
     re.IGNORECASE,
 )
 
