@@ -28,7 +28,13 @@ Substitute this literal value everywhere `$REPO_ROOT` appears in these instructi
 
 ### Step 1 — Claim your worker number
 
-First prune stale worktree references (idempotent, safe to always run):
+First, make sure the main repo is on `main` and up to date:
+```
+git -C $REPO_ROOT checkout main
+git -C $REPO_ROOT pull origin main
+```
+
+Then prune stale worktree references (idempotent, safe to always run):
 ```
 git -C $REPO_ROOT worktree prune
 ```
