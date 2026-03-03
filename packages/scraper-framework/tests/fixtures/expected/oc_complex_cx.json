@@ -1,13 +1,15 @@
 {
   "_fixture": "oc_complex_cx.pdf",
-  "_description": "OC Complex Civil Department — Dept CX101 (Judge William D. Claster). 2-page PDF, future date, 0 case numbers matched by DD-DDDDDDDD regex.",
+  "_description": "OC Complex Civil Department — Dept CX101 (Judge William D. Claster). 2-page PDF, future date, 9 case numbers matched.",
   "_link_text": "CLASTER, William D. - Dept CX101",
   "_captured": "2026-03-02",
   "courthouse": "Complex Civil Department",
   "department": "CX101",
   "judge_name": "William D. Claster",
   "page_count": 2,
-  "case_count": 0,
+  "case_count": 9,
+  "primary_case_number": "2023-01301305",
+  "case_number_format": "DDDD-DDDDDDDD",
   "hearing_date": "March 06, 2026",
   "ruling_text_contains": [
     "LAW & MOTION CALENDAR",
@@ -15,6 +17,5 @@
     "CX-101",
     "JUDGE WILLIAM D. CLASTER"
   ],
-  "_edge_case": "complex_civil_format",
-  "_notes": "Complex Civil uses slightly different PDF layout. Future date (3 days out). OC case number regex DD-DDDDDDDD may not match all CX cases — complex cases may use different number format. ZERO case numbers extracted."
+  "_notes": "Complex Civil uses slightly different PDF layout. Future date (3 days out). Uses 4-digit year prefix case numbers (DDDD-DDDDDDDD)."
 }

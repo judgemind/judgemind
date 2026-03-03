@@ -1,20 +1,20 @@
 {
   "_fixture": "oc_central_c34.pdf",
-  "_description": "OC Central Justice Center — Dept C34 (Judge H. Shaina Colover). 27 pages, 1 case number found.",
+  "_description": "OC Central Justice Center — Dept C34 (Judge H. Shaina Colover). 27 pages, 11 case numbers found (mix of DD and DDDD year prefixes).",
   "_link_text": "COLOVER, H. Shaina - Dept C34",
   "_captured": "2026-03-02",
   "courthouse": "Central Justice Center",
   "department": "C34",
   "judge_name": "H. Shaina Colover",
   "page_count": 27,
-  "case_count_min": 1,
-  "primary_case_number": "25-01506656",
-  "case_number_format": "DD-DDDDDDDD",
+  "case_count": 11,
+  "primary_case_number": "2024-01393434",
+  "case_number_format": "mixed",
   "hearing_date": "February 26, 2026",
   "ruling_text_contains": [
     "TENTATIVE RULINGS",
     "DEPT C34",
     "JUDGE H. SHAINA COLOVER"
   ],
-  "_notes": "Alternate Central Justice Center format. Hearing on Thursday at 1:30 PM. Header states 10:00 AM posting time."
+  "_notes": "Alternate Central Justice Center format. Hearing on Thursday at 1:30 PM. Header states 10:00 AM posting time. Uses a mix of DD-DDDDDDDD and DDDD-DDDDDDDD case number formats."
 }

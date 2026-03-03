@@ -15,7 +15,10 @@ PDF structure (Apkarian / Dept C25, 36 pages):
   Page 1 header: "TENTATIVE RULINGS / LAW & MOTION / DEPT C25 / Judge Gassia Apkarian"
   Hearing dates like "February 24, 2026"
   Case rows:  "<line#> <Case Name>  <motion>\n<case_number>  ..."
-  Case number format: DD-DDDDDDDD  (e.g. "25-01455183")
+  Case number formats:
+    Central/West:        DD-DDDDDDDD   (e.g. "25-01455183")
+    Costa Mesa/Complex:  DDDD-DDDDDDDD (e.g. "2024-01437598")
+    North:               No case numbers in PDF text (only line numbers + case names)
 
 Courthouse mapping (derived from dept code prefix):
   CX*  → Complex Civil Department (Laguna Hills)
@@ -89,7 +92,8 @@ class OCTentativeRulingsScraper(PdfLinkScraper):
             link_text_re=_oc_link_text_re(),
             courthouse_from_dept=_oc_courthouse,
             verify_ssl=True,
-            case_number_re=re.compile(r"\b\d{2}-\d{8}\b"),
+            # Central/West use DD-DDDDDDDD; Costa Mesa/Complex use DDDD-DDDDDDDD
+            case_number_re=re.compile(r"\b\d{2,4}-\d{8}\b"),
         )
         super().__init__(config, pdf_config=pdf_config, **kwargs)
 

@@ -139,9 +139,61 @@ def test_oc_pdf_text_contains_case_numbers() -> None:
 
     pdf_bytes = _load_bytes("oc_apkarian_c25.pdf")
     text = _extract_pdf_text(pdf_bytes)
-    # OC case number format: DD-DDDDDDDD
-    matches = re.findall(r"\b\d{2}-\d{8}\b", text)
+    # OC case number format: DD-DDDDDDDD or DDDD-DDDDDDDD
+    matches = re.findall(r"\b\d{2,4}-\d{8}\b", text)
     assert len(matches) >= 10  # real fixture has 14
+
+
+def test_oc_costa_mesa_case_numbers() -> None:
+    """Regression: Costa Mesa PDFs use DDDD-DDDDDDDD format (#47)."""
+    import re
+
+    pdf_bytes = _load_bytes("oc_costa_mesa_cm.pdf")
+    text = _extract_pdf_text(pdf_bytes)
+    # Costa Mesa uses 4-digit year prefix: e.g. 2024-01437598
+    matches = re.findall(r"\b\d{2,4}-\d{8}\b", text)
+    assert len(matches) >= 5, f"Expected >= 5 case numbers from Costa Mesa, got {len(matches)}"
+    assert "2024-01437598" in matches
+
+
+def test_oc_complex_civil_case_numbers() -> None:
+    """Regression: Complex Civil (CX) PDFs use DDDD-DDDDDDDD format (#47)."""
+    import re
+
+    pdf_bytes = _load_bytes("oc_complex_cx.pdf")
+    text = _extract_pdf_text(pdf_bytes)
+    # Complex Civil uses 4-digit year prefix: e.g. 2023-01301305
+    matches = re.findall(r"\b\d{2,4}-\d{8}\b", text)
+    assert len(matches) >= 9, f"Expected >= 9 case numbers from Complex Civil, got {len(matches)}"
+    assert "2023-01301305" in matches
+
+
+def test_oc_north_has_no_case_numbers() -> None:
+    """North Justice Center PDFs do not contain case numbers (#47)."""
+    import re
+
+    pdf_bytes = _load_bytes("oc_north_n.pdf")
+    text = _extract_pdf_text(pdf_bytes)
+    # North PDFs list cases by line number + name only — no case numbers
+    matches = re.findall(r"\b\d{2,4}-\d{8}\b", text)
+    assert len(matches) == 0, f"Expected 0 case numbers from North, got {len(matches)}"
+    # But the PDF should still contain ruling text
+    assert "TENTATIVE RULINGS" in text or "Tentative" in text
+
+
+def test_oc_central_c34_mixed_formats() -> None:
+    """C34 uses a mix of DD-DDDDDDDD and DDDD-DDDDDDDD case numbers (#47)."""
+    import re
+
+    pdf_bytes = _load_bytes("oc_central_c34.pdf")
+    text = _extract_pdf_text(pdf_bytes)
+    matches = re.findall(r"\b\d{2,4}-\d{8}\b", text)
+    assert len(matches) >= 10, f"Expected >= 10 case numbers from C34, got {len(matches)}"
+    # Should find both 2-digit and 4-digit year prefixes
+    has_short = any(len(m.split("-")[0]) == 2 for m in matches)
+    has_long = any(len(m.split("-")[0]) == 4 for m in matches)
+    assert has_short, "C34 should have DD-DDDDDDDD format case numbers"
+    assert has_long, "C34 should have DDDD-DDDDDDDD format case numbers"
 
 
 def test_riv_pdf_text_extraction() -> None:
