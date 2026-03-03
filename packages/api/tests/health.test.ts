@@ -36,7 +36,7 @@ describe('POST /graphql', () => {
     expect(body.data).toEqual({ __typename: 'Query' });
   });
 
-  it('exposes Case, Judge, Ruling types in schema introspection', async () => {
+  it('exposes Case, Judge, Ruling, Document, Party types in schema introspection', async () => {
     const res = await app.inject({
       method: 'POST',
       url: '/graphql',
@@ -56,19 +56,32 @@ describe('POST /graphql', () => {
     expect(typeNames).toContain('Judge');
     expect(typeNames).toContain('Ruling');
     expect(typeNames).toContain('Court');
+    expect(typeNames).toContain('Document');
+    expect(typeNames).toContain('Party');
+    expect(typeNames).toContain('CaseConnection');
+    expect(typeNames).toContain('RulingConnection');
+    expect(typeNames).toContain('JudgeConnection');
   });
 
-  it('returns cases array (empty or error depending on DB availability)', async () => {
+  it('cases query returns a CaseConnection (edges + pageInfo)', async () => {
     const res = await app.inject({
       method: 'POST',
       url: '/graphql',
       headers: { 'content-type': 'application/json' },
-      payload: JSON.stringify({ query: '{ cases { id caseNumber } }' }),
+      payload: JSON.stringify({
+        query: '{ cases { edges { node { id caseNumber } cursor } pageInfo { hasNextPage endCursor } } }',
+      }),
     });
     expect(res.statusCode).toBe(200);
     const body = JSON.parse(res.body);
-    // When DB is available: data.cases is an array
-    // When DB is unavailable: errors array is present
-    expect(body.data !== undefined || body.errors !== undefined).toBe(true);
+    // When DB available: data.cases has edges + pageInfo shape
+    // When DB unavailable: errors array is present
+    if (body.data?.cases) {
+      expect(body.data.cases).toHaveProperty('edges');
+      expect(body.data.cases).toHaveProperty('pageInfo');
+      expect(Array.isArray(body.data.cases.edges)).toBe(true);
+    } else {
+      expect(body.errors).toBeDefined();
+    }
   });
 });

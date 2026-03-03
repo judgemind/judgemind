@@ -19,6 +19,7 @@
   "dependencies": {
     "@apollo/server": "^4.10",
     "bcryptjs": "^2.4",
+    "dataloader": "^2.2.3",
     "fastify": "^4.26",
     "graphql": "^16.8",
     "jsonwebtoken": "^9.0",
