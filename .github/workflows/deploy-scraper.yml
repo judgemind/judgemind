@@ -1,0 +1,62 @@
+name: Deploy Scraper
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "packages/scraper-framework/**"
+      - ".github/workflows/deploy-scraper.yml"
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Optional image tag (defaults to git SHA)"
+        required: false
+        type: string
+
+concurrency:
+  group: deploy-scraper-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-and-push:
+    name: Build and Push to ECR
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-west-2
+
+      - name: Get AWS account ID
+        id: aws-account
+        run: |
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          echo "id=$ACCOUNT_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push Docker image
+        env:
+          ECR_REGISTRY: ${{ steps.aws-account.outputs.id }}.dkr.ecr.us-west-2.amazonaws.com
+          ECR_REPOSITORY: judgemind/scraper
+        run: |
+          IMAGE_BASE="$ECR_REGISTRY/$ECR_REPOSITORY"
+          SHA_TAG="${GITHUB_SHA::7}"
+          BRANCH_TAG="${GITHUB_REF_NAME//\//-}"
+          CUSTOM_TAG="${{ inputs.image_tag }}"
+
+          TAGS=("-t" "$IMAGE_BASE:$SHA_TAG" "-t" "$IMAGE_BASE:latest" "-t" "$IMAGE_BASE:$BRANCH_TAG")
+
+          if [ -n "$CUSTOM_TAG" ]; then
+            TAGS+=("-t" "$IMAGE_BASE:$CUSTOM_TAG")
+          fi
+
+          docker build "${TAGS[@]}" packages/scraper-framework/
+          docker push "$IMAGE_BASE" --all-tags
