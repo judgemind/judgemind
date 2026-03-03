@@ -135,6 +135,13 @@ def test_sb_judge_s36_honorable_fallback() -> None:
     assert _sb_judge_from_pdf_text(text) == "Joseph Widman"
 
 
+def test_sb_judge_em_dash_format() -> None:
+    # Defensive: em-dash (U+2014) should also be handled even though only en-dash
+    # has been observed so far in live PDFs.
+    text = "Department S99 \u2014 Judge Jane Doe\nSome ruling text"
+    assert _sb_judge_from_pdf_text(text) == "Jane Doe"
+
+
 def test_sb_judge_returns_none_for_empty_text() -> None:
     assert _sb_judge_from_pdf_text("") is None
     assert _sb_judge_from_pdf_text("No header here") is None
