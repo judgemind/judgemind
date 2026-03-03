@@ -156,8 +156,10 @@ class IndexingConsumer:
         "Records" key (SQS/SNS trigger pattern).
         """
         if "Records" in event:
-            events = [json.loads(r.get("body", r.get("Sns", {}).get("Message", "{}")))
-                      for r in event["Records"]]
+            events = [
+                json.loads(r.get("body", r.get("Sns", {}).get("Message", "{}")))
+                for r in event["Records"]
+            ]
         else:
             events = [event]
 

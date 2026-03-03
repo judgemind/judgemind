@@ -73,9 +73,7 @@ class TestIndexDocument:
         self, consumer: IndexingConsumer, mock_opensearch: MagicMock, sample_event: dict
     ) -> None:
         # Document already indexed with same hash
-        mock_opensearch.get.return_value = {
-            "_source": {"content_hash": "abc123def456"}
-        }
+        mock_opensearch.get.return_value = {"_source": {"content_hash": "abc123def456"}}
 
         result = consumer.index_document(sample_event)
 
@@ -86,9 +84,7 @@ class TestIndexDocument:
         self, consumer: IndexingConsumer, mock_opensearch: MagicMock, sample_event: dict
     ) -> None:
         # Document exists but with different hash
-        mock_opensearch.get.return_value = {
-            "_source": {"content_hash": "old_hash_value"}
-        }
+        mock_opensearch.get.return_value = {"_source": {"content_hash": "old_hash_value"}}
 
         result = consumer.index_document(sample_event)
 
@@ -117,8 +113,11 @@ class TestIndexDocument:
         assert call_kwargs["body"]["ruling_text"] == "Inline ruling text"
 
     def test_fetches_text_from_s3(
-        self, consumer: IndexingConsumer, mock_opensearch: MagicMock, mock_s3: MagicMock,
-        sample_event: dict
+        self,
+        consumer: IndexingConsumer,
+        mock_opensearch: MagicMock,
+        mock_s3: MagicMock,
+        sample_event: dict,
     ) -> None:
         mock_opensearch.get.side_effect = Exception("not found")
 
@@ -137,8 +136,14 @@ class TestIndexBatch:
         mock_opensearch.get.side_effect = Exception("not found")
 
         events = [
-            {"document_id": f"doc-{i}", "case_number": f"BC{i}", "court": "Test",
-             "county": "Test", "state": "CA", "content_hash": f"hash{i}"}
+            {
+                "document_id": f"doc-{i}",
+                "case_number": f"BC{i}",
+                "court": "Test",
+                "county": "Test",
+                "state": "CA",
+                "content_hash": f"hash{i}",
+            }
             for i in range(3)
         ]
 
@@ -153,10 +158,22 @@ class TestIndexBatch:
         mock_opensearch.index.side_effect = [Exception("write error"), None]
 
         events = [
-            {"document_id": "doc-fail", "case_number": "BC1", "court": "Test",
-             "county": "Test", "state": "CA", "content_hash": "h1"},
-            {"document_id": "doc-ok", "case_number": "BC2", "court": "Test",
-             "county": "Test", "state": "CA", "content_hash": "h2"},
+            {
+                "document_id": "doc-fail",
+                "case_number": "BC1",
+                "court": "Test",
+                "county": "Test",
+                "state": "CA",
+                "content_hash": "h1",
+            },
+            {
+                "document_id": "doc-ok",
+                "case_number": "BC2",
+                "court": "Test",
+                "county": "Test",
+                "state": "CA",
+                "content_hash": "h2",
+            },
         ]
 
         count = consumer.index_batch(events)
