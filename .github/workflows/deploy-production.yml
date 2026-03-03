@@ -1,42 +1,32 @@
-name: Deploy Scraper
+name: Deploy Scraper (Production)
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - "packages/scraper-framework/**"
-      - ".github/workflows/deploy-scraper.yml"
   workflow_dispatch:
     inputs:
       image_tag:
-        description: "Optional image tag (defaults to git SHA)"
-        required: false
+        description: "Image tag to deploy (SHA or tag from ECR)"
+        required: true
         type: string
 
 concurrency:
-  group: deploy-scraper-${{ github.ref }}
+  group: deploy-scraper-production
   cancel-in-progress: false
 
 env:
   AWS_REGION: us-west-2
   ECR_REPOSITORY: judgemind/scraper
-  ECS_CLUSTER: judgemind-dev
-  TASK_FAMILY: judgemind-scraper-dev
-  SCHEDULER_NAME: judgemind-scraper-dev
+  ECS_CLUSTER: judgemind-production
+  TASK_FAMILY: judgemind-scraper-production
+  SCHEDULER_NAME: judgemind-scraper-production
   CONTAINER_NAME: scraper
 
 jobs:
-  build-and-push:
-    name: Build and Push to ECR
+  deploy-production:
+    name: Deploy to Production
     runs-on: ubuntu-latest
-    outputs:
-      image_uri: ${{ steps.build.outputs.image_uri }}
-      sha_tag: ${{ steps.build.outputs.sha_tag }}
+    environment: production
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -50,45 +40,6 @@ jobs:
           ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
           echo "id=$ACCOUNT_ID" >> "$GITHUB_OUTPUT"
 
-      - name: Login to Amazon ECR
-        uses: aws-actions/amazon-ecr-login@v2
-
-      - name: Build and push Docker image
-        id: build
-        env:
-          ECR_REGISTRY: ${{ steps.aws-account.outputs.id }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com
-        run: |
-          IMAGE_BASE="$ECR_REGISTRY/$ECR_REPOSITORY"
-          SHA_TAG="${GITHUB_SHA::7}"
-          BRANCH_TAG="${GITHUB_REF_NAME//\//-}"
-          CUSTOM_TAG="${{ inputs.image_tag }}"
-
-          TAGS=("-t" "$IMAGE_BASE:$SHA_TAG" "-t" "$IMAGE_BASE:latest" "-t" "$IMAGE_BASE:$BRANCH_TAG")
-
-          if [ -n "$CUSTOM_TAG" ]; then
-            TAGS+=("-t" "$IMAGE_BASE:$CUSTOM_TAG")
-          fi
-
-          docker build "${TAGS[@]}" packages/scraper-framework/
-          docker push "$IMAGE_BASE" --all-tags
-
-          echo "image_uri=$IMAGE_BASE:$SHA_TAG" >> "$GITHUB_OUTPUT"
-          echo "sha_tag=$SHA_TAG" >> "$GITHUB_OUTPUT"
-
-  deploy-staging:
-    name: Deploy to Staging (dev)
-    needs: build-and-push
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ env.AWS_REGION }}
-
       - name: Set pending deployment status
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -99,9 +50,24 @@ jobs:
             "https://api.github.com/repos/${{ github.repository }}/statuses/${{ github.sha }}" \
             -d '{
               "state": "pending",
-              "description": "Deploying scraper to staging...",
-              "context": "deploy/staging"
+              "description": "Deploying scraper to production...",
+              "context": "deploy/production"
             }'
+
+      - name: Verify image exists in ECR
+        env:
+          ECR_REGISTRY: ${{ steps.aws-account.outputs.id }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com
+          IMAGE_TAG: ${{ inputs.image_tag }}
+        run: |
+          echo "Verifying image $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG exists..."
+          aws ecr describe-images \
+            --repository-name "$ECR_REPOSITORY" \
+            --image-ids imageTag="$IMAGE_TAG" \
+            --query 'imageDetails[0].imageTags' \
+            --output json
+
+          echo "image_uri=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> "$GITHUB_OUTPUT"
+        id: verify-image
 
       - name: Get current task definition
         id: current-task-def
@@ -117,7 +83,7 @@ jobs:
       - name: Register new task definition revision
         id: new-task-def
         env:
-          IMAGE_URI: ${{ needs.build-and-push.outputs.image_uri }}
+          IMAGE_URI: ${{ steps.verify-image.outputs.image_uri }}
         run: |
           # Update the container image in the task definition
           jq --arg image "$IMAGE_URI" --arg container "$CONTAINER_NAME" \
@@ -183,7 +149,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           DEPLOY_STATUS: ${{ job.status == 'success' && 'success' || 'failure' }}
-          DEPLOY_DESC: ${{ job.status == 'success' && 'Scraper deployed to staging' || 'Staging deployment failed' }}
+          DEPLOY_DESC: ${{ job.status == 'success' && 'Scraper deployed to production' || 'Production deployment failed' }}
         run: |
           curl -s -X POST \
             -H "Authorization: token $GH_TOKEN" \
@@ -192,5 +158,5 @@ jobs:
             -d "{
               \"state\": \"$DEPLOY_STATUS\",
               \"description\": \"$DEPLOY_DESC\",
-              \"context\": \"deploy/staging\"
+              \"context\": \"deploy/production\"
             }"
