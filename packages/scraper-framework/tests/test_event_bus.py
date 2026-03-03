@@ -11,7 +11,6 @@ import redis
 from framework import CapturedDocument, ContentFormat, ScraperHealthEvent
 from framework.event_bus import RedisEventBus
 
-
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
