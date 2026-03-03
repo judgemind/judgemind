@@ -81,3 +81,9 @@ variable "alert_email" {
   type        = string
   default     = ""
 }
+
+variable "redis_url" {
+  description = "Redis connection URL for the event bus (e.g. redis://host:6379). Empty string disables event emission."
+  type        = string
+  default     = ""
+}

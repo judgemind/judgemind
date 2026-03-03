@@ -1,7 +1,6 @@
 # Dev environment infrastructure.
 #
 # Manages networking, storage, IAM, compute, and email for the dev environment.
-# Redis (cache) module will be added here once implemented.
 #
 # The dev S3 bucket (judgemind-document-archive-dev) was initially created
 # manually. To bring it under Terraform management, import it once:
@@ -39,6 +38,16 @@ module "iam_scraper" {
   document_archive_bucket_arn = module.document_archive.bucket_arn
 }
 
+module "cache" {
+  source = "../../modules/cache"
+
+  environment        = "dev"
+  vpc_id             = module.networking.vpc_id
+  private_subnet_ids = module.networking.private_subnet_ids
+  node_type          = "cache.t4g.micro"
+  num_cache_nodes    = 1
+}
+
 module "compute" {
   source = "../../modules/compute"
 
@@ -47,6 +56,7 @@ module "compute" {
   private_subnet_ids    = module.networking.private_subnet_ids
   ecr_repository_url    = module.ecr.repository_url
   scraper_task_role_arn = module.iam_scraper.role_arn
+  redis_url             = "redis://${module.cache.redis_endpoint}:${module.cache.redis_port}"
 
   # Dev: 0.5 vCPU, 1 GB RAM, daily schedule at 6 AM PT
   task_cpu            = 512
@@ -153,4 +163,14 @@ output "scraper_security_group_id" {
 output "scraper_log_group" {
   description = "Dev CloudWatch log group for scraper output"
   value       = module.compute.log_group_name
+}
+
+output "redis_endpoint" {
+  description = "Dev Redis endpoint for the event bus"
+  value       = module.cache.redis_endpoint
+}
+
+output "redis_port" {
+  description = "Dev Redis port"
+  value       = module.cache.redis_port
 }
