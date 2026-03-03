@@ -60,7 +60,7 @@ resource "aws_ecr_lifecycle_policy" "scraper" {
 # Repository policy: restrict pull to the ECS task execution role.
 # Only created once the execution role ARN is available (compute module, #20).
 resource "aws_ecr_repository_policy" "scraper" {
-  count      = var.ecs_task_execution_role_arn != null ? 1 : 0
+  count      = var.enable_pull_policy ? 1 : 0
   repository = aws_ecr_repository.scraper.name
 
   policy = jsonencode({
