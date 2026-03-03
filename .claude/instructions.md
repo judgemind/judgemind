@@ -101,7 +101,7 @@ gh issue comment <N> --repo judgemind/judgemind --body "Picking this up in worke
 - Look at existing code for patterns. Be consistent with what's already there.
 - If the issue is large or ambiguous, break it into sub-tasks first (see **Creating Sub-Tasks**), label them `agent/ready`, then pick up the first sub-task.
 - If you need a decision from the maintainer, comment on the issue, label it `status/blocked`, and pick up a different task. Do not guess on ambiguous requirements.
-- Implement, run pre-commit checks, commit, push, and open a PR.
+- Implement, run **all** pre-PR checks (see "Pre-PR Checks" section — lint, format, AND tests), commit, push, and open a PR.
 - After pushing, watch CI and iterate until green (see **Git Workflow**).
 - Do not ask the user for confirmation during any of these steps.
 
@@ -149,30 +149,50 @@ When operating as an agent in this repo:
 - Never commit large binary files. Use `.gitignore`.
 - Write clear docstrings/comments for non-obvious logic. Court data has many edge cases — document them.
 
-## Pre-Commit Checks (Required Before Every Commit)
+## Pre-PR Checks (MANDATORY — No Exceptions)
 
-Run these checks locally before committing to catch CI failures early.
+**Every agent (including subagents) MUST run ALL applicable checks locally and verify they pass BEFORE pushing a branch or creating a PR.** Skipping these wastes CI minutes and blocks merges. A PR that fails CI is not done — it's broken.
+
+Run checks from each package directory you modified. If any check fails, fix it before pushing.
 
 **Python packages** (from the package directory, e.g. `packages/scraper-framework/`):
 ```
-.venv/bin/ruff check src/ tests/
-.venv/bin/ruff format --check src/ tests/
+.venv/bin/ruff check src/ tests/           # Lint (rules: E, F, I, N, UP, ANN)
+.venv/bin/ruff format --check src/ tests/   # Format check
+.venv/bin/pytest tests/ -v --tb=short       # Tests (scraper-framework also supports -n auto)
 ```
-If either fails, fix the errors before committing. Auto-fix most lint issues with `ruff check --fix`.
+If lint fails, auto-fix with `.venv/bin/ruff check --fix src/ tests/` then `.venv/bin/ruff format src/ tests/`.
+
+Common ruff pitfalls that agents keep hitting:
+- **I001** (unsorted imports): `ruff check --fix` resolves this. Always run it.
+- **F401** (unused imports): Remove any import you don't actually use.
+- **UP017** (datetime.UTC): Use `datetime.now(datetime.UTC)`, not `datetime.now(timezone.utc)`.
+- **Format ≠ Lint**: `ruff check` and `ruff format` are **separate commands**. You must run BOTH.
 
 **TypeScript packages** (from the package directory):
 ```
-npm run lint
-npm run typecheck
+npm run lint                                # ESLint
+npm run typecheck                           # tsc --noEmit
+npm test                                    # Vitest
 ```
+For `packages/web/`, also run `npm run build` to catch build errors.
 
 **Terraform** (from `infra/terraform/`):
 ```
 terraform fmt -check -recursive
+terraform init -backend=false
 terraform validate
 ```
 
-These mirror the exact CI steps. A commit that fails any of these checks will break CI.
+### Subagent Responsibilities
+
+When you spawn a subagent to implement a feature or fix, the subagent MUST:
+1. Install dependencies and set up the venv/node_modules.
+2. Run ALL lint, format, and test commands listed above for every package it touched.
+3. Fix any failures before committing.
+4. Only push after all local checks pass.
+
+Do NOT rely on CI to catch issues that local checks would have caught. If a subagent creates a PR that fails CI on checks it could have run locally, that is a bug in the subagent's workflow.
 
 ## Git Workflow
 
