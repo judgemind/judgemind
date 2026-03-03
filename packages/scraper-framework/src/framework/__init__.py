@@ -14,6 +14,7 @@ from .models import (
     ValidationStatus,
 )
 from .retry import retry_async, retry_sync
+from .runner import get_scraper_ids, run_scrapers
 from .storage import S3Archiver, build_s3_key
 
 __all__ = [
@@ -30,6 +31,8 @@ __all__ = [
     "ValidationStatus",
     "build_s3_key",
     "content_changed",
+    "get_scraper_ids",
+    "run_scrapers",
     "retry_async",
     "retry_sync",
     "sha256_hex",
