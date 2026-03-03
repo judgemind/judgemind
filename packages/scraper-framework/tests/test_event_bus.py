@@ -6,7 +6,6 @@ import os
 from datetime import datetime
 from unittest.mock import MagicMock, patch
 
-import pytest
 import redis
 
 from framework import CapturedDocument, ContentFormat, ScraperHealthEvent
