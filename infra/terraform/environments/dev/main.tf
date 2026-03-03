@@ -23,6 +23,28 @@ module "iam_scraper" {
   document_archive_bucket_arn = module.document_archive.bucket_arn
 }
 
+module "ses" {
+  source = "../../modules/ses"
+
+  environment    = "dev"
+  sending_domain = "judgemind.org"
+}
+
+output "ses_configuration_set_name" {
+  description = "Dev SES configuration set name (set as SES_CONFIGURATION_SET in API)"
+  value       = module.ses.configuration_set_name
+}
+
+output "ses_notifications_topic_arn" {
+  description = "Dev SNS topic ARN for SES bounce/complaint notifications"
+  value       = module.ses.ses_notifications_topic_arn
+}
+
+output "ses_dkim_tokens" {
+  description = "Dev DKIM CNAME tokens — add each as <token>._domainkey.judgemind.org CNAME <token>.dkim.amazonses.com"
+  value       = module.ses.dkim_tokens
+}
+
 output "document_archive_bucket" {
   description = "Dev document archive bucket name"
   value       = module.document_archive.bucket_id
