@@ -206,8 +206,9 @@ resource "aws_scheduler_schedule" "scraper" {
   name        = "judgemind-scraper-${var.environment}"
   description = "Daily scraper run for ${var.environment}"
 
-  schedule_expression = var.schedule_expression
-  state               = var.schedule_enabled ? "ENABLED" : "DISABLED"
+  schedule_expression          = var.schedule_expression
+  schedule_expression_timezone = var.schedule_timezone
+  state                        = var.schedule_enabled ? "ENABLED" : "DISABLED"
 
   flexible_time_window {
     mode                      = "FLEXIBLE"
@@ -229,5 +230,74 @@ resource "aws_scheduler_schedule" "scraper" {
         assign_public_ip = false
       }
     }
+  }
+}
+
+# ─── Scraper Failure Alerts ──────────────────────────────────────────────────
+# CloudWatch alarm that fires when no scraper task has completed successfully
+# in the past 24 hours. Uses a metric filter on the log group to detect
+# successful completion, then alarms when the count drops to zero.
+
+resource "aws_sns_topic" "scraper_alerts" {
+  count = var.enable_alerts ? 1 : 0
+
+  name = "judgemind-scraper-alerts-${var.environment}"
+
+  tags = {
+    project     = "judgemind"
+    environment = var.environment
+  }
+}
+
+resource "aws_sns_topic_subscription" "scraper_alerts_email" {
+  count = var.enable_alerts && var.alert_email != "" ? 1 : 0
+
+  topic_arn = aws_sns_topic.scraper_alerts[0].arn
+  protocol  = "email"
+  endpoint  = var.alert_email
+}
+
+# Publish a custom metric whenever a scraper run completes (exit code 0).
+# The scraper framework logs "scraper_run_complete" on successful finish.
+# If no such log line appears in 24h, the alarm fires.
+
+resource "aws_cloudwatch_log_metric_filter" "scraper_success" {
+  count = var.enable_alerts ? 1 : 0
+
+  name           = "judgemind-scraper-success-${var.environment}"
+  pattern        = "\"scraper_run_complete\""
+  log_group_name = aws_cloudwatch_log_group.scraper.name
+
+  metric_transformation {
+    name          = "ScraperSuccessCount"
+    namespace     = "Judgemind/Scraper"
+    value         = "1"
+    default_value = "0"
+  }
+}
+
+resource "aws_cloudwatch_metric_alarm" "scraper_no_success" {
+  count = var.enable_alerts ? 1 : 0
+
+  alarm_name        = "judgemind-scraper-no-success-24h-${var.environment}"
+  alarm_description = "No successful scraper run in the past 24 hours (${var.environment})"
+
+  namespace   = "Judgemind/Scraper"
+  metric_name = "ScraperSuccessCount"
+  statistic   = "Sum"
+
+  comparison_operator = "LessThanOrEqualToThreshold"
+  threshold           = 0
+  period              = 86400
+  evaluation_periods  = 1
+  datapoints_to_alarm = 1
+  treat_missing_data  = "breaching"
+
+  alarm_actions = [aws_sns_topic.scraper_alerts[0].arn]
+  ok_actions    = [aws_sns_topic.scraper_alerts[0].arn]
+
+  tags = {
+    project     = "judgemind"
+    environment = var.environment
   }
 }

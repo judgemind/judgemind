@@ -48,12 +48,14 @@ module "compute" {
   ecr_repository_url    = module.ecr.repository_url
   scraper_task_role_arn = module.iam_scraper.role_arn
 
-  # Dev: 0.5 vCPU, 1 GB RAM, daily schedule enabled
+  # Dev: 0.5 vCPU, 1 GB RAM, daily schedule at 6 AM PT
   task_cpu            = 512
   task_memory         = 1024
-  schedule_expression = "rate(1 day)"
+  schedule_expression = "cron(0 6 * * ? *)"
+  schedule_timezone   = "America/Los_Angeles"
   schedule_enabled    = true
   log_retention_days  = 14
+  enable_alerts       = true
 }
 
 module "ses" {
