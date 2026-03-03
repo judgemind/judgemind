@@ -45,6 +45,11 @@ output "ses_dkim_tokens" {
   value       = module.ses.dkim_tokens
 }
 
+output "ses_domain_verification_token" {
+  description = "Production SES domain verification TXT record value — add as _amazonses.judgemind.org TXT <value>"
+  value       = module.ses.domain_verification_token
+}
+
 output "document_archive_bucket" {
   description = "Production document archive bucket name"
   value       = module.document_archive.bucket_id
