@@ -51,20 +51,12 @@ variable "sending_domain" {
   default     = "judgemind.org"
 }
 
-# ─── Data Sources ──────────────────────────────────────────
-
-data "aws_vpc" "default" {
-  default = true
-}
-
-data "aws_subnets" "default" {
-  filter {
-    name   = "vpc-id"
-    values = [data.aws_vpc.default.id]
-  }
-}
-
 # ─── Modules ───────────────────────────────────────────────
+
+module "networking" {
+  source      = "./modules/networking"
+  environment = var.environment
+}
 
 module "storage" {
   source      = "./modules/storage"
@@ -75,8 +67,8 @@ module "storage" {
 module "database" {
   source      = "./modules/database"
   environment = var.environment
-  vpc_id      = data.aws_vpc.default.id
-  subnet_ids  = data.aws_subnets.default.ids
+  vpc_id      = module.networking.vpc_id
+  subnet_ids  = module.networking.private_subnet_ids
 }
 
 module "iam_scraper" {
@@ -90,11 +82,6 @@ module "ses" {
   environment    = var.environment
   sending_domain = var.sending_domain
 }
-
-# module "networking" {
-#   source      = "./modules/networking"
-#   environment = var.environment
-# }
 
 # module "compute" {
 #   source      = "./modules/compute"
