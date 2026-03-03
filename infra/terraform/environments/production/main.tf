@@ -1,4 +1,7 @@
-# Production environment — document archive S3 bucket.
+# Production environment infrastructure.
+#
+# Manages networking, storage, IAM, compute, and email for the production
+# environment. Redis (cache) module will be added here once implemented.
 #
 # Object lock is enabled in COMPLIANCE mode. Once this environment is applied,
 # objects in the bucket cannot be deleted or overwritten for the retention
@@ -6,6 +9,22 @@
 #
 # Retention period: 7 years (configurable via object_lock_retention_years).
 # This matches standard legal records retention requirements.
+#
+# The compute schedule is disabled by default. Run the scraper manually at
+# least once before enabling the EventBridge schedule in a follow-up PR.
+
+module "networking" {
+  source      = "../../modules/networking"
+  environment = "production"
+}
+
+module "ecr" {
+  source      = "../../modules/ecr"
+  environment = "production"
+
+  enable_pull_policy          = true
+  ecs_task_execution_role_arn = module.compute.task_execution_role_arn
+}
 
 module "document_archive" {
   source = "../../modules/storage"
@@ -23,11 +42,58 @@ module "iam_scraper" {
   document_archive_bucket_arn = module.document_archive.bucket_arn
 }
 
+module "compute" {
+  source = "../../modules/compute"
+
+  environment           = "production"
+  vpc_id                = module.networking.vpc_id
+  private_subnet_ids    = module.networking.private_subnet_ids
+  ecr_repository_url    = module.ecr.repository_url
+  scraper_task_role_arn = module.iam_scraper.role_arn
+
+  # Production: 1 vCPU, 2 GB RAM, daily schedule disabled until first manual test
+  task_cpu            = 1024
+  task_memory         = 2048
+  schedule_expression = "rate(1 day)"
+  schedule_enabled    = false
+  log_retention_days  = 30
+}
+
 module "ses" {
   source = "../../modules/ses"
 
   environment    = "production"
   sending_domain = "judgemind.org"
+}
+
+output "ecr_repository_url" {
+  description = "Production ECR repository URL for scraper images"
+  value       = module.ecr.repository_url
+}
+
+output "vpc_id" {
+  description = "Production VPC ID"
+  value       = module.networking.vpc_id
+}
+
+output "private_subnet_ids" {
+  description = "Production private subnet IDs (ECS tasks, RDS, ElastiCache)"
+  value       = module.networking.private_subnet_ids
+}
+
+output "public_subnet_ids" {
+  description = "Production public subnet IDs (NAT gateway, future ALB)"
+  value       = module.networking.public_subnet_ids
+}
+
+output "nat_gateway_public_ip" {
+  description = "Production NAT gateway public IP (whitelist on court websites if needed)"
+  value       = module.networking.nat_gateway_public_ip
+}
+
+output "ses_domain_verification_token" {
+  description = "Production SES domain verification TXT record value"
+  value       = module.ses.domain_verification_token
 }
 
 output "ses_configuration_set_name" {
@@ -63,4 +129,29 @@ output "scraper_role_arn" {
 output "scraper_instance_profile_arn" {
   description = "Production scraper EC2 instance profile ARN"
   value       = module.iam_scraper.instance_profile_arn
+}
+
+output "ecs_cluster_name" {
+  description = "Production ECS cluster name"
+  value       = module.compute.cluster_name
+}
+
+output "ecs_cluster_arn" {
+  description = "Production ECS cluster ARN"
+  value       = module.compute.cluster_arn
+}
+
+output "scraper_task_definition_arn" {
+  description = "Production scraper Fargate task definition ARN"
+  value       = module.compute.task_definition_arn
+}
+
+output "scraper_security_group_id" {
+  description = "Production scraper security group ID (outbound HTTPS only)"
+  value       = module.compute.security_group_id
+}
+
+output "scraper_log_group" {
+  description = "Production CloudWatch log group for scraper output"
+  value       = module.compute.log_group_name
 }
