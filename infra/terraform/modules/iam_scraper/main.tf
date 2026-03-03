@@ -4,9 +4,8 @@
 # Principle of least privilege: s3:PutObject on archive objects only.
 # No s3:GetObject, s3:DeleteObject, or bucket-level permissions are granted.
 #
-# Trust policy is scoped to EC2. When the scraper compute environment is
-# finalised (ECS task role, Lambda, or GitHub Actions OIDC), update the
-# assume_role_policy and the associated instance_profile accordingly.
+# Trust policy allows both EC2 (legacy/local) and ECS tasks to assume this
+# role. ECS Fargate tasks assume it via the task role configuration.
 
 resource "aws_iam_role" "scraper" {
   name        = "judgemind-scraper-${var.environment}"
@@ -18,6 +17,11 @@ resource "aws_iam_role" "scraper" {
       {
         Effect    = "Allow"
         Principal = { Service = "ec2.amazonaws.com" }
+        Action    = "sts:AssumeRole"
+      },
+      {
+        Effect    = "Allow"
+        Principal = { Service = "ecs-tasks.amazonaws.com" }
         Action    = "sts:AssumeRole"
       }
     ]

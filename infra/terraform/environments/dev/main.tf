@@ -1,8 +1,7 @@
 # Dev environment infrastructure.
 #
-# Manages networking, storage, IAM, and email for the dev environment.
-# ECS (compute) and Redis (cache) modules will be added here once those
-# modules are implemented.
+# Manages networking, storage, IAM, compute, and email for the dev environment.
+# Redis (cache) module will be added here once implemented.
 #
 # The dev S3 bucket (judgemind-document-archive-dev) was initially created
 # manually. To bring it under Terraform management, import it once:
@@ -20,6 +19,8 @@ module "networking" {
 module "ecr" {
   source      = "../../modules/ecr"
   environment = "dev"
+
+  ecs_task_execution_role_arn = module.compute.task_execution_role_arn
 }
 
 module "document_archive" {
@@ -35,6 +36,23 @@ module "iam_scraper" {
 
   environment                 = "dev"
   document_archive_bucket_arn = module.document_archive.bucket_arn
+}
+
+module "compute" {
+  source = "../../modules/compute"
+
+  environment           = "dev"
+  vpc_id                = module.networking.vpc_id
+  private_subnet_ids    = module.networking.private_subnet_ids
+  ecr_repository_url    = module.ecr.repository_url
+  scraper_task_role_arn = module.iam_scraper.role_arn
+
+  # Dev: 0.5 vCPU, 1 GB RAM, daily schedule enabled
+  task_cpu            = 512
+  task_memory         = 1024
+  schedule_expression = "rate(1 day)"
+  schedule_enabled    = true
+  log_retention_days  = 14
 }
 
 module "ses" {
@@ -107,4 +125,29 @@ output "scraper_role_arn" {
 output "scraper_instance_profile_arn" {
   description = "Dev scraper EC2 instance profile ARN"
   value       = module.iam_scraper.instance_profile_arn
+}
+
+output "ecs_cluster_name" {
+  description = "Dev ECS cluster name"
+  value       = module.compute.cluster_name
+}
+
+output "ecs_cluster_arn" {
+  description = "Dev ECS cluster ARN"
+  value       = module.compute.cluster_arn
+}
+
+output "scraper_task_definition_arn" {
+  description = "Dev scraper Fargate task definition ARN"
+  value       = module.compute.task_definition_arn
+}
+
+output "scraper_security_group_id" {
+  description = "Dev scraper security group ID (outbound HTTPS only)"
+  value       = module.compute.security_group_id
+}
+
+output "scraper_log_group" {
+  description = "Dev CloudWatch log group for scraper output"
+  value       = module.compute.log_group_name
 }
