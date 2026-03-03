@@ -47,9 +47,15 @@ variable "task_memory" {
 }
 
 variable "schedule_expression" {
-  description = "EventBridge schedule expression for scraper runs (e.g. rate(1 day))"
+  description = "EventBridge schedule expression — rate (e.g. rate(1 day)) or cron (e.g. cron(0 13 * * ? *) for 6 AM PT)"
   type        = string
   default     = "rate(1 day)"
+}
+
+variable "schedule_timezone" {
+  description = "IANA timezone for the EventBridge schedule (only applies to cron expressions)"
+  type        = string
+  default     = "UTC"
 }
 
 variable "schedule_enabled" {
@@ -62,4 +68,16 @@ variable "log_retention_days" {
   description = "Number of days to retain CloudWatch log events"
   type        = number
   default     = 30
+}
+
+variable "enable_alerts" {
+  description = "Whether to create CloudWatch alarms and SNS topic for scraper failure alerts"
+  type        = bool
+  default     = false
+}
+
+variable "alert_email" {
+  description = "Email address for scraper failure alert notifications (optional, SNS subscription)"
+  type        = string
+  default     = ""
 }

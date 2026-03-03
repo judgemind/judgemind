@@ -125,6 +125,12 @@ def run_scrapers(scraper_ids: list[str] | None = None) -> int:
             )
             had_failure = True
 
+    if not had_failure:
+        # This marker is matched by the CloudWatch metric filter
+        # (Judgemind/Scraper ScraperSuccessCount). If this log line does not
+        # appear within 24 hours the "no-success" alarm fires.
+        logger.info("scraper_run_complete", scrapers=[e[0] for e in entries])
+
     return 1 if had_failure else 0
 
 

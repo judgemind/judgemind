@@ -32,3 +32,8 @@ output "schedule_arn" {
   description = "ARN of the EventBridge Scheduler schedule"
   value       = aws_scheduler_schedule.scraper.arn
 }
+
+output "alerts_topic_arn" {
+  description = "ARN of the SNS topic for scraper failure alerts (empty if alerts disabled)"
+  value       = var.enable_alerts ? aws_sns_topic.scraper_alerts[0].arn : ""
+}

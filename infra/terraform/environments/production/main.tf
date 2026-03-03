@@ -54,9 +54,11 @@ module "compute" {
   # Production: 1 vCPU, 2 GB RAM, daily schedule disabled until first manual test
   task_cpu            = 1024
   task_memory         = 2048
-  schedule_expression = "rate(1 day)"
+  schedule_expression = "cron(0 6 * * ? *)"
+  schedule_timezone   = "America/Los_Angeles"
   schedule_enabled    = false
   log_retention_days  = 30
+  enable_alerts       = true
 }
 
 module "ses" {
