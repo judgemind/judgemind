@@ -1,6 +1,6 @@
 {
   "_fixture": "oc_north_n.pdf",
-  "_description": "OC North Justice Center — Dept N6 (Judge Julianne S. Bancroft). 26-page PDF, 0 case numbers matched.",
+  "_description": "OC North Justice Center — Dept N6 (Judge Julianne S. Bancroft). 26-page PDF, 0 case numbers — PDF omits case numbers entirely.",
   "_link_text": "BANCROFT, Julianne S. - Dept. N6",
   "_captured": "2026-03-02",
   "courthouse": "North Justice Center",
@@ -13,6 +13,6 @@
     "Civility",
     "zealous representation"
   ],
-  "_edge_case": "no_standard_case_numbers",
-  "_notes": "North Justice Center PDF has 26 pages but DD-DDDDDDDD regex finds zero case numbers. Possible different case number format or embedded-only numbers. This is a known gap: need to investigate N-prefix case number formats."
+  "_edge_case": "no_case_numbers_in_pdf",
+  "_notes": "North Justice Center PDFs do not include case numbers anywhere in the text. Cases are listed by line number (101, 102, ...) and case name only. This is a format limitation of this courthouse's PDF generation, not a regex issue."
 }
