@@ -72,6 +72,19 @@ module "compute" {
   enable_alerts       = true
 }
 
+module "search" {
+  source = "../../modules/search"
+
+  environment        = "production"
+  vpc_id             = module.networking.vpc_id
+  private_subnet_ids = module.networking.private_subnet_ids
+
+  # Production: single t3.medium.search node, 50 GiB EBS
+  instance_type   = "t3.medium.search"
+  instance_count  = 1
+  ebs_volume_size = 50
+}
+
 module "ses" {
   source = "../../modules/ses"
 
@@ -177,4 +190,24 @@ output "redis_endpoint" {
 output "redis_port" {
   description = "Production Redis port"
   value       = module.cache.redis_port
+}
+
+output "opensearch_endpoint" {
+  description = "Production OpenSearch domain endpoint"
+  value       = module.search.domain_endpoint
+}
+
+output "opensearch_arn" {
+  description = "Production OpenSearch domain ARN"
+  value       = module.search.domain_arn
+}
+
+output "opensearch_security_group_id" {
+  description = "Production OpenSearch security group ID"
+  value       = module.search.security_group_id
+}
+
+output "opensearch_master_credentials_secret_arn" {
+  description = "Production Secrets Manager ARN for OpenSearch master user credentials"
+  value       = module.search.master_credentials_secret_arn
 }

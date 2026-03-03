@@ -88,6 +88,14 @@ module "ses" {
   sending_domain = var.sending_domain
 }
 
+module "search" {
+  source = "./modules/search"
+
+  environment        = var.environment
+  vpc_id             = module.networking.vpc_id
+  private_subnet_ids = module.networking.private_subnet_ids
+}
+
 module "compute" {
   source = "./modules/compute"
 

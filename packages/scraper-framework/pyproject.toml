@@ -22,6 +22,7 @@ dependencies = [
     "pydantic>=2.6",
     "structlog>=24.1",
     "apscheduler>=3.10",
+    "opensearch-py>=2.4",
 ]
 
 [project.optional-dependencies]
@@ -33,6 +34,7 @@ dev = [
     "ruff>=0.3",
     "respx>=0.21",       # httpx mocking
     "moto[s3]>=5.0",     # AWS mocking
+    "opensearch-py>=2.4", # OpenSearch client for indexer tests
 ]
 
 [tool.ruff]
