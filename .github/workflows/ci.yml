@@ -52,7 +52,7 @@ jobs:
       - name: Format check
         run: ruff format --check src/ tests/
       - name: Test
-        run: pytest tests/ -v --tb=short
+        run: pytest tests/ -n auto -v --tb=short
 
   nlp-tests:
     needs: detect-changes
