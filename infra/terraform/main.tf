@@ -45,6 +45,12 @@ variable "environment" {
   default     = "dev"
 }
 
+variable "sending_domain" {
+  description = "Domain used to send transactional email (e.g. judgemind.com)"
+  type        = string
+  default     = "judgemind.org"
+}
+
 # ─── Data Sources ──────────────────────────────────────────
 
 data "aws_vpc" "default" {
@@ -77,6 +83,12 @@ module "iam_scraper" {
   source                      = "./modules/iam_scraper"
   environment                 = var.environment
   document_archive_bucket_arn = module.storage.bucket_arn
+}
+
+module "ses" {
+  source         = "./modules/ses"
+  environment    = var.environment
+  sending_domain = var.sending_domain
 }
 
 # module "networking" {
