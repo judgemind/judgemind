@@ -20,7 +20,7 @@ module "ecr" {
   source      = "../../modules/ecr"
   environment = "dev"
 
-  enable_pull_policy         = true
+  enable_pull_policy          = true
   ecs_task_execution_role_arn = module.compute.task_execution_role_arn
 }
 
