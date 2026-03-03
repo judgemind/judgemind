@@ -77,6 +77,11 @@ module "iam_scraper" {
   document_archive_bucket_arn = module.storage.bucket_arn
 }
 
+module "ecr" {
+  source      = "./modules/ecr"
+  environment = var.environment
+}
+
 module "ses" {
   source         = "./modules/ses"
   environment    = var.environment
