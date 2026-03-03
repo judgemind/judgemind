@@ -1,20 +1,31 @@
 import Fastify, { type FastifyInstance } from 'fastify';
 import { ApolloServer, HeaderMap } from '@apollo/server';
+import type { Pool } from 'pg';
 import { typeDefs } from './graphql/schema';
 import { resolvers } from './graphql/resolvers';
-import { pool } from './data-access/db';
+import { createLoaders } from './graphql/dataloader';
+import { pool as defaultPool } from './data-access/db';
 
-export async function buildApp(): Promise<FastifyInstance> {
+export async function buildApp(db?: Pool): Promise<FastifyInstance> {
+  const pool = db ?? defaultPool;
+
   const app = Fastify({
     logger: process.env.NODE_ENV !== 'test',
   });
 
-  const apollo = new ApolloServer({ typeDefs, resolvers });
+  const apollo = new ApolloServer({
+    typeDefs,
+    resolvers,
+    // Introspection disabled in production to reduce attack surface.
+    introspection: process.env.NODE_ENV !== 'production',
+  });
   await apollo.start();
 
   app.addHook('onClose', async () => {
     await apollo.stop();
-    await pool.end();
+    // Only end the pool if we're using the module-level default; callers that
+    // pass their own pool are responsible for closing it.
+    if (!db) await pool.end();
   });
 
   app.get('/health', async (_req, reply) => {
@@ -46,7 +57,8 @@ export async function buildApp(): Promise<FastifyInstance> {
           body: req.body,
           search: req.url.includes('?') ? req.url.slice(req.url.indexOf('?')) : '',
         },
-        context: async () => ({ pool }),
+        // Fresh DataLoaders per request — never share across requests.
+        context: async () => ({ pool, loaders: createLoaders(pool) }),
       });
 
       reply.status(response.status ?? 200);
