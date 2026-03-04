@@ -8,11 +8,15 @@ let redisClient: RedisClientType | null = null;
 async function getRedis(): Promise<RedisClientType | null> {
   if (redisClient) return redisClient;
   try {
-    redisClient = createClient({ url: process.env.REDIS_URL ?? 'redis://localhost:6379' });
+    redisClient = createClient({
+      url: process.env.REDIS_URL ?? 'redis://localhost:6379',
+      socket: { connectTimeout: 1000, reconnectStrategy: false },
+    });
     await redisClient.connect();
     return redisClient;
   } catch {
     // Redis unavailable — fail open (allow request)
+    redisClient = null;
     return null;
   }
 }
