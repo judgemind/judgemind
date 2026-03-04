@@ -5,6 +5,7 @@ import { typeDefs } from './graphql/schema';
 import { resolvers } from './graphql/resolvers';
 import { createLoaders } from './graphql/dataloader';
 import { pool as defaultPool } from './data-access/db';
+import { extractUser } from './auth';
 
 export async function buildApp(db?: Pool): Promise<FastifyInstance> {
   const pool = db ?? defaultPool;
@@ -57,8 +58,14 @@ export async function buildApp(db?: Pool): Promise<FastifyInstance> {
           body: req.body,
           search: req.url.includes('?') ? req.url.slice(req.url.indexOf('?')) : '',
         },
-        // Fresh DataLoaders per request — never share across requests.
-        context: async () => ({ pool, loaders: createLoaders(pool) }),
+        // Fresh DataLoaders and auth context per request.
+        context: async () => {
+          const user = await extractUser(req, pool);
+          const ip = req.ip ?? req.headers['x-forwarded-for'] ?? 'unknown';
+          const cookieHeader =
+            typeof req.headers.cookie === 'string' ? req.headers.cookie : '';
+          return { pool, loaders: createLoaders(pool), user, ip, reply, cookieHeader };
+        },
       });
 
       reply.status(response.status ?? 200);
