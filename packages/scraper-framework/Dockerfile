@@ -23,14 +23,12 @@ RUN groupadd --gid 1000 scraper \
 
 WORKDIR /app
 
-# Install Python dependencies first (layer cache)
+# Copy source before installing so hatchling can find the packages
 COPY pyproject.toml ./
+COPY src/ ./src/
 RUN pip install --no-cache-dir . \
     && pip install --no-cache-dir playwright \
     && playwright install chromium --with-deps
-
-# Copy application code
-COPY src/ ./src/
 
 # Own everything by the non-root user
 RUN chown -R scraper:scraper /app
