@@ -11,6 +11,7 @@ from datetime import datetime
 from pathlib import Path
 
 import httpx
+import pytest
 import respx
 
 from courts.ca.la_tentatives import (
@@ -25,6 +26,8 @@ from courts.ca.la_tentatives import (
 )
 from framework import ContentFormat
 from framework.models import CapturedDocument
+
+pytestmark = pytest.mark.regression
 
 FIXTURES = Path(__file__).parent / "fixtures"
 

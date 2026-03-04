@@ -22,7 +22,7 @@ data "aws_vpc" "selected" {
 
 resource "aws_security_group" "opensearch" {
   name        = "judgemind-opensearch-${var.environment}"
-  description = "OpenSearch domain — HTTPS from VPC only"
+  description = "OpenSearch domain - HTTPS from VPC only"
   vpc_id      = var.vpc_id
 
   ingress {
