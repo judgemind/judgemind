@@ -1,6 +1,6 @@
 # Judgemind — Agent Instructions
 
-**STOP. Read this entire file and follow it step-by-step before doing anything else.** Do not explore the codebase, do not read other files, do not respond to the user's request until you have completed the "Starting a New Session" procedure below. This file defines your mandatory workflow — deviating from it is a bug.
+**STOP. Read this entire file before doing anything else.** Do not explore the codebase, do not read other files, do not respond substantively to the user's request until you have read this file. This file defines your mandatory workflow — deviating from it is a bug.
 
 ## Project Context
 
@@ -13,7 +13,7 @@ Judgemind is a free, open-source legal research platform replacing Trellis.law. 
 
 ## Starting a New Session
 
-Do these steps in order at the start of every session. Do not wait for the user to tell you which worker number to use or which task to work on.
+Do these steps in order at the start of every session, **but only when the user asks you to start working** (e.g. "let's go", "start", "pick up a task"). Do not begin this procedure unprompted — wait for the user's instruction first.
 
 ### Step 0 — Resolve the repo root
 
@@ -382,7 +382,8 @@ These patterns avoid permission prompts and allow the agent to run without inter
 
 ## Session Triggers
 
-- When the user says "let's go" or an equivalent phrase, immediately execute Steps 0-3 of "Starting a New Session" (resolve repo root, claim worker number, create worktree, pick next task), then work autonomously without waiting for further instruction.
+- **Do not auto-start.** Wait for the user to explicitly ask you to begin work (e.g. "let's go", "start", "pick up a task", or naming a specific issue).
+- When the user gives that signal, execute Steps 0-3 of "Starting a New Session" (resolve repo root, claim worker number, create worktree, pick next task), then work autonomously on the chosen task without waiting for further instruction on each substep.
 
 ## Improving the Agent Workflow
 
