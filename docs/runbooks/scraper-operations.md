@@ -143,12 +143,6 @@ aws s3 cp s3://judgemind-document-archive-dev/ca/la/tentatives/2026/03/03/ruling
 Object paths follow the pattern:
 `{state}/{county}/{doc_type}/{year}/{month}/{day}/{filename}`
 
-### Production object lock
-
-Production objects are locked in COMPLIANCE mode for 7 years. They cannot be
-deleted or overwritten by anyone, including AWS Support. Do not attempt
-`s3 rm` against the production bucket -- it will fail.
-
 ---
 
 ## Add a New Court Scraper

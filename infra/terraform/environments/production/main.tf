@@ -3,13 +3,6 @@
 # Manages networking, storage, IAM, compute, and email for the production
 # environment.
 #
-# Object lock is enabled in COMPLIANCE mode. Once this environment is applied,
-# objects in the bucket cannot be deleted or overwritten for the retention
-# period — not even by AWS Support. Verify this is intentional before applying.
-#
-# Retention period: 7 years (configurable via object_lock_retention_years).
-# This matches standard legal records retention requirements.
-#
 # The compute schedule is enabled. The EventBridge Scheduler triggers a daily
 # scraper run at 6 AM PT.
 
@@ -29,10 +22,9 @@ module "ecr" {
 module "document_archive" {
   source = "../../modules/storage"
 
-  bucket_name                 = "judgemind-document-archive-production"
-  environment                 = "production"
-  enable_object_lock          = true
-  object_lock_retention_years = 7
+  bucket_name        = "judgemind-document-archive-production"
+  environment        = "production"
+  enable_object_lock = false
 }
 
 module "iam_scraper" {
