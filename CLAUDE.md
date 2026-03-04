@@ -17,69 +17,35 @@ Judgemind is a free, open-source legal research platform replacing Trellis.law. 
 
 To pick up a task after setup, use the `/task` skill (see `/task` below).
 
-### Step 0 — Resolve the repo root
+### Steps 0–2 — Run the setup script
 
-The shell may be invoked from inside a previous session's worktree. Always resolve the **main** repo root (not a worktree root) by stripping the worktree suffix from the git common dir:
+Run this from anywhere inside the repo (including from inside an existing worktree):
 ```
-git rev-parse --absolute-git-dir
-```
-If the output ends with `/.git` (e.g. `/home/user/myproject/.git`), strip `/.git` — that is **REPO_ROOT**.
-If the output contains `/worktrees/` (e.g. `/home/user/myproject/.git/worktrees/worker-2`), strip from `/.git` onward — the prefix is **REPO_ROOT**.
-
-Substitute this literal value everywhere `$REPO_ROOT` appears in these instructions. Never hardcode a path; always resolve it fresh each session.
-
-### Step 1 — Claim your worker number
-
-First, make sure the main repo is on `main` and up to date:
-```
-git -C $REPO_ROOT checkout main
-git -C $REPO_ROOT pull origin main
+scripts/start-worker.sh
 ```
 
-Then prune stale worktree references (idempotent, safe to always run):
-```
-git -C $REPO_ROOT worktree prune
-```
-Then list active worktrees:
-```
-git -C $REPO_ROOT worktree list
-```
-Examine the output. Worker paths follow the pattern `worktrees/worker-N`. Pick the **lowest integer N >= 1 not already present** in the list. That is your worker number for this session.
+The script handles everything:
+- Resolves the repo root regardless of where the shell started
+- Ensures `main` is checked out and up to date
+- Prunes stale worktree metadata
+- Removes abandoned worktrees (branches merged into main, or session branches from a previous day)
+- Claims the lowest available worker number, retrying automatically if another agent races to the same number
+- Creates the worktree, configures git hooks, and creates the `tmp/` directory
 
-Example: if the list shows `worktrees/worker-1` and `worktrees/worker-3`, claim **worker-2**.
+It prints the worktree path on stdout, e.g. `/path/to/worktrees/worker-2`. **Record this value** — it is `{worktree}` for the rest of the session.
 
-### Step 2 — Create your worktree (always, no exceptions)
-
-Every agent session must work in an isolated git worktree, never directly in the main repo. Run these sequentially (split to avoid `$()` prompts):
-```
-date +%Y%m%d-%H%M
-git -C $REPO_ROOT worktree add \
-    $REPO_ROOT/worktrees/worker-N -b worker-N/session-YYYYMMDD-HHMM
-mkdir -p $REPO_ROOT/worktrees/worker-N/tmp
-```
-
-**If `git worktree add` fails** (exit code non-zero, e.g. "fatal: '<path>' already exists"), another instance raced you to that number. Do not proceed. Re-run Step 1 (`worktree prune` then `worktree list`) to get a fresh snapshot, pick a new N, and retry Step 2. Repeat until `git worktree add` succeeds.
-
-Then configure the repo to use the shared git hooks (enables the pre-push lint gate):
-```
-git -C $REPO_ROOT/worktrees/worker-N config core.hooksPath .githooks
-```
-
-All subsequent work happens inside `$REPO_ROOT/worktrees/worker-N`.
-Use `{worktree}/tmp/` for **all** temporary files (scripts, PR bodies, etc.) — this directory is gitignored and scoped to your worker, so there are no permission prompts and no collisions between workers.
+All subsequent work happens inside `{worktree}`. Use `{worktree}/tmp/` for **all** temporary files (scripts, PR bodies, etc.) — this directory is gitignored and scoped to your worker, so there are no permission prompts and no collisions between workers.
 
 **Venv isolation:** each agent must create its own venv inside the worktree for every Python package it works in. Never use the venv from the main repo or another worktree — multiple agents on the same machine will stomp on each other if they share a venv. After creating the worktree, set up a venv for each package you need:
 ```
-python3.12 -m venv $REPO_ROOT/worktrees/worker-N/packages/<pkg>/.venv
-cd $REPO_ROOT/worktrees/worker-N/packages/<pkg> && .venv/bin/pip install -e ".[dev]" --quiet
+python3.12 -m venv {worktree}/packages/<pkg>/.venv
+cd {worktree}/packages/<pkg> && .venv/bin/pip install -e ".[dev]" --quiet
 ```
 Only install venvs for packages you actually work in during the session.
 
-When the session is done, remove the worktree:
-```
-git -C $REPO_ROOT worktree remove $REPO_ROOT/worktrees/worker-N
-```
+### Step 3 — Pick up a task
 
+<<<<<<< HEAD
 ### Step 3 — Pick up a task
 
 Use the `/task` skill to claim and work on an issue. Run it after completing Steps 0–2:
@@ -90,13 +56,27 @@ Use the `/task` skill to claim and work on an issue. Run it after completing Ste
 
 The skill works autonomously from issue selection through PR and review request. The PR workflow it follows is defined in the next section.
 
+=======
+Use the `/task` skill to claim and work on an issue. Run it after completing Steps 0–2:
+
+- `/task` — picks the next highest-priority unassigned `agent/ready` issue
+- `/task #42` — works on a specific issue number
+- `/task scrapers` / `/task next perf bug` / etc. — natural-language filter over the backlog
+
+The skill works autonomously from issue selection through PR and review request. The PR workflow it follows is defined in the next section.
+
+>>>>>>> d245ba7 (dx(workflow): replace manual Steps 0-2 with start-worker.sh script)
 ## PR Workflow (authoritative — applies to all task work)
 
 **Single-issue rule:** each PR addresses exactly one issue. Do not combine unrelated changes in a single PR. If an issue is large or ambiguous, break it into sub-tasks first (see **Creating Sub-Tasks**), label them `agent/ready`, then pick up the first sub-task.
 
 **All commits must be made on the worktree branch created in Step 2, never directly on `main`.** Every change goes through a PR — no direct pushes to `main`, ever.
 
+<<<<<<< HEAD
 Complete every substep in order. A task is not done until substep 4.8 is finished. Do not ask the user for confirmation during any of these steps.
+=======
+Complete every substep in order. A task is not done until substep 4.9 is finished. Do not ask the user for confirmation during any of these steps.
+>>>>>>> d245ba7 (dx(workflow): replace manual Steps 0-2 with start-worker.sh script)
 
 #### 4.1 — Understand the problem
 
@@ -165,6 +145,14 @@ Complete every substep in order. A task is not done until substep 4.8 is finishe
 
 - Comment on the issue linking the PR.
 - Add the `status/review` label to the issue.
+
+#### 4.9 — Remove your worktree
+
+The branch must stay (it backs the open PR), but the worktree directory is no longer needed. Run:
+```
+scripts/end-worker.sh {worktree}
+```
+This is the last step of every task. A task is not complete until the worktree is removed.
 
 ## Tool Use Rules
 
