@@ -87,3 +87,9 @@ variable "redis_url" {
   type        = string
   default     = ""
 }
+
+variable "document_archive_bucket" {
+  description = "S3 bucket name for document archival (e.g. judgemind-document-archive-production). Empty string disables archival."
+  type        = string
+  default     = ""
+}

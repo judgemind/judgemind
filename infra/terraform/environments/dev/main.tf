@@ -51,12 +51,13 @@ module "cache" {
 module "compute" {
   source = "../../modules/compute"
 
-  environment           = "dev"
-  vpc_id                = module.networking.vpc_id
-  private_subnet_ids    = module.networking.private_subnet_ids
-  ecr_repository_url    = module.ecr.repository_url
-  scraper_task_role_arn = module.iam_scraper.role_arn
-  redis_url             = "redis://${module.cache.redis_endpoint}:${module.cache.redis_port}"
+  environment             = "dev"
+  vpc_id                  = module.networking.vpc_id
+  private_subnet_ids      = module.networking.private_subnet_ids
+  ecr_repository_url      = module.ecr.repository_url
+  scraper_task_role_arn   = module.iam_scraper.role_arn
+  redis_url               = "redis://${module.cache.redis_endpoint}:${module.cache.redis_port}"
+  document_archive_bucket = module.document_archive.bucket_id
 
   # Dev: 0.5 vCPU, 1 GB RAM, daily schedule at 6 AM PT
   task_cpu            = 512

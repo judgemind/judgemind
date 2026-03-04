@@ -10,8 +10,8 @@
 # Retention period: 7 years (configurable via object_lock_retention_years).
 # This matches standard legal records retention requirements.
 #
-# The compute schedule is disabled by default. Run the scraper manually at
-# least once before enabling the EventBridge schedule in a follow-up PR.
+# The compute schedule is enabled. The EventBridge Scheduler triggers a daily
+# scraper run at 6 AM PT.
 
 module "networking" {
   source      = "../../modules/networking"
@@ -55,19 +55,20 @@ module "cache" {
 module "compute" {
   source = "../../modules/compute"
 
-  environment           = "production"
-  vpc_id                = module.networking.vpc_id
-  private_subnet_ids    = module.networking.private_subnet_ids
-  ecr_repository_url    = module.ecr.repository_url
-  scraper_task_role_arn = module.iam_scraper.role_arn
-  redis_url             = "redis://${module.cache.redis_endpoint}:${module.cache.redis_port}"
+  environment             = "production"
+  vpc_id                  = module.networking.vpc_id
+  private_subnet_ids      = module.networking.private_subnet_ids
+  ecr_repository_url      = module.ecr.repository_url
+  scraper_task_role_arn   = module.iam_scraper.role_arn
+  redis_url               = "redis://${module.cache.redis_endpoint}:${module.cache.redis_port}"
+  document_archive_bucket = module.document_archive.bucket_id
 
-  # Production: 1 vCPU, 2 GB RAM, daily schedule disabled until first manual test
+  # Production: 1 vCPU, 2 GB RAM, daily schedule at 6 AM PT
   task_cpu            = 1024
   task_memory         = 2048
   schedule_expression = "cron(0 6 * * ? *)"
   schedule_timezone   = "America/Los_Angeles"
-  schedule_enabled    = false
+  schedule_enabled    = true
   log_retention_days  = 30
   enable_alerts       = true
 }
