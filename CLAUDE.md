@@ -357,7 +357,6 @@ These patterns avoid permission prompts and allow the agent to run without inter
 - **Dollar-paren `$()` is NEVER allowed in any Bash command — no exceptions.** Command substitution always triggers a prompt. This includes `--body` with cat, heredocs embedded in commands, `git commit -m` with cat, and any other form. If you need a dynamic value, run the command that produces it first as a separate tool call, then use the literal string in the next command. **This also applies to commit messages and strings passed to `-m`: if the message text contains the literal characters `$` followed by `(`, the hook fires. Write the message to a file and use `-F` instead.**
 - **No quoted strings in compound shell commands:** a hook rejects commands that contain quoted characters (e.g. `"text"` or `'text'`) combined with `&&` or `;`. Instead of `cmd1 && echo "label" && cmd2`, make two separate tool calls — one per command.
 - **Multi-line content for `gh` or `git` commands:** always write the content to a file first using the Write tool, then pass it with `--body-file` or `-F`. Never use heredocs or `$()` in shell commands. For commits: `git commit -F {worktree}/tmp/commit_msg.txt`. For PR/issue bodies: `gh issue create --body-file {worktree}/tmp/body.txt`.
-- **`git rebase --continue` without interactive editor:** use `GIT_EDITOR=true git -C {worktree} rebase --continue`. Setting `GIT_EDITOR=true` accepts the default commit message without opening a terminal editor.
 
 ## Session Triggers
 
