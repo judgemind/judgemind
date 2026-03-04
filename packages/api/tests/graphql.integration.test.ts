@@ -51,9 +51,10 @@ async function applySchemaIdempotent(): Promise<void> {
     await pool.query(sql);
   } catch (err: unknown) {
     // 42P07 = duplicate_table, 42710 = duplicate_object, 42P06 = duplicate_schema,
-    // 42723 = duplicate_function, 42P16 = invalid_table_definition
+    // 42723 = duplicate_function, 42P16 = invalid_table_definition,
+    // 23505 = unique_violation (CREATE EXTENSION IF NOT EXISTS can race across workers)
     const code = (err as { code?: string }).code;
-    if (!['42P07', '42710', '42P06', '42723', '42P16'].includes(code ?? '')) {
+    if (!['42P07', '42710', '42P06', '42723', '42P16', '23505'].includes(code ?? '')) {
       throw err;
     }
   }

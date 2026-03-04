@@ -1,9 +1,16 @@
 import type { Pool } from 'pg';
+import type { FastifyReply } from 'fastify';
 import type { Loaders } from './dataloader';
+import type { AuthUser } from '../auth';
+import { authResolvers } from './auth-resolvers';
 
 interface Context {
   pool: Pool;
   loaders: Loaders;
+  user: AuthUser | null;
+  ip: string;
+  reply: FastifyReply;
+  cookieHeader: string;
 }
 
 type Row = Record<string, unknown>;
@@ -379,4 +386,11 @@ export const resolvers = {
     canonicalName: (row: Row) => row.canonical_name,
     partyType: (row: Row) => row.party_type,
   },
+
+  // Auth resolvers
+  ...authResolvers.User ? { User: authResolvers.User } : {},
+  Mutation: authResolvers.Mutation,
 };
+
+// Merge auth Query resolvers into the main Query object
+Object.assign(resolvers.Query, authResolvers.Query);

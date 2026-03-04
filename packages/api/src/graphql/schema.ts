@@ -93,6 +93,22 @@ export const typeDefs = `#graphql
     partyType: String
   }
 
+  """The authenticated user."""
+  type User {
+    id: ID!
+    email: String!
+    emailVerified: Boolean!
+    displayName: String
+    role: String!
+    createdAt: String!
+  }
+
+  """Returned on successful authentication."""
+  type AuthPayload {
+    accessToken: String!
+    user: User!
+  }
+
   # ---------------------------------------------------------------------------
   # Pagination — keyset (cursor-based) for all list queries
   # ---------------------------------------------------------------------------
@@ -185,5 +201,35 @@ export const typeDefs = `#graphql
       first: Int
       after: String
     ): RulingConnection!
+
+    """Return the currently authenticated user, or null."""
+    me: User
+  }
+
+  # ---------------------------------------------------------------------------
+  # Mutations — authentication
+  # ---------------------------------------------------------------------------
+
+  type Mutation {
+    """Register with email and password. Sends a verification email."""
+    register(email: String!, password: String!, displayName: String): AuthPayload!
+
+    """Login with email and password."""
+    login(email: String!, password: String!): AuthPayload!
+
+    """Invalidate the current refresh token."""
+    logout: Boolean!
+
+    """Exchange a valid refresh token (from httpOnly cookie) for a new access token."""
+    refreshToken: AuthPayload!
+
+    """Verify email address using the token sent during registration."""
+    verifyEmail(token: String!): Boolean!
+
+    """Begin Google OAuth: returns the redirect URL to send the user to."""
+    initiateGoogleAuth: String!
+
+    """Complete Google OAuth: exchange the authorization code for an auth payload."""
+    completeGoogleAuth(code: String!): AuthPayload!
   }
 `;

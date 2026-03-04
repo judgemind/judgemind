@@ -375,6 +375,7 @@ CREATE TABLE users (
     email               TEXT        NOT NULL UNIQUE,
     email_verified      BOOLEAN     NOT NULL DEFAULT FALSE,
     password_hash       TEXT,                           -- NULL for OAuth-only accounts
+    google_id           TEXT        UNIQUE,             -- Google OAuth subject identifier
     display_name        TEXT,
     role                TEXT        NOT NULL DEFAULT 'user',  -- 'user', 'admin'
     api_key             TEXT        UNIQUE,             -- For programmatic REST access
@@ -383,6 +384,15 @@ CREATE TABLE users (
     last_login_at       TIMESTAMPTZ,
     created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Refresh tokens — stored hashed, one user can have multiple active sessions
+CREATE TABLE refresh_tokens (
+    id          UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id     UUID        NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    token_hash  TEXT        NOT NULL UNIQUE,
+    expires_at  TIMESTAMPTZ NOT NULL,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
 CREATE TYPE alert_type AS ENUM (
@@ -472,6 +482,10 @@ CREATE INDEX idx_staging_ruled_status       ON staging.ruled_items(validation_st
 
 -- Scraper health — dashboard needs recent runs per scraper
 CREATE INDEX idx_scraper_runs_scraper_id    ON scraper_runs(scraper_id, started_at DESC);
+
+-- Refresh tokens
+CREATE INDEX idx_refresh_tokens_user_id     ON refresh_tokens(user_id);
+CREATE INDEX idx_refresh_tokens_expires     ON refresh_tokens(expires_at);
 
 -- Alert events — digest job queries un-sent events
 CREATE INDEX idx_alert_events_sub_id        ON alert_events(subscription_id);
