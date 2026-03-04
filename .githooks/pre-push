@@ -23,8 +23,13 @@ remote="$1"
 # url="$2"  # unused
 
 failures=0
+push_ref=""
+push_is_new_branch=false
 
 while read -r local_ref local_sha remote_sha _rest; do
+    # Track the ref and whether it's new for the PR check at the end
+    push_ref="$local_ref"
+
     # Skip delete pushes
     if [ "$local_sha" = "0000000000000000000000000000000000000000" ]; then
         continue
@@ -33,6 +38,7 @@ while read -r local_ref local_sha remote_sha _rest; do
     # If this is a new branch (remote_sha is all zeros), diff against the
     # merge-base with origin/main so we check all new commits.
     if [ "$remote_sha" = "0000000000000000000000000000000000000000" ]; then
+        push_is_new_branch=true
         # Fetch main to make sure we have it
         git fetch "$remote" main --quiet 2>/dev/null || true
         merge_base=$(git merge-base "$local_sha" "$remote/main" 2>/dev/null || echo "")
@@ -163,6 +169,41 @@ while read -r local_ref local_sha remote_sha _rest; do
     fi
 
 done
+
+# -------------------------------------------------------------------
+# PR existence check (advisory — runs before push completes)
+# -------------------------------------------------------------------
+# Git has no native post-push hook. We check here as the closest
+# alternative. For existing remote branches we query gh for a PR;
+# for new branches we print a reminder since no PR can exist yet.
+
+pr_check_branch=""
+if [ -n "$push_ref" ]; then
+    pr_check_branch="${push_ref#refs/heads/}"
+fi
+
+if [ -n "$pr_check_branch" ] && [ "$pr_check_branch" != "main" ] && [ "$pr_check_branch" != "master" ]; then
+    if command -v gh &>/dev/null; then
+        if [ "$push_is_new_branch" = true ]; then
+            echo "" >&2
+            echo "--------------------------------------------------------------------" >&2
+            echo "REMINDER: This is a new branch push. Create a PR after push:" >&2
+            echo "  gh pr create --base main --head $pr_check_branch" >&2
+            echo "--------------------------------------------------------------------" >&2
+        else
+            # Branch exists on remote — check for an open PR
+            pr_count=$(gh pr list --head "$pr_check_branch" --repo judgemind/judgemind --json number --jq 'length' 2>/dev/null || echo "")
+            if [ "$pr_count" = "0" ]; then
+                echo "" >&2
+                echo "====================================================================" >&2
+                echo "WARNING: No PR exists for branch '$pr_check_branch'." >&2
+                echo "Create one now:" >&2
+                echo "  gh pr create --base main --head $pr_check_branch" >&2
+                echo "====================================================================" >&2
+            fi
+        fi
+    fi
+fi
 
 # -------------------------------------------------------------------
 # Report results
