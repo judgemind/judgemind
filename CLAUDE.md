@@ -13,7 +13,9 @@ Judgemind is a free, open-source legal research platform replacing Trellis.law. 
 
 ## Starting a New Session
 
-Do these steps in order at the start of every session, **but only when the user asks you to start working** (e.g. "let's go", "start", "pick up a task"). Do not begin this procedure unprompted — wait for the user's instruction first.
+**Always do Steps 0–2 at the start of every session, without waiting for any instruction.** These establish your isolated workspace and must happen before you respond substantively to any request.
+
+To pick up a task after setup, use the `/task` skill (see `/task` below).
 
 ### Step 0 — Resolve the repo root
 
@@ -78,35 +80,21 @@ When the session is done, remove the worktree:
 git -C $REPO_ROOT worktree remove $REPO_ROOT/worktrees/worker-N
 ```
 
-### Step 3 — Pick the next task
+### Step 3 — Pick up a task
 
-List open issues ready for an agent:
-```
-gh issue list --repo judgemind/judgemind \
-    --label agent/ready --state open \
-    --json number,title,assignees,labels \
-    --limit 20
-```
+Use the `/task` skill to claim and work on an issue. Run it after completing Steps 0–2:
 
-Pick the highest-priority unassigned issue. Priority order:
-1. `priority/critical` -> `priority/high` -> `priority/medium` -> `priority/low`
-2. Within the same priority, prefer lower issue numbers (older issues).
-3. Skip issues already assigned to another agent unless their worktree no longer exists in the `worktree list` output.
+- `/task` — picks the next highest-priority unassigned `agent/ready` issue
+- `/task #42` — works on a specific issue number
+- `/task scrapers` / `/task next perf bug` / etc. — natural-language filter over the backlog
 
-Then claim it:
-```
-gh issue edit <N> --repo judgemind/judgemind --add-assignee @me
-gh issue comment <N> --repo judgemind/judgemind --body "Picking this up in worker-N."
-```
+The skill works autonomously from issue selection through PR and review request. The PR workflow it follows is defined in the next section.
 
-Then **rename this conversation** so it is identifiable in the sidebar:
-- Format: `#<N> — <short title>` (e.g. `#42 — Deploy LA/OC/Riverside scrapers`)
-- Use the issue number and a shortened version of the issue title (drop the `[AREA]` prefix tag).
-- In Claude Code on the web, type `/rename #<N> — <short title>` to set the conversation name.
-
-### Step 4 — Work autonomously until the PR is green
+## PR Workflow (authoritative — applies to all task work)
 
 **Single-issue rule:** each PR addresses exactly one issue. Do not combine unrelated changes in a single PR. If an issue is large or ambiguous, break it into sub-tasks first (see **Creating Sub-Tasks**), label them `agent/ready`, then pick up the first sub-task.
+
+**All commits must be made on the worktree branch created in Step 2, never directly on `main`.** Every change goes through a PR — no direct pushes to `main`, ever.
 
 Complete every substep in order. A task is not done until substep 4.8 is finished. Do not ask the user for confirmation during any of these steps.
 
@@ -292,8 +280,8 @@ Do NOT rely on CI to catch issues that local checks would have caught. If a suba
 ## Git Workflow
 
 - Commit messages follow conventional commits: `feat(scraping): implement OC PDF link scraper (#42)`
-- Always branch from `main` (`feat/issue-{N}-short-description`), open a PR, wait for CI to pass, then request human review. Never merge your own PRs. Never push directly to `main`.
-- **A PR is not done until it has no conflicts and CI is green.** Follow the complete post-push checklist in Step 4 (substeps 4.4-4.8) — do not skip any step.
+- Always work on the worktree branch created in Step 2. Open a PR, wait for CI to pass, then request human review. Never merge your own PRs. Never push directly to `main`.
+- **A PR is not done until it has no conflicts and CI is green.** Follow the complete post-push checklist in the PR Workflow section (substeps 4.4–4.8) — do not skip any step.
 
 ## Task Dependencies
 
@@ -304,7 +292,9 @@ Issues can be blocked on other issues. The system uses these conventions:
 
 ### When you finish a task
 
-Search for open issues that were waiting on yours:
+**Implementation tasks (PRs):** dependent issues are unblocked automatically by the `unblock-issues` CI workflow when the PR merges. No manual action needed — but the PR body must include `Closes #N` so the workflow knows which issue was resolved.
+
+**Non-PR completions (investigations, sub-task breakdowns):** manually unblock dependent issues. Search for open issues waiting on yours:
 ```
 gh issue list --repo judgemind/judgemind --state open \
     --search "Blocked by #<your-issue>" \
@@ -382,8 +372,8 @@ These patterns avoid permission prompts and allow the agent to run without inter
 
 ## Session Triggers
 
-- **Do not auto-start.** Wait for the user to explicitly ask you to begin work (e.g. "let's go", "start", "pick up a task", or naming a specific issue).
-- When the user gives that signal, execute Steps 0-3 of "Starting a New Session" (resolve repo root, claim worker number, create worktree, pick next task), then work autonomously on the chosen task without waiting for further instruction on each substep.
+- **Always run Steps 0–2 immediately** at the start of every session (resolve repo root, claim worker number, create worktree) — before responding to any user request.
+- To pick up work, invoke `/task`. Proceed autonomously from issue selection through PR and review request without waiting for further instruction.
 
 ## Improving the Agent Workflow
 

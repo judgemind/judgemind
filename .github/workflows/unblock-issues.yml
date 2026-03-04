@@ -1,0 +1,105 @@
+name: Unblock dependent issues on PR merge
+
+on:
+  pull_request:
+    types: [closed]
+    branches: [main]
+
+jobs:
+  unblock:
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+
+    steps:
+      - name: Unblock dependent issues
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          python3 - << 'PYEOF'
+          import subprocess, json, re, os, sys
+
+          repo = os.environ['GITHUB_REPOSITORY']
+          pr_body = os.environ.get('PR_BODY', '')
+
+          def gh(*args):
+              r = subprocess.run(['gh', *args], capture_output=True, text=True)
+              if r.returncode != 0:
+                  print(f'gh error: {r.stderr.strip()}', file=sys.stderr)
+                  return None
+              return r.stdout.strip()
+
+          def gh_json(*args):
+              out = gh(*args)
+              return json.loads(out) if out else None
+
+          # Extract issue numbers closed by this PR
+          closed = re.findall(r'(?:closes|fixes|resolves)\s+#(\d+)', pr_body, re.IGNORECASE)
+          if not closed:
+              print('No issue references found in PR body.')
+              sys.exit(0)
+
+          for issue_n in closed:
+              print(f'Checking for issues blocked by #{issue_n}...')
+
+              blocked = gh_json(
+                  'issue', 'list', '--repo', repo,
+                  '--state', 'open',
+                  '--search', f'"Blocked by #{issue_n}"',
+                  '--json', 'number,body,labels',
+                  '--limit', '50',
+              )
+              if not blocked:
+                  print(f'No open issues blocked by #{issue_n}.')
+                  continue
+
+              for issue in blocked:
+                  n = issue['number']
+                  body = issue.get('body') or ''
+                  blockers = re.findall(r'Blocked by #(\d+)', body)
+                  if not blockers:
+                      continue
+
+                  all_resolved = True
+                  for b in blockers:
+                      info = gh_json('issue', 'view', b, '--repo', repo, '--json', 'state')
+                      if not info or info.get('state') != 'CLOSED':
+                          print(f'Issue #{n} still waiting on #{b} (not closed).')
+                          all_resolved = False
+                          break
+
+                  if not all_resolved:
+                      continue
+
+                  print(f'All blockers resolved for #{n} — unblocking...')
+
+                  # Strip resolved "Blocked by #X" lines
+                  lines = body.splitlines()
+                  lines = [l for l in lines if not re.match(r'\s*Blocked by #\d+', l)]
+
+                  # Remove empty "## Dependencies" section
+                  result = []
+                  i = 0
+                  while i < len(lines):
+                      if re.match(r'^## Dependencies\s*$', lines[i]):
+                          # Look ahead: skip blank lines; if next content is a heading or EOF, drop section
+                          j = i + 1
+                          while j < len(lines) and not lines[j].strip():
+                              j += 1
+                          if j >= len(lines) or lines[j].startswith('#'):
+                              i = j  # skip the whole empty section
+                              continue
+                      result.append(lines[i])
+                      i += 1
+
+                  with open('/tmp/updated_body.txt', 'w') as f:
+                      f.write('\n'.join(result))
+
+                  gh('issue', 'edit', str(n), '--repo', repo, '--body-file', '/tmp/updated_body.txt')
+                  gh('issue', 'edit', str(n), '--repo', repo,
+                     '--remove-label', 'status/blocked', '--add-label', 'agent/ready')
+                  print(f'Issue #{n} unblocked and marked agent/ready.')
+          PYEOF
