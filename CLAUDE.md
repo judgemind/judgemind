@@ -1,6 +1,6 @@
 # Judgemind — Agent Instructions
 
-Read this file before starting any task. It defines how you work in this codebase.
+**STOP. Read this entire file and follow it step-by-step before doing anything else.** Do not explore the codebase, do not read other files, do not respond to the user's request until you have completed the "Starting a New Session" procedure below. This file defines your mandatory workflow — deviating from it is a bug.
 
 ## Project Context
 
@@ -42,7 +42,7 @@ Then list active worktrees:
 ```
 git -C $REPO_ROOT worktree list
 ```
-Examine the output. Worker paths follow the pattern `worktrees/worker-N`. Pick the **lowest integer N ≥ 1 not already present** in the list. That is your worker number for this session.
+Examine the output. Worker paths follow the pattern `worktrees/worker-N`. Pick the **lowest integer N >= 1 not already present** in the list. That is your worker number for this session.
 
 Example: if the list shows `worktrees/worker-1` and `worktrees/worker-3`, claim **worker-2**.
 
@@ -89,7 +89,7 @@ gh issue list --repo judgemind/judgemind \
 ```
 
 Pick the highest-priority unassigned issue. Priority order:
-1. `priority/critical` → `priority/high` → `priority/medium` → `priority/low`
+1. `priority/critical` -> `priority/high` -> `priority/medium` -> `priority/low`
 2. Within the same priority, prefer lower issue numbers (older issues).
 3. Skip issues already assigned to another agent unless their worktree no longer exists in the `worktree list` output.
 
@@ -152,7 +152,7 @@ Complete every substep in order. A task is not done until substep 4.8 is finishe
 #### 4.6 — Fix CI failures (repeat until green)
 
 - If CI fails, diagnose the failure, fix it locally, push again, and return to substep 4.4.
-- Repeat the 4.4 → 4.5 → 4.6 loop until CI is green. Do not proceed until all checks pass.
+- Repeat the 4.4 -> 4.5 -> 4.6 loop until CI is green. Do not proceed until all checks pass.
 
 #### 4.7 — Update the PR test plan
 
@@ -244,7 +244,7 @@ Common ruff pitfalls that agents keep hitting:
 - **I001** (unsorted imports): `ruff check --fix` resolves this. Always run it.
 - **F401** (unused imports): Remove any import you don't actually use.
 - **UP017** (datetime.UTC): Use `datetime.now(datetime.UTC)`, not `datetime.now(timezone.utc)`.
-- **Format ≠ Lint**: `ruff check` and `ruff format` are **separate commands**. You must run BOTH.
+- **Format != Lint**: `ruff check` and `ruff format` are **separate commands**. You must run BOTH.
 
 **TypeScript packages** (from the package directory):
 ```
@@ -293,7 +293,7 @@ Do NOT rely on CI to catch issues that local checks would have caught. If a suba
 
 - Commit messages follow conventional commits: `feat(scraping): implement OC PDF link scraper (#42)`
 - Always branch from `main` (`feat/issue-{N}-short-description`), open a PR, wait for CI to pass, then request human review. Never merge your own PRs. Never push directly to `main`.
-- **A PR is not done until it has no conflicts and CI is green.** Follow the complete post-push checklist in Step 4 (substeps 4.4–4.8) — do not skip any step.
+- **A PR is not done until it has no conflicts and CI is green.** Follow the complete post-push checklist in Step 4 (substeps 4.4-4.8) — do not skip any step.
 
 ## Task Dependencies
 
@@ -382,7 +382,7 @@ These patterns avoid permission prompts and allow the agent to run without inter
 
 ## Session Triggers
 
-- When the user says "let's go" or an equivalent phrase, immediately execute Steps 1–3 of "Starting a New Session" (claim worker number, create worktree, pick next task), then work autonomously without waiting for further instruction.
+- When the user says "let's go" or an equivalent phrase, immediately execute Steps 0-3 of "Starting a New Session" (resolve repo root, claim worker number, create worktree, pick next task), then work autonomously without waiting for further instruction.
 
 ## Improving the Agent Workflow
 
@@ -392,13 +392,13 @@ When you encounter a permission prompt for a command that is **clearly safe and 
 2. **File a GitHub issue** to track the improvement:
    - Title: `[DX] Agent workflow: avoid prompt for <description>`
    - Label: `type/dx` (create it if it doesn't exist)
-   - Body: describe what triggered the prompt, the workaround used, and the specific line to add to the "Unattended Operation Patterns" section of `.claude/instructions.md`.
+   - Body: describe what triggered the prompt, the workaround used, and the specific line to add to the "Unattended Operation Patterns" section of `CLAUDE.md`.
 
 Do **not** file issues for prompts that exist for good reason — pushing to remote, opening PRs, merging, deploying, deleting branches, or any action that affects shared state. Those prompts are intentional.
 
 ## Memory and Instructions Updates
 
-- Prefer updating `.claude/instructions.md` in the repo over writing to `~/.claude` project memory.
+- Prefer updating `CLAUDE.md` in the repo root over writing to `~/.claude` project memory.
 - Only use local `~/.claude` memory for things that cannot go in the repo (e.g. cross-repo or cross-project preferences).
 
 ## Things You Must Not Do
