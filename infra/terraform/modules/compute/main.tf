@@ -124,7 +124,8 @@ resource "aws_ecs_task_definition" "scraper" {
 
       environment = concat(
         [{ name = "ENVIRONMENT", value = var.environment }],
-        var.redis_url != "" ? [{ name = "REDIS_URL", value = var.redis_url }] : []
+        var.redis_url != "" ? [{ name = "REDIS_URL", value = var.redis_url }] : [],
+        var.document_archive_bucket != "" ? [{ name = "JUDGEMIND_ARCHIVE_BUCKET", value = var.document_archive_bucket }] : []
       )
 
       logConfiguration = {
