@@ -33,7 +33,9 @@ async function applySchemaIdempotent(): Promise<void> {
     await pool.query(sql);
   } catch (err: unknown) {
     const code = (err as { code?: string }).code;
-    if (!['42P07', '42710', '42P06', '42723', '42P16'].includes(code ?? '')) {
+    // 23505 = unique_violation — CREATE EXTENSION IF NOT EXISTS can race
+    // when multiple test workers apply the schema concurrently
+    if (!['42P07', '42710', '42P06', '42723', '42P16', '23505'].includes(code ?? '')) {
       throw err;
     }
   }
@@ -46,7 +48,7 @@ async function applySchemaIdempotent(): Promise<void> {
     await pool.query(migration);
   } catch (err: unknown) {
     const code = (err as { code?: string }).code;
-    if (!['42P07', '42710', '42701'].includes(code ?? '')) {
+    if (!['42P07', '42710', '42701', '23505'].includes(code ?? '')) {
       throw err;
     }
   }
