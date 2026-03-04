@@ -47,7 +47,7 @@ resource "aws_ecs_cluster" "main" {
 
 resource "aws_iam_role" "ecs_task_execution" {
   name        = "judgemind-ecs-execution-${var.environment}"
-  description = "ECS task execution role — pull ECR images and write CloudWatch logs"
+  description = "ECS task execution role - pull ECR images and write CloudWatch logs"
 
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
@@ -77,7 +77,7 @@ resource "aws_iam_role_policy_attachment" "ecs_task_execution" {
 
 resource "aws_security_group" "scraper" {
   name        = "judgemind-scraper-${var.environment}"
-  description = "Scraper ECS tasks — outbound HTTPS only"
+  description = "Scraper ECS tasks - outbound HTTPS only"
   vpc_id      = var.vpc_id
 
   egress {
