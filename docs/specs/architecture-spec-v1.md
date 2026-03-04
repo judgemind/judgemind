@@ -472,7 +472,7 @@ Object versioning: Enabled on the document bucket. Protects against accidental d
 
 Cross-region replication: The document archive is replicated to a second region. If the primary region suffers a catastrophic failure, the archive survives. This is the one area where the cost of redundancy is justified regardless of budget pressure.
 
-Immutable storage: The archive bucket uses object lock (write-once-read-many) to prevent any deletion, even by administrators. Original captured documents should be permanently retained.
+Versioning: The archive bucket has versioning enabled to protect against accidental deletion or overwrite. Object lock (WORM) is not currently enabled.
 
 ### 7.5.2 PostgreSQL (Important)
 
