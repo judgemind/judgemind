@@ -1,6 +1,7 @@
 ---
 description: Pick up and complete a Judgemind GitHub issue autonomously — from selection through PR and review request. Usage: /task (next ready issue), /task #42 (specific issue), /task scrapers (natural-language filter).
 argument-hint: "[#issue | category | next]"
+accept-edits: true
 ---
 
 # /task skill
