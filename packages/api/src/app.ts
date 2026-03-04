@@ -2,12 +2,16 @@ import Fastify, { type FastifyInstance } from 'fastify';
 import { ApolloServer, HeaderMap } from '@apollo/server';
 import type { Pool } from 'pg';
 import type { Client } from '@opensearch-project/opensearch';
+import cors from '@fastify/cors';
+import swagger from '@fastify/swagger';
+import swaggerUi from '@fastify/swagger-ui';
 import { typeDefs } from './graphql/schema';
 import { resolvers } from './graphql/resolvers';
 import { createLoaders } from './graphql/dataloader';
 import { pool as defaultPool } from './data-access/db';
 import { extractUser } from './auth';
 import { opensearchClient as defaultOsClient } from './search/client';
+import { restApiPlugin } from './rest';
 
 export async function buildApp(db?: Pool, os?: Client): Promise<FastifyInstance> {
   const pool = db ?? defaultPool;
@@ -17,21 +21,63 @@ export async function buildApp(db?: Pool, os?: Client): Promise<FastifyInstance>
     logger: process.env.NODE_ENV !== 'test',
   });
 
-  const apollo = new ApolloServer({
-    typeDefs,
-    resolvers,
-    // Introspection disabled in production to reduce attack surface.
-    introspection: process.env.NODE_ENV !== 'production',
-  });
-  await apollo.start();
-
-  app.addHook('onClose', async () => {
-    await apollo.stop();
-    // Only end the pool if we're using the module-level default; callers that
-    // pass their own pool are responsible for closing it.
-    if (!db) await pool.end();
+  // ---------------------------------------------------------------------------
+  // CORS — allow all origins for the public API.
+  // Restrict via CORS_ORIGIN env var in production if needed.
+  // ---------------------------------------------------------------------------
+  await app.register(cors, {
+    origin: process.env.CORS_ORIGIN ?? true,
+    methods: ['GET', 'POST', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-API-Key'],
   });
 
+  // ---------------------------------------------------------------------------
+  // OpenAPI 3.0 spec — auto-generated from route schemas.
+  // ---------------------------------------------------------------------------
+  await app.register(swagger, {
+    openapi: {
+      openapi: '3.0.0',
+      info: {
+        title: 'Judgemind Public API',
+        description:
+          'Public REST API for accessing California tentative rulings, cases, judges, attorneys, and documents. ' +
+          'Unauthenticated requests are limited to 30 req/min. ' +
+          'Obtain an API key from your account settings for 500 req/min.',
+        version: '1.0.0',
+        contact: { email: 'api@judgemind.org' },
+        license: { name: 'Apache 2.0', url: 'https://www.apache.org/licenses/LICENSE-2.0' },
+      },
+      servers: [{ url: '/v1', description: 'API v1' }],
+      components: {
+        securitySchemes: {
+          apiKey: {
+            type: 'apiKey',
+            in: 'header',
+            name: 'X-API-Key',
+            description: 'API key from your Judgemind account settings',
+          },
+        },
+      },
+      tags: [
+        { name: 'Cases', description: 'Court cases' },
+        { name: 'Judges', description: 'Judges' },
+        { name: 'Attorneys', description: 'Attorneys' },
+        { name: 'Documents', description: 'Captured court documents' },
+        { name: 'Rulings', description: 'Tentative and final rulings' },
+      ],
+    },
+  });
+
+  // Swagger UI served at /docs
+  await app.register(swaggerUi, {
+    routePrefix: '/docs',
+    uiConfig: { docExpansion: 'list', deepLinking: true },
+    staticCSP: true,
+  });
+
+  // ---------------------------------------------------------------------------
+  // Health check
+  // ---------------------------------------------------------------------------
   app.get('/health', async (_req, reply) => {
     try {
       await pool.query('SELECT 1');
@@ -39,6 +85,21 @@ export async function buildApp(db?: Pool, os?: Client): Promise<FastifyInstance>
     } catch {
       return reply.status(503).send({ status: 'error', db: 'disconnected' });
     }
+  });
+
+  // ---------------------------------------------------------------------------
+  // GraphQL endpoint (existing)
+  // ---------------------------------------------------------------------------
+  const apollo = new ApolloServer({
+    typeDefs,
+    resolvers,
+    introspection: process.env.NODE_ENV !== 'production',
+  });
+  await apollo.start();
+
+  app.addHook('onClose', async () => {
+    await apollo.stop();
+    if (!db) await pool.end();
   });
 
   app.route({
@@ -61,7 +122,6 @@ export async function buildApp(db?: Pool, os?: Client): Promise<FastifyInstance>
           body: req.body,
           search: req.url.includes('?') ? req.url.slice(req.url.indexOf('?')) : '',
         },
-        // Fresh DataLoaders, auth context, and OpenSearch client per request.
         context: async () => {
           const user = await extractUser(req, pool);
           const ip = req.ip ?? req.headers['x-forwarded-for'] ?? 'unknown';
@@ -87,6 +147,11 @@ export async function buildApp(db?: Pool, os?: Client): Promise<FastifyInstance>
       return reply.send(body);
     },
   });
+
+  // ---------------------------------------------------------------------------
+  // REST API v1 — scoped under /v1 prefix
+  // ---------------------------------------------------------------------------
+  await app.register(restApiPlugin, { prefix: '/v1', pool });
 
   return app;
 }
