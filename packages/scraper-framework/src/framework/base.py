@@ -17,6 +17,14 @@ from .storage import S3Archiver
 logger = structlog.get_logger(__name__)
 
 
+class S3ArchivalError(RuntimeError):
+    """Raised when S3 archival fails for a document.
+
+    S3 failures are not recoverable per-document — document loss is unacceptable,
+    so this exception aborts the entire run rather than skipping the document.
+    """
+
+
 class BaseScraper(abc.ABC):
     """Abstract base class for all Judgemind court scrapers.
 
@@ -92,10 +100,16 @@ class BaseScraper(abc.ABC):
                 try:
                     self._process_document(doc)
                     records_captured += 1
+                except S3ArchivalError:
+                    # S3 failures are critical — document loss is unacceptable.
+                    # Re-raise to abort the run (caught by the outer except block).
+                    raise
                 except Exception as exc:
                     self._log.error(
-                        "Failed to process document",
-                        source_url=doc.source_url,
+                        "Document parse/extraction failed — skipping document",
+                        scraper_id=self.config.scraper_id,
+                        document_id=doc.document_id,
+                        exc_type=type(exc).__name__,
                         error=str(exc),
                     )
 
@@ -136,7 +150,13 @@ class BaseScraper(abc.ABC):
         doc = self.parse_document(doc)
 
         if self._archiver:
-            doc.s3_key = self._archiver.archive(doc)
+            try:
+                doc.s3_key = self._archiver.archive(doc)
+            except Exception as exc:
+                raise S3ArchivalError(
+                    f"S3 archival failed for document {doc.document_id} "
+                    f"(scraper {self.config.scraper_id}): {exc}"
+                ) from exc
             doc.validation_status = ValidationStatus.PENDING
 
         if self._event_bus:

@@ -96,6 +96,9 @@ class TestRunScrapersWithArchival:
     def test_creates_archiver_when_bucket_set(self) -> None:
         doc = _make_doc()
         captured_archiver = {}
+        mock_archiver_instance = MagicMock()
+        mock_archiver_instance.archive.return_value = "ca/test/key.html"
+        mock_archiver_cls = MagicMock(return_value=mock_archiver_instance)
 
         class CapturingStub(StubScraper):
             def __init__(self, **kwargs: object) -> None:
@@ -107,13 +110,13 @@ class TestRunScrapersWithArchival:
         with (
             _patch_registry(entries),
             patch.dict(os.environ, {"JUDGEMIND_ARCHIVE_BUCKET": "my-bucket"}),
+            patch("framework.runner.S3Archiver", mock_archiver_cls),
         ):
             exit_code = run_scrapers()
 
         assert exit_code == 0
-        archiver = captured_archiver["archiver"]
-        assert archiver is not None
-        assert archiver.bucket == "my-bucket"
+        assert captured_archiver["archiver"] is not None
+        mock_archiver_cls.assert_called_once_with(bucket="my-bucket")
 
     def test_archiver_called_per_document(self) -> None:
         doc = _make_doc()
