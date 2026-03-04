@@ -1,14 +1,17 @@
 import Fastify, { type FastifyInstance } from 'fastify';
 import { ApolloServer, HeaderMap } from '@apollo/server';
 import type { Pool } from 'pg';
+import type { Client } from '@opensearch-project/opensearch';
 import { typeDefs } from './graphql/schema';
 import { resolvers } from './graphql/resolvers';
 import { createLoaders } from './graphql/dataloader';
 import { pool as defaultPool } from './data-access/db';
 import { extractUser } from './auth';
+import { opensearchClient as defaultOsClient } from './search/client';
 
-export async function buildApp(db?: Pool): Promise<FastifyInstance> {
+export async function buildApp(db?: Pool, os?: Client): Promise<FastifyInstance> {
   const pool = db ?? defaultPool;
+  const opensearch = os ?? defaultOsClient;
 
   const app = Fastify({
     logger: process.env.NODE_ENV !== 'test',
@@ -58,13 +61,13 @@ export async function buildApp(db?: Pool): Promise<FastifyInstance> {
           body: req.body,
           search: req.url.includes('?') ? req.url.slice(req.url.indexOf('?')) : '',
         },
-        // Fresh DataLoaders and auth context per request.
+        // Fresh DataLoaders, auth context, and OpenSearch client per request.
         context: async () => {
           const user = await extractUser(req, pool);
           const ip = req.ip ?? req.headers['x-forwarded-for'] ?? 'unknown';
           const cookieHeader =
             typeof req.headers.cookie === 'string' ? req.headers.cookie : '';
-          return { pool, loaders: createLoaders(pool), user, ip, reply, cookieHeader };
+          return { pool, loaders: createLoaders(pool), user, ip, reply, cookieHeader, opensearch };
         },
       });
 

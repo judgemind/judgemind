@@ -19,6 +19,7 @@
   "dependencies": {
     "@apollo/server": "^4.10",
     "@aws-sdk/client-ses": "^3.1000.0",
+    "@opensearch-project/opensearch": "^3.5.1",
     "bcryptjs": "^2.4",
     "dataloader": "^2.2.3",
     "fastify": "^4.26",
