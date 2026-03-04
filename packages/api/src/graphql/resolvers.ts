@@ -1,8 +1,10 @@
 import type { Pool } from 'pg';
 import type { FastifyReply } from 'fastify';
+import type { Client } from '@opensearch-project/opensearch';
 import type { Loaders } from './dataloader';
 import type { AuthUser } from '../auth';
 import { authResolvers } from './auth-resolvers';
+import { searchRulings } from '../search/search-rulings';
 
 interface Context {
   pool: Pool;
@@ -11,6 +13,7 @@ interface Context {
   ip: string;
   reply: FastifyReply;
   cookieHeader: string;
+  opensearch: Client;
 }
 
 type Row = Record<string, unknown>;
@@ -42,6 +45,36 @@ function pageSize(first: number | undefined | null): number {
 export const resolvers = {
   Query: {
     health: () => 'ok',
+
+    // -----------------------------------------------------------------------
+    // searchRulings — full-text + filtered search via OpenSearch
+    // -----------------------------------------------------------------------
+
+    searchRulings: async (
+      _: unknown,
+      {
+        query,
+        filters,
+        first,
+        after,
+      }: {
+        query?: string;
+        filters?: {
+          court?: string;
+          county?: string;
+          state?: string;
+          judgeName?: string;
+          dateFrom?: string;
+          dateTo?: string;
+          caseNumber?: string;
+        };
+        first?: number;
+        after?: string;
+      },
+      { opensearch, pool }: Context,
+    ) => {
+      return searchRulings(opensearch, pool, { query, filters, first, after });
+    },
 
     // -----------------------------------------------------------------------
     // case / cases
@@ -385,6 +418,13 @@ export const resolvers = {
   Party: {
     canonicalName: (row: Row) => row.canonical_name,
     partyType: (row: Row) => row.party_type,
+  },
+
+  RulingSearchHit: {
+    rulingId: (hit: Row) => hit.rulingId,
+    caseNumber: (hit: Row) => hit.caseNumber,
+    judgeName: (hit: Row) => hit.judgeName,
+    hearingDate: (hit: Row) => hit.hearingDate,
   },
 
   // Auth resolvers

@@ -110,6 +110,56 @@ export const typeDefs = `#graphql
   }
 
   # ---------------------------------------------------------------------------
+  # Search — full-text search over OpenSearch
+  # ---------------------------------------------------------------------------
+
+  """Filters for tentative ruling search. All fields are optional."""
+  input RulingSearchFilters {
+    """Exact court name, e.g. "Superior Court of California, County of Los Angeles"."""
+    court: String
+    """Exact county name, e.g. "Los Angeles"."""
+    county: String
+    """Two-letter state code, e.g. "CA"."""
+    state: String
+    """Exact judge name as indexed, e.g. "Crowfoot, William A."."""
+    judgeName: String
+    """Hearing date on or after this date (ISO 8601)."""
+    dateFrom: String
+    """Hearing date on or before this date (ISO 8601)."""
+    dateTo: String
+    """Case number prefix, e.g. "24NNCV"."""
+    caseNumber: String
+  }
+
+  """A single search hit from the tentative ruling search."""
+  type RulingSearchHit {
+    """Ruling ID in the database — use with the ruling(id) query for full details."""
+    rulingId: ID!
+    caseNumber: String
+    court: String
+    county: String
+    state: String
+    judgeName: String
+    hearingDate: String
+    """Highlighted excerpt from the ruling text (HTML with <mark> tags)."""
+    excerpt: String
+    """Relevance score (only present for full-text queries)."""
+    score: Float
+  }
+
+  type RulingSearchEdge {
+    node: RulingSearchHit!
+    cursor: String!
+  }
+
+  type RulingSearchConnection {
+    edges: [RulingSearchEdge!]!
+    pageInfo: PageInfo!
+    """Total number of documents matching the query."""
+    totalHits: Int!
+  }
+
+  # ---------------------------------------------------------------------------
   # Pagination — keyset (cursor-based) for all list queries
   # ---------------------------------------------------------------------------
 
@@ -155,6 +205,20 @@ export const typeDefs = `#graphql
 
   type Query {
     health: String!
+
+    """Full-text + filtered search over tentative rulings via OpenSearch.
+    Provide a \`query\` for full-text BM25 search, \`filters\` for metadata filtering, or both.
+    An empty query with filters returns results sorted by hearing date descending."""
+    searchRulings(
+      """Free-text search query against ruling text."""
+      query: String
+      """Metadata filters (court, county, state, judge, dates, case number prefix)."""
+      filters: RulingSearchFilters
+      """Max results (default 20, max 100)."""
+      first: Int
+      """Opaque cursor from a previous response's pageInfo.endCursor."""
+      after: String
+    ): RulingSearchConnection!
 
     """Fetch a single case by ID."""
     case(id: ID!): Case
