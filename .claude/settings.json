@@ -59,7 +59,8 @@
       "Bash(ls*)",
       "Bash(wc*)",
       "Bash(find*)",
-      "Bash(echo*)"
+      "Bash(echo*)",
+      "Bash(bash scripts/*)"
     ]
   },
   "hooks": {
