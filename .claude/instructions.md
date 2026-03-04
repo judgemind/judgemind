@@ -101,14 +101,77 @@ gh issue comment <N> --repo judgemind/judgemind --body "Picking this up in worke
 
 ### Step 4 — Work autonomously until the PR is green
 
+**Single-issue rule:** each PR addresses exactly one issue. Do not combine unrelated changes in a single PR. If an issue is large or ambiguous, break it into sub-tasks first (see **Creating Sub-Tasks**), label them `agent/ready`, then pick up the first sub-task.
+
+Complete every substep in order. A task is not done until substep 4.8 is finished. Do not ask the user for confirmation during any of these steps.
+
+#### 4.1 — Understand the problem
+
 - Read the issue thoroughly, including linked issues.
 - Check `docs/specs/` for relevant guidance (product spec, architecture spec, investigation reports).
 - Look at existing code for patterns. Be consistent with what's already there.
-- If the issue is large or ambiguous, break it into sub-tasks first (see **Creating Sub-Tasks**), label them `agent/ready`, then pick up the first sub-task.
 - If you need a decision from the maintainer, comment on the issue, label it `status/blocked`, and pick up a different task. Do not guess on ambiguous requirements.
-- Implement, run **all** pre-PR checks (see "Pre-PR Checks" section — lint, format, AND tests), commit, push, and open a PR.
-- After pushing, watch CI and iterate until green (see **Git Workflow**).
-- Do not ask the user for confirmation during any of these steps.
+
+#### 4.2 — Implement and verify locally
+
+- Implement the change.
+- Run **all** pre-PR checks (see "Pre-PR Checks" section — lint, format, AND tests) for every package you touched.
+- Fix any failures before proceeding. Do not push code that fails local checks.
+
+#### 4.3 — Push and open a PR
+
+- Commit using conventional commits: `feat(scraping): implement OC PDF link scraper (#42)`
+- Push the branch and immediately open a PR. Never push without creating a PR.
+
+#### 4.4 — Verify no merge conflicts
+
+- Check for merge conflicts:
+  ```
+  gh pr view <N> --repo judgemind/judgemind --json mergeable,mergeStateStatus
+  ```
+- If `mergeable` is `CONFLICTING`, rebase onto main and resolve conflicts:
+  ```
+  git -C $REPO_ROOT/worktrees/worker-N fetch origin main
+  git -C $REPO_ROOT/worktrees/worker-N rebase origin/main
+  ```
+  Resolve any conflicts, then `git rebase --continue`, then push with `--force-with-lease`.
+
+#### 4.5 — Monitor CI
+
+- Watch CI after every push:
+  ```
+  gh run watch <run-id> --repo judgemind/judgemind --exit-status --compact
+  ```
+- Do not move on until CI completes.
+
+#### 4.6 — Fix CI failures (repeat until green)
+
+- If CI fails, diagnose the failure, fix it locally, push again, and return to substep 4.4.
+- Repeat the 4.4 → 4.5 → 4.6 loop until CI is green. Do not proceed until all checks pass.
+
+#### 4.7 — Update the PR test plan
+
+- Fetch the current PR body:
+  ```
+  gh pr view <N> --repo judgemind/judgemind --json body -q .body
+  ```
+- Check off each automated step that passed in CI (typecheck, lint, test). Leave manual steps unchecked until you run them.
+- For manual smoke tests (e.g. `npm run dev` + `curl /health`), create a temporary worktree:
+  ```
+  git -C $REPO_ROOT fetch origin <branch>
+  git -C $REPO_ROOT worktree add $REPO_ROOT/worktrees/smoketest FETCH_HEAD
+  # run smoke test...
+  git -C $REPO_ROOT worktree remove $REPO_ROOT/worktrees/smoketest
+  ```
+- Write the updated body to `{worktree}/tmp/pr_body.txt` and update:
+  ```
+  gh pr edit <N> --repo judgemind/judgemind --body-file {worktree}/tmp/pr_body.txt
+  ```
+
+#### 4.8 — Link the issue and request review
+
+- Comment on the issue linking the PR.
+- Add the `status/review` label to the issue.
 
 ## Tool Use Rules
 
@@ -225,37 +288,7 @@ Do NOT rely on CI to catch issues that local checks would have caught. If a suba
 
 - Commit messages follow conventional commits: `feat(scraping): implement OC PDF link scraper (#42)`
 - Always branch from `main` (`feat/issue-{N}-short-description`), open a PR, wait for CI to pass, then request human review. Never merge your own PRs. Never push directly to `main`.
-- **A PR is not done until it has no conflicts and CI is green.**
-  - After opening a PR, check for merge conflicts: `gh pr view <N> --repo judgemind/judgemind --json mergeable,mergeStateStatus`
-  - If `mergeable` is `CONFLICTING`, rebase onto main and resolve conflicts before doing anything else:
-    ```
-    git -C $REPO_ROOT/worktrees/worker-N fetch origin main
-    git -C $REPO_ROOT/worktrees/worker-N rebase origin/main
-    ```
-    Resolve any conflicts, then `git rebase --continue`, then push with `--force-with-lease`.
-  - After pushing, watch CI: `gh run watch <run-id> --repo judgemind/judgemind --exit-status --compact`
-  - If CI fails, diagnose the failure, fix it, push again, and repeat until green. Only then comment on the issue linking the PR and add the `status/review` label.
-
-### Updating the PR Test Plan
-
-After CI passes, **always** update the PR test plan checkboxes before considering a task done:
-
-1. Fetch the current PR body:
-   ```
-   gh pr view <N> --repo judgemind/judgemind --json body -q .body
-   ```
-2. Check off each automated step that passed in CI (typecheck, lint, test). Leave manual steps unchecked until you run them.
-3. For manual smoke tests (e.g. `npm run dev` + `curl /health`): the PR branch isn't on `main` yet, so create a temporary detached worktree from the branch:
-   ```
-   git -C $REPO_ROOT fetch origin <branch>
-   git -C $REPO_ROOT worktree add $REPO_ROOT/worktrees/smoketest FETCH_HEAD
-   # run smoke test...
-   git -C $REPO_ROOT worktree remove $REPO_ROOT/worktrees/smoketest
-   ```
-4. Write the updated body to `{worktree}/tmp/pr_body.txt` and update the PR:
-   ```
-   gh pr edit <N> --repo judgemind/judgemind --body-file {worktree}/tmp/pr_body.txt
-   ```
+- **A PR is not done until it has no conflicts and CI is green.** Follow the complete post-push checklist in Step 4 (substeps 4.4–4.8) — do not skip any step.
 
 ## Task Dependencies
 
