@@ -99,6 +99,11 @@ gh issue edit <N> --repo judgemind/judgemind --add-assignee @me
 gh issue comment <N> --repo judgemind/judgemind --body "Picking this up in worker-N."
 ```
 
+Then **rename this conversation** so it is identifiable in the sidebar:
+- Format: `#<N> — <short title>` (e.g. `#42 — Deploy LA/OC/Riverside scrapers`)
+- Use the issue number and a shortened version of the issue title (drop the `[AREA]` prefix tag).
+- In Claude Code on the web, type `/rename #<N> — <short title>` to set the conversation name.
+
 ### Step 4 — Work autonomously until the PR is green
 
 **Single-issue rule:** each PR addresses exactly one issue. Do not combine unrelated changes in a single PR. If an issue is large or ambiguous, break it into sub-tasks first (see **Creating Sub-Tasks**), label them `agent/ready`, then pick up the first sub-task.
