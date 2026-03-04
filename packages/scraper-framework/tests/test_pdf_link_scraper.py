@@ -12,6 +12,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import httpx
+import pytest
 import respx
 
 from courts.ca.oc_tentatives import (
@@ -44,6 +45,8 @@ from courts.ca.riverside_tentatives import (
 from courts.ca.riverside_tentatives import (
     default_config as riv_default_config,
 )
+
+pytestmark = pytest.mark.regression
 
 FIXTURES = Path(__file__).parent / "fixtures"
 

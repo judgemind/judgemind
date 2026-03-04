@@ -15,6 +15,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import httpx
+import pytest
 import respx
 
 from courts.ca.pdf_link_scraper import _extract_pdf_links, _extract_pdf_text
@@ -26,6 +27,8 @@ from courts.ca.sb_tentatives import (
     _sb_judge_from_pdf_text,
 )
 from courts.ca.sb_tentatives import default_config as sb_default_config
+
+pytestmark = pytest.mark.regression
 
 FIXTURES = Path(__file__).parent / "fixtures"
 

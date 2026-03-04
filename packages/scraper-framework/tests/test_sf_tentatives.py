@@ -13,6 +13,7 @@ from datetime import datetime
 from pathlib import Path
 
 import httpx
+import pytest
 import respx
 
 from courts.ca.pdf_link_scraper import _extract_pdf_links, _extract_pdf_text
@@ -25,6 +26,8 @@ from courts.ca.sf_tentatives import (
     _sf_judge_from_pdf_text,
 )
 from courts.ca.sf_tentatives import default_config as sf_default_config
+
+pytestmark = pytest.mark.regression
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
