@@ -7,20 +7,22 @@ types.setTypeParser(1082, (val: string) => val); // DATE       → 'YYYY-MM-DD'
 types.setTypeParser(1114, (val: string) => val); // TIMESTAMP  → 'YYYY-MM-DD HH:MI:SS'
 types.setTypeParser(1184, (val: string) => val); // TIMESTAMPTZ → ISO string
 
-const connectionString =
+const rawUrl =
   process.env.DATABASE_URL ?? 'postgresql://judgemind:localdev@localhost:5432/judgemind';
 
-// When connecting to RDS with sslmode=require, the pg driver (v8.x) maps it to
-// verify-full, which requires the server certificate to match the hostname.
-// Depending on the Node.js base image and CA bundle this can fail silently.
-// Explicitly set rejectUnauthorized: false for sslmode=require to match standard
-// libpq semantics (encrypt the connection without verifying the certificate).
-const needsSsl = connectionString.includes('sslmode=');
-const sslOpts = needsSsl ? { rejectUnauthorized: false } : false;
+// The pg driver (v8.x) maps sslmode=require to verify-full, which can fail
+// against RDS depending on the Node.js base image CA bundle. Strip the sslmode
+// parameter from the URL and configure SSL via the Pool's ssl option instead,
+// using rejectUnauthorized: false (encrypt without certificate verification —
+// matching standard libpq sslmode=require semantics).
+const needsSsl = /[?&]sslmode=/.test(rawUrl);
+const connectionString = needsSsl
+  ? rawUrl.replace(/[?&]sslmode=[^&]*/g, '').replace(/\?$/, '')
+  : rawUrl;
 
 export const pool = new Pool({
   connectionString,
-  ssl: sslOpts,
+  ssl: needsSsl ? { rejectUnauthorized: false } : false,
   max: 10,
   idleTimeoutMillis: 30_000,
   connectionTimeoutMillis: 5_000,
