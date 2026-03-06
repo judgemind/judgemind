@@ -2,6 +2,32 @@
 
 **STOP. Read this entire file before doing anything else.** Do not explore the codebase, do not read other files, do not respond substantively to the user's request until you have read this file. This file defines your mandatory workflow — deviating from it is a bug.
 
+## Critical Rules — Read First
+
+These are the most frequently violated rules. **A PreToolUse hook enforces the shell rules automatically**, but you must internalize all of them. See `docs/preflight-checklist.md` for the complete machine-readable checklist.
+
+### NEVER — Shell Commands
+- **NEVER** use `$()` command substitution in any Bash command. Run the inner command as a separate tool call and use the literal result.
+- **NEVER** use heredocs (`<<EOF`) in Bash commands. Write content to a file with the Write tool, then pass via `--body-file` or `-F`.
+- **NEVER** use `python3 -c "..."` for inline scripts. Write to `{worktree}/tmp/script.py` and run the file.
+- **NEVER** combine quoted strings with `&&` or `;`. Split into separate tool calls.
+- **NEVER** prefix scripts with `bash` — run `scripts/start-worker.sh`, not `bash scripts/start-worker.sh`.
+
+### NEVER — Workflow
+- **NEVER** commit directly to `main` during autonomous task work. All `/task` work happens on worktree branches via PRs. (The user may direct you to commit to `main` during interactive sessions — that's fine.)
+- **NEVER** merge your own PRs. Request review and wait for human merge.
+- **NEVER** deploy to production. Production deploys are human-only.
+- **NEVER** skip pre-PR checks. Run lint, format, AND tests locally before pushing.
+- **NEVER** share venvs between worktrees. Each worktree gets its own `.venv`.
+
+### ALWAYS — Before Acting
+- **ALWAYS** Read a file before Writing to it (the Write tool fails on existing files you haven't read).
+- **ALWAYS** pull latest code (`git fetch origin main && git rebase origin/main`) before analyzing or modifying files.
+- **ALWAYS** use `{worktree}/tmp/` for temp files, never `/tmp/`.
+- **ALWAYS** use dedicated tools (Read, Glob, Grep) instead of Bash for file operations.
+- **ALWAYS** watch CI to completion (`gh run watch`) before doing anything else after pushing.
+- **ALWAYS** create a PR immediately after your first push to a branch.
+
 ## Project Context
 
 Judgemind is a free, open-source legal research platform replacing Trellis.law. Read the specs in `docs/specs/` for full context. The key things to know:
@@ -13,11 +39,14 @@ Judgemind is a free, open-source legal research platform replacing Trellis.law. 
 
 ## Starting a New Session
 
-**Always do Steps 0–2 at the start of every session, without waiting for any instruction.** These establish your isolated workspace and must happen before you respond substantively to any request.
+Wait for the user's instruction before deciding what to do. Sessions may involve interactive work on the main branch, or autonomous task work via `/task`. Do not assume which mode — let the user direct you.
 
-To pick up a task after setup, use the `/task` skill (see `/task` below).
+### Available Skills
 
-### Steps 0–2 — Run the setup script
+- **`/task`** — Full autonomous pipeline: ensures a worktree exists (runs setup if needed), claims an issue, implements it, opens a PR, and requests review. Accepts `#N`, natural language filters, or no argument (picks highest priority). **This is the primary way to start autonomous work.**
+- **`/tdd`** — Test-driven implementation for code tasks (Python, TypeScript). Called by `/task` automatically for testable code work. Can also be invoked manually after claiming an issue. **Not for** Terraform, DB migrations, CI/CD, docs, or investigation tasks.
+
+### Worktree setup (manual)
 
 Run this from anywhere inside the repo (including from inside an existing worktree):
 
@@ -38,7 +67,7 @@ It prints the worktree path on stdout, e.g. `/path/to/worktrees/worker-2`. **Rec
 
 All subsequent work happens inside `{worktree}`. Use `{worktree}/tmp/` for **all** temporary files (scripts, PR bodies, etc.) — this directory is gitignored and scoped to your worker, so there are no permission prompts and no collisions between workers.
 
-**Venv isolation:** each agent must create its own venv inside the worktree for every Python package it works in. Never use the venv from the main repo or another worktree — multiple agents on the same machine will stomp on each other if they share a venv. After creating the worktree, set up a venv for each package you need:
+**Venv isolation:** each agent must create its own venv inside the worktree for every Python package it works in. Never use the venv from the main repo or another worktree — multiple agents on the same machine will stomp on each other if they share a venv. The `/task` skill sets up venvs in step A.1 after identifying which packages are needed. If setting up manually:
 
 ```
 python3.12 -m venv {worktree}/packages/<pkg>/.venv
@@ -385,8 +414,9 @@ These patterns avoid permission prompts and allow the agent to run without inter
 
 ## Session Triggers
 
-- **Always run Steps 0–2 immediately** at the start of every session (resolve repo root, claim worker number, create worktree) — before responding to any user request.
-- To pick up work, invoke `/task`. Proceed autonomously from issue selection through PR and review request without waiting for further instruction.
+- When the user asks to pick up work (e.g. "let's go", "start", "pick up a task"), invoke `/task`. It handles everything — worktree setup (if needed), issue selection, implementation, PR, and review request. Proceed autonomously without waiting for further instruction.
+- `/task` automatically uses the `/tdd` TDD workflow for testable code tasks (Python, TypeScript). For infrastructure, migrations, and docs it implements directly.
+- If the user gives a specific instruction without invoking `/task`, work on it directly. Not every session requires a worktree or a GitHub issue.
 
 ## Improving the Agent Workflow
 

@@ -70,6 +70,7 @@
       "Bash(find:*)",
       "Bash(echo:*)",
       "Bash(npm:*)",
+      "Bash(npx:*)",
       "Bash(node:*)",
       "Bash(cd:*)",
       "Bash(pwd:*)",
@@ -89,6 +90,18 @@
     ]
   },
   "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash .claude/hooks/preflight-bash.sh",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
     "SessionStart": [
       {
         "hooks": [

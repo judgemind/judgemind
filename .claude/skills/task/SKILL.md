@@ -1,5 +1,5 @@
 ---
-description: Pick up and complete a Judgemind GitHub issue autonomously — from selection through PR and review request. Usage: /task (next ready issue), /task #42 (specific issue), /task scrapers (natural-language filter).
+description: Pick up and complete a Judgemind GitHub issue autonomously — from worktree setup through PR and review request. Usage: /task (next ready issue), /task #42 (specific issue), /task scrapers (natural-language filter).
 argument-hint: "[#issue | category | next]"
 ---
 
@@ -7,7 +7,21 @@ argument-hint: "[#issue | category | next]"
 
 Pick up one issue from the Judgemind backlog and complete it autonomously. Do not ask for confirmation at any point — work through every step and stop only when the PR is green and review has been requested (or when an investigation task has posted its findings and unblocked any dependents).
 
-**Prerequisite:** Steps 0–2 from CLAUDE.md (resolve repo root, claim worker number, create worktree) must already be complete. If they haven't happened yet, do them now before proceeding.
+---
+
+## Step 0 — Ensure worktree exists
+
+Check whether you are already working inside a worktree (i.e. `{worktree}` is set and the directory exists). If not, run the setup script:
+
+```
+scripts/start-worker.sh
+```
+
+This resolves the repo root, prunes stale worktrees, claims the lowest available worker number, creates the worktree, configures git hooks, and creates the `tmp/` directory.
+
+**Record the printed worktree path** — it is `{worktree}` for the rest of the session. All subsequent work happens inside `{worktree}`.
+
+If you are already in a worktree, skip this step.
 
 ---
 
@@ -67,11 +81,48 @@ If the issue requires a maintainer decision before you can proceed: comment on i
 
 Follow the full PR Workflow defined in CLAUDE.md. **All commits must be on the worktree branch — never on `main`.** Summary of required substeps:
 
-#### A.1 — Implement and verify locally
-- Implement the change on the worktree branch.
-- Run ALL pre-PR checks for every package touched (see CLAUDE.md §Pre-PR Checks). Fix any failures before proceeding. Do not push code that fails local checks.
+#### A.1 — Set up dependencies
+For Python packages you will touch, create a venv:
+```
+python3.12 -m venv {worktree}/packages/<pkg>/.venv
+```
+Then install: `.venv/bin/pip install -e ".[dev]" --quiet`
 
-#### A.2 — Commit and push
+For TypeScript packages: `npm install` from the package directory.
+
+Skip this for Terraform-only or docs-only tasks.
+
+#### A.2 — Implement and verify locally
+- **For testable code tasks** (Python, TypeScript): use the `/tdd` workflow — write failing tests first, implement until green, run all checks. See `.claude/skills/tdd/SKILL.md`.
+- **For non-testable tasks** (Terraform, DB migrations, CI/CD, docs): implement directly, then run all applicable pre-PR checks (see CLAUDE.md §Pre-PR Checks).
+- Fix any failures before proceeding. Do not push code that fails local checks.
+
+#### A.3 — Review your own diff
+
+Before committing, review the complete diff and check for untracked files:
+
+```
+git -C {worktree} diff
+git -C {worktree} status
+```
+
+Check for:
+- **Scope creep**: changes unrelated to the issue (extra refactors, added comments, unrelated fixes). Remove them.
+- **Forgotten debug code**: print statements, console.logs, hardcoded test values.
+- **Missing files**: did you forget to create or modify a file the implementation requires?
+- **Consistency**: does the change follow existing patterns in the codebase?
+- **Test coverage gaps**: are there obvious edge cases the tests don't cover?
+- **Stale references**: do comments, docstrings, or imports reference things that changed?
+- **Untracked files**: does `git status` show files you meant to include, or files that shouldn't be committed?
+
+If you find issues, fix them and re-run the pre-PR checks before continuing. Repeat this review until the diff is clean.
+
+#### A.4 — Stage, commit, and push
+Stage the files you changed (prefer naming specific files over `git add .`):
+```
+git -C {worktree} add <files>
+```
+
 Write the commit message to a file, then commit:
 ```
 git -C {worktree} commit -F {worktree}/tmp/commit_msg.txt
@@ -87,7 +138,7 @@ gh pr create --repo judgemind/judgemind \
     --base main
 ```
 
-#### A.3 — Verify no merge conflicts
+#### A.5 — Verify no merge conflicts
 ```
 gh pr view <PR-N> --repo judgemind/judgemind --json mergeable,mergeStateStatus
 ```
@@ -98,22 +149,27 @@ git -C {worktree} rebase origin/main
 ```
 Resolve conflicts, `git rebase --continue`, then push with `--force-with-lease`.
 
-#### A.4 — Monitor CI and iterate until green
+#### A.6 — Monitor CI and iterate until green
 ```
 gh run watch <run-id> --repo judgemind/judgemind --exit-status --compact
 ```
-If CI fails: diagnose, fix locally, push, return to A.3. Repeat until all checks pass.
+If CI fails: diagnose, fix locally, push, return to A.5. Repeat until all checks pass.
 
-#### A.5 — Update the PR test plan
-Fetch the current PR body, check off automated steps that passed in CI, run any manual smoke tests in a temporary smoketest worktree (see CLAUDE.md §4.7 for the pattern), write the updated body to `{worktree}/tmp/pr_body.txt`, then:
+#### A.7 — Update the PR test plan
+Fetch the current PR body, check off automated steps that passed in CI, run any manual smoke tests in a temporary smoketest worktree (see CLAUDE.md §4.8 for the pattern), write the updated body to `{worktree}/tmp/pr_body.txt`, then:
 ```
 gh pr edit <PR-N> --repo judgemind/judgemind --body-file {worktree}/tmp/pr_body.txt
 ```
 
-#### A.6 — Link the issue and request review
+#### A.8 — Link the issue and request review
 Comment on the issue linking the PR. Add `status/review` label to the issue.
 
 **Dependent issues will be unblocked automatically** by the `unblock-issues` workflow when this PR is merged. No manual unblocking needed.
+
+#### A.9 — Remove worktree
+```
+scripts/end-worker.sh {worktree}
+```
 
 ---
 
@@ -138,11 +194,15 @@ For each result, check every `Blocked by #X` line. If **all** referenced issues 
 
 If any blocker is still open, leave the issue as blocked.
 
+Clean up: `scripts/end-worker.sh {worktree}`
+
 ---
 
 ### Path C: Large or ambiguous task
 
-Break into sub-tasks first (see CLAUDE.md §Creating Sub-Tasks), label them `agent/ready`, then invoke `/task` again to pick up the first sub-task.
+Break into sub-tasks first (see CLAUDE.md §Creating Sub-Tasks), label them `agent/ready`, then pick up the first sub-task (restart from Step 1).
+
+If you only create sub-tasks and do not pick one up in this session, clean up: `scripts/end-worker.sh {worktree}`
 
 ---
 
