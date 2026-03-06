@@ -6,6 +6,10 @@ terraform {
       source  = "hashicorp/aws"
       version = "~> 5.0"
     }
+    cloudflare = {
+      source  = "cloudflare/cloudflare"
+      version = "~> 4.0"
+    }
     random = {
       source  = "hashicorp/random"
       version = "~> 3.0"
@@ -32,6 +36,9 @@ provider "aws" {
     }
   }
 }
+
+# CLOUDFLARE_API_TOKEN env var is read automatically by this provider.
+provider "cloudflare" {}
 
 variable "aws_region" {
   description = "AWS region"
@@ -104,4 +111,9 @@ module "compute" {
   private_subnet_ids    = module.networking.private_subnet_ids
   ecr_repository_url    = module.ecr.repository_url
   scraper_task_role_arn = module.iam_scraper.role_arn
+}
+
+module "dns" {
+  source = "./modules/dns"
+  # All variables have defaults; real values are set in environments/dns/main.tf.
 }

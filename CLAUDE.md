@@ -45,9 +45,6 @@ Only install venvs for packages you actually work in during the session.
 
 ### Step 3 — Pick up a task
 
-<<<<<<< HEAD
-### Step 3 — Pick up a task
-
 Use the `/task` skill to claim and work on an issue. Run it after completing Steps 0–2:
 
 - `/task` — picks the next highest-priority unassigned `agent/ready` issue
@@ -55,28 +52,13 @@ Use the `/task` skill to claim and work on an issue. Run it after completing Ste
 - `/task scrapers` / `/task next perf bug` / etc. — natural-language filter over the backlog
 
 The skill works autonomously from issue selection through PR and review request. The PR workflow it follows is defined in the next section.
-
-=======
-Use the `/task` skill to claim and work on an issue. Run it after completing Steps 0–2:
-
-- `/task` — picks the next highest-priority unassigned `agent/ready` issue
-- `/task #42` — works on a specific issue number
-- `/task scrapers` / `/task next perf bug` / etc. — natural-language filter over the backlog
-
-The skill works autonomously from issue selection through PR and review request. The PR workflow it follows is defined in the next section.
-
->>>>>>> d245ba7 (dx(workflow): replace manual Steps 0-2 with start-worker.sh script)
 ## PR Workflow (authoritative — applies to all task work)
 
 **Single-issue rule:** each PR addresses exactly one issue. Do not combine unrelated changes in a single PR. If an issue is large or ambiguous, break it into sub-tasks first (see **Creating Sub-Tasks**), label them `agent/ready`, then pick up the first sub-task.
 
 **All commits must be made on the worktree branch created in Step 2, never directly on `main`.** Every change goes through a PR — no direct pushes to `main`, ever.
 
-<<<<<<< HEAD
-Complete every substep in order. A task is not done until substep 4.8 is finished. Do not ask the user for confirmation during any of these steps.
-=======
 Complete every substep in order. A task is not done until substep 4.9 is finished. Do not ask the user for confirmation during any of these steps.
->>>>>>> d245ba7 (dx(workflow): replace manual Steps 0-2 with start-worker.sh script)
 
 #### 4.1 — Understand the problem
 
