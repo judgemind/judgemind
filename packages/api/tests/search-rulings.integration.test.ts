@@ -362,7 +362,7 @@ describe('searchRulings — integration', () => {
 
     it('returns results filtered by date range', async () => {
       const body = await gql(`{
-        searchRulings(filters: { dateFrom: "2026-04-11", dateTo: "2026-04-11" }) {
+        searchRulings(filters: { dateFrom: "2026-02-11", dateTo: "2026-02-11" }) {
           edges { node { rulingId hearingDate } }
           totalHits
         }
