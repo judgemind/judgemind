@@ -28,9 +28,10 @@ Courthouse mapping (best-effort — Riverside has many locations):
 from __future__ import annotations
 
 import re
+from datetime import datetime
 from typing import Any
 
-from framework import ScheduleWindow, ScraperConfig
+from framework import CapturedDocument, ScheduleWindow, ScraperConfig
 
 from .pdf_link_scraper import PdfLinkConfig, PdfLinkScraper
 
@@ -45,6 +46,31 @@ _LINK_TEXT_RE = re.compile(
 
 # Case numbers like "CVPS2306157", "CVRI2412345"
 _CASE_NUMBER_RE = re.compile(r"\bCV[A-Z]{2,4}\d{6,8}\b")
+
+
+# Hearing date from PDF text:
+#   "Tentative Rulings for March 2, 2026"
+#   "No Tentative Rulings March 2, 2026"
+_HEARING_DATE_RE = re.compile(
+    r"(?:Tentative Rulings\s+(?:for\s+)?|No Tentative Rulings\s+)"
+    r"(?P<date>(?:January|February|March|April|May|June|July|August"
+    r"|September|October|November|December)\s+\d{1,2},?\s+\d{4})",
+    re.IGNORECASE,
+)
+
+
+def _riv_hearing_date_from_text(text: str) -> datetime | None:
+    """Extract hearing date from Riverside PDF text."""
+    m = _HEARING_DATE_RE.search(text)
+    if not m:
+        return None
+    raw = " ".join(m.group("date").split())
+    for fmt in ("%B %d, %Y", "%B %d %Y"):
+        try:
+            return datetime.strptime(raw, fmt)
+        except ValueError:
+            continue
+    return None
 
 
 def _riv_courthouse(dept: str) -> str | None:
@@ -76,6 +102,16 @@ class RiversideTentativeRulingsScraper(PdfLinkScraper):
             case_number_re=_CASE_NUMBER_RE,
         )
         super().__init__(config, pdf_config=pdf_config, **kwargs)
+
+    def parse_document(self, doc: CapturedDocument) -> CapturedDocument:
+        """Extract case numbers (via super) and hearing date from PDF text."""
+        doc = super().parse_document(doc)
+
+        # Extract hearing date from PDF text
+        if doc.ruling_text and not doc.hearing_date:
+            doc.hearing_date = _riv_hearing_date_from_text(doc.ruling_text)
+
+        return doc
 
 
 def default_config(s3_bucket: str = "") -> ScraperConfig:
