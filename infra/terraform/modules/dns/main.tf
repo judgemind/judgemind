@@ -158,6 +158,35 @@ resource "cloudflare_record" "prod_web" {
   ttl     = 1
 }
 
+# ─── CAA Records ─────────────────────────────────────────────────────────────
+
+# Allow Amazon (ACM) to issue certificates alongside the existing CAs.
+resource "cloudflare_record" "caa_amazon" {
+  zone_id = local.zone_id
+  name    = "@"
+  type    = "CAA"
+  ttl     = 300
+
+  data {
+    flags = "0"
+    tag   = "issue"
+    value = "amazon.com"
+  }
+}
+
+resource "cloudflare_record" "caa_amazontrust" {
+  zone_id = local.zone_id
+  name    = "@"
+  type    = "CAA"
+  ttl     = 300
+
+  data {
+    flags = "0"
+    tag   = "issue"
+    value = "amazontrust.com"
+  }
+}
+
 # ─── ACM Certificate Validation ───────────────────────────────────────────────
 
 resource "cloudflare_record" "acm_validation" {
