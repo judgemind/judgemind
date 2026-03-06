@@ -37,7 +37,7 @@ gh issue list --repo judgemind/judgemind \
     --json number,title,assignees,labels \
     --limit 20
 ```
-Priority order: `priority/critical` > `priority/high` > `priority/medium` > `priority/low`. Within the same priority, prefer lower issue numbers (older issues first). Skip issues already assigned to another agent unless their worktree no longer exists in `git -C $REPO_ROOT worktree list`.
+Priority order: `priority/p0` > `priority/p1` > `priority/p2` > `priority/p3`. Within the same priority, prefer lower issue numbers (older issues first). Skip issues already assigned to another agent unless their worktree no longer exists in `git -C $REPO_ROOT worktree list`.
 
 ### `#N` (e.g. `/task #42`)
 Work on that specific issue regardless of its current labels or assignment. Fetch it:
@@ -81,14 +81,16 @@ After claiming the issue, create todos using `TaskCreate` to track your major wo
 5. "Verify no merge conflicts" — check mergeable status
 6. "Update PR test plan" — check off test plan items
 7. "Merge PR" — squash merge after CI is green
-8. "Remove worktree" — cleanup
+8. "Retrospective" — identify workflow efficiencies and preventative measures
+9. "Remove worktree" — cleanup
 
 **For investigation tasks (Path B):**
 1. "Investigate and document findings"
 2. "File follow-up issues"
 3. "Post summary and request review"
 4. "Unblock dependent issues"
-5. "Remove worktree"
+5. "Retrospective" — identify workflow efficiencies and preventative measures
+6. "Remove worktree"
 
 Mark each todo `in_progress` when you start it and `completed` when done. If a task has fewer than 3 steps total (e.g. a trivial fix), skip todo creation.
 
@@ -174,10 +176,9 @@ gh pr merge <PR-N> --repo judgemind/judgemind --squash --delete-branch
 
 **Dependent issues will be unblocked automatically** by the `unblock-issues` workflow when the PR merges. No manual unblocking needed.
 
-#### A.8 — Remove worktree
-```
-scripts/end-worker.sh {worktree}
-```
+#### A.8 — Proceed to retrospective
+
+Continue to Step 5.
 
 ---
 
@@ -212,7 +213,7 @@ For each result, check every `Blocked by #X` line. If **all** referenced issues 
 
 If any blocker is still open, leave the issue as blocked.
 
-Clean up: `scripts/end-worker.sh {worktree}`
+Continue to Step 5.
 
 ---
 
@@ -220,7 +221,47 @@ Clean up: `scripts/end-worker.sh {worktree}`
 
 Break into sub-tasks first (see CLAUDE.md §Creating Sub-Tasks), label them `agent/ready`, then pick up the first sub-task (restart from Step 1).
 
-If you only create sub-tasks and do not pick one up in this session, clean up: `scripts/end-worker.sh {worktree}`
+If you only create sub-tasks and do not pick one up in this session, clean up: `scripts/end-worker.sh {worktree}` (skip Step 5 — no retrospective needed for task breakdown).
+
+---
+
+## Step 5 — Retrospective
+
+After completing a task (Path A or Path B), reflect on the work before cleaning up. This step produces concrete improvements to the codebase and workflow — not just observations.
+
+### 5a — Workflow efficiency
+
+Review what you did during this task and ask:
+
+- **Was there agent work that a script could do cheaper?** For example: boilerplate setup, repeated lint-fix-retry cycles, mechanical transformations, or data gathering that could be a CLI tool. If so, file an issue to create the script/tool.
+- **Did you hit permission prompts or workflow friction that slowed you down?** If so, file an issue to add the pattern to CLAUDE.md's "Unattended Operation Patterns" section or to `.claude/settings.json`.
+- **Did the ralph loop take more iterations than necessary?** If a clearer task description, better test fixtures, or a pre-built utility would have reduced iterations, file an issue for that.
+
+### 5b — Preventative measures
+
+Review the bug or problem you just fixed and ask:
+
+- **What would have caught this earlier?** Could a lint rule, type check, test, CI check, or runtime assertion have detected this class of bug before it reached production? If so, file an issue to add that check.
+- **Is this a pattern that could recur?** If the same kind of bug could appear in other scrapers, endpoints, or modules, file an issue to audit and fix those too — or to add a shared utility/base class that prevents the bug by construction.
+- **Were there missing or misleading docs/specs?** If the issue was caused or complicated by stale documentation, file an issue to update it.
+
+### 5c — File issues
+
+For each actionable finding from 5a and 5b:
+
+- Write the issue body to `{worktree}/tmp/retro_N.txt`, then create it with `gh issue create --body-file`.
+- Label with `type/dx` (workflow improvements) or the appropriate area label (preventative measures).
+- Set priority based on impact: `priority/p1` for things that would prevent production bugs or save significant agent time across many tasks; `priority/p2` for nice-to-have workflow improvements or one-off friction. **Never set `priority/p0`** — that priority is reserved for humans.
+- Add `agent/ready` so the issue can be picked up autonomously.
+- Keep issue scope tight — one improvement per issue. An agent should be able to pick it up and complete it in a single session.
+
+If the task was trivial and there are genuinely no improvements to make, that's fine — skip filing. But default to filing. The bar is "would this save time or prevent bugs across future tasks?"
+
+### 5d — Remove worktree
+
+```
+scripts/end-worker.sh {worktree}
+```
 
 ---
 
