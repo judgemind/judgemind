@@ -95,10 +95,35 @@ export function formatOutcome(outcome: string | null): string {
     .replace(/\b\w/g, (c) => c.toUpperCase());
 }
 
+/**
+ * Known full motion type mappings (lowercased key -> display label).
+ * Checked before the generic title-case logic so compound terms like
+ * "anti_slapp" render correctly.
+ */
+const MOTION_TYPE_MAP: Record<string, string> = {
+  anti_slapp: 'Anti-SLAPP',
+};
+
+/** Abbreviations that should stay fully uppercase. */
+const UPPERCASE_MOTION_WORDS = new Set(['msj', 'mtd', 'mil']);
+
+/** Small words that stay lowercase unless they are the first word. */
+const LOWERCASE_WORDS = new Set(['to', 'for', 'of', 'in', 'on', 'the', 'a', 'an']);
+
 /** Format a motion type for display, returning a placeholder for null values. */
 export function formatMotionType(motionType: string | null): string {
   if (!motionType) return 'Not classified';
-  return motionType;
+  const key = motionType.toLowerCase();
+  if (MOTION_TYPE_MAP[key]) return MOTION_TYPE_MAP[key];
+  return key
+    .replace(/_/g, ' ')
+    .split(' ')
+    .map((word, i) => {
+      if (UPPERCASE_MOTION_WORDS.has(word)) return word.toUpperCase();
+      if (i > 0 && LOWERCASE_WORDS.has(word)) return word;
+      return word.charAt(0).toUpperCase() + word.slice(1);
+    })
+    .join(' ');
 }
 
 /** Format a judge name for display, returning a placeholder for null values. */
@@ -267,7 +292,7 @@ export function RulingsFeed() {
             </span>
 
             {/* Motion type */}
-            <span className="text-sm uppercase text-slate-500 dark:text-slate-400">
+            <span className="text-sm text-slate-500 dark:text-slate-400">
               {formatMotionType(node.motionType)}
             </span>
 

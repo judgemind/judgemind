@@ -34,6 +34,24 @@ describe('formatLabel', () => {
     // empty string is falsy in JS
     expect(formatLabel('')).toBe('\u2014');
   });
+
+  it('keeps MSJ uppercase', () => {
+    expect(formatLabel('msj')).toBe('MSJ');
+    expect(formatLabel('MSJ')).toBe('MSJ');
+  });
+
+  it('keeps MTD uppercase', () => {
+    expect(formatLabel('mtd')).toBe('MTD');
+  });
+
+  it('keeps MIL uppercase', () => {
+    expect(formatLabel('mil')).toBe('MIL');
+  });
+
+  it('formats anti_slapp as Anti-SLAPP', () => {
+    expect(formatLabel('anti_slapp')).toBe('Anti-SLAPP');
+    expect(formatLabel('ANTI_SLAPP')).toBe('Anti-SLAPP');
+  });
 });
 
 describe('truncateText', () => {
