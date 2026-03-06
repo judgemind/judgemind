@@ -22,6 +22,10 @@ if [[ ! -d "$WORKTREE" ]]; then
     exit 1
 fi
 
-git -C "$REPO_ROOT" worktree remove "$WORKTREE" --force
+# cd to the repo root before removing the worktree so that bash's cwd is not
+# inside the directory being deleted. Without this, bash emits a spurious
+# "pwd: getcwd: No such file or directory" error and exits non-zero.
+cd "$REPO_ROOT"
+git worktree remove "$WORKTREE" --force
 echo "Removed worktree: $WORKTREE" >&2
 echo "(Branch is preserved for the open PR.)" >&2
