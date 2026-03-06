@@ -10,7 +10,7 @@ module "web_dev" {
   environment   = "dev"
   custom_domain = "dev.judgemind.org"
 
-  # API doesn't exist yet — pages will show empty/error states until it's deployed.
+  # API deployed to ECS Fargate behind ALB (Issue #182).
   graphql_url = "https://api.dev.judgemind.org/graphql"
 }
 

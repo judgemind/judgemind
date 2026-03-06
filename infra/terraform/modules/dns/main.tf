@@ -158,6 +158,17 @@ resource "cloudflare_record" "prod_web" {
   ttl     = 1
 }
 
+# ─── ACM Certificate Validation ───────────────────────────────────────────────
+
+resource "cloudflare_record" "acm_validation" {
+  count   = length(var.acm_validation_records)
+  zone_id = local.zone_id
+  name    = var.acm_validation_records[count.index].name
+  type    = "CNAME"
+  content = var.acm_validation_records[count.index].value
+  ttl     = 300
+}
+
 # ─── Production API subdomain ─────────────────────────────────────────────────
 
 resource "cloudflare_record" "prod_api" {

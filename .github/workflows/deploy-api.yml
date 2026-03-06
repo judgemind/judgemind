@@ -1,0 +1,176 @@
+name: Deploy API
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "packages/api/**"
+      - ".github/workflows/deploy-api.yml"
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Optional image tag (defaults to git SHA)"
+        required: false
+        type: string
+
+concurrency:
+  group: deploy-api-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-west-2
+  ECR_REPOSITORY: judgemind/api
+  ECS_CLUSTER: judgemind-dev
+  ECS_SERVICE: judgemind-api-dev
+  TASK_FAMILY: judgemind-api-dev
+  CONTAINER_NAME: api
+
+jobs:
+  build-and-push:
+    name: Build and Push to ECR
+    runs-on: ubuntu-latest
+    outputs:
+      image_uri: ${{ steps.build.outputs.image_uri }}
+      sha_tag: ${{ steps.build.outputs.sha_tag }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Get AWS account ID
+        id: aws-account
+        run: |
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          echo "id=$ACCOUNT_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push Docker image
+        id: build
+        env:
+          ECR_REGISTRY: ${{ steps.aws-account.outputs.id }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com
+        run: |
+          IMAGE_BASE="$ECR_REGISTRY/$ECR_REPOSITORY"
+          SHA_TAG="${GITHUB_SHA::7}"
+          BRANCH_TAG="${GITHUB_REF_NAME//\//-}"
+          CUSTOM_TAG="${{ inputs.image_tag }}"
+
+          TAGS=("-t" "$IMAGE_BASE:$SHA_TAG" "-t" "$IMAGE_BASE:latest" "-t" "$IMAGE_BASE:$BRANCH_TAG")
+
+          if [ -n "$CUSTOM_TAG" ]; then
+            TAGS+=("-t" "$IMAGE_BASE:$CUSTOM_TAG")
+          fi
+
+          docker build "${TAGS[@]}" packages/api/
+          docker push "$IMAGE_BASE" --all-tags
+
+          echo "image_uri=$IMAGE_BASE:$SHA_TAG" >> "$GITHUB_OUTPUT"
+          echo "sha_tag=$SHA_TAG" >> "$GITHUB_OUTPUT"
+
+  deploy-dev:
+    name: Deploy to Dev
+    needs: build-and-push
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Set pending deployment status
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          curl -s -X POST \
+            -H "Authorization: token $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/statuses/${{ github.sha }}" \
+            -d '{
+              "state": "pending",
+              "description": "Deploying API to dev...",
+              "context": "deploy/api-dev"
+            }'
+
+      - name: Get current task definition
+        id: current-task-def
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition "$TASK_FAMILY" \
+            --query 'taskDefinition' \
+            --output json > current-task-def.json
+
+          echo "Current task definition:"
+          cat current-task-def.json | jq '.taskDefinitionArn'
+
+      - name: Register new task definition revision
+        id: new-task-def
+        env:
+          IMAGE_URI: ${{ needs.build-and-push.outputs.image_uri }}
+        run: |
+          # Update the container image in the task definition
+          jq --arg image "$IMAGE_URI" --arg container "$CONTAINER_NAME" \
+            '.containerDefinitions |= map(if .name == $container then .image = $image else . end)' \
+            current-task-def.json > updated-containers.json
+
+          # Register the new revision, keeping only the fields accepted by register-task-definition
+          NEW_TASK_DEF_ARN=$(aws ecs register-task-definition \
+            --family "$TASK_FAMILY" \
+            --requires-compatibilities $(jq -r '.requiresCompatibilities[]' updated-containers.json) \
+            --network-mode $(jq -r '.networkMode' updated-containers.json) \
+            --cpu $(jq -r '.cpu' updated-containers.json) \
+            --memory $(jq -r '.memory' updated-containers.json) \
+            --execution-role-arn $(jq -r '.executionRoleArn' updated-containers.json) \
+            --container-definitions "$(jq -c '.containerDefinitions' updated-containers.json)" \
+            --query 'taskDefinition.taskDefinitionArn' \
+            --output text)
+
+          echo "New task definition ARN: $NEW_TASK_DEF_ARN"
+          echo "arn=$NEW_TASK_DEF_ARN" >> "$GITHUB_OUTPUT"
+
+      - name: Update ECS service
+        env:
+          NEW_TASK_DEF_ARN: ${{ steps.new-task-def.outputs.arn }}
+        run: |
+          aws ecs update-service \
+            --cluster "$ECS_CLUSTER" \
+            --service "$ECS_SERVICE" \
+            --task-definition "$NEW_TASK_DEF_ARN" \
+            --force-new-deployment \
+            --query 'service.serviceName' \
+            --output text
+
+          echo "Waiting for service to stabilize..."
+          aws ecs wait services-stable \
+            --cluster "$ECS_CLUSTER" \
+            --services "$ECS_SERVICE"
+
+          echo "Service updated successfully."
+
+      - name: Set deployment status
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DEPLOY_STATUS: ${{ job.status == 'success' && 'success' || 'failure' }}
+          DEPLOY_DESC: ${{ job.status == 'success' && 'API deployed to dev' || 'Dev deployment failed' }}
+        run: |
+          curl -s -X POST \
+            -H "Authorization: token $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/statuses/${{ github.sha }}" \
+            -d "{
+              \"state\": \"$DEPLOY_STATUS\",
+              \"description\": \"$DEPLOY_DESC\",
+              \"context\": \"deploy/api-dev\"
+            }"

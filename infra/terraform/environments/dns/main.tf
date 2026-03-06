@@ -26,9 +26,17 @@ module "dns" {
 
   # Hosting — updated as services are deployed.
   dev_web_cname  = "cname.vercel-dns.com"                                     # → Vercel (Issue #137)
-  dev_api_cname  = "judgemind-api-dev-1789849795.us-west-2.elb.amazonaws.com" # API ALB (Issue #183)
+  dev_api_cname  = "judgemind-api-dev-1789849795.us-west-2.elb.amazonaws.com" # → ALB (Issue #182)
   prod_web_cname = ""                                                         # Future: production web hosting for judgemind.org
   prod_api_cname = ""                                                         # Future: production API for api.judgemind.org
+
+  # ACM certificate DNS validation records for HTTPS on the API ALB.
+  acm_validation_records = [
+    {
+      name  = "_93844df965d6d55d1a37b05dd86c745d.api.dev.judgemind.org."
+      value = "_06e5e32ccb02447673011c0433f9c831.jkddzztszm.acm-validations.aws."
+    },
+  ]
 }
 
 output "zone_id" {

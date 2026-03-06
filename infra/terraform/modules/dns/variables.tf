@@ -39,3 +39,12 @@ variable "prod_api_cname" {
   type        = string
   default     = ""
 }
+
+variable "acm_validation_records" {
+  description = "ACM certificate DNS validation CNAME records. Each entry maps a record name to its value."
+  type = list(object({
+    name  = string
+    value = string
+  }))
+  default = []
+}
