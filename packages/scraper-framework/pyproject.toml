@@ -46,6 +46,9 @@ line-length = 100
 select = ["E", "F", "I", "N", "UP", "ANN"]
 ignore = ["ANN401"]  # ANN401 conflicts with **kwargs: Any, which is the correct annotation
 
+[tool.ruff.lint.isort]
+known-first-party = ["framework", "courts", "templates", "validation", "ingestion"]
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 markers = [

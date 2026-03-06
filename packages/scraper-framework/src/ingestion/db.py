@@ -176,20 +176,27 @@ def insert_ruling(
     hearing_date: date,
     ruling_text: str | None,
     department: str | None,
+    outcome: str | None = None,
+    motion_type: str | None = None,
 ) -> None:
     """Insert a ruling row linked to the document.
 
     Skipped if a ruling for this document_id already exists (idempotent).
     document_id is a FK to documents.id and serves as the dedup key.
+
+    ``outcome`` must be a valid ``ruling_outcome`` enum value (e.g.
+    ``"granted"``, ``"denied"``) or ``None``.  ``motion_type`` is free-text.
     """
     with conn.cursor() as cur:
         cur.execute(
             """
             INSERT INTO rulings (
                 document_id, case_id, court_id,
-                hearing_date, ruling_text, department, is_tentative
+                hearing_date, ruling_text, department, is_tentative,
+                outcome, motion_type
             )
-            SELECT %s::uuid, %s::uuid, %s::uuid, %s::date, %s, %s, TRUE
+            SELECT %s::uuid, %s::uuid, %s::uuid, %s::date, %s, %s, TRUE,
+                   %s::ruling_outcome, %s
             WHERE NOT EXISTS (
                 SELECT 1 FROM rulings WHERE document_id = %s::uuid
             )
@@ -201,6 +208,8 @@ def insert_ruling(
                 hearing_date,
                 ruling_text,
                 department,
+                outcome,
+                motion_type,
                 document_id,
             ),
         )

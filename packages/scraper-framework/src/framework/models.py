@@ -107,6 +107,8 @@ class CapturedDocument(BaseModel):
     judge_name: str | None = None
     hearing_date: datetime | None = None
     ruling_text: str | None = None
+    outcome: str | None = None
+    motion_type: str | None = None
     extra: dict[str, Any] = Field(default_factory=dict)
 
     # Archival
@@ -147,6 +149,8 @@ class DocumentCapturedEvent(EventEnvelope):
     s3_key: str | None
     s3_bucket: str | None = None
     ruling_text: str | None = None
+    outcome: str | None = None
+    motion_type: str | None = None
     case_number: str | None
     courthouse: str | None
     department: str | None

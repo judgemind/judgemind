@@ -150,6 +150,89 @@ def test_process_event_happy_path(mock_psycopg: MagicMock) -> None:
 
 
 @patch("ingestion.worker.psycopg")
+def test_process_event_passes_outcome_and_motion_type_from_event(mock_psycopg: MagicMock) -> None:
+    """When event carries outcome/motion_type, they are passed to insert_ruling."""
+    worker, os_mock = _make_worker()
+
+    mock_conn = MagicMock()
+    mock_cur = MagicMock()
+    mock_conn.__enter__ = MagicMock(return_value=mock_conn)
+    mock_conn.__exit__ = MagicMock(return_value=False)
+    mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cur)
+    mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+    mock_psycopg.connect.return_value = mock_conn
+    mock_cur.fetchone.side_effect = [("court-uuid-1",), ("case-uuid-1",)]
+    mock_cur.rowcount = 1
+
+    event = _make_event(outcome="denied", motion_type="demurrer")
+    worker.process_event(event)
+
+    # Find the INSERT INTO rulings call
+    ruling_calls = [c for c in mock_cur.execute.call_args_list if "INSERT INTO rulings" in str(c)]
+    assert len(ruling_calls) == 1
+    sql_args = ruling_calls[0][0][1]  # positional args tuple
+    # outcome and motion_type should be in the args
+    assert "denied" in sql_args
+    assert "demurrer" in sql_args
+
+
+@patch("ingestion.worker.psycopg")
+def test_process_event_extracts_outcome_from_ruling_text(mock_psycopg: MagicMock) -> None:
+    """When event has no outcome/motion_type, regex extraction from ruling_text is used."""
+    worker, os_mock = _make_worker()
+
+    mock_conn = MagicMock()
+    mock_cur = MagicMock()
+    mock_conn.__enter__ = MagicMock(return_value=mock_conn)
+    mock_conn.__exit__ = MagicMock(return_value=False)
+    mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cur)
+    mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+    mock_psycopg.connect.return_value = mock_conn
+    mock_cur.fetchone.side_effect = [("court-uuid-1",), ("case-uuid-1",)]
+    mock_cur.rowcount = 1
+
+    event = _make_event(ruling_text="The motion for summary judgment is GRANTED.")
+    # No outcome/motion_type in event — should be extracted from text
+    worker.process_event(event)
+
+    ruling_calls = [c for c in mock_cur.execute.call_args_list if "INSERT INTO rulings" in str(c)]
+    assert len(ruling_calls) == 1
+    sql_args = ruling_calls[0][0][1]
+    assert "granted" in sql_args
+    assert "msj" in sql_args
+
+
+@patch("ingestion.worker.psycopg")
+def test_process_event_event_fields_override_regex(mock_psycopg: MagicMock) -> None:
+    """Event-level outcome/motion_type take precedence over regex extraction."""
+    worker, os_mock = _make_worker()
+
+    mock_conn = MagicMock()
+    mock_cur = MagicMock()
+    mock_conn.__enter__ = MagicMock(return_value=mock_conn)
+    mock_conn.__exit__ = MagicMock(return_value=False)
+    mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cur)
+    mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+    mock_psycopg.connect.return_value = mock_conn
+    mock_cur.fetchone.side_effect = [("court-uuid-1",), ("case-uuid-1",)]
+    mock_cur.rowcount = 1
+
+    # ruling_text says "GRANTED" but event says "denied"
+    event = _make_event(
+        ruling_text="The motion is GRANTED.",
+        outcome="denied",
+        motion_type="demurrer",
+    )
+    worker.process_event(event)
+
+    ruling_calls = [c for c in mock_cur.execute.call_args_list if "INSERT INTO rulings" in str(c)]
+    assert len(ruling_calls) == 1
+    sql_args = ruling_calls[0][0][1]
+    assert "denied" in sql_args
+    assert "demurrer" in sql_args
+
+
+@patch("ingestion.worker.psycopg")
 def test_process_event_no_case_number(mock_psycopg: MagicMock) -> None:
     """Events without case_number use a synthetic UNKNOWN- case number."""
     worker, _ = _make_worker()
