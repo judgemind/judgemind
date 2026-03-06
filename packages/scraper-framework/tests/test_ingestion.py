@@ -13,6 +13,7 @@ from unittest.mock import MagicMock, patch
 import psycopg
 import psycopg.errors
 import pytest
+
 from ingestion.db import _derive_court_code, normalize_judge_name
 from ingestion.worker import (
     InfrastructureError,

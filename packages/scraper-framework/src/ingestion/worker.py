@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING, Any
 
 import psycopg
 import psycopg.errors
+
 from framework.search.indexer import IndexingConsumer
 from framework.search.mapping import TENTATIVE_RULINGS_ALIAS
 
