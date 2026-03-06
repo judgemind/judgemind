@@ -10,6 +10,10 @@ terraform {
       source  = "cloudflare/cloudflare"
       version = "~> 4.0"
     }
+    vercel = {
+      source  = "vercel/vercel"
+      version = "~> 1.0"
+    }
     random = {
       source  = "hashicorp/random"
       version = "~> 3.0"
@@ -39,6 +43,9 @@ provider "aws" {
 
 # CLOUDFLARE_API_TOKEN env var is read automatically by this provider.
 provider "cloudflare" {}
+
+# VERCEL_API_TOKEN env var is read automatically by this provider.
+provider "vercel" {}
 
 variable "aws_region" {
   description = "AWS region"
@@ -116,4 +123,13 @@ module "compute" {
 module "dns" {
   source = "./modules/dns"
   # All variables have defaults; real values are set in environments/dns/main.tf.
+}
+
+module "vercel_web" {
+  source = "./modules/vercel-web"
+  # Required variables — real values set in environments/hosting/main.tf.
+  team_slug     = "judgemind2026-7926s-projects"
+  environment   = var.environment
+  custom_domain = "dev.judgemind.org"
+  graphql_url   = "https://api.dev.judgemind.org/graphql"
 }
