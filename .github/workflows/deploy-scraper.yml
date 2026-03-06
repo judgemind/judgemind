@@ -194,3 +194,117 @@ jobs:
               \"description\": \"$DEPLOY_DESC\",
               \"context\": \"deploy/staging\"
             }"
+
+  deploy-ingestion-worker:
+    name: Deploy Ingestion Worker to Dev
+    needs: build-and-push
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+
+    env:
+      INGESTION_TASK_FAMILY: judgemind-ingestion-worker-dev
+      INGESTION_SERVICE: judgemind-ingestion-worker-dev
+      INGESTION_CONTAINER: ingestion-worker
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Set pending deployment status
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          curl -s -X POST \
+            -H "Authorization: token $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/statuses/${{ github.sha }}" \
+            -d '{
+              "state": "pending",
+              "description": "Deploying ingestion worker to dev...",
+              "context": "deploy/ingestion-worker-dev"
+            }'
+
+      - name: Get current task definition
+        id: current-task-def
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition "$INGESTION_TASK_FAMILY" \
+            --query 'taskDefinition' \
+            --output json > current-task-def.json
+
+          echo "Current task definition:"
+          cat current-task-def.json | jq '.taskDefinitionArn'
+
+      - name: Register new task definition revision
+        id: new-task-def
+        env:
+          IMAGE_URI: ${{ needs.build-and-push.outputs.image_uri }}
+        run: |
+          # Update the container image in the task definition
+          jq --arg image "$IMAGE_URI" --arg container "$INGESTION_CONTAINER" \
+            '.containerDefinitions |= map(if .name == $container then .image = $image else . end)' \
+            current-task-def.json > updated-containers.json
+
+          # Build register args, including task role if present
+          TASK_ROLE=$(jq -r '.taskRoleArn // empty' updated-containers.json)
+          REGISTER_ARGS=(
+            --family "$INGESTION_TASK_FAMILY"
+            --requires-compatibilities $(jq -r '.requiresCompatibilities[]' updated-containers.json)
+            --network-mode $(jq -r '.networkMode' updated-containers.json)
+            --cpu $(jq -r '.cpu' updated-containers.json)
+            --memory $(jq -r '.memory' updated-containers.json)
+            --execution-role-arn $(jq -r '.executionRoleArn' updated-containers.json)
+            --container-definitions "$(jq -c '.containerDefinitions' updated-containers.json)"
+          )
+
+          if [ -n "$TASK_ROLE" ]; then
+            REGISTER_ARGS+=(--task-role-arn "$TASK_ROLE")
+          fi
+
+          NEW_TASK_DEF_ARN=$(aws ecs register-task-definition \
+            "${REGISTER_ARGS[@]}" \
+            --query 'taskDefinition.taskDefinitionArn' \
+            --output text)
+
+          echo "New task definition ARN: $NEW_TASK_DEF_ARN"
+          echo "arn=$NEW_TASK_DEF_ARN" >> "$GITHUB_OUTPUT"
+
+      - name: Update ECS service
+        env:
+          NEW_TASK_DEF_ARN: ${{ steps.new-task-def.outputs.arn }}
+        run: |
+          aws ecs update-service \
+            --cluster "$ECS_CLUSTER" \
+            --service "$INGESTION_SERVICE" \
+            --task-definition "$NEW_TASK_DEF_ARN" \
+            --force-new-deployment \
+            --query 'service.serviceName' \
+            --output text
+
+          echo "Waiting for ingestion worker service to stabilize..."
+          aws ecs wait services-stable \
+            --cluster "$ECS_CLUSTER" \
+            --services "$INGESTION_SERVICE"
+
+          echo "Ingestion worker service updated successfully."
+
+      - name: Set deployment status
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DEPLOY_STATUS: ${{ job.status == 'success' && 'success' || 'failure' }}
+          DEPLOY_DESC: ${{ job.status == 'success' && 'Ingestion worker deployed to dev' || 'Ingestion worker dev deployment failed' }}
+        run: |
+          curl -s -X POST \
+            -H "Authorization: token $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/statuses/${{ github.sha }}" \
+            -d "{
+              \"state\": \"$DEPLOY_STATUS\",
+              \"description\": \"$DEPLOY_DESC\",
+              \"context\": \"deploy/ingestion-worker-dev\"
+            }"
