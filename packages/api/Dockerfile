@@ -18,9 +18,8 @@ FROM node:20-slim AS runtime
 
 WORKDIR /app
 
-# Non-root user for runtime security
-RUN groupadd --gid 1000 api \
-    && useradd --uid 1000 --gid api --create-home api
+# Use the built-in 'node' user (uid/gid 1000) from the base image
+# instead of creating a new user, which fails when GID 1000 already exists.
 
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev && npm cache clean --force
@@ -28,8 +27,8 @@ RUN npm ci --omit=dev && npm cache clean --force
 COPY --from=builder /app/dist/ ./dist/
 COPY migrations/ ./migrations/
 
-RUN chown -R api:api /app
-USER api
+RUN chown -R node:node /app
+USER node
 
 EXPOSE 3001
 
