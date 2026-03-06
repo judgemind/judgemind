@@ -35,6 +35,27 @@ resource "aws_ecs_cluster" "main" {
     value = "enabled"
   }
 
+  configuration {
+    execute_command_configuration {
+      logging = "OVERRIDE"
+
+      log_configuration {
+        cloud_watch_log_group_name = aws_cloudwatch_log_group.ecs_exec.name
+      }
+    }
+  }
+
+  tags = {
+    project     = "judgemind"
+    environment = var.environment
+  }
+}
+
+# CloudWatch log group for ECS Exec session output.
+resource "aws_cloudwatch_log_group" "ecs_exec" {
+  name              = "/ecs/judgemind-exec-${var.environment}"
+  retention_in_days = var.log_retention_days
+
   tags = {
     project     = "judgemind"
     environment = var.environment
@@ -250,6 +271,8 @@ resource "aws_scheduler_schedule" "scraper" {
 
 locals {
   deploy_ingestion = var.db_connection_secret_arn != ""
+  # Extract role name from ARN (arn:aws:iam::ACCT:role/NAME) for inline policy attachment.
+  task_role_name = element(split("/", var.scraper_task_role_arn), length(split("/", var.scraper_task_role_arn)) - 1)
 }
 
 # Allow the task execution role to fetch the DB connection secret so ECS can
@@ -399,6 +422,10 @@ resource "aws_ecs_service" "ingestion_worker" {
   desired_count   = 1
   launch_type     = "FARGATE"
 
+  # Enable ECS Exec so operators can run ad-hoc commands (e.g. psql) on the
+  # running container without a VPN or bastion host.
+  enable_execute_command = true
+
   # Restart the task if it exits unexpectedly.
   deployment_minimum_healthy_percent = 0
   deployment_maximum_percent         = 100
@@ -419,6 +446,46 @@ resource "aws_ecs_service" "ingestion_worker" {
     project     = "judgemind"
     environment = var.environment
   }
+}
+
+# ─── ECS Exec IAM Policy ─────────────────────────────────────────────────────
+# The task role needs SSM permissions for ECS Exec (aws ecs execute-command).
+# This is an inline policy on the task role used by the ingestion worker so
+# operators can run psql and other diagnostic commands inside the container.
+
+resource "aws_iam_role_policy" "ecs_exec_ssm" {
+  count = local.deploy_ingestion ? 1 : 0
+
+  name = "judgemind-ecs-exec-ssm-${var.environment}"
+  role = local.task_role_name
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid    = "AllowECSExec"
+        Effect = "Allow"
+        Action = [
+          "ssmmessages:CreateControlChannel",
+          "ssmmessages:CreateDataChannel",
+          "ssmmessages:OpenControlChannel",
+          "ssmmessages:OpenDataChannel"
+        ]
+        Resource = "*"
+      },
+      {
+        Sid    = "AllowECSExecLogging"
+        Effect = "Allow"
+        Action = [
+          "logs:CreateLogStream",
+          "logs:DescribeLogGroups",
+          "logs:DescribeLogStreams",
+          "logs:PutLogEvents"
+        ]
+        Resource = "${aws_cloudwatch_log_group.ecs_exec.arn}:*"
+      }
+    ]
+  })
 }
 
 # ─── Scraper Failure Alerts ──────────────────────────────────────────────────
