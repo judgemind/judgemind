@@ -1,7 +1,4 @@
--- Migration 002: Auth enhancements — google_id, refresh_tokens
--- =============================================================================
--- Adds Google OAuth support and refresh token storage for JWT auth.
--- =============================================================================
+-- Up Migration
 
 -- Google OAuth: nullable google_id on users table
 ALTER TABLE users ADD COLUMN IF NOT EXISTS google_id TEXT UNIQUE;
@@ -17,3 +14,11 @@ CREATE TABLE IF NOT EXISTS refresh_tokens (
 
 CREATE INDEX IF NOT EXISTS idx_refresh_tokens_user_id ON refresh_tokens(user_id);
 CREATE INDEX IF NOT EXISTS idx_refresh_tokens_expires ON refresh_tokens(expires_at);
+
+
+-- Down Migration
+
+DROP INDEX IF EXISTS idx_refresh_tokens_expires;
+DROP INDEX IF EXISTS idx_refresh_tokens_user_id;
+DROP TABLE IF EXISTS refresh_tokens;
+ALTER TABLE users DROP COLUMN IF EXISTS google_id;

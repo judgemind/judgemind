@@ -10,13 +10,12 @@
  * combinations of full-text queries, metadata filters, and pagination.
  */
 
-import { readFileSync } from 'fs';
-import { join } from 'path';
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { Pool, types } from 'pg';
 import { Client } from '@opensearch-project/opensearch';
 import type { FastifyInstance } from 'fastify';
 import { buildApp } from '../src/app';
+import { applyMigrations } from './setup-db';
 
 // Match date type parsers from src/data-access/db.ts
 types.setTypeParser(1082, (val: string) => val);
@@ -51,21 +50,6 @@ let docId2: string;
 // ---------------------------------------------------------------------------
 // Schema + seed data
 // ---------------------------------------------------------------------------
-
-async function applySchemaIdempotent(): Promise<void> {
-  const sql = readFileSync(join(__dirname, '../src/data-access/schema.sql'), 'utf8');
-  try {
-    await pool.query(sql);
-  } catch (err: unknown) {
-    // 42P07 = duplicate_table, 42710 = duplicate_object, 42P06 = duplicate_schema,
-    // 42723 = duplicate_function, 42P16 = invalid_table_definition,
-    // 23505 = unique_violation (CREATE EXTENSION IF NOT EXISTS can race across workers)
-    const code = (err as { code?: string }).code;
-    if (!['42P07', '42710', '42P06', '42723', '42P16', '23505'].includes(code ?? '')) {
-      throw err;
-    }
-  }
-}
 
 async function seedPgData(): Promise<void> {
   const { rows: cRows } = await pool.query<{ id: string }>(
@@ -248,7 +232,7 @@ async function cleanupOpenSearch(): Promise<void> {
 // ---------------------------------------------------------------------------
 
 beforeAll(async () => {
-  await applySchemaIdempotent();
+  applyMigrations();
   await seedPgData();
   await seedOpenSearch();
   app = await buildApp(pool, osClient);
