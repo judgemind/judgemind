@@ -23,6 +23,7 @@ from datetime import date, datetime
 from typing import TYPE_CHECKING, Any
 
 import psycopg
+import psycopg.errors
 
 from framework.search.indexer import IndexingConsumer
 from framework.search.mapping import TENTATIVE_RULINGS_ALIAS
@@ -34,6 +35,57 @@ if TYPE_CHECKING:
     from redis import Redis
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Infrastructure vs message error classification
+# ---------------------------------------------------------------------------
+
+# psycopg error classes that indicate infrastructure problems (DB unreachable,
+# schema missing, connection dropped). These should never cause dead-lettering
+# because the message itself is fine — the infrastructure is broken.
+_INFRA_PG_ERRORS: tuple[type[Exception], ...] = (
+    psycopg.OperationalError,  # connection refused, server closed, etc.
+    psycopg.InterfaceError,  # connection already closed
+    psycopg.errors.UndefinedTable,  # relation does not exist (migration not run)
+    psycopg.errors.UndefinedColumn,  # column does not exist (schema mismatch)
+    psycopg.errors.InsufficientPrivilege,  # permission denied
+    psycopg.errors.UndefinedFunction,  # function/type does not exist
+    psycopg.errors.InvalidCatalogName,  # database does not exist
+)
+
+# Non-psycopg errors that indicate infrastructure problems.
+_INFRA_GENERIC_ERRORS: tuple[type[Exception], ...] = (
+    ConnectionError,
+    ConnectionRefusedError,
+    ConnectionResetError,
+    TimeoutError,
+    OSError,
+)
+
+
+class InfrastructureError(Exception):
+    """Raised when a message processing failure is caused by infrastructure,
+    not by bad message data.
+
+    The worker should exit (non-zero) on this error so ECS can restart it.
+    Messages must NOT be acknowledged — they stay in the stream for processing
+    after the infrastructure issue is resolved.
+    """
+
+    def __init__(self, cause: Exception) -> None:
+        super().__init__(str(cause))
+        self.__cause__ = cause
+
+
+def is_infrastructure_error(exc: Exception) -> bool:
+    """Return True if the exception indicates an infrastructure problem.
+
+    Infrastructure errors mean the message itself is fine but the system
+    cannot process it right now (DB down, schema missing, etc.). These
+    should NOT cause dead-lettering.
+    """
+    return isinstance(exc, (*_INFRA_PG_ERRORS, *_INFRA_GENERIC_ERRORS))
+
 
 STREAM_DOCUMENT_CAPTURED = "document.captured"
 CONSUMER_GROUP = "ingestion-workers"
@@ -54,9 +106,16 @@ class IngestionWorker:
       3. Indexes the document in OpenSearch via IndexingConsumer.
       4. Acknowledges the message (XACK) only after both writes succeed.
 
-    Failed messages are retried up to max_retries times. After that, the
-    message is acknowledged anyway (dead-letter pattern) to unblock the stream,
-    and the error is logged as CRITICAL for alerting.
+    Error handling distinguishes two categories:
+
+    **Infrastructure errors** (DB down, missing tables, connection failures):
+      Raised as InfrastructureError without acknowledging the message. The
+      worker process exits with non-zero status so ECS restarts it. Messages
+      remain in the stream and will be reprocessed after recovery.
+
+    **Message-level errors** (bad data, validation failures, constraint violations):
+      Retried up to max_retries times. After exhaustion, the message is
+      acknowledged (dead-letter pattern) and logged as CRITICAL for alerting.
     """
 
     def __init__(
@@ -83,6 +142,24 @@ class IngestionWorker:
     # Public interface
     # ------------------------------------------------------------------
 
+    def health_check(self) -> None:
+        """Verify DB connectivity and that required tables exist.
+
+        Raises InfrastructureError if the database is unreachable or the
+        schema is not ready. Called on startup before consuming messages.
+        """
+        required_tables = ("courts", "cases", "documents", "rulings")
+        try:
+            with psycopg.connect(self._pg_dsn) as conn:
+                with conn.cursor() as cur:
+                    for table in required_tables:
+                        cur.execute(
+                            "SELECT 1 FROM information_schema.tables WHERE table_name = %s LIMIT 1",
+                            (table,),
+                        )
+        except (*_INFRA_PG_ERRORS, *_INFRA_GENERIC_ERRORS) as exc:
+            raise InfrastructureError(exc) from exc
+
     def run(
         self,
         batch_size: int = DEFAULT_BATCH_SIZE,
@@ -91,7 +168,10 @@ class IngestionWorker:
         """Block indefinitely, processing events from the Redis stream.
 
         Call this from the process entrypoint. Returns only on KeyboardInterrupt.
+        Raises InfrastructureError if the database is unavailable or the schema
+        is missing — this causes a non-zero exit so ECS can restart the task.
         """
+        self.health_check()
         self._ensure_consumer_group()
         logger.info(
             "Ingestion worker started",
@@ -108,6 +188,10 @@ class IngestionWorker:
             except KeyboardInterrupt:
                 logger.info("Ingestion worker stopped")
                 break
+            except InfrastructureError:
+                # Propagate infra errors to exit the process for ECS restart.
+                # Messages stay unacknowledged in the stream.
+                raise
             except Exception as exc:
                 logger.error("Unexpected error in consumer loop: %s", exc, exc_info=True)
 
@@ -249,16 +333,27 @@ class IngestionWorker:
                 self._redis.xack(STREAM_DOCUMENT_CAPTURED, CONSUMER_GROUP, msg_id)
                 return
             except Exception as exc:
+                if is_infrastructure_error(exc):
+                    # Infrastructure is broken — do NOT acknowledge the message.
+                    # Raise immediately so the worker exits and ECS restarts it.
+                    logger.critical(
+                        "Infrastructure error processing message %s: %s — "
+                        "exiting for restart (message NOT acknowledged)",
+                        msg_id,
+                        exc,
+                    )
+                    raise InfrastructureError(exc) from exc
                 attempt += 1
                 last_exc = exc
                 logger.warning(
-                    "Event processing failed (attempt %d/%d): %s",
+                    "Message-level error processing event (attempt %d/%d): %s",
                     attempt,
                     self._max_retries,
                     exc,
                 )
 
-        # Exhausted retries — dead-letter (acknowledge to unblock stream) and alert
+        # Exhausted retries on a message-level error — dead-letter and alert.
+        # This message has genuinely bad data that won't succeed on retry.
         logger.critical(
             "Dead-lettering message %s after %d retries. Last error: %s",
             msg_id,

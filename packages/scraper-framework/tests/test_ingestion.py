@@ -10,8 +10,18 @@ import json
 from datetime import date, datetime
 from unittest.mock import MagicMock, patch
 
+import psycopg
+import psycopg.errors
+import pytest
+
 from ingestion.db import _derive_court_code
-from ingestion.worker import IngestionWorker, _parse_date, _parse_datetime
+from ingestion.worker import (
+    InfrastructureError,
+    IngestionWorker,
+    _parse_date,
+    _parse_datetime,
+    is_infrastructure_error,
+)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -254,3 +264,210 @@ def test_process_message_dead_letters_malformed_json(mock_psycopg: MagicMock) ->
 
     worker.process_event.assert_not_called()
     worker._redis.xack.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Error classification tests
+# ---------------------------------------------------------------------------
+
+
+def test_is_infrastructure_error_operational_error() -> None:
+    """psycopg.OperationalError (e.g. connection refused) is infra."""
+    exc = psycopg.OperationalError("connection refused")
+    assert is_infrastructure_error(exc) is True
+
+
+def test_is_infrastructure_error_undefined_table() -> None:
+    """UndefinedTable (missing relation) is an infrastructure error."""
+    exc = psycopg.errors.UndefinedTable("relation 'courts' does not exist")
+    assert is_infrastructure_error(exc) is True
+
+
+def test_is_infrastructure_error_undefined_column() -> None:
+    """UndefinedColumn is an infrastructure error (schema mismatch)."""
+    exc = psycopg.errors.UndefinedColumn("column 'foo' does not exist")
+    assert is_infrastructure_error(exc) is True
+
+
+def test_is_infrastructure_error_connection_error() -> None:
+    """Generic ConnectionError is infra."""
+    exc = ConnectionError("connection reset")
+    assert is_infrastructure_error(exc) is True
+
+
+def test_is_infrastructure_error_data_error() -> None:
+    """psycopg.errors.DataError is a message-level error, not infra."""
+    exc = psycopg.errors.DataError("invalid input syntax for type uuid")
+    assert is_infrastructure_error(exc) is False
+
+
+def test_is_infrastructure_error_value_error() -> None:
+    """ValueError is a message-level error."""
+    exc = ValueError("bad data")
+    assert is_infrastructure_error(exc) is False
+
+
+def test_is_infrastructure_error_key_error() -> None:
+    """KeyError is a message-level error."""
+    exc = KeyError("missing_field")
+    assert is_infrastructure_error(exc) is False
+
+
+def test_is_infrastructure_error_unique_violation() -> None:
+    """UniqueViolation is a message-level error (duplicate data)."""
+    exc = psycopg.errors.UniqueViolation("duplicate key")
+    assert is_infrastructure_error(exc) is False
+
+
+def test_is_infrastructure_error_interface_error() -> None:
+    """InterfaceError (e.g. connection closed) is infra."""
+    exc = psycopg.InterfaceError("connection is closed")
+    assert is_infrastructure_error(exc) is True
+
+
+# ---------------------------------------------------------------------------
+# InfrastructureError wrapping
+# ---------------------------------------------------------------------------
+
+
+def test_infrastructure_error_wraps_original() -> None:
+    """InfrastructureError should preserve the original exception."""
+    original = psycopg.OperationalError("db down")
+    wrapped = InfrastructureError(original)
+    assert wrapped.__cause__ is original
+    assert "db down" in str(wrapped)
+
+
+# ---------------------------------------------------------------------------
+# Worker dead-letter logic with error classification
+# ---------------------------------------------------------------------------
+
+
+@patch("ingestion.worker.psycopg")
+def test_process_message_infra_error_raises_instead_of_dead_letter(
+    mock_psycopg: MagicMock,
+) -> None:
+    """Infrastructure errors should NOT dead-letter. They raise InfrastructureError."""
+    worker, _ = _make_worker()
+    worker._max_retries = 3
+    worker.process_event = MagicMock(
+        side_effect=psycopg.OperationalError("connection refused"),
+    )
+
+    msg_id = b"infra-0"
+    data = {b"data": json.dumps(_make_event()).encode()}
+
+    with pytest.raises(InfrastructureError):
+        worker._process_message(msg_id, data)
+
+    # Message must NOT be acknowledged — it stays in the stream for retry after restart
+    worker._redis.xack.assert_not_called()
+
+
+@patch("ingestion.worker.psycopg")
+def test_process_message_dead_letters_only_message_errors(
+    mock_psycopg: MagicMock,
+) -> None:
+    """Message-level errors (e.g. ValueError) should still dead-letter after retries."""
+    worker, _ = _make_worker()
+    worker._max_retries = 2
+    worker.process_event = MagicMock(side_effect=ValueError("bad field"))
+
+    msg_id = b"msg-err-0"
+    data = {b"data": json.dumps(_make_event()).encode()}
+    worker._process_message(msg_id, data)
+
+    assert worker.process_event.call_count == 2
+    worker._redis.xack.assert_called_once()  # dead-lettered
+
+
+@patch("ingestion.worker.psycopg")
+def test_process_message_infra_error_on_first_attempt_raises_immediately(
+    mock_psycopg: MagicMock,
+) -> None:
+    """Infra errors should raise on first attempt, not retry max_retries times."""
+    worker, _ = _make_worker()
+    worker._max_retries = 5
+    worker.process_event = MagicMock(
+        side_effect=psycopg.errors.UndefinedTable("relation 'courts' does not exist"),
+    )
+
+    msg_id = b"infra-1"
+    data = {b"data": json.dumps(_make_event()).encode()}
+
+    with pytest.raises(InfrastructureError):
+        worker._process_message(msg_id, data)
+
+    # Should only attempt once for infra errors (no point retrying immediately)
+    assert worker.process_event.call_count == 1
+    worker._redis.xack.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Health check on startup
+# ---------------------------------------------------------------------------
+
+
+@patch("ingestion.worker.psycopg")
+def test_health_check_success(mock_psycopg: MagicMock) -> None:
+    """Health check passes when DB is reachable and tables exist."""
+    worker, _ = _make_worker()
+    mock_conn = MagicMock()
+    mock_cur = MagicMock()
+    mock_conn.__enter__ = MagicMock(return_value=mock_conn)
+    mock_conn.__exit__ = MagicMock(return_value=False)
+    mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cur)
+    mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+    mock_psycopg.connect.return_value = mock_conn
+
+    # Should not raise
+    worker.health_check()
+
+
+@patch("ingestion.worker.psycopg")
+def test_health_check_raises_on_connection_failure(mock_psycopg: MagicMock) -> None:
+    """Health check raises InfrastructureError if DB is unreachable."""
+    worker, _ = _make_worker()
+    mock_psycopg.connect.side_effect = psycopg.OperationalError("connection refused")
+
+    with pytest.raises(InfrastructureError):
+        worker.health_check()
+
+
+@patch("ingestion.worker.psycopg")
+def test_health_check_raises_on_missing_tables(mock_psycopg: MagicMock) -> None:
+    """Health check raises InfrastructureError if required tables are missing."""
+    worker, _ = _make_worker()
+    mock_conn = MagicMock()
+    mock_cur = MagicMock()
+    mock_conn.__enter__ = MagicMock(return_value=mock_conn)
+    mock_conn.__exit__ = MagicMock(return_value=False)
+    mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cur)
+    mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+    mock_psycopg.connect.return_value = mock_conn
+
+    mock_cur.execute.side_effect = psycopg.errors.UndefinedTable("relation 'courts' does not exist")
+
+    with pytest.raises(InfrastructureError):
+        worker.health_check()
+
+
+# ---------------------------------------------------------------------------
+# Run loop exits on infra errors
+# ---------------------------------------------------------------------------
+
+
+@patch("ingestion.worker.psycopg")
+def test_run_exits_on_infrastructure_error(mock_psycopg: MagicMock) -> None:
+    """The run loop should exit (not swallow) InfrastructureError for ECS restart."""
+    worker, _ = _make_worker()
+    worker._ensure_consumer_group = MagicMock()
+    worker.health_check = MagicMock()  # skip health check
+
+    # Make _process_batch raise InfrastructureError
+    worker._process_batch = MagicMock(
+        side_effect=InfrastructureError(psycopg.OperationalError("db gone")),
+    )
+
+    with pytest.raises(InfrastructureError):
+        worker.run()
