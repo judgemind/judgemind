@@ -93,3 +93,15 @@ variable "document_archive_bucket" {
   type        = string
   default     = ""
 }
+
+variable "db_connection_secret_arn" {
+  description = "ARN of the Secrets Manager secret containing the DATABASE_URL (JSON key: url). When set, the ingestion worker ECS service is deployed."
+  type        = string
+  default     = ""
+}
+
+variable "opensearch_url" {
+  description = "OpenSearch endpoint URL for the ingestion worker (e.g. https://vpc-...us-west-2.es.amazonaws.com). Required when db_connection_secret_arn is set."
+  type        = string
+  default     = ""
+}

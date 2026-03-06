@@ -37,3 +37,13 @@ output "alerts_topic_arn" {
   description = "ARN of the SNS topic for scraper failure alerts (empty if alerts disabled)"
   value       = var.enable_alerts ? aws_sns_topic.scraper_alerts[0].arn : ""
 }
+
+output "ingestion_worker_service_name" {
+  description = "Name of the ingestion worker ECS service (empty if not deployed)"
+  value       = local.deploy_ingestion ? aws_ecs_service.ingestion_worker[0].name : ""
+}
+
+output "ingestion_worker_log_group" {
+  description = "CloudWatch log group for ingestion worker output (empty if not deployed)"
+  value       = local.deploy_ingestion ? aws_cloudwatch_log_group.ingestion_worker[0].name : ""
+}

@@ -243,6 +243,169 @@ resource "aws_scheduler_schedule" "scraper" {
   }
 }
 
+# ─── Ingestion Worker ───────────────────────────────────────────────────────
+# Long-running ECS Fargate service that consumes document.captured events from
+# the Redis Stream and writes them to Postgres and OpenSearch.
+# Only deployed when db_connection_secret_arn is provided.
+
+locals {
+  deploy_ingestion = var.db_connection_secret_arn != ""
+}
+
+# Allow the task execution role to fetch the DB connection secret so ECS can
+# inject DATABASE_URL into the container at launch.
+resource "aws_iam_role_policy" "ecs_task_execution_secrets" {
+  count = local.deploy_ingestion ? 1 : 0
+
+  name = "judgemind-ecs-execution-secrets-${var.environment}"
+  role = aws_iam_role.ecs_task_execution.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid      = "ReadDbSecret"
+        Effect   = "Allow"
+        Action   = "secretsmanager:GetSecretValue"
+        Resource = var.db_connection_secret_arn
+      }
+    ]
+  })
+}
+
+resource "aws_cloudwatch_log_group" "ingestion_worker" {
+  count = local.deploy_ingestion ? 1 : 0
+
+  name              = "/ecs/judgemind-ingestion-worker-${var.environment}"
+  retention_in_days = var.log_retention_days
+
+  tags = {
+    project     = "judgemind"
+    environment = var.environment
+  }
+}
+
+# The ingestion worker needs outbound access to Redis (6379), Postgres (5432),
+# OpenSearch (443), and S3 (443).
+resource "aws_security_group" "ingestion_worker" {
+  count = local.deploy_ingestion ? 1 : 0
+
+  name        = "judgemind-ingestion-worker-${var.environment}"
+  description = "Ingestion worker ECS tasks - outbound to Redis, Postgres, OpenSearch"
+  vpc_id      = var.vpc_id
+
+  egress {
+    description = "HTTPS to OpenSearch and S3"
+    from_port   = 443
+    to_port     = 443
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  egress {
+    description = "Redis event bus"
+    from_port   = 6379
+    to_port     = 6379
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  egress {
+    description = "PostgreSQL database"
+    from_port   = 5432
+    to_port     = 5432
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = {
+    project     = "judgemind"
+    environment = var.environment
+  }
+}
+
+resource "aws_ecs_task_definition" "ingestion_worker" {
+  count = local.deploy_ingestion ? 1 : 0
+
+  family                   = "judgemind-ingestion-worker-${var.environment}"
+  requires_compatibilities = ["FARGATE"]
+  network_mode             = "awsvpc"
+  cpu                      = 256
+  memory                   = 512
+  execution_role_arn       = aws_iam_role.ecs_task_execution.arn
+  task_role_arn            = var.scraper_task_role_arn
+
+  container_definitions = jsonencode([
+    {
+      name      = "ingestion-worker"
+      image     = "${var.ecr_repository_url}:${var.scraper_image_tag}"
+      command   = ["python", "-m", "ingestion"]
+      essential = true
+
+      # DATABASE_URL is injected from Secrets Manager (JSON key: url) so it
+      # is never visible in plaintext in the task definition.
+      secrets = [
+        {
+          name      = "DATABASE_URL"
+          valueFrom = "${var.db_connection_secret_arn}:url::"
+        }
+      ]
+
+      environment = concat(
+        [{ name = "ENVIRONMENT", value = var.environment }],
+        var.redis_url != "" ? [{ name = "REDIS_URL", value = var.redis_url }] : [],
+        var.opensearch_url != "" ? [{ name = "OPENSEARCH_URL", value = var.opensearch_url }] : [],
+        var.document_archive_bucket != "" ? [{ name = "JUDGEMIND_ARCHIVE_BUCKET", value = var.document_archive_bucket }] : []
+      )
+
+      logConfiguration = {
+        logDriver = "awslogs"
+        options = {
+          "awslogs-group"         = "/ecs/judgemind-ingestion-worker-${var.environment}"
+          "awslogs-region"        = data.aws_region.current.id
+          "awslogs-stream-prefix" = "ingestion-worker"
+        }
+      }
+    }
+  ])
+
+  tags = {
+    project     = "judgemind"
+    environment = var.environment
+  }
+}
+
+resource "aws_ecs_service" "ingestion_worker" {
+  count = local.deploy_ingestion ? 1 : 0
+
+  name            = "judgemind-ingestion-worker-${var.environment}"
+  cluster         = aws_ecs_cluster.main.id
+  task_definition = aws_ecs_task_definition.ingestion_worker[0].arn
+  desired_count   = 1
+  launch_type     = "FARGATE"
+
+  # Restart the task if it exits unexpectedly.
+  deployment_minimum_healthy_percent = 0
+  deployment_maximum_percent         = 100
+
+  network_configuration {
+    subnets          = var.private_subnet_ids
+    security_groups  = [aws_security_group.ingestion_worker[0].id]
+    assign_public_ip = false
+  }
+
+  # Ignore changes to task_definition so that image tag updates via CI/CD
+  # don't trigger a Terraform diff on every plan.
+  lifecycle {
+    ignore_changes = [task_definition]
+  }
+
+  tags = {
+    project     = "judgemind"
+    environment = var.environment
+  }
+}
+
 # ─── Scraper Failure Alerts ──────────────────────────────────────────────────
 # CloudWatch alarm that fires when no scraper task has completed successfully
 # in the past 24 hours. Uses a metric filter on the log group to detect

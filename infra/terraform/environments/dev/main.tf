@@ -60,13 +60,15 @@ module "cache" {
 module "compute" {
   source = "../../modules/compute"
 
-  environment             = "dev"
-  vpc_id                  = module.networking.vpc_id
-  private_subnet_ids      = module.networking.private_subnet_ids
-  ecr_repository_url      = module.ecr.repository_url
-  scraper_task_role_arn   = module.iam_scraper.role_arn
-  redis_url               = "redis://${module.cache.redis_endpoint}:${module.cache.redis_port}"
-  document_archive_bucket = module.document_archive.bucket_id
+  environment              = "dev"
+  vpc_id                   = module.networking.vpc_id
+  private_subnet_ids       = module.networking.private_subnet_ids
+  ecr_repository_url       = module.ecr.repository_url
+  scraper_task_role_arn    = module.iam_scraper.role_arn
+  redis_url                = "redis://${module.cache.redis_endpoint}:${module.cache.redis_port}"
+  document_archive_bucket  = module.document_archive.bucket_id
+  db_connection_secret_arn = module.database.db_connection_secret_arn
+  opensearch_url           = "https://${module.search.domain_endpoint}"
 
   # Dev: 0.5 vCPU, 1 GB RAM, daily schedule at 6 AM PT
   task_cpu            = 512
@@ -231,4 +233,14 @@ output "db_port" {
 output "db_connection_secret_arn" {
   description = "Dev Secrets Manager ARN for the database connection string (DATABASE_URL)"
   value       = module.database.db_connection_secret_arn
+}
+
+output "ingestion_worker_service_name" {
+  description = "Dev ingestion worker ECS service name"
+  value       = module.compute.ingestion_worker_service_name
+}
+
+output "ingestion_worker_log_group" {
+  description = "Dev CloudWatch log group for ingestion worker output"
+  value       = module.compute.ingestion_worker_log_group
 }
