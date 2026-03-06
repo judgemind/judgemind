@@ -20,11 +20,13 @@ To pick up a task after setup, use the `/task` skill (see `/task` below).
 ### Steps 0–2 — Run the setup script
 
 Run this from anywhere inside the repo (including from inside an existing worktree):
+
 ```
 scripts/start-worker.sh
 ```
 
 The script handles everything:
+
 - Resolves the repo root regardless of where the shell started
 - Ensures `main` is checked out and up to date
 - Prunes stale worktree metadata
@@ -37,10 +39,12 @@ It prints the worktree path on stdout, e.g. `/path/to/worktrees/worker-2`. **Rec
 All subsequent work happens inside `{worktree}`. Use `{worktree}/tmp/` for **all** temporary files (scripts, PR bodies, etc.) — this directory is gitignored and scoped to your worker, so there are no permission prompts and no collisions between workers.
 
 **Venv isolation:** each agent must create its own venv inside the worktree for every Python package it works in. Never use the venv from the main repo or another worktree — multiple agents on the same machine will stomp on each other if they share a venv. After creating the worktree, set up a venv for each package you need:
+
 ```
 python3.12 -m venv {worktree}/packages/<pkg>/.venv
 cd {worktree}/packages/<pkg> && .venv/bin/pip install -e ".[dev]" --quiet
 ```
+
 Only install venvs for packages you actually work in during the session.
 
 ### Step 3 — Pick up a task
@@ -52,6 +56,7 @@ Use the `/task` skill to claim and work on an issue. Run it after completing Ste
 - `/task scrapers` / `/task next perf bug` / etc. — natural-language filter over the backlog
 
 The skill works autonomously from issue selection through PR and review request. The PR workflow it follows is defined in the next section.
+
 ## PR Workflow (authoritative — applies to all task work)
 
 **Single-issue rule:** each PR addresses exactly one issue. Do not combine unrelated changes in a single PR. If an issue is large or ambiguous, break it into sub-tasks first (see **Creating Sub-Tasks**), label them `agent/ready`, then pick up the first sub-task.
@@ -131,9 +136,11 @@ Complete every substep in order. A task is not done until substep 4.9 is finishe
 #### 4.9 — Remove your worktree
 
 The branch must stay (it backs the open PR), but the worktree directory is no longer needed. Run:
+
 ```
 scripts/end-worker.sh {worktree}
 ```
+
 This is the last step of every task. A task is not complete until the worktree is removed.
 
 ## Tool Use Rules
@@ -147,11 +154,12 @@ When operating as an agent in this repo:
 
 ## Accounts & Deployed Infrastructure
 
-**GitHub:** org `judgemind/judgemind`, active account `judgeminder` (scopes: gist, project, read:org, repo, workflow).
+**GitHub:** org `judgemind/judgemind`, active account `judgemind-agent` (scopes: gist, project, read:org, repo, workflow).
 
 **AWS:** account `155326049300`, user `admin`, region `us-west-2`. This is the Judgemind AWS account, not a personal account.
 
 **Deployed resources (dev):**
+
 - Terraform state: S3 bucket `judgemind-terraform-state`, DynamoDB lock table `judgemind-terraform-locks`
 - Document archive: S3 bucket `judgemind-document-archive-dev`
 - Assets: S3 bucket `judgemind-assets-dev`
@@ -159,6 +167,7 @@ When operating as an agent in this repo:
 ## Code Standards
 
 ### Python (scrapers, NLP pipeline)
+
 - Python 3.12+, using `.venv` in each package directory
 - Run tests: `.venv/bin/pytest tests/ -v`
 - Install deps: `.venv/bin/pip install -e ".[dev]"`
@@ -168,6 +177,7 @@ When operating as an agent in this repo:
 - Async where appropriate (httpx for HTTP, playwright for browser automation)
 
 ### TypeScript (API, frontend)
+
 - Strict mode always
 - Node.js 20+ for API; activate with `source ~/.nvm/nvm.sh && nvm install 20 --no-progress` (nvm is the version manager; `nvm install` is idempotent if already installed)
 - Next.js 14+ for frontend
@@ -175,6 +185,7 @@ When operating as an agent in this repo:
 - Jest or Vitest for testing
 
 ### General
+
 - All code must have tests. Scrapers must have regression tests against archived pages in `tests/fixtures/`.
 - Never hardcode secrets, API keys, credentials, or URLs to live court sites in source code. Use environment variables.
 - Never commit large binary files. Use `.gitignore`.
@@ -191,28 +202,34 @@ When operating as an agent in this repo:
 Run checks from each package directory you modified. If any check fails, fix it before pushing.
 
 **Python packages** (from the package directory, e.g. `packages/scraper-framework/`):
+
 ```
 .venv/bin/ruff check src/ tests/           # Lint (rules: E, F, I, N, UP, ANN)
 .venv/bin/ruff format --check src/ tests/   # Format check
 .venv/bin/pytest tests/ -v --tb=short       # Tests (scraper-framework also supports -n auto)
 ```
+
 If lint fails, auto-fix with `.venv/bin/ruff check --fix src/ tests/` then `.venv/bin/ruff format src/ tests/`.
 
 Common ruff pitfalls that agents keep hitting:
+
 - **I001** (unsorted imports): `ruff check --fix` resolves this. Always run it.
 - **F401** (unused imports): Remove any import you don't actually use.
 - **UP017** (datetime.UTC): Use `datetime.now(datetime.UTC)`, not `datetime.now(timezone.utc)`.
 - **Format != Lint**: `ruff check` and `ruff format` are **separate commands**. You must run BOTH.
 
 **TypeScript packages** (from the package directory):
+
 ```
 npm run lint                                # ESLint
 npm run typecheck                           # tsc --noEmit
 npm test                                    # Vitest
 ```
+
 For `packages/web/`, also run `npm run build` to catch build errors.
 
 **Terraform** (from `infra/terraform/`):
+
 ```
 terraform fmt -check -recursive
 terraform init -backend=false
@@ -226,6 +243,7 @@ terraform validate
 When spawning subagents that will work on **different branches** (e.g. fixing multiple PRs in parallel, implementing features on separate branches), the parent agent **MUST** pass `isolation: "worktree"` in the Agent tool call. Without this, subagents share the parent's working directory and will cause branch checkout conflicts, stash races, and leave the parent on the wrong branch.
 
 Rules:
+
 - **Never run `git checkout` or `git switch` in the parent's working directory from a subagent.** This changes the branch for the parent and every other subagent sharing that directory.
 - If the `isolation: "worktree"` parameter is not available (e.g. the subagent is doing non-git work like API calls or documentation generation), the subagent must **not** check out a different branch in the shared working directory.
 - A subagent that needs to work on a specific branch but is not already worktree-isolated must create its own worktree before doing any branch-specific work:
@@ -240,6 +258,7 @@ Rules:
 #### Pre-PR Checks
 
 When you spawn a subagent to implement a feature or fix, the subagent MUST:
+
 1. Install dependencies and set up the venv/node_modules.
 2. Run ALL lint, format, and test commands listed above for every package it touched.
 3. Fix any failures before committing.
@@ -265,6 +284,7 @@ Issues can be blocked on other issues. The system uses these conventions:
 **Implementation tasks (PRs):** dependent issues are unblocked automatically by the `unblock-issues` CI workflow when the PR merges. No manual action needed — but the PR body must include `Closes #N` so the workflow knows which issue was resolved.
 
 **Non-PR completions (investigations, sub-task breakdowns):** manually unblock dependent issues. Search for open issues waiting on yours:
+
 ```
 gh issue list --repo judgemind/judgemind --state open \
     --search "Blocked by #<your-issue>" \
@@ -272,6 +292,7 @@ gh issue list --repo judgemind/judgemind --state open \
 ```
 
 For each result, re-read its body and check every `Blocked by #X` line. If **all** referenced issues are now closed:
+
 1. Remove the `status/blocked` label.
 2. Add the `agent/ready` label.
 3. Remove the resolved `Blocked by #N` lines from the issue body (write updated body to a temp file and use `gh issue edit <N> --body-file`).
@@ -299,6 +320,7 @@ Investigation tasks produce documentation, not code:
 ## Scraper Development Rules
 
 Key paths:
+
 - Framework base classes: `packages/scraper-framework/src/framework/`
 - California courts: `packages/scraper-framework/src/courts/ca/`
 
