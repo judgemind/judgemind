@@ -94,6 +94,32 @@ module "search" {
   ebs_volume_size = 20
 }
 
+module "api_service" {
+  source = "../../modules/api-service"
+
+  environment        = "dev"
+  vpc_id             = module.networking.vpc_id
+  public_subnet_ids  = module.networking.public_subnet_ids
+  private_subnet_ids = module.networking.private_subnet_ids
+  ecs_cluster_arn    = module.compute.cluster_arn
+  ecs_cluster_name   = module.compute.cluster_name
+  execution_role_arn = module.compute.task_execution_role_arn
+  ecr_repository_url = module.ecr.api_repository_url
+  domain_name        = "api.dev.judgemind.org"
+
+  db_connection_secret_arn          = module.database.db_connection_secret_arn
+  redis_url                         = "redis://${module.cache.redis_endpoint}:${module.cache.redis_port}"
+  opensearch_url                    = "https://${module.search.domain_endpoint}"
+  opensearch_credentials_secret_arn = module.search.master_credentials_secret_arn
+  cors_allowed_origins              = "https://dev.judgemind.org"
+
+  # Dev: 0.25 vCPU, 512 MB, single replica
+  task_cpu           = 256
+  task_memory        = 512
+  desired_count      = 1
+  log_retention_days = 14
+}
+
 module "ses" {
   source = "../../modules/ses"
 
@@ -244,4 +270,29 @@ output "ingestion_worker_service_name" {
 output "ingestion_worker_log_group" {
   description = "Dev CloudWatch log group for ingestion worker output"
   value       = module.compute.ingestion_worker_log_group
+}
+
+output "api_alb_dns_name" {
+  description = "Dev API ALB DNS name (CNAME target for api.dev.judgemind.org)"
+  value       = module.api_service.alb_dns_name
+}
+
+output "api_service_name" {
+  description = "Dev API ECS service name"
+  value       = module.api_service.service_name
+}
+
+output "api_log_group" {
+  description = "Dev CloudWatch log group for API output"
+  value       = module.api_service.log_group_name
+}
+
+output "api_acm_validation" {
+  description = "Dev API ACM certificate DNS validation records — create these in Cloudflare"
+  value       = module.api_service.acm_domain_validation_options
+}
+
+output "api_ecr_repository_url" {
+  description = "Dev ECR repository URL for API images"
+  value       = module.ecr.api_repository_url
 }

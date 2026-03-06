@@ -12,3 +12,8 @@ output "registry_id" {
   description = "AWS account ID of the ECR registry"
   value       = aws_ecr_repository.scraper.registry_id
 }
+
+output "api_repository_url" {
+  description = "ECR repository URL for API images"
+  value       = aws_ecr_repository.api.repository_url
+}
