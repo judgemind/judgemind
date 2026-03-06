@@ -29,7 +29,7 @@ Machine-readable checklist of rules extracted from CLAUDE.md. Agents should vali
 | GI-01 | Never commit to `main` directly | All work on worktree branches; changes go through PRs |
 | GI-02 | Commit messages use conventional format | `feat(area): description (#N)` |
 | GI-03 | Commit message via file | Write to `{worktree}/tmp/commit_msg.txt`, commit with `-F` |
-| GI-04 | Never merge own PRs | Request review, wait for human merge |
+| GI-04 | May merge own PRs after diff review + green CI | `gh pr merge <N> --squash --delete-branch` |
 | GI-05 | PR body must include `Closes #N` | Required for the unblock workflow |
 | GI-06 | Push always followed by PR creation | Never push without immediately creating a PR |
 

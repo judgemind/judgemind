@@ -161,10 +161,13 @@ Fetch the current PR body, check off automated steps that passed in CI, run any 
 gh pr edit <PR-N> --repo judgemind/judgemind --body-file {worktree}/tmp/pr_body.txt
 ```
 
-#### A.8 — Link the issue and request review
-Comment on the issue linking the PR. Add `status/review` label to the issue.
+#### A.8 — Merge the PR
+The PR has passed the diff-review loop (A.3) and CI is green. Merge it:
+```
+gh pr merge <PR-N> --repo judgemind/judgemind --squash --delete-branch
+```
 
-**Dependent issues will be unblocked automatically** by the `unblock-issues` workflow when this PR is merged. No manual unblocking needed.
+**Dependent issues will be unblocked automatically** by the `unblock-issues` workflow when the PR merges. No manual unblocking needed.
 
 #### A.9 — Remove worktree
 ```

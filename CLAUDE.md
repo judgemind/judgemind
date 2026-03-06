@@ -15,7 +15,7 @@ These are the most frequently violated rules. **A PreToolUse hook enforces the s
 
 ### NEVER — Workflow
 - **NEVER** commit directly to `main` during autonomous task work. All `/task` work happens on worktree branches via PRs. (The user may direct you to commit to `main` during interactive sessions — that's fine.)
-- **NEVER** merge your own PRs. Request review and wait for human merge.
+- **You MAY merge your own PRs** if the PR has passed the `/task` diff-review loop (A.3) and CI is green. Use `gh pr merge <N> --repo judgemind/judgemind --squash --delete-branch`.
 - **NEVER** deploy to production. Production deploys are human-only.
 - **NEVER** skip pre-PR checks. Run lint, format, AND tests locally before pushing.
 - **NEVER** share venvs between worktrees. Each worktree gets its own `.venv`.
@@ -318,7 +318,7 @@ Do NOT rely on CI to catch issues that local checks would have caught. If a suba
 ## Git Workflow
 
 - Commit messages follow conventional commits: `feat(scraping): implement OC PDF link scraper (#42)`
-- Always work on the worktree branch created in Step 2. Open a PR, wait for CI to pass, then request human review. Never merge your own PRs. Never push directly to `main`.
+- Always work on the worktree branch created in Step 2. Open a PR, wait for CI to pass. You may merge your own PRs after the diff-review loop (A.3) and CI are green. Never push directly to `main`.
 - **A PR is not done until it has no conflicts and CI is green.** Follow the complete post-push checklist in the PR Workflow section (substeps 4.4–4.8) — do not skip any step.
 
 ## Task Dependencies
@@ -437,7 +437,7 @@ Do **not** file issues for prompts that exist for good reason — pushing to rem
 
 ## Things You Must Not Do
 
-- Do not merge PRs.
+- Do not merge PRs unless they have passed the diff-review loop (A.3) and CI is green.
 - Do not deploy to production.
 - Do not make architectural decisions that contradict the specs without flagging them as `type/decision` issues.
 - Do not scrape live court websites during development.
