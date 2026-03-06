@@ -182,7 +182,7 @@ resource "aws_iam_policy" "scheduler_run_task" {
         Sid      = "AllowRunTask"
         Effect   = "Allow"
         Action   = "ecs:RunTask"
-        Resource = aws_ecs_task_definition.scraper.arn
+        Resource = "arn:aws:ecs:${data.aws_region.current.id}:${data.aws_caller_identity.current.account_id}:task-definition/${aws_ecs_task_definition.scraper.family}:*"
         Condition = {
           ArnEquals = {
             "ecs:cluster" = aws_ecs_cluster.main.arn
