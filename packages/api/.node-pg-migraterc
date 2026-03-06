@@ -2,6 +2,6 @@
   "migrations-dir": "migrations",
   "migration-file-language": "sql",
   "database-url-var": "DATABASE_URL",
-  "schema": "public",
+  "schema": ["public", "staging"],
   "create-schema": true
 }

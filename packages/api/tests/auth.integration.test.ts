@@ -5,13 +5,12 @@
  * Runs against a real PostgreSQL database (same as graphql.integration.test.ts).
  */
 
-import { readFileSync } from 'fs';
-import { join } from 'path';
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { Pool, types } from 'pg';
 import type { FastifyInstance } from 'fastify';
 import { buildApp } from '../src/app';
 import { signVerificationToken } from '../src/auth/tokens';
+import { applyMigrations } from './setup-db';
 
 types.setTypeParser(1082, (val: string) => val);
 types.setTypeParser(1114, (val: string) => val);
@@ -27,35 +26,8 @@ let app: FastifyInstance;
 // Unique email prefix to avoid collisions with other test runs
 const PREFIX = `test-${Date.now()}`;
 
-async function applySchemaIdempotent(): Promise<void> {
-  const sql = readFileSync(join(__dirname, '../src/data-access/schema.sql'), 'utf8');
-  try {
-    await pool.query(sql);
-  } catch (err: unknown) {
-    const code = (err as { code?: string }).code;
-    // 23505 = unique_violation — CREATE EXTENSION IF NOT EXISTS can race
-    // when multiple test workers apply the schema concurrently
-    if (!['42P07', '42710', '42P06', '42723', '42P16', '23505'].includes(code ?? '')) {
-      throw err;
-    }
-  }
-  // Apply migration for google_id + refresh_tokens (idempotent DDL)
-  const migration = readFileSync(
-    join(__dirname, '../migrations/2_auth-google-id-refresh-tokens.sql'),
-    'utf8',
-  );
-  try {
-    await pool.query(migration);
-  } catch (err: unknown) {
-    const code = (err as { code?: string }).code;
-    if (!['42P07', '42710', '42701', '23505'].includes(code ?? '')) {
-      throw err;
-    }
-  }
-}
-
 beforeAll(async () => {
-  await applySchemaIdempotent();
+  applyMigrations();
   app = await buildApp(pool);
 }, 30_000);
 

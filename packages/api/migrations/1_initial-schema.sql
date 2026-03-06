@@ -1,9 +1,4 @@
--- Migration 001: Initial schema
--- =============================================================================
--- Applies the full core entity model.
--- This migration is the source of truth for production deployments.
--- For local development, schema.sql is loaded automatically by docker-compose.
--- =============================================================================
+-- Up Migration
 
 -- Enable UUID generation
 CREATE EXTENSION IF NOT EXISTS "pgcrypto";
@@ -427,3 +422,44 @@ CREATE TRIGGER trg_users_updated_at
 
 CREATE TRIGGER trg_alert_subscriptions_updated_at
     BEFORE UPDATE ON alert_subscriptions FOR EACH ROW EXECUTE FUNCTION update_updated_at();
+
+
+-- Down Migration
+
+-- Drop in reverse dependency order
+DROP TRIGGER IF EXISTS trg_alert_subscriptions_updated_at ON alert_subscriptions;
+DROP TRIGGER IF EXISTS trg_users_updated_at ON users;
+DROP TRIGGER IF EXISTS trg_rulings_updated_at ON rulings;
+DROP TRIGGER IF EXISTS trg_cases_updated_at ON cases;
+DROP TRIGGER IF EXISTS trg_parties_updated_at ON parties;
+DROP TRIGGER IF EXISTS trg_attorneys_updated_at ON attorneys;
+DROP TRIGGER IF EXISTS trg_judges_updated_at ON judges;
+DROP TRIGGER IF EXISTS trg_courts_updated_at ON courts;
+DROP FUNCTION IF EXISTS update_updated_at();
+
+DROP TABLE IF EXISTS alert_events;
+DROP TABLE IF EXISTS alert_subscriptions;
+DROP TYPE IF EXISTS alert_type;
+DROP TABLE IF EXISTS users;
+DROP TABLE IF EXISTS scraper_runs;
+DROP TABLE IF EXISTS staging.ruled_items;
+DROP TABLE IF EXISTS staging.captures;
+DROP TYPE IF EXISTS validation_status;
+DROP TABLE IF EXISTS rulings;
+DROP TYPE IF EXISTS ruling_outcome;
+DROP TABLE IF EXISTS documents;
+DROP TYPE IF EXISTS document_status;
+DROP TYPE IF EXISTS document_format;
+DROP TABLE IF EXISTS case_parties;
+DROP TABLE IF EXISTS case_attorneys;
+DROP TABLE IF EXISTS case_judges;
+DROP TABLE IF EXISTS cases;
+DROP TABLE IF EXISTS party_aliases;
+DROP TABLE IF EXISTS parties;
+DROP TABLE IF EXISTS attorney_aliases;
+DROP TABLE IF EXISTS attorneys;
+DROP TABLE IF EXISTS judge_aliases;
+DROP TABLE IF EXISTS judges;
+DROP TABLE IF EXISTS courts;
+
+DROP SCHEMA IF EXISTS staging;

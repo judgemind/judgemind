@@ -4,16 +4,14 @@
  * afterAll, so the tests are safe to run against an existing schema (local dev)
  * or a fresh one (CI postgres service).
  *
- * The schema is applied idempotently: statements that fail because the object
- * already exists are silently skipped.
+ * Migrations are applied via node-pg-migrate before tests run.
  */
 
-import { readFileSync } from 'fs';
-import { join } from 'path';
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { Pool, types } from 'pg';
 import type { FastifyInstance } from 'fastify';
 import { buildApp } from '../src/app';
+import { applyMigrations } from './setup-db';
 
 // Match the type parsers registered in src/data-access/db.ts so DATE columns
 // come back as 'YYYY-MM-DD' strings rather than millisecond timestamps.
@@ -37,28 +35,6 @@ let caseId: string;
 let rulingId: string;
 const insertedPartyIds: string[] = [];
 const insertedDocIds: string[] = [];
-
-// ---------------------------------------------------------------------------
-// Schema setup — idempotent: ignore "already exists" errors per statement
-// ---------------------------------------------------------------------------
-
-async function applySchemaIdempotent(): Promise<void> {
-  const sql = readFileSync(join(__dirname, '../src/data-access/schema.sql'), 'utf8');
-  try {
-    // Run the entire schema as one batch. In CI (fresh DB) this succeeds.
-    // Locally the schema is already applied; pg will throw on the first
-    // duplicate object — that's fine, we ignore those error codes.
-    await pool.query(sql);
-  } catch (err: unknown) {
-    // 42P07 = duplicate_table, 42710 = duplicate_object, 42P06 = duplicate_schema,
-    // 42723 = duplicate_function, 42P16 = invalid_table_definition,
-    // 23505 = unique_violation (CREATE EXTENSION IF NOT EXISTS can race across workers)
-    const code = (err as { code?: string }).code;
-    if (!['42P07', '42710', '42P06', '42723', '42P16', '23505'].includes(code ?? '')) {
-      throw err;
-    }
-  }
-}
 
 async function seedData(): Promise<void> {
   const { rows: cRows } = await pool.query<{ id: string }>(
@@ -154,7 +130,7 @@ async function cleanupData(): Promise<void> {
 // ---------------------------------------------------------------------------
 
 beforeAll(async () => {
-  await applySchemaIdempotent();
+  applyMigrations();
   await seedData();
   app = await buildApp(pool);
 }, 30_000);
