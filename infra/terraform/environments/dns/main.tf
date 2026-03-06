@@ -23,11 +23,11 @@ module "dns" {
     "y3ggvhi7wtvsiyok2nrzzeujmuva5hvc",
   ]
 
-  # Hosting — set these when the corresponding services are deployed.
-  dev_web_cname  = "" # Issue #137: Vercel CNAME for dev.judgemind.org
-  dev_api_cname  = "" # Future: API hosting for api.dev.judgemind.org
-  prod_web_cname = "" # Future: production web hosting for judgemind.org
-  prod_api_cname = "" # Future: production API for api.judgemind.org
+  # Hosting — updated as services are deployed.
+  dev_web_cname  = "cname.vercel-dns.com" # → Vercel (Issue #137)
+  dev_api_cname  = ""                     # Future: API hosting for api.dev.judgemind.org
+  prod_web_cname = ""                     # Future: production web hosting for judgemind.org
+  prod_api_cname = ""                     # Future: production API for api.judgemind.org
 }
 
 output "zone_id" {

@@ -120,15 +120,16 @@ resource "cloudflare_page_rule" "redirect_www" {
 
 # ─── Dev web subdomain ────────────────────────────────────────────────────────
 
-# Set dev_web_cname when Vercel is configured (Issue #137).
+# DNS-only (proxied = false): Vercel handles SSL and CDN directly.
+# Cloudflare proxy conflicts with Vercel's domain verification.
 resource "cloudflare_record" "dev_web" {
   count   = var.dev_web_cname != "" ? 1 : 0
   zone_id = local.zone_id
   name    = "dev"
   type    = "CNAME"
   content = var.dev_web_cname
-  proxied = true
-  ttl     = 1
+  proxied = false
+  ttl     = 300
 }
 
 # ─── Dev API subdomain ────────────────────────────────────────────────────────
