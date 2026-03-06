@@ -11,7 +11,7 @@ import redis
 
 from framework import CapturedDocument, ContentFormat, ScraperHealthEvent
 from framework.event_bus import RedisEventBus
-from framework.events import EventBus
+from framework.events import DEFAULT_STREAM_MAXLEN, EventBus
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -310,3 +310,68 @@ class TestHearingDateSerialization:
             # Verify it's parseable as ISO datetime
             parsed = datetime.fromisoformat(payload[field])
             assert parsed is not None, f"{field} is not a valid ISO datetime"
+
+
+# ---------------------------------------------------------------------------
+# Tests: MAXLEN trimming (#168)
+# ---------------------------------------------------------------------------
+
+
+class TestStreamMaxlen:
+    """Verify that xadd calls include MAXLEN ~ to bound stream size."""
+
+    def test_emit_document_captured_passes_maxlen(self) -> None:
+        """xadd for document.captured must include maxlen and approximate."""
+        mock_redis = MagicMock()
+        mock_redis.xadd.return_value = b"1234-0"
+        bus = EventBus(mock_redis)
+
+        doc = _make_doc()
+        bus.emit_document_captured(doc, producer_id="test")
+
+        call_args = mock_redis.xadd.call_args
+        assert call_args.kwargs["maxlen"] == DEFAULT_STREAM_MAXLEN
+        assert call_args.kwargs["approximate"] is True
+
+    def test_emit_health_passes_maxlen(self) -> None:
+        """xadd for scraper.health must include maxlen and approximate."""
+        mock_redis = MagicMock()
+        mock_redis.xadd.return_value = b"1234-0"
+        bus = EventBus(mock_redis)
+
+        health = _make_health()
+        bus.emit_health(health)
+
+        call_args = mock_redis.xadd.call_args
+        assert call_args.kwargs["maxlen"] == DEFAULT_STREAM_MAXLEN
+        assert call_args.kwargs["approximate"] is True
+
+    def test_custom_maxlen_via_constructor(self) -> None:
+        """EventBus accepts an explicit maxlen override."""
+        mock_redis = MagicMock()
+        mock_redis.xadd.return_value = b"1234-0"
+        bus = EventBus(mock_redis, maxlen=500)
+
+        doc = _make_doc()
+        bus.emit_document_captured(doc, producer_id="test")
+
+        call_args = mock_redis.xadd.call_args
+        assert call_args.kwargs["maxlen"] == 500
+
+    def test_stream_maxlen_env_var_override(self) -> None:
+        """STREAM_MAXLEN env var overrides the default."""
+        mock_redis = MagicMock()
+        mock_redis.xadd.return_value = b"1234-0"
+
+        with patch.dict(os.environ, {"STREAM_MAXLEN": "5000"}):
+            bus = EventBus(mock_redis)
+
+        doc = _make_doc()
+        bus.emit_document_captured(doc, producer_id="test")
+
+        call_args = mock_redis.xadd.call_args
+        assert call_args.kwargs["maxlen"] == 5000
+
+    def test_default_stream_maxlen_value(self) -> None:
+        """The default MAXLEN should be 10_000."""
+        assert DEFAULT_STREAM_MAXLEN == 10_000
