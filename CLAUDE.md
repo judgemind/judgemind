@@ -78,10 +78,18 @@ Complete every substep in order. A task is not done until substep 4.9 is finishe
 - Run **all** pre-PR checks (see "Pre-PR Checks" section — lint, format, AND tests) for every package you touched.
 - Fix any failures before proceeding. Do not push code that fails local checks.
 
-#### 4.3 — Push and open a PR
+#### 4.3 — Push, open a PR, and immediately watch CI
 
-- Commit using conventional commits: `feat(scraping): implement OC PDF link scraper (#42)`
-- Push the branch and immediately open a PR. Never push without creating a PR.
+Push the branch, open a PR, then start watching CI **in the same step** — do not do anything else until CI completes:
+
+```
+git push -u origin <branch>
+gh pr create --repo judgemind/judgemind ...
+gh run list --repo judgemind/judgemind --branch <branch> --limit 1 --json databaseId -q '.[0].databaseId'
+gh run watch <run-id> --repo judgemind/judgemind --exit-status --compact
+```
+
+**Never leave the CI watch step unfinished.** Do not remove the worktree, do not update the PR body, do not do anything else until `gh run watch` exits. If CI is green, continue to 4.4. If CI fails, go to 4.6.
 
 #### 4.4 — Verify no merge conflicts
 
@@ -94,20 +102,20 @@ Complete every substep in order. A task is not done until substep 4.9 is finishe
   git -C $REPO_ROOT/worktrees/worker-N fetch origin main
   git -C $REPO_ROOT/worktrees/worker-N rebase origin/main
   ```
-  Resolve any conflicts, then `git rebase --continue`, then push with `--force-with-lease`.
+  Resolve any conflicts, then `git rebase --continue`, then push with `--force-with-lease`, then return to 4.3 to watch CI again.
 
-#### 4.5 — Monitor CI
+#### 4.5 — CI is green — confirm before proceeding
 
-- Watch CI after every push:
-  ```
-  gh run watch <run-id> --repo judgemind/judgemind --exit-status --compact
-  ```
-- Do not move on until CI completes.
+After `gh run watch` exits cleanly, verify all required checks passed:
+```
+gh pr view <N> --repo judgemind/judgemind --json statusCheckRollup
+```
+All checks must show `SUCCESS` or `SKIPPED`. Any `FAILURE` goes to 4.6.
 
 #### 4.6 — Fix CI failures (repeat until green)
 
-- If CI fails, diagnose the failure, fix it locally, push again, and return to substep 4.4.
-- Repeat the 4.4 -> 4.5 -> 4.6 loop until CI is green. Do not proceed until all checks pass.
+- If CI fails, diagnose the failure, fix it locally, push again, and return to 4.3.
+- Repeat the 4.3 -> 4.4 -> 4.5 -> 4.6 loop until CI is green. **The worktree must not be removed until this loop exits cleanly.**
 
 #### 4.7 — Update the PR test plan
 
