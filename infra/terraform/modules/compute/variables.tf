@@ -105,3 +105,9 @@ variable "opensearch_url" {
   type        = string
   default     = ""
 }
+
+variable "opensearch_credentials_secret_arn" {
+  description = "ARN of the Secrets Manager secret holding OpenSearch master user credentials (JSON keys: username, password). Required when db_connection_secret_arn is set."
+  type        = string
+  default     = ""
+}

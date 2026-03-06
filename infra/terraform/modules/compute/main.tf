@@ -264,10 +264,13 @@ resource "aws_iam_role_policy" "ecs_task_execution_secrets" {
     Version = "2012-10-17"
     Statement = [
       {
-        Sid      = "ReadDbSecret"
-        Effect   = "Allow"
-        Action   = "secretsmanager:GetSecretValue"
-        Resource = var.db_connection_secret_arn
+        Sid    = "ReadIngestionSecrets"
+        Effect = "Allow"
+        Action = "secretsmanager:GetSecretValue"
+        Resource = compact([
+          var.db_connection_secret_arn,
+          var.opensearch_credentials_secret_arn,
+        ])
       }
     ]
   })
@@ -342,14 +345,26 @@ resource "aws_ecs_task_definition" "ingestion_worker" {
       entryPoint = ["python", "-m", "ingestion"]
       essential  = true
 
-      # DATABASE_URL is injected from Secrets Manager (JSON key: url) so it
-      # is never visible in plaintext in the task definition.
-      secrets = [
-        {
-          name      = "DATABASE_URL"
-          valueFrom = "${var.db_connection_secret_arn}:url::"
-        }
-      ]
+      # Secrets injected from Secrets Manager so they are never visible in
+      # plaintext in the task definition.
+      secrets = concat(
+        [
+          {
+            name      = "DATABASE_URL"
+            valueFrom = "${var.db_connection_secret_arn}:url::"
+          }
+        ],
+        var.opensearch_credentials_secret_arn != "" ? [
+          {
+            name      = "OPENSEARCH_USERNAME"
+            valueFrom = "${var.opensearch_credentials_secret_arn}:username::"
+          },
+          {
+            name      = "OPENSEARCH_PASSWORD"
+            valueFrom = "${var.opensearch_credentials_secret_arn}:password::"
+          }
+        ] : []
+      )
 
       environment = concat(
         [{ name = "ENVIRONMENT", value = var.environment }],
