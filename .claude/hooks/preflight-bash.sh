@@ -51,5 +51,13 @@ if echo "$COMMAND" | grep -qE '&&|;' ; then
     fi
 fi
 
+# 5. cd in compound commands (use git -C, npm --prefix, or separate tool calls)
+if echo "$COMMAND" | grep -qE '&&|;' ; then
+    if echo "$COMMAND" | grep -qE '\bcd\b' ; then
+        echo "BLOCKED: Do not use cd in compound commands. Use 'git -C /path', 'npm --prefix /path', or separate tool calls instead. See CLAUDE.md §Unattended Operation Patterns." >&2
+        exit 2
+    fi
+fi
+
 # All checks passed
 exit 0
