@@ -120,6 +120,21 @@ module "compute" {
   scraper_task_role_arn = module.iam_scraper.role_arn
 }
 
+module "api_service" {
+  source = "./modules/api-service"
+
+  environment              = var.environment
+  vpc_id                   = module.networking.vpc_id
+  public_subnet_ids        = module.networking.public_subnet_ids
+  private_subnet_ids       = module.networking.private_subnet_ids
+  ecs_cluster_arn          = module.compute.cluster_arn
+  ecs_cluster_name         = module.compute.cluster_name
+  execution_role_arn       = module.compute.task_execution_role_arn
+  ecr_repository_url       = module.ecr.api_repository_url
+  domain_name              = "api.dev.judgemind.org"
+  db_connection_secret_arn = module.database.db_connection_secret_arn
+}
+
 module "dns" {
   source = "./modules/dns"
   # All variables have defaults; real values are set in environments/dns/main.tf.

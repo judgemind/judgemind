@@ -17,6 +17,27 @@ export async function buildApp(db?: Pool, os?: Client): Promise<FastifyInstance>
     logger: process.env.NODE_ENV !== 'test',
   });
 
+  // ── CORS ────────────────────────────────────────────────────────────────
+  const allowedOrigins = (process.env.CORS_ALLOWED_ORIGINS ?? '')
+    .split(',')
+    .map((o) => o.trim())
+    .filter(Boolean);
+
+  if (allowedOrigins.length > 0) {
+    app.addHook('onRequest', async (req, reply) => {
+      const origin = req.headers.origin;
+      if (origin && allowedOrigins.includes(origin)) {
+        reply.header('Access-Control-Allow-Origin', origin);
+        reply.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+        reply.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+        reply.header('Access-Control-Allow-Credentials', 'true');
+      }
+      if (req.method === 'OPTIONS') {
+        reply.status(204).send();
+      }
+    });
+  }
+
   const apollo = new ApolloServer({
     typeDefs,
     resolvers,
