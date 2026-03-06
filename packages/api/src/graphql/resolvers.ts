@@ -57,6 +57,7 @@ export const resolvers = {
         filters,
         first,
         after,
+        includeFuture,
       }: {
         query?: string;
         filters?: {
@@ -70,10 +71,11 @@ export const resolvers = {
         };
         first?: number;
         after?: string;
+        includeFuture?: boolean;
       },
       { opensearch, pool }: Context,
     ) => {
-      return searchRulings(opensearch, pool, { query, filters, first, after });
+      return searchRulings(opensearch, pool, { query, filters, first, after, includeFuture });
     },
 
     // -----------------------------------------------------------------------
@@ -234,6 +236,7 @@ export const resolvers = {
         dateFrom,
         dateTo,
         caseNumber,
+        includeFuture,
         first,
         after,
       }: {
@@ -245,6 +248,7 @@ export const resolvers = {
         dateFrom?: string;
         dateTo?: string;
         caseNumber?: string;
+        includeFuture?: boolean;
         first?: number;
         after?: string;
       },
@@ -254,6 +258,11 @@ export const resolvers = {
       const conditions: string[] = [];
       const params: unknown[] = [];
       let i = 1;
+
+      // Exclude future hearing dates by default
+      if (!includeFuture) {
+        conditions.push(`r.hearing_date <= CURRENT_DATE`);
+      }
 
       if (judgeId) {
         conditions.push(`r.judge_id = $${i++}`);

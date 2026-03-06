@@ -108,6 +108,16 @@ async function seedData(): Promise<void> {
              'TENTATIVE RULING: Motion to Dismiss is DENIED.')`,
     [docId, caseId, judgeId, courtId],
   );
+
+  // Ruling 3 — future hearing date (should be excluded by default)
+  await pool.query(
+    `INSERT INTO rulings
+       (document_id, case_id, judge_id, court_id, hearing_date, outcome, motion_type,
+        is_tentative, department, ruling_text)
+     VALUES ($1, $2, $3, $4, '2099-12-31', 'granted', 'msj', true, 'Dept. 3',
+             'TENTATIVE RULING: Future ruling that should be filtered out.')`,
+    [docId, caseId, judgeId, courtId],
+  );
 }
 
 async function cleanupData(): Promise<void> {
@@ -433,8 +443,32 @@ describe('GraphQL schema — integration', () => {
       expect(edges.some((e) => e.node.id === rulingId)).toBe(true);
     });
 
+    it('excludes future hearing dates by default', async () => {
+      const body = await gql(
+        `query($id: ID!) { rulings(courtId: $id) { edges { node { id hearingDate } } } }`,
+        { id: courtId },
+      );
+      expect(body.errors).toBeUndefined();
+      const edges = ((body.data?.rulings as Record<string, unknown>).edges as Array<{ node: { id: string; hearingDate: string } }>);
+      // Should not contain the future ruling (2099-12-31)
+      edges.forEach((e) => {
+        expect(new Date(e.node.hearingDate).getTime()).toBeLessThanOrEqual(new Date().getTime() + 86_400_000);
+      });
+    });
+
+    it('includes future hearing dates when includeFuture is true', async () => {
+      const body = await gql(
+        `query($id: ID!) { rulings(courtId: $id, includeFuture: true) { edges { node { id hearingDate } } } }`,
+        { id: courtId },
+      );
+      expect(body.errors).toBeUndefined();
+      const edges = ((body.data?.rulings as Record<string, unknown>).edges as Array<{ node: { id: string; hearingDate: string } }>);
+      // Should contain the future ruling (2099-12-31)
+      expect(edges.some((e) => e.node.hearingDate === '2099-12-31')).toBe(true);
+    });
+
     it('cursor pagination: first=1 then after cursor gives next page', async () => {
-      // We seeded 2 rulings; first=1 must produce hasNextPage=true
+      // We seeded 2 past rulings; first=1 must produce hasNextPage=true
       const page1 = await gql(`{
         rulings(first: 1) {
           edges { node { id } cursor }

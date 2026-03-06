@@ -20,6 +20,7 @@ export interface SearchRulingsArgs {
   filters?: RulingFilters;
   first?: number;
   after?: string;
+  includeFuture?: boolean;
 }
 
 export interface RulingSearchHit {
@@ -58,9 +59,18 @@ function decodeCursor(cursor: string): unknown[] {
   return JSON.parse(Buffer.from(cursor, 'base64').toString('utf8')) as unknown[];
 }
 
-function buildQuery(query: string | undefined, filters: RulingFilters | undefined) {
+function buildQuery(
+  query: string | undefined,
+  filters: RulingFilters | undefined,
+  includeFuture?: boolean,
+) {
   const must: unknown[] = [];
   const filter: unknown[] = [];
+
+  // Exclude future hearing dates by default
+  if (!includeFuture) {
+    filter.push({ range: { hearing_date: { lte: 'now/d' } } });
+  }
 
   if (query) {
     must.push({ match: { ruling_text: { query, operator: 'and' } } });
@@ -80,7 +90,7 @@ function buildQuery(query: string | undefined, filters: RulingFilters | undefine
     }
   }
 
-  // If no query and no filters, match all
+  // If no query and no filters (besides the future-date filter), match all
   if (must.length === 0 && filter.length === 0) {
     return { match_all: {} };
   }
@@ -99,7 +109,7 @@ export async function searchRulings(
   args: SearchRulingsArgs,
 ): Promise<SearchResult> {
   const limit = pageSize(args.first);
-  const osQuery = buildQuery(args.query, args.filters);
+  const osQuery = buildQuery(args.query, args.filters, args.includeFuture);
 
   // Sort: relevance first if query provided, then hearing_date desc, then _id for tiebreaker
   const sort: unknown[] = [];
