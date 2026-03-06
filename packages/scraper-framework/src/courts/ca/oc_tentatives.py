@@ -31,6 +31,7 @@ Courthouse mapping (derived from dept code prefix):
 from __future__ import annotations
 
 import re
+from datetime import datetime
 from typing import Any
 
 import httpx
@@ -66,6 +67,30 @@ def _oc_judge_name_from_match(m: re.Match) -> str:
     last = m.group("last").strip().title()
     first = m.group("first").strip()
     return f"{first} {last}"
+
+
+# Hearing date from PDF text: "February 24, 2026", "March 06, 2026", etc.
+# Match the first occurrence of "Month DD, YYYY" in the extracted PDF text.
+_HEARING_DATE_RE = re.compile(
+    r"(?:January|February|March|April|May|June|July|August|September"
+    r"|October|November|December)\s+\d{1,2},?\s+\d{4}",
+)
+
+
+def _oc_hearing_date_from_text(text: str) -> datetime | None:
+    """Extract the first date (Month DD, YYYY) from OC PDF text as hearing date."""
+    m = _HEARING_DATE_RE.search(text)
+    if not m:
+        return None
+    raw = m.group(0)
+    # Normalize whitespace (some PDFs split across lines)
+    raw = " ".join(raw.split())
+    for fmt in ("%B %d, %Y", "%B %d %Y"):
+        try:
+            return datetime.strptime(raw, fmt)
+        except ValueError:
+            continue
+    return None
 
 
 def _oc_courthouse(dept: str) -> str:
@@ -107,6 +132,16 @@ class OCTentativeRulingsScraper(PdfLinkScraper):
             last = m.group("last").strip().title()
             first = m.group("first").strip()
             doc.judge_name = f"{first} {last}"
+
+        return doc
+
+    def parse_document(self, doc: CapturedDocument) -> CapturedDocument:
+        """Extract case numbers (via super) and hearing date from PDF text."""
+        doc = super().parse_document(doc)
+
+        # Extract hearing date from PDF text
+        if doc.ruling_text and not doc.hearing_date:
+            doc.hearing_date = _oc_hearing_date_from_text(doc.ruling_text)
 
         return doc
 

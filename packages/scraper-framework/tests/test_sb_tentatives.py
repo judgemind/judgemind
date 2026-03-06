@@ -24,6 +24,7 @@ from courts.ca.sb_tentatives import (
     INDEX_URL,
     SBTentativeRulingsScraper,
     _sb_courthouse,
+    _sb_hearing_date_from_filename,
     _sb_judge_from_pdf_text,
 )
 from courts.ca.sb_tentatives import default_config as sb_default_config
@@ -188,6 +189,53 @@ def test_sb_s36_no_case_numbers() -> None:
 
 
 # ---------------------------------------------------------------------------
+# _sb_hearing_date_from_filename — unit tests
+# ---------------------------------------------------------------------------
+
+
+def test_sb_hearing_date_s24() -> None:
+    """CVS24030426.pdf → 03/04/2026."""
+    from datetime import datetime
+
+    dt = _sb_hearing_date_from_filename("CVS24030426.pdf")
+    assert dt == datetime(2026, 3, 4)
+
+
+def test_sb_hearing_date_r12() -> None:
+    """CVR12030326.pdf → 03/03/2026."""
+    from datetime import datetime
+
+    dt = _sb_hearing_date_from_filename("CVR12030326.pdf")
+    assert dt == datetime(2026, 3, 3)
+
+
+def test_sb_hearing_date_r17() -> None:
+    """CVR17030226.pdf → 03/02/2026."""
+    from datetime import datetime
+
+    dt = _sb_hearing_date_from_filename("CVR17030226.pdf")
+    assert dt == datetime(2026, 3, 2)
+
+
+def test_sb_hearing_date_s36() -> None:
+    """CVS36030326.pdf → 03/03/2026."""
+    from datetime import datetime
+
+    dt = _sb_hearing_date_from_filename("CVS36030326.pdf")
+    assert dt == datetime(2026, 3, 3)
+
+
+def test_sb_hearing_date_returns_none_for_bad_filename() -> None:
+    assert _sb_hearing_date_from_filename("random.pdf") is None
+    assert _sb_hearing_date_from_filename("") is None
+
+
+def test_sb_hearing_date_returns_none_for_invalid_date() -> None:
+    # Month 99 is invalid
+    assert _sb_hearing_date_from_filename("CVS24990126.pdf") is None
+
+
+# ---------------------------------------------------------------------------
 # Courthouse mapping
 # ---------------------------------------------------------------------------
 
@@ -290,6 +338,32 @@ def test_sb_run_extracts_case_numbers() -> None:
     has_case = [d for d in parsed if d.case_number]
     assert len(has_case) > 0
     assert has_case[0].case_number == "CIVRS2502080"
+
+
+@respx.mock
+def test_sb_run_populates_hearing_date() -> None:
+    from datetime import datetime
+
+    html = _load_html("sb_iframe_page.html")
+    pdf_bytes = _load_bytes("sb_r12_20260303_0df41117.pdf")
+
+    respx.get(INDEX_URL).mock(return_value=httpx.Response(200, text=html))
+    respx.get(url__regex=r"\.pdf$").mock(return_value=httpx.Response(200, content=pdf_bytes))
+
+    config = sb_default_config()
+    config.request_delay_seconds = 0
+    scraper = SBTentativeRulingsScraper(config=config)
+
+    docs = scraper.fetch_documents()
+    parsed = [scraper.parse_document(d) for d in docs]
+
+    # All but 1 should have hearing dates (CVS36202626.pdf has invalid date digits)
+    has_date = [d for d in parsed if d.hearing_date]
+    assert len(has_date) == 51
+
+    # First link is CVS24030426.pdf → 03/04/2026
+    first = has_date[0]
+    assert first.hearing_date == datetime(2026, 3, 4)
 
 
 @respx.mock

@@ -31,6 +31,7 @@ Courthouse mapping (conservative — only S and R confirmed from fixtures):
 from __future__ import annotations
 
 import re
+from datetime import datetime
 from typing import Any
 
 from framework import CapturedDocument, ScheduleWindow, ScraperConfig
@@ -59,6 +60,25 @@ _HONORABLE_RE = re.compile(
 
 # Case numbers like "CIVRS2502080", "CIVSB2416631"
 _CASE_NUMBER_RE = re.compile(r"\bCIV[A-Z]{2}\d{5,8}\b")
+
+
+# Filename date: CV{LOC}{DEPT}{MMDDYY}.pdf → extract MMDDYY
+_FILENAME_DATE_RE = re.compile(r"CV[A-Z]\d+(\d{6})\.pdf$", re.IGNORECASE)
+
+
+def _sb_hearing_date_from_filename(filename: str) -> datetime | None:
+    """Parse hearing date from SB filename like 'CVS24030426.pdf' → 03/04/2026."""
+    m = _FILENAME_DATE_RE.search(filename)
+    if not m:
+        return None
+    mmddyy = m.group(1)
+    try:
+        month = int(mmddyy[0:2])
+        day = int(mmddyy[2:4])
+        year = 2000 + int(mmddyy[4:6])
+        return datetime(year, month, day)
+    except (ValueError, IndexError):
+        return None
 
 
 def _sb_judge_from_pdf_text(text: str) -> str | None:
@@ -103,10 +123,16 @@ class SBTentativeRulingsScraper(PdfLinkScraper):
         super().__init__(config, pdf_config=pdf_config, **kwargs)
 
     def parse_document(self, doc: CapturedDocument) -> CapturedDocument:
-        """Extract case numbers (via super) and judge name from PDF text."""
+        """Extract case numbers (via super), judge name, and hearing date."""
         doc = super().parse_document(doc)
         if doc.ruling_text and not doc.judge_name:
             doc.judge_name = _sb_judge_from_pdf_text(doc.ruling_text)
+
+        # Extract hearing date from link text (filename) stored in extra
+        link_text = doc.extra.get("link_text", "")
+        if link_text and not doc.hearing_date:
+            doc.hearing_date = _sb_hearing_date_from_filename(link_text)
+
         return doc
 
 
