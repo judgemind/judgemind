@@ -137,6 +137,7 @@ class BaseScraper(abc.ABC):
 
         if self._archiver:
             doc.s3_key = self._archiver.archive(doc)
+            doc.s3_bucket = self._archiver.bucket
             doc.validation_status = ValidationStatus.PENDING
 
         if self._event_bus:

@@ -46,6 +46,8 @@ class EventBus:
             content_format=doc.content_format,
             content_hash=doc.content_hash,
             s3_key=doc.s3_key,
+            s3_bucket=doc.s3_bucket,
+            ruling_text=doc.ruling_text,
             case_number=doc.case_number,
             courthouse=doc.courthouse,
             department=doc.department,

@@ -98,8 +98,9 @@ class IndexingConsumer:
             )
             return False
 
-        # Fetch text content from S3
-        ruling_text = self._fetch_text(s3_key) if s3_key else event.get("ruling_text", "")
+        # Use ruling_text from the event if available (scraper already parsed it);
+        # fall back to fetching raw content from S3 when it's absent.
+        ruling_text = event.get("ruling_text") or (self._fetch_text(s3_key) if s3_key else "")
 
         # Build OpenSearch document
         os_doc = {

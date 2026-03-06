@@ -111,6 +111,7 @@ class CapturedDocument(BaseModel):
 
     # Archival
     s3_key: str | None = None  # set after archiving
+    s3_bucket: str | None = None  # set after archiving
 
     # Validation
     validation_status: ValidationStatus = ValidationStatus.PENDING
@@ -144,6 +145,8 @@ class DocumentCapturedEvent(EventEnvelope):
     content_format: ContentFormat
     content_hash: str
     s3_key: str | None
+    s3_bucket: str | None = None
+    ruling_text: str | None = None
     case_number: str | None
     courthouse: str | None
     department: str | None
