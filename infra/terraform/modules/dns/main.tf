@@ -101,27 +101,20 @@ resource "cloudflare_record" "www" {
   ttl     = 1 # Automatic when proxied
 }
 
-resource "cloudflare_ruleset" "redirect_www" {
-  zone_id     = local.zone_id
-  name        = "Redirect www to apex"
-  description = "301 redirect www.judgemind.org → judgemind.org"
-  kind        = "zone"
-  phase       = "http_request_redirect"
+# Page rule to 301 redirect www.judgemind.org/* → https://judgemind.org/$1.
+# Requires Zone > Page Rules > Edit on the API token.
+# Free plan includes 3 page rules; this uses 1.
+resource "cloudflare_page_rule" "redirect_www" {
+  zone_id  = local.zone_id
+  target   = "www.judgemind.org/*"
+  priority = 1
+  status   = "active"
 
-  rules {
-    action = "redirect"
-    action_parameters {
-      from_value {
-        status_code = 301
-        target_url {
-          expression = "concat(\"https://judgemind.org\", http.request.uri.path)"
-        }
-        preserve_query_string = true
-      }
+  actions {
+    forwarding_url {
+      url         = "https://judgemind.org/$1"
+      status_code = 301
     }
-    expression  = "(http.host eq \"www.judgemind.org\")"
-    description = "Redirect www to apex"
-    enabled     = true
   }
 }
 
