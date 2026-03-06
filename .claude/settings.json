@@ -51,6 +51,7 @@
       "Bash(gh auth*)",
       "Bash(gh run*)",
       "Bash(gh workflow*)",
+      "Bash(gh search*)",
       "Bash(.venv/bin/*)",
       "Bash(**/.venv/bin/*)",
       "Bash(scripts/*)",
