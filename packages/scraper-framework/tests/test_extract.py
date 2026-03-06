@@ -1,8 +1,8 @@
-"""Tests for the basic regex-based outcome and motion_type extraction."""
+"""Tests for the basic regex-based outcome, motion_type, and judge name extraction."""
 
 from __future__ import annotations
 
-from ingestion.extract import extract_motion_type, extract_outcome
+from ingestion.extract import extract_judge_name, extract_motion_type, extract_outcome
 
 # ---------------------------------------------------------------------------
 # Outcome extraction
@@ -108,3 +108,50 @@ class TestExtractMotionType:
         """Summary adjudication should match before plain summary judgment."""
         text = "Motion for Summary Adjudication of Issues"
         assert extract_motion_type(text) == "msj_partial"
+
+
+# ---------------------------------------------------------------------------
+# Judge name extraction
+# ---------------------------------------------------------------------------
+
+
+class TestExtractJudgeName:
+    """Tests for extract_judge_name()."""
+
+    def test_la_style_signature(self) -> None:
+        text = "William A. Crowfoot Judge of the Superior Court"
+        assert extract_judge_name(text) == "William A. Crowfoot"
+
+    def test_sb_department_judge(self) -> None:
+        text = "Department S22 - Judge Bobby P. Luna\nCase 12345"
+        assert extract_judge_name(text) == "Bobby P. Luna"
+
+    def test_sb_before_the_honorable(self) -> None:
+        text = "BEFORE THE HONORABLE BOBBY P. LUNA\nSome ruling text"
+        assert extract_judge_name(text) == "BOBBY P. LUNA"
+
+    def test_sf_presiding(self) -> None:
+        text = "Presiding: JOHN A. SMITH\nDepartment 403"
+        assert extract_judge_name(text) == "JOHN A. SMITH"
+
+    def test_riverside_honorable(self) -> None:
+        text = "Department 2 - Honorable Jane B. Doe\nRuling on motion"
+        assert extract_judge_name(text) == "Jane B. Doe"
+
+    def test_no_match(self) -> None:
+        assert extract_judge_name("The motion is granted.") is None
+
+    def test_empty_string(self) -> None:
+        assert extract_judge_name("") is None
+
+    def test_whitespace_collapsed(self) -> None:
+        text = "Presiding:  JOHN   A.   SMITH  \nDepartment 403"
+        assert extract_judge_name(text) == "JOHN A. SMITH"
+
+    def test_sb_em_dash(self) -> None:
+        text = "Department S36\u2014Judge Maria C. Garcia\nSome text"
+        assert extract_judge_name(text) == "Maria C. Garcia"
+
+    def test_sb_en_dash(self) -> None:
+        text = "Department R17\u2013Judge Robert E. Lee\nSome text"
+        assert extract_judge_name(text) == "Robert E. Lee"
