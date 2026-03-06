@@ -288,15 +288,13 @@ terraform validate
 
 ### Subagent Responsibilities
 
-#### Worktree Isolation (mandatory for branch work)
+#### Worktree Isolation
 
-When spawning subagents that will work on **different branches** (e.g. fixing multiple PRs in parallel, implementing features on separate branches), the parent agent **MUST** pass `isolation: "worktree"` in the Agent tool call. Without this, subagents share the parent's working directory and will cause branch checkout conflicts, stash races, and leave the parent on the wrong branch.
+**Do NOT use `isolation: "worktree"` on the Agent tool for `/task` subagents.** The `/task` skill creates its own worktree via `scripts/start-worker.sh` internally. The Agent tool's `isolation: "worktree"` creates a *separate* temporary worktree at a different path, which **breaks project permissions** — the `.claude/settings.json` allow-list is keyed to the repo root, so agents in the tool-created worktree lose all pre-approved Bash/Write permissions and immediately prompt the user.
 
-Rules:
+**Rule:** spawn `/task` agents **without** `isolation: "worktree"`. The skill's internal worktree provides the branch isolation. Multiple `/task` agents can run in parallel safely because each claims a unique worker number.
 
-- **Never run `git checkout` or `git switch` in the parent's working directory from a subagent.** This changes the branch for the parent and every other subagent sharing that directory.
-- If the `isolation: "worktree"` parameter is not available (e.g. the subagent is doing non-git work like API calls or documentation generation), the subagent must **not** check out a different branch in the shared working directory.
-- A subagent that needs to work on a specific branch but is not already worktree-isolated must create its own worktree before doing any branch-specific work:
+For non-`/task` subagents that need branch isolation (rare), the agent must create its own worktree before doing any branch-specific work:
   ```
   git -C $REPO_ROOT worktree add $REPO_ROOT/worktrees/sub-<task> <branch>
   ```
@@ -304,6 +302,8 @@ Rules:
   ```
   git -C $REPO_ROOT worktree remove $REPO_ROOT/worktrees/sub-<task>
   ```
+
+**Never run `git checkout` or `git switch` in the parent's working directory from a subagent.** This changes the branch for the parent and every other subagent sharing that directory.
 
 #### Pre-PR Checks
 
