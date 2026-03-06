@@ -94,3 +94,55 @@ def extract_motion_type(ruling_text: str) -> str | None:
         if pattern.search(ruling_text):
             return value
     return None
+
+
+# ---------------------------------------------------------------------------
+# Judge name extraction
+# ---------------------------------------------------------------------------
+
+# Patterns drawn from the California court scrapers.  Each targets a
+# different court's formatting style so the backfill can recover judge
+# names from ruling text that was already stored in the database.
+
+_JUDGE_NAME_PATTERNS: list[re.Pattern[str]] = [
+    # LA: "William A. Crowfoot Judge of the Superior Court"
+    re.compile(r"([^\n]+?)\s+Judge of the Superior Court"),
+    # SB: "Department S22 - Judge Bobby P. Luna"
+    re.compile(
+        r"Department\s+\S+?\s*[-\u2013\u2014]\s*Judge\s+(?P<judge_name>[^\n]+)",
+        re.IGNORECASE,
+    ),
+    # SB alternate: "BEFORE THE HONORABLE BOBBY P. LUNA"
+    re.compile(r"BEFORE THE HONORABLE\s+(?P<judge_name>[^\n]+)", re.IGNORECASE),
+    # SF: "Presiding: BOBBY P. LUNA"
+    re.compile(r"Presiding:\s+(?P<judge_name>[A-Z][^\n]+)"),
+    # Riverside / OC style: "Department 1 - Honorable John A. Smith"
+    re.compile(
+        r"Department\s+\S+\s*-\s*Honorable\s+(?P<judge_name>[^\n]+)",
+        re.IGNORECASE,
+    ),
+]
+
+
+def extract_judge_name(ruling_text: str) -> str | None:
+    """Extract a judge name from ruling text using court-specific regex patterns.
+
+    Tries multiple patterns used by California court scrapers (LA, SB, SF,
+    Riverside, OC).  Returns the first matched name stripped of whitespace,
+    or ``None`` if no pattern matches.
+
+    The returned name is *raw* — callers should pass it through
+    ``normalize_judge_name`` before using it as a canonical name.
+    """
+    for pattern in _JUDGE_NAME_PATTERNS:
+        m = pattern.search(ruling_text)
+        if m:
+            # Use named group 'judge_name' if present, otherwise group 1
+            try:
+                name = m.group("judge_name")
+            except IndexError:
+                name = m.group(1)
+            name = " ".join(name.strip().split())  # collapse whitespace
+            if name:
+                return name
+    return None
