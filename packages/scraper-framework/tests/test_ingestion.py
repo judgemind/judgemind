@@ -14,7 +14,7 @@ import psycopg
 import psycopg.errors
 import pytest
 
-from ingestion.db import _derive_court_code, normalize_judge_name
+from ingestion.db import _derive_court_code, normalize_judge_name, upsert_case
 from ingestion.worker import (
     InfrastructureError,
     IngestionWorker,
@@ -769,3 +769,106 @@ def test_process_event_with_existing_judge_alias(mock_psycopg: MagicMock) -> Non
     # But should still insert ruling and case_judges
     assert "INSERT INTO rulings" in all_sql
     assert "INSERT INTO case_judges" in all_sql
+
+
+# ---------------------------------------------------------------------------
+# upsert_case — case_title support
+# ---------------------------------------------------------------------------
+
+
+def test_upsert_case_passes_case_title_in_sql() -> None:
+    """upsert_case includes case_title in INSERT and COALESCE on conflict."""
+    mock_conn = MagicMock()
+    mock_cur = MagicMock()
+    mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cur)
+    mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+    mock_cur.fetchone.return_value = ("case-uuid-1",)
+
+    result = upsert_case(mock_conn, "23STCV12345", "court-uuid-1", case_title="Smith v. Jones")
+
+    assert result == "case-uuid-1"
+    sql = str(mock_cur.execute.call_args)
+    assert "case_title" in sql
+    assert "COALESCE" in sql
+    assert "Smith v. Jones" in sql
+
+
+def test_upsert_case_none_title_still_works() -> None:
+    """upsert_case with case_title=None passes NULL and uses COALESCE."""
+    mock_conn = MagicMock()
+    mock_cur = MagicMock()
+    mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cur)
+    mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+    mock_cur.fetchone.return_value = ("case-uuid-1",)
+
+    result = upsert_case(mock_conn, "23STCV12345", "court-uuid-1", case_title=None)
+
+    assert result == "case-uuid-1"
+    sql = str(mock_cur.execute.call_args)
+    assert "COALESCE" in sql
+
+
+# ---------------------------------------------------------------------------
+# process_event — case_title pass-through
+# ---------------------------------------------------------------------------
+
+
+@patch("ingestion.worker.psycopg")
+def test_process_event_passes_case_title_to_upsert_case(mock_psycopg: MagicMock) -> None:
+    """When event carries case_title, it is passed to upsert_case."""
+    worker, os_mock = _make_worker()
+
+    mock_conn = MagicMock()
+    mock_cur = MagicMock()
+    mock_conn.__enter__ = MagicMock(return_value=mock_conn)
+    mock_conn.__exit__ = MagicMock(return_value=False)
+    mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cur)
+    mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+    mock_psycopg.connect.return_value = mock_conn
+    mock_cur.fetchone.side_effect = [
+        ("court-uuid-1",),  # upsert_court
+        ("case-uuid-1",),  # upsert_case
+        None,  # resolve_judge: no existing alias
+        ("judge-uuid-1",),  # resolve_judge: INSERT INTO judges
+    ]
+    mock_cur.rowcount = 1
+
+    event = _make_event(case_title="Aasi v. American Honda")
+    worker.process_event(event)
+
+    # Find the INSERT INTO cases call and verify case_title is in the args
+    case_calls = [c for c in mock_cur.execute.call_args_list if "INSERT INTO cases" in str(c)]
+    assert len(case_calls) == 1
+    sql_args = case_calls[0][0][1]  # positional args tuple
+    assert "Aasi v. American Honda" in sql_args
+
+
+@patch("ingestion.worker.psycopg")
+def test_process_event_without_case_title_passes_none(mock_psycopg: MagicMock) -> None:
+    """When event has no case_title, None is passed to upsert_case."""
+    worker, os_mock = _make_worker()
+
+    mock_conn = MagicMock()
+    mock_cur = MagicMock()
+    mock_conn.__enter__ = MagicMock(return_value=mock_conn)
+    mock_conn.__exit__ = MagicMock(return_value=False)
+    mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cur)
+    mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+    mock_psycopg.connect.return_value = mock_conn
+    mock_cur.fetchone.side_effect = [
+        ("court-uuid-1",),  # upsert_court
+        ("case-uuid-1",),  # upsert_case
+        None,  # resolve_judge: no existing alias
+        ("judge-uuid-1",),  # resolve_judge: INSERT INTO judges
+    ]
+    mock_cur.rowcount = 1
+
+    event = _make_event()  # no case_title key
+    worker.process_event(event)
+
+    # Verify case_title=None is in the SQL args
+    case_calls = [c for c in mock_cur.execute.call_args_list if "INSERT INTO cases" in str(c)]
+    assert len(case_calls) == 1
+    sql_args = case_calls[0][0][1]
+    # None should be the 4th argument (case_title)
+    assert None in sql_args

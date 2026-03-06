@@ -213,6 +213,7 @@ class IngestionWorker:
         county: str = event_data["county"]
         court: str = event_data.get("court", "Superior Court")
         case_number: str | None = event_data.get("case_number")
+        case_title: str | None = event_data.get("case_title")
         department: str | None = event_data.get("department")
         judge_name: str | None = event_data.get("judge_name")
         ruling_text: str | None = event_data.get("ruling_text")
@@ -244,7 +245,7 @@ class IngestionWorker:
 
             # 2. Ensure case exists — use document_id as synthetic case_number if absent
             effective_case_number = case_number or f"UNKNOWN-{document_id}"
-            case_id = upsert_case(conn, effective_case_number, court_id)
+            case_id = upsert_case(conn, effective_case_number, court_id, case_title=case_title)
 
             # 3. Insert document (idempotent on document_id)
             is_new = insert_document(

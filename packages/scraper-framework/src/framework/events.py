@@ -56,6 +56,7 @@ class EventBus:
             outcome=doc.outcome,
             motion_type=doc.motion_type,
             case_number=doc.case_number,
+            case_title=doc.case_title,
             courthouse=doc.courthouse,
             department=doc.department,
             judge_name=doc.judge_name,

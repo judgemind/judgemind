@@ -53,6 +53,17 @@ _CASE_NUMBER_RE = re.compile(r"Case Number:\s*(\w+)")
 # Judge name: "<div>William A. Crowfoot Judge of the Superior Court</div>"
 _JUDGE_DIV_RE = re.compile(r"(.+?)\s+Judge of the Superior Court", re.DOTALL)
 
+# Case title extraction from party caption block.
+# The party section text typically looks like:
+#   "SUMAYYA AASI, et al.,\n  Plaintiff(s),\n  vs.\n  AMERICAN HONDA...,\n  Defendant(s)."
+# We capture the plaintiff/petitioner name and defendant/respondent name around "vs."
+_CASE_TITLE_RE = re.compile(
+    r"^(?P<plaintiff>.+?),?\s*\n\s*(?:Plaintiff|Petitioner|Cross-Complainant)\(?s?\)?,?"
+    r"\s+vs\.\s+"
+    r"(?P<defendant>.+?),?\s*\n\s*(?:Defendant|Respondent|Cross-Defendant)\(?s?\)?\.?",
+    re.DOTALL | re.MULTILINE,
+)
+
 # Marker present in the LA Court stale-ViewState error page (HTTP 200, ~8KB).
 # When the POST uses an expired ViewState or a dropdown option that no longer
 # exists, the server returns this error page instead of ruling content.
@@ -261,6 +272,9 @@ def _extract_ruling_fields(soup: BeautifulSoup, doc: CapturedDocument) -> None:
         if len(case_numbers) > 1:
             doc.extra["all_case_numbers"] = case_numbers
 
+    # Case title from the party caption block
+    doc.case_title = _extract_case_title(content)
+
     # Judge name from the signature div
     for div in content.find_all("div"):
         div_text = div.get_text(separator=" ", strip=True)
@@ -269,6 +283,45 @@ def _extract_ruling_fields(soup: BeautifulSoup, doc: CapturedDocument) -> None:
             # Normalize whitespace in name
             doc.judge_name = " ".join(m.group(1).split())
             break
+
+
+def _extract_case_title(content: BeautifulSoup) -> str | None:
+    """Extract the first case title from the party caption block.
+
+    LA ruling HTML places parties in a table near an ``<a name="Parties">``
+    anchor.  The text in the first column of that table follows the pattern::
+
+        PLAINTIFF NAME, et al.,
+            Plaintiff(s),
+            vs.
+        DEFENDANT NAME, et al.,
+            Defendant(s).
+
+    We find the first ``<a name="Parties">`` anchor, walk up to the enclosing
+    ``<td>``, extract its text, and apply ``_CASE_TITLE_RE`` to pull out the
+    two party names.  The title is formatted as "Plaintiff v. Defendant".
+    """
+    anchor = content.find("a", attrs={"name": "Parties"})
+    if anchor is None:
+        return None
+
+    # Walk up to the enclosing <td>
+    td = anchor.find_parent("td")
+    if td is None:
+        return None
+
+    td_text = td.get_text(separator="\n", strip=False)
+    m = _CASE_TITLE_RE.search(td_text)
+    if m is None:
+        return None
+
+    plaintiff = " ".join(m.group("plaintiff").split()).strip().rstrip(",")
+    defendant = " ".join(m.group("defendant").split()).strip().rstrip(",")
+
+    if not plaintiff or not defendant:
+        return None
+
+    return f"{plaintiff.title()} v. {defendant.title()}"
 
 
 # ---------------------------------------------------------------------------
