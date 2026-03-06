@@ -1,5 +1,5 @@
 output "alb_dns_name" {
-  description = "DNS name of the API ALB (use as CNAME target for api.dev.judgemind.org)"
+  description = "DNS name of the API ALB (use as CNAME target for dev.api.judgemind.org)"
   value       = aws_lb.api.dns_name
 }
 

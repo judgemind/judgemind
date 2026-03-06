@@ -11,7 +11,7 @@ module "web_dev" {
   custom_domain = "dev.judgemind.org"
 
   # API deployed to ECS Fargate behind ALB (Issue #182).
-  graphql_url = "https://api.dev.judgemind.org/graphql"
+  graphql_url = "https://dev.api.judgemind.org/graphql"
 }
 
 output "web_dev_project_id" {

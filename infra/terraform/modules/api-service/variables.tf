@@ -74,7 +74,7 @@ variable "container_port" {
 }
 
 variable "domain_name" {
-  description = "Domain name for the API (e.g. api.dev.judgemind.org). Used for the ACM certificate."
+  description = "Domain name for the API (e.g. dev.api.judgemind.org). Used for the ACM certificate."
   type        = string
 }
 

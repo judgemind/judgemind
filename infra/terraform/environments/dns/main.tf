@@ -31,10 +31,11 @@ module "dns" {
   prod_api_cname = ""                                                         # Future: production API for api.judgemind.org
 
   # ACM certificate DNS validation records for HTTPS on the API ALB.
+  # Values from: terraform -chdir=../dev output api_acm_validation
   acm_validation_records = [
     {
-      name  = "_93844df965d6d55d1a37b05dd86c745d.api.dev.judgemind.org."
-      value = "_06e5e32ccb02447673011c0433f9c831.jkddzztszm.acm-validations.aws."
+      name  = "_27b9101c0edcca5108f98b3942e7866d.dev.api.judgemind.org."
+      value = "_25b58ba53f33f4812c398b9e17894593.jkddzztszm.acm-validations.aws."
     },
   ]
 }

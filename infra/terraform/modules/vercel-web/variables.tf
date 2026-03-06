@@ -20,6 +20,6 @@ variable "custom_domain" {
 }
 
 variable "graphql_url" {
-  description = "Value for NEXT_PUBLIC_GRAPHQL_URL (e.g. https://api.dev.judgemind.org/graphql)"
+  description = "Value for NEXT_PUBLIC_GRAPHQL_URL (e.g. https://dev.api.judgemind.org/graphql)"
   type        = string
 }

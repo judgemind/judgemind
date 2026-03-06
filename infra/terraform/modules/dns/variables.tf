@@ -23,7 +23,7 @@ variable "dev_web_cname" {
 }
 
 variable "dev_api_cname" {
-  description = "CNAME target for api.dev.judgemind.org. Leave empty to omit the record."
+  description = "CNAME target for dev.api.judgemind.org. Leave empty to omit the record."
   type        = string
   default     = ""
 }

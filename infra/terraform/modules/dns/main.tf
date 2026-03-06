@@ -137,11 +137,11 @@ resource "cloudflare_record" "dev_web" {
 resource "cloudflare_record" "dev_api" {
   count   = var.dev_api_cname != "" ? 1 : 0
   zone_id = local.zone_id
-  name    = "api.dev"
+  name    = "dev.api"
   type    = "CNAME"
   content = var.dev_api_cname
-  proxied = true
-  ttl     = 1
+  proxied = false
+  ttl     = 300
 }
 
 # ─── Production web apex ──────────────────────────────────────────────────────

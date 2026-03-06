@@ -408,6 +408,19 @@ View a real-time cost dashboard showing per-user, per-feature, and per-model spe
 
 The primary Judgemind instance is deployed on a single cloud provider, optimized for cost. The initial recommendation is AWS due to mature managed services and competitive reserved pricing, but the architecture is cloud-agnostic.
 
+## 7.1.1 Domain Naming Convention
+
+All Judgemind services follow a consistent domain naming pattern. Production services use bare subdomains under `judgemind.org`. Non-production environments prefix the environment name to the service subdomain.
+
+| Service | Production | Dev |
+|---------|-----------|-----|
+| Web app | `judgemind.org` | `dev.judgemind.org` |
+| API     | `api.judgemind.org` | `dev.api.judgemind.org` |
+
+The pattern is `{env}.{service}.judgemind.org` for non-production and `{service}.judgemind.org` for production (web app uses the bare domain). This keeps the environment as a prefix, avoiding DNS conflicts where a parent subdomain's CNAME (e.g. `dev.` pointing to Vercel) would affect child subdomains (e.g. CAA record inheritance).
+
+Future services (e.g. `ws.judgemind.org` for WebSocket, `admin.judgemind.org`) follow the same pattern: `dev.ws.judgemind.org`, `dev.admin.judgemind.org`, etc.
+
 ## 7.2 Self-Hosted Deployment
 
 Because Judgemind is open source, the entire platform must be deployable by a third party. The self-hosted deployment path uses Docker Compose for development and small deployments, with Kubernetes manifests available for production scale.

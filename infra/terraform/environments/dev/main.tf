@@ -105,7 +105,7 @@ module "api_service" {
   ecs_cluster_name   = module.compute.cluster_name
   execution_role_arn = module.compute.task_execution_role_arn
   ecr_repository_url = module.ecr.api_repository_url
-  domain_name        = "api.dev.judgemind.org"
+  domain_name        = "dev.api.judgemind.org"
 
   db_connection_secret_arn          = module.database.db_connection_secret_arn
   redis_url                         = "redis://${module.cache.redis_endpoint}:${module.cache.redis_port}"
@@ -273,7 +273,7 @@ output "ingestion_worker_log_group" {
 }
 
 output "api_alb_dns_name" {
-  description = "Dev API ALB DNS name (CNAME target for api.dev.judgemind.org)"
+  description = "Dev API ALB DNS name (CNAME target for dev.api.judgemind.org)"
   value       = module.api_service.alb_dns_name
 }
 
