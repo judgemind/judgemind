@@ -73,37 +73,37 @@ def upsert_case(
     conn: psycopg.Connection,
     case_number: str,
     court_id: str,
+    case_title: str | None = None,
 ) -> str:
     """Upsert a case row and return its UUID.
 
     Uses (court_id, case_number) as the natural key per the schema UNIQUE constraint.
     case_number_normalized strips whitespace and lowercases for search.
+
+    ``case_title`` is set on INSERT and updated on conflict only when a non-NULL
+    value is provided (COALESCE preserves an existing title).
     """
     normalized = case_number.strip().lower().replace(" ", "").replace("-", "")
     with conn.cursor() as cur:
         cur.execute(
             """
-            INSERT INTO cases (case_number, case_number_normalized, court_id)
-            VALUES (%s, %s, %s::uuid)
-            ON CONFLICT (court_id, case_number) DO NOTHING
+            INSERT INTO cases (case_number, case_number_normalized, court_id, case_title)
+            VALUES (%s, %s, %s::uuid, %s)
+            ON CONFLICT (court_id, case_number) DO UPDATE
+                SET case_title = COALESCE(EXCLUDED.case_title, cases.case_title)
             RETURNING id
             """,
-            (case_number, normalized, court_id),
+            (case_number, normalized, court_id, case_title),
         )
         row = cur.fetchone()
-        if row is None:
-            # Row already existed — fetch the id
-            cur.execute(
-                "SELECT id FROM cases WHERE court_id = %s::uuid AND case_number = %s",
-                (court_id, case_number),
-            )
-            row = cur.fetchone()
     if row is None:
         raise RuntimeError(
             f"upsert_case: could not retrieve case id for case_number={case_number!r}"
         )
     case_id: str = str(row[0])
-    logger.debug("upsert_case: case_number=%s id=%s", case_number, case_id)
+    logger.debug(
+        "upsert_case: case_number=%s case_title=%s id=%s", case_number, case_title, case_id
+    )
     return case_id
 
 

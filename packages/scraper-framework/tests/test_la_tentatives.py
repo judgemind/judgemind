@@ -18,6 +18,7 @@ from courts.ca.la_tentatives import (
     CIVIL_URL,
     LATentativeRulingsScraper,
     _extract_aspnet_tokens,
+    _extract_case_title,
     _extract_ruling_fields,
     _is_stale_viewstate_response,
     _parse_dropdown_options,
@@ -204,6 +205,47 @@ def test_extract_fields_uses_speech_synthesis_div() -> None:
     _extract_ruling_fields(soup, doc)
     # Navigation text should not appear in ruling_text
     assert "Online Services" not in (doc.ruling_text or "")
+
+
+# ---------------------------------------------------------------------------
+# _extract_case_title — against real ruling response
+# ---------------------------------------------------------------------------
+
+
+def test_extract_case_title_from_fixture() -> None:
+    """Extract case title from the real fixture HTML."""
+    from bs4 import BeautifulSoup
+
+    html = _load("la_ruling_response.html")
+    soup = BeautifulSoup(html, "lxml")
+    content = soup.find("div", id="speechSynthesis")
+    title = _extract_case_title(content)
+    assert title is not None
+    assert "Aasi" in title
+    assert "Honda" in title
+    assert " v. " in title
+
+
+def test_extract_case_title_sets_doc_field() -> None:
+    """_extract_ruling_fields populates doc.case_title from the fixture."""
+    from bs4 import BeautifulSoup
+
+    doc = _make_ruling_doc()
+    soup = BeautifulSoup(doc.raw_content, "lxml")
+    _extract_ruling_fields(soup, doc)
+    assert doc.case_title is not None
+    assert "Aasi" in doc.case_title
+    assert " v. " in doc.case_title
+
+
+def test_extract_case_title_returns_none_without_parties_anchor() -> None:
+    """When there is no Parties anchor, _extract_case_title returns None."""
+    from bs4 import BeautifulSoup
+
+    html = "<div id='speechSynthesis'><p>Some ruling text.</p></div>"
+    soup = BeautifulSoup(html, "lxml")
+    content = soup.find("div", id="speechSynthesis")
+    assert _extract_case_title(content) is None
 
 
 # ---------------------------------------------------------------------------

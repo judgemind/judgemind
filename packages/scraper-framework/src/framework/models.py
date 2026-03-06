@@ -102,6 +102,7 @@ class CapturedDocument(BaseModel):
 
     # Parsed fields (populated by the scraper, may be partial)
     case_number: str | None = None
+    case_title: str | None = None
     courthouse: str | None = None
     department: str | None = None
     judge_name: str | None = None
@@ -152,6 +153,7 @@ class DocumentCapturedEvent(EventEnvelope):
     outcome: str | None = None
     motion_type: str | None = None
     case_number: str | None
+    case_title: str | None = None
     courthouse: str | None
     department: str | None
     judge_name: str | None
