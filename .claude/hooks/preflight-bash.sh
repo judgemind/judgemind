@@ -25,9 +25,8 @@ fi
 # Note: uses grep -E (POSIX extended regex) for macOS compatibility. Do NOT use grep -P.
 
 # 1. Dollar-paren command substitution: $( ... )
-#    No exceptions — agents must use -F/--body-file instead.
 if echo "$COMMAND" | grep -qE '\$\(' ; then
-    echo "BLOCKED: Command contains \$() command substitution. Use separate tool calls for dynamic values, or write content to a file and use -F/--body-file. See CLAUDE.md §Unattended Operation Patterns." >&2
+    echo "BLOCKED: Command contains \$() command substitution. Use separate tool calls for dynamic values, or use scripts/with-secret.sh for secrets. See CLAUDE.md §Unattended Operation Patterns." >&2
     exit 2
 fi
 
