@@ -8,9 +8,10 @@
 #   terraform -chdir=../dev output ses_domain_verification_token
 #   terraform -chdir=../dev output ses_dkim_tokens
 #
-# Web/API subdomain CNAMEs are left empty until hosting is provisioned:
-#   dev_web_cname  — set when Vercel is configured (Issue #137)
-#   prod_web_cname — set when production ALB is configured (future issue)
+# Web/API subdomain CNAMEs — set as services are provisioned:
+#   dev_web_cname  — Vercel (Issue #137)
+#   dev_api_cname  — API ALB (Issue #183)
+#   prod_web_cname — set when production web hosting is configured (future issue)
 
 module "dns" {
   source = "../../modules/dns"
@@ -24,10 +25,10 @@ module "dns" {
   ]
 
   # Hosting — updated as services are deployed.
-  dev_web_cname  = "cname.vercel-dns.com" # → Vercel (Issue #137)
-  dev_api_cname  = ""                     # Future: API hosting for api.dev.judgemind.org
-  prod_web_cname = ""                     # Future: production web hosting for judgemind.org
-  prod_api_cname = ""                     # Future: production API for api.judgemind.org
+  dev_web_cname  = "cname.vercel-dns.com"                                     # → Vercel (Issue #137)
+  dev_api_cname  = "judgemind-api-dev-1789849795.us-west-2.elb.amazonaws.com" # API ALB (Issue #183)
+  prod_web_cname = ""                                                         # Future: production web hosting for judgemind.org
+  prod_api_cname = ""                                                         # Future: production API for api.judgemind.org
 }
 
 output "zone_id" {
