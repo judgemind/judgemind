@@ -148,6 +148,7 @@ This is the last step of every task. A task is not complete until the worktree i
 When operating as an agent in this repo:
 
 - **Use dedicated tools for file operations** — never use Bash for `cat`, `ls`, `grep`, `find`. Use Read, Glob, and Grep instead.
+- **Always Read before Write** — if a file might already exist (e.g. any path in `tmp/`), use the Read tool first before writing, even if you don't need the existing content. The Write tool requires this for existing files and will fail otherwise.
 - **Use Bash only for shell-only operations** — git, gh CLI, running tests, pip install, terraform, etc.
 - **Bash commands prompt for confirmation** — this is intentional. Do not try to circumvent it. Work around prompts using the patterns in "Unattended Operation Patterns" below.
 - `sudo` and `rm` always prompt; split commands to avoid triggering prompts unnecessarily.
