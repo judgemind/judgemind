@@ -1,6 +1,7 @@
 import { gql } from '@apollo/client';
 import { createApolloClient } from '@/lib/apollo-client';
 import { buildCaseHeading } from '@/lib/display-helpers';
+import { CaseDetail } from './CaseDetail';
 
 const CASE_QUERY = gql`
   query CaseDetail($id: ID!) {
@@ -59,7 +60,9 @@ export default async function CaseDetailPage({ params }: Props) {
           {caseData.court.courtName} &middot; {caseData.court.county}
         </p>
       )}
-      <p className="mt-2 text-sm text-slate-500 dark:text-slate-400">Case details coming soon.</p>
+      <div className="mt-6">
+        <CaseDetail caseId={id} />
+      </div>
     </div>
   );
 }
