@@ -377,7 +377,7 @@ export function CaseDetail({ caseId }: { caseId: string }) {
 
         <div className="mt-3 rounded-lg border border-slate-200 dark:border-slate-700">
           {/* Header row */}
-          <div className="hidden grid-cols-[6rem_1fr_7rem_6rem] gap-4 border-b border-slate-200 px-4 py-2 text-xs font-semibold uppercase tracking-wide text-slate-500 dark:border-slate-700 dark:text-slate-400 sm:grid">
+          <div className="hidden grid-cols-[6rem_1fr_10rem_6rem] gap-4 border-b border-slate-200 px-4 py-2 text-xs font-semibold uppercase tracking-wide text-slate-500 dark:border-slate-700 dark:text-slate-400 sm:grid">
             <span>Date</span>
             <span>Motion</span>
             <span>Judge</span>
@@ -421,7 +421,7 @@ export function CaseDetail({ caseId }: { caseId: string }) {
               >
                 {/* Metadata row */}
                 <div
-                  className="grid grid-cols-1 gap-1 px-4 py-3 hover:bg-slate-50 dark:hover:bg-slate-800/50 sm:grid-cols-[6rem_1fr_7rem_6rem] sm:items-center sm:gap-4"
+                  className="grid grid-cols-1 gap-1 px-4 py-3 hover:bg-slate-50 dark:hover:bg-slate-800/50 sm:grid-cols-[6rem_1fr_10rem_6rem] sm:items-center sm:gap-4"
                 >
                   {/* Date */}
                   <span className="text-xs text-slate-500 dark:text-slate-400">
@@ -439,7 +439,7 @@ export function CaseDetail({ caseId }: { caseId: string }) {
                   </span>
 
                   {/* Judge */}
-                  <span className="truncate text-sm text-slate-700 dark:text-slate-300">
+                  <span className="text-sm text-slate-700 dark:text-slate-300">
                     {node.judge?.canonicalName ?? '\u2014'}
                   </span>
 
