@@ -24,11 +24,11 @@ from typing import TYPE_CHECKING, Any
 
 import psycopg
 import psycopg.errors
-
 from framework.search.indexer import IndexingConsumer
 from framework.search.mapping import TENTATIVE_RULINGS_ALIAS
 
 from .db import insert_document, insert_ruling, upsert_case, upsert_court
+from .extract import extract_motion_type, extract_outcome
 
 if TYPE_CHECKING:
     from opensearchpy import OpenSearch
@@ -219,6 +219,15 @@ class IngestionWorker:
         capture_ts = _parse_datetime(event_data.get("capture_timestamp"))
         hearing_dt = _parse_date(event_data.get("hearing_date"))
 
+        # Outcome and motion_type: prefer event fields, fall back to regex
+        outcome: str | None = event_data.get("outcome")
+        motion_type: str | None = event_data.get("motion_type")
+        if ruling_text and (outcome is None or motion_type is None):
+            if outcome is None:
+                outcome = extract_outcome(ruling_text)
+            if motion_type is None:
+                motion_type = extract_motion_type(ruling_text)
+
         court_name = f"{court}, County of {county}"
 
         with psycopg.connect(self._pg_dsn) as conn:
@@ -255,6 +264,8 @@ class IngestionWorker:
                     hearing_date=hearing_dt,
                     ruling_text=ruling_text,
                     department=department,
+                    outcome=outcome,
+                    motion_type=motion_type,
                 )
             else:
                 logger.warning("No hearing_date for document %s — ruling row skipped", document_id)
