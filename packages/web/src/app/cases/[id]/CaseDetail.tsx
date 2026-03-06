@@ -1,5 +1,6 @@
 'use client';
 
+import { useState } from 'react';
 import { useQuery, gql } from '@apollo/client';
 import Link from 'next/link';
 import { formatDate, formatOutcome } from '../../rulings/RulingsFeed';
@@ -45,6 +46,7 @@ const CASE_RULINGS_QUERY = gql`
           judge {
             canonicalName
           }
+          rulingText
         }
       }
       pageInfo {
@@ -89,6 +91,7 @@ interface RulingNode {
   judge: {
     canonicalName: string;
   } | null;
+  rulingText: string | null;
 }
 
 interface RulingsData {
@@ -108,6 +111,24 @@ const OUTCOME_BADGE: Record<string, string> = {
 };
 
 const PAGE_SIZE = 20;
+
+/** Number of characters shown before truncation. */
+export const RULING_TEXT_TRUNCATE_LENGTH = 500;
+
+/**
+ * Truncate text to `maxLen` characters, breaking at the last whitespace
+ * boundary before the limit. Returns the original string if it fits.
+ */
+export function truncateText(text: string, maxLen: number): string {
+  if (text.length <= maxLen) return text;
+  const truncated = text.slice(0, maxLen);
+  const lastSpace = truncated.lastIndexOf(' ');
+  // If there's a space in the first half, break there; otherwise hard-cut.
+  if (lastSpace > maxLen / 2) {
+    return truncated.slice(0, lastSpace) + '\u2026';
+  }
+  return truncated + '\u2026';
+}
 
 /** Format a snake_case string to Title Case. */
 export function formatLabel(value: string | null): string {
@@ -168,6 +189,22 @@ export function CaseDetail({ caseId }: { caseId: string }) {
     variables: { caseId, first: PAGE_SIZE },
     notifyOnNetworkStatusChange: true,
   });
+
+  const [expandedRulings, setExpandedRulings] = useState<Set<string>>(
+    new Set(),
+  );
+
+  function toggleRuling(id: string) {
+    setExpandedRulings((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) {
+        next.delete(id);
+      } else {
+        next.add(id);
+      }
+      return next;
+    });
+  }
 
   const edges = rulingsData?.rulings.edges ?? [];
   const pageInfo = rulingsData?.rulings.pageInfo;
@@ -356,43 +393,77 @@ export function CaseDetail({ caseId }: { caseId: string }) {
           )}
 
           {/* Rows */}
-          {edges.map(({ node }) => (
-            <div
-              key={node.id}
-              className="grid grid-cols-1 gap-1 border-b border-slate-100 px-4 py-3 last:border-0 hover:bg-slate-50 dark:border-slate-700 dark:hover:bg-slate-800/50 sm:grid-cols-[6rem_1fr_7rem_6rem] sm:items-center sm:gap-4"
-            >
-              {/* Date */}
-              <span className="text-xs text-slate-500 dark:text-slate-400">
-                {formatDate(node.hearingDate)}
-              </span>
+          {edges.map(({ node }) => {
+            const isExpanded = expandedRulings.has(node.id);
+            const isLong =
+              !!node.rulingText &&
+              node.rulingText.length > RULING_TEXT_TRUNCATE_LENGTH;
 
-              {/* Motion type */}
-              <span className="text-sm text-slate-900 dark:text-slate-100">
-                {node.motionType ? formatLabel(node.motionType) : '\u2014'}
-                {node.department && (
-                  <span className="ml-2 text-xs text-slate-500 dark:text-slate-400">
-                    Dept. {node.department}
-                  </span>
-                )}
-              </span>
-
-              {/* Judge */}
-              <span className="truncate text-sm text-slate-700 dark:text-slate-300">
-                {node.judge?.canonicalName ?? '\u2014'}
-              </span>
-
-              {/* Outcome badge */}
-              <span
-                className={`inline-flex w-fit items-center rounded px-2 py-0.5 text-xs font-medium ${
-                  node.outcome && OUTCOME_BADGE[node.outcome]
-                    ? OUTCOME_BADGE[node.outcome]
-                    : 'bg-slate-100 text-slate-600 dark:bg-slate-700 dark:text-slate-300'
-                }`}
+            return (
+              <div
+                key={node.id}
+                className="border-b border-slate-100 last:border-0 dark:border-slate-700"
               >
-                {formatOutcome(node.outcome)}
-              </span>
-            </div>
-          ))}
+                {/* Metadata row */}
+                <div
+                  className="grid grid-cols-1 gap-1 px-4 py-3 hover:bg-slate-50 dark:hover:bg-slate-800/50 sm:grid-cols-[6rem_1fr_7rem_6rem] sm:items-center sm:gap-4"
+                >
+                  {/* Date */}
+                  <span className="text-xs text-slate-500 dark:text-slate-400">
+                    {formatDate(node.hearingDate)}
+                  </span>
+
+                  {/* Motion type */}
+                  <span className="text-sm text-slate-900 dark:text-slate-100">
+                    {node.motionType ? formatLabel(node.motionType) : '\u2014'}
+                    {node.department && (
+                      <span className="ml-2 text-xs text-slate-500 dark:text-slate-400">
+                        Dept. {node.department}
+                      </span>
+                    )}
+                  </span>
+
+                  {/* Judge */}
+                  <span className="truncate text-sm text-slate-700 dark:text-slate-300">
+                    {node.judge?.canonicalName ?? '\u2014'}
+                  </span>
+
+                  {/* Outcome badge */}
+                  <span
+                    className={`inline-flex w-fit items-center rounded px-2 py-0.5 text-xs font-medium ${
+                      node.outcome && OUTCOME_BADGE[node.outcome]
+                        ? OUTCOME_BADGE[node.outcome]
+                        : 'bg-slate-100 text-slate-600 dark:bg-slate-700 dark:text-slate-300'
+                    }`}
+                  >
+                    {formatOutcome(node.outcome)}
+                  </span>
+                </div>
+
+                {/* Ruling text */}
+                {node.rulingText && (
+                  <div className="px-4 pb-3">
+                    <pre className="whitespace-pre-wrap text-sm leading-relaxed text-slate-700 dark:text-slate-300">
+                      {isLong && !isExpanded
+                        ? truncateText(
+                            node.rulingText,
+                            RULING_TEXT_TRUNCATE_LENGTH,
+                          )
+                        : node.rulingText}
+                    </pre>
+                    {isLong && (
+                      <button
+                        onClick={() => toggleRuling(node.id)}
+                        className="mt-1 text-xs font-medium text-brand-600 hover:text-brand-700 dark:text-brand-400 dark:hover:text-brand-300"
+                      >
+                        {isExpanded ? 'Show less' : 'Show more'}
+                      </button>
+                    )}
+                  </div>
+                )}
+              </div>
+            );
+          })}
 
           {/* Load more */}
           {pageInfo?.hasNextPage && (
