@@ -35,5 +35,8 @@ RUN chown -R scraper:scraper /app
 
 USER scraper
 
-# Runner entrypoint: accepts optional scraper IDs as args
-ENTRYPOINT ["python", "-m", "framework"]
+# Base entrypoint: runs a Python module specified by CMD.
+# The scraper runner uses CMD ["framework"] (default).
+# The ingestion worker overrides CMD to ["ingestion"] via ECS task definition.
+ENTRYPOINT ["python", "-m"]
+CMD ["framework"]

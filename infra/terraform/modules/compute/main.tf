@@ -340,10 +340,10 @@ resource "aws_ecs_task_definition" "ingestion_worker" {
 
   container_definitions = jsonencode([
     {
-      name       = "ingestion-worker"
-      image      = "${var.ecr_repository_url}:${var.scraper_image_tag}"
-      entryPoint = ["python", "-m", "ingestion"]
-      essential  = true
+      name      = "ingestion-worker"
+      image     = "${var.ecr_repository_url}:${var.scraper_image_tag}"
+      command   = ["ingestion"]
+      essential = true
 
       # Secrets injected from Secrets Manager so they are never visible in
       # plaintext in the task definition.
