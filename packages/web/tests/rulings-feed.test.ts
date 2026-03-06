@@ -1,5 +1,10 @@
 import { describe, it, expect } from 'vitest';
-import { formatDate, formatOutcome } from '../src/app/rulings/RulingsFeed';
+import {
+  formatDate,
+  formatOutcome,
+  formatMotionType,
+  formatJudgeName,
+} from '../src/app/rulings/RulingsFeed';
 
 describe('formatDate', () => {
   it('formats an ISO date as a short readable date', () => {
@@ -16,8 +21,8 @@ describe('formatDate', () => {
 });
 
 describe('formatOutcome', () => {
-  it('returns — for null outcome', () => {
-    expect(formatOutcome(null)).toBe('—');
+  it('returns "Not classified" for null outcome', () => {
+    expect(formatOutcome(null)).toBe('Not classified');
   });
 
   it('formats granted', () => {
@@ -38,5 +43,37 @@ describe('formatOutcome', () => {
 
   it('formats off_calendar', () => {
     expect(formatOutcome('off_calendar')).toBe('Off Calendar');
+  });
+});
+
+describe('formatMotionType', () => {
+  it('returns "Not classified" for null motion type', () => {
+    expect(formatMotionType(null)).toBe('Not classified');
+  });
+
+  it('returns the motion type string as-is when present', () => {
+    expect(formatMotionType('msj')).toBe('msj');
+  });
+
+  it('returns the motion type for demurrer', () => {
+    expect(formatMotionType('demurrer')).toBe('demurrer');
+  });
+});
+
+describe('formatJudgeName', () => {
+  it('returns "Unknown judge" for null judge', () => {
+    expect(formatJudgeName(null)).toBe('Unknown judge');
+  });
+
+  it('returns the canonical name when judge is present', () => {
+    expect(formatJudgeName({ canonicalName: 'Smith, John' })).toBe(
+      'Smith, John',
+    );
+  });
+
+  it('returns the canonical name for a different judge', () => {
+    expect(formatJudgeName({ canonicalName: 'Doe, Jane M.' })).toBe(
+      'Doe, Jane M.',
+    );
   });
 });

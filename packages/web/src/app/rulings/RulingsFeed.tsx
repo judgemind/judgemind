@@ -89,10 +89,24 @@ export function formatDate(iso: string): string {
 
 /** Convert a snake_case outcome code to a human-readable label. */
 export function formatOutcome(outcome: string | null): string {
-  if (!outcome) return '—';
+  if (!outcome) return 'Not classified';
   return outcome
     .replace(/_/g, ' ')
     .replace(/\b\w/g, (c) => c.toUpperCase());
+}
+
+/** Format a motion type for display, returning a placeholder for null values. */
+export function formatMotionType(motionType: string | null): string {
+  if (!motionType) return 'Not classified';
+  return motionType;
+}
+
+/** Format a judge name for display, returning a placeholder for null values. */
+export function formatJudgeName(
+  judge: { canonicalName: string } | null,
+): string {
+  if (!judge) return 'Unknown judge';
+  return judge.canonicalName;
 }
 
 const PAGE_SIZE = 20;
@@ -249,12 +263,12 @@ export function RulingsFeed() {
 
             {/* Judge */}
             <span className="truncate text-sm text-slate-700 dark:text-slate-300">
-              {node.judge?.canonicalName ?? '—'}
+              {formatJudgeName(node.judge)}
             </span>
 
             {/* Motion type */}
             <span className="text-sm uppercase text-slate-500 dark:text-slate-400">
-              {node.motionType ?? '—'}
+              {formatMotionType(node.motionType)}
             </span>
 
             {/* Outcome badge */}
