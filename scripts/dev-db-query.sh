@@ -45,31 +45,21 @@ fi
 # ─── Build the command ───────────────────────────────────────────────────────
 
 if [[ $# -eq 0 ]]; then
-    # Interactive psql session
-    echo "Connecting to dev database via ECS Exec (interactive psql)..." >&2
-    echo "Task: $task_arn" >&2
-    echo "" >&2
-
-    aws ecs execute-command \
-        --cluster "$CLUSTER" \
-        --task "$task_arn" \
-        --container "$CONTAINER" \
-        --interactive \
-        --region "$REGION" \
-        --command "psql \$DATABASE_URL"
-else
-    # Run a single query and return results
-    query="$1"
-
-    echo "Running query on dev database via ECS Exec..." >&2
-    echo "Task: $task_arn" >&2
-    echo "" >&2
-
-    aws ecs execute-command \
-        --cluster "$CLUSTER" \
-        --task "$task_arn" \
-        --container "$CONTAINER" \
-        --interactive \
-        --region "$REGION" \
-        --command "psql \$DATABASE_URL -c \"$query\""
+    echo "Usage: scripts/dev-db-query.sh \"SELECT COUNT(*) FROM rulings\"" >&2
+    exit 1
 fi
+
+query="$1"
+
+echo "Running query on dev database via ECS Exec..." >&2
+echo "Task: $task_arn" >&2
+echo "" >&2
+
+# Use Python + psycopg (already installed in the container) instead of psql
+aws ecs execute-command \
+    --cluster "$CLUSTER" \
+    --task "$task_arn" \
+    --container "$CONTAINER" \
+    --interactive \
+    --region "$REGION" \
+    --command "python3 -c \"import os,psycopg,json;c=psycopg.connect(os.environ['DATABASE_URL']);r=c.cursor();r.execute('$query');cols=[d[0] for d in r.description];rows=[dict(zip(cols,row)) for row in r.fetchall()];print(json.dumps(rows,indent=2,default=str))\""
