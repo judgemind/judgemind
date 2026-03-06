@@ -40,11 +40,24 @@ Write `feedback.md` with: `No prior feedback. This is the first iteration.`
 
 ---
 
-## Step 1 — The Loop
+## Step 1 — Create todo list for the loop
+
+Create todos using `TaskCreate` to track progress through the ralph loop:
+
+1. "Ralph iteration 1 — worker" (activeForm: "Implementing iteration 1")
+2. "Ralph iteration 1 — reviewer" (activeForm: "Reviewing iteration 1")
+
+Only create todos for the current iteration. When a REVISE triggers the next iteration, create new todos for that iteration at that time.
+
+Mark each todo `in_progress` when starting and `completed` when done.
+
+---
+
+## Step 2 — The Loop
 
 Set `iteration = 1` and `max_iterations = 5`.
 
-### 1a — Worker phase
+### 2a — Worker phase
 
 Spawn a **worker subagent** (using the Agent tool) with this prompt structure:
 
@@ -76,7 +89,7 @@ After the worker subagent completes, read `{worktree}/tmp/ralph/work-status.txt`
 - If **STUCK**: Stop the loop. Comment on the issue describing the blocker. Add `status/blocked`. Return to the caller with failure status.
 - If **COMPLETE**: Continue to the review phase.
 
-### 1b — Review phase
+### 2b — Review phase
 
 Spawn a **reviewer subagent** (using the Agent tool) with this prompt structure:
 
@@ -109,12 +122,12 @@ Spawn a **reviewer subagent** (using the Agent tool) with this prompt structure:
 
 After the reviewer subagent completes, read `{worktree}/tmp/ralph/review-result.txt`.
 
-- If **SHIP**: The loop is done. Continue to Step 2.
-- If **REVISE**: Increment iteration. If `iteration > max_iterations`, stop the loop and comment on the issue that the ralph loop hit its max iterations — add `status/blocked` and return with failure. Otherwise, return to 1a.
+- If **SHIP**: The loop is done. Continue to Step 3.
+- If **REVISE**: Increment iteration. If `iteration > max_iterations`, stop the loop and comment on the issue that the ralph loop hit its max iterations — add `status/blocked` and return with failure. Otherwise, create new todos for the next iteration ("Ralph iteration N — worker", "Ralph iteration N — reviewer"), then return to 2a.
 
 ---
 
-## Step 2 — Done — Return to Caller
+## Step 3 — Done — Return to Caller
 
 The reviewer has approved the implementation. The code is ready for commit.
 

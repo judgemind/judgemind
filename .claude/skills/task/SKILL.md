@@ -69,7 +69,32 @@ Comment content: `Picking this up in worker-N.`
 
 ---
 
-## Step 3 — Determine the response type and execute
+## Step 3 — Create todo list for progress tracking
+
+After claiming the issue, create todos using `TaskCreate` to track your major workflow steps. This makes progress visible and prevents skipping steps.
+
+**For implementation tasks (Path A):**
+1. "Set up dependencies" — venvs/node_modules for affected packages
+2. "Implement and review (ralph loop)" — the core implementation phase
+3. "Commit and push" — stage, commit, create PR
+4. "Watch CI and fix failures" — monitor CI, resolve any failures
+5. "Verify no merge conflicts" — check mergeable status
+6. "Update PR test plan" — check off test plan items
+7. "Merge PR" — squash merge after CI is green
+8. "Remove worktree" — cleanup
+
+**For investigation tasks (Path B):**
+1. "Investigate and document findings"
+2. "File follow-up issues"
+3. "Post summary and request review"
+4. "Unblock dependent issues"
+5. "Remove worktree"
+
+Mark each todo `in_progress` when you start it and `completed` when done. If a task has fewer than 3 steps total (e.g. a trivial fix), skip todo creation.
+
+---
+
+## Step 4 — Determine the response type and execute
 
 Read the issue body thoroughly, including linked issues. Check `docs/specs/` for relevant guidance. Look at existing code for patterns — be consistent with what's already there.
 

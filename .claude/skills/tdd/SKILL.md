@@ -17,7 +17,21 @@ Do not ask for confirmation. Work autonomously through every step.
 
 ---
 
-## Step 1 — Understand the Requirements
+## Step 1 — Create todo list for TDD steps
+
+Create todos using `TaskCreate` to track the TDD cycle:
+
+1. "Understand requirements" (activeForm: "Reading requirements")
+2. "Write failing tests" (activeForm: "Writing tests")
+3. "Implement minimum code" (activeForm: "Implementing")
+4. "Iterate until green" (activeForm: "Fixing test failures")
+5. "Run all pre-PR checks" (activeForm: "Running pre-PR checks")
+
+Mark each todo `in_progress` when starting and `completed` when done.
+
+---
+
+## Step 2 — Understand the Requirements
 
 Read the issue body thoroughly. Check `docs/specs/` for relevant guidance. Examine existing code and test patterns in the packages you will modify.
 
@@ -28,7 +42,7 @@ Identify:
 
 ---
 
-## Step 2 — Write Failing Tests First
+## Step 3 — Write Failing Tests First
 
 Before writing any implementation code, create comprehensive tests that define the acceptance criteria:
 
@@ -50,7 +64,7 @@ All new tests MUST fail at this point. If any pass, your tests aren't testing th
 
 ---
 
-## Step 3 — Implement Minimum Code to Pass
+## Step 4 — Implement Minimum Code to Pass
 
 Write the minimum implementation to make all tests pass. Do not over-engineer — if three lines work, don't write a framework.
 
@@ -62,7 +76,7 @@ Guidelines:
 
 ---
 
-## Step 4 — Iterate Until Green
+## Step 5 — Iterate Until Green
 
 Run the full test suite (not just new tests):
 
@@ -83,7 +97,7 @@ If any test fails:
 
 ---
 
-## Step 5 — Run All Pre-PR Checks
+## Step 6 — Run All Pre-PR Checks
 
 Run every applicable check for every package you touched:
 
@@ -105,7 +119,7 @@ Fix any failures. Auto-fix lint with `.venv/bin/ruff check --fix src/ tests/` th
 
 ---
 
-## Step 6 — Done — Return to Caller
+## Step 7 — Done — Return to Caller
 
 All checks pass. The implementation phase is complete. **Do not commit, push, or open a PR from this skill.** Return control to the calling workflow (`/task` Path A, or the manual PR workflow in CLAUDE.md) which handles commit, push, PR creation, CI monitoring, and cleanup.
 
