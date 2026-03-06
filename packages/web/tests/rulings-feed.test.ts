@@ -51,12 +51,41 @@ describe('formatMotionType', () => {
     expect(formatMotionType(null)).toBe('Not classified');
   });
 
-  it('returns the motion type string as-is when present', () => {
-    expect(formatMotionType('msj')).toBe('msj');
+  it('formats lowercase snake_case to Title Case', () => {
+    expect(formatMotionType('motion_to_compel')).toBe('Motion to Compel');
   });
 
-  it('returns the motion type for demurrer', () => {
-    expect(formatMotionType('demurrer')).toBe('demurrer');
+  it('formats UPPER_CASE snake_case to Title Case', () => {
+    expect(formatMotionType('MOTION_TO_COMPEL')).toBe('Motion to Compel');
+  });
+
+  it('formats single-word types to Title Case', () => {
+    expect(formatMotionType('demurrer')).toBe('Demurrer');
+    expect(formatMotionType('DEMURRER')).toBe('Demurrer');
+  });
+
+  it('keeps MSJ uppercase', () => {
+    expect(formatMotionType('msj')).toBe('MSJ');
+    expect(formatMotionType('MSJ')).toBe('MSJ');
+  });
+
+  it('keeps MTD uppercase', () => {
+    expect(formatMotionType('mtd')).toBe('MTD');
+    expect(formatMotionType('MTD')).toBe('MTD');
+  });
+
+  it('keeps MIL uppercase', () => {
+    expect(formatMotionType('mil')).toBe('MIL');
+    expect(formatMotionType('MIL')).toBe('MIL');
+  });
+
+  it('formats anti_slapp as Anti-SLAPP', () => {
+    expect(formatMotionType('anti_slapp')).toBe('Anti-SLAPP');
+    expect(formatMotionType('ANTI_SLAPP')).toBe('Anti-SLAPP');
+  });
+
+  it('formats motion_to_strike correctly', () => {
+    expect(formatMotionType('motion_to_strike')).toBe('Motion to Strike');
   });
 });
 
