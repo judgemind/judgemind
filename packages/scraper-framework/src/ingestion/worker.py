@@ -24,11 +24,17 @@ from typing import TYPE_CHECKING, Any
 
 import psycopg
 import psycopg.errors
-
 from framework.search.indexer import IndexingConsumer
 from framework.search.mapping import TENTATIVE_RULINGS_ALIAS
 
-from .db import insert_document, insert_ruling, upsert_case, upsert_court
+from .db import (
+    insert_document,
+    insert_ruling,
+    resolve_judge,
+    upsert_case,
+    upsert_case_judge,
+    upsert_court,
+)
 from .extract import extract_motion_type, extract_outcome
 
 if TYPE_CHECKING:
@@ -255,7 +261,12 @@ class IngestionWorker:
                 hearing_date=hearing_dt,
             )
 
-            # 4. Insert ruling (only if hearing_date is known)
+            # 4. Resolve judge name to canonical judge record
+            judge_id: str | None = None
+            if judge_name:
+                judge_id = resolve_judge(conn, judge_name, court_id)
+
+            # 5. Insert ruling (only if hearing_date is known)
             if hearing_dt is not None:
                 insert_ruling(
                     conn,
@@ -265,11 +276,16 @@ class IngestionWorker:
                     hearing_date=hearing_dt,
                     ruling_text=ruling_text,
                     department=department,
+                    judge_id=judge_id,
                     outcome=outcome,
                     motion_type=motion_type,
                 )
             else:
                 logger.warning("No hearing_date for document %s — ruling row skipped", document_id)
+
+            # 6. Link case to judge
+            if judge_id is not None:
+                upsert_case_judge(conn, case_id, judge_id, hearing_dt)
 
             conn.commit()
 

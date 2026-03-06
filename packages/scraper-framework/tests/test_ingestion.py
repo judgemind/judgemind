@@ -13,8 +13,7 @@ from unittest.mock import MagicMock, patch
 import psycopg
 import psycopg.errors
 import pytest
-
-from ingestion.db import _derive_court_code
+from ingestion.db import _derive_court_code, normalize_judge_name
 from ingestion.worker import (
     InfrastructureError,
     IngestionWorker,
@@ -131,6 +130,8 @@ def test_process_event_happy_path(mock_psycopg: MagicMock) -> None:
     mock_cur.fetchone.side_effect = [
         ("court-uuid-1",),  # upsert_court
         ("case-uuid-1",),  # upsert_case
+        None,  # resolve_judge: no existing alias found
+        ("judge-uuid-1",),  # resolve_judge: INSERT INTO judges RETURNING id
     ]
     mock_cur.rowcount = 1  # insert_document: new row
 
@@ -148,6 +149,12 @@ def test_process_event_happy_path(mock_psycopg: MagicMock) -> None:
     assert indexed_doc["county"] == "Los Angeles"
     assert indexed_doc["ruling_text"] == "The motion for summary judgment is GRANTED."
 
+    # Verify judge resolution and ruling insertion with judge_id
+    all_sql = " ".join(str(c) for c in mock_cur.execute.call_args_list)
+    assert "INSERT INTO judges" in all_sql
+    assert "INSERT INTO judge_aliases" in all_sql
+    assert "INSERT INTO case_judges" in all_sql
+
 
 @patch("ingestion.worker.psycopg")
 def test_process_event_passes_outcome_and_motion_type_from_event(mock_psycopg: MagicMock) -> None:
@@ -161,7 +168,12 @@ def test_process_event_passes_outcome_and_motion_type_from_event(mock_psycopg: M
     mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cur)
     mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
     mock_psycopg.connect.return_value = mock_conn
-    mock_cur.fetchone.side_effect = [("court-uuid-1",), ("case-uuid-1",)]
+    mock_cur.fetchone.side_effect = [
+        ("court-uuid-1",),  # upsert_court
+        ("case-uuid-1",),   # upsert_case
+        None,                # resolve_judge: no existing alias
+        ("judge-uuid-1",),   # resolve_judge: INSERT INTO judges
+    ]
     mock_cur.rowcount = 1
 
     event = _make_event(outcome="denied", motion_type="demurrer")
@@ -188,7 +200,12 @@ def test_process_event_extracts_outcome_from_ruling_text(mock_psycopg: MagicMock
     mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cur)
     mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
     mock_psycopg.connect.return_value = mock_conn
-    mock_cur.fetchone.side_effect = [("court-uuid-1",), ("case-uuid-1",)]
+    mock_cur.fetchone.side_effect = [
+        ("court-uuid-1",),  # upsert_court
+        ("case-uuid-1",),   # upsert_case
+        None,                # resolve_judge: no existing alias
+        ("judge-uuid-1",),   # resolve_judge: INSERT INTO judges
+    ]
     mock_cur.rowcount = 1
 
     event = _make_event(ruling_text="The motion for summary judgment is GRANTED.")
@@ -214,7 +231,12 @@ def test_process_event_event_fields_override_regex(mock_psycopg: MagicMock) -> N
     mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cur)
     mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
     mock_psycopg.connect.return_value = mock_conn
-    mock_cur.fetchone.side_effect = [("court-uuid-1",), ("case-uuid-1",)]
+    mock_cur.fetchone.side_effect = [
+        ("court-uuid-1",),  # upsert_court
+        ("case-uuid-1",),   # upsert_case
+        None,                # resolve_judge: no existing alias
+        ("judge-uuid-1",),   # resolve_judge: INSERT INTO judges
+    ]
     mock_cur.rowcount = 1
 
     # ruling_text says "GRANTED" but event says "denied"
@@ -244,7 +266,12 @@ def test_process_event_no_case_number(mock_psycopg: MagicMock) -> None:
     mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cur)
     mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
     mock_psycopg.connect.return_value = mock_conn
-    mock_cur.fetchone.side_effect = [("court-uuid-1",), ("case-uuid-1",)]
+    mock_cur.fetchone.side_effect = [
+        ("court-uuid-1",),  # upsert_court
+        ("case-uuid-1",),  # upsert_case
+        None,  # resolve_judge: no existing alias
+        ("judge-uuid-1",),  # resolve_judge: INSERT INTO judges
+    ]
     mock_cur.rowcount = 1
 
     doc_id = "bbbbbbbb-0000-0000-0000-000000000002"
@@ -268,7 +295,12 @@ def test_process_event_no_hearing_date_skips_ruling(mock_psycopg: MagicMock) -> 
     mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cur)
     mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
     mock_psycopg.connect.return_value = mock_conn
-    mock_cur.fetchone.side_effect = [("court-uuid-1",), ("case-uuid-1",)]
+    mock_cur.fetchone.side_effect = [
+        ("court-uuid-1",),  # upsert_court
+        ("case-uuid-1",),  # upsert_case
+        None,  # resolve_judge: no existing alias
+        ("judge-uuid-1",),  # resolve_judge: INSERT INTO judges
+    ]
     mock_cur.rowcount = 1
 
     event = _make_event(hearing_date=None)
@@ -279,6 +311,12 @@ def test_process_event_no_hearing_date_skips_ruling(mock_psycopg: MagicMock) -> 
     # insert_ruling uses a specific SQL pattern — check it was NOT called
     ruling_calls = [c for c in mock_cur.execute.call_args_list if "INSERT INTO rulings" in str(c)]
     assert len(ruling_calls) == 0
+
+    # But case_judges should still be populated since judge was resolved
+    case_judge_calls = [
+        c for c in mock_cur.execute.call_args_list if "INSERT INTO case_judges" in str(c)
+    ]
+    assert len(case_judge_calls) == 1
 
 
 @patch("ingestion.worker.psycopg")
@@ -293,7 +331,12 @@ def test_process_event_duplicate_skips_opensearch(mock_psycopg: MagicMock) -> No
     mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cur)
     mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
     mock_psycopg.connect.return_value = mock_conn
-    mock_cur.fetchone.side_effect = [("court-uuid-1",), ("case-uuid-1",)]
+    mock_cur.fetchone.side_effect = [
+        ("court-uuid-1",),  # upsert_court
+        ("case-uuid-1",),  # upsert_case
+        None,  # resolve_judge: no existing alias
+        ("judge-uuid-1",),  # resolve_judge: INSERT INTO judges
+    ]
     mock_cur.rowcount = 0  # document already exists — ON CONFLICT DO NOTHING
 
     worker.process_event(_make_event())
@@ -554,3 +597,174 @@ def test_run_exits_on_infrastructure_error(mock_psycopg: MagicMock) -> None:
 
     with pytest.raises(InfrastructureError):
         worker.run()
+
+
+# ---------------------------------------------------------------------------
+# Judge name normalization
+# ---------------------------------------------------------------------------
+
+
+def test_normalize_judge_name_last_comma_first() -> None:
+    """'LAST, FIRST M.' format is converted to 'First M. Last'."""
+    assert normalize_judge_name("Smith, John A.") == "John A. Smith"
+
+
+def test_normalize_judge_name_first_last() -> None:
+    """'FIRST LAST' format is title-cased."""
+    assert normalize_judge_name("john smith") == "John Smith"
+
+
+def test_normalize_judge_name_all_caps_comma() -> None:
+    """All-caps 'LUNA, BOBBY P.' format is normalized."""
+    assert normalize_judge_name("LUNA, BOBBY P.") == "Bobby P. Luna"
+
+
+def test_normalize_judge_name_extra_whitespace() -> None:
+    """Extra whitespace is collapsed and stripped."""
+    assert normalize_judge_name("  Smith ,  John   A. ") == "John A. Smith"
+
+
+def test_normalize_judge_name_already_normal() -> None:
+    """Already normalized name passes through."""
+    assert normalize_judge_name("John A. Smith") == "John A. Smith"
+
+
+def test_normalize_judge_name_single_name() -> None:
+    """Single name is title-cased."""
+    assert normalize_judge_name("SMITH") == "Smith"
+
+
+# ---------------------------------------------------------------------------
+# Judge resolution (resolve_judge)
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_judge_existing_alias() -> None:
+    """resolve_judge returns existing judge_id when alias matches."""
+    from ingestion.db import resolve_judge
+
+    mock_conn = MagicMock()
+    mock_cur = MagicMock()
+    mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cur)
+    mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+
+    # Simulate existing alias found
+    mock_cur.fetchone.return_value = ("existing-judge-uuid",)
+
+    result = resolve_judge(mock_conn, "Smith, John A.", "court-uuid-1")
+
+    assert result == "existing-judge-uuid"
+    # Should NOT insert a new judge
+    all_sql = " ".join(str(c) for c in mock_cur.execute.call_args_list)
+    assert "INSERT INTO judges" not in all_sql
+
+
+def test_resolve_judge_creates_new() -> None:
+    """resolve_judge creates a new judge and alias when no match exists."""
+    from ingestion.db import resolve_judge
+
+    mock_conn = MagicMock()
+    mock_cur = MagicMock()
+    mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cur)
+    mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+
+    # No existing alias, then INSERT returns new judge id
+    mock_cur.fetchone.side_effect = [None, ("new-judge-uuid",)]
+
+    result = resolve_judge(mock_conn, "Luna, Bobby P.", "court-uuid-1")
+
+    assert result == "new-judge-uuid"
+    all_sql = " ".join(str(c) for c in mock_cur.execute.call_args_list)
+    assert "INSERT INTO judges" in all_sql
+    assert "INSERT INTO judge_aliases" in all_sql
+    # Verify the canonical name was normalized
+    assert "Bobby P. Luna" in all_sql
+
+
+# ---------------------------------------------------------------------------
+# upsert_case_judge
+# ---------------------------------------------------------------------------
+
+
+def test_upsert_case_judge_inserts() -> None:
+    """upsert_case_judge executes the INSERT INTO case_judges SQL."""
+    from ingestion.db import upsert_case_judge
+
+    mock_conn = MagicMock()
+    mock_cur = MagicMock()
+    mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cur)
+    mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+
+    upsert_case_judge(mock_conn, "case-uuid-1", "judge-uuid-1", date(2026, 3, 5))
+
+    mock_cur.execute.assert_called_once()
+    sql = str(mock_cur.execute.call_args)
+    assert "INSERT INTO case_judges" in sql
+    assert "ON CONFLICT" in sql
+
+
+# ---------------------------------------------------------------------------
+# process_event — judge resolution integration
+# ---------------------------------------------------------------------------
+
+
+@patch("ingestion.worker.psycopg")
+def test_process_event_no_judge_name_leaves_judge_id_null(mock_psycopg: MagicMock) -> None:
+    """Events without judge_name should not resolve a judge — judge_id stays NULL."""
+    worker, os_mock = _make_worker()
+
+    mock_conn = MagicMock()
+    mock_cur = MagicMock()
+    mock_conn.__enter__ = MagicMock(return_value=mock_conn)
+    mock_conn.__exit__ = MagicMock(return_value=False)
+    mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cur)
+    mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+    mock_psycopg.connect.return_value = mock_conn
+    mock_cur.fetchone.side_effect = [
+        ("court-uuid-1",),  # upsert_court
+        ("case-uuid-1",),  # upsert_case
+    ]
+    mock_cur.rowcount = 1
+
+    event = _make_event(judge_name=None)
+    worker.process_event(event)
+
+    mock_conn.commit.assert_called_once()
+
+    # No judge resolution should happen
+    all_sql = " ".join(str(c) for c in mock_cur.execute.call_args_list)
+    assert "INSERT INTO judges" not in all_sql
+    assert "judge_aliases" not in all_sql
+    assert "case_judges" not in all_sql
+
+
+@patch("ingestion.worker.psycopg")
+def test_process_event_with_existing_judge_alias(mock_psycopg: MagicMock) -> None:
+    """When judge alias already exists, reuse the existing judge_id."""
+    worker, os_mock = _make_worker()
+
+    mock_conn = MagicMock()
+    mock_cur = MagicMock()
+    mock_conn.__enter__ = MagicMock(return_value=mock_conn)
+    mock_conn.__exit__ = MagicMock(return_value=False)
+    mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cur)
+    mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+    mock_psycopg.connect.return_value = mock_conn
+    mock_cur.fetchone.side_effect = [
+        ("court-uuid-1",),  # upsert_court
+        ("case-uuid-1",),  # upsert_case
+        ("existing-judge-uuid",),  # resolve_judge: found existing alias
+    ]
+    mock_cur.rowcount = 1
+
+    event = _make_event()
+    worker.process_event(event)
+
+    mock_conn.commit.assert_called_once()
+
+    # Should not create a new judge
+    all_sql = " ".join(str(c) for c in mock_cur.execute.call_args_list)
+    assert "INSERT INTO judges" not in all_sql
+    # But should still insert ruling and case_judges
+    assert "INSERT INTO rulings" in all_sql
+    assert "INSERT INTO case_judges" in all_sql
