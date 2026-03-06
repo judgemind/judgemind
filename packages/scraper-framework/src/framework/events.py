@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime
 
 import redis
 
@@ -14,15 +13,6 @@ logger = logging.getLogger(__name__)
 
 STREAM_DOCUMENT_CAPTURED = "document.captured"
 STREAM_SCRAPER_HEALTH = "scraper.health"
-
-
-def _serialize(obj: object) -> object:
-    """JSON-serializable helper for datetime and bytes."""
-    if isinstance(obj, datetime):
-        return obj.isoformat()
-    if isinstance(obj, bytes):
-        return obj.hex()
-    raise TypeError(f"Not serializable: {type(obj)}")
 
 
 class EventBus:
@@ -55,17 +45,19 @@ class EventBus:
             hearing_date=doc.hearing_date,
             capture_timestamp=doc.capture_timestamp,
         )
-        payload = json.loads(event.model_dump_json())
-        msg_id = self._redis.xadd(
-            STREAM_DOCUMENT_CAPTURED, {"data": json.dumps(payload, default=_serialize)}
-        )
+        # Use model_dump(mode="json") instead of json.loads(model_dump_json())
+        # to avoid Pydantic v2 serialization edge cases with
+        # `from __future__ import annotations` and `datetime | None` unions.
+        # model_dump(mode="json") returns a dict with all values already
+        # JSON-compatible (datetimes as ISO strings, enums as values, etc.)
+        # without the redundant JSON string round-trip.  (#191)
+        payload = event.model_dump(mode="json")
+        msg_id = self._redis.xadd(STREAM_DOCUMENT_CAPTURED, {"data": json.dumps(payload)})
         logger.debug("Emitted %s → %s", STREAM_DOCUMENT_CAPTURED, msg_id)
         return msg_id
 
     def emit_health(self, event: ScraperHealthEvent) -> str:
-        payload = json.loads(event.model_dump_json())
-        msg_id = self._redis.xadd(
-            STREAM_SCRAPER_HEALTH, {"data": json.dumps(payload, default=_serialize)}
-        )
+        payload = event.model_dump(mode="json")
+        msg_id = self._redis.xadd(STREAM_SCRAPER_HEALTH, {"data": json.dumps(payload)})
         logger.debug("Emitted %s → %s", STREAM_SCRAPER_HEALTH, msg_id)
         return msg_id
