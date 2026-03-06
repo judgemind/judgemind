@@ -53,11 +53,12 @@ export async function buildApp(db?: Pool, os?: Client): Promise<FastifyInstance>
     if (!db) await pool.end();
   });
 
-  app.get('/health', async (_req, reply) => {
+  app.get('/health', async (req, reply) => {
     try {
       await pool.query('SELECT 1');
       return reply.send({ status: 'ok', db: 'connected' });
-    } catch {
+    } catch (err) {
+      req.log.error({ err }, 'Health check: database connection failed');
       return reply.status(503).send({ status: 'error', db: 'disconnected' });
     }
   });
