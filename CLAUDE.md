@@ -363,8 +363,9 @@ If a task naturally breaks into 2+ independent pieces of work, create child issu
 Investigation tasks produce documentation, not code:
 
 - Write findings directly in the issue body or as a markdown file in `docs/investigations/`.
-- Always end with: recommended next steps, sub-tasks to create, and decisions that need human input.
 - Be specific about what you found and what you couldn't determine.
+- Always end with: decisions that need human input (if any).
+- **Always file follow-up issues** for every actionable finding. Don't just recommend next steps — create the issues so the work is tracked and can be picked up. Label them `agent/ready` if fully specified, or flag them for human input if a decision is needed first. Reference the investigation issue as the parent (see §Creating Sub-Tasks).
 
 ## Scraper Development Rules
 

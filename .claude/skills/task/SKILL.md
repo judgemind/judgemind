@@ -178,12 +178,22 @@ scripts/end-worker.sh {worktree}
 
 ### Path B: Investigation task
 
-Write findings to `docs/investigations/<slug>-<YYYY-MM>.md` and/or into the issue body. End with:
-- Recommended next steps
-- Sub-tasks to create (see CLAUDE.md §Creating Sub-Tasks)
-- Decisions that need human input
+Write findings to `docs/investigations/<slug>-<YYYY-MM>.md` and/or into the issue body.
 
-Create any sub-tasks, label them `agent/ready`. Post a summary comment on the issue, add `status/review`.
+#### B.1 — File follow-up issues for every actionable finding
+
+Do not just list recommendations — **create GitHub issues** for each concrete next step so the work is tracked and can be picked up by agents. For each follow-up:
+
+- Write the issue body to `{worktree}/tmp/followup_N.txt`, then create it with `gh issue create --body-file`.
+- Reference the investigation as the parent: include `Parent: #<investigation-issue>` in the body.
+- Label with appropriate area and type labels.
+- Add `agent/ready` if the issue is fully specified and ready for work. If it requires a human decision first, note that in the body and omit `agent/ready`.
+
+If the investigation reveals no actionable follow-ups (everything is working as expected), state that explicitly in the findings.
+
+#### B.2 — Post summary and request review
+
+Post a summary comment on the investigation issue listing the findings and linking all follow-up issues created. Add the `status/review` label.
 
 Then manually unblock any issues that were waiting on this one. Search for them:
 ```
