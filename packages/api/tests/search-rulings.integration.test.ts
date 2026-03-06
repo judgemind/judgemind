@@ -82,7 +82,7 @@ async function seedPgData(): Promise<void> {
         source_url, scraper_id, captured_at, hearing_date, status)
      VALUES ($1, $2, 'ruling', 'ca/la/search-test/doc1.html', 'judgemind-document-archive-dev',
              'html', 'searchtest-hash-1', 'https://example.com',
-             'ca-la-tentatives-civil', NOW(), '2026-04-10', 'active')
+             'ca-la-tentatives-civil', NOW(), '2026-02-10', 'active')
      RETURNING id`,
     [caseId, courtId],
   );
@@ -95,7 +95,7 @@ async function seedPgData(): Promise<void> {
         source_url, scraper_id, captured_at, hearing_date, status)
      VALUES ($1, $2, 'ruling', 'ca/la/search-test/doc2.html', 'judgemind-document-archive-dev',
              'html', 'searchtest-hash-2', 'https://example.com',
-             'ca-la-tentatives-civil', NOW(), '2026-04-11', 'active')
+             'ca-la-tentatives-civil', NOW(), '2026-02-11', 'active')
      RETURNING id`,
     [caseId, courtId],
   );
@@ -106,7 +106,7 @@ async function seedPgData(): Promise<void> {
     `INSERT INTO rulings
        (document_id, case_id, judge_id, court_id, hearing_date, outcome, motion_type,
         is_tentative, department, ruling_text)
-     VALUES ($1, $2, $3, $4, '2026-04-10', 'granted', 'msj', true, 'Dept. 5',
+     VALUES ($1, $2, $3, $4, '2026-02-10', 'granted', 'msj', true, 'Dept. 5',
              'TENTATIVE RULING: Defendant motion for summary judgment is GRANTED. The court finds no triable issue of material fact.')
      RETURNING id`,
     [docId1, caseId, judgeId, courtId],
@@ -118,7 +118,7 @@ async function seedPgData(): Promise<void> {
     `INSERT INTO rulings
        (document_id, case_id, judge_id, court_id, hearing_date, outcome, motion_type,
         is_tentative, department, ruling_text)
-     VALUES ($1, $2, $3, $4, '2026-04-11', 'denied', 'demurrer', true, 'Dept. 5',
+     VALUES ($1, $2, $3, $4, '2026-02-11', 'denied', 'demurrer', true, 'Dept. 5',
              'TENTATIVE RULING: Demurrer to the complaint is OVERRULED. Plaintiff has sufficiently alleged fraud with specificity.')
      RETURNING id`,
     [docId2, caseId, judgeId, courtId],
@@ -178,7 +178,7 @@ async function seedOpenSearch(): Promise<void> {
       county: 'Los Angeles',
       state: 'CA',
       judge_name: 'Johnson, Robert M.',
-      hearing_date: '2026-04-10',
+      hearing_date: '2026-02-10',
       ruling_text:
         'TENTATIVE RULING: Defendant motion for summary judgment is GRANTED. The court finds no triable issue of material fact.',
       document_id: docId1,
@@ -193,7 +193,7 @@ async function seedOpenSearch(): Promise<void> {
       county: 'Los Angeles',
       state: 'CA',
       judge_name: 'Johnson, Robert M.',
-      hearing_date: '2026-04-11',
+      hearing_date: '2026-02-11',
       ruling_text:
         'TENTATIVE RULING: Demurrer to the complaint is OVERRULED. Plaintiff has sufficiently alleged fraud with specificity.',
       document_id: docId2,
@@ -330,8 +330,8 @@ describe('searchRulings — integration', () => {
       }>;
       expect(edges.length).toBe(2);
       // Filter-only: sorted by hearing_date DESC
-      expect(edges[0].node.hearingDate).toBe('2026-04-11');
-      expect(edges[1].node.hearingDate).toBe('2026-04-10');
+      expect(edges[0].node.hearingDate).toBe('2026-02-11');
+      expect(edges[1].node.hearingDate).toBe('2026-02-10');
     });
 
     it('returns results filtered by state', async () => {
@@ -362,7 +362,7 @@ describe('searchRulings — integration', () => {
 
     it('returns results filtered by date range', async () => {
       const body = await gql(`{
-        searchRulings(filters: { dateFrom: "2026-04-11", dateTo: "2026-04-11" }) {
+        searchRulings(filters: { dateFrom: "2026-02-11", dateTo: "2026-02-11" }) {
           edges { node { rulingId hearingDate } }
           totalHits
         }
@@ -372,7 +372,7 @@ describe('searchRulings — integration', () => {
       const edges = conn.edges as Array<{ node: { rulingId: string; hearingDate: string } }>;
       expect(edges.length).toBe(1);
       expect(edges[0].node.rulingId).toBe(rulingId2);
-      expect(edges[0].node.hearingDate).toBe('2026-04-11');
+      expect(edges[0].node.hearingDate).toBe('2026-02-11');
     });
 
     it('returns results filtered by case number prefix', async () => {

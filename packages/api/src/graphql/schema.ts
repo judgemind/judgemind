@@ -208,7 +208,8 @@ export const typeDefs = `#graphql
 
     """Full-text + filtered search over tentative rulings via OpenSearch.
     Provide a \`query\` for full-text BM25 search, \`filters\` for metadata filtering, or both.
-    An empty query with filters returns results sorted by hearing date descending."""
+    An empty query with filters returns results sorted by hearing date descending.
+    By default, rulings with future hearing dates are excluded. Pass includeFuture: true to include them."""
     searchRulings(
       """Free-text search query against ruling text."""
       query: String
@@ -218,6 +219,8 @@ export const typeDefs = `#graphql
       first: Int
       """Opaque cursor from a previous response's pageInfo.endCursor."""
       after: String
+      """Include rulings with future hearing dates (default false). For admin/debugging use."""
+      includeFuture: Boolean
     ): RulingSearchConnection!
 
     """Fetch a single case by ID."""
@@ -247,7 +250,8 @@ export const typeDefs = `#graphql
     """Fetch a single ruling by ID."""
     ruling(id: ID!): Ruling
 
-    """List rulings. Ordered by hearing_date DESC, id DESC."""
+    """List rulings. Ordered by hearing_date DESC, id DESC.
+    By default, rulings with future hearing dates are excluded. Pass includeFuture: true to include them (admin/debugging)."""
     rulings(
       judgeId: ID
       caseId: ID
@@ -262,6 +266,8 @@ export const typeDefs = `#graphql
       dateTo: String
       """Exact match on the linked case's case_number."""
       caseNumber: String
+      """Include rulings with future hearing dates (default false). For admin/debugging use."""
+      includeFuture: Boolean
       first: Int
       after: String
     ): RulingConnection!

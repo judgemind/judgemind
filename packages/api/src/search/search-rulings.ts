@@ -20,6 +20,7 @@ export interface SearchRulingsArgs {
   filters?: RulingFilters;
   first?: number;
   after?: string;
+  includeFuture?: boolean;
 }
 
 export interface RulingSearchHit {
@@ -58,7 +59,11 @@ function decodeCursor(cursor: string): unknown[] {
   return JSON.parse(Buffer.from(cursor, 'base64').toString('utf8')) as unknown[];
 }
 
-function buildQuery(query: string | undefined, filters: RulingFilters | undefined) {
+function buildQuery(
+  query: string | undefined,
+  filters: RulingFilters | undefined,
+  includeFuture?: boolean,
+) {
   const must: unknown[] = [];
   const filter: unknown[] = [];
 
@@ -72,15 +77,23 @@ function buildQuery(query: string | undefined, filters: RulingFilters | undefine
     if (filters.state) filter.push({ term: { state: filters.state } });
     if (filters.judgeName) filter.push({ term: { judge_name: filters.judgeName } });
     if (filters.caseNumber) filter.push({ prefix: { case_number: filters.caseNumber } });
-    if (filters.dateFrom || filters.dateTo) {
-      const range: Record<string, string> = {};
-      if (filters.dateFrom) range.gte = filters.dateFrom;
-      if (filters.dateTo) range.lte = filters.dateTo;
+  }
+
+  // Build a single hearing_date range filter that merges the user's date
+  // bounds with the default future-date exclusion (lte: now/d).
+  {
+    const range: Record<string, string> = {};
+    if (filters?.dateFrom) range.gte = filters.dateFrom;
+    if (filters?.dateTo) range.lte = filters.dateTo;
+    if (!includeFuture && !range.lte) {
+      range.lte = 'now/d';
+    }
+    if (Object.keys(range).length > 0) {
       filter.push({ range: { hearing_date: range } });
     }
   }
 
-  // If no query and no filters, match all
+  // If no query and no filters (besides the future-date filter), match all
   if (must.length === 0 && filter.length === 0) {
     return { match_all: {} };
   }
@@ -99,7 +112,7 @@ export async function searchRulings(
   args: SearchRulingsArgs,
 ): Promise<SearchResult> {
   const limit = pageSize(args.first);
-  const osQuery = buildQuery(args.query, args.filters);
+  const osQuery = buildQuery(args.query, args.filters, args.includeFuture);
 
   // Sort: relevance first if query provided, then hearing_date desc, then _id for tiebreaker
   const sort: unknown[] = [];
