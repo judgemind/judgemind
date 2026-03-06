@@ -38,6 +38,15 @@ module "iam_scraper" {
   document_archive_bucket_arn = module.document_archive.bucket_arn
 }
 
+module "database" {
+  source = "../../modules/database"
+
+  environment    = "dev"
+  vpc_id         = module.networking.vpc_id
+  subnet_ids     = module.networking.private_subnet_ids
+  instance_class = "db.t4g.micro"
+}
+
 module "cache" {
   source = "../../modules/cache"
 
@@ -207,4 +216,19 @@ output "opensearch_security_group_id" {
 output "opensearch_master_credentials_secret_arn" {
   description = "Dev Secrets Manager ARN for OpenSearch master user credentials"
   value       = module.search.master_credentials_secret_arn
+}
+
+output "db_endpoint" {
+  description = "Dev RDS PostgreSQL endpoint"
+  value       = module.database.db_endpoint
+}
+
+output "db_port" {
+  description = "Dev RDS PostgreSQL port"
+  value       = module.database.db_port
+}
+
+output "db_connection_secret_arn" {
+  description = "Dev Secrets Manager ARN for the database connection string (DATABASE_URL)"
+  value       = module.database.db_connection_secret_arn
 }
