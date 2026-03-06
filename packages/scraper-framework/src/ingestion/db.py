@@ -7,12 +7,15 @@ Write order per event:
   1. upsert_court  — idempotent on court_code
   2. upsert_case   — idempotent on (court_id, case_number)
   3. insert_document — idempotent on documents.id (= scraper document_id UUID)
-  4. insert_ruling   — skipped if document already exists (idempotent via step 3)
+  4. resolve_judge  — resolve raw judge_name to canonical judge record
+  5. insert_ruling   — skipped if document already exists (idempotent via step 3)
+  6. upsert_case_judge — link case to judge in join table
 """
 
 from __future__ import annotations
 
 import logging
+import re
 from datetime import date, datetime
 from typing import TYPE_CHECKING
 
@@ -168,6 +171,119 @@ def insert_document(
     return inserted
 
 
+def normalize_judge_name(raw_name: str) -> str:
+    """Normalize a raw judge name string to a canonical form.
+
+    Handles common court formats:
+      - "LAST, FIRST M."    -> "First M. Last"
+      - "FIRST M. LAST"     -> "First M. Last"
+      - "  Smith,  John A. " -> "John A. Smith"
+
+    Steps:
+      1. Strip leading/trailing whitespace.
+      2. Collapse internal whitespace.
+      3. If the name contains a comma, treat the part before the comma as the
+         last name and the part after as the first/middle.
+      4. Title-case the result.
+    """
+    name = raw_name.strip()
+    # Collapse multiple spaces to one
+    name = re.sub(r"\s+", " ", name)
+
+    if "," in name:
+        parts = name.split(",", 1)
+        last = parts[0].strip()
+        first = parts[1].strip()
+        name = f"{first} {last}"
+
+    # Title-case, but preserve periods (e.g. "A." stays "A.")
+    return name.title()
+
+
+def resolve_judge(
+    conn: psycopg.Connection,
+    raw_name: str,
+    court_id: str,
+) -> str:
+    """Resolve a raw judge name to a canonical judge record, returning the judge UUID.
+
+    Lookup strategy (simple — exact normalized name match within the same court):
+      1. Search judge_aliases for a matching raw_name + court (via judge.court_id).
+      2. If found, return the judge_id from the alias.
+      3. If not found, create a new judge with canonical_name = normalized name,
+         create a judge_alias linking raw_name to the new judge, and return the id.
+    """
+    canonical = normalize_judge_name(raw_name)
+
+    with conn.cursor() as cur:
+        # Look up existing alias for this raw name at this court
+        cur.execute(
+            """
+            SELECT ja.judge_id
+            FROM judge_aliases ja
+            JOIN judges j ON j.id = ja.judge_id
+            WHERE ja.raw_name = %s AND j.court_id = %s::uuid
+            LIMIT 1
+            """,
+            (raw_name, court_id),
+        )
+        row = cur.fetchone()
+        if row is not None:
+            judge_id: str = str(row[0])
+            logger.debug("resolve_judge: found existing alias for %r -> %s", raw_name, judge_id)
+            return judge_id
+
+        # No alias found — create new judge and alias
+        cur.execute(
+            """
+            INSERT INTO judges (canonical_name, court_id)
+            VALUES (%s, %s::uuid)
+            RETURNING id
+            """,
+            (canonical, court_id),
+        )
+        row = cur.fetchone()
+        if row is None:
+            raise RuntimeError(
+                f"resolve_judge: INSERT INTO judges returned no row for name={canonical!r}"
+            )
+        judge_id = str(row[0])
+
+        cur.execute(
+            """
+            INSERT INTO judge_aliases (judge_id, raw_name, source, confidence, is_verified)
+            VALUES (%s::uuid, %s, 'scraper', 1.0, FALSE)
+            """,
+            (judge_id, raw_name),
+        )
+
+        logger.debug("resolve_judge: created new judge %s for %r", judge_id, raw_name)
+        return judge_id
+
+
+def upsert_case_judge(
+    conn: psycopg.Connection,
+    case_id: str,
+    judge_id: str,
+    hearing_date: date | None,
+) -> None:
+    """Link a case to a judge in the case_judges join table.
+
+    Idempotent — ON CONFLICT on the (case_id, judge_id) PK does nothing.
+    Sets is_current = TRUE and assigned_at to the hearing_date if provided.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO case_judges (case_id, judge_id, assigned_at, is_current)
+            VALUES (%s::uuid, %s::uuid, %s, TRUE)
+            ON CONFLICT (case_id, judge_id) DO NOTHING
+            """,
+            (case_id, judge_id, hearing_date),
+        )
+    logger.debug("upsert_case_judge: case_id=%s judge_id=%s", case_id, judge_id)
+
+
 def insert_ruling(
     conn: psycopg.Connection,
     document_id: str,
@@ -176,6 +292,7 @@ def insert_ruling(
     hearing_date: date,
     ruling_text: str | None,
     department: str | None,
+    judge_id: str | None = None,
     outcome: str | None = None,
     motion_type: str | None = None,
 ) -> None:
@@ -191,11 +308,11 @@ def insert_ruling(
         cur.execute(
             """
             INSERT INTO rulings (
-                document_id, case_id, court_id,
+                document_id, case_id, court_id, judge_id,
                 hearing_date, ruling_text, department, is_tentative,
                 outcome, motion_type
             )
-            SELECT %s::uuid, %s::uuid, %s::uuid, %s::date, %s, %s, TRUE,
+            SELECT %s::uuid, %s::uuid, %s::uuid, %s::uuid, %s::date, %s, %s, TRUE,
                    %s::ruling_outcome, %s
             WHERE NOT EXISTS (
                 SELECT 1 FROM rulings WHERE document_id = %s::uuid
@@ -205,6 +322,7 @@ def insert_ruling(
                 document_id,
                 case_id,
                 court_id,
+                judge_id,
                 hearing_date,
                 ruling_text,
                 department,
