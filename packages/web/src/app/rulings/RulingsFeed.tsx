@@ -224,7 +224,7 @@ export function RulingsFeed() {
       {/* Table */}
       <div className="rounded-lg border border-slate-200 dark:border-slate-700">
         {/* Header */}
-        <div className="hidden grid-cols-[6rem_1fr_7rem_6rem_6rem] gap-4 border-b border-slate-200 px-4 py-2 text-xs font-semibold uppercase tracking-wide text-slate-500 dark:border-slate-700 dark:text-slate-400 sm:grid">
+        <div className="hidden grid-cols-[6rem_1fr_10rem_10rem_6rem] gap-4 border-b border-slate-200 px-4 py-2 text-xs font-semibold uppercase tracking-wide text-slate-500 dark:border-slate-700 dark:text-slate-400 sm:grid">
           <span>Date</span>
           <span>Case / Court</span>
           <span>Judge</span>
@@ -259,7 +259,7 @@ export function RulingsFeed() {
         {edges.map(({ node }) => (
           <div
             key={node.id}
-            className="grid grid-cols-1 gap-1 border-b border-slate-100 px-4 py-3 last:border-0 hover:bg-slate-50 dark:border-slate-700 dark:hover:bg-slate-800/50 sm:grid-cols-[6rem_1fr_7rem_6rem_6rem] sm:items-center sm:gap-4"
+            className="grid grid-cols-1 gap-1 border-b border-slate-100 px-4 py-3 last:border-0 hover:bg-slate-50 dark:border-slate-700 dark:hover:bg-slate-800/50 sm:grid-cols-[6rem_1fr_10rem_10rem_6rem] sm:items-center sm:gap-4"
           >
             {/* Date */}
             <span className="text-xs text-slate-500 dark:text-slate-400">
@@ -287,7 +287,7 @@ export function RulingsFeed() {
             </div>
 
             {/* Judge */}
-            <span className="truncate text-sm text-slate-700 dark:text-slate-300">
+            <span className="text-sm text-slate-700 dark:text-slate-300">
               {formatJudgeName(node.judge)}
             </span>
 
