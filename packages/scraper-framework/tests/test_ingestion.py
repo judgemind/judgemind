@@ -171,9 +171,9 @@ def test_process_event_passes_outcome_and_motion_type_from_event(mock_psycopg: M
     mock_psycopg.connect.return_value = mock_conn
     mock_cur.fetchone.side_effect = [
         ("court-uuid-1",),  # upsert_court
-        ("case-uuid-1",),   # upsert_case
-        None,                # resolve_judge: no existing alias
-        ("judge-uuid-1",),   # resolve_judge: INSERT INTO judges
+        ("case-uuid-1",),  # upsert_case
+        None,  # resolve_judge: no existing alias
+        ("judge-uuid-1",),  # resolve_judge: INSERT INTO judges
     ]
     mock_cur.rowcount = 1
 
@@ -203,9 +203,9 @@ def test_process_event_extracts_outcome_from_ruling_text(mock_psycopg: MagicMock
     mock_psycopg.connect.return_value = mock_conn
     mock_cur.fetchone.side_effect = [
         ("court-uuid-1",),  # upsert_court
-        ("case-uuid-1",),   # upsert_case
-        None,                # resolve_judge: no existing alias
-        ("judge-uuid-1",),   # resolve_judge: INSERT INTO judges
+        ("case-uuid-1",),  # upsert_case
+        None,  # resolve_judge: no existing alias
+        ("judge-uuid-1",),  # resolve_judge: INSERT INTO judges
     ]
     mock_cur.rowcount = 1
 
@@ -234,9 +234,9 @@ def test_process_event_event_fields_override_regex(mock_psycopg: MagicMock) -> N
     mock_psycopg.connect.return_value = mock_conn
     mock_cur.fetchone.side_effect = [
         ("court-uuid-1",),  # upsert_court
-        ("case-uuid-1",),   # upsert_case
-        None,                # resolve_judge: no existing alias
-        ("judge-uuid-1",),   # resolve_judge: INSERT INTO judges
+        ("case-uuid-1",),  # upsert_case
+        None,  # resolve_judge: no existing alias
+        ("judge-uuid-1",),  # resolve_judge: INSERT INTO judges
     ]
     mock_cur.rowcount = 1
 
