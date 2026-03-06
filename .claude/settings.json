@@ -1,7 +1,4 @@
 {
-  "env": {
-    "ANTHROPIC_MODEL": "opus[1m]"
-  },
   "permissions": {
     "deny": ["NotebookEdit", "Task(Bash)"],
     "allow": [
@@ -50,16 +47,21 @@
       "Bash(gh label*)",
       "Bash(gh project*)",
       "Bash(gh auth*)",
+      "Bash(gh run*)",
       "Bash(.venv/bin/pytest*)",
       "Bash(.venv/bin/pip*)",
       "Bash(.venv/bin/python*)",
+      "Bash(python:*)",
+      "Bash(python3:*)",
       "Bash(scripts/start-worker.sh:*)",
       "Bash(scripts/end-worker.sh:*)",
       "Bash(brew install*)",
       "Bash(brew upgrade*)",
       "Bash(terraform:*)",
+      "Bash(vercel:*)",
       "Bash(aws:*)",
       "Bash(curl:*)",
+      "Bash(dig:*)",
       "Bash(tar:*)",
       "Bash(cp:*)",
       "Bash(mv:*)",

@@ -18,6 +18,7 @@ build/
 *.swo
 
 # Environment & secrets
+.claude/settings.local.json
 .env
 .env.local
 .env.*.local
