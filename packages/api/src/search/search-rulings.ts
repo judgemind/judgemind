@@ -67,11 +67,6 @@ function buildQuery(
   const must: unknown[] = [];
   const filter: unknown[] = [];
 
-  // Exclude future hearing dates by default
-  if (!includeFuture) {
-    filter.push({ range: { hearing_date: { lte: 'now/d' } } });
-  }
-
   if (query) {
     must.push({ match: { ruling_text: { query, operator: 'and' } } });
   }
@@ -82,10 +77,18 @@ function buildQuery(
     if (filters.state) filter.push({ term: { state: filters.state } });
     if (filters.judgeName) filter.push({ term: { judge_name: filters.judgeName } });
     if (filters.caseNumber) filter.push({ prefix: { case_number: filters.caseNumber } });
-    if (filters.dateFrom || filters.dateTo) {
-      const range: Record<string, string> = {};
-      if (filters.dateFrom) range.gte = filters.dateFrom;
-      if (filters.dateTo) range.lte = filters.dateTo;
+  }
+
+  // Build a single hearing_date range filter that merges the user's date
+  // bounds with the default future-date exclusion (lte: now/d).
+  {
+    const range: Record<string, string> = {};
+    if (filters?.dateFrom) range.gte = filters.dateFrom;
+    if (filters?.dateTo) range.lte = filters.dateTo;
+    if (!includeFuture && !range.lte) {
+      range.lte = 'now/d';
+    }
+    if (Object.keys(range).length > 0) {
       filter.push({ range: { hearing_date: range } });
     }
   }
