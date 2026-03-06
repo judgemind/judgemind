@@ -63,22 +63,33 @@ The skill works autonomously from issue selection through PR and review request.
 
 **All commits must be made on the worktree branch created in Step 2, never directly on `main`.** Every change goes through a PR — no direct pushes to `main`, ever.
 
-Complete every substep in order. A task is not done until substep 4.9 is finished. Do not ask the user for confirmation during any of these steps.
+Complete every substep in order. A task is not done until substep 4.10 is finished. Do not ask the user for confirmation during any of these steps.
 
-#### 4.1 — Understand the problem
+#### 4.1 — Sync the worktree to latest main
+
+Before touching any code, fetch and rebase onto the latest `origin/main`:
+
+```
+git -C {worktree} fetch origin main
+git -C {worktree} rebase origin/main
+```
+
+This ensures your branch starts from the current tip of main, not from whenever the worktree was created.
+
+#### 4.2 — Understand the problem
 
 - Read the issue thoroughly, including linked issues.
 - Check `docs/specs/` for relevant guidance (product spec, architecture spec, investigation reports).
 - Look at existing code for patterns. Be consistent with what's already there.
 - If you need a decision from the maintainer, comment on the issue, label it `status/blocked`, and pick up a different task. Do not guess on ambiguous requirements.
 
-#### 4.2 — Implement and verify locally
+#### 4.3 — Implement and verify locally
 
 - Implement the change.
 - Run **all** pre-PR checks (see "Pre-PR Checks" section — lint, format, AND tests) for every package you touched.
 - Fix any failures before proceeding. Do not push code that fails local checks.
 
-#### 4.3 — Push, open a PR, and immediately watch CI
+#### 4.4 — Push, open a PR, and immediately watch CI
 
 Push the branch, open a PR, then start watching CI **in the same step** — do not do anything else until CI completes:
 
@@ -89,9 +100,9 @@ gh run list --repo judgemind/judgemind --branch <branch> --limit 1 --json databa
 gh run watch <run-id> --repo judgemind/judgemind --exit-status --compact
 ```
 
-**Never leave the CI watch step unfinished.** Do not remove the worktree, do not update the PR body, do not do anything else until `gh run watch` exits. If CI is green, continue to 4.4. If CI fails, go to 4.6.
+**Never leave the CI watch step unfinished.** Do not remove the worktree, do not update the PR body, do not do anything else until `gh run watch` exits. If CI is green, continue to 4.5. If CI fails, go to 4.7.
 
-#### 4.4 — Verify no merge conflicts
+#### 4.5 — Verify no merge conflicts
 
 - Check for merge conflicts:
   ```
@@ -102,22 +113,22 @@ gh run watch <run-id> --repo judgemind/judgemind --exit-status --compact
   git -C $REPO_ROOT/worktrees/worker-N fetch origin main
   git -C $REPO_ROOT/worktrees/worker-N rebase origin/main
   ```
-  Resolve any conflicts, then `git rebase --continue`, then push with `--force-with-lease`, then return to 4.3 to watch CI again.
+  Resolve any conflicts, then `git rebase --continue`, then push with `--force-with-lease`, then return to 4.4 to watch CI again.
 
-#### 4.5 — CI is green — confirm before proceeding
+#### 4.6 — CI is green — confirm before proceeding
 
 After `gh run watch` exits cleanly, verify all required checks passed:
 ```
 gh pr view <N> --repo judgemind/judgemind --json statusCheckRollup
 ```
-All checks must show `SUCCESS` or `SKIPPED`. Any `FAILURE` goes to 4.6.
+All checks must show `SUCCESS` or `SKIPPED`. Any `FAILURE` goes to 4.7.
 
-#### 4.6 — Fix CI failures (repeat until green)
+#### 4.7 — Fix CI failures (repeat until green)
 
-- If CI fails, diagnose the failure, fix it locally, push again, and return to 4.3.
-- Repeat the 4.3 -> 4.4 -> 4.5 -> 4.6 loop until CI is green. **The worktree must not be removed until this loop exits cleanly.**
+- If CI fails, diagnose the failure, fix it locally, push again, and return to 4.4.
+- Repeat the 4.4 -> 4.5 -> 4.6 -> 4.7 loop until CI is green. **The worktree must not be removed until this loop exits cleanly.**
 
-#### 4.7 — Update the PR test plan
+#### 4.8 — Update the PR test plan
 
 - Fetch the current PR body:
   ```
@@ -136,12 +147,12 @@ All checks must show `SUCCESS` or `SKIPPED`. Any `FAILURE` goes to 4.6.
   gh pr edit <N> --repo judgemind/judgemind --body-file {worktree}/tmp/pr_body.txt
   ```
 
-#### 4.8 — Link the issue and request review
+#### 4.9 — Link the issue and request review
 
 - Comment on the issue linking the PR.
 - Add the `status/review` label to the issue.
 
-#### 4.9 — Remove your worktree
+#### 4.10 — Remove your worktree
 
 The branch must stay (it backs the open PR), but the worktree directory is no longer needed. Run:
 

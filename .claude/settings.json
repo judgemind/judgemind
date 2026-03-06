@@ -4,6 +4,7 @@
     "allow": [
       "Edit(**)",
       "Write(**)",
+      "Write(/tmp/*)",
       "Glob",
       "Grep",
       "Skill",
@@ -76,6 +77,7 @@
       "Bash(uniq:*)",
       "Bash(grep:*)",
       "Bash(head:*)",
+      "Bash(tail:*)",
       "Bash(which:*)",
       "Bash(realpath:*)",
       "Bash(dirname:*)",
