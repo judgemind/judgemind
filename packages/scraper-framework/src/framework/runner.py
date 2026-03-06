@@ -50,6 +50,8 @@ def _build_registry() -> list[tuple[str, type, callable]]:
     from courts.ca.riverside_tentatives import default_config as riverside_config
     from courts.ca.sb_tentatives import SBTentativeRulingsScraper
     from courts.ca.sb_tentatives import default_config as sb_config
+    from courts.ca.sf_tentatives import SFTentativeRulingsScraper
+    from courts.ca.sf_tentatives import default_config as sf_config
 
     _REGISTRY.extend(
         [
@@ -57,6 +59,7 @@ def _build_registry() -> list[tuple[str, type, callable]]:
             ("ca-oc-tentatives", OCTentativeRulingsScraper, oc_config),
             ("ca-riverside-tentatives", RiversideTentativeRulingsScraper, riverside_config),
             ("ca-sb-tentatives", SBTentativeRulingsScraper, sb_config),
+            ("ca-sf-tentatives-family-law", SFTentativeRulingsScraper, sf_config),
         ]
     )
     return _REGISTRY
