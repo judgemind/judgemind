@@ -92,32 +92,12 @@ For TypeScript packages: `npm install` from the package directory.
 
 Skip this for Terraform-only or docs-only tasks.
 
-#### A.2 — Implement and verify locally
-- **For testable code tasks** (Python, TypeScript): use the `/tdd` workflow — write failing tests first, implement until green, run all checks. See `.claude/skills/tdd/SKILL.md`.
-- **For non-testable tasks** (Terraform, DB migrations, CI/CD, docs): implement directly, then run all applicable pre-PR checks (see CLAUDE.md §Pre-PR Checks).
-- Fix any failures before proceeding. Do not push code that fails local checks.
+#### A.2 — Implement and review (ralph loop)
+- **For testable code tasks** (Python, TypeScript): use the `/ralph` loop — iterative work-then-review with fresh context each iteration. See `.claude/skills/ralph/SKILL.md`. This replaces the old `/tdd` + self-review steps. `/ralph` handles implementation (TDD), pre-PR checks, and cross-perspective review internally. It returns when the reviewer subagent says SHIP.
+- **For non-testable tasks** (Terraform, DB migrations, CI/CD, docs): implement directly, then run all applicable pre-PR checks (see CLAUDE.md §Pre-PR Checks) and review your own diff before continuing.
+- If `/ralph` exits with a blocker (STUCK or max iterations), the issue has already been commented on and labeled `status/blocked`. Clean up the worktree (`scripts/end-worker.sh {worktree}`) and stop.
 
-#### A.3 — Review your own diff
-
-Before committing, review the complete diff and check for untracked files:
-
-```
-git -C {worktree} diff
-git -C {worktree} status
-```
-
-Check for:
-- **Scope creep**: changes unrelated to the issue (extra refactors, added comments, unrelated fixes). Remove them.
-- **Forgotten debug code**: print statements, console.logs, hardcoded test values.
-- **Missing files**: did you forget to create or modify a file the implementation requires?
-- **Consistency**: does the change follow existing patterns in the codebase?
-- **Test coverage gaps**: are there obvious edge cases the tests don't cover?
-- **Stale references**: do comments, docstrings, or imports reference things that changed?
-- **Untracked files**: does `git status` show files you meant to include, or files that shouldn't be committed?
-
-If you find issues, fix them and re-run the pre-PR checks before continuing. Repeat this review until the diff is clean.
-
-#### A.4 — Stage, commit, and push
+#### A.3 — Stage, commit, and push
 Stage the files you changed (prefer naming specific files over `git add .`):
 ```
 git -C {worktree} add <files>
@@ -138,7 +118,7 @@ gh pr create --repo judgemind/judgemind \
     --base main
 ```
 
-#### A.5 — Verify no merge conflicts
+#### A.4 — Verify no merge conflicts
 ```
 gh pr view <PR-N> --repo judgemind/judgemind --json mergeable,mergeStateStatus
 ```
@@ -149,27 +129,27 @@ git -C {worktree} rebase origin/main
 ```
 Resolve conflicts, `git rebase --continue`, then push with `--force-with-lease`.
 
-#### A.6 — Monitor CI and iterate until green
+#### A.5 — Monitor CI and iterate until green
 ```
 gh run watch <run-id> --repo judgemind/judgemind --exit-status --compact
 ```
-If CI fails: diagnose, fix locally, push, return to A.5. Repeat until all checks pass.
+If CI fails: diagnose, fix locally, push, return to A.4. Repeat until all checks pass.
 
-#### A.7 — Update the PR test plan
+#### A.6 — Update the PR test plan
 Fetch the current PR body, check off automated steps that passed in CI, run any manual smoke tests in a temporary smoketest worktree (see CLAUDE.md §4.8 for the pattern), write the updated body to `{worktree}/tmp/pr_body.txt`, then:
 ```
 gh pr edit <PR-N> --repo judgemind/judgemind --body-file {worktree}/tmp/pr_body.txt
 ```
 
-#### A.8 — Merge the PR
-The PR has passed the diff-review loop (A.3) and CI is green. Merge it:
+#### A.7 — Merge the PR
+The PR has passed the ralph loop review (A.2) and CI is green. Merge it:
 ```
 gh pr merge <PR-N> --repo judgemind/judgemind --squash --delete-branch
 ```
 
 **Dependent issues will be unblocked automatically** by the `unblock-issues` workflow when the PR merges. No manual unblocking needed.
 
-#### A.9 — Remove worktree
+#### A.8 — Remove worktree
 ```
 scripts/end-worker.sh {worktree}
 ```

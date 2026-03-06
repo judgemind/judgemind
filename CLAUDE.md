@@ -15,7 +15,7 @@ These are the most frequently violated rules. **A PreToolUse hook enforces the s
 
 ### NEVER — Workflow
 - **NEVER** commit directly to `main` during autonomous task work. All `/task` work happens on worktree branches via PRs. (The user may direct you to commit to `main` during interactive sessions — that's fine.)
-- **You MAY merge your own PRs** if the PR has passed the `/task` diff-review loop (A.3) and CI is green. Use `gh pr merge <N> --repo judgemind/judgemind --squash --delete-branch`.
+- **You MAY merge your own PRs** if the PR has passed the `/ralph` review loop (A.2) and CI is green. Use `gh pr merge <N> --repo judgemind/judgemind --squash --delete-branch`.
 - **NEVER** deploy to production. Production deploys are human-only.
 - **NEVER** skip pre-PR checks. Run lint, format, AND tests locally before pushing.
 - **NEVER** share venvs between worktrees. Each worktree gets its own `.venv`.
@@ -44,7 +44,8 @@ Wait for the user's instruction before deciding what to do. Sessions may involve
 ### Available Skills
 
 - **`/task`** — Full autonomous pipeline: ensures a worktree exists (runs setup if needed), claims an issue, implements it, opens a PR, and requests review. Accepts `#N`, natural language filters, or no argument (picks highest priority). **This is the primary way to start autonomous work.**
-- **`/tdd`** — Test-driven implementation for code tasks (Python, TypeScript). Called by `/task` automatically for testable code work. Can also be invoked manually after claiming an issue. **Not for** Terraform, DB migrations, CI/CD, docs, or investigation tasks.
+- **`/ralph`** — Iterative work-review loop with fresh context each iteration. Spawns a worker subagent (TDD) and a reviewer subagent. Loops until the reviewer says SHIP or max iterations (5) reached. Called by `/task` automatically for testable code tasks. Can also be invoked manually after claiming an issue.
+- **`/tdd`** — Test-driven implementation for code tasks (Python, TypeScript). Called by `/ralph` internally as the worker phase. Can also be invoked standalone for manual workflows. **Not for** Terraform, DB migrations, CI/CD, docs, or investigation tasks.
 
 ### Worktree setup (manual)
 
@@ -114,8 +115,8 @@ This ensures your branch starts from the current tip of main, not from whenever 
 
 #### 4.3 — Implement and verify locally
 
-- Implement the change.
-- Run **all** pre-PR checks (see "Pre-PR Checks" section — lint, format, AND tests) for every package you touched.
+- **For testable code tasks** (Python, TypeScript): use the `/ralph` loop — iterative work-then-review with fresh context each iteration. See `.claude/skills/ralph/SKILL.md`. `/ralph` handles implementation (TDD), pre-PR checks, and cross-perspective review internally.
+- **For non-testable tasks** (Terraform, DB migrations, CI/CD, docs): implement directly, then run all applicable pre-PR checks (see "Pre-PR Checks" section — lint, format, AND tests) and review your own diff before continuing.
 - Fix any failures before proceeding. Do not push code that fails local checks.
 
 #### 4.4 — Push, open a PR, and immediately watch CI
@@ -318,7 +319,7 @@ Do NOT rely on CI to catch issues that local checks would have caught. If a suba
 ## Git Workflow
 
 - Commit messages follow conventional commits: `feat(scraping): implement OC PDF link scraper (#42)`
-- Always work on the worktree branch created in Step 2. Open a PR, wait for CI to pass. You may merge your own PRs after the diff-review loop (A.3) and CI are green. Never push directly to `main`.
+- Always work on the worktree branch created in Step 2. Open a PR, wait for CI to pass. You may merge your own PRs after the ralph review loop (A.2) and CI are green. Never push directly to `main`.
 - **A PR is not done until it has no conflicts and CI is green.** Follow the complete post-push checklist in the PR Workflow section (substeps 4.4–4.8) — do not skip any step.
 
 ## Task Dependencies
@@ -444,7 +445,7 @@ Do **not** file issues for prompts that exist for good reason — pushing to rem
 
 ## Things You Must Not Do
 
-- Do not merge PRs unless they have passed the diff-review loop (A.3) and CI is green.
+- Do not merge PRs unless they have passed the ralph review loop (A.2) and CI is green.
 - Do not deploy to production.
 - Do not make architectural decisions that contradict the specs without flagging them as `type/decision` issues.
 - Do not scrape live court websites during development.
