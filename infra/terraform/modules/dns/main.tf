@@ -57,6 +57,16 @@ resource "cloudflare_record" "ses_dkim" {
   ttl     = 300
 }
 
+# ─── DMARC ──────────────────────────────────────────────────────────────────
+
+resource "cloudflare_record" "dmarc" {
+  zone_id = local.zone_id
+  name    = "_dmarc"
+  type    = "TXT"
+  content = "v=DMARC1; p=none;"
+  ttl     = 300
+}
+
 # ─── SPF ─────────────────────────────────────────────────────────────────────
 
 # SPF for the root domain. If an SPF record already exists, import it first.

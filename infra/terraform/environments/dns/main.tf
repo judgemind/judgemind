@@ -19,9 +19,9 @@ module "dns" {
   # SES domain verification — shared across environments (same domain identity).
   ses_verification_token = "w1QjyCYfazpNy7TMeIk+MHj4njB1Qf1eo1D2xm4pLl4="
   ses_dkim_tokens = [
-    "5qgh4kqag5yy4ofvqx6ujo56kdyrsacz",
-    "bfbq7yuinjzrbta3y4z2fgxesifrpsnr",
-    "y3ggvhi7wtvsiyok2nrzzeujmuva5hvc",
+    "r2lixfuvf5hmj6uaze7h3a6ix6iybzu4",
+    "4jeszxtx2dk3u5gh2hyetsp2ztmn6d73",
+    "l7jfzdrqxnhrej6tfiegfjz6eqb5q4er",
   ]
 
   # Hosting — updated as services are deployed.
