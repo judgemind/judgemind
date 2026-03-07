@@ -42,6 +42,7 @@ const CASE_RULINGS_QUERY = gql`
           hearingDate
           motionType
           outcome
+          isTentative
           department
           judge {
             canonicalName
@@ -87,6 +88,7 @@ interface RulingNode {
   hearingDate: string;
   motionType: string | null;
   outcome: string | null;
+  isTentative: boolean;
   department: string | null;
   judge: {
     canonicalName: string;
@@ -109,6 +111,12 @@ const OUTCOME_BADGE: Record<string, string> = {
   denied_in_part:
     'bg-yellow-100 text-yellow-800 dark:bg-yellow-900 dark:text-yellow-200',
 };
+
+/** Party types grouped as plaintiffs. */
+const PLAINTIFF_TYPES = new Set(['plaintiff', 'petitioner', 'cross_complainant']);
+
+/** Party types grouped as defendants. */
+const DEFENDANT_TYPES = new Set(['defendant', 'respondent', 'cross_defendant']);
 
 const PAGE_SIZE = 20;
 
@@ -153,6 +161,34 @@ export function formatLabel(value: string | null): string {
     .join(' ');
 }
 
+/**
+ * Group parties into plaintiffs, defendants, and other columns.
+ * Returns three arrays: plaintiffs, defendants, and others (parties with
+ * an unrecognized or null partyType).
+ */
+export function groupParties(
+  parties: Array<{ id: string; canonicalName: string; partyType: string | null }>,
+): {
+  plaintiffs: typeof parties;
+  defendants: typeof parties;
+  others: typeof parties;
+} {
+  const plaintiffs: typeof parties = [];
+  const defendants: typeof parties = [];
+  const others: typeof parties = [];
+  for (const party of parties) {
+    const key = party.partyType?.toLowerCase() ?? '';
+    if (PLAINTIFF_TYPES.has(key)) {
+      plaintiffs.push(party);
+    } else if (DEFENDANT_TYPES.has(key)) {
+      defendants.push(party);
+    } else {
+      others.push(party);
+    }
+  }
+  return { plaintiffs, defendants, others };
+}
+
 function SkeletonBlock() {
   return (
     <div className="animate-pulse space-y-4">
@@ -182,6 +218,40 @@ function SkeletonRow() {
       <div className="w-20 shrink-0">
         <div className="h-5 rounded bg-slate-200 dark:bg-slate-700" />
       </div>
+    </div>
+  );
+}
+
+function PartyColumn({
+  label,
+  parties,
+}: {
+  label: string;
+  parties: Array<{ id: string; canonicalName: string; partyType: string | null }>;
+}) {
+  return (
+    <div>
+      <h3 className="text-xs font-medium uppercase tracking-wide text-slate-500 dark:text-slate-400">
+        {label}
+      </h3>
+      {parties.length === 0 ? (
+        <p className="mt-1 text-sm text-slate-400 dark:text-slate-500">
+          None listed
+        </p>
+      ) : (
+        <ul className="mt-1 space-y-1">
+          {parties.map((party) => (
+            <li key={party.id} className="text-sm text-slate-900 dark:text-slate-100">
+              {party.canonicalName}
+              {party.partyType && (
+                <span className="ml-2 text-xs text-slate-500 dark:text-slate-400">
+                  ({formatLabel(party.partyType)})
+                </span>
+              )}
+            </li>
+          ))}
+        </ul>
+      )}
     </div>
   );
 }
@@ -268,26 +338,12 @@ export function CaseDetail({ caseId }: { caseId: string }) {
     );
   }
 
+  const { plaintiffs, defendants, others } = groupParties(caseRecord.parties);
+
   return (
     <div>
       {/* Case metadata */}
-      <div className="mt-6 grid grid-cols-2 gap-x-8 gap-y-4 sm:grid-cols-3">
-        <div>
-          <dt className="text-xs font-medium uppercase tracking-wide text-slate-500 dark:text-slate-400">
-            Case Type
-          </dt>
-          <dd className="mt-1 text-sm text-slate-900 dark:text-slate-100">
-            {formatLabel(caseRecord.caseType)}
-          </dd>
-        </div>
-        <div>
-          <dt className="text-xs font-medium uppercase tracking-wide text-slate-500 dark:text-slate-400">
-            Status
-          </dt>
-          <dd className="mt-1 text-sm text-slate-900 dark:text-slate-100">
-            {formatLabel(caseRecord.caseStatus)}
-          </dd>
-        </div>
+      <div className="grid grid-cols-2 gap-x-8 gap-y-4 sm:grid-cols-3">
         <div>
           <dt className="text-xs font-medium uppercase tracking-wide text-slate-500 dark:text-slate-400">
             Filed Date
@@ -313,6 +369,26 @@ export function CaseDetail({ caseId }: { caseId: string }) {
           </dd>
         </div>
       </div>
+
+      {/* Parties — two-column layout */}
+      <section className="mt-8">
+        <h2 className="text-sm font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">
+          Parties
+        </h2>
+        {caseRecord.parties.length === 0 ? (
+          <p className="mt-2 text-sm text-slate-400 dark:text-slate-500">
+            No parties listed.
+          </p>
+        ) : (
+          <div className="mt-2 grid grid-cols-1 gap-6 sm:grid-cols-2">
+            <PartyColumn label="Plaintiffs" parties={plaintiffs} />
+            <PartyColumn label="Defendants" parties={defendants} />
+            {others.length > 0 && (
+              <PartyColumn label="Other Parties" parties={others} />
+            )}
+          </div>
+        )}
+      </section>
 
       {/* Judges */}
       <section className="mt-8">
@@ -344,31 +420,6 @@ export function CaseDetail({ caseId }: { caseId: string }) {
         )}
       </section>
 
-      {/* Parties */}
-      <section className="mt-8">
-        <h2 className="text-sm font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">
-          Parties
-        </h2>
-        {caseRecord.parties.length === 0 ? (
-          <p className="mt-2 text-sm text-slate-400 dark:text-slate-500">
-            No parties listed.
-          </p>
-        ) : (
-          <ul className="mt-2 space-y-1">
-            {caseRecord.parties.map((party) => (
-              <li key={party.id} className="text-sm text-slate-900 dark:text-slate-100">
-                {party.canonicalName}
-                {party.partyType && (
-                  <span className="ml-2 text-xs text-slate-500 dark:text-slate-400">
-                    ({formatLabel(party.partyType)})
-                  </span>
-                )}
-              </li>
-            ))}
-          </ul>
-        )}
-      </section>
-
       {/* Rulings */}
       <section className="mt-8">
         <h2 className="text-sm font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">
@@ -377,11 +428,12 @@ export function CaseDetail({ caseId }: { caseId: string }) {
 
         <div className="mt-3 rounded-lg border border-slate-200 dark:border-slate-700">
           {/* Header row */}
-          <div className="hidden grid-cols-[6rem_1fr_10rem_6rem] gap-4 border-b border-slate-200 px-4 py-2 text-xs font-semibold uppercase tracking-wide text-slate-500 dark:border-slate-700 dark:text-slate-400 sm:grid">
+          <div className="hidden grid-cols-[6rem_1fr_10rem_6rem_5.5rem] gap-4 border-b border-slate-200 px-4 py-2 text-xs font-semibold uppercase tracking-wide text-slate-500 dark:border-slate-700 dark:text-slate-400 sm:grid">
             <span>Date</span>
             <span>Motion</span>
             <span>Judge</span>
             <span>Outcome</span>
+            <span>Type</span>
           </div>
 
           {/* Skeleton */}
@@ -403,7 +455,7 @@ export function CaseDetail({ caseId }: { caseId: string }) {
           {/* Empty state */}
           {!rulingsLoading && !rulingsError && edges.length === 0 && (
             <p className="p-8 text-center text-slate-400 dark:text-slate-500">
-              No rulings found for this case.
+              No rulings captured for this case.
             </p>
           )}
 
@@ -421,7 +473,7 @@ export function CaseDetail({ caseId }: { caseId: string }) {
               >
                 {/* Metadata row */}
                 <div
-                  className="grid grid-cols-1 gap-1 px-4 py-3 hover:bg-slate-50 dark:hover:bg-slate-800/50 sm:grid-cols-[6rem_1fr_10rem_6rem] sm:items-center sm:gap-4"
+                  className="grid grid-cols-1 gap-1 px-4 py-3 hover:bg-slate-50 dark:hover:bg-slate-800/50 sm:grid-cols-[6rem_1fr_10rem_6rem_5.5rem] sm:items-center sm:gap-4"
                 >
                   {/* Date */}
                   <span className="text-xs text-slate-500 dark:text-slate-400">
@@ -452,6 +504,17 @@ export function CaseDetail({ caseId }: { caseId: string }) {
                     }`}
                   >
                     {formatOutcome(node.outcome)}
+                  </span>
+
+                  {/* Tentative / Final badge */}
+                  <span
+                    className={`inline-flex w-fit items-center rounded px-2 py-0.5 text-xs font-medium ${
+                      node.isTentative
+                        ? 'bg-amber-100 text-amber-800 dark:bg-amber-900 dark:text-amber-200'
+                        : 'bg-indigo-100 text-indigo-800 dark:bg-indigo-900 dark:text-indigo-200'
+                    }`}
+                  >
+                    {node.isTentative ? 'Tentative' : 'Final'}
                   </span>
                 </div>
 
