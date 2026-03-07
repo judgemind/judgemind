@@ -36,48 +36,164 @@ logger = logging.getLogger(__name__)
 # Title extraction regex
 # ---------------------------------------------------------------------------
 
-# Matches party caption blocks found in LA ruling text, e.g.:
-#   "EMELITA BUENAVENTURA, Plaintiff(s), vs. CITY OF PASADENA, Defendant(s)."
-# Also handles Petitioner/Respondent and Cross-Complainant/Cross-Defendant.
-_CASE_TITLE_RE = re.compile(
-    r"^(?P<plaintiff>.+?),?\s*\n\s*(?:Plaintiff|Petitioner|Cross-Complainant)\(?s?\)?,?"
-    r"\s+vs\.\s+"
-    r"(?P<defendant>.+?),?\s*\n\s*(?:Defendant|Respondent|Cross-Defendant)\(?s?\)?\.?",
-    re.DOTALL | re.MULTILINE,
+# Matches the formal party caption block in LA ruling text.
+#
+# The caption block follows a specific pattern:
+#   PARTY_NAME,\n  Plaintiff(s),\n  vs.\n  PARTY_NAME,\n  Defendant(s).
+#
+# Key distinction from body text: in the caption, "Plaintiff" appears as a
+# standalone role designation (followed by comma/period/paren/newline), NOT
+# as part of a sentence like "Plaintiff's motion..." or "Plaintiff filed...".
+#
+# The regex requires:
+# 1. A party role keyword (Plaintiff/Petitioner/Cross-Complainant) preceded
+#    by a comma or newline (not by a word character — avoids mid-sentence hits)
+# 2. Followed by "vs." or "v." on the same or next line
+# 3. Followed by another party role keyword (Defendant/Respondent/Cross-Defendant)
+#
+# We use a single regex that matches the entire caption block from the
+# plaintiff role through the defendant role, then extract names from the
+# text immediately before and between those markers.
+
+# Find the caption Plaintiff/Defendant role designations that appear at the
+# start of a line (with optional whitespace).  This distinguishes caption
+# markers from body text like "Plaintiff's motion..." which appears mid-line.
+# Match Plaintiff/Defendant role keywords that appear as standalone
+# designations — either at the start of a line or after a comma.
+# The negative lookahead (?![\w']) excludes possessives ("Plaintiff's")
+# and mid-word hits.
+# Caption role designations appear on their own line, followed by comma,
+# period, paren, or newline — never followed by a space and a name
+# (which would indicate body text like "Plaintiff Smith filed...").
+_P_ROLE_RE = re.compile(
+    r"(?:^|\n)\s*(?:Plaintiff|Petitioner|Cross-Complainant)\(?s?\)?\s*[,.\n)]",
+    re.MULTILINE,
+)
+_D_ROLE_RE = re.compile(
+    r"(?:^|\n)\s*(?:Defendant|Respondent|Cross-Defendant)\(?s?\)?\s*[,.\n)]",
+    re.MULTILINE,
+)
+# Also match inline format: ", Plaintiff(s), vs."
+_P_ROLE_INLINE_RE = re.compile(
+    r",\s*(?:Plaintiff|Petitioner|Cross-Complainant)\(?s?\)?\s*,",
+)
+_D_ROLE_INLINE_RE = re.compile(
+    r",\s*(?:Defendant|Respondent|Cross-Defendant)\(?s?\)?[,.]",
+)
+_VS_RE = re.compile(r"\bv(?:s)?\.", re.IGNORECASE)
+
+# Descriptors that follow a party name and should be stripped.
+_DESCRIPTOR_RE = re.compile(
+    r",?\s*(?:an individual|a (?:public|private|California|Delaware)"
+    r"[\w\s,]*?(?:entity|company|corporation|trust|llc|inc\.?))"
+    r"[\s,]*$",
+    re.IGNORECASE,
 )
 
-# Fallback: single-line pattern for text that has been flattened or
-# doesn't have newlines before the party designations. Matches e.g.:
-#   "EMELITA BUENAVENTURA, Plaintiff(s), vs. CITY OF PASADENA, Defendant(s)."
-_CASE_TITLE_FLAT_RE = re.compile(
-    r"(?P<plaintiff>[A-Z][A-Z\s,.'()-]+?),?\s*"
-    r"(?:Plaintiff|Petitioner|Cross-Complainant)\(?s?\)?,?\s+"
-    r"vs\.\s+"
-    r"(?P<defendant>[A-Z][A-Z\s,.'()-]+?),?\s*"
-    r"(?:Defendant|Respondent|Cross-Defendant)\(?s?\)?\.?",
-    re.DOTALL,
-)
+
+def _clean_party_name(raw: str) -> str:
+    """Normalise a captured party name: collapse whitespace, strip trailing
+    commas/et al, remove descriptors like 'an individual', and title-case."""
+    name = " ".join(raw.split()).strip()
+    # Strip descriptors like ", an individual" or ", a public entity"
+    name = _DESCRIPTOR_RE.sub("", name).strip().rstrip(",").strip()
+    # Strip "et al." suffix
+    name = re.sub(r",?\s*et\s+al\.?\s*$", "", name, flags=re.IGNORECASE).strip()
+    # Remove stray leading/trailing punctuation
+    name = name.strip(")(,.; ")
+    return name
 
 
 def extract_case_title(ruling_text: str) -> str | None:
-    """Extract a case title from ruling text using regex.
+    """Extract a case title from ruling text.
 
-    Returns a title like "Buenaventura v. City Of Pasadena" or None if
-    no party caption block is found.
+    Finds the Plaintiff → vs./v. → Defendant caption block and returns a title
+    like "Buenaventura v. City Of Pasadena", or None if no caption is found.
+
+    The function looks for line-anchored Plaintiff/Defendant keywords (which
+    distinguish the caption block from body text), then extracts names from
+    the surrounding text.
     """
-    m = _CASE_TITLE_RE.search(ruling_text)
-    if m is None:
-        m = _CASE_TITLE_FLAT_RE.search(ruling_text)
-    if m is None:
+    # Step 1: find "Plaintiff" as a standalone role designation.
+    # Try line-anchored first (most reliable), then inline format.
+    p_match = _P_ROLE_RE.search(ruling_text)
+    if p_match is None:
+        p_match = _P_ROLE_INLINE_RE.search(ruling_text)
+    if p_match is None:
         return None
 
-    plaintiff = " ".join(m.group("plaintiff").split()).strip().rstrip(",")
-    defendant = " ".join(m.group("defendant").split()).strip().rstrip(",")
+    # Step 2: find "vs." or "v." after the plaintiff role.
+    # In the caption, "vs." appears within ~30 chars of "Plaintiff".
+    # A large gap means the vs. is in body text, not the caption.
+    vs_match = _VS_RE.search(ruling_text, p_match.end())
+    if vs_match is None:
+        return None
+    if vs_match.start() - p_match.end() > 30:
+        return None
+
+    # Step 3: find "Defendant" after vs.
+    # Similarly, the defendant name + role should be within ~300 chars of vs.
+    d_match = _D_ROLE_RE.search(ruling_text, vs_match.end())
+    if d_match is None:
+        d_match = _D_ROLE_INLINE_RE.search(ruling_text, vs_match.end())
+    if d_match is None:
+        return None
+    if d_match.start() - vs_match.end() > 300:
+        return None
+
+    # Step 4: extract plaintiff name — text before the Plaintiff line.
+    # Look back up to 300 chars and take lines that look like names.
+    search_start = max(0, p_match.start() - 300)
+    plaintiff_raw = ruling_text[search_start : p_match.start()]
+    lines = plaintiff_raw.split("\n")
+
+    name_lines: list[str] = []
+    for line in reversed(lines):
+        stripped = line.strip()
+        if not stripped or stripped == ",":
+            if name_lines:
+                break
+            continue
+        upper = stripped.upper()
+        # Stop at structural header lines
+        if (
+            upper in ("DISTRICT", "CALIFORNIA", "DEPARTMENT")
+            or upper.startswith("SUPERIOR COURT")
+            or upper.startswith("FOR THE")
+            or upper.startswith("COUNTY OF")
+        ):
+            break
+        # Stop at single-char/number lines (department designators like "V", "3")
+        if len(stripped) <= 2 and not stripped.endswith(","):
+            break
+        # Limit to 4 lines max — party names don't span more than that
+        if len(name_lines) >= 4:
+            break
+        name_lines.append(stripped)
+
+    if not name_lines:
+        return None
+
+    name_lines.reverse()
+    plaintiff = " ".join(name_lines)
+
+    # Step 5: extract defendant name — text between vs. and Defendant line
+    defendant_raw = ruling_text[vs_match.end() : d_match.start()]
+
+    plaintiff = _clean_party_name(plaintiff)
+    defendant = _clean_party_name(defendant_raw)
 
     if not plaintiff or not defendant:
         return None
 
-    return f"{plaintiff.title()} v. {defendant.title()}"
+    title = f"{plaintiff.title()} v. {defendant.title()}"
+
+    # Sanity check: reject obviously wrong extractions.
+    # Real case titles are under ~120 chars; anything longer is body text.
+    if len(title) > 150:
+        return None
+
+    return title
 
 
 # ---------------------------------------------------------------------------

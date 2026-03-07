@@ -111,6 +111,64 @@ class TestExtractCaseTitle:
         assert "Buenaventura" in result
         assert "City Of Pasadena" in result
 
+    def test_real_la_format_with_full_header(self) -> None:
+        """Real LA ruling format with newlines inside party names."""
+        text = (
+            "DEPARTMENT 3 LAW AND MOTION RULINGS\n"
+            "Case Number:\n"
+            "22STCV29629\n"
+            "Hearing Date:\n"
+            "March 5, 2026\n"
+            "Dept:\n"
+            "3\n"
+            "SUPERIOR COURT OF THE STATE OF\n"
+            "CALIFORNIA\n"
+            "FOR THE COUNTY OF LOS ANGELES - NORTHEAST\n"
+            "DISTRICT\n"
+            "EMELITA\n"
+            "   BUENAVENTURA\n"
+            ",\n"
+            "Plaintiff(s),\n"
+            "vs.\n"
+            "CITY OF\n"
+            "   PASADENA\n"
+            ",\n"
+            "Defendant(s).\n"
+            ")\n"
+        )
+        result = backfill.extract_case_title(text)
+        assert result is not None
+        # Must NOT include the header text
+        assert "Department" not in result
+        assert "Superior Court" not in result.lower()
+        assert "Buenaventura" in result
+        assert "Pasadena" in result
+        assert " v. " in result
+
+    def test_real_la_mixed_case_with_descriptor(self) -> None:
+        """Mixed case names with descriptors like 'an individual'."""
+        text = (
+            "DISTRICT\n"
+            "KRISTI BERTRAM, an individual,\n"
+            "Plaintiff,\n"
+            "vs.\n"
+            "CITY OF LOS ANGELES, a\n"
+            "  public entity; STATE OF CALIFORNIA, a public entity,\n"
+            "Defendants.\n"
+        )
+        result = backfill.extract_case_title(text)
+        assert result is not None
+        assert "Bertram" in result
+        assert " v. " in result
+
+    def test_v_without_s(self) -> None:
+        """Handle 'v.' (not 'vs.') as separator."""
+        text = "MAYA KADOSH\n,\nPlaintiff\n,\nv.\nMOUSSA MASJEDI\n,\nDefendant\n"
+        result = backfill.extract_case_title(text)
+        assert result is not None
+        assert "Kadosh" in result
+        assert "Masjedi" in result
+
 
 # ---------------------------------------------------------------------------
 # backfill_batch tests
