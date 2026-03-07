@@ -249,6 +249,112 @@ def test_extract_case_title_returns_none_without_parties_anchor() -> None:
 
 
 # ---------------------------------------------------------------------------
+# _extract_case_title — MOVING PARTY / RESPONDING PARTY pattern (fallback)
+# ---------------------------------------------------------------------------
+
+
+def test_extract_case_title_moving_responding_fallback() -> None:
+    """When no Parties anchor exists, extract from MOVING/RESPONDING PARTY fields."""
+    from bs4 import BeautifulSoup
+
+    html = (
+        "<div id='speechSynthesis'>"
+        "<p>MOVING PARTY: Defendant Rayne Dealership Corporation.</p>"
+        "<p>RESPONDING PARTY: Plaintiffs Alpha Beta and Gamma Delta.</p>"
+        "<p>The motion is DENIED.</p>"
+        "</div>"
+    )
+    soup = BeautifulSoup(html, "lxml")
+    content = soup.find("div", id="speechSynthesis")
+    title = _extract_case_title(content)
+    assert title is not None
+    assert "Rayne Dealership Corporation" in title
+    assert "Alpha Beta" in title
+    assert " v. " in title
+    # Role prefixes should be stripped
+    assert "Defendant" not in title
+    assert "Plaintiffs" not in title
+
+
+def test_extract_case_title_moving_party_no_opposition() -> None:
+    """No opposition filed should not produce a title."""
+    from bs4 import BeautifulSoup
+
+    html = (
+        "<div id='speechSynthesis'>"
+        "<p>MOVING PARTY: Defendant Big Corp.</p>"
+        "<p>RESPONDING PARTY: No opposition filed.</p>"
+        "</div>"
+    )
+    soup = BeautifulSoup(html, "lxml")
+    content = soup.find("div", id="speechSynthesis")
+    assert _extract_case_title(content) is None
+
+
+def test_extract_case_title_from_cha_f46_fixture() -> None:
+    """CHA F46 fixture has MOVING PARTY but RESPONDING is 'No opposition filed'."""
+    from bs4 import BeautifulSoup
+
+    html = _load("la_ruling_cha_f46.html")
+    soup = BeautifulSoup(html, "lxml")
+    content = soup.find("div", id="speechSynthesis")
+    # This fixture has "No opposition filed" so title should be None
+    # (or from another pattern if present)
+    _extract_case_title(content)
+    # We just verify it doesn't crash — the fixture has
+    # "No opposition filed" as the responding party
+
+
+def test_extract_case_title_from_com_a_fixture() -> None:
+    """COM A fixture has both Parties anchor AND MOVING/RESPONDING PARTY fields."""
+    from bs4 import BeautifulSoup
+
+    html = _load("la_ruling_com_a.html")
+    soup = BeautifulSoup(html, "lxml")
+    content = soup.find("div", id="speechSynthesis")
+    title = _extract_case_title(content)
+    assert title is not None
+    # The Parties anchor should take precedence
+    assert " v. " in title
+
+
+# ---------------------------------------------------------------------------
+# _extract_case_title — Case Name field pattern (fallback)
+# ---------------------------------------------------------------------------
+
+
+def test_extract_case_title_case_name_field() -> None:
+    """Extract from inline 'CASE NAME:' field when no Parties anchor."""
+    from bs4 import BeautifulSoup
+
+    html = (
+        "<div id='speechSynthesis'>"
+        "<p>CASE NAME: Porsche Leasing Ltd. et al. v. Tsisana Mikia, et al. "
+        "CASE NUMBER: 25SMCV01132</p>"
+        "</div>"
+    )
+    soup = BeautifulSoup(html, "lxml")
+    content = soup.find("div", id="speechSynthesis")
+    title = _extract_case_title(content)
+    assert title is not None
+    assert "Porsche" in title
+    assert "Mikia" in title
+
+
+def test_extract_case_title_from_bh205_fixture() -> None:
+    """BH 205 fixture has a CASE NAME field with party names."""
+    from bs4 import BeautifulSoup
+
+    html = _load("la_ruling_bh205.html")
+    soup = BeautifulSoup(html, "lxml")
+    content = soup.find("div", id="speechSynthesis")
+    title = _extract_case_title(content)
+    assert title is not None
+    assert "Porsche" in title or "Mikia" in title
+    assert "v." in title
+
+
+# ---------------------------------------------------------------------------
 # Full scraper run — mocked HTTP using real fixture content
 # ---------------------------------------------------------------------------
 

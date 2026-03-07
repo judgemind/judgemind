@@ -171,6 +171,140 @@ class TestExtractCaseTitle:
 
 
 # ---------------------------------------------------------------------------
+# MOVING PARTY / RESPONDING PARTY pattern tests
+# ---------------------------------------------------------------------------
+
+
+class TestExtractFromMovingResponding:
+    """Tests for the MOVING PARTY / RESPONDING PARTY extraction pattern."""
+
+    def test_basic_moving_responding(self) -> None:
+        """Extract title from MOVING PARTY + RESPONDING PARTY fields."""
+        text = (
+            "MOVING PARTY: Defendant Acme Corporation.\n"
+            "RESPONDING PARTY: Plaintiff John Smith.\n"
+            "The motion is GRANTED.\n"
+        )
+        result = backfill.extract_case_title(text)
+        assert result is not None
+        assert "Acme Corporation" in result
+        assert "John Smith" in result
+        assert " v. " in result
+
+    def test_strips_role_prefix_defendant(self) -> None:
+        """Role prefix 'Defendant' is stripped from party names."""
+        text = (
+            "MOVING PARTY: Defendant Rayne Dealership Corporation.\n"
+            "RESPONDING PARTY: Plaintiff Jane Doe.\n"
+        )
+        result = backfill.extract_case_title(text)
+        assert result is not None
+        assert "Rayne Dealership Corporation" in result
+        assert "Defendant" not in result
+        assert "Plaintiff" not in result
+
+    def test_strips_role_prefix_plaintiffs(self) -> None:
+        """Role prefix 'Plaintiffs' (plural) is stripped."""
+        text = (
+            "MOVING PARTY: Defendants Ashley Willowbrook LP and Ashley Willowbrook GP LP.\n"
+            "RESPONDING PARTY: Plaintiffs David Keichline, Claudia Lopez, and Mason Keichline.\n"
+        )
+        result = backfill.extract_case_title(text)
+        assert result is not None
+        assert "Ashley Willowbrook" in result
+        assert "David Keichline" in result
+        assert "Defendants" not in result
+        assert "Plaintiffs" not in result
+
+    def test_no_opposition_returns_none(self) -> None:
+        """When responding party is 'No opposition filed', return None."""
+        text = (
+            "MOVING PARTY: Defendant Rayne Dealership Corporation.\n"
+            "RESPONDING PARTY: No opposition filed.\n"
+        )
+        result = backfill.extract_case_title(text)
+        # No opposing party means we can't construct a vs. title.
+        # The caption block fallback might still work, but with just
+        # MOVING/RESPONDING fields and no caption, we return None.
+        assert result is None
+
+    def test_opposing_party_keyword(self) -> None:
+        """OPPOSING PARTY works the same as RESPONDING PARTY."""
+        text = "MOVING PARTY: Defendant Big Corp.\nOPPOSING PARTY: Plaintiff Small LLC.\n"
+        result = backfill.extract_case_title(text)
+        assert result is not None
+        assert "Big Corp" in result
+        assert "Small Llc" in result
+
+    def test_moving_party_embedded_in_ruling(self) -> None:
+        """MOVING/RESPONDING PARTY fields work when surrounded by other text."""
+        text = (
+            "DEPARTMENT F46 LAW AND MOTION RULINGS\n"
+            "Case Number: 21CHCV00539\n"
+            "Hearing Date: March 2, 2026\n\n"
+            "MOVING PARTY: Defendant Rayne Dealership Corporation.\n"
+            "RESPONDING PARTY: Plaintiffs Alpha Beta and Gamma Delta.\n\n"
+            "RELIEF REQUESTED: Motion for summary judgment.\n"
+            "The motion is DENIED.\n"
+        )
+        result = backfill.extract_case_title(text)
+        assert result is not None
+        assert "Rayne Dealership Corporation" in result
+        assert "Alpha Beta" in result
+
+
+# ---------------------------------------------------------------------------
+# Case Name / Case Title field pattern tests
+# ---------------------------------------------------------------------------
+
+
+class TestExtractFromCaseNameField:
+    """Tests for the Case Name / Case Title inline field extraction."""
+
+    def test_case_name_field(self) -> None:
+        """Extract title from 'CASE NAME:' field."""
+        text = (
+            "CASE NAME: Porsche Leasing Ltd. et al. v. Tsisana Mikia, et al. "
+            "CASE NUMBER: 25SMCV01132\n"
+        )
+        result = backfill.extract_case_title(text)
+        assert result is not None
+        assert "Porsche" in result
+        assert "Mikia" in result
+        assert "v." in result
+
+    def test_case_title_field(self) -> None:
+        """Extract title from 'CASE TITLE:' field (alternate label)."""
+        text = "CASE TITLE: Smith Corp v. Jones Industries CASE NUMBER: 22SMCV01940\n"
+        result = backfill.extract_case_title(text)
+        assert result is not None
+        assert "Smith Corp" in result
+        assert "Jones Industries" in result
+
+    def test_case_name_without_v_returns_none(self) -> None:
+        """Case Name field without 'v.' is not a party title."""
+        text = "CASE NAME: Motion for Summary Judgment CASE NUMBER: 22STCV12345\n"
+        result = backfill.extract_case_title(text)
+        assert result is None
+
+    def test_caption_block_preferred_over_case_name(self) -> None:
+        """When both caption block and Case Name exist, caption block wins."""
+        text = (
+            "CASE NAME: Wrong Title v. Wrong Party CASE NUMBER: 12345\n"
+            "JOHN SMITH,\n"
+            "  Plaintiff(s),\n"
+            "  vs.\n"
+            "JANE DOE,\n"
+            "  Defendant(s).\n"
+        )
+        result = backfill.extract_case_title(text)
+        assert result is not None
+        # Caption block should win
+        assert "John Smith" in result
+        assert "Jane Doe" in result
+
+
+# ---------------------------------------------------------------------------
 # backfill_batch tests
 # ---------------------------------------------------------------------------
 
