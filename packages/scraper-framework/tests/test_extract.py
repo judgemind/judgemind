@@ -155,3 +155,83 @@ class TestExtractJudgeName:
     def test_sb_en_dash(self) -> None:
         text = "Department R17\u2013Judge Robert E. Lee\nSome text"
         assert extract_judge_name(text) == "Robert E. Lee"
+
+    # --- Case-insensitive "Judge of the Superior Court" ---
+
+    def test_la_uppercase_judge_of_superior_court(self) -> None:
+        """LA rulings sometimes have the signature in all-caps."""
+        text = "JARED D. MOSES\nJUDGE OF THE SUPERIOR COURT"
+        assert extract_judge_name(text) == "JARED D. MOSES"
+
+    def test_la_hon_prefix_with_judge_of_superior_court(self) -> None:
+        """LA fixture: 'Hon. Elizabeth L. Bradley Judge of the Superior Court'."""
+        text = "Hon. Elizabeth L. Bradley\nJudge of the Superior Court"
+        assert extract_judge_name(text) == "Hon. Elizabeth L. Bradley"
+
+    # --- JUDICIAL OFFICER pattern ---
+
+    def test_judicial_officer_colon(self) -> None:
+        """'JUDICIAL OFFICER: Name' pattern used by some courts."""
+        text = "JUDICIAL OFFICER: Maria L. Gonzalez\nDepartment 12"
+        assert extract_judge_name(text) == "Maria L. Gonzalez"
+
+    def test_judicial_officer_lowercase(self) -> None:
+        """Case-insensitive match for 'Judicial Officer:'."""
+        text = "Judicial Officer: Robert A. Dukes\nCourtroom 5"
+        assert extract_judge_name(text) == "Robert A. Dukes"
+
+    def test_judicial_officer_no_space_after_colon(self) -> None:
+        text = "JUDICIAL OFFICER:Michael T. Chang\nDept 7"
+        assert extract_judge_name(text) == "Michael T. Chang"
+
+    # --- Hon. / Honorable standalone pattern ---
+
+    def test_hon_dot_prefix(self) -> None:
+        """'Hon. Name' as a standalone prefix (no 'Judge of ...' suffix)."""
+        text = "Ruling by Hon. Sarah K. Park on the demurrer."
+        assert extract_judge_name(text) == "Sarah K. Park"
+
+    def test_honorable_prefix(self) -> None:
+        """'Honorable Name' as a standalone prefix."""
+        text = "The Honorable James R. Williams presiding."
+        assert extract_judge_name(text) == "James R. Williams"
+
+    def test_hon_no_dot(self) -> None:
+        """'Hon Name' without the period --- some courts omit the dot."""
+        text = "Heard before Hon Patricia M. Lee"
+        assert extract_judge_name(text) == "Patricia M. Lee"
+
+    def test_honorable_multiword_last_name(self) -> None:
+        """Names with hyphenated surnames."""
+        text = "Honorable Mary Anne Chen-Ramirez presiding"
+        assert extract_judge_name(text) == "Mary Anne Chen-Ramirez"
+
+    # --- Judge: Name / Judge Name in headers ---
+
+    def test_judge_colon_name(self) -> None:
+        """'Judge: Name' header format."""
+        text = "Judge: Thomas P. Kelly\nDepartment 5"
+        assert extract_judge_name(text) == "Thomas P. Kelly"
+
+    def test_judge_name_header(self) -> None:
+        """'Judge Name' without colon in a header."""
+        text = "Judge Lisa M. Torres\nCourtroom 3A"
+        assert extract_judge_name(text) == "Lisa M. Torres"
+
+    def test_judge_of_superior_court_not_double_matched(self) -> None:
+        """'Judge' pattern should NOT match 'Judge of the Superior Court'."""
+        text = "William A. Crowfoot Judge of the Superior Court"
+        # Should be matched by the first pattern, yielding the name correctly
+        assert extract_judge_name(text) == "William A. Crowfoot"
+
+    # --- Edge cases and false-positive prevention ---
+
+    def test_no_false_positive_on_judge_word_in_ruling(self) -> None:
+        """The word 'judge' in ruling body text should not trigger a match."""
+        text = "The judge granted the motion."
+        assert extract_judge_name(text) is None
+
+    def test_no_false_positive_on_judicial_notice(self) -> None:
+        """'judicial notice' should not trigger the JUDICIAL OFFICER pattern."""
+        text = "The court takes judicial notice of the following."
+        assert extract_judge_name(text) is None
