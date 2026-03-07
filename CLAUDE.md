@@ -94,7 +94,7 @@ The skill works autonomously from issue selection through PR and review request.
 
 **All commits must be made on the worktree branch created in Step 2, never directly on `main`.** Every change goes through a PR — no direct pushes to `main`, ever.
 
-Complete every substep in order. A task is not done until substep 4.10 is finished. Do not ask the user for confirmation during any of these steps.
+Complete every substep in order. A task is not done until substep 4.11 is finished. Do not ask the user for confirmation during any of these steps.
 
 #### 4.1 — Sync the worktree to latest main
 
@@ -183,7 +183,28 @@ All checks must show `SUCCESS` or `SKIPPED`. Any `FAILURE` goes to 4.7.
 - Comment on the issue linking the PR.
 - Add the `status/review` label to the issue.
 
-#### 4.10 — Remove your worktree
+#### 4.10 — Verify deployment (after merge, deployed services only)
+
+**This step applies only to PRs that change deployed code** (API, frontend, scrapers, infrastructure). Skip it for pure library, tooling, docs, or CI-only changes.
+
+After the PR is merged, verify the deploy pipeline succeeds and the fix is live:
+
+1. Identify the relevant deploy workflow based on which packages were modified:
+   - `packages/api/` or API routes -> `deploy-api.yml`
+   - `packages/scraper-framework/` or scraper code -> `deploy-scraper.yml`
+   - `packages/web/` or frontend -> `deploy-production.yml`
+   - `infra/terraform/` -> `terraform.yml`
+2. Watch the deploy workflow that triggers on the merge to `main`:
+   ```
+   gh run list --repo judgemind/judgemind --workflow "<deploy-workflow>.yml" --branch main --limit 1 --json databaseId -q '.[0].databaseId'
+   gh run watch <run-id> --repo judgemind/judgemind --exit-status --compact
+   ```
+3. If the deploy **fails**: file a new `priority/p1` issue describing the deploy failure, reference the merged PR, and add `agent/ready`. Do NOT consider the original task complete — comment on the original issue noting the deploy failure and linking the new issue.
+4. If the deploy **succeeds**: smoke-test the fix on the deployed environment where feasible (e.g., `curl` an API endpoint, check a page loads). This confirms the change is actually live, not just merged.
+
+Only proceed to 4.11 after deployment is verified (or the step is skipped for non-deployed changes).
+
+#### 4.11 — Remove your worktree
 
 The branch must stay (it backs the open PR), but the worktree directory is no longer needed. Run:
 
