@@ -81,8 +81,9 @@ After claiming the issue, create todos using `TaskCreate` to track your major wo
 5. "Verify no merge conflicts" — check mergeable status
 6. "Update PR test plan" — check off test plan items
 7. "Merge PR" — squash merge after CI is green
-8. "Retrospective" — identify workflow efficiencies and preventative measures
-9. "Remove worktree" — cleanup
+8. "Verify deployment" — watch deploy pipeline and smoke-test (deployed services only)
+9. "Retrospective" — identify workflow efficiencies and preventative measures
+10. "Remove worktree" — cleanup
 
 **For investigation tasks (Path B):**
 1. "Investigate and document findings"
@@ -176,7 +177,26 @@ gh pr merge <PR-N> --repo judgemind/judgemind --squash --delete-branch
 
 **Dependent issues will be unblocked automatically** by the `unblock-issues` workflow when the PR merges. No manual unblocking needed.
 
-#### A.8 — Proceed to retrospective
+#### A.8 — Verify deployment (deployed services only)
+
+**This step applies only to PRs that change deployed code** (API, frontend, scrapers, infrastructure). Skip it for pure library, tooling, docs, or CI-only changes.
+
+After the PR is merged, verify the deploy pipeline succeeds and the fix is live:
+
+1. Identify the relevant deploy workflow based on which packages were modified:
+   - `packages/api/` or API routes → `deploy-api.yml`
+   - `packages/scraper-framework/` or scraper code → `deploy-scraper.yml`
+   - `packages/web/` or frontend → `deploy-production.yml`
+   - `infra/terraform/` → `terraform.yml`
+2. Watch the deploy workflow that triggers on the merge to `main`:
+   ```
+   gh run list --repo judgemind/judgemind --workflow "<deploy-workflow>.yml" --branch main --limit 1 --json databaseId -q '.[0].databaseId'
+   gh run watch <run-id> --repo judgemind/judgemind --exit-status --compact
+   ```
+3. If the deploy **fails**: file a new `priority/p1` issue describing the deploy failure, reference the merged PR, and add `agent/ready`. Do NOT consider the original task complete — comment on the original issue noting the deploy failure and linking the new issue.
+4. If the deploy **succeeds**: smoke-test the fix on the deployed environment where feasible (e.g., `curl` an API endpoint, check a page loads).
+
+#### A.9 — Proceed to retrospective
 
 Continue to Step 5.
 
