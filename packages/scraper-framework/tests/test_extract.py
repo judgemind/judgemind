@@ -109,6 +109,92 @@ class TestExtractMotionType:
         text = "Motion for Summary Adjudication of Issues"
         assert extract_motion_type(text) == "msj_partial"
 
+    # --- New motion type patterns (issue #260) ---
+
+    def test_ex_parte_application(self) -> None:
+        text = "Ex Parte Application for Temporary Restraining Order"
+        assert extract_motion_type(text) == "ex_parte_application"
+
+    def test_ex_parte_application_lowercase(self) -> None:
+        text = "Plaintiff's ex parte application for order shortening time"
+        assert extract_motion_type(text) == "ex_parte_application"
+
+    def test_ex_parte_motion(self) -> None:
+        text = "Ex Parte Motion for Leave to File"
+        assert extract_motion_type(text) == "ex_parte_application"
+
+    def test_petition_writ_of_mandate(self) -> None:
+        text = "Petition for Writ of Mandate"
+        assert extract_motion_type(text) == "petition_writ_of_mandate"
+
+    def test_petition_writ_of_mandamus(self) -> None:
+        text = "Petition for Writ of Mandamus filed by Respondent"
+        assert extract_motion_type(text) == "petition_writ_of_mandate"
+
+    def test_petition_habeas_corpus(self) -> None:
+        text = "Petition for Writ of Habeas Corpus"
+        assert extract_motion_type(text) == "petition_habeas_corpus"
+
+    def test_petition_generic(self) -> None:
+        text = "Petition to Approve Minor's Compromise"
+        assert extract_motion_type(text) == "petition"
+
+    def test_petition_specific_writ_before_generic(self) -> None:
+        """Writ of mandate petition should match before generic petition."""
+        text = "Petition for Writ of Mandate is denied."
+        assert extract_motion_type(text) == "petition_writ_of_mandate"
+
+    def test_order_to_show_cause(self) -> None:
+        text = "Order to Show Cause re: Contempt"
+        assert extract_motion_type(text) == "osc"
+
+    def test_order_to_show_cause_lowercase(self) -> None:
+        text = "Hearing on order to show cause re contempt"
+        assert extract_motion_type(text) == "osc"
+
+    def test_motion_to_quash(self) -> None:
+        text = "Motion to Quash Service of Summons"
+        assert extract_motion_type(text) == "motion_to_quash"
+
+    def test_motion_to_quash_subpoena(self) -> None:
+        text = "Motion to Quash Deposition Subpoena"
+        assert extract_motion_type(text) == "motion_to_quash"
+
+    def test_motion_for_reconsideration(self) -> None:
+        text = "Motion for Reconsideration of the Court's Prior Ruling"
+        assert extract_motion_type(text) == "motion_for_reconsideration"
+
+    def test_motion_for_protective_order(self) -> None:
+        text = "Motion for Protective Order re: Trade Secrets"
+        assert extract_motion_type(text) == "motion_for_protective_order"
+
+    def test_motion_for_attorney_fees(self) -> None:
+        text = "Motion for Attorney Fees and Costs"
+        assert extract_motion_type(text) == "motion_for_attorney_fees"
+
+    def test_motion_for_attorneys_fees(self) -> None:
+        """Handle the possessive form 'attorney's fees'."""
+        text = "Motion for Attorney's Fees pursuant to CCP 1021.5"
+        assert extract_motion_type(text) == "motion_for_attorney_fees"
+
+    def test_motion_for_attorneys_fees_plural(self) -> None:
+        """Handle the plural possessive 'attorneys fees'."""
+        text = "Motion for Attorneys Fees"
+        assert extract_motion_type(text) == "motion_for_attorney_fees"
+
+    def test_motion_to_set_aside_default(self) -> None:
+        text = "Motion to Set Aside Default and Default Judgment"
+        assert extract_motion_type(text) == "motion_to_set_aside_default"
+
+    def test_motion_to_set_aside_the_default(self) -> None:
+        """Handle 'set aside the default' variant."""
+        text = "Motion to Set Aside the Default entered on January 5"
+        assert extract_motion_type(text) == "motion_to_set_aside_default"
+
+    def test_motion_to_vacate(self) -> None:
+        text = "Motion to Vacate Judgment"
+        assert extract_motion_type(text) == "motion_to_vacate"
+
 
 # ---------------------------------------------------------------------------
 # Judge name extraction

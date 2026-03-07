@@ -69,6 +69,64 @@ _MOTION_TYPE_PATTERNS: list[tuple[re.Pattern[str], str]] = [
         re.compile(r"\bpreliminary\s+injunction\b", re.IGNORECASE),
         "preliminary_injunction",
     ),
+    # --- New patterns added for issue #260 ---
+    (
+        re.compile(r"\bex\s+parte\s+application\b", re.IGNORECASE),
+        "ex_parte_application",
+    ),
+    (
+        re.compile(r"\bex\s+parte\s+motion\b", re.IGNORECASE),
+        "ex_parte_application",
+    ),
+    (
+        re.compile(
+            r"\bpetition\s+for\s+writ\s+of\s+(?:mandate|mandamus)\b",
+            re.IGNORECASE,
+        ),
+        "petition_writ_of_mandate",
+    ),
+    (
+        re.compile(
+            r"\bpetition\s+for\s+writ\s+of\s+habeas\s+corpus\b",
+            re.IGNORECASE,
+        ),
+        "petition_habeas_corpus",
+    ),
+    (
+        re.compile(r"\bpetition\b", re.IGNORECASE),
+        "petition",
+    ),
+    (
+        re.compile(r"\border\s+to\s+show\s+cause\b", re.IGNORECASE),
+        "osc",
+    ),
+    (
+        re.compile(r"\bmotion\s+to\s+quash\b", re.IGNORECASE),
+        "motion_to_quash",
+    ),
+    (
+        re.compile(r"\bmotion\s+for\s+reconsideration\b", re.IGNORECASE),
+        "motion_for_reconsideration",
+    ),
+    (
+        re.compile(r"\bmotion\s+for\s+protective\s+order\b", re.IGNORECASE),
+        "motion_for_protective_order",
+    ),
+    (
+        re.compile(r"\bmotion\s+for\s+attorney.?s?\s+fees\b", re.IGNORECASE),
+        "motion_for_attorney_fees",
+    ),
+    (
+        re.compile(
+            r"\bmotion\s+to\s+set\s+aside\s+(?:the\s+)?default\b",
+            re.IGNORECASE,
+        ),
+        "motion_to_set_aside_default",
+    ),
+    (
+        re.compile(r"\bmotion\s+to\s+vacate\b", re.IGNORECASE),
+        "motion_to_vacate",
+    ),
 ]
 
 
