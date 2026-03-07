@@ -3,6 +3,7 @@ import './globals.css';
 import { Header } from '@/components/layout/Header';
 import { Sidebar } from '@/components/layout/Sidebar';
 import { ApolloProvider } from '@/providers/ApolloProvider';
+import { AuthProvider } from '@/providers/AuthProvider';
 import { ThemeProvider } from '@/providers/ThemeProvider';
 
 export const metadata: Metadata = {
@@ -30,13 +31,15 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
       <body>
         <ThemeProvider>
           <ApolloProvider>
-            <div className="flex h-screen flex-col">
-              <Header />
-              <div className="flex flex-1 overflow-hidden">
-                <Sidebar />
-                <main className="flex-1 overflow-y-auto p-6">{children}</main>
+            <AuthProvider>
+              <div className="flex h-screen flex-col">
+                <Header />
+                <div className="flex flex-1 overflow-hidden">
+                  <Sidebar />
+                  <main className="flex-1 overflow-y-auto p-6">{children}</main>
+                </div>
               </div>
-            </div>
+            </AuthProvider>
           </ApolloProvider>
         </ThemeProvider>
       </body>
