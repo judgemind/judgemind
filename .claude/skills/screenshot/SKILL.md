@@ -11,21 +11,7 @@ Capture a screenshot of a page on `dev.judgemind.org` and display it. This lets 
 
 **Restriction:** Only `dev.judgemind.org` URLs are allowed. The script rejects any other host.
 
----
-
-## Setup (one-time per session)
-
-If playwright is not yet installed in the current environment, install it:
-
-```
-pip install playwright
-playwright install chromium
-```
-
-If working in a worktree with the scraper-framework venv, playwright is already available:
-```
-{worktree}/packages/scraper-framework/.venv/bin/playwright install chromium
-```
+**No setup required.** The script auto-bootstraps its own venv with playwright and chromium on first run. The venv lives at `~/.judgemind/tools-venv/` and is reused across sessions and worktrees.
 
 ---
 
