@@ -163,8 +163,12 @@ def extract_motion_type(ruling_text: str) -> str | None:
 # names from ruling text that was already stored in the database.
 
 _JUDGE_NAME_PATTERNS: list[re.Pattern[str]] = [
-    # LA: "William A. Crowfoot Judge of the Superior Court"
-    re.compile(r"([^\n]+?)\s+Judge of the Superior Court"),
+    # LA: "William A. Crowfoot Judge of the Superior Court" (now case-insensitive
+    # to also match "JARED D. MOSES JUDGE OF THE SUPERIOR COURT")
+    re.compile(
+        r"([^\n]+?)\s+Judge of the Superior Court",
+        re.IGNORECASE,
+    ),
     # SB: "Department S22 - Judge Bobby P. Luna"
     re.compile(
         r"Department\s+\S+?\s*[-\u2013\u2014]\s*Judge\s+(?P<judge_name>[^\n]+)",
@@ -178,6 +182,35 @@ _JUDGE_NAME_PATTERNS: list[re.Pattern[str]] = [
     re.compile(
         r"Department\s+\S+\s*-\s*Honorable\s+(?P<judge_name>[^\n]+)",
         re.IGNORECASE,
+    ),
+    # "JUDICIAL OFFICER: John A. Smith" — used by some LA and inland courts.
+    # Captures everything to end of line after the colon.
+    re.compile(
+        r"JUDICIAL\s+OFFICER\s*:\s*(?P<judge_name>[A-Za-z][^\n]+)",
+        re.IGNORECASE,
+    ),
+    # "Hon. John A. Smith" or "Honorable John A. Smith" (standalone, many courts).
+    # Requires first+last name minimum.  Uses literal spaces (not \s) so names
+    # do not span across newlines.  Supports hyphenated surnames.
+    re.compile(
+        r"\bHon(?:orable)?\.?[ ]+"
+        r"(?P<judge_name>"
+        r"[A-Z][a-z]+"  # first name
+        r"(?:[ ]+[A-Z][a-z.'\-]*)*"  # middle initials/names
+        r"[ ]+[A-Z][a-z]+(?:-[A-Z][a-z]+)*"  # last name (optionally hyphenated)
+        r")",
+    ),
+    # Standalone "Judge: Name" or "Judge Name" in headers.  Same name-shape
+    # constraints as "Hon." pattern.  Uses literal spaces to stay on one line.
+    re.compile(
+        r"(?<![a-zA-Z])"  # not preceded by a letter
+        r"Judge[:  ][ ]*"
+        r"(?P<judge_name>"
+        r"[A-Z][a-z]+"  # first name
+        r"(?:[ ]+[A-Z][a-z.'\-]*)*"  # middle initials/names
+        r"[ ]+[A-Z][a-z]+(?:-[A-Z][a-z]+)*"  # last name (optionally hyphenated)
+        r")"
+        r"(?![ ]+of\b)",  # exclude "Judge X of the Superior Court"
     ),
 ]
 
