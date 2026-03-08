@@ -5,6 +5,7 @@ import type { Loaders } from './dataloader';
 import type { AuthUser } from '../auth';
 import { authResolvers } from './auth-resolvers';
 import { searchRulings } from '../search/search-rulings';
+import { getJudgeAnalytics } from './judge-analytics';
 
 interface Context {
   pool: Pool;
@@ -155,6 +156,18 @@ export const resolvers = {
               : null,
         },
       };
+    },
+
+    // -----------------------------------------------------------------------
+    // judgeAnalytics
+    // -----------------------------------------------------------------------
+
+    judgeAnalytics: async (
+      _: unknown,
+      { judgeId }: { judgeId: string },
+      { pool }: Context,
+    ) => {
+      return getJudgeAnalytics(pool, judgeId);
     },
 
     // -----------------------------------------------------------------------

@@ -110,6 +110,40 @@ export const typeDefs = `#graphql
   }
 
   # ---------------------------------------------------------------------------
+  # Judge Analytics — grant/deny rates by motion type
+  # ---------------------------------------------------------------------------
+
+  """Count of rulings with a specific outcome for a judge."""
+  type OutcomeCount {
+    outcome: String!
+    count: Int!
+  }
+
+  """Aggregated statistics for a single motion type across a judge's rulings."""
+  type MotionStats {
+    motionType: String!
+    total: Int!
+    granted: Int!
+    denied: Int!
+    grantedInPart: Int!
+    other: Int!
+    """Grant rate: granted / (granted + denied + grantedInPart). Excludes procedural outcomes."""
+    grantRate: Float!
+  }
+
+  """Aggregated analytics for a single judge."""
+  type JudgeAnalytics {
+    judgeId: ID!
+    totalRulings: Int!
+    rulingsByOutcome: [OutcomeCount!]!
+    rulingsByMotionType: [MotionStats!]!
+    """ISO 8601 date of the earliest ruling."""
+    earliestRuling: String
+    """ISO 8601 date of the latest ruling."""
+    latestRuling: String
+  }
+
+  # ---------------------------------------------------------------------------
   # Search — full-text search over OpenSearch
   # ---------------------------------------------------------------------------
 
@@ -236,6 +270,10 @@ export const typeDefs = `#graphql
       """Opaque cursor from a previous response's pageInfo.endCursor."""
       after: String
     ): CaseConnection!
+
+    """Aggregated analytics for a judge: grant/deny rates by motion type, outcome distribution, and date range.
+    Returns null if the judge does not exist. Returns empty arrays if the judge has no classified rulings."""
+    judgeAnalytics(judgeId: ID!): JudgeAnalytics
 
     """Fetch a single judge by ID."""
     judge(id: ID!): Judge
