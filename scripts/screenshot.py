@@ -10,7 +10,7 @@ Usage:
     python3 scripts/screenshot.py /rulings --wait 5000
 
 The script auto-bootstraps its own venv with playwright and chromium on first
-run. No manual setup is required. The venv lives at ~/.judgemind/tools-venv/
+run. No manual setup is required. The venv lives at <repo-root>/.venv/
 and is reused across sessions and worktrees.
 """
 
@@ -23,7 +23,13 @@ from urllib.parse import urlparse
 
 ALLOWED_HOST = "dev.judgemind.org"
 BASE_URL = f"https://{ALLOWED_HOST}"
-TOOLS_VENV_DIR = Path.home() / ".judgemind" / "tools-venv"
+
+# Resolve repo root: this script lives at <repo-root>/scripts/screenshot.py.
+# For worktrees, git rev-parse --show-toplevel returns the worktree root, but
+# we want the main repo root so the venv is shared across all worktrees.
+_SCRIPT_DIR = Path(__file__).resolve().parent
+_REPO_ROOT = _SCRIPT_DIR.parent
+TOOLS_VENV_DIR = _REPO_ROOT / ".venv"
 
 
 def _get_venv_python() -> str:

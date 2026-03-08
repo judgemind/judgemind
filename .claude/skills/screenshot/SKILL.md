@@ -11,7 +11,7 @@ Capture a screenshot of a page on `dev.judgemind.org` and display it. This lets 
 
 **Restriction:** Only `dev.judgemind.org` URLs are allowed. The script rejects any other host.
 
-**No setup required.** The script auto-bootstraps its own venv with playwright and chromium on first run. The venv lives at `~/.judgemind/tools-venv/` and is reused across sessions and worktrees.
+**No setup required.** The script auto-bootstraps its own venv with playwright and chromium on first run. The venv lives at `<repo-root>/.venv/` and is reused across sessions and worktrees.
 
 ---
 
