@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from ingestion.extract import (
+    _looks_like_person_name,
     extract_case_number,
     extract_judge_name,
     extract_motion_type,
@@ -326,6 +327,141 @@ class TestExtractJudgeName:
         """'judicial notice' should not trigger the JUDICIAL OFFICER pattern."""
         text = "The court takes judicial notice of the following."
         assert extract_judge_name(text) is None
+
+    # --- Party name / organization false-positive prevention (#326) ---
+
+    def test_no_false_positive_heritage_medical_group(self) -> None:
+        """Party name 'Heritage Medical Group' must not be extracted as judge (#326)."""
+        text = "Heritage Medical Group Judge of the Superior Court ruling stands."
+        assert extract_judge_name(text) is None
+
+    def test_no_false_positive_heritage_medical_group_judge_colon(self) -> None:
+        """'Judge: Heritage Medical Group' must not extract the party name (#326)."""
+        text = "Judge: Heritage Medical Group\nCVPS2303018"
+        assert extract_judge_name(text) is None
+
+    def test_no_false_positive_bank_of_america(self) -> None:
+        """Bank names must not be extracted as judge names."""
+        text = "Bank of America, N.A. Judge of the Superior Court"
+        assert extract_judge_name(text) is None
+
+    def test_no_false_positive_llc(self) -> None:
+        """Company with LLC suffix must not be extracted as judge."""
+        text = "Department 5 - Honorable Acme Properties LLC"
+        assert extract_judge_name(text) is None
+
+    def test_no_false_positive_inc(self) -> None:
+        """Company with Inc suffix must not be extracted."""
+        text = "Legacy, Inc., A California Corporation Judge of the Superior Court"
+        assert extract_judge_name(text) is None
+
+    def test_no_false_positive_insurance_company(self) -> None:
+        """Insurance company name must not be extracted."""
+        text = "State Farm Insurance Judge of the Superior Court"
+        assert extract_judge_name(text) is None
+
+    def test_no_false_positive_vs_in_name(self) -> None:
+        """Case title with 'vs' leaked into judge field must be rejected."""
+        text = "SMITH vs JONES Judge of the Superior Court"
+        assert extract_judge_name(text) is None
+
+    def test_no_false_positive_v_dot_in_name(self) -> None:
+        """Case title with 'v.' leaked into judge field must be rejected."""
+        text = "Smith v. Jones Judge of the Superior Court"
+        assert extract_judge_name(text) is None
+
+    def test_no_false_positive_county_of(self) -> None:
+        """Government entity must not be extracted."""
+        text = "County of Riverside Judge of the Superior Court"
+        assert extract_judge_name(text) is None
+
+    def test_no_false_positive_california_corporation(self) -> None:
+        """Entity with 'A California' descriptor must not be extracted."""
+        text = "Department PS2 - Honorable Legacy Inc A California Corporation"
+        assert extract_judge_name(text) is None
+
+    def test_valid_judge_still_extracted_after_validation(self) -> None:
+        """Valid judge names must still be extracted with validation in place."""
+        text = "William A. Crowfoot Judge of the Superior Court"
+        assert extract_judge_name(text) == "William A. Crowfoot"
+
+    def test_valid_judge_hon_still_extracted(self) -> None:
+        """'Hon. Name' patterns must still work with validation."""
+        text = "Ruling by Hon. Sarah K. Park on the demurrer."
+        assert extract_judge_name(text) == "Sarah K. Park"
+
+    def test_no_false_positive_hospital(self) -> None:
+        """Hospital names must not be extracted."""
+        text = "JUDICIAL OFFICER: Desert Regional Hospital"
+        assert extract_judge_name(text) is None
+
+    def test_no_false_positive_school_district(self) -> None:
+        """School district must not be extracted."""
+        text = "Presiding: RIVERSIDE UNIFIED SCHOOL DISTRICT"
+        assert extract_judge_name(text) is None
+
+
+# ---------------------------------------------------------------------------
+# _looks_like_person_name validation
+# ---------------------------------------------------------------------------
+
+
+class TestLooksLikePersonName:
+    """Tests for the _looks_like_person_name helper (#326)."""
+
+    def test_valid_simple_name(self) -> None:
+        assert _looks_like_person_name("William A. Crowfoot") is True
+
+    def test_valid_hyphenated_name(self) -> None:
+        assert _looks_like_person_name("Mary Anne Chen-Ramirez") is True
+
+    def test_valid_short_name(self) -> None:
+        assert _looks_like_person_name("Jim Lee") is True
+
+    def test_reject_empty(self) -> None:
+        assert _looks_like_person_name("") is False
+
+    def test_reject_too_short(self) -> None:
+        assert _looks_like_person_name("AB") is False
+
+    def test_reject_too_long(self) -> None:
+        assert _looks_like_person_name("A" * 61) is False
+
+    def test_reject_llc(self) -> None:
+        assert _looks_like_person_name("Acme Properties LLC") is False
+
+    def test_reject_inc(self) -> None:
+        assert _looks_like_person_name("Legacy, Inc.") is False
+
+    def test_reject_medical(self) -> None:
+        assert _looks_like_person_name("Heritage Medical Group") is False
+
+    def test_reject_bank(self) -> None:
+        assert _looks_like_person_name("Bank of America, N.A.") is False
+
+    def test_reject_hospital(self) -> None:
+        assert _looks_like_person_name("Desert Regional Hospital") is False
+
+    def test_reject_vs(self) -> None:
+        assert _looks_like_person_name("SMITH vs JONES") is False
+
+    def test_reject_v_dot(self) -> None:
+        assert _looks_like_person_name("Smith v. Jones") is False
+
+    def test_reject_county_of(self) -> None:
+        assert _looks_like_person_name("County of Riverside") is False
+
+    def test_reject_california_corporation(self) -> None:
+        assert _looks_like_person_name("Legacy Inc A California Corporation") is False
+
+    def test_reject_dba(self) -> None:
+        assert _looks_like_person_name("John Smith DBA Smith Enterprises") is False
+
+    def test_reject_insurance(self) -> None:
+        assert _looks_like_person_name("State Farm Insurance") is False
+
+    def test_reject_school_district(self) -> None:
+        assert _looks_like_person_name("RIVERSIDE UNIFIED SCHOOL DISTRICT") is False
 
 
 # ---------------------------------------------------------------------------
