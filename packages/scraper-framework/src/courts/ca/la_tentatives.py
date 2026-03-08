@@ -50,6 +50,14 @@ _OPTION_TEXT_RE = re.compile(
 # Case numbers in ruling text: "Case Number:24NNCV02551" (no space)
 _CASE_NUMBER_RE = re.compile(r"Case Number:\s*(\w+)")
 
+# Split boundary: <HR> (optionally with attributes) followed by a Case Number header.
+# Matches the boundary *between* cases inside the speechSynthesis div.
+# Uses a lookahead so the Case Number header stays in the second segment.
+_CASE_SPLIT_RE = re.compile(
+    r"<HR[^>]*>\s*(?:<P>)?\s*(?=<B>\s*Case Number:\s*</B>)",
+    re.IGNORECASE,
+)
+
 # Judge name: "<div>William A. Crowfoot Judge of the Superior Court</div>"
 _JUDGE_DIV_RE = re.compile(r"(.+?)\s+Judge of the Superior Court", re.DOTALL)
 
@@ -152,22 +160,25 @@ class LATentativeRulingsScraper(BaseScraper):
                             context="stale_viewstate",
                         )
                         continue
-                    doc = self._make_base_doc(
-                        source_url=CIVIL_URL,
-                        raw_content=ruling_html.encode("utf-8"),
-                        content_format=ContentFormat.HTML,
-                    )
-                    doc.courthouse = opt.courthouse
-                    doc.department = opt.department
-                    doc.hearing_date = opt.hearing_date
-                    doc.extra["courthouse_code"] = opt.courthouse_code
-                    doc.extra["dropdown_value"] = opt.value
-                    docs.append(doc)
+                    case_htmls = _split_cases_html(ruling_html)
+                    for case_html in case_htmls:
+                        doc = self._make_base_doc(
+                            source_url=CIVIL_URL,
+                            raw_content=case_html.encode("utf-8"),
+                            content_format=ContentFormat.HTML,
+                        )
+                        doc.courthouse = opt.courthouse
+                        doc.department = opt.department
+                        doc.hearing_date = opt.hearing_date
+                        doc.extra["courthouse_code"] = opt.courthouse_code
+                        doc.extra["dropdown_value"] = opt.value
+                        docs.append(doc)
                     self._log.debug(
                         "Fetched ruling",
                         courthouse=opt.courthouse,
                         dept=opt.department,
                         date=str(opt.hearing_date),
+                        cases=len(case_htmls),
                     )
                 except Exception as exc:
                     self._log.error(
@@ -293,11 +304,59 @@ def _is_stale_viewstate_response(html: str) -> bool:
     return _LA_ERROR_MARKER in html
 
 
-def _extract_ruling_fields(soup: BeautifulSoup, doc: CapturedDocument) -> None:
-    """Extract structured fields from the ruling response HTML.
+def _split_cases_html(ruling_html: str) -> list[str]:
+    """Split a department response HTML into per-case HTML sections.
 
-    The ruling content lives in div#speechSynthesis.
-    A single response may contain rulings for multiple cases.
+    A single department response may contain rulings for multiple cases.
+    Each case section is preceded by a ``<HR>`` tag and a
+    ``<B> Case Number: </B>`` header.
+
+    Returns a list of HTML strings, each wrapped in a
+    ``<div id="speechSynthesis">`` so downstream parsing works unchanged.
+    If only one case is present, returns a single-element list containing
+    the original HTML unmodified.
+    """
+    soup = BeautifulSoup(ruling_html, "lxml")
+    speech_div = soup.find("div", id="speechSynthesis")
+    if speech_div is None:
+        return [ruling_html]
+
+    inner_html = speech_div.decode_contents()
+
+    # Split on <HR> immediately before a Case Number header.
+    sections = _CASE_SPLIT_RE.split(inner_html)
+
+    # Filter out empty/whitespace-only sections and the department header
+    # that appears before the first case number.
+    result: list[str] = []
+    for section in sections:
+        stripped = section.strip()
+        if not stripped:
+            continue
+        # A section is valid only if it contains a Case Number header.
+        # Check against plain text since the HTML may have tags between
+        # "Case Number:" and the actual number.
+        section_text = BeautifulSoup(stripped, "lxml").get_text()
+        if not _CASE_NUMBER_RE.search(section_text):
+            continue
+        # Wrap each section back in the speechSynthesis div and a minimal
+        # HTML shell so BeautifulSoup parsing in _extract_ruling_fields works.
+        wrapped = f'<html><body><div id="speechSynthesis">{stripped}</div></body></html>'
+        result.append(wrapped)
+
+    # If splitting produced nothing (unexpected format), fall back to original
+    if not result:
+        return [ruling_html]
+
+    return result
+
+
+def _extract_ruling_fields(soup: BeautifulSoup, doc: CapturedDocument) -> None:
+    """Extract structured fields from a single-case ruling HTML.
+
+    The ruling content lives in div#speechSynthesis.  Multi-case department
+    responses are split into individual sections by ``_split_cases_html``
+    before this function is called, so each invocation handles exactly one case.
     """
     content = soup.find("div", id="speechSynthesis")
     if not content:

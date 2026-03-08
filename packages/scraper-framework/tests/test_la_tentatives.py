@@ -25,6 +25,7 @@ from courts.ca.la_tentatives import (
     _is_stale_viewstate_response,
     _parse_dropdown_options,
     _parse_option,
+    _split_cases_html,
     default_config,
 )
 from framework import ContentFormat
@@ -168,14 +169,30 @@ def test_extract_fields_case_number() -> None:
 
 
 def test_extract_fields_all_case_numbers() -> None:
+    """After splitting, each section has exactly one case number (no all_case_numbers)."""
     from bs4 import BeautifulSoup
 
-    doc = _make_ruling_doc()
-    soup = BeautifulSoup(doc.raw_content, "lxml")
-    _extract_ruling_fields(soup, doc)
-    # Real fixture has 2 cases in this dept response
-    assert "all_case_numbers" in doc.extra
-    assert "26NNCP00062" in doc.extra["all_case_numbers"]
+    html = _load("la_ruling_response.html")
+    sections = _split_cases_html(html)
+    assert len(sections) == 2
+
+    # Each section should have only one case number
+    for section in sections:
+        doc = CapturedDocument(
+            scraper_id="test",
+            state="CA",
+            county="Los Angeles",
+            court="Superior Court",
+            source_url=CIVIL_URL,
+            capture_timestamp=datetime(2026, 3, 2),
+            content_format=ContentFormat.HTML,
+            raw_content=section.encode("utf-8"),
+            content_hash="",
+        )
+        soup = BeautifulSoup(doc.raw_content, "lxml")
+        _extract_ruling_fields(soup, doc)
+        assert doc.case_number is not None
+        assert "all_case_numbers" not in doc.extra
 
 
 def test_extract_fields_judge_name() -> None:
@@ -207,6 +224,114 @@ def test_extract_fields_uses_speech_synthesis_div() -> None:
     _extract_ruling_fields(soup, doc)
     # Navigation text should not appear in ruling_text
     assert "Online Services" not in (doc.ruling_text or "")
+
+
+# ---------------------------------------------------------------------------
+# _split_cases_html — multi-case splitting
+# ---------------------------------------------------------------------------
+
+
+def test_split_cases_html_two_cases_from_fixture() -> None:
+    """The real fixture la_ruling_response.html has 2 cases; splitting should yield 2 sections."""
+    html = _load("la_ruling_response.html")
+    sections = _split_cases_html(html)
+    assert len(sections) == 2
+
+
+def test_split_cases_html_each_section_has_own_case_number() -> None:
+    """Each split section should contain exactly one case number."""
+    from bs4 import BeautifulSoup
+
+    html = _load("la_ruling_response.html")
+    sections = _split_cases_html(html)
+    assert len(sections) == 2
+
+    # First case
+    soup1 = BeautifulSoup(sections[0], "lxml")
+    text1 = soup1.get_text()
+    assert "24NNCV02551" in text1
+    assert "26NNCP00062" not in text1
+
+    # Second case
+    soup2 = BeautifulSoup(sections[1], "lxml")
+    text2 = soup2.get_text()
+    assert "26NNCP00062" in text2
+    assert "24NNCV02551" not in text2
+
+
+def test_split_cases_html_sections_have_speech_synthesis_div() -> None:
+    """Each split section should be wrapped in a div#speechSynthesis for parse compatibility."""
+    from bs4 import BeautifulSoup
+
+    html = _load("la_ruling_response.html")
+    sections = _split_cases_html(html)
+    for section in sections:
+        soup = BeautifulSoup(section, "lxml")
+        assert soup.find("div", id="speechSynthesis") is not None
+
+
+def test_split_cases_html_single_case_no_regression() -> None:
+    """A single-case response should return one section."""
+    html = _load("la_ruling_pas_p.html")
+    sections = _split_cases_html(html)
+    assert len(sections) >= 1
+
+
+def test_split_cases_html_no_speech_div_returns_original() -> None:
+    """HTML without div#speechSynthesis should return the original HTML."""
+    html = "<html><body><p>No rulings here.</p></body></html>"
+    sections = _split_cases_html(html)
+    assert len(sections) == 1
+    assert sections[0] == html
+
+
+def test_split_cases_per_case_field_extraction() -> None:
+    """After splitting, _extract_ruling_fields extracts correct fields for each case."""
+    from bs4 import BeautifulSoup
+
+    html = _load("la_ruling_response.html")
+    sections = _split_cases_html(html)
+    assert len(sections) == 2
+
+    # Case 1: Aasi v. Honda
+    doc1 = CapturedDocument(
+        scraper_id="test",
+        state="CA",
+        county="Los Angeles",
+        court="Superior Court",
+        source_url=CIVIL_URL,
+        capture_timestamp=datetime(2026, 3, 2),
+        content_format=ContentFormat.HTML,
+        raw_content=sections[0].encode("utf-8"),
+        content_hash="",
+    )
+    soup1 = BeautifulSoup(doc1.raw_content, "lxml")
+    _extract_ruling_fields(soup1, doc1)
+    assert doc1.case_number == "24NNCV02551"
+    assert doc1.judge_name is not None
+    assert "Crowfoot" in doc1.judge_name
+    assert doc1.case_title is not None
+    assert "Aasi" in doc1.case_title
+
+    # Case 2: Mic-Bry8
+    doc2 = CapturedDocument(
+        scraper_id="test",
+        state="CA",
+        county="Los Angeles",
+        court="Superior Court",
+        source_url=CIVIL_URL,
+        capture_timestamp=datetime(2026, 3, 2),
+        content_format=ContentFormat.HTML,
+        raw_content=sections[1].encode("utf-8"),
+        content_hash="",
+    )
+    soup2 = BeautifulSoup(doc2.raw_content, "lxml")
+    _extract_ruling_fields(soup2, doc2)
+    assert doc2.case_number == "26NNCP00062"
+    assert doc2.judge_name is not None
+    assert "Crowfoot" in doc2.judge_name
+    assert doc2.case_title is not None
+    assert "Mic-Bry8" in doc2.case_title or "Mic-bry8" in doc2.case_title.lower()
 
 
 # ---------------------------------------------------------------------------
@@ -375,7 +500,7 @@ def test_full_run_with_real_fixtures() -> None:
     health = scraper.run()
 
     assert health.success is True
-    assert health.records_captured == 97  # real fixture has 97 options
+    assert health.records_captured == 194  # 97 options x 2 cases per fixture
 
 
 @respx.mock
@@ -417,7 +542,7 @@ def test_run_continues_when_single_post_fails() -> None:
     health = scraper.run()
 
     assert health.success is True
-    assert health.records_captured == 96  # 97 options minus 1 failed
+    assert health.records_captured == 192  # (97 - 1 failed) x 2 cases per fixture
 
 
 def test_default_config() -> None:
@@ -505,7 +630,7 @@ def test_full_run_stale_viewstate_mixed_with_real() -> None:
     health = scraper.run()
 
     assert health.success is True
-    assert health.records_captured == 95  # 97 options - 2 stale-ViewState skips
+    assert health.records_captured == 190  # (97 - 2 stale skips) x 2 cases per fixture
 
 
 # ---------------------------------------------------------------------------
