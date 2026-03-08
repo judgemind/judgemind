@@ -1,0 +1,246 @@
+"""Tests for the dedup_rulings script (issue #302).
+
+All database interactions are mocked — these tests verify the SQL logic
+and batch processing without requiring a live database.
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+from unittest.mock import MagicMock, patch
+
+# Ensure the scripts directory is importable
+sys.path.insert(
+    0,
+    os.path.join(os.path.dirname(__file__), "..", "..", "..", "scripts"),
+)
+
+
+def _make_mock_conn() -> MagicMock:
+    """Return a mock psycopg connection with cursor context manager."""
+    mock_conn = MagicMock()
+    mock_cur = MagicMock()
+    mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cur)
+    mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+    return mock_conn, mock_cur
+
+
+def test_count_duplicates_returns_count() -> None:
+    """count_duplicates should return the count from the query."""
+    from dedup_rulings import count_duplicates
+
+    mock_conn, mock_cur = _make_mock_conn()
+    mock_cur.fetchone.return_value = (42,)
+
+    result = count_duplicates(mock_conn)
+
+    assert result == 42
+    mock_cur.execute.assert_called_once()
+    sql = str(mock_cur.execute.call_args)
+    assert "ROW_NUMBER" in sql
+    assert "rn > 1" in sql
+
+
+def test_count_duplicates_returns_zero_when_no_duplicates() -> None:
+    """count_duplicates should return 0 when there are no duplicates."""
+    from dedup_rulings import count_duplicates
+
+    mock_conn, mock_cur = _make_mock_conn()
+    mock_cur.fetchone.return_value = (0,)
+
+    result = count_duplicates(mock_conn)
+
+    assert result == 0
+
+
+def test_dedup_batch_deletes_duplicates() -> None:
+    """dedup_batch should delete duplicate rulings and orphaned documents."""
+    from dedup_rulings import dedup_batch
+
+    mock_conn = MagicMock()
+    cursors: list[MagicMock] = []
+
+    def make_cursor() -> MagicMock:
+        cur = MagicMock()
+        cursors.append(cur)
+        ctx = MagicMock()
+        ctx.__enter__ = MagicMock(return_value=cur)
+        ctx.__exit__ = MagicMock(return_value=False)
+        return ctx
+
+    mock_conn.cursor.side_effect = make_cursor
+
+    # First cursor: FIND_DUPLICATES_QUERY returns 2 duplicate rows
+    # Second cursor: DELETE FROM rulings
+    # Third cursor: DELETE FROM documents (orphans)
+
+    # We need to set up the cursors' return values after they're created
+    # Use a counter to track which cursor call we're on
+    call_count = [0]
+    original_side_effect = mock_conn.cursor.side_effect
+
+    def cursor_factory() -> MagicMock:
+        ctx = original_side_effect()
+        cur = cursors[-1]
+        idx = call_count[0]
+        call_count[0] += 1
+
+        if idx == 0:
+            # FIND_DUPLICATES_QUERY
+            cur.fetchall.return_value = [
+                ("ruling-uuid-2", "doc-uuid-2"),
+                ("ruling-uuid-3", "doc-uuid-3"),
+            ]
+        elif idx == 1:
+            # DELETE FROM rulings
+            cur.rowcount = 2
+        elif idx == 2:
+            # DELETE FROM documents (orphans)
+            cur.rowcount = 2
+        return ctx
+
+    mock_conn.cursor.side_effect = cursor_factory
+
+    stats = dedup_batch(mock_conn, batch_size=100, offset=0)
+
+    assert stats["rulings_deleted"] == 2
+    assert stats["documents_deleted"] == 2
+
+
+def test_dedup_batch_returns_zeros_when_no_duplicates() -> None:
+    """dedup_batch should return zero stats when no duplicates found."""
+    from dedup_rulings import dedup_batch
+
+    mock_conn, mock_cur = _make_mock_conn()
+    mock_cur.fetchall.return_value = []
+
+    stats = dedup_batch(mock_conn, batch_size=100, offset=0)
+
+    assert stats["rulings_deleted"] == 0
+    assert stats["documents_deleted"] == 0
+
+
+@patch("dedup_rulings.psycopg")
+def test_run_dedup_dry_run_rolls_back(mock_psycopg: MagicMock) -> None:
+    """In dry-run mode, run_dedup should rollback instead of commit."""
+    from dedup_rulings import run_dedup
+
+    mock_conn = MagicMock()
+    mock_conn.__enter__ = MagicMock(return_value=mock_conn)
+    mock_conn.__exit__ = MagicMock(return_value=False)
+    mock_psycopg.connect.return_value = mock_conn
+
+    cursors: list[MagicMock] = []
+    call_idx = [0]
+
+    def cursor_factory() -> MagicMock:
+        cur = MagicMock()
+        cursors.append(cur)
+        ctx = MagicMock()
+        ctx.__enter__ = MagicMock(return_value=cur)
+        ctx.__exit__ = MagicMock(return_value=False)
+
+        idx = call_idx[0]
+        call_idx[0] += 1
+
+        if idx == 0:
+            # count_duplicates
+            cur.fetchone.return_value = (3,)
+        elif idx == 1:
+            # FIND_DUPLICATES_QUERY
+            cur.fetchall.return_value = [
+                ("r1", "d1"),
+                ("r2", "d2"),
+                ("r3", "d3"),
+            ]
+        elif idx == 2:
+            # DELETE FROM rulings
+            cur.rowcount = 3
+        elif idx == 3:
+            # DELETE FROM documents
+            cur.rowcount = 3
+        return ctx
+
+    mock_conn.cursor.side_effect = cursor_factory
+
+    stats = run_dedup("postgresql://localhost/test", dry_run=True)
+
+    assert stats["total_rulings_deleted"] == 3
+    assert stats["total_documents_deleted"] == 3
+    # Should rollback, not commit
+    mock_conn.rollback.assert_called()
+    mock_conn.commit.assert_not_called()
+
+
+@patch("dedup_rulings.psycopg")
+def test_run_dedup_no_duplicates_exits_early(mock_psycopg: MagicMock) -> None:
+    """When no duplicates exist, run_dedup should exit without deleting."""
+    from dedup_rulings import run_dedup
+
+    mock_conn = MagicMock()
+    mock_conn.__enter__ = MagicMock(return_value=mock_conn)
+    mock_conn.__exit__ = MagicMock(return_value=False)
+    mock_psycopg.connect.return_value = mock_conn
+
+    mock_cur = MagicMock()
+    ctx = MagicMock()
+    ctx.__enter__ = MagicMock(return_value=mock_cur)
+    ctx.__exit__ = MagicMock(return_value=False)
+    mock_conn.cursor.return_value = ctx
+
+    # count_duplicates returns 0
+    mock_cur.fetchone.return_value = (0,)
+
+    stats = run_dedup("postgresql://localhost/test")
+
+    assert stats["total_rulings_deleted"] == 0
+    assert stats["total_documents_deleted"] == 0
+    mock_conn.commit.assert_not_called()
+
+
+@patch("dedup_rulings.psycopg")
+def test_run_dedup_commits_each_batch(mock_psycopg: MagicMock) -> None:
+    """In non-dry-run mode, each batch should be committed."""
+    from dedup_rulings import run_dedup
+
+    mock_conn = MagicMock()
+    mock_conn.__enter__ = MagicMock(return_value=mock_conn)
+    mock_conn.__exit__ = MagicMock(return_value=False)
+    mock_psycopg.connect.return_value = mock_conn
+
+    call_idx = [0]
+
+    def cursor_factory() -> MagicMock:
+        cur = MagicMock()
+        ctx = MagicMock()
+        ctx.__enter__ = MagicMock(return_value=cur)
+        ctx.__exit__ = MagicMock(return_value=False)
+
+        idx = call_idx[0]
+        call_idx[0] += 1
+
+        if idx == 0:
+            # count_duplicates
+            cur.fetchone.return_value = (2,)
+        elif idx == 1:
+            # First batch: FIND_DUPLICATES_QUERY
+            cur.fetchall.return_value = [("r1", "d1"), ("r2", "d2")]
+        elif idx == 2:
+            # DELETE FROM rulings
+            cur.rowcount = 2
+        elif idx == 3:
+            # DELETE FROM documents
+            cur.rowcount = 1
+        elif idx == 4:
+            # Second batch: FIND_DUPLICATES_QUERY (no more duplicates)
+            cur.fetchall.return_value = []
+        return ctx
+
+    mock_conn.cursor.side_effect = cursor_factory
+
+    stats = run_dedup("postgresql://localhost/test", batch_size=10)
+
+    assert stats["total_rulings_deleted"] == 2
+    assert stats["total_documents_deleted"] == 1
+    mock_conn.commit.assert_called()

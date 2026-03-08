@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import uuid
 from datetime import datetime
 from unittest.mock import MagicMock
 
 from framework import BaseScraper, CapturedDocument, ContentFormat, ScraperConfig
+from framework.hashing import sha256_hex
 
 
 class DummyScraper(BaseScraper):
@@ -140,3 +142,91 @@ def test_run_continues_after_single_doc_failure() -> None:
 
     assert health.success is True
     assert health.records_captured == 1
+
+
+# ---------------------------------------------------------------------------
+# Deterministic document_id (#302 — duplicate ruling prevention)
+# ---------------------------------------------------------------------------
+
+
+def test_document_id_is_deterministic_for_same_content() -> None:
+    """Re-processing the same raw content should produce the same document_id.
+
+    This is the key property that prevents duplicate rulings: if the scraper
+    fetches the same page on two separate runs, the deterministic document_id
+    means insert_document hits ON CONFLICT DO NOTHING and insert_ruling's
+    WHERE NOT EXISTS check also skips the insert.
+    """
+    config = _make_config()
+    captured: list[CapturedDocument] = []
+
+    class CapturingScraper(DummyScraper):
+        def parse_document(self, d: CapturedDocument) -> CapturedDocument:
+            captured.append(d)
+            return d
+
+    content = b"<html>same content both times</html>"
+
+    # First run
+    doc1 = _make_doc(config)
+    doc1.raw_content = content
+    scraper1 = CapturingScraper(docs=[doc1], config=config)
+    scraper1.run()
+
+    # Second run — same content, different initial document_id
+    doc2 = _make_doc(config)
+    doc2.raw_content = content
+    scraper2 = CapturingScraper(docs=[doc2], config=config)
+    scraper2.run()
+
+    assert len(captured) == 2
+    # The two documents started with different random UUIDs but after
+    # _process_document both should have the same deterministic document_id.
+    assert captured[0].document_id == captured[1].document_id
+    # And it should be the expected uuid5 value
+    expected_hash = sha256_hex(content)
+    expected_id = str(uuid.uuid5(uuid.NAMESPACE_URL, expected_hash))
+    assert captured[0].document_id == expected_id
+
+
+def test_document_id_differs_for_different_content() -> None:
+    """Different raw content should produce different document_ids."""
+    config = _make_config()
+    captured: list[CapturedDocument] = []
+
+    class CapturingScraper(DummyScraper):
+        def parse_document(self, d: CapturedDocument) -> CapturedDocument:
+            captured.append(d)
+            return d
+
+    doc1 = _make_doc(config)
+    doc1.raw_content = b"<html>ruling A</html>"
+
+    doc2 = _make_doc(config)
+    doc2.raw_content = b"<html>ruling B</html>"
+
+    scraper = CapturingScraper(docs=[doc1, doc2], config=config)
+    scraper.run()
+
+    assert len(captured) == 2
+    assert captured[0].document_id != captured[1].document_id
+
+
+def test_document_id_is_valid_uuid() -> None:
+    """The deterministic document_id should be a valid UUID string."""
+    config = _make_config()
+    captured: list[CapturedDocument] = []
+
+    class CapturingScraper(DummyScraper):
+        def parse_document(self, d: CapturedDocument) -> CapturedDocument:
+            captured.append(d)
+            return d
+
+    doc = _make_doc(config)
+    scraper = CapturingScraper(docs=[doc], config=config)
+    scraper.run()
+
+    assert len(captured) == 1
+    # Should parse as a valid UUID without raising
+    parsed = uuid.UUID(captured[0].document_id)
+    assert parsed.version == 5
