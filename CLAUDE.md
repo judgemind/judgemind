@@ -403,6 +403,7 @@ Key paths:
 - Every captured document gets a SHA-256 content hash for version tracking.
 - Raw content is always archived to object storage before any processing.
 - Scraper configurations (URLs, selectors, schedules) are separate from scraper logic.
+- **Field extraction completeness is a hard requirement.** A scraper is not done until it correctly parses 100% of the structured fields present in the rulings obtained during development. Required fields: **judge name, motion type, case title, hearing date, outcome, parties**. If a field is present in the source data, the scraper must extract it — do not ship scrapers that leave extractable fields empty and rely on backfills later. Write regression tests against real fixtures for every field. "Unknown" / "Not classified" values are acceptable only when the source data genuinely does not contain the information.
 
 ## Infrastructure Code
 
