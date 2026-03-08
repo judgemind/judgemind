@@ -28,6 +28,8 @@ import structlog
 from bs4 import BeautifulSoup
 
 from framework import BaseScraper, CapturedDocument, ContentFormat, ScraperConfig
+from framework.events import EventBus
+from framework.storage import S3Archiver
 
 logger = structlog.get_logger(__name__)
 
@@ -133,6 +135,16 @@ class DropdownOption:
 class LATentativeRulingsScraper(BaseScraper):
     """Scrapes all published LA County civil tentative rulings via dropdown enumeration."""
 
+    def __init__(
+        self,
+        config: ScraperConfig,
+        archiver: S3Archiver | None = None,
+        event_bus: EventBus | None = None,
+        dept_judge_map: dict[str, str] | None = None,
+    ) -> None:
+        super().__init__(config, archiver=archiver, event_bus=event_bus)
+        self._dept_judge_map: dict[str, str] = dept_judge_map or {}
+
     def fetch_documents(self) -> list[CapturedDocument]:
         docs = []
         with httpx.Client(
@@ -195,6 +207,21 @@ class LATentativeRulingsScraper(BaseScraper):
             _extract_ruling_fields(soup, doc)
         except Exception as exc:
             self._log.warning("Parse error", error=str(exc))
+
+        # Fallback: if ruling text didn't contain a judge name, try the
+        # department-to-judge mapping from the judicial officer directory.
+        if doc.judge_name is None and doc.department and self._dept_judge_map:
+            from courts.ca.la_dept_judges import lookup_judge_for_department
+
+            mapped_name = lookup_judge_for_department(self._dept_judge_map, doc.department)
+            if mapped_name:
+                doc.judge_name = mapped_name
+                self._log.debug(
+                    "Judge name populated from department mapping",
+                    department=doc.department,
+                    judge_name=mapped_name,
+                )
+
         return doc
 
 
