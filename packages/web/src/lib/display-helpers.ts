@@ -1,11 +1,14 @@
-/** Build a human-readable heading from case data. */
+/** Build a human-readable heading from case data.
+ *  When a case title is available it is returned as the heading
+ *  (the case number should be shown separately as a subtitle).
+ *  Without a title the case number is the heading. */
 export function buildCaseHeading(
   caseData: { caseNumber: string; caseTitle: string | null } | null,
   fallbackId: string,
 ): string {
   if (!caseData) return `Case ${fallbackId}`;
   if (caseData.caseTitle) {
-    return `${caseData.caseTitle} \u2014 ${caseData.caseNumber}`;
+    return caseData.caseTitle;
   }
   return caseData.caseNumber;
 }

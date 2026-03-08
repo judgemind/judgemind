@@ -85,9 +85,11 @@ export default async function CaseDetailPage({ params }: Props) {
           )}
         </div>
       </div>
-      <p className="mt-1 text-sm text-slate-500 dark:text-slate-400">
-        {caseData.caseNumber}
-      </p>
+      {caseData.caseTitle && (
+        <p className="mt-1 text-sm text-slate-500 dark:text-slate-400">
+          {caseData.caseNumber}
+        </p>
+      )}
       {caseData.court && (
         <p className="mt-0.5 text-sm text-slate-500 dark:text-slate-400">
           {caseData.court.courtName} &middot; {caseData.court.county}
