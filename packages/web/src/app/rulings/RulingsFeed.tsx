@@ -271,7 +271,7 @@ export function RulingsFeed() {
               {node.case ? (
                 <Link
                   href={`/cases/${node.case.id}`}
-                  className="truncate font-medium text-slate-900 hover:text-brand-600 dark:text-slate-100 dark:hover:text-brand-400"
+                  className="block truncate font-medium text-slate-900 hover:text-brand-600 dark:text-slate-100 dark:hover:text-brand-400"
                 >
                   {node.case.caseNumber}
                   {node.case.caseTitle ? ` — ${node.case.caseTitle}` : ''}
