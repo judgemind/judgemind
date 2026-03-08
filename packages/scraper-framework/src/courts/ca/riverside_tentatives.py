@@ -118,6 +118,23 @@ _MOTION_TYPE_RE = re.compile(
 )
 
 
+_NO_TENTATIVE_RULINGS_RE = re.compile(
+    r"^\s*No\s+Tentative\s+Rulings?\b",
+    re.IGNORECASE,
+)
+
+
+def _is_no_tentative_rulings(text: str) -> bool:
+    """Return True if the PDF text is a 'No Tentative Rulings' boilerplate page.
+
+    Riverside publishes placeholder PDFs for departments with no rulings.
+    These pages start with 'No Tentative Rulings' followed by a date or
+    'for' and then standard boilerplate about court reporters. They should
+    not be ingested as actual ruling records.
+    """
+    return bool(_NO_TENTATIVE_RULINGS_RE.match(text))
+
+
 class SplitRuling:
     """A single ruling extracted from a multi-ruling PDF."""
 
@@ -477,6 +494,15 @@ class RiversideTentativeRulingsScraper(PdfLinkScraper):
             except Exception as exc:
                 logger.warning("PDF text extraction failed", error=str(exc))
                 split_docs.append(doc)
+                continue
+
+            # Skip "No Tentative Rulings" boilerplate pages (#318)
+            if _is_no_tentative_rulings(text):
+                logger.info(
+                    "Skipping 'No Tentative Rulings' boilerplate",
+                    department=doc.department,
+                    judge=doc.judge_name,
+                )
                 continue
 
             rulings = _split_rulings(text)
