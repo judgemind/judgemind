@@ -86,8 +86,8 @@ export default async function CaseDetailPage({ params }: Props) {
         </div>
       </div>
       {caseData.caseTitle && (
-        <p className="mt-1 text-sm text-slate-500 dark:text-slate-400">
-          {caseData.caseNumber}
+        <p className="mt-1 text-base text-slate-700 dark:text-slate-300">
+          {caseData.caseTitle}
         </p>
       )}
       {caseData.court && (
