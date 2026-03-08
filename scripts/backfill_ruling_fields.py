@@ -10,6 +10,11 @@ Usage:
         -e DATABASE_URL=judgemind/dev/db/connection:.url \
         -- packages/scraper-framework/.venv/bin/python3 scripts/backfill_ruling_fields.py
 
+Each batch is committed independently so that progress is saved
+incrementally.  If the connection drops mid-run, already-committed
+batches are preserved and the script can be safely re-run (it is
+idempotent — it only updates rows that still have NULL fields).
+
 Options:
     --dry-run       Print what would be updated without writing to the database.
     --batch-size N  Number of rulings to process per batch (default: 100).
@@ -144,12 +149,20 @@ def run_backfill(
             total_processed += processed
             total_updated += updated
 
+            # Commit (or rollback) after each batch so that progress is
+            # saved incrementally and not lost if the connection drops.
+            if dry_run:
+                conn.rollback()
+            else:
+                conn.commit()
+
             logger.info(
-                "Batch: processed=%d updated=%d (total: %d/%d)",
+                "Batch: processed=%d updated=%d (total: %d/%d)%s",
                 processed,
                 updated,
                 total_processed,
                 total_updated,
+                " [dry-run, rolled back]" if dry_run else " [committed]",
             )
 
             if processed < effective_batch:
@@ -157,13 +170,6 @@ def run_backfill(
                 break
 
             offset += effective_batch
-
-        if dry_run:
-            conn.rollback()
-            logger.info("DRY RUN — rolled back all changes")
-        else:
-            conn.commit()
-            logger.info("Committed all changes")
 
     stats = {
         "total_processed": total_processed,
