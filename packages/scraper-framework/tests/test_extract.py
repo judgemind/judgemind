@@ -327,6 +327,33 @@ class TestExtractJudgeName:
         text = "The court takes judicial notice of the following."
         assert extract_judge_name(text) is None
 
+    # --- Truncation regression tests (#327) ---
+
+    def test_la_full_name_not_truncated(self) -> None:
+        """Regression: extract_judge_name must return the complete name (#327).
+        'James I. Montgomery' was being stored as 'James I. Montgomer'."""
+        text = "James I. Montgomery Judge of the Superior Court"
+        result = extract_judge_name(text)
+        assert result == "James I. Montgomery"
+
+    def test_la_full_name_multiline_not_truncated(self) -> None:
+        """Multi-line ruling text: full name must be preserved."""
+        text = "The motion is GRANTED.\nJames I. Montgomery Judge of the Superior Court"
+        result = extract_judge_name(text)
+        assert result == "James I. Montgomery"
+
+    def test_long_judge_name_not_truncated(self) -> None:
+        """Very long judge name is extracted in full."""
+        text = "Christopher Michael Alexander Judge of the Superior Court"
+        result = extract_judge_name(text)
+        assert result == "Christopher Michael Alexander"
+
+    def test_name_with_suffix_not_truncated(self) -> None:
+        """Names with suffixes like III are fully extracted."""
+        text = "Arthur Hester III Judge of the Superior Court"
+        result = extract_judge_name(text)
+        assert result == "Arthur Hester III"
+
 
 # ---------------------------------------------------------------------------
 # Case number extraction
