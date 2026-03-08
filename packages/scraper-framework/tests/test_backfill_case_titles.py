@@ -389,7 +389,7 @@ class TestRunBackfill:
 
     @patch("backfill_case_titles.psycopg")
     @patch("backfill_case_titles.backfill_batch")
-    def test_dry_run_rolls_back(
+    def test_dry_run_rolls_back_per_batch(
         self,
         mock_batch: MagicMock,
         mock_psycopg: MagicMock,
@@ -398,20 +398,21 @@ class TestRunBackfill:
         mock_conn.__enter__ = MagicMock(return_value=mock_conn)
         mock_conn.__exit__ = MagicMock(return_value=False)
         mock_psycopg.connect.return_value = mock_conn
-        mock_batch.return_value = (5, 3)
 
-        mock_batch.side_effect = [(5, 3)]
+        # Two batches: first full, second partial (signals end)
+        mock_batch.side_effect = [(100, 80), (5, 3)]
 
         stats = backfill.run_backfill("postgresql://test", batch_size=100, dry_run=True)
 
-        mock_conn.rollback.assert_called_once()
+        # Rollback is called after each batch in dry-run mode
+        assert mock_conn.rollback.call_count == 2
         mock_conn.commit.assert_not_called()
-        assert stats["total_processed"] == 5
-        assert stats["total_updated"] == 3
+        assert stats["total_processed"] == 105
+        assert stats["total_updated"] == 83
 
     @patch("backfill_case_titles.psycopg")
     @patch("backfill_case_titles.backfill_batch")
-    def test_commits_on_success(
+    def test_commits_per_batch(
         self,
         mock_batch: MagicMock,
         mock_psycopg: MagicMock,
@@ -421,11 +422,14 @@ class TestRunBackfill:
         mock_conn.__exit__ = MagicMock(return_value=False)
         mock_psycopg.connect.return_value = mock_conn
 
+        # Two batches: first full, second partial (signals end)
         mock_batch.side_effect = [(100, 80), (30, 20)]
 
         stats = backfill.run_backfill("postgresql://test", batch_size=100)
 
-        mock_conn.commit.assert_called_once()
+        # Commit is called after each batch for resilience
+        assert mock_conn.commit.call_count == 2
+        mock_conn.rollback.assert_not_called()
         assert stats["total_processed"] == 130
         assert stats["total_updated"] == 100
 
