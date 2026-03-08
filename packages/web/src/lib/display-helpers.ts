@@ -64,6 +64,54 @@ const PAGE_NUMBER_PATTERNS: RegExp[] = [
   /^\s*\d{1,3}\s*$/,
 ];
 
+// ---------------------------------------------------------------------------
+// Boilerplate patterns (display-time safety net)
+// ---------------------------------------------------------------------------
+
+/** Single-line boilerplate patterns to strip. */
+const BOILERPLATE_PATTERNS: RegExp[] = [
+  /^\s*SUPERIOR\s+COURT\s+OF\s+(?:THE\s+STATE\s+OF\s+)?CALIFORNIA\s*$/i,
+  /^\s*COUNTY\s+OF\s+\w[\w\s]*$/i,
+  /^\s*(?:DEPARTMENT|DEPT\.?)\s+\S+\s*$/i,
+  /^\s*(?:parties\s+who\s+intend\s+to\s+submit|if\s+you\s+intend\s+to\s+submit|unless\s+.*\s+notif(?:y|ies)|parties\s+should\s+notify|the\s+court\s+will\s+prepare|if\s+the\s+parties\s+neither)/i,
+];
+
+/** Multi-line block start patterns — when matched, all consecutive non-blank
+ *  lines from this point are removed. */
+const BLOCK_START_PATTERNS: RegExp[] = [
+  /^\s*(?:DEPARTMENT|DEPT\.?)\s+\S+\s+LAW\s+AND\s+MOTION\s+RULINGS?\s*$/i,
+  /^\s*if\s+you\s+wish\s+to\s+submit\s+on\s+the\s+tentative/i,
+  /^\s*if\s+you\s+intend\s+to\s+submit\s+on\s+this\s+tentative/i,
+];
+
+/** Remove boilerplate header/instruction lines and multi-line blocks. */
+export function stripBoilerplate(text: string): string {
+  const lines = text.split('\n');
+  const cleaned: string[] = [];
+  let i = 0;
+  while (i < lines.length) {
+    const line = lines[i];
+
+    // Single-line boilerplate
+    if (BOILERPLATE_PATTERNS.some((p) => p.test(line))) {
+      i++;
+      continue;
+    }
+
+    // Multi-line block start
+    if (BLOCK_START_PATTERNS.some((p) => p.test(line))) {
+      while (i < lines.length && lines[i].trim().length > 0) {
+        i++;
+      }
+      continue;
+    }
+
+    cleaned.push(line);
+    i++;
+  }
+  return cleaned.join('\n');
+}
+
 /** Remove lines that are page number artifacts. */
 export function stripPageNumbers(text: string): string {
   return text
@@ -104,6 +152,9 @@ const SECTION_HEADER_RE = /^\s*[A-Z][A-Z /&]+[A-Z]\s*$/;
 /** Pattern for indented lines (4+ spaces or tab). */
 const INDENT_RE = /^(?:    |\t)/;
 
+/** Visual separator lines: underscores, dashes, equals, or asterisks (3+). */
+const SEPARATOR_RE = /^\s*[_\-=*]{3,}\s*$/;
+
 /** Check whether a line looks like an ALL CAPS section header. */
 function isSectionHeader(line: string): boolean {
   const stripped = line.trim();
@@ -125,20 +176,35 @@ export function detectParagraphs(text: string): string {
   const lines = text.split('\n');
   if (lines.length <= 1) return text;
 
-  // Compute average non-empty line length for short-line heuristic
+  // Compute average non-empty line length for short-line heuristic.
+  // Exclude separator lines so they don't skew the average.
   const nonEmptyLengths = lines
-    .filter((l) => l.trim().length > 0)
+    .filter((l) => l.trim().length > 0 && !SEPARATOR_RE.test(l))
     .map((l) => l.length);
   const avgLen =
     nonEmptyLengths.length > 0
       ? nonEmptyLengths.reduce((a, b) => a + b, 0) / nonEmptyLengths.length
       : 0;
 
-  const result: string[] = [lines[0]];
+  const result: string[] = [];
+
+  // Handle first line: separator becomes empty line
+  if (SEPARATOR_RE.test(lines[0])) {
+    result.push('');
+  } else {
+    result.push(lines[0]);
+  }
 
   for (let i = 1; i < lines.length; i++) {
     const current = lines[i];
     const prev = lines[i - 1];
+
+    // Heuristic 0: Separator lines become paragraph breaks
+    if (SEPARATOR_RE.test(current)) {
+      result.push('');
+      continue;
+    }
+
     let insertBreak = false;
 
     // Heuristic 1: Section headers in ALL CAPS
@@ -184,6 +250,7 @@ export function detectParagraphs(text: string): string {
 export function cleanRulingText(text: string): string[] {
   let cleaned = fixEncoding(text);
   cleaned = stripPageNumbers(cleaned);
+  cleaned = stripBoilerplate(cleaned);
 
   // Detect paragraph boundaries for text that only has single newlines
   cleaned = detectParagraphs(cleaned);

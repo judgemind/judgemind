@@ -91,6 +91,30 @@ _BOILERPLATE_PATTERNS: list[re.Pattern[str]] = [
     ),
 ]
 
+# ---------------------------------------------------------------------------
+# Multi-line boilerplate block patterns
+# ---------------------------------------------------------------------------
+# These match the *start* of a multi-line instruction block.  Everything from
+# the start marker through consecutive non-blank lines is removed.
+
+_BLOCK_START_PATTERNS: list[re.Pattern[str]] = [
+    # LA County Dept 51 style: "DEPARTMENT 51 LAW AND MOTION RULINGS"
+    re.compile(
+        r"^\s*(?:DEPARTMENT|DEPT\.?)\s+\S+\s+LAW\s+AND\s+MOTION\s+RULINGS?\s*$",
+        re.IGNORECASE,
+    ),
+    # "If you wish to submit on the tentative ruling..."
+    re.compile(
+        r"^\s*if\s+you\s+wish\s+to\s+submit\s+on\s+the\s+tentative",
+        re.IGNORECASE,
+    ),
+    # "If you intend to submit on this tentative ruling..."
+    re.compile(
+        r"^\s*if\s+you\s+intend\s+to\s+submit\s+on\s+this\s+tentative",
+        re.IGNORECASE,
+    ),
+]
+
 
 def fix_encoding(text: str) -> str:
     """Fix common mojibake / encoding errors in ruling text.
@@ -117,17 +141,35 @@ def strip_page_numbers(text: str) -> str:
 
 
 def strip_boilerplate(text: str) -> str:
-    """Remove common boilerplate header/instruction lines.
+    """Remove common boilerplate header/instruction lines and blocks.
 
-    Only removes lines that match boilerplate patterns entirely — does not
-    modify lines that contain substantive content mixed with boilerplate.
+    Handles two kinds of boilerplate:
+      1. Single lines matching ``_BOILERPLATE_PATTERNS`` (removed individually).
+      2. Multi-line instruction blocks that start with a ``_BLOCK_START_PATTERNS``
+         marker.  When a start marker is found, all consecutive non-blank lines
+         from that point are removed (the block ends at the first blank line or
+         end of text).
     """
     lines = text.split("\n")
     cleaned: list[str] = []
-    for line in lines:
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+
+        # Check for single-line boilerplate
         if any(p.match(line) for p in _BOILERPLATE_PATTERNS):
+            i += 1
             continue
+
+        # Check for multi-line block start
+        if any(p.match(line) for p in _BLOCK_START_PATTERNS):
+            # Skip all consecutive non-blank lines (the block)
+            while i < len(lines) and lines[i].strip():
+                i += 1
+            continue
+
         cleaned.append(line)
+        i += 1
     return "\n".join(cleaned)
 
 
@@ -166,6 +208,13 @@ _KNOWN_HEADERS: frozenset[str] = frozenset(
 # Indentation: 4+ spaces or a tab at the start of a line.
 _INDENT_PATTERN: re.Pattern[str] = re.compile(r"^(?:    |\t)")
 
+# Visual separator lines: lines composed entirely of underscores, dashes,
+# equals signs, or asterisks (with optional whitespace).  These are used as
+# section dividers in some court rulings and should be treated as paragraph
+# breaks.  Require at least 3 repeated characters to avoid matching short
+# dashes that might be part of content.
+_SEPARATOR_PATTERN: re.Pattern[str] = re.compile(r"^\s*[_\-=*]{3,}\s*$")
+
 
 def _is_section_header(line: str) -> bool:
     """Check if a line looks like an ALL CAPS section header."""
@@ -202,15 +251,31 @@ def detect_paragraphs(text: str) -> str:
     if len(lines) <= 1:
         return text
 
-    # Compute average non-empty line length for short-line heuristic
-    non_empty_lengths = [len(line) for line in lines if line.strip()]
+    # Compute average non-empty line length for short-line heuristic.
+    # Exclude separator lines from the average calculation so they don't
+    # skew the short-line heuristic.
+    non_empty_lengths = [
+        len(line) for line in lines if line.strip() and not _SEPARATOR_PATTERN.match(line)
+    ]
     avg_len = sum(non_empty_lengths) / max(len(non_empty_lengths), 1)
 
-    result: list[str] = [lines[0]]
+    result: list[str] = []
+    # Handle first line: if it is a separator, replace with empty line
+    if _SEPARATOR_PATTERN.match(lines[0]):
+        result.append("")
+    else:
+        result.append(lines[0])
 
     for i in range(1, len(lines)):
         current = lines[i]
         prev = lines[i - 1]
+
+        # Heuristic 0: Separator lines (underscores, dashes, etc.) become
+        # paragraph breaks.  The separator line itself is removed and replaced
+        # with a blank line.
+        if _SEPARATOR_PATTERN.match(current):
+            result.append("")
+            continue
 
         insert_break = False
 
