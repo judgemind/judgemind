@@ -263,8 +263,9 @@ def test_process_event_event_fields_override_regex(mock_psycopg: MagicMock) -> N
 
 
 @patch("ingestion.worker.psycopg")
-def test_process_event_no_case_number(mock_psycopg: MagicMock) -> None:
-    """Events without case_number use a synthetic UNKNOWN- case number."""
+def test_process_event_no_case_number_falls_back_to_unknown(mock_psycopg: MagicMock) -> None:
+    """Events without case_number AND no extractable case number in ruling_text
+    use a synthetic UNKNOWN- case number."""
     worker, _ = _make_worker()
 
     mock_conn = MagicMock()
@@ -283,12 +284,52 @@ def test_process_event_no_case_number(mock_psycopg: MagicMock) -> None:
     mock_cur.rowcount = 1
 
     doc_id = "bbbbbbbb-0000-0000-0000-000000000002"
-    event = _make_event(case_number=None, document_id=doc_id)
+    # ruling_text has no case number patterns — should fall back to UNKNOWN
+    event = _make_event(
+        case_number=None,
+        document_id=doc_id,
+        ruling_text="The motion for summary judgment is GRANTED.",
+    )
     worker.process_event(event)
 
     # Verify that a synthetic case number was upserted
     all_sql = " ".join(str(c) for c in mock_cur.execute.call_args_list)
     assert f"UNKNOWN-{doc_id}" in all_sql
+
+
+@patch("ingestion.worker.psycopg")
+def test_process_event_extracts_case_number_from_ruling_text(mock_psycopg: MagicMock) -> None:
+    """When case_number is None but ruling_text contains a case number,
+    the fallback extraction should capture it."""
+    worker, _ = _make_worker()
+
+    mock_conn = MagicMock()
+    mock_cur = MagicMock()
+    mock_conn.__enter__ = MagicMock(return_value=mock_conn)
+    mock_conn.__exit__ = MagicMock(return_value=False)
+    mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cur)
+    mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+    mock_psycopg.connect.return_value = mock_conn
+    mock_cur.fetchone.side_effect = [
+        ("court-uuid-1",),  # upsert_court
+        ("case-uuid-1",),  # upsert_case
+        None,  # resolve_judge: no existing alias
+        ("judge-uuid-1",),  # resolve_judge: INSERT INTO judges
+    ]
+    mock_cur.rowcount = 1
+
+    doc_id = "cccccccc-0000-0000-0000-000000000003"
+    event = _make_event(
+        case_number=None,
+        document_id=doc_id,
+        ruling_text="Case Number: 24NNCV02551\nThe motion is GRANTED.",
+    )
+    worker.process_event(event)
+
+    # Verify the extracted case number was used, NOT the UNKNOWN fallback
+    all_sql = " ".join(str(c) for c in mock_cur.execute.call_args_list)
+    assert "24NNCV02551" in all_sql
+    assert f"UNKNOWN-{doc_id}" not in all_sql
 
 
 @patch("ingestion.worker.psycopg")

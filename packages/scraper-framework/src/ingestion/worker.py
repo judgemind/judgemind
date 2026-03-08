@@ -38,7 +38,7 @@ from .db import (
     upsert_court,
     upsert_party,
 )
-from .extract import extract_motion_type, extract_outcome
+from .extract import extract_case_number, extract_motion_type, extract_outcome
 from .text_cleanup import clean_ruling_text
 
 if TYPE_CHECKING:
@@ -246,12 +246,29 @@ class IngestionWorker:
 
         court_name = f"{court}, County of {county}"
 
+        # Fallback case number extraction: if the scraper did not populate
+        # case_number but ruling_text is available, try regex extraction from
+        # the text before resorting to the synthetic UNKNOWN- prefix.
+        if not case_number and ruling_text:
+            extracted = extract_case_number(ruling_text)
+            if extracted:
+                logger.info(
+                    "Extracted case_number from ruling text (scraper did not provide it)",
+                    extra={"document_id": document_id, "case_number": extracted},
+                )
+                case_number = extracted
+
         with psycopg.connect(self._pg_dsn) as conn:
             # 1. Ensure court exists
             court_id = upsert_court(conn, state, county, court_name)
 
             # 2. Ensure case exists — use document_id as synthetic case_number if absent
             effective_case_number = case_number or f"UNKNOWN-{document_id}"
+            if effective_case_number.startswith("UNKNOWN-"):
+                logger.warning(
+                    "No case_number extractable for document — using synthetic UNKNOWN identifier",
+                    extra={"document_id": document_id},
+                )
             case_id = upsert_case(conn, effective_case_number, court_id, case_title=case_title)
 
             # 3. Insert document (idempotent on document_id)

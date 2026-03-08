@@ -1,8 +1,13 @@
-"""Tests for the basic regex-based outcome, motion_type, and judge name extraction."""
+"""Tests for the basic regex-based outcome, motion_type, judge name, and case number extraction."""
 
 from __future__ import annotations
 
-from ingestion.extract import extract_judge_name, extract_motion_type, extract_outcome
+from ingestion.extract import (
+    extract_case_number,
+    extract_judge_name,
+    extract_motion_type,
+    extract_outcome,
+)
 
 # ---------------------------------------------------------------------------
 # Outcome extraction
@@ -321,3 +326,114 @@ class TestExtractJudgeName:
         """'judicial notice' should not trigger the JUDICIAL OFFICER pattern."""
         text = "The court takes judicial notice of the following."
         assert extract_judge_name(text) is None
+
+
+# ---------------------------------------------------------------------------
+# Case number extraction
+# ---------------------------------------------------------------------------
+
+
+class TestExtractCaseNumber:
+    """Tests for extract_case_number()."""
+
+    # --- LA label pattern ---
+
+    def test_la_label_pattern(self) -> None:
+        text = "Case Number: 24NNCV02551  Hearing Date: March 2, 2026"
+        assert extract_case_number(text) == "24NNCV02551"
+
+    def test_la_label_pattern_no_space(self) -> None:
+        text = "Case Number:24NNCV02551"
+        assert extract_case_number(text) == "24NNCV02551"
+
+    def test_la_label_case_insensitive(self) -> None:
+        text = "case number: 26NNCP00062"
+        assert extract_case_number(text) == "26NNCP00062"
+
+    # --- San Francisco ---
+
+    def test_sf_case_number(self) -> None:
+        text = "Case Number: FPT-25-378624\nHearing Date: March 3, 2026"
+        assert extract_case_number(text) == "FPT-25-378624"
+
+    def test_sf_case_number_standalone(self) -> None:
+        """SF case number without a label prefix."""
+        text = "Department 403\nFMS-20-387302\nHearing on petition"
+        assert extract_case_number(text) == "FMS-20-387302"
+
+    # --- San Bernardino ---
+
+    def test_sb_case_number(self) -> None:
+        text = "CIVRS2502080 SMITH v. JONES"
+        assert extract_case_number(text) == "CIVRS2502080"
+
+    def test_sb_longer_digits(self) -> None:
+        text = "CIVSB2416631 motion for summary judgment"
+        assert extract_case_number(text) == "CIVSB2416631"
+
+    # --- Riverside ---
+
+    def test_riverside_case_number(self) -> None:
+        text = "1.\nCVPS2306157 SMITH VS JONES"
+        assert extract_case_number(text) == "CVPS2306157"
+
+    def test_riverside_four_letter_code(self) -> None:
+        text = "CVMVSS2401234 hearing continued"
+        assert extract_case_number(text) == "CVMVSS2401234"
+
+    # --- Santa Clara ---
+
+    def test_sc_case_number(self) -> None:
+        text = "LINE 1  24CV443183  Smith v. Jones  Motion for Summary Judgment"
+        assert extract_case_number(text) == "24CV443183"
+
+    def test_sc_another(self) -> None:
+        text = "25CV460465 Doe v. Roe"
+        assert extract_case_number(text) == "25CV460465"
+
+    # --- LA standalone (no label) ---
+
+    def test_la_standalone_nncv(self) -> None:
+        """LA civil case number without 'Case Number:' label."""
+        text = "Department 3\n24NNCV02551\nMotion for summary judgment is GRANTED."
+        assert extract_case_number(text) == "24NNCV02551"
+
+    def test_la_standalone_stcv(self) -> None:
+        text = "Ruling on 23STCV12345 demurrer"
+        assert extract_case_number(text) == "23STCV12345"
+
+    def test_la_standalone_nncp(self) -> None:
+        text = "26NNCP00062 petition"
+        assert extract_case_number(text) == "26NNCP00062"
+
+    # --- OC Civil ---
+
+    def test_oc_civil_two_digit_prefix(self) -> None:
+        text = "25-01455183 SMITH v. JONES motion to compel"
+        assert extract_case_number(text) == "25-01455183"
+
+    def test_oc_civil_four_digit_prefix(self) -> None:
+        text = "2024-01437598 DOE v. ROE"
+        assert extract_case_number(text) == "2024-01437598"
+
+    # --- OC Family Law ---
+
+    def test_oc_family_law(self) -> None:
+        text = "24D006789 In re Marriage of Smith"
+        assert extract_case_number(text) == "24D006789"
+
+    # --- No match ---
+
+    def test_no_match(self) -> None:
+        text = "The motion for summary judgment is GRANTED."
+        assert extract_case_number(text) is None
+
+    def test_empty_string(self) -> None:
+        assert extract_case_number("") is None
+
+    # --- Priority: label pattern preferred over standalone ---
+
+    def test_label_pattern_preferred(self) -> None:
+        """When 'Case Number:' label is present, use that over standalone patterns."""
+        text = "Case Number: 24NNCV02551\nSome other text with 25CV460465"
+        assert extract_case_number(text) == "24NNCV02551"
