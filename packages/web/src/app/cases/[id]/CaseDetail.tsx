@@ -49,6 +49,8 @@ const CASE_RULINGS_QUERY = gql`
             canonicalName
           }
           rulingText
+          documentId
+          documentFormat
         }
       }
       pageInfo {
@@ -95,6 +97,8 @@ interface RulingNode {
     canonicalName: string;
   } | null;
   rulingText: string | null;
+  documentId: string | null;
+  documentFormat: string | null;
 }
 
 interface RulingsData {
@@ -118,6 +122,21 @@ const PLAINTIFF_TYPES = new Set(['plaintiff', 'petitioner', 'cross_complainant']
 
 /** Party types grouped as defendants. */
 const DEFENDANT_TYPES = new Set(['defendant', 'respondent', 'cross_defendant']);
+
+/** Map document format to a human-readable label. */
+export const FORMAT_LABELS: Record<string, string> = {
+  pdf: 'PDF',
+  html: 'HTML',
+  txt: 'TXT',
+  docx: 'DOCX',
+};
+
+/** Build the download URL for a document. Uses the same origin as the GraphQL API. */
+export function buildDownloadUrl(documentId: string): string {
+  const graphqlUrl = process.env.NEXT_PUBLIC_GRAPHQL_URL ?? 'http://localhost:3001/graphql';
+  const baseUrl = graphqlUrl.replace(/\/graphql$/, '');
+  return `${baseUrl}/api/documents/${documentId}/download`;
+}
 
 const PAGE_SIZE = 20;
 
@@ -549,14 +568,50 @@ export function CaseDetail({ caseId }: { caseId: string }) {
                         ));
                       })()}
                     </div>
-                    {isLong && (
-                      <button
-                        onClick={() => toggleRuling(node.id)}
-                        className="mt-1 text-xs font-medium text-brand-600 hover:text-brand-700 dark:text-brand-400 dark:hover:text-brand-300"
-                      >
-                        {isExpanded ? 'Show less' : 'Show more'}
-                      </button>
-                    )}
+                    <div className="mt-1 flex items-center gap-3">
+                      {isLong && (
+                        <button
+                          onClick={() => toggleRuling(node.id)}
+                          className="text-xs font-medium text-brand-600 hover:text-brand-700 dark:text-brand-400 dark:hover:text-brand-300"
+                        >
+                          {isExpanded ? 'Show less' : 'Show more'}
+                        </button>
+                      )}
+                      {node.documentId && (
+                        <a
+                          href={buildDownloadUrl(node.documentId)}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="inline-flex items-center gap-1 text-xs font-medium text-brand-600 hover:text-brand-700 dark:text-brand-400 dark:hover:text-brand-300"
+                        >
+                          Download original
+                          {node.documentFormat && (
+                            <span className="rounded bg-slate-100 px-1.5 py-0.5 text-[10px] font-semibold uppercase text-slate-600 dark:bg-slate-700 dark:text-slate-300">
+                              {FORMAT_LABELS[node.documentFormat] ?? node.documentFormat.toUpperCase()}
+                            </span>
+                          )}
+                        </a>
+                      )}
+                    </div>
+                  </div>
+                )}
+
+                {/* Download button when there is no ruling text but document exists */}
+                {!node.rulingText && node.documentId && (
+                  <div className="px-4 pb-3">
+                    <a
+                      href={buildDownloadUrl(node.documentId)}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="inline-flex items-center gap-1 text-xs font-medium text-brand-600 hover:text-brand-700 dark:text-brand-400 dark:hover:text-brand-300"
+                    >
+                      Download original
+                      {node.documentFormat && (
+                        <span className="rounded bg-slate-100 px-1.5 py-0.5 text-[10px] font-semibold uppercase text-slate-600 dark:bg-slate-700 dark:text-slate-300">
+                          {FORMAT_LABELS[node.documentFormat] ?? node.documentFormat.toUpperCase()}
+                        </span>
+                      )}
+                    </a>
                   </div>
                 )}
               </div>

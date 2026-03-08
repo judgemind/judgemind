@@ -417,6 +417,15 @@ export const resolvers = {
     isTentative: (row: Row) => row.is_tentative,
     rulingText: (row: Row) => row.ruling_text,
     postedAt: (row: Row) => row.posted_at,
+    documentId: (row: Row) => row.document_id,
+    documentFormat: async (row: Row, _: unknown, { pool }: Context) => {
+      if (!row.document_id) return null;
+      const { rows } = await pool.query<Row>(
+        'SELECT format FROM documents WHERE id = $1',
+        [row.document_id],
+      );
+      return rows[0]?.format ?? null;
+    },
     court: (row: Row, _: unknown, { loaders }: Context) =>
       row.court_id ? loaders.courtLoader.load(row.court_id as string) : null,
     judge: (row: Row, _: unknown, { loaders }: Context) =>

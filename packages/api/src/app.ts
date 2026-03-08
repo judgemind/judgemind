@@ -8,6 +8,7 @@ import { createLoaders } from './graphql/dataloader';
 import { pool as defaultPool } from './data-access/db';
 import { extractUser } from './auth';
 import { opensearchClient as defaultOsClient } from './search/client';
+import { registerDocumentDownload } from './rest/document-download';
 
 export async function buildApp(db?: Pool, os?: Client): Promise<FastifyInstance> {
   const pool = db ?? defaultPool;
@@ -52,6 +53,9 @@ export async function buildApp(db?: Pool, os?: Client): Promise<FastifyInstance>
     // pass their own pool are responsible for closing it.
     if (!db) await pool.end();
   });
+
+  // ── REST routes ──────────────────────────────────────────────────────────
+  registerDocumentDownload(app, pool);
 
   app.get('/health', async (req, reply) => {
     try {
