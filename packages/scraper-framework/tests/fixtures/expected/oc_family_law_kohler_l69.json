@@ -1,0 +1,24 @@
+{
+  "_fixture": "oc_family_law_kohler_l69.pdf",
+  "_description": "OC Family Law — Dept L69 (Commissioner Robert Kohler). 1-page PDF with boilerplate only, no active rulings.",
+  "_link_text": "KOHLER, Robert - Dept. L69",
+  "_captured": "2026-03-07",
+  "courthouse": "Lamoreaux Justice Center",
+  "department": "L69",
+  "judge_name": "Robert Kohler",
+  "page_count": 1,
+  "case_count": 0,
+  "primary_case_number": null,
+  "case_number_format": null,
+  "hearing_date": null,
+  "case_title": null,
+  "outcome": "OFF CALENDAR",
+  "motion_type": null,
+  "ruling_text_contains": [
+    "TENTATIVE RULINGS",
+    "DEPARTMENT L69",
+    "Commissioner Robert Kohler",
+    "LAMOREAUX JUSTICE CENTER"
+  ],
+  "_notes": "Empty rulings page — boilerplate header only. No hearing date, no case numbers, no active rulings."
+}

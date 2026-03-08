@@ -1,0 +1,23 @@
+{
+  "_fixture": "oc_probate_cm3.pdf",
+  "_description": "OC Probate — Dept CM3 (Judge Erin Rowe). 6-page PDF with 1 trust case.",
+  "_link_text": "CM3 Law and Motion",
+  "_captured": "2026-03-07",
+  "courthouse": "Costa Mesa Justice Center",
+  "department": "CM3",
+  "judge_name": "Erin Rowe",
+  "page_count": 6,
+  "case_count": 1,
+  "primary_case_number": "01157766",
+  "case_number_format": "0DDDDDDD",
+  "hearing_date": "2026-03-04",
+  "case_title": "Fard - Trust",
+  "outcome": "DENIED",
+  "motion_type": "MOTIONS FOR JUDGMENT ON THE PLEADINGS",
+  "ruling_text_contains": [
+    "TENTATIVE RULINGS FOR DEPARTMENT CM3",
+    "HON. Judge Erin Rowe",
+    "Date: 03/04/26"
+  ],
+  "_notes": "Probate format. Case numbers: 8 digits starting with 0. Date format: MM/DD/YY. Judge from PDF header."
+}
