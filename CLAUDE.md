@@ -463,6 +463,13 @@ These patterns avoid permission prompts and allow the agent to run without inter
   scripts/with-secret.sh -e DB_USER=judgemind/dev/db/connection:.username -e DB_PASS=judgemind/dev/db/connection:.password -- ./run.sh
   ```
   The `-e VAR=secret-id` form uses the raw SecretString. The `-e VAR=secret-id:.field` form extracts a JSON key. Multiple `-e` flags can be chained.
+- **No inline JSON or complex quoting in `curl` commands.** Commands with mixed `"` and `'` quoting (e.g. `-H "Content-Type: application/json" -d '{"query":...}'`) trigger permission prompts. Instead, write the request body to a file and use `@` to reference it:
+  ```
+  # Write the JSON body first using the Write tool, then:
+  curl -s -X POST https://dev.api.judgemind.org/graphql \
+    -H Content-Type:application/json \
+    -d @{worktree}/tmp/query.json
+  ```
 - **No quoted strings in compound shell commands:** a hook rejects commands that contain quoted characters (e.g. `"text"` or `'text'`) combined with `&&` or `;`. Instead of `cmd1 && echo "label" && cmd2`, make two separate tool calls — one per command.
 - **Multi-line content for `gh` or `git` commands:** always write the content to a file first using the Write tool, then pass it with `--body-file` or `-F`. Never use heredocs or `$()` in shell commands. For commits: `git commit -F {worktree}/tmp/commit_msg.txt`. For PR/issue bodies: `gh issue create --body-file {worktree}/tmp/body.txt`.
 
