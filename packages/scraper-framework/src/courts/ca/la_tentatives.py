@@ -64,6 +64,31 @@ _CASE_TITLE_RE = re.compile(
     re.DOTALL | re.MULTILINE,
 )
 
+# ---------------------------------------------------------------------------
+# Fallback title extraction patterns (text-based, for rulings without anchors)
+# ---------------------------------------------------------------------------
+
+# Pattern 2: "MOVING PARTY: [name]" / "RESPONDING PARTY: [name]"
+_MOVING_PARTY_RE = re.compile(
+    r"MOVING PART(?:Y|IES)\s*:\s*(?P<name>.+?)(?:\.|$)",
+    re.IGNORECASE | re.MULTILINE,
+)
+_RESPONDING_PARTY_RE = re.compile(
+    r"(?:RESPONDING|OPPOSING) PART(?:Y|IES)\s*:\s*(?P<name>.+?)(?:\.|$)",
+    re.IGNORECASE | re.MULTILINE,
+)
+_ROLE_PREFIX_RE = re.compile(
+    r"^(?:Defendants?|Plaintiffs?|Petitioners?|Respondents?"
+    r"|Cross-Complainants?|Cross-Defendants?)\s+",
+    re.IGNORECASE,
+)
+
+# Pattern 3: "Case Name: [text]" or "Case Title: [text]"
+_CASE_NAME_FIELD_RE = re.compile(
+    r"CASE\s+(?:NAME|TITLE)\s*:\s*(?P<title>.+?)(?:\s+CASE\s+NUMBER|\s*$)",
+    re.IGNORECASE | re.MULTILINE,
+)
+
 # Marker present in the LA Court stale-ViewState error page (HTTP 200, ~8KB).
 # When the POST uses an expired ViewState or a dropdown option that no longer
 # exists, the server returns this error page instead of ruling content.
@@ -286,21 +311,33 @@ def _extract_ruling_fields(soup: BeautifulSoup, doc: CapturedDocument) -> None:
 
 
 def _extract_case_title(content: BeautifulSoup) -> str | None:
-    """Extract the first case title from the party caption block.
+    """Extract the first case title from ruling HTML content.
 
-    LA ruling HTML places parties in a table near an ``<a name="Parties">``
-    anchor.  The text in the first column of that table follows the pattern::
+    Tries multiple extraction strategies in order of reliability:
 
-        PLAINTIFF NAME, et al.,
-            Plaintiff(s),
-            vs.
-        DEFENDANT NAME, et al.,
-            Defendant(s).
-
-    We find the first ``<a name="Parties">`` anchor, walk up to the enclosing
-    ``<td>``, extract its text, and apply ``_CASE_TITLE_RE`` to pull out the
-    two party names.  The title is formatted as "Plaintiff v. Defendant".
+    1. ``<a name="Parties">`` anchor with formal caption block (most reliable)
+    2. Inline "Case Name:" or "Case Title:" field
+    3. "MOVING PARTY:" / "RESPONDING PARTY:" fields
     """
+    # Strategy 1: Parties anchor with formal caption block
+    title = _extract_title_from_parties_anchor(content)
+    if title is not None:
+        return title
+
+    # For fallback strategies, work with the full text content
+    full_text = content.get_text(separator="\n", strip=True)
+
+    # Strategy 2: Inline "Case Name:" / "Case Title:" field
+    title = _extract_title_from_case_name_field(full_text)
+    if title is not None:
+        return title
+
+    # Strategy 3: MOVING PARTY / RESPONDING PARTY fields
+    return _extract_title_from_moving_responding(full_text)
+
+
+def _extract_title_from_parties_anchor(content: BeautifulSoup) -> str | None:
+    """Extract case title from the ``<a name="Parties">`` anchor pattern."""
     anchor = content.find("a", attrs={"name": "Parties"})
     if anchor is None:
         return None
@@ -322,6 +359,86 @@ def _extract_case_title(content: BeautifulSoup) -> str | None:
         return None
 
     return f"{plaintiff.title()} v. {defendant.title()}"
+
+
+def _clean_party_name(raw: str) -> str:
+    """Normalise a captured party name: collapse whitespace, strip role prefix,
+    strip trailing commas/et al, and clean up punctuation."""
+    name = " ".join(raw.split()).strip()
+    # Strip role prefixes like "Defendant " or "Plaintiffs "
+    name = _ROLE_PREFIX_RE.sub("", name)
+    # Strip "et al." suffix
+    name = re.sub(r",?\s*et\s+al\.?\s*$", "", name, flags=re.IGNORECASE).strip()
+    # Remove stray leading/trailing punctuation
+    name = name.strip(")(,.; ")
+    return name
+
+
+def _extract_title_from_moving_responding(text: str) -> str | None:
+    """Extract a case title from MOVING PARTY / RESPONDING PARTY fields."""
+    m_match = _MOVING_PARTY_RE.search(text)
+    if m_match is None:
+        return None
+    r_match = _RESPONDING_PARTY_RE.search(text)
+    if r_match is None:
+        return None
+
+    moving_raw = m_match.group("name").strip()
+    responding_raw = r_match.group("name").strip()
+
+    # Reject non-party content like "No opposition filed"
+    skip_phrases = ("no opposition", "none", "no response", "unopposed")
+    for phrase in skip_phrases:
+        if phrase in responding_raw.lower():
+            return None
+
+    moving_name = _clean_party_name(moving_raw)
+    responding_name = _clean_party_name(responding_raw)
+
+    if not moving_name or not responding_name:
+        return None
+
+    title = f"{moving_name.title()} v. {responding_name.title()}"
+
+    if len(title) > 150:
+        return None
+
+    return title
+
+
+def _extract_title_from_case_name_field(text: str) -> str | None:
+    """Extract a case title from an inline 'Case Name:' or 'Case Title:' field.
+
+    In HTML-derived text, individual characters may be on separate lines
+    (due to deeply nested spans). We collapse all whitespace into spaces
+    before searching.
+    """
+    # Collapse multi-line text into a single line for matching
+    collapsed = " ".join(text.split())
+
+    m = _CASE_NAME_FIELD_RE.search(collapsed)
+    if m is None:
+        return None
+
+    raw_title = m.group("title").strip()
+
+    # Must contain "v." or "v " to be a real case name
+    if not re.search(r"\bv\.?\s", raw_title):
+        return None
+
+    # Clean up whitespace
+    title = " ".join(raw_title.split())
+
+    # Fix "v ." -> "v." (HTML fragmentation artifact)
+    title = re.sub(r"\bv\s+\.", "v.", title)
+
+    # Strip trailing punctuation
+    title = title.rstrip(".,;: ")
+
+    if len(title) > 150 or len(title) < 5:
+        return None
+
+    return title
 
 
 # ---------------------------------------------------------------------------
