@@ -38,7 +38,7 @@ sys.path.insert(
 
 import psycopg  # noqa: E402
 
-from ingestion.db import resolve_judge  # noqa: E402
+from ingestion.db import resolve_judge, upsert_case_judge  # noqa: E402
 from ingestion.extract import extract_judge_name, extract_motion_type, extract_outcome  # noqa: E402
 
 logging.basicConfig(
@@ -52,7 +52,8 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 FETCH_QUERY = """
-    SELECT r.id, r.ruling_text, r.court_id, r.judge_id, r.outcome, r.motion_type
+    SELECT r.id, r.ruling_text, r.court_id, r.judge_id, r.outcome, r.motion_type,
+           r.case_id, r.hearing_date
     FROM rulings r
     WHERE r.ruling_text IS NOT NULL
       AND (r.judge_id IS NULL OR r.outcome IS NULL OR r.motion_type IS NULL)
@@ -92,6 +93,8 @@ def backfill_batch(
         existing_judge_id,
         existing_outcome,
         existing_motion_type,
+        case_id,
+        hearing_date,
     ) in rows:
         processed += 1
         new_outcome = None
@@ -119,9 +122,58 @@ def backfill_batch(
                 UPDATE_QUERY,
                 (new_judge_id, new_outcome, new_motion_type, str(ruling_id)),
             )
+
+        # Create case-judge association so Case.judges resolver works.
+        # Use newly resolved judge_id, or fall back to the existing one on
+        # the ruling row (the ruling may already have a judge_id but be
+        # missing outcome/motion_type — we still need the case_judges link).
+        effective_judge_id = new_judge_id or (
+            str(existing_judge_id) if existing_judge_id else None
+        )
+        if effective_judge_id and case_id:
+            upsert_case_judge(conn, str(case_id), effective_judge_id, hearing_date)
+
         updated += 1
 
     return processed, updated
+
+
+CASE_JUDGES_BACKFILL_QUERY = """
+    SELECT DISTINCT r.case_id, r.judge_id, r.hearing_date
+    FROM rulings r
+    WHERE r.judge_id IS NOT NULL
+      AND r.case_id IS NOT NULL
+      AND NOT EXISTS (
+          SELECT 1 FROM case_judges cj
+          WHERE cj.case_id = r.case_id AND cj.judge_id = r.judge_id
+      )
+    ORDER BY r.case_id
+    LIMIT %s OFFSET %s
+"""
+
+
+def backfill_case_judges_batch(
+    conn: psycopg.Connection,
+    batch_size: int = 100,
+    offset: int = 0,
+) -> int:
+    """Create missing case_judges rows for rulings that have judge_id set.
+
+    Returns the number of case_judges rows created.
+    """
+    with conn.cursor() as cur:
+        cur.execute(CASE_JUDGES_BACKFILL_QUERY, (batch_size, offset))
+        rows = cur.fetchall()
+
+    if not rows:
+        return 0
+
+    created = 0
+    for case_id, judge_id, hearing_date in rows:
+        upsert_case_judge(conn, str(case_id), str(judge_id), hearing_date)
+        created += 1
+
+    return created
 
 
 def run_backfill(
@@ -171,9 +223,42 @@ def run_backfill(
 
             offset += effective_batch
 
+        # Second pass: create case_judges rows for any rulings that already
+        # have judge_id set (from a previous backfill or the ingestion
+        # pipeline) but are missing the case_judges link.
+        cj_offset = 0
+        total_case_judges = 0
+        while True:
+            created = backfill_case_judges_batch(conn, batch_size, cj_offset)
+            total_case_judges += created
+
+            if dry_run:
+                conn.rollback()
+            else:
+                conn.commit()
+
+            if created > 0:
+                logger.info(
+                    "case_judges: created=%d (total: %d)%s",
+                    created,
+                    total_case_judges,
+                    " [dry-run, rolled back]" if dry_run else " [committed]",
+                )
+
+            if created < batch_size:
+                break
+
+            cj_offset += batch_size
+
+        if total_case_judges > 0:
+            logger.info(
+                "case_judges backfill complete: %d links created", total_case_judges
+            )
+
     stats = {
         "total_processed": total_processed,
         "total_updated": total_updated,
+        "total_case_judges_created": total_case_judges,
     }
     return stats
 
