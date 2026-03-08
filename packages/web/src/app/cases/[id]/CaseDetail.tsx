@@ -4,6 +4,7 @@ import { useState } from 'react';
 import { useQuery, gql } from '@apollo/client';
 import Link from 'next/link';
 import { formatDate, formatOutcome } from '../../rulings/RulingsFeed';
+import { cleanRulingText } from '../../../lib/display-helpers';
 
 const CASE_QUERY = gql`
   query CaseDetail($id: ID!) {
@@ -541,14 +542,19 @@ export function CaseDetail({ caseId }: { caseId: string }) {
                 {/* Ruling text */}
                 {node.rulingText && (
                   <div className="px-4 pb-3">
-                    <pre className="whitespace-pre-wrap text-sm leading-relaxed text-slate-700 dark:text-slate-300">
-                      {isLong && !isExpanded
-                        ? truncateText(
-                            node.rulingText,
-                            RULING_TEXT_TRUNCATE_LENGTH,
-                          )
-                        : node.rulingText}
-                    </pre>
+                    <div className="space-y-3">
+                      {(() => {
+                        const displayText = isLong && !isExpanded
+                          ? truncateText(node.rulingText, RULING_TEXT_TRUNCATE_LENGTH)
+                          : node.rulingText;
+                        const paragraphs = cleanRulingText(displayText);
+                        return paragraphs.map((paragraph, idx) => (
+                          <p key={idx} className="text-sm leading-relaxed text-slate-700 dark:text-slate-300">
+                            {paragraph}
+                          </p>
+                        ));
+                      })()}
+                    </div>
                     {isLong && (
                       <button
                         onClick={() => toggleRuling(node.id)}

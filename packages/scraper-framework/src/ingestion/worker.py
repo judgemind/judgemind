@@ -37,6 +37,7 @@ from .db import (
     upsert_court,
 )
 from .extract import extract_motion_type, extract_outcome
+from .text_cleanup import clean_ruling_text
 
 if TYPE_CHECKING:
     from opensearchpy import OpenSearch
@@ -237,6 +238,10 @@ class IngestionWorker:
             if motion_type is None:
                 motion_type = extract_motion_type(ruling_text)
 
+        # Clean ruling text for display — extraction uses raw text above for
+        # better regex matching; the cleaned version is stored in Postgres.
+        cleaned_ruling_text = clean_ruling_text(ruling_text)
+
         court_name = f"{court}, County of {county}"
 
         with psycopg.connect(self._pg_dsn) as conn:
@@ -276,7 +281,7 @@ class IngestionWorker:
                     case_id=case_id,
                     court_id=court_id,
                     hearing_date=hearing_dt,
-                    ruling_text=ruling_text,
+                    ruling_text=cleaned_ruling_text,
                     department=department,
                     judge_id=judge_id,
                     outcome=outcome,
