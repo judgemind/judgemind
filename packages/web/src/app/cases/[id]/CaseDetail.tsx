@@ -393,16 +393,12 @@ export function CaseDetail({ caseId }: { caseId: string }) {
         </div>
       </div>
 
-      {/* Parties — two-column layout */}
-      <section className="mt-8">
-        <h2 className="text-sm font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">
-          Parties
-        </h2>
-        {caseRecord.parties.length === 0 ? (
-          <p className="mt-2 text-sm text-slate-400 dark:text-slate-500">
-            No parties listed.
-          </p>
-        ) : (
+      {/* Parties — two-column layout (hidden when empty) */}
+      {caseRecord.parties.length > 0 && (
+        <section className="mt-8">
+          <h2 className="text-sm font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">
+            Parties
+          </h2>
           <div className="mt-2 grid grid-cols-1 gap-6 sm:grid-cols-2">
             <PartyColumn label="Plaintiffs" parties={plaintiffs} />
             <PartyColumn label="Defendants" parties={defendants} />
@@ -410,19 +406,15 @@ export function CaseDetail({ caseId }: { caseId: string }) {
               <PartyColumn label="Other Parties" parties={others} />
             )}
           </div>
-        )}
-      </section>
+        </section>
+      )}
 
-      {/* Judges */}
-      <section className="mt-8">
-        <h2 className="text-sm font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">
-          Judges
-        </h2>
-        {displayJudges.length === 0 ? (
-          <p className="mt-2 text-sm text-slate-400 dark:text-slate-500">
-            No judges assigned.
-          </p>
-        ) : (
+      {/* Judges (hidden when empty) */}
+      {displayJudges.length > 0 && (
+        <section className="mt-8">
+          <h2 className="text-sm font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">
+            Judges
+          </h2>
           <ul className="mt-2 space-y-1">
             {displayJudges.map((judge) => (
               <li key={judge.id} className="text-sm text-slate-900 dark:text-slate-100">
@@ -440,8 +432,8 @@ export function CaseDetail({ caseId }: { caseId: string }) {
               </li>
             ))}
           </ul>
-        )}
-      </section>
+        </section>
+      )}
 
       {/* Rulings */}
       <section className="mt-8">
