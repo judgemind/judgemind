@@ -80,6 +80,50 @@ done < <(
 )
 
 # ---------------------------------------------------------------------------
+# Step 1d — Clean stale worker directories and branches
+#
+# A worktree directory might exist without being registered (e.g. after a
+# manual rm that left a partial directory). And local branches like
+# worker-N/session-* might linger after a worktree was removed. Both of
+# these block git worktree add from claiming the worker number.
+# ---------------------------------------------------------------------------
+WORKTREES_DIR="$REPO_ROOT/worktrees"
+
+# Get the set of worker numbers that are registered as active worktrees
+ACTIVE_WORKERS=$(
+    git -C "$REPO_ROOT" worktree list --porcelain \
+        | awk '/^worktree / && $2 ~ /\/worktrees\/worker-[0-9]+/ {
+            n = $2
+            sub(/.*\/worker-/, "", n)
+            print n + 0
+        }'
+)
+
+# Remove stale directories that aren't registered worktrees
+if [ -d "$WORKTREES_DIR" ]; then
+    for dir in "$WORKTREES_DIR"/worker-*; do
+        [ -d "$dir" ] || continue
+        dir_num=$(basename "$dir" | sed 's/worker-//')
+        if ! echo "$ACTIVE_WORKERS" | grep -qx "$dir_num"; then
+            echo "Removing stale directory (not a registered worktree): $dir" >&2
+            rm -rf "$dir"
+        fi
+    done
+fi
+
+# Delete stale local branches matching worker-N/* that have no active worktree
+while IFS= read -r branch; do
+    [ -n "$branch" ] || continue
+    # Extract worker number from branch name (e.g. worker-3/session-... -> 3)
+    branch_num=$(echo "$branch" | sed -n 's|^worker-\([0-9]*\)/.*|\1|p')
+    [ -n "$branch_num" ] || continue
+    if ! echo "$ACTIVE_WORKERS" | grep -qx "$branch_num"; then
+        echo "Deleting stale local branch: $branch" >&2
+        git -C "$REPO_ROOT" branch -D "$branch" 2>/dev/null || true
+    fi
+done < <(git -C "$REPO_ROOT" branch --list 'worker-*/*' | sed 's/^[* ]*//')
+
+# ---------------------------------------------------------------------------
 # Step 2 — Claim the lowest available worker number and create the worktree
 #
 # Retries up to 10 times in case of a race with another agent.
@@ -107,6 +151,18 @@ for attempt in $(seq 1 10); do
     TIMESTAMP=$(date +%Y%m%d-%H%M)
     BRANCH="worker-${N}/session-${TIMESTAMP}"
     WORKTREE="$REPO_ROOT/worktrees/worker-${N}"
+
+    # Clean up any leftover directory or branch that could block creation
+    if [ -d "$WORKTREE" ]; then
+        echo "Removing leftover directory blocking worker $N: $WORKTREE" >&2
+        rm -rf "$WORKTREE"
+    fi
+    # Delete any existing local branches for this worker number
+    while IFS= read -r old_branch; do
+        [ -n "$old_branch" ] || continue
+        echo "Deleting leftover branch blocking worker $N: $old_branch" >&2
+        git -C "$REPO_ROOT" branch -D "$old_branch" 2>/dev/null || true
+    done < <(git -C "$REPO_ROOT" branch --list "worker-${N}/*" | sed 's/^[* ]*//')
 
     if git -C "$REPO_ROOT" worktree add "$WORKTREE" -b "$BRANCH" 2>/dev/null; then
         git -C "$WORKTREE" config core.hooksPath .githooks

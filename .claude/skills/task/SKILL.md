@@ -23,6 +23,29 @@ This resolves the repo root, prunes stale worktrees, claims the lowest available
 
 If you are already in a worktree, skip this step.
 
+### Status file setup
+
+After creating or entering a worktree, set up the agent status file so the orchestrator can monitor progress. Derive the worker number from the worktree path (e.g. `worker-2` → `2`).
+
+The status file lives at `{repo_root}/tmp/agent-status/worker-N.txt` (in the **repo root's** `tmp/`, not the worktree's `tmp/`). Create the directory if needed:
+
+```
+mkdir -p {repo_root}/tmp/agent-status
+```
+
+The status file format is:
+
+```
+issue: #<N>
+phase: <phase>
+updated: <ISO-8601 timestamp>
+summary: <one-line description of current activity>
+```
+
+Phases (in typical order): `claiming`, `setup`, `ralph-worker (iteration N)`, `ralph-reviewer (iteration N)`, `pushing`, `ci-watch`, `ci-fix`, `merging`, `deploying`, `retrospective`, `done`, `blocked`.
+
+**Write a status update at every major step transition** — use the Write tool to overwrite the status file. The first update should be written immediately after worktree setup with phase `claiming`.
+
 ---
 
 ## Step 1 — Identify the issue
@@ -110,6 +133,8 @@ If the issue requires a maintainer decision before you can proceed: comment on i
 Follow the full PR Workflow defined in CLAUDE.md. **All commits must be on the worktree branch — never on `main`.** Summary of required substeps:
 
 #### A.1 — Set up dependencies
+Write status: `phase: setup`, `summary: Installing dependencies for <packages>`.
+
 For Python packages you will touch, create a venv:
 ```
 python3.12 -m venv {worktree}/packages/<pkg>/.venv
@@ -126,6 +151,8 @@ Skip this for Terraform-only or docs-only tasks.
 - If `/ralph` exits with a blocker (STUCK or max iterations), the issue has already been commented on and labeled `status/blocked`. Clean up the worktree (`scripts/end-worker.sh {worktree}`) and stop.
 
 #### A.3 — Stage, commit, and push
+Write status: `phase: pushing`, `summary: Staging, committing, and pushing to remote`.
+
 Stage the files you changed (prefer naming specific files over `git add .`):
 ```
 git -C {worktree} add <files>
@@ -158,10 +185,12 @@ git -C {worktree} rebase origin/main
 Resolve conflicts, `git rebase --continue`, then push with `--force-with-lease`.
 
 #### A.5 — Monitor CI and iterate until green
+Write status: `phase: ci-watch`, `summary: Watching CI run <run-id>`.
+
 ```
 gh run watch <run-id> --repo judgemind/judgemind --exit-status --compact
 ```
-If CI fails: diagnose, fix locally, push, return to A.4. Repeat until all checks pass.
+If CI fails: write status `phase: ci-fix`, `summary: Fixing CI failure: <brief reason>`. Diagnose, fix locally, push, return to A.4. Repeat until all checks pass.
 
 #### A.6 — Update the PR test plan
 Fetch the current PR body, check off automated steps that passed in CI, run any manual smoke tests in a temporary smoketest worktree (see CLAUDE.md §4.8 for the pattern), write the updated body to `{worktree}/tmp/pr_body.txt`, then:
@@ -170,6 +199,8 @@ gh pr edit <PR-N> --repo judgemind/judgemind --body-file {worktree}/tmp/pr_body.
 ```
 
 #### A.7 — Merge the PR
+Write status: `phase: merging`, `summary: Squash merging PR #<N>`.
+
 The PR has passed the ralph loop review (A.2) and CI is green. Merge it:
 ```
 gh pr merge <PR-N> --repo judgemind/judgemind --squash --delete-branch
@@ -178,6 +209,7 @@ gh pr merge <PR-N> --repo judgemind/judgemind --squash --delete-branch
 **Dependent issues will be unblocked automatically** by the `unblock-issues` workflow when the PR merges. No manual unblocking needed.
 
 #### A.8 — Verify deployment (deployed services only)
+Write status: `phase: deploying`, `summary: Watching deploy pipeline for <workflow>`.
 
 **This step applies only to PRs that change deployed code** (API, frontend, scrapers, infrastructure). Skip it for pure library, tooling, docs, or CI-only changes.
 
@@ -247,6 +279,8 @@ If you only create sub-tasks and do not pick one up in this session, clean up: `
 
 ## Step 5 — Retrospective
 
+Write status: `phase: retrospective`, `summary: Filing retro issues`.
+
 After completing a task (Path A or Path B), reflect on the work before cleaning up. This step produces concrete improvements to the codebase and workflow — not just observations.
 
 ### 5a — Workflow efficiency
@@ -278,6 +312,8 @@ For each actionable finding from 5a and 5b:
 If the task was trivial and there are genuinely no improvements to make, that's fine — skip filing. But default to filing. The bar is "would this save time or prevent bugs across future tasks?"
 
 ### 5d — Remove worktree
+
+Write status: `phase: done`, `summary: Task complete. Removing worktree.`
 
 ```
 scripts/end-worker.sh {worktree}

@@ -15,6 +15,10 @@ Implement the current task using a ralph loop: an iterative work-then-review cyc
 
 Do not ask for confirmation. Work autonomously through every step.
 
+### Status file
+
+The `/task` skill sets up a status file at `{repo_root}/tmp/agent-status/worker-N.txt`. The `/ralph` skill writes status updates to this file at each worker/reviewer phase transition using the Write tool. The format is defined in `/task` Step 0. Derive the status file path from the worktree path (e.g. `worktrees/worker-2` → `{repo_root}/tmp/agent-status/worker-2.txt`).
+
 ---
 
 ## Step 0 — Set up ralph state directory
@@ -59,6 +63,8 @@ Set `iteration = 1` and `max_iterations = 5`.
 
 ### 2a — Worker phase
 
+Write status: `phase: ralph-worker (iteration N)`, `summary: Worker implementing iteration N`.
+
 Spawn a **worker subagent** (using the Agent tool) with this prompt structure:
 
 > You are implementing a code task in a ralph loop (iteration N of max 5).
@@ -90,6 +96,8 @@ After the worker subagent completes, read `{worktree}/tmp/ralph/work-status.txt`
 - If **COMPLETE**: Continue to the review phase.
 
 ### 2b — Review phase
+
+Write status: `phase: ralph-reviewer (iteration N)`, `summary: Reviewer evaluating iteration N`.
 
 Spawn a **reviewer subagent** (using the Agent tool) with this prompt structure:
 
