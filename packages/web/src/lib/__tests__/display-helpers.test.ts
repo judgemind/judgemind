@@ -43,6 +43,54 @@ describe('stripBoilerplate', () => {
     const text = 'The court grants the motion for summary judgment.';
     expect(stripBoilerplate(text)).toBe(text);
   });
+
+  it('does not delete entire text when no blank lines exist (LA ruling regression)', () => {
+    // Regression test for #336: LA ruling PDFs often have no blank lines.
+    // The block removal loop would consume the entire document because it
+    // never found a blank line to stop at. With MAX_BLOCK_LINES=5, only
+    // the header plus up to 4 following lines are removed.
+    const lines = [
+      'DEPARTMENT 37 LAW AND MOTION RULINGS',
+      'Case Number: 25STCV34748',
+      'TENTATIVE RULING',
+      'Hearing Date: January 15, 2025',
+      "Defendant's Motion to Quash Service of Summons",
+      'The court has reviewed the moving papers filed by defendant.',
+      'The motion to quash is DENIED.',
+      'Defendant is ordered to file a responsive pleading within 30 days.',
+      'The court finds that service was proper under CCP 415.10.',
+      'Plaintiff served the summons and complaint by personal delivery.',
+      'The proof of service was filed on December 1, 2024.',
+      'The court rejects the argument that service was defective.',
+    ];
+    const text = lines.join('\n');
+    const result = stripBoilerplate(text);
+    // The header block should be removed but the bulk of content must survive
+    expect(result).not.toContain('LAW AND MOTION');
+    // Lines after the cap should be preserved
+    expect(result).toContain('The court has reviewed the moving papers');
+    expect(result).toContain('The motion to quash is DENIED.');
+    expect(result).toContain('The court finds that service was proper');
+    expect(result).toContain('The court rejects the argument');
+  });
+
+  it('caps block removal at MAX_BLOCK_LINES even with no blank lines', () => {
+    // Build a document with a block header followed by 20 content lines,
+    // none separated by blank lines
+    const header = 'DEPARTMENT 51 LAW AND MOTION RULINGS';
+    const contentLines = Array.from(
+      { length: 20 },
+      (_, i) => `Content line ${i + 1} of the ruling.`,
+    );
+    const text = [header, ...contentLines].join('\n');
+    const result = stripBoilerplate(text);
+    // Block removal should stop after MAX_BLOCK_LINES (5), preserving later lines
+    expect(result).toContain('Content line 5 of the ruling.');
+    expect(result).toContain('Content line 20 of the ruling.');
+    // First 4 content lines (plus header = 5 total) should be removed
+    expect(result).not.toContain('Content line 1 of the ruling.');
+    expect(result).not.toContain('Content line 4 of the ruling.');
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -226,6 +274,32 @@ describe('cleanRulingText', () => {
     expect(joined).not.toContain('___');
     expect(joined).toContain('Section 1.');
     expect(joined).toContain('Section 2.');
+  });
+
+  it('preserves LA ruling text with no blank lines (#336 regression)', () => {
+    // Full pipeline regression: LA rulings with DEPARTMENT header and no
+    // blank lines should produce non-empty output with the ruling content.
+    const lines = [
+      'DEPARTMENT 37 LAW AND MOTION RULINGS',
+      'Case Number: 25STCV34748',
+      'TENTATIVE RULING',
+      'Hearing Date: January 15, 2025',
+      "Defendant's Motion to Quash Service of Summons",
+      'The court has reviewed the moving papers filed by defendant.',
+      'The motion to quash is DENIED.',
+      'Defendant is ordered to file a responsive pleading within 30 days.',
+      'The court finds that service was proper under CCP 415.10.',
+      'Plaintiff served the summons and complaint by personal delivery.',
+      'The proof of service was filed on December 1, 2024.',
+      'The court rejects the argument that service was defective.',
+    ];
+    const text = lines.join('\n');
+    const result = cleanRulingText(text);
+    expect(result.length).toBeGreaterThan(0);
+    const joined = result.join(' ');
+    expect(joined).toContain('DENIED');
+    expect(joined).toContain('reviewed the moving papers');
+    expect(joined).not.toContain('LAW AND MOTION');
   });
 
   it('handles text with encoding issues and missing paragraphs', () => {
