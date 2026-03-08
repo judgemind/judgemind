@@ -365,14 +365,16 @@ export function CaseDetail({ caseId }: { caseId: string }) {
     <div>
       {/* Case metadata */}
       <div className="grid grid-cols-2 gap-x-8 gap-y-4 sm:grid-cols-3">
-        <div>
-          <dt className="text-xs font-medium uppercase tracking-wide text-slate-500 dark:text-slate-400">
-            Filed Date
-          </dt>
-          <dd className="mt-1 text-sm text-slate-900 dark:text-slate-100">
-            {caseRecord.filedAt ? formatDate(caseRecord.filedAt) : '\u2014'}
-          </dd>
-        </div>
+        {caseRecord.filedAt && (
+          <div>
+            <dt className="text-xs font-medium uppercase tracking-wide text-slate-500 dark:text-slate-400">
+              Filed Date
+            </dt>
+            <dd className="mt-1 text-sm text-slate-900 dark:text-slate-100">
+              {formatDate(caseRecord.filedAt)}
+            </dd>
+          </div>
+        )}
         <div>
           <dt className="text-xs font-medium uppercase tracking-wide text-slate-500 dark:text-slate-400">
             Court
