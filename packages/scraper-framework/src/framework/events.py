@@ -62,6 +62,7 @@ class EventBus:
             judge_name=doc.judge_name,
             hearing_date=doc.hearing_date,
             capture_timestamp=doc.capture_timestamp,
+            parties=doc.parties,
         )
         # Use model_dump(mode="json") instead of json.loads(model_dump_json())
         # to avoid Pydantic v2 serialization edge cases with

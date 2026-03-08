@@ -332,3 +332,102 @@ def insert_ruling(
             ),
         )
     logger.debug("insert_ruling: document_id=%s rowcount=%s", document_id, conn.cursor().rowcount)
+
+
+def normalize_party_name(raw_name: str) -> str:
+    """Normalize a raw party name string to a canonical form.
+
+    Steps:
+      1. Strip leading/trailing whitespace.
+      2. Collapse internal whitespace.
+      3. Title-case the result.
+    """
+    name = raw_name.strip()
+    name = re.sub(r"\s+", " ", name)
+    return name.title()
+
+
+def upsert_party(
+    conn: psycopg.Connection,
+    raw_name: str,
+    party_type: str | None = None,
+) -> str:
+    """Resolve a raw party name to a canonical party record, returning the party UUID.
+
+    Lookup strategy (same pattern as ``resolve_judge``):
+      1. Search party_aliases for a matching raw_name.
+      2. If found, return the party_id from the alias.
+      3. If not found, create a new party with canonical_name = normalized name,
+         create a party_alias linking raw_name to the new party, and return the id.
+    """
+    canonical = normalize_party_name(raw_name)
+
+    with conn.cursor() as cur:
+        # Look up existing alias for this raw name
+        cur.execute(
+            """
+            SELECT pa.party_id
+            FROM party_aliases pa
+            WHERE pa.raw_name = %s
+            LIMIT 1
+            """,
+            (raw_name,),
+        )
+        row = cur.fetchone()
+        if row is not None:
+            party_id: str = str(row[0])
+            logger.debug("upsert_party: found alias for %r -> %s", raw_name, party_id)
+            return party_id
+
+        # No alias found — create new party and alias
+        cur.execute(
+            """
+            INSERT INTO parties (canonical_name, party_type)
+            VALUES (%s, %s)
+            RETURNING id
+            """,
+            (canonical, party_type),
+        )
+        row = cur.fetchone()
+        if row is None:
+            raise RuntimeError(
+                f"upsert_party: INSERT INTO parties returned no row for name={canonical!r}"
+            )
+        party_id = str(row[0])
+
+        cur.execute(
+            """
+            INSERT INTO party_aliases (party_id, raw_name, source, confidence, is_verified)
+            VALUES (%s::uuid, %s, 'scraper', 1.0, FALSE)
+            """,
+            (party_id, raw_name),
+        )
+
+        logger.debug("upsert_party: created new party %s for %r", party_id, raw_name)
+        return party_id
+
+
+def upsert_case_party(
+    conn: psycopg.Connection,
+    case_id: str,
+    party_id: str,
+    role: str,
+) -> None:
+    """Link a party to a case in the case_parties join table.
+
+    Idempotent — skips insert if a matching (case_id, party_id, role) row
+    already exists.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO case_parties (case_id, party_id, role)
+            SELECT %s::uuid, %s::uuid, %s
+            WHERE NOT EXISTS (
+                SELECT 1 FROM case_parties
+                WHERE case_id = %s::uuid AND party_id = %s::uuid AND role = %s
+            )
+            """,
+            (case_id, party_id, role, case_id, party_id, role),
+        )
+    logger.debug("upsert_case_party: case_id=%s party_id=%s role=%s", case_id, party_id, role)

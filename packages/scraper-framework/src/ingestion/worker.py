@@ -34,7 +34,9 @@ from .db import (
     resolve_judge,
     upsert_case,
     upsert_case_judge,
+    upsert_case_party,
     upsert_court,
+    upsert_party,
 )
 from .extract import extract_motion_type, extract_outcome
 from .text_cleanup import clean_ruling_text
@@ -293,6 +295,16 @@ class IngestionWorker:
             # 6. Link case to judge
             if judge_id is not None:
                 upsert_case_judge(conn, case_id, judge_id, hearing_dt)
+
+            # 7. Create party records and link to case
+            parties_data: list[dict[str, str]] = event_data.get("parties", [])
+            for party_info in parties_data:
+                party_name = party_info.get("name", "")
+                party_role = party_info.get("role", "")
+                if party_name:
+                    party_id = upsert_party(conn, party_name)
+                    if party_role:
+                        upsert_case_party(conn, case_id, party_id, party_role)
 
             conn.commit()
 
