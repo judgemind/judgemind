@@ -29,6 +29,7 @@ from courts.ca.riverside_tentatives import (
     _extract_case_title_from_ruling,
     _extract_motion_type,
     _extract_outcome,
+    _is_no_tentative_rulings,
     _riv_hearing_date_from_text,
     _split_rulings,
 )
@@ -109,6 +110,63 @@ def test_riv_hearing_date_hall_of_justice_no_date() -> None:
 
 
 # ---------------------------------------------------------------------------
+# _is_no_tentative_rulings — unit tests (#318)
+# ---------------------------------------------------------------------------
+
+
+def test_is_no_tentative_rulings_murrieta_text() -> None:
+    """Murrieta boilerplate starts with 'No Tentative Rulings March 2, 2026'."""
+    text = (
+        "No Tentative Rulings March 2, 2026\n"
+        "Department M205\n"
+        "Riverside Superior Court provides official court reporters..."
+    )
+    assert _is_no_tentative_rulings(text) is True
+
+
+def test_is_no_tentative_rulings_hall_of_justice_text() -> None:
+    """Hall of Justice boilerplate starts with 'No Tentative Rulings for'."""
+    text = (
+        "No Tentative Rulings for\n"
+        "Department 260\n"
+        "Riverside Superior Court provides official court reporters..."
+    )
+    assert _is_no_tentative_rulings(text) is True
+
+
+def test_is_no_tentative_rulings_murrieta_fixture() -> None:
+    """Murrieta fixture PDF is detected as boilerplate."""
+    text = _extract_pdf_text(_load_bytes("riv_murrieta.pdf"))
+    assert _is_no_tentative_rulings(text) is True
+
+
+def test_is_no_tentative_rulings_hall_of_justice_fixture() -> None:
+    """Hall of Justice fixture PDF is detected as boilerplate."""
+    text = _extract_pdf_text(_load_bytes("riv_hall_of_justice.pdf"))
+    assert _is_no_tentative_rulings(text) is True
+
+
+def test_is_no_tentative_rulings_false_for_real_rulings() -> None:
+    """Real ruling PDFs (PS1, Moreno Valley) are NOT boilerplate."""
+    ps1_text = _extract_pdf_text(_load_bytes("riv_ps1.pdf"))
+    assert _is_no_tentative_rulings(ps1_text) is False
+
+    mv_text = _extract_pdf_text(_load_bytes("riv_moreno_valley.pdf"))
+    assert _is_no_tentative_rulings(mv_text) is False
+
+
+def test_is_no_tentative_rulings_false_for_empty() -> None:
+    """Empty string is not boilerplate."""
+    assert _is_no_tentative_rulings("") is False
+
+
+def test_is_no_tentative_rulings_case_insensitive() -> None:
+    """Detection is case-insensitive."""
+    assert _is_no_tentative_rulings("NO TENTATIVE RULINGS March 2, 2026") is True
+    assert _is_no_tentative_rulings("no tentative rulings for\nDepartment 1") is True
+
+
+# ---------------------------------------------------------------------------
 # Full scraper run — hearing_date populated
 # ---------------------------------------------------------------------------
 
@@ -135,8 +193,8 @@ def test_riv_run_populates_hearing_date() -> None:
 
 
 @respx.mock
-def test_riv_run_no_date_when_pdf_has_none() -> None:
-    """When a PDF has no date (like hall_of_justice), hearing_date is None."""
+def test_riv_run_no_date_boilerplate_pdf_skipped() -> None:
+    """Hall of Justice 'No Tentative Rulings' PDFs are now skipped (#318)."""
     html = _load_html("riv_page.html")
     pdf_bytes = _load_bytes("riv_hall_of_justice.pdf")
 
@@ -148,10 +206,8 @@ def test_riv_run_no_date_when_pdf_has_none() -> None:
     scraper = RiversideTentativeRulingsScraper(config=config)
 
     docs = scraper.fetch_documents()
-    parsed = [scraper.parse_document(d) for d in docs]
-
-    # Hall of Justice fixture has no date
-    assert all(d.hearing_date is None for d in parsed)
+    # All docs are boilerplate — none should be returned
+    assert len(docs) == 0
 
 
 # ---------------------------------------------------------------------------
@@ -499,8 +555,8 @@ def test_riv_run_split_docs_have_individual_ruling_text() -> None:
 
 
 @respx.mock
-def test_riv_run_no_split_for_single_ruling_pdf() -> None:
-    """PDFs with no numbered rulings are kept as-is (not split)."""
+def test_riv_run_skips_no_tentative_rulings_pdfs() -> None:
+    """'No Tentative Rulings' boilerplate PDFs are skipped entirely (#318)."""
     html = _load_html("riv_page.html")
     pdf_bytes = _load_bytes("riv_hall_of_justice.pdf")
 
@@ -514,7 +570,24 @@ def test_riv_run_no_split_for_single_ruling_pdf() -> None:
     scraper = RiversideTentativeRulingsScraper(config=config)
 
     docs = scraper.fetch_documents()
-    # 17 PDFs, each has 0 numbered rulings -> kept as original single doc
-    assert len(docs) == 17
-    # No pre_split flag
-    assert all(not d.extra.get("pre_split") for d in docs)
+    # All 17 PDFs are "No Tentative Rulings" boilerplate — all should be skipped
+    assert len(docs) == 0
+
+
+@respx.mock
+def test_riv_run_skips_murrieta_no_tentative_rulings() -> None:
+    """Murrieta 'No Tentative Rulings' PDFs are skipped entirely (#318)."""
+    html = _load_html("riv_page.html")
+    pdf_bytes = _load_bytes("riv_murrieta.pdf")
+
+    respx.get(INDEX_URL).mock(return_value=httpx.Response(200, text=html))
+    respx.get(url__regex=r"\.pdf$").mock(
+        return_value=httpx.Response(200, content=pdf_bytes),
+    )
+
+    config = riv_default_config()
+    config.request_delay_seconds = 0
+    scraper = RiversideTentativeRulingsScraper(config=config)
+
+    docs = scraper.fetch_documents()
+    assert len(docs) == 0
