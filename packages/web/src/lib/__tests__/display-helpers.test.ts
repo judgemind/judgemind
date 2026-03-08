@@ -1,8 +1,49 @@
 import { describe, it, expect } from 'vitest';
 import {
   detectParagraphs,
+  stripBoilerplate,
   cleanRulingText,
 } from '../display-helpers';
+
+// ---------------------------------------------------------------------------
+// stripBoilerplate
+// ---------------------------------------------------------------------------
+
+describe('stripBoilerplate', () => {
+  it('removes single-line boilerplate headers', () => {
+    const text = 'SUPERIOR COURT OF CALIFORNIA\nThe motion is granted.';
+    expect(stripBoilerplate(text)).toBe('The motion is granted.');
+  });
+
+  it('removes multi-line DEPARTMENT LAW AND MOTION block', () => {
+    const text =
+      'DEPARTMENT 51 LAW AND MOTION RULINGS\n' +
+      '1. If you wish to submit on the tentative ruling, email the clerk.\n' +
+      '2. If you intend to appear, notify the court.\n' +
+      '\n' +
+      'The motion is granted.';
+    const result = stripBoilerplate(text);
+    expect(result).not.toContain('LAW AND MOTION');
+    expect(result).not.toContain('wish to submit');
+    expect(result).toContain('The motion is granted.');
+  });
+
+  it('removes block starting with "If you wish to submit"', () => {
+    const text =
+      'If you wish to submit on the tentative ruling, email the clerk.\n' +
+      'Failure to do so will result in the matter being taken off calendar.\n' +
+      '\n' +
+      'The motion is denied.';
+    const result = stripBoilerplate(text);
+    expect(result).not.toContain('wish to submit');
+    expect(result).toContain('The motion is denied.');
+  });
+
+  it('preserves substantive content', () => {
+    const text = 'The court grants the motion for summary judgment.';
+    expect(stripBoilerplate(text)).toBe(text);
+  });
+});
 
 // ---------------------------------------------------------------------------
 // detectParagraphs
@@ -77,6 +118,44 @@ describe('detectParagraphs', () => {
     const text = 'The motion is granted.';
     expect(detectParagraphs(text)).toBe(text);
   });
+
+  it('treats underscore separator lines as paragraph breaks', () => {
+    const text =
+      'First section.\n' +
+      '__________________________________\n' +
+      'Second section.';
+    const result = detectParagraphs(text);
+    expect(result).not.toContain('__');
+    expect(result).toContain('\n\n');
+    expect(result).toContain('First section.');
+    expect(result).toContain('Second section.');
+  });
+
+  it('treats dash separator lines as paragraph breaks', () => {
+    const text =
+      'Section A.\n' +
+      '-----------------------------------\n' +
+      'Section B.';
+    const result = detectParagraphs(text);
+    expect(result).not.toContain('---');
+    expect(result).toContain('\n\n');
+  });
+
+  it('treats equals separator lines as paragraph breaks', () => {
+    const text =
+      'Above.\n' +
+      '===================================\n' +
+      'Below.';
+    const result = detectParagraphs(text);
+    expect(result).not.toContain('===');
+    expect(result).toContain('\n\n');
+  });
+
+  it('does not treat short dashes as separators', () => {
+    const text = 'Content.\n--\nMore content.';
+    const result = detectParagraphs(text);
+    expect(result).toContain('--');
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -120,6 +199,33 @@ describe('cleanRulingText', () => {
       'First paragraph with some content.',
       'Second paragraph with more content.',
     ]);
+  });
+
+  it('strips multi-line boilerplate blocks from output', () => {
+    const text =
+      'DEPARTMENT 51 LAW AND MOTION RULINGS\n' +
+      '1. If you wish to submit, email the clerk.\n' +
+      '2. If you intend to appear, notify.\n' +
+      '\n' +
+      'The motion is granted.';
+    const result = cleanRulingText(text);
+    const joined = result.join(' ');
+    expect(joined).not.toContain('LAW AND MOTION');
+    expect(joined).not.toContain('wish to submit');
+    expect(joined).toContain('The motion is granted.');
+  });
+
+  it('treats separator lines as paragraph breaks', () => {
+    const text =
+      'Section 1.\n' +
+      '___________________________________\n' +
+      'Section 2.';
+    const result = cleanRulingText(text);
+    expect(result.length).toBeGreaterThanOrEqual(2);
+    const joined = result.join(' ');
+    expect(joined).not.toContain('___');
+    expect(joined).toContain('Section 1.');
+    expect(joined).toContain('Section 2.');
   });
 
   it('handles text with encoding issues and missing paragraphs', () => {
