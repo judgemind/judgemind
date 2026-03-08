@@ -390,7 +390,8 @@ def test_riv_full_run() -> None:
     health = scraper.run()
 
     assert health.success is True
-    assert health.records_captured == 17
+    # PS1 fixture has 4 rulings; 17 PDFs * 4 rulings = 68 records after splitting
+    assert health.records_captured == 68
 
 
 @respx.mock
@@ -406,13 +407,14 @@ def test_riv_run_populates_judge_and_dept() -> None:
     scraper = RiversideTentativeRulingsScraper(config=config)
 
     docs = scraper.fetch_documents()
-    assert len(docs) == 17
+    # PS1 fixture has 4 rulings; 17 PDFs * 4 rulings = 68 after splitting
+    assert len(docs) == 68
 
-    # PS1 doc should have judge Hester
+    # PS1 docs should all have judge Hester (4 split rulings from PS1 PDF)
     ps1_docs = [d for d in docs if d.department == "PS1"]
-    assert len(ps1_docs) == 1
-    assert "Hester" in (ps1_docs[0].judge_name or "")
-    assert ps1_docs[0].courthouse == "Palm Springs Courthouse"
+    assert len(ps1_docs) == 4
+    assert all("Hester" in (d.judge_name or "") for d in ps1_docs)
+    assert all(d.courthouse == "Palm Springs Courthouse" for d in ps1_docs)
 
 
 # ---------------------------------------------------------------------------

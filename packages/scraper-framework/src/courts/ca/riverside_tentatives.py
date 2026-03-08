@@ -17,6 +17,12 @@ PDF structure (PS1, 4 pages):
   Case entries: "<N>.\n{CASE_NUMBER} {PARTY_VS_PARTY} {motion}\nTentative Ruling: ..."
   Case number format: CV + location code + year + seq, e.g. "CVPS2306157"
 
+Ruling splitting:
+  A single PDF may contain rulings for multiple cases, each starting with a numbered
+  entry (e.g. "1.\\n...CVPS2306157..."). We split on these numbered boundaries so each
+  case gets its own CapturedDocument with correct case number, ruling text, parties,
+  motion type, and outcome.
+
 Courthouse mapping (best-effort — Riverside has many locations):
   PS*  → Palm Springs Courthouse
   M*   → Murrieta Courthouse (mid-county)
@@ -31,9 +37,13 @@ import re
 from datetime import datetime
 from typing import Any
 
-from framework import CapturedDocument, ScheduleWindow, ScraperConfig
+import structlog
 
-from .pdf_link_scraper import PdfLinkConfig, PdfLinkScraper
+from framework import CapturedDocument, ContentFormat, ScheduleWindow, ScraperConfig
+
+from .pdf_link_scraper import PdfLinkConfig, PdfLinkScraper, _extract_pdf_text
+
+logger = structlog.get_logger(__name__)
 
 INDEX_URL = "https://www.riverside.courts.ca.gov/online-services/tentative-rulings"
 BASE_URL = "https://www.riverside.courts.ca.gov"
@@ -73,6 +83,354 @@ def _riv_hearing_date_from_text(text: str) -> datetime | None:
     return None
 
 
+# ---------------------------------------------------------------------------
+# Ruling-splitting helpers
+# ---------------------------------------------------------------------------
+
+# Numbered ruling entry: "1.\n..." or "1.\nCVPS2306157 ..."
+# Matches a line that is just a number followed by a period, at a line boundary.
+# The number can be at the start of a line or after a page break.
+_RULING_ENTRY_RE = re.compile(
+    r"^(?P<num>\d{1,3})\.\s*$",
+    re.MULTILINE,
+)
+
+# Party pattern: "YELDELL vs HENSS" or "BANK OF AMERICA, N.A. vs VARGAS"
+# Captures plaintiff and defendant around " vs " (case-insensitive).
+_PARTY_VS_RE = re.compile(
+    r"^(?P<plaintiff>.+?)\s+vs\s+(?P<defendant>.+?)$",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+# Outcome from "Tentative Ruling:" line — extract first sentence or keyword.
+_OUTCOME_RE = re.compile(
+    r"Tentative Ruling:\s*(?P<outcome>.+?)(?:\.|$)",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+# Motion type from the text between the entry number and "Tentative Ruling:".
+# Common patterns: "Hearing re: Demurrer...", "Motion to Compel...",
+# "Motion for Judgment on the Pleadings...", etc.
+_MOTION_TYPE_RE = re.compile(
+    r"(?:Hearing re:\s*|(?:MOTION|Motion)\s+(?:to|for|re)\s+)"
+    r"(?P<motion_type>[^\n]+?)(?:\s+(?:by|of|on)\s|\s*$)",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+class SplitRuling:
+    """A single ruling extracted from a multi-ruling PDF."""
+
+    __slots__ = (
+        "ruling_index",
+        "case_number",
+        "ruling_text",
+        "case_title",
+        "motion_type",
+        "outcome",
+    )
+
+    def __init__(
+        self,
+        ruling_index: int,
+        case_number: str | None,
+        ruling_text: str,
+        case_title: str | None,
+        motion_type: str | None,
+        outcome: str | None,
+    ) -> None:
+        self.ruling_index = ruling_index
+        self.case_number = case_number
+        self.ruling_text = ruling_text
+        self.case_title = case_title
+        self.motion_type = motion_type
+        self.outcome = outcome
+
+
+def _split_rulings(text: str) -> list[SplitRuling]:
+    """Split PDF text containing multiple numbered rulings into individual SplitRuling objects.
+
+    Riverside PDFs use numbered entries like:
+        1.
+        CVPS2306157 YELDELL vs HENSS  Hearing re: Demurrer ...
+        Tentative Ruling: ...
+
+        2.
+        CVPS2306202 CRUMP vs IRWIN  ...
+        Tentative Ruling: ...
+
+    Returns an empty list if no numbered entries are found.
+    Returns a single-element list if only one entry exists.
+    """
+    # Find all numbered entry positions
+    matches = list(_RULING_ENTRY_RE.finditer(text))
+    if not matches:
+        return []
+
+    rulings: list[SplitRuling] = []
+    for i, match in enumerate(matches):
+        entry_num = int(match.group("num"))
+        start = match.end()
+        # End is either the start of the next entry or the end of text.
+        # We look for the next entry's match start, minus any leading whitespace.
+        if i + 1 < len(matches):
+            end = matches[i + 1].start()
+        else:
+            end = len(text)
+
+        ruling_text = text[start:end].strip()
+
+        # Remove "Page N of M" footers
+        ruling_text = re.sub(r"\nPage \d+ of \d+\s*$", "", ruling_text).strip()
+
+        # Extract case number
+        case_match = _CASE_NUMBER_RE.search(ruling_text)
+        case_number = case_match.group(0) if case_match else None
+
+        # Extract case title (party vs party)
+        case_title = _extract_case_title_from_ruling(ruling_text)
+
+        # Extract motion type
+        motion_type = _extract_motion_type(ruling_text)
+
+        # Extract outcome
+        outcome = _extract_outcome(ruling_text)
+
+        rulings.append(
+            SplitRuling(
+                ruling_index=entry_num,
+                case_number=case_number,
+                ruling_text=ruling_text,
+                case_title=case_title,
+                motion_type=motion_type,
+                outcome=outcome,
+            )
+        )
+
+    return rulings
+
+
+def _extract_case_title_from_ruling(text: str) -> str | None:
+    """Extract case title in 'Plaintiff v. Defendant' format from ruling text.
+
+    Riverside PDFs have the party names on the same line as the case number:
+
+        CVPS2306157 YELDELL vs HENSS  <motion description>
+
+    Or the case number is on a separate line but near a "vs" pattern:
+
+        CVPS2404518 NIETO vs CREATING A   <rest is noise from columns>
+
+    We find the line containing the case number, then look for "X vs Y"
+    on that same line. The party names are typically ALL-CAPS single words
+    or short phrases.
+    """
+    # Find the line containing the case number
+    case_match = _CASE_NUMBER_RE.search(text[:500])
+    if not case_match:
+        return None
+
+    # Get the line containing the case number
+    line_start = text.rfind("\n", 0, case_match.start()) + 1
+    line_end = text.find("\n", case_match.end())
+    if line_end == -1:
+        line_end = len(text)
+    case_line = text[line_start:line_end].strip()
+
+    # Look for "X vs Y" on the case line
+    # Pattern: after case number, "PLAINTIFF vs DEFENDANT <rest>"
+    vs_match = re.search(
+        r"(?:CV[A-Z]{2,4}\d{6,8}\s+)?(?P<plaintiff>[A-Z][A-Z\s,.'-]+?)\s+vs\s+(?P<defendant>[A-Z][A-Z\s,.'-]+)",
+        case_line,
+        re.IGNORECASE,
+    )
+    if not vs_match:
+        return None
+
+    plaintiff = " ".join(vs_match.group("plaintiff").split()).strip()
+    defendant = " ".join(vs_match.group("defendant").split()).strip()
+
+    # Truncate defendant at motion-related keywords (common in these PDFs)
+    for keyword in (
+        "Hearing",
+        "Motion",
+        "Demurrer",
+        "Complaint",
+        "Sanctions",
+        "Requests",
+        "Request",
+        "Order",
+        "Application",
+    ):
+        # Case-insensitive truncation at word boundaries
+        pattern = re.compile(r"\b" + keyword + r"\b", re.IGNORECASE)
+        kw_match = pattern.search(defendant)
+        if kw_match and kw_match.start() > 0:
+            defendant = defendant[: kw_match.start()].strip()
+
+    # Strip trailing punctuation and noise
+    plaintiff = plaintiff.strip(" ,;:")
+    defendant = defendant.strip(" ,;:")
+
+    # Remove case number fragments that may appear in defendant
+    defendant = _CASE_NUMBER_RE.sub("", defendant).strip()
+
+    if not plaintiff or not defendant or len(plaintiff) < 2 or len(defendant) < 2:
+        return None
+
+    return f"{plaintiff.title()} v. {defendant.title()}"
+
+
+def _extract_motion_type(text: str) -> str | None:
+    """Extract motion type from the header area of the ruling text.
+
+    The motion type appears in the lines before "Tentative Ruling:".
+    Common patterns:
+    - "Hearing re: Demurrer on 1st Amended Complaint..."
+    - "Motion to Compel Plaintiff's Responses..."
+    - "Motion for Judgment on the Pleadings..."
+    - "MOTION TO DEEM REQUESTS FOR ADMISSIONS ADMITTED"
+    """
+    # Extract text before "Tentative Ruling:" — the motion description lives there
+    tr_idx = text.lower().find("tentative ruling:")
+    if tr_idx == -1:
+        header = text[:500]
+    else:
+        header = text[:tr_idx]
+
+    # Try specific patterns in order of reliability
+
+    # Pattern 1: "Hearing re: <type>"
+    m = re.search(r"Hearing re:\s*(?P<mt>.+?)(?:\s+on\s|\s+of\s|\s*$)", header, re.IGNORECASE)
+    if m:
+        return " ".join(m.group("mt").split()).strip().rstrip(" ,;:")
+
+    # Pattern 2: "Motion to/for <type>"
+    m = re.search(
+        r"(?:MOTION|Motion)\s+(?:to|for)\s+(?P<mt>.+)",
+        header,
+        re.IGNORECASE | re.DOTALL,
+    )
+    if m:
+        raw = " ".join(m.group("mt").split()).strip()
+        # Truncate at party names / case numbers / common noise
+        for truncate_pattern in [
+            _CASE_NUMBER_RE,
+            re.compile(r"\bby\s+[A-Z]", re.IGNORECASE),
+            re.compile(r"\bvs\b", re.IGNORECASE),
+        ]:
+            trunc_match = truncate_pattern.search(raw)
+            if trunc_match and trunc_match.start() > 3:
+                raw = raw[: trunc_match.start()].strip()
+        raw = raw.rstrip(" ,;:(")
+        if len(raw) > 80:
+            raw = raw[:80]
+        return _normalize_motion_type(raw) if raw else None
+
+    # Pattern 3: "MOTION TO <type>" (all caps, MV-style)
+    m = re.search(
+        r"MOTION\s+TO\s+(?P<mt>[A-Z\s]+?)(?:\s+BY\s|\s+OF\s|\s*$)",
+        header,
+    )
+    if m:
+        raw = " ".join(m.group("mt").split()).strip()
+        return _normalize_motion_type(raw) if raw else None
+
+    return None
+
+
+# Known motion type patterns for normalization.
+# Maps a regex pattern to the canonical motion type name.
+_MOTION_TYPE_MAP: list[tuple[re.Pattern, str]] = [
+    (re.compile(r"demurrer", re.IGNORECASE), "Demurrer"),
+    (re.compile(r"judgment\s+on\s+the\s+pleadings", re.IGNORECASE), "Judgment on the Pleadings"),
+    (re.compile(r"summary\s+judgment", re.IGNORECASE), "Summary Judgment"),
+    (re.compile(r"summary\s+adjudication", re.IGNORECASE), "Summary Adjudication"),
+    (re.compile(r"compel", re.IGNORECASE), "Motion to Compel"),
+    (re.compile(r"deem\b.*\badmission", re.IGNORECASE), "Deem Admissions Admitted"),
+    (re.compile(r"deem\s+requests?\b", re.IGNORECASE), "Deem Admissions Admitted"),
+    (re.compile(r"terminating\s+sanctions?", re.IGNORECASE), "Terminating Sanctions"),
+    (re.compile(r"monetary\s+sanctions?", re.IGNORECASE), "Monetary Sanctions"),
+    (re.compile(r"production\s+of\s+documents?", re.IGNORECASE), "Production of Documents"),
+    (re.compile(r"protective\s+order", re.IGNORECASE), "Protective Order"),
+    (re.compile(r"preliminary\s+injunction", re.IGNORECASE), "Preliminary Injunction"),
+    (re.compile(r"attorney.?s?\s+fees?", re.IGNORECASE), "Attorney's Fees"),
+    (re.compile(r"strike", re.IGNORECASE), "Motion to Strike"),
+    (re.compile(r"quash", re.IGNORECASE), "Motion to Quash"),
+    (re.compile(r"relief\s+from\s+default", re.IGNORECASE), "Relief from Default"),
+    (re.compile(r"leave\s+to\s+amend", re.IGNORECASE), "Leave to Amend"),
+    (re.compile(r"terminating", re.IGNORECASE), "Terminating Sanctions"),
+]
+
+
+def _normalize_motion_type(raw: str) -> str:
+    """Normalize a raw motion type string against known patterns.
+
+    Prefers matches that appear earliest in the text (the primary motion type).
+    Falls back to title-cased raw text if no known pattern matches.
+    """
+    best_match: tuple[int, str] | None = None
+    for pattern, canonical in _MOTION_TYPE_MAP:
+        m = pattern.search(raw)
+        if m:
+            pos = m.start()
+            if best_match is None or pos < best_match[0]:
+                best_match = (pos, canonical)
+    if best_match is not None:
+        return best_match[1]
+    return raw.title().rstrip(" ,;:")
+
+
+def _extract_outcome(text: str) -> str | None:
+    """Extract outcome from the ruling text.
+
+    Looks for the final disposition, which in Riverside PDFs appears as
+    one of:
+    - "Tentative Ruling: Granted." / "Tentative Ruling: Denied."
+    - "Demurrer is OVERRULED" / "Motion ... DENIED"
+    - Final line like "Motion for ... DENIED"
+
+    For rulings with long narrative text after "Tentative Ruling:", we scan
+    the full text for disposition keywords instead of relying on just the
+    first line.
+    """
+    text_lower = text.lower()
+
+    # Check for explicit outcome keywords anywhere in the text, prioritising
+    # patterns that appear near the end of the ruling (the disposition).
+    # Search backwards through the text for the most specific match.
+
+    # Pattern: "is OVERRULED/SUSTAINED/GRANTED/DENIED" (common at ruling end)
+    disposition_re = re.compile(
+        r"\b(?:is\s+)?(?P<outcome>overruled|sustained|granted|denied|moot)\b",
+        re.IGNORECASE,
+    )
+    # Find the LAST occurrence (most likely to be the final disposition)
+    matches = list(disposition_re.finditer(text))
+    if matches:
+        return matches[-1].group("outcome").capitalize()
+
+    # "continued to ..." pattern
+    if re.search(r"\bcontinued\s+to\b", text_lower):
+        return "Continued"
+
+    # "No tentative ruling" pattern
+    m = _OUTCOME_RE.search(text)
+    if m:
+        raw = " ".join(m.group("outcome").split()).strip()
+        if "no tentative" in raw.lower():
+            return "No Tentative Ruling"
+        if "hearing will be conducted" in raw.lower():
+            return "No Tentative Ruling"
+
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Courthouse mapping
+# ---------------------------------------------------------------------------
+
+
 def _riv_courthouse(dept: str) -> str | None:
     dept_upper = dept.upper()
     if dept_upper.startswith("PS"):
@@ -90,7 +448,12 @@ def _riv_courthouse(dept: str) -> str | None:
 
 
 class RiversideTentativeRulingsScraper(PdfLinkScraper):
-    """Riverside County civil tentative rulings — PDF-link pattern."""
+    """Riverside County civil tentative rulings — PDF-link pattern.
+
+    Overrides fetch_documents to split multi-ruling PDFs into individual
+    CapturedDocument records, each with its own case number, ruling text,
+    parties, motion type, and outcome.
+    """
 
     def __init__(self, config: ScraperConfig, **kwargs: Any) -> None:
         pdf_config = PdfLinkConfig(
@@ -103,14 +466,74 @@ class RiversideTentativeRulingsScraper(PdfLinkScraper):
         )
         super().__init__(config, pdf_config=pdf_config, **kwargs)
 
-    def parse_document(self, doc: CapturedDocument) -> CapturedDocument:
-        """Extract case numbers (via super) and hearing date from PDF text."""
-        doc = super().parse_document(doc)
+    def fetch_documents(self) -> list[CapturedDocument]:
+        """Fetch PDFs then split multi-ruling PDFs into individual documents."""
+        raw_docs = super().fetch_documents()
+        split_docs: list[CapturedDocument] = []
 
-        # Extract hearing date from PDF text
+        for doc in raw_docs:
+            try:
+                text = _extract_pdf_text(doc.raw_content)
+            except Exception as exc:
+                logger.warning("PDF text extraction failed", error=str(exc))
+                split_docs.append(doc)
+                continue
+
+            rulings = _split_rulings(text)
+            if len(rulings) <= 1:
+                # Single ruling or no rulings — keep original doc
+                split_docs.append(doc)
+                continue
+
+            # Extract hearing date from the full PDF text (it's in the header)
+            hearing_date = _riv_hearing_date_from_text(text)
+
+            logger.info(
+                "Splitting multi-ruling PDF",
+                department=doc.department,
+                ruling_count=len(rulings),
+            )
+            for ruling in rulings:
+                child = self._make_base_doc(
+                    source_url=doc.source_url,
+                    raw_content=doc.raw_content,
+                    content_format=ContentFormat.PDF,
+                )
+                # Preserve parent metadata
+                child.judge_name = doc.judge_name
+                child.department = doc.department
+                child.courthouse = doc.courthouse
+                child.hearing_date = hearing_date
+                child.extra = {**doc.extra}
+                # Set per-ruling fields
+                child.case_number = ruling.case_number
+                child.ruling_text = ruling.ruling_text
+                child.case_title = ruling.case_title
+                child.motion_type = ruling.motion_type
+                child.outcome = ruling.outcome
+                child.extra["ruling_index"] = ruling.ruling_index
+                child.extra["pre_split"] = True
+                split_docs.append(child)
+
+        return split_docs
+
+    def parse_document(self, doc: CapturedDocument) -> CapturedDocument:
+        """Extract fields from PDF text.
+
+        If the document was pre-split by fetch_documents, skip the parent's
+        parse_document (which would re-extract the full PDF text and overwrite
+        our per-ruling fields) and only add the hearing date.
+        """
+        if doc.extra.get("pre_split"):
+            # Already split — just extract hearing date from ruling text
+            if doc.ruling_text and not doc.hearing_date:
+                doc.hearing_date = _riv_hearing_date_from_text(doc.ruling_text)
+            return doc
+
+        # Single-ruling PDF: use parent parse logic
+        doc = super().parse_document(doc)
         if doc.ruling_text and not doc.hearing_date:
             doc.hearing_date = _riv_hearing_date_from_text(doc.ruling_text)
-
         return doc
 
 
