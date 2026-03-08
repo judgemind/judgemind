@@ -131,6 +131,116 @@ def strip_boilerplate(text: str) -> str:
     return "\n".join(cleaned)
 
 
+# ---------------------------------------------------------------------------
+# Paragraph detection
+# ---------------------------------------------------------------------------
+# PDF-extracted text often has single newlines at line breaks but no
+# double-newline separators between paragraphs.  These heuristics detect
+# paragraph boundaries and insert double-newline separators.
+
+# Section headers commonly found in California court rulings.
+# Must be ALL CAPS, optionally with spaces between words.
+_SECTION_HEADER_PATTERN: re.Pattern[str] = re.compile(r"^\s*[A-Z][A-Z /&]+[A-Z]\s*$")
+
+# Known section header keywords for stricter matching on short headers.
+_KNOWN_HEADERS: frozenset[str] = frozenset(
+    {
+        "BACKGROUND",
+        "DISCUSSION",
+        "RULING",
+        "ORDER",
+        "ANALYSIS",
+        "CONCLUSION",
+        "LEGAL STANDARD",
+        "FACTUAL BACKGROUND",
+        "PROCEDURAL HISTORY",
+        "TENTATIVE RULING",
+        "MOTION",
+        "OPPOSITION",
+        "REPLY",
+        "FINDINGS",
+        "STATEMENT OF DECISION",
+    }
+)
+
+# Indentation: 4+ spaces or a tab at the start of a line.
+_INDENT_PATTERN: re.Pattern[str] = re.compile(r"^(?:    |\t)")
+
+
+def _is_section_header(line: str) -> bool:
+    """Check if a line looks like an ALL CAPS section header."""
+    stripped = line.strip()
+    if not stripped:
+        return False
+    # Check known headers first (handles short ones like "ORDER")
+    if stripped in _KNOWN_HEADERS:
+        return True
+    # For unknown headers, require at least 3 chars and all-caps pattern
+    if len(stripped) >= 3 and _SECTION_HEADER_PATTERN.match(line):
+        return True
+    return False
+
+
+def detect_paragraphs(text: str) -> str:
+    """Detect paragraph boundaries in single-newline text.
+
+    Inserts double-newline separators at detected paragraph boundaries.
+    If the text already contains double newlines, it is returned as-is
+    (the existing paragraph structure is assumed to be correct).
+
+    Heuristics applied:
+      - ALL CAPS section headers get a blank line inserted before them
+      - Lines with significant indentation (4+ spaces or tab) after
+        a non-indented line start a new paragraph
+      - A short line (< 60% of average line length) followed by a line
+        starting with a capital letter is treated as a paragraph boundary
+    """
+    if not text or "\n\n" in text:
+        return text
+
+    lines = text.split("\n")
+    if len(lines) <= 1:
+        return text
+
+    # Compute average non-empty line length for short-line heuristic
+    non_empty_lengths = [len(line) for line in lines if line.strip()]
+    avg_len = sum(non_empty_lengths) / max(len(non_empty_lengths), 1)
+
+    result: list[str] = [lines[0]]
+
+    for i in range(1, len(lines)):
+        current = lines[i]
+        prev = lines[i - 1]
+
+        insert_break = False
+
+        # Heuristic 1: Section headers in ALL CAPS
+        if _is_section_header(current):
+            insert_break = True
+
+        # Heuristic 2: Indentation change (non-indented -> indented)
+        elif _INDENT_PATTERN.match(current) and prev.strip() and not _INDENT_PATTERN.match(prev):
+            insert_break = True
+
+        # Heuristic 3: Short previous line + current starts with capital
+        # Only trigger if previous line is meaningfully short and ends a sentence
+        elif (
+            prev.strip()
+            and current.strip()
+            and len(prev.rstrip()) < avg_len * 0.6
+            and avg_len > 20
+            and current.lstrip()[0:1].isupper()
+            and prev.rstrip()[-1:] in {".", ":", ";", "!", "?"}
+        ):
+            insert_break = True
+
+        if insert_break:
+            result.append("")  # blank line = paragraph separator
+        result.append(current)
+
+    return "\n".join(result)
+
+
 def collapse_whitespace(text: str) -> str:
     """Collapse excessive blank lines and trailing whitespace.
 
@@ -163,7 +273,8 @@ def clean_ruling_text(text: str | None) -> str | None:
       1. Fix encoding errors (mojibake)
       2. Strip page number artifacts
       3. Strip boilerplate headers
-      4. Collapse excessive whitespace
+      4. Detect paragraph boundaries (insert double-newline separators)
+      5. Collapse excessive whitespace
 
     The raw content in S3 is never modified — this only affects the
     ruling_text stored in Postgres for display.
@@ -175,6 +286,7 @@ def clean_ruling_text(text: str | None) -> str | None:
     result = fix_encoding(result)
     result = strip_page_numbers(result)
     result = strip_boilerplate(result)
+    result = detect_paragraphs(result)
     result = collapse_whitespace(result)
 
     return result if result else None

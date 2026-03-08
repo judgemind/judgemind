@@ -5,6 +5,7 @@ from __future__ import annotations
 from ingestion.text_cleanup import (
     clean_ruling_text,
     collapse_whitespace,
+    detect_paragraphs,
     fix_encoding,
     strip_boilerplate,
     strip_page_numbers,
@@ -167,6 +168,107 @@ class TestCollapseWhitespace:
 
 
 # ---------------------------------------------------------------------------
+# detect_paragraphs
+# ---------------------------------------------------------------------------
+
+
+class TestDetectParagraphs:
+    """Tests for paragraph boundary detection in single-newline text."""
+
+    def test_preserves_existing_double_newlines(self) -> None:
+        """Text that already has paragraph breaks should be unchanged."""
+        text = "First paragraph.\n\nSecond paragraph."
+        assert detect_paragraphs(text) == text
+
+    def test_section_header_all_caps(self) -> None:
+        """ALL CAPS section headers should get a paragraph break before them."""
+        text = (
+            "Some introductory text about the case.\n"
+            "BACKGROUND\n"
+            "The plaintiff filed a complaint on January 1."
+        )
+        result = detect_paragraphs(text)
+        assert "\n\nBACKGROUND\n" in result
+
+    def test_multiple_section_headers(self) -> None:
+        """Multiple section headers should each get paragraph breaks."""
+        text = (
+            "Intro text here.\n"
+            "DISCUSSION\n"
+            "The court considers the following.\n"
+            "RULING\n"
+            "The motion is granted."
+        )
+        result = detect_paragraphs(text)
+        assert "\n\nDISCUSSION\n" in result
+        assert "\n\nRULING\n" in result
+
+    def test_section_header_multiword(self) -> None:
+        """Multi-word ALL CAPS headers like LEGAL STANDARD should be detected."""
+        text = "Some text.\nLEGAL STANDARD\nThe standard for summary judgment is..."
+        result = detect_paragraphs(text)
+        assert "\n\nLEGAL STANDARD\n" in result
+
+    def test_indentation_change(self) -> None:
+        """A line indented with 4+ spaces after a non-indented line is a new paragraph."""
+        text = "The court rules as follows.\n    The motion for summary judgment is granted."
+        result = detect_paragraphs(text)
+        assert "\n\n    The motion" in result
+
+    def test_tab_indentation(self) -> None:
+        """A tab-indented line after a non-indented line is a new paragraph."""
+        text = "The court rules as follows.\n\tThe motion for summary judgment is granted."
+        result = detect_paragraphs(text)
+        assert "\n\n\tThe motion" in result
+
+    def test_short_line_followed_by_capital(self) -> None:
+        """A short line followed by a line starting with a capital letter is a paragraph break."""
+        text = (
+            "The motion is granted.\nThe court further orders that the defendant shall pay costs."
+        )
+        # The first line is short relative to the second, and second starts with capital
+        result = detect_paragraphs(text)
+        # This should insert a paragraph break
+        assert "\n\n" in result
+
+    def test_no_false_split_mid_sentence(self) -> None:
+        """Lines that are continuations (not starting with capital) should not be split."""
+        text = (
+            "The court has reviewed the plaintiff's motion for summary\n"
+            "judgment and finds that there are no triable issues of\n"
+            "material fact."
+        )
+        result = detect_paragraphs(text)
+        # Should NOT insert paragraph breaks in the middle of sentences
+        assert result.count("\n\n") == 0
+
+    def test_empty_string(self) -> None:
+        assert detect_paragraphs("") == ""
+
+    def test_single_line(self) -> None:
+        text = "The motion is granted."
+        assert detect_paragraphs(text) == text
+
+    def test_realistic_wall_of_text(self) -> None:
+        """Simulate a real PDF-extracted ruling that lost paragraph breaks."""
+        text = (
+            "The motion for summary judgment filed by defendant is considered.\n"
+            "BACKGROUND\n"
+            "Plaintiff filed this action on January 1, 2024 alleging\n"
+            "causes of action for negligence and breach of contract.\n"
+            "DISCUSSION\n"
+            "The court applies the standard set forth in Code of Civil\n"
+            "Procedure section 437c.\n"
+            "RULING\n"
+            "The motion is DENIED."
+        )
+        result = detect_paragraphs(text)
+        # Each section header should produce a paragraph break
+        paragraphs = result.split("\n\n")
+        assert len(paragraphs) >= 4  # intro, BACKGROUND+content, DISCUSSION+content, RULING+content
+
+
+# ---------------------------------------------------------------------------
 # clean_ruling_text (integration)
 # ---------------------------------------------------------------------------
 
@@ -230,3 +332,19 @@ class TestCleanRulingText:
         )
         result = clean_ruling_text(clean)
         assert result == clean
+
+    def test_pipeline_detects_paragraphs_in_wall_of_text(self) -> None:
+        """Verify detect_paragraphs is wired into the cleanup pipeline."""
+        raw = (
+            "The court considers the motion.\n"
+            "BACKGROUND\n"
+            "Plaintiff filed suit in 2024.\n"
+            "RULING\n"
+            "The motion is denied."
+        )
+        result = clean_ruling_text(raw)
+        assert result is not None
+        # Section headers should have produced paragraph breaks
+        assert "\n\n" in result
+        assert "BACKGROUND" in result
+        assert "RULING" in result

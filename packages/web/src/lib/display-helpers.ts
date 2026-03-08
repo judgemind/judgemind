@@ -72,16 +72,121 @@ export function stripPageNumbers(text: string): string {
     .join('\n');
 }
 
+// ---------------------------------------------------------------------------
+// Paragraph detection (display-time fallback)
+// ---------------------------------------------------------------------------
+// PDF-extracted text often has single newlines at line breaks but no
+// double-newline separators between paragraphs. These heuristics detect
+// paragraph boundaries and insert double-newline separators.
+
+/** Known ALL CAPS section headers in California court rulings. */
+const KNOWN_HEADERS = new Set([
+  'BACKGROUND',
+  'DISCUSSION',
+  'RULING',
+  'ORDER',
+  'ANALYSIS',
+  'CONCLUSION',
+  'LEGAL STANDARD',
+  'FACTUAL BACKGROUND',
+  'PROCEDURAL HISTORY',
+  'TENTATIVE RULING',
+  'MOTION',
+  'OPPOSITION',
+  'REPLY',
+  'FINDINGS',
+  'STATEMENT OF DECISION',
+]);
+
+/** Pattern for ALL CAPS lines (potential section headers). */
+const SECTION_HEADER_RE = /^\s*[A-Z][A-Z /&]+[A-Z]\s*$/;
+
+/** Pattern for indented lines (4+ spaces or tab). */
+const INDENT_RE = /^(?:    |\t)/;
+
+/** Check whether a line looks like an ALL CAPS section header. */
+function isSectionHeader(line: string): boolean {
+  const stripped = line.trim();
+  if (!stripped) return false;
+  if (KNOWN_HEADERS.has(stripped)) return true;
+  if (stripped.length >= 3 && SECTION_HEADER_RE.test(line)) return true;
+  return false;
+}
+
+/**
+ * Detect paragraph boundaries in single-newline text.
+ *
+ * Inserts double-newline separators at detected paragraph boundaries.
+ * If the text already contains double newlines, it is returned as-is.
+ */
+export function detectParagraphs(text: string): string {
+  if (!text || text.includes('\n\n')) return text;
+
+  const lines = text.split('\n');
+  if (lines.length <= 1) return text;
+
+  // Compute average non-empty line length for short-line heuristic
+  const nonEmptyLengths = lines
+    .filter((l) => l.trim().length > 0)
+    .map((l) => l.length);
+  const avgLen =
+    nonEmptyLengths.length > 0
+      ? nonEmptyLengths.reduce((a, b) => a + b, 0) / nonEmptyLengths.length
+      : 0;
+
+  const result: string[] = [lines[0]];
+
+  for (let i = 1; i < lines.length; i++) {
+    const current = lines[i];
+    const prev = lines[i - 1];
+    let insertBreak = false;
+
+    // Heuristic 1: Section headers in ALL CAPS
+    if (isSectionHeader(current)) {
+      insertBreak = true;
+    }
+    // Heuristic 2: Indentation change (non-indented -> indented)
+    else if (
+      INDENT_RE.test(current) &&
+      prev.trim().length > 0 &&
+      !INDENT_RE.test(prev)
+    ) {
+      insertBreak = true;
+    }
+    // Heuristic 3: Short previous line + current starts with capital
+    else if (
+      prev.trim().length > 0 &&
+      current.trim().length > 0 &&
+      prev.trimEnd().length < avgLen * 0.6 &&
+      avgLen > 20 &&
+      /^[A-Z]/.test(current.trimStart()) &&
+      /[.:;!?]$/.test(prev.trimEnd())
+    ) {
+      insertBreak = true;
+    }
+
+    if (insertBreak) {
+      result.push(''); // blank line = paragraph separator
+    }
+    result.push(current);
+  }
+
+  return result.join('\n');
+}
+
 /**
  * Clean ruling text for display.
  *
- * Applies encoding fixes, strips page numbers, and collapses excessive
- * blank lines. Returns an array of paragraph strings suitable for
- * rendering as separate `<p>` elements.
+ * Applies encoding fixes, strips page numbers, detects paragraph
+ * boundaries, and collapses excessive blank lines. Returns an array
+ * of paragraph strings suitable for rendering as separate `<p>` elements.
  */
 export function cleanRulingText(text: string): string[] {
   let cleaned = fixEncoding(text);
   cleaned = stripPageNumbers(cleaned);
+
+  // Detect paragraph boundaries for text that only has single newlines
+  cleaned = detectParagraphs(cleaned);
 
   // Strip trailing whitespace per line
   cleaned = cleaned
