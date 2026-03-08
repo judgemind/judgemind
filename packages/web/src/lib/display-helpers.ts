@@ -73,13 +73,18 @@ const BOILERPLATE_PATTERNS: RegExp[] = [
   /^\s*(?:parties\s+who\s+intend\s+to\s+submit|if\s+you\s+intend\s+to\s+submit|unless\s+.*\s+notif(?:y|ies)|parties\s+should\s+notify|the\s+court\s+will\s+prepare|if\s+the\s+parties\s+neither)/i,
 ];
 
-/** Multi-line block start patterns — when matched, all consecutive non-blank
- *  lines from this point are removed. */
+/** Multi-line block start patterns — when matched, consecutive non-blank
+ *  lines from this point are removed (up to MAX_BLOCK_LINES). */
 const BLOCK_START_PATTERNS: RegExp[] = [
   /^\s*(?:DEPARTMENT|DEPT\.?)\s+\S+\s+LAW\s+AND\s+MOTION\s+RULINGS?\s*$/i,
   /^\s*if\s+you\s+wish\s+to\s+submit\s+on\s+the\s+tentative/i,
   /^\s*if\s+you\s+intend\s+to\s+submit\s+on\s+this\s+tentative/i,
 ];
+
+/** Maximum number of lines a boilerplate block can consume. Prevents runaway
+ *  removal when the source text has no blank lines (e.g. LA ruling PDFs).
+ *  Boilerplate blocks are typically 1 header + 2-4 instruction lines. */
+const MAX_BLOCK_LINES = 5;
 
 /** Remove boilerplate header/instruction lines and multi-line blocks. */
 export function stripBoilerplate(text: string): string {
@@ -95,10 +100,18 @@ export function stripBoilerplate(text: string): string {
       continue;
     }
 
-    // Multi-line block start
+    // Multi-line block start — remove up to MAX_BLOCK_LINES consecutive
+    // non-blank lines. The cap prevents runaway removal when the source
+    // text has no blank lines separating boilerplate from content.
     if (BLOCK_START_PATTERNS.some((p) => p.test(line))) {
-      while (i < lines.length && lines[i].trim().length > 0) {
+      let removed = 0;
+      while (
+        i < lines.length &&
+        lines[i].trim().length > 0 &&
+        removed < MAX_BLOCK_LINES
+      ) {
         i++;
+        removed++;
       }
       continue;
     }
