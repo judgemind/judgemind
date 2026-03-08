@@ -186,9 +186,11 @@ if [[ -n "$SCRIPT_PATH" ]]; then
         script_args="$script_args '$(printf '%s' "$arg" | sed "s/'/'\\\\''/g")'"
     done
 
-    # The remote command: decode the script to a temp file, run it, clean up
+    # The remote command: decode the script to a temp file, run it, clean up.
+    # Wrapped in bash -c because ECS Exec's --command runs a single executable
+    # without a shell — pipes, redirects, and && are not supported otherwise.
     remote_script="/tmp/_ecs_run_script"
-    cmd="echo '$encoded' | base64 -d > $remote_script && $interpreter $remote_script$script_args; rm -f $remote_script"
+    cmd="bash -c 'echo $encoded | base64 -d > $remote_script && $interpreter $remote_script$script_args; rm -f $remote_script'"
 
     echo "Transferring script: $SCRIPT_PATH" >&2
     echo "Interpreter: $interpreter" >&2
