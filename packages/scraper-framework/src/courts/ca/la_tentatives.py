@@ -64,6 +64,24 @@ _CASE_TITLE_RE = re.compile(
     re.DOTALL | re.MULTILINE,
 )
 
+# Like _CASE_TITLE_RE but also captures the role keywords so we can map names to roles.
+_CASE_PARTIES_RE = re.compile(
+    r"^(?P<plaintiff>.+?),?\s*\n\s*(?P<p_role>Plaintiff|Petitioner|Cross-Complainant)\(?s?\)?,?"
+    r"\s+vs\.\s+"
+    r"(?P<defendant>.+?),?\s*\n\s*(?P<d_role>Defendant|Respondent|Cross-Defendant)\(?s?\)?\.?",
+    re.DOTALL | re.MULTILINE,
+)
+
+# Map caption role keywords to normalized role values for the case_parties table.
+_ROLE_MAP: dict[str, str] = {
+    "plaintiff": "plaintiff",
+    "petitioner": "petitioner",
+    "cross-complainant": "cross_complainant",
+    "defendant": "defendant",
+    "respondent": "respondent",
+    "cross-defendant": "cross_defendant",
+}
+
 # ---------------------------------------------------------------------------
 # Fallback title extraction patterns (text-based, for rulings without anchors)
 # ---------------------------------------------------------------------------
@@ -300,6 +318,9 @@ def _extract_ruling_fields(soup: BeautifulSoup, doc: CapturedDocument) -> None:
     # Case title from the party caption block
     doc.case_title = _extract_case_title(content)
 
+    # Party extraction
+    doc.parties = _extract_parties(content)
+
     # Judge name from the signature div
     for div in content.find_all("div"):
         div_text = div.get_text(separator=" ", strip=True)
@@ -439,6 +460,144 @@ def _extract_title_from_case_name_field(text: str) -> str | None:
         return None
 
     return title
+
+
+# ---------------------------------------------------------------------------
+# Party extraction
+# ---------------------------------------------------------------------------
+
+
+def _extract_parties(content: BeautifulSoup) -> list[dict[str, str]]:
+    """Extract party names and roles from ruling HTML content.
+
+    Tries multiple extraction strategies in order of reliability:
+
+    1. ``<a name="Parties">`` anchor with formal caption block (most reliable)
+    2. "MOVING PARTY:" / "RESPONDING PARTY:" fields (fallback)
+
+    Returns a list of dicts, each with ``name`` and ``role`` keys.
+    """
+    parties = _extract_parties_from_anchor(content)
+    if parties:
+        return parties
+
+    full_text = content.get_text(separator="\n", strip=True)
+    return _extract_parties_from_moving_responding(full_text)
+
+
+def _extract_parties_from_anchor(content: BeautifulSoup) -> list[dict[str, str]]:
+    """Extract party records from ``<a name="Parties">`` anchor blocks.
+
+    Finds all Parties anchors in the content (one per case in multi-case
+    responses), parses the enclosing ``<td>`` text to identify plaintiff/
+    defendant names and their roles.
+    """
+    parties: list[dict[str, str]] = []
+    seen_names: set[str] = set()
+
+    for anchor in content.find_all("a", attrs={"name": "Parties"}):
+        td = anchor.find_parent("td")
+        if td is None:
+            continue
+
+        td_text = td.get_text(separator="\n", strip=False)
+        m = _CASE_PARTIES_RE.search(td_text)
+        if m is None:
+            continue
+
+        p_role = _ROLE_MAP.get(m.group("p_role").lower(), "plaintiff")
+        d_role = _ROLE_MAP.get(m.group("d_role").lower(), "defendant")
+
+        plaintiff_raw = " ".join(m.group("plaintiff").split()).strip().rstrip(",")
+        defendant_raw = " ".join(m.group("defendant").split()).strip().rstrip(",")
+
+        plaintiff_name = _clean_party_name(plaintiff_raw)
+        defendant_name = _clean_party_name(defendant_raw)
+
+        if plaintiff_name:
+            key = plaintiff_name.lower()
+            if key not in seen_names:
+                seen_names.add(key)
+                parties.append({"name": plaintiff_name.title(), "role": p_role})
+
+        if defendant_name:
+            key = defendant_name.lower()
+            if key not in seen_names:
+                seen_names.add(key)
+                parties.append({"name": defendant_name.title(), "role": d_role})
+
+    return parties
+
+
+def _extract_parties_from_moving_responding(text: str) -> list[dict[str, str]]:
+    """Extract party records from MOVING PARTY / RESPONDING PARTY fields.
+
+    Uses ``moving_party`` and ``responding_party`` as roles since the
+    actual plaintiff/defendant designation is unclear from these fields.
+    Individual names are split on " and " when multiple are listed.
+    """
+    m_match = _MOVING_PARTY_RE.search(text)
+    if m_match is None:
+        return []
+    r_match = _RESPONDING_PARTY_RE.search(text)
+    if r_match is None:
+        return []
+
+    moving_raw = m_match.group("name").strip()
+    responding_raw = r_match.group("name").strip()
+
+    # Reject non-party content like "No opposition filed"
+    skip_phrases = ("no opposition", "none", "no response", "unopposed")
+    for phrase in skip_phrases:
+        if phrase in responding_raw.lower():
+            return []
+
+    parties: list[dict[str, str]] = []
+    seen_names: set[str] = set()
+
+    for raw_name, role in [
+        (moving_raw, "moving_party"),
+        (responding_raw, "responding_party"),
+    ]:
+        # Split on " and " to get individual names when multiple are listed
+        # e.g. "Plaintiffs David Keichline, Claudia Lopez, and Mason Keichline"
+        cleaned = _clean_party_name(raw_name)
+        if not cleaned:
+            continue
+
+        # Try splitting on ", and " or " and " for multiple names
+        # But be careful: "Ashley Willowbrook LP and Ashley Willowbrook GP LP"
+        # is two separate entities, while "David Keichline, Claudia Lopez, and
+        # Mason Keichline" is three people.
+        sub_names = _split_party_names(cleaned)
+        for name in sub_names:
+            name = name.strip().strip(")(,.; ")
+            if not name:
+                continue
+            key = name.lower()
+            if key not in seen_names:
+                seen_names.add(key)
+                parties.append({"name": name.title(), "role": role})
+
+    return parties
+
+
+def _split_party_names(text: str) -> list[str]:
+    """Split a string containing multiple party names into individual names.
+
+    Handles patterns like:
+    - "David Keichline, Claudia Lopez, and Mason Keichline"
+    - "Ashley Willowbrook LP and Ashley Willowbrook GP LP"
+
+    Uses ", " as the primary delimiter. Also splits on " and " when it
+    appears after a comma-separated list (Oxford comma pattern).
+    """
+    # First, handle Oxford comma: "A, B, and C" -> split on ", " and ", and "
+    parts = re.split(r",\s+and\s+|,\s+", text)
+    # If no commas found, try splitting on standalone " and "
+    if len(parts) == 1:
+        parts = re.split(r"\s+and\s+", text)
+    return [p.strip() for p in parts if p.strip()]
 
 
 # ---------------------------------------------------------------------------

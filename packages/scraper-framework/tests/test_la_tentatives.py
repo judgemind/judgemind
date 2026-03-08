@@ -19,6 +19,8 @@ from courts.ca.la_tentatives import (
     LATentativeRulingsScraper,
     _extract_aspnet_tokens,
     _extract_case_title,
+    _extract_parties,
+    _extract_parties_from_anchor,
     _extract_ruling_fields,
     _is_stale_viewstate_response,
     _parse_dropdown_options,
@@ -504,3 +506,165 @@ def test_full_run_stale_viewstate_mixed_with_real() -> None:
 
     assert health.success is True
     assert health.records_captured == 95  # 97 options - 2 stale-ViewState skips
+
+
+# ---------------------------------------------------------------------------
+# _extract_parties — party extraction from real fixtures
+# ---------------------------------------------------------------------------
+
+
+def test_extract_parties_from_fixture() -> None:
+    """Extract parties from the real fixture HTML (la_ruling_response.html).
+
+    This fixture has 2 cases with Parties anchors:
+    1. SUMAYYA AASI (Plaintiff) vs. AMERICAN HONDA MOTOR CO., INC. (Defendant)
+    2. MIC-BRY8, LLC (Petitioner) vs. CERTAIN STATUTORY INTERESTED PARTIES... (Respondent)
+    """
+    from bs4 import BeautifulSoup
+
+    html = _load("la_ruling_response.html")
+    soup = BeautifulSoup(html, "lxml")
+    content = soup.find("div", id="speechSynthesis")
+    parties = _extract_parties(content)
+    assert len(parties) >= 2
+
+    # Check that plaintiff/defendant roles are present
+    roles = {p["role"] for p in parties}
+    assert "plaintiff" in roles or "petitioner" in roles
+    assert "defendant" in roles or "respondent" in roles
+
+    # Check that Aasi is found as a party
+    names_lower = [p["name"].lower() for p in parties]
+    assert any("aasi" in n for n in names_lower)
+
+
+def test_extract_parties_from_anchor_fixture() -> None:
+    """_extract_parties_from_anchor finds parties in la_ruling_response.html."""
+    from bs4 import BeautifulSoup
+
+    html = _load("la_ruling_response.html")
+    soup = BeautifulSoup(html, "lxml")
+    content = soup.find("div", id="speechSynthesis")
+    parties = _extract_parties_from_anchor(content)
+    assert len(parties) >= 2
+
+    # First case: Aasi (plaintiff) vs Honda (defendant)
+    plaintiff_parties = [p for p in parties if p["role"] == "plaintiff"]
+    defendant_parties = [p for p in parties if p["role"] == "defendant"]
+    assert len(plaintiff_parties) >= 1
+    assert len(defendant_parties) >= 1
+    assert any("Aasi" in p["name"] for p in plaintiff_parties)
+    assert any("Honda" in p["name"] for p in defendant_parties)
+
+
+def test_extract_parties_from_anchor_petitioner_respondent() -> None:
+    """The second case in la_ruling_response.html uses petitioner/respondent roles."""
+    from bs4 import BeautifulSoup
+
+    html = _load("la_ruling_response.html")
+    soup = BeautifulSoup(html, "lxml")
+    content = soup.find("div", id="speechSynthesis")
+    parties = _extract_parties_from_anchor(content)
+
+    roles = {p["role"] for p in parties}
+    assert "petitioner" in roles
+    assert "respondent" in roles
+
+
+def test_extract_parties_from_com_a_fixture() -> None:
+    """COM A fixture has Parties anchor — DAVID KEICHLINE vs ASHLEY WILLOWBROOK LP."""
+    from bs4 import BeautifulSoup
+
+    html = _load("la_ruling_com_a.html")
+    soup = BeautifulSoup(html, "lxml")
+    content = soup.find("div", id="speechSynthesis")
+    parties = _extract_parties(content)
+    assert len(parties) >= 2
+
+    names_lower = [p["name"].lower() for p in parties]
+    assert any("keichline" in n for n in names_lower)
+    assert any("willowbrook" in n for n in names_lower)
+
+
+def test_extract_parties_sets_doc_field() -> None:
+    """_extract_ruling_fields populates doc.parties from the fixture."""
+    from bs4 import BeautifulSoup
+
+    doc = _make_ruling_doc()
+    soup = BeautifulSoup(doc.raw_content, "lxml")
+    _extract_ruling_fields(soup, doc)
+    assert len(doc.parties) >= 2
+
+    # Verify name and role keys are present
+    for party in doc.parties:
+        assert "name" in party
+        assert "role" in party
+        assert party["name"]
+        assert party["role"]
+
+
+def test_extract_parties_moving_responding_fallback() -> None:
+    """When no Parties anchor, extract from MOVING/RESPONDING PARTY fields."""
+    from bs4 import BeautifulSoup
+
+    html = (
+        "<div id='speechSynthesis'>"
+        "<p>MOVING PARTY: Defendant Rayne Dealership Corporation.</p>"
+        "<p>RESPONDING PARTY: Plaintiffs Alpha Beta and Gamma Delta.</p>"
+        "<p>The motion is DENIED.</p>"
+        "</div>"
+    )
+    soup = BeautifulSoup(html, "lxml")
+    content = soup.find("div", id="speechSynthesis")
+    parties = _extract_parties(content)
+    assert len(parties) >= 2
+
+    # Role prefixes should be stripped from names
+    for party in parties:
+        assert "Defendant" not in party["name"]
+        assert "Plaintiffs" not in party["name"]
+
+    # Check roles are moving_party/responding_party
+    roles = {p["role"] for p in parties}
+    assert "moving_party" in roles
+    assert "responding_party" in roles
+
+
+def test_extract_parties_moving_responding_no_opposition() -> None:
+    """No opposition filed returns empty parties list."""
+    from bs4 import BeautifulSoup
+
+    html = (
+        "<div id='speechSynthesis'>"
+        "<p>MOVING PARTY: Defendant Big Corp.</p>"
+        "<p>RESPONDING PARTY: No opposition filed.</p>"
+        "</div>"
+    )
+    soup = BeautifulSoup(html, "lxml")
+    content = soup.find("div", id="speechSynthesis")
+    parties = _extract_parties(content)
+    assert parties == []
+
+
+def test_extract_parties_no_parties_anchor_no_moving() -> None:
+    """When no Parties anchor and no MOVING PARTY, return empty list."""
+    from bs4 import BeautifulSoup
+
+    html = "<div id='speechSynthesis'><p>Some ruling text.</p></div>"
+    soup = BeautifulSoup(html, "lxml")
+    content = soup.find("div", id="speechSynthesis")
+    parties = _extract_parties(content)
+    assert parties == []
+
+
+def test_extract_parties_names_are_title_cased() -> None:
+    """Party names should be title-cased."""
+    from bs4 import BeautifulSoup
+
+    html = _load("la_ruling_response.html")
+    soup = BeautifulSoup(html, "lxml")
+    content = soup.find("div", id="speechSynthesis")
+    parties = _extract_parties(content)
+    for party in parties:
+        # Title case: first letter of each word capitalized
+        assert party["name"] == party["name"].title()

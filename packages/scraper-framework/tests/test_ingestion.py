@@ -14,7 +14,14 @@ import psycopg
 import psycopg.errors
 import pytest
 
-from ingestion.db import _derive_court_code, normalize_judge_name, upsert_case
+from ingestion.db import (
+    _derive_court_code,
+    normalize_judge_name,
+    normalize_party_name,
+    upsert_case,
+    upsert_case_party,
+    upsert_party,
+)
 from ingestion.worker import (
     InfrastructureError,
     IngestionWorker,
@@ -872,3 +879,177 @@ def test_process_event_without_case_title_passes_none(mock_psycopg: MagicMock) -
     sql_args = case_calls[0][0][1]
     # None should be the 4th argument (case_title)
     assert None in sql_args
+
+
+# ---------------------------------------------------------------------------
+# Party name normalization
+# ---------------------------------------------------------------------------
+
+
+def test_normalize_party_name_basic() -> None:
+    """Basic party name normalization."""
+    assert normalize_party_name("  sumayya aasi  ") == "Sumayya Aasi"
+
+
+def test_normalize_party_name_collapses_whitespace() -> None:
+    """Extra whitespace is collapsed."""
+    assert normalize_party_name("AMERICAN  HONDA  MOTOR  CO.") == "American Honda Motor Co."
+
+
+def test_normalize_party_name_title_case() -> None:
+    """Names are title-cased."""
+    assert normalize_party_name("DAVID KEICHLINE") == "David Keichline"
+
+
+# ---------------------------------------------------------------------------
+# upsert_party
+# ---------------------------------------------------------------------------
+
+
+def test_upsert_party_existing_alias() -> None:
+    """upsert_party returns existing party_id when alias matches."""
+    mock_conn = MagicMock()
+    mock_cur = MagicMock()
+    mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cur)
+    mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+
+    # Simulate existing alias found
+    mock_cur.fetchone.return_value = ("existing-party-uuid",)
+
+    result = upsert_party(mock_conn, "Sumayya Aasi")
+
+    assert result == "existing-party-uuid"
+    # Should NOT insert a new party
+    all_sql = " ".join(str(c) for c in mock_cur.execute.call_args_list)
+    assert "INSERT INTO parties" not in all_sql
+
+
+def test_upsert_party_creates_new() -> None:
+    """upsert_party creates a new party and alias when no match exists."""
+    mock_conn = MagicMock()
+    mock_cur = MagicMock()
+    mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cur)
+    mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+
+    # No existing alias, then INSERT returns new party id
+    mock_cur.fetchone.side_effect = [None, ("new-party-uuid",)]
+
+    result = upsert_party(mock_conn, "Sumayya Aasi")
+
+    assert result == "new-party-uuid"
+    all_sql = " ".join(str(c) for c in mock_cur.execute.call_args_list)
+    assert "INSERT INTO parties" in all_sql
+    assert "INSERT INTO party_aliases" in all_sql
+
+
+def test_upsert_party_with_party_type() -> None:
+    """upsert_party passes party_type to INSERT."""
+    mock_conn = MagicMock()
+    mock_cur = MagicMock()
+    mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cur)
+    mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+
+    mock_cur.fetchone.side_effect = [None, ("new-party-uuid",)]
+
+    result = upsert_party(mock_conn, "Acme Corp", party_type="corporation")
+
+    assert result == "new-party-uuid"
+    # Verify party_type was passed
+    insert_calls = [c for c in mock_cur.execute.call_args_list if "INSERT INTO parties" in str(c)]
+    assert len(insert_calls) == 1
+    sql_args = insert_calls[0][0][1]
+    assert "corporation" in sql_args
+
+
+# ---------------------------------------------------------------------------
+# upsert_case_party
+# ---------------------------------------------------------------------------
+
+
+def test_upsert_case_party_executes_insert() -> None:
+    """upsert_case_party executes the INSERT SQL."""
+    mock_conn = MagicMock()
+    mock_cur = MagicMock()
+    mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cur)
+    mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+
+    upsert_case_party(mock_conn, "case-uuid-1", "party-uuid-1", "plaintiff")
+
+    mock_cur.execute.assert_called_once()
+    sql = str(mock_cur.execute.call_args)
+    assert "INSERT INTO case_parties" in sql
+    assert "NOT EXISTS" in sql
+
+
+# ---------------------------------------------------------------------------
+# process_event — party processing
+# ---------------------------------------------------------------------------
+
+
+@patch("ingestion.worker.psycopg")
+def test_process_event_with_parties(mock_psycopg: MagicMock) -> None:
+    """When event carries parties, party records and case_party links are created."""
+    worker, os_mock = _make_worker()
+
+    mock_conn = MagicMock()
+    mock_cur = MagicMock()
+    mock_conn.__enter__ = MagicMock(return_value=mock_conn)
+    mock_conn.__exit__ = MagicMock(return_value=False)
+    mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cur)
+    mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+    mock_psycopg.connect.return_value = mock_conn
+    mock_cur.fetchone.side_effect = [
+        ("court-uuid-1",),  # upsert_court
+        ("case-uuid-1",),  # upsert_case
+        None,  # resolve_judge: no existing alias
+        ("judge-uuid-1",),  # resolve_judge: INSERT INTO judges
+        # upsert_party for first party: no existing alias, then INSERT
+        None,
+        ("party-uuid-1",),
+        # upsert_party for second party: no existing alias, then INSERT
+        None,
+        ("party-uuid-2",),
+    ]
+    mock_cur.rowcount = 1
+
+    event = _make_event(
+        parties=[
+            {"name": "Sumayya Aasi", "role": "plaintiff"},
+            {"name": "American Honda Motor Co.", "role": "defendant"},
+        ]
+    )
+    worker.process_event(event)
+
+    mock_conn.commit.assert_called_once()
+
+    all_sql = " ".join(str(c) for c in mock_cur.execute.call_args_list)
+    assert "INSERT INTO parties" in all_sql
+    assert "INSERT INTO party_aliases" in all_sql
+    assert "INSERT INTO case_parties" in all_sql
+
+
+@patch("ingestion.worker.psycopg")
+def test_process_event_without_parties_no_party_calls(mock_psycopg: MagicMock) -> None:
+    """When event has no parties, no party DB calls are made."""
+    worker, os_mock = _make_worker()
+
+    mock_conn = MagicMock()
+    mock_cur = MagicMock()
+    mock_conn.__enter__ = MagicMock(return_value=mock_conn)
+    mock_conn.__exit__ = MagicMock(return_value=False)
+    mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cur)
+    mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+    mock_psycopg.connect.return_value = mock_conn
+    mock_cur.fetchone.side_effect = [
+        ("court-uuid-1",),  # upsert_court
+        ("case-uuid-1",),  # upsert_case
+        None,  # resolve_judge: no existing alias
+        ("judge-uuid-1",),  # resolve_judge: INSERT INTO judges
+    ]
+    mock_cur.rowcount = 1
+
+    event = _make_event()  # no parties key
+    worker.process_event(event)
+
+    all_sql = " ".join(str(c) for c in mock_cur.execute.call_args_list)
+    assert "INSERT INTO case_parties" not in all_sql

@@ -110,6 +110,7 @@ class CapturedDocument(BaseModel):
     ruling_text: str | None = None
     outcome: str | None = None
     motion_type: str | None = None
+    parties: list[dict[str, str]] = Field(default_factory=list)
     extra: dict[str, Any] = Field(default_factory=dict)
 
     # Archival
@@ -159,6 +160,7 @@ class DocumentCapturedEvent(EventEnvelope):
     judge_name: str | None
     hearing_date: datetime | None
     capture_timestamp: datetime
+    parties: list[dict[str, str]] = Field(default_factory=list)
 
 
 class ScraperHealthEvent(EventEnvelope):
