@@ -5,12 +5,12 @@ import {
 } from '../src/lib/display-helpers';
 
 describe('buildCaseHeading', () => {
-  it('shows case title and number when both are present', () => {
+  it('shows only the case title when both title and number are present', () => {
     const result = buildCaseHeading(
       { caseNumber: '23STCV12345', caseTitle: 'Smith v. Jones' },
       'some-uuid',
     );
-    expect(result).toBe('Smith v. Jones \u2014 23STCV12345');
+    expect(result).toBe('Smith v. Jones');
   });
 
   it('shows only case number when title is null', () => {

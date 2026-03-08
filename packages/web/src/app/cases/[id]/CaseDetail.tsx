@@ -340,6 +340,26 @@ export function CaseDetail({ caseId }: { caseId: string }) {
 
   const { plaintiffs, defendants, others } = groupParties(caseRecord.parties);
 
+  // Derive unique judges from rulings when the case-level judges list is empty.
+  const judgesFromRulings = (() => {
+    if (caseRecord.judges.length > 0) return [];
+    const seen = new Set<string>();
+    const result: Array<{ id: string; canonicalName: string; department: string | null }> = [];
+    for (const { node } of edges) {
+      if (node.judge && !seen.has(node.judge.canonicalName)) {
+        seen.add(node.judge.canonicalName);
+        result.push({
+          id: node.judge.canonicalName, // no judge id from rulings query
+          canonicalName: node.judge.canonicalName,
+          department: node.department,
+        });
+      }
+    }
+    return result;
+  })();
+
+  const displayJudges = caseRecord.judges.length > 0 ? caseRecord.judges : judgesFromRulings;
+
   return (
     <div>
       {/* Case metadata */}
@@ -395,13 +415,13 @@ export function CaseDetail({ caseId }: { caseId: string }) {
         <h2 className="text-sm font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">
           Judges
         </h2>
-        {caseRecord.judges.length === 0 ? (
+        {displayJudges.length === 0 ? (
           <p className="mt-2 text-sm text-slate-400 dark:text-slate-500">
             No judges assigned.
           </p>
         ) : (
           <ul className="mt-2 space-y-1">
-            {caseRecord.judges.map((judge) => (
+            {displayJudges.map((judge) => (
               <li key={judge.id} className="text-sm text-slate-900 dark:text-slate-100">
                 <Link
                   href={`/judges/${judge.id}`}

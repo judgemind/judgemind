@@ -355,13 +355,23 @@ export const resolvers = {
     court: (row: Row, _: unknown, { loaders }: Context) =>
       row.court_id ? loaders.courtLoader.load(row.court_id as string) : null,
     judges: async (row: Row, _: unknown, { pool }: Context) => {
+      // Try the explicit case_judges link table first.
       const { rows } = await pool.query<Row>(
         `SELECT j.* FROM judges j
          JOIN case_judges cj ON cj.judge_id = j.id
          WHERE cj.case_id = $1`,
         [row.id],
       );
-      return rows;
+      if (rows.length > 0) return rows;
+
+      // Fall back to judges referenced by the case's rulings.
+      const { rows: fromRulings } = await pool.query<Row>(
+        `SELECT DISTINCT j.* FROM judges j
+         JOIN rulings r ON r.judge_id = j.id
+         WHERE r.case_id = $1`,
+        [row.id],
+      );
+      return fromRulings;
     },
     parties: async (row: Row, _: unknown, { pool }: Context) => {
       const { rows } = await pool.query<Row>(
