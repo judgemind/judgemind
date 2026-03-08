@@ -2,6 +2,16 @@
 
 Machine-readable checklist of rules extracted from CLAUDE.md. Agents should validate proposed actions against this checklist before execution.
 
+## Enforced Rules (hook + scripts/preflight.sh)
+
+| ID | Rule | Enforcement | Script Function |
+|----|------|-------------|-----------------|
+| E-01 | No `$()`, heredocs, or backtick expansion | PreToolUse hook blocks | `preflight_no_forbidden_syntax` |
+| E-02 | Fetch/rebase before analyzing code | Manual / script check | `preflight_branch_fresh --fetch` |
+| E-03 | Must be in a worktree during task work | Manual / script check | `preflight_in_worktree` |
+| E-04 | Venv must be local to worktree | Manual / script check | `preflight_venv_local` |
+| E-05 | Never push to main/master | PreToolUse hook blocks | `preflight_not_on_main` |
+
 ## Shell Command Rules
 
 | ID | Rule | Pattern to Reject | Fix |

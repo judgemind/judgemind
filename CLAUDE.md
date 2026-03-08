@@ -29,6 +29,29 @@ These are the most frequently violated rules. **A PreToolUse hook enforces the s
 - **ALWAYS** watch CI to completion (`gh run watch`) before doing anything else after pushing.
 - **ALWAYS** create a PR immediately after your first push to a branch.
 
+## Enforced Rules — Automated Checks
+
+These rules address the most common friction patterns from real sessions. Each has an automated enforcement mechanism — either the PreToolUse hook (`.claude/hooks/preflight-bash.sh`) or runtime checks in `scripts/preflight.sh`.
+
+| # | Friction Pattern | Rule | Enforcement |
+|---|---|---|---|
+| E1 | 20× `$()` / special chars triggering prompts | **Never use `$()`, heredocs, or backtick expansion in Bash commands.** Run the inner command as a separate tool call, capture the literal output, and paste it into the next command. For multi-line content, write to `{worktree}/tmp/` and use `--body-file` or `-F`. | PreToolUse hook blocks `$(`, `<<EOF`, `python -c`. |
+| E2 | 6× acting on stale code | **Always fetch and rebase before analyzing or modifying code.** Before any implementation work: `git fetch origin main && git rebase origin/main`. Before reading code to answer a question: at minimum `git fetch origin main` and verify you're not behind. Never trust cached file contents from a previous session. | `preflight_branch_fresh --fetch` in `scripts/preflight.sh`. |
+| E3 | Multiple worktree/venv path errors | **Verify you are in a worktree, not the main repo.** During task work, your pwd must be inside a worktree (`worktrees/worker-N/`). Your `.venv` must be inside the worktree's package directory — never reuse the main repo's venv or another worktree's venv. | `preflight_in_worktree` and `preflight_venv_local` in `scripts/preflight.sh`. |
+| E4 | Pushing to main | **Never push to main/master.** The PreToolUse hook blocks `git push` commands that target main or run while on main. All changes go through feature branches and PRs. The only exception: the user explicitly directs you to push to main in an interactive session. | PreToolUse hook blocks `git push` to main/master. |
+
+### How to use `scripts/preflight.sh`
+
+Source the file and call individual checks. Each function returns non-zero on failure with a diagnostic message:
+
+```bash
+source scripts/preflight.sh
+preflight_in_worktree       # Fail if pwd is main repo, not a worktree
+preflight_not_on_main       # Fail if on main/master branch
+preflight_branch_fresh      # Fail if behind origin/main (add --fetch to fetch first)
+preflight_venv_local        # Fail if .venv is missing or is a symlink
+```
+
 ## Project Context
 
 Judgemind is a free, open-source legal research platform replacing Trellis.law. Read the specs in `docs/specs/` for full context. The key things to know:
