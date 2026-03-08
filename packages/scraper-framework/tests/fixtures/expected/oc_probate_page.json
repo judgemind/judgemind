@@ -1,0 +1,16 @@
+{
+  "_fixture": "oc_probate_page.html",
+  "_description": "OC Probate tentative rulings index page. Lists departments with PDF links.",
+  "_captured": "2026-03-07",
+  "pdf_link_count": 6,
+  "courthouse_distribution": {
+    "Costa Mesa Justice Center (CM)": 6
+  },
+  "first_link": {
+    "link_text": "CM3 Law and Motion",
+    "href_contains": "CM3rulings",
+    "courthouse": "Costa Mesa Justice Center"
+  },
+  "link_text_format": "CMN Law and Motion",
+  "_notes": "6 links on 2026-03-07. No judge names in link text — must extract from PDF. All departments are CM* (Costa Mesa)."
+}

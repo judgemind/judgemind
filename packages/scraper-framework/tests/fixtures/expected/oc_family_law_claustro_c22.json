@@ -1,0 +1,24 @@
+{
+  "_fixture": "oc_family_law_claustro_c22.pdf",
+  "_description": "OC Family Law — Dept C22 (Judge Israel Claustro). 1-page PDF with 3 family law cases.",
+  "_link_text": "CLAUSTRO, Israel - Dept C22",
+  "_captured": "2026-03-07",
+  "courthouse": "Central Justice Center",
+  "department": "C22",
+  "judge_name": "Israel Claustro",
+  "page_count": 1,
+  "case_count": 3,
+  "primary_case_number": "25D006297",
+  "case_number_format": "DDdDDDDDD",
+  "hearing_date": "December 5, 2025",
+  "case_title": "BAEZ V. BAEZ",
+  "outcome": "OFF CALENDAR",
+  "motion_type": "Request for Order",
+  "ruling_text_contains": [
+    "TENTATIVE RULINGS",
+    "DEPARTMENT C22",
+    "Judge Israel Claustro",
+    "CENTRAL JUSTICE CENTER"
+  ],
+  "_notes": "Family law format. Case numbers: 2-digit year + D + 6 digits. Outcomes in ruling text. RFO is primary motion type."
+}

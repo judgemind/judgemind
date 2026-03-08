@@ -1,0 +1,23 @@
+{
+  "_fixture": "oc_probate_cm5.pdf",
+  "_description": "OC Probate — Dept CM05 (Judge Ebrahim Baytieh). 6-page PDF with 3 cases.",
+  "_link_text": "CM5 Law and Motion",
+  "_captured": "2026-03-07",
+  "courthouse": "Costa Mesa Justice Center",
+  "department": "CM05",
+  "judge_name": "Ebrahim Baytieh",
+  "page_count": 6,
+  "case_count": 3,
+  "primary_case_number": "01430606",
+  "case_number_format": "0DDDDDDD",
+  "hearing_date": "2026-02-19",
+  "case_title": "Collins - Trust",
+  "outcome": "DENIED",
+  "motion_type": "MOTION FOR PROTECTIVE ORDER",
+  "ruling_text_contains": [
+    "TENTATIVE RULINGS FOR DEPARTMENT CM05",
+    "HON. Judge Ebrahim Baytieh",
+    "Date: 02/19/26"
+  ],
+  "_notes": "Probate format. Multiple cases. First case is Collins Trust with protective order motion."
+}

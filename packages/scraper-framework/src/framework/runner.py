@@ -44,6 +44,10 @@ def _build_registry() -> list[tuple[str, type, callable]]:
 
     from courts.ca.la_tentatives import LATentativeRulingsScraper
     from courts.ca.la_tentatives import default_config as la_config
+    from courts.ca.oc_family_law_tentatives import OCFamilyLawTentativeRulingsScraper
+    from courts.ca.oc_family_law_tentatives import default_config as oc_fl_config
+    from courts.ca.oc_probate_tentatives import OCProbateTentativeRulingsScraper
+    from courts.ca.oc_probate_tentatives import default_config as oc_probate_config
     from courts.ca.oc_tentatives import OCTentativeRulingsScraper
     from courts.ca.oc_tentatives import default_config as oc_config
     from courts.ca.riverside_tentatives import RiversideTentativeRulingsScraper
@@ -57,6 +61,8 @@ def _build_registry() -> list[tuple[str, type, callable]]:
         [
             ("ca-la-tentatives-civil", LATentativeRulingsScraper, la_config),
             ("ca-oc-tentatives", OCTentativeRulingsScraper, oc_config),
+            ("ca-oc-tentatives-family-law", OCFamilyLawTentativeRulingsScraper, oc_fl_config),
+            ("ca-oc-tentatives-probate", OCProbateTentativeRulingsScraper, oc_probate_config),
             ("ca-riverside-tentatives", RiversideTentativeRulingsScraper, riverside_config),
             ("ca-sb-tentatives", SBTentativeRulingsScraper, sb_config),
             ("ca-sf-tentatives-family-law", SFTentativeRulingsScraper, sf_config),
