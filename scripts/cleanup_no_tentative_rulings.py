@@ -66,6 +66,11 @@ DELETE_RULINGS_QUERY = """
     WHERE case_id = %s::uuid
 """
 
+DELETE_DOCUMENTS_QUERY = """
+    DELETE FROM documents
+    WHERE case_id = %s::uuid
+"""
+
 DELETE_CASE_QUERY = """
     DELETE FROM cases
     WHERE id = %s::uuid
@@ -109,6 +114,7 @@ def cleanup_batch(
 
         with conn.cursor() as cur:
             cur.execute(DELETE_RULINGS_QUERY, (str(case_id),))
+            cur.execute(DELETE_DOCUMENTS_QUERY, (str(case_id),))
             cur.execute(DELETE_CASE_QUERY, (str(case_id),))
         deleted += 1
 
