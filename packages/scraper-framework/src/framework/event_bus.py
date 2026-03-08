@@ -11,15 +11,15 @@ Usage:
 
 from __future__ import annotations
 
-import logging
 import os
 
 import redis
+import structlog
 
 from .events import EventBus
 from .models import CapturedDocument, ScraperHealthEvent
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 
 
 class RedisEventBus:
@@ -37,12 +37,12 @@ class RedisEventBus:
                 client = redis.Redis.from_url(redis_url, decode_responses=False)
                 client.ping()
                 self._inner = EventBus(client)
-                logger.info("Redis event bus connected: %s", redis_url)
+                logger.info("Redis event bus connected", redis_url=redis_url)
             except redis.RedisError as exc:
                 logger.warning(
-                    "Redis event bus unavailable (%s), events will be skipped: %s",
-                    redis_url,
-                    exc,
+                    "Redis event bus unavailable, events will be skipped",
+                    redis_url=redis_url,
+                    error=str(exc),
                 )
         else:
             logger.info("REDIS_URL not set — event emission disabled")
@@ -72,7 +72,7 @@ class RedisEventBus:
                 doc, producer_id=producer_id, correlation_id=correlation_id
             )
         except Exception as exc:
-            logger.warning("Failed to emit document.captured event: %s", exc)
+            logger.warning("Failed to emit document.captured event", error=str(exc))
             return None
 
     def emit_health(self, event: ScraperHealthEvent) -> str | None:
@@ -83,5 +83,5 @@ class RedisEventBus:
         try:
             return self._inner.emit_health(event)
         except Exception as exc:
-            logger.warning("Failed to emit scraper.health event: %s", exc)
+            logger.warning("Failed to emit scraper.health event", error=str(exc))
             return None
