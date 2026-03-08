@@ -79,5 +79,13 @@ if echo "$COMMAND" | grep -qE '&&|;' ; then
     fi
 fi
 
+# 6. Consecutive quote characters at word start (potential obfuscation)
+#    Catches patterns like ""word, ''word, "'word, '"word at word boundaries.
+#    These serve no legitimate purpose and may be attempts to bypass other checks.
+if echo "$COMMAND" | grep -qE '(^|[[:space:]])(["'"'"']){2,}[a-zA-Z]' ; then
+    echo "BLOCKED: Command contains consecutive quote characters at word start (potential obfuscation). See CLAUDE.md §Unattended Operation Patterns." >&2
+    exit 2
+fi
+
 # All checks passed
 exit 0
