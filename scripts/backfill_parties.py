@@ -74,12 +74,18 @@ _ROLE_PREFIX_RE = re.compile(
 )
 
 
+MAX_PARTY_NAME_LENGTH = 500  # btree index limit is ~900 chars; stay well under
+
+
 def _clean_party_name(raw: str) -> str:
     """Normalise a captured party name."""
     name = " ".join(raw.split()).strip()
     name = _ROLE_PREFIX_RE.sub("", name)
     name = re.sub(r",?\s*et\s+al\.?\s*$", "", name, flags=re.IGNORECASE).strip()
     name = name.strip(")(,.; ")
+    # Truncate excessively long names to stay within btree index limits
+    if len(name) > MAX_PARTY_NAME_LENGTH:
+        name = name[:MAX_PARTY_NAME_LENGTH].rsplit(" ", 1)[0]
     return name
 
 
@@ -288,14 +294,22 @@ def backfill_batch(
         for party_info in parties:
             party_name = party_info["name"]
             party_role = party_info["role"]
-            party_id = _upsert_party(conn, party_name)
+            try:
+                party_id = _upsert_party(conn, party_name)
+            except psycopg.errors.ProgramLimitExceeded:
+                logger.warning(
+                    "Skipping party with name too long for index: %s... (case %s)",
+                    party_name[:80],
+                    case_id,
+                )
+                conn.rollback()
+                continue
             _upsert_case_party(conn, str(case_id), party_id, party_role)
 
         logger.info(
-            "Case %s -> %d parties: %s",
+            "Case %s -> %d parties",
             case_id,
             len(parties),
-            ", ".join(p["name"] for p in parties),
         )
         updated += 1
 
