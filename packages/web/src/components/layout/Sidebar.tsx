@@ -2,7 +2,7 @@ import Link from 'next/link';
 
 export function Sidebar() {
   return (
-    <aside className="hidden w-56 shrink-0 border-r border-slate-200 bg-slate-50 dark:border-slate-700 dark:bg-slate-900 lg:block">
+    <aside className="sticky top-14 hidden h-[calc(100vh-3.5rem)] w-56 shrink-0 border-r border-slate-200 bg-slate-50 dark:border-slate-700 dark:bg-slate-900 lg:block">
       <nav className="flex flex-col gap-1 p-4 text-sm">
         <p className="mb-1 px-2 text-xs font-semibold uppercase tracking-wider text-slate-400 dark:text-slate-500">
           Explore
