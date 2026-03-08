@@ -56,6 +56,10 @@ export const typeDefs = `#graphql
     rulingText: String
     """When the court published this tentative, if known. ISO 8601."""
     postedAt: String
+    """The ID of the raw document in the documents table. Used to construct the download URL."""
+    documentId: ID
+    """Format of the raw document: html, pdf, docx, or txt."""
+    documentFormat: String
     case: Case
     judge: Judge
     court: Court

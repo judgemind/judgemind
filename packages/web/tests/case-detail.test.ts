@@ -3,6 +3,8 @@ import {
   formatLabel,
   truncateText,
   groupParties,
+  buildDownloadUrl,
+  FORMAT_LABELS,
   RULING_TEXT_TRUNCATE_LENGTH,
 } from '../src/app/cases/[id]/CaseDetail';
 
@@ -162,5 +164,32 @@ describe('groupParties', () => {
     expect(plaintiffs).toHaveLength(0);
     expect(defendants).toHaveLength(0);
     expect(others).toHaveLength(0);
+  });
+});
+
+describe('buildDownloadUrl', () => {
+  it('builds a URL using the default API base', () => {
+    const url = buildDownloadUrl('00000000-0000-0000-0000-000000000001');
+    expect(url).toBe(
+      'http://localhost:3001/api/documents/00000000-0000-0000-0000-000000000001/download',
+    );
+  });
+});
+
+describe('FORMAT_LABELS', () => {
+  it('maps pdf to PDF', () => {
+    expect(FORMAT_LABELS['pdf']).toBe('PDF');
+  });
+
+  it('maps html to HTML', () => {
+    expect(FORMAT_LABELS['html']).toBe('HTML');
+  });
+
+  it('maps txt to TXT', () => {
+    expect(FORMAT_LABELS['txt']).toBe('TXT');
+  });
+
+  it('maps docx to DOCX', () => {
+    expect(FORMAT_LABELS['docx']).toBe('DOCX');
   });
 });
