@@ -215,6 +215,61 @@ _JUDGE_NAME_PATTERNS: list[re.Pattern[str]] = [
 ]
 
 
+# ---------------------------------------------------------------------------
+# Case number extraction
+# ---------------------------------------------------------------------------
+
+# Patterns drawn from the California court scrapers.  Ordered so the most
+# specific (and least likely to false-positive) patterns match first.
+# Each pattern is compiled once at module load time.
+
+_CASE_NUMBER_PATTERNS: list[re.Pattern[str]] = [
+    # LA label pattern: "Case Number: 24NNCV02551" — most reliable when present.
+    # The label anchors the match so the captured group can be broad.
+    # Uses [\w-]+ to also capture hyphenated case numbers like FPT-25-378624.
+    re.compile(r"Case\s+Number\s*:\s*([\w-]+)", re.IGNORECASE),
+    # San Francisco: F + 2 letters + hyphen + 2-digit year + hyphen + 6 digits.
+    # e.g. FPT-25-378624, FMS-20-387302, FDI-14-781786
+    re.compile(r"\bF[A-Z]{2}-\d{2}-\d{6}\b"),
+    # San Bernardino: CIV + 2 letters + 5-8 digits. e.g. CIVRS2502080
+    re.compile(r"\bCIV[A-Z]{2}\d{5,8}\b"),
+    # Riverside: CV + 2-4 letters + 6-8 digits. e.g. CVPS2306157
+    re.compile(r"\bCV[A-Z]{2,4}\d{6,8}\b"),
+    # Santa Clara: 2-digit year + CV + 6 digits. e.g. 24CV443183
+    re.compile(r"\b\d{2}CV\d{6}\b"),
+    # LA standalone: 2-digit year + 2-letter area code + 2-letter case type + 5-6 digits.
+    # Area codes: NN, ST, AV, SC, VE, BB, PD, GC, NE, WE, LC, CC, etc.
+    # Case types: CV (civil), CP (complex/probate), LC (limited civil), etc.
+    # e.g. 24NNCV02551, 26NNCP00062, 23STCV12345
+    re.compile(r"\b\d{2}[A-Z]{2}(?:CV|CP|LC|CC|BB|PD|GC|NE|WE)\d{5,6}\b"),
+    # OC Civil: 2-4 digit prefix + hyphen + 8 digits. e.g. 30-2024-01370288
+    re.compile(r"\b\d{2,4}-\d{8}\b"),
+    # OC Family Law: 2-digit year + D + 6 digits. e.g. 24D006789
+    re.compile(r"\b\d{2}D\d{6}\b"),
+]
+
+
+def extract_case_number(ruling_text: str) -> str | None:
+    """Extract a case number from ruling text using court-specific regex patterns.
+
+    Tries multiple patterns used by California court scrapers (LA, SF, SB,
+    Riverside, SC, OC).  Returns the first matched case number, or ``None``
+    if no pattern matches.
+
+    This is a fallback for when the scraper does not populate ``case_number``
+    in the event payload.  The patterns are ordered so more specific formats
+    match first to minimize false positives.
+    """
+    for pattern in _CASE_NUMBER_PATTERNS:
+        m = pattern.search(ruling_text)
+        if m:
+            # Use group(1) if there's a capture group, otherwise group(0)
+            if m.lastindex and m.lastindex >= 1:
+                return m.group(1)
+            return m.group(0)
+    return None
+
+
 def extract_judge_name(ruling_text: str) -> str | None:
     """Extract a judge name from ruling text using court-specific regex patterns.
 
