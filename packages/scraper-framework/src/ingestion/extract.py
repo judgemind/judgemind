@@ -270,12 +270,72 @@ def extract_case_number(ruling_text: str) -> str | None:
     return None
 
 
+# Business / organization keywords used by _looks_like_person_name().
+# Compiled once at module load time.  Uses word boundaries so that
+# "COUNTY OF" matches at the start of the string.
+_ORG_KEYWORD_RE = re.compile(
+    r"\b(?:"
+    r"LLC|INC|CORP|CORPORATION|LTD|L\.P\.|N\.A\."
+    r"|GROUP|MEDICAL|HOSPITAL|CLINIC|INSURANCE|BANK"
+    r"|ASSOCIATES|PARTNERS|FOUNDATION|UNIVERSITY|COLLEGE"
+    r"|SCHOOL|DISTRICT|AUTHORITY|COMPANY|ENTERPRISES"
+    r"|SERVICES|SOLUTIONS|INDUSTRIES|HOLDINGS|PROPERTIES"
+    r"|MANAGEMENT|HEALTHCARE|FINANCIAL|INVESTMENTS"
+    r"|TRUST|ESTATE|ASSOCIATION|SOCIETY|UNION"
+    r"|COUNTY\s+OF|CITY\s+OF|STATE\s+OF|PEOPLE\s+OF|DEPARTMENT\s+OF"
+    r"|D/B/A|DBA"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_person_name(name: str) -> bool:
+    """Return True if *name* plausibly represents a person (judge) rather than an organization.
+
+    This is a heuristic guard against false positives where party names like
+    "Heritage Medical Group" or "Bank of America, N.A." are extracted as judge
+    names by the broad regex patterns in ``_JUDGE_NAME_PATTERNS``.
+
+    Checks applied (any failure → False):
+    - Rejects names containing common business/organization suffixes.
+    - Rejects names containing "vs" or "v." (case title leaked into the field).
+    - Rejects names that are too long (> 60 chars) — real judge names are short.
+    - Rejects names that are too short (< 3 chars) — need at least first + last.
+    """
+    if not name:
+        return False
+
+    # Too long or too short
+    if len(name) > 60 or len(name) < 3:
+        return False
+
+    # Normalize for matching
+    upper = name.upper()
+
+    # Case title leaked into name: contains "VS" or "V." separator
+    if re.search(r"\bVS\b", upper) or re.search(r"\bV\.", upper):
+        return False
+
+    if _ORG_KEYWORD_RE.search(upper):
+        return False
+
+    # "A CALIFORNIA CORPORATION" or similar entity descriptors
+    if re.search(r"\bA\s+CALIFORNIA\b", upper):
+        return False
+
+    return True
+
+
 def extract_judge_name(ruling_text: str) -> str | None:
     """Extract a judge name from ruling text using court-specific regex patterns.
 
     Tries multiple patterns used by California court scrapers (LA, SB, SF,
     Riverside, OC).  Returns the first matched name stripped of whitespace,
     or ``None`` if no pattern matches.
+
+    After a pattern match, the extracted name is validated with
+    ``_looks_like_person_name`` to reject false positives where party or
+    organization names are captured instead of judge names (see #326).
 
     The returned name is *raw* — callers should pass it through
     ``normalize_judge_name`` before using it as a canonical name.
@@ -289,6 +349,6 @@ def extract_judge_name(ruling_text: str) -> str | None:
             except IndexError:
                 name = m.group(1)
             name = " ".join(name.strip().split())  # collapse whitespace
-            if name:
+            if name and _looks_like_person_name(name):
                 return name
     return None
