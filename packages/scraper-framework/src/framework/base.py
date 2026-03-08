@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import abc
 import time
+import uuid
 from datetime import datetime
 
 import structlog
@@ -131,8 +132,19 @@ class BaseScraper(abc.ABC):
     # ------------------------------------------------------------------
 
     def _process_document(self, doc: CapturedDocument) -> None:
-        """Hash → parse → archive → emit for a single document."""
+        """Hash → derive deterministic ID → parse → archive → emit for a single document.
+
+        The document_id is derived deterministically from the content hash so
+        that re-scraping the same content produces the same UUID. This makes
+        insert_document (ON CONFLICT DO NOTHING on documents.id) and
+        insert_ruling (WHERE NOT EXISTS on document_id) idempotent across
+        scraper runs — the same raw content always maps to the same document.
+        """
         doc.content_hash = sha256_hex(doc.raw_content)
+        # Deterministic document_id: same content → same UUID → dedup works.
+        # uuid5 with NAMESPACE_URL is a standard way to derive reproducible
+        # UUIDs from a string key (here, the SHA-256 hex digest).
+        doc.document_id = str(uuid.uuid5(uuid.NAMESPACE_URL, doc.content_hash))
         doc = self.parse_document(doc)
 
         if self._archiver:
