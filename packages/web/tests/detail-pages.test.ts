@@ -8,17 +8,9 @@ import {
 } from '../src/lib/display-helpers';
 
 describe('buildCaseHeading', () => {
-  it('shows only the case title when both title and number are present', () => {
+  it('shows the case number as heading', () => {
     const result = buildCaseHeading(
-      { caseNumber: '23STCV12345', caseTitle: 'Smith v. Jones' },
-      'some-uuid',
-    );
-    expect(result).toBe('Smith v. Jones');
-  });
-
-  it('shows only case number when title is null', () => {
-    const result = buildCaseHeading(
-      { caseNumber: '23STCV12345', caseTitle: null },
+      { caseNumber: '23STCV12345' },
       'some-uuid',
     );
     expect(result).toBe('23STCV12345');
