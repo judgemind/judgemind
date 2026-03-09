@@ -118,6 +118,7 @@ Spawn a **reviewer subagent** (using the Agent tool) with this prompt structure:
 >    - **Code quality**: Does it follow existing patterns? Any debug code, hardcoded values, or forgotten TODOs?
 >    - **Missing pieces**: Are there files that should have been created or modified but weren't?
 >    - **Stale references**: Do comments, imports, or docstrings reference things that changed?
+>    - **Performance**: Are there obvious bottlenecks? Sequential I/O that could be parallelized? O(n²) patterns (e.g. LIMIT/OFFSET pagination, nested loops over large datasets)? Missing connection pooling or batching for network calls (DB, S3, HTTP)?
 > 4. Make a binary decision:
 >    - **SHIP**: The implementation is correct, well-tested, properly scoped, and ready for PR. Write "SHIP" to `{worktree}/tmp/ralph/review-result.txt`.
 >    - **REVISE**: Something needs to change. Write "REVISE" to `{worktree}/tmp/ralph/review-result.txt`. Then write specific, actionable feedback to `{worktree}/tmp/ralph/feedback.md` — describe exactly what needs to change and why. Be concrete: reference specific files, functions, and line numbers.
