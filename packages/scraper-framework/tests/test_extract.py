@@ -564,6 +564,11 @@ class TestExtractCaseNumber:
         text = "CIVSB2416631 motion for summary judgment"
         assert extract_case_number(text) == "CIVSB2416631"
 
+    def test_sb_dept_s36_whitespace(self) -> None:
+        """Dept S36 uses a space: 'CIVSB 2600093' → normalised to 'CIVSB2600093'."""
+        text = "CIVSB 2600093 motion re: preliminary injunction"
+        assert extract_case_number(text) == "CIVSB2600093"
+
     # --- Riverside ---
 
     def test_riverside_case_number(self) -> None:
