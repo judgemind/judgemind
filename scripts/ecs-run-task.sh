@@ -12,7 +12,8 @@
 #   2. Creates a temporary "judgemind-oneshot-dev" task definition with a
 #      bash -c entrypoint
 #   3. Uploads the script to S3 if it exceeds the 8192-byte command override
-#      limit, otherwise base64-encodes it inline
+#      limit (downloaded in-container via pre-signed URL — no AWS CLI needed),
+#      otherwise base64-encodes it inline
 #   4. Runs the task, polls for completion, and streams CloudWatch logs
 #   5. Cleans up the temporary task definition (and S3 object) on exit
 #
@@ -207,9 +208,19 @@ if [[ "$ENCODED_SIZE" -gt 6000 ]]; then
         aws s3 cp "$SCRIPT_PATH" "s3://${S3_BUCKET}/${S3_SCRIPT_KEY}" \
             --region "$REGION" \
             --no-cli-pager > /dev/null
+
+        # Generate a pre-signed URL (5 min TTL) so the container can download
+        # the script without needing the AWS CLI installed.
+        PRESIGNED_URL=$(aws s3 presign "s3://${S3_BUCKET}/${S3_SCRIPT_KEY}" \
+            --region "$REGION" \
+            --expires-in 300)
+    else
+        PRESIGNED_URL="https://${S3_BUCKET}.s3.${REGION}.amazonaws.com/${S3_SCRIPT_KEY}?PRESIGNED_PLACEHOLDER"
     fi
 
-    COMMAND_STR="aws s3 cp s3://${S3_BUCKET}/${S3_SCRIPT_KEY} /tmp/_oneshot_script --region ${REGION} && ${INTERPRETER} /tmp/_oneshot_script${ARGS_STR}"
+    # Use curl to download (available in most container images). If curl is
+    # missing, fall back to Python's urllib which is always present.
+    COMMAND_STR="{ curl -sS --fail -o /tmp/_oneshot_script '${PRESIGNED_URL}' || python3 -c \"import urllib.request; urllib.request.urlretrieve('${PRESIGNED_URL}', '/tmp/_oneshot_script')\"; } && ${INTERPRETER} /tmp/_oneshot_script${ARGS_STR}"
 else
     ENCODED=$(base64 < "$SCRIPT_PATH")
     COMMAND_STR="echo ${ENCODED} | base64 -d > /tmp/_oneshot_script && ${INTERPRETER} /tmp/_oneshot_script${ARGS_STR}"
@@ -217,7 +228,7 @@ fi
 
 echo "Script: ${SCRIPT_PATH} (${SCRIPT_SIZE} bytes)" >&2
 echo "Interpreter: ${INTERPRETER}" >&2
-echo "Delivery: $(if [[ "$USE_S3" == "true" ]]; then echo "S3"; else echo "inline (base64)"; fi)" >&2
+echo "Delivery: $(if [[ "$USE_S3" == "true" ]]; then echo "S3 (pre-signed URL, 5 min TTL)"; else echo "inline (base64)"; fi)" >&2
 if [[ ${#SCRIPT_ARGS[@]} -gt 0 ]]; then
     echo "Script args:${ARGS_STR}" >&2
 fi
