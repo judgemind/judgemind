@@ -76,67 +76,65 @@ _SCRAPER_REGISTRY: dict[str, type] = {}
 
 
 def _load_scraper_registry() -> None:
-    """Lazily populate the scraper registry from known court modules.
+    """Lazily populate the scraper registry by auto-discovering court modules.
 
-    Keys must match the scraper_id values stored in the documents table
-    (e.g. "ca-oc-tentatives-civil", not "ca-oc-tentatives").
+    Scans the ``courts/`` package tree for modules that expose a
+    ``default_config()`` function and a ``BaseScraper`` subclass.  For each
+    such module the ``scraper_id`` from the config is mapped to the scraper
+    class.  This eliminates the need to maintain a hardcoded import list —
+    adding a new scraper module automatically registers it.
     """
     if _SCRAPER_REGISTRY:
         return
-    try:
-        from courts.ca.la_tentatives import LATentativeRulingsScraper
 
-        _SCRAPER_REGISTRY["ca-la-tentatives-civil"] = LATentativeRulingsScraper
-    except ImportError:
-        pass
-    try:
-        from courts.ca.oc_tentatives import OCTentativeRulingsScraper
+    import importlib
+    import inspect
+    import pkgutil
 
-        _SCRAPER_REGISTRY["ca-oc-tentatives-civil"] = OCTentativeRulingsScraper
-    except ImportError:
-        pass
     try:
-        from courts.ca.oc_family_law_tentatives import OCFamilyLawTentativeRulingsScraper
-
-        _SCRAPER_REGISTRY["ca-oc-tentatives-family-law"] = (
-            OCFamilyLawTentativeRulingsScraper
-        )
+        import courts  # noqa: E402
     except ImportError:
-        pass
-    try:
-        from courts.ca.oc_probate_tentatives import OCProbateTentativeRulingsScraper
+        logger.warning("courts package not importable — scraper registry empty")
+        return
 
-        _SCRAPER_REGISTRY["ca-oc-tentatives-probate"] = (
-            OCProbateTentativeRulingsScraper
-        )
-    except ImportError:
-        pass
-    try:
-        from courts.ca.sb_tentatives import SBTentativeRulingsScraper
+    from framework.base import BaseScraper  # noqa: E402
 
-        _SCRAPER_REGISTRY["ca-sb-tentatives-civil"] = SBTentativeRulingsScraper
-    except ImportError:
-        pass
-    try:
-        from courts.ca.sf_tentatives import SFTentativeRulingsScraper
+    for importer, modname, ispkg in pkgutil.walk_packages(
+        courts.__path__, prefix="courts."
+    ):
+        if ispkg:
+            continue
+        try:
+            mod = importlib.import_module(modname)
+        except Exception:
+            logger.debug("Could not import %s — skipping", modname)
+            continue
 
-        _SCRAPER_REGISTRY["ca-sf-tentatives-family-law"] = SFTentativeRulingsScraper
-    except ImportError:
-        pass
-    try:
-        from courts.ca.sc_tentatives import SCTentativeRulingsScraper
+        config_fn = getattr(mod, "default_config", None)
+        if config_fn is None or not callable(config_fn):
+            continue
 
-        _SCRAPER_REGISTRY["ca-sc-tentatives-civil"] = SCTentativeRulingsScraper
-    except ImportError:
-        pass
-    try:
-        from courts.ca.riverside_tentatives import RiversideTentativeRulingsScraper
+        # Find the concrete BaseScraper subclass in this module.
+        scraper_cls: type | None = None
+        for _name, obj in inspect.getmembers(mod, inspect.isclass):
+            if (
+                issubclass(obj, BaseScraper)
+                and obj is not BaseScraper
+                and obj.__module__ == mod.__name__
+            ):
+                scraper_cls = obj
+                break
 
-        _SCRAPER_REGISTRY["ca-riverside-tentatives-civil"] = (
-            RiversideTentativeRulingsScraper
-        )
-    except ImportError:
-        pass
+        if scraper_cls is None:
+            continue
+
+        try:
+            config = config_fn()
+            _SCRAPER_REGISTRY[config.scraper_id] = scraper_cls
+        except Exception:
+            logger.warning(
+                "default_config() failed for %s — skipping", modname, exc_info=True
+            )
 
 
 FETCH_DOCUMENTS_QUERY = """
