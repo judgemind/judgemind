@@ -1127,12 +1127,14 @@ def test_process_event_passes_case_title_to_upsert_case(mock_psycopg: MagicMock)
         (True,),  # insert_document: RETURNING is_new = True
         None,  # resolve_judge: no existing alias
         ("judge-uuid-1",),  # resolve_judge: INSERT INTO judges
-        # Caption fallback extracts parties from "Aasi v. American Honda":
-        None,  # upsert_party for Aasi: no existing alias
-        ("party-uuid-1",),  # upsert_party: INSERT INTO parties
-        None,  # upsert_party for American Honda: no existing alias
-        ("party-uuid-2",),  # upsert_party: INSERT INTO parties
+        # batch_upsert_parties: executemany RETURNING ids for caption-extracted parties
+        ("party-uuid-1",),
+        ("party-uuid-2",),
     ]
+    # batch_upsert_parties SELECT returns no existing aliases
+    mock_cur.fetchall.return_value = []
+    # nextset for executemany returning
+    mock_cur.nextset.side_effect = [True, False]
     mock_cur.rowcount = 1
 
     event = _make_event(case_title="Aasi v. American Honda")
@@ -1290,13 +1292,14 @@ def test_process_event_with_parties(mock_psycopg: MagicMock) -> None:
         (True,),  # insert_document: RETURNING is_new = True
         None,  # resolve_judge: no existing alias
         ("judge-uuid-1",),  # resolve_judge: INSERT INTO judges
-        # upsert_party for first party: no existing alias, then INSERT
-        None,
+        # batch_upsert_parties: executemany RETURNING ids
         ("party-uuid-1",),
-        # upsert_party for second party: no existing alias, then INSERT
-        None,
         ("party-uuid-2",),
     ]
+    # batch_upsert_parties SELECT returns no existing aliases
+    mock_cur.fetchall.return_value = []
+    # nextset for executemany returning
+    mock_cur.nextset.side_effect = [True, False]
     mock_cur.rowcount = 1
 
     event = _make_event(
@@ -1309,10 +1312,11 @@ def test_process_event_with_parties(mock_psycopg: MagicMock) -> None:
 
     mock_conn.commit.assert_called_once()
 
-    all_sql = " ".join(str(c) for c in mock_cur.execute.call_args_list)
-    assert "INSERT INTO parties" in all_sql
-    assert "INSERT INTO party_aliases" in all_sql
-    assert "INSERT INTO case_parties" in all_sql
+    # batch_upsert_parties uses executemany for parties, aliases, and case_parties
+    all_executemany_sql = " ".join(str(c) for c in mock_cur.executemany.call_args_list)
+    assert "INSERT INTO parties" in all_executemany_sql
+    assert "party_aliases" in all_executemany_sql
+    assert "case_parties" in all_executemany_sql
 
 
 @patch("ingestion.worker.psycopg")
@@ -1352,13 +1356,14 @@ def test_process_event_extracts_parties_from_case_title(mock_psycopg: MagicMock)
         (True,),  # insert_document: RETURNING is_new = True
         None,  # resolve_judge: no existing alias
         ("judge-uuid-1",),  # resolve_judge: INSERT INTO judges
-        # upsert_party for plaintiff: no existing alias, then INSERT
-        None,
+        # batch_upsert_parties: executemany RETURNING ids
         ("party-uuid-1",),
-        # upsert_party for defendant: no existing alias, then INSERT
-        None,
         ("party-uuid-2",),
     ]
+    # batch_upsert_parties SELECT returns no existing aliases
+    mock_cur.fetchall.return_value = []
+    # nextset for executemany returning
+    mock_cur.nextset.side_effect = [True, False]
     mock_cur.rowcount = 1
 
     event = _make_event(
@@ -1368,9 +1373,9 @@ def test_process_event_extracts_parties_from_case_title(mock_psycopg: MagicMock)
 
     mock_conn.commit.assert_called_once()
 
-    all_sql = " ".join(str(c) for c in mock_cur.execute.call_args_list)
-    assert "INSERT INTO parties" in all_sql
-    assert "INSERT INTO case_parties" in all_sql
+    all_executemany_sql = " ".join(str(c) for c in mock_cur.executemany.call_args_list)
+    assert "INSERT INTO parties" in all_executemany_sql
+    assert "case_parties" in all_executemany_sql
 
 
 # ---------------------------------------------------------------------------
@@ -1517,12 +1522,14 @@ def test_process_event_llm_extraction_populates_missing_fields(
         (True,),  # insert_document: RETURNING is_new = True
         None,  # resolve_judge: no existing alias
         ("judge-uuid-1",),  # resolve_judge: INSERT INTO judges
-        # Party upserts from LLM parties
-        None,
+        # batch_upsert_parties: executemany RETURNING ids for LLM parties
         ("party-uuid-1",),
-        None,
         ("party-uuid-2",),
     ]
+    # batch_upsert_parties SELECT returns no existing aliases
+    mock_cur.fetchall.return_value = []
+    # nextset for executemany returning
+    mock_cur.nextset.side_effect = [True, False]
     mock_cur.rowcount = 1
 
     # Configure LLM to return structured results
@@ -1577,9 +1584,10 @@ def test_process_event_llm_extraction_populates_missing_fields(
     # Judge was resolved (from LLM result)
     assert "judges" in all_sql.lower()
 
-    # Parties from LLM were written
-    assert "INSERT INTO parties" in all_sql
-    assert "INSERT INTO case_parties" in all_sql
+    # Parties from LLM were written via batch_upsert_parties
+    all_executemany_sql = " ".join(str(c) for c in mock_cur.executemany.call_args_list)
+    assert "INSERT INTO parties" in all_executemany_sql
+    assert "case_parties" in all_executemany_sql
 
 
 @patch("ingestion.worker.extract_fields_llm")
@@ -1680,12 +1688,14 @@ def test_process_event_llm_matches_ruling_by_case_number(
         (True,),  # insert_document: RETURNING is_new = True
         None,  # resolve_judge: no existing alias
         ("judge-uuid-1",),  # resolve_judge: INSERT INTO judges
-        # Party upserts from caption extraction ("Smith v. Jones")
-        None,
+        # batch_upsert_parties: executemany RETURNING ids for caption-extracted parties
         ("party-uuid-1",),
-        None,
         ("party-uuid-2",),
     ]
+    # batch_upsert_parties SELECT returns no existing aliases
+    mock_cur.fetchall.return_value = []
+    # nextset for executemany returning
+    mock_cur.nextset.side_effect = [True, False]
     mock_cur.rowcount = 1
 
     # LLM returns two rulings — one matches the event's case_number
@@ -1755,15 +1765,13 @@ def test_process_event_scraper_fields_take_precedence_over_llm(
         ("case-uuid-1",),  # upsert_case
         (True,),  # insert_document: RETURNING is_new = True
         ("existing-judge-uuid",),  # resolve_judge: existing alias
-        # Party upserts — LLM provides a party since scraper didn't, and
-        # caption fallback may also fire for "Correct v. Title"
-        None,
+        # batch_upsert_parties: executemany RETURNING id for LLM party
         ("party-uuid-1",),
-        None,
-        ("party-uuid-2",),
-        None,
-        ("party-uuid-3",),
     ]
+    # batch_upsert_parties SELECT returns no existing aliases
+    mock_cur.fetchall.return_value = []
+    # nextset for executemany returning
+    mock_cur.nextset.side_effect = [False]
     mock_cur.rowcount = 1
 
     # LLM returns different values than the scraper

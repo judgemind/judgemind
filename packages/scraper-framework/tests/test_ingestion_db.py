@@ -1,7 +1,8 @@
-"""Tests for NUL byte stripping in ingestion/db.py.
+"""Tests for ingestion/db.py.
 
-Verifies that all text fields passed to PostgreSQL have NUL (0x00) bytes
-removed at the DB layer, protecting all callers from Postgres text field errors.
+Covers:
+  - NUL byte stripping in text fields
+  - batch_upsert_parties function
 """
 
 from __future__ import annotations
@@ -11,6 +12,7 @@ from unittest.mock import MagicMock
 
 from ingestion.db import (
     _strip_nul,
+    batch_upsert_parties,
     insert_ruling,
     upsert_case,
     upsert_party,
@@ -198,8 +200,226 @@ class TestUpsertPartyNulStripping:
         cur.fetchone.side_effect = [None, ("party-uuid-1",)]
         upsert_party(conn, raw_name="John\x00Doe", party_type="plaintiff")
         # Check that the INSERT calls don't contain NUL bytes
-        for call in cur.execute.call_args_list:
-            call_args = call[0][1]
+        for c in cur.execute.call_args_list:
+            call_args = c[0][1]
             for arg in call_args:
                 if isinstance(arg, str):
                     assert "\x00" not in arg, f"NUL byte found in arg: {arg!r}"
+
+
+# ---------------------------------------------------------------------------
+# batch_upsert_parties
+# ---------------------------------------------------------------------------
+
+
+def _mock_conn_for_batch() -> tuple[MagicMock, MagicMock]:
+    """Create a mock connection suitable for batch_upsert_parties.
+
+    Returns (conn, cur) where cur is the mock cursor.
+    """
+    conn = MagicMock()
+    cur = MagicMock()
+    conn.cursor.return_value.__enter__ = MagicMock(return_value=cur)
+    conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+    return conn, cur
+
+
+class TestBatchUpsertParties:
+    """Tests for batch_upsert_parties()."""
+
+    def test_empty_list_is_noop(self) -> None:
+        """Empty parties_data should not issue any queries."""
+        conn, cur = _mock_conn_for_batch()
+        batch_upsert_parties(conn, "case-1", [])
+        cur.execute.assert_not_called()
+        cur.executemany.assert_not_called()
+
+    def test_blank_names_filtered(self) -> None:
+        """Parties with empty or whitespace names are skipped."""
+        conn, cur = _mock_conn_for_batch()
+        batch_upsert_parties(
+            conn,
+            "case-1",
+            [
+                {"name": "", "role": "plaintiff"},
+                {"name": "   ", "role": "defendant"},
+            ],
+        )
+        cur.execute.assert_not_called()
+        cur.executemany.assert_not_called()
+
+    def test_all_existing_parties_no_insert(self) -> None:
+        """When all parties already exist, no INSERT into parties is needed."""
+        conn, cur = _mock_conn_for_batch()
+        # The SELECT returns both parties as already existing
+        cur.fetchall.return_value = [
+            ("John Doe", "party-1"),
+            ("Jane Smith", "party-2"),
+        ]
+
+        batch_upsert_parties(
+            conn,
+            "case-1",
+            [
+                {"name": "John Doe", "role": "plaintiff"},
+                {"name": "Jane Smith", "role": "defendant"},
+            ],
+        )
+
+        # Should have: 1 SELECT (batch lookup), 1 executemany (case_party links)
+        assert cur.execute.call_count == 1  # SELECT only
+        sql_select = cur.execute.call_args_list[0][0][0]
+        assert "party_aliases" in sql_select
+        assert "ANY" in sql_select
+
+        # executemany for case_party links
+        assert cur.executemany.call_count == 1
+        executemany_sql = cur.executemany.call_args_list[0][0][0]
+        assert "case_parties" in executemany_sql
+        link_params = cur.executemany.call_args_list[0][0][1]
+        assert len(link_params) == 2
+
+    def test_new_parties_inserted(self) -> None:
+        """When no existing aliases found, new parties and aliases are created."""
+        conn, cur = _mock_conn_for_batch()
+        # SELECT returns no existing aliases
+        cur.fetchall.side_effect = [
+            [],  # batch alias lookup
+        ]
+        # For executemany with returning=True, fetchone returns party IDs
+        cur.fetchone.side_effect = [("pid-1",), ("pid-2",)]
+        cur.nextset.side_effect = [True, False]
+
+        batch_upsert_parties(
+            conn,
+            "case-1",
+            [
+                {"name": "John Doe", "role": "plaintiff"},
+                {"name": "Jane Smith", "role": "defendant"},
+            ],
+        )
+
+        # Should have: 1 SELECT, then executemany calls for:
+        # parties INSERT, aliases INSERT, case_parties INSERT
+        assert cur.execute.call_count == 1  # SELECT
+        assert cur.executemany.call_count == 3  # parties, aliases, case_parties
+
+        # Verify parties INSERT (executemany with returning=True)
+        parties_call = cur.executemany.call_args_list[0]
+        assert "INSERT INTO parties" in parties_call[0][0]
+        assert parties_call[1].get("returning") is True
+        assert len(parties_call[0][1]) == 2  # 2 new parties
+
+        # Verify aliases INSERT
+        aliases_call = cur.executemany.call_args_list[1]
+        assert "party_aliases" in aliases_call[0][0]
+        assert len(aliases_call[0][1]) == 2
+
+        # Verify case_party links
+        links_call = cur.executemany.call_args_list[2]
+        assert "case_parties" in links_call[0][0]
+        assert len(links_call[0][1]) == 2
+
+    def test_mixed_existing_and_new(self) -> None:
+        """Mix of existing and new parties only inserts the new ones."""
+        conn, cur = _mock_conn_for_batch()
+        # SELECT returns one existing alias
+        cur.fetchall.side_effect = [
+            [("John Doe", "existing-pid")],  # batch alias lookup
+        ]
+        # fetchone for the one new party
+        cur.fetchone.side_effect = [("new-pid",)]
+        cur.nextset.side_effect = [False]
+
+        batch_upsert_parties(
+            conn,
+            "case-1",
+            [
+                {"name": "John Doe", "role": "plaintiff"},
+                {"name": "Jane Smith", "role": "defendant"},
+            ],
+        )
+
+        # parties INSERT should have 1 entry (only Jane Smith)
+        parties_call = cur.executemany.call_args_list[0]
+        assert len(parties_call[0][1]) == 1
+        assert parties_call[0][1][0] == ("Jane Smith",)
+
+    def test_nul_bytes_stripped_from_names(self) -> None:
+        """NUL bytes in party names are stripped before processing."""
+        conn, cur = _mock_conn_for_batch()
+        cur.fetchall.side_effect = [[]]
+        cur.fetchone.side_effect = [("pid-1",)]
+        cur.nextset.side_effect = [False]
+
+        batch_upsert_parties(
+            conn,
+            "case-1",
+            [
+                {"name": "John\x00Doe", "role": "plaintiff"},
+            ],
+        )
+
+        # The SELECT should use the cleaned name
+        select_args = cur.execute.call_args_list[0][0][1]
+        assert "\x00" not in str(select_args)
+
+        # The INSERT should use cleaned canonical name
+        parties_params = cur.executemany.call_args_list[0][0][1]
+        assert "\x00" not in str(parties_params)
+
+    def test_deduplicates_by_raw_name(self) -> None:
+        """Duplicate names (case-insensitive) are deduplicated."""
+        conn, cur = _mock_conn_for_batch()
+        cur.fetchall.side_effect = [[]]
+        cur.fetchone.side_effect = [("pid-1",)]
+        cur.nextset.side_effect = [False]
+
+        batch_upsert_parties(
+            conn,
+            "case-1",
+            [
+                {"name": "John Doe", "role": "plaintiff"},
+                {"name": "john doe", "role": "defendant"},  # duplicate
+            ],
+        )
+
+        # Only 1 party should be inserted (deduped)
+        parties_params = cur.executemany.call_args_list[0][0][1]
+        assert len(parties_params) == 1
+
+    def test_parties_without_role_skip_case_party_link(self) -> None:
+        """Parties with empty role are upserted but not linked to the case."""
+        conn, cur = _mock_conn_for_batch()
+        cur.fetchall.side_effect = [[]]
+        cur.fetchone.side_effect = [("pid-1",)]
+        cur.nextset.side_effect = [False]
+
+        batch_upsert_parties(
+            conn,
+            "case-1",
+            [
+                {"name": "John Doe", "role": ""},
+            ],
+        )
+
+        # Should have SELECT + parties INSERT + aliases INSERT, but NO case_parties
+        assert cur.execute.call_count == 1  # SELECT
+        assert cur.executemany.call_count == 2  # parties + aliases (no case_parties)
+
+    def test_custom_alias_source(self) -> None:
+        """The alias_source parameter is passed to the aliases INSERT."""
+        conn, cur = _mock_conn_for_batch()
+        cur.fetchall.side_effect = [[]]
+        cur.fetchone.side_effect = [("pid-1",)]
+        cur.nextset.side_effect = [False]
+
+        batch_upsert_parties(
+            conn,
+            "case-1",
+            [{"name": "John Doe", "role": "plaintiff"}],
+            alias_source="backfill",
+        )
+
+        aliases_params = cur.executemany.call_args_list[1][0][1]
+        assert aliases_params[0][2] == "backfill"

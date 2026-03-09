@@ -34,14 +34,13 @@ from framework.search.indexer import IndexingConsumer
 from framework.search.mapping import TENTATIVE_RULINGS_ALIAS
 
 from .db import (
+    batch_upsert_parties,
     insert_document,
     insert_ruling,
     resolve_judge,
     upsert_case,
     upsert_case_judge,
-    upsert_case_party,
     upsert_court,
-    upsert_party,
 )
 from .extract import (
     extract_case_number,
@@ -530,14 +529,8 @@ class IngestionWorker:
             if judge_id is not None:
                 upsert_case_judge(conn, case_id, judge_id, hearing_dt)
 
-            # 7. Create party records and link to case
-            for party_info in parties_data:
-                party_name = party_info.get("name", "")
-                party_role = party_info.get("role", "")
-                if party_name:
-                    party_id = upsert_party(conn, party_name)
-                    if party_role:
-                        upsert_case_party(conn, case_id, party_id, party_role)
+            # 7. Create party records and link to case (batched — O(1) queries)
+            batch_upsert_parties(conn, case_id, parties_data)
 
             conn.commit()
         except Exception:

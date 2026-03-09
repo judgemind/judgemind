@@ -46,6 +46,7 @@ sys.path.insert(0, os.path.normpath(_FRAMEWORK_SRC))
 
 from framework.party_utils import is_name_fragment as _is_name_fragment  # noqa: E402, F401 — re-exported for tests
 from framework.party_utils import split_party_names as _split_party_names  # noqa: E402
+from ingestion.db import batch_upsert_parties  # noqa: E402
 
 logging.basicConfig(
     level=logging.INFO,
@@ -306,20 +307,17 @@ def backfill_batch(
             logger.debug("No parties extracted for case %s", case_id)
             continue
 
-        for party_info in parties:
-            party_name = party_info["name"]
-            party_role = party_info["role"]
-            try:
-                party_id = _upsert_party(conn, party_name)
-            except psycopg.errors.ProgramLimitExceeded:
-                logger.warning(
-                    "Skipping party with name too long for index: %s... (case %s)",
-                    party_name[:80],
-                    case_id,
-                )
-                conn.rollback()
-                continue
-            _upsert_case_party(conn, str(case_id), party_id, party_role)
+        try:
+            batch_upsert_parties(
+                conn, str(case_id), parties, alias_source="backfill"
+            )
+        except psycopg.errors.ProgramLimitExceeded:
+            logger.warning(
+                "Skipping parties with name too long for index (case %s)",
+                case_id,
+            )
+            conn.rollback()
+            continue
 
         logger.info(
             "Case %s -> %d parties",

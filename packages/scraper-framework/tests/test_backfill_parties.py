@@ -162,34 +162,17 @@ class TestBackfillBatch:
         assert updated == 0
         assert next_cursor == _DEFAULT_CURSOR
 
-    def test_extracts_and_creates_parties(self) -> None:
+    @patch("backfill_parties.batch_upsert_parties")
+    def test_extracts_and_creates_parties(self, mock_batch: MagicMock) -> None:
         """Ruling text with a caption block produces party records."""
         ruling_text = "JOHN DOE,\n  Plaintiff(s),\n  vs.\nJANE SMITH,\n  Defendant(s)."
         row = _make_case_row(ruling_text)
 
         conn = MagicMock()
-        cur_fetch = MagicMock()
-        cur_fetch.fetchall.return_value = [row]
-
-        contexts = [cur_fetch]
-        # We need cursors for each upsert_party (2 parties x 2 calls each)
-        # and upsert_case_party (2 calls)
-        for _ in range(6):
-            ctx_mock = MagicMock()
-            # upsert_party: no existing alias, then INSERT returns new id
-            ctx_mock.fetchone.side_effect = [None, (str(uuid.uuid4()),)]
-            contexts.append(ctx_mock)
-
-        context_iter = iter(contexts)
-
-        def cursor_ctx() -> MagicMock:
-            ctx = MagicMock()
-            cur = next(context_iter)
-            ctx.__enter__ = MagicMock(return_value=cur)
-            ctx.__exit__ = MagicMock(return_value=False)
-            return ctx
-
-        conn.cursor.side_effect = cursor_ctx
+        cur = MagicMock()
+        conn.cursor.return_value.__enter__ = MagicMock(return_value=cur)
+        conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+        cur.fetchall.return_value = [row]
 
         processed, updated, _cursor = backfill_parties.backfill_batch(
             conn, batch_size=10, cursor=_DEFAULT_CURSOR
@@ -197,6 +180,12 @@ class TestBackfillBatch:
 
         assert processed == 1
         assert updated == 1
+        # batch_upsert_parties was called with the extracted parties
+        mock_batch.assert_called_once()
+        call_args = mock_batch.call_args
+        parties_arg = call_args[0][2]
+        assert len(parties_arg) == 2
+        assert call_args[1].get("alias_source") == "backfill"
 
     def test_skips_no_parties(self) -> None:
         """Ruling text with no extractable parties is skipped."""
