@@ -20,16 +20,12 @@ GIT_DIR=$(git rev-parse --absolute-git-dir 2>/dev/null) || {
 REPO_ROOT="${GIT_DIR%%/.git*}"
 
 # ---------------------------------------------------------------------------
-# Step 1a — Ensure main is up to date
-# Skip pull if the working tree is dirty (uncommitted changes present).
-# In that case the caller is responsible for carrying changes into the worktree.
+# Step 1a — Fetch latest main from origin
+# We intentionally do NOT checkout or pull in the parent repo — that would
+# change the parent's working tree and interfere with other processes.
+# Worktrees are created from origin/main directly (see Step 2).
 # ---------------------------------------------------------------------------
-git -C "$REPO_ROOT" checkout main --quiet
-if git -C "$REPO_ROOT" diff --quiet && git -C "$REPO_ROOT" diff --cached --quiet; then
-    git -C "$REPO_ROOT" pull origin main --quiet
-else
-    echo "WARNING: main has uncommitted changes — skipping pull. Copy your changes into the worktree manually." >&2
-fi
+git -C "$REPO_ROOT" fetch origin main --quiet
 
 # ---------------------------------------------------------------------------
 # Step 1b — Prune stale worktree metadata
@@ -46,8 +42,9 @@ git -C "$REPO_ROOT" worktree prune
 # ---------------------------------------------------------------------------
 TODAY=$(date +%Y%m%d)
 
-# Build a list of merged branch names (one per line, no leading spaces)
-MERGED=$(git -C "$REPO_ROOT" branch --merged main | sed 's/^[* ]*//')
+# Build a list of merged branch names (one per line, no leading spaces).
+# Use origin/main so we don't depend on the local main branch being current.
+MERGED=$(git -C "$REPO_ROOT" branch --merged origin/main | sed 's/^[* ]*//')
 
 # Parse worktree list --porcelain into "<path> <branch>" lines.
 # "refs/heads/" is 11 chars; substr($2, 12) strips it.
@@ -164,7 +161,7 @@ for attempt in $(seq 1 10); do
         git -C "$REPO_ROOT" branch -D "$old_branch" 2>/dev/null || true
     done < <(git -C "$REPO_ROOT" branch --list "worker-${N}/*" | sed 's/^[* ]*//')
 
-    if git -C "$REPO_ROOT" worktree add "$WORKTREE" -b "$BRANCH" 2>/dev/null; then
+    if git -C "$REPO_ROOT" worktree add "$WORKTREE" -b "$BRANCH" origin/main 2>/dev/null; then
         git -C "$WORKTREE" config core.hooksPath .githooks
         mkdir -p "$WORKTREE/tmp"
         echo "$WORKTREE"

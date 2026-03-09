@@ -82,7 +82,7 @@ scripts/start-worker.sh
 The script handles everything:
 
 - Resolves the repo root regardless of where the shell started
-- Ensures `main` is checked out and up to date
+- Fetches latest `origin/main` (without changing the parent's checked-out branch)
 - Prunes stale worktree metadata
 - Removes abandoned worktrees (branches merged into main, or session branches from a previous day)
 - Claims the lowest available worker number, retrying automatically if another agent races to the same number
