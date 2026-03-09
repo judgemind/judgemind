@@ -14,8 +14,12 @@ import anthropic
 import pytest
 
 from ingestion.llm_extract import (
+    LLMExtractionResult,
+    LLMRulingResult,
+    _merge_results,
     _normalize_case_number,
     _parse_response,
+    _split_text_into_chunks,
     extract_fields_llm,
     preprocess_html,
 )
@@ -554,9 +558,9 @@ class TestExtractFieldsLlm:
         )
         assert result is None
 
-    def test_text_truncation(self) -> None:
-        """Documents longer than 100K chars should be truncated."""
-        long_text = "A" * 200_000
+    def test_small_doc_no_chunking(self) -> None:
+        """Documents under max_chars should be processed in a single API call."""
+        short_text = "A" * 1000
         response_json = json.dumps(
             {
                 "judge_name": None,
@@ -567,16 +571,13 @@ class TestExtractFieldsLlm:
         )
         client = _mock_client(response_json)
         result = extract_fields_llm(
-            document_text=long_text,
+            document_text=short_text,
             content_format="pdf",
             client=client,
+            max_chars=80_000,
         )
         assert result is not None
-        # Verify the text sent to API was truncated
-        user_msg = client.messages.create.call_args.kwargs["messages"][0]["content"]
-        # The user message includes the "Document (pdf):" prefix, but the actual
-        # text content should be <= 100K
-        assert len(user_msg) < 200_000
+        assert client.messages.create.call_count == 1
 
     def test_client_created_from_env_when_not_provided(self) -> None:
         """When no client is provided, should create one from ANTHROPIC_API_KEY."""
@@ -737,3 +738,410 @@ class TestRealFixtures:
         # PDF text should be passed as-is (no HTML stripping)
         user_msg = client.messages.create.call_args.kwargs["messages"][0]["content"]
         assert "Department S22 - Judge Bobby P. Luna" in user_msg
+
+
+# ---------------------------------------------------------------------------
+# Chunking tests
+# ---------------------------------------------------------------------------
+
+
+class TestSplitTextIntoChunks:
+    """Tests for _split_text_into_chunks."""
+
+    def test_short_text_returns_single_chunk(self) -> None:
+        text = "Short document"
+        chunks = _split_text_into_chunks(text, max_chars=1000, content_format="pdf")
+        assert chunks == [text]
+
+    def test_pdf_splits_on_form_feed(self) -> None:
+        page1 = "A" * 5000
+        page2 = "B" * 5000
+        page3 = "C" * 5000
+        text = f"{page1}\f{page2}\f{page3}"
+        # max_chars=6000 means page1 fits alone, page2+page3 must split
+        chunks = _split_text_into_chunks(text, max_chars=6000, content_format="pdf")
+        assert len(chunks) >= 2
+        # First chunk should contain page1 content
+        assert "A" * 100 in chunks[0]
+
+    def test_html_splits_on_case_boundary(self) -> None:
+        case1 = "Case Number: 001\nSome ruling text for case 1\n"
+        case2 = "Case Number: 002\nSome ruling text for case 2\n"
+        text = case1 + "\n" + case2
+        # Set max_chars small enough to force a split
+        chunks = _split_text_into_chunks(text, max_chars=40, content_format="html")
+        assert len(chunks) >= 2
+
+    def test_fallback_to_paragraph_breaks(self) -> None:
+        # No form feeds, no HR, no case numbers — just paragraphs
+        paragraphs = ["Paragraph " + str(i) + " text." for i in range(20)]
+        text = "\n\n".join(paragraphs)
+        chunks = _split_text_into_chunks(text, max_chars=100, content_format="pdf")
+        assert len(chunks) >= 2
+
+    def test_force_split_wall_of_text(self) -> None:
+        # No natural boundaries at all
+        text = "A" * 10000
+        chunks = _split_text_into_chunks(text, max_chars=3000, content_format="pdf")
+        assert len(chunks) >= 2
+        # Each chunk should be at most max_chars
+        for chunk in chunks:
+            assert len(chunk) <= 3000 + 500  # allow for overlap prefix
+
+    def test_max_chunks_cap(self) -> None:
+        # Create a very long document that would need many chunks
+        text = "A" * 500_000
+        chunks = _split_text_into_chunks(text, max_chars=3000, content_format="pdf")
+        assert len(chunks) <= 5
+
+    def test_overlap_between_chunks(self) -> None:
+        # Force-split a wall of text and verify overlap
+        text = "ABCDEFGHIJ" * 1000  # 10K chars
+        chunks = _split_text_into_chunks(text, max_chars=3000, content_format="pdf")
+        if len(chunks) >= 2:
+            # The end of chunk[0] should appear at the start of chunk[1]
+            tail_of_first = chunks[0][-500:]
+            assert tail_of_first in chunks[1]
+
+
+class TestMergeResults:
+    """Tests for _merge_results."""
+
+    def test_empty_list(self) -> None:
+        result = _merge_results([])
+        assert result.case_count == 0
+        assert result.rulings == []
+
+    def test_single_result_passthrough(self) -> None:
+        r = LLMExtractionResult(
+            judge_name="Judge A",
+            hearing_date=date(2026, 3, 9),
+            department="5",
+            case_count=1,
+            rulings=[LLMRulingResult(case_number="001", outcome="granted")],
+        )
+        merged = _merge_results([r])
+        assert merged.judge_name == "Judge A"
+        assert merged.case_count == 1
+
+    def test_doc_fields_from_first_chunk(self) -> None:
+        r1 = LLMExtractionResult(
+            judge_name="Judge First",
+            hearing_date=date(2026, 3, 9),
+            department="A",
+            case_count=1,
+            rulings=[LLMRulingResult(case_number="001")],
+        )
+        r2 = LLMExtractionResult(
+            judge_name="Judge Second",
+            hearing_date=date(2026, 3, 10),
+            department="B",
+            case_count=1,
+            rulings=[LLMRulingResult(case_number="002")],
+        )
+        merged = _merge_results([r1, r2])
+        assert merged.judge_name == "Judge First"
+        assert merged.hearing_date == date(2026, 3, 9)
+        assert merged.department == "A"
+
+    def test_deduplication_by_case_number(self) -> None:
+        r1 = LLMExtractionResult(
+            judge_name="Judge",
+            rulings=[
+                LLMRulingResult(case_number="001", outcome="granted"),
+                LLMRulingResult(case_number="002", outcome="denied"),
+            ],
+        )
+        r2 = LLMExtractionResult(
+            judge_name="Judge",
+            rulings=[
+                LLMRulingResult(case_number="002", outcome="denied"),  # dup
+                LLMRulingResult(case_number="003", outcome="moot"),
+            ],
+        )
+        merged = _merge_results([r1, r2])
+        assert merged.case_count == 3
+        case_numbers = [r.case_number for r in merged.rulings]
+        assert case_numbers == ["001", "002", "003"]
+
+    def test_rulings_without_case_number_not_deduped(self) -> None:
+        """Rulings with None case_number should all be kept."""
+        r1 = LLMExtractionResult(
+            rulings=[LLMRulingResult(case_number=None, outcome="granted")],
+        )
+        r2 = LLMExtractionResult(
+            rulings=[LLMRulingResult(case_number=None, outcome="denied")],
+        )
+        merged = _merge_results([r1, r2])
+        assert merged.case_count == 2
+
+    def test_case_count_is_unique_rulings(self) -> None:
+        """case_count should be count of unique rulings, not sum of per-chunk counts."""
+        r1 = LLMExtractionResult(
+            case_count=2,
+            rulings=[
+                LLMRulingResult(case_number="001"),
+                LLMRulingResult(case_number="002"),
+            ],
+        )
+        r2 = LLMExtractionResult(
+            case_count=2,
+            rulings=[
+                LLMRulingResult(case_number="002"),  # overlap
+                LLMRulingResult(case_number="003"),
+            ],
+        )
+        merged = _merge_results([r1, r2])
+        # Should be 3 unique, not 4 (sum)
+        assert merged.case_count == 3
+
+
+class TestChunkedExtraction:
+    """Integration tests for chunked extraction through extract_fields_llm."""
+
+    def test_large_doc_produces_multiple_calls(self) -> None:
+        """A document exceeding max_chars should produce multiple API calls."""
+        # Build a two-page PDF document where each page exceeds max_chars
+        page1 = "Page 1 content. " * 5000  # ~80K chars
+        page2 = "Page 2 content. " * 5000  # ~80K chars
+        text = f"{page1}\f{page2}"
+
+        response_chunk1 = json.dumps(
+            {
+                "judge_name": "Test Judge",
+                "hearing_date": "2026-03-09",
+                "department": "5",
+                "rulings": [
+                    {
+                        "case_number": "001",
+                        "case_title": "A v. B",
+                        "outcome": "granted",
+                        "motion_type": "msj",
+                        "parties": [],
+                    }
+                ],
+            }
+        )
+        response_chunk2 = json.dumps(
+            {
+                "judge_name": "Test Judge",
+                "hearing_date": "2026-03-09",
+                "department": "5",
+                "rulings": [
+                    {
+                        "case_number": "002",
+                        "case_title": "C v. D",
+                        "outcome": "denied",
+                        "motion_type": "demurrer",
+                        "parties": [],
+                    }
+                ],
+            }
+        )
+
+        # The mock needs to handle however many chunks are produced
+        good_responses = [response_chunk1, response_chunk2]
+        client = MagicMock(spec=anthropic.Anthropic)
+        client.messages.create.side_effect = [
+            _make_api_response(r)
+            for r in good_responses * 3  # enough for up to 6 chunks
+        ]
+
+        result = extract_fields_llm(
+            document_text=text,
+            content_format="pdf",
+            client=client,
+            max_chars=80_000,
+        )
+        assert result is not None
+        # Should have made more than 1 API call
+        assert client.messages.create.call_count >= 2
+        # Should have results from multiple chunks
+        assert result.case_count >= 1
+        assert result.judge_name == "Test Judge"
+
+    def test_dedup_across_overlap_region(self) -> None:
+        """Same case appearing in overlap region should be deduplicated."""
+        # Two chunks return the same case number — only one should survive
+        response1 = json.dumps(
+            {
+                "judge_name": "Judge Overlap",
+                "hearing_date": "2026-03-09",
+                "department": "3",
+                "rulings": [
+                    {
+                        "case_number": "OVERLAP-001",
+                        "case_title": "X v. Y",
+                        "outcome": "granted",
+                        "motion_type": "msj",
+                        "parties": [],
+                    },
+                    {
+                        "case_number": "UNIQUE-001",
+                        "case_title": "A v. B",
+                        "outcome": "denied",
+                        "motion_type": "demurrer",
+                        "parties": [],
+                    },
+                ],
+            }
+        )
+        response2 = json.dumps(
+            {
+                "judge_name": "Judge Overlap",
+                "hearing_date": "2026-03-09",
+                "department": "3",
+                "rulings": [
+                    {
+                        "case_number": "OVERLAP-001",  # duplicate from overlap
+                        "case_title": "X v. Y",
+                        "outcome": "granted",
+                        "motion_type": "msj",
+                        "parties": [],
+                    },
+                    {
+                        "case_number": "UNIQUE-002",
+                        "case_title": "C v. D",
+                        "outcome": "moot",
+                        "motion_type": "mtd",
+                        "parties": [],
+                    },
+                ],
+            }
+        )
+
+        # Build a doc large enough to chunk with form-feed boundary
+        half = "X" * 50_000
+        text = f"{half}\f{half}"
+
+        client = MagicMock(spec=anthropic.Anthropic)
+        client.messages.create.side_effect = [
+            _make_api_response(response1),
+            _make_api_response(response2),
+        ]
+
+        result = extract_fields_llm(
+            document_text=text,
+            content_format="pdf",
+            client=client,
+            max_chars=60_000,
+        )
+        assert result is not None
+        # OVERLAP-001 appears in both chunks but should only appear once
+        assert result.case_count == 3
+        case_numbers = [r.case_number for r in result.rulings]
+        assert case_numbers == ["OVERLAP-001", "UNIQUE-001", "UNIQUE-002"]
+
+    def test_merge_takes_doc_fields_from_first_chunk(self) -> None:
+        """Document-level fields should come from the first chunk."""
+        response1 = json.dumps(
+            {
+                "judge_name": "First Chunk Judge",
+                "hearing_date": "2026-03-01",
+                "department": "A",
+                "rulings": [
+                    {
+                        "case_number": "001",
+                        "case_title": "A v. B",
+                        "outcome": "granted",
+                        "motion_type": "msj",
+                        "parties": [],
+                    }
+                ],
+            }
+        )
+        response2 = json.dumps(
+            {
+                "judge_name": "Second Chunk Judge",
+                "hearing_date": "2026-03-02",
+                "department": "B",
+                "rulings": [
+                    {
+                        "case_number": "002",
+                        "case_title": "C v. D",
+                        "outcome": "denied",
+                        "motion_type": "demurrer",
+                        "parties": [],
+                    }
+                ],
+            }
+        )
+
+        half = "Y" * 50_000
+        text = f"{half}\f{half}"
+
+        client = MagicMock(spec=anthropic.Anthropic)
+        client.messages.create.side_effect = [
+            _make_api_response(response1),
+            _make_api_response(response2),
+        ]
+
+        result = extract_fields_llm(
+            document_text=text,
+            content_format="pdf",
+            client=client,
+            max_chars=60_000,
+        )
+        assert result is not None
+        assert result.judge_name == "First Chunk Judge"
+        assert result.hearing_date == date(2026, 3, 1)
+        assert result.department == "A"
+        assert result.case_count == 2
+
+    def test_chunk_api_failure_partial_result(self) -> None:
+        """If one chunk's API call fails, the other chunks' results are returned."""
+        good_response = json.dumps(
+            {
+                "judge_name": "Good Judge",
+                "hearing_date": "2026-03-09",
+                "department": "1",
+                "rulings": [
+                    {
+                        "case_number": "001",
+                        "case_title": "A v. B",
+                        "outcome": "granted",
+                        "motion_type": "msj",
+                        "parties": [],
+                    }
+                ],
+            }
+        )
+
+        half = "Z" * 50_000
+        text = f"{half}\f{half}"
+
+        client = MagicMock(spec=anthropic.Anthropic)
+        # First chunk succeeds, second fails
+        client.messages.create.side_effect = [
+            _make_api_response(good_response),
+            anthropic.APIError(message="Server error", request=MagicMock(), body=None),
+        ]
+
+        result = extract_fields_llm(
+            document_text=text,
+            content_format="pdf",
+            client=client,
+            max_chars=60_000,
+        )
+        assert result is not None
+        # Should have the result from the first chunk only
+        assert result.case_count == 1
+        assert result.judge_name == "Good Judge"
+
+    def test_all_chunks_fail_returns_none(self) -> None:
+        """If all chunks' API calls fail, return None."""
+        half = "W" * 50_000
+        text = f"{half}\f{half}"
+
+        client = MagicMock(spec=anthropic.Anthropic)
+        client.messages.create.side_effect = anthropic.APIError(
+            message="Server error", request=MagicMock(), body=None
+        )
+
+        result = extract_fields_llm(
+            document_text=text,
+            content_format="pdf",
+            client=client,
+            max_chars=60_000,
+        )
+        assert result is None

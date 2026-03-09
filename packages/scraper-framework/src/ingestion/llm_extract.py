@@ -233,12 +233,177 @@ def _parse_date(raw: str | None) -> date | None:
 
 
 # ---------------------------------------------------------------------------
+# Chunking helpers
+# ---------------------------------------------------------------------------
+
+# Hard cap on chunks per document to control cost.
+_MAX_CHUNKS = 5
+
+# Overlap characters between consecutive chunks for context continuity.
+_CHUNK_OVERLAP = 500
+
+# Patterns that indicate natural split boundaries in text.
+_PAGE_BREAK_RE = re.compile(r"\f")  # Form feed (pymupdf page separator)
+_HR_RE = re.compile(r"<HR[^>]*>", re.IGNORECASE)
+# Case number patterns used as split candidates in text.
+_CASE_BOUNDARY_RE = re.compile(
+    r"\n(?=\s*(?:Case\s+(?:Number|No\.?)|CASE\s+(?:NUMBER|NO\.?))\s*[:\s])",
+    re.IGNORECASE,
+)
+
+
+def _split_text_into_chunks(
+    text: str,
+    max_chars: int,
+    content_format: str,
+) -> list[str]:
+    """Split *text* into chunks of at most *max_chars* characters.
+
+    Splitting strategy:
+    - For PDFs: split at form-feed (``\\f``) page boundaries first.
+    - For HTML (post-stripping): split at ``<HR>`` tags or case-number
+      boundaries.
+    - Fallback: split on double-newline paragraph boundaries.
+
+    Each chunk (except the first) is prefixed with the last
+    ``_CHUNK_OVERLAP`` characters of the previous chunk so the model has
+    continuity context.
+
+    Returns at most ``_MAX_CHUNKS`` chunks.  If the document is so large
+    that even *_MAX_CHUNKS* chunks of *max_chars* cannot cover it, the
+    tail is silently truncated and a warning is logged.
+    """
+    if len(text) <= max_chars:
+        return [text]
+
+    # Choose boundary pattern based on format.
+    if content_format == "pdf":
+        boundaries = [m.start() for m in _PAGE_BREAK_RE.finditer(text)]
+    else:
+        # HTML: try <HR> first, then case-number boundaries.
+        boundaries = [m.start() for m in _HR_RE.finditer(text)]
+        if not boundaries:
+            boundaries = [m.start() for m in _CASE_BOUNDARY_RE.finditer(text)]
+
+    # Fallback: double-newline paragraph breaks.
+    if not boundaries:
+        boundaries = [m.start() for m in re.finditer(r"\n\n", text)]
+
+    # If still no boundaries (wall of text), force-split at max_chars.
+    if not boundaries:
+        return _force_split(text, max_chars)
+
+    # Greedy packing: walk through boundaries, emitting a chunk whenever
+    # the *next* boundary would push us past max_chars.  We also track
+    # the last boundary that fits so we always split at a natural point.
+    chunks: list[str] = []
+    chunk_start = 0
+    last_boundary = 0  # last boundary position within the current chunk
+
+    for boundary in boundaries:
+        span = boundary - chunk_start
+        if span > max_chars:
+            # The region from chunk_start to this boundary exceeds the
+            # limit.  Split at the *previous* boundary if we have one,
+            # otherwise at this boundary.
+            split_at = last_boundary if last_boundary > chunk_start else boundary
+            chunks.append(text[chunk_start:split_at])
+            chunk_start = max(split_at - _CHUNK_OVERLAP, 0)
+            if len(chunks) >= _MAX_CHUNKS:
+                break
+        last_boundary = boundary
+
+    # Append the remaining text.
+    if len(chunks) < _MAX_CHUNKS and chunk_start < len(text):
+        remaining = text[chunk_start:]
+        if len(remaining) > max_chars:
+            # Still too large — split the remainder at boundaries or
+            # force-split as a fallback.
+            sub_chunks = _force_split(remaining, max_chars)
+            for sc in sub_chunks:
+                if len(chunks) >= _MAX_CHUNKS:
+                    break
+                chunks.append(sc)
+        else:
+            chunks.append(remaining)
+
+    if not chunks:
+        chunks = [text[:max_chars]]
+
+    if len(chunks) >= _MAX_CHUNKS:
+        # Check if we covered the full text.
+        covered = sum(len(c) for c in chunks)
+        if covered < len(text):
+            logger.warning(
+                "llm_extract.chunk_truncated",
+                total_chars=len(text),
+                chunks=len(chunks),
+            )
+
+    return chunks
+
+
+def _force_split(text: str, max_chars: int) -> list[str]:
+    """Split *text* into fixed-size chunks with overlap (no natural boundaries)."""
+    chunks: list[str] = []
+    pos = 0
+    while pos < len(text) and len(chunks) < _MAX_CHUNKS:
+        end = min(pos + max_chars, len(text))
+        chunks.append(text[pos:end])
+        pos = end - _CHUNK_OVERLAP if end < len(text) else end
+    if len(text) > pos:
+        logger.warning(
+            "llm_extract.chunk_truncated",
+            total_chars=len(text),
+            chunks=len(chunks),
+        )
+    return chunks
+
+
+def _merge_results(
+    results: list[LLMExtractionResult],
+) -> LLMExtractionResult:
+    """Merge extraction results from multiple chunks into a single result.
+
+    - Document-level fields (judge, department, hearing_date) are taken
+      from the *first* chunk (headers appear at the top of documents).
+    - Rulings are concatenated and deduplicated by ``case_number``.
+    - ``case_count`` is the number of unique rulings after dedup.
+    """
+    if not results:
+        return LLMExtractionResult()
+
+    first = results[0]
+
+    # Collect all rulings, dedup by case_number (keep first occurrence).
+    seen_case_numbers: set[str] = set()
+    unique_rulings: list[LLMRulingResult] = []
+
+    for result in results:
+        for ruling in result.rulings:
+            key = ruling.case_number
+            if key and key in seen_case_numbers:
+                continue
+            if key:
+                seen_case_numbers.add(key)
+            unique_rulings.append(ruling)
+
+    return LLMExtractionResult(
+        judge_name=first.judge_name,
+        hearing_date=first.hearing_date,
+        department=first.department,
+        case_count=len(unique_rulings),
+        rulings=unique_rulings,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
-# Maximum document text length to send to the model (chars).
-# 100K chars ≈ ~25K tokens, well within Haiku's context window.
-_MAX_DOCUMENT_LENGTH = 100_000
+# Default per-chunk character budget.  80K chars leaves room for the
+# system prompt and output tokens within Haiku's context window.
+_DEFAULT_MAX_CHARS = 80_000
 
 
 def extract_fields_llm(
@@ -246,8 +411,14 @@ def extract_fields_llm(
     content_format: str,  # "html" or "pdf"
     metadata: dict[str, str] | None = None,
     client: anthropic.Anthropic | None = None,
+    max_chars: int = _DEFAULT_MAX_CHARS,
 ) -> LLMExtractionResult | None:
     """Extract structured fields from a court ruling using Claude Haiku.
+
+    If the document exceeds *max_chars* after preprocessing, it is
+    automatically split into overlapping chunks, each extracted
+    independently, and the results merged.  This is transparent to the
+    caller — the return type is always a single ``LLMExtractionResult``.
 
     Args:
         document_text: Raw document content (HTML or plain text from PDF).
@@ -256,6 +427,8 @@ def extract_fields_llm(
             May contain keys: ``link_text``, ``judge_name``, ``department``.
         client: Optional pre-created Anthropic client for connection reuse.
             If not provided, creates one from the ``ANTHROPIC_API_KEY`` env var.
+        max_chars: Per-chunk character limit.  Documents under this size
+            are processed in a single call (no chunking overhead).
 
     Returns:
         An ``LLMExtractionResult`` with extracted fields, or ``None`` if
@@ -270,11 +443,52 @@ def extract_fields_llm(
     else:
         text = document_text
 
-    # Truncate to max length
-    if len(text) > _MAX_DOCUMENT_LENGTH:
-        text = text[:_MAX_DOCUMENT_LENGTH]
+    # Create client if not provided
+    if client is None:
+        try:
+            client = anthropic.Anthropic()
+        except anthropic.AuthenticationError:
+            logger.warning("llm_extract.auth_error", error="Missing or invalid ANTHROPIC_API_KEY")
+            return None
 
-    # Build the user message with optional metadata context
+    # Split into chunks if needed
+    chunks = _split_text_into_chunks(text, max_chars, content_format)
+
+    if len(chunks) > 1:
+        logger.info(
+            "llm_extract.chunked",
+            total_chars=len(text),
+            num_chunks=len(chunks),
+            chunk_sizes=[len(c) for c in chunks],
+        )
+
+    # Extract from each chunk
+    chunk_results: list[LLMExtractionResult] = []
+    for i, chunk in enumerate(chunks):
+        user_message = _build_user_message(chunk, content_format, metadata)
+        response = _call_api(client, user_message)
+        if response is None:
+            logger.warning("llm_extract.chunk_api_failure", chunk_index=i)
+            continue
+        parsed = _parse_response(response, metadata)
+        if parsed is not None:
+            chunk_results.append(parsed)
+
+    if not chunk_results:
+        return None
+
+    # Single chunk: return directly.  Multiple: merge.
+    if len(chunk_results) == 1:
+        return chunk_results[0]
+    return _merge_results(chunk_results)
+
+
+def _build_user_message(
+    text: str,
+    content_format: str,
+    metadata: dict[str, str] | None,
+) -> str:
+    """Build the user message for a single chunk."""
     user_parts: list[str] = []
     if metadata:
         meta_lines: list[str] = []
@@ -288,23 +502,7 @@ def extract_fields_llm(
             user_parts.append("Metadata from scraper:\n" + "\n".join(meta_lines))
 
     user_parts.append(f"Document ({content_format}):\n\n{text}")
-    user_message = "\n\n".join(user_parts)
-
-    # Create client if not provided
-    if client is None:
-        try:
-            client = anthropic.Anthropic()
-        except anthropic.AuthenticationError:
-            logger.warning("llm_extract.auth_error", error="Missing or invalid ANTHROPIC_API_KEY")
-            return None
-
-    # Call the API with retry on rate limit
-    response = _call_api(client, user_message)
-    if response is None:
-        return None
-
-    # Parse the response
-    return _parse_response(response, metadata)
+    return "\n\n".join(user_parts)
 
 
 def _call_api(
