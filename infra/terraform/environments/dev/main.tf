@@ -10,6 +10,12 @@
 #
 # Object lock is intentionally disabled for dev so test objects can be deleted.
 
+# Look up the Anthropic API key secret so we can pass its ARN to the compute
+# module without hardcoding the random Secrets Manager suffix.
+data "aws_secretsmanager_secret" "anthropic_api_key" {
+  name = "judgemind/anthropic/api-key"
+}
+
 module "networking" {
   source      = "../../modules/networking"
   environment = "dev"
@@ -70,6 +76,7 @@ module "compute" {
   db_connection_secret_arn          = module.database.db_connection_secret_arn
   opensearch_url                    = "https://${module.search.domain_endpoint}"
   opensearch_credentials_secret_arn = module.search.master_credentials_secret_arn
+  anthropic_api_key_secret_arn      = data.aws_secretsmanager_secret.anthropic_api_key.arn
 
   # Dev: 0.5 vCPU, 1 GB RAM, daily schedule at 6 AM PT
   task_cpu            = 512
