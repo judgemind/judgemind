@@ -117,3 +117,9 @@ variable "anthropic_api_key_secret_arn" {
   type        = string
   default     = ""
 }
+
+variable "google_api_key_secret_arn" {
+  description = "ARN of the Secrets Manager secret holding the Google API key (plain string). When set, GOOGLE_API_KEY is injected into the ingestion worker container."
+  type        = string
+  default     = ""
+}

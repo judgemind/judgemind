@@ -405,7 +405,7 @@ def _merge_results(
 # ---------------------------------------------------------------------------
 
 # Default per-chunk character budget.  80K chars leaves room for the
-# system prompt and output tokens within Haiku's context window.
+# system prompt and output tokens within the model's context window.
 _DEFAULT_MAX_CHARS = 80_000
 
 
@@ -422,7 +422,7 @@ def extract_fields_llm(
 
     The provider and model are resolved from the explicit arguments, then from
     ``LLM_PROVIDER`` / ``LLM_MODEL`` environment variables, then from built-in
-    defaults (Anthropic Claude Haiku).
+    defaults (Google Gemini 2.5 Flash Lite).
 
     If the document exceeds *max_chars* after preprocessing, it is
     automatically split into overlapping chunks, each extracted
@@ -438,8 +438,8 @@ def extract_fields_llm(
             Accepts an ``anthropic.Anthropic`` or ``google.genai.Client``
             depending on the provider.  If ``None``, the provider adapter
             creates one from the appropriate env var.
-        provider: LLM provider name (``"anthropic"``, ``"google"``).
-            Falls back to ``LLM_PROVIDER`` env var, then ``"anthropic"``.
+        provider: LLM provider name (``"google"``, ``"anthropic"``).
+            Falls back to ``LLM_PROVIDER`` env var, then ``"google"``.
         model: Model ID.  Falls back to ``LLM_MODEL`` env var, then a
             per-provider default.
         max_chars: Per-chunk character limit.  Documents under this size

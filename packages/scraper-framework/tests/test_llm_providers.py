@@ -286,44 +286,44 @@ class TestCallGoogle:
 class TestCallLlm:
     """Tests for the top-level call_llm dispatcher."""
 
-    def test_defaults_to_anthropic(self) -> None:
-        """With no provider specified, defaults to anthropic."""
-        with (
-            patch("ingestion.llm_providers._call_anthropic") as mock_anthropic,
-            patch.dict("os.environ", {}, clear=True),
-        ):
-            mock_anthropic.return_value = LLMResponse(text="ok", input_tokens=1, output_tokens=1)
-            result = call_llm(system_prompt="sys", user_message="user")
-
-        assert result is not None
-        mock_anthropic.assert_called_once()
-        # Verify default model
-        call_args = mock_anthropic.call_args
-        assert call_args[0][2] == "claude-haiku-4-5-20251001"
-
-    def test_provider_from_env(self) -> None:
-        """LLM_PROVIDER env var selects provider."""
+    def test_defaults_to_google(self) -> None:
+        """With no provider specified, defaults to google."""
         with (
             patch("ingestion.llm_providers._call_google") as mock_google,
-            patch.dict("os.environ", {"LLM_PROVIDER": "google"}, clear=True),
+            patch.dict("os.environ", {}, clear=True),
         ):
             mock_google.return_value = LLMResponse(text="ok", input_tokens=1, output_tokens=1)
             result = call_llm(system_prompt="sys", user_message="user")
 
         assert result is not None
         mock_google.assert_called_once()
+        # Verify default model
+        call_args = mock_google.call_args
+        assert call_args[0][2] == "gemini-2.5-flash-lite"
+
+    def test_provider_from_env(self) -> None:
+        """LLM_PROVIDER env var selects provider (anthropic overrides google default)."""
+        with (
+            patch("ingestion.llm_providers._call_anthropic") as mock_anthropic,
+            patch.dict("os.environ", {"LLM_PROVIDER": "anthropic"}, clear=True),
+        ):
+            mock_anthropic.return_value = LLMResponse(text="ok", input_tokens=1, output_tokens=1)
+            result = call_llm(system_prompt="sys", user_message="user")
+
+        assert result is not None
+        mock_anthropic.assert_called_once()
 
     def test_model_from_env(self) -> None:
         """LLM_MODEL env var overrides default model."""
         with (
-            patch("ingestion.llm_providers._call_anthropic") as mock_anthropic,
-            patch.dict("os.environ", {"LLM_MODEL": "claude-opus-4-20250514"}, clear=True),
+            patch("ingestion.llm_providers._call_google") as mock_google,
+            patch.dict("os.environ", {"LLM_MODEL": "gemini-2.0-flash"}, clear=True),
         ):
-            mock_anthropic.return_value = LLMResponse(text="ok", input_tokens=1, output_tokens=1)
+            mock_google.return_value = LLMResponse(text="ok", input_tokens=1, output_tokens=1)
             call_llm(system_prompt="sys", user_message="user")
 
-        call_args = mock_anthropic.call_args
-        assert call_args[0][2] == "claude-opus-4-20250514"
+        call_args = mock_google.call_args
+        assert call_args[0][2] == "gemini-2.0-flash"
 
     def test_explicit_args_override_env(self) -> None:
         """Explicit provider/model args override env vars."""
@@ -416,23 +416,23 @@ class TestCreateClient:
 
         assert client is None
 
-    def test_defaults_to_anthropic(self) -> None:
-        """With no provider arg, defaults to anthropic."""
+    def test_defaults_to_google(self) -> None:
+        """With no provider arg, defaults to google."""
         mock_instance = MagicMock()
         with (
-            patch("anthropic.Anthropic", return_value=mock_instance),
-            patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}, clear=True),
+            patch("google.genai.Client", return_value=mock_instance),
+            patch.dict("os.environ", {"GOOGLE_API_KEY": "test-key"}, clear=True),
         ):
             client = create_client()
 
         assert client is mock_instance
 
     def test_provider_from_env(self) -> None:
-        """LLM_PROVIDER env var selects provider."""
+        """LLM_PROVIDER env var selects provider (anthropic overrides google default)."""
         mock_instance = MagicMock()
         with (
-            patch("google.genai.Client", return_value=mock_instance),
-            patch.dict("os.environ", {"LLM_PROVIDER": "google", "GOOGLE_API_KEY": "k"}),
+            patch("anthropic.Anthropic", return_value=mock_instance),
+            patch.dict("os.environ", {"LLM_PROVIDER": "anthropic", "ANTHROPIC_API_KEY": "k"}),
         ):
             client = create_client()
 

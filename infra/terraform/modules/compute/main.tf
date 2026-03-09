@@ -294,6 +294,7 @@ resource "aws_iam_role_policy" "ecs_task_execution_secrets" {
           var.db_connection_secret_arn,
           var.opensearch_credentials_secret_arn,
           var.anthropic_api_key_secret_arn,
+          var.google_api_key_secret_arn,
         ])
       }
     ]
@@ -393,11 +394,20 @@ resource "aws_ecs_task_definition" "ingestion_worker" {
             name      = "ANTHROPIC_API_KEY"
             valueFrom = var.anthropic_api_key_secret_arn
           }
+        ] : [],
+        var.google_api_key_secret_arn != "" ? [
+          {
+            name      = "GOOGLE_API_KEY"
+            valueFrom = var.google_api_key_secret_arn
+          }
         ] : []
       )
 
       environment = concat(
-        [{ name = "ENVIRONMENT", value = var.environment }],
+        [
+          { name = "ENVIRONMENT", value = var.environment },
+          { name = "LLM_PROVIDER", value = "google" }
+        ],
         var.redis_url != "" ? [{ name = "REDIS_URL", value = var.redis_url }] : [],
         var.opensearch_url != "" ? [{ name = "OPENSEARCH_URL", value = var.opensearch_url }] : [],
         var.document_archive_bucket != "" ? [{ name = "JUDGEMIND_ARCHIVE_BUCKET", value = var.document_archive_bucket }] : []

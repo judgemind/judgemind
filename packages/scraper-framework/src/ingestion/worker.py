@@ -10,10 +10,10 @@ Environment variables:
     REDIS_URL         — Redis URL, e.g. redis://localhost:6379 (required)
     OPENSEARCH_URL    — OpenSearch endpoint, e.g. https://localhost:9200 (required)
     JUDGEMIND_ARCHIVE_BUCKET — S3 bucket for document content (required for full-text indexing)
-    LLM_PROVIDER      — LLM provider: "anthropic" (default) or "google"
+    LLM_PROVIDER      — LLM provider: "google" (default) or "anthropic"
     LLM_MODEL         — Model ID (provider-specific; sensible defaults per provider)
-    ANTHROPIC_API_KEY  — Required when LLM_PROVIDER is "anthropic" (default)
-    GOOGLE_API_KEY     — Required when LLM_PROVIDER is "google"
+    GOOGLE_API_KEY     — Required when LLM_PROVIDER is "google" (default)
+    ANTHROPIC_API_KEY  — Required when LLM_PROVIDER is "anthropic"
     MAX_RETRIES       — Per-message retry limit before dead-lettering (default: 3)
 """
 
@@ -250,7 +250,7 @@ class IngestionWorker:
 
         Extraction strategy (per field):
           1. Use the scraper-provided value if present.
-          2. Try LLM extraction (if ANTHROPIC_API_KEY is configured).
+          2. Try LLM extraction (if the LLM provider API key is configured).
           3. Fall back to regex extraction.
 
         Exposed for testing. Raises on unrecoverable errors.
