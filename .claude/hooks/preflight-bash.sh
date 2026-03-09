@@ -26,7 +26,10 @@ fi
 
 # 0. Push to main/master — block during task work.
 #    Catches: git push origin main, git push -u origin main, git -C /path push origin main
-if echo "$COMMAND" | grep -qE '\bgit\b.*\bpush\b' ; then
+#    The regex requires "push" as a git subcommand (after git or git -C <path>),
+#    not just anywhere in the command. This avoids false positives on commands like
+#    "git add .githooks/pre-push" where "push" appears in a filename.
+if echo "$COMMAND" | grep -qE '\bgit\b(\s+-C\s+\S+)?\s+push\b' ; then
     # Extract what looks like the branch being pushed (last word, or after "origin")
     if echo "$COMMAND" | grep -qE '\bpush\b.*\b(main|master)\b' ; then
         echo "BLOCKED: Pushing directly to main/master is not allowed during task work. Push to a feature branch and open a PR. See CLAUDE.md §Git Workflow." >&2
