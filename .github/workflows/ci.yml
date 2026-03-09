@@ -41,7 +41,7 @@ jobs:
             infra:
               - 'infra/**'
 
-  scraper-tests:
+  scraper-unit-tests:
     needs: detect-changes
     if: needs.detect-changes.outputs.scraper == 'true'
     runs-on: ubuntu-latest
@@ -62,7 +62,37 @@ jobs:
       - name: Format check
         run: ruff format --check src/ tests/
       - name: Test
-        run: pytest tests/ -n auto -v --tb=short
+        run: >-
+          pytest tests/ -n auto -v --tb=short
+          --ignore=tests/test_reingest_from_s3.py
+          --ignore=tests/test_reingest_registry.py
+          --ignore=tests/test_ingestion.py
+          --ignore=tests/test_extract.py
+
+  ingestion-tests:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.scraper == 'true'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: packages/scraper-framework
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+      - name: Install dependencies
+        run: |
+          pip install -e ".[dev]"
+      - name: Test
+        run: >-
+          pytest
+          tests/test_reingest_from_s3.py
+          tests/test_reingest_registry.py
+          tests/test_ingestion.py
+          tests/test_extract.py
+          -n auto -v --tb=short
 
   nlp-tests:
     needs: detect-changes
@@ -184,7 +214,7 @@ jobs:
   # Always runs. Reports success only when every applicable job passed or was
   # skipped (path filter did not match). Branch protection requires this check.
   ci-passed:
-    needs: [scraper-tests, nlp-tests, api-tests, web-tests, infra-validate]
+    needs: [scraper-unit-tests, ingestion-tests, nlp-tests, api-tests, web-tests, infra-validate]
     if: always()
     runs-on: ubuntu-latest
     steps:
