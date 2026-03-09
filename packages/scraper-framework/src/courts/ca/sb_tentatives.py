@@ -133,6 +133,15 @@ class SBTentativeRulingsScraper(PdfLinkScraper):
         if link_text and not doc.hearing_date:
             doc.hearing_date = _sb_hearing_date_from_filename(link_text)
 
+        # Fallback: extract hearing date from PDF text header
+        # (covers reingest where link_text is unavailable)
+        if doc.ruling_text and not doc.hearing_date:
+            from ingestion.extract import extract_hearing_date
+
+            hd = extract_hearing_date(doc.ruling_text)
+            if hd:
+                doc.hearing_date = datetime(hd.year, hd.month, hd.day)
+
         return doc
 
 

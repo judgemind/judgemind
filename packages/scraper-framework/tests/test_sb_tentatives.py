@@ -357,9 +357,10 @@ def test_sb_run_populates_hearing_date() -> None:
     docs = scraper.fetch_documents()
     parsed = [scraper.parse_document(d) for d in docs]
 
-    # All but 1 should have hearing dates (CVS36202626.pdf has invalid date digits)
+    # All 52 have hearing dates: 51 from filename, 1 (CVS36202626.pdf with
+    # invalid filename digits) recovered via PDF text header fallback.
     has_date = [d for d in parsed if d.hearing_date]
-    assert len(has_date) == 51
+    assert len(has_date) == 52
 
     # First link is CVS24030426.pdf → 03/04/2026
     first = has_date[0]

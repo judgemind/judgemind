@@ -57,6 +57,8 @@ from ingestion.db import (  # noqa: E402
 )
 from ingestion.extract import (  # noqa: E402
     extract_case_number,
+    extract_case_title,
+    extract_hearing_date,
     extract_judge_name,
     extract_motion_type,
     extract_outcome,
@@ -74,43 +76,65 @@ _SCRAPER_REGISTRY: dict[str, type] = {}
 
 
 def _load_scraper_registry() -> None:
-    """Lazily populate the scraper registry from known court modules."""
+    """Lazily populate the scraper registry from known court modules.
+
+    Keys must match the scraper_id values stored in the documents table
+    (e.g. "ca-oc-tentatives-civil", not "ca-oc-tentatives").
+    """
     if _SCRAPER_REGISTRY:
         return
     try:
-        from courts.ca.la_tentatives import LATentativesScraper
+        from courts.ca.la_tentatives import LATentativeRulingsScraper
 
-        _SCRAPER_REGISTRY["ca-la-tentatives-civil"] = LATentativesScraper
+        _SCRAPER_REGISTRY["ca-la-tentatives-civil"] = LATentativeRulingsScraper
     except ImportError:
         pass
     try:
-        from courts.ca.oc_tentatives import OCTentativesScraper
+        from courts.ca.oc_tentatives import OCTentativeRulingsScraper
 
-        _SCRAPER_REGISTRY["ca-oc-tentatives"] = OCTentativesScraper
+        _SCRAPER_REGISTRY["ca-oc-tentatives-civil"] = OCTentativeRulingsScraper
     except ImportError:
         pass
     try:
-        from courts.ca.sb_tentatives import SBTentativesScraper
+        from courts.ca.oc_family_law_tentatives import OCFamilyLawTentativeRulingsScraper
 
-        _SCRAPER_REGISTRY["ca-sb-tentatives"] = SBTentativesScraper
+        _SCRAPER_REGISTRY["ca-oc-tentatives-family-law"] = (
+            OCFamilyLawTentativeRulingsScraper
+        )
     except ImportError:
         pass
     try:
-        from courts.ca.sf_tentatives import SFTentativesScraper
+        from courts.ca.oc_probate_tentatives import OCProbateTentativeRulingsScraper
 
-        _SCRAPER_REGISTRY["ca-sf-tentatives"] = SFTentativesScraper
+        _SCRAPER_REGISTRY["ca-oc-tentatives-probate"] = (
+            OCProbateTentativeRulingsScraper
+        )
     except ImportError:
         pass
     try:
-        from courts.ca.sc_tentatives import SCTentativesScraper
+        from courts.ca.sb_tentatives import SBTentativeRulingsScraper
 
-        _SCRAPER_REGISTRY["ca-sc-tentatives"] = SCTentativesScraper
+        _SCRAPER_REGISTRY["ca-sb-tentatives-civil"] = SBTentativeRulingsScraper
     except ImportError:
         pass
     try:
-        from courts.ca.riverside_tentatives import RiversideTentativesScraper
+        from courts.ca.sf_tentatives import SFTentativeRulingsScraper
 
-        _SCRAPER_REGISTRY["ca-riverside-tentatives"] = RiversideTentativesScraper
+        _SCRAPER_REGISTRY["ca-sf-tentatives-family-law"] = SFTentativeRulingsScraper
+    except ImportError:
+        pass
+    try:
+        from courts.ca.sc_tentatives import SCTentativeRulingsScraper
+
+        _SCRAPER_REGISTRY["ca-sc-tentatives-civil"] = SCTentativeRulingsScraper
+    except ImportError:
+        pass
+    try:
+        from courts.ca.riverside_tentatives import RiversideTentativeRulingsScraper
+
+        _SCRAPER_REGISTRY["ca-riverside-tentatives-civil"] = (
+            RiversideTentativeRulingsScraper
+        )
     except ImportError:
         pass
 
@@ -245,6 +269,10 @@ def _reparse_document(
         extracted["motion_type"] = extract_motion_type(text)
     if not extracted["case_number"]:
         extracted["case_number"] = extract_case_number(text)
+    if not extracted["case_title"]:
+        extracted["case_title"] = extract_case_title(text)
+    if not extracted["hearing_date"]:
+        extracted["hearing_date"] = extract_hearing_date(text)
 
     return extracted
 
