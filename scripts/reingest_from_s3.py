@@ -247,6 +247,37 @@ def _fetch_s3_content(s3_client: object, bucket: str, key: str) -> bytes:
     return response["Body"].read()  # type: ignore[index]
 
 
+def _extract_text_from_content(
+    raw_content: bytes,
+    doc_format: str,
+) -> str:
+    """Extract readable text from raw document content.
+
+    For PDF documents, uses pdfplumber to extract text properly.
+    For other formats (HTML, plain text), decodes as UTF-8.
+    """
+    if doc_format == "pdf":
+        try:
+            import io
+
+            import pdfplumber
+
+            lines: list[str] = []
+            with pdfplumber.open(io.BytesIO(raw_content)) as pdf:
+                for page in pdf.pages:
+                    page_text = page.extract_text()
+                    if page_text:
+                        lines.append(page_text)
+            extracted_text = "\n".join(lines)
+            if extracted_text.strip():
+                return extracted_text
+        except Exception:
+            logger.debug(
+                "pdfplumber text extraction failed, falling back to UTF-8 decode"
+            )
+    return raw_content.decode("utf-8", errors="replace")
+
+
 def _reparse_document(
     raw_content: bytes,
     scraper_id: str,
@@ -254,12 +285,16 @@ def _reparse_document(
 ) -> dict:
     """Re-parse a document using the scraper's parse_document method.
 
+    For PDF documents, extracts text via pdfplumber instead of raw UTF-8
+    decode, which produces garbage on binary PDF content.
+
     Falls back to regex extraction if no scraper class is available.
     Returns a dict of extracted fields.
     """
     _load_scraper_registry()
 
-    text = raw_content.decode("utf-8", errors="replace").replace("\x00", "")
+    doc_format = doc_meta.get("format", "html")
+    text = _extract_text_from_content(raw_content, doc_format).replace("\x00", "")
     extracted: dict = {
         "ruling_text": text,
         "case_number": doc_meta.get("case_number"),
@@ -321,7 +356,9 @@ def _reparse_document(
                 exc_info=True,
             )
 
-    # Fill in any remaining gaps with regex extraction
+    # Fill in any remaining gaps with regex extraction.
+    # For PDF documents, ``text`` is pdfplumber-extracted text (not garbage
+    # UTF-8 decode), so regex patterns can match real content.
     if not extracted["judge_name"]:
         extracted["judge_name"] = extract_judge_name(text)
     if not extracted["outcome"]:
