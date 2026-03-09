@@ -171,6 +171,7 @@ class IngestionWorker:
         self._redis = redis_client
         self._pg_dsn = pg_dsn
         self._max_retries = max_retries
+        self._conn: psycopg.Connection | None = None
         self._indexer = IndexingConsumer(
             opensearch_client=opensearch_client,
             s3_client=s3_client,
@@ -192,21 +193,51 @@ class IngestionWorker:
     # Public interface
     # ------------------------------------------------------------------
 
+    def _get_connection(self) -> psycopg.Connection:
+        """Return the persistent Postgres connection, creating or reconnecting as needed.
+
+        The connection is created lazily on first call and reused across all
+        subsequent ``process_event`` invocations. If the connection is closed
+        (e.g. server restart, network blip), a new one is transparently created.
+
+        Autocommit is OFF — callers manage transactions explicitly via
+        ``conn.commit()`` / ``conn.rollback()``.
+        """
+        if self._conn is None or self._conn.closed:
+            if self._conn is not None:
+                logger.info("Reconnecting to Postgres (previous connection was closed)")
+            self._conn = psycopg.connect(self._pg_dsn, autocommit=False)
+        return self._conn
+
+    def close(self) -> None:
+        """Close the persistent Postgres connection if open.
+
+        Safe to call multiple times. Called automatically when the worker
+        shuts down via ``run()``.
+        """
+        if self._conn is not None and not self._conn.closed:
+            self._conn.close()
+            self._conn = None
+
     def health_check(self) -> None:
         """Verify DB connectivity and that required tables exist.
 
         Raises InfrastructureError if the database is unreachable or the
         schema is not ready. Called on startup before consuming messages.
+
+        Uses the persistent connection so the same connection is reused for
+        subsequent ``process_event`` calls.
         """
         required_tables = ("courts", "cases", "documents", "rulings")
         try:
-            with psycopg.connect(self._pg_dsn) as conn:
-                with conn.cursor() as cur:
-                    for table in required_tables:
-                        cur.execute(
-                            "SELECT 1 FROM information_schema.tables WHERE table_name = %s LIMIT 1",
-                            (table,),
-                        )
+            conn = self._get_connection()
+            with conn.cursor() as cur:
+                for table in required_tables:
+                    cur.execute(
+                        "SELECT 1 FROM information_schema.tables WHERE table_name = %s LIMIT 1",
+                        (table,),
+                    )
+            conn.rollback()  # Release any read-lock from the health check
         except (*_INFRA_PG_ERRORS, *_INFRA_GENERIC_ERRORS) as exc:
             raise InfrastructureError(exc) from exc
 
@@ -232,18 +263,21 @@ class IngestionWorker:
             },
         )
 
-        while True:
-            try:
-                self._process_batch(batch_size=batch_size, block_ms=block_ms)
-            except KeyboardInterrupt:
-                logger.info("Ingestion worker stopped")
-                break
-            except InfrastructureError:
-                # Propagate infra errors to exit the process for ECS restart.
-                # Messages stay unacknowledged in the stream.
-                raise
-            except Exception as exc:
-                logger.error("Unexpected error in consumer loop: %s", exc, exc_info=True)
+        try:
+            while True:
+                try:
+                    self._process_batch(batch_size=batch_size, block_ms=block_ms)
+                except KeyboardInterrupt:
+                    logger.info("Ingestion worker stopped")
+                    break
+                except InfrastructureError:
+                    # Propagate infra errors to exit the process for ECS restart.
+                    # Messages stay unacknowledged in the stream.
+                    raise
+                except Exception as exc:
+                    logger.error("Unexpected error in consumer loop: %s", exc, exc_info=True)
+        finally:
+            self.close()
 
     def process_event(self, event_data: dict[str, Any]) -> None:
         """Process a single deserialized event dict.
@@ -440,7 +474,8 @@ class IngestionWorker:
                 },
             )
 
-        with psycopg.connect(self._pg_dsn) as conn:
+        conn = self._get_connection()
+        try:
             # 1. Ensure court exists
             court_id = upsert_court(conn, state, county, court_name)
 
@@ -505,6 +540,9 @@ class IngestionWorker:
                         upsert_case_party(conn, case_id, party_id, party_role)
 
             conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
 
         if is_new:
             # Index in OpenSearch — document_id is used as the OS doc id

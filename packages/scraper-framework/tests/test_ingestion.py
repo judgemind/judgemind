@@ -61,6 +61,20 @@ def _make_event(**overrides: object) -> dict:
     return base
 
 
+def _make_mock_conn() -> tuple[MagicMock, MagicMock]:
+    """Return a (mock_conn, mock_cur) pair configured for the persistent connection pattern.
+
+    The mock_conn has ``closed = False`` so ``_get_connection()`` reuses it,
+    and cursor context-manager protocol is set up for db.py helper functions.
+    """
+    mock_conn = MagicMock()
+    mock_cur = MagicMock()
+    mock_conn.closed = False
+    mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cur)
+    mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+    return mock_conn, mock_cur
+
+
 def _make_worker(pg_dsn: str = "postgresql://localhost/test") -> tuple[IngestionWorker, MagicMock]:
     """Return a worker with mocked OpenSearch and S3."""
     redis_mock = MagicMock()
@@ -128,12 +142,7 @@ def test_process_event_happy_path(mock_psycopg: MagicMock) -> None:
     worker, os_mock = _make_worker()
 
     # Set up mock connection and cursor
-    mock_conn = MagicMock()
-    mock_cur = MagicMock()
-    mock_conn.__enter__ = MagicMock(return_value=mock_conn)
-    mock_conn.__exit__ = MagicMock(return_value=False)
-    mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cur)
-    mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+    mock_conn, mock_cur = _make_mock_conn()
     mock_psycopg.connect.return_value = mock_conn
 
     # upsert_court returns court_id
@@ -172,12 +181,7 @@ def test_process_event_passes_outcome_and_motion_type_from_event(mock_psycopg: M
     """When event carries outcome/motion_type, they are passed to insert_ruling."""
     worker, os_mock = _make_worker()
 
-    mock_conn = MagicMock()
-    mock_cur = MagicMock()
-    mock_conn.__enter__ = MagicMock(return_value=mock_conn)
-    mock_conn.__exit__ = MagicMock(return_value=False)
-    mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cur)
-    mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+    mock_conn, mock_cur = _make_mock_conn()
     mock_psycopg.connect.return_value = mock_conn
     mock_cur.fetchone.side_effect = [
         ("court-uuid-1",),  # upsert_court
@@ -205,12 +209,7 @@ def test_process_event_extracts_outcome_from_ruling_text(mock_psycopg: MagicMock
     """When event has no outcome/motion_type, regex extraction from ruling_text is used."""
     worker, os_mock = _make_worker()
 
-    mock_conn = MagicMock()
-    mock_cur = MagicMock()
-    mock_conn.__enter__ = MagicMock(return_value=mock_conn)
-    mock_conn.__exit__ = MagicMock(return_value=False)
-    mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cur)
-    mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+    mock_conn, mock_cur = _make_mock_conn()
     mock_psycopg.connect.return_value = mock_conn
     mock_cur.fetchone.side_effect = [
         ("court-uuid-1",),  # upsert_court
@@ -237,12 +236,7 @@ def test_process_event_event_fields_override_regex(mock_psycopg: MagicMock) -> N
     """Event-level outcome/motion_type take precedence over regex extraction."""
     worker, os_mock = _make_worker()
 
-    mock_conn = MagicMock()
-    mock_cur = MagicMock()
-    mock_conn.__enter__ = MagicMock(return_value=mock_conn)
-    mock_conn.__exit__ = MagicMock(return_value=False)
-    mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cur)
-    mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+    mock_conn, mock_cur = _make_mock_conn()
     mock_psycopg.connect.return_value = mock_conn
     mock_cur.fetchone.side_effect = [
         ("court-uuid-1",),  # upsert_court
@@ -274,12 +268,7 @@ def test_process_event_no_case_number_falls_back_to_unknown(mock_psycopg: MagicM
     use a synthetic UNKNOWN- case number."""
     worker, _ = _make_worker()
 
-    mock_conn = MagicMock()
-    mock_cur = MagicMock()
-    mock_conn.__enter__ = MagicMock(return_value=mock_conn)
-    mock_conn.__exit__ = MagicMock(return_value=False)
-    mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cur)
-    mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+    mock_conn, mock_cur = _make_mock_conn()
     mock_psycopg.connect.return_value = mock_conn
     mock_cur.fetchone.side_effect = [
         ("court-uuid-1",),  # upsert_court
@@ -310,12 +299,7 @@ def test_process_event_extracts_case_number_from_ruling_text(mock_psycopg: Magic
     the fallback extraction should capture it."""
     worker, _ = _make_worker()
 
-    mock_conn = MagicMock()
-    mock_cur = MagicMock()
-    mock_conn.__enter__ = MagicMock(return_value=mock_conn)
-    mock_conn.__exit__ = MagicMock(return_value=False)
-    mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cur)
-    mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+    mock_conn, mock_cur = _make_mock_conn()
     mock_psycopg.connect.return_value = mock_conn
     mock_cur.fetchone.side_effect = [
         ("court-uuid-1",),  # upsert_court
@@ -346,12 +330,7 @@ def test_process_event_extracts_judge_name_from_ruling_text(mock_psycopg: MagicM
     the fallback extraction should capture it (#401)."""
     worker, _ = _make_worker()
 
-    mock_conn = MagicMock()
-    mock_cur = MagicMock()
-    mock_conn.__enter__ = MagicMock(return_value=mock_conn)
-    mock_conn.__exit__ = MagicMock(return_value=False)
-    mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cur)
-    mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+    mock_conn, mock_cur = _make_mock_conn()
     mock_psycopg.connect.return_value = mock_conn
     mock_cur.fetchone.side_effect = [
         ("court-uuid-1",),  # upsert_court
@@ -380,12 +359,7 @@ def test_process_event_no_hearing_date_skips_ruling(mock_psycopg: MagicMock) -> 
     """Events without hearing_date should still insert document but skip ruling."""
     worker, os_mock = _make_worker()
 
-    mock_conn = MagicMock()
-    mock_cur = MagicMock()
-    mock_conn.__enter__ = MagicMock(return_value=mock_conn)
-    mock_conn.__exit__ = MagicMock(return_value=False)
-    mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cur)
-    mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+    mock_conn, mock_cur = _make_mock_conn()
     mock_psycopg.connect.return_value = mock_conn
     mock_cur.fetchone.side_effect = [
         ("court-uuid-1",),  # upsert_court
@@ -417,12 +391,7 @@ def test_process_event_duplicate_skips_opensearch(mock_psycopg: MagicMock) -> No
     """If document_id already in Postgres, OpenSearch indexing is skipped."""
     worker, os_mock = _make_worker()
 
-    mock_conn = MagicMock()
-    mock_cur = MagicMock()
-    mock_conn.__enter__ = MagicMock(return_value=mock_conn)
-    mock_conn.__exit__ = MagicMock(return_value=False)
-    mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cur)
-    mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+    mock_conn, mock_cur = _make_mock_conn()
     mock_psycopg.connect.return_value = mock_conn
     mock_cur.fetchone.side_effect = [
         ("court-uuid-1",),  # upsert_court
@@ -632,12 +601,7 @@ def test_process_message_infra_error_on_first_attempt_raises_immediately(
 def test_health_check_success(mock_psycopg: MagicMock) -> None:
     """Health check passes when DB is reachable and tables exist."""
     worker, _ = _make_worker()
-    mock_conn = MagicMock()
-    mock_cur = MagicMock()
-    mock_conn.__enter__ = MagicMock(return_value=mock_conn)
-    mock_conn.__exit__ = MagicMock(return_value=False)
-    mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cur)
-    mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+    mock_conn, mock_cur = _make_mock_conn()
     mock_psycopg.connect.return_value = mock_conn
 
     # Should not raise
@@ -658,18 +622,141 @@ def test_health_check_raises_on_connection_failure(mock_psycopg: MagicMock) -> N
 def test_health_check_raises_on_missing_tables(mock_psycopg: MagicMock) -> None:
     """Health check raises InfrastructureError if required tables are missing."""
     worker, _ = _make_worker()
-    mock_conn = MagicMock()
-    mock_cur = MagicMock()
-    mock_conn.__enter__ = MagicMock(return_value=mock_conn)
-    mock_conn.__exit__ = MagicMock(return_value=False)
-    mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cur)
-    mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+    mock_conn, mock_cur = _make_mock_conn()
     mock_psycopg.connect.return_value = mock_conn
 
     mock_cur.execute.side_effect = psycopg.errors.UndefinedTable("relation 'courts' does not exist")
 
     with pytest.raises(InfrastructureError):
         worker.health_check()
+
+
+# ---------------------------------------------------------------------------
+# Persistent connection — reuse and reconnection (#476)
+# ---------------------------------------------------------------------------
+
+
+@patch("ingestion.worker.psycopg")
+def test_get_connection_creates_on_first_call(mock_psycopg: MagicMock) -> None:
+    """_get_connection creates a connection on first call."""
+    worker, _ = _make_worker()
+    mock_conn, _ = _make_mock_conn()
+    mock_psycopg.connect.return_value = mock_conn
+
+    conn = worker._get_connection()
+
+    assert conn is mock_conn
+    mock_psycopg.connect.assert_called_once_with(worker._pg_dsn, autocommit=False)
+
+
+@patch("ingestion.worker.psycopg")
+def test_get_connection_reuses_existing(mock_psycopg: MagicMock) -> None:
+    """_get_connection reuses the same connection on subsequent calls."""
+    worker, _ = _make_worker()
+    mock_conn, _ = _make_mock_conn()
+    mock_psycopg.connect.return_value = mock_conn
+
+    conn1 = worker._get_connection()
+    conn2 = worker._get_connection()
+
+    assert conn1 is conn2
+    # Only one connect call — the connection is reused
+    mock_psycopg.connect.assert_called_once()
+
+
+@patch("ingestion.worker.psycopg")
+def test_get_connection_reconnects_when_closed(mock_psycopg: MagicMock) -> None:
+    """_get_connection creates a new connection if the existing one is closed."""
+    worker, _ = _make_worker()
+    mock_conn_1, _ = _make_mock_conn()
+    mock_conn_2, _ = _make_mock_conn()
+    mock_psycopg.connect.side_effect = [mock_conn_1, mock_conn_2]
+
+    conn1 = worker._get_connection()
+    assert conn1 is mock_conn_1
+
+    # Simulate connection being closed (e.g. server restart)
+    mock_conn_1.closed = True
+
+    conn2 = worker._get_connection()
+    assert conn2 is mock_conn_2
+    assert mock_psycopg.connect.call_count == 2
+
+
+@patch("ingestion.worker.psycopg")
+def test_process_event_reuses_connection(mock_psycopg: MagicMock) -> None:
+    """Multiple process_event calls reuse the same DB connection."""
+    worker, os_mock = _make_worker()
+    mock_conn, mock_cur = _make_mock_conn()
+    mock_psycopg.connect.return_value = mock_conn
+    mock_cur.fetchone.side_effect = [
+        # First event
+        ("court-uuid-1",),
+        ("case-uuid-1",),
+        (True,),
+        None,
+        ("judge-uuid-1",),
+        # Second event
+        ("court-uuid-1",),
+        ("case-uuid-1",),
+        (True,),
+        None,
+        ("judge-uuid-2",),
+    ]
+    mock_cur.rowcount = 1
+
+    worker.process_event(_make_event(document_id="doc-1"))
+    worker.process_event(_make_event(document_id="doc-2"))
+
+    # Connection was created only once, not per-event
+    mock_psycopg.connect.assert_called_once()
+    # Both events committed on the same connection
+    assert mock_conn.commit.call_count == 2
+
+
+@patch("ingestion.worker.psycopg")
+def test_close_closes_connection(mock_psycopg: MagicMock) -> None:
+    """close() closes the persistent connection."""
+    worker, _ = _make_worker()
+    mock_conn, _ = _make_mock_conn()
+    mock_psycopg.connect.return_value = mock_conn
+
+    worker._get_connection()  # create the connection
+    worker.close()
+
+    mock_conn.close.assert_called_once()
+
+
+@patch("ingestion.worker.psycopg")
+def test_close_idempotent(mock_psycopg: MagicMock) -> None:
+    """close() is safe to call multiple times."""
+    worker, _ = _make_worker()
+    mock_conn, _ = _make_mock_conn()
+    mock_psycopg.connect.return_value = mock_conn
+
+    worker._get_connection()
+    worker.close()
+    # After close, _conn is None — second close should not raise
+    worker.close()
+
+    mock_conn.close.assert_called_once()
+
+
+@patch("ingestion.worker.psycopg")
+def test_process_event_rollback_on_error(mock_psycopg: MagicMock) -> None:
+    """process_event rolls back the transaction on error."""
+    worker, _ = _make_worker()
+    mock_conn, mock_cur = _make_mock_conn()
+    mock_psycopg.connect.return_value = mock_conn
+
+    # Make the first DB call raise
+    mock_cur.fetchone.side_effect = psycopg.errors.DataError("bad data")
+
+    with pytest.raises(psycopg.errors.DataError):
+        worker.process_event(_make_event())
+
+    mock_conn.rollback.assert_called_once()
+    mock_conn.commit.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -691,6 +778,26 @@ def test_run_exits_on_infrastructure_error(mock_psycopg: MagicMock) -> None:
 
     with pytest.raises(InfrastructureError):
         worker.run()
+
+
+@patch("ingestion.worker.psycopg")
+def test_run_closes_connection_on_exit(mock_psycopg: MagicMock) -> None:
+    """The run loop closes the persistent DB connection when it stops."""
+    worker, _ = _make_worker()
+    mock_conn, _ = _make_mock_conn()
+    mock_psycopg.connect.return_value = mock_conn
+    worker._ensure_consumer_group = MagicMock()
+    worker.health_check = MagicMock()
+
+    # Simulate a single batch then KeyboardInterrupt to stop the loop
+    worker._process_batch = MagicMock(side_effect=KeyboardInterrupt)
+
+    # Establish a connection so close() has something to clean up
+    worker._conn = mock_conn
+
+    worker.run()
+
+    mock_conn.close.assert_called_once()
 
 
 # ---------------------------------------------------------------------------
@@ -916,12 +1023,7 @@ def test_process_event_no_judge_name_leaves_judge_id_null(mock_psycopg: MagicMoc
     """Events without judge_name should not resolve a judge — judge_id stays NULL."""
     worker, os_mock = _make_worker()
 
-    mock_conn = MagicMock()
-    mock_cur = MagicMock()
-    mock_conn.__enter__ = MagicMock(return_value=mock_conn)
-    mock_conn.__exit__ = MagicMock(return_value=False)
-    mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cur)
-    mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+    mock_conn, mock_cur = _make_mock_conn()
     mock_psycopg.connect.return_value = mock_conn
     mock_cur.fetchone.side_effect = [
         ("court-uuid-1",),  # upsert_court
@@ -947,12 +1049,7 @@ def test_process_event_with_existing_judge_alias(mock_psycopg: MagicMock) -> Non
     """When judge alias already exists, reuse the existing judge_id."""
     worker, os_mock = _make_worker()
 
-    mock_conn = MagicMock()
-    mock_cur = MagicMock()
-    mock_conn.__enter__ = MagicMock(return_value=mock_conn)
-    mock_conn.__exit__ = MagicMock(return_value=False)
-    mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cur)
-    mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+    mock_conn, mock_cur = _make_mock_conn()
     mock_psycopg.connect.return_value = mock_conn
     mock_cur.fetchone.side_effect = [
         ("court-uuid-1",),  # upsert_court
@@ -1022,12 +1119,7 @@ def test_process_event_passes_case_title_to_upsert_case(mock_psycopg: MagicMock)
     """When event carries case_title, it is passed to upsert_case."""
     worker, os_mock = _make_worker()
 
-    mock_conn = MagicMock()
-    mock_cur = MagicMock()
-    mock_conn.__enter__ = MagicMock(return_value=mock_conn)
-    mock_conn.__exit__ = MagicMock(return_value=False)
-    mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cur)
-    mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+    mock_conn, mock_cur = _make_mock_conn()
     mock_psycopg.connect.return_value = mock_conn
     mock_cur.fetchone.side_effect = [
         ("court-uuid-1",),  # upsert_court
@@ -1058,12 +1150,7 @@ def test_process_event_without_case_title_passes_none(mock_psycopg: MagicMock) -
     """When event has no case_title, None is passed to upsert_case."""
     worker, os_mock = _make_worker()
 
-    mock_conn = MagicMock()
-    mock_cur = MagicMock()
-    mock_conn.__enter__ = MagicMock(return_value=mock_conn)
-    mock_conn.__exit__ = MagicMock(return_value=False)
-    mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cur)
-    mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+    mock_conn, mock_cur = _make_mock_conn()
     mock_psycopg.connect.return_value = mock_conn
     mock_cur.fetchone.side_effect = [
         ("court-uuid-1",),  # upsert_court
@@ -1195,12 +1282,7 @@ def test_process_event_with_parties(mock_psycopg: MagicMock) -> None:
     """When event carries parties, party records and case_party links are created."""
     worker, os_mock = _make_worker()
 
-    mock_conn = MagicMock()
-    mock_cur = MagicMock()
-    mock_conn.__enter__ = MagicMock(return_value=mock_conn)
-    mock_conn.__exit__ = MagicMock(return_value=False)
-    mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cur)
-    mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+    mock_conn, mock_cur = _make_mock_conn()
     mock_psycopg.connect.return_value = mock_conn
     mock_cur.fetchone.side_effect = [
         ("court-uuid-1",),  # upsert_court
@@ -1238,12 +1320,7 @@ def test_process_event_without_parties_no_party_calls(mock_psycopg: MagicMock) -
     """When event has no parties, no party DB calls are made."""
     worker, os_mock = _make_worker()
 
-    mock_conn = MagicMock()
-    mock_cur = MagicMock()
-    mock_conn.__enter__ = MagicMock(return_value=mock_conn)
-    mock_conn.__exit__ = MagicMock(return_value=False)
-    mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cur)
-    mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+    mock_conn, mock_cur = _make_mock_conn()
     mock_psycopg.connect.return_value = mock_conn
     mock_cur.fetchone.side_effect = [
         ("court-uuid-1",),  # upsert_court
@@ -1267,12 +1344,7 @@ def test_process_event_extracts_parties_from_case_title(mock_psycopg: MagicMock)
     extracted from the caption as a fallback (#328)."""
     worker, os_mock = _make_worker()
 
-    mock_conn = MagicMock()
-    mock_cur = MagicMock()
-    mock_conn.__enter__ = MagicMock(return_value=mock_conn)
-    mock_conn.__exit__ = MagicMock(return_value=False)
-    mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cur)
-    mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+    mock_conn, mock_cur = _make_mock_conn()
     mock_psycopg.connect.return_value = mock_conn
     mock_cur.fetchone.side_effect = [
         ("court-uuid-1",),  # upsert_court
@@ -1437,12 +1509,7 @@ def test_process_event_llm_extraction_populates_missing_fields(
     # Simulate an anthropic client being configured
     worker._llm_client = MagicMock()
 
-    mock_conn = MagicMock()
-    mock_cur = MagicMock()
-    mock_conn.__enter__ = MagicMock(return_value=mock_conn)
-    mock_conn.__exit__ = MagicMock(return_value=False)
-    mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cur)
-    mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+    mock_conn, mock_cur = _make_mock_conn()
     mock_psycopg.connect.return_value = mock_conn
     mock_cur.fetchone.side_effect = [
         ("court-uuid-1",),  # upsert_court
@@ -1525,12 +1592,7 @@ def test_process_event_llm_failure_falls_back_to_regex(
     worker, os_mock = _make_worker()
     worker._llm_client = MagicMock()
 
-    mock_conn = MagicMock()
-    mock_cur = MagicMock()
-    mock_conn.__enter__ = MagicMock(return_value=mock_conn)
-    mock_conn.__exit__ = MagicMock(return_value=False)
-    mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cur)
-    mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+    mock_conn, mock_cur = _make_mock_conn()
     mock_psycopg.connect.return_value = mock_conn
     mock_cur.fetchone.side_effect = [
         ("court-uuid-1",),  # upsert_court
@@ -1571,12 +1633,7 @@ def test_process_event_no_anthropic_client_uses_regex_only(
     # Ensure no anthropic client
     worker._llm_client = None
 
-    mock_conn = MagicMock()
-    mock_cur = MagicMock()
-    mock_conn.__enter__ = MagicMock(return_value=mock_conn)
-    mock_conn.__exit__ = MagicMock(return_value=False)
-    mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cur)
-    mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+    mock_conn, mock_cur = _make_mock_conn()
     mock_psycopg.connect.return_value = mock_conn
     mock_cur.fetchone.side_effect = [
         ("court-uuid-1",),  # upsert_court
@@ -1615,12 +1672,7 @@ def test_process_event_llm_matches_ruling_by_case_number(
     worker, os_mock = _make_worker()
     worker._llm_client = MagicMock()
 
-    mock_conn = MagicMock()
-    mock_cur = MagicMock()
-    mock_conn.__enter__ = MagicMock(return_value=mock_conn)
-    mock_conn.__exit__ = MagicMock(return_value=False)
-    mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cur)
-    mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+    mock_conn, mock_cur = _make_mock_conn()
     mock_psycopg.connect.return_value = mock_conn
     mock_cur.fetchone.side_effect = [
         ("court-uuid-1",),  # upsert_court
@@ -1696,12 +1748,7 @@ def test_process_event_scraper_fields_take_precedence_over_llm(
     worker, os_mock = _make_worker()
     worker._llm_client = MagicMock()
 
-    mock_conn = MagicMock()
-    mock_cur = MagicMock()
-    mock_conn.__enter__ = MagicMock(return_value=mock_conn)
-    mock_conn.__exit__ = MagicMock(return_value=False)
-    mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cur)
-    mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+    mock_conn, mock_cur = _make_mock_conn()
     mock_psycopg.connect.return_value = mock_conn
     mock_cur.fetchone.side_effect = [
         ("court-uuid-1",),  # upsert_court
