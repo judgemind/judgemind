@@ -125,9 +125,14 @@ FETCH_DOCUMENTS_QUERY = """
     LEFT JOIN cases c ON c.id = d.case_id
     WHERE d.status = 'active'
     {filters}
-    ORDER BY d.captured_at
-    LIMIT %s OFFSET %s
+    AND (d.captured_at, d.id) > (%s, %s)
+    ORDER BY d.captured_at, d.id
+    LIMIT %s
 """
+
+# Minimum cursor values for the first batch
+_CURSOR_MIN_TIMESTAMP = datetime(1970, 1, 1)
+_CURSOR_MIN_UUID = "00000000-0000-0000-0000-000000000000"
 
 
 def _build_filters(
@@ -246,16 +251,17 @@ def reingest_batch(
     conn: psycopg.Connection,
     s3_client: object,
     batch_size: int,
-    offset: int,
+    cursor: tuple[datetime, str],
     filters: str,
     filter_params: list,
     dry_run: bool = False,
-) -> tuple[int, int]:
-    """Process one batch. Returns (processed, updated)."""
+) -> tuple[int, int, tuple[datetime, str]]:
+    """Process one batch. Returns (processed, updated, next_cursor)."""
     processed = 0
     updated = 0
+    next_cursor = cursor
 
-    params = filter_params + [batch_size, offset]
+    params = filter_params + [cursor[0], cursor[1], batch_size]
 
     with conn.cursor() as cur:
         cur.execute(
@@ -265,7 +271,7 @@ def reingest_batch(
         rows = cur.fetchall()
 
     if not rows:
-        return 0, 0
+        return 0, 0, cursor
 
     for row in rows:
         (
@@ -288,6 +294,7 @@ def reingest_batch(
         ) = row
         processed += 1
         doc_id_str = str(doc_id)
+        next_cursor = (captured_at, doc_id_str)
 
         if not s3_key or not s3_bucket:
             logger.warning("Document %s has no S3 key/bucket — skipping", doc_id_str)
@@ -399,7 +406,7 @@ def reingest_batch(
 
         updated += 1
 
-    return processed, updated
+    return processed, updated, next_cursor
 
 
 def run_reingest(
@@ -418,7 +425,7 @@ def run_reingest(
     s3_client = boto3.client("s3")
     total_processed = 0
     total_updated = 0
-    offset = 0
+    cursor: tuple[datetime, str] = (_CURSOR_MIN_TIMESTAMP, _CURSOR_MIN_UUID)
 
     with psycopg.connect(dsn) as conn:
         while True:
@@ -429,11 +436,11 @@ def run_reingest(
                     break
                 effective_batch = min(batch_size, remaining)
 
-            processed, updated = reingest_batch(
+            processed, updated, cursor = reingest_batch(
                 conn,
                 s3_client,
                 effective_batch,
-                offset,
+                cursor,
                 filters,
                 filter_params,
                 dry_run=dry_run,
@@ -457,7 +464,6 @@ def run_reingest(
 
             if processed < effective_batch:
                 break
-            offset += effective_batch
 
     return {
         "total_processed": total_processed,
