@@ -25,6 +25,21 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _strip_nul(value: str | None) -> str | None:
+    """Remove NUL (0x00) bytes from a string.
+
+    PostgreSQL text fields cannot contain NUL bytes. This helper is applied
+    to all text parameters before they are passed to INSERT/UPDATE statements,
+    protecting all callers from the ``ValueError: PostgreSQL text fields
+    cannot contain NUL (0x00) bytes`` error.
+
+    Returns ``None`` unchanged so it is safe to call on optional fields.
+    """
+    if value is None:
+        return None
+    return value.replace("\x00", "")
+
+
 def _derive_court_code(state: str, county: str) -> str:
     """Derive a URL-safe court code from state + county.
 
@@ -84,6 +99,7 @@ def upsert_case(
     value is provided (COALESCE preserves an existing title).
     """
     normalized = case_number.strip().lower().replace(" ", "").replace("-", "")
+    case_title = _strip_nul(case_title)
     with conn.cursor() as cur:
         cur.execute(
             """
@@ -218,6 +234,7 @@ def resolve_judge(
       3. If not found, create a new judge with canonical_name = normalized name,
          create a judge_alias linking raw_name to the new judge, and return the id.
     """
+    raw_name = _strip_nul(raw_name) or raw_name
     canonical = normalize_judge_name(raw_name)
 
     with conn.cursor() as cur:
@@ -312,6 +329,10 @@ def insert_ruling(
     ``outcome`` must be a valid ``ruling_outcome`` enum value (e.g.
     ``"granted"``, ``"denied"``) or ``None``.  ``motion_type`` is free-text.
     """
+    ruling_text = _strip_nul(ruling_text)
+    department = _strip_nul(department)
+    outcome = _strip_nul(outcome)
+    motion_type = _strip_nul(motion_type)
     with conn.cursor() as cur:
         cur.execute(
             """
@@ -372,6 +393,7 @@ def upsert_party(
       3. If not found, create a new party with canonical_name = normalized name,
          create a party_alias linking raw_name to the new party, and return the id.
     """
+    raw_name = _strip_nul(raw_name) or raw_name
     canonical = normalize_party_name(raw_name)
 
     with conn.cursor() as cur:
