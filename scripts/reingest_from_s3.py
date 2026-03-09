@@ -259,7 +259,7 @@ def _reparse_document(
     """
     _load_scraper_registry()
 
-    text = raw_content.decode("utf-8", errors="replace")
+    text = raw_content.decode("utf-8", errors="replace").replace("\x00", "")
     extracted: dict = {
         "ruling_text": text,
         "case_number": doc_meta.get("case_number"),
@@ -299,7 +299,8 @@ def _reparse_document(
                 content_hash=doc_meta["content_hash"],
             )
             parsed = scraper.parse_document(cap_doc)
-            extracted["ruling_text"] = parsed.ruling_text or text
+            ruling = parsed.ruling_text or text
+            extracted["ruling_text"] = ruling.replace("\x00", "") if ruling else text
             extracted["case_number"] = parsed.case_number or extracted["case_number"]
             extracted["case_title"] = parsed.case_title or extracted["case_title"]
             extracted["judge_name"] = parsed.judge_name
