@@ -79,40 +79,54 @@ function computeGrantRate(granted: number, denied: number, grantedInPart: number
 // ---------------------------------------------------------------------------
 
 async function queryAnalytics(pool: Pool, judgeId: string): Promise<JudgeAnalytics> {
-  // Total rulings count
-  const totalResult = await pool.query<Row>(
-    'SELECT COUNT(*)::int as count FROM rulings WHERE judge_id = $1',
-    [judgeId],
-  );
+  // Run all 4 independent queries concurrently — total latency is max(queries)
+  // instead of sum(queries). Each query uses its own connection from the pool.
+  const [totalResult, outcomeResult, motionResult, dateResult] = await Promise.all([
+    // Total rulings count
+    pool.query<Row>('SELECT COUNT(*)::int as count FROM rulings WHERE judge_id = $1', [judgeId]),
+
+    // By outcome
+    pool.query<Row>(
+      `SELECT outcome::text, COUNT(*)::int as count
+       FROM rulings
+       WHERE judge_id = $1 AND outcome IS NOT NULL
+       GROUP BY outcome`,
+      [judgeId],
+    ),
+
+    // By motion type (with outcome breakdown)
+    pool.query<Row>(
+      `SELECT motion_type,
+         COUNT(*)::int as total,
+         COUNT(*) FILTER (WHERE outcome = 'granted')::int as granted,
+         COUNT(*) FILTER (WHERE outcome = 'denied')::int as denied,
+         COUNT(*) FILTER (WHERE outcome IN ('granted_in_part','denied_in_part'))::int as granted_in_part,
+         COUNT(*) FILTER (WHERE outcome NOT IN ('granted','denied','granted_in_part','denied_in_part') AND outcome IS NOT NULL)::int as other
+       FROM rulings
+       WHERE judge_id = $1 AND motion_type IS NOT NULL
+       GROUP BY motion_type
+       ORDER BY total DESC`,
+      [judgeId],
+    ),
+
+    // Date range
+    pool.query<Row>(
+      `SELECT
+         MIN(hearing_date)::text as earliest,
+         MAX(hearing_date)::text as latest
+       FROM rulings
+       WHERE judge_id = $1`,
+      [judgeId],
+    ),
+  ]);
+
   const totalRulings = (totalResult.rows[0]?.count as number) ?? 0;
 
-  // By outcome
-  const outcomeResult = await pool.query<Row>(
-    `SELECT outcome::text, COUNT(*)::int as count
-     FROM rulings
-     WHERE judge_id = $1 AND outcome IS NOT NULL
-     GROUP BY outcome`,
-    [judgeId],
-  );
   const rulingsByOutcome: OutcomeCount[] = outcomeResult.rows.map((row) => ({
     outcome: row.outcome as string,
     count: row.count as number,
   }));
 
-  // By motion type (with outcome breakdown)
-  const motionResult = await pool.query<Row>(
-    `SELECT motion_type,
-       COUNT(*)::int as total,
-       COUNT(*) FILTER (WHERE outcome = 'granted')::int as granted,
-       COUNT(*) FILTER (WHERE outcome = 'denied')::int as denied,
-       COUNT(*) FILTER (WHERE outcome IN ('granted_in_part','denied_in_part'))::int as granted_in_part,
-       COUNT(*) FILTER (WHERE outcome NOT IN ('granted','denied','granted_in_part','denied_in_part') AND outcome IS NOT NULL)::int as other
-     FROM rulings
-     WHERE judge_id = $1 AND motion_type IS NOT NULL
-     GROUP BY motion_type
-     ORDER BY total DESC`,
-    [judgeId],
-  );
   const rulingsByMotionType: MotionStats[] = motionResult.rows.map((row) => {
     const granted = row.granted as number;
     const denied = row.denied as number;
@@ -128,15 +142,6 @@ async function queryAnalytics(pool: Pool, judgeId: string): Promise<JudgeAnalyti
     };
   });
 
-  // Date range
-  const dateResult = await pool.query<Row>(
-    `SELECT
-       MIN(hearing_date)::text as earliest,
-       MAX(hearing_date)::text as latest
-     FROM rulings
-     WHERE judge_id = $1`,
-    [judgeId],
-  );
   const earliestRuling = (dateResult.rows[0]?.earliest as string) ?? null;
   const latestRuling = (dateResult.rows[0]?.latest as string) ?? null;
 
