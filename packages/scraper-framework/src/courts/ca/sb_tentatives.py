@@ -20,8 +20,8 @@ Judge/dept extraction from PDF page 1 text (two observed formats):
   Fallback: "BEFORE THE HONORABLE JOSEPH WIDMAN"
             (title-cased on extraction; used by Dept S36)
 
-Case number format: CIV + 2 uppercase letters + 5-8 digits
-  e.g. CIVRS2502080, CIVSB2416631
+Case number format: CIV + 2 uppercase letters + optional space + 5-8 digits
+  e.g. CIVRS2502080, CIVSB2416631, CIVSB 2600093 (Dept S36 uses a space)
 
 Courthouse mapping (conservative — only S and R confirmed from fixtures):
   S* → San Bernardino Justice Center
@@ -58,8 +58,10 @@ _HONORABLE_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Case numbers like "CIVRS2502080", "CIVSB2416631"
-_CASE_NUMBER_RE = re.compile(r"\bCIV[A-Z]{2}\d{5,8}\b")
+# Case numbers like "CIVRS2502080", "CIVSB2416631", "CIVSB 2600093" (Dept S36
+# uses a space between the location code and digits).  The optional \s* handles
+# both formats; extracted values are normalised (space removed) in parse_document.
+_CASE_NUMBER_RE = re.compile(r"\bCIV[A-Z]{2}\s*\d{5,8}\b")
 
 
 # Filename date: CV{LOC}{DEPT}{MMDDYY}.pdf → extract MMDDYY
@@ -125,6 +127,15 @@ class SBTentativeRulingsScraper(PdfLinkScraper):
     def parse_document(self, doc: CapturedDocument) -> CapturedDocument:
         """Extract case numbers (via super), judge name, and hearing date."""
         doc = super().parse_document(doc)
+
+        # Normalise case numbers: remove any internal whitespace that the
+        # broadened regex may have matched (e.g. "CIVSB 2600093" → "CIVSB2600093").
+        if doc.case_number:
+            doc.case_number = doc.case_number.replace(" ", "")
+        all_nums = doc.extra.get("all_case_numbers")
+        if all_nums:
+            doc.extra["all_case_numbers"] = [n.replace(" ", "") for n in all_nums]
+
         if doc.ruling_text and not doc.judge_name:
             doc.judge_name = _sb_judge_from_pdf_text(doc.ruling_text)
 
