@@ -29,6 +29,8 @@
 #
 # Options:
 #   --env <env>         Environment (default: dev)
+#   --cpu <units>       CPU units for the task (default: 1024). Valid: 256, 512, 1024, 2048, 4096.
+#   --memory <mb>       Memory in MB for the task (default: 2048). Must be valid for the CPU value.
 #   --dry-run           Show what would be done without running
 #   --timeout <secs>    Max seconds to wait for task completion (default: 1800)
 #   --help              Show this help message
@@ -45,6 +47,8 @@ set -euo pipefail
 ENVIRONMENT="dev"
 DRY_RUN=false
 TIMEOUT=1800
+CPU_OVERRIDE=""
+MEMORY_OVERRIDE=""
 SCRIPT_PATH=""
 REGION="us-west-2"
 SCRIPT_ARGS=()
@@ -63,6 +67,14 @@ while [[ $# -gt 0 ]]; do
             ENVIRONMENT="$2"
             shift 2
             ;;
+        --cpu)
+            CPU_OVERRIDE="$2"
+            shift 2
+            ;;
+        --memory)
+            MEMORY_OVERRIDE="$2"
+            shift 2
+            ;;
         --dry-run)
             DRY_RUN=true
             shift
@@ -72,7 +84,7 @@ while [[ $# -gt 0 ]]; do
             shift 2
             ;;
         --help|-h)
-            head -n 37 "$0" | tail -n +2 | sed 's/^# \?//'
+            head -n 39 "$0" | tail -n +2 | sed 's/^# \?//'
             exit 0
             ;;
         --)
@@ -111,6 +123,37 @@ fi
 
 # Update bucket name for the environment
 S3_BUCKET="judgemind-assets-${ENVIRONMENT}"
+
+# ─── Resolve CPU and memory ────────────────────────────────────────────────
+# Defaults: 1024 CPU / 2048 MB — enough for batch processing and PDF extraction.
+# These override whatever the source task definition uses.
+CPU="${CPU_OVERRIDE:-1024}"
+MEMORY="${MEMORY_OVERRIDE:-2048}"
+
+# Validate Fargate CPU/memory combinations
+# https://docs.aws.amazon.com/AmazonECS/latest/developerguide/task-cpu-memory-error.html
+validate_fargate_resources() {
+    local cpu="$1" mem="$2"
+    case "$cpu" in
+        256)  [[ "$mem" == 512 || "$mem" == 1024 || "$mem" == 2048 ]] && return 0 ;;
+        512)  [[ "$mem" -ge 1024 && "$mem" -le 4096 && $(( mem % 1024 )) -eq 0 ]] && return 0 ;;
+        1024) [[ "$mem" -ge 2048 && "$mem" -le 8192 && $(( mem % 1024 )) -eq 0 ]] && return 0 ;;
+        2048) [[ "$mem" -ge 4096 && "$mem" -le 16384 && $(( mem % 1024 )) -eq 0 ]] && return 0 ;;
+        4096) [[ "$mem" -ge 8192 && "$mem" -le 30720 && $(( mem % 1024 )) -eq 0 ]] && return 0 ;;
+    esac
+    return 1
+}
+
+if ! validate_fargate_resources "$CPU" "$MEMORY"; then
+    echo "Error: invalid Fargate CPU/memory combination: ${CPU} CPU / ${MEMORY} MB." >&2
+    echo "Valid combinations:" >&2
+    echo "  256 CPU:  512, 1024, 2048 MB" >&2
+    echo "  512 CPU:  1024-4096 MB (1 GB increments)" >&2
+    echo "  1024 CPU: 2048-8192 MB (1 GB increments)" >&2
+    echo "  2048 CPU: 4096-16384 MB (1 GB increments)" >&2
+    echo "  4096 CPU: 8192-30720 MB (1 GB increments)" >&2
+    exit 1
+fi
 
 # ─── Cleanup trap ────────────────────────────────────────────────────────────
 
@@ -228,6 +271,7 @@ fi
 
 echo "Script: ${SCRIPT_PATH} (${SCRIPT_SIZE} bytes)" >&2
 echo "Interpreter: ${INTERPRETER}" >&2
+echo "Resources: ${CPU} CPU / ${MEMORY} MB memory" >&2
 echo "Delivery: $(if [[ "$USE_S3" == "true" ]]; then echo "S3 (pre-signed URL, 5 min TTL)"; else echo "inline (base64)"; fi)" >&2
 if [[ ${#SCRIPT_ARGS[@]} -gt 0 ]]; then
     echo "Script args:${ARGS_STR}" >&2
@@ -248,6 +292,8 @@ import os
 source_td = json.loads(sys.stdin.read())["taskDefinition"]
 command_str = os.environ["COMMAND_STR"]
 family = os.environ["ONESHOT_FAMILY"]
+cpu = os.environ["ONESHOT_CPU"]
+memory = os.environ["ONESHOT_MEMORY"]
 
 # Get the first container definition as a template
 source_container = source_td["containerDefinitions"][0]
@@ -275,8 +321,8 @@ task_def = {
     "family": family,
     "requiresCompatibilities": ["FARGATE"],
     "networkMode": "awsvpc",
-    "cpu": source_td.get("cpu", "256"),
-    "memory": source_td.get("memory", "512"),
+    "cpu": cpu,
+    "memory": memory,
     "executionRoleArn": source_td["executionRoleArn"],
     "taskRoleArn": source_td.get("taskRoleArn", ""),
     "containerDefinitions": [container],
@@ -294,6 +340,8 @@ echo "Building oneshot task definition (family=${ONESHOT_FAMILY})..." >&2
 TASK_DEF_JSON=$(echo "$SOURCE_TASK_DEF" | \
     COMMAND_STR="$COMMAND_STR" \
     ONESHOT_FAMILY="$ONESHOT_FAMILY" \
+    ONESHOT_CPU="$CPU" \
+    ONESHOT_MEMORY="$MEMORY" \
     python3 "${TMP_DIR}/_build_task_def.py")
 
 if [[ "$DRY_RUN" == "true" ]]; then
