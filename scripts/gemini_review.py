@@ -30,6 +30,12 @@ import os
 import sys
 from pathlib import Path
 
+from ralph_review_log import (
+    ReviewTimer,
+    compute_diff_stats,
+    log_review,
+)
+
 
 def read_file(path: Path) -> str:
     """Read a file and return its contents, or empty string if missing."""
@@ -87,6 +93,29 @@ or readability. Don't request changes outside the scope of the task. If tests pa
 acceptance criteria are met, lean toward SHIP."""
 
 
+def _read_iteration(state_dir: Path) -> int:
+    """Read the current ralph iteration number from the state directory.
+
+    The ralph loop writes the iteration number to iteration.txt.
+    Returns 0 if the file is missing or unreadable.
+    """
+    try:
+        return int((state_dir / "iteration.txt").read_text(encoding="utf-8").strip())
+    except (FileNotFoundError, ValueError):
+        return 0
+
+
+def _resolve_worktree(state_dir: Path) -> Path | None:
+    """Resolve the worktree path from the state directory.
+
+    The state dir is {worktree}/tmp/ralph/, so the worktree is two levels up.
+    """
+    worktree = state_dir.parent.parent
+    if (worktree / ".git").exists():
+        return worktree
+    return None
+
+
 def run_review(state_dir: Path) -> int:
     """Run the Gemini review and write results.
 
@@ -94,6 +123,8 @@ def run_review(state_dir: Path) -> int:
         0 on success, 1 on error, 2 on graceful skip.
     """
     api_key = os.environ.get("GOOGLE_API_KEY", "")
+    iteration = _read_iteration(state_dir)
+
     if not api_key:
         print(
             "WARNING: GOOGLE_API_KEY not set. Skipping Gemini review (graceful degradation).",
@@ -105,6 +136,17 @@ def run_review(state_dir: Path) -> int:
         feedback_path.write_text(
             "Gemini review skipped: GOOGLE_API_KEY not available.\n",
             encoding="utf-8",
+        )
+        # Log the skip
+        worktree = _resolve_worktree(state_dir)
+        diff_stats = compute_diff_stats(worktree) if worktree else None
+        log_review(
+            state_dir,
+            iteration=iteration,
+            model="gemini-2.5-pro",
+            verdict="SKIPPED",
+            feedback="GOOGLE_API_KEY not available.",
+            diff_stats=diff_stats,
         )
         return 2
 
@@ -134,14 +176,29 @@ def run_review(state_dir: Path) -> int:
         )
         return 1
 
+    # Compute diff stats before the API call
+    worktree = _resolve_worktree(state_dir)
+    diff_stats = compute_diff_stats(worktree) if worktree else None
+
+    timer = ReviewTimer()
     try:
         client = genai.Client(api_key=api_key)
-        response = client.models.generate_content(
-            model=model,
-            contents=prompt,
-        )
+        with timer:
+            response = client.models.generate_content(
+                model=model,
+                contents=prompt,
+            )
 
         review_text = response.text.strip() if response.text else ""
+
+        # Extract token usage from response metadata if available
+        input_tokens = None
+        output_tokens = None
+        usage = getattr(response, "usage_metadata", None)
+        if usage:
+            input_tokens = getattr(usage, "prompt_token_count", None)
+            output_tokens = getattr(usage, "candidates_token_count", None)
+
     except Exception as exc:
         print(f"ERROR: Gemini API call failed: {exc}", file=sys.stderr)
         # Graceful degradation on API errors — don't block the review loop
@@ -151,6 +208,16 @@ def run_review(state_dir: Path) -> int:
         feedback_path.write_text(
             f"Gemini review skipped due to API error: {exc}\n",
             encoding="utf-8",
+        )
+        # Log the API error as a skipped review
+        log_review(
+            state_dir,
+            iteration=iteration,
+            model=model,
+            verdict="SKIPPED",
+            feedback=f"API error: {exc}",
+            latency_ms=timer.latency_ms,
+            diff_stats=diff_stats,
         )
         return 2
 
@@ -181,6 +248,19 @@ def run_review(state_dir: Path) -> int:
     feedback_path.write_text(
         f"# Gemini Review ({model})\n\n{review_text}\n",
         encoding="utf-8",
+    )
+
+    # Log the review to the structured JSONL log
+    log_review(
+        state_dir,
+        iteration=iteration,
+        model=model,
+        verdict=verdict,
+        feedback=review_text,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        latency_ms=timer.latency_ms,
+        diff_stats=diff_stats,
     )
 
     print(f"Gemini review complete: {verdict}")
