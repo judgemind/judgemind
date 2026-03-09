@@ -1,7 +1,8 @@
 """Tests for the reingest_from_s3 script.
 
-Verifies keyset (cursor-based) pagination replaces LIMIT/OFFSET,
-ensuring constant per-batch performance and correct CLI flag behavior.
+Verifies keyset (cursor-based) pagination, parallel S3 fetching,
+error handling, and CLI flag behavior. All database and S3 access
+is mocked.
 """
 
 from __future__ import annotations
@@ -41,8 +42,8 @@ def _make_document_row(
     doc_id: uuid.UUID = _DOC_ID_1,
     captured_at: datetime = _CAPTURED_AT_1,
     *,
-    s3_key: str = "docs/test.html",
-    s3_bucket: str = "test-bucket",
+    s3_key: str | None = "docs/test.html",
+    s3_bucket: str | None = "test-bucket",
     scraper_id: str = "ca-la-tentatives-civil",
     case_number: str = "24STCV12345",
     case_title: str = "Smith v. Jones",
@@ -76,6 +77,34 @@ def _mock_cursor_context(cur: MagicMock) -> MagicMock:
     return ctx
 
 
+def _mock_conn_returning(rows: list) -> MagicMock:
+    """Create a mock connection whose first cursor returns the given rows."""
+    conn = MagicMock()
+    cur_fetch = MagicMock()
+    cur_fetch.fetchall.return_value = rows
+
+    # All subsequent cursors are generic mocks (for DB writes)
+    call_count = 0
+
+    def cursor_ctx() -> MagicMock:
+        nonlocal call_count
+        ctx = MagicMock()
+        if call_count == 0:
+            ctx.__enter__ = MagicMock(return_value=cur_fetch)
+        else:
+            cur = MagicMock()
+            ctx.__enter__ = MagicMock(return_value=cur)
+        ctx.__exit__ = MagicMock(return_value=False)
+        call_count += 1
+        return ctx
+
+    conn.cursor.side_effect = cursor_ctx
+    return conn
+
+
+_DEFAULT_CURSOR = (reingest._CURSOR_MIN_TIMESTAMP, reingest._CURSOR_MIN_UUID)
+
+
 # ---------------------------------------------------------------------------
 # FETCH_DOCUMENTS_QUERY tests
 # ---------------------------------------------------------------------------
@@ -99,12 +128,32 @@ class TestFetchDocumentsQuery:
 
 
 # ---------------------------------------------------------------------------
-# reingest_batch tests
+# _fetch_s3_content tests
 # ---------------------------------------------------------------------------
 
 
-class TestReingestBatch:
-    """Tests for reingest_batch() with cursor-based pagination."""
+class TestFetchS3Content:
+    """Tests for the _fetch_s3_content helper."""
+
+    def test_returns_body_bytes(self) -> None:
+        s3 = MagicMock()
+        body_mock = MagicMock()
+        body_mock.read.return_value = b"<html>ruling</html>"
+        s3.get_object.return_value = {"Body": body_mock}
+
+        result = reingest._fetch_s3_content(s3, "my-bucket", "my-key")
+
+        s3.get_object.assert_called_once_with(Bucket="my-bucket", Key="my-key")
+        assert result == b"<html>ruling</html>"
+
+
+# ---------------------------------------------------------------------------
+# reingest_batch tests — cursor pagination
+# ---------------------------------------------------------------------------
+
+
+class TestReingestBatchCursor:
+    """Tests for reingest_batch() cursor-based pagination."""
 
     def test_no_rows_returns_zero_and_same_cursor(self) -> None:
         """Empty batch returns zero counts and unchanged cursor."""
@@ -113,19 +162,18 @@ class TestReingestBatch:
         cur.fetchall.return_value = []
         conn.cursor.return_value = _mock_cursor_context(cur)
 
-        initial_cursor = (reingest._CURSOR_MIN_TIMESTAMP, reingest._CURSOR_MIN_UUID)
         processed, updated, next_cursor = reingest.reingest_batch(
             conn,
             MagicMock(),
             batch_size=10,
-            cursor=initial_cursor,
+            cursor=_DEFAULT_CURSOR,
             filters="",
             filter_params=[],
         )
 
         assert processed == 0
         assert updated == 0
-        assert next_cursor == initial_cursor
+        assert next_cursor == _DEFAULT_CURSOR
 
     def test_cursor_passed_to_query(self) -> None:
         """The cursor values are passed as parameters to the SQL query."""
@@ -147,7 +195,6 @@ class TestReingestBatch:
             filter_params=[],
         )
 
-        # Verify the execute call has cursor params + batch_size
         call_args = cur.execute.call_args[0]
         params = call_args[1]
         assert params == [cursor_ts, cursor_id, batch_size]
@@ -191,7 +238,6 @@ class TestReingestBatch:
         cur_fetch = MagicMock()
         cur_fetch.fetchall.return_value = [row1, row2]
 
-        # Use a single cursor context for the fetch, then additional for inserts
         extra = [_mock_cursor_context(MagicMock()) for _ in range(10)]
         contexts = iter([_mock_cursor_context(cur_fetch)] + extra)
         conn.cursor.side_effect = lambda: next(contexts)
@@ -209,12 +255,11 @@ class TestReingestBatch:
             "hearing_date": _HEARING_DATE,
         }
 
-        initial_cursor = (reingest._CURSOR_MIN_TIMESTAMP, reingest._CURSOR_MIN_UUID)
         processed, updated, next_cursor = reingest.reingest_batch(
             conn,
             MagicMock(),
             batch_size=10,
-            cursor=initial_cursor,
+            cursor=_DEFAULT_CURSOR,
             filters="",
             filter_params=[],
             dry_run=True,
@@ -238,12 +283,11 @@ class TestReingestBatch:
         cur_fetch.fetchall.return_value = [row]
         conn.cursor.return_value = _mock_cursor_context(cur_fetch)
 
-        initial_cursor = (reingest._CURSOR_MIN_TIMESTAMP, reingest._CURSOR_MIN_UUID)
         processed, updated, next_cursor = reingest.reingest_batch(
             conn,
             MagicMock(),
             batch_size=10,
-            cursor=initial_cursor,
+            cursor=_DEFAULT_CURSOR,
             filters="",
             filter_params=[],
             dry_run=True,
@@ -251,9 +295,163 @@ class TestReingestBatch:
 
         assert processed == 1
         assert updated == 0
-        # Cursor still advances past the skipped row
         assert next_cursor == (_CAPTURED_AT_1, str(_DOC_ID_1))
         mock_fetch_s3.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# reingest_batch tests — parallel S3 fetches
+# ---------------------------------------------------------------------------
+
+
+class TestReingestBatchParallel:
+    """Tests that reingest_batch fetches S3 objects in parallel."""
+
+    @patch("reingest_from_s3._reparse_document")
+    @patch("reingest_from_s3._fetch_s3_content")
+    def test_concurrent_s3_fetches(self, mock_fetch: MagicMock, mock_reparse: MagicMock) -> None:
+        """Multiple documents in a batch trigger concurrent S3 fetches."""
+        rows = [_make_document_row(uuid.uuid4(), _CAPTURED_AT_1) for _ in range(3)]
+        conn = _mock_conn_returning(rows)
+
+        mock_fetch.return_value = b"<html>content</html>"
+        mock_reparse.return_value = {
+            "ruling_text": "content",
+            "case_number": "24STCV12345",
+            "case_title": "Smith v. Jones",
+            "judge_name": None,
+            "outcome": None,
+            "motion_type": None,
+            "department": None,
+            "parties": [],
+            "hearing_date": _HEARING_DATE,
+        }
+
+        processed, updated, _next_cursor = reingest.reingest_batch(
+            conn,
+            MagicMock(),
+            batch_size=10,
+            cursor=_DEFAULT_CURSOR,
+            filters="",
+            filter_params=[],
+            dry_run=True,
+            concurrency=3,
+        )
+
+        assert processed == 3
+        assert mock_fetch.call_count == 3
+
+    @patch("reingest_from_s3._reparse_document")
+    @patch("reingest_from_s3._fetch_s3_content")
+    def test_failed_s3_fetch_skipped(self, mock_fetch: MagicMock, mock_reparse: MagicMock) -> None:
+        """Documents with failed S3 fetches are skipped, others proceed."""
+        rows = [_make_document_row(uuid.uuid4(), _CAPTURED_AT_1) for _ in range(3)]
+        conn = _mock_conn_returning(rows)
+
+        mock_fetch.side_effect = [
+            b"<html>ok1</html>",
+            Exception("S3 timeout"),
+            b"<html>ok3</html>",
+        ]
+        mock_reparse.return_value = {
+            "ruling_text": "content",
+            "case_number": "24STCV12345",
+            "case_title": "Smith v. Jones",
+            "judge_name": None,
+            "outcome": None,
+            "motion_type": None,
+            "department": None,
+            "parties": [],
+            "hearing_date": _HEARING_DATE,
+        }
+
+        processed, updated, _next_cursor = reingest.reingest_batch(
+            conn,
+            MagicMock(),
+            batch_size=10,
+            cursor=_DEFAULT_CURSOR,
+            filters="",
+            filter_params=[],
+            dry_run=True,
+            concurrency=3,
+        )
+
+        assert processed == 3
+        assert mock_reparse.call_count == 2
+
+    @patch("reingest_from_s3._reparse_document")
+    @patch("reingest_from_s3._fetch_s3_content")
+    def test_no_s3_key_skipped_before_fetch(
+        self, mock_fetch: MagicMock, mock_reparse: MagicMock
+    ) -> None:
+        """Documents without s3_key or s3_bucket skip S3 fetch entirely."""
+        rows = [
+            _make_document_row(uuid.uuid4(), _CAPTURED_AT_1, s3_key=None),
+            _make_document_row(uuid.uuid4(), _CAPTURED_AT_1, s3_bucket=None),
+            _make_document_row(uuid.uuid4(), _CAPTURED_AT_1),  # valid
+        ]
+        conn = _mock_conn_returning(rows)
+
+        mock_fetch.return_value = b"<html>content</html>"
+        mock_reparse.return_value = {
+            "ruling_text": "content",
+            "case_number": "24STCV12345",
+            "case_title": "Smith v. Jones",
+            "judge_name": None,
+            "outcome": None,
+            "motion_type": None,
+            "department": None,
+            "parties": [],
+            "hearing_date": _HEARING_DATE,
+        }
+
+        processed, updated, _next_cursor = reingest.reingest_batch(
+            conn,
+            MagicMock(),
+            batch_size=10,
+            cursor=_DEFAULT_CURSOR,
+            filters="",
+            filter_params=[],
+            dry_run=True,
+            concurrency=3,
+        )
+
+        assert processed == 3
+        assert mock_fetch.call_count == 1
+
+    @patch("reingest_from_s3._reparse_document")
+    @patch("reingest_from_s3._fetch_s3_content")
+    def test_concurrency_1_works(self, mock_fetch: MagicMock, mock_reparse: MagicMock) -> None:
+        """Concurrency of 1 effectively disables parallelism but still works."""
+        rows = [_make_document_row(uuid.uuid4(), _CAPTURED_AT_1) for _ in range(2)]
+        conn = _mock_conn_returning(rows)
+
+        mock_fetch.return_value = b"<html>content</html>"
+        mock_reparse.return_value = {
+            "ruling_text": "content",
+            "case_number": "24STCV12345",
+            "case_title": "Smith v. Jones",
+            "judge_name": None,
+            "outcome": None,
+            "motion_type": None,
+            "department": None,
+            "parties": [],
+            "hearing_date": _HEARING_DATE,
+        }
+
+        processed, updated, _next_cursor = reingest.reingest_batch(
+            conn,
+            MagicMock(),
+            batch_size=10,
+            cursor=_DEFAULT_CURSOR,
+            filters="",
+            filter_params=[],
+            dry_run=True,
+            concurrency=1,
+        )
+
+        assert processed == 2
+        assert mock_fetch.call_count == 2
 
 
 # ---------------------------------------------------------------------------
@@ -262,7 +460,7 @@ class TestReingestBatch:
 
 
 class TestRunReingest:
-    """Tests for run_reingest() end-to-end flow with keyset pagination."""
+    """Tests for run_reingest() end-to-end flow."""
 
     @patch("reingest_from_s3.boto3")
     @patch("reingest_from_s3.psycopg")
@@ -279,15 +477,13 @@ class TestRunReingest:
         mock_conn.__exit__ = MagicMock(return_value=False)
         mock_psycopg.connect.return_value = mock_conn
 
-        cursor_min = (reingest._CURSOR_MIN_TIMESTAMP, reingest._CURSOR_MIN_UUID)
-        mock_batch.return_value = (0, 0, cursor_min)
+        mock_batch.return_value = (0, 0, _DEFAULT_CURSOR)
 
         reingest.run_reingest("postgresql://test", batch_size=50)
 
-        # First call should use minimum cursor
         first_call = mock_batch.call_args_list[0]
-        cursor_arg = first_call[0][3]  # 4th positional arg is cursor
-        assert cursor_arg == (reingest._CURSOR_MIN_TIMESTAMP, reingest._CURSOR_MIN_UUID)
+        cursor_arg = first_call[0][3]
+        assert cursor_arg == _DEFAULT_CURSOR
 
     @patch("reingest_from_s3.boto3")
     @patch("reingest_from_s3.psycopg")
@@ -307,7 +503,6 @@ class TestRunReingest:
         cursor_1 = (_CAPTURED_AT_1, str(_DOC_ID_1))
         cursor_2 = (_CAPTURED_AT_2, str(_DOC_ID_2))
 
-        # Two full batches, then a partial batch
         mock_batch.side_effect = [
             (50, 40, cursor_1),
             (50, 30, cursor_2),
@@ -316,9 +511,8 @@ class TestRunReingest:
 
         reingest.run_reingest("postgresql://test", batch_size=50)
 
-        # Verify cursor progression
         calls = mock_batch.call_args_list
-        assert calls[0][0][3] == (reingest._CURSOR_MIN_TIMESTAMP, reingest._CURSOR_MIN_UUID)
+        assert calls[0][0][3] == _DEFAULT_CURSOR
         assert calls[1][0][3] == cursor_1
         assert calls[2][0][3] == cursor_2
 
@@ -395,10 +589,55 @@ class TestRunReingest:
 
         stats = reingest.run_reingest("postgresql://test", batch_size=100, limit=30)
 
-        # effective_batch should be capped to 30
         call_args = mock_batch.call_args_list[0]
-        assert call_args[0][2] == 30  # batch_size arg
+        assert call_args[0][2] == 30
         assert stats["total_processed"] == 30
+
+    @patch("reingest_from_s3.boto3")
+    @patch("reingest_from_s3.psycopg")
+    @patch("reingest_from_s3.reingest_batch")
+    def test_concurrency_passed_to_batch(
+        self,
+        mock_batch: MagicMock,
+        mock_psycopg: MagicMock,
+        mock_boto3: MagicMock,
+    ) -> None:
+        mock_conn = MagicMock()
+        mock_conn.__enter__ = MagicMock(return_value=mock_conn)
+        mock_conn.__exit__ = MagicMock(return_value=False)
+        mock_psycopg.connect.return_value = mock_conn
+
+        mock_batch.return_value = (5, 3, _DEFAULT_CURSOR)
+
+        reingest.run_reingest(
+            "postgresql://test",
+            batch_size=50,
+            concurrency=20,
+        )
+
+        batch_call = mock_batch.call_args_list[0]
+        assert batch_call.kwargs.get("concurrency") == 20
+
+    @patch("reingest_from_s3.boto3")
+    @patch("reingest_from_s3.psycopg")
+    @patch("reingest_from_s3.reingest_batch")
+    def test_default_concurrency_is_10(
+        self,
+        mock_batch: MagicMock,
+        mock_psycopg: MagicMock,
+        mock_boto3: MagicMock,
+    ) -> None:
+        mock_conn = MagicMock()
+        mock_conn.__enter__ = MagicMock(return_value=mock_conn)
+        mock_conn.__exit__ = MagicMock(return_value=False)
+        mock_psycopg.connect.return_value = mock_conn
+
+        mock_batch.return_value = (5, 3, _DEFAULT_CURSOR)
+
+        reingest.run_reingest("postgresql://test", batch_size=50)
+
+        batch_call = mock_batch.call_args_list[0]
+        assert batch_call.kwargs.get("concurrency") == 10
 
     @patch("reingest_from_s3.boto3")
     @patch("reingest_from_s3.psycopg")
@@ -414,14 +653,13 @@ class TestRunReingest:
         mock_conn.__exit__ = MagicMock(return_value=False)
         mock_psycopg.connect.return_value = mock_conn
 
-        cursor_min = (reingest._CURSOR_MIN_TIMESTAMP, reingest._CURSOR_MIN_UUID)
-        mock_batch.return_value = (0, 0, cursor_min)
+        mock_batch.return_value = (0, 0, _DEFAULT_CURSOR)
 
         reingest.run_reingest("postgresql://test", county="Orange")
 
         call_args = mock_batch.call_args_list[0]
-        filters_arg = call_args[0][4]  # filters string
-        filter_params_arg = call_args[0][5]  # filter_params list
+        filters_arg = call_args[0][4]
+        filter_params_arg = call_args[0][5]
         assert "AND ct.county = %s" in filters_arg
         assert "Orange" in filter_params_arg
 
@@ -439,8 +677,7 @@ class TestRunReingest:
         mock_conn.__exit__ = MagicMock(return_value=False)
         mock_psycopg.connect.return_value = mock_conn
 
-        cursor_min = (reingest._CURSOR_MIN_TIMESTAMP, reingest._CURSOR_MIN_UUID)
-        mock_batch.return_value = (0, 0, cursor_min)
+        mock_batch.return_value = (0, 0, _DEFAULT_CURSOR)
 
         reingest.run_reingest(
             "postgresql://test",
@@ -467,3 +704,37 @@ class TestCursorMinValues:
 
     def test_min_uuid_is_nil(self) -> None:
         assert reingest._CURSOR_MIN_UUID == "00000000-0000-0000-0000-000000000000"
+
+
+# ---------------------------------------------------------------------------
+# CLI argument tests
+# ---------------------------------------------------------------------------
+
+
+class TestCLIConcurrencyFlag:
+    """Tests that --concurrency CLI flag is properly parsed."""
+
+    def test_parser_has_concurrency_arg(self) -> None:
+        """The argument parser accepts --concurrency."""
+        import argparse
+
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--county", type=str, default=None)
+        parser.add_argument("--date-from", type=str, default=None)
+        parser.add_argument("--date-to", type=str, default=None)
+        parser.add_argument("--dry-run", action="store_true")
+        parser.add_argument("--batch-size", type=int, default=50)
+        parser.add_argument("--limit", type=int, default=None)
+        parser.add_argument("--concurrency", type=int, default=10)
+
+        args = parser.parse_args(["--concurrency", "20"])
+        assert args.concurrency == 20
+
+    def test_parser_default_concurrency(self) -> None:
+        """Default concurrency is 10 when not specified."""
+        import argparse
+
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--concurrency", type=int, default=10)
+        args = parser.parse_args([])
+        assert args.concurrency == 10
