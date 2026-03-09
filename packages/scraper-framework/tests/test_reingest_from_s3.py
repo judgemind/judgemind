@@ -176,6 +176,73 @@ class TestFetchS3Content:
 
 
 # ---------------------------------------------------------------------------
+# _reparse_document tests — NUL byte stripping
+# ---------------------------------------------------------------------------
+
+
+class TestReparseDocumentNulBytes:
+    """Verify that NUL (0x00) bytes are stripped from ruling text."""
+
+    def _doc_meta(self) -> dict:
+        return {
+            "document_id": str(_DOC_ID_1),
+            "state": "CA",
+            "county": "Los Angeles",
+            "court_name": "Los Angeles Superior Court",
+            "source_url": "https://court.example.com/ruling",
+            "captured_at": _CAPTURED_AT_1,
+            "content_hash": "abc123",
+            "format": "html",
+            "case_number": "24STCV12345",
+            "case_title": "Smith v. Jones",
+            "hearing_date": _HEARING_DATE,
+            "court_id": str(_COURT_ID),
+            "scraper_id": "ca-la-tentatives-civil",
+            "s3_key": "docs/test.html",
+            "s3_bucket": "test-bucket",
+        }
+
+    @patch.object(reingest, "_load_scraper_registry")
+    def test_nul_bytes_stripped_from_raw_decode(
+        self,
+        mock_registry: MagicMock,
+    ) -> None:
+        """NUL bytes in raw content are removed after UTF-8 decode."""
+        raw = b"ruling\x00text\x00here"
+        result = reingest._reparse_document(raw, "unknown-scraper", self._doc_meta())
+        assert "\x00" not in result["ruling_text"]
+        assert "rulingtexthere" in result["ruling_text"]
+
+    @patch.object(reingest, "_load_scraper_registry")
+    def test_nul_bytes_stripped_from_scraper_parse(
+        self,
+        mock_registry: MagicMock,
+    ) -> None:
+        """NUL bytes in scraper-parsed ruling text are also removed."""
+        raw = b"<html>ruling</html>"
+        mock_scraper_cls = MagicMock()
+        mock_parsed = MagicMock()
+        mock_parsed.ruling_text = "parsed\x00ruling\x00text"
+        mock_parsed.case_number = "24STCV12345"
+        mock_parsed.case_title = "Smith v. Jones"
+        mock_parsed.judge_name = "Judge Test"
+        mock_parsed.outcome = "granted"
+        mock_parsed.motion_type = "demurrer"
+        mock_parsed.department = "1"
+        mock_parsed.parties = []
+        mock_parsed.hearing_date = None
+        mock_scraper_cls.return_value.parse_document.return_value = mock_parsed
+        reingest._SCRAPER_REGISTRY["test-scraper"] = mock_scraper_cls
+
+        try:
+            result = reingest._reparse_document(raw, "test-scraper", self._doc_meta())
+            assert "\x00" not in result["ruling_text"]
+            assert "parsedrulingtext" in result["ruling_text"]
+        finally:
+            reingest._SCRAPER_REGISTRY.pop("test-scraper", None)
+
+
+# ---------------------------------------------------------------------------
 # reingest_batch tests — cursor pagination
 # ---------------------------------------------------------------------------
 
