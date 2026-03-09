@@ -16,5 +16,6 @@
     "DEPT CM2",
     "Judge Andre De La Cruz"
   ],
-  "_notes": "Costa Mesa format uses 'DEPT CM2' (not CM02) in text. Uses 4-digit year prefix case numbers (DDDD-DDDDDDDD). Stale date (Feb 19 — fixture captured March 2)."
+  "department_in_document": "CM2",
+  "_notes": "Costa Mesa format uses 'DEPT CM2' (not CM02) in text — the link text has the leading zero ('CM02') while the document text does not ('CM2'). Expected department value ('CM02') comes from the authoritative link text. Uses 4-digit year prefix case numbers (DDDD-DDDDDDDD). Stale date (Feb 19 — fixture captured March 2)."
 }
