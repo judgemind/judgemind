@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
-# pre-push hook: run lint/format checks on changed packages before pushing.
+# pre-push hook: run lint/format/test checks on changed packages before pushing.
 #
-# Prevents pushes that would fail CI on issues that take <1 second to check
-# locally (missing ruff format, unused imports, terraform fmt, etc.).
+# Prevents pushes that would fail CI on issues detectable locally — missing
+# ruff format, unused imports, terraform fmt, and broken tests.
 #
 # Detects which packages have changes being pushed and runs the appropriate
-# checks for each package type (Python, TypeScript, Terraform).
+# checks for each package type (Python, TypeScript, Terraform). Tests are
+# only run for packages with actual code changes (not just docs or config).
 #
 # Ref: https://github.com/judgemind/judgemind/issues/81
+# Ref: https://github.com/judgemind/judgemind/issues/378
 
 set -uo pipefail
 
@@ -61,6 +63,9 @@ while read -r local_ref local_sha remote_sha _rest; do
     changed_python_pkgs=""
     changed_ts_pkgs=""
     changed_terraform=false
+    # Track packages with code changes (not just docs/config) for test runs
+    python_pkgs_with_code=""
+    ts_pkgs_with_code=""
 
     while IFS= read -r file; do
         # Python packages: packages/<pkg>/ with a pyproject.toml
@@ -70,9 +75,21 @@ while read -r local_ref local_sha remote_sha _rest; do
                 if ! echo "$changed_python_pkgs" | grep -qw "$pkg" 2>/dev/null; then
                     changed_python_pkgs="$changed_python_pkgs $pkg"
                 fi
+                # Check if this is a code file (src/ or tests/ .py files)
+                if [[ "$file" =~ ^packages/[^/]+/(src|tests)/.+\.py$ ]]; then
+                    if ! echo "$python_pkgs_with_code" | grep -qw "$pkg" 2>/dev/null; then
+                        python_pkgs_with_code="$python_pkgs_with_code $pkg"
+                    fi
+                fi
             elif [ -f "packages/$pkg/package.json" ]; then
                 if ! echo "$changed_ts_pkgs" | grep -qw "$pkg" 2>/dev/null; then
                     changed_ts_pkgs="$changed_ts_pkgs $pkg"
+                fi
+                # Check if this is a code file (.ts, .tsx, .js, .jsx in src/ or tests/)
+                if [[ "$file" =~ ^packages/[^/]+/(src|tests|__tests__|lib)/.+\.(ts|tsx|js|jsx)$ ]]; then
+                    if ! echo "$ts_pkgs_with_code" | grep -qw "$pkg" 2>/dev/null; then
+                        ts_pkgs_with_code="$ts_pkgs_with_code $pkg"
+                    fi
                 fi
             fi
         fi
@@ -127,6 +144,26 @@ while read -r local_ref local_sha remote_sha _rest; do
     done
 
     # ---------------------------------------------------------------
+    # Run tests for Python packages (code changes only)
+    # ---------------------------------------------------------------
+    for pkg in $python_pkgs_with_code; do
+        pkg_dir="packages/$pkg"
+
+        if [ -x "$pkg_dir/.venv/bin/pytest" ]; then
+            echo "pre-push: running tests for Python package '$pkg'..." >&2
+            if ! "$pkg_dir/.venv/bin/pytest" "$pkg_dir/tests/" -x -q --tb=line 2>&1; then
+                echo "" >&2
+                echo "  FAILED: tests for $pkg" >&2
+                echo "  Run: $pkg_dir/.venv/bin/pytest $pkg_dir/tests/ -v --tb=short" >&2
+                failures=$((failures + 1))
+            fi
+        else
+            echo "  WARNING: pytest not found for $pkg — skipping tests" >&2
+            echo "  Install with: $pkg_dir/.venv/bin/pip install -e '.[dev]'" >&2
+        fi
+    done
+
+    # ---------------------------------------------------------------
     # Run checks for TypeScript packages
     # ---------------------------------------------------------------
     for pkg in $changed_ts_pkgs; do
@@ -147,6 +184,31 @@ while read -r local_ref local_sha remote_sha _rest; do
                 echo "  Fix lint issues in $pkg_dir before pushing." >&2
                 failures=$((failures + 1))
             fi
+        fi
+    done
+
+    # ---------------------------------------------------------------
+    # Run tests for TypeScript packages (code changes only)
+    # ---------------------------------------------------------------
+    for pkg in $ts_pkgs_with_code; do
+        pkg_dir="packages/$pkg"
+
+        if [ ! -f "$pkg_dir/package.json" ]; then
+            continue
+        fi
+
+        # Check if a test script exists in package.json
+        if ! grep -q '"test"' "$pkg_dir/package.json" 2>/dev/null; then
+            echo "  No test script found for $pkg — skipping tests" >&2
+            continue
+        fi
+
+        echo "pre-push: running tests for TypeScript package '$pkg'..." >&2
+        if ! (cd "$pkg_dir" && npm test 2>&1); then
+            echo "" >&2
+            echo "  FAILED: tests for $pkg" >&2
+            echo "  Run: cd $pkg_dir && npm test" >&2
+            failures=$((failures + 1))
         fi
     done
 
