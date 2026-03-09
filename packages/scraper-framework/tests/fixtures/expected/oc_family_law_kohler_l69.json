@@ -12,7 +12,7 @@
   "case_number_format": null,
   "hearing_date": null,
   "case_title": null,
-  "outcome": "OFF CALENDAR",
+  "outcome": null,
   "motion_type": null,
   "ruling_text_contains": [
     "TENTATIVE RULINGS",

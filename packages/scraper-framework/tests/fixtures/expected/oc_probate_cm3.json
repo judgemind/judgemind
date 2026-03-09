@@ -19,5 +19,6 @@
     "HON. Judge Erin Rowe",
     "Date: 03/04/26"
   ],
-  "_notes": "Probate format. Case numbers: 8 digits starting with 0. Date format: MM/DD/YY. Judge from PDF header."
+  "all_outcomes": ["DENIED", "GRANTED"],
+  "_notes": "Probate format. Case numbers: 8 digits starting with 0. Date format: MM/DD/YY. Judge from PDF header. PDF has TWO motions for judgment on the pleadings: first is DENIED, second is GRANTED. Primary outcome reflects the first motion."
 }
