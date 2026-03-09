@@ -22,6 +22,12 @@ _SCRIPTS_DIR = os.path.join(
     "scripts",
 )
 sys.path.insert(0, _SCRIPTS_DIR)
+
+# Ensure the scraper-framework src is importable (needed for auto-discovery)
+_SRC_DIR = os.path.join(os.path.dirname(__file__), "..", "src")
+if _SRC_DIR not in sys.path:
+    sys.path.insert(0, os.path.abspath(_SRC_DIR))
+
 reingest = importlib.import_module("reingest_from_s3")
 
 
@@ -924,3 +930,77 @@ class TestCLIConcurrencyFlag:
         parser.add_argument("--concurrency", type=int, default=10)
         args = parser.parse_args([])
         assert args.concurrency == 10
+
+
+# ---------------------------------------------------------------------------
+# Scraper registry auto-discovery tests
+# ---------------------------------------------------------------------------
+
+
+class TestScraperRegistryAutoDiscovery:
+    """Tests that _load_scraper_registry() auto-discovers scrapers."""
+
+    def setup_method(self) -> None:
+        """Clear the registry before each test so _load_scraper_registry re-runs."""
+        reingest._SCRAPER_REGISTRY.clear()
+
+    def test_registry_is_non_empty(self) -> None:
+        """Auto-discovery should find at least one scraper."""
+        reingest._load_scraper_registry()
+        assert len(reingest._SCRAPER_REGISTRY) > 0
+
+    def test_registry_contains_all_known_scrapers(self) -> None:
+        """Registry should contain all scraper modules that have default_config()."""
+        reingest._load_scraper_registry()
+
+        # These are the scraper_ids from the known court modules
+        expected_ids = {
+            "ca-la-tentatives-civil",
+            "ca-oc-tentatives-civil",
+            "ca-oc-tentatives-family-law",
+            "ca-oc-tentatives-probate",
+            "ca-sb-tentatives-civil",
+            "ca-sf-tentatives-family-law",
+            "ca-sc-tentatives-civil",
+            "ca-riverside-tentatives-civil",
+        }
+        assert expected_ids == set(reingest._SCRAPER_REGISTRY.keys())
+
+    def test_registry_values_are_basescraper_subclasses(self) -> None:
+        """Every value in the registry should be a BaseScraper subclass."""
+        from framework.base import BaseScraper
+
+        reingest._load_scraper_registry()
+        for scraper_id, cls in reingest._SCRAPER_REGISTRY.items():
+            assert issubclass(cls, BaseScraper), (
+                f"{scraper_id} maps to {cls} which is not a BaseScraper subclass"
+            )
+
+    def test_registry_keys_match_default_config_scraper_id(self) -> None:
+        """Each registry key should match the scraper_id from default_config()."""
+        reingest._load_scraper_registry()
+        for scraper_id, cls in reingest._SCRAPER_REGISTRY.items():
+            # Find the module that defines this class and call default_config()
+            import importlib
+
+            mod = importlib.import_module(cls.__module__)
+            config = mod.default_config()
+            assert config.scraper_id == scraper_id
+
+    def test_idempotent_load(self) -> None:
+        """Calling _load_scraper_registry() twice does not duplicate entries."""
+        reingest._load_scraper_registry()
+        count_first = len(reingest._SCRAPER_REGISTRY)
+        reingest._load_scraper_registry()
+        count_second = len(reingest._SCRAPER_REGISTRY)
+        assert count_first == count_second
+
+    def test_no_hardcoded_imports_in_load_function(self) -> None:
+        """The _load_scraper_registry function should not contain hardcoded court imports."""
+        import inspect
+
+        source = inspect.getsource(reingest._load_scraper_registry)
+        # Should not have direct imports like "from courts.ca.la_tentatives import ..."
+        assert "from courts.ca." not in source
+        # Should use auto-discovery via pkgutil or importlib
+        assert "pkgutil" in source or "importlib" in source
