@@ -57,37 +57,72 @@ describe('truncateText', () => {
 // ---------------------------------------------------------------------------
 
 describe('groupParties', () => {
-  const parties = [
-    { id: '1', canonicalName: 'Alice', partyType: 'plaintiff' },
-    { id: '2', canonicalName: 'Bob', partyType: 'defendant' },
-    { id: '3', canonicalName: 'Carol', partyType: 'petitioner' },
-    { id: '4', canonicalName: 'Dave', partyType: 'respondent' },
-    { id: '5', canonicalName: 'Eve', partyType: 'witness' },
-    { id: '6', canonicalName: 'Frank', partyType: null },
-  ];
+  it('groups by role when role is present', () => {
+    const parties = [
+      { id: '1', canonicalName: 'Alice', partyType: null, role: 'plaintiff' },
+      { id: '2', canonicalName: 'Bob', partyType: null, role: 'defendant' },
+      { id: '3', canonicalName: 'Carol', partyType: null, role: 'petitioner' },
+      { id: '4', canonicalName: 'Dave', partyType: null, role: 'respondent' },
+      { id: '5', canonicalName: 'Eve', partyType: null, role: 'witness' },
+      { id: '6', canonicalName: 'Frank', partyType: null, role: null },
+    ];
 
-  it('groups plaintiffs correctly', () => {
     const result = groupParties(parties);
     expect(result.plaintiffs.map((p) => p.canonicalName)).toEqual([
       'Alice',
       'Carol',
     ]);
-  });
-
-  it('groups defendants correctly', () => {
-    const result = groupParties(parties);
     expect(result.defendants.map((p) => p.canonicalName)).toEqual([
       'Bob',
       'Dave',
     ]);
-  });
-
-  it('puts unrecognized party types in others', () => {
-    const result = groupParties(parties);
     expect(result.others.map((p) => p.canonicalName)).toEqual([
       'Eve',
       'Frank',
     ]);
+  });
+
+  it('falls back to partyType when role is null', () => {
+    const parties = [
+      { id: '1', canonicalName: 'Alice', partyType: 'plaintiff', role: null },
+      { id: '2', canonicalName: 'Bob', partyType: 'defendant', role: null },
+    ];
+
+    const result = groupParties(parties);
+    expect(result.plaintiffs.map((p) => p.canonicalName)).toEqual(['Alice']);
+    expect(result.defendants.map((p) => p.canonicalName)).toEqual(['Bob']);
+  });
+
+  it('role takes precedence over partyType', () => {
+    const parties = [
+      { id: '1', canonicalName: 'Alice', partyType: 'defendant', role: 'plaintiff' },
+    ];
+
+    const result = groupParties(parties);
+    expect(result.plaintiffs.map((p) => p.canonicalName)).toEqual(['Alice']);
+    expect(result.defendants).toEqual([]);
+  });
+
+  it('groups moving_party as plaintiff and responding_party as defendant', () => {
+    const parties = [
+      { id: '1', canonicalName: 'Alice', partyType: null, role: 'moving_party' },
+      { id: '2', canonicalName: 'Bob', partyType: null, role: 'responding_party' },
+    ];
+
+    const result = groupParties(parties);
+    expect(result.plaintiffs.map((p) => p.canonicalName)).toEqual(['Alice']);
+    expect(result.defendants.map((p) => p.canonicalName)).toEqual(['Bob']);
+  });
+
+  it('groups cross_complainant and cross_defendant correctly', () => {
+    const parties = [
+      { id: '1', canonicalName: 'Alice', partyType: null, role: 'cross_complainant' },
+      { id: '2', canonicalName: 'Bob', partyType: null, role: 'cross_defendant' },
+    ];
+
+    const result = groupParties(parties);
+    expect(result.plaintiffs.map((p) => p.canonicalName)).toEqual(['Alice']);
+    expect(result.defendants.map((p) => p.canonicalName)).toEqual(['Bob']);
   });
 
   it('handles empty list', () => {

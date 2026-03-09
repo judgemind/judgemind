@@ -95,6 +95,8 @@ export const typeDefs = `#graphql
     canonicalName: String!
     """e.g. "individual", "corporation", "government"."""
     partyType: String
+    """Case-specific role: plaintiff, defendant, petitioner, respondent, etc."""
+    role: String
   }
 
   """The authenticated user."""

@@ -115,6 +115,30 @@ class TestExtractParties:
         parties = backfill_parties.extract_parties(text)
         assert parties == []
 
+    def test_corporate_suffix_not_split(self) -> None:
+        """Corporate suffixes like 'Inc.' should stay with their entity name."""
+        text = (
+            "CALDERA, et al.,\n"
+            "  Plaintiff(s),\n"
+            "  vs.\n"
+            "TECHNO-ADVANCED, INC., et al.,\n"
+            "  Defendant(s)."
+        )
+        parties = backfill_parties.extract_parties(text)
+        assert len(parties) == 2
+        names = [p["name"].lower() for p in parties]
+        # "Inc" should NOT appear as a standalone entry
+        assert not any(n.strip().rstrip(".") == "inc" for n in names)
+        # The defendant should contain both parts
+        assert any("techno" in n and "inc" in n for n in names)
+
+    def test_fragment_names_filtered(self) -> None:
+        """Standalone fragments like 'Inc' or 'AB' should be filtered out."""
+        assert backfill_parties._is_name_fragment("Inc") is True
+        assert backfill_parties._is_name_fragment("LLC") is True
+        assert backfill_parties._is_name_fragment("AB") is True
+        assert backfill_parties._is_name_fragment("John Doe") is False
+
 
 # ---------------------------------------------------------------------------
 # backfill_batch tests
