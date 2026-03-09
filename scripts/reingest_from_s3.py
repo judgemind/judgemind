@@ -25,6 +25,7 @@ Options:
     --concurrency N     Number of parallel S3 fetch threads (default: 10).
     --parse-workers N   Number of parallel scraper parse threads (default: 4).
     --parse-timeout N   Per-document parse timeout in seconds (default: 60).
+    --no-llm            Disable LLM extraction, use regex-only mode.
 """
 
 from __future__ import annotations
@@ -35,8 +36,13 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    import anthropic as anthropic_mod
 
 # Ensure the scraper-framework source is importable
 sys.path.insert(
@@ -66,6 +72,11 @@ from ingestion.extract import (  # noqa: E402
     extract_judge_name,
     extract_motion_type,
     extract_outcome,
+)
+from ingestion.llm_extract import (  # noqa: E402
+    LLMExtractionResult,
+    LLMRulingResult,
+    extract_fields_llm,
 )
 
 logging.basicConfig(
@@ -269,19 +280,46 @@ def _extract_text_from_content(
     return raw_content.decode("utf-8", errors="replace")
 
 
+def _match_ruling(
+    llm_result: LLMExtractionResult,
+    case_number: str | None,
+) -> LLMRulingResult | None:
+    """Find the ruling matching the given case_number, or return the first ruling.
+
+    Mirrors the helper in ``worker.py``: if the document already has a
+    case_number from the scraper, look for a matching ruling in the LLM
+    results. If no match, fall back to the first ruling (the LLM may have
+    normalized the case number differently).
+    """
+    if not llm_result.rulings:
+        return None
+    if case_number:
+        matching = [r for r in llm_result.rulings if r.case_number == case_number]
+        if matching:
+            return matching[0]
+    return llm_result.rulings[0]
+
+
 def _reparse_document(
     raw_content: bytes,
     scraper_id: str,
     doc_meta: dict,
     pdf_timeout: float = 30.0,
+    anthropic_client: anthropic_mod.Anthropic | None = None,
 ) -> dict:
-    """Re-parse a document using the scraper's parse_document method.
+    """Re-parse a document using a three-tier extraction strategy.
+
+    Extraction priority per field:
+      1. Scraper ``parse_document()`` (highest priority).
+      2. LLM extraction via ``extract_fields_llm()`` (if *anthropic_client*
+         is provided).
+      3. Regex fallback (lowest priority).
 
     For PDF documents, extracts text via pdfplumber in a subprocess with
     a hard timeout to prevent hangs from C extensions.
 
-    Falls back to regex extraction if no scraper class is available.
-    Returns a dict of extracted fields.
+    Returns a dict of extracted fields plus an ``extraction_methods`` dict
+    recording which method populated each field.
     """
     _load_scraper_registry()
 
@@ -350,22 +388,143 @@ def _reparse_document(
                 exc_info=True,
             )
 
-    # Fill in any remaining gaps with regex extraction.
+    # Track extraction method per field for observability.
+    extraction_methods: dict[str, str] = {}
+
+    # Record which fields were filled by the scraper.
+    for field in (
+        "judge_name",
+        "outcome",
+        "motion_type",
+        "case_number",
+        "case_title",
+        "hearing_date",
+        "department",
+        "parties",
+    ):
+        val = extracted.get(field)
+        if val and (not isinstance(val, list) or len(val) > 0):
+            extraction_methods[field] = "scraper"
+
+    # ------------------------------------------------------------------
+    # LLM extraction — secondary method for missing fields
+    # ------------------------------------------------------------------
+    if anthropic_client is not None:
+        missing_fields = [
+            f
+            for f in (
+                "hearing_date",
+                "outcome",
+                "motion_type",
+                "case_number",
+                "case_title",
+                "judge_name",
+                "department",
+                "parties",
+            )
+            if not extracted.get(f)
+            or (isinstance(extracted.get(f), list) and len(extracted[f]) == 0)
+        ]
+        if missing_fields and text.strip():
+            t0 = time.monotonic()
+            llm_result = extract_fields_llm(
+                document_text=text,
+                content_format=doc_format,
+                metadata=None,
+                client=anthropic_client,
+            )
+            llm_latency_ms = round((time.monotonic() - t0) * 1000)
+
+            if llm_result is not None:
+                ruling = _match_ruling(llm_result, extracted.get("case_number"))
+
+                # Apply document-level fields from LLM
+                if not extracted["hearing_date"] and llm_result.hearing_date:
+                    extracted["hearing_date"] = llm_result.hearing_date
+                    extraction_methods["hearing_date"] = "llm"
+                if not extracted["judge_name"] and llm_result.judge_name:
+                    extracted["judge_name"] = llm_result.judge_name
+                    extraction_methods["judge_name"] = "llm"
+                if not extracted.get("department") and llm_result.department:
+                    extracted["department"] = llm_result.department
+                    extraction_methods["department"] = "llm"
+
+                # Apply ruling-level fields from the matched ruling
+                if ruling is not None:
+                    if not extracted["case_number"] and ruling.case_number:
+                        extracted["case_number"] = ruling.case_number
+                        extraction_methods["case_number"] = "llm"
+                    if not extracted["case_title"] and ruling.case_title:
+                        extracted["case_title"] = ruling.case_title
+                        extraction_methods["case_title"] = "llm"
+                    if not extracted["outcome"] and ruling.outcome:
+                        extracted["outcome"] = ruling.outcome
+                        extraction_methods["outcome"] = "llm"
+                    if not extracted["motion_type"] and ruling.motion_type:
+                        extracted["motion_type"] = ruling.motion_type
+                        extraction_methods["motion_type"] = "llm"
+                    if not extracted["parties"] and ruling.parties:
+                        extracted["parties"] = ruling.parties
+                        extraction_methods["parties"] = "llm"
+
+                logger.info(
+                    "LLM extraction completed for %s (latency=%dms, methods=%s)",
+                    doc_meta["document_id"],
+                    llm_latency_ms,
+                    extraction_methods,
+                )
+            else:
+                logger.info(
+                    "LLM extraction returned None for %s (latency=%dms) — "
+                    "falling back to regex",
+                    doc_meta["document_id"],
+                    llm_latency_ms,
+                )
+
+    # ------------------------------------------------------------------
+    # Regex fallback — fill any fields still missing after scraper + LLM
+    # ------------------------------------------------------------------
     # For PDF documents, ``text`` is pdfplumber-extracted text (not garbage
     # UTF-8 decode), so regex patterns can match real content.
     if not extracted["judge_name"]:
-        extracted["judge_name"] = extract_judge_name(text)
+        val = extract_judge_name(text)
+        if val:
+            extracted["judge_name"] = val
+            extraction_methods.setdefault("judge_name", "regex")
     if not extracted["outcome"]:
-        extracted["outcome"] = extract_outcome(text)
+        val = extract_outcome(text)
+        if val:
+            extracted["outcome"] = val
+            extraction_methods.setdefault("outcome", "regex")
     if not extracted["motion_type"]:
-        extracted["motion_type"] = extract_motion_type(text)
+        val = extract_motion_type(text)
+        if val:
+            extracted["motion_type"] = val
+            extraction_methods.setdefault("motion_type", "regex")
     if not extracted["case_number"]:
-        extracted["case_number"] = extract_case_number(text)
+        val = extract_case_number(text)
+        if val:
+            extracted["case_number"] = val
+            extraction_methods.setdefault("case_number", "regex")
     if not extracted["case_title"]:
-        extracted["case_title"] = extract_case_title(text)
+        val = extract_case_title(text)
+        if val:
+            extracted["case_title"] = val
+            extraction_methods.setdefault("case_title", "regex")
     if not extracted["hearing_date"]:
-        extracted["hearing_date"] = extract_hearing_date(text)
+        val = extract_hearing_date(text)
+        if val:
+            extracted["hearing_date"] = val
+            extraction_methods.setdefault("hearing_date", "regex")
 
+    if extraction_methods:
+        logger.info(
+            "Field extraction summary for %s: %s",
+            doc_meta["document_id"],
+            extraction_methods,
+        )
+
+    extracted["extraction_methods"] = extraction_methods
     return extracted
 
 
@@ -380,6 +539,7 @@ def reingest_batch(
     concurrency: int = 10,
     parse_workers: int = 4,
     parse_timeout: float = 60.0,
+    anthropic_client: anthropic_mod.Anthropic | None = None,
 ) -> tuple[int, int, tuple[datetime, str]]:
     """Process one batch. Returns (processed, updated, next_cursor).
 
@@ -387,6 +547,9 @@ def reingest_batch(
     ``concurrency``).  Scraper parsing is parallelised with ``parse_workers``
     threads.  Each parse call is guarded by a ``parse_timeout`` (seconds).
     DB writes remain sequential.
+
+    If *anthropic_client* is provided, LLM extraction is used for fields
+    that the scraper did not populate, before falling back to regex.
     """
     processed = 0
     updated = 0
@@ -504,6 +667,7 @@ def reingest_batch(
                 doc_meta["scraper_id"],
                 doc_meta,
                 parse_timeout,
+                anthropic_client,
             )
             parse_futures[future] = (idx, doc_meta)
 
@@ -631,11 +795,25 @@ def run_reingest(
     concurrency: int = 10,
     parse_workers: int = 4,
     parse_timeout: float = 60.0,
+    no_llm: bool = False,
 ) -> dict[str, int]:
     """Run the full reingest. Returns summary stats."""
     filters, filter_params = _build_filters(county, date_from, date_to)
 
     s3_client = boto3.client("s3")
+
+    # Create Anthropic client for LLM extraction (shared across batches for
+    # connection reuse).  If ANTHROPIC_API_KEY is not set or --no-llm is
+    # specified, LLM extraction is skipped and regex-only mode is used.
+    anthropic_client: anthropic_mod.Anthropic | None = None
+    if not no_llm and os.environ.get("ANTHROPIC_API_KEY"):
+        import anthropic  # noqa: E402
+
+        anthropic_client = anthropic.Anthropic()
+        logger.info("LLM extraction enabled (using ANTHROPIC_API_KEY)")
+    else:
+        reason = "--no-llm flag" if no_llm else "ANTHROPIC_API_KEY not set"
+        logger.info("LLM extraction disabled (%s) — using regex-only mode", reason)
     total_processed = 0
     total_updated = 0
     cursor: tuple[datetime, str] = (_CURSOR_MIN_TIMESTAMP, _CURSOR_MIN_UUID)
@@ -660,6 +838,7 @@ def run_reingest(
                 concurrency=concurrency,
                 parse_workers=parse_workers,
                 parse_timeout=parse_timeout,
+                anthropic_client=anthropic_client,
             )
             total_processed += processed
             total_updated += updated
@@ -727,6 +906,11 @@ def main() -> None:
         default=60.0,
         help="Per-document parse timeout in seconds (default: 60).",
     )
+    parser.add_argument(
+        "--no-llm",
+        action="store_true",
+        help="Disable LLM extraction, use regex-only mode.",
+    )
     args = parser.parse_args()
 
     dsn = os.environ.get("DATABASE_URL")
@@ -748,6 +932,7 @@ def main() -> None:
         concurrency=args.concurrency,
         parse_workers=args.parse_workers,
         parse_timeout=args.parse_timeout,
+        no_llm=args.no_llm,
     )
 
     logger.info(
