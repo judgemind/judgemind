@@ -30,11 +30,11 @@ Options:
 from __future__ import annotations
 
 import argparse
-import ctypes
 import logging
 import os
+import subprocess
 import sys
-import threading
+import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime
 
@@ -141,64 +141,6 @@ def _load_scraper_registry() -> None:
             )
 
 
-class _ParseTimeout(Exception):
-    """Raised when a parse operation exceeds its time limit."""
-
-
-def _run_with_timeout(
-    fn: object,
-    args: tuple,
-    timeout_seconds: float,
-) -> object:
-    """Run *fn(*args)* in the calling thread with a hard timeout.
-
-    Uses ``ctypes.pythonapi.PyThreadState_SetAsyncExc`` to raise
-    ``_ParseTimeout`` in the target thread if the timer fires.  This is
-    thread-safe and works in non-main threads (unlike ``signal.SIGALRM``).
-
-    Falls back to a simple call (no timeout) on platforms where
-    ``PyThreadState_SetAsyncExc`` is unavailable.
-    """
-    result: list = []
-    exc: list[BaseException] = []
-    target_tid: int | None = None
-    timed_out = threading.Event()
-
-    def _worker() -> None:
-        nonlocal target_tid
-        target_tid = threading.current_thread().ident
-        try:
-            result.append(fn(*args))  # type: ignore[operator]
-        except _ParseTimeout:
-            # Expected when the timer fires.
-            pass
-        except BaseException as e:
-            exc.append(e)
-
-    def _on_timeout() -> None:
-        timed_out.set()
-        if target_tid is not None:
-            ctypes.pythonapi.PyThreadState_SetAsyncExc(
-                ctypes.c_ulong(target_tid),
-                ctypes.py_object(_ParseTimeout),
-            )
-
-    worker = threading.Thread(target=_worker, daemon=True)
-    timer = threading.Timer(timeout_seconds, _on_timeout)
-    timer.start()
-    worker.start()
-    worker.join(timeout=timeout_seconds + 5)
-    timer.cancel()
-
-    if timed_out.is_set():
-        raise _ParseTimeout(f"Parse timed out after {timeout_seconds}s")
-    if exc:
-        raise exc[0]
-    if not result:
-        raise RuntimeError("Worker finished without producing a result")
-    return result[0]
-
-
 FETCH_DOCUMENTS_QUERY = """
     SELECT
         d.id, d.case_id, d.court_id, d.s3_key, d.s3_bucket,
@@ -247,34 +189,83 @@ def _fetch_s3_content(s3_client: object, bucket: str, key: str) -> bytes:
     return response["Body"].read()  # type: ignore[index]
 
 
+def _extract_pdf_text_subprocess(
+    raw_content: bytes,
+    timeout: float = 30.0,
+) -> str | None:
+    """Extract text from PDF using pdfplumber in a subprocess with hard timeout.
+
+    Runs pdfplumber in a separate process so that if the C PDF parser hangs,
+    the OS can kill it.  ``PyThreadState_SetAsyncExc`` does not work for C
+    extensions — this subprocess approach is the only reliable timeout.
+
+    Returns the extracted text, or ``None`` if extraction failed or timed out.
+    """
+    tmp_fd, tmp_path = tempfile.mkstemp(suffix=".pdf")
+    try:
+        os.write(tmp_fd, raw_content)
+        os.close(tmp_fd)
+
+        # Find the Python interpreter from the current environment.
+        python = sys.executable
+
+        result = subprocess.run(
+            [
+                python,
+                "-c",
+                (
+                    "import pdfplumber,sys\n"
+                    "pdf=pdfplumber.open(sys.argv[1])\n"
+                    "for p in pdf.pages:\n"
+                    "    t=p.extract_text()\n"
+                    "    if t:\n"
+                    "        print(t)\n"
+                ),
+                tmp_path,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout
+        return None
+    except subprocess.TimeoutExpired:
+        logger.debug("PDF subprocess timed out after %.0fs", timeout)
+        return None
+    except Exception:
+        logger.debug("PDF subprocess extraction failed", exc_info=True)
+        return None
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+
+
 def _extract_text_from_content(
     raw_content: bytes,
     doc_format: str,
+    pdf_timeout: float = 30.0,
 ) -> str:
     """Extract readable text from raw document content.
 
-    For PDF documents, uses pdfplumber to extract text properly.
+    For PDF documents, uses pdfplumber in a **subprocess** with a hard
+    timeout to prevent hangs from C extensions.  The previous in-process
+    approach using ``PyThreadState_SetAsyncExc`` could not interrupt
+    pdfplumber's C PDF parser, leading to hung threads and blocked batches.
+
     For other formats (HTML, plain text), decodes as UTF-8.
     """
     if doc_format == "pdf":
-        try:
-            import io
-
-            import pdfplumber
-
-            lines: list[str] = []
-            with pdfplumber.open(io.BytesIO(raw_content)) as pdf:
-                for page in pdf.pages:
-                    page_text = page.extract_text()
-                    if page_text:
-                        lines.append(page_text)
-            extracted_text = "\n".join(lines)
-            if extracted_text.strip():
-                return extracted_text
-        except Exception:
-            logger.debug(
-                "pdfplumber text extraction failed, falling back to UTF-8 decode"
-            )
+        text = _extract_pdf_text_subprocess(raw_content, timeout=pdf_timeout)
+        if text and text.strip():
+            return text
+        # Subprocess failed (timeout, crash, or empty output) — fall back
+        # to UTF-8 decode rather than risking an in-process hang.
+        logger.debug(
+            "PDF subprocess extraction returned no text, falling back to UTF-8"
+        )
     return raw_content.decode("utf-8", errors="replace")
 
 
@@ -282,11 +273,12 @@ def _reparse_document(
     raw_content: bytes,
     scraper_id: str,
     doc_meta: dict,
+    pdf_timeout: float = 30.0,
 ) -> dict:
     """Re-parse a document using the scraper's parse_document method.
 
-    For PDF documents, extracts text via pdfplumber instead of raw UTF-8
-    decode, which produces garbage on binary PDF content.
+    For PDF documents, extracts text via pdfplumber in a subprocess with
+    a hard timeout to prevent hangs from C extensions.
 
     Falls back to regex extraction if no scraper class is available.
     Returns a dict of extracted fields.
@@ -294,7 +286,9 @@ def _reparse_document(
     _load_scraper_registry()
 
     doc_format = doc_meta.get("format", "html")
-    text = _extract_text_from_content(raw_content, doc_format).replace("\x00", "")
+    text = _extract_text_from_content(
+        raw_content, doc_format, pdf_timeout=pdf_timeout
+    ).replace("\x00", "")
     extracted: dict = {
         "ruling_text": text,
         "case_number": doc_meta.get("case_number"),
@@ -493,16 +487,22 @@ def reingest_batch(
     if not parseable:
         return processed, updated, next_cursor
 
-    # --- Parse documents in parallel -----------------------------------------
+    # --- Parse documents in parallel ------------------------------------------
+    # Parsing runs in threads.  The subprocess-based timeout inside
+    # ``_extract_text_from_content`` provides hard isolation for pdfplumber's
+    # C extension — if the PDF parser hangs, the subprocess is killed by the
+    # OS after ``parse_timeout`` seconds.  No thread-level timeout hacks are
+    # needed here.
     parsed_docs: list[tuple[dict, dict]] = []  # (doc_meta, extracted)
 
     with ThreadPoolExecutor(max_workers=parse_workers) as pool:
         parse_futures = {}
         for idx, doc_meta, raw_content in parseable:
             future = pool.submit(
-                _run_with_timeout,
                 _reparse_document,
-                (raw_content, doc_meta["scraper_id"], doc_meta),
+                raw_content,
+                doc_meta["scraper_id"],
+                doc_meta,
                 parse_timeout,
             )
             parse_futures[future] = (idx, doc_meta)
@@ -512,13 +512,6 @@ def reingest_batch(
             doc_id_str = doc_meta["document_id"]
             try:
                 extracted = future.result()
-            except _ParseTimeout:
-                logger.warning(
-                    "Parse timed out for %s after %.0fs — skipping",
-                    doc_id_str,
-                    parse_timeout,
-                )
-                continue
             except Exception:
                 logger.warning(
                     "Parse failed for %s — skipping",

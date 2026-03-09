@@ -1055,14 +1055,14 @@ class TestParallelParsing:
         # Only 2 succeed, so only 2 are written to DB
         assert updated == 2
 
-    @patch("reingest_from_s3._run_with_timeout")
+    @patch("reingest_from_s3._reparse_document")
     @patch("reingest_from_s3._fetch_s3_content")
-    def test_parse_timeout_skips_document(
+    def test_parse_exception_skips_document(
         self,
         mock_fetch: MagicMock,
-        mock_timeout_fn: MagicMock,
+        mock_reparse: MagicMock,
     ) -> None:
-        """If parsing times out, the document is skipped."""
+        """If parsing raises any exception, the document is skipped."""
         rows = [_make_document_row(uuid.uuid4(), _CAPTURED_AT_1) for _ in range(2)]
         conn = _mock_conn_with_rows(rows)
 
@@ -1079,9 +1079,9 @@ class TestParallelParsing:
             "parties": [],
             "hearing_date": _HEARING_DATE,
         }
-        mock_timeout_fn.side_effect = [
+        mock_reparse.side_effect = [
             ok_result,
-            reingest._ParseTimeout("timed out"),
+            RuntimeError("pdfplumber hung and was killed"),
         ]
 
         processed, updated, _next_cursor = reingest.reingest_batch(
@@ -1196,40 +1196,42 @@ class TestParallelParsing:
 
 
 # ---------------------------------------------------------------------------
-# _run_with_timeout tests
+# _extract_pdf_text_subprocess tests
 # ---------------------------------------------------------------------------
 
 
-class TestRunWithTimeout:
-    """Tests for the _run_with_timeout helper."""
+class TestExtractPdfTextSubprocess:
+    """Tests for the subprocess-based PDF text extraction."""
 
-    def test_returns_result_on_success(self) -> None:
-        """Normal function returns its result."""
-        result = reingest._run_with_timeout(lambda x: x * 2, (21,), 5.0)
-        assert result == 42
+    def test_extracts_text_from_real_pdf(self) -> None:
+        """Subprocess extraction produces readable text from a real PDF."""
+        fixtures_dir = os.path.join(os.path.dirname(__file__), "fixtures")
+        pdf_path = os.path.join(fixtures_dir, "oc_apkarian_c25.pdf")
+        with open(pdf_path, "rb") as f:
+            pdf_bytes = f.read()
 
-    def test_raises_parse_timeout_on_slow_function(self) -> None:
-        """Function that exceeds timeout raises _ParseTimeout."""
-        import time
+        result = reingest._extract_pdf_text_subprocess(pdf_bytes, timeout=30.0)
+        assert result is not None
+        assert len(result) > 100
+        assert "%PDF" not in result
 
-        def slow(x: int) -> int:
-            time.sleep(10)
-            return x
+    def test_returns_none_on_invalid_pdf(self) -> None:
+        """Invalid PDF bytes return None (subprocess exits non-zero)."""
+        result = reingest._extract_pdf_text_subprocess(b"not a real pdf", timeout=5.0)
+        assert result is None
 
-        import pytest
+    def test_returns_none_on_timeout(self) -> None:
+        """A very short timeout returns None without hanging."""
+        # Use a tiny timeout that the subprocess can't possibly meet
+        fixtures_dir = os.path.join(os.path.dirname(__file__), "fixtures")
+        pdf_path = os.path.join(fixtures_dir, "oc_apkarian_c25.pdf")
+        with open(pdf_path, "rb") as f:
+            pdf_bytes = f.read()
 
-        with pytest.raises(reingest._ParseTimeout):
-            reingest._run_with_timeout(slow, (1,), 0.5)
-
-    def test_propagates_exceptions(self) -> None:
-        """Exceptions from the function are propagated."""
-        import pytest
-
-        def boom() -> None:
-            raise ValueError("kaboom")
-
-        with pytest.raises(ValueError, match="kaboom"):
-            reingest._run_with_timeout(boom, (), 5.0)
+        # 0.001s timeout — subprocess won't even start pdfplumber in time
+        result = reingest._extract_pdf_text_subprocess(pdf_bytes, timeout=0.001)
+        # Should return None (timeout), not hang
+        assert result is None
 
 
 # ---------------------------------------------------------------------------
@@ -1355,8 +1357,8 @@ class TestExtractTextFromContent:
         result = reingest._extract_text_from_content(html, "html")
         assert "Hello world" in result
 
-    def test_pdf_extracted_via_pdfplumber(self) -> None:
-        """PDF content is extracted via pdfplumber, not raw UTF-8 decode."""
+    def test_pdf_extracted_via_subprocess(self) -> None:
+        """PDF content is extracted via pdfplumber subprocess."""
         fixtures_dir = os.path.join(os.path.dirname(__file__), "fixtures")
         pdf_path = os.path.join(fixtures_dir, "oc_apkarian_c25.pdf")
         with open(pdf_path, "rb") as f:
