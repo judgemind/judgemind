@@ -1,8 +1,8 @@
 """Tests for the reingest_from_s3 script.
 
 Verifies keyset (cursor-based) pagination, parallel S3 fetching,
-psycopg3 pipeline batching of DB writes, error handling, and CLI
-flag behavior. All database and S3 access is mocked.
+psycopg3 pipeline batching of DB writes, LLM extraction integration,
+error handling, and CLI flag behavior. All database and S3 access is mocked.
 """
 
 from __future__ import annotations
@@ -1533,3 +1533,450 @@ class TestReparsePdfDocuments:
         assert "from courts.ca." not in source
         # Should use auto-discovery via pkgutil or importlib
         assert "pkgutil" in source or "importlib" in source
+
+
+# ---------------------------------------------------------------------------
+# _match_ruling tests
+# ---------------------------------------------------------------------------
+
+
+class TestMatchRuling:
+    """Tests for the _match_ruling helper."""
+
+    def test_returns_none_for_empty_rulings(self) -> None:
+        """Returns None when there are no rulings."""
+        from ingestion.llm_extract import LLMExtractionResult
+
+        result = LLMExtractionResult(rulings=[])
+        assert reingest._match_ruling(result, "24STCV12345") is None
+
+    def test_returns_matching_ruling_by_case_number(self) -> None:
+        """Returns the ruling matching the given case number."""
+        from ingestion.llm_extract import LLMExtractionResult, LLMRulingResult
+
+        r1 = LLMRulingResult(case_number="24STCV11111", outcome="granted")
+        r2 = LLMRulingResult(case_number="24STCV22222", outcome="denied")
+        result = LLMExtractionResult(rulings=[r1, r2])
+        matched = reingest._match_ruling(result, "24STCV22222")
+        assert matched is r2
+
+    def test_returns_first_ruling_when_no_match(self) -> None:
+        """Falls back to the first ruling when no case number matches."""
+        from ingestion.llm_extract import LLMExtractionResult, LLMRulingResult
+
+        r1 = LLMRulingResult(case_number="24STCV11111", outcome="granted")
+        r2 = LLMRulingResult(case_number="24STCV22222", outcome="denied")
+        result = LLMExtractionResult(rulings=[r1, r2])
+        matched = reingest._match_ruling(result, "NO-MATCH")
+        assert matched is r1
+
+    def test_returns_first_ruling_when_no_case_number(self) -> None:
+        """Falls back to first ruling when case_number is None."""
+        from ingestion.llm_extract import LLMExtractionResult, LLMRulingResult
+
+        r1 = LLMRulingResult(case_number="24STCV11111", outcome="granted")
+        result = LLMExtractionResult(rulings=[r1])
+        matched = reingest._match_ruling(result, None)
+        assert matched is r1
+
+
+# ---------------------------------------------------------------------------
+# LLM extraction integration in _reparse_document
+# ---------------------------------------------------------------------------
+
+
+class TestReparseDocumentLLM:
+    """Tests for LLM extraction integration in _reparse_document."""
+
+    def _doc_meta(self) -> dict:
+        return {
+            "document_id": str(_DOC_ID_1),
+            "state": "CA",
+            "county": "Los Angeles",
+            "court_name": "Los Angeles Superior Court",
+            "source_url": "https://court.example.com/ruling",
+            "captured_at": _CAPTURED_AT_1,
+            "content_hash": "abc123",
+            "format": "html",
+            "case_number": None,
+            "case_title": None,
+            "hearing_date": None,
+            "court_id": str(_COURT_ID),
+            "scraper_id": "unknown-scraper",
+            "s3_key": "docs/test.html",
+            "s3_bucket": "test-bucket",
+        }
+
+    @patch.object(reingest, "_load_scraper_registry")
+    @patch("reingest_from_s3.extract_fields_llm")
+    def test_llm_fills_missing_fields(
+        self,
+        mock_llm: MagicMock,
+        mock_registry: MagicMock,
+    ) -> None:
+        """LLM extraction fills fields that scraper did not provide."""
+        from ingestion.llm_extract import LLMExtractionResult, LLMRulingResult
+
+        mock_llm.return_value = LLMExtractionResult(
+            judge_name="Jane Doe",
+            hearing_date=date(2026, 3, 5),
+            department="12",
+            case_count=1,
+            rulings=[
+                LLMRulingResult(
+                    case_number="24STCV99999",
+                    case_title="Doe v. Smith",
+                    outcome="granted",
+                    motion_type="msj",
+                    parties=[
+                        {"name": "Jane Doe", "role": "plaintiff"},
+                        {"name": "John Smith", "role": "defendant"},
+                    ],
+                )
+            ],
+        )
+
+        raw = b"<html>ruling text with motion is granted</html>"
+        client = MagicMock()
+        result = reingest._reparse_document(
+            raw, "unknown-scraper", self._doc_meta(), anthropic_client=client
+        )
+
+        assert result["judge_name"] == "Jane Doe"
+        assert result["hearing_date"] == date(2026, 3, 5)
+        assert result["case_number"] == "24STCV99999"
+        assert result["case_title"] == "Doe v. Smith"
+        assert result["outcome"] == "granted"
+        assert result["motion_type"] == "msj"
+        assert result["department"] == "12"
+        assert len(result["parties"]) == 2
+        assert result["extraction_methods"]["judge_name"] == "llm"
+        assert result["extraction_methods"]["outcome"] == "llm"
+
+    @patch.object(reingest, "_load_scraper_registry")
+    @patch("reingest_from_s3.extract_fields_llm")
+    def test_llm_not_called_without_client(
+        self,
+        mock_llm: MagicMock,
+        mock_registry: MagicMock,
+    ) -> None:
+        """LLM extraction is skipped when anthropic_client is None."""
+        raw = b"<html>ruling text</html>"
+        reingest._reparse_document(raw, "unknown-scraper", self._doc_meta())
+
+        mock_llm.assert_not_called()
+
+    @patch.object(reingest, "_load_scraper_registry")
+    @patch("reingest_from_s3.extract_fields_llm")
+    def test_llm_not_called_when_all_fields_present(
+        self,
+        mock_llm: MagicMock,
+        mock_registry: MagicMock,
+    ) -> None:
+        """LLM is not called when scraper already filled all fields."""
+        # Set up scraper to fill everything
+        mock_scraper_cls = MagicMock()
+        mock_parsed = MagicMock()
+        mock_parsed.ruling_text = "ruling text"
+        mock_parsed.case_number = "24STCV12345"
+        mock_parsed.case_title = "Smith v. Jones"
+        mock_parsed.judge_name = "Judge Test"
+        mock_parsed.outcome = "granted"
+        mock_parsed.motion_type = "demurrer"
+        mock_parsed.department = "1"
+        mock_parsed.parties = [{"name": "Smith", "role": "plaintiff"}]
+        mock_parsed.hearing_date = date(2026, 3, 5)
+        mock_scraper_cls.return_value.parse_document.return_value = mock_parsed
+        reingest._SCRAPER_REGISTRY["test-all-filled"] = mock_scraper_cls
+
+        try:
+            meta = self._doc_meta()
+            meta["scraper_id"] = "test-all-filled"
+            raw = b"<html>ruling text</html>"
+            client = MagicMock()
+            reingest._reparse_document(raw, "test-all-filled", meta, anthropic_client=client)
+            mock_llm.assert_not_called()
+        finally:
+            reingest._SCRAPER_REGISTRY.pop("test-all-filled", None)
+
+    @patch.object(reingest, "_load_scraper_registry")
+    @patch("reingest_from_s3.extract_fields_llm")
+    def test_llm_failure_falls_through_to_regex(
+        self,
+        mock_llm: MagicMock,
+        mock_registry: MagicMock,
+    ) -> None:
+        """When LLM returns None, regex fallback is still used."""
+        mock_llm.return_value = None
+
+        raw = b"<html>Motion for Summary Judgment is GRANTED. Judge John Smith presiding.</html>"
+        client = MagicMock()
+        result = reingest._reparse_document(
+            raw, "unknown-scraper", self._doc_meta(), anthropic_client=client
+        )
+
+        # LLM was called but returned None — regex should have been tried
+        mock_llm.assert_called_once()
+        # extraction_methods should use regex for whatever regex found
+        methods = result["extraction_methods"]
+        for field_method in methods.values():
+            assert field_method == "regex"
+
+    @patch.object(reingest, "_load_scraper_registry")
+    @patch("reingest_from_s3.extract_fields_llm")
+    def test_scraper_fields_not_overridden_by_llm(
+        self,
+        mock_llm: MagicMock,
+        mock_registry: MagicMock,
+    ) -> None:
+        """Scraper-provided fields are NOT overridden by LLM extraction."""
+        from ingestion.llm_extract import LLMExtractionResult, LLMRulingResult
+
+        # Set up scraper to fill judge_name
+        mock_scraper_cls = MagicMock()
+        mock_parsed = MagicMock()
+        mock_parsed.ruling_text = "ruling text"
+        mock_parsed.case_number = None
+        mock_parsed.case_title = None
+        mock_parsed.judge_name = "Scraper Judge"
+        mock_parsed.outcome = None
+        mock_parsed.motion_type = None
+        mock_parsed.department = None
+        mock_parsed.parties = []
+        mock_parsed.hearing_date = None
+        mock_scraper_cls.return_value.parse_document.return_value = mock_parsed
+        reingest._SCRAPER_REGISTRY["test-partial"] = mock_scraper_cls
+
+        # LLM would provide a different judge name
+        mock_llm.return_value = LLMExtractionResult(
+            judge_name="LLM Judge",
+            hearing_date=date(2026, 3, 5),
+            rulings=[
+                LLMRulingResult(
+                    case_number="24STCV99999",
+                    outcome="denied",
+                )
+            ],
+        )
+
+        try:
+            meta = self._doc_meta()
+            meta["scraper_id"] = "test-partial"
+            raw = b"<html>ruling text</html>"
+            client = MagicMock()
+            result = reingest._reparse_document(raw, "test-partial", meta, anthropic_client=client)
+
+            # Scraper judge should be preserved, LLM should not override
+            assert result["judge_name"] == "Scraper Judge"
+            assert result["extraction_methods"]["judge_name"] == "scraper"
+            # LLM should fill missing fields
+            assert result["case_number"] == "24STCV99999"
+            assert result["extraction_methods"]["case_number"] == "llm"
+            assert result["hearing_date"] == date(2026, 3, 5)
+            assert result["extraction_methods"]["hearing_date"] == "llm"
+        finally:
+            reingest._SCRAPER_REGISTRY.pop("test-partial", None)
+
+    @patch.object(reingest, "_load_scraper_registry")
+    def test_extraction_methods_in_result(
+        self,
+        mock_registry: MagicMock,
+    ) -> None:
+        """extraction_methods dict is included in the returned result."""
+        raw = b"<html>Motion is GRANTED</html>"
+        result = reingest._reparse_document(raw, "unknown-scraper", self._doc_meta())
+        assert "extraction_methods" in result
+        assert isinstance(result["extraction_methods"], dict)
+
+
+# ---------------------------------------------------------------------------
+# LLM extraction in reingest_batch — anthropic_client passthrough
+# ---------------------------------------------------------------------------
+
+
+class TestReingestBatchLLM:
+    """Tests that reingest_batch passes anthropic_client through to parsing."""
+
+    @patch("reingest_from_s3._reparse_document")
+    @patch("reingest_from_s3._fetch_s3_content")
+    def test_anthropic_client_passed_to_reparse(
+        self,
+        mock_fetch_s3: MagicMock,
+        mock_reparse: MagicMock,
+    ) -> None:
+        """anthropic_client is forwarded from reingest_batch to _reparse_document."""
+        row = _make_document_row()
+        conn = _mock_conn_returning([row])
+
+        mock_fetch_s3.return_value = b"<html>text</html>"
+        mock_reparse.return_value = {
+            "ruling_text": "text",
+            "case_number": "24STCV12345",
+            "case_title": "Smith v. Jones",
+            "judge_name": None,
+            "outcome": None,
+            "motion_type": None,
+            "department": None,
+            "parties": [],
+            "hearing_date": _HEARING_DATE,
+            "extraction_methods": {},
+        }
+
+        mock_client = MagicMock()
+        reingest.reingest_batch(
+            conn,
+            MagicMock(),
+            batch_size=10,
+            cursor=_DEFAULT_CURSOR,
+            filters="",
+            filter_params=[],
+            dry_run=True,
+            anthropic_client=mock_client,
+        )
+
+        # Verify _reparse_document was called with the anthropic_client
+        call_args = mock_reparse.call_args[0]
+        assert call_args[4] is mock_client
+
+    @patch("reingest_from_s3._reparse_document")
+    @patch("reingest_from_s3._fetch_s3_content")
+    def test_no_anthropic_client_by_default(
+        self,
+        mock_fetch_s3: MagicMock,
+        mock_reparse: MagicMock,
+    ) -> None:
+        """By default, anthropic_client is None (no LLM extraction)."""
+        row = _make_document_row()
+        conn = _mock_conn_returning([row])
+
+        mock_fetch_s3.return_value = b"<html>text</html>"
+        mock_reparse.return_value = {
+            "ruling_text": "text",
+            "case_number": "24STCV12345",
+            "case_title": "Smith v. Jones",
+            "judge_name": None,
+            "outcome": None,
+            "motion_type": None,
+            "department": None,
+            "parties": [],
+            "hearing_date": _HEARING_DATE,
+            "extraction_methods": {},
+        }
+
+        reingest.reingest_batch(
+            conn,
+            MagicMock(),
+            batch_size=10,
+            cursor=_DEFAULT_CURSOR,
+            filters="",
+            filter_params=[],
+            dry_run=True,
+        )
+
+        call_args = mock_reparse.call_args[0]
+        assert call_args[4] is None
+
+
+# ---------------------------------------------------------------------------
+# run_reingest — LLM client creation
+# ---------------------------------------------------------------------------
+
+
+class TestRunReingestLLM:
+    """Tests for LLM client creation in run_reingest."""
+
+    @patch("reingest_from_s3.boto3")
+    @patch("reingest_from_s3.psycopg")
+    @patch("reingest_from_s3.reingest_batch")
+    def test_no_llm_flag_disables_llm(
+        self,
+        mock_batch: MagicMock,
+        mock_psycopg: MagicMock,
+        mock_boto3: MagicMock,
+    ) -> None:
+        """no_llm=True prevents LLM client creation even with API key set."""
+        mock_conn = MagicMock()
+        mock_conn.__enter__ = MagicMock(return_value=mock_conn)
+        mock_conn.__exit__ = MagicMock(return_value=False)
+        mock_psycopg.connect.return_value = mock_conn
+        mock_batch.return_value = (0, 0, _DEFAULT_CURSOR)
+
+        with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "test-key"}):
+            reingest.run_reingest("postgresql://test", no_llm=True)
+
+        batch_call = mock_batch.call_args_list[0]
+        assert batch_call.kwargs.get("anthropic_client") is None
+
+    @patch("reingest_from_s3.boto3")
+    @patch("reingest_from_s3.psycopg")
+    @patch("reingest_from_s3.reingest_batch")
+    def test_no_api_key_disables_llm(
+        self,
+        mock_batch: MagicMock,
+        mock_psycopg: MagicMock,
+        mock_boto3: MagicMock,
+    ) -> None:
+        """Without ANTHROPIC_API_KEY, anthropic_client is None."""
+        mock_conn = MagicMock()
+        mock_conn.__enter__ = MagicMock(return_value=mock_conn)
+        mock_conn.__exit__ = MagicMock(return_value=False)
+        mock_psycopg.connect.return_value = mock_conn
+        mock_batch.return_value = (0, 0, _DEFAULT_CURSOR)
+
+        with patch.dict(os.environ, {}, clear=True):
+            # Ensure ANTHROPIC_API_KEY is not set
+            os.environ.pop("ANTHROPIC_API_KEY", None)
+            reingest.run_reingest("postgresql://test")
+
+        batch_call = mock_batch.call_args_list[0]
+        assert batch_call.kwargs.get("anthropic_client") is None
+
+    @patch("reingest_from_s3.boto3")
+    @patch("reingest_from_s3.psycopg")
+    @patch("reingest_from_s3.reingest_batch")
+    def test_api_key_creates_client(
+        self,
+        mock_batch: MagicMock,
+        mock_psycopg: MagicMock,
+        mock_boto3: MagicMock,
+    ) -> None:
+        """With ANTHROPIC_API_KEY set, an Anthropic client is created and passed."""
+        mock_conn = MagicMock()
+        mock_conn.__enter__ = MagicMock(return_value=mock_conn)
+        mock_conn.__exit__ = MagicMock(return_value=False)
+        mock_psycopg.connect.return_value = mock_conn
+        mock_batch.return_value = (0, 0, _DEFAULT_CURSOR)
+
+        with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "test-key-123"}):
+            reingest.run_reingest("postgresql://test")
+
+        batch_call = mock_batch.call_args_list[0]
+        client = batch_call.kwargs.get("anthropic_client")
+        assert client is not None
+
+
+# ---------------------------------------------------------------------------
+# CLI --no-llm flag tests
+# ---------------------------------------------------------------------------
+
+
+class TestCLINoLLMFlag:
+    """Tests that --no-llm CLI flag is properly parsed."""
+
+    def test_parser_has_no_llm_arg(self) -> None:
+        """The argument parser accepts --no-llm."""
+        import argparse
+
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--no-llm", action="store_true")
+        args = parser.parse_args(["--no-llm"])
+        assert args.no_llm is True
+
+    def test_parser_default_no_llm_is_false(self) -> None:
+        """Default --no-llm is False (LLM enabled by default)."""
+        import argparse
+
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--no-llm", action="store_true")
+        args = parser.parse_args([])
+        assert args.no_llm is False
