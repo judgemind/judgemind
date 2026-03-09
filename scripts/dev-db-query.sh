@@ -14,6 +14,7 @@
 # Usage:
 #   scripts/dev-db-query.sh "SELECT COUNT(*) FROM rulings"
 #   scripts/dev-db-query.sh "SELECT id, case_number FROM rulings LIMIT 5"
+#   scripts/dev-db-query.sh "SELECT * FROM courts WHERE state = 'CA'"
 #
 # For an interactive psql session (no query argument):
 #   scripts/dev-db-query.sh
@@ -55,6 +56,10 @@ echo "Running query on dev database via ECS Exec..." >&2
 echo "Task: $task_arn" >&2
 echo "" >&2
 
+# Base64-encode the query to avoid quoting issues with single/double quotes
+# in SQL (e.g. WHERE status = 'active'). The Python one-liner decodes it.
+query_b64=$(printf '%s' "$query" | base64 | tr -d '\n')
+
 # Use Python + psycopg (already installed in the container) instead of psql
 aws ecs execute-command \
     --cluster "$CLUSTER" \
@@ -62,4 +67,4 @@ aws ecs execute-command \
     --container "$CONTAINER" \
     --interactive \
     --region "$REGION" \
-    --command "python3 -c \"import os,psycopg,json;c=psycopg.connect(os.environ['DATABASE_URL']);r=c.cursor();r.execute('$query');cols=[d[0] for d in r.description];rows=[dict(zip(cols,row)) for row in r.fetchall()];print(json.dumps(rows,indent=2,default=str))\""
+    --command "python3 -c \"import os,psycopg,json,base64;q=base64.b64decode('${query_b64}').decode();c=psycopg.connect(os.environ['DATABASE_URL']);r=c.cursor();r.execute(q);cols=[d[0] for d in r.description];rows=[dict(zip(cols,row)) for row in r.fetchall()];print(json.dumps(rows,indent=2,default=str))\""
