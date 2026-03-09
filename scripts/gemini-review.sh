@@ -63,11 +63,11 @@ for venv_dir in "${WORKTREE}"/packages/*/.venv/bin/python3; do
     fi
 done
 
-# Check if google-genai is available
+# Check if google-genai is available; install from scripts/requirements.txt if not
 if ! "$PYTHON" -c "from google import genai" 2>/dev/null; then
-    echo "WARNING: google-genai not available. Installing temporarily..." >&2
-    "$PYTHON" -m pip install google-genai --quiet 2>/dev/null || {
-        echo "WARNING: Could not install google-genai. Skipping Gemini review." >&2
+    echo "INFO: google-genai not found in current Python. Installing from scripts/requirements.txt..." >&2
+    "$PYTHON" -m pip install -r "${SCRIPT_DIR}/requirements.txt" --quiet 2>/dev/null || {
+        echo "WARNING: Could not install script dependencies. Skipping Gemini review." >&2
         echo "SKIPPED" > "${STATE_DIR}/gemini-review-result.txt"
         echo "Gemini review skipped: google-genai package not available." > "${STATE_DIR}/gemini-feedback.md"
         exit 2
