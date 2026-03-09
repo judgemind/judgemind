@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from io import BytesIO
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -130,10 +130,15 @@ class TestIndexDocument:
 
 
 class TestIndexBatch:
-    def test_indexes_multiple_documents(
-        self, consumer: IndexingConsumer, mock_opensearch: MagicMock
+    @patch("framework.search.indexer.helpers.bulk")
+    def test_indexes_multiple_documents_via_bulk(
+        self,
+        mock_bulk: MagicMock,
+        consumer: IndexingConsumer,
+        mock_opensearch: MagicMock,
     ) -> None:
         mock_opensearch.get.side_effect = Exception("not found")
+        mock_bulk.return_value = (3, 0)
 
         events = [
             {
@@ -148,14 +153,27 @@ class TestIndexBatch:
         ]
 
         count = consumer.index_batch(events)
-        assert count == 3
 
-    def test_continues_on_failure(
-        self, consumer: IndexingConsumer, mock_opensearch: MagicMock
+        assert count == 3
+        mock_bulk.assert_called_once()
+        # Verify the actions passed to bulk have the right structure
+        call_args = mock_bulk.call_args
+        actions = call_args[0][1]  # second positional arg
+        assert len(actions) == 3
+        assert actions[0]["_op_type"] == "index"
+        assert actions[0]["_id"] == "doc-0"
+        assert actions[0]["_source"]["case_number"] == "BC0"
+
+    @patch("framework.search.indexer.helpers.bulk")
+    def test_bulk_reports_partial_failures(
+        self,
+        mock_bulk: MagicMock,
+        consumer: IndexingConsumer,
+        mock_opensearch: MagicMock,
     ) -> None:
-        # First call fails, second succeeds
         mock_opensearch.get.side_effect = Exception("not found")
-        mock_opensearch.index.side_effect = [Exception("write error"), None]
+        # 1 success, 1 failure
+        mock_bulk.return_value = (1, 1)
 
         events = [
             {
@@ -179,22 +197,96 @@ class TestIndexBatch:
         count = consumer.index_batch(events)
         assert count == 1
 
+    @patch("framework.search.indexer.helpers.bulk")
+    def test_skips_already_indexed_documents_in_batch(
+        self,
+        mock_bulk: MagicMock,
+        consumer: IndexingConsumer,
+        mock_opensearch: MagicMock,
+    ) -> None:
+        # First doc already indexed with same hash, second is new
+        mock_opensearch.get.side_effect = [
+            {"_source": {"content_hash": "existing_hash"}},
+            Exception("not found"),
+        ]
+        mock_bulk.return_value = (1, 0)
+
+        events = [
+            {
+                "document_id": "doc-existing",
+                "case_number": "BC1",
+                "court": "Test",
+                "county": "Test",
+                "state": "CA",
+                "content_hash": "existing_hash",
+            },
+            {
+                "document_id": "doc-new",
+                "case_number": "BC2",
+                "court": "Test",
+                "county": "Test",
+                "state": "CA",
+                "content_hash": "new_hash",
+            },
+        ]
+
+        count = consumer.index_batch(events)
+        assert count == 1
+        # Only one action sent to bulk (the new doc)
+        actions = mock_bulk.call_args[0][1]
+        assert len(actions) == 1
+        assert actions[0]["_id"] == "doc-new"
+
+    def test_returns_zero_when_all_skipped(
+        self,
+        consumer: IndexingConsumer,
+        mock_opensearch: MagicMock,
+    ) -> None:
+        # All docs already indexed
+        mock_opensearch.get.return_value = {"_source": {"content_hash": "same_hash"}}
+
+        events = [
+            {
+                "document_id": "doc-1",
+                "case_number": "BC1",
+                "court": "Test",
+                "county": "Test",
+                "state": "CA",
+                "content_hash": "same_hash",
+            },
+        ]
+
+        count = consumer.index_batch(events)
+        assert count == 0
+
 
 class TestLambdaHandler:
+    @patch("framework.search.indexer.helpers.bulk")
     def test_handles_single_event(
-        self, consumer: IndexingConsumer, mock_opensearch: MagicMock, sample_event: dict
+        self,
+        mock_bulk: MagicMock,
+        consumer: IndexingConsumer,
+        mock_opensearch: MagicMock,
+        sample_event: dict,
     ) -> None:
         mock_opensearch.get.side_effect = Exception("not found")
+        mock_bulk.return_value = (1, 0)
 
         result = consumer.lambda_handler(sample_event)
 
         assert result["total"] == 1
         assert result["indexed"] == 1
 
+    @patch("framework.search.indexer.helpers.bulk")
     def test_handles_sqs_records(
-        self, consumer: IndexingConsumer, mock_opensearch: MagicMock, sample_event: dict
+        self,
+        mock_bulk: MagicMock,
+        consumer: IndexingConsumer,
+        mock_opensearch: MagicMock,
+        sample_event: dict,
     ) -> None:
         mock_opensearch.get.side_effect = Exception("not found")
+        mock_bulk.return_value = (1, 0)
 
         sqs_event = {
             "Records": [

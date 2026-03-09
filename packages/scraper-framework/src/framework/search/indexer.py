@@ -33,6 +33,8 @@ import logging
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
+from opensearchpy import helpers
+
 from .mapping import TENTATIVE_RULINGS_ALIAS, create_index
 
 if TYPE_CHECKING:
@@ -85,37 +87,11 @@ class IndexingConsumer:
         Returns True if the document was indexed (new or updated),
         False if skipped (same content_hash already indexed).
         """
-        document_id = event["document_id"]
-        content_hash = event.get("content_hash", "")
-        s3_key = event.get("s3_key")
-
-        # Check if already indexed with same hash (idempotency)
-        if content_hash and self._already_indexed(document_id, content_hash):
-            logger.debug(
-                "Document %s already indexed with hash %s, skipping",
-                document_id,
-                content_hash[:12],
-            )
+        os_doc = self._build_os_doc(event)
+        if os_doc is None:
             return False
 
-        # Use ruling_text from the event if available (scraper already parsed it);
-        # fall back to fetching raw content from S3 when it's absent.
-        ruling_text = event.get("ruling_text") or (self._fetch_text(s3_key) if s3_key else "")
-
-        # Build OpenSearch document
-        os_doc = {
-            "case_number": event.get("case_number"),
-            "court": event.get("court"),
-            "county": event.get("county"),
-            "state": event.get("state"),
-            "judge_name": event.get("judge_name"),
-            "hearing_date": event.get("hearing_date"),
-            "ruling_text": ruling_text,
-            "document_id": document_id,
-            "s3_key": s3_key,
-            "content_hash": content_hash,
-            "indexed_at": datetime.now(UTC).isoformat(),
-        }
+        document_id = event["document_id"]
 
         self._os.index(
             index=self._index,
@@ -132,19 +108,50 @@ class IndexingConsumer:
         return True
 
     def index_batch(self, events: list[dict[str, Any]]) -> int:
-        """Index a batch of documents. Returns the count of documents indexed."""
-        indexed = 0
+        """Index a batch of documents using the OpenSearch bulk API.
+
+        Reduces N HTTP round-trips to 1 per batch. Individual document
+        errors are logged but do not prevent other documents from being
+        indexed.
+
+        Returns the count of documents successfully indexed.
+        """
+        actions: list[dict[str, Any]] = []
         for event in events:
             try:
-                if self.index_document(event):
-                    indexed += 1
+                os_doc = self._build_os_doc(event)
+                if os_doc is not None:
+                    actions.append(
+                        {
+                            "_op_type": "index",
+                            "_index": self._index,
+                            "_id": event["document_id"],
+                            "_source": os_doc,
+                        }
+                    )
             except Exception as exc:
                 logger.error(
-                    "Failed to index document %s: %s",
+                    "Failed to build document %s: %s",
                     event.get("document_id", "unknown"),
                     exc,
                 )
-        return indexed
+
+        if not actions:
+            return 0
+
+        success, errors = helpers.bulk(
+            self._os,
+            actions,
+            stats_only=True,
+            raise_on_error=False,
+        )
+
+        if errors:
+            logger.error("Bulk indexing had %d failures out of %d actions", errors, len(actions))
+
+        skipped = len(events) - len(actions)
+        logger.info("Bulk indexed %d documents (%d skipped, %d failed)", success, skipped, errors)
+        return success
 
     # ------------------------------------------------------------------
     # Lambda handler interface
@@ -234,6 +241,43 @@ class IndexingConsumer:
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    def _build_os_doc(self, event: dict[str, Any]) -> dict[str, Any] | None:
+        """Build an OpenSearch document from an event, or return None to skip.
+
+        Returns None if the document is already indexed with the same
+        content_hash (idempotency check).
+        """
+        document_id = event["document_id"]
+        content_hash = event.get("content_hash", "")
+        s3_key = event.get("s3_key")
+
+        # Idempotency: skip if already indexed with the same hash
+        if content_hash and self._already_indexed(document_id, content_hash):
+            logger.debug(
+                "Document %s already indexed with hash %s, skipping",
+                document_id,
+                content_hash[:12],
+            )
+            return None
+
+        # Use ruling_text from the event if available (scraper already parsed it);
+        # fall back to fetching raw content from S3 when it's absent.
+        ruling_text = event.get("ruling_text") or (self._fetch_text(s3_key) if s3_key else "")
+
+        return {
+            "case_number": event.get("case_number"),
+            "court": event.get("court"),
+            "county": event.get("county"),
+            "state": event.get("state"),
+            "judge_name": event.get("judge_name"),
+            "hearing_date": event.get("hearing_date"),
+            "ruling_text": ruling_text,
+            "document_id": document_id,
+            "s3_key": s3_key,
+            "content_hash": content_hash,
+            "indexed_at": datetime.now(UTC).isoformat(),
+        }
 
     def _already_indexed(self, document_id: str, content_hash: str) -> bool:
         """Check if a document with the same content_hash is already indexed."""
