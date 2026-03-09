@@ -321,6 +321,33 @@ class TestExtractJudgeName:
 
     # --- Edge cases and false-positive prevention ---
 
+    # --- ALL-CAPS "JUDGE NAME" pattern (#401) ---
+
+    def test_la_allcaps_dept_judge(self) -> None:
+        """LA header: 'DEPARTMENT 56 JUDGE STEVEN A. ELLIS' in ALL CAPS (#401)."""
+        text = "DEPARTMENT 56 JUDGE STEVEN A. ELLIS\nCase Number: 24NNCV02551"
+        assert extract_judge_name(text) == "STEVEN A. ELLIS"
+
+    def test_la_allcaps_judge_no_middle_initial(self) -> None:
+        """ALL-CAPS judge name without middle initial."""
+        text = "DEPARTMENT 72 JUDGE DAVID SOTELO\nHearing on motion"
+        assert extract_judge_name(text) == "DAVID SOTELO"
+
+    def test_la_allcaps_judge_without_department(self) -> None:
+        """ALL-CAPS 'JUDGE NAME' without DEPARTMENT prefix."""
+        text = "JUDGE MARK MOONEY\nThe motion is granted."
+        assert extract_judge_name(text) == "MARK MOONEY"
+
+    def test_la_allcaps_judge_hyphenated_surname(self) -> None:
+        """ALL-CAPS judge with hyphenated surname."""
+        text = "DEPARTMENT 3 JUDGE MARIA CHEN-RAMIREZ\nCase Number: 24STCV00123"
+        assert extract_judge_name(text) == "MARIA CHEN-RAMIREZ"
+
+    def test_la_allcaps_judge_multiple_middle_initials(self) -> None:
+        """ALL-CAPS judge with multiple middle initials."""
+        text = "DEPARTMENT 61 JUDGE JAMES R. B. SMITH\nMotion denied."
+        assert extract_judge_name(text) == "JAMES R. B. SMITH"
+
     def test_no_false_positive_on_judge_word_in_ruling(self) -> None:
         """The word 'judge' in ruling body text should not trigger a match."""
         text = "The judge granted the motion."

@@ -213,6 +213,22 @@ _JUDGE_NAME_PATTERNS: list[re.Pattern[str]] = [
         r")"
         r"(?![ ]+of\b)",  # exclude "Judge X of the Superior Court"
     ),
+    # LA ALL-CAPS header: "DEPARTMENT 56 JUDGE STEVEN A. ELLIS" (#401)
+    # Matches "JUDGE FIRST [M.] LAST" in ALL-CAPS, typically preceded by
+    # "DEPARTMENT <number>".  Requires at least first + last name in uppercase.
+    # Case-sensitive: only matches ALL-CAPS names to avoid false positives on
+    # phrases like "judge decided the case".
+    re.compile(
+        r"(?:DEPARTMENT\s+\S+\s+)?"
+        r"JUDGE\s+"
+        r"(?P<judge_name>"
+        r"[A-Z]{2,}"  # first name (all caps, 2+ chars)
+        r"(?:\s+[A-Z]\.?)*"  # optional middle initials
+        r"\s+[A-Z]{2,}"  # last name (all caps, 2+ chars)
+        r"(?:-[A-Z]{2,})?"  # optional hyphenated surname
+        r")"
+        r"(?!\s+[Oo][Ff]\b)",  # exclude "JUDGE X OF the Superior Court"
+    ),
 ]
 
 
