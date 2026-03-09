@@ -22,10 +22,12 @@ from courts.ca.la_tentatives import (
     _extract_parties,
     _extract_parties_from_anchor,
     _extract_ruling_fields,
+    _is_corporate_suffix,
     _is_stale_viewstate_response,
     _parse_dropdown_options,
     _parse_option,
     _split_cases_html,
+    _split_party_names,
     default_config,
 )
 from framework import ContentFormat
@@ -793,3 +795,60 @@ def test_extract_parties_names_are_title_cased() -> None:
     for party in parties:
         # Title case: first letter of each word capitalized
         assert party["name"] == party["name"].title()
+
+
+# ---------------------------------------------------------------------------
+# _split_party_names — corporate suffix handling (#328)
+# ---------------------------------------------------------------------------
+
+
+def test_split_party_names_corporate_suffix_kept() -> None:
+    """Corporate suffixes (Inc, LLC, etc.) must stay with the preceding name."""
+    result = _split_party_names("Techno-Advanced, Inc.")
+    assert result == ["Techno-Advanced, Inc."]
+
+
+def test_split_party_names_multiple_with_suffix() -> None:
+    """Multiple parties where one has a corporate suffix."""
+    result = _split_party_names("John Smith, Techno-Advanced, Inc., Jane Doe")
+    assert "Techno-Advanced, Inc." in result
+    assert "John Smith" in result
+    assert "Jane Doe" in result
+    assert len(result) == 3
+
+
+def test_split_party_names_llc_suffix() -> None:
+    result = _split_party_names("Acme, LLC")
+    assert result == ["Acme, LLC"]
+
+
+def test_split_party_names_corp_suffix() -> None:
+    result = _split_party_names("Big Company, Corp.")
+    assert result == ["Big Company, Corp."]
+
+
+def test_split_party_names_no_suffix() -> None:
+    """Regular comma-separated names should still split normally."""
+    result = _split_party_names("John Smith, Jane Doe, Bob Brown")
+    assert len(result) == 3
+
+
+def test_split_party_names_oxford_comma_with_suffix() -> None:
+    """Oxford comma pattern with a corporate suffix."""
+    result = _split_party_names("John Smith, Acme, Inc., and Jane Doe")
+    assert "John Smith" in result
+    assert "Acme, Inc." in result
+    assert "Jane Doe" in result
+
+
+def test_is_corporate_suffix() -> None:
+    """Verify _is_corporate_suffix recognizes common suffixes."""
+    assert _is_corporate_suffix("Inc") is True
+    assert _is_corporate_suffix("Inc.") is True
+    assert _is_corporate_suffix("LLC") is True
+    assert _is_corporate_suffix("Corp") is True
+    assert _is_corporate_suffix("Ltd") is True
+    assert _is_corporate_suffix("L.P.") is True
+    assert _is_corporate_suffix("LP") is True
+    assert _is_corporate_suffix("Smith") is False
+    assert _is_corporate_suffix("John") is False

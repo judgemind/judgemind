@@ -474,6 +474,117 @@ def extract_hearing_date(ruling_text: str) -> date | None:
     return None
 
 
+# ---------------------------------------------------------------------------
+# Party extraction from case captions
+# ---------------------------------------------------------------------------
+
+# Corporate suffixes that must not be split from the preceding name when
+# the caption is comma-separated.  Matches with or without trailing period.
+_CORPORATE_SUFFIX_RE = re.compile(
+    r"^(?:Inc|LLC|Corp|Corporation|Ltd|L\.?P\.?|N\.?A\.?"
+    r"|Co|PA|PC|PLLC|LLP|DBA|GP)\.?$",
+    re.IGNORECASE,
+)
+
+# Pattern to extract "Plaintiff(s) v. Defendant(s)" from a case title string.
+_CAPTION_VS_RE = re.compile(
+    r"^(?P<plaintiff_side>.+?)"
+    r"\s+v[Ss]?\.?\s+"
+    r"(?P<defendant_side>.+)$",
+)
+
+# Suffixes to strip from each side (et al., etc.)
+_ET_AL_RE = re.compile(r",?\s*et\s+al\.?\s*$", re.IGNORECASE)
+
+
+def _split_caption_names(text: str) -> list[str]:
+    """Split a caption side (e.g. "Caldera, et al.") into individual names.
+
+    Handles comma-separated lists while keeping corporate suffixes attached
+    to the preceding entity name (e.g. "Techno-Advanced, Inc." stays intact).
+    """
+    # Strip "et al." before splitting
+    text = _ET_AL_RE.sub("", text).strip()
+    if not text:
+        return []
+
+    # Split on ", and " (Oxford comma) or ", "
+    raw_parts = re.split(r",\s+and\s+|,\s+", text)
+    if len(raw_parts) == 1:
+        raw_parts = re.split(r"\s+and\s+", text)
+
+    # Reassemble corporate suffixes onto the preceding name
+    parts: list[str] = []
+    for fragment in raw_parts:
+        fragment = fragment.strip().strip(")(,.; ")
+        if not fragment:
+            continue
+        if parts and _CORPORATE_SUFFIX_RE.match(fragment):
+            parts[-1] = f"{parts[-1]}, {fragment}"
+        else:
+            parts.append(fragment)
+
+    return [p for p in parts if len(p) >= 2]
+
+
+def _is_name_fragment(name: str) -> bool:
+    """Return True if *name* looks like a fragment rather than a complete name.
+
+    Fragments are single tokens shorter than 4 characters that are not
+    recognizable abbreviations (like "Jr" or initials).
+    """
+    stripped = name.strip().rstrip(".")
+    # Single very short token with no spaces — likely a fragment
+    if " " not in stripped and len(stripped) < 3:
+        return True
+    # Corporate suffix on its own is a fragment
+    if _CORPORATE_SUFFIX_RE.match(stripped):
+        return True
+    return False
+
+
+def extract_parties_from_caption(case_title: str) -> list[dict[str, str]]:
+    """Extract party names and roles from a case title / caption string.
+
+    Parses "Plaintiff v. Defendant" style captions and returns a list of
+    party dicts with ``name`` and ``role`` keys.  This is a fallback used
+    by the ingestion pipeline when the scraper does not provide structured
+    party data.
+
+    Corporate suffixes (Inc, LLC, Corp, etc.) are kept with their parent
+    entity name.  Name fragments are filtered out.
+
+    Returns an empty list if the caption cannot be parsed.
+    """
+    if not case_title:
+        return []
+
+    m = _CAPTION_VS_RE.match(case_title.strip())
+    if m is None:
+        return []
+
+    parties: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+
+    for side, role in [
+        (m.group("plaintiff_side"), "plaintiff"),
+        (m.group("defendant_side"), "defendant"),
+    ]:
+        names = _split_caption_names(side)
+        for name in names:
+            # Title-case normalization
+            name = name.strip().rstrip(".,;: ")
+            if not name or _is_name_fragment(name):
+                continue
+            key = (name.lower(), role)
+            if key in seen:
+                continue
+            seen.add(key)
+            parties.append({"name": name, "role": role})
+
+    return parties
+
+
 def extract_judge_name(ruling_text: str) -> str | None:
     """Extract a judge name from ruling text using court-specific regex patterns.
 

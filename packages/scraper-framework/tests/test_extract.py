@@ -10,6 +10,7 @@ from ingestion.extract import (
     extract_judge_name,
     extract_motion_type,
     extract_outcome,
+    extract_parties_from_caption,
 )
 
 # ---------------------------------------------------------------------------
@@ -722,3 +723,93 @@ class TestExtractCaseTitle:
         assert result is not None
         assert "McDonald" in result
         assert "O'Brien" in result
+
+
+# ---------------------------------------------------------------------------
+# Party extraction from case captions
+# ---------------------------------------------------------------------------
+
+
+class TestExtractPartiesFromCaption:
+    """Tests for extract_parties_from_caption()."""
+
+    def test_simple_v_separator(self) -> None:
+        """Basic 'Plaintiff v. Defendant' caption."""
+        parties = extract_parties_from_caption("Smith v. Jones")
+        assert len(parties) == 2
+        assert parties[0] == {"name": "Smith", "role": "plaintiff"}
+        assert parties[1] == {"name": "Jones", "role": "defendant"}
+
+    def test_et_al_stripped(self) -> None:
+        """'et al.' is stripped but the primary name is kept."""
+        parties = extract_parties_from_caption("Caldera, et al. v. Techno-Advanced, Inc., et al.")
+        assert any(p["role"] == "plaintiff" for p in parties)
+        assert any(p["role"] == "defendant" for p in parties)
+        # Caldera should be a plaintiff
+        plaintiff_names = [p["name"] for p in parties if p["role"] == "plaintiff"]
+        assert any("Caldera" in n for n in plaintiff_names)
+        # Techno-Advanced, Inc. should be a defendant (not split)
+        defendant_names = [p["name"] for p in parties if p["role"] == "defendant"]
+        assert any("Techno-Advanced" in n for n in defendant_names)
+
+    def test_corporate_suffix_not_split(self) -> None:
+        """Inc, LLC, Corp etc. should stay with the preceding entity name."""
+        parties = extract_parties_from_caption("Acme, Inc. v. Beta, LLC")
+        assert len(parties) == 2
+        assert "Inc" in parties[0]["name"]  # kept together
+        assert "LLC" in parties[1]["name"]  # kept together
+        # Verify no standalone "Inc" or "LLC" entries
+        names = [p["name"] for p in parties]
+        assert "Inc" not in names
+        assert "LLC" not in names
+        assert "Inc." not in names
+        assert "LLC." not in names
+
+    def test_multiple_defendants(self) -> None:
+        """Multiple defendants separated by commas."""
+        parties = extract_parties_from_caption("Smith v. Jones, Williams, and Brown")
+        defendants = [p for p in parties if p["role"] == "defendant"]
+        assert len(defendants) == 3
+
+    def test_name_fragment_filtered(self) -> None:
+        """Single-character or very short fragments are filtered out."""
+        parties = extract_parties_from_caption("A v. Jones")
+        # "A" is too short to be a valid party name
+        assert len(parties) == 1
+        assert parties[0]["name"] == "Jones"
+
+    def test_empty_input(self) -> None:
+        assert extract_parties_from_caption("") == []
+        assert extract_parties_from_caption("No caption here") == []
+
+    def test_vs_variant(self) -> None:
+        """Handles 'vs.' and 'vs' separators."""
+        parties = extract_parties_from_caption("Smith vs. Jones")
+        assert len(parties) == 2
+        parties2 = extract_parties_from_caption("Smith vs Jones")
+        assert len(parties2) == 2
+
+    def test_deduplicated(self) -> None:
+        """Same name on both sides should not produce duplicates."""
+        parties = extract_parties_from_caption("Smith v. Smith")
+        assert len(parties) == 2  # same name, different roles
+
+    def test_issue_328_regression(self) -> None:
+        """Regression test for issue #328: Caldera v. Techno-Advanced, Inc.
+
+        Previously produced fragments: Inc, Salvador, Techno-Advanced as
+        separate entries, all classified as 'other'.
+        """
+        title = "Caldera, et al. v. Techno-Advanced, Inc., et al"
+        parties = extract_parties_from_caption(title)
+        names = [p["name"] for p in parties]
+
+        # "Inc" must not appear as a standalone entry
+        assert "Inc" not in names
+        assert "Inc." not in names
+
+        # Roles must be plaintiff/defendant, not "other"
+        roles = {p["role"] for p in parties}
+        assert "other" not in roles
+        assert "plaintiff" in roles
+        assert "defendant" in roles
