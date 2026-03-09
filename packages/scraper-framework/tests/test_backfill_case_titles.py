@@ -10,6 +10,7 @@ import importlib
 import os
 import sys
 import uuid
+from datetime import datetime
 from unittest.mock import MagicMock, patch
 
 _SCRIPTS_DIR = os.path.join(
@@ -309,6 +310,10 @@ class TestExtractFromCaseNameField:
 # ---------------------------------------------------------------------------
 
 
+_DEFAULT_CURSOR = (backfill._CURSOR_MIN_TIMESTAMP, backfill._CURSOR_MIN_UUID)
+_CREATED_AT = datetime(2026, 3, 1, 10, 0, 0)
+
+
 class TestBackfillBatch:
     """Tests for backfill_batch()."""
 
@@ -319,15 +324,18 @@ class TestBackfillBatch:
         conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
         cur.fetchall.return_value = []
 
-        processed, updated = backfill.backfill_batch(conn, batch_size=10, offset=0)
+        processed, updated, next_cursor = backfill.backfill_batch(
+            conn, batch_size=10, cursor=_DEFAULT_CURSOR
+        )
         assert processed == 0
         assert updated == 0
+        assert next_cursor == _DEFAULT_CURSOR
 
     def test_extracts_title_and_updates(self) -> None:
         """Case with ruling text containing party names gets updated."""
         case_id = str(uuid.uuid4())
         ruling_text = "JOHN SMITH,\n  Plaintiff(s),\n  vs.\nJANE DOE,\n  Defendant(s).\n"
-        row = (case_id, ruling_text)
+        row = (case_id, ruling_text, _CREATED_AT)
 
         conn = MagicMock()
         cur_fetch = MagicMock()
@@ -346,7 +354,9 @@ class TestBackfillBatch:
 
         conn.cursor.side_effect = cursor_ctx
 
-        processed, updated = backfill.backfill_batch(conn, batch_size=10, offset=0)
+        processed, updated, _cursor = backfill.backfill_batch(
+            conn, batch_size=10, cursor=_DEFAULT_CURSOR
+        )
 
         assert processed == 1
         assert updated == 1
@@ -362,7 +372,7 @@ class TestBackfillBatch:
         """Case with ruling text that has no party names is skipped."""
         case_id = str(uuid.uuid4())
         ruling_text = "The court sets a case management conference for April 1."
-        row = (case_id, ruling_text)
+        row = (case_id, ruling_text, _CREATED_AT)
 
         conn = MagicMock()
         cur_fetch = MagicMock()
@@ -373,7 +383,9 @@ class TestBackfillBatch:
         ctx.__exit__ = MagicMock(return_value=False)
         conn.cursor.return_value = ctx
 
-        processed, updated = backfill.backfill_batch(conn, batch_size=10, offset=0)
+        processed, updated, _cursor = backfill.backfill_batch(
+            conn, batch_size=10, cursor=_DEFAULT_CURSOR
+        )
 
         assert processed == 1
         assert updated == 0
@@ -399,8 +411,10 @@ class TestRunBackfill:
         mock_conn.__exit__ = MagicMock(return_value=False)
         mock_psycopg.connect.return_value = mock_conn
 
+        cursor_1 = (datetime(2026, 3, 1), str(uuid.uuid4()))
+        cursor_2 = (datetime(2026, 3, 2), str(uuid.uuid4()))
         # Two batches: first full, second partial (signals end)
-        mock_batch.side_effect = [(100, 80), (5, 3)]
+        mock_batch.side_effect = [(100, 80, cursor_1), (5, 3, cursor_2)]
 
         stats = backfill.run_backfill("postgresql://test", batch_size=100, dry_run=True)
 
@@ -422,8 +436,10 @@ class TestRunBackfill:
         mock_conn.__exit__ = MagicMock(return_value=False)
         mock_psycopg.connect.return_value = mock_conn
 
+        cursor_1 = (datetime(2026, 3, 1), str(uuid.uuid4()))
+        cursor_2 = (datetime(2026, 3, 2), str(uuid.uuid4()))
         # Two batches: first full, second partial (signals end)
-        mock_batch.side_effect = [(100, 80), (30, 20)]
+        mock_batch.side_effect = [(100, 80, cursor_1), (30, 20, cursor_2)]
 
         stats = backfill.run_backfill("postgresql://test", batch_size=100)
 
@@ -445,7 +461,8 @@ class TestRunBackfill:
         mock_conn.__exit__ = MagicMock(return_value=False)
         mock_psycopg.connect.return_value = mock_conn
 
-        mock_batch.side_effect = [(50, 40)]
+        cursor_1 = (datetime(2026, 3, 1), str(uuid.uuid4()))
+        mock_batch.side_effect = [(50, 40, cursor_1)]
 
         stats = backfill.run_backfill("postgresql://test", batch_size=100, limit=50)
 
@@ -453,3 +470,8 @@ class TestRunBackfill:
         call_args = mock_batch.call_args_list[0]
         assert call_args[0][1] == 50  # effective_batch = min(100, 50)
         assert stats["total_processed"] == 50
+
+    def test_query_uses_keyset_not_offset(self) -> None:
+        """The query must use keyset pagination, not OFFSET."""
+        assert "OFFSET" not in backfill.FETCH_QUERY
+        assert "(c.created_at, c.id) > (%s, %s)" in backfill.FETCH_QUERY

@@ -10,6 +10,7 @@ import importlib
 import os
 import sys
 import uuid
+from datetime import datetime
 from unittest.mock import MagicMock, patch
 
 _SCRIPTS_DIR = os.path.join(
@@ -28,16 +29,20 @@ backfill_parties = importlib.import_module("backfill_parties")
 # ---------------------------------------------------------------------------
 
 _COURT_ID = str(uuid.uuid4())
+_CREATED_AT = datetime(2026, 3, 1, 10, 0, 0)
+_DEFAULT_CURSOR = (backfill_parties._CURSOR_MIN_TIMESTAMP, backfill_parties._CURSOR_MIN_UUID)
 
 
 def _make_case_row(
     ruling_text: str,
+    created_at: datetime = _CREATED_AT,
 ) -> tuple:
     """Return a tuple matching the FETCH_QUERY columns."""
     return (
         str(uuid.uuid4()),  # c.id
         ruling_text,
         _COURT_ID,
+        created_at,  # c.created_at
     )
 
 
@@ -126,9 +131,12 @@ class TestBackfillBatch:
         conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
         cur.fetchall.return_value = []
 
-        processed, updated = backfill_parties.backfill_batch(conn, batch_size=10, offset=0)
+        processed, updated, next_cursor = backfill_parties.backfill_batch(
+            conn, batch_size=10, cursor=_DEFAULT_CURSOR
+        )
         assert processed == 0
         assert updated == 0
+        assert next_cursor == _DEFAULT_CURSOR
 
     def test_extracts_and_creates_parties(self) -> None:
         """Ruling text with a caption block produces party records."""
@@ -159,7 +167,9 @@ class TestBackfillBatch:
 
         conn.cursor.side_effect = cursor_ctx
 
-        processed, updated = backfill_parties.backfill_batch(conn, batch_size=10, offset=0)
+        processed, updated, _cursor = backfill_parties.backfill_batch(
+            conn, batch_size=10, cursor=_DEFAULT_CURSOR
+        )
 
         assert processed == 1
         assert updated == 1
@@ -178,7 +188,9 @@ class TestBackfillBatch:
         ctx.__exit__ = MagicMock(return_value=False)
         conn.cursor.return_value = ctx
 
-        processed, updated = backfill_parties.backfill_batch(conn, batch_size=10, offset=0)
+        processed, updated, _cursor = backfill_parties.backfill_batch(
+            conn, batch_size=10, cursor=_DEFAULT_CURSOR
+        )
 
         assert processed == 1
         assert updated == 0
@@ -204,7 +216,9 @@ class TestRunBackfill:
         mock_conn.__exit__ = MagicMock(return_value=False)
         mock_psycopg.connect.return_value = mock_conn
 
-        mock_batch.side_effect = [(100, 80), (5, 3)]
+        cursor_1 = (datetime(2026, 3, 1), str(uuid.uuid4()))
+        cursor_2 = (datetime(2026, 3, 2), str(uuid.uuid4()))
+        mock_batch.side_effect = [(100, 80, cursor_1), (5, 3, cursor_2)]
 
         stats = backfill_parties.run_backfill("postgresql://test", batch_size=100, dry_run=True)
 
@@ -225,7 +239,9 @@ class TestRunBackfill:
         mock_conn.__exit__ = MagicMock(return_value=False)
         mock_psycopg.connect.return_value = mock_conn
 
-        mock_batch.side_effect = [(100, 80), (30, 20)]
+        cursor_1 = (datetime(2026, 3, 1), str(uuid.uuid4()))
+        cursor_2 = (datetime(2026, 3, 2), str(uuid.uuid4()))
+        mock_batch.side_effect = [(100, 80, cursor_1), (30, 20, cursor_2)]
 
         stats = backfill_parties.run_backfill("postgresql://test", batch_size=100)
 
@@ -246,10 +262,16 @@ class TestRunBackfill:
         mock_conn.__exit__ = MagicMock(return_value=False)
         mock_psycopg.connect.return_value = mock_conn
 
-        mock_batch.side_effect = [(50, 40)]
+        cursor_1 = (datetime(2026, 3, 1), str(uuid.uuid4()))
+        mock_batch.side_effect = [(50, 40, cursor_1)]
 
         stats = backfill_parties.run_backfill("postgresql://test", batch_size=100, limit=50)
 
         call_args = mock_batch.call_args_list[0]
         assert call_args[0][1] == 50
         assert stats["total_processed"] == 50
+
+    def test_query_uses_keyset_not_offset(self) -> None:
+        """The query must use keyset pagination, not OFFSET."""
+        assert "OFFSET" not in backfill_parties.FETCH_QUERY
+        assert "(c.created_at, c.id) > (%s, %s)" in backfill_parties.FETCH_QUERY

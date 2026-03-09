@@ -56,6 +56,9 @@ logger = logging.getLogger(__name__)
 # Core backfill logic (importable for testing)
 # ---------------------------------------------------------------------------
 
+# Minimum cursor value for the first batch
+_CURSOR_MIN_UUID = "00000000-0000-0000-0000-000000000000"
+
 # Fetch all judges, joining with rulings to get ruling_text for re-extraction.
 # We look for judges whose rulings contain extractable judge names.
 FETCH_QUERY = """
@@ -64,8 +67,9 @@ FETCH_QUERY = """
     FROM judges j
     JOIN rulings r ON r.judge_id = j.id
     WHERE r.ruling_text IS NOT NULL
+    AND j.id > %s::uuid
     ORDER BY j.id
-    LIMIT %s OFFSET %s
+    LIMIT %s
 """
 
 UPDATE_JUDGE_QUERY = """
@@ -86,26 +90,31 @@ UPDATE_ALIAS_QUERY = """
 def backfill_batch(
     conn: psycopg.Connection,
     batch_size: int = 100,
-    offset: int = 0,
-) -> tuple[int, int]:
-    """Process one batch of judges.  Returns (processed, updated) counts."""
+    cursor: str = _CURSOR_MIN_UUID,
+) -> tuple[int, int, str]:
+    """Process one batch of judges.  Returns (processed, updated, next_cursor)."""
     processed = 0
     updated = 0
+    next_cursor = cursor
 
     with conn.cursor() as cur:
-        cur.execute(FETCH_QUERY, (batch_size, offset))
+        cur.execute(FETCH_QUERY, (cursor, batch_size))
         rows = cur.fetchall()
 
     if not rows:
-        return 0, 0
+        return 0, 0, cursor
 
     # Group rulings by judge_id — a judge may have multiple rulings
     judge_rulings: dict[str, list[tuple[str, str]]] = {}
+    last_judge_id: str = cursor
     for judge_id, canonical_name, ruling_text in rows:
         key = str(judge_id)
+        last_judge_id = key
         if key not in judge_rulings:
             judge_rulings[key] = []
         judge_rulings[key].append((str(canonical_name), ruling_text))
+
+    next_cursor = last_judge_id
 
     for judge_id, entries in judge_rulings.items():
         processed += 1
@@ -149,7 +158,7 @@ def backfill_batch(
 
         updated += 1
 
-    return processed, updated
+    return processed, updated, next_cursor
 
 
 def run_backfill(
@@ -162,7 +171,7 @@ def run_backfill(
     """Run the full backfill.  Returns summary stats."""
     total_processed = 0
     total_updated = 0
-    offset = 0
+    cursor: str = _CURSOR_MIN_UUID
 
     with psycopg.connect(dsn) as conn:
         while True:
@@ -173,7 +182,7 @@ def run_backfill(
                     break
                 effective_batch = min(batch_size, remaining)
 
-            processed, updated = backfill_batch(conn, effective_batch, offset)
+            processed, updated, cursor = backfill_batch(conn, effective_batch, cursor)
             total_processed += processed
             total_updated += updated
 
@@ -193,8 +202,6 @@ def run_backfill(
 
             if processed < effective_batch:
                 break
-
-            offset += effective_batch
 
     return {
         "total_processed": total_processed,

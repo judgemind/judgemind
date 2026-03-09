@@ -16,6 +16,8 @@ sys.path.insert(
     os.path.join(os.path.dirname(__file__), "..", "..", "..", "scripts"),
 )
 
+from dedup_rulings import _CURSOR_MIN_UUID  # noqa: E402
+
 
 def _make_mock_conn() -> MagicMock:
     """Return a mock psycopg connection with cursor context manager."""
@@ -102,10 +104,11 @@ def test_dedup_batch_deletes_duplicates() -> None:
 
     mock_conn.cursor.side_effect = cursor_factory
 
-    stats = dedup_batch(mock_conn, batch_size=100, offset=0)
+    stats, next_cursor = dedup_batch(mock_conn, batch_size=100, cursor=_CURSOR_MIN_UUID)
 
     assert stats["rulings_deleted"] == 2
     assert stats["documents_deleted"] == 2
+    assert next_cursor == "ruling-uuid-3"
 
 
 def test_dedup_batch_returns_zeros_when_no_duplicates() -> None:
@@ -115,10 +118,11 @@ def test_dedup_batch_returns_zeros_when_no_duplicates() -> None:
     mock_conn, mock_cur = _make_mock_conn()
     mock_cur.fetchall.return_value = []
 
-    stats = dedup_batch(mock_conn, batch_size=100, offset=0)
+    stats, next_cursor = dedup_batch(mock_conn, batch_size=100, cursor=_CURSOR_MIN_UUID)
 
     assert stats["rulings_deleted"] == 0
     assert stats["documents_deleted"] == 0
+    assert next_cursor == _CURSOR_MIN_UUID
 
 
 @patch("dedup_rulings.psycopg")
@@ -160,6 +164,9 @@ def test_run_dedup_dry_run_rolls_back(mock_psycopg: MagicMock) -> None:
         elif idx == 3:
             # DELETE FROM documents
             cur.rowcount = 3
+        elif idx == 4:
+            # Next batch: no more duplicates past cursor "r3"
+            cur.fetchall.return_value = []
         return ctx
 
     mock_conn.cursor.side_effect = cursor_factory
@@ -244,3 +251,11 @@ def test_run_dedup_commits_each_batch(mock_psycopg: MagicMock) -> None:
     assert stats["total_rulings_deleted"] == 2
     assert stats["total_documents_deleted"] == 1
     mock_conn.commit.assert_called()
+
+
+def test_query_uses_keyset_not_offset() -> None:
+    """The FIND_DUPLICATES_QUERY must use keyset pagination, not OFFSET."""
+    from dedup_rulings import FIND_DUPLICATES_QUERY
+
+    assert "OFFSET" not in FIND_DUPLICATES_QUERY
+    assert "id > %s::uuid" in FIND_DUPLICATES_QUERY

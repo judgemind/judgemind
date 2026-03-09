@@ -28,6 +28,7 @@ backfill = importlib.import_module("backfill_judge_names")
 # ---------------------------------------------------------------------------
 
 _JUDGE_ID = str(uuid.uuid4())
+_DEFAULT_CURSOR = backfill._CURSOR_MIN_UUID
 
 
 def _make_judge_row(
@@ -58,9 +59,12 @@ class TestBackfillBatch:
         conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
         cur.fetchall.return_value = []
 
-        processed, updated = backfill.backfill_batch(conn, batch_size=10, offset=0)
+        processed, updated, next_cursor = backfill.backfill_batch(
+            conn, batch_size=10, cursor=_DEFAULT_CURSOR
+        )
         assert processed == 0
         assert updated == 0
+        assert next_cursor == _DEFAULT_CURSOR
 
     def test_fixes_truncated_name(self) -> None:
         """Judge with truncated name gets updated when ruling text contains full name."""
@@ -88,7 +92,9 @@ class TestBackfillBatch:
 
         conn.cursor.side_effect = cursor_ctx
 
-        processed, updated = backfill.backfill_batch(conn, batch_size=10, offset=0)
+        processed, updated, _cursor = backfill.backfill_batch(
+            conn, batch_size=10, cursor=_DEFAULT_CURSOR
+        )
 
         assert processed == 1
         assert updated == 1
@@ -120,7 +126,9 @@ class TestBackfillBatch:
         ctx.__exit__ = MagicMock(return_value=False)
         conn.cursor.return_value = ctx
 
-        processed, updated = backfill.backfill_batch(conn, batch_size=10, offset=0)
+        processed, updated, _cursor = backfill.backfill_batch(
+            conn, batch_size=10, cursor=_DEFAULT_CURSOR
+        )
 
         assert processed == 1
         assert updated == 0
@@ -143,7 +151,9 @@ class TestBackfillBatch:
         ctx.__exit__ = MagicMock(return_value=False)
         conn.cursor.return_value = ctx
 
-        processed, updated = backfill.backfill_batch(conn, batch_size=10, offset=0)
+        processed, updated, _cursor = backfill.backfill_batch(
+            conn, batch_size=10, cursor=_DEFAULT_CURSOR
+        )
 
         assert processed == 1
         assert updated == 0
@@ -183,7 +193,9 @@ class TestBackfillBatch:
 
         conn.cursor.side_effect = cursor_ctx
 
-        processed, updated = backfill.backfill_batch(conn, batch_size=10, offset=0)
+        processed, updated, _cursor = backfill.backfill_batch(
+            conn, batch_size=10, cursor=_DEFAULT_CURSOR
+        )
 
         assert processed == 1
         assert updated == 1
@@ -216,7 +228,9 @@ class TestBackfillBatch:
 
         conn.cursor.side_effect = cursor_ctx
 
-        processed, updated = backfill.backfill_batch(conn, batch_size=10, offset=0)
+        processed, updated, _cursor = backfill.backfill_batch(
+            conn, batch_size=10, cursor=_DEFAULT_CURSOR
+        )
 
         assert processed == 1
         assert updated == 1
@@ -245,7 +259,9 @@ class TestRunBackfill:
         mock_conn.__exit__ = MagicMock(return_value=False)
         mock_psycopg.connect.return_value = mock_conn
 
-        mock_batch.side_effect = [(50, 10), (5, 1)]
+        cursor_1 = str(uuid.uuid4())
+        cursor_2 = str(uuid.uuid4())
+        mock_batch.side_effect = [(50, 10, cursor_1), (5, 1, cursor_2)]
 
         stats = backfill.run_backfill("postgresql://test", batch_size=50, dry_run=True)
 
@@ -266,7 +282,9 @@ class TestRunBackfill:
         mock_conn.__exit__ = MagicMock(return_value=False)
         mock_psycopg.connect.return_value = mock_conn
 
-        mock_batch.side_effect = [(50, 10), (20, 5)]
+        cursor_1 = str(uuid.uuid4())
+        cursor_2 = str(uuid.uuid4())
+        mock_batch.side_effect = [(50, 10, cursor_1), (20, 5, cursor_2)]
 
         stats = backfill.run_backfill("postgresql://test", batch_size=50)
 
@@ -287,10 +305,16 @@ class TestRunBackfill:
         mock_conn.__exit__ = MagicMock(return_value=False)
         mock_psycopg.connect.return_value = mock_conn
 
-        mock_batch.side_effect = [(25, 5)]
+        cursor_1 = str(uuid.uuid4())
+        mock_batch.side_effect = [(25, 5, cursor_1)]
 
         stats = backfill.run_backfill("postgresql://test", batch_size=100, limit=25)
 
         call_args = mock_batch.call_args_list[0]
         assert call_args[0][1] == 25  # effective_batch = min(100, 25)
         assert stats["total_processed"] == 25
+
+    def test_query_uses_keyset_not_offset(self) -> None:
+        """The query must use keyset pagination, not OFFSET."""
+        assert "OFFSET" not in backfill.FETCH_QUERY
+        assert "j.id > %s::uuid" in backfill.FETCH_QUERY

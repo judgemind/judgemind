@@ -52,6 +52,9 @@ logger = logging.getLogger(__name__)
 # Core dedup logic (importable for testing)
 # ---------------------------------------------------------------------------
 
+# Minimum cursor value for the first batch
+_CURSOR_MIN_UUID = "00000000-0000-0000-0000-000000000000"
+
 # Find duplicate groups: rulings that share (case_id, hearing_date, department)
 # and have more than one row. Returns the IDs to KEEP (oldest per group).
 FIND_DUPLICATES_QUERY = """
@@ -70,8 +73,9 @@ FIND_DUPLICATES_QUERY = """
     SELECT id, document_id
     FROM ranked
     WHERE rn > 1
-    ORDER BY case_id, hearing_date
-    LIMIT %s OFFSET %s
+    AND id > %s::uuid
+    ORDER BY id
+    LIMIT %s
 """
 
 # Count total duplicates (for progress reporting)
@@ -99,23 +103,25 @@ def count_duplicates(conn: psycopg.Connection) -> int:
 def dedup_batch(
     conn: psycopg.Connection,
     batch_size: int = 100,
-    offset: int = 0,
-) -> dict[str, int]:
+    cursor: str = _CURSOR_MIN_UUID,
+) -> tuple[dict[str, int], str]:
     """Delete one batch of duplicate rulings and their orphaned documents.
 
-    Returns a stats dict with keys: rulings_deleted, documents_deleted.
+    Returns (stats_dict, next_cursor) where stats has keys:
+    rulings_deleted, documents_deleted.
     """
     stats: dict[str, int] = {"rulings_deleted": 0, "documents_deleted": 0}
 
     with conn.cursor() as cur:
-        cur.execute(FIND_DUPLICATES_QUERY, (batch_size, offset))
+        cur.execute(FIND_DUPLICATES_QUERY, (cursor, batch_size))
         rows = cur.fetchall()
 
     if not rows:
-        return stats
+        return stats, cursor
 
     ruling_ids = [str(row[0]) for row in rows]
     document_ids = [str(row[1]) for row in rows]
+    next_cursor = ruling_ids[-1]
 
     # Delete duplicate rulings
     with conn.cursor() as cur:
@@ -138,7 +144,7 @@ def dedup_batch(
         )
         stats["documents_deleted"] = cur.rowcount
 
-    return stats
+    return stats, next_cursor
 
 
 def run_dedup(
@@ -160,10 +166,13 @@ def run_dedup(
         if dup_count == 0:
             return total
 
-        # Process in batches. Since we delete rows, always use offset=0
-        # (deleted rows shift the window).
+        # Process in batches using keyset pagination on ruling id.
+        # In non-dry-run mode, deleted rows are removed so the cursor
+        # still advances correctly. In dry-run mode, the cursor also
+        # advances (rows are rolled back but the cursor tracks position).
+        cursor: str = _CURSOR_MIN_UUID
         while True:
-            batch_stats = dedup_batch(conn, batch_size, offset=0)
+            batch_stats, cursor = dedup_batch(conn, batch_size, cursor)
 
             if batch_stats["rulings_deleted"] == 0:
                 break
@@ -180,10 +189,6 @@ def run_dedup(
                     total["total_rulings_deleted"],
                     total["total_documents_deleted"],
                 )
-                # In dry-run mode, the rows weren't actually deleted, so
-                # re-fetching offset=0 would return the same rows. Break
-                # after one batch to avoid an infinite loop.
-                break
             else:
                 conn.commit()
                 logger.info(

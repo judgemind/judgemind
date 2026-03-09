@@ -27,6 +27,7 @@ import argparse
 import logging
 import os
 import sys
+from datetime import datetime
 
 # Ensure the scraper-framework source is importable
 sys.path.insert(
@@ -51,14 +52,19 @@ logger = logging.getLogger(__name__)
 # Core backfill logic (importable for testing)
 # ---------------------------------------------------------------------------
 
+# Minimum cursor values for the first batch
+_CURSOR_MIN_TIMESTAMP = datetime(1970, 1, 1)
+_CURSOR_MIN_UUID = "00000000-0000-0000-0000-000000000000"
+
 FETCH_QUERY = """
     SELECT r.id, r.ruling_text, r.court_id, r.judge_id, r.outcome, r.motion_type,
-           r.case_id, r.hearing_date
+           r.case_id, r.hearing_date, r.created_at
     FROM rulings r
     WHERE r.ruling_text IS NOT NULL
       AND (r.judge_id IS NULL OR r.outcome IS NULL OR r.motion_type IS NULL)
-    ORDER BY r.created_at
-    LIMIT %s OFFSET %s
+    AND (r.created_at, r.id) > (%s, %s)
+    ORDER BY r.created_at, r.id
+    LIMIT %s
 """
 
 UPDATE_QUERY = """
@@ -73,18 +79,19 @@ UPDATE_QUERY = """
 def backfill_batch(
     conn: psycopg.Connection,
     batch_size: int = 100,
-    offset: int = 0,
-) -> tuple[int, int]:
-    """Process one batch of rulings.  Returns (processed, updated) counts."""
+    cursor: tuple[datetime, str] = (_CURSOR_MIN_TIMESTAMP, _CURSOR_MIN_UUID),
+) -> tuple[int, int, tuple[datetime, str]]:
+    """Process one batch of rulings.  Returns (processed, updated, next_cursor)."""
     processed = 0
     updated = 0
+    next_cursor = cursor
 
     with conn.cursor() as cur:
-        cur.execute(FETCH_QUERY, (batch_size, offset))
+        cur.execute(FETCH_QUERY, (cursor[0], cursor[1], batch_size))
         rows = cur.fetchall()
 
     if not rows:
-        return 0, 0
+        return 0, 0, cursor
 
     for (
         ruling_id,
@@ -95,8 +102,10 @@ def backfill_batch(
         existing_motion_type,
         case_id,
         hearing_date,
+        created_at,
     ) in rows:
         processed += 1
+        next_cursor = (created_at, str(ruling_id))
         new_outcome = None
         new_motion_type = None
         new_judge_id = None
@@ -135,7 +144,7 @@ def backfill_batch(
 
         updated += 1
 
-    return processed, updated
+    return processed, updated, next_cursor
 
 
 CASE_JUDGES_BACKFILL_QUERY = """
@@ -147,33 +156,36 @@ CASE_JUDGES_BACKFILL_QUERY = """
           SELECT 1 FROM case_judges cj
           WHERE cj.case_id = r.case_id AND cj.judge_id = r.judge_id
       )
+    AND r.case_id > %s::uuid
     ORDER BY r.case_id
-    LIMIT %s OFFSET %s
+    LIMIT %s
 """
 
 
 def backfill_case_judges_batch(
     conn: psycopg.Connection,
     batch_size: int = 100,
-    offset: int = 0,
-) -> int:
+    cursor: str = _CURSOR_MIN_UUID,
+) -> tuple[int, str]:
     """Create missing case_judges rows for rulings that have judge_id set.
 
-    Returns the number of case_judges rows created.
+    Returns (created_count, next_cursor).
     """
     with conn.cursor() as cur:
-        cur.execute(CASE_JUDGES_BACKFILL_QUERY, (batch_size, offset))
+        cur.execute(CASE_JUDGES_BACKFILL_QUERY, (cursor, batch_size))
         rows = cur.fetchall()
 
     if not rows:
-        return 0
+        return 0, cursor
 
     created = 0
+    next_cursor = cursor
     for case_id, judge_id, hearing_date in rows:
         upsert_case_judge(conn, str(case_id), str(judge_id), hearing_date)
+        next_cursor = str(case_id)
         created += 1
 
-    return created
+    return created, next_cursor
 
 
 def run_backfill(
@@ -186,7 +198,7 @@ def run_backfill(
     """Run the full backfill.  Returns summary stats."""
     total_processed = 0
     total_updated = 0
-    offset = 0
+    cursor: tuple[datetime, str] = (_CURSOR_MIN_TIMESTAMP, _CURSOR_MIN_UUID)
 
     with psycopg.connect(dsn) as conn:
         while True:
@@ -197,7 +209,7 @@ def run_backfill(
                     break
                 effective_batch = min(batch_size, remaining)
 
-            processed, updated = backfill_batch(conn, effective_batch, offset)
+            processed, updated, cursor = backfill_batch(conn, effective_batch, cursor)
             total_processed += processed
             total_updated += updated
 
@@ -221,15 +233,13 @@ def run_backfill(
                 # Last batch — no more rows
                 break
 
-            offset += effective_batch
-
         # Second pass: create case_judges rows for any rulings that already
         # have judge_id set (from a previous backfill or the ingestion
         # pipeline) but are missing the case_judges link.
-        cj_offset = 0
+        cj_cursor: str = _CURSOR_MIN_UUID
         total_case_judges = 0
         while True:
-            created = backfill_case_judges_batch(conn, batch_size, cj_offset)
+            created, cj_cursor = backfill_case_judges_batch(conn, batch_size, cj_cursor)
             total_case_judges += created
 
             if dry_run:
@@ -247,8 +257,6 @@ def run_backfill(
 
             if created < batch_size:
                 break
-
-            cj_offset += batch_size
 
         if total_case_judges > 0:
             logger.info(
