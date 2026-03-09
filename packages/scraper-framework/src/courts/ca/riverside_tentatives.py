@@ -40,6 +40,7 @@ from typing import Any
 import structlog
 
 from framework import CapturedDocument, ContentFormat, ScheduleWindow, ScraperConfig
+from ingestion.extract import extract_judge_name
 
 from .pdf_link_scraper import PdfLinkConfig, PdfLinkScraper, _extract_pdf_text
 
@@ -505,6 +506,19 @@ class RiversideTentativeRulingsScraper(PdfLinkScraper):
                 )
                 continue
 
+            # Fallback: extract judge name from PDF text when link text
+            # didn't provide one (#411).  Many Riverside PDFs contain
+            # "Department X - Honorable Name" headers in the body text.
+            if not doc.judge_name:
+                pdf_judge = extract_judge_name(text)
+                if pdf_judge:
+                    doc.judge_name = pdf_judge
+                    logger.info(
+                        "Extracted judge name from PDF content",
+                        department=doc.department,
+                        judge=pdf_judge,
+                    )
+
             rulings = _split_rulings(text)
             if len(rulings) <= 1:
                 # Single ruling or no rulings — keep original doc
@@ -560,6 +574,11 @@ class RiversideTentativeRulingsScraper(PdfLinkScraper):
         doc = super().parse_document(doc)
         if doc.ruling_text and not doc.hearing_date:
             doc.hearing_date = _riv_hearing_date_from_text(doc.ruling_text)
+        # Fallback: extract judge name from ruling text (#411)
+        if not doc.judge_name and doc.ruling_text:
+            pdf_judge = extract_judge_name(doc.ruling_text)
+            if pdf_judge:
+                doc.judge_name = pdf_judge
         return doc
 
 

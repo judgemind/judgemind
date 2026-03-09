@@ -4,6 +4,7 @@ Covers:
   - hearing_date extraction
   - multi-ruling PDF splitting (issue #295)
   - per-ruling field extraction: case number, case title, motion type, outcome
+  - PDF-content judge name fallback (issue #411)
 
 Fixtures captured from live site 2026-03-02:
   riv_page.html            — index page with 17 PDF links
@@ -17,6 +18,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from pathlib import Path
+from unittest.mock import patch
 
 import httpx
 import pytest
@@ -591,3 +593,141 @@ def test_riv_run_skips_murrieta_no_tentative_rulings() -> None:
 
     docs = scraper.fetch_documents()
     assert len(docs) == 0
+
+
+# ---------------------------------------------------------------------------
+# PDF-content judge name fallback (#411)
+# ---------------------------------------------------------------------------
+
+
+def _html_without_judge_names() -> str:
+    """Return modified index HTML where link text lacks judge names.
+
+    Replaces 'Department PS1 - Honorable Arthur Hester III' with
+    just 'Department PS1' to simulate links without judge info.
+    """
+    import re
+
+    html = _load_html("riv_page.html")
+    return re.sub(
+        r"(Department\s+\S+)\s*-\s*Honorable\s+[^<]+",
+        r"\1",
+        html,
+    )
+
+
+@respx.mock
+def test_riv_pdf_judge_fallback_when_link_text_has_no_name() -> None:
+    """When link text lacks judge name, extract_judge_name is called on PDF text (#411)."""
+    html = _html_without_judge_names()
+    pdf_bytes = _load_bytes("riv_ps1.pdf")
+
+    respx.get(INDEX_URL).mock(return_value=httpx.Response(200, text=html))
+    respx.get(url__regex=r"\.pdf$").mock(
+        return_value=httpx.Response(200, content=pdf_bytes),
+    )
+
+    config = riv_default_config()
+    config.request_delay_seconds = 0
+    scraper = RiversideTentativeRulingsScraper(config=config)
+
+    # Mock extract_judge_name to return a judge name from the PDF text
+    with patch(
+        "courts.ca.riverside_tentatives.extract_judge_name",
+        return_value="Arthur Hester III",
+    ) as mock_extract:
+        docs = scraper.fetch_documents()
+        # extract_judge_name should have been called (once per PDF with no link-text judge)
+        assert mock_extract.call_count > 0
+
+    # All split docs should have the fallback judge name
+    assert len(docs) > 0
+    for doc in docs:
+        assert doc.judge_name == "Arthur Hester III"
+
+
+@respx.mock
+def test_riv_pdf_judge_fallback_preserves_link_text_judge_name() -> None:
+    """When link text has a judge name, it is preserved (PDF fallback not used) (#411)."""
+    html = _load_html("riv_page.html")  # unmodified — has judge names
+    pdf_bytes = _load_bytes("riv_ps1.pdf")
+
+    respx.get(INDEX_URL).mock(return_value=httpx.Response(200, text=html))
+    respx.get(url__regex=r"\.pdf$").mock(
+        return_value=httpx.Response(200, content=pdf_bytes),
+    )
+
+    config = riv_default_config()
+    config.request_delay_seconds = 0
+    scraper = RiversideTentativeRulingsScraper(config=config)
+
+    with patch(
+        "courts.ca.riverside_tentatives.extract_judge_name",
+        return_value="SHOULD NOT APPEAR",
+    ):
+        docs = scraper.fetch_documents()
+
+    # Judge names from link text are preserved — the fallback value is NOT used
+    ps1_docs = [d for d in docs if d.department == "PS1"]
+    assert len(ps1_docs) > 0
+    for doc in ps1_docs:
+        assert doc.judge_name == "Arthur Hester III"
+
+
+@respx.mock
+def test_riv_pdf_judge_fallback_none_when_no_judge_in_pdf() -> None:
+    """When neither link text nor PDF content has a judge name, judge_name stays None (#411)."""
+    html = _html_without_judge_names()
+    pdf_bytes = _load_bytes("riv_ps1.pdf")
+
+    respx.get(INDEX_URL).mock(return_value=httpx.Response(200, text=html))
+    respx.get(url__regex=r"\.pdf$").mock(
+        return_value=httpx.Response(200, content=pdf_bytes),
+    )
+
+    config = riv_default_config()
+    config.request_delay_seconds = 0
+    scraper = RiversideTentativeRulingsScraper(config=config)
+
+    # extract_judge_name returns None (no judge found in PDF text)
+    with patch(
+        "courts.ca.riverside_tentatives.extract_judge_name",
+        return_value=None,
+    ):
+        docs = scraper.fetch_documents()
+
+    assert len(docs) > 0
+    for doc in docs:
+        assert doc.judge_name is None
+
+
+@respx.mock
+def test_riv_parse_document_judge_fallback_single_ruling() -> None:
+    """parse_document falls back to extract_judge_name for single-ruling PDFs (#411)."""
+    pdf_bytes = _load_bytes("riv_ps1.pdf")
+
+    # Dummy mock for the index page (not used by parse_document, but needed for respx)
+    respx.get(INDEX_URL).mock(return_value=httpx.Response(200, text="<html></html>"))
+
+    config = riv_default_config()
+    config.request_delay_seconds = 0
+    scraper = RiversideTentativeRulingsScraper(config=config)
+
+    # Use _make_base_doc to create a properly formed CapturedDocument
+    from framework import ContentFormat
+
+    doc = scraper._make_base_doc(
+        source_url="https://example.com/test.pdf",
+        raw_content=pdf_bytes,
+        content_format=ContentFormat.PDF,
+    )
+    doc.judge_name = None
+    doc.extra = {}
+
+    with patch(
+        "courts.ca.riverside_tentatives.extract_judge_name",
+        return_value="Test Judge Name",
+    ) as mock_extract:
+        result = scraper.parse_document(doc)
+        mock_extract.assert_called_once()
+        assert result.judge_name == "Test Judge Name"
