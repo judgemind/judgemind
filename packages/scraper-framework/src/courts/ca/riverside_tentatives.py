@@ -132,6 +132,10 @@ def _is_no_tentative_rulings(text: str) -> bool:
     These pages start with 'No Tentative Rulings' followed by a date or
     'for' and then standard boilerplate about court reporters. They should
     not be ingested as actual ruling records.
+
+    .. note:: This is now also handled by the base-class ``_is_boilerplate()``
+       hook in ``PdfLinkScraper``, which uses the same regex.  This function
+       is kept for backward compatibility with existing tests.
     """
     return bool(_NO_TENTATIVE_RULINGS_RE.match(text))
 
@@ -485,7 +489,11 @@ class RiversideTentativeRulingsScraper(PdfLinkScraper):
         super().__init__(config, pdf_config=pdf_config, **kwargs)
 
     def fetch_documents(self) -> list[CapturedDocument]:
-        """Fetch PDFs then split multi-ruling PDFs into individual documents."""
+        """Fetch PDFs then split multi-ruling PDFs into individual documents.
+
+        Boilerplate "No Tentative Rulings" PDFs are already filtered by the
+        base-class ``_is_boilerplate()`` hook before reaching this method.
+        """
         raw_docs = super().fetch_documents()
         split_docs: list[CapturedDocument] = []
 
@@ -495,15 +503,6 @@ class RiversideTentativeRulingsScraper(PdfLinkScraper):
             except Exception as exc:
                 logger.warning("PDF text extraction failed", error=str(exc))
                 split_docs.append(doc)
-                continue
-
-            # Skip "No Tentative Rulings" boilerplate pages (#318)
-            if _is_no_tentative_rulings(text):
-                logger.info(
-                    "Skipping 'No Tentative Rulings' boilerplate",
-                    department=doc.department,
-                    judge=doc.judge_name,
-                )
                 continue
 
             # Fallback: extract judge name from PDF text when link text

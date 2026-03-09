@@ -242,11 +242,12 @@ def test_oc_fl_run_populates_all_fields() -> None:
 
 @respx.mock
 def test_oc_fl_run_with_empty_rulings_pdf() -> None:
-    """Kohler L69 PDF is empty — scraper handles gracefully."""
+    """Kohler L69 PDF is empty boilerplate — scraper skips it (#322)."""
     html = _load_html("oc_family_law_page.html")
     pdf_bytes = _load_bytes("oc_family_law_kohler_l69.pdf")
 
     respx.get(INDEX_URL).mock(return_value=httpx.Response(200, text=html))
+    # Both PDF URLs return the empty Kohler fixture
     respx.get(url__regex=r"\.pdf$").mock(return_value=httpx.Response(200, content=pdf_bytes))
 
     config = fl_default_config()
@@ -254,15 +255,9 @@ def test_oc_fl_run_with_empty_rulings_pdf() -> None:
     scraper = OCFamilyLawTentativeRulingsScraper(config=config)
 
     docs = scraper.fetch_documents()
-    parsed = [scraper.parse_document(d) for d in docs]
 
-    # Judge name still extracted from link text
-    assert parsed[0].judge_name == "Israel Claustro"
-    # Kohler's empty PDF: no case number, no hearing date
-    doc = parsed[1]
-    assert doc.judge_name == "Robert Kohler"
-    assert doc.case_number is None
-    # hearing_date may or may not be None depending on boilerplate
+    # Both PDFs are boilerplate (empty template) — both should be skipped
+    assert len(docs) == 0
 
 
 # ---------------------------------------------------------------------------

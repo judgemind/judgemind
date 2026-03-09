@@ -35,6 +35,15 @@ from framework import BaseScraper, CapturedDocument, ContentFormat, ScraperConfi
 
 logger = structlog.get_logger(__name__)
 
+# Common "no rulings" boilerplate pattern — matches text that starts with
+# "No Tentative Ruling(s)" (case-insensitive, optional leading whitespace).
+# Used by the default _is_boilerplate() implementation.  Courts like Riverside
+# publish placeholder PDFs with this text for departments with no rulings.
+_NO_RULINGS_RE = re.compile(
+    r"^\s*No\s+Tentative\s+Rulings?\b",
+    re.IGNORECASE,
+)
+
 
 @dataclass
 class PdfLinkConfig:
@@ -63,7 +72,12 @@ class PdfLinkConfig:
 
 
 class PdfLinkScraper(BaseScraper):
-    """Scrapes Pattern-2 courts: PDF links on an index page, one PDF per judge."""
+    """Scrapes Pattern-2 courts: PDF links on an index page, one PDF per judge.
+
+    Subclasses can override ``_is_boilerplate`` to detect placeholder PDFs that
+    should be silently skipped (e.g. "No Tentative Rulings" pages).  The base
+    implementation catches common patterns; subclasses may extend or replace it.
+    """
 
     def __init__(
         self,
@@ -73,6 +87,24 @@ class PdfLinkScraper(BaseScraper):
     ) -> None:
         super().__init__(config, **kwargs)
         self._pdf_config = pdf_config
+
+    # ------------------------------------------------------------------
+    # Boilerplate detection hook (override in subclasses as needed)
+    # ------------------------------------------------------------------
+
+    def _is_boilerplate(self, text: str) -> bool:
+        """Return True if *text* is a boilerplate placeholder, not a real ruling.
+
+        Courts sometimes publish PDFs for departments with no rulings that
+        contain only instructional text (e.g. "No Tentative Rulings") or a
+        department header with no case entries.  These should be skipped
+        rather than ingested as UNKNOWN case records.
+
+        The base implementation checks for common "No Tentative Rulings"
+        patterns.  Subclasses should call ``super()._is_boilerplate(text)``
+        and add court-specific checks.
+        """
+        return bool(_NO_RULINGS_RE.match(text))
 
     def fetch_documents(self) -> list[CapturedDocument]:
         pc = self._pdf_config
@@ -95,6 +127,24 @@ class PdfLinkScraper(BaseScraper):
                 time.sleep(self.config.request_delay_seconds)
                 try:
                     doc = self._fetch_one_pdf(client, href, link_text)
+
+                    # Check for boilerplate before adding to results (#322).
+                    # Extract text early so subclasses that override
+                    # _is_boilerplate can inspect it.
+                    try:
+                        text = _extract_pdf_text(doc.raw_content)
+                    except Exception:
+                        text = None
+
+                    if text is not None and self._is_boilerplate(text):
+                        self._log.info(
+                            "Skipping boilerplate PDF",
+                            department=doc.department,
+                            judge=doc.judge_name,
+                            url=href,
+                        )
+                        continue
+
                     docs.append(doc)
                     self._log.debug(
                         "Fetched PDF",

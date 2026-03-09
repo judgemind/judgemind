@@ -156,8 +156,32 @@ def _oc_fl_courthouse(dept: str) -> str:
     return "Central Justice Center"
 
 
+_EMPTY_CASE_TABLE_RE = re.compile(
+    r"TENTATIVE\s+RULINGS?\s*\n"
+    r"Date:\s*\n",
+    re.IGNORECASE,
+)
+
+
 class OCFamilyLawTentativeRulingsScraper(PdfLinkScraper):
     """Orange County Family Law tentative rulings — PDF-link pattern."""
+
+    def _is_boilerplate(self, text: str) -> bool:
+        """Detect OC Family Law boilerplate PDFs (#322).
+
+        OC publishes placeholder PDFs with the department header and
+        procedural instructions but no actual rulings.  These are
+        identified by having a "TENTATIVE RULINGS / Date:" header with
+        no date value AND no case numbers in the text.
+        """
+        if super()._is_boilerplate(text):
+            return True
+
+        # OC-specific: header table with empty date and no case numbers.
+        if _EMPTY_CASE_TABLE_RE.search(text) and not _CASE_NUMBER_RE.search(text):
+            return True
+
+        return False
 
     def __init__(self, config: ScraperConfig, **kwargs: Any) -> None:
         pdf_config = PdfLinkConfig(

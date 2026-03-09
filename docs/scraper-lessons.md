@@ -19,6 +19,7 @@ Common issues found during audits and fixes. Consult this when writing or review
 - **PDF text extraction order varies.** `pdfplumber` extracts text in visual order, which may not match reading order for multi-column layouts.
 - **San Bernardino extracts hearing date from filename, not content.** This is fragile — if the filename format changes, all dates are lost. Prefer content-based extraction with filename as fallback.
 - **Multi-ruling PDFs (Riverside):** When splitting a PDF into individual rulings, ensure metadata (hearing_date, judge_name) from the parent document propagates to all children.
+- **Boilerplate PDF detection (#322):** Courts publish placeholder PDFs for departments with no rulings. These contain only instructional text (e.g. "No Tentative Rulings") or an empty case table. The `PdfLinkScraper` base class has a `_is_boilerplate(text)` hook that subclasses can override to detect court-specific patterns. The base implementation catches "No Tentative Rulings" text. OC scrapers additionally check for empty "TENTATIVE RULINGS / Date:" headers with no case numbers. Always override `_is_boilerplate()` when adding a new PDF-based scraper if the court publishes placeholder pages.
 
 ## Ingestion Pipeline
 

@@ -143,12 +143,34 @@ def _oc_probate_courthouse(_dept: str) -> str:
     return "Costa Mesa Justice Center"
 
 
+_EMPTY_RULINGS_RE = re.compile(
+    r"TENTATIVE\s+RULINGS\s+FOR\s+DEPARTMENT\s+\S+\s*\n"
+    r"[^\n]*\n"  # judge line
+    r"Date:\s*\n",
+    re.IGNORECASE,
+)
+
+
 class OCProbateTentativeRulingsScraper(PdfLinkScraper):
     """Orange County Probate tentative rulings — PDF-link pattern.
 
     Department is extracted from link text (e.g. "CM3 Law and Motion").
     Judge name is extracted from PDF text ("HON. Judge ...") in parse_document().
     """
+
+    def _is_boilerplate(self, text: str) -> bool:
+        """Detect OC Probate boilerplate PDFs (#322).
+
+        Probate placeholder PDFs have the TENTATIVE RULINGS FOR DEPARTMENT
+        header with an empty Date: field and no case numbers.
+        """
+        if super()._is_boilerplate(text):
+            return True
+
+        if _EMPTY_RULINGS_RE.search(text) and not _CASE_NUMBER_RE.search(text):
+            return True
+
+        return False
 
     def __init__(self, config: ScraperConfig, **kwargs: Any) -> None:
         pdf_config = PdfLinkConfig(
