@@ -341,6 +341,41 @@ def test_process_event_extracts_case_number_from_ruling_text(mock_psycopg: Magic
 
 
 @patch("ingestion.worker.psycopg")
+def test_process_event_extracts_judge_name_from_ruling_text(mock_psycopg: MagicMock) -> None:
+    """When judge_name is None but ruling_text contains a judge name,
+    the fallback extraction should capture it (#401)."""
+    worker, _ = _make_worker()
+
+    mock_conn = MagicMock()
+    mock_cur = MagicMock()
+    mock_conn.__enter__ = MagicMock(return_value=mock_conn)
+    mock_conn.__exit__ = MagicMock(return_value=False)
+    mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cur)
+    mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+    mock_psycopg.connect.return_value = mock_conn
+    mock_cur.fetchone.side_effect = [
+        ("court-uuid-1",),  # upsert_court
+        ("case-uuid-1",),  # upsert_case
+        (True,),  # insert_document: RETURNING is_new = True
+        None,  # resolve_judge: no existing alias
+        ("judge-uuid-1",),  # resolve_judge: INSERT INTO judges
+    ]
+    mock_cur.rowcount = 1
+
+    event = _make_event(
+        judge_name=None,
+        ruling_text=(
+            "DEPARTMENT 56 JUDGE STEVEN A. ELLIS\nCase Number: 24NNCV02551\nThe motion is GRANTED."
+        ),
+    )
+    worker.process_event(event)
+
+    # resolve_judge should have been called — judge name extracted from text
+    all_sql = " ".join(str(c) for c in mock_cur.execute.call_args_list)
+    assert "judges" in all_sql.lower() or "judge_aliases" in all_sql.lower()
+
+
+@patch("ingestion.worker.psycopg")
 def test_process_event_no_hearing_date_skips_ruling(mock_psycopg: MagicMock) -> None:
     """Events without hearing_date should still insert document but skip ruling."""
     worker, os_mock = _make_worker()

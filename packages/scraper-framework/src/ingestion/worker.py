@@ -42,6 +42,7 @@ from .extract import (
     extract_case_number,
     extract_case_title,
     extract_hearing_date,
+    extract_judge_name,
     extract_motion_type,
     extract_outcome,
     extract_parties_from_caption,
@@ -278,6 +279,18 @@ class IngestionWorker:
         # Fallback case_title extraction from ruling text
         if not case_title and ruling_text:
             case_title = extract_case_title(ruling_text)
+
+        # Fallback judge_name extraction from ruling text (#401).
+        # Many LA rulings have the judge name in the text (e.g., ALL-CAPS header
+        # "DEPARTMENT 56 JUDGE STEVEN A. ELLIS") but the scraper may not have
+        # extracted it if the pattern wasn't supported at capture time.
+        if not judge_name and ruling_text:
+            judge_name = extract_judge_name(ruling_text)
+            if judge_name:
+                logger.info(
+                    "Extracted judge_name from ruling text (scraper did not provide it)",
+                    extra={"document_id": document_id, "judge_name": judge_name},
+                )
 
         with psycopg.connect(self._pg_dsn) as conn:
             # 1. Ensure court exists
