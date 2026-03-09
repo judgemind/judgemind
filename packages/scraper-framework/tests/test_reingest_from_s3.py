@@ -440,8 +440,7 @@ class TestReingestBatchPipeline:
         assert updated == 0
         conn.pipeline.assert_not_called()
 
-    @patch("reingest_from_s3.upsert_case_party")
-    @patch("reingest_from_s3.upsert_party")
+    @patch("reingest_from_s3.batch_upsert_parties")
     @patch("reingest_from_s3.upsert_case_judge")
     @patch("reingest_from_s3.insert_ruling")
     @patch("reingest_from_s3.resolve_judge")
@@ -458,8 +457,7 @@ class TestReingestBatchPipeline:
         mock_resolve_judge: MagicMock,
         mock_insert_ruling: MagicMock,
         mock_upsert_cj: MagicMock,
-        mock_upsert_party: MagicMock,
-        mock_upsert_cp: MagicMock,
+        mock_batch_parties: MagicMock,
     ) -> None:
         """DB writes happen inside a pipeline context."""
         row = _make_document_row()

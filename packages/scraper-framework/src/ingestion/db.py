@@ -482,3 +482,120 @@ def upsert_case_party(
             (case_id, party_id, role, case_id, party_id, role),
         )
     logger.debug("upsert_case_party: case_id=%s party_id=%s role=%s", case_id, party_id, role)
+
+
+def batch_upsert_parties(
+    conn: psycopg.Connection,
+    case_id: str,
+    parties_data: list[dict[str, str]],
+    alias_source: str = "scraper",
+) -> None:
+    """Batch-upsert parties and link them to a case in O(1) queries.
+
+    Replaces the N+1 pattern of calling ``upsert_party`` + ``upsert_case_party``
+    in a loop.  For a document with *n* parties, this issues a constant number
+    of queries (3-4) instead of 2n-3n individual queries.
+
+    Steps:
+      1. Collect all distinct (raw_name, canonical_name, role) tuples.
+      2. Single ``SELECT ... WHERE raw_name = ANY(...)`` to find existing aliases.
+      3. Single ``INSERT ... RETURNING`` for new parties + ``executemany`` for aliases.
+      4. Single ``executemany`` for case_party links with ``ON CONFLICT DO NOTHING``.
+
+    Parameters
+    ----------
+    conn : psycopg.Connection
+        Open connection (caller manages transaction / commit).
+    case_id : str
+        UUID of the case to link parties to.
+    parties_data : list[dict[str, str]]
+        Each dict must have ``"name"`` and optionally ``"role"``.
+    alias_source : str
+        Value for the ``source`` column in ``party_aliases`` (default: ``"scraper"``).
+    """
+    if not parties_data:
+        return
+
+    # Deduplicate and collect valid entries
+    entries: list[tuple[str, str, str]] = []  # (raw_name, canonical, role)
+    seen: set[str] = set()
+    for party_info in parties_data:
+        raw_name = (_strip_nul(party_info.get("name", "")) or "").strip()
+        if not raw_name:
+            continue
+        role = party_info.get("role", "")
+        canonical = normalize_party_name(raw_name)
+        key = raw_name.lower()
+        if key not in seen:
+            seen.add(key)
+            entries.append((raw_name, canonical, role))
+
+    if not entries:
+        return
+
+    raw_names = [e[0] for e in entries]
+    new_count = 0
+
+    with conn.cursor() as cur:
+        # Step 1: Batch-lookup existing aliases — single SELECT for all names
+        cur.execute(
+            "SELECT raw_name, party_id FROM party_aliases WHERE raw_name = ANY(%s)",
+            (raw_names,),
+        )
+        existing: dict[str, str] = {row[0]: str(row[1]) for row in cur.fetchall()}
+
+        # Step 2: Insert new parties + aliases for names not yet in the DB
+        new_entries = [(rn, cn) for rn, cn, _role in entries if rn not in existing]
+        new_count = len(new_entries)
+        if new_entries:
+            # Insert each new party and collect its ID.  We use executemany with
+            # returning=True so psycopg3 pipelines the INSERTs in a single
+            # network round-trip.
+            cur.executemany(
+                "INSERT INTO parties (canonical_name, party_type) VALUES (%s, NULL) RETURNING id",
+                [(cn,) for _rn, cn in new_entries],
+                returning=True,
+            )
+            # Collect RETURNING ids — one per statement in the executemany batch.
+            new_ids: list[str] = []
+            while True:
+                row = cur.fetchone()
+                if row is not None:
+                    new_ids.append(str(row[0]))
+                if not cur.nextset():
+                    break
+
+            # Insert aliases linking raw_name -> party_id
+            cur.executemany(
+                "INSERT INTO party_aliases "
+                "(party_id, raw_name, source, confidence, is_verified) "
+                "VALUES (%s::uuid, %s, %s, 1.0, FALSE) "
+                "ON CONFLICT DO NOTHING",
+                [(pid, rn, alias_source) for (rn, _cn), pid in zip(new_entries, new_ids)],
+            )
+
+            # Merge new IDs into the lookup dict
+            for (rn, _cn), pid in zip(new_entries, new_ids):
+                existing[rn] = pid
+
+        # Step 3: Batch-insert case_party links
+        link_params = []
+        for raw_name, _canonical, role in entries:
+            party_id = existing.get(raw_name)
+            if party_id and role:
+                link_params.append((case_id, party_id, role))
+
+        if link_params:
+            cur.executemany(
+                "INSERT INTO case_parties (case_id, party_id, role) "
+                "VALUES (%s::uuid, %s::uuid, %s) "
+                "ON CONFLICT DO NOTHING",
+                link_params,
+            )
+
+    logger.debug(
+        "batch_upsert_parties: case_id=%s party_count=%d new=%d",
+        case_id,
+        len(entries),
+        new_count,
+    )

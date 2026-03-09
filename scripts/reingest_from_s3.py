@@ -57,13 +57,12 @@ import psycopg  # noqa: E402
 
 from framework.models import CapturedDocument, ContentFormat  # noqa: E402
 from ingestion.db import (  # noqa: E402
+    batch_upsert_parties,
     insert_document,
     insert_ruling,
     resolve_judge,
     upsert_case,
     upsert_case_judge,
-    upsert_case_party,
-    upsert_party,
 )
 from ingestion.extract import (  # noqa: E402
     extract_case_number,
@@ -769,14 +768,10 @@ def reingest_batch(
             if judge_id:
                 upsert_case_judge(conn, new_case_id, judge_id, effective_hearing)
 
-            # Parties
-            for party_info in extracted.get("parties", []):
-                party_name = party_info.get("name", "")
-                party_role = party_info.get("role", "")
-                if party_name:
-                    party_id = upsert_party(conn, party_name)
-                    if party_role:
-                        upsert_case_party(conn, new_case_id, party_id, party_role)
+            # Parties (batched — O(1) queries regardless of party count)
+            batch_upsert_parties(
+                conn, new_case_id, extracted.get("parties", [])
+            )
 
             updated += 1
 
