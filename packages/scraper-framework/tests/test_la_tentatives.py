@@ -22,6 +22,7 @@ from courts.ca.la_tentatives import (
     _extract_parties,
     _extract_parties_from_anchor,
     _extract_ruling_fields,
+    _is_dept_header_boilerplate,
     _is_name_fragment,
     _is_stale_viewstate_response,
     _parse_dropdown_options,
@@ -279,12 +280,11 @@ def test_split_cases_html_single_case_no_regression() -> None:
     assert len(sections) >= 1
 
 
-def test_split_cases_html_no_speech_div_returns_original() -> None:
-    """HTML without div#speechSynthesis should return the original HTML."""
+def test_split_cases_html_no_speech_div_returns_empty() -> None:
+    """HTML without div#speechSynthesis should return an empty list."""
     html = "<html><body><p>No rulings here.</p></body></html>"
     sections = _split_cases_html(html)
-    assert len(sections) == 1
-    assert sections[0] == html
+    assert sections == []
 
 
 def test_split_cases_per_case_field_extraction() -> None:
@@ -877,3 +877,88 @@ def test_is_name_fragment_valid_names() -> None:
     assert _is_name_fragment("Techno-Advanced, Inc.") is False
     assert _is_name_fragment("Google") is False
     assert _is_name_fragment("Jane Smith Corporation") is False
+
+
+# ---------------------------------------------------------------------------
+# Department header boilerplate filtering (#422)
+# ---------------------------------------------------------------------------
+
+
+def test_is_dept_header_boilerplate_detects_fixture() -> None:
+    """The department header fixture should be detected as boilerplate."""
+    html = _load("la_ruling_dept_header.html")
+    assert _is_dept_header_boilerplate(html) is True
+
+
+def test_is_dept_header_boilerplate_rejects_real_ruling() -> None:
+    """A real ruling with case numbers is NOT boilerplate."""
+    html = _load("la_ruling_response.html")
+    assert _is_dept_header_boilerplate(html) is False
+
+
+def test_is_dept_header_boilerplate_rejects_plain_text() -> None:
+    """Plain text without the DEPARTMENT pattern is NOT boilerplate."""
+    assert _is_dept_header_boilerplate("<p>Some random content</p>") is False
+
+
+def test_split_cases_html_dept_header_returns_empty() -> None:
+    """Department header boilerplate should produce zero case sections."""
+    html = _load("la_ruling_dept_header.html")
+    sections = _split_cases_html(html)
+    assert sections == []
+
+
+def test_split_cases_html_dept_header_not_stored_as_ruling() -> None:
+    """Full scraper pipeline: department header pages should not produce documents."""
+    html = _load("la_ruling_dept_header.html")
+    # _split_cases_html returns [] so fetch_documents will not append any docs
+    sections = _split_cases_html(html)
+    assert len(sections) == 0
+
+
+@respx.mock
+def test_full_run_dept_header_not_counted() -> None:
+    """Full run: when every POST returns a department header, records_captured == 0."""
+    main_html = _load("la_main_page.html")
+    dept_header_html = _load("la_ruling_dept_header.html")
+
+    respx.get(CIVIL_URL).mock(return_value=httpx.Response(200, text=main_html))
+    respx.post(CIVIL_URL).mock(return_value=httpx.Response(200, text=dept_header_html))
+
+    config = default_config()
+    config.request_delay_seconds = 0
+    scraper = LATentativeRulingsScraper(config=config)
+    health = scraper.run()
+
+    assert health.success is True
+    assert health.records_captured == 0
+
+
+@respx.mock
+def test_full_run_dept_header_mixed_with_real() -> None:
+    """Full run: department headers are skipped; valid rulings still count."""
+    main_html = _load("la_main_page.html")
+    dept_header_html = _load("la_ruling_dept_header.html")
+    ruling_html = _load("la_ruling_response.html")
+
+    respx.get(CIVIL_URL).mock(return_value=httpx.Response(200, text=main_html))
+
+    call_count = 0
+
+    def post_side_effect(request: httpx.Request) -> httpx.Response:
+        nonlocal call_count
+        call_count += 1
+        # First three calls return department headers; rest return real rulings
+        if call_count <= 3:
+            return httpx.Response(200, text=dept_header_html)
+        return httpx.Response(200, text=ruling_html)
+
+    respx.post(CIVIL_URL).mock(side_effect=post_side_effect)
+
+    config = default_config()
+    config.request_delay_seconds = 0
+    scraper = LATentativeRulingsScraper(config=config)
+    health = scraper.run()
+
+    assert health.success is True
+    assert health.records_captured == 188  # (97 - 3 headers) x 2 cases per fixture
