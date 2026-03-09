@@ -377,13 +377,82 @@ echo "Task ARN: ${TASK_ARN}" >&2
 echo "Task ID:  ${TASK_ID}" >&2
 echo "" >&2
 
-# ─── Step 6: Poll for completion ─────────────────────────────────────────────
+# ─── Step 6: Poll for completion with real-time log streaming ────────────────
 
 echo "Waiting for task to complete (timeout: ${TIMEOUT}s)..." >&2
 
 POLL_INTERVAL=10
 ELAPSED=0
 LAST_STATUS=""
+
+# Log streaming state
+LOG_GROUP="/ecs/judgemind-ingestion-worker-${ENVIRONMENT}"
+LOG_STREAM_NAME=""
+LOG_NEXT_TOKEN=""
+LOG_STREAMING=false
+
+# find_log_stream — Locate the CloudWatch log stream for this task.
+# The stream name follows the pattern: oneshot/oneshot/<task-id>
+# Returns the stream name, or empty string if not found yet.
+find_log_stream() {
+    aws logs describe-log-streams \
+        --log-group-name "$LOG_GROUP" \
+        --log-stream-name-prefix "oneshot/oneshot/" \
+        --order-by LogStreamName \
+        --max-items 50 \
+        --region "$REGION" \
+        --output text \
+        --query "logStreams[*].logStreamName" \
+        --no-cli-pager 2>/dev/null | tr '\t' '\n' | grep -F "$TASK_ID" | head -n 1 || true
+}
+
+# stream_new_logs — Fetch and print any new log events since the last check.
+# Uses LOG_NEXT_TOKEN to track position; updates it after each call.
+stream_new_logs() {
+    if [[ -z "$LOG_STREAM_NAME" ]]; then
+        return
+    fi
+
+    local args=(
+        logs get-log-events
+        --log-group-name "$LOG_GROUP"
+        --log-stream-name "$LOG_STREAM_NAME"
+        --region "$REGION"
+        --output json
+        --start-from-head true
+        --no-cli-pager
+    )
+
+    if [[ -n "$LOG_NEXT_TOKEN" ]]; then
+        args+=(--next-token "$LOG_NEXT_TOKEN")
+    fi
+
+    local result
+    result=$(aws "${args[@]}" 2>/dev/null) || return 0
+
+    # Extract log messages and forward token from the response
+    local messages new_token
+    messages=$(echo "$result" | python3 -c "
+import sys, json
+data = json.load(sys.stdin)
+for event in data.get('events', []):
+    print(event.get('message', '').rstrip())
+" 2>/dev/null) || true
+
+    new_token=$(echo "$result" | python3 -c "
+import sys, json
+data = json.load(sys.stdin)
+print(data.get('nextForwardToken', ''))
+" 2>/dev/null) || true
+
+    if [[ -n "$messages" ]]; then
+        echo "$messages"
+    fi
+
+    if [[ -n "$new_token" ]]; then
+        LOG_NEXT_TOKEN="$new_token"
+    fi
+}
 
 while [[ $ELAPSED -lt $TIMEOUT ]]; do
     DESCRIBE_OUTPUT=$(aws ecs describe-tasks \
@@ -400,6 +469,21 @@ while [[ $ELAPSED -lt $TIMEOUT ]]; do
         LAST_STATUS="$CURRENT_STATUS"
     fi
 
+    # Start log streaming once the task is RUNNING (or already STOPPED)
+    if [[ "$LOG_STREAMING" == "false" && ( "$CURRENT_STATUS" == "RUNNING" || "$CURRENT_STATUS" == "STOPPED" ) ]]; then
+        LOG_STREAM_NAME=$(find_log_stream)
+        if [[ -n "$LOG_STREAM_NAME" ]]; then
+            echo "Log stream: ${LOG_STREAM_NAME}" >&2
+            echo "─── Live Logs ───────────────────────────────────────────────────" >&2
+            LOG_STREAMING=true
+        fi
+    fi
+
+    # Stream any new log events
+    if [[ "$LOG_STREAMING" == "true" ]]; then
+        stream_new_logs
+    fi
+
     if [[ "$CURRENT_STATUS" == "STOPPED" ]]; then
         break
     fi
@@ -407,6 +491,13 @@ while [[ $ELAPSED -lt $TIMEOUT ]]; do
     sleep "$POLL_INTERVAL"
     ELAPSED=$((ELAPSED + POLL_INTERVAL))
 done
+
+# Final log flush — capture any events that arrived after the last poll
+if [[ "$LOG_STREAMING" == "true" ]]; then
+    sleep 2
+    stream_new_logs
+    echo "─── End of Live Logs ────────────────────────────────────────────" >&2
+fi
 
 if [[ "$CURRENT_STATUS" != "STOPPED" ]]; then
     echo "Error: task did not complete within ${TIMEOUT}s." >&2
@@ -447,21 +538,25 @@ if [[ -n "$STOP_REASON" ]]; then
     echo "Stop reason: ${STOP_REASON}" >&2
 fi
 
-# ─── Step 8: Retrieve and display CloudWatch logs ────────────────────────────
+# ─── Step 8: Retrieve and display CloudWatch logs (fallback) ─────────────────
 
-LOG_GROUP="/ecs/judgemind-ingestion-worker-${ENVIRONMENT}"
+# If live streaming was active, logs were already shown above. Only do the
+# full post-hoc retrieval if we never managed to stream (e.g. log stream
+# wasn't found during the poll loop, or the task was very short-lived).
 
-echo "" >&2
-echo "─── Task Logs ───────────────────────────────────────────────────" >&2
+if [[ "$LOG_STREAMING" == "false" ]]; then
+    echo "" >&2
+    echo "─── Task Logs ───────────────────────────────────────────────────" >&2
 
-# Give CloudWatch a moment to flush
-sleep 3
+    # Give CloudWatch a moment to flush
+    sleep 3
 
-# Use the existing ecs-logs.sh script to retrieve logs
-"$REPO_ROOT/scripts/ecs-logs.sh" "$LOG_GROUP" --task "$TASK_ID" --lines 200 2>/dev/null || {
-    echo "(Could not retrieve logs. Check manually with:)" >&2
-    echo "  scripts/ecs-logs.sh ${LOG_GROUP} --task ${TASK_ID}" >&2
-}
+    # Use the existing ecs-logs.sh script to retrieve logs
+    "$REPO_ROOT/scripts/ecs-logs.sh" "$LOG_GROUP" --task "$TASK_ID" --lines 200 2>/dev/null || {
+        echo "(Could not retrieve logs. Check manually with:)" >&2
+        echo "  scripts/ecs-logs.sh ${LOG_GROUP} --task ${TASK_ID}" >&2
+    }
+fi
 
 # ─── Done ────────────────────────────────────────────────────────────────────
 
