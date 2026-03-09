@@ -408,6 +408,14 @@ find_log_stream() {
 
 # stream_new_logs — Fetch and print any new log events since the last check.
 # Uses LOG_NEXT_TOKEN to track position; updates it after each call.
+#
+# On the first call (no token), we pass --start-from-head so events are
+# returned in chronological order. On subsequent calls we pass the forward
+# token instead — --start-from-head must NOT be combined with --next-token
+# because the token already encodes position.
+#
+# Note: --start-from-head is a boolean *flag* (no value argument). Passing
+# "true" as a separate positional arg causes the CLI to fail silently.
 stream_new_logs() {
     if [[ -z "$LOG_STREAM_NAME" ]]; then
         return
@@ -419,12 +427,15 @@ stream_new_logs() {
         --log-stream-name "$LOG_STREAM_NAME"
         --region "$REGION"
         --output json
-        --start-from-head true
         --no-cli-pager
     )
 
     if [[ -n "$LOG_NEXT_TOKEN" ]]; then
+        # Use forward token from previous call (already encodes position)
         args+=(--next-token "$LOG_NEXT_TOKEN")
+    else
+        # First call — read from the beginning of the stream
+        args+=(--start-from-head)
     fi
 
     local result
@@ -469,13 +480,18 @@ while [[ $ELAPSED -lt $TIMEOUT ]]; do
         LAST_STATUS="$CURRENT_STATUS"
     fi
 
-    # Start log streaming once the task is RUNNING (or already STOPPED)
+    # Start log streaming once the task is RUNNING (or already STOPPED).
+    # The log stream may not exist immediately — CloudWatch creates it on
+    # first write, which lags container start by a few seconds. Keep
+    # retrying on every poll iteration until we find it.
     if [[ "$LOG_STREAMING" == "false" && ( "$CURRENT_STATUS" == "RUNNING" || "$CURRENT_STATUS" == "STOPPED" ) ]]; then
         LOG_STREAM_NAME=$(find_log_stream)
         if [[ -n "$LOG_STREAM_NAME" ]]; then
             echo "Log stream: ${LOG_STREAM_NAME}" >&2
             echo "─── Live Logs ───────────────────────────────────────────────────" >&2
             LOG_STREAMING=true
+        else
+            echo "Waiting for log stream to appear..." >&2
         fi
     fi
 
@@ -492,7 +508,23 @@ while [[ $ELAPSED -lt $TIMEOUT ]]; do
     ELAPSED=$((ELAPSED + POLL_INTERVAL))
 done
 
-# Final log flush — capture any events that arrived after the last poll
+# Final log flush — capture any events that arrived after the last poll.
+# If we never found the log stream during the poll loop (e.g. for very
+# short-lived tasks), retry a few times with a brief delay — CloudWatch
+# may still be creating the stream.
+if [[ "$LOG_STREAMING" == "false" ]]; then
+    for _retry in 1 2 3; do
+        sleep 3
+        LOG_STREAM_NAME=$(find_log_stream)
+        if [[ -n "$LOG_STREAM_NAME" ]]; then
+            echo "Log stream: ${LOG_STREAM_NAME}" >&2
+            echo "─── Live Logs ───────────────────────────────────────────────────" >&2
+            LOG_STREAMING=true
+            break
+        fi
+    done
+fi
+
 if [[ "$LOG_STREAMING" == "true" ]]; then
     sleep 2
     stream_new_logs
