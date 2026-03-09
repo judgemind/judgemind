@@ -684,6 +684,51 @@ def test_normalize_judge_name_single_name() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Judge name normalization — truncation regression tests (#327)
+# ---------------------------------------------------------------------------
+
+
+def test_normalize_judge_name_preserves_full_length() -> None:
+    """Regression: normalize must not truncate names (issue #327).
+    'James I. Montgomery' was being stored as 'James I. Montgomer'."""
+    assert normalize_judge_name("James I. Montgomery") == "James I. Montgomery"
+
+
+def test_normalize_judge_name_long_name_with_suffix() -> None:
+    """Names with suffixes like 'III' or 'Jr.' preserve full length."""
+    assert normalize_judge_name("Arthur Hester III") == "Arthur Hester Iii"
+    # Note: .title() lowercases "III" to "Iii" — this is a known limitation
+    # but the important thing is no truncation occurs.
+
+
+def test_normalize_judge_name_hyphenated_surname() -> None:
+    """Hyphenated surnames are preserved at full length."""
+    assert normalize_judge_name("Maria Santos-Rodriguez") == "Maria Santos-Rodriguez"
+
+
+def test_normalize_judge_name_long_compound_name() -> None:
+    """Long compound names with multiple parts are not truncated."""
+    name = "Christopher Michael Alexander Van Der Berg"
+    result = normalize_judge_name(name)
+    assert result == "Christopher Michael Alexander Van Der Berg"
+    assert len(result) == len(name)
+
+
+def test_normalize_judge_name_preserves_periods() -> None:
+    """Middle initials with periods are preserved without truncation."""
+    assert normalize_judge_name("William A. Crowfoot") == "William A. Crowfoot"
+    assert normalize_judge_name("H. Shaina Colover") == "H. Shaina Colover"
+
+
+def test_normalize_judge_name_all_caps_long_name() -> None:
+    """All-caps long name is title-cased without truncation."""
+    name = "JAMES I. MONTGOMERY"
+    result = normalize_judge_name(name)
+    assert result == "James I. Montgomery"
+    assert len(result) == len(name)
+
+
+# ---------------------------------------------------------------------------
 # Judge resolution (resolve_judge)
 # ---------------------------------------------------------------------------
 
