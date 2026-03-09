@@ -218,9 +218,9 @@ if [[ "$ENCODED_SIZE" -gt 6000 ]]; then
         PRESIGNED_URL="https://${S3_BUCKET}.s3.${REGION}.amazonaws.com/${S3_SCRIPT_KEY}?PRESIGNED_PLACEHOLDER"
     fi
 
-    # Use curl to download (available in most container images). If curl is
-    # missing, fall back to Python's urllib which is always present.
-    COMMAND_STR="{ curl -sS --fail -o /tmp/_oneshot_script '${PRESIGNED_URL}' || python3 -c \"import urllib.request; urllib.request.urlretrieve('${PRESIGNED_URL}', '/tmp/_oneshot_script')\"; } && ${INTERPRETER} /tmp/_oneshot_script${ARGS_STR}"
+    # Use Python's urllib to download — always available in the container
+    # image (python:3.12-slim). Avoids "curl: command not found" noise.
+    COMMAND_STR="python3 -c \"import urllib.request; urllib.request.urlretrieve('${PRESIGNED_URL}', '/tmp/_oneshot_script')\" && ${INTERPRETER} /tmp/_oneshot_script${ARGS_STR}"
 else
     ENCODED=$(base64 < "$SCRIPT_PATH")
     COMMAND_STR="echo ${ENCODED} | base64 -d > /tmp/_oneshot_script && ${INTERPRETER} /tmp/_oneshot_script${ARGS_STR}"
