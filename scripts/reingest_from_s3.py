@@ -22,6 +22,7 @@ Options:
     --dry-run           Parse and show what would be updated, but don't write to DB.
     --batch-size N      Number of documents per batch (default: 50).
     --limit N           Maximum total documents to re-ingest.
+    --concurrency N     Number of parallel S3 fetch threads (default: 10).
 """
 
 from __future__ import annotations
@@ -30,6 +31,7 @@ import argparse
 import logging
 import os
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime
 
 # Ensure the scraper-framework source is importable
@@ -255,8 +257,13 @@ def reingest_batch(
     filters: str,
     filter_params: list,
     dry_run: bool = False,
+    concurrency: int = 10,
 ) -> tuple[int, int, tuple[datetime, str]]:
-    """Process one batch. Returns (processed, updated, next_cursor)."""
+    """Process one batch. Returns (processed, updated, next_cursor).
+
+    S3 objects are fetched in parallel using a thread pool (controlled by
+    ``concurrency``).  DB writes remain sequential.
+    """
     processed = 0
     updated = 0
     next_cursor = cursor
@@ -273,7 +280,33 @@ def reingest_batch(
     if not rows:
         return 0, 0, cursor
 
-    for row in rows:
+    # --- Prefetch S3 content in parallel -----------------------------------
+    # Parallel S3 fetch — submit all rows with valid s3_key + s3_bucket,
+    # then collect results keyed by row index.
+    s3_results: dict[int, bytes] = {}
+    with ThreadPoolExecutor(max_workers=concurrency) as pool:
+        futures = {}
+        for idx, row in enumerate(rows):
+            s3_key = row[3]
+            s3_bucket = row[4]
+            if s3_key and s3_bucket:
+                future = pool.submit(_fetch_s3_content, s3_client, s3_bucket, s3_key)
+                futures[future] = idx
+
+        for future in as_completed(futures):
+            idx = futures[future]
+            doc_id_str = str(rows[idx][0])
+            try:
+                s3_results[idx] = future.result()
+            except Exception:
+                logger.warning(
+                    "Failed to fetch S3 content for %s — skipping",
+                    doc_id_str,
+                    exc_info=True,
+                )
+
+    # --- Process rows sequentially (DB writes) -----------------------------
+    for idx, row in enumerate(rows):
         (
             doc_id,
             case_id,
@@ -300,14 +333,9 @@ def reingest_batch(
             logger.warning("Document %s has no S3 key/bucket — skipping", doc_id_str)
             continue
 
-        try:
-            raw_content = _fetch_s3_content(s3_client, s3_bucket, s3_key)
-        except Exception:
-            logger.warning(
-                "Failed to fetch S3 content for %s — skipping",
-                doc_id_str,
-                exc_info=True,
-            )
+        raw_content = s3_results.get(idx)
+        if raw_content is None:
+            # S3 fetch failed or was not attempted
             continue
 
         doc_meta = {
@@ -418,6 +446,7 @@ def run_reingest(
     batch_size: int = 50,
     limit: int | None = None,
     dry_run: bool = False,
+    concurrency: int = 10,
 ) -> dict[str, int]:
     """Run the full reingest. Returns summary stats."""
     filters, filter_params = _build_filters(county, date_from, date_to)
@@ -444,6 +473,7 @@ def run_reingest(
                 filters,
                 filter_params,
                 dry_run=dry_run,
+                concurrency=concurrency,
             )
             total_processed += processed
             total_updated += updated
@@ -493,6 +523,12 @@ def main() -> None:
     parser.add_argument(
         "--limit", type=int, default=None, help="Max documents to process."
     )
+    parser.add_argument(
+        "--concurrency",
+        type=int,
+        default=10,
+        help="Number of parallel S3 fetch threads (default: 10).",
+    )
     args = parser.parse_args()
 
     dsn = os.environ.get("DATABASE_URL")
@@ -511,6 +547,7 @@ def main() -> None:
         batch_size=args.batch_size,
         limit=args.limit,
         dry_run=args.dry_run,
+        concurrency=args.concurrency,
     )
 
     logger.info(
