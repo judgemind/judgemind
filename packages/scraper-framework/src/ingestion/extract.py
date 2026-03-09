@@ -248,8 +248,10 @@ _CASE_NUMBER_PATTERNS: list[re.Pattern[str]] = [
     # San Francisco: F + 2 letters + hyphen + 2-digit year + hyphen + 6 digits.
     # e.g. FPT-25-378624, FMS-20-387302, FDI-14-781786
     re.compile(r"\bF[A-Z]{2}-\d{2}-\d{6}\b"),
-    # San Bernardino: CIV + 2 letters + 5-8 digits. e.g. CIVRS2502080
-    re.compile(r"\bCIV[A-Z]{2}\d{5,8}\b"),
+    # San Bernardino: CIV + 2 letters + optional space + 5-8 digits.
+    # e.g. CIVRS2502080, CIVSB2416631, CIVSB 2600093 (Dept S36 uses a space).
+    # Callers should normalise by removing any internal whitespace.
+    re.compile(r"\bCIV[A-Z]{2}\s*\d{5,8}\b"),
     # Riverside: CV + 2-4 letters + 6-8 digits. e.g. CVPS2306157
     re.compile(r"\bCV[A-Z]{2,4}\d{6,8}\b"),
     # Santa Clara: 2-digit year + CV + 6 digits. e.g. 24CV443183
@@ -282,8 +284,12 @@ def extract_case_number(ruling_text: str) -> str | None:
         if m:
             # Use group(1) if there's a capture group, otherwise group(0)
             if m.lastindex and m.lastindex >= 1:
-                return m.group(1)
-            return m.group(0)
+                raw = m.group(1)
+            else:
+                raw = m.group(0)
+            # Normalise: remove internal whitespace (e.g. "CIVSB 2600093" →
+            # "CIVSB2600093" for SB Dept S36 format).
+            return raw.replace(" ", "")
     return None
 
 
