@@ -77,6 +77,14 @@ def _mock_cursor_context(cur: MagicMock) -> MagicMock:
     return ctx
 
 
+def _mock_pipeline_context() -> MagicMock:
+    """Create a mock for conn.pipeline() context manager."""
+    ctx = MagicMock()
+    ctx.__enter__ = MagicMock(return_value=ctx)
+    ctx.__exit__ = MagicMock(return_value=False)
+    return ctx
+
+
 def _mock_conn_returning(rows: list) -> MagicMock:
     """Create a mock connection whose first cursor returns the given rows."""
     conn = MagicMock()
@@ -99,6 +107,7 @@ def _mock_conn_returning(rows: list) -> MagicMock:
         return ctx
 
     conn.cursor.side_effect = cursor_ctx
+    conn.pipeline.return_value = _mock_pipeline_context()
     return conn
 
 
@@ -452,6 +461,164 @@ class TestReingestBatchParallel:
 
         assert processed == 2
         assert mock_fetch.call_count == 2
+
+
+# ---------------------------------------------------------------------------
+# Pipeline mode tests
+# ---------------------------------------------------------------------------
+
+
+class TestReingestBatchPipeline:
+    """Tests that reingest_batch uses psycopg3 pipeline mode for DB writes."""
+
+    @patch("reingest_from_s3._reparse_document")
+    @patch("reingest_from_s3._fetch_s3_content")
+    def test_pipeline_context_entered(self, mock_fetch: MagicMock, mock_reparse: MagicMock) -> None:
+        """conn.pipeline() context manager is entered during non-dry-run."""
+        rows = [_make_document_row(uuid.uuid4(), _CAPTURED_AT_1)]
+        conn = _mock_conn_returning(rows)
+
+        mock_fetch.return_value = b"<html>content</html>"
+        mock_reparse.return_value = {
+            "ruling_text": "content",
+            "case_number": "24STCV12345",
+            "case_title": "Smith v. Jones",
+            "judge_name": "Smith",
+            "outcome": "granted",
+            "motion_type": "Motion for Summary Judgment",
+            "department": "1",
+            "parties": [{"name": "John Doe", "role": "plaintiff"}],
+            "hearing_date": _HEARING_DATE,
+        }
+
+        reingest.reingest_batch(
+            conn,
+            MagicMock(),
+            batch_size=10,
+            cursor=_DEFAULT_CURSOR,
+            filters="",
+            filter_params=[],
+            dry_run=False,
+        )
+
+        conn.pipeline.assert_called_once()
+        pipeline_ctx = conn.pipeline.return_value
+        pipeline_ctx.__enter__.assert_called_once()
+        pipeline_ctx.__exit__.assert_called_once()
+
+    @patch("reingest_from_s3._reparse_document")
+    @patch("reingest_from_s3._fetch_s3_content")
+    def test_pipeline_entered_for_dry_run(
+        self, mock_fetch: MagicMock, mock_reparse: MagicMock
+    ) -> None:
+        """Pipeline context is entered even during dry-run (no harm, no foul)."""
+        rows = [_make_document_row(uuid.uuid4(), _CAPTURED_AT_1)]
+        conn = _mock_conn_returning(rows)
+
+        mock_fetch.return_value = b"<html>content</html>"
+        mock_reparse.return_value = {
+            "ruling_text": "content",
+            "case_number": "24STCV12345",
+            "case_title": "Smith v. Jones",
+            "judge_name": None,
+            "outcome": None,
+            "motion_type": None,
+            "department": None,
+            "parties": [],
+            "hearing_date": _HEARING_DATE,
+        }
+
+        reingest.reingest_batch(
+            conn,
+            MagicMock(),
+            batch_size=10,
+            cursor=_DEFAULT_CURSOR,
+            filters="",
+            filter_params=[],
+            dry_run=True,
+        )
+
+        conn.pipeline.assert_called_once()
+
+    def test_pipeline_not_entered_for_empty_batch(self) -> None:
+        """When no rows are returned, pipeline is not entered."""
+        conn = MagicMock()
+        cur = MagicMock()
+        cur.fetchall.return_value = []
+        conn.cursor.return_value = _mock_cursor_context(cur)
+
+        reingest.reingest_batch(
+            conn,
+            MagicMock(),
+            batch_size=10,
+            cursor=_DEFAULT_CURSOR,
+            filters="",
+            filter_params=[],
+        )
+
+        conn.pipeline.assert_not_called()
+
+    @patch("reingest_from_s3.upsert_case_party")
+    @patch("reingest_from_s3.upsert_party")
+    @patch("reingest_from_s3.upsert_case_judge")
+    @patch("reingest_from_s3.insert_ruling")
+    @patch("reingest_from_s3.resolve_judge")
+    @patch("reingest_from_s3.insert_document")
+    @patch("reingest_from_s3.upsert_case")
+    @patch("reingest_from_s3._reparse_document")
+    @patch("reingest_from_s3._fetch_s3_content")
+    def test_db_functions_called_within_pipeline(
+        self,
+        mock_fetch: MagicMock,
+        mock_reparse: MagicMock,
+        mock_upsert_case: MagicMock,
+        mock_insert_doc: MagicMock,
+        mock_resolve_judge: MagicMock,
+        mock_insert_ruling: MagicMock,
+        mock_upsert_case_judge: MagicMock,
+        mock_upsert_party: MagicMock,
+        mock_upsert_case_party: MagicMock,
+    ) -> None:
+        """All DB write functions are called with correct args inside pipeline."""
+        doc_id = uuid.uuid4()
+        rows = [_make_document_row(doc_id, _CAPTURED_AT_1)]
+        conn = _mock_conn_returning(rows)
+
+        mock_fetch.return_value = b"<html>content</html>"
+        mock_upsert_case.return_value = "case-id-123"
+        mock_resolve_judge.return_value = "judge-id-456"
+        mock_upsert_party.return_value = "party-id-789"
+        mock_reparse.return_value = {
+            "ruling_text": "content",
+            "case_number": "24STCV12345",
+            "case_title": "Smith v. Jones",
+            "judge_name": "Judge Smith",
+            "outcome": "granted",
+            "motion_type": "MSJ",
+            "department": "Dept 1",
+            "parties": [{"name": "John Doe", "role": "plaintiff"}],
+            "hearing_date": _HEARING_DATE,
+        }
+
+        processed, updated, _ = reingest.reingest_batch(
+            conn,
+            MagicMock(),
+            batch_size=10,
+            cursor=_DEFAULT_CURSOR,
+            filters="",
+            filter_params=[],
+            dry_run=False,
+        )
+
+        assert processed == 1
+        assert updated == 1
+        mock_upsert_case.assert_called_once()
+        mock_insert_doc.assert_called_once()
+        mock_resolve_judge.assert_called_once()
+        mock_insert_ruling.assert_called_once()
+        mock_upsert_case_judge.assert_called_once()
+        mock_upsert_party.assert_called_once()
+        mock_upsert_case_party.assert_called_once()
 
 
 # ---------------------------------------------------------------------------

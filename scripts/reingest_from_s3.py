@@ -262,7 +262,9 @@ def reingest_batch(
     """Process one batch. Returns (processed, updated, next_cursor).
 
     S3 objects are fetched in parallel using a thread pool (controlled by
-    ``concurrency``).  DB writes remain sequential.
+    ``concurrency``).  DB writes use psycopg3's pipeline mode to amortise
+    network round-trips — multiple queries are sent without waiting for
+    individual responses at the protocol level.
     """
     processed = 0
     updated = 0
@@ -305,134 +307,143 @@ def reingest_batch(
                     exc_info=True,
                 )
 
-    # --- Process rows sequentially (DB writes) -----------------------------
-    for idx, row in enumerate(rows):
-        (
-            doc_id,
-            case_id,
-            court_id,
-            s3_key,
-            s3_bucket,
-            content_hash,
-            source_url,
-            scraper_id,
-            captured_at,
-            hearing_date,
-            doc_format,
-            state,
-            county,
-            court_name,
-            case_number,
-            case_title,
-        ) = row
-        processed += 1
-        doc_id_str = str(doc_id)
-        next_cursor = (captured_at, doc_id_str)
-
-        if not s3_key or not s3_bucket:
-            logger.warning("Document %s has no S3 key/bucket — skipping", doc_id_str)
-            continue
-
-        raw_content = s3_results.get(idx)
-        if raw_content is None:
-            # S3 fetch failed or was not attempted
-            continue
-
-        doc_meta = {
-            "document_id": doc_id_str,
-            "state": state,
-            "county": county,
-            "court_name": court_name,
-            "source_url": source_url,
-            "captured_at": captured_at,
-            "content_hash": content_hash,
-            "format": doc_format,
-            "case_number": case_number,
-            "case_title": case_title,
-            "hearing_date": hearing_date,
-        }
-
-        extracted = _reparse_document(raw_content, scraper_id, doc_meta)
-
-        if dry_run:
-            logger.info(
-                "DRY-RUN: %s county=%s judge=%s outcome=%s motion=%s title=%s case=%s parties=%d",
-                doc_id_str,
+    # --- Process rows with pipelined DB writes ------------------------------
+    # psycopg3's pipeline mode batches protocol-level messages so that
+    # multiple queries are sent without waiting for individual round-trip
+    # responses.  Even though some queries within a single document depend
+    # on results of prior queries (e.g. upsert_case returns case_id used
+    # by insert_document), the pipeline still amortises TCP round-trips
+    # across the batch because libpq groups the send/recv cycles.
+    with conn.pipeline():
+        for idx, row in enumerate(rows):
+            (
+                doc_id,
+                case_id,
+                court_id,
+                s3_key,
+                s3_bucket,
+                content_hash,
+                source_url,
+                scraper_id,
+                captured_at,
+                hearing_date,
+                doc_format,
+                state,
                 county,
-                extracted["judge_name"],
-                extracted["outcome"],
-                extracted["motion_type"],
-                extracted["case_title"],
-                extracted["case_number"],
-                len(extracted["parties"]),
+                court_name,
+                case_number,
+                case_title,
+            ) = row
+            processed += 1
+            doc_id_str = str(doc_id)
+            next_cursor = (captured_at, doc_id_str)
+
+            if not s3_key or not s3_bucket:
+                logger.warning(
+                    "Document %s has no S3 key/bucket — skipping", doc_id_str
+                )
+                continue
+
+            raw_content = s3_results.get(idx)
+            if raw_content is None:
+                # S3 fetch failed or was not attempted
+                continue
+
+            doc_meta = {
+                "document_id": doc_id_str,
+                "state": state,
+                "county": county,
+                "court_name": court_name,
+                "source_url": source_url,
+                "captured_at": captured_at,
+                "content_hash": content_hash,
+                "format": doc_format,
+                "case_number": case_number,
+                "case_title": case_title,
+                "hearing_date": hearing_date,
+            }
+
+            extracted = _reparse_document(raw_content, scraper_id, doc_meta)
+
+            if dry_run:
+                logger.info(
+                    "DRY-RUN: %s county=%s judge=%s outcome=%s motion=%s title=%s case=%s parties=%d",
+                    doc_id_str,
+                    county,
+                    extracted["judge_name"],
+                    extracted["outcome"],
+                    extracted["motion_type"],
+                    extracted["case_title"],
+                    extracted["case_number"],
+                    len(extracted["parties"]),
+                )
+                continue
+
+            # Re-run through the ingestion pipeline (now with upsert semantics)
+            effective_case_number = (
+                extracted["case_number"] or case_number or f"UNKNOWN-{doc_id_str}"
             )
-            continue
+            new_case_id = upsert_case(
+                conn,
+                effective_case_number,
+                str(court_id),
+                case_title=extracted["case_title"],
+            )
 
-        # Re-run through the ingestion pipeline (now with upsert semantics)
-        effective_case_number = (
-            extracted["case_number"] or case_number or f"UNKNOWN-{doc_id_str}"
-        )
-        new_case_id = upsert_case(
-            conn,
-            effective_case_number,
-            str(court_id),
-            case_title=extracted["case_title"],
-        )
-
-        effective_hearing = extracted["hearing_date"] or hearing_date
-        insert_document(
-            conn,
-            document_id=doc_id_str,
-            case_id=new_case_id,
-            court_id=str(court_id),
-            content_format=doc_format,
-            content_hash=content_hash,
-            s3_key=s3_key,
-            s3_bucket=s3_bucket,
-            source_url=source_url,
-            scraper_id=scraper_id,
-            captured_at=captured_at,
-            hearing_date=effective_hearing,
-        )
-
-        # Resolve judge
-        judge_id = None
-        if extracted["judge_name"]:
-            judge_id = resolve_judge(conn, extracted["judge_name"], str(court_id))
-
-        # Upsert ruling
-        if effective_hearing is not None:
-            ruling_text = extracted["ruling_text"]
-            # Clean ruling text if it's the full raw HTML — take first 50k chars
-            if ruling_text and len(ruling_text) > 50000:
-                ruling_text = ruling_text[:50000]
-
-            insert_ruling(
+            effective_hearing = extracted["hearing_date"] or hearing_date
+            insert_document(
                 conn,
                 document_id=doc_id_str,
                 case_id=new_case_id,
                 court_id=str(court_id),
+                content_format=doc_format,
+                content_hash=content_hash,
+                s3_key=s3_key,
+                s3_bucket=s3_bucket,
+                source_url=source_url,
+                scraper_id=scraper_id,
+                captured_at=captured_at,
                 hearing_date=effective_hearing,
-                ruling_text=ruling_text,
-                department=extracted["department"],
-                judge_id=judge_id,
-                outcome=extracted["outcome"],
-                motion_type=extracted["motion_type"],
             )
 
-        if judge_id:
-            upsert_case_judge(conn, new_case_id, judge_id, effective_hearing)
+            # Resolve judge
+            judge_id = None
+            if extracted["judge_name"]:
+                judge_id = resolve_judge(conn, extracted["judge_name"], str(court_id))
 
-        # Parties
-        for party_info in extracted.get("parties", []):
-            party_name = party_info.get("name", "")
-            party_role = party_info.get("role", "")
-            if party_name:
-                party_id = upsert_party(conn, party_name)
-                if party_role:
-                    upsert_case_party(conn, new_case_id, party_id, party_role)
+            # Upsert ruling
+            if effective_hearing is not None:
+                ruling_text = extracted["ruling_text"]
+                # Clean ruling text if it's the full raw HTML — take first 50k chars
+                if ruling_text and len(ruling_text) > 50000:
+                    ruling_text = ruling_text[:50000]
 
-        updated += 1
+                insert_ruling(
+                    conn,
+                    document_id=doc_id_str,
+                    case_id=new_case_id,
+                    court_id=str(court_id),
+                    hearing_date=effective_hearing,
+                    ruling_text=ruling_text,
+                    department=extracted["department"],
+                    judge_id=judge_id,
+                    outcome=extracted["outcome"],
+                    motion_type=extracted["motion_type"],
+                )
+
+            if judge_id:
+                upsert_case_judge(conn, new_case_id, judge_id, effective_hearing)
+
+            # Parties
+            for party_info in extracted.get("parties", []):
+                party_name = party_info.get("name", "")
+                party_role = party_info.get("role", "")
+                if party_name:
+                    party_id = upsert_party(conn, party_name)
+                    if party_role:
+                        upsert_case_party(conn, new_case_id, party_id, party_role)
+
+            updated += 1
 
     return processed, updated, next_cursor
 
