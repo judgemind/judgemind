@@ -416,6 +416,12 @@ def _extract_ruling_fields(soup: BeautifulSoup, doc: CapturedDocument) -> None:
             doc.judge_name = " ".join(m.group(1).split())
             break
 
+    # Fallback: use the broader regex patterns from extract.py
+    if not doc.judge_name and doc.ruling_text:
+        from ingestion.extract import extract_judge_name
+
+        doc.judge_name = extract_judge_name(doc.ruling_text)
+
 
 def _extract_case_title(content: BeautifulSoup) -> str | None:
     """Extract the first case title from ruling HTML content.

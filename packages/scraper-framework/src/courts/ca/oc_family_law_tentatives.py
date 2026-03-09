@@ -72,6 +72,7 @@ def _oc_fl_judge_name_from_match(m: re.Match) -> str:
 _HEARING_DATE_RE = re.compile(
     r"(?:January|February|March|April|May|June|July|August|September"
     r"|October|November|December)\s+\d{1,2},?\s+\d{4}",
+    re.IGNORECASE,
 )
 
 # Case number: 2-digit year + "D" + 6 digits (e.g. "25D006297")

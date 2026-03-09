@@ -10,6 +10,7 @@ The regex patterns target common California tentative ruling language.
 from __future__ import annotations
 
 import re
+from datetime import date, datetime
 
 # ---------------------------------------------------------------------------
 # Outcome extraction
@@ -324,6 +325,117 @@ def _looks_like_person_name(name: str) -> bool:
         return False
 
     return True
+
+
+# ---------------------------------------------------------------------------
+# Case title extraction
+# ---------------------------------------------------------------------------
+
+# Patterns to extract case titles ("Plaintiff v. Defendant") from ruling text.
+# Ordered by specificity — most anchored patterns first.
+_CASE_TITLE_PATTERNS: list[re.Pattern[str]] = [
+    # "Case Name: X v. Y" or "Case Title: X v. Y"
+    re.compile(
+        r"(?:Case\s+(?:Name|Title))\s*:\s*(?P<title>[^\n]{5,150})",
+        re.IGNORECASE,
+    ),
+    # "PLAINTIFF vs DEFENDANT" with case number prefix, Riverside-style
+    # e.g. "CVPS2306157 YELDELL vs HENSS Hearing re: Demurrer"
+    re.compile(
+        r"(?:^|\n)\s*(?:\S+\s+)"
+        r"(?P<title>[A-Z][A-Za-z,.'\- ]+?\s+vs?\.?\s+[A-Z][A-Za-z,.'\- ]+?)"
+        r"\s+(?:Hearing|Motion|Demurrer|Petition|Application|Order)",
+        re.MULTILINE,
+    ),
+    # Generic "X v. Y" or "X vs Y" or "X vs. Y" — broad fallback
+    re.compile(
+        r"(?:^|\n)\s*(?P<title>"
+        r"[A-Z][A-Za-z,.'\- ]{2,60}"
+        r"\s+(?:vs?\.?|VS\.?)\s+"
+        r"[A-Z][A-Za-z,.'\- ]{2,60}"
+        r")",
+        re.MULTILINE,
+    ),
+]
+
+
+def extract_case_title(ruling_text: str) -> str | None:
+    """Extract a case title from ruling text using regex patterns.
+
+    Looks for "Plaintiff v. Defendant" patterns in the text.
+    Returns the title in title case, or ``None`` if no pattern matches.
+    """
+    for pattern in _CASE_TITLE_PATTERNS:
+        m = pattern.search(ruling_text)
+        if m:
+            title = m.group("title").strip()
+            # Normalize: "AASI vs HONDA" → "Aasi v. Honda"
+            title = re.sub(r"\s+vs\.?\s+", " v. ", title, flags=re.IGNORECASE)
+            title = re.sub(r"\s+VS\.?\s+", " v. ", title)
+            # Title-case if all-caps
+            if title == title.upper():
+                title = title.title()
+            # Clean trailing punctuation
+            title = title.rstrip(".,;: ")
+            if len(title) >= 5:
+                return title
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Hearing date extraction
+# ---------------------------------------------------------------------------
+
+# Common date formats found in California tentative rulings.
+# Ordered by specificity — "Month DD, YYYY" first (most common in court PDFs),
+# then numeric formats.
+_HEARING_DATE_PATTERNS: list[tuple[re.Pattern[str], list[str]]] = [
+    # "February 24, 2026" or "February 24 2026" (with or without comma)
+    (
+        re.compile(
+            r"(?:January|February|March|April|May|June|July|August"
+            r"|September|October|November|December)"
+            r"\s+\d{1,2},?\s+\d{4}",
+            re.IGNORECASE,
+        ),
+        ["%B %d, %Y", "%B %d %Y"],
+    ),
+    # "Date: 03/04/26" or "Date: 03/04/2026"
+    (
+        re.compile(
+            r"Date:\s*(\d{1,2}/\d{1,2}/\d{2,4})",
+            re.IGNORECASE,
+        ),
+        ["%m/%d/%Y", "%m/%d/%y"],
+    ),
+    # Standalone MM/DD/YYYY or MM/DD/YY (less anchored — try last)
+    (
+        re.compile(r"\b(\d{1,2}/\d{1,2}/\d{4})\b"),
+        ["%m/%d/%Y"],
+    ),
+]
+
+
+def extract_hearing_date(ruling_text: str) -> date | None:
+    """Extract a hearing date from ruling text using common date patterns.
+
+    Returns the first successfully parsed date, or ``None`` if no pattern
+    matches.  This is a fallback for when scrapers do not populate
+    ``hearing_date`` in the event payload.
+    """
+    for pattern, formats in _HEARING_DATE_PATTERNS:
+        m = pattern.search(ruling_text)
+        if not m:
+            continue
+        # Use capture group if present, otherwise full match
+        raw = m.group(1) if m.lastindex and m.lastindex >= 1 else m.group(0)
+        raw = " ".join(raw.split())  # normalize whitespace
+        for fmt in formats:
+            try:
+                return datetime.strptime(raw, fmt).date()
+            except ValueError:
+                continue
+    return None
 
 
 def extract_judge_name(ruling_text: str) -> str | None:

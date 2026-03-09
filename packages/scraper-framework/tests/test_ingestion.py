@@ -16,6 +16,8 @@ import pytest
 
 from ingestion.db import (
     _derive_court_code,
+    insert_document,
+    insert_ruling,
     normalize_judge_name,
     normalize_party_name,
     upsert_case,
@@ -138,10 +140,11 @@ def test_process_event_happy_path(mock_psycopg: MagicMock) -> None:
     mock_cur.fetchone.side_effect = [
         ("court-uuid-1",),  # upsert_court
         ("case-uuid-1",),  # upsert_case
+        (True,),  # insert_document: RETURNING is_new = True
         None,  # resolve_judge: no existing alias found
         ("judge-uuid-1",),  # resolve_judge: INSERT INTO judges RETURNING id
     ]
-    mock_cur.rowcount = 1  # insert_document: new row
+    mock_cur.rowcount = 1
 
     event = _make_event()
     worker.process_event(event)
@@ -179,6 +182,7 @@ def test_process_event_passes_outcome_and_motion_type_from_event(mock_psycopg: M
     mock_cur.fetchone.side_effect = [
         ("court-uuid-1",),  # upsert_court
         ("case-uuid-1",),  # upsert_case
+        (True,),  # insert_document: RETURNING is_new = True
         None,  # resolve_judge: no existing alias
         ("judge-uuid-1",),  # resolve_judge: INSERT INTO judges
     ]
@@ -211,6 +215,7 @@ def test_process_event_extracts_outcome_from_ruling_text(mock_psycopg: MagicMock
     mock_cur.fetchone.side_effect = [
         ("court-uuid-1",),  # upsert_court
         ("case-uuid-1",),  # upsert_case
+        (True,),  # insert_document: RETURNING is_new = True
         None,  # resolve_judge: no existing alias
         ("judge-uuid-1",),  # resolve_judge: INSERT INTO judges
     ]
@@ -242,6 +247,7 @@ def test_process_event_event_fields_override_regex(mock_psycopg: MagicMock) -> N
     mock_cur.fetchone.side_effect = [
         ("court-uuid-1",),  # upsert_court
         ("case-uuid-1",),  # upsert_case
+        (True,),  # insert_document: RETURNING is_new = True
         None,  # resolve_judge: no existing alias
         ("judge-uuid-1",),  # resolve_judge: INSERT INTO judges
     ]
@@ -255,7 +261,7 @@ def test_process_event_event_fields_override_regex(mock_psycopg: MagicMock) -> N
     )
     worker.process_event(event)
 
-    ruling_calls = [c for c in mock_cur.execute.call_args_list if "INSERT INTO rulings" in str(c)]
+    ruling_calls = [c for c in mock_cur.execute.call_args_list if "INTO rulings" in str(c)]
     assert len(ruling_calls) == 1
     sql_args = ruling_calls[0][0][1]
     assert "denied" in sql_args
@@ -278,6 +284,7 @@ def test_process_event_no_case_number_falls_back_to_unknown(mock_psycopg: MagicM
     mock_cur.fetchone.side_effect = [
         ("court-uuid-1",),  # upsert_court
         ("case-uuid-1",),  # upsert_case
+        (True,),  # insert_document: RETURNING is_new = True
         None,  # resolve_judge: no existing alias
         ("judge-uuid-1",),  # resolve_judge: INSERT INTO judges
     ]
@@ -313,6 +320,7 @@ def test_process_event_extracts_case_number_from_ruling_text(mock_psycopg: Magic
     mock_cur.fetchone.side_effect = [
         ("court-uuid-1",),  # upsert_court
         ("case-uuid-1",),  # upsert_case
+        (True,),  # insert_document: RETURNING is_new = True
         None,  # resolve_judge: no existing alias
         ("judge-uuid-1",),  # resolve_judge: INSERT INTO judges
     ]
@@ -347,6 +355,7 @@ def test_process_event_no_hearing_date_skips_ruling(mock_psycopg: MagicMock) -> 
     mock_cur.fetchone.side_effect = [
         ("court-uuid-1",),  # upsert_court
         ("case-uuid-1",),  # upsert_case
+        (True,),  # insert_document: RETURNING is_new = True
         None,  # resolve_judge: no existing alias
         ("judge-uuid-1",),  # resolve_judge: INSERT INTO judges
     ]
@@ -383,10 +392,11 @@ def test_process_event_duplicate_skips_opensearch(mock_psycopg: MagicMock) -> No
     mock_cur.fetchone.side_effect = [
         ("court-uuid-1",),  # upsert_court
         ("case-uuid-1",),  # upsert_case
+        (False,),  # insert_document: RETURNING is_new = False (existing doc, upsert updated)
         None,  # resolve_judge: no existing alias
         ("judge-uuid-1",),  # resolve_judge: INSERT INTO judges
     ]
-    mock_cur.rowcount = 0  # document already exists — ON CONFLICT DO NOTHING
+    mock_cur.rowcount = 1  # upsert always returns rowcount=1
 
     worker.process_event(_make_event())
 
@@ -817,6 +827,7 @@ def test_process_event_no_judge_name_leaves_judge_id_null(mock_psycopg: MagicMoc
     mock_cur.fetchone.side_effect = [
         ("court-uuid-1",),  # upsert_court
         ("case-uuid-1",),  # upsert_case
+        (True,),  # insert_document: RETURNING is_new = True
     ]
     mock_cur.rowcount = 1
 
@@ -847,6 +858,7 @@ def test_process_event_with_existing_judge_alias(mock_psycopg: MagicMock) -> Non
     mock_cur.fetchone.side_effect = [
         ("court-uuid-1",),  # upsert_court
         ("case-uuid-1",),  # upsert_case
+        (True,),  # insert_document: RETURNING is_new = True
         ("existing-judge-uuid",),  # resolve_judge: found existing alias
     ]
     mock_cur.rowcount = 1
@@ -860,7 +872,7 @@ def test_process_event_with_existing_judge_alias(mock_psycopg: MagicMock) -> Non
     all_sql = " ".join(str(c) for c in mock_cur.execute.call_args_list)
     assert "INSERT INTO judges" not in all_sql
     # But should still insert ruling and case_judges
-    assert "INSERT INTO rulings" in all_sql
+    assert "INTO rulings" in all_sql
     assert "INSERT INTO case_judges" in all_sql
 
 
@@ -921,6 +933,7 @@ def test_process_event_passes_case_title_to_upsert_case(mock_psycopg: MagicMock)
     mock_cur.fetchone.side_effect = [
         ("court-uuid-1",),  # upsert_court
         ("case-uuid-1",),  # upsert_case
+        (True,),  # insert_document: RETURNING is_new = True
         None,  # resolve_judge: no existing alias
         ("judge-uuid-1",),  # resolve_judge: INSERT INTO judges
     ]
@@ -951,6 +964,7 @@ def test_process_event_without_case_title_passes_none(mock_psycopg: MagicMock) -
     mock_cur.fetchone.side_effect = [
         ("court-uuid-1",),  # upsert_court
         ("case-uuid-1",),  # upsert_case
+        (True,),  # insert_document: RETURNING is_new = True
         None,  # resolve_judge: no existing alias
         ("judge-uuid-1",),  # resolve_judge: INSERT INTO judges
     ]
@@ -1087,6 +1101,7 @@ def test_process_event_with_parties(mock_psycopg: MagicMock) -> None:
     mock_cur.fetchone.side_effect = [
         ("court-uuid-1",),  # upsert_court
         ("case-uuid-1",),  # upsert_case
+        (True,),  # insert_document: RETURNING is_new = True
         None,  # resolve_judge: no existing alias
         ("judge-uuid-1",),  # resolve_judge: INSERT INTO judges
         # upsert_party for first party: no existing alias, then INSERT
@@ -1129,6 +1144,7 @@ def test_process_event_without_parties_no_party_calls(mock_psycopg: MagicMock) -
     mock_cur.fetchone.side_effect = [
         ("court-uuid-1",),  # upsert_court
         ("case-uuid-1",),  # upsert_case
+        (True,),  # insert_document: RETURNING is_new = True
         None,  # resolve_judge: no existing alias
         ("judge-uuid-1",),  # resolve_judge: INSERT INTO judges
     ]
@@ -1139,3 +1155,121 @@ def test_process_event_without_parties_no_party_calls(mock_psycopg: MagicMock) -
 
     all_sql = " ".join(str(c) for c in mock_cur.execute.call_args_list)
     assert "INSERT INTO case_parties" not in all_sql
+
+
+# ---------------------------------------------------------------------------
+# Upsert behavior — insert_document and insert_ruling
+# ---------------------------------------------------------------------------
+
+
+def test_insert_document_upsert_updates_mutable_fields() -> None:
+    """insert_document ON CONFLICT updates hearing_date and case_id."""
+    mock_conn = MagicMock()
+    mock_cur = MagicMock()
+    mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cur)
+    mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+
+    # Simulate existing row (xmax != 0 → is_new = False)
+    mock_cur.fetchone.return_value = (False,)
+
+    result = insert_document(
+        mock_conn,
+        document_id="doc-uuid-1",
+        case_id="case-uuid-1",
+        court_id="court-uuid-1",
+        content_format="html",
+        content_hash="abc123",
+        s3_key="key",
+        s3_bucket="bucket",
+        source_url="https://example.com",
+        scraper_id="test-scraper",
+        captured_at=datetime(2026, 3, 5),
+        hearing_date=date(2026, 3, 5),
+    )
+
+    assert result is False  # not a new insert
+    sql = str(mock_cur.execute.call_args)
+    assert "ON CONFLICT (id) DO UPDATE" in sql
+    assert "hearing_date" in sql
+    assert "case_id" in sql
+
+
+def test_insert_document_upsert_new_row_returns_true() -> None:
+    """insert_document returns True for genuinely new rows."""
+    mock_conn = MagicMock()
+    mock_cur = MagicMock()
+    mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cur)
+    mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+
+    mock_cur.fetchone.return_value = (True,)
+
+    result = insert_document(
+        mock_conn,
+        document_id="doc-uuid-2",
+        case_id="case-uuid-1",
+        court_id="court-uuid-1",
+        content_format="html",
+        content_hash="def456",
+        s3_key="key2",
+        s3_bucket="bucket",
+        source_url="https://example.com/2",
+        scraper_id="test-scraper",
+        captured_at=datetime(2026, 3, 6),
+        hearing_date=date(2026, 3, 6),
+    )
+
+    assert result is True
+
+
+def test_insert_ruling_upsert_uses_on_conflict() -> None:
+    """insert_ruling uses ON CONFLICT (document_id) DO UPDATE."""
+    mock_conn = MagicMock()
+    mock_cur = MagicMock()
+    mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cur)
+    mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+
+    insert_ruling(
+        mock_conn,
+        document_id="doc-uuid-1",
+        case_id="case-uuid-1",
+        court_id="court-uuid-1",
+        hearing_date=date(2026, 3, 5),
+        ruling_text="Motion GRANTED.",
+        department="Dept. 1",
+        judge_id="judge-uuid-1",
+        outcome="granted",
+        motion_type="msj",
+    )
+
+    sql = str(mock_cur.execute.call_args)
+    assert "ON CONFLICT (document_id) DO UPDATE" in sql
+    assert "COALESCE" in sql
+    # Verify all updatable fields are in the ON CONFLICT clause
+    assert "judge_id" in sql
+    assert "outcome" in sql
+    assert "motion_type" in sql
+    assert "ruling_text" in sql
+    assert "department" in sql
+
+
+def test_insert_ruling_upsert_no_duplicate_document_id_param() -> None:
+    """insert_ruling args should not contain duplicate document_id."""
+    mock_conn = MagicMock()
+    mock_cur = MagicMock()
+    mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cur)
+    mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+
+    insert_ruling(
+        mock_conn,
+        document_id="doc-uuid-1",
+        case_id="case-uuid-1",
+        court_id="court-uuid-1",
+        hearing_date=date(2026, 3, 5),
+        ruling_text="Motion GRANTED.",
+        department="Dept. 1",
+    )
+
+    # The old pattern had document_id twice in the args tuple. New pattern has it once.
+    sql_args = mock_cur.execute.call_args[0][1]
+    doc_id_count = sum(1 for a in sql_args if a == "doc-uuid-1")
+    assert doc_id_count == 1

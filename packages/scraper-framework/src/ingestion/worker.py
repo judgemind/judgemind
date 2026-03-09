@@ -38,7 +38,13 @@ from .db import (
     upsert_court,
     upsert_party,
 )
-from .extract import extract_case_number, extract_motion_type, extract_outcome
+from .extract import (
+    extract_case_number,
+    extract_case_title,
+    extract_hearing_date,
+    extract_motion_type,
+    extract_outcome,
+)
 from .text_cleanup import clean_ruling_text
 
 if TYPE_CHECKING:
@@ -231,6 +237,16 @@ class IngestionWorker:
         capture_ts = _parse_datetime(event_data.get("capture_timestamp"))
         hearing_dt = _parse_date(event_data.get("hearing_date"))
 
+        # Fallback hearing date extraction: without hearing_date, no ruling
+        # row is created, which cascades to missing judge/outcome/motion_type.
+        if hearing_dt is None and ruling_text:
+            hearing_dt = extract_hearing_date(ruling_text)
+            if hearing_dt is not None:
+                logger.info(
+                    "Extracted hearing_date from ruling text (scraper did not provide it)",
+                    extra={"document_id": document_id, "hearing_date": str(hearing_dt)},
+                )
+
         # Outcome and motion_type: prefer event fields, fall back to regex
         outcome: str | None = event_data.get("outcome")
         motion_type: str | None = event_data.get("motion_type")
@@ -257,6 +273,10 @@ class IngestionWorker:
                     extra={"document_id": document_id, "case_number": extracted},
                 )
                 case_number = extracted
+
+        # Fallback case_title extraction from ruling text
+        if not case_title and ruling_text:
+            case_title = extract_case_title(ruling_text)
 
         with psycopg.connect(self._pg_dsn) as conn:
             # 1. Ensure court exists

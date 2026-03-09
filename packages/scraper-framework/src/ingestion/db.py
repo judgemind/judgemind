@@ -121,10 +121,11 @@ def insert_document(
     captured_at: datetime,
     hearing_date: date | None,
 ) -> bool:
-    """Insert a document row using the scraper-assigned document_id as the PK.
+    """Upsert a document row using the scraper-assigned document_id as the PK.
 
-    Returns True if a new row was inserted, False if it already existed
-    (idempotent — same document_id is a no-op).
+    Returns True if a new row was inserted, False if it already existed.
+    On conflict, updates mutable fields (hearing_date, case_id) while
+    preserving immutable fields (s3_key, content_hash, captured_at).
 
     The scraper's document_id UUID is used as documents.id so that OpenSearch
     document IDs and rulings.document_id references all converge on the same key.
@@ -150,7 +151,10 @@ def insert_document(
                 %s, %s, %s,
                 %s, %s, 'active'
             )
-            ON CONFLICT (id) DO NOTHING
+            ON CONFLICT (id) DO UPDATE SET
+                hearing_date = COALESCE(EXCLUDED.hearing_date, documents.hearing_date),
+                case_id = EXCLUDED.case_id
+            RETURNING (xmax = 0) AS is_new
             """,
             (
                 document_id,
@@ -166,7 +170,8 @@ def insert_document(
                 hearing_date,
             ),
         )
-        inserted = cur.rowcount == 1
+        row = cur.fetchone()
+        inserted = bool(row[0]) if row else False
     logger.debug("insert_document: id=%s inserted=%s", document_id, inserted)
     return inserted
 
@@ -296,10 +301,13 @@ def insert_ruling(
     outcome: str | None = None,
     motion_type: str | None = None,
 ) -> None:
-    """Insert a ruling row linked to the document.
+    """Upsert a ruling row linked to the document.
 
-    Skipped if a ruling for this document_id already exists (idempotent).
-    document_id is a FK to documents.id and serves as the dedup key.
+    On conflict (same document_id), updates extracted fields using COALESCE
+    so that non-NULL existing values are preserved unless the new value is
+    also non-NULL (allowing improved extraction to overwrite).
+
+    Requires a UNIQUE constraint on rulings.document_id (migration 3).
 
     ``outcome`` must be a valid ``ruling_outcome`` enum value (e.g.
     ``"granted"``, ``"denied"``) or ``None``.  ``motion_type`` is free-text.
@@ -312,11 +320,16 @@ def insert_ruling(
                 hearing_date, ruling_text, department, is_tentative,
                 outcome, motion_type
             )
-            SELECT %s::uuid, %s::uuid, %s::uuid, %s::uuid, %s::date, %s, %s, TRUE,
-                   %s::ruling_outcome, %s
-            WHERE NOT EXISTS (
-                SELECT 1 FROM rulings WHERE document_id = %s::uuid
+            VALUES (
+                %s::uuid, %s::uuid, %s::uuid, %s::uuid, %s::date, %s, %s, TRUE,
+                %s::ruling_outcome, %s
             )
+            ON CONFLICT (document_id) DO UPDATE SET
+                judge_id = COALESCE(EXCLUDED.judge_id, rulings.judge_id),
+                outcome = COALESCE(EXCLUDED.outcome, rulings.outcome),
+                motion_type = COALESCE(EXCLUDED.motion_type, rulings.motion_type),
+                ruling_text = COALESCE(EXCLUDED.ruling_text, rulings.ruling_text),
+                department = COALESCE(EXCLUDED.department, rulings.department)
             """,
             (
                 document_id,
@@ -328,10 +341,9 @@ def insert_ruling(
                 department,
                 outcome,
                 motion_type,
-                document_id,
             ),
         )
-    logger.debug("insert_ruling: document_id=%s rowcount=%s", document_id, conn.cursor().rowcount)
+    logger.debug("insert_ruling: document_id=%s", document_id)
 
 
 def normalize_party_name(raw_name: str) -> str:

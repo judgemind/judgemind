@@ -1,8 +1,9 @@
 # IAM role and policy for the scraper process.
 #
-# The scraper role grants write-only access to the document archive bucket.
-# Principle of least privilege: s3:PutObject on archive objects only.
-# No s3:GetObject, s3:DeleteObject, or bucket-level permissions are granted.
+# The scraper role grants read/write access to the document archive bucket.
+# s3:PutObject for archiving captured documents, s3:GetObject for the
+# reingest workflow (re-processing existing documents).
+# No s3:DeleteObject or bucket-level permissions are granted.
 #
 # Trust policy allows both EC2 (legacy/local) and ECS tasks to assume this
 # role. ECS Fargate tasks assume it via the task role configuration.
@@ -33,10 +34,12 @@ resource "aws_iam_role" "scraper" {
   }
 }
 
-# Write-only policy: s3:PutObject on archive objects.
+# Read/write policy: s3:PutObject + s3:GetObject on archive objects.
+# GetObject is needed for the reingest workflow (re-processing existing
+# documents through improved extraction logic).
 resource "aws_iam_policy" "scraper_s3_write" {
   name        = "judgemind-scraper-s3-write-${var.environment}"
-  description = "Allows the scraper to write objects to the document archive bucket"
+  description = "Allows the scraper to read and write objects in the document archive bucket"
 
   policy = jsonencode({
     Version = "2012-10-17"
@@ -45,6 +48,12 @@ resource "aws_iam_policy" "scraper_s3_write" {
         Sid      = "AllowPutObject"
         Effect   = "Allow"
         Action   = "s3:PutObject"
+        Resource = "${var.document_archive_bucket_arn}/*"
+      },
+      {
+        Sid      = "AllowGetObject"
+        Effect   = "Allow"
+        Action   = "s3:GetObject"
         Resource = "${var.document_archive_bucket_arn}/*"
       }
     ]
