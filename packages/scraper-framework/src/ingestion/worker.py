@@ -10,6 +10,7 @@ Environment variables:
     REDIS_URL         — Redis URL, e.g. redis://localhost:6379 (required)
     OPENSEARCH_URL    — OpenSearch endpoint, e.g. https://localhost:9200 (required)
     JUDGEMIND_ARCHIVE_BUCKET — S3 bucket for document content (required for full-text indexing)
+    ANTHROPIC_API_KEY — Anthropic API key for LLM extraction (optional; regex-only if absent)
     MAX_RETRIES       — Per-message retry limit before dead-lettering (default: 3)
 """
 
@@ -19,6 +20,7 @@ import json
 import logging
 import os
 import socket
+import time
 from datetime import date, datetime
 from typing import TYPE_CHECKING, Any
 
@@ -47,13 +49,27 @@ from .extract import (
     extract_outcome,
     extract_parties_from_caption,
 )
+from .llm_extract import LLMExtractionResult, LLMRulingResult, extract_fields_llm
 from .text_cleanup import clean_ruling_text
 
 if TYPE_CHECKING:
+    import anthropic
     from opensearchpy import OpenSearch
     from redis import Redis
 
 logger = logging.getLogger(__name__)
+
+# Fields that LLM extraction can populate when missing from the scraper event.
+EXTRACTABLE_FIELDS = (
+    "hearing_date",
+    "outcome",
+    "motion_type",
+    "case_number",
+    "case_title",
+    "judge_name",
+    "department",
+    "parties",
+)
 
 # ---------------------------------------------------------------------------
 # Infrastructure vs message error classification
@@ -145,6 +161,7 @@ class IngestionWorker:
         s3_client: Any,
         archive_bucket: str,
         max_retries: int = DEFAULT_MAX_RETRIES,
+        anthropic_client: anthropic.Anthropic | None = None,
     ) -> None:
         self._redis = redis_client
         self._pg_dsn = pg_dsn
@@ -156,6 +173,18 @@ class IngestionWorker:
             index_name=TENTATIVE_RULINGS_ALIAS,
             ensure_index=True,
         )
+
+        # LLM extraction client — create from env var if not provided.
+        # If ANTHROPIC_API_KEY is not set, run in regex-only mode.
+        self._anthropic_client: anthropic.Anthropic | None = anthropic_client
+        if self._anthropic_client is None and os.environ.get("ANTHROPIC_API_KEY"):
+            import anthropic as _anthropic
+
+            self._anthropic_client = _anthropic.Anthropic()
+        if self._anthropic_client is None:
+            logger.warning(
+                "ANTHROPIC_API_KEY not set — LLM extraction disabled, using regex-only mode"
+            )
 
     # ------------------------------------------------------------------
     # Public interface
@@ -217,6 +246,11 @@ class IngestionWorker:
     def process_event(self, event_data: dict[str, Any]) -> None:
         """Process a single deserialized event dict.
 
+        Extraction strategy (per field):
+          1. Use the scraper-provided value if present.
+          2. Try LLM extraction (if ANTHROPIC_API_KEY is configured).
+          3. Fall back to regex extraction.
+
         Exposed for testing. Raises on unrecoverable errors.
         """
         document_id: str = event_data["document_id"]
@@ -239,24 +273,111 @@ class IngestionWorker:
         capture_ts = _parse_datetime(event_data.get("capture_timestamp"))
         hearing_dt = _parse_date(event_data.get("hearing_date"))
 
-        # Fallback hearing date extraction: without hearing_date, no ruling
-        # row is created, which cascades to missing judge/outcome/motion_type.
+        outcome: str | None = event_data.get("outcome")
+        motion_type: str | None = event_data.get("motion_type")
+        parties_data: list[dict[str, str]] = event_data.get("parties", [])
+
+        # ------------------------------------------------------------------
+        # Determine which fields are missing and need extraction
+        # ------------------------------------------------------------------
+        missing_fields = [f for f in EXTRACTABLE_FIELDS if not event_data.get(f)]
+
+        # Track which method populated each extracted field for logging
+        extraction_methods: dict[str, str] = {}
+
+        # ------------------------------------------------------------------
+        # LLM extraction — primary method for missing fields
+        # ------------------------------------------------------------------
+        llm_result: LLMExtractionResult | None = None
+        if missing_fields and ruling_text and self._anthropic_client is not None:
+            metadata = {
+                "link_text": event_data.get("extra", {}).get("link_text")
+                if isinstance(event_data.get("extra"), dict)
+                else None,
+                "judge_name": event_data.get("judge_name"),
+                "department": event_data.get("department"),
+            }
+            t0 = time.monotonic()
+            llm_result = extract_fields_llm(
+                document_text=ruling_text,
+                content_format=content_format,
+                metadata=metadata,
+                client=self._anthropic_client,
+            )
+            llm_latency_ms = round((time.monotonic() - t0) * 1000)
+
+            if llm_result is not None:
+                # Find the matching ruling by case_number if available
+                ruling = _match_ruling(llm_result, case_number)
+
+                # Apply document-level fields from LLM
+                if hearing_dt is None and llm_result.hearing_date is not None:
+                    hearing_dt = llm_result.hearing_date
+                    extraction_methods["hearing_date"] = "llm"
+                if not judge_name and llm_result.judge_name:
+                    judge_name = llm_result.judge_name
+                    extraction_methods["judge_name"] = "llm"
+                if not department and llm_result.department:
+                    department = llm_result.department
+                    extraction_methods["department"] = "llm"
+
+                # Apply ruling-level fields from the matched ruling
+                if ruling is not None:
+                    if not case_number and ruling.case_number:
+                        case_number = ruling.case_number
+                        extraction_methods["case_number"] = "llm"
+                    if not case_title and ruling.case_title:
+                        case_title = ruling.case_title
+                        extraction_methods["case_title"] = "llm"
+                    if outcome is None and ruling.outcome:
+                        outcome = ruling.outcome
+                        extraction_methods["outcome"] = "llm"
+                    if motion_type is None and ruling.motion_type:
+                        motion_type = ruling.motion_type
+                        extraction_methods["motion_type"] = "llm"
+                    if not parties_data and ruling.parties:
+                        parties_data = ruling.parties
+                        extraction_methods["parties"] = "llm"
+
+                logger.info(
+                    "LLM extraction completed",
+                    extra={
+                        "document_id": document_id,
+                        "llm_latency_ms": llm_latency_ms,
+                        "extraction_methods": extraction_methods,
+                        "llm_case_count": llm_result.case_count,
+                    },
+                )
+            else:
+                logger.info(
+                    "LLM extraction returned None — falling back to regex",
+                    extra={
+                        "document_id": document_id,
+                        "llm_latency_ms": llm_latency_ms,
+                    },
+                )
+
+        # ------------------------------------------------------------------
+        # Regex fallback — fill any fields still missing after LLM
+        # ------------------------------------------------------------------
         if hearing_dt is None and ruling_text:
             hearing_dt = extract_hearing_date(ruling_text)
             if hearing_dt is not None:
+                extraction_methods.setdefault("hearing_date", "regex")
                 logger.info(
-                    "Extracted hearing_date from ruling text (scraper did not provide it)",
+                    "Extracted hearing_date from ruling text (regex fallback)",
                     extra={"document_id": document_id, "hearing_date": str(hearing_dt)},
                 )
 
-        # Outcome and motion_type: prefer event fields, fall back to regex
-        outcome: str | None = event_data.get("outcome")
-        motion_type: str | None = event_data.get("motion_type")
         if ruling_text and (outcome is None or motion_type is None):
             if outcome is None:
                 outcome = extract_outcome(ruling_text)
+                if outcome is not None:
+                    extraction_methods.setdefault("outcome", "regex")
             if motion_type is None:
                 motion_type = extract_motion_type(ruling_text)
+                if motion_type is not None:
+                    extraction_methods.setdefault("motion_type", "regex")
 
         # Clean ruling text for display — extraction uses raw text above for
         # better regex matching; the cleaned version is stored in Postgres.
@@ -264,33 +385,56 @@ class IngestionWorker:
 
         court_name = f"{court}, County of {county}"
 
-        # Fallback case number extraction: if the scraper did not populate
-        # case_number but ruling_text is available, try regex extraction from
-        # the text before resorting to the synthetic UNKNOWN- prefix.
+        # Fallback case number extraction (regex)
         if not case_number and ruling_text:
             extracted = extract_case_number(ruling_text)
             if extracted:
+                extraction_methods.setdefault("case_number", "regex")
                 logger.info(
-                    "Extracted case_number from ruling text (scraper did not provide it)",
+                    "Extracted case_number from ruling text (regex fallback)",
                     extra={"document_id": document_id, "case_number": extracted},
                 )
                 case_number = extracted
 
-        # Fallback case_title extraction from ruling text
+        # Fallback case_title extraction (regex)
         if not case_title and ruling_text:
             case_title = extract_case_title(ruling_text)
+            if case_title:
+                extraction_methods.setdefault("case_title", "regex")
 
         # Fallback judge_name extraction from ruling text (#401).
-        # Many LA rulings have the judge name in the text (e.g., ALL-CAPS header
-        # "DEPARTMENT 56 JUDGE STEVEN A. ELLIS") but the scraper may not have
-        # extracted it if the pattern wasn't supported at capture time.
         if not judge_name and ruling_text:
             judge_name = extract_judge_name(ruling_text)
             if judge_name:
+                extraction_methods.setdefault("judge_name", "regex")
                 logger.info(
-                    "Extracted judge_name from ruling text (scraper did not provide it)",
+                    "Extracted judge_name from ruling text (regex fallback)",
                     extra={"document_id": document_id, "judge_name": judge_name},
                 )
+
+        # Fallback: if no parties yet but we have a case title with "v.",
+        # extract plaintiff/defendant from the caption.
+        effective_title = case_title or event_data.get("case_title")
+        if not parties_data and effective_title:
+            parties_data = extract_parties_from_caption(effective_title)
+            if parties_data:
+                extraction_methods.setdefault("parties", "regex")
+                logger.info(
+                    "Extracted parties from case caption (regex fallback)",
+                    extra={
+                        "document_id": document_id,
+                        "party_count": len(parties_data),
+                    },
+                )
+
+        if extraction_methods:
+            logger.info(
+                "Field extraction summary",
+                extra={
+                    "document_id": document_id,
+                    "extraction_methods": extraction_methods,
+                },
+            )
 
         with psycopg.connect(self._pg_dsn) as conn:
             # 1. Ensure court exists
@@ -348,22 +492,6 @@ class IngestionWorker:
                 upsert_case_judge(conn, case_id, judge_id, hearing_dt)
 
             # 7. Create party records and link to case
-            parties_data: list[dict[str, str]] = event_data.get("parties", [])
-
-            # Fallback: if scraper provided no parties but we have a case title
-            # with a "v." separator, extract plaintiff/defendant from the caption.
-            effective_title = case_title or event_data.get("case_title")
-            if not parties_data and effective_title:
-                parties_data = extract_parties_from_caption(effective_title)
-                if parties_data:
-                    logger.info(
-                        "Extracted parties from case caption (scraper did not provide them)",
-                        extra={
-                            "document_id": document_id,
-                            "party_count": len(parties_data),
-                        },
-                    )
-
             for party_info in parties_data:
                 party_name = party_info.get("name", "")
                 party_role = party_info.get("role", "")
@@ -375,7 +503,7 @@ class IngestionWorker:
             conn.commit()
 
         if is_new:
-            # 5. Index in OpenSearch — document_id is used as the OS doc id
+            # Index in OpenSearch — document_id is used as the OS doc id
             # so rulings.document_id FK aligns with OpenSearch _id
             self._indexer.index_document(
                 {
@@ -474,6 +602,30 @@ class IngestionWorker:
             last_exc,
         )
         self._redis.xack(STREAM_DOCUMENT_CAPTURED, CONSUMER_GROUP, msg_id)
+
+
+# ---------------------------------------------------------------------------
+# LLM ruling matching helper
+# ---------------------------------------------------------------------------
+
+
+def _match_ruling(
+    llm_result: LLMExtractionResult,
+    case_number: str | None,
+) -> LLMRulingResult | None:
+    """Find the ruling matching the event's case_number, or return the first ruling.
+
+    If the event already has a case_number from the scraper, look for a matching
+    ruling in the LLM results. If no match is found, fall back to the first ruling
+    (the LLM may have normalized the case number differently).
+    """
+    if not llm_result.rulings:
+        return None
+    if case_number:
+        matching = [r for r in llm_result.rulings if r.case_number == case_number]
+        if matching:
+            return matching[0]
+    return llm_result.rulings[0]
 
 
 # ---------------------------------------------------------------------------

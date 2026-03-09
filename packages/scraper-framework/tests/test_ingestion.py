@@ -1417,3 +1417,400 @@ def test_insert_ruling_upsert_no_duplicate_document_id_param() -> None:
     sql_args = mock_cur.execute.call_args[0][1]
     doc_id_count = sum(1 for a in sql_args if a == "doc-uuid-1")
     assert doc_id_count == 1
+
+
+# ---------------------------------------------------------------------------
+# LLM extraction integration — mock LLM response, verify fields populated
+# ---------------------------------------------------------------------------
+
+
+@patch("ingestion.worker.extract_fields_llm")
+@patch("ingestion.worker.psycopg")
+def test_process_event_llm_extraction_populates_missing_fields(
+    mock_psycopg: MagicMock,
+    mock_llm: MagicMock,
+) -> None:
+    """When LLM extraction returns results, missing fields are populated from LLM."""
+    from ingestion.llm_extract import LLMExtractionResult, LLMRulingResult
+
+    worker, os_mock = _make_worker()
+    # Simulate an anthropic client being configured
+    worker._anthropic_client = MagicMock()
+
+    mock_conn = MagicMock()
+    mock_cur = MagicMock()
+    mock_conn.__enter__ = MagicMock(return_value=mock_conn)
+    mock_conn.__exit__ = MagicMock(return_value=False)
+    mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cur)
+    mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+    mock_psycopg.connect.return_value = mock_conn
+    mock_cur.fetchone.side_effect = [
+        ("court-uuid-1",),  # upsert_court
+        ("case-uuid-1",),  # upsert_case
+        (True,),  # insert_document: RETURNING is_new = True
+        None,  # resolve_judge: no existing alias
+        ("judge-uuid-1",),  # resolve_judge: INSERT INTO judges
+        # Party upserts from LLM parties
+        None,
+        ("party-uuid-1",),
+        None,
+        ("party-uuid-2",),
+    ]
+    mock_cur.rowcount = 1
+
+    # Configure LLM to return structured results
+    mock_llm.return_value = LLMExtractionResult(
+        judge_name="Steven A. Ellis",
+        hearing_date=date(2026, 3, 10),
+        department="56",
+        case_count=1,
+        rulings=[
+            LLMRulingResult(
+                case_number="24NNCV02551",
+                case_title="Doe v. Roe",
+                outcome="granted",
+                motion_type="msj",
+                parties=[
+                    {"name": "John Doe", "role": "plaintiff"},
+                    {"name": "Jane Roe", "role": "defendant"},
+                ],
+            )
+        ],
+    )
+
+    # Event with minimal fields — LLM should fill in the rest
+    event = _make_event(
+        case_number=None,
+        case_title=None,
+        judge_name=None,
+        department=None,
+        hearing_date=None,
+        outcome=None,
+        motion_type=None,
+        ruling_text="Some ruling text that LLM will parse",
+    )
+    worker.process_event(event)
+
+    # Verify LLM was called
+    mock_llm.assert_called_once()
+
+    # Verify fields from LLM were used in DB writes
+    all_sql = " ".join(str(c) for c in mock_cur.execute.call_args_list)
+
+    # Case number from LLM
+    assert "24NNCV02551" in all_sql
+
+    # Ruling should have been inserted (hearing_date from LLM)
+    ruling_calls = [c for c in mock_cur.execute.call_args_list if "INSERT INTO rulings" in str(c)]
+    assert len(ruling_calls) == 1
+    sql_args = ruling_calls[0][0][1]
+    assert "granted" in sql_args
+    assert "msj" in sql_args
+
+    # Judge was resolved (from LLM result)
+    assert "judges" in all_sql.lower()
+
+    # Parties from LLM were written
+    assert "INSERT INTO parties" in all_sql
+    assert "INSERT INTO case_parties" in all_sql
+
+
+@patch("ingestion.worker.extract_fields_llm")
+@patch("ingestion.worker.psycopg")
+def test_process_event_llm_failure_falls_back_to_regex(
+    mock_psycopg: MagicMock,
+    mock_llm: MagicMock,
+) -> None:
+    """When LLM extraction returns None, regex extraction is used as fallback."""
+    worker, os_mock = _make_worker()
+    worker._anthropic_client = MagicMock()
+
+    mock_conn = MagicMock()
+    mock_cur = MagicMock()
+    mock_conn.__enter__ = MagicMock(return_value=mock_conn)
+    mock_conn.__exit__ = MagicMock(return_value=False)
+    mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cur)
+    mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+    mock_psycopg.connect.return_value = mock_conn
+    mock_cur.fetchone.side_effect = [
+        ("court-uuid-1",),  # upsert_court
+        ("case-uuid-1",),  # upsert_case
+        (True,),  # insert_document: RETURNING is_new = True
+        None,  # resolve_judge: no existing alias
+        ("judge-uuid-1",),  # resolve_judge: INSERT INTO judges
+    ]
+    mock_cur.rowcount = 1
+
+    # LLM returns None (simulating API failure)
+    mock_llm.return_value = None
+
+    event = _make_event(
+        outcome=None,
+        motion_type=None,
+        ruling_text="The motion for summary judgment is GRANTED.",
+    )
+    worker.process_event(event)
+
+    # LLM was attempted
+    mock_llm.assert_called_once()
+
+    # Regex fallback should have extracted outcome and motion_type
+    ruling_calls = [c for c in mock_cur.execute.call_args_list if "INSERT INTO rulings" in str(c)]
+    assert len(ruling_calls) == 1
+    sql_args = ruling_calls[0][0][1]
+    assert "granted" in sql_args
+    assert "msj" in sql_args
+
+
+@patch("ingestion.worker.psycopg")
+def test_process_event_no_anthropic_client_uses_regex_only(
+    mock_psycopg: MagicMock,
+) -> None:
+    """When anthropic client is None (no API key), regex-only mode is used."""
+    worker, os_mock = _make_worker()
+    # Ensure no anthropic client
+    worker._anthropic_client = None
+
+    mock_conn = MagicMock()
+    mock_cur = MagicMock()
+    mock_conn.__enter__ = MagicMock(return_value=mock_conn)
+    mock_conn.__exit__ = MagicMock(return_value=False)
+    mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cur)
+    mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+    mock_psycopg.connect.return_value = mock_conn
+    mock_cur.fetchone.side_effect = [
+        ("court-uuid-1",),  # upsert_court
+        ("case-uuid-1",),  # upsert_case
+        (True,),  # insert_document: RETURNING is_new = True
+        None,  # resolve_judge: no existing alias
+        ("judge-uuid-1",),  # resolve_judge: INSERT INTO judges
+    ]
+    mock_cur.rowcount = 1
+
+    event = _make_event(
+        outcome=None,
+        motion_type=None,
+        ruling_text="The motion for summary judgment is GRANTED.",
+    )
+    worker.process_event(event)
+
+    # Regex should still extract outcome and motion_type
+    ruling_calls = [c for c in mock_cur.execute.call_args_list if "INSERT INTO rulings" in str(c)]
+    assert len(ruling_calls) == 1
+    sql_args = ruling_calls[0][0][1]
+    assert "granted" in sql_args
+    assert "msj" in sql_args
+
+
+@patch("ingestion.worker.extract_fields_llm")
+@patch("ingestion.worker.psycopg")
+def test_process_event_llm_matches_ruling_by_case_number(
+    mock_psycopg: MagicMock,
+    mock_llm: MagicMock,
+) -> None:
+    """When event has a case_number and LLM returns multiple rulings,
+    the matching ruling is used."""
+    from ingestion.llm_extract import LLMExtractionResult, LLMRulingResult
+
+    worker, os_mock = _make_worker()
+    worker._anthropic_client = MagicMock()
+
+    mock_conn = MagicMock()
+    mock_cur = MagicMock()
+    mock_conn.__enter__ = MagicMock(return_value=mock_conn)
+    mock_conn.__exit__ = MagicMock(return_value=False)
+    mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cur)
+    mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+    mock_psycopg.connect.return_value = mock_conn
+    mock_cur.fetchone.side_effect = [
+        ("court-uuid-1",),  # upsert_court
+        ("case-uuid-1",),  # upsert_case
+        (True,),  # insert_document: RETURNING is_new = True
+        None,  # resolve_judge: no existing alias
+        ("judge-uuid-1",),  # resolve_judge: INSERT INTO judges
+        # Party upserts from caption extraction ("Smith v. Jones")
+        None,
+        ("party-uuid-1",),
+        None,
+        ("party-uuid-2",),
+    ]
+    mock_cur.rowcount = 1
+
+    # LLM returns two rulings — one matches the event's case_number
+    mock_llm.return_value = LLMExtractionResult(
+        judge_name="Ellis",
+        hearing_date=date(2026, 3, 10),
+        department="56",
+        case_count=2,
+        rulings=[
+            LLMRulingResult(
+                case_number="24NNCV99999",
+                case_title="Other v. Case",
+                outcome="denied",
+                motion_type="demurrer",
+                parties=[],
+            ),
+            LLMRulingResult(
+                case_number="23STCV12345",
+                case_title="Smith v. Jones",
+                outcome="granted",
+                motion_type="msj",
+                parties=[],
+            ),
+        ],
+    )
+
+    # Event has case_number that matches the second ruling
+    event = _make_event(
+        case_number="23STCV12345",
+        outcome=None,
+        motion_type=None,
+        case_title=None,
+        ruling_text="Some ruling text",
+    )
+    worker.process_event(event)
+
+    # Should use the second ruling (matching case_number), not the first
+    ruling_calls = [c for c in mock_cur.execute.call_args_list if "INSERT INTO rulings" in str(c)]
+    assert len(ruling_calls) == 1
+    sql_args = ruling_calls[0][0][1]
+    assert "granted" in sql_args
+    assert "msj" in sql_args
+
+    # case_title from the matched ruling
+    case_calls = [c for c in mock_cur.execute.call_args_list if "INSERT INTO cases" in str(c)]
+    assert len(case_calls) == 1
+    case_args = case_calls[0][0][1]
+    assert "Smith v. Jones" in case_args
+
+
+@patch("ingestion.worker.extract_fields_llm")
+@patch("ingestion.worker.psycopg")
+def test_process_event_scraper_fields_take_precedence_over_llm(
+    mock_psycopg: MagicMock,
+    mock_llm: MagicMock,
+) -> None:
+    """Scraper-provided fields are not overwritten by LLM results."""
+    from ingestion.llm_extract import LLMExtractionResult, LLMRulingResult
+
+    worker, os_mock = _make_worker()
+    worker._anthropic_client = MagicMock()
+
+    mock_conn = MagicMock()
+    mock_cur = MagicMock()
+    mock_conn.__enter__ = MagicMock(return_value=mock_conn)
+    mock_conn.__exit__ = MagicMock(return_value=False)
+    mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cur)
+    mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+    mock_psycopg.connect.return_value = mock_conn
+    mock_cur.fetchone.side_effect = [
+        ("court-uuid-1",),  # upsert_court
+        ("case-uuid-1",),  # upsert_case
+        (True,),  # insert_document: RETURNING is_new = True
+        ("existing-judge-uuid",),  # resolve_judge: existing alias
+        # Party upserts — LLM provides a party since scraper didn't, and
+        # caption fallback may also fire for "Correct v. Title"
+        None,
+        ("party-uuid-1",),
+        None,
+        ("party-uuid-2",),
+        None,
+        ("party-uuid-3",),
+    ]
+    mock_cur.rowcount = 1
+
+    # LLM returns different values than the scraper
+    mock_llm.return_value = LLMExtractionResult(
+        judge_name="Wrong Judge",
+        hearing_date=date(2099, 1, 1),
+        department="99",
+        case_count=1,
+        rulings=[
+            LLMRulingResult(
+                case_number="WRONG-CASE",
+                case_title="Wrong v. Title",
+                outcome="denied",
+                motion_type="demurrer",
+                parties=[{"name": "Wrong", "role": "plaintiff"}],
+            )
+        ],
+    )
+
+    # Event has ALL fields populated by scraper — LLM should not override
+    event = _make_event(
+        case_number="23STCV12345",
+        case_title="Correct v. Title",
+        judge_name="Correct Judge",
+        department="Dept. 1",
+        hearing_date="2026-03-05",
+        outcome="granted",
+        motion_type="msj",
+        ruling_text="Some ruling text",
+    )
+    worker.process_event(event)
+
+    # Scraper values should be used, not LLM values
+    ruling_calls = [c for c in mock_cur.execute.call_args_list if "INSERT INTO rulings" in str(c)]
+    assert len(ruling_calls) == 1
+    sql_args = ruling_calls[0][0][1]
+    assert "granted" in sql_args
+    assert "msj" in sql_args
+    # "denied" and "demurrer" from LLM should NOT appear
+    assert "denied" not in sql_args
+    assert "demurrer" not in sql_args
+
+    case_calls = [c for c in mock_cur.execute.call_args_list if "INSERT INTO cases" in str(c)]
+    assert len(case_calls) == 1
+    case_args = case_calls[0][0][1]
+    assert "Correct v. Title" in case_args
+
+
+# ---------------------------------------------------------------------------
+# _match_ruling unit tests
+# ---------------------------------------------------------------------------
+
+
+def test_match_ruling_finds_by_case_number() -> None:
+    """_match_ruling returns the ruling matching the event's case_number."""
+    from ingestion.llm_extract import LLMExtractionResult, LLMRulingResult
+    from ingestion.worker import _match_ruling
+
+    result = LLMExtractionResult(
+        rulings=[
+            LLMRulingResult(case_number="AAA"),
+            LLMRulingResult(case_number="BBB"),
+        ]
+    )
+    assert _match_ruling(result, "BBB").case_number == "BBB"
+
+
+def test_match_ruling_falls_back_to_first() -> None:
+    """_match_ruling returns the first ruling if no case_number match."""
+    from ingestion.llm_extract import LLMExtractionResult, LLMRulingResult
+    from ingestion.worker import _match_ruling
+
+    result = LLMExtractionResult(
+        rulings=[
+            LLMRulingResult(case_number="AAA"),
+            LLMRulingResult(case_number="BBB"),
+        ]
+    )
+    assert _match_ruling(result, "CCC").case_number == "AAA"
+
+
+def test_match_ruling_no_case_number_returns_first() -> None:
+    """_match_ruling returns the first ruling when event has no case_number."""
+    from ingestion.llm_extract import LLMExtractionResult, LLMRulingResult
+    from ingestion.worker import _match_ruling
+
+    result = LLMExtractionResult(rulings=[LLMRulingResult(case_number="AAA")])
+    assert _match_ruling(result, None).case_number == "AAA"
+
+
+def test_match_ruling_empty_rulings_returns_none() -> None:
+    """_match_ruling returns None when LLM returned no rulings."""
+    from ingestion.llm_extract import LLMExtractionResult
+    from ingestion.worker import _match_ruling
+
+    result = LLMExtractionResult(rulings=[])
+    assert _match_ruling(result, "AAA") is None
