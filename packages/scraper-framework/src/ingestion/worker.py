@@ -44,6 +44,7 @@ from .extract import (
     extract_hearing_date,
     extract_motion_type,
     extract_outcome,
+    extract_parties_from_caption,
 )
 from .text_cleanup import clean_ruling_text
 
@@ -335,6 +336,21 @@ class IngestionWorker:
 
             # 7. Create party records and link to case
             parties_data: list[dict[str, str]] = event_data.get("parties", [])
+
+            # Fallback: if scraper provided no parties but we have a case title
+            # with a "v." separator, extract plaintiff/defendant from the caption.
+            effective_title = case_title or event_data.get("case_title")
+            if not parties_data and effective_title:
+                parties_data = extract_parties_from_caption(effective_title)
+                if parties_data:
+                    logger.info(
+                        "Extracted parties from case caption (scraper did not provide them)",
+                        extra={
+                            "document_id": document_id,
+                            "party_count": len(parties_data),
+                        },
+                    )
+
             for party_info in parties_data:
                 party_name = party_info.get("name", "")
                 party_role = party_info.get("role", "")

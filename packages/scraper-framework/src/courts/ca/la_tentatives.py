@@ -674,21 +674,61 @@ def _extract_parties_from_moving_responding(text: str) -> list[dict[str, str]]:
     return parties
 
 
+def _is_corporate_suffix(token: str) -> bool:
+    """Return True if *token* is a corporate/entity suffix that should not be
+    split from the preceding name.
+
+    Examples: Inc, Inc., LLC, Corp, Corporation, Ltd, L.P., N.A., Co., LP, GP
+    """
+    normalized = token.strip().replace(".", "").upper()
+    return normalized in {
+        "INC",
+        "LLC",
+        "CORP",
+        "CORPORATION",
+        "LTD",
+        "LP",
+        "GP",
+        "CO",
+        "NA",
+        "PA",
+        "PC",
+        "PLLC",
+        "LLP",
+        "DBA",
+    }
+
+
 def _split_party_names(text: str) -> list[str]:
     """Split a string containing multiple party names into individual names.
 
     Handles patterns like:
     - "David Keichline, Claudia Lopez, and Mason Keichline"
     - "Ashley Willowbrook LP and Ashley Willowbrook GP LP"
+    - "Techno-Advanced, Inc." (corporate suffix kept with name)
 
-    Uses ", " as the primary delimiter. Also splits on " and " when it
-    appears after a comma-separated list (Oxford comma pattern).
+    Uses ", " as the primary delimiter.  After splitting, reassembles
+    fragments that are corporate suffixes (Inc, LLC, Corp, etc.) back
+    onto the preceding name so that "Techno-Advanced, Inc." stays intact.
     """
     # First, handle Oxford comma: "A, B, and C" -> split on ", " and ", and "
-    parts = re.split(r",\s+and\s+|,\s+", text)
+    raw_parts = re.split(r",\s+and\s+|,\s+", text)
     # If no commas found, try splitting on standalone " and "
-    if len(parts) == 1:
-        parts = re.split(r"\s+and\s+", text)
+    if len(raw_parts) == 1:
+        raw_parts = re.split(r"\s+and\s+", text)
+
+    # Reassemble corporate suffixes onto the preceding name.
+    # e.g. ["Techno-Advanced", "Inc."] -> ["Techno-Advanced, Inc."]
+    parts: list[str] = []
+    for fragment in raw_parts:
+        fragment = fragment.strip()
+        if not fragment:
+            continue
+        if parts and _is_corporate_suffix(fragment):
+            parts[-1] = f"{parts[-1]}, {fragment}"
+        else:
+            parts.append(fragment)
+
     return [p.strip() for p in parts if p.strip()]
 
 
