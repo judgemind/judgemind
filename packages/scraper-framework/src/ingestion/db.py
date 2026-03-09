@@ -192,6 +192,15 @@ def insert_document(
     return inserted
 
 
+# Honorific prefixes to strip from judge names during normalization.
+# Ordered so longer/more-specific prefixes match first.
+# Anchored to the start of the string (^) so mid-name occurrences are not affected.
+_HONORIFIC_PREFIX_RE = re.compile(
+    r"^(?:The\s+)?Honorable\.?\s+|^Hon\.?\s+|^Judge:?\s+",
+    re.IGNORECASE,
+)
+
+
 def normalize_judge_name(raw_name: str) -> str:
     """Normalize a raw judge name string to a canonical form.
 
@@ -199,17 +208,25 @@ def normalize_judge_name(raw_name: str) -> str:
       - "LAST, FIRST M."    -> "First M. Last"
       - "FIRST M. LAST"     -> "First M. Last"
       - "  Smith,  John A. " -> "John A. Smith"
+      - "Hon. Joseph B. Widman" -> "Joseph B. Widman"
+      - "Judge Bobby P. Luna" -> "Bobby P. Luna"
+      - "The Honorable Jane Doe" -> "Jane Doe"
 
     Steps:
       1. Strip leading/trailing whitespace.
       2. Collapse internal whitespace.
-      3. If the name contains a comma, treat the part before the comma as the
+      3. Strip honorific prefixes (Hon., Judge, The Honorable, Honorable).
+      4. If the name contains a comma, treat the part before the comma as the
          last name and the part after as the first/middle.
-      4. Title-case the result.
+      5. Title-case the result.
     """
     name = raw_name.strip()
     # Collapse multiple spaces to one
     name = re.sub(r"\s+", " ", name)
+
+    # Strip honorific prefixes — order matters: "The Honorable" before "Honorable",
+    # and "Hon." before "Hon" to avoid leaving a trailing period.
+    name = _HONORIFIC_PREFIX_RE.sub("", name).strip()
 
     if "," in name:
         parts = name.split(",", 1)

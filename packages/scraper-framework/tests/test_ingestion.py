@@ -774,6 +774,70 @@ def test_normalize_judge_name_all_caps_long_name() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Judge name normalization — honorific prefix stripping (#331)
+# ---------------------------------------------------------------------------
+
+
+def test_normalize_judge_name_strips_hon_dot() -> None:
+    """'Hon. Joseph B. Widman' → 'Joseph B. Widman'."""
+    assert normalize_judge_name("Hon. Joseph B. Widman") == "Joseph B. Widman"
+
+
+def test_normalize_judge_name_strips_hon_no_dot() -> None:
+    """'Hon Joseph B. Widman' → 'Joseph B. Widman'."""
+    assert normalize_judge_name("Hon Joseph B. Widman") == "Joseph B. Widman"
+
+
+def test_normalize_judge_name_strips_honorable() -> None:
+    """'Honorable Jane Doe' → 'Jane Doe'."""
+    assert normalize_judge_name("Honorable Jane Doe") == "Jane Doe"
+
+
+def test_normalize_judge_name_strips_the_honorable() -> None:
+    """'The Honorable Jane Doe' → 'Jane Doe'."""
+    assert normalize_judge_name("The Honorable Jane Doe") == "Jane Doe"
+
+
+def test_normalize_judge_name_strips_judge_prefix() -> None:
+    """'Judge Bobby P. Luna' → 'Bobby P. Luna'."""
+    assert normalize_judge_name("Judge Bobby P. Luna") == "Bobby P. Luna"
+
+
+def test_normalize_judge_name_strips_judge_colon() -> None:
+    """'Judge: Bobby P. Luna' → 'Bobby P. Luna'."""
+    assert normalize_judge_name("Judge: Bobby P. Luna") == "Bobby P. Luna"
+
+
+def test_normalize_judge_name_strips_hon_case_insensitive() -> None:
+    """Honorific stripping is case-insensitive."""
+    assert normalize_judge_name("HON. JOHN SMITH") == "John Smith"
+    assert normalize_judge_name("the honorable john smith") == "John Smith"
+    assert normalize_judge_name("JUDGE MARK MOONEY") == "Mark Mooney"
+
+
+def test_normalize_judge_name_hon_with_comma_format() -> None:
+    """'Hon. SMITH, JOHN A.' → comma-flip then title-case."""
+    assert normalize_judge_name("Hon. Smith, John A.") == "John A. Smith"
+
+
+def test_normalize_judge_name_honorable_with_allcaps() -> None:
+    """'THE HONORABLE JOSEPH WIDMAN' → 'Joseph Widman'."""
+    assert normalize_judge_name("THE HONORABLE JOSEPH WIDMAN") == "Joseph Widman"
+
+
+def test_normalize_judge_name_consistency_with_without_hon() -> None:
+    """Same judge with and without 'Hon.' should produce the same canonical name.
+
+    This is the core bug from issue #331: 'Joseph Widman' and 'Hon. Joseph B. Widman'
+    produce different canonical names because the prefix was not stripped.
+    """
+    # With middle initial, both variants should normalize the same way
+    assert normalize_judge_name("Hon. Joseph B. Widman") == normalize_judge_name("Joseph B. Widman")
+    # Plain name without prefix should still work
+    assert normalize_judge_name("Joseph Widman") == "Joseph Widman"
+
+
+# ---------------------------------------------------------------------------
 # Judge resolution (resolve_judge)
 # ---------------------------------------------------------------------------
 
