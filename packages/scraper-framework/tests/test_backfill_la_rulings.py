@@ -81,6 +81,10 @@ JANE SMITH,
 </body></html>"""
 
 
+_CREATED_AT = datetime(2026, 3, 5, 18, 0)
+_DEFAULT_CURSOR = (backfill_la._CURSOR_MIN_TIMESTAMP, backfill_la._CURSOR_MIN_UUID)
+
+
 def _make_ruling_row(
     s3_key: str = _S3_KEY,
     s3_bucket: str | None = _BUCKET,
@@ -100,6 +104,7 @@ def _make_ruling_row(
         "ca-la-tentatives",  # d.scraper_id
         datetime(2026, 3, 5, 18, 0),  # d.captured_at
         case_number,  # c.case_number
+        _CREATED_AT,  # r.created_at
     )
 
 
@@ -320,8 +325,15 @@ class TestBackfillBatch:
     @patch("backfill_la_rulings.process_ruling")
     def test_empty_batch(self, mock_process: MagicMock) -> None:
         conn = _mock_cursor_factory([])
-        stats = backfill_la.backfill_batch(conn, MagicMock(), _BUCKET, 50, 0)
+        stats, next_cursor = backfill_la.backfill_batch(
+            conn,
+            MagicMock(),
+            _BUCKET,
+            50,
+            cursor=_DEFAULT_CURSOR,
+        )
         assert stats["processed"] == 0
+        assert next_cursor == _DEFAULT_CURSOR
         mock_process.assert_not_called()
 
     @patch("backfill_la_rulings.process_ruling")
@@ -330,9 +342,16 @@ class TestBackfillBatch:
         row = _make_ruling_row()
         conn = _mock_cursor_factory([row])
 
-        stats = backfill_la.backfill_batch(conn, MagicMock(), _BUCKET, 50, 0)
+        stats, next_cursor = backfill_la.backfill_batch(
+            conn,
+            MagicMock(),
+            _BUCKET,
+            50,
+            cursor=_DEFAULT_CURSOR,
+        )
         assert stats["processed"] == 1
         assert stats["updated"] == 1
+        assert next_cursor == (_CREATED_AT, _RULING_ID)
         mock_process.assert_called_once()
 
     @patch("backfill_la_rulings.process_ruling")
@@ -342,7 +361,13 @@ class TestBackfillBatch:
         row = _make_ruling_row()
         conn = _mock_cursor_factory([row])
 
-        stats = backfill_la.backfill_batch(conn, MagicMock(), _BUCKET, 50, 0)
+        stats, _cursor = backfill_la.backfill_batch(
+            conn,
+            MagicMock(),
+            _BUCKET,
+            50,
+            cursor=_DEFAULT_CURSOR,
+        )
         assert stats["processed"] == 1
         assert stats["skipped"] == 1
 
@@ -369,9 +394,11 @@ class TestRunBackfill:
         mock_conn.__exit__ = MagicMock(return_value=False)
         mock_psycopg.connect.return_value = mock_conn
 
+        cursor_1 = (datetime(2026, 3, 5, 12, 0), str(uuid.uuid4()))
+        cursor_2 = (datetime(2026, 3, 5, 14, 0), str(uuid.uuid4()))
         mock_batch.side_effect = [
-            {"processed": 50, "updated": 40, "split_created": 5, "skipped": 5},
-            {"processed": 10, "updated": 8, "split_created": 1, "skipped": 1},
+            ({"processed": 50, "updated": 40, "split_created": 5, "skipped": 5}, cursor_1),
+            ({"processed": 10, "updated": 8, "split_created": 1, "skipped": 1}, cursor_2),
         ]
 
         stats = backfill_la.run_backfill("postgresql://test", dry_run=True)
@@ -396,9 +423,11 @@ class TestRunBackfill:
         mock_conn.__exit__ = MagicMock(return_value=False)
         mock_psycopg.connect.return_value = mock_conn
 
+        cursor_1 = (datetime(2026, 3, 5, 12, 0), str(uuid.uuid4()))
+        cursor_2 = (datetime(2026, 3, 5, 14, 0), str(uuid.uuid4()))
         mock_batch.side_effect = [
-            {"processed": 50, "updated": 45, "split_created": 3, "skipped": 2},
-            {"processed": 20, "updated": 18, "split_created": 1, "skipped": 1},
+            ({"processed": 50, "updated": 45, "split_created": 3, "skipped": 2}, cursor_1),
+            ({"processed": 20, "updated": 18, "split_created": 1, "skipped": 1}, cursor_2),
         ]
 
         stats = backfill_la.run_backfill("postgresql://test")
@@ -422,8 +451,9 @@ class TestRunBackfill:
         mock_conn.__exit__ = MagicMock(return_value=False)
         mock_psycopg.connect.return_value = mock_conn
 
+        cursor_1 = (datetime(2026, 3, 5, 12, 0), str(uuid.uuid4()))
         mock_batch.side_effect = [
-            {"processed": 10, "updated": 8, "split_created": 1, "skipped": 1},
+            ({"processed": 10, "updated": 8, "split_created": 1, "skipped": 1}, cursor_1),
         ]
 
         stats = backfill_la.run_backfill(
@@ -435,3 +465,8 @@ class TestRunBackfill:
         call_args = mock_batch.call_args_list[0]
         assert call_args[0][3] == 10  # effective_batch = min(50, 10)
         assert stats["total_processed"] == 10
+
+    def test_query_uses_keyset_not_offset(self) -> None:
+        """The FETCH_QUERY must use keyset pagination, not OFFSET."""
+        assert "OFFSET" not in backfill_la.FETCH_QUERY
+        assert "(r.created_at, r.id) > (%s, %s)" in backfill_la.FETCH_QUERY

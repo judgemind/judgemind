@@ -78,6 +78,10 @@ DEFAULT_BUCKET = "judgemind-document-archive-dev"
 # Queries
 # ---------------------------------------------------------------------------
 
+# Minimum cursor values for the first batch
+_CURSOR_MIN_TIMESTAMP = datetime(1970, 1, 1)
+_CURSOR_MIN_UUID = "00000000-0000-0000-0000-000000000000"
+
 # Fetch LA County rulings that have an S3 archive (so we can re-process from raw HTML).
 # We join documents to get the s3_key/s3_bucket, and filter for CA / Los Angeles.
 FETCH_QUERY = """
@@ -92,7 +96,8 @@ FETCH_QUERY = """
            d.source_url,
            d.scraper_id,
            d.captured_at,
-           c.case_number
+           c.case_number,
+           r.created_at
     FROM rulings r
     JOIN documents d ON d.id = r.document_id
     JOIN courts ct ON ct.id = r.court_id
@@ -100,8 +105,9 @@ FETCH_QUERY = """
     WHERE ct.state = 'CA'
       AND ct.county = 'Los Angeles'
       AND d.s3_key IS NOT NULL
-    ORDER BY r.created_at
-    LIMIT %s OFFSET %s
+    AND (r.created_at, r.id) > (%s, %s)
+    ORDER BY r.created_at, r.id
+    LIMIT %s
 """
 
 UPDATE_RULING_TEXT_QUERY = """
@@ -421,11 +427,12 @@ def backfill_batch(
     s3_client: object,
     default_bucket: str,
     batch_size: int = 50,
-    offset: int = 0,
-) -> dict[str, int]:
+    cursor: tuple[datetime, str] = (_CURSOR_MIN_TIMESTAMP, _CURSOR_MIN_UUID),
+) -> tuple[dict[str, int], tuple[datetime, str]]:
     """Process one batch of LA County rulings.
 
-    Returns a stats dict with keys: processed, updated, split_created, skipped.
+    Returns (stats_dict, next_cursor) where stats has keys:
+    processed, updated, split_created, skipped.
     """
     stats: dict[str, int] = {
         "processed": 0,
@@ -433,13 +440,14 @@ def backfill_batch(
         "split_created": 0,
         "skipped": 0,
     }
+    next_cursor = cursor
 
     with conn.cursor() as cur:
-        cur.execute(FETCH_QUERY, (batch_size, offset))
+        cur.execute(FETCH_QUERY, (cursor[0], cursor[1], batch_size))
         rows = cur.fetchall()
 
     if not rows:
-        return stats
+        return stats, cursor
 
     for (
         ruling_id,
@@ -454,8 +462,10 @@ def backfill_batch(
         scraper_id,
         captured_at,
         existing_case_number,
+        created_at,
     ) in rows:
         stats["processed"] += 1
+        next_cursor = (created_at, str(ruling_id))
         try:
             result = process_ruling(
                 conn,
@@ -486,7 +496,7 @@ def backfill_batch(
             )
             stats["skipped"] += 1
 
-    return stats
+    return stats, next_cursor
 
 
 def run_backfill(
@@ -504,7 +514,7 @@ def run_backfill(
         "total_split_created": 0,
         "total_skipped": 0,
     }
-    offset = 0
+    cursor: tuple[datetime, str] = (_CURSOR_MIN_TIMESTAMP, _CURSOR_MIN_UUID)
     s3_client = boto3.client("s3")
 
     with psycopg.connect(dsn) as conn:
@@ -516,12 +526,12 @@ def run_backfill(
                     break
                 effective_batch = min(batch_size, remaining)
 
-            batch_stats = backfill_batch(
+            batch_stats, cursor = backfill_batch(
                 conn,
                 s3_client,
                 bucket,
                 effective_batch,
-                offset,
+                cursor,
             )
             total["total_processed"] += batch_stats["processed"]
             total["total_updated"] += batch_stats["updated"]
@@ -549,8 +559,6 @@ def run_backfill(
 
             if batch_stats["processed"] < effective_batch:
                 break
-
-            offset += effective_batch
 
     return total
 

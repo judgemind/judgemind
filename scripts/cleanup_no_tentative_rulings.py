@@ -26,6 +26,7 @@ import logging
 import os
 import re
 import sys
+from datetime import datetime
 
 import psycopg
 
@@ -45,8 +46,12 @@ _NO_TENTATIVE_RULINGS_RE = re.compile(
 # SQL queries
 # ---------------------------------------------------------------------------
 
+# Minimum cursor values for the first batch
+_CURSOR_MIN_TIMESTAMP = datetime(1970, 1, 1)
+_CURSOR_MIN_UUID = "00000000-0000-0000-0000-000000000000"
+
 FETCH_QUERY = """
-    SELECT c.id, c.case_number, r.ruling_text
+    SELECT c.id, c.case_number, r.ruling_text, c.created_at
     FROM cases c
     JOIN LATERAL (
         SELECT r2.ruling_text
@@ -57,8 +62,9 @@ FETCH_QUERY = """
         LIMIT 1
     ) r ON TRUE
     WHERE c.case_number LIKE 'UNKNOWN-%%'
-    ORDER BY c.created_at
-    LIMIT %s OFFSET %s
+    AND (c.created_at, c.id) > (%s, %s)
+    ORDER BY c.created_at, c.id
+    LIMIT %s
 """
 
 DELETE_RULINGS_QUERY = """
@@ -86,21 +92,23 @@ DELETE_CASE_QUERY = """
 def cleanup_batch(
     conn: psycopg.Connection,
     batch_size: int = 100,
-    offset: int = 0,
-) -> tuple[int, int]:
-    """Process one batch of UNKNOWN cases. Returns (processed, deleted) counts."""
+    cursor: tuple[datetime, str] = (_CURSOR_MIN_TIMESTAMP, _CURSOR_MIN_UUID),
+) -> tuple[int, int, tuple[datetime, str]]:
+    """Process one batch of UNKNOWN cases. Returns (processed, deleted, next_cursor)."""
     processed = 0
     deleted = 0
+    next_cursor = cursor
 
     with conn.cursor() as cur:
-        cur.execute(FETCH_QUERY, (batch_size, offset))
+        cur.execute(FETCH_QUERY, (cursor[0], cursor[1], batch_size))
         rows = cur.fetchall()
 
     if not rows:
-        return 0, 0
+        return 0, 0, cursor
 
-    for case_id, case_number, ruling_text in rows:
+    for case_id, case_number, ruling_text, created_at in rows:
         processed += 1
+        next_cursor = (created_at, str(case_id))
 
         if not ruling_text or not _NO_TENTATIVE_RULINGS_RE.match(ruling_text):
             continue
@@ -118,7 +126,7 @@ def cleanup_batch(
             cur.execute(DELETE_CASE_QUERY, (str(case_id),))
         deleted += 1
 
-    return processed, deleted
+    return processed, deleted, next_cursor
 
 
 def run_cleanup(
@@ -131,7 +139,7 @@ def run_cleanup(
     """Run the full cleanup. Returns summary stats."""
     total_processed = 0
     total_deleted = 0
-    offset = 0
+    cursor: tuple[datetime, str] = (_CURSOR_MIN_TIMESTAMP, _CURSOR_MIN_UUID)
 
     with psycopg.connect(dsn) as conn:
         while True:
@@ -142,7 +150,7 @@ def run_cleanup(
                     break
                 effective_batch = min(batch_size, remaining)
 
-            processed, deleted = cleanup_batch(conn, effective_batch, offset)
+            processed, deleted, cursor = cleanup_batch(conn, effective_batch, cursor)
             total_processed += processed
             total_deleted += deleted
 
@@ -162,14 +170,6 @@ def run_cleanup(
 
             if processed < effective_batch:
                 break
-
-            # When deleting, offset does not advance since rows are removed.
-            # But when NOT deleting (dry-run or no matches), advance offset.
-            if not dry_run and deleted > 0:
-                # Rows were deleted, so next batch starts at same offset
-                pass
-            else:
-                offset += effective_batch
 
     return {
         "total_processed": total_processed,

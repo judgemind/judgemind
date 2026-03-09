@@ -10,7 +10,7 @@ import importlib
 import os
 import sys
 import uuid
-from datetime import date
+from datetime import date, datetime
 from unittest.mock import MagicMock, patch
 
 _SCRIPTS_DIR = os.path.join(
@@ -31,6 +31,8 @@ backfill = importlib.import_module("backfill_ruling_fields")
 _COURT_ID = str(uuid.uuid4())
 _CASE_ID = str(uuid.uuid4())
 _HEARING_DATE = date(2026, 3, 5)
+_CREATED_AT = datetime(2026, 3, 1, 10, 0, 0)
+_DEFAULT_CURSOR = (backfill._CURSOR_MIN_TIMESTAMP, backfill._CURSOR_MIN_UUID)
 
 
 def _make_ruling_row(
@@ -41,6 +43,7 @@ def _make_ruling_row(
     motion_type: str | None = None,
     case_id: str | None = None,
     hearing_date: date | None = None,
+    created_at: datetime | None = None,
 ) -> tuple:
     """Return a tuple matching the FETCH_QUERY columns."""
     return (
@@ -52,6 +55,7 @@ def _make_ruling_row(
         motion_type,
         case_id if case_id is not None else _CASE_ID,
         hearing_date if hearing_date is not None else _HEARING_DATE,
+        created_at if created_at is not None else _CREATED_AT,
     )
 
 
@@ -70,7 +74,11 @@ class TestBackfillBatch:
         conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
         cur.fetchall.return_value = []
 
-        processed, updated = backfill.backfill_batch(conn, batch_size=10, offset=0)
+        processed, updated, _cursor = backfill.backfill_batch(
+            conn,
+            batch_size=10,
+            cursor=_DEFAULT_CURSOR,
+        )
         assert processed == 0
         assert updated == 0
 
@@ -101,7 +109,11 @@ class TestBackfillBatch:
         # No judge name in this text
         mock_resolve.return_value = None
 
-        processed, updated = backfill.backfill_batch(conn, batch_size=10, offset=0)
+        processed, updated, _cursor = backfill.backfill_batch(
+            conn,
+            batch_size=10,
+            cursor=_DEFAULT_CURSOR,
+        )
 
         assert processed == 1
         assert updated == 1
@@ -131,7 +143,11 @@ class TestBackfillBatch:
         ctx.__exit__ = MagicMock(return_value=False)
         conn.cursor.return_value = ctx
 
-        processed, updated = backfill.backfill_batch(conn, batch_size=10, offset=0)
+        processed, updated, _cursor = backfill.backfill_batch(
+            conn,
+            batch_size=10,
+            cursor=_DEFAULT_CURSOR,
+        )
 
         assert processed == 1
         assert updated == 0
@@ -164,7 +180,11 @@ class TestBackfillBatch:
         conn.cursor.side_effect = cursor_ctx
         mock_resolve.return_value = "judge-uuid-123"
 
-        processed, updated = backfill.backfill_batch(conn, batch_size=10, offset=0)
+        processed, updated, _cursor = backfill.backfill_batch(
+            conn,
+            batch_size=10,
+            cursor=_DEFAULT_CURSOR,
+        )
 
         assert processed == 1
         assert updated == 1
@@ -210,7 +230,11 @@ class TestBackfillBatch:
 
         conn.cursor.side_effect = cursor_ctx
 
-        processed, updated = backfill.backfill_batch(conn, batch_size=10, offset=0)
+        processed, updated, _cursor = backfill.backfill_batch(
+            conn,
+            batch_size=10,
+            cursor=_DEFAULT_CURSOR,
+        )
 
         assert processed == 1
         assert updated == 1
@@ -236,7 +260,11 @@ class TestBackfillBatch:
         ctx.__exit__ = MagicMock(return_value=False)
         conn.cursor.return_value = ctx
 
-        processed, updated = backfill.backfill_batch(conn, batch_size=10, offset=0)
+        processed, updated, _cursor = backfill.backfill_batch(
+            conn,
+            batch_size=10,
+            cursor=_DEFAULT_CURSOR,
+        )
 
         assert processed == 1
         assert updated == 0
@@ -259,7 +287,11 @@ class TestBackfillCaseJudgesBatch:
         conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
         cur.fetchall.return_value = []
 
-        created = backfill.backfill_case_judges_batch(conn, batch_size=10, offset=0)
+        created, _cursor = backfill.backfill_case_judges_batch(
+            conn,
+            batch_size=10,
+            cursor=backfill._CURSOR_MIN_UUID,
+        )
         assert created == 0
         mock_upsert_cj.assert_not_called()
 
@@ -281,7 +313,11 @@ class TestBackfillCaseJudgesBatch:
             (case_id_2, judge_id_2, hd),
         ]
 
-        created = backfill.backfill_case_judges_batch(conn, batch_size=10, offset=0)
+        created, _cursor = backfill.backfill_case_judges_batch(
+            conn,
+            batch_size=10,
+            cursor=backfill._CURSOR_MIN_UUID,
+        )
 
         assert created == 2
         assert mock_upsert_cj.call_count == 2
@@ -306,9 +342,11 @@ class TestRunBackfill:
         mock_conn.__exit__ = MagicMock(return_value=False)
         mock_psycopg.connect.return_value = mock_conn
 
+        cursor_1 = (datetime(2026, 3, 1), str(uuid.uuid4()))
+        cursor_2 = (datetime(2026, 3, 2), str(uuid.uuid4()))
         # Two batches: first full, second partial (signals end)
-        mock_batch.side_effect = [(100, 80), (5, 3)]
-        mock_cj_batch.return_value = 0  # no orphan case_judges
+        mock_batch.side_effect = [(100, 80, cursor_1), (5, 3, cursor_2)]
+        mock_cj_batch.return_value = (0, backfill._CURSOR_MIN_UUID)  # no orphan case_judges
 
         stats = backfill.run_backfill("postgresql://test", batch_size=100, dry_run=True)
 
@@ -333,9 +371,11 @@ class TestRunBackfill:
         mock_conn.__exit__ = MagicMock(return_value=False)
         mock_psycopg.connect.return_value = mock_conn
 
+        cursor_1 = (datetime(2026, 3, 1), str(uuid.uuid4()))
+        cursor_2 = (datetime(2026, 3, 2), str(uuid.uuid4()))
         # Two batches: first full, second partial (signals end)
-        mock_batch.side_effect = [(100, 80), (30, 20)]
-        mock_cj_batch.return_value = 0  # no orphan case_judges
+        mock_batch.side_effect = [(100, 80, cursor_1), (30, 20, cursor_2)]
+        mock_cj_batch.return_value = (0, backfill._CURSOR_MIN_UUID)  # no orphan case_judges
 
         stats = backfill.run_backfill("postgresql://test", batch_size=100)
 
@@ -360,9 +400,10 @@ class TestRunBackfill:
         mock_conn.__exit__ = MagicMock(return_value=False)
         mock_psycopg.connect.return_value = mock_conn
 
+        cursor_1 = (datetime(2026, 3, 1), str(uuid.uuid4()))
         # Limit 50, batch_size 100 — should process at most 50
-        mock_batch.side_effect = [(50, 40)]
-        mock_cj_batch.return_value = 0
+        mock_batch.side_effect = [(50, 40, cursor_1)]
+        mock_cj_batch.return_value = (0, backfill._CURSOR_MIN_UUID)
 
         stats = backfill.run_backfill("postgresql://test", batch_size=100, limit=50)
 
@@ -386,12 +427,22 @@ class TestRunBackfill:
         mock_conn.__exit__ = MagicMock(return_value=False)
         mock_psycopg.connect.return_value = mock_conn
 
+        cursor_0 = _DEFAULT_CURSOR
         # No ruling field updates needed
-        mock_batch.side_effect = [(0, 0)]
+        mock_batch.side_effect = [(0, 0, cursor_0)]
         # 100 orphan case_judges links (full batch), then 5 more (partial = done)
-        mock_cj_batch.side_effect = [100, 5]
+        cj_cursor_1 = str(uuid.uuid4())
+        cj_cursor_2 = str(uuid.uuid4())
+        mock_cj_batch.side_effect = [(100, cj_cursor_1), (5, cj_cursor_2)]
 
         stats = backfill.run_backfill("postgresql://test", batch_size=100)
 
         assert stats["total_case_judges_created"] == 105
         assert mock_cj_batch.call_count == 2  # first full batch, then partial
+
+    def test_query_uses_keyset_not_offset(self) -> None:
+        """The queries must use keyset pagination, not OFFSET."""
+        assert "OFFSET" not in backfill.FETCH_QUERY
+        assert "(r.created_at, r.id) > (%s, %s)" in backfill.FETCH_QUERY
+        assert "OFFSET" not in backfill.CASE_JUDGES_BACKFILL_QUERY
+        assert "r.case_id > %s::uuid" in backfill.CASE_JUDGES_BACKFILL_QUERY

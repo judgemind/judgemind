@@ -28,6 +28,7 @@ import logging
 import os
 import re
 import sys
+from datetime import datetime
 
 import psycopg
 
@@ -329,8 +330,12 @@ def _extract_from_caption_block(ruling_text: str) -> str | None:
 # Core backfill logic (importable for testing)
 # ---------------------------------------------------------------------------
 
+# Minimum cursor values for the first batch
+_CURSOR_MIN_TIMESTAMP = datetime(1970, 1, 1)
+_CURSOR_MIN_UUID = "00000000-0000-0000-0000-000000000000"
+
 FETCH_QUERY = """
-    SELECT c.id, r.ruling_text
+    SELECT c.id, r.ruling_text, c.created_at
     FROM cases c
     JOIN LATERAL (
         SELECT r2.ruling_text
@@ -341,8 +346,9 @@ FETCH_QUERY = """
         LIMIT 1
     ) r ON TRUE
     WHERE c.case_title IS NULL
-    ORDER BY c.created_at
-    LIMIT %s OFFSET %s
+    AND (c.created_at, c.id) > (%s, %s)
+    ORDER BY c.created_at, c.id
+    LIMIT %s
 """
 
 UPDATE_QUERY = """
@@ -357,21 +363,23 @@ UPDATE_QUERY = """
 def backfill_batch(
     conn: psycopg.Connection,
     batch_size: int = 100,
-    offset: int = 0,
-) -> tuple[int, int]:
-    """Process one batch of cases.  Returns (processed, updated) counts."""
+    cursor: tuple[datetime, str] = (_CURSOR_MIN_TIMESTAMP, _CURSOR_MIN_UUID),
+) -> tuple[int, int, tuple[datetime, str]]:
+    """Process one batch of cases.  Returns (processed, updated, next_cursor)."""
     processed = 0
     updated = 0
+    next_cursor = cursor
 
     with conn.cursor() as cur:
-        cur.execute(FETCH_QUERY, (batch_size, offset))
+        cur.execute(FETCH_QUERY, (cursor[0], cursor[1], batch_size))
         rows = cur.fetchall()
 
     if not rows:
-        return 0, 0
+        return 0, 0, cursor
 
-    for case_id, ruling_text in rows:
+    for case_id, ruling_text, created_at in rows:
         processed += 1
+        next_cursor = (created_at, str(case_id))
 
         title = extract_case_title(ruling_text)
         if title is None:
@@ -384,7 +392,7 @@ def backfill_batch(
             cur.execute(UPDATE_QUERY, (title, str(case_id)))
         updated += 1
 
-    return processed, updated
+    return processed, updated, next_cursor
 
 
 def run_backfill(
@@ -397,7 +405,7 @@ def run_backfill(
     """Run the full backfill.  Returns summary stats."""
     total_processed = 0
     total_updated = 0
-    offset = 0
+    cursor: tuple[datetime, str] = (_CURSOR_MIN_TIMESTAMP, _CURSOR_MIN_UUID)
 
     with psycopg.connect(dsn) as conn:
         while True:
@@ -408,7 +416,7 @@ def run_backfill(
                     break
                 effective_batch = min(batch_size, remaining)
 
-            processed, updated = backfill_batch(conn, effective_batch, offset)
+            processed, updated, cursor = backfill_batch(conn, effective_batch, cursor)
             total_processed += processed
             total_updated += updated
 
@@ -431,8 +439,6 @@ def run_backfill(
             if processed < effective_batch:
                 # Last batch — no more rows
                 break
-
-            offset += effective_batch
 
     stats = {
         "total_processed": total_processed,
