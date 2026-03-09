@@ -20,17 +20,21 @@ Options:
     --date-from DATE    Only re-ingest documents captured on or after this date.
     --date-to DATE      Only re-ingest documents captured on or before this date.
     --dry-run           Parse and show what would be updated, but don't write to DB.
-    --batch-size N      Number of documents per batch (default: 50).
+    --batch-size N      Number of documents per batch (default: 200).
     --limit N           Maximum total documents to re-ingest.
     --concurrency N     Number of parallel S3 fetch threads (default: 10).
+    --parse-workers N   Number of parallel scraper parse threads (default: 4).
+    --parse-timeout N   Per-document parse timeout in seconds (default: 60).
 """
 
 from __future__ import annotations
 
 import argparse
+import ctypes
 import logging
 import os
 import sys
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime
 
@@ -135,6 +139,64 @@ def _load_scraper_registry() -> None:
             logger.warning(
                 "default_config() failed for %s — skipping", modname, exc_info=True
             )
+
+
+class _ParseTimeout(Exception):
+    """Raised when a parse operation exceeds its time limit."""
+
+
+def _run_with_timeout(
+    fn: object,
+    args: tuple,
+    timeout_seconds: float,
+) -> object:
+    """Run *fn(*args)* in the calling thread with a hard timeout.
+
+    Uses ``ctypes.pythonapi.PyThreadState_SetAsyncExc`` to raise
+    ``_ParseTimeout`` in the target thread if the timer fires.  This is
+    thread-safe and works in non-main threads (unlike ``signal.SIGALRM``).
+
+    Falls back to a simple call (no timeout) on platforms where
+    ``PyThreadState_SetAsyncExc`` is unavailable.
+    """
+    result: list = []
+    exc: list[BaseException] = []
+    target_tid: int | None = None
+    timed_out = threading.Event()
+
+    def _worker() -> None:
+        nonlocal target_tid
+        target_tid = threading.current_thread().ident
+        try:
+            result.append(fn(*args))  # type: ignore[operator]
+        except _ParseTimeout:
+            # Expected when the timer fires.
+            pass
+        except BaseException as e:
+            exc.append(e)
+
+    def _on_timeout() -> None:
+        timed_out.set()
+        if target_tid is not None:
+            ctypes.pythonapi.PyThreadState_SetAsyncExc(
+                ctypes.c_ulong(target_tid),
+                ctypes.py_object(_ParseTimeout),
+            )
+
+    worker = threading.Thread(target=_worker, daemon=True)
+    timer = threading.Timer(timeout_seconds, _on_timeout)
+    timer.start()
+    worker.start()
+    worker.join(timeout=timeout_seconds + 5)
+    timer.cancel()
+
+    if timed_out.is_set():
+        raise _ParseTimeout(f"Parse timed out after {timeout_seconds}s")
+    if exc:
+        raise exc[0]
+    if not result:
+        raise RuntimeError("Worker finished without producing a result")
+    return result[0]
 
 
 FETCH_DOCUMENTS_QUERY = """
@@ -284,11 +346,15 @@ def reingest_batch(
     filter_params: list,
     dry_run: bool = False,
     concurrency: int = 10,
+    parse_workers: int = 4,
+    parse_timeout: float = 60.0,
 ) -> tuple[int, int, tuple[datetime, str]]:
     """Process one batch. Returns (processed, updated, next_cursor).
 
     S3 objects are fetched in parallel using a thread pool (controlled by
-    ``concurrency``).  DB writes remain sequential.
+    ``concurrency``).  Scraper parsing is parallelised with ``parse_workers``
+    threads.  Each parse call is guarded by a ``parse_timeout`` (seconds).
+    DB writes remain sequential.
     """
     processed = 0
     updated = 0
@@ -331,8 +397,8 @@ def reingest_batch(
                     exc_info=True,
                 )
 
-    # --- Parse rows and collect documents for DB write ----------------------
-    parsed_docs: list[tuple[dict, dict]] = []  # (doc_meta, extracted)
+    # --- Build doc_meta for rows with fetched content -----------------------
+    parseable: list[tuple[int, dict, bytes]] = []  # (idx, doc_meta, raw_content)
 
     for idx, row in enumerate(rows):
         (
@@ -384,23 +450,60 @@ def reingest_batch(
             "s3_bucket": s3_bucket,
         }
 
-        extracted = _reparse_document(raw_content, scraper_id, doc_meta)
+        parseable.append((idx, doc_meta, raw_content))
 
-        if dry_run:
-            logger.info(
-                "DRY-RUN: %s county=%s judge=%s outcome=%s motion=%s title=%s case=%s parties=%d",
-                doc_id_str,
-                county,
-                extracted["judge_name"],
-                extracted["outcome"],
-                extracted["motion_type"],
-                extracted["case_title"],
-                extracted["case_number"],
-                len(extracted["parties"]),
+    if not parseable:
+        return processed, updated, next_cursor
+
+    # --- Parse documents in parallel -----------------------------------------
+    parsed_docs: list[tuple[dict, dict]] = []  # (doc_meta, extracted)
+
+    with ThreadPoolExecutor(max_workers=parse_workers) as pool:
+        parse_futures = {}
+        for idx, doc_meta, raw_content in parseable:
+            future = pool.submit(
+                _run_with_timeout,
+                _reparse_document,
+                (raw_content, doc_meta["scraper_id"], doc_meta),
+                parse_timeout,
             )
-            continue
+            parse_futures[future] = (idx, doc_meta)
 
-        parsed_docs.append((doc_meta, extracted))
+        for future in as_completed(parse_futures):
+            idx, doc_meta = parse_futures[future]
+            doc_id_str = doc_meta["document_id"]
+            try:
+                extracted = future.result()
+            except _ParseTimeout:
+                logger.warning(
+                    "Parse timed out for %s after %.0fs — skipping",
+                    doc_id_str,
+                    parse_timeout,
+                )
+                continue
+            except Exception:
+                logger.warning(
+                    "Parse failed for %s — skipping",
+                    doc_id_str,
+                    exc_info=True,
+                )
+                continue
+
+            if dry_run:
+                logger.info(
+                    "DRY-RUN: %s county=%s judge=%s outcome=%s motion=%s title=%s case=%s parties=%d",
+                    doc_id_str,
+                    doc_meta["county"],
+                    extracted["judge_name"],
+                    extracted["outcome"],
+                    extracted["motion_type"],
+                    extracted["case_title"],
+                    extracted["case_number"],
+                    len(extracted["parties"]),
+                )
+                continue
+
+            parsed_docs.append((doc_meta, extracted))
 
     if dry_run or not parsed_docs:
         return processed, updated, next_cursor
@@ -491,10 +594,12 @@ def run_reingest(
     county: str | None = None,
     date_from: date | None = None,
     date_to: date | None = None,
-    batch_size: int = 50,
+    batch_size: int = 200,
     limit: int | None = None,
     dry_run: bool = False,
     concurrency: int = 10,
+    parse_workers: int = 4,
+    parse_timeout: float = 60.0,
 ) -> dict[str, int]:
     """Run the full reingest. Returns summary stats."""
     filters, filter_params = _build_filters(county, date_from, date_to)
@@ -522,6 +627,8 @@ def run_reingest(
                 filter_params,
                 dry_run=dry_run,
                 concurrency=concurrency,
+                parse_workers=parse_workers,
+                parse_timeout=parse_timeout,
             )
             total_processed += processed
             total_updated += updated
@@ -566,7 +673,7 @@ def main() -> None:
         "--dry-run", action="store_true", help="Parse but don't update DB."
     )
     parser.add_argument(
-        "--batch-size", type=int, default=50, help="Batch size (default: 50)."
+        "--batch-size", type=int, default=200, help="Batch size (default: 200)."
     )
     parser.add_argument(
         "--limit", type=int, default=None, help="Max documents to process."
@@ -576,6 +683,18 @@ def main() -> None:
         type=int,
         default=10,
         help="Number of parallel S3 fetch threads (default: 10).",
+    )
+    parser.add_argument(
+        "--parse-workers",
+        type=int,
+        default=4,
+        help="Number of parallel scraper parse threads (default: 4).",
+    )
+    parser.add_argument(
+        "--parse-timeout",
+        type=float,
+        default=60.0,
+        help="Per-document parse timeout in seconds (default: 60).",
     )
     args = parser.parse_args()
 
@@ -596,6 +715,8 @@ def main() -> None:
         limit=args.limit,
         dry_run=args.dry_run,
         concurrency=args.concurrency,
+        parse_workers=args.parse_workers,
+        parse_timeout=args.parse_timeout,
     )
 
     logger.info(

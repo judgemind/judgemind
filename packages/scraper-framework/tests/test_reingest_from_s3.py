@@ -899,6 +899,273 @@ class TestCursorMinValues:
 
 
 # ---------------------------------------------------------------------------
+# Parallel parse tests
+# ---------------------------------------------------------------------------
+
+
+class TestParallelParsing:
+    """Tests that scraper parsing runs in parallel within a batch."""
+
+    @patch("reingest_from_s3._reparse_document")
+    @patch("reingest_from_s3._fetch_s3_content")
+    def test_parse_called_for_each_document(
+        self,
+        mock_fetch: MagicMock,
+        mock_reparse: MagicMock,
+    ) -> None:
+        """Each document with fetched content gets parsed via _reparse_document."""
+        rows = [_make_document_row(uuid.uuid4(), _CAPTURED_AT_1) for _ in range(3)]
+        conn = _mock_conn_returning(rows)
+
+        mock_fetch.return_value = b"<html>content</html>"
+        mock_reparse.return_value = {
+            "ruling_text": "content",
+            "case_number": "24STCV12345",
+            "case_title": "Smith v. Jones",
+            "judge_name": None,
+            "outcome": None,
+            "motion_type": None,
+            "department": None,
+            "parties": [],
+            "hearing_date": _HEARING_DATE,
+        }
+
+        processed, updated, _next_cursor = reingest.reingest_batch(
+            conn,
+            MagicMock(),
+            batch_size=10,
+            cursor=_DEFAULT_CURSOR,
+            filters="",
+            filter_params=[],
+            dry_run=True,
+            parse_workers=2,
+        )
+
+        assert processed == 3
+        assert mock_reparse.call_count == 3
+
+    @patch("reingest_from_s3._reparse_document")
+    @patch("reingest_from_s3._fetch_s3_content")
+    def test_parse_failure_skips_document(
+        self,
+        mock_fetch: MagicMock,
+        mock_reparse: MagicMock,
+    ) -> None:
+        """If _reparse_document raises, that document is skipped."""
+        rows = [_make_document_row(uuid.uuid4(), _CAPTURED_AT_1) for _ in range(3)]
+        conn = _mock_conn_with_rows(rows)
+
+        mock_fetch.return_value = b"<html>content</html>"
+
+        ok_result = {
+            "ruling_text": "content",
+            "case_number": "24STCV12345",
+            "case_title": "Smith v. Jones",
+            "judge_name": "Judge X",
+            "outcome": "granted",
+            "motion_type": "msj",
+            "department": "1",
+            "parties": [],
+            "hearing_date": _HEARING_DATE,
+        }
+        mock_reparse.side_effect = [
+            ok_result,
+            RuntimeError("pdfplumber crash"),
+            ok_result,
+        ]
+
+        processed, updated, _next_cursor = reingest.reingest_batch(
+            conn,
+            MagicMock(),
+            batch_size=10,
+            cursor=_DEFAULT_CURSOR,
+            filters="",
+            filter_params=[],
+            parse_workers=1,
+        )
+
+        assert processed == 3
+        # Only 2 succeed, so only 2 are written to DB
+        assert updated == 2
+
+    @patch("reingest_from_s3._run_with_timeout")
+    @patch("reingest_from_s3._fetch_s3_content")
+    def test_parse_timeout_skips_document(
+        self,
+        mock_fetch: MagicMock,
+        mock_timeout_fn: MagicMock,
+    ) -> None:
+        """If parsing times out, the document is skipped."""
+        rows = [_make_document_row(uuid.uuid4(), _CAPTURED_AT_1) for _ in range(2)]
+        conn = _mock_conn_with_rows(rows)
+
+        mock_fetch.return_value = b"<html>content</html>"
+
+        ok_result = {
+            "ruling_text": "content",
+            "case_number": "24STCV12345",
+            "case_title": "Smith v. Jones",
+            "judge_name": "Judge X",
+            "outcome": "granted",
+            "motion_type": "msj",
+            "department": "1",
+            "parties": [],
+            "hearing_date": _HEARING_DATE,
+        }
+        mock_timeout_fn.side_effect = [
+            ok_result,
+            reingest._ParseTimeout("timed out"),
+        ]
+
+        processed, updated, _next_cursor = reingest.reingest_batch(
+            conn,
+            MagicMock(),
+            batch_size=10,
+            cursor=_DEFAULT_CURSOR,
+            filters="",
+            filter_params=[],
+            parse_workers=1,
+        )
+
+        assert processed == 2
+        assert updated == 1
+
+    @patch("reingest_from_s3.boto3")
+    @patch("reingest_from_s3.psycopg")
+    @patch("reingest_from_s3.reingest_batch")
+    def test_parse_workers_passed_to_batch(
+        self,
+        mock_batch: MagicMock,
+        mock_psycopg: MagicMock,
+        mock_boto3: MagicMock,
+    ) -> None:
+        """parse_workers is forwarded from run_reingest to reingest_batch."""
+        mock_conn = MagicMock()
+        mock_conn.__enter__ = MagicMock(return_value=mock_conn)
+        mock_conn.__exit__ = MagicMock(return_value=False)
+        mock_psycopg.connect.return_value = mock_conn
+
+        mock_batch.return_value = (5, 3, _DEFAULT_CURSOR)
+
+        reingest.run_reingest(
+            "postgresql://test",
+            batch_size=50,
+            parse_workers=6,
+        )
+
+        batch_call = mock_batch.call_args_list[0]
+        assert batch_call.kwargs.get("parse_workers") == 6
+
+    @patch("reingest_from_s3.boto3")
+    @patch("reingest_from_s3.psycopg")
+    @patch("reingest_from_s3.reingest_batch")
+    def test_parse_timeout_passed_to_batch(
+        self,
+        mock_batch: MagicMock,
+        mock_psycopg: MagicMock,
+        mock_boto3: MagicMock,
+    ) -> None:
+        """parse_timeout is forwarded from run_reingest to reingest_batch."""
+        mock_conn = MagicMock()
+        mock_conn.__enter__ = MagicMock(return_value=mock_conn)
+        mock_conn.__exit__ = MagicMock(return_value=False)
+        mock_psycopg.connect.return_value = mock_conn
+
+        mock_batch.return_value = (5, 3, _DEFAULT_CURSOR)
+
+        reingest.run_reingest(
+            "postgresql://test",
+            batch_size=50,
+            parse_timeout=30.0,
+        )
+
+        batch_call = mock_batch.call_args_list[0]
+        assert batch_call.kwargs.get("parse_timeout") == 30.0
+
+    @patch("reingest_from_s3.boto3")
+    @patch("reingest_from_s3.psycopg")
+    @patch("reingest_from_s3.reingest_batch")
+    def test_default_parse_workers_is_4(
+        self,
+        mock_batch: MagicMock,
+        mock_psycopg: MagicMock,
+        mock_boto3: MagicMock,
+    ) -> None:
+        """Default parse_workers is 4 when not specified."""
+        mock_conn = MagicMock()
+        mock_conn.__enter__ = MagicMock(return_value=mock_conn)
+        mock_conn.__exit__ = MagicMock(return_value=False)
+        mock_psycopg.connect.return_value = mock_conn
+
+        mock_batch.return_value = (5, 3, _DEFAULT_CURSOR)
+
+        reingest.run_reingest("postgresql://test", batch_size=50)
+
+        batch_call = mock_batch.call_args_list[0]
+        assert batch_call.kwargs.get("parse_workers") == 4
+
+    @patch("reingest_from_s3.boto3")
+    @patch("reingest_from_s3.psycopg")
+    @patch("reingest_from_s3.reingest_batch")
+    def test_default_batch_size_is_200(
+        self,
+        mock_batch: MagicMock,
+        mock_psycopg: MagicMock,
+        mock_boto3: MagicMock,
+    ) -> None:
+        """Default batch_size is 200."""
+        mock_conn = MagicMock()
+        mock_conn.__enter__ = MagicMock(return_value=mock_conn)
+        mock_conn.__exit__ = MagicMock(return_value=False)
+        mock_psycopg.connect.return_value = mock_conn
+
+        mock_batch.return_value = (0, 0, _DEFAULT_CURSOR)
+
+        reingest.run_reingest("postgresql://test")
+
+        batch_call = mock_batch.call_args_list[0]
+        # batch_size is the 3rd positional arg (conn, s3, batch_size, ...)
+        assert batch_call[0][2] == 200
+
+
+# ---------------------------------------------------------------------------
+# _run_with_timeout tests
+# ---------------------------------------------------------------------------
+
+
+class TestRunWithTimeout:
+    """Tests for the _run_with_timeout helper."""
+
+    def test_returns_result_on_success(self) -> None:
+        """Normal function returns its result."""
+        result = reingest._run_with_timeout(lambda x: x * 2, (21,), 5.0)
+        assert result == 42
+
+    def test_raises_parse_timeout_on_slow_function(self) -> None:
+        """Function that exceeds timeout raises _ParseTimeout."""
+        import time
+
+        def slow(x: int) -> int:
+            time.sleep(10)
+            return x
+
+        import pytest
+
+        with pytest.raises(reingest._ParseTimeout):
+            reingest._run_with_timeout(slow, (1,), 0.5)
+
+    def test_propagates_exceptions(self) -> None:
+        """Exceptions from the function are propagated."""
+        import pytest
+
+        def boom() -> None:
+            raise ValueError("kaboom")
+
+        with pytest.raises(ValueError, match="kaboom"):
+            reingest._run_with_timeout(boom, (), 5.0)
+
+
+# ---------------------------------------------------------------------------
 # CLI argument tests
 # ---------------------------------------------------------------------------
 
@@ -915,7 +1182,7 @@ class TestCLIConcurrencyFlag:
         parser.add_argument("--date-from", type=str, default=None)
         parser.add_argument("--date-to", type=str, default=None)
         parser.add_argument("--dry-run", action="store_true")
-        parser.add_argument("--batch-size", type=int, default=50)
+        parser.add_argument("--batch-size", type=int, default=200)
         parser.add_argument("--limit", type=int, default=None)
         parser.add_argument("--concurrency", type=int, default=10)
 
@@ -930,6 +1197,46 @@ class TestCLIConcurrencyFlag:
         parser.add_argument("--concurrency", type=int, default=10)
         args = parser.parse_args([])
         assert args.concurrency == 10
+
+
+class TestCLIParseWorkersFlag:
+    """Tests that --parse-workers and --parse-timeout CLI flags are parsed."""
+
+    def test_parser_has_parse_workers_arg(self) -> None:
+        """The argument parser accepts --parse-workers."""
+        import argparse
+
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--parse-workers", type=int, default=4)
+        args = parser.parse_args(["--parse-workers", "6"])
+        assert args.parse_workers == 6
+
+    def test_parser_default_parse_workers(self) -> None:
+        """Default parse-workers is 4."""
+        import argparse
+
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--parse-workers", type=int, default=4)
+        args = parser.parse_args([])
+        assert args.parse_workers == 4
+
+    def test_parser_has_parse_timeout_arg(self) -> None:
+        """The argument parser accepts --parse-timeout."""
+        import argparse
+
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--parse-timeout", type=float, default=60.0)
+        args = parser.parse_args(["--parse-timeout", "30"])
+        assert args.parse_timeout == 30.0
+
+    def test_parser_default_parse_timeout(self) -> None:
+        """Default parse-timeout is 60.0."""
+        import argparse
+
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--parse-timeout", type=float, default=60.0)
+        args = parser.parse_args([])
+        assert args.parse_timeout == 60.0
 
 
 # ---------------------------------------------------------------------------
