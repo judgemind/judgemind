@@ -293,6 +293,7 @@ resource "aws_iam_role_policy" "ecs_task_execution_secrets" {
         Resource = compact([
           var.db_connection_secret_arn,
           var.opensearch_credentials_secret_arn,
+          var.anthropic_api_key_secret_arn,
         ])
       }
     ]
@@ -385,6 +386,12 @@ resource "aws_ecs_task_definition" "ingestion_worker" {
           {
             name      = "OPENSEARCH_PASSWORD"
             valueFrom = "${var.opensearch_credentials_secret_arn}:password::"
+          }
+        ] : [],
+        var.anthropic_api_key_secret_arn != "" ? [
+          {
+            name      = "ANTHROPIC_API_KEY"
+            valueFrom = var.anthropic_api_key_secret_arn
           }
         ] : []
       )
