@@ -1,7 +1,10 @@
-"""LLM-based field extraction using Claude Haiku.
+"""LLM-based field extraction for court ruling documents.
 
 Extracts structured fields (judge name, hearing date, case number, case title,
-outcome, motion type, parties) from court ruling documents via the Anthropic API.
+outcome, motion type, parties) from court ruling documents via a configurable
+LLM provider (Anthropic, Google GenAI, etc.).  The provider and model are
+selected via ``LLM_PROVIDER`` and ``LLM_MODEL`` environment variables.
+
 This is the core extraction logic called by the ingestion worker for fields that
 scrapers did not populate.
 
@@ -14,12 +17,12 @@ from __future__ import annotations
 import html
 import json
 import re
-import time
 from dataclasses import dataclass, field
 from datetime import date
 
-import anthropic
 import structlog
+
+from .llm_providers import call_llm
 
 logger = structlog.get_logger(__name__)
 
@@ -410,10 +413,16 @@ def extract_fields_llm(
     document_text: str,
     content_format: str,  # "html" or "pdf"
     metadata: dict[str, str] | None = None,
-    client: anthropic.Anthropic | None = None,
+    client: object | None = None,
+    provider: str | None = None,
+    model: str | None = None,
     max_chars: int = _DEFAULT_MAX_CHARS,
 ) -> LLMExtractionResult | None:
-    """Extract structured fields from a court ruling using Claude Haiku.
+    """Extract structured fields from a court ruling via a configurable LLM.
+
+    The provider and model are resolved from the explicit arguments, then from
+    ``LLM_PROVIDER`` / ``LLM_MODEL`` environment variables, then from built-in
+    defaults (Anthropic Claude Haiku).
 
     If the document exceeds *max_chars* after preprocessing, it is
     automatically split into overlapping chunks, each extracted
@@ -425,8 +434,14 @@ def extract_fields_llm(
         content_format: ``"html"`` or ``"pdf"``.
         metadata: Optional dict with authoritative scraper-provided context.
             May contain keys: ``link_text``, ``judge_name``, ``department``.
-        client: Optional pre-created Anthropic client for connection reuse.
-            If not provided, creates one from the ``ANTHROPIC_API_KEY`` env var.
+        client: Optional pre-created provider client for connection reuse.
+            Accepts an ``anthropic.Anthropic`` or ``google.genai.Client``
+            depending on the provider.  If ``None``, the provider adapter
+            creates one from the appropriate env var.
+        provider: LLM provider name (``"anthropic"``, ``"google"``).
+            Falls back to ``LLM_PROVIDER`` env var, then ``"anthropic"``.
+        model: Model ID.  Falls back to ``LLM_MODEL`` env var, then a
+            per-provider default.
         max_chars: Per-chunk character limit.  Documents under this size
             are processed in a single call (no chunking overhead).
 
@@ -443,14 +458,6 @@ def extract_fields_llm(
     else:
         text = document_text
 
-    # Create client if not provided
-    if client is None:
-        try:
-            client = anthropic.Anthropic()
-        except anthropic.AuthenticationError:
-            logger.warning("llm_extract.auth_error", error="Missing or invalid ANTHROPIC_API_KEY")
-            return None
-
     # Split into chunks if needed
     chunks = _split_text_into_chunks(text, max_chars, content_format)
 
@@ -466,11 +473,17 @@ def extract_fields_llm(
     chunk_results: list[LLMExtractionResult] = []
     for i, chunk in enumerate(chunks):
         user_message = _build_user_message(chunk, content_format, metadata)
-        response = _call_api(client, user_message)
-        if response is None:
+        llm_response = call_llm(
+            system_prompt=_SYSTEM_PROMPT,
+            user_message=user_message,
+            provider=provider,
+            model=model,
+            client=client,
+        )
+        if llm_response is None:
             logger.warning("llm_extract.chunk_api_failure", chunk_index=i)
             continue
-        parsed = _parse_response(response, metadata)
+        parsed = _parse_response(llm_response.text, metadata)
         if parsed is not None:
             chunk_results.append(parsed)
 
@@ -503,40 +516,6 @@ def _build_user_message(
 
     user_parts.append(f"Document ({content_format}):\n\n{text}")
     return "\n\n".join(user_parts)
-
-
-def _call_api(
-    client: anthropic.Anthropic,
-    user_message: str,
-    *,
-    max_retries: int = 1,
-) -> str | None:
-    """Call Claude Haiku and return the raw response text.
-
-    Retries once on rate limit with 1s backoff. Returns ``None`` on any
-    unrecoverable failure.
-    """
-    for attempt in range(1 + max_retries):
-        try:
-            response = client.messages.create(
-                model="claude-3-5-haiku-latest",
-                max_tokens=4096,
-                temperature=0,
-                system=_SYSTEM_PROMPT,
-                messages=[{"role": "user", "content": user_message}],
-            )
-            return response.content[0].text.strip()
-        except anthropic.RateLimitError:
-            if attempt < max_retries:
-                logger.warning("llm_extract.rate_limit", attempt=attempt + 1)
-                time.sleep(1)
-                continue
-            logger.warning("llm_extract.rate_limit_exhausted")
-            return None
-        except anthropic.APIError as exc:
-            logger.warning("llm_extract.api_error", error=str(exc))
-            return None
-    return None  # pragma: no cover — defensive unreachable
 
 
 def _parse_response(
