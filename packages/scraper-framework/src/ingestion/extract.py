@@ -60,7 +60,7 @@ _MOTION_TYPE_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"\bmotion\s+to\s+dismiss\b", re.IGNORECASE), "mtd"),
     (re.compile(r"\bmotion\s+in\s+limine\b", re.IGNORECASE), "mil"),
     (re.compile(r"\bdemurrer\b", re.IGNORECASE), "demurrer"),
-    (re.compile(r"\bmotion\s+to\s+compel\b", re.IGNORECASE), "motion_to_compel"),
+    (re.compile(r"\bmotions?\s+to\s+compel\b", re.IGNORECASE), "motion_to_compel"),
     (
         re.compile(r"\banti[- ]?slapp\b", re.IGNORECASE),
         "anti_slapp",
@@ -94,6 +94,13 @@ _MOTION_TYPE_PATTERNS: list[tuple[re.Pattern[str], str]] = [
         "petition_habeas_corpus",
     ),
     (
+        re.compile(
+            r"\bclass\s+action\s+settlement\b|\bpreliminary\s+approval\b",
+            re.IGNORECASE,
+        ),
+        "class_action_settlement",
+    ),
+    (
         re.compile(r"\bpetition\b", re.IGNORECASE),
         "petition",
     ),
@@ -114,7 +121,10 @@ _MOTION_TYPE_PATTERNS: list[tuple[re.Pattern[str], str]] = [
         "motion_for_protective_order",
     ),
     (
-        re.compile(r"\bmotion\s+for\s+attorney.?s?\s+fees\b", re.IGNORECASE),
+        re.compile(
+            r"\bmotion\s+for\s+attorney['\u2018\u2019]?s?['\u2018\u2019]?\s*fees\b",
+            re.IGNORECASE,
+        ),
         "motion_for_attorney_fees",
     ),
     (
@@ -127,6 +137,56 @@ _MOTION_TYPE_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (
         re.compile(r"\bmotion\s+to\s+vacate\b", re.IGNORECASE),
         "motion_to_vacate",
+    ),
+    # --- New patterns added for issue #421 ---
+    (
+        re.compile(r"\bdefault\s+judgment\b", re.IGNORECASE),
+        "default_judgment",
+    ),
+    (
+        re.compile(r"\bto\s+be\s+relieved\s+as\s+counsel\b", re.IGNORECASE),
+        "motion_to_be_relieved_as_counsel",
+    ),
+    (
+        re.compile(r"\bmotion\s+for\s+leave\b", re.IGNORECASE),
+        "motion_for_leave_to_amend",
+    ),
+    (
+        re.compile(r"\bmotion\s+for\s+sanctions\b", re.IGNORECASE),
+        "motion_for_sanctions",
+    ),
+    (
+        re.compile(r"\bmotion\s+for\s+relief\b", re.IGNORECASE),
+        "motion_for_relief",
+    ),
+    (
+        re.compile(r"\bmotion\s+for\s+pro\s+hac\s+vice\b", re.IGNORECASE),
+        "motion_pro_hac_vice",
+    ),
+    (
+        re.compile(r"\bmotion\s+to\s+substitute\b", re.IGNORECASE),
+        "motion_to_substitute",
+    ),
+    (
+        re.compile(r"\bMILs?\b"),
+        "mil",
+    ),
+    (
+        re.compile(r"\bmotion\s+to\s+tax\s+costs\b", re.IGNORECASE),
+        "motion_to_tax_costs",
+    ),
+    (
+        re.compile(r"\bwrit\s+of\s+possession\b", re.IGNORECASE),
+        "writ_of_possession",
+    ),
+    (
+        re.compile(r"\bmotion\s+for\s+new\s+trial\b", re.IGNORECASE),
+        "motion_for_new_trial",
+    ),
+    # Broad ex parte fallback — must come after specific ex_parte_application/motion
+    (
+        re.compile(r"\bex\s+parte\b", re.IGNORECASE),
+        "ex_parte_application",
     ),
 ]
 

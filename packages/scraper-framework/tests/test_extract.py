@@ -204,6 +204,98 @@ class TestExtractMotionType:
         text = "Motion to Vacate Judgment"
         assert extract_motion_type(text) == "motion_to_vacate"
 
+    # --- Bug fixes (issue #421) ---
+
+    def test_attorneys_fees_curly_apostrophe(self) -> None:
+        """Curly apostrophe (U+2019) in 'Attorneys\u2019 Fees' must match (#421)."""
+        text = "Motion for Attorneys\u2019 Fees"
+        assert extract_motion_type(text) == "motion_for_attorney_fees"
+
+    def test_attorneys_fees_straight_apostrophe(self) -> None:
+        """Straight apostrophe in \"Attorney's Fees\" must still match."""
+        text = "Motion for Attorney's Fees"
+        assert extract_motion_type(text) == "motion_for_attorney_fees"
+
+    def test_motions_to_compel_plural(self) -> None:
+        """Plural 'motions to compel' must match (#421)."""
+        text = "Motions to Compel Further Discovery Responses"
+        assert extract_motion_type(text) == "motion_to_compel"
+
+    def test_motion_to_compel_singular_still_works(self) -> None:
+        """Singular 'motion to compel' must still match after plural fix."""
+        text = "Motion to Compel Responses"
+        assert extract_motion_type(text) == "motion_to_compel"
+
+    # --- New patterns (issue #421) ---
+
+    def test_default_judgment(self) -> None:
+        text = "Application for Default Judgment"
+        assert extract_motion_type(text) == "default_judgment"
+
+    def test_motion_to_be_relieved_as_counsel(self) -> None:
+        text = "Motion to Be Relieved as Counsel"
+        assert extract_motion_type(text) == "motion_to_be_relieved_as_counsel"
+
+    def test_motion_for_leave_to_amend(self) -> None:
+        text = "Motion for Leave to File Second Amended Complaint"
+        assert extract_motion_type(text) == "motion_for_leave_to_amend"
+
+    def test_class_action_settlement(self) -> None:
+        text = "Motion for Class Action Settlement Approval"
+        assert extract_motion_type(text) == "class_action_settlement"
+
+    def test_preliminary_approval(self) -> None:
+        text = "Petition for Preliminary Approval of Settlement"
+        assert extract_motion_type(text) == "class_action_settlement"
+
+    def test_motion_for_sanctions(self) -> None:
+        text = "Motion for Sanctions under CCP 128.7"
+        assert extract_motion_type(text) == "motion_for_sanctions"
+
+    def test_motion_for_relief(self) -> None:
+        text = "Motion for Relief from Waiver of Objections"
+        assert extract_motion_type(text) == "motion_for_relief"
+
+    def test_motion_for_sanctions_before_relief(self) -> None:
+        """Sanctions should match before generic relief."""
+        text = "Motion for Sanctions"
+        assert extract_motion_type(text) == "motion_for_sanctions"
+
+    def test_ex_parte_standalone(self) -> None:
+        """Standalone 'ex parte' without 'application' or 'motion' (#421)."""
+        text = "Ex Parte for Temporary Restraining Order"
+        assert extract_motion_type(text) == "ex_parte_application"
+
+    def test_motion_pro_hac_vice(self) -> None:
+        text = "Motion for Pro Hac Vice Admission"
+        assert extract_motion_type(text) == "motion_pro_hac_vice"
+
+    def test_motion_to_substitute(self) -> None:
+        text = "Motion to Substitute Party"
+        assert extract_motion_type(text) == "motion_to_substitute"
+
+    def test_mil_abbreviation(self) -> None:
+        """'MIL' abbreviation for motion in limine (#421)."""
+        text = "Defendant's MIL No. 3 to Exclude Expert Testimony"
+        assert extract_motion_type(text) == "mil"
+
+    def test_mils_abbreviation_plural(self) -> None:
+        """'MILs' plural abbreviation (#421)."""
+        text = "Ruling on Plaintiff's MILs"
+        assert extract_motion_type(text) == "mil"
+
+    def test_motion_to_tax_costs(self) -> None:
+        text = "Motion to Tax Costs"
+        assert extract_motion_type(text) == "motion_to_tax_costs"
+
+    def test_writ_of_possession(self) -> None:
+        text = "Application for Writ of Possession"
+        assert extract_motion_type(text) == "writ_of_possession"
+
+    def test_motion_for_new_trial(self) -> None:
+        text = "Motion for New Trial"
+        assert extract_motion_type(text) == "motion_for_new_trial"
+
 
 # ---------------------------------------------------------------------------
 # Judge name extraction
