@@ -92,7 +92,7 @@ Execution: Fetch data, parse response (HTML, PDF, or DOCX), extract structured f
 
 Field extraction completeness: A scraper is not considered complete until it correctly extracts 100% of the structured fields present in the source data obtained during development. Required fields: judge name, motion type, case title, hearing date, outcome, and parties. If a field is present in the source, the scraper must extract it — do not ship scrapers that leave extractable fields empty and rely on post-hoc backfills. Regression tests against real fixtures must cover every extracted field. "Unknown" or "Not classified" values are acceptable only when the source data genuinely does not contain the information.
 
-Output: Emit standardized ingestion events to the message queue. Events include raw content, parsed content, content hash, source metadata, and capture timestamp.
+Output: Emit standardized ingestion events to the message queue. Events include raw content, parsed content, content hash, source metadata, and capture timestamp. Scrapers populate as many structured fields as possible (judge name, case number, hearing date, etc.) from the court website's own structured data. Any fields the scraper cannot populate are filled downstream by the three-tier extraction pipeline (see Section 5.2).
 
 Error handling: Retry with exponential backoff. Alert on repeated failures. Log all errors with enough context for debugging (URL, response status, partial content).
 
@@ -258,19 +258,43 @@ Phase 2 (Months 6–12): If Tier 1 costs exceed ~$3,000/month (indicating ~10,00
 
 Ongoing: Tier 2 and Tier 3 remain on hosted commercial APIs indefinitely. Their per-call costs scale with users, not data volume, and quality requirements justify premium models. Rate limiting on AI features prevents runaway costs.
 
-## 5.2 NLP Pipeline (Tier 1)
+## 5.2 NLP Pipeline (Tier 1) — Three-Tier Extraction
 
-Every ingested document passes through the NLP pipeline during processing. Outputs are stored in PostgreSQL (structured fields), Elasticsearch (text index), and Qdrant (embeddings). This means user-facing features can serve pre-computed results rather than making live API calls.
+Every ingested document passes through a three-tier field extraction pipeline during ingestion. The pipeline fills in structured fields (judge name, hearing date, case number, case title, outcome, motion type, parties, department) using increasingly broad methods until all available information is captured.
 
-Entity extraction: Identify and normalize judges, attorneys, parties, dates, monetary amounts, case numbers, and statute references. Output feeds the entity resolution system (Section 4.1.2).
+### 5.2.1 Extraction Tiers (Implemented)
 
-Document classification: Classify document type (motion, brief, ruling, order, complaint, etc.), motion type (MSJ, MTD, MIL, etc.), and ruling outcome (granted, denied, partial, moot, etc.).
+The ingestion worker (`packages/scraper-framework/src/ingestion/worker.py`) applies three tiers in priority order for each field:
 
-Summarization: Generate a one-paragraph summary of each document at ingestion time. Cached for instant retrieval when users view the document.
+**Tier 1 — Scraper-provided fields (highest priority).** Scrapers extract structured data directly from the court website's HTML/PDF structure during `parse_document()`. These values are authoritative because they come from the source's own structured data (e.g., a case number in a URL parameter, a judge name in a page header). Any field the scraper populates is used as-is and not overwritten by later tiers.
 
-Embedding generation: Generate vector embeddings using an open-source model. Stored in Qdrant for semantic search and RAG retrieval.
+**Tier 2 — LLM extraction.** For fields the scraper did not populate, the ingestion worker calls a configurable LLM to extract them from the document text. The LLM receives a structured JSON extraction prompt with the document content and any authoritative metadata from the scraper (judge name, department) as context. The LLM returns structured JSON with all extractable fields, which are applied only to fields still missing after Tier 1. On any API failure, the LLM tier returns `None` and the worker falls through to Tier 3.
 
-Version classification: When a document or ruling is re-captured with a different content hash, classify the change as substantive or cosmetic using LLM-based diffing.
+Key implementation details:
+- **Provider-agnostic adapter** (`packages/scraper-framework/src/ingestion/llm_providers.py`): supports Anthropic and Google GenAI via `LLM_PROVIDER` and `LLM_MODEL` environment variables. Default: Claude Haiku (`claude-haiku-4-5-20251001`).
+- **Document chunking** (`packages/scraper-framework/src/ingestion/llm_extract.py`): documents exceeding the per-chunk character budget (80K chars) are split at natural boundaries (form feeds for PDFs, `<HR>` tags or case-number headers for HTML, paragraph breaks as fallback). Up to 5 chunks per document, with 500-character overlap for context continuity. Results are merged with deduplication by case number.
+- **Connection reuse:** the worker creates a single LLM client at startup and reuses it across all documents in the session, amortizing connection overhead.
+- **Rate-limit retry:** each provider adapter retries once on rate-limit errors (HTTP 429 / ResourceExhausted) with a 1-second backoff.
+- **Multi-ruling documents:** a single document may contain rulings for multiple cases. The LLM returns an array of rulings, and the worker matches each to the correct event by case number.
+- **Cost:** approximately $47/month on Anthropic Haiku at current ingestion volume (~1,000 documents/day).
+
+**Tier 3 — Regex fallback.** For fields still missing after LLM extraction (or when the LLM API is unavailable), the worker applies court-specific regex patterns (`packages/scraper-framework/src/ingestion/extract.py`). These cover outcome classification, motion type identification, case number extraction, case title parsing, judge name extraction, hearing date extraction, and party extraction from case captions. The regex patterns are drawn from real California court formatting and are ordered by specificity to minimize false positives.
+
+### 5.2.2 Extraction Logging
+
+The worker tracks which tier populated each field in an `extraction_methods` dict (values: `"scraper"`, `"llm"`, `"regex"`) and logs a summary for every document. This enables monitoring of extraction quality and identifying courts where scrapers should be improved to reduce LLM dependency.
+
+### 5.2.3 Reingestion
+
+Historical documents already in S3 can be reprocessed through the full three-tier pipeline using `scripts/reingest_from_s3.py`. This script reads archived documents from the S3 bucket, reconstructs ingestion events, and pushes them through the same extraction pipeline. This is used to backfill fields for documents that were ingested before LLM extraction was available, or after extraction logic improvements.
+
+### 5.2.4 Planned Features (Not Yet Implemented)
+
+The following Tier 1 capabilities are planned but not yet built:
+
+- **Summarization:** Generate a one-paragraph summary of each document at ingestion time. Cached for instant retrieval when users view the document.
+- **Embedding generation:** Generate vector embeddings using an open-source model. Stored in Qdrant for semantic search and RAG retrieval.
+- **Version classification:** When a document or ruling is re-captured with a different content hash, classify the change as substantive or cosmetic using LLM-based diffing.
 
 ## 5.3 RAG Pipeline (Tiers 2 & 3)
 
