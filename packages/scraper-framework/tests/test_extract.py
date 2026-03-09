@@ -1,10 +1,12 @@
-"""Tests for the basic regex-based outcome, motion_type, judge name, and case number extraction."""
+"""Tests for the basic regex-based outcome, motion_type, judge name, case number,
+and case title extraction."""
 
 from __future__ import annotations
 
 from ingestion.extract import (
     _looks_like_person_name,
     extract_case_number,
+    extract_case_title,
     extract_judge_name,
     extract_motion_type,
     extract_outcome,
@@ -600,3 +602,123 @@ class TestExtractCaseNumber:
         """When 'Case Number:' label is present, use that over standalone patterns."""
         text = "Case Number: 24NNCV02551\nSome other text with 25CV460465"
         assert extract_case_number(text) == "24NNCV02551"
+
+
+# ---------------------------------------------------------------------------
+# Case title extraction (#337)
+# ---------------------------------------------------------------------------
+
+
+class TestExtractCaseTitle:
+    """Tests for extract_case_title() — inline v. patterns (#337)."""
+
+    def test_inline_v_with_case_number(self) -> None:
+        """'Name v. Name, No. CaseNumber' — issue #337 primary example."""
+        text = "Raymond Yawen Wu v. Steve Tsui et al., No. 25STCV34748"
+        result = extract_case_title(text)
+        assert result is not None
+        assert "Wu" in result
+        assert "Tsui" in result
+        assert "v." in result
+        # Case number should NOT be in the title
+        assert "25STCV" not in result
+
+    def test_inline_v_with_et_al(self) -> None:
+        """'Name v. Name et al.' format."""
+        text = "John Smith v. Acme Corp et al.\nThe motion is granted."
+        result = extract_case_title(text)
+        assert result is not None
+        assert "Smith" in result
+        assert "Acme Corp" in result
+        assert "v." in result
+
+    def test_inline_v_simple(self) -> None:
+        """Simple 'Name v. Name' on its own line."""
+        text = "Smith v. Jones\nCase Number: 24NNCV02551"
+        result = extract_case_title(text)
+        assert result is not None
+        assert "Smith" in result
+        assert "Jones" in result
+        assert "v." in result
+
+    def test_inline_vs_dot(self) -> None:
+        """'Name vs. Name' format."""
+        text = "GARCIA vs. HERNANDEZ\nThe demurrer is sustained."
+        result = extract_case_title(text)
+        assert result is not None
+        assert "Garcia" in result
+        assert "Hernandez" in result
+        assert "v." in result
+
+    def test_inline_vs_all_caps(self) -> None:
+        """All-caps 'NAME VS NAME' format."""
+        text = "SMITH VS JONES\nMotion for summary judgment"
+        result = extract_case_title(text)
+        assert result is not None
+        assert "Smith" in result
+        assert "Jones" in result
+
+    def test_case_name_field(self) -> None:
+        """'Case Name: X v. Y' field extraction."""
+        text = "Case Name: Martinez v. City of Los Angeles\nCase Number: 22STCV12345"
+        result = extract_case_title(text)
+        assert result is not None
+        assert "Martinez" in result
+        assert "City of Los Angeles" in result
+
+    def test_case_title_field(self) -> None:
+        """'Case Title: X v. Y' field extraction."""
+        text = "Case Title: Doe v. Roe Corp\nHearing Date: March 5, 2026"
+        result = extract_case_title(text)
+        assert result is not None
+        assert "Doe" in result
+        assert "Roe" in result
+
+    def test_riverside_style_with_hearing(self) -> None:
+        """Riverside-style: 'CASENUMBER PLAINTIFF vs DEFENDANT Hearing re:'."""
+        text = "CVPS2306157 YELDELL vs HENSS Hearing re: Demurrer"
+        result = extract_case_title(text)
+        assert result is not None
+        assert "Yeldell" in result
+        assert "Henss" in result
+
+    def test_no_match_plain_text(self) -> None:
+        """Plain text without any title pattern returns None."""
+        text = "The motion for summary judgment is GRANTED."
+        assert extract_case_title(text) is None
+
+    def test_no_match_empty(self) -> None:
+        assert extract_case_title("") is None
+
+    def test_multiline_v_with_case_number_next_line(self) -> None:
+        """'Name v. Name' on one line, case number on next line (#337)."""
+        text = "Raymond Yawen Wu v. Steve Tsui et al.\nNo. 25STCV34748\nThe motion is denied."
+        result = extract_case_title(text)
+        assert result is not None
+        assert "Wu" in result
+        assert "Tsui" in result
+        assert "25STCV" not in result
+
+    def test_inline_v_case_no_prefix(self) -> None:
+        """'Name v. Name, Case No. CaseNumber' variant."""
+        text = "Alpha Beta v. Gamma Delta, Case No. 24NNCV02551"
+        result = extract_case_title(text)
+        assert result is not None
+        assert "Alpha Beta" in result
+        assert "Gamma Delta" in result
+        assert "24NNCV" not in result
+
+    def test_title_case_normalization(self) -> None:
+        """All-caps titles should be normalized to title case."""
+        text = "SMITH V. JONES\nThe court rules as follows."
+        result = extract_case_title(text)
+        assert result is not None
+        assert result == "Smith v. Jones"
+
+    def test_mixed_case_preserved(self) -> None:
+        """Mixed-case titles should be preserved (not re-cased)."""
+        text = "McDonald v. O'Brien\nMotion denied."
+        result = extract_case_title(text)
+        assert result is not None
+        assert "McDonald" in result
+        assert "O'Brien" in result
