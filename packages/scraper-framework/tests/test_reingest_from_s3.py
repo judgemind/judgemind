@@ -1340,6 +1340,159 @@ class TestScraperRegistryAutoDiscovery:
         }
         assert expected_ids == set(reingest._SCRAPER_REGISTRY.keys())
 
+
+# ---------------------------------------------------------------------------
+# _extract_text_from_content tests
+# ---------------------------------------------------------------------------
+
+
+class TestExtractTextFromContent:
+    """Tests for the _extract_text_from_content helper."""
+
+    def test_html_decoded_as_utf8(self) -> None:
+        """HTML content is decoded as UTF-8."""
+        html = b"<html><body>Hello world</body></html>"
+        result = reingest._extract_text_from_content(html, "html")
+        assert "Hello world" in result
+
+    def test_pdf_extracted_via_pdfplumber(self) -> None:
+        """PDF content is extracted via pdfplumber, not raw UTF-8 decode."""
+        fixtures_dir = os.path.join(os.path.dirname(__file__), "fixtures")
+        pdf_path = os.path.join(fixtures_dir, "oc_apkarian_c25.pdf")
+        with open(pdf_path, "rb") as f:
+            pdf_bytes = f.read()
+
+        result = reingest._extract_text_from_content(pdf_bytes, "pdf")
+        # pdfplumber should extract readable text
+        assert len(result) > 100
+        # Should NOT contain PDF binary garbage
+        assert "%PDF" not in result
+        # Should contain actual ruling text
+        assert "TENTATIVE" in result.upper() or "DEPT" in result.upper()
+
+    def test_pdf_fallback_to_utf8_on_invalid_pdf(self) -> None:
+        """Invalid PDF bytes fall back to UTF-8 decode."""
+        fake_pdf = b"not a real pdf"
+        result = reingest._extract_text_from_content(fake_pdf, "pdf")
+        assert result == "not a real pdf"
+
+    def test_unknown_format_decoded_as_utf8(self) -> None:
+        """Unknown format is decoded as UTF-8."""
+        content = b"some text content"
+        result = reingest._extract_text_from_content(content, "text")
+        assert result == "some text content"
+
+
+# ---------------------------------------------------------------------------
+# _reparse_document tests — PdfLinkScraper subclasses
+# ---------------------------------------------------------------------------
+
+
+class TestReparsePdfDocuments:
+    """Tests that _reparse_document correctly handles PDF scraper types.
+
+    PdfLinkScraper subclasses (OC, SB, Riverside, SF) must be instantiated
+    correctly during reingest and produce proper parse output from real PDFs.
+    """
+
+    _FIXTURES_DIR = os.path.join(os.path.dirname(__file__), "fixtures")
+
+    @staticmethod
+    def _make_pdf_doc_meta(
+        scraper_id: str,
+        county: str,
+        doc_format: str = "pdf",
+    ) -> dict:
+        return {
+            "document_id": "test-pdf-123",
+            "state": "CA",
+            "county": county,
+            "court_name": "Superior Court",
+            "source_url": "https://example.com/ruling.pdf",
+            "captured_at": datetime(2026, 3, 5, 10, 0, 0),
+            "content_hash": "abc123",
+            "format": doc_format,
+            "case_number": None,
+            "case_title": None,
+            "hearing_date": None,
+        }
+
+    def test_oc_civil_reparse_extracts_text(self) -> None:
+        """OC civil PDF scraper extracts ruling text via pdfplumber."""
+        pdf_path = os.path.join(self._FIXTURES_DIR, "oc_apkarian_c25.pdf")
+        with open(pdf_path, "rb") as f:
+            pdf_bytes = f.read()
+
+        doc_meta = self._make_pdf_doc_meta("ca-oc-tentatives-civil", "Orange")
+        result = reingest._reparse_document(pdf_bytes, "ca-oc-tentatives-civil", doc_meta)
+
+        # Should have extracted meaningful text, not garbage
+        assert result["ruling_text"] is not None
+        assert len(result["ruling_text"]) > 100
+        assert "%PDF" not in result["ruling_text"]
+
+    def test_sb_reparse_extracts_judge(self) -> None:
+        """SB PDF scraper extracts judge name from PDF text."""
+        pdf_path = os.path.join(self._FIXTURES_DIR, "sb_r12_20260303_0df41117.pdf")
+        with open(pdf_path, "rb") as f:
+            pdf_bytes = f.read()
+
+        doc_meta = self._make_pdf_doc_meta("ca-sb-tentatives-civil", "San Bernardino")
+        result = reingest._reparse_document(pdf_bytes, "ca-sb-tentatives-civil", doc_meta)
+
+        # SB scraper extracts judge name from PDF text header
+        assert result["judge_name"] is not None
+        assert len(result["judge_name"]) > 2
+
+    def test_sf_reparse_extracts_text(self) -> None:
+        """SF PDF scraper extracts ruling text."""
+        pdf_path = os.path.join(self._FIXTURES_DIR, "sf_dept403_ruling.pdf")
+        with open(pdf_path, "rb") as f:
+            pdf_bytes = f.read()
+
+        doc_meta = self._make_pdf_doc_meta("ca-sf-tentatives-family-law", "San Francisco")
+        result = reingest._reparse_document(pdf_bytes, "ca-sf-tentatives-family-law", doc_meta)
+
+        assert result["ruling_text"] is not None
+        assert len(result["ruling_text"]) > 100
+
+    def test_riverside_reparse_extracts_text(self) -> None:
+        """Riverside PDF scraper extracts ruling text."""
+        pdf_path = os.path.join(self._FIXTURES_DIR, "riv_ps1.pdf")
+        with open(pdf_path, "rb") as f:
+            pdf_bytes = f.read()
+
+        doc_meta = self._make_pdf_doc_meta("ca-riverside-tentatives-civil", "Riverside")
+        result = reingest._reparse_document(pdf_bytes, "ca-riverside-tentatives-civil", doc_meta)
+
+        assert result["ruling_text"] is not None
+        assert len(result["ruling_text"]) > 100
+
+    def test_pdf_fallback_extracts_text_when_no_scraper(self) -> None:
+        """When no scraper is registered, PDF text is still extracted via pdfplumber."""
+        pdf_path = os.path.join(self._FIXTURES_DIR, "oc_apkarian_c25.pdf")
+        with open(pdf_path, "rb") as f:
+            pdf_bytes = f.read()
+
+        doc_meta = self._make_pdf_doc_meta("unknown-scraper-id", "Test")
+        result = reingest._reparse_document(pdf_bytes, "unknown-scraper-id", doc_meta)
+
+        # Even without a scraper, the text should be properly extracted
+        assert result["ruling_text"] is not None
+        assert len(result["ruling_text"]) > 100
+        assert "%PDF" not in result["ruling_text"]
+
+    def test_non_pdf_scraper_still_works(self) -> None:
+        """LA (non-PDF) scraper still works with HTML content."""
+        html = b"<html><body>Motion is GRANTED. Judge Smith presiding.</body></html>"
+        doc_meta = self._make_pdf_doc_meta(
+            "ca-la-tentatives-civil", "Los Angeles", doc_format="html"
+        )
+        result = reingest._reparse_document(html, "ca-la-tentatives-civil", doc_meta)
+
+        assert result["ruling_text"] is not None
+        assert "GRANTED" in result["ruling_text"]
+
     def test_registry_values_are_basescraper_subclasses(self) -> None:
         """Every value in the registry should be a BaseScraper subclass."""
         from framework.base import BaseScraper
