@@ -28,6 +28,7 @@ const CASE_QUERY = gql`
         id
         canonicalName
         partyType
+        role
       }
     }
   }
@@ -82,6 +83,7 @@ interface CaseData {
       id: string;
       canonicalName: string;
       partyType: string | null;
+      role: string | null;
     }>;
   } | null;
 }
@@ -117,11 +119,11 @@ const OUTCOME_BADGE: Record<string, string> = {
     'bg-yellow-100 text-yellow-800 dark:bg-yellow-900 dark:text-yellow-200',
 };
 
-/** Party types grouped as plaintiffs. */
-const PLAINTIFF_TYPES = new Set(['plaintiff', 'petitioner', 'cross_complainant']);
+/** Party roles grouped as plaintiffs. */
+const PLAINTIFF_ROLES = new Set(['plaintiff', 'petitioner', 'cross_complainant', 'moving_party']);
 
-/** Party types grouped as defendants. */
-const DEFENDANT_TYPES = new Set(['defendant', 'respondent', 'cross_defendant']);
+/** Party roles grouped as defendants. */
+const DEFENDANT_ROLES = new Set(['defendant', 'respondent', 'cross_defendant', 'responding_party']);
 
 /** Map document format to a human-readable label. */
 export const FORMAT_LABELS: Record<string, string> = {
@@ -183,11 +185,12 @@ export function formatLabel(value: string | null): string {
 
 /**
  * Group parties into plaintiffs, defendants, and other columns.
- * Returns three arrays: plaintiffs, defendants, and others (parties with
- * an unrecognized or null partyType).
+ * Uses the case-specific ``role`` from the case_parties join table
+ * (plaintiff, defendant, petitioner, etc.). Falls back to ``partyType``
+ * for legacy data that only has entity classification.
  */
 export function groupParties(
-  parties: Array<{ id: string; canonicalName: string; partyType: string | null }>,
+  parties: Array<{ id: string; canonicalName: string; partyType: string | null; role: string | null }>,
 ): {
   plaintiffs: typeof parties;
   defendants: typeof parties;
@@ -197,10 +200,10 @@ export function groupParties(
   const defendants: typeof parties = [];
   const others: typeof parties = [];
   for (const party of parties) {
-    const key = party.partyType?.toLowerCase() ?? '';
-    if (PLAINTIFF_TYPES.has(key)) {
+    const key = (party.role ?? party.partyType ?? '').toLowerCase();
+    if (PLAINTIFF_ROLES.has(key)) {
       plaintiffs.push(party);
-    } else if (DEFENDANT_TYPES.has(key)) {
+    } else if (DEFENDANT_ROLES.has(key)) {
       defendants.push(party);
     } else {
       others.push(party);
@@ -247,7 +250,7 @@ function PartyColumn({
   parties,
 }: {
   label: string;
-  parties: Array<{ id: string; canonicalName: string; partyType: string | null }>;
+  parties: Array<{ id: string; canonicalName: string; partyType: string | null; role: string | null }>;
 }) {
   return (
     <div>

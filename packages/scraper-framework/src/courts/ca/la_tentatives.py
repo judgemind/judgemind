@@ -674,29 +674,53 @@ def _extract_parties_from_moving_responding(text: str) -> list[dict[str, str]]:
     return parties
 
 
-def _is_corporate_suffix(token: str) -> bool:
-    """Return True if *token* is a corporate/entity suffix that should not be
-    split from the preceding name.
+def _is_name_fragment(name: str) -> bool:
+    """Return True if *name* is a fragment that should not be a standalone party.
 
-    Examples: Inc, Inc., LLC, Corp, Corporation, Ltd, L.P., N.A., Co., LP, GP
+    Rejects:
+    - Corporate suffixes alone (Inc, LLC, Corp, Ltd, etc.)
+    - Single words shorter than 3 characters
+    - Names that look like incomplete fragments (single word, no space)
     """
-    normalized = token.strip().replace(".", "").upper()
-    return normalized in {
+    stripped = name.strip().rstrip(".,;: ")
+    if not stripped:
+        return True
+
+    upper = stripped.upper().rstrip(".")
+    # Standalone corporate suffixes
+    corp_suffixes = {
         "INC",
         "LLC",
+        "LLP",
+        "LP",
         "CORP",
         "CORPORATION",
         "LTD",
-        "LP",
-        "GP",
         "CO",
+        "COMPANY",
         "NA",
-        "PA",
         "PC",
         "PLLC",
-        "LLP",
-        "DBA",
+        "PLC",
     }
+    if upper in corp_suffixes:
+        return True
+
+    # Single word with no space — likely a fragment (first name only, etc.)
+    # Allow single-word org names that are long enough (e.g. "Google")
+    if " " not in stripped and len(stripped) < 4:
+        return True
+
+    return False
+
+
+# Corporate suffix patterns that should NOT trigger a comma split.
+# Matches ", Inc", ", LLC", etc. at the end of a name or before another comma.
+_CORP_SUFFIX_RE = re.compile(
+    r",\s*(?:Inc|LLC|LLP|L\.?P\.?|Corp|Corporation|Ltd|Co|Company"
+    r"|N\.?A\.?|P\.?C\.?|PLLC|PLC)\.?(?=\s*(?:,|$))",
+    re.IGNORECASE,
+)
 
 
 def _split_party_names(text: str) -> list[str]:
@@ -707,29 +731,30 @@ def _split_party_names(text: str) -> list[str]:
     - "Ashley Willowbrook LP and Ashley Willowbrook GP LP"
     - "Techno-Advanced, Inc." (corporate suffix kept with name)
 
-    Uses ", " as the primary delimiter.  After splitting, reassembles
-    fragments that are corporate suffixes (Inc, LLC, Corp, etc.) back
-    onto the preceding name so that "Techno-Advanced, Inc." stays intact.
+    Uses ", " as the primary delimiter. Also splits on " and " when it
+    appears after a comma-separated list (Oxford comma pattern).
+
+    Corporate suffixes (Inc, LLC, Corp, etc.) preceded by commas are
+    protected from splitting so "Techno-Advanced, Inc." stays intact.
     """
+    # Protect corporate suffixes from comma-splitting by replacing the comma
+    # with a placeholder.  E.g. "Techno-Advanced, Inc." -> "Techno-Advanced\x00 Inc."
+    placeholder = "\x00"
+    protected = _CORP_SUFFIX_RE.sub(lambda m: m.group(0).replace(",", placeholder, 1), text)
+
     # First, handle Oxford comma: "A, B, and C" -> split on ", " and ", and "
-    raw_parts = re.split(r",\s+and\s+|,\s+", text)
+    parts = re.split(r",\s+and\s+|,\s+", protected)
     # If no commas found, try splitting on standalone " and "
-    if len(raw_parts) == 1:
-        raw_parts = re.split(r"\s+and\s+", text)
+    if len(parts) == 1:
+        parts = re.split(r"\s+and\s+", protected)
 
-    # Reassemble corporate suffixes onto the preceding name.
-    # e.g. ["Techno-Advanced", "Inc."] -> ["Techno-Advanced, Inc."]
-    parts: list[str] = []
-    for fragment in raw_parts:
-        fragment = fragment.strip()
-        if not fragment:
-            continue
-        if parts and _is_corporate_suffix(fragment):
-            parts[-1] = f"{parts[-1]}, {fragment}"
-        else:
-            parts.append(fragment)
-
-    return [p.strip() for p in parts if p.strip()]
+    # Restore placeholders and filter fragments
+    result: list[str] = []
+    for p in parts:
+        restored = p.replace(placeholder, ",").strip()
+        if restored and not _is_name_fragment(restored):
+            result.append(restored)
+    return result
 
 
 # ---------------------------------------------------------------------------

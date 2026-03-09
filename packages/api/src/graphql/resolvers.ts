@@ -388,7 +388,7 @@ export const resolvers = {
     },
     parties: async (row: Row, _: unknown, { pool }: Context) => {
       const { rows } = await pool.query<Row>(
-        `SELECT p.* FROM parties p
+        `SELECT p.*, cp.role FROM parties p
          JOIN case_parties cp ON cp.party_id = p.id
          WHERE cp.case_id = $1`,
         [row.id],
@@ -459,6 +459,7 @@ export const resolvers = {
   Party: {
     canonicalName: (row: Row) => row.canonical_name,
     partyType: (row: Row) => row.party_type,
+    role: (row: Row) => row.role ?? null,
   },
 
   RulingSearchHit: {

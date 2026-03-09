@@ -90,12 +90,66 @@ def _clean_party_name(raw: str) -> str:
     return name
 
 
+def _is_name_fragment(name: str) -> bool:
+    """Return True if *name* is a fragment that should not be a standalone party."""
+    stripped = name.strip().rstrip(".,;: ")
+    if not stripped:
+        return True
+
+    upper = stripped.upper().rstrip(".")
+    corp_suffixes = {
+        "INC",
+        "LLC",
+        "LLP",
+        "LP",
+        "CORP",
+        "CORPORATION",
+        "LTD",
+        "CO",
+        "COMPANY",
+        "NA",
+        "PC",
+        "PLLC",
+        "PLC",
+    }
+    if upper in corp_suffixes:
+        return True
+
+    if " " not in stripped and len(stripped) < 4:
+        return True
+
+    return False
+
+
+# Corporate suffix patterns that should NOT trigger a comma split.
+_CORP_SUFFIX_RE = re.compile(
+    r",\s*(?:Inc|LLC|LLP|L\.?P\.?|Corp|Corporation|Ltd|Co|Company"
+    r"|N\.?A\.?|P\.?C\.?|PLLC|PLC)\.?(?=\s*(?:,|$))",
+    re.IGNORECASE,
+)
+
+
 def _split_party_names(text: str) -> list[str]:
-    """Split a string containing multiple party names into individual names."""
-    parts = re.split(r",\s+and\s+|,\s+", text)
+    """Split a string containing multiple party names into individual names.
+
+    Corporate suffixes (Inc, LLC, Corp, etc.) preceded by commas are
+    protected from splitting so "Techno-Advanced, Inc." stays intact.
+    """
+    placeholder = "\x00"
+    protected = _CORP_SUFFIX_RE.sub(
+        lambda m: m.group(0).replace(",", placeholder, 1), text
+    )
+
+    parts = re.split(r",\s+and\s+|,\s+", protected)
     if len(parts) == 1:
-        parts = re.split(r"\s+and\s+", text)
-    return [p.strip() for p in parts if p.strip()]
+        parts = re.split(r"\s+and\s+", protected)
+
+    result: list[str] = []
+    for p in parts:
+        restored = p.replace(placeholder, ",").strip()
+        if restored and not _is_name_fragment(restored):
+            result.append(restored)
+    return result
 
 
 def extract_parties(ruling_text: str) -> list[dict[str, str]]:

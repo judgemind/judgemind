@@ -74,7 +74,8 @@ async function seedData(): Promise<void> {
     [caseId, pRows[0].id],
   );
 
-  const { rows: dRows } = await pool.query<{ id: string }>(
+  // Create separate documents for each ruling (document_id has a unique constraint)
+  const { rows: dRows1 } = await pool.query<{ id: string }>(
     `INSERT INTO documents
        (case_id, court_id, document_type, s3_key, s3_bucket, format, content_hash,
         source_url, scraper_id, captured_at, hearing_date, status)
@@ -84,8 +85,34 @@ async function seedData(): Promise<void> {
      RETURNING id`,
     [caseId, courtId],
   );
-  const docId = dRows[0].id;
-  insertedDocIds.push(docId);
+  const docId1 = dRows1[0].id;
+  insertedDocIds.push(docId1);
+
+  const { rows: dRows2 } = await pool.query<{ id: string }>(
+    `INSERT INTO documents
+       (case_id, court_id, document_type, s3_key, s3_bucket, format, content_hash,
+        source_url, scraper_id, captured_at, hearing_date, status)
+     VALUES ($1, $2, 'ruling', 'ca/la/ca-la-test/doc2.html', 'judgemind-document-archive-dev',
+             'html', 'def456ghi789', 'https://www.lacourt.ca.gov',
+             'ca-la-tentatives-civil', NOW(), '2026-03-01', 'active')
+     RETURNING id`,
+    [caseId, courtId],
+  );
+  const docId2 = dRows2[0].id;
+  insertedDocIds.push(docId2);
+
+  const { rows: dRows3 } = await pool.query<{ id: string }>(
+    `INSERT INTO documents
+       (case_id, court_id, document_type, s3_key, s3_bucket, format, content_hash,
+        source_url, scraper_id, captured_at, hearing_date, status)
+     VALUES ($1, $2, 'ruling', 'ca/la/ca-la-test/doc3.html', 'judgemind-document-archive-dev',
+             'html', 'ghi789jkl012', 'https://www.lacourt.ca.gov',
+             'ca-la-tentatives-civil', NOW(), '2099-12-31', 'active')
+     RETURNING id`,
+    [caseId, courtId],
+  );
+  const docId3 = dRows3[0].id;
+  insertedDocIds.push(docId3);
 
   // Ruling 1 — granted / msj / 2026-03-02
   const { rows: rRows } = await pool.query<{ id: string }>(
@@ -95,7 +122,7 @@ async function seedData(): Promise<void> {
      VALUES ($1, $2, $3, $4, '2026-03-02', 'granted', 'msj', true, 'Dept. 3',
              'TENTATIVE RULING: Motion for Summary Judgment is GRANTED.')
      RETURNING id`,
-    [docId, caseId, judgeId, courtId],
+    [docId1, caseId, judgeId, courtId],
   );
   rulingId = rRows[0].id;
 
@@ -106,7 +133,7 @@ async function seedData(): Promise<void> {
         is_tentative, department, ruling_text)
      VALUES ($1, $2, $3, $4, '2026-03-01', 'denied', 'mtd', true, 'Dept. 3',
              'TENTATIVE RULING: Motion to Dismiss is DENIED.')`,
-    [docId, caseId, judgeId, courtId],
+    [docId2, caseId, judgeId, courtId],
   );
 
   // Ruling 3 — future hearing date (should be excluded by default)
@@ -116,7 +143,7 @@ async function seedData(): Promise<void> {
         is_tentative, department, ruling_text)
      VALUES ($1, $2, $3, $4, '2099-12-31', 'granted', 'msj', true, 'Dept. 3',
              'TENTATIVE RULING: Future ruling that should be filtered out.')`,
-    [docId, caseId, judgeId, courtId],
+    [docId3, caseId, judgeId, courtId],
   );
 }
 

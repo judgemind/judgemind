@@ -102,13 +102,14 @@ describe('truncateText', () => {
 });
 
 describe('groupParties', () => {
-  const mkParty = (id: string, name: string, type: string | null) => ({
+  const mkParty = (id: string, name: string, role: string | null, partyType: string | null = null) => ({
     id,
     canonicalName: name,
-    partyType: type,
+    partyType,
+    role,
   });
 
-  it('groups plaintiffs and defendants correctly', () => {
+  it('groups by role when role is present', () => {
     const parties = [
       mkParty('1', 'Alice Smith', 'plaintiff'),
       mkParty('2', 'Bob Jones', 'defendant'),
@@ -142,7 +143,7 @@ describe('groupParties', () => {
     expect(defendants).toHaveLength(1);
   });
 
-  it('puts unrecognized party types in others', () => {
+  it('puts unrecognized roles in others', () => {
     const parties = [
       mkParty('1', 'Witness', 'witness'),
       mkParty('2', 'Intervenor', 'intervenor'),
@@ -153,7 +154,7 @@ describe('groupParties', () => {
     expect(others).toHaveLength(2);
   });
 
-  it('puts null party types in others', () => {
+  it('puts null role and null partyType in others', () => {
     const parties = [mkParty('1', 'Unknown', null)];
     const { others } = groupParties(parties);
     expect(others).toHaveLength(1);
@@ -164,6 +165,35 @@ describe('groupParties', () => {
     expect(plaintiffs).toHaveLength(0);
     expect(defendants).toHaveLength(0);
     expect(others).toHaveLength(0);
+  });
+
+  it('role takes precedence over partyType', () => {
+    const parties = [
+      mkParty('1', 'Alice', 'plaintiff', 'defendant'),
+    ];
+    const { plaintiffs, defendants } = groupParties(parties);
+    expect(plaintiffs).toHaveLength(1);
+    expect(defendants).toHaveLength(0);
+  });
+
+  it('falls back to partyType when role is null', () => {
+    const parties = [
+      mkParty('1', 'Alice', null, 'plaintiff'),
+      mkParty('2', 'Bob', null, 'defendant'),
+    ];
+    const { plaintiffs, defendants } = groupParties(parties);
+    expect(plaintiffs).toHaveLength(1);
+    expect(defendants).toHaveLength(1);
+  });
+
+  it('groups moving_party as plaintiff and responding_party as defendant', () => {
+    const parties = [
+      mkParty('1', 'Alice', 'moving_party'),
+      mkParty('2', 'Bob', 'responding_party'),
+    ];
+    const { plaintiffs, defendants } = groupParties(parties);
+    expect(plaintiffs).toHaveLength(1);
+    expect(defendants).toHaveLength(1);
   });
 });
 
