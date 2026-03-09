@@ -52,6 +52,9 @@ logs/
 # Agent worker temp files
 tmp/
 
+# Eval script results (run-specific, not committed)
+scripts/eval/results/
+
 # Scraped data (never commit raw court data)
 data/
 *.html.raw
