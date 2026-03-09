@@ -1,8 +1,8 @@
 """Tests for the reingest_from_s3 script.
 
 Verifies keyset (cursor-based) pagination, parallel S3 fetching,
-error handling, and CLI flag behavior. All database and S3 access
-is mocked.
+psycopg3 pipeline batching of DB writes, error handling, and CLI
+flag behavior. All database and S3 access is mocked.
 """
 
 from __future__ import annotations
@@ -100,6 +100,28 @@ def _mock_conn_returning(rows: list) -> MagicMock:
 
     conn.cursor.side_effect = cursor_ctx
     return conn
+
+
+def _mock_conn_with_rows(rows: list[tuple]) -> MagicMock:
+    """Create a mock connection that returns rows and supports pipeline context."""
+    conn = _mock_conn_returning(rows)
+
+    # Pipeline context manager
+    pipeline = MagicMock()
+    pipeline.__enter__ = MagicMock(return_value=pipeline)
+    pipeline.__exit__ = MagicMock(return_value=False)
+    conn.pipeline.return_value = pipeline
+
+    return conn
+
+
+def _mock_s3_client(content: bytes = b"<html>ruling text</html>") -> MagicMock:
+    """Create a mock S3 client that returns the given content."""
+    s3 = MagicMock()
+    body = MagicMock()
+    body.read.return_value = content
+    s3.get_object.return_value = {"Body": body}
+    return s3
 
 
 _DEFAULT_CURSOR = (reingest._CURSOR_MIN_TIMESTAMP, reingest._CURSOR_MIN_UUID)
@@ -297,6 +319,170 @@ class TestReingestBatchCursor:
         assert updated == 0
         assert next_cursor == (_CAPTURED_AT_1, str(_DOC_ID_1))
         mock_fetch_s3.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# reingest_batch tests — pipeline batching
+# ---------------------------------------------------------------------------
+
+
+class TestReingestBatchPipeline:
+    """Tests for DB pipeline batching in reingest_batch()."""
+
+    @patch("reingest_from_s3._reparse_document")
+    @patch("reingest_from_s3._fetch_s3_content")
+    def test_dry_run_skips_pipeline(
+        self,
+        mock_fetch_s3: MagicMock,
+        mock_reparse: MagicMock,
+    ) -> None:
+        """In dry-run mode, pipeline context is not entered."""
+        row = _make_document_row()
+        conn = _mock_conn_with_rows([row])
+
+        mock_fetch_s3.return_value = b"<html>text</html>"
+        mock_reparse.return_value = {
+            "ruling_text": "text",
+            "case_number": "23STCV01234",
+            "case_title": "Smith v. Jones",
+            "judge_name": None,
+            "outcome": None,
+            "motion_type": None,
+            "department": None,
+            "parties": [],
+            "hearing_date": _HEARING_DATE,
+        }
+
+        processed, updated, _cursor = reingest.reingest_batch(
+            conn,
+            MagicMock(),
+            batch_size=10,
+            cursor=_DEFAULT_CURSOR,
+            filters="",
+            filter_params=[],
+            dry_run=True,
+        )
+
+        assert processed == 1
+        assert updated == 0
+        conn.pipeline.assert_not_called()
+
+    @patch("reingest_from_s3.upsert_case_party")
+    @patch("reingest_from_s3.upsert_party")
+    @patch("reingest_from_s3.upsert_case_judge")
+    @patch("reingest_from_s3.insert_ruling")
+    @patch("reingest_from_s3.resolve_judge")
+    @patch("reingest_from_s3.insert_document")
+    @patch("reingest_from_s3.upsert_case")
+    @patch("reingest_from_s3._reparse_document")
+    @patch("reingest_from_s3._fetch_s3_content")
+    def test_pipeline_context_used_for_db_writes(
+        self,
+        mock_fetch_s3: MagicMock,
+        mock_reparse: MagicMock,
+        mock_upsert_case: MagicMock,
+        mock_insert_doc: MagicMock,
+        mock_resolve_judge: MagicMock,
+        mock_insert_ruling: MagicMock,
+        mock_upsert_cj: MagicMock,
+        mock_upsert_party: MagicMock,
+        mock_upsert_cp: MagicMock,
+    ) -> None:
+        """DB writes happen inside a pipeline context."""
+        row = _make_document_row()
+        conn = _mock_conn_with_rows([row])
+
+        mock_fetch_s3.return_value = b"<html>text</html>"
+        mock_reparse.return_value = {
+            "ruling_text": "The motion is granted.",
+            "case_number": "23STCV01234",
+            "case_title": "Smith v. Jones",
+            "judge_name": "John Smith",
+            "outcome": "granted",
+            "motion_type": "msj",
+            "department": "1",
+            "parties": [],
+            "hearing_date": _HEARING_DATE,
+        }
+        mock_upsert_case.return_value = "new-case-id"
+        mock_resolve_judge.return_value = "judge-id"
+
+        processed, updated, _cursor = reingest.reingest_batch(
+            conn,
+            MagicMock(),
+            batch_size=10,
+            cursor=_DEFAULT_CURSOR,
+            filters="",
+            filter_params=[],
+        )
+
+        assert processed == 1
+        assert updated == 1
+        conn.pipeline.assert_called_once()
+        mock_upsert_case.assert_called_once()
+        mock_insert_doc.assert_called_once()
+        mock_resolve_judge.assert_called_once()
+        mock_insert_ruling.assert_called_once()
+        mock_upsert_cj.assert_called_once()
+
+    @patch("reingest_from_s3.upsert_case_judge")
+    @patch("reingest_from_s3.insert_ruling")
+    @patch("reingest_from_s3.resolve_judge")
+    @patch("reingest_from_s3.insert_document")
+    @patch("reingest_from_s3.upsert_case")
+    @patch("reingest_from_s3._reparse_document")
+    @patch("reingest_from_s3._fetch_s3_content")
+    def test_case_id_flows_through_pipeline(
+        self,
+        mock_fetch_s3: MagicMock,
+        mock_reparse: MagicMock,
+        mock_upsert_case: MagicMock,
+        mock_insert_doc: MagicMock,
+        mock_resolve_judge: MagicMock,
+        mock_insert_ruling: MagicMock,
+        mock_upsert_cj: MagicMock,
+    ) -> None:
+        """The case_id from upsert_case flows to insert_document and insert_ruling."""
+        row = _make_document_row()
+        conn = _mock_conn_with_rows([row])
+
+        mock_fetch_s3.return_value = b"<html>text</html>"
+        mock_reparse.return_value = {
+            "ruling_text": "The motion is granted.",
+            "case_number": "23STCV01234",
+            "case_title": "Smith v. Jones",
+            "judge_name": "Judge Doe",
+            "outcome": "granted",
+            "motion_type": "msj",
+            "department": "1",
+            "parties": [],
+            "hearing_date": _HEARING_DATE,
+        }
+        mock_upsert_case.return_value = "pipeline-case-id"
+        mock_resolve_judge.return_value = "pipeline-judge-id"
+
+        reingest.reingest_batch(
+            conn,
+            MagicMock(),
+            batch_size=10,
+            cursor=_DEFAULT_CURSOR,
+            filters="",
+            filter_params=[],
+        )
+
+        insert_doc_kwargs = mock_insert_doc.call_args[1]
+        assert insert_doc_kwargs["case_id"] == "pipeline-case-id"
+
+        insert_ruling_kwargs = mock_insert_ruling.call_args[1]
+        assert insert_ruling_kwargs["case_id"] == "pipeline-case-id"
+        assert insert_ruling_kwargs["judge_id"] == "pipeline-judge-id"
+
+        mock_upsert_cj.assert_called_once_with(
+            conn,
+            "pipeline-case-id",
+            "pipeline-judge-id",
+            _HEARING_DATE,
+        )
 
 
 # ---------------------------------------------------------------------------

@@ -305,7 +305,9 @@ def reingest_batch(
                     exc_info=True,
                 )
 
-    # --- Process rows sequentially (DB writes) -----------------------------
+    # --- Parse rows and collect documents for DB write ----------------------
+    parsed_docs: list[tuple[dict, dict]] = []  # (doc_meta, extracted)
+
     for idx, row in enumerate(rows):
         (
             doc_id,
@@ -350,6 +352,10 @@ def reingest_batch(
             "case_number": case_number,
             "case_title": case_title,
             "hearing_date": hearing_date,
+            "court_id": str(court_id),
+            "scraper_id": scraper_id,
+            "s3_key": s3_key,
+            "s3_bucket": s3_bucket,
         }
 
         extracted = _reparse_document(raw_content, scraper_id, doc_meta)
@@ -368,71 +374,87 @@ def reingest_batch(
             )
             continue
 
-        # Re-run through the ingestion pipeline (now with upsert semantics)
-        effective_case_number = (
-            extracted["case_number"] or case_number or f"UNKNOWN-{doc_id_str}"
-        )
-        new_case_id = upsert_case(
-            conn,
-            effective_case_number,
-            str(court_id),
-            case_title=extracted["case_title"],
-        )
+        parsed_docs.append((doc_meta, extracted))
 
-        effective_hearing = extracted["hearing_date"] or hearing_date
-        insert_document(
-            conn,
-            document_id=doc_id_str,
-            case_id=new_case_id,
-            court_id=str(court_id),
-            content_format=doc_format,
-            content_hash=content_hash,
-            s3_key=s3_key,
-            s3_bucket=s3_bucket,
-            source_url=source_url,
-            scraper_id=scraper_id,
-            captured_at=captured_at,
-            hearing_date=effective_hearing,
-        )
+    if dry_run or not parsed_docs:
+        return processed, updated, next_cursor
 
-        # Resolve judge
-        judge_id = None
-        if extracted["judge_name"]:
-            judge_id = resolve_judge(conn, extracted["judge_name"], str(court_id))
+    # --- DB writes inside a pipeline context --------------------------------
+    # Pipeline mode batches TCP round-trips — multiple queries are sent without
+    # waiting for individual responses, then results are collected as needed.
+    # Each document still reads intermediate IDs (case_id, judge_id, party_id)
+    # via fetchone(), but the network overhead is amortised across the batch.
+    with conn.pipeline():
+        for doc_meta, extracted in parsed_docs:
+            doc_id_str = doc_meta["document_id"]
+            court_id_str = doc_meta["court_id"]
 
-        # Upsert ruling
-        if effective_hearing is not None:
-            ruling_text = extracted["ruling_text"]
-            # Clean ruling text if it's the full raw HTML — take first 50k chars
-            if ruling_text and len(ruling_text) > 50000:
-                ruling_text = ruling_text[:50000]
+            effective_case_number = (
+                extracted["case_number"]
+                or doc_meta["case_number"]
+                or f"UNKNOWN-{doc_id_str}"
+            )
+            new_case_id = upsert_case(
+                conn,
+                effective_case_number,
+                court_id_str,
+                case_title=extracted["case_title"],
+            )
 
-            insert_ruling(
+            effective_hearing = extracted["hearing_date"] or doc_meta["hearing_date"]
+            insert_document(
                 conn,
                 document_id=doc_id_str,
                 case_id=new_case_id,
-                court_id=str(court_id),
+                court_id=court_id_str,
+                content_format=doc_meta["format"],
+                content_hash=doc_meta["content_hash"],
+                s3_key=doc_meta["s3_key"],
+                s3_bucket=doc_meta["s3_bucket"],
+                source_url=doc_meta["source_url"],
+                scraper_id=doc_meta["scraper_id"],
+                captured_at=doc_meta["captured_at"],
                 hearing_date=effective_hearing,
-                ruling_text=ruling_text,
-                department=extracted["department"],
-                judge_id=judge_id,
-                outcome=extracted["outcome"],
-                motion_type=extracted["motion_type"],
             )
 
-        if judge_id:
-            upsert_case_judge(conn, new_case_id, judge_id, effective_hearing)
+            # Resolve judge
+            judge_id = None
+            if extracted["judge_name"]:
+                judge_id = resolve_judge(conn, extracted["judge_name"], court_id_str)
 
-        # Parties
-        for party_info in extracted.get("parties", []):
-            party_name = party_info.get("name", "")
-            party_role = party_info.get("role", "")
-            if party_name:
-                party_id = upsert_party(conn, party_name)
-                if party_role:
-                    upsert_case_party(conn, new_case_id, party_id, party_role)
+            # Upsert ruling
+            if effective_hearing is not None:
+                ruling_text = extracted["ruling_text"]
+                # Clean ruling text if it's the full raw HTML — take first 50k chars
+                if ruling_text and len(ruling_text) > 50000:
+                    ruling_text = ruling_text[:50000]
 
-        updated += 1
+                insert_ruling(
+                    conn,
+                    document_id=doc_id_str,
+                    case_id=new_case_id,
+                    court_id=court_id_str,
+                    hearing_date=effective_hearing,
+                    ruling_text=ruling_text,
+                    department=extracted["department"],
+                    judge_id=judge_id,
+                    outcome=extracted["outcome"],
+                    motion_type=extracted["motion_type"],
+                )
+
+            if judge_id:
+                upsert_case_judge(conn, new_case_id, judge_id, effective_hearing)
+
+            # Parties
+            for party_info in extracted.get("parties", []):
+                party_name = party_info.get("name", "")
+                party_role = party_info.get("role", "")
+                if party_name:
+                    party_id = upsert_party(conn, party_name)
+                    if party_role:
+                        upsert_case_party(conn, new_case_id, party_id, party_role)
+
+            updated += 1
 
     return processed, updated, next_cursor
 
