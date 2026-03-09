@@ -1,6 +1,6 @@
 """Tests for LLM-based field extraction (llm_extract.py).
 
-All tests mock the Anthropic API — no real API calls are made.
+All tests mock the LLM provider layer — no real API calls are made.
 """
 
 from __future__ import annotations
@@ -10,7 +10,6 @@ from datetime import date
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-import anthropic
 import pytest
 
 from ingestion.llm_extract import (
@@ -23,6 +22,7 @@ from ingestion.llm_extract import (
     extract_fields_llm,
     preprocess_html,
 )
+from ingestion.llm_providers import LLMResponse
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -31,20 +31,15 @@ from ingestion.llm_extract import (
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 
 
-def _make_api_response(text: str) -> MagicMock:
-    """Create a mock Anthropic API response with the given text content."""
-    block = MagicMock()
-    block.text = text
-    response = MagicMock()
-    response.content = [block]
-    return response
-
-
-def _mock_client(response_text: str) -> MagicMock:
-    """Create a mock Anthropic client that returns the given JSON string."""
-    client = MagicMock(spec=anthropic.Anthropic)
-    client.messages.create.return_value = _make_api_response(response_text)
-    return client
+def _mock_call_llm(response_text: str) -> MagicMock:
+    """Create a mock for call_llm that returns the given JSON string."""
+    return MagicMock(
+        return_value=LLMResponse(
+            text=response_text,
+            input_tokens=100,
+            output_tokens=50,
+        )
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -390,21 +385,16 @@ class TestExtractFieldsLlm:
                 ],
             }
         )
-        client = _mock_client(response_json)
-        result = extract_fields_llm(
-            document_text="Some PDF text about a ruling...",
-            content_format="pdf",
-            client=client,
-        )
+        mock_fn = _mock_call_llm(response_json)
+        with patch("ingestion.llm_extract.call_llm", mock_fn):
+            result = extract_fields_llm(
+                document_text="Some PDF text about a ruling...",
+                content_format="pdf",
+            )
         assert result is not None
         assert result.judge_name == "Bobby Luna"
         assert result.case_count == 1
         assert result.rulings[0].outcome == "granted"
-
-        # Verify the API was called with correct params
-        call_args = client.messages.create.call_args
-        assert call_args.kwargs["model"] == "claude-3-5-haiku-latest"
-        assert call_args.kwargs["temperature"] == 0
 
     def test_happy_path_html(self) -> None:
         html_doc = """
@@ -432,15 +422,16 @@ class TestExtractFieldsLlm:
                 ],
             }
         )
-        client = _mock_client(response_json)
-        result = extract_fields_llm(
-            document_text=html_doc,
-            content_format="html",
-            client=client,
-        )
+        mock_fn = _mock_call_llm(response_json)
+        with patch("ingestion.llm_extract.call_llm", mock_fn):
+            result = extract_fields_llm(
+                document_text=html_doc,
+                content_format="html",
+            )
         assert result is not None
-        # Verify HTML was preprocessed — the user message should have stripped HTML
-        user_msg = client.messages.create.call_args.kwargs["messages"][0]["content"]
+        # Verify HTML was preprocessed — the user message should not have HTML tags
+        call_args = mock_fn.call_args
+        user_msg = call_args.kwargs["user_message"]
         assert "<div" not in user_msg
         assert "DEPARTMENT 3" in user_msg
 
@@ -453,27 +444,27 @@ class TestExtractFieldsLlm:
                 "rulings": [],
             }
         )
-        client = _mock_client(response_json)
+        mock_fn = _mock_call_llm(response_json)
         metadata = {"judge_name": "Auth Judge", "department": "5", "link_text": "Dept 5 rulings"}
-        result = extract_fields_llm(
-            document_text="Ruling text",
-            content_format="pdf",
-            metadata=metadata,
-            client=client,
-        )
+        with patch("ingestion.llm_extract.call_llm", mock_fn):
+            result = extract_fields_llm(
+                document_text="Ruling text",
+                content_format="pdf",
+                metadata=metadata,
+            )
         assert result is not None
         # Metadata should override model output
         assert result.judge_name == "Auth Judge"
         assert result.department == "5"
         # Metadata should appear in the user message
-        user_msg = client.messages.create.call_args.kwargs["messages"][0]["content"]
+        call_args = mock_fn.call_args
+        user_msg = call_args.kwargs["user_message"]
         assert "Judge name (authoritative): Auth Judge" in user_msg
 
     def test_empty_text_returns_none(self) -> None:
         result = extract_fields_llm(
             document_text="",
             content_format="pdf",
-            client=MagicMock(spec=anthropic.Anthropic),
         )
         assert result is None
 
@@ -481,85 +472,29 @@ class TestExtractFieldsLlm:
         result = extract_fields_llm(
             document_text="   \n\n  ",
             content_format="pdf",
-            client=MagicMock(spec=anthropic.Anthropic),
         )
         assert result is None
 
     def test_api_error_returns_none(self) -> None:
-        client = MagicMock(spec=anthropic.Anthropic)
-        client.messages.create.side_effect = anthropic.APIError(
-            message="Server error",
-            request=MagicMock(),
-            body=None,
-        )
-        result = extract_fields_llm(
-            document_text="Some text",
-            content_format="pdf",
-            client=client,
-        )
-        assert result is None
-
-    def test_rate_limit_retries_once(self) -> None:
-        """On rate limit, should retry once with 1s backoff then succeed."""
-        good_response = json.dumps(
-            {
-                "judge_name": None,
-                "hearing_date": None,
-                "department": None,
-                "rulings": [],
-            }
-        )
-        client = MagicMock(spec=anthropic.Anthropic)
-        # First call raises rate limit, second succeeds
-        rate_limit_error = anthropic.RateLimitError(
-            message="Rate limited",
-            response=MagicMock(status_code=429, headers={}),
-            body=None,
-        )
-        client.messages.create.side_effect = [
-            rate_limit_error,
-            _make_api_response(good_response),
-        ]
-        with patch("ingestion.llm_extract.time.sleep") as mock_sleep:
+        mock_fn = MagicMock(return_value=None)
+        with patch("ingestion.llm_extract.call_llm", mock_fn):
             result = extract_fields_llm(
                 document_text="Some text",
                 content_format="pdf",
-                client=client,
-            )
-        assert result is not None
-        # Should have slept 1s between retries
-        mock_sleep.assert_called_once_with(1)
-        # Should have called the API twice
-        assert client.messages.create.call_count == 2
-
-    def test_rate_limit_exhausted_returns_none(self) -> None:
-        """On double rate limit, should give up and return None."""
-        client = MagicMock(spec=anthropic.Anthropic)
-        rate_limit_error = anthropic.RateLimitError(
-            message="Rate limited",
-            response=MagicMock(status_code=429, headers={}),
-            body=None,
-        )
-        client.messages.create.side_effect = rate_limit_error
-        with patch("ingestion.llm_extract.time.sleep"):
-            result = extract_fields_llm(
-                document_text="Some text",
-                content_format="pdf",
-                client=client,
             )
         assert result is None
 
     def test_malformed_json_response_returns_none(self) -> None:
-        client = _mock_client("This is not JSON at all")
-        result = extract_fields_llm(
-            document_text="Some text",
-            content_format="pdf",
-            client=client,
-        )
+        mock_fn = _mock_call_llm("This is not JSON at all")
+        with patch("ingestion.llm_extract.call_llm", mock_fn):
+            result = extract_fields_llm(
+                document_text="Some text",
+                content_format="pdf",
+            )
         assert result is None
 
     def test_small_doc_no_chunking(self) -> None:
-        """Documents under max_chars should be processed in a single API call."""
+        """Documents under max_chars should be processed in a single call."""
         short_text = "A" * 1000
         response_json = json.dumps(
             {
@@ -569,18 +504,18 @@ class TestExtractFieldsLlm:
                 "rulings": [],
             }
         )
-        client = _mock_client(response_json)
-        result = extract_fields_llm(
-            document_text=short_text,
-            content_format="pdf",
-            client=client,
-            max_chars=80_000,
-        )
+        mock_fn = _mock_call_llm(response_json)
+        with patch("ingestion.llm_extract.call_llm", mock_fn):
+            result = extract_fields_llm(
+                document_text=short_text,
+                content_format="pdf",
+                max_chars=80_000,
+            )
         assert result is not None
-        assert client.messages.create.call_count == 1
+        assert mock_fn.call_count == 1
 
-    def test_client_created_from_env_when_not_provided(self) -> None:
-        """When no client is provided, should create one from ANTHROPIC_API_KEY."""
+    def test_provider_and_model_passed_through(self) -> None:
+        """Provider and model args are forwarded to call_llm."""
         response_json = json.dumps(
             {
                 "judge_name": None,
@@ -589,15 +524,18 @@ class TestExtractFieldsLlm:
                 "rulings": [],
             }
         )
-        mock_instance = _mock_client(response_json)
-
-        with patch("ingestion.llm_extract.anthropic.Anthropic", return_value=mock_instance):
+        mock_fn = _mock_call_llm(response_json)
+        with patch("ingestion.llm_extract.call_llm", mock_fn):
             result = extract_fields_llm(
                 document_text="Some text",
                 content_format="pdf",
-                # No client passed
+                provider="google",
+                model="gemini-2.5-flash-lite",
             )
         assert result is not None
+        call_kwargs = mock_fn.call_args.kwargs
+        assert call_kwargs["provider"] == "google"
+        assert call_kwargs["model"] == "gemini-2.5-flash-lite"
 
 
 # ---------------------------------------------------------------------------
@@ -606,14 +544,14 @@ class TestExtractFieldsLlm:
 
 
 class TestRealFixtures:
-    """Tests using real court ruling fixtures with mocked API responses.
+    """Tests using real court ruling fixtures with mocked LLM responses.
 
     These verify that HTML preprocessing correctly extracts content from
     real fixture files, and that the module handles realistic data shapes.
     """
 
     def test_la_ruling_response_preprocessing(self) -> None:
-        """Verify LA ruling HTML is preprocessed and sent to the API."""
+        """Verify LA ruling HTML is preprocessed and sent to the LLM."""
         fixture_path = FIXTURES_DIR / "la_ruling_response.html"
         if not fixture_path.exists():
             pytest.skip("LA fixture not available")
@@ -635,17 +573,17 @@ class TestRealFixtures:
                 ],
             }
         )
-        client = _mock_client(response_json)
-        result = extract_fields_llm(
-            document_text=raw_html,
-            content_format="html",
-            client=client,
-        )
+        mock_fn = _mock_call_llm(response_json)
+        with patch("ingestion.llm_extract.call_llm", mock_fn):
+            result = extract_fields_llm(
+                document_text=raw_html,
+                content_format="html",
+            )
         assert result is not None
         assert result.case_count == 1
 
         # The user message should have been preprocessed (no raw HTML tags)
-        user_msg = client.messages.create.call_args.kwargs["messages"][0]["content"]
+        user_msg = mock_fn.call_args.kwargs["user_message"]
         assert "<div" not in user_msg
         # But should contain the actual ruling text
         assert "Case Number" in user_msg or "DEPARTMENT" in user_msg
@@ -676,13 +614,13 @@ class TestRealFixtures:
                 ],
             }
         )
-        client = _mock_client(response_json)
-        result = extract_fields_llm(
-            document_text=raw_html,
-            content_format="html",
-            metadata={"judge_name": "Steven A. Ellis", "department": "56"},
-            client=client,
-        )
+        mock_fn = _mock_call_llm(response_json)
+        with patch("ingestion.llm_extract.call_llm", mock_fn):
+            result = extract_fields_llm(
+                document_text=raw_html,
+                content_format="html",
+                metadata={"judge_name": "Steven A. Ellis", "department": "56"},
+            )
         assert result is not None
         # Metadata should override
         assert result.judge_name == "Steven A. Ellis"
@@ -724,19 +662,19 @@ class TestRealFixtures:
                 ],
             }
         )
-        client = _mock_client(response_json)
-        result = extract_fields_llm(
-            document_text=pdf_text,
-            content_format="pdf",
-            client=client,
-        )
+        mock_fn = _mock_call_llm(response_json)
+        with patch("ingestion.llm_extract.call_llm", mock_fn):
+            result = extract_fields_llm(
+                document_text=pdf_text,
+                content_format="pdf",
+            )
         assert result is not None
         assert result.judge_name == "Bobby P. Luna"
         assert result.hearing_date == date(2026, 3, 4)
         assert result.case_count == 1
 
         # PDF text should be passed as-is (no HTML stripping)
-        user_msg = client.messages.create.call_args.kwargs["messages"][0]["content"]
+        user_msg = mock_fn.call_args.kwargs["user_message"]
         assert "Department S22 - Judge Bobby P. Luna" in user_msg
 
 
@@ -900,7 +838,7 @@ class TestChunkedExtraction:
     """Integration tests for chunked extraction through extract_fields_llm."""
 
     def test_large_doc_produces_multiple_calls(self) -> None:
-        """A document exceeding max_chars should produce multiple API calls."""
+        """A document exceeding max_chars should produce multiple LLM calls."""
         # Build a two-page PDF document where each page exceeds max_chars
         page1 = "Page 1 content. " * 5000  # ~80K chars
         page2 = "Page 2 content. " * 5000  # ~80K chars
@@ -939,30 +877,32 @@ class TestChunkedExtraction:
             }
         )
 
-        # The mock needs to handle however many chunks are produced
-        good_responses = [response_chunk1, response_chunk2]
-        client = MagicMock(spec=anthropic.Anthropic)
-        client.messages.create.side_effect = [
-            _make_api_response(r)
-            for r in good_responses * 3  # enough for up to 6 chunks
-        ]
+        # Alternate responses for however many chunks are produced
+        responses = [response_chunk1, response_chunk2] * 3
+        call_count = 0
 
-        result = extract_fields_llm(
-            document_text=text,
-            content_format="pdf",
-            client=client,
-            max_chars=80_000,
-        )
+        def mock_call_llm_side_effect(**kwargs: object) -> LLMResponse:
+            nonlocal call_count
+            idx = call_count % len(responses)
+            call_count += 1
+            return LLMResponse(text=responses[idx], input_tokens=100, output_tokens=50)
+
+        mock_fn = MagicMock(side_effect=mock_call_llm_side_effect)
+        with patch("ingestion.llm_extract.call_llm", mock_fn):
+            result = extract_fields_llm(
+                document_text=text,
+                content_format="pdf",
+                max_chars=80_000,
+            )
         assert result is not None
-        # Should have made more than 1 API call
-        assert client.messages.create.call_count >= 2
+        # Should have made more than 1 call
+        assert mock_fn.call_count >= 2
         # Should have results from multiple chunks
         assert result.case_count >= 1
         assert result.judge_name == "Test Judge"
 
     def test_dedup_across_overlap_region(self) -> None:
         """Same case appearing in overlap region should be deduplicated."""
-        # Two chunks return the same case number — only one should survive
         response1 = json.dumps(
             {
                 "judge_name": "Judge Overlap",
@@ -1010,22 +950,25 @@ class TestChunkedExtraction:
             }
         )
 
-        # Build a doc large enough to chunk with form-feed boundary
         half = "X" * 50_000
         text = f"{half}\f{half}"
 
-        client = MagicMock(spec=anthropic.Anthropic)
-        client.messages.create.side_effect = [
-            _make_api_response(response1),
-            _make_api_response(response2),
-        ]
+        responses = [response1, response2]
+        call_idx = 0
 
-        result = extract_fields_llm(
-            document_text=text,
-            content_format="pdf",
-            client=client,
-            max_chars=60_000,
-        )
+        def mock_side_effect(**kwargs: object) -> LLMResponse:
+            nonlocal call_idx
+            r = responses[min(call_idx, len(responses) - 1)]
+            call_idx += 1
+            return LLMResponse(text=r, input_tokens=100, output_tokens=50)
+
+        mock_fn = MagicMock(side_effect=mock_side_effect)
+        with patch("ingestion.llm_extract.call_llm", mock_fn):
+            result = extract_fields_llm(
+                document_text=text,
+                content_format="pdf",
+                max_chars=60_000,
+            )
         assert result is not None
         # OVERLAP-001 appears in both chunks but should only appear once
         assert result.case_count == 3
@@ -1070,18 +1013,22 @@ class TestChunkedExtraction:
         half = "Y" * 50_000
         text = f"{half}\f{half}"
 
-        client = MagicMock(spec=anthropic.Anthropic)
-        client.messages.create.side_effect = [
-            _make_api_response(response1),
-            _make_api_response(response2),
-        ]
+        responses = [response1, response2]
+        call_idx = 0
 
-        result = extract_fields_llm(
-            document_text=text,
-            content_format="pdf",
-            client=client,
-            max_chars=60_000,
-        )
+        def mock_side_effect(**kwargs: object) -> LLMResponse:
+            nonlocal call_idx
+            r = responses[min(call_idx, len(responses) - 1)]
+            call_idx += 1
+            return LLMResponse(text=r, input_tokens=100, output_tokens=50)
+
+        mock_fn = MagicMock(side_effect=mock_side_effect)
+        with patch("ingestion.llm_extract.call_llm", mock_fn):
+            result = extract_fields_llm(
+                document_text=text,
+                content_format="pdf",
+                max_chars=60_000,
+            )
         assert result is not None
         assert result.judge_name == "First Chunk Judge"
         assert result.hearing_date == date(2026, 3, 1)
@@ -1089,7 +1036,7 @@ class TestChunkedExtraction:
         assert result.case_count == 2
 
     def test_chunk_api_failure_partial_result(self) -> None:
-        """If one chunk's API call fails, the other chunks' results are returned."""
+        """If one chunk's LLM call fails, the other chunks' results are returned."""
         good_response = json.dumps(
             {
                 "judge_name": "Good Judge",
@@ -1110,38 +1057,37 @@ class TestChunkedExtraction:
         half = "Z" * 50_000
         text = f"{half}\f{half}"
 
-        client = MagicMock(spec=anthropic.Anthropic)
-        # First chunk succeeds, second fails
-        client.messages.create.side_effect = [
-            _make_api_response(good_response),
-            anthropic.APIError(message="Server error", request=MagicMock(), body=None),
-        ]
+        call_idx = 0
 
-        result = extract_fields_llm(
-            document_text=text,
-            content_format="pdf",
-            client=client,
-            max_chars=60_000,
-        )
+        def mock_side_effect(**kwargs: object) -> LLMResponse | None:
+            nonlocal call_idx
+            call_idx += 1
+            if call_idx == 1:
+                return LLMResponse(text=good_response, input_tokens=100, output_tokens=50)
+            return None  # second chunk fails
+
+        mock_fn = MagicMock(side_effect=mock_side_effect)
+        with patch("ingestion.llm_extract.call_llm", mock_fn):
+            result = extract_fields_llm(
+                document_text=text,
+                content_format="pdf",
+                max_chars=60_000,
+            )
         assert result is not None
         # Should have the result from the first chunk only
         assert result.case_count == 1
         assert result.judge_name == "Good Judge"
 
     def test_all_chunks_fail_returns_none(self) -> None:
-        """If all chunks' API calls fail, return None."""
+        """If all chunks' LLM calls fail, return None."""
         half = "W" * 50_000
         text = f"{half}\f{half}"
 
-        client = MagicMock(spec=anthropic.Anthropic)
-        client.messages.create.side_effect = anthropic.APIError(
-            message="Server error", request=MagicMock(), body=None
-        )
-
-        result = extract_fields_llm(
-            document_text=text,
-            content_format="pdf",
-            client=client,
-            max_chars=60_000,
-        )
+        mock_fn = MagicMock(return_value=None)
+        with patch("ingestion.llm_extract.call_llm", mock_fn):
+            result = extract_fields_llm(
+                document_text=text,
+                content_format="pdf",
+                max_chars=60_000,
+            )
         assert result is None

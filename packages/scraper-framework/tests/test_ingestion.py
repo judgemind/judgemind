@@ -1435,7 +1435,7 @@ def test_process_event_llm_extraction_populates_missing_fields(
 
     worker, os_mock = _make_worker()
     # Simulate an anthropic client being configured
-    worker._anthropic_client = MagicMock()
+    worker._llm_client = MagicMock()
 
     mock_conn = MagicMock()
     mock_cur = MagicMock()
@@ -1523,7 +1523,7 @@ def test_process_event_llm_failure_falls_back_to_regex(
 ) -> None:
     """When LLM extraction returns None, regex extraction is used as fallback."""
     worker, os_mock = _make_worker()
-    worker._anthropic_client = MagicMock()
+    worker._llm_client = MagicMock()
 
     mock_conn = MagicMock()
     mock_cur = MagicMock()
@@ -1569,7 +1569,7 @@ def test_process_event_no_anthropic_client_uses_regex_only(
     """When anthropic client is None (no API key), regex-only mode is used."""
     worker, os_mock = _make_worker()
     # Ensure no anthropic client
-    worker._anthropic_client = None
+    worker._llm_client = None
 
     mock_conn = MagicMock()
     mock_cur = MagicMock()
@@ -1613,7 +1613,7 @@ def test_process_event_llm_matches_ruling_by_case_number(
     from ingestion.llm_extract import LLMExtractionResult, LLMRulingResult
 
     worker, os_mock = _make_worker()
-    worker._anthropic_client = MagicMock()
+    worker._llm_client = MagicMock()
 
     mock_conn = MagicMock()
     mock_cur = MagicMock()
@@ -1694,7 +1694,7 @@ def test_process_event_scraper_fields_take_precedence_over_llm(
     from ingestion.llm_extract import LLMExtractionResult, LLMRulingResult
 
     worker, os_mock = _make_worker()
-    worker._anthropic_client = MagicMock()
+    worker._llm_client = MagicMock()
 
     mock_conn = MagicMock()
     mock_cur = MagicMock()

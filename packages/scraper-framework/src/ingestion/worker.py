@@ -10,7 +10,10 @@ Environment variables:
     REDIS_URL         — Redis URL, e.g. redis://localhost:6379 (required)
     OPENSEARCH_URL    — OpenSearch endpoint, e.g. https://localhost:9200 (required)
     JUDGEMIND_ARCHIVE_BUCKET — S3 bucket for document content (required for full-text indexing)
-    ANTHROPIC_API_KEY — Anthropic API key for LLM extraction (optional; regex-only if absent)
+    LLM_PROVIDER      — LLM provider: "anthropic" (default) or "google"
+    LLM_MODEL         — Model ID (provider-specific; sensible defaults per provider)
+    ANTHROPIC_API_KEY  — Required when LLM_PROVIDER is "anthropic" (default)
+    GOOGLE_API_KEY     — Required when LLM_PROVIDER is "google"
     MAX_RETRIES       — Per-message retry limit before dead-lettering (default: 3)
 """
 
@@ -50,10 +53,10 @@ from .extract import (
     extract_parties_from_caption,
 )
 from .llm_extract import LLMExtractionResult, LLMRulingResult, extract_fields_llm
+from .llm_providers import create_client as create_llm_client
 from .text_cleanup import clean_ruling_text
 
 if TYPE_CHECKING:
-    import anthropic
     from opensearchpy import OpenSearch
     from redis import Redis
 
@@ -161,7 +164,9 @@ class IngestionWorker:
         s3_client: Any,
         archive_bucket: str,
         max_retries: int = DEFAULT_MAX_RETRIES,
-        anthropic_client: anthropic.Anthropic | None = None,
+        llm_client: object | None = None,
+        llm_provider: str | None = None,
+        llm_model: str | None = None,
     ) -> None:
         self._redis = redis_client
         self._pg_dsn = pg_dsn
@@ -174,17 +179,14 @@ class IngestionWorker:
             ensure_index=True,
         )
 
-        # LLM extraction client — create from env var if not provided.
-        # If ANTHROPIC_API_KEY is not set, run in regex-only mode.
-        self._anthropic_client: anthropic.Anthropic | None = anthropic_client
-        if self._anthropic_client is None and os.environ.get("ANTHROPIC_API_KEY"):
-            import anthropic as _anthropic
-
-            self._anthropic_client = _anthropic.Anthropic()
-        if self._anthropic_client is None:
-            logger.warning(
-                "ANTHROPIC_API_KEY not set — LLM extraction disabled, using regex-only mode"
-            )
+        # LLM extraction — provider and model resolved from args, then env vars.
+        self._llm_provider: str | None = llm_provider or os.environ.get("LLM_PROVIDER")
+        self._llm_model: str | None = llm_model or os.environ.get("LLM_MODEL")
+        self._llm_client: object | None = llm_client
+        if self._llm_client is None:
+            self._llm_client = create_llm_client(provider=self._llm_provider)
+        if self._llm_client is None:
+            logger.warning("LLM API key not set — LLM extraction disabled, using regex-only mode")
 
     # ------------------------------------------------------------------
     # Public interface
@@ -289,7 +291,7 @@ class IngestionWorker:
         # LLM extraction — primary method for missing fields
         # ------------------------------------------------------------------
         llm_result: LLMExtractionResult | None = None
-        if missing_fields and ruling_text and self._anthropic_client is not None:
+        if missing_fields and ruling_text and self._llm_client is not None:
             metadata = {
                 "link_text": event_data.get("extra", {}).get("link_text")
                 if isinstance(event_data.get("extra"), dict)
@@ -302,7 +304,9 @@ class IngestionWorker:
                 document_text=ruling_text,
                 content_format=content_format,
                 metadata=metadata,
-                client=self._anthropic_client,
+                client=self._llm_client,
+                provider=self._llm_provider,
+                model=self._llm_model,
             )
             llm_latency_ms = round((time.monotonic() - t0) * 1000)
 
