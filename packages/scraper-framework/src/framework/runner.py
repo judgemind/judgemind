@@ -117,12 +117,38 @@ def run_scrapers(scraper_ids: list[str] | None = None) -> int:
 
     had_failure = False
 
+    # Pre-fetch the LA department-to-judge mapping if we're running the LA scraper.
+    # This is done once per run and shared across all LA scraper instances.
+    la_dept_judge_map: dict[str, str] = {}
+    la_scraper_ids = {"ca-la-tentatives-civil"}
+    if any(e[0] in la_scraper_ids for e in entries):
+        try:
+            from courts.ca.la_dept_judges import fetch_department_judge_mapping
+
+            la_dept_judge_map = fetch_department_judge_mapping()
+            logger.info(
+                "Loaded LA dept-judge mapping",
+                departments=len(la_dept_judge_map),
+            )
+        except Exception as exc:
+            logger.warning(
+                "Failed to fetch LA dept-judge mapping — judge names from "
+                "department lookup will be unavailable this run",
+                error=str(exc),
+            )
+
     for scraper_id, scraper_cls, config_factory in entries:
         log = logger.bind(scraper_id=scraper_id)
         log.info("Running scraper")
 
         config: ScraperConfig = config_factory(s3_bucket=bucket)
-        scraper = scraper_cls(config=config, archiver=archiver, event_bus=event_bus)
+
+        # Pass dept-judge mapping to LA scraper
+        extra_kwargs: dict[str, object] = {}
+        if scraper_id in la_scraper_ids and la_dept_judge_map:
+            extra_kwargs["dept_judge_map"] = la_dept_judge_map
+
+        scraper = scraper_cls(config=config, archiver=archiver, event_bus=event_bus, **extra_kwargs)
 
         try:
             health = scraper.run()
