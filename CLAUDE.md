@@ -301,7 +301,7 @@ Ship correct code first, but don't ship code with obvious O(n) network calls whe
 
 **Every agent (including subagents) MUST run ALL applicable checks locally and verify they pass BEFORE pushing a branch or creating a PR.** Skipping these wastes CI minutes and blocks merges. A PR that fails CI is not done — it's broken.
 
-> **Note:** The `.githooks/pre-push` hook automatically runs ruff, eslint, and terraform fmt on changed packages before every push. If you configured `core.hooksPath` during worktree setup (Step 2), common lint and format issues will be caught automatically and the push will be blocked until they are fixed. This does **not** replace running the full check suite (including tests) — it only gates on fast, deterministic checks.
+> **Note:** The `.githooks/pre-push` hook automatically runs ruff, eslint, terraform fmt, and tests (pytest/npm test) on changed packages before every push. If you configured `core.hooksPath` during worktree setup (Step 2), lint, format, and test issues will be caught automatically and the push will be blocked until they are fixed. Tests only run for packages with actual code changes (`.py`, `.ts`, `.tsx`, `.js`, `.jsx` files in `src/` or `tests/`) and use fail-fast mode (`-x`) to keep the hook fast.
 >
 > The pre-push hook also checks whether a PR exists for the branch being pushed. For new branches it prints a reminder to create a PR; for existing branches with no PR it prints a warning. **Always create a PR immediately after your first push to a branch** — do not push and move on without one.
 
