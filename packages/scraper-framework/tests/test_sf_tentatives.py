@@ -21,6 +21,7 @@ from courts.ca.sf_tentatives import (
     BASE_URL,
     INDEX_URL,
     SFTentativeRulingsScraper,
+    _sf_case_title_from_pdf_text,
     _sf_courthouse,
     _sf_hearing_date_from_filename,
     _sf_judge_from_pdf_text,
@@ -213,6 +214,124 @@ def test_sf_courthouse_all_departments() -> None:
 def test_sf_courthouse_unknown_department() -> None:
     # All SF family law departments map to the same courthouse
     assert _sf_courthouse("999") == "San Francisco Courthouse"
+
+
+# ---------------------------------------------------------------------------
+# Case title extraction — _sf_case_title_from_pdf_text
+# ---------------------------------------------------------------------------
+
+
+def test_sf_case_title_single_line_names() -> None:
+    """Standard SF caption with single-line petitioner and respondent names."""
+    text = (
+        "1 SUPERIOR COURT OF CALIFORNIA\n"
+        "2 COUNTY OF SAN FRANCISCO\n"
+        "3 UNIFIED FAMILY COURT\n"
+        "4\n"
+        "5\n"
+        ")\n"
+        "6 MICHAEL EDWARD GRAVES, ) Case Number: FPT-25-378624\n"
+        ")\n"
+        "7 Petitioner ) Hearing Date: March 3, 2026\n"
+        ")\n"
+        "8 VS. ) Hearing Time: 9:00 AM\n"
+        ")\n"
+        "9 RANJIE LONG, ) Department: 403\n"
+        ")\n"
+        "10 Respondent ) Presiding: BOBBY P. LUNA\n"
+    )
+    title = _sf_case_title_from_pdf_text(text)
+    assert title == "Michael Edward Graves v. Ranjie Long"
+
+
+def test_sf_case_title_multi_line_name() -> None:
+    """SF caption where petitioner name spans two lines."""
+    text = (
+        "1 SUPERIOR COURT OF CALIFORNIA\n"
+        "2 COUNTY OF SAN FRANCISCO\n"
+        "3 UNIFIED FAMILY COURT\n"
+        "4\n"
+        "5\n"
+        ")\n"
+        "6 MARIA DE LOS ANGELES RAMIREZ ) Case Number: FPT-25-378672\n"
+        ")\n"
+        "7 HERNANDEZ, ) Hearing Date: March 3, 2026\n"
+        ")\n"
+        "8 Petitioner ) Hearing Time: 9:00 AM\n"
+        ")\n"
+        "9 VS. ) Department: 403\n"
+        ")\n"
+        "10 EDILZAR FERNANDO JUAREZ MEJIA, ) Presiding: BOBBY P. LUNA\n"
+        ")\n"
+        "11 Respondent )\n"
+    )
+    title = _sf_case_title_from_pdf_text(text)
+    assert title == "Maria De Los Angeles Ramirez Hernandez v. Edilzar Fernando Juarez Mejia"
+
+
+def test_sf_case_title_from_fixture_pdf() -> None:
+    """Extract case title from the real SF fixture PDF."""
+    from courts.ca.pdf_link_scraper import _extract_pdf_text
+
+    text = _extract_pdf_text(_load_bytes("sf_dept403_ruling.pdf"))
+    title = _sf_case_title_from_pdf_text(text)
+    assert title is not None
+    assert "Graves" in title
+    assert "Long" in title
+    assert " v. " in title
+
+
+def test_sf_case_title_returns_none_for_no_caption() -> None:
+    assert _sf_case_title_from_pdf_text("") is None
+    assert _sf_case_title_from_pdf_text("No caption block here") is None
+
+
+def test_sf_case_title_title_cased() -> None:
+    """All-caps names should be converted to title case."""
+    text = (
+        "1 SUPERIOR COURT OF CALIFORNIA\n"
+        "2 COUNTY OF SAN FRANCISCO\n"
+        "3 UNIFIED FAMILY COURT\n"
+        "4\n"
+        "5\n"
+        ")\n"
+        "6 JAMES PROPP, ) Case Number: FDI-14-781786\n"
+        ")\n"
+        "7 Petitioner ) Hearing Date: March 3, 2026\n"
+        ")\n"
+        "8 VS. ) Hearing Time: 9:00 AM\n"
+        ")\n"
+        "9 DENISE CHILDERS, ) Department: 403\n"
+        ")\n"
+        "10 Respondent ) Presiding: BOBBY P. LUNA\n"
+    )
+    title = _sf_case_title_from_pdf_text(text)
+    assert title == "James Propp v. Denise Childers"
+
+
+# ---------------------------------------------------------------------------
+# Case title in full scraper run
+# ---------------------------------------------------------------------------
+
+
+@respx.mock
+def test_sf_run_populates_case_title() -> None:
+    html = _load_html("sf_family_law_page.html")
+    pdf_bytes = _load_bytes("sf_dept403_ruling.pdf")
+
+    respx.get(INDEX_URL).mock(return_value=httpx.Response(200, text=html))
+    respx.get(url__regex=r"\.pdf$").mock(return_value=httpx.Response(200, content=pdf_bytes))
+
+    config = sf_default_config()
+    config.request_delay_seconds = 0
+    scraper = SFTentativeRulingsScraper(config=config)
+
+    docs = scraper.fetch_documents()
+    parsed = [scraper.parse_document(d) for d in docs]
+    has_title = [d for d in parsed if d.case_title]
+    assert len(has_title) == 19
+    assert "Graves" in has_title[0].case_title
+    assert " v. " in has_title[0].case_title
 
 
 # ---------------------------------------------------------------------------

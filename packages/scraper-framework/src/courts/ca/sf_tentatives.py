@@ -57,6 +57,112 @@ _PRESIDING_RE = re.compile(
 _CASE_NUMBER_RE = re.compile(r"\bF[A-Z]{2}-\d{2}-\d{6}\b")
 
 
+# SF court caption format (multi-line, with line numbers and ")" delimiters):
+#
+#   6 MICHAEL EDWARD GRAVES, ) Case Number: FPT-25-378624
+#   )
+#   7 Petitioner ) Hearing Date: March 3, 2026
+#   )
+#   8 VS. ) Hearing Time: 9:00 AM
+#   )
+#   9 RANJIE LONG, ) Department: 403
+#   )
+#  10 Respondent ) Presiding: BOBBY P. LUNA
+#
+# Petitioner name may span multiple lines:
+#   6 MARIA DE LOS ANGELES RAMIREZ ) Case Number: FPT-25-378672
+#   )
+#   7 HERNANDEZ, ) Hearing Date: March 3, 2026
+#   )
+#   8 Petitioner ) Hearing Time: 9:00 AM
+#
+# Strategy: find "VS." line, scan backward for petitioner, forward for respondent.
+
+# Metadata fields that appear after ")" on caption lines — used to strip noise.
+_CAPTION_METADATA_RE = re.compile(
+    r"\)\s*(?:Case\s+Number:|Hearing\s+(?:Date|Time):|Department:|Presiding:).*",
+    re.IGNORECASE,
+)
+
+# Leading line-number prefix: "6 " or "10 " at start of line
+_LINE_NUM_RE = re.compile(r"^\s*\d+\s+")
+
+
+def _clean_caption_line(line: str) -> str:
+    """Strip metadata, line numbers, and delimiter noise from a caption line."""
+    # Remove metadata after ")"
+    line = _CAPTION_METADATA_RE.sub("", line)
+    # Remove leading line number
+    line = _LINE_NUM_RE.sub("", line)
+    # Remove remaining ")" characters and whitespace
+    line = line.replace(")", "").strip()
+    # Remove trailing/leading commas
+    line = line.strip(",").strip()
+    # Reject bare line numbers (e.g. "4", "29") that weren't caught above
+    if line.isdigit():
+        return ""
+    return line
+
+
+def _sf_case_title_from_pdf_text(text: str) -> str | None:
+    """Extract case title from SF PDF caption block.
+
+    Parses the multi-line court caption format used by SF Family Court PDFs,
+    extracting petitioner and respondent names to form "Petitioner v. Respondent".
+    """
+    lines = text.split("\n")
+
+    # Find lines containing "VS." (the separator between petitioner/respondent)
+    vs_indices = [i for i, line in enumerate(lines) if re.search(r"\bVS\.\s*\)", line)]
+    if not vs_indices:
+        return None
+
+    vs_idx = vs_indices[0]
+
+    # --- Extract petitioner name ---
+    # Scan backward from VS. line to find name lines before "Petitioner"
+    pet_parts: list[str] = []
+    for i in range(vs_idx - 1, max(vs_idx - 10, -1), -1):
+        cleaned = _clean_caption_line(lines[i])
+        if not cleaned:
+            continue
+        upper = cleaned.upper()
+        if upper == "PETITIONER":
+            continue  # skip the role marker line
+        # Stop at court header lines or empty structural lines
+        if any(kw in upper for kw in ("SUPERIOR COURT", "COUNTY OF", "UNIFIED FAMILY", "COURT")):
+            break
+        pet_parts.insert(0, cleaned)
+
+    # --- Extract respondent name ---
+    # Scan forward from VS. line to find name lines before "Respondent"
+    resp_parts: list[str] = []
+    for i in range(vs_idx + 1, min(vs_idx + 10, len(lines))):
+        cleaned = _clean_caption_line(lines[i])
+        if not cleaned:
+            continue
+        upper = cleaned.upper()
+        if upper == "RESPONDENT":
+            break  # stop at the role marker
+        if "REQUEST FOR ORDER" in upper or "TENTATIVE RULING" in upper:
+            break  # went too far
+        resp_parts.append(cleaned)
+
+    pet_name = " ".join(pet_parts).strip()
+    resp_name = " ".join(resp_parts).strip()
+
+    if not pet_name or not resp_name:
+        return None
+
+    # Title-case if all uppercase
+    if pet_name.isupper():
+        pet_name = pet_name.title()
+    if resp_name.isupper():
+        resp_name = resp_name.title()
+
+    return f"{pet_name} v. {resp_name}"
+
+
 def _sf_judge_from_pdf_text(text: str) -> str | None:
     """Extract judge name from SF PDF text (e.g. 'BOBBY P. LUNA' → 'Bobby P. Luna')."""
     m = _PRESIDING_RE.search(text)
@@ -105,7 +211,7 @@ class SFTentativeRulingsScraper(PdfLinkScraper):
         super().__init__(config, pdf_config=pdf_config, **kwargs)
 
     def parse_document(self, doc: CapturedDocument) -> CapturedDocument:
-        """Extract case numbers (via super) and judge name + hearing date from PDF text."""
+        """Extract case numbers, judge name, hearing date, and case title."""
         doc = super().parse_document(doc)
 
         # Extract judge name from PDF text if not already set
@@ -116,6 +222,10 @@ class SFTentativeRulingsScraper(PdfLinkScraper):
         link_text = doc.extra.get("link_text", "")
         if link_text and not doc.hearing_date:
             doc.hearing_date = _sf_hearing_date_from_filename(link_text)
+
+        # Extract case title from SF caption block
+        if doc.ruling_text and not doc.case_title:
+            doc.case_title = _sf_case_title_from_pdf_text(doc.ruling_text)
 
         return doc
 
