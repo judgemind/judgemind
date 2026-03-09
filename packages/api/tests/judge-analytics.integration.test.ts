@@ -65,18 +65,7 @@ async function seedData(): Promise<void> {
   );
   caseId = csRows[0].id;
 
-  // Document (required FK for rulings)
-  const { rows: dRows } = await pool.query<{ id: string }>(
-    `INSERT INTO documents
-       (case_id, court_id, document_type, s3_key, s3_bucket, format, content_hash,
-        captured_at, status)
-     VALUES ($1, $2, 'ruling', 'ca/sf/analytics-test/doc.html',
-             'judgemind-document-archive-dev', 'html', 'analytics-test-hash',
-             NOW(), 'active')
-     RETURNING id`,
-    [caseId, courtId],
-  );
-  const docId = dRows[0].id;
+  // Documents are created per ruling in the loop below (document_id has a unique constraint).
 
   // Seed rulings with various outcomes and motion types:
   //
@@ -107,13 +96,24 @@ async function seedData(): Promise<void> {
     { date: '2025-10-01', outcome: null, motion: 'msj' },
   ];
 
-  for (const r of rulings) {
+  // Each ruling needs its own document (document_id has a unique constraint)
+  for (let i = 0; i < rulings.length; i++) {
+    const r = rulings[i];
+    const { rows: docRows } = await pool.query<{ id: string }>(
+      `INSERT INTO documents
+         (case_id, court_id, document_type, s3_key, s3_bucket, format, content_hash,
+          captured_at, status)
+       VALUES ($1, $2, 'ruling', $3, 'judgemind-document-archive-dev', 'html', $4,
+               NOW(), 'active')
+       RETURNING id`,
+      [caseId, courtId, `ca/sf/analytics-test/doc-${i}.html`, `analytics-hash-${i}`],
+    );
     await pool.query(
       `INSERT INTO rulings
          (document_id, case_id, judge_id, court_id, hearing_date, outcome, motion_type,
           is_tentative, department)
        VALUES ($1, $2, $3, $4, $5, $6, $7, true, 'Dept. A')`,
-      [docId, caseId, judgeId, courtId, r.date, r.outcome, r.motion],
+      [docRows[0].id, caseId, judgeId, courtId, r.date, r.outcome, r.motion],
     );
   }
 }
