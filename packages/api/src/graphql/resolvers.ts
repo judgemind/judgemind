@@ -367,34 +367,10 @@ export const resolvers = {
     filedAt: (row: Row) => row.filed_at,
     court: (row: Row, _: unknown, { loaders }: Context) =>
       row.court_id ? loaders.courtLoader.load(row.court_id as string) : null,
-    judges: async (row: Row, _: unknown, { pool }: Context) => {
-      // Try the explicit case_judges link table first.
-      const { rows } = await pool.query<Row>(
-        `SELECT j.* FROM judges j
-         JOIN case_judges cj ON cj.judge_id = j.id
-         WHERE cj.case_id = $1`,
-        [row.id],
-      );
-      if (rows.length > 0) return rows;
-
-      // Fall back to judges referenced by the case's rulings.
-      const { rows: fromRulings } = await pool.query<Row>(
-        `SELECT DISTINCT j.* FROM judges j
-         JOIN rulings r ON r.judge_id = j.id
-         WHERE r.case_id = $1`,
-        [row.id],
-      );
-      return fromRulings;
-    },
-    parties: async (row: Row, _: unknown, { pool }: Context) => {
-      const { rows } = await pool.query<Row>(
-        `SELECT p.*, cp.role FROM parties p
-         JOIN case_parties cp ON cp.party_id = p.id
-         WHERE cp.case_id = $1`,
-        [row.id],
-      );
-      return rows;
-    },
+    judges: (row: Row, _: unknown, { loaders }: Context) =>
+      loaders.caseJudgesLoader.load(row.id as string),
+    parties: (row: Row, _: unknown, { loaders }: Context) =>
+      loaders.casePartiesLoader.load(row.id as string),
   },
 
   Judge: {
@@ -418,23 +394,14 @@ export const resolvers = {
     rulingText: (row: Row) => row.ruling_text,
     postedAt: (row: Row) => row.posted_at,
     documentId: (row: Row) => row.document_id,
-    documentFormat: async (row: Row, _: unknown, { pool }: Context) => {
-      if (!row.document_id) return null;
-      const { rows } = await pool.query<Row>(
-        'SELECT format FROM documents WHERE id = $1',
-        [row.document_id],
-      );
-      return rows[0]?.format ?? null;
-    },
+    documentFormat: (row: Row, _: unknown, { loaders }: Context) =>
+      row.document_id ? loaders.documentFormatLoader.load(row.document_id as string) : null,
     court: (row: Row, _: unknown, { loaders }: Context) =>
       row.court_id ? loaders.courtLoader.load(row.court_id as string) : null,
     judge: (row: Row, _: unknown, { loaders }: Context) =>
       row.judge_id ? loaders.judgeLoader.load(row.judge_id as string) : null,
-    case: async (row: Row, _: unknown, { pool }: Context) => {
-      if (!row.case_id) return null;
-      const { rows } = await pool.query<Row>('SELECT * FROM cases WHERE id = $1', [row.case_id]);
-      return rows[0] ?? null;
-    },
+    case: (row: Row, _: unknown, { loaders }: Context) =>
+      row.case_id ? loaders.caseLoader.load(row.case_id as string) : null,
   },
 
   Document: {
@@ -449,11 +416,8 @@ export const resolvers = {
     hearingDate: (row: Row) => row.hearing_date,
     court: (row: Row, _: unknown, { loaders }: Context) =>
       row.court_id ? loaders.courtLoader.load(row.court_id as string) : null,
-    case: async (row: Row, _: unknown, { pool }: Context) => {
-      if (!row.case_id) return null;
-      const { rows } = await pool.query<Row>('SELECT * FROM cases WHERE id = $1', [row.case_id]);
-      return rows[0] ?? null;
-    },
+    case: (row: Row, _: unknown, { loaders }: Context) =>
+      row.case_id ? loaders.caseLoader.load(row.case_id as string) : null,
   },
 
   Party: {
