@@ -286,6 +286,17 @@ When operating as an agent in this repo:
 - Never commit large binary files. Use `.gitignore`.
 - Write clear docstrings/comments for non-obvious logic. Court data has many edge cases — document them.
 
+### Performance awareness
+
+Every diff review (human or `/ralph`) must check for these common bottlenecks:
+
+- **Sequential I/O over collections.** If you loop over items and make a network call per item (S3, HTTP, DB query), use concurrency (`ThreadPoolExecutor`, `asyncio.gather`, `pipeline()`) or batching instead.
+- **O(n²) pagination.** Never use `LIMIT/OFFSET` for large datasets — use keyset (cursor-based) pagination.
+- **Unbatched DB writes.** If you insert/update rows in a loop, use `executemany`, `COPY`, or psycopg3 `pipeline()` mode to amortize round-trips.
+- **Missing connection reuse.** Reuse HTTP clients (`httpx.Client`), DB connections, and S3 clients across calls — don't create new ones per iteration.
+
+Ship correct code first, but don't ship code with obvious O(n) network calls when O(1) batched alternatives exist. If you're unsure whether a perf pattern matters at current scale, add a `# TODO(perf):` comment noting the concern.
+
 ## Pre-PR Checks (MANDATORY — No Exceptions)
 
 **Every agent (including subagents) MUST run ALL applicable checks locally and verify they pass BEFORE pushing a branch or creating a PR.** Skipping these wastes CI minutes and blocks merges. A PR that fails CI is not done — it's broken.
