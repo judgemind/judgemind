@@ -306,6 +306,65 @@ class TestExtractFromCaseNameField:
 
 
 # ---------------------------------------------------------------------------
+# Inline "Name v. Name" pattern tests (#337)
+# ---------------------------------------------------------------------------
+
+
+class TestExtractFromInlineVPattern:
+    """Tests for the inline 'Name v. Name' fallback pattern (#337)."""
+
+    def test_inline_v_with_case_number(self) -> None:
+        """'Name v. Name, No. CaseNumber' — issue #337 primary example."""
+        text = "Raymond Yawen Wu v. Steve Tsui et al., No. 25STCV34748"
+        result = backfill.extract_case_title(text)
+        assert result is not None
+        assert "Wu" in result
+        assert "Tsui" in result
+        assert "v." in result
+        assert "25STCV" not in result
+
+    def test_inline_v_et_al(self) -> None:
+        """'Name v. Name et al.' format."""
+        text = "John Smith v. Acme Corp et al.\nThe motion is granted."
+        result = backfill.extract_case_title(text)
+        assert result is not None
+        assert "Smith" in result
+        assert "Acme Corp" in result
+
+    def test_inline_vs_simple(self) -> None:
+        """Simple 'Name vs Name' on its own line."""
+        text = "GARCIA VS HERNANDEZ\nThe demurrer is sustained."
+        result = backfill.extract_case_title(text)
+        assert result is not None
+        assert "Garcia" in result
+        assert "Hernandez" in result
+
+    def test_inline_v_simple_line(self) -> None:
+        """'Name v. Name' on its own line."""
+        text = "Smith v. Jones\nCase Number: 24NNCV02551"
+        result = backfill.extract_case_title(text)
+        assert result is not None
+        assert "Smith" in result
+        assert "Jones" in result
+
+    def test_caption_block_preferred_over_inline(self) -> None:
+        """Caption block should take priority over inline pattern."""
+        text = (
+            "Alpha v. Beta, No. 25STCV34748\n"
+            "JOHN SMITH,\n"
+            "  Plaintiff(s),\n"
+            "  vs.\n"
+            "JANE DOE,\n"
+            "  Defendant(s).\n"
+        )
+        result = backfill.extract_case_title(text)
+        assert result is not None
+        # Caption block should win
+        assert "John Smith" in result
+        assert "Jane Doe" in result
+
+
+# ---------------------------------------------------------------------------
 # backfill_batch tests
 # ---------------------------------------------------------------------------
 

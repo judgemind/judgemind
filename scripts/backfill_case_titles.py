@@ -212,6 +212,56 @@ def _extract_from_case_name_field(ruling_text: str) -> str | None:
     return title
 
 
+def _extract_from_inline_v_pattern(ruling_text: str) -> str | None:
+    """Extract a case title from inline "Name v. Name" patterns (#337).
+
+    Handles common LA ruling formats like:
+      - "Raymond Yawen Wu v. Steve Tsui et al., No. 25STCV34748"
+      - "Smith v. Jones" on a line by itself
+      - "Name v. Name et al." with optional case number suffix
+    """
+    # Pattern: "Name v. Name" with optional ", No. CaseNumber" suffix
+    m = re.search(
+        r"(?:^|\n)\s*"
+        r"([A-Z][A-Za-z,.'\- ]{1,60})"
+        r"\s+[Vv][Ss]?\.?\s+"
+        r"([A-Z][A-Za-z,.'\- ]{1,60})",
+        ruling_text,
+        re.MULTILINE,
+    )
+    if m is None:
+        return None
+
+    plaintiff = m.group(1).strip()
+    defendant = m.group(2).strip()
+
+    # Strip trailing case number references: ", No. 25STCV34748"
+    defendant = re.sub(
+        r",?\s*(?:No\.|Case\s+No\.)\s*\S+\s*$", "", defendant, flags=re.IGNORECASE
+    ).strip()
+
+    # Clean trailing punctuation
+    plaintiff = plaintiff.rstrip(".,;: ")
+    defendant = defendant.rstrip(".,;: ")
+
+    if not plaintiff or not defendant:
+        return None
+
+    # Title-case if name parts are all-caps
+    if plaintiff == plaintiff.upper():
+        plaintiff = plaintiff.title()
+    if defendant == defendant.upper():
+        defendant = defendant.title()
+
+    title = f"{plaintiff} v. {defendant}"
+
+    # Sanity check length
+    if len(title) > 150 or len(title) < 5:
+        return None
+
+    return title
+
+
 def extract_case_title(ruling_text: str) -> str | None:
     """Extract a case title from ruling text.
 
@@ -220,6 +270,7 @@ def extract_case_title(ruling_text: str) -> str | None:
     1. Formal caption block (Plaintiff vs. Defendant) — most reliable
     2. Inline "Case Name:" or "Case Title:" field — direct extraction
     3. "MOVING PARTY:" / "RESPONDING PARTY:" fields — construct from party names
+    4. Inline "Name v. Name" pattern — broad fallback (#337)
 
     Returns a title like "Buenaventura v. City Of Pasadena", or None.
     """
@@ -234,7 +285,12 @@ def extract_case_title(ruling_text: str) -> str | None:
         return title
 
     # Strategy 3: MOVING PARTY / RESPONDING PARTY fields
-    return _extract_from_moving_responding(ruling_text)
+    title = _extract_from_moving_responding(ruling_text)
+    if title is not None:
+        return title
+
+    # Strategy 4: Inline "Name v. Name" pattern — broad fallback (#337)
+    return _extract_from_inline_v_pattern(ruling_text)
 
 
 def _extract_from_caption_block(ruling_text: str) -> str | None:

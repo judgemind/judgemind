@@ -347,16 +347,45 @@ _CASE_TITLE_PATTERNS: list[re.Pattern[str]] = [
         r"\s+(?:Hearing|Motion|Demurrer|Petition|Application|Order)",
         re.MULTILINE,
     ),
+    # "Name v. Name et al., No. CaseNumber" — LA inline header (#337)
+    # e.g. "Raymond Yawen Wu v. Steve Tsui et al., No. 25STCV34748"
+    re.compile(
+        r"(?:^|\n)\s*(?P<title>"
+        r"[A-Z][A-Za-z,.'\- ]{1,60}"
+        r"\s+[Vv][Ss]?\.?\s+"
+        r"[A-Z][A-Za-z,.'\- ]{1,60}"
+        r")"
+        r"(?:,?\s*No\.\s*\S+)?",  # optional trailing ", No. XXXXX"
+        re.MULTILINE,
+    ),
+    # Multi-line: "Name v. Name" on one line, case number on the next (#337)
+    # e.g. "Raymond Yawen Wu v. Steve Tsui et al.\n  No. 25STCV34748"
+    re.compile(
+        r"(?:^|\n)\s*(?P<title>"
+        r"[A-Z][A-Za-z,.'\- ]{1,60}"
+        r"\s+[Vv][Ss]?\.?\s+"
+        r"[A-Z][A-Za-z,.'\- ]{1,60}"
+        r")\s*\n\s*(?:No\.\s*\S+)?",
+        re.MULTILINE,
+    ),
     # Generic "X v. Y" or "X vs Y" or "X vs. Y" — broad fallback
     re.compile(
         r"(?:^|\n)\s*(?P<title>"
-        r"[A-Z][A-Za-z,.'\- ]{2,60}"
-        r"\s+(?:vs?\.?|VS\.?)\s+"
-        r"[A-Z][A-Za-z,.'\- ]{2,60}"
+        r"[A-Z][A-Za-z,.'\- ]{1,60}"
+        r"\s+[Vv][Ss]?\.?\s+"
+        r"[A-Z][A-Za-z,.'\- ]{1,60}"
         r")",
         re.MULTILINE,
     ),
 ]
+
+# Trailing noise to strip from extracted titles — case number references,
+# "et al." punctuation artifacts, etc.
+_TITLE_TRAILING_NOISE_RE = re.compile(
+    r",?\s*No\.\s*\S+\s*$"  # ", No. 25STCV34748"
+    r"|,?\s*Case\s+No\.\s*\S+\s*$",  # ", Case No. 25STCV34748"
+    re.IGNORECASE,
+)
 
 
 def extract_case_title(ruling_text: str) -> str | None:
@@ -369,12 +398,19 @@ def extract_case_title(ruling_text: str) -> str | None:
         m = pattern.search(ruling_text)
         if m:
             title = m.group("title").strip()
+            # Strip trailing case number references: ", No. 25STCV34748"
+            title = _TITLE_TRAILING_NOISE_RE.sub("", title).strip()
+            # Detect all-caps before normalizing the "v." separator.
+            # Strip the separator and check if the remaining name parts
+            # are all uppercase (the separator itself may be lowercase "vs").
+            _name_parts = re.split(r"\s+[Vv][Ss]?\.?\s+", title)
+            is_all_caps = all(p == p.upper() and p.strip() for p in _name_parts)
             # Normalize: "AASI vs HONDA" → "Aasi v. Honda"
-            title = re.sub(r"\s+vs\.?\s+", " v. ", title, flags=re.IGNORECASE)
-            title = re.sub(r"\s+VS\.?\s+", " v. ", title)
-            # Title-case if all-caps
-            if title == title.upper():
-                title = title.title()
+            title = re.sub(r"\s+[Vv][Ss]?\.?\s+", " v. ", title)
+            # Title-case if all-caps — apply to name parts only, not separator
+            if is_all_caps:
+                parts = title.split(" v. ")
+                title = " v. ".join(p.title() for p in parts)
             # Clean trailing punctuation
             title = title.rstrip(".,;: ")
             if len(title) >= 5:
