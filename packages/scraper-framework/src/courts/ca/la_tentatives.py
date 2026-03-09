@@ -122,6 +122,13 @@ _CASE_NAME_FIELD_RE = re.compile(
 # exists, the server returns this error page instead of ruling content.
 _LA_ERROR_MARKER = "We're sorry"
 
+# Department header boilerplate pattern.  Pages like "DEPARTMENT 15 LAW AND
+# MOTION RULINGS" contain no actual ruling content and should be skipped.
+_DEPT_HEADER_BOILERPLATE_RE = re.compile(
+    r"DEPARTMENT\s+\S+\s+LAW AND MOTION RULINGS",
+    re.IGNORECASE,
+)
+
 
 @dataclass
 class DropdownOption:
@@ -331,6 +338,19 @@ def _is_stale_viewstate_response(html: str) -> bool:
     return _LA_ERROR_MARKER in html
 
 
+def _is_dept_header_boilerplate(html: str) -> bool:
+    """Return True if *html* is a department header boilerplate page.
+
+    These pages contain text like "DEPARTMENT 15 LAW AND MOTION RULINGS"
+    but no actual ruling content (no ``Case Number:`` present).  They
+    should not be stored as ruling rows.
+    """
+    text = BeautifulSoup(html, "lxml").get_text()
+    if _CASE_NUMBER_RE.search(text):
+        return False
+    return bool(_DEPT_HEADER_BOILERPLATE_RE.search(text))
+
+
 def _split_cases_html(ruling_html: str) -> list[str]:
     """Split a department response HTML into per-case HTML sections.
 
@@ -340,13 +360,13 @@ def _split_cases_html(ruling_html: str) -> list[str]:
 
     Returns a list of HTML strings, each wrapped in a
     ``<div id="speechSynthesis">`` so downstream parsing works unchanged.
-    If only one case is present, returns a single-element list containing
-    the original HTML unmodified.
+    Returns an empty list when no valid case sections are found (e.g.
+    department header boilerplate pages with no ``Case Number:`` present).
     """
     soup = BeautifulSoup(ruling_html, "lxml")
     speech_div = soup.find("div", id="speechSynthesis")
     if speech_div is None:
-        return [ruling_html]
+        return []
 
     inner_html = speech_div.decode_contents()
 
@@ -371,9 +391,12 @@ def _split_cases_html(ruling_html: str) -> list[str]:
         wrapped = f'<html><body><div id="speechSynthesis">{stripped}</div></body></html>'
         result.append(wrapped)
 
-    # If splitting produced nothing (unexpected format), fall back to original
+    # If splitting produced nothing, the response likely contains only
+    # department header boilerplate (e.g. "DEPARTMENT 15 LAW AND MOTION
+    # RULINGS") with no actual rulings.  Return an empty list so these
+    # pages are not stored as ruling rows.
     if not result:
-        return [ruling_html]
+        return []
 
     return result
 
