@@ -31,18 +31,7 @@ These are the most frequently violated rules. **A PreToolUse hook enforces the s
 
 ## Enforced Rules — Automated Checks
 
-These rules address the most common friction patterns from real sessions. Each has an automated enforcement mechanism — either the PreToolUse hook (`.claude/hooks/preflight-bash.sh`) or runtime checks in `scripts/preflight.sh`.
-
-| # | Friction Pattern | Rule | Enforcement |
-|---|---|---|---|
-| E1 | 20× `$()` / special chars triggering prompts | **Never use `$()`, heredocs, or backtick expansion in Bash commands.** Run the inner command as a separate tool call, capture the literal output, and paste it into the next command. For multi-line content, write to `{worktree}/tmp/` and use `--body-file` or `-F`. | PreToolUse hook blocks `$(`, `<<EOF`, `python -c`. |
-| E2 | 6× acting on stale code | **Always fetch and rebase before analyzing or modifying code.** Before any implementation work: `git fetch origin main && git rebase origin/main`. Before reading code to answer a question: at minimum `git fetch origin main` and verify you're not behind. Never trust cached file contents from a previous session. | `preflight_branch_fresh --fetch` in `scripts/preflight.sh`. |
-| E3 | Multiple worktree/venv path errors | **Verify you are in a worktree, not the main repo.** During task work, your pwd must be inside a worktree (`worktrees/worker-N/`). Your `.venv` must be inside the worktree's package directory — never reuse the main repo's venv or another worktree's venv. | `preflight_in_worktree` and `preflight_venv_local` in `scripts/preflight.sh`. |
-| E4 | Pushing to main | **Never push to main/master.** The PreToolUse hook blocks `git push` commands that target main or run while on main. All changes go through feature branches and PRs. The only exception: the user explicitly directs you to push to main in an interactive session. | PreToolUse hook blocks `git push` to main/master. |
-
-### How to use `scripts/preflight.sh`
-
-Source the file and call individual checks. Each function returns non-zero on failure with a diagnostic message:
+The PreToolUse hook (`.claude/hooks/preflight-bash.sh`) and `scripts/preflight.sh` automatically enforce the Critical Rules above. The hook blocks `$(`, `<<EOF`, `python -c`, and `git push` to main. Runtime checks:
 
 ```bash
 source scripts/preflight.sh
@@ -63,7 +52,22 @@ Judgemind is a free, open-source legal research platform replacing Trellis.law. 
 
 ## Starting a New Session
 
-Wait for the user's instruction before deciding what to do. Sessions may involve interactive work on the main branch, or autonomous task work via `/task`. Do not assume which mode — let the user direct you.
+Wait for the user's instruction before deciding what to do. Sessions fall into two modes:
+
+### Interactive sessions (human present)
+
+The interactive shell is an **orchestrator, not an implementer.** Do not modify committed code, create branches, or make commits directly. Instead:
+
+- **Explore and prototype** in `tmp/` (scripts, evals, queries) — this is fine.
+- **File GitHub issues** for any real work identified during the session.
+- **Spawn subagents** via `/task #N` to implement changes in isolated worktrees.
+- **Review and discuss** results, plans, and architecture with the user.
+
+The interactive shell's job is to think, plan, investigate, and delegate — not to write production code.
+
+### Autonomous sessions (subagent via `/task`)
+
+Subagents do the implementation work: worktree setup, coding, testing, PR, and review. They follow the full PR Workflow below.
 
 ### Available Skills
 
@@ -73,33 +77,18 @@ Wait for the user's instruction before deciding what to do. Sessions may involve
 
 ### Worktree setup (manual)
 
-Run this from anywhere inside the repo (including from inside an existing worktree):
-
 ```
 scripts/start-worker.sh
 ```
 
-The script handles everything:
+Claims a worker number, creates the worktree from latest `origin/main`, configures git hooks, and creates `tmp/`. Prints the worktree path (e.g. `/path/to/worktrees/worker-2`) — this is `{worktree}` for the session.
 
-- Resolves the repo root regardless of where the shell started
-- Fetches latest `origin/main` (without changing the parent's checked-out branch)
-- Prunes stale worktree metadata
-- Removes abandoned worktrees (branches merged into main, or session branches from a previous day)
-- Claims the lowest available worker number, retrying automatically if another agent races to the same number
-- Creates the worktree, configures git hooks, and creates the `tmp/` directory
-
-It prints the worktree path on stdout, e.g. `/path/to/worktrees/worker-2`. **Record this value** — it is `{worktree}` for the rest of the session.
-
-All subsequent work happens inside `{worktree}`. Use `{worktree}/tmp/` for **all** temporary files (scripts, PR bodies, etc.) — this directory is gitignored and scoped to your worker, so there are no permission prompts and no collisions between workers.
-
-**Venv isolation:** each agent must create its own venv inside the worktree for every Python package it works in. Never use the venv from the main repo or another worktree — multiple agents on the same machine will stomp on each other if they share a venv. The `/task` skill sets up venvs in step A.1 after identifying which packages are needed. If setting up manually:
+All work happens inside `{worktree}`. Use `{worktree}/tmp/` for **all** temp files (gitignored, no permission prompts). Each worktree gets its own `.venv` per package — never share venvs between worktrees:
 
 ```
 python3.12 -m venv {worktree}/packages/<pkg>/.venv
 cd {worktree}/packages/<pkg> && .venv/bin/pip install -e ".[dev]" --quiet
 ```
-
-Only install venvs for packages you actually work in during the session.
 
 ### Step 3 — Pick up a task
 
@@ -184,22 +173,8 @@ All checks must show `SUCCESS` or `SKIPPED`. Any `FAILURE` goes to 4.7.
 
 #### 4.8 — Update the PR test plan
 
-- Fetch the current PR body:
-  ```
-  gh pr view <N> --repo judgemind/judgemind --json body -q .body
-  ```
-- Check off each automated step that passed in CI (typecheck, lint, test). Leave manual steps unchecked until you run them.
-- For manual smoke tests (e.g. `npm run dev` + `curl /health`), create a temporary worktree:
-  ```
-  git -C $REPO_ROOT fetch origin <branch>
-  git -C $REPO_ROOT worktree add $REPO_ROOT/worktrees/smoketest FETCH_HEAD
-  # run smoke test...
-  git -C $REPO_ROOT worktree remove $REPO_ROOT/worktrees/smoketest
-  ```
-- Write the updated body to `{worktree}/tmp/pr_body.txt` and update:
-  ```
-  gh pr edit <N> --repo judgemind/judgemind --body-file {worktree}/tmp/pr_body.txt
-  ```
+- Fetch the PR body with `gh pr view`, check off automated steps that passed in CI.
+- Write the updated body to `{worktree}/tmp/pr_body.txt` and update with `gh pr edit --body-file`.
 
 #### 4.9 — Link the issue and request review
 
@@ -208,24 +183,11 @@ All checks must show `SUCCESS` or `SKIPPED`. Any `FAILURE` goes to 4.7.
 
 #### 4.10 — Verify deployment (after merge, deployed services only)
 
-**This step applies only to PRs that change deployed code** (API, frontend, scrapers, infrastructure). Skip it for pure library, tooling, docs, or CI-only changes.
+Skip for library, tooling, docs, or CI-only changes. For deployed code (API, scrapers, web, infra):
 
-After the PR is merged, verify the deploy pipeline succeeds and the fix is live:
-
-1. Identify the relevant deploy workflow based on which packages were modified:
-   - `packages/api/` or API routes -> `deploy-api.yml`
-   - `packages/scraper-framework/` or scraper code -> `deploy-scraper.yml`
-   - `packages/web/` or frontend -> `deploy-production.yml`
-   - `infra/terraform/` -> `terraform.yml`
-2. Watch the deploy workflow that triggers on the merge to `main`:
-   ```
-   gh run list --repo judgemind/judgemind --workflow "<deploy-workflow>.yml" --branch main --limit 1 --json databaseId -q '.[0].databaseId'
-   gh run watch <run-id> --repo judgemind/judgemind --exit-status --compact
-   ```
-3. If the deploy **fails**: file a new `priority/p1` issue describing the deploy failure, reference the merged PR, and add `agent/ready`. Do NOT consider the original task complete — comment on the original issue noting the deploy failure and linking the new issue.
-4. If the deploy **succeeds**: smoke-test the fix on the deployed environment where feasible (e.g., `curl` an API endpoint, check a page loads). This confirms the change is actually live, not just merged.
-
-Only proceed to 4.11 after deployment is verified (or the step is skipped for non-deployed changes).
+1. Watch the deploy workflow triggered by the merge to `main` (`gh run watch`).
+2. If deploy **fails**: file a `priority/p1` issue, reference the merged PR, add `agent/ready`.
+3. If deploy **succeeds**: smoke-test the deployed environment where feasible.
 
 #### 4.11 — Remove your worktree
 
@@ -301,11 +263,7 @@ Ship correct code first, but don't ship code with obvious O(n) network calls whe
 
 **Every agent (including subagents) MUST run ALL applicable checks locally and verify they pass BEFORE pushing a branch or creating a PR.** Skipping these wastes CI minutes and blocks merges. A PR that fails CI is not done — it's broken.
 
-> **Note:** The `.githooks/pre-push` hook automatically runs ruff, eslint, terraform fmt, and tests (pytest/npm test) on changed packages before every push. If you configured `core.hooksPath` during worktree setup (Step 2), lint, format, and test issues will be caught automatically and the push will be blocked until they are fixed. Tests only run for packages with actual code changes (`.py`, `.ts`, `.tsx`, `.js`, `.jsx` files in `src/` or `tests/`) and use fail-fast mode (`-x`) to keep the hook fast.
->
-> The pre-push hook also checks whether a PR exists for the branch being pushed. For new branches it prints a reminder to create a PR; for existing branches with no PR it prints a warning. **Always create a PR immediately after your first push to a branch** — do not push and move on without one.
-
-Run checks from each package directory you modified. If any check fails, fix it before pushing.
+> The `.githooks/pre-push` hook automatically runs lint, format, and tests on changed packages before every push — it will block the push on failure. Run checks manually if you want to catch issues earlier:
 
 **Python packages** (from the package directory, e.g. `packages/scraper-framework/`):
 
@@ -449,14 +407,7 @@ Key paths:
 
 ### Pre-PR Checklist for Terraform Tasks
 
-Before marking a Terraform PR ready, complete ALL of the following locally:
-
-1. `terraform fmt -check -recursive infra/terraform/` — fix any formatting issues
-2. Validate the **root** `infra/terraform/` config AND each environment: `terraform -chdir=infra/terraform init -backend=false && terraform validate`. The root config is the CI integration point — new required module variables must be added there too.
-3. **Import any pre-existing resources** that were created outside Terraform before they were managed by code. Run `terraform import` for each, then verify with `terraform plan` that it shows no unexpected changes.
-4. `terraform -chdir=infra/terraform/environments/<env> plan -no-color` (with real backend) — confirm the plan is clean or shows only expected changes (no destroys of existing resources).
-5. `terraform apply` if the plan looks correct — verify `No changes` on a second `plan` afterward.
-6. Check all test plan items in the PR body before requesting review.
+See `docs/terraform-checklist.md` for the full checklist.
 
 ## Unattended Operation Patterns
 
@@ -483,16 +434,12 @@ These patterns avoid permission prompts and allow the agent to run without inter
   ```
 - **No quoted strings in compound shell commands:** a hook rejects commands that contain quoted characters (e.g. `"text"` or `'text'`) combined with `&&` or `;`. Instead of `cmd1 && echo "label" && cmd2`, make two separate tool calls — one per command.
 - **Multi-line content for `gh` or `git` commands:** always write the content to a file first using the Write tool, then pass it with `--body-file` or `-F`. Never use heredocs or `$()` in shell commands. For commits: `git commit -F {worktree}/tmp/commit_msg.txt`. For PR/issue bodies: `gh issue create --body-file {worktree}/tmp/body.txt`.
-- **Editing files in `.claude/` directories:** The Edit and Write tools are denied for all paths under `.claude/` (settings, hooks, skills) due to a built-in tool-level safety policy. This applies in worktrees too — the `Edit(**)` and `Write(**)` allow rules in `settings.json` do not override this restriction. To modify `.claude/` files:
-  1. Write the updated content to `{worktree}/tmp/<filename>` using the Write tool.
-  2. Copy it into place: `cp {worktree}/tmp/<filename> {worktree}/.claude/path/to/<filename>`
-  The `Bash(cp *)` permission is pre-approved, so the copy step runs without a prompt.
 
 ## Session Triggers
 
-- When the user asks to pick up work (e.g. "let's go", "start", "pick up a task"), invoke `/task`. It handles everything — worktree setup (if needed), issue selection, implementation, PR, and review request. Proceed autonomously without waiting for further instruction.
-- `/task` automatically uses the `/tdd` TDD workflow for testable code tasks (Python, TypeScript). For infrastructure, migrations, and docs it implements directly.
-- If the user gives a specific instruction without invoking `/task`, work on it directly. Not every session requires a worktree or a GitHub issue.
+- When the user asks to pick up work (e.g. "let's go", "start", "pick up a task"), invoke `/task` as a background subagent. It handles everything autonomously.
+- If the user asks to explore, investigate, or prototype — do it in `tmp/` and file issues for any real work identified.
+- Remember: the interactive shell orchestrates. It does not implement.
 
 ## Improving the Agent Workflow
 
@@ -527,11 +474,7 @@ Do **not** file issues for prompts that exist for good reason — pushing to rem
 - Prefer updating `CLAUDE.md` in the repo root over writing to `~/.claude` project memory.
 - Only use local `~/.claude` memory for things that cannot go in the repo (e.g. cross-repo or cross-project preferences).
 
-## Things You Must Not Do
+## Additional Prohibitions
 
-- Do not merge PRs unless they have passed the ralph review loop (A.2) and CI is green.
-- Do not deploy to production.
-- Do not make architectural decisions that contradict the specs without flagging them as `type/decision` issues.
-- Do not scrape live court websites during development.
-- Do not store secrets in code, config files, or commit history.
+- Do not make architectural decisions that contradict `docs/specs/` without filing a `type/decision` issue.
 - Do not add dependencies without justification in the PR description.
