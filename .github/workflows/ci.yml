@@ -63,7 +63,7 @@ jobs:
         run: ruff format --check src/ tests/
       - name: Test
         run: >-
-          pytest tests/ -n auto -v --tb=short
+          pytest tests/ -n 8 -v --tb=short
           --ignore=tests/test_reingest_from_s3.py
           --ignore=tests/test_reingest_registry.py
           --ignore=tests/test_ingestion.py
@@ -92,7 +92,7 @@ jobs:
           tests/test_reingest_registry.py
           tests/test_ingestion.py
           tests/test_extract.py
-          -n auto -v --tb=short
+          -n 8 -v --tb=short
 
   nlp-tests:
     needs: detect-changes
