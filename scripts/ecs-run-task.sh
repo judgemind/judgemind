@@ -252,11 +252,12 @@ if [[ "$ENCODED_SIZE" -gt 6000 ]]; then
             --region "$REGION" \
             --no-cli-pager > /dev/null
 
-        # Generate a pre-signed URL (5 min TTL) so the container can download
-        # the script without needing the AWS CLI installed.
+        # Generate a pre-signed URL (15 min TTL) so the container can download
+        # the script without needing the AWS CLI installed. 15 minutes allows
+        # for Fargate cold starts which can exceed 5 minutes.
         PRESIGNED_URL=$(aws s3 presign "s3://${S3_BUCKET}/${S3_SCRIPT_KEY}" \
             --region "$REGION" \
-            --expires-in 300)
+            --expires-in 900)
     else
         PRESIGNED_URL="https://${S3_BUCKET}.s3.${REGION}.amazonaws.com/${S3_SCRIPT_KEY}?PRESIGNED_PLACEHOLDER"
     fi
