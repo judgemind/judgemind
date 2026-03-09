@@ -180,12 +180,36 @@ def test_sb_s22_multiple_case_numbers() -> None:
     assert len(matches) >= 2
 
 
-def test_sb_s36_no_case_numbers() -> None:
-    import re
+def test_sb_s36_case_number_with_space() -> None:
+    """Dept S36 uses 'CIVSB 2600093' (with space) — the updated regex matches it."""
+    from courts.ca.sb_tentatives import _CASE_NUMBER_RE
 
     text = _extract_pdf_text(_load_bytes("sb_s36_20260303_a6da3fb7.pdf"))
-    matches = re.findall(r"\bCIV[A-Z]{2}\d{5,8}\b", text)
-    assert len(matches) == 0
+    matches = _CASE_NUMBER_RE.findall(text)
+    assert len(matches) >= 1
+    # The raw match includes the space; normalisation happens in parse_document.
+    assert any("2600093" in m for m in matches)
+
+
+@respx.mock
+def test_sb_s36_parse_document_normalises_case_number() -> None:
+    """Full pipeline: S36 PDF with spaced case number is normalised to no space."""
+    html = _load_html("sb_iframe_page.html")
+    pdf_bytes = _load_bytes("sb_s36_20260303_a6da3fb7.pdf")
+
+    respx.get(INDEX_URL).mock(return_value=httpx.Response(200, text=html))
+    respx.get(url__regex=r"\.pdf$").mock(
+        return_value=httpx.Response(200, content=pdf_bytes),
+    )
+
+    config = sb_default_config()
+    config.request_delay_seconds = 0
+    scraper = SBTentativeRulingsScraper(config=config)
+
+    docs = scraper.fetch_documents()
+    # Parse just the first doc (all use the same S36 fixture)
+    parsed = scraper.parse_document(docs[0])
+    assert parsed.case_number == "CIVSB2600093"
 
 
 # ---------------------------------------------------------------------------
