@@ -481,13 +481,29 @@ These patterns avoid permission prompts and allow the agent to run without inter
 
 ## Improving the Agent Workflow
 
+### Continuous DX improvements
+
+At the end of every implementation loop — whether autonomous (`/ralph`, `/task`) or manual/human-directed — pause and consider whether any workflow friction, repeated patterns, or missing automation could be improved. If you identify a DX improvement:
+
+1. **File a GitHub issue** immediately:
+   - Title: `[DX] <description>`
+   - Label: `type/dx`
+   - Body: describe the friction, the ideal fix, and which files are likely affected.
+   - Add `agent/ready` if the fix is self-contained and fully specified.
+2. **Kick off a background subagent** (via `/task #N`) to implement the fix in parallel, so it doesn't block the current work.
+
+Examples of DX improvements to look for:
+- Permission prompts that could be avoided with a better command pattern or settings change
+- Repeated manual steps that could be scripted or added to a hook
+- Missing preflight checks that would have caught an error earlier
+- CLAUDE.md rules that are unclear, outdated, or missing
+
+### Permission prompt workarounds
+
 When you encounter a permission prompt for a command that is **clearly safe and non-destructive** (read-only operations, local file writes, running tests, formatting tools, creating branches), and the prompt could be avoided with a better command pattern:
 
-1. **Work around it immediately** using the patterns above or by splitting the command.
-2. **File a GitHub issue** to track the improvement:
-   - Title: `[DX] Agent workflow: avoid prompt for <description>`
-   - Label: `type/dx` (create it if it doesn't exist)
-   - Body: describe what triggered the prompt, the workaround used, and the specific line to add to the "Unattended Operation Patterns" section of `CLAUDE.md`.
+1. **Work around it immediately** using the patterns in "Unattended Operation Patterns" above or by splitting the command.
+2. **File a GitHub issue** to track the improvement (see above).
 
 Do **not** file issues for prompts that exist for good reason — pushing to remote, opening PRs, merging, deploying, deleting branches, or any action that affects shared state. Those prompts are intentional.
 
