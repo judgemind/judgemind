@@ -5,7 +5,7 @@ with a unified interface. Each adapter accepts a system prompt + user message
 and returns the raw text response + token counts.
 
 Configuration is via environment variables:
-- ``LLM_PROVIDER``: ``"anthropic"`` (default) or ``"google"``
+- ``LLM_PROVIDER``: ``"google"`` (default) or ``"anthropic"``
 - ``LLM_MODEL``: model ID (defaults per provider if not set)
 - ``ANTHROPIC_API_KEY``: required when provider is ``"anthropic"``
 - ``GOOGLE_API_KEY``: required when provider is ``"google"``
@@ -196,8 +196,8 @@ def call_llm(
     Args:
         system_prompt: System prompt text.
         user_message: User message text.
-        provider: Provider name — ``"anthropic"`` or ``"google"``.
-            Falls back to ``LLM_PROVIDER`` env var, then ``"anthropic"``.
+        provider: Provider name — ``"google"`` or ``"anthropic"``.
+            Falls back to ``LLM_PROVIDER`` env var, then ``"google"``.
         model: Model ID.  Falls back to ``LLM_MODEL`` env var, then a
             per-provider default.
         client: Optional pre-created provider client for connection reuse.
@@ -207,7 +207,7 @@ def call_llm(
         An ``LLMResponse`` with the text and token counts, or ``None``
         on any unrecoverable failure.
     """
-    resolved_provider = provider or os.environ.get("LLM_PROVIDER", "anthropic")
+    resolved_provider = provider or os.environ.get("LLM_PROVIDER", "google")
     resolved_model = (
         model
         or os.environ.get("LLM_MODEL")
@@ -242,13 +242,13 @@ def create_client(
 
     Args:
         provider: Provider name.  Falls back to ``LLM_PROVIDER`` env var,
-            then ``"anthropic"``.
+            then ``"google"``.
 
     Returns:
         A provider-specific client object, or ``None`` if credentials
         are missing.
     """
-    resolved_provider = provider or os.environ.get("LLM_PROVIDER", "anthropic")
+    resolved_provider = provider or os.environ.get("LLM_PROVIDER", "google")
 
     if resolved_provider == "anthropic":
         api_key = os.environ.get("ANTHROPIC_API_KEY")
