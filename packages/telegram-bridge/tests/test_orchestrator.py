@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from pathlib import Path
 
 import boto3
 import httpx
@@ -702,3 +703,235 @@ class TestBackgroundPolling:
             assert commands == []
 
             await orch.stop_polling()
+
+
+# ── State persistence ──────────────────────────────────────────────────
+
+
+class TestStatePersistence:
+    @respx.mock
+    async def test_task_started_persists_to_file(self, tmp_path: Path) -> None:
+        """task_started() writes worker state to the state file."""
+        with mock_aws():
+            _setup_secret()
+            respx.post("https://api.telegram.org/botfake-bot-token/sendMessage").mock(
+                return_value=httpx.Response(200, json={"ok": True})
+            )
+
+            state_file = str(tmp_path / "state.json")
+            bridge = _make_bridge()
+            orch = OrchestratorBridge(bridge=bridge, state_file=state_file)
+            await orch.task_started(issue_number=42, title="Fix the widget", worker=3)
+
+            # The file should exist and contain the worker.
+            data = json.loads(Path(state_file).read_text())
+            assert "3" in data["workers"]
+            assert data["workers"]["3"]["issue_number"] == 42
+            assert data["workers"]["3"]["issue_title"] == "Fix the widget"
+
+    @respx.mock
+    async def test_new_instance_loads_persisted_workers(self, tmp_path: Path) -> None:
+        """A fresh OrchestratorBridge instance loads workers from the state file."""
+        with mock_aws():
+            _setup_secret()
+            respx.post("https://api.telegram.org/botfake-bot-token/sendMessage").mock(
+                return_value=httpx.Response(200, json={"ok": True})
+            )
+
+            state_file = str(tmp_path / "state.json")
+
+            # First instance: start a task.
+            bridge1 = _make_bridge()
+            orch1 = OrchestratorBridge(bridge=bridge1, state_file=state_file)
+            await orch1.task_started(issue_number=42, title="Fix the widget", worker=3)
+
+            # Second instance: should pick up the worker from disk.
+            bridge2 = _make_bridge()
+            orch2 = OrchestratorBridge(bridge=bridge2, state_file=state_file)
+            workers = orch2.get_workers()
+            assert len(workers) == 1
+            assert workers[0].issue_number == 42
+            assert workers[0].worker_number == 3
+
+    @respx.mock
+    async def test_task_completed_removes_worker_from_file(self, tmp_path: Path) -> None:
+        """task_completed() removes the worker from the persisted state."""
+        with mock_aws():
+            _setup_secret()
+            respx.post("https://api.telegram.org/botfake-bot-token/sendMessage").mock(
+                return_value=httpx.Response(200, json={"ok": True})
+            )
+
+            state_file = str(tmp_path / "state.json")
+            bridge = _make_bridge()
+            orch = OrchestratorBridge(bridge=bridge, state_file=state_file)
+            await orch.task_started(issue_number=42, title="Fix the widget", worker=3)
+            await orch.task_completed(issue_number=42, summary="Done.", worker=3)
+
+            data = json.loads(Path(state_file).read_text())
+            assert data["workers"] == {}
+
+    @respx.mock
+    async def test_task_failed_removes_worker_from_file(self, tmp_path: Path) -> None:
+        """task_failed() removes the worker from the persisted state."""
+        with mock_aws():
+            _setup_secret()
+            respx.post("https://api.telegram.org/botfake-bot-token/sendMessage").mock(
+                return_value=httpx.Response(200, json={"ok": True})
+            )
+
+            state_file = str(tmp_path / "state.json")
+            bridge = _make_bridge()
+            orch = OrchestratorBridge(bridge=bridge, state_file=state_file)
+            await orch.task_started(issue_number=42, title="Fix the widget", worker=3)
+            await orch.task_failed(issue_number=42, error="CI broke.", worker=3)
+
+            data = json.loads(Path(state_file).read_text())
+            assert data["workers"] == {}
+
+    @respx.mock
+    async def test_update_worker_persists_phase(self, tmp_path: Path) -> None:
+        """update_worker() saves the new phase to disk."""
+        with mock_aws():
+            _setup_secret()
+            respx.post("https://api.telegram.org/botfake-bot-token/sendMessage").mock(
+                return_value=httpx.Response(200, json={"ok": True})
+            )
+
+            state_file = str(tmp_path / "state.json")
+            bridge = _make_bridge()
+            orch = OrchestratorBridge(bridge=bridge, state_file=state_file)
+            await orch.task_started(issue_number=42, title="Fix widget", worker=3)
+            orch.update_worker(3, phase="ci-watch")
+
+            data = json.loads(Path(state_file).read_text())
+            assert data["workers"]["3"]["phase"] == "ci-watch"
+
+    @respx.mock
+    async def test_pause_persists_to_file(self, tmp_path: Path) -> None:
+        """handle_command(PAUSE) persists paused=True to disk."""
+        with mock_aws():
+            _setup_secret()
+            respx.post("https://api.telegram.org/botfake-bot-token/sendMessage").mock(
+                return_value=httpx.Response(200, json={"ok": True})
+            )
+
+            state_file = str(tmp_path / "state.json")
+            bridge = _make_bridge()
+            orch = OrchestratorBridge(bridge=bridge, state_file=state_file)
+            await orch.handle_command(Command(kind=CommandKind.PAUSE))
+
+            data = json.loads(Path(state_file).read_text())
+            assert data["paused"] is True
+
+    @respx.mock
+    async def test_resume_persists_to_file(self, tmp_path: Path) -> None:
+        """handle_command(RESUME) persists paused=False to disk."""
+        with mock_aws():
+            _setup_secret()
+            respx.post("https://api.telegram.org/botfake-bot-token/sendMessage").mock(
+                return_value=httpx.Response(200, json={"ok": True})
+            )
+
+            state_file = str(tmp_path / "state.json")
+            bridge = _make_bridge()
+            orch = OrchestratorBridge(bridge=bridge, state_file=state_file, paused=True)
+            await orch.handle_command(Command(kind=CommandKind.RESUME))
+
+            data = json.loads(Path(state_file).read_text())
+            assert data["paused"] is False
+
+    @respx.mock
+    async def test_new_instance_loads_paused_flag(self, tmp_path: Path) -> None:
+        """A fresh instance loads the paused flag from the state file."""
+        with mock_aws():
+            _setup_secret()
+            respx.post("https://api.telegram.org/botfake-bot-token/sendMessage").mock(
+                return_value=httpx.Response(200, json={"ok": True})
+            )
+
+            state_file = str(tmp_path / "state.json")
+            bridge1 = _make_bridge()
+            orch1 = OrchestratorBridge(bridge=bridge1, state_file=state_file)
+            await orch1.handle_command(Command(kind=CommandKind.PAUSE))
+
+            bridge2 = _make_bridge()
+            orch2 = OrchestratorBridge(bridge=bridge2, state_file=state_file)
+            assert orch2.paused is True
+
+    @respx.mock
+    async def test_session_ended_removes_state_file(self, tmp_path: Path) -> None:
+        """session_ended() cleans up the state file."""
+        with mock_aws():
+            _setup_secret()
+            respx.post("https://api.telegram.org/botfake-bot-token/sendMessage").mock(
+                return_value=httpx.Response(200, json={"ok": True})
+            )
+
+            state_file = str(tmp_path / "state.json")
+            bridge = _make_bridge()
+            orch = OrchestratorBridge(bridge=bridge, state_file=state_file)
+            await orch.task_started(issue_number=42, title="Fix widget", worker=3)
+            assert Path(state_file).exists()
+
+            await orch.session_ended()
+            assert not Path(state_file).exists()
+
+    def test_missing_state_file_starts_fresh(self, tmp_path: Path) -> None:
+        """If the state file doesn't exist, instance starts with empty state."""
+        with mock_aws():
+            state_file = str(tmp_path / "nonexistent.json")
+            bridge = _make_bridge()
+            orch = OrchestratorBridge(bridge=bridge, state_file=state_file)
+            assert orch.get_workers() == []
+            assert orch.paused is False
+
+    def test_corrupt_state_file_starts_fresh(self, tmp_path: Path) -> None:
+        """If the state file is corrupt, instance starts with empty state."""
+        with mock_aws():
+            state_file = tmp_path / "corrupt.json"
+            state_file.write_text("not valid json{{{")
+
+            bridge = _make_bridge()
+            orch = OrchestratorBridge(bridge=bridge, state_file=str(state_file))
+            assert orch.get_workers() == []
+            assert orch.paused is False
+
+    def test_no_state_file_means_in_memory_only(self) -> None:
+        """Without state_file, behavior is unchanged (in-memory only)."""
+        with mock_aws():
+            bridge = _make_bridge()
+            orch = OrchestratorBridge(bridge=bridge)
+            # No state_file set — _save_state and _load_state should be no-ops.
+            orch._save_state()
+            orch._load_state()
+            assert orch.get_workers() == []
+
+    @respx.mock
+    async def test_reply_status_uses_persisted_workers(self, tmp_path: Path) -> None:
+        """A fresh instance's reply_status() reports workers loaded from disk."""
+        with mock_aws():
+            _setup_secret()
+            route = respx.post("https://api.telegram.org/botfake-bot-token/sendMessage").mock(
+                return_value=httpx.Response(200, json={"ok": True})
+            )
+
+            state_file = str(tmp_path / "state.json")
+
+            # First process: start a task.
+            bridge1 = _make_bridge()
+            orch1 = OrchestratorBridge(bridge=bridge1, state_file=state_file)
+            await orch1.task_started(issue_number=42, title="Fix widget", worker=3)
+
+            # Second process: reply_status should include the worker.
+            route.reset()
+            route.mock(return_value=httpx.Response(200, json={"ok": True}))
+
+            bridge2 = _make_bridge()
+            orch2 = OrchestratorBridge(bridge=bridge2, state_file=state_file)
+            await orch2.reply_status()
+            await bridge2.close()
+
+            body = json.loads(route.calls[0].request.content)
+            assert "Worker-3" in body["text"] or "Worker\\-3" in body["text"]
+            assert "#42" in body["text"] or "42" in body["text"]

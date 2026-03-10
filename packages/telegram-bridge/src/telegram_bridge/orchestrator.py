@@ -11,9 +11,11 @@ from __future__ import annotations
 
 import asyncio
 import datetime
+import json
 import logging
 from dataclasses import dataclass, field
 from enum import Enum
+from pathlib import Path
 from typing import Any
 
 from .client import TelegramBridge
@@ -131,10 +133,70 @@ class OrchestratorBridge:
     bridge: TelegramBridge
     repo: str = DEFAULT_GITHUB_REPO
     paused: bool = False
+    state_file: str | None = None
     _workers: dict[int, WorkerInfo] = field(default_factory=dict)
     _pending_commands: list[Command] = field(default_factory=list)
     _poll_task: asyncio.Task[None] | None = field(default=None, repr=False)
     _poll_interval: float = field(default=30.0, repr=False)
+
+    def __post_init__(self) -> None:
+        """Load persisted state from *state_file* if it exists."""
+        if self.state_file:
+            self._load_state()
+
+    # ── State persistence ────────────────────────────────────────────────
+
+    def _save_state(self) -> None:
+        """Persist worker state and paused flag to *state_file*."""
+        if not self.state_file:
+            return
+        data = {
+            "paused": self.paused,
+            "workers": {
+                str(k): {
+                    "worker_number": v.worker_number,
+                    "issue_number": v.issue_number,
+                    "issue_title": v.issue_title,
+                    "phase": v.phase,
+                    "updated": v.updated,
+                }
+                for k, v in self._workers.items()
+            },
+        }
+        path = Path(self.state_file)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(data, indent=2))
+
+    def _load_state(self) -> None:
+        """Load worker state and paused flag from *state_file*."""
+        if not self.state_file:
+            return
+        path = Path(self.state_file)
+        if not path.exists():
+            return
+        try:
+            data = json.loads(path.read_text())
+            self.paused = data.get("paused", False)
+            self._workers = {}
+            for _key, w in data.get("workers", {}).items():
+                info = WorkerInfo(
+                    worker_number=w["worker_number"],
+                    issue_number=w["issue_number"],
+                    issue_title=w["issue_title"],
+                    phase=w["phase"],
+                    updated=w.get("updated", ""),
+                )
+                self._workers[info.worker_number] = info
+        except (json.JSONDecodeError, KeyError, TypeError):
+            logger.warning("Failed to load state file %s — starting fresh.", self.state_file)
+
+    def _clear_state_file(self) -> None:
+        """Remove the *state_file* on session end."""
+        if not self.state_file:
+            return
+        path = Path(self.state_file)
+        if path.exists():
+            path.unlink()
 
     # ── Lifecycle notifications ─────────────────────────────────────────
 
@@ -144,6 +206,7 @@ class OrchestratorBridge:
 
     async def session_ended(self) -> None:
         """Notify that the orchestrator session has ended."""
+        self._clear_state_file()
         await self.bridge.notify("Orchestrator session ended.")
 
     async def task_started(self, *, issue_number: int, title: str, worker: int) -> None:
@@ -155,6 +218,7 @@ class OrchestratorBridge:
             phase="starting",
             updated=datetime.datetime.now(datetime.UTC).isoformat(),
         )
+        self._save_state()
         await self.bridge.status_update(
             task=f"#{issue_number}",
             state="in_progress",
@@ -165,6 +229,7 @@ class OrchestratorBridge:
     async def task_completed(self, *, issue_number: int, summary: str, worker: int) -> None:
         """Notify that a task agent has completed successfully."""
         self._workers.pop(worker, None)
+        self._save_state()
         await self.bridge.status_update(
             task=f"#{issue_number}",
             state="complete",
@@ -175,6 +240,7 @@ class OrchestratorBridge:
     async def task_failed(self, *, issue_number: int, error: str, worker: int) -> None:
         """Notify that a task agent has failed."""
         self._workers.pop(worker, None)
+        self._save_state()
         await self.bridge.status_update(
             task=f"#{issue_number}",
             state="failed",
@@ -189,6 +255,7 @@ class OrchestratorBridge:
         if worker in self._workers:
             self._workers[worker].phase = phase
             self._workers[worker].updated = datetime.datetime.now(datetime.UTC).isoformat()
+            self._save_state()
 
     def get_workers(self) -> list[WorkerInfo]:
         """Return a snapshot of all tracked workers."""
@@ -260,11 +327,13 @@ class OrchestratorBridge:
 
         elif cmd.kind == CommandKind.PAUSE:
             self.paused = True
+            self._save_state()
             await self.bridge.notify("Paused. No new issues will be spawned.", repo=self.repo)
             result["reply"] = "Paused."
 
         elif cmd.kind == CommandKind.RESUME:
             self.paused = False
+            self._save_state()
             await self.bridge.notify("Resumed. Will spawn issues as normal.", repo=self.repo)
             result["reply"] = "Resumed."
 
@@ -368,8 +437,13 @@ def create_orchestrator_bridge(
     sqs_queue_url: str | None = None,
     region_name: str = "us-west-2",
     repo: str = DEFAULT_GITHUB_REPO,
+    state_file: str | None = None,
 ) -> OrchestratorBridge:
     """Factory that creates an :class:`OrchestratorBridge` with a fresh client.
+
+    If *state_file* is provided, worker state and the paused flag are persisted
+    to that path so that short-lived invocations can share state across process
+    boundaries.
 
     The caller can also pass an existing :class:`TelegramBridge` directly
     to the dataclass constructor for testing.
@@ -379,4 +453,4 @@ def create_orchestrator_bridge(
         sqs_queue_url=sqs_queue_url,
         region_name=region_name,
     )
-    return OrchestratorBridge(bridge=bridge, repo=repo)
+    return OrchestratorBridge(bridge=bridge, repo=repo, state_file=state_file)
