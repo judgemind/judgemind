@@ -20,7 +20,7 @@ Options:
     --date-from DATE    Only re-ingest documents captured on or after this date.
     --date-to DATE      Only re-ingest documents captured on or before this date.
     --dry-run           Parse and show what would be updated, but don't write to DB.
-    --batch-size N      Number of documents per batch (default: 200).
+    --batch-size N      Number of documents per batch (default: 25).
     --limit N           Maximum total documents to re-ingest.
     --concurrency N     Number of parallel S3 fetch threads (default: 10).
     --parse-workers N   Number of parallel scraper parse threads (default: 4).
@@ -559,6 +559,8 @@ def reingest_batch(
     llm_model: str | None = None,
     llm_timeout: float | None = 60.0,
     force_llm: bool = False,
+    running_processed: int = 0,
+    running_updated: int = 0,
 ) -> tuple[int, int, int, tuple[datetime, str]]:
     """Process one batch. Returns (processed, updated, llm_skipped, next_cursor).
 
@@ -566,6 +568,13 @@ def reingest_batch(
     ``concurrency``).  Scraper parsing is parallelised with ``parse_workers``
     threads.  Each parse call is guarded by a ``parse_timeout`` (seconds).
     DB writes remain sequential.
+
+    Each document is committed individually so that a crash mid-batch does
+    not lose already-processed documents.  The DB writes are idempotent
+    (upserts), so partial batch commits are safe.
+
+    *running_processed* and *running_updated* are cumulative totals from
+    prior batches, used for progress logging.
 
     If *llm_client* is provided, LLM extraction is used for fields
     that the scraper did not populate, before falling back to regex.
@@ -732,11 +741,11 @@ def reingest_batch(
     if dry_run or not parsed_docs:
         return processed, updated, llm_skipped, next_cursor
 
-    # --- DB writes — one savepoint per document -----------------------------
-    # We use per-document savepoints so that a single bad document (e.g. an
-    # oversized party name that exceeds the B-tree index limit) does not crash
-    # the entire batch.  If a document fails, the savepoint is rolled back and
-    # the next document is processed normally.
+    # --- DB writes — commit after each document ------------------------------
+    # Each document is written inside a savepoint and then committed
+    # individually.  This ensures that a crash mid-batch does not lose
+    # already-processed documents.  The DB writes are idempotent (upserts),
+    # so partial batch commits are safe.
     for doc_meta, extracted in parsed_docs:
         doc_id_str = doc_meta["document_id"]
         court_id_str = doc_meta["court_id"]
@@ -806,7 +815,17 @@ def reingest_batch(
                 # Parties (batched — O(1) queries regardless of party count)
                 batch_upsert_parties(conn, new_case_id, extracted.get("parties", []))
 
+            # Commit immediately so this document is durable even if a
+            # later document (or the process) crashes.
+            conn.commit()
             updated += 1
+
+            logger.info(
+                "Committed document %s (total: processed=%d, updated=%d)",
+                doc_id_str,
+                running_processed + processed,
+                running_updated + updated,
+            )
 
         except Exception:
             logger.error(
@@ -824,7 +843,7 @@ def run_reingest(
     county: str | None = None,
     date_from: date | None = None,
     date_to: date | None = None,
-    batch_size: int = 200,
+    batch_size: int = 25,
     limit: int | None = None,
     dry_run: bool = False,
     concurrency: int = 10,
@@ -888,6 +907,8 @@ def run_reingest(
                 llm_model=llm_model,
                 llm_timeout=llm_timeout,
                 force_llm=force_llm,
+                running_processed=total_processed,
+                running_updated=total_updated,
             )
             total_processed += processed
             total_updated += updated
@@ -895,18 +916,16 @@ def run_reingest(
 
             if dry_run:
                 conn.rollback()
-            else:
-                conn.commit()
 
             logger.info(
-                "Batch: processed=%d updated=%d llm_skipped=%d (total: %d/%d/%d)%s",
+                "Batch complete: processed=%d updated=%d llm_skipped=%d (total: %d/%d/%d)%s",
                 processed,
                 updated,
                 batch_llm_skipped,
                 total_processed,
                 total_updated,
                 total_llm_skipped,
-                " [dry-run]" if dry_run else " [committed]",
+                " [dry-run]" if dry_run else "",
             )
 
             if processed < effective_batch:
@@ -936,7 +955,7 @@ def main() -> None:
         "--dry-run", action="store_true", help="Parse but don't update DB."
     )
     parser.add_argument(
-        "--batch-size", type=int, default=200, help="Batch size (default: 200)."
+        "--batch-size", type=int, default=25, help="Batch size (default: 25)."
     )
     parser.add_argument(
         "--limit", type=int, default=None, help="Max documents to process."
