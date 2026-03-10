@@ -109,14 +109,14 @@ def _mock_conn_returning(rows: list) -> MagicMock:
 
 
 def _mock_conn_with_rows(rows: list[tuple]) -> MagicMock:
-    """Create a mock connection that returns rows and supports pipeline context."""
+    """Create a mock connection that returns rows and supports transaction context."""
     conn = _mock_conn_returning(rows)
 
-    # Pipeline context manager
-    pipeline = MagicMock()
-    pipeline.__enter__ = MagicMock(return_value=pipeline)
-    pipeline.__exit__ = MagicMock(return_value=False)
-    conn.pipeline.return_value = pipeline
+    # Transaction context manager (savepoints — conn.transaction())
+    txn = MagicMock()
+    txn.__enter__ = MagicMock(return_value=txn)
+    txn.__exit__ = MagicMock(return_value=False)
+    conn.transaction.return_value = txn
 
     return conn
 
@@ -395,21 +395,21 @@ class TestReingestBatchCursor:
 
 
 # ---------------------------------------------------------------------------
-# reingest_batch tests — pipeline batching
+# reingest_batch tests — per-document DB writes
 # ---------------------------------------------------------------------------
 
 
-class TestReingestBatchPipeline:
-    """Tests for DB pipeline batching in reingest_batch()."""
+class TestReingestBatchDBWrites:
+    """Tests for per-document DB writes in reingest_batch()."""
 
     @patch("reingest_from_s3._reparse_document")
     @patch("reingest_from_s3._fetch_s3_content")
-    def test_dry_run_skips_pipeline(
+    def test_dry_run_skips_db_writes(
         self,
         mock_fetch_s3: MagicMock,
         mock_reparse: MagicMock,
     ) -> None:
-        """In dry-run mode, pipeline context is not entered."""
+        """In dry-run mode, transaction context is not entered."""
         row = _make_document_row()
         conn = _mock_conn_with_rows([row])
 
@@ -438,7 +438,7 @@ class TestReingestBatchPipeline:
 
         assert processed == 1
         assert updated == 0
-        conn.pipeline.assert_not_called()
+        conn.transaction.assert_not_called()
 
     @patch("reingest_from_s3.batch_upsert_parties")
     @patch("reingest_from_s3.upsert_case_judge")
@@ -448,7 +448,7 @@ class TestReingestBatchPipeline:
     @patch("reingest_from_s3.upsert_case")
     @patch("reingest_from_s3._reparse_document")
     @patch("reingest_from_s3._fetch_s3_content")
-    def test_pipeline_context_used_for_db_writes(
+    def test_transaction_context_used_for_db_writes(
         self,
         mock_fetch_s3: MagicMock,
         mock_reparse: MagicMock,
@@ -459,7 +459,7 @@ class TestReingestBatchPipeline:
         mock_upsert_cj: MagicMock,
         mock_batch_parties: MagicMock,
     ) -> None:
-        """DB writes happen inside a pipeline context."""
+        """DB writes happen inside a transaction (savepoint) context."""
         row = _make_document_row()
         conn = _mock_conn_with_rows([row])
 
@@ -489,7 +489,7 @@ class TestReingestBatchPipeline:
 
         assert processed == 1
         assert updated == 1
-        conn.pipeline.assert_called_once()
+        conn.transaction.assert_called_once()
         mock_upsert_case.assert_called_once()
         mock_insert_doc.assert_called_once()
         mock_resolve_judge.assert_called_once()
@@ -1978,3 +1978,141 @@ class TestCLINoLLMFlag:
         parser.add_argument("--no-llm", action="store_true")
         args = parser.parse_args([])
         assert args.no_llm is False
+
+
+# ---------------------------------------------------------------------------
+# reingest_batch tests — per-document error handling
+# ---------------------------------------------------------------------------
+
+
+class TestReingestBatchPerDocumentErrorHandling:
+    """Verify that a single bad document does not crash the entire batch."""
+
+    @patch("reingest_from_s3.batch_upsert_parties")
+    @patch("reingest_from_s3.upsert_case_judge")
+    @patch("reingest_from_s3.insert_ruling")
+    @patch("reingest_from_s3.resolve_judge")
+    @patch("reingest_from_s3.insert_document")
+    @patch("reingest_from_s3.upsert_case")
+    @patch("reingest_from_s3._reparse_document")
+    @patch("reingest_from_s3._fetch_s3_content")
+    def test_bad_document_skipped_others_succeed(
+        self,
+        mock_fetch_s3: MagicMock,
+        mock_reparse: MagicMock,
+        mock_upsert_case: MagicMock,
+        mock_insert_doc: MagicMock,
+        mock_resolve_judge: MagicMock,
+        mock_insert_ruling: MagicMock,
+        mock_upsert_cj: MagicMock,
+        mock_batch_parties: MagicMock,
+    ) -> None:
+        """When one document raises an exception during DB writes, the batch
+        continues and processes the remaining documents."""
+        doc_id_bad = uuid.uuid4()
+        doc_id_good = uuid.uuid4()
+        row_bad = _make_document_row(doc_id=doc_id_bad, captured_at=_CAPTURED_AT_1)
+        row_good = _make_document_row(doc_id=doc_id_good, captured_at=_CAPTURED_AT_2)
+
+        conn = _mock_conn_with_rows([row_bad, row_good])
+        mock_fetch_s3.return_value = b"<html>text</html>"
+
+        extracted_good = {
+            "ruling_text": "Granted.",
+            "case_number": "23STCV01234",
+            "case_title": "A v. B",
+            "judge_name": "Judge Good",
+            "outcome": "granted",
+            "motion_type": "msj",
+            "department": "1",
+            "parties": [],
+            "hearing_date": _HEARING_DATE,
+        }
+        mock_reparse.return_value = extracted_good
+        mock_upsert_case.return_value = "case-id"
+        mock_resolve_judge.return_value = "judge-id"
+
+        # Make the transaction context manager raise for the first call (bad doc)
+        # then succeed for the second (good doc)
+        call_count = 0
+
+        def transaction_side_effect() -> MagicMock:
+            nonlocal call_count
+            call_count += 1
+            txn = MagicMock()
+            if call_count == 1:
+                # First doc: raise inside the context
+                txn.__enter__ = MagicMock(side_effect=Exception("index row requires 9568 bytes"))
+            else:
+                txn.__enter__ = MagicMock(return_value=txn)
+            txn.__exit__ = MagicMock(return_value=False)
+            return txn
+
+        conn.transaction.side_effect = transaction_side_effect
+
+        processed, updated, _cursor = reingest.reingest_batch(
+            conn,
+            MagicMock(),
+            batch_size=10,
+            cursor=_DEFAULT_CURSOR,
+            filters="",
+            filter_params=[],
+        )
+
+        # Both documents were processed (fetched + parsed)
+        assert processed == 2
+        # Only one was successfully written (the second one)
+        assert updated == 1
+
+    @patch("reingest_from_s3.batch_upsert_parties")
+    @patch("reingest_from_s3.upsert_case_judge")
+    @patch("reingest_from_s3.insert_ruling")
+    @patch("reingest_from_s3.resolve_judge")
+    @patch("reingest_from_s3.insert_document")
+    @patch("reingest_from_s3.upsert_case")
+    @patch("reingest_from_s3._reparse_document")
+    @patch("reingest_from_s3._fetch_s3_content")
+    def test_all_docs_fail_returns_zero_updated(
+        self,
+        mock_fetch_s3: MagicMock,
+        mock_reparse: MagicMock,
+        mock_upsert_case: MagicMock,
+        mock_insert_doc: MagicMock,
+        mock_resolve_judge: MagicMock,
+        mock_insert_ruling: MagicMock,
+        mock_upsert_cj: MagicMock,
+        mock_batch_parties: MagicMock,
+    ) -> None:
+        """When every document fails DB writes, updated count is zero."""
+        row = _make_document_row()
+        conn = _mock_conn_with_rows([row])
+        mock_fetch_s3.return_value = b"<html>text</html>"
+        mock_reparse.return_value = {
+            "ruling_text": "text",
+            "case_number": "23STCV01234",
+            "case_title": "A v. B",
+            "judge_name": None,
+            "outcome": None,
+            "motion_type": None,
+            "department": None,
+            "parties": [],
+            "hearing_date": _HEARING_DATE,
+        }
+
+        # Every transaction raises
+        txn = MagicMock()
+        txn.__enter__ = MagicMock(side_effect=Exception("DB error"))
+        txn.__exit__ = MagicMock(return_value=False)
+        conn.transaction.return_value = txn
+
+        processed, updated, _cursor = reingest.reingest_batch(
+            conn,
+            MagicMock(),
+            batch_size=10,
+            cursor=_DEFAULT_CURSOR,
+            filters="",
+            filter_params=[],
+        )
+
+        assert processed == 1
+        assert updated == 0

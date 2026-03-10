@@ -11,7 +11,9 @@ from datetime import date
 from unittest.mock import MagicMock
 
 from ingestion.db import (
+    _MAX_PARTY_NAME_LENGTH,
     _strip_nul,
+    _truncate_party_name,
     batch_upsert_parties,
     insert_ruling,
     upsert_case,
@@ -423,3 +425,76 @@ class TestBatchUpsertParties:
 
         aliases_params = cur.executemany.call_args_list[1][0][1]
         assert aliases_params[0][2] == "backfill"
+
+    def test_long_party_name_truncated(self) -> None:
+        """Party names exceeding _MAX_PARTY_NAME_LENGTH are truncated."""
+        conn, cur = _mock_conn_for_batch()
+        cur.fetchall.side_effect = [[]]
+        cur.fetchone.side_effect = [("pid-1",)]
+        cur.nextset.side_effect = [False]
+
+        long_name = "A" * 9000
+        batch_upsert_parties(
+            conn,
+            "case-1",
+            [{"name": long_name, "role": "plaintiff"}],
+        )
+
+        # The SELECT should use the truncated name
+        select_args = cur.execute.call_args_list[0][0][1]
+        raw_names_list = select_args[0]
+        assert len(raw_names_list[0]) == _MAX_PARTY_NAME_LENGTH
+
+
+# ---------------------------------------------------------------------------
+# _truncate_party_name
+# ---------------------------------------------------------------------------
+
+
+class TestTruncatePartyName:
+    """Tests for the _truncate_party_name helper."""
+
+    def test_short_name_unchanged(self) -> None:
+        assert _truncate_party_name("John Doe") == "John Doe"
+
+    def test_exact_limit_unchanged(self) -> None:
+        name = "A" * _MAX_PARTY_NAME_LENGTH
+        assert _truncate_party_name(name) == name
+
+    def test_over_limit_truncated(self) -> None:
+        name = "B" * (_MAX_PARTY_NAME_LENGTH + 500)
+        result = _truncate_party_name(name)
+        assert len(result) == _MAX_PARTY_NAME_LENGTH
+
+    def test_way_over_limit_truncated(self) -> None:
+        """Reproduces the original bug: 9568-byte garbage party name."""
+        name = "X" * 9568
+        result = _truncate_party_name(name)
+        assert len(result) == _MAX_PARTY_NAME_LENGTH
+
+
+# ---------------------------------------------------------------------------
+# upsert_party — truncation
+# ---------------------------------------------------------------------------
+
+
+class TestUpsertPartyTruncation:
+    """Verify upsert_party truncates oversized party names."""
+
+    def test_long_name_truncated_before_insert(self) -> None:
+        conn = _mock_conn()
+        cur = conn.cursor.return_value.__enter__.return_value
+        # First fetchone: no existing alias; second: new party id
+        cur.fetchone.side_effect = [None, ("party-uuid-1",)]
+
+        long_name = "C" * 9000
+        upsert_party(conn, raw_name=long_name, party_type="plaintiff")
+
+        # All execute calls should use truncated names
+        for c in cur.execute.call_args_list:
+            call_args = c[0][1]
+            for arg in call_args:
+                if isinstance(arg, str):
+                    assert len(arg) <= _MAX_PARTY_NAME_LENGTH, (
+                        f"Arg length {len(arg)} exceeds limit"
+                    )

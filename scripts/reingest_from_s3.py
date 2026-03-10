@@ -702,78 +702,88 @@ def reingest_batch(
     if dry_run or not parsed_docs:
         return processed, updated, next_cursor
 
-    # --- DB writes inside a pipeline context --------------------------------
-    # Pipeline mode batches TCP round-trips — multiple queries are sent without
-    # waiting for individual responses, then results are collected as needed.
-    # Each document still reads intermediate IDs (case_id, judge_id, party_id)
-    # via fetchone(), but the network overhead is amortised across the batch.
-    with conn.pipeline():
-        for doc_meta, extracted in parsed_docs:
-            doc_id_str = doc_meta["document_id"]
-            court_id_str = doc_meta["court_id"]
+    # --- DB writes — one savepoint per document -----------------------------
+    # We use per-document savepoints so that a single bad document (e.g. an
+    # oversized party name that exceeds the B-tree index limit) does not crash
+    # the entire batch.  If a document fails, the savepoint is rolled back and
+    # the next document is processed normally.
+    for doc_meta, extracted in parsed_docs:
+        doc_id_str = doc_meta["document_id"]
+        court_id_str = doc_meta["court_id"]
 
-            effective_case_number = (
-                extracted["case_number"]
-                or doc_meta["case_number"]
-                or f"UNKNOWN-{doc_id_str}"
-            )
-            new_case_id = upsert_case(
-                conn,
-                effective_case_number,
-                court_id_str,
-                case_title=extracted["case_title"],
-            )
+        try:
+            with conn.transaction():
+                effective_case_number = (
+                    extracted["case_number"]
+                    or doc_meta["case_number"]
+                    or f"UNKNOWN-{doc_id_str}"
+                )
+                new_case_id = upsert_case(
+                    conn,
+                    effective_case_number,
+                    court_id_str,
+                    case_title=extracted["case_title"],
+                )
 
-            effective_hearing = extracted["hearing_date"] or doc_meta["hearing_date"]
-            insert_document(
-                conn,
-                document_id=doc_id_str,
-                case_id=new_case_id,
-                court_id=court_id_str,
-                content_format=doc_meta["format"],
-                content_hash=doc_meta["content_hash"],
-                s3_key=doc_meta["s3_key"],
-                s3_bucket=doc_meta["s3_bucket"],
-                source_url=doc_meta["source_url"],
-                scraper_id=doc_meta["scraper_id"],
-                captured_at=doc_meta["captured_at"],
-                hearing_date=effective_hearing,
-            )
-
-            # Resolve judge
-            judge_id = None
-            if extracted["judge_name"]:
-                judge_id = resolve_judge(conn, extracted["judge_name"], court_id_str)
-
-            # Upsert ruling
-            if effective_hearing is not None:
-                ruling_text = extracted["ruling_text"]
-                # Clean ruling text if it's the full raw HTML — take first 50k chars
-                if ruling_text and len(ruling_text) > 50000:
-                    ruling_text = ruling_text[:50000]
-
-                insert_ruling(
+                effective_hearing = (
+                    extracted["hearing_date"] or doc_meta["hearing_date"]
+                )
+                insert_document(
                     conn,
                     document_id=doc_id_str,
                     case_id=new_case_id,
                     court_id=court_id_str,
+                    content_format=doc_meta["format"],
+                    content_hash=doc_meta["content_hash"],
+                    s3_key=doc_meta["s3_key"],
+                    s3_bucket=doc_meta["s3_bucket"],
+                    source_url=doc_meta["source_url"],
+                    scraper_id=doc_meta["scraper_id"],
+                    captured_at=doc_meta["captured_at"],
                     hearing_date=effective_hearing,
-                    ruling_text=ruling_text,
-                    department=extracted["department"],
-                    judge_id=judge_id,
-                    outcome=extracted["outcome"],
-                    motion_type=extracted["motion_type"],
                 )
 
-            if judge_id:
-                upsert_case_judge(conn, new_case_id, judge_id, effective_hearing)
+                # Resolve judge
+                judge_id = None
+                if extracted["judge_name"]:
+                    judge_id = resolve_judge(
+                        conn, extracted["judge_name"], court_id_str
+                    )
 
-            # Parties (batched — O(1) queries regardless of party count)
-            batch_upsert_parties(
-                conn, new_case_id, extracted.get("parties", [])
-            )
+                # Upsert ruling
+                if effective_hearing is not None:
+                    ruling_text = extracted["ruling_text"]
+                    # Clean ruling text if it's the full raw HTML — take first 50k chars
+                    if ruling_text and len(ruling_text) > 50000:
+                        ruling_text = ruling_text[:50000]
+
+                    insert_ruling(
+                        conn,
+                        document_id=doc_id_str,
+                        case_id=new_case_id,
+                        court_id=court_id_str,
+                        hearing_date=effective_hearing,
+                        ruling_text=ruling_text,
+                        department=extracted["department"],
+                        judge_id=judge_id,
+                        outcome=extracted["outcome"],
+                        motion_type=extracted["motion_type"],
+                    )
+
+                if judge_id:
+                    upsert_case_judge(conn, new_case_id, judge_id, effective_hearing)
+
+                # Parties (batched — O(1) queries regardless of party count)
+                batch_upsert_parties(conn, new_case_id, extracted.get("parties", []))
 
             updated += 1
+
+        except Exception:
+            logger.error(
+                "DB write failed for document %s — skipping (batch continues)",
+                doc_id_str,
+                exc_info=True,
+            )
 
     return processed, updated, next_cursor
 
