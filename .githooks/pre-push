@@ -94,6 +94,24 @@ while read -r local_ref local_sha remote_sha _rest; do
             fi
         fi
 
+        # Python packages under infra/<dir>/ with a pyproject.toml (e.g. Lambda handlers)
+        if [[ "$file" =~ ^infra/([^/]+)/ ]]; then
+            infra_pkg="${BASH_REMATCH[1]}"
+            if [ -f "infra/$infra_pkg/pyproject.toml" ]; then
+                # Use infra/<dir> as the "package" identifier to avoid collisions
+                pkg_id="infra/$infra_pkg"
+                if ! echo "$changed_python_pkgs" | grep -qF "$pkg_id" 2>/dev/null; then
+                    changed_python_pkgs="$changed_python_pkgs $pkg_id"
+                fi
+                # Check if this is a code file (.py in any subdirectory or root)
+                if [[ "$file" =~ \.py$ ]]; then
+                    if ! echo "$python_pkgs_with_code" | grep -qF "$pkg_id" 2>/dev/null; then
+                        python_pkgs_with_code="$python_pkgs_with_code $pkg_id"
+                    fi
+                fi
+            fi
+        fi
+
         # Terraform: infra/terraform/
         if [[ "$file" =~ ^infra/terraform/ ]]; then
             changed_terraform=true
@@ -104,7 +122,13 @@ while read -r local_ref local_sha remote_sha _rest; do
     # Run checks for Python packages
     # ---------------------------------------------------------------
     for pkg in $changed_python_pkgs; do
-        pkg_dir="packages/$pkg"
+        # Determine package directory: infra/* packages use pkg as-is,
+        # packages/* packages are prefixed with "packages/"
+        if [[ "$pkg" == infra/* ]]; then
+            pkg_dir="$pkg"
+        else
+            pkg_dir="packages/$pkg"
+        fi
         echo "pre-push: checking Python package '$pkg'..." >&2
 
         # Prefer the package's own venv ruff, fall back to global
@@ -147,7 +171,11 @@ while read -r local_ref local_sha remote_sha _rest; do
     # Run tests for Python packages (code changes only)
     # ---------------------------------------------------------------
     for pkg in $python_pkgs_with_code; do
-        pkg_dir="packages/$pkg"
+        if [[ "$pkg" == infra/* ]]; then
+            pkg_dir="$pkg"
+        else
+            pkg_dir="packages/$pkg"
+        fi
 
         if [ -x "$pkg_dir/.venv/bin/pytest" ]; then
             echo "pre-push: running tests for Python package '$pkg'..." >&2
