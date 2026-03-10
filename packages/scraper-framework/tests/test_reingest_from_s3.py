@@ -557,6 +557,235 @@ class TestReingestBatchDBWrites:
 
 
 # ---------------------------------------------------------------------------
+# reingest_batch tests — per-document commits
+# ---------------------------------------------------------------------------
+
+
+class TestReingestBatchPerDocumentCommit:
+    """Tests that reingest_batch commits after each document."""
+
+    @patch("reingest_from_s3.batch_upsert_parties")
+    @patch("reingest_from_s3.upsert_case_judge")
+    @patch("reingest_from_s3.insert_ruling")
+    @patch("reingest_from_s3.resolve_judge")
+    @patch("reingest_from_s3.insert_document")
+    @patch("reingest_from_s3.upsert_case")
+    @patch("reingest_from_s3._reparse_document")
+    @patch("reingest_from_s3._fetch_s3_content")
+    def test_commit_called_per_document(
+        self,
+        mock_fetch_s3: MagicMock,
+        mock_reparse: MagicMock,
+        mock_upsert_case: MagicMock,
+        mock_insert_doc: MagicMock,
+        mock_resolve_judge: MagicMock,
+        mock_insert_ruling: MagicMock,
+        mock_upsert_cj: MagicMock,
+        mock_batch_parties: MagicMock,
+    ) -> None:
+        """conn.commit() is called once per successfully written document."""
+        rows = [
+            _make_document_row(uuid.uuid4(), _CAPTURED_AT_1),
+            _make_document_row(uuid.uuid4(), _CAPTURED_AT_2),
+        ]
+        conn = _mock_conn_with_rows(rows)
+
+        mock_fetch_s3.return_value = b"<html>text</html>"
+        mock_reparse.return_value = {
+            "ruling_text": "The motion is granted.",
+            "case_number": "23STCV01234",
+            "case_title": "Smith v. Jones",
+            "judge_name": "John Smith",
+            "outcome": "granted",
+            "motion_type": "msj",
+            "department": "1",
+            "parties": [],
+            "hearing_date": _HEARING_DATE,
+        }
+        mock_upsert_case.return_value = "case-id"
+        mock_resolve_judge.return_value = "judge-id"
+
+        processed, updated, _llm_skipped, _cursor = reingest.reingest_batch(
+            conn,
+            MagicMock(),
+            batch_size=10,
+            cursor=_DEFAULT_CURSOR,
+            filters="",
+            filter_params=[],
+        )
+
+        assert processed == 2
+        assert updated == 2
+        # One commit per document, not one per batch
+        assert conn.commit.call_count == 2
+
+    @patch("reingest_from_s3.batch_upsert_parties")
+    @patch("reingest_from_s3.upsert_case_judge")
+    @patch("reingest_from_s3.insert_ruling")
+    @patch("reingest_from_s3.resolve_judge")
+    @patch("reingest_from_s3.insert_document")
+    @patch("reingest_from_s3.upsert_case")
+    @patch("reingest_from_s3._reparse_document")
+    @patch("reingest_from_s3._fetch_s3_content")
+    def test_failed_document_does_not_commit(
+        self,
+        mock_fetch_s3: MagicMock,
+        mock_reparse: MagicMock,
+        mock_upsert_case: MagicMock,
+        mock_insert_doc: MagicMock,
+        mock_resolve_judge: MagicMock,
+        mock_insert_ruling: MagicMock,
+        mock_upsert_cj: MagicMock,
+        mock_batch_parties: MagicMock,
+    ) -> None:
+        """If a document's DB write fails, that document is not committed
+        but prior successful documents remain committed."""
+        rows = [
+            _make_document_row(uuid.uuid4(), _CAPTURED_AT_1),
+            _make_document_row(uuid.uuid4(), _CAPTURED_AT_2),
+        ]
+        conn = _mock_conn_with_rows(rows)
+
+        mock_fetch_s3.return_value = b"<html>text</html>"
+        mock_reparse.return_value = {
+            "ruling_text": "The motion is granted.",
+            "case_number": "23STCV01234",
+            "case_title": "Smith v. Jones",
+            "judge_name": "John Smith",
+            "outcome": "granted",
+            "motion_type": "msj",
+            "department": "1",
+            "parties": [],
+            "hearing_date": _HEARING_DATE,
+        }
+        mock_upsert_case.return_value = "case-id"
+        mock_resolve_judge.return_value = "judge-id"
+
+        # Make the transaction context raise on the second document
+        call_count = 0
+        txn_ok = MagicMock()
+        txn_ok.__enter__ = MagicMock(return_value=txn_ok)
+        txn_ok.__exit__ = MagicMock(return_value=False)
+
+        txn_fail = MagicMock()
+        txn_fail.__enter__ = MagicMock(side_effect=RuntimeError("DB constraint violation"))
+        txn_fail.__exit__ = MagicMock(return_value=False)
+
+        def make_txn() -> MagicMock:
+            nonlocal call_count
+            call_count += 1
+            if call_count == 2:
+                return txn_fail
+            return txn_ok
+
+        conn.transaction.side_effect = make_txn
+
+        processed, updated, _llm_skipped, _cursor = reingest.reingest_batch(
+            conn,
+            MagicMock(),
+            batch_size=10,
+            cursor=_DEFAULT_CURSOR,
+            filters="",
+            filter_params=[],
+        )
+
+        assert processed == 2
+        assert updated == 1
+        # Only one commit — the first document succeeded, the second failed
+        assert conn.commit.call_count == 1
+
+    @patch("reingest_from_s3.batch_upsert_parties")
+    @patch("reingest_from_s3.upsert_case_judge")
+    @patch("reingest_from_s3.insert_ruling")
+    @patch("reingest_from_s3.resolve_judge")
+    @patch("reingest_from_s3.insert_document")
+    @patch("reingest_from_s3.upsert_case")
+    @patch("reingest_from_s3._reparse_document")
+    @patch("reingest_from_s3._fetch_s3_content")
+    def test_dry_run_does_not_commit(
+        self,
+        mock_fetch_s3: MagicMock,
+        mock_reparse: MagicMock,
+        mock_upsert_case: MagicMock,
+        mock_insert_doc: MagicMock,
+        mock_resolve_judge: MagicMock,
+        mock_insert_ruling: MagicMock,
+        mock_upsert_cj: MagicMock,
+        mock_batch_parties: MagicMock,
+    ) -> None:
+        """Dry-run mode does not call conn.commit() at all."""
+        row = _make_document_row()
+        conn = _mock_conn_with_rows([row])
+
+        mock_fetch_s3.return_value = b"<html>text</html>"
+        mock_reparse.return_value = {
+            "ruling_text": "text",
+            "case_number": "23STCV01234",
+            "case_title": "Smith v. Jones",
+            "judge_name": None,
+            "outcome": None,
+            "motion_type": None,
+            "department": None,
+            "parties": [],
+            "hearing_date": _HEARING_DATE,
+        }
+
+        reingest.reingest_batch(
+            conn,
+            MagicMock(),
+            batch_size=10,
+            cursor=_DEFAULT_CURSOR,
+            filters="",
+            filter_params=[],
+            dry_run=True,
+        )
+
+        conn.commit.assert_not_called()
+
+
+class TestReingestBatchRunningTotals:
+    """Tests that running totals are passed and forwarded correctly."""
+
+    @patch("reingest_from_s3.boto3")
+    @patch("reingest_from_s3.psycopg")
+    @patch("reingest_from_s3.reingest_batch")
+    def test_running_totals_passed_to_batch(
+        self,
+        mock_batch: MagicMock,
+        mock_psycopg: MagicMock,
+        mock_boto3: MagicMock,
+    ) -> None:
+        """run_reingest passes cumulative totals to reingest_batch."""
+        mock_conn = MagicMock()
+        mock_conn.__enter__ = MagicMock(return_value=mock_conn)
+        mock_conn.__exit__ = MagicMock(return_value=False)
+        mock_psycopg.connect.return_value = mock_conn
+
+        cursor_1 = (_CAPTURED_AT_1, str(_DOC_ID_1))
+        cursor_2 = (_CAPTURED_AT_2, str(_DOC_ID_2))
+
+        mock_batch.side_effect = [
+            (10, 8, 0, cursor_1),  # full batch -> loop continues
+            (10, 7, 0, cursor_2),  # full batch -> loop continues
+            (5, 3, 0, cursor_2),  # partial batch -> loop ends
+        ]
+
+        reingest.run_reingest("postgresql://test", batch_size=10)
+
+        calls = mock_batch.call_args_list
+        assert len(calls) == 3
+        # First batch: running totals start at 0
+        assert calls[0].kwargs.get("running_processed") == 0
+        assert calls[0].kwargs.get("running_updated") == 0
+        # Second batch: running totals reflect first batch
+        assert calls[1].kwargs.get("running_processed") == 10
+        assert calls[1].kwargs.get("running_updated") == 8
+        # Third batch: running totals reflect first + second batch
+        assert calls[2].kwargs.get("running_processed") == 20
+        assert calls[2].kwargs.get("running_updated") == 15
+
+
+# ---------------------------------------------------------------------------
 # reingest_batch tests — parallel S3 fetches
 # ---------------------------------------------------------------------------
 
@@ -803,12 +1032,14 @@ class TestRunReingest:
     @patch("reingest_from_s3.boto3")
     @patch("reingest_from_s3.psycopg")
     @patch("reingest_from_s3.reingest_batch")
-    def test_commits_per_batch(
+    def test_no_batch_level_commit_in_non_dry_run(
         self,
         mock_batch: MagicMock,
         mock_psycopg: MagicMock,
         mock_boto3: MagicMock,
     ) -> None:
+        """run_reingest no longer calls conn.commit() — per-document commits
+        happen inside reingest_batch instead."""
         mock_conn = MagicMock()
         mock_conn.__enter__ = MagicMock(return_value=mock_conn)
         mock_conn.__exit__ = MagicMock(return_value=False)
@@ -822,7 +1053,8 @@ class TestRunReingest:
 
         stats = reingest.run_reingest("postgresql://test", batch_size=50)
 
-        assert mock_conn.commit.call_count == 2
+        # Commits now happen per-document inside reingest_batch, not here
+        mock_conn.commit.assert_not_called()
         mock_conn.rollback.assert_not_called()
         assert stats["total_processed"] == 80
         assert stats["total_updated"] == 60
@@ -1172,13 +1404,13 @@ class TestParallelParsing:
     @patch("reingest_from_s3.boto3")
     @patch("reingest_from_s3.psycopg")
     @patch("reingest_from_s3.reingest_batch")
-    def test_default_batch_size_is_200(
+    def test_default_batch_size_is_25(
         self,
         mock_batch: MagicMock,
         mock_psycopg: MagicMock,
         mock_boto3: MagicMock,
     ) -> None:
-        """Default batch_size is 200."""
+        """Default batch_size is 25."""
         mock_conn = MagicMock()
         mock_conn.__enter__ = MagicMock(return_value=mock_conn)
         mock_conn.__exit__ = MagicMock(return_value=False)
@@ -1190,7 +1422,7 @@ class TestParallelParsing:
 
         batch_call = mock_batch.call_args_list[0]
         # batch_size is the 3rd positional arg (conn, s3, batch_size, ...)
-        assert batch_call[0][2] == 200
+        assert batch_call[0][2] == 25
 
 
 # ---------------------------------------------------------------------------
