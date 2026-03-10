@@ -402,8 +402,16 @@ Key paths:
 - Terraform for all AWS resources. No clicking in the console.
 - Every resource must be in a module.
 - Use variables for anything environment-specific (instance sizes, counts, etc.).
-- Tag all resources with `project=judgemind` and `environment={dev|staging|production}`.
+- **Do NOT add `tags` blocks to individual resources** — the AWS provider's `default_tags` already applies `Project`, `Environment`, and `ManagedBy` to all resources. Adding per-resource tags causes IAM failures (tag keys are case-insensitive, so `environment` and `Environment` collide).
 - Never commit AWS credentials or state files. Use remote state in S3.
+
+### Terraform apply after merge
+
+After a Terraform PR merges to main, the subagent that authored the PR must apply to dev:
+```
+terraform -chdir=$REPO_ROOT/infra/terraform apply -target=module.<module_name> -auto-approve
+```
+Verify the apply succeeds. If it fails, file a `priority/p1` issue. Production applies are human-only.
 
 ### Pre-PR Checklist for Terraform Tasks
 
