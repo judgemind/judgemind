@@ -11,8 +11,10 @@ from __future__ import annotations
 
 import asyncio
 import datetime
+import fcntl
 import json
 import logging
+import os
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -134,6 +136,7 @@ class OrchestratorBridge:
     repo: str = DEFAULT_GITHUB_REPO
     paused: bool = False
     state_file: str | None = None
+    inbox_path: str | None = None
     _workers: dict[int, WorkerInfo] = field(default_factory=dict)
     _pending_commands: list[Command] = field(default_factory=list)
     _poll_task: asyncio.Task[None] | None = field(default=None, repr=False)
@@ -418,6 +421,63 @@ class OrchestratorBridge:
         self._pending_commands.clear()
         return commands
 
+    # ── File-based inbox (for use with tg-poll-daemon.py) ──────────────
+
+    def read_inbox(self) -> list[Command]:
+        """Read and clear all commands from the file-based inbox.
+
+        The background daemon (``scripts/tg-poll-daemon.py``) writes raw SQS
+        messages to *inbox_path* as a JSON array.  This method reads that file,
+        parses each entry into a :class:`Command`, atomically truncates the
+        file, and returns the parsed commands.
+
+        Returns an empty list if *inbox_path* is not set, the file does not
+        exist, or the file is empty.
+
+        File locking (``fcntl.flock``) ensures mutual exclusion with the
+        daemon's append operation.
+        """
+        if not self.inbox_path:
+            return []
+
+        path = Path(self.inbox_path)
+        if not path.exists():
+            return []
+
+        commands: list[Command] = []
+
+        try:
+            fd = os.open(str(path), os.O_RDWR)
+        except OSError:
+            return []
+
+        try:
+            with os.fdopen(fd, "r+") as f:
+                fcntl.flock(f, fcntl.LOCK_EX)
+                content = f.read()
+                if not content.strip():
+                    return []
+
+                try:
+                    entries = json.loads(content)
+                except (json.JSONDecodeError, ValueError):
+                    logger.warning("Corrupt inbox file — clearing it.")
+                    entries = []
+
+                # Truncate the file while we hold the lock.
+                f.seek(0)
+                f.truncate()
+
+            for entry in entries:
+                text = entry.get("text", "") if isinstance(entry, dict) else str(entry)
+                cmd = parse_command(text)
+                commands.append(cmd)
+
+        except Exception:
+            logger.warning("Failed to read inbox file", exc_info=True)
+
+        return commands
+
     async def _poll_loop(self) -> None:
         """Internal loop that polls SQS on a fixed interval."""
         while True:
@@ -438,12 +498,17 @@ def create_orchestrator_bridge(
     region_name: str = "us-west-2",
     repo: str = DEFAULT_GITHUB_REPO,
     state_file: str | None = None,
+    inbox_path: str | None = None,
 ) -> OrchestratorBridge:
     """Factory that creates an :class:`OrchestratorBridge` with a fresh client.
 
     If *state_file* is provided, worker state and the paused flag are persisted
     to that path so that short-lived invocations can share state across process
     boundaries.
+
+    If *inbox_path* is provided, :meth:`OrchestratorBridge.read_inbox` will
+    read commands from that file (written by ``scripts/tg-poll-daemon.py``)
+    instead of polling SQS directly.
 
     The caller can also pass an existing :class:`TelegramBridge` directly
     to the dataclass constructor for testing.
@@ -453,4 +518,6 @@ def create_orchestrator_bridge(
         sqs_queue_url=sqs_queue_url,
         region_name=region_name,
     )
-    return OrchestratorBridge(bridge=bridge, repo=repo, state_file=state_file)
+    return OrchestratorBridge(
+        bridge=bridge, repo=repo, state_file=state_file, inbox_path=inbox_path
+    )

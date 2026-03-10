@@ -705,6 +705,93 @@ class TestBackgroundPolling:
             await orch.stop_polling()
 
 
+# ── File-based inbox (read_inbox) ──────────────────────────────────────
+
+
+class TestReadInbox:
+    def test_returns_empty_when_no_inbox_path(self) -> None:
+        with mock_aws():
+            bridge = _make_bridge()
+            orch = OrchestratorBridge(bridge=bridge)
+            assert orch.read_inbox() == []
+
+    def test_returns_empty_when_file_missing(self, tmp_path: Path) -> None:
+        with mock_aws():
+            bridge = _make_bridge()
+            inbox = str(tmp_path / "nonexistent.json")
+            orch = OrchestratorBridge(bridge=bridge, inbox_path=inbox)
+            assert orch.read_inbox() == []
+
+    def test_returns_empty_when_file_empty(self, tmp_path: Path) -> None:
+        with mock_aws():
+            bridge = _make_bridge()
+            inbox_file = tmp_path / "inbox.json"
+            inbox_file.write_text("")
+            orch = OrchestratorBridge(bridge=bridge, inbox_path=str(inbox_file))
+            assert orch.read_inbox() == []
+
+    def test_reads_and_parses_commands(self, tmp_path: Path) -> None:
+        with mock_aws():
+            bridge = _make_bridge()
+            inbox_file = tmp_path / "inbox.json"
+            inbox_file.write_text(
+                json.dumps(
+                    [
+                        {"text": "status", "user_id": 123},
+                        {"text": "start #42", "user_id": 123},
+                        {"text": "hello world", "user_id": 123},
+                    ]
+                )
+            )
+            orch = OrchestratorBridge(bridge=bridge, inbox_path=str(inbox_file))
+            commands = orch.read_inbox()
+
+            assert len(commands) == 3
+            assert commands[0].kind == CommandKind.STATUS
+            assert commands[1].kind == CommandKind.START
+            assert commands[1].issue_number == 42
+            assert commands[2].kind == CommandKind.FREE_TEXT
+
+    def test_clears_file_after_reading(self, tmp_path: Path) -> None:
+        with mock_aws():
+            bridge = _make_bridge()
+            inbox_file = tmp_path / "inbox.json"
+            inbox_file.write_text(json.dumps([{"text": "status"}]))
+            orch = OrchestratorBridge(bridge=bridge, inbox_path=str(inbox_file))
+
+            commands = orch.read_inbox()
+            assert len(commands) == 1
+
+            # File should be empty now.
+            assert inbox_file.read_text().strip() == ""
+
+            # Second read returns empty.
+            assert orch.read_inbox() == []
+
+    def test_handles_corrupt_file(self, tmp_path: Path) -> None:
+        with mock_aws():
+            bridge = _make_bridge()
+            inbox_file = tmp_path / "inbox.json"
+            inbox_file.write_text("not valid json{{{")
+            orch = OrchestratorBridge(bridge=bridge, inbox_path=str(inbox_file))
+
+            commands = orch.read_inbox()
+            assert commands == []
+            # File should be cleared.
+            assert inbox_file.read_text().strip() == ""
+
+    def test_pause_command_from_inbox(self, tmp_path: Path) -> None:
+        with mock_aws():
+            bridge = _make_bridge()
+            inbox_file = tmp_path / "inbox.json"
+            inbox_file.write_text(json.dumps([{"text": "pause"}]))
+            orch = OrchestratorBridge(bridge=bridge, inbox_path=str(inbox_file))
+
+            commands = orch.read_inbox()
+            assert len(commands) == 1
+            assert commands[0].kind == CommandKind.PAUSE
+
+
 # ── State persistence ──────────────────────────────────────────────────
 
 
