@@ -175,6 +175,7 @@ class TelegramBridge:
             "text": escaped_question,
             "parse_mode": "MarkdownV2",
             "reply_markup": keyboard,
+            "disable_web_page_preview": True,
         }
         if self._debug:
             logger.debug("Telegram ask() request payload: %s", json.dumps(payload))
@@ -279,6 +280,7 @@ class TelegramBridge:
                 "chat_id": chat_id,
                 "text": text,
                 "parse_mode": parse_mode,
+                "disable_web_page_preview": True,
             }
             try:
                 if self._debug:
