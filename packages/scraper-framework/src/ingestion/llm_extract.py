@@ -282,7 +282,9 @@ def _parse_date(raw: str | None) -> date | None:
 # ---------------------------------------------------------------------------
 
 # Hard cap on chunks per document to control cost.
-_MAX_CHUNKS = 5
+# 10 chunks x 80K chars/chunk = ~800K effective coverage (minus overlap),
+# sufficient for the largest LA Superior Court multi-ruling documents.
+_MAX_CHUNKS = 10
 
 # Overlap characters between consecutive chunks for context continuity.
 _CHUNK_OVERLAP = 500
@@ -460,6 +462,7 @@ def extract_fields_llm(
     model: str | None = None,
     max_chars: int = _DEFAULT_MAX_CHARS,
     timeout: float | None = None,
+    max_total_chars: int | None = None,
 ) -> LLMExtractionResult | None:
     """Extract structured fields from a court ruling via a configurable LLM.
 
@@ -471,6 +474,10 @@ def extract_fields_llm(
     automatically split into overlapping chunks, each extracted
     independently, and the results merged.  This is transparent to the
     caller — the return type is always a single ``LLMExtractionResult``.
+
+    Supports documents up to ~800K characters via chunking (10 chunks x 80K
+    chars/chunk).  Callers that want to enforce a hard size limit can pass
+    *max_total_chars*; documents exceeding it are skipped (returns ``None``).
 
     Args:
         document_text: Raw document content (HTML or plain text from PDF).
@@ -490,6 +497,10 @@ def extract_fields_llm(
         timeout: Per-call timeout in seconds for each LLM API call.
             If ``None``, no timeout is applied.  On timeout, the call
             returns ``None`` and the caller falls back to regex extraction.
+        max_total_chars: Optional hard limit on total (preprocessed) text
+            size.  Documents exceeding this are skipped entirely and the
+            function returns ``None``.  Default: ``None`` (no limit —
+            documents of any size are processed via chunking).
 
     Returns:
         An ``LLMExtractionResult`` with extracted fields, or ``None`` if
@@ -503,6 +514,16 @@ def extract_fields_llm(
         text = preprocess_html(document_text)
     else:
         text = document_text
+
+    # Enforce optional hard size limit (after preprocessing, since HTML
+    # stripping can dramatically reduce size — e.g. 618K HTML -> 5K text).
+    if max_total_chars is not None and len(text) > max_total_chars:
+        logger.warning(
+            "llm_extract.text_too_large",
+            total_chars=len(text),
+            max_total_chars=max_total_chars,
+        )
+        return None
 
     # Split into chunks if needed
     chunks = _split_text_into_chunks(text, max_chars, content_format)

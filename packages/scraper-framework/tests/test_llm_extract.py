@@ -1031,7 +1031,7 @@ class TestSplitTextIntoChunks:
         # Create a very long document that would need many chunks
         text = "A" * 500_000
         chunks = _split_text_into_chunks(text, max_chars=3000, content_format="pdf")
-        assert len(chunks) <= 5
+        assert len(chunks) <= 10
 
     def test_overlap_between_chunks(self) -> None:
         # Force-split a wall of text and verify overlap
@@ -1449,3 +1449,158 @@ class TestChunkedExtraction:
         assert mock_fn.call_count == 3
         # At least 2 distinct threads should have been used (concurrency).
         assert len(set(thread_ids)) >= 2
+
+    def test_max_total_chars_skips_oversized_document(self) -> None:
+        """Documents exceeding max_total_chars should return None without calling LLM."""
+        large_text = "X" * 300_000  # 300K chars
+        mock_fn = _mock_call_llm("{}")
+        with patch("ingestion.llm_extract.call_llm", mock_fn):
+            result = extract_fields_llm(
+                document_text=large_text,
+                content_format="pdf",
+                max_total_chars=200_000,
+            )
+        assert result is None
+        # LLM should never have been called
+        assert mock_fn.call_count == 0
+
+    def test_max_total_chars_allows_under_limit(self) -> None:
+        """Documents under max_total_chars should be processed normally."""
+        text = "Some ruling text " * 100  # ~1.7K chars
+        response_json = json.dumps(
+            {
+                "judge_name": "Test Judge",
+                "hearing_date": "2026-03-09",
+                "department": "1",
+                "rulings": [],
+            }
+        )
+        mock_fn = _mock_call_llm(response_json)
+        with patch("ingestion.llm_extract.call_llm", mock_fn):
+            result = extract_fields_llm(
+                document_text=text,
+                content_format="pdf",
+                max_total_chars=200_000,
+            )
+        assert result is not None
+        assert mock_fn.call_count == 1
+
+    def test_max_total_chars_none_allows_any_size(self) -> None:
+        """When max_total_chars is None (default), any size document is processed."""
+        large_text = "X" * 300_000
+        response_json = json.dumps(
+            {
+                "judge_name": "Big Doc Judge",
+                "hearing_date": "2026-03-09",
+                "department": "1",
+                "rulings": [
+                    {
+                        "case_number": "001",
+                        "case_title": "A v. B",
+                        "outcome": "granted",
+                        "motion_type": "msj",
+                        "parties": [],
+                    }
+                ],
+            }
+        )
+        mock_fn = _mock_call_llm(response_json)
+        with patch("ingestion.llm_extract.call_llm", mock_fn):
+            result = extract_fields_llm(
+                document_text=large_text,
+                content_format="pdf",
+                max_chars=80_000,
+                # max_total_chars not set — defaults to None
+            )
+        assert result is not None
+        # Should have chunked and called LLM multiple times
+        assert mock_fn.call_count >= 2
+
+    def test_max_total_chars_applies_after_html_preprocessing(self) -> None:
+        """HTML preprocessing reduces size before max_total_chars check.
+
+        A 300K HTML document might preprocess to <5K of text, which should
+        pass a 200K max_total_chars limit.
+        """
+        # Build a large HTML doc with lots of boilerplate but small content
+        boilerplate = "<style>.rule { color: red; }</style>" * 6000
+        content = '<td><div id="speechSynthesis">Short ruling text</div></td>'
+        html_doc = f"<html><body>{boilerplate}{content}</body></html>"
+        assert len(html_doc) > 200_000  # raw HTML is large
+
+        response_json = json.dumps(
+            {
+                "judge_name": "HTML Judge",
+                "hearing_date": "2026-03-09",
+                "department": "1",
+                "rulings": [],
+            }
+        )
+        mock_fn = _mock_call_llm(response_json)
+        with patch("ingestion.llm_extract.call_llm", mock_fn):
+            result = extract_fields_llm(
+                document_text=html_doc,
+                content_format="html",
+                max_total_chars=200_000,  # limit on preprocessed text
+            )
+        # Preprocessed text is tiny, so it should pass the limit
+        assert result is not None
+        assert mock_fn.call_count == 1
+
+    def test_large_multi_ruling_document_merges_all_chunks(self) -> None:
+        """Simulate a >400K char LA multi-ruling document with 8 chunks.
+
+        Verifies that the increased _MAX_CHUNKS (10) handles documents
+        that previously exceeded the 5-chunk limit.
+        """
+        # Build an 8-page PDF with distinct case numbers per page
+        pages: list[str] = []
+        for i in range(8):
+            page_text = f"Case Number: 24STCV{i:05d}\n"
+            page_text += f"Smith{i} v. Jones{i}\n"
+            page_text += "Ruling text content. " * 3000  # ~60K per page
+            pages.append(page_text)
+        text = "\f".join(pages)
+        assert len(text) > 400_000  # confirms it exceeds old 5-chunk limit
+
+        _lock = threading.Lock()
+        _idx = [0]
+
+        def mock_side_effect(**kwargs: object) -> LLMResponse:
+            with _lock:
+                chunk_idx = _idx[0]
+                _idx[0] += 1
+            # Each chunk returns one unique ruling
+            response = json.dumps(
+                {
+                    "judge_name": "LA Multi Judge",
+                    "hearing_date": "2026-03-09",
+                    "department": "42",
+                    "rulings": [
+                        {
+                            "case_number": f"24STCV{chunk_idx:05d}",
+                            "case_title": f"Smith{chunk_idx} v. Jones{chunk_idx}",
+                            "outcome": "granted",
+                            "motion_type": "msj",
+                            "parties": [],
+                        }
+                    ],
+                }
+            )
+            return LLMResponse(text=response, input_tokens=100, output_tokens=50)
+
+        mock_fn = MagicMock(side_effect=mock_side_effect)
+        with patch("ingestion.llm_extract.call_llm", mock_fn):
+            result = extract_fields_llm(
+                document_text=text,
+                content_format="pdf",
+                max_chars=80_000,
+            )
+        assert result is not None
+        # Should have processed multiple chunks (more than old limit of 5)
+        assert mock_fn.call_count >= 6
+        # Document-level fields from first chunk
+        assert result.judge_name == "LA Multi Judge"
+        assert result.department == "42"
+        # Should have collected rulings from all chunks
+        assert result.case_count >= 6
