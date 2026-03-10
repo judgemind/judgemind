@@ -7,6 +7,10 @@
 # to trigger a user confirmation prompt — not a hard block, but friction that
 # prevents accidental direct edits from orchestrator sessions.
 #
+# Branch resolution: the branch is resolved from the *file's* directory, not
+# the agent's CWD. This prevents false positives when the CWD is on main but
+# the target file lives in a worktree on a feature branch.
+#
 # Exceptions (always allowed, even on main):
 #   - Files under tmp/          (orchestrator temp files)
 #   - Files under ~/.claude/    (memory updates)
@@ -19,8 +23,25 @@ set -uo pipefail
 # Read the JSON input from stdin
 INPUT=$(cat)
 
-# Determine current branch
-BRANCH=$(git symbolic-ref --short HEAD 2>/dev/null || echo "")
+# Extract the file path first — we need it to resolve the correct git branch.
+# The file may live in a worktree whose branch differs from the CWD's branch.
+FILE_PATH=$(echo "$INPUT" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('tool_input',{}).get('file_path',''))" 2>/dev/null)
+
+if [ -z "$FILE_PATH" ]; then
+    # Can't parse file path — let it through to avoid blocking on hook errors
+    exit 0
+fi
+
+# Resolve the git branch from the file's directory, not the CWD.
+# This prevents false positives when the agent's CWD is on main but the
+# target file lives in a worktree on a feature branch.
+FILE_DIR=$(dirname "$FILE_PATH")
+if [ -d "$FILE_DIR" ]; then
+    BRANCH=$(git -C "$FILE_DIR" symbolic-ref --short HEAD 2>/dev/null || echo "")
+else
+    # Directory doesn't exist yet (new file) — fall back to CWD
+    BRANCH=$(git symbolic-ref --short HEAD 2>/dev/null || echo "")
+fi
 
 # If not on main or master, allow everything
 if [[ "$BRANCH" != "main" && "$BRANCH" != "master" ]]; then
@@ -28,12 +49,6 @@ if [[ "$BRANCH" != "main" && "$BRANCH" != "master" ]]; then
 fi
 
 # On main — check the file path for exceptions
-FILE_PATH=$(echo "$INPUT" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('tool_input',{}).get('file_path',''))" 2>/dev/null)
-
-if [ -z "$FILE_PATH" ]; then
-    # Can't parse file path — let it through to avoid blocking on hook errors
-    exit 0
-fi
 
 # Exception: tmp/ directories (anywhere in path)
 if echo "$FILE_PATH" | grep -qE '(^|/)tmp/' ; then
