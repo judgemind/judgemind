@@ -15,6 +15,7 @@ extraction (``extract.py``).
 from __future__ import annotations
 
 import html
+import io
 import json
 import re
 from concurrent.futures import ThreadPoolExecutor
@@ -145,6 +146,68 @@ def preprocess_html(raw_html: str) -> str:
     text = _BLANK_LINES_RE.sub("\n\n", text)
 
     return text.strip()
+
+
+# ---------------------------------------------------------------------------
+# PDF text extraction
+# ---------------------------------------------------------------------------
+
+# PDF magic bytes: all valid PDFs start with "%PDF"
+_PDF_MAGIC = b"%PDF"
+
+
+def is_pdf_binary(content: str | bytes) -> bool:
+    """Return True if *content* appears to be raw PDF binary data.
+
+    Checks for the PDF magic bytes (``%PDF``) at the start of the content.
+    Works with both ``str`` (which may contain mojibake from decoding binary
+    PDF bytes as UTF-8) and ``bytes``.
+    """
+    if isinstance(content, bytes):
+        return content[:4] == _PDF_MAGIC
+    # When raw PDF bytes are decoded as UTF-8/latin-1, the string starts with "%PDF"
+    return content.startswith("%PDF")
+
+
+def extract_text_from_pdf(content: str | bytes) -> str | None:
+    """Extract readable text from PDF binary content using pdfplumber.
+
+    Accepts either raw ``bytes`` or a ``str`` that was produced by decoding
+    raw PDF bytes (common when PDF content is stored as a text field).
+
+    Returns the extracted text, or ``None`` if extraction fails or produces
+    no text.  On failure, logs a warning and returns ``None`` so callers can
+    fall back gracefully.
+    """
+    try:
+        import pdfplumber
+    except ImportError:
+        logger.warning("pdfplumber not installed — cannot extract PDF text")
+        return None
+
+    if isinstance(content, str):
+        # Re-encode to bytes — PDF content decoded as latin-1 round-trips cleanly;
+        # UTF-8 decoded content may have replacement chars but we try anyway.
+        try:
+            raw_bytes = content.encode("latin-1")
+        except UnicodeEncodeError:
+            raw_bytes = content.encode("utf-8", errors="replace")
+    else:
+        raw_bytes = content
+
+    try:
+        pages_text: list[str] = []
+        with pdfplumber.open(io.BytesIO(raw_bytes)) as pdf:
+            for page in pdf.pages:
+                text = page.extract_text()
+                if text:
+                    pages_text.append(text)
+        if pages_text:
+            return "\n\f\n".join(pages_text)
+        return None
+    except Exception:
+        logger.warning("PDF text extraction failed", exc_info=True)
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -498,9 +561,16 @@ def extract_fields_llm(
     if not document_text or not document_text.strip():
         return None
 
-    # Preprocess HTML to strip boilerplate
+    # Preprocess based on content format
     if content_format == "html":
         text = preprocess_html(document_text)
+    elif content_format == "pdf" and is_pdf_binary(document_text):
+        # Raw PDF binary was passed instead of extracted text — extract it now.
+        extracted = extract_text_from_pdf(document_text)
+        if not extracted:
+            logger.warning("llm_extract.pdf_extraction_empty")
+            return None
+        text = extracted
     else:
         text = document_text
 
