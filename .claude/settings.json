@@ -76,6 +76,16 @@
             "timeout": 5
           }
         ]
+      },
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash .claude/hooks/orchestrator-guard.sh",
+            "timeout": 5
+          }
+        ]
       }
     ],
     "SessionStart": [
