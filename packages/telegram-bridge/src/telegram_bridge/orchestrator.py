@@ -16,6 +16,7 @@ from enum import Enum
 from typing import Any
 
 from .client import TelegramBridge
+from .formatting import DEFAULT_GITHUB_REPO
 from .models import Message
 
 logger = logging.getLogger(__name__)
@@ -127,6 +128,7 @@ class OrchestratorBridge:
     """
 
     bridge: TelegramBridge
+    repo: str = DEFAULT_GITHUB_REPO
     paused: bool = False
     _workers: dict[int, WorkerInfo] = field(default_factory=dict)
 
@@ -153,6 +155,7 @@ class OrchestratorBridge:
             task=f"#{issue_number}",
             state="in_progress",
             details=f"Starting: {title} (worker-{worker})",
+            repo=self.repo,
         )
 
     async def task_completed(self, *, issue_number: int, summary: str, worker: int) -> None:
@@ -162,6 +165,7 @@ class OrchestratorBridge:
             task=f"#{issue_number}",
             state="complete",
             details=summary,
+            repo=self.repo,
         )
 
     async def task_failed(self, *, issue_number: int, error: str, worker: int) -> None:
@@ -171,6 +175,7 @@ class OrchestratorBridge:
             task=f"#{issue_number}",
             state="failed",
             details=error,
+            repo=self.repo,
         )
 
     # ── Worker tracking ─────────────────────────────────────────────────
@@ -205,10 +210,10 @@ class OrchestratorBridge:
         """Send a status summary of active workers to Telegram."""
         workers = self.get_workers()
         if not workers:
-            status_text = "No active tasks."
+            status_text = "No active issues."
             if self.paused:
                 status_text += " (paused — not spawning new work)"
-            await self.bridge.notify(status_text)
+            await self.bridge.notify(status_text, repo=self.repo)
             return
 
         lines = []
@@ -219,7 +224,7 @@ class OrchestratorBridge:
         summary = "\n".join(lines)
         if self.paused:
             summary += "\n\n(paused — not spawning new work)"
-        await self.bridge.notify(summary)
+        await self.bridge.notify(summary, repo=self.repo)
 
     async def handle_command(self, cmd: Command) -> dict[str, Any]:
         """Handle a single command and return a result dict.
@@ -238,16 +243,18 @@ class OrchestratorBridge:
 
         elif cmd.kind == CommandKind.PAUSE:
             self.paused = True
-            await self.bridge.notify("Paused. No new tasks will be spawned.")
+            await self.bridge.notify("Paused. No new issues will be spawned.", repo=self.repo)
             result["reply"] = "Paused."
 
         elif cmd.kind == CommandKind.RESUME:
             self.paused = False
-            await self.bridge.notify("Resumed. Will spawn tasks as normal.")
+            await self.bridge.notify("Resumed. Will spawn issues as normal.", repo=self.repo)
             result["reply"] = "Resumed."
 
         elif cmd.kind == CommandKind.START:
-            await self.bridge.notify(f"Acknowledged: will start task #{cmd.issue_number}.")
+            await self.bridge.notify(
+                f"Acknowledged: will start issue #{cmd.issue_number}.", repo=self.repo
+            )
             result["reply"] = f"Starting #{cmd.issue_number}."
             result["action"] = "start_task"
             result["issue_number"] = cmd.issue_number
@@ -255,14 +262,15 @@ class OrchestratorBridge:
         elif cmd.kind == CommandKind.STOP:
             await self.bridge.notify(
                 f"Acknowledged: noted stop request for #{cmd.issue_number}. "
-                "Will not spawn more work for this issue."
+                "Will not spawn more work for this issue.",
+                repo=self.repo,
             )
             result["reply"] = f"Stop noted for #{cmd.issue_number}."
             result["action"] = "stop_task"
             result["issue_number"] = cmd.issue_number
 
         elif cmd.kind == CommandKind.FREE_TEXT:
-            await self.bridge.notify(f"Received: {cmd.raw_text}")
+            await self.bridge.notify(f"Received: {cmd.raw_text}", repo=self.repo)
             result["reply"] = f"Forwarded to orchestrator: {cmd.raw_text}"
             result["action"] = "forward"
             result["text"] = cmd.raw_text
@@ -288,6 +296,7 @@ def create_orchestrator_bridge(
     secret_id: str = "judgemind/telegram/bot",
     sqs_queue_url: str | None = None,
     region_name: str = "us-west-2",
+    repo: str = DEFAULT_GITHUB_REPO,
 ) -> OrchestratorBridge:
     """Factory that creates an :class:`OrchestratorBridge` with a fresh client.
 
@@ -299,4 +308,4 @@ def create_orchestrator_bridge(
         sqs_queue_url=sqs_queue_url,
         region_name=region_name,
     )
-    return OrchestratorBridge(bridge=bridge)
+    return OrchestratorBridge(bridge=bridge, repo=repo)
