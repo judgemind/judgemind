@@ -13,6 +13,11 @@ class TestEscapeMdv2:
         assert escape_mdv2("#heading") == r"\#heading"
         assert escape_mdv2("a.b") == r"a\.b"
 
+    def test_exclamation_mark_not_escaped(self) -> None:
+        """Exclamation marks should not be escaped — they are not MarkdownV2 specials."""
+        assert escape_mdv2("Links working!") == "Links working!"
+        assert escape_mdv2("Done! Next step.") == "Done! Next step\\."
+
     def test_multiple_specials(self) -> None:
         result = escape_mdv2("PR #482 (merged)")
         assert r"\#" in result

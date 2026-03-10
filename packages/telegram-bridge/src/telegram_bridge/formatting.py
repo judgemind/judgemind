@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 
 # Characters that must be escaped in Telegram MarkdownV2 outside of code blocks.
-_ESCAPE_RE = re.compile(r"([_*\[\]()~`>#+\-=|{}.!\\])")
+_ESCAPE_RE = re.compile(r"([_*\[\]()~`>#+\-=|{}.\\])")
 
 # Default GitHub repository for link generation.
 DEFAULT_GITHUB_REPO = "judgemind/judgemind"

@@ -167,6 +167,40 @@ class TestNotify:
             assert "(https://github.com/" in body["text"]
 
     @respx.mock
+    async def test_notify_disables_link_preview(self) -> None:
+        with mock_aws():
+            _setup_secret()
+
+            route = respx.post("https://api.telegram.org/botfake-bot-token/sendMessage").mock(
+                return_value=httpx.Response(200, json={"ok": True})
+            )
+
+            bridge = TelegramBridge(region_name="us-west-2")
+            await bridge.notify("Check PR #42 for details.")
+            await bridge.close()
+
+            body = json.loads(route.calls[0].request.content)
+            assert body["disable_web_page_preview"] is True
+
+    @respx.mock
+    async def test_notify_does_not_escape_exclamation_marks(self) -> None:
+        with mock_aws():
+            _setup_secret()
+
+            route = respx.post("https://api.telegram.org/botfake-bot-token/sendMessage").mock(
+                return_value=httpx.Response(200, json={"ok": True})
+            )
+
+            bridge = TelegramBridge(region_name="us-west-2")
+            await bridge.notify("Links working!")
+            await bridge.close()
+
+            body = json.loads(route.calls[0].request.content)
+            # The exclamation mark should appear unescaped in the sent text
+            assert "\\!" not in body["text"]
+            assert "working!" in body["text"]
+
+    @respx.mock
     async def test_notify_respects_custom_repo(self) -> None:
         with mock_aws():
             _setup_secret()
@@ -187,6 +221,22 @@ class TestNotify:
 
 
 class TestStatusUpdate:
+    @respx.mock
+    async def test_status_update_disables_link_preview(self) -> None:
+        with mock_aws():
+            _setup_secret()
+
+            route = respx.post("https://api.telegram.org/botfake-bot-token/sendMessage").mock(
+                return_value=httpx.Response(200, json={"ok": True})
+            )
+
+            bridge = TelegramBridge(region_name="us-west-2")
+            await bridge.status_update(task="#476", state="complete", details="PR #482 merged.")
+            await bridge.close()
+
+            body = json.loads(route.calls[0].request.content)
+            assert body["disable_web_page_preview"] is True
+
     @respx.mock
     async def test_status_update_sends_formatted_card(self) -> None:
         with mock_aws():
@@ -210,6 +260,35 @@ class TestStatusUpdate:
 
 
 class TestAsk:
+    @respx.mock
+    async def test_ask_disables_link_preview(self) -> None:
+        with mock_aws():
+            _setup_secret()
+            queue_url = _setup_sqs()
+
+            route = respx.post("https://api.telegram.org/botfake-bot-token/sendMessage").mock(
+                return_value=httpx.Response(200, json={"ok": True, "result": {"message_id": 1}})
+            )
+
+            sqs = boto3.client("sqs", region_name="us-west-2")
+            sqs.send_message(
+                QueueUrl=queue_url,
+                MessageBody=json.dumps(
+                    {
+                        "callback_query_message_id": 1,
+                        "callback_data": "Yes",
+                        "user_id": 12345,
+                    }
+                ),
+            )
+
+            bridge = TelegramBridge(region_name="us-west-2", sqs_queue_url=queue_url)
+            await bridge.ask("Continue?", options=["Yes", "No"], timeout=5.0)
+            await bridge.close()
+
+            body = json.loads(route.calls[0].request.content)
+            assert body["disable_web_page_preview"] is True
+
     @respx.mock
     async def test_ask_sends_inline_keyboard(self) -> None:
         with mock_aws():
