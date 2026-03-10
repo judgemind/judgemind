@@ -347,6 +347,7 @@ def _reparse_document(
         "ruling_text": text,
         "case_number": doc_meta.get("case_number"),
         "case_title": doc_meta.get("case_title"),
+        "case_type": doc_meta.get("case_type"),
         "judge_name": None,
         "outcome": None,
         "motion_type": None,
@@ -414,6 +415,7 @@ def _reparse_document(
         "motion_type",
         "case_number",
         "case_title",
+        "case_type",
         "hearing_date",
         "department",
         "parties",
@@ -436,6 +438,7 @@ def _reparse_document(
                 "motion_type",
                 "case_number",
                 "case_title",
+                "case_type",
                 "judge_name",
                 "department",
                 "parties",
@@ -491,6 +494,9 @@ def _reparse_document(
                     if not extracted["motion_type"] and ruling.motion_type:
                         extracted["motion_type"] = ruling.motion_type
                         extraction_methods["motion_type"] = "llm"
+                    if not extracted["case_type"] and ruling.case_type:
+                        extracted["case_type"] = ruling.case_type
+                        extraction_methods["case_type"] = "llm"
                     if not extracted["parties"] and ruling.parties:
                         extracted["parties"] = ruling.parties
                         extraction_methods["parties"] = "llm"
@@ -845,6 +851,7 @@ def reingest_batch(
                     effective_case_number,
                     court_id_str,
                     case_title=extracted["case_title"],
+                    case_type=extracted.get("case_type"),
                 )
 
                 effective_hearing = (

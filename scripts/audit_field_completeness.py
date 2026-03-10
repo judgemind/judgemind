@@ -49,7 +49,8 @@ AUDIT_QUERY = """
         COUNT(CASE WHEN EXISTS (
             SELECT 1 FROM case_parties cp WHERE cp.case_id = c.id
         ) THEN 1 END) AS has_parties,
-        COUNT(d.hearing_date) AS has_hearing_date
+        COUNT(d.hearing_date) AS has_hearing_date,
+        COUNT(c.case_type) AS has_case_type
     FROM documents d
     JOIN courts ct ON ct.id = d.court_id
     LEFT JOIN rulings r ON r.document_id = d.id
@@ -73,7 +74,8 @@ VERBOSE_QUERY = """
         CASE WHEN NOT EXISTS (
             SELECT 1 FROM case_parties cp WHERE cp.case_id = c.id
         ) THEN 'parties' ELSE NULL END AS missing_parties,
-        CASE WHEN d.hearing_date IS NULL THEN 'hearing_date' ELSE NULL END AS missing_hearing_date
+        CASE WHEN d.hearing_date IS NULL THEN 'hearing_date' ELSE NULL END AS missing_hearing_date,
+        CASE WHEN c.case_type IS NULL THEN 'case_type' ELSE NULL END AS missing_case_type
     FROM documents d
     JOIN courts ct ON ct.id = d.court_id
     LEFT JOIN rulings r ON r.document_id = d.id
@@ -124,6 +126,7 @@ def run_audit(
                 has_case_number,
                 has_parties,
                 has_hearing_date,
+                has_case_type,
             ) = row
 
             county_result = {
@@ -169,6 +172,11 @@ def run_audit(
                         "count": has_hearing_date,
                         "total": total,
                         "pct": round(has_hearing_date / total * 100, 1) if total else 0,
+                    },
+                    "case_type": {
+                        "count": has_case_type,
+                        "total": total,
+                        "pct": round(has_case_type / total * 100, 1) if total else 0,
                     },
                 },
             }
@@ -239,6 +247,7 @@ def _print_table(results: list[dict]) -> None:
         "outcome",
         "case_title",
         "case_number",
+        "case_type",
         "parties",
         "hearing_date",
     ]
