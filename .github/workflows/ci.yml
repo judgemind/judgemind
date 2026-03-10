@@ -25,6 +25,7 @@ jobs:
       web: ${{ steps.changes.outputs.web }}
       infra: ${{ steps.changes.outputs.infra }}
       telegram: ${{ steps.changes.outputs.telegram }}
+      infra-lambda: ${{ steps.changes.outputs.infra-lambda }}
     steps:
       - uses: actions/checkout@v4
       - uses: dorny/paths-filter@v3
@@ -43,6 +44,8 @@ jobs:
               - 'infra/**'
             telegram:
               - 'packages/telegram-bridge/**'
+            infra-lambda:
+              - 'infra/telegram-bot/**'
 
   scraper-unit-tests:
     needs: detect-changes
@@ -262,10 +265,43 @@ jobs:
           terraform init -backend=false
           terraform validate
 
+  lambda-tests:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.infra-lambda == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        lambda-dir:
+          - infra/telegram-bot
+    defaults:
+      run:
+        working-directory: ${{ matrix.lambda-dir }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/cache@v4
+        id: venv-cache
+        with:
+          path: ${{ matrix.lambda-dir }}/.venv
+          key: venv-${{ matrix.lambda-dir }}-${{ runner.os }}-py3.12-${{ hashFiles(format('{0}/pyproject.toml', matrix.lambda-dir)) }}
+      - name: Install dependencies
+        if: steps.venv-cache.outputs.cache-hit != 'true'
+        run: |
+          python -m venv .venv
+          .venv/bin/pip install -e ".[dev]"
+      - name: Lint
+        run: .venv/bin/ruff check .
+      - name: Format check
+        run: .venv/bin/ruff format --check .
+      - name: Test
+        run: .venv/bin/pytest tests/ -v --tb=short
+
   # Always runs. Reports success only when every applicable job passed or was
   # skipped (path filter did not match). Branch protection requires this check.
   ci-passed:
-    needs: [scraper-unit-tests, ingestion-tests, nlp-tests, api-tests, web-tests, telegram-bridge-tests, infra-validate]
+    needs: [scraper-unit-tests, ingestion-tests, nlp-tests, api-tests, web-tests, telegram-bridge-tests, infra-validate, lambda-tests]
     if: always()
     runs-on: ubuntu-latest
     steps:
