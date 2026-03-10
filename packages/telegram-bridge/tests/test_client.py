@@ -4,13 +4,15 @@ from __future__ import annotations
 
 import datetime
 import json
+import logging
+import logging.handlers
 
 import boto3
 import httpx
 import respx
 from moto import mock_aws
 
-from telegram_bridge import Message, TelegramBridge
+from telegram_bridge import Message, SentMessage, TelegramBridge
 
 # ── Helpers ──────────────────────────────────────────────────────────────
 
@@ -313,3 +315,300 @@ class TestPoll:
             bridge = TelegramBridge(region_name="us-west-2")
             result = await bridge.poll()
             assert result == []
+
+
+# ── last_sent_messages() / debug inspection ─────────────────────────────
+
+
+class TestDebugInspection:
+    """Tests for the sent message debug/inspection feature."""
+
+    @respx.mock
+    async def test_sent_messages_stored_after_notify(self) -> None:
+        with mock_aws():
+            _setup_secret(user_ids=[111])
+
+            respx.post("https://api.telegram.org/botfake-bot-token/sendMessage").mock(
+                return_value=httpx.Response(
+                    200,
+                    json={
+                        "ok": True,
+                        "result": {
+                            "message_id": 42,
+                            "text": "Hello world.",
+                            "entities": [{"type": "bold", "offset": 0, "length": 5}],
+                        },
+                    },
+                )
+            )
+
+            bridge = TelegramBridge(region_name="us-west-2")
+            await bridge.notify("Hello world.")
+            await bridge.close()
+
+            msgs = bridge.last_sent_messages()
+            assert len(msgs) == 1
+            assert isinstance(msgs[0], SentMessage)
+            assert msgs[0].chat_id == 111
+            assert msgs[0].message_id == 42
+            assert msgs[0].rendered_text == "Hello world."
+            assert msgs[0].entities == [{"type": "bold", "offset": 0, "length": 5}]
+            assert msgs[0].parse_mode == "MarkdownV2"
+
+    @respx.mock
+    async def test_sent_messages_stored_for_multiple_chat_ids(self) -> None:
+        with mock_aws():
+            _setup_secret(user_ids=[111, 222])
+
+            respx.post("https://api.telegram.org/botfake-bot-token/sendMessage").mock(
+                return_value=httpx.Response(
+                    200,
+                    json={
+                        "ok": True,
+                        "result": {"message_id": 99, "text": "hi"},
+                    },
+                )
+            )
+
+            bridge = TelegramBridge(region_name="us-west-2")
+            await bridge.notify("hi")
+            await bridge.close()
+
+            msgs = bridge.last_sent_messages(n=10)
+            assert len(msgs) == 2
+            chat_ids = {m.chat_id for m in msgs}
+            assert chat_ids == {111, 222}
+
+    @respx.mock
+    async def test_last_sent_messages_returns_most_recent_first(self) -> None:
+        with mock_aws():
+            _setup_secret(user_ids=[111])
+
+            call_count = 0
+
+            def _response(request: httpx.Request) -> httpx.Response:
+                nonlocal call_count
+                call_count += 1
+                return httpx.Response(
+                    200,
+                    json={
+                        "ok": True,
+                        "result": {"message_id": call_count, "text": f"msg-{call_count}"},
+                    },
+                )
+
+            respx.post("https://api.telegram.org/botfake-bot-token/sendMessage").mock(
+                side_effect=_response
+            )
+
+            bridge = TelegramBridge(region_name="us-west-2")
+            await bridge.notify("first")
+            await bridge.notify("second")
+            await bridge.notify("third")
+            await bridge.close()
+
+            msgs = bridge.last_sent_messages(n=2)
+            assert len(msgs) == 2
+            # Most recent first
+            assert msgs[0].message_id == 3
+            assert msgs[1].message_id == 2
+
+    @respx.mock
+    async def test_last_sent_messages_default_is_five(self) -> None:
+        with mock_aws():
+            _setup_secret(user_ids=[111])
+
+            call_count = 0
+
+            def _response(request: httpx.Request) -> httpx.Response:
+                nonlocal call_count
+                call_count += 1
+                return httpx.Response(
+                    200,
+                    json={
+                        "ok": True,
+                        "result": {"message_id": call_count, "text": f"msg-{call_count}"},
+                    },
+                )
+
+            respx.post("https://api.telegram.org/botfake-bot-token/sendMessage").mock(
+                side_effect=_response
+            )
+
+            bridge = TelegramBridge(region_name="us-west-2")
+            for _ in range(8):
+                await bridge.notify("msg")
+            await bridge.close()
+
+            msgs = bridge.last_sent_messages()
+            assert len(msgs) == 5
+
+    @respx.mock
+    async def test_buffer_respects_max_size(self) -> None:
+        with mock_aws():
+            _setup_secret(user_ids=[111])
+
+            call_count = 0
+
+            def _response(request: httpx.Request) -> httpx.Response:
+                nonlocal call_count
+                call_count += 1
+                return httpx.Response(
+                    200,
+                    json={
+                        "ok": True,
+                        "result": {"message_id": call_count, "text": f"msg-{call_count}"},
+                    },
+                )
+
+            respx.post("https://api.telegram.org/botfake-bot-token/sendMessage").mock(
+                side_effect=_response
+            )
+
+            bridge = TelegramBridge(region_name="us-west-2", debug_buffer_size=3)
+            for _ in range(5):
+                await bridge.notify("msg")
+            await bridge.close()
+
+            # Buffer size is 3, so only 3 messages retained
+            msgs = bridge.last_sent_messages(n=10)
+            assert len(msgs) == 3
+            # Most recent should have highest message_id
+            assert msgs[0].message_id == 5
+
+    @respx.mock
+    async def test_ask_stores_sent_message(self) -> None:
+        with mock_aws():
+            _setup_secret(user_ids=[111])
+            queue_url = _setup_sqs()
+
+            respx.post("https://api.telegram.org/botfake-bot-token/sendMessage").mock(
+                return_value=httpx.Response(
+                    200,
+                    json={
+                        "ok": True,
+                        "result": {"message_id": 55, "text": "Rebase?"},
+                    },
+                )
+            )
+
+            sqs = boto3.client("sqs", region_name="us-west-2")
+            sqs.send_message(
+                QueueUrl=queue_url,
+                MessageBody=json.dumps(
+                    {
+                        "callback_query_message_id": 55,
+                        "callback_data": "Yes",
+                        "user_id": 111,
+                    }
+                ),
+            )
+
+            bridge = TelegramBridge(region_name="us-west-2", sqs_queue_url=queue_url)
+            await bridge.ask("Rebase?", options=["Yes", "No"], timeout=5.0)
+            await bridge.close()
+
+            msgs = bridge.last_sent_messages()
+            assert len(msgs) == 1
+            assert msgs[0].message_id == 55
+            assert msgs[0].chat_id == 111
+
+    def test_last_sent_messages_empty_when_no_sends(self) -> None:
+        bridge = TelegramBridge(region_name="us-west-2")
+        assert bridge.last_sent_messages() == []
+
+    @respx.mock
+    async def test_raw_response_stored(self) -> None:
+        with mock_aws():
+            _setup_secret(user_ids=[111])
+
+            full_response = {
+                "ok": True,
+                "result": {
+                    "message_id": 10,
+                    "text": "test",
+                    "entities": [],
+                    "date": 1234567890,
+                },
+            }
+
+            respx.post("https://api.telegram.org/botfake-bot-token/sendMessage").mock(
+                return_value=httpx.Response(200, json=full_response)
+            )
+
+            bridge = TelegramBridge(region_name="us-west-2")
+            await bridge.notify("test")
+            await bridge.close()
+
+            msgs = bridge.last_sent_messages()
+            assert msgs[0].raw_response == full_response
+
+    @respx.mock
+    async def test_debug_flag_set_from_env(self) -> None:
+        """When DEBUG_TELEGRAM=1, the bridge sets _debug=True."""
+        import os
+
+        old = os.environ.get("DEBUG_TELEGRAM")
+        os.environ["DEBUG_TELEGRAM"] = "1"
+        try:
+            with mock_aws():
+                _setup_secret(user_ids=[111])
+
+                respx.post("https://api.telegram.org/botfake-bot-token/sendMessage").mock(
+                    return_value=httpx.Response(
+                        200,
+                        json={"ok": True, "result": {"message_id": 1, "text": "hi"}},
+                    )
+                )
+
+                bridge = TelegramBridge(region_name="us-west-2")
+                assert bridge._debug is True
+
+                await bridge.notify("hi")
+                await bridge.close()
+
+                assert len(bridge.last_sent_messages()) == 1
+        finally:
+            if old is None:
+                os.environ.pop("DEBUG_TELEGRAM", None)
+            else:
+                os.environ["DEBUG_TELEGRAM"] = old
+
+    @respx.mock
+    async def test_debug_logging_emits_log_records(self) -> None:
+        """Verify that debug log records are actually emitted when DEBUG_TELEGRAM=1."""
+        import os
+
+        old = os.environ.get("DEBUG_TELEGRAM")
+        os.environ["DEBUG_TELEGRAM"] = "1"
+        try:
+            with mock_aws():
+                _setup_secret(user_ids=[111])
+
+                respx.post("https://api.telegram.org/botfake-bot-token/sendMessage").mock(
+                    return_value=httpx.Response(
+                        200,
+                        json={"ok": True, "result": {"message_id": 1, "text": "hi"}},
+                    )
+                )
+
+                bridge = TelegramBridge(region_name="us-west-2")
+
+                tg_logger = logging.getLogger("telegram_bridge.client")
+                tg_logger.setLevel(logging.DEBUG)
+
+                handler = logging.handlers.MemoryHandler(capacity=100)
+                tg_logger.addHandler(handler)
+                try:
+                    await bridge.notify("hi")
+                    handler.flush()
+                    debug_records = [r for r in handler.buffer if "Telegram" in r.getMessage()]
+                    assert len(debug_records) >= 2  # request + response
+                finally:
+                    tg_logger.removeHandler(handler)
+                    await bridge.close()
+        finally:
+            if old is None:
+                os.environ.pop("DEBUG_TELEGRAM", None)
+            else:
+                os.environ["DEBUG_TELEGRAM"] = old
