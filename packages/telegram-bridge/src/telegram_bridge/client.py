@@ -3,17 +3,19 @@
 from __future__ import annotations
 
 import asyncio
+import collections
 import datetime
 import json
 import logging
+import os
 import threading
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import boto3
 import httpx
 
 from .formatting import DEFAULT_GITHUB_REPO, escape_mdv2, format_status_card, linkify_github_refs
-from .models import Message
+from .models import Message, SentMessage
 
 if TYPE_CHECKING:
     pass
@@ -21,6 +23,9 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _TELEGRAM_API_BASE = "https://api.telegram.org"
+
+# Maximum number of sent messages retained in the debug ring buffer.
+_DEFAULT_DEBUG_BUFFER_SIZE = 50
 
 
 class TelegramBridge:
@@ -31,6 +36,15 @@ class TelegramBridge:
     is empty, all methods silently become no-ops so that the bridge is opt-in.
 
     Thread-safe: multiple agents in the same process can share one instance.
+
+    **Debug / inspection support:**
+
+    Every successful ``sendMessage`` call stores the Telegram API response in an
+    internal ring buffer.  Use :meth:`last_sent_messages` to retrieve recent
+    messages with their rendered text and entities.
+
+    Set the ``DEBUG_TELEGRAM=1`` environment variable to enable verbose logging
+    of raw request and response payloads.
     """
 
     def __init__(
@@ -39,6 +53,7 @@ class TelegramBridge:
         secret_id: str = "judgemind/telegram/bot",
         sqs_queue_url: str | None = None,
         region_name: str = "us-west-2",
+        debug_buffer_size: int = _DEFAULT_DEBUG_BUFFER_SIZE,
     ) -> None:
         self._secret_id = secret_id
         self._sqs_queue_url = sqs_queue_url
@@ -53,6 +68,12 @@ class TelegramBridge:
 
         # Reusable HTTP client for Telegram API calls.
         self._http: httpx.AsyncClient | None = None
+
+        # Debug ring buffer for sent messages.
+        self._sent_messages: collections.deque[SentMessage] = collections.deque(
+            maxlen=debug_buffer_size
+        )
+        self._debug = os.environ.get("DEBUG_TELEGRAM", "") == "1"
 
     # ── Lazy initialisation ──────────────────────────────────────────────
 
@@ -148,21 +169,48 @@ class TelegramBridge:
 
         chat_id = self._chat_ids[0]
         http = await self._get_http()
+        escaped_question = escape_mdv2(question)
+        payload = {
+            "chat_id": chat_id,
+            "text": escaped_question,
+            "parse_mode": "MarkdownV2",
+            "reply_markup": keyboard,
+        }
+        if self._debug:
+            logger.debug("Telegram ask() request payload: %s", json.dumps(payload))
+
         resp = await http.post(
             f"{_TELEGRAM_API_BASE}/bot{self._bot_token}/sendMessage",
-            json={
-                "chat_id": chat_id,
-                "text": escape_mdv2(question),
-                "parse_mode": "MarkdownV2",
-                "reply_markup": keyboard,
-            },
+            json=payload,
         )
         resp.raise_for_status()
-        sent = resp.json()
-        message_id = sent.get("result", {}).get("message_id")
+        resp_data = resp.json()
+        if self._debug:
+            logger.debug("Telegram ask() response: %s", json.dumps(resp_data))
+
+        self._record_sent_message(chat_id, escaped_question, "MarkdownV2", resp_data)
+        message_id = resp_data.get("result", {}).get("message_id")
 
         # Poll SQS for a callback_query response matching this message.
         return await self._poll_for_answer(message_id, options, timeout)
+
+    def last_sent_messages(self, n: int = 5) -> list[SentMessage]:
+        """Return the last *n* sent messages, most recent first.
+
+        Each :class:`SentMessage` includes the rendered text and entities as
+        returned by the Telegram API, allowing the caller to inspect exactly
+        what Telegram displayed.
+
+        Args:
+            n: Number of messages to return (default 5).
+
+        Returns:
+            A list of up to *n* :class:`SentMessage` objects.
+        """
+        # deque is ordered oldest-first; reverse for most-recent-first.
+        items = list(self._sent_messages)
+        items.reverse()
+        return items[:n]
 
     async def poll(self) -> list[Message]:
         """Read and delete all pending inbound messages from SQS.
@@ -227,22 +275,52 @@ class TelegramBridge:
         """Send *text* to every configured chat ID."""
         http = await self._get_http()
         for chat_id in self._chat_ids:
+            payload = {
+                "chat_id": chat_id,
+                "text": text,
+                "parse_mode": parse_mode,
+            }
             try:
+                if self._debug:
+                    logger.debug("Telegram request payload: %s", json.dumps(payload))
+
                 resp = await http.post(
                     f"{_TELEGRAM_API_BASE}/bot{self._bot_token}/sendMessage",
-                    json={
-                        "chat_id": chat_id,
-                        "text": text,
-                        "parse_mode": parse_mode,
-                    },
+                    json=payload,
                 )
                 resp.raise_for_status()
+
+                resp_data = resp.json()
+                if self._debug:
+                    logger.debug("Telegram response: %s", json.dumps(resp_data))
+
+                self._record_sent_message(chat_id, text, parse_mode, resp_data)
             except Exception:
                 logger.warning(
                     "Failed to send Telegram message to chat %s",
                     chat_id,
                     exc_info=True,
                 )
+
+    def _record_sent_message(
+        self,
+        chat_id: int,
+        text: str,
+        parse_mode: str,
+        resp_data: dict[str, Any],
+    ) -> None:
+        """Store a :class:`SentMessage` from a Telegram API response."""
+        result = resp_data.get("result", {})
+        sent = SentMessage(
+            chat_id=chat_id,
+            text=text,
+            parse_mode=parse_mode,
+            message_id=result.get("message_id"),
+            rendered_text=result.get("text"),
+            entities=result.get("entities", []),
+            raw_response=resp_data,
+        )
+        self._sent_messages.append(sent)
 
     async def _poll_for_answer(
         self,
