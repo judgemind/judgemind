@@ -94,6 +94,92 @@ class TestNotify:
             sent_ids = {b["chat_id"] for b in bodies}
             assert sent_ids == {111, 222}
 
+    @respx.mock
+    async def test_notify_uses_markdownv2_parse_mode(self) -> None:
+        with mock_aws():
+            _setup_secret()
+
+            route = respx.post("https://api.telegram.org/botfake-bot-token/sendMessage").mock(
+                return_value=httpx.Response(200, json={"ok": True})
+            )
+
+            bridge = TelegramBridge(region_name="us-west-2")
+            await bridge.notify("Hello world.")
+            await bridge.close()
+
+            body = json.loads(route.calls[0].request.content)
+            assert body["parse_mode"] == "MarkdownV2"
+
+    @respx.mock
+    async def test_notify_linkifies_issue_references(self) -> None:
+        with mock_aws():
+            _setup_secret()
+
+            route = respx.post("https://api.telegram.org/botfake-bot-token/sendMessage").mock(
+                return_value=httpx.Response(200, json={"ok": True})
+            )
+
+            bridge = TelegramBridge(region_name="us-west-2")
+            await bridge.notify("Fixed #42 today.")
+            await bridge.close()
+
+            body = json.loads(route.calls[0].request.content)
+            # Should contain a clickable link for #42
+            assert "[\\#42](https://github.com/judgemind/judgemind/issues/42)" in body["text"]
+            assert body["parse_mode"] == "MarkdownV2"
+
+    @respx.mock
+    async def test_notify_linkifies_pr_references(self) -> None:
+        with mock_aws():
+            _setup_secret()
+
+            route = respx.post("https://api.telegram.org/botfake-bot-token/sendMessage").mock(
+                return_value=httpx.Response(200, json={"ok": True})
+            )
+
+            bridge = TelegramBridge(region_name="us-west-2")
+            await bridge.notify("PR #549 merged successfully.")
+            await bridge.close()
+
+            body = json.loads(route.calls[0].request.content)
+            # Should contain a clickable link for PR #549
+            assert "[PR \\#549](https://github.com/judgemind/judgemind/pull/549)" in body["text"]
+
+    @respx.mock
+    async def test_notify_escapes_special_chars_outside_links(self) -> None:
+        with mock_aws():
+            _setup_secret()
+
+            route = respx.post("https://api.telegram.org/botfake-bot-token/sendMessage").mock(
+                return_value=httpx.Response(200, json={"ok": True})
+            )
+
+            bridge = TelegramBridge(region_name="us-west-2")
+            await bridge.notify("Issue #10 (done).")
+            await bridge.close()
+
+            body = json.loads(route.calls[0].request.content)
+            # Parentheses around "done" should be escaped for MarkdownV2
+            assert "\\(done\\)" in body["text"]
+            # But the link URL parentheses should NOT be escaped
+            assert "(https://github.com/" in body["text"]
+
+    @respx.mock
+    async def test_notify_respects_custom_repo(self) -> None:
+        with mock_aws():
+            _setup_secret()
+
+            route = respx.post("https://api.telegram.org/botfake-bot-token/sendMessage").mock(
+                return_value=httpx.Response(200, json={"ok": True})
+            )
+
+            bridge = TelegramBridge(region_name="us-west-2")
+            await bridge.notify("#99 fixed.", repo="owner/other-repo")
+            await bridge.close()
+
+            body = json.loads(route.calls[0].request.content)
+            assert "https://github.com/owner/other-repo/issues/99" in body["text"]
+
 
 # ── status_update() ─────────────────────────────────────────────────────
 
