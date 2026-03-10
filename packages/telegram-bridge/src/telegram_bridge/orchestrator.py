@@ -9,6 +9,7 @@ All functions are no-ops when Telegram is not configured.
 
 from __future__ import annotations
 
+import asyncio
 import datetime
 import logging
 from dataclasses import dataclass, field
@@ -131,6 +132,9 @@ class OrchestratorBridge:
     repo: str = DEFAULT_GITHUB_REPO
     paused: bool = False
     _workers: dict[int, WorkerInfo] = field(default_factory=dict)
+    _pending_commands: list[Command] = field(default_factory=list)
+    _poll_task: asyncio.Task[None] | None = field(default=None, repr=False)
+    _poll_interval: float = field(default=30.0, repr=False)
 
     # ── Lifecycle notifications ─────────────────────────────────────────
 
@@ -289,6 +293,59 @@ class OrchestratorBridge:
             result = await self.handle_command(cmd)
             results.append(result)
         return results
+
+    # ── Background polling ───────────────────────────────────────────
+
+    async def start_polling(self, interval: float = 30.0) -> None:
+        """Start a background task that polls for commands on *interval* seconds.
+
+        Commands are accumulated in an internal buffer and can be retrieved
+        with :meth:`drain_pending_commands`.  If polling is already active
+        the existing task is cancelled and restarted with the new interval.
+
+        No-op if the underlying bridge is disabled.
+        """
+        await self.stop_polling()
+        self._poll_interval = interval
+        self._poll_task = asyncio.create_task(self._poll_loop())
+
+    async def stop_polling(self) -> None:
+        """Cancel the background polling task if one is running."""
+        if self._poll_task is not None and not self._poll_task.done():
+            self._poll_task.cancel()
+            try:
+                await self._poll_task
+            except asyncio.CancelledError:
+                pass
+        self._poll_task = None
+
+    @property
+    def polling(self) -> bool:
+        """Return ``True`` if background polling is active."""
+        return self._poll_task is not None and not self._poll_task.done()
+
+    def drain_pending_commands(self) -> list[Command]:
+        """Return and clear all commands accumulated by background polling.
+
+        This is the primary way for the orchestrator to consume commands
+        when using :meth:`start_polling`.  The returned list may be empty
+        if no commands have arrived since the last drain.
+        """
+        commands = list(self._pending_commands)
+        self._pending_commands.clear()
+        return commands
+
+    async def _poll_loop(self) -> None:
+        """Internal loop that polls SQS on a fixed interval."""
+        while True:
+            try:
+                commands = await self.poll_commands()
+                self._pending_commands.extend(commands)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.warning("Background poll failed", exc_info=True)
+            await asyncio.sleep(self._poll_interval)
 
 
 def create_orchestrator_bridge(
