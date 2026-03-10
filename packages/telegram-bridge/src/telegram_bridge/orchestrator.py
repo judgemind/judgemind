@@ -190,6 +190,19 @@ class OrchestratorBridge:
         """Return a snapshot of all tracked workers."""
         return list(self._workers.values())
 
+    # ── Reply helpers ───────────────────────────────────────────────────
+
+    async def reply(self, text: str) -> None:
+        """Send a free-form reply back to Telegram.
+
+        Use this after processing a ``FREE_TEXT`` command to send the
+        orchestrator's response back to the user via Telegram, making
+        the channel truly bidirectional.
+
+        No-op if the bridge is disabled.
+        """
+        await self.bridge.notify(text, repo=self.repo)
+
     # ── Inbound command polling ─────────────────────────────────────────
 
     async def poll_commands(self) -> list[Command]:
@@ -274,6 +287,7 @@ class OrchestratorBridge:
             result["reply"] = f"Forwarded to orchestrator: {cmd.raw_text}"
             result["action"] = "forward"
             result["text"] = cmd.raw_text
+            result["needs_reply"] = True
 
         return result
 
