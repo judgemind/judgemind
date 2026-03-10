@@ -1637,7 +1637,7 @@ class TestReparseDocumentLLM:
         raw = b"<html>ruling text with motion is granted</html>"
         client = MagicMock()
         result = reingest._reparse_document(
-            raw, "unknown-scraper", self._doc_meta(), anthropic_client=client
+            raw, "unknown-scraper", self._doc_meta(), llm_client=client
         )
 
         assert result["judge_name"] == "Jane Doe"
@@ -1658,7 +1658,7 @@ class TestReparseDocumentLLM:
         mock_llm: MagicMock,
         mock_registry: MagicMock,
     ) -> None:
-        """LLM extraction is skipped when anthropic_client is None."""
+        """LLM extraction is skipped when llm_client is None."""
         raw = b"<html>ruling text</html>"
         reingest._reparse_document(raw, "unknown-scraper", self._doc_meta())
 
@@ -1692,7 +1692,7 @@ class TestReparseDocumentLLM:
             meta["scraper_id"] = "test-all-filled"
             raw = b"<html>ruling text</html>"
             client = MagicMock()
-            reingest._reparse_document(raw, "test-all-filled", meta, anthropic_client=client)
+            reingest._reparse_document(raw, "test-all-filled", meta, llm_client=client)
             mock_llm.assert_not_called()
         finally:
             reingest._SCRAPER_REGISTRY.pop("test-all-filled", None)
@@ -1710,7 +1710,7 @@ class TestReparseDocumentLLM:
         raw = b"<html>Motion for Summary Judgment is GRANTED. Judge John Smith presiding.</html>"
         client = MagicMock()
         result = reingest._reparse_document(
-            raw, "unknown-scraper", self._doc_meta(), anthropic_client=client
+            raw, "unknown-scraper", self._doc_meta(), llm_client=client
         )
 
         # LLM was called but returned None — regex should have been tried
@@ -1762,7 +1762,7 @@ class TestReparseDocumentLLM:
             meta["scraper_id"] = "test-partial"
             raw = b"<html>ruling text</html>"
             client = MagicMock()
-            result = reingest._reparse_document(raw, "test-partial", meta, anthropic_client=client)
+            result = reingest._reparse_document(raw, "test-partial", meta, llm_client=client)
 
             # Scraper judge should be preserved, LLM should not override
             assert result["judge_name"] == "Scraper Judge"
@@ -1788,21 +1788,21 @@ class TestReparseDocumentLLM:
 
 
 # ---------------------------------------------------------------------------
-# LLM extraction in reingest_batch — anthropic_client passthrough
+# LLM extraction in reingest_batch — llm_client passthrough
 # ---------------------------------------------------------------------------
 
 
 class TestReingestBatchLLM:
-    """Tests that reingest_batch passes anthropic_client through to parsing."""
+    """Tests that reingest_batch passes llm_client through to parsing."""
 
     @patch("reingest_from_s3._reparse_document")
     @patch("reingest_from_s3._fetch_s3_content")
-    def test_anthropic_client_passed_to_reparse(
+    def test_llm_client_passed_to_reparse(
         self,
         mock_fetch_s3: MagicMock,
         mock_reparse: MagicMock,
     ) -> None:
-        """anthropic_client is forwarded from reingest_batch to _reparse_document."""
+        """llm_client is forwarded from reingest_batch to _reparse_document."""
         row = _make_document_row()
         conn = _mock_conn_returning([row])
 
@@ -1829,7 +1829,7 @@ class TestReingestBatchLLM:
             filters="",
             filter_params=[],
             dry_run=True,
-            anthropic_client=mock_client,
+            llm_client=mock_client,
         )
 
         # Verify _reparse_document was called with the anthropic_client
@@ -1838,12 +1838,12 @@ class TestReingestBatchLLM:
 
     @patch("reingest_from_s3._reparse_document")
     @patch("reingest_from_s3._fetch_s3_content")
-    def test_no_anthropic_client_by_default(
+    def test_no_llm_client_by_default(
         self,
         mock_fetch_s3: MagicMock,
         mock_reparse: MagicMock,
     ) -> None:
-        """By default, anthropic_client is None (no LLM extraction)."""
+        """By default, llm_client is None (no LLM extraction)."""
         row = _make_document_row()
         conn = _mock_conn_returning([row])
 
@@ -1903,7 +1903,7 @@ class TestRunReingestLLM:
             reingest.run_reingest("postgresql://test", no_llm=True)
 
         batch_call = mock_batch.call_args_list[0]
-        assert batch_call.kwargs.get("anthropic_client") is None
+        assert batch_call.kwargs.get("llm_client") is None
 
     @patch("reingest_from_s3.boto3")
     @patch("reingest_from_s3.psycopg")
@@ -1914,7 +1914,7 @@ class TestRunReingestLLM:
         mock_psycopg: MagicMock,
         mock_boto3: MagicMock,
     ) -> None:
-        """Without ANTHROPIC_API_KEY, anthropic_client is None."""
+        """Without any LLM API key, llm_client is None."""
         mock_conn = MagicMock()
         mock_conn.__enter__ = MagicMock(return_value=mock_conn)
         mock_conn.__exit__ = MagicMock(return_value=False)
@@ -1922,35 +1922,42 @@ class TestRunReingestLLM:
         mock_batch.return_value = (0, 0, _DEFAULT_CURSOR)
 
         with patch.dict(os.environ, {}, clear=True):
-            # Ensure ANTHROPIC_API_KEY is not set
+            # Ensure no LLM API keys are set
             os.environ.pop("ANTHROPIC_API_KEY", None)
+            os.environ.pop("GOOGLE_API_KEY", None)
             reingest.run_reingest("postgresql://test")
 
         batch_call = mock_batch.call_args_list[0]
-        assert batch_call.kwargs.get("anthropic_client") is None
+        assert batch_call.kwargs.get("llm_client") is None
 
     @patch("reingest_from_s3.boto3")
     @patch("reingest_from_s3.psycopg")
     @patch("reingest_from_s3.reingest_batch")
+    @patch("reingest_from_s3.create_llm_client")
     def test_api_key_creates_client(
         self,
+        mock_create_client: MagicMock,
         mock_batch: MagicMock,
         mock_psycopg: MagicMock,
         mock_boto3: MagicMock,
     ) -> None:
-        """With ANTHROPIC_API_KEY set, an Anthropic client is created and passed."""
+        """When create_llm_client() returns a client, it is passed to reingest_batch."""
         mock_conn = MagicMock()
         mock_conn.__enter__ = MagicMock(return_value=mock_conn)
         mock_conn.__exit__ = MagicMock(return_value=False)
         mock_psycopg.connect.return_value = mock_conn
         mock_batch.return_value = (0, 0, _DEFAULT_CURSOR)
 
-        with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "test-key-123"}):
+        fake_client = MagicMock()
+        mock_create_client.return_value = fake_client
+
+        env = {"LLM_PROVIDER": "anthropic", "ANTHROPIC_API_KEY": "test-key-123"}
+        with patch.dict(os.environ, env):
             reingest.run_reingest("postgresql://test")
 
         batch_call = mock_batch.call_args_list[0]
-        client = batch_call.kwargs.get("anthropic_client")
-        assert client is not None
+        client = batch_call.kwargs.get("llm_client")
+        assert client is fake_client
 
 
 # ---------------------------------------------------------------------------
