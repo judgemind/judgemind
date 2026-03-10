@@ -471,7 +471,7 @@ These patterns avoid permission prompts and allow the agent to run without inter
 ## Session Triggers
 
 - When the user asks to pick up work (e.g. "let's go", "start", "pick up a task"), invoke `/task` as a background subagent. It handles everything autonomously.
-- **Telegram commands** are another inbound channel. When the bridge is configured, call `process_commands()` periodically to poll for Telegram messages. A `start #N` command is equivalent to the user typing `/task #N`. See the "Telegram Integration" subsection below.
+- **Telegram commands** are another inbound channel. When the bridge is configured, call `start_polling()` to auto-poll for Telegram messages in the background, then call `drain_pending_commands()` between tasks to retrieve accumulated commands. A `start #N` command is equivalent to the user typing `/task #N`. See the "Telegram Integration" subsection below.
 - If the user asks to explore, investigate, or prototype — do it in `tmp/` and file issues for any real work identified.
 - Remember: the interactive shell orchestrates. It does not implement.
 
@@ -481,7 +481,7 @@ When Telegram is configured (bot token in Secrets Manager `judgemind/telegram/bo
 
 **Lifecycle notifications:** call `session_started()` when an interactive session begins, `task_started()` / `task_completed()` / `task_failed()` around `/task` agent invocations, and `session_ended()` when shutting down.
 
-**Inbound commands:** call `process_commands()` periodically (between batch launches, when idle, etc.) to poll the SQS queue. Supported commands:
+**Inbound commands:** call `await bridge.start_polling(interval=30)` once at session start to begin automatic background polling. Retrieve accumulated commands with `bridge.drain_pending_commands()` between tasks. The manual `process_commands()` method is still available for one-shot polling. Supported commands:
 
 - `status` — replies with a summary of running tasks
 - `start #N` — returns an action dict; orchestrator should spawn `/task #N`
