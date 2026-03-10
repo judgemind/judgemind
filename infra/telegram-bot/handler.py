@@ -101,7 +101,7 @@ def _handle_message(update: dict[str, Any]) -> None:
         logger.info("Rejected message from unauthorized user %d", user_id)
         return
 
-    text = message.get("text", "")
+    text = message.get("text") or message.get("caption", "")
     _enqueue_message(
         chat_id=chat_id,
         user_id=user_id,

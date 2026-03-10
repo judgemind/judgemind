@@ -112,8 +112,54 @@ class TestValidMessage:
         assert attrs["user_id"]["StringValue"] == str(ALLOWED_USER_ID)
         assert attrs["message_type"]["StringValue"] == "text"
 
-    def test_message_without_text(self, aws_env: dict[str, str]) -> None:
-        """A message with no text field (e.g. photo) should enqueue with empty text."""
+    def test_photo_with_caption(self, aws_env: dict[str, str]) -> None:
+        """A photo message with a caption should enqueue the caption as text."""
+        import handler
+
+        update = {
+            "update_id": 2,
+            "message": {
+                "message_id": 43,
+                "from": {"id": ALLOWED_USER_ID, "first_name": "Test"},
+                "chat": {"id": CHAT_ID, "type": "private"},
+                "photo": [{"file_id": "abc", "width": 100, "height": 100}],
+                "caption": "start #99",
+            },
+        }
+        result = handler.handler(_make_event(update), None)
+        assert result["statusCode"] == 200
+
+        messages = _get_sqs_messages(aws_env["queue_url"])
+        assert len(messages) == 1
+        body = json.loads(messages[0]["Body"])
+        assert body["text"] == "start #99"
+        assert body["chat_id"] == CHAT_ID
+        assert body["user_id"] == ALLOWED_USER_ID
+
+    def test_text_takes_precedence_over_caption(self, aws_env: dict[str, str]) -> None:
+        """When both text and caption exist, text should be used."""
+        import handler
+
+        update = {
+            "update_id": 2,
+            "message": {
+                "message_id": 43,
+                "from": {"id": ALLOWED_USER_ID, "first_name": "Test"},
+                "chat": {"id": CHAT_ID, "type": "private"},
+                "text": "/status",
+                "caption": "this should be ignored",
+            },
+        }
+        result = handler.handler(_make_event(update), None)
+        assert result["statusCode"] == 200
+
+        messages = _get_sqs_messages(aws_env["queue_url"])
+        assert len(messages) == 1
+        body = json.loads(messages[0]["Body"])
+        assert body["text"] == "/status"
+
+    def test_message_without_text_or_caption(self, aws_env: dict[str, str]) -> None:
+        """A message with neither text nor caption should enqueue with empty text."""
         import handler
 
         update = {
