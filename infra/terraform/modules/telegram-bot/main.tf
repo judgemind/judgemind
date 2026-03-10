@@ -15,10 +15,6 @@ resource "aws_secretsmanager_secret" "telegram_bot" {
   name        = "judgemind/telegram/bot"
   description = "Telegram bot token and allowed user IDs"
 
-  tags = {
-    project     = "judgemind"
-    environment = var.environment
-  }
 }
 
 resource "aws_secretsmanager_secret_version" "telegram_bot" {
@@ -43,10 +39,6 @@ resource "aws_sqs_queue" "telegram_inbound" {
   message_retention_seconds  = var.sqs_message_retention_seconds
   visibility_timeout_seconds = var.sqs_visibility_timeout_seconds
 
-  tags = {
-    project     = "judgemind"
-    environment = var.environment
-  }
 }
 
 # ─── IAM Role for Lambda ─────────────────────────────────────────────────────
@@ -67,10 +59,6 @@ resource "aws_iam_role" "telegram_webhook_lambda" {
     ]
   })
 
-  tags = {
-    project     = "judgemind"
-    environment = var.environment
-  }
 }
 
 # Allow Lambda to write CloudWatch logs.
@@ -119,10 +107,6 @@ resource "aws_cloudwatch_log_group" "telegram_webhook" {
   name              = "/aws/lambda/judgemind-telegram-webhook-${var.environment}"
   retention_in_days = var.log_retention_days
 
-  tags = {
-    project     = "judgemind"
-    environment = var.environment
-  }
 }
 
 # ─── Lambda Function ─────────────────────────────────────────────────────────
@@ -170,10 +154,6 @@ resource "aws_lambda_function" "telegram_webhook" {
     ignore_changes = [filename, source_code_hash]
   }
 
-  tags = {
-    project     = "judgemind"
-    environment = var.environment
-  }
 }
 
 # ─── API Gateway (HTTP API v2) ────────────────────────────────────────────────
@@ -182,10 +162,6 @@ resource "aws_apigatewayv2_api" "telegram_webhook" {
   name          = "judgemind-telegram-webhook-${var.environment}"
   protocol_type = "HTTP"
 
-  tags = {
-    project     = "judgemind"
-    environment = var.environment
-  }
 }
 
 resource "aws_apigatewayv2_stage" "default" {
@@ -193,10 +169,6 @@ resource "aws_apigatewayv2_stage" "default" {
   name        = "$default"
   auto_deploy = true
 
-  tags = {
-    project     = "judgemind"
-    environment = var.environment
-  }
 }
 
 resource "aws_apigatewayv2_integration" "lambda" {
