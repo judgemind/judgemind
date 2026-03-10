@@ -153,3 +153,8 @@ module "vercel_web" {
   custom_domain = "dev.judgemind.org"
   graphql_url   = "https://dev.api.judgemind.org/graphql"
 }
+
+module "telegram_bot" {
+  source      = "./modules/telegram-bot"
+  environment = var.environment
+}
