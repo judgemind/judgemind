@@ -7,7 +7,12 @@ API shape).
 
 from __future__ import annotations
 
+import importlib.metadata
 from unittest.mock import MagicMock, patch
+
+import anthropic
+import pytest
+from google import genai
 
 from ingestion.llm_providers import (
     LLMResponse,
@@ -501,3 +506,93 @@ class TestGoogleDefensiveCheck:
         )
 
         assert result is None
+
+
+# ---------------------------------------------------------------------------
+# SDK namespace conflict detection (CI integration tests)
+# ---------------------------------------------------------------------------
+
+
+class TestSdkNamespaceConflict:
+    """Detect conflicting Google GenAI SDK packages.
+
+    The ``google-generativeai`` package installs into the same ``google``
+    namespace as ``google-genai`` and shadows its modules.  If both are
+    installed, our adapter silently breaks at runtime.  These tests catch
+    the conflict in CI before it reaches production.
+    """
+
+    def test_google_generativeai_not_installed(self) -> None:
+        """google-generativeai must NOT be installed alongside google-genai.
+
+        The two packages share the ``google`` namespace and conflict at
+        runtime.  Our adapter requires ``google-genai`` only.
+        """
+        with pytest.raises(importlib.metadata.PackageNotFoundError):
+            importlib.metadata.version("google-generativeai")
+
+    def test_google_genai_is_installed(self) -> None:
+        """google-genai must be installed (it's our required SDK)."""
+        version = importlib.metadata.version("google-genai")
+        assert version, "google-genai is installed but has no version string"
+
+
+# ---------------------------------------------------------------------------
+# create_client type verification (real SDK, fake keys, no API calls)
+# ---------------------------------------------------------------------------
+
+
+class TestCreateClientTypes:
+    """Verify create_client() returns the correct SDK client types.
+
+    These tests use real SDK classes with fake API keys — no network calls
+    are made.  They ensure the adapter layer returns objects whose types
+    match what our code expects, catching version mismatches or incorrect
+    imports.
+    """
+
+    def test_google_client_type(self) -> None:
+        """create_client('google') returns a google.genai.Client instance."""
+        with patch.dict("os.environ", {"GOOGLE_API_KEY": "fake-key-for-test"}):
+            client = create_client(provider="google")
+
+        assert client is not None
+        assert isinstance(client, genai.Client)
+
+    def test_google_client_has_models_attr(self) -> None:
+        """Google client must have a ``models`` attribute with generate_content."""
+        with patch.dict("os.environ", {"GOOGLE_API_KEY": "fake-key-for-test"}):
+            client = create_client(provider="google")
+
+        assert client is not None
+        assert hasattr(client, "models")
+        assert hasattr(client.models, "generate_content")
+        assert callable(client.models.generate_content)
+
+    def test_anthropic_client_type(self) -> None:
+        """create_client('anthropic') returns an anthropic.Anthropic instance."""
+        with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "fake-key-for-test"}):
+            client = create_client(provider="anthropic")
+
+        assert client is not None
+        assert isinstance(client, anthropic.Anthropic)
+
+    def test_anthropic_client_has_messages_attr(self) -> None:
+        """Anthropic client must have a ``messages`` attribute with create."""
+        with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "fake-key-for-test"}):
+            client = create_client(provider="anthropic")
+
+        assert client is not None
+        assert hasattr(client, "messages")
+        assert hasattr(client.messages, "create")
+        assert callable(client.messages.create)
+
+    def test_missing_key_returns_none(self) -> None:
+        """create_client returns None when API key is missing."""
+        with patch.dict("os.environ", {}, clear=True):
+            assert create_client(provider="google") is None
+            assert create_client(provider="anthropic") is None
+
+    def test_unknown_provider_returns_none(self) -> None:
+        """create_client returns None for an unsupported provider name."""
+        assert create_client(provider="openai") is None
