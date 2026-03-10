@@ -640,6 +640,56 @@ class TestExtractFieldsLlm:
         assert call_kwargs["provider"] == "google"
         assert call_kwargs["model"] == "gemini-2.5-flash-lite"
 
+    def test_timeout_forwarded_to_call_llm(self) -> None:
+        """The timeout parameter is forwarded to call_llm."""
+        response_json = json.dumps(
+            {
+                "judge_name": "Test",
+                "hearing_date": None,
+                "department": None,
+                "rulings": [],
+            }
+        )
+        mock_fn = _mock_call_llm(response_json)
+        with patch("ingestion.llm_extract.call_llm", mock_fn):
+            extract_fields_llm(
+                document_text="Some text",
+                content_format="pdf",
+                timeout=42.0,
+            )
+        call_kwargs = mock_fn.call_args.kwargs
+        assert call_kwargs["timeout"] == 42.0
+
+    def test_timeout_none_by_default(self) -> None:
+        """When timeout is not specified, None is forwarded."""
+        response_json = json.dumps(
+            {
+                "judge_name": "Test",
+                "hearing_date": None,
+                "department": None,
+                "rulings": [],
+            }
+        )
+        mock_fn = _mock_call_llm(response_json)
+        with patch("ingestion.llm_extract.call_llm", mock_fn):
+            extract_fields_llm(
+                document_text="Some text",
+                content_format="pdf",
+            )
+        call_kwargs = mock_fn.call_args.kwargs
+        assert call_kwargs["timeout"] is None
+
+    def test_timeout_triggers_fallback_to_none(self) -> None:
+        """When call_llm returns None (e.g. timeout), extract_fields_llm returns None."""
+        mock_fn = MagicMock(return_value=None)
+        with patch("ingestion.llm_extract.call_llm", mock_fn):
+            result = extract_fields_llm(
+                document_text="Some text about a ruling",
+                content_format="pdf",
+                timeout=10.0,
+            )
+        assert result is None
+
 
 # ---------------------------------------------------------------------------
 # Real fixture tests (mocked API, real HTML preprocessing)
