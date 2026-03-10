@@ -46,6 +46,23 @@ OUTCOME_VALUES = frozenset(
 )
 
 # ---------------------------------------------------------------------------
+# Case type taxonomy — matches the ``cases.case_type`` TEXT column
+# ---------------------------------------------------------------------------
+
+CASE_TYPE_VALUES = frozenset(
+    {
+        "civil",
+        "criminal",
+        "family",
+        "probate",
+        "small_claims",
+        "juvenile",
+        "traffic",
+        "other",
+    }
+)
+
+# ---------------------------------------------------------------------------
 # Result dataclasses
 # ---------------------------------------------------------------------------
 
@@ -56,6 +73,7 @@ class LLMRulingResult:
 
     case_number: str | None = None
     case_title: str | None = None
+    case_type: str | None = None  # Uses CASE_TYPE_VALUES
     outcome: str | None = None  # Uses ruling_outcome enum values
     motion_type: str | None = None
     parties: list[dict[str, str]] = field(default_factory=list)
@@ -162,7 +180,29 @@ _SYSTEM_PROMPT = (  # noqa: E501 — prompt text sent to LLM, line length irrele
     "from case captions. Each party is "
     '{"name": "...", "role": "plaintiff"} or '
     '{"name": "...", "role": "defendant"}.\n\n'
-    "5. **Motion type:** Use a short descriptive label. "
+    "5. **Case type:** Classify the case using EXACTLY one "
+    "of these values:\n"
+    "   - civil (general civil litigation, torts, contracts, "
+    "employment, PI — includes 'unlimited civil' and "
+    "'limited civil')\n"
+    "   - criminal\n"
+    "   - family (divorce, custody, domestic violence)\n"
+    "   - probate (wills, estates, conservatorships, "
+    "guardianships)\n"
+    "   - small_claims\n"
+    "   - juvenile\n"
+    "   - traffic\n"
+    "   - other (only if none of the above fit)\n\n"
+    "   Inference hints: case numbers starting with SC or "
+    "containing 'SC' often indicate small claims; "
+    "'CV', 'CIV', 'STCV' indicate civil; "
+    "'CR', 'F' indicate criminal; "
+    "'FL', 'DV' indicate family; "
+    "'PR', 'BP' indicate probate. "
+    "Motion types like 'demurrer', 'msj', 'anti_slapp' "
+    "are civil. "
+    "If the case type cannot be determined, use null.\n\n"
+    "6. **Motion type:** Use a short descriptive label. "
     "Common values: "
     '"msj" (summary judgment), '
     '"msj_partial" (summary adjudication), '
@@ -178,11 +218,11 @@ _SYSTEM_PROMPT = (  # noqa: E501 — prompt text sent to LLM, line length irrele
     '"motion_for_leave_to_amend", '
     '"motion_for_sanctions", '
     '"osc" (order to show cause), "other".\n\n'
-    "6. **Hearing date:** Return as ISO format "
+    "7. **Hearing date:** Return as ISO format "
     '"YYYY-MM-DD".\n\n'
-    "7. **Judge name:** Extract the judge's full name. "
+    "8. **Judge name:** Extract the judge's full name. "
     'Do not include titles like "Hon." or "Judge".\n\n'
-    "8. If metadata is provided (judge_name, department), "
+    "9. If metadata is provided (judge_name, department), "
     "treat it as authoritative — use it directly rather "
     "than extracting from the document.\n\n"
     "## Output format\n\n"
@@ -195,6 +235,7 @@ _SYSTEM_PROMPT = (  # noqa: E501 — prompt text sent to LLM, line length irrele
     "    {\n"
     '      "case_number": "24NNCV02551" or null,\n'
     '      "case_title": "Smith v. Jones" or null,\n'
+    '      "case_type": "civil" or null,\n'
     '      "outcome": "granted" or null,\n'
     '      "motion_type": "msj" or null,\n'
     '      "parties": [\n'
@@ -588,6 +629,11 @@ def _parse_response(
         if case_number:
             case_number = _normalize_case_number(str(case_number))
 
+        # Validate case_type against enum
+        case_type = r.get("case_type")
+        if case_type and case_type not in CASE_TYPE_VALUES:
+            case_type = "other"
+
         # Validate outcome against enum
         outcome = r.get("outcome")
         if outcome and outcome not in OUTCOME_VALUES:
@@ -615,6 +661,7 @@ def _parse_response(
             LLMRulingResult(
                 case_number=case_number,
                 case_title=r.get("case_title"),
+                case_type=case_type,
                 outcome=outcome,
                 motion_type=r.get("motion_type"),
                 parties=parties,

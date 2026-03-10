@@ -14,6 +14,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from ingestion.llm_extract import (
+    CASE_TYPE_VALUES,
     LLMExtractionResult,
     LLMRulingResult,
     _merge_results,
@@ -435,6 +436,121 @@ class TestParseResponse:
         assert result is not None
         assert len(result.rulings[0].parties) == 0
 
+    def test_case_type_extracted(self) -> None:
+        """Valid case_type values are extracted and preserved."""
+        response_json = json.dumps(
+            {
+                "judge_name": None,
+                "hearing_date": None,
+                "department": None,
+                "rulings": [
+                    {
+                        "case_number": "24STCV12345",
+                        "case_title": "Smith v. Jones",
+                        "case_type": "civil",
+                        "outcome": "granted",
+                        "motion_type": "msj",
+                        "parties": [],
+                    }
+                ],
+            }
+        )
+        result = _parse_response(response_json, None)
+        assert result is not None
+        assert result.rulings[0].case_type == "civil"
+
+    def test_case_type_all_valid_values(self) -> None:
+        """All defined CASE_TYPE_VALUES are accepted without normalization."""
+        for case_type in CASE_TYPE_VALUES:
+            response_json = json.dumps(
+                {
+                    "judge_name": None,
+                    "hearing_date": None,
+                    "department": None,
+                    "rulings": [
+                        {
+                            "case_number": "001",
+                            "case_title": "A v. B",
+                            "case_type": case_type,
+                            "outcome": None,
+                            "motion_type": None,
+                            "parties": [],
+                        }
+                    ],
+                }
+            )
+            result = _parse_response(response_json, None)
+            assert result is not None
+            assert result.rulings[0].case_type == case_type
+
+    def test_case_type_invalid_normalized_to_other(self) -> None:
+        """Invalid case_type values are normalized to 'other'."""
+        response_json = json.dumps(
+            {
+                "judge_name": None,
+                "hearing_date": None,
+                "department": None,
+                "rulings": [
+                    {
+                        "case_number": "001",
+                        "case_title": "A v. B",
+                        "case_type": "administrative",  # not in enum
+                        "outcome": None,
+                        "motion_type": None,
+                        "parties": [],
+                    }
+                ],
+            }
+        )
+        result = _parse_response(response_json, None)
+        assert result is not None
+        assert result.rulings[0].case_type == "other"
+
+    def test_case_type_null_preserved(self) -> None:
+        """Null case_type is preserved as None."""
+        response_json = json.dumps(
+            {
+                "judge_name": None,
+                "hearing_date": None,
+                "department": None,
+                "rulings": [
+                    {
+                        "case_number": "001",
+                        "case_title": "A v. B",
+                        "case_type": None,
+                        "outcome": None,
+                        "motion_type": None,
+                        "parties": [],
+                    }
+                ],
+            }
+        )
+        result = _parse_response(response_json, None)
+        assert result is not None
+        assert result.rulings[0].case_type is None
+
+    def test_case_type_missing_field_defaults_to_none(self) -> None:
+        """When case_type is not in the response, it defaults to None."""
+        response_json = json.dumps(
+            {
+                "judge_name": None,
+                "hearing_date": None,
+                "department": None,
+                "rulings": [
+                    {
+                        "case_number": "001",
+                        "case_title": "A v. B",
+                        "outcome": None,
+                        "motion_type": None,
+                        "parties": [],
+                    }
+                ],
+            }
+        )
+        result = _parse_response(response_json, None)
+        assert result is not None
+        assert result.rulings[0].case_type is None
+
     def test_valid_party_names_preserved(self) -> None:
         """Normal-length party names without newlines pass validation."""
         response_json = json.dumps(
@@ -564,6 +680,37 @@ class TestExtractFieldsLlm:
         call_args = mock_fn.call_args
         user_msg = call_args.kwargs["user_message"]
         assert "Judge name (authoritative): Auth Judge" in user_msg
+
+    def test_case_type_in_system_prompt(self) -> None:
+        """The system prompt should instruct the LLM about case_type extraction."""
+        response_json = json.dumps(
+            {
+                "judge_name": None,
+                "hearing_date": None,
+                "department": None,
+                "rulings": [
+                    {
+                        "case_number": "24STCV12345",
+                        "case_title": "Smith v. Jones",
+                        "case_type": "civil",
+                        "outcome": "granted",
+                        "motion_type": "msj",
+                        "parties": [],
+                    }
+                ],
+            }
+        )
+        mock_fn = _mock_call_llm(response_json)
+        with patch("ingestion.llm_extract.call_llm", mock_fn):
+            extract_fields_llm(
+                document_text="Some ruling text",
+                content_format="pdf",
+            )
+        call_kwargs = mock_fn.call_args.kwargs
+        system_prompt = call_kwargs["system_prompt"]
+        assert "case_type" in system_prompt
+        assert "civil" in system_prompt
+        assert "small_claims" in system_prompt
 
     def test_empty_text_returns_none(self) -> None:
         result = extract_fields_llm(
