@@ -487,7 +487,7 @@ When Telegram is configured (bot token in Secrets Manager `judgemind/telegram/bo
 - `start #N` — returns an action dict; orchestrator should spawn `/task #N`
 - `stop #N` — acknowledges; orchestrator should avoid spawning more work for that issue
 - `pause` / `resume` — toggles whether the orchestrator spawns new task agents
-- Free text — forwarded for orchestrator interpretation
+- Free text — forwarded for orchestrator interpretation. **The orchestrator must reply via Telegram** by calling `bridge.reply("your response text")` after processing the message. Check `result["needs_reply"]` on the result dict returned by `process_commands()` / `handle_command()` — when `True`, the user is waiting for a response in Telegram.
 
 If Telegram is not configured, all bridge calls are silent no-ops. No existing workflows are affected.
 

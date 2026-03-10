@@ -372,6 +372,84 @@ class TestHandleCommand:
             assert result["action"] == "forward"
             assert result["text"] == "check the scrapers"
 
+    @respx.mock
+    async def test_handle_free_text_sets_needs_reply(self) -> None:
+        with mock_aws():
+            _setup_secret()
+            respx.post("https://api.telegram.org/botfake-bot-token/sendMessage").mock(
+                return_value=httpx.Response(200, json={"ok": True})
+            )
+
+            bridge = _make_bridge()
+            orch = OrchestratorBridge(bridge=bridge)
+            result = await orch.handle_command(
+                Command(kind=CommandKind.FREE_TEXT, raw_text="how are scrapers doing?")
+            )
+            await bridge.close()
+
+            assert result["needs_reply"] is True
+
+    @respx.mock
+    async def test_handle_non_free_text_has_no_needs_reply(self) -> None:
+        with mock_aws():
+            _setup_secret()
+            respx.post("https://api.telegram.org/botfake-bot-token/sendMessage").mock(
+                return_value=httpx.Response(200, json={"ok": True})
+            )
+
+            bridge = _make_bridge()
+            orch = OrchestratorBridge(bridge=bridge)
+            result = await orch.handle_command(Command(kind=CommandKind.STATUS))
+            await bridge.close()
+
+            assert "needs_reply" not in result
+
+
+# ── reply() ─────────────────────────────────────────────────────────
+
+
+class TestReply:
+    @respx.mock
+    async def test_reply_sends_text_via_telegram(self) -> None:
+        with mock_aws():
+            _setup_secret()
+            route = respx.post("https://api.telegram.org/botfake-bot-token/sendMessage").mock(
+                return_value=httpx.Response(200, json={"ok": True})
+            )
+
+            bridge = _make_bridge()
+            orch = OrchestratorBridge(bridge=bridge)
+            await orch.reply("All scrapers are healthy.")
+            await bridge.close()
+
+            assert route.call_count == 1
+            body = json.loads(route.calls[0].request.content)
+            assert "scrapers are healthy" in body["text"].lower()
+
+    async def test_reply_noop_when_disabled(self) -> None:
+        with mock_aws():
+            # No secret → bridge disabled
+            bridge = _make_bridge()
+            orch = OrchestratorBridge(bridge=bridge)
+            # Should not raise
+            await orch.reply("This should be silently dropped.")
+
+    @respx.mock
+    async def test_reply_linkifies_github_refs(self) -> None:
+        with mock_aws():
+            _setup_secret()
+            route = respx.post("https://api.telegram.org/botfake-bot-token/sendMessage").mock(
+                return_value=httpx.Response(200, json={"ok": True})
+            )
+
+            bridge = _make_bridge()
+            orch = OrchestratorBridge(bridge=bridge)
+            await orch.reply("See #42 for details.")
+            await bridge.close()
+
+            body = json.loads(route.calls[0].request.content)
+            assert "https://github.com/judgemind/judgemind/issues/42" in body["text"]
+
 
 # ── reply_status() ──────────────────────────────────────────────────────
 
