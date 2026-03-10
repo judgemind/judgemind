@@ -27,8 +27,14 @@ WORKDIR /app
 COPY pyproject.toml ./
 COPY src/ ./src/
 RUN pip install --no-cache-dir . \
-    && pip install --no-cache-dir playwright \
+    && pip uninstall -y google-generativeai 2>/dev/null || true
+RUN pip install --no-cache-dir playwright \
     && playwright install chromium --with-deps
+
+# Fail the build if the conflicting old Google AI SDK crept back in.
+# google-generativeai and google-genai share the google.genai namespace;
+# having both installed breaks client.models.generate_content().
+RUN ! pip show google-generativeai >/dev/null 2>&1
 
 # Own everything by the non-root user
 RUN chown -R scraper:scraper /app
