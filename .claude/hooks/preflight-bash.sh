@@ -82,11 +82,18 @@ if echo "$COMMAND" | grep -qE '&&|;' ; then
     fi
 fi
 
-# 6. Consecutive quote characters at word start (potential obfuscation)
-#    Catches patterns like ""word, ''word, "'word, '"word at word boundaries.
-#    These serve no legitimate purpose and may be attempts to bypass other checks.
-if echo "$COMMAND" | grep -qE '(^|[[:space:]])(["'"'"']){2,}[a-zA-Z]' ; then
-    echo "BLOCKED: Command contains consecutive quote characters at word start (potential obfuscation). See CLAUDE.md §Unattended Operation Patterns." >&2
+# 6. Consecutive quote characters (triggers CLI "potential obfuscation" rejection)
+#    Catches patterns like:
+#      - '' or "" anywhere in the command (e.g. != '' in SQL, empty string args)
+#      - ""word, ''word (consecutive quotes followed by text)
+#    The Claude CLI rejects these with an opaque error. Agents should use
+#    IS NOT NULL instead of != '', or write queries/scripts to a file.
+if echo "$COMMAND" | grep -qE "''" ; then
+    echo "BLOCKED: Command contains consecutive single quotes ('') which triggers a CLI rejection. Use IS NOT NULL instead of != '' in SQL, or write the query/script to a file. See CLAUDE.md §Unattended Operation Patterns." >&2
+    exit 2
+fi
+if echo "$COMMAND" | grep -qE '""' ; then
+    echo "BLOCKED: Command contains consecutive double quotes (\"\") which triggers a CLI rejection. Write the content to a file instead of using empty string literals inline. See CLAUDE.md §Unattended Operation Patterns." >&2
     exit 2
 fi
 
