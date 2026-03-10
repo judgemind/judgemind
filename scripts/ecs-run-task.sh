@@ -25,6 +25,8 @@
 # Usage:
 #   scripts/ecs-run-task.sh <script-path> [-- script-args...]
 #   scripts/ecs-run-task.sh --env dev <script-path> [-- script-args...]
+#   scripts/ecs-run-task.sh --detach <script-path> [-- script-args...]
+#   scripts/ecs-run-task.sh --logs <task-arn>
 #   scripts/ecs-run-task.sh --dry-run <script-path>
 #
 # Options:
@@ -32,6 +34,10 @@
 #   --cpu <units>       CPU units for the task (default: 1024). Valid: 256, 512, 1024, 2048, 4096.
 #   --memory <mb>       Memory in MB for the task (default: 2048). Must be valid for the CPU value.
 #   --latest-image      Use the latest image from ECR instead of the running service's image
+#   --detach            Launch the task and exit immediately. Prints the task ARN
+#                       to stdout for later use with --logs.
+#   --logs <task-arn>   Retrieve logs and status for a previously launched task.
+#                       Accepts a full task ARN.
 #   --dry-run           Show what would be done without running
 #   --timeout <secs>    Max seconds to wait for task completion (default: 1800)
 #   --help              Show this help message
@@ -40,6 +46,8 @@
 #   scripts/ecs-run-task.sh scripts/backfill_ruling_fields.py -- --dry-run
 #   scripts/ecs-run-task.sh scripts/cleanup_no_tentative_rulings.py
 #   scripts/ecs-run-task.sh --timeout 3600 scripts/backfill_parties.py
+#   scripts/ecs-run-task.sh --detach scripts/reingest_from_s3.py -- --all
+#   scripts/ecs-run-task.sh --logs arn:aws:ecs:us-west-2:155326049300:task/judgemind-dev/abc123
 
 set -euo pipefail
 
@@ -47,6 +55,8 @@ set -euo pipefail
 
 ENVIRONMENT="dev"
 DRY_RUN=false
+DETACH=false
+LOGS_TASK_ARN=""
 TIMEOUT=1800
 CPU_OVERRIDE=""
 MEMORY_OVERRIDE=""
@@ -81,6 +91,14 @@ while [[ $# -gt 0 ]]; do
             USE_LATEST_IMAGE=true
             shift
             ;;
+        --detach)
+            DETACH=true
+            shift
+            ;;
+        --logs)
+            LOGS_TASK_ARN="$2"
+            shift 2
+            ;;
         --dry-run)
             DRY_RUN=true
             shift
@@ -90,7 +108,7 @@ while [[ $# -gt 0 ]]; do
             shift 2
             ;;
         --help|-h)
-            head -n 42 "$0" | tail -n +2 | sed 's/^# \?//'
+            head -n 51 "$0" | tail -n +2 | sed 's/^# \?//'
             exit 0
             ;;
         --)
@@ -113,6 +131,97 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+
+# ─── --logs mode: retrieve logs for a previously launched task ─────────────
+
+if [[ -n "$LOGS_TASK_ARN" ]]; then
+    # Extract cluster and task ID from the ARN.
+    # ARN format: arn:aws:ecs:<region>:<account>:task/<cluster>/<task-id>
+    CLUSTER_FROM_ARN=$(echo "$LOGS_TASK_ARN" | cut -d'/' -f2)
+    TASK_ID_FROM_ARN=$(echo "$LOGS_TASK_ARN" | rev | cut -d'/' -f1 | rev)
+
+    if [[ -z "$CLUSTER_FROM_ARN" || -z "$TASK_ID_FROM_ARN" ]]; then
+        echo "Error: could not parse task ARN: $LOGS_TASK_ARN" >&2
+        echo "Expected format: arn:aws:ecs:<region>:<account>:task/<cluster>/<task-id>" >&2
+        exit 1
+    fi
+
+    # Describe the task to get its status
+    echo "Task ARN: ${LOGS_TASK_ARN}" >&2
+
+    TASK_DESCRIBE=$(aws ecs describe-tasks \
+        --cluster "$CLUSTER_FROM_ARN" \
+        --tasks "$LOGS_TASK_ARN" \
+        --region "$REGION" \
+        --output json \
+        --no-cli-pager 2>/dev/null) || {
+        echo "Error: could not describe task. Check the ARN and your AWS credentials." >&2
+        exit 1
+    }
+
+    # Use a temp file for the Python extraction
+    LOGS_TMP_DIR=$(mktemp -d)
+    trap "rm -rf $LOGS_TMP_DIR" EXIT
+
+    cat > "${LOGS_TMP_DIR}/_extract_task_info.py" << 'PYEOF'
+import json, sys
+data = json.load(sys.stdin)
+tasks = data.get("tasks", [])
+if not tasks:
+    print("ERROR: task not found", file=sys.stderr)
+    sys.exit(1)
+task = tasks[0]
+status = task.get("lastStatus", "UNKNOWN")
+exit_code = None
+containers = task.get("containers", [])
+if containers:
+    exit_code = containers[0].get("exitCode")
+stop_reason = task.get("stoppedReason", "")
+# Print status info to stderr
+print(f"Status: {status}", file=sys.stderr)
+if stop_reason:
+    print(f"Stop reason: {stop_reason}", file=sys.stderr)
+if exit_code is not None:
+    print(f"Exit code: {exit_code}", file=sys.stderr)
+# Print exit code to stdout for the shell to capture.
+# If the task is still running, print "RUNNING" so the caller knows.
+if status == "STOPPED" and exit_code is not None:
+    print(exit_code)
+elif status == "STOPPED":
+    print(1)
+else:
+    print("RUNNING")
+PYEOF
+
+    LOGS_EXIT_INFO=$(echo "$TASK_DESCRIBE" | python3 "${LOGS_TMP_DIR}/_extract_task_info.py")
+
+    # Determine the log group from the environment in the cluster name
+    # Cluster name is like "judgemind-dev" → environment is "dev"
+    LOGS_ENV=$(echo "$CLUSTER_FROM_ARN" | rev | cut -d'-' -f1 | rev)
+    LOGS_LOG_GROUP="/ecs/judgemind-ingestion-worker-${LOGS_ENV}"
+
+    echo "" >&2
+    echo "─── Task Logs ───────────────────────────────────────────────────" >&2
+
+    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+    "$REPO_ROOT/scripts/ecs-logs.sh" "$LOGS_LOG_GROUP" --task "$TASK_ID_FROM_ARN" --lines 200 2>/dev/null || {
+        echo "(Could not retrieve logs. Check manually with:)" >&2
+        echo "  scripts/ecs-logs.sh ${LOGS_LOG_GROUP} --task ${TASK_ID_FROM_ARN}" >&2
+    }
+
+    # Exit with the task's exit code if stopped, or 0 if still running
+    if [[ "$LOGS_EXIT_INFO" == "RUNNING" ]]; then
+        echo "" >&2
+        echo "Task is still running. Re-run this command later to check again." >&2
+        exit 0
+    else
+        exit "$LOGS_EXIT_INFO"
+    fi
+fi
+
+# ─── Normal mode: require a script path ────────────────────────────────────
 
 if [[ -z "$SCRIPT_PATH" ]]; then
     echo "Error: script path is required." >&2
@@ -176,10 +285,13 @@ cleanup() {
             --output text > /dev/null 2>&1 || true
     fi
 
-    if [[ -n "$S3_SCRIPT_KEY" ]]; then
+    if [[ -n "$S3_SCRIPT_KEY" && "$DETACH" == "false" ]]; then
         echo "Cleaning up: removing script from S3..." >&2
         aws s3 rm "s3://${S3_BUCKET}/${S3_SCRIPT_KEY}" \
             --region "$REGION" > /dev/null 2>&1 || true
+    elif [[ -n "$S3_SCRIPT_KEY" && "$DETACH" == "true" ]]; then
+        echo "Detach mode: S3 script at s3://${S3_BUCKET}/${S3_SCRIPT_KEY} left for task to download." >&2
+        echo "Clean it up manually after the task completes, or it will expire from bucket lifecycle rules." >&2
     fi
 
     if [[ -n "$TMP_DIR" && -d "$TMP_DIR" ]]; then
@@ -532,6 +644,22 @@ TASK_ID=$(echo "$TASK_ARN" | rev | cut -d'/' -f1 | rev)
 echo "Task ARN: ${TASK_ARN}" >&2
 echo "Task ID:  ${TASK_ID}" >&2
 echo "" >&2
+
+# ─── Detach mode: print ARN to stdout and exit ──────────────────────────────
+
+if [[ "$DETACH" == "true" ]]; then
+    LOG_GROUP="/ecs/judgemind-ingestion-worker-${ENVIRONMENT}"
+    echo "Detach mode: task launched successfully." >&2
+    echo "Log group: ${LOG_GROUP}" >&2
+    echo "" >&2
+    echo "To check status and retrieve logs later:" >&2
+    echo "  scripts/ecs-run-task.sh --logs ${TASK_ARN}" >&2
+
+    # Print the task ARN to stdout (everything else goes to stderr)
+    # so callers can capture it easily.
+    echo "${TASK_ARN}"
+    exit 0
+fi
 
 # ─── Step 6: Poll for completion with real-time log streaming ────────────────
 
