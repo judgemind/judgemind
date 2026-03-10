@@ -27,6 +27,7 @@ Options:
     --parse-timeout N   Per-document parse timeout in seconds (default: 60).
     --no-llm            Disable LLM extraction, use regex-only mode.
     --llm-timeout N     Per-call LLM API timeout in seconds (default: 60).
+    --force-llm         Force LLM even when all fields are already populated.
 """
 
 from __future__ import annotations
@@ -306,20 +307,23 @@ def _reparse_document(
     llm_provider: str | None = None,
     llm_model: str | None = None,
     llm_timeout: float | None = 60.0,
+    force_llm: bool = False,
 ) -> dict:
     """Re-parse a document using a three-tier extraction strategy.
 
     Extraction priority per field:
       1. Scraper ``parse_document()`` (highest priority).
       2. LLM extraction via ``extract_fields_llm()`` (if *llm_client*
-         is provided).
+         is provided and fields are missing, or *force_llm* is True).
       3. Regex fallback (lowest priority).
 
     For PDF documents, extracts text via pdfplumber in a subprocess with
     a hard timeout to prevent hangs from C extensions.
 
     Returns a dict of extracted fields plus an ``extraction_methods`` dict
-    recording which method populated each field.
+    recording which method populated each field, and an ``llm_skipped``
+    boolean indicating whether LLM extraction was skipped because all
+    fields were already populated.
     """
     _load_scraper_registry()
 
@@ -409,6 +413,7 @@ def _reparse_document(
     # ------------------------------------------------------------------
     # LLM extraction — secondary method for missing fields
     # ------------------------------------------------------------------
+    llm_skipped = False
     if llm_client is not None:
         missing_fields = [
             f
@@ -425,7 +430,13 @@ def _reparse_document(
             if not extracted.get(f)
             or (isinstance(extracted.get(f), list) and len(extracted[f]) == 0)
         ]
-        if missing_fields and text.strip():
+        if not missing_fields and not force_llm:
+            logger.info(
+                "All fields present for %s, skipping LLM extraction",
+                doc_meta["document_id"],
+            )
+            llm_skipped = True
+        elif (missing_fields or force_llm) and text.strip():
             t0 = time.monotonic()
             llm_result = extract_fields_llm(
                 document_text=text,
@@ -528,6 +539,7 @@ def _reparse_document(
         )
 
     extracted["extraction_methods"] = extraction_methods
+    extracted["llm_skipped"] = llm_skipped
     return extracted
 
 
@@ -546,8 +558,9 @@ def reingest_batch(
     llm_provider: str | None = None,
     llm_model: str | None = None,
     llm_timeout: float | None = 60.0,
-) -> tuple[int, int, tuple[datetime, str]]:
-    """Process one batch. Returns (processed, updated, next_cursor).
+    force_llm: bool = False,
+) -> tuple[int, int, int, tuple[datetime, str]]:
+    """Process one batch. Returns (processed, updated, llm_skipped, next_cursor).
 
     S3 objects are fetched in parallel using a thread pool (controlled by
     ``concurrency``).  Scraper parsing is parallelised with ``parse_workers``
@@ -556,9 +569,12 @@ def reingest_batch(
 
     If *llm_client* is provided, LLM extraction is used for fields
     that the scraper did not populate, before falling back to regex.
+    If *force_llm* is True, LLM extraction runs even when all fields
+    are already populated.
     """
     processed = 0
     updated = 0
+    llm_skipped = 0
     next_cursor = cursor
 
     params = filter_params + [cursor[0], cursor[1], batch_size]
@@ -571,7 +587,7 @@ def reingest_batch(
         rows = cur.fetchall()
 
     if not rows:
-        return 0, 0, cursor
+        return 0, 0, 0, cursor
 
     # --- Prefetch S3 content in parallel -----------------------------------
     # Parallel S3 fetch — submit all rows with valid s3_key + s3_bucket,
@@ -654,7 +670,7 @@ def reingest_batch(
         parseable.append((idx, doc_meta, raw_content))
 
     if not parseable:
-        return processed, updated, next_cursor
+        return processed, updated, llm_skipped, next_cursor
 
     # --- Parse documents in parallel ------------------------------------------
     # Parsing runs in threads.  The subprocess-based timeout inside
@@ -677,6 +693,7 @@ def reingest_batch(
                 llm_provider,
                 llm_model,
                 llm_timeout,
+                force_llm,
             )
             parse_futures[future] = (idx, doc_meta)
 
@@ -692,6 +709,9 @@ def reingest_batch(
                     exc_info=True,
                 )
                 continue
+
+            if extracted.get("llm_skipped"):
+                llm_skipped += 1
 
             if dry_run:
                 logger.info(
@@ -710,7 +730,7 @@ def reingest_batch(
             parsed_docs.append((doc_meta, extracted))
 
     if dry_run or not parsed_docs:
-        return processed, updated, next_cursor
+        return processed, updated, llm_skipped, next_cursor
 
     # --- DB writes — one savepoint per document -----------------------------
     # We use per-document savepoints so that a single bad document (e.g. an
@@ -795,7 +815,7 @@ def reingest_batch(
                 exc_info=True,
             )
 
-    return processed, updated, next_cursor
+    return processed, updated, llm_skipped, next_cursor
 
 
 def run_reingest(
@@ -812,6 +832,7 @@ def run_reingest(
     parse_timeout: float = 60.0,
     no_llm: bool = False,
     llm_timeout: float | None = 60.0,
+    force_llm: bool = False,
 ) -> dict[str, int]:
     """Run the full reingest. Returns summary stats."""
     filters, filter_params = _build_filters(county, date_from, date_to)
@@ -829,15 +850,17 @@ def run_reingest(
         llm_client = create_llm_client(provider=llm_provider)
     if llm_client is not None:
         logger.info(
-            "LLM extraction enabled (provider=%s, model=%s)",
+            "LLM extraction enabled (provider=%s, model=%s, force=%s)",
             llm_provider or "default",
             llm_model or "default",
+            force_llm,
         )
     else:
         reason = "--no-llm flag" if no_llm else "no API key for configured provider"
         logger.info("LLM extraction disabled (%s) — using regex-only mode", reason)
     total_processed = 0
     total_updated = 0
+    total_llm_skipped = 0
     cursor: tuple[datetime, str] = (_CURSOR_MIN_TIMESTAMP, _CURSOR_MIN_UUID)
 
     with psycopg.connect(dsn) as conn:
@@ -849,7 +872,7 @@ def run_reingest(
                     break
                 effective_batch = min(batch_size, remaining)
 
-            processed, updated, cursor = reingest_batch(
+            processed, updated, batch_llm_skipped, cursor = reingest_batch(
                 conn,
                 s3_client,
                 effective_batch,
@@ -864,9 +887,11 @@ def run_reingest(
                 llm_provider=llm_provider,
                 llm_model=llm_model,
                 llm_timeout=llm_timeout,
+                force_llm=force_llm,
             )
             total_processed += processed
             total_updated += updated
+            total_llm_skipped += batch_llm_skipped
 
             if dry_run:
                 conn.rollback()
@@ -874,11 +899,13 @@ def run_reingest(
                 conn.commit()
 
             logger.info(
-                "Batch: processed=%d updated=%d (total: %d/%d)%s",
+                "Batch: processed=%d updated=%d llm_skipped=%d (total: %d/%d/%d)%s",
                 processed,
                 updated,
+                batch_llm_skipped,
                 total_processed,
                 total_updated,
+                total_llm_skipped,
                 " [dry-run]" if dry_run else " [committed]",
             )
 
@@ -888,6 +915,7 @@ def run_reingest(
     return {
         "total_processed": total_processed,
         "total_updated": total_updated,
+        "total_llm_skipped": total_llm_skipped,
     }
 
 
@@ -942,6 +970,11 @@ def main() -> None:
         default=60.0,
         help="Per-call LLM API timeout in seconds (default: 60).",
     )
+    parser.add_argument(
+        "--force-llm",
+        action="store_true",
+        help="Force LLM extraction even when all fields are already populated.",
+    )
     args = parser.parse_args()
 
     dsn = os.environ.get("DATABASE_URL")
@@ -965,12 +998,14 @@ def main() -> None:
         parse_timeout=args.parse_timeout,
         no_llm=args.no_llm,
         llm_timeout=args.llm_timeout,
+        force_llm=args.force_llm,
     )
 
     logger.info(
-        "Reingest complete: %d documents processed, %d updated",
+        "Reingest complete: %d documents processed, %d updated, %d LLM skipped",
         stats["total_processed"],
         stats["total_updated"],
+        stats["total_llm_skipped"],
     )
 
 
