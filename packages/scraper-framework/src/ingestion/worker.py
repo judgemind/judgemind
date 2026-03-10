@@ -68,6 +68,7 @@ EXTRACTABLE_FIELDS = (
     "motion_type",
     "case_number",
     "case_title",
+    "case_type",
     "judge_name",
     "department",
     "parties",
@@ -312,6 +313,7 @@ class IngestionWorker:
 
         outcome: str | None = event_data.get("outcome")
         motion_type: str | None = event_data.get("motion_type")
+        case_type: str | None = event_data.get("case_type")
         parties_data: list[dict[str, str]] = event_data.get("parties", [])
 
         # ------------------------------------------------------------------
@@ -375,6 +377,9 @@ class IngestionWorker:
                     if motion_type is None and ruling.motion_type:
                         motion_type = ruling.motion_type
                         extraction_methods["motion_type"] = "llm"
+                    if case_type is None and ruling.case_type:
+                        case_type = ruling.case_type
+                        extraction_methods["case_type"] = "llm"
                     if not parties_data and ruling.parties:
                         parties_data = ruling.parties
                         extraction_methods["parties"] = "llm"
@@ -488,7 +493,9 @@ class IngestionWorker:
                     "No case_number extractable for document — using synthetic UNKNOWN identifier",
                     extra={"document_id": document_id},
                 )
-            case_id = upsert_case(conn, effective_case_number, court_id, case_title=case_title)
+            case_id = upsert_case(
+                conn, effective_case_number, court_id, case_title=case_title, case_type=case_type
+            )
 
             # 3. Insert document (idempotent on document_id)
             is_new = insert_document(

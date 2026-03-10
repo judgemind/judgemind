@@ -112,27 +112,30 @@ def upsert_case(
     case_number: str,
     court_id: str,
     case_title: str | None = None,
+    case_type: str | None = None,
 ) -> str:
     """Upsert a case row and return its UUID.
 
     Uses (court_id, case_number) as the natural key per the schema UNIQUE constraint.
     case_number_normalized strips whitespace and lowercases for search.
 
-    ``case_title`` is set on INSERT and updated on conflict only when a non-NULL
-    value is provided (COALESCE preserves an existing title).
+    ``case_title`` and ``case_type`` are set on INSERT and updated on conflict
+    only when a non-NULL value is provided (COALESCE preserves existing values).
     """
     normalized = case_number.strip().lower().replace(" ", "").replace("-", "")
     case_title = _strip_nul(case_title)
+    case_type = _strip_nul(case_type)
     with conn.cursor() as cur:
         cur.execute(
             """
-            INSERT INTO cases (case_number, case_number_normalized, court_id, case_title)
-            VALUES (%s, %s, %s::uuid, %s)
+            INSERT INTO cases (case_number, case_number_normalized, court_id, case_title, case_type)
+            VALUES (%s, %s, %s::uuid, %s, %s)
             ON CONFLICT (court_id, case_number) DO UPDATE
-                SET case_title = COALESCE(EXCLUDED.case_title, cases.case_title)
+                SET case_title = COALESCE(EXCLUDED.case_title, cases.case_title),
+                    case_type  = COALESCE(EXCLUDED.case_type, cases.case_type)
             RETURNING id
             """,
-            (case_number, normalized, court_id, case_title),
+            (case_number, normalized, court_id, case_title, case_type),
         )
         row = cur.fetchone()
     if row is None:
@@ -141,7 +144,11 @@ def upsert_case(
         )
     case_id: str = str(row[0])
     logger.debug(
-        "upsert_case: case_number=%s case_title=%s id=%s", case_number, case_title, case_id
+        "upsert_case: case_number=%s case_title=%s case_type=%s id=%s",
+        case_number,
+        case_title,
+        case_type,
+        case_id,
     )
     return case_id
 
