@@ -31,6 +31,7 @@
 #   --env <env>         Environment (default: dev)
 #   --cpu <units>       CPU units for the task (default: 1024). Valid: 256, 512, 1024, 2048, 4096.
 #   --memory <mb>       Memory in MB for the task (default: 2048). Must be valid for the CPU value.
+#   --latest-image      Use the latest image from ECR instead of the running service's image
 #   --dry-run           Show what would be done without running
 #   --timeout <secs>    Max seconds to wait for task completion (default: 1800)
 #   --help              Show this help message
@@ -52,6 +53,7 @@ MEMORY_OVERRIDE=""
 SCRIPT_PATH=""
 REGION="us-west-2"
 SCRIPT_ARGS=()
+USE_LATEST_IMAGE=false
 
 # Track resources for cleanup
 ONESHOT_TASK_DEF_ARN=""
@@ -75,6 +77,10 @@ while [[ $# -gt 0 ]]; do
             MEMORY_OVERRIDE="$2"
             shift 2
             ;;
+        --latest-image)
+            USE_LATEST_IMAGE=true
+            shift
+            ;;
         --dry-run)
             DRY_RUN=true
             shift
@@ -84,7 +90,7 @@ while [[ $# -gt 0 ]]; do
             shift 2
             ;;
         --help|-h)
-            head -n 39 "$0" | tail -n +2 | sed 's/^# \?//'
+            head -n 42 "$0" | tail -n +2 | sed 's/^# \?//'
             exit 0
             ;;
         --)
@@ -210,6 +216,96 @@ SOURCE_TASK_DEF=$(aws ecs describe-task-definition \
     exit 1
 }
 
+# ─── Step 1b: Detect stale image and optionally use latest from ECR ──────
+
+# Extract the image URI from the source task definition's first container.
+SERVICE_IMAGE=$(echo "$SOURCE_TASK_DEF" | python3 -c "
+import sys, json
+td = json.load(sys.stdin)['taskDefinition']
+print(td['containerDefinitions'][0]['image'])
+")
+
+# Derive the ECR repository URI (everything before the colon/tag or @sha256:digest)
+# e.g. "155326049300.dkr.ecr.us-west-2.amazonaws.com/judgemind/scraper:abc123"
+#   -> repo URI: "155326049300.dkr.ecr.us-west-2.amazonaws.com/judgemind/scraper"
+#   -> repo name: "judgemind/scraper"
+ECR_REPO_URI="${SERVICE_IMAGE%%:*}"
+ECR_REPO_URI="${ECR_REPO_URI%%@*}"
+# Extract just the repository name (after the hostname, e.g.
+# "155326049300.dkr.ecr.us-west-2.amazonaws.com/judgemind/scraper"
+#   -> "judgemind/scraper")
+ECR_REPO_NAME="${ECR_REPO_URI#*.amazonaws.com/}"
+
+# Resolve the digest of the image currently used by the service
+SERVICE_IMAGE_TAG="${SERVICE_IMAGE#*:}"
+if [[ "$SERVICE_IMAGE_TAG" == "$SERVICE_IMAGE" ]]; then
+    # No tag found — image might use @sha256: digest format
+    SERVICE_IMAGE_TAG="latest"
+fi
+
+# Get the digest of the service's image
+SERVICE_DIGEST=$(aws ecr describe-images \
+    --repository-name "$ECR_REPO_NAME" \
+    --image-ids "imageTag=${SERVICE_IMAGE_TAG}" \
+    --region "$REGION" \
+    --query 'imageDetails[0].imageDigest' \
+    --output text \
+    --no-cli-pager 2>/dev/null) || SERVICE_DIGEST=""
+
+# Get the latest image from ECR (most recently pushed)
+LATEST_ECR_INFO=$(aws ecr describe-images \
+    --repository-name "$ECR_REPO_NAME" \
+    --image-ids imageTag=latest \
+    --region "$REGION" \
+    --query 'imageDetails[0].{digest:imageDigest,pushed:imagePushedAt}' \
+    --output json \
+    --no-cli-pager 2>/dev/null) || LATEST_ECR_INFO=""
+
+if [[ -n "$LATEST_ECR_INFO" && "$LATEST_ECR_INFO" != "null" ]]; then
+    LATEST_DIGEST=$(echo "$LATEST_ECR_INFO" | python3 -c "import sys,json; print(json.load(sys.stdin)['digest'])")
+    LATEST_PUSHED=$(echo "$LATEST_ECR_INFO" | python3 -c "import sys,json; print(json.load(sys.stdin)['pushed'])")
+
+    if [[ -n "$SERVICE_DIGEST" && "$SERVICE_DIGEST" != "$LATEST_DIGEST" ]]; then
+        if [[ "$USE_LATEST_IMAGE" == "true" ]]; then
+            echo "Using latest ECR image (pushed ${LATEST_PUSHED})." >&2
+            echo "Service image (tag=${SERVICE_IMAGE_TAG}) has a different digest — overriding." >&2
+        else
+            echo "" >&2
+            echo "WARNING: The running service's image differs from the latest in ECR." >&2
+            echo "  Service image tag: ${SERVICE_IMAGE_TAG}" >&2
+            echo "  Service digest:    ${SERVICE_DIGEST}" >&2
+            echo "  Latest digest:     ${LATEST_DIGEST}" >&2
+            echo "  Latest pushed:     ${LATEST_PUSHED}" >&2
+            echo "" >&2
+            echo "The oneshot task may run with stale code. To use the latest image:" >&2
+            echo "  scripts/ecs-run-task.sh --latest-image <script-path> [-- args...]" >&2
+            echo "" >&2
+        fi
+    else
+        # Digests match — service is up to date
+        if [[ "$USE_LATEST_IMAGE" == "true" ]]; then
+            echo "Service image already matches the latest ECR image — no override needed." >&2
+        fi
+    fi
+else
+    # Could not resolve latest ECR image — skip the check
+    if [[ "$USE_LATEST_IMAGE" == "true" ]]; then
+        echo "WARNING: Could not resolve latest image from ECR repository '${ECR_REPO_NAME}'." >&2
+        echo "Falling back to the service's image." >&2
+    fi
+    # Reset the flag so we don't try to override below
+    USE_LATEST_IMAGE=false
+fi
+
+# If --latest-image was requested and digests differ, override the image in the
+# task definition. We do this by setting an env var that the Python task-def
+# builder (Step 3) will pick up.
+if [[ "$USE_LATEST_IMAGE" == "true" && -n "$LATEST_DIGEST" && "$SERVICE_DIGEST" != "$LATEST_DIGEST" ]]; then
+    OVERRIDE_IMAGE="${ECR_REPO_URI}:latest"
+else
+    OVERRIDE_IMAGE=""
+fi
+
 # ─── Step 2: Prepare the script payload ──────────────────────────────────────
 
 SCRIPT_SIZE=$(wc -c < "$SCRIPT_PATH" | tr -d ' ')
@@ -273,6 +369,11 @@ fi
 echo "Script: ${SCRIPT_PATH} (${SCRIPT_SIZE} bytes)" >&2
 echo "Interpreter: ${INTERPRETER}" >&2
 echo "Resources: ${CPU} CPU / ${MEMORY} MB memory" >&2
+if [[ -n "$OVERRIDE_IMAGE" ]]; then
+    echo "Image: ${OVERRIDE_IMAGE} (--latest-image)" >&2
+else
+    echo "Image: ${SERVICE_IMAGE} (from service task def)" >&2
+fi
 echo "Delivery: $(if [[ "$USE_S3" == "true" ]]; then echo "S3 (pre-signed URL, 5 min TTL)"; else echo "inline (base64)"; fi)" >&2
 if [[ ${#SCRIPT_ARGS[@]} -gt 0 ]]; then
     echo "Script args:${ARGS_STR}" >&2
@@ -295,14 +396,19 @@ command_str = os.environ["COMMAND_STR"]
 family = os.environ["ONESHOT_FAMILY"]
 cpu = os.environ["ONESHOT_CPU"]
 memory = os.environ["ONESHOT_MEMORY"]
+override_image = os.environ.get("OVERRIDE_IMAGE", "")
 
 # Get the first container definition as a template
 source_container = source_td["containerDefinitions"][0]
 
+# Use the override image if provided (--latest-image flag), otherwise use
+# the image from the running service's task definition.
+image = override_image if override_image else source_container["image"]
+
 # Build the oneshot container definition
 container = {
     "name": "oneshot",
-    "image": source_container["image"],
+    "image": image,
     "essential": True,
     "entryPoint": ["bash", "-c"],
     "command": [command_str],
@@ -343,6 +449,7 @@ TASK_DEF_JSON=$(echo "$SOURCE_TASK_DEF" | \
     ONESHOT_FAMILY="$ONESHOT_FAMILY" \
     ONESHOT_CPU="$CPU" \
     ONESHOT_MEMORY="$MEMORY" \
+    OVERRIDE_IMAGE="${OVERRIDE_IMAGE}" \
     python3 "${TMP_DIR}/_build_task_def.py")
 
 if [[ "$DRY_RUN" == "true" ]]; then
