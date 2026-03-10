@@ -1947,6 +1947,7 @@ class TestReparseDocumentLLM:
         try:
             meta = self._doc_meta()
             meta["scraper_id"] = "test-all-filled"
+            meta["case_type"] = "civil"
             raw = b"<html>ruling text</html>"
             client = MagicMock()
             reingest._reparse_document(raw, "test-all-filled", meta, llm_client=client)
@@ -2438,6 +2439,7 @@ class TestLLMSkipIfComplete:
         try:
             meta = self._doc_meta()
             meta["scraper_id"] = "test-all-filled"
+            meta["case_type"] = "civil"
             raw = b"<html>ruling text</html>"
             client = MagicMock()
             result = reingest._reparse_document(raw, "test-all-filled", meta, llm_client=client)
@@ -2475,6 +2477,7 @@ class TestLLMSkipIfComplete:
         try:
             meta = self._doc_meta()
             meta["scraper_id"] = "test-all-filled"
+            meta["case_type"] = "civil"
             raw = b"<html>ruling text</html>"
             client = MagicMock()
             result = reingest._reparse_document(
