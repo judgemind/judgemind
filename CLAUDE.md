@@ -221,6 +221,29 @@ When operating as an agent in this repo:
 - Document archive: S3 bucket `judgemind-document-archive-dev`
 - Assets: S3 bucket `judgemind-assets-dev`
 
+### Telegram Bridge (optional)
+
+The Telegram bridge lets agents send lifecycle notifications and receive inbound commands via a Telegram bot. It is **opt-in** — if the secret is missing or the bot token is empty, all bridge calls silently become no-ops and no existing workflows are affected.
+
+**Architecture:** Telegram webhook POST -> API Gateway -> Lambda (`infra/telegram-bot/handler.py`) -> SQS queue. The Python client (`packages/telegram-bridge/`) reads commands from SQS and sends replies via the Telegram Bot API.
+
+**Secrets Manager secret:** `judgemind/telegram/bot` — JSON structure:
+```json
+{
+  "bot_token": "<Telegram bot token from BotFather>",
+  "allowed_user_ids": [123456789]
+}
+```
+The `allowed_user_ids` array controls who can send commands. Messages from unlisted users are silently dropped by the Lambda.
+
+**Infrastructure (Terraform module `telegram_bot`):**
+- Lambda: `judgemind-telegram-webhook-dev`
+- API Gateway (HTTP): `judgemind-telegram-webhook-dev`
+- SQS queue: `judgemind-telegram-inbound-dev`
+- Secret: `judgemind/telegram/bot`
+
+See `docs/telegram-setup.md` for end-to-end setup instructions.
+
 ## Code Standards
 
 ### Python (scrapers, NLP pipeline)
@@ -442,10 +465,12 @@ These patterns avoid permission prompts and allow the agent to run without inter
   ```
 - **No quoted strings in compound shell commands:** a hook rejects commands that contain quoted characters (e.g. `"text"` or `'text'`) combined with `&&` or `;`. Instead of `cmd1 && echo "label" && cmd2`, make two separate tool calls — one per command.
 - **Multi-line content for `gh` or `git` commands:** always write the content to a file first using the Write tool, then pass it with `--body-file` or `-F`. Never use heredocs or `$()` in shell commands. For commits: `git commit -F {worktree}/tmp/commit_msg.txt`. For PR/issue bodies: `gh issue create --body-file {worktree}/tmp/body.txt`.
+- **Telegram bridge notifications:** the `TelegramBridge` and `OrchestratorBridge` classes are async. In synchronous contexts, use `asyncio.run()` or schedule on an existing event loop. The bridge auto-initialises lazily on first use — no explicit setup needed beyond passing the secret ID and SQS queue URL. If the secret is missing or empty, all calls are silent no-ops, so it is safe to call unconditionally.
 
 ## Session Triggers
 
 - When the user asks to pick up work (e.g. "let's go", "start", "pick up a task"), invoke `/task` as a background subagent. It handles everything autonomously.
+- **Telegram commands** are another inbound channel. When the bridge is configured, call `process_commands()` periodically to poll for Telegram messages. A `start #N` command is equivalent to the user typing `/task #N`. See the "Telegram Integration" subsection below.
 - If the user asks to explore, investigate, or prototype — do it in `tmp/` and file issues for any real work identified.
 - Remember: the interactive shell orchestrates. It does not implement.
 
