@@ -24,6 +24,29 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Maximum length for party names.  PostgreSQL B-tree indexes have a row-size
+# limit of 8191 bytes; real party names are well under 200 characters.  We
+# truncate at 500 as a safety net — long enough for any legitimate name but
+# short enough to never hit the index limit.
+_MAX_PARTY_NAME_LENGTH = 500
+
+
+def _truncate_party_name(name: str) -> str:
+    """Truncate a party name to ``_MAX_PARTY_NAME_LENGTH`` characters.
+
+    Logs a warning when truncation occurs so the issue is visible in
+    monitoring without crashing the pipeline.
+    """
+    if len(name) <= _MAX_PARTY_NAME_LENGTH:
+        return name
+    logger.warning(
+        "Truncating party name from %d to %d chars (first 80 chars: %r)",
+        len(name),
+        _MAX_PARTY_NAME_LENGTH,
+        name[:80],
+    )
+    return name[:_MAX_PARTY_NAME_LENGTH]
+
 
 def _strip_nul(value: str | None) -> str | None:
     """Remove NUL (0x00) bytes from a string.
@@ -411,6 +434,7 @@ def upsert_party(
          create a party_alias linking raw_name to the new party, and return the id.
     """
     raw_name = _strip_nul(raw_name) or raw_name
+    raw_name = _truncate_party_name(raw_name)
     canonical = normalize_party_name(raw_name)
 
     with conn.cursor() as cur:
@@ -523,6 +547,7 @@ def batch_upsert_parties(
         raw_name = (_strip_nul(party_info.get("name", "")) or "").strip()
         if not raw_name:
             continue
+        raw_name = _truncate_party_name(raw_name)
         role = party_info.get("role", "")
         canonical = normalize_party_name(raw_name)
         key = raw_name.lower()

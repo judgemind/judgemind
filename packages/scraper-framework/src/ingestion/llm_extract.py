@@ -568,13 +568,23 @@ def _parse_response(
         if outcome and outcome not in OUTCOME_VALUES:
             outcome = "other"
 
-        # Parse parties
+        # Parse parties — validate that names are plausible (not
+        # garbage text blocks).  Real party names are well under 200
+        # chars and never contain newlines.
         raw_parties = r.get("parties", [])
         parties: list[dict[str, str]] = []
         if isinstance(raw_parties, list):
             for p in raw_parties:
                 if isinstance(p, dict) and p.get("name") and p.get("role"):
-                    parties.append({"name": str(p["name"]), "role": str(p["role"])})
+                    name = str(p["name"]).strip()
+                    if len(name) > 200 or "\n" in name or "\r" in name:
+                        logger.warning(
+                            "llm_extract.invalid_party_name",
+                            length=len(name),
+                            preview=name[:80],
+                        )
+                        continue
+                    parties.append({"name": name, "role": str(p["role"])})
 
         rulings.append(
             LLMRulingResult(

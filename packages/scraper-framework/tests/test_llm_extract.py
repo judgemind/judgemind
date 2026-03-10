@@ -356,6 +356,109 @@ class TestParseResponse:
         assert result.rulings == []
         assert result.case_count == 0
 
+    def test_long_party_name_discarded(self) -> None:
+        """Party names > 200 chars are discarded as garbage."""
+        long_name = "A" * 300
+        response_json = json.dumps(
+            {
+                "judge_name": None,
+                "hearing_date": None,
+                "department": None,
+                "rulings": [
+                    {
+                        "case_number": "001",
+                        "case_title": "A v. B",
+                        "outcome": "granted",
+                        "motion_type": "msj",
+                        "parties": [
+                            {"name": long_name, "role": "plaintiff"},
+                            {"name": "Valid Name", "role": "defendant"},
+                        ],
+                    }
+                ],
+            }
+        )
+        result = _parse_response(response_json, None)
+        assert result is not None
+        # Only the valid party should remain
+        assert len(result.rulings[0].parties) == 1
+        assert result.rulings[0].parties[0]["name"] == "Valid Name"
+
+    def test_party_name_with_newlines_discarded(self) -> None:
+        """Party names containing newlines are discarded as garbage."""
+        response_json = json.dumps(
+            {
+                "judge_name": None,
+                "hearing_date": None,
+                "department": None,
+                "rulings": [
+                    {
+                        "case_number": "001",
+                        "case_title": "A v. B",
+                        "outcome": "granted",
+                        "motion_type": "msj",
+                        "parties": [
+                            {"name": "Line one\nLine two", "role": "plaintiff"},
+                            {"name": "Good Name", "role": "defendant"},
+                        ],
+                    }
+                ],
+            }
+        )
+        result = _parse_response(response_json, None)
+        assert result is not None
+        assert len(result.rulings[0].parties) == 1
+        assert result.rulings[0].parties[0]["name"] == "Good Name"
+
+    def test_party_name_with_carriage_return_discarded(self) -> None:
+        """Party names containing \\r are discarded."""
+        response_json = json.dumps(
+            {
+                "judge_name": None,
+                "hearing_date": None,
+                "department": None,
+                "rulings": [
+                    {
+                        "case_number": "001",
+                        "case_title": "X v. Y",
+                        "outcome": None,
+                        "motion_type": None,
+                        "parties": [
+                            {"name": "Bad\rName", "role": "plaintiff"},
+                        ],
+                    }
+                ],
+            }
+        )
+        result = _parse_response(response_json, None)
+        assert result is not None
+        assert len(result.rulings[0].parties) == 0
+
+    def test_valid_party_names_preserved(self) -> None:
+        """Normal-length party names without newlines pass validation."""
+        response_json = json.dumps(
+            {
+                "judge_name": None,
+                "hearing_date": None,
+                "department": None,
+                "rulings": [
+                    {
+                        "case_number": "001",
+                        "case_title": "A v. B",
+                        "outcome": "granted",
+                        "motion_type": "msj",
+                        "parties": [
+                            {"name": "John Smith", "role": "plaintiff"},
+                            {"name": "Acme Corp International Holdings LLC", "role": "defendant"},
+                        ],
+                    }
+                ],
+            }
+        )
+        result = _parse_response(response_json, None)
+        assert result is not None
+        assert len(result.rulings[0].parties) == 2
+
 
 # ---------------------------------------------------------------------------
 # extract_fields_llm — integration tests with mocked API
