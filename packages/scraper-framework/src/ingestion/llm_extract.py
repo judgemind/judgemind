@@ -17,6 +17,7 @@ from __future__ import annotations
 import html
 import json
 import re
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import date
 
@@ -473,9 +474,17 @@ def extract_fields_llm(
             chunk_sizes=[len(c) for c in chunks],
         )
 
-    # Extract from each chunk
-    chunk_results: list[LLMExtractionResult] = []
-    for i, chunk in enumerate(chunks):
+    # Extract from each chunk — concurrently when multiple chunks exist.
+    # Each chunk's LLM call is independent (shared only prompt + metadata),
+    # so we use ThreadPoolExecutor to process them in parallel.  This
+    # reduces wall-clock time for a 5-chunk document from ~15s to ~3s
+    # (limited by the slowest single chunk).
+
+    def _extract_single_chunk(
+        chunk_index_and_text: tuple[int, str],
+    ) -> LLMExtractionResult | None:
+        """Process a single chunk through the LLM and parse the response."""
+        i, chunk = chunk_index_and_text
         user_message = _build_user_message(chunk, content_format, metadata)
         llm_response = call_llm(
             system_prompt=_SYSTEM_PROMPT,
@@ -487,10 +496,21 @@ def extract_fields_llm(
         )
         if llm_response is None:
             logger.warning("llm_extract.chunk_api_failure", chunk_index=i)
-            continue
-        parsed = _parse_response(llm_response.text, metadata)
-        if parsed is not None:
-            chunk_results.append(parsed)
+            return None
+        return _parse_response(llm_response.text, metadata)
+
+    if len(chunks) == 1:
+        # Single chunk — no thread overhead needed.
+        result = _extract_single_chunk((0, chunks[0]))
+        chunk_results: list[LLMExtractionResult] = [result] if result is not None else []
+    else:
+        # Multiple chunks — process concurrently.  executor.map preserves
+        # input order, which is critical: _merge_results takes document-
+        # level fields (judge, department, date) from the *first* result.
+        max_workers = min(len(chunks), _MAX_CHUNKS)
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            ordered_results = list(executor.map(_extract_single_chunk, enumerate(chunks)))
+        chunk_results = [r for r in ordered_results if r is not None]
 
     if not chunk_results:
         return None
