@@ -39,10 +39,6 @@ import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:
-    import anthropic as anthropic_mod
 
 # Ensure the scraper-framework source is importable
 sys.path.insert(
@@ -77,6 +73,7 @@ from ingestion.llm_extract import (  # noqa: E402
     LLMRulingResult,
     extract_fields_llm,
 )
+from ingestion.llm_providers import create_client as create_llm_client  # noqa: E402
 
 logging.basicConfig(
     level=logging.INFO,
@@ -304,13 +301,15 @@ def _reparse_document(
     scraper_id: str,
     doc_meta: dict,
     pdf_timeout: float = 30.0,
-    anthropic_client: anthropic_mod.Anthropic | None = None,
+    llm_client: object | None = None,
+    llm_provider: str | None = None,
+    llm_model: str | None = None,
 ) -> dict:
     """Re-parse a document using a three-tier extraction strategy.
 
     Extraction priority per field:
       1. Scraper ``parse_document()`` (highest priority).
-      2. LLM extraction via ``extract_fields_llm()`` (if *anthropic_client*
+      2. LLM extraction via ``extract_fields_llm()`` (if *llm_client*
          is provided).
       3. Regex fallback (lowest priority).
 
@@ -408,7 +407,7 @@ def _reparse_document(
     # ------------------------------------------------------------------
     # LLM extraction — secondary method for missing fields
     # ------------------------------------------------------------------
-    if anthropic_client is not None:
+    if llm_client is not None:
         missing_fields = [
             f
             for f in (
@@ -430,7 +429,9 @@ def _reparse_document(
                 document_text=text,
                 content_format=doc_format,
                 metadata=None,
-                client=anthropic_client,
+                client=llm_client,
+                provider=llm_provider,
+                model=llm_model,
             )
             llm_latency_ms = round((time.monotonic() - t0) * 1000)
 
@@ -538,7 +539,9 @@ def reingest_batch(
     concurrency: int = 10,
     parse_workers: int = 4,
     parse_timeout: float = 60.0,
-    anthropic_client: anthropic_mod.Anthropic | None = None,
+    llm_client: object | None = None,
+    llm_provider: str | None = None,
+    llm_model: str | None = None,
 ) -> tuple[int, int, tuple[datetime, str]]:
     """Process one batch. Returns (processed, updated, next_cursor).
 
@@ -547,7 +550,7 @@ def reingest_batch(
     threads.  Each parse call is guarded by a ``parse_timeout`` (seconds).
     DB writes remain sequential.
 
-    If *anthropic_client* is provided, LLM extraction is used for fields
+    If *llm_client* is provided, LLM extraction is used for fields
     that the scraper did not populate, before falling back to regex.
     """
     processed = 0
@@ -666,7 +669,9 @@ def reingest_batch(
                 doc_meta["scraper_id"],
                 doc_meta,
                 parse_timeout,
-                anthropic_client,
+                llm_client,
+                llm_provider,
+                llm_model,
             )
             parse_futures[future] = (idx, doc_meta)
 
@@ -807,17 +812,23 @@ def run_reingest(
 
     s3_client = boto3.client("s3")
 
-    # Create Anthropic client for LLM extraction (shared across batches for
-    # connection reuse).  If ANTHROPIC_API_KEY is not set or --no-llm is
-    # specified, LLM extraction is skipped and regex-only mode is used.
-    anthropic_client: anthropic_mod.Anthropic | None = None
-    if not no_llm and os.environ.get("ANTHROPIC_API_KEY"):
-        import anthropic  # noqa: E402
-
-        anthropic_client = anthropic.Anthropic()
-        logger.info("LLM extraction enabled (using ANTHROPIC_API_KEY)")
+    # Create LLM client for extraction (shared across batches for connection
+    # reuse).  Respects LLM_PROVIDER and LLM_MODEL env vars via
+    # create_llm_client().  If --no-llm is specified or no API key is
+    # available for the configured provider, LLM extraction is skipped.
+    llm_client: object | None = None
+    llm_provider: str | None = os.environ.get("LLM_PROVIDER")
+    llm_model: str | None = os.environ.get("LLM_MODEL")
+    if not no_llm:
+        llm_client = create_llm_client(provider=llm_provider)
+    if llm_client is not None:
+        logger.info(
+            "LLM extraction enabled (provider=%s, model=%s)",
+            llm_provider or "default",
+            llm_model or "default",
+        )
     else:
-        reason = "--no-llm flag" if no_llm else "ANTHROPIC_API_KEY not set"
+        reason = "--no-llm flag" if no_llm else "no API key for configured provider"
         logger.info("LLM extraction disabled (%s) — using regex-only mode", reason)
     total_processed = 0
     total_updated = 0
@@ -843,7 +854,9 @@ def run_reingest(
                 concurrency=concurrency,
                 parse_workers=parse_workers,
                 parse_timeout=parse_timeout,
-                anthropic_client=anthropic_client,
+                llm_client=llm_client,
+                llm_provider=llm_provider,
+                llm_model=llm_model,
             )
             total_processed += processed
             total_updated += updated
