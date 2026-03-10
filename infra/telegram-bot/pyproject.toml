@@ -1,0 +1,32 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["."]
+only-include = ["handler.py"]
+
+[project]
+name = "judgemind-telegram-bot"
+version = "0.1.0"
+description = "Telegram webhook handler Lambda for Judgemind"
+requires-python = ">=3.12"
+license = "Apache-2.0"
+dependencies = [
+    "boto3>=1.34",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.3",
+    "moto[secretsmanager,sqs]>=5.0",
+]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "UP", "ANN"]
+ignore = ["ANN401"]
