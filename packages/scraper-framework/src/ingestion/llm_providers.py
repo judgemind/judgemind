@@ -135,6 +135,18 @@ def _call_google(
             return None
         client = genai.Client(api_key=api_key)
 
+    # Defensive check: verify the SDK client exposes the expected API.
+    # The google-genai 1.x SDK provides client.models.generate_content(),
+    # but namespace conflicts with google-generativeai or broken installs
+    # can produce a Models object without this method.
+    if not hasattr(client.models, "generate_content"):
+        logger.error(
+            "llm_providers.google_sdk_incompatible",
+            models_type=type(client.models).__qualname__,
+            hint="Ensure google-genai>=1.0,<2.0 is installed; google-generativeai must NOT be",
+        )
+        return None
+
     config = types.GenerateContentConfig(
         system_instruction=system_prompt,
         temperature=0,
