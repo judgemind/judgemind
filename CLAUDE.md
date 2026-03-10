@@ -441,6 +441,22 @@ These patterns avoid permission prompts and allow the agent to run without inter
 - If the user asks to explore, investigate, or prototype — do it in `tmp/` and file issues for any real work identified.
 - Remember: the interactive shell orchestrates. It does not implement.
 
+### Telegram Integration (optional)
+
+When Telegram is configured (bot token in Secrets Manager `judgemind/telegram/bot` and SQS queue `judgemind-telegram-inbound-dev`), the orchestrator can receive inbound commands from Telegram and send lifecycle notifications. Use `packages/telegram-bridge/` — specifically the `OrchestratorBridge` class.
+
+**Lifecycle notifications:** call `session_started()` when an interactive session begins, `task_started()` / `task_completed()` / `task_failed()` around `/task` agent invocations, and `session_ended()` when shutting down.
+
+**Inbound commands:** call `process_commands()` periodically (between batch launches, when idle, etc.) to poll the SQS queue. Supported commands:
+
+- `status` — replies with a summary of running tasks
+- `start #N` — returns an action dict; orchestrator should spawn `/task #N`
+- `stop #N` — acknowledges; orchestrator should avoid spawning more work for that issue
+- `pause` / `resume` — toggles whether the orchestrator spawns new task agents
+- Free text — forwarded for orchestrator interpretation
+
+If Telegram is not configured, all bridge calls are silent no-ops. No existing workflows are affected.
+
 ## Improving the Agent Workflow
 
 ### Continuous DX improvements
