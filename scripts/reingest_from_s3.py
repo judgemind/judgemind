@@ -41,6 +41,7 @@ import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime
+from typing import Any
 
 # Ensure the scraper-framework source is importable
 sys.path.insert(
@@ -52,6 +53,7 @@ sys.path.insert(
 
 import boto3  # noqa: E402
 import psycopg  # noqa: E402
+import structlog  # noqa: E402
 
 from framework.models import CapturedDocument, ContentFormat  # noqa: E402
 from ingestion.db import (  # noqa: E402
@@ -77,11 +79,21 @@ from ingestion.llm_extract import (  # noqa: E402
 )
 from ingestion.llm_providers import create_client as create_llm_client  # noqa: E402
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)-8s %(message)s",
+structlog.configure(
+    processors=[
+        structlog.contextvars.merge_contextvars,
+        structlog.processors.add_log_level,
+        structlog.processors.TimeStamper(fmt="iso"),
+        structlog.dev.ConsoleRenderer()
+        if sys.stderr.isatty()
+        else structlog.processors.JSONRenderer(),
+    ],
+    wrapper_class=structlog.make_filtering_bound_logger(logging.INFO),
+    context_class=dict,
+    logger_factory=structlog.PrintLoggerFactory(),
+    cache_logger_on_first_use=True,
 )
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger()
 
 
 # Registry mapping scraper_id to scraper class for parse_document()
@@ -120,7 +132,7 @@ def _load_scraper_registry() -> None:
         try:
             mod = importlib.import_module(modname)
         except Exception:
-            logger.debug("Could not import %s — skipping", modname)
+            logger.debug("Could not import module, skipping", module=modname)
             continue
 
         config_fn = getattr(mod, "default_config", None)
@@ -146,7 +158,7 @@ def _load_scraper_registry() -> None:
             _SCRAPER_REGISTRY[config.scraper_id] = scraper_cls
         except Exception:
             logger.warning(
-                "default_config() failed for %s — skipping", modname, exc_info=True
+                "default_config() failed, skipping", module=modname, exc_info=True
             )
 
 
@@ -240,7 +252,7 @@ def _extract_pdf_text_subprocess(
             return result.stdout
         return None
     except subprocess.TimeoutExpired:
-        logger.debug("PDF subprocess timed out after %.0fs", timeout)
+        logger.debug("PDF subprocess timed out", timeout_seconds=timeout)
         return None
     except Exception:
         logger.debug("PDF subprocess extraction failed", exc_info=True)
@@ -387,8 +399,8 @@ def _reparse_document(
                 )
         except Exception:
             logger.warning(
-                "Scraper parse_document failed for %s, falling back to regex",
-                doc_meta["document_id"],
+                "Scraper parse_document failed, falling back to regex",
+                document_id=doc_meta["document_id"],
                 exc_info=True,
             )
 
@@ -414,6 +426,7 @@ def _reparse_document(
     # LLM extraction — secondary method for missing fields
     # ------------------------------------------------------------------
     llm_skipped = False
+    llm_outcome = "not_attempted"
     if llm_client is not None:
         missing_fields = [
             f
@@ -432,10 +445,11 @@ def _reparse_document(
         ]
         if not missing_fields and not force_llm:
             logger.info(
-                "All fields present for %s, skipping LLM extraction",
-                doc_meta["document_id"],
+                "All fields present, skipping LLM extraction",
+                document_id=doc_meta["document_id"],
             )
             llm_skipped = True
+            llm_outcome = "skipped"
         elif (missing_fields or force_llm) and text.strip():
             t0 = time.monotonic()
             llm_result = extract_fields_llm(
@@ -481,18 +495,19 @@ def _reparse_document(
                         extracted["parties"] = ruling.parties
                         extraction_methods["parties"] = "llm"
 
+                llm_outcome = "success"
                 logger.info(
-                    "LLM extraction completed for %s (latency=%dms, methods=%s)",
-                    doc_meta["document_id"],
-                    llm_latency_ms,
-                    extraction_methods,
+                    "LLM extraction completed",
+                    document_id=doc_meta["document_id"],
+                    latency_ms=llm_latency_ms,
+                    methods=extraction_methods,
                 )
             else:
+                llm_outcome = "failure"
                 logger.info(
-                    "LLM extraction returned None for %s (latency=%dms) — "
-                    "falling back to regex",
-                    doc_meta["document_id"],
-                    llm_latency_ms,
+                    "LLM extraction returned None, falling back to regex",
+                    document_id=doc_meta["document_id"],
+                    latency_ms=llm_latency_ms,
                 )
 
     # ------------------------------------------------------------------
@@ -533,13 +548,14 @@ def _reparse_document(
 
     if extraction_methods:
         logger.info(
-            "Field extraction summary for %s: %s",
-            doc_meta["document_id"],
-            extraction_methods,
+            "Field extraction summary",
+            document_id=doc_meta["document_id"],
+            methods=extraction_methods,
         )
 
     extracted["extraction_methods"] = extraction_methods
     extracted["llm_skipped"] = llm_skipped
+    extracted["llm_outcome"] = llm_outcome
     return extracted
 
 
@@ -561,8 +577,20 @@ def reingest_batch(
     force_llm: bool = False,
     running_processed: int = 0,
     running_updated: int = 0,
-) -> tuple[int, int, int, tuple[datetime, str]]:
-    """Process one batch. Returns (processed, updated, llm_skipped, next_cursor).
+    batch_number: int = 0,
+) -> dict[str, Any]:
+    """Process one batch. Returns a dict of batch stats.
+
+    Returned dict keys:
+      - ``processed``: number of documents iterated over
+      - ``updated``: number of documents successfully written to DB
+      - ``llm_skipped``: number of documents where LLM was skipped
+      - ``next_cursor``: cursor for the next batch
+      - ``failed``: number of documents that failed DB writes
+      - ``skipped``: number of documents skipped (no S3 key, fetch failure, parse failure)
+      - ``llm_success``: LLM extraction successes
+      - ``llm_failure``: LLM extraction failures
+      - ``batch_number``: batch sequence number
 
     S3 objects are fetched in parallel using a thread pool (controlled by
     ``concurrency``).  Scraper parsing is parallelised with ``parse_workers``
@@ -584,6 +612,10 @@ def reingest_batch(
     processed = 0
     updated = 0
     llm_skipped = 0
+    failed = 0
+    skipped = 0
+    llm_success = 0
+    llm_failure = 0
     next_cursor = cursor
 
     params = filter_params + [cursor[0], cursor[1], batch_size]
@@ -596,7 +628,17 @@ def reingest_batch(
         rows = cur.fetchall()
 
     if not rows:
-        return 0, 0, 0, cursor
+        return {
+            "processed": 0,
+            "updated": 0,
+            "llm_skipped": 0,
+            "next_cursor": cursor,
+            "failed": 0,
+            "skipped": 0,
+            "llm_success": 0,
+            "llm_failure": 0,
+            "batch_number": batch_number,
+        }
 
     # --- Prefetch S3 content in parallel -----------------------------------
     # Parallel S3 fetch — submit all rows with valid s3_key + s3_bucket,
@@ -618,8 +660,8 @@ def reingest_batch(
                 s3_results[idx] = future.result()
             except Exception:
                 logger.warning(
-                    "Failed to fetch S3 content for %s — skipping",
-                    doc_id_str,
+                    "Failed to fetch S3 content, skipping",
+                    document_id=doc_id_str,
                     exc_info=True,
                 )
 
@@ -650,12 +692,16 @@ def reingest_batch(
         next_cursor = (captured_at, doc_id_str)
 
         if not s3_key or not s3_bucket:
-            logger.warning("Document %s has no S3 key/bucket — skipping", doc_id_str)
+            logger.warning(
+                "Document has no S3 key/bucket, skipping", document_id=doc_id_str
+            )
+            skipped += 1
             continue
 
         raw_content = s3_results.get(idx)
         if raw_content is None:
             # S3 fetch failed or was not attempted
+            skipped += 1
             continue
 
         doc_meta = {
@@ -679,7 +725,17 @@ def reingest_batch(
         parseable.append((idx, doc_meta, raw_content))
 
     if not parseable:
-        return processed, updated, llm_skipped, next_cursor
+        return {
+            "processed": processed,
+            "updated": updated,
+            "llm_skipped": llm_skipped,
+            "next_cursor": next_cursor,
+            "failed": failed,
+            "skipped": skipped,
+            "llm_success": llm_success,
+            "llm_failure": llm_failure,
+            "batch_number": batch_number,
+        }
 
     # --- Parse documents in parallel ------------------------------------------
     # Parsing runs in threads.  The subprocess-based timeout inside
@@ -706,40 +762,67 @@ def reingest_batch(
             )
             parse_futures[future] = (idx, doc_meta)
 
-        for future in as_completed(parse_futures):
+        for doc_index, future in enumerate(as_completed(parse_futures)):
             idx, doc_meta = parse_futures[future]
             doc_id_str = doc_meta["document_id"]
             try:
                 extracted = future.result()
             except Exception:
                 logger.warning(
-                    "Parse failed for %s — skipping",
-                    doc_id_str,
+                    "Parse failed, skipping",
+                    document_id=doc_id_str,
                     exc_info=True,
                 )
+                skipped += 1
                 continue
 
             if extracted.get("llm_skipped"):
                 llm_skipped += 1
 
+            # Track LLM outcomes
+            doc_llm_outcome = extracted.get("llm_outcome", "not_attempted")
+            if doc_llm_outcome == "success":
+                llm_success += 1
+            elif doc_llm_outcome == "failure":
+                llm_failure += 1
+
+            logger.info(
+                "document_progress",
+                document_index=doc_index,
+                document_id=doc_id_str,
+                county=doc_meta["county"],
+                case_number=doc_meta.get("case_number"),
+                llm_outcome=doc_llm_outcome,
+            )
+
             if dry_run:
                 logger.info(
-                    "DRY-RUN: %s county=%s judge=%s outcome=%s motion=%s title=%s case=%s parties=%d",
-                    doc_id_str,
-                    doc_meta["county"],
-                    extracted["judge_name"],
-                    extracted["outcome"],
-                    extracted["motion_type"],
-                    extracted["case_title"],
-                    extracted["case_number"],
-                    len(extracted["parties"]),
+                    "DRY-RUN",
+                    document_id=doc_id_str,
+                    county=doc_meta["county"],
+                    judge=extracted["judge_name"],
+                    outcome=extracted["outcome"],
+                    motion_type=extracted["motion_type"],
+                    case_title=extracted["case_title"],
+                    case_number=extracted["case_number"],
+                    parties_count=len(extracted["parties"]),
                 )
                 continue
 
             parsed_docs.append((doc_meta, extracted))
 
     if dry_run or not parsed_docs:
-        return processed, updated, llm_skipped, next_cursor
+        return {
+            "processed": processed,
+            "updated": updated,
+            "llm_skipped": llm_skipped,
+            "next_cursor": next_cursor,
+            "failed": failed,
+            "skipped": skipped,
+            "llm_success": llm_success,
+            "llm_failure": llm_failure,
+            "batch_number": batch_number,
+        }
 
     # --- DB writes — commit after each document ------------------------------
     # Each document is written inside a savepoint and then committed
@@ -821,20 +904,31 @@ def reingest_batch(
             updated += 1
 
             logger.info(
-                "Committed document %s (total: processed=%d, updated=%d)",
-                doc_id_str,
-                running_processed + processed,
-                running_updated + updated,
+                "Committed document",
+                document_id=doc_id_str,
+                total_processed=running_processed + processed,
+                total_updated=running_updated + updated,
             )
 
         except Exception:
+            failed += 1
             logger.error(
-                "DB write failed for document %s — skipping (batch continues)",
-                doc_id_str,
+                "DB write failed, skipping (batch continues)",
+                document_id=doc_id_str,
                 exc_info=True,
             )
 
-    return processed, updated, llm_skipped, next_cursor
+    return {
+        "processed": processed,
+        "updated": updated,
+        "llm_skipped": llm_skipped,
+        "next_cursor": next_cursor,
+        "failed": failed,
+        "skipped": skipped,
+        "llm_success": llm_success,
+        "llm_failure": llm_failure,
+        "batch_number": batch_number,
+    }
 
 
 def run_reingest(
@@ -869,18 +963,24 @@ def run_reingest(
         llm_client = create_llm_client(provider=llm_provider)
     if llm_client is not None:
         logger.info(
-            "LLM extraction enabled (provider=%s, model=%s, force=%s)",
-            llm_provider or "default",
-            llm_model or "default",
-            force_llm,
+            "LLM extraction enabled",
+            provider=llm_provider or "default",
+            model=llm_model or "default",
+            force=force_llm,
         )
     else:
         reason = "--no-llm flag" if no_llm else "no API key for configured provider"
-        logger.info("LLM extraction disabled (%s) — using regex-only mode", reason)
+        logger.info("LLM extraction disabled, using regex-only mode", reason=reason)
     total_processed = 0
     total_updated = 0
     total_llm_skipped = 0
+    total_failed = 0
+    total_skipped = 0
+    total_batches = 0
+    total_llm_success = 0
+    total_llm_failure = 0
     cursor: tuple[datetime, str] = (_CURSOR_MIN_TIMESTAMP, _CURSOR_MIN_UUID)
+    t0 = time.monotonic()
 
     with psycopg.connect(dsn) as conn:
         while True:
@@ -891,7 +991,15 @@ def run_reingest(
                     break
                 effective_batch = min(batch_size, remaining)
 
-            processed, updated, batch_llm_skipped, cursor = reingest_batch(
+            total_batches += 1
+
+            logger.info(
+                "batch_start",
+                batch_number=total_batches,
+                batch_size=effective_batch,
+            )
+
+            batch_result = reingest_batch(
                 conn,
                 s3_client,
                 effective_batch,
@@ -909,32 +1017,62 @@ def run_reingest(
                 force_llm=force_llm,
                 running_processed=total_processed,
                 running_updated=total_updated,
+                batch_number=total_batches,
             )
+            processed = batch_result["processed"]
+            updated = batch_result["updated"]
+            cursor = batch_result["next_cursor"]
             total_processed += processed
             total_updated += updated
-            total_llm_skipped += batch_llm_skipped
+            total_llm_skipped += batch_result["llm_skipped"]
+            total_failed += batch_result["failed"]
+            total_skipped += batch_result["skipped"]
+            total_llm_success += batch_result["llm_success"]
+            total_llm_failure += batch_result["llm_failure"]
 
             if dry_run:
                 conn.rollback()
 
             logger.info(
-                "Batch complete: processed=%d updated=%d llm_skipped=%d (total: %d/%d/%d)%s",
-                processed,
-                updated,
-                batch_llm_skipped,
-                total_processed,
-                total_updated,
-                total_llm_skipped,
-                " [dry-run]" if dry_run else "",
+                "batch_complete",
+                batch_number=total_batches,
+                processed=processed,
+                updated=updated,
+                llm_skipped=batch_result["llm_skipped"],
+                total_processed=total_processed,
+                total_updated=total_updated,
+                total_llm_skipped=total_llm_skipped,
+                mode="dry-run" if dry_run else "committed",
             )
 
             if processed < effective_batch:
                 break
 
+    wall_time = round(time.monotonic() - t0, 2)
+
+    logger.info(
+        "reingest_complete",
+        total_processed=total_processed,
+        total_updated=total_updated,
+        total_llm_skipped=total_llm_skipped,
+        total_failed=total_failed,
+        total_skipped=total_skipped,
+        total_batches=total_batches,
+        llm_success=total_llm_success,
+        llm_failure=total_llm_failure,
+        wall_time_seconds=wall_time,
+    )
+
     return {
         "total_processed": total_processed,
         "total_updated": total_updated,
         "total_llm_skipped": total_llm_skipped,
+        "total_failed": total_failed,
+        "total_skipped": total_skipped,
+        "total_batches": total_batches,
+        "llm_success": total_llm_success,
+        "llm_failure": total_llm_failure,
+        "wall_time_seconds": wall_time,
     }
 
 
@@ -1021,10 +1159,10 @@ def main() -> None:
     )
 
     logger.info(
-        "Reingest complete: %d documents processed, %d updated, %d LLM skipped",
-        stats["total_processed"],
-        stats["total_updated"],
-        stats["total_llm_skipped"],
+        "Reingest complete",
+        total_processed=stats["total_processed"],
+        total_updated=stats["total_updated"],
+        total_llm_skipped=stats["total_llm_skipped"],
     )
 
 
