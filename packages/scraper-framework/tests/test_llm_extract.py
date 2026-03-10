@@ -6,6 +6,7 @@ All tests mock the LLM provider layer — no real API calls are made.
 from __future__ import annotations
 
 import json
+import threading
 from datetime import date
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -982,12 +983,14 @@ class TestChunkedExtraction:
 
         # Alternate responses for however many chunks are produced
         responses = [response_chunk1, response_chunk2] * 3
-        call_count = 0
+        _call_counter = threading.local()
+        _call_lock = threading.Lock()
+        _call_count_shared = [0]
 
         def mock_call_llm_side_effect(**kwargs: object) -> LLMResponse:
-            nonlocal call_count
-            idx = call_count % len(responses)
-            call_count += 1
+            with _call_lock:
+                idx = _call_count_shared[0] % len(responses)
+                _call_count_shared[0] += 1
             return LLMResponse(text=responses[idx], input_tokens=100, output_tokens=50)
 
         mock_fn = MagicMock(side_effect=mock_call_llm_side_effect)
@@ -1057,12 +1060,13 @@ class TestChunkedExtraction:
         text = f"{half}\f{half}"
 
         responses = [response1, response2]
-        call_idx = 0
+        _lock = threading.Lock()
+        _idx = [0]
 
         def mock_side_effect(**kwargs: object) -> LLMResponse:
-            nonlocal call_idx
-            r = responses[min(call_idx, len(responses) - 1)]
-            call_idx += 1
+            with _lock:
+                r = responses[min(_idx[0], len(responses) - 1)]
+                _idx[0] += 1
             return LLMResponse(text=r, input_tokens=100, output_tokens=50)
 
         mock_fn = MagicMock(side_effect=mock_side_effect)
@@ -1117,12 +1121,13 @@ class TestChunkedExtraction:
         text = f"{half}\f{half}"
 
         responses = [response1, response2]
-        call_idx = 0
+        _lock = threading.Lock()
+        _idx = [0]
 
         def mock_side_effect(**kwargs: object) -> LLMResponse:
-            nonlocal call_idx
-            r = responses[min(call_idx, len(responses) - 1)]
-            call_idx += 1
+            with _lock:
+                r = responses[min(_idx[0], len(responses) - 1)]
+                _idx[0] += 1
             return LLMResponse(text=r, input_tokens=100, output_tokens=50)
 
         mock_fn = MagicMock(side_effect=mock_side_effect)
@@ -1160,12 +1165,14 @@ class TestChunkedExtraction:
         half = "Z" * 50_000
         text = f"{half}\f{half}"
 
-        call_idx = 0
+        _lock = threading.Lock()
+        _idx = [0]
 
         def mock_side_effect(**kwargs: object) -> LLMResponse | None:
-            nonlocal call_idx
-            call_idx += 1
-            if call_idx == 1:
+            with _lock:
+                _idx[0] += 1
+                current = _idx[0]
+            if current == 1:
                 return LLMResponse(text=good_response, input_tokens=100, output_tokens=50)
             return None  # second chunk fails
 
@@ -1194,3 +1201,54 @@ class TestChunkedExtraction:
                 max_chars=60_000,
             )
         assert result is None
+
+    def test_chunks_processed_concurrently(self) -> None:
+        """Multiple chunks should be processed concurrently via ThreadPoolExecutor."""
+        # Create a 3-page document that will be split into 3 chunks.
+        page = "X" * 50_000
+        text = f"{page}\f{page}\f{page}"
+
+        # Track which threads process each chunk.
+        thread_ids: list[int] = []
+        _lock = threading.Lock()
+        # Use an Event to make LLM calls block until all threads have started,
+        # proving they run concurrently rather than sequentially.
+        barrier = threading.Barrier(3, timeout=5)
+
+        response_json = json.dumps(
+            {
+                "judge_name": "Concurrent Judge",
+                "hearing_date": "2026-03-09",
+                "department": "1",
+                "rulings": [
+                    {
+                        "case_number": None,
+                        "case_title": "Test",
+                        "outcome": "granted",
+                        "motion_type": "msj",
+                        "parties": [],
+                    }
+                ],
+            }
+        )
+
+        def mock_concurrent_llm(**kwargs: object) -> LLMResponse:
+            with _lock:
+                thread_ids.append(threading.current_thread().ident)
+            # All 3 threads must reach the barrier before any can proceed.
+            # If execution were sequential, this would deadlock/timeout.
+            barrier.wait()
+            return LLMResponse(text=response_json, input_tokens=100, output_tokens=50)
+
+        mock_fn = MagicMock(side_effect=mock_concurrent_llm)
+        with patch("ingestion.llm_extract.call_llm", mock_fn):
+            result = extract_fields_llm(
+                document_text=text,
+                content_format="pdf",
+                max_chars=60_000,
+            )
+        assert result is not None
+        # All 3 chunks should have been processed.
+        assert mock_fn.call_count == 3
+        # At least 2 distinct threads should have been used (concurrency).
+        assert len(set(thread_ids)) >= 2
