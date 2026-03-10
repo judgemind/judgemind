@@ -10,9 +10,14 @@ Usage:
     scripts/tg-poll-daemon.py --inbox tmp/tg_inbox.json [--interval 30] [--pid-file tmp/tg_poll.pid]
 
 The daemon writes its PID to ``--pid-file`` (default ``tmp/tg_poll.pid``) for
-graceful shutdown::
+graceful shutdown.  To stop the daemon, create the corresponding stop file
+(same path with ``.stop`` instead of ``.pid``)::
 
-    kill "$(cat tmp/tg_poll.pid)"
+    touch tmp/tg_poll.stop
+
+The daemon checks for the stop file each iteration and exits gracefully,
+cleaning up both the PID file and the stop file on exit.  This avoids
+``kill`` which is blocked in sandboxed environments like Claude Code.
 
 Environment:
     AWS credentials must be available (profile, env vars, or instance role).
@@ -65,6 +70,37 @@ def _remove_pid_file(path: Path) -> None:
     """Remove the PID file if it exists."""
     try:
         path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _stop_file_path(pid_file: Path) -> Path:
+    """Derive the stop-file path from a PID file path.
+
+    Convention: ``tmp/foo.pid`` -> ``tmp/foo.stop``.
+    """
+    return pid_file.with_suffix(".stop")
+
+
+def _check_stop_file(pid_file: Path) -> bool:
+    """Check whether the stop file exists, and if so set the shutdown flag.
+
+    Returns ``True`` if the stop file was found (shutdown requested).
+    """
+    global _shutdown_requested  # noqa: PLW0603
+    stop_path = _stop_file_path(pid_file)
+    if stop_path.exists():
+        logger.info("Stop file detected (%s) — shutting down.", stop_path)
+        _shutdown_requested = True
+        return True
+    return False
+
+
+def _remove_stop_file(pid_file: Path) -> None:
+    """Remove the stop file derived from *pid_file* if it exists."""
+    stop_path = _stop_file_path(pid_file)
+    try:
+        stop_path.unlink(missing_ok=True)
     except OSError:
         pass
 
@@ -177,12 +213,17 @@ def run_daemon(
             except Exception:
                 logger.warning("Poll cycle failed", exc_info=True)
 
-            # Sleep in small increments so we can respond to signals promptly.
+            # Sleep in small increments so we can respond to signals and
+            # stop-file requests promptly.
             deadline = time.monotonic() + interval
             while time.monotonic() < deadline and not _shutdown_requested:
+                _check_stop_file(pid_file)
+                if _shutdown_requested:
+                    break
                 time.sleep(min(1.0, deadline - time.monotonic()))
     finally:
         _remove_pid_file(pid_file)
+        _remove_stop_file(pid_file)
         logger.info("Daemon stopped.")
 
 
