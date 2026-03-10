@@ -1,6 +1,8 @@
 """Tests for the LLM provider adapter layer (llm_providers.py).
 
-All tests mock the provider APIs — no real API calls are made.
+All tests mock the provider APIs — no real API calls are made (except the SDK
+surface smoke test which instantiates a client with a fake key to verify the
+API shape).
 """
 
 from __future__ import annotations
@@ -442,3 +444,60 @@ class TestCreateClient:
         """Unknown provider returns None."""
         client = create_client(provider="openai")
         assert client is None
+
+
+# ---------------------------------------------------------------------------
+# SDK surface smoke tests (real SDK, no API calls)
+# ---------------------------------------------------------------------------
+
+
+class TestGoogleSdkSurface:
+    """Verify the installed google-genai SDK exposes the expected API surface.
+
+    These tests instantiate a real ``genai.Client`` with a fake API key —
+    no network calls are made.  They exist to catch SDK version mismatches
+    or namespace conflicts (e.g. ``google-generativeai`` shadowing
+    ``google-genai``) before deployment.
+    """
+
+    def test_client_models_has_generate_content(self) -> None:
+        """client.models must have a generate_content method."""
+        from google import genai
+
+        client = genai.Client(api_key="fake-key-for-test")
+        assert hasattr(client.models, "generate_content"), (
+            f"client.models ({type(client.models).__qualname__}) is missing "
+            "generate_content — check installed google-genai version"
+        )
+
+    def test_client_models_generate_content_is_callable(self) -> None:
+        """generate_content must be callable (not just an attribute)."""
+        from google import genai
+
+        client = genai.Client(api_key="fake-key-for-test")
+        assert callable(client.models.generate_content)
+
+    def test_generate_content_config_type_exists(self) -> None:
+        """GenerateContentConfig must be importable from google.genai.types."""
+        from google.genai import types
+
+        assert hasattr(types, "GenerateContentConfig")
+
+
+class TestGoogleDefensiveCheck:
+    """Test the defensive SDK compatibility check in _call_google."""
+
+    def test_incompatible_client_returns_none(self) -> None:
+        """If client.models lacks generate_content, returns None immediately."""
+        # Simulate an incompatible client where models has no generate_content
+        client = MagicMock()
+        del client.models.generate_content  # remove the auto-created attr
+
+        result = _call_google(
+            system_prompt="sys",
+            user_message="user",
+            model="test-model",
+            client=client,
+        )
+
+        assert result is None
