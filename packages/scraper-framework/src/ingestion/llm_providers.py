@@ -53,6 +53,7 @@ def _call_anthropic(
     *,
     client: object | None = None,
     max_retries: int = 1,
+    timeout: float | None = None,
 ) -> LLMResponse | None:
     """Call the Anthropic Messages API.
 
@@ -64,6 +65,8 @@ def _call_anthropic(
             connection reuse.  If ``None``, creates one from the
             ``ANTHROPIC_API_KEY`` env var.
         max_retries: Number of retries on rate-limit errors.
+        timeout: Per-call timeout in seconds.  If ``None``, no timeout
+            is applied.  On timeout, returns ``None``.
 
     Returns:
         An ``LLMResponse`` or ``None`` on unrecoverable failure.
@@ -76,6 +79,11 @@ def _call_anthropic(
             logger.warning("llm_providers.anthropic_auth_error")
             return None
 
+    # Build optional timeout kwarg for the Anthropic SDK.
+    timeout_kwargs: dict = {}
+    if timeout is not None:
+        timeout_kwargs["timeout"] = timeout
+
     for attempt in range(1 + max_retries):
         try:
             response = client.messages.create(
@@ -84,12 +92,20 @@ def _call_anthropic(
                 temperature=0,
                 system=system_prompt,
                 messages=[{"role": "user", "content": user_message}],
+                **timeout_kwargs,
             )
             return LLMResponse(
                 text=response.content[0].text.strip(),
                 input_tokens=response.usage.input_tokens,
                 output_tokens=response.usage.output_tokens,
             )
+        except anthropic.APITimeoutError:
+            logger.warning(
+                "llm_providers.anthropic_timeout",
+                timeout=timeout,
+                attempt=attempt + 1,
+            )
+            return None
         except anthropic.RateLimitError:
             if attempt < max_retries:
                 logger.warning("llm_providers.anthropic_rate_limit", attempt=attempt + 1)
@@ -110,6 +126,7 @@ def _call_google(
     *,
     client: object | None = None,
     max_retries: int = 1,
+    timeout: float | None = None,
 ) -> LLMResponse | None:
     """Call the Google GenAI API.
 
@@ -121,6 +138,8 @@ def _call_google(
             connection reuse.  If ``None``, creates one from the
             ``GOOGLE_API_KEY`` env var.
         max_retries: Number of retries on resource-exhausted errors.
+        timeout: Per-call timeout in seconds.  If ``None``, no timeout
+            is applied.  On timeout, returns ``None``.
 
     Returns:
         An ``LLMResponse`` or ``None`` on unrecoverable failure.
@@ -147,12 +166,15 @@ def _call_google(
         )
         return None
 
-    config = types.GenerateContentConfig(
-        system_instruction=system_prompt,
-        temperature=0,
-        max_output_tokens=4096,
-        response_mime_type="application/json",
-    )
+    config_kwargs: dict = {
+        "system_instruction": system_prompt,
+        "temperature": 0,
+        "max_output_tokens": 4096,
+        "response_mime_type": "application/json",
+    }
+    if timeout is not None:
+        config_kwargs["http_options"] = types.HttpOptions(timeout=int(timeout * 1000))
+    config = types.GenerateContentConfig(**config_kwargs)
 
     for attempt in range(1 + max_retries):
         try:
@@ -176,6 +198,14 @@ def _call_google(
             # google-genai raises google.api_core.exceptions for rate limits
             # and other API errors.  Catch broadly and check for retryable.
             exc_name = type(exc).__name__
+            # Timeout errors — return immediately without retrying.
+            if "DeadlineExceeded" in exc_name or "Timeout" in exc_name:
+                logger.warning(
+                    "llm_providers.google_timeout",
+                    timeout=timeout,
+                    error=str(exc),
+                )
+                return None
             if "ResourceExhausted" in exc_name and attempt < max_retries:
                 logger.warning("llm_providers.google_rate_limit", attempt=attempt + 1)
                 time.sleep(1)
@@ -198,6 +228,7 @@ def call_llm(
     model: str | None = None,
     client: object | None = None,
     max_retries: int = 1,
+    timeout: float | None = None,
 ) -> LLMResponse | None:
     """Call an LLM provider and return the response.
 
@@ -214,6 +245,9 @@ def call_llm(
             per-provider default.
         client: Optional pre-created provider client for connection reuse.
         max_retries: Number of retries on rate-limit errors.
+        timeout: Per-call timeout in seconds.  If ``None``, no timeout
+            is applied.  On timeout, returns ``None`` so the caller can
+            fall back to the next extraction tier (e.g. regex).
 
     Returns:
         An ``LLMResponse`` with the text and token counts, or ``None``
@@ -233,6 +267,7 @@ def call_llm(
             resolved_model,
             client=client,
             max_retries=max_retries,
+            timeout=timeout,
         )
     elif resolved_provider == "google":
         return _call_google(
@@ -241,6 +276,7 @@ def call_llm(
             resolved_model,
             client=client,
             max_retries=max_retries,
+            timeout=timeout,
         )
     else:
         logger.error("llm_providers.unknown_provider", provider=resolved_provider)

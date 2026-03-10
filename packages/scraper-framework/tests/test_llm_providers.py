@@ -484,6 +484,179 @@ class TestGoogleSdkSurface:
         assert hasattr(types, "GenerateContentConfig")
 
 
+# ---------------------------------------------------------------------------
+# Timeout tests
+# ---------------------------------------------------------------------------
+
+
+class TestAnthropicTimeout:
+    """Tests for timeout behavior in the Anthropic adapter."""
+
+    def test_timeout_returns_none(self) -> None:
+        """APITimeoutError returns None immediately."""
+        import anthropic
+
+        client = MagicMock()
+        client.messages.create.side_effect = anthropic.APITimeoutError(
+            request=MagicMock(),
+        )
+
+        result = _call_anthropic(
+            system_prompt="sys",
+            user_message="user",
+            model="test-model",
+            client=client,
+            timeout=10.0,
+        )
+
+        assert result is None
+
+    def test_timeout_param_passed_to_sdk(self) -> None:
+        """The timeout parameter is forwarded to the SDK create() call."""
+        mock_usage = MagicMock()
+        mock_usage.input_tokens = 10
+        mock_usage.output_tokens = 5
+        mock_block = MagicMock()
+        mock_block.text = "ok"
+        mock_response = MagicMock()
+        mock_response.content = [mock_block]
+        mock_response.usage = mock_usage
+
+        client = MagicMock()
+        client.messages.create.return_value = mock_response
+
+        _call_anthropic(
+            system_prompt="sys",
+            user_message="user",
+            model="test-model",
+            client=client,
+            timeout=30.0,
+        )
+
+        call_kwargs = client.messages.create.call_args.kwargs
+        assert call_kwargs["timeout"] == 30.0
+
+    def test_no_timeout_param_when_none(self) -> None:
+        """When timeout is None, no timeout kwarg is passed to the SDK."""
+        mock_usage = MagicMock()
+        mock_usage.input_tokens = 10
+        mock_usage.output_tokens = 5
+        mock_block = MagicMock()
+        mock_block.text = "ok"
+        mock_response = MagicMock()
+        mock_response.content = [mock_block]
+        mock_response.usage = mock_usage
+
+        client = MagicMock()
+        client.messages.create.return_value = mock_response
+
+        _call_anthropic(
+            system_prompt="sys",
+            user_message="user",
+            model="test-model",
+            client=client,
+            timeout=None,
+        )
+
+        call_kwargs = client.messages.create.call_args.kwargs
+        assert "timeout" not in call_kwargs
+
+
+class TestGoogleTimeout:
+    """Tests for timeout behavior in the Google adapter."""
+
+    def test_deadline_exceeded_returns_none(self) -> None:
+        """DeadlineExceeded error returns None immediately (no retries)."""
+
+        class DeadlineExceededError(Exception):
+            pass
+
+        client = MagicMock()
+        client.models.generate_content.side_effect = DeadlineExceededError("deadline exceeded")
+
+        result = _call_google(
+            system_prompt="sys",
+            user_message="user",
+            model="test-model",
+            client=client,
+            timeout=10.0,
+            max_retries=3,
+        )
+
+        assert result is None
+        # Should NOT retry on timeout — only one call
+        assert client.models.generate_content.call_count == 1
+
+    def test_timeout_error_returns_none(self) -> None:
+        """TimeoutError returns None immediately."""
+
+        class HTTPTimeoutError(TimeoutError):
+            pass
+
+        client = MagicMock()
+        client.models.generate_content.side_effect = HTTPTimeoutError("timed out")
+
+        result = _call_google(
+            system_prompt="sys",
+            user_message="user",
+            model="test-model",
+            client=client,
+            timeout=10.0,
+        )
+
+        assert result is None
+
+
+class TestCallLlmTimeout:
+    """Tests for timeout passthrough in the call_llm dispatcher."""
+
+    def test_timeout_forwarded_to_anthropic(self) -> None:
+        """Timeout parameter is forwarded to the Anthropic adapter."""
+        with (
+            patch("ingestion.llm_providers._call_anthropic") as mock_anthropic,
+            patch.dict("os.environ", {}, clear=True),
+        ):
+            mock_anthropic.return_value = LLMResponse(text="ok", input_tokens=1, output_tokens=1)
+            call_llm(
+                system_prompt="sys",
+                user_message="user",
+                provider="anthropic",
+                timeout=45.0,
+            )
+
+        call_kwargs = mock_anthropic.call_args.kwargs
+        assert call_kwargs["timeout"] == 45.0
+
+    def test_timeout_forwarded_to_google(self) -> None:
+        """Timeout parameter is forwarded to the Google adapter."""
+        with (
+            patch("ingestion.llm_providers._call_google") as mock_google,
+            patch.dict("os.environ", {}, clear=True),
+        ):
+            mock_google.return_value = LLMResponse(text="ok", input_tokens=1, output_tokens=1)
+            call_llm(
+                system_prompt="sys",
+                user_message="user",
+                provider="google",
+                timeout=45.0,
+            )
+
+        call_kwargs = mock_google.call_args.kwargs
+        assert call_kwargs["timeout"] == 45.0
+
+    def test_timeout_defaults_to_none(self) -> None:
+        """When timeout is not specified, None is forwarded."""
+        with (
+            patch("ingestion.llm_providers._call_google") as mock_google,
+            patch.dict("os.environ", {}, clear=True),
+        ):
+            mock_google.return_value = LLMResponse(text="ok", input_tokens=1, output_tokens=1)
+            call_llm(system_prompt="sys", user_message="user")
+
+        call_kwargs = mock_google.call_args.kwargs
+        assert call_kwargs["timeout"] is None
+
+
 class TestGoogleDefensiveCheck:
     """Test the defensive SDK compatibility check in _call_google."""
 

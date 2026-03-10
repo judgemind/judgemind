@@ -417,6 +417,7 @@ def extract_fields_llm(
     provider: str | None = None,
     model: str | None = None,
     max_chars: int = _DEFAULT_MAX_CHARS,
+    timeout: float | None = None,
 ) -> LLMExtractionResult | None:
     """Extract structured fields from a court ruling via a configurable LLM.
 
@@ -444,6 +445,9 @@ def extract_fields_llm(
             per-provider default.
         max_chars: Per-chunk character limit.  Documents under this size
             are processed in a single call (no chunking overhead).
+        timeout: Per-call timeout in seconds for each LLM API call.
+            If ``None``, no timeout is applied.  On timeout, the call
+            returns ``None`` and the caller falls back to regex extraction.
 
     Returns:
         An ``LLMExtractionResult`` with extracted fields, or ``None`` if
@@ -479,6 +483,7 @@ def extract_fields_llm(
             provider=provider,
             model=model,
             client=client,
+            timeout=timeout,
         )
         if llm_response is None:
             logger.warning("llm_extract.chunk_api_failure", chunk_index=i)

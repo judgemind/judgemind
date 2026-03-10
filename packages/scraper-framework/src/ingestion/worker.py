@@ -166,6 +166,7 @@ class IngestionWorker:
         llm_client: object | None = None,
         llm_provider: str | None = None,
         llm_model: str | None = None,
+        llm_timeout: float | None = 60.0,
     ) -> None:
         self._redis = redis_client
         self._pg_dsn = pg_dsn
@@ -182,6 +183,7 @@ class IngestionWorker:
         # LLM extraction — provider and model resolved from args, then env vars.
         self._llm_provider: str | None = llm_provider or os.environ.get("LLM_PROVIDER")
         self._llm_model: str | None = llm_model or os.environ.get("LLM_MODEL")
+        self._llm_timeout: float | None = llm_timeout
         self._llm_client: object | None = llm_client
         if self._llm_client is None:
             self._llm_client = create_llm_client(provider=self._llm_provider)
@@ -340,6 +342,7 @@ class IngestionWorker:
                 client=self._llm_client,
                 provider=self._llm_provider,
                 model=self._llm_model,
+                timeout=self._llm_timeout,
             )
             llm_latency_ms = round((time.monotonic() - t0) * 1000)
 

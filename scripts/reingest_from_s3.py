@@ -26,6 +26,7 @@ Options:
     --parse-workers N   Number of parallel scraper parse threads (default: 4).
     --parse-timeout N   Per-document parse timeout in seconds (default: 60).
     --no-llm            Disable LLM extraction, use regex-only mode.
+    --llm-timeout N     Per-call LLM API timeout in seconds (default: 60).
 """
 
 from __future__ import annotations
@@ -304,6 +305,7 @@ def _reparse_document(
     llm_client: object | None = None,
     llm_provider: str | None = None,
     llm_model: str | None = None,
+    llm_timeout: float | None = 60.0,
 ) -> dict:
     """Re-parse a document using a three-tier extraction strategy.
 
@@ -432,6 +434,7 @@ def _reparse_document(
                 client=llm_client,
                 provider=llm_provider,
                 model=llm_model,
+                timeout=llm_timeout,
             )
             llm_latency_ms = round((time.monotonic() - t0) * 1000)
 
@@ -542,6 +545,7 @@ def reingest_batch(
     llm_client: object | None = None,
     llm_provider: str | None = None,
     llm_model: str | None = None,
+    llm_timeout: float | None = 60.0,
 ) -> tuple[int, int, tuple[datetime, str]]:
     """Process one batch. Returns (processed, updated, next_cursor).
 
@@ -672,6 +676,7 @@ def reingest_batch(
                 llm_client,
                 llm_provider,
                 llm_model,
+                llm_timeout,
             )
             parse_futures[future] = (idx, doc_meta)
 
@@ -806,6 +811,7 @@ def run_reingest(
     parse_workers: int = 4,
     parse_timeout: float = 60.0,
     no_llm: bool = False,
+    llm_timeout: float | None = 60.0,
 ) -> dict[str, int]:
     """Run the full reingest. Returns summary stats."""
     filters, filter_params = _build_filters(county, date_from, date_to)
@@ -857,6 +863,7 @@ def run_reingest(
                 llm_client=llm_client,
                 llm_provider=llm_provider,
                 llm_model=llm_model,
+                llm_timeout=llm_timeout,
             )
             total_processed += processed
             total_updated += updated
@@ -929,6 +936,12 @@ def main() -> None:
         action="store_true",
         help="Disable LLM extraction, use regex-only mode.",
     )
+    parser.add_argument(
+        "--llm-timeout",
+        type=float,
+        default=60.0,
+        help="Per-call LLM API timeout in seconds (default: 60).",
+    )
     args = parser.parse_args()
 
     dsn = os.environ.get("DATABASE_URL")
@@ -951,6 +964,7 @@ def main() -> None:
         parse_workers=args.parse_workers,
         parse_timeout=args.parse_timeout,
         no_llm=args.no_llm,
+        llm_timeout=args.llm_timeout,
     )
 
     logger.info(
