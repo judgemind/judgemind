@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING
 import boto3
 import httpx
 
-from .formatting import escape_mdv2, format_status_card
+from .formatting import DEFAULT_GITHUB_REPO, escape_mdv2, format_status_card, linkify_github_refs
 from .models import Message
 
 if TYPE_CHECKING:
@@ -91,16 +91,17 @@ class TelegramBridge:
 
     # ── Public API ───────────────────────────────────────────────────────
 
-    async def notify(self, text: str) -> None:
+    async def notify(self, text: str, *, repo: str = DEFAULT_GITHUB_REPO) -> None:
         """Send a plain-text notification to all allowed users.
 
+        GitHub references (``#N``, ``PR #N``) are converted to clickable links.
         No-op if the bridge is disabled (missing or empty bot token).
         """
         self._ensure_initialised()
         if self._disabled:
             return
-        escaped = escape_mdv2(text)
-        await self._send_to_all(escaped, parse_mode="MarkdownV2")
+        formatted = linkify_github_refs(text, repo=repo)
+        await self._send_to_all(formatted, parse_mode="MarkdownV2")
 
     async def status_update(
         self,
@@ -108,6 +109,7 @@ class TelegramBridge:
         task: str,
         state: str,
         details: str,
+        repo: str = DEFAULT_GITHUB_REPO,
     ) -> None:
         """Send a formatted status card to all allowed users.
 
@@ -116,7 +118,7 @@ class TelegramBridge:
         self._ensure_initialised()
         if self._disabled:
             return
-        card = format_status_card(task=task, state=state, details=details)
+        card = format_status_card(task=task, state=state, details=details, repo=repo)
         await self._send_to_all(card, parse_mode="MarkdownV2")
 
     async def ask(

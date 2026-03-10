@@ -151,7 +151,11 @@ class TestLifecycleNotifications:
 
             assert route.call_count == 1
             body = json.loads(route.calls[0].request.content)
-            assert "#42" in body["text"]
+            # Should contain a clickable link to issue #42.
+            assert "https://github.com/judgemind/judgemind/issues/42" in body["text"]
+            # Should say "Issue", not "Task".
+            assert "Issue" in body["text"]
+            assert "Task" not in body["text"]
 
     @respx.mock
     async def test_task_started_tracks_worker(self) -> None:
@@ -374,7 +378,7 @@ class TestHandleCommand:
 
 class TestReplyStatus:
     @respx.mock
-    async def test_no_workers_sends_no_active_tasks(self) -> None:
+    async def test_no_workers_sends_no_active_issues(self) -> None:
         with mock_aws():
             _setup_secret()
             route = respx.post("https://api.telegram.org/botfake-bot-token/sendMessage").mock(
@@ -387,7 +391,7 @@ class TestReplyStatus:
             await bridge.close()
 
             body = json.loads(route.calls[0].request.content)
-            assert "no active tasks" in body["text"].lower()
+            assert "no active issues" in body["text"].lower()
 
     @respx.mock
     async def test_with_workers_lists_them(self) -> None:
@@ -409,7 +413,8 @@ class TestReplyStatus:
             await bridge.close()
 
             body = json.loads(route.calls[0].request.content)
-            assert "#42" in body["text"]
+            # Issue reference should be a clickable link.
+            assert "https://github.com/judgemind/judgemind/issues/42" in body["text"]
             assert "Worker\\-3" in body["text"] or "Worker-3" in body["text"]
 
     @respx.mock

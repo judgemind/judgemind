@@ -115,7 +115,7 @@ class TestStatusUpdate:
             assert route.call_count == 1
             body = json.loads(route.calls[0].request.content)
             assert body["parse_mode"] == "MarkdownV2"
-            assert "Task" in body["text"]
+            assert "Issue" in body["text"]
 
 
 # ── ask() ────────────────────────────────────────────────────────────────
