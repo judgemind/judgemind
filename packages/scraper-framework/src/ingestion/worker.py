@@ -51,7 +51,13 @@ from .extract import (
     extract_outcome,
     extract_parties_from_caption,
 )
-from .llm_extract import LLMExtractionResult, LLMRulingResult, extract_fields_llm
+from .llm_extract import (
+    LLMExtractionResult,
+    LLMRulingResult,
+    extract_fields_llm,
+    extract_text_from_pdf,
+    is_pdf_binary,
+)
 from .llm_providers import create_client as create_llm_client
 from .text_cleanup import clean_ruling_text
 
@@ -305,6 +311,27 @@ class IngestionWorker:
         s3_bucket: str | None = event_data.get("s3_bucket")
         source_url: str = event_data.get("source_url", "")
         scraper_id: str = event_data.get("scraper_id", "")
+
+        # PDF preprocessing: if ruling_text is raw PDF binary, extract text first.
+        # This handles documents where the scraper stored raw PDF bytes instead of
+        # extracted text (e.g. Riverside, Orange county PDFs).
+        if ruling_text and content_format == "pdf" and is_pdf_binary(ruling_text):
+            extracted_pdf_text = extract_text_from_pdf(ruling_text)
+            if extracted_pdf_text:
+                logger.info(
+                    "Extracted text from raw PDF binary",
+                    extra={
+                        "document_id": document_id,
+                        "original_length": len(ruling_text),
+                        "extracted_length": len(extracted_pdf_text),
+                    },
+                )
+                ruling_text = extracted_pdf_text
+            else:
+                logger.warning(
+                    "PDF text extraction returned no text — LLM may fail",
+                    extra={"document_id": document_id},
+                )
 
         # Parse timestamps
         capture_ts = _parse_datetime(event_data.get("capture_timestamp"))
