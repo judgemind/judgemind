@@ -14,6 +14,7 @@ import fcntl
 import json
 import logging
 import os
+import uuid
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -228,6 +229,34 @@ def _parse_inbox_entry(entry: dict[str, Any]) -> Command:
     return parse_command(text)
 
 
+# ── Pending reply tracking ──────────────────────────────────────────────────
+
+#: Default timeout in seconds for pending replies before a fallback is sent.
+DEFAULT_REPLY_TIMEOUT_SECONDS: float = 60.0
+
+
+@dataclass
+class PendingReply:
+    """Tracks an outbound reply that the orchestrator owes the user.
+
+    When the orchestrator picks up a ``discuss``, ``do``, or ``free_text``
+    command, a :class:`PendingReply` is created.  The orchestrator is expected
+    to call :meth:`OrchestratorBridge.resolve_pending_reply` (or use the
+    ``command_id`` parameter on :meth:`OrchestratorBridge.reply`) when it has
+    finished processing.  If no reply arrives within *timeout_seconds*, the
+    bridge sends a fallback message.
+    """
+
+    command_id: str
+    kind: str
+    raw_text: str
+    reply_to: int | None = None
+    created_at: datetime.datetime = field(
+        default_factory=lambda: datetime.datetime.now(datetime.UTC)
+    )
+    fallback_sent: bool = False
+
+
 # ── Worker state (used for status replies) ─────────────────────────────────
 
 
@@ -274,6 +303,8 @@ class OrchestratorBridge:
     _workers: dict[int, WorkerInfo] = field(default_factory=dict)
     _stopped_issues: set[int] = field(default_factory=set)
     _recently_completed: list[dict[str, Any]] = field(default_factory=list)
+    _pending_replies: dict[str, PendingReply] = field(default_factory=dict)
+    reply_timeout_seconds: float = DEFAULT_REPLY_TIMEOUT_SECONDS
 
     def __post_init__(self) -> None:
         """Load persisted state from *state_file* if it exists."""
@@ -539,16 +570,102 @@ class OrchestratorBridge:
 
     # ── Reply helpers ───────────────────────────────────────────────────
 
-    async def reply(self, text: str) -> None:
+    async def reply(
+        self,
+        text: str,
+        *,
+        command_id: str | None = None,
+        reply_to_message_id: int | None = None,
+    ) -> None:
         """Send a free-form reply back to Telegram.
 
-        Use this after processing a ``FREE_TEXT`` command to send the
-        orchestrator's response back to the user via Telegram, making
-        the channel truly bidirectional.
+        Use this after processing a ``discuss``, ``do``, or ``free_text``
+        command to send the orchestrator's response back to the user via
+        Telegram, making the channel truly bidirectional.
+
+        Args:
+            text: The reply text to send.
+            command_id: If provided, resolves the corresponding pending
+                reply so that no timeout fallback is sent.
+            reply_to_message_id: If provided, the Telegram ``message_id``
+                to thread this reply to (sets ``reply_to_message_id`` in
+                the Telegram API payload).
 
         No-op if the bridge is disabled.
         """
-        await self.bridge.notify(text, repo=self.repo)
+        if command_id is not None:
+            self.resolve_pending_reply(command_id)
+        await self.bridge.notify(text, repo=self.repo, reply_to_message_id=reply_to_message_id)
+
+    # ── Pending reply tracking ─────────────────────────────────────────
+
+    def _track_pending_reply(
+        self,
+        *,
+        kind: str,
+        raw_text: str,
+        reply_to: int | None = None,
+    ) -> str:
+        """Create a pending reply record and return its unique command ID.
+
+        Called internally by :meth:`handle_command` for ``discuss``, ``do``,
+        and ``free_text`` commands.
+        """
+        command_id = uuid.uuid4().hex
+        self._pending_replies[command_id] = PendingReply(
+            command_id=command_id,
+            kind=kind,
+            raw_text=raw_text,
+            reply_to=reply_to,
+        )
+        return command_id
+
+    def resolve_pending_reply(self, command_id: str) -> PendingReply | None:
+        """Remove a pending reply record, indicating it has been answered.
+
+        Returns the removed :class:`PendingReply`, or ``None`` if the
+        *command_id* was not found (already resolved or never tracked).
+        """
+        return self._pending_replies.pop(command_id, None)
+
+    async def check_reply_timeouts(
+        self,
+        timeout_seconds: float | None = None,
+    ) -> list[PendingReply]:
+        """Check all pending replies and send a fallback for any that have timed out.
+
+        Args:
+            timeout_seconds: Override the default timeout. If ``None``, uses
+                :attr:`reply_timeout_seconds`.
+
+        Returns:
+            A list of :class:`PendingReply` entries that timed out and
+            received a fallback message.
+        """
+        if timeout_seconds is None:
+            timeout_seconds = self.reply_timeout_seconds
+
+        now = datetime.datetime.now(datetime.UTC)
+        timed_out: list[PendingReply] = []
+
+        for pending in list(self._pending_replies.values()):
+            if pending.fallback_sent:
+                continue
+            elapsed = (now - pending.created_at).total_seconds()
+            if elapsed >= timeout_seconds:
+                pending.fallback_sent = True
+                timed_out.append(pending)
+                await self.bridge.notify(
+                    "Still working on your request \u2014 will reply when ready.",
+                    repo=self.repo,
+                    reply_to_message_id=pending.reply_to,
+                )
+
+        return timed_out
+
+    def get_pending_replies(self) -> list[PendingReply]:
+        """Return a snapshot of all pending reply records."""
+        return list(self._pending_replies.values())
 
     async def notify(self, text: str, *, repo: str = DEFAULT_GITHUB_REPO) -> None:
         """Send a plain-text notification to all allowed users.
@@ -657,34 +774,42 @@ class OrchestratorBridge:
             result["reply_to"] = cmd.reply_to
 
         elif cmd.kind == CommandKind.DISCUSS:
-            await self.bridge.notify(
-                "Passing your question to the orchestrator — it has full codebase "
-                "context and will reply shortly.",
-                repo=self.repo,
+            # No Telegram notification here — the responder daemon already
+            # replied to the user with a Claude-generated acknowledgment.
+            command_id = self._track_pending_reply(
+                kind="discuss", raw_text=cmd.message, reply_to=cmd.reply_to
             )
             result["reply"] = "Forwarded to orchestrator for discussion."
             result["action"] = "discuss"
             result["message"] = cmd.message
             result["reply_to"] = cmd.reply_to
             result["needs_reply"] = True
+            result["command_id"] = command_id
 
         elif cmd.kind == CommandKind.DO:
-            await self.bridge.notify(
-                "On it — forwarding your request to the orchestrator.",
-                repo=self.repo,
+            # No Telegram notification here — the responder daemon already
+            # replied to the user with a Claude-generated acknowledgment.
+            command_id = self._track_pending_reply(
+                kind="do", raw_text=cmd.instruction, reply_to=cmd.reply_to
             )
             result["reply"] = "Forwarded to orchestrator for execution."
             result["action"] = "do"
             result["instruction"] = cmd.instruction
             result["reply_to"] = cmd.reply_to
             result["needs_reply"] = True
+            result["command_id"] = command_id
 
         elif cmd.kind == CommandKind.FREE_TEXT:
-            await self.bridge.notify(f"Received: {cmd.raw_text}", repo=self.repo)
+            # No Telegram notification here — the responder daemon already
+            # replied to the user with a Claude-generated acknowledgment.
+            command_id = self._track_pending_reply(
+                kind="free_text", raw_text=cmd.raw_text, reply_to=cmd.reply_to
+            )
             result["reply"] = f"Forwarded to orchestrator: {cmd.raw_text}"
             result["action"] = "forward"
             result["text"] = cmd.raw_text
             result["needs_reply"] = True
+            result["command_id"] = command_id
 
         return result
 

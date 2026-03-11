@@ -16,6 +16,7 @@ from .orchestrator import (
     InstructionKind,
     OrchestratorBridge,
     OrchestratorInstruction,
+    PendingReply,
     create_orchestrator_bridge,
 )
 from .validation import ValidationResult, validate_github_links, validate_telegram_payload
@@ -28,6 +29,7 @@ __all__ = [
     "Message",
     "OrchestratorBridge",
     "OrchestratorInstruction",
+    "PendingReply",
     "RateLimitError",
     "RateLimiter",
     "SentMessage",

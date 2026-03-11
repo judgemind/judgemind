@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import datetime
 import json
 from pathlib import Path
 
@@ -14,6 +15,7 @@ from telegram_bridge import (
     Command,
     CommandKind,
     OrchestratorBridge,
+    PendingReply,
     TelegramBridge,
     create_orchestrator_bridge,
 )
@@ -1478,10 +1480,11 @@ class TestHandleCommandNewTypes:
             assert result["reply_to"] == 12345
 
     @respx.mock
-    async def test_handle_discuss(self) -> None:
+    async def test_handle_discuss_no_duplicate_notification(self) -> None:
+        """Discuss commands should NOT send a Telegram notification (responder already did)."""
         with mock_aws():
             _setup_secret()
-            respx.post("https://api.telegram.org/botfake-bot-token/sendMessage").mock(
+            route = respx.post("https://api.telegram.org/botfake-bot-token/sendMessage").mock(
                 return_value=httpx.Response(200, json={"ok": True})
             )
 
@@ -1499,12 +1502,16 @@ class TestHandleCommandNewTypes:
             assert result["action"] == "discuss"
             assert result["message"] == "Should we use Redis?"
             assert result["needs_reply"] is True
+            assert "command_id" in result
+            # No Telegram message should have been sent by handle_command.
+            assert route.call_count == 0
 
     @respx.mock
-    async def test_handle_do(self) -> None:
+    async def test_handle_do_no_duplicate_notification(self) -> None:
+        """Do commands should NOT send a Telegram notification (responder already did)."""
         with mock_aws():
             _setup_secret()
-            respx.post("https://api.telegram.org/botfake-bot-token/sendMessage").mock(
+            route = respx.post("https://api.telegram.org/botfake-bot-token/sendMessage").mock(
                 return_value=httpx.Response(200, json={"ok": True})
             )
 
@@ -1522,6 +1529,30 @@ class TestHandleCommandNewTypes:
             assert result["action"] == "do"
             assert result["instruction"] == "Merge PR #750"
             assert result["needs_reply"] is True
+            assert "command_id" in result
+            # No Telegram message should have been sent by handle_command.
+            assert route.call_count == 0
+
+    @respx.mock
+    async def test_handle_free_text_no_duplicate_notification(self) -> None:
+        """Free-text commands should NOT send a Telegram notification (responder already did)."""
+        with mock_aws():
+            _setup_secret()
+            route = respx.post("https://api.telegram.org/botfake-bot-token/sendMessage").mock(
+                return_value=httpx.Response(200, json={"ok": True})
+            )
+
+            bridge = _make_bridge()
+            orch = OrchestratorBridge(bridge=bridge)
+            result = await orch.handle_command(
+                Command(kind=CommandKind.FREE_TEXT, raw_text="how are scrapers doing?")
+            )
+            await bridge.close()
+
+            assert result["needs_reply"] is True
+            assert "command_id" in result
+            # No Telegram message should have been sent by handle_command.
+            assert route.call_count == 0
 
 
 # ── OrchestratorInstruction parsing ────────────────────────────────────
@@ -1764,3 +1795,304 @@ class TestCreateOrchestratorBridgeOrchestratorInbox:
         with mock_aws():
             orch = create_orchestrator_bridge(orchestrator_inbox_path="/tmp/test_orch_inbox.json")
             assert orch.orchestrator_inbox_path == "/tmp/test_orch_inbox.json"
+
+
+# ── Pending reply tracking ──────────────────────────────────────────────
+
+
+class TestPendingReplyTracking:
+    """Tests for the pending reply tracking system (discuss/do timeout fallback)."""
+
+    @respx.mock
+    async def test_discuss_creates_pending_reply(self) -> None:
+        """handle_command(DISCUSS) should create a pending reply entry."""
+        with mock_aws():
+            _setup_secret()
+            respx.post("https://api.telegram.org/botfake-bot-token/sendMessage").mock(
+                return_value=httpx.Response(200, json={"ok": True})
+            )
+
+            bridge = _make_bridge()
+            orch = OrchestratorBridge(bridge=bridge)
+            result = await orch.handle_command(
+                Command(
+                    kind=CommandKind.DISCUSS,
+                    message="Should we use Redis?",
+                    reply_to=12345,
+                )
+            )
+            await bridge.close()
+
+            pending = orch.get_pending_replies()
+            assert len(pending) == 1
+            assert pending[0].kind == "discuss"
+            assert pending[0].raw_text == "Should we use Redis?"
+            assert pending[0].reply_to == 12345
+            assert pending[0].command_id == result["command_id"]
+
+    @respx.mock
+    async def test_do_creates_pending_reply(self) -> None:
+        """handle_command(DO) should create a pending reply entry."""
+        with mock_aws():
+            _setup_secret()
+            respx.post("https://api.telegram.org/botfake-bot-token/sendMessage").mock(
+                return_value=httpx.Response(200, json={"ok": True})
+            )
+
+            bridge = _make_bridge()
+            orch = OrchestratorBridge(bridge=bridge)
+            result = await orch.handle_command(
+                Command(
+                    kind=CommandKind.DO,
+                    instruction="Merge PR #750",
+                    reply_to=12345,
+                )
+            )
+            await bridge.close()
+
+            pending = orch.get_pending_replies()
+            assert len(pending) == 1
+            assert pending[0].kind == "do"
+            assert pending[0].raw_text == "Merge PR #750"
+            assert pending[0].command_id == result["command_id"]
+
+    @respx.mock
+    async def test_resolve_pending_reply_removes_entry(self) -> None:
+        with mock_aws():
+            _setup_secret()
+            respx.post("https://api.telegram.org/botfake-bot-token/sendMessage").mock(
+                return_value=httpx.Response(200, json={"ok": True})
+            )
+
+            bridge = _make_bridge()
+            orch = OrchestratorBridge(bridge=bridge)
+            result = await orch.handle_command(
+                Command(kind=CommandKind.DISCUSS, message="test", reply_to=12345)
+            )
+            command_id = result["command_id"]
+
+            assert len(orch.get_pending_replies()) == 1
+            resolved = orch.resolve_pending_reply(command_id)
+            assert resolved is not None
+            assert resolved.command_id == command_id
+            assert len(orch.get_pending_replies()) == 0
+
+    def test_resolve_unknown_command_id_returns_none(self) -> None:
+        with mock_aws():
+            bridge = _make_bridge()
+            orch = OrchestratorBridge(bridge=bridge)
+            assert orch.resolve_pending_reply("nonexistent") is None
+
+    @respx.mock
+    async def test_reply_with_command_id_resolves_pending(self) -> None:
+        """Calling reply() with command_id should auto-resolve the pending entry."""
+        with mock_aws():
+            _setup_secret()
+            respx.post("https://api.telegram.org/botfake-bot-token/sendMessage").mock(
+                return_value=httpx.Response(200, json={"ok": True})
+            )
+
+            bridge = _make_bridge()
+            orch = OrchestratorBridge(bridge=bridge)
+            result = await orch.handle_command(
+                Command(kind=CommandKind.DISCUSS, message="test", reply_to=12345)
+            )
+            command_id = result["command_id"]
+
+            assert len(orch.get_pending_replies()) == 1
+            await orch.reply("Here is my answer.", command_id=command_id)
+            assert len(orch.get_pending_replies()) == 0
+            await bridge.close()
+
+    @respx.mock
+    async def test_check_reply_timeouts_sends_fallback(self) -> None:
+        """Pending replies that exceed the timeout should get a fallback message."""
+        with mock_aws():
+            _setup_secret()
+            route = respx.post("https://api.telegram.org/botfake-bot-token/sendMessage").mock(
+                return_value=httpx.Response(200, json={"ok": True})
+            )
+
+            bridge = _make_bridge()
+            orch = OrchestratorBridge(bridge=bridge, reply_timeout_seconds=60.0)
+
+            # Manually track a pending reply with a timestamp in the past.
+            orch._pending_replies["test-cmd"] = PendingReply(
+                command_id="test-cmd",
+                kind="discuss",
+                raw_text="Old question",
+                reply_to=12345,
+                created_at=datetime.datetime.now(datetime.UTC) - datetime.timedelta(seconds=120),
+            )
+
+            timed_out = await orch.check_reply_timeouts()
+            await bridge.close()
+
+            assert len(timed_out) == 1
+            assert timed_out[0].command_id == "test-cmd"
+            assert timed_out[0].fallback_sent is True
+            # A fallback message should have been sent.
+            assert route.call_count == 1
+            body = json.loads(route.calls[0].request.content)
+            assert "still working" in body["text"].lower()
+
+    @respx.mock
+    async def test_check_reply_timeouts_skips_recent(self) -> None:
+        """Pending replies within the timeout should not trigger a fallback."""
+        with mock_aws():
+            _setup_secret()
+            route = respx.post("https://api.telegram.org/botfake-bot-token/sendMessage").mock(
+                return_value=httpx.Response(200, json={"ok": True})
+            )
+
+            bridge = _make_bridge()
+            orch = OrchestratorBridge(bridge=bridge, reply_timeout_seconds=60.0)
+
+            # Manually track a pending reply with a recent timestamp.
+            orch._pending_replies["fresh-cmd"] = PendingReply(
+                command_id="fresh-cmd",
+                kind="discuss",
+                raw_text="Recent question",
+                created_at=datetime.datetime.now(datetime.UTC),
+            )
+
+            timed_out = await orch.check_reply_timeouts()
+            await bridge.close()
+
+            assert len(timed_out) == 0
+            assert route.call_count == 0
+
+    @respx.mock
+    async def test_check_reply_timeouts_only_sends_fallback_once(self) -> None:
+        """Fallback should only be sent once per pending reply."""
+        with mock_aws():
+            _setup_secret()
+            route = respx.post("https://api.telegram.org/botfake-bot-token/sendMessage").mock(
+                return_value=httpx.Response(200, json={"ok": True})
+            )
+
+            bridge = _make_bridge()
+            orch = OrchestratorBridge(bridge=bridge, reply_timeout_seconds=60.0)
+
+            orch._pending_replies["test-cmd"] = PendingReply(
+                command_id="test-cmd",
+                kind="do",
+                raw_text="Old instruction",
+                created_at=datetime.datetime.now(datetime.UTC) - datetime.timedelta(seconds=120),
+            )
+
+            # First check sends fallback.
+            timed_out_1 = await orch.check_reply_timeouts()
+            assert len(timed_out_1) == 1
+
+            # Second check should not send another fallback.
+            timed_out_2 = await orch.check_reply_timeouts()
+            assert len(timed_out_2) == 0
+            await bridge.close()
+
+            # Only one message total.
+            assert route.call_count == 1
+
+    @respx.mock
+    async def test_status_commands_do_not_create_pending_reply(self) -> None:
+        """Non-discuss/do commands should not create pending reply entries."""
+        with mock_aws():
+            _setup_secret()
+            respx.post("https://api.telegram.org/botfake-bot-token/sendMessage").mock(
+                return_value=httpx.Response(200, json={"ok": True})
+            )
+
+            bridge = _make_bridge()
+            orch = OrchestratorBridge(bridge=bridge)
+            await orch.handle_command(Command(kind=CommandKind.STATUS))
+            await orch.handle_command(Command(kind=CommandKind.PAUSE))
+            await bridge.close()
+
+            assert len(orch.get_pending_replies()) == 0
+
+
+# ── reply_to_message_id threading ───────────────────────────────────────
+
+
+class TestReplyToMessageId:
+    """Tests for reply_to_message_id support in outbound messages."""
+
+    @respx.mock
+    async def test_reply_with_reply_to_message_id(self) -> None:
+        """reply() should pass reply_to_message_id to the Telegram API."""
+        with mock_aws():
+            _setup_secret()
+            route = respx.post("https://api.telegram.org/botfake-bot-token/sendMessage").mock(
+                return_value=httpx.Response(200, json={"ok": True})
+            )
+
+            bridge = _make_bridge()
+            orch = OrchestratorBridge(bridge=bridge)
+            await orch.reply("Answering your question.", reply_to_message_id=42)
+            await bridge.close()
+
+            assert route.call_count == 1
+            body = json.loads(route.calls[0].request.content)
+            assert body["reply_to_message_id"] == 42
+
+    @respx.mock
+    async def test_reply_without_reply_to_message_id(self) -> None:
+        """reply() without reply_to_message_id should not include it in the payload."""
+        with mock_aws():
+            _setup_secret()
+            route = respx.post("https://api.telegram.org/botfake-bot-token/sendMessage").mock(
+                return_value=httpx.Response(200, json={"ok": True})
+            )
+
+            bridge = _make_bridge()
+            orch = OrchestratorBridge(bridge=bridge)
+            await orch.reply("Just a message.")
+            await bridge.close()
+
+            assert route.call_count == 1
+            body = json.loads(route.calls[0].request.content)
+            assert "reply_to_message_id" not in body
+
+    @respx.mock
+    async def test_notify_with_reply_to_message_id(self) -> None:
+        """TelegramBridge.notify() should support reply_to_message_id."""
+        with mock_aws():
+            _setup_secret()
+            route = respx.post("https://api.telegram.org/botfake-bot-token/sendMessage").mock(
+                return_value=httpx.Response(200, json={"ok": True})
+            )
+
+            bridge = _make_bridge()
+            await bridge.notify("Threaded reply.", reply_to_message_id=99)
+            await bridge.close()
+
+            assert route.call_count == 1
+            body = json.loads(route.calls[0].request.content)
+            assert body["reply_to_message_id"] == 99
+
+    @respx.mock
+    async def test_timeout_fallback_includes_reply_to(self) -> None:
+        """Timeout fallback should include reply_to_message_id if set on the pending reply."""
+        with mock_aws():
+            _setup_secret()
+            route = respx.post("https://api.telegram.org/botfake-bot-token/sendMessage").mock(
+                return_value=httpx.Response(200, json={"ok": True})
+            )
+
+            bridge = _make_bridge()
+            orch = OrchestratorBridge(bridge=bridge, reply_timeout_seconds=60.0)
+
+            orch._pending_replies["test-cmd"] = PendingReply(
+                command_id="test-cmd",
+                kind="discuss",
+                raw_text="Question",
+                reply_to=42,
+                created_at=datetime.datetime.now(datetime.UTC) - datetime.timedelta(seconds=120),
+            )
+
+            await orch.check_reply_timeouts()
+            await bridge.close()
+
+            assert route.call_count == 1
+            body = json.loads(route.calls[0].request.content)
+            assert body.get("reply_to_message_id") == 42
