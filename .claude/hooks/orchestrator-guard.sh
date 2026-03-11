@@ -11,6 +11,10 @@
 # the agent's CWD. This prevents false positives when the CWD is on main but
 # the target file lives in a worktree on a feature branch.
 #
+# When the file's directory doesn't exist yet (new file in a new subdirectory),
+# the hook walks up the path hierarchy to find the nearest existing ancestor
+# directory and resolves the branch from there.
+#
 # Exceptions (always allowed, even on main):
 #   - Files under tmp/          (orchestrator temp files)
 #   - Files under ~/.claude/    (memory updates)
@@ -39,8 +43,17 @@ FILE_DIR=$(dirname "$FILE_PATH")
 if [ -d "$FILE_DIR" ]; then
     BRANCH=$(git -C "$FILE_DIR" symbolic-ref --short HEAD 2>/dev/null || echo "")
 else
-    # Directory doesn't exist yet (new file) — fall back to CWD
-    BRANCH=$(git symbolic-ref --short HEAD 2>/dev/null || echo "")
+    # Directory doesn't exist yet (new file) — walk up the path hierarchy
+    # to find the nearest existing ancestor directory
+    WALK="$FILE_DIR"
+    while [ ! -d "$WALK" ] && [ "$WALK" != "/" ]; do
+        WALK=$(dirname "$WALK")
+    done
+    if [ -d "$WALK" ]; then
+        BRANCH=$(git -C "$WALK" symbolic-ref --short HEAD 2>/dev/null || echo "")
+    else
+        BRANCH=$(git symbolic-ref --short HEAD 2>/dev/null || echo "")
+    fi
 fi
 
 # If not on main or master, allow everything
