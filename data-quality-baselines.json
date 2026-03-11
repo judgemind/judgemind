@@ -36,5 +36,6 @@
       "expected_daily_rulings": 8,
       "schedule_type": "daily"
     }
-  }
+  },
+  "field_completeness": {}
 }
