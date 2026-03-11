@@ -1,8 +1,7 @@
 'use client';
 
 import Link from 'next/link';
-import { cleanRulingText } from '@/lib/display-helpers';
-import { buildDownloadUrl, FORMAT_LABELS } from '../../cases/[id]/CaseDetail';
+import { buildDownloadUrl, cleanRulingText, FORMAT_LABELS } from '@/lib/display-helpers';
 
 interface RulingProps {
   ruling: {

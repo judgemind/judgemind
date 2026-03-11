@@ -4,7 +4,7 @@ import {
   formatOutcome,
   formatMotionType,
   formatJudgeName,
-} from '../src/app/rulings/RulingsFeed';
+} from '../src/lib/display-helpers';
 
 describe('formatDate', () => {
   it('formats an ISO date as a short readable date', () => {

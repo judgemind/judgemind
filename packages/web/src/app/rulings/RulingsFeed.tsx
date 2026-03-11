@@ -4,8 +4,10 @@ import { useState } from 'react';
 import { useQuery, gql } from '@apollo/client';
 import Link from 'next/link';
 import {
-  formatDate as _formatDate,
-  formatOutcome as _formatOutcome,
+  formatDate,
+  formatOutcome,
+  formatMotionType,
+  formatJudgeName,
 } from '@/lib/display-helpers';
 
 const RULINGS_QUERY = gql`
@@ -78,49 +80,6 @@ interface RulingsData {
     edges: Array<{ cursor: string; node: RulingNode }>;
     pageInfo: { hasNextPage: boolean; endCursor: string | null };
   };
-}
-
-// Re-export from shared helpers so existing imports from this module continue to work.
-export const formatDate = _formatDate;
-export const formatOutcome = _formatOutcome;
-
-/**
- * Known full motion type mappings (lowercased key -> display label).
- * Checked before the generic title-case logic so compound terms like
- * "anti_slapp" render correctly.
- */
-const MOTION_TYPE_MAP: Record<string, string> = {
-  anti_slapp: 'Anti-SLAPP',
-};
-
-/** Abbreviations that should stay fully uppercase. */
-const UPPERCASE_MOTION_WORDS = new Set(['msj', 'mtd', 'mil']);
-
-/** Small words that stay lowercase unless they are the first word. */
-const LOWERCASE_WORDS = new Set(['to', 'for', 'of', 'in', 'on', 'the', 'a', 'an']);
-
-/** Format a motion type for display, returning a placeholder for null values. */
-export function formatMotionType(motionType: string | null): string {
-  if (!motionType) return 'Not classified';
-  const key = motionType.toLowerCase();
-  if (MOTION_TYPE_MAP[key]) return MOTION_TYPE_MAP[key];
-  return key
-    .replace(/_/g, ' ')
-    .split(' ')
-    .map((word, i) => {
-      if (UPPERCASE_MOTION_WORDS.has(word)) return word.toUpperCase();
-      if (i > 0 && LOWERCASE_WORDS.has(word)) return word;
-      return word.charAt(0).toUpperCase() + word.slice(1);
-    })
-    .join(' ');
-}
-
-/** Format a judge name for display, returning a placeholder for null values. */
-export function formatJudgeName(
-  judge: { canonicalName: string } | null,
-): string {
-  if (!judge) return 'Unknown judge';
-  return judge.canonicalName;
 }
 
 const PAGE_SIZE = 20;

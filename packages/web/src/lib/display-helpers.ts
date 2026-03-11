@@ -301,6 +301,137 @@ export function detectParagraphs(text: string): string {
   return result.join('\n');
 }
 
+// ---------------------------------------------------------------------------
+// Motion type formatting
+// ---------------------------------------------------------------------------
+
+/**
+ * Known full motion type mappings (lowercased key -> display label).
+ * Checked before the generic title-case logic so compound terms like
+ * "anti_slapp" render correctly.
+ */
+const MOTION_TYPE_MAP: Record<string, string> = {
+  anti_slapp: 'Anti-SLAPP',
+};
+
+/** Abbreviations that should stay fully uppercase. */
+const UPPERCASE_MOTION_WORDS = new Set(['msj', 'mtd', 'mil']);
+
+/** Small words that stay lowercase unless they are the first word. */
+const LOWERCASE_WORDS = new Set(['to', 'for', 'of', 'in', 'on', 'the', 'a', 'an']);
+
+/** Format a motion type for display, returning a placeholder for null values. */
+export function formatMotionType(motionType: string | null): string {
+  if (!motionType) return 'Not classified';
+  const key = motionType.toLowerCase();
+  if (MOTION_TYPE_MAP[key]) return MOTION_TYPE_MAP[key];
+  return key
+    .replace(/_/g, ' ')
+    .split(' ')
+    .map((word, i) => {
+      if (UPPERCASE_MOTION_WORDS.has(word)) return word.toUpperCase();
+      if (i > 0 && LOWERCASE_WORDS.has(word)) return word;
+      return word.charAt(0).toUpperCase() + word.slice(1);
+    })
+    .join(' ');
+}
+
+// ---------------------------------------------------------------------------
+// Judge name formatting
+// ---------------------------------------------------------------------------
+
+/** Format a judge name for display, returning a placeholder for null values. */
+export function formatJudgeName(
+  judge: { canonicalName: string } | null,
+): string {
+  if (!judge) return 'Unknown judge';
+  return judge.canonicalName;
+}
+
+// ---------------------------------------------------------------------------
+// Document helpers
+// ---------------------------------------------------------------------------
+
+/** Map document format to a human-readable label. */
+export const FORMAT_LABELS: Record<string, string> = {
+  pdf: 'PDF',
+  html: 'HTML',
+  txt: 'TXT',
+  docx: 'DOCX',
+};
+
+/** Build the download URL for a document. Uses the same origin as the GraphQL API. */
+export function buildDownloadUrl(documentId: string): string {
+  const graphqlUrl = process.env.NEXT_PUBLIC_GRAPHQL_URL ?? 'http://localhost:3001/graphql';
+  const baseUrl = graphqlUrl.replace(/\/graphql$/, '');
+  return `${baseUrl}/api/documents/${documentId}/download`;
+}
+
+// ---------------------------------------------------------------------------
+// Text truncation
+// ---------------------------------------------------------------------------
+
+/** Number of characters shown before truncation. */
+export const RULING_TEXT_TRUNCATE_LENGTH = 500;
+
+/**
+ * Truncate text to `maxLen` characters, breaking at the last whitespace
+ * boundary before the limit. Returns the original string if it fits.
+ */
+export function truncateText(text: string, maxLen: number): string {
+  if (text.length <= maxLen) return text;
+  const truncated = text.slice(0, maxLen);
+  const lastSpace = truncated.lastIndexOf(' ');
+  // If there's a space in the first half, break there; otherwise hard-cut.
+  if (lastSpace > maxLen / 2) {
+    return truncated.slice(0, lastSpace) + '\u2026';
+  }
+  return truncated + '\u2026';
+}
+
+// ---------------------------------------------------------------------------
+// Party grouping
+// ---------------------------------------------------------------------------
+
+/** Party roles grouped as plaintiffs. */
+const PLAINTIFF_ROLES = new Set(['plaintiff', 'petitioner', 'cross_complainant', 'moving_party']);
+
+/** Party roles grouped as defendants. */
+const DEFENDANT_ROLES = new Set(['defendant', 'respondent', 'cross_defendant', 'responding_party']);
+
+/**
+ * Group parties into plaintiffs, defendants, and other columns.
+ * Uses the case-specific ``role`` from the case_parties join table
+ * (plaintiff, defendant, petitioner, etc.). Falls back to ``partyType``
+ * for legacy data that only has entity classification.
+ */
+export function groupParties(
+  parties: Array<{ id: string; canonicalName: string; partyType: string | null; role: string | null }>,
+): {
+  plaintiffs: typeof parties;
+  defendants: typeof parties;
+  others: typeof parties;
+} {
+  const plaintiffs: typeof parties = [];
+  const defendants: typeof parties = [];
+  const others: typeof parties = [];
+  for (const party of parties) {
+    const key = (party.role ?? party.partyType ?? '').toLowerCase();
+    if (PLAINTIFF_ROLES.has(key)) {
+      plaintiffs.push(party);
+    } else if (DEFENDANT_ROLES.has(key)) {
+      defendants.push(party);
+    } else {
+      others.push(party);
+    }
+  }
+  return { plaintiffs, defendants, others };
+}
+
+// ---------------------------------------------------------------------------
+// Ruling text cleanup (display-time)
+// ---------------------------------------------------------------------------
+
 /**
  * Clean ruling text for display.
  *
