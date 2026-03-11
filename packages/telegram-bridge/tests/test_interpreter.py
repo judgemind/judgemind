@@ -9,6 +9,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from telegram_bridge.interpreter import (
+    _SYSTEM_PROMPT,
     InterpretedMessage,
     RateLimiter,
     RateLimitError,
@@ -400,3 +401,69 @@ class TestRateLimiter:
         with pytest.raises(RateLimitError) as exc_info:
             limiter.acquire()
         assert 0 < exc_info.value.retry_after <= 30.0
+
+
+# ── _SYSTEM_PROMPT content ────────────────────────────────────────────
+
+
+class TestSystemPromptContent:
+    """Verify the system prompt includes the tightened forwarding criteria."""
+
+    def test_has_decision_tree_section(self) -> None:
+        assert "Deciding when to forward vs. answer directly" in _SYSTEM_PROMPT
+
+    def test_prioritizes_status_context_answering(self) -> None:
+        # The decision tree should instruct answering from status context first.
+        assert "Answerable from the orchestrator status context?" in _SYSTEM_PROMPT
+
+    def test_status_answer_comes_before_discuss(self) -> None:
+        # The "answer from status" rule must appear before the "discuss" rule
+        # to ensure the model checks status-answerable questions first.
+        status_pos = _SYSTEM_PROMPT.index("Answerable from the orchestrator status context?")
+        discuss_pos = _SYSTEM_PROMPT.index("Requires codebase access?")
+        assert status_pos < discuss_pos
+
+    def test_has_direct_reply_examples(self) -> None:
+        # The prompt should include examples of questions answerable from status.
+        assert "How many workers are active?" in _SYSTEM_PROMPT
+        assert "What's the queue look like?" in _SYSTEM_PROMPT
+
+    def test_has_discuss_examples(self) -> None:
+        # The prompt should include examples of questions requiring codebase access.
+        assert "Why is the OC scraper failing?" in _SYSTEM_PROMPT
+
+    def test_has_do_examples(self) -> None:
+        # The prompt should include examples of actions for the orchestrator.
+        assert "Merge PR #750" in _SYSTEM_PROMPT
+
+    def test_instructs_empty_actions_for_status_queries(self) -> None:
+        # The prompt should explicitly say to use an empty actions array
+        # for status-answerable questions.
+        assert "empty `actions` array" in _SYSTEM_PROMPT
+
+    def test_warns_against_forwarding_status_queries(self) -> None:
+        # The prompt should explicitly warn against using discuss/do for
+        # status-answerable questions.
+        assert 'Do NOT forward these as "discuss" or "do"' in _SYSTEM_PROMPT
+
+
+# ── System prompt passed to API ───────────────────────────────────────
+
+
+class TestSystemPromptPassedToApi:
+    """Verify the updated system prompt is actually sent to the Claude API."""
+
+    @patch("telegram_bridge.interpreter.anthropic.Anthropic")
+    def test_system_prompt_includes_decision_tree(self, mock_cls: MagicMock) -> None:
+        mock_client = MagicMock()
+        mock_cls.return_value = mock_client
+        mock_client.messages.create.return_value = _make_mock_response(
+            json.dumps({"reply": "ok", "actions": []})
+        )
+
+        interpret_message(text="hi", api_key="test-key", rate_limiter=None)
+
+        call_args = mock_client.messages.create.call_args
+        system_prompt = call_args.kwargs["system"]
+        assert "Deciding when to forward vs. answer directly" in system_prompt
+        assert "Answerable from the orchestrator status context?" in system_prompt
