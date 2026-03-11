@@ -68,6 +68,10 @@ scripts/ecs-run-task.sh scripts/backfill_ruling_fields.py -- --dry-run
 scripts/ecs-run-task.sh --detach scripts/reingest_from_s3.py -- --all
 scripts/ecs-run-task.sh --logs <task-arn>
 
+# Tail logs for a task by ID (printed when the task launches)
+scripts/ecs-task-logs.sh <task-id>
+scripts/ecs-task-logs.sh <task-id> --follow
+
 # Override CPU/memory for heavy workloads
 scripts/ecs-run-task.sh --cpu 2048 --memory 4096 scripts/backfill_parties.py
 ```

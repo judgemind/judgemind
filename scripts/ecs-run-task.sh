@@ -643,17 +643,22 @@ TASK_ID=$(echo "$TASK_ARN" | rev | cut -d'/' -f1 | rev)
 
 echo "Task ARN: ${TASK_ARN}" >&2
 echo "Task ID:  ${TASK_ID}" >&2
+
+# Print the log location so the user can find logs easily
+LOG_GROUP="/ecs/judgemind-ingestion-worker-${ENVIRONMENT}"
+LOG_STREAM="oneshot/oneshot/${TASK_ID}"
+echo "" >&2
+echo "Logs:" >&2
+echo "  Log group:  ${LOG_GROUP}" >&2
+echo "  Log stream: ${LOG_STREAM}" >&2
+echo "  Tail logs:  scripts/ecs-task-logs.sh ${TASK_ID}" >&2
+echo "  Full status: scripts/ecs-run-task.sh --logs ${TASK_ARN}" >&2
 echo "" >&2
 
 # ─── Detach mode: print ARN to stdout and exit ──────────────────────────────
 
 if [[ "$DETACH" == "true" ]]; then
-    LOG_GROUP="/ecs/judgemind-ingestion-worker-${ENVIRONMENT}"
     echo "Detach mode: task launched successfully." >&2
-    echo "Log group: ${LOG_GROUP}" >&2
-    echo "" >&2
-    echo "To check status and retrieve logs later:" >&2
-    echo "  scripts/ecs-run-task.sh --logs ${TASK_ARN}" >&2
 
     # Print the task ARN to stdout (everything else goes to stderr)
     # so callers can capture it easily.
