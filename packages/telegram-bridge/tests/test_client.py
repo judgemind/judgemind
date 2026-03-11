@@ -97,7 +97,7 @@ class TestNotify:
             assert sent_ids == {111, 222}
 
     @respx.mock
-    async def test_notify_uses_markdownv2_parse_mode(self) -> None:
+    async def test_notify_uses_html_parse_mode(self) -> None:
         with mock_aws():
             _setup_secret()
 
@@ -110,7 +110,7 @@ class TestNotify:
             await bridge.close()
 
             body = json.loads(route.calls[0].request.content)
-            assert body["parse_mode"] == "MarkdownV2"
+            assert body["parse_mode"] == "HTML"
 
     @respx.mock
     async def test_notify_linkifies_issue_references(self) -> None:
@@ -126,9 +126,11 @@ class TestNotify:
             await bridge.close()
 
             body = json.loads(route.calls[0].request.content)
-            # Should contain a clickable link for #42
-            assert "[\\#42](https://github.com/judgemind/judgemind/issues/42)" in body["text"]
-            assert body["parse_mode"] == "MarkdownV2"
+            # Should contain a clickable HTML link for #42
+            assert (
+                '<a href="https://github.com/judgemind/judgemind/issues/42">#42</a>' in body["text"]
+            )
+            assert body["parse_mode"] == "HTML"
 
     @respx.mock
     async def test_notify_linkifies_pr_references(self) -> None:
@@ -144,11 +146,14 @@ class TestNotify:
             await bridge.close()
 
             body = json.loads(route.calls[0].request.content)
-            # Should contain a clickable link for PR #549
-            assert "[PR \\#549](https://github.com/judgemind/judgemind/pull/549)" in body["text"]
+            # Should contain a clickable HTML link for PR #549
+            assert (
+                '<a href="https://github.com/judgemind/judgemind/pull/549">PR #549</a>'
+                in body["text"]
+            )
 
     @respx.mock
-    async def test_notify_escapes_special_chars_outside_links(self) -> None:
+    async def test_notify_escapes_html_special_chars_outside_links(self) -> None:
         with mock_aws():
             _setup_secret()
 
@@ -157,14 +162,14 @@ class TestNotify:
             )
 
             bridge = TelegramBridge(region_name="us-west-2")
-            await bridge.notify("Issue #10 (done).")
+            await bridge.notify("Issue #10 <done>.")
             await bridge.close()
 
             body = json.loads(route.calls[0].request.content)
-            # Parentheses around "done" should be escaped for MarkdownV2
-            assert "\\(done\\)" in body["text"]
-            # But the link URL parentheses should NOT be escaped
-            assert "(https://github.com/" in body["text"]
+            # Angle brackets around "done" should be escaped for HTML
+            assert "&lt;done&gt;" in body["text"]
+            # But the link HTML should NOT be escaped
+            assert '<a href="https://github.com/' in body["text"]
 
     @respx.mock
     async def test_notify_disables_link_preview(self) -> None:
@@ -183,7 +188,8 @@ class TestNotify:
             assert body["disable_web_page_preview"] is True
 
     @respx.mock
-    async def test_notify_does_not_escape_exclamation_marks(self) -> None:
+    async def test_notify_does_not_escape_markdown_special_chars(self) -> None:
+        """Characters special in MarkdownV2 but not HTML should pass through."""
         with mock_aws():
             _setup_secret()
 
@@ -196,8 +202,7 @@ class TestNotify:
             await bridge.close()
 
             body = json.loads(route.calls[0].request.content)
-            # The exclamation mark should appear unescaped in the sent text
-            assert "\\!" not in body["text"]
+            # Exclamation marks, underscores, dots etc. should appear unescaped
             assert "working!" in body["text"]
 
     @respx.mock
@@ -215,6 +220,134 @@ class TestNotify:
 
             body = json.loads(route.calls[0].request.content)
             assert "https://github.com/owner/other-repo/issues/99" in body["text"]
+
+
+# ── 400 fallback ─────────────────────────────────────────────────────────
+
+
+class TestFallbackOn400:
+    """When Telegram returns 400 (bad formatting), the client retries as plain text."""
+
+    @respx.mock
+    async def test_notify_retries_as_plain_text_on_400(self) -> None:
+        with mock_aws():
+            _setup_secret(user_ids=[111])
+
+            call_count = 0
+
+            def _side_effect(request: httpx.Request) -> httpx.Response:
+                nonlocal call_count
+                call_count += 1
+                body = json.loads(request.content)
+                if "parse_mode" in body:
+                    # First call with parse_mode returns 400
+                    return httpx.Response(
+                        400,
+                        json={
+                            "ok": False,
+                            "description": "Bad Request: can't parse entities",
+                        },
+                    )
+                # Retry without parse_mode succeeds
+                return httpx.Response(
+                    200,
+                    json={"ok": True, "result": {"message_id": 1, "text": "test"}},
+                )
+
+            route = respx.post("https://api.telegram.org/botfake-bot-token/sendMessage").mock(
+                side_effect=_side_effect
+            )
+
+            bridge = TelegramBridge(region_name="us-west-2")
+            await bridge.notify("Test message with <bad> formatting")
+            await bridge.close()
+
+            # Should have made 2 calls: first with HTML, then plain text fallback
+            assert route.call_count == 2
+
+            # First call should have parse_mode
+            first_body = json.loads(route.calls[0].request.content)
+            assert first_body["parse_mode"] == "HTML"
+
+            # Second call should NOT have parse_mode
+            second_body = json.loads(route.calls[1].request.content)
+            assert "parse_mode" not in second_body
+
+    @respx.mock
+    async def test_notify_fallback_records_empty_parse_mode(self) -> None:
+        with mock_aws():
+            _setup_secret(user_ids=[111])
+
+            def _side_effect(request: httpx.Request) -> httpx.Response:
+                body = json.loads(request.content)
+                if "parse_mode" in body:
+                    return httpx.Response(
+                        400,
+                        json={"ok": False, "description": "Bad Request"},
+                    )
+                return httpx.Response(
+                    200,
+                    json={"ok": True, "result": {"message_id": 1, "text": "test"}},
+                )
+
+            respx.post("https://api.telegram.org/botfake-bot-token/sendMessage").mock(
+                side_effect=_side_effect
+            )
+
+            bridge = TelegramBridge(region_name="us-west-2")
+            await bridge.notify("test")
+            await bridge.close()
+
+            msgs = bridge.last_sent_messages()
+            assert len(msgs) == 1
+            # Fallback should record empty parse_mode
+            assert msgs[0].parse_mode == ""
+
+    @respx.mock
+    async def test_ask_retries_as_plain_text_on_400(self) -> None:
+        with mock_aws():
+            _setup_secret(user_ids=[111])
+            queue_url = _setup_sqs()
+
+            call_count = 0
+
+            def _side_effect(request: httpx.Request) -> httpx.Response:
+                nonlocal call_count
+                call_count += 1
+                body = json.loads(request.content)
+                if "parse_mode" in body:
+                    return httpx.Response(
+                        400,
+                        json={"ok": False, "description": "Bad Request"},
+                    )
+                return httpx.Response(
+                    200,
+                    json={"ok": True, "result": {"message_id": 1, "text": "Q?"}},
+                )
+
+            route = respx.post("https://api.telegram.org/botfake-bot-token/sendMessage").mock(
+                side_effect=_side_effect
+            )
+
+            sqs = boto3.client("sqs", region_name="us-west-2")
+            sqs.send_message(
+                QueueUrl=queue_url,
+                MessageBody=json.dumps(
+                    {
+                        "callback_query_message_id": 1,
+                        "callback_data": "Yes",
+                        "user_id": 111,
+                    }
+                ),
+            )
+
+            bridge = TelegramBridge(region_name="us-west-2", sqs_queue_url=queue_url)
+            result = await bridge.ask("Question?", options=["Yes", "No"], timeout=5.0)
+            await bridge.close()
+
+            assert result == "Yes"
+            # Should have made 2 calls: first with HTML, then plain text fallback
+            assert route.call_count == 2
 
 
 # ── status_update() ─────────────────────────────────────────────────────
@@ -252,8 +385,25 @@ class TestStatusUpdate:
 
             assert route.call_count == 1
             body = json.loads(route.calls[0].request.content)
-            assert body["parse_mode"] == "MarkdownV2"
+            assert body["parse_mode"] == "HTML"
             assert "Issue" in body["text"]
+
+    @respx.mock
+    async def test_status_update_uses_html_bold(self) -> None:
+        with mock_aws():
+            _setup_secret()
+
+            route = respx.post("https://api.telegram.org/botfake-bot-token/sendMessage").mock(
+                return_value=httpx.Response(200, json={"ok": True})
+            )
+
+            bridge = TelegramBridge(region_name="us-west-2")
+            await bridge.status_update(task="#1", state="complete", details="Done.")
+            await bridge.close()
+
+            body = json.loads(route.calls[0].request.content)
+            assert "<b>" in body["text"]
+            assert "</b>" in body["text"]
 
 
 # ── ask() ────────────────────────────────────────────────────────────────
@@ -349,6 +499,35 @@ class TestAsk:
             result = await bridge.ask("Q?", options=["A"])
             assert result is None
 
+    @respx.mock
+    async def test_ask_uses_html_parse_mode(self) -> None:
+        with mock_aws():
+            _setup_secret()
+            queue_url = _setup_sqs()
+
+            route = respx.post("https://api.telegram.org/botfake-bot-token/sendMessage").mock(
+                return_value=httpx.Response(200, json={"ok": True, "result": {"message_id": 1}})
+            )
+
+            sqs = boto3.client("sqs", region_name="us-west-2")
+            sqs.send_message(
+                QueueUrl=queue_url,
+                MessageBody=json.dumps(
+                    {
+                        "callback_query_message_id": 1,
+                        "callback_data": "Yes",
+                        "user_id": 12345,
+                    }
+                ),
+            )
+
+            bridge = TelegramBridge(region_name="us-west-2", sqs_queue_url=queue_url)
+            await bridge.ask("Continue?", options=["Yes", "No"], timeout=5.0)
+            await bridge.close()
+
+            body = json.loads(route.calls[0].request.content)
+            assert body["parse_mode"] == "HTML"
+
 
 # ── poll() ───────────────────────────────────────────────────────────────
 
@@ -432,7 +611,7 @@ class TestDebugInspection:
             assert msgs[0].message_id == 42
             assert msgs[0].rendered_text == "Hello world."
             assert msgs[0].entities == [{"type": "bold", "offset": 0, "length": 5}]
-            assert msgs[0].parse_mode == "MarkdownV2"
+            assert msgs[0].parse_mode == "HTML"
 
     @respx.mock
     async def test_sent_messages_stored_for_multiple_chat_ids(self) -> None:

@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, Any
 import boto3
 import httpx
 
-from .formatting import DEFAULT_GITHUB_REPO, escape_mdv2, format_status_card, linkify_github_refs
+from .formatting import DEFAULT_GITHUB_REPO, escape_html, format_status_card, linkify_github_refs
 from .models import Message, SentMessage
 
 if TYPE_CHECKING:
@@ -122,7 +122,7 @@ class TelegramBridge:
         if self._disabled:
             return
         formatted = linkify_github_refs(text, repo=repo)
-        await self._send_to_all(formatted, parse_mode="MarkdownV2")
+        await self._send_to_all(formatted, parse_mode="HTML")
 
     async def status_update(
         self,
@@ -140,7 +140,7 @@ class TelegramBridge:
         if self._disabled:
             return
         card = format_status_card(task=task, state=state, details=details, repo=repo)
-        await self._send_to_all(card, parse_mode="MarkdownV2")
+        await self._send_to_all(card, parse_mode="HTML")
 
     async def ask(
         self,
@@ -169,11 +169,11 @@ class TelegramBridge:
 
         chat_id = self._chat_ids[0]
         http = await self._get_http()
-        escaped_question = escape_mdv2(question)
-        payload = {
+        escaped_question = escape_html(question)
+        payload: dict[str, Any] = {
             "chat_id": chat_id,
             "text": escaped_question,
-            "parse_mode": "MarkdownV2",
+            "parse_mode": "HTML",
             "reply_markup": keyboard,
             "disable_web_page_preview": True,
         }
@@ -184,12 +184,26 @@ class TelegramBridge:
             f"{_TELEGRAM_API_BASE}/bot{self._bot_token}/sendMessage",
             json=payload,
         )
+
+        # On 400 (bad formatting), retry without parse_mode as plain text.
+        if resp.status_code == 400:
+            logger.warning(
+                "Telegram returned 400 for ask() — retrying as plain text (chat %s).",
+                chat_id,
+            )
+            payload.pop("parse_mode", None)
+            resp = await http.post(
+                f"{_TELEGRAM_API_BASE}/bot{self._bot_token}/sendMessage",
+                json=payload,
+            )
+
         resp.raise_for_status()
         resp_data = resp.json()
         if self._debug:
             logger.debug("Telegram ask() response: %s", json.dumps(resp_data))
 
-        self._record_sent_message(chat_id, escaped_question, "MarkdownV2", resp_data)
+        used_parse_mode = payload.get("parse_mode", "")
+        self._record_sent_message(chat_id, escaped_question, used_parse_mode, resp_data)
         message_id = resp_data.get("result", {}).get("message_id")
 
         # Poll SQS for a callback_query response matching this message.
@@ -273,10 +287,15 @@ class TelegramBridge:
     # ── Internals ────────────────────────────────────────────────────────
 
     async def _send_to_all(self, text: str, *, parse_mode: str) -> None:
-        """Send *text* to every configured chat ID."""
+        """Send *text* to every configured chat ID.
+
+        If Telegram returns 400 (Bad Request) — typically caused by formatting
+        issues — the message is retried as plain text so it is delivered rather
+        than silently dropped.
+        """
         http = await self._get_http()
         for chat_id in self._chat_ids:
-            payload = {
+            payload: dict[str, Any] = {
                 "chat_id": chat_id,
                 "text": text,
                 "parse_mode": parse_mode,
@@ -290,6 +309,29 @@ class TelegramBridge:
                     f"{_TELEGRAM_API_BASE}/bot{self._bot_token}/sendMessage",
                     json=payload,
                 )
+
+                # On 400 (bad formatting), retry without parse_mode as plain text.
+                if resp.status_code == 400:
+                    logger.warning(
+                        "Telegram returned 400 — retrying as plain text (chat %s).",
+                        chat_id,
+                    )
+                    fallback_payload: dict[str, Any] = {
+                        "chat_id": chat_id,
+                        "text": text,
+                        "disable_web_page_preview": True,
+                    }
+                    resp = await http.post(
+                        f"{_TELEGRAM_API_BASE}/bot{self._bot_token}/sendMessage",
+                        json=fallback_payload,
+                    )
+                    resp.raise_for_status()
+                    resp_data = resp.json()
+                    if self._debug:
+                        logger.debug("Telegram fallback response: %s", json.dumps(resp_data))
+                    self._record_sent_message(chat_id, text, "", resp_data)
+                    continue
+
                 resp.raise_for_status()
 
                 resp_data = resp.json()

@@ -180,8 +180,12 @@ def send_telegram_reply(
         text: The message text to send.
         bot_token: Telegram bot token.
         chat_ids: List of chat IDs to send to.
-        parse_mode: Optional Telegram parse mode (e.g. ``"MarkdownV2"``).
+        parse_mode: Optional Telegram parse mode (e.g. ``"HTML"``).
             When ``None``, the message is sent as plain text.
+
+    If Telegram returns 400 (Bad Request) — typically caused by formatting
+    issues — the message is retried as plain text so it is delivered rather
+    than silently dropped.
 
     Errors are logged but not raised — the daemon should keep running even
     if a single reply fails.
@@ -200,6 +204,21 @@ def send_telegram_reply(
                     f"{TELEGRAM_API_BASE}/bot{bot_token}/sendMessage",
                     json=payload,
                 )
+                # On 400 (bad formatting), retry without parse_mode as plain text.
+                if resp.status_code == 400 and parse_mode is not None:
+                    logger.warning(
+                        "Telegram returned 400 for chat %d — retrying as plain text.",
+                        chat_id,
+                    )
+                    fallback_payload: dict[str, object] = {
+                        "chat_id": chat_id,
+                        "text": text,
+                        "disable_web_page_preview": True,
+                    }
+                    resp = client.post(
+                        f"{TELEGRAM_API_BASE}/bot{bot_token}/sendMessage",
+                        json=fallback_payload,
+                    )
                 if resp.status_code != 200:
                     logger.warning(
                         "Telegram API returned %d for chat %d",
@@ -515,14 +534,14 @@ def dispatch_message(
         )
         return
 
-    # Format the reply for Telegram: convert #N refs to clickable links
-    # and escape special characters for MarkdownV2.
+    # Format the reply for Telegram: convert #N refs to clickable HTML links
+    # and escape special characters for HTML.
     formatted_reply = linkify_github_refs(result.reply)
     send_telegram_reply(
         formatted_reply,
         bot_token=bot_token,
         chat_ids=chat_ids,
-        parse_mode="MarkdownV2",
+        parse_mode="HTML",
     )
 
     # Execute any actions.
