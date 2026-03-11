@@ -41,6 +41,7 @@ jobs:
             scripts/data-quality-check.py
             scripts/ecs-run-task.sh
             scripts/ecs-logs.sh
+            scripts/notify-telegram.sh
             data-quality-baselines.json
 
       - name: Configure AWS credentials
@@ -120,6 +121,7 @@ jobs:
           fi
 
       - name: Create failure issue
+        id: create-issue
         if: >-
           steps.check.outputs.healthy == 'false' &&
           steps.existing.outputs.exists == 'false'
@@ -162,11 +164,31 @@ jobs:
             echo "It will not create duplicates while this issue is open."
           } > /tmp/issue_body.md
 
-          gh issue create \
+          ISSUE_URL=$(gh issue create \
             --repo "${{ github.repository }}" \
             --title "Data quality regression: collection health alerts on dev" \
             --body-file /tmp/issue_body.md \
-            --label "priority/p1,area/scraping,data-quality-failure,agent/ready"
+            --label "priority/p1,area/scraping,data-quality-failure,agent/ready")
+
+          echo "issue_url=$ISSUE_URL" >> "$GITHUB_OUTPUT"
+          echo "created=true" >> "$GITHUB_OUTPUT"
+
+      - name: Send Telegram notification
+        if: steps.create-issue.outputs.created == 'true'
+        continue-on-error: true
+        run: |
+          ISSUE_URL="${{ steps.create-issue.outputs.issue_url }}"
+          ISSUE_NUM="${ISSUE_URL##*/}"
+
+          {
+            echo "<b>Data Quality Alert</b>"
+            echo ""
+            echo "Hourly checks detected collection health issues on dev."
+            echo ""
+            echo "Issue #${ISSUE_NUM}: ${ISSUE_URL}"
+          } > /tmp/tg_message.txt
+
+          scripts/notify-telegram.sh --message-file /tmp/tg_message.txt
 
       - name: Update existing issue with new failures
         if: >-
