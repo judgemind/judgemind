@@ -30,8 +30,12 @@ Alert = dqc.Alert
 Baselines = dqc.Baselines
 FileIssuesResult = dqc.FileIssuesResult
 load_baselines = dqc.load_baselines
+load_field_baselines = dqc.load_field_baselines
+save_field_baselines = dqc.save_field_baselines
 check_ingest_rates = dqc.check_ingest_rates
 check_scraper_staleness = dqc.check_scraper_staleness
+check_field_completeness = dqc.check_field_completeness
+_query_field_completeness = dqc._query_field_completeness
 format_json = dqc.format_json
 format_text = dqc.format_text
 file_issues_for_alerts = dqc.file_issues_for_alerts
@@ -413,6 +417,11 @@ class TestRunChecks:
         old_time = NOW - timedelta(hours=10)
         conn = FakeConnection(
             {
+                # "LEFT JOIN rulings" must come before "d.created_at >=" so
+                # the field completeness query matches it first (both queries
+                # contain "d.created_at >=" but only the field completeness
+                # query contains "LEFT JOIN rulings").
+                "LEFT JOIN rulings": [],
                 "d.created_at <": [("Los Angeles", 200)],
                 "d.created_at >=": [],
                 "DISTINCT ct.county": [("Los Angeles",)],
@@ -428,6 +437,8 @@ class TestRunChecks:
         dqc.psycopg.connect = MagicMock(return_value=conn)
         original_load = dqc.load_baselines
         dqc.load_baselines = MagicMock(return_value=baselines)
+        original_field_load = dqc.load_field_baselines
+        dqc.load_field_baselines = MagicMock(return_value={})
         try:
             alerts = dqc.run_checks("fake://dsn", now=NOW)
             metrics = {a.metric for a in alerts}
@@ -436,12 +447,15 @@ class TestRunChecks:
         finally:
             dqc.psycopg.connect = original_connect
             dqc.load_baselines = original_load
+            dqc.load_field_baselines = original_field_load
 
     def test_run_checks_healthy(self) -> None:
         """run_checks returns empty list when everything is healthy."""
         recent = NOW - timedelta(hours=1)
         conn = FakeConnection(
             {
+                # "LEFT JOIN rulings" must come first — see comment in test above.
+                "LEFT JOIN rulings": [],
                 "d.created_at <": [
                     ("Los Angeles", 200),
                     ("Orange", 100),
@@ -462,12 +476,15 @@ class TestRunChecks:
         dqc.psycopg.connect = MagicMock(return_value=conn)
         original_load = dqc.load_baselines
         dqc.load_baselines = MagicMock(return_value=baselines)
+        original_field_load = dqc.load_field_baselines
+        dqc.load_field_baselines = MagicMock(return_value={})
         try:
             alerts = dqc.run_checks("fake://dsn", now=NOW)
             assert len(alerts) == 0
         finally:
             dqc.psycopg.connect = original_connect
             dqc.load_baselines = original_load
+            dqc.load_field_baselines = original_field_load
 
 
 # ---------------------------------------------------------------------------
@@ -843,3 +860,423 @@ class TestFileIssuesForAlerts:
             call_args = call[0][0]
             repo_idx = call_args.index("--repo")
             assert call_args[repo_idx + 1] == "custom/repo"
+
+
+def _make_field_completeness_row(
+    county: str,
+    total: int = 100,
+    ruling: int = 100,
+    judge: int = 95,
+    motion_type: int = 90,
+    outcome: int = 90,
+    title: int = 100,
+    case_number: int = 100,
+    parties: int = 80,
+    hearing_date: int = 100,
+    case_type: int = 85,
+) -> tuple[Any, ...]:
+    """Create a row matching the FIELD_COMPLETENESS_QUERY result shape."""
+    return (
+        county,
+        total,
+        ruling,
+        judge,
+        motion_type,
+        outcome,
+        title,
+        case_number,
+        parties,
+        hearing_date,
+        case_type,
+    )
+
+
+class TestLoadFieldBaselines:
+    """Tests for load_field_baselines function."""
+
+    def test_load_valid_file(self, tmp_path: Path) -> None:
+        """Loads field completeness baselines from JSON."""
+        baselines_file = tmp_path / "baselines.json"
+        baselines_file.write_text(
+            json.dumps(
+                {
+                    "counties": {},
+                    "field_completeness": {
+                        "Los Angeles": {
+                            "ruling": 99.5,
+                            "judge": 95.0,
+                        }
+                    },
+                }
+            )
+        )
+        result = load_field_baselines(baselines_file)
+        assert "Los Angeles" in result
+        assert result["Los Angeles"]["ruling"] == 99.5
+        assert result["Los Angeles"]["judge"] == 95.0
+
+    def test_missing_file_returns_empty(self, tmp_path: Path) -> None:
+        """Returns empty dict when baselines file does not exist."""
+        result = load_field_baselines(tmp_path / "nonexistent.json")
+        assert result == {}
+
+    def test_missing_section_returns_empty(self, tmp_path: Path) -> None:
+        """Returns empty dict when field_completeness section is absent."""
+        baselines_file = tmp_path / "baselines.json"
+        baselines_file.write_text(json.dumps({"counties": {}}))
+        result = load_field_baselines(baselines_file)
+        assert result == {}
+
+
+class TestSaveFieldBaselines:
+    """Tests for save_field_baselines function."""
+
+    def test_creates_new_file(self, tmp_path: Path) -> None:
+        """Creates baselines file when it does not exist."""
+        baselines_file = tmp_path / "baselines.json"
+        current = {"Los Angeles": {"ruling": 99.5, "judge": 95.0}}
+        save_field_baselines(current, baselines_file)
+
+        with open(baselines_file) as f:
+            raw = json.load(f)
+        assert raw["field_completeness"]["Los Angeles"]["ruling"] == 99.5
+        assert raw["field_completeness"]["Los Angeles"]["judge"] == 95.0
+
+    def test_ratchet_up_only(self, tmp_path: Path) -> None:
+        """Only updates baselines when current value is higher."""
+        baselines_file = tmp_path / "baselines.json"
+        baselines_file.write_text(
+            json.dumps(
+                {
+                    "counties": {},
+                    "field_completeness": {"Los Angeles": {"ruling": 99.5, "judge": 95.0}},
+                }
+            )
+        )
+        # Try to save lower values — should not decrease.
+        current = {"Los Angeles": {"ruling": 90.0, "judge": 97.0}}
+        save_field_baselines(current, baselines_file)
+
+        with open(baselines_file) as f:
+            raw = json.load(f)
+        fc = raw["field_completeness"]["Los Angeles"]
+        assert fc["ruling"] == 99.5  # Kept old higher value
+        assert fc["judge"] == 97.0  # Updated to new higher value
+
+    def test_preserves_existing_counties_section(self, tmp_path: Path) -> None:
+        """Preserves the existing counties section when updating."""
+        baselines_file = tmp_path / "baselines.json"
+        baselines_file.write_text(
+            json.dumps(
+                {
+                    "counties": {
+                        "Los Angeles": {
+                            "expected_daily_rulings": 50,
+                            "schedule_type": "daily",
+                        }
+                    },
+                    "field_completeness": {},
+                }
+            )
+        )
+        current = {"Los Angeles": {"ruling": 99.0}}
+        save_field_baselines(current, baselines_file)
+
+        with open(baselines_file) as f:
+            raw = json.load(f)
+        # Counties section should be untouched.
+        assert raw["counties"]["Los Angeles"]["expected_daily_rulings"] == 50
+        assert raw["field_completeness"]["Los Angeles"]["ruling"] == 99.0
+
+    def test_adds_new_county(self, tmp_path: Path) -> None:
+        """Adds a new county to existing baselines."""
+        baselines_file = tmp_path / "baselines.json"
+        baselines_file.write_text(
+            json.dumps(
+                {
+                    "counties": {},
+                    "field_completeness": {"Los Angeles": {"ruling": 99.0}},
+                }
+            )
+        )
+        current = {"Orange": {"ruling": 98.0}}
+        save_field_baselines(current, baselines_file)
+
+        with open(baselines_file) as f:
+            raw = json.load(f)
+        assert raw["field_completeness"]["Los Angeles"]["ruling"] == 99.0
+        assert raw["field_completeness"]["Orange"]["ruling"] == 98.0
+
+
+class TestQueryFieldCompleteness:
+    """Tests for _query_field_completeness function."""
+
+    def test_returns_percentages(self) -> None:
+        """Returns per-field percentages for each county."""
+        conn = FakeConnection(
+            {
+                "case_parties": [
+                    _make_field_completeness_row(
+                        "Los Angeles",
+                        total=200,
+                        ruling=200,
+                        judge=190,
+                        motion_type=180,
+                        outcome=180,
+                        title=200,
+                        case_number=200,
+                        parties=160,
+                        hearing_date=200,
+                        case_type=170,
+                    ),
+                ],
+            }
+        )
+        result = _query_field_completeness(conn, NOW)
+        assert "Los Angeles" in result
+        assert result["Los Angeles"]["ruling"] == 100.0
+        assert result["Los Angeles"]["judge"] == 95.0
+        assert result["Los Angeles"]["parties"] == 80.0
+
+    def test_skips_zero_total_counties(self) -> None:
+        """Skips counties with zero total documents."""
+        conn = FakeConnection(
+            {
+                "case_parties": [
+                    _make_field_completeness_row(
+                        "Empty County",
+                        total=0,
+                        ruling=0,
+                        judge=0,
+                        motion_type=0,
+                        outcome=0,
+                        title=0,
+                        case_number=0,
+                        parties=0,
+                        hearing_date=0,
+                        case_type=0,
+                    ),
+                ],
+            }
+        )
+        result = _query_field_completeness(conn, NOW)
+        assert "Empty County" not in result
+
+    def test_multiple_counties(self) -> None:
+        """Returns results for multiple counties."""
+        conn = FakeConnection(
+            {
+                "case_parties": [
+                    _make_field_completeness_row("Los Angeles", total=100, judge=95),
+                    _make_field_completeness_row("Orange", total=50, judge=40),
+                ],
+            }
+        )
+        result = _query_field_completeness(conn, NOW)
+        assert len(result) == 2
+        assert result["Los Angeles"]["judge"] == 95.0
+        assert result["Orange"]["judge"] == 80.0
+
+
+class TestCheckFieldCompleteness:
+    """Tests for check_field_completeness function."""
+
+    def test_no_alerts_when_above_baseline(self) -> None:
+        """No alerts when all fields are at or above baseline."""
+        conn = FakeConnection(
+            {
+                "case_parties": [
+                    _make_field_completeness_row(
+                        "Los Angeles",
+                        total=100,
+                        judge=96,
+                    ),
+                ],
+            }
+        )
+        field_baselines = {
+            "Los Angeles": {"judge": 95.0, "ruling": 100.0},
+        }
+        alerts = check_field_completeness(conn, NOW, field_baselines)
+        assert len(alerts) == 0
+
+    def test_p1_alert_for_large_drop(self) -> None:
+        """P1 alert when field drops more than 10 percentage points."""
+        conn = FakeConnection(
+            {
+                "case_parties": [
+                    _make_field_completeness_row(
+                        "Los Angeles",
+                        total=100,
+                        judge=80,
+                    ),
+                ],
+            }
+        )
+        field_baselines = {
+            "Los Angeles": {
+                "judge": 95.0,
+                "ruling": 100.0,
+                "motion_type": 90.0,
+                "outcome": 90.0,
+                "case_title": 100.0,
+                "case_number": 100.0,
+                "parties": 80.0,
+                "hearing_date": 100.0,
+                "case_type": 85.0,
+            },
+        }
+        alerts = check_field_completeness(conn, NOW, field_baselines)
+        judge_alerts = [a for a in alerts if "judge" in a.message]
+        assert len(judge_alerts) == 1
+        assert judge_alerts[0].severity == "p1"
+        assert judge_alerts[0].metric == "field_completeness"
+        assert judge_alerts[0].expected == 95.0
+        assert judge_alerts[0].actual == 80.0
+
+    def test_p2_alert_for_moderate_drop(self) -> None:
+        """P2 alert when field drops 5-10 percentage points."""
+        conn = FakeConnection(
+            {
+                "case_parties": [
+                    _make_field_completeness_row(
+                        "Los Angeles",
+                        total=100,
+                        judge=88,
+                    ),
+                ],
+            }
+        )
+        field_baselines = {
+            "Los Angeles": {
+                "judge": 95.0,
+                "ruling": 100.0,
+                "motion_type": 90.0,
+                "outcome": 90.0,
+                "case_title": 100.0,
+                "case_number": 100.0,
+                "parties": 80.0,
+                "hearing_date": 100.0,
+                "case_type": 85.0,
+            },
+        }
+        alerts = check_field_completeness(conn, NOW, field_baselines)
+        judge_alerts = [a for a in alerts if "judge" in a.message]
+        assert len(judge_alerts) == 1
+        assert judge_alerts[0].severity == "p2"
+
+    def test_ignores_zero_baseline_fields(self) -> None:
+        """Does not alert on fields with 0% baseline."""
+        conn = FakeConnection(
+            {
+                "case_parties": [
+                    _make_field_completeness_row(
+                        "Los Angeles",
+                        total=100,
+                        parties=0,
+                    ),
+                ],
+            }
+        )
+        # parties baseline is 0% — should not alert even though current is also 0%.
+        field_baselines = {
+            "Los Angeles": {
+                "ruling": 100.0,
+                "judge": 95.0,
+                "motion_type": 90.0,
+                "outcome": 90.0,
+                "case_title": 100.0,
+                "case_number": 100.0,
+                "parties": 0.0,
+                "hearing_date": 100.0,
+                "case_type": 85.0,
+            },
+        }
+        alerts = check_field_completeness(conn, NOW, field_baselines)
+        parties_alerts = [a for a in alerts if "parties" in a.message]
+        assert len(parties_alerts) == 0
+
+    def test_no_alerts_without_baselines(self) -> None:
+        """No alerts when no field baselines exist for a county."""
+        conn = FakeConnection(
+            {
+                "case_parties": [
+                    _make_field_completeness_row(
+                        "Unknown County",
+                        total=100,
+                        judge=50,
+                    ),
+                ],
+            }
+        )
+        alerts = check_field_completeness(conn, NOW, {})
+        assert len(alerts) == 0
+
+    def test_multiple_fields_multiple_severities(self) -> None:
+        """Generates alerts for multiple fields with different severities."""
+        conn = FakeConnection(
+            {
+                "case_parties": [
+                    _make_field_completeness_row(
+                        "Los Angeles",
+                        total=100,
+                        judge=80,  # 95 -> 80 = 15pp drop (p1)
+                        motion_type=83,  # 90 -> 83 = 7pp drop (p2)
+                    ),
+                ],
+            }
+        )
+        field_baselines = {
+            "Los Angeles": {
+                "ruling": 100.0,
+                "judge": 95.0,
+                "motion_type": 90.0,
+                "outcome": 90.0,
+                "case_title": 100.0,
+                "case_number": 100.0,
+                "parties": 80.0,
+                "hearing_date": 100.0,
+                "case_type": 85.0,
+            },
+        }
+        alerts = check_field_completeness(conn, NOW, field_baselines)
+        severities = {a.severity for a in alerts}
+        assert "p1" in severities
+        assert "p2" in severities
+        assert len(alerts) >= 2
+
+    def test_alert_output_format(self) -> None:
+        """Alert has correct metric, county, expected, actual fields."""
+        conn = FakeConnection(
+            {
+                "case_parties": [
+                    _make_field_completeness_row(
+                        "Orange",
+                        total=100,
+                        judge=80,
+                    ),
+                ],
+            }
+        )
+        field_baselines = {
+            "Orange": {
+                "judge": 95.0,
+                "ruling": 100.0,
+                "motion_type": 90.0,
+                "outcome": 90.0,
+                "case_title": 100.0,
+                "case_number": 100.0,
+                "parties": 80.0,
+                "hearing_date": 100.0,
+                "case_type": 85.0,
+            },
+        }
+        alerts = check_field_completeness(conn, NOW, field_baselines)
+        judge_alerts = [a for a in alerts if "judge" in a.message]
+        assert len(judge_alerts) == 1
+        alert = judge_alerts[0]
+        assert alert.county == "Orange"
+        assert alert.metric == "field_completeness"
+        assert alert.expected == 95.0
+        assert alert.actual == 80.0
+        assert "15.0pp drop" in alert.message

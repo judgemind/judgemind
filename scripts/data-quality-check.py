@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Data quality monitoring — collection health checks.
+"""Data quality monitoring — collection health and field completeness checks.
 
 Queries the database and flags counties with unhealthy ruling ingest
-rates, stale scrapers, or zero new rulings.
+rates, stale scrapers, zero new rulings, or field completeness regressions.
 
 Usage:
     scripts/with-secret.sh \\
@@ -10,9 +10,10 @@ Usage:
         -- packages/scraper-framework/.venv/bin/python3 scripts/data-quality-check.py
 
 Options:
-    --json          Machine-readable JSON output (default).
-    --text          Human-readable text output.
-    --county NAME   Check only the specified county.
+    --json              Machine-readable JSON output (default).
+    --text              Human-readable text output.
+    --county NAME       Check only the specified county.
+    --update-baselines  Snapshot current field completeness as baselines (ratchet up only).
 
 Exit code: 0 if all healthy, 1 if alerts found.
 """
@@ -55,13 +56,20 @@ INGEST_DROP_THRESHOLD = 0.5  # Flag if below 50% of 7-day average
 DAILY_SCRAPER_STALE_HOURS = 6
 FREQUENT_SCRAPER_STALE_HOURS = 2
 
+# Field completeness regression thresholds (percentage points below baseline).
+FIELD_DROP_P1_THRESHOLD = 10.0  # >10pp drop = p1
+FIELD_DROP_P2_THRESHOLD = 5.0   # 5-10pp drop = p2
+
+# Window for recent-only field completeness checks (days).
+FIELD_COMPLETENESS_WINDOW_DAYS = 7
+
 
 @dataclass
 class Alert:
     """A single data quality alert."""
 
     county: str
-    metric: str  # ingest_rate, scraper_stale, zero_rulings
+    metric: str  # ingest_rate, scraper_stale, zero_rulings, field_completeness
     severity: str  # p1, p2
     expected: float | int | str
     actual: float | int | str
@@ -160,6 +168,216 @@ LATEST_CAPTURE_PER_COUNTY_QUERY = """
     {county_filter}
     GROUP BY ct.county
 """
+
+# Same field structure as AUDIT_QUERY in audit_field_completeness.py, but
+# scoped to recent documents (last N days) for faster, regression-focused checks.
+# audit_field_completeness.py scans all documents; this query only checks recent ones.
+FIELD_COMPLETENESS_QUERY = """
+    SELECT
+        ct.county,
+        COUNT(d.id) AS total_docs,
+        COUNT(r.id) AS has_ruling,
+        COUNT(r.judge_id) AS has_judge,
+        COUNT(r.motion_type) AS has_motion_type,
+        COUNT(r.outcome) AS has_outcome,
+        COUNT(CASE WHEN c.case_title IS NOT NULL THEN 1 END) AS has_title,
+        COUNT(CASE WHEN c.case_number NOT LIKE 'UNKNOWN-%%' THEN 1 END) AS has_case_number,
+        COUNT(CASE WHEN EXISTS (
+            SELECT 1 FROM case_parties cp WHERE cp.case_id = c.id
+        ) THEN 1 END) AS has_parties,
+        COUNT(d.hearing_date) AS has_hearing_date,
+        COUNT(c.case_type) AS has_case_type
+    FROM documents d
+    JOIN courts ct ON ct.id = d.court_id
+    LEFT JOIN rulings r ON r.document_id = d.id
+    LEFT JOIN cases c ON c.id = d.case_id
+    WHERE d.status = 'active'
+      AND d.created_at >= %s
+    {county_filter}
+    GROUP BY ct.county ORDER BY ct.county
+"""
+
+
+def load_field_baselines(
+    path: Path | None = None,
+) -> dict[str, dict[str, float]]:
+    """Load per-county field completeness baselines from JSON config file.
+
+    Args:
+        path: Path to baselines JSON file. Defaults to repo root.
+
+    Returns:
+        Dict mapping county name to dict of field name -> baseline percentage.
+    """
+    baselines_path = path or DEFAULT_BASELINES_PATH
+    if not baselines_path.exists():
+        return {}
+    with open(baselines_path) as f:
+        raw = json.load(f)
+    return raw.get("field_completeness", {})
+
+
+def save_field_baselines(
+    current_completeness: dict[str, dict[str, float]],
+    path: Path | None = None,
+) -> None:
+    """Save field completeness baselines, ratcheting up only.
+
+    Updates baselines only if current values are higher than existing ones
+    or if no baseline exists for a county/field. Never lowers baselines.
+
+    Args:
+        current_completeness: Dict of county -> field -> current percentage.
+        path: Path to baselines JSON file. Defaults to repo root.
+    """
+    baselines_path = path or DEFAULT_BASELINES_PATH
+    if baselines_path.exists():
+        with open(baselines_path) as f:
+            raw = json.load(f)
+    else:
+        raw = {}
+
+    existing = raw.get("field_completeness", {})
+
+    for county, fields in current_completeness.items():
+        if county not in existing:
+            existing[county] = {}
+        for field, pct in fields.items():
+            old_pct = existing[county].get(field, 0.0)
+            # Ratchet: only update if current is higher or no baseline exists.
+            if pct > old_pct:
+                existing[county][field] = round(pct, 1)
+
+    raw["field_completeness"] = existing
+    with open(baselines_path, "w") as f:
+        json.dump(raw, f, indent=2)
+        f.write("\n")
+
+    logger.info("Field completeness baselines updated at %s", baselines_path)
+
+
+def _query_field_completeness(
+    conn: psycopg.Connection,  # type: ignore[type-arg]
+    now: datetime,
+    county: str | None = None,
+) -> dict[str, dict[str, float]]:
+    """Query the database for current field completeness percentages.
+
+    Only considers documents created within the last FIELD_COMPLETENESS_WINDOW_DAYS
+    to focus on recent regressions and keep the query fast.
+
+    Args:
+        conn: Database connection.
+        now: Current timestamp for time calculations.
+        county: Optional county filter.
+
+    Returns:
+        Dict mapping county name to dict of field name -> percentage (0-100).
+    """
+    county_filter, county_params = _build_county_filter(county)
+    cutoff = now - timedelta(days=FIELD_COMPLETENESS_WINDOW_DAYS)
+    result: dict[str, dict[str, float]] = {}
+
+    with conn.cursor() as cur:
+        cur.execute(
+            FIELD_COMPLETENESS_QUERY.format(county_filter=county_filter),
+            (cutoff, *county_params),
+        )
+        for row in cur.fetchall():
+            (
+                county_name,
+                total,
+                has_ruling,
+                has_judge,
+                has_motion_type,
+                has_outcome,
+                has_title,
+                has_case_number,
+                has_parties,
+                has_hearing_date,
+                has_case_type,
+            ) = row
+
+            if total == 0:
+                continue
+
+            counts = {
+                "ruling": has_ruling,
+                "judge": has_judge,
+                "motion_type": has_motion_type,
+                "outcome": has_outcome,
+                "case_title": has_title,
+                "case_number": has_case_number,
+                "parties": has_parties,
+                "hearing_date": has_hearing_date,
+                "case_type": has_case_type,
+            }
+
+            result[county_name] = {
+                field: round(count / total * 100, 1)
+                for field, count in counts.items()
+            }
+
+    return result
+
+
+def check_field_completeness(
+    conn: psycopg.Connection,  # type: ignore[type-arg]
+    now: datetime,
+    field_baselines: dict[str, dict[str, float]],
+    county: str | None = None,
+) -> list[Alert]:
+    """Check field completeness against baselines and flag regressions.
+
+    Args:
+        conn: Database connection.
+        now: Current timestamp for time calculations.
+        field_baselines: Per-county, per-field baseline percentages.
+        county: Optional county filter.
+
+    Returns:
+        List of alerts for field completeness regressions.
+    """
+    alerts: list[Alert] = []
+    current = _query_field_completeness(conn, now, county)
+
+    for county_name, fields in current.items():
+        county_baselines = field_baselines.get(county_name, {})
+        if not county_baselines:
+            continue
+
+        for field, current_pct in fields.items():
+            baseline_pct = county_baselines.get(field, 0.0)
+
+            # Ignore fields with 0% baseline (county genuinely lacks the field).
+            if baseline_pct == 0.0:
+                continue
+
+            drop = baseline_pct - current_pct
+
+            if drop > FIELD_DROP_P1_THRESHOLD:
+                severity = "p1"
+            elif drop > FIELD_DROP_P2_THRESHOLD:
+                severity = "p2"
+            else:
+                continue
+
+            alerts.append(
+                Alert(
+                    county=county_name,
+                    metric="field_completeness",
+                    severity=severity,
+                    expected=baseline_pct,
+                    actual=current_pct,
+                    message=(
+                        f"{county_name}: {field} completeness dropped from "
+                        f"{baseline_pct:.1f}% to {current_pct:.1f}% "
+                        f"({drop:.1f}pp drop)"
+                    ),
+                )
+            )
+
+    return alerts
 
 
 def _build_county_filter(county: str | None) -> tuple[str, tuple[str, ...]]:
@@ -366,6 +584,7 @@ def run_checks(
     county: str | None = None,
     baselines_path: Path | None = None,
     now: datetime | None = None,
+    update_baselines: bool = False,
 ) -> list[Alert]:
     """Run all data quality checks.
 
@@ -374,6 +593,8 @@ def run_checks(
         county: Optional county name filter.
         baselines_path: Path to baselines JSON file.
         now: Override current time (for testing).
+        update_baselines: If True, snapshot current field completeness
+            as baselines (ratchet up only) and skip alerting.
 
     Returns:
         List of all alerts found.
@@ -382,11 +603,20 @@ def run_checks(
         now = datetime.now(UTC)
 
     baselines = load_baselines(baselines_path)
+    field_baselines = load_field_baselines(baselines_path)
     alerts: list[Alert] = []
 
     with psycopg.connect(dsn) as conn:
         alerts.extend(check_ingest_rates(conn, now, baselines, county))
         alerts.extend(check_scraper_staleness(conn, now, baselines, county))
+
+        if update_baselines:
+            current = _query_field_completeness(conn, now, county)
+            save_field_baselines(current, baselines_path)
+        else:
+            alerts.extend(
+                check_field_completeness(conn, now, field_baselines, county)
+            )
 
     return alerts
 
@@ -692,7 +922,7 @@ def file_issues_for_alerts(
 def main() -> None:
     """CLI entry point."""
     parser = argparse.ArgumentParser(
-        description="Data quality monitoring — collection health checks.",
+        description="Data quality monitoring — collection health and field completeness checks.",
     )
     parser.add_argument(
         "--json",
@@ -729,6 +959,11 @@ def main() -> None:
         default=DEFAULT_REPO,
         help="GitHub repository for issue filing (default: judgemind/judgemind).",
     )
+    parser.add_argument(
+        "--update-baselines",
+        action="store_true",
+        help="Snapshot current field completeness as baselines (ratchet up only).",
+    )
     args = parser.parse_args()
 
     dsn = os.environ.get("DATABASE_URL")
@@ -737,7 +972,12 @@ def main() -> None:
         sys.exit(1)
 
     baselines_path = Path(args.baselines) if args.baselines else None
-    alerts = run_checks(dsn, county=args.county, baselines_path=baselines_path)
+    alerts = run_checks(
+        dsn,
+        county=args.county,
+        baselines_path=baselines_path,
+        update_baselines=args.update_baselines,
+    )
 
     if args.text:
         print(format_text(alerts))
