@@ -40,10 +40,10 @@ const STATUS_BADGE: Record<string, string> = {
   dismissed: 'bg-red-100 text-red-800 dark:bg-red-900 dark:text-red-200',
 };
 
-type Props = { params: Promise<{ id: string }> };
+type Props = { params: { id: string } };
 
 export default async function CaseDetailPage({ params }: Props) {
-  const { id } = await params;
+  const { id } = params;
 
   let caseData: CaseData['case'] = null;
   try {

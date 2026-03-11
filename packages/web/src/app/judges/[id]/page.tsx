@@ -30,10 +30,10 @@ interface JudgeData {
   } | null;
 }
 
-type Props = { params: Promise<{ id: string }> };
+type Props = { params: { id: string } };
 
 export default async function JudgeDetailPage({ params }: Props) {
-  const { id } = await params;
+  const { id } = params;
 
   let judgeData: JudgeData['judge'] = null;
   try {
