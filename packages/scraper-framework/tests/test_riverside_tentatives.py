@@ -26,6 +26,7 @@ import respx
 
 from courts.ca.pdf_link_scraper import _extract_pdf_text
 from courts.ca.riverside_tentatives import (
+    _CASE_NUMBER_RE,
     INDEX_URL,
     RiversideTentativeRulingsScraper,
     _extract_case_title_from_ruling,
@@ -1095,3 +1096,125 @@ def test_riv_parse_document_single_ruling_dept_judge_fallback() -> None:
         result = scraper.parse_document(doc)
 
     assert result.judge_name == "Mapped Single Judge"
+
+
+# ---------------------------------------------------------------------------
+# Expanded case number regex — non-CV prefixes (#805)
+# ---------------------------------------------------------------------------
+
+
+class TestCaseNumberRegexExpanded:
+    """Verify _CASE_NUMBER_RE matches both CV-prefixed and location-prefixed case numbers."""
+
+    def test_cv_prefixed_case_numbers(self) -> None:
+        """Existing CV-prefixed case numbers still match."""
+        assert _CASE_NUMBER_RE.match("CVPS2306157")
+        assert _CASE_NUMBER_RE.match("CVRI2412345")
+        assert _CASE_NUMBER_RE.match("CVMV2507098")
+
+    def test_ric_prefix(self) -> None:
+        """RIC (Riverside - Hall of Justice) prefix matches."""
+        assert _CASE_NUMBER_RE.match("RIC1904113")
+
+    def test_mcc_prefix(self) -> None:
+        """MCC (Murrieta) prefix matches."""
+        assert _CASE_NUMBER_RE.match("MCC2012345")
+
+    def test_psc_prefix(self) -> None:
+        """PSC (Palm Springs) prefix matches."""
+        assert _CASE_NUMBER_RE.match("PSC2101234")
+
+    def test_swc_prefix(self) -> None:
+        """SWC (Southwest) prefix matches."""
+        assert _CASE_NUMBER_RE.match("SWC2200001")
+
+    def test_inc_prefix(self) -> None:
+        """INC (Indio) prefix matches."""
+        assert _CASE_NUMBER_RE.match("INC2300001")
+
+    def test_no_match_random_prefix(self) -> None:
+        """Unknown prefixes do not match."""
+        assert _CASE_NUMBER_RE.match("XYZ1234567") is None
+        assert _CASE_NUMBER_RE.match("ABC1234567") is None
+
+    def test_no_match_too_few_digits(self) -> None:
+        """Case numbers with fewer than 6 digits do not match."""
+        assert _CASE_NUMBER_RE.match("RIC12345") is None
+
+    def test_word_boundary(self) -> None:
+        """Regex uses word boundaries to avoid partial matches."""
+        text = "sometext RIC1904113 moretext"
+        m = _CASE_NUMBER_RE.search(text)
+        assert m is not None
+        assert m.group(0) == "RIC1904113"
+
+
+# ---------------------------------------------------------------------------
+# _split_rulings with non-CV case numbers (#805)
+# ---------------------------------------------------------------------------
+
+
+def test_split_rulings_ric_prefix() -> None:
+    """_split_rulings correctly extracts RIC-prefixed case numbers."""
+    text = (
+        "Tentative Rulings for March 2, 2026\n"
+        "Department 2\n\n"
+        "1.\n"
+        "RIC1904113 FOUR STAR MIDWEST vs CITY OF JURUPA  Hearing re: Demurrer\n"
+        "Tentative Ruling: Granted.\n\n"
+        "2.\n"
+        "CVRI2412345 SMITH vs JONES  Motion to Compel\n"
+        "Tentative Ruling: Denied.\n"
+    )
+    rulings = _split_rulings(text)
+    assert len(rulings) == 2
+    assert rulings[0].case_number == "RIC1904113"
+    assert rulings[1].case_number == "CVRI2412345"
+
+
+def test_split_rulings_mixed_prefixes() -> None:
+    """_split_rulings handles a mix of CV and location-prefixed case numbers."""
+    text = (
+        "Tentative Rulings for March 2, 2026\n"
+        "Department 2\n\n"
+        "1.\n"
+        "MCC2012345 DOE vs ROE  Hearing re: Demurrer\n"
+        "Tentative Ruling: Overruled.\n\n"
+        "2.\n"
+        "CVPS2306157 YELDELL vs HENSS  Motion to Strike\n"
+        "Tentative Ruling: Denied.\n\n"
+        "3.\n"
+        "INC2300001 ALPHA vs BETA  Motion for Summary Judgment\n"
+        "Tentative Ruling: Granted.\n"
+    )
+    rulings = _split_rulings(text)
+    assert len(rulings) == 3
+    assert rulings[0].case_number == "MCC2012345"
+    assert rulings[1].case_number == "CVPS2306157"
+    assert rulings[2].case_number == "INC2300001"
+
+
+# ---------------------------------------------------------------------------
+# _extract_case_title_from_ruling with non-CV case numbers (#805)
+# ---------------------------------------------------------------------------
+
+
+def test_extract_case_title_ric_prefix() -> None:
+    """Case title extraction works with RIC-prefixed case numbers."""
+    text = "RIC1904113 FOUR STAR MIDWEST vs CITY OF JURUPA Hearing re: Demurrer"
+    result = _extract_case_title_from_ruling(text)
+    assert result == "Four Star Midwest v. City Of Jurupa"
+
+
+def test_extract_case_title_mcc_prefix() -> None:
+    """Case title extraction works with MCC-prefixed case numbers."""
+    text = "MCC2012345 DOE vs ROE Hearing re: Motion to Compel"
+    result = _extract_case_title_from_ruling(text)
+    assert result == "Doe v. Roe"
+
+
+def test_extract_case_title_psc_prefix() -> None:
+    """Case title extraction works with PSC-prefixed case numbers."""
+    text = "PSC2101234 JOHNSON vs WILLIAMS Application for Protective Order"
+    result = _extract_case_title_from_ruling(text)
+    assert result == "Johnson v. Williams"
