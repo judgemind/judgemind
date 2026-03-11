@@ -32,6 +32,12 @@ variable "sqs_visibility_timeout_seconds" {
   default     = 30
 }
 
+variable "sqs_receive_wait_time_seconds" {
+  description = "SQS long-poll wait time (seconds) — consumers block up to this duration for messages, reducing empty API calls and latency"
+  type        = number
+  default     = 20
+}
+
 variable "log_retention_days" {
   description = "Number of days to retain CloudWatch log events"
   type        = number
