@@ -1,6 +1,7 @@
 ---
 description: Ralph loop — iterative work-review cycle with fresh context each iteration. Spawns a worker subagent to implement, then runs Gemini cross-model review and a Claude reviewer subagent. Loops until both reviewers say SHIP or max iterations reached. Called by /task for implementation tasks.
 argument-hint: ""
+maxTurns: 200
 ---
 
 # /ralph skill
