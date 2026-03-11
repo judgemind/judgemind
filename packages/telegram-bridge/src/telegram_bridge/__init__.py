@@ -7,6 +7,8 @@ from .interpreter import (
     RateLimiter,
     RateLimitError,
     build_orchestrator_status,
+    clear_client_cache,
+    get_client,
     interpret_message,
 )
 from .models import Message, SentMessage
@@ -36,7 +38,9 @@ __all__ = [
     "TelegramBridge",
     "ValidationResult",
     "build_orchestrator_status",
+    "clear_client_cache",
     "create_orchestrator_bridge",
+    "get_client",
     "escape_html",
     "interpret_message",
     "linkify_github_refs",

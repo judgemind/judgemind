@@ -15,9 +15,12 @@ from telegram_bridge.interpreter import (
     InterpretedMessage,
     RateLimiter,
     RateLimitError,
+    _client_cache,
     _parse_response,
     _validate_action,
     build_orchestrator_status,
+    clear_client_cache,
+    get_client,
     interpret_message,
 )
 
@@ -275,6 +278,33 @@ class TestInterpretMessage:
         mock_anthropic_cls.assert_called_once_with(api_key="my-secret-key")
 
     @patch("telegram_bridge.interpreter.anthropic.Anthropic")
+    def test_client_reused_across_calls(self, mock_anthropic_cls: MagicMock) -> None:
+        mock_client = MagicMock()
+        mock_anthropic_cls.return_value = mock_client
+        mock_client.messages.create.return_value = _make_mock_response(
+            json.dumps({"reply": "ok", "actions": []})
+        )
+
+        interpret_message(text="hi", api_key="test-key", rate_limiter=None)
+        interpret_message(text="hi again", api_key="test-key", rate_limiter=None)
+
+        # Client constructor should only be called once — reused from cache.
+        mock_anthropic_cls.assert_called_once_with(api_key="test-key")
+        assert mock_client.messages.create.call_count == 2
+
+    def test_explicit_client_bypasses_cache(self) -> None:
+        mock_client = MagicMock()
+        mock_client.messages.create.return_value = _make_mock_response(
+            json.dumps({"reply": "ok", "actions": []})
+        )
+
+        interpret_message(text="hi", client=mock_client, rate_limiter=None)
+
+        mock_client.messages.create.assert_called_once()
+        # Cache should remain empty — explicit client is not cached.
+        assert len(_client_cache) == 0
+
+    @patch("telegram_bridge.interpreter.anthropic.Anthropic")
     def test_code_fence_response(self, mock_anthropic_cls: MagicMock) -> None:
         mock_client = MagicMock()
         mock_anthropic_cls.return_value = mock_client
@@ -362,6 +392,47 @@ class TestInterpretMessage:
         interpret_message(text="hi again", api_key="test-key", rate_limiter=None)
 
         assert mock_client.messages.create.call_count == 2
+
+
+# ── get_client() / clear_client_cache() ────────────────────────────────
+
+
+class TestGetClient:
+    @patch("telegram_bridge.interpreter.anthropic.Anthropic")
+    def test_returns_cached_client(self, mock_anthropic_cls: MagicMock) -> None:
+        client1 = get_client(api_key="key-a")
+        client2 = get_client(api_key="key-a")
+        assert client1 is client2
+        mock_anthropic_cls.assert_called_once_with(api_key="key-a")
+
+    @patch("telegram_bridge.interpreter.anthropic.Anthropic")
+    def test_different_keys_get_different_clients(self, mock_anthropic_cls: MagicMock) -> None:
+        get_client(api_key="key-a")
+        get_client(api_key="key-b")
+        # Two distinct clients should be created — one per key.
+        assert mock_anthropic_cls.call_count == 2
+        # Verify both keys were used.
+        calls = mock_anthropic_cls.call_args_list
+        assert calls[0].kwargs["api_key"] == "key-a"
+        assert calls[1].kwargs["api_key"] == "key-b"
+
+    @patch("telegram_bridge.interpreter.anthropic.Anthropic")
+    def test_none_key_uses_env_default(self, mock_anthropic_cls: MagicMock) -> None:
+        get_client(api_key=None)
+        mock_anthropic_cls.assert_called_once_with(api_key=None)
+
+    @patch("telegram_bridge.interpreter.anthropic.Anthropic")
+    def test_clear_cache_removes_all_clients(self, mock_anthropic_cls: MagicMock) -> None:
+        get_client(api_key="key-a")
+        get_client(api_key="key-b")
+        assert len(_client_cache) == 2
+
+        clear_client_cache()
+        assert len(_client_cache) == 0
+
+        # Next call should create a new client.
+        get_client(api_key="key-a")
+        assert mock_anthropic_cls.call_count == 3  # 2 original + 1 new
 
 
 # ── RateLimiter ────────────────────────────────────────────────────────

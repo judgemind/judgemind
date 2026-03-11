@@ -54,6 +54,37 @@ ALLOWED_PRIORITIES: frozenset[str] = frozenset({"p1", "p2", "p3"})
 # The model to use for interpretation.  Haiku is fast and cheap.
 _DEFAULT_MODEL = "claude-haiku-4-5-20251001"
 
+# Module-level client cache keyed by API key (or ``None`` for env-var default).
+# This avoids creating a new HTTP connection pool on every interpreter call.
+_client_cache: dict[str | None, anthropic.Anthropic] = {}
+
+
+def get_client(api_key: str | None = None) -> anthropic.Anthropic:
+    """Return a cached :class:`anthropic.Anthropic` client for the given API key.
+
+    If no client exists for this key yet, one is created and cached.  Passing
+    ``None`` uses the SDK's default behavior (reads ``ANTHROPIC_API_KEY`` from
+    the environment).
+
+    Args:
+        api_key: Anthropic API key, or ``None`` to use the environment variable.
+
+    Returns:
+        A reusable :class:`anthropic.Anthropic` client instance.
+    """
+    if api_key not in _client_cache:
+        _client_cache[api_key] = anthropic.Anthropic(api_key=api_key)
+    return _client_cache[api_key]
+
+
+def clear_client_cache() -> None:
+    """Clear the module-level client cache.
+
+    Useful for testing or when API keys change at runtime.
+    """
+    _client_cache.clear()
+
+
 # Maximum tokens for the interpreter response.
 _MAX_TOKENS = 512
 
@@ -215,6 +246,7 @@ def interpret_message(
     text: str,
     orchestrator_status: dict[str, Any] | None = None,
     api_key: str | None = None,
+    client: anthropic.Anthropic | None = None,
     model: str = _DEFAULT_MODEL,
     rate_limiter: RateLimiter | None = _default_rate_limiter,
 ) -> InterpretedMessage:
@@ -230,6 +262,10 @@ def interpret_message(
             paused status).  Passed as context to the interpreter.
         api_key: Anthropic API key.  If ``None``, the ``ANTHROPIC_API_KEY``
             environment variable is used (standard anthropic SDK behavior).
+            Ignored when *client* is provided.
+        client: Pre-created :class:`anthropic.Anthropic` client for connection
+            reuse.  When ``None`` (the default), a cached client is obtained
+            via :func:`get_client` keyed by *api_key*.
         model: The Claude model to use.  Defaults to Haiku for speed/cost.
         rate_limiter: Optional rate limiter to prevent excessive API usage.
             Defaults to the module-level limiter (20 calls/60s).  Pass ``None``
@@ -246,7 +282,8 @@ def interpret_message(
     if rate_limiter is not None:
         rate_limiter.acquire()
 
-    client = anthropic.Anthropic(api_key=api_key)
+    if client is None:
+        client = get_client(api_key=api_key)
 
     # Build the user message with orchestrator context.
     user_parts: list[str] = []
