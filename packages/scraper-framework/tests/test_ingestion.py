@@ -2367,3 +2367,229 @@ def test_process_event_non_pdf_skips_pdf_extraction(
     mock_extract_pdf.assert_not_called()
 
     mock_conn.commit.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Coverage gap tests — remaining uncovered lines in worker.py (#811)
+# ---------------------------------------------------------------------------
+
+
+def test_parse_date_date_object() -> None:
+    """_parse_date with a date object returns it directly (line 783)."""
+    d = date(2026, 3, 5)
+    assert _parse_date(d) is d
+
+
+def test_parse_date_invalid_string() -> None:
+    """_parse_date with an invalid string returns None (lines 787-788)."""
+    assert _parse_date("not-a-date") is None
+
+
+@patch("ingestion.worker.psycopg")
+def test_ensure_consumer_group_creates_group(mock_psycopg: MagicMock) -> None:
+    """_ensure_consumer_group calls xgroup_create on first run (lines 661-670)."""
+    worker, _ = _make_worker()
+
+    worker._ensure_consumer_group()
+
+    worker._redis.xgroup_create.assert_called_once_with(
+        "document.captured", "ingestion-workers", id="0", mkstream=True
+    )
+
+
+@patch("ingestion.worker.psycopg")
+def test_ensure_consumer_group_already_exists(mock_psycopg: MagicMock) -> None:
+    """_ensure_consumer_group silently ignores 'group already exists' error."""
+    worker, _ = _make_worker()
+    worker._redis.xgroup_create.side_effect = Exception(
+        "BUSYGROUP Consumer Group name already exists"
+    )
+
+    # Should not raise
+    worker._ensure_consumer_group()
+
+
+@patch("ingestion.worker.psycopg")
+def test_process_batch_calls_xreadgroup(mock_psycopg: MagicMock) -> None:
+    """_process_batch calls xreadgroup and processes returned messages (lines 673-685)."""
+    worker, _ = _make_worker()
+    worker.process_event = MagicMock()
+
+    event_data = _make_event()
+    msg_id = b"1234-0"
+    worker._redis.xreadgroup.return_value = [
+        (b"document.captured", [(msg_id, {b"data": json.dumps(event_data).encode()})])
+    ]
+
+    worker._process_batch(batch_size=10, block_ms=5000)
+
+    worker._redis.xreadgroup.assert_called_once()
+    worker.process_event.assert_called_once()
+    worker._redis.xack.assert_called_once()
+
+
+@patch("ingestion.worker.psycopg")
+def test_process_batch_no_messages(mock_psycopg: MagicMock) -> None:
+    """_process_batch does nothing when no messages are returned."""
+    worker, _ = _make_worker()
+    worker.process_event = MagicMock()
+    worker._redis.xreadgroup.return_value = None
+
+    worker._process_batch(batch_size=10, block_ms=5000)
+
+    worker.process_event.assert_not_called()
+
+
+@patch("ingestion.worker.psycopg")
+def test_run_loop_continues_on_generic_exception(mock_psycopg: MagicMock) -> None:
+    """The run loop logs and continues on generic exceptions (lines 317-318).
+
+    After the generic exception, simulate KeyboardInterrupt to break the loop.
+    """
+    worker, _ = _make_worker()
+    worker._ensure_consumer_group = MagicMock()
+    worker.health_check = MagicMock()
+
+    # First call raises generic exception, second call raises KeyboardInterrupt
+    worker._process_batch = MagicMock(
+        side_effect=[RuntimeError("unexpected"), KeyboardInterrupt],
+    )
+
+    # Should NOT raise — it catches the RuntimeError and continues,
+    # then exits gracefully on KeyboardInterrupt
+    worker.run()
+
+    assert worker._process_batch.call_count == 2
+
+
+@patch("ingestion.worker.extract_fields_llm")
+@patch("ingestion.worker.psycopg")
+def test_process_event_llm_extraction_populates_case_type(
+    mock_psycopg: MagicMock,
+    mock_llm: MagicMock,
+) -> None:
+    """When LLM extraction returns case_type, it populates the field (lines 440-441)."""
+    from ingestion.llm_extract import LLMExtractionResult, LLMRulingResult
+
+    worker, os_mock = _make_worker()
+    worker._llm_client = MagicMock()
+
+    mock_conn, mock_cur = _make_mock_conn()
+    mock_psycopg.connect.return_value = mock_conn
+    mock_cur.fetchone.side_effect = [
+        ("court-uuid-1",),  # upsert_court
+        ("case-uuid-1",),  # upsert_case
+        (True,),  # insert_document: RETURNING is_new = True
+        None,  # resolve_judge: no existing alias
+        ("judge-uuid-1",),  # resolve_judge: INSERT INTO judges
+    ]
+    mock_cur.rowcount = 1
+
+    # LLM returns case_type but nothing else new
+    mock_llm.return_value = LLMExtractionResult(
+        case_count=1,
+        rulings=[
+            LLMRulingResult(
+                case_number="23STCV12345",
+                case_type="civil",
+            )
+        ],
+    )
+
+    event = _make_event(
+        case_type=None,
+        ruling_text="Some ruling text",
+    )
+    worker.process_event(event)
+
+    mock_llm.assert_called_once()
+
+    # Verify case_type was passed to upsert_case
+    all_sql = " ".join(str(c) for c in mock_cur.execute.call_args_list)
+    assert "civil" in all_sql
+
+
+@patch("ingestion.worker.extract_hearing_date")
+@patch("ingestion.worker.psycopg")
+def test_process_event_regex_hearing_date_extraction(
+    mock_psycopg: MagicMock,
+    mock_extract_hd: MagicMock,
+) -> None:
+    """When hearing_date is missing and regex extracts it, tracks it (lines 470-471)."""
+    worker, os_mock = _make_worker()
+
+    mock_conn, mock_cur = _make_mock_conn()
+    mock_psycopg.connect.return_value = mock_conn
+    mock_cur.fetchone.side_effect = [
+        ("court-uuid-1",),  # upsert_court
+        ("case-uuid-1",),  # upsert_case
+        (True,),  # insert_document: RETURNING is_new = True
+        None,  # resolve_judge: no existing alias
+        ("judge-uuid-1",),  # resolve_judge: INSERT INTO judges
+    ]
+    mock_cur.rowcount = 1
+
+    # Regex extraction returns a date
+    mock_extract_hd.return_value = date(2026, 3, 10)
+
+    event = _make_event(
+        hearing_date=None,
+        ruling_text="Hearing Date: March 10, 2026\nThe motion is GRANTED.",
+    )
+    worker.process_event(event)
+
+    # Hearing date should have been extracted via regex
+    mock_extract_hd.assert_called_once()
+
+    # Ruling should have been inserted since hearing_date is now available
+    ruling_calls = [c for c in mock_cur.execute.call_args_list if "INSERT INTO rulings" in str(c)]
+    assert len(ruling_calls) == 1
+
+
+@patch("ingestion.worker.extract_case_title")
+@patch("ingestion.worker.psycopg")
+def test_process_event_regex_case_title_extraction(
+    mock_psycopg: MagicMock,
+    mock_extract_title: MagicMock,
+) -> None:
+    """When case_title is missing and regex extracts it, extraction_methods tracks it (line 507)."""
+    worker, os_mock = _make_worker()
+
+    mock_conn, mock_cur = _make_mock_conn()
+    mock_psycopg.connect.return_value = mock_conn
+    mock_cur.fetchone.side_effect = [
+        ("court-uuid-1",),  # upsert_court
+        ("case-uuid-1",),  # upsert_case
+        (True,),  # insert_document: RETURNING is_new = True
+        None,  # resolve_judge: no existing alias
+        ("judge-uuid-1",),  # resolve_judge: INSERT INTO judges
+    ]
+    mock_cur.rowcount = 1
+
+    # Regex returns a title
+    mock_extract_title.return_value = "Smith v. Jones"
+
+    # "Smith v. Jones" triggers extract_parties_from_caption which produces
+    # party records that need additional fetchone calls for batch_upsert_parties
+    mock_cur.fetchone.side_effect = [
+        ("court-uuid-1",),  # upsert_court
+        ("case-uuid-1",),  # upsert_case
+        (True,),  # insert_document: RETURNING is_new = True
+        None,  # resolve_judge: no existing alias
+        ("judge-uuid-1",),  # resolve_judge: INSERT INTO judges
+        # batch_upsert_parties: RETURNING ids for extracted parties
+        ("party-uuid-1",),
+        ("party-uuid-2",),
+    ]
+    # batch_upsert_parties SELECT returns no existing aliases
+    mock_cur.fetchall.return_value = []
+    mock_cur.nextset.side_effect = [True, False]
+
+    event = _make_event(
+        case_title=None,
+        ruling_text="Case: Smith v. Jones\nThe motion is GRANTED.",
+    )
+    worker.process_event(event)
+
+    mock_extract_title.assert_called_once()
+    mock_conn.commit.assert_called_once()
