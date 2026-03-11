@@ -127,6 +127,9 @@ resource "aws_secretsmanager_secret" "opensearch_master" {
   recovery_window_in_days = var.environment == "production" ? 30 : 0
 }
 
+# NOTE: This secret_version IS Terraform-managed — all values are derived from
+# Terraform resources (random_password, aws_opensearch_domain). Do NOT add
+# ignore_changes here; Terraform must keep the secret in sync with OpenSearch.
 resource "aws_secretsmanager_secret_version" "opensearch_master" {
   secret_id = aws_secretsmanager_secret.opensearch_master.id
   secret_string = jsonencode({

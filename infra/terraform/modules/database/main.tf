@@ -129,6 +129,9 @@ resource "aws_secretsmanager_secret" "db_connection" {
   recovery_window_in_days = var.environment == "production" ? 30 : 0
 }
 
+# NOTE: This secret_version IS Terraform-managed — all values are derived from
+# Terraform resources (random_password, aws_db_instance). Do NOT add
+# ignore_changes here; Terraform must keep the secret in sync with the DB.
 resource "aws_secretsmanager_secret_version" "db_connection" {
   secret_id = aws_secretsmanager_secret.db_connection.id
   secret_string = jsonencode({

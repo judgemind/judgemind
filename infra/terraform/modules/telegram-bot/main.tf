@@ -17,18 +17,11 @@ resource "aws_secretsmanager_secret" "telegram_bot" {
 
 }
 
-resource "aws_secretsmanager_secret_version" "telegram_bot" {
-  secret_id = aws_secretsmanager_secret.telegram_bot.id
-  secret_string = jsonencode({
-    bot_token        = ""
-    allowed_user_ids = []
-  })
-
-  # Don't overwrite if the secret has been manually populated.
-  lifecycle {
-    ignore_changes = [secret_string]
-  }
-}
+# NOTE: No aws_secretsmanager_secret_version here — the secret value is
+# populated manually (bot token + allowed user IDs). Terraform manages only
+# the secret container, never the value. This prevents Terraform from
+# overwriting the real token on apply or during state migrations.
+# See #712 for context.
 
 # ─── SQS Queue ────────────────────────────────────────────────────────────────
 # Standard queue for inbound Telegram messages. Ordering doesn't matter for
