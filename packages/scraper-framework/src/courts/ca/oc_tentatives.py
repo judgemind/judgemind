@@ -231,6 +231,35 @@ def _oc_courthouse(dept: str) -> str:
     return "Central Justice Center"
 
 
+# ---------------------------------------------------------------------------
+# Case number normalization — fix split-line and alternate formats
+# ---------------------------------------------------------------------------
+
+# Matches case numbers split across two lines by pdfplumber's columnar extraction.
+# E.g.: "2024-\n01428785" or "25-\n  01428785"
+_SPLIT_CASE_NUMBER_RE = re.compile(
+    r"(\d{2,4})-\s*\n\s*(\d{7,8})\b",
+)
+
+# Three-part case numbers: location prefix + year + sequence.
+# E.g. "30-2024-01420730" where "30" is a location/court prefix.
+_THREE_PART_CASE_NUMBER_RE = re.compile(
+    r"\b(\d{2})-(\d{4}-\d{7,8})\b",
+)
+
+
+def _normalize_oc_text(text: str) -> str:
+    """Pre-process extracted PDF text to rejoin case numbers split across lines.
+
+    pdfplumber's columnar layout extraction can split case numbers like
+    "2024-01428785" across two lines:
+        2024-
+        01428785
+    This function detects that pattern and merges the fragments back together.
+    """
+    return _SPLIT_CASE_NUMBER_RE.sub(r"\1-\2", text)
+
+
 _EMPTY_CASE_TABLE_RE = re.compile(
     r"TENTATIVE\s+RULINGS?\s*\n"
     r"(?:LAW\s*[&]\s*MOTION\s*\n)?"
@@ -268,7 +297,9 @@ class OCTentativeRulingsScraper(PdfLinkScraper):
             courthouse_from_dept=_oc_courthouse,
             verify_ssl=True,
             # Central/West use DD-DDDDDDDD; Costa Mesa/Complex use DDDD-DDDDDDDD
-            case_number_re=re.compile(r"\b\d{2,4}-\d{8}\b"),
+            # Some depts use 7-digit sequences (e.g. 24-1377364 in C20)
+            # Three-part format (30-2024-01420730) is handled by normalize + this regex
+            case_number_re=re.compile(r"\b\d{2,4}-\d{7,8}\b"),
         )
         super().__init__(config, pdf_config=pdf_config, **kwargs)
 
@@ -288,12 +319,66 @@ class OCTentativeRulingsScraper(PdfLinkScraper):
     def parse_document(self, doc: CapturedDocument) -> CapturedDocument:
         """Extract case numbers, hearing date, and case titles from PDF text.
 
+        Pre-processes PDF text to rejoin case numbers split across lines by
+        pdfplumber's columnar extraction, then delegates to the base class for
+        regex matching. Also handles three-part case number formats
+        (e.g. ``30-2024-01420730``) by extracting the full number including the
+        location prefix.
+
         For North Justice Center PDFs (departments starting with "N"), case
         numbers are not present in the PDF text. Instead we parse the columnar
         layout to extract case titles and motion types, making these records
         useful for legal research even without formal case numbers.
         """
         doc = super().parse_document(doc)
+
+        # Post-process: normalize text to rejoin split-line case numbers,
+        # then re-run case number extraction on the normalized text.
+        if doc.ruling_text:
+            normalized = _normalize_oc_text(doc.ruling_text)
+            doc.ruling_text = normalized
+
+            # Re-extract case numbers from normalized text
+            case_numbers = self._pdf_config.case_number_re.findall(normalized)
+
+            # Also capture three-part case numbers (e.g. 30-2024-01420730).
+            # These have a location prefix that the standard regex misses.
+            three_part = _THREE_PART_CASE_NUMBER_RE.findall(normalized)
+            three_part_full = [f"{prefix}-{rest}" for prefix, rest in three_part]
+
+            # Merge: prefer three-part where the suffix matches a standard match
+            all_numbers: list[str] = []
+            standard_set = set(case_numbers)
+            # For each three-part number, replace its suffix in the results
+            suffix_to_full: dict[str, str] = {}
+            for full_num in three_part_full:
+                # The suffix (e.g. "2024-01420730") is what the standard regex finds
+                parts = full_num.split("-", 1)
+                suffix = parts[1] if len(parts) > 1 else full_num
+                suffix_to_full[suffix] = full_num
+
+            for cn in case_numbers:
+                if cn in suffix_to_full:
+                    all_numbers.append(suffix_to_full[cn])
+                else:
+                    all_numbers.append(cn)
+            # Add any three-part numbers whose suffix wasn't in case_numbers
+            for suffix, full in suffix_to_full.items():
+                if suffix not in standard_set:
+                    all_numbers.append(full)
+
+            # Deduplicate while preserving order
+            seen: set[str] = set()
+            deduped: list[str] = []
+            for cn in all_numbers:
+                if cn not in seen:
+                    seen.add(cn)
+                    deduped.append(cn)
+
+            if deduped:
+                doc.case_number = deduped[0]
+                if len(deduped) > 1:
+                    doc.extra["all_case_numbers"] = deduped
 
         # Extract hearing date from PDF text
         if doc.ruling_text and not doc.hearing_date:

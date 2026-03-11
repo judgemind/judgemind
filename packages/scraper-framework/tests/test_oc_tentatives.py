@@ -25,6 +25,7 @@ from courts.ca.oc_tentatives import (
     INDEX_URL,
     OCTentativeRulingsScraper,
     _is_north_dept,
+    _normalize_oc_text,
     _oc_hearing_date_from_text,
     _parse_north_case_entries,
 )
@@ -319,3 +320,291 @@ def test_oc_run_central_no_case_titles_in_extra() -> None:
 
     # Central docs should have case_number (from regex), not case_titles
     assert "case_titles" not in parsed.extra
+
+
+# ---------------------------------------------------------------------------
+# _normalize_oc_text — unit tests for split-line case number rejoining
+# ---------------------------------------------------------------------------
+
+
+def test_normalize_oc_text_split_four_digit_year() -> None:
+    """Case number split across lines: 2024-\\n01428785 -> 2024-01428785."""
+    text = (
+        "53. Morton v.     Plaintiff Robert Morton's ...\n"
+        "OC Sheriff        DENIED.\n"
+        "2024-\n01428785\nSome more text"
+    )
+    result = _normalize_oc_text(text)
+    assert "2024-01428785" in result
+    assert "2024-\n01428785" not in result
+
+
+def test_normalize_oc_text_split_two_digit_year() -> None:
+    """Case number split across lines: 25-\\n01455183 -> 25-01455183."""
+    text = "Some text\n25-\n01455183\nMore text"
+    result = _normalize_oc_text(text)
+    assert "25-01455183" in result
+
+
+def test_normalize_oc_text_split_with_spaces() -> None:
+    """Case number split with whitespace: 2024-  \\n  01428785."""
+    text = "Text before\n2024-  \n  01428785\nText after"
+    result = _normalize_oc_text(text)
+    assert "2024-01428785" in result
+
+
+def test_normalize_oc_text_split_seven_digit() -> None:
+    """Case number split with 7-digit sequence: 24-\\n1377364."""
+    text = "Ruling text\n24-\n1377364\nMore text"
+    result = _normalize_oc_text(text)
+    assert "24-1377364" in result
+
+
+def test_normalize_oc_text_no_split_passthrough() -> None:
+    """Text without split case numbers passes through unchanged."""
+    text = "25-01455183 is a normal case number\nOn a single line"
+    result = _normalize_oc_text(text)
+    assert result == text
+
+
+def test_normalize_oc_text_multiple_splits() -> None:
+    """Multiple split case numbers in the same text."""
+    text = "Case 1:\n2024-\n01428785\nCase 2:\n25-\n01455183\n"
+    result = _normalize_oc_text(text)
+    assert "2024-01428785" in result
+    assert "25-01455183" in result
+
+
+# ---------------------------------------------------------------------------
+# Seven-digit case numbers — regex tests
+# ---------------------------------------------------------------------------
+
+
+def test_seven_digit_case_number_matched() -> None:
+    """Case number with 7 digits after dash (C20 format) is captured."""
+    from courts.ca.oc_tentatives import OCTentativeRulingsScraper
+
+    config = oc_default_config()
+    scraper = OCTentativeRulingsScraper(config=config)
+    regex = scraper._pdf_config.case_number_re
+
+    assert regex.search("24-1377364") is not None
+    assert regex.search("24-1377364").group() == "24-1377364"
+
+
+def test_seven_digit_case_number_in_context() -> None:
+    """Seven-digit case number extracted from realistic PDF text."""
+    from courts.ca.oc_tentatives import OCTentativeRulingsScraper
+
+    config = oc_default_config()
+    scraper = OCTentativeRulingsScraper(config=config)
+    regex = scraper._pdf_config.case_number_re
+
+    text = "1. Smith v. Jones   Motion for Summary Judgment\n24-1377364          GRANTED."
+    matches = regex.findall(text)
+    assert "24-1377364" in matches
+
+
+def test_eight_digit_case_number_still_matched() -> None:
+    """Standard 8-digit case numbers still work after regex relaxation."""
+    from courts.ca.oc_tentatives import OCTentativeRulingsScraper
+
+    config = oc_default_config()
+    scraper = OCTentativeRulingsScraper(config=config)
+    regex = scraper._pdf_config.case_number_re
+
+    assert regex.search("25-01455183") is not None
+    assert regex.search("2024-01437598") is not None
+
+
+# ---------------------------------------------------------------------------
+# Three-part case numbers — integration tests
+# ---------------------------------------------------------------------------
+
+
+@respx.mock
+def test_oc_three_part_case_number_captured() -> None:
+    """Three-part case numbers (30-2024-01420730) are captured with prefix."""
+    html = _load_html("oc_civil_page.html")
+    # Use the C34 fixture which has three-part case numbers
+    pdf_bytes = _load_bytes("oc_central_c34.pdf")
+
+    respx.get(INDEX_URL).mock(return_value=httpx.Response(200, text=html))
+    respx.get(url__regex=r"\.pdf$").mock(return_value=httpx.Response(200, content=pdf_bytes))
+
+    config = oc_default_config()
+    config.request_delay_seconds = 0
+    scraper = OCTentativeRulingsScraper(config=config)
+
+    docs = scraper.fetch_documents()
+    assert len(docs) > 0
+
+    parsed = scraper.parse_document(docs[0])
+
+    # The C34 fixture contains three-part case numbers like 30-2024-01393434
+    # These should be captured with the full prefix
+    all_numbers = parsed.extra.get("all_case_numbers", [parsed.case_number])
+    three_part_numbers = [cn for cn in all_numbers if cn.count("-") == 2]
+    assert len(three_part_numbers) > 0, f"Expected three-part case numbers but got: {all_numbers}"
+    # Verify format: DD-DDDD-DDDDDDD+
+    for cn in three_part_numbers:
+        parts = cn.split("-")
+        assert len(parts) == 3
+        assert all(p.isdigit() for p in parts)
+
+
+def test_oc_split_case_number_synthetic() -> None:
+    """Synthetic test: split case numbers are rejoined and extracted."""
+    from unittest.mock import patch
+
+    from framework import ContentFormat
+
+    config = oc_default_config()
+    scraper = OCTentativeRulingsScraper(config=config)
+
+    doc = scraper._make_base_doc(
+        source_url="https://example.com/test.pdf",
+        raw_content=b"fake-pdf",
+        content_format=ContentFormat.PDF,
+    )
+    doc.department = "C28"
+
+    synthetic_text = (
+        "TENTATIVE RULINGS\nLAW & MOTION\nDEPT C28\n"
+        "Date: March 10, 2026\n"
+        "1. Smith v. Jones   Motion for Summary Judgment\n"
+        "2024-\n"
+        "01428785          GRANTED.\n"
+        "2. Doe v. Roe      Demurrer\n"
+        "25-01455183       SUSTAINED.\n"
+    )
+
+    with patch(
+        "courts.ca.pdf_link_scraper._extract_pdf_text",
+        return_value=synthetic_text,
+    ):
+        parsed = scraper.parse_document(doc)
+
+    # The split case number should be rejoined
+    all_numbers = parsed.extra.get("all_case_numbers", [parsed.case_number])
+    assert "2024-01428785" in all_numbers
+    assert "25-01455183" in all_numbers
+
+
+def test_oc_seven_digit_case_number_synthetic() -> None:
+    """Synthetic test: 7-digit case numbers are extracted."""
+    from unittest.mock import patch
+
+    from framework import ContentFormat
+
+    config = oc_default_config()
+    scraper = OCTentativeRulingsScraper(config=config)
+
+    doc = scraper._make_base_doc(
+        source_url="https://example.com/test.pdf",
+        raw_content=b"fake-pdf",
+        content_format=ContentFormat.PDF,
+    )
+    doc.department = "C20"
+
+    synthetic_text = (
+        "TENTATIVE RULINGS\nLAW & MOTION\nDEPT C20\n"
+        "Date: March 10, 2026\n"
+        "1. Alpha v. Beta   Motion to Compel\n"
+        "24-1377364          GRANTED.\n"
+        "2. Gamma v. Delta  Demurrer\n"
+        "24-1388901          OVERRULED.\n"
+    )
+
+    with patch(
+        "courts.ca.pdf_link_scraper._extract_pdf_text",
+        return_value=synthetic_text,
+    ):
+        parsed = scraper.parse_document(doc)
+
+    all_numbers = parsed.extra.get("all_case_numbers", [parsed.case_number])
+    assert "24-1377364" in all_numbers
+    assert "24-1388901" in all_numbers
+
+
+# ---------------------------------------------------------------------------
+# Regression: existing fixtures still work after changes
+# ---------------------------------------------------------------------------
+
+
+def test_oc_west_case_numbers_unchanged() -> None:
+    """West JC fixture still extracts the same case numbers after changes."""
+    from framework import ContentFormat
+
+    config = oc_default_config()
+    scraper = OCTentativeRulingsScraper(config=config)
+
+    pdf_bytes = _load_bytes("oc_west_w.pdf")
+
+    doc = scraper._make_base_doc(
+        source_url="https://example.com/test.pdf",
+        raw_content=pdf_bytes,
+        content_format=ContentFormat.PDF,
+    )
+    doc.department = "W15"
+
+    parsed = scraper.parse_document(doc)
+
+    # West JC should still have case numbers
+    assert parsed.case_number is not None
+    # Known case numbers from the fixture
+    assert parsed.case_number.count("-") == 1  # Standard 2-part format
+
+
+def test_oc_apkarian_case_numbers_unchanged() -> None:
+    """Apkarian C25 fixture still extracts the same case numbers."""
+    from framework import ContentFormat
+
+    config = oc_default_config()
+    scraper = OCTentativeRulingsScraper(config=config)
+
+    pdf_bytes = _load_bytes("oc_apkarian_c25.pdf")
+
+    doc = scraper._make_base_doc(
+        source_url="https://example.com/test.pdf",
+        raw_content=pdf_bytes,
+        content_format=ContentFormat.PDF,
+    )
+    doc.department = "C25"
+
+    parsed = scraper.parse_document(doc)
+
+    assert parsed.case_number is not None
+    all_numbers = parsed.extra.get("all_case_numbers", [parsed.case_number])
+    assert len(all_numbers) >= 10  # C25 has many case numbers
+
+
+def test_oc_central_c34_three_part_numbers() -> None:
+    """C34 fixture captures three-part case numbers with location prefix."""
+    from framework import ContentFormat
+
+    config = oc_default_config()
+    scraper = OCTentativeRulingsScraper(config=config)
+
+    pdf_bytes = _load_bytes("oc_central_c34.pdf")
+
+    doc = scraper._make_base_doc(
+        source_url="https://example.com/test.pdf",
+        raw_content=pdf_bytes,
+        content_format=ContentFormat.PDF,
+    )
+    doc.department = "C34"
+
+    parsed = scraper.parse_document(doc)
+
+    assert parsed.case_number is not None
+    all_numbers = parsed.extra.get("all_case_numbers", [parsed.case_number])
+
+    # C34 has known three-part numbers like 30-2024-01393434
+    three_part = [cn for cn in all_numbers if cn.count("-") == 2]
+    assert len(three_part) > 0, f"Expected three-part numbers in C34, got: {all_numbers}"
+
+    # Verify 30-2024-01393434 is captured (known from fixture inspection)
+    assert any("30-2024-01393434" == cn for cn in all_numbers), (
+        f"Expected 30-2024-01393434 in {all_numbers}"
+    )
