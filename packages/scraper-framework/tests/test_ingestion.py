@@ -1018,9 +1018,15 @@ def test_upsert_case_judge_inserts() -> None:
 # ---------------------------------------------------------------------------
 
 
+@patch("ingestion.worker.fetch_department_judge_mapping", return_value={})
 @patch("ingestion.worker.psycopg")
-def test_process_event_no_judge_name_leaves_judge_id_null(mock_psycopg: MagicMock) -> None:
-    """Events without judge_name should not resolve a judge — judge_id stays NULL."""
+def test_process_event_no_judge_name_leaves_judge_id_null(
+    mock_psycopg: MagicMock, _mock_fetch_dept: MagicMock
+) -> None:
+    """Events without judge_name should not resolve a judge — judge_id stays NULL.
+
+    The LA dept-to-judge mapping returns empty, so no dept lookup resolves either.
+    """
     worker, os_mock = _make_worker()
 
     mock_conn, mock_cur = _make_mock_conn()
@@ -1869,3 +1875,194 @@ def test_match_ruling_empty_rulings_returns_none() -> None:
 
     result = LLMExtractionResult(rulings=[])
     assert _match_ruling(result, "AAA") is None
+
+
+# ---------------------------------------------------------------------------
+# LA department-to-judge lookup tests (#584)
+# ---------------------------------------------------------------------------
+
+
+@patch(
+    "ingestion.worker.fetch_department_judge_mapping",
+    return_value={"1": "Jane Doe", "52": "John Smith"},
+)
+@patch("ingestion.worker.psycopg")
+def test_la_dept_lookup_resolves_judge_when_name_missing(
+    mock_psycopg: MagicMock, _mock_fetch_dept: MagicMock
+) -> None:
+    """LA event with department but no judge_name resolves judge via dept map."""
+    worker, os_mock = _make_worker()
+
+    mock_conn, mock_cur = _make_mock_conn()
+    mock_psycopg.connect.return_value = mock_conn
+    mock_cur.fetchone.side_effect = [
+        ("court-uuid-1",),  # upsert_court
+        ("case-uuid-1",),  # upsert_case
+        (True,),  # insert_document: RETURNING is_new = True
+        None,  # resolve_judge: no existing alias
+        ("judge-uuid-dept",),  # resolve_judge: INSERT INTO judges
+    ]
+    mock_cur.rowcount = 1
+
+    event = _make_event(judge_name=None, department="1")
+    worker.process_event(event)
+
+    mock_conn.commit.assert_called_once()
+
+    # Judge resolution should have happened via dept lookup
+    all_sql = " ".join(str(c) for c in mock_cur.execute.call_args_list)
+    assert "judges" in all_sql.lower() or "judge_aliases" in all_sql.lower()
+
+
+@patch(
+    "ingestion.worker.fetch_department_judge_mapping",
+    return_value={"1": "Jane Doe"},
+)
+@patch("ingestion.worker.psycopg")
+def test_la_dept_lookup_skipped_when_judge_name_present(
+    mock_psycopg: MagicMock, mock_fetch_dept: MagicMock
+) -> None:
+    """LA event with judge_name already present skips dept lookup entirely."""
+    worker, os_mock = _make_worker()
+
+    mock_conn, mock_cur = _make_mock_conn()
+    mock_psycopg.connect.return_value = mock_conn
+    mock_cur.fetchone.side_effect = [
+        ("court-uuid-1",),  # upsert_court
+        ("case-uuid-1",),  # upsert_case
+        (True,),  # insert_document: RETURNING is_new = True
+        None,  # resolve_judge: no existing alias
+        ("judge-uuid-1",),  # resolve_judge: INSERT INTO judges
+    ]
+    mock_cur.rowcount = 1
+
+    event = _make_event(judge_name="Already Known", department="1")
+    worker.process_event(event)
+
+    # fetch_department_judge_mapping should NOT have been called
+    mock_fetch_dept.assert_not_called()
+
+
+@patch("ingestion.worker.psycopg")
+def test_la_dept_lookup_skipped_for_non_la_county(mock_psycopg: MagicMock) -> None:
+    """Non-LA county events should not trigger the dept lookup."""
+    worker, os_mock = _make_worker()
+
+    mock_conn, mock_cur = _make_mock_conn()
+    mock_psycopg.connect.return_value = mock_conn
+    mock_cur.fetchone.side_effect = [
+        ("court-uuid-1",),  # upsert_court
+        ("case-uuid-1",),  # upsert_case
+        (True,),  # insert_document: RETURNING is_new = True
+    ]
+    mock_cur.rowcount = 1
+
+    event = _make_event(
+        judge_name=None,
+        department="1",
+        state="CA",
+        county="Orange",
+        ruling_text="Short ruling text.",
+    )
+    worker.process_event(event)
+
+    # _la_dept_map should remain None (never fetched)
+    assert worker._la_dept_map is None
+
+
+@patch(
+    "ingestion.worker.fetch_department_judge_mapping",
+    return_value={"1": "Jane Doe"},
+)
+@patch("ingestion.worker.psycopg")
+def test_la_dept_lookup_unmapped_dept_leaves_judge_null(
+    mock_psycopg: MagicMock, _mock_fetch_dept: MagicMock
+) -> None:
+    """LA event with department not in mapping — judge stays NULL."""
+    worker, os_mock = _make_worker()
+
+    mock_conn, mock_cur = _make_mock_conn()
+    mock_psycopg.connect.return_value = mock_conn
+    mock_cur.fetchone.side_effect = [
+        ("court-uuid-1",),  # upsert_court
+        ("case-uuid-1",),  # upsert_case
+        (True,),  # insert_document: RETURNING is_new = True
+    ]
+    mock_cur.rowcount = 1
+
+    event = _make_event(judge_name=None, department="999")
+    worker.process_event(event)
+
+    mock_conn.commit.assert_called_once()
+
+    # No judge resolution should happen
+    all_sql = " ".join(str(c) for c in mock_cur.execute.call_args_list)
+    assert "INSERT INTO judges" not in all_sql
+    assert "case_judges" not in all_sql
+
+
+@patch(
+    "ingestion.worker.fetch_department_judge_mapping",
+    return_value={"1": "Jane Doe"},
+)
+@patch("ingestion.worker.psycopg")
+def test_la_dept_map_cached_across_events(
+    mock_psycopg: MagicMock, mock_fetch_dept: MagicMock
+) -> None:
+    """The dept map should be fetched once and reused for subsequent events."""
+    worker, os_mock = _make_worker()
+
+    mock_conn, mock_cur = _make_mock_conn()
+    mock_psycopg.connect.return_value = mock_conn
+
+    # Process two LA events with no judge_name
+    for doc_id in ("doc-1", "doc-2"):
+        mock_cur.fetchone.side_effect = [
+            ("court-uuid-1",),  # upsert_court
+            ("case-uuid-1",),  # upsert_case
+            (True,),  # insert_document
+            None,  # resolve_judge: no existing alias
+            ("judge-uuid-1",),  # resolve_judge: INSERT INTO judges
+        ]
+        mock_cur.rowcount = 1
+        event = _make_event(document_id=doc_id, judge_name=None, department="1")
+        worker.process_event(event)
+        mock_conn.reset_mock()
+        mock_cur.reset_mock()
+
+    # fetch_department_judge_mapping should have been called exactly once
+    mock_fetch_dept.assert_called_once()
+
+
+@patch(
+    "ingestion.worker.fetch_department_judge_mapping",
+    side_effect=Exception("Network error"),
+)
+@patch("ingestion.worker.psycopg")
+def test_la_dept_map_fetch_failure_degrades_gracefully(
+    mock_psycopg: MagicMock, _mock_fetch_dept: MagicMock
+) -> None:
+    """If dept map fetch fails, worker continues without dept lookup."""
+    worker, os_mock = _make_worker()
+
+    mock_conn, mock_cur = _make_mock_conn()
+    mock_psycopg.connect.return_value = mock_conn
+    mock_cur.fetchone.side_effect = [
+        ("court-uuid-1",),  # upsert_court
+        ("case-uuid-1",),  # upsert_case
+        (True,),  # insert_document: RETURNING is_new = True
+    ]
+    mock_cur.rowcount = 1
+
+    event = _make_event(judge_name=None, department="1")
+    worker.process_event(event)
+
+    # Worker should still commit — just without judge_id
+    mock_conn.commit.assert_called_once()
+
+    # Dept map should be set to empty dict (not None — fetch was attempted)
+    assert worker._la_dept_map == {}
+
+    # No judge resolution should happen
+    all_sql = " ".join(str(c) for c in mock_cur.execute.call_args_list)
+    assert "INSERT INTO judges" not in all_sql
