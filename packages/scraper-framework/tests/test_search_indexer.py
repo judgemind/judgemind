@@ -8,7 +8,11 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from framework.search.indexer import IndexingConsumer
+from framework.search.indexer import (
+    CONSUMER_GROUP,
+    STREAM_DOCUMENT_VALIDATED,
+    IndexingConsumer,
+)
 
 
 @pytest.fixture()
@@ -298,3 +302,388 @@ class TestLambdaHandler:
 
         assert result["total"] == 1
         assert result["indexed"] == 1
+
+    @patch("framework.search.indexer.helpers.bulk")
+    def test_handles_sns_records(
+        self,
+        mock_bulk: MagicMock,
+        consumer: IndexingConsumer,
+        mock_opensearch: MagicMock,
+        sample_event: dict,
+    ) -> None:
+        mock_opensearch.get.side_effect = Exception("not found")
+        mock_bulk.return_value = (1, 0)
+
+        sns_event = {
+            "Records": [
+                {"Sns": {"Message": json.dumps(sample_event)}},
+            ]
+        }
+
+        result = consumer.lambda_handler(sns_event)
+
+        assert result["total"] == 1
+        assert result["indexed"] == 1
+
+
+class TestIndexBatchErrorHandling:
+    """Tests for error handling in index_batch when _build_os_doc raises."""
+
+    @patch("framework.search.indexer.helpers.bulk")
+    def test_batch_handles_build_doc_exception(
+        self,
+        mock_bulk: MagicMock,
+        consumer: IndexingConsumer,
+        mock_opensearch: MagicMock,
+    ) -> None:
+        """When _build_os_doc raises for one event, other events still get indexed."""
+        # First call raises (missing document_id), second succeeds
+        mock_opensearch.get.side_effect = Exception("not found")
+        mock_bulk.return_value = (1, 0)
+
+        events = [
+            {
+                # Missing document_id — will cause KeyError in _build_os_doc
+            },
+            {
+                "document_id": "doc-ok",
+                "case_number": "BC2",
+                "court": "Test",
+                "county": "Test",
+                "state": "CA",
+                "content_hash": "h2",
+            },
+        ]
+
+        count = consumer.index_batch(events)
+
+        assert count == 1
+        actions = mock_bulk.call_args[0][1]
+        assert len(actions) == 1
+        assert actions[0]["_id"] == "doc-ok"
+
+    @patch("framework.search.indexer.helpers.bulk")
+    def test_batch_all_build_failures_returns_zero(
+        self,
+        mock_bulk: MagicMock,
+        consumer: IndexingConsumer,
+    ) -> None:
+        """When all events fail _build_os_doc, bulk is never called and returns 0."""
+        events = [
+            {},  # Missing document_id
+            {},  # Missing document_id
+        ]
+
+        count = consumer.index_batch(events)
+
+        assert count == 0
+        mock_bulk.assert_not_called()
+
+
+class TestStreamConsumer:
+    """Tests for the Redis Streams consumer loop (run_stream_consumer)."""
+
+    def test_creates_consumer_group(
+        self, consumer: IndexingConsumer, mock_opensearch: MagicMock
+    ) -> None:
+        """run_stream_consumer creates the consumer group on start."""
+        mock_redis = MagicMock()
+        # Make xreadgroup raise KeyboardInterrupt to break the loop immediately
+        mock_redis.xreadgroup.side_effect = KeyboardInterrupt
+
+        consumer.run_stream_consumer(mock_redis)
+
+        mock_redis.xgroup_create.assert_called_once_with(
+            STREAM_DOCUMENT_VALIDATED, CONSUMER_GROUP, id="0", mkstream=True
+        )
+
+    def test_group_already_exists(
+        self, consumer: IndexingConsumer, mock_opensearch: MagicMock
+    ) -> None:
+        """If the consumer group already exists, the exception is swallowed."""
+        mock_redis = MagicMock()
+        mock_redis.xgroup_create.side_effect = Exception("BUSYGROUP group already exists")
+        mock_redis.xreadgroup.side_effect = KeyboardInterrupt
+
+        # Should not raise
+        consumer.run_stream_consumer(mock_redis)
+
+        mock_redis.xgroup_create.assert_called_once()
+
+    def test_processes_messages_and_acks(
+        self, consumer: IndexingConsumer, mock_opensearch: MagicMock
+    ) -> None:
+        """Consumer reads messages, indexes them, and acknowledges."""
+        mock_opensearch.get.side_effect = Exception("not found")
+
+        mock_redis = MagicMock()
+        event_data = {
+            "document_id": "doc-stream-1",
+            "case_number": "BC999",
+            "court": "Stream Court",
+            "county": "Stream County",
+            "state": "CA",
+            "content_hash": "streamhash",
+        }
+
+        # First call returns a message, second raises KeyboardInterrupt
+        mock_redis.xreadgroup.side_effect = [
+            [
+                (
+                    STREAM_DOCUMENT_VALIDATED,
+                    [("msg-id-1", {b"data": json.dumps(event_data).encode()})],
+                )
+            ],
+            KeyboardInterrupt,
+        ]
+
+        consumer.run_stream_consumer(mock_redis)
+
+        # Document should have been indexed
+        mock_opensearch.index.assert_called_once()
+        call_kwargs = mock_opensearch.index.call_args.kwargs
+        assert call_kwargs["id"] == "doc-stream-1"
+
+        # Message should have been acknowledged
+        mock_redis.xack.assert_called_once_with(
+            STREAM_DOCUMENT_VALIDATED, CONSUMER_GROUP, "msg-id-1"
+        )
+
+    def test_continues_on_empty_read(
+        self, consumer: IndexingConsumer, mock_opensearch: MagicMock
+    ) -> None:
+        """When xreadgroup returns empty, the loop continues."""
+        mock_redis = MagicMock()
+        # First call returns empty (None/[]), second raises KeyboardInterrupt
+        mock_redis.xreadgroup.side_effect = [None, KeyboardInterrupt]
+
+        consumer.run_stream_consumer(mock_redis)
+
+        # Should have been called twice before breaking
+        assert mock_redis.xreadgroup.call_count == 2
+        mock_opensearch.index.assert_not_called()
+
+    def test_handles_message_processing_error(
+        self, consumer: IndexingConsumer, mock_opensearch: MagicMock
+    ) -> None:
+        """If index_document fails for a message, the loop continues without acking."""
+        mock_opensearch.get.side_effect = Exception("not found")
+        # Make index() raise to simulate indexing failure
+        mock_opensearch.index.side_effect = Exception("OpenSearch write error")
+
+        mock_redis = MagicMock()
+        event_data = {
+            "document_id": "doc-fail",
+            "case_number": "BC000",
+            "court": "Fail Court",
+            "county": "Fail County",
+            "state": "CA",
+            "content_hash": "failhash",
+        }
+
+        mock_redis.xreadgroup.side_effect = [
+            [
+                (
+                    STREAM_DOCUMENT_VALIDATED,
+                    [("msg-id-fail", {b"data": json.dumps(event_data).encode()})],
+                )
+            ],
+            KeyboardInterrupt,
+        ]
+
+        consumer.run_stream_consumer(mock_redis)
+
+        # Message should NOT have been acknowledged (processing failed)
+        mock_redis.xack.assert_not_called()
+
+    def test_handles_stream_error_and_continues(
+        self, consumer: IndexingConsumer, mock_opensearch: MagicMock
+    ) -> None:
+        """A generic exception in the outer loop is caught and the loop continues."""
+        mock_redis = MagicMock()
+        # First call raises a generic error, second raises KeyboardInterrupt
+        mock_redis.xreadgroup.side_effect = [
+            ConnectionError("Redis connection lost"),
+            KeyboardInterrupt,
+        ]
+
+        consumer.run_stream_consumer(mock_redis)
+
+        # Should have tried twice before breaking
+        assert mock_redis.xreadgroup.call_count == 2
+
+    def test_custom_stream_name_and_batch_size(
+        self, consumer: IndexingConsumer, mock_opensearch: MagicMock
+    ) -> None:
+        """Custom stream, batch_size, and block_ms are passed through."""
+        mock_redis = MagicMock()
+        mock_redis.xreadgroup.side_effect = KeyboardInterrupt
+
+        consumer.run_stream_consumer(
+            mock_redis, stream="custom.stream", batch_size=50, block_ms=1000
+        )
+
+        mock_redis.xgroup_create.assert_called_once_with(
+            "custom.stream", CONSUMER_GROUP, id="0", mkstream=True
+        )
+
+    def test_processes_message_with_string_data_key(
+        self, consumer: IndexingConsumer, mock_opensearch: MagicMock
+    ) -> None:
+        """Messages can have string 'data' key (not bytes)."""
+        mock_opensearch.get.side_effect = Exception("not found")
+
+        mock_redis = MagicMock()
+        event_data = {
+            "document_id": "doc-str",
+            "case_number": "BC111",
+            "court": "Str Court",
+            "county": "Str County",
+            "state": "CA",
+            "content_hash": "strhash",
+        }
+
+        mock_redis.xreadgroup.side_effect = [
+            [
+                (
+                    STREAM_DOCUMENT_VALIDATED,
+                    [("msg-str-1", {"data": json.dumps(event_data)})],
+                )
+            ],
+            KeyboardInterrupt,
+        ]
+
+        consumer.run_stream_consumer(mock_redis)
+
+        mock_opensearch.index.assert_called_once()
+        call_kwargs = mock_opensearch.index.call_args.kwargs
+        assert call_kwargs["id"] == "doc-str"
+        mock_redis.xack.assert_called_once()
+
+
+class TestFetchTextError:
+    """Tests for S3 fetch error handling in _fetch_text."""
+
+    def test_fetch_text_returns_empty_on_s3_error(
+        self, consumer: IndexingConsumer, mock_opensearch: MagicMock, mock_s3: MagicMock
+    ) -> None:
+        """When S3 get_object raises, _fetch_text returns empty string."""
+        mock_s3.get_object.side_effect = Exception("Access Denied")
+        mock_opensearch.get.side_effect = Exception("not found")
+
+        event = {
+            "document_id": "doc-s3-fail",
+            "s3_key": "some/key.html",
+            "case_number": "BC555",
+            "court": "S3 Court",
+            "county": "S3 County",
+            "state": "CA",
+            "content_hash": "s3failhash",
+        }
+
+        result = consumer.index_document(event)
+
+        assert result is True
+        call_kwargs = mock_opensearch.index.call_args.kwargs
+        # ruling_text should be empty string since S3 failed
+        assert call_kwargs["body"]["ruling_text"] == ""
+
+    def test_fetch_text_handles_decode_errors(
+        self, consumer: IndexingConsumer, mock_opensearch: MagicMock, mock_s3: MagicMock
+    ) -> None:
+        """Non-UTF8 bytes are decoded with replacement characters."""
+        mock_s3.get_object.return_value = {
+            "Body": BytesIO(b"\xff\xfe invalid utf8 \x80\x81"),
+        }
+        mock_opensearch.get.side_effect = Exception("not found")
+
+        event = {
+            "document_id": "doc-decode",
+            "s3_key": "some/binary.html",
+            "case_number": "BC666",
+            "court": "Decode Court",
+            "county": "Decode County",
+            "state": "CA",
+            "content_hash": "decodehash",
+        }
+
+        result = consumer.index_document(event)
+
+        assert result is True
+        call_kwargs = mock_opensearch.index.call_args.kwargs
+        # Should have content with replacement characters, not raise
+        assert len(call_kwargs["body"]["ruling_text"]) > 0
+
+
+class TestConstructor:
+    """Tests for IndexingConsumer constructor edge cases."""
+
+    def test_skip_ensure_index(self, mock_opensearch: MagicMock, mock_s3: MagicMock) -> None:
+        """When ensure_index=False, create_index is not called."""
+        with patch("framework.search.indexer.create_index") as mock_create:
+            IndexingConsumer(
+                opensearch_client=mock_opensearch,
+                s3_client=mock_s3,
+                bucket="test-bucket",
+                ensure_index=False,
+            )
+            mock_create.assert_not_called()
+
+    def test_ensure_index_called_by_default(
+        self, mock_opensearch: MagicMock, mock_s3: MagicMock
+    ) -> None:
+        """By default, create_index is called during construction."""
+        with patch("framework.search.indexer.create_index") as mock_create:
+            IndexingConsumer(
+                opensearch_client=mock_opensearch,
+                s3_client=mock_s3,
+                bucket="test-bucket",
+            )
+            mock_create.assert_called_once_with(mock_opensearch)
+
+    def test_custom_index_name(self, mock_opensearch: MagicMock, mock_s3: MagicMock) -> None:
+        """Custom index_name is used for indexing operations."""
+        consumer = IndexingConsumer(
+            opensearch_client=mock_opensearch,
+            s3_client=mock_s3,
+            bucket="test-bucket",
+            index_name="custom_index",
+            ensure_index=False,
+        )
+        mock_opensearch.get.side_effect = Exception("not found")
+
+        event = {
+            "document_id": "doc-custom",
+            "case_number": "BC1",
+            "court": "Test",
+            "county": "Test",
+            "state": "CA",
+            "content_hash": "hash1",
+        }
+        consumer.index_document(event)
+
+        call_kwargs = mock_opensearch.index.call_args.kwargs
+        assert call_kwargs["index"] == "custom_index"
+
+
+class TestAlreadyIndexed:
+    """Tests for the _already_indexed idempotency check."""
+
+    def test_no_content_hash_skips_check(
+        self, consumer: IndexingConsumer, mock_opensearch: MagicMock
+    ) -> None:
+        """When content_hash is empty, idempotency check is skipped."""
+        event = {
+            "document_id": "doc-no-hash",
+            "case_number": "BC1",
+            "court": "Test",
+            "county": "Test",
+            "state": "CA",
+            "content_hash": "",
+        }
+
+        result = consumer.index_document(event)
+
+        assert result is True
+        # get() should not be called when hash is empty
+        mock_opensearch.get.assert_not_called()
