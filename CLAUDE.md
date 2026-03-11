@@ -506,6 +506,23 @@ When Telegram is configured (bot token in Secrets Manager `judgemind/telegram/bo
 
 If Telegram is not configured, all bridge calls are silent no-ops. No existing workflows are affected.
 
+#### Responder daemon and state files
+
+The standalone **responder daemon** (`scripts/tg-responder.py`) handles simple Telegram commands (`status`, `pause`, `resume`, `stop #N`) directly — replying within seconds — and queues complex commands (`start #N`, free text) to an inbox file for the orchestrator. It communicates with the orchestrator via shared state files:
+
+- **`tmp/orchestrator_state.json`** — the responder writes `paused` flag changes here. The orchestrator must call `bridge.refresh_state()` before each spawn decision to pick up `pause`/`resume` changes made out-of-loop.
+- **`tmp/stop_requests.json`** — the responder appends stop requests here (JSON array of `{"issue_number": N, "timestamp": "..."}`). The orchestrator reads and clears this file by calling `bridge.read_stop_requests()`, which returns newly stopped issue numbers and accumulates them in `bridge.stopped_issues`. Use `bridge.is_issue_stopped(N)` to check before spawning.
+- **`tmp/tg_inbox.json`** — queued `start` and free-text commands, read by `bridge.read_inbox()`.
+
+**Orchestrator spawn loop pattern:**
+1. Call `bridge.refresh_state()` to pick up external `paused` changes.
+2. Call `bridge.read_stop_requests()` to consume new stop requests.
+3. Check `bridge.paused` — if `True`, skip spawning.
+4. Before spawning issue `#N`, check `bridge.is_issue_stopped(N)` — if `True`, skip it.
+5. Call `bridge.read_inbox()` or `bridge.drain_pending_commands()` to get inbound `start` commands.
+
+To start the responder daemon: `scripts/tg-responder.py`. To stop it: create `tmp/tg_responder.stop`.
+
 ## Improving the Agent Workflow
 
 ### Continuous DX improvements

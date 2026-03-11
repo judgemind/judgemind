@@ -11,7 +11,13 @@ import httpx
 import respx
 from moto import mock_aws
 
-from telegram_bridge import Command, CommandKind, OrchestratorBridge, TelegramBridge
+from telegram_bridge import (
+    Command,
+    CommandKind,
+    OrchestratorBridge,
+    TelegramBridge,
+    create_orchestrator_bridge,
+)
 from telegram_bridge.orchestrator import parse_command
 
 # ── Helpers ──────────────────────────────────────────────────────────────
@@ -1022,3 +1028,202 @@ class TestStatePersistence:
             body = json.loads(route.calls[0].request.content)
             assert "Worker-3" in body["text"] or "Worker\\-3" in body["text"]
             assert "#42" in body["text"] or "42" in body["text"]
+
+
+# ── refresh_state() ───────────────────────────────────────────────────
+
+
+class TestRefreshState:
+    @respx.mock
+    async def test_refresh_picks_up_external_pause(self, tmp_path: Path) -> None:
+        """refresh_state() re-reads the state file to pick up external changes."""
+        with mock_aws():
+            _setup_secret()
+            respx.post("https://api.telegram.org/botfake-bot-token/sendMessage").mock(
+                return_value=httpx.Response(200, json={"ok": True})
+            )
+
+            state_file = str(tmp_path / "state.json")
+            bridge = _make_bridge()
+            orch = OrchestratorBridge(bridge=bridge, state_file=state_file)
+            assert orch.paused is False
+
+            # Simulate the responder daemon writing paused=True externally.
+            Path(state_file).write_text(json.dumps({"paused": True, "workers": {}}))
+
+            orch.refresh_state()
+            assert orch.paused is True
+
+    @respx.mock
+    async def test_refresh_picks_up_external_workers(self, tmp_path: Path) -> None:
+        """refresh_state() loads workers added by another process."""
+        with mock_aws():
+            _setup_secret()
+            respx.post("https://api.telegram.org/botfake-bot-token/sendMessage").mock(
+                return_value=httpx.Response(200, json={"ok": True})
+            )
+
+            state_file = str(tmp_path / "state.json")
+            bridge = _make_bridge()
+            orch = OrchestratorBridge(bridge=bridge, state_file=state_file)
+            assert orch.get_workers() == []
+
+            # Simulate another process adding a worker.
+            Path(state_file).write_text(
+                json.dumps(
+                    {
+                        "paused": False,
+                        "workers": {
+                            "5": {
+                                "worker_number": 5,
+                                "issue_number": 99,
+                                "issue_title": "New task",
+                                "phase": "implementing",
+                                "updated": "",
+                            }
+                        },
+                    }
+                )
+            )
+
+            orch.refresh_state()
+            workers = orch.get_workers()
+            assert len(workers) == 1
+            assert workers[0].issue_number == 99
+
+    def test_refresh_noop_without_state_file(self) -> None:
+        """refresh_state() is a no-op when no state_file is set."""
+        with mock_aws():
+            bridge = _make_bridge()
+            orch = OrchestratorBridge(bridge=bridge)
+            # Should not raise.
+            orch.refresh_state()
+            assert orch.paused is False
+
+
+# ── read_stop_requests() ──────────────────────────────────────────────
+
+
+class TestReadStopRequests:
+    def test_returns_empty_when_no_path(self) -> None:
+        with mock_aws():
+            bridge = _make_bridge()
+            orch = OrchestratorBridge(bridge=bridge)
+            assert orch.read_stop_requests() == []
+
+    def test_returns_empty_when_file_missing(self, tmp_path: Path) -> None:
+        with mock_aws():
+            bridge = _make_bridge()
+            stop_file = str(tmp_path / "nonexistent.json")
+            orch = OrchestratorBridge(bridge=bridge, stop_requests_path=stop_file)
+            assert orch.read_stop_requests() == []
+
+    def test_returns_empty_when_file_empty(self, tmp_path: Path) -> None:
+        with mock_aws():
+            bridge = _make_bridge()
+            stop_file = tmp_path / "stop.json"
+            stop_file.write_text("")
+            orch = OrchestratorBridge(bridge=bridge, stop_requests_path=str(stop_file))
+            assert orch.read_stop_requests() == []
+
+    def test_reads_and_clears_stop_requests(self, tmp_path: Path) -> None:
+        with mock_aws():
+            bridge = _make_bridge()
+            stop_file = tmp_path / "stop.json"
+            stop_file.write_text(
+                json.dumps(
+                    [
+                        {"issue_number": 42, "timestamp": "2026-03-10T20:00:00Z"},
+                        {"issue_number": 99, "timestamp": "2026-03-10T20:01:00Z"},
+                    ]
+                )
+            )
+            orch = OrchestratorBridge(bridge=bridge, stop_requests_path=str(stop_file))
+            result = orch.read_stop_requests()
+
+            assert result == [42, 99]
+            # File should be cleared.
+            assert stop_file.read_text().strip() == ""
+            # Second read returns empty.
+            assert orch.read_stop_requests() == []
+
+    def test_accumulates_in_stopped_issues(self, tmp_path: Path) -> None:
+        with mock_aws():
+            bridge = _make_bridge()
+            stop_file = tmp_path / "stop.json"
+            stop_file.write_text(json.dumps([{"issue_number": 42}]))
+            orch = OrchestratorBridge(bridge=bridge, stop_requests_path=str(stop_file))
+
+            orch.read_stop_requests()
+            assert orch.is_issue_stopped(42)
+            assert not orch.is_issue_stopped(99)
+
+            # Write more stop requests.
+            stop_file.write_text(json.dumps([{"issue_number": 99}]))
+            orch.read_stop_requests()
+            assert orch.is_issue_stopped(42)  # Still remembered.
+            assert orch.is_issue_stopped(99)
+
+    def test_stopped_issues_property(self, tmp_path: Path) -> None:
+        with mock_aws():
+            bridge = _make_bridge()
+            stop_file = tmp_path / "stop.json"
+            stop_file.write_text(json.dumps([{"issue_number": 10}, {"issue_number": 20}]))
+            orch = OrchestratorBridge(bridge=bridge, stop_requests_path=str(stop_file))
+            orch.read_stop_requests()
+
+            assert orch.stopped_issues == frozenset({10, 20})
+
+    def test_clear_stopped_issues(self, tmp_path: Path) -> None:
+        with mock_aws():
+            bridge = _make_bridge()
+            stop_file = tmp_path / "stop.json"
+            stop_file.write_text(json.dumps([{"issue_number": 42}]))
+            orch = OrchestratorBridge(bridge=bridge, stop_requests_path=str(stop_file))
+            orch.read_stop_requests()
+            assert orch.is_issue_stopped(42)
+
+            orch.clear_stopped_issues()
+            assert not orch.is_issue_stopped(42)
+            assert orch.stopped_issues == frozenset()
+
+    def test_handles_corrupt_file(self, tmp_path: Path) -> None:
+        with mock_aws():
+            bridge = _make_bridge()
+            stop_file = tmp_path / "stop.json"
+            stop_file.write_text("not valid json{{{")
+            orch = OrchestratorBridge(bridge=bridge, stop_requests_path=str(stop_file))
+
+            result = orch.read_stop_requests()
+            assert result == []
+            # File should be cleared.
+            assert stop_file.read_text().strip() == ""
+
+    def test_skips_invalid_entries(self, tmp_path: Path) -> None:
+        with mock_aws():
+            bridge = _make_bridge()
+            stop_file = tmp_path / "stop.json"
+            stop_file.write_text(
+                json.dumps(
+                    [
+                        {"issue_number": 42},
+                        {"no_issue": "bad"},
+                        "just a string",
+                        {"issue_number": "not_an_int"},
+                        {"issue_number": 99},
+                    ]
+                )
+            )
+            orch = OrchestratorBridge(bridge=bridge, stop_requests_path=str(stop_file))
+            result = orch.read_stop_requests()
+            assert result == [42, 99]
+
+
+# ── create_orchestrator_bridge with stop_requests_path ────────────────
+
+
+class TestCreateOrchestratorBridgeStopRequests:
+    def test_factory_accepts_stop_requests_path(self) -> None:
+        with mock_aws():
+            orch = create_orchestrator_bridge(stop_requests_path="/tmp/test_stop.json")
+            assert orch.stop_requests_path == "/tmp/test_stop.json"
