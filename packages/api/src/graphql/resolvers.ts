@@ -4,6 +4,7 @@ import type { Client } from '@opensearch-project/opensearch';
 import type { Loaders } from './dataloader';
 import type { AuthUser } from '../auth';
 import { authResolvers } from './auth-resolvers';
+import { alertResolvers } from './alert-resolvers';
 import { searchRulings } from '../search/search-rulings';
 import { getJudgeAnalytics } from './judge-analytics';
 
@@ -433,6 +434,9 @@ export const resolvers = {
     hearingDate: (hit: Row) => hit.hearingDate,
   },
 
+  // Alert field resolvers
+  AlertSubscription: alertResolvers.AlertSubscription,
+
   // Auth resolvers
   ...authResolvers.User ? { User: authResolvers.User } : {},
   Mutation: authResolvers.Mutation,
@@ -440,3 +444,7 @@ export const resolvers = {
 
 // Merge auth Query resolvers into the main Query object
 Object.assign(resolvers.Query, authResolvers.Query);
+
+// Merge alert Query and Mutation resolvers
+Object.assign(resolvers.Query, alertResolvers.Query);
+Object.assign(resolvers.Mutation, alertResolvers.Mutation);

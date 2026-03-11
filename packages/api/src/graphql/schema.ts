@@ -240,6 +240,22 @@ export const typeDefs = `#graphql
   }
 
   # ---------------------------------------------------------------------------
+  # Alert Subscriptions
+  # ---------------------------------------------------------------------------
+
+  """A user's subscription to receive alerts on matching court activity."""
+  type AlertSubscription {
+    id: ID!
+    """One of: case_docket, judge_ruling, keyword, party_attorney."""
+    alertType: String!
+    """JSON string encoding the filter criteria for this alert type."""
+    filters: String!
+    """Whether this subscription is currently active."""
+    isActive: Boolean!
+    createdAt: String!
+  }
+
+  # ---------------------------------------------------------------------------
   # Queries
   # ---------------------------------------------------------------------------
 
@@ -318,6 +334,9 @@ export const typeDefs = `#graphql
 
     """Return the currently authenticated user, or null."""
     me: User
+
+    """List the authenticated user's alert subscriptions, newest first."""
+    myAlerts: [AlertSubscription!]!
   }
 
   # ---------------------------------------------------------------------------
@@ -345,5 +364,19 @@ export const typeDefs = `#graphql
 
     """Complete Google OAuth: exchange the authorization code for an auth payload."""
     completeGoogleAuth(code: String!): AuthPayload!
+
+    """Create a new alert subscription for the authenticated user."""
+    createAlertSubscription(
+      """One of: case_docket, judge_ruling, keyword, party_attorney."""
+      alertType: String!
+      """JSON string encoding the filter criteria (e.g. {"judge_id":"..."})."""
+      filters: String!
+    ): AlertSubscription!
+
+    """Delete an alert subscription owned by the authenticated user."""
+    deleteAlertSubscription(id: ID!): Boolean!
+
+    """Toggle an alert subscription on or off."""
+    toggleAlertSubscription(id: ID!, isActive: Boolean!): AlertSubscription!
   }
 `;
