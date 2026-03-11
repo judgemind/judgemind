@@ -419,10 +419,6 @@ class OrchestratorBridge:
 
         try:
             fd = os.open(str(path), os.O_RDWR)
-        except OSError:
-            return []
-
-        try:
             with os.fdopen(fd, "r+") as f:
                 fcntl.flock(f, fcntl.LOCK_EX)
                 content = f.read()
@@ -792,10 +788,6 @@ class OrchestratorBridge:
 
         try:
             fd = os.open(str(path), os.O_RDWR)
-        except OSError:
-            return []
-
-        try:
             with os.fdopen(fd, "r+") as f:
                 fcntl.flock(f, fcntl.LOCK_EX)
                 content = f.read()
