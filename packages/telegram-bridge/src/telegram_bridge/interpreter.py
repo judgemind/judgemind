@@ -20,6 +20,37 @@ import anthropic
 
 logger = logging.getLogger(__name__)
 
+# Known action types and their required/optional fields.
+# Each entry maps an action type to a dict of field specs:
+#   {"field_name": {"required": bool, "type": type | tuple[type, ...], "default": value}}
+_ACTION_SCHEMAS: dict[str, dict[str, dict[str, Any]]] = {
+    "start": {
+        "issue": {"required": True, "type": int},
+    },
+    "stop": {
+        "issue": {"required": True, "type": int},
+    },
+    "pause": {},
+    "resume": {},
+    "file_issue": {
+        "description": {"required": True, "type": str},
+        "priority": {"required": False, "type": str, "default": "p2"},
+        "labels": {"required": False, "type": list},
+    },
+    "discuss": {
+        "message": {"required": True, "type": str},
+    },
+    "do": {
+        "instruction": {"required": True, "type": str},
+    },
+}
+
+#: The set of known action type strings.
+KNOWN_ACTION_TYPES: frozenset[str] = frozenset(_ACTION_SCHEMAS)
+
+#: Allowed priority values for ``file_issue`` actions.
+ALLOWED_PRIORITIES: frozenset[str] = frozenset({"p1", "p2", "p3"})
+
 # The model to use for interpretation.  Haiku is fast and cheap.
 _DEFAULT_MODEL = "claude-haiku-4-5-20251001"
 
@@ -281,11 +312,87 @@ def _parse_response(text: str) -> dict[str, Any]:
     validated_actions: list[dict[str, Any]] = []
     if isinstance(actions, list):
         for action in actions:
-            if isinstance(action, dict) and "type" in action:
-                validated_actions.append(action)
+            validated = _validate_action(action)
+            if validated is not None:
+                validated_actions.append(validated)
 
     result["actions"] = validated_actions
     return result
+
+
+def _validate_action(action: Any) -> dict[str, Any] | None:
+    """Validate a single action dict against the known schema.
+
+    Returns the (possibly cleaned-up) action dict if valid, or ``None``
+    if the action should be dropped.  Logs a warning for every dropped or
+    fixed action.
+    """
+    if not isinstance(action, dict):
+        logger.warning("Dropping non-dict action: %r", action)
+        return None
+
+    action_type = action.get("type")
+    if not isinstance(action_type, str):
+        logger.warning("Dropping action without string 'type': %r", action)
+        return None
+
+    if action_type not in KNOWN_ACTION_TYPES:
+        logger.warning("Dropping action with unknown type %r", action_type)
+        return None
+
+    schema = _ACTION_SCHEMAS[action_type]
+
+    # Check required fields and types.
+    for field_name, spec in schema.items():
+        value = action.get(field_name)
+        if value is None:
+            if spec.get("required", False):
+                logger.warning(
+                    "Dropping %r action: missing required field %r",
+                    action_type,
+                    field_name,
+                )
+                return None
+            # Apply default for optional missing fields.
+            if "default" in spec:
+                action[field_name] = spec["default"]
+            continue
+
+        expected_type = spec.get("type")
+        if expected_type is not None and not isinstance(value, expected_type):
+            # Try to coerce int fields from string (e.g. "42" → 42).
+            if expected_type is int and isinstance(value, str):
+                try:
+                    action[field_name] = int(value)
+                    logger.warning(
+                        "Coerced %r field %r from string %r to int",
+                        action_type,
+                        field_name,
+                        value,
+                    )
+                    continue
+                except ValueError:
+                    pass
+            logger.warning(
+                "Dropping %r action: field %r has type %s, expected %s",
+                action_type,
+                field_name,
+                type(value).__name__,
+                expected_type.__name__ if isinstance(expected_type, type) else str(expected_type),
+            )
+            return None
+
+    # Special validation: normalize priority for file_issue.
+    if action_type == "file_issue":
+        priority = action.get("priority", "p2")
+        if priority not in ALLOWED_PRIORITIES:
+            logger.warning(
+                "Normalizing invalid priority %r to 'p2' in file_issue action",
+                priority,
+            )
+            action["priority"] = "p2"
+
+    return action
 
 
 def build_orchestrator_status(

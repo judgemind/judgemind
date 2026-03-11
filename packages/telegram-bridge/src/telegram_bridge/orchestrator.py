@@ -22,7 +22,7 @@ from typing import Any
 
 from .client import TelegramBridge
 from .formatting import DEFAULT_GITHUB_REPO
-from .interpreter import build_orchestrator_status
+from .interpreter import ALLOWED_PRIORITIES, build_orchestrator_status
 
 logger = logging.getLogger(__name__)
 
@@ -192,10 +192,17 @@ def _parse_inbox_entry(entry: dict[str, Any]) -> Command:
         reply_to = None
 
     if action == "file_issue":
+        priority = str(entry.get("priority", "p2"))
+        if priority not in ALLOWED_PRIORITIES:
+            logger.warning(
+                "Normalizing invalid priority %r to 'p2' in inbox file_issue entry",
+                priority,
+            )
+            priority = "p2"
         return Command(
             kind=CommandKind.FILE_ISSUE,
             description=str(entry.get("description", "")),
-            priority=str(entry.get("priority", "p2")),
+            priority=priority,
             labels=tuple(entry.get("labels", ())),
             reply_to=reply_to,
             raw_text=str(entry.get("description", "")),
