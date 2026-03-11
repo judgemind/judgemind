@@ -920,18 +920,16 @@ class TestNoLlmFlag:
         assert args.rate_limit_window == 120.0
 
 
-# ── MarkdownV2 formatting in replies ──────────────────────────────────
+# ── HTML formatting in replies ────────────────────────────────────────
 
 
-class TestMarkdownV2Formatting:
-    """Tests verifying that Claude replies are sent with MarkdownV2 parse_mode
+class TestHtmlFormatting:
+    """Tests verifying that Claude replies are sent with HTML parse_mode
     and that issue references are converted to clickable links."""
 
     @respx.mock
     @patch("tg_responder.interpret_message")
-    def test_claude_reply_sent_with_markdownv2(
-        self, mock_interpret: MagicMock, tmp_path: Path
-    ) -> None:
+    def test_claude_reply_sent_with_html(self, mock_interpret: MagicMock, tmp_path: Path) -> None:
         from telegram_bridge.interpreter import InterpretedMessage
 
         mock_interpret.return_value = InterpretedMessage(
@@ -957,7 +955,7 @@ class TestMarkdownV2Formatting:
 
         assert route.call_count == 1
         body = json.loads(route.calls[0].request.content)
-        assert body["parse_mode"] == "MarkdownV2"
+        assert body["parse_mode"] == "HTML"
 
     @respx.mock
     @patch("tg_responder.interpret_message")
@@ -988,9 +986,9 @@ class TestMarkdownV2Formatting:
         assert route.call_count == 1
         body = json.loads(route.calls[0].request.content)
         text = body["text"]
-        # Issue #42 should be a clickable link
+        # Issue #42 should be a clickable HTML link
         assert "https://github.com/judgemind/judgemind/issues/42" in text
-        # PR #100 should be a clickable link
+        # PR #100 should be a clickable HTML link
         assert "https://github.com/judgemind/judgemind/pull/100" in text
 
     @respx.mock
@@ -1004,10 +1002,10 @@ class TestMarkdownV2Formatting:
             "Hello",
             bot_token="fake-token",
             chat_ids=[12345],
-            parse_mode="MarkdownV2",
+            parse_mode="HTML",
         )
         body = json.loads(route.calls[0].request.content)
-        assert body["parse_mode"] == "MarkdownV2"
+        assert body["parse_mode"] == "HTML"
 
     @respx.mock
     def test_send_telegram_reply_no_parse_mode_by_default(self) -> None:
@@ -1023,6 +1021,34 @@ class TestMarkdownV2Formatting:
         )
         body = json.loads(route.calls[0].request.content)
         assert "parse_mode" not in body
+
+    @respx.mock
+    def test_send_telegram_reply_retries_plain_text_on_400(self) -> None:
+        """Verify that send_telegram_reply retries without parse_mode on 400."""
+
+        def _side_effect(request: httpx.Request) -> httpx.Response:
+            body = json.loads(request.content)
+            if "parse_mode" in body:
+                return httpx.Response(
+                    400,
+                    json={"ok": False, "description": "Bad Request: can't parse entities"},
+                )
+            return httpx.Response(200, json={"ok": True})
+
+        route = respx.post("https://api.telegram.org/botfake-token/sendMessage").mock(
+            side_effect=_side_effect
+        )
+        mod = _import_responder()
+        mod.send_telegram_reply(
+            "Hello <world>",
+            bot_token="fake-token",
+            chat_ids=[12345],
+            parse_mode="HTML",
+        )
+        # Should have been called twice: first with HTML, then plain text
+        assert route.call_count == 2
+        second_body = json.loads(route.calls[1].request.content)
+        assert "parse_mode" not in second_body
 
 
 # ── Default rate limit ──────────────────────────────────────────────────

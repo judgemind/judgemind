@@ -1,11 +1,16 @@
-"""Telegram MarkdownV2 formatting helpers."""
+"""Telegram HTML formatting helpers.
+
+Uses ``parse_mode=HTML`` instead of ``MarkdownV2`` because HTML only
+requires escaping ``<``, ``>``, and ``&``, making it far more robust
+for free-text replies from the Claude interpreter.  MarkdownV2 requires
+escaping 18+ special characters and silently breaks with 400 errors when
+any are missed.
+"""
 
 from __future__ import annotations
 
+import html
 import re
-
-# Characters that must be escaped in Telegram MarkdownV2 outside of code blocks.
-_ESCAPE_RE = re.compile(r"([_*\[\]()~`>#+\-=|{}.\\])")
 
 # Default GitHub repository for link generation.
 DEFAULT_GITHUB_REPO = "judgemind/judgemind"
@@ -17,26 +22,34 @@ DEFAULT_GITHUB_REPO = "judgemind/judgemind"
 _GITHUB_REF_RE = re.compile(r"(?<!\w)(PR\s+#(\d+))|(?<!\w)#(\d+)")
 
 
-def escape_mdv2(text: str) -> str:
-    """Escape special characters for Telegram MarkdownV2.
+def escape_html(text: str) -> str:
+    """Escape special characters for Telegram HTML parse mode.
 
-    See https://core.telegram.org/bots/api#markdownv2-style
+    Only ``<``, ``>``, and ``&`` need escaping.
+
+    See https://core.telegram.org/bots/api#html-style
     """
-    return _ESCAPE_RE.sub(r"\\\1", text)
+    return html.escape(text, quote=False)
+
+
+# Keep the old name as an alias for backwards compatibility during the
+# transition.  Callers that imported ``escape_mdv2`` will get the HTML
+# escaper instead, which is safe — HTML-escaping is a superset of "do
+# nothing harmful" for plain text.
+escape_mdv2 = escape_html
 
 
 def linkify_github_refs(text: str, *, repo: str = DEFAULT_GITHUB_REPO) -> str:
-    """Replace ``#N`` and ``PR #N`` references with clickable MarkdownV2 links.
+    """Replace ``#N`` and ``PR #N`` references with clickable HTML links.
 
-    Non-link text is escaped for MarkdownV2; link syntax characters are left
-    intact so Telegram renders them as hyperlinks.
+    Non-link text is escaped for HTML; link syntax uses ``<a href>`` tags.
 
     Args:
         text: Raw (unescaped) text that may contain GitHub references.
         repo: GitHub repository in ``owner/repo`` format.
 
     Returns:
-        MarkdownV2-safe string with clickable links.
+        HTML-safe string with clickable links.
     """
     base_url = f"https://github.com/{repo}"
     parts: list[str] = []
@@ -44,21 +57,21 @@ def linkify_github_refs(text: str, *, repo: str = DEFAULT_GITHUB_REPO) -> str:
 
     for m in _GITHUB_REF_RE.finditer(text):
         # Escape any text before this match.
-        parts.append(escape_mdv2(text[last_end : m.start()]))
+        parts.append(escape_html(text[last_end : m.start()]))
 
         if m.group(1):
             # "PR #N" variant
             pr_num = m.group(2)
-            parts.append(f"[PR \\#{pr_num}]({base_url}/pull/{pr_num})")
+            parts.append(f'<a href="{base_url}/pull/{pr_num}">PR #{pr_num}</a>')
         else:
             # Standalone "#N"
             issue_num = m.group(3)
-            parts.append(f"[\\#{issue_num}]({base_url}/issues/{issue_num})")
+            parts.append(f'<a href="{base_url}/issues/{issue_num}">#{issue_num}</a>')
 
         last_end = m.end()
 
     # Escape any remaining text after the last match.
-    parts.append(escape_mdv2(text[last_end:]))
+    parts.append(escape_html(text[last_end:]))
     return "".join(parts)
 
 
@@ -69,15 +82,15 @@ def format_status_card(
     details: str,
     repo: str = DEFAULT_GITHUB_REPO,
 ) -> str:
-    """Build a compact MarkdownV2 status card.
+    """Build a compact HTML status card.
 
-    Returns a string ready to pass as ``text`` with ``parse_mode=MarkdownV2``.
+    Returns a string ready to pass as ``text`` with ``parse_mode=HTML``.
     """
     state_emoji = _STATE_EMOJIS.get(state.lower(), "\u2139\ufe0f")
     # Issue label is bold; task and details get GitHub-linked references.
     return (
-        f"\U0001f4cb *Issue {linkify_github_refs(task, repo=repo)}*\n"
-        f"Status: {state_emoji} {escape_mdv2(state.capitalize())}\n"
+        f"\U0001f4cb <b>Issue {linkify_github_refs(task, repo=repo)}</b>\n"
+        f"Status: {state_emoji} {escape_html(state.capitalize())}\n"
         f"{linkify_github_refs(details, repo=repo)}"
     )
 
