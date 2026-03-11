@@ -15,6 +15,8 @@ Implement the current task using a ralph loop: an iterative work-then-review cyc
 
 Do not ask for confirmation. Work autonomously through every step.
 
+**IMPORTANT — Ralph is NOT the end of the task.** When this skill completes, the calling `/task` workflow has 7 more mandatory steps remaining (A.3 through A.9: commit, push, PR, CI, merge, deploy, retrospective). Ralph completing means the code is ready — but the code has not been committed, pushed, reviewed by CI, or merged. Exiting after ralph is a known failure mode (#721).
+
 ### Status file
 
 The `/task` skill sets up a status file at `{repo_root}/tmp/agent-status/worker-N.txt`. The `/ralph` skill writes status updates to this file at each worker/reviewer phase transition using the Write tool. The format is defined in `/task` Step 0. Derive the status file path from the worktree path (e.g. `worktrees/worker-2` -> `{repo_root}/tmp/agent-status/worker-2.txt`).
@@ -260,6 +262,8 @@ The code is ready for commit. Return control to the calling workflow (`/task` Pa
 
 **Do not commit, push, or open a PR from this skill.**
 
+**DO NOT EXIT OR STOP after writing this file.** The `/task` workflow has 7 more mandatory steps (A.3 through A.9) that MUST execute after ralph completes. Ralph completing is the HALFWAY POINT of the task, not the end. The code is implemented but has not been committed, pushed, or merged. Exiting here is a known failure mode — see issue #721. You MUST return control to the calling `/task` workflow so it can continue with commit, push, PR creation, CI monitoring, merge, deployment verification, and retrospective.
+
 ---
 
 ## Guardrails
@@ -269,6 +273,7 @@ The code is ready for commit. Return control to the calling workflow (`/task` Pa
 - **File-based state only.** No information passes between iterations except through the ralph state files.
 - **All standard rules apply.** No `$()`, no heredocs, no inline Python, temp files in `{worktree}/tmp/`.
 - **Gemini review is best-effort.** If the Google API key is unavailable or the API call fails, the loop continues with Claude-only review. Gemini review never blocks the loop.
+- **Ralph is not task completion.** Ralph handles implementation and review only. The calling `/task` workflow handles commit, push, PR, CI, merge, deploy, and cleanup. Never exit after ralph without completing the full `/task` workflow.
 
 ---
 

@@ -132,7 +132,7 @@ If the issue requires a maintainer decision before you can proceed: comment on i
 
 Follow the full PR Workflow defined in CLAUDE.md. **All commits must be on the worktree branch — never on `main`.** Summary of required substeps:
 
-**IMPORTANT — Completion contract:** This task is NOT done after implementation or after ralph says SHIP. The task requires completing ALL substeps A.1 through A.9. After ralph returns, you MUST continue with A.3 (commit/push), A.4 (merge conflicts), A.5 (CI), A.6 (PR update), A.7 (merge), A.8 (deploy verification), and A.9 (retrospective). Stopping after ralph is a bug.
+**IMPORTANT — Completion contract:** This task is NOT done after implementation or after ralph says SHIP. The task requires completing ALL substeps A.1 through A.9. After ralph returns, you MUST continue with A.3 (commit/push), A.4 (merge conflicts), A.5 (CI), A.6 (PR update), A.7 (merge), A.8 (deploy verification), and A.9 (retrospective). Stopping after ralph is a bug — see issue #721.
 
 #### A.1 — Set up dependencies
 Write status: `phase: setup`, `summary: Installing dependencies for <packages>`.
@@ -156,6 +156,13 @@ Skip this for Terraform-only or docs-only tasks.
 1. Read `{worktree}/tmp/ralph/ralph-done.txt` to confirm ralph completed with SHIP status.
 2. Read `{worktree}/tmp/ralph/review-result.txt` to verify the final verdict is SHIP.
 3. If both confirm SHIP, **immediately continue to A.3 below.** Do not stop, do not return, do not consider the task done. The code is implemented but not yet committed, pushed, or merged — the task is only halfway complete.
+
+**POST-RALPH SELF-RECOVERY GUARD:** Before proceeding to A.3, verify that the task is genuinely incomplete by running these checks:
+1. Run `git -C {worktree} status` to confirm there are uncommitted changes (there should be — ralph implements but does not commit).
+2. Run `git -C {worktree} log --oneline -1` to see the latest commit — it should NOT contain the current issue number (the implementation hasn't been committed yet).
+3. Check whether a PR already exists for this branch: `gh pr list --repo judgemind/judgemind --head <branch-name> --json number --limit 1`. It should return an empty list (no PR yet).
+
+If any of these checks show that work remains (uncommitted changes exist, no PR yet), you MUST continue to A.3. Do not exit. Do not return. Do not consider the task done. Exiting at this point is a critical workflow failure (#721).
 
 #### A.3 — Stage, commit, and push
 Write status: `phase: pushing`, `summary: Staging, committing, and pushing to remote`.
