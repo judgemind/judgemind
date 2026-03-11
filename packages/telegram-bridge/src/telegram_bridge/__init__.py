@@ -1,7 +1,7 @@
 """Judgemind Telegram bridge — Python client for agent notifications and commands."""
 
 from .client import TelegramBridge
-from .formatting import linkify_github_refs
+from .formatting import escape_html, linkify_github_refs
 from .interpreter import (
     InterpretedMessage,
     RateLimiter,
@@ -16,14 +16,15 @@ __all__ = [
     "Command",
     "CommandKind",
     "InterpretedMessage",
-    "RateLimitError",
-    "RateLimiter",
     "Message",
     "OrchestratorBridge",
+    "RateLimitError",
+    "RateLimiter",
     "SentMessage",
     "TelegramBridge",
     "build_orchestrator_status",
     "create_orchestrator_bridge",
+    "escape_html",
     "interpret_message",
     "linkify_github_refs",
 ]
