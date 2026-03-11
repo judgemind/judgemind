@@ -80,6 +80,7 @@ module "compute" {
   db_connection_secret_arn          = module.database.db_connection_secret_arn
   opensearch_url                    = "https://${module.search.domain_endpoint}"
   opensearch_credentials_secret_arn = module.search.master_credentials_secret_arn
+  llm_provider                      = "anthropic"
   anthropic_api_key_secret_arn      = data.aws_secretsmanager_secret.anthropic_api_key.arn
   google_api_key_secret_arn         = data.aws_secretsmanager_secret.google_api_key.arn
 
