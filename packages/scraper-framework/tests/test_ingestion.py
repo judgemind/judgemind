@@ -847,10 +847,12 @@ def test_normalize_judge_name_preserves_full_length() -> None:
 
 
 def test_normalize_judge_name_long_name_with_suffix() -> None:
-    """Names with suffixes like 'III' or 'Jr.' preserve full length."""
-    assert normalize_judge_name("Arthur Hester III") == "Arthur Hester Iii"
-    # Note: .title() lowercases "III" to "Iii" — this is a known limitation
-    # but the important thing is no truncation occurs.
+    """Names with suffixes like 'III' or 'Jr.' preserve correct casing."""
+    assert normalize_judge_name("Arthur Hester III") == "Arthur Hester III"
+    assert normalize_judge_name("Arthur Hester Jr.") == "Arthur Hester Jr."
+    assert normalize_judge_name("Arthur Hester Sr.") == "Arthur Hester Sr."
+    assert normalize_judge_name("Arthur Hester II") == "Arthur Hester II"
+    assert normalize_judge_name("Arthur Hester IV") == "Arthur Hester IV"
 
 
 def test_normalize_judge_name_hyphenated_surname() -> None:
@@ -942,6 +944,162 @@ def test_normalize_judge_name_consistency_with_without_hon() -> None:
     assert normalize_judge_name("Hon. Joseph B. Widman") == normalize_judge_name("Joseph B. Widman")
     # Plain name without prefix should still work
     assert normalize_judge_name("Joseph Widman") == "Joseph Widman"
+
+
+# ---------------------------------------------------------------------------
+# Judge name normalization — Arbitrator prefix stripping (#589)
+# ---------------------------------------------------------------------------
+
+
+def test_normalize_judge_name_strips_arbitrator() -> None:
+    """'Arbitrator Howard B. Miller' -> 'Howard B. Miller'."""
+    assert normalize_judge_name("Arbitrator Howard B. Miller") == "Howard B. Miller"
+
+
+def test_normalize_judge_name_strips_arbitrator_case_insensitive() -> None:
+    """Arbitrator stripping is case-insensitive."""
+    assert normalize_judge_name("ARBITRATOR HOWARD MILLER") == "Howard Miller"
+    assert normalize_judge_name("arbitrator Jane Doe") == "Jane Doe"
+
+
+# ---------------------------------------------------------------------------
+# Judge name normalization — suffix handling (#589)
+# ---------------------------------------------------------------------------
+
+
+def test_normalize_judge_name_suffix_at_beginning() -> None:
+    """'Jr. Edward B. Moreton' -> 'Edward B. Moreton Jr.' — suffix moved to end."""
+    assert normalize_judge_name("Jr. Edward B. Moreton") == "Edward B. Moreton Jr."
+
+
+def test_normalize_judge_name_sr_suffix_at_beginning() -> None:
+    """'Sr. John Smith' -> 'John Smith Sr.'."""
+    assert normalize_judge_name("Sr. John Smith") == "John Smith Sr."
+
+
+def test_normalize_judge_name_roman_numeral_suffix_at_beginning() -> None:
+    """'III Robert Jones' -> 'Robert Jones III'."""
+    assert normalize_judge_name("III Robert Jones") == "Robert Jones III"
+
+
+def test_normalize_judge_name_suffix_at_end_unchanged() -> None:
+    """Suffix already at end should stay there."""
+    assert normalize_judge_name("Edward B. Moreton Jr.") == "Edward B. Moreton Jr."
+    assert normalize_judge_name("Robert Jones III") == "Robert Jones III"
+
+
+# ---------------------------------------------------------------------------
+# Judge name normalization — garbage rejection (#589)
+# ---------------------------------------------------------------------------
+
+
+def test_normalize_judge_name_rejects_too_long() -> None:
+    """Names longer than 80 chars are rejected as garbage."""
+    long_name = "A" * 81
+    assert normalize_judge_name(long_name) is None
+
+
+def test_normalize_judge_name_rejects_unicode_junk() -> None:
+    """Names with unicode replacement characters are cleaned; pure junk rejected."""
+    # Pure replacement characters
+    assert normalize_judge_name("\ufffd") is None
+    assert normalize_judge_name("\ufffd \ufffd\ufffd \ufffd") is None
+    # Mixed: replacement chars stripped, valid name remains
+    assert normalize_judge_name("\ufffd John A. Smith\ufffd") == "John A. Smith"
+
+
+def test_normalize_judge_name_rejects_paragraph_text() -> None:
+    """Paragraph text captured as a name is rejected."""
+    paragraph = "2026 ___ Hon. Tiana J. Murillo Moving Party Is Ordered to appear"
+    assert normalize_judge_name(paragraph) is None
+
+
+def test_normalize_judge_name_rejects_ruling_text_ordered() -> None:
+    """Strings containing 'Ordered to' are rejected."""
+    assert normalize_judge_name("Judge Smith Ordered to appear in court") is None
+
+
+def test_normalize_judge_name_rejects_ruling_text_fragments() -> None:
+    """Common ruling text fragments trigger rejection."""
+    assert normalize_judge_name("Plaintiff John Smith") is None
+    assert normalize_judge_name("Defendant Corp LLC") is None
+
+
+def test_normalize_judge_name_valid_names_pass() -> None:
+    """Ensure valid names are not rejected by garbage checks."""
+    assert normalize_judge_name("John A. Smith") == "John A. Smith"
+    assert normalize_judge_name("H. Shaina Colover") == "H. Shaina Colover"
+    assert normalize_judge_name("Edward B. Moreton Jr.") == "Edward B. Moreton Jr."
+    assert normalize_judge_name("Maria Santos-Rodriguez") == "Maria Santos-Rodriguez"
+
+
+# ---------------------------------------------------------------------------
+# Judge name validation — _looks_like_valid_judge_name (#589)
+# ---------------------------------------------------------------------------
+
+
+def test_looks_like_valid_judge_name_rejects_single_word() -> None:
+    """Single-word names (last name only) are rejected."""
+    from ingestion.db import _looks_like_valid_judge_name
+
+    assert _looks_like_valid_judge_name("Bahadori") is False
+    assert _looks_like_valid_judge_name("Crowfoot") is False
+    assert _looks_like_valid_judge_name("Smith") is False
+
+
+def test_looks_like_valid_judge_name_accepts_full_names() -> None:
+    """Full names with first + last are accepted."""
+    from ingestion.db import _looks_like_valid_judge_name
+
+    assert _looks_like_valid_judge_name("John Smith") is True
+    assert _looks_like_valid_judge_name("Bobby P. Luna") is True
+    assert _looks_like_valid_judge_name("H. Shaina Colover") is True
+
+
+def test_looks_like_valid_judge_name_rejects_empty() -> None:
+    """Empty or whitespace-only strings are rejected."""
+    from ingestion.db import _looks_like_valid_judge_name
+
+    assert _looks_like_valid_judge_name("") is False
+    assert _looks_like_valid_judge_name("   ") is False
+
+
+# ---------------------------------------------------------------------------
+# resolve_judge — invalid name rejection (#589)
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_judge_rejects_garbage_name() -> None:
+    """resolve_judge returns None for garbage names instead of creating records."""
+    from ingestion.db import resolve_judge
+
+    mock_conn = MagicMock()
+
+    # Garbage name — should not touch the DB at all
+    result = resolve_judge(
+        mock_conn,
+        "2026 ___ Hon. Tiana J. Murillo Moving Party Is Ordered to appear",
+        "court-uuid-1",
+    )
+    assert result is None
+
+
+def test_resolve_judge_rejects_single_word_name() -> None:
+    """resolve_judge returns None for single-word (last-name-only) names."""
+    from ingestion.db import resolve_judge
+
+    mock_conn = MagicMock()
+    result = resolve_judge(mock_conn, "Bahadori", "court-uuid-1")
+    assert result is None
+
+
+def test_resolve_judge_rejects_unicode_junk() -> None:
+    """resolve_judge returns None for unicode junk names."""
+    from ingestion.db import resolve_judge
+
+    mock_conn = MagicMock()
+    result = resolve_judge(mock_conn, "\ufffd\ufffd \ufffd", "court-uuid-1")
+    assert result is None
 
 
 # ---------------------------------------------------------------------------
