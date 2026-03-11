@@ -283,27 +283,22 @@ def call_llm(
         return None
 
 
-def create_client(
-    provider: str | None = None,
-) -> object | None:
-    """Create a reusable LLM client for connection pooling.
+def _try_create(provider: str) -> object | None:
+    """Try to create an LLM client for a single provider.
 
     Args:
-        provider: Provider name.  Falls back to ``LLM_PROVIDER`` env var,
-            then ``"google"``.
+        provider: Provider name — ``"google"`` or ``"anthropic"``.
 
     Returns:
         A provider-specific client object, or ``None`` if credentials
-        are missing.
+        are missing or the provider is unknown.
     """
-    resolved_provider = provider or os.environ.get("LLM_PROVIDER", "google")
-
-    if resolved_provider == "anthropic":
+    if provider == "anthropic":
         api_key = os.environ.get("ANTHROPIC_API_KEY")
         if not api_key:
             return None
         return anthropic.Anthropic()
-    elif resolved_provider == "google":
+    elif provider == "google":
         from google import genai
 
         api_key = os.environ.get("GOOGLE_API_KEY")
@@ -311,5 +306,43 @@ def create_client(
             return None
         return genai.Client(api_key=api_key)
     else:
-        logger.error("llm_providers.unknown_provider", provider=resolved_provider)
         return None
+
+
+def create_client(
+    provider: str | None = None,
+) -> object | None:
+    """Create a reusable LLM client for connection pooling.
+
+    Tries the requested provider first.  If its API key is missing, falls
+    back to the other known provider and logs a warning so the mismatch
+    is visible.
+
+    Args:
+        provider: Provider name.  Falls back to ``LLM_PROVIDER`` env var,
+            then ``"google"``.
+
+    Returns:
+        A provider-specific client object, or ``None`` if no provider's
+        credentials are available.
+    """
+    resolved_provider = provider or os.environ.get("LLM_PROVIDER", "google")
+
+    # Try the primary provider first.
+    client = _try_create(resolved_provider)
+    if client is not None:
+        return client
+
+    # Fallback: try other known providers.
+    for alt in _PROVIDER_DEFAULT_MODELS:
+        if alt != resolved_provider:
+            client = _try_create(alt)
+            if client is not None:
+                logger.warning(
+                    "llm_providers.fallback",
+                    configured=resolved_provider,
+                    using=alt,
+                )
+                return client
+
+    return None
