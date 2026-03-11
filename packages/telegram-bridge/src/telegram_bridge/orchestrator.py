@@ -99,6 +99,77 @@ def parse_command(text: str) -> Command:
     return Command(kind=CommandKind.FREE_TEXT, raw_text=stripped)
 
 
+# ── Orchestrator instruction types ────────────────────────────────────────
+
+
+class InstructionKind(Enum):
+    """Recognised subagent → orchestrator instruction types."""
+
+    RESTART_RESPONDER = "restart_responder"
+    TERRAFORM_APPLY = "terraform_apply"
+    NOTIFY = "notify"
+    RUN_SCRIPT = "run_script"
+    FILE_ISSUE = "file_issue"
+
+
+#: The set of allowed action strings for validation.
+ALLOWED_INSTRUCTION_ACTIONS: frozenset[str] = frozenset(kind.value for kind in InstructionKind)
+
+
+@dataclass(frozen=True)
+class OrchestratorInstruction:
+    """A parsed instruction from a subagent to the orchestrator.
+
+    Subagents write these to ``tmp/orchestrator_inbox.json`` via
+    ``scripts/orchestrator-request.py``.  The orchestrator reads them
+    with :meth:`OrchestratorBridge.read_orchestrator_inbox`.
+    """
+
+    kind: InstructionKind
+    from_issue: int | None = None
+    reason: str = ""
+    message: str = ""
+    module: str = ""
+    script: str = ""
+    args: tuple[str, ...] = ()
+    description: str = ""
+    priority: str = ""
+    labels: tuple[str, ...] = ()
+    title: str = ""
+    timestamp: str = ""
+
+
+def _parse_instruction(entry: dict[str, Any]) -> OrchestratorInstruction | None:
+    """Parse a raw JSON dict into an :class:`OrchestratorInstruction`.
+
+    Returns ``None`` if the entry has an unrecognised or missing action.
+    """
+    action = entry.get("action", "")
+    if action not in ALLOWED_INSTRUCTION_ACTIONS:
+        logger.warning("Unknown orchestrator instruction action: %s — skipping.", action)
+        return None
+
+    kind = InstructionKind(action)
+    from_issue = entry.get("from_issue")
+    if not isinstance(from_issue, int):
+        from_issue = None
+
+    return OrchestratorInstruction(
+        kind=kind,
+        from_issue=from_issue,
+        reason=str(entry.get("reason", "")),
+        message=str(entry.get("message", "")),
+        module=str(entry.get("module", "")),
+        script=str(entry.get("script", "")),
+        args=tuple(str(a) for a in entry.get("args", [])),
+        description=str(entry.get("description", "")),
+        priority=str(entry.get("priority", "")),
+        labels=tuple(str(lbl) for lbl in entry.get("labels", [])),
+        title=str(entry.get("title", "")),
+        timestamp=str(entry.get("timestamp", "")),
+    )
+
+
 def _extract_issue_number(fragment: str) -> int | None:
     """Extract an issue number from ``#N`` or ``N``."""
     fragment = fragment.strip().lstrip("#")
@@ -201,6 +272,7 @@ class OrchestratorBridge:
     status_file: str | None = None
     inbox_path: str | None = None
     stop_requests_path: str | None = None
+    orchestrator_inbox_path: str | None = None
     _workers: dict[int, WorkerInfo] = field(default_factory=dict)
     _pending_commands: list[Command] = field(default_factory=list)
     _stopped_issues: set[int] = field(default_factory=set)
@@ -753,6 +825,70 @@ class OrchestratorBridge:
 
         return commands
 
+    # ── Orchestrator inbox (subagent → orchestrator) ─────────────────────
+
+    def read_orchestrator_inbox(self) -> list[OrchestratorInstruction]:
+        """Read and clear all instructions from the orchestrator inbox file.
+
+        Subagents write instructions to *orchestrator_inbox_path* (typically
+        ``tmp/orchestrator_inbox.json``) using ``scripts/orchestrator-request.py``.
+        This method reads that file, parses each entry into an
+        :class:`OrchestratorInstruction`, atomically truncates the file, and
+        returns the parsed instructions.
+
+        Returns an empty list if *orchestrator_inbox_path* is not set, the
+        file does not exist, or the file is empty.  Invalid entries (unknown
+        action types, corrupt JSON) are logged and skipped.
+
+        File locking (``fcntl.flock``) ensures mutual exclusion with the
+        subagent's append operation.
+        """
+        if not self.orchestrator_inbox_path:
+            return []
+
+        path = Path(self.orchestrator_inbox_path)
+        if not path.exists():
+            return []
+
+        instructions: list[OrchestratorInstruction] = []
+
+        try:
+            fd = os.open(str(path), os.O_RDWR)
+            with os.fdopen(fd, "r+") as f:
+                fcntl.flock(f, fcntl.LOCK_EX)
+                content = f.read()
+                if not content.strip():
+                    return []
+
+                try:
+                    entries = json.loads(content)
+                except (json.JSONDecodeError, ValueError):
+                    logger.warning("Corrupt orchestrator inbox file — clearing it.")
+                    entries = []
+
+                # Truncate the file while we hold the lock.
+                f.seek(0)
+                f.truncate()
+
+            if not isinstance(entries, list):
+                logger.warning("Orchestrator inbox is not a JSON array — ignoring.")
+                return []
+
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    logger.warning("Skipping non-dict entry in orchestrator inbox.")
+                    continue
+                instruction = _parse_instruction(entry)
+                if instruction is not None:
+                    instructions.append(instruction)
+
+        except OSError:
+            return []
+        except Exception:
+            logger.warning("Failed to read orchestrator inbox file", exc_info=True)
+
+        return instructions
+
     async def _poll_loop(self) -> None:
         """Internal loop that polls SQS on a fixed interval."""
         while True:
@@ -776,6 +912,7 @@ def create_orchestrator_bridge(
     status_file: str | None = None,
     inbox_path: str | None = None,
     stop_requests_path: str | None = None,
+    orchestrator_inbox_path: str | None = None,
 ) -> OrchestratorBridge:
     """Factory that creates an :class:`OrchestratorBridge` with a fresh client.
 
@@ -796,6 +933,10 @@ def create_orchestrator_bridge(
     :meth:`OrchestratorBridge.read_stop_requests` will read stop requests
     written by the responder daemon (``scripts/tg-responder.py``).
 
+    If *orchestrator_inbox_path* is provided,
+    :meth:`OrchestratorBridge.read_orchestrator_inbox` will read instructions
+    written by subagents via ``scripts/orchestrator-request.py``.
+
     The caller can also pass an existing :class:`TelegramBridge` directly
     to the dataclass constructor for testing.
     """
@@ -811,4 +952,5 @@ def create_orchestrator_bridge(
         status_file=status_file,
         inbox_path=inbox_path,
         stop_requests_path=stop_requests_path,
+        orchestrator_inbox_path=orchestrator_inbox_path,
     )
