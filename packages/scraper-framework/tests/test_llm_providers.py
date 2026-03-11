@@ -18,6 +18,7 @@ from ingestion.llm_providers import (
     LLMResponse,
     _call_anthropic,
     _call_google,
+    _try_create,
     call_llm,
     create_client,
 )
@@ -449,6 +450,152 @@ class TestCreateClient:
         """Unknown provider returns None."""
         client = create_client(provider="openai")
         assert client is None
+
+
+# ---------------------------------------------------------------------------
+# _try_create tests
+# ---------------------------------------------------------------------------
+
+
+class TestTryCreate:
+    """Tests for the _try_create() helper."""
+
+    def test_anthropic_with_key(self) -> None:
+        """Creates Anthropic client when API key is available."""
+        mock_instance = MagicMock()
+        with (
+            patch("anthropic.Anthropic", return_value=mock_instance),
+            patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}),
+        ):
+            client = _try_create("anthropic")
+        assert client is mock_instance
+
+    def test_anthropic_without_key(self) -> None:
+        """Returns None when ANTHROPIC_API_KEY is missing."""
+        with patch.dict("os.environ", {}, clear=True):
+            assert _try_create("anthropic") is None
+
+    def test_google_with_key(self) -> None:
+        """Creates Google client when API key is available."""
+        mock_instance = MagicMock()
+        with (
+            patch("google.genai.Client", return_value=mock_instance),
+            patch.dict("os.environ", {"GOOGLE_API_KEY": "test-key"}),
+        ):
+            client = _try_create("google")
+        assert client is mock_instance
+
+    def test_google_without_key(self) -> None:
+        """Returns None when GOOGLE_API_KEY is missing."""
+        with patch.dict("os.environ", {}, clear=True):
+            assert _try_create("google") is None
+
+    def test_unknown_provider(self) -> None:
+        """Returns None for an unsupported provider."""
+        assert _try_create("openai") is None
+
+
+# ---------------------------------------------------------------------------
+# create_client fallback tests
+# ---------------------------------------------------------------------------
+
+
+class TestCreateClientFallback:
+    """Tests for the provider fallback logic in create_client()."""
+
+    def test_fallback_google_to_anthropic(self) -> None:
+        """When configured for google but only ANTHROPIC_API_KEY is set, falls back."""
+        mock_instance = MagicMock()
+        with (
+            patch("anthropic.Anthropic", return_value=mock_instance),
+            patch.dict(
+                "os.environ",
+                {"LLM_PROVIDER": "google", "ANTHROPIC_API_KEY": "test-key"},
+                clear=True,
+            ),
+        ):
+            client = create_client()
+        assert client is mock_instance
+
+    def test_fallback_anthropic_to_google(self) -> None:
+        """When configured for anthropic but only GOOGLE_API_KEY is set, falls back."""
+        mock_instance = MagicMock()
+        with (
+            patch("google.genai.Client", return_value=mock_instance),
+            patch.dict(
+                "os.environ",
+                {"LLM_PROVIDER": "anthropic", "GOOGLE_API_KEY": "test-key"},
+                clear=True,
+            ),
+        ):
+            client = create_client()
+        assert client is mock_instance
+
+    def test_no_fallback_when_primary_works(self) -> None:
+        """When primary provider's key is available, no fallback occurs."""
+        mock_instance = MagicMock()
+        with (
+            patch("google.genai.Client", return_value=mock_instance),
+            patch.dict(
+                "os.environ",
+                {"GOOGLE_API_KEY": "test-key"},
+                clear=True,
+            ),
+        ):
+            client = create_client(provider="google")
+        assert client is mock_instance
+
+    def test_no_keys_returns_none(self) -> None:
+        """When no provider's key is available, returns None."""
+        with patch.dict("os.environ", {}, clear=True):
+            assert create_client() is None
+
+    def test_explicit_provider_with_fallback(self) -> None:
+        """Explicit provider arg still falls back when its key is missing."""
+        mock_instance = MagicMock()
+        with (
+            patch("google.genai.Client", return_value=mock_instance),
+            patch.dict(
+                "os.environ",
+                {"GOOGLE_API_KEY": "test-key"},
+                clear=True,
+            ),
+        ):
+            client = create_client(provider="anthropic")
+        assert client is mock_instance
+
+    def test_fallback_logs_warning(self) -> None:
+        """Fallback logs a warning with configured and actual provider."""
+        mock_instance = MagicMock()
+        with (
+            patch("anthropic.Anthropic", return_value=mock_instance),
+            patch("ingestion.llm_providers.logger") as mock_logger,
+            patch.dict(
+                "os.environ",
+                {"LLM_PROVIDER": "google", "ANTHROPIC_API_KEY": "test-key"},
+                clear=True,
+            ),
+        ):
+            create_client()
+        mock_logger.warning.assert_called_once_with(
+            "llm_providers.fallback",
+            configured="google",
+            using="anthropic",
+        )
+
+    def test_unknown_provider_still_falls_back(self) -> None:
+        """An unknown primary provider triggers fallback to known providers."""
+        mock_instance = MagicMock()
+        with (
+            patch("anthropic.Anthropic", return_value=mock_instance),
+            patch.dict(
+                "os.environ",
+                {"ANTHROPIC_API_KEY": "test-key"},
+                clear=True,
+            ),
+        ):
+            client = create_client(provider="openai")
+        assert client is mock_instance
 
 
 # ---------------------------------------------------------------------------
