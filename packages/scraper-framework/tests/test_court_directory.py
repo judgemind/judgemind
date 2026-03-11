@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -322,3 +322,91 @@ class TestGetMappingForDate:
         cursor.execute.assert_called_once()
         sql, params = cursor.execute.call_args.args
         assert params == (COURT_ID, as_of)
+
+
+# ---------------------------------------------------------------------------
+# lookup_judge tests
+# ---------------------------------------------------------------------------
+
+
+class TestLookupJudge:
+    """Tests for CourtDirectory.lookup_judge() — date-aware department lookup."""
+
+    def test_returns_judge_name_when_found(self, directory: _StubDirectory) -> None:
+        """Should return the judge name from the snapshot mapping."""
+        cursor = directory._conn.cursor.return_value.__enter__.return_value
+        cursor.fetchone.return_value = (MAPPING,)
+
+        result = directory.lookup_judge(COURT_ID, "1", datetime(2026, 3, 1, tzinfo=UTC))
+
+        assert result == "Judge Smith"
+
+    def test_returns_none_when_department_not_in_mapping(self, directory: _StubDirectory) -> None:
+        """Should return None if the department isn't in the snapshot."""
+        cursor = directory._conn.cursor.return_value.__enter__.return_value
+        cursor.fetchone.return_value = (MAPPING,)
+
+        result = directory.lookup_judge(COURT_ID, "99", datetime(2026, 3, 1, tzinfo=UTC))
+
+        assert result is None
+
+    def test_returns_none_when_no_snapshot(self, directory: _StubDirectory) -> None:
+        """Should return None when no snapshot exists before the date."""
+        cursor = directory._conn.cursor.return_value.__enter__.return_value
+        cursor.fetchone.return_value = None
+
+        result = directory.lookup_judge(COURT_ID, "1", datetime(2026, 3, 1, tzinfo=UTC))
+
+        assert result is None
+
+    def test_caches_snapshot_by_date(self, directory: _StubDirectory) -> None:
+        """Multiple lookups for the same date should reuse cached snapshot."""
+        cursor = directory._conn.cursor.return_value.__enter__.return_value
+        cursor.fetchone.return_value = (MAPPING,)
+
+        # Two lookups for the same date
+        directory.lookup_judge(COURT_ID, "1", datetime(2026, 3, 1, 10, 0, tzinfo=UTC))
+        directory.lookup_judge(COURT_ID, "2", datetime(2026, 3, 1, 14, 0, tzinfo=UTC))
+
+        # get_snapshot should only be called once (the SELECT query)
+        assert cursor.execute.call_count == 1
+
+    def test_different_dates_query_separately(self, directory: _StubDirectory) -> None:
+        """Lookups for different dates should query the DB separately."""
+        cursor = directory._conn.cursor.return_value.__enter__.return_value
+        mapping_march = {"1": "Judge A"}
+        mapping_april = {"1": "Judge B"}
+        cursor.fetchone.side_effect = [(mapping_march,), (mapping_april,)]
+
+        r1 = directory.lookup_judge(COURT_ID, "1", datetime(2026, 3, 1, tzinfo=UTC))
+        r2 = directory.lookup_judge(COURT_ID, "1", datetime(2026, 4, 1, tzinfo=UTC))
+
+        assert r1 == "Judge A"
+        assert r2 == "Judge B"
+        assert cursor.execute.call_count == 2
+
+    def test_accepts_date_object(self, directory: _StubDirectory) -> None:
+        """Should accept a plain date (not datetime) and convert to end-of-day."""
+        cursor = directory._conn.cursor.return_value.__enter__.return_value
+        cursor.fetchone.return_value = (MAPPING,)
+
+        result = directory.lookup_judge(COURT_ID, "1", date(2026, 3, 1))
+
+        assert result == "Judge Smith"
+        # Verify the query used a datetime with end-of-day time
+        call_args = cursor.execute.call_args.args
+        query_as_of = call_args[1][1]
+        assert isinstance(query_as_of, datetime)
+        assert query_as_of.hour == 23
+        assert query_as_of.minute == 59
+
+    def test_defaults_to_now_when_no_date(self, directory: _StubDirectory) -> None:
+        """Should use current time when as_of is None."""
+        cursor = directory._conn.cursor.return_value.__enter__.return_value
+        cursor.fetchone.return_value = (MAPPING,)
+
+        result = directory.lookup_judge(COURT_ID, "1")
+
+        assert result == "Judge Smith"
+        # Should have made a DB query
+        cursor.execute.assert_called_once()

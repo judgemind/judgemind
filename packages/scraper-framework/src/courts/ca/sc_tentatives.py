@@ -549,6 +549,28 @@ class SCTentativeRulingsScraper(BaseScraper):
             if pdf_dept and not doc.department:
                 doc.department = pdf_dept
 
+            # If judge name is still missing, try a date-aware directory
+            # lookup using the hearing date from the PDF (#767).
+            if (
+                not doc.judge_name
+                and doc.department
+                and doc.hearing_date
+                and self._court_directory is not None
+            ):
+                mapped_name = self._court_directory.lookup_judge(
+                    COURT_ID,
+                    doc.department,
+                    as_of=doc.hearing_date,
+                )
+                if mapped_name:
+                    doc.judge_name = mapped_name
+                    self._log.debug(
+                        "Judge name populated from historical snapshot",
+                        department=doc.department,
+                        judge_name=mapped_name,
+                        hearing_date=str(doc.hearing_date),
+                    )
+
             # Extract case title from first case in the PDF
             case_title = parse_case_title(text)
             if case_title:

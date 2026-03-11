@@ -241,31 +241,35 @@ class LATentativeRulingsScraper(BaseScraper):
 
         # Fallback: if ruling text didn't contain a judge name, try the
         # department-to-judge mapping from the judicial officer directory.
-        # When a court directory is available and the ruling has a hearing
-        # date, use the historical snapshot closest to that date so that
-        # judge-to-department assignments are accurate for past rulings.
+        # When a court directory is available, use a date-aware lookup so
+        # historical rulings get the correct judge assignment (#767).
         if doc.judge_name is None and doc.department:
-            from courts.ca.la_dept_judges import lookup_judge_for_department
+            mapped_name: str | None = None
 
-            effective_map = self._dept_judge_map
             if self._court_directory is not None and doc.hearing_date is not None:
-                date_map = self._court_directory.get_mapping_for_date(
-                    self._court_id,
-                    doc.hearing_date,
-                    fallback=self._dept_judge_map,
-                )
-                if date_map is not None:
-                    effective_map = date_map
+                from courts.ca.la_dept_judges import normalize_department
 
-            if effective_map:
-                mapped_name = lookup_judge_for_department(effective_map, doc.department)
-                if mapped_name:
-                    doc.judge_name = mapped_name
-                    self._log.debug(
-                        "Judge name populated from department mapping",
-                        department=doc.department,
-                        judge_name=mapped_name,
-                    )
+                norm_dept = normalize_department(doc.department)
+                mapped_name = self._court_directory.lookup_judge(
+                    self._court_id,
+                    norm_dept,
+                    as_of=doc.hearing_date,
+                )
+            elif self._dept_judge_map:
+                from courts.ca.la_dept_judges import lookup_judge_for_department
+
+                mapped_name = lookup_judge_for_department(
+                    self._dept_judge_map,
+                    doc.department,
+                )
+
+            if mapped_name:
+                doc.judge_name = mapped_name
+                self._log.debug(
+                    "Judge name populated from department mapping",
+                    department=doc.department,
+                    judge_name=mapped_name,
+                )
 
         return doc
 

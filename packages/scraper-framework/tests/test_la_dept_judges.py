@@ -7,6 +7,7 @@ Fixtures:
 
 from __future__ import annotations
 
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -577,3 +578,167 @@ class TestScraperDeptJudgeMapFallback:
         doc = self._make_doc_without_judge(department="999")
         result = scraper.parse_document(doc)
         assert result.judge_name is None
+
+
+# ---------------------------------------------------------------------------
+# Scraper integration: date-aware directory lookup (#767)
+# ---------------------------------------------------------------------------
+
+
+class TestScraperDateAwareLookup:
+    """Test that LATentativeRulingsScraper.parse_document uses date-aware
+    snapshot lookups via CourtDirectory.lookup_judge when a court directory
+    is available and the ruling has a hearing date."""
+
+    def _make_doc_without_judge(
+        self,
+        department: str = "52",
+        hearing_date: datetime | None = None,
+    ) -> CapturedDocument:
+        """Create a ruling doc whose HTML has no judge name signature."""
+        from datetime import datetime as dt
+
+        html = (
+            '<html><body><div id="speechSynthesis">'
+            "<p><B>Case Number:</B> 24STCV12345</p>"
+            "<p>The motion for summary judgment is GRANTED.</p>"
+            "</div></body></html>"
+        )
+        return CapturedDocument(
+            scraper_id="ca-la-tentatives-civil",
+            state="CA",
+            county="Los Angeles",
+            court="Superior Court",
+            source_url="https://example.com",
+            capture_timestamp=dt(2026, 3, 2, 18, 0, 0),
+            content_format=ContentFormat.HTML,
+            raw_content=html.encode("utf-8"),
+            content_hash="",
+            department=department,
+            hearing_date=hearing_date,
+        )
+
+    def _make_directory_with_snapshot(
+        self,
+        snapshot_mapping: dict[str, str] | None,
+    ) -> LACourtDirectory:
+        """Create a LACourtDirectory with a mocked get_snapshot response."""
+        mock_db = MagicMock()
+        mock_cursor = MagicMock()
+        if snapshot_mapping is not None:
+            mock_cursor.fetchone.return_value = (snapshot_mapping,)
+        else:
+            mock_cursor.fetchone.return_value = None
+        mock_db.cursor.return_value.__enter__ = MagicMock(return_value=mock_cursor)
+        mock_db.cursor.return_value.__exit__ = MagicMock(return_value=False)
+
+        return LACourtDirectory(
+            s3_client=MagicMock(),
+            s3_bucket="test-bucket",
+            db_conn=mock_db,
+        )
+
+    def test_uses_historical_snapshot_for_hearing_date(self) -> None:
+        """When court directory is present and ruling has a hearing date,
+        use date-aware lookup_judge (not static dept map)."""
+        from datetime import datetime as dt
+
+        # Historical snapshot: dept 52 was Judge Alpha in Feb 2026
+        snapshot_mapping = {"52": "Judge Alpha"}
+        directory = self._make_directory_with_snapshot(snapshot_mapping)
+
+        config = default_config()
+        scraper = LATentativeRulingsScraper(
+            config=config,
+            court_directory=directory,
+            # Static map has a different judge — should NOT be used
+            dept_judge_map={"52": "Judge Beta"},
+        )
+
+        doc = self._make_doc_without_judge(
+            department="52",
+            hearing_date=dt(2026, 2, 15),
+        )
+        result = scraper.parse_document(doc)
+
+        assert result.judge_name == "Judge Alpha"
+
+    def test_falls_back_to_static_map_without_hearing_date(self) -> None:
+        """When court directory is present but ruling has no hearing date,
+        fall back to the static dept_judge_map."""
+        snapshot_mapping = {"52": "Judge Alpha"}
+        directory = self._make_directory_with_snapshot(snapshot_mapping)
+
+        config = default_config()
+        scraper = LATentativeRulingsScraper(
+            config=config,
+            court_directory=directory,
+            dept_judge_map={"52": "Judge Beta"},
+        )
+
+        doc = self._make_doc_without_judge(department="52", hearing_date=None)
+        result = scraper.parse_document(doc)
+
+        # No hearing date -> can't do date-aware lookup, falls back to static map
+        assert result.judge_name == "Judge Beta"
+
+    def test_falls_back_to_static_map_without_court_directory(self) -> None:
+        """Without a court directory, the static dept_judge_map is used."""
+        from datetime import datetime as dt
+
+        config = default_config()
+        scraper = LATentativeRulingsScraper(
+            config=config,
+            dept_judge_map={"52": "Judge Beta"},
+        )
+
+        doc = self._make_doc_without_judge(
+            department="52",
+            hearing_date=dt(2026, 2, 15),
+        )
+        result = scraper.parse_document(doc)
+
+        assert result.judge_name == "Judge Beta"
+
+    def test_returns_none_when_snapshot_has_no_department(self) -> None:
+        """When the historical snapshot exists but does not contain the dept,
+        and no static map is available, judge is None."""
+        from datetime import datetime as dt
+
+        snapshot_mapping = {"99": "Judge Other"}
+        directory = self._make_directory_with_snapshot(snapshot_mapping)
+
+        config = default_config()
+        scraper = LATentativeRulingsScraper(
+            config=config,
+            court_directory=directory,
+        )
+
+        doc = self._make_doc_without_judge(
+            department="52",
+            hearing_date=dt(2026, 2, 15),
+        )
+        result = scraper.parse_document(doc)
+
+        assert result.judge_name is None
+
+    def test_normalizes_department_for_lookup(self) -> None:
+        """The date-aware lookup normalizes the department (e.g., '052' -> '52')."""
+        from datetime import datetime as dt
+
+        snapshot_mapping = {"52": "Judge Alpha"}
+        directory = self._make_directory_with_snapshot(snapshot_mapping)
+
+        config = default_config()
+        scraper = LATentativeRulingsScraper(
+            config=config,
+            court_directory=directory,
+        )
+
+        doc = self._make_doc_without_judge(
+            department="052",
+            hearing_date=dt(2026, 2, 15),
+        )
+        result = scraper.parse_document(doc)
+
+        assert result.judge_name == "Judge Alpha"

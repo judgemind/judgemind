@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import abc
 import json
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime, time
 from typing import TYPE_CHECKING
 
 import structlog
@@ -58,6 +58,8 @@ class CourtDirectory(abc.ABC):
         self._s3 = s3_client
         self._bucket = s3_bucket
         self._conn = db_conn
+        # Cache for date-aware snapshot lookups: (court_id, date) -> mapping | None
+        self._snapshot_cache: dict[tuple[str, date], dict[str, str] | None] = {}
 
     # ------------------------------------------------------------------
     # Abstract interface
@@ -266,6 +268,59 @@ class CourtDirectory(abc.ABC):
         raw, mapping = self.fetch_current()
         self.save_snapshot(raw, mapping, court_id)
         return mapping
+
+    def lookup_judge(
+        self,
+        court_id: str,
+        department: str,
+        as_of: datetime | date | None = None,
+    ) -> str | None:
+        """Look up a judge name by department using a date-appropriate snapshot.
+
+        Uses the directory snapshot closest to (but not after) ``as_of`` to
+        resolve the department-to-judge mapping.  Results are cached per
+        ``(court_id, date)`` to avoid repeated DB queries when processing
+        many rulings on the same hearing date.
+
+        When ``as_of`` is ``None``, the current time is used (equivalent to
+        looking up the latest snapshot).
+
+        Parameters
+        ----------
+        court_id : str
+            The court identifier (e.g. ``"ca_los_angeles"``).
+        department : str
+            The department number/code to look up.
+        as_of : datetime | date | None
+            The point in time for the lookup.  Typically the ruling's
+            hearing date.  ``None`` defaults to now.
+
+        Returns
+        -------
+        str | None
+            The judge's full name, or ``None`` if no snapshot contains the
+            department or no snapshot exists before ``as_of``.
+        """
+        if as_of is None:
+            as_of = datetime.now(UTC)
+
+        # Normalize to a datetime for the DB query
+        if isinstance(as_of, date) and not isinstance(as_of, datetime):
+            lookup_dt = datetime.combine(as_of, time(23, 59, 59), tzinfo=UTC)
+        else:
+            lookup_dt = as_of
+
+        # Cache key uses date granularity — snapshots change at most daily
+        cache_key = (court_id, lookup_dt.date() if isinstance(lookup_dt, datetime) else lookup_dt)
+
+        if cache_key not in self._snapshot_cache:
+            self._snapshot_cache[cache_key] = self.get_snapshot(court_id, lookup_dt)
+
+        mapping = self._snapshot_cache[cache_key]
+        if mapping is None:
+            return None
+
+        return mapping.get(department)
 
     # ------------------------------------------------------------------
     # Internal helpers
