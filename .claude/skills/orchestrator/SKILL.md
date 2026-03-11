@@ -29,7 +29,13 @@ Initialize the Telegram bridge and start the responder daemon:
 scripts/tg-responder.py
 ```
 
-Send a `session_started` notification via the bridge. If Telegram is not configured, skip silently — all bridge calls are no-ops when unconfigured.
+Send a `session_started` notification:
+
+```
+scripts/tg-notify.py session_started
+```
+
+If Telegram is not configured, both commands exit silently (exit 0) — all bridge calls are no-ops when unconfigured.
 
 ### 2. Scan the work queue
 
@@ -95,7 +101,29 @@ as a background subagent. Before spawning:
 4. If `bridge.is_issue_stopped(N)` is `True`, skip that issue
 5. Skip issues already being worked on by another slot
 
-Send a `task_started` Telegram notification for each launch.
+**After spawning each agent**, send a `task_started` notification and update the status file:
+
+```
+scripts/tg-notify.py task_started <issue_number> "<title>" <worker_number>
+```
+
+This sends the Telegram message **and** updates `tmp/orchestrator_status.json` so the responder daemon has accurate context.
+
+### Processing agent completions
+
+When a `<task-notification>` arrives indicating an agent has completed:
+
+**On success:**
+```
+scripts/tg-notify.py task_completed <issue_number> "<summary>" <worker_number>
+```
+
+**On failure:**
+```
+scripts/tg-notify.py task_failed <issue_number> "<error_summary>" <worker_number>
+```
+
+Both commands update the status file automatically. Always send a notification immediately when an agent completes or fails — do not batch them.
 
 ---
 
@@ -114,7 +142,10 @@ gh pr merge <N> --repo judgemind/judgemind --squash --delete-branch
 
 After merging:
 - **Immediately sync to latest main** (see "Post-merge sync" in Rules below) — this must happen before spawning any new agents
-- Send a Telegram notification
+- **Send a Telegram notification:**
+  ```
+  scripts/tg-notify.py pr_merged <pr_number> "<pr_title>"
+  ```
 - Check if the merged PR triggers a deploy workflow (see CLAUDE.md "Verify deployment")
 - For deployed services, watch the deploy workflow to completion
 
@@ -125,14 +156,20 @@ After merging:
 If a PR's CI is failing:
 - Check if the failure is in a check the agent could fix (lint, test, type error)
 - If so, the `/task` agent should already be handling it — check its status file
-- If the agent has exited and CI is still failing, log it and notify via Telegram
+- If the agent has exited and CI is still failing, log it and notify via Telegram:
+  ```
+  scripts/tg-notify.py notify "CI still failing on PR #<N> after agent exited — needs attention"
+  ```
 - Do not attempt to fix another agent's PR from the orchestrator — spawn a new `/task` for it if needed
 
 ### Handling merge conflicts
 
 If a PR has merge conflicts:
 - The owning `/task` agent should handle rebasing
-- If the agent has exited, log it and notify via Telegram
+- If the agent has exited, log it and notify via Telegram:
+  ```
+  scripts/tg-notify.py notify "PR #<N> has merge conflicts and agent has exited — needs attention"
+  ```
 - The orchestrator does not rebase other agents' branches
 
 ---
@@ -163,17 +200,41 @@ The orchestrator proactively manages issues:
 
 ## Telegram Communication
 
-### Outbound notifications
+### Notification script
 
-Send Telegram messages for:
-- Session started/ended
-- Agent launched (issue number and title)
-- Agent completed (issue number, PR number, merge status)
-- Agent failed (issue number, error summary)
-- PR merged
-- Deploy succeeded/failed
-- Blocker encountered (needs human decision)
-- Status summary (when requested)
+All outbound Telegram notifications MUST use the committed script `scripts/tg-notify.py`. This script wraps the `telegram_bridge` package and handles:
+
+- Sending the Telegram message via the bot API
+- Updating `tmp/orchestrator_status.json` so the responder daemon has accurate context
+- Persisting worker state to `tmp/orchestrator_state.json`
+- Exiting silently (exit 0) when Telegram is not configured
+
+**Available commands:**
+
+| Command | Arguments | When to use |
+|---|---|---|
+| `scripts/tg-notify.py session_started` | (none) | Orchestrator startup |
+| `scripts/tg-notify.py session_ended` | (none) | Orchestrator shutdown |
+| `scripts/tg-notify.py task_started` | `<issue> <title> <worker>` | After spawning a `/task` agent |
+| `scripts/tg-notify.py task_completed` | `<issue> <summary> <worker>` | Agent completed successfully |
+| `scripts/tg-notify.py task_failed` | `<issue> <error> <worker>` | Agent failed |
+| `scripts/tg-notify.py pr_merged` | `<pr_number> <title>` | After squash-merging a PR |
+| `scripts/tg-notify.py notify` | `<message>` | Free-form notification (blockers, CI issues, deploy status) |
+
+**IMPORTANT:** Always call `scripts/tg-notify.py` after every lifecycle event. Do not rely on remembering to send notifications manually — the script handles both the Telegram message and the status file update atomically. If you skip the notification, the responder daemon will have stale status and give incorrect answers to user queries.
+
+### Outbound notification checklist
+
+Send a notification for **every** lifecycle event:
+
+- [ ] **Session started** — at orchestrator startup
+- [ ] **Agent launched** — after each `/task #N` spawn (include issue number, title, worker number)
+- [ ] **Agent completed** — when `<task-notification>` reports success (include issue number, summary, worker number)
+- [ ] **Agent failed** — when `<task-notification>` reports failure (include issue number, error, worker number)
+- [ ] **PR merged** — after each `gh pr merge` (include PR number and title)
+- [ ] **Deploy succeeded/failed** — after watching deploy workflow
+- [ ] **Blocker encountered** — when an issue needs human decision
+- [ ] **Session ended** — at orchestrator shutdown
 
 ### Inbound commands
 
@@ -196,6 +257,8 @@ The responder daemon communicates via shared state files (see CLAUDE.md "Respond
 - Read `tmp/stop_requests.json` for stop requests
 - Read `tmp/tg_inbox.json` for queued start commands and free text
 
+**The orchestrator MUST update `tmp/orchestrator_status.json` after every state change.** The `scripts/tg-notify.py` script does this automatically for lifecycle events (`task_started`, `task_completed`, `task_failed`, `pr_merged`). For other state changes (pause, resume, slot changes), call `bridge.write_status()` directly or use `scripts/tg-notify.py notify` to trigger a status file update.
+
 ---
 
 ## Shutdown
@@ -209,7 +272,10 @@ Shutdown procedure:
 1. Stop launching new agents
 2. Wait for all active agents to complete (do not kill them)
 3. Merge any remaining green PRs
-4. Send `session_ended` Telegram notification
+4. Send `session_ended` Telegram notification:
+   ```
+   scripts/tg-notify.py session_ended
+   ```
 5. Stop the responder daemon (create `tmp/tg_responder.stop`)
 6. Print a summary of what was accomplished:
    - Issues completed
@@ -258,5 +324,5 @@ Do this **immediately** after every `gh pr merge` call, before spawning new agen
 - **Never set `priority/p0`.** That priority is reserved for humans.
 - **Merge your own agents' PRs** when CI is green and ralph has approved.
 - **File issues proactively** for discovered problems — don't just observe them.
-- **Notify via Telegram** for all significant events, not just when asked.
+- **Notify via Telegram** for all significant events, not just when asked. Use `scripts/tg-notify.py` for every lifecycle event.
 - **Default to action.** If a decision is clear and reversible, make it. Only ask for irreversible or ambiguous decisions.
