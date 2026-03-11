@@ -26,6 +26,7 @@ jobs:
       infra: ${{ steps.changes.outputs.infra }}
       telegram: ${{ steps.changes.outputs.telegram }}
       infra-lambda: ${{ steps.changes.outputs.infra-lambda }}
+      any-testable: ${{ steps.any-testable.outputs.result }}
     steps:
       - uses: actions/checkout@v4
       - uses: dorny/paths-filter@v3
@@ -46,6 +47,19 @@ jobs:
               - 'packages/telegram-bridge/**'
             infra-lambda:
               - 'infra/telegram-bot/**'
+      - name: Check if any coverage-producing package changed
+        id: any-testable
+        run: |
+          if [ "${{ steps.changes.outputs.scraper }}" = "true" ] || \
+             [ "${{ steps.changes.outputs.nlp }}" = "true" ] || \
+             [ "${{ steps.changes.outputs.api }}" = "true" ] || \
+             [ "${{ steps.changes.outputs.web }}" = "true" ] || \
+             [ "${{ steps.changes.outputs.telegram }}" = "true" ] || \
+             [ "${{ steps.changes.outputs.infra-lambda }}" = "true" ]; then
+            echo "result=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "result=false" >> "$GITHUB_OUTPUT"
+          fi
 
   scraper-unit-tests:
     needs: detect-changes
@@ -363,7 +377,7 @@ jobs:
   # ---------------------------------------------------------------
   coverage-check:
     needs: [detect-changes, scraper-unit-tests, ingestion-tests, nlp-tests, api-tests, web-tests, telegram-bridge-tests, lambda-tests]
-    if: always() && github.event_name == 'pull_request'
+    if: always() && github.event_name == 'pull_request' && needs.detect-changes.outputs.any-testable == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
