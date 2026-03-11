@@ -432,9 +432,11 @@ Key paths:
 
 After a Terraform PR merges to main, the subagent that authored the PR must apply to dev:
 ```
-terraform -chdir=$REPO_ROOT/infra/terraform apply -target=module.<module_name> -auto-approve
+terraform -chdir=$REPO_ROOT/infra/terraform/environments/dev apply -target=module.<module_name> -auto-approve
 ```
-Verify the apply succeeds. If it fails, file a `priority/p1` issue. Production applies are human-only.
+Verify the apply succeeds. If it fails, file a `priority/p1` issue.
+
+**Important:** The root `infra/terraform/` directory does not track deployed resources. Each environment has its own state backend under `infra/terraform/environments/<env>/`. Running apply from the root creates duplicate resources that collide with the real ones. Always use the environment-specific path. Production applies (`environments/production/`) are human-only.
 
 ### Pre-PR Checklist for Terraform Tasks
 
