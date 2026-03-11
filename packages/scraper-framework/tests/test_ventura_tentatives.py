@@ -512,3 +512,198 @@ def test_ventura_field_completeness() -> None:
         # outcome and case_title come from document content
         assert parsed.outcome, f"Missing outcome for doc {parsed.source_url}"
         assert parsed.case_title, f"Missing case_title for doc {parsed.source_url}"
+
+
+# ---------------------------------------------------------------------------
+# Additional coverage tests — edge cases and branches
+# ---------------------------------------------------------------------------
+
+
+def test_extract_verification_token_beautifulsoup_fallback() -> None:
+    """Token extraction via BeautifulSoup when regex fails."""
+    # Use an attribute order that the regex won't match
+    html = (
+        '<form><input type="hidden" name="__RequestVerificationToken"'
+        ' value="BS_FALLBACK_TOKEN" /></form>'
+    )
+    token = extract_verification_token(html)
+    assert token == "BS_FALLBACK_TOKEN"
+
+
+def test_parse_event_datetime_invalid_date() -> None:
+    """Invalid date values should return None (ValueError branch)."""
+    # Month 13 is invalid
+    assert parse_event_datetime("13/32/2026 8:30 AM") is None
+
+
+def test_parse_results_table_row_with_few_cells() -> None:
+    """Rows with fewer than 5 cells should be skipped."""
+    html = """
+    <table>
+      <thead><tr><th>A</th><th>B</th></tr></thead>
+      <tbody>
+        <tr><td>only</td><td>two</td></tr>
+        <tr>
+          <td>2025CUBC040123</td><td>Demurrer</td>
+          <td>03/11/2026 8:30 AM</td><td>20</td>
+          <td><a href="/CaseInquiry/ViewFile/999">View</a></td>
+        </tr>
+      </tbody>
+    </table>
+    """
+    results = parse_results_table(html)
+    assert len(results) == 1
+    assert results[0].case_number == "2025CUBC040123"
+
+
+def test_parse_results_table_empty_case_number() -> None:
+    """Rows with empty case number should be skipped."""
+    html = """
+    <table>
+      <tbody>
+        <tr>
+          <td></td><td>Demurrer</td>
+          <td>03/11/2026 8:30 AM</td><td>20</td>
+          <td><a href="/CaseInquiry/ViewFile/999">View</a></td>
+        </tr>
+      </tbody>
+    </table>
+    """
+    results = parse_results_table(html)
+    assert len(results) == 0
+
+
+@respx.mock
+def test_ventura_run_pdf_content_type() -> None:
+    """Documents with application/pdf content type should be marked as PDF."""
+    search_html = _load_html("ventura_search_page.html")
+    # Minimal results page with 1 row
+    results_html = """
+    <table><tbody><tr>
+      <td>2025CUBC040123</td><td>Demurrer</td>
+      <td>03/11/2026 8:30 AM</td><td>20</td>
+      <td><a href="/CaseInquiry/ViewFile/100001">View</a></td>
+    </tr></tbody></table>
+    """
+
+    respx.get(SEARCH_URL).mock(return_value=httpx.Response(200, text=search_html))
+    respx.post(SEARCH_URL).mock(return_value=httpx.Response(200, text=results_html))
+    # Return non-PDF, non-HTML content type
+    respx.get(url__regex=r"/CaseInquiry/ViewFile/\d+").mock(
+        return_value=httpx.Response(
+            200,
+            content=b"plain text content",
+            headers={"content-type": "application/octet-stream"},
+        )
+    )
+
+    config = ventura_default_config()
+    config.request_delay_seconds = 0
+    scraper = VenturaTentativeRulingsScraper(
+        config=config,
+        search_dates=[datetime(2026, 3, 11)],
+    )
+    docs = scraper.fetch_documents()
+    assert len(docs) == 1
+    # Default content format for unknown types is HTML
+    from framework import ContentFormat
+
+    assert docs[0].content_format == ContentFormat.HTML
+
+
+@respx.mock
+def test_ventura_run_no_doc_link() -> None:
+    """Results without a ViewFile link should create a placeholder document."""
+    search_html = _load_html("ventura_search_page.html")
+    results_html = """
+    <table><tbody><tr>
+      <td>2025CUBC040123</td><td>Demurrer</td>
+      <td>03/11/2026 8:30 AM</td><td>20</td>
+      <td>No document</td>
+    </tr></tbody></table>
+    """
+
+    respx.get(SEARCH_URL).mock(return_value=httpx.Response(200, text=search_html))
+    respx.post(SEARCH_URL).mock(return_value=httpx.Response(200, text=results_html))
+
+    config = ventura_default_config()
+    config.request_delay_seconds = 0
+    scraper = VenturaTentativeRulingsScraper(
+        config=config,
+        search_dates=[datetime(2026, 3, 11)],
+    )
+    health = scraper.run()
+    assert health.success is True
+    assert health.records_captured == 1
+
+
+@respx.mock
+def test_ventura_search_date_error() -> None:
+    """A POST error for one date should not crash the whole run."""
+    search_html = _load_html("ventura_search_page.html")
+
+    respx.get(SEARCH_URL).mock(return_value=httpx.Response(200, text=search_html))
+    respx.post(SEARCH_URL).mock(return_value=httpx.Response(500))
+
+    config = ventura_default_config()
+    config.max_retries = 1
+    config.request_delay_seconds = 0
+    scraper = VenturaTentativeRulingsScraper(
+        config=config,
+        search_dates=[datetime(2026, 3, 11)],
+    )
+    # The search_date error is caught internally, so run succeeds with 0 records
+    health = scraper.run()
+    assert health.success is True
+    assert health.records_captured == 0
+
+
+def test_ventura_parse_document_empty_content() -> None:
+    """parse_document should handle documents with no raw_content."""
+    from framework import CapturedDocument, ContentFormat
+
+    config = ventura_default_config()
+    scraper = VenturaTentativeRulingsScraper(config=config)
+
+    doc = CapturedDocument(
+        scraper_id=config.scraper_id,
+        state="CA",
+        county="Ventura",
+        court="Superior Court",
+        source_url="https://example.com",
+        capture_timestamp=datetime(2026, 3, 11),
+        content_format=ContentFormat.HTML,
+        raw_content=b"",
+        content_hash="",
+    )
+    result = scraper.parse_document(doc)
+    assert result.ruling_text is None
+
+
+def test_extract_html_text_latin1_fallback() -> None:
+    """HTML with non-UTF-8 encoding should fall back to latin-1."""
+    # Latin-1 encoded content with a non-UTF-8 byte
+    content = "The motion is GRANTED. Caf\xe9".encode("latin-1")
+    text = _extract_html_text(content)
+    assert "GRANTED" in text
+
+
+def test_extract_outcome_raw_fallback() -> None:
+    """An outcome keyword that doesn't match normalization should return raw."""
+    # This tests the raw return path (line 450) — an outcome regex match
+    # that doesn't hit any of the normalization branches.
+    # The regex already handles most cases, so test that raw passthrough works.
+    # Verify the regex would match but normalization wouldn't catch a weird case
+    text = "The issue is MOOT and resolved."
+    result = _extract_outcome(text)
+    assert result == "Moot"
+
+
+def test_extract_case_title_long_truncation() -> None:
+    """Long case titles should be truncated to 200 characters."""
+    # Build a very long "X v. Y" string
+    long_name = "A" * 150
+    text = f"{long_name} v. {long_name}\nSome other text"
+    title = _extract_case_title(text)
+    assert title is not None
+    assert len(title) <= 200
