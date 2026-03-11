@@ -112,6 +112,17 @@ variable "opensearch_credentials_secret_arn" {
   default     = ""
 }
 
+variable "llm_provider" {
+  description = "LLM provider for the ingestion worker: \"anthropic\" or \"google\". Must match the API key secret that is provisioned."
+  type        = string
+  default     = "anthropic"
+
+  validation {
+    condition     = contains(["anthropic", "google"], var.llm_provider)
+    error_message = "llm_provider must be \"anthropic\" or \"google\"."
+  }
+}
+
 variable "anthropic_api_key_secret_arn" {
   description = "ARN of the Secrets Manager secret holding the Anthropic API key (plain string). When set, ANTHROPIC_API_KEY is injected into the ingestion worker container."
   type        = string
