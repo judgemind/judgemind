@@ -67,8 +67,11 @@ class TestEnsureVenv:
 
             with patch("_venv_helper._REPO_ROOT", tmp_path):
                 with patch("sys.executable", str(fake_python)):
-                    # Should return without calling execv
-                    ensure_venv("test-pkg")
+                    # Mock _check_venv_has_deps since this test verifies
+                    # correct-venv detection, not dependency checking
+                    with patch("_venv_helper._check_venv_has_deps", return_value=True):
+                        # Should return without calling execv
+                        ensure_venv("test-pkg")
 
     def test_exits_with_error_when_venv_missing(self, tmp_path: Path) -> None:
         """ensure_venv should sys.exit(1) with helpful message when no venv."""
@@ -108,8 +111,11 @@ class TestEnsureVenv:
             fake_python.write_text("#!/bin/sh\n")  # Just a file, not the real Python
 
             with patch("_venv_helper._REPO_ROOT", tmp_path):
-                with patch("os.execv") as mock_execv:
-                    ensure_venv("test-pkg")
-                    mock_execv.assert_called_once()
-                    call_args = mock_execv.call_args[0]
-                    assert call_args[0] == str(fake_python)
+                # Mock _check_venv_has_deps since this test verifies
+                # execv behavior, not dependency checking
+                with patch("_venv_helper._check_venv_has_deps", return_value=True):
+                    with patch("os.execv") as mock_execv:
+                        ensure_venv("test-pkg")
+                        mock_execv.assert_called_once()
+                        call_args = mock_execv.call_args[0]
+                        assert call_args[0] == str(fake_python)
