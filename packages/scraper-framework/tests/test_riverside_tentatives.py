@@ -794,12 +794,12 @@ def test_extract_motion_type_truncated_at_80_chars() -> None:
 
 
 # ---------------------------------------------------------------------------
-# _extract_motion_type — pattern 3: all-caps MOTION TO (lines 353-361)
+# _extract_motion_type — all-caps input (handled by Pattern 2 with IGNORECASE)
 # ---------------------------------------------------------------------------
 
 
 def test_extract_motion_type_all_caps_pattern() -> None:
-    """All-caps MOTION TO pattern (Pattern 3) is matched."""
+    """All-caps MOTION TO input is matched by Pattern 2 (IGNORECASE)."""
     text = (
         "MOTION TO DEEM REQUESTS FOR ADMISSIONS ADMITTED BY PLAINTIFF\nTentative Ruling: Granted."
     )
@@ -814,13 +814,13 @@ def test_extract_motion_type_all_caps_no_by_of() -> None:
     assert result == "Motion to Strike"
 
 
-def test_extract_motion_type_pattern3_empty_returns_none() -> None:
-    """Pattern 3 match with empty motion type returns None."""
-    # "MOTION TO BY" — the group is empty after stripping
+def test_extract_motion_type_all_caps_empty_returns_none() -> None:
+    """All-caps MOTION TO with empty motion type returns None."""
+    # "MOTION TO BY" — the group captures "BY PLAINTIFF" but truncation
+    # at the "by" pattern leaves it empty
     text = "MOTION TO BY PLAINTIFF\nTentative Ruling: Granted."
     result = _extract_motion_type(text)
-    # Pattern 2 will match first since it uses DOTALL, but let's verify
-    # the function doesn't crash and returns something sensible
+    # Pattern 2 matches; verify the function doesn't crash
     assert result is None or isinstance(result, str)
 
 
