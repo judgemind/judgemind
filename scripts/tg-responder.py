@@ -366,8 +366,8 @@ def _atomic_json_update(
     path = Path(file_path)
     path.parent.mkdir(parents=True, exist_ok=True)
 
-    fd = os.open(str(path), os.O_RDWR | os.O_CREAT)
     try:
+        fd = os.open(str(path), os.O_RDWR | os.O_CREAT)
         with os.fdopen(fd, "r+") as f:
             fcntl.flock(f, fcntl.LOCK_EX)
             try:
@@ -506,8 +506,8 @@ def queue_to_inbox(message: dict[str, object], inbox_file: str) -> None:
     path = Path(inbox_file)
     path.parent.mkdir(parents=True, exist_ok=True)
 
-    fd = os.open(str(path), os.O_RDWR | os.O_CREAT)
     try:
+        fd = os.open(str(path), os.O_RDWR | os.O_CREAT)
         with os.fdopen(fd, "r+") as f:
             fcntl.flock(f, fcntl.LOCK_EX)
             try:
