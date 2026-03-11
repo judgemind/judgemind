@@ -184,8 +184,8 @@ describe('dataQualityMetrics', () => {
       node: { id: string; county: string; metricName: string; metricValue: number };
       cursor: string;
     }>;
-    // We seeded 10 rows total for this date
-    expect(edges.length).toBe(10);
+    // We seeded 11 rows total for this date (LA: 5, Orange: 3, SF: 3)
+    expect(edges.length).toBe(11);
     // All should have valid fields
     for (const edge of edges) {
       expect(edge.node.id).toBeTruthy();
