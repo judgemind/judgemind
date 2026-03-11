@@ -31,7 +31,6 @@ vi.mock('next/navigation', () => ({
 // Stub client-side component used inside the page
 vi.mock('../CaseDetail', () => ({
   CaseDetail: () => null,
-  formatLabel: (v: string | null) => v ?? '\u2014',
 }));
 
 // ---------------------------------------------------------------------------
