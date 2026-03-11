@@ -146,6 +146,11 @@ def test_cc_hearing_date_returns_none_for_invalid() -> None:
     assert _cc_hearing_date_from_filename("") is None
 
 
+def test_cc_hearing_date_returns_none_for_bad_date_values() -> None:
+    """Filename with matching pattern but invalid date values (e.g. month 99)."""
+    assert _cc_hearing_date_from_filename("16_993226.pdf") is None
+
+
 # ---------------------------------------------------------------------------
 # _cc_hearing_date_from_pdf — against real PDF text
 # ---------------------------------------------------------------------------
@@ -167,6 +172,21 @@ def test_cc_hearing_date_probate_pdf() -> None:
     text = _extract_pdf_text(_load_bytes("cc_dept30_031626.pdf"))
     dt = _cc_hearing_date_from_pdf(text)
     assert dt == datetime(2026, 3, 16)
+
+
+def test_cc_hearing_date_from_pdf_invalid_civil_date() -> None:
+    """Civil-format date string that doesn't parse should fall through."""
+    assert _cc_hearing_date_from_pdf("HEARING DATE: 99/99/9999") is None
+
+
+def test_cc_hearing_date_from_pdf_no_date() -> None:
+    """Text with no date patterns at all returns None."""
+    assert _cc_hearing_date_from_pdf("No date information here.") is None
+
+
+def test_cc_hearing_date_from_pdf_invalid_probate_date() -> None:
+    """Probate-format header with invalid date values."""
+    assert _cc_hearing_date_from_pdf("COURT CALENDAR FOR NOTAMONTH 99, 9999") is None
 
 
 # ---------------------------------------------------------------------------
@@ -193,6 +213,17 @@ def test_cc_judge_dept30() -> None:
     judge = _cc_judge_from_pdf(text)
     assert judge is not None
     assert "George" in judge
+
+
+def test_cc_judge_from_pdf_no_match() -> None:
+    """Text with no JUDICIAL OFFICER line returns None."""
+    assert _cc_judge_from_pdf("No officer information here.") is None
+
+
+def test_cc_judge_from_pdf_mixed_case() -> None:
+    """Non-uppercase judge name is returned as-is."""
+    result = _cc_judge_from_pdf("JUDICIAL OFFICER: Benjamin T Reyes II")
+    assert result == "Benjamin T Reyes II"
 
 
 # ---------------------------------------------------------------------------
@@ -263,6 +294,13 @@ def test_cc_motion_type_none() -> None:
     assert _cc_extract_motion_type(text) is None
 
 
+def test_cc_motion_type_order_to_show_cause() -> None:
+    """Test OSC motion type extraction (motion_type2 group)."""
+    result = _cc_extract_motion_type("*ORDER TO SHOW CAUSE")
+    assert result is not None
+    assert "Order To Show Cause" in result
+
+
 # ---------------------------------------------------------------------------
 # Case number extraction — against real PDF text
 # ---------------------------------------------------------------------------
@@ -327,6 +365,173 @@ def test_cc_case_title_dept30_probate() -> None:
     assert m is not None
     title = m.group("case_name").strip()
     assert len(title) > 0
+
+
+# ---------------------------------------------------------------------------
+# _cc_extract_links — edge cases
+# ---------------------------------------------------------------------------
+
+
+def test_cc_extract_links_deduplicates_urls() -> None:
+    """Duplicate href values should be deduplicated."""
+    html = """<html><body>
+    <a class="tentative-ruling" href="TR\\Department 16 - Judge Reyes\\16_031126.pdf">Mar 11</a>
+    <a class="tentative-ruling" href="TR\\Department 16 - Judge Reyes\\16_031126.pdf">Mar 11</a>
+    </body></html>"""
+    links = _cc_extract_links(html, BASE_URL)
+    assert len(links) == 1
+
+
+# ---------------------------------------------------------------------------
+# fetch_documents error handling
+# ---------------------------------------------------------------------------
+
+
+@respx.mock
+def test_cc_fetch_pdf_error_skips_gracefully() -> None:
+    """When a PDF download fails, the scraper should skip it and continue."""
+    config = cc_default_config()
+    scraper = CCTentativeRulingsScraper(config)
+
+    # Minimal index page with two links to different departments
+    dept14_href = "TR\\Department 14 - Judge Athanasiou\\14_031026.pdf"
+    index_html = (
+        "<html><body>"
+        '<a class="tentative-ruling" '
+        'href="TR\\Department 16 - Judge Reyes\\16_031126.pdf">Mar 11</a>'
+        f'<a class="tentative-ruling" href="{dept14_href}">Mar 10</a>'
+        "</body></html>"
+    )
+    respx.get(INDEX_URL).mock(return_value=httpx.Response(200, text=index_html))
+
+    # First PDF returns 500, second succeeds
+    dept16_url = (
+        "https://retired.cc-courts.org/civil/TR/Department%2016%20-%20Judge%20Reyes/16_031126.pdf"
+    )
+    dept14_url = "https://retired.cc-courts.org/civil/TR/Department%2014%20-%20Judge%20Athanasiou/14_031026.pdf"
+    respx.get(dept16_url).mock(return_value=httpx.Response(500))
+    respx.get(dept14_url).mock(
+        return_value=httpx.Response(200, content=_load_bytes("cc_dept14_031026.pdf"))
+    )
+
+    docs = scraper.fetch_documents()
+    # Should have 1 doc (the one that succeeded)
+    assert len(docs) == 1
+    assert docs[0].department == "14"
+
+
+@respx.mock
+def test_cc_fetch_boilerplate_pdf_skipped() -> None:
+    """Boilerplate PDFs should be skipped during fetch."""
+    config = cc_default_config()
+    scraper = CCTentativeRulingsScraper(config)
+
+    index_html = """<html><body>
+    <a class="tentative-ruling" href="TR\\Department 16 - Judge Reyes\\16_031126.pdf">Mar 11</a>
+    </body></html>"""
+    respx.get(INDEX_URL).mock(return_value=httpx.Response(200, text=index_html))
+
+    # Create a fake "boilerplate" PDF (just text that triggers _is_boilerplate).
+    # The _is_boilerplate method checks for very short content.
+    # Use a real PDF for fetch but monkey-patch _is_boilerplate to return True.
+    pdf_bytes = _load_bytes("cc_dept16_031126.pdf")
+    respx.route(method="GET", url__regex=r".*\.pdf$").mock(
+        return_value=httpx.Response(200, content=pdf_bytes)
+    )
+
+    original = scraper._is_boilerplate
+    scraper._is_boilerplate = lambda text: True  # type: ignore[assignment]
+    try:
+        docs = scraper.fetch_documents()
+        assert len(docs) == 0
+    finally:
+        scraper._is_boilerplate = original  # type: ignore[assignment]
+
+
+@respx.mock
+def test_cc_fetch_pdf_text_extraction_failure() -> None:
+    """When PDF text extraction fails in fetch_documents, the doc should still be included."""
+    config = cc_default_config()
+    scraper = CCTentativeRulingsScraper(config)
+
+    index_html = """<html><body>
+    <a class="tentative-ruling" href="TR\\Department 16 - Judge Reyes\\16_031126.pdf">Mar 11</a>
+    </body></html>"""
+    respx.get(INDEX_URL).mock(return_value=httpx.Response(200, text=index_html))
+
+    # Return invalid PDF content that will fail text extraction
+    respx.route(method="GET", url__regex=r".*\.pdf$").mock(
+        return_value=httpx.Response(200, content=b"not-a-real-pdf-content")
+    )
+
+    docs = scraper.fetch_documents()
+    # Doc should still be included (text extraction failure is non-fatal in fetch)
+    assert len(docs) == 1
+
+
+# ---------------------------------------------------------------------------
+# parse_document error handling
+# ---------------------------------------------------------------------------
+
+
+@respx.mock
+def test_cc_parse_document_pdf_extraction_failure() -> None:
+    """When PDF text extraction fails in parse_document, doc is returned unchanged."""
+    config = cc_default_config()
+    scraper = CCTentativeRulingsScraper(config)
+
+    doc = scraper._make_base_doc(
+        source_url="https://example.com/test.pdf",
+        raw_content=b"not-a-real-pdf",
+        content_format="pdf",
+    )
+    doc.department = "16"
+    doc.judge_name = "Reyes"
+
+    parsed = scraper.parse_document(doc)
+    # Should return doc unchanged since text extraction fails
+    assert parsed.judge_name == "Reyes"
+    assert parsed.ruling_text is None
+
+
+@respx.mock
+def test_cc_parse_document_no_judge_extracts_from_pdf() -> None:
+    """When doc has no judge_name, parse_document extracts from PDF header."""
+    config = cc_default_config()
+    scraper = CCTentativeRulingsScraper(config)
+
+    pdf_bytes = _load_bytes("cc_dept16_031126.pdf")
+    doc = scraper._make_base_doc(
+        source_url="https://example.com/test.pdf",
+        raw_content=pdf_bytes,
+        content_format="pdf",
+    )
+    doc.department = "16"
+    doc.judge_name = None  # No judge set from URL path
+
+    parsed = scraper.parse_document(doc)
+    assert parsed.judge_name is not None
+    assert "Reyes" in parsed.judge_name
+
+
+@respx.mock
+def test_cc_parse_document_no_hearing_date_extracts_from_pdf() -> None:
+    """When doc has no hearing_date, parse_document extracts from PDF text."""
+    config = cc_default_config()
+    scraper = CCTentativeRulingsScraper(config)
+
+    pdf_bytes = _load_bytes("cc_dept16_031126.pdf")
+    doc = scraper._make_base_doc(
+        source_url="https://example.com/test.pdf",
+        raw_content=pdf_bytes,
+        content_format="pdf",
+    )
+    doc.department = "16"
+    doc.hearing_date = None  # No date set from filename
+
+    parsed = scraper.parse_document(doc)
+    assert parsed.hearing_date is not None
+    assert parsed.hearing_date == datetime(2026, 3, 11)
 
 
 # ---------------------------------------------------------------------------
