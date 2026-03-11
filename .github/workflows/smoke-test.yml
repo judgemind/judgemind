@@ -35,22 +35,13 @@ jobs:
       - name: Fetch sample IDs from API
         id: ids
         run: |
-          # Get a sample ruling ID and case ID
-          RULING_RESP=$(curl -s --max-time 15 \
+          # Get a sample case ID
+          CASE_RESP=$(curl -s --max-time 15 \
             -X POST "$API_URL" \
             -H 'Content-Type: application/json' \
-            -d '{"query":"{ rulings(first: 1) { edges { node { id case { id } } } } }"}')
+            -d '{"query":"{ cases(first: 1) { edges { node { id } } } }"}' || true)
 
-          RULING_ID=$(echo "$RULING_RESP" | jq -r '.data.rulings.edges[0].node.id // empty' 2>/dev/null)
-          CASE_ID=$(echo "$RULING_RESP" | jq -r '.data.rulings.edges[0].node.case.id // empty' 2>/dev/null)
-
-          if [ -n "$RULING_ID" ]; then
-            echo "ruling_id=$RULING_ID" >> "$GITHUB_OUTPUT"
-            echo "Found sample ruling ID: $RULING_ID"
-          else
-            echo "ruling_id=" >> "$GITHUB_OUTPUT"
-            echo "WARNING: Could not fetch a sample ruling ID from the API"
-          fi
+          CASE_ID=$(echo "$CASE_RESP" | jq -r '.data.cases.edges[0].node.id // empty' 2>/dev/null || true)
 
           if [ -n "$CASE_ID" ]; then
             echo "case_id=$CASE_ID" >> "$GITHUB_OUTPUT"
@@ -64,9 +55,9 @@ jobs:
           JUDGE_RESP=$(curl -s --max-time 15 \
             -X POST "$API_URL" \
             -H 'Content-Type: application/json' \
-            -d '{"query":"{ judges(first: 1) { edges { node { id } } } }"}')
+            -d '{"query":"{ judges(first: 1) { edges { node { id } } } }"}' || true)
 
-          JUDGE_ID=$(echo "$JUDGE_RESP" | jq -r '.data.judges.edges[0].node.id // empty' 2>/dev/null)
+          JUDGE_ID=$(echo "$JUDGE_RESP" | jq -r '.data.judges.edges[0].node.id // empty' 2>/dev/null || true)
 
           if [ -n "$JUDGE_ID" ]; then
             echo "judge_id=$JUDGE_ID" >> "$GITHUB_OUTPUT"
@@ -79,7 +70,6 @@ jobs:
       - name: Smoke test major pages
         id: smoke
         env:
-          RULING_ID: ${{ steps.ids.outputs.ruling_id }}
           CASE_ID: ${{ steps.ids.outputs.case_id }}
           JUDGE_ID: ${{ steps.ids.outputs.judge_id }}
         run: |
@@ -95,9 +85,6 @@ jobs:
           )
 
           # Add dynamic pages if we have sample IDs
-          if [ -n "$RULING_ID" ]; then
-            PAGES+=("/rulings/${RULING_ID}")
-          fi
           if [ -n "$CASE_ID" ]; then
             PAGES+=("/cases/${CASE_ID}")
           fi
@@ -111,7 +98,7 @@ jobs:
               --max-time 30 \
               --retry 2 \
               --retry-delay 5 \
-              "${BASE_URL}${page}")
+              "${BASE_URL}${page}" || echo "000")
 
             if [ "$HTTP_CODE" -ge 500 ] 2>/dev/null || [ "$HTTP_CODE" = "000" ]; then
               echo "FAIL: ${page} returned ${HTTP_CODE}"
@@ -131,12 +118,13 @@ jobs:
               echo -e "$FAILED_PAGES"
               echo 'GHEOF'
             } >> "$GITHUB_OUTPUT"
+            exit 1
           else
             echo "has_failures=false" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Check for existing open issue
-        if: steps.smoke.outputs.has_failures == 'true'
+        if: failure() && steps.smoke.outputs.has_failures == 'true'
         id: existing
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -159,6 +147,7 @@ jobs:
 
       - name: Create failure issue
         if: >-
+          failure() &&
           steps.smoke.outputs.has_failures == 'true' &&
           steps.existing.outputs.exists == 'false'
         env:
