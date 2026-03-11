@@ -186,7 +186,16 @@ Process commands from the Telegram inbox and responder daemon:
 | `stop #N` | Stop spawning work for issue #N; if an agent is working on it, let it finish |
 | `pause` | Stop launching new agents; existing agents continue |
 | `resume` | Resume launching new agents |
+| `file_issue` | Create a GitHub issue from the user's description; confirm with issue URL via Telegram |
+| `discuss` | User wants to discuss something requiring codebase context; formulate a response using file access, code reading, etc. and reply via Telegram |
+| `do` | User wants an action performed (merge PR, check CI, etc.); execute the instruction and confirm via Telegram |
 | Free text | Interpret and reply via Telegram — check `result["needs_reply"]` |
+
+The `file_issue`, `discuss`, and `do` commands are classified by the Haiku interpreter in the responder daemon and written to the inbox as structured entries with an `action` key. The orchestrator reads these via `bridge.read_inbox()` which returns `Command` objects with the appropriate `CommandKind`. Each command's result dict includes the metadata needed to act on it:
+
+- **`file_issue`**: `result["description"]`, `result["priority"]`, `result["labels"]`, `result["reply_to"]`
+- **`discuss`**: `result["message"]`, `result["reply_to"]`, `result["needs_reply"]`
+- **`do`**: `result["instruction"]`, `result["reply_to"]`, `result["needs_reply"]`
 
 ### State file integration
 
@@ -194,7 +203,7 @@ The responder daemon communicates via shared state files (see CLAUDE.md "Respond
 
 - Read `tmp/orchestrator_state.json` for pause/resume state
 - Read `tmp/stop_requests.json` for stop requests
-- Read `tmp/tg_inbox.json` for queued start commands and free text
+- Read `tmp/tg_inbox.json` for queued commands (start, file_issue, discuss, do, and free text)
 
 ---
 

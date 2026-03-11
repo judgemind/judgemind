@@ -723,6 +723,184 @@ class TestDispatchMessage:
         assert stop_data[0]["issue_number"] == 42
 
 
+# ── dispatch_message — new action types (file_issue, discuss, do) ──────
+
+
+class TestDispatchMessageNewActions:
+    """Tests for the new complex request passthrough action types."""
+
+    @respx.mock
+    @patch("tg_responder.interpret_message")
+    def test_file_issue_action_queued_to_inbox(
+        self, mock_interpret: MagicMock, tmp_path: Path
+    ) -> None:
+        from telegram_bridge.interpreter import InterpretedMessage
+
+        mock_interpret.return_value = InterpretedMessage(
+            reply="Filing that issue.",
+            actions=[
+                {
+                    "type": "file_issue",
+                    "description": "OC scraper timing out on PDFs",
+                    "priority": "p2",
+                    "labels": ["area/scraping"],
+                }
+            ],
+        )
+        respx.post("https://api.telegram.org/botfake-token/sendMessage").mock(
+            return_value=httpx.Response(200, json={"ok": True})
+        )
+
+        inbox_file = tmp_path / "inbox.json"
+
+        mod = _import_responder()
+        mod.dispatch_message(
+            message={"text": "file a bug about OC scraper", "user_id": 12345},
+            bot_token="fake-token",
+            chat_ids=[12345],
+            state_file=str(tmp_path / "state.json"),
+            status_file=str(tmp_path / "status.json"),
+            agent_status_dir=str(tmp_path / "agent-status"),
+            stop_requests_file=str(tmp_path / "stop.json"),
+            inbox_file=str(inbox_file),
+            anthropic_api_key="test-key",
+        )
+
+        data = json.loads(inbox_file.read_text())
+        assert len(data) == 1
+        assert data[0]["action"] == "file_issue"
+        assert data[0]["description"] == "OC scraper timing out on PDFs"
+        assert data[0]["priority"] == "p2"
+        assert data[0]["labels"] == ["area/scraping"]
+        assert data[0]["reply_to"] == 12345
+
+    @respx.mock
+    @patch("tg_responder.interpret_message")
+    def test_discuss_action_queued_to_inbox(
+        self, mock_interpret: MagicMock, tmp_path: Path
+    ) -> None:
+        from telegram_bridge.interpreter import InterpretedMessage
+
+        mock_interpret.return_value = InterpretedMessage(
+            reply="Forwarding to the orchestrator.",
+            actions=[
+                {
+                    "type": "discuss",
+                    "message": "Should we use Redis for caching ruling lookups?",
+                }
+            ],
+        )
+        respx.post("https://api.telegram.org/botfake-token/sendMessage").mock(
+            return_value=httpx.Response(200, json={"ok": True})
+        )
+
+        inbox_file = tmp_path / "inbox.json"
+
+        mod = _import_responder()
+        mod.dispatch_message(
+            message={
+                "text": "Should we use Redis for caching ruling lookups?",
+                "user_id": 12345,
+            },
+            bot_token="fake-token",
+            chat_ids=[12345],
+            state_file=str(tmp_path / "state.json"),
+            status_file=str(tmp_path / "status.json"),
+            agent_status_dir=str(tmp_path / "agent-status"),
+            stop_requests_file=str(tmp_path / "stop.json"),
+            inbox_file=str(inbox_file),
+            anthropic_api_key="test-key",
+        )
+
+        data = json.loads(inbox_file.read_text())
+        assert len(data) == 1
+        assert data[0]["action"] == "discuss"
+        assert data[0]["message"] == "Should we use Redis for caching ruling lookups?"
+        assert data[0]["reply_to"] == 12345
+
+    @respx.mock
+    @patch("tg_responder.interpret_message")
+    def test_do_action_queued_to_inbox(self, mock_interpret: MagicMock, tmp_path: Path) -> None:
+        from telegram_bridge.interpreter import InterpretedMessage
+
+        mock_interpret.return_value = InterpretedMessage(
+            reply="On it.",
+            actions=[
+                {
+                    "type": "do",
+                    "instruction": "Check if PR #738 CI passed and merge it",
+                }
+            ],
+        )
+        respx.post("https://api.telegram.org/botfake-token/sendMessage").mock(
+            return_value=httpx.Response(200, json={"ok": True})
+        )
+
+        inbox_file = tmp_path / "inbox.json"
+
+        mod = _import_responder()
+        mod.dispatch_message(
+            message={
+                "text": "check CI on #738 and merge it",
+                "user_id": 12345,
+            },
+            bot_token="fake-token",
+            chat_ids=[12345],
+            state_file=str(tmp_path / "state.json"),
+            status_file=str(tmp_path / "status.json"),
+            agent_status_dir=str(tmp_path / "agent-status"),
+            stop_requests_file=str(tmp_path / "stop.json"),
+            inbox_file=str(inbox_file),
+            anthropic_api_key="test-key",
+        )
+
+        data = json.loads(inbox_file.read_text())
+        assert len(data) == 1
+        assert data[0]["action"] == "do"
+        assert data[0]["instruction"] == "Check if PR #738 CI passed and merge it"
+        assert data[0]["reply_to"] == 12345
+
+    @respx.mock
+    @patch("tg_responder.interpret_message")
+    def test_file_issue_defaults_priority_to_p2(
+        self, mock_interpret: MagicMock, tmp_path: Path
+    ) -> None:
+        from telegram_bridge.interpreter import InterpretedMessage
+
+        mock_interpret.return_value = InterpretedMessage(
+            reply="Filing.",
+            actions=[
+                {
+                    "type": "file_issue",
+                    "description": "Something broken",
+                    # No priority or labels specified.
+                }
+            ],
+        )
+        respx.post("https://api.telegram.org/botfake-token/sendMessage").mock(
+            return_value=httpx.Response(200, json={"ok": True})
+        )
+
+        inbox_file = tmp_path / "inbox.json"
+
+        mod = _import_responder()
+        mod.dispatch_message(
+            message={"text": "file a bug", "user_id": 12345},
+            bot_token="fake-token",
+            chat_ids=[12345],
+            state_file=str(tmp_path / "state.json"),
+            status_file=str(tmp_path / "status.json"),
+            agent_status_dir=str(tmp_path / "agent-status"),
+            stop_requests_file=str(tmp_path / "stop.json"),
+            inbox_file=str(inbox_file),
+            anthropic_api_key="test-key",
+        )
+
+        data = json.loads(inbox_file.read_text())
+        assert data[0]["priority"] == "p2"
+        assert data[0]["labels"] == []
+
+
 # ── SQS polling ─────────────────────────────────────────────────────────
 
 

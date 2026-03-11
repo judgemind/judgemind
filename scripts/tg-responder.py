@@ -553,6 +553,7 @@ def dispatch_message(
     # Execute any actions.
     for action in result.actions:
         action_type = action.get("type", "")
+        user_id = message.get("user_id")
 
         if action_type == "pause":
             handle_pause(state_file)
@@ -572,10 +573,48 @@ def dispatch_message(
             issue_num = action.get("issue")
             if isinstance(issue_num, int):
                 queue_to_inbox(
-                    {"text": f"start #{issue_num}", "user_id": message.get("user_id")},
+                    {"text": f"start #{issue_num}", "user_id": user_id},
                     inbox_file,
                 )
                 logger.info("Action: start #%d (queued for orchestrator)", issue_num)
+
+        elif action_type == "file_issue":
+            queue_to_inbox(
+                {
+                    "action": "file_issue",
+                    "description": action.get("description", ""),
+                    "priority": action.get("priority", "p2"),
+                    "labels": action.get("labels", []),
+                    "reply_to": user_id,
+                    "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                },
+                inbox_file,
+            )
+            logger.info("Action: file_issue (queued for orchestrator)")
+
+        elif action_type == "discuss":
+            queue_to_inbox(
+                {
+                    "action": "discuss",
+                    "message": action.get("message", ""),
+                    "reply_to": user_id,
+                    "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                },
+                inbox_file,
+            )
+            logger.info("Action: discuss (queued for orchestrator)")
+
+        elif action_type == "do":
+            queue_to_inbox(
+                {
+                    "action": "do",
+                    "instruction": action.get("instruction", ""),
+                    "reply_to": user_id,
+                    "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                },
+                inbox_file,
+            )
+            logger.info("Action: do (queued for orchestrator)")
 
 
 # Keep dispatch_command as a backwards-compatible alias for tests that use it.
