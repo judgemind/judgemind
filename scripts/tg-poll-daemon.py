@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 """Background Telegram SQS polling daemon.
 
+.. deprecated::
+    This daemon is deprecated in favour of ``scripts/tg-responder.py``, which
+    handles simple commands (status, pause, resume, stop) directly and replies
+    via the Telegram Bot API within seconds.  Use ``tg-responder.py`` instead.
+
 Polls the Telegram inbound SQS queue on a configurable interval and writes
 received commands to a JSON inbox file.  The orchestrator reads this file
 periodically instead of running the poll inline, saving context tokens and
