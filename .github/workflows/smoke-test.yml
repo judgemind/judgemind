@@ -71,11 +71,28 @@ jobs:
             echo "WARNING: Could not fetch a sample judge ID from the API"
           fi
 
+          # Get a sample ruling ID
+          RULING_RESP=$(curl -s --max-time 15 \
+            -X POST "$API_URL" \
+            -H 'Content-Type: application/json' \
+            -d '{"query":"{ rulings(first: 1) { edges { node { id } } } }"}' || true)
+
+          RULING_ID=$(echo "$RULING_RESP" | jq -r '.data.rulings.edges[0].node.id // empty' 2>/dev/null || true)
+
+          if [ -n "$RULING_ID" ]; then
+            echo "ruling_id=$RULING_ID" >> "$GITHUB_OUTPUT"
+            echo "Found sample ruling ID: $RULING_ID"
+          else
+            echo "ruling_id=" >> "$GITHUB_OUTPUT"
+            echo "WARNING: Could not fetch a sample ruling ID from the API"
+          fi
+
       - name: Smoke test major pages
         id: smoke
         env:
           CASE_ID: ${{ steps.ids.outputs.case_id }}
           JUDGE_ID: ${{ steps.ids.outputs.judge_id }}
+          RULING_ID: ${{ steps.ids.outputs.ruling_id }}
         run: |
           FAILED_PAGES=""
           TOTAL=0
@@ -94,6 +111,9 @@ jobs:
           fi
           if [ -n "$JUDGE_ID" ]; then
             PAGES+=("/judges/${JUDGE_ID}")
+          fi
+          if [ -n "$RULING_ID" ]; then
+            PAGES+=("/rulings/${RULING_ID}")
           fi
 
           for page in "${PAGES[@]}"; do

@@ -3,6 +3,10 @@
 import { useState } from 'react';
 import { useQuery, gql } from '@apollo/client';
 import Link from 'next/link';
+import {
+  formatDate as _formatDate,
+  formatOutcome as _formatOutcome,
+} from '@/lib/display-helpers';
 
 const RULINGS_QUERY = gql`
   query Rulings(
@@ -76,24 +80,9 @@ interface RulingsData {
   };
 }
 
-/** Format an ISO 8601 date string as a short readable date (e.g. "Mar 5, 2026"). */
-export function formatDate(iso: string): string {
-  const d = new Date(iso + 'T00:00:00Z');
-  return d.toLocaleDateString('en-US', {
-    month: 'short',
-    day: 'numeric',
-    year: 'numeric',
-    timeZone: 'UTC',
-  });
-}
-
-/** Convert a snake_case outcome code to a human-readable label. */
-export function formatOutcome(outcome: string | null): string {
-  if (!outcome) return 'Not classified';
-  return outcome
-    .replace(/_/g, ' ')
-    .replace(/\b\w/g, (c) => c.toUpperCase());
-}
+// Re-export from shared helpers so existing imports from this module continue to work.
+export const formatDate = _formatDate;
+export const formatOutcome = _formatOutcome;
 
 /**
  * Known full motion type mappings (lowercased key -> display label).

@@ -48,6 +48,29 @@ export function formatLabel(value: string | null): string {
 }
 
 // ---------------------------------------------------------------------------
+// Date & outcome formatting (shared between server & client components)
+// ---------------------------------------------------------------------------
+
+/** Format an ISO 8601 date string as a short readable date (e.g. "Mar 5, 2026"). */
+export function formatDate(iso: string): string {
+  const d = new Date(iso + 'T00:00:00Z');
+  return d.toLocaleDateString('en-US', {
+    month: 'short',
+    day: 'numeric',
+    year: 'numeric',
+    timeZone: 'UTC',
+  });
+}
+
+/** Convert a snake_case outcome code to a human-readable label. Returns "Not classified" for null. */
+export function formatOutcome(outcome: string | null): string {
+  if (!outcome) return 'Not classified';
+  return outcome
+    .replace(/_/g, ' ')
+    .replace(/\b\w/g, (c) => c.toUpperCase());
+}
+
+// ---------------------------------------------------------------------------
 // Ruling text cleanup (display-time)
 // ---------------------------------------------------------------------------
 // Cleans ruling text for display in the frontend. This is a safety net for
