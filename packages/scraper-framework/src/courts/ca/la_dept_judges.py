@@ -23,10 +23,16 @@ uses unpadded numbers while the directory uses zero-padded numbers.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import httpx
 import structlog
 from bs4 import BeautifulSoup
+
+from framework.court_directory import CourtDirectory
+
+if TYPE_CHECKING:
+    import psycopg
 
 logger = structlog.get_logger(__name__)
 
@@ -163,10 +169,8 @@ def lookup_judge_for_department(
     return dept_map.get(norm)
 
 
-def fetch_department_judge_mapping(
-    timeout: float = 30.0,
-) -> dict[str, str]:
-    """Fetch the LA judicial officer directory and return a dept→judge mapping.
+def _fetch_and_parse_directory(timeout: float = 30.0) -> tuple[bytes, dict[str, str]]:
+    """Fetch and parse the LA judicial officer directory (shared helper).
 
     Makes a single HTTP GET to the judicial officers page, parses the
     officer table, and builds the department-to-judge mapping.
@@ -175,7 +179,7 @@ def fetch_department_judge_mapping(
         timeout: HTTP request timeout in seconds.
 
     Returns:
-        Dict mapping normalized department strings to full judge names.
+        Tuple of (raw_response_bytes, dept_to_judge_mapping).
 
     Raises:
         httpx.HTTPStatusError: If the HTTP request fails.
@@ -189,7 +193,94 @@ def fetch_department_judge_mapping(
         response = client.get(JUDICIAL_OFFICERS_URL)
         response.raise_for_status()
 
+    raw = response.content
     officers = parse_judicial_officers_html(response.text)
     dept_map = build_department_judge_map(officers)
     logger.info("Built department-judge mapping", departments=len(dept_map))
+    return raw, dept_map
+
+
+class LACourtDirectory(CourtDirectory):
+    """LA County Superior Court department-to-judge directory with snapshotting.
+
+    Implements ``CourtDirectory.fetch_current()`` by scraping the judicial
+    officer directory page and parsing the HTML table into a department-to-judge
+    mapping.  The base class handles S3 archival, DB storage, and content-hash
+    deduplication.
+
+    Parameters
+    ----------
+    s3_client : object
+        A boto3 S3 client for archiving raw directory responses.
+    s3_bucket : str
+        The S3 bucket name for archival.
+    db_conn : psycopg.Connection
+        A psycopg3 connection for reading/writing snapshots.
+    timeout : float
+        HTTP request timeout in seconds (default 30.0).
+    """
+
+    #: Court identifier used for S3 keys and DB records.
+    COURT_ID: str = "ca_los_angeles"
+
+    def __init__(
+        self,
+        s3_client: object,
+        s3_bucket: str,
+        db_conn: psycopg.Connection,
+        timeout: float = 30.0,
+    ) -> None:
+        super().__init__(s3_client, s3_bucket, db_conn)
+        self._timeout = timeout
+
+    def fetch_current(self) -> tuple[bytes, dict[str, str]]:
+        """Fetch the live LA judicial officer directory.
+
+        Returns
+        -------
+        tuple[bytes, dict[str, str]]
+            A tuple of (raw_html_bytes, dept_to_judge_mapping).
+        """
+        return _fetch_and_parse_directory(self._timeout)
+
+    def fetch_and_snapshot(self, court_id: str | None = None) -> dict[str, str]:
+        """Fetch the live directory and save a snapshot.
+
+        Overrides the base class to default ``court_id`` to
+        :attr:`COURT_ID` (``"ca_los_angeles"``).
+
+        Parameters
+        ----------
+        court_id : str | None
+            The court identifier.  Defaults to ``COURT_ID``.
+
+        Returns
+        -------
+        dict[str, str]
+            The parsed {department: judge_name} mapping.
+        """
+        return super().fetch_and_snapshot(court_id or self.COURT_ID)
+
+
+def fetch_department_judge_mapping(
+    timeout: float = 30.0,
+) -> dict[str, str]:
+    """Fetch the LA judicial officer directory and return a dept→judge mapping.
+
+    Makes a single HTTP GET to the judicial officers page, parses the
+    officer table, and builds the department-to-judge mapping.
+
+    This is a convenience function that does **not** perform snapshotting.
+    For production use with archival, use :class:`LACourtDirectory` instead.
+
+    Args:
+        timeout: HTTP request timeout in seconds.
+
+    Returns:
+        Dict mapping normalized department strings to full judge names.
+
+    Raises:
+        httpx.HTTPStatusError: If the HTTP request fails.
+    """
+    _raw, dept_map = _fetch_and_parse_directory(timeout)
     return dept_map

@@ -28,6 +28,7 @@ import structlog
 from bs4 import BeautifulSoup
 
 from framework import BaseScraper, CapturedDocument, ContentFormat, ScraperConfig
+from framework.court_directory import CourtDirectory
 from framework.events import EventBus
 from framework.party_utils import (
     is_name_fragment as _is_name_fragment,  # noqa: F401 — re-exported for tests
@@ -152,11 +153,29 @@ class LATentativeRulingsScraper(BaseScraper):
         archiver: S3Archiver | None = None,
         event_bus: EventBus | None = None,
         dept_judge_map: dict[str, str] | None = None,
+        court_directory: CourtDirectory | None = None,
     ) -> None:
         super().__init__(config, archiver=archiver, event_bus=event_bus)
         self._dept_judge_map: dict[str, str] = dept_judge_map or {}
+        self._court_directory = court_directory
 
     def fetch_documents(self) -> list[CapturedDocument]:
+        # If a court directory is provided, snapshot it and use the result
+        # as the department-to-judge mapping for this scraper run.
+        if self._court_directory is not None:
+            from courts.ca.la_dept_judges import LACourtDirectory
+
+            court_id = (
+                self._court_directory.COURT_ID
+                if isinstance(self._court_directory, LACourtDirectory)
+                else "ca_los_angeles"
+            )
+            self._dept_judge_map = self._court_directory.fetch_and_snapshot(court_id)
+            self._log.info(
+                "Snapshotted court directory",
+                court_id=court_id,
+                departments=len(self._dept_judge_map),
+            )
         docs = []
         with httpx.Client(
             timeout=self.config.request_timeout_seconds,

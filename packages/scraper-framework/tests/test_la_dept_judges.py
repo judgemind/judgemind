@@ -8,6 +8,7 @@ Fixtures:
 from __future__ import annotations
 
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import httpx
 import pytest
@@ -16,6 +17,7 @@ import respx
 from courts.ca.la_dept_judges import (
     JUDICIAL_OFFICERS_URL,
     JudicialOfficer,
+    LACourtDirectory,
     build_department_judge_map,
     fetch_department_judge_mapping,
     lookup_judge_for_department,
@@ -227,6 +229,230 @@ def test_fetch_mapping_http_error_raises() -> None:
     respx.get(JUDICIAL_OFFICERS_URL).mock(return_value=httpx.Response(503))
     with pytest.raises(httpx.HTTPStatusError):
         fetch_department_judge_mapping()
+
+
+# ---------------------------------------------------------------------------
+# LACourtDirectory — fetch_current and snapshot integration
+# ---------------------------------------------------------------------------
+
+
+class TestLACourtDirectory:
+    """Tests for the LACourtDirectory subclass of CourtDirectory."""
+
+    def _make_mock_db(self) -> MagicMock:
+        """Create a mock psycopg connection with cursor context manager."""
+        mock_conn = MagicMock()
+        mock_cursor = MagicMock()
+        mock_cursor.fetchone.return_value = None  # no prior snapshot (not duplicate)
+        mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cursor)
+        mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+        return mock_conn
+
+    def _make_mock_s3(self) -> MagicMock:
+        """Create a mock S3 client."""
+        return MagicMock()
+
+    @respx.mock
+    def test_fetch_current_returns_raw_and_mapping(self) -> None:
+        """fetch_current() returns (raw_bytes, dept_map) from the live page."""
+        html = _load("la_judicial_officers.html")
+        respx.get(JUDICIAL_OFFICERS_URL).mock(return_value=httpx.Response(200, text=html))
+
+        directory = LACourtDirectory(
+            s3_client=self._make_mock_s3(),
+            s3_bucket="test-bucket",
+            db_conn=self._make_mock_db(),
+        )
+
+        raw, mapping = directory.fetch_current()
+        assert isinstance(raw, bytes)
+        assert len(raw) > 0
+        assert isinstance(mapping, dict)
+        assert len(mapping) == 14
+        assert mapping["3"] == "William A. Crowfoot"
+        assert mapping["52"] == "Jerrold Abeles"
+
+    @respx.mock
+    def test_fetch_and_snapshot_archives_to_s3(self) -> None:
+        """fetch_and_snapshot() uploads raw HTML to S3."""
+        html = _load("la_judicial_officers.html")
+        respx.get(JUDICIAL_OFFICERS_URL).mock(return_value=httpx.Response(200, text=html))
+
+        mock_s3 = self._make_mock_s3()
+        mock_db = self._make_mock_db()
+
+        directory = LACourtDirectory(
+            s3_client=mock_s3,
+            s3_bucket="test-bucket",
+            db_conn=mock_db,
+        )
+
+        mapping = directory.fetch_and_snapshot()
+        assert len(mapping) == 14
+        assert mapping["3"] == "William A. Crowfoot"
+
+        # Verify S3 put_object was called
+        mock_s3.put_object.assert_called_once()
+        call_kwargs = mock_s3.put_object.call_args
+        assert call_kwargs.kwargs["Bucket"] == "test-bucket"
+        assert call_kwargs.kwargs["Key"].startswith("directories/ca_los_angeles/")
+        assert call_kwargs.kwargs["ContentType"] == "text/html"
+        assert len(call_kwargs.kwargs["Body"]) > 0
+
+    @respx.mock
+    def test_fetch_and_snapshot_inserts_into_db(self) -> None:
+        """fetch_and_snapshot() inserts mapping into the DB when content is new."""
+        html = _load("la_judicial_officers.html")
+        respx.get(JUDICIAL_OFFICERS_URL).mock(return_value=httpx.Response(200, text=html))
+
+        mock_s3 = self._make_mock_s3()
+        mock_db = self._make_mock_db()
+        mock_cursor = mock_db.cursor.return_value.__enter__.return_value
+
+        directory = LACourtDirectory(
+            s3_client=mock_s3,
+            s3_bucket="test-bucket",
+            db_conn=mock_db,
+        )
+
+        mapping = directory.fetch_and_snapshot()
+        assert len(mapping) == 14
+
+        # The cursor should have been called for both _is_duplicate check
+        # and the INSERT.  The INSERT call contains the mapping JSON.
+        calls = mock_cursor.execute.call_args_list
+        assert len(calls) >= 1
+
+        # Verify commit was called (new snapshot inserted)
+        mock_db.commit.assert_called()
+
+    @respx.mock
+    def test_fetch_and_snapshot_deduplicates(self) -> None:
+        """fetch_and_snapshot() skips DB insert when content hash matches."""
+        html = _load("la_judicial_officers.html")
+        respx.get(JUDICIAL_OFFICERS_URL).mock(return_value=httpx.Response(200, text=html))
+
+        mock_s3 = self._make_mock_s3()
+        mock_db = self._make_mock_db()
+        mock_cursor = mock_db.cursor.return_value.__enter__.return_value
+
+        # Simulate existing snapshot with same content hash
+        from framework.hashing import sha256_hex
+
+        content_hash = sha256_hex(html.encode("utf-8"))
+        mock_cursor.fetchone.return_value = (content_hash,)
+
+        directory = LACourtDirectory(
+            s3_client=mock_s3,
+            s3_bucket="test-bucket",
+            db_conn=mock_db,
+        )
+
+        mapping = directory.fetch_and_snapshot()
+        assert len(mapping) == 14
+
+        # S3 upload should still happen (always archive raw)
+        mock_s3.put_object.assert_called_once()
+
+        # But commit should NOT be called (duplicate detected)
+        mock_db.commit.assert_not_called()
+
+    @respx.mock
+    def test_fetch_current_http_error_raises(self) -> None:
+        """fetch_current() propagates HTTP errors."""
+        respx.get(JUDICIAL_OFFICERS_URL).mock(return_value=httpx.Response(503))
+
+        directory = LACourtDirectory(
+            s3_client=self._make_mock_s3(),
+            s3_bucket="test-bucket",
+            db_conn=self._make_mock_db(),
+        )
+
+        with pytest.raises(httpx.HTTPStatusError):
+            directory.fetch_current()
+
+    def test_court_id_default(self) -> None:
+        """LACourtDirectory.COURT_ID is 'ca_los_angeles'."""
+        assert LACourtDirectory.COURT_ID == "ca_los_angeles"
+
+    @respx.mock
+    def test_fetch_and_snapshot_uses_default_court_id(self) -> None:
+        """fetch_and_snapshot() without args uses COURT_ID."""
+        html = _load("la_judicial_officers.html")
+        respx.get(JUDICIAL_OFFICERS_URL).mock(return_value=httpx.Response(200, text=html))
+
+        mock_s3 = self._make_mock_s3()
+        mock_db = self._make_mock_db()
+
+        directory = LACourtDirectory(
+            s3_client=mock_s3,
+            s3_bucket="test-bucket",
+            db_conn=mock_db,
+        )
+
+        directory.fetch_and_snapshot()
+
+        # Verify S3 key uses ca_los_angeles
+        call_kwargs = mock_s3.put_object.call_args
+        assert "ca_los_angeles" in call_kwargs.kwargs["Key"]
+
+
+# ---------------------------------------------------------------------------
+# Scraper integration: court_directory snapshots during fetch_documents
+# ---------------------------------------------------------------------------
+
+
+class TestScraperCourtDirectoryIntegration:
+    """Test that LATentativeRulingsScraper snapshots the directory when given
+    a CourtDirectory instance."""
+
+    @respx.mock
+    def test_fetch_documents_snapshots_directory(self) -> None:
+        """When court_directory is provided, fetch_documents calls
+        fetch_and_snapshot and populates dept_judge_map."""
+        html = _load("la_judicial_officers.html")
+        respx.get(JUDICIAL_OFFICERS_URL).mock(return_value=httpx.Response(200, text=html))
+
+        mock_s3 = MagicMock()
+        mock_db = MagicMock()
+        mock_cursor = MagicMock()
+        mock_cursor.fetchone.return_value = None
+        mock_db.cursor.return_value.__enter__ = MagicMock(return_value=mock_cursor)
+        mock_db.cursor.return_value.__exit__ = MagicMock(return_value=False)
+
+        directory = LACourtDirectory(
+            s3_client=mock_s3,
+            s3_bucket="test-bucket",
+            db_conn=mock_db,
+        )
+
+        config = default_config()
+        scraper = LATentativeRulingsScraper(
+            config=config,
+            court_directory=directory,
+        )
+
+        # Mock the main page fetch to return an empty page (no options)
+        # so we only test the directory snapshotting, not the full scrape
+        empty_page = (
+            "<html><body>"
+            '<input name="__VIEWSTATE" value="abc"/>'
+            '<select id="siteMasterHolder_basicBodyHolder_List2DeptDate">'
+            "</select>"
+            "</body></html>"
+        )
+        respx.get("https://www.lacourt.ca.gov/tentativeRulingNet/ui/main.aspx?casetype=civil").mock(
+            return_value=httpx.Response(200, text=empty_page)
+        )
+
+        scraper.fetch_documents()
+
+        # Verify directory was snapshotted (S3 upload happened)
+        mock_s3.put_object.assert_called_once()
+
+        # Verify the dept_judge_map was populated
+        assert len(scraper._dept_judge_map) == 14
+        assert scraper._dept_judge_map["3"] == "William A. Crowfoot"
 
 
 # ---------------------------------------------------------------------------
