@@ -121,6 +121,7 @@ data "archive_file" "lambda_placeholder" {
 
 resource "aws_lambda_function" "telegram_webhook" {
   function_name = "judgemind-telegram-webhook-${var.environment}"
+  description   = "Telegram webhook handler — validates sender, enqueues to SQS"
   role          = aws_iam_role.telegram_webhook_lambda.arn
   handler       = "lambda_function.handler"
   runtime       = "python3.12"
