@@ -1,6 +1,8 @@
 import { gql } from '@apollo/client';
+import { notFound } from 'next/navigation';
 import { createApolloClient } from '@/lib/apollo-client';
 import { buildJudgeHeading } from '@/lib/display-helpers';
+import { JudgeProfile } from './JudgeProfile';
 
 const JUDGE_QUERY = gql`
   query JudgeDetail($id: ID!) {
@@ -44,23 +46,38 @@ export default async function JudgeDetailPage({ params }: Props) {
     });
     judgeData = data?.judge ?? null;
   } catch {
-    // GraphQL fetch failed — fall through to fallback display
+    // GraphQL fetch failed — fall through to not found
+  }
+
+  if (!judgeData) {
+    notFound();
   }
 
   const heading = buildJudgeHeading(judgeData, id);
 
   return (
     <div className="mx-auto max-w-4xl">
-      <h1 className="text-2xl font-bold text-slate-900 dark:text-slate-100">{heading}</h1>
-      {judgeData?.court && (
+      <div className="flex flex-wrap items-start gap-3">
+        <h1 className="text-2xl font-bold text-slate-900 dark:text-slate-100">{heading}</h1>
+        <span
+          className={`inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-medium ${
+            judgeData.isActive
+              ? 'bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200'
+              : 'bg-slate-100 text-slate-600 dark:bg-slate-700 dark:text-slate-300'
+          }`}
+        >
+          {judgeData.isActive ? 'Active' : 'Inactive'}
+        </span>
+      </div>
+      {judgeData.court && (
         <p className="mt-1 text-sm text-slate-500 dark:text-slate-400">
           {judgeData.court.courtName} &middot; {judgeData.court.county}
           {judgeData.department ? ` \u00B7 Dept. ${judgeData.department}` : ''}
         </p>
       )}
-      <p className="mt-2 text-sm text-slate-500 dark:text-slate-400">
-        Judge analytics coming soon.
-      </p>
+      <div className="mt-6">
+        <JudgeProfile judgeId={id} />
+      </div>
     </div>
   );
 }
