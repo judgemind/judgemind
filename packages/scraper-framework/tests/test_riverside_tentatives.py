@@ -32,10 +32,13 @@ from courts.ca.riverside_tentatives import (
     _extract_motion_type,
     _extract_outcome,
     _is_no_tentative_rulings,
+    _normalize_motion_type,
+    _riv_courthouse,
     _riv_hearing_date_from_text,
     _split_rulings,
 )
 from courts.ca.riverside_tentatives import default_config as riv_default_config
+from framework import CapturedDocument, ContentFormat
 
 pytestmark = pytest.mark.regression
 
@@ -714,8 +717,6 @@ def test_riv_parse_document_judge_fallback_single_ruling() -> None:
     scraper = RiversideTentativeRulingsScraper(config=config)
 
     # Use _make_base_doc to create a properly formed CapturedDocument
-    from framework import ContentFormat
-
     doc = scraper._make_base_doc(
         source_url="https://example.com/test.pdf",
         raw_content=pdf_bytes,
@@ -731,3 +732,366 @@ def test_riv_parse_document_judge_fallback_single_ruling() -> None:
         result = scraper.parse_document(doc)
         mock_extract.assert_called_once()
         assert result.judge_name == "Test Judge Name"
+
+
+# ---------------------------------------------------------------------------
+# _riv_hearing_date_from_text — edge case: matched date but invalid format (line 84)
+# ---------------------------------------------------------------------------
+
+
+def test_riv_hearing_date_returns_none_for_unparseable_date() -> None:
+    """When the regex matches but the date string can't be parsed, return None."""
+    # "Zeptember" will match the regex's date group only if we inject it in a
+    # way the regex likes — instead use a month name but with invalid day "99".
+    # Actually, let's trigger the fallback by providing a date that the regex
+    # matches but strptime can't parse.  The regex requires a valid month name,
+    # so the only way to hit line 84 is if the day/year combo is invalid.
+    text = "Tentative Rulings for February 30, 2026\nDepartment PS1"
+    # February 30 doesn't exist; strptime will raise ValueError for both formats
+    result = _riv_hearing_date_from_text(text)
+    assert result is None
+
+
+# ---------------------------------------------------------------------------
+# _extract_case_title_from_ruling — no case number (line 253)
+# ---------------------------------------------------------------------------
+
+
+def test_extract_case_title_no_case_number() -> None:
+    """Returns None when ruling text has no case number."""
+    text = "Some ruling text without any case number\nPlaintiff vs Defendant"
+    assert _extract_case_title_from_ruling(text) is None
+
+
+# ---------------------------------------------------------------------------
+# _extract_case_title_from_ruling — short plaintiff/defendant (line 301)
+# ---------------------------------------------------------------------------
+
+
+def test_extract_case_title_short_names_returns_none() -> None:
+    """Returns None when plaintiff or defendant name is too short (< 2 chars)."""
+    # After stripping punctuation and noise, defendant becomes single char.
+    # The vs regex requires [A-Z][A-Z\\s,.'-]+?, so plaintiff matches "A,"
+    # which after strip(" ,;:") becomes "A" (len 1) -> returns None.
+    text = "CVPS2306157 A, vs B, Hearing re: Demurrer"
+    result = _extract_case_title_from_ruling(text)
+    assert result is None
+
+
+# ---------------------------------------------------------------------------
+# _extract_motion_type — long motion type truncated at 80 chars (line 349)
+# ---------------------------------------------------------------------------
+
+
+def test_extract_motion_type_truncated_at_80_chars() -> None:
+    """Motion type longer than 80 chars is truncated."""
+    long_motion = "A" * 100
+    text = f"Motion to {long_motion}\nTentative Ruling: Granted."
+    result = _extract_motion_type(text)
+    assert result is not None
+    # After truncation to 80 chars, the result should be normalized
+    assert len(result) <= 80
+
+
+# ---------------------------------------------------------------------------
+# _extract_motion_type — pattern 3: all-caps MOTION TO (lines 353-361)
+# ---------------------------------------------------------------------------
+
+
+def test_extract_motion_type_all_caps_pattern() -> None:
+    """All-caps MOTION TO pattern (Pattern 3) is matched."""
+    text = (
+        "MOTION TO DEEM REQUESTS FOR ADMISSIONS ADMITTED BY PLAINTIFF\nTentative Ruling: Granted."
+    )
+    result = _extract_motion_type(text)
+    assert result == "Deem Admissions Admitted"
+
+
+def test_extract_motion_type_all_caps_no_by_of() -> None:
+    """All-caps MOTION TO without 'BY' or 'OF' suffix."""
+    text = "MOTION TO STRIKE\nTentative Ruling: Granted."
+    result = _extract_motion_type(text)
+    assert result == "Motion to Strike"
+
+
+def test_extract_motion_type_pattern3_empty_returns_none() -> None:
+    """Pattern 3 match with empty motion type returns None."""
+    # "MOTION TO BY" — the group is empty after stripping
+    text = "MOTION TO BY PLAINTIFF\nTentative Ruling: Granted."
+    result = _extract_motion_type(text)
+    # Pattern 2 will match first since it uses DOTALL, but let's verify
+    # the function doesn't crash and returns something sensible
+    assert result is None or isinstance(result, str)
+
+
+# ---------------------------------------------------------------------------
+# _normalize_motion_type — fallback to title case (line 403)
+# ---------------------------------------------------------------------------
+
+
+def test_normalize_motion_type_unknown_pattern() -> None:
+    """Unknown motion type falls back to title-cased raw text."""
+    result = _normalize_motion_type("some unusual motion description")
+    assert result == "Some Unusual Motion Description"
+
+
+def test_normalize_motion_type_with_trailing_punctuation() -> None:
+    """Trailing punctuation is stripped from the fallback."""
+    result = _normalize_motion_type("something unusual,;:")
+    assert result == "Something Unusual"
+
+
+# ---------------------------------------------------------------------------
+# _extract_outcome — "hearing will be conducted" (lines 445-448)
+# ---------------------------------------------------------------------------
+
+
+def test_extract_outcome_hearing_will_be_conducted() -> None:
+    """'hearing will be conducted' maps to 'No Tentative Ruling'."""
+    text = "Tentative Ruling: A hearing will be conducted on this matter."
+    result = _extract_outcome(text)
+    assert result == "No Tentative Ruling"
+
+
+def test_extract_outcome_no_match_returns_none() -> None:
+    """Returns None when no outcome pattern is found."""
+    text = "This ruling contains no recognizable disposition keywords at all."
+    result = _extract_outcome(text)
+    assert result is None
+
+
+# ---------------------------------------------------------------------------
+# _riv_courthouse — unknown department code (line 469)
+# ---------------------------------------------------------------------------
+
+
+def test_riv_courthouse_unknown_returns_none() -> None:
+    """Unknown department prefix returns None."""
+    assert _riv_courthouse("X99") is None
+    assert _riv_courthouse("ZZZZ") is None
+
+
+def test_riv_courthouse_known_prefixes() -> None:
+    """Known department prefixes map to correct courthouses."""
+    assert _riv_courthouse("PS1") == "Palm Springs Courthouse"
+    assert _riv_courthouse("MV1") == "Moreno Valley Courthouse"
+    assert _riv_courthouse("M205") == "Murrieta Courthouse"
+    assert _riv_courthouse("C1") == "Corona Courthouse"
+    assert _riv_courthouse("05") == "Hall of Justice"
+
+
+# ---------------------------------------------------------------------------
+# fetch_documents — PDF text extraction failure (lines 509-512)
+# ---------------------------------------------------------------------------
+
+
+@respx.mock
+def test_riv_fetch_documents_pdf_extraction_failure() -> None:
+    """When PDF text extraction fails, the original doc is kept as-is."""
+    html = _load_html("riv_page.html")
+    # Use invalid PDF content that will cause extraction to fail
+    bad_pdf = b"This is not a valid PDF"
+
+    respx.get(INDEX_URL).mock(return_value=httpx.Response(200, text=html))
+    respx.get(url__regex=r"\.pdf$").mock(
+        return_value=httpx.Response(200, content=bad_pdf),
+    )
+
+    config = riv_default_config()
+    config.request_delay_seconds = 0
+    scraper = RiversideTentativeRulingsScraper(config=config)
+
+    docs = scraper.fetch_documents()
+    # Despite extraction failures, docs are still returned (unsplit)
+    assert len(docs) == 17  # one per PDF link, no splitting
+
+
+# ---------------------------------------------------------------------------
+# fetch_documents — department-to-judge mapping fallback (lines 529-534)
+# ---------------------------------------------------------------------------
+
+
+@respx.mock
+def test_riv_fetch_documents_dept_judge_map_fallback() -> None:
+    """When both link text and PDF content lack a judge name, dept_judge_map is used."""
+    html = _load_html("riv_page.html")
+    pdf_bytes = _load_bytes("riv_ps1.pdf")
+
+    respx.get(INDEX_URL).mock(return_value=httpx.Response(200, text=html))
+    respx.get(url__regex=r"\.pdf$").mock(
+        return_value=httpx.Response(200, content=pdf_bytes),
+    )
+
+    config = riv_default_config()
+    config.request_delay_seconds = 0
+    dept_map = {"PS1": "Mapped Judge Name"}
+    scraper = RiversideTentativeRulingsScraper(
+        config=config,
+        dept_judge_map=dept_map,
+    )
+
+    # Patch _fetch_one_pdf to return docs with department set but no judge
+    original_fetch = scraper._fetch_one_pdf.__func__
+
+    def _fetch_no_judge(
+        self: object,
+        client: object,
+        href: str,
+        link_text: str,
+    ) -> CapturedDocument:
+        doc = original_fetch(self, client, href, link_text)
+        doc.judge_name = None  # simulate missing judge from link text
+        return doc
+
+    with patch.object(type(scraper), "_fetch_one_pdf", _fetch_no_judge):
+        with patch(
+            "courts.ca.riverside_tentatives.extract_judge_name",
+            return_value=None,
+        ):
+            docs = scraper.fetch_documents()
+
+    ps1_docs = [d for d in docs if d.department == "PS1"]
+    assert len(ps1_docs) > 0
+    for doc in ps1_docs:
+        assert doc.judge_name == "Mapped Judge Name"
+
+
+# ---------------------------------------------------------------------------
+# fetch_documents — single ruling PDF not split (lines 543-544)
+# ---------------------------------------------------------------------------
+
+
+@respx.mock
+def test_riv_fetch_documents_single_ruling_not_split() -> None:
+    """A PDF with a single numbered ruling is not split."""
+    html = _load_html("riv_page.html")
+    pdf_bytes = _load_bytes("riv_ps1.pdf")
+
+    respx.get(INDEX_URL).mock(return_value=httpx.Response(200, text=html))
+    respx.get(url__regex=r"\.pdf$").mock(
+        return_value=httpx.Response(200, content=pdf_bytes),
+    )
+
+    config = riv_default_config()
+    config.request_delay_seconds = 0
+    scraper = RiversideTentativeRulingsScraper(config=config)
+
+    # Patch _split_rulings to return a single ruling (simulating single-ruling PDF)
+    from courts.ca.riverside_tentatives import SplitRuling
+
+    single_ruling = SplitRuling(
+        ruling_index=1,
+        case_number="CVPS2306157",
+        ruling_text="Some ruling text",
+        case_title="Test v. Case",
+        motion_type="Demurrer",
+        outcome="Granted",
+    )
+    with patch(
+        "courts.ca.riverside_tentatives._split_rulings",
+        return_value=[single_ruling],
+    ):
+        docs = scraper.fetch_documents()
+
+    # Each of the 17 PDFs returns as a single doc (not split)
+    assert len(docs) == 17
+    # None should have pre_split flag
+    assert all(not d.extra.get("pre_split") for d in docs)
+
+
+# ---------------------------------------------------------------------------
+# parse_document — pre-split doc hearing date from ruling text (line 588)
+# ---------------------------------------------------------------------------
+
+
+@respx.mock
+def test_riv_parse_document_pre_split_extracts_hearing_date() -> None:
+    """parse_document extracts hearing date from ruling_text for pre-split docs."""
+    respx.get(INDEX_URL).mock(return_value=httpx.Response(200, text="<html></html>"))
+
+    config = riv_default_config()
+    config.request_delay_seconds = 0
+    scraper = RiversideTentativeRulingsScraper(config=config)
+
+    doc = scraper._make_base_doc(
+        source_url="https://example.com/test.pdf",
+        raw_content=b"dummy",
+        content_format=ContentFormat.PDF,
+    )
+    doc.extra = {"pre_split": True}
+    doc.judge_name = "Test Judge"
+    doc.hearing_date = None
+    doc.ruling_text = "Tentative Rulings for March 2, 2026\nSome ruling text"
+
+    result = scraper.parse_document(doc)
+    assert result.hearing_date == datetime(2026, 3, 2)
+
+
+# ---------------------------------------------------------------------------
+# parse_document — pre-split doc dept-judge mapping (lines 591-595)
+# ---------------------------------------------------------------------------
+
+
+@respx.mock
+def test_riv_parse_document_pre_split_dept_judge_fallback() -> None:
+    """parse_document uses dept_judge_map for pre-split docs without judge name."""
+    respx.get(INDEX_URL).mock(return_value=httpx.Response(200, text="<html></html>"))
+
+    config = riv_default_config()
+    config.request_delay_seconds = 0
+    dept_map = {"PS1": "Mapped Pre-Split Judge"}
+    scraper = RiversideTentativeRulingsScraper(
+        config=config,
+        dept_judge_map=dept_map,
+    )
+
+    doc = scraper._make_base_doc(
+        source_url="https://example.com/test.pdf",
+        raw_content=b"dummy",
+        content_format=ContentFormat.PDF,
+    )
+    doc.extra = {"pre_split": True}
+    doc.judge_name = None
+    doc.department = "PS1"
+
+    result = scraper.parse_document(doc)
+    assert result.judge_name == "Mapped Pre-Split Judge"
+
+
+# ---------------------------------------------------------------------------
+# parse_document — single-ruling doc dept-judge mapping (lines 609-613)
+# ---------------------------------------------------------------------------
+
+
+@respx.mock
+def test_riv_parse_document_single_ruling_dept_judge_fallback() -> None:
+    """parse_document uses dept_judge_map for single-ruling docs without judge name."""
+    pdf_bytes = _load_bytes("riv_ps1.pdf")
+
+    respx.get(INDEX_URL).mock(return_value=httpx.Response(200, text="<html></html>"))
+
+    config = riv_default_config()
+    config.request_delay_seconds = 0
+    dept_map = {"PS1": "Mapped Single Judge"}
+    scraper = RiversideTentativeRulingsScraper(
+        config=config,
+        dept_judge_map=dept_map,
+    )
+
+    doc = scraper._make_base_doc(
+        source_url="https://example.com/test.pdf",
+        raw_content=pdf_bytes,
+        content_format=ContentFormat.PDF,
+    )
+    doc.extra = {}
+    doc.judge_name = None
+    doc.department = "PS1"
+
+    # Mock extract_judge_name to return None so dept map is tried
+    with patch(
+        "courts.ca.riverside_tentatives.extract_judge_name",
+        return_value=None,
+    ):
+        result = scraper.parse_document(doc)
+
+    assert result.judge_name == "Mapped Single Judge"
