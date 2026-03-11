@@ -2224,3 +2224,146 @@ def test_la_dept_map_fetch_failure_degrades_gracefully(
     # No judge resolution should happen
     all_sql = " ".join(str(c) for c in mock_cur.execute.call_args_list)
     assert "INSERT INTO judges" not in all_sql
+
+
+# ---------------------------------------------------------------------------
+# PDF binary preprocessing in process_event
+# ---------------------------------------------------------------------------
+
+
+@patch("ingestion.worker.extract_text_from_pdf")
+@patch("ingestion.worker.is_pdf_binary")
+@patch("ingestion.worker.extract_fields_llm")
+@patch("ingestion.worker.psycopg")
+def test_process_event_extracts_text_from_pdf_binary(
+    mock_psycopg: MagicMock,
+    mock_llm: MagicMock,
+    mock_is_pdf: MagicMock,
+    mock_extract_pdf: MagicMock,
+) -> None:
+    """When ruling_text is raw PDF binary, text is extracted before LLM/regex processing."""
+    worker, os_mock = _make_worker()
+    worker._llm_client = MagicMock()
+
+    mock_conn, mock_cur = _make_mock_conn()
+    mock_psycopg.connect.return_value = mock_conn
+    mock_cur.fetchone.side_effect = [
+        ("court-uuid-1",),  # upsert_court
+        ("case-uuid-1",),  # upsert_case
+        (True,),  # insert_document: RETURNING is_new = True
+        None,  # resolve_judge: no existing alias
+        ("judge-uuid-1",),  # resolve_judge: INSERT INTO judges
+    ]
+    mock_cur.rowcount = 1
+
+    # Simulate raw PDF binary content
+    mock_is_pdf.return_value = True
+    mock_extract_pdf.return_value = "The motion for summary judgment is GRANTED."
+
+    # LLM returns None so regex fallback kicks in
+    mock_llm.return_value = None
+
+    event = _make_event(
+        ruling_text="%PDF-1.4 fake binary content",
+        content_format="pdf",
+        outcome=None,
+        motion_type=None,
+    )
+    worker.process_event(event)
+
+    # PDF binary should have been detected and text extracted
+    mock_is_pdf.assert_called_once()
+    mock_extract_pdf.assert_called_once_with("%PDF-1.4 fake binary content")
+
+    # LLM should receive the extracted text, not raw binary
+    mock_llm.assert_called_once()
+    call_kwargs = mock_llm.call_args
+    assert call_kwargs[1]["document_text"] == "The motion for summary judgment is GRANTED."
+
+    # Ruling should be inserted (regex fallback extracts outcome from extracted text)
+    ruling_calls = [c for c in mock_cur.execute.call_args_list if "INSERT INTO rulings" in str(c)]
+    assert len(ruling_calls) == 1
+
+
+@patch("ingestion.worker.extract_text_from_pdf")
+@patch("ingestion.worker.is_pdf_binary")
+@patch("ingestion.worker.extract_fields_llm")
+@patch("ingestion.worker.psycopg")
+def test_process_event_pdf_extraction_failure_continues(
+    mock_psycopg: MagicMock,
+    mock_llm: MagicMock,
+    mock_is_pdf: MagicMock,
+    mock_extract_pdf: MagicMock,
+) -> None:
+    """When PDF text extraction returns None, processing continues with original text."""
+    worker, os_mock = _make_worker()
+    worker._llm_client = MagicMock()
+
+    mock_conn, mock_cur = _make_mock_conn()
+    mock_psycopg.connect.return_value = mock_conn
+    mock_cur.fetchone.side_effect = [
+        ("court-uuid-1",),  # upsert_court
+        ("case-uuid-1",),  # upsert_case
+        (True,),  # insert_document: RETURNING is_new = True
+        None,  # resolve_judge: no existing alias
+        ("judge-uuid-1",),  # resolve_judge: INSERT INTO judges
+    ]
+    mock_cur.rowcount = 1
+
+    # Simulate PDF extraction failure
+    mock_is_pdf.return_value = True
+    mock_extract_pdf.return_value = None
+
+    # LLM returns None (will fail on binary content anyway)
+    mock_llm.return_value = None
+
+    event = _make_event(
+        ruling_text="%PDF-1.4 corrupt binary",
+        content_format="pdf",
+        outcome=None,
+    )
+    worker.process_event(event)
+
+    # PDF extraction was attempted
+    mock_extract_pdf.assert_called_once()
+
+    # LLM is still called with the original (binary) text since extraction failed
+    mock_llm.assert_called_once()
+
+    # Worker should still commit — event processing doesn't fail
+    mock_conn.commit.assert_called_once()
+
+
+@patch("ingestion.worker.extract_text_from_pdf")
+@patch("ingestion.worker.is_pdf_binary")
+@patch("ingestion.worker.psycopg")
+def test_process_event_non_pdf_skips_pdf_extraction(
+    mock_psycopg: MagicMock,
+    mock_is_pdf: MagicMock,
+    mock_extract_pdf: MagicMock,
+) -> None:
+    """HTML content does not trigger PDF extraction preprocessing."""
+    worker, os_mock = _make_worker()
+
+    mock_conn, mock_cur = _make_mock_conn()
+    mock_psycopg.connect.return_value = mock_conn
+    mock_cur.fetchone.side_effect = [
+        ("court-uuid-1",),  # upsert_court
+        ("case-uuid-1",),  # upsert_case
+        (True,),  # insert_document: RETURNING is_new = True
+        None,  # resolve_judge: no existing alias
+        ("judge-uuid-1",),  # resolve_judge: INSERT INTO judges
+    ]
+    mock_cur.rowcount = 1
+
+    event = _make_event(
+        ruling_text="<html><body>The motion is GRANTED.</body></html>",
+        content_format="html",
+    )
+    worker.process_event(event)
+
+    # PDF binary check should not be called for HTML content
+    mock_is_pdf.assert_not_called()
+    mock_extract_pdf.assert_not_called()
+
+    mock_conn.commit.assert_called_once()
