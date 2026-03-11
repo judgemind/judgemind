@@ -99,23 +99,92 @@ class TestEnsureVenv:
             assert "python3.12 -m venv" in captured.err
             assert "pip install" in captured.err
 
-    def test_calls_execv_when_venv_exists_but_not_active(self, tmp_path: Path) -> None:
-        """ensure_venv should call os.execv when the venv exists but is not active."""
+    def test_uses_subprocess_run_by_default(self, tmp_path: Path) -> None:
+        """ensure_venv should use subprocess.run by default (not os.execv)."""
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop("_VENV_HELPER_SKIP", None)
+            os.environ.pop("_VENV_HELPER_USE_EXECV", None)
 
             # Create a fake venv Python
             fake_venv = tmp_path / "packages" / "test-pkg" / ".venv" / "bin"
             fake_venv.mkdir(parents=True)
             fake_python = fake_venv / "python3"
-            fake_python.write_text("#!/bin/sh\n")  # Just a file, not the real Python
+            fake_python.write_text("#!/bin/sh\n")
 
             with patch("_venv_helper._REPO_ROOT", tmp_path):
-                # Mock _check_venv_has_deps since this test verifies
-                # execv behavior, not dependency checking
+                with patch("_venv_helper._check_venv_has_deps", return_value=True):
+                    mock_result = type("Result", (), {"returncode": 0})()
+                    with patch("subprocess.run", return_value=mock_result) as mock_run:
+                        with pytest.raises(SystemExit) as exc_info:
+                            ensure_venv("test-pkg")
+                        assert exc_info.value.code == 0
+                        mock_run.assert_called_once()
+                        call_args = mock_run.call_args[0][0]
+                        assert call_args[0] == str(fake_python)
+
+    def test_propagates_nonzero_exit_code(self, tmp_path: Path) -> None:
+        """ensure_venv should propagate non-zero exit codes from the subprocess."""
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("_VENV_HELPER_SKIP", None)
+            os.environ.pop("_VENV_HELPER_USE_EXECV", None)
+
+            fake_venv = tmp_path / "packages" / "test-pkg" / ".venv" / "bin"
+            fake_venv.mkdir(parents=True)
+            fake_python = fake_venv / "python3"
+            fake_python.write_text("#!/bin/sh\n")
+
+            with patch("_venv_helper._REPO_ROOT", tmp_path):
+                with patch("_venv_helper._check_venv_has_deps", return_value=True):
+                    mock_result = type("Result", (), {"returncode": 42})()
+                    with patch("subprocess.run", return_value=mock_result):
+                        with pytest.raises(SystemExit) as exc_info:
+                            ensure_venv("test-pkg")
+                        assert exc_info.value.code == 42
+
+    def test_uses_execv_when_env_var_set(self, tmp_path: Path) -> None:
+        """ensure_venv should use os.execv when _VENV_HELPER_USE_EXECV is set."""
+        with patch.dict(os.environ, {"_VENV_HELPER_USE_EXECV": "1"}, clear=False):
+            os.environ.pop("_VENV_HELPER_SKIP", None)
+
+            fake_venv = tmp_path / "packages" / "test-pkg" / ".venv" / "bin"
+            fake_venv.mkdir(parents=True)
+            fake_python = fake_venv / "python3"
+            fake_python.write_text("#!/bin/sh\n")
+
+            with patch("_venv_helper._REPO_ROOT", tmp_path):
                 with patch("_venv_helper._check_venv_has_deps", return_value=True):
                     with patch("os.execv") as mock_execv:
                         ensure_venv("test-pkg")
                         mock_execv.assert_called_once()
                         call_args = mock_execv.call_args[0]
                         assert call_args[0] == str(fake_python)
+
+    def test_subprocess_receives_sys_argv(self, tmp_path: Path) -> None:
+        """ensure_venv should pass sys.argv to the subprocess."""
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("_VENV_HELPER_SKIP", None)
+            os.environ.pop("_VENV_HELPER_USE_EXECV", None)
+
+            fake_venv = tmp_path / "packages" / "test-pkg" / ".venv" / "bin"
+            fake_venv.mkdir(parents=True)
+            fake_python = fake_venv / "python3"
+            fake_python.write_text("#!/bin/sh\n")
+
+            test_argv = ["/some/script.py", "--flag", "value"]
+
+            with patch("_venv_helper._REPO_ROOT", tmp_path):
+                with patch("_venv_helper._check_venv_has_deps", return_value=True):
+                    with patch("sys.argv", test_argv):
+                        mock_result = type("Result", (), {"returncode": 0})()
+                        with patch(
+                            "subprocess.run", return_value=mock_result
+                        ) as mock_run:
+                            with pytest.raises(SystemExit):
+                                ensure_venv("test-pkg")
+                            expected_cmd = [
+                                str(fake_python),
+                                "/some/script.py",
+                                "--flag",
+                                "value",
+                            ]
+                            mock_run.assert_called_once_with(expected_cmd)
