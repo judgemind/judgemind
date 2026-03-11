@@ -240,6 +240,343 @@ class TestReadAgentStatusFiles:
         assert statuses == []
 
 
+# ── Merge agent status into orchestrator ────────────────────────────────
+
+
+class TestMergeAgentStatusIntoOrchestrator:
+    """Tests for merge_agent_status_into_orchestrator()."""
+
+    def test_adds_new_workers_from_agent_status(self) -> None:
+        """Workers in agent-status files but not orchestrator are added."""
+        mod = _import_responder()
+        orch_status = {
+            "active_agents": [
+                {
+                    "worker_number": 1,
+                    "issue_number": 42,
+                    "phase": "ci-watch",
+                    "updated": "2026-03-10T19:00:00Z",
+                }
+            ],
+            "updated_at": "2026-03-10T19:00:00Z",
+        }
+        agent_statuses = [
+            {
+                "worker": "worker-3",
+                "issue": "#99",
+                "phase": "implementing",
+                "updated": "2026-03-10T19:10:00Z",
+                "summary": "Writing tests",
+            }
+        ]
+        result = mod.merge_agent_status_into_orchestrator(orch_status, agent_statuses)
+        agents = result["active_agents"]
+        assert len(agents) == 2
+        # Original agent preserved.
+        assert agents[0]["issue_number"] == 42
+        # New agent added from status file.
+        assert agents[1]["issue_number"] == "#99"
+        assert agents[1]["source"] == "agent-status-file"
+
+    def test_updates_existing_worker_with_fresher_data(self) -> None:
+        """When agent-status file has a more recent timestamp, it wins."""
+        mod = _import_responder()
+        orch_status = {
+            "active_agents": [
+                {
+                    "worker_number": 2,
+                    "issue_number": 42,
+                    "phase": "ci-watch",
+                    "updated": "2026-03-10T19:00:00Z",
+                }
+            ],
+            "updated_at": "2026-03-10T19:00:00Z",
+        }
+        agent_statuses = [
+            {
+                "worker": "worker-2",
+                "issue": "#42",
+                "phase": "merging",
+                "updated": "2026-03-10T19:30:00Z",
+                "summary": "Squash merging PR",
+            }
+        ]
+        result = mod.merge_agent_status_into_orchestrator(orch_status, agent_statuses)
+        agents = result["active_agents"]
+        assert len(agents) == 1
+        assert agents[0]["phase"] == "merging"
+        assert agents[0]["source"] == "agent-status-file"
+        assert agents[0]["summary"] == "Squash merging PR"
+
+    def test_keeps_orchestrator_data_when_fresher(self) -> None:
+        """When orchestrator status is more recent, it is preserved."""
+        mod = _import_responder()
+        orch_status = {
+            "active_agents": [
+                {
+                    "worker_number": 2,
+                    "issue_number": 42,
+                    "phase": "merging",
+                    "updated": "2026-03-10T19:30:00Z",
+                }
+            ],
+            "updated_at": "2026-03-10T19:30:00Z",
+        }
+        agent_statuses = [
+            {
+                "worker": "worker-2",
+                "issue": "#42",
+                "phase": "ci-watch",
+                "updated": "2026-03-10T19:00:00Z",
+                "summary": "Watching CI",
+            }
+        ]
+        result = mod.merge_agent_status_into_orchestrator(orch_status, agent_statuses)
+        agents = result["active_agents"]
+        assert len(agents) == 1
+        assert agents[0]["phase"] == "merging"
+        assert "source" not in agents[0]
+
+    def test_skips_done_workers_not_in_orchestrator(self) -> None:
+        """Workers in 'done' phase from agent-status are not added."""
+        mod = _import_responder()
+        orch_status = {"active_agents": [], "updated_at": "2026-03-10T19:00:00Z"}
+        agent_statuses = [
+            {
+                "worker": "worker-5",
+                "issue": "#99",
+                "phase": "done",
+                "updated": "2026-03-10T19:30:00Z",
+                "summary": "Task complete",
+            }
+        ]
+        result = mod.merge_agent_status_into_orchestrator(orch_status, agent_statuses)
+        assert len(result["active_agents"]) == 0
+
+    def test_staleness_warning_when_old(self) -> None:
+        """A staleness warning is added when status is older than threshold."""
+        mod = _import_responder()
+        # Use an old timestamp (5 minutes ago).
+        old_ts = "2020-01-01T00:00:00Z"
+        orch_status = {
+            "active_agents": [],
+            "updated_at": old_ts,
+        }
+        result = mod.merge_agent_status_into_orchestrator(
+            orch_status, [], staleness_threshold_seconds=60.0
+        )
+        assert "staleness_warning" in result
+        assert "stale" in result["staleness_warning"].lower()
+
+    def test_no_staleness_warning_when_fresh(self) -> None:
+        """No staleness warning when status is recent."""
+        import datetime
+
+        mod = _import_responder()
+        now_ts = datetime.datetime.now(datetime.UTC).isoformat()
+        orch_status = {
+            "active_agents": [],
+            "updated_at": now_ts,
+        }
+        result = mod.merge_agent_status_into_orchestrator(
+            orch_status, [], staleness_threshold_seconds=120.0
+        )
+        assert "staleness_warning" not in result
+
+    def test_does_not_mutate_input(self) -> None:
+        """The original orchestrator_status dict is not modified."""
+        mod = _import_responder()
+        orch_status = {
+            "active_agents": [
+                {
+                    "worker_number": 1,
+                    "issue_number": 42,
+                    "phase": "ci-watch",
+                    "updated": "2026-03-10T19:00:00Z",
+                }
+            ],
+            "updated_at": "2026-03-10T19:00:00Z",
+        }
+        original_agents = list(orch_status["active_agents"])
+        agent_statuses = [
+            {
+                "worker": "worker-3",
+                "issue": "#99",
+                "phase": "implementing",
+                "updated": "2026-03-10T19:10:00Z",
+            }
+        ]
+        mod.merge_agent_status_into_orchestrator(orch_status, agent_statuses)
+        # Original dict should not be modified (active_agents list may be
+        # shallow-copied but original list should have same length).
+        assert len(orch_status["active_agents"]) == len(original_agents)
+
+
+class TestDispatchMessageMergesAgentStatus:
+    """Tests that dispatch_message always merges agent-status files."""
+
+    @respx.mock
+    @patch("tg_responder.interpret_message")
+    def test_merges_agent_status_when_status_file_exists(
+        self, mock_interpret: MagicMock, tmp_path: Path
+    ) -> None:
+        """Agent-status files supplement orchestrator_status.json."""
+        from telegram_bridge.interpreter import InterpretedMessage
+
+        mock_interpret.return_value = InterpretedMessage(
+            reply="Two workers running.",
+            actions=[],
+        )
+        respx.post("https://api.telegram.org/botfake-token/sendMessage").mock(
+            return_value=httpx.Response(200, json={"ok": True})
+        )
+
+        # Write orchestrator status with one worker.
+        status_file = tmp_path / "status.json"
+        status_data = {
+            "active_agents": [
+                {
+                    "worker_number": 1,
+                    "issue_number": 42,
+                    "phase": "ci-watch",
+                    "updated": "2026-03-10T19:00:00Z",
+                }
+            ],
+            "paused": False,
+            "updated_at": "2026-03-10T19:00:00Z",
+        }
+        status_file.write_text(json.dumps(status_data))
+
+        # Write agent-status file for a different worker.
+        agent_dir = tmp_path / "agent-status"
+        agent_dir.mkdir()
+        (agent_dir / "worker-3.txt").write_text(
+            "issue: #99\nphase: implementing\n"
+            "updated: 2026-03-10T19:10:00Z\nsummary: Writing code\n"
+        )
+
+        mod = _import_responder()
+        mod.dispatch_message(
+            message={"text": "status", "user_id": 12345},
+            bot_token="fake-token",
+            chat_ids=[12345],
+            state_file=str(tmp_path / "state.json"),
+            status_file=str(status_file),
+            agent_status_dir=str(agent_dir),
+            stop_requests_file=str(tmp_path / "stop.json"),
+            inbox_file=str(tmp_path / "inbox.json"),
+            anthropic_api_key="test-key",
+        )
+
+        call_kwargs = mock_interpret.call_args.kwargs
+        agents = call_kwargs["orchestrator_status"]["active_agents"]
+        # Should have both workers: one from status file, one from agent-status.
+        assert len(agents) == 2
+        worker_issues = {a.get("issue_number") for a in agents}
+        assert 42 in worker_issues
+        assert "#99" in worker_issues
+
+    @respx.mock
+    @patch("tg_responder.interpret_message")
+    def test_prefers_fresher_agent_status_per_worker(
+        self, mock_interpret: MagicMock, tmp_path: Path
+    ) -> None:
+        """When agent-status file is newer, its phase wins."""
+        from telegram_bridge.interpreter import InterpretedMessage
+
+        mock_interpret.return_value = InterpretedMessage(
+            reply="Worker updated.",
+            actions=[],
+        )
+        respx.post("https://api.telegram.org/botfake-token/sendMessage").mock(
+            return_value=httpx.Response(200, json={"ok": True})
+        )
+
+        # Orchestrator says worker-2 is in ci-watch (old).
+        status_file = tmp_path / "status.json"
+        status_data = {
+            "active_agents": [
+                {
+                    "worker_number": 2,
+                    "issue_number": 42,
+                    "phase": "ci-watch",
+                    "updated": "2026-03-10T19:00:00Z",
+                }
+            ],
+            "paused": False,
+            "updated_at": "2026-03-10T19:00:00Z",
+        }
+        status_file.write_text(json.dumps(status_data))
+
+        # Agent-status says worker-2 is merging (newer).
+        agent_dir = tmp_path / "agent-status"
+        agent_dir.mkdir()
+        (agent_dir / "worker-2.txt").write_text(
+            "issue: #42\nphase: merging\nupdated: 2026-03-10T19:30:00Z\nsummary: Squash merge\n"
+        )
+
+        mod = _import_responder()
+        mod.dispatch_message(
+            message={"text": "what's worker 2 doing?", "user_id": 12345},
+            bot_token="fake-token",
+            chat_ids=[12345],
+            state_file=str(tmp_path / "state.json"),
+            status_file=str(status_file),
+            agent_status_dir=str(agent_dir),
+            stop_requests_file=str(tmp_path / "stop.json"),
+            inbox_file=str(tmp_path / "inbox.json"),
+            anthropic_api_key="test-key",
+        )
+
+        call_kwargs = mock_interpret.call_args.kwargs
+        agents = call_kwargs["orchestrator_status"]["active_agents"]
+        assert len(agents) == 1
+        assert agents[0]["phase"] == "merging"
+
+    @respx.mock
+    @patch("tg_responder.interpret_message")
+    def test_staleness_warning_included_in_context(
+        self, mock_interpret: MagicMock, tmp_path: Path
+    ) -> None:
+        """Stale orchestrator status includes a warning in the context."""
+        from telegram_bridge.interpreter import InterpretedMessage
+
+        mock_interpret.return_value = InterpretedMessage(
+            reply="Status is stale.",
+            actions=[],
+        )
+        respx.post("https://api.telegram.org/botfake-token/sendMessage").mock(
+            return_value=httpx.Response(200, json={"ok": True})
+        )
+
+        # Write orchestrator status with a very old timestamp.
+        status_file = tmp_path / "status.json"
+        status_data = {
+            "active_agents": [],
+            "paused": False,
+            "updated_at": "2020-01-01T00:00:00Z",
+        }
+        status_file.write_text(json.dumps(status_data))
+
+        mod = _import_responder()
+        mod.dispatch_message(
+            message={"text": "status", "user_id": 12345},
+            bot_token="fake-token",
+            chat_ids=[12345],
+            state_file=str(tmp_path / "state.json"),
+            status_file=str(status_file),
+            agent_status_dir=str(tmp_path / "agent-status"),
+            stop_requests_file=str(tmp_path / "stop.json"),
+            inbox_file=str(tmp_path / "inbox.json"),
+            anthropic_api_key="test-key",
+        )
+
+        call_kwargs = mock_interpret.call_args.kwargs
+        status = call_kwargs["orchestrator_status"]
+        assert "staleness_warning" in status
+        assert "stale" in status["staleness_warning"].lower()
+
+
 # ── Status command ──────────────────────────────────────────────────────
 
 
