@@ -337,7 +337,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: coverage-lambda-${{ matrix.lambda-dir }}
+          name: coverage-lambda-telegram-bot
           path: ${{ matrix.lambda-dir }}/coverage.xml
 
   # Always runs. Reports success only when every applicable job passed or was
