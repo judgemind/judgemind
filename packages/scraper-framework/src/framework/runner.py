@@ -58,6 +58,8 @@ def _build_registry() -> list[tuple[str, type, callable]]:
     from courts.ca.sc_tentatives import default_config as sc_config
     from courts.ca.sf_tentatives import SFTentativeRulingsScraper
     from courts.ca.sf_tentatives import default_config as sf_config
+    from courts.ca.ventura_tentatives import VenturaTentativeRulingsScraper
+    from courts.ca.ventura_tentatives import default_config as ventura_config
 
     _REGISTRY.extend(
         [
@@ -69,6 +71,7 @@ def _build_registry() -> list[tuple[str, type, callable]]:
             ("ca-sb-tentatives", SBTentativeRulingsScraper, sb_config),
             ("ca-sc-tentatives", SCTentativeRulingsScraper, sc_config),
             ("ca-sf-tentatives-family-law", SFTentativeRulingsScraper, sf_config),
+            ("ca-ventura-tentatives", VenturaTentativeRulingsScraper, ventura_config),
         ]
     )
     return _REGISTRY
