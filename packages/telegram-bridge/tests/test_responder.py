@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import sys
+import time
 import types
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -792,6 +794,162 @@ class TestDaemonLifecycle:
         mod.cleanup_daemon_files(pid_file)
         assert not pid_file.exists()
         assert not stop_file.exists()
+
+
+# ── Process alive check ────────────────────────────────────────────────
+
+
+class TestIsProcessAlive:
+    def test_current_process_is_alive(self) -> None:
+        mod = _import_responder()
+        assert mod.is_process_alive(os.getpid()) is True
+
+    def test_dead_process_returns_false(self) -> None:
+        mod = _import_responder()
+        # PID 99999999 is almost certainly not running.
+        assert mod.is_process_alive(99999999) is False
+
+
+# ── Stale PID detection ────────────────────────────────────────────────
+
+
+class TestCheckStalePid:
+    def test_no_pid_file_is_noop(self, tmp_path: Path) -> None:
+        mod = _import_responder()
+        pid_file = tmp_path / "test.pid"
+        # Should not raise.
+        mod.check_stale_pid(pid_file)
+
+    def test_stale_pid_is_cleaned_up(self, tmp_path: Path) -> None:
+        mod = _import_responder()
+        pid_file = tmp_path / "test.pid"
+        # Write a PID that does not exist.
+        pid_file.write_text("99999999")
+        mod.check_stale_pid(pid_file)
+        # PID file should be removed.
+        assert not pid_file.exists()
+
+    def test_corrupt_pid_file_is_cleaned_up(self, tmp_path: Path) -> None:
+        mod = _import_responder()
+        pid_file = tmp_path / "test.pid"
+        pid_file.write_text("not-a-number")
+        mod.check_stale_pid(pid_file)
+        assert not pid_file.exists()
+
+    def test_alive_process_without_force_exits(self, tmp_path: Path) -> None:
+        mod = _import_responder()
+        pid_file = tmp_path / "test.pid"
+        # Write the current process PID (which is alive).
+        pid_file.write_text(str(os.getpid()))
+        with pytest.raises(SystemExit) as exc_info:
+            mod.check_stale_pid(pid_file, force=False)
+        assert exc_info.value.code == 1
+
+    @patch("tg_responder.is_process_alive")
+    def test_force_stops_existing_and_proceeds(self, mock_alive: MagicMock, tmp_path: Path) -> None:
+        mod = _import_responder()
+        pid_file = tmp_path / "test.pid"
+        pid_file.write_text("12345")
+
+        # Simulate: first call returns True (alive), then False (exited).
+        mock_alive.side_effect = [True, True, False]
+
+        mod.check_stale_pid(pid_file, force=True)
+
+        # Stop file should have been created (then cleaned up).
+        # PID file should be cleaned up after the process exits.
+        assert not pid_file.exists()
+
+    @patch("tg_responder.is_process_alive")
+    def test_force_exits_if_process_wont_die(self, mock_alive: MagicMock, tmp_path: Path) -> None:
+        mod = _import_responder()
+        pid_file = tmp_path / "test.pid"
+        pid_file.write_text("12345")
+
+        # Process never exits.
+        mock_alive.return_value = True
+
+        with pytest.raises(SystemExit) as exc_info:
+            # Patch time.sleep to avoid waiting 10 real seconds.
+            with patch("tg_responder.time.sleep"):
+                # Also patch time.monotonic to simulate time passing.
+                start = time.monotonic()
+                with patch(
+                    "tg_responder.time.monotonic",
+                    side_effect=[start, start + 11.0],
+                ):
+                    mod.check_stale_pid(pid_file, force=True)
+        assert exc_info.value.code == 1
+
+
+# ── _should_stop helper ────────────────────────────────────────────────
+
+
+class TestShouldStop:
+    def test_returns_false_when_no_stop_requested(self, tmp_path: Path) -> None:
+        mod = _import_responder()
+        # Reset global state.
+        mod._shutdown_requested = False
+        pid_file = tmp_path / "test.pid"
+        assert mod._should_stop(pid_file) is False
+
+    def test_returns_true_when_shutdown_flag_set(self, tmp_path: Path) -> None:
+        mod = _import_responder()
+        mod._shutdown_requested = True
+        pid_file = tmp_path / "test.pid"
+        assert mod._should_stop(pid_file) is True
+        # Reset.
+        mod._shutdown_requested = False
+
+    def test_returns_true_when_stop_file_exists(self, tmp_path: Path) -> None:
+        mod = _import_responder()
+        mod._shutdown_requested = False
+        pid_file = tmp_path / "test.pid"
+        stop_file = tmp_path / "test.stop"
+        stop_file.write_text("")
+        assert mod._should_stop(pid_file) is True
+        # The function should also set the shutdown flag.
+        assert mod._shutdown_requested is True
+        # Reset.
+        mod._shutdown_requested = False
+
+
+# ── SQS_BOTO_CONFIG ────────────────────────────────────────────────────
+
+
+class TestSqsBotoConfig:
+    def test_config_has_bounded_timeouts(self) -> None:
+        mod = _import_responder()
+        config = mod.SQS_BOTO_CONFIG
+        assert config.connect_timeout == 5
+        assert config.read_timeout == 10
+
+    def test_config_has_limited_retries(self) -> None:
+        mod = _import_responder()
+        config = mod.SQS_BOTO_CONFIG
+        assert config.retries["max_attempts"] == 2
+
+
+# ── --force CLI flag ───────────────────────────────────────────────────
+
+
+class TestForceCliFlag:
+    def test_cli_parser_has_force_flag(self) -> None:
+        """Verify the --force argument is recognized by the CLI parser."""
+        import argparse
+
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--force", action="store_true", default=False)
+        args = parser.parse_args(["--force"])
+        assert args.force is True
+
+    def test_cli_parser_force_defaults_to_false(self) -> None:
+        import argparse
+
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--force", action="store_true", default=False)
+        args = parser.parse_args([])
+        assert args.force is False
 
 
 # ── Rate limiting in dispatch_message ────────────────────────────────

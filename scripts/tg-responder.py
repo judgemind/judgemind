@@ -18,8 +18,13 @@ To stop the daemon gracefully, create the stop file::
 
     touch tmp/tg_responder.stop
 
-The daemon checks for the stop file each iteration and exits, cleaning up
-both the PID file and the stop file.
+The daemon checks for the stop file frequently — before and after every
+network call, and during the sleep interval — so it responds within a few
+seconds even during error retry loops.
+
+If a daemon is already running, the script refuses to start (prints an
+error).  Use ``--force`` to request the existing daemon to shut down (via
+the stop file) and wait up to 10 seconds before starting a new one.
 
 Environment:
     AWS credentials must be available (profile, env vars, or instance role).
@@ -52,6 +57,7 @@ from typing import Any
 try:
     import boto3
     import httpx
+    from botocore.config import Config as BotoConfig
 except ModuleNotFoundError as exc:
     _pkg_dir = Path(__file__).resolve().parents[1] / "packages" / "telegram-bridge"
     print(
@@ -60,7 +66,7 @@ except ModuleNotFoundError as exc:
         f"The telegram-bridge venv exists but is missing required packages.\n"
         f"Install them with:\n"
         f"\n"
-        f"    {_pkg_dir}/.venv/bin/pip install -e \"{_pkg_dir}[dev]\" --quiet\n",
+        f'    {_pkg_dir}/.venv/bin/pip install -e "{_pkg_dir}[dev]" --quiet\n',
         file=sys.stderr,
     )
     sys.exit(1)
@@ -86,7 +92,7 @@ except ModuleNotFoundError as exc:
         f"The telegram-bridge package is not installed in the venv.\n"
         f"Install it with:\n"
         f"\n"
-        f"    {_pkg_dir2}/.venv/bin/pip install -e \"{_pkg_dir2}[dev]\" --quiet\n",
+        f'    {_pkg_dir2}/.venv/bin/pip install -e "{_pkg_dir2}[dev]" --quiet\n',
         file=sys.stderr,
     )
     sys.exit(1)
@@ -665,6 +671,86 @@ def _handle_signal(signum: int, _frame: object) -> None:
     _shutdown_requested = True
 
 
+def is_process_alive(pid: int) -> bool:
+    """Check whether a process with the given PID is still running.
+
+    Uses ``os.kill(pid, 0)`` which checks process existence without
+    sending a signal.  Returns ``False`` for stale PIDs or permission
+    errors (the process belongs to a different user, which means it's
+    not our daemon).
+    """
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # Process exists but belongs to another user — not our daemon.
+        return False
+    return True
+
+
+def check_stale_pid(pid_file: Path, *, force: bool = False) -> None:
+    """Check for an existing PID file and handle stale/active processes.
+
+    If a PID file exists:
+      - If the process is still alive and ``force`` is False, raise
+        ``SystemExit`` with a clear error message.
+      - If the process is still alive and ``force`` is True, write the
+        stop file and wait up to 10 seconds for it to exit.  If it
+        doesn't exit, raise ``SystemExit``.
+      - If the process is dead (stale PID), clean up and proceed.
+
+    Args:
+        pid_file: Path to the PID file (e.g. ``tmp/tg_responder.pid``).
+        force: If ``True``, attempt to stop the existing process via the
+            stop file before starting.
+    """
+    if not pid_file.exists():
+        return
+
+    try:
+        old_pid = int(pid_file.read_text().strip())
+    except (ValueError, OSError):
+        # Corrupt or unreadable PID file — clean up and proceed.
+        logger.warning("Corrupt PID file %s — removing.", pid_file)
+        cleanup_daemon_files(pid_file)
+        return
+
+    if not is_process_alive(old_pid):
+        logger.info("Stale PID file (pid %d is dead) — cleaning up.", old_pid)
+        cleanup_daemon_files(pid_file)
+        return
+
+    # Process is alive.
+    if not force:
+        logger.error(
+            "Another responder is already running (pid %d). "
+            "Use --force to stop it and start a new one.",
+            old_pid,
+        )
+        raise SystemExit(1)
+
+    # Force mode: write stop file and wait.
+    stop_path = pid_file.with_suffix(".stop")
+    logger.info("Force mode: requesting shutdown of existing daemon (pid %d).", old_pid)
+    stop_path.write_text("")
+
+    deadline = time.monotonic() + 10.0
+    while time.monotonic() < deadline:
+        if not is_process_alive(old_pid):
+            logger.info("Old daemon (pid %d) has exited.", old_pid)
+            cleanup_daemon_files(pid_file)
+            return
+        time.sleep(0.5)
+
+    logger.error(
+        "Old daemon (pid %d) did not exit within 10 seconds. "
+        "Cannot start — manual intervention required.",
+        old_pid,
+    )
+    raise SystemExit(1)
+
+
 def write_pid_file(path: Path) -> None:
     """Write the current PID to *path*."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -700,6 +786,34 @@ def cleanup_daemon_files(pid_file: Path) -> None:
 # ── Main daemon loop ────────────────────────────────────────────────────
 
 
+def _should_stop(pid_file: Path) -> bool:
+    """Return ``True`` if shutdown has been requested (signal or stop file).
+
+    Checks both the global ``_shutdown_requested`` flag (set by signal
+    handlers) and the stop file.  This function is designed to be called
+    frequently — before and after every network call — so the daemon
+    stays responsive to shutdown requests even during error retry loops.
+    """
+    global _shutdown_requested  # noqa: PLW0603
+    if _shutdown_requested:
+        return True
+    if check_stop_file(pid_file):
+        _shutdown_requested = True
+        return True
+    return False
+
+
+# Botocore configuration with bounded timeouts so the daemon stays
+# responsive to shutdown requests even when the network is unreliable.
+# Default botocore retries can block for 30s+; these settings cap each
+# SQS call to ~15s worst-case (2 attempts * (5s connect + 10s read) / 2).
+SQS_BOTO_CONFIG = BotoConfig(
+    connect_timeout=5,
+    read_timeout=10,
+    retries={"max_attempts": 2, "mode": "standard"},
+)
+
+
 def run_daemon(
     *,
     pid_file: Path,
@@ -716,6 +830,7 @@ def run_daemon(
     no_llm: bool = False,
     rate_limit_calls: int = 20,
     rate_limit_window: float = 60.0,
+    force: bool = False,
 ) -> None:
     """Main daemon loop: poll SQS, interpret messages via Claude, repeat.
 
@@ -724,11 +839,15 @@ def run_daemon(
             Messages are queued with a simple acknowledgment instead.
         rate_limit_calls: Max Claude API calls within the rate limit window.
         rate_limit_window: Rate limit window duration in seconds.
+        force: If ``True``, stop any existing daemon process before starting.
     """
     global _shutdown_requested  # noqa: PLW0603
 
     signal.signal(signal.SIGTERM, _handle_signal)
     signal.signal(signal.SIGINT, _handle_signal)
+
+    # Check for stale or active PID file before starting.
+    check_stale_pid(pid_file, force=force)
 
     write_pid_file(pid_file)
 
@@ -770,12 +889,19 @@ def run_daemon(
         chat_ids,
     )
 
-    sqs = boto3.client("sqs", region_name=region)
+    # Use bounded timeouts so the daemon stays responsive during errors.
+    sqs = boto3.client("sqs", region_name=region, config=SQS_BOTO_CONFIG)
 
     try:
-        while not _shutdown_requested:
+        while not _should_stop(pid_file):
             try:
                 messages = poll_sqs(sqs, queue_url)
+
+                # Check for stop between poll and dispatch — the poll
+                # itself may have taken several seconds if retrying.
+                if _should_stop(pid_file):
+                    break
+
                 for msg in messages:
                     dispatch_message(
                         message=msg,
@@ -789,7 +915,11 @@ def run_daemon(
                         anthropic_api_key=anthropic_api_key,
                         rate_limiter=limiter,
                     )
-                if messages:
+                    # Check for stop between each message dispatch.
+                    if _should_stop(pid_file):
+                        break
+
+                if messages and not _shutdown_requested:
                     logger.info("Processed %d message(s).", len(messages))
             except Exception:
                 logger.warning("Poll cycle failed", exc_info=True)
@@ -883,6 +1013,12 @@ def main() -> None:
         default=60.0,
         help="Rate limit window duration in seconds (default: 60)",
     )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        default=False,
+        help="Stop any existing daemon process before starting (waits up to 10s)",
+    )
     args = parser.parse_args()
 
     run_daemon(
@@ -900,6 +1036,7 @@ def main() -> None:
         no_llm=args.no_llm,
         rate_limit_calls=args.rate_limit_calls,
         rate_limit_window=args.rate_limit_window,
+        force=args.force,
     )
 
 
