@@ -39,6 +39,11 @@ Closes: #424
 
 from __future__ import annotations
 
+# Ensure we are running inside the scraper-framework venv (re-execs if not).
+from _venv_helper import ensure_venv
+
+ensure_venv("scraper-framework")
+
 import argparse
 import logging
 import os

@@ -281,6 +281,21 @@ See `docs/telegram-setup.md` for end-to-end setup instructions.
 - Dependencies managed via pyproject.toml
 - Async where appropriate (httpx for HTTP, playwright for browser automation)
 
+### Python scripts (`scripts/*.py`)
+
+Scripts in `scripts/` that import non-stdlib modules (e.g. `psycopg`, `boto3`, `httpx`) must use the `_venv_helper` module to auto-detect and activate the correct package venv. Add this at the top of the script, **before** any non-stdlib imports:
+
+```python
+from _venv_helper import ensure_venv
+ensure_venv("scraper-framework")  # or "telegram-bridge", etc.
+```
+
+When a script is run with system Python (or any Python other than the target venv), `ensure_venv` will automatically re-exec it with the correct venv Python via `os.execv`. If the venv does not exist, it prints a clear error with setup instructions and exits.
+
+- Set `_VENV_HELPER_SKIP=1` in tests or containers where deps are already available.
+- Scripts that only use stdlib modules do not need `ensure_venv`.
+- Eval scripts (`scripts/eval/`) document their requirements in comments and are excluded from this convention since they don't correspond to a specific package venv.
+
 ### TypeScript (API, frontend)
 
 - Strict mode always
