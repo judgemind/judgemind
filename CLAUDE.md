@@ -473,6 +473,18 @@ These patterns avoid permission prompts and allow the agent to run without inter
 
 ## Session Triggers
 
+### Handling system tags in user message turns
+
+**Task notifications and system reminders are system events, not user responses.** Messages tagged with `<task-notification>` or `<system-reminder>` are injected into the user's message turn by the platform — the user did not type them and may not even be aware they arrived.
+
+When one of these tags arrives and you have a **pending question or decision waiting on the user**:
+
+1. **Do not treat the notification as the user's answer.** The user has not responded yet.
+2. **Acknowledge the notification in one line** (e.g. "Task #N completed successfully.") and then **continue waiting for the user's actual response** to your pending question. Do not launch into a full status report, re-summarize the conversation, or take new actions that change the conversational context.
+3. **Do not re-ask the pending question** — it is already on screen. Simply state that you are still waiting for the user's input on it.
+
+This applies equally to `<task-notification>` (background agent completions/failures) and `<system-reminder>` (context refreshes, memory updates). Neither constitutes user input. Treat them as informational side-channels and preserve the primary conversational flow.
+
 - When the user asks to pick up work (e.g. "let's go", "start", "pick up a task"), invoke `/task` as a background subagent. It handles everything autonomously.
 - **Telegram commands** are another inbound channel. When the bridge is configured, call `start_polling()` to auto-poll for Telegram messages in the background, then call `drain_pending_commands()` between tasks to retrieve accumulated commands. A `start #N` command is equivalent to the user typing `/task #N`. See the "Telegram Integration" subsection below.
 - If the user asks to explore, investigate, or prototype — do it in `tmp/` and file issues for any real work identified.
