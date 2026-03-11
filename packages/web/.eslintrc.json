@@ -1,3 +1,15 @@
 {
-  "extends": "next/core-web-vitals"
+  "extends": "next/core-web-vitals",
+  "plugins": ["local"],
+  "rules": {
+    "local/no-client-utility-import": "warn"
+  },
+  "overrides": [
+    {
+      "files": ["**/__tests__/**", "**/*.test.ts", "**/*.test.tsx", "tests/**"],
+      "rules": {
+        "local/no-client-utility-import": "off"
+      }
+    }
+  ]
 }
