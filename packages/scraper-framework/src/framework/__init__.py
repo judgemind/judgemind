@@ -1,6 +1,7 @@
 """Judgemind scraper framework — public API."""
 
 from .base import BaseScraper
+from .court_directory import CourtDirectory
 from .event_bus import RedisEventBus
 from .events import EventBus
 from .hashing import content_changed, sha256_hex
@@ -21,6 +22,7 @@ from .storage import S3Archiver, build_s3_key
 
 __all__ = [
     "BaseScraper",
+    "CourtDirectory",
     "CapturedDocument",
     "ContentFormat",
     "DocumentCapturedEvent",
