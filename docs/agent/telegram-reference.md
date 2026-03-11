@@ -33,7 +33,7 @@ When Telegram is configured (bot token in Secrets Manager `judgemind/telegram/bo
 
 **Inbound messages:** All Telegram messages are interpreted as free text by a Claude API call (Haiku) in the responder daemon. The daemon responds directly with natural-language replies and extracts actionable commands (start, pause, resume, stop) for the orchestrator. No special command syntax is required — users can write naturally.
 
-The orchestrator still uses `bridge.start_polling(interval=30)` or `bridge.drain_pending_commands()` to pick up commands from the inbox file. The responder daemon handles the interpretation and reply, so the orchestrator only sees pre-parsed actions.
+The orchestrator uses `bridge.read_inbox()` to pick up commands from the file-based inbox. The responder daemon handles the interpretation and reply, so the orchestrator only sees pre-parsed actions.
 
 If Telegram is not configured, all bridge calls are silent no-ops. No existing workflows are affected.
 
@@ -63,7 +63,7 @@ The standalone **responder daemon** (`scripts/tg-responder.py`) interprets all T
 3. Call `bridge.read_stop_requests()` to consume new stop requests.
 4. Check `bridge.paused` — if `True`, skip spawning.
 5. Before spawning issue `#N`, check `bridge.is_issue_stopped(N)` — if `True`, skip it.
-6. Call `bridge.read_inbox()` or `bridge.drain_pending_commands()` to get inbound `start` commands.
+6. Call `bridge.read_inbox()` to get inbound `start` commands.
 
 **Secrets required:**
 - `judgemind/telegram/bot` — bot token and allowed user IDs (existing)
