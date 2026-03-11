@@ -20,7 +20,7 @@ import anthropic
 logger = logging.getLogger(__name__)
 
 # The model to use for interpretation.  Haiku is fast and cheap.
-_DEFAULT_MODEL = "claude-haiku-4-5-20250514"
+_DEFAULT_MODEL = "claude-haiku-4-5-20251001"
 
 # Maximum tokens for the interpreter response.
 _MAX_TOKENS = 512
