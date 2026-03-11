@@ -256,6 +256,45 @@ export const typeDefs = `#graphql
   }
 
   # ---------------------------------------------------------------------------
+  # Data Quality Metrics — admin-only monitoring dashboard
+  # ---------------------------------------------------------------------------
+
+  """A single data quality metric measurement."""
+  type DataQualityMetric {
+    id: ID!
+    recordedAt: String!
+    county: String!
+    metricName: String!
+    metricValue: Float!
+    metadata: String
+  }
+
+  """Per-county health status overview computed from latest metrics."""
+  type DataQualityOverview {
+    county: String!
+    """One of: green, yellow, red."""
+    healthStatus: String!
+    """Number of rulings ingested in the last 24 hours."""
+    rulingCount24h: Float
+    """Percentage of required fields populated (0-100)."""
+    fieldCompletenessPct: Float
+    """Hours since last successful scraper run."""
+    scraperLastSuccessAgeHours: Float
+    """When the latest metric for this county was recorded."""
+    lastUpdated: String
+  }
+
+  type DataQualityMetricEdge {
+    node: DataQualityMetric!
+    cursor: String!
+  }
+
+  type DataQualityMetricConnection {
+    edges: [DataQualityMetricEdge!]!
+    pageInfo: PageInfo!
+  }
+
+  # ---------------------------------------------------------------------------
   # Queries
   # ---------------------------------------------------------------------------
 
@@ -337,6 +376,27 @@ export const typeDefs = `#graphql
 
     """List the authenticated user's alert subscriptions, newest first."""
     myAlerts: [AlertSubscription!]!
+
+    """Time-series data quality metrics with filtering. Admin only.
+    Returns metrics ordered by recorded_at DESC with keyset pagination."""
+    dataQualityMetrics(
+      """Filter by county name."""
+      county: String
+      """Filter by metric name (e.g. ruling_count_24h, field_completeness_pct)."""
+      metricName: String
+      """Start of time range (ISO 8601). Required."""
+      startDate: String!
+      """End of time range (ISO 8601). Required."""
+      endDate: String!
+      """Max results (default 20, max 100)."""
+      first: Int
+      """Opaque cursor from a previous response's pageInfo.endCursor."""
+      after: String
+    ): DataQualityMetricConnection!
+
+    """Per-county health status overview. Admin only.
+    Computes green/yellow/red status from the latest metrics for each county."""
+    dataQualityOverview: [DataQualityOverview!]!
   }
 
   # ---------------------------------------------------------------------------

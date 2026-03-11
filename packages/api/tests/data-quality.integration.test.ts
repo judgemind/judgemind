@@ -1,0 +1,348 @@
+/**
+ * Integration tests for data quality metrics GraphQL resolvers.
+ *
+ * Tests both dataQualityMetrics and dataQualityOverview queries against a
+ * real PostgreSQL database. Verifies admin-only access, filtering, pagination,
+ * and health status computation.
+ */
+
+import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { Pool, types } from 'pg';
+import type { FastifyInstance } from 'fastify';
+import { buildApp } from '../src/app';
+import { applyMigrations } from './setup-db';
+import { signAccessToken } from '../src/auth';
+
+// Match type parsers from src/data-access/db.ts
+types.setTypeParser(1082, (val: string) => val);
+types.setTypeParser(1114, (val: string) => val);
+types.setTypeParser(1184, (val: string) => val);
+
+const pool = new Pool({
+  connectionString:
+    process.env.DATABASE_URL ?? 'postgresql://judgemind:localdev@localhost:5432/judgemind',
+});
+
+let app: FastifyInstance;
+let adminToken: string;
+let userToken: string;
+let adminUserId: string;
+let regularUserId: string;
+const insertedMetricIds: string[] = [];
+
+async function seedData(): Promise<void> {
+  // Create admin user
+  const { rows: adminRows } = await pool.query<{ id: string }>(
+    `INSERT INTO users (email, email_verified, role, password_hash)
+     VALUES ('dq-admin@test.com', true, 'admin', 'not-a-real-hash')
+     RETURNING id`,
+  );
+  adminUserId = adminRows[0].id;
+  adminToken = signAccessToken({ sub: adminUserId, email: 'dq-admin@test.com', role: 'admin' });
+
+  // Create regular user
+  const { rows: userRows } = await pool.query<{ id: string }>(
+    `INSERT INTO users (email, email_verified, role, password_hash)
+     VALUES ('dq-user@test.com', true, 'user', 'not-a-real-hash')
+     RETURNING id`,
+  );
+  regularUserId = userRows[0].id;
+  userToken = signAccessToken({ sub: regularUserId, email: 'dq-user@test.com', role: 'user' });
+
+  // Insert data quality metrics
+  const metricsData = [
+    // Los Angeles metrics — healthy
+    { county: 'Los Angeles', metric_name: 'ruling_count_24h', metric_value: 42, recorded_at: '2026-03-01T10:00:00Z' },
+    { county: 'Los Angeles', metric_name: 'field_completeness_pct', metric_value: 95, recorded_at: '2026-03-01T10:00:00Z' },
+    { county: 'Los Angeles', metric_name: 'scraper_last_success_age_hours', metric_value: 2, recorded_at: '2026-03-01T10:00:00Z' },
+    // Orange metrics — degraded (yellow)
+    { county: 'Orange', metric_name: 'ruling_count_24h', metric_value: 5, recorded_at: '2026-03-01T10:00:00Z' },
+    { county: 'Orange', metric_name: 'field_completeness_pct', metric_value: 80, recorded_at: '2026-03-01T10:00:00Z' },
+    { county: 'Orange', metric_name: 'scraper_last_success_age_hours', metric_value: 3, recorded_at: '2026-03-01T10:00:00Z' },
+    // San Diego metrics — unhealthy (red: scraper down)
+    { county: 'San Diego', metric_name: 'ruling_count_24h', metric_value: 0, recorded_at: '2026-03-01T10:00:00Z' },
+    { county: 'San Diego', metric_name: 'scraper_last_success_age_hours', metric_value: 48, recorded_at: '2026-03-01T10:00:00Z' },
+    // Older LA metric (for time range filtering test)
+    { county: 'Los Angeles', metric_name: 'ruling_count_24h', metric_value: 30, recorded_at: '2026-02-01T10:00:00Z' },
+  ];
+
+  for (const m of metricsData) {
+    const { rows } = await pool.query<{ id: string }>(
+      `INSERT INTO data_quality_metrics (county, metric_name, metric_value, recorded_at)
+       VALUES ($1, $2, $3, $4::timestamptz)
+       RETURNING id`,
+      [m.county, m.metric_name, m.metric_value, m.recorded_at],
+    );
+    insertedMetricIds.push(rows[0].id);
+  }
+}
+
+async function cleanupData(): Promise<void> {
+  for (const id of insertedMetricIds) {
+    await pool.query(`DELETE FROM data_quality_metrics WHERE id = $1`, [id]);
+  }
+  if (adminUserId) {
+    await pool.query(`DELETE FROM users WHERE id = $1`, [adminUserId]);
+  }
+  if (regularUserId) {
+    await pool.query(`DELETE FROM users WHERE id = $1`, [regularUserId]);
+  }
+}
+
+beforeAll(async () => {
+  applyMigrations();
+  await seedData();
+  app = await buildApp(pool);
+}, 30_000);
+
+afterAll(async () => {
+  await app?.close();
+  await cleanupData();
+  await pool.end();
+}, 15_000);
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+async function gql(
+  query: string,
+  variables?: Record<string, unknown>,
+  token?: string,
+) {
+  const headers: Record<string, string> = { 'content-type': 'application/json' };
+  if (token) {
+    headers.authorization = `Bearer ${token}`;
+  }
+  const res = await app.inject({
+    method: 'POST',
+    url: '/graphql',
+    headers,
+    payload: JSON.stringify({ query, variables }),
+  });
+  return JSON.parse(res.body) as { data?: Record<string, unknown>; errors?: Array<{ message: string; extensions?: { code: string } }> };
+}
+
+// ---------------------------------------------------------------------------
+// Tests — dataQualityMetrics
+// ---------------------------------------------------------------------------
+
+describe('dataQualityMetrics', () => {
+  it('rejects unauthenticated requests', async () => {
+    const body = await gql(`{
+      dataQualityMetrics(startDate: "2026-01-01T00:00:00Z", endDate: "2026-12-31T23:59:59Z") {
+        edges { node { id } }
+        pageInfo { hasNextPage }
+      }
+    }`);
+    expect(body.errors).toBeDefined();
+    expect(body.errors![0].extensions?.code).toBe('UNAUTHENTICATED');
+  });
+
+  it('rejects non-admin users', async () => {
+    const body = await gql(
+      `{
+        dataQualityMetrics(startDate: "2026-01-01T00:00:00Z", endDate: "2026-12-31T23:59:59Z") {
+          edges { node { id } }
+          pageInfo { hasNextPage }
+        }
+      }`,
+      undefined,
+      userToken,
+    );
+    expect(body.errors).toBeDefined();
+    expect(body.errors![0].extensions?.code).toBe('FORBIDDEN');
+  });
+
+  it('returns metrics for admin users', async () => {
+    const body = await gql(
+      `{
+        dataQualityMetrics(startDate: "2026-01-01T00:00:00Z", endDate: "2026-12-31T23:59:59Z") {
+          edges { node { id county metricName metricValue recordedAt } cursor }
+          pageInfo { hasNextPage endCursor }
+        }
+      }`,
+      undefined,
+      adminToken,
+    );
+    expect(body.errors).toBeUndefined();
+    const conn = body.data?.dataQualityMetrics as Record<string, unknown>;
+    const edges = conn.edges as Array<{ node: Record<string, unknown>; cursor: string }>;
+    expect(edges.length).toBeGreaterThan(0);
+    // Check that results have the expected shape
+    const firstNode = edges[0].node;
+    expect(firstNode).toHaveProperty('id');
+    expect(firstNode).toHaveProperty('county');
+    expect(firstNode).toHaveProperty('metricName');
+    expect(firstNode).toHaveProperty('metricValue');
+    expect(firstNode).toHaveProperty('recordedAt');
+    expect(typeof edges[0].cursor).toBe('string');
+  });
+
+  it('filters by county', async () => {
+    const body = await gql(
+      `{
+        dataQualityMetrics(
+          county: "Los Angeles"
+          startDate: "2026-01-01T00:00:00Z"
+          endDate: "2026-12-31T23:59:59Z"
+        ) {
+          edges { node { county } }
+          pageInfo { hasNextPage }
+        }
+      }`,
+      undefined,
+      adminToken,
+    );
+    expect(body.errors).toBeUndefined();
+    const conn = body.data?.dataQualityMetrics as Record<string, unknown>;
+    const edges = conn.edges as Array<{ node: { county: string } }>;
+    expect(edges.length).toBeGreaterThan(0);
+    edges.forEach((e) => expect(e.node.county).toBe('Los Angeles'));
+  });
+
+  it('filters by metricName', async () => {
+    const body = await gql(
+      `{
+        dataQualityMetrics(
+          metricName: "ruling_count_24h"
+          startDate: "2026-01-01T00:00:00Z"
+          endDate: "2026-12-31T23:59:59Z"
+        ) {
+          edges { node { metricName } }
+          pageInfo { hasNextPage }
+        }
+      }`,
+      undefined,
+      adminToken,
+    );
+    expect(body.errors).toBeUndefined();
+    const conn = body.data?.dataQualityMetrics as Record<string, unknown>;
+    const edges = conn.edges as Array<{ node: { metricName: string } }>;
+    expect(edges.length).toBeGreaterThan(0);
+    edges.forEach((e) => expect(e.node.metricName).toBe('ruling_count_24h'));
+  });
+
+  it('filters by time range', async () => {
+    const body = await gql(
+      `{
+        dataQualityMetrics(
+          county: "Los Angeles"
+          metricName: "ruling_count_24h"
+          startDate: "2026-02-15T00:00:00Z"
+          endDate: "2026-12-31T23:59:59Z"
+        ) {
+          edges { node { metricValue } }
+          pageInfo { hasNextPage }
+        }
+      }`,
+      undefined,
+      adminToken,
+    );
+    expect(body.errors).toBeUndefined();
+    const conn = body.data?.dataQualityMetrics as Record<string, unknown>;
+    const edges = conn.edges as Array<{ node: { metricValue: number } }>;
+    // Should only get the March metric (42), not the February one (30)
+    expect(edges).toHaveLength(1);
+    expect(edges[0].node.metricValue).toBe(42);
+  });
+
+  it('supports cursor pagination', async () => {
+    const page1 = await gql(
+      `{
+        dataQualityMetrics(
+          startDate: "2026-01-01T00:00:00Z"
+          endDate: "2026-12-31T23:59:59Z"
+          first: 2
+        ) {
+          edges { node { id } cursor }
+          pageInfo { hasNextPage endCursor }
+        }
+      }`,
+      undefined,
+      adminToken,
+    );
+    expect(page1.errors).toBeUndefined();
+    const p1 = page1.data?.dataQualityMetrics as Record<string, unknown>;
+    const p1Edges = p1.edges as Array<{ node: { id: string }; cursor: string }>;
+    expect(p1Edges).toHaveLength(2);
+    expect((p1.pageInfo as Record<string, unknown>).hasNextPage).toBe(true);
+
+    const cursor = (p1.pageInfo as Record<string, unknown>).endCursor as string;
+    const page2 = await gql(
+      `query($after: String) {
+        dataQualityMetrics(
+          startDate: "2026-01-01T00:00:00Z"
+          endDate: "2026-12-31T23:59:59Z"
+          first: 2
+          after: $after
+        ) {
+          edges { node { id } }
+          pageInfo { hasNextPage }
+        }
+      }`,
+      { after: cursor },
+      adminToken,
+    );
+    expect(page2.errors).toBeUndefined();
+    const p2 = page2.data?.dataQualityMetrics as Record<string, unknown>;
+    const p2Edges = p2.edges as Array<{ node: { id: string } }>;
+    // Page 2 should have different IDs than page 1
+    const p1Ids = p1Edges.map((e) => e.node.id);
+    p2Edges.forEach((e) => expect(p1Ids).not.toContain(e.node.id));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Tests — dataQualityOverview
+// ---------------------------------------------------------------------------
+
+describe('dataQualityOverview', () => {
+  it('rejects unauthenticated requests', async () => {
+    const body = await gql(`{ dataQualityOverview { county healthStatus } }`);
+    expect(body.errors).toBeDefined();
+    expect(body.errors![0].extensions?.code).toBe('UNAUTHENTICATED');
+  });
+
+  it('rejects non-admin users', async () => {
+    const body = await gql(
+      `{ dataQualityOverview { county healthStatus } }`,
+      undefined,
+      userToken,
+    );
+    expect(body.errors).toBeDefined();
+    expect(body.errors![0].extensions?.code).toBe('FORBIDDEN');
+  });
+
+  it('returns per-county overview for admin', async () => {
+    const body = await gql(
+      `{ dataQualityOverview {
+        county healthStatus rulingCount24h fieldCompletenessPct
+        scraperLastSuccessAgeHours lastUpdated
+      } }`,
+      undefined,
+      adminToken,
+    );
+    expect(body.errors).toBeUndefined();
+    const overview = body.data?.dataQualityOverview as Array<Record<string, unknown>>;
+    expect(overview.length).toBeGreaterThanOrEqual(3);
+
+    // Find our seeded counties
+    const la = overview.find((o) => o.county === 'Los Angeles');
+    const oc = overview.find((o) => o.county === 'Orange');
+    const sd = overview.find((o) => o.county === 'San Diego');
+
+    expect(la).toBeDefined();
+    expect(la!.healthStatus).toBe('green');
+    expect(la!.rulingCount24h).toBe(42);
+    expect(la!.fieldCompletenessPct).toBe(95);
+    expect(la!.scraperLastSuccessAgeHours).toBe(2);
+    expect(la!.lastUpdated).toBeDefined();
+
+    expect(oc).toBeDefined();
+    expect(oc!.healthStatus).toBe('yellow');
+
+    expect(sd).toBeDefined();
+    expect(sd!.healthStatus).toBe('red');
+  });
+});
