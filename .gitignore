@@ -10,6 +10,7 @@ dist/
 build/
 .next/
 *.egg-info/
+*.tsbuildinfo
 
 # IDE
 .vscode/
