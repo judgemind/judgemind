@@ -39,6 +39,9 @@ class CommandKind(Enum):
     STOP = "stop"
     PAUSE = "pause"
     RESUME = "resume"
+    FILE_ISSUE = "file_issue"
+    DISCUSS = "discuss"
+    DO = "do"
     FREE_TEXT = "free_text"
 
 
@@ -49,6 +52,13 @@ class Command:
     kind: CommandKind
     issue_number: int | None = None
     raw_text: str = ""
+    # Extended metadata for complex command types.
+    description: str = ""
+    priority: str = ""
+    labels: tuple[str, ...] = ()
+    message: str = ""
+    instruction: str = ""
+    reply_to: int | None = None
 
 
 def parse_command(text: str) -> Command:
@@ -96,6 +106,57 @@ def _extract_issue_number(fragment: str) -> int | None:
         return int(fragment)
     except ValueError:
         return None
+
+
+def _parse_inbox_entry(entry: dict[str, Any]) -> Command:
+    """Parse a structured inbox entry written by the responder daemon.
+
+    The responder writes entries with an ``action`` key that maps to one of
+    the extended command types (``file_issue``, ``discuss``, ``do``, ``start``).
+    """
+    action = entry.get("action", "")
+    reply_to = entry.get("reply_to")
+    if isinstance(reply_to, int):
+        pass
+    else:
+        reply_to = None
+
+    if action == "file_issue":
+        return Command(
+            kind=CommandKind.FILE_ISSUE,
+            description=str(entry.get("description", "")),
+            priority=str(entry.get("priority", "p2")),
+            labels=tuple(entry.get("labels", ())),
+            reply_to=reply_to,
+            raw_text=str(entry.get("description", "")),
+        )
+    if action == "discuss":
+        return Command(
+            kind=CommandKind.DISCUSS,
+            message=str(entry.get("message", "")),
+            reply_to=reply_to,
+            raw_text=str(entry.get("message", "")),
+        )
+    if action == "do":
+        return Command(
+            kind=CommandKind.DO,
+            instruction=str(entry.get("instruction", "")),
+            reply_to=reply_to,
+            raw_text=str(entry.get("instruction", "")),
+        )
+    if action == "start":
+        issue_num = entry.get("issue")
+        if isinstance(issue_num, int):
+            return Command(
+                kind=CommandKind.START,
+                issue_number=issue_num,
+                reply_to=reply_to,
+                raw_text=f"start #{issue_num}",
+            )
+
+    # Fall back to text-based parsing for unrecognised actions.
+    text = str(entry.get("text", entry.get("instruction", "")))
+    return parse_command(text)
 
 
 # ── Worker state (used for status replies) ─────────────────────────────────
@@ -534,6 +595,41 @@ class OrchestratorBridge:
             result["action"] = "stop_task"
             result["issue_number"] = cmd.issue_number
 
+        elif cmd.kind == CommandKind.FILE_ISSUE:
+            await self.bridge.notify(
+                "Filing that issue — I'll send the link when it's created.",
+                repo=self.repo,
+            )
+            result["reply"] = "Filing issue."
+            result["action"] = "file_issue"
+            result["description"] = cmd.description
+            result["priority"] = cmd.priority
+            result["labels"] = list(cmd.labels)
+            result["reply_to"] = cmd.reply_to
+
+        elif cmd.kind == CommandKind.DISCUSS:
+            await self.bridge.notify(
+                "Passing your question to the orchestrator — it has full codebase "
+                "context and will reply shortly.",
+                repo=self.repo,
+            )
+            result["reply"] = "Forwarded to orchestrator for discussion."
+            result["action"] = "discuss"
+            result["message"] = cmd.message
+            result["reply_to"] = cmd.reply_to
+            result["needs_reply"] = True
+
+        elif cmd.kind == CommandKind.DO:
+            await self.bridge.notify(
+                "On it — forwarding your request to the orchestrator.",
+                repo=self.repo,
+            )
+            result["reply"] = "Forwarded to orchestrator for execution."
+            result["action"] = "do"
+            result["instruction"] = cmd.instruction
+            result["reply_to"] = cmd.reply_to
+            result["needs_reply"] = True
+
         elif cmd.kind == CommandKind.FREE_TEXT:
             await self.bridge.notify(f"Received: {cmd.raw_text}", repo=self.repo)
             result["reply"] = f"Forwarded to orchestrator: {cmd.raw_text}"
@@ -645,8 +741,11 @@ class OrchestratorBridge:
                 f.truncate()
 
             for entry in entries:
-                text = entry.get("text", "") if isinstance(entry, dict) else str(entry)
-                cmd = parse_command(text)
+                if isinstance(entry, dict) and "action" in entry:
+                    cmd = _parse_inbox_entry(entry)
+                else:
+                    text = entry.get("text", "") if isinstance(entry, dict) else str(entry)
+                    cmd = parse_command(text)
                 commands.append(cmd)
 
         except Exception:

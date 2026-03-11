@@ -54,6 +54,61 @@ class TestParseResponse:
         assert result["actions"][0]["type"] == "start"
         assert result["actions"][0]["issue"] == 42
 
+    def test_actions_with_file_issue(self) -> None:
+        text = json.dumps(
+            {
+                "reply": "Filing that issue.",
+                "actions": [
+                    {
+                        "type": "file_issue",
+                        "description": "OC scraper timing out",
+                        "priority": "p2",
+                        "labels": ["area/scraping"],
+                    }
+                ],
+            }
+        )
+        result = _parse_response(text)
+        assert len(result["actions"]) == 1
+        assert result["actions"][0]["type"] == "file_issue"
+        assert result["actions"][0]["description"] == "OC scraper timing out"
+        assert result["actions"][0]["priority"] == "p2"
+        assert result["actions"][0]["labels"] == ["area/scraping"]
+
+    def test_actions_with_discuss(self) -> None:
+        text = json.dumps(
+            {
+                "reply": "Forwarding to orchestrator.",
+                "actions": [
+                    {
+                        "type": "discuss",
+                        "message": "Should we use Redis for caching?",
+                    }
+                ],
+            }
+        )
+        result = _parse_response(text)
+        assert len(result["actions"]) == 1
+        assert result["actions"][0]["type"] == "discuss"
+        assert result["actions"][0]["message"] == "Should we use Redis for caching?"
+
+    def test_actions_with_do(self) -> None:
+        text = json.dumps(
+            {
+                "reply": "Checking CI now.",
+                "actions": [
+                    {
+                        "type": "do",
+                        "instruction": "Check if PR #738 CI passed and merge it",
+                    }
+                ],
+            }
+        )
+        result = _parse_response(text)
+        assert len(result["actions"]) == 1
+        assert result["actions"][0]["type"] == "do"
+        assert result["actions"][0]["instruction"] == "Check if PR #738 CI passed and merge it"
+
     def test_actions_with_multiple(self) -> None:
         text = json.dumps(
             {

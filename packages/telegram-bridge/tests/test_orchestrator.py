@@ -1492,3 +1492,239 @@ class TestWriteStatus:
 
             data = json.loads(Path(status_file).read_text())
             assert sorted(data["stopped_issues"]) == [99, 101]
+
+
+# ── _parse_inbox_entry() ──────────────────────────────────────────────────
+
+
+class TestParseInboxEntry:
+    """Tests for structured inbox entries with action metadata."""
+
+    def test_file_issue_entry(self, tmp_path: Path) -> None:
+        with mock_aws():
+            bridge = _make_bridge()
+            inbox_file = tmp_path / "inbox.json"
+            inbox_file.write_text(
+                json.dumps(
+                    [
+                        {
+                            "action": "file_issue",
+                            "description": "OC scraper timing out",
+                            "priority": "p2",
+                            "labels": ["area/scraping"],
+                            "reply_to": 12345,
+                            "timestamp": "2026-03-10T20:00:00+00:00",
+                        }
+                    ]
+                )
+            )
+            orch = OrchestratorBridge(bridge=bridge, inbox_path=str(inbox_file))
+            commands = orch.read_inbox()
+
+            assert len(commands) == 1
+            cmd = commands[0]
+            assert cmd.kind == CommandKind.FILE_ISSUE
+            assert cmd.description == "OC scraper timing out"
+            assert cmd.priority == "p2"
+            assert cmd.labels == ("area/scraping",)
+            assert cmd.reply_to == 12345
+
+    def test_discuss_entry(self, tmp_path: Path) -> None:
+        with mock_aws():
+            bridge = _make_bridge()
+            inbox_file = tmp_path / "inbox.json"
+            inbox_file.write_text(
+                json.dumps(
+                    [
+                        {
+                            "action": "discuss",
+                            "message": "Should we use Redis for caching?",
+                            "reply_to": 12345,
+                            "timestamp": "2026-03-10T20:00:00+00:00",
+                        }
+                    ]
+                )
+            )
+            orch = OrchestratorBridge(bridge=bridge, inbox_path=str(inbox_file))
+            commands = orch.read_inbox()
+
+            assert len(commands) == 1
+            cmd = commands[0]
+            assert cmd.kind == CommandKind.DISCUSS
+            assert cmd.message == "Should we use Redis for caching?"
+            assert cmd.reply_to == 12345
+
+    def test_do_entry(self, tmp_path: Path) -> None:
+        with mock_aws():
+            bridge = _make_bridge()
+            inbox_file = tmp_path / "inbox.json"
+            inbox_file.write_text(
+                json.dumps(
+                    [
+                        {
+                            "action": "do",
+                            "instruction": "Check CI on PR #738 and merge it",
+                            "reply_to": 12345,
+                            "timestamp": "2026-03-10T20:00:00+00:00",
+                        }
+                    ]
+                )
+            )
+            orch = OrchestratorBridge(bridge=bridge, inbox_path=str(inbox_file))
+            commands = orch.read_inbox()
+
+            assert len(commands) == 1
+            cmd = commands[0]
+            assert cmd.kind == CommandKind.DO
+            assert cmd.instruction == "Check CI on PR #738 and merge it"
+            assert cmd.reply_to == 12345
+
+    def test_start_entry_with_action_key(self, tmp_path: Path) -> None:
+        with mock_aws():
+            bridge = _make_bridge()
+            inbox_file = tmp_path / "inbox.json"
+            inbox_file.write_text(
+                json.dumps(
+                    [
+                        {
+                            "action": "start",
+                            "issue": 42,
+                            "reply_to": 12345,
+                        }
+                    ]
+                )
+            )
+            orch = OrchestratorBridge(bridge=bridge, inbox_path=str(inbox_file))
+            commands = orch.read_inbox()
+
+            assert len(commands) == 1
+            cmd = commands[0]
+            assert cmd.kind == CommandKind.START
+            assert cmd.issue_number == 42
+
+    def test_mixed_text_and_structured_entries(self, tmp_path: Path) -> None:
+        with mock_aws():
+            bridge = _make_bridge()
+            inbox_file = tmp_path / "inbox.json"
+            inbox_file.write_text(
+                json.dumps(
+                    [
+                        {"text": "start #100", "user_id": 123},
+                        {
+                            "action": "file_issue",
+                            "description": "Bug in parser",
+                            "priority": "p1",
+                            "labels": [],
+                            "reply_to": 123,
+                        },
+                        {"text": "pause", "user_id": 123},
+                    ]
+                )
+            )
+            orch = OrchestratorBridge(bridge=bridge, inbox_path=str(inbox_file))
+            commands = orch.read_inbox()
+
+            assert len(commands) == 3
+            assert commands[0].kind == CommandKind.START
+            assert commands[0].issue_number == 100
+            assert commands[1].kind == CommandKind.FILE_ISSUE
+            assert commands[1].description == "Bug in parser"
+            assert commands[2].kind == CommandKind.PAUSE
+
+    def test_unknown_action_falls_back_to_text(self, tmp_path: Path) -> None:
+        with mock_aws():
+            bridge = _make_bridge()
+            inbox_file = tmp_path / "inbox.json"
+            inbox_file.write_text(
+                json.dumps(
+                    [
+                        {
+                            "action": "unknown_type",
+                            "text": "status",
+                        }
+                    ]
+                )
+            )
+            orch = OrchestratorBridge(bridge=bridge, inbox_path=str(inbox_file))
+            commands = orch.read_inbox()
+
+            assert len(commands) == 1
+            assert commands[0].kind == CommandKind.STATUS
+
+
+# ── handle_command() — new command types ────────────────────────────────
+
+
+class TestHandleCommandNewTypes:
+    @respx.mock
+    async def test_handle_file_issue(self) -> None:
+        with mock_aws():
+            _setup_secret()
+            respx.post("https://api.telegram.org/botfake-bot-token/sendMessage").mock(
+                return_value=httpx.Response(200, json={"ok": True})
+            )
+
+            bridge = _make_bridge()
+            orch = OrchestratorBridge(bridge=bridge)
+            result = await orch.handle_command(
+                Command(
+                    kind=CommandKind.FILE_ISSUE,
+                    description="OC scraper timing out",
+                    priority="p2",
+                    labels=("area/scraping",),
+                    reply_to=12345,
+                )
+            )
+            await bridge.close()
+
+            assert result["action"] == "file_issue"
+            assert result["description"] == "OC scraper timing out"
+            assert result["priority"] == "p2"
+            assert result["labels"] == ["area/scraping"]
+            assert result["reply_to"] == 12345
+
+    @respx.mock
+    async def test_handle_discuss(self) -> None:
+        with mock_aws():
+            _setup_secret()
+            respx.post("https://api.telegram.org/botfake-bot-token/sendMessage").mock(
+                return_value=httpx.Response(200, json={"ok": True})
+            )
+
+            bridge = _make_bridge()
+            orch = OrchestratorBridge(bridge=bridge)
+            result = await orch.handle_command(
+                Command(
+                    kind=CommandKind.DISCUSS,
+                    message="Should we use Redis?",
+                    reply_to=12345,
+                )
+            )
+            await bridge.close()
+
+            assert result["action"] == "discuss"
+            assert result["message"] == "Should we use Redis?"
+            assert result["needs_reply"] is True
+
+    @respx.mock
+    async def test_handle_do(self) -> None:
+        with mock_aws():
+            _setup_secret()
+            respx.post("https://api.telegram.org/botfake-bot-token/sendMessage").mock(
+                return_value=httpx.Response(200, json={"ok": True})
+            )
+
+            bridge = _make_bridge()
+            orch = OrchestratorBridge(bridge=bridge)
+            result = await orch.handle_command(
+                Command(
+                    kind=CommandKind.DO,
+                    instruction="Merge PR #750",
+                    reply_to=12345,
+                )
+            )
+            await bridge.close()
+
+            assert result["action"] == "do"
+            assert result["instruction"] == "Merge PR #750"
+            assert result["needs_reply"] is True
