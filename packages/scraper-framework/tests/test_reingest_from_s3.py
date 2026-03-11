@@ -12,6 +12,7 @@ import os
 import sys
 import uuid
 from datetime import date, datetime
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 _SCRIPTS_DIR = os.path.join(
@@ -3019,3 +3020,609 @@ class TestProgressLogging:
         )
 
         assert result["batch_number"] == 42
+
+
+# ---------------------------------------------------------------------------
+# _make_split_document_id tests
+# ---------------------------------------------------------------------------
+
+
+class TestMakeSplitDocumentId:
+    """Tests for deterministic split document ID generation."""
+
+    def test_deterministic_same_inputs(self) -> None:
+        """Same content_hash + ruling_index always produces the same UUID."""
+        id1 = reingest._make_split_document_id("abc123", 1)
+        id2 = reingest._make_split_document_id("abc123", 1)
+        assert id1 == id2
+
+    def test_different_ruling_index_different_id(self) -> None:
+        """Different ruling indices produce different UUIDs."""
+        id1 = reingest._make_split_document_id("abc123", 1)
+        id2 = reingest._make_split_document_id("abc123", 2)
+        assert id1 != id2
+
+    def test_different_content_hash_different_id(self) -> None:
+        """Different content hashes produce different UUIDs."""
+        id1 = reingest._make_split_document_id("abc123", 1)
+        id2 = reingest._make_split_document_id("def456", 1)
+        assert id1 != id2
+
+    def test_returns_valid_uuid_string(self) -> None:
+        """The returned string is a valid UUID."""
+        result = reingest._make_split_document_id("abc123", 1)
+        parsed = uuid.UUID(result)
+        assert str(parsed) == result
+
+    def test_different_from_unsplit_id(self) -> None:
+        """Split document ID differs from the standard unsplit ID."""
+        content_hash = "abc123"
+        unsplit_id = str(uuid.uuid5(uuid.NAMESPACE_URL, content_hash))
+        split_id = reingest._make_split_document_id(content_hash, 1)
+        assert split_id != unsplit_id
+
+
+# ---------------------------------------------------------------------------
+# _full_reparse_document tests
+# ---------------------------------------------------------------------------
+
+
+class TestFullReparseDocument:
+    """Tests for _full_reparse_document()."""
+
+    def _doc_meta(self, **overrides: Any) -> dict:
+        meta = {
+            "document_id": str(_DOC_ID_1),
+            "state": "CA",
+            "county": "Riverside",
+            "court_name": "Riverside Superior Court",
+            "source_url": "https://court.example.com/ruling.pdf",
+            "captured_at": _CAPTURED_AT_1,
+            "content_hash": "abc123",
+            "format": "pdf",
+            "case_number": "CVPS2306157",
+            "case_title": None,
+            "case_type": None,
+            "hearing_date": _HEARING_DATE,
+            "court_id": str(_COURT_ID),
+            "scraper_id": "ca-riverside-tentatives-civil",
+            "s3_key": "docs/test.pdf",
+            "s3_bucket": "test-bucket",
+        }
+        meta.update(overrides)
+        return meta
+
+    @patch.object(reingest, "_load_scraper_registry")
+    @patch.object(reingest, "_reparse_document")
+    def test_falls_back_to_reparse_without_split_registry(
+        self,
+        mock_reparse: MagicMock,
+        mock_registry: MagicMock,
+    ) -> None:
+        """When no split function is registered, falls back to _reparse_document."""
+        # Clear split registry
+        reingest._SPLIT_REGISTRY.clear()
+        mock_reparse.return_value = {
+            "ruling_text": "some ruling",
+            "case_number": "CVPS2306157",
+            "case_title": None,
+            "judge_name": None,
+            "outcome": None,
+            "motion_type": None,
+            "department": None,
+            "parties": [],
+            "hearing_date": _HEARING_DATE,
+        }
+
+        result = reingest._full_reparse_document(b"raw pdf", "unknown-scraper", self._doc_meta())
+
+        assert len(result) == 1
+        assert result[0]["is_split"] is False
+        assert result[0]["ruling_index"] == 0
+        assert result[0]["split_document_id"] == str(_DOC_ID_1)
+
+    @patch.object(reingest, "_load_scraper_registry")
+    @patch.object(reingest, "_reparse_document")
+    @patch.object(reingest, "_extract_text_from_content")
+    def test_falls_back_when_split_returns_single_ruling(
+        self,
+        mock_extract: MagicMock,
+        mock_reparse: MagicMock,
+        mock_registry: MagicMock,
+    ) -> None:
+        """When split function returns 0 or 1 ruling, falls back to standard reparse."""
+        mock_split = MagicMock(return_value=[])
+        reingest._SPLIT_REGISTRY["test-scraper"] = mock_split
+        mock_extract.return_value = "some text"
+        mock_reparse.return_value = {
+            "ruling_text": "some ruling",
+            "case_number": "CVPS2306157",
+            "case_title": None,
+            "judge_name": None,
+            "outcome": None,
+            "motion_type": None,
+            "department": None,
+            "parties": [],
+            "hearing_date": _HEARING_DATE,
+        }
+
+        try:
+            result = reingest._full_reparse_document(
+                b"raw pdf", "test-scraper", self._doc_meta(scraper_id="test-scraper")
+            )
+            assert len(result) == 1
+            assert result[0]["is_split"] is False
+        finally:
+            reingest._SPLIT_REGISTRY.pop("test-scraper", None)
+
+    @patch.object(reingest, "_load_scraper_registry")
+    @patch.object(reingest, "_extract_text_from_content")
+    def test_splits_multi_ruling_document(
+        self,
+        mock_extract: MagicMock,
+        mock_registry: MagicMock,
+    ) -> None:
+        """When split function returns multiple rulings, creates one dict per ruling."""
+        from courts.ca.riverside_tentatives import SplitRuling
+
+        rulings = [
+            SplitRuling(
+                ruling_index=1,
+                case_number="CVPS2306157",
+                ruling_text="Ruling 1 text",
+                case_title="Yeldell V. Henss",
+                motion_type="Demurrer",
+                outcome="Granted",
+            ),
+            SplitRuling(
+                ruling_index=2,
+                case_number="CVPS2306202",
+                ruling_text="Ruling 2 text",
+                case_title="Crump V. Irwin",
+                motion_type="Motion to Compel",
+                outcome="Denied",
+            ),
+        ]
+        mock_split = MagicMock(return_value=rulings)
+        reingest._SPLIT_REGISTRY["test-split"] = mock_split
+        reingest._SCRAPER_REGISTRY.pop("test-split", None)
+        mock_extract.return_value = "full pdf text"
+
+        try:
+            result = reingest._full_reparse_document(
+                b"raw pdf", "test-split", self._doc_meta(scraper_id="test-split")
+            )
+
+            assert len(result) == 2
+
+            # First ruling
+            assert result[0]["is_split"] is True
+            assert result[0]["ruling_index"] == 1
+            assert result[0]["case_number"] == "CVPS2306157"
+            assert result[0]["ruling_text"] == "Ruling 1 text"
+            assert result[0]["case_title"] == "Yeldell V. Henss"
+            assert result[0]["motion_type"] == "Demurrer"
+            assert result[0]["outcome"] == "Granted"
+
+            # Second ruling
+            assert result[1]["is_split"] is True
+            assert result[1]["ruling_index"] == 2
+            assert result[1]["case_number"] == "CVPS2306202"
+            assert result[1]["ruling_text"] == "Ruling 2 text"
+
+            # Split document IDs are deterministic and different
+            assert result[0]["split_document_id"] != result[1]["split_document_id"]
+            # Both are valid UUIDs
+            uuid.UUID(result[0]["split_document_id"])
+            uuid.UUID(result[1]["split_document_id"])
+        finally:
+            reingest._SPLIT_REGISTRY.pop("test-split", None)
+
+    @patch.object(reingest, "_load_scraper_registry")
+    @patch.object(reingest, "_extract_text_from_content")
+    def test_split_ids_are_idempotent(
+        self,
+        mock_extract: MagicMock,
+        mock_registry: MagicMock,
+    ) -> None:
+        """Running full-reparse twice produces the same split document IDs."""
+        from courts.ca.riverside_tentatives import SplitRuling
+
+        rulings = [
+            SplitRuling(1, "CVPS001", "text1", None, None, None),
+            SplitRuling(2, "CVPS002", "text2", None, None, None),
+        ]
+        mock_split = MagicMock(return_value=rulings)
+        reingest._SPLIT_REGISTRY["test-idem"] = mock_split
+        reingest._SCRAPER_REGISTRY.pop("test-idem", None)
+        mock_extract.return_value = "pdf text"
+
+        try:
+            meta = self._doc_meta(scraper_id="test-idem")
+            result1 = reingest._full_reparse_document(b"raw pdf", "test-idem", meta)
+            result2 = reingest._full_reparse_document(b"raw pdf", "test-idem", meta)
+
+            assert result1[0]["split_document_id"] == result2[0]["split_document_id"]
+            assert result1[1]["split_document_id"] == result2[1]["split_document_id"]
+        finally:
+            reingest._SPLIT_REGISTRY.pop("test-idem", None)
+
+    @patch.object(reingest, "_load_scraper_registry")
+    @patch.object(reingest, "_extract_text_from_content")
+    def test_nul_bytes_stripped_from_split_ruling_text(
+        self,
+        mock_extract: MagicMock,
+        mock_registry: MagicMock,
+    ) -> None:
+        """NUL bytes in split ruling text are removed."""
+        from courts.ca.riverside_tentatives import SplitRuling
+
+        rulings = [
+            SplitRuling(1, "CVPS001", "ruling\x00text", None, None, None),
+            SplitRuling(2, "CVPS002", "clean text", None, None, None),
+        ]
+        mock_split = MagicMock(return_value=rulings)
+        reingest._SPLIT_REGISTRY["test-nul"] = mock_split
+        reingest._SCRAPER_REGISTRY.pop("test-nul", None)
+        mock_extract.return_value = "pdf text"
+
+        try:
+            result = reingest._full_reparse_document(
+                b"raw pdf", "test-nul", self._doc_meta(scraper_id="test-nul")
+            )
+            assert "\x00" not in result[0]["ruling_text"]
+            assert result[0]["ruling_text"] == "rulingtext"
+        finally:
+            reingest._SPLIT_REGISTRY.pop("test-nul", None)
+
+
+# ---------------------------------------------------------------------------
+# _supersede_document tests
+# ---------------------------------------------------------------------------
+
+
+class TestSupersedeDocument:
+    """Tests for _supersede_document()."""
+
+    def test_executes_update_query(self) -> None:
+        """Calls UPDATE on documents with status='superseded'."""
+        conn = MagicMock()
+        cur = MagicMock()
+        ctx = MagicMock()
+        ctx.__enter__ = MagicMock(return_value=cur)
+        ctx.__exit__ = MagicMock(return_value=False)
+        conn.cursor.return_value = ctx
+
+        reingest._supersede_document(conn, str(_DOC_ID_1))
+
+        cur.execute.assert_called_once()
+        sql = cur.execute.call_args[0][0]
+        assert "UPDATE documents" in sql
+        assert "superseded" in sql
+        params = cur.execute.call_args[0][1]
+        assert params == (str(_DOC_ID_1),)
+
+
+# ---------------------------------------------------------------------------
+# reingest_batch tests — full_reparse mode
+# ---------------------------------------------------------------------------
+
+
+class TestReingestBatchFullReparse:
+    """Tests for reingest_batch() with full_reparse=True."""
+
+    @patch("reingest_from_s3._supersede_document")
+    @patch("reingest_from_s3.batch_upsert_parties")
+    @patch("reingest_from_s3.upsert_case_judge")
+    @patch("reingest_from_s3.insert_ruling")
+    @patch("reingest_from_s3.resolve_judge")
+    @patch("reingest_from_s3.insert_document")
+    @patch("reingest_from_s3.upsert_case")
+    @patch("reingest_from_s3._full_reparse_document")
+    @patch("reingest_from_s3._fetch_s3_content")
+    def test_full_reparse_calls_full_reparse_fn(
+        self,
+        mock_fetch_s3: MagicMock,
+        mock_full_reparse: MagicMock,
+        mock_upsert_case: MagicMock,
+        mock_insert_doc: MagicMock,
+        mock_resolve_judge: MagicMock,
+        mock_insert_ruling: MagicMock,
+        mock_upsert_cj: MagicMock,
+        mock_batch_parties: MagicMock,
+        mock_supersede: MagicMock,
+    ) -> None:
+        """full_reparse=True uses _full_reparse_document instead of _reparse_document."""
+        row = _make_document_row(
+            scraper_id="ca-riverside-tentatives-civil",
+            case_number="CVPS2306157",
+        )
+        conn = _mock_conn_with_rows([row])
+
+        mock_fetch_s3.return_value = b"pdf content"
+        mock_full_reparse.return_value = [
+            {
+                "ruling_text": "Ruling 1",
+                "case_number": "CVPS2306157",
+                "case_title": "Yeldell v. Henss",
+                "judge_name": "Arthur Hester III",
+                "outcome": "granted",
+                "motion_type": "Demurrer",
+                "department": "PS1",
+                "parties": [],
+                "hearing_date": _HEARING_DATE,
+                "ruling_index": 1,
+                "split_document_id": "split-id-1",
+                "is_split": True,
+                "llm_skipped": True,
+                "llm_outcome": "not_attempted",
+            },
+            {
+                "ruling_text": "Ruling 2",
+                "case_number": "CVPS2306202",
+                "case_title": "Crump v. Irwin",
+                "judge_name": "Arthur Hester III",
+                "outcome": "denied",
+                "motion_type": "Motion to Compel",
+                "department": "PS1",
+                "parties": [],
+                "hearing_date": _HEARING_DATE,
+                "ruling_index": 2,
+                "split_document_id": "split-id-2",
+                "is_split": True,
+                "llm_skipped": True,
+                "llm_outcome": "not_attempted",
+            },
+        ]
+        mock_upsert_case.return_value = "case-id"
+        mock_resolve_judge.return_value = "judge-id"
+
+        result = reingest.reingest_batch(
+            conn,
+            MagicMock(),
+            batch_size=10,
+            cursor=_DEFAULT_CURSOR,
+            filters="",
+            filter_params=[],
+            full_reparse=True,
+        )
+
+        assert result["processed"] == 1
+        assert result["updated"] == 1
+        # insert_document called twice — one per split ruling
+        assert mock_insert_doc.call_count == 2
+        # insert_ruling called twice
+        assert mock_insert_ruling.call_count == 2
+        # Original document superseded
+        mock_supersede.assert_called_once()
+        # upsert_case called twice (different case numbers)
+        assert mock_upsert_case.call_count == 2
+
+    @patch("reingest_from_s3._supersede_document")
+    @patch("reingest_from_s3.batch_upsert_parties")
+    @patch("reingest_from_s3.upsert_case_judge")
+    @patch("reingest_from_s3.insert_ruling")
+    @patch("reingest_from_s3.resolve_judge")
+    @patch("reingest_from_s3.insert_document")
+    @patch("reingest_from_s3.upsert_case")
+    @patch("reingest_from_s3._full_reparse_document")
+    @patch("reingest_from_s3._fetch_s3_content")
+    def test_full_reparse_no_split_does_not_supersede(
+        self,
+        mock_fetch_s3: MagicMock,
+        mock_full_reparse: MagicMock,
+        mock_upsert_case: MagicMock,
+        mock_insert_doc: MagicMock,
+        mock_resolve_judge: MagicMock,
+        mock_insert_ruling: MagicMock,
+        mock_upsert_cj: MagicMock,
+        mock_batch_parties: MagicMock,
+        mock_supersede: MagicMock,
+    ) -> None:
+        """When full_reparse does not split, original document is not superseded."""
+        row = _make_document_row()
+        conn = _mock_conn_with_rows([row])
+
+        mock_fetch_s3.return_value = b"html content"
+        mock_full_reparse.return_value = [
+            {
+                "ruling_text": "Single ruling",
+                "case_number": "24STCV12345",
+                "case_title": "Smith v. Jones",
+                "judge_name": "John Smith",
+                "outcome": "granted",
+                "motion_type": "msj",
+                "department": "1",
+                "parties": [],
+                "hearing_date": _HEARING_DATE,
+                "ruling_index": 0,
+                "split_document_id": str(_DOC_ID_1),
+                "is_split": False,
+                "llm_skipped": True,
+                "llm_outcome": "not_attempted",
+            },
+        ]
+        mock_upsert_case.return_value = "case-id"
+        mock_resolve_judge.return_value = "judge-id"
+
+        result = reingest.reingest_batch(
+            conn,
+            MagicMock(),
+            batch_size=10,
+            cursor=_DEFAULT_CURSOR,
+            filters="",
+            filter_params=[],
+            full_reparse=True,
+        )
+
+        assert result["updated"] == 1
+        mock_supersede.assert_not_called()
+
+    @patch("reingest_from_s3._full_reparse_document")
+    @patch("reingest_from_s3._fetch_s3_content")
+    def test_full_reparse_dry_run_logs_split_info(
+        self,
+        mock_fetch_s3: MagicMock,
+        mock_full_reparse: MagicMock,
+    ) -> None:
+        """Dry-run with full_reparse logs split ruling info."""
+        row = _make_document_row()
+        conn = MagicMock()
+        cur = MagicMock()
+        cur.fetchall.return_value = [row]
+        conn.cursor.return_value = _mock_cursor_context(cur)
+
+        mock_fetch_s3.return_value = b"pdf content"
+        mock_full_reparse.return_value = [
+            {
+                "ruling_text": "Ruling 1",
+                "case_number": "CVPS001",
+                "case_title": None,
+                "judge_name": None,
+                "outcome": None,
+                "motion_type": None,
+                "department": None,
+                "parties": [],
+                "hearing_date": _HEARING_DATE,
+                "ruling_index": 1,
+                "split_document_id": "split-1",
+                "is_split": True,
+                "llm_skipped": True,
+                "llm_outcome": "not_attempted",
+            },
+            {
+                "ruling_text": "Ruling 2",
+                "case_number": "CVPS002",
+                "case_title": None,
+                "judge_name": None,
+                "outcome": None,
+                "motion_type": None,
+                "department": None,
+                "parties": [],
+                "hearing_date": _HEARING_DATE,
+                "ruling_index": 2,
+                "split_document_id": "split-2",
+                "is_split": True,
+                "llm_skipped": True,
+                "llm_outcome": "not_attempted",
+            },
+        ]
+
+        result = reingest.reingest_batch(
+            conn,
+            MagicMock(),
+            batch_size=10,
+            cursor=_DEFAULT_CURSOR,
+            filters="",
+            filter_params=[],
+            dry_run=True,
+            full_reparse=True,
+        )
+
+        assert result["processed"] == 1
+        assert result["updated"] == 0
+
+    @patch("reingest_from_s3._supersede_document")
+    @patch("reingest_from_s3.batch_upsert_parties")
+    @patch("reingest_from_s3.upsert_case_judge")
+    @patch("reingest_from_s3.insert_ruling")
+    @patch("reingest_from_s3.resolve_judge")
+    @patch("reingest_from_s3.insert_document")
+    @patch("reingest_from_s3.upsert_case")
+    @patch("reingest_from_s3._full_reparse_document")
+    @patch("reingest_from_s3._fetch_s3_content")
+    def test_split_document_ids_used_for_db_writes(
+        self,
+        mock_fetch_s3: MagicMock,
+        mock_full_reparse: MagicMock,
+        mock_upsert_case: MagicMock,
+        mock_insert_doc: MagicMock,
+        mock_resolve_judge: MagicMock,
+        mock_insert_ruling: MagicMock,
+        mock_upsert_cj: MagicMock,
+        mock_batch_parties: MagicMock,
+        mock_supersede: MagicMock,
+    ) -> None:
+        """Split document IDs (not original doc ID) are used for document+ruling inserts."""
+        row = _make_document_row()
+        conn = _mock_conn_with_rows([row])
+
+        mock_fetch_s3.return_value = b"pdf content"
+        mock_full_reparse.return_value = [
+            {
+                "ruling_text": "Ruling 1",
+                "case_number": "CVPS001",
+                "case_title": None,
+                "judge_name": "Judge X",
+                "outcome": "granted",
+                "motion_type": "Demurrer",
+                "department": "PS1",
+                "parties": [],
+                "hearing_date": _HEARING_DATE,
+                "ruling_index": 1,
+                "split_document_id": "split-doc-aaa",
+                "is_split": True,
+                "llm_skipped": True,
+                "llm_outcome": "not_attempted",
+            },
+            {
+                "ruling_text": "Ruling 2",
+                "case_number": "CVPS002",
+                "case_title": None,
+                "judge_name": "Judge X",
+                "outcome": "denied",
+                "motion_type": "MSJ",
+                "department": "PS1",
+                "parties": [],
+                "hearing_date": _HEARING_DATE,
+                "ruling_index": 2,
+                "split_document_id": "split-doc-bbb",
+                "is_split": True,
+                "llm_skipped": True,
+                "llm_outcome": "not_attempted",
+            },
+        ]
+        mock_upsert_case.return_value = "case-id"
+        mock_resolve_judge.return_value = "judge-id"
+
+        reingest.reingest_batch(
+            conn,
+            MagicMock(),
+            batch_size=10,
+            cursor=_DEFAULT_CURSOR,
+            filters="",
+            filter_params=[],
+            full_reparse=True,
+        )
+
+        # Check insert_document was called with split IDs
+        doc_ids = [c[1]["document_id"] for c in mock_insert_doc.call_args_list]
+        assert "split-doc-aaa" in doc_ids
+        assert "split-doc-bbb" in doc_ids
+
+        # Check insert_ruling was called with split IDs
+        ruling_doc_ids = [c[1]["document_id"] for c in mock_insert_ruling.call_args_list]
+        assert "split-doc-aaa" in ruling_doc_ids
+        assert "split-doc-bbb" in ruling_doc_ids
+
+
+# ---------------------------------------------------------------------------
+# _SPLIT_REGISTRY tests
+# ---------------------------------------------------------------------------
+
+
+class TestSplitRegistry:
+    """Tests for the split function registry."""
+
+    def test_split_registry_populated_for_riverside(self) -> None:
+        """Auto-discovery registers Riverside's _split_rulings in _SPLIT_REGISTRY."""
+        # Clear registries to force re-discovery
+        reingest._SCRAPER_REGISTRY.clear()
+        reingest._SPLIT_REGISTRY.clear()
+
+        # Call the real auto-discovery function
+        reingest._load_scraper_registry()
+
+        scraper_id = "ca-riverside-tentatives-civil"
+        assert scraper_id in reingest._SPLIT_REGISTRY
+        assert callable(reingest._SPLIT_REGISTRY[scraper_id])
