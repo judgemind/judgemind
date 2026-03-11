@@ -1,0 +1,195 @@
+name: Smoke Test
+
+on:
+  schedule:
+    # Every 15 minutes
+    - cron: '*/15 * * * *'
+  # Also run on deployment_status from Vercel
+  deployment_status:
+  # Allow manual trigger for debugging
+  workflow_dispatch:
+
+# Only one smoke test at a time
+concurrency:
+  group: smoke-test
+  cancel-in-progress: true
+
+permissions:
+  issues: write
+  contents: read
+
+jobs:
+  smoke-test:
+    name: Check major pages
+    runs-on: ubuntu-latest
+    # For deployment_status, only run when the deploy succeeded
+    if: >-
+      github.event_name != 'deployment_status' ||
+      github.event.deployment_status.state == 'success'
+
+    env:
+      BASE_URL: https://dev.judgemind.org
+      API_URL: https://dev.api.judgemind.org/graphql
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github
+
+      - name: Fetch sample IDs from API
+        id: ids
+        run: |
+          # Get a sample case ID
+          CASE_RESP=$(curl -s --max-time 15 \
+            -X POST "$API_URL" \
+            -H 'Content-Type: application/json' \
+            -d '{"query":"{ cases(first: 1) { edges { node { id } } } }"}' || true)
+
+          CASE_ID=$(echo "$CASE_RESP" | jq -r '.data.cases.edges[0].node.id // empty' 2>/dev/null || true)
+
+          if [ -n "$CASE_ID" ]; then
+            echo "case_id=$CASE_ID" >> "$GITHUB_OUTPUT"
+            echo "Found sample case ID: $CASE_ID"
+          else
+            echo "case_id=" >> "$GITHUB_OUTPUT"
+            echo "WARNING: Could not fetch a sample case ID from the API"
+          fi
+
+          # Get a sample judge ID
+          JUDGE_RESP=$(curl -s --max-time 15 \
+            -X POST "$API_URL" \
+            -H 'Content-Type: application/json' \
+            -d '{"query":"{ judges(first: 1) { edges { node { id } } } }"}' || true)
+
+          JUDGE_ID=$(echo "$JUDGE_RESP" | jq -r '.data.judges.edges[0].node.id // empty' 2>/dev/null || true)
+
+          if [ -n "$JUDGE_ID" ]; then
+            echo "judge_id=$JUDGE_ID" >> "$GITHUB_OUTPUT"
+            echo "Found sample judge ID: $JUDGE_ID"
+          else
+            echo "judge_id=" >> "$GITHUB_OUTPUT"
+            echo "WARNING: Could not fetch a sample judge ID from the API"
+          fi
+
+      - name: Smoke test major pages
+        id: smoke
+        env:
+          CASE_ID: ${{ steps.ids.outputs.case_id }}
+          JUDGE_ID: ${{ steps.ids.outputs.judge_id }}
+        run: |
+          FAILED_PAGES=""
+          TOTAL=0
+          PASSED=0
+
+          # Static pages that should always return 200
+          PAGES=(
+            "/"
+            "/rulings"
+            "/search"
+          )
+
+          # Add dynamic pages if we have sample IDs
+          if [ -n "$CASE_ID" ]; then
+            PAGES+=("/cases/${CASE_ID}")
+          fi
+          if [ -n "$JUDGE_ID" ]; then
+            PAGES+=("/judges/${JUDGE_ID}")
+          fi
+
+          for page in "${PAGES[@]}"; do
+            TOTAL=$((TOTAL + 1))
+            HTTP_CODE=$(curl -s -o /dev/null -w '%{http_code}' \
+              --max-time 30 \
+              --retry 2 \
+              --retry-delay 5 \
+              "${BASE_URL}${page}" || echo "000")
+
+            if [ "$HTTP_CODE" -ge 500 ] 2>/dev/null || [ "$HTTP_CODE" = "000" ]; then
+              echo "FAIL: ${page} returned ${HTTP_CODE}"
+              FAILED_PAGES="${FAILED_PAGES}| \`${page}\` | ${HTTP_CODE} |\n"
+            else
+              echo "OK:   ${page} returned ${HTTP_CODE}"
+              PASSED=$((PASSED + 1))
+            fi
+          done
+
+          echo "Results: ${PASSED}/${TOTAL} pages OK"
+
+          if [ -n "$FAILED_PAGES" ]; then
+            echo "has_failures=true" >> "$GITHUB_OUTPUT"
+            {
+              echo 'failed_pages<<GHEOF'
+              echo -e "$FAILED_PAGES"
+              echo 'GHEOF'
+            } >> "$GITHUB_OUTPUT"
+            exit 1
+          else
+            echo "has_failures=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check for existing open issue
+        if: failure() && steps.smoke.outputs.has_failures == 'true'
+        id: existing
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          EXISTING=$(gh issue list \
+            --repo "${{ github.repository }}" \
+            --state open \
+            --label "smoke-test-failure" \
+            --json number \
+            --limit 1 \
+            -q '.[0].number // empty')
+
+          if [ -n "$EXISTING" ]; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "number=$EXISTING" >> "$GITHUB_OUTPUT"
+            echo "Open smoke-test issue already exists: #${EXISTING}"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create failure issue
+        if: >-
+          failure() &&
+          steps.smoke.outputs.has_failures == 'true' &&
+          steps.existing.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FAILED_PAGES: ${{ steps.smoke.outputs.failed_pages }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          TRIGGER: ${{ github.event_name }}
+        run: |
+          TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+          {
+            echo "## Smoke Test Failure"
+            echo ""
+            echo "The scheduled smoke test detected pages returning 5xx errors on \`dev.judgemind.org\`."
+            echo ""
+            echo "### Failed Pages"
+            echo ""
+            echo "| Page | HTTP Status |"
+            echo "|------|-------------|"
+            echo -e "$FAILED_PAGES"
+            echo ""
+            echo "### Context"
+            echo ""
+            echo "- **Workflow run:** ${RUN_URL}"
+            echo "- **Triggered by:** ${TRIGGER}"
+            echo "- **Timestamp:** ${TIMESTAMP}"
+            echo ""
+            echo "### Next Steps"
+            echo ""
+            echo "1. Check the Vercel deployment dashboard for recent deploy failures"
+            echo "2. Check the API health at \`https://dev.api.judgemind.org/graphql\`"
+            echo "3. Review recent commits to \`main\` for breaking changes"
+            echo ""
+            echo "This issue was created automatically by the smoke test workflow. It will not create duplicates while this issue is open."
+          } > /tmp/issue_body.md
+
+          gh issue create \
+            --repo "${{ github.repository }}" \
+            --title "Smoke test failure: pages returning 5xx on dev.judgemind.org" \
+            --body-file /tmp/issue_body.md \
+            --label "priority/p1,area/frontend,smoke-test-failure,agent/ready"
