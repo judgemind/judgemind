@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import sys
 import types
 from pathlib import Path
@@ -79,6 +80,16 @@ def _import_responder() -> types.ModuleType:
     mod_name = "tg_responder"
     if mod_name in sys.modules:
         return importlib.import_module(mod_name)
+
+    # The responder script lives in scripts/ and imports _venv_helper from
+    # the same directory.  Add scripts/ to sys.path so the import resolves,
+    # and set the skip flag so ensure_venv() doesn't re-exec into the venv
+    # (we are already running inside the test venv).
+    scripts_dir = str(REPO_ROOT / "scripts")
+    if scripts_dir not in sys.path:
+        sys.path.insert(0, scripts_dir)
+    os.environ.setdefault("_VENV_HELPER_SKIP", "1")
+
     spec = importlib.util.spec_from_file_location(mod_name, str(_RESPONDER_PATH))
     assert spec is not None and spec.loader is not None
     mod = importlib.util.module_from_spec(spec)
