@@ -11,6 +11,7 @@ from .interpreter import (
 )
 from .models import Message, SentMessage
 from .orchestrator import Command, CommandKind, OrchestratorBridge, create_orchestrator_bridge
+from .validation import ValidationResult, validate_github_links, validate_telegram_payload
 
 __all__ = [
     "Command",
@@ -22,9 +23,12 @@ __all__ = [
     "RateLimiter",
     "SentMessage",
     "TelegramBridge",
+    "ValidationResult",
     "build_orchestrator_status",
     "create_orchestrator_bridge",
     "escape_html",
     "interpret_message",
     "linkify_github_refs",
+    "validate_github_links",
+    "validate_telegram_payload",
 ]

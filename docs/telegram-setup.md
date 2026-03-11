@@ -133,6 +133,82 @@ Once the bridge is active, the orchestrator polls SQS and recognizes these comma
 | `resume`       | Resumes normal task spawning                         |
 | *(free text)*  | Forwarded to the orchestrator for interpretation     |
 
+## Automated Testing
+
+### Tier 1 — CI integration tests
+
+The integration tests in `packages/telegram-bridge/tests/test_interpreter_e2e.py` validate the full interpreter-to-payload pipeline without touching Telegram. They run automatically in CI on every change to the telegram-bridge package (~5 seconds, no external dependencies).
+
+What they cover:
+- Interpreter output is valid JSON with correct action types
+- Formatted replies are safe for Telegram HTML parse mode (no unescaped `<`, `>`, `&`)
+- GitHub references (`#N`, `PR #N`) are linkified as clickable `<a>` tags
+- Status cards render correctly
+- Lambda handler correctly enqueues messages to SQS
+- Edge cases: special characters, malformed JSON responses, multiple issue references
+
+Run locally:
+```bash
+cd packages/telegram-bridge
+.venv/bin/pytest tests/test_interpreter_e2e.py -v
+```
+
+### Tier 2 — End-to-end smoke test with test bot
+
+The `scripts/tg-smoke-test.py` script validates the full pipeline by sending a real message through the Lambda webhook and verifying the bot's reply via the Telegram API.
+
+#### Setting up a test bot
+
+1. Open Telegram and search for [@BotFather](https://t.me/BotFather).
+2. Send `/newbot` and create a test bot (e.g. `judgemind_test_bot`).
+3. Copy the bot token.
+4. Store the token in Secrets Manager:
+   ```bash
+   aws secretsmanager create-secret \
+       --name judgemind/telegram/test-bot \
+       --secret-string '{"bot_token": "<TEST_BOT_TOKEN>"}'
+   ```
+   Or update if the secret already exists:
+   ```bash
+   aws secretsmanager put-secret-value \
+       --secret-id judgemind/telegram/test-bot \
+       --secret-string '{"bot_token": "<TEST_BOT_TOKEN>"}'
+   ```
+5. Add the test bot's user ID to the production bot's `allowed_user_ids` in the `judgemind/telegram/bot` secret so the Lambda accepts messages from it.
+6. Get the test bot's user ID by sending a message to it and checking the webhook logs, or use [@userinfobot](https://t.me/userinfobot).
+
+#### Running the smoke test
+
+```bash
+# Using Secrets Manager for the test bot token:
+TG_TEST_USER_ID=<test_bot_user_id> \
+TG_TEST_CHAT_ID=<chat_id> \
+WEBHOOK_URL=<api_gateway_url>/webhook \
+    scripts/tg-smoke-test.py
+
+# Or with explicit token:
+TG_TEST_BOT_TOKEN=<token> \
+TG_TEST_USER_ID=<test_bot_user_id> \
+TG_TEST_CHAT_ID=<chat_id> \
+WEBHOOK_URL=<api_gateway_url>/webhook \
+    scripts/tg-smoke-test.py
+
+# Validate configuration only (no messages sent):
+scripts/tg-smoke-test.py --dry-run --webhook-url <url>
+
+# Custom timeout:
+scripts/tg-smoke-test.py --timeout 60
+```
+
+The script exits 0 on success, 1 on test failure, and 2 on configuration error.
+
+#### What it checks
+
+1. Webhook accepts the synthetic payload (HTTP 200)
+2. Bot replies within the timeout (default 30 seconds)
+3. Reply text is non-empty and non-trivial
+4. GitHub issue references in the reply are rendered as clickable links (text_link entities)
+
 ## Troubleshooting
 
 **Bot doesn't respond to messages:**
