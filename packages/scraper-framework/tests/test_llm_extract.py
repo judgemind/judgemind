@@ -14,6 +14,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from ingestion.llm_extract import (
+    _SYSTEM_PROMPT,
     CASE_TYPE_VALUES,
     LLMExtractionResult,
     LLMRulingResult,
@@ -1604,3 +1605,73 @@ class TestChunkedExtraction:
         assert result.department == "42"
         # Should have collected rulings from all chunks
         assert result.case_count >= 6
+
+
+# ---------------------------------------------------------------------------
+# Outcome taxonomy clarity (#635)
+# ---------------------------------------------------------------------------
+
+
+class TestOutcomeTaxonomyClarity:
+    """Verify the system prompt explicitly guides the LLM on edge-case outcomes.
+
+    Issue #635: 'denied without prejudice' was classified as 'other' because the
+    taxonomy only said 'denied — motion was fully denied'.  The fix adds explicit
+    guidance for 'denied without prejudice' -> 'denied' and 'granted with
+    conditions' -> 'granted'.
+    """
+
+    def test_prompt_mentions_denied_without_prejudice(self) -> None:
+        assert "denied without prejudice" in _SYSTEM_PROMPT
+
+    def test_prompt_mentions_granted_with_conditions(self) -> None:
+        assert "granted with conditions" in _SYSTEM_PROMPT
+
+    def test_denied_without_prejudice_parsed_as_denied(self) -> None:
+        """When the LLM correctly returns 'denied', _parse_response keeps it."""
+        response_json = json.dumps(
+            {
+                "judge_name": "Test Judge",
+                "hearing_date": "2025-12-01",
+                "department": "C25",
+                "rulings": [
+                    {
+                        "case_number": "24CV12345",
+                        "case_title": "Smith v. Jones",
+                        "case_type": "civil",
+                        "outcome": "denied",
+                        "motion_type": "motion_for_leave_to_amend",
+                        "parties": [
+                            {"name": "Smith", "role": "plaintiff"},
+                            {"name": "Jones", "role": "defendant"},
+                        ],
+                    }
+                ],
+            }
+        )
+        result = _parse_response(response_json, None)
+        assert result is not None
+        assert result.rulings[0].outcome == "denied"
+
+    def test_granted_with_conditions_parsed_as_granted(self) -> None:
+        """When the LLM correctly returns 'granted', _parse_response keeps it."""
+        response_json = json.dumps(
+            {
+                "judge_name": None,
+                "hearing_date": None,
+                "department": None,
+                "rulings": [
+                    {
+                        "case_number": "24CV99999",
+                        "case_title": "A v. B",
+                        "case_type": "civil",
+                        "outcome": "granted",
+                        "motion_type": "preliminary_injunction",
+                        "parties": [],
+                    }
+                ],
+            }
+        )
+        result = _parse_response(response_json, None)
+        assert result is not None
+        assert result.rulings[0].outcome == "granted"
