@@ -42,6 +42,7 @@ jobs:
             scripts/ecs-run-task.sh
             scripts/ecs-logs.sh
             scripts/notify-telegram.sh
+            scripts/format-dq-summary.py
             data-quality-baselines.json
 
       - name: Configure AWS credentials
@@ -98,6 +99,24 @@ jobs:
             echo "Data quality check found alerts (exit code $EXIT_CODE)."
           fi
 
+      - name: Extract alert summary
+        if: steps.check.outputs.healthy == 'false'
+        id: summary
+        run: |
+          # Extract a markdown summary and a Telegram one-liner from the
+          # captured ECS task output. format-dq-summary.py parses the JSON
+          # alert payload emitted by data-quality-check.py.
+          MARKDOWN=$(python3 scripts/format-dq-summary.py /tmp/check_output.txt 2>/dev/null || echo "Could not extract alert details from check output.")
+          TELEGRAM=$(python3 scripts/format-dq-summary.py --telegram /tmp/check_output.txt 2>/dev/null || echo "Alert details unavailable.")
+
+          # Write to files for downstream steps (avoids quoting issues in
+          # GITHUB_OUTPUT for multi-line content).
+          echo "$MARKDOWN" > /tmp/alert_summary.md
+          echo "$TELEGRAM" > /tmp/alert_telegram.txt
+
+          echo "Alert summary extracted:"
+          cat /tmp/alert_summary.md
+
       - name: Check for existing open issue
         if: steps.check.outputs.healthy == 'false'
         id: existing
@@ -136,9 +155,10 @@ jobs:
             echo ""
             echo "The hourly data quality check detected collection health issues in the dev database."
             echo ""
-            echo "### Details"
+            echo "### Alert Summary"
             echo ""
-            echo "See the workflow run logs for the full output of the data quality check."
+            cat /tmp/alert_summary.md
+            echo ""
             echo ""
             echo "### Context"
             echo ""
@@ -155,7 +175,7 @@ jobs:
             echo ""
             echo "### Next Steps"
             echo ""
-            echo "1. Check the workflow run logs for specific county alerts"
+            echo "1. Review the alert details above to understand what failed"
             echo "2. Run manually: \`scripts/ecs-run-task.sh scripts/data-quality-check.py -- --text\`"
             echo "3. Check scraper logs: \`scripts/ecs-logs.sh /ecs/judgemind-scraper-dev --lines 100\`"
             echo "4. Review recent scraper deployments"
@@ -179,11 +199,12 @@ jobs:
         run: |
           ISSUE_URL="${{ steps.create-issue.outputs.issue_url }}"
           ISSUE_NUM="${ISSUE_URL##*/}"
+          TG_SUMMARY=$(cat /tmp/alert_telegram.txt 2>/dev/null || echo "Alert details unavailable.")
 
           {
             echo "<b>Data Quality Alert</b>"
             echo ""
-            echo "Hourly checks detected collection health issues on dev."
+            echo "${TG_SUMMARY}"
             echo ""
             echo "Issue #${ISSUE_NUM}: ${ISSUE_URL}"
           } > /tmp/tg_message.txt
@@ -204,7 +225,8 @@ jobs:
           {
             echo "### Update: Still failing at ${TIMESTAMP}"
             echo ""
-            echo "See workflow run for details."
+            cat /tmp/alert_summary.md
+            echo ""
             echo ""
             echo "**Workflow run:** ${RUN_URL}"
           } > /tmp/comment_body.md
