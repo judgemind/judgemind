@@ -530,6 +530,122 @@ def queue_to_inbox(message: dict[str, object], inbox_file: str) -> None:
 # ── Dispatch ────────────────────────────────────────────────────────────
 
 
+def _parse_iso_timestamp(ts: str) -> datetime.datetime | None:
+    """Parse an ISO-8601 timestamp string, returning ``None`` on failure."""
+    if not ts:
+        return None
+    try:
+        dt = datetime.datetime.fromisoformat(ts)
+        # Ensure timezone-aware (assume UTC if naive).
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=datetime.timezone.utc)
+        return dt
+    except (ValueError, TypeError):
+        return None
+
+
+def _staleness_seconds(ts: str) -> float | None:
+    """Return the number of seconds since *ts*, or ``None`` if unparseable."""
+    dt = _parse_iso_timestamp(ts)
+    if dt is None:
+        return None
+    now = datetime.datetime.now(datetime.timezone.utc)
+    return (now - dt).total_seconds()
+
+
+def merge_agent_status_into_orchestrator(
+    orchestrator_status: dict[str, Any],
+    agent_statuses: list[dict[str, str]],
+    *,
+    staleness_threshold_seconds: float = 120.0,
+) -> dict[str, Any]:
+    """Merge per-worker agent-status files into the orchestrator status.
+
+    For each worker found in *agent_statuses*, if the agent-status file has
+    a more recent ``updated`` timestamp than the corresponding entry in
+    ``orchestrator_status["active_agents"]``, the agent-status data is
+    preferred.  Workers only present in agent-status files are added.
+
+    If the overall ``updated_at`` field on the orchestrator status is older
+    than *staleness_threshold_seconds*, a ``staleness_warning`` key is added
+    to the returned dict.
+
+    The input *orchestrator_status* dict is **not** mutated; a shallow copy
+    is returned.
+
+    Args:
+        orchestrator_status: The status dict read from
+            ``orchestrator_status.json``.
+        agent_statuses: List of dicts from :func:`read_agent_status_files`.
+        staleness_threshold_seconds: Threshold (in seconds) above which
+            a staleness warning is emitted.  Defaults to 120 (2 minutes).
+
+    Returns:
+        A (possibly enriched) copy of *orchestrator_status*.
+    """
+    result = dict(orchestrator_status)
+    active_agents: list[dict[str, Any]] = list(result.get("active_agents", []))
+
+    # Build a lookup of existing agents by worker name/number for comparison.
+    agent_by_worker: dict[str, dict[str, Any]] = {}
+    for agent in active_agents:
+        # orchestrator_status entries use "worker_number" as an int
+        worker_key = f"worker-{agent.get('worker_number', '')}"
+        agent_by_worker[worker_key] = agent
+
+    for status in agent_statuses:
+        worker_name = status.get("worker", "")
+        if not worker_name:
+            continue
+
+        existing = agent_by_worker.get(worker_name)
+
+        # Parse timestamps for comparison.
+        status_ts = _parse_iso_timestamp(status.get("updated", ""))
+        existing_ts = _parse_iso_timestamp(
+            existing.get("updated", "") if existing else ""
+        )
+
+        # Prefer agent-status file if it is more recent or if no existing entry.
+        if existing is None:
+            # Only add if the worker is not in a terminal phase.
+            phase = status.get("phase", "")
+            if phase == "done":
+                continue
+            active_agents.append(
+                {
+                    "worker_number": worker_name.replace("worker-", ""),
+                    "issue_number": status.get("issue", "?"),
+                    "issue_title": status.get("summary", ""),
+                    "phase": phase,
+                    "updated": status.get("updated", ""),
+                    "source": "agent-status-file",
+                }
+            )
+        elif status_ts is not None and (existing_ts is None or status_ts > existing_ts):
+            # Update existing entry with fresher data from agent-status file.
+            existing["phase"] = status.get("phase", existing.get("phase", ""))
+            existing["updated"] = status.get("updated", existing.get("updated", ""))
+            if status.get("summary"):
+                existing["summary"] = status["summary"]
+            existing["source"] = "agent-status-file"
+
+    result["active_agents"] = active_agents
+
+    # Check overall staleness of orchestrator_status.json.
+    overall_updated = result.get("updated_at", "")
+    staleness = _staleness_seconds(overall_updated)
+    if staleness is not None and staleness > staleness_threshold_seconds:
+        minutes = staleness / 60.0
+        result["staleness_warning"] = (
+            f"Note: orchestrator status may be stale — "
+            f"last updated {minutes:.0f} minute(s) ago. "
+            f"Agent-status files have been merged for fresher per-worker data."
+        )
+
+    return result
+
+
 def dispatch_message(
     *,
     message: dict[str, object],
@@ -552,6 +668,11 @@ def dispatch_message(
     If the Anthropic API key is not available, falls back to a simple
     acknowledgment.
 
+    Agent-status files (``worker-N.txt``) are always read and merged with
+    the orchestrator status, preferring whichever source has the more
+    recent timestamp per worker.  This ensures the interpreter always has
+    the freshest possible view of each worker's state.
+
     Args:
         rate_limiter: Optional rate limiter passed through to
             :func:`interpret_message`.  When ``None``, no rate limiting
@@ -573,16 +694,24 @@ def dispatch_message(
     # Read orchestrator status for context.
     orchestrator_status = read_orchestrator_status(status_file)
 
+    # Always read agent-status files for per-worker freshness.
+    agent_statuses = read_agent_status_files(agent_status_dir)
+
     # If no status file exists, build a basic context from agent status files
     # and orchestrator state.
     if orchestrator_status is None:
         state = read_orchestrator_state(state_file)
-        agent_statuses = read_agent_status_files(agent_status_dir)
         orchestrator_status = {
             "active_agents": agent_statuses,
             "paused": state.get("paused", False),
             "workers": state.get("workers", {}),
         }
+    else:
+        # Merge agent-status data into orchestrator status, preferring
+        # whichever source is more recent per worker.
+        orchestrator_status = merge_agent_status_into_orchestrator(
+            orchestrator_status, agent_statuses
+        )
 
     # Call the Claude interpreter.
     try:
@@ -658,7 +787,9 @@ def dispatch_message(
                     "priority": action.get("priority", "p2"),
                     "labels": action.get("labels", []),
                     "reply_to": user_id,
-                    "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                    "timestamp": datetime.datetime.now(
+                        datetime.timezone.utc
+                    ).isoformat(),
                 },
                 inbox_file,
             )
@@ -670,7 +801,9 @@ def dispatch_message(
                     "action": "discuss",
                     "message": action.get("message", ""),
                     "reply_to": user_id,
-                    "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                    "timestamp": datetime.datetime.now(
+                        datetime.timezone.utc
+                    ).isoformat(),
                 },
                 inbox_file,
             )
@@ -682,7 +815,9 @@ def dispatch_message(
                     "action": "do",
                     "instruction": action.get("instruction", ""),
                     "reply_to": user_id,
-                    "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                    "timestamp": datetime.datetime.now(
+                        datetime.timezone.utc
+                    ).isoformat(),
                 },
                 inbox_file,
             )
