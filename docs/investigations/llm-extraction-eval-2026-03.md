@@ -127,7 +127,66 @@ This means the tiered escalation strategy based on confidence thresholds would n
 2. **Hybrid vs full migration:** Should we use LLM for new courts only, or also migrate existing courts?
 3. **Accuracy threshold:** What per-field accuracy is required before we ship LLM extraction to production? (Current: ~79% overall, but many "errors" are normalization issues.)
 
+## v2 Prompt Evaluation (#428)
+
+**Date:** 2026-03-10
+
+### Prompt Changes
+
+Six improvements applied to `_SYSTEM_PROMPT` in `packages/scraper-framework/src/ingestion/llm_extract.py`:
+
+1. **Multi-case counting:** Strengthened instruction to "read through the ENTIRE document systematically" and "count every case number you find," with guidance on common patterns (numbered lists, case headers, page breaks).
+2. **Outcome taxonomy clarification:** Added explicit definitions and examples for each outcome value. Key addition: "off_calendar means the hearing was REMOVED from the calendar entirely. This is NOT the same as 'continued'."
+3. **Multi-department PDFs:** New rule instructing the model to extract ALL rulings from ALL departments, with the top-level fields reflecting the first department.
+4. **Case number normalization:** Already present in v1 prompt (no change needed).
+5. **Department normalization:** New rule: "Preserve the department identifier exactly as it appears, INCLUDING leading zeros. 'CM02' stays 'CM02'."
+6. **Judge name extraction:** Expanded instruction to check "document headers, footers, department headings, signature blocks, PDF metadata, and the ruling text itself."
+
+Additional: added `motion_for_judgment_on_the_pleadings` and `motion_for_protective_order` to the motion type taxonomy.
+
+### v2 Accuracy Results (Haiku)
+
+| Field | v1 | v2 | Change |
+|-------|-----|-----|--------|
+| judge_name | 77.8% | 100.0% | +22.2pp |
+| hearing_date | 94.4% | 100.0% | +5.6pp |
+| department | 88.9% | 93.3% | +4.4pp |
+| case_number | 94.4% | 100.0% | +5.6pp |
+| case_title | 75.0% | 100.0% | +25.0pp |
+| outcome | 25.0% | 85.7% | +60.7pp |
+| motion_type | 50.0% | 87.5% | +37.5pp |
+| case_count | 55.6% | 94.1% | +38.5pp |
+| **OVERALL** | **78.4%** | **95.4%** | **+17.0pp** |
+
+**All acceptance criteria met:**
+- Overall accuracy >90%: **95.4%** (target: >90%)
+- case_count accuracy >80%: **94.1%** (target: >80%)
+- outcome accuracy >60%: **85.7%** (target: >60%)
+
+### v2 Remaining Mismatches
+
+Only 4 mismatches out of 87 field comparisons:
+
+| Fixture | Field | Expected | Got | Analysis |
+|---------|-------|----------|-----|----------|
+| oc_costa_mesa_cm.pdf | department | CM02 | CM2 | Model drops leading zero despite explicit instruction. Persistent across runs. |
+| oc_family_law_claustro_c22.pdf | motion_type | other | None | Family law RFO — model does not classify unrecognized motion types. |
+| oc_probate_cm5.pdf | case_count | 2 | 3 | Ambiguous — document may contain a third case depending on interpretation. |
+| la_ruling_cha_f46.html | outcome | denied | other | "Denied without prejudice" classified as "other" instead of "denied". |
+
+### Key Takeaways
+
+1. **The v2 prompt dramatically improved case_count and outcome accuracy** — the two worst-performing fields in v1. The instruction to "read through the ENTIRE document systematically" and the explicit outcome definitions resolved most systematic errors.
+
+2. **Department leading-zero normalization is a stubborn model limitation.** Even with explicit "CM02 stays CM02" instructions, Haiku drops the leading zero. This should be handled in post-processing rather than prompt engineering.
+
+3. **"Denied without prejudice" → "other"** is a taxonomy edge case. The prompt should add: "denied — motion was denied, INCLUDING 'denied without prejudice'."
+
+4. **Average latency is ~5s per fixture on Haiku** (range: 0.6s for empty docs to 15s for 36-page PDFs). This is acceptable for batch processing.
+
 ## Raw Data
 
-Full results JSON: `worktrees/worker-2/tmp/llm_eval_results.json`
-Eval script: `worktrees/worker-2/tmp/llm_extraction_eval.py`
+v1 results JSON: `worktrees/worker-2/tmp/llm_eval_results.json` (no longer available — worktree removed)
+v1 eval script: `worktrees/worker-2/tmp/llm_extraction_eval.py` (no longer available — worktree removed)
+v2 results JSON: `worktrees/worker-9/tmp/llm_eval_v2_results.json`
+v2 eval script: `worktrees/worker-9/tmp/llm_extraction_eval.py`

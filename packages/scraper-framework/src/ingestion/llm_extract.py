@@ -221,29 +221,53 @@ _SYSTEM_PROMPT = (  # noqa: E501 — prompt text sent to LLM, line length irrele
     "fields into JSON.\n\n"
     "## Rules\n\n"
     "1. **Multi-ruling documents:** A single document may "
-    "contain rulings for multiple cases. Return an array "
-    "of ALL cases found.\n\n"
-    "2. **Outcome taxonomy** — use EXACTLY one of these "
+    "contain rulings for MANY cases (sometimes 10+). You MUST "
+    "return an array of ALL cases found in the entire document. "
+    "Read through the ENTIRE document systematically — do not "
+    "stop after the first few cases. Count every case number "
+    "you find. Common patterns: numbered lists (#1, #2, ...), "
+    "case headers with case numbers, or page breaks between "
+    "cases.\n\n"
+    "2. **Multi-department documents:** Some documents contain "
+    "rulings from multiple departments (e.g. Dept N14 on page 1, "
+    "Dept N6 on page 15). Extract ALL rulings from ALL "
+    "departments. The top-level judge_name and department should "
+    "reflect the FIRST department in the document. If different "
+    "departments have different judges, note the judge for each "
+    "department in the rulings where applicable.\n\n"
+    "3. **Outcome taxonomy** — use EXACTLY one of these "
     "values:\n"
-    "   - granted\n"
-    "   - denied\n"
-    "   - granted_in_part\n"
-    "   - denied_in_part\n"
-    "   - moot\n"
-    "   - continued\n"
-    "   - off_calendar\n"
-    "   - submitted\n"
+    "   - granted — motion was fully granted\n"
+    "   - denied — motion was fully denied\n"
+    "   - granted_in_part — motion was partially granted "
+    "and partially denied\n"
+    "   - denied_in_part — motion was partially denied\n"
+    "   - moot — motion is moot (no longer relevant)\n"
+    "   - continued — hearing was postponed to a future date\n"
+    "   - off_calendar — the hearing was REMOVED from the "
+    "calendar entirely. This is NOT the same as 'continued'. "
+    "'Off calendar' means the matter will not be heard. "
+    "Look for phrases like 'taken off calendar', "
+    "'off calendar', 'removed from calendar', "
+    "'OCAL', 'OC', or 'vacated'.\n"
+    "   - submitted — matter was taken under submission "
+    "for the judge to decide later\n"
     "   - other (only if none of the above fit)\n\n"
-    "3. **Case number normalization:** Strip any county "
+    "4. **Case number normalization:** Strip any county "
     "prefix digits before the year. For example, "
     '"30-2024-01393434" becomes "2024-01393434". '
     "Keep the full number for formats like "
     '"24NNCV02551".\n\n'
-    "4. **Parties:** Extract plaintiff(s) and defendant(s) "
+    "5. **Department normalization:** Preserve the department "
+    "identifier exactly as it appears in the document, "
+    "INCLUDING leading zeros. For example, 'CM02' stays "
+    "'CM02' (do NOT simplify to 'CM2'). 'CM05' stays "
+    "'CM05'. 'N14' stays 'N14'.\n\n"
+    "6. **Parties:** Extract plaintiff(s) and defendant(s) "
     "from case captions. Each party is "
     '{"name": "...", "role": "plaintiff"} or '
     '{"name": "...", "role": "defendant"}.\n\n'
-    "5. **Case type:** Classify the case using EXACTLY one "
+    "7. **Case type:** Classify the case using EXACTLY one "
     "of these values:\n"
     "   - civil (general civil litigation, torts, contracts, "
     "employment, PI — includes 'unlimited civil' and "
@@ -265,7 +289,7 @@ _SYSTEM_PROMPT = (  # noqa: E501 — prompt text sent to LLM, line length irrele
     "Motion types like 'demurrer', 'msj', 'anti_slapp' "
     "are civil. "
     "If the case type cannot be determined, use null.\n\n"
-    "6. **Motion type:** Use a short descriptive label. "
+    "8. **Motion type:** Use a short descriptive label. "
     "Common values: "
     '"msj" (summary judgment), '
     '"msj_partial" (summary adjudication), '
@@ -280,12 +304,23 @@ _SYSTEM_PROMPT = (  # noqa: E501 — prompt text sent to LLM, line length irrele
     '"motion_to_be_relieved_as_counsel", '
     '"motion_for_leave_to_amend", '
     '"motion_for_sanctions", '
+    '"motion_for_judgment_on_the_pleadings", '
+    '"motion_for_protective_order", '
     '"osc" (order to show cause), "other".\n\n'
-    "7. **Hearing date:** Return as ISO format "
+    "9. **Hearing date:** Return as ISO format "
     '"YYYY-MM-DD".\n\n'
-    "8. **Judge name:** Extract the judge's full name. "
-    'Do not include titles like "Hon." or "Judge".\n\n'
-    "9. If metadata is provided (judge_name, department), "
+    "10. **Judge name:** Extract the judge's full name. "
+    'Do not include titles like "Hon.", "Judge", or '
+    '"Commissioner". Check ALL of these locations for '
+    "the judge's name:\n"
+    "   - Document headers and footers\n"
+    "   - Department headings (e.g. 'DEPT C25 / "
+    "Judge Gassia Apkarian')\n"
+    "   - Signature blocks at the end of rulings\n"
+    "   - PDF metadata or page headers\n"
+    "   - The ruling text itself\n"
+    "   If no judge name is found anywhere, return null.\n\n"
+    "11. If metadata is provided (judge_name, department), "
     "treat it as authoritative — use it directly rather "
     "than extracting from the document.\n\n"
     "## Output format\n\n"
@@ -293,7 +328,7 @@ _SYSTEM_PROMPT = (  # noqa: E501 — prompt text sent to LLM, line length irrele
     "{\n"
     '  "judge_name": "First M. Last" or null,\n'
     '  "hearing_date": "YYYY-MM-DD" or null,\n'
-    '  "department": "3" or "H" or null,\n'
+    '  "department": "C25" or "N14" or "CM02" or null,\n'
     '  "rulings": [\n'
     "    {\n"
     '      "case_number": "24NNCV02551" or null,\n'
