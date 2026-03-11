@@ -110,6 +110,41 @@ preflight_venv_local() {
 }
 
 # --------------------------------------------------------------------------
+# preflight_tf_not_root [path]
+#   Verify that a terraform apply/destroy is not being run from the root
+#   infra/terraform/ directory. The root config shares module sources with
+#   environment-specific configs but has its own state backend (key
+#   "terraform.tfstate"). Running apply from the root creates duplicate
+#   resources that collide with the real ones in environments/<env>/.
+#
+#   Pass the -chdir path or cwd if not provided.
+#   Returns 0 (OK) if the path is an environment directory.
+#   Returns 1 (FAIL) if the path is the root infra/terraform/ directory.
+# --------------------------------------------------------------------------
+preflight_tf_not_root() {
+    local tf_dir="${1:-.}"
+
+    # Resolve to absolute path
+    tf_dir=$(cd "$tf_dir" 2>/dev/null && pwd) || tf_dir="$1"
+
+    # Check if the path ends with infra/terraform (the root) rather than
+    # infra/terraform/environments/<env>
+    if [[ "$tf_dir" =~ infra/terraform/?$ ]]; then
+        echo "PREFLIGHT FAIL: terraform apply/destroy from root infra/terraform/ is forbidden." >&2
+        echo "  The root directory does not track deployed resources." >&2
+        echo "  Use an environment-specific path instead:" >&2
+        echo "    infra/terraform/environments/dev/" >&2
+        echo "    infra/terraform/environments/staging/" >&2
+        echo "    infra/terraform/environments/production/" >&2
+        echo "" >&2
+        echo "  Example: terraform -chdir=infra/terraform/environments/dev apply" >&2
+        return 1
+    fi
+
+    return 0
+}
+
+# --------------------------------------------------------------------------
 # preflight_no_forbidden_syntax <command_string>
 #   Check a command string for forbidden shell patterns. Mirrors the checks
 #   in .claude/hooks/preflight-bash.sh but can be called from scripts.

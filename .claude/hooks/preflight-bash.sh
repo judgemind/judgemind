@@ -104,5 +104,25 @@ if echo "$COMMAND" | grep -qE '""[[:space:]]+-' ; then
     exit 2
 fi
 
+# 7. Terraform apply/destroy from root infra/terraform/ path.
+#    The root directory has its own state backend that creates duplicate resources.
+#    All applies must target an environment-specific path (environments/dev/, etc.).
+#    Catches: terraform -chdir=.../infra/terraform apply
+#             terraform -chdir=infra/terraform destroy
+#    Does NOT block: terraform -chdir=infra/terraform/environments/dev apply
+#                    terraform -chdir=infra/terraform init (init/plan/fmt are fine)
+#                    terraform -chdir=infra/terraform validate
+#                    terraform -chdir=infra/terraform state ... (state ops are fine)
+if echo "$COMMAND" | grep -qE '\bterraform\b' ; then
+    if echo "$COMMAND" | grep -qE '\b(apply|destroy)\b' ; then
+        if echo "$COMMAND" | grep -qE 'infra/terraform' ; then
+            if ! echo "$COMMAND" | grep -qE 'infra/terraform/environments/' ; then
+                echo "BLOCKED: terraform apply/destroy from root infra/terraform/ is forbidden. The root state creates duplicate resources. Use an environment-specific path: infra/terraform/environments/dev/ (or staging/production). See CLAUDE.md §Infrastructure Code." >&2
+                exit 2
+            fi
+        fi
+    fi
+fi
+
 # All checks passed
 exit 0
