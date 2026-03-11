@@ -349,15 +349,6 @@ def _extract_motion_type(text: str) -> str | None:
             raw = raw[:80]
         return _normalize_motion_type(raw) if raw else None
 
-    # Pattern 3: "MOTION TO <type>" (all caps, MV-style)
-    m = re.search(
-        r"MOTION\s+TO\s+(?P<mt>[A-Z\s]+?)(?:\s+BY\s|\s+OF\s|\s*$)",
-        header,
-    )
-    if m:
-        raw = " ".join(m.group("mt").split()).strip()
-        return _normalize_motion_type(raw) if raw else None
-
     return None
 
 
