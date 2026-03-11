@@ -12,7 +12,7 @@ messages without responding.
 
 Usage::
 
-    scripts/tg-responder.py [--interval 5] [--pid-file tmp/tg_responder.pid]
+    scripts/tg-responder.py [--interval 1] [--pid-file tmp/tg_responder.pid]
 
 To stop the daemon gracefully, create the stop file::
 
@@ -589,18 +589,28 @@ def dispatch_command(
 def poll_sqs(
     sqs_client: object,
     queue_url: str,
+    *,
+    long_poll_seconds: int = 20,
 ) -> list[dict[str, object]]:
     """Receive and delete all pending messages from *queue_url*.
+
+    The first ``receive_message`` call uses SQS long polling (blocks up to
+    *long_poll_seconds*) to avoid empty short-poll API calls.  Subsequent
+    calls to drain any remaining messages use ``WaitTimeSeconds=0``.
 
     Returns a list of parsed message bodies (dicts).
     """
     messages: list[dict[str, object]] = []
+    first_call = True
 
     while True:
+        wait_time = long_poll_seconds if first_call else 0
+        first_call = False
+
         resp = sqs_client.receive_message(  # type: ignore[union-attr]
             QueueUrl=queue_url,
             MaxNumberOfMessages=10,
-            WaitTimeSeconds=0,
+            WaitTimeSeconds=wait_time,
         )
         batch = resp.get("Messages", [])
         if not batch:
@@ -798,8 +808,8 @@ def main() -> None:
     parser.add_argument(
         "--interval",
         type=float,
-        default=5.0,
-        help="Polling interval in seconds (default: 5)",
+        default=1.0,
+        help="Polling interval in seconds between long-poll cycles (default: 1)",
     )
     parser.add_argument(
         "--state-file",

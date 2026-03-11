@@ -733,7 +733,8 @@ class TestPollSqs:
 
             mod = _import_responder()
             sqs = boto3.client("sqs", region_name="us-west-2")
-            messages = mod.poll_sqs(sqs, queue_url)
+            # Use long_poll_seconds=0 to avoid moto blocking on long poll.
+            messages = mod.poll_sqs(sqs, queue_url, long_poll_seconds=0)
             assert len(messages) == 2
 
             # Messages should be deleted from queue
@@ -745,8 +746,17 @@ class TestPollSqs:
             queue_url = _setup_sqs()
             mod = _import_responder()
             sqs = boto3.client("sqs", region_name="us-west-2")
-            messages = mod.poll_sqs(sqs, queue_url)
+            messages = mod.poll_sqs(sqs, queue_url, long_poll_seconds=0)
             assert messages == []
+
+    def test_long_poll_seconds_default_is_20(self) -> None:
+        """Verify the default long_poll_seconds parameter is 20."""
+        import inspect
+
+        mod = _import_responder()
+        sig = inspect.signature(mod.poll_sqs)
+        default = sig.parameters["long_poll_seconds"].default
+        assert default == 20
 
 
 # ── Daemon lifecycle ────────────────────────────────────────────────────
