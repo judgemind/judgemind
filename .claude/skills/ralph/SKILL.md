@@ -36,7 +36,8 @@ Create the state directory and seed the task file:
 ├── gemini-review-result.txt   # Gemini verdict: "SHIP", "REVISE", or "SKIPPED"
 ├── gemini-feedback.md         # Gemini detailed review feedback
 ├── iteration.txt              # current iteration number (written before each iteration)
-└── review-log.jsonl           # structured review log (appended by gemini_review.py and the loop)
+├── review-log.jsonl           # structured review log (appended by gemini_review.py and the loop)
+└── ralph-done.txt             # completion signal for the calling /task workflow
 ```
 
 Write `task.md` with:
@@ -243,7 +244,17 @@ Run this script with any available Python 3 interpreter.
 
 If the loop ended due to max iterations (not SHIP), change `final_verdict` to `"MAX_ITERATIONS"` before running.
 
-### 3b — Return to caller
+### 3b — Write completion signal and return to caller
+
+**CRITICAL:** Write a completion signal file so the calling `/task` workflow can verify ralph finished and knows what to do next. This file serves as a handoff contract between the two skills.
+
+Write `{worktree}/tmp/ralph/ralph-done.txt` with exactly this content (substituting the actual iteration count):
+
+```
+status: SHIP
+iterations: <N>
+next-steps: The /task workflow MUST now continue with: A.3 (stage, commit, push), A.4 (verify no merge conflicts), A.5 (monitor CI), A.6 (update PR test plan), A.7 (merge PR), A.8 (verify deployment if applicable), A.9 (retrospective). THE TASK IS NOT COMPLETE UNTIL ALL THESE STEPS FINISH.
+```
 
 The code is ready for commit. Return control to the calling workflow (`/task` Path A), which handles staging, committing, pushing, PR creation, CI monitoring, and cleanup.
 
