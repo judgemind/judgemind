@@ -9,6 +9,9 @@ import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+# Skip venv auto-detection during tests — deps are mocked.
+os.environ["_VENV_HELPER_SKIP"] = "1"
+
 # Add the scripts directory to the path so we can import the daemon module.
 SCRIPTS_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(SCRIPTS_DIR))
