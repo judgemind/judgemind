@@ -367,6 +367,27 @@ COMMENT ON TABLE scraper_runs IS 'One row per scraper execution. Powers the heal
 
 
 -- =============================================================================
+-- DATA QUALITY METRICS
+-- Time-series metrics per county for the data quality dashboard.
+-- TODO(ops): Add a retention policy (e.g. DROP rows older than 90 days) when
+-- data volume warrants it.
+-- =============================================================================
+
+CREATE TABLE data_quality_metrics (
+    id              BIGSERIAL       PRIMARY KEY,
+    recorded_at     TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
+    county          TEXT            NOT NULL,
+    metric_name     TEXT            NOT NULL,
+    metric_value    NUMERIC         NOT NULL,
+    metadata        JSONB
+);
+
+COMMENT ON TABLE data_quality_metrics IS 'Time-series data quality metrics per county. Powers the data quality dashboard.';
+COMMENT ON COLUMN data_quality_metrics.metric_name IS 'e.g. ruling_count_24h, field_completeness_pct, scraper_last_success_age_hours.';
+COMMENT ON COLUMN data_quality_metrics.metadata IS 'Optional context: {scraper_id, run_id, breakdown, ...}.';
+
+
+-- =============================================================================
 -- USERS & ALERTS
 -- =============================================================================
 
@@ -482,6 +503,9 @@ CREATE INDEX idx_staging_ruled_status       ON staging.ruled_items(validation_st
 
 -- Scraper health — dashboard needs recent runs per scraper
 CREATE INDEX idx_scraper_runs_scraper_id    ON scraper_runs(scraper_id, started_at DESC);
+
+-- Data quality metrics — time-series lookups by county and metric
+CREATE INDEX idx_dqm_county_metric_time     ON data_quality_metrics(county, metric_name, recorded_at DESC);
 
 -- Refresh tokens
 CREATE INDEX idx_refresh_tokens_user_id     ON refresh_tokens(user_id);
