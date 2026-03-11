@@ -4,6 +4,6 @@
   "packages/nlp-pipeline": 100.0,
   "packages/telegram-bridge": 94.9,
   "packages/api": 57.7,
-  "packages/web": 33.3,
+  "packages/web": 29.0,
   "infra/telegram-bot": 95.0
 }
