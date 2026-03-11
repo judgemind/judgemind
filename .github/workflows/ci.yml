@@ -375,9 +375,13 @@ jobs:
       - name: Diff coverage — scraper-framework
         if: needs.detect-changes.outputs.scraper == 'true'
         run: |
-          COV_FILE="coverage-artifacts/coverage-scraper-unit/coverage.xml"
-          if [ -f "$COV_FILE" ]; then
-            diff-cover "$COV_FILE" --compare-branch=origin/main --fail-under=90 --diff-range-notation='..'
+          COV_UNIT="coverage-artifacts/coverage-scraper-unit/coverage.xml"
+          COV_INGEST="coverage-artifacts/coverage-scraper-ingestion/coverage.xml"
+          COV_FILES=""
+          if [ -f "$COV_UNIT" ]; then COV_FILES="$COV_UNIT"; fi
+          if [ -f "$COV_INGEST" ]; then COV_FILES="$COV_FILES $COV_INGEST"; fi
+          if [ -n "$COV_FILES" ]; then
+            diff-cover $COV_FILES --compare-branch=origin/main --fail-under=90 --diff-range-notation='..'
           else
             echo "No coverage artifact for scraper-framework — skipping diff-cover"
           fi

@@ -78,6 +78,7 @@ from ingestion.db import (  # noqa: E402
 from ingestion.extract import (  # noqa: E402
     extract_case_number,
     extract_case_title,
+    extract_case_type_from_number,
     extract_hearing_date,
     extract_judge_name,
     extract_motion_type,
@@ -576,6 +577,13 @@ def _reparse_document(
         if val:
             extracted["hearing_date"] = val
             extraction_methods.setdefault("hearing_date", "regex")
+
+    # Fallback case_type from case number prefix (#706).
+    if not extracted["case_type"] and extracted["case_number"]:
+        val = extract_case_type_from_number(extracted["case_number"])
+        if val:
+            extracted["case_type"] = val
+            extraction_methods.setdefault("case_type", "regex")
 
     if extraction_methods:
         logger.info(
