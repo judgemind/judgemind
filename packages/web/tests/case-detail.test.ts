@@ -5,8 +5,8 @@ import {
   buildDownloadUrl,
   FORMAT_LABELS,
   RULING_TEXT_TRUNCATE_LENGTH,
-} from '../src/app/cases/[id]/CaseDetail';
-import { formatLabel } from '../src/lib/display-helpers';
+  formatLabel,
+} from '../src/lib/display-helpers';
 
 describe('formatLabel', () => {
   it('returns em-dash for null', () => {

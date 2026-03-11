@@ -4,7 +4,7 @@ import { useState, useCallback, useEffect, useMemo } from 'react';
 import { useQuery, gql } from '@apollo/client';
 import { useRouter, useSearchParams } from 'next/navigation';
 import Link from 'next/link';
-import { formatDate } from '../rulings/RulingsFeed';
+import { formatDate } from '@/lib/display-helpers';
 
 const SEARCH_RULINGS_QUERY = gql`
   query SearchRulings(

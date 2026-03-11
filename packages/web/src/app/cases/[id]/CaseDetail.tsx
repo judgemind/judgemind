@@ -3,8 +3,17 @@
 import { useState } from 'react';
 import { useQuery, gql } from '@apollo/client';
 import Link from 'next/link';
-import { formatDate, formatOutcome } from '../../rulings/RulingsFeed';
-import { cleanRulingText, formatLabel } from '../../../lib/display-helpers';
+import {
+  buildDownloadUrl,
+  cleanRulingText,
+  FORMAT_LABELS,
+  formatDate,
+  formatLabel,
+  formatOutcome,
+  groupParties,
+  RULING_TEXT_TRUNCATE_LENGTH,
+  truncateText,
+} from '../../../lib/display-helpers';
 
 const CASE_QUERY = gql`
   query CaseDetail($id: ID!) {
@@ -119,75 +128,7 @@ const OUTCOME_BADGE: Record<string, string> = {
     'bg-yellow-100 text-yellow-800 dark:bg-yellow-900 dark:text-yellow-200',
 };
 
-/** Party roles grouped as plaintiffs. */
-const PLAINTIFF_ROLES = new Set(['plaintiff', 'petitioner', 'cross_complainant', 'moving_party']);
-
-/** Party roles grouped as defendants. */
-const DEFENDANT_ROLES = new Set(['defendant', 'respondent', 'cross_defendant', 'responding_party']);
-
-/** Map document format to a human-readable label. */
-export const FORMAT_LABELS: Record<string, string> = {
-  pdf: 'PDF',
-  html: 'HTML',
-  txt: 'TXT',
-  docx: 'DOCX',
-};
-
-/** Build the download URL for a document. Uses the same origin as the GraphQL API. */
-export function buildDownloadUrl(documentId: string): string {
-  const graphqlUrl = process.env.NEXT_PUBLIC_GRAPHQL_URL ?? 'http://localhost:3001/graphql';
-  const baseUrl = graphqlUrl.replace(/\/graphql$/, '');
-  return `${baseUrl}/api/documents/${documentId}/download`;
-}
-
 const PAGE_SIZE = 20;
-
-/** Number of characters shown before truncation. */
-export const RULING_TEXT_TRUNCATE_LENGTH = 500;
-
-/**
- * Truncate text to `maxLen` characters, breaking at the last whitespace
- * boundary before the limit. Returns the original string if it fits.
- */
-export function truncateText(text: string, maxLen: number): string {
-  if (text.length <= maxLen) return text;
-  const truncated = text.slice(0, maxLen);
-  const lastSpace = truncated.lastIndexOf(' ');
-  // If there's a space in the first half, break there; otherwise hard-cut.
-  if (lastSpace > maxLen / 2) {
-    return truncated.slice(0, lastSpace) + '\u2026';
-  }
-  return truncated + '\u2026';
-}
-
-/**
- * Group parties into plaintiffs, defendants, and other columns.
- * Uses the case-specific ``role`` from the case_parties join table
- * (plaintiff, defendant, petitioner, etc.). Falls back to ``partyType``
- * for legacy data that only has entity classification.
- */
-export function groupParties(
-  parties: Array<{ id: string; canonicalName: string; partyType: string | null; role: string | null }>,
-): {
-  plaintiffs: typeof parties;
-  defendants: typeof parties;
-  others: typeof parties;
-} {
-  const plaintiffs: typeof parties = [];
-  const defendants: typeof parties = [];
-  const others: typeof parties = [];
-  for (const party of parties) {
-    const key = (party.role ?? party.partyType ?? '').toLowerCase();
-    if (PLAINTIFF_ROLES.has(key)) {
-      plaintiffs.push(party);
-    } else if (DEFENDANT_ROLES.has(key)) {
-      defendants.push(party);
-    } else {
-      others.push(party);
-    }
-  }
-  return { plaintiffs, defendants, others };
-}
 
 function SkeletonBlock() {
   return (

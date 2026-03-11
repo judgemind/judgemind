@@ -1,8 +1,15 @@
 import { describe, it, expect } from 'vitest';
 import {
+  buildDownloadUrl,
   detectParagraphs,
+  FORMAT_LABELS,
+  formatJudgeName,
   formatLabel,
+  formatMotionType,
+  groupParties,
+  RULING_TEXT_TRUNCATE_LENGTH,
   stripBoilerplate,
+  truncateText,
   cleanRulingText,
 } from '../display-helpers';
 
@@ -25,6 +32,134 @@ describe('formatLabel', () => {
 
   it('handles anti_slapp as a known compound label', () => {
     expect(formatLabel('anti_slapp')).toBe('Anti-SLAPP');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// formatMotionType
+// ---------------------------------------------------------------------------
+
+describe('formatMotionType', () => {
+  it('returns "Not classified" for null', () => {
+    expect(formatMotionType(null)).toBe('Not classified');
+  });
+
+  it('handles anti_slapp as a known compound label', () => {
+    expect(formatMotionType('anti_slapp')).toBe('Anti-SLAPP');
+  });
+
+  it('uppercases known abbreviations', () => {
+    expect(formatMotionType('msj')).toBe('MSJ');
+    expect(formatMotionType('mtd')).toBe('MTD');
+    expect(formatMotionType('mil')).toBe('MIL');
+  });
+
+  it('lowercases small words except at start', () => {
+    expect(formatMotionType('motion_to_dismiss')).toBe('Motion to Dismiss');
+  });
+
+  it('title-cases generic motion types', () => {
+    expect(formatMotionType('summary_judgment')).toBe('Summary Judgment');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// formatJudgeName
+// ---------------------------------------------------------------------------
+
+describe('formatJudgeName', () => {
+  it('returns "Unknown judge" for null', () => {
+    expect(formatJudgeName(null)).toBe('Unknown judge');
+  });
+
+  it('returns the canonical name', () => {
+    expect(formatJudgeName({ canonicalName: 'Smith, John' })).toBe('Smith, John');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// FORMAT_LABELS & buildDownloadUrl
+// ---------------------------------------------------------------------------
+
+describe('FORMAT_LABELS', () => {
+  it('maps common document formats', () => {
+    expect(FORMAT_LABELS['pdf']).toBe('PDF');
+    expect(FORMAT_LABELS['html']).toBe('HTML');
+  });
+});
+
+describe('buildDownloadUrl', () => {
+  it('builds URL from NEXT_PUBLIC_GRAPHQL_URL env var', () => {
+    const original = process.env.NEXT_PUBLIC_GRAPHQL_URL;
+    process.env.NEXT_PUBLIC_GRAPHQL_URL = 'https://api.example.com/graphql';
+    expect(buildDownloadUrl('doc-123')).toBe('https://api.example.com/api/documents/doc-123/download');
+    process.env.NEXT_PUBLIC_GRAPHQL_URL = original;
+  });
+
+  it('falls back to localhost when env var is unset', () => {
+    const original = process.env.NEXT_PUBLIC_GRAPHQL_URL;
+    delete process.env.NEXT_PUBLIC_GRAPHQL_URL;
+    expect(buildDownloadUrl('doc-456')).toBe('http://localhost:3001/api/documents/doc-456/download');
+    process.env.NEXT_PUBLIC_GRAPHQL_URL = original;
+  });
+});
+
+// ---------------------------------------------------------------------------
+// truncateText & RULING_TEXT_TRUNCATE_LENGTH
+// ---------------------------------------------------------------------------
+
+describe('RULING_TEXT_TRUNCATE_LENGTH', () => {
+  it('is 500', () => {
+    expect(RULING_TEXT_TRUNCATE_LENGTH).toBe(500);
+  });
+});
+
+describe('truncateText', () => {
+  it('returns short text unchanged', () => {
+    expect(truncateText('Hello world', 100)).toBe('Hello world');
+  });
+
+  it('truncates at word boundary', () => {
+    const text = 'The quick brown fox jumps over the lazy dog';
+    const result = truncateText(text, 25);
+    expect(result).toContain('\u2026');
+    expect(result.length).toBeLessThanOrEqual(30);
+  });
+
+  it('returns original when length equals maxLen', () => {
+    expect(truncateText('exact', 5)).toBe('exact');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// groupParties
+// ---------------------------------------------------------------------------
+
+describe('groupParties', () => {
+  it('groups by role when role is present', () => {
+    const parties = [
+      { id: '1', canonicalName: 'Alice', partyType: null, role: 'plaintiff' },
+      { id: '2', canonicalName: 'Bob', partyType: null, role: 'defendant' },
+      { id: '3', canonicalName: 'Carol', partyType: null, role: 'petitioner' },
+    ];
+    const result = groupParties(parties);
+    expect(result.plaintiffs.map((p) => p.canonicalName)).toEqual(['Alice', 'Carol']);
+    expect(result.defendants.map((p) => p.canonicalName)).toEqual(['Bob']);
+  });
+
+  it('falls back to partyType when role is null', () => {
+    const parties = [
+      { id: '1', canonicalName: 'Alice', partyType: 'plaintiff', role: null },
+    ];
+    const result = groupParties(parties);
+    expect(result.plaintiffs.map((p) => p.canonicalName)).toEqual(['Alice']);
+  });
+
+  it('handles empty list', () => {
+    const result = groupParties([]);
+    expect(result.plaintiffs).toEqual([]);
+    expect(result.defendants).toEqual([]);
+    expect(result.others).toEqual([]);
   });
 });
 
