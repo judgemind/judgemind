@@ -426,6 +426,31 @@ class OrchestratorBridge:
         """
         await self.bridge.notify(text, repo=self.repo)
 
+    async def notify(self, text: str, *, repo: str = DEFAULT_GITHUB_REPO) -> None:
+        """Send a plain-text notification to all allowed users.
+
+        Pass-through to :meth:`TelegramBridge.notify` so that callers can
+        use ``OrchestratorBridge`` without needing to access the inner bridge
+        directly.  No-op if the bridge is disabled.
+        """
+        await self.bridge.notify(text, repo=repo)
+
+    async def status_update(
+        self,
+        *,
+        task: str,
+        state: str,
+        details: str,
+        repo: str = DEFAULT_GITHUB_REPO,
+    ) -> None:
+        """Send a formatted status card to all allowed users.
+
+        Pass-through to :meth:`TelegramBridge.status_update` so that callers
+        can use ``OrchestratorBridge`` without needing to access the inner
+        bridge directly.  No-op if the bridge is disabled.
+        """
+        await self.bridge.status_update(task=task, state=state, details=details, repo=repo)
+
     # ── Inbound command polling ─────────────────────────────────────────
 
     async def poll_commands(self) -> list[Command]:
