@@ -112,17 +112,31 @@ class TelegramBridge:
 
     # ── Public API ───────────────────────────────────────────────────────
 
-    async def notify(self, text: str, *, repo: str = DEFAULT_GITHUB_REPO) -> None:
+    async def notify(
+        self,
+        text: str,
+        *,
+        repo: str = DEFAULT_GITHUB_REPO,
+        reply_to_message_id: int | None = None,
+    ) -> None:
         """Send a plain-text notification to all allowed users.
 
         GitHub references (``#N``, ``PR #N``) are converted to clickable links.
         No-op if the bridge is disabled (missing or empty bot token).
+
+        Args:
+            text: The notification text.
+            repo: GitHub repo for linkifying issue references.
+            reply_to_message_id: If provided, the Telegram ``message_id``
+                to thread this message as a reply to.
         """
         self._ensure_initialised()
         if self._disabled:
             return
         formatted = linkify_github_refs(text, repo=repo)
-        await self._send_to_all(formatted, parse_mode="HTML")
+        await self._send_to_all(
+            formatted, parse_mode="HTML", reply_to_message_id=reply_to_message_id
+        )
 
     async def status_update(
         self,
@@ -131,6 +145,7 @@ class TelegramBridge:
         state: str,
         details: str,
         repo: str = DEFAULT_GITHUB_REPO,
+        reply_to_message_id: int | None = None,
     ) -> None:
         """Send a formatted status card to all allowed users.
 
@@ -140,7 +155,7 @@ class TelegramBridge:
         if self._disabled:
             return
         card = format_status_card(task=task, state=state, details=details, repo=repo)
-        await self._send_to_all(card, parse_mode="HTML")
+        await self._send_to_all(card, parse_mode="HTML", reply_to_message_id=reply_to_message_id)
 
     async def ask(
         self,
@@ -286,12 +301,24 @@ class TelegramBridge:
 
     # ── Internals ────────────────────────────────────────────────────────
 
-    async def _send_to_all(self, text: str, *, parse_mode: str) -> None:
+    async def _send_to_all(
+        self,
+        text: str,
+        *,
+        parse_mode: str,
+        reply_to_message_id: int | None = None,
+    ) -> None:
         """Send *text* to every configured chat ID.
 
         If Telegram returns 400 (Bad Request) — typically caused by formatting
         issues — the message is retried as plain text so it is delivered rather
         than silently dropped.
+
+        Args:
+            text: The message text.
+            parse_mode: Telegram parse mode (e.g. ``"HTML"``).
+            reply_to_message_id: If provided, the Telegram ``message_id``
+                to thread this message as a reply to.
         """
         http = await self._get_http()
         for chat_id in self._chat_ids:
@@ -301,6 +328,8 @@ class TelegramBridge:
                 "parse_mode": parse_mode,
                 "disable_web_page_preview": True,
             }
+            if reply_to_message_id is not None:
+                payload["reply_to_message_id"] = reply_to_message_id
             try:
                 if self._debug:
                     logger.debug("Telegram request payload: %s", json.dumps(payload))
