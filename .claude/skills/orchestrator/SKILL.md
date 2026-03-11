@@ -70,12 +70,13 @@ Handle any in-flight PRs before launching new work (see "PR Merge Policy" below)
 The orchestrator runs a continuous loop:
 
 1. **Refresh state** — check Telegram inbox, stop requests, and pause state
-2. **Handle in-flight PRs** — merge any that are ready, fix any that are failing
-3. **Sync after merges** — pull latest main after each merge (see "Post-merge sync" in Rules)
-4. **Fill agent slots** — launch `/task` agents for the next highest-priority issues
-5. **Process completions** — handle agent completion/failure notifications
-6. **Triage** — close done issues, file new issues for discovered problems
-7. **Repeat** until shutdown
+2. **Process orchestrator inbox** — read and execute subagent instructions (see "Subagent Instruction Channel" below)
+3. **Handle in-flight PRs** — merge any that are ready, fix any that are failing
+4. **Sync after merges** — pull latest main after each merge (see "Post-merge sync" in Rules)
+5. **Fill agent slots** — launch `/task` agents for the next highest-priority issues
+6. **Process completions** — handle agent completion/failure notifications
+7. **Triage** — close done issues, file new issues for discovered problems
+8. **Repeat** until shutdown
 
 ### Slot management
 
@@ -97,9 +98,10 @@ as a background subagent. Before spawning:
 
 1. Call `bridge.refresh_state()` to pick up external pause/resume changes
 2. Call `bridge.read_stop_requests()` to consume stop requests
-3. If `bridge.paused` is `True`, skip spawning
-4. If `bridge.is_issue_stopped(N)` is `True`, skip that issue
-5. Skip issues already being worked on by another slot
+3. Call `bridge.read_orchestrator_inbox()` to process subagent instructions
+4. If `bridge.paused` is `True`, skip spawning
+5. If `bridge.is_issue_stopped(N)` is `True`, skip that issue
+6. Skip issues already being worked on by another slot
 
 **After spawning each agent**, send a `task_started` notification and update the status file:
 
@@ -124,6 +126,58 @@ scripts/tg-notify.py task_failed <issue_number> "<error_summary>" <worker_number
 ```
 
 Both commands update the status file automatically. Always send a notification immediately when an agent completes or fails — do not batch them.
+
+---
+
+## Subagent Instruction Channel
+
+Subagents can request actions from the orchestrator by writing to `tmp/orchestrator_inbox.json`. This is a file-based instruction channel similar to `tmp/tg_inbox.json` (Telegram inbox), but for subagent-to-orchestrator communication.
+
+### How subagents write instructions
+
+Subagents use `scripts/orchestrator-request.py` to append entries:
+
+```
+scripts/orchestrator-request.py restart_responder --reason "telegram-bridge code updated" --from-issue 733
+scripts/orchestrator-request.py notify --message "Found regression in OC scraper" --from-issue 600
+scripts/orchestrator-request.py terraform_apply --module telegram-bot --from-issue 712
+scripts/orchestrator-request.py run_script --script scripts/tg-set-webhook.sh --from-issue 725
+scripts/orchestrator-request.py file_issue --title "Bug report" --description "Details..." --priority p1 --labels area/scraping
+```
+
+The script is stdlib-only (no venv needed) and uses file locking for safe concurrent access.
+
+### How the orchestrator reads instructions
+
+In the main loop (step 2), call `bridge.read_orchestrator_inbox()` which returns a list of `OrchestratorInstruction` objects. For each instruction:
+
+| Action | How to handle |
+|---|---|
+| `restart_responder` | Create `tmp/tg_responder.stop`, wait for daemon to exit, reinstall telegram-bridge deps, restart `scripts/tg-responder.py` |
+| `terraform_apply` | Run `terraform -chdir=infra/terraform/environments/dev apply -target=module.<module> -auto-approve` |
+| `notify` | Send a Telegram notification via `scripts/tg-notify.py notify "<message>"` |
+| `run_script` | Execute the specified script (validate it starts with `scripts/` for safety) |
+| `file_issue` | Create a GitHub issue with `gh issue create` using the provided title, description, priority, and labels |
+
+**Safety rules:**
+- Only the pre-defined action types in `InstructionKind` are accepted — unknown actions are logged and skipped
+- `run_script` must validate the script path starts with `scripts/` to prevent arbitrary command execution
+- Log all instructions and their outcomes
+- Send a Telegram notification confirming each instruction was processed
+
+### Inbox file format
+
+`tmp/orchestrator_inbox.json` is a JSON array of instruction objects:
+
+```json
+[
+  {"action": "restart_responder", "reason": "code updated", "from_issue": 733, "timestamp": "..."},
+  {"action": "terraform_apply", "module": "telegram-bot", "from_issue": 712, "timestamp": "..."},
+  {"action": "notify", "message": "Found a regression", "from_issue": 600, "timestamp": "..."}
+]
+```
+
+The file is atomically read and truncated by `read_orchestrator_inbox()`, just like `read_inbox()` and `read_stop_requests()`.
 
 ---
 
@@ -265,6 +319,7 @@ The responder daemon communicates via shared state files (see CLAUDE.md "Respond
 - Read `tmp/orchestrator_state.json` for pause/resume state
 - Read `tmp/stop_requests.json` for stop requests
 - Read `tmp/tg_inbox.json` for queued commands (start, file_issue, discuss, do, and free text)
+- Read `tmp/orchestrator_inbox.json` for subagent instructions (restart_responder, terraform_apply, notify, run_script, file_issue)
 
 **The orchestrator MUST update `tmp/orchestrator_status.json` after every state change.** The `scripts/tg-notify.py` script does this automatically for lifecycle events (`task_started`, `task_completed`, `task_failed`, `pr_merged`). For other state changes (pause, resume, slot changes), call `bridge.write_status()` directly or use `scripts/tg-notify.py notify` to trigger a status file update.
 

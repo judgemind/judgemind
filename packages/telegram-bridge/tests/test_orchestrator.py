@@ -18,7 +18,11 @@ from telegram_bridge import (
     TelegramBridge,
     create_orchestrator_bridge,
 )
-from telegram_bridge.orchestrator import parse_command
+from telegram_bridge.orchestrator import (
+    InstructionKind,
+    _parse_instruction,
+    parse_command,
+)
 
 # ── Helpers ──────────────────────────────────────────────────────────────
 
@@ -1728,3 +1732,245 @@ class TestHandleCommandNewTypes:
             assert result["action"] == "do"
             assert result["instruction"] == "Merge PR #750"
             assert result["needs_reply"] is True
+
+
+# ── OrchestratorInstruction parsing ────────────────────────────────────
+
+
+class TestParseInstruction:
+    def test_restart_responder(self) -> None:
+        entry = {
+            "action": "restart_responder",
+            "reason": "telegram-bridge code updated",
+            "from_issue": 733,
+            "timestamp": "2026-03-11T09:00:00Z",
+        }
+        inst = _parse_instruction(entry)
+        assert inst is not None
+        assert inst.kind == InstructionKind.RESTART_RESPONDER
+        assert inst.reason == "telegram-bridge code updated"
+        assert inst.from_issue == 733
+        assert inst.timestamp == "2026-03-11T09:00:00Z"
+
+    def test_terraform_apply(self) -> None:
+        entry = {
+            "action": "terraform_apply",
+            "module": "telegram-bot",
+            "from_issue": 712,
+        }
+        inst = _parse_instruction(entry)
+        assert inst is not None
+        assert inst.kind == InstructionKind.TERRAFORM_APPLY
+        assert inst.module == "telegram-bot"
+        assert inst.from_issue == 712
+
+    def test_notify(self) -> None:
+        entry = {
+            "action": "notify",
+            "message": "Found a regression in OC scraper",
+            "from_issue": 600,
+        }
+        inst = _parse_instruction(entry)
+        assert inst is not None
+        assert inst.kind == InstructionKind.NOTIFY
+        assert inst.message == "Found a regression in OC scraper"
+
+    def test_run_script(self) -> None:
+        entry = {
+            "action": "run_script",
+            "script": "scripts/tg-set-webhook.sh",
+            "args": ["--force"],
+            "from_issue": 725,
+        }
+        inst = _parse_instruction(entry)
+        assert inst is not None
+        assert inst.kind == InstructionKind.RUN_SCRIPT
+        assert inst.script == "scripts/tg-set-webhook.sh"
+        assert inst.args == ("--force",)
+
+    def test_file_issue(self) -> None:
+        entry = {
+            "action": "file_issue",
+            "title": "OC scraper timing out",
+            "description": "The Orange County scraper has been timing out.",
+            "priority": "p1",
+            "labels": ["area/scraping", "priority/p1"],
+            "from_issue": 500,
+        }
+        inst = _parse_instruction(entry)
+        assert inst is not None
+        assert inst.kind == InstructionKind.FILE_ISSUE
+        assert inst.title == "OC scraper timing out"
+        assert inst.description == "The Orange County scraper has been timing out."
+        assert inst.priority == "p1"
+        assert inst.labels == ("area/scraping", "priority/p1")
+
+    def test_unknown_action_returns_none(self) -> None:
+        entry = {"action": "unknown_action", "from_issue": 1}
+        inst = _parse_instruction(entry)
+        assert inst is None
+
+    def test_missing_action_returns_none(self) -> None:
+        entry = {"from_issue": 1}
+        inst = _parse_instruction(entry)
+        assert inst is None
+
+    def test_non_int_from_issue_becomes_none(self) -> None:
+        entry = {"action": "notify", "message": "test", "from_issue": "not_int"}
+        inst = _parse_instruction(entry)
+        assert inst is not None
+        assert inst.from_issue is None
+
+    def test_missing_optional_fields_default(self) -> None:
+        entry = {"action": "restart_responder"}
+        inst = _parse_instruction(entry)
+        assert inst is not None
+        assert inst.reason == ""
+        assert inst.from_issue is None
+        assert inst.timestamp == ""
+
+
+# ── read_orchestrator_inbox() ──────────────────────────────────────────
+
+
+class TestReadOrchestratorInbox:
+    def test_returns_empty_when_no_path(self) -> None:
+        with mock_aws():
+            bridge = _make_bridge()
+            orch = OrchestratorBridge(bridge=bridge)
+            assert orch.read_orchestrator_inbox() == []
+
+    def test_returns_empty_when_file_missing(self, tmp_path: Path) -> None:
+        with mock_aws():
+            bridge = _make_bridge()
+            inbox = str(tmp_path / "nonexistent.json")
+            orch = OrchestratorBridge(bridge=bridge, orchestrator_inbox_path=inbox)
+            assert orch.read_orchestrator_inbox() == []
+
+    def test_returns_empty_when_file_empty(self, tmp_path: Path) -> None:
+        with mock_aws():
+            bridge = _make_bridge()
+            inbox_file = tmp_path / "inbox.json"
+            inbox_file.write_text("")
+            orch = OrchestratorBridge(bridge=bridge, orchestrator_inbox_path=str(inbox_file))
+            assert orch.read_orchestrator_inbox() == []
+
+    def test_reads_and_parses_instructions(self, tmp_path: Path) -> None:
+        with mock_aws():
+            bridge = _make_bridge()
+            inbox_file = tmp_path / "inbox.json"
+            inbox_file.write_text(
+                json.dumps(
+                    [
+                        {
+                            "action": "restart_responder",
+                            "reason": "code updated",
+                            "from_issue": 733,
+                        },
+                        {
+                            "action": "notify",
+                            "message": "Regression found",
+                            "from_issue": 600,
+                        },
+                        {
+                            "action": "terraform_apply",
+                            "module": "telegram-bot",
+                        },
+                    ]
+                )
+            )
+            orch = OrchestratorBridge(bridge=bridge, orchestrator_inbox_path=str(inbox_file))
+            instructions = orch.read_orchestrator_inbox()
+
+            assert len(instructions) == 3
+            assert instructions[0].kind == InstructionKind.RESTART_RESPONDER
+            assert instructions[0].reason == "code updated"
+            assert instructions[0].from_issue == 733
+            assert instructions[1].kind == InstructionKind.NOTIFY
+            assert instructions[1].message == "Regression found"
+            assert instructions[2].kind == InstructionKind.TERRAFORM_APPLY
+            assert instructions[2].module == "telegram-bot"
+
+    def test_clears_file_after_reading(self, tmp_path: Path) -> None:
+        with mock_aws():
+            bridge = _make_bridge()
+            inbox_file = tmp_path / "inbox.json"
+            inbox_file.write_text(json.dumps([{"action": "notify", "message": "test"}]))
+            orch = OrchestratorBridge(bridge=bridge, orchestrator_inbox_path=str(inbox_file))
+
+            instructions = orch.read_orchestrator_inbox()
+            assert len(instructions) == 1
+
+            # File should be empty now.
+            assert inbox_file.read_text().strip() == ""
+
+            # Second read returns empty.
+            assert orch.read_orchestrator_inbox() == []
+
+    def test_handles_corrupt_file(self, tmp_path: Path) -> None:
+        with mock_aws():
+            bridge = _make_bridge()
+            inbox_file = tmp_path / "inbox.json"
+            inbox_file.write_text("not valid json{{{")
+            orch = OrchestratorBridge(bridge=bridge, orchestrator_inbox_path=str(inbox_file))
+
+            instructions = orch.read_orchestrator_inbox()
+            assert instructions == []
+            # File should be cleared.
+            assert inbox_file.read_text().strip() == ""
+
+    def test_skips_unknown_actions(self, tmp_path: Path) -> None:
+        with mock_aws():
+            bridge = _make_bridge()
+            inbox_file = tmp_path / "inbox.json"
+            inbox_file.write_text(
+                json.dumps(
+                    [
+                        {"action": "notify", "message": "valid"},
+                        {"action": "unknown_thing"},
+                        {"action": "restart_responder"},
+                    ]
+                )
+            )
+            orch = OrchestratorBridge(bridge=bridge, orchestrator_inbox_path=str(inbox_file))
+            instructions = orch.read_orchestrator_inbox()
+            assert len(instructions) == 2
+            assert instructions[0].kind == InstructionKind.NOTIFY
+            assert instructions[1].kind == InstructionKind.RESTART_RESPONDER
+
+    def test_skips_non_dict_entries(self, tmp_path: Path) -> None:
+        with mock_aws():
+            bridge = _make_bridge()
+            inbox_file = tmp_path / "inbox.json"
+            inbox_file.write_text(
+                json.dumps(
+                    [
+                        {"action": "notify", "message": "valid"},
+                        "just a string",
+                        42,
+                        {"action": "restart_responder"},
+                    ]
+                )
+            )
+            orch = OrchestratorBridge(bridge=bridge, orchestrator_inbox_path=str(inbox_file))
+            instructions = orch.read_orchestrator_inbox()
+            assert len(instructions) == 2
+
+    def test_handles_non_array_json(self, tmp_path: Path) -> None:
+        with mock_aws():
+            bridge = _make_bridge()
+            inbox_file = tmp_path / "inbox.json"
+            inbox_file.write_text(json.dumps({"action": "notify"}))
+            orch = OrchestratorBridge(bridge=bridge, orchestrator_inbox_path=str(inbox_file))
+            instructions = orch.read_orchestrator_inbox()
+            assert instructions == []
+
+
+# ── create_orchestrator_bridge with orchestrator_inbox_path ────────────
+
+
+class TestCreateOrchestratorBridgeOrchestratorInbox:
+    def test_factory_accepts_orchestrator_inbox_path(self) -> None:
+        with mock_aws():
+            orch = create_orchestrator_bridge(orchestrator_inbox_path="/tmp/test_orch_inbox.json")
+            assert orch.orchestrator_inbox_path == "/tmp/test_orch_inbox.json"
