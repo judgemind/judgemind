@@ -79,15 +79,52 @@ run_test("no quotes with && allowed", "ls && pwd", 0)
 print("\nCheck 5: cd in compound commands")
 run_test("cd && cmd blocked", "cd /tmp && ls", 2)
 
-# --- Check 6: consecutive quote characters ---
-print("\nCheck 6: Consecutive quote characters")
-# Empty single quotes (e.g. SQL != '')
-empty_sq = f"scripts/dev-db-query.sh SELECT * FROM rulings WHERE title != {SQ}{SQ}"
-run_test("SQL != empty string (single quotes) blocked", empty_sq, 2)
+# --- Check 6: empty quotes before flags (bypass attempts) ---
+print("\nCheck 6: Empty quotes before flags")
 
-# Empty double quotes
-empty_dq = f"echo test {DQ}{DQ} foo"
-run_test("empty double quotes blocked", empty_dq, 2)
+# Bypass attempts — should be BLOCKED
+run_test(
+    "empty single quotes before -rf blocked",
+    f"rm {SQ}{SQ} -rf /important",
+    2,
+)
+run_test(
+    "empty double quotes before --force blocked",
+    f"git checkout {DQ}{DQ} --force",
+    2,
+)
+run_test(
+    "empty single quotes before --delete blocked",
+    f"cmd {SQ}{SQ} --delete",
+    2,
+)
+
+# Legitimate uses — should be ALLOWED
+run_test(
+    "jq expression with dash in string allowed",
+    f"gh issue list --json number,title --jq {SQ}.[] | .number | tostring + {DQ} - {DQ} + .title{SQ}",
+    0,
+)
+run_test(
+    "SQL != empty string allowed",
+    f"scripts/dev-db-query.sh SELECT * FROM rulings WHERE title != {SQ}{SQ}",
+    0,
+)
+run_test(
+    "empty double quotes as argument allowed",
+    f"echo test {DQ}{DQ} foo",
+    0,
+)
+run_test(
+    "jq with quoted dash separator allowed",
+    f"gh pr view 123 --json state,title --jq {SQ}.state + {DQ} - {DQ} + .title{SQ}",
+    0,
+)
+run_test(
+    "empty string at end of command allowed",
+    f"echo {SQ}{SQ}",
+    0,
+)
 
 # Normal usage should pass
 run_test("normal command no quotes", "git status", 0)

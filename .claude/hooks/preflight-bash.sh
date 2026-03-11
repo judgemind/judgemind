@@ -82,18 +82,25 @@ if echo "$COMMAND" | grep -qE '&&|;' ; then
     fi
 fi
 
-# 6. Consecutive quote characters (triggers CLI "potential obfuscation" rejection)
-#    Catches patterns like:
-#      - '' or "" anywhere in the command (e.g. != '' in SQL, empty string args)
-#      - ""word, ''word (consecutive quotes followed by text)
-#    The Claude CLI rejects these with an opaque error. Agents should use
-#    IS NOT NULL instead of != '', or write queries/scripts to a file.
-if echo "$COMMAND" | grep -qE "''" ; then
-    echo "BLOCKED: Command contains consecutive single quotes ('') which triggers a CLI rejection. Use IS NOT NULL instead of != '' in SQL, or write the query/script to a file. See CLAUDE.md §Unattended Operation Patterns." >&2
+# 6. Empty quotes immediately before a flag (potential bypass attempt)
+#    Catches bypass patterns like:
+#      - '' -rf, '' --force (empty single quotes before a flag)
+#      - "" -rf, "" --force (empty double quotes before a flag)
+#    These look like attempts to bypass safety checks by prepending empty quotes
+#    to a flag argument (e.g. rm '' -rf /important).
+#
+#    Legitimate uses of '' or "" are NOT blocked:
+#      - jq expressions: --jq '.state + " - " + .title'
+#      - SQL comparisons: WHERE title != ''
+#      - Empty string arguments: --default ""
+#
+#    Only blocks when empty quotes are followed by whitespace then a dash (flag).
+if echo "$COMMAND" | grep -qE "''[[:space:]]+-" ; then
+    echo "BLOCKED: Command contains empty quotes before a flag ('' -...), which looks like a bypass attempt. If this is a legitimate use, write the command to a script file. See CLAUDE.md §Unattended Operation Patterns." >&2
     exit 2
 fi
-if echo "$COMMAND" | grep -qE '""' ; then
-    echo "BLOCKED: Command contains consecutive double quotes (\"\") which triggers a CLI rejection. Write the content to a file instead of using empty string literals inline. See CLAUDE.md §Unattended Operation Patterns." >&2
+if echo "$COMMAND" | grep -qE '""[[:space:]]+-' ; then
+    echo "BLOCKED: Command contains empty quotes before a flag (\"\" -...), which looks like a bypass attempt. If this is a legitimate use, write the command to a script file. See CLAUDE.md §Unattended Operation Patterns." >&2
     exit 2
 fi
 
