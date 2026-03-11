@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Ventura County Superior Court - Tentative Rulings</title>
+</head>
+<body>
+    <div class="container">
+        <h1>Tentative Rulings Search</h1>
+        <form action="/CaseInquiry/TentativeRulings" method="post">
+            <input name="__RequestVerificationToken" type="hidden" value="CfDJ8NcV7abc123def456ghi789_TEST_TOKEN_VALUE" />
+            <div class="form-group">
+                <label for="SearchFromDate">Search From Date</label>
+                <input type="text" id="SearchFromDate" name="SearchFromDate" value="3/11/2026" class="form-control" />
+            </div>
+            <button type="submit" class="btn btn-primary">Search</button>
+        </form>
+
+        <table class="table table-striped">
+            <thead>
+                <tr>
+                    <th>Case Number</th>
+                    <th>Event Type</th>
+                    <th>Event Date/Time</th>
+                    <th>Department</th>
+                    <th>Document</th>
+                </tr>
+            </thead>
+            <tbody>
+                <tr>
+                    <td>2025CUBC040123</td>
+                    <td>Demurrer to Complaint</td>
+                    <td>03/11/2026 8:30 AM</td>
+                    <td>20</td>
+                    <td><a href="/CaseInquiry/ViewFile/100001">View</a></td>
+                </tr>
+                <tr>
+                    <td>2024CUBC038456</td>
+                    <td>Motion to Compel Further Responses</td>
+                    <td>03/11/2026 8:30 AM</td>
+                    <td>20</td>
+                    <td><a href="/CaseInquiry/ViewFile/100002">View</a></td>
+                </tr>
+                <tr>
+                    <td>2025CUBC041789</td>
+                    <td>Motion for Summary Judgment</td>
+                    <td>03/11/2026 8:30 AM</td>
+                    <td>42</td>
+                    <td><a href="/CaseInquiry/ViewFile/100003">View</a></td>
+                </tr>
+                <tr>
+                    <td>2023CUBC035012</td>
+                    <td>Motion to Strike</td>
+                    <td>03/11/2026 8:30 AM</td>
+                    <td>42</td>
+                    <td><a href="/CaseInquiry/ViewFile/100004">View</a></td>
+                </tr>
+                <tr>
+                    <td>2025CUPR042345</td>
+                    <td>Petition for Probate</td>
+                    <td>03/11/2026 9:00 AM</td>
+                    <td>43</td>
+                    <td><a href="/CaseInquiry/ViewFile/100005">View</a></td>
+                </tr>
+                <tr>
+                    <td>2024CUBC039678</td>
+                    <td>Demurrer to First Amended Complaint</td>
+                    <td>03/11/2026 8:30 AM</td>
+                    <td>20</td>
+                    <td><a href="/CaseInquiry/ViewFile/100006">View</a></td>
+                </tr>
+            </tbody>
+        </table>
+    </div>
+</body>
+</html>
