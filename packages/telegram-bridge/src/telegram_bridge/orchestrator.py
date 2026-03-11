@@ -570,12 +570,12 @@ class OrchestratorBridge:
         self._pending_commands.clear()
         return commands
 
-    # ── File-based inbox (for use with tg-poll-daemon.py) ──────────────
+    # ── File-based inbox (for use with tg-responder.py) ────────────────
 
     def read_inbox(self) -> list[Command]:
         """Read and clear all commands from the file-based inbox.
 
-        The background daemon (``scripts/tg-poll-daemon.py``) writes raw SQS
+        The background daemon (``scripts/tg-responder.py``) writes raw SQS
         messages to *inbox_path* as a JSON array.  This method reads that file,
         parses each entry into a :class:`Command`, atomically truncates the
         file, and returns the parsed commands.
@@ -663,7 +663,7 @@ def create_orchestrator_bridge(
     the Claude interpreter.
 
     If *inbox_path* is provided, :meth:`OrchestratorBridge.read_inbox` will
-    read commands from that file (written by ``scripts/tg-poll-daemon.py``)
+    read commands from that file (written by ``scripts/tg-responder.py``)
     instead of polling SQS directly.
 
     If *stop_requests_path* is provided,

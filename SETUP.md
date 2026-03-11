@@ -45,7 +45,7 @@ Work through this list in order. Each item should take 5-30 minutes.
 - [ ] **Create labels**:
 
   ```bash
-  # Run the label creation commands from scripts/seed-issues.md
+  # Create labels manually via gh label create
   ```
 
 - [ ] **Create GitHub Project** board:
@@ -96,7 +96,7 @@ Work through this list in order. Each item should take 5-30 minutes.
 
 ## 4. Create Seed Issues
 
-- [ ] Run the `gh issue create` commands from `scripts/seed-issues.md`
+- [ ] Create initial issues via `gh issue create`
 - [ ] Assign priority labels
 - [ ] Move P1 issues to "Ready for Agent" on the project board
 
