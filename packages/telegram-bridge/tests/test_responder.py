@@ -784,11 +784,6 @@ class TestDaemonLifecycle:
         assert not stop_file.exists()
 
 
-# ── Deprecation notice on old daemon ────────────────────────────────────
-
-
-class TestOldDaemonDeprecation:
-    def test_old_daemon_has_deprecation_notice(self) -> None:
-        old_daemon = REPO_ROOT / "scripts" / "tg-poll-daemon.py"
-        content = old_daemon.read_text()
-        assert "deprecated" in content.lower() or "DEPRECATED" in content
+# ── Old daemon removed ──────────────────────────────────────────────────
+# The deprecated tg-poll-daemon.py was removed in #646. The responder
+# daemon (scripts/tg-responder.py) fully replaces it.
