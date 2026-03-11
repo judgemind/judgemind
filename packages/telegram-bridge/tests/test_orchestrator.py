@@ -1447,6 +1447,78 @@ class TestParseInboxEntry:
             assert len(commands) == 1
             assert commands[0].kind == CommandKind.STATUS
 
+    def test_file_issue_invalid_priority_normalized(self, tmp_path: Path) -> None:
+        """Invalid priority values in inbox entries should be normalized to p2."""
+        with mock_aws():
+            bridge = _make_bridge()
+            inbox_file = tmp_path / "inbox.json"
+            inbox_file.write_text(
+                json.dumps(
+                    [
+                        {
+                            "action": "file_issue",
+                            "description": "Critical bug",
+                            "priority": "critical",
+                            "labels": [],
+                            "reply_to": 123,
+                        }
+                    ]
+                )
+            )
+            orch = OrchestratorBridge(bridge=bridge, inbox_path=str(inbox_file))
+            commands = orch.read_inbox()
+
+            assert len(commands) == 1
+            assert commands[0].kind == CommandKind.FILE_ISSUE
+            assert commands[0].priority == "p2"
+
+    def test_file_issue_p0_priority_normalized(self, tmp_path: Path) -> None:
+        """p0 is human-only and should be normalized to p2 in inbox entries."""
+        with mock_aws():
+            bridge = _make_bridge()
+            inbox_file = tmp_path / "inbox.json"
+            inbox_file.write_text(
+                json.dumps(
+                    [
+                        {
+                            "action": "file_issue",
+                            "description": "Urgent bug",
+                            "priority": "p0",
+                            "labels": [],
+                        }
+                    ]
+                )
+            )
+            orch = OrchestratorBridge(bridge=bridge, inbox_path=str(inbox_file))
+            commands = orch.read_inbox()
+
+            assert len(commands) == 1
+            assert commands[0].priority == "p2"
+
+    def test_file_issue_valid_priorities_pass_through(self, tmp_path: Path) -> None:
+        """Valid priority values (p1, p2, p3) should pass through unchanged."""
+        for priority in ("p1", "p2", "p3"):
+            with mock_aws():
+                bridge = _make_bridge()
+                inbox_file = tmp_path / "inbox.json"
+                inbox_file.write_text(
+                    json.dumps(
+                        [
+                            {
+                                "action": "file_issue",
+                                "description": "Bug",
+                                "priority": priority,
+                                "labels": [],
+                            }
+                        ]
+                    )
+                )
+                orch = OrchestratorBridge(bridge=bridge, inbox_path=str(inbox_file))
+                commands = orch.read_inbox()
+
+                assert len(commands) == 1
+                assert commands[0].priority == priority
+
 
 # ── handle_command() — new command types ────────────────────────────────
 

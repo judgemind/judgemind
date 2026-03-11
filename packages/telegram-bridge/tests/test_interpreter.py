@@ -10,10 +10,13 @@ import pytest
 
 from telegram_bridge.interpreter import (
     _SYSTEM_PROMPT,
+    ALLOWED_PRIORITIES,
+    KNOWN_ACTION_TYPES,
     InterpretedMessage,
     RateLimiter,
     RateLimitError,
     _parse_response,
+    _validate_action,
     build_orchestrator_status,
     interpret_message,
 )
@@ -467,3 +470,235 @@ class TestSystemPromptPassedToApi:
         system_prompt = call_args.kwargs["system"]
         assert "Deciding when to forward vs. answer directly" in system_prompt
         assert "Answerable from the orchestrator status context?" in system_prompt
+
+
+# ── _validate_action() ──────────────────────────────────────────────────
+
+
+class TestValidateAction:
+    """Tests for individual action validation."""
+
+    def test_valid_start_action(self) -> None:
+        result = _validate_action({"type": "start", "issue": 42})
+        assert result is not None
+        assert result["type"] == "start"
+        assert result["issue"] == 42
+
+    def test_valid_stop_action(self) -> None:
+        result = _validate_action({"type": "stop", "issue": 99})
+        assert result is not None
+        assert result["type"] == "stop"
+        assert result["issue"] == 99
+
+    def test_valid_pause_action(self) -> None:
+        result = _validate_action({"type": "pause"})
+        assert result is not None
+        assert result["type"] == "pause"
+
+    def test_valid_resume_action(self) -> None:
+        result = _validate_action({"type": "resume"})
+        assert result is not None
+        assert result["type"] == "resume"
+
+    def test_valid_file_issue_action(self) -> None:
+        result = _validate_action(
+            {"type": "file_issue", "description": "Bug report", "priority": "p1"}
+        )
+        assert result is not None
+        assert result["type"] == "file_issue"
+        assert result["description"] == "Bug report"
+        assert result["priority"] == "p1"
+
+    def test_valid_discuss_action(self) -> None:
+        result = _validate_action({"type": "discuss", "message": "Architecture question"})
+        assert result is not None
+        assert result["message"] == "Architecture question"
+
+    def test_valid_do_action(self) -> None:
+        result = _validate_action({"type": "do", "instruction": "Check CI on PR #738"})
+        assert result is not None
+        assert result["instruction"] == "Check CI on PR #738"
+
+    # ── Unknown / invalid types ──
+
+    def test_unknown_type_dropped(self) -> None:
+        assert _validate_action({"type": "explode"}) is None
+
+    def test_non_dict_dropped(self) -> None:
+        assert _validate_action("not a dict") is None
+
+    def test_missing_type_dropped(self) -> None:
+        assert _validate_action({"issue": 42}) is None
+
+    def test_non_string_type_dropped(self) -> None:
+        assert _validate_action({"type": 123}) is None
+
+    # ── Missing required fields ──
+
+    def test_start_without_issue_dropped(self) -> None:
+        assert _validate_action({"type": "start"}) is None
+
+    def test_stop_without_issue_dropped(self) -> None:
+        assert _validate_action({"type": "stop"}) is None
+
+    def test_file_issue_without_description_dropped(self) -> None:
+        assert _validate_action({"type": "file_issue", "priority": "p2"}) is None
+
+    def test_discuss_without_message_dropped(self) -> None:
+        assert _validate_action({"type": "discuss"}) is None
+
+    def test_do_without_instruction_dropped(self) -> None:
+        assert _validate_action({"type": "do"}) is None
+
+    # ── Wrong field types ──
+
+    def test_start_with_string_issue_coerced(self) -> None:
+        result = _validate_action({"type": "start", "issue": "42"})
+        assert result is not None
+        assert result["issue"] == 42
+
+    def test_start_with_non_numeric_string_dropped(self) -> None:
+        assert _validate_action({"type": "start", "issue": "not-a-number"}) is None
+
+    def test_start_with_list_issue_dropped(self) -> None:
+        assert _validate_action({"type": "start", "issue": [42]}) is None
+
+    def test_file_issue_with_int_description_dropped(self) -> None:
+        assert _validate_action({"type": "file_issue", "description": 123}) is None
+
+    # ── Priority validation ──
+
+    def test_file_issue_invalid_priority_normalized(self) -> None:
+        result = _validate_action(
+            {"type": "file_issue", "description": "Bug", "priority": "critical"}
+        )
+        assert result is not None
+        assert result["priority"] == "p2"
+
+    def test_file_issue_p0_normalized(self) -> None:
+        """p0 is human-only and should be normalized to p2."""
+        result = _validate_action({"type": "file_issue", "description": "Bug", "priority": "p0"})
+        assert result is not None
+        assert result["priority"] == "p2"
+
+    def test_file_issue_missing_priority_defaults_to_p2(self) -> None:
+        result = _validate_action({"type": "file_issue", "description": "Bug"})
+        assert result is not None
+        assert result["priority"] == "p2"
+
+    def test_file_issue_valid_priorities_accepted(self) -> None:
+        for p in ALLOWED_PRIORITIES:
+            result = _validate_action({"type": "file_issue", "description": "Bug", "priority": p})
+            assert result is not None
+            assert result["priority"] == p
+
+    # ── Optional fields ──
+
+    def test_file_issue_with_labels(self) -> None:
+        result = _validate_action(
+            {
+                "type": "file_issue",
+                "description": "Bug",
+                "priority": "p2",
+                "labels": ["area/scraping"],
+            }
+        )
+        assert result is not None
+        assert result["labels"] == ["area/scraping"]
+
+    def test_file_issue_labels_wrong_type_dropped(self) -> None:
+        result = _validate_action(
+            {
+                "type": "file_issue",
+                "description": "Bug",
+                "priority": "p2",
+                "labels": "area/scraping",
+            }
+        )
+        assert result is None
+
+
+# ── Schema-aware _parse_response() ──────────────────────────────────────
+
+
+class TestParseResponseSchemaValidation:
+    """Tests for _parse_response() with the new schema validation."""
+
+    def test_unknown_action_type_filtered(self) -> None:
+        text = json.dumps(
+            {
+                "reply": "OK.",
+                "actions": [
+                    {"type": "pause"},
+                    {"type": "unknown_action"},
+                ],
+            }
+        )
+        result = _parse_response(text)
+        assert len(result["actions"]) == 1
+        assert result["actions"][0]["type"] == "pause"
+
+    def test_start_missing_issue_filtered(self) -> None:
+        text = json.dumps(
+            {
+                "reply": "Starting...",
+                "actions": [{"type": "start"}],
+            }
+        )
+        result = _parse_response(text)
+        assert len(result["actions"]) == 0
+
+    def test_stop_missing_issue_filtered(self) -> None:
+        text = json.dumps(
+            {
+                "reply": "Stopping...",
+                "actions": [{"type": "stop"}],
+            }
+        )
+        result = _parse_response(text)
+        assert len(result["actions"]) == 0
+
+    def test_file_issue_priority_normalized(self) -> None:
+        text = json.dumps(
+            {
+                "reply": "Filing...",
+                "actions": [{"type": "file_issue", "description": "Bug", "priority": "urgent"}],
+            }
+        )
+        result = _parse_response(text)
+        assert len(result["actions"]) == 1
+        assert result["actions"][0]["priority"] == "p2"
+
+    def test_string_issue_coerced_to_int(self) -> None:
+        text = json.dumps(
+            {
+                "reply": "Starting...",
+                "actions": [{"type": "start", "issue": "42"}],
+            }
+        )
+        result = _parse_response(text)
+        assert len(result["actions"]) == 1
+        assert result["actions"][0]["issue"] == 42
+
+    def test_multiple_actions_mixed_validity(self) -> None:
+        text = json.dumps(
+            {
+                "reply": "OK.",
+                "actions": [
+                    {"type": "pause"},
+                    {"type": "start"},  # missing issue - dropped
+                    {"type": "stop", "issue": 99},
+                    {"type": "banana"},  # unknown type - dropped
+                    "not a dict",  # not a dict - dropped
+                ],
+            }
+        )
+        result = _parse_response(text)
+        assert len(result["actions"]) == 2
+        assert result["actions"][0]["type"] == "pause"
+        assert result["actions"][1]["type"] == "stop"
+
+    def test_all_known_types_present(self) -> None:
+        """Verify the KNOWN_ACTION_TYPES set matches expected types."""
+        expected = {"start", "stop", "pause", "resume", "file_issue", "discuss", "do"}
+        assert KNOWN_ACTION_TYPES == expected
