@@ -1107,6 +1107,28 @@ class TestSqsBotoConfig:
         config = mod.SQS_BOTO_CONFIG
         assert config.retries["max_attempts"] == 2
 
+    def test_read_timeout_exceeds_long_poll_wait(self) -> None:
+        """read_timeout must be >= long_poll_seconds + 5 to avoid timeouts.
+
+        SQS long polling blocks for up to ``long_poll_seconds``
+        (WaitTimeSeconds).  If read_timeout is shorter, the HTTP socket
+        times out before SQS can respond.  The +5s buffer accounts for
+        response transmission overhead.
+
+        See: https://github.com/judgemind/judgemind/issues/769
+        """
+        import inspect
+
+        mod = _import_responder()
+        config = mod.SQS_BOTO_CONFIG
+        sig = inspect.signature(mod.poll_sqs)
+        long_poll_default = sig.parameters["long_poll_seconds"].default
+
+        assert config.read_timeout >= long_poll_default + 5, (
+            f"SQS_BOTO_CONFIG.read_timeout ({config.read_timeout}s) must be "
+            f">= poll_sqs long_poll_seconds default ({long_poll_default}s) + 5"
+        )
+
 
 # ── --force CLI flag ───────────────────────────────────────────────────
 
