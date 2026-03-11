@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import json
 import time
-from datetime import datetime, UTC
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -55,7 +55,7 @@ def log_review(
     """
     record: dict[str, Any] = {
         "type": "review",
-        "timestamp": datetime.now(UTC).isoformat(),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
         "iteration": iteration,
         "model": model,
         "verdict": verdict,
@@ -141,7 +141,7 @@ def log_summary(
 
     record: dict[str, Any] = {
         "type": "summary",
-        "timestamp": datetime.now(UTC).isoformat(),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
         "total_iterations": total_iterations,
         "final_verdict": final_verdict,
         "agreement_rate": agreement_rate,

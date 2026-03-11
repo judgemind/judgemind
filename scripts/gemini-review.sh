@@ -54,14 +54,25 @@ for f in $all_files; do
     fi
 done
 
-# Find a Python interpreter — prefer a worktree venv if available, else system python
-PYTHON="python3"
+# Find a Python interpreter — prefer a worktree venv if available,
+# then python3.12/3.11 (guaranteed >= 3.11 for datetime.timezone compat),
+# then fall back to system python3.
+PYTHON=""
 for venv_dir in "${WORKTREE}"/packages/*/.venv/bin/python3; do
     if [[ -x "$venv_dir" ]]; then
         PYTHON="$venv_dir"
         break
     fi
 done
+if [[ -z "$PYTHON" ]]; then
+    for candidate in python3.12 python3.11 python3; do
+        if command -v "$candidate" &>/dev/null; then
+            PYTHON="$candidate"
+            break
+        fi
+    done
+fi
+PYTHON="${PYTHON:-python3}"
 
 # Check if google-genai is available; install from scripts/requirements.txt if not
 if ! "$PYTHON" -c "from google import genai" 2>/dev/null; then

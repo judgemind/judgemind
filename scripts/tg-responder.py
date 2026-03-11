@@ -293,7 +293,7 @@ def handle_stop(issue_number: int, stop_requests_file: str) -> None:
         data.append(
             {
                 "issue_number": issue_number,
-                "timestamp": datetime.datetime.now(datetime.UTC).isoformat(),
+                "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
             }
         )
         return data
