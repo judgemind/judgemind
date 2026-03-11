@@ -16,6 +16,7 @@ These are the most frequently violated rules. **A PreToolUse hook enforces the s
 ### NEVER — Workflow
 - **NEVER** commit directly to `main` during autonomous task work. All `/task` work happens on worktree branches via PRs. (The user may direct you to commit to `main` during interactive sessions — that's fine.)
 - **You MAY merge your own PRs** if the PR has passed the `/ralph` review loop (A.2) and CI is green. Use `gh pr merge <N> --repo judgemind/judgemind --squash --delete-branch`.
+- **NEVER** exit or stop after `/ralph` completes without finishing the full `/task` workflow (A.3 through A.9). Ralph completing means the code is ready — but uncommitted, unpushed, and unmerged. The task is only halfway done. See #721.
 - **NEVER** deploy to production. Production deploys are human-only.
 - **NEVER** set `priority/p0` on issues unless explicitly told to by a human. `p0` is human-only.
 - **NEVER** skip pre-PR checks. Run lint, format, AND tests locally before pushing.

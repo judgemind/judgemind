@@ -67,6 +67,7 @@ Machine-readable checklist of rules extracted from CLAUDE.md. Agents should vali
 | TW-04 | Clean up worktree when done | `scripts/end-worker.sh {worktree}` is the last step |
 | TW-05 | Never deploy to production | Production deploys are human-only |
 | TW-06 | Venv isolation per worktree | Never share venvs between worktrees |
+| TW-07 | Never exit after ralph without completing A.3-A.9 | Ralph = halfway done. Must commit, push, PR, CI, merge, deploy, retrospective. Verify with `git status` and `gh pr list` (#721) |
 
 ## Security Rules
 
