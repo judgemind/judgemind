@@ -286,20 +286,38 @@ jobs:
     needs: detect-changes
     if: needs.detect-changes.outputs.infra == 'true'
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: infra/terraform
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_REGION: us-west-2
+      TF_IN_AUTOMATION: true
     steps:
       - uses: actions/checkout@v4
       - uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: '1.7'
       - name: Terraform fmt check
-        run: terraform fmt -check -recursive
-      - name: Terraform validate
+        run: terraform fmt -check -recursive infra/terraform/
+
+      # Validate each environment (no credentials needed)
+      - name: Validate dev
         run: |
-          terraform init -backend=false
-          terraform validate
+          terraform -chdir=infra/terraform/environments/dev init -backend=false
+          terraform -chdir=infra/terraform/environments/dev validate
+      - name: Validate production
+        run: |
+          terraform -chdir=infra/terraform/environments/production init -backend=false
+          terraform -chdir=infra/terraform/environments/production validate
+
+      # Plan with real backend to catch provider-specific attribute errors
+      # (e.g. wrong resource attribute names that `validate` misses).
+      # Skipped if AWS credentials are not configured.
+      - name: Terraform Init (dev)
+        if: env.AWS_ACCESS_KEY_ID != ''
+        run: terraform -chdir=infra/terraform/environments/dev init
+      - name: Terraform Plan (dev)
+        if: env.AWS_ACCESS_KEY_ID != ''
+        run: terraform -chdir=infra/terraform/environments/dev plan -no-color -input=false
 
   lambda-tests:
     needs: detect-changes
