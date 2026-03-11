@@ -219,6 +219,18 @@ Shutdown procedure:
 
 ## Rules
 
+### Responsiveness — the orchestrator's primary constraint
+
+The orchestrator must stay responsive to user interaction and Telegram commands at all times. A blocked orchestrator cannot process pause/resume commands, dispatch new work, merge PRs, or reply to Telegram messages.
+
+- **Never do long-running work in the main agent — delegate to subagents.** "Long-running" means anything that might take more than ~10 seconds: code changes, investigations, deep codebase exploration, issue body rewrites, running tests, large file analysis, or multi-step research.
+- **The orchestrator's job is: read messages, make quick decisions, dispatch work, send updates.** It is a dispatcher, not an implementer.
+- **Allowed in the main agent:** `gh` CLI calls, quick file reads, Telegram sends, short status checks, writing issue comments, updating labels, spawning subagents.
+- **Everything else = spawn a subagent.** If you are unsure whether something is "quick enough," it is not — delegate it.
+- **Never block on a single long operation.** If a `gh run watch` or similar command could take minutes, run it in a way that does not prevent processing other events in the main loop. Prefer polling with short timeouts over blocking waits.
+
+### General rules
+
 - **Never modify committed code directly.** All code changes go through `/task` agents in worktrees.
 - **Never push to main.** All changes go through PRs.
 - **Never deploy to production.** Production deploys are human-only.
