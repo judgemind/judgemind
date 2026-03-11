@@ -226,12 +226,45 @@ def insert_document(
 # Ordered so longer/more-specific prefixes match first.
 # Anchored to the start of the string (^) so mid-name occurrences are not affected.
 _HONORIFIC_PREFIX_RE = re.compile(
-    r"^(?:The\s+)?Honorable\.?\s+|^Hon\.?\s+|^Judge:?\s+",
+    r"^(?:The\s+)?Honorable\.?\s+|^Hon\.?\s+|^Judge:?\s+|^Arbitrator\s+",
     re.IGNORECASE,
 )
 
+# Generational suffixes that should appear at the end of a name.
+# Used to detect and fix misplaced suffixes (e.g. "Jr. Edward B. Moreton").
+_GENERATIONAL_SUFFIXES = {"Jr", "Jr.", "Sr", "Sr.", "II", "III", "IV"}
 
-def normalize_judge_name(raw_name: str) -> str:
+# Canonical forms for generational suffixes (preserves correct casing after title()).
+_SUFFIX_CANONICAL: dict[str, str] = {
+    "jr": "Jr.",
+    "jr.": "Jr.",
+    "sr": "Sr.",
+    "sr.": "Sr.",
+    "ii": "II",
+    "iii": "III",
+    "iv": "IV",
+}
+
+# Maximum length for a valid judge name.  Real judge names are well under 80
+# characters; anything longer is likely paragraph text captured by mistake.
+_MAX_JUDGE_NAME_LENGTH = 80
+
+# Pattern for detecting garbage/paragraph text in judge names.
+# Matches ruling text fragments, party labels, year prefixes, and underscores.
+# NOTE: We do NOT use a simple "period + space + capital" sentence-boundary
+# pattern because it false-positives on middle initials like "A. Smith".
+_GARBAGE_NAME_RE = re.compile(
+    r"Moving\s+Party"  # ruling text fragment
+    r"|Is\s+Ordered"  # ruling text fragment
+    r"|Ordered\s+to"  # ruling text fragment
+    r"|Plaintiff"  # party label
+    r"|Defendant"  # party label
+    r"|^\d{4}\s+"  # starts with a year
+    r"|_{2,}",  # underscores (template placeholders)
+)
+
+
+def normalize_judge_name(raw_name: str) -> str | None:
     """Normalize a raw judge name string to a canonical form.
 
     Handles common court formats:
@@ -241,22 +274,52 @@ def normalize_judge_name(raw_name: str) -> str:
       - "Hon. Joseph B. Widman" -> "Joseph B. Widman"
       - "Judge Bobby P. Luna" -> "Bobby P. Luna"
       - "The Honorable Jane Doe" -> "Jane Doe"
+      - "Arbitrator Howard B. Miller" -> "Howard B. Miller"
+      - "Jr. Edward B. Moreton" -> "Edward B. Moreton Jr."
+
+    Returns ``None`` for names that are clearly invalid (garbage text,
+    too long, unicode junk, or single-word-only names without a first name).
 
     Steps:
-      1. Strip leading/trailing whitespace.
-      2. Collapse internal whitespace.
-      3. Strip honorific prefixes (Hon., Judge, The Honorable, Honorable).
-      4. If the name contains a comma, treat the part before the comma as the
+      1. Strip unicode replacement characters (U+FFFD).
+      2. Strip leading/trailing whitespace and collapse internal whitespace.
+      3. Reject strings > 80 chars or containing garbage patterns.
+      4. Strip honorific prefixes (Hon., Judge, The Honorable, Arbitrator).
+      5. If the name contains a comma, treat the part before the comma as the
          last name and the part after as the first/middle.
-      5. Title-case the result.
+      6. Move misplaced generational suffixes (Jr., Sr., III, etc.) to end.
+      7. Title-case the result, preserving correct suffix casing.
     """
-    name = raw_name.strip()
+    # Strip unicode replacement characters
+    name = raw_name.replace("\ufffd", "").strip()
+
     # Collapse multiple spaces to one
     name = re.sub(r"\s+", " ", name)
+
+    # Reject empty or obviously invalid names
+    if not name:
+        return None
+
+    # Reject names that are too long (likely paragraph text)
+    if len(name) > _MAX_JUDGE_NAME_LENGTH:
+        logger.warning(
+            "Rejecting judge name exceeding %d chars: %r",
+            _MAX_JUDGE_NAME_LENGTH,
+            name[:80],
+        )
+        return None
+
+    # Reject garbage patterns (sentences, ruling text fragments, etc.)
+    if _GARBAGE_NAME_RE.search(name):
+        logger.warning("Rejecting judge name with garbage pattern: %r", name[:80])
+        return None
 
     # Strip honorific prefixes — order matters: "The Honorable" before "Honorable",
     # and "Hon." before "Hon" to avoid leaving a trailing period.
     name = _HONORIFIC_PREFIX_RE.sub("", name).strip()
+
+    if not name:
+        return None
 
     if "," in name:
         parts = name.split(",", 1)
@@ -264,25 +327,81 @@ def normalize_judge_name(raw_name: str) -> str:
         first = parts[1].strip()
         name = f"{first} {last}"
 
+    # Move misplaced generational suffix from beginning to end.
+    # E.g. "Jr. Edward B. Moreton" -> "Edward B. Moreton Jr."
+    words = name.split()
+    if len(words) >= 2 and words[0].rstrip(".") in {s.rstrip(".") for s in _GENERATIONAL_SUFFIXES}:
+        suffix = words[0]
+        name = " ".join(words[1:]) + " " + suffix
+
     # Title-case, but preserve periods (e.g. "A." stays "A.")
-    return name.title()
+    name = name.title()
+
+    # Fix generational suffixes that title() mangles (e.g. "Iii" -> "III")
+    words = name.split()
+    for i, word in enumerate(words):
+        canonical = _SUFFIX_CANONICAL.get(word.lower().rstrip(","))
+        if canonical is not None:
+            # Preserve any trailing comma
+            trail = "," if word.endswith(",") else ""
+            words[i] = canonical + trail
+    name = " ".join(words)
+
+    return name
+
+
+def _looks_like_valid_judge_name(name: str) -> bool:
+    """Return True if *name* is plausibly a valid judge name.
+
+    Rejects:
+    - Single-word names (last name only, no first name)
+    - Empty or whitespace-only strings
+
+    This guard prevents garbage entries from being created in the judges table.
+    """
+    if not name or not name.strip():
+        return False
+
+    # Must have at least two words (first + last name)
+    words = name.strip().split()
+    if len(words) < 2:
+        return False
+
+    return True
 
 
 def resolve_judge(
     conn: psycopg.Connection,
     raw_name: str,
     court_id: str,
-) -> str:
+) -> str | None:
     """Resolve a raw judge name to a canonical judge record, returning the judge UUID.
 
+    Returns ``None`` if the raw name is invalid (garbage, too short, etc.)
+    instead of creating a bad judge record.
+
     Lookup strategy (simple — exact normalized name match within the same court):
-      1. Search judge_aliases for a matching raw_name + court (via judge.court_id).
-      2. If found, return the judge_id from the alias.
-      3. If not found, create a new judge with canonical_name = normalized name,
+      1. Normalize the raw name and validate it.
+      2. Search judge_aliases for a matching raw_name + court (via judge.court_id).
+      3. If found, return the judge_id from the alias.
+      4. If not found, create a new judge with canonical_name = normalized name,
          create a judge_alias linking raw_name to the new judge, and return the id.
     """
     raw_name = _strip_nul(raw_name) or raw_name
     canonical = normalize_judge_name(raw_name)
+
+    # Reject invalid names before touching the database
+    if canonical is None:
+        logger.warning("resolve_judge: rejected invalid raw name %r", raw_name[:80])
+        return None
+
+    if not _looks_like_valid_judge_name(canonical):
+        logger.warning(
+            "resolve_judge: rejected single-word or invalid name %r (normalized: %r)",
+            raw_name[:80],
+            canonical,
+        )
+        return None
 
     with conn.cursor() as cur:
         # Look up existing alias for this raw name at this court
