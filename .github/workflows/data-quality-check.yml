@@ -1,0 +1,229 @@
+name: Data Quality Check
+
+on:
+  schedule:
+    # Every hour at minute 15 (offset from other scheduled workflows)
+    - cron: '15 * * * *'
+  # Allow manual trigger for debugging
+  workflow_dispatch:
+    inputs:
+      county:
+        description: "Optional county name to check (default: all)"
+        required: false
+        type: string
+      text_output:
+        description: "Use human-readable text output instead of JSON"
+        required: false
+        type: boolean
+        default: false
+
+# Only one quality check at a time
+concurrency:
+  group: data-quality-check
+  cancel-in-progress: true
+
+permissions:
+  issues: write
+  contents: read
+
+env:
+  AWS_REGION: us-west-2
+
+jobs:
+  data-quality-check:
+    name: Run data quality checks via ECS
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            scripts/data-quality-check.py
+            scripts/ecs-run-task.sh
+            scripts/ecs-logs.sh
+            data-quality-baselines.json
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Build script arguments
+        id: args
+        run: |
+          ARGS=""
+          if [ "${{ inputs.text_output }}" = "true" ]; then
+            ARGS="--text"
+          fi
+          if [ -n "${{ inputs.county }}" ]; then
+            ARGS="$ARGS --county ${{ inputs.county }}"
+          fi
+          echo "script_args=$ARGS" >> "$GITHUB_OUTPUT"
+
+      - name: Run data quality check on ECS
+        id: check
+        env:
+          SCRIPT_ARGS: ${{ steps.args.outputs.script_args }}
+        run: |
+          # Run the data quality check script on ECS via ecs-run-task.sh.
+          # The ECS task has DATABASE_URL injected from Secrets Manager.
+          # Use --cpu 256 --memory 512 since this is a lightweight SQL-only task.
+          set +e
+          if [ -n "$SCRIPT_ARGS" ]; then
+            scripts/ecs-run-task.sh \
+              --cpu 256 --memory 512 \
+              --timeout 300 \
+              --latest-image \
+              scripts/data-quality-check.py -- $SCRIPT_ARGS 2>&1 | tee /tmp/check_output.txt
+          else
+            scripts/ecs-run-task.sh \
+              --cpu 256 --memory 512 \
+              --timeout 300 \
+              --latest-image \
+              scripts/data-quality-check.py 2>&1 | tee /tmp/check_output.txt
+          fi
+          EXIT_CODE=${PIPESTATUS[0]}
+          set -e
+
+          echo "exit_code=$EXIT_CODE" >> "$GITHUB_OUTPUT"
+
+          if [ "$EXIT_CODE" -eq 0 ]; then
+            echo "healthy=true" >> "$GITHUB_OUTPUT"
+            echo "Data quality check passed: all counties healthy."
+          else
+            echo "healthy=false" >> "$GITHUB_OUTPUT"
+            echo "Data quality check found alerts (exit code $EXIT_CODE)."
+          fi
+
+      - name: Check for existing open issue
+        if: steps.check.outputs.healthy == 'false'
+        id: existing
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          EXISTING=$(gh issue list \
+            --repo "${{ github.repository }}" \
+            --state open \
+            --label "data-quality-failure" \
+            --json number \
+            --limit 1 \
+            -q '.[0].number // empty')
+
+          if [ -n "$EXISTING" ]; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "number=$EXISTING" >> "$GITHUB_OUTPUT"
+            echo "Open data-quality issue already exists: #${EXISTING}"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create failure issue
+        if: >-
+          steps.check.outputs.healthy == 'false' &&
+          steps.existing.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+          {
+            echo "## Data Quality Check Failure"
+            echo ""
+            echo "The hourly data quality check detected collection health issues in the dev database."
+            echo ""
+            echo "### Details"
+            echo ""
+            echo "See the workflow run logs for the full output of the data quality check."
+            echo ""
+            echo "### Context"
+            echo ""
+            echo "- **Workflow run:** ${RUN_URL}"
+            echo "- **Timestamp:** ${TIMESTAMP}"
+            echo "- **Check script:** \`scripts/data-quality-check.py\`"
+            echo "- **Baselines:** \`data-quality-baselines.json\`"
+            echo ""
+            echo "### Possible Causes"
+            echo ""
+            echo "- Scraper failure or court site change (zero rulings, stale scraper)"
+            echo "- Ingest rate drop (>50% below 7-day average)"
+            echo "- Database connectivity issues"
+            echo ""
+            echo "### Next Steps"
+            echo ""
+            echo "1. Check the workflow run logs for specific county alerts"
+            echo "2. Run manually: \`scripts/ecs-run-task.sh scripts/data-quality-check.py -- --text\`"
+            echo "3. Check scraper logs: \`scripts/ecs-logs.sh /ecs/judgemind-scraper-dev --lines 100\`"
+            echo "4. Review recent scraper deployments"
+            echo ""
+            echo "This issue was created automatically by the data quality check workflow."
+            echo "It will not create duplicates while this issue is open."
+          } > /tmp/issue_body.md
+
+          gh issue create \
+            --repo "${{ github.repository }}" \
+            --title "Data quality regression: collection health alerts on dev" \
+            --body-file /tmp/issue_body.md \
+            --label "priority/p1,area/scraping,data-quality-failure,agent/ready"
+
+      - name: Update existing issue with new failures
+        if: >-
+          steps.check.outputs.healthy == 'false' &&
+          steps.existing.outputs.exists == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ISSUE_NUM: ${{ steps.existing.outputs.number }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+          {
+            echo "### Update: Still failing at ${TIMESTAMP}"
+            echo ""
+            echo "See workflow run for details."
+            echo ""
+            echo "**Workflow run:** ${RUN_URL}"
+          } > /tmp/comment_body.md
+
+          gh issue comment "$ISSUE_NUM" \
+            --repo "${{ github.repository }}" \
+            --body-file /tmp/comment_body.md
+
+      - name: Auto-close resolved quality issues
+        if: steps.check.outputs.healthy == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          # Find all open issues with the data-quality-failure label
+          ISSUES=$(gh issue list \
+            --repo "${{ github.repository }}" \
+            --state open \
+            --label "data-quality-failure" \
+            --json number \
+            -q '.[].number')
+
+          if [ -z "$ISSUES" ]; then
+            echo "No open data-quality-failure issues to close."
+            exit 0
+          fi
+
+          for ISSUE_NUM in $ISSUES; do
+            echo "Closing data-quality issue #${ISSUE_NUM} — all checks are passing."
+
+            {
+              echo "All data quality checks are now passing. Auto-closing this issue."
+              echo ""
+              echo "**Passing workflow run:** ${RUN_URL}"
+            } > /tmp/close_comment.md
+
+            gh issue comment "$ISSUE_NUM" \
+              --repo "${{ github.repository }}" \
+              --body-file /tmp/close_comment.md
+
+            gh issue close "$ISSUE_NUM" \
+              --repo "${{ github.repository }}" \
+              --reason completed
+          done
