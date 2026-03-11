@@ -22,6 +22,7 @@ from typing import Any
 
 from .client import TelegramBridge
 from .formatting import DEFAULT_GITHUB_REPO
+from .interpreter import build_orchestrator_status
 from .models import Message
 
 logger = logging.getLogger(__name__)
@@ -136,11 +137,13 @@ class OrchestratorBridge:
     repo: str = DEFAULT_GITHUB_REPO
     paused: bool = False
     state_file: str | None = None
+    status_file: str | None = None
     inbox_path: str | None = None
     stop_requests_path: str | None = None
     _workers: dict[int, WorkerInfo] = field(default_factory=dict)
     _pending_commands: list[Command] = field(default_factory=list)
     _stopped_issues: set[int] = field(default_factory=set)
+    _recently_completed: list[dict[str, Any]] = field(default_factory=list)
     _poll_task: asyncio.Task[None] | None = field(default=None, repr=False)
     _poll_interval: float = field(default=30.0, repr=False)
 
@@ -202,6 +205,53 @@ class OrchestratorBridge:
         path = Path(self.state_file)
         if path.exists():
             path.unlink()
+
+    def write_status(
+        self,
+        *,
+        open_prs: list[dict[str, Any]] | None = None,
+        queue: list[dict[str, Any]] | None = None,
+    ) -> None:
+        """Write the orchestrator status JSON for the responder daemon.
+
+        This writes ``orchestrator_status.json`` (at *status_file*) containing
+        the full orchestrator state — active agents, open PRs, recently
+        completed tasks, queue, and paused/stopped state.  The responder
+        daemon reads this file to provide context to the Claude interpreter.
+
+        Call this after every state change (task start/complete/fail, pause,
+        resume, etc.).
+
+        Args:
+            open_prs: List of open PR dicts (number, CI status, mergeable).
+            queue: Next issues by priority (list of dicts with number, title).
+        """
+        if not self.status_file:
+            return
+
+        active_agents = [
+            {
+                "worker_number": w.worker_number,
+                "issue_number": w.issue_number,
+                "issue_title": w.issue_title,
+                "phase": w.phase,
+                "updated": w.updated,
+            }
+            for w in self._workers.values()
+        ]
+
+        status = build_orchestrator_status(
+            active_agents=active_agents,
+            open_prs=open_prs or [],
+            recently_completed=self._recently_completed[-10:],
+            queue=queue or [],
+            paused=self.paused,
+            stopped_issues=sorted(self._stopped_issues),
+        )
+
+        path = Path(self.status_file)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(status, indent=2, default=str))
 
     def refresh_state(self) -> None:
         """Re-read the state file to pick up external changes.
@@ -302,6 +352,7 @@ class OrchestratorBridge:
             updated=datetime.datetime.now(datetime.UTC).isoformat(),
         )
         self._save_state()
+        self.write_status()
         await self.bridge.status_update(
             task=f"#{issue_number}",
             state="in_progress",
@@ -312,7 +363,16 @@ class OrchestratorBridge:
     async def task_completed(self, *, issue_number: int, summary: str, worker: int) -> None:
         """Notify that a task agent has completed successfully."""
         self._workers.pop(worker, None)
+        self._recently_completed.append(
+            {
+                "issue_number": issue_number,
+                "outcome": "completed",
+                "summary": summary,
+                "timestamp": datetime.datetime.now(datetime.UTC).isoformat(),
+            }
+        )
         self._save_state()
+        self.write_status()
         await self.bridge.status_update(
             task=f"#{issue_number}",
             state="complete",
@@ -323,7 +383,16 @@ class OrchestratorBridge:
     async def task_failed(self, *, issue_number: int, error: str, worker: int) -> None:
         """Notify that a task agent has failed."""
         self._workers.pop(worker, None)
+        self._recently_completed.append(
+            {
+                "issue_number": issue_number,
+                "outcome": "failed",
+                "error": error,
+                "timestamp": datetime.datetime.now(datetime.UTC).isoformat(),
+            }
+        )
         self._save_state()
+        self.write_status()
         await self.bridge.status_update(
             task=f"#{issue_number}",
             state="failed",
@@ -578,6 +647,7 @@ def create_orchestrator_bridge(
     region_name: str = "us-west-2",
     repo: str = DEFAULT_GITHUB_REPO,
     state_file: str | None = None,
+    status_file: str | None = None,
     inbox_path: str | None = None,
     stop_requests_path: str | None = None,
 ) -> OrchestratorBridge:
@@ -586,6 +656,11 @@ def create_orchestrator_bridge(
     If *state_file* is provided, worker state and the paused flag are persisted
     to that path so that short-lived invocations can share state across process
     boundaries.
+
+    If *status_file* is provided, :meth:`OrchestratorBridge.write_status` will
+    write the full orchestrator status (active agents, PRs, queue, etc.) to
+    that path.  The responder daemon reads this file to provide context to
+    the Claude interpreter.
 
     If *inbox_path* is provided, :meth:`OrchestratorBridge.read_inbox` will
     read commands from that file (written by ``scripts/tg-poll-daemon.py``)
@@ -607,6 +682,7 @@ def create_orchestrator_bridge(
         bridge=bridge,
         repo=repo,
         state_file=state_file,
+        status_file=status_file,
         inbox_path=inbox_path,
         stop_requests_path=stop_requests_path,
     )

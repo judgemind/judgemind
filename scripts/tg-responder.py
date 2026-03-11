@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Standalone Telegram responder daemon.
 
-Polls the Telegram inbound SQS queue every few seconds and handles simple
-commands (status, pause, resume, stop) directly — replying via the Telegram
-Bot API within seconds.  Complex commands (start, free text) are queued to
-an inbox file for the orchestrator to pick up.
+Polls the Telegram inbound SQS queue every few seconds and interprets all
+messages as free text using a lightweight Claude API call (Haiku).  The
+interpreter understands the current orchestrator state and can respond
+naturally to any question, while also extracting actionable commands
+(start, pause, resume, stop) for the orchestrator.
 
 This daemon **replaces** ``scripts/tg-poll-daemon.py``, which only queued
 messages without responding.
@@ -24,6 +25,9 @@ Environment:
     AWS credentials must be available (profile, env vars, or instance role).
     The bot token and chat IDs are read from Secrets Manager
     (``judgemind/telegram/bot``) at startup.
+    The Anthropic API key must be available via the ``ANTHROPIC_API_KEY``
+    environment variable or via Secrets Manager
+    (``judgemind/anthropic/api-key``).
 """
 
 from __future__ import annotations
@@ -38,6 +42,7 @@ import signal
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
 import boto3
 import httpx
@@ -48,7 +53,7 @@ _BRIDGE_SRC = _REPO_ROOT / "packages" / "telegram-bridge" / "src"
 if str(_BRIDGE_SRC) not in sys.path:
     sys.path.insert(0, str(_BRIDGE_SRC))
 
-from telegram_bridge.orchestrator import CommandKind, parse_command  # noqa: E402
+from telegram_bridge.interpreter import interpret_message  # noqa: E402
 
 logging.basicConfig(
     level=logging.INFO,
@@ -92,6 +97,37 @@ def load_secret(
     return token, chat_ids
 
 
+def load_anthropic_api_key(
+    *,
+    secret_id: str = "judgemind/anthropic/api-key",
+    region: str = DEFAULT_REGION,
+) -> str | None:
+    """Load the Anthropic API key from env var or Secrets Manager.
+
+    Returns ``None`` if the key is not available (Claude interpretation
+    will be skipped and a fallback response sent).
+    """
+    # Check env var first.
+    key = os.environ.get("ANTHROPIC_API_KEY")
+    if key:
+        return key
+
+    # Try Secrets Manager.
+    try:
+        client = boto3.client("secretsmanager", region_name=region)
+        resp = client.get_secret_value(SecretId=secret_id)
+        secret_str = resp["SecretString"]
+        # The secret may be a raw key string or JSON with an "api_key" field.
+        try:
+            data = json.loads(secret_str)
+            return data.get("api_key", secret_str)
+        except (json.JSONDecodeError, ValueError):
+            return secret_str
+    except Exception:
+        logger.info("Anthropic API key not found — Claude interpretation disabled.")
+        return None
+
+
 # ── Telegram replies ────────────────────────────────────────────────────
 
 
@@ -131,6 +167,24 @@ def send_telegram_reply(
 
 
 # ── State file helpers ──────────────────────────────────────────────────
+
+
+def read_orchestrator_status(status_file: str) -> dict[str, Any] | None:
+    """Read the orchestrator status JSON file.
+
+    This is the rich status file written by OrchestratorBridge.write_status(),
+    containing active agents, open PRs, queue, etc.
+
+    Returns ``None`` if the file is missing or corrupt.
+    """
+    path = Path(status_file)
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text())
+    except (json.JSONDecodeError, ValueError):
+        logger.warning("Corrupt orchestrator status file — ignoring.")
+        return None
 
 
 def read_orchestrator_state(state_file: str) -> dict[str, object]:
@@ -239,7 +293,7 @@ def format_status_reply(
                 lines.append(
                     f"Worker-{w.get('worker_number', '?')}: "
                     f"#{w.get('issue_number', '?')} ({w.get('phase', '?')}) "
-                    f"— {w.get('issue_title', '?')}"
+                    f"--- {w.get('issue_title', '?')}"
                 )
 
     # Supplement with agent-status files (may have workers not in orchestrator state).
@@ -254,11 +308,11 @@ def format_status_reply(
             issue = s.get("issue", "?")
             phase = s.get("phase", "?")
             summary = s.get("summary", "")
-            lines.append(f"{worker_name}: {issue} ({phase}) — {summary}")
+            lines.append(f"{worker_name}: {issue} ({phase}) --- {summary}")
 
     result = "\n".join(lines) if lines else "No active issues."
     if paused:
-        result += "\n\n(paused — not spawning new work)"
+        result += "\n\n(paused --- not spawning new work)"
     return result
 
 
@@ -333,6 +387,102 @@ def queue_to_inbox(message: dict[str, object], inbox_file: str) -> None:
 # ── Dispatch ────────────────────────────────────────────────────────────
 
 
+def dispatch_message(
+    *,
+    message: dict[str, object],
+    bot_token: str,
+    chat_ids: list[int],
+    state_file: str,
+    status_file: str,
+    agent_status_dir: str,
+    stop_requests_file: str,
+    inbox_file: str,
+    anthropic_api_key: str | None = None,
+) -> None:
+    """Interpret and dispatch a single inbound message using Claude API.
+
+    All messages are sent to the Claude interpreter for natural-language
+    understanding.  The interpreter returns a reply and optional actions
+    (start, pause, resume, stop) which are executed by the daemon.
+
+    If the Anthropic API key is not available, falls back to a simple
+    acknowledgment.
+    """
+    text = str(message.get("text", ""))
+
+    if not anthropic_api_key:
+        # No API key — fall back to simple acknowledgment and queue.
+        queue_to_inbox(dict(message), inbox_file)
+        send_telegram_reply(
+            f"Received your message (interpreter unavailable): {text}",
+            bot_token=bot_token,
+            chat_ids=chat_ids,
+        )
+        return
+
+    # Read orchestrator status for context.
+    orchestrator_status = read_orchestrator_status(status_file)
+
+    # If no status file exists, build a basic context from agent status files
+    # and orchestrator state.
+    if orchestrator_status is None:
+        state = read_orchestrator_state(state_file)
+        agent_statuses = read_agent_status_files(agent_status_dir)
+        orchestrator_status = {
+            "active_agents": agent_statuses,
+            "paused": state.get("paused", False),
+            "workers": state.get("workers", {}),
+        }
+
+    # Call the Claude interpreter.
+    try:
+        result = interpret_message(
+            text=text,
+            orchestrator_status=orchestrator_status,
+            api_key=anthropic_api_key,
+        )
+    except Exception:
+        logger.warning("Claude interpreter failed — falling back", exc_info=True)
+        queue_to_inbox(dict(message), inbox_file)
+        send_telegram_reply(
+            f"Received your message (interpreter error): {text}",
+            bot_token=bot_token,
+            chat_ids=chat_ids,
+        )
+        return
+
+    # Send the Claude-generated reply.
+    send_telegram_reply(result.reply, bot_token=bot_token, chat_ids=chat_ids)
+
+    # Execute any actions.
+    for action in result.actions:
+        action_type = action.get("type", "")
+
+        if action_type == "pause":
+            handle_pause(state_file)
+            logger.info("Action: pause")
+
+        elif action_type == "resume":
+            handle_resume(state_file)
+            logger.info("Action: resume")
+
+        elif action_type == "stop":
+            issue_num = action.get("issue")
+            if isinstance(issue_num, int):
+                handle_stop(issue_num, stop_requests_file)
+                logger.info("Action: stop #%d", issue_num)
+
+        elif action_type == "start":
+            issue_num = action.get("issue")
+            if isinstance(issue_num, int):
+                queue_to_inbox(
+                    {"text": f"start #{issue_num}", "user_id": message.get("user_id")},
+                    inbox_file,
+                )
+                logger.info("Action: start #%d (queued for orchestrator)", issue_num)
+
+
+# Keep dispatch_command as a backwards-compatible alias for tests that use it.
 def dispatch_command(
     *,
     message: dict[str, object],
@@ -343,57 +493,23 @@ def dispatch_command(
     stop_requests_file: str,
     inbox_file: str,
 ) -> None:
-    """Parse and dispatch a single inbound message."""
-    text = str(message.get("text", ""))
-    cmd = parse_command(text)
+    """Legacy dispatch using the old command parser.
 
-    if cmd.kind == CommandKind.STATUS:
-        state = read_orchestrator_state(state_file)
-        agent_statuses = read_agent_status_files(agent_status_dir)
-        reply = format_status_reply(state, agent_statuses=agent_statuses)
-        send_telegram_reply(reply, bot_token=bot_token, chat_ids=chat_ids)
-
-    elif cmd.kind == CommandKind.PAUSE:
-        handle_pause(state_file)
-        send_telegram_reply(
-            "Paused. No new issues will be spawned.",
-            bot_token=bot_token,
-            chat_ids=chat_ids,
-        )
-
-    elif cmd.kind == CommandKind.RESUME:
-        handle_resume(state_file)
-        send_telegram_reply(
-            "Resumed. Will spawn issues as normal.",
-            bot_token=bot_token,
-            chat_ids=chat_ids,
-        )
-
-    elif cmd.kind == CommandKind.STOP:
-        handle_stop(cmd.issue_number, stop_requests_file)
-        send_telegram_reply(
-            f"Stop request noted for #{cmd.issue_number}. "
-            "Will not spawn more work for this issue.",
-            bot_token=bot_token,
-            chat_ids=chat_ids,
-        )
-
-    elif cmd.kind == CommandKind.START:
-        queue_to_inbox(dict(message), inbox_file)
-        send_telegram_reply(
-            f"Acknowledged: will start issue #{cmd.issue_number}. "
-            "Queued for orchestrator.",
-            bot_token=bot_token,
-            chat_ids=chat_ids,
-        )
-
-    elif cmd.kind == CommandKind.FREE_TEXT:
-        queue_to_inbox(dict(message), inbox_file)
-        send_telegram_reply(
-            f"Received your message. Queued for orchestrator: {text}",
-            bot_token=bot_token,
-            chat_ids=chat_ids,
-        )
+    .. deprecated::
+        Use :func:`dispatch_message` instead, which uses Claude API
+        interpretation for natural-language understanding.
+    """
+    dispatch_message(
+        message=message,
+        bot_token=bot_token,
+        chat_ids=chat_ids,
+        state_file=state_file,
+        status_file="tmp/orchestrator_status.json",
+        agent_status_dir=agent_status_dir,
+        stop_requests_file=stop_requests_file,
+        inbox_file=inbox_file,
+        anthropic_api_key=None,  # Falls back to simple acknowledgment.
+    )
 
 
 # ── SQS polling ─────────────────────────────────────────────────────────
@@ -445,7 +561,7 @@ def poll_sqs(
 def _handle_signal(signum: int, _frame: object) -> None:
     """Set the shutdown flag on SIGTERM/SIGINT."""
     global _shutdown_requested  # noqa: PLW0603
-    logger.info("Received signal %d — shutting down.", signum)
+    logger.info("Received signal %d --- shutting down.", signum)
     _shutdown_requested = True
 
 
@@ -463,7 +579,7 @@ def check_stop_file(pid_file: Path) -> bool:
     """
     stop_path = pid_file.with_suffix(".stop")
     if stop_path.exists():
-        logger.info("Stop file detected (%s) — shutting down.", stop_path)
+        logger.info("Stop file detected (%s) --- shutting down.", stop_path)
         return True
     return False
 
@@ -491,12 +607,14 @@ def run_daemon(
     region: str,
     interval: float,
     state_file: str,
+    status_file: str,
     agent_status_dir: str,
     stop_requests_file: str,
     inbox_file: str,
     secret_id: str = "judgemind/telegram/bot",
+    anthropic_secret_id: str = "judgemind/anthropic/api-key",
 ) -> None:
-    """Main daemon loop: poll SQS, dispatch commands, repeat."""
+    """Main daemon loop: poll SQS, interpret messages via Claude, repeat."""
     global _shutdown_requested  # noqa: PLW0603
 
     signal.signal(signal.SIGTERM, _handle_signal)
@@ -504,8 +622,18 @@ def run_daemon(
 
     write_pid_file(pid_file)
 
-    # Load secret at startup.
+    # Load secrets at startup.
     bot_token, chat_ids = load_secret(secret_id=secret_id, region=region)
+    anthropic_api_key = load_anthropic_api_key(
+        secret_id=anthropic_secret_id, region=region
+    )
+    if anthropic_api_key:
+        logger.info("Claude interpreter enabled (Haiku).")
+    else:
+        logger.warning(
+            "Claude interpreter disabled — will fall back to simple acknowledgment."
+        )
+
     logger.info(
         "Started (PID %d). Polling every %ds. Chat IDs: %s",
         os.getpid(),
@@ -520,14 +648,16 @@ def run_daemon(
             try:
                 messages = poll_sqs(sqs, queue_url)
                 for msg in messages:
-                    dispatch_command(
+                    dispatch_message(
                         message=msg,
                         bot_token=bot_token,
                         chat_ids=chat_ids,
                         state_file=state_file,
+                        status_file=status_file,
                         agent_status_dir=agent_status_dir,
                         stop_requests_file=stop_requests_file,
                         inbox_file=inbox_file,
+                        anthropic_api_key=anthropic_api_key,
                     )
                 if messages:
                     logger.info("Processed %d message(s).", len(messages))
@@ -576,6 +706,11 @@ def main() -> None:
         help="Path to orchestrator state file",
     )
     parser.add_argument(
+        "--status-file",
+        default="tmp/orchestrator_status.json",
+        help="Path to orchestrator status JSON file (written by OrchestratorBridge)",
+    )
+    parser.add_argument(
         "--agent-status-dir",
         default="tmp/agent-status",
         help="Directory containing worker-N.txt status files",
@@ -595,6 +730,11 @@ def main() -> None:
         default="judgemind/telegram/bot",
         help="Secrets Manager secret ID for bot token",
     )
+    parser.add_argument(
+        "--anthropic-secret-id",
+        default="judgemind/anthropic/api-key",
+        help="Secrets Manager secret ID for Anthropic API key",
+    )
     args = parser.parse_args()
 
     run_daemon(
@@ -603,10 +743,12 @@ def main() -> None:
         region=args.region,
         interval=args.interval,
         state_file=args.state_file,
+        status_file=args.status_file,
         agent_status_dir=args.agent_status_dir,
         stop_requests_file=args.stop_requests_file,
         inbox_file=args.inbox_file,
         secret_id=args.secret_id,
+        anthropic_secret_id=args.anthropic_secret_id,
     )
 
 

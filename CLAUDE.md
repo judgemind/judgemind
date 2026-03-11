@@ -536,30 +536,43 @@ When Telegram is configured (bot token in Secrets Manager `judgemind/telegram/bo
 
 **Lifecycle notifications:** call `session_started()` when an interactive session begins, `task_started()` / `task_completed()` / `task_failed()` around `/task` agent invocations, and `session_ended()` when shutting down.
 
-**Inbound commands:** call `await bridge.start_polling(interval=30)` once at session start to begin automatic background polling. Retrieve accumulated commands with `bridge.drain_pending_commands()` between tasks. The manual `process_commands()` method is still available for one-shot polling. Supported commands:
+**Inbound messages:** All Telegram messages are interpreted as free text by a Claude API call (Haiku) in the responder daemon. The daemon responds directly with natural-language replies and extracts actionable commands (start, pause, resume, stop) for the orchestrator. No special command syntax is required — users can write naturally.
 
-- `status` — replies with a summary of running tasks
-- `start #N` — returns an action dict; orchestrator should spawn `/task #N`
-- `stop #N` — acknowledges; orchestrator should avoid spawning more work for that issue
-- `pause` / `resume` — toggles whether the orchestrator spawns new task agents
-- Free text — forwarded for orchestrator interpretation. **The orchestrator must reply via Telegram** by calling `bridge.reply("your response text")` after processing the message. Check `result["needs_reply"]` on the result dict returned by `process_commands()` / `handle_command()` — when `True`, the user is waiting for a response in Telegram.
+The orchestrator still uses `bridge.start_polling(interval=30)` or `bridge.drain_pending_commands()` to pick up commands from the inbox file. The responder daemon handles the interpretation and reply, so the orchestrator only sees pre-parsed actions.
 
 If Telegram is not configured, all bridge calls are silent no-ops. No existing workflows are affected.
 
+#### Orchestrator status file
+
+The orchestrator must call `bridge.write_status()` after every state change (task start, complete, fail, pause, resume). This writes `tmp/orchestrator_status.json` containing:
+- Active agents: issue number, title, worker number, phase
+- Open PRs: number, CI status, mergeable
+- Recently completed tasks: issue number, outcome
+- Queue: next issues by priority
+- Paused/stopped state
+
+The responder daemon reads this file to provide context to the Claude interpreter, enabling it to give informed, specific answers about orchestrator state.
+
 #### Responder daemon and state files
 
-The standalone **responder daemon** (`scripts/tg-responder.py`) handles simple Telegram commands (`status`, `pause`, `resume`, `stop #N`) directly — replying within seconds — and queues complex commands (`start #N`, free text) to an inbox file for the orchestrator. It communicates with the orchestrator via shared state files:
+The standalone **responder daemon** (`scripts/tg-responder.py`) interprets all Telegram messages via a Claude API call (Haiku, ~$0.001/interaction). It receives the user's message and the current orchestrator status, generates a natural-language reply, and extracts any actionable commands. It communicates with the orchestrator via shared state files:
 
+- **`tmp/orchestrator_status.json`** — written by `OrchestratorBridge.write_status()`. The responder reads this to provide context to the Claude interpreter. Contains active agents, open PRs, queue, and paused/stopped state.
 - **`tmp/orchestrator_state.json`** — the responder writes `paused` flag changes here. The orchestrator must call `bridge.refresh_state()` before each spawn decision to pick up `pause`/`resume` changes made out-of-loop.
 - **`tmp/stop_requests.json`** — the responder appends stop requests here (JSON array of `{"issue_number": N, "timestamp": "..."}`). The orchestrator reads and clears this file by calling `bridge.read_stop_requests()`, which returns newly stopped issue numbers and accumulates them in `bridge.stopped_issues`. Use `bridge.is_issue_stopped(N)` to check before spawning.
-- **`tmp/tg_inbox.json`** — queued `start` and free-text commands, read by `bridge.read_inbox()`.
+- **`tmp/tg_inbox.json`** — queued `start` commands extracted by the interpreter, read by `bridge.read_inbox()`.
 
 **Orchestrator spawn loop pattern:**
-1. Call `bridge.refresh_state()` to pick up external `paused` changes.
-2. Call `bridge.read_stop_requests()` to consume new stop requests.
-3. Check `bridge.paused` — if `True`, skip spawning.
-4. Before spawning issue `#N`, check `bridge.is_issue_stopped(N)` — if `True`, skip it.
-5. Call `bridge.read_inbox()` or `bridge.drain_pending_commands()` to get inbound `start` commands.
+1. Call `bridge.write_status()` to update the status file for the responder.
+2. Call `bridge.refresh_state()` to pick up external `paused` changes.
+3. Call `bridge.read_stop_requests()` to consume new stop requests.
+4. Check `bridge.paused` — if `True`, skip spawning.
+5. Before spawning issue `#N`, check `bridge.is_issue_stopped(N)` — if `True`, skip it.
+6. Call `bridge.read_inbox()` or `bridge.drain_pending_commands()` to get inbound `start` commands.
+
+**Secrets required:**
+- `judgemind/telegram/bot` — bot token and allowed user IDs (existing)
+- `judgemind/anthropic/api-key` — Anthropic API key for Claude interpreter, or set `ANTHROPIC_API_KEY` env var. If missing, the daemon falls back to simple acknowledgments.
 
 To start the responder daemon: `scripts/tg-responder.py`. To stop it: create `tmp/tg_responder.stop`.
 
