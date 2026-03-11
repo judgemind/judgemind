@@ -240,6 +240,50 @@ export const typeDefs = `#graphql
   }
 
   # ---------------------------------------------------------------------------
+  # Data Quality Metrics — admin-only time-series monitoring
+  # ---------------------------------------------------------------------------
+
+  """A single data quality metric measurement at a point in time."""
+  type DataQualityMetric {
+    id: ID!
+    """When this metric was recorded (ISO 8601)."""
+    recordedAt: String!
+    """County name, e.g. "Los Angeles"."""
+    county: String!
+    """Metric identifier, e.g. "ruling_count_24h", "field_completeness_pct"."""
+    metricName: String!
+    """Numeric value of the metric."""
+    metricValue: Float!
+    """Optional JSON context (e.g. which fields are missing, error details)."""
+    metadata: String
+  }
+
+  type DataQualityMetricEdge {
+    node: DataQualityMetric!
+    cursor: String!
+  }
+
+  type DataQualityMetricConnection {
+    edges: [DataQualityMetricEdge!]!
+    pageInfo: PageInfo!
+  }
+
+  """Current health overview for a single county."""
+  type DataQualityOverview {
+    county: String!
+    """One of: green, yellow, red."""
+    healthStatus: String!
+    """Rolling 24-hour ruling ingest count."""
+    rulingCount24h: Float
+    """Overall field completeness percentage (0-100)."""
+    fieldCompletenessPct: Float
+    """Hours since last successful scraper run."""
+    scraperLastSuccessAgeHours: Float
+    """When the most recent metric was recorded (ISO 8601)."""
+    lastUpdated: String
+  }
+
+  # ---------------------------------------------------------------------------
   # Alert Subscriptions
   # ---------------------------------------------------------------------------
 
@@ -331,6 +375,27 @@ export const typeDefs = `#graphql
       first: Int
       after: String
     ): RulingConnection!
+
+    """Time-series data quality metrics. Admin-only. Ordered by recorded_at DESC, id DESC.
+    Returns a paginated connection with keyset cursors."""
+    dataQualityMetrics(
+      """Filter by county name."""
+      county: String
+      """Filter by metric name, e.g. "ruling_count_24h"."""
+      metricName: String
+      """Start of time range (ISO 8601). Required."""
+      startDate: String!
+      """End of time range (ISO 8601). Required."""
+      endDate: String!
+      """Max results per page (default 100, max 1000)."""
+      limit: Int
+      """Opaque cursor from a previous response's pageInfo.endCursor."""
+      after: String
+    ): DataQualityMetricConnection!
+
+    """Current health overview for all counties. Admin-only.
+    Computes green/yellow/red status from the latest metrics per county."""
+    dataQualityOverview: [DataQualityOverview!]!
 
     """Return the currently authenticated user, or null."""
     me: User
