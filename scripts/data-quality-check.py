@@ -754,6 +754,10 @@ def main() -> None:
             len(filing_result.failed),
         )
 
+    # Log a completion marker for CloudWatch metric filters.
+    # This allows a CloudWatch alarm to detect when the check stops running.
+    logger.info("data_quality_check_complete alert_count=%d", len(alerts))
+
     sys.exit(0 if len(alerts) == 0 else 1)
 
 

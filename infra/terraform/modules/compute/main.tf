@@ -573,3 +573,50 @@ resource "aws_cloudwatch_metric_alarm" "scraper_no_success" {
     environment = var.environment
   }
 }
+
+# ─── Data Quality Check Alerts ───────────────────────────────────────────────
+# CloudWatch alarm that fires when the hourly data quality check has not
+# completed in the past 2 hours. The check runs as a oneshot ECS task launched
+# by GitHub Actions, logging to the ingestion worker log group. The script logs
+# "data_quality_check_complete" on every run.
+
+resource "aws_cloudwatch_log_metric_filter" "data_quality_complete" {
+  count = var.enable_alerts && local.deploy_ingestion ? 1 : 0
+
+  name           = "judgemind-data-quality-complete-${var.environment}"
+  pattern        = "\"data_quality_check_complete\""
+  log_group_name = aws_cloudwatch_log_group.ingestion_worker[0].name
+
+  metric_transformation {
+    name          = "DataQualityCheckCount"
+    namespace     = "Judgemind/DataQuality"
+    value         = "1"
+    default_value = "0"
+  }
+}
+
+resource "aws_cloudwatch_metric_alarm" "data_quality_no_run" {
+  count = var.enable_alerts && local.deploy_ingestion ? 1 : 0
+
+  alarm_name        = "judgemind-data-quality-no-run-2h-${var.environment}"
+  alarm_description = "No data quality check has completed in the past 2 hours (${var.environment}). The hourly GitHub Actions workflow may be failing or disabled."
+
+  namespace   = "Judgemind/DataQuality"
+  metric_name = "DataQualityCheckCount"
+  statistic   = "Sum"
+
+  comparison_operator = "LessThanOrEqualToThreshold"
+  threshold           = 0
+  period              = 7200
+  evaluation_periods  = 1
+  datapoints_to_alarm = 1
+  treat_missing_data  = "breaching"
+
+  alarm_actions = [aws_sns_topic.scraper_alerts[0].arn]
+  ok_actions    = [aws_sns_topic.scraper_alerts[0].arn]
+
+  tags = {
+    project     = "judgemind"
+    environment = var.environment
+  }
+}
