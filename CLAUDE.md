@@ -470,6 +470,18 @@ These patterns avoid permission prompts and allow the agent to run without inter
 - **Telegram bridge notifications:** the `TelegramBridge` and `OrchestratorBridge` classes are async. In synchronous contexts, use `asyncio.run()` or schedule on an existing event loop. The bridge auto-initialises lazily on first use — no explicit setup needed beyond passing the secret ID and SQS queue URL. If the secret is missing or empty, all calls are silent no-ops, so it is safe to call unconditionally.
 - **File-based graceful shutdown for background processes:** Never use `kill` to stop background daemons — it is blocked by the sandbox. Instead, use the file-based stop convention: for any daemon that writes a PID to `tmp/foo.pid`, create `tmp/foo.stop` to request shutdown. The daemon checks for the stop file each iteration and exits gracefully, cleaning up both the PID file and the stop file. To stop the Telegram poller: create `tmp/tg_poll.stop` using the Write tool. The daemon (`scripts/tg-poll-daemon.py`) will detect it within 1 second and exit. For new background daemons, follow the same convention: check `_check_stop_file(pid_file)` in the sleep loop and call `_remove_stop_file(pid_file)` in the `finally` block.
 - **Writing to `.claude/` directories (skills, hooks, settings):** The Claude Code platform has a built-in deny on the `.claude/` directory that overrides project-level `Edit(**)` / `Write(**)` permissions. This is a security boundary — it prevents agents from modifying their own permissions, hooks, or configuration without human approval. This protection **cannot be overridden** via `settings.json`, and it blocks Edit, Write, `cp`, and `mv` tools when the destination is inside `.claude/`. The only workaround is a Python script: write the new content to `{worktree}/tmp/new_file.md` using the Write tool, then write a helper script to `{worktree}/tmp/copy_to_claude.py` that uses `shutil.copy2()` to copy it into `.claude/`. Run the script with `python3 {worktree}/tmp/copy_to_claude.py`. This works because the platform does not inspect Python script arguments for `.claude/` paths. Use `scripts/write-claude-file.sh` as a convenience wrapper (see below).
+- **ECS script execution — prefer `ecs-run-task.sh` over `ecs-run.sh`:** `scripts/ecs-run.sh` uses ECS Exec (SSM sessions) which frequently disconnects within seconds, losing all output. Use `scripts/ecs-run-task.sh` instead — it launches a clean Fargate task and streams logs reliably from CloudWatch. Reserve `ecs-run.sh` only for quick interactive debugging (e.g. `scripts/ecs-run.sh bash`).
+  ```
+  # Run a script and wait for completion (default)
+  scripts/ecs-run-task.sh scripts/backfill_ruling_fields.py -- --dry-run
+
+  # Long-running tasks: launch and detach, check logs later
+  scripts/ecs-run-task.sh --detach scripts/reingest_from_s3.py -- --all
+  scripts/ecs-run-task.sh --logs <task-arn>
+
+  # Override CPU/memory for heavy workloads
+  scripts/ecs-run-task.sh --cpu 2048 --memory 4096 scripts/backfill_parties.py
+  ```
 
 ## Session Triggers
 
