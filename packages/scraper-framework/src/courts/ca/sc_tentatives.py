@@ -45,7 +45,14 @@ import pdfplumber
 import structlog
 from bs4 import BeautifulSoup
 
-from framework import BaseScraper, CapturedDocument, ContentFormat, ScheduleWindow, ScraperConfig
+from framework import (
+    BaseScraper,
+    CapturedDocument,
+    ContentFormat,
+    CourtDirectory,
+    ScheduleWindow,
+    ScraperConfig,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -125,6 +132,46 @@ class DepartmentInfo:
         self.department = department
         self.page_url = page_url
         self.judge_name = judge_name
+
+
+# ---------------------------------------------------------------------------
+# Court directory snapshot
+# ---------------------------------------------------------------------------
+
+COURT_ID = "ca_santa_clara"
+
+
+class SantaClaraCourtDirectory(CourtDirectory):
+    """Snapshot the Santa Clara dept-to-judge mapping using CourtDirectory infrastructure.
+
+    Fetches the tentative rulings landing page and extracts the department-to-judge
+    mapping from the link structure. The raw HTML is archived to S3 and the parsed
+    mapping is stored in the ``court_directory_snapshots`` DB table.
+    """
+
+    def fetch_current(self) -> tuple[bytes, dict[str, str]]:
+        """Fetch the live landing page and extract the dept-to-judge mapping.
+
+        Returns
+        -------
+        tuple[bytes, dict[str, str]]
+            A tuple of (raw_html_bytes, {department_number: judge_name}).
+        """
+        with httpx.Client(
+            timeout=30.0,
+            follow_redirects=True,
+            headers={"User-Agent": "Judgemind/1.0 (+https://judgemind.org/scraper)"},
+        ) as client:
+            response = client.get(LANDING_URL)
+            response.raise_for_status()
+
+        raw = response.content
+        departments = extract_departments(response.text)
+        mapping: dict[str, str] = {}
+        for dept in departments:
+            if dept.judge_name:
+                mapping[dept.department] = dept.judge_name
+        return raw, mapping
 
 
 # ---------------------------------------------------------------------------
@@ -337,10 +384,26 @@ class SCTentativeRulingsScraper(BaseScraper):
     1. Landing page → discover department links and judge names
     2. Department pages → discover PDF links (1-2 per department, by hearing day)
     3. Download each PDF → parse rulings
+
+    Parameters
+    ----------
+    config : ScraperConfig
+        Scraper configuration.
+    court_directory : SantaClaraCourtDirectory | None
+        Optional court directory instance. When provided, the scraper will
+        snapshot the department-to-judge mapping on each run via
+        ``fetch_and_snapshot()``. When ``None``, the scraper falls back to
+        fetching and parsing the landing page inline (no snapshot).
     """
 
-    def __init__(self, config: ScraperConfig, **kwargs: Any) -> None:
+    def __init__(
+        self,
+        config: ScraperConfig,
+        court_directory: SantaClaraCourtDirectory | None = None,
+        **kwargs: Any,
+    ) -> None:
         super().__init__(config, **kwargs)
+        self._court_directory = court_directory
 
     def fetch_documents(self) -> list[CapturedDocument]:
         """Fetch all ruling PDFs from all departments."""
@@ -351,12 +414,31 @@ class SCTentativeRulingsScraper(BaseScraper):
             follow_redirects=True,
             headers={"User-Agent": "Judgemind/1.0 (+https://judgemind.org/scraper)"},
         ) as client:
-            # Step 1: Fetch landing page and discover departments
+            # Step 1: Fetch landing page and discover departments.
+            # When a court directory is provided, snapshot the mapping and
+            # still fetch the landing page to discover department URLs.
+            if self._court_directory is not None:
+                self._log.info("Snapshotting court directory", court_id=COURT_ID)
+                dir_mapping = self._court_directory.fetch_and_snapshot(COURT_ID)
+                self._log.info(
+                    "Court directory snapshot taken",
+                    court_id=COURT_ID,
+                    departments=len(dir_mapping),
+                )
+
             self._log.info("Fetching landing page", url=LANDING_URL)
             response = client.get(LANDING_URL)
             response.raise_for_status()
 
             departments = extract_departments(response.text)
+
+            # If we have a directory mapping, enrich departments with judge names
+            # from the snapshot (in case inline extraction missed any).
+            if self._court_directory is not None:
+                for dept_info in departments:
+                    if not dept_info.judge_name and dept_info.department in dir_mapping:
+                        dept_info.judge_name = dir_mapping[dept_info.department]
+
             self._log.info("Found departments", count=len(departments))
 
             # Step 2: For each department, fetch the page and find PDF links

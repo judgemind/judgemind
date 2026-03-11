@@ -14,13 +14,16 @@ from __future__ import annotations
 
 from datetime import datetime
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import httpx
 import pytest
 import respx
 
 from courts.ca.sc_tentatives import (
+    COURT_ID,
     LANDING_URL,
+    SantaClaraCourtDirectory,
     SCTentativeRulingsScraper,
     extract_departments,
     extract_pdf_links_from_dept_page,
@@ -35,6 +38,7 @@ from courts.ca.sc_tentatives import (
     parse_outcome,
 )
 from courts.ca.sc_tentatives import default_config as sc_default_config
+from framework.hashing import sha256_hex
 
 pytestmark = pytest.mark.regression
 
@@ -546,3 +550,210 @@ def test_sc_default_config() -> None:
     assert config.county == "Santa Clara"
     assert config.s3_bucket == "judgemind-document-archive-dev"
     assert len(config.schedule_windows) == 2
+
+
+# ---------------------------------------------------------------------------
+# SantaClaraCourtDirectory — snapshot behavior
+# ---------------------------------------------------------------------------
+
+
+def _mock_db_conn(existing_hash: str | None = None) -> MagicMock:
+    """Create a mock psycopg connection with cursor context manager."""
+    conn = MagicMock()
+    cursor = MagicMock()
+    conn.cursor.return_value.__enter__ = MagicMock(return_value=cursor)
+    conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+    # _is_duplicate check: return None (no prior snapshot) or the existing hash
+    if existing_hash is not None:
+        cursor.fetchone.return_value = (existing_hash,)
+    else:
+        cursor.fetchone.return_value = None
+    return conn
+
+
+class TestSantaClaraCourtDirectory:
+    """Tests for the SantaClaraCourtDirectory subclass."""
+
+    @respx.mock
+    def test_fetch_current_returns_raw_and_mapping(self) -> None:
+        """fetch_current() should return raw HTML bytes and a dept-to-judge mapping."""
+        landing_html = _load_html("sc_landing_page.html")
+        respx.get(LANDING_URL).mock(return_value=httpx.Response(200, text=landing_html))
+
+        s3 = MagicMock()
+        db = _mock_db_conn()
+        directory = SantaClaraCourtDirectory(s3_client=s3, s3_bucket="test-bucket", db_conn=db)
+
+        raw, mapping = directory.fetch_current()
+
+        assert isinstance(raw, bytes)
+        assert len(raw) > 0
+        # Should have entries for the 10 departments with judges
+        assert len(mapping) >= 8  # some depts might not have judge links
+        assert mapping.get("1") == "Eunice W. Lee"
+        assert mapping.get("6") == "Rafael Sivilla-Jones"
+        assert mapping.get("16") == "Vincent I. Parrett"
+
+    @respx.mock
+    def test_fetch_and_snapshot_archives_to_s3(self) -> None:
+        """fetch_and_snapshot() should upload raw HTML to S3."""
+        landing_html = _load_html("sc_landing_page.html")
+        respx.get(LANDING_URL).mock(return_value=httpx.Response(200, text=landing_html))
+
+        s3 = MagicMock()
+        db = _mock_db_conn()
+        directory = SantaClaraCourtDirectory(s3_client=s3, s3_bucket="test-bucket", db_conn=db)
+
+        mapping = directory.fetch_and_snapshot(COURT_ID)
+
+        assert len(mapping) >= 8
+        s3.put_object.assert_called_once()
+        call_kwargs = s3.put_object.call_args.kwargs
+        assert call_kwargs["Bucket"] == "test-bucket"
+        assert call_kwargs["Key"].startswith(f"directories/{COURT_ID}/")
+        assert call_kwargs["ContentType"] == "text/html"
+
+    @respx.mock
+    def test_fetch_and_snapshot_inserts_into_db(self) -> None:
+        """fetch_and_snapshot() should insert a new snapshot row into the DB."""
+        landing_html = _load_html("sc_landing_page.html")
+        respx.get(LANDING_URL).mock(return_value=httpx.Response(200, text=landing_html))
+
+        s3 = MagicMock()
+        db = _mock_db_conn()
+        directory = SantaClaraCourtDirectory(s3_client=s3, s3_bucket="test-bucket", db_conn=db)
+
+        directory.fetch_and_snapshot(COURT_ID)
+
+        db.commit.assert_called_once()
+        cursor = db.cursor.return_value.__enter__.return_value
+        calls = cursor.execute.call_args_list
+        # First call: dedup SELECT, second call: INSERT
+        assert len(calls) == 2
+        insert_sql = calls[1].args[0]
+        assert "INSERT INTO court_directory_snapshots" in insert_sql
+
+    @respx.mock
+    def test_fetch_and_snapshot_dedup_skips_insert(self) -> None:
+        """When content hash matches, the DB insert should be skipped (dedup)."""
+        landing_html = _load_html("sc_landing_page.html")
+        respx.get(LANDING_URL).mock(return_value=httpx.Response(200, text=landing_html))
+
+        s3 = MagicMock()
+
+        # First, get the actual raw bytes the directory will return
+        dir_probe = SantaClaraCourtDirectory(s3_client=s3, s3_bucket="b", db_conn=_mock_db_conn())
+        actual_raw, _ = dir_probe.fetch_current()
+        content_hash = sha256_hex(actual_raw)
+
+        # Now create the real directory with the existing hash matching
+        respx.get(LANDING_URL).mock(return_value=httpx.Response(200, text=landing_html))
+        s3_real = MagicMock()
+        db = _mock_db_conn(existing_hash=content_hash)
+        directory = SantaClaraCourtDirectory(s3_client=s3_real, s3_bucket="test-bucket", db_conn=db)
+
+        mapping = directory.fetch_and_snapshot(COURT_ID)
+
+        # S3 upload should still happen (always archive)
+        s3_real.put_object.assert_called_once()
+        # But DB commit should NOT happen (dedup)
+        db.commit.assert_not_called()
+        # Mapping should still be returned
+        assert len(mapping) >= 8
+
+    @respx.mock
+    def test_mapping_excludes_departments_without_judges(self) -> None:
+        """Departments without judge names should not appear in the mapping."""
+        landing_html = _load_html("sc_landing_page.html")
+        respx.get(LANDING_URL).mock(return_value=httpx.Response(200, text=landing_html))
+
+        s3 = MagicMock()
+        db = _mock_db_conn()
+        directory = SantaClaraCourtDirectory(s3_client=s3, s3_bucket="test-bucket", db_conn=db)
+
+        _, mapping = directory.fetch_current()
+
+        # All values should be non-empty judge names
+        for dept, judge in mapping.items():
+            assert judge, f"Department {dept} has empty judge name"
+            assert isinstance(judge, str)
+
+
+class TestSCScraperWithDirectory:
+    """Tests for SCTentativeRulingsScraper wired to SantaClaraCourtDirectory."""
+
+    @respx.mock
+    def test_scraper_snapshots_directory_on_run(self) -> None:
+        """When court_directory is provided, the scraper should call fetch_and_snapshot."""
+        landing_html = _load_html("sc_landing_page.html")
+        dept1_html = _load_html("sc_dept1_page.html")
+        dept1_pdf = _load_bytes("sc_dept1_tues.pdf")
+
+        respx.get(LANDING_URL).mock(return_value=httpx.Response(200, text=landing_html))
+        respx.get(url__regex=r"tentative-rulings/dep").mock(
+            return_value=httpx.Response(200, text=dept1_html)
+        )
+        respx.get(url__regex=r"\.pdf$").mock(return_value=httpx.Response(200, content=dept1_pdf))
+
+        s3 = MagicMock()
+        db = _mock_db_conn()
+        directory = SantaClaraCourtDirectory(s3_client=s3, s3_bucket="test-bucket", db_conn=db)
+
+        config = sc_default_config()
+        config.request_delay_seconds = 0
+        scraper = SCTentativeRulingsScraper(config=config, court_directory=directory)
+        health = scraper.run()
+
+        assert health.success is True
+        # Directory should have been archived to S3
+        s3.put_object.assert_called_once()
+        call_kwargs = s3.put_object.call_args.kwargs
+        assert call_kwargs["Key"].startswith(f"directories/{COURT_ID}/")
+
+    @respx.mock
+    def test_scraper_works_without_directory(self) -> None:
+        """When no court_directory is provided, the scraper should still work (backward compat)."""
+        landing_html = _load_html("sc_landing_page.html")
+        dept1_html = _load_html("sc_dept1_page.html")
+        dept1_pdf = _load_bytes("sc_dept1_tues.pdf")
+
+        respx.get(LANDING_URL).mock(return_value=httpx.Response(200, text=landing_html))
+        respx.get(url__regex=r"tentative-rulings/dep").mock(
+            return_value=httpx.Response(200, text=dept1_html)
+        )
+        respx.get(url__regex=r"\.pdf$").mock(return_value=httpx.Response(200, content=dept1_pdf))
+
+        config = sc_default_config()
+        config.request_delay_seconds = 0
+        # No court_directory — should fall back to inline behavior
+        scraper = SCTentativeRulingsScraper(config=config)
+        health = scraper.run()
+
+        assert health.success is True
+        assert health.records_captured == 20
+
+    @respx.mock
+    def test_scraper_with_directory_still_captures_all_docs(self) -> None:
+        """Scraper with directory should still capture the same number of documents."""
+        landing_html = _load_html("sc_landing_page.html")
+        dept1_html = _load_html("sc_dept1_page.html")
+        dept1_pdf = _load_bytes("sc_dept1_tues.pdf")
+
+        respx.get(LANDING_URL).mock(return_value=httpx.Response(200, text=landing_html))
+        respx.get(url__regex=r"tentative-rulings/dep").mock(
+            return_value=httpx.Response(200, text=dept1_html)
+        )
+        respx.get(url__regex=r"\.pdf$").mock(return_value=httpx.Response(200, content=dept1_pdf))
+
+        s3 = MagicMock()
+        db = _mock_db_conn()
+        directory = SantaClaraCourtDirectory(s3_client=s3, s3_bucket="test-bucket", db_conn=db)
+
+        config = sc_default_config()
+        config.request_delay_seconds = 0
+        scraper = SCTentativeRulingsScraper(config=config, court_directory=directory)
+        health = scraper.run()
+
+        assert health.success is True
+        # 10 departments x 2 PDFs each = 20 documents
+        assert health.records_captured == 20
