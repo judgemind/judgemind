@@ -363,6 +363,56 @@ def _normalize_case_number(raw: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Department normalization — restore leading zeros
+# ---------------------------------------------------------------------------
+
+# Known department prefixes where the numeric suffix should be zero-padded
+# to a specific width.  For example, OC Costa Mesa departments use "CM"
+# followed by a 2-digit number (CM01–CM99).  When an LLM strips the
+# leading zero (returning "CM2" instead of "CM02"), this mapping lets us
+# restore it.
+#
+# Format: prefix -> expected digit width of the numeric suffix.
+_DEPT_ZERO_PAD: dict[str, int] = {
+    "CM": 2,  # OC Costa Mesa: CM01–CM99
+    "CX": 2,  # OC Central Justice Center annex
+    "CL": 2,  # OC Civil Complex Center
+    "L": 2,  # OC Lamoreaux Justice Center
+    "W": 2,  # OC West Justice Center
+    "H": 2,  # OC Harbor Justice Center
+}
+
+# Regex: one or more ASCII letters, then one or more digits.
+_DEPT_SPLIT_RE = re.compile(r"^([A-Za-z]+)(\d+)$")
+
+
+def _normalize_department(raw: str) -> str:
+    """Restore leading zeros on department identifiers.
+
+    LLMs (especially Haiku) tend to drop leading zeros from department
+    identifiers — e.g. returning ``"CM2"`` instead of ``"CM02"``.
+
+    This function checks the prefix against ``_DEPT_ZERO_PAD`` and pads
+    the numeric suffix to the expected width.  Unknown prefixes are
+    returned unchanged.
+    """
+    m = _DEPT_SPLIT_RE.match(raw.strip())
+    if not m:
+        return raw.strip()
+
+    prefix = m.group(1).upper()
+    digits = m.group(2)
+
+    expected_width = _DEPT_ZERO_PAD.get(prefix)
+    if expected_width is None:
+        return raw.strip()
+
+    # Preserve original casing of the prefix from the input.
+    original_prefix = m.group(1)
+    return f"{original_prefix}{digits.zfill(expected_width)}"
+
+
+# ---------------------------------------------------------------------------
 # Date parsing helper
 # ---------------------------------------------------------------------------
 
@@ -734,6 +784,10 @@ def _parse_response(
     judge_name = parsed.get("judge_name")
     hearing_date = _parse_date(parsed.get("hearing_date"))
     department = parsed.get("department")
+
+    # Normalize department leading zeros (fix LLM zero-stripping)
+    if department and isinstance(department, str):
+        department = _normalize_department(department)
 
     # Override with authoritative metadata
     if metadata:

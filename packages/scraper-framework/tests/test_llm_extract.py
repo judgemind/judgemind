@@ -20,6 +20,7 @@ from ingestion.llm_extract import (
     LLMRulingResult,
     _merge_results,
     _normalize_case_number,
+    _normalize_department,
     _parse_response,
     _split_text_into_chunks,
     extract_fields_llm,
@@ -167,6 +168,63 @@ class TestNormalizeCaseNumber:
 
 
 # ---------------------------------------------------------------------------
+# _normalize_department
+# ---------------------------------------------------------------------------
+
+
+class TestNormalizeDepartment:
+    """Tests for department leading-zero normalization."""
+
+    def test_cm02_from_cm2(self) -> None:
+        """LLM returns 'CM2' — should be normalized to 'CM02'."""
+        assert _normalize_department("CM2") == "CM02"
+
+    def test_cm05_from_cm5(self) -> None:
+        """LLM returns 'CM5' — should be normalized to 'CM05'."""
+        assert _normalize_department("CM5") == "CM05"
+
+    def test_cm02_already_correct(self) -> None:
+        """Already-correct 'CM02' should be unchanged."""
+        assert _normalize_department("CM02") == "CM02"
+
+    def test_cm12_two_digits_unchanged(self) -> None:
+        """Two-digit suffix 'CM12' should be unchanged."""
+        assert _normalize_department("CM12") == "CM12"
+
+    def test_cx_prefix(self) -> None:
+        """CX prefix should also be zero-padded."""
+        assert _normalize_department("CX3") == "CX03"
+
+    def test_l_prefix(self) -> None:
+        """L prefix (Lamoreaux) should be zero-padded."""
+        assert _normalize_department("L5") == "L05"
+
+    def test_unknown_prefix_unchanged(self) -> None:
+        """Unknown prefix 'N14' should be unchanged (not in mapping)."""
+        assert _normalize_department("N14") == "N14"
+
+    def test_unknown_prefix_single_digit_unchanged(self) -> None:
+        """Unknown prefix 'Z3' should be unchanged (not in mapping)."""
+        assert _normalize_department("Z3") == "Z3"
+
+    def test_no_digits_unchanged(self) -> None:
+        """Pure text department like 'A' should be unchanged."""
+        assert _normalize_department("A") == "A"
+
+    def test_pure_digits_unchanged(self) -> None:
+        """Pure numeric department like '25' should be unchanged."""
+        assert _normalize_department("25") == "25"
+
+    def test_strips_whitespace(self) -> None:
+        """Leading/trailing whitespace should be stripped."""
+        assert _normalize_department("  CM2  ") == "CM02"
+
+    def test_preserves_original_case(self) -> None:
+        """Lowercase input prefix should preserve its casing."""
+        assert _normalize_department("cm2") == "cm02"
+
+
+# ---------------------------------------------------------------------------
 # _parse_response
 # ---------------------------------------------------------------------------
 
@@ -218,6 +276,35 @@ class TestParseResponse:
         assert result is not None
         assert result.judge_name == "Correct Name"
         assert result.department == "5"
+
+    def test_department_leading_zero_normalized_without_metadata(self) -> None:
+        """When no metadata, LLM output 'CM2' should be normalized to 'CM02'."""
+        response_json = json.dumps(
+            {
+                "judge_name": None,
+                "hearing_date": None,
+                "department": "CM2",
+                "rulings": [],
+            }
+        )
+        result = _parse_response(response_json, None)
+        assert result is not None
+        assert result.department == "CM02"
+
+    def test_department_metadata_overrides_normalization(self) -> None:
+        """Metadata department should take precedence even over normalization."""
+        response_json = json.dumps(
+            {
+                "judge_name": None,
+                "hearing_date": None,
+                "department": "CM2",
+                "rulings": [],
+            }
+        )
+        metadata = {"department": "CM02"}
+        result = _parse_response(response_json, metadata)
+        assert result is not None
+        assert result.department == "CM02"
 
     def test_strips_markdown_code_fences(self) -> None:
         inner = json.dumps(
