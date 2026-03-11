@@ -43,6 +43,7 @@ _SCRAPER_MODULES: list[tuple[str, str]] = [
     ("courts.ca.sf_tentatives", "SFTentativeRulingsScraper"),
     ("courts.ca.sc_tentatives", "SCTentativeRulingsScraper"),
     ("courts.ca.riverside_tentatives", "RiversideTentativeRulingsScraper"),
+    ("courts.ca.fresno_tentatives", "FresnoTentativeRulingsScraper"),
 ]
 
 

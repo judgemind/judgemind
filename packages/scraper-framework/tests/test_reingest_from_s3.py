@@ -1595,6 +1595,7 @@ class TestScraperRegistryAutoDiscovery:
             "ca-sf-tentatives-family-law",
             "ca-sc-tentatives-civil",
             "ca-riverside-tentatives-civil",
+            "ca-fresno-tentatives-civil",
         }
         assert expected_ids == set(reingest._SCRAPER_REGISTRY.keys())
 
