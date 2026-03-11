@@ -15,7 +15,9 @@ PDF URL pattern: /system/files/{YYYY-MM}/{CODE}ruling{MMDDYY}.pdf
 PDF structure (PS1, 4 pages):
   Page 1: "Tentative Rulings for March 2, 2026\nDepartment PS1\n..."
   Case entries: "<N>.\n{CASE_NUMBER} {PARTY_VS_PARTY} {motion}\nTentative Ruling: ..."
-  Case number format: CV + location code + year + seq, e.g. "CVPS2306157"
+  Case number format: prefix + digits, e.g. "CVPS2306157", "RIC1904113"
+  Prefixes: CV + location code (CVPS, CVRI, CVMV, etc.), or court location
+  codes (RIC, MCC, PSC, SWC, INC) used by some departments.
 
 Ruling splitting:
   A single PDF may contain rulings for multiple cases, each starting with a numbered
@@ -55,8 +57,10 @@ _LINK_TEXT_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Case numbers like "CVPS2306157", "CVRI2412345"
-_CASE_NUMBER_RE = re.compile(r"\bCV[A-Z]{2,4}\d{6,8}\b")
+# Case numbers like "CVPS2306157", "CVRI2412345", "RIC1904113", "MCC2012345"
+# CV-prefixed: CV + 2-4 letter location code + 6-8 digits (e.g. CVPS2306157)
+# Location-prefixed: RIC, MCC, PSC, SWC, INC + 0-4 letters + 6-10 digits
+_CASE_NUMBER_RE = re.compile(r"\b(?:CV[A-Z]{2,4}|(?:RIC|MCC|PSC|SWC|INC)[A-Z]{0,4})\d{6,10}\b")
 
 
 # Hearing date from PDF text:
@@ -261,11 +265,13 @@ def _extract_case_title_from_ruling(text: str) -> str | None:
 
     # Look for "X vs Y" on the case line
     # Pattern: after case number, "PLAINTIFF vs DEFENDANT <rest>"
-    vs_match = re.search(
-        r"(?:CV[A-Z]{2,4}\d{6,8}\s+)?(?P<plaintiff>[A-Z][A-Z\s,.'-]+?)\s+vs\s+(?P<defendant>[A-Z][A-Z\s,.'-]+)",
-        case_line,
-        re.IGNORECASE,
+    # Use _CASE_NUMBER_RE.pattern to stay in sync with the main regex.
+    _vs_pat = (
+        _CASE_NUMBER_RE.pattern
+        + r"\s+(?P<plaintiff>[A-Z][A-Z\s,.'-]+?)"
+        + r"\s+vs\s+(?P<defendant>[A-Z][A-Z\s,.'-]+)"
     )
+    vs_match = re.search(_vs_pat, case_line, re.IGNORECASE)
     if not vs_match:
         return None
 
