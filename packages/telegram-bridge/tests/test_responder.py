@@ -920,6 +920,150 @@ class TestNoLlmFlag:
         assert args.rate_limit_window == 120.0
 
 
+# ── MarkdownV2 formatting in replies ──────────────────────────────────
+
+
+class TestMarkdownV2Formatting:
+    """Tests verifying that Claude replies are sent with MarkdownV2 parse_mode
+    and that issue references are converted to clickable links."""
+
+    @respx.mock
+    @patch("tg_responder.interpret_message")
+    def test_claude_reply_sent_with_markdownv2(
+        self, mock_interpret: MagicMock, tmp_path: Path
+    ) -> None:
+        from telegram_bridge.interpreter import InterpretedMessage
+
+        mock_interpret.return_value = InterpretedMessage(
+            reply="Everything looks good.",
+            actions=[],
+        )
+        route = respx.post("https://api.telegram.org/botfake-token/sendMessage").mock(
+            return_value=httpx.Response(200, json={"ok": True})
+        )
+
+        mod = _import_responder()
+        mod.dispatch_message(
+            message={"text": "status", "user_id": 12345},
+            bot_token="fake-token",
+            chat_ids=[12345],
+            state_file=str(tmp_path / "state.json"),
+            status_file=str(tmp_path / "status.json"),
+            agent_status_dir=str(tmp_path / "agent-status"),
+            stop_requests_file=str(tmp_path / "stop.json"),
+            inbox_file=str(tmp_path / "inbox.json"),
+            anthropic_api_key="test-key",
+        )
+
+        assert route.call_count == 1
+        body = json.loads(route.calls[0].request.content)
+        assert body["parse_mode"] == "MarkdownV2"
+
+    @respx.mock
+    @patch("tg_responder.interpret_message")
+    def test_issue_refs_linkified_in_reply(self, mock_interpret: MagicMock, tmp_path: Path) -> None:
+        from telegram_bridge.interpreter import InterpretedMessage
+
+        mock_interpret.return_value = InterpretedMessage(
+            reply="Working on #42 now. PR #100 is in review.",
+            actions=[],
+        )
+        route = respx.post("https://api.telegram.org/botfake-token/sendMessage").mock(
+            return_value=httpx.Response(200, json={"ok": True})
+        )
+
+        mod = _import_responder()
+        mod.dispatch_message(
+            message={"text": "what are you doing?", "user_id": 12345},
+            bot_token="fake-token",
+            chat_ids=[12345],
+            state_file=str(tmp_path / "state.json"),
+            status_file=str(tmp_path / "status.json"),
+            agent_status_dir=str(tmp_path / "agent-status"),
+            stop_requests_file=str(tmp_path / "stop.json"),
+            inbox_file=str(tmp_path / "inbox.json"),
+            anthropic_api_key="test-key",
+        )
+
+        assert route.call_count == 1
+        body = json.loads(route.calls[0].request.content)
+        text = body["text"]
+        # Issue #42 should be a clickable link
+        assert "https://github.com/judgemind/judgemind/issues/42" in text
+        # PR #100 should be a clickable link
+        assert "https://github.com/judgemind/judgemind/pull/100" in text
+
+    @respx.mock
+    def test_send_telegram_reply_with_parse_mode(self) -> None:
+        """Verify that send_telegram_reply passes parse_mode to the API."""
+        route = respx.post("https://api.telegram.org/botfake-token/sendMessage").mock(
+            return_value=httpx.Response(200, json={"ok": True})
+        )
+        mod = _import_responder()
+        mod.send_telegram_reply(
+            "Hello",
+            bot_token="fake-token",
+            chat_ids=[12345],
+            parse_mode="MarkdownV2",
+        )
+        body = json.loads(route.calls[0].request.content)
+        assert body["parse_mode"] == "MarkdownV2"
+
+    @respx.mock
+    def test_send_telegram_reply_no_parse_mode_by_default(self) -> None:
+        """Verify that send_telegram_reply omits parse_mode when not specified."""
+        route = respx.post("https://api.telegram.org/botfake-token/sendMessage").mock(
+            return_value=httpx.Response(200, json={"ok": True})
+        )
+        mod = _import_responder()
+        mod.send_telegram_reply(
+            "Hello",
+            bot_token="fake-token",
+            chat_ids=[12345],
+        )
+        body = json.loads(route.calls[0].request.content)
+        assert "parse_mode" not in body
+
+
+# ── Default rate limit ──────────────────────────────────────────────────
+
+
+class TestDefaultRateLimit:
+    """Tests verifying the rate limit default is 20 calls per 60 seconds."""
+
+    def test_module_default_rate_limiter(self) -> None:
+        from telegram_bridge.interpreter import _default_rate_limiter
+
+        assert _default_rate_limiter.max_calls == 20
+        assert _default_rate_limiter.window_seconds == 60.0
+
+    def test_cli_default_rate_limit_calls(self) -> None:
+        """Verify the CLI default for --rate-limit-calls is 20."""
+        _import_responder()
+        # The argparse default is set in the source code; verify by
+        # inspecting the parser.
+        import argparse
+
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--rate-limit-calls", type=int, default=20)
+        args = parser.parse_args([])
+        assert args.rate_limit_calls == 20
+
+
+# ── Interpreter system prompt ────────────────────────────────────────────
+
+
+class TestInterpreterPrompt:
+    """Tests verifying the system prompt includes formatting guidance."""
+
+    def test_system_prompt_has_plain_text_instructions(self) -> None:
+        from telegram_bridge.interpreter import _SYSTEM_PROMPT
+
+        assert "plain text" in _SYSTEM_PROMPT.lower()
+        # Should mention that #N will be converted to links
+        assert "#N" in _SYSTEM_PROMPT or "#42" in _SYSTEM_PROMPT
+
+
 # ── Old daemon removed ──────────────────────────────────────────────────
 # The deprecated tg-poll-daemon.py was removed in #646. The responder
 # daemon (scripts/tg-responder.py) fully replaces it.

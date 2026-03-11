@@ -71,6 +71,15 @@ The `actions` array may be empty if no action is needed (just a reply).
 debugging, etc.), politely note that you can only manage orchestrator \
 operations and suggest they check the GitHub issue or logs directly.
 - Use the orchestrator status context to give informed, specific answers.
+
+## Formatting Rules
+
+- Write the reply in **plain text only** — no markdown, no bold, no bullet \
+points, no code blocks. The message will be formatted for Telegram separately.
+- Reference GitHub issues as `#N` (e.g. `#42`, `#720`). These will be \
+automatically converted to clickable links.
+- Do NOT use asterisks for bold, underscores for italic, or backticks for \
+code. Just write plain text.
 """
 
 
@@ -121,8 +130,9 @@ class RateLimiter:
         self._timestamps.clear()
 
 
-# Module-level default rate limiter: 1 call per 60 seconds.
-_default_rate_limiter = RateLimiter(max_calls=1, window_seconds=60.0)
+# Module-level default rate limiter: 20 calls per 60 seconds.
+# Haiku calls cost ~$0.001 each, so even heavy usage is pennies.
+_default_rate_limiter = RateLimiter(max_calls=20, window_seconds=60.0)
 
 
 @dataclass(frozen=True)
@@ -156,7 +166,7 @@ def interpret_message(
             environment variable is used (standard anthropic SDK behavior).
         model: The Claude model to use.  Defaults to Haiku for speed/cost.
         rate_limiter: Optional rate limiter to prevent excessive API usage.
-            Defaults to the module-level limiter (1 call/60s).  Pass ``None``
+            Defaults to the module-level limiter (20 calls/60s).  Pass ``None``
             to disable rate limiting.
 
     Returns:
