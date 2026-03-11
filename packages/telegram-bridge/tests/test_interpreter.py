@@ -101,6 +101,7 @@ class TestBuildOrchestratorStatus:
         assert status["queue"] == []
         assert status["paused"] is False
         assert status["stopped_issues"] == []
+        assert "updated_at" in status
 
     def test_with_data(self) -> None:
         agents = [{"worker": 1, "issue": 42, "phase": "ci-watch"}]
@@ -115,6 +116,15 @@ class TestBuildOrchestratorStatus:
         assert status["open_prs"] == prs
         assert status["paused"] is True
         assert status["stopped_issues"] == [99]
+        assert "updated_at" in status
+
+    def test_updated_at_is_iso_format(self) -> None:
+        import datetime
+
+        status = build_orchestrator_status()
+        # Should be parseable as an ISO-8601 datetime.
+        parsed = datetime.datetime.fromisoformat(status["updated_at"])
+        assert parsed.tzinfo is not None or "T" in status["updated_at"]
 
 
 # ── interpret_message() ─────────────────────────────────────────────────

@@ -1326,3 +1326,169 @@ class TestCreateOrchestratorBridgeStopRequests:
         with mock_aws():
             orch = create_orchestrator_bridge(stop_requests_path="/tmp/test_stop.json")
             assert orch.stop_requests_path == "/tmp/test_stop.json"
+
+
+# ── write_status() ───────────────────────────────────────────────────
+
+
+class TestWriteStatus:
+    def test_writes_status_json_to_file(self, tmp_path: Path) -> None:
+        """write_status() creates orchestrator_status.json with expected keys."""
+        with mock_aws():
+            status_file = str(tmp_path / "orchestrator_status.json")
+            bridge = _make_bridge()
+            orch = OrchestratorBridge(bridge=bridge, status_file=status_file)
+            orch.write_status()
+
+            data = json.loads(Path(status_file).read_text())
+            assert data["active_agents"] == []
+            assert data["open_prs"] == []
+            assert data["recently_completed"] == []
+            assert data["queue"] == []
+            assert data["paused"] is False
+            assert data["stopped_issues"] == []
+            assert "updated_at" in data
+
+    @respx.mock
+    async def test_task_started_writes_status_file(self, tmp_path: Path) -> None:
+        """task_started() should write the status file with the new worker."""
+        with mock_aws():
+            _setup_secret()
+            respx.post("https://api.telegram.org/botfake-bot-token/sendMessage").mock(
+                return_value=httpx.Response(200, json={"ok": True})
+            )
+
+            status_file = str(tmp_path / "status.json")
+            bridge = _make_bridge()
+            orch = OrchestratorBridge(bridge=bridge, status_file=status_file)
+            await orch.task_started(issue_number=42, title="Fix widget", worker=3)
+
+            data = json.loads(Path(status_file).read_text())
+            assert len(data["active_agents"]) == 1
+            assert data["active_agents"][0]["issue_number"] == 42
+            assert data["active_agents"][0]["worker_number"] == 3
+            assert "updated_at" in data
+
+    @respx.mock
+    async def test_task_completed_writes_status_file(self, tmp_path: Path) -> None:
+        """task_completed() should update the status file (worker removed, added to completed)."""
+        with mock_aws():
+            _setup_secret()
+            respx.post("https://api.telegram.org/botfake-bot-token/sendMessage").mock(
+                return_value=httpx.Response(200, json={"ok": True})
+            )
+
+            status_file = str(tmp_path / "status.json")
+            bridge = _make_bridge()
+            orch = OrchestratorBridge(bridge=bridge, status_file=status_file)
+            await orch.task_started(issue_number=42, title="Fix widget", worker=3)
+            await orch.task_completed(issue_number=42, summary="PR merged.", worker=3)
+
+            data = json.loads(Path(status_file).read_text())
+            assert data["active_agents"] == []
+            assert len(data["recently_completed"]) == 1
+            assert data["recently_completed"][0]["issue_number"] == 42
+            assert data["recently_completed"][0]["outcome"] == "completed"
+
+    @respx.mock
+    async def test_task_failed_writes_status_file(self, tmp_path: Path) -> None:
+        """task_failed() should update the status file (worker removed, failure recorded)."""
+        with mock_aws():
+            _setup_secret()
+            respx.post("https://api.telegram.org/botfake-bot-token/sendMessage").mock(
+                return_value=httpx.Response(200, json={"ok": True})
+            )
+
+            status_file = str(tmp_path / "status.json")
+            bridge = _make_bridge()
+            orch = OrchestratorBridge(bridge=bridge, status_file=status_file)
+            await orch.task_started(issue_number=42, title="Fix widget", worker=3)
+            await orch.task_failed(issue_number=42, error="CI broke.", worker=3)
+
+            data = json.loads(Path(status_file).read_text())
+            assert data["active_agents"] == []
+            assert len(data["recently_completed"]) == 1
+            assert data["recently_completed"][0]["issue_number"] == 42
+            assert data["recently_completed"][0]["outcome"] == "failed"
+
+    @respx.mock
+    async def test_pause_writes_status_file(self, tmp_path: Path) -> None:
+        """handle_command(PAUSE) should update the status file with paused=True."""
+        with mock_aws():
+            _setup_secret()
+            respx.post("https://api.telegram.org/botfake-bot-token/sendMessage").mock(
+                return_value=httpx.Response(200, json={"ok": True})
+            )
+
+            status_file = str(tmp_path / "status.json")
+            bridge = _make_bridge()
+            orch = OrchestratorBridge(bridge=bridge, status_file=status_file)
+            await orch.handle_command(Command(kind=CommandKind.PAUSE))
+
+            data = json.loads(Path(status_file).read_text())
+            assert data["paused"] is True
+
+    @respx.mock
+    async def test_resume_writes_status_file(self, tmp_path: Path) -> None:
+        """handle_command(RESUME) should update the status file with paused=False."""
+        with mock_aws():
+            _setup_secret()
+            respx.post("https://api.telegram.org/botfake-bot-token/sendMessage").mock(
+                return_value=httpx.Response(200, json={"ok": True})
+            )
+
+            status_file = str(tmp_path / "status.json")
+            bridge = _make_bridge()
+            orch = OrchestratorBridge(bridge=bridge, status_file=status_file, paused=True)
+            await orch.handle_command(Command(kind=CommandKind.RESUME))
+
+            data = json.loads(Path(status_file).read_text())
+            assert data["paused"] is False
+
+    def test_write_status_includes_open_prs_and_queue(self, tmp_path: Path) -> None:
+        """write_status() passes open_prs and queue through to the output."""
+        with mock_aws():
+            status_file = str(tmp_path / "status.json")
+            bridge = _make_bridge()
+            orch = OrchestratorBridge(bridge=bridge, status_file=status_file)
+            orch.write_status(
+                open_prs=[{"number": 100, "ci_status": "green", "mergeable": True}],
+                queue=[{"number": 650, "title": "Next task"}],
+            )
+
+            data = json.loads(Path(status_file).read_text())
+            assert len(data["open_prs"]) == 1
+            assert data["open_prs"][0]["number"] == 100
+            assert len(data["queue"]) == 1
+            assert data["queue"][0]["number"] == 650
+
+    def test_write_status_noop_without_status_file(self) -> None:
+        """write_status() is a no-op when status_file is not set."""
+        with mock_aws():
+            bridge = _make_bridge()
+            orch = OrchestratorBridge(bridge=bridge)
+            # Should not raise.
+            orch.write_status()
+
+    def test_write_status_creates_parent_directories(self, tmp_path: Path) -> None:
+        """write_status() creates parent directories if they don't exist."""
+        with mock_aws():
+            status_file = str(tmp_path / "nested" / "dir" / "status.json")
+            bridge = _make_bridge()
+            orch = OrchestratorBridge(bridge=bridge, status_file=status_file)
+            orch.write_status()
+
+            assert Path(status_file).exists()
+
+    def test_write_status_includes_stopped_issues(self, tmp_path: Path) -> None:
+        """write_status() reflects stopped issues in the output."""
+        with mock_aws():
+            status_file = str(tmp_path / "status.json")
+            bridge = _make_bridge()
+            orch = OrchestratorBridge(bridge=bridge, status_file=status_file)
+            orch._stopped_issues.add(99)
+            orch._stopped_issues.add(101)
+            orch.write_status()
+
+            data = json.loads(Path(status_file).read_text())
+            assert sorted(data["stopped_issues"]) == [99, 101]
