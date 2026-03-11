@@ -49,6 +49,7 @@ from .db import (
 from .extract import (
     extract_case_number,
     extract_case_title,
+    extract_case_type_from_number,
     extract_hearing_date,
     extract_judge_name,
     extract_motion_type,
@@ -549,6 +550,12 @@ class IngestionWorker:
                         "party_count": len(parties_data),
                     },
                 )
+
+        # Fallback case_type from case number prefix (#706).
+        if case_type is None and case_number:
+            case_type = extract_case_type_from_number(case_number)
+            if case_type:
+                extraction_methods.setdefault("case_type", "regex")
 
         if extraction_methods:
             logger.info(

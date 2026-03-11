@@ -7,6 +7,7 @@ from ingestion.extract import (
     _looks_like_person_name,
     extract_case_number,
     extract_case_title,
+    extract_case_type_from_number,
     extract_judge_name,
     extract_motion_type,
     extract_outcome,
@@ -937,3 +938,128 @@ class TestExtractPartiesFromCaption:
         assert "other" not in roles
         assert "plaintiff" in roles
         assert "defendant" in roles
+
+
+# ---------------------------------------------------------------------------
+# Case type extraction from case number prefix
+# ---------------------------------------------------------------------------
+
+
+class TestExtractCaseTypeFromNumber:
+    """Tests for extract_case_type_from_number()."""
+
+    # --- Civil prefixes ---
+
+    def test_riverside_cv_prefix(self) -> None:
+        assert extract_case_type_from_number("CVRI2502741") == "civil"
+
+    def test_riverside_cvps(self) -> None:
+        assert extract_case_type_from_number("CVPS2306157") == "civil"
+
+    def test_riverside_cvme(self) -> None:
+        assert extract_case_type_from_number("CVME2100123") == "civil"
+
+    def test_riverside_cvsw(self) -> None:
+        assert extract_case_type_from_number("CVSW2401234") == "civil"
+
+    def test_riverside_cvco(self) -> None:
+        assert extract_case_type_from_number("CVCO2301234") == "civil"
+
+    def test_la_stcv(self) -> None:
+        assert extract_case_type_from_number("23STCV12345") == "civil"
+
+    def test_la_nncv(self) -> None:
+        assert extract_case_type_from_number("24NNCV02551") == "civil"
+
+    def test_santa_clara_cv(self) -> None:
+        assert extract_case_type_from_number("24CV443183") == "civil"
+
+    def test_san_bernardino_civ(self) -> None:
+        assert extract_case_type_from_number("CIVSB2416631") == "civil"
+
+    def test_san_bernardino_civrs(self) -> None:
+        assert extract_case_type_from_number("CIVRS2502080") == "civil"
+
+    def test_oc_civil_format(self) -> None:
+        assert extract_case_type_from_number("30-2024-01370288") == "civil"
+
+    def test_oc_civil_short_format(self) -> None:
+        assert extract_case_type_from_number("2024-01380242") == "civil"
+
+    # --- Family law prefixes ---
+
+    def test_family_fl(self) -> None:
+        assert extract_case_type_from_number("FL2301234") == "family"
+
+    def test_family_dv(self) -> None:
+        assert extract_case_type_from_number("DV2301234") == "family"
+
+    def test_oc_family_d_format(self) -> None:
+        """OC family law: 2-digit year + D + 6 digits."""
+        assert extract_case_type_from_number("24D006789") == "family"
+
+    # --- Probate prefixes ---
+
+    def test_probate_pr(self) -> None:
+        assert extract_case_type_from_number("PR2301234") == "probate"
+
+    def test_probate_bp(self) -> None:
+        assert extract_case_type_from_number("BP2301234") == "probate"
+
+    def test_la_probate_cp(self) -> None:
+        """LA complex/probate: 26NNCP00062."""
+        assert extract_case_type_from_number("26NNCP00062") == "probate"
+
+    # --- Small claims ---
+
+    def test_small_claims_sc(self) -> None:
+        assert extract_case_type_from_number("SC2301234") == "small_claims"
+
+    # --- Criminal prefixes ---
+
+    def test_criminal_cr(self) -> None:
+        assert extract_case_type_from_number("CR2301234") == "criminal"
+
+    def test_felony_f_digit(self) -> None:
+        """Felony docket format: F + digits."""
+        assert extract_case_type_from_number("F2301234") == "criminal"
+
+    def test_sf_felony_fpt(self) -> None:
+        """SF felony: FPT-25-378624."""
+        assert extract_case_type_from_number("FPT-25-378624") == "criminal"
+
+    def test_sf_felony_fms(self) -> None:
+        assert extract_case_type_from_number("FMS-20-387302") == "criminal"
+
+    def test_sf_felony_fdi(self) -> None:
+        assert extract_case_type_from_number("FDI-14-781786") == "criminal"
+
+    # --- Juvenile ---
+
+    def test_juvenile_jv(self) -> None:
+        assert extract_case_type_from_number("JV2301234") == "juvenile"
+
+    # --- Traffic ---
+
+    def test_traffic_tr(self) -> None:
+        assert extract_case_type_from_number("TR2301234") == "traffic"
+
+    # --- Edge cases ---
+
+    def test_none_input(self) -> None:
+        assert extract_case_type_from_number(None) is None  # type: ignore[arg-type]
+
+    def test_empty_string(self) -> None:
+        assert extract_case_type_from_number("") is None
+
+    def test_whitespace_only(self) -> None:
+        assert extract_case_type_from_number("   ") is None
+
+    def test_unrecognized_prefix(self) -> None:
+        assert extract_case_type_from_number("UNKNOWN123") is None
+
+    def test_case_insensitive(self) -> None:
+        assert extract_case_type_from_number("cvri2502741") == "civil"
+
+    def test_leading_whitespace_stripped(self) -> None:
+        assert extract_case_type_from_number("  CVRI2502741  ") == "civil"

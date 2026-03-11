@@ -353,6 +353,64 @@ def extract_case_number(ruling_text: str) -> str | None:
     return None
 
 
+# ---------------------------------------------------------------------------
+# Case type extraction from case number prefix
+# ---------------------------------------------------------------------------
+
+# Ordered so more specific prefixes match first.  Each tuple is
+# (compiled regex, case_type value).  Patterns are anchored to the start
+# of the case number (after optional leading digits for court/year codes).
+_CASE_TYPE_PREFIX_PATTERNS: list[tuple[re.Pattern[str], str]] = [
+    # Civil prefixes — CV variants (Riverside, Santa Clara, SB, LA)
+    # Matches: CVRI, CVME, CVPS, CVSW, CVCO, 24CV, 24NNCV, 23STCV, CIV*, etc.
+    (re.compile(r"^(?:\d{2,4})?(?:[A-Z]{2})?CV", re.IGNORECASE), "civil"),
+    (re.compile(r"^CIV", re.IGNORECASE), "civil"),
+    # Family law prefixes
+    (re.compile(r"^(?:\d{2,4})?FL", re.IGNORECASE), "family"),
+    (re.compile(r"^(?:\d{2,4})?DV", re.IGNORECASE), "family"),
+    (re.compile(r"^(?:\d{2,4})?D\d", re.IGNORECASE), "family"),
+    # Probate prefixes
+    (re.compile(r"^(?:\d{2,4})?(?:[A-Z]{2})?PR", re.IGNORECASE), "probate"),
+    (re.compile(r"^(?:\d{2,4})?(?:[A-Z]{2})?BP", re.IGNORECASE), "probate"),
+    (re.compile(r"^(?:\d{2,4})?(?:[A-Z]{2})?CP", re.IGNORECASE), "probate"),
+    # Small claims
+    (re.compile(r"^(?:\d{2,4})?(?:[A-Z]{2})?SC", re.IGNORECASE), "small_claims"),
+    # Criminal prefixes
+    (re.compile(r"^(?:\d{2,4})?(?:[A-Z]{2})?CR", re.IGNORECASE), "criminal"),
+    # Felony docket format: F + digit (e.g. F2301234)
+    (re.compile(r"^F\d", re.IGNORECASE), "criminal"),
+    # SF felony: FPT, FMS, FDI, etc. — F + 2 letters + hyphen
+    (re.compile(r"^F[A-Z]{2}-", re.IGNORECASE), "criminal"),
+    # Juvenile
+    (re.compile(r"^(?:\d{2,4})?(?:[A-Z]{2})?JV", re.IGNORECASE), "juvenile"),
+    # Traffic
+    (re.compile(r"^(?:\d{2,4})?(?:[A-Z]{2})?TR", re.IGNORECASE), "traffic"),
+    # OC civil format: digits-digits (e.g. 30-2024-01370288 or 2024-01380242)
+    (re.compile(r"^\d{2,4}-\d{4,8}"), "civil"),
+]
+
+
+def extract_case_type_from_number(case_number: str) -> str | None:
+    """Infer case type from a California case number prefix.
+
+    California courts embed case type information in case number prefixes
+    (e.g. ``CVRI2502741`` is civil, ``FL2301234`` is family).  This provides
+    a zero-cost fallback when the LLM does not return a ``case_type``.
+
+    Returns one of the ``CASE_TYPE_VALUES`` strings, or ``None`` if the
+    prefix is not recognized.
+    """
+    if not case_number:
+        return None
+    case_number = case_number.strip()
+    if not case_number:
+        return None
+    for pattern, case_type in _CASE_TYPE_PREFIX_PATTERNS:
+        if pattern.match(case_number):
+            return case_type
+    return None
+
+
 # Business / organization keywords used by _looks_like_person_name().
 # Compiled once at module load time.  Uses word boundaries so that
 # "COUNTY OF" matches at the start of the string.
