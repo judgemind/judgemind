@@ -340,10 +340,171 @@ jobs:
           name: coverage-lambda-telegram-bot
           path: ${{ matrix.lambda-dir }}/coverage.xml
 
+  # ---------------------------------------------------------------
+  # Coverage gates: diff coverage (new lines) + overall floor ratchet
+  # ---------------------------------------------------------------
+  coverage-check:
+    needs: [detect-changes, scraper-unit-tests, ingestion-tests, nlp-tests, api-tests, web-tests, telegram-bridge-tests, lambda-tests]
+    if: always() && github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install diff-cover
+        run: pip install diff-cover
+
+      # Download all coverage artifacts (each upload is optional — packages
+      # that were skipped or had no tests will simply be missing).
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: coverage-*
+          path: coverage-artifacts/
+          merge-multiple: false
+
+      - name: List downloaded artifacts
+        run: find coverage-artifacts/ -type f 2>/dev/null || echo "No artifacts"
+
+      # --- Diff coverage checks (new/changed lines must be >= 90% covered) ---
+
+      - name: Diff coverage — scraper-framework
+        if: needs.detect-changes.outputs.scraper == 'true'
+        run: |
+          COV_FILE="coverage-artifacts/coverage-scraper-unit/coverage.xml"
+          if [ -f "$COV_FILE" ]; then
+            diff-cover "$COV_FILE" --compare-branch=origin/main --fail-under=90 --diff-range-notation='..'
+          else
+            echo "No coverage artifact for scraper-framework — skipping diff-cover"
+          fi
+
+      - name: Diff coverage — nlp-pipeline
+        if: needs.detect-changes.outputs.nlp == 'true'
+        run: |
+          COV_FILE="coverage-artifacts/coverage-nlp/coverage.xml"
+          if [ -f "$COV_FILE" ]; then
+            diff-cover "$COV_FILE" --compare-branch=origin/main --fail-under=90 --diff-range-notation='..'
+          else
+            echo "No coverage artifact for nlp-pipeline — skipping diff-cover"
+          fi
+
+      - name: Diff coverage — telegram-bridge
+        if: needs.detect-changes.outputs.telegram == 'true'
+        run: |
+          COV_FILE="coverage-artifacts/coverage-telegram/coverage.xml"
+          if [ -f "$COV_FILE" ]; then
+            diff-cover "$COV_FILE" --compare-branch=origin/main --fail-under=90 --diff-range-notation='..'
+          else
+            echo "No coverage artifact for telegram-bridge — skipping diff-cover"
+          fi
+
+      - name: Diff coverage — lambda-telegram-bot
+        if: needs.detect-changes.outputs.infra-lambda == 'true'
+        run: |
+          COV_FILE="coverage-artifacts/coverage-lambda-telegram-bot/coverage.xml"
+          if [ -f "$COV_FILE" ]; then
+            diff-cover "$COV_FILE" --compare-branch=origin/main --fail-under=90 --diff-range-notation='..'
+          else
+            echo "No coverage artifact for lambda-telegram-bot — skipping diff-cover"
+          fi
+
+      - name: Diff coverage — api
+        if: needs.detect-changes.outputs.api == 'true'
+        run: |
+          COV_FILE="coverage-artifacts/coverage-api/lcov.info"
+          if [ -f "$COV_FILE" ]; then
+            diff-cover "$COV_FILE" --compare-branch=origin/main --fail-under=90 --diff-range-notation='..'
+          else
+            echo "No coverage artifact for api — skipping diff-cover"
+          fi
+
+      - name: Diff coverage — web
+        if: needs.detect-changes.outputs.web == 'true'
+        run: |
+          COV_FILE="coverage-artifacts/coverage-web/lcov.info"
+          if [ -f "$COV_FILE" ]; then
+            diff-cover "$COV_FILE" --compare-branch=origin/main --fail-under=90 --diff-range-notation='..'
+          else
+            echo "No coverage artifact for web — skipping diff-cover"
+          fi
+
+      # --- Overall coverage floor ratchet ---
+      # Fails if any package's coverage dropped below its baseline.
+
+      - name: Coverage floor ratchet — scraper-framework
+        if: needs.detect-changes.outputs.scraper == 'true'
+        run: |
+          COV_FILE="coverage-artifacts/coverage-scraper-unit/coverage.xml"
+          if [ -f "$COV_FILE" ]; then
+            python scripts/update-coverage-baselines.py \
+              --package packages/scraper-framework \
+              --coverage-file "$COV_FILE" \
+              --dry-run
+          fi
+
+      - name: Coverage floor ratchet — nlp-pipeline
+        if: needs.detect-changes.outputs.nlp == 'true'
+        run: |
+          COV_FILE="coverage-artifacts/coverage-nlp/coverage.xml"
+          if [ -f "$COV_FILE" ]; then
+            python scripts/update-coverage-baselines.py \
+              --package packages/nlp-pipeline \
+              --coverage-file "$COV_FILE" \
+              --dry-run
+          fi
+
+      - name: Coverage floor ratchet — telegram-bridge
+        if: needs.detect-changes.outputs.telegram == 'true'
+        run: |
+          COV_FILE="coverage-artifacts/coverage-telegram/coverage.xml"
+          if [ -f "$COV_FILE" ]; then
+            python scripts/update-coverage-baselines.py \
+              --package packages/telegram-bridge \
+              --coverage-file "$COV_FILE" \
+              --dry-run
+          fi
+
+      - name: Coverage floor ratchet — lambda-telegram-bot
+        if: needs.detect-changes.outputs.infra-lambda == 'true'
+        run: |
+          COV_FILE="coverage-artifacts/coverage-lambda-telegram-bot/coverage.xml"
+          if [ -f "$COV_FILE" ]; then
+            python scripts/update-coverage-baselines.py \
+              --package infra/telegram-bot \
+              --coverage-file "$COV_FILE" \
+              --dry-run
+          fi
+
+      - name: Coverage floor ratchet — api
+        if: needs.detect-changes.outputs.api == 'true'
+        run: |
+          COV_FILE="coverage-artifacts/coverage-api/lcov.info"
+          if [ -f "$COV_FILE" ]; then
+            python scripts/update-coverage-baselines.py \
+              --package packages/api \
+              --coverage-file "$COV_FILE" \
+              --dry-run
+          fi
+
+      - name: Coverage floor ratchet — web
+        if: needs.detect-changes.outputs.web == 'true'
+        run: |
+          COV_FILE="coverage-artifacts/coverage-web/lcov.info"
+          if [ -f "$COV_FILE" ]; then
+            python scripts/update-coverage-baselines.py \
+              --package packages/web \
+              --coverage-file "$COV_FILE" \
+              --dry-run
+          fi
+
   # Always runs. Reports success only when every applicable job passed or was
   # skipped (path filter did not match). Branch protection requires this check.
   ci-passed:
-    needs: [scraper-unit-tests, ingestion-tests, nlp-tests, api-tests, web-tests, telegram-bridge-tests, infra-validate, lambda-tests]
+    needs: [scraper-unit-tests, ingestion-tests, nlp-tests, api-tests, web-tests, telegram-bridge-tests, infra-validate, lambda-tests, coverage-check]
     if: always()
     runs-on: ubuntu-latest
     steps:

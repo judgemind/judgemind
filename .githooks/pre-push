@@ -192,6 +192,36 @@ while read -r local_ref local_sha remote_sha _rest; do
     done
 
     # ---------------------------------------------------------------
+    # Coverage floor check for Python packages (after tests generate coverage.xml)
+    # ---------------------------------------------------------------
+    for pkg in $python_pkgs_with_code; do
+        if [[ "$pkg" == infra/* ]]; then
+            pkg_dir="$pkg"
+            pkg_key="$pkg"
+        else
+            pkg_dir="packages/$pkg"
+            pkg_key="packages/$pkg"
+        fi
+
+        cov_file="$pkg_dir/coverage.xml"
+        baselines_file="coverage-baselines.json"
+        if [ -f "$cov_file" ] && [ -f "$baselines_file" ] && [ -f "scripts/update-coverage-baselines.py" ]; then
+            echo "pre-push: checking coverage floor for '$pkg'..." >&2
+            if ! python3 scripts/update-coverage-baselines.py \
+                    --package "$pkg_key" \
+                    --coverage-file "$cov_file" \
+                    --baselines-file "$baselines_file" \
+                    --dry-run 2>&1; then
+                echo "" >&2
+                echo "  FAILED: coverage floor check for $pkg" >&2
+                echo "  Coverage has dropped below the baseline in coverage-baselines.json." >&2
+                echo "  Add tests to restore coverage before pushing." >&2
+                failures=$((failures + 1))
+            fi
+        fi
+    done
+
+    # ---------------------------------------------------------------
     # Run checks for TypeScript packages
     # ---------------------------------------------------------------
     for pkg in $changed_ts_pkgs; do
@@ -237,6 +267,29 @@ while read -r local_ref local_sha remote_sha _rest; do
             echo "  FAILED: tests for $pkg" >&2
             echo "  Run: cd $pkg_dir && npm test" >&2
             failures=$((failures + 1))
+        fi
+    done
+
+    # ---------------------------------------------------------------
+    # Coverage floor check for TypeScript packages (after tests generate lcov.info)
+    # ---------------------------------------------------------------
+    for pkg in $ts_pkgs_with_code; do
+        pkg_dir="packages/$pkg"
+        cov_file="$pkg_dir/coverage/lcov.info"
+        baselines_file="coverage-baselines.json"
+        if [ -f "$cov_file" ] && [ -f "$baselines_file" ] && [ -f "scripts/update-coverage-baselines.py" ]; then
+            echo "pre-push: checking coverage floor for '$pkg'..." >&2
+            if ! python3 scripts/update-coverage-baselines.py \
+                    --package "packages/$pkg" \
+                    --coverage-file "$cov_file" \
+                    --baselines-file "$baselines_file" \
+                    --dry-run 2>&1; then
+                echo "" >&2
+                echo "  FAILED: coverage floor check for $pkg" >&2
+                echo "  Coverage has dropped below the baseline in coverage-baselines.json." >&2
+                echo "  Add tests to restore coverage before pushing." >&2
+                failures=$((failures + 1))
+            fi
         fi
     done
 
