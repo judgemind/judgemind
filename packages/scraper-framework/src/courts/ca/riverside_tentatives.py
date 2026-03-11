@@ -477,7 +477,12 @@ class RiversideTentativeRulingsScraper(PdfLinkScraper):
     parties, motion type, and outcome.
     """
 
-    def __init__(self, config: ScraperConfig, **kwargs: Any) -> None:
+    def __init__(
+        self,
+        config: ScraperConfig,
+        dept_judge_map: dict[str, str] | None = None,
+        **kwargs: Any,
+    ) -> None:
         pdf_config = PdfLinkConfig(
             index_url=INDEX_URL,
             pdf_base_url=BASE_URL,
@@ -487,6 +492,7 @@ class RiversideTentativeRulingsScraper(PdfLinkScraper):
             case_number_re=_CASE_NUMBER_RE,
         )
         super().__init__(config, pdf_config=pdf_config, **kwargs)
+        self._dept_judge_map: dict[str, str] = dept_judge_map or {}
 
     def fetch_documents(self) -> list[CapturedDocument]:
         """Fetch PDFs then split multi-ruling PDFs into individual documents.
@@ -516,6 +522,19 @@ class RiversideTentativeRulingsScraper(PdfLinkScraper):
                         "Extracted judge name from PDF content",
                         department=doc.department,
                         judge=pdf_judge,
+                    )
+
+            # Fallback: use department-to-judge mapping (#585)
+            if not doc.judge_name and doc.department and self._dept_judge_map:
+                from courts.ca.riverside_dept_judges import lookup_judge_for_department
+
+                mapped_name = lookup_judge_for_department(self._dept_judge_map, doc.department)
+                if mapped_name:
+                    doc.judge_name = mapped_name
+                    logger.info(
+                        "Judge name populated from department mapping",
+                        department=doc.department,
+                        judge_name=mapped_name,
                     )
 
             rulings = _split_rulings(text)
@@ -567,6 +586,13 @@ class RiversideTentativeRulingsScraper(PdfLinkScraper):
             # Already split — just extract hearing date from ruling text
             if doc.ruling_text and not doc.hearing_date:
                 doc.hearing_date = _riv_hearing_date_from_text(doc.ruling_text)
+            # Fallback: department-to-judge mapping for pre-split docs (#585)
+            if not doc.judge_name and doc.department and self._dept_judge_map:
+                from courts.ca.riverside_dept_judges import lookup_judge_for_department
+
+                mapped_name = lookup_judge_for_department(self._dept_judge_map, doc.department)
+                if mapped_name:
+                    doc.judge_name = mapped_name
             return doc
 
         # Single-ruling PDF: use parent parse logic
@@ -578,6 +604,13 @@ class RiversideTentativeRulingsScraper(PdfLinkScraper):
             pdf_judge = extract_judge_name(doc.ruling_text)
             if pdf_judge:
                 doc.judge_name = pdf_judge
+        # Fallback: department-to-judge mapping (#585)
+        if not doc.judge_name and doc.department and self._dept_judge_map:
+            from courts.ca.riverside_dept_judges import lookup_judge_for_department
+
+            mapped_name = lookup_judge_for_department(self._dept_judge_map, doc.department)
+            if mapped_name:
+                doc.judge_name = mapped_name
         return doc
 
 
