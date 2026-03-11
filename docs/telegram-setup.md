@@ -81,7 +81,43 @@ aws lambda update-function-code \
 
 ## Step 6 — Register the webhook URL with Telegram
 
-Tell Telegram to send updates to your API Gateway endpoint. Use the bot token from Step 1 and the webhook URL from Step 4:
+Tell Telegram to send updates to your API Gateway endpoint. The **full webhook URL** must include the `/webhook` path suffix — the bare API Gateway URL will return 404.
+
+The URL format is:
+
+```
+https://<api-gateway-id>.execute-api.us-west-2.amazonaws.com/webhook
+```
+
+For example: `https://abc123def4.execute-api.us-west-2.amazonaws.com/webhook`
+
+You can get it from Terraform output:
+
+```bash
+terraform -chdir=infra/terraform/environments/dev output -raw telegram_webhook_url
+```
+
+### Recommended: use the helper script
+
+The easiest way to register the webhook is the helper script, which reads both the bot token (from Secrets Manager) and the API Gateway URL (from Terraform output) automatically:
+
+```bash
+scripts/tg-set-webhook.sh
+```
+
+Options:
+- `--dry-run` — print the URL that would be set, without calling setWebhook
+- `--verify` — after setting, call `getWebhookInfo` to confirm the URL matches
+
+You can also override either value via environment variables:
+
+```bash
+TG_BOT_TOKEN=<token> TG_WEBHOOK_URL=<url> scripts/tg-set-webhook.sh
+```
+
+### Manual method
+
+If you prefer to set the webhook manually:
 
 ```bash
 curl -s -X POST "https://api.telegram.org/bot<YOUR_BOT_TOKEN>/setWebhook" \
@@ -89,7 +125,7 @@ curl -s -X POST "https://api.telegram.org/bot<YOUR_BOT_TOKEN>/setWebhook" \
     -d '{"url": "<WEBHOOK_URL>"}'
 ```
 
-Replace `<YOUR_BOT_TOKEN>` and `<WEBHOOK_URL>` (the full URL including `/webhook`, e.g. `https://abc123.execute-api.us-west-2.amazonaws.com/webhook`).
+Replace `<YOUR_BOT_TOKEN>` with the token from Step 1 and `<WEBHOOK_URL>` with the **full URL including `/webhook`**.
 
 You should get a response like:
 
@@ -102,6 +138,8 @@ To verify the webhook is registered:
 ```bash
 curl -s "https://api.telegram.org/bot<YOUR_BOT_TOKEN>/getWebhookInfo"
 ```
+
+**Common mistake:** omitting the `/webhook` path suffix. The bare API Gateway URL (without `/webhook`) returns 404, and Telegram messages will be silently dropped. Always check with `getWebhookInfo` after setting.
 
 ## Step 7 — Test the integration
 

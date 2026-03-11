@@ -1437,6 +1437,134 @@ class TestInterpreterPrompt:
         assert "#N" in _SYSTEM_PROMPT or "#42" in _SYSTEM_PROMPT
 
 
+# ── Webhook health check ────────────────────────────────────────────────
+
+
+class TestCheckWebhookHealth:
+    """Tests for the webhook URL health check on responder startup."""
+
+    @respx.mock
+    def test_logs_ok_when_url_correct(self, caplog: pytest.LogCaptureFixture) -> None:
+        """A correctly registered URL should log INFO with 'OK'."""
+        respx.get("https://api.telegram.org/bottest-token/getWebhookInfo").mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "ok": True,
+                    "result": {
+                        "url": "https://abc123.execute-api.us-west-2.amazonaws.com/webhook",
+                        "has_custom_certificate": False,
+                        "pending_update_count": 0,
+                    },
+                },
+            )
+        )
+        mod = _import_responder()
+        with caplog.at_level("INFO"):
+            mod.check_webhook_health(bot_token="test-token")
+        assert any("OK" in r.message for r in caplog.records)
+
+    @respx.mock
+    def test_warns_when_no_url_registered(self, caplog: pytest.LogCaptureFixture) -> None:
+        """An empty webhook URL should produce a warning."""
+        respx.get("https://api.telegram.org/bottest-token/getWebhookInfo").mock(
+            return_value=httpx.Response(
+                200,
+                json={"ok": True, "result": {"url": "", "pending_update_count": 0}},
+            )
+        )
+        mod = _import_responder()
+        with caplog.at_level("WARNING"):
+            mod.check_webhook_health(bot_token="test-token")
+        assert any("no webhook URL" in r.message for r in caplog.records)
+
+    @respx.mock
+    def test_warns_when_url_missing_webhook_path(self, caplog: pytest.LogCaptureFixture) -> None:
+        """A URL without /webhook suffix should produce a warning."""
+        respx.get("https://api.telegram.org/bottest-token/getWebhookInfo").mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "ok": True,
+                    "result": {
+                        "url": "https://abc123.execute-api.us-west-2.amazonaws.com",
+                        "pending_update_count": 0,
+                    },
+                },
+            )
+        )
+        mod = _import_responder()
+        with caplog.at_level("WARNING"):
+            mod.check_webhook_health(bot_token="test-token")
+        assert any("does not end with /webhook" in r.message for r in caplog.records)
+
+    @respx.mock
+    def test_warns_when_url_missing_expected_substring(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A URL that doesn't contain the expected substring should warn."""
+        respx.get("https://api.telegram.org/bottest-token/getWebhookInfo").mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "ok": True,
+                    "result": {
+                        "url": "https://example.com/webhook",
+                        "pending_update_count": 0,
+                    },
+                },
+            )
+        )
+        mod = _import_responder()
+        with caplog.at_level("WARNING"):
+            mod.check_webhook_health(bot_token="test-token")
+        assert any("does not contain" in r.message for r in caplog.records)
+
+    @respx.mock
+    def test_warns_on_telegram_last_error(self, caplog: pytest.LogCaptureFixture) -> None:
+        """If Telegram reports a last_error_message, it should be logged."""
+        respx.get("https://api.telegram.org/bottest-token/getWebhookInfo").mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "ok": True,
+                    "result": {
+                        "url": "https://abc123.execute-api.us-west-2.amazonaws.com/webhook",
+                        "pending_update_count": 0,
+                        "last_error_message": "Connection refused",
+                    },
+                },
+            )
+        )
+        mod = _import_responder()
+        with caplog.at_level("WARNING"):
+            mod.check_webhook_health(bot_token="test-token")
+        assert any("Connection refused" in r.message for r in caplog.records)
+
+    @respx.mock
+    def test_does_not_raise_on_api_failure(self, caplog: pytest.LogCaptureFixture) -> None:
+        """Network or API errors should be caught and logged, not raised."""
+        respx.get("https://api.telegram.org/bottest-token/getWebhookInfo").mock(
+            return_value=httpx.Response(500, text="Internal Server Error")
+        )
+        mod = _import_responder()
+        with caplog.at_level("WARNING"):
+            mod.check_webhook_health(bot_token="test-token")
+        # Should not raise; should log a warning about the HTTP status.
+        assert any("returned 500" in r.message for r in caplog.records)
+
+    @respx.mock
+    def test_does_not_raise_on_network_error(self, caplog: pytest.LogCaptureFixture) -> None:
+        """A network error should be caught and logged, not raised."""
+        respx.get("https://api.telegram.org/bottest-token/getWebhookInfo").mock(
+            side_effect=httpx.ConnectError("DNS resolution failed")
+        )
+        mod = _import_responder()
+        with caplog.at_level("WARNING"):
+            mod.check_webhook_health(bot_token="test-token")
+        assert any("failed (non-fatal)" in r.message for r in caplog.records)
+
+
 # ── Old daemon removed ──────────────────────────────────────────────────
 # The deprecated tg-poll-daemon.py was removed in #646. The responder
 # daemon (scripts/tg-responder.py) fully replaces it.

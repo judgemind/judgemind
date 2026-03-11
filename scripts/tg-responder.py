@@ -170,6 +170,78 @@ def load_anthropic_api_key(
         return None
 
 
+# ── Webhook health check ───────────────────────────────────────────────
+
+
+def check_webhook_health(
+    *,
+    bot_token: str,
+    expected_url_substring: str = "execute-api",
+) -> None:
+    """Check the registered webhook URL and warn if it looks wrong.
+
+    Calls Telegram's ``getWebhookInfo`` endpoint at startup and logs a
+    warning if:
+    - No webhook URL is registered
+    - The registered URL does not end with ``/webhook``
+    - The registered URL does not contain the expected substring
+      (default: ``execute-api`` for AWS API Gateway)
+
+    This is a best-effort check — failures are logged as warnings,
+    never raised as exceptions, so the daemon always starts.
+    """
+    try:
+        with httpx.Client(timeout=10.0) as client:
+            resp = client.get(f"{TELEGRAM_API_BASE}/bot{bot_token}/getWebhookInfo")
+            if resp.status_code != 200:
+                logger.warning(
+                    "Webhook health check: Telegram API returned %d", resp.status_code
+                )
+                return
+
+            data = resp.json()
+            result = data.get("result", {})
+            url = result.get("url", "")
+
+            if not url:
+                logger.warning(
+                    "Webhook health check: no webhook URL is registered. "
+                    "Run scripts/tg-set-webhook.sh to set it."
+                )
+                return
+
+            if not url.endswith("/webhook"):
+                logger.warning(
+                    "Webhook health check: registered URL does not end with /webhook: %s — "
+                    "messages will be dropped (404). "
+                    "Run scripts/tg-set-webhook.sh to fix.",
+                    url,
+                )
+                return
+
+            if expected_url_substring and expected_url_substring not in url:
+                logger.warning(
+                    "Webhook health check: registered URL does not contain '%s': %s — "
+                    "this may indicate a misconfiguration.",
+                    expected_url_substring,
+                    url,
+                )
+                return
+
+            # Check for pending errors reported by Telegram.
+            last_error = result.get("last_error_message", "")
+            if last_error:
+                logger.warning(
+                    "Webhook health check: Telegram reports an error: %s",
+                    last_error,
+                )
+                return
+
+            logger.info("Webhook health check: OK (%s)", url)
+    except Exception:
+        logger.warning("Webhook health check failed (non-fatal)", exc_info=True)
+
+
 # ── Telegram replies ────────────────────────────────────────────────────
 
 
@@ -907,6 +979,9 @@ def run_daemon(
         logger.warning(
             "Claude interpreter disabled — will fall back to simple acknowledgment."
         )
+
+    # Check that the webhook URL is correctly registered with Telegram.
+    check_webhook_health(bot_token=bot_token)
 
     # Create a rate limiter for Claude API calls.
     limiter: RateLimiter | None = None
