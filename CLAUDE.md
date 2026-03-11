@@ -293,8 +293,10 @@ Ship correct code first, but don't ship code with obvious O(n) network calls whe
 ```
 .venv/bin/ruff check src/ tests/           # Lint (rules: E, F, I, N, UP, ANN)
 .venv/bin/ruff format --check src/ tests/   # Format check
-.venv/bin/pytest tests/ -v --tb=short       # Tests (scraper-framework also supports -n auto)
+.venv/bin/pytest tests/ -v --tb=short       # Tests with coverage (configured via pyproject.toml addopts)
 ```
+
+Coverage reports are generated automatically by pytest (configured in `pyproject.toml` via `--cov` addopts). Reports appear in `htmlcov/` (HTML) and `coverage.xml` (CI artifact). Both are gitignored.
 
 If lint fails, auto-fix with `.venv/bin/ruff check --fix src/ tests/` then `.venv/bin/ruff format src/ tests/`.
 
@@ -311,9 +313,10 @@ Common ruff pitfalls that agents keep hitting:
 npm run lint                                # ESLint
 npm run typecheck                           # tsc --noEmit
 npm test                                    # Vitest
+npx vitest run --coverage                   # Tests with coverage report
 ```
 
-For `packages/web/`, also run `npm run build` to catch build errors.
+For `packages/web/`, also run `npm run build` to catch build errors. Coverage reports (v8 provider) are configured in `vitest.config.ts` and output to `coverage/` (HTML + lcov). The directory is gitignored.
 
 **Terraform** (from `infra/terraform/`):
 

@@ -80,6 +80,12 @@ jobs:
           --ignore=tests/test_reingest_registry.py
           --ignore=tests/test_ingestion.py
           --ignore=tests/test_extract.py
+      - name: Upload coverage
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-scraper-unit
+          path: packages/scraper-framework/coverage.xml
 
   ingestion-tests:
     needs: detect-changes
@@ -111,6 +117,12 @@ jobs:
           tests/test_ingestion.py
           tests/test_extract.py
           -n 8 -v --tb=short
+      - name: Upload coverage
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-scraper-ingestion
+          path: packages/scraper-framework/coverage.xml
 
   nlp-tests:
     needs: detect-changes
@@ -140,6 +152,12 @@ jobs:
         run: .venv/bin/ruff format --check src/ tests/
       - name: Test
         run: .venv/bin/pytest tests/ -v --tb=short
+      - name: Upload coverage
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-nlp
+          path: packages/nlp-pipeline/coverage.xml
 
   api-tests:
     needs: detect-changes
@@ -192,7 +210,13 @@ jobs:
       - name: Type check
         run: npm run typecheck
       - name: Test
-        run: npm test
+        run: npx vitest run --coverage --passWithNoTests
+      - name: Upload coverage
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-api
+          path: packages/api/coverage/lcov.info
 
   web-tests:
     needs: detect-changes
@@ -213,7 +237,13 @@ jobs:
       - name: Type check
         run: npm run typecheck
       - name: Test
-        run: npm test
+        run: npx vitest run --coverage --passWithNoTests
+      - name: Upload coverage
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-web
+          path: packages/web/coverage/lcov.info
       - name: Build
         run: npm run build
 
@@ -245,6 +275,12 @@ jobs:
         run: .venv/bin/ruff format --check src/ tests/
       - name: Test
         run: .venv/bin/pytest tests/ -v --tb=short
+      - name: Upload coverage
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-telegram
+          path: packages/telegram-bridge/coverage.xml
 
   infra-validate:
     needs: detect-changes
@@ -297,6 +333,12 @@ jobs:
         run: .venv/bin/ruff format --check .
       - name: Test
         run: .venv/bin/pytest tests/ -v --tb=short
+      - name: Upload coverage
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-lambda-${{ matrix.lambda-dir }}
+          path: ${{ matrix.lambda-dir }}/coverage.xml
 
   # Always runs. Reports success only when every applicable job passed or was
   # skipped (path filter did not match). Branch protection requires this check.
