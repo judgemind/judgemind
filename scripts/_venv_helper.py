@@ -2,8 +2,8 @@
 
 Scripts that need non-stdlib dependencies should call ``ensure_venv()`` at
 the top of the file, before any non-stdlib imports.  If the script is not
-already running inside the target venv, it will re-exec itself with the
-correct Python interpreter via ``os.execv``.
+already running inside the target venv, it will re-launch itself with the
+correct Python interpreter via ``subprocess.run``.
 
 Usage example (for a script that needs packages/telegram-bridge)::
 
@@ -27,11 +27,17 @@ Environment variables:
     _VENV_HELPER_SKIP: Set to any non-empty value to skip the venv check.
         Useful in test environments or containers where dependencies are
         already available without a venv.
+    _VENV_HELPER_USE_EXECV: Set to any non-empty value to use ``os.execv``
+        instead of ``subprocess.run`` for re-execution.  ``os.execv``
+        replaces the current process (slightly more efficient) but fails
+        in some subprocess environments (e.g. Claude Code's Bash tool).
+        The default ``subprocess.run`` approach works everywhere.
 """
 
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -97,7 +103,7 @@ def _print_install_instructions(package_name: str) -> None:
         f"This script requires the '{package_name}' package and its deps.\n"
         f"Install them with:\n"
         f"\n"
-        f"    {pkg_dir}/.venv/bin/pip install -e \"{pkg_dir}[dev]\" --quiet\n",
+        f'    {pkg_dir}/.venv/bin/pip install -e "{pkg_dir}[dev]" --quiet\n',
         file=sys.stderr,
     )
 
@@ -105,18 +111,27 @@ def _print_install_instructions(package_name: str) -> None:
 def ensure_venv(package_name: str) -> None:
     """Ensure the script is running inside the venv for *package_name*.
 
-    If the current Python interpreter is not the venv's Python, re-exec
+    If the current Python interpreter is not the venv's Python, re-launch
     the script with the correct interpreter (preserving all arguments).
     If the venv does not exist, print a helpful error and exit.
     If the venv exists but has no dependencies installed, print a helpful
     error and exit instead of crashing with a raw ``ModuleNotFoundError``.
 
+    By default, re-launching uses ``subprocess.run`` which spawns a child
+    process, waits for it, and propagates the exit code.  This works
+    reliably in all environments including Claude Code's Bash tool.
+
+    Set ``_VENV_HELPER_USE_EXECV=1`` to use ``os.execv`` instead, which
+    replaces the current process (slightly more efficient but fails in
+    some subprocess environments).
+
     This function only returns if:
     - We are already in the correct venv, or
     - ``_VENV_HELPER_SKIP`` env var is set (for tests/containers).
 
-    Otherwise it calls ``os.execv`` (which replaces the process) or
-    ``sys.exit`` (if the venv is missing or empty).
+    Otherwise it calls ``subprocess.run`` + ``sys.exit`` (or ``os.execv``
+    if ``_VENV_HELPER_USE_EXECV`` is set), or ``sys.exit(1)`` if the venv
+    is missing or empty.
 
     Args:
         package_name: The package directory name under ``packages/``
@@ -151,15 +166,27 @@ def ensure_venv(package_name: str) -> None:
             f"Create it with:\n"
             f"\n"
             f"    python3.12 -m venv {pkg_dir}/.venv\n"
-            f"    {pkg_dir}/.venv/bin/pip install -e \"{pkg_dir}[dev]\" --quiet\n",
+            f'    {pkg_dir}/.venv/bin/pip install -e "{pkg_dir}[dev]" --quiet\n',
             file=sys.stderr,
         )
         sys.exit(1)
 
-    # Venv exists but may be empty — check before re-exec.
+    # Venv exists but may be empty — check before re-launch.
     if not _check_venv_has_deps(package_name):
         _print_install_instructions(package_name)
         sys.exit(1)
 
-    # Re-exec with the venv Python
-    os.execv(str(venv_py), [str(venv_py), *sys.argv])
+    # Re-launch with the venv Python.
+    cmd = [str(venv_py), *sys.argv]
+
+    if os.environ.get("_VENV_HELPER_USE_EXECV"):
+        # Legacy mode: replace the current process.  Slightly more
+        # efficient but fails in some subprocess environments (e.g.
+        # Claude Code's Bash tool where os.execv breaks stdout capture).
+        os.execv(str(venv_py), cmd)
+    else:
+        # Default: spawn a child process and propagate its exit code.
+        # This works reliably in all environments — terminal, subprocess
+        # wrappers, CI runners, Claude Code Bash tool, etc.
+        result = subprocess.run(cmd)
+        sys.exit(result.returncode)
