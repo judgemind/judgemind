@@ -55,9 +55,9 @@ jobs:
       - name: Build script arguments
         id: args
         run: |
-          ARGS=""
+          ARGS="--persist-metrics"
           if [ "${{ inputs.text_output }}" = "true" ]; then
-            ARGS="--text"
+            ARGS="$ARGS --text"
           fi
           if [ -n "${{ inputs.county }}" ]; then
             ARGS="$ARGS --county ${{ inputs.county }}"
@@ -73,19 +73,11 @@ jobs:
           # The ECS task has DATABASE_URL injected from Secrets Manager.
           # Use --cpu 256 --memory 512 since this is a lightweight SQL-only task.
           set +e
-          if [ -n "$SCRIPT_ARGS" ]; then
-            scripts/ecs-run-task.sh \
-              --cpu 256 --memory 512 \
-              --timeout 300 \
-              --latest-image \
-              scripts/data-quality-check.py -- $SCRIPT_ARGS 2>&1 | tee /tmp/check_output.txt
-          else
-            scripts/ecs-run-task.sh \
-              --cpu 256 --memory 512 \
-              --timeout 300 \
-              --latest-image \
-              scripts/data-quality-check.py 2>&1 | tee /tmp/check_output.txt
-          fi
+          scripts/ecs-run-task.sh \
+            --cpu 256 --memory 512 \
+            --timeout 300 \
+            --latest-image \
+            scripts/data-quality-check.py -- $SCRIPT_ARGS 2>&1 | tee /tmp/check_output.txt
           EXIT_CODE=${PIPESTATUS[0]}
           set -e
 
