@@ -72,6 +72,7 @@ if str(_BRIDGE_SRC) not in sys.path:
     sys.path.insert(0, str(_BRIDGE_SRC))
 
 try:
+    from telegram_bridge.formatting import linkify_github_refs  # noqa: E402
     from telegram_bridge.interpreter import (  # noqa: E402
         RateLimitError,
         RateLimiter,
@@ -171,19 +172,29 @@ def send_telegram_reply(
     *,
     bot_token: str,
     chat_ids: list[int],
+    parse_mode: str | None = None,
 ) -> None:
-    """Send a plain-text message to all chat IDs via the Telegram Bot API.
+    """Send a message to all chat IDs via the Telegram Bot API.
+
+    Args:
+        text: The message text to send.
+        bot_token: Telegram bot token.
+        chat_ids: List of chat IDs to send to.
+        parse_mode: Optional Telegram parse mode (e.g. ``"MarkdownV2"``).
+            When ``None``, the message is sent as plain text.
 
     Errors are logged but not raised — the daemon should keep running even
     if a single reply fails.
     """
     with httpx.Client(timeout=15.0) as client:
         for chat_id in chat_ids:
-            payload = {
+            payload: dict[str, object] = {
                 "chat_id": chat_id,
                 "text": text,
                 "disable_web_page_preview": True,
             }
+            if parse_mode is not None:
+                payload["parse_mode"] = parse_mode
             try:
                 resp = client.post(
                     f"{TELEGRAM_API_BASE}/bot{bot_token}/sendMessage",
@@ -504,8 +515,15 @@ def dispatch_message(
         )
         return
 
-    # Send the Claude-generated reply.
-    send_telegram_reply(result.reply, bot_token=bot_token, chat_ids=chat_ids)
+    # Format the reply for Telegram: convert #N refs to clickable links
+    # and escape special characters for MarkdownV2.
+    formatted_reply = linkify_github_refs(result.reply)
+    send_telegram_reply(
+        formatted_reply,
+        bot_token=bot_token,
+        chat_ids=chat_ids,
+        parse_mode="MarkdownV2",
+    )
 
     # Execute any actions.
     for action in result.actions:
@@ -667,7 +685,7 @@ def run_daemon(
     secret_id: str = "judgemind/telegram/bot",
     anthropic_secret_id: str = "judgemind/anthropic/api-key",
     no_llm: bool = False,
-    rate_limit_calls: int = 1,
+    rate_limit_calls: int = 20,
     rate_limit_window: float = 60.0,
 ) -> None:
     """Main daemon loop: poll SQS, interpret messages via Claude, repeat.
@@ -827,8 +845,8 @@ def main() -> None:
     parser.add_argument(
         "--rate-limit-calls",
         type=int,
-        default=1,
-        help="Max Claude API calls within the rate limit window (default: 1)",
+        default=20,
+        help="Max Claude API calls within the rate limit window (default: 20)",
     )
     parser.add_argument(
         "--rate-limit-window",
