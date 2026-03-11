@@ -65,10 +65,11 @@ The orchestrator runs a continuous loop:
 
 1. **Refresh state** — check Telegram inbox, stop requests, and pause state
 2. **Handle in-flight PRs** — merge any that are ready, fix any that are failing
-3. **Fill agent slots** — launch `/task` agents for the next highest-priority issues
-4. **Process completions** — handle agent completion/failure notifications
-5. **Triage** — close done issues, file new issues for discovered problems
-6. **Repeat** until shutdown
+3. **Sync after merges** — pull latest main after each merge (see "Post-merge sync" in Rules)
+4. **Fill agent slots** — launch `/task` agents for the next highest-priority issues
+5. **Process completions** — handle agent completion/failure notifications
+6. **Triage** — close done issues, file new issues for discovered problems
+7. **Repeat** until shutdown
 
 ### Slot management
 
@@ -112,6 +113,7 @@ gh pr merge <N> --repo judgemind/judgemind --squash --delete-branch
 ```
 
 After merging:
+- **Immediately sync to latest main** (see "Post-merge sync" in Rules below) — this must happen before spawning any new agents
 - Send a Telegram notification
 - Check if the merged PR triggers a deploy workflow (see CLAUDE.md "Verify deployment")
 - For deployed services, watch the deploy workflow to completion
@@ -229,9 +231,28 @@ The orchestrator must stay responsive to user interaction and Telegram commands 
 - **Everything else = spawn a subagent.** If you are unsure whether something is "quick enough," it is not — delegate it.
 - **Never block on a single long operation.** If a `gh run watch` or similar command could take minutes, run it in a way that does not prevent processing other events in the main loop. Prefer polling with short timeouts over blocking waits.
 
+### No direct code changes on main
+
+The orchestrator MUST NOT make any code changes on `main` itself. All code changes must be delegated to `/task` subagents working in worktrees.
+
+- **Prohibited (code changes):** editing source files, modifying configs, writing scripts, updating documentation content, changing Terraform, or any operation that results in a `git commit` on the orchestrator's checkout. If it would show up in `git diff`, delegate it to a `/task` subagent.
+- **Allowed (non-code operations):** `gh` CLI calls (issue comments, label changes, PR merges, issue creation/editing), reading files for decision-making, writing to `tmp/`, sending Telegram messages, running `git fetch`/`git pull`. These do not modify committed code and are safe to run inline.
+
+If you catch yourself about to edit a file or stage a commit from the orchestrator agent, **stop and spawn a `/task` subagent instead.**
+
+### Post-merge sync
+
+After each PR merge, the orchestrator MUST pull latest main so that subsequent `/task` agents start from the current tip of the codebase:
+
+```
+git fetch origin main
+git pull origin main --ff-only
+```
+
+Do this **immediately** after every `gh pr merge` call, before spawning new agents or processing the next item in the loop. Without this step, new worktrees created by `/task` agents will be based on stale code, leading to merge conflicts or missed changes.
+
 ### General rules
 
-- **Never modify committed code directly.** All code changes go through `/task` agents in worktrees.
 - **Never push to main.** All changes go through PRs.
 - **Never deploy to production.** Production deploys are human-only.
 - **Never set `priority/p0`.** That priority is reserved for humans.
