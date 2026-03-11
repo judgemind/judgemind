@@ -1,0 +1,65 @@
+{
+  "_comment": "Site quality check baselines. Each entry defines a check with expected content markers. The hourly workflow validates these and auto-files issues on regression. Do not remove entries without updating the workflow.",
+  "pages": [
+    {
+      "name": "Home",
+      "path": "/",
+      "content_markers": ["Judgemind", "rulings"]
+    },
+    {
+      "name": "Rulings list",
+      "path": "/rulings",
+      "content_markers": ["rulings"]
+    },
+    {
+      "name": "Search",
+      "path": "/search",
+      "content_markers": ["search"]
+    }
+  ],
+  "graphql_queries": [
+    {
+      "name": "Recent rulings",
+      "query": "{ rulings(first: 3) { edges { node { id hearingDate } } } }",
+      "expected_path": "data.rulings.edges",
+      "min_items": 1
+    },
+    {
+      "name": "Judge list",
+      "query": "{ judges(first: 3) { edges { node { id canonicalName } } } }",
+      "expected_path": "data.judges.edges",
+      "min_items": 1
+    },
+    {
+      "name": "Case list",
+      "query": "{ cases(first: 3) { edges { node { id caseNumber } } } }",
+      "expected_path": "data.cases.edges",
+      "min_items": 1
+    },
+    {
+      "name": "Health check",
+      "query": "{ health }",
+      "expected_path": "data.health",
+      "expected_value": "ok"
+    }
+  ],
+  "functional_checks": {
+    "search": {
+      "query": "{ searchRulings(query: \"motion\", first: 1) { totalHits edges { node { rulingId } } } }",
+      "expected_path": "data.searchRulings.totalHits",
+      "min_value": 1
+    },
+    "judge_profile": {
+      "sample_query": "{ judges(first: 1) { edges { node { id } } } }",
+      "sample_id_path": "data.judges.edges.0.node.id",
+      "detail_query_template": "{ judge(id: \"%s\") { id canonicalName } judgeAnalytics(judgeId: \"%s\") { totalRulings } }",
+      "expected_fields": ["data.judge.canonicalName"]
+    },
+    "ruling_detail": {
+      "sample_query": "{ rulings(first: 1) { edges { node { id } } } }",
+      "sample_id_path": "data.rulings.edges.0.node.id",
+      "detail_query_template": "{ ruling(id: \"%s\") { id hearingDate outcome rulingText case { caseNumber } judge { canonicalName } } }",
+      "expected_fields": ["data.ruling.hearingDate"]
+    }
+  }
+}
