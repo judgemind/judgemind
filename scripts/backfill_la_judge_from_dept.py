@@ -7,10 +7,11 @@ directory provides a department-to-judge mapping that can retroactively
 fill these gaps.
 
 For each LA ruling with a department but no judge_id, this script:
-  1. Looks up the judge name via the dept-to-judge mapping
-  2. Resolves the judge name to a canonical judge record (resolve_judge)
-  3. Updates the ruling's judge_id
-  4. Links the judge to the case via case_judges
+  1. Looks up the judge name via historical directory snapshots when available
+  2. Falls back to the live directory when no snapshot predates the ruling
+  3. Resolves the judge name to a canonical judge record (resolve_judge)
+  4. Updates the ruling's judge_id
+  5. Links the judge to the case via case_judges
 
 Usage:
     scripts/with-secret.sh \\
@@ -31,9 +32,11 @@ Options:
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import sys
+from datetime import date, datetime, time
 
 # Ensure the scraper-framework source is importable
 sys.path.insert(
@@ -64,6 +67,9 @@ logger = logging.getLogger(__name__)
 # Minimum cursor value for the first batch
 _CURSOR_MIN_UUID = "00000000-0000-0000-0000-000000000000"
 
+# LA County court identifier used for snapshot lookups
+LA_COURT_ID_SNAPSHOT = "ca_los_angeles"
+
 # Fetch LA County rulings that have a department but no judge_id.
 # Uses keyset pagination on ruling id (not LIMIT/OFFSET).
 FETCH_QUERY = """
@@ -91,17 +97,138 @@ UPDATE_RULING_JUDGE_QUERY = """
       AND judge_id IS NULL
 """
 
+# Query the court_directory_snapshots table for the most recent snapshot
+# captured on or before a given datetime.  This is the same logic as
+# CourtDirectory.get_snapshot() but as a standalone function so the
+# backfill script doesn't need to instantiate the ABC + S3 client.
+SNAPSHOT_QUERY = """
+    SELECT mapping FROM court_directory_snapshots
+    WHERE court_id = %s AND captured_at <= %s
+    ORDER BY captured_at DESC
+    LIMIT 1
+"""
+
+
+def get_snapshot_mapping(
+    conn: psycopg.Connection,
+    court_id: str,
+    as_of: datetime,
+) -> dict[str, str] | None:
+    """Get the directory snapshot closest to (but not after) a given datetime.
+
+    This mirrors ``CourtDirectory.get_snapshot()`` but is a standalone function
+    that only requires a DB connection — no S3 client or ABC instantiation.
+
+    Parameters
+    ----------
+    conn : psycopg.Connection
+        An open psycopg3 connection.
+    court_id : str
+        The court identifier (e.g. ``"ca_los_angeles"``).
+    as_of : datetime
+        The point in time to look up.
+
+    Returns
+    -------
+    dict[str, str] | None
+        The parsed {department: judge_name} mapping, or None if no
+        snapshot exists before the given datetime.
+    """
+    with conn.cursor() as cur:
+        cur.execute(SNAPSHOT_QUERY, (court_id, as_of))
+        row = cur.fetchone()
+
+    if row is None:
+        return None
+
+    mapping: dict[str, str] = row[0] if isinstance(row[0], dict) else json.loads(row[0])
+    return mapping
+
+
+def _hearing_date_to_datetime(hearing_date: date | datetime) -> datetime:
+    """Convert a hearing date to a datetime for snapshot lookup.
+
+    If already a datetime, return as-is.  If a date, convert to
+    end-of-day (23:59:59) so the snapshot query includes any
+    snapshot captured on the same day.
+    """
+    if isinstance(hearing_date, datetime):
+        return hearing_date
+    return datetime.combine(hearing_date, time(23, 59, 59))
+
+
+def _get_effective_mapping(
+    conn: psycopg.Connection,
+    hearing_date: date | datetime,
+    live_dept_map: dict[str, str],
+    snapshot_cache: dict[date, dict[str, str] | None],
+) -> dict[str, str]:
+    """Return the best available department-to-judge mapping for a ruling.
+
+    Uses the historical directory snapshot closest to (but not after) the
+    ruling's hearing date.  Falls back to the live directory mapping when
+    no snapshot predates the ruling.
+
+    Results are cached per hearing_date to avoid repeated DB queries for
+    rulings on the same date within a batch.
+
+    Parameters
+    ----------
+    conn : psycopg.Connection
+        An open psycopg3 connection.
+    hearing_date : date | datetime
+        The ruling's hearing date.
+    live_dept_map : dict[str, str]
+        The current live department-to-judge mapping (fallback).
+    snapshot_cache : dict[date, dict[str, str] | None]
+        Mutable cache keyed by date.  Updated in place.
+
+    Returns
+    -------
+    dict[str, str]
+        The department-to-judge mapping to use for this ruling.
+    """
+    cache_key = (
+        hearing_date
+        if isinstance(hearing_date, date) and not isinstance(hearing_date, datetime)
+        else hearing_date
+    )
+    if isinstance(cache_key, datetime):
+        cache_key = cache_key.date()
+
+    if cache_key not in snapshot_cache:
+        as_of = _hearing_date_to_datetime(hearing_date)
+        snapshot_cache[cache_key] = get_snapshot_mapping(
+            conn, LA_COURT_ID_SNAPSHOT, as_of
+        )
+
+    snapshot = snapshot_cache[cache_key]
+    if snapshot is not None:
+        return snapshot
+
+    # No historical snapshot — fall back to the live directory
+    return live_dept_map
+
 
 def backfill_batch(
     conn: psycopg.Connection,
     dept_map: dict[str, str],
     batch_size: int = 100,
     cursor: str = _CURSOR_MIN_UUID,
+    *,
+    snapshot_cache: dict[date, dict[str, str] | None] | None = None,
 ) -> tuple[int, int, str]:
-    """Process one batch of rulings.  Returns (processed, updated, next_cursor)."""
+    """Process one batch of rulings.  Returns (processed, updated, next_cursor).
+
+    For each ruling, looks up the historical directory snapshot closest to
+    the ruling's hearing date.  Falls back to the live ``dept_map`` when no
+    snapshot predates the ruling.
+    """
     processed = 0
     updated = 0
     next_cursor = cursor
+    if snapshot_cache is None:
+        snapshot_cache = {}
 
     with conn.cursor() as cur:
         cur.execute(FETCH_QUERY, (cursor, batch_size))
@@ -114,7 +241,12 @@ def backfill_batch(
         processed += 1
         next_cursor = str(ruling_id)
 
-        judge_name = lookup_judge_for_department(dept_map, department)
+        # Use historical snapshot if available, else fall back to live map
+        effective_map = _get_effective_mapping(
+            conn, hearing_date, dept_map, snapshot_cache
+        )
+
+        judge_name = lookup_judge_for_department(effective_map, department)
         if judge_name is None:
             logger.debug(
                 "No mapping for department %r (ruling %s)", department, ruling_id
@@ -151,10 +283,17 @@ def run_backfill(
     limit: int | None = None,
     dry_run: bool = False,
 ) -> dict[str, int]:
-    """Run the full backfill.  Returns summary stats."""
+    """Run the full backfill.  Returns summary stats.
+
+    Uses historical directory snapshots when available.  The snapshot cache
+    is shared across batches so repeated hearing dates don't re-query the DB.
+    Falls back to the live ``dept_map`` for rulings predating the first snapshot.
+    """
     total_processed = 0
     total_updated = 0
     cursor: str = _CURSOR_MIN_UUID
+    # Shared across batches so repeated dates don't re-query
+    snapshot_cache: dict[date, dict[str, str] | None] = {}
 
     with psycopg.connect(dsn) as conn:
         while True:
@@ -166,7 +305,11 @@ def run_backfill(
                 effective_batch = min(batch_size, remaining)
 
             processed, updated, cursor = backfill_batch(
-                conn, dept_map, effective_batch, cursor
+                conn,
+                dept_map,
+                effective_batch,
+                cursor,
+                snapshot_cache=snapshot_cache,
             )
             total_processed += processed
             total_updated += updated
