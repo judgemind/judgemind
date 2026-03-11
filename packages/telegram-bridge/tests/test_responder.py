@@ -1100,7 +1100,7 @@ class TestSqsBotoConfig:
         mod = _import_responder()
         config = mod.SQS_BOTO_CONFIG
         assert config.connect_timeout == 5
-        assert config.read_timeout == 10
+        assert config.read_timeout == 25
 
     def test_config_has_limited_retries(self) -> None:
         mod = _import_responder()

@@ -917,10 +917,13 @@ def _should_stop(pid_file: Path) -> bool:
 # Botocore configuration with bounded timeouts so the daemon stays
 # responsive to shutdown requests even when the network is unreliable.
 # Default botocore retries can block for 30s+; these settings cap each
-# SQS call to ~15s worst-case (2 attempts * (5s connect + 10s read) / 2).
+# SQS call to ~35s worst-case (2 attempts * (5s connect + 25s read) / 2).
+# read_timeout must exceed WaitTimeSeconds (20s) + buffer for response
+# transmission, otherwise every long-poll cycle times out before SQS
+# can respond.
 SQS_BOTO_CONFIG = BotoConfig(
     connect_timeout=5,
-    read_timeout=10,
+    read_timeout=25,
     retries={"max_attempts": 2, "mode": "standard"},
 )
 
