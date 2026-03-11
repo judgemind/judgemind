@@ -1,0 +1,9 @@
+{
+  "_comment": "Coverage floor ratchet. Values are minimum overall line coverage percentages. Updated automatically by scripts/update-coverage-baselines.py when coverage increases. Do not lower these values manually.",
+  "packages/scraper-framework": 0,
+  "packages/nlp-pipeline": 0,
+  "packages/telegram-bridge": 0,
+  "packages/api": 0,
+  "packages/web": 0,
+  "infra/telegram-bot": 0
+}

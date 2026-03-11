@@ -248,6 +248,10 @@ If lint fails: `.venv/bin/ruff check --fix src/ tests/` then `.venv/bin/ruff for
 
 Common ruff pitfalls: **I001** (unsorted imports, `--fix` resolves), **F401** (unused imports, remove them), **UP017** (use `datetime.now(datetime.UTC)`). Format and lint are **separate commands** — run BOTH.
 
+**Coverage gates (enforced in CI):**
+- **Diff coverage:** new/changed lines must have >= 90% test coverage. CI runs `diff-cover` against `coverage.xml` (Python) or `lcov.info` (TypeScript).
+- **Coverage floor ratchet:** overall package coverage must not decrease below the baseline in `coverage-baselines.json`. The floor only goes up — when coverage increases, update the baselines with `scripts/update-coverage-baselines.py`.
+
 **TypeScript packages:**
 
 ```
@@ -256,7 +260,7 @@ npm run typecheck                           # tsc --noEmit
 npm test                                    # Vitest
 ```
 
-For `packages/web/`, also run `npm run build`.
+For `packages/web/`, also run `npm run build`. The same diff coverage and floor ratchet gates apply to TypeScript packages (CI reads `lcov.info`).
 
 **Terraform** (from `infra/terraform/`):
 
