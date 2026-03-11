@@ -231,6 +231,8 @@ class TestNoOpMode:
             await orch.task_completed(issue_number=1, summary="Done.", worker=1)
             await orch.task_failed(issue_number=2, error="Err.", worker=2)
             await orch.reply_status()
+            await orch.notify("Test notification.")
+            await orch.status_update(task="#1", state="complete", details="Done.")
 
             commands = await orch.poll_commands()
             assert commands == []
@@ -457,6 +459,103 @@ class TestReply:
 
             body = json.loads(route.calls[0].request.content)
             assert "https://github.com/judgemind/judgemind/issues/42" in body["text"]
+
+
+# ── notify() pass-through ────────────────────────────────────────────────
+
+
+class TestNotifyPassthrough:
+    """Tests for OrchestratorBridge.notify() delegation to TelegramBridge."""
+
+    @respx.mock
+    async def test_notify_delegates_to_inner_bridge(self) -> None:
+        with mock_aws():
+            _setup_secret()
+            route = respx.post("https://api.telegram.org/botfake-bot-token/sendMessage").mock(
+                return_value=httpx.Response(200, json={"ok": True})
+            )
+
+            bridge = _make_bridge()
+            orch = OrchestratorBridge(bridge=bridge)
+            await orch.notify("Scraper run complete.")
+            await bridge.close()
+
+            assert route.call_count == 1
+            body = json.loads(route.calls[0].request.content)
+            assert "Scraper run complete" in body["text"]
+
+    async def test_notify_noop_when_disabled(self) -> None:
+        with mock_aws():
+            bridge = _make_bridge()
+            orch = OrchestratorBridge(bridge=bridge)
+            # Should not raise
+            await orch.notify("This should be silently dropped.")
+
+    @respx.mock
+    async def test_notify_passes_repo_kwarg(self) -> None:
+        with mock_aws():
+            _setup_secret()
+            route = respx.post("https://api.telegram.org/botfake-bot-token/sendMessage").mock(
+                return_value=httpx.Response(200, json={"ok": True})
+            )
+
+            bridge = _make_bridge()
+            orch = OrchestratorBridge(bridge=bridge)
+            await orch.notify("See #10 for details.", repo="myorg/myrepo")
+            await bridge.close()
+
+            assert route.call_count == 1
+            body = json.loads(route.calls[0].request.content)
+            assert "https://github.com/myorg/myrepo/issues/10" in body["text"]
+
+
+# ── status_update() pass-through ─────────────────────────────────────────
+
+
+class TestStatusUpdatePassthrough:
+    """Tests for OrchestratorBridge.status_update() delegation to TelegramBridge."""
+
+    @respx.mock
+    async def test_status_update_delegates_to_inner_bridge(self) -> None:
+        with mock_aws():
+            _setup_secret()
+            route = respx.post("https://api.telegram.org/botfake-bot-token/sendMessage").mock(
+                return_value=httpx.Response(200, json={"ok": True})
+            )
+
+            bridge = _make_bridge()
+            orch = OrchestratorBridge(bridge=bridge)
+            await orch.status_update(task="#99", state="complete", details="All done.")
+            await bridge.close()
+
+            assert route.call_count == 1
+            body = json.loads(route.calls[0].request.content)
+            # The formatted card should contain the task and details
+            assert "#99" in body["text"] or "99" in body["text"]
+
+    async def test_status_update_noop_when_disabled(self) -> None:
+        with mock_aws():
+            bridge = _make_bridge()
+            orch = OrchestratorBridge(bridge=bridge)
+            # Should not raise
+            await orch.status_update(task="#1", state="failed", details="Error occurred.")
+
+    @respx.mock
+    async def test_status_update_passes_repo_kwarg(self) -> None:
+        with mock_aws():
+            _setup_secret()
+            route = respx.post("https://api.telegram.org/botfake-bot-token/sendMessage").mock(
+                return_value=httpx.Response(200, json={"ok": True})
+            )
+
+            bridge = _make_bridge()
+            orch = OrchestratorBridge(bridge=bridge)
+            await orch.status_update(
+                task="#5", state="in_progress", details="Working", repo="myorg/myrepo"
+            )
+            await bridge.close()
+
+            assert route.call_count == 1
 
 
 # ── reply_status() ──────────────────────────────────────────────────────
