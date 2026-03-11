@@ -406,7 +406,7 @@ resource "aws_ecs_task_definition" "ingestion_worker" {
       environment = concat(
         [
           { name = "ENVIRONMENT", value = var.environment },
-          { name = "LLM_PROVIDER", value = "google" }
+          { name = "LLM_PROVIDER", value = "anthropic" }
         ],
         var.redis_url != "" ? [{ name = "REDIS_URL", value = var.redis_url }] : [],
         var.opensearch_url != "" ? [{ name = "OPENSEARCH_URL", value = var.opensearch_url }] : [],
