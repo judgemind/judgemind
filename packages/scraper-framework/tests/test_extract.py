@@ -3,11 +3,16 @@ and case title extraction."""
 
 from __future__ import annotations
 
+from datetime import date
+
 from ingestion.extract import (
+    _is_name_fragment,
     _looks_like_person_name,
+    _split_caption_names,
     extract_case_number,
     extract_case_title,
     extract_case_type_from_number,
+    extract_hearing_date,
     extract_judge_name,
     extract_motion_type,
     extract_outcome,
@@ -1063,3 +1068,245 @@ class TestExtractCaseTypeFromNumber:
 
     def test_leading_whitespace_stripped(self) -> None:
         assert extract_case_type_from_number("  CVRI2502741  ") == "civil"
+
+
+# ---------------------------------------------------------------------------
+# Hearing date extraction
+# ---------------------------------------------------------------------------
+
+
+class TestExtractHearingDate:
+    """Tests for extract_hearing_date()."""
+
+    def test_month_day_comma_year(self) -> None:
+        """Standard 'Month DD, YYYY' format."""
+        text = "Hearing Date: February 24, 2026\nDepartment 5"
+        assert extract_hearing_date(text) == date(2026, 2, 24)
+
+    def test_month_day_year_no_comma(self) -> None:
+        """'Month DD YYYY' without comma."""
+        text = "March 5 2026 hearing on motion"
+        assert extract_hearing_date(text) == date(2026, 3, 5)
+
+    def test_date_colon_mm_dd_yyyy(self) -> None:
+        """'Date: MM/DD/YYYY' format."""
+        text = "Date: 03/04/2026\nDepartment 12"
+        assert extract_hearing_date(text) == date(2026, 3, 4)
+
+    def test_date_colon_mm_dd_yy(self) -> None:
+        """'Date: MM/DD/YY' short year format."""
+        text = "Date: 03/04/26\nCourtroom B"
+        assert extract_hearing_date(text) == date(2026, 3, 4)
+
+    def test_standalone_mm_dd_yyyy(self) -> None:
+        """Standalone 'MM/DD/YYYY' without label."""
+        text = "Hearing on 01/15/2026 for motion to compel"
+        assert extract_hearing_date(text) == date(2026, 1, 15)
+
+    def test_case_insensitive_month(self) -> None:
+        """Month name matching is case-insensitive."""
+        text = "hearing on JANUARY 10, 2026 in department 3"
+        assert extract_hearing_date(text) == date(2026, 1, 10)
+
+    def test_no_match(self) -> None:
+        """Text without a date returns None."""
+        text = "The motion for summary judgment is GRANTED."
+        assert extract_hearing_date(text) is None
+
+    def test_empty_string(self) -> None:
+        assert extract_hearing_date("") is None
+
+    def test_first_date_wins(self) -> None:
+        """When multiple dates appear, the first matching pattern wins."""
+        text = "Hearing Date: January 5, 2026\nContinued to February 10, 2026"
+        assert extract_hearing_date(text) == date(2026, 1, 5)
+
+    def test_single_digit_day(self) -> None:
+        """Single-digit day without leading zero."""
+        text = "Date: 3/4/2026"
+        assert extract_hearing_date(text) == date(2026, 3, 4)
+
+    def test_december_31(self) -> None:
+        """End of year date."""
+        text = "December 31, 2025 ruling"
+        assert extract_hearing_date(text) == date(2025, 12, 31)
+
+
+# ---------------------------------------------------------------------------
+# _looks_like_person_name — additional coverage
+# ---------------------------------------------------------------------------
+
+
+class TestLooksLikePersonNameAdditional:
+    """Additional tests for _looks_like_person_name to cover remaining branches."""
+
+    def test_reject_a_california_without_other_org_keywords(self) -> None:
+        """'A California' descriptor alone (no LLC/Inc) must be rejected."""
+        # This name has no org keywords like LLC/Inc, but has "A California"
+        assert _looks_like_person_name("Smith A California Entity") is False
+
+    def test_accept_normal_name_near_boundary(self) -> None:
+        """Name at exactly 60 chars should be accepted."""
+        name = "A" * 29 + " " + "B" * 30  # 60 chars total
+        assert _looks_like_person_name(name) is True
+
+    def test_reject_exactly_61_chars(self) -> None:
+        """Name at 61 chars should be rejected."""
+        name = "A" * 30 + " " + "B" * 30  # 61 chars total
+        assert _looks_like_person_name(name) is False
+
+
+# ---------------------------------------------------------------------------
+# _split_caption_names — direct tests
+# ---------------------------------------------------------------------------
+
+
+class TestSplitCaptionNames:
+    """Tests for _split_caption_names helper."""
+
+    def test_and_separator_without_commas(self) -> None:
+        """Names joined by 'and' without commas use the fallback split."""
+        result = _split_caption_names("Smith and Jones")
+        assert result == ["Smith", "Jones"]
+
+    def test_et_al_stripped(self) -> None:
+        """'et al.' is removed before splitting."""
+        result = _split_caption_names("Smith, et al.")
+        assert result == ["Smith"]
+
+    def test_empty_string(self) -> None:
+        result = _split_caption_names("")
+        assert result == []
+
+    def test_corporate_suffix_reattached(self) -> None:
+        """Inc, LLC etc. are reattached to the preceding name."""
+        result = _split_caption_names("Acme, Inc., Beta Corp")
+        assert any("Acme" in n and "Inc" in n for n in result)
+
+    def test_single_name(self) -> None:
+        """A single name with no separator."""
+        result = _split_caption_names("Smith")
+        assert result == ["Smith"]
+
+    def test_oxford_comma(self) -> None:
+        """Oxford comma: 'A, B, and C' splitting."""
+        result = _split_caption_names("Smith, Jones, and Williams")
+        assert len(result) == 3
+
+    def test_strips_surrounding_punctuation(self) -> None:
+        """Parentheses and semicolons are stripped from fragments."""
+        result = _split_caption_names("(Smith), Jones;")
+        assert "Smith" in result
+        assert "Jones" in result
+
+    def test_empty_fragment_after_stripping(self) -> None:
+        """Fragments that are empty after stripping punctuation are skipped."""
+        # ", , Smith" — the first fragment after comma split is empty
+        result = _split_caption_names(", , Smith")
+        assert result == ["Smith"]
+
+    def test_only_punctuation_fragments(self) -> None:
+        """All-punctuation fragments produce an empty list."""
+        result = _split_caption_names("., ;, ()")
+        assert result == []
+
+
+# ---------------------------------------------------------------------------
+# _is_name_fragment — direct tests
+# ---------------------------------------------------------------------------
+
+
+class TestIsNameFragment:
+    """Tests for _is_name_fragment helper."""
+
+    def test_single_char_is_fragment(self) -> None:
+        assert _is_name_fragment("A") is True
+
+    def test_two_char_is_fragment(self) -> None:
+        assert _is_name_fragment("AB") is True
+
+    def test_three_char_with_space_not_fragment(self) -> None:
+        """Three chars with a space is not a fragment."""
+        assert _is_name_fragment("A B") is False
+
+    def test_corporate_suffix_is_fragment(self) -> None:
+        """Standalone corporate suffix should be a fragment."""
+        assert _is_name_fragment("Inc") is True
+        assert _is_name_fragment("LLC") is True
+        assert _is_name_fragment("Corp") is True
+
+    def test_real_name_not_fragment(self) -> None:
+        assert _is_name_fragment("Smith") is False
+
+    def test_initial_with_period(self) -> None:
+        """Single initial with period like 'J.' — 2 chars stripped to 1."""
+        assert _is_name_fragment("J.") is True
+
+
+# ---------------------------------------------------------------------------
+# extract_parties_from_caption — additional coverage
+# ---------------------------------------------------------------------------
+
+
+class TestExtractPartiesFromCaptionAdditional:
+    """Additional tests for extract_parties_from_caption edge cases."""
+
+    def test_duplicate_name_same_role_deduplicated(self) -> None:
+        """Duplicate plaintiff names should be deduplicated."""
+        # Construct a caption where the same name appears twice on plaintiff side
+        parties = extract_parties_from_caption("Smith, Smith v. Jones")
+        plaintiff_names = [p["name"] for p in parties if p["role"] == "plaintiff"]
+        # Smith should appear only once as plaintiff
+        assert plaintiff_names.count("Smith") == 1
+
+    def test_and_separated_parties(self) -> None:
+        """Parties separated by 'and' on the plaintiff side."""
+        parties = extract_parties_from_caption("Smith and Jones v. Williams")
+        plaintiffs = [p for p in parties if p["role"] == "plaintiff"]
+        assert len(plaintiffs) == 2
+
+    def test_none_input(self) -> None:
+        """None input returns empty list."""
+        assert extract_parties_from_caption(None) == []  # type: ignore[arg-type]
+
+    def test_no_v_separator(self) -> None:
+        """Caption without v./vs. returns empty list."""
+        assert extract_parties_from_caption("Just a random string") == []
+
+    def test_trailing_punctuation_stripped(self) -> None:
+        """Trailing commas, periods, semicolons are stripped from party names."""
+        parties = extract_parties_from_caption("Smith, v. Jones.")
+        names = [p["name"] for p in parties]
+        # Names should not end with punctuation
+        for name in names:
+            assert not name.endswith(".")
+            assert not name.endswith(",")
+
+    def test_fragment_on_defendant_side_filtered(self) -> None:
+        """Very short fragments on defendant side are filtered out."""
+        parties = extract_parties_from_caption("Smith v. A")
+        defendants = [p for p in parties if p["role"] == "defendant"]
+        # "A" is too short — should be filtered
+        assert len(defendants) == 0
+
+    def test_case_insensitive_dedup(self) -> None:
+        """Dedup is case-insensitive: 'SMITH' and 'Smith' are the same party."""
+        parties = extract_parties_from_caption("SMITH, Smith v. Jones")
+        plaintiffs = [p for p in parties if p["role"] == "plaintiff"]
+        assert len(plaintiffs) == 1
+
+    def test_name_becomes_fragment_after_rstrip(self) -> None:
+        """A name like 'A.' passes _split_caption_names (len 2) but becomes
+        a fragment after rstrip in extract_parties_from_caption (len 1)."""
+        parties = extract_parties_from_caption("A. v. Jones")
+        plaintiffs = [p for p in parties if p["role"] == "plaintiff"]
+        # "A." → "A" after rstrip → fragment → filtered
+        assert len(plaintiffs) == 0
+
+    def test_corporate_suffix_as_party_name_filtered(self) -> None:
+        """A standalone corporate suffix like 'Inc' survives _split_caption_names
+        (len 3) but is filtered by _is_name_fragment in extract_parties_from_caption."""
+        parties = extract_parties_from_caption("Inc v. Jones")
+        plaintiffs = [p for p in parties if p["role"] == "plaintiff"]
+        # "Inc" is a corporate suffix fragment — should be filtered
+        assert len(plaintiffs) == 0
