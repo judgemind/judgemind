@@ -49,8 +49,21 @@ import time
 from pathlib import Path
 from typing import Any
 
-import boto3
-import httpx
+try:
+    import boto3
+    import httpx
+except ModuleNotFoundError as exc:
+    _pkg_dir = Path(__file__).resolve().parents[1] / "packages" / "telegram-bridge"
+    print(
+        f"ERROR: Missing dependency: {exc.name}\n"
+        f"\n"
+        f"The telegram-bridge venv exists but is missing required packages.\n"
+        f"Install them with:\n"
+        f"\n"
+        f"    {_pkg_dir}/.venv/bin/pip install -e \"{_pkg_dir}[dev]\" --quiet\n",
+        file=sys.stderr,
+    )
+    sys.exit(1)
 
 # Add the packages dir to sys.path so we can import telegram_bridge.
 _REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -58,7 +71,20 @@ _BRIDGE_SRC = _REPO_ROOT / "packages" / "telegram-bridge" / "src"
 if str(_BRIDGE_SRC) not in sys.path:
     sys.path.insert(0, str(_BRIDGE_SRC))
 
-from telegram_bridge.interpreter import interpret_message  # noqa: E402
+try:
+    from telegram_bridge.interpreter import interpret_message  # noqa: E402
+except ModuleNotFoundError as exc:
+    _pkg_dir2 = Path(__file__).resolve().parents[1] / "packages" / "telegram-bridge"
+    print(
+        f"ERROR: Missing dependency: {exc.name}\n"
+        f"\n"
+        f"The telegram-bridge package is not installed in the venv.\n"
+        f"Install it with:\n"
+        f"\n"
+        f"    {_pkg_dir2}/.venv/bin/pip install -e \"{_pkg_dir2}[dev]\" --quiet\n",
+        file=sys.stderr,
+    )
+    sys.exit(1)
 
 logging.basicConfig(
     level=logging.INFO,
