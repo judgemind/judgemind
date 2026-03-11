@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
 from pathlib import Path
 
@@ -237,52 +236,6 @@ class TestNoOpMode:
             await orch.reply_status()
             await orch.notify("Test notification.")
             await orch.status_update(task="#1", state="complete", details="Done.")
-
-            commands = await orch.poll_commands()
-            assert commands == []
-
-
-# ── Command polling ──────────────────────────────────────────────────────
-
-
-class TestPollCommands:
-    async def test_poll_parses_messages_into_commands(self) -> None:
-        with mock_aws():
-            _setup_secret()
-            queue_url = _setup_sqs()
-
-            sqs = boto3.client("sqs", region_name="us-west-2")
-            for text in ["status", "start #10", "hello there"]:
-                sqs.send_message(
-                    QueueUrl=queue_url,
-                    MessageBody=json.dumps(
-                        {
-                            "text": text,
-                            "user_id": 12345,
-                            "timestamp": "2026-03-09T20:00:00+00:00",
-                        }
-                    ),
-                )
-
-            bridge = _make_bridge(sqs_queue_url=queue_url)
-            orch = OrchestratorBridge(bridge=bridge)
-            commands = await orch.poll_commands()
-
-            assert len(commands) == 3
-            kinds = {c.kind for c in commands}
-            assert CommandKind.STATUS in kinds
-            assert CommandKind.START in kinds
-            assert CommandKind.FREE_TEXT in kinds
-
-    async def test_poll_returns_empty_when_queue_empty(self) -> None:
-        with mock_aws():
-            _setup_secret()
-            queue_url = _setup_sqs()
-
-            bridge = _make_bridge(sqs_queue_url=queue_url)
-            orch = OrchestratorBridge(bridge=bridge)
-            commands = await orch.poll_commands()
-            assert commands == []
 
 
 # ── handle_command() ────────────────────────────────────────────────────
@@ -623,41 +576,6 @@ class TestReplyStatus:
             assert "paused" in body["text"].lower()
 
 
-# ── process_commands() (end-to-end) ─────────────────────────────────────
-
-
-class TestProcessCommands:
-    @respx.mock
-    async def test_process_polls_and_handles(self) -> None:
-        with mock_aws():
-            _setup_secret()
-            queue_url = _setup_sqs()
-
-            sqs = boto3.client("sqs", region_name="us-west-2")
-            sqs.send_message(
-                QueueUrl=queue_url,
-                MessageBody=json.dumps(
-                    {
-                        "text": "pause",
-                        "user_id": 12345,
-                        "timestamp": "2026-03-09T20:00:00+00:00",
-                    }
-                ),
-            )
-
-            respx.post("https://api.telegram.org/botfake-bot-token/sendMessage").mock(
-                return_value=httpx.Response(200, json={"ok": True})
-            )
-
-            bridge = _make_bridge(sqs_queue_url=queue_url)
-            orch = OrchestratorBridge(bridge=bridge)
-            results = await orch.process_commands()
-            await bridge.close()
-
-            assert len(results) == 1
-            assert orch.paused is True
-
-
 # ── update_worker() ────────────────────────────────────────────────────
 
 
@@ -684,134 +602,6 @@ class TestUpdateWorker:
             orch = OrchestratorBridge(bridge=bridge)
             orch.update_worker(99, phase="done")  # Should not raise
             assert orch.get_workers() == []
-
-
-# ── Background polling ─────────────────────────────────────────────────
-
-
-class TestBackgroundPolling:
-    async def test_start_polling_sets_polling_flag(self) -> None:
-        with mock_aws():
-            _setup_secret()
-            queue_url = _setup_sqs()
-
-            bridge = _make_bridge(sqs_queue_url=queue_url)
-            orch = OrchestratorBridge(bridge=bridge)
-
-            assert orch.polling is False
-            await orch.start_polling(interval=100.0)
-            assert orch.polling is True
-
-            await orch.stop_polling()
-            assert orch.polling is False
-
-    async def test_stop_polling_is_idempotent(self) -> None:
-        with mock_aws():
-            bridge = _make_bridge()
-            orch = OrchestratorBridge(bridge=bridge)
-
-            # Should not raise even when no task is running.
-            await orch.stop_polling()
-            await orch.stop_polling()
-
-    async def test_poll_loop_accumulates_commands(self) -> None:
-        with mock_aws():
-            _setup_secret()
-            queue_url = _setup_sqs()
-
-            sqs = boto3.client("sqs", region_name="us-west-2")
-            sqs.send_message(
-                QueueUrl=queue_url,
-                MessageBody=json.dumps(
-                    {
-                        "text": "status",
-                        "user_id": 12345,
-                        "timestamp": "2026-03-09T20:00:00+00:00",
-                    }
-                ),
-            )
-
-            bridge = _make_bridge(sqs_queue_url=queue_url)
-            orch = OrchestratorBridge(bridge=bridge)
-
-            # Start polling with a short interval.
-            await orch.start_polling(interval=0.05)
-
-            # Give the loop time to run at least once.
-            await asyncio.sleep(0.2)
-
-            commands = orch.drain_pending_commands()
-            assert len(commands) >= 1
-            assert commands[0].kind == CommandKind.STATUS
-
-            await orch.stop_polling()
-
-    async def test_drain_clears_pending(self) -> None:
-        with mock_aws():
-            _setup_secret()
-            queue_url = _setup_sqs()
-
-            sqs = boto3.client("sqs", region_name="us-west-2")
-            sqs.send_message(
-                QueueUrl=queue_url,
-                MessageBody=json.dumps(
-                    {
-                        "text": "pause",
-                        "user_id": 12345,
-                        "timestamp": "2026-03-09T20:00:00+00:00",
-                    }
-                ),
-            )
-
-            bridge = _make_bridge(sqs_queue_url=queue_url)
-            orch = OrchestratorBridge(bridge=bridge)
-
-            await orch.start_polling(interval=0.05)
-            await asyncio.sleep(0.2)
-
-            first_drain = orch.drain_pending_commands()
-            assert len(first_drain) >= 1
-
-            # Second drain should be empty — pending was cleared.
-            second_drain = orch.drain_pending_commands()
-            assert second_drain == []
-
-            await orch.stop_polling()
-
-    async def test_restart_polling_replaces_task(self) -> None:
-        with mock_aws():
-            _setup_secret()
-            queue_url = _setup_sqs()
-
-            bridge = _make_bridge(sqs_queue_url=queue_url)
-            orch = OrchestratorBridge(bridge=bridge)
-
-            await orch.start_polling(interval=100.0)
-            first_task = orch._poll_task
-
-            await orch.start_polling(interval=50.0)
-            second_task = orch._poll_task
-
-            assert first_task is not second_task
-            assert first_task is not None and first_task.done()
-            assert orch.polling is True
-
-            await orch.stop_polling()
-
-    async def test_polling_noop_when_disabled(self) -> None:
-        with mock_aws():
-            # No secret → bridge disabled
-            bridge = _make_bridge()
-            orch = OrchestratorBridge(bridge=bridge)
-
-            await orch.start_polling(interval=0.05)
-            await asyncio.sleep(0.2)
-
-            # Should accumulate no commands (poll returns []).
-            commands = orch.drain_pending_commands()
-            assert commands == []
-
-            await orch.stop_polling()
 
 
 # ── File-based inbox (read_inbox) ──────────────────────────────────────

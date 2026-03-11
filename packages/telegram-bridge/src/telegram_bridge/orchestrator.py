@@ -9,7 +9,6 @@ All functions are no-ops when Telegram is not configured.
 
 from __future__ import annotations
 
-import asyncio
 import datetime
 import fcntl
 import json
@@ -23,7 +22,6 @@ from typing import Any
 from .client import TelegramBridge
 from .formatting import DEFAULT_GITHUB_REPO
 from .interpreter import build_orchestrator_status
-from .models import Message
 
 logger = logging.getLogger(__name__)
 
@@ -255,8 +253,8 @@ class OrchestratorBridge:
 
     * **Lifecycle notifications** — ``session_started``, ``task_started``,
       ``task_completed``, ``task_failed``, ``session_ended``.
-    * **Inbound command polling** — ``poll_commands`` reads the SQS queue,
-      parses each message into a :class:`Command`, and returns them.
+    * **File-based inbox** — ``read_inbox`` reads commands from the file-based
+      inbox written by the responder daemon (``scripts/tg-responder.py``).
     * **Status reply** — ``reply_status`` sends a formatted summary of
       active workers back to Telegram.
     * **Pause/resume** — ``paused`` flag that the orchestrator can check
@@ -274,11 +272,8 @@ class OrchestratorBridge:
     stop_requests_path: str | None = None
     orchestrator_inbox_path: str | None = None
     _workers: dict[int, WorkerInfo] = field(default_factory=dict)
-    _pending_commands: list[Command] = field(default_factory=list)
     _stopped_issues: set[int] = field(default_factory=set)
     _recently_completed: list[dict[str, Any]] = field(default_factory=list)
-    _poll_task: asyncio.Task[None] | None = field(default=None, repr=False)
-    _poll_interval: float = field(default=30.0, repr=False)
 
     def __post_init__(self) -> None:
         """Load persisted state from *state_file* if it exists."""
@@ -580,20 +575,6 @@ class OrchestratorBridge:
         """
         await self.bridge.status_update(task=task, state=state, details=details, repo=repo)
 
-    # ── Inbound command polling ─────────────────────────────────────────
-
-    async def poll_commands(self) -> list[Command]:
-        """Poll for inbound messages and parse them into commands.
-
-        Returns an empty list if the bridge is disabled or the queue is empty.
-        """
-        messages: list[Message] = await self.bridge.poll()
-        commands: list[Command] = []
-        for msg in messages:
-            cmd = parse_command(msg.text)
-            commands.append(cmd)
-        return commands
-
     # ── Built-in command handlers ───────────────────────────────────────
 
     async def reply_status(self) -> None:
@@ -706,60 +687,6 @@ class OrchestratorBridge:
             result["needs_reply"] = True
 
         return result
-
-    async def process_commands(self) -> list[dict[str, Any]]:
-        """Poll for commands and handle each one. Returns list of result dicts.
-
-        The orchestrator should inspect any results with ``action`` keys
-        and act accordingly (e.g. spawn a task agent for ``start_task``).
-        """
-        commands = await self.poll_commands()
-        results = []
-        for cmd in commands:
-            result = await self.handle_command(cmd)
-            results.append(result)
-        return results
-
-    # ── Background polling ───────────────────────────────────────────
-
-    async def start_polling(self, interval: float = 30.0) -> None:
-        """Start a background task that polls for commands on *interval* seconds.
-
-        Commands are accumulated in an internal buffer and can be retrieved
-        with :meth:`drain_pending_commands`.  If polling is already active
-        the existing task is cancelled and restarted with the new interval.
-
-        No-op if the underlying bridge is disabled.
-        """
-        await self.stop_polling()
-        self._poll_interval = interval
-        self._poll_task = asyncio.create_task(self._poll_loop())
-
-    async def stop_polling(self) -> None:
-        """Cancel the background polling task if one is running."""
-        if self._poll_task is not None and not self._poll_task.done():
-            self._poll_task.cancel()
-            try:
-                await self._poll_task
-            except asyncio.CancelledError:
-                pass
-        self._poll_task = None
-
-    @property
-    def polling(self) -> bool:
-        """Return ``True`` if background polling is active."""
-        return self._poll_task is not None and not self._poll_task.done()
-
-    def drain_pending_commands(self) -> list[Command]:
-        """Return and clear all commands accumulated by background polling.
-
-        This is the primary way for the orchestrator to consume commands
-        when using :meth:`start_polling`.  The returned list may be empty
-        if no commands have arrived since the last drain.
-        """
-        commands = list(self._pending_commands)
-        self._pending_commands.clear()
-        return commands
 
     # ── File-based inbox (for use with tg-responder.py) ────────────────
 
@@ -881,18 +808,6 @@ class OrchestratorBridge:
 
         return instructions
 
-    async def _poll_loop(self) -> None:
-        """Internal loop that polls SQS on a fixed interval."""
-        while True:
-            try:
-                commands = await self.poll_commands()
-                self._pending_commands.extend(commands)
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                logger.warning("Background poll failed", exc_info=True)
-            await asyncio.sleep(self._poll_interval)
-
 
 def create_orchestrator_bridge(
     *,
@@ -918,8 +833,7 @@ def create_orchestrator_bridge(
     the Claude interpreter.
 
     If *inbox_path* is provided, :meth:`OrchestratorBridge.read_inbox` will
-    read commands from that file (written by ``scripts/tg-responder.py``)
-    instead of polling SQS directly.
+    read commands from that file (written by ``scripts/tg-responder.py``).
 
     If *stop_requests_path* is provided,
     :meth:`OrchestratorBridge.read_stop_requests` will read stop requests
