@@ -3,10 +3,15 @@
 from __future__ import annotations
 
 import json
+import time
 from unittest.mock import MagicMock, patch
+
+import pytest
 
 from telegram_bridge.interpreter import (
     InterpretedMessage,
+    RateLimiter,
+    RateLimitError,
     _parse_response,
     build_orchestrator_status,
     interpret_message,
@@ -134,7 +139,7 @@ class TestInterpretMessage:
             json.dumps({"reply": "All systems running.", "actions": []})
         )
 
-        result = interpret_message(text="status", api_key="test-key")
+        result = interpret_message(text="status", api_key="test-key", rate_limiter=None)
 
         assert isinstance(result, InterpretedMessage)
         assert result.reply == "All systems running."
@@ -154,7 +159,7 @@ class TestInterpretMessage:
             )
         )
 
-        result = interpret_message(text="please work on 42", api_key="test-key")
+        result = interpret_message(text="please work on 42", api_key="test-key", rate_limiter=None)
 
         assert result.reply == "Starting issue 42."
         assert len(result.actions) == 1
@@ -180,6 +185,7 @@ class TestInterpretMessage:
             text="how many agents?",
             orchestrator_status=status,
             api_key="test-key",
+            rate_limiter=None,
         )
 
         # Verify the orchestrator status was passed in the user message.
@@ -195,7 +201,7 @@ class TestInterpretMessage:
             json.dumps({"reply": "ok", "actions": []})
         )
 
-        interpret_message(text="hi", api_key="my-secret-key")
+        interpret_message(text="hi", api_key="my-secret-key", rate_limiter=None)
 
         mock_anthropic_cls.assert_called_once_with(api_key="my-secret-key")
 
@@ -208,7 +214,7 @@ class TestInterpretMessage:
             '```json\n{"reply": "Paused.", "actions": [{"type": "pause"}]}\n```'
         )
 
-        result = interpret_message(text="pause everything", api_key="test-key")
+        result = interpret_message(text="pause everything", api_key="test-key", rate_limiter=None)
 
         assert result.reply == "Paused."
         assert len(result.actions) == 1
@@ -223,7 +229,7 @@ class TestInterpretMessage:
             "I'm not sure what you mean."
         )
 
-        result = interpret_message(text="blah", api_key="test-key")
+        result = interpret_message(text="blah", api_key="test-key", rate_limiter=None)
 
         # Should gracefully handle non-JSON by using raw text as reply.
         assert "not sure" in result.reply.lower()
@@ -237,7 +243,7 @@ class TestInterpretMessage:
             json.dumps({"reply": "ok", "actions": []})
         )
 
-        interpret_message(text="hi", api_key="test-key")
+        interpret_message(text="hi", api_key="test-key", rate_limiter=None)
 
         call_args = mock_client.messages.create.call_args
         assert "haiku" in call_args.kwargs["model"]
@@ -250,7 +256,82 @@ class TestInterpretMessage:
             json.dumps({"reply": "ok", "actions": []})
         )
 
-        interpret_message(text="hi", api_key="test-key", model="claude-sonnet-4-20250514")
+        interpret_message(
+            text="hi", api_key="test-key", model="claude-sonnet-4-20250514", rate_limiter=None
+        )
 
         call_args = mock_client.messages.create.call_args
         assert call_args.kwargs["model"] == "claude-sonnet-4-20250514"
+
+    @patch("telegram_bridge.interpreter.anthropic.Anthropic")
+    def test_rate_limiter_blocks_excessive_calls(self, mock_anthropic_cls: MagicMock) -> None:
+        mock_client = MagicMock()
+        mock_anthropic_cls.return_value = mock_client
+        mock_client.messages.create.return_value = _make_mock_response(
+            json.dumps({"reply": "ok", "actions": []})
+        )
+
+        limiter = RateLimiter(max_calls=1, window_seconds=60.0)
+
+        # First call should succeed.
+        interpret_message(text="hi", api_key="test-key", rate_limiter=limiter)
+
+        # Second call should be rate-limited.
+        with pytest.raises(RateLimitError):
+            interpret_message(text="hi again", api_key="test-key", rate_limiter=limiter)
+
+    @patch("telegram_bridge.interpreter.anthropic.Anthropic")
+    def test_no_rate_limiter(self, mock_anthropic_cls: MagicMock) -> None:
+        mock_client = MagicMock()
+        mock_anthropic_cls.return_value = mock_client
+        mock_client.messages.create.return_value = _make_mock_response(
+            json.dumps({"reply": "ok", "actions": []})
+        )
+
+        # Both calls should succeed with no rate limiter.
+        interpret_message(text="hi", api_key="test-key", rate_limiter=None)
+        interpret_message(text="hi again", api_key="test-key", rate_limiter=None)
+
+        assert mock_client.messages.create.call_count == 2
+
+
+# ── RateLimiter ────────────────────────────────────────────────────────
+
+
+class TestRateLimiter:
+    def test_allows_within_limit(self) -> None:
+        limiter = RateLimiter(max_calls=3, window_seconds=60.0)
+        limiter.acquire()
+        limiter.acquire()
+        limiter.acquire()
+        # All three should succeed.
+
+    def test_blocks_over_limit(self) -> None:
+        limiter = RateLimiter(max_calls=2, window_seconds=60.0)
+        limiter.acquire()
+        limiter.acquire()
+        with pytest.raises(RateLimitError) as exc_info:
+            limiter.acquire()
+        assert exc_info.value.retry_after > 0
+
+    def test_window_expiry(self) -> None:
+        limiter = RateLimiter(max_calls=1, window_seconds=0.1)
+        limiter.acquire()
+        # Wait for the window to expire.
+        time.sleep(0.15)
+        # Should succeed after window expires.
+        limiter.acquire()
+
+    def test_reset_clears_timestamps(self) -> None:
+        limiter = RateLimiter(max_calls=1, window_seconds=60.0)
+        limiter.acquire()
+        limiter.reset()
+        # Should succeed after reset.
+        limiter.acquire()
+
+    def test_retry_after_is_positive(self) -> None:
+        limiter = RateLimiter(max_calls=1, window_seconds=30.0)
+        limiter.acquire()
+        with pytest.raises(RateLimitError) as exc_info:
+            limiter.acquire()
+        assert 0 < exc_info.value.retry_after <= 30.0

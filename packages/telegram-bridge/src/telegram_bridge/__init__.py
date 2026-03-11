@@ -2,7 +2,13 @@
 
 from .client import TelegramBridge
 from .formatting import linkify_github_refs
-from .interpreter import InterpretedMessage, build_orchestrator_status, interpret_message
+from .interpreter import (
+    InterpretedMessage,
+    RateLimiter,
+    RateLimitError,
+    build_orchestrator_status,
+    interpret_message,
+)
 from .models import Message, SentMessage
 from .orchestrator import Command, CommandKind, OrchestratorBridge, create_orchestrator_bridge
 
@@ -10,6 +16,8 @@ __all__ = [
     "Command",
     "CommandKind",
     "InterpretedMessage",
+    "RateLimitError",
+    "RateLimiter",
     "Message",
     "OrchestratorBridge",
     "SentMessage",
