@@ -30,6 +30,10 @@ from typing import TYPE_CHECKING, Any
 import psycopg
 import psycopg.errors
 
+from courts.ca.la_dept_judges import (
+    fetch_department_judge_mapping,
+    lookup_judge_for_department,
+)
 from framework.search.indexer import IndexingConsumer
 from framework.search.mapping import TENTATIVE_RULINGS_ALIAS
 
@@ -197,9 +201,36 @@ class IngestionWorker:
         if self._llm_client is None:
             logger.warning("LLM API key not set — LLM extraction disabled, using regex-only mode")
 
+        # LA County department-to-judge mapping — lazy-loaded on first LA event.
+        # None means "not yet fetched"; empty dict means "fetch failed or empty".
+        self._la_dept_map: dict[str, str] | None = None
+
     # ------------------------------------------------------------------
     # Public interface
     # ------------------------------------------------------------------
+
+    def _get_la_dept_map(self) -> dict[str, str]:
+        """Return the LA County department-to-judge mapping, fetching lazily on first call.
+
+        The mapping is cached for the lifetime of the worker instance. If the
+        fetch fails (network error, page changed), returns an empty dict and
+        logs a warning — the worker continues without dept-based judge lookup.
+        """
+        if self._la_dept_map is None:
+            try:
+                self._la_dept_map = fetch_department_judge_mapping()
+                logger.info(
+                    "Loaded LA department-to-judge mapping",
+                    extra={"department_count": len(self._la_dept_map)},
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Failed to fetch LA department-to-judge mapping — "
+                    "dept-based judge lookup disabled: %s",
+                    exc,
+                )
+                self._la_dept_map = {}
+        return self._la_dept_map
 
     def _get_connection(self) -> psycopg.Connection:
         """Return the persistent Postgres connection, creating or reconnecting as needed.
@@ -482,6 +513,26 @@ class IngestionWorker:
                 logger.info(
                     "Extracted judge_name from ruling text (regex fallback)",
                     extra={"document_id": document_id, "judge_name": judge_name},
+                )
+
+        # LA County department-to-judge lookup (#584).
+        # When LLM and regex extraction both fail to find a judge name but a
+        # department is available, look up the judge via the LA judicial officer
+        # directory mapping. This handles rulings where the judge name isn't
+        # present in the text but the department is known.
+        if not judge_name and department and state == "CA" and county == "Los Angeles":
+            dept_map = self._get_la_dept_map()
+            dept_judge = lookup_judge_for_department(dept_map, department)
+            if dept_judge:
+                judge_name = dept_judge
+                extraction_methods["judge_name"] = "dept_lookup"
+                logger.info(
+                    "Resolved judge_name from LA department mapping",
+                    extra={
+                        "document_id": document_id,
+                        "department": department,
+                        "judge_name": judge_name,
+                    },
                 )
 
         # Fallback: if no parties yet but we have a case title with "v.",
