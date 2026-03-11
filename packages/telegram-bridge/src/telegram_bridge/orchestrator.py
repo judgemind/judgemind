@@ -137,8 +137,10 @@ class OrchestratorBridge:
     paused: bool = False
     state_file: str | None = None
     inbox_path: str | None = None
+    stop_requests_path: str | None = None
     _workers: dict[int, WorkerInfo] = field(default_factory=dict)
     _pending_commands: list[Command] = field(default_factory=list)
+    _stopped_issues: set[int] = field(default_factory=set)
     _poll_task: asyncio.Task[None] | None = field(default=None, repr=False)
     _poll_interval: float = field(default=30.0, repr=False)
 
@@ -200,6 +202,84 @@ class OrchestratorBridge:
         path = Path(self.state_file)
         if path.exists():
             path.unlink()
+
+    def refresh_state(self) -> None:
+        """Re-read the state file to pick up external changes.
+
+        The responder daemon writes ``paused`` and worker state directly
+        to the state file.  The orchestrator should call this method
+        before each spawn decision to pick up those changes.
+        """
+        self._load_state()
+
+    def read_stop_requests(self) -> list[int]:
+        """Read and clear stop requests written by the responder daemon.
+
+        The responder writes stop requests to *stop_requests_path* as a
+        JSON array of objects with an ``issue_number`` field.  This method
+        reads the file atomically (with ``fcntl.flock``), extracts the
+        issue numbers, truncates the file, and merges the numbers into
+        the internal ``_stopped_issues`` set.
+
+        Returns the list of *newly read* issue numbers from this call.
+        Previously read stop requests remain in ``_stopped_issues`` until
+        cleared via :meth:`clear_stopped_issues`.
+        """
+        if not self.stop_requests_path:
+            return []
+
+        path = Path(self.stop_requests_path)
+        if not path.exists():
+            return []
+
+        new_issues: list[int] = []
+
+        try:
+            fd = os.open(str(path), os.O_RDWR)
+        except OSError:
+            return []
+
+        try:
+            with os.fdopen(fd, "r+") as f:
+                fcntl.flock(f, fcntl.LOCK_EX)
+                content = f.read()
+                if not content.strip():
+                    return []
+
+                try:
+                    entries = json.loads(content)
+                except (json.JSONDecodeError, ValueError):
+                    logger.warning("Corrupt stop_requests file — clearing it.")
+                    entries = []
+
+                # Truncate the file while we hold the lock.
+                f.seek(0)
+                f.truncate()
+
+            for entry in entries:
+                if isinstance(entry, dict):
+                    issue_num = entry.get("issue_number")
+                    if isinstance(issue_num, int):
+                        new_issues.append(issue_num)
+                        self._stopped_issues.add(issue_num)
+
+        except Exception:
+            logger.warning("Failed to read stop_requests file", exc_info=True)
+
+        return new_issues
+
+    def is_issue_stopped(self, issue_number: int) -> bool:
+        """Return ``True`` if *issue_number* has been stopped via a stop request."""
+        return issue_number in self._stopped_issues
+
+    def clear_stopped_issues(self) -> None:
+        """Clear all accumulated stop requests."""
+        self._stopped_issues.clear()
+
+    @property
+    def stopped_issues(self) -> frozenset[int]:
+        """Return a snapshot of all stopped issue numbers."""
+        return frozenset(self._stopped_issues)
 
     # ── Lifecycle notifications ─────────────────────────────────────────
 
@@ -499,6 +579,7 @@ def create_orchestrator_bridge(
     repo: str = DEFAULT_GITHUB_REPO,
     state_file: str | None = None,
     inbox_path: str | None = None,
+    stop_requests_path: str | None = None,
 ) -> OrchestratorBridge:
     """Factory that creates an :class:`OrchestratorBridge` with a fresh client.
 
@@ -510,6 +591,10 @@ def create_orchestrator_bridge(
     read commands from that file (written by ``scripts/tg-poll-daemon.py``)
     instead of polling SQS directly.
 
+    If *stop_requests_path* is provided,
+    :meth:`OrchestratorBridge.read_stop_requests` will read stop requests
+    written by the responder daemon (``scripts/tg-responder.py``).
+
     The caller can also pass an existing :class:`TelegramBridge` directly
     to the dataclass constructor for testing.
     """
@@ -519,5 +604,9 @@ def create_orchestrator_bridge(
         region_name=region_name,
     )
     return OrchestratorBridge(
-        bridge=bridge, repo=repo, state_file=state_file, inbox_path=inbox_path
+        bridge=bridge,
+        repo=repo,
+        state_file=state_file,
+        inbox_path=inbox_path,
+        stop_requests_path=stop_requests_path,
     )
