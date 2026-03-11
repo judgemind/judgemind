@@ -1,8 +1,8 @@
 import { gql } from '@apollo/client';
 import { notFound } from 'next/navigation';
 import { createApolloClient } from '@/lib/apollo-client';
-import { buildCaseHeading } from '@/lib/display-helpers';
-import { CaseDetail, formatLabel } from './CaseDetail';
+import { buildCaseHeading, formatLabel } from '@/lib/display-helpers';
+import { CaseDetail } from './CaseDetail';
 
 const CASE_QUERY = gql`
   query CaseDetail($id: ID!) {

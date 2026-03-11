@@ -1,9 +1,32 @@
 import { describe, it, expect } from 'vitest';
 import {
   detectParagraphs,
+  formatLabel,
   stripBoilerplate,
   cleanRulingText,
 } from '../display-helpers';
+
+// ---------------------------------------------------------------------------
+// formatLabel (shared between server & client — regression test for #643)
+// ---------------------------------------------------------------------------
+
+describe('formatLabel', () => {
+  it('returns em-dash for null', () => {
+    expect(formatLabel(null)).toBe('\u2014');
+  });
+
+  it('converts snake_case to Title Case', () => {
+    expect(formatLabel('granted_in_part')).toBe('Granted In Part');
+  });
+
+  it('uppercases known abbreviations', () => {
+    expect(formatLabel('msj')).toBe('MSJ');
+  });
+
+  it('handles anti_slapp as a known compound label', () => {
+    expect(formatLabel('anti_slapp')).toBe('Anti-SLAPP');
+  });
+});
 
 // ---------------------------------------------------------------------------
 // stripBoilerplate

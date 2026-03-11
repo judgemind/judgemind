@@ -20,6 +20,34 @@ export function buildJudgeHeading(
 }
 
 // ---------------------------------------------------------------------------
+// Generic label formatting (shared between server & client components)
+// ---------------------------------------------------------------------------
+
+/**
+ * Known full label mappings (lowercased key -> display label).
+ * Checked before generic title-case logic so compound terms render correctly.
+ */
+const LABEL_MAP: Record<string, string> = {
+  anti_slapp: 'Anti-SLAPP',
+};
+
+/** Abbreviations that should stay fully uppercase. */
+const UPPERCASE_LABEL_WORDS = new Set(['msj', 'mtd', 'mil']);
+
+/** Format a snake_case string to Title Case, preserving known abbreviations.
+ *  Returns an em-dash for null values. */
+export function formatLabel(value: string | null): string {
+  if (!value) return '\u2014';
+  const key = value.toLowerCase();
+  if (LABEL_MAP[key]) return LABEL_MAP[key];
+  return key
+    .replace(/_/g, ' ')
+    .split(' ')
+    .map((word) => UPPERCASE_LABEL_WORDS.has(word) ? word.toUpperCase() : (word.charAt(0).toUpperCase() + word.slice(1)))
+    .join(' ');
+}
+
+// ---------------------------------------------------------------------------
 // Ruling text cleanup (display-time)
 // ---------------------------------------------------------------------------
 // Cleans ruling text for display in the frontend. This is a safety net for

@@ -4,7 +4,7 @@ import { useState } from 'react';
 import { useQuery, gql } from '@apollo/client';
 import Link from 'next/link';
 import { formatDate, formatOutcome } from '../../rulings/RulingsFeed';
-import { cleanRulingText } from '../../../lib/display-helpers';
+import { cleanRulingText, formatLabel } from '../../../lib/display-helpers';
 
 const CASE_QUERY = gql`
   query CaseDetail($id: ID!) {
@@ -158,29 +158,6 @@ export function truncateText(text: string, maxLen: number): string {
     return truncated.slice(0, lastSpace) + '\u2026';
   }
   return truncated + '\u2026';
-}
-
-/**
- * Known full label mappings (lowercased key -> display label).
- * Checked before generic title-case logic so compound terms render correctly.
- */
-const LABEL_MAP: Record<string, string> = {
-  anti_slapp: 'Anti-SLAPP',
-};
-
-/** Abbreviations that should stay fully uppercase. */
-const UPPERCASE_LABEL_WORDS = new Set(['msj', 'mtd', 'mil']);
-
-/** Format a snake_case string to Title Case, preserving known abbreviations. */
-export function formatLabel(value: string | null): string {
-  if (!value) return '\u2014';
-  const key = value.toLowerCase();
-  if (LABEL_MAP[key]) return LABEL_MAP[key];
-  return key
-    .replace(/_/g, ' ')
-    .split(' ')
-    .map((word) => UPPERCASE_LABEL_WORDS.has(word) ? word.toUpperCase() : (word.charAt(0).toUpperCase() + word.slice(1)))
-    .join(' ');
 }
 
 /**

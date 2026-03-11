@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
-import { formatLabel, truncateText, groupParties } from '../CaseDetail';
+import { truncateText, groupParties } from '../CaseDetail';
+import { formatLabel } from '../../../../lib/display-helpers';
 
 // ---------------------------------------------------------------------------
 // formatLabel
