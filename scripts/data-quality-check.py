@@ -14,6 +14,8 @@ Options:
     --text              Human-readable text output.
     --county NAME       Check only the specified county.
     --update-baselines  Snapshot current field completeness as baselines (ratchet up only).
+    --store-results     Store check results to S3 for trend analysis.
+    --weekly-summary    Generate a markdown weekly summary from stored snapshots.
 
 Exit code: 0 if all healthy, 1 if alerts found.
 """
@@ -36,8 +38,17 @@ import tempfile
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 import psycopg
+
+from dq_trend_storage import (
+    Snapshot,
+    detect_trends,
+    generate_weekly_summary,
+    load_snapshots,
+    store_snapshot,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -58,7 +69,7 @@ FREQUENT_SCRAPER_STALE_HOURS = 2
 
 # Field completeness regression thresholds (percentage points below baseline).
 FIELD_DROP_P1_THRESHOLD = 10.0  # >10pp drop = p1
-FIELD_DROP_P2_THRESHOLD = 5.0   # 5-10pp drop = p2
+FIELD_DROP_P2_THRESHOLD = 5.0  # 5-10pp drop = p2
 
 # Window for recent-only field completeness checks (days).
 FIELD_COMPLETENESS_WINDOW_DAYS = 7
@@ -314,8 +325,7 @@ def _query_field_completeness(
             }
 
             result[county_name] = {
-                field: round(count / total * 100, 1)
-                for field, count in counts.items()
+                field: round(count / total * 100, 1) for field, count in counts.items()
             }
 
     return result
@@ -578,6 +588,58 @@ def check_scraper_staleness(
     return alerts
 
 
+@dataclass
+class CheckResult:
+    """Full result from a data quality check run."""
+
+    alerts: list[Alert]
+    county_metrics: dict[str, dict[str, Any]]
+
+
+def _collect_county_metrics(
+    conn: psycopg.Connection,  # type: ignore[type-arg]
+    now: datetime,
+    county: str | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Collect per-county metrics for snapshot storage.
+
+    Gathers ruling counts and field completeness into a dict suitable
+    for storing as a snapshot.
+
+    Args:
+        conn: Database connection.
+        now: Current timestamp for time calculations.
+        county: Optional county filter.
+
+    Returns:
+        Dict mapping county name to metrics dict.
+    """
+    county_filter, county_params = _build_county_filter(county)
+    result: dict[str, dict[str, Any]] = {}
+
+    # Get 24h ruling counts
+    cutoff_24h = now - timedelta(hours=24)
+    with conn.cursor() as cur:
+        cur.execute(
+            RULING_COUNTS_24H_QUERY.format(county_filter=county_filter),
+            (cutoff_24h, *county_params),
+        )
+        for row in cur.fetchall():
+            county_name, count = row[0], row[1]
+            if county_name not in result:
+                result[county_name] = {}
+            result[county_name]["ruling_count_24h"] = count
+
+    # Get field completeness
+    field_completeness = _query_field_completeness(conn, now, county)
+    for county_name, fields in field_completeness.items():
+        if county_name not in result:
+            result[county_name] = {}
+        result[county_name]["field_completeness"] = fields
+
+    return result
+
+
 def run_checks(
     dsn: str,
     *,
@@ -614,11 +676,55 @@ def run_checks(
             current = _query_field_completeness(conn, now, county)
             save_field_baselines(current, baselines_path)
         else:
-            alerts.extend(
-                check_field_completeness(conn, now, field_baselines, county)
-            )
+            alerts.extend(check_field_completeness(conn, now, field_baselines, county))
 
     return alerts
+
+
+def run_checks_full(
+    dsn: str,
+    *,
+    county: str | None = None,
+    baselines_path: Path | None = None,
+    now: datetime | None = None,
+    update_baselines: bool = False,
+) -> CheckResult:
+    """Run all data quality checks and collect county metrics.
+
+    Like ``run_checks`` but also returns the per-county metrics snapshot
+    needed for trend storage.
+
+    Args:
+        dsn: Database connection string.
+        county: Optional county name filter.
+        baselines_path: Path to baselines JSON file.
+        now: Override current time (for testing).
+        update_baselines: If True, snapshot current field completeness
+            as baselines (ratchet up only) and skip alerting.
+
+    Returns:
+        CheckResult with alerts and county metrics.
+    """
+    if now is None:
+        now = datetime.now(UTC)
+
+    baselines = load_baselines(baselines_path)
+    field_baselines = load_field_baselines(baselines_path)
+    alerts: list[Alert] = []
+
+    with psycopg.connect(dsn) as conn:
+        alerts.extend(check_ingest_rates(conn, now, baselines, county))
+        alerts.extend(check_scraper_staleness(conn, now, baselines, county))
+
+        if update_baselines:
+            current = _query_field_completeness(conn, now, county)
+            save_field_baselines(current, baselines_path)
+        else:
+            alerts.extend(check_field_completeness(conn, now, field_baselines, county))
+
+        county_metrics = _collect_county_metrics(conn, now, county)
+
+    return CheckResult(alerts=alerts, county_metrics=county_metrics)
 
 
 def format_json(alerts: list[Alert]) -> str:
@@ -964,7 +1070,32 @@ def main() -> None:
         action="store_true",
         help="Snapshot current field completeness as baselines (ratchet up only).",
     )
+    parser.add_argument(
+        "--store-results",
+        action="store_true",
+        default=False,
+        help="Store check results to S3 for trend analysis.",
+    )
+    parser.add_argument(
+        "--s3-bucket",
+        type=str,
+        default="judgemind-assets-dev",
+        help="S3 bucket for trend storage (default: judgemind-assets-dev).",
+    )
+    parser.add_argument(
+        "--weekly-summary",
+        action="store_true",
+        default=False,
+        help="Generate a markdown weekly summary from stored snapshots.",
+    )
     args = parser.parse_args()
+
+    # Weekly summary mode: load snapshots from S3 and generate report.
+    # Does not require a database connection.
+    if args.weekly_summary:
+        snapshots = load_snapshots(bucket=args.s3_bucket)
+        print(generate_weekly_summary(snapshots))
+        sys.exit(0)
 
     dsn = os.environ.get("DATABASE_URL")
     if not dsn:
@@ -972,12 +1103,47 @@ def main() -> None:
         sys.exit(1)
 
     baselines_path = Path(args.baselines) if args.baselines else None
-    alerts = run_checks(
-        dsn,
-        county=args.county,
-        baselines_path=baselines_path,
-        update_baselines=args.update_baselines,
-    )
+
+    if args.store_results:
+        # Use run_checks_full to also collect county metrics for storage.
+        check_result = run_checks_full(
+            dsn,
+            county=args.county,
+            baselines_path=baselines_path,
+            update_baselines=args.update_baselines,
+        )
+        alerts = check_result.alerts
+        now = datetime.now(UTC)
+
+        snapshot = Snapshot(
+            timestamp=now.isoformat(),
+            county_metrics=check_result.county_metrics,
+            alerts=[asdict(a) for a in alerts],
+        )
+        store_snapshot(snapshot, bucket=args.s3_bucket)
+
+        # Also run trend detection and include trend alerts in output.
+        snapshots = load_snapshots(bucket=args.s3_bucket, now=now)
+        trend_alerts = detect_trends(snapshots, now=now)
+        if trend_alerts:
+            for ta in trend_alerts:
+                alerts.append(
+                    Alert(
+                        county=ta.county,
+                        metric=ta.metric,
+                        severity=ta.severity,
+                        expected=ta.prior_avg,
+                        actual=ta.current_avg,
+                        message=ta.message,
+                    )
+                )
+    else:
+        alerts = run_checks(
+            dsn,
+            county=args.county,
+            baselines_path=baselines_path,
+            update_baselines=args.update_baselines,
+        )
 
     if args.text:
         print(format_text(alerts))
