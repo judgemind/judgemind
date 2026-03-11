@@ -183,11 +183,13 @@ All checks must show `SUCCESS` or `SKIPPED`. Any `FAILURE` goes to 4.7.
 
 #### 4.10 — Verify deployment (after merge, deployed services only)
 
-Skip for library, tooling, docs, or CI-only changes. For deployed code (API, scrapers, web, infra):
+Skip for library, tooling, docs, or CI-only changes. For deployed code (API, scrapers, infra):
 
 1. Watch the deploy workflow triggered by the merge to `main` (`gh run watch`).
 2. If deploy **fails**: file a `priority/p1` issue, reference the merged PR, add `agent/ready`.
 3. If deploy **succeeds**: smoke-test the deployed environment where feasible.
+
+For **web frontend** changes (`packages/web/`): Vercel deploys automatically via its GitHub App — there is no GitHub Actions workflow to watch. Instead, check the commit status on the merge commit (Vercel posts `deployment/vercel` status) or check the Vercel dashboard. Smoke-test by loading `https://dev.judgemind.org` after the deploy completes.
 
 #### 4.11 — Remove your worktree
 
@@ -220,6 +222,33 @@ When operating as an agent in this repo:
 - Terraform state: S3 bucket `judgemind-terraform-state`, DynamoDB lock table `judgemind-terraform-locks`
 - Document archive: S3 bucket `judgemind-document-archive-dev`
 - Assets: S3 bucket `judgemind-assets-dev`
+
+### Web Frontend (Vercel)
+
+The Next.js web app (`packages/web/`) is deployed on **Vercel** with automatic Git-based deployments. Vercel watches the `judgemind/judgemind` repo and deploys on every push to `main` (production) and on every PR branch (preview).
+
+**Infrastructure:** managed by Terraform module `vercel-web` in `infra/terraform/environments/hosting/`. The Vercel API token is stored in Secrets Manager at `judgemind/vercel/api-token`.
+
+**Environments:**
+
+| Environment | URL | Vercel project | Trigger |
+|---|---|---|---|
+| Dev | `dev.judgemind.org` | `judgemind-web-dev` | Push to `main` |
+| Preview | `*.vercel.app` (auto-generated) | `judgemind-web-dev` | Push to any PR branch |
+
+**Environment variables** (set in Vercel project, managed by Terraform):
+- `NEXT_PUBLIC_GRAPHQL_URL` = `https://dev.api.judgemind.org/graphql`
+
+**Checking deploy status:**
+```
+# List recent deployments (requires Vercel CLI: npm i -g vercel)
+vercel list judgemind-web-dev --token "$VERCEL_API_TOKEN"
+
+# Or check from the Vercel dashboard:
+# https://vercel.com/judgemind2026-7926s-projects/judgemind-web-dev/deployments
+```
+
+There is **no GitHub Actions deploy workflow** for the web frontend — Vercel handles deployments directly via its GitHub App integration. The `deploy-production.yml` workflow is for the scraper (ECS), not the web app. To check whether a frontend deploy succeeded after merging to `main`, check the Vercel dashboard or the commit status checks on the merge commit (Vercel posts deployment status as a GitHub commit status).
 
 ### Telegram Bridge (optional)
 
