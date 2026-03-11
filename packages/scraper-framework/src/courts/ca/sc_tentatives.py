@@ -404,6 +404,7 @@ class SCTentativeRulingsScraper(BaseScraper):
     ) -> None:
         super().__init__(config, **kwargs)
         self._court_directory = court_directory
+        self._dir_mapping: dict[str, str] = {}
 
     def fetch_documents(self) -> list[CapturedDocument]:
         """Fetch all ruling PDFs from all departments."""
@@ -419,11 +420,11 @@ class SCTentativeRulingsScraper(BaseScraper):
             # still fetch the landing page to discover department URLs.
             if self._court_directory is not None:
                 self._log.info("Snapshotting court directory", court_id=COURT_ID)
-                dir_mapping = self._court_directory.fetch_and_snapshot(COURT_ID)
+                self._dir_mapping = self._court_directory.fetch_and_snapshot(COURT_ID)
                 self._log.info(
                     "Court directory snapshot taken",
                     court_id=COURT_ID,
-                    departments=len(dir_mapping),
+                    departments=len(self._dir_mapping),
                 )
 
             self._log.info("Fetching landing page", url=LANDING_URL)
@@ -436,8 +437,8 @@ class SCTentativeRulingsScraper(BaseScraper):
             # from the snapshot (in case inline extraction missed any).
             if self._court_directory is not None:
                 for dept_info in departments:
-                    if not dept_info.judge_name and dept_info.department in dir_mapping:
-                        dept_info.judge_name = dir_mapping[dept_info.department]
+                    if not dept_info.judge_name and dept_info.department in self._dir_mapping:
+                        dept_info.judge_name = self._dir_mapping[dept_info.department]
 
             self._log.info("Found departments", count=len(departments))
 
@@ -564,6 +565,27 @@ class SCTentativeRulingsScraper(BaseScraper):
 
         except Exception as exc:
             self._log.warning("PDF parse error", error=str(exc))
+
+        # Fallback: if judge name is still missing after PDF extraction,
+        # use the date-appropriate directory snapshot for the hearing date.
+        if doc.judge_name is None and doc.department and self._court_directory is not None:
+            effective_map = self._dir_mapping
+            if doc.hearing_date is not None:
+                date_map = self._court_directory.get_mapping_for_date(
+                    COURT_ID,
+                    doc.hearing_date,
+                    fallback=self._dir_mapping,
+                )
+                if date_map is not None:
+                    effective_map = date_map
+            judge_name = effective_map.get(doc.department)
+            if judge_name:
+                doc.judge_name = judge_name
+                self._log.debug(
+                    "Judge name populated from directory snapshot",
+                    department=doc.department,
+                    judge_name=judge_name,
+                )
 
         return doc
 

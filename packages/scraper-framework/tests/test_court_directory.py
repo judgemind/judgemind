@@ -256,3 +256,69 @@ class TestIsDuplicate:
         cursor.fetchone.return_value = ("old_hash",)
 
         assert directory._is_duplicate(COURT_ID, "new_hash") is False
+
+
+# ---------------------------------------------------------------------------
+# get_mapping_for_date tests
+# ---------------------------------------------------------------------------
+
+
+class TestGetMappingForDate:
+    """Tests for CourtDirectory.get_mapping_for_date()."""
+
+    def test_returns_snapshot_when_found(self, directory: _StubDirectory) -> None:
+        """Should return the snapshot mapping when one exists before as_of."""
+        cursor = directory._conn.cursor.return_value.__enter__.return_value
+        historical = {"1": "Old Judge", "2": "Other Judge"}
+        cursor.fetchone.return_value = (historical,)
+
+        result = directory.get_mapping_for_date(COURT_ID, datetime(2026, 3, 1, tzinfo=UTC))
+
+        assert result == historical
+
+    def test_returns_fallback_when_no_snapshot(self, directory: _StubDirectory) -> None:
+        """Should return fallback when no snapshot predates as_of."""
+        cursor = directory._conn.cursor.return_value.__enter__.return_value
+        cursor.fetchone.return_value = None
+
+        fallback = {"10": "Fallback Judge"}
+        result = directory.get_mapping_for_date(
+            COURT_ID, datetime(2026, 3, 1, tzinfo=UTC), fallback=fallback
+        )
+
+        assert result == fallback
+
+    def test_returns_none_when_no_snapshot_and_no_fallback(self, directory: _StubDirectory) -> None:
+        """Should return None when no snapshot exists and no fallback provided."""
+        cursor = directory._conn.cursor.return_value.__enter__.return_value
+        cursor.fetchone.return_value = None
+
+        result = directory.get_mapping_for_date(COURT_ID, datetime(2026, 3, 1, tzinfo=UTC))
+
+        assert result is None
+
+    def test_prefers_snapshot_over_fallback(self, directory: _StubDirectory) -> None:
+        """When a snapshot exists, fallback should be ignored."""
+        cursor = directory._conn.cursor.return_value.__enter__.return_value
+        historical = {"1": "Historical Judge"}
+        cursor.fetchone.return_value = (historical,)
+
+        fallback = {"1": "Fallback Judge"}
+        result = directory.get_mapping_for_date(
+            COURT_ID, datetime(2026, 3, 1, tzinfo=UTC), fallback=fallback
+        )
+
+        assert result == historical
+        assert result != fallback
+
+    def test_passes_correct_parameters(self, directory: _StubDirectory) -> None:
+        """Should pass court_id and as_of to get_snapshot."""
+        cursor = directory._conn.cursor.return_value.__enter__.return_value
+        cursor.fetchone.return_value = None
+
+        as_of = datetime(2026, 2, 15, 10, 30, 0, tzinfo=UTC)
+        directory.get_mapping_for_date(COURT_ID, as_of)
+
+        cursor.execute.assert_called_once()
+        sql, params = cursor.execute.call_args.args
+        assert params == (COURT_ID, as_of)

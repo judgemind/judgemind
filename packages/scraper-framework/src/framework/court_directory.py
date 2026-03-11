@@ -208,6 +208,44 @@ class CourtDirectory(abc.ABC):
         )
         return mapping
 
+    def get_mapping_for_date(
+        self,
+        court_id: str,
+        as_of: datetime,
+        *,
+        fallback: dict[str, str] | None = None,
+    ) -> dict[str, str] | None:
+        """Get the date-appropriate directory mapping with optional fallback.
+
+        Looks up the historical snapshot closest to (but not after) ``as_of``.
+        If no snapshot predates the given datetime, returns ``fallback`` (which
+        defaults to ``None``).
+
+        This is the preferred method for scrapers to use when looking up judge
+        names for a ruling — it ensures each ruling uses the directory that was
+        active at the time of the hearing, not the current directory.
+
+        Parameters
+        ----------
+        court_id : str
+            The court identifier (e.g. ``"ca_los_angeles"``).
+        as_of : datetime
+            The hearing date or capture date of the ruling.
+        fallback : dict[str, str] | None
+            Mapping to return when no snapshot predates ``as_of``.
+            Typically the mapping from the most recent ``fetch_and_snapshot()``.
+
+        Returns
+        -------
+        dict[str, str] | None
+            The date-appropriate {department: judge_name} mapping, or
+            ``fallback`` if no historical snapshot exists.
+        """
+        snapshot = self.get_snapshot(court_id, as_of)
+        if snapshot is not None:
+            return snapshot
+        return fallback
+
     def fetch_and_snapshot(self, court_id: str) -> dict[str, str]:
         """Fetch the live directory and save a snapshot.
 

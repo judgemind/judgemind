@@ -757,3 +757,117 @@ class TestSCScraperWithDirectory:
         assert health.success is True
         # 10 departments x 2 PDFs each = 20 documents
         assert health.records_captured == 20
+
+
+# ---------------------------------------------------------------------------
+# Date-aware directory lookup in parse_document (#767)
+# ---------------------------------------------------------------------------
+
+
+class TestDateAwareDirectoryLookup:
+    """Tests for date-aware directory snapshot usage in parse_document."""
+
+    def _make_scraper_with_directory(
+        self,
+        snapshot_map: dict[str, str] | None = None,
+        live_mapping: dict[str, str] | None = None,
+    ) -> SCTentativeRulingsScraper:
+        """Create a scraper with a mocked court_directory for testing."""
+        from courts.ca.sc_tentatives import default_config as sc_cfg
+
+        config = sc_cfg()
+        config.request_delay_seconds = 0
+
+        court_directory = MagicMock()
+        court_directory.get_mapping_for_date.return_value = snapshot_map
+
+        scraper = SCTentativeRulingsScraper(config=config, court_directory=court_directory)
+        scraper._dir_mapping = live_mapping or {}
+        return scraper
+
+    def test_uses_date_appropriate_snapshot_when_judge_missing(self) -> None:
+        """parse_document should use historical snapshot when judge is None after PDF parse."""
+        from framework import CapturedDocument, ContentFormat
+
+        snapshot_map = {"1": "Historical Judge"}
+        scraper = self._make_scraper_with_directory(
+            snapshot_map=snapshot_map,
+            live_mapping={"1": "Live Judge"},
+        )
+
+        # Create a doc with no judge_name (simulating PDF without judge header)
+        doc = CapturedDocument(
+            scraper_id="ca-sc-tentatives-civil",
+            state="CA",
+            county="Santa Clara",
+            court="Superior Court",
+            source_url="https://example.com/dept-1-tues.pdf",
+            capture_timestamp=datetime(2026, 3, 3),
+            content_format=ContentFormat.PDF,
+            raw_content=b"%PDF-1.4 empty",  # Invalid PDF, will fail parse
+            content_hash="",
+            department="1",
+            hearing_date=datetime(2026, 1, 15),
+        )
+        result = scraper.parse_document(doc)
+        assert result.judge_name == "Historical Judge"
+
+        scraper._court_directory.get_mapping_for_date.assert_called_once_with(
+            COURT_ID,
+            datetime(2026, 1, 15),
+            fallback={"1": "Live Judge"},
+        )
+
+    @respx.mock
+    def test_skips_directory_lookup_when_judge_from_pdf(self) -> None:
+        """When the PDF contains a judge name, directory lookup should be skipped."""
+        from framework import CapturedDocument, ContentFormat
+
+        dept1_pdf = _load_bytes("sc_dept1_tues.pdf")
+        scraper = self._make_scraper_with_directory(
+            snapshot_map={"1": "Wrong Judge"},
+            live_mapping={"1": "Also Wrong"},
+        )
+
+        doc = CapturedDocument(
+            scraper_id="ca-sc-tentatives-civil",
+            state="CA",
+            county="Santa Clara",
+            court="Superior Court",
+            source_url="https://example.com/dept-1-tues.pdf",
+            capture_timestamp=datetime(2026, 3, 3),
+            content_format=ContentFormat.PDF,
+            raw_content=dept1_pdf,
+            content_hash="",
+            department="1",
+            hearing_date=datetime(2026, 3, 3),
+        )
+        result = scraper.parse_document(doc)
+        # Judge should come from the PDF, not directory
+        assert result.judge_name == "Eunice Lee"
+        scraper._court_directory.get_mapping_for_date.assert_not_called()
+
+    def test_falls_back_to_live_mapping_without_hearing_date(self) -> None:
+        """Without hearing_date, should use _dir_mapping for fallback."""
+        from framework import CapturedDocument, ContentFormat
+
+        scraper = self._make_scraper_with_directory(
+            snapshot_map={"1": "Snapshot Judge"},
+            live_mapping={"1": "Live Judge"},
+        )
+
+        doc = CapturedDocument(
+            scraper_id="ca-sc-tentatives-civil",
+            state="CA",
+            county="Santa Clara",
+            court="Superior Court",
+            source_url="https://example.com/dept-1-tues.pdf",
+            capture_timestamp=datetime(2026, 3, 3),
+            content_format=ContentFormat.PDF,
+            raw_content=b"%PDF-1.4 empty",
+            content_hash="",
+            department="1",
+        )
+        result = scraper.parse_document(doc)
+        assert result.judge_name == "Live Judge"
+        scraper._court_directory.get_mapping_for_date.assert_not_called()

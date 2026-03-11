@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import httpx
 import pytest
@@ -962,3 +963,153 @@ def test_full_run_dept_header_mixed_with_real() -> None:
 
     assert health.success is True
     assert health.records_captured == 188  # (97 - 3 headers) x 2 cases per fixture
+
+
+# ---------------------------------------------------------------------------
+# Date-aware directory lookup in parse_document (#767)
+# ---------------------------------------------------------------------------
+
+
+class TestDateAwareDirectoryLookup:
+    """Tests for date-aware directory snapshot usage in parse_document."""
+
+    def _make_scraper_with_directory(
+        self,
+        snapshot_map: dict[str, str] | None = None,
+        static_map: dict[str, str] | None = None,
+    ) -> LATentativeRulingsScraper:
+        """Create a scraper with a mocked court_directory for testing."""
+        config = default_config()
+        config.request_delay_seconds = 0
+
+        court_directory = MagicMock()
+        court_directory.get_mapping_for_date.return_value = snapshot_map
+
+        scraper = LATentativeRulingsScraper(config=config, court_directory=court_directory)
+        scraper._court_id = "ca_los_angeles"
+        scraper._dept_judge_map = static_map or {}
+        return scraper
+
+    def test_uses_date_appropriate_snapshot(self) -> None:
+        """parse_document should use the historical snapshot when available."""
+        snapshot_map = {"3": "Historical Judge"}
+        scraper = self._make_scraper_with_directory(
+            snapshot_map=snapshot_map,
+            static_map={"3": "Current Judge"},
+        )
+
+        doc = CapturedDocument(
+            scraper_id="ca-la-tentatives-civil",
+            state="CA",
+            county="Los Angeles",
+            court="Superior Court",
+            source_url=CIVIL_URL,
+            capture_timestamp=datetime(2026, 3, 2),
+            content_format=ContentFormat.HTML,
+            raw_content=b"<div id='speechSynthesis'><p>Some ruling</p></div>",
+            content_hash="",
+            department="3",
+            hearing_date=datetime(2026, 1, 15),
+        )
+        result = scraper.parse_document(doc)
+        assert result.judge_name == "Historical Judge"
+
+        scraper._court_directory.get_mapping_for_date.assert_called_once_with(
+            "ca_los_angeles",
+            datetime(2026, 1, 15),
+            fallback={"3": "Current Judge"},
+        )
+
+    def test_falls_back_to_static_map_without_court_directory(self) -> None:
+        """Without court_directory, scraper should use _dept_judge_map."""
+        config = default_config()
+        config.request_delay_seconds = 0
+        scraper = LATentativeRulingsScraper(config=config)
+        scraper._dept_judge_map = {"3": "Static Map Judge"}
+
+        doc = CapturedDocument(
+            scraper_id="ca-la-tentatives-civil",
+            state="CA",
+            county="Los Angeles",
+            court="Superior Court",
+            source_url=CIVIL_URL,
+            capture_timestamp=datetime(2026, 3, 2),
+            content_format=ContentFormat.HTML,
+            raw_content=b"<div id='speechSynthesis'><p>Some ruling</p></div>",
+            content_hash="",
+            department="3",
+            hearing_date=datetime(2026, 1, 15),
+        )
+        result = scraper.parse_document(doc)
+        assert result.judge_name == "Static Map Judge"
+
+    def test_falls_back_without_hearing_date(self) -> None:
+        """Without hearing_date, should use _dept_judge_map even with court_directory."""
+        scraper = self._make_scraper_with_directory(
+            snapshot_map={"3": "Snapshot Judge"},
+            static_map={"3": "Static Judge"},
+        )
+
+        doc = CapturedDocument(
+            scraper_id="ca-la-tentatives-civil",
+            state="CA",
+            county="Los Angeles",
+            court="Superior Court",
+            source_url=CIVIL_URL,
+            capture_timestamp=datetime(2026, 3, 2),
+            content_format=ContentFormat.HTML,
+            raw_content=b"<div id='speechSynthesis'><p>Some ruling</p></div>",
+            content_hash="",
+            department="3",
+        )
+        result = scraper.parse_document(doc)
+        assert result.judge_name == "Static Judge"
+        scraper._court_directory.get_mapping_for_date.assert_not_called()
+
+    def test_skips_lookup_when_judge_in_html(self) -> None:
+        """When the HTML contains a judge name, directory lookup should be skipped."""
+        html = _load("la_ruling_response.html")
+        scraper = self._make_scraper_with_directory(
+            snapshot_map={"3": "Wrong Judge"},
+            static_map={"3": "Also Wrong"},
+        )
+
+        doc = CapturedDocument(
+            scraper_id="ca-la-tentatives-civil",
+            state="CA",
+            county="Los Angeles",
+            court="Superior Court",
+            source_url=CIVIL_URL,
+            capture_timestamp=datetime(2026, 3, 2),
+            content_format=ContentFormat.HTML,
+            raw_content=html.encode("utf-8"),
+            content_hash="",
+            department="3",
+            hearing_date=datetime(2026, 3, 2),
+        )
+        result = scraper.parse_document(doc)
+        # Judge should come from the HTML, not the directory
+        assert "Crowfoot" in result.judge_name
+
+    def test_no_mapping_match_leaves_judge_none(self) -> None:
+        """When no mapping has the department, judge_name stays None."""
+        scraper = self._make_scraper_with_directory(
+            snapshot_map={"99": "Some Judge"},
+            static_map={"99": "Other Judge"},
+        )
+
+        doc = CapturedDocument(
+            scraper_id="ca-la-tentatives-civil",
+            state="CA",
+            county="Los Angeles",
+            court="Superior Court",
+            source_url=CIVIL_URL,
+            capture_timestamp=datetime(2026, 3, 2),
+            content_format=ContentFormat.HTML,
+            raw_content=b"<div id='speechSynthesis'><p>Some ruling</p></div>",
+            content_hash="",
+            department="3",
+            hearing_date=datetime(2026, 1, 15),
+        )
+        result = scraper.parse_document(doc)
+        assert result.judge_name is None
