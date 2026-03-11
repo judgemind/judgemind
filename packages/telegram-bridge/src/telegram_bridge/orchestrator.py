@@ -505,12 +505,14 @@ class OrchestratorBridge:
         elif cmd.kind == CommandKind.PAUSE:
             self.paused = True
             self._save_state()
+            self.write_status()
             await self.bridge.notify("Paused. No new issues will be spawned.", repo=self.repo)
             result["reply"] = "Paused."
 
         elif cmd.kind == CommandKind.RESUME:
             self.paused = False
             self._save_state()
+            self.write_status()
             await self.bridge.notify("Resumed. Will spawn issues as normal.", repo=self.repo)
             result["reply"] = "Resumed."
 

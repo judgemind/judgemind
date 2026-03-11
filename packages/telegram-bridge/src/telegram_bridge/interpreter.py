@@ -277,8 +277,11 @@ def build_orchestrator_status(
         stopped_issues: Issue numbers that have been stopped.
 
     Returns:
-        A dict suitable for JSON serialization.
+        A dict suitable for JSON serialization.  Includes an ``updated_at``
+        ISO-8601 timestamp so consumers can detect staleness.
     """
+    import datetime
+
     return {
         "active_agents": active_agents or [],
         "open_prs": open_prs or [],
@@ -286,4 +289,5 @@ def build_orchestrator_status(
         "queue": queue or [],
         "paused": paused,
         "stopped_issues": stopped_issues or [],
+        "updated_at": datetime.datetime.now(datetime.UTC).isoformat(),
     }
