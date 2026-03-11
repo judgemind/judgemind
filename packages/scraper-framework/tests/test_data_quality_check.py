@@ -36,6 +36,9 @@ check_ingest_rates = dqc.check_ingest_rates
 check_scraper_staleness = dqc.check_scraper_staleness
 check_field_completeness = dqc.check_field_completeness
 _query_field_completeness = dqc._query_field_completeness
+_collect_full_metrics = dqc._collect_full_metrics
+_format_metrics_for_snapshot = dqc._format_metrics_for_snapshot
+persist_metrics = dqc.persist_metrics
 format_json = dqc.format_json
 format_text = dqc.format_text
 file_issues_for_alerts = dqc.file_issues_for_alerts
@@ -1280,3 +1283,490 @@ class TestCheckFieldCompleteness:
         assert alert.expected == 95.0
         assert alert.actual == 80.0
         assert "15.0pp drop" in alert.message
+
+
+# ---------------------------------------------------------------------------
+# Tests for _collect_full_metrics
+# ---------------------------------------------------------------------------
+
+
+class TestCollectFullMetrics:
+    """Tests for _collect_full_metrics function."""
+
+    def test_collects_ruling_count_24h(self) -> None:
+        """Collects ruling_count_24h with doc type breakdown metadata."""
+        # Keys must uniquely match each SQL query string.
+        # Order matters: more specific keys first so they match before generic ones.
+        conn = FakeConnection(
+            {
+                # RULING_COUNTS_7D_QUERY (has "created_at < %s", 24h query does not)
+                "created_at < %s": [],
+                # RULING_COUNTS_24H_QUERY (generic "ruling_count" matches this)
+                "AS ruling_count": [("Los Angeles", 42)],
+                # RULING_COUNT_BY_TYPE_QUERY
+                "d.doc_type": [
+                    ("Los Angeles", "tentative_ruling", 30),
+                    ("Los Angeles", "minute_order", 12),
+                ],
+                # FIELD_COMPLETENESS_QUERY (unique key: "has_ruling")
+                "has_ruling": [],
+                # FIELD_GAP_DOCS_QUERY (unique key: "r.judge_id IS NULL")
+                "r.judge_id IS NULL": [],
+                # LATEST_SCRAPER_RUN_QUERY
+                "ranked_runs": [],
+                # SCRAPER_SUCCESS_RATE_24H_QUERY
+                "success_count": [],
+            }
+        )
+        result = _collect_full_metrics(conn, NOW)
+        assert "Los Angeles" in result
+        m = result["Los Angeles"]["ruling_count_24h"]
+        assert m["value"] == 42
+        assert m["metadata"]["by_doc_type"]["tentative_ruling"] == 30
+        assert m["metadata"]["by_doc_type"]["minute_order"] == 12
+
+    def test_collects_ruling_count_7d_avg(self) -> None:
+        """Collects ruling_count_7d_avg from 7-day window."""
+        conn = FakeConnection(
+            {
+                # 7d query matches first via "created_at < %s"
+                "created_at < %s": [("Orange", 120)],
+                # 24h query matches via "AS ruling_count"
+                "AS ruling_count": [],
+                "d.doc_type": [],
+                "has_ruling": [],
+                "r.judge_id IS NULL": [],
+                "ranked_runs": [],
+                "success_count": [],
+            }
+        )
+        result = _collect_full_metrics(conn, NOW)
+        assert "Orange" in result
+        m = result["Orange"]["ruling_count_7d_avg"]
+        assert m["value"] == round(120 / 6.0, 2)  # ROLLING_WINDOW_DAYS = 6
+        assert m["metadata"]["total_7d_window"] == 120
+
+    def test_collects_field_completeness_metrics(self) -> None:
+        """Collects overall and per-field completeness metrics."""
+        conn = FakeConnection(
+            {
+                "created_at < %s": [],
+                "AS ruling_count": [],
+                "d.doc_type": [],
+                "has_ruling": [
+                    _make_field_completeness_row(
+                        "Los Angeles",
+                        total=100,
+                        ruling=100,
+                        judge=90,
+                        motion_type=80,
+                        outcome=85,
+                        title=100,
+                        case_number=100,
+                        parties=70,
+                        hearing_date=95,
+                        case_type=90,
+                    ),
+                ],
+                "r.judge_id IS NULL": [],
+                "ranked_runs": [],
+                "success_count": [],
+            }
+        )
+        result = _collect_full_metrics(conn, NOW)
+        la = result["Los Angeles"]
+
+        # Overall field completeness is the average of all 9 fields.
+        assert "field_completeness_pct" in la
+        assert la["field_completeness_pct"]["value"] > 0
+
+        # Individual field metrics.
+        assert la["field_completeness_judge"]["value"] == 90.0
+        assert la["field_completeness_motion_type"]["value"] == 80.0
+        assert la["field_completeness_parties"]["value"] == 70.0
+        assert la["field_completeness_outcome"]["value"] == 85.0
+        assert la["field_completeness_hearing_date"]["value"] == 95.0
+
+    def test_collects_scraper_last_success_age(self) -> None:
+        """Collects scraper_last_success_age_hours from latest scraper run."""
+        two_hours_ago = NOW - timedelta(hours=2)
+        conn = FakeConnection(
+            {
+                "created_at < %s": [],
+                "AS ruling_count": [],
+                "d.doc_type": [],
+                "has_ruling": [],
+                "r.judge_id IS NULL": [],
+                "ranked_runs": [("ca-la-tentative", "Los Angeles", two_hours_ago, "success")],
+                "success_count": [],
+            }
+        )
+        result = _collect_full_metrics(conn, NOW)
+        m = result["Los Angeles"]["scraper_last_success_age_hours"]
+        assert abs(m["value"] - 2.0) < 0.01
+
+    def test_collects_scraper_success_rate(self) -> None:
+        """Collects scraper_run_success_rate_24h with error metadata."""
+        conn = FakeConnection(
+            {
+                "created_at < %s": [],
+                "AS ruling_count": [],
+                "d.doc_type": [],
+                "has_ruling": [],
+                "r.judge_id IS NULL": [],
+                "ranked_runs": [],
+                "success_count": [
+                    (
+                        "Los Angeles",
+                        10,
+                        8,
+                        [
+                            {"status": "failure", "error_message": "timeout"},
+                            {"status": "failure", "error_message": "timeout"},
+                        ],
+                    ),
+                ],
+            }
+        )
+        result = _collect_full_metrics(conn, NOW)
+        m = result["Los Angeles"]["scraper_run_success_rate_24h"]
+        assert m["value"] == 80.0
+        assert m["metadata"]["total_runs"] == 10
+        assert m["metadata"]["success_count"] == 8
+        assert m["metadata"]["error_types"]["timeout"] == 2
+
+    def test_scraper_success_rate_no_error_details(self) -> None:
+        """Handles None error_details (all runs succeeded)."""
+        conn = FakeConnection(
+            {
+                "created_at < %s": [],
+                "AS ruling_count": [],
+                "d.doc_type": [],
+                "has_ruling": [],
+                "r.judge_id IS NULL": [],
+                "ranked_runs": [],
+                "success_count": [("Orange", 5, 5, None)],
+            }
+        )
+        result = _collect_full_metrics(conn, NOW)
+        m = result["Orange"]["scraper_run_success_rate_24h"]
+        assert m["value"] == 100.0
+        assert "error_types" not in m["metadata"]
+
+    def test_multiple_counties(self) -> None:
+        """Collects metrics for multiple counties."""
+        conn = FakeConnection(
+            {
+                "created_at < %s": [],
+                "AS ruling_count": [("Los Angeles", 40), ("Orange", 15)],
+                "d.doc_type": [],
+                "has_ruling": [],
+                "r.judge_id IS NULL": [],
+                "ranked_runs": [],
+                "success_count": [],
+            }
+        )
+        result = _collect_full_metrics(conn, NOW)
+        assert "Los Angeles" in result
+        assert "Orange" in result
+        assert result["Los Angeles"]["ruling_count_24h"]["value"] == 40
+        assert result["Orange"]["ruling_count_24h"]["value"] == 15
+
+    def test_field_gap_docs_metadata(self) -> None:
+        """Includes document IDs with gaps in field completeness metadata."""
+        conn = FakeConnection(
+            {
+                "created_at < %s": [],
+                "AS ruling_count": [],
+                "d.doc_type": [],
+                "has_ruling": [
+                    _make_field_completeness_row("Los Angeles", total=100, judge=90),
+                ],
+                "r.judge_id IS NULL": [
+                    ("Los Angeles", "doc-abc-123"),
+                    ("Los Angeles", "doc-def-456"),
+                ],
+                "ranked_runs": [],
+                "success_count": [],
+            }
+        )
+        result = _collect_full_metrics(conn, NOW)
+        metadata = result["Los Angeles"]["field_completeness_pct"]["metadata"]
+        assert "docs_with_gaps" in metadata
+        assert "doc-abc-123" in metadata["docs_with_gaps"]
+        assert "doc-def-456" in metadata["docs_with_gaps"]
+
+
+# ---------------------------------------------------------------------------
+# Tests for persist_metrics
+# ---------------------------------------------------------------------------
+
+
+class RecordingCursor:
+    """A cursor that records executemany calls for verification."""
+
+    def __init__(self) -> None:
+        self.executemany_calls: list[tuple[str, list[Any]]] = []
+
+    def executemany(self, query: str, params: list[Any]) -> None:
+        """Record the query and params."""
+        self.executemany_calls.append((query, list(params)))
+
+    def __enter__(self) -> RecordingCursor:
+        return self
+
+    def __exit__(self, *args: Any) -> None:
+        pass
+
+
+class RecordingConnection:
+    """A mock connection that records cursor operations."""
+
+    def __init__(self) -> None:
+        self._cursor = RecordingCursor()
+        self.committed = False
+        self.rolled_back = False
+
+    def cursor(self) -> RecordingCursor:
+        """Return the recording cursor."""
+        return self._cursor
+
+    def commit(self) -> None:
+        """Record commit."""
+        self.committed = True
+
+    def rollback(self) -> None:
+        """Record rollback."""
+        self.rolled_back = True
+
+
+class TestPersistMetrics:
+    """Tests for persist_metrics function."""
+
+    def test_writes_all_metrics_in_batch(self) -> None:
+        """Writes all metric rows using executemany (batched insert)."""
+        conn = RecordingConnection()
+        county_metrics = {
+            "Los Angeles": {
+                "ruling_count_24h": {"value": 42, "metadata": {"by_doc_type": {"tentative": 42}}},
+                "ruling_count_7d_avg": {"value": 35.5, "metadata": None},
+            },
+            "Orange": {
+                "ruling_count_24h": {"value": 15, "metadata": None},
+            },
+        }
+        count = persist_metrics(conn, county_metrics, now=NOW)
+        assert count == 3
+        assert conn.committed
+        assert not conn.rolled_back
+
+        # Verify executemany was called once with 3 rows.
+        assert len(conn._cursor.executemany_calls) == 1
+        query, params = conn._cursor.executemany_calls[0]
+        assert "INSERT INTO data_quality_metrics" in query
+        assert len(params) == 3
+
+    def test_uses_executemany_not_per_row_insert(self) -> None:
+        """Verifies batched insert (executemany) is used, not individual inserts."""
+        conn = RecordingConnection()
+        county_metrics = {
+            "County A": {
+                "metric_1": {"value": 1, "metadata": None},
+                "metric_2": {"value": 2, "metadata": None},
+                "metric_3": {"value": 3, "metadata": None},
+            },
+        }
+        persist_metrics(conn, county_metrics, now=NOW)
+        # Should be exactly 1 executemany call, not 3 separate ones.
+        assert len(conn._cursor.executemany_calls) == 1
+
+    def test_serializes_metadata_as_json(self) -> None:
+        """Serializes metadata dict to JSON string."""
+        conn = RecordingConnection()
+        county_metrics = {
+            "Los Angeles": {
+                "ruling_count_24h": {
+                    "value": 42,
+                    "metadata": {"by_doc_type": {"tentative": 42}},
+                },
+            },
+        }
+        persist_metrics(conn, county_metrics, now=NOW)
+        _, params = conn._cursor.executemany_calls[0]
+        row = params[0]
+        # row is (now, county, metric_name, value, metadata_json)
+        metadata_json = row[4]
+        assert metadata_json is not None
+        parsed = json.loads(metadata_json)
+        assert parsed["by_doc_type"]["tentative"] == 42
+
+    def test_none_metadata_stays_none(self) -> None:
+        """None metadata is not serialized — stays as None."""
+        conn = RecordingConnection()
+        county_metrics = {
+            "Los Angeles": {
+                "ruling_count_7d_avg": {"value": 10.0, "metadata": None},
+            },
+        }
+        persist_metrics(conn, county_metrics, now=NOW)
+        _, params = conn._cursor.executemany_calls[0]
+        row = params[0]
+        assert row[4] is None
+
+    def test_db_error_does_not_raise(self) -> None:
+        """DB errors are caught and logged, not raised."""
+        conn = RecordingConnection()
+        # Make executemany raise an exception.
+        conn._cursor.executemany = MagicMock(  # type: ignore[assignment]
+            side_effect=RuntimeError("connection lost"),
+        )
+        county_metrics = {
+            "Los Angeles": {
+                "ruling_count_24h": {"value": 42, "metadata": None},
+            },
+        }
+        # Should not raise.
+        count = persist_metrics(conn, county_metrics, now=NOW)
+        assert count == 0
+        assert conn.rolled_back
+
+    def test_empty_metrics_returns_zero(self) -> None:
+        """Returns 0 when there are no metrics to persist."""
+        conn = RecordingConnection()
+        count = persist_metrics(conn, {}, now=NOW)
+        assert count == 0
+        assert not conn.committed
+
+    def test_correct_row_structure(self) -> None:
+        """Each row has (timestamp, county, metric_name, value, metadata_json)."""
+        conn = RecordingConnection()
+        county_metrics = {
+            "Orange": {
+                "scraper_run_success_rate_24h": {
+                    "value": 80.0,
+                    "metadata": {"total_runs": 10, "success_count": 8},
+                },
+            },
+        }
+        persist_metrics(conn, county_metrics, now=NOW)
+        _, params = conn._cursor.executemany_calls[0]
+        row = params[0]
+        assert row[0] == NOW  # recorded_at
+        assert row[1] == "Orange"  # county
+        assert row[2] == "scraper_run_success_rate_24h"  # metric_name
+        assert row[3] == 80.0  # metric_value
+        metadata = json.loads(row[4])
+        assert metadata["total_runs"] == 10
+
+    def test_all_metric_names_written(self) -> None:
+        """All 10 documented metric names are present when data exists."""
+        two_hours_ago = NOW - timedelta(hours=2)
+        conn = FakeConnection(
+            {
+                "created_at < %s": [("TestCounty", 210)],
+                "AS ruling_count": [("TestCounty", 50)],
+                "d.doc_type": [("TestCounty", "ruling", 50)],
+                "has_ruling": [
+                    _make_field_completeness_row(
+                        "TestCounty",
+                        total=100,
+                        ruling=100,
+                        judge=95,
+                        motion_type=90,
+                        outcome=88,
+                        title=100,
+                        case_number=100,
+                        parties=75,
+                        hearing_date=92,
+                        case_type=85,
+                    ),
+                ],
+                "r.judge_id IS NULL": [],
+                "ranked_runs": [("ca-test", "TestCounty", two_hours_ago, "success")],
+                "success_count": [("TestCounty", 10, 9, None)],
+            }
+        )
+        metrics = _collect_full_metrics(conn, NOW)
+        metric_names = set(metrics["TestCounty"].keys())
+
+        expected_names = {
+            "ruling_count_24h",
+            "ruling_count_7d_avg",
+            "field_completeness_pct",
+            "field_completeness_judge",
+            "field_completeness_motion_type",
+            "field_completeness_parties",
+            "field_completeness_outcome",
+            "field_completeness_hearing_date",
+            "scraper_last_success_age_hours",
+            "scraper_run_success_rate_24h",
+        }
+        assert expected_names == metric_names
+
+
+# ---------------------------------------------------------------------------
+# Tests for _format_metrics_for_snapshot
+# ---------------------------------------------------------------------------
+
+
+class TestFormatMetricsForSnapshot:
+    """Tests for _format_metrics_for_snapshot function."""
+
+    def test_converts_ruling_count(self) -> None:
+        """Converts ruling_count_24h to the legacy snapshot format."""
+        full_metrics = {
+            "Los Angeles": {
+                "ruling_count_24h": {"value": 42, "metadata": {"by_doc_type": {"tentative": 42}}},
+            },
+        }
+        result = _format_metrics_for_snapshot(full_metrics)
+        assert result["Los Angeles"]["ruling_count_24h"] == 42
+
+    def test_converts_field_completeness(self) -> None:
+        """Re-constructs field_completeness dict from individual metrics."""
+        full_metrics = {
+            "Los Angeles": {
+                "field_completeness_pct": {"value": 90.0, "metadata": None},
+                "field_completeness_judge": {"value": 95.0, "metadata": None},
+                "field_completeness_motion_type": {"value": 88.0, "metadata": None},
+            },
+        }
+        result = _format_metrics_for_snapshot(full_metrics)
+        fc = result["Los Angeles"]["field_completeness"]
+        assert fc["judge"] == 95.0
+        assert fc["motion_type"] == 88.0
+        # field_completeness_pct should NOT appear in the fc dict (it's the overall).
+        assert "pct" not in fc
+
+    def test_empty_input(self) -> None:
+        """Returns empty dict for empty input."""
+        assert _format_metrics_for_snapshot({}) == {}
+
+    def test_skips_non_snapshot_metrics(self) -> None:
+        """Only includes ruling_count_24h and field completeness in snapshot."""
+        full_metrics = {
+            "Los Angeles": {
+                "scraper_run_success_rate_24h": {"value": 80.0, "metadata": None},
+                "ruling_count_7d_avg": {"value": 35.0, "metadata": None},
+            },
+        }
+        result = _format_metrics_for_snapshot(full_metrics)
+        # No ruling_count_24h or field_completeness, so county should be empty/absent.
+        assert "Los Angeles" not in result
+
+    def test_mixed_metrics(self) -> None:
+        """Handles a mix of snapshot-relevant and other metrics."""
+        full_metrics = {
+            "Orange": {
+                "ruling_count_24h": {"value": 15, "metadata": None},
+                "ruling_count_7d_avg": {"value": 12.0, "metadata": None},
+                "field_completeness_judge": {"value": 90.0, "metadata": None},
+                "scraper_last_success_age_hours": {"value": 1.5, "metadata": None},
+            },
+        }
+        result = _format_metrics_for_snapshot(full_metrics)
+        assert result["Orange"]["ruling_count_24h"] == 15
+        assert result["Orange"]["field_completeness"]["judge"] == 90.0
+        # Non-snapshot metrics should not appear.
+        assert "ruling_count_7d_avg" not in result["Orange"]
+        assert "scraper_last_success_age_hours" not in result["Orange"]

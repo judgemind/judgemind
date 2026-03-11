@@ -180,6 +180,53 @@ LATEST_CAPTURE_PER_COUNTY_QUERY = """
     GROUP BY ct.county
 """
 
+SCRAPER_SUCCESS_RATE_24H_QUERY = """
+    SELECT ct.county,
+           COUNT(*) AS total_runs,
+           COUNT(CASE WHEN sr.status = 'success' THEN 1 END) AS success_count,
+           json_agg(
+               json_build_object(
+                   'status', sr.status,
+                   'error_message', sr.error_message
+               ) ORDER BY sr.started_at DESC
+           ) FILTER (WHERE sr.status != 'success') AS error_details
+    FROM scraper_runs sr
+    JOIN courts ct ON ct.id = sr.court_id
+    WHERE sr.started_at >= %s
+    {county_filter}
+    GROUP BY ct.county
+"""
+
+RULING_COUNT_BY_TYPE_QUERY = """
+    SELECT ct.county, d.doc_type, COUNT(d.id) AS count
+    FROM documents d
+    JOIN courts ct ON ct.id = d.court_id
+    WHERE d.status = 'active'
+      AND d.created_at >= %s
+      {county_filter}
+    GROUP BY ct.county, d.doc_type
+"""
+
+FIELD_GAP_DOCS_QUERY = """
+    SELECT ct.county, d.id AS doc_id
+    FROM documents d
+    JOIN courts ct ON ct.id = d.court_id
+    LEFT JOIN rulings r ON r.document_id = d.id
+    LEFT JOIN cases c ON c.id = d.case_id
+    WHERE d.status = 'active'
+      AND d.created_at >= %s
+      AND (
+          r.judge_id IS NULL
+          OR r.motion_type IS NULL
+          OR r.outcome IS NULL
+          OR d.hearing_date IS NULL
+          OR NOT EXISTS (SELECT 1 FROM case_parties cp WHERE cp.case_id = c.id)
+      )
+      {county_filter}
+    GROUP BY ct.county, d.id
+    ORDER BY ct.county
+"""
+
 # Same field structure as AUDIT_QUERY in audit_field_completeness.py, but
 # scoped to recent documents (last N days) for faster, regression-focused checks.
 # audit_field_completeness.py scans all documents; this query only checks recent ones.
@@ -640,6 +687,284 @@ def _collect_county_metrics(
     return result
 
 
+def _collect_full_metrics(
+    conn: psycopg.Connection,  # type: ignore[type-arg]
+    now: datetime,
+    county: str | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Collect all per-county metrics for persistence to data_quality_metrics.
+
+    Extends ``_collect_county_metrics`` with 7-day averages, scraper health,
+    and metadata suitable for the data_quality_metrics table.
+
+    Args:
+        conn: Database connection.
+        now: Current timestamp for time calculations.
+        county: Optional county filter.
+
+    Returns:
+        Dict mapping county name to a flat metrics dict.  Each value dict
+        contains metric_name -> {value, metadata} pairs.
+    """
+    county_filter, county_params = _build_county_filter(county)
+    result: dict[str, dict[str, Any]] = {}
+
+    def _ensure(county_name: str) -> dict[str, Any]:
+        if county_name not in result:
+            result[county_name] = {}
+        return result[county_name]
+
+    cutoff_24h = now - timedelta(hours=24)
+    cutoff_7d = now - timedelta(days=7)
+
+    # --- Ruling count 24h ---
+    with conn.cursor() as cur:
+        cur.execute(
+            RULING_COUNTS_24H_QUERY.format(county_filter=county_filter),
+            (cutoff_24h, *county_params),
+        )
+        for row in cur.fetchall():
+            county_name, count = row[0], row[1]
+            _ensure(county_name)["ruling_count_24h"] = {
+                "value": count,
+                "metadata": None,  # type breakdown added below
+            }
+
+    # --- Ruling count by type (metadata for ruling_count_24h) ---
+    with conn.cursor() as cur:
+        cur.execute(
+            RULING_COUNT_BY_TYPE_QUERY.format(county_filter=county_filter),
+            (cutoff_24h, *county_params),
+        )
+        type_breakdown: dict[str, dict[str, int]] = {}
+        for row in cur.fetchall():
+            county_name, doc_type, count = row[0], row[1], row[2]
+            if county_name not in type_breakdown:
+                type_breakdown[county_name] = {}
+            type_breakdown[county_name][doc_type or "unknown"] = count
+
+    for county_name, breakdown in type_breakdown.items():
+        metrics = _ensure(county_name)
+        if "ruling_count_24h" in metrics:
+            metrics["ruling_count_24h"]["metadata"] = {
+                "by_doc_type": breakdown,
+            }
+
+    # --- Ruling count 7d average ---
+    with conn.cursor() as cur:
+        cur.execute(
+            RULING_COUNTS_7D_QUERY.format(county_filter=county_filter),
+            (cutoff_7d, cutoff_24h, *county_params),
+        )
+        for row in cur.fetchall():
+            county_name = row[0]
+            total_7d = row[1]
+            avg = round(total_7d / ROLLING_WINDOW_DAYS, 2)
+            _ensure(county_name)["ruling_count_7d_avg"] = {
+                "value": avg,
+                "metadata": {
+                    "total_7d_window": total_7d,
+                    "window_days": ROLLING_WINDOW_DAYS,
+                },
+            }
+
+    # --- Field completeness ---
+    field_completeness = _query_field_completeness(conn, now, county)
+
+    # Collect doc IDs with field gaps for metadata.
+    gap_docs: dict[str, list[str]] = {}
+    with conn.cursor() as cur:
+        cur.execute(
+            FIELD_GAP_DOCS_QUERY.format(county_filter=county_filter),
+            (now - timedelta(days=FIELD_COMPLETENESS_WINDOW_DAYS), *county_params),
+        )
+        for row in cur.fetchall():
+            county_name, doc_id = row[0], str(row[1])
+            if county_name not in gap_docs:
+                gap_docs[county_name] = []
+            # Cap at 20 doc IDs per county for metadata size.
+            if len(gap_docs[county_name]) < 20:
+                gap_docs[county_name].append(doc_id)
+
+    for county_name, fields in field_completeness.items():
+        metrics = _ensure(county_name)
+        gap_doc_ids = gap_docs.get(county_name, [])
+        gap_metadata = {"docs_with_gaps": gap_doc_ids} if gap_doc_ids else None
+
+        # Overall field completeness (average of all individual fields).
+        if fields:
+            overall_pct = round(sum(fields.values()) / len(fields), 2)
+            metrics["field_completeness_pct"] = {
+                "value": overall_pct,
+                "metadata": gap_metadata,
+            }
+
+        # Individual field completeness metrics.
+        _field_metric_map = {
+            "judge": "field_completeness_judge",
+            "motion_type": "field_completeness_motion_type",
+            "parties": "field_completeness_parties",
+            "outcome": "field_completeness_outcome",
+            "hearing_date": "field_completeness_hearing_date",
+        }
+        for field_key, metric_name in _field_metric_map.items():
+            if field_key in fields:
+                metrics[metric_name] = {
+                    "value": fields[field_key],
+                    "metadata": gap_metadata,
+                }
+
+    # --- Scraper last success age ---
+    with conn.cursor() as cur:
+        cur.execute(
+            LATEST_SCRAPER_RUN_QUERY.format(county_filter=county_filter),
+            county_params,
+        )
+        for row in cur.fetchall():
+            _scraper_id, county_name, started_at, status = row
+            if status == "success" and started_at is not None:
+                hours_since = round((now - started_at).total_seconds() / 3600, 2)
+                _ensure(county_name)["scraper_last_success_age_hours"] = {
+                    "value": hours_since,
+                    "metadata": None,
+                }
+
+    # --- Scraper success rate 24h ---
+    with conn.cursor() as cur:
+        cur.execute(
+            SCRAPER_SUCCESS_RATE_24H_QUERY.format(county_filter=county_filter),
+            (cutoff_24h, *county_params),
+        )
+        for row in cur.fetchall():
+            county_name = row[0]
+            total_runs = row[1]
+            success_count = row[2]
+            error_details_json = row[3]
+            rate = round(success_count / total_runs * 100, 2) if total_runs > 0 else 0.0
+
+            error_metadata: dict[str, Any] = {
+                "total_runs": total_runs,
+                "success_count": success_count,
+            }
+            # Summarize error types for metadata.
+            if error_details_json:
+                error_types: dict[str, int] = {}
+                for err in error_details_json:
+                    err_msg = err.get("error_message") or "unknown"
+                    # Truncate long error messages for metadata.
+                    err_key = err_msg[:100]
+                    error_types[err_key] = error_types.get(err_key, 0) + 1
+                error_metadata["error_types"] = error_types
+
+            _ensure(county_name)["scraper_run_success_rate_24h"] = {
+                "value": rate,
+                "metadata": error_metadata,
+            }
+
+    return result
+
+
+def _format_metrics_for_snapshot(
+    full_metrics: dict[str, dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    """Convert ``_collect_full_metrics`` output to the legacy snapshot format.
+
+    The S3 trend-storage layer expects the simpler structure produced by
+    the old ``_collect_county_metrics``: ``{county: {ruling_count_24h: int,
+    field_completeness: {field: pct, ...}}}``.  This helper adapts the
+    richer ``_collect_full_metrics`` output to that format.
+
+    Args:
+        full_metrics: Output of ``_collect_full_metrics``.
+
+    Returns:
+        Dict in the legacy snapshot format.
+    """
+    snapshot_data: dict[str, dict[str, Any]] = {}
+    for county_name, metrics in full_metrics.items():
+        county_data: dict[str, Any] = {}
+        if "ruling_count_24h" in metrics:
+            county_data["ruling_count_24h"] = metrics["ruling_count_24h"]["value"]
+
+        # Re-construct the field_completeness dict from the individual metrics.
+        _field_prefix = "field_completeness_"
+        fc_data = {
+            k.replace(_field_prefix, ""): v["value"]
+            for k, v in metrics.items()
+            if k.startswith(_field_prefix) and k != "field_completeness_pct"
+        }
+        if fc_data:
+            county_data["field_completeness"] = fc_data
+
+        if county_data:
+            snapshot_data[county_name] = county_data
+    return snapshot_data
+
+
+# ---------------------------------------------------------------------------
+# Metrics persistence
+# ---------------------------------------------------------------------------
+
+INSERT_METRICS_QUERY = """
+    INSERT INTO data_quality_metrics (recorded_at, county, metric_name, metric_value, metadata)
+    VALUES (%s, %s, %s, %s, %s)
+"""
+
+
+def persist_metrics(
+    conn: psycopg.Connection,  # type: ignore[type-arg]
+    county_metrics: dict[str, dict[str, Any]],
+    now: datetime | None = None,
+) -> int:
+    """Write collected metrics to the data_quality_metrics table.
+
+    Uses batched inserts via ``executemany`` to minimize round-trips.
+    Failures are logged but do not raise — the check run must not be
+    blocked by metrics storage.
+
+    Args:
+        conn: Database connection (reused from the check run).
+        county_metrics: Dict from ``_collect_full_metrics``.  Each value
+            is a dict of metric_name -> {value, metadata}.
+        now: Timestamp for the recorded_at column.  Defaults to UTC now.
+
+    Returns:
+        Number of metric rows inserted, or 0 on failure.
+    """
+    if now is None:
+        now = datetime.now(UTC)
+
+    rows: list[tuple[datetime, str, str, float, str | None]] = []
+    for county_name, metrics in county_metrics.items():
+        for metric_name, metric_data in metrics.items():
+            value = metric_data["value"]
+            metadata = metric_data.get("metadata")
+            metadata_json = json.dumps(metadata) if metadata is not None else None
+            rows.append((now, county_name, metric_name, float(value), metadata_json))
+
+    if not rows:
+        logger.info("No metrics to persist.")
+        return 0
+
+    try:
+        with conn.cursor() as cur:
+            cur.executemany(INSERT_METRICS_QUERY, rows)
+        conn.commit()
+        logger.info("Persisted %d metric rows to data_quality_metrics.", len(rows))
+        return len(rows)
+    except Exception:
+        logger.exception(
+            "Failed to persist %d metrics to data_quality_metrics — "
+            "continuing without metrics storage.",
+            len(rows),
+        )
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return 0
+
+
 def run_checks(
     dsn: str,
     *,
@@ -688,11 +1013,13 @@ def run_checks_full(
     baselines_path: Path | None = None,
     now: datetime | None = None,
     update_baselines: bool = False,
+    persist: bool = False,
 ) -> CheckResult:
     """Run all data quality checks and collect county metrics.
 
     Like ``run_checks`` but also returns the per-county metrics snapshot
-    needed for trend storage.
+    needed for trend storage.  When ``persist=True``, writes all collected
+    metrics to the ``data_quality_metrics`` table.
 
     Args:
         dsn: Database connection string.
@@ -701,6 +1028,7 @@ def run_checks_full(
         now: Override current time (for testing).
         update_baselines: If True, snapshot current field completeness
             as baselines (ratchet up only) and skip alerting.
+        persist: If True, write metrics to the data_quality_metrics table.
 
     Returns:
         CheckResult with alerts and county metrics.
@@ -722,7 +1050,14 @@ def run_checks_full(
         else:
             alerts.extend(check_field_completeness(conn, now, field_baselines, county))
 
-        county_metrics = _collect_county_metrics(conn, now, county)
+        # Single metric collection pass — _collect_full_metrics is a
+        # superset of _collect_county_metrics.  We derive the legacy
+        # snapshot format from the full metrics to avoid duplicate queries.
+        full_metrics = _collect_full_metrics(conn, now, county)
+        county_metrics = _format_metrics_for_snapshot(full_metrics)
+
+        if persist:
+            persist_metrics(conn, full_metrics, now)
 
     return CheckResult(alerts=alerts, county_metrics=county_metrics)
 
@@ -1088,6 +1423,12 @@ def main() -> None:
         default=False,
         help="Generate a markdown weekly summary from stored snapshots.",
     )
+    parser.add_argument(
+        "--persist-metrics",
+        action="store_true",
+        default=False,
+        help="Write per-county metrics to the data_quality_metrics table.",
+    )
     args = parser.parse_args()
 
     # Weekly summary mode: load snapshots from S3 and generate report.
@@ -1104,39 +1445,42 @@ def main() -> None:
 
     baselines_path = Path(args.baselines) if args.baselines else None
 
-    if args.store_results:
+    if args.store_results or args.persist_metrics:
         # Use run_checks_full to also collect county metrics for storage.
         check_result = run_checks_full(
             dsn,
             county=args.county,
             baselines_path=baselines_path,
             update_baselines=args.update_baselines,
+            persist=args.persist_metrics,
         )
         alerts = check_result.alerts
-        now = datetime.now(UTC)
 
-        snapshot = Snapshot(
-            timestamp=now.isoformat(),
-            county_metrics=check_result.county_metrics,
-            alerts=[asdict(a) for a in alerts],
-        )
-        store_snapshot(snapshot, bucket=args.s3_bucket)
+        if args.store_results:
+            now = datetime.now(UTC)
 
-        # Also run trend detection and include trend alerts in output.
-        snapshots = load_snapshots(bucket=args.s3_bucket, now=now)
-        trend_alerts = detect_trends(snapshots, now=now)
-        if trend_alerts:
-            for ta in trend_alerts:
-                alerts.append(
-                    Alert(
-                        county=ta.county,
-                        metric=ta.metric,
-                        severity=ta.severity,
-                        expected=ta.prior_avg,
-                        actual=ta.current_avg,
-                        message=ta.message,
+            snapshot = Snapshot(
+                timestamp=now.isoformat(),
+                county_metrics=check_result.county_metrics,
+                alerts=[asdict(a) for a in alerts],
+            )
+            store_snapshot(snapshot, bucket=args.s3_bucket)
+
+            # Also run trend detection and include trend alerts in output.
+            snapshots = load_snapshots(bucket=args.s3_bucket, now=now)
+            trend_alerts = detect_trends(snapshots, now=now)
+            if trend_alerts:
+                for ta in trend_alerts:
+                    alerts.append(
+                        Alert(
+                            county=ta.county,
+                            metric=ta.metric,
+                            severity=ta.severity,
+                            expected=ta.prior_avg,
+                            actual=ta.current_avg,
+                            message=ta.message,
+                        )
                     )
-                )
     else:
         alerts = run_checks(
             dsn,
