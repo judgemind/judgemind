@@ -11,6 +11,7 @@ import json
 import sys
 import types
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 import boto3
 import httpx
@@ -135,7 +136,7 @@ class TestSendTelegramReply:
             return_value=httpx.Response(500, json={"ok": False})
         )
         mod = _import_responder()
-        # Should not raise — errors are logged, not propagated.
+        # Should not raise --- errors are logged, not propagated.
         mod.send_telegram_reply("Hello!", bot_token="fake-token", chat_ids=[111])
 
 
@@ -180,6 +181,32 @@ class TestReadOrchestratorState:
         state = mod.read_orchestrator_state(str(state_file))
         assert state["paused"] is False
         assert state["workers"] == {}
+
+
+class TestReadOrchestratorStatus:
+    def test_reads_status_file(self, tmp_path: Path) -> None:
+        status_file = tmp_path / "orchestrator_status.json"
+        status_data = {
+            "active_agents": [{"worker": 1, "issue": 42}],
+            "paused": False,
+        }
+        status_file.write_text(json.dumps(status_data))
+        mod = _import_responder()
+        result = mod.read_orchestrator_status(str(status_file))
+        assert result is not None
+        assert result["active_agents"][0]["issue"] == 42
+
+    def test_returns_none_when_missing(self, tmp_path: Path) -> None:
+        mod = _import_responder()
+        result = mod.read_orchestrator_status(str(tmp_path / "nonexistent.json"))
+        assert result is None
+
+    def test_returns_none_when_corrupt(self, tmp_path: Path) -> None:
+        status_file = tmp_path / "status.json"
+        status_file.write_text("not json{{{")
+        mod = _import_responder()
+        result = mod.read_orchestrator_status(str(status_file))
+        assert result is None
 
 
 class TestReadAgentStatusFiles:
@@ -354,144 +381,338 @@ class TestQueueToInbox:
         assert data[1]["text"] == "new msg"
 
 
-# ── Full dispatch ───────────────────────────────────────────────────────
+# ── Legacy dispatch_command (no API key --- fallback mode) ──────────────
 
 
-class TestDispatchCommand:
+class TestDispatchCommandLegacy:
+    """Tests for the legacy dispatch_command wrapper (no Claude API key).
+
+    In this mode, all messages are queued to inbox with a simple acknowledgment.
+    """
+
     @respx.mock
-    def test_status_command(self, tmp_path: Path) -> None:
+    def test_queues_message_and_sends_ack(self, tmp_path: Path) -> None:
         route = respx.post("https://api.telegram.org/botfake-token/sendMessage").mock(
             return_value=httpx.Response(200, json={"ok": True})
         )
-        state_file = tmp_path / "state.json"
-        state_file.write_text(json.dumps({"paused": False, "workers": {}}))
+        inbox_file = tmp_path / "inbox.json"
         mod = _import_responder()
         mod.dispatch_command(
             message={"text": "status", "user_id": 12345},
             bot_token="fake-token",
             chat_ids=[12345],
-            state_file=str(state_file),
+            state_file=str(tmp_path / "state.json"),
             agent_status_dir=str(tmp_path / "agent-status"),
             stop_requests_file=str(tmp_path / "stop.json"),
-            inbox_file=str(tmp_path / "inbox.json"),
+            inbox_file=str(inbox_file),
         )
         assert route.call_count == 1
         body = json.loads(route.calls[0].request.content)
-        assert "no active" in body["text"].lower()
+        assert "interpreter unavailable" in body["text"].lower()
+        data = json.loads(inbox_file.read_text())
+        assert len(data) == 1
+
+
+# ── dispatch_message with Claude interpreter ────────────────────────────
+
+
+class TestDispatchMessage:
+    """Tests for dispatch_message with mocked Claude interpreter."""
 
     @respx.mock
-    def test_pause_command(self, tmp_path: Path) -> None:
+    @patch("tg_responder.interpret_message")
+    def test_sends_claude_reply(self, mock_interpret: MagicMock, tmp_path: Path) -> None:
+        from telegram_bridge.interpreter import InterpretedMessage
+
+        mock_interpret.return_value = InterpretedMessage(
+            reply="All 2 agents are running smoothly.",
+            actions=[],
+        )
         route = respx.post("https://api.telegram.org/botfake-token/sendMessage").mock(
             return_value=httpx.Response(200, json={"ok": True})
         )
-        state_file = tmp_path / "state.json"
-        state_file.write_text(json.dumps({"paused": False, "workers": {}}))
+
         mod = _import_responder()
-        mod.dispatch_command(
-            message={"text": "pause", "user_id": 12345},
+        mod.dispatch_message(
+            message={"text": "status", "user_id": 12345},
             bot_token="fake-token",
             chat_ids=[12345],
-            state_file=str(state_file),
+            state_file=str(tmp_path / "state.json"),
+            status_file=str(tmp_path / "status.json"),
             agent_status_dir=str(tmp_path / "agent-status"),
             stop_requests_file=str(tmp_path / "stop.json"),
             inbox_file=str(tmp_path / "inbox.json"),
+            anthropic_api_key="test-key",
         )
+
         assert route.call_count == 1
         body = json.loads(route.calls[0].request.content)
-        assert "paused" in body["text"].lower()
-        # Verify state was updated
+        assert "2 agents" in body["text"]
+        mock_interpret.assert_called_once()
+
+    @respx.mock
+    @patch("tg_responder.interpret_message")
+    def test_executes_pause_action(self, mock_interpret: MagicMock, tmp_path: Path) -> None:
+        from telegram_bridge.interpreter import InterpretedMessage
+
+        mock_interpret.return_value = InterpretedMessage(
+            reply="Paused. No new work will be spawned.",
+            actions=[{"type": "pause"}],
+        )
+        respx.post("https://api.telegram.org/botfake-token/sendMessage").mock(
+            return_value=httpx.Response(200, json={"ok": True})
+        )
+
+        state_file = tmp_path / "state.json"
+        state_file.write_text(json.dumps({"paused": False, "workers": {}}))
+
+        mod = _import_responder()
+        mod.dispatch_message(
+            message={"text": "pause everything", "user_id": 12345},
+            bot_token="fake-token",
+            chat_ids=[12345],
+            state_file=str(state_file),
+            status_file=str(tmp_path / "status.json"),
+            agent_status_dir=str(tmp_path / "agent-status"),
+            stop_requests_file=str(tmp_path / "stop.json"),
+            inbox_file=str(tmp_path / "inbox.json"),
+            anthropic_api_key="test-key",
+        )
+
         data = json.loads(state_file.read_text())
         assert data["paused"] is True
 
     @respx.mock
-    def test_resume_command(self, tmp_path: Path) -> None:
-        route = respx.post("https://api.telegram.org/botfake-token/sendMessage").mock(
+    @patch("tg_responder.interpret_message")
+    def test_executes_resume_action(self, mock_interpret: MagicMock, tmp_path: Path) -> None:
+        from telegram_bridge.interpreter import InterpretedMessage
+
+        mock_interpret.return_value = InterpretedMessage(
+            reply="Resumed.",
+            actions=[{"type": "resume"}],
+        )
+        respx.post("https://api.telegram.org/botfake-token/sendMessage").mock(
             return_value=httpx.Response(200, json={"ok": True})
         )
+
         state_file = tmp_path / "state.json"
         state_file.write_text(json.dumps({"paused": True, "workers": {}}))
+
         mod = _import_responder()
-        mod.dispatch_command(
-            message={"text": "resume", "user_id": 12345},
+        mod.dispatch_message(
+            message={"text": "resume work", "user_id": 12345},
             bot_token="fake-token",
             chat_ids=[12345],
             state_file=str(state_file),
+            status_file=str(tmp_path / "status.json"),
             agent_status_dir=str(tmp_path / "agent-status"),
             stop_requests_file=str(tmp_path / "stop.json"),
             inbox_file=str(tmp_path / "inbox.json"),
+            anthropic_api_key="test-key",
         )
-        assert route.call_count == 1
-        body = json.loads(route.calls[0].request.content)
-        assert "resumed" in body["text"].lower()
+
         data = json.loads(state_file.read_text())
         assert data["paused"] is False
 
     @respx.mock
-    def test_stop_command(self, tmp_path: Path) -> None:
-        route = respx.post("https://api.telegram.org/botfake-token/sendMessage").mock(
+    @patch("tg_responder.interpret_message")
+    def test_executes_stop_action(self, mock_interpret: MagicMock, tmp_path: Path) -> None:
+        from telegram_bridge.interpreter import InterpretedMessage
+
+        mock_interpret.return_value = InterpretedMessage(
+            reply="Stopping issue 42.",
+            actions=[{"type": "stop", "issue": 42}],
+        )
+        respx.post("https://api.telegram.org/botfake-token/sendMessage").mock(
             return_value=httpx.Response(200, json={"ok": True})
         )
+
         stop_file = tmp_path / "stop.json"
+
         mod = _import_responder()
-        mod.dispatch_command(
-            message={"text": "stop #42", "user_id": 12345},
+        mod.dispatch_message(
+            message={"text": "stop 42", "user_id": 12345},
             bot_token="fake-token",
             chat_ids=[12345],
             state_file=str(tmp_path / "state.json"),
+            status_file=str(tmp_path / "status.json"),
             agent_status_dir=str(tmp_path / "agent-status"),
             stop_requests_file=str(stop_file),
             inbox_file=str(tmp_path / "inbox.json"),
+            anthropic_api_key="test-key",
         )
-        assert route.call_count == 1
-        body = json.loads(route.calls[0].request.content)
-        assert "#42" in body["text"]
+
         data = json.loads(stop_file.read_text())
         assert data[0]["issue_number"] == 42
 
     @respx.mock
-    def test_start_command_queued(self, tmp_path: Path) -> None:
-        route = respx.post("https://api.telegram.org/botfake-token/sendMessage").mock(
+    @patch("tg_responder.interpret_message")
+    def test_executes_start_action(self, mock_interpret: MagicMock, tmp_path: Path) -> None:
+        from telegram_bridge.interpreter import InterpretedMessage
+
+        mock_interpret.return_value = InterpretedMessage(
+            reply="Starting issue 42.",
+            actions=[{"type": "start", "issue": 42}],
+        )
+        respx.post("https://api.telegram.org/botfake-token/sendMessage").mock(
             return_value=httpx.Response(200, json={"ok": True})
         )
+
         inbox_file = tmp_path / "inbox.json"
+
         mod = _import_responder()
-        mod.dispatch_command(
-            message={"text": "start #42", "user_id": 12345},
+        mod.dispatch_message(
+            message={"text": "work on 42 please", "user_id": 12345},
             bot_token="fake-token",
             chat_ids=[12345],
             state_file=str(tmp_path / "state.json"),
+            status_file=str(tmp_path / "status.json"),
             agent_status_dir=str(tmp_path / "agent-status"),
             stop_requests_file=str(tmp_path / "stop.json"),
             inbox_file=str(inbox_file),
+            anthropic_api_key="test-key",
         )
-        # Should send acknowledgment
+
+        data = json.loads(inbox_file.read_text())
+        assert len(data) == 1
+        assert "start" in data[0]["text"]
+
+    @respx.mock
+    @patch("tg_responder.interpret_message")
+    def test_reads_orchestrator_status_file(
+        self, mock_interpret: MagicMock, tmp_path: Path
+    ) -> None:
+        from telegram_bridge.interpreter import InterpretedMessage
+
+        mock_interpret.return_value = InterpretedMessage(
+            reply="Status provided.",
+            actions=[],
+        )
+        respx.post("https://api.telegram.org/botfake-token/sendMessage").mock(
+            return_value=httpx.Response(200, json={"ok": True})
+        )
+
+        status_file = tmp_path / "status.json"
+        status_data = {
+            "active_agents": [{"worker": 1, "issue": 42, "phase": "ci-watch"}],
+            "paused": False,
+        }
+        status_file.write_text(json.dumps(status_data))
+
+        mod = _import_responder()
+        mod.dispatch_message(
+            message={"text": "what's happening?", "user_id": 12345},
+            bot_token="fake-token",
+            chat_ids=[12345],
+            state_file=str(tmp_path / "state.json"),
+            status_file=str(status_file),
+            agent_status_dir=str(tmp_path / "agent-status"),
+            stop_requests_file=str(tmp_path / "stop.json"),
+            inbox_file=str(tmp_path / "inbox.json"),
+            anthropic_api_key="test-key",
+        )
+
+        # Verify the interpret_message was called with the status context.
+        call_kwargs = mock_interpret.call_args.kwargs
+        assert call_kwargs["orchestrator_status"] is not None
+        assert call_kwargs["orchestrator_status"]["active_agents"][0]["issue"] == 42
+
+    @respx.mock
+    @patch("tg_responder.interpret_message")
+    def test_fallback_on_interpreter_error(self, mock_interpret: MagicMock, tmp_path: Path) -> None:
+        mock_interpret.side_effect = Exception("API error")
+        route = respx.post("https://api.telegram.org/botfake-token/sendMessage").mock(
+            return_value=httpx.Response(200, json={"ok": True})
+        )
+
+        inbox_file = tmp_path / "inbox.json"
+
+        mod = _import_responder()
+        mod.dispatch_message(
+            message={"text": "hello", "user_id": 12345},
+            bot_token="fake-token",
+            chat_ids=[12345],
+            state_file=str(tmp_path / "state.json"),
+            status_file=str(tmp_path / "status.json"),
+            agent_status_dir=str(tmp_path / "agent-status"),
+            stop_requests_file=str(tmp_path / "stop.json"),
+            inbox_file=str(inbox_file),
+            anthropic_api_key="test-key",
+        )
+
+        # Should send a fallback acknowledgment.
         assert route.call_count == 1
         body = json.loads(route.calls[0].request.content)
-        assert "#42" in body["text"]
-        # Should queue to inbox
+        assert "interpreter error" in body["text"].lower()
+        # Should queue to inbox.
         data = json.loads(inbox_file.read_text())
         assert len(data) == 1
 
     @respx.mock
-    def test_free_text_queued(self, tmp_path: Path) -> None:
+    def test_fallback_when_no_api_key(self, tmp_path: Path) -> None:
         route = respx.post("https://api.telegram.org/botfake-token/sendMessage").mock(
             return_value=httpx.Response(200, json={"ok": True})
         )
+
         inbox_file = tmp_path / "inbox.json"
+
         mod = _import_responder()
-        mod.dispatch_command(
-            message={"text": "how are the scrapers?", "user_id": 12345},
+        mod.dispatch_message(
+            message={"text": "hello", "user_id": 12345},
             bot_token="fake-token",
             chat_ids=[12345],
             state_file=str(tmp_path / "state.json"),
+            status_file=str(tmp_path / "status.json"),
             agent_status_dir=str(tmp_path / "agent-status"),
             stop_requests_file=str(tmp_path / "stop.json"),
             inbox_file=str(inbox_file),
+            anthropic_api_key=None,
         )
+
         assert route.call_count == 1
+        body = json.loads(route.calls[0].request.content)
+        assert "interpreter unavailable" in body["text"].lower()
         data = json.loads(inbox_file.read_text())
         assert len(data) == 1
-        assert data[0]["text"] == "how are the scrapers?"
+
+    @respx.mock
+    @patch("tg_responder.interpret_message")
+    def test_multiple_actions_executed(self, mock_interpret: MagicMock, tmp_path: Path) -> None:
+        from telegram_bridge.interpreter import InterpretedMessage
+
+        mock_interpret.return_value = InterpretedMessage(
+            reply="Pausing and stopping #42.",
+            actions=[
+                {"type": "pause"},
+                {"type": "stop", "issue": 42},
+            ],
+        )
+        respx.post("https://api.telegram.org/botfake-token/sendMessage").mock(
+            return_value=httpx.Response(200, json={"ok": True})
+        )
+
+        state_file = tmp_path / "state.json"
+        state_file.write_text(json.dumps({"paused": False, "workers": {}}))
+        stop_file = tmp_path / "stop.json"
+
+        mod = _import_responder()
+        mod.dispatch_message(
+            message={"text": "pause and stop 42", "user_id": 12345},
+            bot_token="fake-token",
+            chat_ids=[12345],
+            state_file=str(state_file),
+            status_file=str(tmp_path / "status.json"),
+            agent_status_dir=str(tmp_path / "agent-status"),
+            stop_requests_file=str(stop_file),
+            inbox_file=str(tmp_path / "inbox.json"),
+            anthropic_api_key="test-key",
+        )
+
+        # Both actions should have been executed.
+        data = json.loads(state_file.read_text())
+        assert data["paused"] is True
+        stop_data = json.loads(stop_file.read_text())
+        assert stop_data[0]["issue_number"] == 42
 
 
 # ── SQS polling ─────────────────────────────────────────────────────────
