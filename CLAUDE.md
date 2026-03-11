@@ -56,14 +56,9 @@ Wait for the user's instruction before deciding what to do. Sessions fall into t
 
 ### Interactive sessions (human present)
 
-The interactive shell is an **orchestrator, not an implementer.** Do not modify committed code, create branches, or make commits directly. Instead:
+Interactive sessions are **general-purpose** — the user decides what the session is for. You may explore, investigate, prototype, discuss architecture, file issues, spawn subagents, or anything else the user asks.
 
-- **Explore and prototype** in `tmp/` (scripts, evals, queries) — this is fine.
-- **File GitHub issues** for any real work identified during the session.
-- **Spawn subagents** via `/task #N` to implement changes in isolated worktrees.
-- **Review and discuss** results, plans, and architecture with the user.
-
-The interactive shell's job is to think, plan, investigate, and delegate — not to write production code.
+To enable autonomous work queue management (continuous `/task` spawning, PR merging, issue triage, Telegram integration), invoke `/orchestrator`. This is opt-in — do not assume orchestrator behavior unless the skill is invoked.
 
 ### Autonomous sessions (subagent via `/task`)
 
@@ -74,6 +69,7 @@ Subagents do the implementation work: worktree setup, coding, testing, PR, and r
 - **`/task`** — Full autonomous pipeline: ensures a worktree exists (runs setup if needed), claims an issue, implements it, opens a PR, and requests review. Accepts `#N`, natural language filters, or no argument (picks highest priority). **This is the primary way to start autonomous work.**
 - **`/ralph`** — Iterative work-review loop with fresh context each iteration. Spawns a worker subagent (TDD) and a reviewer subagent. Loops until the reviewer says SHIP or max iterations (5) reached. Called by `/task` automatically for testable code tasks. Can also be invoked manually after claiming an issue.
 - **`/tdd`** — Test-driven implementation for code tasks (Python, TypeScript). Called by `/ralph` internally as the worker phase. Can also be invoked standalone for manual workflows. **Not for** Terraform, DB migrations, CI/CD, docs, or investigation tasks.
+- **`/orchestrator`** — Opt-in autonomous work queue manager. Continuously launches `/task` agents (up to 5 concurrent slots), merges PRs when CI is green and ralph has approved, triages issues, and communicates via Telegram. Accepts optional args: a number for max agent slots (e.g. `/orchestrator 3`) or specific issue numbers (e.g. `/orchestrator #589 #590`). See `.claude/skills/orchestrator/SKILL.md` for the full behavioral specification.
 
 ### Worktree setup (manual)
 
@@ -529,7 +525,7 @@ This applies equally to `<task-notification>` (background agent completions/fail
 - When the user asks to pick up work (e.g. "let's go", "start", "pick up a task"), invoke `/task` as a background subagent. It handles everything autonomously.
 - **Telegram commands** are another inbound channel. When the bridge is configured, call `start_polling()` to auto-poll for Telegram messages in the background, then call `drain_pending_commands()` between tasks to retrieve accumulated commands. A `start #N` command is equivalent to the user typing `/task #N`. See the "Telegram Integration" subsection below.
 - If the user asks to explore, investigate, or prototype — do it in `tmp/` and file issues for any real work identified.
-- Remember: the interactive shell orchestrates. It does not implement.
+- To enable continuous autonomous work queue management, invoke `/orchestrator`.
 
 ### Telegram Integration (optional)
 
