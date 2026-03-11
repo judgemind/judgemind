@@ -4,16 +4,23 @@ Verifies that _load_scraper_registry() in reingest_from_s3.py correctly maps
 every known scraper module to its canonical scraper_id. This would have caught
 the original bug where import names and scraper_id keys were wrong for every
 non-LA scraper (see #358).
+
+Scraper modules are auto-discovered rather than hardcoded so that adding a new
+scraper never requires updating this test file (see #680).
 """
 
 from __future__ import annotations
 
 import importlib
+import inspect
 import os
+import pkgutil
 import sys
 from types import ModuleType
 
 import pytest
+
+from framework.base import BaseScraper
 
 # ---------------------------------------------------------------------------
 # Import the reingest module from scripts/
@@ -30,21 +37,53 @@ sys.path.insert(0, _SCRIPTS_DIR)
 reingest = importlib.import_module("reingest_from_s3")
 
 # ---------------------------------------------------------------------------
-# Enumerate all known scraper modules and their default_config().scraper_id
+# Auto-discover all scraper modules that expose default_config()
 # ---------------------------------------------------------------------------
 
-# Each tuple: (module_path relative to courts package, class name)
-_SCRAPER_MODULES: list[tuple[str, str]] = [
-    ("courts.ca.la_tentatives", "LATentativeRulingsScraper"),
-    ("courts.ca.oc_tentatives", "OCTentativeRulingsScraper"),
-    ("courts.ca.oc_family_law_tentatives", "OCFamilyLawTentativeRulingsScraper"),
-    ("courts.ca.oc_probate_tentatives", "OCProbateTentativeRulingsScraper"),
-    ("courts.ca.sb_tentatives", "SBTentativeRulingsScraper"),
-    ("courts.ca.sf_tentatives", "SFTentativeRulingsScraper"),
-    ("courts.ca.sc_tentatives", "SCTentativeRulingsScraper"),
-    ("courts.ca.riverside_tentatives", "RiversideTentativeRulingsScraper"),
-    ("courts.ca.fresno_tentatives", "FresnoTentativeRulingsScraper"),
-]
+
+def _discover_scraper_modules() -> list[tuple[str, str]]:
+    """Return [(module_path, class_name)] for every scraper with default_config().
+
+    Mirrors the discovery logic in ``_load_scraper_registry()`` — walks the
+    ``courts`` package tree and collects modules that expose a
+    ``default_config()`` callable and a concrete ``BaseScraper`` subclass.
+    """
+    import courts
+
+    result: list[tuple[str, str]] = []
+
+    for _importer, modname, ispkg in pkgutil.walk_packages(courts.__path__, prefix="courts."):
+        if ispkg:
+            continue
+        try:
+            mod = importlib.import_module(modname)
+        except Exception:  # noqa: BLE001
+            continue
+
+        config_fn = getattr(mod, "default_config", None)
+        if config_fn is None or not callable(config_fn):
+            continue
+
+        # Find the concrete BaseScraper subclass defined in this module.
+        scraper_cls_name: str | None = None
+        for name, obj in inspect.getmembers(mod, inspect.isclass):
+            if (
+                issubclass(obj, BaseScraper)
+                and obj is not BaseScraper
+                and obj.__module__ == mod.__name__
+            ):
+                scraper_cls_name = name
+                break
+
+        if scraper_cls_name is None:
+            continue
+
+        result.append((modname, scraper_cls_name))
+
+    return sorted(result)
+
+
+_SCRAPER_MODULES: list[tuple[str, str]] = _discover_scraper_modules()
 
 
 def _load_module(module_path: str) -> ModuleType:
@@ -81,12 +120,19 @@ class TestScraperRegistryNonEmpty:
         )
 
     def test_registry_has_all_known_scrapers(self) -> None:
-        """The registry must contain an entry for every known scraper module."""
+        """The registry must contain an entry for every discovered scraper module."""
         reingest._SCRAPER_REGISTRY.clear()
         reingest._load_scraper_registry()
         assert len(reingest._SCRAPER_REGISTRY) == len(_SCRAPER_MODULES), (
             f"Registry has {len(reingest._SCRAPER_REGISTRY)} entries but "
-            f"there are {len(_SCRAPER_MODULES)} known scraper modules"
+            f"auto-discovery found {len(_SCRAPER_MODULES)} scraper modules"
+        )
+
+    def test_discovery_found_scrapers(self) -> None:
+        """Auto-discovery must find at least one scraper module."""
+        assert len(_SCRAPER_MODULES) > 0, (
+            "Auto-discovery found zero scraper modules — "
+            "check that the courts package is importable"
         )
 
 
