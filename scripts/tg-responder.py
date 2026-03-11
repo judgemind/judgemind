@@ -72,7 +72,11 @@ if str(_BRIDGE_SRC) not in sys.path:
     sys.path.insert(0, str(_BRIDGE_SRC))
 
 try:
-    from telegram_bridge.interpreter import interpret_message  # noqa: E402
+    from telegram_bridge.interpreter import (  # noqa: E402
+        RateLimitError,
+        RateLimiter,
+        interpret_message,
+    )
 except ModuleNotFoundError as exc:
     _pkg_dir2 = Path(__file__).resolve().parents[1] / "packages" / "telegram-bridge"
     print(
@@ -429,6 +433,7 @@ def dispatch_message(
     stop_requests_file: str,
     inbox_file: str,
     anthropic_api_key: str | None = None,
+    rate_limiter: RateLimiter | None = None,
 ) -> None:
     """Interpret and dispatch a single inbound message using Claude API.
 
@@ -438,6 +443,12 @@ def dispatch_message(
 
     If the Anthropic API key is not available, falls back to a simple
     acknowledgment.
+
+    Args:
+        rate_limiter: Optional rate limiter passed through to
+            :func:`interpret_message`.  When ``None``, no rate limiting
+            is applied at the dispatch level (the interpreter's own
+            default limiter still applies unless explicitly disabled).
     """
     text = str(message.get("text", ""))
 
@@ -471,7 +482,18 @@ def dispatch_message(
             text=text,
             orchestrator_status=orchestrator_status,
             api_key=anthropic_api_key,
+            rate_limiter=rate_limiter,
         )
+    except RateLimitError as exc:
+        logger.info("Rate limit exceeded — queuing message for orchestrator.")
+        queue_to_inbox(dict(message), inbox_file)
+        send_telegram_reply(
+            f"Rate limit reached. {exc.retry_after:.0f}s until next Claude interpretation. "
+            f"Your message has been queued.",
+            bot_token=bot_token,
+            chat_ids=chat_ids,
+        )
+        return
     except Exception:
         logger.warning("Claude interpreter failed — falling back", exc_info=True)
         queue_to_inbox(dict(message), inbox_file)
@@ -644,8 +666,18 @@ def run_daemon(
     inbox_file: str,
     secret_id: str = "judgemind/telegram/bot",
     anthropic_secret_id: str = "judgemind/anthropic/api-key",
+    no_llm: bool = False,
+    rate_limit_calls: int = 1,
+    rate_limit_window: float = 60.0,
 ) -> None:
-    """Main daemon loop: poll SQS, interpret messages via Claude, repeat."""
+    """Main daemon loop: poll SQS, interpret messages via Claude, repeat.
+
+    Args:
+        no_llm: If ``True``, disable Claude interpretation entirely.
+            Messages are queued with a simple acknowledgment instead.
+        rate_limit_calls: Max Claude API calls within the rate limit window.
+        rate_limit_window: Rate limit window duration in seconds.
+    """
     global _shutdown_requested  # noqa: PLW0603
 
     signal.signal(signal.SIGTERM, _handle_signal)
@@ -655,14 +687,33 @@ def run_daemon(
 
     # Load secrets at startup.
     bot_token, chat_ids = load_secret(secret_id=secret_id, region=region)
-    anthropic_api_key = load_anthropic_api_key(
-        secret_id=anthropic_secret_id, region=region
-    )
+
+    if no_llm:
+        anthropic_api_key = None
+        logger.info("Claude interpreter disabled via --no-llm flag.")
+    else:
+        anthropic_api_key = load_anthropic_api_key(
+            secret_id=anthropic_secret_id, region=region
+        )
+
     if anthropic_api_key:
         logger.info("Claude interpreter enabled (Haiku).")
-    else:
+    elif not no_llm:
         logger.warning(
             "Claude interpreter disabled — will fall back to simple acknowledgment."
+        )
+
+    # Create a rate limiter for Claude API calls.
+    limiter: RateLimiter | None = None
+    if anthropic_api_key:
+        limiter = RateLimiter(
+            max_calls=rate_limit_calls,
+            window_seconds=rate_limit_window,
+        )
+        logger.info(
+            "Rate limiter: %d call(s) per %ds window.",
+            rate_limit_calls,
+            int(rate_limit_window),
         )
 
     logger.info(
@@ -689,6 +740,7 @@ def run_daemon(
                         stop_requests_file=stop_requests_file,
                         inbox_file=inbox_file,
                         anthropic_api_key=anthropic_api_key,
+                        rate_limiter=limiter,
                     )
                 if messages:
                     logger.info("Processed %d message(s).", len(messages))
@@ -766,6 +818,24 @@ def main() -> None:
         default="judgemind/anthropic/api-key",
         help="Secrets Manager secret ID for Anthropic API key",
     )
+    parser.add_argument(
+        "--no-llm",
+        action="store_true",
+        default=False,
+        help="Disable Claude interpretation entirely (messages get simple acknowledgments)",
+    )
+    parser.add_argument(
+        "--rate-limit-calls",
+        type=int,
+        default=1,
+        help="Max Claude API calls within the rate limit window (default: 1)",
+    )
+    parser.add_argument(
+        "--rate-limit-window",
+        type=float,
+        default=60.0,
+        help="Rate limit window duration in seconds (default: 60)",
+    )
     args = parser.parse_args()
 
     run_daemon(
@@ -780,6 +850,9 @@ def main() -> None:
         inbox_file=args.inbox_file,
         secret_id=args.secret_id,
         anthropic_secret_id=args.anthropic_secret_id,
+        no_llm=args.no_llm,
+        rate_limit_calls=args.rate_limit_calls,
+        rate_limit_window=args.rate_limit_window,
     )
 
 

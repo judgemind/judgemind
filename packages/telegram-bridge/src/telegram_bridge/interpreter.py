@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -73,6 +74,57 @@ operations and suggest they check the GitHub issue or logs directly.
 """
 
 
+class RateLimitError(Exception):
+    """Raised when the Claude API rate limit is exceeded."""
+
+    def __init__(self, retry_after: float) -> None:
+        self.retry_after = retry_after
+        super().__init__(f"Rate limit exceeded. Try again in {retry_after:.0f} seconds.")
+
+
+class RateLimiter:
+    """Simple token-bucket rate limiter for Claude API calls.
+
+    Allows at most ``max_calls`` invocations within a rolling ``window_seconds``
+    window.  Thread-safe for single-process use (no cross-process locking).
+
+    Args:
+        max_calls: Maximum number of calls allowed within the window.
+        window_seconds: Duration of the rolling window in seconds.
+    """
+
+    def __init__(self, max_calls: int = 1, window_seconds: float = 60.0) -> None:
+        self.max_calls = max_calls
+        self.window_seconds = window_seconds
+        self._timestamps: list[float] = []
+
+    def acquire(self) -> None:
+        """Check the rate limit and record a new call.
+
+        Raises:
+            RateLimitError: If the rate limit would be exceeded.
+        """
+        now = time.monotonic()
+        # Prune expired timestamps.
+        cutoff = now - self.window_seconds
+        self._timestamps = [t for t in self._timestamps if t > cutoff]
+
+        if len(self._timestamps) >= self.max_calls:
+            oldest = self._timestamps[0]
+            retry_after = oldest + self.window_seconds - now
+            raise RateLimitError(retry_after)
+
+        self._timestamps.append(now)
+
+    def reset(self) -> None:
+        """Clear all recorded timestamps (useful for testing)."""
+        self._timestamps.clear()
+
+
+# Module-level default rate limiter: 1 call per 60 seconds.
+_default_rate_limiter = RateLimiter(max_calls=1, window_seconds=60.0)
+
+
 @dataclass(frozen=True)
 class InterpretedMessage:
     """Result of interpreting a Telegram message via Claude API."""
@@ -88,6 +140,7 @@ def interpret_message(
     orchestrator_status: dict[str, Any] | None = None,
     api_key: str | None = None,
     model: str = _DEFAULT_MODEL,
+    rate_limiter: RateLimiter | None = _default_rate_limiter,
 ) -> InterpretedMessage:
     """Interpret a Telegram message using the Claude API.
 
@@ -102,14 +155,21 @@ def interpret_message(
         api_key: Anthropic API key.  If ``None``, the ``ANTHROPIC_API_KEY``
             environment variable is used (standard anthropic SDK behavior).
         model: The Claude model to use.  Defaults to Haiku for speed/cost.
+        rate_limiter: Optional rate limiter to prevent excessive API usage.
+            Defaults to the module-level limiter (1 call/60s).  Pass ``None``
+            to disable rate limiting.
 
     Returns:
         An :class:`InterpretedMessage` with the reply text and any actions.
 
     Raises:
+        RateLimitError: If the rate limit is exceeded.
         anthropic.APIError: If the API call fails.
         ValueError: If the response cannot be parsed as valid JSON.
     """
+    if rate_limiter is not None:
+        rate_limiter.acquire()
+
     client = anthropic.Anthropic(api_key=api_key)
 
     # Build the user message with orchestrator context.
