@@ -28,17 +28,23 @@ Options:
     --no-llm            Disable LLM extraction, use regex-only mode.
     --llm-timeout N     Per-call LLM API timeout in seconds (default: 60).
     --force-llm         Force LLM even when all fields are already populated.
+    --full-reparse      Split multi-ruling documents using scraper logic.
+                        Creates individual ruling records for each ruling in
+                        a multi-ruling PDF and supersedes the original unsplit
+                        document. Uses deterministic IDs for idempotency.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import logging
 import os
 import subprocess
 import sys
 import tempfile
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime
 from typing import Any
@@ -55,7 +61,7 @@ import boto3  # noqa: E402
 import psycopg  # noqa: E402
 import structlog  # noqa: E402
 
-from framework.models import CapturedDocument, ContentFormat  # noqa: E402
+from framework.models import CapturedDocument, ContentFormat, ScraperConfig  # noqa: E402
 from ingestion.db import (  # noqa: E402
     batch_upsert_parties,
     insert_document,
@@ -98,6 +104,14 @@ logger = structlog.get_logger()
 
 # Registry mapping scraper_id to scraper class for parse_document()
 _SCRAPER_REGISTRY: dict[str, type] = {}
+
+# Registry mapping scraper_id to a callable that splits raw PDF/document
+# content into multiple extracted-field dicts.  Only populated for scrapers
+# that produce multi-ruling documents (e.g. Riverside).  The callable
+# signature is:  (raw_content: bytes, doc_meta: dict) -> list[dict]
+# Each dict in the returned list has the same shape as _reparse_document()'s
+# return value plus a "ruling_index" key.
+_SPLIT_REGISTRY: dict[str, Any] = {}
 
 
 def _load_scraper_registry() -> None:
@@ -156,6 +170,14 @@ def _load_scraper_registry() -> None:
         try:
             config = config_fn()
             _SCRAPER_REGISTRY[config.scraper_id] = scraper_cls
+
+            # Register split function if the module exports one.
+            # Convention: a module-level ``_split_rulings`` callable
+            # indicates that the scraper produces multi-ruling documents
+            # that need splitting during full reparse.
+            split_fn = getattr(mod, "_split_rulings", None)
+            if split_fn is not None and callable(split_fn):
+                _SPLIT_REGISTRY[config.scraper_id] = split_fn
         except Exception:
             logger.warning(
                 "default_config() failed, skipping", module=modname, exc_info=True
@@ -360,8 +382,6 @@ def _reparse_document(
     if scraper_cls:
         # Create a CapturedDocument and run parse_document
         try:
-            from framework.models import ScraperConfig
-
             config = ScraperConfig(
                 scraper_id=scraper_id,
                 state=doc_meta["state"],
@@ -565,6 +585,225 @@ def _reparse_document(
     return extracted
 
 
+def _make_split_document_id(content_hash: str, ruling_index: int) -> str:
+    """Generate a deterministic document UUID for a split ruling.
+
+    Uses ``uuid5(NAMESPACE_URL, content_hash + ":ruling:" + index)`` so that
+    the same PDF content + ruling index always produces the same UUID.
+    This ensures idempotency: re-running full-reparse on the same S3
+    document produces the same document IDs and upserts harmlessly.
+
+    The ``:ruling:`` separator prevents collisions with the base
+    ``uuid5(NAMESPACE_URL, content_hash)`` used for unsplit documents.
+    """
+    key = f"{content_hash}:ruling:{ruling_index}"
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, key))
+
+
+def _full_reparse_document(
+    raw_content: bytes,
+    scraper_id: str,
+    doc_meta: dict,
+    pdf_timeout: float = 30.0,
+    llm_client: object | None = None,
+    llm_provider: str | None = None,
+    llm_model: str | None = None,
+    llm_timeout: float | None = 60.0,
+    force_llm: bool = False,
+) -> list[dict]:
+    """Re-parse a document with full splitting logic.
+
+    Unlike ``_reparse_document()`` which only calls ``parse_document()``,
+    this function also invokes the scraper's splitting logic (e.g.
+    ``_split_rulings()`` for Riverside) to break multi-ruling PDFs into
+    individual ruling records.
+
+    Returns a **list** of extracted-field dicts (one per ruling).  For
+    scrapers without splitting logic, or documents that don't split,
+    returns a single-element list equivalent to ``_reparse_document()``.
+
+    Each dict in the returned list includes:
+      - All fields from ``_reparse_document()``
+      - ``ruling_index``: int — the 1-based ruling number within the PDF
+      - ``split_document_id``: str — deterministic UUID for the split ruling
+      - ``is_split``: bool — True if this came from splitting
+    """
+    _load_scraper_registry()
+
+    split_fn = _SPLIT_REGISTRY.get(scraper_id)
+    if split_fn is None:
+        # No splitting logic — fall back to single-document reparse
+        result = _reparse_document(
+            raw_content,
+            scraper_id,
+            doc_meta,
+            pdf_timeout=pdf_timeout,
+            llm_client=llm_client,
+            llm_provider=llm_provider,
+            llm_model=llm_model,
+            llm_timeout=llm_timeout,
+            force_llm=force_llm,
+        )
+        result["ruling_index"] = 0
+        result["split_document_id"] = doc_meta["document_id"]
+        result["is_split"] = False
+        return [result]
+
+    # Extract text from the raw content (PDF or HTML)
+    doc_format = doc_meta.get("format", "html")
+    text = _extract_text_from_content(
+        raw_content,
+        doc_format,
+        pdf_timeout=pdf_timeout,
+    ).replace("\x00", "")
+
+    # Call the scraper-specific splitting function
+    split_results = split_fn(text)
+
+    if len(split_results) <= 1:
+        # Single ruling or no rulings — fall back to standard reparse
+        result = _reparse_document(
+            raw_content,
+            scraper_id,
+            doc_meta,
+            pdf_timeout=pdf_timeout,
+            llm_client=llm_client,
+            llm_provider=llm_provider,
+            llm_model=llm_model,
+            llm_timeout=llm_timeout,
+            force_llm=force_llm,
+        )
+        result["ruling_index"] = 0
+        result["split_document_id"] = doc_meta["document_id"]
+        result["is_split"] = False
+        return [result]
+
+    # Multiple rulings — split into individual records
+    content_hash = doc_meta.get("content_hash", "")
+    if not content_hash:
+        content_hash = hashlib.sha256(raw_content).hexdigest()
+
+    # Extract hearing date and judge name from the full PDF text
+    # (these are document-level, shared across all rulings).
+    scraper_cls = _SCRAPER_REGISTRY.get(scraper_id)
+    doc_judge_name: str | None = None
+    doc_hearing_date: Any = doc_meta.get("hearing_date")
+
+    if scraper_cls:
+        try:
+            config = ScraperConfig(
+                scraper_id=scraper_id,
+                state=doc_meta["state"],
+                county=doc_meta["county"],
+                court=doc_meta["court_name"],
+                target_urls=[],
+            )
+            scraper = scraper_cls(config=config)
+            # Use scraper's parse_document for doc-level field extraction
+            # by creating a synthetic doc with the full text.
+            cap_doc = CapturedDocument(
+                document_id=doc_meta["document_id"],
+                scraper_id=scraper_id,
+                state=doc_meta["state"],
+                county=doc_meta["county"],
+                court=doc_meta["court_name"],
+                source_url=doc_meta["source_url"],
+                capture_timestamp=doc_meta["captured_at"],
+                content_format=ContentFormat(doc_meta["format"]),
+                raw_content=raw_content,
+                content_hash=content_hash,
+            )
+            parsed = scraper.parse_document(cap_doc)
+            doc_judge_name = parsed.judge_name
+            if parsed.hearing_date:
+                doc_hearing_date = (
+                    parsed.hearing_date.date()
+                    if isinstance(parsed.hearing_date, datetime)
+                    else parsed.hearing_date
+                )
+            # Also try department from parsed doc
+            doc_department = parsed.department
+        except Exception:
+            logger.warning(
+                "Scraper parse_document failed during full-reparse",
+                document_id=doc_meta["document_id"],
+                exc_info=True,
+            )
+            doc_department = None
+    else:
+        doc_department = None
+
+    # Fall back to regex for judge name if scraper didn't provide one
+    if not doc_judge_name:
+        doc_judge_name = extract_judge_name(text)
+
+    logger.info(
+        "Splitting document into multiple rulings",
+        document_id=doc_meta["document_id"],
+        ruling_count=len(split_results),
+        scraper_id=scraper_id,
+    )
+
+    results: list[dict] = []
+    for ruling in split_results:
+        ruling_index = ruling.ruling_index
+        split_doc_id = _make_split_document_id(content_hash, ruling_index)
+
+        extracted: dict = {
+            "ruling_text": ruling.ruling_text.replace("\x00", "")
+            if ruling.ruling_text
+            else "",
+            "case_number": ruling.case_number or doc_meta.get("case_number"),
+            "case_title": ruling.case_title or doc_meta.get("case_title"),
+            "case_type": doc_meta.get("case_type"),
+            "judge_name": doc_judge_name,
+            "outcome": ruling.outcome,
+            "motion_type": ruling.motion_type,
+            "department": doc_department,
+            "parties": [],
+            "hearing_date": doc_hearing_date,
+            "ruling_index": ruling_index,
+            "split_document_id": split_doc_id,
+            "is_split": True,
+            "extraction_methods": {"ruling_text": "split"},
+            "llm_skipped": True,
+            "llm_outcome": "not_attempted",
+        }
+
+        # Track which fields came from the split
+        for field in ("case_number", "case_title", "outcome", "motion_type"):
+            if extracted.get(field):
+                extracted["extraction_methods"][field] = "split"
+        if doc_judge_name:
+            extracted["extraction_methods"]["judge_name"] = "scraper"
+        if doc_hearing_date:
+            extracted["extraction_methods"]["hearing_date"] = "scraper"
+        if doc_department:
+            extracted["extraction_methods"]["department"] = "scraper"
+
+        results.append(extracted)
+
+    return results
+
+
+def _supersede_document(
+    conn: psycopg.Connection,
+    document_id: str,
+) -> None:
+    """Mark a document as superseded (replaced by split children).
+
+    Sets ``documents.status = 'superseded'`` so the original unsplit
+    document is excluded from future queries and reingest runs.
+    The row is preserved for audit trail purposes.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE documents SET status = 'superseded' WHERE id = %s::uuid",
+            (document_id,),
+        )
+    logger.debug("Superseded document %s", document_id)
+
+
 def reingest_batch(
     conn: psycopg.Connection,
     s3_client: object,
@@ -581,6 +820,7 @@ def reingest_batch(
     llm_model: str | None = None,
     llm_timeout: float | None = 60.0,
     force_llm: bool = False,
+    full_reparse: bool = False,
     running_processed: int = 0,
     running_updated: int = 0,
     batch_number: int = 0,
@@ -614,6 +854,11 @@ def reingest_batch(
     that the scraper did not populate, before falling back to regex.
     If *force_llm* is True, LLM extraction runs even when all fields
     are already populated.
+
+    If *full_reparse* is True, uses ``_full_reparse_document()`` which
+    invokes the scraper's splitting logic (e.g. ``_split_rulings()`` for
+    Riverside) to break multi-ruling PDFs into individual ruling records.
+    Original unsplit documents are marked as superseded.
     """
     processed = 0
     updated = 0
@@ -749,13 +994,18 @@ def reingest_batch(
     # C extension — if the PDF parser hangs, the subprocess is killed by the
     # OS after ``parse_timeout`` seconds.  No thread-level timeout hacks are
     # needed here.
-    parsed_docs: list[tuple[dict, dict]] = []  # (doc_meta, extracted)
+    #
+    # In full_reparse mode, each document may produce multiple extracted dicts
+    # (one per split ruling).  parsed_docs stores (doc_meta, [extracted, ...]).
+    parsed_docs: list[tuple[dict, list[dict]]] = []
+
+    parse_fn = _full_reparse_document if full_reparse else _reparse_document
 
     with ThreadPoolExecutor(max_workers=parse_workers) as pool:
         parse_futures = {}
         for idx, doc_meta, raw_content in parseable:
             future = pool.submit(
-                _reparse_document,
+                parse_fn,
                 raw_content,
                 doc_meta["scraper_id"],
                 doc_meta,
@@ -772,7 +1022,7 @@ def reingest_batch(
             idx, doc_meta = parse_futures[future]
             doc_id_str = doc_meta["document_id"]
             try:
-                extracted = future.result()
+                raw_result = future.result()
             except Exception:
                 logger.warning(
                     "Parse failed, skipping",
@@ -782,15 +1032,22 @@ def reingest_batch(
                 skipped += 1
                 continue
 
-            if extracted.get("llm_skipped"):
-                llm_skipped += 1
+            # Normalize: _reparse_document returns a single dict,
+            # _full_reparse_document returns a list of dicts.
+            if isinstance(raw_result, dict):
+                extracted_list = [raw_result]
+            else:
+                extracted_list = raw_result
 
-            # Track LLM outcomes
-            doc_llm_outcome = extracted.get("llm_outcome", "not_attempted")
-            if doc_llm_outcome == "success":
-                llm_success += 1
-            elif doc_llm_outcome == "failure":
-                llm_failure += 1
+            for extracted in extracted_list:
+                if extracted.get("llm_skipped"):
+                    llm_skipped += 1
+
+                doc_llm_outcome = extracted.get("llm_outcome", "not_attempted")
+                if doc_llm_outcome == "success":
+                    llm_success += 1
+                elif doc_llm_outcome == "failure":
+                    llm_failure += 1
 
             logger.info(
                 "document_progress",
@@ -798,24 +1055,28 @@ def reingest_batch(
                 document_id=doc_id_str,
                 county=doc_meta["county"],
                 case_number=doc_meta.get("case_number"),
-                llm_outcome=doc_llm_outcome,
+                ruling_count=len(extracted_list),
+                full_reparse=full_reparse,
             )
 
             if dry_run:
-                logger.info(
-                    "DRY-RUN",
-                    document_id=doc_id_str,
-                    county=doc_meta["county"],
-                    judge=extracted["judge_name"],
-                    outcome=extracted["outcome"],
-                    motion_type=extracted["motion_type"],
-                    case_title=extracted["case_title"],
-                    case_number=extracted["case_number"],
-                    parties_count=len(extracted["parties"]),
-                )
+                for extracted in extracted_list:
+                    logger.info(
+                        "DRY-RUN",
+                        document_id=extracted.get("split_document_id", doc_id_str),
+                        county=doc_meta["county"],
+                        judge=extracted["judge_name"],
+                        outcome=extracted["outcome"],
+                        motion_type=extracted["motion_type"],
+                        case_title=extracted["case_title"],
+                        case_number=extracted["case_number"],
+                        ruling_index=extracted.get("ruling_index", 0),
+                        is_split=extracted.get("is_split", False),
+                        parties_count=len(extracted["parties"]),
+                    )
                 continue
 
-            parsed_docs.append((doc_meta, extracted))
+            parsed_docs.append((doc_meta, extracted_list))
 
     if dry_run or not parsed_docs:
         return {
@@ -830,89 +1091,115 @@ def reingest_batch(
             "batch_number": batch_number,
         }
 
-    # --- DB writes — commit after each document ------------------------------
-    # Each document is written inside a savepoint and then committed
-    # individually.  This ensures that a crash mid-batch does not lose
-    # already-processed documents.  The DB writes are idempotent (upserts),
-    # so partial batch commits are safe.
-    for doc_meta, extracted in parsed_docs:
+    # --- DB writes — commit after each source document -----------------------
+    # Each source document (and all its split children) is written inside a
+    # single savepoint and then committed.  This ensures atomicity: either
+    # all split rulings from a document are written, or none are.
+    for doc_meta, extracted_list in parsed_docs:
         doc_id_str = doc_meta["document_id"]
         court_id_str = doc_meta["court_id"]
 
         try:
             with conn.transaction():
-                effective_case_number = (
-                    extracted["case_number"]
-                    or doc_meta["case_number"]
-                    or f"UNKNOWN-{doc_id_str}"
-                )
-                new_case_id = upsert_case(
-                    conn,
-                    effective_case_number,
-                    court_id_str,
-                    case_title=extracted["case_title"],
-                    case_type=extracted.get("case_type"),
-                )
+                # Check if this document was split into multiple rulings
+                any_split = any(e.get("is_split") for e in extracted_list)
 
-                effective_hearing = (
-                    extracted["hearing_date"] or doc_meta["hearing_date"]
-                )
-                insert_document(
-                    conn,
-                    document_id=doc_id_str,
-                    case_id=new_case_id,
-                    court_id=court_id_str,
-                    content_format=doc_meta["format"],
-                    content_hash=doc_meta["content_hash"],
-                    s3_key=doc_meta["s3_key"],
-                    s3_bucket=doc_meta["s3_bucket"],
-                    source_url=doc_meta["source_url"],
-                    scraper_id=doc_meta["scraper_id"],
-                    captured_at=doc_meta["captured_at"],
-                    hearing_date=effective_hearing,
-                )
-
-                # Resolve judge
-                judge_id = None
-                if extracted["judge_name"]:
-                    judge_id = resolve_judge(
-                        conn, extracted["judge_name"], court_id_str
+                for extracted in extracted_list:
+                    # Use split_document_id if available, otherwise original
+                    effective_doc_id = extracted.get("split_document_id", doc_id_str)
+                    effective_case_number = (
+                        extracted["case_number"]
+                        or doc_meta["case_number"]
+                        or f"UNKNOWN-{effective_doc_id}"
+                    )
+                    new_case_id = upsert_case(
+                        conn,
+                        effective_case_number,
+                        court_id_str,
+                        case_title=extracted["case_title"],
+                        case_type=extracted.get("case_type"),
                     )
 
-                # Upsert ruling
-                if effective_hearing is not None:
-                    ruling_text = extracted["ruling_text"]
-                    # Clean ruling text if it's the full raw HTML — take first 50k chars
-                    if ruling_text and len(ruling_text) > 50000:
-                        ruling_text = ruling_text[:50000]
+                    effective_hearing = (
+                        extracted["hearing_date"] or doc_meta["hearing_date"]
+                    )
 
-                    insert_ruling(
+                    # For split documents, generate a synthetic content hash
+                    # by incorporating the ruling index.  All split children
+                    # share the same S3 object (s3_key, s3_bucket), so a
+                    # unique hash per ruling is needed to satisfy the DB's
+                    # UNIQUE constraint on (s3_bucket, s3_key, content_hash).
+                    if extracted.get("is_split"):
+                        ruling_idx = extracted.get("ruling_index", 0)
+                        split_hash = hashlib.sha256(
+                            f"{doc_meta['content_hash']}:ruling:{ruling_idx}".encode()
+                        ).hexdigest()
+                    else:
+                        split_hash = doc_meta["content_hash"]
+
+                    insert_document(
                         conn,
-                        document_id=doc_id_str,
+                        document_id=effective_doc_id,
                         case_id=new_case_id,
                         court_id=court_id_str,
+                        content_format=doc_meta["format"],
+                        content_hash=split_hash,
+                        s3_key=doc_meta["s3_key"],
+                        s3_bucket=doc_meta["s3_bucket"],
+                        source_url=doc_meta["source_url"],
+                        scraper_id=doc_meta["scraper_id"],
+                        captured_at=doc_meta["captured_at"],
                         hearing_date=effective_hearing,
-                        ruling_text=ruling_text,
-                        department=extracted["department"],
-                        judge_id=judge_id,
-                        outcome=extracted["outcome"],
-                        motion_type=extracted["motion_type"],
                     )
 
-                if judge_id:
-                    upsert_case_judge(conn, new_case_id, judge_id, effective_hearing)
+                    # Resolve judge
+                    judge_id = None
+                    if extracted["judge_name"]:
+                        judge_id = resolve_judge(
+                            conn, extracted["judge_name"], court_id_str
+                        )
 
-                # Parties (batched — O(1) queries regardless of party count)
-                batch_upsert_parties(conn, new_case_id, extracted.get("parties", []))
+                    # Upsert ruling
+                    if effective_hearing is not None:
+                        ruling_text = extracted["ruling_text"]
+                        if ruling_text and len(ruling_text) > 50000:
+                            ruling_text = ruling_text[:50000]
 
-            # Commit immediately so this document is durable even if a
-            # later document (or the process) crashes.
+                        insert_ruling(
+                            conn,
+                            document_id=effective_doc_id,
+                            case_id=new_case_id,
+                            court_id=court_id_str,
+                            hearing_date=effective_hearing,
+                            ruling_text=ruling_text,
+                            department=extracted["department"],
+                            judge_id=judge_id,
+                            outcome=extracted["outcome"],
+                            motion_type=extracted["motion_type"],
+                        )
+
+                    if judge_id:
+                        upsert_case_judge(
+                            conn, new_case_id, judge_id, effective_hearing
+                        )
+
+                    # Parties
+                    batch_upsert_parties(
+                        conn, new_case_id, extracted.get("parties", [])
+                    )
+
+                # If the document was split, supersede the original
+                if any_split:
+                    _supersede_document(conn, doc_id_str)
+
             conn.commit()
             updated += 1
 
             logger.info(
                 "Committed document",
                 document_id=doc_id_str,
+                ruling_count=len(extracted_list),
+                split=any_split,
                 total_processed=running_processed + processed,
                 total_updated=running_updated + updated,
             )
@@ -953,6 +1240,7 @@ def run_reingest(
     no_llm: bool = False,
     llm_timeout: float | None = 60.0,
     force_llm: bool = False,
+    full_reparse: bool = False,
 ) -> dict[str, int]:
     """Run the full reingest. Returns summary stats."""
     filters, filter_params = _build_filters(county, date_from, date_to)
@@ -1022,6 +1310,7 @@ def run_reingest(
                 llm_model=llm_model,
                 llm_timeout=llm_timeout,
                 force_llm=force_llm,
+                full_reparse=full_reparse,
                 running_processed=total_processed,
                 running_updated=total_updated,
                 batch_number=total_batches,
@@ -1139,6 +1428,16 @@ def main() -> None:
         action="store_true",
         help="Force LLM extraction even when all fields are already populated.",
     )
+    parser.add_argument(
+        "--full-reparse",
+        action="store_true",
+        help=(
+            "Enable full reparse with splitting logic. For scrapers that "
+            "produce multi-ruling documents (e.g. Riverside), this splits "
+            "each PDF into individual ruling records and supersedes the "
+            "original unsplit document. Deterministic IDs ensure idempotency."
+        ),
+    )
     args = parser.parse_args()
 
     dsn = os.environ.get("DATABASE_URL")
@@ -1163,6 +1462,7 @@ def main() -> None:
         no_llm=args.no_llm,
         llm_timeout=args.llm_timeout,
         force_llm=args.force_llm,
+        full_reparse=args.full_reparse,
     )
 
     logger.info(
