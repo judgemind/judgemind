@@ -1582,21 +1582,43 @@ class TestScraperRegistryAutoDiscovery:
         assert len(reingest._SCRAPER_REGISTRY) > 0
 
     def test_registry_contains_all_known_scrapers(self) -> None:
-        """Registry should contain all scraper modules that have default_config()."""
-        reingest._load_scraper_registry()
+        """Registry should contain all scraper modules that have default_config().
 
-        # These are the scraper_ids from the known court modules
-        expected_ids = {
-            "ca-la-tentatives-civil",
-            "ca-oc-tentatives-civil",
-            "ca-oc-tentatives-family-law",
-            "ca-oc-tentatives-probate",
-            "ca-sb-tentatives-civil",
-            "ca-sf-tentatives-family-law",
-            "ca-sc-tentatives-civil",
-            "ca-riverside-tentatives-civil",
-            "ca-fresno-tentatives-civil",
-        }
+        Auto-discovers expected scraper IDs rather than maintaining a hardcoded
+        set, so adding a new scraper never requires updating this test (#680).
+        """
+        import inspect
+        import pkgutil
+
+        import courts
+        from framework.base import BaseScraper
+
+        # Build expected set by walking the courts package — same discovery
+        # strategy as _load_scraper_registry() itself.
+        expected_ids: set[str] = set()
+        for _importer, modname, ispkg in pkgutil.walk_packages(courts.__path__, prefix="courts."):
+            if ispkg:
+                continue
+            try:
+                mod = importlib.import_module(modname)
+            except Exception:  # noqa: BLE001
+                continue
+            config_fn = getattr(mod, "default_config", None)
+            if config_fn is None or not callable(config_fn):
+                continue
+            # Verify there is a concrete BaseScraper subclass in the module.
+            has_scraper = any(
+                inspect.isclass(obj)
+                and issubclass(obj, BaseScraper)
+                and obj is not BaseScraper
+                and obj.__module__ == mod.__name__
+                for _name, obj in inspect.getmembers(mod, inspect.isclass)
+            )
+            if not has_scraper:
+                continue
+            expected_ids.add(config_fn().scraper_id)
+
+        reingest._load_scraper_registry()
         assert expected_ids == set(reingest._SCRAPER_REGISTRY.keys())
 
 
