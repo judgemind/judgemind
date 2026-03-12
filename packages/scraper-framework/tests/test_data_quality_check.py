@@ -1948,3 +1948,71 @@ class TestSqlSchemaValidation:
         assert ("d", "id") in alias_cols
         # county_filter should not appear
         assert not any(c == "county_filter" for _, c in alias_cols)
+
+
+# ---------------------------------------------------------------------------
+# Integration: staleness check prefers scraper_runs over captured_at (#894)
+# ---------------------------------------------------------------------------
+
+
+class TestStalenessCheckPrefersScraperRuns:
+    """Verify that check_scraper_staleness uses scraper_runs data when available,
+    even when documents.captured_at would give a different (stale) answer.
+
+    This is the integration test for #894: once the runner populates scraper_runs,
+    the staleness check should use started_at from scraper_runs instead of
+    falling back to MAX(documents.captured_at).
+    """
+
+    def test_uses_scraper_runs_when_available(self) -> None:
+        """When scraper_runs has a recent entry, staleness check should report
+        fresh — even if captured_at is old (because no new documents were found)."""
+        recent_run = NOW - timedelta(hours=1)  # scraper ran 1h ago
+        old_capture = NOW - timedelta(hours=20)  # last doc capture was 20h ago
+
+        conn = FakeConnection(
+            {
+                "scraper_runs": [("ca-la-tentatives-civil", "Los Angeles", recent_run, "success")],
+                "MAX(d.captured_at)": [("Los Angeles", old_capture)],
+            }
+        )
+        baselines = _make_baselines()
+        alerts = check_scraper_staleness(conn, NOW, baselines)
+
+        # Should be zero alerts because scraper_runs shows a recent run
+        assert len(alerts) == 0
+
+    def test_falls_back_to_captured_at_without_scraper_runs(self) -> None:
+        """When scraper_runs is empty but captured_at is stale, should alert
+        with source=documents.captured_at."""
+        old_capture = NOW - timedelta(hours=20)
+
+        conn = FakeConnection(
+            {
+                "scraper_runs": [],
+                "MAX(d.captured_at)": [("Los Angeles", old_capture)],
+            }
+        )
+        baselines = _make_baselines()
+        alerts = check_scraper_staleness(conn, NOW, baselines)
+
+        assert len(alerts) == 1
+        assert alerts[0].county == "Los Angeles"
+        assert "captured_at" in alerts[0].message
+
+    def test_scraper_runs_source_label(self) -> None:
+        """When scraper_runs provides the data, the alert source should say
+        'scraper_runs' if the scraper is stale."""
+        stale_run = NOW - timedelta(hours=20)
+
+        conn = FakeConnection(
+            {
+                "scraper_runs": [("ca-la-tentatives-civil", "Los Angeles", stale_run, "success")],
+                "MAX(d.captured_at)": [],
+            }
+        )
+        baselines = _make_baselines()
+        alerts = check_scraper_staleness(conn, NOW, baselines)
+
+        assert len(alerts) == 1
+        assert "scraper_runs" in alerts[0].message

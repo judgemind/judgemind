@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 import sys
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -12,7 +12,17 @@ import pytest
 from framework import CapturedDocument, ContentFormat, ScraperConfig
 from framework.base import BaseScraper
 from framework.models import ScraperHealthEvent
-from framework.runner import _REGISTRY, _build_registry, get_scraper_ids, main, run_scrapers
+from framework.runner import (
+    _REGISTRY,
+    _build_registry,
+    _connect_db,
+    _resolve_court_id,
+    get_scraper_ids,
+    main,
+    record_scraper_exception,
+    record_scraper_run,
+    run_scrapers,
+)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -734,3 +744,347 @@ class TestEventBusIntegration:
 
         assert exit_code == 0
         assert captured_event_bus["bus"] is mock_bus
+
+
+# ---------------------------------------------------------------------------
+# Database helpers tests — _connect_db, _resolve_court_id, record_scraper_run
+# ---------------------------------------------------------------------------
+
+
+class TestConnectDb:
+    """Tests for _connect_db()."""
+
+    def test_returns_none_when_no_database_url(self) -> None:
+        """Should return None when DATABASE_URL is not set."""
+        env = os.environ.copy()
+        env.pop("DATABASE_URL", None)
+        with patch.dict(os.environ, env, clear=True):
+            result = _connect_db()
+        assert result is None
+
+    def test_returns_connection_when_url_set(self) -> None:
+        """Should return a connection object when DATABASE_URL is set."""
+        mock_conn = MagicMock()
+        with (
+            patch.dict(os.environ, {"DATABASE_URL": "postgresql://localhost/test"}),
+            patch("framework.runner.psycopg.connect", return_value=mock_conn) as mock_connect,
+        ):
+            result = _connect_db()
+        assert result is mock_conn
+        mock_connect.assert_called_once_with("postgresql://localhost/test", autocommit=True)
+
+    def test_returns_none_on_connection_error(self) -> None:
+        """Should return None and log warning if connection fails."""
+        with (
+            patch.dict(os.environ, {"DATABASE_URL": "postgresql://bad-host/test"}),
+            patch("framework.runner.psycopg.connect", side_effect=Exception("conn failed")),
+        ):
+            result = _connect_db()
+        assert result is None
+
+
+class TestResolveCourtId:
+    """Tests for _resolve_court_id()."""
+
+    def test_resolves_court_id(self) -> None:
+        """Should look up court by state and county and cache the result."""
+        mock_conn = MagicMock()
+        mock_cursor = MagicMock()
+        mock_cursor.fetchone.return_value = ("court-uuid-123",)
+        mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cursor)
+        mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+
+        cache: dict[tuple[str, str], str | None] = {}
+        result = _resolve_court_id(mock_conn, "CA", "Los Angeles", cache)
+
+        assert result == "court-uuid-123"
+        assert cache[("CA", "Los Angeles")] == "court-uuid-123"
+
+    def test_returns_cached_value(self) -> None:
+        """Should return cached value without querying DB again."""
+        mock_conn = MagicMock()
+        cache: dict[tuple[str, str], str | None] = {("CA", "Orange"): "cached-uuid"}
+
+        result = _resolve_court_id(mock_conn, "CA", "Orange", cache)
+
+        assert result == "cached-uuid"
+        mock_conn.cursor.assert_not_called()
+
+    def test_returns_none_when_court_not_found(self) -> None:
+        """Should return None when court doesn't exist in DB."""
+        mock_conn = MagicMock()
+        mock_cursor = MagicMock()
+        mock_cursor.fetchone.return_value = None
+        mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cursor)
+        mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+
+        cache: dict[tuple[str, str], str | None] = {}
+        result = _resolve_court_id(mock_conn, "CA", "NonExistent", cache)
+
+        assert result is None
+        assert cache[("CA", "NonExistent")] is None
+
+    def test_returns_none_on_query_error(self) -> None:
+        """Should return None and cache it on query error."""
+        mock_conn = MagicMock()
+        mock_conn.cursor.return_value.__enter__ = MagicMock(side_effect=Exception("query failed"))
+        mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+
+        cache: dict[tuple[str, str], str | None] = {}
+        result = _resolve_court_id(mock_conn, "CA", "Bad", cache)
+
+        assert result is None
+
+
+class TestRecordScraperRun:
+    """Tests for record_scraper_run()."""
+
+    def _make_health(
+        self,
+        success: bool = True,
+        records: int = 5,
+        elapsed: float = 1.5,
+        error: str | None = None,
+    ) -> ScraperHealthEvent:
+        return ScraperHealthEvent(
+            producer_id="test-scraper",
+            scraper_id="test-scraper",
+            success=success,
+            records_captured=records,
+            response_time_seconds=elapsed,
+            error_message=error,
+            run_timestamp=datetime(2026, 3, 12, 10, 0, 0, tzinfo=UTC),
+        )
+
+    def _make_config(self) -> ScraperConfig:
+        return ScraperConfig(
+            scraper_id="test-scraper",
+            state="CA",
+            county="Test",
+            court="Superior Court",
+            target_urls=["https://example.com"],
+        )
+
+    def test_records_successful_run(self) -> None:
+        """Should insert a row with status 'success'."""
+        mock_conn = MagicMock()
+        mock_cursor = MagicMock()
+        mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cursor)
+        mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+
+        health = self._make_health()
+        config = self._make_config()
+        cache: dict[tuple[str, str], str | None] = {("CA", "Test"): "court-uuid"}
+
+        record_scraper_run(mock_conn, health, config, cache)
+
+        # Verify INSERT was called
+        mock_cursor.execute.assert_called_once()
+        sql, params = mock_cursor.execute.call_args[0]
+        assert "INSERT INTO scraper_runs" in sql
+        assert params[0] == "test-scraper"  # scraper_id
+        assert params[1] == "court-uuid"  # court_id
+        assert params[4] == "success"  # status
+        assert params[5] == 5  # records_captured
+        assert params[6] == 0  # records_failed
+        assert params[7] is None  # error_message
+        assert params[8] == 1500  # response_time_ms
+
+    def test_records_failed_run(self) -> None:
+        """Should insert a row with status 'failure' and error message."""
+        mock_conn = MagicMock()
+        mock_cursor = MagicMock()
+        mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cursor)
+        mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+
+        health = self._make_health(success=False, records=0, error="site down")
+        config = self._make_config()
+        cache: dict[tuple[str, str], str | None] = {("CA", "Test"): None}
+
+        record_scraper_run(mock_conn, health, config, cache)
+
+        sql, params = mock_cursor.execute.call_args[0]
+        assert params[4] == "failure"  # status
+        assert params[7] == "site down"  # error_message
+
+    def test_db_error_does_not_raise(self) -> None:
+        """Should catch DB errors without propagating them."""
+        mock_conn = MagicMock()
+        mock_cursor = MagicMock()
+        mock_cursor.execute.side_effect = Exception("DB write failed")
+        mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cursor)
+        mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+
+        health = self._make_health()
+        config = self._make_config()
+        cache: dict[tuple[str, str], str | None] = {("CA", "Test"): "court-uuid"}
+
+        # Should not raise
+        record_scraper_run(mock_conn, health, config, cache)
+
+    def test_completed_at_calculation(self) -> None:
+        """Should compute completed_at as started_at + response_time_seconds."""
+        mock_conn = MagicMock()
+        mock_cursor = MagicMock()
+        mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cursor)
+        mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+
+        health = self._make_health(elapsed=2.5)
+        config = self._make_config()
+        cache: dict[tuple[str, str], str | None] = {("CA", "Test"): "court-uuid"}
+
+        record_scraper_run(mock_conn, health, config, cache)
+
+        sql, params = mock_cursor.execute.call_args[0]
+        started_at = params[2]
+        completed_at = params[3]
+        assert completed_at == started_at + timedelta(seconds=2.5)
+
+
+class TestRecordScraperException:
+    """Tests for record_scraper_exception()."""
+
+    def test_records_exception_as_failure(self) -> None:
+        """Should insert a row with status 'failure' for unhandled exceptions."""
+        mock_conn = MagicMock()
+        mock_cursor = MagicMock()
+        mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cursor)
+        mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+
+        config = ScraperConfig(
+            scraper_id="bad-scraper",
+            state="CA",
+            county="Test",
+            court="Superior Court",
+            target_urls=["https://example.com"],
+        )
+        started_at = datetime(2026, 3, 12, 10, 0, 0, tzinfo=UTC)
+        cache: dict[tuple[str, str], str | None] = {("CA", "Test"): "court-uuid"}
+
+        record_scraper_exception(mock_conn, "bad-scraper", config, started_at, "kaboom", 0.5, cache)
+
+        sql, params = mock_cursor.execute.call_args[0]
+        assert "INSERT INTO scraper_runs" in sql
+        assert params[0] == "bad-scraper"  # scraper_id
+        assert params[4] == "failure"  # status
+        assert params[5] == 0  # records_captured
+        assert params[7] == "kaboom"  # error_message
+        assert params[8] == 500  # response_time_ms
+
+    def test_db_error_does_not_raise(self) -> None:
+        """Should catch DB errors without propagating them."""
+        mock_conn = MagicMock()
+        mock_cursor = MagicMock()
+        mock_cursor.execute.side_effect = Exception("DB write failed")
+        mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cursor)
+        mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+
+        config = ScraperConfig(
+            scraper_id="bad-scraper",
+            state="CA",
+            county="Test",
+            court="Superior Court",
+            target_urls=["https://example.com"],
+        )
+        started_at = datetime(2026, 3, 12, 10, 0, 0, tzinfo=UTC)
+        cache: dict[tuple[str, str], str | None] = {("CA", "Test"): "court-uuid"}
+
+        # Should not raise
+        record_scraper_exception(mock_conn, "bad-scraper", config, started_at, "kaboom", 0.5, cache)
+
+
+# ---------------------------------------------------------------------------
+# Integration: run_scrapers records to DB
+# ---------------------------------------------------------------------------
+
+
+class TestRunScrapersDbRecording:
+    """Integration tests verifying run_scrapers records scraper runs to the DB."""
+
+    def test_records_successful_run_to_db(self) -> None:
+        """run_scrapers should call record_scraper_run for successful scrapers."""
+        entries = [("test-stub", StubScraper, _stub_config)]
+        mock_conn = MagicMock()
+        mock_cursor = MagicMock()
+        mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cursor)
+        mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+
+        with (
+            _patch_registry(entries),
+            patch("framework.runner._connect_db", return_value=mock_conn),
+        ):
+            exit_code = run_scrapers()
+
+        assert exit_code == 0
+        # Verify at least one INSERT INTO scraper_runs was attempted
+        insert_calls = [
+            c
+            for c in mock_cursor.execute.call_args_list
+            if len(c[0]) > 0 and "INSERT INTO scraper_runs" in str(c[0][0])
+        ]
+        assert len(insert_calls) == 1
+
+    def test_records_exception_to_db(self) -> None:
+        """run_scrapers should record a failure row when scraper.run() raises."""
+
+        class RunRaisingScraper(BaseScraper):
+            def fetch_documents(self) -> list[CapturedDocument]:
+                return []
+
+            def parse_document(self, doc: CapturedDocument) -> CapturedDocument:
+                return doc
+
+            def run(self) -> ScraperHealthEvent:
+                raise RuntimeError("run() exploded")
+
+        entries = [("failing", RunRaisingScraper, _stub_config)]
+        mock_conn = MagicMock()
+        mock_cursor = MagicMock()
+        mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cursor)
+        mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+
+        with (
+            _patch_registry(entries),
+            patch("framework.runner._connect_db", return_value=mock_conn),
+        ):
+            exit_code = run_scrapers()
+
+        assert exit_code == 1
+        # Should have recorded the exception
+        insert_calls = [
+            c
+            for c in mock_cursor.execute.call_args_list
+            if len(c[0]) > 0 and "INSERT INTO scraper_runs" in str(c[0][0])
+        ]
+        assert len(insert_calls) == 1
+        params = insert_calls[0][0][1]
+        assert params[4] == "failure"
+        assert "run() exploded" in params[7]
+
+    def test_no_db_recording_when_database_url_unset(self) -> None:
+        """run_scrapers should skip DB recording when no DB connection available."""
+        entries = [("test-stub", StubScraper, _stub_config)]
+
+        with (
+            _patch_registry(entries),
+            patch("framework.runner._connect_db", return_value=None),
+        ):
+            exit_code = run_scrapers()
+
+        assert exit_code == 0
+
+    def test_db_connection_closed_after_run(self) -> None:
+        """run_scrapers should close the DB connection when done."""
+        entries = [("test-stub", StubScraper, _stub_config)]
+        mock_conn = MagicMock()
+        mock_cursor = MagicMock()
+        mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cursor)
+        mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+
+        with (
+            _patch_registry(entries),
+            patch("framework.runner._connect_db", return_value=mock_conn),
+        ):
+            run_scrapers()
+
+        mock_conn.close.assert_called_once()

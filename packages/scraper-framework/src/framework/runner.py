@@ -9,6 +9,10 @@ Reads REDIS_URL from the environment. When set, document.captured and
 scraper.health events are emitted to Redis Streams. When unset, event
 emission is silently skipped.
 
+Reads DATABASE_URL from the environment. When set, each scraper run is
+recorded in the ``scraper_runs`` table. When unset, run recording is
+silently skipped.
+
 Usage:
     python -m framework.runner                  # run all registered scrapers
     python -m framework.runner ca-la-tentatives # run a single scraper by ID
@@ -18,14 +22,151 @@ from __future__ import annotations
 
 import os
 import sys
+import time
+from datetime import UTC, datetime, timedelta
 
+import psycopg
 import structlog
 
 from .event_bus import RedisEventBus
-from .models import ScraperConfig
+from .models import ScraperConfig, ScraperHealthEvent
 from .storage import S3Archiver
 
 logger = structlog.get_logger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Database helpers — scraper_runs recording
+# ---------------------------------------------------------------------------
+
+
+def _connect_db() -> psycopg.Connection | None:  # type: ignore[type-arg]
+    """Open a DB connection from DATABASE_URL, or return None if unavailable."""
+    database_url = os.environ.get("DATABASE_URL", "")
+    if not database_url:
+        return None
+    try:
+        conn = psycopg.connect(database_url, autocommit=True)
+        return conn
+    except Exception as exc:
+        logger.warning("Failed to connect to database — run recording disabled", error=str(exc))
+        return None
+
+
+def _resolve_court_id(
+    conn: psycopg.Connection,  # type: ignore[type-arg]
+    state: str,
+    county: str,
+    cache: dict[tuple[str, str], str | None],
+) -> str | None:
+    """Look up court UUID by state+county, with per-run caching."""
+    key = (state, county)
+    if key in cache:
+        return cache[key]
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id FROM courts WHERE state = %s AND county = %s LIMIT 1",
+                (state, county),
+            )
+            row = cur.fetchone()
+            court_id = str(row[0]) if row else None
+    except Exception as exc:
+        logger.warning("Failed to resolve court_id", state=state, county=county, error=str(exc))
+        court_id = None
+    cache[key] = court_id
+    return court_id
+
+
+def record_scraper_run(
+    conn: psycopg.Connection,  # type: ignore[type-arg]
+    health: ScraperHealthEvent,
+    config: ScraperConfig,
+    court_id_cache: dict[tuple[str, str], str | None],
+) -> None:
+    """Write a row to scraper_runs for this scraper execution."""
+    court_id = _resolve_court_id(conn, config.state, config.county, court_id_cache)
+    started_at = health.run_timestamp
+    completed_at = started_at + timedelta(seconds=health.response_time_seconds)
+    status = "success" if health.success else "failure"
+    response_time_ms = round(health.response_time_seconds * 1000)
+
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO scraper_runs
+                    (scraper_id, court_id, started_at, completed_at, status,
+                     records_captured, records_failed, error_message, response_time_ms)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    health.scraper_id,
+                    court_id,
+                    started_at,
+                    completed_at,
+                    status,
+                    health.records_captured,
+                    0,  # records_failed not tracked by ScraperHealthEvent
+                    health.error_message,
+                    response_time_ms,
+                ),
+            )
+        logger.info(
+            "Recorded scraper run",
+            scraper_id=health.scraper_id,
+            status=status,
+            records=health.records_captured,
+        )
+    except Exception as exc:
+        logger.warning("Failed to record scraper run", scraper_id=health.scraper_id, error=str(exc))
+
+
+def record_scraper_exception(
+    conn: psycopg.Connection,  # type: ignore[type-arg]
+    scraper_id: str,
+    config: ScraperConfig,
+    started_at: datetime,
+    error_message: str,
+    elapsed_seconds: float,
+    court_id_cache: dict[tuple[str, str], str | None],
+) -> None:
+    """Record a scraper_runs row for a scraper that raised an unhandled exception."""
+    court_id = _resolve_court_id(conn, config.state, config.county, court_id_cache)
+    completed_at = started_at + timedelta(seconds=elapsed_seconds)
+    response_time_ms = round(elapsed_seconds * 1000)
+
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO scraper_runs
+                    (scraper_id, court_id, started_at, completed_at, status,
+                     records_captured, records_failed, error_message, response_time_ms)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    scraper_id,
+                    court_id,
+                    started_at,
+                    completed_at,
+                    "failure",
+                    0,
+                    0,
+                    error_message,
+                    response_time_ms,
+                ),
+            )
+        logger.info(
+            "Recorded scraper exception run",
+            scraper_id=scraper_id,
+            error=error_message,
+        )
+    except Exception as exc:
+        logger.warning(
+            "Failed to record scraper exception run", scraper_id=scraper_id, error=str(exc)
+        )
+
 
 # ---------------------------------------------------------------------------
 # Scraper registry
@@ -109,6 +250,14 @@ def run_scrapers(scraper_ids: list[str] | None = None) -> int:
 
     event_bus = RedisEventBus.from_env()
 
+    db_conn = _connect_db()
+    if db_conn:
+        logger.info("Database recording enabled")
+    else:
+        logger.info("Database recording disabled (DATABASE_URL not set or connection failed)")
+
+    court_id_cache: dict[tuple[str, str], str | None] = {}
+
     registry = _build_registry()
 
     # Filter to requested scrapers
@@ -182,12 +331,29 @@ def run_scrapers(scraper_ids: list[str] | None = None) -> int:
 
         scraper = scraper_cls(config=config, archiver=archiver, event_bus=event_bus, **extra_kwargs)
 
+        run_start = time.monotonic()
+        run_started_at = datetime.now(UTC)
+
         try:
             health = scraper.run()
         except Exception as exc:
             log.error("Unhandled exception in scraper", error=str(exc))
+            elapsed = time.monotonic() - run_start
+            if db_conn:
+                record_scraper_exception(
+                    db_conn,
+                    scraper_id,
+                    config,
+                    run_started_at,
+                    str(exc),
+                    elapsed,
+                    court_id_cache,
+                )
             had_failure = True
             continue
+
+        if db_conn:
+            record_scraper_run(db_conn, health, config, court_id_cache)
 
         if health.success:
             log.info(
@@ -202,6 +368,12 @@ def run_scrapers(scraper_ids: list[str] | None = None) -> int:
                 records=health.records_captured,
             )
             had_failure = True
+
+    if db_conn:
+        try:
+            db_conn.close()
+        except Exception:
+            pass
 
     if not had_failure:
         # This marker is matched by the CloudWatch metric filter
