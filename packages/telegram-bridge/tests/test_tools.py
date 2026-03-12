@@ -489,6 +489,14 @@ class TestExecuteShellCommand:
         )
         assert "--rw flag is not allowed" in result.lower()
 
+    def test_dev_db_query_rw_flag_blocked_any_position(self, tmp_path: Path) -> None:
+        """The --rw flag must be blocked even when not in the first position."""
+        result = execute_shell_command(
+            repo_root=tmp_path,
+            command='scripts/dev-db-query.sh "SELECT 1" --rw',
+        )
+        assert "--rw flag is not allowed" in result.lower()
+
     def test_dev_db_query_keyword_in_literal_allowed(self, tmp_path: Path) -> None:
         """Keywords inside string literals should not trigger blocking."""
         result = execute_shell_command(

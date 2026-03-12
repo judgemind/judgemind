@@ -399,8 +399,9 @@ def execute_shell_command(
     # Validate SQL safety for dev-db-query.sh commands.
     if args[0] == "scripts/dev-db-query.sh":
         # Block --rw flag — Telegram queries must always use the default
-        # read-only mode for defense-in-depth.
-        if len(args) >= 2 and args[1] == "--rw":
+        # read-only mode for defense-in-depth.  Scan all arguments so the
+        # guard works regardless of where --rw appears in the command.
+        if "--rw" in args:
             return (
                 "Error: the --rw flag is not allowed through the Telegram interface. "
                 "All Telegram database queries run in read-only mode."
