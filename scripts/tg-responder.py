@@ -529,6 +529,160 @@ def queue_to_inbox(message: dict[str, object], inbox_file: str) -> None:
         logger.warning("Failed to write inbox file", exc_info=True)
 
 
+# ── Photo handling ──────────────────────────────────────────────────────
+
+
+def download_telegram_photo(
+    *,
+    file_id: str,
+    bot_token: str,
+    save_dir: str,
+    message_id: int | None = None,
+) -> str | None:
+    """Download a photo from Telegram and save it locally.
+
+    Uses the Telegram Bot API ``getFile`` endpoint to resolve the file path,
+    then downloads the file content.
+
+    Args:
+        file_id: Telegram file_id of the photo to download.
+        bot_token: Telegram bot token for API authentication.
+        save_dir: Directory to save the downloaded photo (e.g. ``tmp/tg_photos``).
+        message_id: Optional message ID for the filename.
+
+    Returns:
+        The absolute path to the saved file, or ``None`` if the download failed.
+    """
+    save_path = Path(save_dir)
+    save_path.mkdir(parents=True, exist_ok=True)
+
+    try:
+        with httpx.Client(timeout=30.0) as client:
+            # Step 1: Get the file path from Telegram.
+            get_file_resp = client.get(
+                f"{TELEGRAM_API_BASE}/bot{bot_token}/getFile",
+                params={"file_id": file_id},
+            )
+            if get_file_resp.status_code != 200:
+                logger.warning(
+                    "Telegram getFile returned %d for file_id %s",
+                    get_file_resp.status_code,
+                    file_id,
+                )
+                return None
+
+            file_data = get_file_resp.json()
+            file_path = file_data.get("result", {}).get("file_path", "")
+            if not file_path:
+                logger.warning("Telegram getFile returned no file_path for %s", file_id)
+                return None
+
+            # Step 2: Download the file content.
+            download_url = f"{TELEGRAM_API_BASE}/file/bot{bot_token}/{file_path}"
+            download_resp = client.get(download_url)
+            if download_resp.status_code != 200:
+                logger.warning(
+                    "Telegram file download returned %d for %s",
+                    download_resp.status_code,
+                    file_path,
+                )
+                return None
+
+            # Determine file extension from the Telegram file path.
+            ext = Path(file_path).suffix or ".jpg"
+            timestamp = datetime.datetime.now(datetime.timezone.utc).strftime(
+                "%Y%m%d_%H%M%S"
+            )
+            msg_suffix = f"_{message_id}" if message_id is not None else ""
+            filename = f"{timestamp}{msg_suffix}{ext}"
+            local_path = save_path / filename
+
+            local_path.write_bytes(download_resp.content)
+            logger.info(
+                "Saved photo to %s (%d bytes)", local_path, len(download_resp.content)
+            )
+            return str(local_path)
+
+    except Exception:
+        logger.warning("Failed to download photo %s", file_id, exc_info=True)
+        return None
+
+
+def handle_photo_message(
+    *,
+    message: dict[str, object],
+    bot_token: str,
+    chat_ids: list[int],
+    inbox_file: str,
+    photos_dir: str = "tmp/tg_photos",
+) -> None:
+    """Handle an inbound photo message.
+
+    Downloads the largest photo variant, saves it locally, creates an inbox
+    entry for the orchestrator, and replies to the user confirming receipt.
+
+    Args:
+        message: The parsed SQS message body containing ``photo`` (list of
+            PhotoSize dicts), optional ``caption``, ``message_id``, etc.
+        bot_token: Telegram bot token for API calls.
+        chat_ids: Chat IDs to send the confirmation reply to.
+        inbox_file: Path to the inbox JSON file.
+        photos_dir: Directory to save photos (default: ``tmp/tg_photos``).
+    """
+    photo_sizes = message.get("photo", [])
+    if not isinstance(photo_sizes, list) or not photo_sizes:
+        logger.warning("Photo message has no photo sizes — skipping.")
+        return
+
+    # Use the largest photo (last in the array per Telegram API convention).
+    largest = photo_sizes[-1]
+    file_id = largest.get("file_id", "")
+    if not file_id:
+        logger.warning("Photo message has no file_id — skipping.")
+        return
+
+    message_id = message.get("message_id")
+    caption = str(message.get("caption", "") or message.get("text", "") or "")
+
+    # Download the photo.
+    local_path = download_telegram_photo(
+        file_id=str(file_id),
+        bot_token=bot_token,
+        save_dir=photos_dir,
+        message_id=int(message_id) if message_id is not None else None,
+    )
+
+    if local_path is None:
+        send_telegram_reply(
+            "Failed to download photo. Please try again.",
+            bot_token=bot_token,
+            chat_ids=chat_ids,
+        )
+        return
+
+    # Create inbox entry for the orchestrator.
+    inbox_entry: dict[str, object] = {
+        "action": "photo",
+        "file_path": local_path,
+        "reply_to": message_id,
+        "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    }
+    if caption:
+        inbox_entry["caption"] = caption
+
+    queue_to_inbox(inbox_entry, inbox_file)
+
+    # Reply to user confirming receipt.
+    reply_text = "Photo received, forwarded to orchestrator."
+    if caption:
+        reply_text = f"Photo received (caption: {caption}), forwarded to orchestrator."
+    send_telegram_reply(
+        reply_text,
+        bot_token=bot_token,
+        chat_ids=chat_ids,
+    )
+
+
 # ── Dispatch ────────────────────────────────────────────────────────────
 
 
@@ -836,6 +990,16 @@ def dispatch_message(
         repo_root: Absolute path to the repository root.  Required when
             *use_opus* is ``True`` so the agent can access files.
     """
+    # Check for photo messages — handle them separately.
+    if message.get("photo"):
+        handle_photo_message(
+            message=message,
+            bot_token=bot_token,
+            chat_ids=chat_ids,
+            inbox_file=inbox_file,
+        )
+        return
+
     text = str(message.get("text", ""))
 
     if not anthropic_api_key:

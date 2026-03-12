@@ -92,7 +92,12 @@ def _answer_callback_query(callback_query_id: str) -> None:
 
 
 def _handle_message(update: dict[str, Any]) -> None:
-    """Process a standard text message update."""
+    """Process a standard message update (text or photo).
+
+    For photo messages, the ``photo`` array and ``message_id`` are included
+    in the SQS payload so the responder daemon can download the image via
+    the Telegram Bot API.
+    """
     message = update["message"]
     user_id = message["from"]["id"]
     chat_id = message["chat"]["id"]
@@ -102,13 +107,28 @@ def _handle_message(update: dict[str, Any]) -> None:
         return
 
     text = message.get("text") or message.get("caption", "")
+    payload: dict[str, Any] = {
+        "text": text,
+        "chat_id": chat_id,
+        "user_id": user_id,
+    }
+
+    # Include photo metadata so the responder can download the image.
+    photo = message.get("photo")
+    if photo:
+        payload["photo"] = photo
+        payload["message_id"] = message.get("message_id")
+        message_type = "photo"
+    else:
+        message_type = "text"
+
     _enqueue_message(
         chat_id=chat_id,
         user_id=user_id,
-        message_type="text",
-        payload=json.dumps({"text": text, "chat_id": chat_id, "user_id": user_id}),
+        message_type=message_type,
+        payload=json.dumps(payload),
     )
-    logger.info("Enqueued text message from user %d in chat %d", user_id, chat_id)
+    logger.info("Enqueued %s message from user %d in chat %d", message_type, user_id, chat_id)
 
 
 def _handle_callback_query(update: dict[str, Any]) -> None:

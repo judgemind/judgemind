@@ -113,7 +113,7 @@ class TestValidMessage:
         assert attrs["message_type"]["StringValue"] == "text"
 
     def test_photo_with_caption(self, aws_env: dict[str, str]) -> None:
-        """A photo message with a caption should enqueue the caption as text."""
+        """A photo message should enqueue photo metadata and caption."""
         import handler
 
         update = {
@@ -135,6 +135,12 @@ class TestValidMessage:
         assert body["text"] == "start #99"
         assert body["chat_id"] == CHAT_ID
         assert body["user_id"] == ALLOWED_USER_ID
+        # Photo metadata should be included.
+        assert body["photo"] == [{"file_id": "abc", "width": 100, "height": 100}]
+        assert body["message_id"] == 43
+        # Message type attribute should be "photo".
+        attrs = messages[0]["MessageAttributes"]
+        assert attrs["message_type"]["StringValue"] == "photo"
 
     def test_text_takes_precedence_over_caption(self, aws_env: dict[str, str]) -> None:
         """When both text and caption exist, text should be used."""
