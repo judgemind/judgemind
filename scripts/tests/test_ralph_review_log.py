@@ -227,6 +227,46 @@ class TestLogSummary:
         record = json.loads(log_path.read_text(encoding="utf-8").strip())
         assert record["claude_only_catches"] == [1]
 
+    def test_detects_adversarial_only_catches(self, state_dir: Path) -> None:
+        reviews = [
+            {"iteration": 1, "model": "gemini-2.5-pro", "verdict": "SHIP"},
+            {"iteration": 1, "model": "gemini-2.5-pro-adversarial", "verdict": "REVISE"},
+            {"iteration": 1, "model": "claude", "verdict": "SHIP"},
+        ]
+        log_summary(
+            state_dir,
+            total_iterations=1,
+            final_verdict="SHIP",
+            reviews=reviews,
+        )
+        log_path = state_dir / "review-log.jsonl"
+        record = json.loads(log_path.read_text(encoding="utf-8").strip())
+        assert record["adversarial_only_catches"] == [1]
+        assert "gemini_only_catches" not in record
+        assert "claude_only_catches" not in record
+
+    def test_adversarial_catch_not_counted_as_gemini(self, state_dir: Path) -> None:
+        """Adversarial-only REVISE should not be attributed to gemini or claude."""
+        reviews = [
+            {"iteration": 1, "model": "gemini-2.5-pro", "verdict": "SHIP"},
+            {"iteration": 1, "model": "gemini-adversarial", "verdict": "REVISE"},
+            {"iteration": 1, "model": "claude", "verdict": "SHIP"},
+            {"iteration": 2, "model": "gemini-2.5-pro", "verdict": "SHIP"},
+            {"iteration": 2, "model": "gemini-adversarial", "verdict": "SHIP"},
+            {"iteration": 2, "model": "claude", "verdict": "SHIP"},
+        ]
+        log_summary(
+            state_dir,
+            total_iterations=2,
+            final_verdict="SHIP",
+            reviews=reviews,
+        )
+        log_path = state_dir / "review-log.jsonl"
+        record = json.loads(log_path.read_text(encoding="utf-8").strip())
+        assert record["adversarial_only_catches"] == [1]
+        assert record["agreement_count"] == 1
+        assert record["disagreement_count"] == 1
+
     def test_skips_skipped_gemini(self, state_dir: Path) -> None:
         reviews = [
             {"iteration": 1, "model": "gemini-2.5-pro", "verdict": "SKIPPED"},

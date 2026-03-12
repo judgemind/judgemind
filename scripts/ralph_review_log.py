@@ -101,6 +101,7 @@ def log_summary(
     disagreement_count = 0
     gemini_only_catches: list[int] = []
     claude_only_catches: list[int] = []
+    adversarial_only_catches: list[int] = []
 
     # Group reviews by iteration
     by_iteration: dict[int, dict[str, str]] = {}
@@ -146,11 +147,12 @@ def log_summary(
             disagreement_count += 1
             # Track which reviewer(s) uniquely caught issues
             revivers = {name for name, v in active_verdicts if v == "REVISE"}
-            shippers = {name for name, v in active_verdicts if v == "SHIP"}
             if revivers == {"gemini"}:
                 gemini_only_catches.append(it)
             elif revivers == {"claude"}:
                 claude_only_catches.append(it)
+            elif revivers == {"adversarial"}:
+                adversarial_only_catches.append(it)
 
     total_compared = agreement_count + disagreement_count
     agreement_rate = (
@@ -171,6 +173,8 @@ def log_summary(
         record["gemini_only_catches"] = gemini_only_catches
     if claude_only_catches:
         record["claude_only_catches"] = claude_only_catches
+    if adversarial_only_catches:
+        record["adversarial_only_catches"] = adversarial_only_catches
 
     _append_record(state_dir, record)
 
