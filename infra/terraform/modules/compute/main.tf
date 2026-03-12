@@ -123,6 +123,20 @@ resource "aws_security_group" "scraper" {
   }
 }
 
+# When a residential proxy is configured, allow outbound traffic to the
+# proxy port so the scraper can route requests through it.
+resource "aws_security_group_rule" "scraper_proxy_egress" {
+  count = var.proxy_secret_arn != "" ? 1 : 0
+
+  type              = "egress"
+  description       = "Residential proxy"
+  from_port         = var.proxy_port
+  to_port           = var.proxy_port
+  protocol          = "tcp"
+  cidr_blocks       = ["0.0.0.0/0"]
+  security_group_id = aws_security_group.scraper.id
+}
+
 # ─── Task Definition ───────────────────────────────────────────────────────
 # Fargate task running the scraper-framework container. The container uses
 # the task role (scraper write role) for S3 access and the execution role

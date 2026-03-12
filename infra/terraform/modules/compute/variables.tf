@@ -140,3 +140,9 @@ variable "proxy_secret_arn" {
   type        = string
   default     = ""
 }
+
+variable "proxy_port" {
+  description = "TCP port used by the residential proxy. An egress rule is added to the scraper security group when proxy_secret_arn is set."
+  type        = number
+  default     = 33335
+}
