@@ -247,6 +247,11 @@ resource "aws_iam_role_policy" "api_ses" {
           "ses:SendRawEmail",
         ]
         Resource = "*"
+        Condition = {
+          StringEquals = {
+            "ses:FromAddress" = var.email_from
+          }
+        }
       }
     ]
   })
