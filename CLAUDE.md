@@ -339,6 +339,7 @@ Key paths: framework in `packages/scraper-framework/src/framework/`, California 
 - Terraform for all AWS resources. Every resource must be in a module.
 - **Do NOT add `tags` blocks to individual resources** — the AWS provider's `default_tags` handles this.
 - Never commit AWS credentials or state files.
+- **Dev terraform apply is automated.** After a PR that touches `infra/terraform/` merges to main, the orchestrator automatically runs `terraform apply` for the dev environment. Production applies remain human-only. See `.claude/skills/orchestrator/SKILL.md` for the full apply procedure.
 
 For Terraform apply/deploy details, see `docs/agent/infrastructure-reference.md`.
 
