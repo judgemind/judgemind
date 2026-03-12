@@ -2777,6 +2777,567 @@ class TestDispatchMessagePhotoRouting:
         mock_interpret.assert_called_once()
 
 
+# ── Document message handling ──────────────────────────────────────────
+
+
+class TestHandleDocumentMessage:
+    """Tests for handle_document_message()."""
+
+    @respx.mock
+    def test_downloads_saves_and_creates_inbox_entry(self, tmp_path: Path) -> None:
+        """Full happy path: download document, save, inbox entry, reply."""
+        mod = _import_responder()
+
+        respx.get(
+            "https://api.telegram.org/botfake-token/getFile",
+            params={"file_id": "doc-file-id"},
+        ).mock(
+            return_value=httpx.Response(
+                200,
+                json={"ok": True, "result": {"file_path": "documents/report.pdf"}},
+            )
+        )
+        respx.get("https://api.telegram.org/file/botfake-token/documents/report.pdf").mock(
+            return_value=httpx.Response(200, content=b"pdf-bytes")
+        )
+
+        reply_route = respx.post("https://api.telegram.org/botfake-token/sendMessage").mock(
+            return_value=httpx.Response(200, json={"ok": True})
+        )
+
+        inbox_file = str(tmp_path / "inbox.json")
+        docs_dir = str(tmp_path / "tg_documents")
+
+        message: dict[str, object] = {
+            "document": {
+                "file_id": "doc-file-id",
+                "file_unique_id": "doc-unique",
+                "file_name": "report.pdf",
+                "mime_type": "application/pdf",
+                "file_size": 12345,
+            },
+            "caption": "Check this report",
+            "message_id": 101,
+            "user_id": 12345,
+            "chat_id": 12345,
+        }
+
+        mod.handle_document_message(
+            message=message,
+            bot_token="fake-token",
+            chat_ids=[12345],
+            inbox_file=inbox_file,
+            documents_dir=docs_dir,
+        )
+
+        # Check inbox entry was created.
+        inbox_data = json.loads(Path(inbox_file).read_text())
+        assert len(inbox_data) == 1
+        entry = inbox_data[0]
+        assert entry["action"] == "document"
+        assert entry["file_path"] is not None
+        assert entry["file_name"] == "report.pdf"
+        assert entry["mime_type"] == "application/pdf"
+        assert entry["caption"] == "Check this report"
+        assert entry["reply_to"] == 101
+        assert "timestamp" in entry
+
+        # Check file was saved.
+        assert Path(entry["file_path"]).exists()
+        assert Path(entry["file_path"]).read_bytes() == b"pdf-bytes"
+
+        # Check reply was sent.
+        assert reply_route.call_count == 1
+        reply_body = json.loads(reply_route.calls[0].request.content)
+        assert "Document" in reply_body["text"]
+        assert "report.pdf" in reply_body["text"]
+        assert "Check this report" in reply_body["text"]
+
+    @respx.mock
+    def test_no_caption(self, tmp_path: Path) -> None:
+        """Document without caption omits caption field from inbox entry."""
+        mod = _import_responder()
+
+        respx.get(
+            "https://api.telegram.org/botfake-token/getFile",
+            params={"file_id": "doc-id"},
+        ).mock(
+            return_value=httpx.Response(
+                200,
+                json={"ok": True, "result": {"file_path": "documents/file.txt"}},
+            )
+        )
+        respx.get("https://api.telegram.org/file/botfake-token/documents/file.txt").mock(
+            return_value=httpx.Response(200, content=b"data")
+        )
+
+        reply_route = respx.post("https://api.telegram.org/botfake-token/sendMessage").mock(
+            return_value=httpx.Response(200, json={"ok": True})
+        )
+
+        inbox_file = str(tmp_path / "inbox.json")
+
+        message: dict[str, object] = {
+            "document": {
+                "file_id": "doc-id",
+                "file_unique_id": "doc-unique",
+                "file_name": "notes.txt",
+                "mime_type": "text/plain",
+            },
+            "message_id": 102,
+            "user_id": 12345,
+        }
+
+        mod.handle_document_message(
+            message=message,
+            bot_token="fake-token",
+            chat_ids=[12345],
+            inbox_file=inbox_file,
+            documents_dir=str(tmp_path / "tg_documents"),
+        )
+
+        inbox_data = json.loads(Path(inbox_file).read_text())
+        assert len(inbox_data) == 1
+        assert "caption" not in inbox_data[0]
+
+        # Reply should not mention caption.
+        reply_body = json.loads(reply_route.calls[0].request.content)
+        assert "Document (notes.txt) received, forwarded to orchestrator." == reply_body["text"]
+
+    @respx.mock
+    def test_download_failure_sends_error_reply(self, tmp_path: Path) -> None:
+        """When document download fails, an error reply is sent."""
+        mod = _import_responder()
+
+        respx.get(
+            "https://api.telegram.org/botfake-token/getFile",
+            params={"file_id": "bad-doc-id"},
+        ).mock(return_value=httpx.Response(500))
+
+        reply_route = respx.post("https://api.telegram.org/botfake-token/sendMessage").mock(
+            return_value=httpx.Response(200, json={"ok": True})
+        )
+
+        inbox_file = str(tmp_path / "inbox.json")
+
+        message: dict[str, object] = {
+            "document": {
+                "file_id": "bad-doc-id",
+                "file_unique_id": "bad-unique",
+                "file_name": "fail.pdf",
+            },
+            "message_id": 103,
+        }
+
+        mod.handle_document_message(
+            message=message,
+            bot_token="fake-token",
+            chat_ids=[12345],
+            inbox_file=inbox_file,
+            documents_dir=str(tmp_path / "tg_documents"),
+        )
+
+        # No inbox entry should be created.
+        assert not Path(inbox_file).exists()
+
+        # Error reply should be sent.
+        assert reply_route.call_count == 1
+        reply_body = json.loads(reply_route.calls[0].request.content)
+        assert "Failed to download document" in reply_body["text"]
+
+    def test_empty_document_dict_skipped(self, tmp_path: Path) -> None:
+        """Messages with empty document dict are silently skipped."""
+        mod = _import_responder()
+
+        message: dict[str, object] = {
+            "document": {},
+            "message_id": 104,
+        }
+
+        # Should not raise.
+        mod.handle_document_message(
+            message=message,
+            bot_token="fake-token",
+            chat_ids=[12345],
+            inbox_file=str(tmp_path / "inbox.json"),
+            documents_dir=str(tmp_path / "tg_documents"),
+        )
+
+    def test_no_document_key_skipped(self, tmp_path: Path) -> None:
+        """Messages without document key are silently skipped."""
+        mod = _import_responder()
+
+        message: dict[str, object] = {
+            "message_id": 105,
+        }
+
+        mod.handle_document_message(
+            message=message,
+            bot_token="fake-token",
+            chat_ids=[12345],
+            inbox_file=str(tmp_path / "inbox.json"),
+            documents_dir=str(tmp_path / "tg_documents"),
+        )
+
+
+# ── Voice message handling ─────────────────────────────────────────────
+
+
+class TestHandleVoiceMessage:
+    """Tests for handle_voice_message()."""
+
+    @respx.mock
+    def test_downloads_saves_and_creates_inbox_entry(self, tmp_path: Path) -> None:
+        """Full happy path: download voice, save, inbox entry, reply."""
+        mod = _import_responder()
+
+        respx.get(
+            "https://api.telegram.org/botfake-token/getFile",
+            params={"file_id": "voice-file-id"},
+        ).mock(
+            return_value=httpx.Response(
+                200,
+                json={"ok": True, "result": {"file_path": "voice/note.oga"}},
+            )
+        )
+        respx.get("https://api.telegram.org/file/botfake-token/voice/note.oga").mock(
+            return_value=httpx.Response(200, content=b"voice-bytes")
+        )
+
+        reply_route = respx.post("https://api.telegram.org/botfake-token/sendMessage").mock(
+            return_value=httpx.Response(200, json={"ok": True})
+        )
+
+        inbox_file = str(tmp_path / "inbox.json")
+        voice_dir = str(tmp_path / "tg_voice")
+
+        message: dict[str, object] = {
+            "voice": {
+                "file_id": "voice-file-id",
+                "file_unique_id": "voice-unique",
+                "duration": 5,
+                "mime_type": "audio/ogg",
+                "file_size": 9876,
+            },
+            "message_id": 201,
+            "user_id": 12345,
+            "chat_id": 12345,
+        }
+
+        mod.handle_voice_message(
+            message=message,
+            bot_token="fake-token",
+            chat_ids=[12345],
+            inbox_file=inbox_file,
+            voice_dir=voice_dir,
+        )
+
+        # Check inbox entry was created.
+        inbox_data = json.loads(Path(inbox_file).read_text())
+        assert len(inbox_data) == 1
+        entry = inbox_data[0]
+        assert entry["action"] == "voice"
+        assert entry["file_path"] is not None
+        assert entry["duration"] == 5
+        assert entry["mime_type"] == "audio/ogg"
+        assert entry["reply_to"] == 201
+        assert "timestamp" in entry
+
+        # Check file was saved.
+        assert Path(entry["file_path"]).exists()
+        assert Path(entry["file_path"]).read_bytes() == b"voice-bytes"
+
+        # Check reply was sent.
+        assert reply_route.call_count == 1
+        reply_body = json.loads(reply_route.calls[0].request.content)
+        assert "Voice message" in reply_body["text"]
+        assert "5s" in reply_body["text"]
+
+    @respx.mock
+    def test_no_duration(self, tmp_path: Path) -> None:
+        """Voice without duration omits duration field from inbox entry."""
+        mod = _import_responder()
+
+        respx.get(
+            "https://api.telegram.org/botfake-token/getFile",
+            params={"file_id": "voice-id"},
+        ).mock(
+            return_value=httpx.Response(
+                200,
+                json={"ok": True, "result": {"file_path": "voice/msg.ogg"}},
+            )
+        )
+        respx.get("https://api.telegram.org/file/botfake-token/voice/msg.ogg").mock(
+            return_value=httpx.Response(200, content=b"data")
+        )
+
+        reply_route = respx.post("https://api.telegram.org/botfake-token/sendMessage").mock(
+            return_value=httpx.Response(200, json={"ok": True})
+        )
+
+        inbox_file = str(tmp_path / "inbox.json")
+
+        message: dict[str, object] = {
+            "voice": {
+                "file_id": "voice-id",
+                "file_unique_id": "voice-unique",
+            },
+            "message_id": 202,
+            "user_id": 12345,
+        }
+
+        mod.handle_voice_message(
+            message=message,
+            bot_token="fake-token",
+            chat_ids=[12345],
+            inbox_file=inbox_file,
+            voice_dir=str(tmp_path / "tg_voice"),
+        )
+
+        inbox_data = json.loads(Path(inbox_file).read_text())
+        assert len(inbox_data) == 1
+        assert "duration" not in inbox_data[0]
+
+        # Reply should not contain duration.
+        reply_body = json.loads(reply_route.calls[0].request.content)
+        assert "Voice message received, forwarded to orchestrator." == reply_body["text"]
+
+    @respx.mock
+    def test_download_failure_sends_error_reply(self, tmp_path: Path) -> None:
+        """When voice download fails, an error reply is sent."""
+        mod = _import_responder()
+
+        respx.get(
+            "https://api.telegram.org/botfake-token/getFile",
+            params={"file_id": "bad-voice-id"},
+        ).mock(return_value=httpx.Response(500))
+
+        reply_route = respx.post("https://api.telegram.org/botfake-token/sendMessage").mock(
+            return_value=httpx.Response(200, json={"ok": True})
+        )
+
+        inbox_file = str(tmp_path / "inbox.json")
+
+        message: dict[str, object] = {
+            "voice": {
+                "file_id": "bad-voice-id",
+                "file_unique_id": "bad-unique",
+            },
+            "message_id": 203,
+        }
+
+        mod.handle_voice_message(
+            message=message,
+            bot_token="fake-token",
+            chat_ids=[12345],
+            inbox_file=inbox_file,
+            voice_dir=str(tmp_path / "tg_voice"),
+        )
+
+        # No inbox entry should be created.
+        assert not Path(inbox_file).exists()
+
+        # Error reply should be sent.
+        assert reply_route.call_count == 1
+        reply_body = json.loads(reply_route.calls[0].request.content)
+        assert "Failed to download voice message" in reply_body["text"]
+
+    def test_empty_voice_dict_skipped(self, tmp_path: Path) -> None:
+        """Messages with empty voice dict are silently skipped."""
+        mod = _import_responder()
+
+        message: dict[str, object] = {
+            "voice": {},
+            "message_id": 204,
+        }
+
+        mod.handle_voice_message(
+            message=message,
+            bot_token="fake-token",
+            chat_ids=[12345],
+            inbox_file=str(tmp_path / "inbox.json"),
+            voice_dir=str(tmp_path / "tg_voice"),
+        )
+
+
+# ── Dispatch routing for document and voice ────────────────────────────
+
+
+class TestDispatchMessageDocumentRouting:
+    """Tests that dispatch_message routes document messages correctly."""
+
+    @respx.mock
+    def test_document_message_routed_to_handler(self, tmp_path: Path) -> None:
+        """Messages with 'document' key skip Claude and are handled as documents."""
+        mod = _import_responder()
+
+        respx.get(
+            "https://api.telegram.org/botfake-token/getFile",
+            params={"file_id": "doc-id"},
+        ).mock(
+            return_value=httpx.Response(
+                200,
+                json={"ok": True, "result": {"file_path": "documents/file.pdf"}},
+            )
+        )
+        respx.get("https://api.telegram.org/file/botfake-token/documents/file.pdf").mock(
+            return_value=httpx.Response(200, content=b"data")
+        )
+
+        respx.post("https://api.telegram.org/botfake-token/sendMessage").mock(
+            return_value=httpx.Response(200, json={"ok": True})
+        )
+
+        inbox_file = str(tmp_path / "inbox.json")
+
+        mod.dispatch_message(
+            message={
+                "text": "",
+                "document": {
+                    "file_id": "doc-id",
+                    "file_unique_id": "doc-unique",
+                    "file_name": "file.pdf",
+                    "mime_type": "application/pdf",
+                },
+                "message_id": 70,
+                "user_id": 12345,
+                "chat_id": 12345,
+            },
+            bot_token="fake-token",
+            chat_ids=[12345],
+            state_file=str(tmp_path / "state.json"),
+            status_file=str(tmp_path / "status.json"),
+            agent_status_dir=str(tmp_path / "agent-status"),
+            stop_requests_file=str(tmp_path / "stop.json"),
+            inbox_file=inbox_file,
+            anthropic_api_key="test-key",
+        )
+
+        # An inbox entry should exist with action "document".
+        inbox_data = json.loads(Path(inbox_file).read_text())
+        assert len(inbox_data) == 1
+        assert inbox_data[0]["action"] == "document"
+
+
+class TestDispatchMessageVoiceRouting:
+    """Tests that dispatch_message routes voice messages correctly."""
+
+    @respx.mock
+    def test_voice_message_routed_to_handler(self, tmp_path: Path) -> None:
+        """Messages with 'voice' key skip Claude and are handled as voice."""
+        mod = _import_responder()
+
+        respx.get(
+            "https://api.telegram.org/botfake-token/getFile",
+            params={"file_id": "voice-id"},
+        ).mock(
+            return_value=httpx.Response(
+                200,
+                json={"ok": True, "result": {"file_path": "voice/msg.ogg"}},
+            )
+        )
+        respx.get("https://api.telegram.org/file/botfake-token/voice/msg.ogg").mock(
+            return_value=httpx.Response(200, content=b"data")
+        )
+
+        respx.post("https://api.telegram.org/botfake-token/sendMessage").mock(
+            return_value=httpx.Response(200, json={"ok": True})
+        )
+
+        inbox_file = str(tmp_path / "inbox.json")
+
+        mod.dispatch_message(
+            message={
+                "text": "",
+                "voice": {
+                    "file_id": "voice-id",
+                    "file_unique_id": "voice-unique",
+                    "duration": 3,
+                },
+                "message_id": 71,
+                "user_id": 12345,
+                "chat_id": 12345,
+            },
+            bot_token="fake-token",
+            chat_ids=[12345],
+            state_file=str(tmp_path / "state.json"),
+            status_file=str(tmp_path / "status.json"),
+            agent_status_dir=str(tmp_path / "agent-status"),
+            stop_requests_file=str(tmp_path / "stop.json"),
+            inbox_file=inbox_file,
+            anthropic_api_key="test-key",
+        )
+
+        # An inbox entry should exist with action "voice".
+        inbox_data = json.loads(Path(inbox_file).read_text())
+        assert len(inbox_data) == 1
+        assert inbox_data[0]["action"] == "voice"
+
+
+# ── Download telegram file (generic) ──────────────────────────────────
+
+
+class TestDownloadTelegramFile:
+    """Tests for the generic download_telegram_file() function."""
+
+    @respx.mock
+    def test_uses_filename_hint_extension(self, tmp_path: Path) -> None:
+        """When Telegram file path has no extension, filename_hint is used."""
+        mod = _import_responder()
+
+        respx.get(
+            "https://api.telegram.org/botfake-token/getFile",
+            params={"file_id": "doc-id"},
+        ).mock(
+            return_value=httpx.Response(
+                200,
+                json={"ok": True, "result": {"file_path": "documents/file_123"}},
+            )
+        )
+        respx.get("https://api.telegram.org/file/botfake-token/documents/file_123").mock(
+            return_value=httpx.Response(200, content=b"content")
+        )
+
+        result = mod.download_telegram_file(
+            file_id="doc-id",
+            bot_token="fake-token",
+            save_dir=str(tmp_path / "downloads"),
+            filename_hint="report.pdf",
+        )
+
+        assert result is not None
+        assert result.endswith(".pdf")
+        assert Path(result).read_bytes() == b"content"
+
+    @respx.mock
+    def test_uses_default_ext_when_no_hints(self, tmp_path: Path) -> None:
+        """When neither Telegram path nor filename_hint has an extension."""
+        mod = _import_responder()
+
+        respx.get(
+            "https://api.telegram.org/botfake-token/getFile",
+            params={"file_id": "file-id"},
+        ).mock(
+            return_value=httpx.Response(
+                200,
+                json={"ok": True, "result": {"file_path": "files/blob"}},
+            )
+        )
+        respx.get("https://api.telegram.org/file/botfake-token/files/blob").mock(
+            return_value=httpx.Response(200, content=b"data")
+        )
+
+        result = mod.download_telegram_file(
+            file_id="file-id",
+            bot_token="fake-token",
+            save_dir=str(tmp_path / "downloads"),
+            default_ext=".ogg",
+        )
+
+        assert result is not None
+        assert result.endswith(".ogg")
+
+
 # ── Old daemon removed ──────────────────────────────────────────────────
 # The deprecated tg-poll-daemon.py was removed in #646. The responder
 # daemon (scripts/tg-responder.py) fully replaces it.

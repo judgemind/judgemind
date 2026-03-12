@@ -92,11 +92,11 @@ def _answer_callback_query(callback_query_id: str) -> None:
 
 
 def _handle_message(update: dict[str, Any]) -> None:
-    """Process a standard message update (text or photo).
+    """Process a standard message update (text, photo, document, or voice).
 
-    For photo messages, the ``photo`` array and ``message_id`` are included
-    in the SQS payload so the responder daemon can download the image via
-    the Telegram Bot API.
+    For media messages, the relevant metadata (``photo``, ``document``,
+    ``voice``) and ``message_id`` are included in the SQS payload so the
+    responder daemon can download the file via the Telegram Bot API.
     """
     message = update["message"]
     user_id = message["from"]["id"]
@@ -113,12 +113,23 @@ def _handle_message(update: dict[str, Any]) -> None:
         "user_id": user_id,
     }
 
-    # Include photo metadata so the responder can download the image.
+    # Detect media type and include metadata for the responder.
     photo = message.get("photo")
+    document = message.get("document")
+    voice = message.get("voice")
+
     if photo:
         payload["photo"] = photo
         payload["message_id"] = message.get("message_id")
         message_type = "photo"
+    elif document:
+        payload["document"] = document
+        payload["message_id"] = message.get("message_id")
+        message_type = "document"
+    elif voice:
+        payload["voice"] = voice
+        payload["message_id"] = message.get("message_id")
+        message_type = "voice"
     else:
         message_type = "text"
 

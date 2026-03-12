@@ -529,26 +529,33 @@ def queue_to_inbox(message: dict[str, object], inbox_file: str) -> None:
         logger.warning("Failed to write inbox file", exc_info=True)
 
 
-# ── Photo handling ──────────────────────────────────────────────────────
+# ── File download helper ───────────────────────────────────────────────
 
 
-def download_telegram_photo(
+def download_telegram_file(
     *,
     file_id: str,
     bot_token: str,
     save_dir: str,
     message_id: int | None = None,
+    default_ext: str = ".bin",
+    filename_hint: str | None = None,
 ) -> str | None:
-    """Download a photo from Telegram and save it locally.
+    """Download a file from Telegram and save it locally.
 
     Uses the Telegram Bot API ``getFile`` endpoint to resolve the file path,
     then downloads the file content.
 
     Args:
-        file_id: Telegram file_id of the photo to download.
+        file_id: Telegram file_id of the file to download.
         bot_token: Telegram bot token for API authentication.
-        save_dir: Directory to save the downloaded photo (e.g. ``tmp/tg_photos``).
+        save_dir: Directory to save the downloaded file.
         message_id: Optional message ID for the filename.
+        default_ext: Default file extension if none can be determined
+            from the Telegram file path (default: ``.bin``).
+        filename_hint: Optional original filename (e.g. from a document
+            message).  When provided, the extension is taken from this
+            filename if the Telegram file path has none.
 
     Returns:
         The absolute path to the saved file, or ``None`` if the download failed.
@@ -588,8 +595,13 @@ def download_telegram_photo(
                 )
                 return None
 
-            # Determine file extension from the Telegram file path.
-            ext = Path(file_path).suffix or ".jpg"
+            # Determine file extension: prefer Telegram file_path, fall back
+            # to filename_hint, then default_ext.
+            ext = Path(file_path).suffix
+            if not ext and filename_hint:
+                ext = Path(filename_hint).suffix
+            if not ext:
+                ext = default_ext
             timestamp = datetime.datetime.now(datetime.timezone.utc).strftime(
                 "%Y%m%d_%H%M%S"
             )
@@ -599,13 +611,38 @@ def download_telegram_photo(
 
             local_path.write_bytes(download_resp.content)
             logger.info(
-                "Saved photo to %s (%d bytes)", local_path, len(download_resp.content)
+                "Saved file to %s (%d bytes)", local_path, len(download_resp.content)
             )
             return str(local_path)
 
     except Exception:
-        logger.warning("Failed to download photo %s", file_id, exc_info=True)
+        logger.warning("Failed to download file %s", file_id, exc_info=True)
         return None
+
+
+# Keep as a backwards-compatible alias.
+def download_telegram_photo(
+    *,
+    file_id: str,
+    bot_token: str,
+    save_dir: str,
+    message_id: int | None = None,
+) -> str | None:
+    """Download a photo from Telegram and save it locally.
+
+    Thin wrapper around :func:`download_telegram_file` with ``.jpg`` as
+    the default extension.
+    """
+    return download_telegram_file(
+        file_id=file_id,
+        bot_token=bot_token,
+        save_dir=save_dir,
+        message_id=message_id,
+        default_ext=".jpg",
+    )
+
+
+# ── Media message handlers ─────────────────────────────────────────────
 
 
 def handle_photo_message(
@@ -678,6 +715,165 @@ def handle_photo_message(
         reply_text = f"Photo received (caption: {caption}), forwarded to orchestrator."
     send_telegram_reply(
         reply_text,
+        bot_token=bot_token,
+        chat_ids=chat_ids,
+    )
+
+
+def handle_document_message(
+    *,
+    message: dict[str, object],
+    bot_token: str,
+    chat_ids: list[int],
+    inbox_file: str,
+    documents_dir: str = "tmp/tg_documents",
+) -> None:
+    """Handle an inbound document message.
+
+    Downloads the document, saves it locally, creates an inbox entry for
+    the orchestrator, and replies to the user confirming receipt.
+
+    Args:
+        message: The parsed SQS message body containing ``document`` (dict
+            with ``file_id``, ``file_name``, ``mime_type``, etc.), optional
+            ``caption``, ``message_id``, etc.
+        bot_token: Telegram bot token for API calls.
+        chat_ids: Chat IDs to send the confirmation reply to.
+        inbox_file: Path to the inbox JSON file.
+        documents_dir: Directory to save documents (default: ``tmp/tg_documents``).
+    """
+    doc = message.get("document")
+    if not isinstance(doc, dict) or not doc:
+        logger.warning("Document message has no document metadata — skipping.")
+        return
+
+    file_id = doc.get("file_id", "")
+    if not file_id:
+        logger.warning("Document message has no file_id — skipping.")
+        return
+
+    message_id = message.get("message_id")
+    caption = str(message.get("caption", "") or message.get("text", "") or "")
+    file_name = str(doc.get("file_name", ""))
+
+    # Download the document.
+    local_path = download_telegram_file(
+        file_id=str(file_id),
+        bot_token=bot_token,
+        save_dir=documents_dir,
+        message_id=int(message_id) if message_id is not None else None,
+        filename_hint=file_name or None,
+    )
+
+    if local_path is None:
+        send_telegram_reply(
+            "Failed to download document. Please try again.",
+            bot_token=bot_token,
+            chat_ids=chat_ids,
+        )
+        return
+
+    # Create inbox entry for the orchestrator.
+    inbox_entry: dict[str, object] = {
+        "action": "document",
+        "file_path": local_path,
+        "reply_to": message_id,
+        "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    }
+    if file_name:
+        inbox_entry["file_name"] = file_name
+    if doc.get("mime_type"):
+        inbox_entry["mime_type"] = doc["mime_type"]
+    if caption:
+        inbox_entry["caption"] = caption
+
+    queue_to_inbox(inbox_entry, inbox_file)
+
+    # Reply to user confirming receipt.
+    name_part = f" ({file_name})" if file_name else ""
+    reply_text = f"Document{name_part} received, forwarded to orchestrator."
+    if caption:
+        reply_text = (
+            f"Document{name_part} received (caption: {caption}), "
+            f"forwarded to orchestrator."
+        )
+    send_telegram_reply(
+        reply_text,
+        bot_token=bot_token,
+        chat_ids=chat_ids,
+    )
+
+
+def handle_voice_message(
+    *,
+    message: dict[str, object],
+    bot_token: str,
+    chat_ids: list[int],
+    inbox_file: str,
+    voice_dir: str = "tmp/tg_voice",
+) -> None:
+    """Handle an inbound voice message.
+
+    Downloads the voice note, saves it locally, creates an inbox entry for
+    the orchestrator, and replies to the user confirming receipt.
+
+    Args:
+        message: The parsed SQS message body containing ``voice`` (dict
+            with ``file_id``, ``duration``, ``mime_type``, etc.),
+            ``message_id``, etc.
+        bot_token: Telegram bot token for API calls.
+        chat_ids: Chat IDs to send the confirmation reply to.
+        inbox_file: Path to the inbox JSON file.
+        voice_dir: Directory to save voice files (default: ``tmp/tg_voice``).
+    """
+    voice = message.get("voice")
+    if not isinstance(voice, dict) or not voice:
+        logger.warning("Voice message has no voice metadata — skipping.")
+        return
+
+    file_id = voice.get("file_id", "")
+    if not file_id:
+        logger.warning("Voice message has no file_id — skipping.")
+        return
+
+    message_id = message.get("message_id")
+    duration = voice.get("duration")
+
+    # Download the voice note.
+    local_path = download_telegram_file(
+        file_id=str(file_id),
+        bot_token=bot_token,
+        save_dir=voice_dir,
+        message_id=int(message_id) if message_id is not None else None,
+        default_ext=".ogg",
+    )
+
+    if local_path is None:
+        send_telegram_reply(
+            "Failed to download voice message. Please try again.",
+            bot_token=bot_token,
+            chat_ids=chat_ids,
+        )
+        return
+
+    # Create inbox entry for the orchestrator.
+    inbox_entry: dict[str, object] = {
+        "action": "voice",
+        "file_path": local_path,
+        "reply_to": message_id,
+        "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    }
+    if duration is not None:
+        inbox_entry["duration"] = duration
+    if voice.get("mime_type"):
+        inbox_entry["mime_type"] = voice["mime_type"]
+
+    queue_to_inbox(inbox_entry, inbox_file)
+
+    # Reply to user confirming receipt.
+    duration_part = f" ({duration}s)" if duration is not None else ""
+    send_telegram_reply(
+        f"Voice message{duration_part} received, forwarded to orchestrator.",
         bot_token=bot_token,
         chat_ids=chat_ids,
     )
@@ -990,9 +1186,27 @@ def dispatch_message(
         repo_root: Absolute path to the repository root.  Required when
             *use_opus* is ``True`` so the agent can access files.
     """
-    # Check for photo messages — handle them separately.
+    # Check for media messages — handle them separately.
     if message.get("photo"):
         handle_photo_message(
+            message=message,
+            bot_token=bot_token,
+            chat_ids=chat_ids,
+            inbox_file=inbox_file,
+        )
+        return
+
+    if message.get("document"):
+        handle_document_message(
+            message=message,
+            bot_token=bot_token,
+            chat_ids=chat_ids,
+            inbox_file=inbox_file,
+        )
+        return
+
+    if message.get("voice"):
+        handle_voice_message(
             message=message,
             bot_token=bot_token,
             chat_ids=chat_ids,
