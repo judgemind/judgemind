@@ -9,12 +9,6 @@ export function Sidebar() {
         </p>
         <SidebarLink href="/search">Search Rulings</SidebarLink>
         <SidebarLink href="/rulings">Latest Rulings</SidebarLink>
-
-        <p className="mb-1 mt-4 px-2 text-xs font-semibold uppercase tracking-wider text-slate-400 dark:text-slate-500">
-          Research
-        </p>
-        <SidebarLink href="/cases">Cases</SidebarLink>
-        <SidebarLink href="/judges">Judges</SidebarLink>
       </nav>
     </aside>
   );
