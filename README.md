@@ -1,5 +1,7 @@
 # Judgemind
 
+[![codecov](https://codecov.io/gh/judgemind/judgemind/graph/badge.svg)](https://codecov.io/gh/judgemind/judgemind)
+
 **Free, open-source legal research & litigation intelligence.**
 
 Public court data should be publicly searchable. Judgemind provides the same caliber of state trial court data, judge analytics, and AI-powered litigation tools that commercial platforms charge $70–$200+/month for — free and open source.
