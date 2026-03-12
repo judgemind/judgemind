@@ -1435,7 +1435,8 @@ def test_upsert_case_party_executes_insert() -> None:
     mock_cur.execute.assert_called_once()
     sql = str(mock_cur.execute.call_args)
     assert "INSERT INTO case_parties" in sql
-    assert "NOT EXISTS" in sql
+    assert "ON CONFLICT" in sql
+    assert "DO NOTHING" in sql
 
 
 # ---------------------------------------------------------------------------

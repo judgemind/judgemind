@@ -2,12 +2,13 @@
 -- Add UNIQUE constraint on case_parties(case_id, party_id, role) to prevent
 -- duplicate party-case links during re-ingestion.  Fixes #873.
 
--- First, remove duplicate rows — keep the one with the smallest id per group.
-DELETE FROM case_parties cp
-WHERE cp.id NOT IN (
-    SELECT MIN(id)
+-- First, remove duplicate rows — keep one per (case_id, party_id, role) group.
+-- Uses DISTINCT ON instead of MIN(uuid) which is not supported in PostgreSQL.
+DELETE FROM case_parties
+WHERE id NOT IN (
+    SELECT DISTINCT ON (case_id, party_id, role) id
     FROM case_parties
-    GROUP BY case_id, party_id, role
+    ORDER BY case_id, party_id, role, id
 );
 
 -- Add the unique constraint so ON CONFLICT DO NOTHING works on the business key.
