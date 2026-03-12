@@ -71,15 +71,24 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
+        id: setup-python
         with:
           python-version: '3.12'
       - uses: actions/cache@v4
         id: venv-cache
         with:
           path: packages/scraper-framework/.venv
-          key: venv-scraper-${{ runner.os }}-py3.12-${{ hashFiles('packages/scraper-framework/pyproject.toml') }}
+          key: venv-scraper-${{ runner.os }}-py${{ steps.setup-python.outputs.python-version }}-${{ hashFiles('packages/scraper-framework/pyproject.toml') }}
+      - name: Validate cached venv
+        if: steps.venv-cache.outputs.cache-hit == 'true'
+        run: |
+          if ! .venv/bin/python --version > /dev/null 2>&1; then
+            echo "Cached venv is invalid (Python version mismatch), recreating..."
+            rm -rf .venv
+            echo "venv-invalid=true" >> "$GITHUB_ENV"
+          fi
       - name: Install dependencies
-        if: steps.venv-cache.outputs.cache-hit != 'true'
+        if: steps.venv-cache.outputs.cache-hit != 'true' || env.venv-invalid == 'true'
         run: |
           python -m venv .venv
           .venv/bin/pip install -e ".[dev]"
@@ -119,15 +128,24 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
+        id: setup-python
         with:
           python-version: '3.12'
       - uses: actions/cache@v4
         id: venv-cache
         with:
           path: packages/scraper-framework/.venv
-          key: venv-scraper-${{ runner.os }}-py3.12-${{ hashFiles('packages/scraper-framework/pyproject.toml') }}
+          key: venv-scraper-${{ runner.os }}-py${{ steps.setup-python.outputs.python-version }}-${{ hashFiles('packages/scraper-framework/pyproject.toml') }}
+      - name: Validate cached venv
+        if: steps.venv-cache.outputs.cache-hit == 'true'
+        run: |
+          if ! .venv/bin/python --version > /dev/null 2>&1; then
+            echo "Cached venv is invalid (Python version mismatch), recreating..."
+            rm -rf .venv
+            echo "venv-invalid=true" >> "$GITHUB_ENV"
+          fi
       - name: Install dependencies
-        if: steps.venv-cache.outputs.cache-hit != 'true'
+        if: steps.venv-cache.outputs.cache-hit != 'true' || env.venv-invalid == 'true'
         run: |
           python -m venv .venv
           .venv/bin/pip install -e ".[dev]"
@@ -164,15 +182,24 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
+        id: setup-python
         with:
           python-version: '3.12'
       - uses: actions/cache@v4
         id: venv-cache
         with:
           path: packages/nlp-pipeline/.venv
-          key: venv-nlp-${{ runner.os }}-py3.12-${{ hashFiles('packages/nlp-pipeline/pyproject.toml') }}
+          key: venv-nlp-${{ runner.os }}-py${{ steps.setup-python.outputs.python-version }}-${{ hashFiles('packages/nlp-pipeline/pyproject.toml') }}
+      - name: Validate cached venv
+        if: steps.venv-cache.outputs.cache-hit == 'true'
+        run: |
+          if ! .venv/bin/python --version > /dev/null 2>&1; then
+            echo "Cached venv is invalid (Python version mismatch), recreating..."
+            rm -rf .venv
+            echo "venv-invalid=true" >> "$GITHUB_ENV"
+          fi
       - name: Install dependencies
-        if: steps.venv-cache.outputs.cache-hit != 'true'
+        if: steps.venv-cache.outputs.cache-hit != 'true' || env.venv-invalid == 'true'
         run: |
           python -m venv .venv
           .venv/bin/pip install -e ".[dev]"
@@ -311,15 +338,24 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
+        id: setup-python
         with:
           python-version: '3.12'
       - uses: actions/cache@v4
         id: venv-cache
         with:
           path: packages/telegram-bridge/.venv
-          key: venv-telegram-${{ runner.os }}-py3.12-${{ hashFiles('packages/telegram-bridge/pyproject.toml') }}
+          key: venv-telegram-${{ runner.os }}-py${{ steps.setup-python.outputs.python-version }}-${{ hashFiles('packages/telegram-bridge/pyproject.toml') }}
+      - name: Validate cached venv
+        if: steps.venv-cache.outputs.cache-hit == 'true'
+        run: |
+          if ! .venv/bin/python --version > /dev/null 2>&1; then
+            echo "Cached venv is invalid (Python version mismatch), recreating..."
+            rm -rf .venv
+            echo "venv-invalid=true" >> "$GITHUB_ENV"
+          fi
       - name: Install dependencies
-        if: steps.venv-cache.outputs.cache-hit != 'true'
+        if: steps.venv-cache.outputs.cache-hit != 'true' || env.venv-invalid == 'true'
         run: |
           python -m venv .venv
           .venv/bin/pip install -e ".[dev]"
@@ -395,15 +431,24 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
+        id: setup-python
         with:
           python-version: '3.12'
       - uses: actions/cache@v4
         id: venv-cache
         with:
           path: ${{ matrix.lambda-dir }}/.venv
-          key: venv-${{ matrix.lambda-dir }}-${{ runner.os }}-py3.12-${{ hashFiles(format('{0}/pyproject.toml', matrix.lambda-dir)) }}
+          key: venv-${{ matrix.lambda-dir }}-${{ runner.os }}-py${{ steps.setup-python.outputs.python-version }}-${{ hashFiles(format('{0}/pyproject.toml', matrix.lambda-dir)) }}
+      - name: Validate cached venv
+        if: steps.venv-cache.outputs.cache-hit == 'true'
+        run: |
+          if ! .venv/bin/python --version > /dev/null 2>&1; then
+            echo "Cached venv is invalid (Python version mismatch), recreating..."
+            rm -rf .venv
+            echo "venv-invalid=true" >> "$GITHUB_ENV"
+          fi
       - name: Install dependencies
-        if: steps.venv-cache.outputs.cache-hit != 'true'
+        if: steps.venv-cache.outputs.cache-hit != 'true' || env.venv-invalid == 'true'
         run: |
           python -m venv .venv
           .venv/bin/pip install -e ".[dev]"
