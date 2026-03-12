@@ -142,6 +142,73 @@ class TestValidMessage:
         attrs = messages[0]["MessageAttributes"]
         assert attrs["message_type"]["StringValue"] == "photo"
 
+    def test_document_with_caption(self, aws_env: dict[str, str]) -> None:
+        """A document message should enqueue document metadata and caption."""
+        import handler
+
+        update = {
+            "update_id": 2,
+            "message": {
+                "message_id": 44,
+                "from": {"id": ALLOWED_USER_ID, "first_name": "Test"},
+                "chat": {"id": CHAT_ID, "type": "private"},
+                "document": {
+                    "file_id": "doc-abc",
+                    "file_unique_id": "doc-unique",
+                    "file_name": "report.pdf",
+                    "mime_type": "application/pdf",
+                    "file_size": 12345,
+                },
+                "caption": "Here is the report",
+            },
+        }
+        result = handler.handler(_make_event(update), None)
+        assert result["statusCode"] == 200
+
+        messages = _get_sqs_messages(aws_env["queue_url"])
+        assert len(messages) == 1
+        body = json.loads(messages[0]["Body"])
+        assert body["text"] == "Here is the report"
+        assert body["chat_id"] == CHAT_ID
+        assert body["user_id"] == ALLOWED_USER_ID
+        assert body["document"]["file_id"] == "doc-abc"
+        assert body["document"]["file_name"] == "report.pdf"
+        assert body["message_id"] == 44
+        attrs = messages[0]["MessageAttributes"]
+        assert attrs["message_type"]["StringValue"] == "document"
+
+    def test_voice_message(self, aws_env: dict[str, str]) -> None:
+        """A voice message should enqueue voice metadata."""
+        import handler
+
+        update = {
+            "update_id": 2,
+            "message": {
+                "message_id": 45,
+                "from": {"id": ALLOWED_USER_ID, "first_name": "Test"},
+                "chat": {"id": CHAT_ID, "type": "private"},
+                "voice": {
+                    "file_id": "voice-abc",
+                    "file_unique_id": "voice-unique",
+                    "duration": 5,
+                    "mime_type": "audio/ogg",
+                    "file_size": 9876,
+                },
+            },
+        }
+        result = handler.handler(_make_event(update), None)
+        assert result["statusCode"] == 200
+
+        messages = _get_sqs_messages(aws_env["queue_url"])
+        assert len(messages) == 1
+        body = json.loads(messages[0]["Body"])
+        assert body["text"] == ""
+        assert body["voice"]["file_id"] == "voice-abc"
+        assert body["voice"]["duration"] == 5
+        assert body["message_id"] == 45
+        attrs = messages[0]["MessageAttributes"]
+        assert attrs["message_type"]["StringValue"] == "voice"
+
     def test_text_takes_precedence_over_caption(self, aws_env: dict[str, str]) -> None:
         """When both text and caption exist, text should be used."""
         import handler
