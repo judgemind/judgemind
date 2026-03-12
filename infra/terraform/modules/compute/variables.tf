@@ -134,3 +134,9 @@ variable "google_api_key_secret_arn" {
   type        = string
   default     = ""
 }
+
+variable "proxy_secret_arn" {
+  description = "ARN of the Secrets Manager secret holding the residential proxy URL (plain string). When set, SD_PROXY_URL is injected into the scraper container."
+  type        = string
+  default     = ""
+}

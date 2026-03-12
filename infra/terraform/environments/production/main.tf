@@ -6,6 +6,12 @@
 # The compute schedule is enabled. The EventBridge Scheduler triggers a daily
 # scraper run at 6 AM PT.
 
+# Look up the residential proxy secret so we can pass its ARN to the compute
+# module without hardcoding the random Secrets Manager suffix.
+data "aws_secretsmanager_secret" "residential_proxy" {
+  name = "judgemind/proxy/residential"
+}
+
 module "networking" {
   source      = "../../modules/networking"
   environment = "production"
@@ -54,6 +60,7 @@ module "compute" {
   scraper_task_role_arn   = module.iam_scraper.role_arn
   redis_url               = "redis://${module.cache.redis_endpoint}:${module.cache.redis_port}"
   document_archive_bucket = module.document_archive.bucket_id
+  proxy_secret_arn        = data.aws_secretsmanager_secret.residential_proxy.arn
 
   # Production: 1 vCPU, 2 GB RAM, daily schedule at 6 AM PT
   task_cpu            = 1024

@@ -20,6 +20,10 @@ data "aws_secretsmanager_secret" "google_api_key" {
   name = "judgemind/google/api-key"
 }
 
+data "aws_secretsmanager_secret" "residential_proxy" {
+  name = "judgemind/proxy/residential"
+}
+
 module "networking" {
   source      = "../../modules/networking"
   environment = "dev"
@@ -83,6 +87,7 @@ module "compute" {
   llm_provider                      = "anthropic"
   anthropic_api_key_secret_arn      = data.aws_secretsmanager_secret.anthropic_api_key.arn
   google_api_key_secret_arn         = data.aws_secretsmanager_secret.google_api_key.arn
+  proxy_secret_arn                  = data.aws_secretsmanager_secret.residential_proxy.arn
 
   # Dev: 0.5 vCPU, 1 GB RAM, daily schedule at 6 AM PT
   task_cpu            = 512
