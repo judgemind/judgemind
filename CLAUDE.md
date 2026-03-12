@@ -25,7 +25,7 @@ These are the most frequently violated rules. **A PreToolUse hook enforces the s
 
 ### ALWAYS — Before Acting
 - **ALWAYS** Read a file before Writing to it (the Write tool fails on existing files you haven't read).
-- **ALWAYS** pull latest code (`git fetch origin main && git rebase origin/main`) before analyzing or modifying files.
+- **ALWAYS** pull latest code (run `git fetch origin main` then `git rebase origin/main` as separate tool calls) before analyzing or modifying files.
 - **ALWAYS** use `{worktree}/tmp/` for temp files, never `/tmp/`.
 - **ALWAYS** use dedicated tools (Read, Glob, Grep) instead of Bash for file operations.
 - **ALWAYS** watch CI to completion (`gh run watch`) before doing anything else after pushing.
