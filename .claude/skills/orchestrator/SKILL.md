@@ -207,6 +207,8 @@ After merging:
   ```
 - Check if the merged PR triggers a deploy workflow (see CLAUDE.md "Verify deployment")
 - For deployed services, watch the deploy workflow to completion
+- **If PR touches `packages/telegram-bridge/` or `scripts/tg-responder.py`** — restart the responder daemon (see "Auto-restart responder daemon" below)
+- **If PR touches `infra/terraform/`** — run `terraform apply` for dev (see #900)
 - **Increment `prs_since_last_audit`** and persist it to `tmp/orchestrator_status.json`. When the counter reaches 20, the next main loop iteration will trigger an audit (see "Periodic Audit" below).
 
 **Do not merge PRs from external contributors or PRs you did not create** unless the user explicitly asks.
@@ -231,6 +233,20 @@ If a PR has merge conflicts:
   scripts/tg-notify.py notify "PR #<N> has merge conflicts and agent has exited — needs attention"
   ```
 - The orchestrator does not rebase other agents' branches
+
+### Auto-restart responder daemon
+
+When a merged PR modifies the responder code (`packages/telegram-bridge/` or `scripts/tg-responder.py`), restart the daemon to pick up the changes. This is quick and runs inline (not delegated to a subagent):
+
+1. Read `tmp/tg_responder.pid` to get the current PID
+2. Create `tmp/tg_responder.stop` (signals the daemon to shut down gracefully)
+3. Wait for the process to exit (poll `ps -p <pid>`, max 10 seconds)
+4. Remove `tmp/tg_responder.stop`
+5. Launch `scripts/tg-responder.py` (inherits current flags/config)
+6. Verify new PID file exists
+7. Send Telegram notification: "Responder daemon restarted after PR #N merged"
+
+If the restart fails, file a p1 issue and notify via Telegram.
 
 ---
 
