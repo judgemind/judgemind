@@ -12,6 +12,7 @@ These are the most frequently violated rules. **A PreToolUse hook enforces the s
 - **NEVER** use `python3 -c "..."` for inline scripts. Write to `{worktree}/tmp/script.py` and run the file.
 - **NEVER** combine quoted strings with `&&` or `;`. Split into separate tool calls.
 - **NEVER** prefix scripts with `bash` — run `scripts/start-worker.sh`, not `bash scripts/start-worker.sh`.
+- **NEVER** use Edit or Write tools on files inside `.claude/`. The CLI blocks these operations. Write content to `{worktree}/tmp/` first, then copy it into place with `scripts/write-claude-file.sh {worktree}/tmp/file.md {worktree}/.claude/target/file.md`.
 
 ### NEVER — Workflow
 - **NEVER** commit directly to `main` during autonomous task work. All `/task` work happens on worktree branches via PRs. (The user may direct you to commit to `main` during interactive sessions — that's fine.)

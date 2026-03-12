@@ -23,6 +23,7 @@ Machine-readable checklist of rules extracted from CLAUDE.md. Agents should vali
 | SH-05 | No `bash` prefix for scripts | `bash scripts/...` | Run directly: `scripts/start-worker.sh` |
 | SH-06 | Use `git -C` for remote paths | `cd /path && git ...` | `git -C /absolute/path <subcommand>` |
 | SH-07 | Temp files in worktree only | `/tmp/` in file paths | Use `{worktree}/tmp/` instead |
+| SH-08 | No Edit/Write to `.claude/` | Edit or Write tool targeting `.claude/` paths | Write to `{worktree}/tmp/`, then `scripts/write-claude-file.sh` to copy into `.claude/` |
 
 ## File Operation Rules
 
