@@ -2346,6 +2346,437 @@ class TestOpusDispatch:
         assert args.model == "opus"
 
 
+# ── Photo message handling ─────────────────────────────────────────────
+
+
+class TestDownloadTelegramPhoto:
+    """Tests for download_telegram_photo()."""
+
+    @respx.mock
+    def test_downloads_and_saves_photo(self, tmp_path: Path) -> None:
+        """Successfully downloads a photo and saves it to disk."""
+        mod = _import_responder()
+
+        # Mock getFile response.
+        respx.get(
+            "https://api.telegram.org/botfake-token/getFile",
+            params={"file_id": "test-file-id"},
+        ).mock(
+            return_value=httpx.Response(
+                200,
+                json={"ok": True, "result": {"file_path": "photos/test.jpg"}},
+            )
+        )
+
+        # Mock file download.
+        respx.get("https://api.telegram.org/file/botfake-token/photos/test.jpg").mock(
+            return_value=httpx.Response(200, content=b"fake-image-data")
+        )
+
+        save_dir = str(tmp_path / "tg_photos")
+        result = mod.download_telegram_photo(
+            file_id="test-file-id",
+            bot_token="fake-token",
+            save_dir=save_dir,
+            message_id=42,
+        )
+
+        assert result is not None
+        assert Path(result).exists()
+        assert Path(result).read_bytes() == b"fake-image-data"
+        assert "_42" in result
+        assert result.endswith(".jpg")
+
+    @respx.mock
+    def test_returns_none_on_get_file_failure(self, tmp_path: Path) -> None:
+        """Returns None when getFile API call fails."""
+        mod = _import_responder()
+
+        respx.get(
+            "https://api.telegram.org/botfake-token/getFile",
+            params={"file_id": "bad-id"},
+        ).mock(return_value=httpx.Response(404, json={"ok": False}))
+
+        result = mod.download_telegram_photo(
+            file_id="bad-id",
+            bot_token="fake-token",
+            save_dir=str(tmp_path / "tg_photos"),
+        )
+        assert result is None
+
+    @respx.mock
+    def test_returns_none_on_download_failure(self, tmp_path: Path) -> None:
+        """Returns None when file download fails."""
+        mod = _import_responder()
+
+        respx.get(
+            "https://api.telegram.org/botfake-token/getFile",
+            params={"file_id": "test-id"},
+        ).mock(
+            return_value=httpx.Response(
+                200,
+                json={"ok": True, "result": {"file_path": "photos/test.png"}},
+            )
+        )
+        respx.get("https://api.telegram.org/file/botfake-token/photos/test.png").mock(
+            return_value=httpx.Response(500)
+        )
+
+        result = mod.download_telegram_photo(
+            file_id="test-id",
+            bot_token="fake-token",
+            save_dir=str(tmp_path / "tg_photos"),
+        )
+        assert result is None
+
+    @respx.mock
+    def test_creates_save_directory(self, tmp_path: Path) -> None:
+        """Creates the save directory if it does not exist."""
+        mod = _import_responder()
+
+        respx.get(
+            "https://api.telegram.org/botfake-token/getFile",
+            params={"file_id": "test-id"},
+        ).mock(
+            return_value=httpx.Response(
+                200,
+                json={"ok": True, "result": {"file_path": "photos/img.jpg"}},
+            )
+        )
+        respx.get("https://api.telegram.org/file/botfake-token/photos/img.jpg").mock(
+            return_value=httpx.Response(200, content=b"data")
+        )
+
+        nested_dir = str(tmp_path / "nested" / "tg_photos")
+        result = mod.download_telegram_photo(
+            file_id="test-id",
+            bot_token="fake-token",
+            save_dir=nested_dir,
+        )
+        assert result is not None
+        assert Path(nested_dir).is_dir()
+
+    @respx.mock
+    def test_returns_none_on_empty_file_path(self, tmp_path: Path) -> None:
+        """Returns None when getFile returns no file_path."""
+        mod = _import_responder()
+
+        respx.get(
+            "https://api.telegram.org/botfake-token/getFile",
+            params={"file_id": "test-id"},
+        ).mock(
+            return_value=httpx.Response(
+                200,
+                json={"ok": True, "result": {}},
+            )
+        )
+
+        result = mod.download_telegram_photo(
+            file_id="test-id",
+            bot_token="fake-token",
+            save_dir=str(tmp_path / "tg_photos"),
+        )
+        assert result is None
+
+
+class TestHandlePhotoMessage:
+    """Tests for handle_photo_message()."""
+
+    @respx.mock
+    def test_downloads_saves_and_creates_inbox_entry(self, tmp_path: Path) -> None:
+        """Full happy path: download, save, inbox entry, reply."""
+        mod = _import_responder()
+
+        # Mock getFile and download.
+        respx.get(
+            "https://api.telegram.org/botfake-token/getFile",
+            params={"file_id": "large-photo-id"},
+        ).mock(
+            return_value=httpx.Response(
+                200,
+                json={"ok": True, "result": {"file_path": "photos/large.jpg"}},
+            )
+        )
+        respx.get("https://api.telegram.org/file/botfake-token/photos/large.jpg").mock(
+            return_value=httpx.Response(200, content=b"photo-bytes")
+        )
+
+        reply_route = respx.post("https://api.telegram.org/botfake-token/sendMessage").mock(
+            return_value=httpx.Response(200, json={"ok": True})
+        )
+
+        inbox_file = str(tmp_path / "inbox.json")
+        photos_dir = str(tmp_path / "tg_photos")
+
+        message: dict[str, object] = {
+            "photo": [
+                {"file_id": "small-photo-id", "width": 100, "height": 100},
+                {"file_id": "large-photo-id", "width": 800, "height": 600},
+            ],
+            "caption": "Check this out",
+            "message_id": 99,
+            "user_id": 12345,
+            "chat_id": 12345,
+        }
+
+        mod.handle_photo_message(
+            message=message,
+            bot_token="fake-token",
+            chat_ids=[12345],
+            inbox_file=inbox_file,
+            photos_dir=photos_dir,
+        )
+
+        # Check inbox entry was created.
+        inbox_data = json.loads(Path(inbox_file).read_text())
+        assert len(inbox_data) == 1
+        entry = inbox_data[0]
+        assert entry["action"] == "photo"
+        assert entry["file_path"] is not None
+        assert entry["caption"] == "Check this out"
+        assert entry["reply_to"] == 99
+        assert "timestamp" in entry
+
+        # Check photo was saved.
+        assert Path(entry["file_path"]).exists()
+        assert Path(entry["file_path"]).read_bytes() == b"photo-bytes"
+
+        # Check reply was sent.
+        assert reply_route.call_count == 1
+        reply_body = json.loads(reply_route.calls[0].request.content)
+        assert "Photo received" in reply_body["text"]
+        assert "Check this out" in reply_body["text"]
+
+    @respx.mock
+    def test_no_caption(self, tmp_path: Path) -> None:
+        """Photo without caption omits caption field from inbox entry."""
+        mod = _import_responder()
+
+        respx.get(
+            "https://api.telegram.org/botfake-token/getFile",
+            params={"file_id": "photo-id"},
+        ).mock(
+            return_value=httpx.Response(
+                200,
+                json={"ok": True, "result": {"file_path": "photos/img.jpg"}},
+            )
+        )
+        respx.get("https://api.telegram.org/file/botfake-token/photos/img.jpg").mock(
+            return_value=httpx.Response(200, content=b"data")
+        )
+
+        reply_route = respx.post("https://api.telegram.org/botfake-token/sendMessage").mock(
+            return_value=httpx.Response(200, json={"ok": True})
+        )
+
+        inbox_file = str(tmp_path / "inbox.json")
+
+        message: dict[str, object] = {
+            "photo": [{"file_id": "photo-id", "width": 800, "height": 600}],
+            "message_id": 50,
+            "user_id": 12345,
+        }
+
+        mod.handle_photo_message(
+            message=message,
+            bot_token="fake-token",
+            chat_ids=[12345],
+            inbox_file=inbox_file,
+            photos_dir=str(tmp_path / "tg_photos"),
+        )
+
+        inbox_data = json.loads(Path(inbox_file).read_text())
+        assert len(inbox_data) == 1
+        assert "caption" not in inbox_data[0]
+
+        # Reply should not mention caption.
+        reply_body = json.loads(reply_route.calls[0].request.content)
+        assert "Photo received, forwarded to orchestrator." == reply_body["text"]
+
+    @respx.mock
+    def test_download_failure_sends_error_reply(self, tmp_path: Path) -> None:
+        """When photo download fails, an error reply is sent."""
+        mod = _import_responder()
+
+        respx.get(
+            "https://api.telegram.org/botfake-token/getFile",
+            params={"file_id": "bad-id"},
+        ).mock(return_value=httpx.Response(500))
+
+        reply_route = respx.post("https://api.telegram.org/botfake-token/sendMessage").mock(
+            return_value=httpx.Response(200, json={"ok": True})
+        )
+
+        inbox_file = str(tmp_path / "inbox.json")
+
+        message: dict[str, object] = {
+            "photo": [{"file_id": "bad-id", "width": 100, "height": 100}],
+            "message_id": 51,
+        }
+
+        mod.handle_photo_message(
+            message=message,
+            bot_token="fake-token",
+            chat_ids=[12345],
+            inbox_file=inbox_file,
+            photos_dir=str(tmp_path / "tg_photos"),
+        )
+
+        # No inbox entry should be created.
+        assert not Path(inbox_file).exists()
+
+        # Error reply should be sent.
+        assert reply_route.call_count == 1
+        reply_body = json.loads(reply_route.calls[0].request.content)
+        assert "Failed to download" in reply_body["text"]
+
+    def test_empty_photo_array_skipped(self, tmp_path: Path) -> None:
+        """Messages with empty photo array are silently skipped."""
+        mod = _import_responder()
+
+        message: dict[str, object] = {
+            "photo": [],
+            "message_id": 52,
+        }
+
+        # Should not raise.
+        mod.handle_photo_message(
+            message=message,
+            bot_token="fake-token",
+            chat_ids=[12345],
+            inbox_file=str(tmp_path / "inbox.json"),
+            photos_dir=str(tmp_path / "tg_photos"),
+        )
+
+    @respx.mock
+    def test_uses_largest_photo(self, tmp_path: Path) -> None:
+        """Should use the last (largest) photo in the array."""
+        mod = _import_responder()
+
+        # Only the large photo file_id should be requested.
+        respx.get(
+            "https://api.telegram.org/botfake-token/getFile",
+            params={"file_id": "large-id"},
+        ).mock(
+            return_value=httpx.Response(
+                200,
+                json={"ok": True, "result": {"file_path": "photos/large.jpg"}},
+            )
+        )
+        respx.get("https://api.telegram.org/file/botfake-token/photos/large.jpg").mock(
+            return_value=httpx.Response(200, content=b"big-photo")
+        )
+
+        respx.post("https://api.telegram.org/botfake-token/sendMessage").mock(
+            return_value=httpx.Response(200, json={"ok": True})
+        )
+
+        message: dict[str, object] = {
+            "photo": [
+                {"file_id": "small-id", "width": 90, "height": 90},
+                {"file_id": "medium-id", "width": 320, "height": 320},
+                {"file_id": "large-id", "width": 800, "height": 800},
+            ],
+            "message_id": 53,
+        }
+
+        mod.handle_photo_message(
+            message=message,
+            bot_token="fake-token",
+            chat_ids=[12345],
+            inbox_file=str(tmp_path / "inbox.json"),
+            photos_dir=str(tmp_path / "tg_photos"),
+        )
+
+        inbox_data = json.loads(Path(tmp_path / "inbox.json").read_text())
+        assert len(inbox_data) == 1
+        # Verify the saved file contains the large photo data.
+        assert Path(inbox_data[0]["file_path"]).read_bytes() == b"big-photo"
+
+
+class TestDispatchMessagePhotoRouting:
+    """Tests that dispatch_message routes photo messages to handle_photo_message."""
+
+    @respx.mock
+    def test_photo_message_routed_to_handler(self, tmp_path: Path) -> None:
+        """Messages with 'photo' key skip Claude and are handled as photos."""
+        mod = _import_responder()
+
+        # Mock getFile and download.
+        respx.get(
+            "https://api.telegram.org/botfake-token/getFile",
+            params={"file_id": "photo-id"},
+        ).mock(
+            return_value=httpx.Response(
+                200,
+                json={"ok": True, "result": {"file_path": "photos/img.jpg"}},
+            )
+        )
+        respx.get("https://api.telegram.org/file/botfake-token/photos/img.jpg").mock(
+            return_value=httpx.Response(200, content=b"data")
+        )
+
+        respx.post("https://api.telegram.org/botfake-token/sendMessage").mock(
+            return_value=httpx.Response(200, json={"ok": True})
+        )
+
+        inbox_file = str(tmp_path / "inbox.json")
+
+        mod.dispatch_message(
+            message={
+                "text": "",
+                "photo": [{"file_id": "photo-id", "width": 800, "height": 600}],
+                "message_id": 60,
+                "user_id": 12345,
+                "chat_id": 12345,
+            },
+            bot_token="fake-token",
+            chat_ids=[12345],
+            state_file=str(tmp_path / "state.json"),
+            status_file=str(tmp_path / "status.json"),
+            agent_status_dir=str(tmp_path / "agent-status"),
+            stop_requests_file=str(tmp_path / "stop.json"),
+            inbox_file=inbox_file,
+            anthropic_api_key="test-key",
+        )
+
+        # An inbox entry should exist with action "photo".
+        inbox_data = json.loads(Path(inbox_file).read_text())
+        assert len(inbox_data) == 1
+        assert inbox_data[0]["action"] == "photo"
+
+    @respx.mock
+    @patch("tg_responder.interpret_message")
+    def test_text_message_still_uses_claude(
+        self, mock_interpret: MagicMock, tmp_path: Path
+    ) -> None:
+        """Messages without 'photo' key still go through Claude interpreter."""
+        from telegram_bridge.interpreter import InterpretedMessage
+
+        mock_interpret.return_value = InterpretedMessage(
+            reply="Hello!",
+            actions=[],
+        )
+        respx.post("https://api.telegram.org/botfake-token/sendMessage").mock(
+            return_value=httpx.Response(200, json={"ok": True})
+        )
+
+        mod = _import_responder()
+        mod.dispatch_message(
+            message={"text": "hello", "user_id": 12345},
+            bot_token="fake-token",
+            chat_ids=[12345],
+            state_file=str(tmp_path / "state.json"),
+            status_file=str(tmp_path / "status.json"),
+            agent_status_dir=str(tmp_path / "agent-status"),
+            stop_requests_file=str(tmp_path / "stop.json"),
+            inbox_file=str(tmp_path / "inbox.json"),
+            anthropic_api_key="test-key",
+        )
+
+        mock_interpret.assert_called_once()
+
+
 # ── Old daemon removed ──────────────────────────────────────────────────
 # The deprecated tg-poll-daemon.py was removed in #646. The responder
 # daemon (scripts/tg-responder.py) fully replaces it.
