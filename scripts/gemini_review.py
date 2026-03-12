@@ -4,18 +4,27 @@
 Reads task context and a git diff, sends them to Gemini for review,
 and writes a verdict (SHIP or REVISE) plus detailed feedback.
 
+Supports two modes:
+  - standard (default): general code review
+  - adversarial: bug-hunting focused review
+
 Inputs (read from well-known paths):
   {worktree}/tmp/ralph/task.md          — acceptance criteria and issue context
   {worktree}/tmp/ralph/diff.txt         — git diff of all changes
   {worktree}/tmp/ralph/changed_files.txt — full content of changed files
 
 Outputs (written to well-known paths):
-  {worktree}/tmp/ralph/gemini-review-result.txt — "SHIP" or "REVISE"
-  {worktree}/tmp/ralph/gemini-feedback.md       — detailed review feedback
+  Standard mode:
+    {worktree}/tmp/ralph/gemini-review-result.txt — "SHIP" or "REVISE"
+    {worktree}/tmp/ralph/gemini-feedback.md       — detailed review feedback
+  Adversarial mode:
+    {worktree}/tmp/ralph/adversarial-result.txt   — "SHIP" or "REVISE"
+    {worktree}/tmp/ralph/adversarial-feedback.md  — detailed adversarial findings
 
 Environment variables:
   GOOGLE_API_KEY       — Required. Google API key for Gemini access.
   GEMINI_REVIEW_MODEL  — Optional. Model ID. Default: gemini-2.5-pro.
+  GEMINI_REVIEW_MODE   — Optional. "standard" (default) or "adversarial".
   RALPH_STATE_DIR      — Required. Path to {worktree}/tmp/ralph/.
 
 Exit codes:
@@ -45,8 +54,22 @@ def read_file(path: Path) -> str:
         return ""
 
 
+def _output_names(mode: str) -> tuple[str, str]:
+    """Return (result_filename, feedback_filename) for the given review mode."""
+    if mode == "adversarial":
+        return "adversarial-result.txt", "adversarial-feedback.md"
+    return "gemini-review-result.txt", "gemini-feedback.md"
+
+
+def _model_log_name(mode: str, model: str) -> str:
+    """Return the model identifier used in review-log.jsonl."""
+    if mode == "adversarial":
+        return f"{model}-adversarial"
+    return model
+
+
 def build_review_prompt(task_md: str, diff_text: str, changed_files: str) -> str:
-    """Build the review prompt for Gemini."""
+    """Build the standard review prompt for Gemini."""
     return f"""You are a cross-model code reviewer in an iterative review loop. Your job is to
 evaluate whether a code implementation is ready to ship or needs revision. You are providing
 an independent perspective — a different AI model wrote this code.
@@ -93,6 +116,50 @@ or readability. Don't request changes outside the scope of the task. If tests pa
 acceptance criteria are met, lean toward SHIP."""
 
 
+def build_adversarial_prompt(task_md: str, diff_text: str, changed_files: str) -> str:
+    """Build the adversarial (bug-hunting) review prompt for Gemini."""
+    return f"""You are doing an adversarial code review. Your goal is to find real bugs, not style nits.
+
+Look for:
+- Dead code and unused parameters
+- Logic errors (off-by-one, short-circuit, wrong branches)
+- Missing error handling and untested exception branches
+- Concurrency safety (shared resources, race conditions, temp files)
+- Deprecated codepaths
+- Cross-component assumptions that could break in partial/retry scenarios
+
+## Task Requirements
+
+{task_md}
+
+## Git Diff (all changes)
+
+```diff
+{diff_text}
+```
+
+## Full Content of Changed Files
+
+{changed_files}
+
+## Your Response
+
+Start with a single word on the first line: either SHIP or REVISE.
+
+- If SHIP: briefly confirm you found no real bugs.
+- If REVISE: list each bug you found with:
+  - The exact file and line number
+  - What the bug is
+  - Why it matters (what could go wrong in production)
+  - A concrete fix suggestion
+
+Only flag real bugs and correctness issues. Do NOT flag:
+- Style preferences or naming conventions
+- Missing documentation
+- Suggestions that are nice-to-have but not bugs
+- Changes outside the scope of the task"""
+
+
 def _read_iteration(state_dir: Path) -> int:
     """Read the current ralph iteration number from the state directory.
 
@@ -116,25 +183,37 @@ def _resolve_worktree(state_dir: Path) -> Path | None:
     return None
 
 
-def run_review(state_dir: Path) -> int:
+def run_review(state_dir: Path, *, mode: str = "standard") -> int:
     """Run the Gemini review and write results.
+
+    Args:
+        state_dir: Path to the ralph state directory.
+        mode: Review mode — "standard" or "adversarial".
 
     Returns:
         0 on success, 1 on error, 2 on graceful skip.
     """
+    if mode not in ("standard", "adversarial"):
+        print(f"ERROR: Invalid review mode: {mode!r}. Use 'standard' or 'adversarial'.", file=sys.stderr)
+        return 1
+
     api_key = os.environ.get("GOOGLE_API_KEY", "")
     iteration = _read_iteration(state_dir)
+    result_name, feedback_name = _output_names(mode)
+    model = os.environ.get("GEMINI_REVIEW_MODEL", "gemini-2.5-pro")
+    log_model = _model_log_name(mode, model)
+    mode_label = "adversarial" if mode == "adversarial" else "standard"
 
     if not api_key:
         print(
-            "WARNING: GOOGLE_API_KEY not set. Skipping Gemini review (graceful degradation).",
+            f"WARNING: GOOGLE_API_KEY not set. Skipping Gemini {mode_label} review (graceful degradation).",
             file=sys.stderr,
         )
-        result_path = state_dir / "gemini-review-result.txt"
-        feedback_path = state_dir / "gemini-feedback.md"
+        result_path = state_dir / result_name
+        feedback_path = state_dir / feedback_name
         result_path.write_text("SKIPPED\n", encoding="utf-8")
         feedback_path.write_text(
-            "Gemini review skipped: GOOGLE_API_KEY not available.\n",
+            f"Gemini {mode_label} review skipped: GOOGLE_API_KEY not available.\n",
             encoding="utf-8",
         )
         # Log the skip
@@ -143,14 +222,12 @@ def run_review(state_dir: Path) -> int:
         log_review(
             state_dir,
             iteration=iteration,
-            model="gemini-2.5-pro",
+            model=log_model,
             verdict="SKIPPED",
             feedback="GOOGLE_API_KEY not available.",
             diff_stats=diff_stats,
         )
         return 2
-
-    model = os.environ.get("GEMINI_REVIEW_MODEL", "gemini-2.5-pro")
 
     # Read inputs
     task_md = read_file(state_dir / "task.md")
@@ -164,7 +241,10 @@ def run_review(state_dir: Path) -> int:
         print("ERROR: diff.txt not found or empty in state directory.", file=sys.stderr)
         return 1
 
-    prompt = build_review_prompt(task_md, diff_text, changed_files)
+    if mode == "adversarial":
+        prompt = build_adversarial_prompt(task_md, diff_text, changed_files)
+    else:
+        prompt = build_review_prompt(task_md, diff_text, changed_files)
 
     try:
         from google import genai  # type: ignore[import-untyped]
@@ -200,20 +280,20 @@ def run_review(state_dir: Path) -> int:
             output_tokens = getattr(usage, "candidates_token_count", None)
 
     except Exception as exc:
-        print(f"ERROR: Gemini API call failed: {exc}", file=sys.stderr)
+        print(f"ERROR: Gemini {mode_label} API call failed: {exc}", file=sys.stderr)
         # Graceful degradation on API errors — don't block the review loop
-        result_path = state_dir / "gemini-review-result.txt"
-        feedback_path = state_dir / "gemini-feedback.md"
+        result_path = state_dir / result_name
+        feedback_path = state_dir / feedback_name
         result_path.write_text("SKIPPED\n", encoding="utf-8")
         feedback_path.write_text(
-            f"Gemini review skipped due to API error: {exc}\n",
+            f"Gemini {mode_label} review skipped due to API error: {exc}\n",
             encoding="utf-8",
         )
         # Log the API error as a skipped review
         log_review(
             state_dir,
             iteration=iteration,
-            model=model,
+            model=log_model,
             verdict="SKIPPED",
             feedback=f"API error: {exc}",
             latency_ms=timer.latency_ms,
@@ -222,7 +302,7 @@ def run_review(state_dir: Path) -> int:
         return 2
 
     if not review_text:
-        print("ERROR: Gemini returned empty response.", file=sys.stderr)
+        print(f"ERROR: Gemini {mode_label} returned empty response.", file=sys.stderr)
         return 1
 
     # Parse verdict from first line
@@ -234,19 +314,19 @@ def run_review(state_dir: Path) -> int:
     else:
         # If the model didn't follow the format, treat as REVISE to be safe
         print(
-            f"WARNING: Gemini response did not start with SHIP or REVISE "
+            f"WARNING: Gemini {mode_label} response did not start with SHIP or REVISE "
             f"(got: {first_line!r}). Treating as REVISE.",
             file=sys.stderr,
         )
         verdict = "REVISE"
 
     # Write outputs
-    result_path = state_dir / "gemini-review-result.txt"
-    feedback_path = state_dir / "gemini-feedback.md"
+    result_path = state_dir / result_name
+    feedback_path = state_dir / feedback_name
 
     result_path.write_text(f"{verdict}\n", encoding="utf-8")
     feedback_path.write_text(
-        f"# Gemini Review ({model})\n\n{review_text}\n",
+        f"# Gemini {mode_label.title()} Review ({model})\n\n{review_text}\n",
         encoding="utf-8",
     )
 
@@ -254,7 +334,7 @@ def run_review(state_dir: Path) -> int:
     log_review(
         state_dir,
         iteration=iteration,
-        model=model,
+        model=log_model,
         verdict=verdict,
         feedback=review_text,
         input_tokens=input_tokens,
@@ -263,7 +343,7 @@ def run_review(state_dir: Path) -> int:
         diff_stats=diff_stats,
     )
 
-    print(f"Gemini review complete: {verdict}")
+    print(f"Gemini {mode_label} review complete: {verdict}")
     return 0
 
 
@@ -279,7 +359,8 @@ def main() -> None:
         print(f"ERROR: State directory does not exist: {state_dir}", file=sys.stderr)
         sys.exit(1)
 
-    exit_code = run_review(state_dir)
+    mode = os.environ.get("GEMINI_REVIEW_MODE", "standard")
+    exit_code = run_review(state_dir, mode=mode)
     sys.exit(exit_code)
 
 

@@ -2,12 +2,17 @@
 # gemini-review.sh — Run the Gemini cross-model review for the /ralph loop.
 #
 # Usage:
-#   scripts/gemini-review.sh <worktree-path>
+#   scripts/gemini-review.sh <worktree-path> [--adversarial]
 #
 # This wrapper:
 # 1. Prepares the diff and changed-files inputs from the worktree
 # 2. Injects the Google API key from Secrets Manager via with-secret.sh
 # 3. Runs gemini_review.py with RALPH_STATE_DIR set
+#
+# Options:
+#   --adversarial   Run in adversarial (bug-hunting) mode instead of standard review.
+#                   Sets GEMINI_REVIEW_MODE=adversarial and writes to adversarial-result.txt
+#                   and adversarial-feedback.md instead of the standard output files.
 #
 # Exit codes:
 #   0 — Review completed (SHIP or REVISE written to result file)
@@ -18,12 +23,32 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
-if [[ $# -lt 1 ]]; then
-    echo "Usage: scripts/gemini-review.sh <worktree-path>" >&2
+# Parse arguments
+ADVERSARIAL=false
+WORKTREE=""
+
+for arg in "$@"; do
+    case "$arg" in
+        --adversarial)
+            ADVERSARIAL=true
+            ;;
+        *)
+            if [[ -z "$WORKTREE" ]]; then
+                WORKTREE="$arg"
+            else
+                echo "ERROR: Unexpected argument: $arg" >&2
+                echo "Usage: scripts/gemini-review.sh <worktree-path> [--adversarial]" >&2
+                exit 1
+            fi
+            ;;
+    esac
+done
+
+if [[ -z "$WORKTREE" ]]; then
+    echo "Usage: scripts/gemini-review.sh <worktree-path> [--adversarial]" >&2
     exit 1
 fi
 
-WORKTREE="$1"
 STATE_DIR="${WORKTREE}/tmp/ralph"
 
 if [[ ! -d "$STATE_DIR" ]]; then
@@ -88,6 +113,14 @@ fi
 # Run the review with the Google API key injected from Secrets Manager
 export RALPH_STATE_DIR="$STATE_DIR"
 
+if [[ "$ADVERSARIAL" == "true" ]]; then
+    export GEMINI_REVIEW_MODE="adversarial"
+    echo "Running Gemini adversarial review..." >&2
+else
+    export GEMINI_REVIEW_MODE="standard"
+    echo "Running Gemini standard review..." >&2
+fi
+
 "${SCRIPT_DIR}/with-secret.sh" \
     -e GOOGLE_API_KEY=judgemind/google/api-key \
     -- "$PYTHON" "${SCRIPT_DIR}/gemini_review.py"
@@ -95,7 +128,7 @@ export RALPH_STATE_DIR="$STATE_DIR"
 exit_code=$?
 
 if [[ $exit_code -eq 2 ]]; then
-    echo "Gemini review skipped (graceful degradation)." >&2
+    echo "Gemini ${GEMINI_REVIEW_MODE} review skipped (graceful degradation)." >&2
 fi
 
 exit $exit_code
