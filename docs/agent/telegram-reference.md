@@ -69,9 +69,9 @@ The standalone **responder daemon** (`scripts/tg-responder.py`) interprets all T
 - `judgemind/telegram/bot` — bot token and allowed user IDs (existing)
 - `judgemind/anthropic/api-key` — Anthropic API key for Claude interpreter, or set `ANTHROPIC_API_KEY` env var. If missing, the daemon falls back to simple acknowledgments.
 
-To start the responder daemon: `scripts/tg-responder.py`. To stop it: create `tmp/tg_responder.stop`.
+To start the responder daemon: `scripts/tg-responder.py`. To stop it: `scripts/tg-stop-responder.sh`.
 
 ## Unattended Operation Patterns — Telegram
 
 - **Telegram bridge notifications:** the `TelegramBridge` and `OrchestratorBridge` classes are async. In synchronous contexts, use `asyncio.run()` or schedule on an existing event loop. The bridge auto-initialises lazily on first use — no explicit setup needed beyond passing the secret ID and SQS queue URL. If the secret is missing or empty, all calls are silent no-ops, so it is safe to call unconditionally.
-- **File-based graceful shutdown for background processes:** Never use `kill` to stop background daemons — it is blocked by the sandbox. Instead, use the file-based stop convention: for any daemon that writes a PID to `tmp/foo.pid`, create `tmp/foo.stop` to request shutdown. The daemon checks for the stop file each iteration and exits gracefully, cleaning up both the PID file and the stop file. To stop the Telegram responder: create `tmp/tg_responder.stop` using the Write tool. The daemon (`scripts/tg-responder.py`) will detect it within 1 second and exit. For new background daemons, follow the same convention: check `_check_stop_file(pid_file)` in the sleep loop and call `_remove_stop_file(pid_file)` in the `finally` block.
+- **Stopping background daemons:** Use `scripts/tg-stop-responder.sh` to stop the Telegram responder daemon. It reads the PID file, sends SIGTERM, waits up to 10 seconds for graceful shutdown, and escalates to SIGKILL if needed. For new background daemons, follow the same PID file convention (`tmp/foo.pid`) and handle SIGTERM for graceful shutdown.

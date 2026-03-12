@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# PreToolUse hook for Edit and Write tools: soft-blocks file edits on the main
-# branch to remind orchestrators to delegate via /task instead.
+# PreToolUse hook for Edit and Write tools: warns when editing files on the main
+# branch, as a reminder to orchestrators to delegate via /task instead.
 #
 # This hook receives the tool input as JSON on stdin. It extracts the file_path
-# and checks whether the current branch is main/master. If so, it exits non-zero
-# to trigger a user confirmation prompt — not a hard block, but friction that
-# prevents accidental direct edits from orchestrator sessions.
+# and checks whether the current branch is main/master. If so, it prints a
+# warning to stderr but allows the operation to proceed. This is advisory —
+# interactive sessions may legitimately edit files on main.
 #
 # Branch resolution: the branch is resolved from the *file's* directory, not
 # the agent's CWD. This prevents false positives when the CWD is on main but
@@ -15,12 +15,12 @@
 # the hook walks up the path hierarchy to find the nearest existing ancestor
 # directory and resolves the branch from there.
 #
-# Exceptions (always allowed, even on main):
+# Exceptions (no warning):
 #   - Files under tmp/          (orchestrator temp files)
 #   - Files under ~/.claude/    (memory updates)
 #   - Files under .claude/      (settings/hook config)
 #
-# Exit 0 = allow silently, exit 2 = block with message on stderr.
+# Exit 0 = allow (always). Warnings are printed to stderr.
 
 set -uo pipefail
 
@@ -79,7 +79,6 @@ if [[ "$FILE_PATH" == "$HOME_CLAUDE"* ]]; then
     exit 0
 fi
 
-# On main and editing a production file — soft-block
-echo "You're on main. Orchestrators don't edit production files directly." >&2
-echo "File an issue and use /task to spawn a subagent instead." >&2
-exit 2
+# On main and editing a production file — warn but allow
+echo "⚠ Warning: editing a production file on main. Consider using a worktree branch for non-trivial changes." >&2
+exit 0

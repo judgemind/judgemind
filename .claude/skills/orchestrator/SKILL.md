@@ -158,7 +158,7 @@ In the main loop (step 2), call `bridge.read_orchestrator_inbox()` which returns
 
 | Action | How to handle |
 |---|---|
-| `restart_responder` | Create `tmp/tg_responder.stop`, wait for daemon to exit, reinstall telegram-bridge deps, restart `scripts/tg-responder.py` |
+| `restart_responder` | Run `scripts/tg-stop-responder.sh`, reinstall telegram-bridge deps, restart `scripts/tg-responder.py` |
 | `terraform_apply` | Run `terraform -chdir=infra/terraform/environments/dev apply -target=module.<module> -auto-approve` |
 | `notify` | Send a Telegram notification via `scripts/tg-notify.py notify "<message>"` |
 | `run_script` | Execute the specified script (validate it starts with `scripts/` for safety) |
@@ -238,13 +238,11 @@ If a PR has merge conflicts:
 
 When a merged PR modifies the responder code (`packages/telegram-bridge/` or `scripts/tg-responder.py`), restart the daemon to pick up the changes. This is quick and runs inline (not delegated to a subagent):
 
-1. Read `tmp/tg_responder.pid` to get the current PID
-2. Create `tmp/tg_responder.stop` (signals the daemon to shut down gracefully)
-3. Wait for the process to exit (poll `ps -p <pid>`, max 10 seconds)
-4. Remove `tmp/tg_responder.stop`
-5. Launch `scripts/tg-responder.py` (inherits current flags/config)
-6. Verify new PID file exists
-7. Send Telegram notification: "Responder daemon restarted after PR #N merged"
+1. Run `scripts/tg-stop-responder.sh` (sends SIGTERM, waits for exit, cleans up PID/stop files)
+2. Reinstall telegram-bridge deps if needed
+3. Launch `scripts/tg-responder.py` (inherits current flags/config)
+4. Verify new PID file exists
+5. Send Telegram notification: "Responder daemon restarted after PR #N merged"
 
 If the restart fails, file a p1 issue and notify via Telegram.
 
@@ -389,7 +387,6 @@ The `tmp/orchestrator_status.json` file includes the `prs_since_last_audit` coun
 
 Shutdown triggers:
 - User types `/stop` or asks to stop
-- `tmp/tg_responder.stop` file is created
 - All issues in the queue are complete and no agents are running
 
 Shutdown procedure:
@@ -400,7 +397,7 @@ Shutdown procedure:
    ```
    scripts/tg-notify.py session_ended
    ```
-5. Stop the responder daemon (create `tmp/tg_responder.stop`)
+5. Stop the responder daemon (`scripts/tg-stop-responder.sh`)
 6. Print a summary of what was accomplished:
    - Issues completed
    - PRs merged

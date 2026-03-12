@@ -14,13 +14,13 @@ Usage::
 
     scripts/tg-responder.py [--interval 1] [--pid-file tmp/tg_responder.pid]
 
-To stop the daemon gracefully, create the stop file::
+To stop the daemon gracefully::
 
-    touch tmp/tg_responder.stop
+    scripts/tg-stop-responder.sh
 
-The daemon checks for the stop file frequently — before and after every
-network call, and during the sleep interval — so it responds within a few
-seconds even during error retry loops.
+This sends SIGTERM to the daemon process, waits for graceful shutdown, and
+cleans up PID/stop files. The daemon also checks for a ``tmp/tg_responder.stop``
+file as a fallback shutdown mechanism.
 
 If a daemon is already running, the script refuses to start (prints an
 error).  Use ``--force`` to request the existing daemon to shut down (via
