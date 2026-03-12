@@ -66,10 +66,10 @@ echo "Task: $task_arn" >&2
 echo "" >&2
 
 # Base64-encode the query to avoid quoting issues with single/double quotes
-# in SQL (e.g. WHERE status = 'active'). The Python one-liner decodes it.
+# in SQL (e.g. WHERE status = 'active'). The runner script decodes it.
 query_b64=$(printf '%s' "$query" | base64 | tr -d '\n')
 
-# When READ_ONLY is true (the default), the Python code sets the session to
+# When READ_ONLY is true (the default), the runner script sets the session to
 # read-only mode before executing the user's query, so PostgreSQL itself
 # rejects any write attempt — defense-in-depth on top of the application-
 # level SQL keyword blocklist.
@@ -79,11 +79,20 @@ else
     readonly_flag="0"
 fi
 
-# Use Python + psycopg (already installed in the container) instead of psql
+# ─── Upload and run the Python query runner ──────────────────────────────────
+# The query logic lives in scripts/dev_db_query_runner.py.  We base64-encode
+# the script, decode it to a temp file on the container, and run it — the same
+# pattern used by ecs-run.sh --script.  This avoids the fragile one-liner that
+# was previously embedded in the --command string.
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+runner_encoded=$(base64 < "$SCRIPT_DIR/dev_db_query_runner.py" | tr -d '\n')
+remote_script="/tmp/_dev_db_query_runner.py"
+
 aws ecs execute-command \
     --cluster "$CLUSTER" \
     --task "$task_arn" \
     --container "$CONTAINER" \
     --interactive \
     --region "$REGION" \
-    --command "python3 -c \"import os,psycopg,json,base64;q=base64.b64decode('${query_b64}').decode();c=psycopg.connect(os.environ['DATABASE_URL']);r=c.cursor();r.execute('SET default_transaction_read_only = on') if '${readonly_flag}'=='1' else None;r.execute(q);print(json.dumps([dict(zip([d[0] for d in r.description],row)) for row in r.fetchall()],indent=2,default=str)) if r.description else print(json.dumps({'rowcount':r.rowcount}))\""
+    --command "bash -c 'echo $runner_encoded | base64 -d > $remote_script && python3 $remote_script $query_b64 $readonly_flag; rm -f $remote_script'"
