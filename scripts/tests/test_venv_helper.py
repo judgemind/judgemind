@@ -55,23 +55,50 @@ class TestEnsureVenv:
             ensure_venv("nonexistent-package")
 
     def test_returns_when_already_in_correct_venv(self, tmp_path: Path) -> None:
-        """ensure_venv should return if sys.executable matches the venv Python."""
+        """ensure_venv should return if sys.prefix matches the venv directory."""
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop("_VENV_HELPER_SKIP", None)
-            # Create a fake venv Python that matches sys.executable
+            # Create a fake venv structure
             fake_venv = tmp_path / "packages" / "test-pkg" / ".venv" / "bin"
             fake_venv.mkdir(parents=True)
             fake_python = fake_venv / "python3"
-            # Symlink to the real Python so realpath matches
+            fake_python.symlink_to(sys.executable)
+
+            venv_dir = str(tmp_path / "packages" / "test-pkg" / ".venv")
+
+            with patch("_venv_helper._REPO_ROOT", tmp_path):
+                # Simulate being inside the venv: sys.prefix points to the
+                # venv root, and differs from sys.base_prefix.
+                with patch("sys.prefix", venv_dir):
+                    with patch("sys.base_prefix", "/usr/lib/python3"):
+                        with patch("_venv_helper._check_venv_has_deps", return_value=True):
+                            # Should return without re-exec
+                            ensure_venv("test-pkg")
+
+    def test_not_fooled_by_symlinked_venv_python(self, tmp_path: Path) -> None:
+        """System python must not be mistaken for venv python even when
+        the venv bin/python3 is a symlink to the same binary (the bug
+        that realpath-based detection had)."""
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("_VENV_HELPER_SKIP", None)
+            os.environ.pop("_VENV_HELPER_USE_EXECV", None)
+
+            # Create a fake venv whose python3 symlinks to sys.executable
+            fake_venv = tmp_path / "packages" / "test-pkg" / ".venv" / "bin"
+            fake_venv.mkdir(parents=True)
+            fake_python = fake_venv / "python3"
             fake_python.symlink_to(sys.executable)
 
             with patch("_venv_helper._REPO_ROOT", tmp_path):
-                with patch("sys.executable", str(fake_python)):
-                    # Mock _check_venv_has_deps since this test verifies
-                    # correct-venv detection, not dependency checking
-                    with patch("_venv_helper._check_venv_has_deps", return_value=True):
-                        # Should return without calling execv
-                        ensure_venv("test-pkg")
+                with patch("_venv_helper._check_venv_has_deps", return_value=True):
+                    # sys.prefix == sys.base_prefix means we are NOT in a venv,
+                    # so ensure_venv must re-exec rather than return.
+                    mock_result = type("Result", (), {"returncode": 0})()
+                    with patch("subprocess.run", return_value=mock_result) as mock_run:
+                        with pytest.raises(SystemExit) as exc_info:
+                            ensure_venv("test-pkg")
+                        assert exc_info.value.code == 0
+                        mock_run.assert_called_once()
 
     def test_exits_with_error_when_venv_missing(self, tmp_path: Path) -> None:
         """ensure_venv should sys.exit(1) with helpful message when no venv."""

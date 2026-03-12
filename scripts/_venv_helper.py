@@ -143,17 +143,27 @@ def ensure_venv(package_name: str) -> None:
         return
 
     venv_py = _venv_python(package_name)
+    venv_dir = venv_py.parent.parent  # .venv/bin/python3 -> .venv
 
     # Already running in the correct venv?
+    # We check sys.prefix rather than sys.executable because venv bin/python3
+    # is a symlink to the system Python — os.path.realpath resolves both to
+    # the same binary, making executable comparison unreliable.  sys.prefix
+    # is set by the venv's pyvenv.cfg and reliably points to the venv root
+    # only when the venv interpreter is active.
     try:
-        if os.path.realpath(sys.executable) == os.path.realpath(str(venv_py)):
+        in_correct_venv = (
+            sys.prefix != sys.base_prefix
+            and os.path.realpath(sys.prefix) == os.path.realpath(str(venv_dir))
+        )
+        if in_correct_venv:
             # We are in the right venv — verify deps are installed.
             if not _check_venv_has_deps(package_name):
                 _print_install_instructions(package_name)
                 sys.exit(1)
             return
     except OSError:
-        pass  # venv_py might not exist yet — fall through
+        pass  # venv_dir might not exist yet — fall through
 
     # Check if the venv exists
     if not venv_py.exists():
