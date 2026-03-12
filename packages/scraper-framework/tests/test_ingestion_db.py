@@ -2,21 +2,36 @@
 
 Covers:
   - NUL byte stripping in text fields
+  - Court, case, document, ruling, judge, and party upsert operations
+  - Judge name normalization
+  - Party name normalization and truncation
   - batch_upsert_parties function
+  - Error handling (RuntimeError on missing rows)
 """
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime
 from unittest.mock import MagicMock
+
+import pytest
 
 from ingestion.db import (
     _MAX_PARTY_NAME_LENGTH,
+    _derive_court_code,
+    _looks_like_valid_judge_name,
     _strip_nul,
     _truncate_party_name,
     batch_upsert_parties,
+    insert_document,
     insert_ruling,
+    normalize_judge_name,
+    normalize_party_name,
+    resolve_judge,
     upsert_case,
+    upsert_case_judge,
+    upsert_case_party,
+    upsert_court,
     upsert_party,
 )
 
@@ -498,3 +513,516 @@ class TestUpsertPartyTruncation:
                     assert len(arg) <= _MAX_PARTY_NAME_LENGTH, (
                         f"Arg length {len(arg)} exceeds limit"
                     )
+
+
+# ---------------------------------------------------------------------------
+# _derive_court_code
+# ---------------------------------------------------------------------------
+
+
+class TestDeriveCourtCode:
+    """Tests for _derive_court_code helper."""
+
+    def test_simple_county(self) -> None:
+        assert _derive_court_code("CA", "Orange") == "ca-orange"
+
+    def test_multi_word_county(self) -> None:
+        assert _derive_court_code("CA", "Los Angeles") == "ca-los-angeles"
+
+    def test_preserves_hyphens_in_county(self) -> None:
+        assert _derive_court_code("CA", "San Bernardino") == "ca-san-bernardino"
+
+    def test_uppercase_state(self) -> None:
+        assert _derive_court_code("TX", "Harris") == "tx-harris"
+
+
+# ---------------------------------------------------------------------------
+# upsert_court
+# ---------------------------------------------------------------------------
+
+
+class TestUpsertCourt:
+    """Tests for upsert_court function."""
+
+    def test_returns_court_id(self) -> None:
+        conn = _mock_conn()
+        result = upsert_court(conn, "CA", "Orange", "Orange County Superior Court")
+        assert result == "fake-uuid-1"
+
+    def test_passes_correct_params(self) -> None:
+        conn = _mock_conn()
+        upsert_court(conn, "CA", "Los Angeles", "LA Superior Court", timezone="America/Chicago")
+        args = _get_execute_args(conn)
+        assert args == (
+            "CA",
+            "Los Angeles",
+            "LA Superior Court",
+            "ca-los-angeles",
+            "America/Chicago",
+        )
+
+    def test_default_timezone(self) -> None:
+        conn = _mock_conn()
+        upsert_court(conn, "CA", "Orange", "OC Superior Court")
+        args = _get_execute_args(conn)
+        assert args[4] == "America/Los_Angeles"
+
+    def test_raises_if_no_row_returned(self) -> None:
+        conn = _mock_conn()
+        cur = conn.cursor.return_value.__enter__.return_value
+        cur.fetchone.return_value = None
+        with pytest.raises(RuntimeError, match="upsert_court returned no row"):
+            upsert_court(conn, "CA", "Orange", "OC Court")
+
+
+# ---------------------------------------------------------------------------
+# upsert_case — additional tests
+# ---------------------------------------------------------------------------
+
+
+class TestUpsertCase:
+    """Tests for upsert_case function beyond NUL stripping."""
+
+    def test_returns_case_id(self) -> None:
+        conn = _mock_conn()
+        result = upsert_case(conn, case_number="23STCV12345", court_id="court-1")
+        assert result == "fake-uuid-1"
+
+    def test_normalizes_case_number(self) -> None:
+        conn = _mock_conn()
+        upsert_case(conn, case_number=" 23-STCV 12345 ", court_id="court-1")
+        args = _get_execute_args(conn)
+        # case_number is args[0], normalized is args[1]
+        assert args[0] == " 23-STCV 12345 "
+        assert args[1] == "23stcv12345"
+
+    def test_case_type_nul_stripped(self) -> None:
+        conn = _mock_conn()
+        upsert_case(
+            conn,
+            case_number="23STCV12345",
+            court_id="court-1",
+            case_type="civil\x00",
+        )
+        args = _get_execute_args(conn)
+        assert "\x00" not in str(args)
+
+    def test_raises_if_no_row_returned(self) -> None:
+        conn = _mock_conn()
+        cur = conn.cursor.return_value.__enter__.return_value
+        cur.fetchone.return_value = None
+        with pytest.raises(RuntimeError, match="upsert_case"):
+            upsert_case(conn, case_number="CASE1", court_id="court-1")
+
+
+# ---------------------------------------------------------------------------
+# insert_document
+# ---------------------------------------------------------------------------
+
+
+class TestInsertDocument:
+    """Tests for insert_document function."""
+
+    def test_returns_true_for_new_document(self) -> None:
+        conn = _mock_conn()
+        cur = conn.cursor.return_value.__enter__.return_value
+        cur.fetchone.return_value = (True,)  # is_new = True
+        result = insert_document(
+            conn,
+            document_id="doc-1",
+            case_id="case-1",
+            court_id="court-1",
+            content_format="html",
+            content_hash="abc123",
+            s3_key="rulings/doc-1.html",
+            s3_bucket="judgemind-docs",
+            source_url="https://example.com/ruling.html",
+            scraper_id="scraper-oc",
+            captured_at=datetime(2026, 3, 5, 10, 0, 0),
+            hearing_date=date(2026, 3, 10),
+        )
+        assert result is True
+
+    def test_returns_false_for_existing_document(self) -> None:
+        conn = _mock_conn()
+        cur = conn.cursor.return_value.__enter__.return_value
+        cur.fetchone.return_value = (False,)  # is_new = False
+        result = insert_document(
+            conn,
+            document_id="doc-1",
+            case_id="case-1",
+            court_id="court-1",
+            content_format="pdf",
+            content_hash="abc123",
+            s3_key="rulings/doc-1.pdf",
+            s3_bucket="judgemind-docs",
+            source_url="https://example.com/ruling.pdf",
+            scraper_id="scraper-oc",
+            captured_at=datetime(2026, 3, 5, 10, 0, 0),
+            hearing_date=None,
+        )
+        assert result is False
+
+    def test_returns_false_when_no_row(self) -> None:
+        conn = _mock_conn()
+        cur = conn.cursor.return_value.__enter__.return_value
+        cur.fetchone.return_value = None
+        result = insert_document(
+            conn,
+            document_id="doc-1",
+            case_id="case-1",
+            court_id="court-1",
+            content_format="html",
+            content_hash="abc123",
+            s3_key=None,
+            s3_bucket=None,
+            source_url="https://example.com",
+            scraper_id="scraper-1",
+            captured_at=datetime(2026, 3, 5),
+            hearing_date=None,
+        )
+        assert result is False
+
+    def test_format_mapping_html(self) -> None:
+        conn = _mock_conn()
+        cur = conn.cursor.return_value.__enter__.return_value
+        cur.fetchone.return_value = (True,)
+        insert_document(
+            conn,
+            document_id="doc-1",
+            case_id="case-1",
+            court_id="court-1",
+            content_format="HTML",
+            content_hash="abc",
+            s3_key=None,
+            s3_bucket=None,
+            source_url="https://example.com",
+            scraper_id="scraper-1",
+            captured_at=datetime(2026, 3, 5),
+            hearing_date=None,
+        )
+        args = _get_execute_args(conn)
+        # pg_format is args[3]
+        assert args[3] == "html"
+
+    def test_format_mapping_pdf(self) -> None:
+        conn = _mock_conn()
+        cur = conn.cursor.return_value.__enter__.return_value
+        cur.fetchone.return_value = (True,)
+        insert_document(
+            conn,
+            document_id="doc-1",
+            case_id="case-1",
+            court_id="court-1",
+            content_format="pdf",
+            content_hash="abc",
+            s3_key=None,
+            s3_bucket=None,
+            source_url="https://example.com",
+            scraper_id="scraper-1",
+            captured_at=datetime(2026, 3, 5),
+            hearing_date=None,
+        )
+        args = _get_execute_args(conn)
+        assert args[3] == "pdf"
+
+    def test_format_mapping_text(self) -> None:
+        conn = _mock_conn()
+        cur = conn.cursor.return_value.__enter__.return_value
+        cur.fetchone.return_value = (True,)
+        insert_document(
+            conn,
+            document_id="doc-1",
+            case_id="case-1",
+            court_id="court-1",
+            content_format="text",
+            content_hash="abc",
+            s3_key=None,
+            s3_bucket=None,
+            source_url="https://example.com",
+            scraper_id="scraper-1",
+            captured_at=datetime(2026, 3, 5),
+            hearing_date=None,
+        )
+        args = _get_execute_args(conn)
+        assert args[3] == "txt"
+
+    def test_format_mapping_unknown_defaults_html(self) -> None:
+        conn = _mock_conn()
+        cur = conn.cursor.return_value.__enter__.return_value
+        cur.fetchone.return_value = (True,)
+        insert_document(
+            conn,
+            document_id="doc-1",
+            case_id="case-1",
+            court_id="court-1",
+            content_format="rtf",
+            content_hash="abc",
+            s3_key=None,
+            s3_bucket=None,
+            source_url="https://example.com",
+            scraper_id="scraper-1",
+            captured_at=datetime(2026, 3, 5),
+            hearing_date=None,
+        )
+        args = _get_execute_args(conn)
+        assert args[3] == "html"
+
+
+# ---------------------------------------------------------------------------
+# normalize_judge_name
+# ---------------------------------------------------------------------------
+
+
+class TestNormalizeJudgeName:
+    """Tests for normalize_judge_name function."""
+
+    def test_last_first_format(self) -> None:
+        assert normalize_judge_name("SMITH, JOHN A.") == "John A. Smith"
+
+    def test_first_last_format(self) -> None:
+        assert normalize_judge_name("JOHN A. SMITH") == "John A. Smith"
+
+    def test_strips_whitespace(self) -> None:
+        assert normalize_judge_name("  Smith,  John A. ") == "John A. Smith"
+
+    def test_strips_hon_prefix(self) -> None:
+        assert normalize_judge_name("Hon. Joseph B. Widman") == "Joseph B. Widman"
+
+    def test_strips_judge_prefix(self) -> None:
+        assert normalize_judge_name("Judge Bobby P. Luna") == "Bobby P. Luna"
+
+    def test_strips_the_honorable(self) -> None:
+        assert normalize_judge_name("The Honorable Jane Doe") == "Jane Doe"
+
+    def test_strips_arbitrator(self) -> None:
+        assert normalize_judge_name("Arbitrator Howard B. Miller") == "Howard B. Miller"
+
+    def test_misplaced_jr_suffix(self) -> None:
+        assert normalize_judge_name("Jr. Edward B. Moreton") == "Edward B. Moreton Jr."
+
+    def test_returns_none_for_empty(self) -> None:
+        assert normalize_judge_name("") is None
+
+    def test_returns_none_for_whitespace(self) -> None:
+        assert normalize_judge_name("   ") is None
+
+    def test_returns_none_for_too_long(self) -> None:
+        long_name = "A" * 81
+        assert normalize_judge_name(long_name) is None
+
+    def test_returns_none_for_garbage_moving_party(self) -> None:
+        assert normalize_judge_name("Moving Party filed a motion") is None
+
+    def test_returns_none_for_garbage_ordered(self) -> None:
+        assert normalize_judge_name("Is Ordered to appear") is None
+
+    def test_returns_none_for_garbage_plaintiff(self) -> None:
+        assert normalize_judge_name("Plaintiff John Doe") is None
+
+    def test_returns_none_for_garbage_year_prefix(self) -> None:
+        assert normalize_judge_name("2024 ruling text here") is None
+
+    def test_returns_none_for_garbage_underscores(self) -> None:
+        assert normalize_judge_name("____fill_in____") is None
+
+    def test_strips_unicode_replacement_chars(self) -> None:
+        result = normalize_judge_name("\ufffdJohn\ufffd Smith")
+        assert result == "John Smith"
+
+    def test_collapses_internal_whitespace(self) -> None:
+        assert normalize_judge_name("John   A.   Smith") == "John A. Smith"
+
+    def test_generational_suffix_iii(self) -> None:
+        result = normalize_judge_name("JOHN SMITH III")
+        assert result == "John Smith III"
+
+    def test_generational_suffix_sr(self) -> None:
+        result = normalize_judge_name("JOHN SMITH SR.")
+        assert result == "John Smith Sr."
+
+    def test_judge_colon_prefix(self) -> None:
+        result = normalize_judge_name("Judge: Bobby P. Luna")
+        assert result == "Bobby P. Luna"
+
+    def test_returns_none_for_ordered_to(self) -> None:
+        assert normalize_judge_name("Ordered to appear next week") is None
+
+    def test_returns_none_for_defendant(self) -> None:
+        assert normalize_judge_name("Defendant Smith") is None
+
+
+# ---------------------------------------------------------------------------
+# _looks_like_valid_judge_name
+# ---------------------------------------------------------------------------
+
+
+class TestLooksLikeValidJudgeName:
+    """Tests for _looks_like_valid_judge_name helper."""
+
+    def test_valid_two_word_name(self) -> None:
+        assert _looks_like_valid_judge_name("John Smith") is True
+
+    def test_valid_three_word_name(self) -> None:
+        assert _looks_like_valid_judge_name("John A. Smith") is True
+
+    def test_single_word_rejected(self) -> None:
+        assert _looks_like_valid_judge_name("Smith") is False
+
+    def test_empty_string_rejected(self) -> None:
+        assert _looks_like_valid_judge_name("") is False
+
+    def test_whitespace_only_rejected(self) -> None:
+        assert _looks_like_valid_judge_name("   ") is False
+
+
+# ---------------------------------------------------------------------------
+# resolve_judge
+# ---------------------------------------------------------------------------
+
+
+class TestResolveJudge:
+    """Tests for resolve_judge function."""
+
+    def test_returns_existing_alias(self) -> None:
+        conn = _mock_conn()
+        cur = conn.cursor.return_value.__enter__.return_value
+        cur.fetchone.return_value = ("existing-judge-id",)
+        result = resolve_judge(conn, "Hon. John Smith", "court-1")
+        assert result == "existing-judge-id"
+
+    def test_creates_new_judge_when_no_alias(self) -> None:
+        conn = _mock_conn()
+        cur = conn.cursor.return_value.__enter__.return_value
+        # First fetchone: no existing alias; second: new judge id
+        cur.fetchone.side_effect = [None, ("new-judge-id",)]
+        result = resolve_judge(conn, "Hon. John Smith", "court-1")
+        assert result == "new-judge-id"
+        # Should have 3 execute calls: SELECT alias, INSERT judge, INSERT alias
+        assert cur.execute.call_count == 3
+
+    def test_returns_none_for_garbage_name(self) -> None:
+        conn = _mock_conn()
+        result = resolve_judge(conn, "Moving Party filed a motion", "court-1")
+        assert result is None
+
+    def test_returns_none_for_single_word_name(self) -> None:
+        conn = _mock_conn()
+        result = resolve_judge(conn, "Smith", "court-1")
+        assert result is None
+
+    def test_returns_none_for_empty_name(self) -> None:
+        conn = _mock_conn()
+        result = resolve_judge(conn, "", "court-1")
+        assert result is None
+
+    def test_strips_nul_from_raw_name(self) -> None:
+        conn = _mock_conn()
+        cur = conn.cursor.return_value.__enter__.return_value
+        cur.fetchone.return_value = ("existing-judge-id",)
+        result = resolve_judge(conn, "John\x00 Smith", "court-1")
+        assert result == "existing-judge-id"
+        # Verify NUL was stripped from the name passed to SQL
+        select_args = cur.execute.call_args_list[0][0][1]
+        assert "\x00" not in str(select_args)
+
+    def test_raises_on_insert_returning_none(self) -> None:
+        conn = _mock_conn()
+        cur = conn.cursor.return_value.__enter__.return_value
+        # First fetchone: no alias; second: INSERT returns None
+        cur.fetchone.side_effect = [None, None]
+        with pytest.raises(RuntimeError, match="resolve_judge"):
+            resolve_judge(conn, "John Smith", "court-1")
+
+
+# ---------------------------------------------------------------------------
+# upsert_case_judge
+# ---------------------------------------------------------------------------
+
+
+class TestUpsertCaseJudge:
+    """Tests for upsert_case_judge function."""
+
+    def test_inserts_with_hearing_date(self) -> None:
+        conn = _mock_conn()
+        upsert_case_judge(conn, "case-1", "judge-1", date(2026, 3, 10))
+        args = _get_execute_args(conn)
+        assert args == ("case-1", "judge-1", date(2026, 3, 10))
+
+    def test_inserts_with_none_hearing_date(self) -> None:
+        conn = _mock_conn()
+        upsert_case_judge(conn, "case-1", "judge-1", None)
+        args = _get_execute_args(conn)
+        assert args == ("case-1", "judge-1", None)
+
+    def test_execute_called_once(self) -> None:
+        conn = _mock_conn()
+        cur = conn.cursor.return_value.__enter__.return_value
+        upsert_case_judge(conn, "case-1", "judge-1", None)
+        assert cur.execute.call_count == 1
+
+
+# ---------------------------------------------------------------------------
+# upsert_party — existing alias path
+# ---------------------------------------------------------------------------
+
+
+class TestUpsertPartyExistingAlias:
+    """Verify upsert_party returns existing party_id when alias exists."""
+
+    def test_returns_existing_party_id(self) -> None:
+        conn = _mock_conn()
+        cur = conn.cursor.return_value.__enter__.return_value
+        cur.fetchone.return_value = ("existing-party-id",)
+        result = upsert_party(conn, raw_name="John Doe", party_type="plaintiff")
+        assert result == "existing-party-id"
+        # Should only have the SELECT call, no INSERT
+        assert cur.execute.call_count == 1
+
+    def test_raises_if_insert_returns_none(self) -> None:
+        conn = _mock_conn()
+        cur = conn.cursor.return_value.__enter__.return_value
+        # First fetchone: no alias; second: INSERT returns None
+        cur.fetchone.side_effect = [None, None]
+        with pytest.raises(RuntimeError, match="upsert_party"):
+            upsert_party(conn, raw_name="John Doe", party_type="plaintiff")
+
+
+# ---------------------------------------------------------------------------
+# upsert_case_party
+# ---------------------------------------------------------------------------
+
+
+class TestUpsertCaseParty:
+    """Tests for upsert_case_party function."""
+
+    def test_passes_correct_params(self) -> None:
+        conn = _mock_conn()
+        upsert_case_party(conn, "case-1", "party-1", "plaintiff")
+        args = _get_execute_args(conn)
+        # The function passes (case_id, party_id, role) twice for the WHERE NOT EXISTS
+        assert args == ("case-1", "party-1", "plaintiff", "case-1", "party-1", "plaintiff")
+
+    def test_execute_called_once(self) -> None:
+        conn = _mock_conn()
+        cur = conn.cursor.return_value.__enter__.return_value
+        upsert_case_party(conn, "case-1", "party-1", "defendant")
+        assert cur.execute.call_count == 1
+
+
+# ---------------------------------------------------------------------------
+# normalize_party_name
+# ---------------------------------------------------------------------------
+
+
+class TestNormalizePartyName:
+    """Tests for normalize_party_name function."""
+
+    def test_title_cases(self) -> None:
+        assert normalize_party_name("JOHN DOE") == "John Doe"
+
+    def test_strips_whitespace(self) -> None:
+        assert normalize_party_name("  John Doe  ") == "John Doe"
+
+    def test_collapses_internal_whitespace(self) -> None:
+        assert normalize_party_name("John   Doe") == "John Doe"
