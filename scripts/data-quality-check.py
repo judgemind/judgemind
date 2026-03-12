@@ -206,13 +206,13 @@ SCRAPER_SUCCESS_RATE_24H_QUERY = """
 """
 
 RULING_COUNT_BY_TYPE_QUERY = """
-    SELECT ct.county, d.doc_type, COUNT(d.id) AS count
+    SELECT ct.county, d.document_type, COUNT(d.id) AS count
     FROM documents d
     JOIN courts ct ON ct.id = d.court_id
     WHERE d.status = 'active'
       AND d.created_at >= %s
       {county_filter}
-    GROUP BY ct.county, d.doc_type
+    GROUP BY ct.county, d.document_type
 """
 
 FIELD_GAP_DOCS_QUERY = """
