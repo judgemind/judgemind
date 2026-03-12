@@ -15,6 +15,7 @@ from telegram_bridge.tools import (
     execute_shell_command,
     execute_tool,
     is_command_allowed,
+    is_sql_read_only,
 )
 
 # ── Tool definitions ───────────────────────────────────────────────────
@@ -100,6 +101,98 @@ class TestIsCommandAllowed:
         assert is_command_allowed(
             ["gh", "issue", "list", "--repo", "judgemind/judgemind", "--limit", "5"]
         )
+
+
+# ── is_sql_read_only() ─────────────────────────────────────────────────
+
+
+class TestIsSqlReadOnly:
+    """Tests for the SQL read-only validation function."""
+
+    # ── Allowed (read-only) queries ───────────────────────────────────
+
+    def test_simple_select(self) -> None:
+        assert is_sql_read_only("SELECT COUNT(*) FROM rulings")
+
+    def test_select_with_where(self) -> None:
+        assert is_sql_read_only("SELECT id, case_number FROM rulings WHERE state = 'CA'")
+
+    def test_explain(self) -> None:
+        assert is_sql_read_only("EXPLAIN SELECT * FROM courts")
+
+    def test_with_cte_select(self) -> None:
+        assert is_sql_read_only(
+            "WITH recent AS (SELECT * FROM rulings WHERE created_at > '2024-01-01') "
+            "SELECT * FROM recent"
+        )
+
+    def test_show(self) -> None:
+        assert is_sql_read_only("SHOW TABLES")
+
+    # ── Blocked (destructive) queries ─────────────────────────────────
+
+    def test_drop_table(self) -> None:
+        assert not is_sql_read_only("DROP TABLE rulings")
+
+    def test_delete_from(self) -> None:
+        assert not is_sql_read_only("DELETE FROM rulings WHERE id = 1")
+
+    def test_update(self) -> None:
+        assert not is_sql_read_only("UPDATE rulings SET status = 'deleted'")
+
+    def test_alter_table(self) -> None:
+        assert not is_sql_read_only("ALTER TABLE rulings ADD COLUMN foo TEXT")
+
+    def test_truncate(self) -> None:
+        assert not is_sql_read_only("TRUNCATE TABLE rulings")
+
+    def test_insert(self) -> None:
+        assert not is_sql_read_only("INSERT INTO rulings (id) VALUES (1)")
+
+    def test_create_table(self) -> None:
+        assert not is_sql_read_only("CREATE TABLE evil (id INT)")
+
+    def test_grant(self) -> None:
+        assert not is_sql_read_only("GRANT ALL ON rulings TO public")
+
+    def test_revoke(self) -> None:
+        assert not is_sql_read_only("REVOKE SELECT ON rulings FROM public")
+
+    def test_replace(self) -> None:
+        assert not is_sql_read_only("REPLACE INTO rulings (id) VALUES (1)")
+
+    # ── Case insensitivity ────────────────────────────────────────────
+
+    def test_lowercase_drop(self) -> None:
+        assert not is_sql_read_only("drop table rulings")
+
+    def test_mixed_case_delete(self) -> None:
+        assert not is_sql_read_only("Delete FROM rulings")
+
+    def test_uppercase_select_allowed(self) -> None:
+        assert is_sql_read_only("SELECT 1")
+
+    def test_lowercase_select_allowed(self) -> None:
+        assert is_sql_read_only("select 1")
+
+    # ── Edge cases ────────────────────────────────────────────────────
+
+    def test_keyword_in_string_literal_allowed(self) -> None:
+        """Keywords inside single-quoted strings should NOT trigger blocking."""
+        assert is_sql_read_only("SELECT * FROM rulings WHERE status = 'DELETE'")
+
+    def test_keyword_in_string_literal_drop(self) -> None:
+        assert is_sql_read_only("SELECT * FROM rulings WHERE action = 'DROP TABLE'")
+
+    def test_keyword_as_column_substring_allowed(self) -> None:
+        """'updated_at' contains 'update' but is not a standalone keyword."""
+        assert is_sql_read_only("SELECT updated_at FROM rulings")
+
+    def test_empty_string(self) -> None:
+        assert is_sql_read_only("")
+
+    def test_multiple_destructive_keywords(self) -> None:
+        assert not is_sql_read_only("DROP TABLE rulings; DELETE FROM courts")
 
 
 # ── _truncate() ────────────────────────────────────────────────────────
@@ -348,6 +441,53 @@ class TestExecuteShellCommand:
         result = execute_shell_command(repo_root=tmp_path, command="git log --oneline -5")
         # Not blocked by allowlist — will error about not a git repo.
         assert "not in the allowlist" not in result.lower()
+
+    def test_dev_db_query_select_not_blocked(self, tmp_path: Path) -> None:
+        """A SELECT query should pass SQL validation (will fail at execution, not validation)."""
+        result = execute_shell_command(
+            repo_root=tmp_path,
+            command='scripts/dev-db-query.sh "SELECT COUNT(*) FROM rulings"',
+        )
+        # Should NOT be blocked by SQL validation.
+        assert "destructive sql blocked" not in result.lower()
+
+    def test_dev_db_query_drop_blocked(self, tmp_path: Path) -> None:
+        """A DROP query should be blocked by SQL validation."""
+        result = execute_shell_command(
+            repo_root=tmp_path,
+            command='scripts/dev-db-query.sh "DROP TABLE rulings"',
+        )
+        assert "destructive sql blocked" in result.lower()
+
+    def test_dev_db_query_delete_blocked(self, tmp_path: Path) -> None:
+        result = execute_shell_command(
+            repo_root=tmp_path,
+            command='scripts/dev-db-query.sh "DELETE FROM rulings WHERE id = 1"',
+        )
+        assert "destructive sql blocked" in result.lower()
+
+    def test_dev_db_query_update_blocked(self, tmp_path: Path) -> None:
+        result = execute_shell_command(
+            repo_root=tmp_path,
+            command='scripts/dev-db-query.sh "UPDATE rulings SET x = 1"',
+        )
+        assert "destructive sql blocked" in result.lower()
+
+    def test_dev_db_query_no_arg_blocked(self, tmp_path: Path) -> None:
+        """dev-db-query.sh with no SQL argument should be rejected."""
+        result = execute_shell_command(
+            repo_root=tmp_path,
+            command="scripts/dev-db-query.sh",
+        )
+        assert "requires a sql query" in result.lower()
+
+    def test_dev_db_query_keyword_in_literal_allowed(self, tmp_path: Path) -> None:
+        """Keywords inside string literals should not trigger blocking."""
+        result = execute_shell_command(
+            repo_root=tmp_path,
+            command="scripts/dev-db-query.sh \"SELECT * FROM rulings WHERE status = 'DELETE'\"",
+        )
+        assert "destructive sql blocked" not in result.lower()
 
 
 # ── execute_tool() dispatch ──────────────────────────────────────────
