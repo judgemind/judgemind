@@ -155,6 +155,7 @@ The Claude reviewer prompt should be:
 >    - **Code quality**: Does it follow existing patterns? Any debug code, hardcoded values, or forgotten TODOs?
 >    - **Missing pieces**: Are there files that should have been created or modified but weren't?
 >    - **Stale references**: Do comments, imports, or docstrings reference things that changed?
+>    - **Documentation consistency**: If the change modifies behavior, configuration, or interfaces — do related docs (`docs/`, `CLAUDE.md`, `.claude/skills/`, `README.md`, `CONTRIBUTING.md`) need corresponding updates? Flag any docs that reference the old behavior.
 >    - **Performance**: Are there obvious bottlenecks? Sequential I/O that could be parallelized? O(n^2) patterns (e.g. LIMIT/OFFSET pagination, nested loops over large datasets)? Missing connection pooling or batching for network calls (DB, S3, HTTP)?
 > 5. Make a binary decision:
 >    - **SHIP**: The implementation is correct, well-tested, properly scoped, and ready for PR. Write "SHIP" to `{worktree}/tmp/ralph/review-result.txt`.
