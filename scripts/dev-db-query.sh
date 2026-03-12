@@ -16,8 +16,9 @@
 #   scripts/dev-db-query.sh "SELECT id, case_number FROM rulings LIMIT 5"
 #   scripts/dev-db-query.sh "SELECT * FROM courts WHERE state = 'CA'"
 #
-# For an interactive psql session (no query argument):
-#   scripts/dev-db-query.sh
+# By default, the session is set to read-only mode (SET default_transaction_read_only = on)
+# so that only SELECT/EXPLAIN queries succeed. Use --rw to allow writes:
+#   scripts/dev-db-query.sh --rw "UPDATE rulings SET status = 'active' WHERE id = 1"
 
 set -euo pipefail
 
@@ -25,6 +26,14 @@ CLUSTER="judgemind-dev"
 SERVICE="judgemind-ingestion-worker-dev"
 CONTAINER="ingestion-worker"
 REGION="us-west-2"
+
+# ─── Parse flags ──────────────────────────────────────────────────────────────
+
+READ_ONLY=true
+if [[ "${1:-}" == "--rw" ]]; then
+    READ_ONLY=false
+    shift
+fi
 
 # ─── Resolve a running task ARN ──────────────────────────────────────────────
 
@@ -46,7 +55,7 @@ fi
 # ─── Build the command ───────────────────────────────────────────────────────
 
 if [[ $# -eq 0 ]]; then
-    echo "Usage: scripts/dev-db-query.sh \"SELECT COUNT(*) FROM rulings\"" >&2
+    echo "Usage: scripts/dev-db-query.sh [--rw] \"SELECT COUNT(*) FROM rulings\"" >&2
     exit 1
 fi
 
@@ -60,6 +69,16 @@ echo "" >&2
 # in SQL (e.g. WHERE status = 'active'). The Python one-liner decodes it.
 query_b64=$(printf '%s' "$query" | base64 | tr -d '\n')
 
+# When READ_ONLY is true (the default), the Python code sets the session to
+# read-only mode before executing the user's query, so PostgreSQL itself
+# rejects any write attempt — defense-in-depth on top of the application-
+# level SQL keyword blocklist.
+if [[ "$READ_ONLY" == "true" ]]; then
+    readonly_flag="1"
+else
+    readonly_flag="0"
+fi
+
 # Use Python + psycopg (already installed in the container) instead of psql
 aws ecs execute-command \
     --cluster "$CLUSTER" \
@@ -67,4 +86,4 @@ aws ecs execute-command \
     --container "$CONTAINER" \
     --interactive \
     --region "$REGION" \
-    --command "python3 -c \"import os,psycopg,json,base64;q=base64.b64decode('${query_b64}').decode();c=psycopg.connect(os.environ['DATABASE_URL']);r=c.cursor();r.execute(q);cols=[d[0] for d in r.description];rows=[dict(zip(cols,row)) for row in r.fetchall()];print(json.dumps(rows,indent=2,default=str))\""
+    --command "python3 -c \"import os,psycopg,json,base64;q=base64.b64decode('${query_b64}').decode();c=psycopg.connect(os.environ['DATABASE_URL']);r=c.cursor();r.execute('SET default_transaction_read_only = on') if '${readonly_flag}'=='1' else None;r.execute(q);cols=[d[0] for d in r.description];rows=[dict(zip(cols,row)) for row in r.fetchall()];print(json.dumps(rows,indent=2,default=str))\""
