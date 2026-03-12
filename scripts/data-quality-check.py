@@ -42,13 +42,21 @@ from typing import Any
 
 import psycopg
 
-from dq_trend_storage import (
-    Snapshot,
-    detect_trends,
-    generate_weekly_summary,
-    load_snapshots,
-    store_snapshot,
-)
+# dq_trend_storage is lazily imported only when --store-results or
+# --weekly-summary is used.  This avoids a hard ModuleNotFoundError when
+# the script runs as an ECS oneshot (only the main script is uploaded).
+_dq_trend_storage = None
+
+
+def _import_trend_storage():  # noqa: ANN202
+    """Lazy-import dq_trend_storage on first use."""
+    global _dq_trend_storage  # noqa: PLW0603
+    if _dq_trend_storage is None:
+        import dq_trend_storage as _mod
+
+        _dq_trend_storage = _mod
+    return _dq_trend_storage
+
 
 logging.basicConfig(
     level=logging.INFO,
@@ -1434,8 +1442,9 @@ def main() -> None:
     # Weekly summary mode: load snapshots from S3 and generate report.
     # Does not require a database connection.
     if args.weekly_summary:
-        snapshots = load_snapshots(bucket=args.s3_bucket)
-        print(generate_weekly_summary(snapshots))
+        ts = _import_trend_storage()
+        snapshots = ts.load_snapshots(bucket=args.s3_bucket)
+        print(ts.generate_weekly_summary(snapshots))
         sys.exit(0)
 
     dsn = os.environ.get("DATABASE_URL")
@@ -1457,18 +1466,19 @@ def main() -> None:
         alerts = check_result.alerts
 
         if args.store_results:
+            ts = _import_trend_storage()
             now = datetime.now(UTC)
 
-            snapshot = Snapshot(
+            snapshot = ts.Snapshot(
                 timestamp=now.isoformat(),
                 county_metrics=check_result.county_metrics,
                 alerts=[asdict(a) for a in alerts],
             )
-            store_snapshot(snapshot, bucket=args.s3_bucket)
+            ts.store_snapshot(snapshot, bucket=args.s3_bucket)
 
             # Also run trend detection and include trend alerts in output.
-            snapshots = load_snapshots(bucket=args.s3_bucket, now=now)
-            trend_alerts = detect_trends(snapshots, now=now)
+            snapshots = ts.load_snapshots(bucket=args.s3_bucket, now=now)
+            trend_alerts = ts.detect_trends(snapshots, now=now)
             if trend_alerts:
                 for ta in trend_alerts:
                     alerts.append(
