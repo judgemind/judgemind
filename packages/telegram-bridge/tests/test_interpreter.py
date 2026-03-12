@@ -494,7 +494,7 @@ class TestSystemPromptContent:
         # The "answer from status" rule must appear before the "discuss" rule
         # to ensure the model checks status-answerable questions first.
         status_pos = _SYSTEM_PROMPT.index("Answerable from the orchestrator status context?")
-        discuss_pos = _SYSTEM_PROMPT.index("Requires codebase access?")
+        discuss_pos = _SYSTEM_PROMPT.index("Requires codebase access")
         assert status_pos < discuss_pos
 
     def test_has_direct_reply_examples(self) -> None:
@@ -519,6 +519,39 @@ class TestSystemPromptContent:
         # The prompt should explicitly warn against using discuss/do for
         # status-answerable questions.
         assert 'Do NOT forward these as "discuss" or "do"' in _SYSTEM_PROMPT
+
+    def test_has_confidence_threshold(self) -> None:
+        # The prompt should include a confidence threshold section.
+        assert "Confidence threshold" in _SYSTEM_PROMPT
+        assert "HIGH CONFIDENCE" in _SYSTEM_PROMPT
+
+    def test_never_ask_for_clarification(self) -> None:
+        # The prompt should explicitly forbid asking for clarification.
+        assert "NEVER ask the user for clarification" in _SYSTEM_PROMPT
+
+    def test_never_say_i_dont_know(self) -> None:
+        # The prompt should explicitly forbid "I don't know" responses.
+        assert 'NEVER say "I don\'t know"' in _SYSTEM_PROMPT
+
+    def test_never_guess(self) -> None:
+        # The prompt should explicitly forbid guessing.
+        assert "NEVER guess" in _SYSTEM_PROMPT
+
+    def test_forward_when_uncertain(self) -> None:
+        # The prompt should instruct forwarding when uncertain.
+        prompt_lower = _SYSTEM_PROMPT.lower()
+        assert "when uncertain" in prompt_lower or "when in doubt" in prompt_lower
+
+    def test_confidence_before_decision_tree(self) -> None:
+        # The confidence threshold section should appear before the decision tree
+        # to set the mindset before individual rules.
+        confidence_pos = _SYSTEM_PROMPT.index("Confidence threshold")
+        decision_pos = _SYSTEM_PROMPT.index("Deciding when to forward vs. answer directly")
+        assert confidence_pos < decision_pos
+
+    def test_no_ask_clarification_guideline_removed(self) -> None:
+        # The old guideline about asking for clarification should be gone.
+        assert "ask for clarification in the reply" not in _SYSTEM_PROMPT
 
 
 # ── System prompt passed to API ───────────────────────────────────────
