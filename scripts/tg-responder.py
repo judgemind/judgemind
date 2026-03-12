@@ -44,6 +44,7 @@ ensure_venv("telegram-bridge")
 
 import argparse
 import datetime
+from dataclasses import dataclass
 import fcntl
 import json
 import logging
@@ -551,6 +552,155 @@ def _staleness_seconds(ts: str) -> float | None:
         return None
     now = datetime.datetime.now(datetime.timezone.utc)
     return (now - dt).total_seconds()
+
+
+# ── Proactive staleness alert ──────────────────────────────────────────
+
+#: Default threshold (seconds) before sending a proactive stale alert.
+STALE_ALERT_THRESHOLD_SECONDS: float = 300.0  # 5 minutes
+
+
+@dataclass
+class StalenessTracker:
+    """Tracks whether a proactive stale alert has been sent.
+
+    The tracker ensures only one alert is sent per stale period.  When the
+    orchestrator status becomes fresh again (``updated_at`` changes to a
+    recent value), the tracker resets so a future stale period can trigger
+    a new alert.
+
+    Attributes:
+        alert_sent: ``True`` if a stale alert has been sent for the
+            current stale period.
+        last_seen_updated_at: The ``updated_at`` value from the status
+            file when the alert was sent.  Used to detect when the
+            orchestrator has written a fresh update (which resets the
+            tracker).
+    """
+
+    alert_sent: bool = False
+    last_seen_updated_at: str = ""
+
+
+def format_stale_alert(
+    staleness_secs: float,
+    orchestrator_status: dict[str, Any] | None,
+) -> str:
+    """Format a proactive stale-orchestrator alert message.
+
+    Args:
+        staleness_secs: How many seconds the status has been stale.
+        orchestrator_status: The last-read orchestrator status dict,
+            or ``None`` if the status file is missing.
+
+    Returns:
+        A plain-text alert message suitable for Telegram.
+    """
+    minutes = staleness_secs / 60.0
+    lines: list[str] = [
+        f"Warning: orchestrator status has not been updated for "
+        f"{minutes:.0f} minute(s). The orchestrator may have stalled.",
+    ]
+
+    if orchestrator_status:
+        # Include last known state.
+        paused = orchestrator_status.get("paused", False)
+        active_agents = orchestrator_status.get("active_agents", [])
+        recently_completed = orchestrator_status.get("recently_completed", [])
+
+        if paused:
+            lines.append("Last known state: paused.")
+        elif active_agents:
+            agent_lines = []
+            for agent in active_agents:
+                issue = agent.get("issue_number", "?")
+                phase = agent.get("phase", "?")
+                title = agent.get("issue_title", "")
+                agent_lines.append(f"  #{issue} ({phase}) - {title}")
+            lines.append("Last known active agents:")
+            lines.extend(agent_lines)
+        else:
+            lines.append("Last known state: no active agents.")
+
+        # Show recent completions/failures for context.
+        if recently_completed:
+            last_few = recently_completed[-3:]
+            completion_lines = []
+            for entry in last_few:
+                issue = entry.get("issue_number", "?")
+                outcome = entry.get("outcome", "?")
+                completion_lines.append(f"  #{issue} ({outcome})")
+            lines.append("Recent tasks:")
+            lines.extend(completion_lines)
+
+        updated_at = orchestrator_status.get("updated_at", "unknown")
+        lines.append(f"Last heartbeat: {updated_at}")
+
+    lines.append("")
+    lines.append("Suggestions:")
+    lines.append("  - Check if the orchestrator session is still running")
+    lines.append("  - Restart with /orchestrator if needed")
+
+    return "\n".join(lines)
+
+
+def check_orchestrator_staleness(
+    *,
+    status_file: str,
+    tracker: StalenessTracker,
+    threshold_seconds: float = STALE_ALERT_THRESHOLD_SECONDS,
+) -> tuple[bool, str, dict[str, Any] | None]:
+    """Check whether the orchestrator status is stale and an alert should be sent.
+
+    This function handles de-duplication: it only returns ``True`` the
+    first time staleness is detected.  If the status file is updated
+    (``updated_at`` changes), the tracker resets so a future stale period
+    can trigger a new alert.
+
+    Args:
+        status_file: Path to the orchestrator status JSON file.
+        tracker: Mutable :class:`StalenessTracker` that persists across
+            poll cycles.
+        threshold_seconds: Number of seconds after which the status is
+            considered stale.
+
+    Returns:
+        A tuple of ``(should_alert, alert_text, orchestrator_status)``.
+        ``should_alert`` is ``True`` only when an alert needs to be sent.
+        ``alert_text`` is the formatted alert message (empty string if
+        no alert).  ``orchestrator_status`` is the parsed status dict
+        (or ``None`` if the file is missing/corrupt).
+    """
+    orchestrator_status = read_orchestrator_status(status_file)
+
+    if orchestrator_status is None:
+        # No status file — nothing to check.  Don't alert about a missing
+        # file; the orchestrator may not have started yet.
+        return False, "", None
+
+    updated_at = str(orchestrator_status.get("updated_at", ""))
+
+    # If the updated_at has changed since we last checked, the orchestrator
+    # is alive — reset the tracker.
+    if updated_at != tracker.last_seen_updated_at:
+        tracker.alert_sent = False
+        tracker.last_seen_updated_at = updated_at
+
+    staleness = _staleness_seconds(updated_at)
+    if staleness is None:
+        return False, "", orchestrator_status
+
+    if staleness <= threshold_seconds:
+        # Status is fresh — no alert needed.
+        return False, "", orchestrator_status
+
+    # Status is stale.  Only alert if we haven't already.
+    if tracker.alert_sent:
+        return False, "", orchestrator_status
+
+    tracker.alert_sent = True
+    alert_text = format_stale_alert(staleness, orchestrator_status)
+    return True, alert_text, orchestrator_status
 
 
 def merge_agent_status_into_orchestrator(
@@ -1144,6 +1294,9 @@ def run_daemon(
     # Use bounded timeouts so the daemon stays responsive during errors.
     sqs = boto3.client("sqs", region_name=region, config=SQS_BOTO_CONFIG)
 
+    # Staleness tracker for proactive alerts (persists across poll cycles).
+    staleness_tracker = StalenessTracker()
+
     try:
         while not _should_stop(pid_file):
             try:
@@ -1173,6 +1326,20 @@ def run_daemon(
 
                 if messages and not _shutdown_requested:
                     logger.info("Processed %d message(s).", len(messages))
+
+                # Proactive staleness check — runs every cycle regardless
+                # of whether any messages were received.
+                should_alert, alert_text, _ = check_orchestrator_staleness(
+                    status_file=status_file,
+                    tracker=staleness_tracker,
+                )
+                if should_alert:
+                    logger.warning("Orchestrator status is stale — sending alert.")
+                    send_telegram_reply(
+                        alert_text,
+                        bot_token=bot_token,
+                        chat_ids=chat_ids,
+                    )
             except Exception:
                 logger.warning("Poll cycle failed", exc_info=True)
 
