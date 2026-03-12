@@ -256,124 +256,127 @@ def run_scrapers(scraper_ids: list[str] | None = None) -> int:
     else:
         logger.info("Database recording disabled (DATABASE_URL not set or connection failed)")
 
-    court_id_cache: dict[tuple[str, str], str | None] = {}
+    try:
+        court_id_cache: dict[tuple[str, str], str | None] = {}
 
-    registry = _build_registry()
+        registry = _build_registry()
 
-    # Filter to requested scrapers
-    if scraper_ids:
-        known_ids = {entry[0] for entry in registry}
-        unknown = set(scraper_ids) - known_ids
-        if unknown:
-            logger.error("Unknown scraper IDs", ids=sorted(unknown), known=sorted(known_ids))
-            return 1
-        entries = [entry for entry in registry if entry[0] in scraper_ids]
-    else:
-        entries = list(registry)
-
-    logger.info("Starting scraper run", scrapers=[e[0] for e in entries])
-
-    had_failure = False
-
-    # Pre-fetch the LA department-to-judge mapping if we're running the LA scraper.
-    # This is done once per run and shared across all LA scraper instances.
-    la_dept_judge_map: dict[str, str] = {}
-    la_scraper_ids = {"ca-la-tentatives-civil"}
-    if any(e[0] in la_scraper_ids for e in entries):
-        try:
-            from courts.ca.la_dept_judges import fetch_department_judge_mapping
-
-            la_dept_judge_map = fetch_department_judge_mapping()
-            logger.info(
-                "Loaded LA dept-judge mapping",
-                departments=len(la_dept_judge_map),
-            )
-        except Exception as exc:
-            logger.warning(
-                "Failed to fetch LA dept-judge mapping — judge names from "
-                "department lookup will be unavailable this run",
-                error=str(exc),
-            )
-
-    # Pre-fetch the Riverside department-to-judge mapping (#585).
-    riv_dept_judge_map: dict[str, str] = {}
-    riv_scraper_ids = {"ca-riverside-tentatives"}
-    if any(e[0] in riv_scraper_ids for e in entries):
-        try:
-            from courts.ca.riverside_dept_judges import (
-                fetch_department_judge_mapping as fetch_riv_mapping,
-            )
-
-            riv_dept_judge_map = fetch_riv_mapping()
-            logger.info(
-                "Loaded Riverside dept-judge mapping",
-                departments=len(riv_dept_judge_map),
-            )
-        except Exception as exc:
-            logger.warning(
-                "Failed to fetch Riverside dept-judge mapping — judge names from "
-                "department lookup will be unavailable this run",
-                error=str(exc),
-            )
-
-    for scraper_id, scraper_cls, config_factory in entries:
-        log = logger.bind(scraper_id=scraper_id)
-        log.info("Running scraper")
-
-        config: ScraperConfig = config_factory(s3_bucket=bucket)
-
-        # Pass dept-judge mapping to LA and Riverside scrapers
-        extra_kwargs: dict[str, object] = {}
-        if scraper_id in la_scraper_ids and la_dept_judge_map:
-            extra_kwargs["dept_judge_map"] = la_dept_judge_map
-        if scraper_id in riv_scraper_ids and riv_dept_judge_map:
-            extra_kwargs["dept_judge_map"] = riv_dept_judge_map
-
-        scraper = scraper_cls(config=config, archiver=archiver, event_bus=event_bus, **extra_kwargs)
-
-        run_start = time.monotonic()
-        run_started_at = datetime.now(UTC)
-
-        try:
-            health = scraper.run()
-        except Exception as exc:
-            log.error("Unhandled exception in scraper", error=str(exc))
-            elapsed = time.monotonic() - run_start
-            if db_conn:
-                record_scraper_exception(
-                    db_conn,
-                    scraper_id,
-                    config,
-                    run_started_at,
-                    str(exc),
-                    elapsed,
-                    court_id_cache,
-                )
-            had_failure = True
-            continue
-
-        if db_conn:
-            record_scraper_run(db_conn, health, config, court_id_cache)
-
-        if health.success:
-            log.info(
-                "Scraper completed",
-                records=health.records_captured,
-                time_seconds=round(health.response_time_seconds, 2),
-            )
+        # Filter to requested scrapers
+        if scraper_ids:
+            known_ids = {entry[0] for entry in registry}
+            unknown = set(scraper_ids) - known_ids
+            if unknown:
+                logger.error("Unknown scraper IDs", ids=sorted(unknown), known=sorted(known_ids))
+                return 1
+            entries = [entry for entry in registry if entry[0] in scraper_ids]
         else:
-            log.error(
-                "Scraper reported failure",
-                error=health.error_message,
-                records=health.records_captured,
-            )
-            had_failure = True
+            entries = list(registry)
 
-    if db_conn:
-        try:
-            db_conn.close()
-        except Exception:
-            pass
+        logger.info("Starting scraper run", scrapers=[e[0] for e in entries])
+
+        had_failure = False
+
+        # Pre-fetch the LA department-to-judge mapping if we're running the LA scraper.
+        # This is done once per run and shared across all LA scraper instances.
+        la_dept_judge_map: dict[str, str] = {}
+        la_scraper_ids = {"ca-la-tentatives-civil"}
+        if any(e[0] in la_scraper_ids for e in entries):
+            try:
+                from courts.ca.la_dept_judges import fetch_department_judge_mapping
+
+                la_dept_judge_map = fetch_department_judge_mapping()
+                logger.info(
+                    "Loaded LA dept-judge mapping",
+                    departments=len(la_dept_judge_map),
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Failed to fetch LA dept-judge mapping — judge names from "
+                    "department lookup will be unavailable this run",
+                    error=str(exc),
+                )
+
+        # Pre-fetch the Riverside department-to-judge mapping (#585).
+        riv_dept_judge_map: dict[str, str] = {}
+        riv_scraper_ids = {"ca-riverside-tentatives"}
+        if any(e[0] in riv_scraper_ids for e in entries):
+            try:
+                from courts.ca.riverside_dept_judges import (
+                    fetch_department_judge_mapping as fetch_riv_mapping,
+                )
+
+                riv_dept_judge_map = fetch_riv_mapping()
+                logger.info(
+                    "Loaded Riverside dept-judge mapping",
+                    departments=len(riv_dept_judge_map),
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Failed to fetch Riverside dept-judge mapping — judge names from "
+                    "department lookup will be unavailable this run",
+                    error=str(exc),
+                )
+
+        for scraper_id, scraper_cls, config_factory in entries:
+            log = logger.bind(scraper_id=scraper_id)
+            log.info("Running scraper")
+
+            config: ScraperConfig = config_factory(s3_bucket=bucket)
+
+            # Pass dept-judge mapping to LA and Riverside scrapers
+            extra_kwargs: dict[str, object] = {}
+            if scraper_id in la_scraper_ids and la_dept_judge_map:
+                extra_kwargs["dept_judge_map"] = la_dept_judge_map
+            if scraper_id in riv_scraper_ids and riv_dept_judge_map:
+                extra_kwargs["dept_judge_map"] = riv_dept_judge_map
+
+            scraper = scraper_cls(
+                config=config, archiver=archiver, event_bus=event_bus, **extra_kwargs
+            )
+
+            run_start = time.monotonic()
+            run_started_at = datetime.now(UTC)
+
+            try:
+                health = scraper.run()
+            except Exception as exc:
+                log.error("Unhandled exception in scraper", error=str(exc))
+                elapsed = time.monotonic() - run_start
+                if db_conn:
+                    record_scraper_exception(
+                        db_conn,
+                        scraper_id,
+                        config,
+                        run_started_at,
+                        str(exc),
+                        elapsed,
+                        court_id_cache,
+                    )
+                had_failure = True
+                continue
+
+            if db_conn:
+                record_scraper_run(db_conn, health, config, court_id_cache)
+
+            if health.success:
+                log.info(
+                    "Scraper completed",
+                    records=health.records_captured,
+                    time_seconds=round(health.response_time_seconds, 2),
+                )
+            else:
+                log.error(
+                    "Scraper reported failure",
+                    error=health.error_message,
+                    records=health.records_captured,
+                )
+                had_failure = True
+    finally:
+        if db_conn:
+            try:
+                db_conn.close()
+            except Exception:
+                pass
 
     if not had_failure:
         # This marker is matched by the CloudWatch metric filter

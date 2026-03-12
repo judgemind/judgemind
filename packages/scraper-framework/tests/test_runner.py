@@ -1088,3 +1088,18 @@ class TestRunScrapersDbRecording:
             run_scrapers()
 
         mock_conn.close.assert_called_once()
+
+    def test_db_connection_closed_on_early_exit(self) -> None:
+        """run_scrapers should close the DB connection even when returning early
+        due to unknown scraper IDs (#921)."""
+        entries = [("test-stub", StubScraper, _stub_config)]
+        mock_conn = MagicMock()
+
+        with (
+            _patch_registry(entries),
+            patch("framework.runner._connect_db", return_value=mock_conn),
+        ):
+            exit_code = run_scrapers(scraper_ids=["nonexistent"])
+
+        assert exit_code == 1
+        mock_conn.close.assert_called_once()
