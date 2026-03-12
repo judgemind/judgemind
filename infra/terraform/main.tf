@@ -138,6 +138,8 @@ module "api_service" {
   opensearch_url                    = ""
   opensearch_credentials_secret_arn = ""
   cors_allowed_origins              = ""
+  ses_configuration_set_name        = module.ses.configuration_set_name
+  email_from                        = "no-reply@judgemind.org"
 }
 
 module "dns" {
