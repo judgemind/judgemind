@@ -701,17 +701,28 @@ def check_scraper_staleness(
             continue
 
         hours_since = (now - last_activity).total_seconds() / 3600
-        if hours_since > stale_threshold_hours:
+
+        # When using captured_at as the fallback (no scraper_runs data),
+        # the timestamp only updates when *new* content is ingested — not
+        # when the scraper runs.  Courts with low posting volume may go
+        # many days without new content even though the scraper is healthy.
+        # Apply a generous multiplier to reduce false positives until
+        # scraper_runs data is available (see #899).
+        effective_threshold = stale_threshold_hours
+        if source == "documents.captured_at":
+            effective_threshold = max(stale_threshold_hours * 4, 72.0)
+
+        if hours_since > effective_threshold:
             alerts.append(
                 Alert(
                     county=county_name,
                     metric="scraper_stale",
-                    severity="p1" if hours_since > stale_threshold_hours * 4 else "p2",
-                    expected=f"<{stale_threshold_hours}h",
+                    severity="p1" if hours_since > effective_threshold * 4 else "p2",
+                    expected=f"<{effective_threshold}h",
                     actual=f"{hours_since:.1f}h",
                     message=(
                         f"{county_name}: scraper stale for {hours_since:.1f}h "
-                        f"(threshold: {stale_threshold_hours}h, source: {source})"
+                        f"(threshold: {effective_threshold}h, source: {source})"
                     ),
                 )
             )

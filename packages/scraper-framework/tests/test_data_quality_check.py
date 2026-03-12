@@ -366,8 +366,14 @@ class TestCheckScraperStaleness:
         assert alerts[0].county == "Orange"
 
     def test_falls_back_to_captured_at(self) -> None:
-        """Uses documents.captured_at when no scraper_runs exist."""
-        old_capture = NOW - timedelta(hours=15)
+        """Uses documents.captured_at when no scraper_runs exist.
+
+        When using the captured_at fallback, the effective threshold is
+        max(base_threshold * 4, 72h) to reduce false positives from courts
+        that post infrequently.  So we need a capture older than 72h to
+        trigger an alert.
+        """
+        old_capture = NOW - timedelta(hours=80)
         conn = FakeConnection(
             {
                 "scraper_runs": [],  # No scraper_runs
@@ -378,6 +384,24 @@ class TestCheckScraperStaleness:
         alerts = check_scraper_staleness(conn, NOW, baselines)
         assert len(alerts) == 1
         assert "captured_at" in alerts[0].message
+
+    def test_captured_at_fallback_uses_generous_threshold(self) -> None:
+        """captured_at fallback does NOT alert within the 72h tolerance.
+
+        When scraper_runs is empty, an old captured_at does not necessarily
+        mean the scraper is broken — the court may simply not have posted
+        new content.  The effective threshold is raised to 72h minimum.
+        """
+        old_capture = NOW - timedelta(hours=50)
+        conn = FakeConnection(
+            {
+                "scraper_runs": [],
+                "MAX(d.captured_at)": [("Los Angeles", old_capture)],
+            }
+        )
+        baselines = _make_baselines()
+        alerts = check_scraper_staleness(conn, NOW, baselines)
+        assert len(alerts) == 0
 
     def test_very_stale_is_p1(self) -> None:
         """Very stale scrapers (>4x threshold) get p1 severity."""
@@ -2176,9 +2200,13 @@ class TestStalenessCheckPrefersScraperRuns:
         assert len(alerts) == 0
 
     def test_falls_back_to_captured_at_without_scraper_runs(self) -> None:
-        """When scraper_runs is empty but captured_at is stale, should alert
-        with source=documents.captured_at."""
-        old_capture = NOW - timedelta(hours=20)
+        """When scraper_runs is empty but captured_at is very stale, should alert
+        with source=documents.captured_at.
+
+        The captured_at fallback uses a generous threshold (72h minimum) to
+        reduce false positives.  We use 80h to exceed that threshold.
+        """
+        old_capture = NOW - timedelta(hours=80)
 
         conn = FakeConnection(
             {

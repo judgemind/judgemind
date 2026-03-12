@@ -9,7 +9,7 @@
       "schedule_type": "daily"
     },
     "Santa Clara": {
-      "expected_daily_rulings": 10,
+      "expected_daily_rulings": 1,
       "schedule_type": "daily",
       "posting_days": ["Mon", "Tue", "Wed", "Thu"]
     },
@@ -17,20 +17,8 @@
       "expected_daily_rulings": 5,
       "schedule_type": "daily"
     },
-    "Santa Barbara": {
-      "expected_daily_rulings": 5,
-      "schedule_type": "daily"
-    },
-    "Contra Costa": {
-      "expected_daily_rulings": 10,
-      "schedule_type": "daily"
-    },
     "Riverside": {
       "expected_daily_rulings": 15,
-      "schedule_type": "daily"
-    },
-    "Fresno": {
-      "expected_daily_rulings": 8,
       "schedule_type": "daily"
     },
     "Ventura": {
