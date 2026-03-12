@@ -2,7 +2,7 @@
 
 ## For AI Agents
 
-Read `.claude/instructions.md` before starting work. It covers code standards, git workflow, and rules.
+Read `CLAUDE.md` before starting work. It covers code standards, git workflow, and rules.
 
 ## For Human Contributors
 

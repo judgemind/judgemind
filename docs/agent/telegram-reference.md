@@ -31,7 +31,7 @@ When Telegram is configured (bot token in Secrets Manager `judgemind/telegram/bo
 
 **Lifecycle notifications:** call `session_started()` when an interactive session begins, `task_started()` / `task_completed()` / `task_failed()` around `/task` agent invocations, and `session_ended()` when shutting down.
 
-**Inbound messages:** All Telegram messages are interpreted as free text by a Claude API call (Haiku) in the responder daemon. The daemon responds directly with natural-language replies and extracts actionable commands (start, pause, resume, stop) for the orchestrator. No special command syntax is required — users can write naturally.
+**Inbound messages:** All Telegram messages are interpreted as free text by a Claude API call (Opus) in the responder daemon. The daemon responds directly with natural-language replies and extracts actionable commands (start, pause, resume, stop) for the orchestrator. No special command syntax is required — users can write naturally.
 
 The orchestrator uses `bridge.read_inbox()` to pick up commands from the file-based inbox. The responder daemon handles the interpretation and reply, so the orchestrator only sees pre-parsed actions.
 
@@ -50,7 +50,7 @@ The responder daemon reads this file to provide context to the Claude interprete
 
 ## Responder Daemon and State Files
 
-The standalone **responder daemon** (`scripts/tg-responder.py`) interprets all Telegram messages via a Claude API call (Haiku, ~$0.001/interaction). It receives the user's message and the current orchestrator status, generates a natural-language reply, and extracts any actionable commands. It communicates with the orchestrator via shared state files:
+The standalone **responder daemon** (`scripts/tg-responder.py`) interprets all Telegram messages via a Claude API call (Opus). It receives the user's message and the current orchestrator status, generates a natural-language reply, and extracts any actionable commands. It communicates with the orchestrator via shared state files:
 
 - **`tmp/orchestrator_status.json`** — written by `OrchestratorBridge.write_status()`. The responder reads this to provide context to the Claude interpreter. Contains active agents, open PRs, queue, and paused/stopped state.
 - **`tmp/orchestrator_state.json`** — the responder writes `paused` flag changes here. The orchestrator must call `bridge.refresh_state()` before each spawn decision to pick up `pause`/`resume` changes made out-of-loop.

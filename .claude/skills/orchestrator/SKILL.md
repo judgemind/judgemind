@@ -448,7 +448,7 @@ Process commands from the Telegram inbox and responder daemon:
 | `do` | User wants an action performed (merge PR, check CI, etc.); execute the instruction and confirm via Telegram |
 | Free text | Interpret and reply via Telegram — check `result["needs_reply"]` |
 
-The `file_issue`, `discuss`, and `do` commands are classified by the Haiku interpreter in the responder daemon and written to the inbox as structured entries with an `action` key. The orchestrator reads these via `bridge.read_inbox()` which returns `Command` objects with the appropriate `CommandKind`. Each command's result dict includes the metadata needed to act on it:
+The `file_issue`, `discuss`, and `do` commands are classified by the Opus interpreter in the responder daemon and written to the inbox as structured entries with an `action` key. The orchestrator reads these via `bridge.read_inbox()` which returns `Command` objects with the appropriate `CommandKind`. Each command's result dict includes the metadata needed to act on it:
 
 - **`file_issue`**: `result["description"]`, `result["priority"]`, `result["labels"]`, `result["reply_to"]`
 - **`discuss`**: `result["message"]`, `result["reply_to"]`, `result["needs_reply"]`

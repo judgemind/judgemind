@@ -60,7 +60,7 @@ npm run dev
 
 See [CONTRIBUTING.md](CONTRIBUTING.md). All PRs require review before merge.
 
-If you're an AI agent working on this codebase, read [.claude/instructions.md](.claude/instructions.md) first.
+If you're an AI agent working on this codebase, read [CLAUDE.md](CLAUDE.md) first.
 
 ## License
 
