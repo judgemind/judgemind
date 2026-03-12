@@ -13,6 +13,7 @@ from __future__ import annotations
 import fnmatch
 import logging
 import os
+import re
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -62,6 +63,55 @@ def is_command_allowed(args: list[str]) -> bool:
         if len(args) >= len(prefix) and tuple(args[: len(prefix)]) == prefix:
             return True
     return False
+
+
+# ── SQL safety validation ─────────────────────────────────────────────
+
+#: SQL keywords that indicate a write/destructive operation.
+_DESTRUCTIVE_SQL_KEYWORDS: frozenset[str] = frozenset(
+    {
+        "ALTER",
+        "CREATE",
+        "DELETE",
+        "DROP",
+        "GRANT",
+        "INSERT",
+        "REPLACE",
+        "REVOKE",
+        "TRUNCATE",
+        "UPDATE",
+    }
+)
+
+#: Regex that matches a destructive SQL keyword as a standalone word,
+#: ignoring occurrences inside single-quoted string literals.
+#: We strip string literals first, then check for keywords.
+_SINGLE_QUOTED_STRING_RE: re.Pattern[str] = re.compile(r"'[^']*'")
+
+
+def is_sql_read_only(sql: str) -> bool:
+    """Check whether *sql* appears to be a read-only query.
+
+    Strips single-quoted string literals before checking so that keywords
+    appearing inside literal values (e.g. ``WHERE status = 'DELETE'``) do
+    not cause false positives.
+
+    Args:
+        sql: The SQL query string.
+
+    Returns:
+        ``True`` if the query looks read-only, ``False`` if it contains
+        destructive keywords.
+    """
+    # Remove single-quoted strings to avoid false positives on literals.
+    sanitised = _SINGLE_QUOTED_STRING_RE.sub("", sql)
+
+    # Tokenise on word boundaries and check against the blocklist.
+    tokens = re.findall(r"[A-Za-z_]+", sanitised)
+    for token in tokens:
+        if token.upper() in _DESTRUCTIVE_SQL_KEYWORDS:
+            return False
+    return True
 
 
 # ── Tool schemas (Anthropic tool_use format) ───────────────────────────
@@ -149,7 +199,8 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
         "description": (
             "Run an allowlisted read-only shell command and return its output. "
             "Allowed commands: gh issue/pr list/view, git log/diff/show/status/branch, "
-            "scripts/dev-db-query.sh. No destructive commands."
+            "scripts/dev-db-query.sh (read-only SQL only — SELECT, EXPLAIN, etc.). "
+            "No destructive commands or SQL (DROP, DELETE, UPDATE, etc.)."
         ),
         "input_schema": {
             "type": "object",
@@ -332,8 +383,21 @@ def execute_shell_command(
         return (
             f"Error: command '{args[0]}' is not in the allowlist. "
             f"Allowed: gh issue/pr list/view, git log/diff/show/status/branch, "
-            f"scripts/dev-db-query.sh"
+            f"scripts/dev-db-query.sh (read-only queries only)"
         )
+
+    # Validate SQL safety for dev-db-query.sh commands.
+    if args[0] == "scripts/dev-db-query.sh":
+        if len(args) < 2:
+            return "Error: scripts/dev-db-query.sh requires a SQL query argument."
+        sql = args[1]
+        if not is_sql_read_only(sql):
+            return (
+                "Error: destructive SQL blocked. "
+                "Only read-only queries (SELECT, EXPLAIN, etc.) are allowed "
+                "through the Telegram interface. "
+                "Blocked keywords: " + ", ".join(sorted(_DESTRUCTIVE_SQL_KEYWORDS)) + "."
+            )
 
     # Set up environment — inherit PATH so gh/git are found.
     env = dict(os.environ)
