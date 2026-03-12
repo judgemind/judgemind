@@ -114,6 +114,10 @@ def log_summary(
 
     for it, verdicts in sorted(by_iteration.items()):
         gemini_v = verdicts.get("gemini-2.5-pro", verdicts.get("gemini", "SKIPPED"))
+        adversarial_v = verdicts.get(
+            "gemini-2.5-pro-adversarial",
+            verdicts.get("gemini-adversarial", "SKIPPED"),
+        )
         # Find claude verdict (any key starting with "claude")
         claude_v = "SKIPPED"
         for k, v in verdicts.items():
@@ -121,17 +125,31 @@ def log_summary(
                 claude_v = v
                 break
 
-        # Skip iterations where Gemini was unavailable
-        if gemini_v == "SKIPPED":
+        # Compare each non-SKIPPED reviewer pair for agreement stats
+        active_verdicts: list[tuple[str, str]] = []
+        if gemini_v != "SKIPPED":
+            active_verdicts.append(("gemini", gemini_v))
+        if adversarial_v != "SKIPPED":
+            active_verdicts.append(("adversarial", adversarial_v))
+        if claude_v != "SKIPPED":
+            active_verdicts.append(("claude", claude_v))
+
+        # Skip iterations with fewer than 2 active reviewers
+        if len(active_verdicts) < 2:
             continue
 
-        if gemini_v == claude_v:
+        # All active reviewers agree?
+        all_verdicts = [v for _, v in active_verdicts]
+        if len(set(all_verdicts)) == 1:
             agreement_count += 1
         else:
             disagreement_count += 1
-            if gemini_v == "REVISE" and claude_v == "SHIP":
+            # Track which reviewer(s) uniquely caught issues
+            revivers = {name for name, v in active_verdicts if v == "REVISE"}
+            shippers = {name for name, v in active_verdicts if v == "SHIP"}
+            if revivers == {"gemini"}:
                 gemini_only_catches.append(it)
-            elif claude_v == "REVISE" and gemini_v == "SHIP":
+            elif revivers == {"claude"}:
                 claude_only_catches.append(it)
 
     total_compared = agreement_count + disagreement_count
