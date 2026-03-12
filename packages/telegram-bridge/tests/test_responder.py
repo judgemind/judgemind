@@ -1924,6 +1924,266 @@ class TestCheckWebhookHealth:
         assert any("failed (non-fatal)" in r.message for r in caplog.records)
 
 
+# ── Proactive staleness alert ──────────────────────────────────────────
+
+
+class TestStalenessTracker:
+    """Tests for the StalenessTracker and check_orchestrator_staleness."""
+
+    def test_no_alert_when_status_file_missing(self, tmp_path: Path) -> None:
+        """No alert when the status file does not exist."""
+        mod = _import_responder()
+        tracker = mod.StalenessTracker()
+        should_alert, alert_text, status = mod.check_orchestrator_staleness(
+            status_file=str(tmp_path / "nonexistent.json"),
+            tracker=tracker,
+        )
+        assert should_alert is False
+        assert alert_text == ""
+        assert status is None
+
+    def test_no_alert_when_status_is_fresh(self, tmp_path: Path) -> None:
+        """No alert when the orchestrator status was recently updated."""
+        import datetime
+
+        mod = _import_responder()
+        tracker = mod.StalenessTracker()
+        status_file = tmp_path / "status.json"
+        now_ts = datetime.datetime.now(datetime.UTC).isoformat()
+        status_file.write_text(json.dumps({"active_agents": [], "updated_at": now_ts}))
+        should_alert, alert_text, status = mod.check_orchestrator_staleness(
+            status_file=str(status_file),
+            tracker=tracker,
+            threshold_seconds=300.0,
+        )
+        assert should_alert is False
+        assert alert_text == ""
+        assert status is not None
+
+    def test_alert_when_status_is_stale(self, tmp_path: Path) -> None:
+        """Alert fires when the status is older than the threshold."""
+        mod = _import_responder()
+        tracker = mod.StalenessTracker()
+        status_file = tmp_path / "status.json"
+        old_ts = "2020-01-01T00:00:00Z"
+        status_file.write_text(
+            json.dumps(
+                {
+                    "active_agents": [
+                        {
+                            "issue_number": 42,
+                            "phase": "ci-watch",
+                            "issue_title": "Fix something",
+                        }
+                    ],
+                    "recently_completed": [
+                        {"issue_number": 100, "outcome": "completed"},
+                    ],
+                    "paused": False,
+                    "updated_at": old_ts,
+                }
+            )
+        )
+        should_alert, alert_text, status = mod.check_orchestrator_staleness(
+            status_file=str(status_file),
+            tracker=tracker,
+            threshold_seconds=60.0,
+        )
+        assert should_alert is True
+        assert "stalled" in alert_text.lower() or "not been updated" in alert_text.lower()
+        assert "#42" in alert_text
+        assert "ci-watch" in alert_text
+        assert "#100" in alert_text
+        assert "completed" in alert_text
+        assert old_ts in alert_text
+        assert "/orchestrator" in alert_text
+        assert tracker.alert_sent is True
+
+    def test_deduplication_only_one_alert_per_stale_period(self, tmp_path: Path) -> None:
+        """Only one alert is sent per stale period (de-duplication)."""
+        mod = _import_responder()
+        tracker = mod.StalenessTracker()
+        status_file = tmp_path / "status.json"
+        old_ts = "2020-01-01T00:00:00Z"
+        status_file.write_text(json.dumps({"active_agents": [], "updated_at": old_ts}))
+
+        # First check: alert fires.
+        should_alert1, _, _ = mod.check_orchestrator_staleness(
+            status_file=str(status_file),
+            tracker=tracker,
+            threshold_seconds=60.0,
+        )
+        assert should_alert1 is True
+
+        # Second check (same stale period): no alert.
+        should_alert2, _, _ = mod.check_orchestrator_staleness(
+            status_file=str(status_file),
+            tracker=tracker,
+            threshold_seconds=60.0,
+        )
+        assert should_alert2 is False
+
+    def test_reset_after_fresh_update(self, tmp_path: Path) -> None:
+        """After the orchestrator writes a fresh update, a new stale period can alert."""
+        import datetime
+
+        mod = _import_responder()
+        tracker = mod.StalenessTracker()
+        status_file = tmp_path / "status.json"
+        old_ts = "2020-01-01T00:00:00Z"
+        status_file.write_text(json.dumps({"active_agents": [], "updated_at": old_ts}))
+
+        # First stale period: alert fires.
+        should_alert1, _, _ = mod.check_orchestrator_staleness(
+            status_file=str(status_file),
+            tracker=tracker,
+            threshold_seconds=60.0,
+        )
+        assert should_alert1 is True
+
+        # Orchestrator comes back — writes a fresh timestamp.
+        fresh_ts = datetime.datetime.now(datetime.UTC).isoformat()
+        status_file.write_text(json.dumps({"active_agents": [], "updated_at": fresh_ts}))
+
+        # Check with fresh status — no alert, tracker resets.
+        should_alert2, _, _ = mod.check_orchestrator_staleness(
+            status_file=str(status_file),
+            tracker=tracker,
+            threshold_seconds=60.0,
+        )
+        assert should_alert2 is False
+        assert tracker.alert_sent is False
+
+        # Orchestrator stalls again (simulate by writing old timestamp).
+        second_stale_ts = "2020-06-01T00:00:00Z"
+        status_file.write_text(json.dumps({"active_agents": [], "updated_at": second_stale_ts}))
+
+        # Second stale period: alert fires again.
+        should_alert3, _, _ = mod.check_orchestrator_staleness(
+            status_file=str(status_file),
+            tracker=tracker,
+            threshold_seconds=60.0,
+        )
+        assert should_alert3 is True
+
+    def test_alert_with_paused_state(self, tmp_path: Path) -> None:
+        """Alert includes 'paused' info when orchestrator was paused."""
+        mod = _import_responder()
+        tracker = mod.StalenessTracker()
+        status_file = tmp_path / "status.json"
+        status_file.write_text(
+            json.dumps(
+                {
+                    "active_agents": [],
+                    "paused": True,
+                    "updated_at": "2020-01-01T00:00:00Z",
+                }
+            )
+        )
+        should_alert, alert_text, _ = mod.check_orchestrator_staleness(
+            status_file=str(status_file),
+            tracker=tracker,
+            threshold_seconds=60.0,
+        )
+        assert should_alert is True
+        assert "paused" in alert_text.lower()
+
+    def test_alert_with_no_agents(self, tmp_path: Path) -> None:
+        """Alert includes 'no active agents' when none are running."""
+        mod = _import_responder()
+        tracker = mod.StalenessTracker()
+        status_file = tmp_path / "status.json"
+        status_file.write_text(
+            json.dumps(
+                {
+                    "active_agents": [],
+                    "paused": False,
+                    "updated_at": "2020-01-01T00:00:00Z",
+                }
+            )
+        )
+        should_alert, alert_text, _ = mod.check_orchestrator_staleness(
+            status_file=str(status_file),
+            tracker=tracker,
+            threshold_seconds=60.0,
+        )
+        assert should_alert is True
+        assert "no active agents" in alert_text.lower()
+
+
+class TestFormatStaleAlert:
+    """Tests for the format_stale_alert function."""
+
+    def test_basic_alert_format(self) -> None:
+        """Alert includes time, suggestions, and last heartbeat."""
+        mod = _import_responder()
+        alert = mod.format_stale_alert(
+            600.0,
+            {
+                "active_agents": [],
+                "paused": False,
+                "updated_at": "2026-03-10T10:00:00Z",
+            },
+        )
+        assert "10 minute" in alert
+        assert "/orchestrator" in alert
+        assert "2026-03-10T10:00:00Z" in alert
+
+    def test_alert_with_none_status(self) -> None:
+        """Alert works when orchestrator_status is None."""
+        mod = _import_responder()
+        alert = mod.format_stale_alert(300.0, None)
+        assert "5 minute" in alert
+        assert "/orchestrator" in alert
+
+    def test_alert_includes_active_agents(self) -> None:
+        """Alert lists active agents when present."""
+        mod = _import_responder()
+        alert = mod.format_stale_alert(
+            300.0,
+            {
+                "active_agents": [
+                    {
+                        "issue_number": 42,
+                        "phase": "ci-watch",
+                        "issue_title": "Fix widget",
+                    },
+                    {
+                        "issue_number": 99,
+                        "phase": "ralph-worker (iteration 2)",
+                        "issue_title": "Add feature",
+                    },
+                ],
+                "paused": False,
+                "updated_at": "2026-03-10T10:00:00Z",
+            },
+        )
+        assert "#42" in alert
+        assert "ci-watch" in alert
+        assert "#99" in alert
+        assert "Fix widget" in alert
+
+    def test_alert_includes_recent_completions(self) -> None:
+        """Alert shows recent task completions for context."""
+        mod = _import_responder()
+        alert = mod.format_stale_alert(
+            300.0,
+            {
+                "active_agents": [],
+                "paused": False,
+                "recently_completed": [
+                    {"issue_number": 10, "outcome": "completed"},
+                    {"issue_number": 20, "outcome": "failed"},
+                ],
+                "updated_at": "2026-03-10T10:00:00Z",
+            },
+        )
+        assert "#10" in alert
+        assert "completed" in alert
+        assert "#20" in alert
+        assert "failed" in alert
+
+
 # ── Old daemon removed ──────────────────────────────────────────────────
 # The deprecated tg-poll-daemon.py was removed in #646. The responder
 # daemon (scripts/tg-responder.py) fully replaces it.
