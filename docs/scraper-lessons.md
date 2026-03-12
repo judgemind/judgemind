@@ -33,3 +33,99 @@ Common issues found during audits and fixes. Consult this when writing or review
 - **Every scraper needs regression tests against real fixtures.** Save actual PDFs/HTML to `tests/fixtures/` and test field extraction against them.
 - **Test edge cases explicitly:** empty PDFs, PDFs with no rulings, unusual date formats, missing fields.
 - **Run the full test suite before pushing** — `695 tests` across all scrapers as of 2026-03-08.
+
+## Composed / Pipeline Scrapers
+
+Some courts require a multi-phase scraping pipeline — for example, one phase discovers case numbers from a calendar and a second phase fetches tentative rulings for each case. The canonical example is `SDPipelineScraper` (`packages/scraper-framework/src/courts/ca/sd_pipeline.py`), which chains `SDCalendarScraper` (Phase 1) with `SDTentativeRulingsScraper` (Phase 2).
+
+### When to use this pattern
+
+Use a pipeline scraper when:
+- Data collection naturally splits into discovery (Phase 1) and detail-fetching (Phase 2).
+- Each phase has fundamentally different scraping mechanics (e.g., plain HTTP vs. Playwright browser automation).
+- The phases need different request delays, timeouts, or retry settings.
+
+### Factory methods for child scrapers
+
+Create each child scraper through a dedicated factory method (`_create_phase1_scraper`, `_create_phase2_scraper`) rather than constructing them inline. This has two benefits:
+
+1. **Testability.** Tests can mock the factory methods to inject stub scrapers that return canned fixtures instead of hitting real court sites.
+2. **Lazy imports.** Importing child scraper modules inside the factory avoids circular imports and keeps the pipeline module lightweight.
+
+```python
+def _create_phase1_scraper(
+    self,
+    archiver: S3Archiver | None,
+    event_bus: EventBus | None,
+) -> BaseScraper:
+    from courts.ca.sd_calendar import SDCalendarScraper
+    from courts.ca.sd_calendar import default_config as calendar_config
+
+    config = calendar_config(s3_bucket=self.config.s3_bucket)
+    return SDCalendarScraper(config=config, archiver=archiver, event_bus=event_bus)
+```
+
+### Config independence between parent and child
+
+Each child scraper should use **its own default config**, not inherit the pipeline's config. Phase 1 (plain HTTP, 1s delay, 3 retries) and Phase 2 (Playwright browser, 3s delay, 2 retries) have fundamentally different optimal settings. Only environment-level config like `s3_bucket` should be propagated from the parent.
+
+```python
+# Good: each phase gets its own tuned config
+config = calendar_config(s3_bucket=self.config.s3_bucket)
+
+# Bad: inheriting the pipeline's config forces both phases to share settings
+return SDCalendarScraper(config=self.config, ...)
+```
+
+### Delegating `parse_document` to a child scraper
+
+The pipeline scraper's `fetch_documents` returns Phase 2 documents, so `parse_document` must delegate to the Phase 2 scraper. This keeps parsing logic in one place rather than duplicating it in the pipeline orchestrator.
+
+```python
+def parse_document(self, doc: CapturedDocument) -> CapturedDocument:
+    parser = self._get_phase2_parser()
+    return parser.parse_document(doc)
+```
+
+### Lazy caching for parser instances
+
+The `parse_document` method is called once per document. Creating a new Phase 2 scraper for each call is wasteful. Use a lazy-cached instance:
+
+```python
+def __init__(self, ...) -> None:
+    ...
+    self._phase2_parser: BaseScraper | None = None
+
+def _get_phase2_parser(self) -> BaseScraper:
+    if self._phase2_parser is None:
+        self._phase2_parser = self._create_phase2_scraper(
+            case_numbers=[],
+            archiver=self._archiver,
+            event_bus=self._event_bus,
+        )
+    return self._phase2_parser
+```
+
+Note: pass an empty `case_numbers=[]` (or equivalent no-op arguments) since the parser instance is only used for `parse_document`, not `fetch_documents`.
+
+### Deduplication of intermediate results
+
+Phase 1 may return multiple calendar entries for the same case number. Deduplicate before passing to Phase 2 to avoid redundant work:
+
+```python
+seen: set[str] = set()
+case_numbers: list[str] = []
+for doc in phase1_docs:
+    cn = doc.case_number
+    if cn and cn not in seen:
+        seen.add(cn)
+        case_numbers.append(cn)
+```
+
+Use a `set` for O(1) membership checks but maintain a `list` for deterministic ordering.
+
+### Testing pipeline scrapers
+
+- **Mock the factory methods**, not the child scrapers' internals. This lets you test the pipeline's orchestration logic (deduplication, Phase 1 -> Phase 2 handoff, empty results) in isolation.
+- **Test the empty-results path.** If Phase 1 returns no case numbers, Phase 2 should be skipped entirely.
+- **Test deduplication.** Provide Phase 1 fixtures with duplicate case numbers and verify Phase 2 receives the deduplicated list.
