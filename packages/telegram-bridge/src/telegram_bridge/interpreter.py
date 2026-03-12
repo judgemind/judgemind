@@ -4,8 +4,14 @@ Replaces the hard-coded command parser with a single-turn Claude API call
 that interprets all messages as free text, using the current orchestrator
 status as context.
 
-The interpreter uses ``claude-haiku-4-5`` for speed and cost efficiency
-(~$0.001 per interaction).
+Two modes are available:
+
+- **Haiku** (lightweight): Single-turn JSON classification.  Fast and cheap
+  (~$0.001 per interaction).  Used for simple command classification.
+- **Opus** (full agent): Multi-turn conversation with tool use.  Can read
+  files, search code, query GitHub, and run allowlisted shell commands to
+  answer substantive questions about the project.  Falls back to Haiku
+  behaviour for orchestrator actions (start, stop, pause, resume).
 """
 
 from __future__ import annotations
@@ -14,6 +20,7 @@ import json
 import logging
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import anthropic
@@ -51,8 +58,11 @@ KNOWN_ACTION_TYPES: frozenset[str] = frozenset(_ACTION_SCHEMAS)
 #: Allowed priority values for ``file_issue`` actions.
 ALLOWED_PRIORITIES: frozenset[str] = frozenset({"p1", "p2", "p3"})
 
-# The model to use for interpretation.  Haiku is fast and cheap.
+# The model to use for lightweight interpretation.  Haiku is fast and cheap.
 _DEFAULT_MODEL = "claude-haiku-4-5-20251001"
+
+# The model to use for full agent mode with tool use.
+OPUS_MODEL = "claude-opus-4-20250514"
 
 # Module-level client cache keyed by API key (or ``None`` for env-var default).
 # This avoids creating a new HTTP connection pool on every interpreter call.
@@ -450,6 +460,198 @@ def _validate_action(action: Any) -> dict[str, Any] | None:
             action["priority"] = "p2"
 
     return action
+
+
+# Maximum tokens for the Opus agent response (needs more room for tool use).
+_OPUS_MAX_TOKENS = 4096
+
+# Maximum number of tool-use rounds before giving up.
+_MAX_TOOL_ROUNDS = 10
+
+_OPUS_SYSTEM_PROMPT = """\
+You are an intelligent assistant for the Judgemind project — a free, \
+open-source legal research platform. You communicate with the project \
+maintainer via Telegram.
+
+You have read-only access to the repository via tools. Use them to answer \
+questions about the codebase, architecture, GitHub issues/PRs, git history, \
+and database contents.
+
+## What you CAN do (answer directly using tools)
+
+- Read files from the repository
+- Search code with grep or glob patterns
+- Check GitHub issues and PRs (gh issue/pr list/view)
+- View git log, diff, status, branches
+- Query the dev database (scripts/dev-db-query.sh)
+- Answer questions about project architecture, code patterns, and status
+
+## What you CANNOT do (forward to orchestrator)
+
+For these, return a JSON response with the appropriate action:
+- **start** — Start work on an issue: {"type": "start", "issue": N}
+- **stop** — Stop work on an issue: {"type": "stop", "issue": N}
+- **pause** — Pause the orchestrator: {"type": "pause"}
+- **resume** — Resume the orchestrator: {"type": "resume"}
+- **file_issue** — Create a GitHub issue: \
+{"type": "file_issue", "description": "...", "priority": "p2"}
+- **do** — Perform an action (merge, deploy, run tests, etc.): \
+{"type": "do", "instruction": "..."}
+
+## Response format
+
+Your final response MUST be valid JSON:
+```json
+{
+  "reply": "Your answer to the user (plain text, no markdown)",
+  "actions": []
+}
+```
+
+The `actions` array should be empty for informational responses. Only include \
+actions when the user explicitly requests an orchestrator command.
+
+## Formatting Rules
+
+- Write the reply in plain text only — no markdown, no bold, no bullet points, \
+no code blocks. The message will be formatted for Telegram separately.
+- Reference GitHub issues as #N (e.g. #42, #720). These will be automatically \
+converted to clickable links.
+- Be concise but thorough. Telegram messages should be readable on mobile.
+- When showing code snippets, keep them short and relevant.
+- Do NOT use asterisks for bold, underscores for italic, or backticks for code.
+"""
+
+
+def interpret_message_with_tools(
+    *,
+    text: str,
+    repo_root: Path,
+    orchestrator_status: dict[str, Any] | None = None,
+    api_key: str | None = None,
+    client: anthropic.Anthropic | None = None,
+    model: str = OPUS_MODEL,
+    rate_limiter: RateLimiter | None = None,
+    max_tool_rounds: int = _MAX_TOOL_ROUNDS,
+) -> InterpretedMessage:
+    """Interpret a Telegram message using Claude Opus with tool access.
+
+    This runs a multi-turn conversation loop: Claude can call tools
+    (read files, search code, run allowlisted commands) to gather
+    information before composing a final answer.
+
+    The system prompt uses prompt caching to reduce costs on repeated
+    calls (the system prompt is mostly static).
+
+    Args:
+        text: The raw message text from Telegram.
+        repo_root: Absolute path to the repository root for tool access.
+        orchestrator_status: Current orchestrator state.
+        api_key: Anthropic API key (``None`` for env var default).
+        client: Pre-created client for connection reuse.
+        model: The Claude model to use.  Defaults to Opus.
+        rate_limiter: Optional rate limiter.
+        max_tool_rounds: Maximum number of tool-use rounds.
+
+    Returns:
+        An :class:`InterpretedMessage` with the reply text and any actions.
+
+    Raises:
+        RateLimitError: If the rate limit is exceeded.
+        anthropic.APIError: If the API call fails.
+    """
+    from .tools import TOOL_DEFINITIONS, execute_tool
+
+    if rate_limiter is not None:
+        rate_limiter.acquire()
+
+    if client is None:
+        client = get_client(api_key=api_key)
+
+    # Build system prompt with prompt caching.
+    system_blocks: list[dict[str, Any]] = [
+        {
+            "type": "text",
+            "text": _OPUS_SYSTEM_PROMPT,
+            "cache_control": {"type": "ephemeral"},
+        },
+    ]
+
+    # Build user message with orchestrator context.
+    user_parts: list[str] = []
+    if orchestrator_status:
+        user_parts.append(
+            "## Current Orchestrator Status\n```json\n"
+            f"{json.dumps(orchestrator_status, indent=2, default=str)}\n```\n"
+        )
+    user_parts.append(f"## User Message\n{text}")
+    user_message = "\n".join(user_parts)
+
+    messages: list[dict[str, Any]] = [{"role": "user", "content": user_message}]
+
+    # Multi-turn tool-use loop.
+    for _round in range(max_tool_rounds):
+        response = client.messages.create(
+            model=model,
+            max_tokens=_OPUS_MAX_TOKENS,
+            system=system_blocks,
+            messages=messages,
+            tools=TOOL_DEFINITIONS,
+        )
+
+        # Check if the model wants to use tools.
+        if response.stop_reason != "tool_use":
+            # No more tool calls — extract final answer.
+            break
+
+        # Process tool calls and build tool results.
+        assistant_content = response.content
+        tool_results: list[dict[str, Any]] = []
+
+        for block in assistant_content:
+            if block.type == "tool_use":
+                tool_output = execute_tool(
+                    repo_root=repo_root,
+                    tool_name=block.name,
+                    tool_input=block.input,
+                )
+                tool_results.append(
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": block.id,
+                        "content": tool_output,
+                    }
+                )
+
+        # Append assistant message and tool results to conversation.
+        messages.append({"role": "assistant", "content": assistant_content})
+        messages.append({"role": "user", "content": tool_results})
+    else:
+        # Exhausted tool rounds — use whatever we have.
+        logger.warning("Opus agent exhausted %d tool rounds.", max_tool_rounds)
+
+    # Extract the final text response.
+    response_text = ""
+    for block in response.content:
+        if block.type == "text":
+            response_text += block.text
+
+    if not response_text:
+        # No text in the response — generate a fallback.
+        return InterpretedMessage(
+            reply="I looked into your question but couldn't formulate a response. "
+            "Your message has been noted.",
+            actions=[],
+            raw_response={},
+        )
+
+    # Parse the JSON response (same format as Haiku).
+    parsed = _parse_response(response_text)
+    return InterpretedMessage(
+        reply=parsed.get("reply", "I understood your message but couldn't generate a response."),
+        actions=parsed.get("actions", []),
+        raw_response=parsed,
+    )
 
 
 def build_orchestrator_status(

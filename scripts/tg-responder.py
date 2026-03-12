@@ -84,6 +84,7 @@ try:
         RateLimitError,
         RateLimiter,
         interpret_message,
+        interpret_message_with_tools,
     )
 except ModuleNotFoundError as exc:
     _pkg_dir2 = Path(__file__).resolve().parents[1] / "packages" / "telegram-bridge"
@@ -808,6 +809,8 @@ def dispatch_message(
     inbox_file: str,
     anthropic_api_key: str | None = None,
     rate_limiter: RateLimiter | None = None,
+    use_opus: bool = False,
+    repo_root: Path | None = None,
 ) -> None:
     """Interpret and dispatch a single inbound message using Claude API.
 
@@ -828,6 +831,10 @@ def dispatch_message(
             :func:`interpret_message`.  When ``None``, no rate limiting
             is applied at the dispatch level (the interpreter's own
             default limiter still applies unless explicitly disabled).
+        use_opus: If ``True``, use the Opus agent with tool access for
+            message interpretation.  Requires *repo_root* to be set.
+        repo_root: Absolute path to the repository root.  Required when
+            *use_opus* is ``True`` so the agent can access files.
     """
     text = str(message.get("text", ""))
 
@@ -865,12 +872,21 @@ def dispatch_message(
 
     # Call the Claude interpreter.
     try:
-        result = interpret_message(
-            text=text,
-            orchestrator_status=orchestrator_status,
-            api_key=anthropic_api_key,
-            rate_limiter=rate_limiter,
-        )
+        if use_opus and repo_root is not None:
+            result = interpret_message_with_tools(
+                text=text,
+                repo_root=repo_root,
+                orchestrator_status=orchestrator_status,
+                api_key=anthropic_api_key,
+                rate_limiter=rate_limiter,
+            )
+        else:
+            result = interpret_message(
+                text=text,
+                orchestrator_status=orchestrator_status,
+                api_key=anthropic_api_key,
+                rate_limiter=rate_limiter,
+            )
     except RateLimitError as exc:
         logger.info("Rate limit exceeded — queuing message for orchestrator.")
         queue_to_inbox(dict(message), inbox_file)
@@ -1227,6 +1243,7 @@ def run_daemon(
     secret_id: str = "judgemind/telegram/bot",
     anthropic_secret_id: str = "judgemind/anthropic/api-key",
     no_llm: bool = False,
+    model: str = "opus",
     rate_limit_calls: int = 20,
     rate_limit_window: float = 60.0,
     force: bool = False,
@@ -1236,6 +1253,8 @@ def run_daemon(
     Args:
         no_llm: If ``True``, disable Claude interpretation entirely.
             Messages are queued with a simple acknowledgment instead.
+        model: Which Claude model to use: ``"opus"`` for the full agent
+            with tool access, ``"haiku"`` for lightweight classification.
         rate_limit_calls: Max Claude API calls within the rate limit window.
         rate_limit_window: Rate limit window duration in seconds.
         force: If ``True``, stop any existing daemon process before starting.
@@ -1261,8 +1280,11 @@ def run_daemon(
             secret_id=anthropic_secret_id, region=region
         )
 
+    use_opus = model == "opus"
+
     if anthropic_api_key:
-        logger.info("Claude interpreter enabled (Haiku).")
+        model_label = "Opus (agent with tools)" if use_opus else "Haiku (lightweight)"
+        logger.info("Claude interpreter enabled (%s).", model_label)
     elif not no_llm:
         logger.warning(
             "Claude interpreter disabled — will fall back to simple acknowledgment."
@@ -1319,6 +1341,8 @@ def run_daemon(
                         inbox_file=inbox_file,
                         anthropic_api_key=anthropic_api_key,
                         rate_limiter=limiter,
+                        use_opus=use_opus,
+                        repo_root=_REPO_ROOT,
                     )
                     # Check for stop between each message dispatch.
                     if _should_stop(pid_file):
@@ -1421,10 +1445,19 @@ def main() -> None:
         help="Disable Claude interpretation entirely (messages get simple acknowledgments)",
     )
     parser.add_argument(
+        "--model",
+        choices=["opus", "haiku"],
+        default="opus",
+        help=(
+            "Which Claude model to use: 'opus' for full agent with tool access, "
+            "'haiku' for lightweight classification (default: opus)"
+        ),
+    )
+    parser.add_argument(
         "--rate-limit-calls",
         type=int,
-        default=20,
-        help="Max Claude API calls within the rate limit window (default: 20)",
+        default=10,
+        help="Max Claude API calls within the rate limit window (default: 10)",
     )
     parser.add_argument(
         "--rate-limit-window",
@@ -1453,6 +1486,7 @@ def main() -> None:
         secret_id=args.secret_id,
         anthropic_secret_id=args.anthropic_secret_id,
         no_llm=args.no_llm,
+        model=args.model,
         rate_limit_calls=args.rate_limit_calls,
         rate_limit_window=args.rate_limit_window,
         force=args.force,
