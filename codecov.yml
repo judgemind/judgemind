@@ -1,0 +1,85 @@
+# Codecov configuration for Judgemind monorepo
+# https://docs.codecov.io/docs/codecov-yaml
+
+codecov:
+  require_ci_to_pass: true
+
+comment:
+  layout: "reach,diff,flags,components"
+  behavior: default
+  require_changes: true
+
+coverage:
+  status:
+    # Overall project coverage — informational only, do not block PRs.
+    # The coverage floor ratchet in CI (coverage-baselines.json) is the
+    # authoritative gate; Codecov is for visibility.
+    project:
+      default:
+        target: auto
+        threshold: 1%
+        informational: true
+    # Diff coverage — also informational; diff-cover in CI is the gate.
+    patch:
+      default:
+        target: 90%
+        informational: true
+
+# Flag definitions for per-package tracking
+flags:
+  scraper-unit:
+    paths:
+      - packages/scraper-framework/
+    carryforward: true
+  scraper-ingestion:
+    paths:
+      - packages/scraper-framework/
+    carryforward: true
+  nlp:
+    paths:
+      - packages/nlp-pipeline/
+    carryforward: true
+  api:
+    paths:
+      - packages/api/
+    carryforward: true
+  web:
+    paths:
+      - packages/web/
+    carryforward: true
+  telegram-bridge:
+    paths:
+      - packages/telegram-bridge/
+    carryforward: true
+  lambda-telegram-bot:
+    paths:
+      - infra/telegram-bot/
+    carryforward: true
+
+# Component definitions for dashboard grouping
+component_management:
+  individual_components:
+    - component_id: scraper-framework
+      name: Scraper Framework
+      paths:
+        - packages/scraper-framework/**
+    - component_id: nlp-pipeline
+      name: NLP Pipeline
+      paths:
+        - packages/nlp-pipeline/**
+    - component_id: api
+      name: API
+      paths:
+        - packages/api/**
+    - component_id: web
+      name: Web Frontend
+      paths:
+        - packages/web/**
+    - component_id: telegram-bridge
+      name: Telegram Bridge
+      paths:
+        - packages/telegram-bridge/**
+    - component_id: lambda-telegram-bot
+      name: Lambda - Telegram Bot
+      paths:
+        - infra/telegram-bot/**

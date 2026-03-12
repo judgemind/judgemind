@@ -100,6 +100,14 @@ jobs:
         with:
           name: coverage-scraper-unit
           path: packages/scraper-framework/coverage.xml
+      - name: Upload to Codecov
+        if: always() && hashFiles('packages/scraper-framework/coverage.xml') != ''
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: packages/scraper-framework/coverage.xml
+          flags: scraper-unit
+          fail_ci_if_error: false
 
   ingestion-tests:
     needs: detect-changes
@@ -137,6 +145,14 @@ jobs:
         with:
           name: coverage-scraper-ingestion
           path: packages/scraper-framework/coverage.xml
+      - name: Upload to Codecov
+        if: always() && hashFiles('packages/scraper-framework/coverage.xml') != ''
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: packages/scraper-framework/coverage.xml
+          flags: scraper-ingestion
+          fail_ci_if_error: false
 
   nlp-tests:
     needs: detect-changes
@@ -172,6 +188,14 @@ jobs:
         with:
           name: coverage-nlp
           path: packages/nlp-pipeline/coverage.xml
+      - name: Upload to Codecov
+        if: always() && hashFiles('packages/nlp-pipeline/coverage.xml') != ''
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: packages/nlp-pipeline/coverage.xml
+          flags: nlp
+          fail_ci_if_error: false
 
   api-tests:
     needs: detect-changes
@@ -231,6 +255,14 @@ jobs:
         with:
           name: coverage-api
           path: packages/api/coverage/lcov.info
+      - name: Upload to Codecov
+        if: always() && hashFiles('packages/api/coverage/lcov.info') != ''
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: packages/api/coverage/lcov.info
+          flags: api
+          fail_ci_if_error: false
 
   web-tests:
     needs: detect-changes
@@ -258,6 +290,14 @@ jobs:
         with:
           name: coverage-web
           path: packages/web/coverage/lcov.info
+      - name: Upload to Codecov
+        if: always() && hashFiles('packages/web/coverage/lcov.info') != ''
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: packages/web/coverage/lcov.info
+          flags: web
+          fail_ci_if_error: false
       - name: Build
         run: npm run build
 
@@ -295,6 +335,14 @@ jobs:
         with:
           name: coverage-telegram
           path: packages/telegram-bridge/coverage.xml
+      - name: Upload to Codecov
+        if: always() && hashFiles('packages/telegram-bridge/coverage.xml') != ''
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: packages/telegram-bridge/coverage.xml
+          flags: telegram-bridge
+          fail_ci_if_error: false
 
   infra-validate:
     needs: detect-changes
@@ -371,6 +419,14 @@ jobs:
         with:
           name: coverage-lambda-telegram-bot
           path: ${{ matrix.lambda-dir }}/coverage.xml
+      - name: Upload to Codecov
+        if: always() && hashFiles(format('{0}/coverage.xml', matrix.lambda-dir)) != ''
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: ${{ matrix.lambda-dir }}/coverage.xml
+          flags: lambda-telegram-bot
+          fail_ci_if_error: false
 
   # ---------------------------------------------------------------
   # Coverage gates: diff coverage (new lines) + overall floor ratchet
