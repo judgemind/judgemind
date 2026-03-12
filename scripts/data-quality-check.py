@@ -103,6 +103,8 @@ class Baselines:
 
     expected_daily_rulings: float
     schedule_type: str  # daily, frequent
+    posting_days: list[str] | None = None  # e.g. ["Mon", "Tue", "Wed", "Thu"]
+    max_expected_gap_hours: float | None = None  # explicit override
 
 
 def load_baselines(path: Path | None = None) -> dict[str, Baselines]:
@@ -127,6 +129,8 @@ def load_baselines(path: Path | None = None) -> dict[str, Baselines]:
         result[county] = Baselines(
             expected_daily_rulings=config.get("expected_daily_rulings", 0),
             schedule_type=config.get("schedule_type", "daily"),
+            posting_days=config.get("posting_days"),
+            max_expected_gap_hours=config.get("max_expected_gap_hours"),
         )
     return result
 
@@ -556,6 +560,76 @@ def check_ingest_rates(
     return alerts
 
 
+# Day-of-week abbreviations used in posting_days config.
+_DAY_ABBREVS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+
+
+def _calculate_stale_threshold(
+    now: datetime,
+    schedule_type: str,
+    posting_days: list[str] | None,
+    max_expected_gap_hours: float | None,
+) -> float:
+    """Calculate the staleness threshold in hours for a county.
+
+    For counties with ``posting_days`` set, the threshold accounts for
+    expected gaps when no new content is posted (e.g. weekends).  The
+    threshold is the number of hours from the *end* of the most recent
+    posting day to ``now``, plus a buffer equal to the base threshold
+    for that schedule type.
+
+    Args:
+        now: Current timestamp (must be timezone-aware).
+        schedule_type: "daily" or "frequent".
+        posting_days: Optional list of day abbreviations (Mon-Sun) when
+            the court posts content.
+        max_expected_gap_hours: Explicit override.  If set, returned
+            directly without further calculation.
+
+    Returns:
+        Staleness threshold in hours.
+    """
+    if max_expected_gap_hours is not None:
+        return max_expected_gap_hours
+
+    base_threshold = (
+        FREQUENT_SCRAPER_STALE_HOURS
+        if schedule_type == "frequent"
+        else DAILY_SCRAPER_STALE_HOURS
+    )
+
+    if not posting_days:
+        return base_threshold
+
+    # Map day abbreviations to weekday integers (Mon=0 .. Sun=6).
+    posting_weekdays: set[int] = set()
+    for day in posting_days:
+        if day in _DAY_ABBREVS:
+            posting_weekdays.add(_DAY_ABBREVS.index(day))
+
+    if not posting_weekdays:
+        return base_threshold
+
+    # Walk backwards from today to find the most recent posting day.
+    # Start from today (if today is a posting day, the scraper should
+    # have run today so the gap is just the base threshold).
+    current_weekday = now.weekday()  # Mon=0 .. Sun=6
+    for days_back in range(8):  # at most 7 days back + today
+        check_day = (current_weekday - days_back) % 7
+        if check_day in posting_weekdays:
+            if days_back == 0:
+                # Today is a posting day — use the normal base threshold.
+                return base_threshold
+            # The last posting day was ``days_back`` days ago.  The
+            # expected gap is approximately ``days_back * 24`` hours,
+            # plus the base buffer to allow the scraper time to run.
+            return days_back * 24.0 + base_threshold
+
+    # Should never reach here (we check 8 days covering a full week),
+    # but fall back to a safe large value.
+    return 7 * 24.0 + base_threshold  # pragma: no cover
+
+
 def check_scraper_staleness(
     conn: psycopg.Connection,  # type: ignore[type-arg]
     now: datetime,
@@ -606,10 +680,10 @@ def check_scraper_staleness(
     for county_name in sorted(counties_to_check):
         baseline = baselines.get(county_name)
         schedule_type = baseline.schedule_type if baseline else "daily"
-        stale_threshold_hours = (
-            FREQUENT_SCRAPER_STALE_HOURS
-            if schedule_type == "frequent"
-            else DAILY_SCRAPER_STALE_HOURS
+        posting_days = baseline.posting_days if baseline else None
+        max_gap_override = baseline.max_expected_gap_hours if baseline else None
+        stale_threshold_hours = _calculate_stale_threshold(
+            now, schedule_type, posting_days, max_gap_override
         )
 
         last_activity: datetime | None = None

@@ -34,6 +34,7 @@ load_field_baselines = dqc.load_field_baselines
 save_field_baselines = dqc.save_field_baselines
 check_ingest_rates = dqc.check_ingest_rates
 check_scraper_staleness = dqc.check_scraper_staleness
+_calculate_stale_threshold = dqc._calculate_stale_threshold
 check_field_completeness = dqc.check_field_completeness
 _query_field_completeness = dqc._query_field_completeness
 _collect_full_metrics = dqc._collect_full_metrics
@@ -88,6 +89,8 @@ def _make_baselines(
         name: Baselines(
             expected_daily_rulings=cfg.get("expected_daily_rulings", 0),
             schedule_type=cfg.get("schedule_type", "daily"),
+            posting_days=cfg.get("posting_days"),
+            max_expected_gap_hours=cfg.get("max_expected_gap_hours"),
         )
         for name, cfg in counties.items()
     }
@@ -181,6 +184,35 @@ class TestLoadBaselines:
         result = load_baselines(baselines_file)
         assert result["Test"].expected_daily_rulings == 0
         assert result["Test"].schedule_type == "daily"
+        assert result["Test"].posting_days is None
+        assert result["Test"].max_expected_gap_hours is None
+
+    def test_load_posting_days_and_max_gap(self, tmp_path: Path) -> None:
+        """Loads posting_days and max_expected_gap_hours from config."""
+        baselines_file = tmp_path / "baselines.json"
+        baselines_file.write_text(
+            json.dumps(
+                {
+                    "counties": {
+                        "Santa Clara": {
+                            "expected_daily_rulings": 10,
+                            "schedule_type": "daily",
+                            "posting_days": ["Mon", "Tue", "Wed", "Thu"],
+                        },
+                        "Custom": {
+                            "expected_daily_rulings": 5,
+                            "schedule_type": "daily",
+                            "max_expected_gap_hours": 72.0,
+                        },
+                    }
+                }
+            )
+        )
+        result = load_baselines(baselines_file)
+        assert result["Santa Clara"].posting_days == ["Mon", "Tue", "Wed", "Thu"]
+        assert result["Santa Clara"].max_expected_gap_hours is None
+        assert result["Custom"].posting_days is None
+        assert result["Custom"].max_expected_gap_hours == 72.0
 
 
 class TestCheckIngestRates:
@@ -374,6 +406,167 @@ class TestCheckScraperStaleness:
         alerts = check_scraper_staleness(conn, NOW, baselines)
         assert len(alerts) == 1
         assert alerts[0].severity == "p2"
+
+
+class TestCalculateStaleThreshold:
+    """Tests for _calculate_stale_threshold helper."""
+
+    def test_daily_no_posting_days_returns_default(self) -> None:
+        """Without posting_days, returns DAILY_SCRAPER_STALE_HOURS."""
+        threshold = _calculate_stale_threshold(NOW, "daily", None, None)
+        assert threshold == 14  # DAILY_SCRAPER_STALE_HOURS
+
+    def test_frequent_no_posting_days_returns_default(self) -> None:
+        """Without posting_days, frequent schedule returns 2h."""
+        threshold = _calculate_stale_threshold(NOW, "frequent", None, None)
+        assert threshold == 2  # FREQUENT_SCRAPER_STALE_HOURS
+
+    def test_max_expected_gap_hours_overrides_all(self) -> None:
+        """Explicit max_expected_gap_hours overrides everything."""
+        threshold = _calculate_stale_threshold(NOW, "daily", ["Mon", "Tue"], 72.0)
+        assert threshold == 72.0
+
+    def test_posting_day_today_returns_base_threshold(self) -> None:
+        """When today is a posting day, returns the base threshold."""
+        # NOW is Tuesday 2026-03-11 12:00 UTC
+        threshold = _calculate_stale_threshold(NOW, "daily", ["Mon", "Tue", "Wed", "Thu"], None)
+        assert threshold == 14  # Base threshold — today is a posting day
+
+    def test_saturday_with_weekday_posting(self) -> None:
+        """Saturday check for Mon-Thu posting: last post was Thursday, 2 days ago."""
+        saturday = datetime(2026, 3, 14, 12, 0, 0, tzinfo=UTC)  # Saturday
+        threshold = _calculate_stale_threshold(
+            saturday, "daily", ["Mon", "Tue", "Wed", "Thu"], None
+        )
+        # Last posting day was Thursday (2 days ago) -> 48h + 14h buffer
+        assert threshold == 62.0
+
+    def test_sunday_with_weekday_posting(self) -> None:
+        """Sunday check for Mon-Thu posting: last post was Thursday, 3 days ago."""
+        sunday = datetime(2026, 3, 15, 12, 0, 0, tzinfo=UTC)  # Sunday
+        threshold = _calculate_stale_threshold(sunday, "daily", ["Mon", "Tue", "Wed", "Thu"], None)
+        # Last posting day was Thursday (3 days ago) -> 72h + 14h buffer
+        assert threshold == 86.0
+
+    def test_monday_with_weekday_posting(self) -> None:
+        """Monday check for Mon-Thu posting: today is a posting day."""
+        monday = datetime(2026, 3, 16, 12, 0, 0, tzinfo=UTC)  # Monday
+        threshold = _calculate_stale_threshold(monday, "daily", ["Mon", "Tue", "Wed", "Thu"], None)
+        # Monday is a posting day -> base threshold
+        assert threshold == 14
+
+    def test_friday_with_mon_thu_posting(self) -> None:
+        """Friday check for Mon-Thu posting: last post was Thursday, 1 day ago."""
+        friday = datetime(2026, 3, 13, 12, 0, 0, tzinfo=UTC)  # Friday
+        threshold = _calculate_stale_threshold(friday, "daily", ["Mon", "Tue", "Wed", "Thu"], None)
+        # Last posting day was Thursday (1 day ago) -> 24h + 14h buffer
+        assert threshold == 38.0
+
+    def test_mon_to_fri_posting_on_saturday(self) -> None:
+        """Saturday check for Mon-Fri posting: last post was Friday, 1 day ago."""
+        saturday = datetime(2026, 3, 14, 12, 0, 0, tzinfo=UTC)  # Saturday
+        threshold = _calculate_stale_threshold(
+            saturday, "daily", ["Mon", "Tue", "Wed", "Thu", "Fri"], None
+        )
+        # Last posting day was Friday (1 day ago) -> 24h + 14h buffer
+        assert threshold == 38.0
+
+    def test_empty_posting_days_returns_base(self) -> None:
+        """Empty posting_days list falls back to base threshold."""
+        threshold = _calculate_stale_threshold(NOW, "daily", [], None)
+        assert threshold == 14
+
+    def test_invalid_day_abbrevs_ignored(self) -> None:
+        """Invalid day abbreviations are silently ignored."""
+        threshold = _calculate_stale_threshold(NOW, "daily", ["Xyz", "Abc"], None)
+        assert threshold == 14  # Falls back to base — no valid days
+
+
+class TestScheduleAwareStaleness:
+    """Integration tests for schedule-aware staleness in check_scraper_staleness."""
+
+    def test_santa_clara_not_stale_on_saturday(self) -> None:
+        """Santa Clara (Mon-Thu posting) should not alert on Saturday with 48h gap."""
+        saturday = datetime(2026, 3, 14, 12, 0, 0, tzinfo=UTC)
+        # Last scraper run was Thursday at noon — 48h ago
+        last_run = datetime(2026, 3, 12, 12, 0, 0, tzinfo=UTC)
+        conn = FakeConnection(
+            {
+                "scraper_runs": [("ca-sc-tentatives", "Santa Clara", last_run, "success")],
+                "MAX(d.captured_at)": [],
+            }
+        )
+        baselines = _make_baselines(
+            {
+                "Santa Clara": {
+                    "expected_daily_rulings": 10,
+                    "schedule_type": "daily",
+                    "posting_days": ["Mon", "Tue", "Wed", "Thu"],
+                }
+            }
+        )
+        alerts = check_scraper_staleness(conn, saturday, baselines)
+        assert len(alerts) == 0
+
+    def test_santa_clara_stale_on_posting_day(self) -> None:
+        """Santa Clara should alert when stale on a posting day (Tuesday)."""
+        tuesday = datetime(2026, 3, 11, 12, 0, 0, tzinfo=UTC)
+        # Last run was 15h ago — exceeds the 14h base threshold
+        last_run = tuesday - timedelta(hours=15)
+        conn = FakeConnection(
+            {
+                "scraper_runs": [("ca-sc-tentatives", "Santa Clara", last_run, "success")],
+                "MAX(d.captured_at)": [],
+            }
+        )
+        baselines = _make_baselines(
+            {
+                "Santa Clara": {
+                    "expected_daily_rulings": 10,
+                    "schedule_type": "daily",
+                    "posting_days": ["Mon", "Tue", "Wed", "Thu"],
+                }
+            }
+        )
+        alerts = check_scraper_staleness(conn, tuesday, baselines)
+        assert len(alerts) == 1
+        assert alerts[0].county == "Santa Clara"
+
+    def test_daily_county_unaffected(self) -> None:
+        """Counties without posting_days still use the default threshold."""
+        stale_time = NOW - timedelta(hours=15)
+        conn = FakeConnection(
+            {
+                "scraper_runs": [("ca-la-tentatives-civil", "Los Angeles", stale_time, "success")],
+                "MAX(d.captured_at)": [],
+            }
+        )
+        baselines = _make_baselines()
+        alerts = check_scraper_staleness(conn, NOW, baselines)
+        assert len(alerts) == 1
+        assert alerts[0].county == "Los Angeles"
+
+    def test_max_gap_override(self) -> None:
+        """max_expected_gap_hours overrides all other logic."""
+        # 40h gap — would be stale with 14h default, but not with 48h override
+        last_run = NOW - timedelta(hours=40)
+        conn = FakeConnection(
+            {
+                "scraper_runs": [("ca-sc-tentatives", "Santa Clara", last_run, "success")],
+                "MAX(d.captured_at)": [],
+            }
+        )
+        baselines = _make_baselines(
+            {
+                "Santa Clara": {
+                    "expected_daily_rulings": 10,
+                    "schedule_type": "daily",
+                    "max_expected_gap_hours": 48.0,
+                }
+            }
+        )
+        alerts = check_scraper_staleness(conn, NOW, baselines)
+        assert len(alerts) == 0
 
 
 class TestFormatOutput:
