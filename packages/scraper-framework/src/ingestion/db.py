@@ -616,20 +616,17 @@ def upsert_case_party(
 ) -> None:
     """Link a party to a case in the case_parties join table.
 
-    Idempotent — skips insert if a matching (case_id, party_id, role) row
-    already exists.
+    Idempotent — ON CONFLICT DO NOTHING on the (case_id, party_id, role)
+    unique constraint prevents duplicate rows.
     """
     with conn.cursor() as cur:
         cur.execute(
             """
             INSERT INTO case_parties (case_id, party_id, role)
-            SELECT %s::uuid, %s::uuid, %s
-            WHERE NOT EXISTS (
-                SELECT 1 FROM case_parties
-                WHERE case_id = %s::uuid AND party_id = %s::uuid AND role = %s
-            )
+            VALUES (%s::uuid, %s::uuid, %s)
+            ON CONFLICT (case_id, party_id, role) DO NOTHING
             """,
-            (case_id, party_id, role, case_id, party_id, role),
+            (case_id, party_id, role),
         )
     logger.debug("upsert_case_party: case_id=%s party_id=%s role=%s", case_id, party_id, role)
 

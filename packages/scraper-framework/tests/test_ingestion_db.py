@@ -441,6 +441,23 @@ class TestBatchUpsertParties:
         aliases_params = cur.executemany.call_args_list[1][0][1]
         assert aliases_params[0][2] == "backfill"
 
+    def test_case_party_links_use_on_conflict(self) -> None:
+        """Verify case_parties INSERT uses ON CONFLICT DO NOTHING (#873)."""
+        conn, cur = _mock_conn_for_batch()
+        cur.fetchall.return_value = [("John Doe", "party-1")]
+
+        batch_upsert_parties(
+            conn,
+            "case-1",
+            [{"name": "John Doe", "role": "plaintiff"}],
+        )
+
+        # The last executemany call should be the case_parties INSERT
+        links_call = cur.executemany.call_args_list[-1]
+        sql = links_call[0][0]
+        assert "case_parties" in sql
+        assert "ON CONFLICT DO NOTHING" in sql
+
     def test_long_party_name_truncated(self) -> None:
         """Party names exceeding _MAX_PARTY_NAME_LENGTH are truncated."""
         conn, cur = _mock_conn_for_batch()
@@ -1000,8 +1017,16 @@ class TestUpsertCaseParty:
         conn = _mock_conn()
         upsert_case_party(conn, "case-1", "party-1", "plaintiff")
         args = _get_execute_args(conn)
-        # The function passes (case_id, party_id, role) twice for the WHERE NOT EXISTS
-        assert args == ("case-1", "party-1", "plaintiff", "case-1", "party-1", "plaintiff")
+        assert args == ("case-1", "party-1", "plaintiff")
+
+    def test_uses_on_conflict_do_nothing(self) -> None:
+        """Verify the SQL uses ON CONFLICT DO NOTHING on the business key."""
+        conn = _mock_conn()
+        cur = conn.cursor.return_value.__enter__.return_value
+        upsert_case_party(conn, "case-1", "party-1", "plaintiff")
+        sql = cur.execute.call_args[0][0]
+        assert "ON CONFLICT" in sql
+        assert "DO NOTHING" in sql
 
     def test_execute_called_once(self) -> None:
         conn = _mock_conn()

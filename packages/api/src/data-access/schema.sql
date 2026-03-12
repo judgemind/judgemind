@@ -179,7 +179,8 @@ CREATE TABLE case_parties (
     id          UUID    PRIMARY KEY DEFAULT gen_random_uuid(),
     case_id     UUID    NOT NULL REFERENCES cases(id) ON DELETE CASCADE,
     party_id    UUID    NOT NULL REFERENCES parties(id),
-    role        TEXT    NOT NULL     -- 'plaintiff', 'defendant', 'cross-defendant', 'respondent', etc.
+    role        TEXT    NOT NULL,    -- 'plaintiff', 'defendant', 'cross-defendant', 'respondent', etc.
+    UNIQUE (case_id, party_id, role)
 );
 
 COMMENT ON TABLE cases                    IS 'Court cases. case_number + court_id is the unique key.';
