@@ -116,6 +116,15 @@ scripts/tg-notify.py task_started <issue_number> "<title>" <worker_number>
 
 This sends the Telegram message **and** updates `tmp/orchestrator_status.json` so the responder daemon has accurate context.
 
+### Filtering task notifications
+
+Not all `<task-notification>` messages require orchestrator action. The platform fires notifications for both subagent completions and background command completions. The orchestrator **must** distinguish between the two:
+
+- **Respond to:** Agent completions — notifications where the `<summary>` starts with `"Agent"` (e.g. `"Agent for task #42 completed"`, `"Agent for task #42 failed"`). These represent `/task` or `/audit` subagent results that require slot bookkeeping, Telegram notification, and potential backfill.
+- **Ignore silently:** Background command completions — notifications where the `<summary>` starts with `"Background command"` (e.g. `"Background command completed"`, `"Background command failed"`). These are internal operations run by subagents (Gemini reviews, `gh run watch`, test suites, lint runs, etc.) and need no orchestrator action.
+
+**When a background command notification arrives, do nothing.** Do not acknowledge it, do not print a status message, do not send a Telegram notification. Simply continue the main loop. Responding to these creates noise in the conversation without adding value.
+
 ### Processing agent completions
 
 When a `<task-notification>` arrives indicating an agent has completed:
