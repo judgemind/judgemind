@@ -149,6 +149,15 @@ resource "aws_ecs_task_definition" "scraper" {
         var.document_archive_bucket != "" ? [{ name = "JUDGEMIND_ARCHIVE_BUCKET", value = var.document_archive_bucket }] : []
       )
 
+      secrets = concat(
+        var.proxy_secret_arn != "" ? [
+          {
+            name      = "SD_PROXY_URL"
+            valueFrom = var.proxy_secret_arn
+          }
+        ] : []
+      )
+
       logConfiguration = {
         logDriver = "awslogs"
         options = {
@@ -296,6 +305,27 @@ resource "aws_iam_role_policy" "ecs_task_execution_secrets" {
           var.anthropic_api_key_secret_arn,
           var.google_api_key_secret_arn,
         ])
+      }
+    ]
+  })
+}
+
+# Allow the task execution role to fetch the residential proxy secret so ECS
+# can inject SD_PROXY_URL into the scraper container at launch.
+resource "aws_iam_role_policy" "ecs_task_execution_proxy_secret" {
+  count = var.proxy_secret_arn != "" ? 1 : 0
+
+  name = "judgemind-ecs-execution-proxy-secret-${var.environment}"
+  role = aws_iam_role.ecs_task_execution.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid      = "ReadProxySecret"
+        Effect   = "Allow"
+        Action   = "secretsmanager:GetSecretValue"
+        Resource = var.proxy_secret_arn
       }
     ]
   })
