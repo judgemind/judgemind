@@ -47,7 +47,7 @@ def extract_json_from_output(text: str) -> dict[str, Any] | None:
     Returns:
         Parsed JSON dict, or None if no valid alert JSON was found.
     """
-    # Strategy 1: Try to find a line that starts with '{' and parse it.
+    # Strategy 1: Try to find a single line containing the full JSON.
     for line in text.splitlines():
         stripped = line.strip()
         if stripped.startswith("{") and '"healthy"' in stripped:
@@ -56,10 +56,41 @@ def extract_json_from_output(text: str) -> dict[str, Any] | None:
             except json.JSONDecodeError:
                 continue
 
-    # Strategy 2: Try to find a multi-line JSON block.
-    # Look for {"healthy": ... } pattern across lines.
+    # Strategy 2: Reconstruct multi-line JSON block.
+    # When data-quality-check.py uses indent=2, the opening '{' is on its
+    # own line and '"healthy"' is on the next.  Collect lines from the first
+    # standalone '{' through the matching top-level '}' and parse.
+    lines = text.splitlines()
+    json_start: int | None = None
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped == "{" and json_start is None:
+            # Peek ahead to see if the next non-empty line looks like JSON
+            for j in range(i + 1, min(i + 5, len(lines))):
+                if '"healthy"' in lines[j]:
+                    json_start = i
+                    break
+            if json_start is not None:
+                break
+
+    if json_start is not None:
+        # Walk forward tracking brace depth to find the closing '}'
+        depth = 0
+        json_lines: list[str] = []
+        for i in range(json_start, len(lines)):
+            stripped = lines[i].strip()
+            json_lines.append(stripped)
+            depth += stripped.count("{") - stripped.count("}")
+            if depth <= 0:
+                break
+        try:
+            return json.loads("\n".join(json_lines))
+        except json.JSONDecodeError:
+            pass
+
+    # Strategy 3: Regex fallback for compact or slightly noisy JSON.
     match = re.search(
-        r'\{"healthy"\s*:.*?"alerts"\s*:\s*\[.*?\]\s*\}',
+        r'\{\s*"healthy"\s*:.*?"alerts"\s*:\s*\[.*?\]\s*\}',
         text,
         re.DOTALL,
     )

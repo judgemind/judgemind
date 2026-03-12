@@ -91,6 +91,75 @@ Task failed"""
         assert result["alerts"][1]["severity"] == "p2"
         assert result["alerts"][1]["county"] == "Orange"
 
+    def test_multiline_indented_json(self) -> None:
+        """Extract multi-line JSON with indent=2, as produced by data-quality-check.py."""
+        payload = {
+            "healthy": False,
+            "alert_count": 2,
+            "alerts": [
+                {
+                    "county": "Santa Clara",
+                    "metric": "scraper_stale",
+                    "severity": "p1",
+                    "expected": "<6h",
+                    "actual": "78.5h",
+                    "message": "Santa Clara: scraper stale for 78.5h (threshold: 6h)",
+                },
+                {
+                    "county": "Los Angeles",
+                    "metric": "scraper_stale",
+                    "severity": "p2",
+                    "expected": "<6h",
+                    "actual": "6.6h",
+                    "message": "Los Angeles: scraper stale for 6.6h (threshold: 6h)",
+                },
+            ],
+        }
+        # Simulate ECS output: logging lines, then indented JSON, then status
+        text = (
+            "2026-03-12 19:55:05,516 INFO     Checking county: Los Angeles\n"
+            "2026-03-12 19:56:05,516 INFO     data_quality_check_complete alert_count=2\n"
+            + json.dumps(payload, indent=2)
+            + "\n"
+            "Status: DEPROVISIONING\n"
+            "Status: STOPPED\n"
+        )
+        result = extract_json_from_output(text)
+        assert result is not None
+        assert result["healthy"] is False
+        assert result["alert_count"] == 2
+        assert len(result["alerts"]) == 2
+        assert result["alerts"][0]["county"] == "Santa Clara"
+
+    def test_multiline_json_with_log_prefixes(self) -> None:
+        """Extract JSON even when lines have CloudWatch-style prefixes stripped."""
+        # In practice, ecs-run-task.sh strips CloudWatch prefixes, but the
+        # JSON is still multi-line with indent=2.
+        text = (
+            "Status: RUNNING\n"
+            "2026-03-12 19:56:05,516 INFO     data_quality_check_complete\n"
+            "{\n"
+            '  "healthy": false,\n'
+            '  "alert_count": 1,\n'
+            '  "alerts": [\n'
+            "    {\n"
+            '      "county": "Orange",\n'
+            '      "metric": "ingest_rate",\n'
+            '      "severity": "p2",\n'
+            '      "expected": 22.5,\n'
+            '      "actual": 4,\n'
+            '      "message": "Orange: 4 rulings in 24h"\n'
+            "    }\n"
+            "  ]\n"
+            "}\n"
+            "Status: STOPPED\n"
+        )
+        result = extract_json_from_output(text)
+        assert result is not None
+        assert result["healthy"] is False
+        assert result["alert_count"] == 1
+        assert result["alerts"][0]["county"] == "Orange"
+
     def test_healthy_json(self) -> None:
         """Extract healthy JSON output."""
         data = json.dumps({"healthy": True, "alert_count": 0, "alerts": []})

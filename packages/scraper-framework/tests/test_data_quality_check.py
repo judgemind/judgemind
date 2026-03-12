@@ -303,8 +303,8 @@ class TestCheckScraperStaleness:
         assert len(alerts) == 0
 
     def test_stale_daily_scraper_alert(self) -> None:
-        """Alert when daily scraper hasn't run in >6 hours."""
-        stale_time = NOW - timedelta(hours=8)
+        """Alert when daily scraper hasn't run in >14 hours."""
+        stale_time = NOW - timedelta(hours=15)
         conn = FakeConnection(
             {
                 "scraper_runs": [("ca-la-tentatives-civil", "Los Angeles", stale_time, "success")],
@@ -335,7 +335,7 @@ class TestCheckScraperStaleness:
 
     def test_falls_back_to_captured_at(self) -> None:
         """Uses documents.captured_at when no scraper_runs exist."""
-        old_capture = NOW - timedelta(hours=10)
+        old_capture = NOW - timedelta(hours=15)
         conn = FakeConnection(
             {
                 "scraper_runs": [],  # No scraper_runs
@@ -349,7 +349,7 @@ class TestCheckScraperStaleness:
 
     def test_very_stale_is_p1(self) -> None:
         """Very stale scrapers (>4x threshold) get p1 severity."""
-        very_stale = NOW - timedelta(hours=25)
+        very_stale = NOW - timedelta(hours=57)
         conn = FakeConnection(
             {
                 "scraper_runs": [("ca-la-tentatives-civil", "Los Angeles", very_stale, "success")],
@@ -363,7 +363,7 @@ class TestCheckScraperStaleness:
 
     def test_moderately_stale_is_p2(self) -> None:
         """Moderately stale scrapers get p2 severity."""
-        stale = NOW - timedelta(hours=8)
+        stale = NOW - timedelta(hours=15)
         conn = FakeConnection(
             {
                 "scraper_runs": [("ca-la-tentatives-civil", "Los Angeles", stale, "success")],
@@ -441,7 +441,7 @@ class TestRunChecks:
 
     def test_run_checks_returns_alerts(self) -> None:
         """run_checks combines ingest rate and staleness alerts."""
-        old_time = NOW - timedelta(hours=10)
+        old_time = NOW - timedelta(hours=15)
         conn = FakeConnection(
             {
                 # "LEFT JOIN rulings" must come before "d.created_at >=" so
@@ -540,9 +540,9 @@ _STALE_ALERT = Alert(
     county="Santa Clara",
     metric="scraper_stale",
     severity="p1",
-    expected="<6h",
-    actual="25.0h",
-    message="Santa Clara: scraper stale for 25.0h (threshold: 6h, source: scraper_runs)",
+    expected="<14h",
+    actual="57.0h",
+    message="Santa Clara: scraper stale for 57.0h (threshold: 14h, source: scraper_runs)",
 )
 
 

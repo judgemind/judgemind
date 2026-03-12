@@ -72,7 +72,9 @@ DEFAULT_BASELINES_PATH = _REPO_ROOT / "data-quality-baselines.json"
 
 # Thresholds
 INGEST_DROP_THRESHOLD = 0.5  # Flag if below 50% of 7-day average
-DAILY_SCRAPER_STALE_HOURS = 6
+DAILY_SCRAPER_STALE_HOURS = (
+    14  # Must exceed the 12h poll interval to avoid false positives
+)
 FREQUENT_SCRAPER_STALE_HOURS = 2
 
 # Field completeness regression thresholds (percentage points below baseline).
