@@ -206,6 +206,7 @@ ensure_venv("scraper-framework")  # or "telegram-bridge", etc.
 
 - Set `_VENV_HELPER_SKIP=1` in tests or containers where deps are already available.
 - Eval scripts (`scripts/eval/`) are excluded from this convention.
+- **ECS oneshot constraint:** Scripts run via `ecs-run-task.sh` are uploaded as single files — they **cannot import other `.py` files from `scripts/`**. Only stdlib, installed packages, and `_venv_helper` (stubbed in-container) are available. If you need shared code, either inline it, use a lazy import inside a function (for optional features), or move the shared code into an installed package. CI enforces this via `scripts/check-oneshot-imports.sh`. Scripts that are never run as ECS oneshots can be added to the `LOCAL_ONLY` list in that script.
 
 ### TypeScript (API, frontend)
 
