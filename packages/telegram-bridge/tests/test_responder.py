@@ -1761,7 +1761,12 @@ class TestHtmlFormatting:
 
 
 class TestDefaultRateLimit:
-    """Tests verifying the rate limit default is 20 calls per 60 seconds."""
+    """Tests verifying rate limit defaults.
+
+    The module-level default limiter (used by interpret_message/Haiku) is
+    20 calls/60s.  The CLI default (used by the daemon, defaulting to Opus)
+    is 10 calls/60s to control cost.
+    """
 
     def test_module_default_rate_limiter(self) -> None:
         from telegram_bridge.interpreter import _default_rate_limiter
@@ -1770,16 +1775,14 @@ class TestDefaultRateLimit:
         assert _default_rate_limiter.window_seconds == 60.0
 
     def test_cli_default_rate_limit_calls(self) -> None:
-        """Verify the CLI default for --rate-limit-calls is 20."""
+        """Verify the CLI default for --rate-limit-calls is 10 (Opus cost safety)."""
         _import_responder()
-        # The argparse default is set in the source code; verify by
-        # inspecting the parser.
         import argparse
 
         parser = argparse.ArgumentParser()
-        parser.add_argument("--rate-limit-calls", type=int, default=20)
+        parser.add_argument("--rate-limit-calls", type=int, default=10)
         args = parser.parse_args([])
-        assert args.rate_limit_calls == 20
+        assert args.rate_limit_calls == 10
 
 
 # ── Interpreter system prompt ────────────────────────────────────────────
@@ -2182,6 +2185,165 @@ class TestFormatStaleAlert:
         assert "completed" in alert
         assert "#20" in alert
         assert "failed" in alert
+
+
+# ── Opus agent mode ────────────────────────────────────────────────────
+
+
+class TestOpusDispatch:
+    """Tests for dispatch_message in Opus agent mode."""
+
+    @respx.mock
+    @patch("tg_responder.interpret_message_with_tools")
+    def test_opus_mode_calls_tools_interpreter(self, mock_opus: MagicMock, tmp_path: Path) -> None:
+        from telegram_bridge.interpreter import InterpretedMessage
+
+        mock_opus.return_value = InterpretedMessage(
+            reply="The README describes Judgemind.",
+            actions=[],
+        )
+        route = respx.post("https://api.telegram.org/botfake-token/sendMessage").mock(
+            return_value=httpx.Response(200, json={"ok": True})
+        )
+
+        mod = _import_responder()
+        mod.dispatch_message(
+            message={"text": "What is this project?", "user_id": 12345},
+            bot_token="fake-token",
+            chat_ids=[12345],
+            state_file=str(tmp_path / "state.json"),
+            status_file=str(tmp_path / "status.json"),
+            agent_status_dir=str(tmp_path / "agent-status"),
+            stop_requests_file=str(tmp_path / "stop.json"),
+            inbox_file=str(tmp_path / "inbox.json"),
+            anthropic_api_key="test-key",
+            use_opus=True,
+            repo_root=tmp_path,
+        )
+
+        mock_opus.assert_called_once()
+        assert route.call_count == 1
+        body = json.loads(route.calls[0].request.content)
+        assert "Judgemind" in body["text"]
+
+    @respx.mock
+    @patch("tg_responder.interpret_message")
+    def test_haiku_mode_calls_basic_interpreter(
+        self, mock_haiku: MagicMock, tmp_path: Path
+    ) -> None:
+        from telegram_bridge.interpreter import InterpretedMessage
+
+        mock_haiku.return_value = InterpretedMessage(
+            reply="All good.",
+            actions=[],
+        )
+        route = respx.post("https://api.telegram.org/botfake-token/sendMessage").mock(
+            return_value=httpx.Response(200, json={"ok": True})
+        )
+
+        mod = _import_responder()
+        mod.dispatch_message(
+            message={"text": "status", "user_id": 12345},
+            bot_token="fake-token",
+            chat_ids=[12345],
+            state_file=str(tmp_path / "state.json"),
+            status_file=str(tmp_path / "status.json"),
+            agent_status_dir=str(tmp_path / "agent-status"),
+            stop_requests_file=str(tmp_path / "stop.json"),
+            inbox_file=str(tmp_path / "inbox.json"),
+            anthropic_api_key="test-key",
+            use_opus=False,
+        )
+
+        mock_haiku.assert_called_once()
+        assert route.call_count == 1
+
+    @respx.mock
+    @patch("tg_responder.interpret_message_with_tools")
+    def test_opus_actions_still_executed(self, mock_opus: MagicMock, tmp_path: Path) -> None:
+        """Opus mode still executes orchestrator actions (pause, etc.)."""
+        from telegram_bridge.interpreter import InterpretedMessage
+
+        mock_opus.return_value = InterpretedMessage(
+            reply="Pausing the orchestrator.",
+            actions=[{"type": "pause"}],
+        )
+        respx.post("https://api.telegram.org/botfake-token/sendMessage").mock(
+            return_value=httpx.Response(200, json={"ok": True})
+        )
+
+        state_file = tmp_path / "state.json"
+        state_file.write_text(json.dumps({"paused": False, "workers": {}}))
+
+        mod = _import_responder()
+        mod.dispatch_message(
+            message={"text": "pause", "user_id": 12345},
+            bot_token="fake-token",
+            chat_ids=[12345],
+            state_file=str(state_file),
+            status_file=str(tmp_path / "status.json"),
+            agent_status_dir=str(tmp_path / "agent-status"),
+            stop_requests_file=str(tmp_path / "stop.json"),
+            inbox_file=str(tmp_path / "inbox.json"),
+            anthropic_api_key="test-key",
+            use_opus=True,
+            repo_root=tmp_path,
+        )
+
+        data = json.loads(state_file.read_text())
+        assert data["paused"] is True
+
+    @respx.mock
+    @patch("tg_responder.interpret_message")
+    def test_opus_false_with_no_repo_root_falls_back_to_haiku(
+        self, mock_haiku: MagicMock, tmp_path: Path
+    ) -> None:
+        """When use_opus=True but repo_root is None, falls back to Haiku."""
+        from telegram_bridge.interpreter import InterpretedMessage
+
+        mock_haiku.return_value = InterpretedMessage(
+            reply="Fallback reply.",
+            actions=[],
+        )
+        respx.post("https://api.telegram.org/botfake-token/sendMessage").mock(
+            return_value=httpx.Response(200, json={"ok": True})
+        )
+
+        mod = _import_responder()
+        mod.dispatch_message(
+            message={"text": "hello", "user_id": 12345},
+            bot_token="fake-token",
+            chat_ids=[12345],
+            state_file=str(tmp_path / "state.json"),
+            status_file=str(tmp_path / "status.json"),
+            agent_status_dir=str(tmp_path / "agent-status"),
+            stop_requests_file=str(tmp_path / "stop.json"),
+            inbox_file=str(tmp_path / "inbox.json"),
+            anthropic_api_key="test-key",
+            use_opus=True,
+            repo_root=None,
+        )
+
+        # Falls back to basic interpreter when repo_root is None.
+        mock_haiku.assert_called_once()
+
+    def test_cli_parser_has_model_arg(self) -> None:
+        """Verify the --model argument is recognized by the CLI parser."""
+        import argparse
+
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--model", choices=["opus", "haiku"], default="opus")
+        args = parser.parse_args(["--model", "haiku"])
+        assert args.model == "haiku"
+
+    def test_cli_model_default_is_opus(self) -> None:
+        """Verify the --model default is opus."""
+        import argparse
+
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--model", choices=["opus", "haiku"], default="opus")
+        args = parser.parse_args([])
+        assert args.model == "opus"
 
 
 # ── Old daemon removed ──────────────────────────────────────────────────

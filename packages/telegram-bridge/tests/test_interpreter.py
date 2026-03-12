@@ -4,14 +4,18 @@ from __future__ import annotations
 
 import json
 import time
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from telegram_bridge.interpreter import (
+    _OPUS_MAX_TOKENS,
+    _OPUS_SYSTEM_PROMPT,
     _SYSTEM_PROMPT,
     ALLOWED_PRIORITIES,
     KNOWN_ACTION_TYPES,
+    OPUS_MODEL,
     InterpretedMessage,
     RateLimiter,
     RateLimitError,
@@ -22,6 +26,7 @@ from telegram_bridge.interpreter import (
     clear_client_cache,
     get_client,
     interpret_message,
+    interpret_message_with_tools,
 )
 
 # ── _parse_response() ───────────────────────────────────────────────────
@@ -809,3 +814,362 @@ class TestParseResponseSchemaValidation:
         """Verify the KNOWN_ACTION_TYPES set matches expected types."""
         expected = {"start", "stop", "pause", "resume", "file_issue", "discuss", "do"}
         assert KNOWN_ACTION_TYPES == expected
+
+
+# ── Opus interpreter constants ─────────────────────────────────────────
+
+
+class TestOpusConstants:
+    def test_opus_model_is_opus(self) -> None:
+        assert "opus" in OPUS_MODEL.lower()
+
+    def test_opus_max_tokens_is_larger(self) -> None:
+        assert _OPUS_MAX_TOKENS >= 2048
+
+    def test_opus_system_prompt_has_tool_instructions(self) -> None:
+        assert "read-only" in _OPUS_SYSTEM_PROMPT.lower() or "Read" in _OPUS_SYSTEM_PROMPT
+        assert "tool" in _OPUS_SYSTEM_PROMPT.lower()
+
+    def test_opus_system_prompt_has_action_format(self) -> None:
+        """The Opus prompt should still describe the action JSON format."""
+        assert '"actions"' in _OPUS_SYSTEM_PROMPT
+        assert "start" in _OPUS_SYSTEM_PROMPT
+        assert "pause" in _OPUS_SYSTEM_PROMPT
+
+    def test_opus_system_prompt_has_formatting_rules(self) -> None:
+        assert "plain text" in _OPUS_SYSTEM_PROMPT.lower()
+
+
+# ── interpret_message_with_tools() ─────────────────────────────────────
+
+
+def _make_tool_use_block(tool_id: str, name: str, tool_input: dict[str, object]) -> MagicMock:
+    """Create a mock tool_use content block."""
+    block = MagicMock()
+    block.type = "tool_use"
+    block.id = tool_id
+    block.name = name
+    block.input = tool_input
+    return block
+
+
+def _make_text_block(text: str) -> MagicMock:
+    """Create a mock text content block."""
+    block = MagicMock()
+    block.type = "text"
+    block.text = text
+    return block
+
+
+class TestInterpretMessageWithTools:
+    @patch("telegram_bridge.interpreter.anthropic.Anthropic")
+    def test_simple_reply_no_tools(self, mock_cls: MagicMock, tmp_path: Path) -> None:
+        """Opus agent can answer without using any tools."""
+        mock_client = MagicMock()
+        mock_cls.return_value = mock_client
+
+        # Response that ends immediately (no tool use).
+        response = MagicMock()
+        response.stop_reason = "end_turn"
+        response.content = [
+            _make_text_block(
+                json.dumps({"reply": "The project is a legal research platform.", "actions": []})
+            )
+        ]
+        mock_client.messages.create.return_value = response
+
+        result = interpret_message_with_tools(
+            text="What is this project?",
+            repo_root=tmp_path,
+            api_key="test-key",
+            rate_limiter=None,
+        )
+
+        assert isinstance(result, InterpretedMessage)
+        assert "legal research" in result.reply.lower()
+        assert result.actions == []
+        mock_client.messages.create.assert_called_once()
+
+    @patch("telegram_bridge.interpreter.anthropic.Anthropic")
+    def test_tool_use_then_answer(self, mock_cls: MagicMock, tmp_path: Path) -> None:
+        """Opus agent uses a tool then provides a final answer."""
+        mock_client = MagicMock()
+        mock_cls.return_value = mock_client
+
+        # Create a test file for the tool to read.
+        (tmp_path / "README.md").write_text("# Judgemind\nA legal research platform.\n")
+
+        # First response: tool use.
+        tool_response = MagicMock()
+        tool_response.stop_reason = "tool_use"
+        tool_response.content = [_make_tool_use_block("call_1", "read_file", {"path": "README.md"})]
+
+        # Second response: final answer.
+        final_response = MagicMock()
+        final_response.stop_reason = "end_turn"
+        final_response.content = [
+            _make_text_block(
+                json.dumps(
+                    {
+                        "reply": "The README says Judgemind is a legal research platform.",
+                        "actions": [],
+                    }
+                )
+            )
+        ]
+
+        mock_client.messages.create.side_effect = [tool_response, final_response]
+
+        result = interpret_message_with_tools(
+            text="What does the README say?",
+            repo_root=tmp_path,
+            api_key="test-key",
+            rate_limiter=None,
+        )
+
+        assert "legal research" in result.reply.lower()
+        assert result.actions == []
+        # Two API calls: one for tool use, one for final answer.
+        assert mock_client.messages.create.call_count == 2
+
+    @patch("telegram_bridge.interpreter.anthropic.Anthropic")
+    def test_tool_results_passed_back(self, mock_cls: MagicMock, tmp_path: Path) -> None:
+        """Verify tool results are correctly passed back in the conversation."""
+        mock_client = MagicMock()
+        mock_cls.return_value = mock_client
+
+        (tmp_path / "test.py").write_text("def hello(): pass\n")
+
+        tool_response = MagicMock()
+        tool_response.stop_reason = "tool_use"
+        tool_response.content = [_make_tool_use_block("call_1", "read_file", {"path": "test.py"})]
+
+        final_response = MagicMock()
+        final_response.stop_reason = "end_turn"
+        final_response.content = [
+            _make_text_block(json.dumps({"reply": "Found hello function.", "actions": []}))
+        ]
+
+        mock_client.messages.create.side_effect = [tool_response, final_response]
+
+        interpret_message_with_tools(
+            text="show test.py",
+            repo_root=tmp_path,
+            api_key="test-key",
+            rate_limiter=None,
+        )
+
+        # Check the second call includes tool results.
+        second_call = mock_client.messages.create.call_args_list[1]
+        messages = second_call.kwargs["messages"]
+        # Should be: user, assistant (tool use), user (tool result)
+        assert len(messages) == 3
+        assert messages[2]["role"] == "user"
+        # Tool result should contain the file content.
+        tool_result_content = messages[2]["content"]
+        assert len(tool_result_content) == 1
+        assert tool_result_content[0]["type"] == "tool_result"
+        assert "hello" in tool_result_content[0]["content"]
+
+    @patch("telegram_bridge.interpreter.anthropic.Anthropic")
+    def test_actions_still_forwarded(self, mock_cls: MagicMock, tmp_path: Path) -> None:
+        """Opus agent can still return orchestrator actions."""
+        mock_client = MagicMock()
+        mock_cls.return_value = mock_client
+
+        response = MagicMock()
+        response.stop_reason = "end_turn"
+        response.content = [
+            _make_text_block(
+                json.dumps(
+                    {
+                        "reply": "Pausing the orchestrator.",
+                        "actions": [{"type": "pause"}],
+                    }
+                )
+            )
+        ]
+        mock_client.messages.create.return_value = response
+
+        result = interpret_message_with_tools(
+            text="pause",
+            repo_root=tmp_path,
+            api_key="test-key",
+            rate_limiter=None,
+        )
+
+        assert len(result.actions) == 1
+        assert result.actions[0]["type"] == "pause"
+
+    @patch("telegram_bridge.interpreter.anthropic.Anthropic")
+    def test_rate_limiter_applied(self, mock_cls: MagicMock, tmp_path: Path) -> None:
+        """Rate limiter blocks excessive calls."""
+        mock_client = MagicMock()
+        mock_cls.return_value = mock_client
+
+        response = MagicMock()
+        response.stop_reason = "end_turn"
+        response.content = [_make_text_block(json.dumps({"reply": "ok", "actions": []}))]
+        mock_client.messages.create.return_value = response
+
+        limiter = RateLimiter(max_calls=1, window_seconds=60.0)
+
+        interpret_message_with_tools(
+            text="hi",
+            repo_root=tmp_path,
+            api_key="test-key",
+            rate_limiter=limiter,
+        )
+
+        with pytest.raises(RateLimitError):
+            interpret_message_with_tools(
+                text="hi again",
+                repo_root=tmp_path,
+                api_key="test-key",
+                rate_limiter=limiter,
+            )
+
+    @patch("telegram_bridge.interpreter.anthropic.Anthropic")
+    def test_prompt_caching_enabled(self, mock_cls: MagicMock, tmp_path: Path) -> None:
+        """System prompt uses cache_control for prompt caching."""
+        mock_client = MagicMock()
+        mock_cls.return_value = mock_client
+
+        response = MagicMock()
+        response.stop_reason = "end_turn"
+        response.content = [_make_text_block(json.dumps({"reply": "ok", "actions": []}))]
+        mock_client.messages.create.return_value = response
+
+        interpret_message_with_tools(
+            text="hi",
+            repo_root=tmp_path,
+            api_key="test-key",
+            rate_limiter=None,
+        )
+
+        call_args = mock_client.messages.create.call_args
+        system_blocks = call_args.kwargs["system"]
+        assert isinstance(system_blocks, list)
+        assert len(system_blocks) >= 1
+        assert system_blocks[0]["cache_control"] == {"type": "ephemeral"}
+
+    @patch("telegram_bridge.interpreter.anthropic.Anthropic")
+    def test_tools_passed_to_api(self, mock_cls: MagicMock, tmp_path: Path) -> None:
+        """Tool definitions are passed to the API call."""
+        mock_client = MagicMock()
+        mock_cls.return_value = mock_client
+
+        response = MagicMock()
+        response.stop_reason = "end_turn"
+        response.content = [_make_text_block(json.dumps({"reply": "ok", "actions": []}))]
+        mock_client.messages.create.return_value = response
+
+        interpret_message_with_tools(
+            text="hi",
+            repo_root=tmp_path,
+            api_key="test-key",
+            rate_limiter=None,
+        )
+
+        call_args = mock_client.messages.create.call_args
+        tools = call_args.kwargs["tools"]
+        assert isinstance(tools, list)
+        tool_names = {t["name"] for t in tools}
+        assert "read_file" in tool_names
+        assert "grep_files" in tool_names
+        assert "run_shell_command" in tool_names
+
+    @patch("telegram_bridge.interpreter.anthropic.Anthropic")
+    def test_max_tool_rounds_respected(self, mock_cls: MagicMock, tmp_path: Path) -> None:
+        """Agent stops after max_tool_rounds even if model keeps calling tools."""
+        mock_client = MagicMock()
+        mock_cls.return_value = mock_client
+
+        # Every response is a tool use — should stop after max rounds.
+        tool_response = MagicMock()
+        tool_response.stop_reason = "tool_use"
+        tool_response.content = [_make_tool_use_block("call_x", "read_file", {"path": "nope.txt"})]
+
+        # After max rounds, the last response is used as-is.
+        # Since it has no text, we get a fallback.
+        mock_client.messages.create.return_value = tool_response
+
+        result = interpret_message_with_tools(
+            text="loop forever",
+            repo_root=tmp_path,
+            api_key="test-key",
+            rate_limiter=None,
+            max_tool_rounds=3,
+        )
+
+        # Should have called the API 3 times (max rounds).
+        assert mock_client.messages.create.call_count == 3
+        # Should get a fallback reply since no text block was produced.
+        assert "couldn't formulate" in result.reply.lower() or "noted" in result.reply.lower()
+
+    @patch("telegram_bridge.interpreter.anthropic.Anthropic")
+    def test_uses_opus_model_by_default(self, mock_cls: MagicMock, tmp_path: Path) -> None:
+        """Default model is Opus."""
+        mock_client = MagicMock()
+        mock_cls.return_value = mock_client
+
+        response = MagicMock()
+        response.stop_reason = "end_turn"
+        response.content = [_make_text_block(json.dumps({"reply": "ok", "actions": []}))]
+        mock_client.messages.create.return_value = response
+
+        interpret_message_with_tools(
+            text="hi",
+            repo_root=tmp_path,
+            api_key="test-key",
+            rate_limiter=None,
+        )
+
+        call_args = mock_client.messages.create.call_args
+        assert "opus" in call_args.kwargs["model"].lower()
+
+    @patch("telegram_bridge.interpreter.anthropic.Anthropic")
+    def test_orchestrator_status_in_user_message(self, mock_cls: MagicMock, tmp_path: Path) -> None:
+        """Orchestrator status is included in the user message."""
+        mock_client = MagicMock()
+        mock_cls.return_value = mock_client
+
+        response = MagicMock()
+        response.stop_reason = "end_turn"
+        response.content = [_make_text_block(json.dumps({"reply": "2 agents.", "actions": []}))]
+        mock_client.messages.create.return_value = response
+
+        status = build_orchestrator_status(active_agents=[{"worker": 1}, {"worker": 2}])
+
+        interpret_message_with_tools(
+            text="how many agents?",
+            repo_root=tmp_path,
+            orchestrator_status=status,
+            api_key="test-key",
+            rate_limiter=None,
+        )
+
+        call_args = mock_client.messages.create.call_args
+        user_msg = call_args.kwargs["messages"][0]["content"]
+        assert "Orchestrator Status" in user_msg
+
+    @patch("telegram_bridge.interpreter.anthropic.Anthropic")
+    def test_no_text_in_response_gives_fallback(self, mock_cls: MagicMock, tmp_path: Path) -> None:
+        """If no text block in response, return a fallback message."""
+        mock_client = MagicMock()
+        mock_cls.return_value = mock_client
+
+        response = MagicMock()
+        response.stop_reason = "end_turn"
+        response.content = []  # No content blocks at all.
+        mock_client.messages.create.return_value = response
+
+        result = interpret_message_with_tools(
+            text="hello",
+            repo_root=tmp_path,
+            api_key="test-key",
+            rate_limiter=None,
+        )
+
+        assert "couldn't formulate" in result.reply.lower() or "noted" in result.reply.lower()
+        assert result.actions == []
