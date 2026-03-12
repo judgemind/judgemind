@@ -37,5 +37,98 @@
       "schedule_type": "daily"
     }
   },
-  "field_completeness": {}
+  "field_completeness": {
+    "_updated": "2026-03-12",
+    "_note": "Baselines after reingest with OC/Riverside case number extraction fixes (#804, #805)",
+    "Los Angeles": {
+      "total_documents": 748,
+      "ruling": 100.0,
+      "judge": 38.4,
+      "motion_type": 99.6,
+      "outcome": 99.9,
+      "case_title": 96.9,
+      "case_number": 99.3,
+      "parties": 96.1,
+      "hearing_date": 100.0,
+      "case_type": 99.9
+    },
+    "Orange": {
+      "total_documents": 135,
+      "ruling": 100.0,
+      "judge": 100.0,
+      "motion_type": 100.0,
+      "outcome": 100.0,
+      "case_title": 100.0,
+      "case_number": 84.4,
+      "parties": 100.0,
+      "hearing_date": 100.0,
+      "case_type": 97.0,
+      "_known_gaps": {
+        "case_number": "21 UNKNOWN cases from OC North JC PDFs that structurally lack case numbers"
+      }
+    },
+    "Riverside": {
+      "total_documents": 66,
+      "ruling": 100.0,
+      "judge": 57.6,
+      "motion_type": 97.0,
+      "outcome": 98.5,
+      "case_title": 97.0,
+      "case_number": 97.0,
+      "parties": 97.0,
+      "hearing_date": 100.0,
+      "case_type": 97.0,
+      "_known_gaps": {
+        "case_number": "2 UNKNOWN cases, likely truncated or unusual format PDFs"
+      }
+    },
+    "San Bernardino": {
+      "total_documents": 173,
+      "ruling": 100.0,
+      "judge": 100.0,
+      "motion_type": 100.0,
+      "outcome": 100.0,
+      "case_title": 100.0,
+      "case_number": 100.0,
+      "parties": 100.0,
+      "hearing_date": 100.0,
+      "case_type": 100.0
+    },
+    "San Francisco": {
+      "total_documents": 39,
+      "ruling": 100.0,
+      "judge": 100.0,
+      "motion_type": 100.0,
+      "outcome": 100.0,
+      "case_title": 100.0,
+      "case_number": 100.0,
+      "parties": 100.0,
+      "hearing_date": 100.0,
+      "case_type": 100.0
+    },
+    "Santa Clara": {
+      "total_documents": 2,
+      "ruling": 100.0,
+      "judge": 100.0,
+      "motion_type": 100.0,
+      "outcome": 100.0,
+      "case_title": 100.0,
+      "case_number": 50.0,
+      "parties": 100.0,
+      "hearing_date": 100.0,
+      "case_type": 100.0
+    },
+    "Ventura": {
+      "total_documents": 13,
+      "ruling": 100.0,
+      "judge": 0.0,
+      "motion_type": 100.0,
+      "outcome": 100.0,
+      "case_title": 100.0,
+      "case_number": 100.0,
+      "parties": 46.2,
+      "hearing_date": 100.0,
+      "case_type": 100.0
+    }
+  }
 }
