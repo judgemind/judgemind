@@ -171,7 +171,8 @@ CREATE TABLE case_attorneys (
     role        TEXT    NOT NULL,    -- 'plaintiff_counsel', 'defense_counsel', 'amicus', etc.
     party_id    UUID    REFERENCES parties(id),   -- Which party they represent
     appeared_at DATE,
-    withdrew_at DATE
+    withdrew_at DATE,
+    UNIQUE (case_id, attorney_id, role)
 );
 
 -- Which parties appear in a case and in what role
