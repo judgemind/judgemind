@@ -10,7 +10,8 @@
     },
     "Santa Clara": {
       "expected_daily_rulings": 10,
-      "schedule_type": "daily"
+      "schedule_type": "daily",
+      "posting_days": ["Mon", "Tue", "Wed", "Thu"]
     },
     "San Francisco": {
       "expected_daily_rulings": 5,
