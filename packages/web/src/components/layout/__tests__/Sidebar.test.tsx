@@ -25,9 +25,11 @@ describe('Sidebar', () => {
     expect(screen.getByText('Explore')).toBeInTheDocument();
   });
 
-  it('renders the Research section heading', () => {
+  it('does not render the Research section (cases/judges pages not yet built)', () => {
     render(<Sidebar />);
-    expect(screen.getByText('Research')).toBeInTheDocument();
+    expect(screen.queryByText('Research')).not.toBeInTheDocument();
+    expect(screen.queryByText('Cases')).not.toBeInTheDocument();
+    expect(screen.queryByText('Judges')).not.toBeInTheDocument();
   });
 
   it('renders navigation links with correct hrefs', () => {
@@ -38,11 +40,5 @@ describe('Sidebar', () => {
 
     const rulingsLink = screen.getByText('Latest Rulings');
     expect(rulingsLink.closest('a')).toHaveAttribute('href', '/rulings');
-
-    const casesLink = screen.getByText('Cases');
-    expect(casesLink.closest('a')).toHaveAttribute('href', '/cases');
-
-    const judgesLink = screen.getByText('Judges');
-    expect(judgesLink.closest('a')).toHaveAttribute('href', '/judges');
   });
 });
