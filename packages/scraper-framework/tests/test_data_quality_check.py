@@ -1328,7 +1328,7 @@ class TestCollectFullMetrics:
                 # RULING_COUNTS_24H_QUERY (generic "ruling_count" matches this)
                 "AS ruling_count": [("Los Angeles", 42)],
                 # RULING_COUNT_BY_TYPE_QUERY
-                "d.doc_type": [
+                "d.document_type": [
                     ("Los Angeles", "tentative_ruling", 30),
                     ("Los Angeles", "minute_order", 12),
                 ],
@@ -1357,7 +1357,7 @@ class TestCollectFullMetrics:
                 "created_at < %s": [("Orange", 120)],
                 # 24h query matches via "AS ruling_count"
                 "AS ruling_count": [],
-                "d.doc_type": [],
+                "d.document_type": [],
                 "has_ruling": [],
                 "r.judge_id IS NULL": [],
                 "ranked_runs": [],
@@ -1376,7 +1376,7 @@ class TestCollectFullMetrics:
             {
                 "created_at < %s": [],
                 "AS ruling_count": [],
-                "d.doc_type": [],
+                "d.document_type": [],
                 "has_ruling": [
                     _make_field_completeness_row(
                         "Los Angeles",
@@ -1418,7 +1418,7 @@ class TestCollectFullMetrics:
             {
                 "created_at < %s": [],
                 "AS ruling_count": [],
-                "d.doc_type": [],
+                "d.document_type": [],
                 "has_ruling": [],
                 "r.judge_id IS NULL": [],
                 "ranked_runs": [("ca-la-tentative", "Los Angeles", two_hours_ago, "success")],
@@ -1435,7 +1435,7 @@ class TestCollectFullMetrics:
             {
                 "created_at < %s": [],
                 "AS ruling_count": [],
-                "d.doc_type": [],
+                "d.document_type": [],
                 "has_ruling": [],
                 "r.judge_id IS NULL": [],
                 "ranked_runs": [],
@@ -1465,7 +1465,7 @@ class TestCollectFullMetrics:
             {
                 "created_at < %s": [],
                 "AS ruling_count": [],
-                "d.doc_type": [],
+                "d.document_type": [],
                 "has_ruling": [],
                 "r.judge_id IS NULL": [],
                 "ranked_runs": [],
@@ -1483,7 +1483,7 @@ class TestCollectFullMetrics:
             {
                 "created_at < %s": [],
                 "AS ruling_count": [("Los Angeles", 40), ("Orange", 15)],
-                "d.doc_type": [],
+                "d.document_type": [],
                 "has_ruling": [],
                 "r.judge_id IS NULL": [],
                 "ranked_runs": [],
@@ -1502,7 +1502,7 @@ class TestCollectFullMetrics:
             {
                 "created_at < %s": [],
                 "AS ruling_count": [],
-                "d.doc_type": [],
+                "d.document_type": [],
                 "has_ruling": [
                     _make_field_completeness_row("Los Angeles", total=100, judge=90),
                 ],
@@ -1689,7 +1689,7 @@ class TestPersistMetrics:
             {
                 "created_at < %s": [("TestCounty", 210)],
                 "AS ruling_count": [("TestCounty", 50)],
-                "d.doc_type": [("TestCounty", "ruling", 50)],
+                "d.document_type": [("TestCounty", "ruling", 50)],
                 "has_ruling": [
                     _make_field_completeness_row(
                         "TestCounty",
