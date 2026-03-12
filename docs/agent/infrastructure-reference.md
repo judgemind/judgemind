@@ -44,11 +44,18 @@ There is **no GitHub Actions deploy workflow** for the web frontend — Vercel h
 
 ### Terraform apply after merge
 
-After a Terraform PR merges to main, the subagent that authored the PR must apply to dev:
+**Dev apply is automated by the orchestrator.** When the orchestrator merges a PR that touches `infra/terraform/`, it automatically runs `terraform apply` for the dev environment. The orchestrator detects infra PRs by checking changed file paths, determines which environments need an apply, and handles init/plan/apply inline. See `.claude/skills/orchestrator/SKILL.md` "Auto-apply dev terraform" for the full procedure.
+
+**If the orchestrator is not running** (e.g., during interactive sessions), the subagent that authored the PR must apply to dev manually:
 ```
 terraform -chdir=$REPO_ROOT/infra/terraform/environments/dev apply -target=module.<module_name> -auto-approve
 ```
 Verify the apply succeeds. If it fails, file a `priority/p1` issue.
+
+**For DNS/hosting environments** that require the Cloudflare API token:
+```
+scripts/with-secret.sh -e CLOUDFLARE_API_TOKEN=judgemind/cloudflare/api-token -- terraform -chdir=infra/terraform/environments/dns apply -auto-approve
+```
 
 **Important:** The root `infra/terraform/` directory does not track deployed resources. Each environment has its own state backend under `infra/terraform/environments/<env>/`. Running apply from the root creates duplicate resources that collide with the real ones. Always use the environment-specific path. Production applies (`environments/production/`) are human-only. **The PreToolUse hook (`preflight-bash.sh`) blocks `terraform apply` and `terraform destroy` commands that target the root path.** The `preflight_tf_not_root` function in `scripts/preflight.sh` provides the same check for scripts.
 

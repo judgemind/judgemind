@@ -159,7 +159,7 @@ In the main loop (step 2), call `bridge.read_orchestrator_inbox()` which returns
 | Action | How to handle |
 |---|---|
 | `restart_responder` | Run `scripts/tg-stop-responder.sh`, reinstall telegram-bridge deps, restart `scripts/tg-responder.py` |
-| `terraform_apply` | Run `terraform -chdir=infra/terraform/environments/dev apply -target=module.<module> -auto-approve` |
+| `terraform_apply` | Run dev terraform apply for the specified module (see "Auto-apply dev terraform" below) |
 | `notify` | Send a Telegram notification via `scripts/tg-notify.py notify "<message>"` |
 | `run_script` | Execute the specified script (validate it starts with `scripts/` for safety) |
 | `file_issue` | Create a GitHub issue with `gh issue create` using the provided title, description, priority, and labels |
@@ -208,7 +208,7 @@ After merging:
 - Check if the merged PR triggers a deploy workflow (see CLAUDE.md "Verify deployment")
 - For deployed services, watch the deploy workflow to completion
 - **If PR touches `packages/telegram-bridge/` or `scripts/tg-responder.py`** — restart the responder daemon (see "Auto-restart responder daemon" below)
-- **If PR touches `infra/terraform/`** — run `terraform apply` for dev (see #900)
+- **If PR touches `infra/terraform/`** — run dev terraform apply (see "Auto-apply dev terraform" below)
 - **Increment `prs_since_last_audit`** and persist it to `tmp/orchestrator_status.json`. When the counter reaches 20, the next main loop iteration will trigger an audit (see "Periodic Audit" below).
 
 **Do not merge PRs from external contributors or PRs you did not create** unless the user explicitly asks.
@@ -245,6 +245,91 @@ When a merged PR modifies the responder code (`packages/telegram-bridge/` or `sc
 5. Send Telegram notification: "Responder daemon restarted after PR #N merged"
 
 If the restart fails, file a p1 issue and notify via Telegram.
+
+### Auto-apply dev terraform
+
+When a merged PR touches files under `infra/terraform/`, the orchestrator automatically applies the changes to the **dev environment only**. Production applies remain human-only. This runs inline in the orchestrator (not delegated to a subagent) because it is a short, well-defined operation.
+
+This same logic also handles `terraform_apply` instructions from the subagent instruction channel (when a subagent requests a targeted module apply via `scripts/orchestrator-request.py terraform_apply`).
+
+#### Detecting infra PRs
+
+After merging a PR, check whether any changed files match `infra/terraform/**`. Use the PR's file list:
+
+```
+gh pr view <N> --repo judgemind/judgemind --json files --jq '.files[].path'
+```
+
+If any path starts with `infra/terraform/`, proceed with the apply.
+
+#### Determining which environments to apply
+
+Inspect the changed file paths to decide which environment directories need an apply:
+
+| Changed path pattern | Environment to apply |
+|---|---|
+| `infra/terraform/environments/dev/` | `environments/dev` |
+| `infra/terraform/environments/dns/` | `environments/dns` (requires Cloudflare secret) |
+| `infra/terraform/environments/hosting/` | `environments/hosting` (requires Cloudflare secret) |
+| `infra/terraform/environments/staging/` | `environments/staging` |
+| `infra/terraform/environments/production/` | **Skip** — production is human-only |
+| `infra/terraform/modules/` or root `infra/terraform/*.tf` | `environments/dev` (modules are consumed by environments) |
+
+If a subagent `terraform_apply` instruction specifies a `--module`, use `-target=module.<module>` to scope the apply to just that module.
+
+#### Apply procedure
+
+For each environment that needs an apply:
+
+1. **Init the environment:**
+   ```
+   terraform -chdir=infra/terraform/environments/dev init
+   ```
+
+2. **Run plan first** to verify expected changes:
+   ```
+   terraform -chdir=infra/terraform/environments/dev plan -no-color
+   ```
+
+3. **Apply with auto-approve:**
+   ```
+   terraform -chdir=infra/terraform/environments/dev apply -auto-approve
+   ```
+
+4. **For DNS/hosting environments** that need the Cloudflare API token, use secret injection:
+   ```
+   scripts/with-secret.sh -e CLOUDFLARE_API_TOKEN=judgemind/cloudflare/api-token -- terraform -chdir=infra/terraform/environments/dns apply -auto-approve
+   ```
+
+5. **For targeted module applies** (from subagent instructions):
+   ```
+   terraform -chdir=infra/terraform/environments/dev apply -target=module.<module_name> -auto-approve
+   ```
+
+#### Success handling
+
+After a successful apply:
+- Send a Telegram notification with the environment and a brief summary:
+  ```
+  scripts/tg-notify.py notify "Terraform apply succeeded for dev after PR #<N> merged"
+  ```
+
+#### Failure handling
+
+If the apply fails:
+1. Send a Telegram notification immediately:
+   ```
+   scripts/tg-notify.py notify "Terraform apply FAILED for dev after PR #<N> — filing p1 issue"
+   ```
+2. File a `priority/p1` issue describing the failure, referencing the merged PR, with `agent/ready` label so an agent can investigate.
+3. Do not retry automatically — the filed issue will be picked up by an agent.
+
+#### Safety constraints
+
+- **Never apply to `environments/production/`** — production is human-only, always.
+- **Never apply from the root `infra/terraform/` directory** — this creates duplicate resources. Always use environment-specific paths. The preflight hook enforces this.
+- **Always run from the main repo checkout** (not a worktree) after pulling latest main.
+- **Terraform apply can acquire state locks** — if a lock conflict occurs, wait briefly and retry once. If it fails again, file a p1 issue.
 
 ---
 
@@ -341,6 +426,7 @@ Send a notification for **every** lifecycle event:
 - [ ] **Agent failed** — when `<task-notification>` reports failure (include issue number, error, worker number)
 - [ ] **PR merged** — after each `gh pr merge` (include PR number and title)
 - [ ] **Deploy succeeded/failed** — after watching deploy workflow
+- [ ] **Terraform apply succeeded/failed** — after applying dev terraform for infra PRs
 - [ ] **Blocker encountered** — when an issue needs human decision
 - [ ] **Audit triggered** — when `/audit` is spawned (include PR count since last audit)
 - [ ] **Session ended** — at orchestrator shutdown
@@ -414,7 +500,7 @@ The orchestrator must stay responsive to user interaction and Telegram commands 
 
 - **Never do long-running work in the main agent — delegate to subagents.** "Long-running" means anything that might take more than ~10 seconds: code changes, investigations, deep codebase exploration, issue body rewrites, running tests, large file analysis, or multi-step research.
 - **The orchestrator's job is: read messages, make quick decisions, dispatch work, send updates.** It is a dispatcher, not an implementer.
-- **Allowed in the main agent:** `gh` CLI calls, quick file reads, Telegram sends, short status checks, writing issue comments, updating labels, spawning subagents.
+- **Allowed in the main agent:** `gh` CLI calls, quick file reads, Telegram sends, short status checks, writing issue comments, updating labels, spawning subagents, terraform apply for dev environments.
 - **Everything else = spawn a subagent.** If you are unsure whether something is "quick enough," it is not — delegate it.
 - **Never block on a single long operation.** If a `gh run watch` or similar command could take minutes, run it in a way that does not prevent processing other events in the main loop. Prefer polling with short timeouts over blocking waits.
 
@@ -423,7 +509,7 @@ The orchestrator must stay responsive to user interaction and Telegram commands 
 The orchestrator MUST NOT make any code changes on `main` itself. All code changes must be delegated to `/task` subagents working in worktrees.
 
 - **Prohibited (code changes):** editing source files, modifying configs, writing scripts, updating documentation content, changing Terraform, or any operation that results in a `git commit` on the orchestrator's checkout. If it would show up in `git diff`, delegate it to a `/task` subagent.
-- **Allowed (non-code operations):** `gh` CLI calls (issue comments, label changes, PR merges, issue creation/editing), reading files for decision-making, writing to `tmp/`, sending Telegram messages, running `git fetch`/`git pull`. These do not modify committed code and are safe to run inline.
+- **Allowed (non-code operations):** `gh` CLI calls (issue comments, label changes, PR merges, issue creation/editing), reading files for decision-making, writing to `tmp/`, sending Telegram messages, running `git fetch`/`git pull`, running `terraform apply` for dev environments (applying already-merged code, not changing it). These do not modify committed code and are safe to run inline.
 
 If you catch yourself about to edit a file or stage a commit from the orchestrator agent, **stop and spawn a `/task` subagent instead.**
 
