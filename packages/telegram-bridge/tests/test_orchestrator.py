@@ -1143,6 +1143,7 @@ class TestWriteStatus:
             assert data["queue"] == []
             assert data["paused"] is False
             assert data["stopped_issues"] == []
+            assert data["prs_since_last_audit"] == 0
             assert "updated_at" in data
 
     @respx.mock
@@ -1288,6 +1289,44 @@ class TestWriteStatus:
 
             data = json.loads(Path(status_file).read_text())
             assert sorted(data["stopped_issues"]) == [99, 101]
+
+    def test_write_status_includes_prs_since_last_audit(self, tmp_path: Path) -> None:
+        """write_status() includes the prs_since_last_audit counter."""
+        with mock_aws():
+            status_file = str(tmp_path / "status.json")
+            bridge = _make_bridge()
+            orch = OrchestratorBridge(bridge=bridge, status_file=status_file)
+            orch.prs_since_last_audit = 15
+            orch.write_status()
+
+            data = json.loads(Path(status_file).read_text())
+            assert data["prs_since_last_audit"] == 15
+
+    def test_write_status_prs_since_last_audit_defaults_to_zero(self, tmp_path: Path) -> None:
+        """write_status() defaults prs_since_last_audit to 0."""
+        with mock_aws():
+            status_file = str(tmp_path / "status.json")
+            bridge = _make_bridge()
+            orch = OrchestratorBridge(bridge=bridge, status_file=status_file)
+            orch.write_status()
+
+            data = json.loads(Path(status_file).read_text())
+            assert data["prs_since_last_audit"] == 0
+
+    def test_prs_since_last_audit_persisted_across_sessions(self, tmp_path: Path) -> None:
+        """prs_since_last_audit is saved to and loaded from the state file."""
+        with mock_aws():
+            state_file = str(tmp_path / "state.json")
+            bridge = _make_bridge()
+
+            # Save state with counter at 12
+            orch1 = OrchestratorBridge(bridge=bridge, state_file=state_file)
+            orch1.prs_since_last_audit = 12
+            orch1._save_state()
+
+            # Load into a new bridge
+            orch2 = OrchestratorBridge(bridge=bridge, state_file=state_file)
+            assert orch2.prs_since_last_audit == 12
 
 
 # ── _parse_inbox_entry() ──────────────────────────────────────────────────

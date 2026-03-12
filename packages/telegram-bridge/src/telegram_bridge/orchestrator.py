@@ -307,6 +307,7 @@ class OrchestratorBridge:
     inbox_path: str | None = None
     stop_requests_path: str | None = None
     orchestrator_inbox_path: str | None = None
+    prs_since_last_audit: int = 0
     _workers: dict[int, WorkerInfo] = field(default_factory=dict)
     _stopped_issues: set[int] = field(default_factory=set)
     _recently_completed: list[dict[str, Any]] = field(default_factory=list)
@@ -326,6 +327,7 @@ class OrchestratorBridge:
             return
         data = {
             "paused": self.paused,
+            "prs_since_last_audit": self.prs_since_last_audit,
             "workers": {
                 str(k): {
                     "worker_number": v.worker_number,
@@ -351,6 +353,7 @@ class OrchestratorBridge:
         try:
             data = json.loads(path.read_text())
             self.paused = data.get("paused", False)
+            self.prs_since_last_audit = data.get("prs_since_last_audit", 0)
             self._workers = {}
             for _key, w in data.get("workers", {}).items():
                 info = WorkerInfo(
@@ -413,6 +416,7 @@ class OrchestratorBridge:
             queue=queue or [],
             paused=self.paused,
             stopped_issues=sorted(self._stopped_issues),
+            prs_since_last_audit=self.prs_since_last_audit,
         )
 
         path = Path(self.status_file)

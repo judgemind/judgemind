@@ -460,6 +460,7 @@ def build_orchestrator_status(
     queue: list[dict[str, Any]] | None = None,
     paused: bool = False,
     stopped_issues: list[int] | None = None,
+    prs_since_last_audit: int = 0,
 ) -> dict[str, Any]:
     """Build the orchestrator status dict for the interpreter context.
 
@@ -474,6 +475,8 @@ def build_orchestrator_status(
         queue: Next issues by priority.
         paused: Whether the orchestrator is paused.
         stopped_issues: Issue numbers that have been stopped.
+        prs_since_last_audit: Number of PRs merged since the last /audit run.
+            The orchestrator triggers an audit when this reaches 20.
 
     Returns:
         A dict suitable for JSON serialization.  Includes an ``updated_at``
@@ -488,5 +491,6 @@ def build_orchestrator_status(
         "queue": queue or [],
         "paused": paused,
         "stopped_issues": stopped_issues or [],
+        "prs_since_last_audit": prs_since_last_audit,
         "updated_at": datetime.datetime.now(datetime.UTC).isoformat(),
     }

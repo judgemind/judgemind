@@ -63,6 +63,10 @@ gh pr list --repo judgemind/judgemind --state open \
 
 Handle any in-flight PRs before launching new work (see "PR Merge Policy" below).
 
+### 4. Initialize audit counter
+
+Read `tmp/orchestrator_status.json` to recover the `prs_since_last_audit` counter from a previous session. If the file does not exist or the field is missing, initialize the counter to 0.
+
 ---
 
 ## Main Loop
@@ -73,10 +77,11 @@ The orchestrator runs a continuous loop:
 2. **Process orchestrator inbox** — read and execute subagent instructions (see "Subagent Instruction Channel" below)
 3. **Handle in-flight PRs** — merge any that are ready, fix any that are failing
 4. **Sync after merges** — pull latest main after each merge (see "Post-merge sync" in Rules)
-5. **Fill agent slots** — launch `/task` agents for the next highest-priority issues
-6. **Process completions** — handle agent completion/failure notifications
-7. **Triage** — close done issues, file new issues for discovered problems
-8. **Repeat** until shutdown
+5. **Check audit trigger** — if `prs_since_last_audit >= 20`, spawn `/audit` (see "Periodic Audit" below)
+6. **Fill agent slots** — launch `/task` agents for the next highest-priority issues
+7. **Process completions** — handle agent completion/failure notifications
+8. **Triage** — close done issues, file new issues for discovered problems
+9. **Repeat** until shutdown
 
 ### Slot management
 
@@ -202,6 +207,7 @@ After merging:
   ```
 - Check if the merged PR triggers a deploy workflow (see CLAUDE.md "Verify deployment")
 - For deployed services, watch the deploy workflow to completion
+- **Increment `prs_since_last_audit`** and persist it to `tmp/orchestrator_status.json`. When the counter reaches 20, the next main loop iteration will trigger an audit (see "Periodic Audit" below).
 
 **Do not merge PRs from external contributors or PRs you did not create** unless the user explicitly asks.
 
@@ -225,6 +231,40 @@ If a PR has merge conflicts:
   scripts/tg-notify.py notify "PR #<N> has merge conflicts and agent has exited — needs attention"
   ```
 - The orchestrator does not rebase other agents' branches
+
+---
+
+## Periodic Audit
+
+The orchestrator triggers a codebase health audit every 20 merged PRs using the `/audit` skill.
+
+### Counter management
+
+- Track `prs_since_last_audit` as an integer counter, persisted in `tmp/orchestrator_status.json`.
+- After each PR merge, increment the counter by 1.
+- On startup, read the counter from the status file (default to 0 if missing).
+- The counter persists across orchestrator restarts via the status file.
+
+### Trigger condition
+
+In the main loop (step 5), after handling merges and syncing:
+
+1. Check if `prs_since_last_audit >= 20`.
+2. Check that no `/audit` agent is already running (avoid overlapping audits).
+3. If both conditions are met and a slot is available, spawn `/audit` as a background subagent.
+4. Reset `prs_since_last_audit` to 0 and persist to `tmp/orchestrator_status.json`.
+5. Send a Telegram notification:
+   ```
+   scripts/tg-notify.py notify "Launching periodic audit (20 PRs merged since last audit)"
+   ```
+
+### Slot usage
+
+The `/audit` agent occupies one agent slot like any `/task` agent. It creates its own worktree internally. The audit does not block other work — other agents continue running in parallel.
+
+### Manual trigger
+
+The user can also trigger an audit manually via Telegram (`start audit`) or by invoking `/audit` directly. Manual triggers reset the counter to 0.
 
 ---
 
@@ -288,6 +328,7 @@ Send a notification for **every** lifecycle event:
 - [ ] **PR merged** — after each `gh pr merge` (include PR number and title)
 - [ ] **Deploy succeeded/failed** — after watching deploy workflow
 - [ ] **Blocker encountered** — when an issue needs human decision
+- [ ] **Audit triggered** — when `/audit` is spawned (include PR count since last audit)
 - [ ] **Session ended** — at orchestrator shutdown
 
 ### Inbound commands
@@ -298,6 +339,7 @@ Process commands from the Telegram inbox and responder daemon:
 |---|---|
 | `status` | Handled by responder daemon directly |
 | `start #N` | Spawn `/task #N` in the next available slot |
+| `start audit` | Spawn `/audit` immediately, reset `prs_since_last_audit` to 0 |
 | `stop #N` | Stop spawning work for issue #N; if an agent is working on it, let it finish |
 | `pause` | Stop launching new agents; existing agents continue |
 | `resume` | Resume launching new agents |
@@ -322,6 +364,8 @@ The responder daemon communicates via shared state files (see CLAUDE.md "Respond
 - Read `tmp/orchestrator_inbox.json` for subagent instructions (restart_responder, terraform_apply, notify, run_script, file_issue)
 
 **The orchestrator MUST update `tmp/orchestrator_status.json` after every state change.** The `scripts/tg-notify.py` script does this automatically for lifecycle events (`task_started`, `task_completed`, `task_failed`, `pr_merged`). For other state changes (pause, resume, slot changes), call `bridge.write_status()` directly or use `scripts/tg-notify.py notify` to trigger a status file update.
+
+The `tmp/orchestrator_status.json` file includes the `prs_since_last_audit` counter alongside the existing fields (`active_agents`, `open_prs`, `recently_completed`, `queue`, `paused`, `stopped_issues`, `updated_at`).
 
 ---
 
