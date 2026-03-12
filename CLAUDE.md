@@ -70,6 +70,7 @@ Subagents do the implementation work: worktree setup, coding, testing, PR, and r
 - **`/ralph`** — Iterative work-review loop. Spawns worker (TDD) and reviewer subagents. Called by `/task` automatically for testable code tasks.
 - **`/tdd`** — Test-driven implementation for code tasks (Python, TypeScript). Called by `/ralph` internally. **Not for** Terraform, DB migrations, CI/CD, docs, or investigation tasks.
 - **`/orchestrator`** — Opt-in autonomous work queue manager. See `.claude/skills/orchestrator/SKILL.md`.
+- **`/audit`** — Periodic codebase health audit. Reviews recent PRs, checks for dead code, test gaps, performance issues, security concerns, and dependency health. Files issues for findings. Triggered by the orchestrator every 20 merged PRs, or manually.
 
 ### Worktree setup (manual)
 

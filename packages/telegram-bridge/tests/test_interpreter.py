@@ -163,6 +163,7 @@ class TestBuildOrchestratorStatus:
         assert status["queue"] == []
         assert status["paused"] is False
         assert status["stopped_issues"] == []
+        assert status["prs_since_last_audit"] == 0
         assert "updated_at" in status
 
     def test_with_data(self) -> None:
@@ -173,11 +174,13 @@ class TestBuildOrchestratorStatus:
             open_prs=prs,
             paused=True,
             stopped_issues=[99],
+            prs_since_last_audit=15,
         )
         assert status["active_agents"] == agents
         assert status["open_prs"] == prs
         assert status["paused"] is True
         assert status["stopped_issues"] == [99]
+        assert status["prs_since_last_audit"] == 15
         assert "updated_at" in status
 
     def test_updated_at_is_iso_format(self) -> None:
