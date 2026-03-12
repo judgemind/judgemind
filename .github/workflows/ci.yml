@@ -639,6 +639,19 @@ jobs:
           fi
 
   # ---------------------------------------------------------------
+  # Data quality baselines structural validation
+  # ---------------------------------------------------------------
+  dq-baselines-validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Validate data-quality-baselines.json
+        run: python scripts/validate-dq-baselines.py
+
+  # ---------------------------------------------------------------
   # ECS oneshot import guard: prevent scripts/ from importing siblings
   # ---------------------------------------------------------------
   oneshot-imports-check:
@@ -651,7 +664,7 @@ jobs:
   # Always runs. Reports success only when every applicable job passed or was
   # skipped (path filter did not match). Branch protection requires this check.
   ci-passed:
-    needs: [scraper-unit-tests, ingestion-tests, nlp-tests, api-tests, web-tests, telegram-bridge-tests, infra-validate, lambda-tests, coverage-check, oneshot-imports-check]
+    needs: [scraper-unit-tests, ingestion-tests, nlp-tests, api-tests, web-tests, telegram-bridge-tests, infra-validate, lambda-tests, coverage-check, oneshot-imports-check, dq-baselines-validate]
     if: always()
     runs-on: ubuntu-latest
     steps:
