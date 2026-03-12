@@ -260,6 +260,60 @@ class TestExecuteGlobFiles:
 
         assert "no files" in result.lower()
 
+    def test_glob_excludes_git_directory(self, tmp_path: Path) -> None:
+        git_dir = tmp_path / ".git" / "objects"
+        git_dir.mkdir(parents=True)
+        (git_dir / "abc123").write_text("")
+        (tmp_path / "real.py").write_text("")
+
+        result = execute_glob_files(repo_root=tmp_path, pattern="**/*")
+
+        assert "real.py" in result
+        assert ".git" not in result
+
+    def test_glob_excludes_node_modules(self, tmp_path: Path) -> None:
+        nm = tmp_path / "node_modules" / "pkg"
+        nm.mkdir(parents=True)
+        (nm / "index.js").write_text("")
+        (tmp_path / "app.js").write_text("")
+
+        result = execute_glob_files(repo_root=tmp_path, pattern="**/*.js")
+
+        assert "app.js" in result
+        assert "node_modules" not in result
+
+    def test_glob_excludes_venv(self, tmp_path: Path) -> None:
+        venv = tmp_path / ".venv" / "lib"
+        venv.mkdir(parents=True)
+        (venv / "site.py").write_text("")
+        (tmp_path / "main.py").write_text("")
+
+        result = execute_glob_files(repo_root=tmp_path, pattern="**/*.py")
+
+        assert "main.py" in result
+        assert ".venv" not in result
+
+    def test_glob_excludes_pycache(self, tmp_path: Path) -> None:
+        cache = tmp_path / "src" / "__pycache__"
+        cache.mkdir(parents=True)
+        (cache / "mod.cpython-312.pyc").write_text("")
+        (tmp_path / "src" / "mod.py").write_text("")
+
+        result = execute_glob_files(repo_root=tmp_path, pattern="**/*")
+
+        assert "mod.py" in result
+        assert "__pycache__" not in result
+
+    def test_glob_recursive_pattern(self, tmp_path: Path) -> None:
+        """Verify recursive globs work with the new Path.glob() approach."""
+        sub = tmp_path / "a" / "b" / "c"
+        sub.mkdir(parents=True)
+        (sub / "deep.py").write_text("")
+
+        result = execute_glob_files(repo_root=tmp_path, pattern="**/*.py")
+
+        assert "deep.py" in result
+
 
 # ── execute_shell_command() ──────────────────────────────────────────
 

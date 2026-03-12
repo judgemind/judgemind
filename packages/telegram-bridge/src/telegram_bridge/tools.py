@@ -10,7 +10,6 @@ destructive commands.
 
 from __future__ import annotations
 
-import fnmatch
 import logging
 import os
 import subprocess
@@ -275,12 +274,20 @@ def execute_grep_files(
     return _truncate(output)
 
 
+_GLOB_EXCLUDED_DIRS: frozenset[str] = frozenset(
+    {".git", "node_modules", ".venv", "__pycache__", ".mypy_cache", ".ruff_cache"}
+)
+
+
 def execute_glob_files(
     *,
     repo_root: Path,
     pattern: str,
 ) -> str:
     """List files matching a glob pattern.
+
+    Uses ``Path.glob()`` directly instead of enumerating all files,
+    and skips common large directories that are never interesting.
 
     Args:
         repo_root: Absolute path to the repository root.
@@ -290,13 +297,16 @@ def execute_glob_files(
         Newline-separated list of matching file paths.
     """
     matches: list[str] = []
-    for p in sorted(repo_root.rglob("*")):
-        if p.is_file():
-            rel = str(p.relative_to(repo_root))
-            if fnmatch.fnmatch(rel, pattern):
-                matches.append(rel)
-            if len(matches) >= 200:
-                break
+    for p in sorted(repo_root.glob(pattern)):
+        if not p.is_file():
+            continue
+        # Skip files inside excluded directories.
+        rel = p.relative_to(repo_root)
+        if _GLOB_EXCLUDED_DIRS.intersection(rel.parts):
+            continue
+        matches.append(str(rel))
+        if len(matches) >= 200:
+            break
 
     if not matches:
         return "No files matched the pattern."
