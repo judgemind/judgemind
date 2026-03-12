@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from pathlib import Path
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -601,3 +602,394 @@ class TestDefaultConfig:
     def test_request_delay(self) -> None:
         config = default_config()
         assert config.request_delay_seconds == 3.0  # 3 second delay for rate limiting
+
+
+# ---------------------------------------------------------------------------
+# Playwright-mocked async tests for fetch_documents / _fetch_all
+# ---------------------------------------------------------------------------
+
+
+def _make_mock_page(
+    content_sequence: list[str],
+) -> AsyncMock:
+    """Create a mock Playwright page that returns content_sequence on successive
+    content() calls."""
+    page = AsyncMock()
+    page.goto = AsyncMock()
+    page.content = AsyncMock(side_effect=content_sequence)
+    page.wait_for_url = AsyncMock()
+    return page
+
+
+def _make_mock_browser(page: AsyncMock) -> AsyncMock:
+    """Create a mock browser that yields the given page."""
+    context = AsyncMock()
+    context.new_page = AsyncMock(return_value=page)
+    context.add_init_script = AsyncMock()
+
+    browser = AsyncMock()
+    browser.new_context = AsyncMock(return_value=context)
+    browser.close = AsyncMock()
+    return browser
+
+
+class TestFetchDocumentsWithMockedPlaywright:
+    """Integration tests with mocked Playwright browser."""
+
+    def test_fetch_with_ruling_found(self) -> None:
+        """Full flow: CF solved, search returns result, detail has ruling."""
+        portal_html = "<html><body>Portal home</body></html>"
+        search_html = _load_html("sd_roa_search_results.html")
+        detail_html = _load_html("sd_roa_case_detail.html")
+
+        page = _make_mock_page([portal_html, search_html, detail_html])
+        browser = _make_mock_browser(page)
+
+        mock_pw = AsyncMock()
+        mock_pw.chromium.launch = AsyncMock(return_value=browser)
+
+        mock_pw_ctx = AsyncMock()
+        mock_pw_ctx.__aenter__ = AsyncMock(return_value=mock_pw)
+        mock_pw_ctx.__aexit__ = AsyncMock(return_value=False)
+
+        config = _make_config()
+        scraper = SDTentativeRulingsScraper(config, case_numbers=["24CU016153C"])
+
+        with patch(
+            "playwright.async_api.async_playwright",
+            return_value=mock_pw_ctx,
+        ):
+            docs = scraper.fetch_documents()
+
+        assert len(docs) == 1
+        doc = docs[0]
+        assert doc.case_number == "24CU016153C"
+        assert doc.judge_name == "Matthew C. Braner"
+        assert doc.department == "C-60"
+        assert doc.outcome == "GRANTED IN PART AND DENIED IN PART"
+        assert doc.motion_type == "Motion to Compel Further Responses"
+        assert len(doc.parties) == 3
+
+    def test_fetch_no_ruling_on_roa(self) -> None:
+        """Case found but ROA has no tentative ruling."""
+        portal_html = "<html><body>Portal</body></html>"
+        search_html = _load_html("sd_roa_search_results.html")
+        detail_html = _load_html("sd_roa_no_ruling.html")
+
+        page = _make_mock_page([portal_html, search_html, detail_html])
+        browser = _make_mock_browser(page)
+
+        mock_pw = AsyncMock()
+        mock_pw.chromium.launch = AsyncMock(return_value=browser)
+
+        mock_pw_ctx = AsyncMock()
+        mock_pw_ctx.__aenter__ = AsyncMock(return_value=mock_pw)
+        mock_pw_ctx.__aexit__ = AsyncMock(return_value=False)
+
+        config = _make_config()
+        scraper = SDTentativeRulingsScraper(config, case_numbers=["23CU005421C"])
+
+        with patch(
+            "playwright.async_api.async_playwright",
+            return_value=mock_pw_ctx,
+        ):
+            docs = scraper.fetch_documents()
+
+        assert len(docs) == 0
+
+    def test_fetch_no_search_results(self) -> None:
+        """SmartSearch returns no results for the case number."""
+        portal_html = "<html><body>Portal</body></html>"
+        empty_search = "<html><body><div>No results</div></body></html>"
+
+        page = _make_mock_page([portal_html, empty_search])
+        browser = _make_mock_browser(page)
+
+        mock_pw = AsyncMock()
+        mock_pw.chromium.launch = AsyncMock(return_value=browser)
+
+        mock_pw_ctx = AsyncMock()
+        mock_pw_ctx.__aenter__ = AsyncMock(return_value=mock_pw)
+        mock_pw_ctx.__aexit__ = AsyncMock(return_value=False)
+
+        config = _make_config()
+        scraper = SDTentativeRulingsScraper(config, case_numbers=["99XX000000X"])
+
+        with patch(
+            "playwright.async_api.async_playwright",
+            return_value=mock_pw_ctx,
+        ):
+            docs = scraper.fetch_documents()
+
+        assert len(docs) == 0
+
+    def test_fetch_cloudflare_challenge_blocks(self) -> None:
+        """Cloudflare challenge is not solved — returns empty."""
+        cf_html = _load_html("sd_roa_cloudflare_challenge.html")
+
+        page = _make_mock_page([cf_html, cf_html])
+        # wait_for_url raises to simulate challenge not resolving
+        page.wait_for_url = AsyncMock(side_effect=TimeoutError("timeout"))
+        browser = _make_mock_browser(page)
+
+        mock_pw = AsyncMock()
+        mock_pw.chromium.launch = AsyncMock(return_value=browser)
+
+        mock_pw_ctx = AsyncMock()
+        mock_pw_ctx.__aenter__ = AsyncMock(return_value=mock_pw)
+        mock_pw_ctx.__aexit__ = AsyncMock(return_value=False)
+
+        config = _make_config()
+        scraper = SDTentativeRulingsScraper(config, case_numbers=["24CU016153C"])
+
+        with patch(
+            "playwright.async_api.async_playwright",
+            return_value=mock_pw_ctx,
+        ):
+            docs = scraper.fetch_documents()
+
+        assert len(docs) == 0
+
+    def test_fetch_cloudflare_rechallenge_on_search(self) -> None:
+        """CF challenge resolved initially but re-triggered on search."""
+        portal_html = "<html><body>Portal</body></html>"
+        cf_html = _load_html("sd_roa_cloudflare_challenge.html")
+
+        page = _make_mock_page([portal_html, cf_html])
+        browser = _make_mock_browser(page)
+
+        mock_pw = AsyncMock()
+        mock_pw.chromium.launch = AsyncMock(return_value=browser)
+
+        mock_pw_ctx = AsyncMock()
+        mock_pw_ctx.__aenter__ = AsyncMock(return_value=mock_pw)
+        mock_pw_ctx.__aexit__ = AsyncMock(return_value=False)
+
+        config = _make_config()
+        scraper = SDTentativeRulingsScraper(config, case_numbers=["24CU016153C"])
+
+        with patch(
+            "playwright.async_api.async_playwright",
+            return_value=mock_pw_ctx,
+        ):
+            docs = scraper.fetch_documents()
+
+        assert len(docs) == 0
+
+    def test_fetch_cloudflare_rechallenge_on_detail(self) -> None:
+        """CF re-triggered on case detail page."""
+        portal_html = "<html><body>Portal</body></html>"
+        search_html = _load_html("sd_roa_search_results.html")
+        cf_html = _load_html("sd_roa_cloudflare_challenge.html")
+
+        page = _make_mock_page([portal_html, search_html, cf_html])
+        browser = _make_mock_browser(page)
+
+        mock_pw = AsyncMock()
+        mock_pw.chromium.launch = AsyncMock(return_value=browser)
+
+        mock_pw_ctx = AsyncMock()
+        mock_pw_ctx.__aenter__ = AsyncMock(return_value=mock_pw)
+        mock_pw_ctx.__aexit__ = AsyncMock(return_value=False)
+
+        config = _make_config()
+        scraper = SDTentativeRulingsScraper(config, case_numbers=["24CU016153C"])
+
+        with patch(
+            "playwright.async_api.async_playwright",
+            return_value=mock_pw_ctx,
+        ):
+            docs = scraper.fetch_documents()
+
+        assert len(docs) == 0
+
+    def test_fetch_multiple_cases(self) -> None:
+        """Multiple cases: one with ruling, one without."""
+        portal_html = "<html><body>Portal</body></html>"
+        search1 = _load_html("sd_roa_search_results.html")
+        detail1 = _load_html("sd_roa_case_detail.html")
+        # Second case: reuse search results but no ruling page
+        search2 = _load_html("sd_roa_search_results.html")
+        detail2 = _load_html("sd_roa_no_ruling.html")
+
+        page = _make_mock_page([portal_html, search1, detail1, search2, detail2])
+        browser = _make_mock_browser(page)
+
+        mock_pw = AsyncMock()
+        mock_pw.chromium.launch = AsyncMock(return_value=browser)
+
+        mock_pw_ctx = AsyncMock()
+        mock_pw_ctx.__aenter__ = AsyncMock(return_value=mock_pw)
+        mock_pw_ctx.__aexit__ = AsyncMock(return_value=False)
+
+        config = _make_config()
+        scraper = SDTentativeRulingsScraper(
+            config,
+            case_numbers=["24CU016153C", "23CU005421C"],
+        )
+
+        with patch(
+            "playwright.async_api.async_playwright",
+            return_value=mock_pw_ctx,
+        ):
+            docs = scraper.fetch_documents()
+
+        # Only the first case has a ruling
+        assert len(docs) == 1
+        assert docs[0].case_number == "24CU016153C"
+
+    def test_fetch_with_proxy(self) -> None:
+        """Proxy URL is passed to Playwright launch kwargs."""
+        portal_html = "<html><body>Portal</body></html>"
+        search_html = _load_html("sd_roa_search_results.html")
+        detail_html = _load_html("sd_roa_case_detail.html")
+
+        page = _make_mock_page([portal_html, search_html, detail_html])
+        browser = _make_mock_browser(page)
+
+        mock_pw = AsyncMock()
+        mock_pw.chromium.launch = AsyncMock(return_value=browser)
+
+        mock_pw_ctx = AsyncMock()
+        mock_pw_ctx.__aenter__ = AsyncMock(return_value=mock_pw)
+        mock_pw_ctx.__aexit__ = AsyncMock(return_value=False)
+
+        config = _make_config()
+        scraper = SDTentativeRulingsScraper(
+            config,
+            case_numbers=["24CU016153C"],
+            proxy_url="http://proxy:8080",
+        )
+
+        with patch(
+            "playwright.async_api.async_playwright",
+            return_value=mock_pw_ctx,
+        ):
+            docs = scraper.fetch_documents()
+
+        # Verify proxy was passed
+        launch_call = mock_pw.chromium.launch.call_args
+        assert launch_call.kwargs.get("proxy") == {"server": "http://proxy:8080"}
+        assert len(docs) == 1
+
+    def test_fetch_case_exception_continues(self) -> None:
+        """Exception on one case should not stop other cases."""
+        portal_html = "<html><body>Portal</body></html>"
+        search_html = _load_html("sd_roa_search_results.html")
+        detail_html = _load_html("sd_roa_case_detail.html")
+
+        # First search raises, second succeeds
+        page = AsyncMock()
+        page.wait_for_url = AsyncMock()
+        call_count = 0
+
+        async def mock_goto(url: str, **kwargs: object) -> None:
+            nonlocal call_count
+            call_count += 1
+
+        page.goto = AsyncMock(side_effect=mock_goto)
+
+        content_calls = [portal_html]
+
+        async def mock_content() -> str:
+            return content_calls.pop(0)
+
+        # First case: goto raises on search
+        page.goto = AsyncMock(
+            side_effect=[
+                None,  # portal goto
+                RuntimeError("Network error"),  # search goto fails
+                None,  # search goto succeeds
+                None,  # detail goto
+            ]
+        )
+        page.content = AsyncMock(
+            side_effect=[
+                portal_html,  # portal content
+                search_html,  # search content
+                detail_html,  # detail content
+            ]
+        )
+        browser = _make_mock_browser(page)
+
+        mock_pw = AsyncMock()
+        mock_pw.chromium.launch = AsyncMock(return_value=browser)
+
+        mock_pw_ctx = AsyncMock()
+        mock_pw_ctx.__aenter__ = AsyncMock(return_value=mock_pw)
+        mock_pw_ctx.__aexit__ = AsyncMock(return_value=False)
+
+        config = _make_config()
+        scraper = SDTentativeRulingsScraper(
+            config,
+            case_numbers=["FAIL-CASE", "24CU016153C"],
+        )
+
+        with patch(
+            "playwright.async_api.async_playwright",
+            return_value=mock_pw_ctx,
+        ):
+            docs = scraper.fetch_documents()
+
+        # First case failed, second succeeded
+        assert len(docs) == 1
+        assert docs[0].case_number == "24CU016153C"
+
+    def test_fetch_browser_close_on_exception(self) -> None:
+        """Browser is closed even if an exception occurs."""
+        portal_html = "<html><body>Portal</body></html>"
+
+        page = AsyncMock()
+        page.goto = AsyncMock(side_effect=RuntimeError("Fatal error"))
+        page.content = AsyncMock(return_value=portal_html)
+        page.wait_for_url = AsyncMock()
+
+        browser = _make_mock_browser(page)
+        mock_pw = AsyncMock()
+        mock_pw.chromium.launch = AsyncMock(return_value=browser)
+
+        mock_pw_ctx = AsyncMock()
+        mock_pw_ctx.__aenter__ = AsyncMock(return_value=mock_pw)
+        mock_pw_ctx.__aexit__ = AsyncMock(return_value=False)
+
+        config = _make_config()
+        scraper = SDTentativeRulingsScraper(config, case_numbers=["24CU016153C"])
+
+        with patch(
+            "playwright.async_api.async_playwright",
+            return_value=mock_pw_ctx,
+        ):
+            # Should not raise — error handled gracefully
+            scraper.fetch_documents()
+
+        # Browser should have been closed
+        browser.close.assert_awaited_once()
+
+    def test_cloudflare_solved_after_wait(self) -> None:
+        """CF challenge detected then solved after wait_for_url."""
+        cf_html = _load_html("sd_roa_cloudflare_challenge.html")
+        search_html = _load_html("sd_roa_search_results.html")
+        detail_html = _load_html("sd_roa_case_detail.html")
+
+        page = _make_mock_page([cf_html, search_html, detail_html])
+        # wait_for_url succeeds (challenge resolved)
+        page.wait_for_url = AsyncMock()
+        browser = _make_mock_browser(page)
+
+        mock_pw = AsyncMock()
+        mock_pw.chromium.launch = AsyncMock(return_value=browser)
+
+        mock_pw_ctx = AsyncMock()
+        mock_pw_ctx.__aenter__ = AsyncMock(return_value=mock_pw)
+        mock_pw_ctx.__aexit__ = AsyncMock(return_value=False)
+
+        config = _make_config()
+        scraper = SDTentativeRulingsScraper(config, case_numbers=["24CU016153C"])
+
+        with patch(
+            "playwright.async_api.async_playwright",
+            return_value=mock_pw_ctx,
+        ):
+            docs = scraper.fetch_documents()
+
+        assert len(docs) == 1

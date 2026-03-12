@@ -426,7 +426,7 @@ class SDTentativeRulingsScraper(BaseScraper):
             proxy=bool(self._proxy_url),
         )
 
-        return asyncio.get_event_loop().run_until_complete(self._fetch_all())
+        return asyncio.run(self._fetch_all())
 
     async def _fetch_all(self) -> list[CapturedDocument]:
         """Async implementation of the fetch loop."""
