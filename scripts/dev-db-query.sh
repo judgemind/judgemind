@@ -86,4 +86,4 @@ aws ecs execute-command \
     --container "$CONTAINER" \
     --interactive \
     --region "$REGION" \
-    --command "python3 -c \"import os,psycopg,json,base64;q=base64.b64decode('${query_b64}').decode();c=psycopg.connect(os.environ['DATABASE_URL']);r=c.cursor();r.execute('SET default_transaction_read_only = on') if '${readonly_flag}'=='1' else None;r.execute(q);cols=[d[0] for d in r.description];rows=[dict(zip(cols,row)) for row in r.fetchall()];print(json.dumps(rows,indent=2,default=str))\""
+    --command "python3 -c \"import os,psycopg,json,base64;q=base64.b64decode('${query_b64}').decode();c=psycopg.connect(os.environ['DATABASE_URL']);r=c.cursor();r.execute('SET default_transaction_read_only = on') if '${readonly_flag}'=='1' else None;r.execute(q);print(json.dumps([dict(zip([d[0] for d in r.description],row)) for row in r.fetchall()],indent=2,default=str)) if r.description else print(json.dumps({'rowcount':r.rowcount}))\""
