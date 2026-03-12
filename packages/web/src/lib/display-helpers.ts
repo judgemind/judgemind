@@ -412,10 +412,21 @@ export function groupParties(
   defendants: typeof parties;
   others: typeof parties;
 } {
+  // Deduplicate parties by (id, role) to handle any duplicate rows from the DB.
+  const seen = new Set<string>();
+  const deduped: typeof parties = [];
+  for (const party of parties) {
+    const dedupKey = `${party.id}:${party.role ?? ''}`;
+    if (!seen.has(dedupKey)) {
+      seen.add(dedupKey);
+      deduped.push(party);
+    }
+  }
+
   const plaintiffs: typeof parties = [];
   const defendants: typeof parties = [];
   const others: typeof parties = [];
-  for (const party of parties) {
+  for (const party of deduped) {
     const key = (party.role ?? party.partyType ?? '').toLowerCase();
     if (PLAINTIFF_ROLES.has(key)) {
       plaintiffs.push(party);

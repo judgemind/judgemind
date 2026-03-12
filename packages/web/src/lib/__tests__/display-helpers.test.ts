@@ -161,6 +161,31 @@ describe('groupParties', () => {
     expect(result.defendants).toEqual([]);
     expect(result.others).toEqual([]);
   });
+
+  it('deduplicates parties with same id and role (#873)', () => {
+    const parties = [
+      { id: '1', canonicalName: 'Alice', partyType: null, role: 'plaintiff' },
+      { id: '1', canonicalName: 'Alice', partyType: null, role: 'plaintiff' },
+      { id: '1', canonicalName: 'Alice', partyType: null, role: 'plaintiff' },
+      { id: '2', canonicalName: 'Bob', partyType: null, role: 'defendant' },
+      { id: '2', canonicalName: 'Bob', partyType: null, role: 'defendant' },
+    ];
+    const result = groupParties(parties);
+    expect(result.plaintiffs).toHaveLength(1);
+    expect(result.plaintiffs[0].canonicalName).toBe('Alice');
+    expect(result.defendants).toHaveLength(1);
+    expect(result.defendants[0].canonicalName).toBe('Bob');
+  });
+
+  it('preserves parties with same id but different roles', () => {
+    const parties = [
+      { id: '1', canonicalName: 'Alice', partyType: null, role: 'plaintiff' },
+      { id: '1', canonicalName: 'Alice', partyType: null, role: 'cross_defendant' },
+    ];
+    const result = groupParties(parties);
+    expect(result.plaintiffs).toHaveLength(1);
+    expect(result.defendants).toHaveLength(1);
+  });
 });
 
 // ---------------------------------------------------------------------------
