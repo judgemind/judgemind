@@ -19,16 +19,21 @@ import pytest
 import respx
 
 from courts.ca.fresno_tentatives import (
+    _ISSUED_BY_RE,
+    _NO_RULINGS_RE,
     BASE_URL,
     INDEX_URL,
     FresnoTentativeRulingsScraper,
+    SplitRuling,
     _extract_case_number,
     _extract_case_title,
     _extract_motion_type,
     _extract_outcome,
+    _fresno_courthouse,
     _fresno_dept_from_filename,
     _fresno_hearing_date_from_filename,
     _fresno_hearing_date_from_text,
+    _normalize_outcome,
     _split_rulings,
 )
 from courts.ca.fresno_tentatives import default_config as fresno_default_config
@@ -579,3 +584,505 @@ def test_fresno_502_ruling_garcia() -> None:
     assert r.case_number is not None
     assert r.case_title is not None
     assert r.outcome is not None
+
+
+# ---------------------------------------------------------------------------
+# _normalize_outcome — additional branch coverage
+# ---------------------------------------------------------------------------
+
+
+def test_normalize_outcome_sustain_plain() -> None:
+    """Plain 'To sustain' without leave qualifier."""
+    assert _normalize_outcome("To sustain the demurrer.") == "Sustained"
+
+
+def test_normalize_outcome_sustain_with_leave() -> None:
+    """'To sustain ... with leave to amend'."""
+    assert _normalize_outcome("To sustain with leave to amend.") == "Sustained with Leave to Amend"
+
+
+def test_normalize_outcome_overrule() -> None:
+    assert _normalize_outcome("To overrule the demurrer.") == "Overruled"
+
+
+def test_normalize_outcome_stay() -> None:
+    assert _normalize_outcome("To stay all proceedings.") == "Stayed"
+
+
+def test_normalize_outcome_take_off_calendar() -> None:
+    assert _normalize_outcome("To take the motion off calendar.") == "Off Calendar"
+
+
+def test_normalize_outcome_period_truncation() -> None:
+    """Short outcome with a period should truncate at the period."""
+    result = _normalize_outcome("Some other outcome text. More detail here")
+    assert result == "Some other outcome text"
+
+
+def test_normalize_outcome_long_truncation() -> None:
+    """Outcomes longer than 60 chars without a short period get truncated at 60."""
+    long_text = (
+        "To do something very unusual that doesn't match any pattern and keeps going further"
+    )
+    result = _normalize_outcome(long_text)
+    assert len(result) <= 60
+
+
+def test_normalize_outcome_raw_strip_fallback() -> None:
+    """Short outcome without period returns as-is stripped."""
+    assert _normalize_outcome("  Short ruling  ") == "Short ruling"
+
+
+# ---------------------------------------------------------------------------
+# _extract_outcome — fallback disposition paths
+# ---------------------------------------------------------------------------
+
+
+def test_fresno_outcome_fallback_overruled() -> None:
+    """Fallback regex matches 'overruled' when Tentative Ruling block has no 'To ...'."""
+    text = "Tentative Ruling:\nSee below.\nThe demurrer is overruled in its entirety."
+    assert _extract_outcome(text) == "Overruled"
+
+
+def test_fresno_outcome_fallback_sustained() -> None:
+    text = "Tentative Ruling:\nSee below.\nThe objection is sustained."
+    assert _extract_outcome(text) == "Sustained"
+
+
+def test_fresno_outcome_fallback_moot() -> None:
+    text = "Tentative Ruling:\nSee below.\nThe motion is moot."
+    assert _extract_outcome(text) == "Moot"
+
+
+def test_fresno_outcome_fallback_continued_to() -> None:
+    """Fallback 'continued to' pattern."""
+    text = "Tentative Ruling:\nSee below.\nThe hearing is continued to April 15, 2026."
+    assert _extract_outcome(text) == "Continued"
+
+
+def test_fresno_outcome_fallback_off_calendar() -> None:
+    """Fallback 'off calendar' text detection."""
+    text = "Tentative Ruling:\nSee below.\nThis matter is taken off calendar."
+    assert _extract_outcome(text) == "Off Calendar"
+
+
+def test_fresno_outcome_fallback_off_calendar_short() -> None:
+    """Fallback 'off calendar' without 'taken'."""
+    text = "Tentative Ruling:\nSee below.\nMatter is off calendar per stipulation."
+    assert _extract_outcome(text) == "Off Calendar"
+
+
+# ---------------------------------------------------------------------------
+# _fresno_hearing_date_from_text — no-comma format
+# ---------------------------------------------------------------------------
+
+
+def test_fresno_hearing_date_from_text_no_comma() -> None:
+    """Hearing date format without comma: 'March 10 2026'."""
+    text = "Tentative Rulings for March 10 2026\nDepartment 403"
+    dt = _fresno_hearing_date_from_text(text)
+    assert dt == datetime(2026, 3, 10)
+
+
+def test_fresno_hearing_date_from_text_none() -> None:
+    """No date found returns None."""
+    assert _fresno_hearing_date_from_text("No date here at all") is None
+
+
+def test_fresno_hearing_date_invalid_date() -> None:
+    """Invalid date string returns None (e.g. bad month spelling)."""
+    text = "Tentative Rulings for Frobuary 42, 2026\nDepartment 403"
+    assert _fresno_hearing_date_from_text(text) is None
+
+
+# ---------------------------------------------------------------------------
+# _extract_case_title — edge cases
+# ---------------------------------------------------------------------------
+
+
+def test_fresno_extract_case_title_empty_after_strip() -> None:
+    """Re: line with text that collapses to empty returns None.
+
+    The _extract_case_title function strips whitespace and returns None
+    if the result is empty. We can't easily hit this with real "Re:" patterns
+    since the regex captures the whole line, so we verify the function handles
+    a title that's just whitespace on the same line.
+    """
+    # "Re:" followed by text on the same line that is captured by (.+?)
+    # The (.+?) requires at least one char, so true-empty after Re: doesn't match.
+    # Instead, test with the function's text[:500] limit:
+    # Put "Re:" line beyond the 500-char search window
+    long_prefix = "A" * 501
+    text = f"{long_prefix}\nRe: Hidden Title\nCase No. 25CECG03271"
+    assert _extract_case_title(text) is None
+
+
+# ---------------------------------------------------------------------------
+# _extract_motion_type — truncation edge case
+# ---------------------------------------------------------------------------
+
+
+def test_fresno_extract_motion_type_truncated_at_120() -> None:
+    """Motion type longer than 120 chars gets truncated."""
+    long_motion = "A" * 130
+    text = f"Motion: {long_motion}\nTentative Ruling:"
+    result = _extract_motion_type(text)
+    assert result is not None
+    assert len(result) <= 120
+
+
+def test_fresno_extract_motion_type_stops_at_keyword() -> None:
+    """Motion type extraction stops at known field markers like 'Tentative Ruling:'."""
+    text = "Motion: Demurrer to Complaint\nTentative Ruling:\nTo grant the motion."
+    result = _extract_motion_type(text)
+    assert result == "Demurrer to Complaint"
+    # "Tentative Ruling:" should NOT be part of the motion
+    assert "Tentative" not in result
+
+
+# ---------------------------------------------------------------------------
+# _split_rulings — edge cases
+# ---------------------------------------------------------------------------
+
+
+def test_split_rulings_no_entries() -> None:
+    """Text without numbered entries returns empty list."""
+    assert _split_rulings("Just some normal text without any rulings") == []
+
+
+def test_split_rulings_short_entry_skipped() -> None:
+    """Entries with ruling text < 50 chars are skipped."""
+    text = (
+        "(1) Tentative Ruling\n"
+        "Short.\n"
+        "(2) Tentative Ruling\n"
+        "Re: Smith v. Jones\n"
+        "Superior Court Case No. 25CECG03271\n"
+        "Hearing Date: March 10, 2026 (Dept. 403)\n"
+        "Motion: Demurrer to Complaint\n"
+        "Tentative Ruling:\n"
+        "To grant. The demurrer is sustained without leave to amend.\n"
+    )
+    rulings = _split_rulings(text)
+    # Only the second entry should appear (first is too short)
+    assert len(rulings) == 1
+    assert rulings[0].ruling_index == 2
+
+
+def test_split_rulings_removes_page_footers() -> None:
+    """Page number footers are stripped from ruling text."""
+    text = (
+        "(1) Tentative Ruling\n"
+        "Re: Smith v. Jones\n"
+        "Superior Court Case No. 25CECG03271\n"
+        "Hearing Date: March 10, 2026 (Dept. 403)\n"
+        "Motion: Demurrer to Complaint\n"
+        "Tentative Ruling:\n"
+        "To grant the motion. The court finds good cause.\n"
+        "15\n"
+    )
+    rulings = _split_rulings(text)
+    assert len(rulings) == 1
+    # The trailing page number should be removed
+    assert not rulings[0].ruling_text.rstrip().endswith("15")
+
+
+def test_split_rulings_newline_between_number_and_tentative() -> None:
+    """Match entry where number and 'Tentative Ruling' are on separate lines."""
+    text = (
+        "(1)\n"
+        "Tentative Ruling\n"
+        "Re: Alpha v. Beta Corp\n"
+        "Superior Court Case No. 25CECG09999\n"
+        "Hearing Date: March 10, 2026 (Dept. 501)\n"
+        "Motion: Motion for Summary Judgment\n"
+        "Tentative Ruling:\n"
+        "To deny the motion. The court finds triable issues of material fact.\n"
+    )
+    rulings = _split_rulings(text)
+    assert len(rulings) == 1
+    assert rulings[0].ruling_index == 1
+    assert rulings[0].case_title == "Alpha v. Beta Corp"
+
+
+# ---------------------------------------------------------------------------
+# SplitRuling — direct construction
+# ---------------------------------------------------------------------------
+
+
+def test_split_ruling_construction() -> None:
+    """SplitRuling can be constructed with all fields."""
+    r = SplitRuling(
+        ruling_index=1,
+        case_number="25CECG03271",
+        ruling_text="Some ruling text here",
+        case_title="Smith v. Jones",
+        motion_type="Demurrer",
+        outcome="Sustained",
+        hearing_date=datetime(2026, 3, 10),
+    )
+    assert r.ruling_index == 1
+    assert r.case_number == "25CECG03271"
+    assert r.case_title == "Smith v. Jones"
+    assert r.motion_type == "Demurrer"
+    assert r.outcome == "Sustained"
+    assert r.hearing_date == datetime(2026, 3, 10)
+
+
+# ---------------------------------------------------------------------------
+# _NO_RULINGS_RE and _ISSUED_BY_RE regex patterns
+# ---------------------------------------------------------------------------
+
+
+def test_no_rulings_regex_matches() -> None:
+    """_NO_RULINGS_RE matches boilerplate 'No Tentative Rulings' text."""
+    assert _NO_RULINGS_RE.search("No Tentative Rulings") is not None
+    assert _NO_RULINGS_RE.search("  No Tentative Ruling for this date") is not None
+    assert _NO_RULINGS_RE.search("no tentative rulings") is not None
+
+
+def test_no_rulings_regex_no_match() -> None:
+    assert _NO_RULINGS_RE.search("Tentative Ruling:\nTo grant.") is None
+
+
+def test_issued_by_regex_matches() -> None:
+    """_ISSUED_BY_RE extracts judge initials from 'Issued By:' line."""
+    m = _ISSUED_BY_RE.search("Issued By: lmg on 3-9-26 .")
+    assert m is not None
+    assert m.group("initials") == "lmg"
+
+    m2 = _ISSUED_BY_RE.search("Issued By: DTT on 3-10-26 .")
+    assert m2 is not None
+    assert m2.group("initials") == "DTT"
+
+
+def test_issued_by_regex_no_match() -> None:
+    assert _ISSUED_BY_RE.search("No issued by line") is None
+
+
+# ---------------------------------------------------------------------------
+# _fresno_courthouse
+# ---------------------------------------------------------------------------
+
+
+def test_fresno_courthouse_returns_constant() -> None:
+    """_fresno_courthouse always returns the same courthouse name."""
+    assert _fresno_courthouse("403") == "B.F. Sisk Federal Courthouse"
+    assert _fresno_courthouse("501") == "B.F. Sisk Federal Courthouse"
+    assert _fresno_courthouse("anything") == "B.F. Sisk Federal Courthouse"
+
+
+# ---------------------------------------------------------------------------
+# _fresno_hearing_date_from_filename — invalid date values
+# ---------------------------------------------------------------------------
+
+
+def test_fresno_hearing_date_from_filename_invalid_month() -> None:
+    """Invalid month (13) returns None via ValueError."""
+    assert _fresno_hearing_date_from_filename("13-10-26-dept-403.pdf") is None
+
+
+def test_fresno_hearing_date_from_filename_invalid_day() -> None:
+    """Invalid day (32) returns None via ValueError."""
+    assert _fresno_hearing_date_from_filename("03-32-26-dept-403.pdf") is None
+
+
+# ---------------------------------------------------------------------------
+# FresnoTentativeRulingsScraper.parse_document — pre-split fallback path
+# ---------------------------------------------------------------------------
+
+
+@respx.mock
+def test_fresno_parse_document_pre_split_no_hearing_date_fallback() -> None:
+    """Pre-split doc without hearing_date falls back to filename extraction."""
+    config = fresno_default_config()
+    config.request_delay_seconds = 0
+    scraper = FresnoTentativeRulingsScraper(config=config)
+
+    from framework import ContentFormat
+
+    doc = scraper._make_base_doc(
+        source_url="https://example.com/03-10-26-dept-403.pdf",
+        raw_content=b"fake-pdf",
+        content_format=ContentFormat.PDF,
+    )
+    doc.extra["pre_split"] = True
+    doc.extra["filename"] = "03-10-26-dept-403.pdf"
+    doc.hearing_date = None
+
+    parsed = scraper.parse_document(doc)
+    assert parsed.hearing_date == datetime(2026, 3, 10)
+
+
+@respx.mock
+def test_fresno_parse_document_non_pre_split_path() -> None:
+    """Non-pre-split doc goes through parent parse_document and Fresno-specific logic."""
+    from unittest.mock import patch
+
+    from framework import ContentFormat
+
+    config = fresno_default_config()
+    config.request_delay_seconds = 0
+    scraper = FresnoTentativeRulingsScraper(config=config)
+
+    doc = scraper._make_base_doc(
+        source_url="https://example.com/03-10-26-dept-403.pdf",
+        raw_content=b"fake-pdf",
+        content_format=ContentFormat.PDF,
+    )
+    doc.extra["filename"] = "03-10-26-dept-403.pdf"
+
+    # Mock _extract_pdf_text to return text with a hearing date
+    with patch(
+        "courts.ca.pdf_link_scraper._extract_pdf_text",
+        return_value=(
+            "Tentative Rulings for March 10, 2026\n"
+            "Department 403\nCase No. 25CECG03271\nSome ruling text"
+        ),
+    ):
+        parsed = scraper.parse_document(doc)
+
+    assert parsed.hearing_date == datetime(2026, 3, 10)
+    assert parsed.case_number is not None
+
+
+@respx.mock
+def test_fresno_parse_document_non_pre_split_filename_fallback() -> None:
+    """Non-pre-split doc falls back to filename for hearing date when text has none."""
+    from unittest.mock import patch
+
+    from framework import ContentFormat
+
+    config = fresno_default_config()
+    config.request_delay_seconds = 0
+    scraper = FresnoTentativeRulingsScraper(config=config)
+
+    doc = scraper._make_base_doc(
+        source_url="https://example.com/03-10-26-dept-403.pdf",
+        raw_content=b"fake-pdf",
+        content_format=ContentFormat.PDF,
+    )
+    doc.extra["filename"] = "03-10-26-dept-403.pdf"
+
+    # Mock _extract_pdf_text to return text without any date
+    with patch(
+        "courts.ca.pdf_link_scraper._extract_pdf_text",
+        return_value="Some ruling text without a date. Case No. 25CECG03271",
+    ):
+        parsed = scraper.parse_document(doc)
+
+    # Should fall back to filename for hearing date
+    assert parsed.hearing_date == datetime(2026, 3, 10)
+
+
+# ---------------------------------------------------------------------------
+# fetch_documents — PDF text extraction failure path
+# ---------------------------------------------------------------------------
+
+
+@respx.mock
+def test_fresno_fetch_documents_pdf_extraction_failure() -> None:
+    """When PDF text extraction fails, the original doc is kept."""
+    from unittest.mock import patch
+
+    html = _load_html("fresno_index_page.html")
+
+    respx.get(INDEX_URL).mock(return_value=httpx.Response(200, text=html))
+    # Return invalid PDF bytes to trigger extraction failure
+    respx.get(url__regex=r"\.pdf").mock(
+        return_value=httpx.Response(200, content=b"not-a-valid-pdf")
+    )
+
+    config = fresno_default_config()
+    config.request_delay_seconds = 0
+    scraper = FresnoTentativeRulingsScraper(config=config)
+
+    with patch(
+        "courts.ca.fresno_tentatives._extract_pdf_text",
+        side_effect=Exception("PDF extraction failed"),
+    ):
+        docs = scraper.fetch_documents()
+
+    # All 20 PDFs should still produce docs (kept as-is on failure)
+    assert len(docs) == 20
+
+
+# ---------------------------------------------------------------------------
+# fetch_documents — single ruling PDF (<=1 rulings)
+# ---------------------------------------------------------------------------
+
+
+@respx.mock
+def test_fresno_fetch_documents_single_ruling_pdf() -> None:
+    """A PDF with exactly 1 ruling keeps the original doc with fields populated."""
+    from unittest.mock import patch
+
+    html = _load_html("fresno_index_page.html")
+
+    respx.get(INDEX_URL).mock(return_value=httpx.Response(200, text=html))
+    respx.get(url__regex=r"\.pdf").mock(return_value=httpx.Response(200, content=b"fake-pdf-bytes"))
+
+    single_ruling_text = (
+        "(1) Tentative Ruling\n"
+        "Re: Smith v. Jones\n"
+        "Superior Court Case No. 25CECG03271\n"
+        "Hearing Date: March 10, 2026 (Dept. 403)\n"
+        "Motion: Demurrer to Complaint\n"
+        "Tentative Ruling:\n"
+        "To grant the motion. The court finds good cause for the relief requested.\n"
+    )
+
+    with patch(
+        "courts.ca.fresno_tentatives._extract_pdf_text",
+        return_value=single_ruling_text,
+    ):
+        config = fresno_default_config()
+        config.request_delay_seconds = 0
+        scraper = FresnoTentativeRulingsScraper(config=config)
+        docs = scraper.fetch_documents()
+
+    # Verify the docs got field data from the single ruling
+    assert len(docs) == 20
+    assert docs[0].case_number == "25CECG03271"
+    assert docs[0].case_title == "Smith v. Jones"
+
+
+# ---------------------------------------------------------------------------
+# Motions with (xN) count pattern
+# ---------------------------------------------------------------------------
+
+
+def test_fresno_extract_motion_with_count() -> None:
+    """Motion with count like 'Motions (x3):'."""
+    text = "Motions (x3): Motion to Compel Responses\nTentative Ruling:"
+    result = _extract_motion_type(text)
+    assert result is not None
+    assert "Compel" in result
+
+
+# ---------------------------------------------------------------------------
+# fetch_documents — zero rulings from split
+# ---------------------------------------------------------------------------
+
+
+@respx.mock
+def test_fresno_fetch_documents_zero_rulings() -> None:
+    """A PDF with no numbered rulings keeps the original doc."""
+    from unittest.mock import patch
+
+    html = _load_html("fresno_index_page.html")
+
+    respx.get(INDEX_URL).mock(return_value=httpx.Response(200, text=html))
+    respx.get(url__regex=r"\.pdf").mock(return_value=httpx.Response(200, content=b"fake-pdf-bytes"))
+
+    with patch(
+        "courts.ca.fresno_tentatives._extract_pdf_text",
+        return_value="No Tentative Rulings for this date.",
+    ):
+        config = fresno_default_config()
+        config.request_delay_seconds = 0
+        scraper = FresnoTentativeRulingsScraper(config=config)
+        docs = scraper.fetch_documents()
+
+    # All 20 PDFs produce 1 doc each (no splitting since no rulings found)
+    assert len(docs) == 20
