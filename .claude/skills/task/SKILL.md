@@ -180,7 +180,18 @@ git -C {worktree} push -u origin <branch>
 ```
 Commit message format: `feat(area): description (#N)` (conventional commits).
 
-Immediately open a PR after the first push — never push without creating one. The PR body must include `Closes #N` so the unblock workflow fires on merge:
+Immediately open a PR after the first push — never push without creating one. **Before creating, check for duplicate PRs** to avoid wasting CI minutes on conflicting duplicates:
+
+```
+source {worktree}/scripts/preflight.sh
+preflight_no_duplicate_pr <N>
+```
+
+- If it returns **0** (duplicate found), the existing PR number is printed to stdout. **Adopt that PR** instead of creating a new one — push to the existing branch and use `gh pr edit` to update the body if needed.
+- If it returns **1** (no duplicate), proceed to create the PR normally.
+- If it returns **2** (error), proceed to create the PR (fail-open).
+
+The PR body must include `Closes #N` so the unblock workflow fires on merge:
 ```
 gh pr create --repo judgemind/judgemind \
     --title "..." \

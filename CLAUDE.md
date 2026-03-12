@@ -40,6 +40,7 @@ preflight_in_worktree       # Fail if pwd is main repo, not a worktree
 preflight_not_on_main       # Fail if on main/master branch
 preflight_branch_fresh      # Fail if behind origin/main (add --fetch to fetch first)
 preflight_venv_local        # Fail if .venv is missing or is a symlink
+preflight_no_duplicate_pr N # Check if open PR already exists for issue #N
 ```
 
 ## Project Context
@@ -119,6 +120,11 @@ git -C {worktree} rebase origin/main
 
 ```
 git push -u origin <branch>
+```
+
+Before creating a PR, check for duplicates using `preflight_no_duplicate_pr` from `scripts/preflight.sh`. If a duplicate is found (return code 0), adopt the existing PR instead of creating a new one. If no duplicate (return code 1) or on error (return code 2), proceed normally:
+
+```
 gh pr create --repo judgemind/judgemind ...
 gh run list --repo judgemind/judgemind --branch <branch> --limit 1 --json databaseId -q '.[0].databaseId'
 gh run watch <run-id> --repo judgemind/judgemind --exit-status --compact
