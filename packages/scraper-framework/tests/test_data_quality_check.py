@@ -1794,3 +1794,311 @@ class TestFormatMetricsForSnapshot:
         # Non-snapshot metrics should not appear.
         assert "ruling_count_7d_avg" not in result["Orange"]
         assert "scraper_last_success_age_hours" not in result["Orange"]
+
+
+# ---------------------------------------------------------------------------
+# Schema validation for SQL query constants
+# ---------------------------------------------------------------------------
+
+_SCHEMA_SQL_PATH = _REPO_ROOT / "packages" / "api" / "src" / "data-access" / "schema.sql"
+
+
+def _parse_schema_columns(schema_path: Path) -> dict[str, set[str]]:
+    """Parse CREATE TABLE statements from schema.sql to extract table->columns.
+
+    Returns a dict mapping table name (lowercase) to a set of column names.
+    Handles both ``CREATE TABLE tablename`` and ``CREATE TABLE schema.tablename``.
+    """
+    import re
+
+    text = schema_path.read_text()
+    table_columns: dict[str, set[str]] = {}
+
+    # Match CREATE TABLE [schema.]tablename ( ... ) with content between parens.
+    # Use re.DOTALL so . matches newlines.
+    create_re = re.compile(
+        r"CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?"
+        r"(?:\w+\.)?(\w+)\s*\((.*?)\)\s*;",
+        re.DOTALL | re.IGNORECASE,
+    )
+
+    for match in create_re.finditer(text):
+        table_name = match.group(1).lower()
+        body = match.group(2)
+        columns: set[str] = set()
+
+        for line in body.split("\n"):
+            line = line.strip()
+            # Skip empty lines, comments, constraints, and PRIMARY KEY lines
+            if not line or line.startswith("--"):
+                continue
+            # Skip constraint lines (CHECK, UNIQUE, PRIMARY KEY, FOREIGN KEY)
+            upper = line.upper().lstrip()
+            if any(
+                upper.startswith(kw)
+                for kw in ("CHECK", "UNIQUE", "PRIMARY", "FOREIGN", "CONSTRAINT")
+            ):
+                continue
+            # A column definition starts with an identifier
+            col_match = re.match(r"(\w+)\s+", line)
+            if col_match:
+                col_name = col_match.group(1).lower()
+                # Skip SQL keywords that might appear at the start of a line
+                if col_name.upper() not in (
+                    "CHECK",
+                    "UNIQUE",
+                    "PRIMARY",
+                    "FOREIGN",
+                    "CONSTRAINT",
+                    "CREATE",
+                    "INDEX",
+                    "COMMENT",
+                    "ON",
+                ):
+                    columns.add(col_name)
+
+        if columns:
+            table_columns[table_name] = columns
+
+    return table_columns
+
+
+def _extract_alias_to_table(query: str) -> dict[str, str]:
+    """Extract table alias mappings from FROM and JOIN clauses in a SQL query.
+
+    Handles patterns like:
+    - ``FROM documents d``
+    - ``JOIN courts ct ON ...``
+    - ``LEFT JOIN rulings r ON ...``
+    - CTE references in the outer query (e.g. ``FROM ranked_runs``)
+
+    Returns a dict mapping alias (lowercase) to table name (lowercase).
+    """
+    import re
+
+    alias_map: dict[str, str] = {}
+
+    # Match FROM/JOIN table [alias] patterns.
+    # Handles: FROM table alias, JOIN table alias ON, LEFT JOIN table alias ON
+    pattern = re.compile(
+        r"(?:FROM|(?:LEFT|RIGHT|INNER|OUTER|CROSS|FULL)?\s*JOIN)\s+"
+        r"(?:\w+\.)?(\w+)\s+(\w+)",
+        re.IGNORECASE,
+    )
+
+    for match in pattern.finditer(query):
+        table = match.group(1).lower()
+        alias = match.group(2).lower()
+        # The "alias" should not be a SQL keyword
+        if alias.upper() not in ("ON", "WHERE", "AND", "OR", "SET", "AS", "USING"):
+            alias_map[alias] = table
+
+    return alias_map
+
+
+def _extract_column_references(query: str) -> list[tuple[str, str]]:
+    """Extract alias.column references from a SQL query.
+
+    Returns a list of (alias, column) tuples, both lowercase.
+    Skips references inside string literals and format placeholders.
+    """
+    import re
+
+    # Remove string literals (single-quoted) to avoid false matches
+    cleaned = re.sub(r"'[^']*'", "''", query)
+    # Remove format placeholders like {county_filter}
+    cleaned = re.sub(r"\{[^}]+\}", "", cleaned)
+    # Remove %s parameter placeholders
+    cleaned = cleaned.replace("%s", "")
+
+    refs: list[tuple[str, str]] = []
+    # Match alias.column patterns (word.word)
+    for match in re.finditer(r"\b(\w+)\.(\w+)\b", cleaned):
+        alias = match.group(1).lower()
+        column = match.group(2).lower()
+        # Skip non-alias patterns (e.g., schema.table in CREATE/FROM)
+        if alias in ("staging", "json_build_object"):
+            continue
+        refs.append((alias, column))
+
+    return refs
+
+
+def _get_all_query_constants() -> dict[str, str]:
+    """Dynamically discover all SQL query constants from the data quality check module.
+
+    Returns a dict mapping constant name to query string.
+    Identifies query constants by the naming convention: uppercase name ending in _QUERY.
+    """
+    queries: dict[str, str] = {}
+    for attr_name in dir(dqc):
+        if attr_name.endswith("_QUERY") and attr_name.isupper():
+            value = getattr(dqc, attr_name)
+            if isinstance(value, str):
+                queries[attr_name] = value
+    return queries
+
+
+class TestSqlSchemaValidation:
+    """Validate that SQL query constants reference columns that exist in schema.sql.
+
+    This test class catches column name mismatches (e.g. d.doc_type instead of
+    d.document_type) at test time. It parses the schema DDL and cross-references
+    all alias.column references in every query constant.
+    """
+
+    def test_schema_file_exists(self) -> None:
+        """The schema SQL file must exist for validation to work."""
+        assert _SCHEMA_SQL_PATH.exists(), f"Schema file not found at {_SCHEMA_SQL_PATH}"
+
+    def test_schema_parser_finds_tables(self) -> None:
+        """The schema parser should find the key tables used by queries."""
+        schema = _parse_schema_columns(_SCHEMA_SQL_PATH)
+        expected_tables = {
+            "courts",
+            "documents",
+            "rulings",
+            "cases",
+            "case_parties",
+            "scraper_runs",
+            "data_quality_metrics",
+        }
+        for table in expected_tables:
+            assert table in schema, f"Schema parser did not find table '{table}'"
+
+    def test_schema_parser_finds_columns(self) -> None:
+        """The schema parser should find known columns in each table."""
+        schema = _parse_schema_columns(_SCHEMA_SQL_PATH)
+        # Spot-check some columns
+        assert "county" in schema["courts"]
+        assert "document_type" in schema["documents"]
+        assert "judge_id" in schema["rulings"]
+        assert "case_title" in schema["cases"]
+        assert "party_id" in schema["case_parties"]
+        assert "scraper_id" in schema["scraper_runs"]
+
+    def test_query_constants_discovered(self) -> None:
+        """All expected query constants should be discovered dynamically."""
+        queries = _get_all_query_constants()
+        expected = {
+            "RULING_COUNTS_24H_QUERY",
+            "RULING_COUNTS_7D_QUERY",
+            "ALL_ACTIVE_COUNTIES_QUERY",
+            "LATEST_SCRAPER_RUN_QUERY",
+            "LATEST_CAPTURE_PER_COUNTY_QUERY",
+            "SCRAPER_SUCCESS_RATE_24H_QUERY",
+            "RULING_COUNT_BY_TYPE_QUERY",
+            "FIELD_GAP_DOCS_QUERY",
+            "FIELD_COMPLETENESS_QUERY",
+            "INSERT_METRICS_QUERY",
+        }
+        for name in expected:
+            assert name in queries, f"Query constant '{name}' not discovered"
+
+    def test_all_column_references_exist_in_schema(self) -> None:
+        """Every alias.column reference in every query must map to a real column.
+
+        This is the core validation test. It:
+        1. Parses the schema to get table->columns.
+        2. For each query constant, extracts alias->table mappings.
+        3. For each alias.column reference, checks the column exists in the table.
+        """
+        schema = _parse_schema_columns(_SCHEMA_SQL_PATH)
+        queries = _get_all_query_constants()
+
+        errors: list[str] = []
+        for query_name, query_sql in queries.items():
+            alias_map = _extract_alias_to_table(query_sql)
+            col_refs = _extract_column_references(query_sql)
+
+            for alias, column in col_refs:
+                if alias not in alias_map:
+                    # Alias might be a CTE or subquery — skip if not in alias_map
+                    continue
+                table = alias_map[alias]
+                if table not in schema:
+                    # Table might be a CTE or view — skip validation
+                    continue
+                if column not in schema[table]:
+                    errors.append(
+                        f"{query_name}: {alias}.{column} -> "
+                        f"column '{column}' does not exist in table '{table}'. "
+                        f"Available columns: {sorted(schema[table])}"
+                    )
+
+        assert not errors, "SQL query constants reference non-existent columns:\n" + "\n".join(
+            f"  - {e}" for e in errors
+        )
+
+    def test_detects_invalid_column_name(self) -> None:
+        """Verify the validation catches a known-bad column reference.
+
+        Simulates the original bug: d.doc_type instead of d.document_type.
+        """
+        schema = _parse_schema_columns(_SCHEMA_SQL_PATH)
+
+        bad_query = """
+            SELECT ct.county, d.doc_type, COUNT(d.id) AS count
+            FROM documents d
+            JOIN courts ct ON ct.id = d.court_id
+            GROUP BY ct.county, d.doc_type
+        """
+        alias_map = _extract_alias_to_table(bad_query)
+        col_refs = _extract_column_references(bad_query)
+
+        invalid_refs = []
+        for alias, column in col_refs:
+            if alias not in alias_map:
+                continue
+            table = alias_map[alias]
+            if table not in schema:
+                continue
+            if column not in schema[table]:
+                invalid_refs.append(f"{alias}.{column}")
+
+        assert "d.doc_type" in invalid_refs, "Validation should have caught d.doc_type as invalid"
+
+    def test_alias_extraction_handles_left_join(self) -> None:
+        """Alias extraction works for LEFT JOIN clauses."""
+        query = """
+            SELECT d.id
+            FROM documents d
+            LEFT JOIN rulings r ON r.document_id = d.id
+            LEFT JOIN cases c ON c.id = d.case_id
+        """
+        alias_map = _extract_alias_to_table(query)
+        assert alias_map["d"] == "documents"
+        assert alias_map["r"] == "rulings"
+        assert alias_map["c"] == "cases"
+
+    def test_alias_extraction_handles_cte(self) -> None:
+        """CTE references in the outer query are handled gracefully."""
+        # LATEST_SCRAPER_RUN_QUERY uses a CTE called ranked_runs
+        query = dqc.LATEST_SCRAPER_RUN_QUERY
+        alias_map = _extract_alias_to_table(query)
+        # Inside the CTE, sr and ct should be mapped
+        assert alias_map.get("sr") == "scraper_runs"
+        assert alias_map.get("ct") == "courts"
+
+    def test_column_extraction_ignores_string_literals(self) -> None:
+        """Column extraction does not pick up alias.column inside strings."""
+        query = """
+            SELECT d.id FROM documents d WHERE d.status = 'active.thing'
+        """
+        refs = _extract_column_references(query)
+        # Should find d.id and d.status but not active.thing
+        alias_cols = [(a, c) for a, c in refs]
+        assert ("d", "id") in alias_cols
+        assert ("d", "status") in alias_cols
+        assert ("active", "thing") not in alias_cols
+
+    def test_column_extraction_ignores_format_placeholders(self) -> None:
+        """Column extraction does not pick up things inside {braces}."""
+        query = """
+            SELECT d.id FROM documents d {county_filter}
+        """
+        refs = _extract_column_references(query)
+        alias_cols = [(a, c) for a, c in refs]
+        assert ("d", "id") in alias_cols
+        # county_filter should not appear
+        assert not any(c == "county_filter" for _, c in alias_cols)
