@@ -98,7 +98,8 @@ Evaluate the implementation against these criteria:
 4. **Code quality**: Does it follow existing patterns? Any debug code, hardcoded values, or forgotten TODOs?
 5. **Missing pieces**: Are there files that should have been created or modified but weren't?
 6. **Stale references**: Do comments, imports, or docstrings reference things that changed?
-7. **Performance**: Are there obvious bottlenecks? Sequential I/O that could be parallelized?
+7. **Documentation consistency**: If the change modifies behavior, configuration, or interfaces — do related docs (`docs/`, `CLAUDE.md`, `.claude/skills/`, `README.md`, `CONTRIBUTING.md`) need corresponding updates? Flag any docs that reference the old behavior.
+8. **Performance**: Are there obvious bottlenecks? Sequential I/O that could be parallelized?
    O(n^2) patterns? Missing connection pooling or batching for network calls?
 
 ## Your Response
