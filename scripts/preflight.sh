@@ -145,6 +145,110 @@ preflight_tf_not_root() {
 }
 
 # --------------------------------------------------------------------------
+# preflight_no_duplicate_pr <issue_number>
+#   Check whether an open PR already exists for the given issue number.
+#   Prevents duplicate PRs when a session loses context (e.g. after context
+#   compaction) or when multiple agents pick up the same issue.
+#
+#   Returns 0 and prints the existing PR number to stdout if a duplicate is
+#   found (caller should adopt that PR instead of creating a new one).
+#   Returns 1 if no duplicate exists (safe to create a new PR).
+#   Returns 2 on error (e.g. gh CLI not available).
+#
+#   Usage:
+#     existing_pr=$(preflight_no_duplicate_pr 42) && {
+#         echo "Adopting existing PR #$existing_pr"
+#     } || {
+#         echo "No duplicate — safe to create PR"
+#     }
+# --------------------------------------------------------------------------
+preflight_no_duplicate_pr() {
+    local issue_number="${1:-}"
+
+    if [[ -z "$issue_number" ]]; then
+        echo "PREFLIGHT FAIL: preflight_no_duplicate_pr requires an issue number argument." >&2
+        return 2
+    fi
+
+    # Strip leading # if present
+    issue_number="${issue_number#\#}"
+
+    if ! command -v gh &>/dev/null; then
+        echo "PREFLIGHT WARN: gh CLI not found — cannot check for duplicate PRs." >&2
+        return 2
+    fi
+
+    # Search for open PRs that reference this issue number in the title.
+    # The title format is typically "feat(area): description (#N)" so we
+    # search for "(#N)" to avoid false positives from unrelated numbers.
+    local pr_json
+    pr_json=$(gh pr list --repo judgemind/judgemind \
+        --state open \
+        --search "in:title #${issue_number}" \
+        --json number,title \
+        --limit 10 2>/dev/null) || {
+        echo "PREFLIGHT WARN: gh pr list failed — cannot check for duplicate PRs." >&2
+        return 2
+    }
+
+    # Parse results: look for PRs whose title contains "(#N)" or "#N"
+    # to confirm the match (the search API can return fuzzy matches).
+    local matching_pr=""
+    matching_pr=$(echo "$pr_json" | python3 -c "
+import sys, json, re
+data = json.load(sys.stdin)
+issue = '${issue_number}'
+for pr in data:
+    title = pr.get('title', '')
+    # Match (#N) at the end of conventional commit titles, or #N anywhere
+    if re.search(r'\(#' + re.escape(issue) + r'\)', title) or re.search(r'#' + re.escape(issue) + r'\b', title):
+        print(pr['number'])
+        break
+" 2>/dev/null) || {
+        echo "PREFLIGHT WARN: Could not parse PR search results." >&2
+        return 2
+    }
+
+    if [[ -n "$matching_pr" ]]; then
+        echo "PREFLIGHT WARN: Open PR #${matching_pr} already exists for issue #${issue_number}." >&2
+        echo "  Adopt the existing PR instead of creating a new one." >&2
+        echo "$matching_pr"
+        return 0
+    fi
+
+    # Also check by branch name pattern — branches often contain the issue number
+    local branch_name
+    branch_name=$(git symbolic-ref --short HEAD 2>/dev/null) || true
+
+    if [[ -n "$branch_name" ]]; then
+        local branch_pr_json
+        branch_pr_json=$(gh pr list --repo judgemind/judgemind \
+            --state open \
+            --head "$branch_name" \
+            --json number \
+            --limit 1 2>/dev/null) || true
+
+        local branch_pr
+        branch_pr=$(echo "$branch_pr_json" | python3 -c "
+import sys, json
+data = json.load(sys.stdin)
+if data:
+    print(data[0]['number'])
+" 2>/dev/null) || true
+
+        if [[ -n "$branch_pr" ]]; then
+            echo "PREFLIGHT WARN: Open PR #${branch_pr} already exists for branch '${branch_name}'." >&2
+            echo "  Adopt the existing PR instead of creating a new one." >&2
+            echo "$branch_pr"
+            return 0
+        fi
+    fi
+
+    # No duplicate found
+    return 1
+}
+
+# --------------------------------------------------------------------------
 # preflight_no_forbidden_syntax <command_string>
 #   Check a command string for forbidden shell patterns. Mirrors the checks
 #   in .claude/hooks/preflight-bash.sh but can be called from scripts.
