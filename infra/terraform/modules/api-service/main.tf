@@ -211,6 +211,47 @@ resource "aws_iam_role_policy" "api_secrets" {
   })
 }
 
+# ─── IAM: Task role for the API container ──────────────────────────────────
+# The task role is assumed by the container at runtime (as opposed to the
+# execution role, which is used by the ECS agent). The API needs SES
+# permissions to send transactional emails (verification, password reset).
+
+resource "aws_iam_role" "api_task" {
+  name        = "judgemind-api-task-${var.environment}"
+  description = "Assumed by the API container at runtime for SES email sending"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect    = "Allow"
+        Principal = { Service = "ecs-tasks.amazonaws.com" }
+        Action    = "sts:AssumeRole"
+      }
+    ]
+  })
+}
+
+resource "aws_iam_role_policy" "api_ses" {
+  name = "judgemind-api-ses-${var.environment}"
+  role = aws_iam_role.api_task.name
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid    = "AllowSESSend"
+        Effect = "Allow"
+        Action = [
+          "ses:SendEmail",
+          "ses:SendRawEmail",
+        ]
+        Resource = "*"
+      }
+    ]
+  })
+}
+
 # ─── ECS Task Definition ───────────────────────────────────────────────────
 
 resource "aws_ecs_task_definition" "api" {
@@ -220,6 +261,7 @@ resource "aws_ecs_task_definition" "api" {
   cpu                      = var.task_cpu
   memory                   = var.task_memory
   execution_role_arn       = var.execution_role_arn
+  task_role_arn            = aws_iam_role.api_task.arn
 
   container_definitions = jsonencode([
     {
@@ -260,7 +302,9 @@ resource "aws_ecs_task_definition" "api" {
         ],
         var.redis_url != "" ? [{ name = "REDIS_URL", value = var.redis_url }] : [],
         var.opensearch_url != "" ? [{ name = "OPENSEARCH_URL", value = var.opensearch_url }] : [],
-        var.cors_allowed_origins != "" ? [{ name = "CORS_ALLOWED_ORIGINS", value = var.cors_allowed_origins }] : []
+        var.cors_allowed_origins != "" ? [{ name = "CORS_ALLOWED_ORIGINS", value = var.cors_allowed_origins }] : [],
+        var.ses_configuration_set_name != "" ? [{ name = "SES_CONFIGURATION_SET", value = var.ses_configuration_set_name }] : [],
+        [{ name = "EMAIL_FROM", value = var.email_from }]
       )
 
       logConfiguration = {

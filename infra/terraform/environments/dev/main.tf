@@ -125,6 +125,8 @@ module "api_service" {
   opensearch_url                    = "https://${module.search.domain_endpoint}"
   opensearch_credentials_secret_arn = module.search.master_credentials_secret_arn
   cors_allowed_origins              = "https://dev.judgemind.org"
+  ses_configuration_set_name        = module.ses.configuration_set_name
+  email_from                        = "no-reply@judgemind.org"
 
   # Dev: 0.25 vCPU, 512 MB, single replica
   task_cpu           = 256

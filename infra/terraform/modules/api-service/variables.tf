@@ -112,3 +112,15 @@ variable "log_retention_days" {
   type        = number
   default     = 30
 }
+
+variable "ses_configuration_set_name" {
+  description = "SES configuration set name for transactional email tracking"
+  type        = string
+  default     = ""
+}
+
+variable "email_from" {
+  description = "Default sender address for transactional emails"
+  type        = string
+  default     = "no-reply@judgemind.org"
+}

@@ -37,3 +37,8 @@ output "acm_domain_validation_options" {
   description = "ACM certificate DNS validation records (create these in your DNS provider)"
   value       = aws_acm_certificate.api.domain_validation_options
 }
+
+output "task_role_arn" {
+  description = "ARN of the API task IAM role (assumed by the container at runtime)"
+  value       = aws_iam_role.api_task.arn
+}
