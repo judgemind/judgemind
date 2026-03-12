@@ -593,10 +593,20 @@ jobs:
               --dry-run
           fi
 
+  # ---------------------------------------------------------------
+  # ECS oneshot import guard: prevent scripts/ from importing siblings
+  # ---------------------------------------------------------------
+  oneshot-imports-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check for sibling imports in oneshot scripts
+        run: scripts/check-oneshot-imports.sh
+
   # Always runs. Reports success only when every applicable job passed or was
   # skipped (path filter did not match). Branch protection requires this check.
   ci-passed:
-    needs: [scraper-unit-tests, ingestion-tests, nlp-tests, api-tests, web-tests, telegram-bridge-tests, infra-validate, lambda-tests, coverage-check]
+    needs: [scraper-unit-tests, ingestion-tests, nlp-tests, api-tests, web-tests, telegram-bridge-tests, infra-validate, lambda-tests, coverage-check, oneshot-imports-check]
     if: always()
     runs-on: ubuntu-latest
     steps:
