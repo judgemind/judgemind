@@ -9,10 +9,10 @@
 The chat agent decision flow has three layers:
 
 1. **Lambda webhook handler** (`infra/telegram-bot/handler.py`) — validates users, enqueues to SQS
-2. **Responder daemon** (`scripts/tg-responder.py`) — polls SQS, calls Claude Haiku interpreter, dispatches actions
+2. **Responder daemon** (`scripts/tg-responder.py`) — polls SQS, calls Claude Opus interpreter, dispatches actions
 3. **Orchestrator** (`packages/telegram-bridge/src/telegram_bridge/orchestrator.py`) — reads file-based inbox, executes actions
 
-Message flow: Telegram -> Lambda -> SQS -> Responder -> Claude Haiku -> (reply to Telegram + write to inbox files) -> Orchestrator reads inbox
+Message flow: Telegram -> Lambda -> SQS -> Responder -> Claude Opus -> (reply to Telegram + write to inbox files) -> Orchestrator reads inbox
 
 ## Findings
 
@@ -20,7 +20,7 @@ Message flow: Telegram -> Lambda -> SQS -> Responder -> Claude Haiku -> (reply t
 
 **Problem:** Two independent parsing paths exist:
 
-- **Interpreter path** (Claude Haiku): `interpret_message()` in `interpreter.py` handles all messages via LLM. Returns structured JSON with `reply` and `actions`.
+- **Interpreter path** (Claude Opus): `interpret_message()` in `interpreter.py` handles all messages via LLM. Returns structured JSON with `reply` and `actions`.
 - **Legacy parser path**: `parse_command()` in `orchestrator.py` uses regex to match `status`, `start #N`, `stop #N`, `pause`, `resume`. Still called by `OrchestratorBridge.poll_commands()` which reads directly from SQS.
 
 The responder daemon uses the interpreter path and writes parsed commands to `tmp/tg_inbox.json`. The orchestrator reads this via `read_inbox()` which calls `_parse_inbox_entry()`. But `OrchestratorBridge.poll_commands()` (which polls SQS directly) still uses the old `parse_command()` regex parser.
@@ -55,7 +55,7 @@ The status file at review time showed 5 active agents with phases like "implemen
 
 **Problem:** The interpreter system prompt lists available actions but the user has no way to discover what the bot can do. There is no help command or capability listing. New users must guess.
 
-**Recommendation:** Add a special case in the interpreter prompt: when the user asks "help", "what can you do", etc., return a formatted list of capabilities. This costs nothing extra since it's handled within the existing Haiku call.
+**Recommendation:** Add a special case in the interpreter prompt: when the user asks "help", "what can you do", etc., return a formatted list of capabilities. This costs nothing extra since it's handled within the existing Opus call.
 
 ### 5. `file_issue` priority defaults to p2 without validation
 
