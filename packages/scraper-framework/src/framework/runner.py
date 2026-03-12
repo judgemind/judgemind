@@ -56,6 +56,8 @@ def _build_registry() -> list[tuple[str, type, callable]]:
     from courts.ca.sb_tentatives import default_config as sb_config
     from courts.ca.sc_tentatives import SCTentativeRulingsScraper
     from courts.ca.sc_tentatives import default_config as sc_config
+    from courts.ca.sd_tentatives import SDTentativeRulingsScraper
+    from courts.ca.sd_tentatives import default_config as sd_config
     from courts.ca.sf_tentatives import SFTentativeRulingsScraper
     from courts.ca.sf_tentatives import default_config as sf_config
     from courts.ca.ventura_tentatives import VenturaTentativeRulingsScraper
@@ -72,6 +74,7 @@ def _build_registry() -> list[tuple[str, type, callable]]:
             ("ca-riverside-tentatives", RiversideTentativeRulingsScraper, riverside_config),
             ("ca-sb-tentatives", SBTentativeRulingsScraper, sb_config),
             ("ca-sc-tentatives", SCTentativeRulingsScraper, sc_config),
+            ("ca-sd-tentatives", SDTentativeRulingsScraper, sd_config),
             ("ca-sf-tentatives-family-law", SFTentativeRulingsScraper, sf_config),
             ("ca-ventura-tentatives", VenturaTentativeRulingsScraper, ventura_config),
             ("federal-courtlistener-opinions", CourtListenerScraper, cl_config),
