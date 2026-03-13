@@ -482,6 +482,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       _VENV_HELPER_SKIP: "1"
+      PYTHONPATH: scripts
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
