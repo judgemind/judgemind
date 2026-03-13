@@ -5,6 +5,7 @@ import { useMutation } from '@apollo/client';
 import Link from 'next/link';
 import { REGISTER_MUTATION } from '@/lib/auth-mutations';
 import type { AuthPayload } from '@/lib/auth-mutations';
+import { setAccessToken } from '@/lib/auth-tokens';
 import { useAuth } from '@/providers/AuthProvider';
 import {
   AuthCard,
@@ -46,6 +47,7 @@ export default function RegisterPage() {
         variables: { email, password },
       });
       if (data?.register.user) {
+        setAccessToken(data.register.accessToken);
         setUser(data.register.user);
         setSuccess(true);
       }

@@ -6,6 +6,7 @@ import { useRouter } from 'next/navigation';
 import Link from 'next/link';
 import { LOGIN_MUTATION } from '@/lib/auth-mutations';
 import type { AuthPayload } from '@/lib/auth-mutations';
+import { setAccessToken } from '@/lib/auth-tokens';
 import { useAuth } from '@/providers/AuthProvider';
 import {
   AuthCard,
@@ -35,6 +36,7 @@ export default function LoginPage() {
         variables: { email, password },
       });
       if (data?.login.user) {
+        setAccessToken(data.login.accessToken);
         setUser(data.login.user);
         router.push('/');
       }

@@ -1,8 +1,28 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { ApolloLink } from '@apollo/client';
+
+// Mock @apollo/client/link/error before importing the module under test.
+// onError must return a valid ApolloLink instance for ApolloLink.from() to work.
+vi.mock('@apollo/client/link/error', () => ({
+  onError: vi.fn(
+    () =>
+      new ApolloLink((operation, forward) => {
+        return forward(operation);
+      }),
+  ),
+}));
+
+// Mock auth-tokens module
+vi.mock('../auth-tokens', () => ({
+  getAccessToken: vi.fn(() => null),
+  setAccessToken: vi.fn(),
+  clearAccessToken: vi.fn(),
+}));
 
 // Reset modules between tests to get fresh client instances
 beforeEach(() => {
   vi.resetModules();
+  vi.clearAllMocks();
 });
 
 describe('createApolloClient', () => {
@@ -20,7 +40,6 @@ describe('createApolloClient', () => {
 
     const { createApolloClient } = await import('../apollo-client');
     const client = createApolloClient();
-    // Client should be created without errors
     expect(client).toBeDefined();
 
     process.env.NEXT_PUBLIC_GRAPHQL_URL = originalEnv;
@@ -42,5 +61,11 @@ describe('createApolloClient', () => {
     const client1 = createApolloClient();
     const client2 = createApolloClient();
     expect(client1).not.toBe(client2);
+  });
+
+  it('configures the client with an InMemoryCache', async () => {
+    const { createApolloClient } = await import('../apollo-client');
+    const client = createApolloClient();
+    expect(client.cache).toBeDefined();
   });
 });
