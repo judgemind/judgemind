@@ -17,14 +17,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from ralph_checkpoint import (
     MARKER_PLAN_APPROVED,
-    MARKER_POST_RALPH,
     MARKER_SHIP,
     build_parser,
     extract_plan_from_comment,
-    extract_post_ralph_state,
     find_checkpoint_comment,
     format_plan_approved_comment,
-    format_post_ralph_comment,
     format_ship_comment,
 )
 
@@ -130,110 +127,9 @@ class TestFormatShipComment:
         assert "</details>" in body
 
 
-class TestFormatPostRalphComment:
-    """Tests for format_post_ralph_comment."""
-
-    def test_contains_marker(self) -> None:
-        body = format_post_ralph_comment("worker-1/session-123", "A.3")
-        assert MARKER_POST_RALPH in body
-
-    def test_contains_branch(self) -> None:
-        body = format_post_ralph_comment("worker-1/session-123", "A.5")
-        assert "worker-1/session-123" in body
-
-    def test_contains_step(self) -> None:
-        body = format_post_ralph_comment("branch", "A.7")
-        assert "A.7" in body
-
-    def test_committed_flag_yes(self) -> None:
-        body = format_post_ralph_comment("branch", "A.4", committed=True)
-        assert "**Committed:** yes" in body
-
-    def test_committed_flag_no(self) -> None:
-        body = format_post_ralph_comment("branch", "A.3", committed=False)
-        assert "**Committed:** no" in body
-
-    def test_pr_number(self) -> None:
-        body = format_post_ralph_comment("branch", "A.5", pr_number=123)
-        assert "**PR:** #123" in body
-
-    def test_pr_not_created(self) -> None:
-        body = format_post_ralph_comment("branch", "A.3")
-        assert "not yet created" in body
-
-    def test_files_list(self) -> None:
-        body = format_post_ralph_comment(
-            "branch", "A.3", files=["src/foo.py", "src/bar.py"]
-        )
-        assert "- `src/foo.py`" in body
-        assert "- `src/bar.py`" in body
-
-    def test_no_files(self) -> None:
-        body = format_post_ralph_comment("branch", "A.3")
-        assert "**Files changed:**" not in body
-
-    def test_has_details_block(self) -> None:
-        body = format_post_ralph_comment("branch", "A.3")
-        assert "<details>" in body
-        assert "</details>" in body
-
-
 # ---------------------------------------------------------------------------
 # Plan extraction tests
 # ---------------------------------------------------------------------------
-
-
-class TestExtractPostRalphState:
-    """Tests for extract_post_ralph_state."""
-
-    def test_extracts_all_fields(self) -> None:
-        body = format_post_ralph_comment(
-            "worker-2/session-456",
-            "A.5",
-            committed=True,
-            pr_number=99,
-            files=["src/a.py", "src/b.py"],
-        )
-        state = extract_post_ralph_state(body)
-        assert state["branch"] == "worker-2/session-456"
-        assert state["step"] == "A.5"
-        assert state["committed"] is True
-        assert state["pr"] == 99
-        assert state["files"] == ["src/a.py", "src/b.py"]
-
-    def test_extracts_minimal_fields(self) -> None:
-        body = format_post_ralph_comment("branch", "A.3")
-        state = extract_post_ralph_state(body)
-        assert state["branch"] == "branch"
-        assert state["step"] == "A.3"
-        assert state["committed"] is False
-        assert state["pr"] is None
-        assert state["files"] == []
-
-    def test_handles_no_match(self) -> None:
-        state = extract_post_ralph_state("no checkpoint here")
-        assert state["branch"] == ""
-        assert state["step"] == ""
-        assert state["committed"] is False
-        assert state["pr"] is None
-        assert state["files"] == []
-
-    def test_roundtrip_preserves_all_fields(self) -> None:
-        """Format then extract — all fields survive the roundtrip."""
-        original_files = ["scripts/ralph_checkpoint.py", "tests/test_it.py"]
-        body = format_post_ralph_comment(
-            "worker-5/session-abc",
-            "A.7",
-            committed=True,
-            pr_number=42,
-            files=original_files,
-        )
-        state = extract_post_ralph_state(body)
-        assert state["branch"] == "worker-5/session-abc"
-        assert state["step"] == "A.7"
-        assert state["committed"] is True
-        assert state["pr"] == 42
-        assert state["files"] == original_files
 
 
 class TestExtractPlanFromComment:
@@ -297,18 +193,6 @@ class TestFindCheckpointComment:
         result = find_checkpoint_comment(42, "ship")
         assert result is not None
         assert MARKER_SHIP in result
-
-    @patch("ralph_checkpoint._fetch_issue_comments")
-    def test_finds_post_ralph(
-        self,
-        mock_fetch: MagicMock,
-    ) -> None:
-        mock_fetch.return_value = [
-            {"body": f"post-ralph details\n{MARKER_POST_RALPH}"},
-        ]
-        result = find_checkpoint_comment(42, "post-ralph")
-        assert result is not None
-        assert MARKER_POST_RALPH in result
 
     @patch("ralph_checkpoint._fetch_issue_comments")
     def test_returns_none_when_not_found(
@@ -404,86 +288,16 @@ class TestBuildParser:
         assert args.branch == "worker-3/session-123"
         assert args.worktree == "/path/to/wt"
 
-    def test_post_ralph_args(self) -> None:
-        parser = build_parser()
-        args = parser.parse_args(
-            [
-                "post-ralph",
-                "--issue",
-                "42",
-                "--branch",
-                "worker-3/session-123",
-                "--step",
-                "A.5",
-                "--committed",
-                "--pr",
-                "99",
-                "--files",
-                "src/foo.py src/bar.py",
-            ]
-        )
-        assert args.issue == 42
-        assert args.branch == "worker-3/session-123"
-        assert args.step == "A.5"
-        assert args.committed is True
-        assert args.pr == 99
-        assert args.files == "src/foo.py src/bar.py"
-
-    def test_post_ralph_minimal_args(self) -> None:
-        parser = build_parser()
-        args = parser.parse_args(
-            [
-                "post-ralph",
-                "--issue",
-                "42",
-                "--branch",
-                "worker-3/session-123",
-                "--step",
-                "A.3",
-            ]
-        )
-        assert args.issue == 42
-        assert args.committed is False
-        assert args.pr is None
-        assert args.files == ""
-
-    def test_post_ralph_rejects_invalid_step(self) -> None:
-        parser = build_parser()
-        with pytest.raises(SystemExit):
-            parser.parse_args(
-                [
-                    "post-ralph",
-                    "--issue",
-                    "42",
-                    "--branch",
-                    "branch",
-                    "--step",
-                    "A.99",
-                ]
-            )
-
     def test_check_args(self) -> None:
         parser = build_parser()
         args = parser.parse_args(["check", "plan-approved", "--issue", "42"])
         assert args.checkpoint_type == "plan-approved"
         assert args.issue == 42
 
-    def test_check_post_ralph_args(self) -> None:
-        parser = build_parser()
-        args = parser.parse_args(["check", "post-ralph", "--issue", "42"])
-        assert args.checkpoint_type == "post-ralph"
-        assert args.issue == 42
-
     def test_read_args(self) -> None:
         parser = build_parser()
         args = parser.parse_args(["read", "ship", "--issue", "42"])
         assert args.checkpoint_type == "ship"
-        assert args.issue == 42
-
-    def test_read_post_ralph_args(self) -> None:
-        parser = build_parser()
-        args = parser.parse_args(["read", "post-ralph", "--issue", "42"])
-        assert args.checkpoint_type == "post-ralph"
         assert args.issue == 42
 
     def test_check_rejects_invalid_type(self) -> None:
@@ -520,22 +334,3 @@ class TestRoundtrip:
         body = format_plan_approved_comment(original, iterations=1)
         extracted = extract_plan_from_comment(body)
         assert extracted == original
-
-    def test_post_ralph_roundtrip(self) -> None:
-        files = [
-            "scripts/ralph_checkpoint.py",
-            "scripts/tests/test_ralph_checkpoint.py",
-        ]
-        body = format_post_ralph_comment(
-            "worker-8/session-20260312",
-            "A.5",
-            committed=True,
-            pr_number=1001,
-            files=files,
-        )
-        state = extract_post_ralph_state(body)
-        assert state["branch"] == "worker-8/session-20260312"
-        assert state["step"] == "A.5"
-        assert state["committed"] is True
-        assert state["pr"] == 1001
-        assert state["files"] == files
