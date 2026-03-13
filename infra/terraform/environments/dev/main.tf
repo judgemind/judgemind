@@ -130,6 +130,7 @@ module "api_service" {
   opensearch_url                    = "https://${module.search.domain_endpoint}"
   opensearch_credentials_secret_arn = module.search.master_credentials_secret_arn
   cors_allowed_origins              = "https://dev.judgemind.org"
+  document_archive_bucket_arn       = module.document_archive.bucket_arn
   ses_configuration_set_name        = module.ses.configuration_set_name
   email_from                        = "no-reply@judgemind.org"
 

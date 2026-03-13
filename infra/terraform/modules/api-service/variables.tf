@@ -124,3 +124,9 @@ variable "email_from" {
   type        = string
   default     = "no-reply@judgemind.org"
 }
+
+variable "document_archive_bucket_arn" {
+  description = "ARN of the document archive S3 bucket (for presigned URL generation)"
+  type        = string
+  default     = ""
+}
