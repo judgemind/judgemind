@@ -155,6 +155,33 @@ Write status: `phase: recovery-check`, `summary: Checking for crash recovery che
 
 Before starting ralph, check whether a previous agent already completed part of the work on this issue. The ralph checkpoint system persists state to GitHub issue comments (via `scripts/ralph_checkpoint.py`), so progress survives agent crashes and worktree cleanup.
 
+**Step 0 — Check for post-ralph checkpoint (highest priority):**
+
+```
+scripts/ralph_checkpoint.py check post-ralph --issue <N>
+```
+
+If the checkpoint exists (exit code 0), a previous agent crashed during steps A.3-A.9 (after ralph SHIP). Read the checkpoint to get the exact state:
+```
+scripts/ralph_checkpoint.py read post-ralph --issue <N>
+```
+This outputs JSON with: `branch`, `step`, `committed`, `pr`, `files`.
+
+1. Check if the branch still exists on the remote:
+   ```
+   git -C {worktree} fetch origin
+   git -C {worktree} ls-remote --heads origin <branch>
+   ```
+2. If the branch exists, check it out:
+   ```
+   git -C {worktree} checkout <branch>
+   ```
+3. Resume from the recorded step:
+   - If `committed` is `false`: jump to **A.3** (stage and commit the changes, then continue).
+   - If `committed` is `true` and `pr` is `null`: jump to **A.3** (push and create PR).
+   - If `pr` is set: jump to the recorded `step` (e.g. A.4, A.5, A.7). The PR already exists — verify its state and continue from there.
+4. If the branch does **not** exist: fall through to the SHIP checkpoint check below.
+
 **Step 1 — Check for SHIP checkpoint:**
 
 ```
@@ -200,11 +227,11 @@ If the checkpoint exists (exit code 0):
 
 **Step 3 — No checkpoints found:**
 
-If neither checkpoint exists (both exit code 1), proceed normally to A.2 with the full ralph flow (including complexity check and plan phase for non-trivial tasks).
+If no checkpoints exist (all exit code 1), proceed normally to A.2 with the full ralph flow (including complexity check and plan phase for non-trivial tasks).
 
 #### A.2 — Implement and review (ralph as foreground subagent)
 
-**Why a subagent?** Spawning ralph as a foreground subagent (via the Agent tool) keeps the parent `/task` agent's context clean. The ralph loop generates substantial implementation detail (code diffs, test output, review feedback) that would otherwise pollute the parent's context. When ralph returns, the parent still has a clear, short context with the remaining workflow steps (A.3–A.9) visible. This prevents the #721 failure mode where agents exit after ralph without completing the post-ralph steps.
+**Why a subagent?** Spawning ralph as a foreground subagent (via the Agent tool) keeps the parent `/task` agent's context clean. The ralph loop generates substantial implementation detail (code diffs, test output, review feedback) that would otherwise pollute the parent's context. When ralph returns, the parent still has a clear, short context with the remaining workflow steps (A.3-A.9) visible. This prevents the #721 failure mode where agents exit after ralph without completing the post-ralph steps.
 
 - **For testable code tasks** (Python, TypeScript): spawn `/ralph` as a **foreground subagent** using the Agent tool:
 
@@ -255,6 +282,11 @@ git -C {worktree} push -u origin <branch>
 ```
 Commit message format: `feat(area): description (#N)` (conventional commits).
 
+**Post-ralph checkpoint — after commit, before PR:** Write a checkpoint recording progress so a crash-recovering agent can skip ahead:
+```
+scripts/ralph_checkpoint.py post-ralph --issue <N> --branch <branch> --step A.3 --committed --files "<space-separated file list>"
+```
+
 Immediately open a PR after the first push — never push without creating one. **Before creating, check for duplicate PRs** to avoid wasting CI minutes on conflicting duplicates:
 
 ```
@@ -272,6 +304,11 @@ gh pr create --repo judgemind/judgemind \
     --title "..." \
     --body-file {worktree}/tmp/pr_body.txt \
     --base main
+```
+
+**Post-ralph checkpoint — after PR creation:** Update the checkpoint with the PR number:
+```
+scripts/ralph_checkpoint.py post-ralph --issue <N> --branch <branch> --step A.4 --committed --pr <PR-N> --files "<space-separated file list>"
 ```
 
 #### A.4 — Verify no merge conflicts
@@ -292,6 +329,11 @@ Write status: `phase: ci-watch`, `summary: Watching CI run <run-id>`.
 gh run watch <run-id> --repo judgemind/judgemind --exit-status --compact
 ```
 If CI fails: write status `phase: ci-fix`, `summary: Fixing CI failure: <brief reason>`. Diagnose, fix locally, push, return to A.4. Repeat until all checks pass.
+
+**Post-ralph checkpoint — after CI green:** Update the checkpoint to record that CI has passed:
+```
+scripts/ralph_checkpoint.py post-ralph --issue <N> --branch <branch> --step A.7 --committed --pr <PR-N>
+```
 
 #### A.6 — Update the PR test plan
 Fetch the current PR body, check off automated steps that passed in CI, run any manual smoke tests in a temporary smoketest worktree (see CLAUDE.md §4.8 for the pattern), write the updated body to `{worktree}/tmp/pr_body.txt`, then:

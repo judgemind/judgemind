@@ -2,7 +2,7 @@
 """Post and read structured checkpoint comments on GitHub issues.
 
 Used by the ralph loop to persist state at key milestones (plan approved,
-SHIP) so that crash recovery can detect what stage a task reached.
+SHIP, post-ralph) so that crash recovery can detect what stage a task reached.
 
 This script is stdlib-only — no venv is needed.  It shells out to ``gh``
 for all GitHub API calls.
@@ -16,11 +16,16 @@ Usage:
     scripts/ralph_checkpoint.py ship \
         --issue 42 --branch worker-3/session-... --worktree {worktree}
 
-    # Check if a checkpoint exists (exit 0 = yes, 1 = no)
-    scripts/ralph_checkpoint.py check plan-approved --issue 42
+    # Post post-ralph progress checkpoint
+    scripts/ralph_checkpoint.py post-ralph \
+        --issue 42 --branch worker-3/session-... --step A.3 \
+        [--committed] [--pr 123] [--files "src/foo.py src/bar.py"]
 
-    # Read plan content from existing checkpoint
-    scripts/ralph_checkpoint.py read plan-approved --issue 42
+    # Check if a checkpoint exists (exit 0 = yes, 1 = no)
+    scripts/ralph_checkpoint.py check post-ralph --issue 42
+
+    # Read checkpoint content
+    scripts/ralph_checkpoint.py read post-ralph --issue 42
 """
 
 from __future__ import annotations
@@ -38,11 +43,16 @@ REPO = "judgemind/judgemind"
 # Machine-readable HTML markers embedded in checkpoint comments.
 MARKER_PLAN_APPROVED = "<!-- ralph-checkpoint:plan-approved -->"
 MARKER_SHIP = "<!-- ralph-checkpoint:ship -->"
+MARKER_POST_RALPH = "<!-- ralph-checkpoint:post-ralph -->"
 
 MARKERS: dict[str, str] = {
     "plan-approved": MARKER_PLAN_APPROVED,
     "ship": MARKER_SHIP,
+    "post-ralph": MARKER_POST_RALPH,
 }
+
+# Valid post-ralph steps in workflow order.
+POST_RALPH_STEPS = ("A.3", "A.4", "A.5", "A.6", "A.7", "A.8", "A.9")
 
 
 # ---------------------------------------------------------------------------
@@ -170,6 +180,45 @@ def extract_plan_from_comment(body: str) -> str:
     return ""
 
 
+def extract_post_ralph_state(body: str) -> dict[str, Any]:
+    """Extract structured state from a post-ralph checkpoint comment.
+
+    Returns a dict with keys: ``branch``, ``step``, ``committed``,
+    ``pr`` (int or None), ``files`` (list of str).
+    """
+    state: dict[str, Any] = {
+        "branch": "",
+        "step": "",
+        "committed": False,
+        "pr": None,
+        "files": [],
+    }
+    branch_match = re.search(r"\*\*Branch:\*\*\s*`([^`]+)`", body)
+    if branch_match:
+        state["branch"] = branch_match.group(1)
+
+    step_match = re.search(r"\*\*Current step:\*\*\s*`([^`]+)`", body)
+    if step_match:
+        state["step"] = step_match.group(1)
+
+    committed_match = re.search(r"\*\*Committed:\*\*\s*(yes|no)", body, re.IGNORECASE)
+    if committed_match:
+        state["committed"] = committed_match.group(1).lower() == "yes"
+
+    pr_match = re.search(r"\*\*PR:\*\*\s*#(\d+)", body)
+    if pr_match:
+        state["pr"] = int(pr_match.group(1))
+
+    files_match = re.search(
+        r"\*\*Files changed:\*\*\s*\n((?:- `[^`]+`\n?)+)",
+        body,
+    )
+    if files_match:
+        state["files"] = re.findall(r"- `([^`]+)`", files_match.group(1))
+
+    return state
+
+
 # ---------------------------------------------------------------------------
 # Comment formatting
 # ---------------------------------------------------------------------------
@@ -284,6 +333,41 @@ def format_ship_comment(
     )
 
 
+def format_post_ralph_comment(
+    branch: str,
+    step: str,
+    *,
+    committed: bool = False,
+    pr_number: int | None = None,
+    files: list[str] | None = None,
+) -> str:
+    """Format the post-ralph progress checkpoint comment.
+
+    This checkpoint records progress through steps A.3-A.9 so that a
+    crash-recovering agent can skip directly to the correct step.
+    """
+    committed_str = "yes" if committed else "no"
+    pr_str = f"#{pr_number}" if pr_number else "not yet created"
+
+    files_block = ""
+    if files:
+        file_lines = "\n".join(f"- `{f}`" for f in files)
+        files_block = f"**Files changed:**\n{file_lines}\n\n"
+
+    return (
+        "<details>\n"
+        f"<summary>\U0001f504 Post-ralph checkpoint \u2014 step {step}"
+        f"</summary>\n\n"
+        f"**Branch:** `{branch}`\n"
+        f"**Current step:** `{step}`\n"
+        f"**Committed:** {committed_str}\n"
+        f"**PR:** {pr_str}\n\n"
+        f"{files_block}"
+        f"</details>\n\n"
+        f"{MARKER_POST_RALPH}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Subcommands
 # ---------------------------------------------------------------------------
@@ -307,6 +391,20 @@ def cmd_ship(args: argparse.Namespace) -> None:
     body = format_ship_comment(args.branch, args.worktree)
     _post_comment(args.issue, body)
     print(f"Posted SHIP checkpoint on issue #{args.issue}")
+
+
+def cmd_post_ralph(args: argparse.Namespace) -> None:
+    """Post a post-ralph progress checkpoint comment."""
+    files = args.files.split() if args.files else []
+    body = format_post_ralph_comment(
+        branch=args.branch,
+        step=args.step,
+        committed=args.committed,
+        pr_number=args.pr,
+        files=files,
+    )
+    _post_comment(args.issue, body)
+    print(f"Posted post-ralph checkpoint (step {args.step}) on issue #{args.issue}")
 
 
 def cmd_check(args: argparse.Namespace) -> None:
@@ -336,6 +434,10 @@ def cmd_read(args: argparse.Namespace) -> None:
     if args.checkpoint_type == "plan-approved":
         content = extract_plan_from_comment(body)
         print(content)
+    elif args.checkpoint_type == "post-ralph":
+        state = extract_post_ralph_state(body)
+        # Output as JSON for machine-readable consumption
+        print(json.dumps(state, indent=2))
     elif args.checkpoint_type == "ship":
         # For ship, output the full details block content
         print(body)
@@ -393,6 +495,38 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_ship.set_defaults(func=cmd_ship)
 
+    # post-ralph
+    p_post_ralph = subparsers.add_parser(
+        "post-ralph",
+        help="Post a post-ralph progress checkpoint comment.",
+    )
+    p_post_ralph.add_argument("--issue", type=int, required=True, help="Issue number.")
+    p_post_ralph.add_argument("--branch", required=True, help="Branch name.")
+    p_post_ralph.add_argument(
+        "--step",
+        required=True,
+        choices=POST_RALPH_STEPS,
+        help="Current workflow step (A.3 through A.9).",
+    )
+    p_post_ralph.add_argument(
+        "--committed",
+        action="store_true",
+        default=False,
+        help="Whether the commit has been made.",
+    )
+    p_post_ralph.add_argument(
+        "--pr",
+        type=int,
+        default=None,
+        help="PR number if one has been created.",
+    )
+    p_post_ralph.add_argument(
+        "--files",
+        default="",
+        help="Space-separated list of changed files.",
+    )
+    p_post_ralph.set_defaults(func=cmd_post_ralph)
+
     # check
     p_check = subparsers.add_parser(
         "check",
@@ -400,7 +534,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_check.add_argument(
         "checkpoint_type",
-        choices=["plan-approved", "ship"],
+        choices=["plan-approved", "ship", "post-ralph"],
         help="Type of checkpoint to check.",
     )
     p_check.add_argument("--issue", type=int, required=True, help="Issue number.")
@@ -413,7 +547,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_read.add_argument(
         "checkpoint_type",
-        choices=["plan-approved", "ship"],
+        choices=["plan-approved", "ship", "post-ralph"],
         help="Type of checkpoint to read.",
     )
     p_read.add_argument("--issue", type=int, required=True, help="Issue number.")
