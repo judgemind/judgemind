@@ -2710,3 +2710,120 @@ def test_heartbeat_includes_idle_duration(mock_psycopg: MagicMock) -> None:
         idle_seconds = call_args[1]["extra"]["idle_seconds"]
         # Should be approximately 300 seconds (5 minutes), allow some tolerance
         assert idle_seconds >= 299
+
+
+# ---------------------------------------------------------------------------
+# insert_ruling with ruling_text_html
+# ---------------------------------------------------------------------------
+
+
+def test_insert_ruling_with_ruling_text_html() -> None:
+    """insert_ruling stores ruling_text_html and includes it in ON CONFLICT."""
+    mock_conn = MagicMock()
+    mock_cur = MagicMock()
+    mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cur)
+    mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+
+    insert_ruling(
+        mock_conn,
+        document_id="doc-uuid-1",
+        case_id="case-uuid-1",
+        court_id="court-uuid-1",
+        hearing_date=date(2026, 3, 5),
+        ruling_text="Motion GRANTED.",
+        department="Dept. 1",
+        ruling_text_html='<div class="ruling"><p>Motion <strong>GRANTED</strong>.</p></div>',
+    )
+
+    sql = str(mock_cur.execute.call_args)
+    assert "ruling_text_html" in sql
+    assert "COALESCE(EXCLUDED.ruling_text_html, rulings.ruling_text_html)" in sql
+
+
+def test_insert_ruling_with_ruling_text_html_none() -> None:
+    """insert_ruling works when ruling_text_html is None (default)."""
+    mock_conn = MagicMock()
+    mock_cur = MagicMock()
+    mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cur)
+    mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+
+    insert_ruling(
+        mock_conn,
+        document_id="doc-uuid-1",
+        case_id="case-uuid-1",
+        court_id="court-uuid-1",
+        hearing_date=date(2026, 3, 5),
+        ruling_text="Motion GRANTED.",
+        department="Dept. 1",
+    )
+
+    # Should still pass — ruling_text_html defaults to None
+    mock_cur.execute.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Ruling formatting integration tests
+# ---------------------------------------------------------------------------
+
+
+@patch("ingestion.worker.format_ruling_text")
+@patch("ingestion.worker.psycopg")
+def test_process_event_formats_ruling_when_enabled(
+    mock_psycopg: MagicMock,
+    mock_format: MagicMock,
+) -> None:
+    """When ENABLE_RULING_FORMATTING is set, format_ruling_text is called."""
+    worker, os_mock = _make_worker()
+    worker._formatting_enabled = True
+    worker._formatting_client = MagicMock()
+    formatted_html = '<div class="ruling"><p>Motion GRANTED.</p></div>'
+    mock_format.return_value = formatted_html
+
+    mock_conn, mock_cur = _make_mock_conn()
+    mock_psycopg.connect.return_value = mock_conn
+    mock_cur.fetchone.side_effect = [
+        ("court-uuid-1",),  # upsert_court
+        ("case-uuid-1",),  # upsert_case
+        (True,),  # insert_document
+        None,  # resolve_judge: no existing alias
+        ("judge-uuid-1",),  # INSERT INTO judges
+    ]
+    mock_cur.fetchall.return_value = []
+
+    event = _make_event()
+    worker.process_event(event)
+
+    # Verify format_ruling_text was called
+    mock_format.assert_called_once()
+
+    # Verify insert_ruling received the formatted HTML
+    sql = str(mock_cur.execute.call_args_list)
+    assert "ruling_text_html" in sql
+
+
+@patch("ingestion.worker.format_ruling_text")
+@patch("ingestion.worker.psycopg")
+def test_process_event_formatting_disabled_by_default(
+    mock_psycopg: MagicMock,
+    mock_format: MagicMock,
+) -> None:
+    """When ENABLE_RULING_FORMATTING is not set, format_ruling_text is not called."""
+    worker, os_mock = _make_worker()
+    # _formatting_enabled defaults to False
+    assert not worker._formatting_enabled
+
+    mock_conn, mock_cur = _make_mock_conn()
+    mock_psycopg.connect.return_value = mock_conn
+    mock_cur.fetchone.side_effect = [
+        ("court-uuid-1",),  # upsert_court
+        ("case-uuid-1",),  # upsert_case
+        (True,),  # insert_document
+        None,  # resolve_judge: no existing alias
+        ("judge-uuid-1",),  # INSERT INTO judges
+    ]
+    mock_cur.fetchall.return_value = []
+
+    event = _make_event()
+    worker.process_event(event)
+
+    mock_format.assert_not_called()
