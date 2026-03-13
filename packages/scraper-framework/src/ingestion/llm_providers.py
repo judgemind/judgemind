@@ -54,6 +54,7 @@ def _call_anthropic(
     client: object | None = None,
     max_retries: int = 1,
     timeout: float | None = None,
+    max_tokens: int = 4096,
 ) -> LLMResponse | None:
     """Call the Anthropic Messages API.
 
@@ -88,7 +89,7 @@ def _call_anthropic(
         try:
             response = client.messages.create(
                 model=model,
-                max_tokens=4096,
+                max_tokens=max_tokens,
                 temperature=0,
                 system=system_prompt,
                 messages=[{"role": "user", "content": user_message}],
@@ -127,6 +128,7 @@ def _call_google(
     client: object | None = None,
     max_retries: int = 1,
     timeout: float | None = None,
+    max_tokens: int = 4096,
 ) -> LLMResponse | None:
     """Call the Google GenAI API.
 
@@ -169,7 +171,7 @@ def _call_google(
     config_kwargs: dict = {
         "system_instruction": system_prompt,
         "temperature": 0,
-        "max_output_tokens": 4096,
+        "max_output_tokens": max_tokens,
         "response_mime_type": "application/json",
     }
     if timeout is not None:
@@ -229,6 +231,7 @@ def call_llm(
     client: object | None = None,
     max_retries: int = 1,
     timeout: float | None = None,
+    max_tokens: int = 4096,
 ) -> LLMResponse | None:
     """Call an LLM provider and return the response.
 
@@ -268,6 +271,7 @@ def call_llm(
             client=client,
             max_retries=max_retries,
             timeout=timeout,
+            max_tokens=max_tokens,
         )
     elif resolved_provider == "google":
         return _call_google(
@@ -277,6 +281,7 @@ def call_llm(
             client=client,
             max_retries=max_retries,
             timeout=timeout,
+            max_tokens=max_tokens,
         )
     else:
         logger.error("llm_providers.unknown_provider", provider=resolved_provider)

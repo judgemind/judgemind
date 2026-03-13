@@ -483,6 +483,7 @@ def insert_ruling(
     judge_id: str | None = None,
     outcome: str | None = None,
     motion_type: str | None = None,
+    ruling_text_html: str | None = None,
 ) -> None:
     """Upsert a ruling row linked to the document.
 
@@ -494,8 +495,11 @@ def insert_ruling(
 
     ``outcome`` must be a valid ``ruling_outcome`` enum value (e.g.
     ``"granted"``, ``"denied"``) or ``None``.  ``motion_type`` is free-text.
+
+    ``ruling_text_html`` is LLM-formatted semantic HTML for display.
     """
     ruling_text = _strip_nul(ruling_text)
+    ruling_text_html = _strip_nul(ruling_text_html)
     department = _strip_nul(department)
     outcome = _strip_nul(outcome)
     motion_type = _strip_nul(motion_type)
@@ -504,11 +508,13 @@ def insert_ruling(
             """
             INSERT INTO rulings (
                 document_id, case_id, court_id, judge_id,
-                hearing_date, ruling_text, department, is_tentative,
+                hearing_date, ruling_text, ruling_text_html,
+                department, is_tentative,
                 outcome, motion_type
             )
             VALUES (
-                %s::uuid, %s::uuid, %s::uuid, %s::uuid, %s::date, %s, %s, TRUE,
+                %s::uuid, %s::uuid, %s::uuid, %s::uuid, %s::date, %s, %s,
+                %s, TRUE,
                 %s::ruling_outcome, %s
             )
             ON CONFLICT (document_id) DO UPDATE SET
@@ -516,6 +522,7 @@ def insert_ruling(
                 outcome = COALESCE(EXCLUDED.outcome, rulings.outcome),
                 motion_type = COALESCE(EXCLUDED.motion_type, rulings.motion_type),
                 ruling_text = COALESCE(EXCLUDED.ruling_text, rulings.ruling_text),
+                ruling_text_html = COALESCE(EXCLUDED.ruling_text_html, rulings.ruling_text_html),
                 department = COALESCE(EXCLUDED.department, rulings.department)
             """,
             (
@@ -525,6 +532,7 @@ def insert_ruling(
                 judge_id,
                 hearing_date,
                 ruling_text,
+                ruling_text_html,
                 department,
                 outcome,
                 motion_type,

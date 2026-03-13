@@ -17,6 +17,7 @@ Environment variables:
     MAX_RETRIES       — Per-message retry limit before dead-lettering (default: 3)
     HEARTBEAT_INTERVAL — Empty poll cycles between heartbeat log messages (default: 60)
     HEARTBEAT_LOG_LEVEL — Log level for heartbeat messages: "DEBUG" or "INFO" (default: "INFO")
+    ENABLE_RULING_FORMATTING — Enable LLM-powered ruling text formatting (default: disabled)
 """
 
 from __future__ import annotations
@@ -66,6 +67,7 @@ from .llm_extract import (
     is_pdf_binary,
 )
 from .llm_providers import create_client as create_llm_client
+from .ruling_formatter import format_ruling_text
 from .text_cleanup import clean_ruling_text
 
 if TYPE_CHECKING:
@@ -216,6 +218,22 @@ class IngestionWorker:
         self._heartbeat_log_level: int = getattr(logging, heartbeat_level_env, logging.INFO)
         self._empty_polls: int = 0
         self._last_event_time: float = time.monotonic()
+
+        # Ruling formatting — uses a dedicated Anthropic client (always Haiku),
+        # separate from the field extraction LLM client which may use Google.
+        self._formatting_enabled = os.environ.get("ENABLE_RULING_FORMATTING", "").lower() in (
+            "1",
+            "true",
+            "yes",
+        )
+        self._formatting_client: object | None = None
+        if self._formatting_enabled:
+            self._formatting_client = create_llm_client(provider="anthropic")
+            if self._formatting_client is None:
+                logger.warning(
+                    "Ruling formatting enabled but ANTHROPIC_API_KEY not set — "
+                    "formatting will use <pre> fallback"
+                )
 
         # LA County department-to-judge mapping — lazy-loaded on first LA event.
         # None means "not yet fetched"; empty dict means "fetch failed or empty".
@@ -581,6 +599,27 @@ class IngestionWorker:
                 },
             )
 
+        # ------------------------------------------------------------------
+        # LLM-powered ruling text formatting (opt-in via ENABLE_RULING_FORMATTING)
+        # ------------------------------------------------------------------
+        ruling_text_html: str | None = None
+        if self._formatting_enabled and cleaned_ruling_text:
+            t0_fmt = time.monotonic()
+            ruling_text_html = format_ruling_text(
+                cleaned_ruling_text,
+                client=self._formatting_client,
+                timeout=self._llm_timeout,
+            )
+            fmt_latency_ms = round((time.monotonic() - t0_fmt) * 1000)
+            logger.info(
+                "Ruling formatting completed",
+                extra={
+                    "document_id": document_id,
+                    "formatting_latency_ms": fmt_latency_ms,
+                    "is_pre_fallback": "<pre>" in ruling_text_html if ruling_text_html else False,
+                },
+            )
+
         conn = self._get_connection()
         try:
             # 1. Ensure court exists
@@ -627,6 +666,7 @@ class IngestionWorker:
                     court_id=court_id,
                     hearing_date=hearing_dt,
                     ruling_text=cleaned_ruling_text,
+                    ruling_text_html=ruling_text_html,
                     department=department,
                     judge_id=judge_id,
                     outcome=outcome,
