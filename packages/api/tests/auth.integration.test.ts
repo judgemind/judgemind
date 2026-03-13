@@ -403,7 +403,7 @@ describe('Auth — integration', () => {
       const cookieStr = Array.isArray(setCookie) ? setCookie[0] : setCookie;
       expect(cookieStr).toContain('refreshToken=');
       expect(cookieStr).toContain('HttpOnly');
-      expect(cookieStr).toContain('SameSite=Strict');
+      expect(cookieStr).toContain('SameSite=None');
     });
 
     it('updates last_login_at on successful login', async () => {

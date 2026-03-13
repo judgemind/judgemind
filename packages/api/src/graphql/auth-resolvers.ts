@@ -64,7 +64,7 @@ async function setRefreshTokenCookie(
   );
   reply.header(
     'set-cookie',
-    `refreshToken=${token}; HttpOnly; Secure; SameSite=Strict; Path=/graphql; Max-Age=${30 * 24 * 60 * 60}`,
+    `refreshToken=${token}; HttpOnly; Secure; SameSite=None; Path=/graphql; Max-Age=${30 * 24 * 60 * 60}`,
   );
 }
 
@@ -201,7 +201,7 @@ export const authResolvers = {
       // Clear cookie
       reply.header(
         'set-cookie',
-        'refreshToken=; HttpOnly; Secure; SameSite=Strict; Path=/graphql; Max-Age=0',
+        'refreshToken=; HttpOnly; Secure; SameSite=None; Path=/graphql; Max-Age=0',
       );
 
       return true;
