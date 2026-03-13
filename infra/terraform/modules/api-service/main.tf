@@ -257,6 +257,30 @@ resource "aws_iam_role_policy" "api_ses" {
   })
 }
 
+# ─── IAM: S3 read access for document downloads ──────────────────────────
+# The document download endpoint generates presigned S3 URLs. The task role
+# must have s3:GetObject permission on the archive bucket for these URLs to
+# work when the client follows the redirect.
+
+resource "aws_iam_role_policy" "api_s3_read" {
+  count = var.document_archive_bucket_arn != "" ? 1 : 0
+
+  name = "judgemind-api-s3-read-${var.environment}"
+  role = aws_iam_role.api_task.name
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid      = "AllowDocumentDownload"
+        Effect   = "Allow"
+        Action   = "s3:GetObject"
+        Resource = "${var.document_archive_bucket_arn}/*"
+      }
+    ]
+  })
+}
+
 # ─── ECS Task Definition ───────────────────────────────────────────────────
 
 resource "aws_ecs_task_definition" "api" {
