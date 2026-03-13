@@ -7,6 +7,7 @@ these tests run offline in CI without any infrastructure.
 from __future__ import annotations
 
 import json
+import time
 from datetime import date, datetime
 from unittest.mock import MagicMock, patch
 
@@ -25,6 +26,7 @@ from ingestion.db import (
     upsert_party,
 )
 from ingestion.worker import (
+    DEFAULT_HEARTBEAT_INTERVAL,
     InfrastructureError,
     IngestionWorker,
     _parse_date,
@@ -2594,3 +2596,117 @@ def test_process_event_regex_case_title_extraction(
 
     mock_extract_title.assert_called_once()
     mock_conn.commit.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Heartbeat logging tests
+# ---------------------------------------------------------------------------
+
+
+@patch("ingestion.worker.psycopg")
+def test_heartbeat_emitted_after_interval_empty_polls(mock_psycopg: MagicMock) -> None:
+    """Worker emits a heartbeat log after HEARTBEAT_INTERVAL consecutive empty polls."""
+    worker, _ = _make_worker()
+    worker._redis.xreadgroup.return_value = None
+
+    with patch("ingestion.worker.logger") as mock_logger:
+        # Simulate (interval - 1) empty polls — no heartbeat yet
+        for _ in range(DEFAULT_HEARTBEAT_INTERVAL - 1):
+            worker._process_batch(batch_size=10, block_ms=5000)
+        mock_logger.log.assert_not_called()
+
+        # The interval-th poll triggers the heartbeat
+        worker._process_batch(batch_size=10, block_ms=5000)
+        mock_logger.log.assert_called_once()
+        call_args = mock_logger.log.call_args
+        assert "Heartbeat" in call_args[0][1]
+        assert "idle_seconds" in call_args[1]["extra"]
+        assert "empty_polls" in call_args[1]["extra"]
+        assert "consumer" in call_args[1]["extra"]
+
+
+@patch("ingestion.worker.psycopg")
+def test_heartbeat_resets_after_message_received(mock_psycopg: MagicMock) -> None:
+    """Empty poll counter resets when a message is processed."""
+    worker, _ = _make_worker()
+    worker.process_event = MagicMock()
+
+    # Accumulate some empty polls
+    worker._redis.xreadgroup.return_value = None
+    for _ in range(DEFAULT_HEARTBEAT_INTERVAL - 1):
+        worker._process_batch(batch_size=10, block_ms=5000)
+
+    assert worker._empty_polls == DEFAULT_HEARTBEAT_INTERVAL - 1
+
+    # Now process a message — counter should reset
+    event_data = _make_event()
+    worker._redis.xreadgroup.return_value = [
+        (b"document.captured", [(b"1234-0", {b"data": json.dumps(event_data).encode()})])
+    ]
+    worker._process_batch(batch_size=10, block_ms=5000)
+
+    assert worker._empty_polls == 0
+
+
+@patch("ingestion.worker.psycopg")
+def test_heartbeat_repeats_periodically(mock_psycopg: MagicMock) -> None:
+    """Heartbeat fires every HEARTBEAT_INTERVAL empty polls, not just once."""
+    worker, _ = _make_worker()
+    worker._redis.xreadgroup.return_value = None
+
+    with patch("ingestion.worker.logger") as mock_logger:
+        # Run for 2x the interval
+        for _ in range(DEFAULT_HEARTBEAT_INTERVAL * 2):
+            worker._process_batch(batch_size=10, block_ms=5000)
+        assert mock_logger.log.call_count == 2
+
+
+@patch("ingestion.worker.psycopg")
+def test_heartbeat_log_level_default_is_info(mock_psycopg: MagicMock) -> None:
+    """By default heartbeat logs at INFO level."""
+    import logging
+
+    worker, _ = _make_worker()
+    assert worker._heartbeat_log_level == logging.INFO
+
+
+@patch.dict("os.environ", {"HEARTBEAT_LOG_LEVEL": "DEBUG"})
+@patch("ingestion.worker.psycopg")
+def test_heartbeat_log_level_configurable(mock_psycopg: MagicMock) -> None:
+    """HEARTBEAT_LOG_LEVEL env var changes the heartbeat log level."""
+    import logging
+
+    worker, _ = _make_worker()
+    assert worker._heartbeat_log_level == logging.DEBUG
+
+
+@patch.dict("os.environ", {"HEARTBEAT_INTERVAL": "10"})
+@patch("ingestion.worker.psycopg")
+def test_heartbeat_interval_configurable(mock_psycopg: MagicMock) -> None:
+    """HEARTBEAT_INTERVAL env var changes the heartbeat frequency."""
+    worker, _ = _make_worker()
+    worker._redis.xreadgroup.return_value = None
+
+    with patch("ingestion.worker.logger") as mock_logger:
+        for _ in range(10):
+            worker._process_batch(batch_size=10, block_ms=5000)
+        assert mock_logger.log.call_count == 1
+
+
+@patch("ingestion.worker.psycopg")
+def test_heartbeat_includes_idle_duration(mock_psycopg: MagicMock) -> None:
+    """Heartbeat reports the time since the last event was processed."""
+    worker, _ = _make_worker()
+    worker._redis.xreadgroup.return_value = None
+
+    # Set last_event_time to a known past value
+    worker._last_event_time = time.monotonic() - 300  # 5 min ago
+
+    with patch("ingestion.worker.logger") as mock_logger:
+        for _ in range(DEFAULT_HEARTBEAT_INTERVAL):
+            worker._process_batch(batch_size=10, block_ms=5000)
+
+        call_args = mock_logger.log.call_args
+        idle_seconds = call_args[1]["extra"]["idle_seconds"]
+        # Should be approximately 300 seconds (5 minutes), allow some tolerance
+        assert idle_seconds >= 299
