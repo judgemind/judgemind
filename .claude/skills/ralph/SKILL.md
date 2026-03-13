@@ -151,6 +151,7 @@ The Claude reviewer prompt should be:
 > 4. Evaluate against these criteria:
 >    - **Correctness**: Does the implementation satisfy the acceptance criteria in task.md?
 >    - **Test coverage**: Are there tests for each acceptance criterion and obvious edge cases?
+>    - **Test requirement (hard reject)**: If the implementation adds new functionality (not trivial changes like doc fixes, config tweaks, or comment-only edits), every acceptance criterion from task.md MUST have a corresponding test. Implementations without tests for new behavior are always REVISE, regardless of code quality.
 >    - **Scope**: Are there changes unrelated to the issue (scope creep, extra refactors, unrelated fixes)?
 >    - **Code quality**: Does it follow existing patterns? Any debug code, hardcoded values, or forgotten TODOs?
 >    - **Missing pieces**: Are there files that should have been created or modified but weren't?
