@@ -387,3 +387,115 @@ resource "aws_ecs_service" "api" {
     environment = var.environment
   }
 }
+
+# ─── CloudWatch Alarms ────────────────────────────────────────────────────────
+# ALB-based alarms for HTTP error rates, latency, and host health. These use
+# metrics published automatically by the ALB — no application code changes
+# needed.
+
+locals {
+  # The ALB ARN suffix is the portion after "loadbalancer/". CloudWatch ALB
+  # metrics use this as the dimension value.
+  alb_arn_suffix = aws_lb.api.arn_suffix
+  tg_arn_suffix  = aws_lb_target_group.api.arn_suffix
+}
+
+resource "aws_cloudwatch_metric_alarm" "api_5xx" {
+  count = var.enable_alerts ? 1 : 0
+
+  alarm_name        = "judgemind-api-5xx-${var.environment}"
+  alarm_description = "API 5xx error rate exceeded ${var.error_5xx_threshold} in 5 minutes (${var.environment})"
+
+  namespace   = "AWS/ApplicationELB"
+  metric_name = "HTTPCode_Target_5XX_Count"
+  statistic   = "Sum"
+  dimensions = {
+    LoadBalancer = local.alb_arn_suffix
+    TargetGroup  = local.tg_arn_suffix
+  }
+
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  threshold           = var.error_5xx_threshold
+  period              = 300
+  evaluation_periods  = 1
+  datapoints_to_alarm = 1
+  treat_missing_data  = "notBreaching"
+
+  alarm_actions = [var.alert_sns_topic_arn]
+  ok_actions    = [var.alert_sns_topic_arn]
+}
+
+resource "aws_cloudwatch_metric_alarm" "api_4xx" {
+  count = var.enable_alerts ? 1 : 0
+
+  alarm_name        = "judgemind-api-4xx-spike-${var.environment}"
+  alarm_description = "API 4xx error rate exceeded ${var.error_4xx_threshold} in 5 minutes (${var.environment})"
+
+  namespace   = "AWS/ApplicationELB"
+  metric_name = "HTTPCode_Target_4XX_Count"
+  statistic   = "Sum"
+  dimensions = {
+    LoadBalancer = local.alb_arn_suffix
+    TargetGroup  = local.tg_arn_suffix
+  }
+
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  threshold           = var.error_4xx_threshold
+  period              = 300
+  evaluation_periods  = 1
+  datapoints_to_alarm = 1
+  treat_missing_data  = "notBreaching"
+
+  alarm_actions = [var.alert_sns_topic_arn]
+  ok_actions    = [var.alert_sns_topic_arn]
+}
+
+resource "aws_cloudwatch_metric_alarm" "api_latency_p99" {
+  count = var.enable_alerts ? 1 : 0
+
+  alarm_name        = "judgemind-api-latency-p99-${var.environment}"
+  alarm_description = "API P99 latency exceeded ${var.latency_p99_threshold}s (${var.environment})"
+
+  namespace   = "AWS/ApplicationELB"
+  metric_name = "TargetResponseTime"
+  dimensions = {
+    LoadBalancer = local.alb_arn_suffix
+    TargetGroup  = local.tg_arn_suffix
+  }
+
+  extended_statistic  = "p99"
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  threshold           = var.latency_p99_threshold
+  period              = 300
+  evaluation_periods  = 2
+  datapoints_to_alarm = 2
+  treat_missing_data  = "notBreaching"
+
+  alarm_actions = [var.alert_sns_topic_arn]
+  ok_actions    = [var.alert_sns_topic_arn]
+}
+
+resource "aws_cloudwatch_metric_alarm" "api_unhealthy_hosts" {
+  count = var.enable_alerts ? 1 : 0
+
+  alarm_name        = "judgemind-api-unhealthy-hosts-${var.environment}"
+  alarm_description = "API has unhealthy hosts behind the ALB (${var.environment})"
+
+  namespace   = "AWS/ApplicationELB"
+  metric_name = "UnHealthyHostCount"
+  statistic   = "Maximum"
+  dimensions = {
+    LoadBalancer = local.alb_arn_suffix
+    TargetGroup  = local.tg_arn_suffix
+  }
+
+  comparison_operator = "GreaterThanThreshold"
+  threshold           = var.unhealthy_host_threshold
+  period              = 300
+  evaluation_periods  = 2
+  datapoints_to_alarm = 2
+  treat_missing_data  = "notBreaching"
+
+  alarm_actions = [var.alert_sns_topic_arn]
+  ok_actions    = [var.alert_sns_topic_arn]
+}

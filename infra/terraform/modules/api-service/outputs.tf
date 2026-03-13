@@ -42,3 +42,13 @@ output "task_role_arn" {
   description = "ARN of the API task IAM role (assumed by the container at runtime)"
   value       = aws_iam_role.api_task.arn
 }
+
+output "alb_arn_suffix" {
+  description = "ARN suffix of the API ALB (used as CloudWatch dimension)"
+  value       = aws_lb.api.arn_suffix
+}
+
+output "target_group_arn_suffix" {
+  description = "ARN suffix of the API target group (used as CloudWatch dimension)"
+  value       = aws_lb_target_group.api.arn_suffix
+}

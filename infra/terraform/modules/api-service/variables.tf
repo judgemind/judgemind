@@ -130,3 +130,41 @@ variable "document_archive_bucket_arn" {
   type        = string
   default     = ""
 }
+
+# ─── Alert Configuration ──────────────────────────────────────────────────────
+
+variable "enable_alerts" {
+  description = "Whether to create CloudWatch alarms for the API service"
+  type        = bool
+  default     = false
+}
+
+variable "alert_sns_topic_arn" {
+  description = "ARN of the SNS topic for alarm notifications (required if enable_alerts is true)"
+  type        = string
+  default     = ""
+}
+
+variable "error_5xx_threshold" {
+  description = "Number of 5xx errors in a 5-minute window before alarming"
+  type        = number
+  default     = 10
+}
+
+variable "error_4xx_threshold" {
+  description = "Number of 4xx errors in a 5-minute window before alarming (higher than 5xx since some 4xx is normal)"
+  type        = number
+  default     = 100
+}
+
+variable "latency_p99_threshold" {
+  description = "P99 latency threshold in seconds before alarming"
+  type        = number
+  default     = 5
+}
+
+variable "unhealthy_host_threshold" {
+  description = "Number of unhealthy hosts before alarming"
+  type        = number
+  default     = 0
+}
