@@ -30,6 +30,7 @@ vi.mock('@/components/layout/Header', () => ({
 
 vi.mock('@/components/layout/Sidebar', () => ({
   Sidebar: () => <aside data-testid="sidebar">Sidebar</aside>,
+  DesktopSidebar: () => <aside data-testid="sidebar">Sidebar</aside>,
 }));
 
 import RootLayout from '../layout';
