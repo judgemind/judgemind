@@ -28,14 +28,36 @@ from opensearchpy import OpenSearch
 
 from .worker import IngestionWorker
 
+# Configure structlog for its own loggers (structlog.get_logger()).
 structlog.configure(
     wrapper_class=structlog.make_filtering_bound_logger(logging.INFO),
     processors=[
-        structlog.processors.TimeStamper(fmt="iso"),
         structlog.processors.add_log_level,
+        structlog.processors.TimeStamper(fmt="iso"),
         structlog.processors.JSONRenderer(),
     ],
 )
+
+# Route standard-library logging (logging.getLogger()) through structlog so
+# that worker.py, db.py, and any other modules using stdlib logging produce
+# the same JSON output visible in CloudWatch.
+#
+# Note: the processor chain here uses structlog.stdlib variants (add_log_level,
+# ExtraAdder) instead of structlog.processors equivalents because stdlib
+# LogRecords carry level/extra data differently than native structlog events.
+_formatter = structlog.stdlib.ProcessorFormatter(
+    processors=[
+        structlog.stdlib.add_log_level,
+        structlog.stdlib.ExtraAdder(),
+        structlog.stdlib.ProcessorFormatter.remove_processors_meta,
+        structlog.processors.TimeStamper(fmt="iso"),
+        structlog.processors.JSONRenderer(),
+    ],
+)
+_handler = logging.StreamHandler()
+_handler.setFormatter(_formatter)
+logging.root.addHandler(_handler)
+logging.root.setLevel(logging.INFO)
 
 logger = structlog.get_logger(__name__)
 
