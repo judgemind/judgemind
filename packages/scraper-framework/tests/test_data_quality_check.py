@@ -365,15 +365,14 @@ class TestCheckScraperStaleness:
         assert len(alerts) == 1
         assert alerts[0].county == "Orange"
 
-    def test_falls_back_to_captured_at(self) -> None:
-        """Uses documents.captured_at when no scraper_runs exist.
+    def test_falls_back_to_last_seen_at(self) -> None:
+        """Uses documents.last_seen_at when no scraper_runs exist.
 
-        When using the captured_at fallback, the effective threshold is
-        max(base_threshold * 4, 72h) to reduce false positives from courts
-        that post infrequently.  So we need a capture older than 72h to
-        trigger an alert.
+        last_seen_at is updated on every upsert (even for dedup'd documents),
+        so the normal staleness threshold applies — no inflated multiplier.
+        A 15h gap exceeds the 14h daily threshold.
         """
-        old_capture = NOW - timedelta(hours=80)
+        old_capture = NOW - timedelta(hours=15)
         conn = FakeConnection(
             {
                 "scraper_runs": [],  # No scraper_runs
@@ -383,20 +382,20 @@ class TestCheckScraperStaleness:
         baselines = _make_baselines()
         alerts = check_scraper_staleness(conn, NOW, baselines)
         assert len(alerts) == 1
-        assert "captured_at" in alerts[0].message
+        assert "last_seen_at" in alerts[0].message
 
-    def test_captured_at_fallback_uses_generous_threshold(self) -> None:
-        """captured_at fallback does NOT alert within the 72h tolerance.
+    def test_last_seen_at_fallback_no_alert_when_fresh(self) -> None:
+        """No alert when last_seen_at is recent, even without scraper_runs.
 
-        When scraper_runs is empty, an old captured_at does not necessarily
-        mean the scraper is broken — the court may simply not have posted
-        new content.  The effective threshold is raised to 72h minimum.
+        Since last_seen_at accurately reflects scraper activity (unlike the
+        old captured_at which only recorded first insert), the normal
+        threshold applies.  13h < 14h daily threshold = no alert.
         """
-        old_capture = NOW - timedelta(hours=50)
+        recent_capture = NOW - timedelta(hours=13)
         conn = FakeConnection(
             {
                 "scraper_runs": [],
-                "MAX(d.captured_at)": [("Los Angeles", old_capture)],
+                "MAX(d.captured_at)": [("Los Angeles", recent_capture)],
             }
         )
         baselines = _make_baselines()
@@ -2199,14 +2198,14 @@ class TestStalenessCheckPrefersScraperRuns:
         # Should be zero alerts because scraper_runs shows a recent run
         assert len(alerts) == 0
 
-    def test_falls_back_to_captured_at_without_scraper_runs(self) -> None:
-        """When scraper_runs is empty but captured_at is very stale, should alert
-        with source=documents.captured_at.
+    def test_falls_back_to_last_seen_at_without_scraper_runs(self) -> None:
+        """When scraper_runs is empty but last_seen_at is stale, should alert
+        with source=documents.last_seen_at.
 
-        The captured_at fallback uses a generous threshold (72h minimum) to
-        reduce false positives.  We use 80h to exceed that threshold.
+        last_seen_at is updated on every upsert, so the normal threshold
+        applies.  15h exceeds the 14h daily threshold.
         """
-        old_capture = NOW - timedelta(hours=80)
+        old_capture = NOW - timedelta(hours=15)
 
         conn = FakeConnection(
             {
@@ -2219,7 +2218,7 @@ class TestStalenessCheckPrefersScraperRuns:
 
         assert len(alerts) == 1
         assert alerts[0].county == "Los Angeles"
-        assert "captured_at" in alerts[0].message
+        assert "last_seen_at" in alerts[0].message
 
     def test_scraper_runs_source_label(self) -> None:
         """When scraper_runs provides the data, the alert source should say
@@ -2237,3 +2236,87 @@ class TestStalenessCheckPrefersScraperRuns:
 
         assert len(alerts) == 1
         assert "scraper_runs" in alerts[0].message
+
+
+class TestStalenessWithDedupedDocuments:
+    """Verify that the staleness metric is accurate for courts with dedup'd
+    documents (low posting volume, same document IDs on re-scrape).
+
+    This is the core fix for #986: courts like Santa Clara that post ~0.3
+    rulings/day would show 80+ hours of "staleness" under the old
+    captured_at-based metric even when the scraper was running every 12h,
+    because captured_at is only set on the first insert.
+
+    With last_seen_at, which is updated on every upsert (including dedup'd
+    re-scrapes), the staleness metric accurately reflects scraper activity.
+    """
+
+    def test_deduped_documents_no_false_stale_alert(self) -> None:
+        """A court with dedup'd documents should NOT trigger a false stale alert.
+
+        Scenario: Santa Clara posts content infrequently. The scraper runs
+        every 12h but finds the same documents (same content hash -> same
+        document_id -> upsert with no new rows). last_seen_at is updated
+        to the current time on each upsert.
+
+        The last_seen_at fallback shows 6h (recent scraper run), not the
+        80h that captured_at would show. No alert should fire.
+        """
+        # last_seen_at was updated 6h ago (scraper ran successfully)
+        recent_last_seen = NOW - timedelta(hours=6)
+        conn = FakeConnection(
+            {
+                "scraper_runs": [],  # No scraper_runs data available
+                "MAX(d.captured_at)": [("Santa Clara", recent_last_seen)],
+            }
+        )
+        baselines = _make_baselines(
+            {"Santa Clara": {"expected_daily_rulings": 1, "schedule_type": "daily"}}
+        )
+        alerts = check_scraper_staleness(conn, NOW, baselines)
+        assert len(alerts) == 0
+
+    def test_deduped_documents_stale_alert_when_scraper_actually_stopped(self) -> None:
+        """A genuinely stale scraper should still trigger an alert.
+
+        Scenario: The scraper has actually stopped running. last_seen_at
+        hasn't been updated in 20h (well past the 14h daily threshold).
+        This should trigger an alert.
+        """
+        stale_last_seen = NOW - timedelta(hours=20)
+        conn = FakeConnection(
+            {
+                "scraper_runs": [],
+                "MAX(d.captured_at)": [("Santa Clara", stale_last_seen)],
+            }
+        )
+        baselines = _make_baselines(
+            {"Santa Clara": {"expected_daily_rulings": 1, "schedule_type": "daily"}}
+        )
+        alerts = check_scraper_staleness(conn, NOW, baselines)
+        assert len(alerts) == 1
+        assert alerts[0].county == "Santa Clara"
+        assert "last_seen_at" in alerts[0].message
+
+    def test_scraper_runs_preferred_over_last_seen_at_for_deduped(self) -> None:
+        """When scraper_runs data exists, it takes precedence over last_seen_at.
+
+        Even if last_seen_at shows a stale value (e.g., documents table hasn't
+        been touched in a while), a recent scraper_runs entry means the scraper
+        is healthy.
+        """
+        recent_run = NOW - timedelta(hours=2)
+        old_last_seen = NOW - timedelta(hours=30)
+        conn = FakeConnection(
+            {
+                "scraper_runs": [
+                    ("ca-santa-clara-tentatives", "Santa Clara", recent_run, "success")
+                ],
+                "MAX(d.captured_at)": [("Santa Clara", old_last_seen)],
+            }
+        )
+        baselines = _make_baselines(
+            {"Santa Clara": {"expected_daily_rulings": 1, "schedule_type": "daily"}}
+        )
+        alerts = check_scraper_staleness(conn, NOW, baselines)
+        assert len(alerts) == 0

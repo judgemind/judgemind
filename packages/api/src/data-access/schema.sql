@@ -215,6 +215,7 @@ CREATE TABLE documents (
     source_url          TEXT,
     scraper_id          TEXT,                           -- e.g., 'ca-la-tentative'
     captured_at         TIMESTAMPTZ         NOT NULL,
+    last_seen_at        TIMESTAMPTZ         NOT NULL DEFAULT NOW(),
     -- Scheduling context
     hearing_date        DATE,
     published_at        TIMESTAMPTZ,                    -- When court published (if known)

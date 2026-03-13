@@ -186,7 +186,8 @@ LATEST_SCRAPER_RUN_QUERY = """
 """
 
 LATEST_CAPTURE_PER_COUNTY_QUERY = """
-    SELECT ct.county, MAX(d.captured_at) AS last_capture
+    SELECT ct.county,
+           GREATEST(MAX(d.last_seen_at), MAX(d.captured_at)) AS last_capture
     FROM documents d
     JOIN courts ct ON ct.id = d.court_id
     WHERE d.status = 'active'
@@ -661,7 +662,10 @@ def check_scraper_staleness(
             scraper_id, county_name, started_at, status = row
             scraper_last_run[county_name] = (scraper_id, started_at, status)
 
-    # Fall back to MAX(captured_at) for counties without scraper_runs
+    # Fall back to MAX(last_seen_at, captured_at) for counties without scraper_runs.
+    # last_seen_at is updated on every document upsert (even when content is
+    # unchanged), so it accurately reflects the last time the scraper ran —
+    # unlike captured_at which only reflects the first insert.
     capture_fallback: dict[str, datetime] = {}
     with conn.cursor() as cur:
         cur.execute(
@@ -695,22 +699,18 @@ def check_scraper_staleness(
             source = "scraper_runs"
         elif county_name in capture_fallback:
             last_activity = capture_fallback[county_name]
-            source = "documents.captured_at"
+            source = "documents.last_seen_at"
 
         if last_activity is None:
             continue
 
         hours_since = (now - last_activity).total_seconds() / 3600
 
-        # When using captured_at as the fallback (no scraper_runs data),
-        # the timestamp only updates when *new* content is ingested — not
-        # when the scraper runs.  Courts with low posting volume may go
-        # many days without new content even though the scraper is healthy.
-        # Apply a generous multiplier to reduce false positives until
-        # scraper_runs data is available (see #899).
+        # last_seen_at is updated on every document upsert (including dedup'd
+        # re-scrapes), so it accurately reflects scraper activity.  No
+        # multiplier needed — the normal threshold applies regardless of
+        # data source.  See #986.
         effective_threshold = stale_threshold_hours
-        if source == "documents.captured_at":
-            effective_threshold = max(stale_threshold_hours * 4, 72.0)
 
         if hours_since > effective_threshold:
             alerts.append(

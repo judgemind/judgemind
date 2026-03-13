@@ -170,8 +170,12 @@ def insert_document(
     """Upsert a document row using the scraper-assigned document_id as the PK.
 
     Returns True if a new row was inserted, False if it already existed.
-    On conflict, updates mutable fields (hearing_date, case_id) while
-    preserving immutable fields (s3_key, content_hash, captured_at).
+    On conflict, updates mutable fields (hearing_date, case_id, last_seen_at)
+    while preserving immutable fields (s3_key, content_hash, captured_at).
+
+    ``last_seen_at`` is always set to the current timestamp on both insert and
+    upsert, so it reflects the most recent time the scraper encountered this
+    document — even when the content hasn't changed (dedup'd documents).
 
     The scraper's document_id UUID is used as documents.id so that OpenSearch
     document IDs and rulings.document_id references all converge on the same key.
@@ -188,18 +192,19 @@ def insert_document(
                 document_type, format,
                 s3_key, s3_bucket,
                 content_hash, source_url, scraper_id,
-                captured_at, hearing_date, status
+                captured_at, last_seen_at, hearing_date, status
             )
             VALUES (
                 %s::uuid, %s::uuid, %s::uuid,
                 'ruling', %s::document_format,
                 %s, %s,
                 %s, %s, %s,
-                %s, %s, 'active'
+                %s, NOW(), %s, 'active'
             )
             ON CONFLICT (id) DO UPDATE SET
                 hearing_date = COALESCE(EXCLUDED.hearing_date, documents.hearing_date),
-                case_id = EXCLUDED.case_id
+                case_id = EXCLUDED.case_id,
+                last_seen_at = NOW()
             RETURNING (xmax = 0) AS is_new
             """,
             (

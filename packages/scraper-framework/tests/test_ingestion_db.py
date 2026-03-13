@@ -764,6 +764,37 @@ class TestInsertDocument:
         args = _get_execute_args(conn)
         assert args[3] == "txt"
 
+    def test_sql_includes_last_seen_at_on_insert_and_upsert(self) -> None:
+        """Verify the SQL sets last_seen_at on both INSERT and ON CONFLICT.
+
+        last_seen_at must be set to NOW() on initial insert and updated
+        to NOW() on upsert so it always reflects the most recent time
+        the scraper encountered this document — even for dedup'd re-scrapes
+        where the content hasn't changed.  See #986.
+        """
+        conn = _mock_conn()
+        cur = conn.cursor.return_value.__enter__.return_value
+        cur.fetchone.return_value = (True,)
+        insert_document(
+            conn,
+            document_id="doc-1",
+            case_id="case-1",
+            court_id="court-1",
+            content_format="html",
+            content_hash="abc123",
+            s3_key=None,
+            s3_bucket=None,
+            source_url="https://example.com",
+            scraper_id="scraper-1",
+            captured_at=datetime(2026, 3, 5),
+            hearing_date=None,
+        )
+        sql = cur.execute.call_args[0][0]
+        # INSERT clause should include last_seen_at column
+        assert "last_seen_at" in sql
+        # ON CONFLICT clause should update last_seen_at = NOW()
+        assert "last_seen_at = NOW()" in sql
+
     def test_format_mapping_unknown_defaults_html(self) -> None:
         conn = _mock_conn()
         cur = conn.cursor.return_value.__enter__.return_value
