@@ -43,7 +43,7 @@ updated: <ISO-8601 timestamp>
 summary: <one-line description of current activity>
 ```
 
-Phases (in typical order): `claiming`, `setup`, `ralph-worker (iteration N)`, `ralph-reviewer (iteration N)`, `pushing`, `ci-watch`, `ci-fix`, `merging`, `deploying`, `retrospective`, `done`, `blocked`.
+Phases (in typical order): `claiming`, `setup`, `recovery-check`, `ralph-worker (iteration N)`, `ralph-reviewer (iteration N)`, `pushing`, `ci-watch`, `ci-fix`, `merging`, `deploying`, `retrospective`, `done`, `blocked`.
 
 **Write a status update at every major step transition** — use the Write tool to overwrite the status file. The first update should be written immediately after worktree setup with phase `claiming`.
 
@@ -99,15 +99,16 @@ After claiming the issue, create todos using `TaskCreate` to track your major wo
 
 **For implementation tasks (Path A):**
 1. "Set up dependencies" — venvs/node_modules for affected packages
-2. "Implement and review (ralph loop)" — the core implementation phase
-3. "Commit and push" — stage, commit, create PR
-4. "Watch CI and fix failures" — monitor CI, resolve any failures
-5. "Verify no merge conflicts" — check mergeable status
-6. "Update PR test plan" — check off test plan items
-7. "Merge PR" — squash merge after CI is green
-8. "Verify deployment" — watch deploy pipeline and smoke-test (deployed services only)
-9. "Retrospective" — identify workflow efficiencies and preventative measures
-10. "Remove worktree" — cleanup
+2. "Check for crash recovery checkpoints" — detect prior agent progress
+3. "Implement and review (ralph loop)" — the core implementation phase
+4. "Commit and push" — stage, commit, create PR
+5. "Watch CI and fix failures" — monitor CI, resolve any failures
+6. "Verify no merge conflicts" — check mergeable status
+7. "Update PR test plan" — check off test plan items
+8. "Merge PR" — squash merge after CI is green
+9. "Verify deployment" — watch deploy pipeline and smoke-test (deployed services only)
+10. "Retrospective" — identify workflow efficiencies and preventative measures
+11. "Remove worktree" — cleanup
 
 **For investigation tasks (Path B):**
 1. "Investigate and document findings"
@@ -147,6 +148,59 @@ Then install: `.venv/bin/pip install -e ".[dev]" --quiet`
 For TypeScript packages: `npm install` from the package directory.
 
 Skip this for Terraform-only or docs-only tasks.
+
+#### A.1.5 — Check for crash recovery checkpoints
+
+Write status: `phase: recovery-check`, `summary: Checking for crash recovery checkpoints on issue #<N>`.
+
+Before starting ralph, check whether a previous agent already completed part of the work on this issue. The ralph checkpoint system persists state to GitHub issue comments (via `scripts/ralph_checkpoint.py`), so progress survives agent crashes and worktree cleanup.
+
+**Step 1 — Check for SHIP checkpoint:**
+
+```
+scripts/ralph_checkpoint.py check ship --issue <N>
+```
+
+If the checkpoint exists (exit code 0):
+1. Read the checkpoint to extract the branch name:
+   ```
+   scripts/ralph_checkpoint.py read ship --issue <N>
+   ```
+   Parse the branch name from the `**Branch:**` line in the output (format: `` **Branch:** `<branch-name>` ``).
+2. Check if the branch still exists on the remote:
+   ```
+   git -C {worktree} fetch origin
+   git -C {worktree} ls-remote --heads origin <branch-name>
+   ```
+3. If the branch exists: check it out in the worktree, skip ralph entirely, and jump directly to **A.3** (stage, commit, push). The implementation is already complete — it just needs to be committed and pushed through the PR workflow.
+   ```
+   git -C {worktree} checkout <branch-name>
+   ```
+   Also check if the changes are already committed on that branch (run `git -C {worktree} status` — if clean, the previous agent committed but may not have pushed a PR). If there are uncommitted changes, they need to be staged and committed in A.3.
+4. If the branch does **not** exist (deleted or cleaned up): fall through to the plan checkpoint check below. The work is gone and needs to be re-done, but the plan may still be recoverable.
+
+**Step 2 — Check for plan-approved checkpoint (only if no SHIP checkpoint, or SHIP branch is gone):**
+
+```
+scripts/ralph_checkpoint.py check plan-approved --issue <N>
+```
+
+If the checkpoint exists (exit code 0):
+1. Read the approved plan content:
+   ```
+   scripts/ralph_checkpoint.py read plan-approved --issue <N>
+   ```
+2. Create the ralph state directory and write the recovered plan:
+   ```
+   mkdir -p {worktree}/tmp/ralph
+   ```
+   Write the output to `{worktree}/tmp/ralph/plan.md`.
+3. Write `{worktree}/tmp/ralph/complexity.txt` with: `non-trivial: recovered plan from previous agent checkpoint`
+4. Proceed to **A.2** and invoke `/ralph`. Because `plan.md` already exists in the ralph state directory, the ralph skill's complexity check (Step 1.5) will detect it and skip the plan phase. Ralph will start directly at the implementation loop (Step 2 — The Loop), using the recovered plan.
+
+**Step 3 — No checkpoints found:**
+
+If neither checkpoint exists (both exit code 1), proceed normally to A.2 with the full ralph flow (including complexity check and plan phase for non-trivial tasks).
 
 #### A.2 — Implement and review (ralph loop)
 - **For testable code tasks** (Python, TypeScript): use the `/ralph` loop — iterative work-then-review with fresh context each iteration. See `.claude/skills/ralph/SKILL.md`. This replaces the old `/tdd` + self-review steps. `/ralph` handles implementation (TDD), pre-PR checks, and cross-perspective review internally. It returns when the reviewer subagent says SHIP.
