@@ -139,6 +139,15 @@ module "api_service" {
   task_memory        = 512
   desired_count      = 1
   log_retention_days = 14
+
+  # API error monitoring — use the same SNS topic as scraper alerts
+  enable_alerts       = true
+  alert_sns_topic_arn = module.compute.alerts_topic_arn
+
+  # Dev thresholds are more lenient since testing generates 4xx errors
+  error_5xx_threshold   = 10
+  error_4xx_threshold   = 200
+  latency_p99_threshold = 5
 }
 
 module "ses" {
@@ -321,4 +330,14 @@ output "api_acm_validation" {
 output "api_ecr_repository_url" {
   description = "Dev ECR repository URL for API images"
   value       = module.ecr.api_repository_url
+}
+
+output "api_alb_arn_suffix" {
+  description = "Dev API ALB ARN suffix (for CloudWatch metric queries)"
+  value       = module.api_service.alb_arn_suffix
+}
+
+output "api_target_group_arn_suffix" {
+  description = "Dev API target group ARN suffix (for CloudWatch metric queries)"
+  value       = module.api_service.target_group_arn_suffix
 }
