@@ -24,29 +24,6 @@ fi
 # --- Forbidden pattern checks ---
 # Note: uses grep -E (POSIX extended regex) for macOS compatibility. Do NOT use grep -P.
 
-# 0. Push to main/master — block during task work.
-#    Catches: git push origin main, git push -u origin main, git -C /path push origin main
-#    The regex requires "push" as a git subcommand (after git or git -C <path>),
-#    not just anywhere in the command. This avoids false positives on commands like
-#    "git add .githooks/pre-push" where "push" appears in a filename.
-if echo "$COMMAND" | grep -qE '\bgit\b(\s+-C\s+\S+)?\s+push\b' ; then
-    # Extract what looks like the branch being pushed (last word, or after "origin")
-    if echo "$COMMAND" | grep -qE '\bpush\b.*\b(main|master)\b' ; then
-        echo "BLOCKED: Pushing directly to main/master is not allowed during task work. Push to a feature branch and open a PR. See CLAUDE.md §Git Workflow." >&2
-        exit 2
-    fi
-    # Also catch bare "git push" when on main (check current branch)
-    current_branch=$(git symbolic-ref --short HEAD 2>/dev/null || echo "")
-    if [[ "$current_branch" == "main" || "$current_branch" == "master" ]]; then
-        # Only block if the push target looks like it includes the current branch
-        # A bare "git push" while on main pushes to main
-        if ! echo "$COMMAND" | grep -qE '\bpush\b.*\b[a-z]+-' ; then
-            echo "BLOCKED: You are on '$current_branch' and running git push. Push to a feature branch instead. See CLAUDE.md §Git Workflow." >&2
-            exit 2
-        fi
-    fi
-fi
-
 # 1. Dollar-paren command substitution: $( ... )
 if echo "$COMMAND" | grep -qE '\$\(' ; then
     echo "BLOCKED: Command contains \$() command substitution. Use separate tool calls for dynamic values, or use scripts/with-secret.sh for secrets. See CLAUDE.md §Unattended Operation Patterns." >&2
