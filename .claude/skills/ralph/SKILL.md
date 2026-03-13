@@ -61,6 +61,8 @@ Write `task.md` with:
 
 Write `feedback.md` with: `No prior feedback. This is the first iteration.`
 
+**Note:** If `/task` crash recovery (A.1.5) already seeded `plan.md` and `complexity.txt` in this directory, do NOT overwrite them. Check for their existence before writing. The recovered plan from a previous agent's checkpoint takes precedence.
+
 ---
 
 ## Step 1 — Create todo list for the loop
@@ -68,7 +70,7 @@ Write `feedback.md` with: `No prior feedback. This is the first iteration.`
 Create todos using `TaskCreate` to track progress through the ralph loop:
 
 1. "Ralph complexity check" (activeForm: "Assessing task complexity")
-2. "Ralph plan phase" (activeForm: "Planning implementation") — only if non-trivial
+2. "Ralph plan phase" (activeForm: "Planning implementation") — only if non-trivial and no recovered plan
 3. "Ralph iteration 1 — worker" (activeForm: "Implementing iteration 1")
 4. "Ralph iteration 1 — Gemini review" (activeForm: "Gemini reviewing iteration 1")
 5. "Ralph iteration 1 — adversarial review" (activeForm: "Adversarial reviewing iteration 1")
@@ -82,7 +84,15 @@ Mark each todo `in_progress` when starting and `completed` when done.
 
 ## Step 1.5 — Complexity check
 
-Before entering the plan phase, assess whether the task is trivial or non-trivial.
+Before entering the plan phase, check whether the plan phase should be skipped.
+
+**Recovered plan (skip plan phase — go directly to Step 2):**
+
+If `{worktree}/tmp/ralph/plan.md` already exists (seeded by `/task` crash recovery from a plan-approved checkpoint on the GitHub issue), the plan phase has already been completed by a previous agent. Skip the plan phase entirely and go directly to Step 2 (The Loop). The recovered plan will guide the worker subagent during implementation.
+
+If `{worktree}/tmp/ralph/complexity.txt` also already exists, do not overwrite it.
+
+**No recovered plan — assess complexity normally:**
 
 **Trivial (skip plan phase — go directly to Step 2):**
 - Single-file documentation changes
@@ -107,7 +117,7 @@ If **trivial**, skip directly to Step 2 (The Loop). If **non-trivial**, continue
 
 ## Step 1.6 — Plan phase
 
-This step only runs for non-trivial tasks (as determined by Step 1.5). The plan phase ensures the implementation approach is sound before writing code. It follows the same iterative review pattern as the code review loop, but with plan-specific prompts.
+This step only runs for non-trivial tasks (as determined by Step 1.5) that do NOT have a recovered plan. The plan phase ensures the implementation approach is sound before writing code. It follows the same iterative review pattern as the code review loop, but with plan-specific prompts.
 
 Set `plan_iteration = 1` and `max_plan_iterations = 3`.
 
@@ -444,7 +454,7 @@ The code is ready for commit. Return control to the calling workflow (`/task` Pa
 - **All standard rules apply.** No `$()`, no heredocs, no inline Python, temp files in `{worktree}/tmp/`.
 - **Gemini reviews are best-effort.** If the Google API key is unavailable or an API call fails, the loop continues with the remaining reviewers. Gemini reviews never block the loop.
 - **Ralph is not task completion.** Ralph handles implementation and review only. The calling `/task` workflow handles commit, push, PR, CI, merge, deploy, and cleanup. Never exit after ralph without completing the full `/task` workflow.
-- **Trivial tasks skip the plan phase.** The complexity check (Step 1.5) gates whether the plan phase runs. Do not skip the complexity check itself.
+- **Trivial tasks and recovered plans skip the plan phase.** The complexity check (Step 1.5) gates whether the plan phase runs. Recovered plans from crash recovery checkpoints also skip the plan phase. Do not skip the complexity check itself.
 
 ---
 
