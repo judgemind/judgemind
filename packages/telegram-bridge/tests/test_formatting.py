@@ -1,10 +1,12 @@
 """Tests for Telegram HTML formatting helpers."""
 
 from telegram_bridge.formatting import (
+    TELEGRAM_MAX_MESSAGE_LENGTH,
     escape_html,
     escape_mdv2,
     format_status_card,
     linkify_github_refs,
+    split_message,
 )
 
 
@@ -118,3 +120,75 @@ class TestFormatStatusCard:
         assert "</b>" in card
         # Should NOT contain MarkdownV2 bold markers
         assert "*Issue" not in card
+
+
+class TestSplitMessage:
+    def test_short_message_returns_single_chunk(self) -> None:
+        text = "Hello world"
+        result = split_message(text)
+        assert result == [text]
+
+    def test_empty_string(self) -> None:
+        result = split_message("")
+        assert result == [""]
+
+    def test_exact_limit_not_split(self) -> None:
+        text = "a" * 4096
+        result = split_message(text)
+        assert result == [text]
+
+    def test_splits_at_paragraph_boundary(self) -> None:
+        para1 = "First paragraph. " * 100  # ~1800 chars
+        para2 = "Second paragraph. " * 100
+        para3 = "Third paragraph. " * 100
+        text = f"{para1}\n\n{para2}\n\n{para3}"
+        result = split_message(text, max_length=4096)
+        assert len(result) >= 2
+        # Each chunk should be within the limit.
+        for chunk in result:
+            assert len(chunk) <= 4096
+
+    def test_splits_at_newline_when_no_paragraph_break(self) -> None:
+        # Build a text with only single newlines.
+        lines = ["Line number " + str(i) for i in range(500)]
+        text = "\n".join(lines)
+        result = split_message(text, max_length=4096)
+        assert len(result) >= 2
+        for chunk in result:
+            assert len(chunk) <= 4096
+
+    def test_splits_at_space_when_no_newlines(self) -> None:
+        text = "word " * 1000  # ~5000 chars
+        result = split_message(text, max_length=4096)
+        assert len(result) >= 2
+        for chunk in result:
+            assert len(chunk) <= 4096
+
+    def test_hard_cut_when_no_good_split_point(self) -> None:
+        # One long word with no spaces or newlines.
+        text = "a" * 5000
+        result = split_message(text, max_length=4096)
+        assert len(result) == 2
+        assert len(result[0]) == 4096
+        assert len(result[1]) == 904
+
+    def test_custom_max_length(self) -> None:
+        text = "Hello World! " * 10  # ~130 chars
+        result = split_message(text, max_length=50)
+        assert len(result) >= 3
+        for chunk in result:
+            assert len(chunk) <= 50
+
+    def test_preserves_content(self) -> None:
+        """All original text should be recoverable from the chunks."""
+        para1 = "First paragraph."
+        para2 = "Second paragraph."
+        text = f"{para1}\n\n{para2}"
+        result = split_message(text, max_length=25)
+        # The full text content should be preserved across chunks.
+        joined = "\n\n".join(result) if len(result) > 1 else result[0]
+        assert para1 in joined
+        assert para2 in joined
+
+    def test_default_limit_is_telegram_max(self) -> None:
+        assert TELEGRAM_MAX_MESSAGE_LENGTH == 4096

@@ -20,6 +20,7 @@ from telegram_bridge.interpreter import (
     RateLimiter,
     RateLimitError,
     _client_cache,
+    _extract_json_object,
     _parse_response,
     _validate_action,
     build_orchestrator_status,
@@ -1173,3 +1174,179 @@ class TestInterpretMessageWithTools:
 
         assert "couldn't formulate" in result.reply.lower() or "noted" in result.reply.lower()
         assert result.actions == []
+
+    @patch("telegram_bridge.interpreter.anthropic.Anthropic")
+    def test_multiple_text_blocks_json_in_last(self, mock_cls: MagicMock, tmp_path: Path) -> None:
+        """When the model outputs preamble in one text block and JSON in another,
+        the JSON block should be used as the reply (not the concatenation)."""
+        mock_client = MagicMock()
+        mock_cls.return_value = mock_client
+
+        response = MagicMock()
+        response.stop_reason = "end_turn"
+        response.content = [
+            _make_text_block("Let me think about this and provide an answer:"),
+            _make_text_block(
+                json.dumps(
+                    {
+                        "reply": "The answer is 42.",
+                        "actions": [],
+                    }
+                )
+            ),
+        ]
+        mock_client.messages.create.return_value = response
+
+        result = interpret_message_with_tools(
+            text="What is the answer?",
+            repo_root=tmp_path,
+            api_key="test-key",
+            rate_limiter=None,
+        )
+
+        assert result.reply == "The answer is 42."
+        assert result.actions == []
+
+    @patch("telegram_bridge.interpreter.anthropic.Anthropic")
+    def test_preamble_then_json_single_block(self, mock_cls: MagicMock, tmp_path: Path) -> None:
+        """When the model outputs preamble text followed by JSON in a single
+        text block, the JSON should be extracted."""
+        mock_client = MagicMock()
+        mock_cls.return_value = mock_client
+
+        json_part = json.dumps({"reply": "Here is the info.", "actions": []})
+        combined = f"Now I have a clear understanding. Let me provide the answer:\n{json_part}"
+        response = MagicMock()
+        response.stop_reason = "end_turn"
+        response.content = [_make_text_block(combined)]
+        mock_client.messages.create.return_value = response
+
+        result = interpret_message_with_tools(
+            text="Tell me about this",
+            repo_root=tmp_path,
+            api_key="test-key",
+            rate_limiter=None,
+        )
+
+        assert result.reply == "Here is the info."
+        assert result.actions == []
+
+    @patch("telegram_bridge.interpreter.anthropic.Anthropic")
+    def test_raw_json_never_leaked_as_reply(self, mock_cls: MagicMock, tmp_path: Path) -> None:
+        """The raw JSON response should never be sent as-is to the user."""
+        mock_client = MagicMock()
+        mock_cls.return_value = mock_client
+
+        json_str = json.dumps(
+            {"reply": "I'll file an issue about the truncated responses.", "actions": []}
+        )
+        response = MagicMock()
+        response.stop_reason = "end_turn"
+        response.content = [_make_text_block(json_str)]
+        mock_client.messages.create.return_value = response
+
+        result = interpret_message_with_tools(
+            text="File a bug",
+            repo_root=tmp_path,
+            api_key="test-key",
+            rate_limiter=None,
+        )
+
+        # The reply should be the extracted text, not raw JSON.
+        assert result.reply == "I'll file an issue about the truncated responses."
+        assert "{" not in result.reply
+        assert "actions" not in result.reply
+
+
+# ── _extract_json_object() ─────────────────────────────────────────────
+
+
+class TestExtractJsonObject:
+    def test_plain_json(self) -> None:
+        text = '{"reply": "hello", "actions": []}'
+        result = _extract_json_object(text)
+        assert result is not None
+        assert result["reply"] == "hello"
+
+    def test_json_with_preamble(self) -> None:
+        text = 'Here is the answer:\n{"reply": "hello", "actions": []}'
+        result = _extract_json_object(text)
+        assert result is not None
+        assert result["reply"] == "hello"
+
+    def test_json_with_trailing_text(self) -> None:
+        text = '{"reply": "hello", "actions": []}\nSome trailing text'
+        result = _extract_json_object(text)
+        assert result is not None
+        assert result["reply"] == "hello"
+
+    def test_json_with_nested_braces(self) -> None:
+        text = '{"reply": "use {braces} carefully", "actions": []}'
+        result = _extract_json_object(text)
+        assert result is not None
+        assert result["reply"] == "use {braces} carefully"
+
+    def test_json_with_escaped_quotes(self) -> None:
+        text = '{"reply": "He said \\"hello\\"", "actions": []}'
+        result = _extract_json_object(text)
+        assert result is not None
+        assert 'He said "hello"' in result["reply"]
+
+    def test_no_json_returns_none(self) -> None:
+        assert _extract_json_object("just plain text") is None
+
+    def test_empty_string_returns_none(self) -> None:
+        assert _extract_json_object("") is None
+
+    def test_incomplete_json_returns_none(self) -> None:
+        assert _extract_json_object('{"reply": "hello"') is None
+
+    def test_array_not_returned(self) -> None:
+        """Arrays are not dicts and should not be returned."""
+        assert _extract_json_object("[1, 2, 3]") is None
+
+    def test_preamble_with_actions(self) -> None:
+        text = (
+            "Let me provide the answer:\n"
+            '{"reply": "Starting #42.", "actions": [{"type": "start", "issue": 42}]}'
+        )
+        result = _extract_json_object(text)
+        assert result is not None
+        assert result["reply"] == "Starting #42."
+        assert len(result["actions"]) == 1
+        assert result["actions"][0]["type"] == "start"
+
+
+# ── _parse_response() with preamble ───────────────────────────────────
+
+
+class TestParseResponseWithPreamble:
+    def test_preamble_before_json(self) -> None:
+        """JSON embedded after preamble text should be extracted."""
+        text = 'Now let me provide the answer:\n{"reply": "42", "actions": []}'
+        result = _parse_response(text)
+        assert result["reply"] == "42"
+
+    def test_preamble_with_code_fence(self) -> None:
+        """Code-fenced JSON should still work (original behavior)."""
+        text = '```json\n{"reply": "hi", "actions": []}\n```'
+        result = _parse_response(text)
+        assert result["reply"] == "hi"
+
+    def test_plain_json_still_works(self) -> None:
+        text = '{"reply": "hello", "actions": []}'
+        result = _parse_response(text)
+        assert result["reply"] == "hello"
+
+    def test_no_json_falls_back_to_raw_text(self) -> None:
+        text = "Just a plain text response with no JSON at all."
+        result = _parse_response(text)
+        assert result["reply"] == text
+        assert result["actions"] == []
+
+    def test_json_without_reply_key_falls_back(self) -> None:
+        """JSON that doesn't have a 'reply' key should fall back to raw text."""
+        text = 'Some preamble\n{"data": "no reply key here"}'
+        result = _parse_response(text)
+        # Falls back because embedded JSON lacks "reply" key.
+        assert result["actions"] == []
