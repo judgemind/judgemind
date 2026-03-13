@@ -6,6 +6,10 @@ import { renderHook } from '@testing-library/react';
 // Mocks
 // ---------------------------------------------------------------------------
 
+const { mockClearAccessToken } = vi.hoisted(() => ({
+  mockClearAccessToken: vi.fn(),
+}));
+
 let mockQueryData: { me: import('@/lib/auth-mutations').AuthUser | null };
 let mockQueryLoading: boolean;
 const mockLogoutMutate = vi.fn().mockResolvedValue({ data: { logout: true } });
@@ -20,6 +24,10 @@ vi.mock('@apollo/client', async () => {
     useMutation: () => [mockLogoutMutate, { loading: false }],
   };
 });
+
+vi.mock('@/lib/auth-tokens', () => ({
+  clearAccessToken: mockClearAccessToken,
+}));
 
 import { AuthProvider, useAuth } from '../AuthProvider';
 
@@ -120,6 +128,28 @@ describe('AuthProvider', () => {
     expect(mockLogoutMutate).toHaveBeenCalledOnce();
   });
 
+  it('clears the access token on logout', async () => {
+    mockQueryLoading = false;
+    mockQueryData = { me: testUser };
+    render(
+      <AuthProvider>
+        <AuthConsumer />
+      </AuthProvider>,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByTestId('user').textContent).toBe('test@example.com');
+    });
+
+    await act(async () => {
+      screen.getByText('Logout').click();
+    });
+
+    await waitFor(() => {
+      expect(mockClearAccessToken).toHaveBeenCalledOnce();
+    });
+  });
+
   it('clears user even when logout mutation throws', async () => {
     mockLogoutMutate.mockRejectedValueOnce(new Error('Network error'));
     mockQueryLoading = false;
@@ -140,6 +170,29 @@ describe('AuthProvider', () => {
 
     await waitFor(() => {
       expect(screen.getByTestId('user').textContent).toBe('null');
+    });
+  });
+
+  it('clears access token even when logout mutation throws', async () => {
+    mockLogoutMutate.mockRejectedValueOnce(new Error('Network error'));
+    mockQueryLoading = false;
+    mockQueryData = { me: testUser };
+    render(
+      <AuthProvider>
+        <AuthConsumer />
+      </AuthProvider>,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByTestId('user').textContent).toBe('test@example.com');
+    });
+
+    await act(async () => {
+      screen.getByText('Logout').click();
+    });
+
+    await waitFor(() => {
+      expect(mockClearAccessToken).toHaveBeenCalledOnce();
     });
   });
 

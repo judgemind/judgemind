@@ -38,6 +38,22 @@ export const VERIFY_EMAIL_MUTATION = gql`
   }
 `;
 
+export const REFRESH_TOKEN_MUTATION = gql`
+  mutation RefreshToken {
+    refreshToken {
+      accessToken
+      user {
+        id
+        email
+        emailVerified
+        displayName
+        role
+        createdAt
+      }
+    }
+  }
+`;
+
 export const LOGOUT_MUTATION = gql`
   mutation Logout {
     logout

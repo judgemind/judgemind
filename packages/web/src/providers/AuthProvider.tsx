@@ -11,6 +11,7 @@ import {
 import { useMutation, useQuery } from '@apollo/client';
 import type { AuthUser } from '@/lib/auth-mutations';
 import { ME_QUERY, LOGOUT_MUTATION } from '@/lib/auth-mutations';
+import { clearAccessToken } from '@/lib/auth-tokens';
 
 interface AuthContextValue {
   /** The currently logged-in user, or null if not authenticated. */
@@ -53,6 +54,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     } catch {
       // Ignore logout errors — clear local state regardless
     }
+    clearAccessToken();
     setUser(null);
   }, [logoutMutation]);
 

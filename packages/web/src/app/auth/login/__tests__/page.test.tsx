@@ -5,6 +5,9 @@ import { render, screen, fireEvent, waitFor } from '@testing-library/react';
 // Mocks
 // ---------------------------------------------------------------------------
 
+const { mockSetAccessToken } = vi.hoisted(() => ({
+  mockSetAccessToken: vi.fn(),
+}));
 const mockPush = vi.fn();
 const mockSetUser = vi.fn();
 let mockMutate: ReturnType<typeof vi.fn>;
@@ -38,6 +41,10 @@ vi.mock('@/providers/AuthProvider', () => ({
     setUser: mockSetUser,
     logout: vi.fn(),
   }),
+}));
+
+vi.mock('@/lib/auth-tokens', () => ({
+  setAccessToken: mockSetAccessToken,
 }));
 
 vi.mock('@apollo/client', async () => {
@@ -120,6 +127,21 @@ describe('LoginPage', () => {
     });
     await waitFor(() => {
       expect(mockPush).toHaveBeenCalledWith('/');
+    });
+  });
+
+  it('stores the access token on successful login', async () => {
+    render(<LoginPage />);
+    fireEvent.change(screen.getByLabelText('Email'), {
+      target: { value: 'test@example.com' },
+    });
+    fireEvent.change(screen.getByLabelText('Password'), {
+      target: { value: 'password123' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Log in' }));
+
+    await waitFor(() => {
+      expect(mockSetAccessToken).toHaveBeenCalledWith('test-token');
     });
   });
 
