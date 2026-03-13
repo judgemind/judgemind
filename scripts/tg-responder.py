@@ -314,7 +314,9 @@ def send_telegram_reply(
                         )
                 except Exception:
                     logger.warning(
-                        "Failed to send Telegram message to chat %d", chat_id, exc_info=True
+                        "Failed to send Telegram message to chat %d",
+                        chat_id,
+                        exc_info=True,
                     )
 
 
@@ -915,7 +917,9 @@ def _staleness_seconds(ts: str) -> float | None:
 # ── Proactive staleness alert ──────────────────────────────────────────
 
 #: Default threshold (seconds) before sending a proactive stale alert.
-STALE_ALERT_THRESHOLD_SECONDS: float = 300.0  # 5 minutes
+#: Set to 60 minutes — agents routinely take 5–30+ minutes per task,
+#: so shorter thresholds cause false-positive warnings.
+STALE_ALERT_THRESHOLD_SECONDS: float = 3600.0  # 60 minutes
 
 
 @dataclass
@@ -957,7 +961,9 @@ def format_stale_alert(
     minutes = staleness_secs / 60.0
     lines: list[str] = [
         f"Warning: orchestrator status has not been updated for "
-        f"{minutes:.0f} minute(s). The orchestrator may have stalled.",
+        f"{minutes:.0f} minute(s). This likely means the orchestrator "
+        f"session has expired or crashed — normal agent work cycles "
+        f"update the status much more frequently than this.",
     ]
 
     if orchestrator_status:
@@ -1065,7 +1071,7 @@ def merge_agent_status_into_orchestrator(
     orchestrator_status: dict[str, Any],
     agent_statuses: list[dict[str, str]],
     *,
-    staleness_threshold_seconds: float = 120.0,
+    staleness_threshold_seconds: float = 3600.0,
 ) -> dict[str, Any]:
     """Merge per-worker agent-status files into the orchestrator status.
 
@@ -1086,7 +1092,7 @@ def merge_agent_status_into_orchestrator(
             ``orchestrator_status.json``.
         agent_statuses: List of dicts from :func:`read_agent_status_files`.
         staleness_threshold_seconds: Threshold (in seconds) above which
-            a staleness warning is emitted.  Defaults to 120 (2 minutes).
+            a staleness warning is emitted.  Defaults to 3600 (60 minutes).
 
     Returns:
         A (possibly enriched) copy of *orchestrator_status*.

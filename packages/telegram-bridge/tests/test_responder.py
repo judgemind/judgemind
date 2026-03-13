@@ -356,7 +356,7 @@ class TestMergeAgentStatusIntoOrchestrator:
     def test_staleness_warning_when_old(self) -> None:
         """A staleness warning is added when status is older than threshold."""
         mod = _import_responder()
-        # Use an old timestamp (5 minutes ago).
+        # Use a very old timestamp (well beyond any threshold).
         old_ts = "2020-01-01T00:00:00Z"
         orch_status = {
             "active_agents": [],
@@ -1993,7 +1993,8 @@ class TestStalenessTracker:
             threshold_seconds=60.0,
         )
         assert should_alert is True
-        assert "stalled" in alert_text.lower() or "not been updated" in alert_text.lower()
+        assert "not been updated" in alert_text.lower()
+        assert "expired or crashed" in alert_text.lower()
         assert "#42" in alert_text
         assert "ci-watch" in alert_text
         assert "#100" in alert_text
@@ -2113,6 +2114,49 @@ class TestStalenessTracker:
         assert should_alert is True
         assert "no active agents" in alert_text.lower()
 
+    def test_default_threshold_is_one_hour(self) -> None:
+        """The default proactive alert threshold is 60 minutes (3600s)."""
+        mod = _import_responder()
+        assert mod.STALE_ALERT_THRESHOLD_SECONDS == 3600.0
+
+    def test_no_alert_at_thirty_minutes(self, tmp_path: Path) -> None:
+        """No alert when status is 30 minutes old (within 60-min threshold)."""
+        import datetime
+
+        mod = _import_responder()
+        tracker = mod.StalenessTracker()
+        status_file = tmp_path / "status.json"
+        # 30 minutes ago — should NOT trigger with the 60-min default.
+        thirty_min_ago = (
+            datetime.datetime.now(datetime.UTC) - datetime.timedelta(minutes=30)
+        ).isoformat()
+        status_file.write_text(json.dumps({"active_agents": [], "updated_at": thirty_min_ago}))
+        should_alert, _, _ = mod.check_orchestrator_staleness(
+            status_file=str(status_file),
+            tracker=tracker,
+            # Use default threshold (omit threshold_seconds).
+        )
+        assert should_alert is False
+
+    def test_alert_at_ninety_minutes(self, tmp_path: Path) -> None:
+        """Alert fires when status is 90 minutes old (beyond 60-min threshold)."""
+        import datetime
+
+        mod = _import_responder()
+        tracker = mod.StalenessTracker()
+        status_file = tmp_path / "status.json"
+        ninety_min_ago = (
+            datetime.datetime.now(datetime.UTC) - datetime.timedelta(minutes=90)
+        ).isoformat()
+        status_file.write_text(json.dumps({"active_agents": [], "updated_at": ninety_min_ago}))
+        should_alert, alert_text, _ = mod.check_orchestrator_staleness(
+            status_file=str(status_file),
+            tracker=tracker,
+            # Use default threshold (omit threshold_seconds).
+        )
+        assert should_alert is True
+        assert "90 minute" in alert_text
+
 
 class TestFormatStaleAlert:
     """Tests for the format_stale_alert function."""
@@ -2121,14 +2165,15 @@ class TestFormatStaleAlert:
         """Alert includes time, suggestions, and last heartbeat."""
         mod = _import_responder()
         alert = mod.format_stale_alert(
-            600.0,
+            3600.0,
             {
                 "active_agents": [],
                 "paused": False,
                 "updated_at": "2026-03-10T10:00:00Z",
             },
         )
-        assert "10 minute" in alert
+        assert "60 minute" in alert
+        assert "expired or crashed" in alert
         assert "/orchestrator" in alert
         assert "2026-03-10T10:00:00Z" in alert
 
