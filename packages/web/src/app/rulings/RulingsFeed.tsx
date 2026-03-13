@@ -1,6 +1,6 @@
 'use client';
 
-import { useState } from 'react';
+import { useState, useEffect, useRef, useCallback } from 'react';
 import { useQuery, gql } from '@apollo/client';
 import Link from 'next/link';
 import {
@@ -125,9 +125,12 @@ export function RulingsFeed() {
 
   const edges = data?.rulings.edges ?? [];
   const pageInfo = data?.rulings.pageInfo;
+  const fetchingMore = useRef(false);
+  const observer = useRef<IntersectionObserver | null>(null);
 
-  function handleLoadMore() {
-    if (!pageInfo?.endCursor) return;
+  const handleLoadMore = useCallback(() => {
+    if (!pageInfo?.endCursor || loading || fetchingMore.current) return;
+    fetchingMore.current = true;
     fetchMore({
       variables: { after: pageInfo.endCursor },
       updateQuery(prev, { fetchMoreResult }) {
@@ -139,8 +142,33 @@ export function RulingsFeed() {
           },
         };
       },
+    }).finally(() => {
+      fetchingMore.current = false;
     });
-  }
+  }, [pageInfo?.endCursor, loading, fetchMore]);
+
+  const sentinelRef = useCallback(
+    (node: HTMLDivElement | null) => {
+      if (observer.current) observer.current.disconnect();
+      if (!node) return;
+      observer.current = new IntersectionObserver(
+        (entries) => {
+          if (entries[0]?.isIntersecting) {
+            handleLoadMore();
+          }
+        },
+        { rootMargin: '200px' },
+      );
+      observer.current.observe(node);
+    },
+    [handleLoadMore],
+  );
+
+  useEffect(() => {
+    return () => {
+      if (observer.current) observer.current.disconnect();
+    };
+  }, []);
 
   return (
     <div>
@@ -257,17 +285,18 @@ export function RulingsFeed() {
           </div>
         ))}
 
-        {/* Load more */}
-        {pageInfo?.hasNextPage && (
-          <div className="flex justify-center py-4">
-            <button
-              onClick={handleLoadMore}
-              disabled={loading}
-              className="rounded-lg border border-slate-300 bg-white px-4 py-2 text-sm font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-50 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-300 dark:hover:bg-slate-700"
-            >
-              {loading ? 'Loading…' : 'Load more'}
-            </button>
-          </div>
+        {/* Loading indicator for infinite scroll */}
+        {loading && edges.length > 0 && (
+          <>
+            {Array.from({ length: 3 }).map((_, i) => (
+              <SkeletonRow key={`loading-${i}`} />
+            ))}
+          </>
+        )}
+
+        {/* Infinite scroll sentinel */}
+        {pageInfo?.hasNextPage && !loading && (
+          <div ref={sentinelRef} data-testid="scroll-sentinel" className="h-1" />
         )}
       </div>
     </div>

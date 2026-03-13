@@ -1,5 +1,5 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { render, screen, fireEvent } from '@testing-library/react';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { render, screen } from '@testing-library/react';
 
 // ---------------------------------------------------------------------------
 // Mocks
@@ -11,6 +11,11 @@ let mockQueryResult: {
   error: Error | undefined;
   fetchMore: ReturnType<typeof vi.fn>;
 };
+
+// IntersectionObserver mock
+let intersectionCallback: IntersectionObserverCallback;
+let mockObserve: ReturnType<typeof vi.fn>;
+let mockDisconnect: ReturnType<typeof vi.fn>;
 
 vi.mock('next/link', () => ({
   default: ({
@@ -75,6 +80,24 @@ describe('RulingsFeed (render)', () => {
       error: undefined,
       fetchMore: vi.fn(),
     };
+
+    mockObserve = vi.fn();
+    mockDisconnect = vi.fn();
+    vi.stubGlobal(
+      'IntersectionObserver',
+      vi.fn((callback: IntersectionObserverCallback) => {
+        intersectionCallback = callback;
+        return {
+          observe: mockObserve,
+          disconnect: mockDisconnect,
+          unobserve: vi.fn(),
+        };
+      }),
+    );
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
   });
 
   it('shows skeleton rows while loading', () => {
@@ -130,7 +153,7 @@ describe('RulingsFeed (render)', () => {
     expect(screen.getByText('\u2014')).toBeInTheDocument();
   });
 
-  it('renders the load more button when hasNextPage is true', () => {
+  it('renders scroll sentinel when hasNextPage is true', () => {
     mockQueryResult.data = {
       rulings: {
         edges: [{ cursor: 'c1', node: makeRulingNode() }],
@@ -138,12 +161,11 @@ describe('RulingsFeed (render)', () => {
       },
     };
     render(<RulingsFeed />);
-    expect(
-      screen.getByRole('button', { name: 'Load more' }),
-    ).toBeInTheDocument();
+    expect(screen.getByTestId('scroll-sentinel')).toBeInTheDocument();
   });
 
-  it('calls fetchMore when load more is clicked', () => {
+  it('calls fetchMore when sentinel becomes visible', () => {
+    mockQueryResult.fetchMore = vi.fn().mockResolvedValue({});
     mockQueryResult.data = {
       rulings: {
         edges: [{ cursor: 'c1', node: makeRulingNode() }],
@@ -151,11 +173,14 @@ describe('RulingsFeed (render)', () => {
       },
     };
     render(<RulingsFeed />);
-    fireEvent.click(screen.getByRole('button', { name: 'Load more' }));
+    intersectionCallback(
+      [{ isIntersecting: true } as IntersectionObserverEntry],
+      {} as IntersectionObserver,
+    );
     expect(mockQueryResult.fetchMore).toHaveBeenCalled();
   });
 
-  it('does not show load more when hasNextPage is false', () => {
+  it('does not show sentinel when hasNextPage is false', () => {
     mockQueryResult.data = {
       rulings: {
         edges: [{ cursor: 'c1', node: makeRulingNode() }],
@@ -163,9 +188,7 @@ describe('RulingsFeed (render)', () => {
       },
     };
     render(<RulingsFeed />);
-    expect(
-      screen.queryByRole('button', { name: 'Load more' }),
-    ).not.toBeInTheDocument();
+    expect(screen.queryByTestId('scroll-sentinel')).not.toBeInTheDocument();
   });
 
   it('renders filter inputs', () => {
