@@ -43,7 +43,7 @@ updated: <ISO-8601 timestamp>
 summary: <one-line description of current activity>
 ```
 
-Phases (in typical order): `claiming`, `setup`, `recovery-check`, `ralph-worker (iteration N)`, `ralph-reviewer (iteration N)`, `pushing`, `ci-watch`, `ci-fix`, `merging`, `deploying`, `retrospective`, `done`, `blocked`.
+Phases (in typical order): `claiming`, `setup`, `recovery-check`, `ralph-subagent`, `pushing`, `ci-watch`, `ci-fix`, `merging`, `deploying`, `retrospective`, `done`, `blocked`.
 
 **Write a status update at every major step transition** — use the Write tool to overwrite the status file. The first update should be written immediately after worktree setup with phase `claiming`.
 
@@ -100,7 +100,7 @@ After claiming the issue, create todos using `TaskCreate` to track your major wo
 **For implementation tasks (Path A):**
 1. "Set up dependencies" — venvs/node_modules for affected packages
 2. "Check for crash recovery checkpoints" — detect prior agent progress
-3. "Implement and review (ralph loop)" — the core implementation phase
+3. "Implement and review (ralph subagent)" — the core implementation phase
 4. "Commit and push" — stage, commit, create PR
 5. "Watch CI and fix failures" — monitor CI, resolve any failures
 6. "Verify no merge conflicts" — check mergeable status
@@ -196,18 +196,39 @@ If the checkpoint exists (exit code 0):
    ```
    Write the output to `{worktree}/tmp/ralph/plan.md`.
 3. Write `{worktree}/tmp/ralph/complexity.txt` with: `non-trivial: recovered plan from previous agent checkpoint`
-4. Proceed to **A.2** and invoke `/ralph`. Because `plan.md` already exists in the ralph state directory, the ralph skill's complexity check (Step 1.5) will detect it and skip the plan phase. Ralph will start directly at the implementation loop (Step 2 — The Loop), using the recovered plan.
+4. Proceed to **A.2** and spawn the ralph subagent. Because `plan.md` already exists in the ralph state directory, the ralph skill's complexity check (Step 1.5) will detect it and skip the plan phase. Ralph will start directly at the implementation loop (Step 2 — The Loop), using the recovered plan.
 
 **Step 3 — No checkpoints found:**
 
 If neither checkpoint exists (both exit code 1), proceed normally to A.2 with the full ralph flow (including complexity check and plan phase for non-trivial tasks).
 
-#### A.2 — Implement and review (ralph loop)
-- **For testable code tasks** (Python, TypeScript): use the `/ralph` loop — iterative work-then-review with fresh context each iteration. See `.claude/skills/ralph/SKILL.md`. This replaces the old `/tdd` + self-review steps. `/ralph` handles implementation (TDD), pre-PR checks, and cross-perspective review internally. It returns when the reviewer subagent says SHIP.
-- **For non-testable tasks** (Terraform, DB migrations, CI/CD, docs): implement directly, then run all applicable pre-PR checks (see CLAUDE.md §Pre-PR Checks) and review your own diff before continuing.
-- If `/ralph` exits with a blocker (STUCK or max iterations), the issue has already been commented on and labeled `status/blocked`. Clean up the worktree (`scripts/end-worker.sh {worktree}`) and stop.
+#### A.2 — Implement and review (ralph as foreground subagent)
 
-**POST-RALPH CHECKPOINT — Do not skip this.** After `/ralph` returns:
+**Why a subagent?** Spawning ralph as a foreground subagent (via the Agent tool) keeps the parent `/task` agent's context clean. The ralph loop generates substantial implementation detail (code diffs, test output, review feedback) that would otherwise pollute the parent's context. When ralph returns, the parent still has a clear, short context with the remaining workflow steps (A.3–A.9) visible. This prevents the #721 failure mode where agents exit after ralph without completing the post-ralph steps.
+
+- **For testable code tasks** (Python, TypeScript): spawn `/ralph` as a **foreground subagent** using the Agent tool:
+
+  > You are running the `/ralph` implementation loop for issue #<N>.
+  >
+  > **Worktree:** `{worktree}`
+  > **Issue number:** <N>
+  > **Repo root:** `{repo_root}`
+  >
+  > Read `.claude/skills/ralph/SKILL.md` for the full ralph skill instructions, then execute the ralph loop.
+  >
+  > The worktree is already set up with dependencies installed. The issue is already claimed.
+  >
+  > When the loop completes (SHIP or STUCK), write the completion files as specified in ralph Step 3. Do not commit, push, or create PRs — the parent `/task` agent handles that.
+  >
+  > **CRITICAL:** After writing `ralph-done.txt`, your work is done. Return control to the parent agent. Do not attempt any post-ralph steps (commit, push, PR, CI, merge).
+
+  **Do NOT use `isolation: "worktree"` on the Agent tool.** The worktree already exists — the Agent tool's worktree isolation would break project permissions.
+
+- **For non-testable tasks** (Terraform, DB migrations, CI/CD, docs): implement directly (no ralph subagent), then run all applicable pre-PR checks (see CLAUDE.md §Pre-PR Checks) and review your own diff before continuing.
+
+- If the ralph subagent exits with a blocker (STUCK or max iterations), the issue has already been commented on and labeled `status/blocked`. Clean up the worktree (`scripts/end-worker.sh {worktree}`) and stop.
+
+**POST-RALPH CHECKPOINT — Do not skip this.** After the ralph subagent returns:
 1. Read `{worktree}/tmp/ralph/ralph-done.txt` to confirm ralph completed with SHIP status.
 2. Read `{worktree}/tmp/ralph/review-result.txt` to verify the final verdict is SHIP.
 3. If both confirm SHIP, **immediately continue to A.3 below.** Do not stop, do not return, do not consider the task done. The code is implemented but not yet committed, pushed, or merged — the task is only halfway complete.
