@@ -26,6 +26,7 @@ jobs:
       infra: ${{ steps.changes.outputs.infra }}
       telegram: ${{ steps.changes.outputs.telegram }}
       infra-lambda: ${{ steps.changes.outputs.infra-lambda }}
+      scripts: ${{ steps.changes.outputs.scripts }}
       any-testable: ${{ steps.any-testable.outputs.result }}
     steps:
       - uses: actions/checkout@v4
@@ -47,6 +48,8 @@ jobs:
               - 'packages/telegram-bridge/**'
             infra-lambda:
               - 'infra/telegram-bot/**'
+            scripts:
+              - 'scripts/**'
       - name: Check if any coverage-producing package changed
         id: any-testable
         run: |
@@ -473,6 +476,22 @@ jobs:
           flags: lambda-telegram-bot
           fail_ci_if_error: false
 
+  scripts-tests:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.scripts == 'true'
+    runs-on: ubuntu-latest
+    env:
+      _VENV_HELPER_SKIP: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install test dependencies
+        run: pip install pytest boto3
+      - name: Test
+        run: pytest scripts/tests/ -v --tb=short
+
   # ---------------------------------------------------------------
   # Coverage gates: diff coverage (new lines) + overall floor ratchet
   # ---------------------------------------------------------------
@@ -664,7 +683,7 @@ jobs:
   # Always runs. Reports success only when every applicable job passed or was
   # skipped (path filter did not match). Branch protection requires this check.
   ci-passed:
-    needs: [scraper-unit-tests, ingestion-tests, nlp-tests, api-tests, web-tests, telegram-bridge-tests, infra-validate, lambda-tests, coverage-check, oneshot-imports-check, dq-baselines-validate]
+    needs: [scraper-unit-tests, ingestion-tests, nlp-tests, api-tests, web-tests, telegram-bridge-tests, infra-validate, lambda-tests, scripts-tests, coverage-check, oneshot-imports-check, dq-baselines-validate]
     if: always()
     runs-on: ubuntu-latest
     steps:
