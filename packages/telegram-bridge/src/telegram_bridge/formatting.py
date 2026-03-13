@@ -109,6 +109,64 @@ def format_status_card(
     )
 
 
+# Telegram's maximum message length.
+TELEGRAM_MAX_MESSAGE_LENGTH = 4096
+
+
+def split_message(text: str, *, max_length: int = TELEGRAM_MAX_MESSAGE_LENGTH) -> list[str]:
+    """Split *text* into chunks that each fit within *max_length*.
+
+    The function prefers splitting at paragraph boundaries (double newlines),
+    then at single newline boundaries, then at the last space before the
+    limit.  As a last resort it hard-cuts at *max_length*.
+
+    Args:
+        text: The text to split.
+        max_length: Maximum length of each chunk (default: 4096, Telegram's limit).
+
+    Returns:
+        A list of text chunks, each at most *max_length* characters.
+        Returns a single-element list if the text already fits.
+    """
+    if len(text) <= max_length:
+        return [text]
+
+    chunks: list[str] = []
+    remaining = text
+
+    while remaining:
+        if len(remaining) <= max_length:
+            chunks.append(remaining)
+            break
+
+        # Try to split at a paragraph boundary (double newline).
+        split_pos = remaining.rfind("\n\n", 0, max_length)
+        if split_pos > 0:
+            chunks.append(remaining[:split_pos].rstrip())
+            remaining = remaining[split_pos:].lstrip("\n")
+            continue
+
+        # Try to split at a single newline.
+        split_pos = remaining.rfind("\n", 0, max_length)
+        if split_pos > 0:
+            chunks.append(remaining[:split_pos].rstrip())
+            remaining = remaining[split_pos + 1 :]
+            continue
+
+        # Try to split at a space.
+        split_pos = remaining.rfind(" ", 0, max_length)
+        if split_pos > 0:
+            chunks.append(remaining[:split_pos])
+            remaining = remaining[split_pos + 1 :]
+            continue
+
+        # No good split point — hard cut.
+        chunks.append(remaining[:max_length])
+        remaining = remaining[max_length:]
+
+    return chunks
+
+
 _STATE_EMOJIS: dict[str, str] = {
     "complete": "\u2705",
     "in_progress": "\u23f3",

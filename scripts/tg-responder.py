@@ -79,7 +79,7 @@ if str(_BRIDGE_SRC) not in sys.path:
     sys.path.insert(0, str(_BRIDGE_SRC))
 
 try:
-    from telegram_bridge.formatting import linkify_github_refs  # noqa: E402
+    from telegram_bridge.formatting import linkify_github_refs, split_message  # noqa: E402
     from telegram_bridge.interpreter import (  # noqa: E402
         RateLimitError,
         RateLimiter,
@@ -256,6 +256,9 @@ def send_telegram_reply(
 ) -> None:
     """Send a message to all chat IDs via the Telegram Bot API.
 
+    If *text* exceeds Telegram's 4096-character limit, it is split at
+    paragraph boundaries and sent as multiple messages.
+
     Args:
         text: The message text to send.
         bot_token: Telegram bot token.
@@ -270,45 +273,49 @@ def send_telegram_reply(
     Errors are logged but not raised — the daemon should keep running even
     if a single reply fails.
     """
+    # Split long messages at paragraph boundaries to avoid truncation.
+    chunks = split_message(text)
+
     with httpx.Client(timeout=15.0) as client:
         for chat_id in chat_ids:
-            payload: dict[str, object] = {
-                "chat_id": chat_id,
-                "text": text,
-                "disable_web_page_preview": True,
-            }
-            if parse_mode is not None:
-                payload["parse_mode"] = parse_mode
-            try:
-                resp = client.post(
-                    f"{TELEGRAM_API_BASE}/bot{bot_token}/sendMessage",
-                    json=payload,
-                )
-                # On 400 (bad formatting), retry without parse_mode as plain text.
-                if resp.status_code == 400 and parse_mode is not None:
-                    logger.warning(
-                        "Telegram returned 400 for chat %d — retrying as plain text.",
-                        chat_id,
-                    )
-                    fallback_payload: dict[str, object] = {
-                        "chat_id": chat_id,
-                        "text": text,
-                        "disable_web_page_preview": True,
-                    }
+            for chunk in chunks:
+                payload: dict[str, object] = {
+                    "chat_id": chat_id,
+                    "text": chunk,
+                    "disable_web_page_preview": True,
+                }
+                if parse_mode is not None:
+                    payload["parse_mode"] = parse_mode
+                try:
                     resp = client.post(
                         f"{TELEGRAM_API_BASE}/bot{bot_token}/sendMessage",
-                        json=fallback_payload,
+                        json=payload,
                     )
-                if resp.status_code != 200:
+                    # On 400 (bad formatting), retry without parse_mode as plain text.
+                    if resp.status_code == 400 and parse_mode is not None:
+                        logger.warning(
+                            "Telegram returned 400 for chat %d — retrying as plain text.",
+                            chat_id,
+                        )
+                        fallback_payload: dict[str, object] = {
+                            "chat_id": chat_id,
+                            "text": chunk,
+                            "disable_web_page_preview": True,
+                        }
+                        resp = client.post(
+                            f"{TELEGRAM_API_BASE}/bot{bot_token}/sendMessage",
+                            json=fallback_payload,
+                        )
+                    if resp.status_code != 200:
+                        logger.warning(
+                            "Telegram API returned %d for chat %d",
+                            resp.status_code,
+                            chat_id,
+                        )
+                except Exception:
                     logger.warning(
-                        "Telegram API returned %d for chat %d",
-                        resp.status_code,
-                        chat_id,
+                        "Failed to send Telegram message to chat %d", chat_id, exc_info=True
                     )
-            except Exception:
-                logger.warning(
-                    "Failed to send Telegram message to chat %d", chat_id, exc_info=True
-                )
 
 
 # ── State file helpers ──────────────────────────────────────────────────

@@ -348,10 +348,70 @@ def interpret_message(
     )
 
 
+def _extract_json_object(text: str) -> dict[str, Any] | None:
+    """Try to extract a JSON object from *text*, searching for the outermost braces.
+
+    This handles cases where the model outputs preamble text before the JSON
+    response (e.g. ``"Let me provide the answer:\\n{...}"``).  It scans for
+    the first ``{`` and finds its matching ``}`` by tracking brace depth,
+    respecting string literals.
+
+    Returns the parsed dict, or ``None`` if no valid JSON object is found.
+    """
+    start = text.find("{")
+    if start == -1:
+        return None
+
+    # Find the matching closing brace by tracking depth.  We need to
+    # respect string literals to avoid being fooled by braces inside strings.
+    depth = 0
+    in_string = False
+    escape_next = False
+    for i in range(start, len(text)):
+        ch = text[i]
+        if escape_next:
+            escape_next = False
+            continue
+        if ch == "\\":
+            if in_string:
+                escape_next = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                candidate = text[start : i + 1]
+                try:
+                    result = json.loads(candidate)
+                    if isinstance(result, dict):
+                        return result
+                except json.JSONDecodeError:
+                    pass
+                # If this brace pair didn't parse, keep looking for the next {.
+                next_start = text.find("{", i + 1)
+                if next_start == -1:
+                    return None
+                # Reset and try from the next {.
+                return _extract_json_object(text[next_start:])
+    return None
+
+
 def _parse_response(text: str) -> dict[str, Any]:
     """Parse the Claude response as JSON, handling markdown code fences.
 
-    The model sometimes wraps JSON in ```json ... ``` blocks.
+    The model sometimes wraps JSON in ```json ... ``` blocks, or outputs
+    preamble text before the JSON response.  This function tries multiple
+    strategies to extract the JSON:
+
+    1. Strip markdown code fences and parse directly.
+    2. Try to find and extract a JSON object embedded in the text.
+    3. Fall back to treating the entire text as a plain-text reply.
     """
     cleaned = text.strip()
 
@@ -364,16 +424,32 @@ def _parse_response(text: str) -> dict[str, Any]:
         if cleaned.endswith("```"):
             cleaned = cleaned[: -len("```")].rstrip()
 
+    # Strategy 1: Try direct JSON parse.
     try:
         result = json.loads(cleaned)
-    except json.JSONDecodeError:
-        logger.warning("Failed to parse interpreter response as JSON: %s", text[:200])
-        # Fall back to treating the entire response as a reply.
-        return {"reply": text.strip(), "actions": []}
-
-    if not isinstance(result, dict):
+        if isinstance(result, dict):
+            return _validate_parsed_response(result)
         return {"reply": str(result), "actions": []}
+    except json.JSONDecodeError:
+        pass
 
+    # Strategy 2: Try to find an embedded JSON object (handles preamble text).
+    extracted = _extract_json_object(cleaned)
+    if extracted is not None and "reply" in extracted:
+        logger.debug("Extracted JSON from text with preamble (length %d).", len(cleaned))
+        return _validate_parsed_response(extracted)
+
+    # Strategy 3: Fall back to treating the entire response as a reply.
+    logger.warning("Failed to parse interpreter response as JSON: %s", text[:200])
+    return {"reply": text.strip(), "actions": []}
+
+
+def _validate_parsed_response(result: dict[str, Any]) -> dict[str, Any]:
+    """Validate and clean up a parsed JSON response dict.
+
+    Validates the ``actions`` array entries against known schemas and
+    returns the result with only valid actions retained.
+    """
     # Validate actions.
     actions = result.get("actions", [])
     validated_actions: list[dict[str, Any]] = []
@@ -631,12 +707,17 @@ def interpret_message_with_tools(
         logger.warning("Opus agent exhausted %d tool rounds.", max_tool_rounds)
 
     # Extract the final text response.
-    response_text = ""
+    # Collect all text blocks so we can try them individually.  The model
+    # sometimes outputs preamble/thinking in one text block and the JSON
+    # response in another.  Trying individual blocks (last first, since
+    # the final block is most likely to contain the answer) avoids the
+    # concatenation problem that causes truncation and raw-JSON leaks.
+    text_blocks: list[str] = []
     for block in response.content:
         if block.type == "text":
-            response_text += block.text
+            text_blocks.append(block.text)
 
-    if not response_text:
+    if not text_blocks:
         # No text in the response — generate a fallback.
         return InterpretedMessage(
             reply="I looked into your question but couldn't formulate a response. "
@@ -645,7 +726,23 @@ def interpret_message_with_tools(
             raw_response={},
         )
 
-    # Parse the JSON response (same format as Haiku).
+    # Strategy 1: Try each text block individually (last first).
+    # The final block most likely contains the JSON response.
+    for block_text in reversed(text_blocks):
+        parsed = _parse_response(block_text)
+        if "reply" in parsed and parsed["reply"] != block_text.strip():
+            # Successfully extracted a structured reply (not a raw-text fallback).
+            return InterpretedMessage(
+                reply=parsed.get(
+                    "reply",
+                    "I understood your message but couldn't generate a response.",
+                ),
+                actions=parsed.get("actions", []),
+                raw_response=parsed,
+            )
+
+    # Strategy 2: Try the concatenated text (original behavior).
+    response_text = "".join(text_blocks)
     parsed = _parse_response(response_text)
     return InterpretedMessage(
         reply=parsed.get("reply", "I understood your message but couldn't generate a response."),
