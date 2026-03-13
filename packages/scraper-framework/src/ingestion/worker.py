@@ -15,6 +15,8 @@ Environment variables:
     GOOGLE_API_KEY     — Required when LLM_PROVIDER is "google" (default)
     ANTHROPIC_API_KEY  — Required when LLM_PROVIDER is "anthropic"
     MAX_RETRIES       — Per-message retry limit before dead-lettering (default: 3)
+    HEARTBEAT_INTERVAL — Empty poll cycles between heartbeat log messages (default: 60)
+    HEARTBEAT_LOG_LEVEL — Log level for heartbeat messages: "DEBUG" or "INFO" (default: "INFO")
 """
 
 from __future__ import annotations
@@ -144,6 +146,9 @@ CONSUMER_NAME = f"ingestion-{socket.gethostname()}-{os.getpid()}"
 DEFAULT_BATCH_SIZE = 10
 DEFAULT_BLOCK_MS = 5000
 DEFAULT_MAX_RETRIES = 3
+# Number of consecutive empty poll cycles between heartbeat log messages.
+# At the default block timeout of 5 seconds, 60 cycles ≈ 5 minutes.
+DEFAULT_HEARTBEAT_INTERVAL = 60
 
 
 class IngestionWorker:
@@ -201,6 +206,16 @@ class IngestionWorker:
             self._llm_client = create_llm_client(provider=self._llm_provider)
         if self._llm_client is None:
             logger.warning("LLM API key not set — LLM extraction disabled, using regex-only mode")
+
+        # Heartbeat tracking — periodic log when idle to prove the worker is alive.
+        heartbeat_interval_env = os.environ.get("HEARTBEAT_INTERVAL")
+        self._heartbeat_interval: int = (
+            int(heartbeat_interval_env) if heartbeat_interval_env else DEFAULT_HEARTBEAT_INTERVAL
+        )
+        heartbeat_level_env = os.environ.get("HEARTBEAT_LOG_LEVEL", "INFO").upper()
+        self._heartbeat_log_level: int = getattr(logging, heartbeat_level_env, logging.INFO)
+        self._empty_polls: int = 0
+        self._last_event_time: float = time.monotonic()
 
         # LA County department-to-judge mapping — lazy-loaded on first LA event.
         # None means "not yet fetched"; empty dict means "fetch failed or empty".
@@ -678,8 +693,24 @@ class IngestionWorker:
             block=block_ms,
         )
         if not messages:
+            self._empty_polls += 1
+            if self._heartbeat_interval > 0 and self._empty_polls % self._heartbeat_interval == 0:
+                idle_seconds = round(time.monotonic() - self._last_event_time)
+                logger.log(
+                    self._heartbeat_log_level,
+                    "Heartbeat: idle for %d seconds (%d empty polls)",
+                    idle_seconds,
+                    self._empty_polls,
+                    extra={
+                        "consumer": CONSUMER_NAME,
+                        "idle_seconds": idle_seconds,
+                        "empty_polls": self._empty_polls,
+                    },
+                )
             return
 
+        self._empty_polls = 0
+        self._last_event_time = time.monotonic()
         for _stream_name, entries in messages:
             for msg_id, data in entries:
                 self._process_message(msg_id, data)
