@@ -1,26 +1,22 @@
 #!/usr/bin/env python3
 """Post and read structured checkpoint comments on GitHub issues.
 
-Used by the ralph loop to persist state at key milestones (plan approved,
-SHIP) so that crash recovery can detect what stage a task reached.
+Used by the ralph loop to persist state at key milestones (SHIP)
+so that crash recovery can detect what stage a task reached.
 
 This script is stdlib-only — no venv is needed.  It shells out to ``gh``
 for all GitHub API calls.
 
 Usage:
-    # Post approved plan
-    scripts/ralph_checkpoint.py plan-approved \
-        --issue 42 --plan-file {worktree}/tmp/ralph/plan.md --iterations 2
-
     # Post ralph SHIP completion
     scripts/ralph_checkpoint.py ship \
         --issue 42 --branch worker-3/session-... --worktree {worktree}
 
     # Check if a checkpoint exists (exit 0 = yes, 1 = no)
-    scripts/ralph_checkpoint.py check plan-approved --issue 42
+    scripts/ralph_checkpoint.py check ship --issue 42
 
-    # Read plan content from existing checkpoint
-    scripts/ralph_checkpoint.py read plan-approved --issue 42
+    # Read content from existing checkpoint
+    scripts/ralph_checkpoint.py read ship --issue 42
 """
 
 from __future__ import annotations
@@ -36,11 +32,9 @@ from typing import Any
 REPO = "judgemind/judgemind"
 
 # Machine-readable HTML markers embedded in checkpoint comments.
-MARKER_PLAN_APPROVED = "<!-- ralph-checkpoint:plan-approved -->"
 MARKER_SHIP = "<!-- ralph-checkpoint:ship -->"
 
 MARKERS: dict[str, str] = {
-    "plan-approved": MARKER_PLAN_APPROVED,
     "ship": MARKER_SHIP,
 }
 
@@ -153,44 +147,9 @@ def find_checkpoint_comment(
     return None
 
 
-def extract_plan_from_comment(body: str) -> str:
-    """Extract the plan content from a plan-approved checkpoint comment.
-
-    The plan is inside a ``<details>`` block.  We extract everything between
-    the ``</summary>`` and the reviewer line.
-    """
-    # Find content between </summary> and the reviewers / closing tags
-    match = re.search(
-        r"</summary>\s*\n(.*?)(?:\n\*\*Reviewers:\*\*|\n</details>)",
-        body,
-        re.DOTALL,
-    )
-    if match:
-        return match.group(1).strip()
-    return ""
-
-
 # ---------------------------------------------------------------------------
 # Comment formatting
 # ---------------------------------------------------------------------------
-
-
-def format_plan_approved_comment(
-    plan_content: str,
-    iterations: int,
-) -> str:
-    """Format the plan-approved checkpoint comment."""
-    return (
-        "<details>\n"
-        f"<summary>\U0001f5fa\ufe0f Approved implementation plan "
-        f"({iterations} iteration{'s' if iterations != 1 else ''})"
-        f"</summary>\n\n"
-        f"{plan_content}\n\n"
-        f"**Reviewers:** Claude \u2705, Gemini standard \u2705, "
-        f"Gemini adversarial \u2705\n\n"
-        f"</details>\n\n"
-        f"{MARKER_PLAN_APPROVED}"
-    )
 
 
 def _git_diff_stat(worktree: str) -> str:
@@ -289,19 +248,6 @@ def format_ship_comment(
 # ---------------------------------------------------------------------------
 
 
-def cmd_plan_approved(args: argparse.Namespace) -> None:
-    """Post a plan-approved checkpoint comment."""
-    plan_path = Path(args.plan_file)
-    if not plan_path.exists():
-        print(f"ERROR: Plan file not found: {plan_path}", file=sys.stderr)
-        sys.exit(1)
-
-    plan_content = plan_path.read_text(encoding="utf-8").strip()
-    body = format_plan_approved_comment(plan_content, args.iterations)
-    _post_comment(args.issue, body)
-    print(f"Posted plan-approved checkpoint on issue #{args.issue}")
-
-
 def cmd_ship(args: argparse.Namespace) -> None:
     """Post a SHIP checkpoint comment."""
     body = format_ship_comment(args.branch, args.worktree)
@@ -333,14 +279,7 @@ def cmd_read(args: argparse.Namespace) -> None:
         )
         sys.exit(1)
 
-    if args.checkpoint_type == "plan-approved":
-        content = extract_plan_from_comment(body)
-        print(content)
-    elif args.checkpoint_type == "ship":
-        # For ship, output the full details block content
-        print(body)
-    else:
-        print(body)
+    print(body)
 
 
 # ---------------------------------------------------------------------------
@@ -355,25 +294,6 @@ def build_parser() -> argparse.ArgumentParser:
         prog="scripts/ralph_checkpoint.py",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
-
-    # plan-approved
-    p_plan = subparsers.add_parser(
-        "plan-approved",
-        help="Post an approved plan checkpoint comment.",
-    )
-    p_plan.add_argument("--issue", type=int, required=True, help="Issue number.")
-    p_plan.add_argument(
-        "--plan-file",
-        required=True,
-        help="Path to the plan markdown file.",
-    )
-    p_plan.add_argument(
-        "--iterations",
-        type=int,
-        required=True,
-        help="Number of planned iterations.",
-    )
-    p_plan.set_defaults(func=cmd_plan_approved)
 
     # ship
     p_ship = subparsers.add_parser(
@@ -400,7 +320,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_check.add_argument(
         "checkpoint_type",
-        choices=["plan-approved", "ship"],
+        choices=["ship"],
         help="Type of checkpoint to check.",
     )
     p_check.add_argument("--issue", type=int, required=True, help="Issue number.")
@@ -413,7 +333,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_read.add_argument(
         "checkpoint_type",
-        choices=["plan-approved", "ship"],
+        choices=["ship"],
         help="Type of checkpoint to read.",
     )
     p_read.add_argument("--issue", type=int, required=True, help="Issue number.")

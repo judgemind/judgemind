@@ -16,12 +16,9 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from ralph_checkpoint import (
-    MARKER_PLAN_APPROVED,
     MARKER_SHIP,
     build_parser,
-    extract_plan_from_comment,
     find_checkpoint_comment,
-    format_plan_approved_comment,
     format_ship_comment,
 )
 
@@ -29,37 +26,6 @@ from ralph_checkpoint import (
 # ---------------------------------------------------------------------------
 # Comment formatting tests
 # ---------------------------------------------------------------------------
-
-
-class TestFormatPlanApprovedComment:
-    """Tests for format_plan_approved_comment."""
-
-    def test_contains_marker(self) -> None:
-        body = format_plan_approved_comment("My plan", iterations=2)
-        assert MARKER_PLAN_APPROVED in body
-
-    def test_contains_plan_content(self) -> None:
-        body = format_plan_approved_comment("Step 1: Do the thing", iterations=3)
-        assert "Step 1: Do the thing" in body
-
-    def test_contains_iteration_count(self) -> None:
-        body = format_plan_approved_comment("plan", iterations=4)
-        assert "4 iterations" in body
-
-    def test_singular_iteration(self) -> None:
-        body = format_plan_approved_comment("plan", iterations=1)
-        assert "1 iteration)" in body
-
-    def test_has_details_block(self) -> None:
-        body = format_plan_approved_comment("plan", iterations=2)
-        assert "<details>" in body
-        assert "</details>" in body
-        assert "<summary>" in body
-        assert "</summary>" in body
-
-    def test_has_reviewer_line(self) -> None:
-        body = format_plan_approved_comment("plan", iterations=2)
-        assert "**Reviewers:**" in body
 
 
 class TestFormatShipComment:
@@ -128,59 +94,12 @@ class TestFormatShipComment:
 
 
 # ---------------------------------------------------------------------------
-# Plan extraction tests
-# ---------------------------------------------------------------------------
-
-
-class TestExtractPlanFromComment:
-    """Tests for extract_plan_from_comment."""
-
-    def test_extracts_plan_content(self) -> None:
-        body = format_plan_approved_comment(
-            "## Step 1\nDo things\n\n## Step 2\nDo more",
-            iterations=2,
-        )
-        plan = extract_plan_from_comment(body)
-        assert "Step 1" in plan
-        assert "Step 2" in plan
-
-    def test_strips_whitespace(self) -> None:
-        body = format_plan_approved_comment("  trimmed  ", iterations=1)
-        plan = extract_plan_from_comment(body)
-        assert plan == "trimmed"
-
-    def test_returns_empty_for_no_match(self) -> None:
-        plan = extract_plan_from_comment("no details block here")
-        assert plan == ""
-
-    def test_handles_multiline_plan(self) -> None:
-        plan_text = "Line 1\nLine 2\nLine 3\n\n- bullet 1\n- bullet 2"
-        body = format_plan_approved_comment(plan_text, iterations=3)
-        extracted = extract_plan_from_comment(body)
-        assert "Line 1" in extracted
-        assert "bullet 2" in extracted
-
-
-# ---------------------------------------------------------------------------
 # Checkpoint detection tests
 # ---------------------------------------------------------------------------
 
 
 class TestFindCheckpointComment:
     """Tests for find_checkpoint_comment."""
-
-    @patch("ralph_checkpoint._fetch_issue_comments")
-    def test_finds_plan_approved(
-        self,
-        mock_fetch: MagicMock,
-    ) -> None:
-        mock_fetch.return_value = [
-            {"body": "Some other comment"},
-            {"body": f"plan details\n{MARKER_PLAN_APPROVED}"},
-        ]
-        result = find_checkpoint_comment(42, "plan-approved")
-        assert result is not None
-        assert MARKER_PLAN_APPROVED in result
 
     @patch("ralph_checkpoint._fetch_issue_comments")
     def test_finds_ship(
@@ -202,7 +121,7 @@ class TestFindCheckpointComment:
         mock_fetch.return_value = [
             {"body": "Just a regular comment"},
         ]
-        result = find_checkpoint_comment(42, "plan-approved")
+        result = find_checkpoint_comment(42, "ship")
         assert result is None
 
     @patch("ralph_checkpoint._fetch_issue_comments")
@@ -254,23 +173,6 @@ class TestCountPassingTests:
 class TestBuildParser:
     """Tests for the CLI argument parser."""
 
-    def test_plan_approved_args(self) -> None:
-        parser = build_parser()
-        args = parser.parse_args(
-            [
-                "plan-approved",
-                "--issue",
-                "42",
-                "--plan-file",
-                "/tmp/plan.md",
-                "--iterations",
-                "2",
-            ]
-        )
-        assert args.issue == 42
-        assert args.plan_file == "/tmp/plan.md"
-        assert args.iterations == 2
-
     def test_ship_args(self) -> None:
         parser = build_parser()
         args = parser.parse_args(
@@ -290,8 +192,8 @@ class TestBuildParser:
 
     def test_check_args(self) -> None:
         parser = build_parser()
-        args = parser.parse_args(["check", "plan-approved", "--issue", "42"])
-        assert args.checkpoint_type == "plan-approved"
+        args = parser.parse_args(["check", "ship", "--issue", "42"])
+        assert args.checkpoint_type == "ship"
         assert args.issue == 42
 
     def test_read_args(self) -> None:
@@ -308,29 +210,5 @@ class TestBuildParser:
     def test_missing_required_args(self) -> None:
         parser = build_parser()
         with pytest.raises(SystemExit):
-            parser.parse_args(["plan-approved"])
+            parser.parse_args(["ship"])
 
-
-# ---------------------------------------------------------------------------
-# Integration-style: roundtrip format -> extract
-# ---------------------------------------------------------------------------
-
-
-class TestRoundtrip:
-    """Test that formatting and extracting are consistent."""
-
-    def test_plan_roundtrip(self) -> None:
-        original = (
-            "## Architecture\n\nUse a factory pattern.\n\n## Tests\n\n5 unit tests."
-        )
-        body = format_plan_approved_comment(original, iterations=2)
-        extracted = extract_plan_from_comment(body)
-        assert "Architecture" in extracted
-        assert "factory pattern" in extracted
-        assert "5 unit tests" in extracted
-
-    def test_plan_roundtrip_preserves_content(self) -> None:
-        original = "Simple one-liner plan."
-        body = format_plan_approved_comment(original, iterations=1)
-        extracted = extract_plan_from_comment(body)
-        assert extracted == original

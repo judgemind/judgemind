@@ -2,11 +2,10 @@
 # gemini-review.sh — Run the Gemini cross-model review for the /ralph loop.
 #
 # Usage:
-#   scripts/gemini-review.sh <worktree-path> [--adversarial] [--plan]
+#   scripts/gemini-review.sh <worktree-path> [--adversarial]
 #
 # This wrapper:
-# 1. Prepares the diff and changed-files inputs from the worktree (code review)
-#    or reads plan.md (plan review)
+# 1. Prepares the diff and changed-files inputs from the worktree
 # 2. Injects the Google API key from Secrets Manager via with-secret.sh
 # 3. Runs gemini_review.py with RALPH_STATE_DIR set
 #
@@ -14,14 +13,10 @@
 #   --adversarial   Run in adversarial (bug-hunting) mode instead of standard review.
 #                   Sets GEMINI_REVIEW_MODE=adversarial and writes to adversarial-result.txt
 #                   and adversarial-feedback.md instead of the standard output files.
-#   --plan          Review an implementation plan instead of a code diff.
-#                   Sets GEMINI_REVIEW_PHASE=plan. Reads plan.md and task.md from the
-#                   ralph state directory. Writes to plan-gemini-result.txt /
-#                   plan-adversarial-result.txt and corresponding feedback files.
 #
 # Exit codes:
-#   0 — Review completed (SHIP/APPROVE or REVISE written to result file)
-#   2 — Review skipped gracefully (no API key, API error, plan.md missing, etc.)
+#   0 — Review completed (SHIP or REVISE written to result file)
+#   2 — Review skipped gracefully (no API key, API error, etc.)
 #   1 — Hard error (missing inputs, bad arguments)
 
 set -euo pipefail
@@ -30,7 +25,6 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 # Parse arguments
 ADVERSARIAL=false
-PLAN=false
 WORKTREE=""
 
 for arg in "$@"; do
@@ -38,15 +32,12 @@ for arg in "$@"; do
         --adversarial)
             ADVERSARIAL=true
             ;;
-        --plan)
-            PLAN=true
-            ;;
         *)
             if [[ -z "$WORKTREE" ]]; then
                 WORKTREE="$arg"
             else
                 echo "ERROR: Unexpected argument: $arg" >&2
-                echo "Usage: scripts/gemini-review.sh <worktree-path> [--adversarial] [--plan]" >&2
+                echo "Usage: scripts/gemini-review.sh <worktree-path> [--adversarial]" >&2
                 exit 1
             fi
             ;;
@@ -54,7 +45,7 @@ for arg in "$@"; do
 done
 
 if [[ -z "$WORKTREE" ]]; then
-    echo "Usage: scripts/gemini-review.sh <worktree-path> [--adversarial] [--plan]" >&2
+    echo "Usage: scripts/gemini-review.sh <worktree-path> [--adversarial]" >&2
     exit 1
 fi
 
@@ -65,31 +56,28 @@ if [[ ! -d "$STATE_DIR" ]]; then
     exit 1
 fi
 
-# Generate diff and changed files (skip for plan reviews)
-if [[ "$PLAN" == "false" ]]; then
-    # Generate diff.txt from the worktree
-    git -C "$WORKTREE" diff > "${STATE_DIR}/diff.txt" 2>/dev/null || true
-    git -C "$WORKTREE" diff --cached >> "${STATE_DIR}/diff.txt" 2>/dev/null || true
+# Generate diff.txt from the worktree
+git -C "$WORKTREE" diff > "${STATE_DIR}/diff.txt" 2>/dev/null || true
+git -C "$WORKTREE" diff --cached >> "${STATE_DIR}/diff.txt" 2>/dev/null || true
 
-    # Generate changed_files.txt — full content of files that have changes
-    changed=$(git -C "$WORKTREE" diff --name-only HEAD 2>/dev/null || true)
-    cached=$(git -C "$WORKTREE" diff --cached --name-only 2>/dev/null || true)
-    untracked=$(git -C "$WORKTREE" ls-files --others --exclude-standard 2>/dev/null || true)
+# Generate changed_files.txt — full content of files that have changes
+changed=$(git -C "$WORKTREE" diff --name-only HEAD 2>/dev/null || true)
+cached=$(git -C "$WORKTREE" diff --cached --name-only 2>/dev/null || true)
+untracked=$(git -C "$WORKTREE" ls-files --others --exclude-standard 2>/dev/null || true)
 
-    # Combine and deduplicate
-    all_files=$(echo -e "${changed}\n${cached}\n${untracked}" | sort -u | grep -v '^$' || true)
+# Combine and deduplicate
+all_files=$(echo -e "${changed}\n${cached}\n${untracked}" | sort -u | grep -v '^$' || true)
 
-    # Write full content of each changed file
-    > "${STATE_DIR}/changed_files.txt"
-    for f in $all_files; do
-        filepath="${WORKTREE}/${f}"
-        if [[ -f "$filepath" ]]; then
-            echo "=== ${f} ===" >> "${STATE_DIR}/changed_files.txt"
-            cat "$filepath" >> "${STATE_DIR}/changed_files.txt"
-            echo "" >> "${STATE_DIR}/changed_files.txt"
-        fi
-    done
-fi
+# Write full content of each changed file
+> "${STATE_DIR}/changed_files.txt"
+for f in $all_files; do
+    filepath="${WORKTREE}/${f}"
+    if [[ -f "$filepath" ]]; then
+        echo "=== ${f} ===" >> "${STATE_DIR}/changed_files.txt"
+        cat "$filepath" >> "${STATE_DIR}/changed_files.txt"
+        echo "" >> "${STATE_DIR}/changed_files.txt"
+    fi
+done
 
 # Use a dedicated scripts venv for script dependencies (google-genai, anthropic).
 # This avoids depending on whichever package venv happens to exist first
@@ -131,16 +119,10 @@ export RALPH_STATE_DIR="$STATE_DIR"
 
 if [[ "$ADVERSARIAL" == "true" ]]; then
     export GEMINI_REVIEW_MODE="adversarial"
+    echo "Running Gemini adversarial review..." >&2
 else
     export GEMINI_REVIEW_MODE="standard"
-fi
-
-if [[ "$PLAN" == "true" ]]; then
-    export GEMINI_REVIEW_PHASE="plan"
-    echo "Running Gemini ${GEMINI_REVIEW_MODE} plan review..." >&2
-else
-    export GEMINI_REVIEW_PHASE="code"
-    echo "Running Gemini ${GEMINI_REVIEW_MODE} review..." >&2
+    echo "Running Gemini standard review..." >&2
 fi
 
 "${SCRIPT_DIR}/with-secret.sh" \
@@ -150,7 +132,7 @@ fi
 exit_code=$?
 
 if [[ $exit_code -eq 2 ]]; then
-    echo "Gemini ${GEMINI_REVIEW_MODE} ${GEMINI_REVIEW_PHASE} review skipped (graceful degradation)." >&2
+    echo "Gemini ${GEMINI_REVIEW_MODE} review skipped (graceful degradation)." >&2
 fi
 
 exit $exit_code
