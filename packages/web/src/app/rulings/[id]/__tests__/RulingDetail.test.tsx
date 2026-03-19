@@ -25,6 +25,7 @@ function buildFullRuling() {
     isTentative: true,
     department: '12' as string | null,
     rulingText: 'The motion is granted.\n\nThe court finds in favor of plaintiff.' as string | null,
+    rulingTextHtml: null as string | null,
     summary: 'Court grants MSJ in favor of plaintiff.' as string | null,
     postedAt: '2026-03-09T18:00:00Z' as string | null,
     documentId: 'doc-1' as string | null,
@@ -54,6 +55,7 @@ function buildMinimalRuling() {
     isTentative: false,
     department: null,
     rulingText: null,
+    rulingTextHtml: null,
     summary: null,
     postedAt: null,
     documentId: null,
@@ -252,5 +254,101 @@ describe('RulingDetail', () => {
     const caseLink = screen.getByText(/25STCV12345/).closest('a');
     expect(caseLink?.textContent).toContain('\u2014');
     expect(caseLink?.textContent).toContain('Smith v. Jones');
+  });
+
+  // -------------------------------------------------------------------------
+  // Formatted HTML rendering (rulingTextHtml)
+  // -------------------------------------------------------------------------
+
+  it('renders formatted HTML when rulingTextHtml is present', () => {
+    const ruling = buildFullRuling();
+    ruling.rulingTextHtml = '<div class="ruling"><section class="ruling-body"><h3>Motion to Compel</h3><p>The motion is <strong>GRANTED</strong>.</p></section></div>';
+    const { container } = render(<RulingDetail ruling={ruling} />);
+
+    // Should render the formatted HTML
+    expect(screen.getByText('Ruling Text')).toBeInTheDocument();
+    const formattedDiv = container.querySelector('.ruling-formatted');
+    expect(formattedDiv).toBeInTheDocument();
+    expect(formattedDiv?.innerHTML).toContain('Motion to Compel');
+    expect(formattedDiv?.innerHTML).toContain('<strong>GRANTED</strong>');
+  });
+
+  it('prefers rulingTextHtml over rulingText when both are present', () => {
+    const ruling = buildFullRuling();
+    ruling.rulingText = 'Plain text version';
+    ruling.rulingTextHtml = '<p>Formatted HTML version</p>';
+    render(<RulingDetail ruling={ruling} />);
+
+    // Should show HTML version, not plain text
+    expect(screen.getByText('Formatted HTML version')).toBeInTheDocument();
+    expect(screen.queryByText('Plain text version')).not.toBeInTheDocument();
+  });
+
+  it('falls back to plain text when rulingTextHtml is null', () => {
+    const ruling = buildFullRuling();
+    ruling.rulingTextHtml = null;
+    ruling.rulingText = 'Fallback plain text.\n\nSecond paragraph.';
+    render(<RulingDetail ruling={ruling} />);
+
+    expect(screen.getByText('Fallback plain text.')).toBeInTheDocument();
+    expect(screen.getByText('Second paragraph.')).toBeInTheDocument();
+  });
+
+  it('does not render ruling text section when both rulingText and rulingTextHtml are null', () => {
+    const ruling = buildFullRuling();
+    ruling.rulingText = null;
+    ruling.rulingTextHtml = null;
+    render(<RulingDetail ruling={ruling} />);
+
+    expect(screen.queryByText('Ruling Text')).not.toBeInTheDocument();
+  });
+
+  it('sanitizes dangerous HTML content from rulingTextHtml', () => {
+    const ruling = buildFullRuling();
+    ruling.rulingTextHtml = '<p>Safe content</p><script>alert("xss")</script><p onclick="alert(1)">More content</p>';
+    const { container } = render(<RulingDetail ruling={ruling} />);
+
+    const formattedDiv = container.querySelector('.ruling-formatted');
+    expect(formattedDiv).toBeInTheDocument();
+    // Script tag should be stripped
+    expect(formattedDiv?.innerHTML).not.toContain('<script>');
+    expect(formattedDiv?.innerHTML).not.toContain('alert');
+    // Safe content should remain
+    expect(formattedDiv?.innerHTML).toContain('Safe content');
+    expect(formattedDiv?.innerHTML).toContain('More content');
+    // onclick should be stripped
+    expect(formattedDiv?.innerHTML).not.toContain('onclick');
+  });
+
+  it('renders formatted HTML with ruling template CSS classes', () => {
+    const ruling = buildFullRuling();
+    ruling.rulingTextHtml = [
+      '<div class="ruling">',
+      '  <header class="ruling-header">',
+      '    <div class="case-number">Case No. 24STCV16071</div>',
+      '    <div class="case-caption">',
+      '      <span class="party plaintiff">Alexis Maxwell</span>',
+      '      <span class="vs">v.</span>',
+      '      <span class="party defendant">650 S Spring Owner LLC</span>',
+      '    </div>',
+      '  </header>',
+      '  <section class="ruling-body">',
+      '    <h3>Motion to Compel Arbitration</h3>',
+      '    <p>The motion is GRANTED.</p>',
+      '  </section>',
+      '</div>',
+    ].join('\n');
+    const { container } = render(<RulingDetail ruling={ruling} />);
+
+    // Verify structure is preserved
+    const formattedDiv = container.querySelector('.ruling-formatted');
+    expect(formattedDiv?.querySelector('.ruling')).toBeInTheDocument();
+    expect(formattedDiv?.querySelector('.ruling-header')).toBeInTheDocument();
+    expect(formattedDiv?.querySelector('.case-number')).toBeInTheDocument();
+    expect(formattedDiv?.querySelector('.case-caption')).toBeInTheDocument();
+    expect(formattedDiv?.querySelector('.party.plaintiff')).toBeInTheDocument();
+    expect(formattedDiv?.querySelector('.party.defendant')).toBeInTheDocument();
+    expect(formattedDiv?.querySelector('.vs')).toBeInTheDocument();
+    expect(formattedDiv?.querySelector('.ruling-body')).toBeInTheDocument();
   });
 });

@@ -2,6 +2,92 @@
 @tailwind components;
 @tailwind utilities;
 
+/* ---------------------------------------------------------------------------
+ * Ruling formatted HTML styles
+ *
+ * Applied to LLM-formatted ruling HTML rendered via ruling_text_html.
+ * The .ruling-formatted wrapper is set by RulingDetail.tsx on the container div.
+ * See issue #971 for the template specification.
+ * --------------------------------------------------------------------------- */
+
+@layer components {
+  .ruling-formatted .ruling {
+    @apply space-y-4;
+  }
+
+  .ruling-formatted .ruling-header {
+    @apply mb-4 border-b border-slate-200 pb-3 dark:border-slate-700;
+  }
+
+  .ruling-formatted .case-number {
+    @apply text-sm font-semibold text-slate-900 dark:text-slate-100;
+  }
+
+  .ruling-formatted .case-caption {
+    @apply mt-1 text-sm text-slate-700 dark:text-slate-300;
+  }
+
+  .ruling-formatted .case-caption .party {
+    @apply font-medium;
+  }
+
+  .ruling-formatted .case-caption .party.plaintiff {
+    @apply text-slate-900 dark:text-slate-100;
+  }
+
+  .ruling-formatted .case-caption .party.defendant {
+    @apply text-slate-900 dark:text-slate-100;
+  }
+
+  .ruling-formatted .case-caption .vs {
+    @apply mx-1 italic text-slate-500 dark:text-slate-400;
+  }
+
+  .ruling-formatted .hearing-info {
+    @apply mt-1 text-xs text-slate-500 dark:text-slate-400;
+  }
+
+  .ruling-formatted .hearing-info > span + span::before {
+    content: " \00B7  ";
+  }
+
+  .ruling-formatted .ruling-body {
+    @apply space-y-3;
+  }
+
+  .ruling-formatted .ruling-body h3 {
+    @apply mt-4 text-base font-semibold text-slate-900 dark:text-slate-100;
+  }
+
+  .ruling-formatted .ruling-body h4 {
+    @apply mt-3 text-sm font-semibold text-slate-800 dark:text-slate-200;
+  }
+
+  .ruling-formatted .ruling-body p {
+    @apply text-sm leading-relaxed text-slate-700 dark:text-slate-300;
+  }
+
+  .ruling-formatted .ruling-body ul {
+    @apply ml-4 list-disc space-y-1 text-sm text-slate-700 dark:text-slate-300;
+  }
+
+  .ruling-formatted .ruling-body ol {
+    @apply ml-4 list-decimal space-y-1 text-sm text-slate-700 dark:text-slate-300;
+  }
+
+  .ruling-formatted .ruling-body li {
+    @apply leading-relaxed;
+  }
+
+  .ruling-formatted .ruling-body strong {
+    @apply font-semibold text-slate-900 dark:text-slate-100;
+  }
+
+  .ruling-formatted .ruling-body blockquote {
+    @apply border-l-2 border-slate-300 pl-3 italic text-slate-600 dark:border-slate-600 dark:text-slate-400;
+  }
+}
+
 @layer base {
   :root {
     --background: 255 255 255;

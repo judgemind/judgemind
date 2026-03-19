@@ -2,6 +2,7 @@
 
 import Link from 'next/link';
 import { buildDownloadUrl, cleanRulingText, FORMAT_LABELS } from '@/lib/display-helpers';
+import { sanitizeRulingHtml } from '@/lib/sanitize-html';
 
 interface RulingProps {
   ruling: {
@@ -12,6 +13,7 @@ interface RulingProps {
     isTentative: boolean;
     department: string | null;
     rulingText: string | null;
+    rulingTextHtml: string | null;
     summary: string | null;
     postedAt: string | null;
     documentId: string | null;
@@ -78,22 +80,31 @@ export function RulingDetail({ ruling }: RulingProps) {
         </section>
       )}
 
-      {/* Ruling text */}
-      {ruling.rulingText && (
+      {/* Ruling text — prefer formatted HTML when available */}
+      {(ruling.rulingTextHtml || ruling.rulingText) && (
         <section className="mb-6">
           <h2 className="text-xs font-medium uppercase tracking-wide text-slate-500 dark:text-slate-400">
             Ruling Text
           </h2>
-          <div className="mt-2 space-y-3">
-            {cleanRulingText(ruling.rulingText).map((paragraph, idx) => (
-              <p
-                key={idx}
-                className="text-sm leading-relaxed text-slate-700 dark:text-slate-300"
-              >
-                {paragraph}
-              </p>
-            ))}
-          </div>
+          {ruling.rulingTextHtml ? (
+            <div
+              className="ruling-formatted mt-2 text-sm leading-relaxed text-slate-700 dark:text-slate-300"
+              dangerouslySetInnerHTML={{
+                __html: sanitizeRulingHtml(ruling.rulingTextHtml),
+              }}
+            />
+          ) : (
+            <div className="mt-2 space-y-3">
+              {cleanRulingText(ruling.rulingText!).map((paragraph, idx) => (
+                <p
+                  key={idx}
+                  className="text-sm leading-relaxed text-slate-700 dark:text-slate-300"
+                >
+                  {paragraph}
+                </p>
+              ))}
+            </div>
+          )}
         </section>
       )}
 

@@ -14,6 +14,7 @@ const RULING_QUERY = gql`
       isTentative
       department
       rulingText
+      rulingTextHtml
       summary
       postedAt
       documentId
@@ -44,6 +45,7 @@ interface RulingData {
     isTentative: boolean;
     department: string | null;
     rulingText: string | null;
+    rulingTextHtml: string | null;
     summary: string | null;
     postedAt: string | null;
     documentId: string | null;
