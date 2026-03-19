@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, screen } from '@testing-library/react';
-import { RulingDetail } from '../RulingDetail';
+import { RulingDetail, sanitizeRulingHtml } from '../RulingDetail';
 
 // ---------------------------------------------------------------------------
 // Mock next/link — render as an anchor tag
@@ -25,6 +25,7 @@ function buildFullRuling() {
     isTentative: true,
     department: '12' as string | null,
     rulingText: 'The motion is granted.\n\nThe court finds in favor of plaintiff.' as string | null,
+    rulingTextHtml: null as string | null,
     summary: 'Court grants MSJ in favor of plaintiff.' as string | null,
     postedAt: '2026-03-09T18:00:00Z' as string | null,
     documentId: 'doc-1' as string | null,
@@ -54,6 +55,7 @@ function buildMinimalRuling() {
     isTentative: false,
     department: null,
     rulingText: null,
+    rulingTextHtml: null,
     summary: null,
     postedAt: null,
     documentId: null,
@@ -156,9 +158,10 @@ describe('RulingDetail', () => {
     expect(screen.queryByText('Summary')).not.toBeInTheDocument();
   });
 
-  it('does not render ruling text section when rulingText is null', () => {
+  it('does not render ruling text section when both rulingText and rulingTextHtml are null', () => {
     const ruling = buildFullRuling();
     ruling.rulingText = null;
+    ruling.rulingTextHtml = null;
     render(<RulingDetail ruling={ruling} />);
 
     expect(screen.queryByText('Ruling Text')).not.toBeInTheDocument();
@@ -252,5 +255,190 @@ describe('RulingDetail', () => {
     const caseLink = screen.getByText(/25STCV12345/).closest('a');
     expect(caseLink?.textContent).toContain('\u2014');
     expect(caseLink?.textContent).toContain('Smith v. Jones');
+  });
+
+  // -------------------------------------------------------------------------
+  // Formatted HTML rendering (rulingTextHtml)
+  // -------------------------------------------------------------------------
+
+  it('renders formatted HTML when rulingTextHtml is present', () => {
+    const ruling = buildFullRuling();
+    ruling.rulingTextHtml = '<div class="ruling"><div class="ruling-body"><p>The motion is <strong>GRANTED</strong>.</p></div></div>';
+    ruling.rulingText = 'The motion is GRANTED.';
+    const { container } = render(<RulingDetail ruling={ruling} />);
+
+    // Should render the HTML content
+    expect(screen.getByText('Ruling Text')).toBeInTheDocument();
+    const rulingContent = container.querySelector('.ruling-content');
+    expect(rulingContent).toBeInTheDocument();
+    expect(rulingContent?.innerHTML).toContain('<strong>GRANTED</strong>');
+
+    // Should have the ruling-body class from the template
+    expect(container.querySelector('.ruling-body')).toBeInTheDocument();
+  });
+
+  it('falls back to raw text when rulingTextHtml is null', () => {
+    const ruling = buildFullRuling();
+    ruling.rulingTextHtml = null;
+    ruling.rulingText = 'The motion is granted.\n\nPlaintiff wins.';
+    const { container } = render(<RulingDetail ruling={ruling} />);
+
+    // Should render paragraphs from cleanRulingText
+    expect(screen.getByText('Ruling Text')).toBeInTheDocument();
+    expect(screen.getByText('The motion is granted.')).toBeInTheDocument();
+    expect(screen.getByText('Plaintiff wins.')).toBeInTheDocument();
+
+    // Should NOT have the ruling-content wrapper with dangerouslySetInnerHTML
+    expect(container.querySelector('.ruling-content')).not.toBeInTheDocument();
+  });
+
+  it('prefers rulingTextHtml over rulingText when both are present', () => {
+    const ruling = buildFullRuling();
+    ruling.rulingTextHtml = '<p>Formatted version</p>';
+    ruling.rulingText = 'Raw version';
+    const { container } = render(<RulingDetail ruling={ruling} />);
+
+    expect(container.querySelector('.ruling-content')).toBeInTheDocument();
+    expect(screen.getByText('Formatted version')).toBeInTheDocument();
+    expect(screen.queryByText('Raw version')).not.toBeInTheDocument();
+  });
+
+  it('renders ruling text section when only rulingTextHtml is present (rulingText is null)', () => {
+    const ruling = buildFullRuling();
+    ruling.rulingTextHtml = '<p>Only HTML available</p>';
+    ruling.rulingText = null;
+    render(<RulingDetail ruling={ruling} />);
+
+    expect(screen.getByText('Ruling Text')).toBeInTheDocument();
+    expect(screen.getByText('Only HTML available')).toBeInTheDocument();
+  });
+
+  // -------------------------------------------------------------------------
+  // HTML sanitization
+  // -------------------------------------------------------------------------
+
+  it('strips script tags from rulingTextHtml', () => {
+    const ruling = buildFullRuling();
+    ruling.rulingTextHtml = '<p>Safe content</p><script>alert("xss")</script>';
+    const { container } = render(<RulingDetail ruling={ruling} />);
+
+    const rulingContent = container.querySelector('.ruling-content');
+    expect(rulingContent).toBeInTheDocument();
+    expect(rulingContent?.innerHTML).toContain('Safe content');
+    expect(rulingContent?.innerHTML).not.toContain('script');
+    expect(rulingContent?.innerHTML).not.toContain('alert');
+  });
+
+  it('strips event handler attributes from rulingTextHtml', () => {
+    const ruling = buildFullRuling();
+    ruling.rulingTextHtml = '<p onerror="alert(1)" onclick="alert(2)">Content</p>';
+    const { container } = render(<RulingDetail ruling={ruling} />);
+
+    const rulingContent = container.querySelector('.ruling-content');
+    expect(rulingContent).toBeInTheDocument();
+    expect(rulingContent?.innerHTML).not.toContain('onerror');
+    expect(rulingContent?.innerHTML).not.toContain('onclick');
+    expect(rulingContent?.innerHTML).toContain('Content');
+  });
+
+  it('strips iframe tags from rulingTextHtml', () => {
+    const ruling = buildFullRuling();
+    ruling.rulingTextHtml = '<p>Before</p><iframe src="https://evil.com"></iframe><p>After</p>';
+    const { container } = render(<RulingDetail ruling={ruling} />);
+
+    const rulingContent = container.querySelector('.ruling-content');
+    expect(rulingContent?.innerHTML).not.toContain('iframe');
+    expect(rulingContent?.innerHTML).toContain('Before');
+    expect(rulingContent?.innerHTML).toContain('After');
+  });
+
+  it('strips style attributes but preserves class attributes', () => {
+    const ruling = buildFullRuling();
+    ruling.rulingTextHtml = '<div class="ruling" style="background:red"><p>Content</p></div>';
+    const { container } = render(<RulingDetail ruling={ruling} />);
+
+    const rulingContent = container.querySelector('.ruling-content');
+    expect(rulingContent?.innerHTML).toContain('class="ruling"');
+    expect(rulingContent?.innerHTML).not.toContain('style');
+  });
+
+  it('strips form and input elements from rulingTextHtml', () => {
+    const ruling = buildFullRuling();
+    ruling.rulingTextHtml = '<p>Content</p><form action="/steal"><input type="text" /></form>';
+    const { container } = render(<RulingDetail ruling={ruling} />);
+
+    const rulingContent = container.querySelector('.ruling-content');
+    expect(rulingContent?.innerHTML).not.toContain('form');
+    expect(rulingContent?.innerHTML).not.toContain('input');
+    expect(rulingContent?.innerHTML).toContain('Content');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// sanitizeRulingHtml unit tests
+// ---------------------------------------------------------------------------
+
+describe('sanitizeRulingHtml', () => {
+  it('preserves allowed tags', () => {
+    const html = '<div class="ruling"><p>Text</p><strong>Bold</strong><em>Italic</em></div>';
+    const result = sanitizeRulingHtml(html);
+    expect(result).toContain('<div class="ruling">');
+    expect(result).toContain('<p>');
+    expect(result).toContain('<strong>');
+    expect(result).toContain('<em>');
+  });
+
+  it('preserves class attributes', () => {
+    const html = '<div class="ruling-body"><span class="case-number">123</span></div>';
+    const result = sanitizeRulingHtml(html);
+    expect(result).toContain('class="ruling-body"');
+    expect(result).toContain('class="case-number"');
+  });
+
+  it('removes script tags', () => {
+    const html = '<p>Safe</p><script>alert("xss")</script>';
+    const result = sanitizeRulingHtml(html);
+    expect(result).not.toContain('script');
+    expect(result).toContain('Safe');
+  });
+
+  it('removes event handler attributes', () => {
+    const html = '<p onmouseover="alert(1)">Hover</p>';
+    const result = sanitizeRulingHtml(html);
+    expect(result).not.toContain('onmouseover');
+    expect(result).toContain('Hover');
+  });
+
+  it('removes style attributes', () => {
+    const html = '<p style="color:red">Styled</p>';
+    const result = sanitizeRulingHtml(html);
+    expect(result).not.toContain('style');
+    expect(result).toContain('Styled');
+  });
+
+  it('removes disallowed tags like img', () => {
+    const html = '<p>Text</p><img src="x" onerror="alert(1)" />';
+    const result = sanitizeRulingHtml(html);
+    expect(result).not.toContain('img');
+    expect(result).toContain('Text');
+  });
+
+  it('preserves list elements', () => {
+    const html = '<ul><li>Item 1</li><li>Item 2</li></ul>';
+    const result = sanitizeRulingHtml(html);
+    expect(result).toContain('<ul>');
+    expect(result).toContain('<li>');
+    expect(result).toContain('Item 1');
+  });
+
+  it('preserves heading elements', () => {
+    const html = '<h3>Motion for Summary Judgment</h3>';
+    const result = sanitizeRulingHtml(html);
+    expect(result).toContain('<h3>');
+    expect(result).toContain('Motion for Summary Judgment');
+  });
+
+  it('returns empty string for empty input', () => {
+    expect(sanitizeRulingHtml('')).toBe('');
   });
 });

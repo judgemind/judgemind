@@ -394,6 +394,7 @@ export const resolvers = {
     motionType: (row: Row) => row.motion_type,
     isTentative: (row: Row) => row.is_tentative,
     rulingText: (row: Row) => row.ruling_text,
+    rulingTextHtml: (row: Row) => row.ruling_text_html,
     postedAt: (row: Row) => row.posted_at,
     documentId: (row: Row) => row.document_id,
     documentFormat: (row: Row, _: unknown, { loaders }: Context) =>
