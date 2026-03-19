@@ -157,6 +157,7 @@ The Claude reviewer prompt should be:
 >    - **Stale references**: Do comments, imports, or docstrings reference things that changed?
 >    - **Documentation consistency**: If the change modifies behavior, configuration, or interfaces — do related docs (`docs/`, `CLAUDE.md`, `.claude/skills/`, `README.md`, `CONTRIBUTING.md`) need corresponding updates? Flag any docs that reference the old behavior.
 >    - **Performance**: Are there obvious bottlenecks? Sequential I/O that could be parallelized? O(n^2) patterns (e.g. LIMIT/OFFSET pagination, nested loops over large datasets)? Missing connection pooling or batching for network calls (DB, S3, HTTP)?
+>    - **Unchecked test plan items**: If the PR includes a test plan with checkboxes, any unchecked items are **merge blockers**. An unchecked item means something was not verified — flag it as a REVISE reason. The author must either check the item (verify it) or remove it (not applicable).
 > 5. Make a binary decision:
 >    - **SHIP**: The implementation is correct, well-tested, properly scoped, and ready for PR. Write "SHIP" to `{worktree}/tmp/ralph/review-result.txt`.
 >    - **REVISE**: Something needs to change. Write "REVISE" to `{worktree}/tmp/ralph/review-result.txt`. Then write specific, actionable feedback to `{worktree}/tmp/ralph/feedback.md` — describe exactly what needs to change and why. Be concrete: reference specific files, functions, and line numbers.
@@ -166,6 +167,7 @@ The Claude reviewer prompt should be:
 > - Don't request changes outside the scope of the task.
 > - If tests pass and the acceptance criteria are met, lean toward SHIP.
 > - If you say REVISE, your feedback must be specific enough that the worker can act on it without guessing.
+> - **Unchecked test plan items are always blockers.** Never approve a PR with unchecked test plan checkboxes.
 
 ### 2c — Collect results
 
@@ -254,7 +256,7 @@ Write `{worktree}/tmp/ralph/ralph-done.txt` with exactly this content (substitut
 ```
 status: SHIP
 iterations: <N>
-next-steps: The /task workflow MUST now continue with: A.3 (stage, commit, push), A.4 (verify no merge conflicts), A.5 (monitor CI), A.6 (update PR test plan), A.7 (merge PR), A.8 (verify deployment if applicable), A.9 (retrospective). THE TASK IS NOT COMPLETE UNTIL ALL THESE STEPS FINISH.
+next-steps: The /task workflow MUST now continue with: A.3 (stage, commit, push), A.4 (verify no merge conflicts), A.5 (monitor CI), A.6 (update PR test plan), A.7 (merge PR), A.8 (verify deployment and functional health if applicable), A.9 (retrospective). THE TASK IS NOT COMPLETE UNTIL ALL THESE STEPS FINISH.
 ```
 
 The code is ready for commit. Return control to the calling workflow (`/task` Path A), which handles staging, committing, pushing, PR creation, CI monitoring, and cleanup.
@@ -273,6 +275,7 @@ The code is ready for commit. Return control to the calling workflow (`/task` Pa
 - **All standard rules apply.** No `$()`, no heredocs, no inline Python, temp files in `{worktree}/tmp/`.
 - **Gemini reviews are best-effort.** If the Google API key is unavailable or an API call fails, the loop continues with the remaining reviewers. Gemini reviews never block the loop.
 - **Ralph is not task completion.** Ralph handles implementation and review only. The calling `/task` workflow handles commit, push, PR, CI, merge, deploy, and cleanup. Never exit after ralph without completing the full `/task` workflow.
+- **Unchecked test plan items are merge blockers.** Reviewers must flag unchecked test plan checkboxes as REVISE reasons. A PR with unchecked items is not ready to ship.
 
 ---
 

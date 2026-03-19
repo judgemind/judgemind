@@ -51,7 +51,7 @@ updated: <ISO-8601 timestamp>
 summary: <one-line description of current activity>
 ```
 
-Phases (in typical order): `claiming`, `setup`, `ralph-worker (iteration N)`, `ralph-reviewer (iteration N)`, `pushing`, `ci-watch`, `ci-fix`, `merging`, `deploying`, `retrospective`, `done`, `blocked`.
+Phases (in typical order): `claiming`, `setup`, `ralph-worker (iteration N)`, `ralph-reviewer (iteration N)`, `pushing`, `ci-watch`, `ci-fix`, `merging`, `deploying`, `verifying`, `retrospective`, `done`, `blocked`.
 
 **Write a status update at every major step transition** — use the Write tool to overwrite the status file. The first update should be written immediately after worktree setup with phase `claiming`.
 
@@ -113,7 +113,7 @@ After claiming the issue, create todos using `TaskCreate` to track your major wo
 5. "Verify no merge conflicts" — check mergeable status
 6. "Update PR test plan" — check off test plan items
 7. "Merge PR" — squash merge after CI is green
-8. "Verify deployment" — watch deploy pipeline and smoke-test (deployed services only)
+8. "Verify deployment and functional health" — watch deploy, then verify feature works in dev (deployed services only)
 9. "Retrospective" — identify workflow efficiencies and preventative measures
 10. "Remove worktree" — cleanup
 
@@ -242,12 +242,12 @@ gh pr merge <PR-N> --repo judgemind/judgemind --squash --delete-branch
 
 **Dependent issues will be unblocked automatically** by the `unblock-issues` workflow when the PR merges. No manual unblocking needed.
 
-#### A.8 — Verify deployment (deployed services only)
+#### A.8 — Verify deployment and functional health (deployed services only)
 Write status: `phase: deploying`, `summary: Watching deploy pipeline for <workflow>`.
 
-**This step applies only to PRs that change deployed code** (API, frontend, scrapers, infrastructure). Skip it for pure library, tooling, docs, or CI-only changes.
+**A task is NOT done when the PR merges. A task is done when the change is deployed AND verified working.** The worktree stays alive until verification passes. Skip this step only for pure library, tooling, docs, or CI-only changes.
 
-After the PR is merged, verify the deploy pipeline succeeds and the fix is live:
+**Step 1 — Watch the deploy workflow:**
 
 1. Identify the relevant deploy workflow based on which packages were modified:
    - `packages/api/` or API routes → `deploy-api.yml`
@@ -260,7 +260,24 @@ After the PR is merged, verify the deploy pipeline succeeds and the fix is live:
    gh run watch <run-id> --repo judgemind/judgemind --exit-status --compact
    ```
 3. If the deploy **fails**: file a new `priority/p1` issue describing the deploy failure, reference the merged PR, and add `agent/ready`. Do NOT consider the original task complete — comment on the original issue noting the deploy failure and linking the new issue.
-4. If the deploy **succeeds**: smoke-test the fix on the deployed environment where feasible (e.g., `curl` an API endpoint, check a page loads).
+4. If the deploy **succeeds**: continue to Step 2.
+
+**Step 2 — Functional verification (required):**
+
+Write status: `phase: verifying`, `summary: Verifying feature works in dev environment`.
+
+A successful deploy only means the new image is running — not that the service works. Verify the feature is actually functional:
+
+| Change type | Verification |
+|---|---|
+| **DB migration + code** | Confirm migration applied (column/table exists via `scripts/dev-db-query.sh`) AND service processes a request without errors |
+| **API endpoint** | Hit the endpoint on dev (`curl https://dev.api.judgemind.org/graphql`), confirm expected response shape and no errors |
+| **Ingestion pipeline** | Confirm the worker processes at least one message successfully (check ECS logs via `scripts/ecs-logs.sh /ecs/judgemind-ingestion-worker-dev --lines 50`) |
+| **Scraper** | Check ECS logs for the next scheduled run, confirm documents are captured without errors |
+| **Frontend** | Confirm the affected page loads on `dev.judgemind.org` and renders the expected content |
+| **DX/tooling** | Run the tool in a representative scenario and confirm expected output |
+
+If functional verification **fails**: diagnose the issue. If it's a simple fix, fix it in a follow-up PR. If it's complex, file a `priority/p1` issue with details, reference the merged PR, and add `agent/ready`.
 
 #### A.9 — Proceed to retrospective
 
@@ -348,6 +365,8 @@ If the task was trivial and there are genuinely no improvements to make, that's 
 ### 5d — Remove worktree
 
 Write status: `phase: done`, `summary: Task complete. Removing worktree.`
+
+**Only remove the worktree after deployment verification passes** (or after confirming the change has no deployed component). Never clean up immediately after merge — the worktree is needed for debugging if verification fails.
 
 ```
 scripts/end-worker.sh {worktree}

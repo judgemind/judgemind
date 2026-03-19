@@ -160,17 +160,38 @@ Fetch the PR body, check off automated steps that passed in CI. Write updated bo
 
 Comment on the issue linking the PR. Add the `status/review` label.
 
-#### 4.10 — Verify deployment (after merge, deployed services only)
+#### 4.10 — Verify deployment and functional health (after merge, deployed services only)
 
-Skip for library, tooling, docs, or CI-only changes. For deployed code (API, scrapers, infra):
+**A task is NOT done when the PR merges. A task is done when the change is deployed AND verified working in the target environment.** The worktree stays alive until verification passes.
+
+Skip this step only for pure library, tooling, docs, or CI-only changes that have no deployed component.
+
+**Step 1 — Watch the deploy workflow:**
 
 1. Watch the deploy workflow triggered by the merge to `main` (`gh run watch`).
-2. If deploy **fails**: file a `priority/p1` issue, reference the merged PR, add `agent/ready`.
-3. If deploy **succeeds**: smoke-test the deployed environment where feasible.
+2. If deploy **fails**: file a `priority/p1` issue, reference the merged PR, add `agent/ready`. Do NOT consider the task complete.
+3. If deploy **succeeds**: continue to Step 2 (functional verification).
 
 For **web frontend** changes: Vercel deploys automatically — see `docs/agent/infrastructure-reference.md` for details.
 
+**Step 2 — Functional verification (required for deployed services):**
+
+A successful deploy only means the new image is running — not that the service works. Verify the feature is actually functional based on the change type:
+
+| Change type | Verification |
+|---|---|
+| **DB migration + code** | Confirm migration applied (column/table exists via `scripts/dev-db-query.sh`) AND service processes a request without errors |
+| **API endpoint** | Hit the endpoint on dev (`curl https://dev.api.judgemind.org/graphql`), confirm expected response shape and no errors |
+| **Ingestion pipeline** | Confirm the worker processes at least one message successfully (check ECS logs via `scripts/ecs-logs.sh /ecs/judgemind-ingestion-worker-dev --lines 50` for recent successful processing) |
+| **Scraper** | Check ECS logs for the next scheduled run, confirm documents are captured without errors |
+| **Frontend** | Confirm the affected page loads on `dev.judgemind.org` and renders the expected content |
+| **DX/tooling** | Run the tool in a representative scenario and confirm expected output |
+
+If functional verification fails: diagnose the issue. If it's a simple fix, fix it in a follow-up PR. If it's complex, file a `priority/p1` issue with details of what's broken, reference the merged PR, and add `agent/ready`.
+
 #### 4.11 — Remove your worktree
+
+**Only remove the worktree after deployment verification passes** (or after confirming the change has no deployed component). Never clean up immediately after merge — the worktree is needed for debugging if verification fails.
 
 ```
 scripts/end-worker.sh {worktree}
