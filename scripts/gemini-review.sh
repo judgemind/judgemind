@@ -79,37 +79,33 @@ for f in $all_files; do
     fi
 done
 
-# Use a dedicated scripts venv for script dependencies (google-genai, anthropic).
-# This avoids depending on whichever package venv happens to exist first
-# (which may not include google-genai) and avoids PEP 668 issues with system Python.
-SCRIPTS_VENV="${WORKTREE}/tmp/.scripts-venv"
-PYTHON="${SCRIPTS_VENV}/bin/python3"
-
-if [[ ! -x "$PYTHON" ]]; then
-    echo "INFO: Creating scripts venv at ${SCRIPTS_VENV}..." >&2
-
-    # Find a base Python to create the venv — prefer python3.12, then 3.11, then python3
-    BASE_PYTHON=""
+# Find a Python interpreter — prefer a worktree venv if available,
+# then python3.12/3.11 (guaranteed >= 3.11 for datetime.timezone compat),
+# then fall back to system python3.
+PYTHON=""
+for venv_dir in "${WORKTREE}"/packages/*/.venv/bin/python3; do
+    if [[ -x "$venv_dir" ]]; then
+        PYTHON="$venv_dir"
+        break
+    fi
+done
+if [[ -z "$PYTHON" ]]; then
     for candidate in python3.12 python3.11 python3; do
         if command -v "$candidate" &>/dev/null; then
-            BASE_PYTHON="$candidate"
+            PYTHON="$candidate"
             break
         fi
     done
-    BASE_PYTHON="${BASE_PYTHON:-python3}"
+fi
+PYTHON="${PYTHON:-python3}"
 
-    "$BASE_PYTHON" -m venv "$SCRIPTS_VENV" || {
-        echo "WARNING: Could not create scripts venv. Skipping Gemini review." >&2
-        echo "SKIPPED" > "${STATE_DIR}/gemini-review-result.txt"
-        echo "Gemini review skipped: failed to create scripts venv." > "${STATE_DIR}/gemini-feedback.md"
-        exit 2
-    }
-
-    echo "INFO: Installing script dependencies from scripts/requirements.txt..." >&2
-    "${SCRIPTS_VENV}/bin/pip" install -r "${SCRIPT_DIR}/requirements.txt" --quiet || {
+# Check if google-genai is available; install from scripts/requirements.txt if not
+if ! "$PYTHON" -c "from google import genai" 2>/dev/null; then
+    echo "INFO: google-genai not found in current Python. Installing from scripts/requirements.txt..." >&2
+    "$PYTHON" -m pip install -r "${SCRIPT_DIR}/requirements.txt" --quiet 2>/dev/null || {
         echo "WARNING: Could not install script dependencies. Skipping Gemini review." >&2
         echo "SKIPPED" > "${STATE_DIR}/gemini-review-result.txt"
-        echo "Gemini review skipped: pip install failed. Check stderr for details." > "${STATE_DIR}/gemini-feedback.md"
+        echo "Gemini review skipped: google-genai package not available." > "${STATE_DIR}/gemini-feedback.md"
         exit 2
     }
 fi

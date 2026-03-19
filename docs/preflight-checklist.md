@@ -70,12 +70,6 @@ Machine-readable checklist of rules extracted from CLAUDE.md. Agents should vali
 | TW-06 | Venv isolation per worktree | Never share venvs between worktrees |
 | TW-07 | Never exit after ralph without completing A.3-A.9 | Ralph = halfway done. Must commit, push, PR, CI, merge, deploy, retrospective. Verify with `git status` and `gh pr list` (#721) |
 
-## Interactive Session Rules
-
-| ID | Rule | Check |
-|----|------|-------|
-| IS-01 | No action without user confirmation | Before filing issues, creating PRs, or acting on proposals in interactive sessions: verify the user's most recent actual message (not `<system-reminder>` or `<task-notification>`) contains explicit approval ("yes", "file it", "go ahead", etc.). Does not apply to autonomous `/task` agents. |
-
 ## Security Rules
 
 | ID | Rule | Check |

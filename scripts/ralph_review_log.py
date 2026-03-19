@@ -39,7 +39,6 @@ def log_review(
     output_tokens: int | None = None,
     latency_ms: int | None = None,
     diff_stats: dict[str, int] | None = None,
-    phase: str | None = None,
 ) -> None:
     """Log a single review record (Gemini or Claude).
 
@@ -47,14 +46,12 @@ def log_review(
         state_dir: Path to {worktree}/tmp/ralph/.
         iteration: Current ralph loop iteration (1-based).
         model: Model identifier (e.g. "gemini-2.5-pro", "claude").
-        verdict: Review verdict — "SHIP", "REVISE", "APPROVE", or "SKIPPED".
+        verdict: Review verdict — "SHIP", "REVISE", or "SKIPPED".
         feedback: Full review feedback text.
         input_tokens: Input token count (if available from API response).
         output_tokens: Output token count (if available from API response).
         latency_ms: API call latency in milliseconds.
         diff_stats: Dict with keys "files_changed", "insertions", "deletions".
-        phase: Review phase — "code" or "plan". Omitted for backward compatibility
-            if not provided.
     """
     record: dict[str, Any] = {
         "type": "review",
@@ -65,8 +62,6 @@ def log_review(
         "feedback": feedback,
     }
 
-    if phase is not None:
-        record["phase"] = phase
     if input_tokens is not None:
         record["input_tokens"] = input_tokens
     if output_tokens is not None:
