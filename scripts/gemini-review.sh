@@ -79,38 +79,9 @@ for f in $all_files; do
     fi
 done
 
-# Find a Python interpreter — prefer a worktree venv if available,
-# then python3.12/3.11 (guaranteed >= 3.11 for datetime.timezone compat),
-# then fall back to system python3.
-PYTHON=""
-for venv_dir in "${WORKTREE}"/packages/*/.venv/bin/python3; do
-    if [[ -x "$venv_dir" ]]; then
-        PYTHON="$venv_dir"
-        break
-    fi
-done
-if [[ -z "$PYTHON" ]]; then
-    for candidate in python3.12 python3.11 python3; do
-        if command -v "$candidate" &>/dev/null; then
-            PYTHON="$candidate"
-            break
-        fi
-    done
-fi
-PYTHON="${PYTHON:-python3}"
-
-# Check if google-genai is available; install from scripts/requirements.txt if not
-if ! "$PYTHON" -c "from google import genai" 2>/dev/null; then
-    echo "INFO: google-genai not found in current Python. Installing from scripts/requirements.txt..." >&2
-    "$PYTHON" -m pip install -r "${SCRIPT_DIR}/requirements.txt" --quiet 2>/dev/null || {
-        echo "WARNING: Could not install script dependencies. Skipping Gemini review." >&2
-        echo "SKIPPED" > "${STATE_DIR}/gemini-review-result.txt"
-        echo "Gemini review skipped: google-genai package not available." > "${STATE_DIR}/gemini-feedback.md"
-        exit 2
-    }
-fi
-
 # Run the review with the Google API key injected from Secrets Manager
+# The Python script uses _venv_helper to re-launch itself inside the
+# scraper-framework venv, so we just need any python3 to start it.
 export RALPH_STATE_DIR="$STATE_DIR"
 
 if [[ "$ADVERSARIAL" == "true" ]]; then
@@ -123,7 +94,7 @@ fi
 
 "${SCRIPT_DIR}/with-secret.sh" \
     -e GOOGLE_API_KEY=judgemind/google/api-key \
-    -- "$PYTHON" "${SCRIPT_DIR}/gemini_review.py"
+    -- python3 "${SCRIPT_DIR}/gemini_review.py"
 
 exit_code=$?
 
