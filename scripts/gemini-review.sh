@@ -81,16 +81,15 @@ done
 
 # Ensure a Python environment with google-genai is available.
 #
-# The Python script uses _venv_helper to re-launch itself inside the
-# scraper-framework venv.  But for non-scraper tasks (API, frontend, infra),
-# that venv may not exist.  In that case, create a lightweight .venv-scripts
-# venv with just the script dependencies and tell _venv_helper to skip its
-# venv check so the Python script runs directly in the scripts venv.
+# The gemini_review.py script declares `# venv: scraper-framework` so
+# run-py.sh would use that venv.  But for non-scraper tasks (API, frontend,
+# infra), that venv may not exist.  In that case, create a lightweight
+# .venv-scripts venv with just the script dependencies.
 SCRAPER_VENV="${WORKTREE}/packages/scraper-framework/.venv/bin/python3"
 PYTHON="python3"
 
 if [[ -x "$SCRAPER_VENV" ]]; then
-    # Scraper-framework venv exists — _venv_helper will handle re-launch
+    # Scraper-framework venv exists — use it directly
     :
 else
     # No scraper-framework venv — create/reuse a lightweight scripts venv
@@ -127,9 +126,8 @@ else
         }
     fi
 
-    # Tell _venv_helper to skip the scraper-framework venv check since
-    # we are running in the scripts venv which has all needed deps.
-    export _VENV_HELPER_SKIP=1
+    # No special env vars needed — the `# venv:` header is just a comment
+    # when the script is invoked directly (not via run-py.sh).
 fi
 
 # Run the review with the Google API key injected from Secrets Manager
