@@ -2,12 +2,38 @@
 # Resolve repo root, clean stale worktrees, claim the next available worker
 # number, create a worktree, and print its absolute path on stdout.
 #
-# Usage: scripts/start-worker.sh
+# Usage: scripts/start-worker.sh [--max-workers N]
 # Output: absolute path to the new worktree (e.g. /path/to/worktrees/worker-2)
+#
+# Options:
+#   --max-workers N   Refuse to create a worker if N or more already exist.
+#                     Used by the orchestrator to enforce slot limits.
 #
 # Safe to run from anywhere inside the repo, including from an existing worktree.
 
 set -euo pipefail
+
+# ---------------------------------------------------------------------------
+# Parse arguments
+# ---------------------------------------------------------------------------
+MAX_WORKERS=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --max-workers)
+            MAX_WORKERS="${2:?--max-workers requires a number}"
+            if ! [[ "$MAX_WORKERS" =~ ^[1-9][0-9]*$ ]]; then
+                echo "ERROR: --max-workers must be a positive integer, got '$MAX_WORKERS'" >&2
+                exit 1
+            fi
+            shift 2
+            ;;
+        *)
+            echo "ERROR: unknown argument: $1" >&2
+            echo "Usage: scripts/start-worker.sh [--max-workers N]" >&2
+            exit 1
+            ;;
+    esac
+done
 
 # ---------------------------------------------------------------------------
 # Step 0 — Resolve repo root
@@ -119,6 +145,23 @@ while IFS= read -r branch; do
         git -C "$REPO_ROOT" branch -D "$branch" 2>/dev/null || true
     fi
 done < <(git -C "$REPO_ROOT" branch --list 'worker-*/*' | sed 's/^[* ]*//')
+
+# ---------------------------------------------------------------------------
+# Step 1e — Enforce max-workers limit (if set)
+#
+# Count currently active worker worktrees after pruning.  If the count
+# already meets or exceeds --max-workers, refuse to create another.
+# ---------------------------------------------------------------------------
+if [[ -n "$MAX_WORKERS" ]]; then
+    ACTIVE_COUNT=$(
+        git -C "$REPO_ROOT" worktree list --porcelain \
+            | awk '/^worktree / && $2 ~ /\/worktrees\/worker-[0-9]+/ { n++ } END { print n+0 }'
+    )
+    if [[ "$ACTIVE_COUNT" -ge "$MAX_WORKERS" ]]; then
+        echo "ERROR: max workers reached ($ACTIVE_COUNT active, limit $MAX_WORKERS)" >&2
+        exit 1
+    fi
+fi
 
 # ---------------------------------------------------------------------------
 # Step 2 — Claim the lowest available worker number and create the worktree

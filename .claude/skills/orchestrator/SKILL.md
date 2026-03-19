@@ -73,6 +73,10 @@ Initialize `loop_iterations` to 0. This counter tracks how many main loop iterat
 
 Also read `session_number` from `tmp/orchestrator_status.json` (default to 0 if missing). Increment it by 1 and persist it back — this tracks how many times the orchestrator has been restarted by the outer `while :; do` loop. The first invocation is session 1.
 
+### 6. Store max_slots for enforcement
+
+Store the max slot count (from the argument, or 5 if not specified) in a variable `max_slots`. This value is used throughout the session for slot enforcement checks. **Do not change this value during the session** — it is set once at startup and used everywhere.
+
 ---
 
 ## Main Loop
@@ -84,7 +88,7 @@ The orchestrator runs a continuous loop:
 3. **Handle in-flight PRs** — merge any that are ready, fix any that are failing
 4. **Sync after merges** — pull latest main after each merge (see "Post-merge sync" in Rules)
 5. **Check audit trigger** — if `prs_since_last_audit >= 20`, spawn `/audit` (see "Periodic Audit" below)
-6. **Fill agent slots** — launch `/task` agents for the next highest-priority issues
+6. **Fill agent slots** — launch `/task` agents for the next highest-priority issues (see "Spawning agents" for the **mandatory slot count check**)
 7. **Process completions** — handle agent completion/failure notifications
 8. **Triage** — close done issues, file new issues for discovered problems
 9. **Check context rotation** — increment `loop_iterations` and check if it is time to wind down (see "Context-Aware Rotation" below)
@@ -95,25 +99,37 @@ The orchestrator runs a continuous loop:
 - Default max slots: **5** (overridable via argument)
 - Track active agents by worker number and issue number
 - When an agent completes, its slot opens immediately
-- Never exceed the max slot count
+- **HARD RULE: Never exceed the max slot count.** The `start-worker.sh` script enforces this via `--max-workers`, but the orchestrator must ALSO check before spawning.
 - Launch `/task` agents **without** `isolation: "worktree"` — the skill manages its own worktree
 
-### Spawning agents
+### Spawning agents — MANDATORY SLOT COUNT CHECK
+
+**Before spawning ANY new `/task` agent, you MUST perform this explicit slot count check. This is not optional. Skipping this check is a bug.**
+
+1. Count the number of currently active agents (agents you have spawned that have not yet completed or failed). This is the length of your tracked active agents list.
+2. Compare: `active_agent_count >= max_slots`. If true, **DO NOT SPAWN**. Skip to the next step of the main loop. Log: "Slot limit reached (N active, limit M) — not spawning."
+3. Only if `active_agent_count < max_slots`, proceed to spawn.
+
+**Additionally**, `scripts/start-worker.sh` provides a hard backstop via `--max-workers`. The `/task` skill accepts `--max-workers` and passes it through to `start-worker.sh`. If the worktree count already meets the limit, the script will exit non-zero and the agent will fail to start. This is a safety net — the orchestrator's own count check (step 2 above) should prevent this from ever being reached.
 
 For each open slot, pick the next highest-priority unassigned `agent/ready` issue and spawn:
 
 ```
-/task #N
+/task #N --max-workers <max_slots>
 ```
 
-as a background subagent. Before spawning:
+**Always pass `--max-workers <max_slots>`** when spawning `/task` agents. This enables the hard backstop in `start-worker.sh`.
 
-1. Call `bridge.refresh_state()` to pick up external pause/resume changes
-2. Call `bridge.read_stop_requests()` to consume stop requests
-3. Call `bridge.read_orchestrator_inbox()` to process subagent instructions
-4. If `bridge.paused` is `True`, skip spawning
-5. If `bridge.is_issue_stopped(N)` is `True`, skip that issue
-6. Skip issues already being worked on by another slot
+as a background subagent. Before spawning each agent:
+
+1. **Re-count active agents** — do not rely on a count from a previous loop iteration. Count NOW.
+2. If `active_agent_count >= max_slots`: stop spawning. Do not spawn this agent or any more.
+3. Call `bridge.refresh_state()` to pick up external pause/resume changes
+4. Call `bridge.read_stop_requests()` to consume stop requests
+5. Call `bridge.read_orchestrator_inbox()` to process subagent instructions
+6. If `bridge.paused` is `True`, skip spawning
+7. If `bridge.is_issue_stopped(N)` is `True`, skip that issue
+8. Skip issues already being worked on by another slot
 
 **After spawning each agent**, send a `task_started` notification and update the status file:
 
