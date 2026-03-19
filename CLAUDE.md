@@ -23,10 +23,6 @@ These are the most frequently violated rules. **A PreToolUse hook enforces the s
 - **NEVER** skip pre-PR checks. Run lint, format, AND tests locally before pushing.
 - **NEVER** share venvs between worktrees. Each worktree gets its own `.venv`.
 
-### NEVER — Interactive Sessions
-- **NEVER file issues, create PRs, or act on a proposed approach without explicit user confirmation.** Before filing any issue or taking action on a proposal during an interactive session, check: did the user explicitly say "yes", "file it", "go ahead", or similar in their most recent actual message (not a `<system-reminder>` or `<task-notification>`)? If not, do not proceed. Proposals and designs require explicit approval before action.
-- This rule does **not** apply to autonomous `/task` agents working from already-filed issues — they should continue to act independently (filing sub-tasks, DX issues, etc.) without asking.
-
 ### ALWAYS — Before Acting
 - **ALWAYS** Read a file before Writing to it (the Write tool fails on existing files you haven't read).
 - **ALWAYS** pull latest code (run `git fetch origin main` then `git rebase origin/main` as separate tool calls) before analyzing or modifying files.
@@ -357,7 +353,7 @@ The Critical Rules above cover the most common patterns. For the full reference 
 
 **Task notifications and system reminders are system events, not user responses.** Messages tagged with `<task-notification>` or `<system-reminder>` are injected by the platform — the user did not type them.
 
-When one of these tags arrives and you have a **pending question**: do not treat it as the user's answer. Acknowledge in one line, continue waiting for the user's actual response. See also the **NEVER — Interactive Sessions** rule in Critical Rules, which provides a concrete point-of-action check before filing issues or acting on proposals.
+When one of these tags arrives and you have a **pending question**: do not treat it as the user's answer. Acknowledge in one line, continue waiting for the user's actual response.
 
 ### Telegram Integration (optional)
 
