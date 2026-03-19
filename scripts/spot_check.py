@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# venv: scraper-framework
 """Spot-check case detail pages for data quality issues.
 
 Takes screenshots of multiple case detail pages from the rulings feed
@@ -6,77 +7,27 @@ for manual review. Useful for verifying scraper output, field extraction,
 and frontend rendering of ruling records.
 
 Usage:
-    scripts/spot_check.py                      # Screenshot 10 cases
-    scripts/spot_check.py --count 20           # Screenshot 20 cases
-    scripts/spot_check.py --output tmp/qa      # Custom output directory
-    scripts/spot_check.py --base-url https://dev.judgemind.org
+    scripts/run-py.sh scripts/spot_check.py                      # Screenshot 10 cases
+    scripts/run-py.sh scripts/spot_check.py --count 20           # Screenshot 20 cases
+    scripts/run-py.sh scripts/spot_check.py --output tmp/qa      # Custom output directory
+    scripts/run-py.sh scripts/spot_check.py --base-url https://dev.judgemind.org
+
+Requires the scraper-framework venv (which includes playwright). Run via
+scripts/run-py.sh, which reads the ``# venv:`` header and activates the
+correct venv automatically.
+
+After creating the venv for the first time, install chromium for playwright::
+
+    packages/scraper-framework/.venv/bin/playwright install chromium
 """
 
 import argparse
-import os
 import sys
 from pathlib import Path
 from urllib.parse import urlparse
 
 ALLOWED_HOSTS = {"dev.judgemind.org", "judgemind.org", "localhost"}
 DEFAULT_BASE_URL = "https://dev.judgemind.org"
-
-# Resolve repo root: this script lives at <repo-root>/scripts/spot_check.py.
-_SCRIPT_DIR = Path(__file__).resolve().parent
-_REPO_ROOT = _SCRIPT_DIR.parent
-TOOLS_VENV_DIR = _REPO_ROOT / ".venv"
-
-
-def _get_venv_python() -> str:
-    """Return the path to the Python executable inside the tools venv."""
-    return str(TOOLS_VENV_DIR / "bin" / "python3")
-
-
-def _ensure_venv() -> None:
-    """Create the tools venv and install playwright + chromium if needed."""
-    import subprocess
-
-    venv_python = _get_venv_python()
-
-    if Path(venv_python).exists():
-        result = subprocess.run(
-            [venv_python, "-c", "import playwright"],
-            capture_output=True,
-        )
-        if result.returncode == 0:
-            return
-
-    print("Auto-bootstrapping tools venv at", TOOLS_VENV_DIR, "...", file=sys.stderr)
-    TOOLS_VENV_DIR.parent.mkdir(parents=True, exist_ok=True)
-    subprocess.run(
-        [sys.executable, "-m", "venv", str(TOOLS_VENV_DIR)],
-        check=True,
-    )
-
-    venv_pip = str(TOOLS_VENV_DIR / "bin" / "pip")
-    subprocess.run(
-        [venv_pip, "install", "--quiet", "playwright"],
-        check=True,
-    )
-
-    venv_playwright = str(TOOLS_VENV_DIR / "bin" / "playwright")
-    subprocess.run(
-        [venv_playwright, "install", "chromium"],
-        check=True,
-    )
-
-    print("Tools venv ready.", file=sys.stderr)
-
-
-def _reexec_in_venv() -> None:
-    """Re-execute this script inside the tools venv if not already in it."""
-    venv_python = _get_venv_python()
-
-    if os.path.realpath(sys.executable) == os.path.realpath(venv_python):
-        return
-
-    _ensure_venv()
-    os.execv(venv_python, [venv_python, *sys.argv])
 
 
 def validate_base_url(url: str) -> str:
@@ -92,8 +43,6 @@ def validate_base_url(url: str) -> str:
 
 
 def main() -> None:
-    _reexec_in_venv()
-
     parser = argparse.ArgumentParser(
         description="Spot-check case detail pages for data quality issues"
     )

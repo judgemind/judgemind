@@ -1,91 +1,31 @@
 #!/usr/bin/env python3
+# venv: scraper-framework
 """Take a screenshot of a page on dev.judgemind.org.
 
 Usage:
-    python3 scripts/screenshot.py /rulings
-    python3 scripts/screenshot.py /rulings --output tmp/rulings.png
-    python3 scripts/screenshot.py /cases/123 --full-page
-    python3 scripts/screenshot.py /rulings --selector ".ruling-card"
-    python3 scripts/screenshot.py /rulings --width 1280 --height 720
-    python3 scripts/screenshot.py /rulings --wait 5000
+    scripts/run-py.sh scripts/screenshot.py /rulings
+    scripts/run-py.sh scripts/screenshot.py /rulings --output tmp/rulings.png
+    scripts/run-py.sh scripts/screenshot.py /cases/123 --full-page
+    scripts/run-py.sh scripts/screenshot.py /rulings --selector ".ruling-card"
+    scripts/run-py.sh scripts/screenshot.py /rulings --width 1280 --height 720
+    scripts/run-py.sh scripts/screenshot.py /rulings --wait 5000
 
-The script auto-bootstraps its own venv with playwright and chromium on first
-run. No manual setup is required. The venv lives at <repo-root>/.venv/
-and is reused across sessions and worktrees.
+Requires the scraper-framework venv (which includes playwright). Run via
+scripts/run-py.sh, which reads the ``# venv:`` header and activates the
+correct venv automatically.
+
+After creating the venv for the first time, install chromium for playwright::
+
+    packages/scraper-framework/.venv/bin/playwright install chromium
 """
 
 import argparse
-import os
-import subprocess
 import sys
 from pathlib import Path
 from urllib.parse import urlparse
 
 ALLOWED_HOST = "dev.judgemind.org"
 BASE_URL = f"https://{ALLOWED_HOST}"
-
-# Resolve repo root: this script lives at <repo-root>/scripts/screenshot.py.
-# For worktrees, git rev-parse --show-toplevel returns the worktree root, but
-# we want the main repo root so the venv is shared across all worktrees.
-_SCRIPT_DIR = Path(__file__).resolve().parent
-_REPO_ROOT = _SCRIPT_DIR.parent
-TOOLS_VENV_DIR = _REPO_ROOT / ".venv"
-
-
-def _get_venv_python() -> str:
-    """Return the path to the Python executable inside the tools venv."""
-    return str(TOOLS_VENV_DIR / "bin" / "python3")
-
-
-def _ensure_venv() -> None:
-    """Create the tools venv and install playwright + chromium if needed."""
-    venv_python = _get_venv_python()
-
-    if Path(venv_python).exists():
-        # Venv exists — check if playwright is importable
-        result = subprocess.run(
-            [venv_python, "-c", "import playwright"],
-            capture_output=True,
-        )
-        if result.returncode == 0:
-            return  # All good — venv and playwright are ready
-
-    # Create or repair the venv
-    print("Auto-bootstrapping tools venv at", TOOLS_VENV_DIR, "...", file=sys.stderr)
-    TOOLS_VENV_DIR.parent.mkdir(parents=True, exist_ok=True)
-    subprocess.run(
-        [sys.executable, "-m", "venv", str(TOOLS_VENV_DIR)],
-        check=True,
-    )
-
-    venv_pip = str(TOOLS_VENV_DIR / "bin" / "pip")
-    subprocess.run(
-        [venv_pip, "install", "--quiet", "playwright"],
-        check=True,
-    )
-
-    venv_playwright = str(TOOLS_VENV_DIR / "bin" / "playwright")
-    subprocess.run(
-        [venv_playwright, "install", "chromium"],
-        check=True,
-    )
-
-    print("Tools venv ready.", file=sys.stderr)
-
-
-def _reexec_in_venv() -> None:
-    """Re-execute this script inside the tools venv if we are not already in it."""
-    venv_python = _get_venv_python()
-
-    # If we are already running inside the tools venv, nothing to do
-    if os.path.realpath(sys.executable) == os.path.realpath(venv_python):
-        return
-
-    # Ensure venv exists and is set up
-    _ensure_venv()
-
-    # Re-exec ourselves with the venv Python, forwarding all arguments
-    os.execv(venv_python, [venv_python, *sys.argv])
 
 
 def validate_url(path: str) -> str:
@@ -103,9 +43,6 @@ def validate_url(path: str) -> str:
 
 
 def main() -> None:
-    # Auto-bootstrap: ensure we are running inside the tools venv with playwright
-    _reexec_in_venv()
-
     parser = argparse.ArgumentParser(description=f"Screenshot a page on {ALLOWED_HOST}")
     parser.add_argument("path", help="URL path (e.g. /rulings) or full URL on dev.judgemind.org")
     parser.add_argument("--output", "-o", help="Output file path (default: tmp/screenshot.png)")
@@ -125,7 +62,6 @@ def main() -> None:
         output = Path("tmp/screenshot.png")
     output.parent.mkdir(parents=True, exist_ok=True)
 
-    # Import playwright — guaranteed available since _reexec_in_venv() ensured it
     from playwright.sync_api import sync_playwright
 
     with sync_playwright() as p:
