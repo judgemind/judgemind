@@ -206,10 +206,22 @@ PYEOF
     SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
     REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-    "$REPO_ROOT/scripts/ecs-logs.sh" "$LOGS_LOG_GROUP" --task "$TASK_ID_FROM_ARN" --lines 200 2>/dev/null || {
+    # Retry log retrieval — CloudWatch may still be ingesting events
+    LOGS_OK=false
+    for _retry_wait in 0 5 10; do
+        if [[ "$_retry_wait" -gt 0 ]]; then
+            echo "Retrying in ${_retry_wait}s..." >&2
+            sleep "$_retry_wait"
+        fi
+        if "$REPO_ROOT/scripts/ecs-logs.sh" "$LOGS_LOG_GROUP" --task "$TASK_ID_FROM_ARN" --lines 200 2>/dev/null; then
+            LOGS_OK=true
+            break
+        fi
+    done
+    if [[ "$LOGS_OK" == "false" ]]; then
         echo "(Could not retrieve logs. Check manually with:)" >&2
         echo "  scripts/ecs-logs.sh ${LOGS_LOG_GROUP} --task ${TASK_ID_FROM_ARN}" >&2
-    }
+    fi
 
     # Exit with the task's exit code if stopped, or 0 if still running
     if [[ "$LOGS_EXIT_INFO" == "RUNNING" ]]; then
@@ -880,14 +892,23 @@ if [[ "$LOG_STREAMING" == "false" ]]; then
     echo "" >&2
     echo "─── Task Logs ───────────────────────────────────────────────────" >&2
 
-    # Give CloudWatch a moment to flush
-    sleep 3
+    # Retry log retrieval with increasing waits. CloudWatch can take
+    # 10-30 seconds to create the log stream after task completion,
+    # especially for short-lived tasks.
+    LOGS_RETRIEVED=false
+    for _log_wait in 5 10 15; do
+        echo "Waiting ${_log_wait}s for CloudWatch log stream..." >&2
+        sleep "$_log_wait"
+        if "$REPO_ROOT/scripts/ecs-logs.sh" "$LOG_GROUP" --task "$TASK_ID" --lines 200 2>/dev/null; then
+            LOGS_RETRIEVED=true
+            break
+        fi
+    done
 
-    # Use the existing ecs-logs.sh script to retrieve logs
-    "$REPO_ROOT/scripts/ecs-logs.sh" "$LOG_GROUP" --task "$TASK_ID" --lines 200 2>/dev/null || {
-        echo "(Could not retrieve logs. Check manually with:)" >&2
+    if [[ "$LOGS_RETRIEVED" == "false" ]]; then
+        echo "(Could not retrieve logs after retries. Check manually with:)" >&2
         echo "  scripts/ecs-logs.sh ${LOG_GROUP} --task ${TASK_ID}" >&2
-    }
+    fi
 fi
 
 # ─── Done ────────────────────────────────────────────────────────────────────

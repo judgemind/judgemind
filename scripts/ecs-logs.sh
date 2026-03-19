@@ -117,38 +117,64 @@ find_stream() {
         --region "$REGION"
         --output text
         --query "logStreams[0].logStreamName"
+        --no-cli-pager
     )
 
     if [[ -n "$TASK_FILTER" ]]; then
         # Filter streams whose name contains the task ID.
         # ECS stream names follow patterns like:
         #   ecs/<container>/<task-id>
-        #   <container>/<container>/<task-id>
-        query_args+=(--log-stream-name-prefix "")
+        #   <container>/<container>/<task-id>  (oneshot tasks)
+        #
+        # Strategy: first try a prefix-based search using common ECS log
+        # stream prefixes. This is faster and works for newly created
+        # streams that may not yet appear in LastEventTime ordering.
+        # Fall back to LastEventTime ordering if prefix search fails.
+        local match=""
 
-        # We can't filter by substring via the API, so we fetch the most
-        # recent streams and grep for the task ID locally.
-        local streams
-        streams=$(aws logs describe-log-streams \
-            --log-group-name "$LOG_GROUP" \
-            --order-by LastEventTime \
-            --descending \
-            --region "$REGION" \
-            --max-items 50 \
-            --output text \
-            --query "logStreams[*].logStreamName" 2>/dev/null) || {
-            echo "Error: failed to list log streams for '$LOG_GROUP'" >&2
-            echo "Check that the log group exists and you have AWS credentials configured." >&2
-            exit 1
-        }
+        # Try known prefixes first (handles oneshot tasks reliably)
+        for prefix in "oneshot/oneshot/" "ecs/" "ingestion-worker/" "scraper/"; do
+            local prefix_streams
+            prefix_streams=$(aws logs describe-log-streams \
+                --log-group-name "$LOG_GROUP" \
+                --log-stream-name-prefix "$prefix" \
+                --order-by LogStreamName \
+                --max-items 100 \
+                --region "$REGION" \
+                --output text \
+                --query "logStreams[*].logStreamName" \
+                --no-cli-pager 2>/dev/null) || continue
 
-        local match
-        match=$(echo "$streams" | tr '\t' '\n' | grep -F "$TASK_FILTER" | head -n 1) || true
+            match=$(echo "$prefix_streams" | tr '\t' '\n' | grep -F "$TASK_FILTER" | head -n 1) || true
+            if [[ -n "$match" ]]; then
+                break
+            fi
+        done
+
+        # Fall back to LastEventTime ordering (catches non-standard prefixes)
+        if [[ -z "$match" ]]; then
+            local streams
+            streams=$(aws logs describe-log-streams \
+                --log-group-name "$LOG_GROUP" \
+                --order-by LastEventTime \
+                --descending \
+                --region "$REGION" \
+                --max-items 50 \
+                --output text \
+                --query "logStreams[*].logStreamName" \
+                --no-cli-pager 2>/dev/null) || {
+                echo "Error: failed to list log streams for '$LOG_GROUP'" >&2
+                echo "Check that the log group exists and you have AWS credentials configured." >&2
+                exit 1
+            }
+
+            match=$(echo "$streams" | tr '\t' '\n' | grep -F "$TASK_FILTER" | head -n 1) || true
+        fi
 
         if [[ -z "$match" ]]; then
             echo "Error: no log stream found matching task '$TASK_FILTER' in '$LOG_GROUP'" >&2
-            echo "Recent streams:" >&2
-            echo "$streams" | tr '\t' '\n' | head -n 5 >&2
+            echo "The log stream may not exist yet. CloudWatch can take 10-30 seconds" >&2
+            echo "to create the stream after a task starts writing logs." >&2
             exit 1
         fi
 
@@ -187,7 +213,8 @@ fetch_events() {
         --log-stream-name "$STREAM"
         --region "$REGION"
         --output json
-        --start-from-head false
+        --no-start-from-head
+        --no-cli-pager
     )
 
     if [[ -n "$NEXT_TOKEN" ]]; then
