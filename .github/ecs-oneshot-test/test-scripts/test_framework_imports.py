@@ -11,13 +11,17 @@ from __future__ import annotations
 import importlib
 import sys
 
-# Modules from the scraper-framework package that oneshot scripts use
+# Modules from the scraper-framework package that oneshot scripts use.
+# Keep in sync with packages/scraper-framework/src/ — if a module is
+# removed or renamed, update this list.
 FRAMEWORK_MODULES = [
     "framework",
-    "framework.config",
-    "framework.db",
+    "framework.base",
+    "framework.models",
+    "framework.storage",
     "courts",
     "ingestion",
+    "ingestion.db",
     "validation",
 ]
 
