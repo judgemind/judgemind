@@ -18,9 +18,8 @@ Notably, these packages are **not available** in CI:
 - `structlog` (structured logging)
 - Any packages from `packages/scraper-framework/` (e.g. `ingestion.*`)
 
-Scripts use `# venv: <package>` header comments instead of `ensure_venv()`.
-The `_VENV_HELPER_SKIP=1` environment variable is set in CI for legacy
-compatibility.
+Scripts use `# venv: <package>` header comments and are run via
+`scripts/run-py.sh`, which reads the header and activates the correct venv.
 
 ## Mocking `sys.modules` for unavailable packages
 

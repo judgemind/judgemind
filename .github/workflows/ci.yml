@@ -491,7 +491,6 @@ jobs:
     if: needs.detect-changes.outputs.scripts == 'true'
     runs-on: ubuntu-latest
     env:
-      _VENV_HELPER_SKIP: "1"
       PYTHONPATH: scripts
     steps:
       - uses: actions/checkout@v4

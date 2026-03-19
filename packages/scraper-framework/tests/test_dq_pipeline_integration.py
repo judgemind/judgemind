@@ -10,7 +10,6 @@ See: https://github.com/judgemind/judgemind/issues/893
 
 from __future__ import annotations
 
-import os
 import sys
 from importlib import import_module
 from pathlib import Path
@@ -18,9 +17,6 @@ from pathlib import Path
 # Add scripts/ to sys.path so we can import the modules.
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 sys.path.insert(0, str(_REPO_ROOT / "scripts"))
-
-# Skip venv re-exec during tests.
-os.environ["_VENV_HELPER_SKIP"] = "1"
 
 # ruff: noqa: E402
 # Import both modules (they have hyphens in their names).

@@ -79,9 +79,8 @@ def _send_sqs_message(queue_url: str, text: str, user_id: int = 12345) -> None:
 def _import_responder() -> types.ModuleType:
     """Import the responder module from its file path.
 
-    The ``scripts/`` directory and ``_VENV_HELPER_SKIP`` env var are
-    configured in ``conftest.py`` so that ``_venv_helper.ensure_venv()``
-    resolves and does not re-exec into a package venv.
+    The ``scripts/`` directory is added to ``sys.path`` in ``conftest.py``
+    so that script imports resolve correctly.
     """
     mod_name = "tg_responder"
     if mod_name in sys.modules:

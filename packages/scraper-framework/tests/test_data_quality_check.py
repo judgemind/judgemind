@@ -14,13 +14,8 @@ from unittest.mock import MagicMock, patch
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 sys.path.insert(0, str(_REPO_ROOT / "scripts"))
 
-# Skip venv re-exec during tests.
-import os
-
-os.environ["_VENV_HELPER_SKIP"] = "1"
-
-# Now import after setting the skip flag.
 # ruff: noqa: E402
+
 from importlib import import_module
 
 # Import the script as a module (it has a hyphen in its name).
