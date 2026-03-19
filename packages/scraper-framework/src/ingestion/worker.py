@@ -155,6 +155,16 @@ DEFAULT_HEARTBEAT_INTERVAL = 60
 # are considered stale and eligible for cleanup.  1 hour = 3,600,000 ms.
 STALE_CONSUMER_IDLE_MS = 3_600_000
 
+# Minimum idle time (milliseconds) for a pending message to be eligible for
+# reclamation via XAUTOCLAIM.  Messages stuck longer than this are assumed
+# abandoned by a crashed consumer.  30 seconds is long enough that a healthy
+# consumer processing a slow message won't lose it.
+PENDING_RECLAIM_MIN_IDLE_MS = 30_000
+
+# How often (in empty-poll cycles) to attempt PEL reclamation during the
+# main loop.  At the default 5 s block, 12 cycles ≈ 1 minute.
+PENDING_RECLAIM_INTERVAL = 12
+
 
 class IngestionWorker:
     """Consumes document.captured events from Redis Streams.
@@ -331,6 +341,16 @@ class IngestionWorker:
         self.health_check()
         self._ensure_consumer_group()
         self._cleanup_stale_consumers()
+
+        # Reclaim any messages left pending by crashed consumers before
+        # starting the main loop.  This is critical: after an infrastructure
+        # error (e.g. missing DB column) is fixed, the messages that caused
+        # crash-loops are stuck in the PEL because XREADGROUP '>' only
+        # delivers new messages.  See #1044.
+        reclaimed = self._reclaim_pending_messages()
+        if reclaimed:
+            logger.info("Startup PEL reclamation processed %d message(s)", reclaimed)
+
         logger.info(
             "Ingestion worker started",
             extra={
@@ -344,6 +364,11 @@ class IngestionWorker:
             while True:
                 try:
                     self._process_batch(batch_size=batch_size, block_ms=block_ms)
+
+                    # Periodically check for pending messages that may have
+                    # been abandoned by other consumers that crashed.
+                    if self._empty_polls > 0 and self._empty_polls % PENDING_RECLAIM_INTERVAL == 0:
+                        self._reclaim_pending_messages()
                 except KeyboardInterrupt:
                     logger.info("Ingestion worker stopped")
                     break
@@ -783,6 +808,69 @@ class IngestionWorker:
                 "deleted": deleted,
             },
         )
+
+    def _reclaim_pending_messages(self, batch_size: int = 100) -> int:
+        """Reclaim abandoned pending messages from dead consumers.
+
+        Uses XAUTOCLAIM to transfer ownership of messages that have been
+        pending (unacknowledged) for longer than ``PENDING_RECLAIM_MIN_IDLE_MS``
+        to this consumer.  The reclaimed messages are then processed normally.
+
+        This handles the case where a consumer crash-looped on an infrastructure
+        error (e.g. missing DB column), left messages unacknowledged in the PEL,
+        and then the infrastructure was fixed.  Without reclamation, those
+        messages would be stuck forever because ``XREADGROUP ... >`` only
+        delivers new messages, not pending ones.
+
+        Args:
+            batch_size: Maximum number of messages to reclaim per call.
+
+        Returns:
+            Number of messages successfully reclaimed and processed.
+        """
+        processed = 0
+        start_id = b"0-0"
+
+        try:
+            # XAUTOCLAIM returns (next_start_id, [(msg_id, data), ...], [deleted_ids])
+            result = self._redis.xautoclaim(
+                STREAM_DOCUMENT_CAPTURED,
+                CONSUMER_GROUP,
+                CONSUMER_NAME,
+                min_idle_time=PENDING_RECLAIM_MIN_IDLE_MS,
+                start_id=start_id,
+                count=batch_size,
+            )
+        except Exception as exc:
+            logger.warning("XAUTOCLAIM failed: %s", exc)
+            return 0
+
+        # XAUTOCLAIM returns a 3-tuple: (next_cursor, [(msg_id, data), ...], [deleted_ids]).
+        # Guard against unexpected shapes gracefully.
+        try:
+            claimed_messages = result[1]
+        except (IndexError, TypeError):
+            return 0
+
+        if not claimed_messages:
+            return 0
+
+        logger.info(
+            "Reclaimed %d pending message(s) from PEL",
+            len(claimed_messages),
+        )
+
+        for msg_id, data in claimed_messages:
+            if data is None:
+                # Message was deleted from the stream but still in PEL.
+                # Acknowledge it to clear the PEL entry.
+                logger.debug("Acknowledging deleted PEL entry %s", msg_id)
+                self._redis.xack(STREAM_DOCUMENT_CAPTURED, CONSUMER_GROUP, msg_id)
+                continue
+            self._process_message(msg_id, data)
+            processed += 1
+
+        return processed
 
     def _process_batch(self, batch_size: int, block_ms: int) -> None:
         messages = self._redis.xreadgroup(

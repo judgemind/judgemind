@@ -28,6 +28,8 @@ from ingestion.db import (
 from ingestion.worker import (
     CONSUMER_NAME,
     DEFAULT_HEARTBEAT_INTERVAL,
+    PENDING_RECLAIM_INTERVAL,
+    PENDING_RECLAIM_MIN_IDLE_MS,
     STALE_CONSUMER_IDLE_MS,
     InfrastructureError,
     IngestionWorker,
@@ -2945,3 +2947,153 @@ def test_process_event_formatting_disabled_by_default(
     worker.process_event(event)
 
     mock_format.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# PEL reclamation tests (#1044)
+# ---------------------------------------------------------------------------
+
+
+@patch("ingestion.worker.psycopg")
+def test_reclaim_pending_processes_claimed_messages(mock_psycopg: MagicMock) -> None:
+    """_reclaim_pending_messages processes messages returned by XAUTOCLAIM."""
+    worker, _ = _make_worker()
+    worker.process_event = MagicMock()
+
+    event_data = _make_event()
+    msg_id = b"1234-0"
+
+    # XAUTOCLAIM returns (next_cursor, [(msg_id, data)], [deleted_ids])
+    worker._redis.xautoclaim.return_value = (
+        b"0-0",
+        [(msg_id, {b"data": json.dumps(event_data).encode()})],
+        [],
+    )
+
+    result = worker._reclaim_pending_messages()
+
+    assert result == 1
+    worker._redis.xautoclaim.assert_called_once_with(
+        "document.captured",
+        "ingestion-workers",
+        CONSUMER_NAME,
+        min_idle_time=PENDING_RECLAIM_MIN_IDLE_MS,
+        start_id=b"0-0",
+        count=100,
+    )
+    worker.process_event.assert_called_once()
+    worker._redis.xack.assert_called_once()
+
+
+@patch("ingestion.worker.psycopg")
+def test_reclaim_pending_no_messages(mock_psycopg: MagicMock) -> None:
+    """_reclaim_pending_messages returns 0 when no messages are pending."""
+    worker, _ = _make_worker()
+    worker.process_event = MagicMock()
+
+    worker._redis.xautoclaim.return_value = (b"0-0", [], [])
+
+    result = worker._reclaim_pending_messages()
+
+    assert result == 0
+    worker.process_event.assert_not_called()
+
+
+@patch("ingestion.worker.psycopg")
+def test_reclaim_pending_handles_xautoclaim_failure(mock_psycopg: MagicMock) -> None:
+    """_reclaim_pending_messages returns 0 when XAUTOCLAIM raises."""
+    worker, _ = _make_worker()
+    worker._redis.xautoclaim.side_effect = Exception("Redis error")
+
+    result = worker._reclaim_pending_messages()
+
+    assert result == 0
+
+
+@patch("ingestion.worker.psycopg")
+def test_reclaim_pending_skips_deleted_entries(mock_psycopg: MagicMock) -> None:
+    """_reclaim_pending_messages acknowledges entries with None data (deleted from stream)."""
+    worker, _ = _make_worker()
+    worker.process_event = MagicMock()
+
+    # Simulate a deleted message: msg_id present but data is None
+    worker._redis.xautoclaim.return_value = (
+        b"0-0",
+        [(b"9999-0", None)],
+        [],
+    )
+
+    result = worker._reclaim_pending_messages()
+
+    assert result == 0
+    worker.process_event.assert_not_called()
+    # The deleted entry should still be acknowledged to clear the PEL
+    worker._redis.xack.assert_called_once_with("document.captured", "ingestion-workers", b"9999-0")
+
+
+@patch("ingestion.worker.psycopg")
+def test_reclaim_pending_called_on_startup(mock_psycopg: MagicMock) -> None:
+    """run() calls _reclaim_pending_messages after _cleanup_stale_consumers."""
+    worker, _ = _make_worker()
+    worker._ensure_consumer_group = MagicMock()
+    worker._cleanup_stale_consumers = MagicMock()
+    worker._reclaim_pending_messages = MagicMock(return_value=0)
+    worker.health_check = MagicMock()
+    worker._process_batch = MagicMock(side_effect=KeyboardInterrupt)
+
+    worker.run()
+
+    worker._reclaim_pending_messages.assert_called()
+
+
+@patch("ingestion.worker.psycopg")
+def test_reclaim_pending_called_periodically(mock_psycopg: MagicMock) -> None:
+    """_reclaim_pending_messages is called every PENDING_RECLAIM_INTERVAL empty polls."""
+    worker, _ = _make_worker()
+    worker._ensure_consumer_group = MagicMock()
+    worker._cleanup_stale_consumers = MagicMock()
+    worker._reclaim_pending_messages = MagicMock(return_value=0)
+    worker.health_check = MagicMock()
+
+    # Simulate empty polls: xreadgroup returns None, then after enough
+    # cycles (PENDING_RECLAIM_INTERVAL), reclaim should be called.
+    call_count = 0
+
+    def fake_process_batch(batch_size: int, block_ms: int) -> None:
+        nonlocal call_count
+        call_count += 1
+        # Simulate empty poll by incrementing the counter
+        worker._empty_polls = call_count
+        if call_count > PENDING_RECLAIM_INTERVAL:
+            raise KeyboardInterrupt
+
+    worker._process_batch = MagicMock(side_effect=fake_process_batch)
+
+    worker.run()
+
+    # Should have been called on startup + at least once during the loop
+    assert worker._reclaim_pending_messages.call_count >= 2
+
+
+@patch("ingestion.worker.psycopg")
+def test_reclaim_pending_processes_multiple_messages(mock_psycopg: MagicMock) -> None:
+    """_reclaim_pending_messages handles multiple messages in one batch."""
+    worker, _ = _make_worker()
+    worker.process_event = MagicMock()
+
+    event1 = _make_event(document_id="doc-1")
+    event2 = _make_event(document_id="doc-2")
+
+    worker._redis.xautoclaim.return_value = (
+        b"0-0",
+        [
+            (b"1000-0", {b"data": json.dumps(event1).encode()}),
+            (b"1001-0", {b"data": json.dumps(event2).encode()}),
+        ],
+        [],
+    )
+
+    result = worker._reclaim_pending_messages()
+
+    assert result == 2
+    assert worker.process_event.call_count == 2
