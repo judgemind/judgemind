@@ -151,6 +151,9 @@ DEFAULT_MAX_RETRIES = 3
 # Number of consecutive empty poll cycles between heartbeat log messages.
 # At the default block timeout of 5 seconds, 60 cycles ≈ 5 minutes.
 DEFAULT_HEARTBEAT_INTERVAL = 60
+# Consumers idle for longer than this (in milliseconds) with 0 pending messages
+# are considered stale and eligible for cleanup.  1 hour = 3,600,000 ms.
+STALE_CONSUMER_IDLE_MS = 3_600_000
 
 
 class IngestionWorker:
@@ -327,6 +330,7 @@ class IngestionWorker:
         """
         self.health_check()
         self._ensure_consumer_group()
+        self._cleanup_stale_consumers()
         logger.info(
             "Ingestion worker started",
             extra={
@@ -723,6 +727,62 @@ class IngestionWorker:
         except Exception:
             # Group already exists — this is expected on restart
             pass
+
+    def _cleanup_stale_consumers(self) -> None:
+        """Remove stale consumers from the consumer group on startup.
+
+        A consumer is considered stale when it has been idle for longer than
+        ``STALE_CONSUMER_IDLE_MS`` *and* has zero pending messages.  The
+        current process's consumer name is always preserved.
+
+        If the ``XINFO CONSUMERS`` call fails (e.g. the stream doesn't exist
+        yet), we log a warning and continue — cleanup is best-effort and must
+        never block worker startup.
+        """
+        try:
+            consumers: list[dict[str, object]] = self._redis.xinfo_consumers(
+                STREAM_DOCUMENT_CAPTURED, CONSUMER_GROUP
+            )
+        except Exception as exc:
+            logger.warning(
+                "Could not list consumers for cleanup: %s",
+                exc,
+            )
+            return
+
+        deleted = 0
+        for consumer in consumers:
+            raw_name = consumer.get("name", b"")
+            name: str = raw_name.decode() if isinstance(raw_name, bytes) else str(raw_name)
+            idle: int = int(consumer.get("idle", 0))
+            pending: int = int(consumer.get("pending", 0))
+
+            if name == CONSUMER_NAME:
+                continue
+
+            if idle >= STALE_CONSUMER_IDLE_MS and pending == 0:
+                try:
+                    self._redis.xgroup_delconsumer(STREAM_DOCUMENT_CAPTURED, CONSUMER_GROUP, name)
+                    deleted += 1
+                    logger.info(
+                        "Deleted stale consumer %s (idle %d ms)",
+                        name,
+                        idle,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Failed to delete stale consumer %s: %s",
+                        name,
+                        exc,
+                    )
+
+        logger.info(
+            "Stale consumer cleanup finished",
+            extra={
+                "total_consumers": len(consumers),
+                "deleted": deleted,
+            },
+        )
 
     def _process_batch(self, batch_size: int, block_ms: int) -> None:
         messages = self._redis.xreadgroup(

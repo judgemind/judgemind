@@ -26,7 +26,9 @@ from ingestion.db import (
     upsert_party,
 )
 from ingestion.worker import (
+    CONSUMER_NAME,
     DEFAULT_HEARTBEAT_INTERVAL,
+    STALE_CONSUMER_IDLE_MS,
     InfrastructureError,
     IngestionWorker,
     _parse_date,
@@ -2410,6 +2412,122 @@ def test_ensure_consumer_group_already_exists(mock_psycopg: MagicMock) -> None:
 
     # Should not raise
     worker._ensure_consumer_group()
+
+
+# ---------------------------------------------------------------------------
+# Stale consumer cleanup tests
+# ---------------------------------------------------------------------------
+
+
+@patch("ingestion.worker.psycopg")
+def test_cleanup_stale_consumers_deletes_idle_consumers(mock_psycopg: MagicMock) -> None:
+    """_cleanup_stale_consumers removes consumers idle > threshold with 0 pending."""
+    worker, _ = _make_worker()
+
+    worker._redis.xinfo_consumers.return_value = [
+        {"name": CONSUMER_NAME.encode(), "idle": 0, "pending": 0},
+        {"name": b"stale-worker-1", "idle": STALE_CONSUMER_IDLE_MS + 1, "pending": 0},
+        {"name": b"stale-worker-2", "idle": STALE_CONSUMER_IDLE_MS * 2, "pending": 0},
+    ]
+
+    worker._cleanup_stale_consumers()
+
+    assert worker._redis.xgroup_delconsumer.call_count == 2
+    worker._redis.xgroup_delconsumer.assert_any_call(
+        "document.captured", "ingestion-workers", "stale-worker-1"
+    )
+    worker._redis.xgroup_delconsumer.assert_any_call(
+        "document.captured", "ingestion-workers", "stale-worker-2"
+    )
+
+
+@patch("ingestion.worker.psycopg")
+def test_cleanup_stale_consumers_preserves_current_consumer(mock_psycopg: MagicMock) -> None:
+    """_cleanup_stale_consumers never deletes the current process's consumer."""
+    worker, _ = _make_worker()
+
+    # Current consumer appears idle and with 0 pending — should still be kept.
+    worker._redis.xinfo_consumers.return_value = [
+        {"name": CONSUMER_NAME.encode(), "idle": STALE_CONSUMER_IDLE_MS + 1, "pending": 0},
+    ]
+
+    worker._cleanup_stale_consumers()
+
+    worker._redis.xgroup_delconsumer.assert_not_called()
+
+
+@patch("ingestion.worker.psycopg")
+def test_cleanup_stale_consumers_keeps_consumers_with_pending(mock_psycopg: MagicMock) -> None:
+    """_cleanup_stale_consumers keeps consumers that have pending messages."""
+    worker, _ = _make_worker()
+
+    worker._redis.xinfo_consumers.return_value = [
+        {"name": b"busy-worker", "idle": STALE_CONSUMER_IDLE_MS + 1, "pending": 3},
+    ]
+
+    worker._cleanup_stale_consumers()
+
+    worker._redis.xgroup_delconsumer.assert_not_called()
+
+
+@patch("ingestion.worker.psycopg")
+def test_cleanup_stale_consumers_keeps_recently_active(mock_psycopg: MagicMock) -> None:
+    """_cleanup_stale_consumers keeps consumers that are not idle long enough."""
+    worker, _ = _make_worker()
+
+    worker._redis.xinfo_consumers.return_value = [
+        {"name": b"active-worker", "idle": STALE_CONSUMER_IDLE_MS - 1, "pending": 0},
+    ]
+
+    worker._cleanup_stale_consumers()
+
+    worker._redis.xgroup_delconsumer.assert_not_called()
+
+
+@patch("ingestion.worker.psycopg")
+def test_cleanup_stale_consumers_handles_xinfo_failure(mock_psycopg: MagicMock) -> None:
+    """_cleanup_stale_consumers logs a warning and continues if xinfo_consumers fails."""
+    worker, _ = _make_worker()
+    worker._redis.xinfo_consumers.side_effect = Exception("stream not found")
+
+    # Should not raise — cleanup is best-effort
+    worker._cleanup_stale_consumers()
+
+    worker._redis.xgroup_delconsumer.assert_not_called()
+
+
+@patch("ingestion.worker.psycopg")
+def test_cleanup_stale_consumers_handles_delconsumer_failure(mock_psycopg: MagicMock) -> None:
+    """_cleanup_stale_consumers continues if deleting one consumer fails."""
+    worker, _ = _make_worker()
+
+    worker._redis.xinfo_consumers.return_value = [
+        {"name": b"fail-worker", "idle": STALE_CONSUMER_IDLE_MS + 1, "pending": 0},
+        {"name": b"ok-worker", "idle": STALE_CONSUMER_IDLE_MS + 1, "pending": 0},
+    ]
+    worker._redis.xgroup_delconsumer.side_effect = [
+        Exception("permission denied"),
+        None,
+    ]
+
+    # Should not raise
+    worker._cleanup_stale_consumers()
+
+    assert worker._redis.xgroup_delconsumer.call_count == 2
+
+
+@patch("ingestion.worker.psycopg")
+def test_cleanup_stale_consumers_called_during_run(mock_psycopg: MagicMock) -> None:
+    """run() calls _cleanup_stale_consumers after _ensure_consumer_group."""
+    worker, _ = _make_worker()
+    worker._ensure_consumer_group = MagicMock()
+    worker._cleanup_stale_consumers = MagicMock()
+    worker.health_check = MagicMock()
+    worker._process_batch = MagicMock(side_effect=KeyboardInterrupt)
+
+    worker.run()
+
+    worker._cleanup_stale_consumers.assert_called_once()
 
 
 @patch("ingestion.worker.psycopg")
