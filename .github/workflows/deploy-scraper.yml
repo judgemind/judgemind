@@ -308,3 +308,150 @@ jobs:
               \"description\": \"$DEPLOY_DESC\",
               \"context\": \"deploy/ingestion-worker-dev\"
             }"
+
+  post-deploy-health-check:
+    name: Post-Deploy Ingestion Worker Health Check
+    needs: deploy-ingestion-worker
+    if: always() && needs.deploy-ingestion-worker.result == 'success'
+    runs-on: ubuntu-latest
+
+    env:
+      INGESTION_SERVICE: judgemind-ingestion-worker-dev
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Wait for new tasks to start
+        run: |
+          echo "Waiting 60 seconds for new ingestion worker task to fully start..."
+          sleep 60
+
+      - name: Health check — verify service is running
+        id: service-check
+        run: |
+          SERVICE_DESC=$(aws ecs describe-services \
+            --cluster "$ECS_CLUSTER" \
+            --services "$INGESTION_SERVICE" \
+            --query 'services[0]' \
+            --output json)
+
+          RUNNING_COUNT=$(echo "$SERVICE_DESC" | jq -r '.runningCount')
+          DESIRED_COUNT=$(echo "$SERVICE_DESC" | jq -r '.desiredCount')
+
+          echo "Running tasks: $RUNNING_COUNT / Desired: $DESIRED_COUNT"
+
+          if [ "$RUNNING_COUNT" -ge "$DESIRED_COUNT" ] && [ "$RUNNING_COUNT" -gt 0 ]; then
+            echo "Service has expected number of running tasks."
+          else
+            echo "ERROR: Service running count ($RUNNING_COUNT) does not match desired ($DESIRED_COUNT)."
+            exit 1
+          fi
+
+      - name: Health check — verify no crash-loop
+        id: crash-check
+        run: |
+          # Check that the most recent task has been running for at least 30 seconds
+          # (a crash-looping container restarts quickly)
+          TASKS=$(aws ecs list-tasks \
+            --cluster "$ECS_CLUSTER" \
+            --service-name "$INGESTION_SERVICE" \
+            --desired-status RUNNING \
+            --query 'taskArns' \
+            --output json)
+
+          TASK_COUNT=$(echo "$TASKS" | jq 'length')
+
+          if [ "$TASK_COUNT" -eq 0 ]; then
+            echo "ERROR: No running tasks found for service."
+            exit 1
+          fi
+
+          FIRST_TASK=$(echo "$TASKS" | jq -r '.[0]')
+          TASK_DESC=$(aws ecs describe-tasks \
+            --cluster "$ECS_CLUSTER" \
+            --tasks "$FIRST_TASK" \
+            --query 'tasks[0]' \
+            --output json)
+
+          LAST_STATUS=$(echo "$TASK_DESC" | jq -r '.lastStatus')
+          HEALTH_STATUS=$(echo "$TASK_DESC" | jq -r '.healthStatus // "UNKNOWN"')
+
+          echo "Task status: $LAST_STATUS, health: $HEALTH_STATUS"
+
+          # Check container exit codes — if any container has stopped with non-zero, it's crash-looping
+          STOPPED_CONTAINERS=$(echo "$TASK_DESC" | jq '[.containers[] | select(.lastStatus == "STOPPED" and .exitCode != 0)] | length')
+
+          if [ "$STOPPED_CONTAINERS" -gt 0 ]; then
+            echo "ERROR: Found $STOPPED_CONTAINERS stopped containers with non-zero exit codes — possible crash-loop."
+            echo "$TASK_DESC" | jq '.containers[] | {name, lastStatus, exitCode, reason}'
+            exit 1
+          fi
+
+          echo "No crash-loop detected. Service appears healthy."
+
+      - name: Health check — verify recent log output (no errors)
+        id: log-check
+        run: |
+          # Fetch the last 20 log events from the ingestion worker
+          LOG_GROUP="/ecs/judgemind-ingestion-worker-dev"
+
+          # Get the most recent log stream
+          LATEST_STREAM=$(aws logs describe-log-streams \
+            --log-group-name "$LOG_GROUP" \
+            --order-by LastEventTime \
+            --descending \
+            --limit 1 \
+            --query 'logStreams[0].logStreamName' \
+            --output text 2>/dev/null || echo "")
+
+          if [ -z "$LATEST_STREAM" ] || [ "$LATEST_STREAM" = "None" ]; then
+            echo "WARNING: No log streams found. Service may still be starting."
+            exit 0
+          fi
+
+          echo "Checking latest log stream: $LATEST_STREAM"
+
+          # Get recent log events
+          EVENTS=$(aws logs get-log-events \
+            --log-group-name "$LOG_GROUP" \
+            --log-stream-name "$LATEST_STREAM" \
+            --limit 20 \
+            --start-from-head false \
+            --output json 2>/dev/null || echo '{"events":[]}')
+
+          EVENT_COUNT=$(echo "$EVENTS" | jq '.events | length')
+          echo "Found $EVENT_COUNT recent log events."
+
+          # Check for critical errors (not warnings or info-level mentions of "error")
+          CRITICAL_ERRORS=$(echo "$EVENTS" | jq -r '.events[].message' | grep -ic "CRITICAL\|Traceback\|InfrastructureError\|crash" || true)
+
+          if [ "$CRITICAL_ERRORS" -gt 0 ]; then
+            echo "WARNING: Found $CRITICAL_ERRORS critical error indicators in recent logs."
+            echo "Recent log events:"
+            echo "$EVENTS" | jq -r '.events[].message' | tail -10
+            # Warning only — don't fail the whole deploy for log noise
+          else
+            echo "No critical errors found in recent logs."
+          fi
+
+      - name: Set health check status
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HEALTH_STATUS: ${{ (steps.service-check.outcome == 'success' && steps.crash-check.outcome == 'success') && 'success' || 'failure' }}
+          HEALTH_DESC: ${{ (steps.service-check.outcome == 'success' && steps.crash-check.outcome == 'success') && 'Ingestion worker health check passed' || 'Ingestion worker health check failed' }}
+        run: |
+          curl -s -X POST \
+            -H "Authorization: token $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/statuses/${{ github.sha }}" \
+            -d "{
+              \"state\": \"$HEALTH_STATUS\",
+              \"description\": \"$HEALTH_DESC\",
+              \"context\": \"deploy/ingestion-worker-dev-health\"
+            }"

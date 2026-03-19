@@ -368,3 +368,90 @@ jobs:
       - name: Skip notification (no migrations)
         if: steps.check-migrations.outputs.has_migrations == 'false'
         run: echo "No migration changes in this deploy — skipping migration step."
+
+  post-deploy-health-check:
+    name: Post-Deploy Health Check
+    needs: [deploy-dev, run-migrations]
+    if: always() && needs.deploy-dev.result == 'success'
+    runs-on: ubuntu-latest
+
+    env:
+      API_URL: https://dev.api.judgemind.org/graphql
+
+    steps:
+      - name: Wait for service to stabilize
+        run: |
+          echo "Waiting 30 seconds for new tasks to fully start..."
+          sleep 30
+
+      - name: Health check — GraphQL introspection
+        id: introspection
+        run: |
+          HTTP_CODE=$(curl -s -o /tmp/response.json -w '%{http_code}' \
+            --max-time 15 \
+            --retry 3 \
+            --retry-delay 10 \
+            -X POST "$API_URL" \
+            -H 'Content-Type: application/json' \
+            -d '{"query":"{ __typename }"}')
+
+          echo "HTTP status: $HTTP_CODE"
+
+          if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
+            echo "GraphQL endpoint is responding."
+            cat /tmp/response.json | head -c 500
+            echo ""
+          else
+            echo "ERROR: GraphQL endpoint returned HTTP $HTTP_CODE"
+            cat /tmp/response.json 2>/dev/null || true
+            exit 1
+          fi
+
+      - name: Health check — sample query
+        id: sample-query
+        run: |
+          HTTP_CODE=$(curl -s -o /tmp/sample_response.json -w '%{http_code}' \
+            --max-time 15 \
+            --retry 2 \
+            --retry-delay 5 \
+            -X POST "$API_URL" \
+            -H 'Content-Type: application/json' \
+            -d '{"query":"{ rulings(first: 1) { edges { node { id } } } }"}')
+
+          echo "HTTP status: $HTTP_CODE"
+
+          if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
+            # Check for GraphQL errors in the response
+            ERRORS=$(cat /tmp/sample_response.json | python3 -c "import sys,json; d=json.load(sys.stdin); print(len(d.get('errors',[])))") 2>/dev/null || echo "parse_error"
+
+            if [ "$ERRORS" = "0" ]; then
+              echo "Sample query succeeded without errors."
+            elif [ "$ERRORS" = "parse_error" ]; then
+              echo "WARNING: Could not parse response, but HTTP status was OK."
+            else
+              echo "ERROR: GraphQL returned errors in response."
+              cat /tmp/sample_response.json | head -c 1000
+              exit 1
+            fi
+          else
+            echo "ERROR: Sample query returned HTTP $HTTP_CODE"
+            cat /tmp/sample_response.json 2>/dev/null || true
+            exit 1
+          fi
+
+      - name: Set health check status
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HEALTH_STATUS: ${{ (steps.introspection.outcome == 'success' && steps.sample-query.outcome == 'success') && 'success' || 'failure' }}
+          HEALTH_DESC: ${{ (steps.introspection.outcome == 'success' && steps.sample-query.outcome == 'success') && 'API health check passed' || 'API health check failed' }}
+        run: |
+          curl -s -X POST \
+            -H "Authorization: token $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/statuses/${{ github.sha }}" \
+            -d "{
+              \"state\": \"$HEALTH_STATUS\",
+              \"description\": \"$HEALTH_DESC\",
+              \"context\": \"deploy/api-dev-health\"
+            }"
