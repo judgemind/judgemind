@@ -87,20 +87,14 @@ create_temp_script "_test_oneshot_ok2.py" "def load():
 assert_passes "Indented 'from ... import' inside function is allowed"
 rm -f "$SCRIPT_DIR/_test_oneshot_ok2.py"
 
-# ─── Test 6: _venv_helper import is now a sibling violation ──────────────
-create_temp_script "_test_oneshot_bad4.py" "from _venv_helper import ensure_venv
-ensure_venv('scraper-framework')"
-assert_fails "_venv_helper import is now detected as sibling import"
-rm -f "$SCRIPT_DIR/_test_oneshot_bad4.py"
-
-# ─── Test 7: stdlib import should pass ────────────────────────────────────
+# ─── Test 6: stdlib import should pass ────────────────────────────────────
 create_temp_script "_test_oneshot_ok4.py" "import json
 import os
 from pathlib import Path"
 assert_passes "stdlib imports are allowed"
 rm -f "$SCRIPT_DIR/_test_oneshot_ok4.py"
 
-# ─── Test 8: Clean state (no temp files) should pass ─────────────────────
+# ─── Test 7: Clean state (no temp files) should pass ─────────────────────
 assert_passes "Clean state with no violations passes"
 
 # ─── Summary ──────────────────────────────────────────────────────────────

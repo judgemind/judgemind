@@ -10,7 +10,6 @@ original per-module tests and helper unit tests.
 
 from __future__ import annotations
 
-import os
 import sys
 from importlib import import_module
 from pathlib import Path
@@ -21,9 +20,6 @@ import pytest
 # Add scripts/ to sys.path so we can import script modules.
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 sys.path.insert(0, str(_REPO_ROOT / "scripts"))
-
-# Skip venv re-exec during tests.
-os.environ["_VENV_HELPER_SKIP"] = "1"
 
 # ruff: noqa: E402
 from helpers.schema_validation import (

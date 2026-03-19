@@ -30,8 +30,6 @@ import pytest
 # scripts-tests CI environment.  We inject mocks before importing.
 # ---------------------------------------------------------------------------
 
-os.environ["_VENV_HELPER_SKIP"] = "1"
-
 # Add scripts directory to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -395,8 +393,6 @@ def test_main_missing_database_url() -> None:
     with patch.dict(os.environ, {}, clear=True):
         # Remove DATABASE_URL if present
         os.environ.pop("DATABASE_URL", None)
-        os.environ["_VENV_HELPER_SKIP"] = "1"
-
         with pytest.raises(SystemExit) as exc_info:
             with patch("sys.argv", ["backfill_ruling_html.py"]):
                 backfill_ruling_html.main()

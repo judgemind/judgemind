@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import os
 import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -16,9 +15,6 @@ from moto import mock_aws
 # Add scripts/ to sys.path so we can import the module.
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 sys.path.insert(0, str(_REPO_ROOT / "scripts"))
-
-# Skip venv re-exec during tests.
-os.environ["_VENV_HELPER_SKIP"] = "1"
 
 # ruff: noqa: E402
 from dq_trend_storage import (
