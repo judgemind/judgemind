@@ -54,6 +54,8 @@ export const typeDefs = `#graphql
     summary: String
     department: String
     rulingText: String
+    """LLM-formatted HTML version of the ruling text, if available."""
+    rulingTextHtml: String
     """When the court published this tentative, if known. ISO 8601."""
     postedAt: String
     """The ID of the raw document in the documents table. Used to construct the download URL."""

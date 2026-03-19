@@ -1,7 +1,33 @@
 'use client';
 
+import DOMPurify from 'isomorphic-dompurify';
 import Link from 'next/link';
 import { buildDownloadUrl, cleanRulingText, FORMAT_LABELS } from '@/lib/display-helpers';
+
+/**
+ * Tags allowed through DOMPurify sanitization for ruling HTML.
+ * Only structural and text-formatting tags needed by the ruling template.
+ */
+const ALLOWED_TAGS = [
+  'div', 'section', 'article', 'header',
+  'span', 'p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6',
+  'strong', 'em', 'b', 'i', 'u', 'br',
+  'ul', 'ol', 'li',
+];
+
+/**
+ * Attributes allowed through DOMPurify sanitization.
+ * Only `class` is needed for CSS styling of ruling template elements.
+ */
+const ALLOWED_ATTR = ['class'];
+
+/** Sanitize ruling HTML, stripping all tags/attributes not in the allowlist. */
+export function sanitizeRulingHtml(html: string): string {
+  return DOMPurify.sanitize(html, {
+    ALLOWED_TAGS,
+    ALLOWED_ATTR,
+  });
+}
 
 interface RulingProps {
   ruling: {
@@ -12,6 +38,7 @@ interface RulingProps {
     isTentative: boolean;
     department: string | null;
     rulingText: string | null;
+    rulingTextHtml: string | null;
     summary: string | null;
     postedAt: string | null;
     documentId: string | null;
@@ -78,22 +105,31 @@ export function RulingDetail({ ruling }: RulingProps) {
         </section>
       )}
 
-      {/* Ruling text */}
-      {ruling.rulingText && (
+      {/* Ruling text — prefer formatted HTML, fall back to raw text */}
+      {(ruling.rulingTextHtml || ruling.rulingText) && (
         <section className="mb-6">
           <h2 className="text-xs font-medium uppercase tracking-wide text-slate-500 dark:text-slate-400">
             Ruling Text
           </h2>
-          <div className="mt-2 space-y-3">
-            {cleanRulingText(ruling.rulingText).map((paragraph, idx) => (
-              <p
-                key={idx}
-                className="text-sm leading-relaxed text-slate-700 dark:text-slate-300"
-              >
-                {paragraph}
-              </p>
-            ))}
-          </div>
+          {ruling.rulingTextHtml ? (
+            <div
+              className="ruling-content mt-2 text-sm leading-relaxed text-slate-700 dark:text-slate-300"
+              dangerouslySetInnerHTML={{
+                __html: sanitizeRulingHtml(ruling.rulingTextHtml),
+              }}
+            />
+          ) : (
+            <div className="mt-2 space-y-3">
+              {cleanRulingText(ruling.rulingText!).map((paragraph, idx) => (
+                <p
+                  key={idx}
+                  className="text-sm leading-relaxed text-slate-700 dark:text-slate-300"
+                >
+                  {paragraph}
+                </p>
+              ))}
+            </div>
+          )}
         </section>
       )}
 
