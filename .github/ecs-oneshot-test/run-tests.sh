@@ -52,7 +52,8 @@ run_test() {
 
     # Base64-encode the script (same as ecs-run-task.sh for small scripts)
     local encoded
-    encoded=$(base64 < "$script_path")
+    # Strip newlines: Linux base64 wraps at 76 chars, which breaks bash -c
+    encoded=$(base64 < "$script_path" | tr -d '\n')
 
     # Build the command string matching ecs-run-task.sh's pattern
     local args_str=""

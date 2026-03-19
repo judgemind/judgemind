@@ -1,0 +1,82 @@
+name: ECS Smoke Test
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "scripts/ecs-run-task.sh"
+      - "scripts/ecs-run.sh"
+      - "scripts/ecs-logs.sh"
+      - "scripts/ecs-smoke-test.py"
+      - "packages/scraper-framework/Dockerfile"
+      - "scripts/check-oneshot-imports.sh"
+      - ".github/workflows/ecs-smoke-test.yml"
+  schedule:
+    # Nightly at 06:00 UTC to catch environment drift
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+
+# Only one ECS smoke test at a time to avoid unnecessary Fargate costs
+concurrency:
+  group: ecs-smoke-test
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  AWS_REGION: us-west-2
+
+jobs:
+  ecs-smoke-test:
+    name: Run smoke test on real ECS
+    runs-on: ubuntu-latest
+    # Skip if AWS credentials are not configured (e.g. fork PRs)
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Verify AWS credentials are available
+        id: aws-check
+        run: |
+          if ! aws sts get-caller-identity --output text > /dev/null 2>&1; then
+            echo "WARNING: AWS credentials not available — skipping ECS smoke test"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Run ECS smoke test
+        if: steps.aws-check.outputs.skip != 'true'
+        id: smoke-test
+        run: |
+          echo "Launching ECS smoke test..."
+          scripts/ecs-run-task.sh --timeout 300 scripts/ecs-smoke-test.py 2>&1 | tee ecs-output.txt
+          echo "ECS smoke test completed successfully."
+
+      - name: Verify marker in output
+        if: steps.aws-check.outputs.skip != 'true'
+        run: |
+          if grep -q "JUDGEMIND_ECS_SMOKE_TEST_OK" ecs-output.txt; then
+            echo "Marker string found in ECS output — log retrieval verified."
+          else
+            echo "ERROR: Marker string NOT found in ECS output."
+            echo "This means either the script did not run or log retrieval is broken."
+            echo ""
+            echo "=== Full output ==="
+            cat ecs-output.txt
+            exit 1
+          fi
+
+      - name: Skip notice
+        if: steps.aws-check.outputs.skip == 'true'
+        run: echo "ECS smoke test skipped — no AWS credentials available."
