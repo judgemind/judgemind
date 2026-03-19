@@ -664,3 +664,53 @@ resource "aws_cloudwatch_metric_alarm" "data_quality_no_run" {
     environment = var.environment
   }
 }
+
+# ─── Ingestion Worker Crash-Loop Alerts ──────────────────────────────────────
+# CloudWatch alarm that fires when the ingestion worker restarts repeatedly in
+# a short window. The worker logs "Infrastructure error" or "Unhandled
+# exception" via structlog JSON before exiting, which triggers an ECS restart.
+# Repeated occurrences indicate a crash loop (e.g. missing DB column, OOM).
+#
+# See: #1044 where a crash loop ran for a week before the data quality check
+# caught the symptom (stale scrapers) after 170+ hours.
+
+resource "aws_cloudwatch_log_metric_filter" "ingestion_worker_crash" {
+  count = var.enable_alerts && local.deploy_ingestion ? 1 : 0
+
+  name           = "judgemind-ingestion-worker-crash-${var.environment}"
+  pattern        = "?\"Infrastructure error\" ?\"Unhandled exception\""
+  log_group_name = aws_cloudwatch_log_group.ingestion_worker[0].name
+
+  metric_transformation {
+    name          = "IngestionWorkerCrashCount"
+    namespace     = "Judgemind/Ingestion"
+    value         = "1"
+    default_value = "0"
+  }
+}
+
+resource "aws_cloudwatch_metric_alarm" "ingestion_worker_crash_loop" {
+  count = var.enable_alerts && local.deploy_ingestion ? 1 : 0
+
+  alarm_name        = "judgemind-ingestion-worker-crash-loop-${var.environment}"
+  alarm_description = "Ingestion worker has crashed >= 3 times in the past 15 minutes (${var.environment}). Check ${aws_cloudwatch_log_group.ingestion_worker[0].name} for details."
+
+  namespace   = "Judgemind/Ingestion"
+  metric_name = "IngestionWorkerCrashCount"
+  statistic   = "Sum"
+
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  threshold           = 3
+  period              = 900
+  evaluation_periods  = 1
+  datapoints_to_alarm = 1
+  treat_missing_data  = "notBreaching"
+
+  alarm_actions = [aws_sns_topic.scraper_alerts[0].arn]
+  ok_actions    = [aws_sns_topic.scraper_alerts[0].arn]
+
+  tags = {
+    project     = "judgemind"
+    environment = var.environment
+  }
+}
