@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# venv: telegram-bridge
 """Standalone Telegram responder daemon.
 
 Polls the Telegram inbound SQS queue every few seconds and interprets all
@@ -36,11 +37,6 @@ Environment:
 """
 
 from __future__ import annotations
-
-# Ensure we are running inside the telegram-bridge venv (re-execs if not).
-from _venv_helper import ensure_venv  # noqa: E402 — must run before non-stdlib imports
-
-ensure_venv("telegram-bridge")
 
 import argparse
 import datetime

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# venv: scraper-framework
 """Gemini 2.5 Pro cross-model reviewer for the /ralph loop.
 
 Reads task context and a git diff, sends them to Gemini for review,
@@ -34,11 +35,6 @@ Exit codes:
 """
 
 from __future__ import annotations
-
-# Ensure we are running inside the scraper-framework venv (re-execs if not).
-from _venv_helper import ensure_venv
-
-ensure_venv("scraper-framework")
 
 import os
 import sys

@@ -18,8 +18,9 @@ Notably, these packages are **not available** in CI:
 - `structlog` (structured logging)
 - Any packages from `packages/scraper-framework/` (e.g. `ingestion.*`)
 
-The `_VENV_HELPER_SKIP=1` environment variable is set in CI so that
-`_venv_helper.ensure_venv()` calls are skipped.
+Scripts use `# venv: <package>` header comments instead of `ensure_venv()`.
+The `_VENV_HELPER_SKIP=1` environment variable is set in CI for legacy
+compatibility.
 
 ## Mocking `sys.modules` for unavailable packages
 
@@ -49,11 +50,7 @@ sys.modules["ingestion"] = mock_ingestion
 sys.modules["ingestion.llm_providers"] = MagicMock()
 sys.modules["ingestion.ruling_formatter"] = MagicMock()
 
-# 3. Set _VENV_HELPER_SKIP so ensure_venv() is a no-op.
-import os
-os.environ["_VENV_HELPER_SKIP"] = "1"
-
-# 4. Now import the script — it picks up the mocks.
+# 3. Now import the script — it picks up the mocks.
 import my_script  # noqa: E402
 ```
 

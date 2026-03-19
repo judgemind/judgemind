@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# venv: scraper-framework
 """Clean up Riverside County UNKNOWN records: boilerplate PDFs and orphaned cases.
 
 Identifies and removes three categories of invalid UNKNOWN records:
@@ -29,11 +30,6 @@ The script is idempotent — re-running it when no UNKNOWN records remain is a n
 """
 
 from __future__ import annotations
-
-# Ensure we are running inside the scraper-framework venv (re-execs if not).
-from _venv_helper import ensure_venv
-
-ensure_venv("scraper-framework")
 
 import argparse
 import logging

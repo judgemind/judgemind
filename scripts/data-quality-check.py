@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# venv: scraper-framework
 """Data quality monitoring — collection health and field completeness checks.
 
 Queries the database and flags counties with unhealthy ruling ingest
@@ -22,12 +23,6 @@ Exit code: 0 if all healthy, 1 if alerts found.
 
 from __future__ import annotations
 
-# Ensure we are running inside the scraper-framework venv (re-execs if not).
-from _venv_helper import ensure_venv
-
-ensure_venv("scraper-framework")
-
-# ruff: noqa: E402
 import argparse
 import json
 import logging

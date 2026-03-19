@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# venv: telegram-bridge
 """Send a Telegram lifecycle notification for the orchestrator.
 
 This is a thin CLI wrapper around the ``telegram_bridge`` package's
@@ -25,11 +26,6 @@ Environment:
 
 from __future__ import annotations
 
-# Ensure we are running inside the telegram-bridge venv (re-execs if not).
-from _venv_helper import ensure_venv  # noqa: E402
-
-ensure_venv("telegram-bridge")
-
 import asyncio
 import sys
 
@@ -49,8 +45,8 @@ def _usage() -> str:
 
 async def _main(args: list[str]) -> int:
     """Dispatch the notification based on the command-line action."""
-    # Import here (after venv activation) so missing deps produce a
-    # clear error from ensure_venv rather than an ImportError traceback.
+    # Import here so missing deps produce a clear error at call time
+    # rather than at module load.
     from telegram_bridge.orchestrator import create_orchestrator_bridge
 
     if len(args) < 1:

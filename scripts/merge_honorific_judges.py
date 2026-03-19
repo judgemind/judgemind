@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# venv: scraper-framework
 """Merge duplicate judge records that have honorific prefixes in canonical_name.
 
 After PR #331 fixed normalize_judge_name() to strip honorific prefixes, newly
@@ -38,11 +39,6 @@ Closes: #424
 """
 
 from __future__ import annotations
-
-# Ensure we are running inside the scraper-framework venv (re-execs if not).
-from _venv_helper import ensure_venv
-
-ensure_venv("scraper-framework")
 
 import argparse
 import logging
