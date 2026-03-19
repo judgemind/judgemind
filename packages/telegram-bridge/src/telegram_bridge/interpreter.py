@@ -760,6 +760,7 @@ def build_orchestrator_status(
     paused: bool = False,
     stopped_issues: list[int] | None = None,
     prs_since_last_audit: int = 0,
+    session_number: int = 0,
 ) -> dict[str, Any]:
     """Build the orchestrator status dict for the interpreter context.
 
@@ -776,6 +777,9 @@ def build_orchestrator_status(
         stopped_issues: Issue numbers that have been stopped.
         prs_since_last_audit: Number of PRs merged since the last /audit run.
             The orchestrator triggers an audit when this reaches 20.
+        session_number: How many times the orchestrator has been (re)started
+            by the outer ``while :; do`` loop.  Incremented on each startup
+            and persisted so the next session continues the count.
 
     Returns:
         A dict suitable for JSON serialization.  Includes an ``updated_at``
@@ -791,5 +795,6 @@ def build_orchestrator_status(
         "paused": paused,
         "stopped_issues": stopped_issues or [],
         "prs_since_last_audit": prs_since_last_audit,
+        "session_number": session_number,
         "updated_at": datetime.datetime.now(datetime.UTC).isoformat(),
     }

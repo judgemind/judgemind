@@ -67,6 +67,12 @@ Handle any in-flight PRs before launching new work (see "PR Merge Policy" below)
 
 Read `tmp/orchestrator_status.json` to recover the `prs_since_last_audit` counter from a previous session. If the file does not exist or the field is missing, initialize the counter to 0.
 
+### 5. Initialize context rotation counter
+
+Initialize `loop_iterations` to 0. This counter tracks how many main loop iterations have elapsed in this session. It is used to trigger a graceful exit before the context window fills up and causes compaction-related forgetfulness (see "Context-Aware Rotation" below).
+
+Also read `session_number` from `tmp/orchestrator_status.json` (default to 0 if missing). Increment it by 1 and persist it back — this tracks how many times the orchestrator has been restarted by the outer `while :; do` loop. The first invocation is session 1.
+
 ---
 
 ## Main Loop
@@ -81,7 +87,8 @@ The orchestrator runs a continuous loop:
 6. **Fill agent slots** — launch `/task` agents for the next highest-priority issues
 7. **Process completions** — handle agent completion/failure notifications
 8. **Triage** — close done issues, file new issues for discovered problems
-9. **Repeat** until shutdown
+9. **Check context rotation** — increment `loop_iterations` and check if it is time to wind down (see "Context-Aware Rotation" below)
+10. **Repeat** until shutdown
 
 ### Slot management
 
@@ -140,6 +147,61 @@ scripts/tg-notify.py task_failed <issue_number> "<error_summary>" <worker_number
 ```
 
 Both commands update the status file automatically. Always send a notification immediately when an agent completes or fails — do not batch them.
+
+---
+
+## Context-Aware Rotation
+
+**Problem:** The orchestrator runs in an outer `while :; do claude /orchestrator; done` loop. Over time, the conversation context fills up. When context compaction occurs, the LLM loses track of in-memory state (active workers, what it was doing, pending decisions), causing the orchestrator to become "forgetful" and unreliable.
+
+**Solution:** The orchestrator proactively exits before context gets too large, allowing the outer loop to restart it with a fresh context. All state is persisted to files, so the new session picks up seamlessly.
+
+### When to rotate
+
+At main loop step 9, increment `loop_iterations`. If **all** of these conditions are true, begin graceful wind-down:
+
+1. `loop_iterations >= 40` — enough iterations have elapsed that context is likely getting large
+2. No agents are in the middle of spawning (all slots are either occupied by running agents or empty)
+
+The threshold of 40 iterations is conservative — each iteration adds tool calls, command outputs, and notification messages to the context. At typical orchestrator verbosity, 40 iterations approaches the context window limit. If you observe compaction happening earlier, reduce this threshold.
+
+**During the wind-down phase (after the threshold is hit):**
+
+1. **Stop launching new agents.** Set an internal `winding_down` flag. Do not fill empty slots.
+2. **Continue processing completions.** Handle `<task-notification>` messages, merge green PRs, send Telegram notifications — all as normal.
+3. **Continue processing Telegram commands.** Respond to `status`, `pause`, `resume`, `stop` commands as normal. For `start #N` commands, acknowledge receipt but note the orchestrator is about to restart and will pick it up in the next session.
+4. **Wait for all active agents to complete.** Check active agent count each iteration. Once all agents have finished (or reported back), proceed to exit.
+5. **Merge any remaining green PRs.** Do one final sweep.
+6. **Persist all state.** Ensure `tmp/orchestrator_status.json` and `tmp/orchestrator_state.json` are up to date with: `prs_since_last_audit`, `session_number`, paused state, stopped issues, and recently completed tasks.
+7. **Send a rotation notification:**
+   ```
+   scripts/tg-notify.py notify "Orchestrator rotating context (session N, M iterations). Restarting momentarily."
+   ```
+8. **Do NOT stop the responder daemon.** The outer loop will restart the orchestrator immediately, and the responder should keep running to avoid missing Telegram messages.
+9. **Do NOT send `session_ended`.** This is a rotation, not a shutdown. The next session will continue seamlessly.
+10. **Exit.** Print a summary of what was accomplished in this session, then stop. The outer `while :; do` loop will restart the orchestrator with a fresh context.
+
+### State that persists across rotations
+
+All of this state survives a rotation because it is file-backed:
+
+| State | File | Notes |
+|---|---|---|
+| Paused flag | `tmp/orchestrator_state.json` | New session reads on startup |
+| Active workers | `tmp/orchestrator_state.json` | New session discovers running agents via worktree list + status files |
+| PRs since last audit | `tmp/orchestrator_status.json` | Counter continues from where it left off |
+| Session number | `tmp/orchestrator_status.json` | Incremented on each startup |
+| Stopped issues | `tmp/stop_requests.json` | Persists across sessions |
+| Responder daemon | PID file in `tmp/` | Keeps running across rotations |
+| Telegram inbox | `tmp/tg_inbox.json` | New session picks up unprocessed commands |
+
+### State that does NOT persist (and that's OK)
+
+| State | Why it's OK |
+|---|---|
+| `loop_iterations` counter | Resets to 0 — that's the point of rotation |
+| In-memory `_recently_completed` list | Status file has a snapshot; startup step 3 re-scans open PRs for current state |
+| Pending reply tracking | Responder daemon handles timeouts independently |
 
 ---
 
@@ -438,6 +500,7 @@ Send a notification for **every** lifecycle event:
 - [ ] **Terraform apply succeeded/failed** — after applying dev terraform for infra PRs
 - [ ] **Blocker encountered** — when an issue needs human decision
 - [ ] **Audit triggered** — when `/audit` is spawned (include PR count since last audit)
+- [ ] **Context rotation** — when winding down for a context rotation (include session number and iteration count)
 - [ ] **Session ended** — at orchestrator shutdown
 
 ### Inbound commands
@@ -474,7 +537,7 @@ The responder daemon communicates via shared state files (see CLAUDE.md "Respond
 
 **The orchestrator MUST update `tmp/orchestrator_status.json` after every state change.** The `scripts/tg-notify.py` script does this automatically for lifecycle events (`task_started`, `task_completed`, `task_failed`, `pr_merged`). For other state changes (pause, resume, slot changes), call `bridge.write_status()` directly or use `scripts/tg-notify.py notify` to trigger a status file update.
 
-The `tmp/orchestrator_status.json` file includes the `prs_since_last_audit` counter alongside the existing fields (`active_agents`, `open_prs`, `recently_completed`, `queue`, `paused`, `stopped_issues`, `updated_at`).
+The `tmp/orchestrator_status.json` file includes the `prs_since_last_audit` counter and `session_number` alongside the existing fields (`active_agents`, `open_prs`, `recently_completed`, `queue`, `paused`, `stopped_issues`, `updated_at`).
 
 ---
 
@@ -483,8 +546,10 @@ The `tmp/orchestrator_status.json` file includes the `prs_since_last_audit` coun
 Shutdown triggers:
 - User types `/stop` or asks to stop
 - All issues in the queue are complete and no agents are running
+- **Context rotation threshold reached** (see "Context-Aware Rotation" above) — this is a **rotation**, not a full shutdown
 
-Shutdown procedure:
+### Full shutdown procedure (user-initiated or queue empty)
+
 1. Stop launching new agents
 2. Wait for all active agents to complete (do not kill them)
 3. Merge any remaining green PRs
@@ -498,6 +563,14 @@ Shutdown procedure:
    - PRs merged
    - Issues filed
    - Blockers remaining
+
+### Context rotation procedure (automatic)
+
+See "Context-Aware Rotation" above for the detailed wind-down steps. Key differences from full shutdown:
+- **Do NOT stop the responder daemon** — it keeps running for the next session
+- **Do NOT send `session_ended`** — this is a rotation, not an end
+- **DO send a rotation notification** via `scripts/tg-notify.py notify`
+- **DO persist all state** to `tmp/` files so the next session picks up seamlessly
 
 ---
 
