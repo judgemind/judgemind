@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# venv: scraper-framework
 """Audit field completeness across all counties.
 
 Queries the database and produces a per-county report showing what
@@ -19,13 +20,7 @@ Options:
 
 Exit code: 0 if all fields are 100%, 1 otherwise.
 """
-
 from __future__ import annotations
-
-# Ensure we are running inside the scraper-framework venv (re-execs if not).
-from _venv_helper import ensure_venv
-
-ensure_venv("scraper-framework")
 
 import argparse
 import json as json_mod

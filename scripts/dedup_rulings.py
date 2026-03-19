@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# venv: scraper-framework
 """Deduplicate ruling rows that were created by non-idempotent scraper runs.
 
 Prior to the deterministic document_id fix (#302), each scraper run generated
@@ -27,11 +28,6 @@ Options:
 """
 
 from __future__ import annotations
-
-# Ensure we are running inside the scraper-framework venv (re-execs if not).
-from _venv_helper import ensure_venv
-
-ensure_venv("scraper-framework")
 
 import argparse
 import logging

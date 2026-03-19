@@ -205,16 +205,19 @@ For detailed infrastructure reference (Vercel, Terraform state, ECS, secrets), s
 
 ### Python scripts (`scripts/*.py`)
 
-Scripts in `scripts/` that import non-stdlib modules must use `_venv_helper`:
+Scripts in `scripts/` that import non-stdlib modules must declare their venv with a `# venv:` header comment in the first 10 lines:
 
 ```python
-from _venv_helper import ensure_venv
-ensure_venv("scraper-framework")  # or "telegram-bridge", etc.
+#!/usr/bin/env python3
+"""Script docstring."""
+# venv: scraper-framework
+from __future__ import annotations
 ```
 
-- Set `_VENV_HELPER_SKIP=1` in tests or containers where deps are already available.
+Run scripts via `scripts/run-py.sh scripts/<name>.py` — it reads the header and activates the correct venv automatically.
+
 - Eval scripts (`scripts/eval/`) are excluded from this convention.
-- **ECS oneshot constraint:** Scripts run via `ecs-run-task.sh` are uploaded as single files — they **cannot import other `.py` files from `scripts/`**. Only stdlib, installed packages, and `_venv_helper` (stubbed in-container) are available. If you need shared code, either inline it, use a lazy import inside a function (for optional features), or move the shared code into an installed package. CI enforces this via `scripts/check-oneshot-imports.sh`. Scripts that are never run as ECS oneshots can be added to the `LOCAL_ONLY` list in that script.
+- **ECS oneshot constraint:** Scripts run via `ecs-run-task.sh` are uploaded as single files — they **cannot import other `.py` files from `scripts/`**. Only stdlib and installed packages are available. If you need shared code, either inline it, use a lazy import inside a function (for optional features), or move the shared code into an installed package. CI enforces this via `scripts/check-oneshot-imports.sh`. Scripts that are never run as ECS oneshots can be added to the `LOCAL_ONLY` list in that script.
 
 ### TypeScript (API, frontend)
 

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# venv: scraper-framework
 """Backfill motion_type for LA County rulings that have NULL motion_type.
 
 After the pattern fixes in #421 (new patterns and bug fixes for curly
@@ -24,11 +25,6 @@ Options:
 """
 
 from __future__ import annotations
-
-# Ensure we are running inside the scraper-framework venv (re-execs if not).
-from _venv_helper import ensure_venv
-
-ensure_venv("scraper-framework")
 
 import argparse
 import logging

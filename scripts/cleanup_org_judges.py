@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# venv: scraper-framework
 """Clean up judge records that are actually organization/party names.
 
 PR #333 fixed `extract_judge_name()` to reject organization/party names going
@@ -34,11 +35,6 @@ organization names have already been cleaned up.
 """
 
 from __future__ import annotations
-
-# Ensure we are running inside the scraper-framework venv (re-execs if not).
-from _venv_helper import ensure_venv
-
-ensure_venv("scraper-framework")
 
 import argparse
 import logging

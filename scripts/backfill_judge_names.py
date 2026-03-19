@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# venv: scraper-framework
 """Backfill truncated judge canonical_name values.
 
 Some judge names were truncated during ingestion (e.g. "James I. Montgomer"
@@ -27,11 +28,6 @@ Options:
 """
 
 from __future__ import annotations
-
-# Ensure we are running inside the scraper-framework venv (re-execs if not).
-from _venv_helper import ensure_venv
-
-ensure_venv("scraper-framework")
 
 import argparse
 import logging

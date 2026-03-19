@@ -10,9 +10,6 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-# Skip _venv_helper re-exec in test environment
-os.environ["_VENV_HELPER_SKIP"] = "1"
-
 # Add scripts directory to path so we can import the module
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 

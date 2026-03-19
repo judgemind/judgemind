@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# venv: telegram-bridge
 """Tier 2: Full end-to-end Telegram pipeline smoke test.
 
 Sends a synthetic Telegram webhook payload to the Lambda endpoint, then polls
@@ -25,17 +26,13 @@ Usage:
 
 from __future__ import annotations
 
-from _venv_helper import ensure_venv
-
-ensure_venv("telegram-bridge")
-
-import argparse  # noqa: E402
-import json  # noqa: E402
-import logging  # noqa: E402
-import os  # noqa: E402
-import re  # noqa: E402
-import sys  # noqa: E402
-import time  # noqa: E402
+import argparse
+import json
+import logging
+import os
+import re
+import sys
+import time
 from typing import Any  # noqa: E402
 
 import httpx  # noqa: E402

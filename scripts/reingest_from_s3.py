@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# venv: scraper-framework
 """Re-ingest existing documents from S3 through the (now-idempotent) pipeline.
 
 For each document in the database, fetches the raw content from S3, re-runs
@@ -35,11 +36,6 @@ Options:
 """
 
 from __future__ import annotations
-
-# Ensure we are running inside the scraper-framework venv (re-execs if not).
-from _venv_helper import ensure_venv
-
-ensure_venv("scraper-framework")
 
 import argparse
 import hashlib

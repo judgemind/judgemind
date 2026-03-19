@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# venv: scraper-framework
 """Backfill case_title on existing cases from ruling_text.
 
 Connects to the database using the DATABASE_URL environment variable
@@ -22,11 +23,6 @@ Options:
 """
 
 from __future__ import annotations
-
-# Ensure we are running inside the scraper-framework venv (re-execs if not).
-from _venv_helper import ensure_venv
-
-ensure_venv("scraper-framework")
 
 import argparse
 import logging
