@@ -14,6 +14,7 @@ import {
   RULING_TEXT_TRUNCATE_LENGTH,
   truncateText,
 } from '../../../lib/display-helpers';
+import { sanitizeRulingHtml } from '../../rulings/[id]/RulingDetail';
 
 const CASE_QUERY = gql`
   query CaseDetail($id: ID!) {
@@ -59,6 +60,7 @@ const CASE_RULINGS_QUERY = gql`
             canonicalName
           }
           rulingText
+          rulingTextHtml
           documentId
           documentFormat
         }
@@ -108,6 +110,7 @@ interface RulingNode {
     canonicalName: string;
   } | null;
   rulingText: string | null;
+  rulingTextHtml: string | null;
   documentId: string | null;
   documentFormat: string | null;
 }
@@ -417,6 +420,7 @@ export function CaseDetail({ caseId }: { caseId: string }) {
           {/* Rows */}
           {edges.map(({ node }) => {
             const isExpanded = expandedRulings.has(node.id);
+            const hasText = !!(node.rulingTextHtml || node.rulingText);
             const isLong =
               !!node.rulingText &&
               node.rulingText.length > RULING_TEXT_TRUNCATE_LENGTH;
@@ -473,22 +477,33 @@ export function CaseDetail({ caseId }: { caseId: string }) {
                   </span>
                 </div>
 
-                {/* Ruling text */}
-                {node.rulingText && (
+                {/* Ruling text — prefer formatted HTML, fall back to plain text */}
+                {hasText && (
                   <div className="px-4 pb-3">
-                    <div className="space-y-3">
-                      {(() => {
-                        const displayText = isLong && !isExpanded
-                          ? truncateText(node.rulingText, RULING_TEXT_TRUNCATE_LENGTH)
-                          : node.rulingText;
-                        const paragraphs = cleanRulingText(displayText);
-                        return paragraphs.map((paragraph, idx) => (
-                          <p key={idx} className="text-sm leading-relaxed text-slate-700 dark:text-slate-300">
-                            {paragraph}
-                          </p>
-                        ));
-                      })()}
-                    </div>
+                    {node.rulingTextHtml && (!isLong || isExpanded) ? (
+                      <div
+                        className="ruling-content text-sm leading-relaxed text-slate-700 dark:text-slate-300"
+                        dangerouslySetInnerHTML={{
+                          __html: sanitizeRulingHtml(node.rulingTextHtml),
+                        }}
+                      />
+                    ) : (
+                      node.rulingText && (
+                        <div className="space-y-3">
+                          {(() => {
+                            const displayText = isLong && !isExpanded
+                              ? truncateText(node.rulingText, RULING_TEXT_TRUNCATE_LENGTH)
+                              : node.rulingText;
+                            const paragraphs = cleanRulingText(displayText);
+                            return paragraphs.map((paragraph, idx) => (
+                              <p key={idx} className="text-sm leading-relaxed text-slate-700 dark:text-slate-300">
+                                {paragraph}
+                              </p>
+                            ));
+                          })()}
+                        </div>
+                      )
+                    )}
                     <div className="mt-1 flex items-center gap-3">
                       {isLong && (
                         <button
@@ -518,7 +533,7 @@ export function CaseDetail({ caseId }: { caseId: string }) {
                 )}
 
                 {/* Download button when there is no ruling text but document exists */}
-                {!node.rulingText && node.documentId && (
+                {!hasText && node.documentId && (
                   <div className="px-4 pb-3">
                     <a
                       href={buildDownloadUrl(node.documentId)}
