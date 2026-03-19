@@ -35,6 +35,11 @@ Exit codes:
 
 from __future__ import annotations
 
+# Ensure we are running inside the scraper-framework venv (re-execs if not).
+from _venv_helper import ensure_venv
+
+ensure_venv("scraper-framework")
+
 import os
 import sys
 from pathlib import Path
