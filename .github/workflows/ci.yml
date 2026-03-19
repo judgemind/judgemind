@@ -27,6 +27,7 @@ jobs:
       telegram: ${{ steps.changes.outputs.telegram }}
       infra-lambda: ${{ steps.changes.outputs.infra-lambda }}
       scripts: ${{ steps.changes.outputs.scripts }}
+      migrations: ${{ steps.changes.outputs.migrations }}
       any-testable: ${{ steps.any-testable.outputs.result }}
     steps:
       - uses: actions/checkout@v4
@@ -50,6 +51,8 @@ jobs:
               - 'infra/telegram-bot/**'
             scripts:
               - 'scripts/**'
+            migrations:
+              - 'packages/api/migrations/**'
       - name: Check if any coverage-producing package changed
         id: any-testable
         run: |
@@ -680,6 +683,41 @@ jobs:
       - uses: actions/checkout@v4
       - name: Check for sibling imports in oneshot scripts
         run: scripts/check-oneshot-imports.sh
+
+  # ---------------------------------------------------------------
+  # Migration notice: comment on PRs that include migration changes
+  # ---------------------------------------------------------------
+  migration-notice:
+    needs: detect-changes
+    if: github.event_name == 'pull_request' && needs.detect-changes.outputs.migrations == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    steps:
+      - name: Post migration notice
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          # Check if we already posted a migration notice on this PR
+          EXISTING=$(curl -s \
+            -H "Authorization: token $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/issues/${PR_NUMBER}/comments" \
+            | jq '[.[] | select(.body | contains("database migration"))] | length')
+
+          if [ "$EXISTING" -gt 0 ]; then
+            echo "Migration notice already posted on this PR."
+            exit 0
+          fi
+
+          curl -s -X POST \
+            -H "Authorization: token $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/issues/${PR_NUMBER}/comments" \
+            -d '{
+              "body": "**Note:** This PR includes database migration changes. Migrations will be **auto-applied to the dev database** when this PR merges to main. Production migrations remain human-triggered.\n\nPlease ensure the migration is backwards-compatible with the current running code during the rollout window."
+            }'
 
   # Always runs. Reports success only when every applicable job passed or was
   # skipped (path filter did not match). Branch protection requires this check.

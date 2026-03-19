@@ -323,6 +323,7 @@ Investigation tasks produce documentation, not code:
 
 - Write findings in the issue body or `docs/investigations/`.
 - **Always file follow-up issues** for every actionable finding. Label them `agent/ready` if fully specified. Reference the investigation issue as the parent.
+- After documenting findings and filing follow-ups, close the investigation issue unless human judgment is genuinely needed.
 
 ## Scraper Development Rules
 
