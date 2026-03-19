@@ -87,11 +87,13 @@ import {
   DATA_QUALITY_OVERVIEW_QUERY,
   DATA_QUALITY_METRICS_QUERY,
 } from '@/lib/data-quality-queries';
+import { REFRESH_TOKEN_MUTATION } from '@/lib/auth-mutations';
 import {
   setAccessToken,
   clearAccessToken,
   getAccessToken,
 } from '@/lib/auth-tokens';
+import { _resetInflightRefresh } from '@/providers/AuthProvider';
 
 // ---------------------------------------------------------------------------
 // Test data
@@ -165,6 +167,13 @@ function logoutMutationMock(): MockedResponse {
   };
 }
 
+function refreshTokenFailMock(): MockedResponse {
+  return {
+    request: { query: REFRESH_TOKEN_MUTATION },
+    error: new Error('No refresh token'),
+  };
+}
+
 function dataQualityOverviewMock(): MockedResponse {
   return {
     request: { query: DATA_QUALITY_OVERVIEW_QUERY },
@@ -225,6 +234,7 @@ describe('Auth lifecycle integration', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     clearAccessToken();
+    _resetInflightRefresh();
   });
 
   // -------------------------------------------------------------------------
@@ -233,7 +243,7 @@ describe('Auth lifecycle integration', () => {
   describe('Login flow', () => {
     it('login stores access token and reflects user in AuthProvider', async () => {
       const mocks = [
-        meQueryMock(null), // Initial load — not logged in
+        refreshTokenFailMock(), // No existing session
         loginMutationMock('test@example.com', 'password123', {
           accessToken: 'jwt-login-token',
           user: testUser,
@@ -273,7 +283,7 @@ describe('Auth lifecycle integration', () => {
 
     it('failed login does not store token or set user', async () => {
       const mocks: MockedResponse[] = [
-        meQueryMock(null),
+        refreshTokenFailMock(),
         {
           request: {
             query: LOGIN_MUTATION,
@@ -351,6 +361,7 @@ describe('Auth lifecycle integration', () => {
   // -------------------------------------------------------------------------
   describe('AuthProvider initial load', () => {
     it('reflects authenticated user from ME_QUERY', async () => {
+      setAccessToken('existing-token');
       const mocks = [meQueryMock(testUser)];
 
       function UserDisplay() {
@@ -369,7 +380,7 @@ describe('Auth lifecycle integration', () => {
     });
 
     it('shows unauthenticated state when ME_QUERY returns null', async () => {
-      const mocks = [meQueryMock(null)];
+      const mocks = [refreshTokenFailMock()];
 
       renderWithProviders(<Header />, mocks);
 
@@ -395,7 +406,7 @@ describe('Auth lifecycle integration', () => {
       };
 
       const mocks = [
-        meQueryMock(null),
+        refreshTokenFailMock(),
         registerMutationMock('new@example.com', 'securepass123', {
           accessToken: 'jwt-register-token',
           user: newUser,
@@ -441,6 +452,7 @@ describe('Auth lifecycle integration', () => {
   // -------------------------------------------------------------------------
   describe('Auth-gated pages', () => {
     it('DataQualityDashboard shows "Access Denied" for non-admin users', async () => {
+      setAccessToken('test-token');
       const mocks = [meQueryMock(testUser)]; // testUser has role: 'user'
 
       renderWithProviders(<DataQualityDashboard />, mocks);
@@ -454,7 +466,7 @@ describe('Auth lifecycle integration', () => {
     });
 
     it('DataQualityDashboard shows "Access Denied" for unauthenticated users', async () => {
-      const mocks = [meQueryMock(null)];
+      const mocks = [refreshTokenFailMock()];
 
       renderWithProviders(<DataQualityDashboard />, mocks);
 
@@ -464,6 +476,7 @@ describe('Auth lifecycle integration', () => {
     });
 
     it('DataQualityDashboard renders content for admin users', async () => {
+      setAccessToken('admin-token');
       const mocks = [
         meQueryMock(adminUser),
         dataQualityOverviewMock(),
