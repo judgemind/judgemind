@@ -28,6 +28,10 @@ Common issues found during audits and fixes. Consult this when writing or review
 - **The worker has fallback chains for critical fields.** If the scraper event doesn't include hearing_date, case_number, or case_title, the worker tries `extract_hearing_date()`, `extract_case_number()`, and `extract_case_title()` from ruling text before giving up. This is a safety net, not a substitute for proper scraper extraction.
 - **Party extraction is the hardest field.** Only LA implements it (structured HTML with role labels). PDF-based courts don't have reliable party structure. This remains an open problem.
 
+## Text Comparison
+
+- **Always use `autojunk=False` with `difflib.SequenceMatcher` when comparing legal text.** The default `autojunk=True` marks frequently-repeated characters as "junk" to speed up matching on short strings. Legal documents are highly repetitive (standard phrases like "The motion for summary judgment is GRANTED." appear many times), causing the heuristic to treat common characters as junk. This produces wildly incorrect similarity scores — e.g. 0.19 instead of 0.99 for texts that differ only by whitespace. Discovered during #978 (ruling text formatter validation). Always pass `SequenceMatcher(None, a, b, autojunk=False)`.
+
 ## Testing
 
 - **Every scraper needs regression tests against real fixtures.** Save actual PDFs/HTML to `tests/fixtures/` and test field extraction against them.
