@@ -3,8 +3,8 @@
 #
 # ECS oneshot scripts (run via ecs-run-task.sh) are uploaded as single files
 # to S3.  They cannot import other local .py files from scripts/ because those
-# files are not present in the container.  Only stdlib, installed packages, and
-# _venv_helper (which has a stub created in-container) are available.
+# files are not present in the container.  Only stdlib and installed packages
+# are available.
 #
 # This script scans all Python files in scripts/ and flags any that contain
 # top-level imports of sibling .py modules.  Files listed in the LOCAL_ONLY
@@ -38,14 +38,14 @@ LOCAL_ONLY=(
 )
 
 # ─── Discover sibling module names ─────────────────────────────────────────
-# Every .py file in scripts/ (except __init__.py, _venv_helper.py, and test
-# files) is a potential sibling module that could be mistakenly imported.
+# Every .py file in scripts/ (except __init__.py and test files) is a
+# potential sibling module that could be mistakenly imported.
 
 sibling_modules=()
 for f in "$SCRIPT_DIR"/*.py; do
     basename_f="$(basename "$f")"
     case "$basename_f" in
-        __init__.py|_venv_helper.py)
+        __init__.py)
             continue
             ;;
     esac

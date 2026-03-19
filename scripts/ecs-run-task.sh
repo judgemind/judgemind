@@ -443,17 +443,6 @@ case "$SCRIPT_PATH" in
     *)    INTERPRETER="bash" ;;
 esac
 
-# Create a stub _venv_helper module for Python scripts that import it.
-# In the container, deps are installed system-wide so venv activation is
-# unnecessary, but the import would fail because _venv_helper.py lives in
-# scripts/ which is not present in the container image.  We write a no-op
-# stub to /tmp and prepend PYTHONPATH so the import succeeds harmlessly.
-if [[ "$INTERPRETER" == "python3" ]]; then
-    VENV_HELPER_STUB="printf 'def ensure_venv(*a,**k):pass\n' > /tmp/_venv_helper.py && export PYTHONPATH=/tmp:\${PYTHONPATH:-} && "
-else
-    VENV_HELPER_STUB=""
-fi
-
 # Build script args string
 ARGS_STR=""
 for arg in "${SCRIPT_ARGS[@]+"${SCRIPT_ARGS[@]}"}"; do
@@ -495,14 +484,14 @@ if [[ "$ENCODED_SIZE" -gt 6000 ]]; then
 
     # Use Python's urllib to download — always available in the container
     # image (python:3.12-slim). Avoids "curl: command not found" noise.
-    COMMAND_STR="${VENV_HELPER_STUB}python3 -c \"import urllib.request; urllib.request.urlretrieve('${PRESIGNED_URL}', '/tmp/_oneshot_script')\" && ${INTERPRETER} /tmp/_oneshot_script${ARGS_STR}"
+    COMMAND_STR="python3 -c \"import urllib.request; urllib.request.urlretrieve('${PRESIGNED_URL}', '/tmp/_oneshot_script')\" && ${INTERPRETER} /tmp/_oneshot_script${ARGS_STR}"
 else
     # Strip newlines from base64 output: Linux base64 wraps at 76 chars by
     # default, and the newlines break the ECS command override when bash -c
     # interprets them as separate commands.  macOS base64 does not wrap, but
     # tr -d '\n' is harmless there.
     ENCODED=$(base64 < "$SCRIPT_PATH" | tr -d '\n')
-    COMMAND_STR="${VENV_HELPER_STUB}echo ${ENCODED} | base64 -d > /tmp/_oneshot_script && ${INTERPRETER} /tmp/_oneshot_script${ARGS_STR}"
+    COMMAND_STR="echo ${ENCODED} | base64 -d > /tmp/_oneshot_script && ${INTERPRETER} /tmp/_oneshot_script${ARGS_STR}"
 fi
 
 echo "Script: ${SCRIPT_PATH} (${SCRIPT_SIZE} bytes)" >&2

@@ -3,7 +3,7 @@
 #
 # Builds a container image that simulates the ECS oneshot environment,
 # then runs test scripts inside it using the same delivery mechanism
-# as ecs-run-task.sh (base64 inline or direct copy, _venv_helper stub).
+# as ecs-run-task.sh (base64 inline or direct copy).
 #
 # Usage:
 #   .github/ecs-oneshot-test/run-tests.sh
@@ -36,11 +36,9 @@ echo ""
 # ─── Helper: run a script inside the container ──────────────────────────────
 #
 # Simulates the ecs-run-task.sh delivery mechanism:
-#   1. Create _venv_helper stub at /tmp/_venv_helper.py
-#   2. Set PYTHONPATH=/tmp so the stub is importable
-#   3. Base64-encode the script, decode inside the container, and run it
+#   1. Base64-encode the script, decode inside the container, and run it
 #
-# This matches the exact logic in ecs-run-task.sh lines 439-490.
+# This matches the delivery logic in ecs-run-task.sh.
 
 run_test() {
     local test_name="$1"
@@ -63,7 +61,7 @@ run_test() {
         args_str="${args_str} '${escaped}'"
     done
 
-    local cmd_str="printf 'def ensure_venv(*a,**k):pass\n' > /tmp/_venv_helper.py && export PYTHONPATH=/tmp:\${PYTHONPATH:-} && echo ${encoded} | base64 -d > /tmp/_oneshot_script && python3 /tmp/_oneshot_script${args_str}"
+    local cmd_str="echo ${encoded} | base64 -d > /tmp/_oneshot_script && python3 /tmp/_oneshot_script${args_str}"
 
     if docker run --rm "$IMAGE_NAME" "$cmd_str" 2>&1; then
         echo "PASS"
@@ -83,9 +81,6 @@ echo ""
 
 run_test "import common dependencies" \
     "$TEST_SCRIPTS_DIR/test_imports.py"
-
-run_test "_venv_helper stub compatibility" \
-    "$TEST_SCRIPTS_DIR/test_venv_helper_stub.py"
 
 run_test "framework internal imports" \
     "$TEST_SCRIPTS_DIR/test_framework_imports.py"

@@ -1,8 +1,9 @@
 # Shared dependencies for standalone scripts in scripts/.
 #
 # These packages are needed by scripts that run outside a package venv
-# (e.g. eval scripts). Most scripts (including gemini_review.py) now use
-# _venv_helper to run inside the scraper-framework venv automatically.
+# (e.g. eval scripts, gemini review). Most scripts declare a `# venv:`
+# header and are run via `scripts/run-py.sh` which activates the correct
+# venv automatically.
 #
 # Install into the active venv or system Python:
 #   pip install -r scripts/requirements.txt
