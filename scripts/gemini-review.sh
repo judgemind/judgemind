@@ -79,9 +79,60 @@ for f in $all_files; do
     fi
 done
 
-# Run the review with the Google API key injected from Secrets Manager
+# Ensure a Python environment with google-genai is available.
+#
 # The Python script uses _venv_helper to re-launch itself inside the
-# scraper-framework venv, so we just need any python3 to start it.
+# scraper-framework venv.  But for non-scraper tasks (API, frontend, infra),
+# that venv may not exist.  In that case, create a lightweight .venv-scripts
+# venv with just the script dependencies and tell _venv_helper to skip its
+# venv check so the Python script runs directly in the scripts venv.
+SCRAPER_VENV="${WORKTREE}/packages/scraper-framework/.venv/bin/python3"
+PYTHON="python3"
+
+if [[ -x "$SCRAPER_VENV" ]]; then
+    # Scraper-framework venv exists — _venv_helper will handle re-launch
+    :
+else
+    # No scraper-framework venv — create/reuse a lightweight scripts venv
+    SCRIPTS_VENV="${WORKTREE}/.venv-scripts"
+    if [[ ! -d "$SCRIPTS_VENV" ]]; then
+        echo "INFO: Creating scripts venv at ${SCRIPTS_VENV}..." >&2
+        BASE_PYTHON=""
+        for candidate in python3.12 python3.11 python3; do
+            if command -v "$candidate" &>/dev/null; then
+                BASE_PYTHON="$candidate"
+                break
+            fi
+        done
+        BASE_PYTHON="${BASE_PYTHON:-python3}"
+
+        "$BASE_PYTHON" -m venv "$SCRIPTS_VENV" 2>/dev/null || {
+            echo "WARNING: Could not create scripts venv. Skipping Gemini review." >&2
+            echo "SKIPPED" > "${STATE_DIR}/gemini-review-result.txt"
+            echo "Gemini review skipped: could not create scripts venv." > "${STATE_DIR}/gemini-feedback.md"
+            exit 2
+        }
+    fi
+
+    PYTHON="${SCRIPTS_VENV}/bin/python3"
+
+    # Install dependencies if google-genai is not yet available
+    if ! "$PYTHON" -c "from google import genai" 2>/dev/null; then
+        echo "INFO: Installing script dependencies into ${SCRIPTS_VENV}..." >&2
+        "$PYTHON" -m pip install -r "${SCRIPT_DIR}/requirements.txt" --quiet 2>/dev/null || {
+            echo "WARNING: Could not install script dependencies. Skipping Gemini review." >&2
+            echo "SKIPPED" > "${STATE_DIR}/gemini-review-result.txt"
+            echo "Gemini review skipped: google-genai package not available." > "${STATE_DIR}/gemini-feedback.md"
+            exit 2
+        }
+    fi
+
+    # Tell _venv_helper to skip the scraper-framework venv check since
+    # we are running in the scripts venv which has all needed deps.
+    export _VENV_HELPER_SKIP=1
+fi
+
+# Run the review with the Google API key injected from Secrets Manager
 export RALPH_STATE_DIR="$STATE_DIR"
 
 if [[ "$ADVERSARIAL" == "true" ]]; then
@@ -94,7 +145,7 @@ fi
 
 "${SCRIPT_DIR}/with-secret.sh" \
     -e GOOGLE_API_KEY=judgemind/google/api-key \
-    -- python3 "${SCRIPT_DIR}/gemini_review.py"
+    -- "$PYTHON" "${SCRIPT_DIR}/gemini_review.py"
 
 exit_code=$?
 
