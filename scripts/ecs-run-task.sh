@@ -497,7 +497,11 @@ if [[ "$ENCODED_SIZE" -gt 6000 ]]; then
     # image (python:3.12-slim). Avoids "curl: command not found" noise.
     COMMAND_STR="${VENV_HELPER_STUB}python3 -c \"import urllib.request; urllib.request.urlretrieve('${PRESIGNED_URL}', '/tmp/_oneshot_script')\" && ${INTERPRETER} /tmp/_oneshot_script${ARGS_STR}"
 else
-    ENCODED=$(base64 < "$SCRIPT_PATH")
+    # Strip newlines from base64 output: Linux base64 wraps at 76 chars by
+    # default, and the newlines break the ECS command override when bash -c
+    # interprets them as separate commands.  macOS base64 does not wrap, but
+    # tr -d '\n' is harmless there.
+    ENCODED=$(base64 < "$SCRIPT_PATH" | tr -d '\n')
     COMMAND_STR="${VENV_HELPER_STUB}echo ${ENCODED} | base64 -d > /tmp/_oneshot_script && ${INTERPRETER} /tmp/_oneshot_script${ARGS_STR}"
 fi
 
