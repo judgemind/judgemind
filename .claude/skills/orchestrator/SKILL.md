@@ -273,6 +273,60 @@ The file is atomically read and truncated by `read_orchestrator_inbox()`, just l
 
 ---
 
+## Orchestrator-to-Subagent Message Channel
+
+The orchestrator can send messages to running subagents via their worktree inbox. This is the reverse of the Subagent Instruction Channel above — it allows the orchestrator to push context to running agents without interrupting them.
+
+### How the orchestrator sends messages
+
+Use `scripts/orchestrator-send.py` to write messages to a subagent's worktree inbox:
+
+```
+scripts/orchestrator-send.py --worktree /path/to/worktree "Rebase onto latest main, PR #100 touched your files"
+scripts/orchestrator-send.py --worktree /path/to/worktree "Issue #42 was deprioritized, finish current work but skip stretch goals"
+```
+
+The script is stdlib-only (no venv needed) and uses file locking for safe concurrent access. Messages are written to `{worktree}/tmp/inbox.json`.
+
+### How subagents receive messages
+
+A PostToolUse hook (`check-inbox.sh`) runs after every tool call in the subagent. When messages are present, it echoes them to stdout prefixed with `[orchestrator]`, then truncates the inbox file. The agent sees messages naturally as part of hook output — no special handling needed.
+
+The hook is designed for minimal overhead:
+- Checks file existence and size in pure bash (fast path: <1ms when no messages)
+- Only invokes Python for JSON parsing when the file has content
+- Uses file locking to avoid races with the orchestrator writing concurrently
+
+### When to send messages
+
+Send a message to a running subagent when:
+- A PR just merged that touches the same files the agent is modifying (suggest a rebase)
+- A user sends a Telegram command relevant to a running agent's work
+- An issue's priority or scope changes while an agent is working on it
+- The orchestrator is winding down for context rotation and wants agents to wrap up
+- A dependency was unblocked or a new constraint was discovered that affects the agent's task
+
+### Message format
+
+`{worktree}/tmp/inbox.json` is a JSON array of message objects:
+
+```json
+[
+  {"timestamp": "2026-03-19T12:00:00+00:00", "message": "Issue #42 was deprioritized"},
+  {"timestamp": "2026-03-19T12:01:00+00:00", "message": "PR #100 just merged, you may need to rebase"}
+]
+```
+
+### Design constraints
+
+- **One-way only.** The agent does not reply through this channel — it already has `orchestrator-request.py` for orchestrator-bound communication.
+- **No guaranteed delivery.** If the agent finishes before checking, the message is lost (and that is fine).
+- **No interruption.** The agent sees the message at its next tool call, not immediately.
+- **Zero overhead when empty.** The hook exits in <1ms when no messages are pending.
+
+
+---
+
 ## PR Merge Policy
 
 The orchestrator proactively merges PRs when all conditions are met:
