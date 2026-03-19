@@ -83,9 +83,9 @@ def _append_to_inbox(entry: dict[str, object], inbox_file: str) -> None:
 
             existing.append(entry)
             f.seek(0)
-            f.truncate()
             json.dump(existing, f, indent=2, default=str)
             f.write("\n")
+            f.truncate()
     except Exception as exc:
         print(f"ERROR: Failed to write inbox file: {exc}", file=sys.stderr)
         sys.exit(1)
