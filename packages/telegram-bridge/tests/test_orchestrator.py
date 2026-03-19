@@ -1328,6 +1328,43 @@ class TestWriteStatus:
             orch2 = OrchestratorBridge(bridge=bridge, state_file=state_file)
             assert orch2.prs_since_last_audit == 12
 
+    def test_session_number_persisted_across_sessions(self, tmp_path: Path) -> None:
+        """session_number is saved to and loaded from the state file."""
+        with mock_aws():
+            state_file = str(tmp_path / "state.json")
+            bridge = _make_bridge()
+
+            # Save state with session_number at 3
+            orch1 = OrchestratorBridge(bridge=bridge, state_file=state_file)
+            orch1.session_number = 3
+            orch1._save_state()
+
+            # Load into a new bridge — should pick up session_number
+            orch2 = OrchestratorBridge(bridge=bridge, state_file=state_file)
+            assert orch2.session_number == 3
+
+    def test_session_number_defaults_to_zero(self, tmp_path: Path) -> None:
+        """session_number defaults to 0 when missing from state file."""
+        with mock_aws():
+            state_file = tmp_path / "state.json"
+            state_file.write_text(json.dumps({"paused": False, "workers": {}}))
+
+            bridge = _make_bridge()
+            orch = OrchestratorBridge(bridge=bridge, state_file=str(state_file))
+            assert orch.session_number == 0
+
+    def test_write_status_includes_session_number(self, tmp_path: Path) -> None:
+        """write_status() includes the session_number field."""
+        with mock_aws():
+            status_file = str(tmp_path / "status.json")
+            bridge = _make_bridge()
+            orch = OrchestratorBridge(bridge=bridge, status_file=status_file)
+            orch.session_number = 5
+            orch.write_status()
+
+            data = json.loads(Path(status_file).read_text())
+            assert data["session_number"] == 5
+
 
 # ── _parse_inbox_entry() ──────────────────────────────────────────────────
 
