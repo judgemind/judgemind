@@ -27,6 +27,7 @@ jobs:
       telegram: ${{ steps.changes.outputs.telegram }}
       infra-lambda: ${{ steps.changes.outputs.infra-lambda }}
       scripts: ${{ steps.changes.outputs.scripts }}
+      ecs-oneshot: ${{ steps.changes.outputs.ecs-oneshot }}
       migrations: ${{ steps.changes.outputs.migrations }}
       any-testable: ${{ steps.any-testable.outputs.result }}
     steps:
@@ -51,6 +52,12 @@ jobs:
               - 'infra/telegram-bot/**'
             scripts:
               - 'scripts/**'
+            ecs-oneshot:
+              - 'scripts/*.py'
+              - 'scripts/ecs-run-task.sh'
+              - 'packages/scraper-framework/Dockerfile'
+              - 'packages/scraper-framework/pyproject.toml'
+              - '.github/ecs-oneshot-test/**'
             migrations:
               - 'packages/api/migrations/**'
       - name: Check if any coverage-producing package changed
@@ -685,6 +692,18 @@ jobs:
         run: scripts/check-oneshot-imports.sh
 
   # ---------------------------------------------------------------
+  # ECS oneshot Docker integration test: run scripts in a container
+  # ---------------------------------------------------------------
+  ecs-oneshot-test:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.ecs-oneshot == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run ECS oneshot integration tests
+        run: .github/ecs-oneshot-test/run-tests.sh
+
+  # ---------------------------------------------------------------
   # Migration notice: comment on PRs that include migration changes
   # ---------------------------------------------------------------
   migration-notice:
@@ -722,7 +741,7 @@ jobs:
   # Always runs. Reports success only when every applicable job passed or was
   # skipped (path filter did not match). Branch protection requires this check.
   ci-passed:
-    needs: [scraper-unit-tests, ingestion-tests, nlp-tests, api-tests, web-tests, telegram-bridge-tests, infra-validate, lambda-tests, scripts-tests, coverage-check, oneshot-imports-check, dq-baselines-validate]
+    needs: [scraper-unit-tests, ingestion-tests, nlp-tests, api-tests, web-tests, telegram-bridge-tests, infra-validate, lambda-tests, scripts-tests, coverage-check, oneshot-imports-check, dq-baselines-validate, ecs-oneshot-test]
     if: always()
     runs-on: ubuntu-latest
     steps:
