@@ -495,6 +495,10 @@ jobs:
         run: pip install pytest boto3
       - name: Test
         run: pytest scripts/tests/ -v --tb=short
+      - name: Check AWS CLI boolean flag usage
+        run: scripts/check-aws-bool-flags.sh
+      - name: Test AWS CLI boolean flag checker
+        run: scripts/tests/test_check_aws_bool_flags.sh
 
   # ---------------------------------------------------------------
   # Coverage gates: diff coverage (new lines) + overall floor ratchet
