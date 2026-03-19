@@ -26,7 +26,7 @@ import redis
 import structlog
 from opensearchpy import OpenSearch
 
-from .worker import IngestionWorker
+from .worker import InfrastructureError, IngestionWorker
 
 # Configure structlog for its own loggers (structlog.get_logger()).
 structlog.configure(
@@ -78,29 +78,40 @@ def main() -> None:
     archive_bucket = _require_env("JUDGEMIND_ARCHIVE_BUCKET")
     max_retries = int(os.environ.get("MAX_RETRIES", "3"))
 
-    redis_client = redis.Redis.from_url(redis_url, decode_responses=False)
-    redis_client.ping()  # Fail fast on bad URL
+    try:
+        redis_client = redis.Redis.from_url(redis_url, decode_responses=False)
+        redis_client.ping()  # Fail fast on bad URL
 
-    os_kwargs: dict = {"hosts": [opensearch_url]}
-    os_user = os.environ.get("OPENSEARCH_USERNAME", "")
-    os_pass = os.environ.get("OPENSEARCH_PASSWORD", "")
-    if os_user and os_pass:
-        os_kwargs["http_auth"] = (os_user, os_pass)
+        os_kwargs: dict = {"hosts": [opensearch_url]}
+        os_user = os.environ.get("OPENSEARCH_USERNAME", "")
+        os_pass = os.environ.get("OPENSEARCH_PASSWORD", "")
+        if os_user and os_pass:
+            os_kwargs["http_auth"] = (os_user, os_pass)
 
-    opensearch_client = OpenSearch(**os_kwargs)
-    s3_client = boto3.client("s3")
+        opensearch_client = OpenSearch(**os_kwargs)
+        s3_client = boto3.client("s3")
 
-    worker = IngestionWorker(
-        redis_client=redis_client,
-        pg_dsn=pg_dsn,
-        opensearch_client=opensearch_client,
-        s3_client=s3_client,
-        archive_bucket=archive_bucket,
-        max_retries=max_retries,
-    )
+        worker = IngestionWorker(
+            redis_client=redis_client,
+            pg_dsn=pg_dsn,
+            opensearch_client=opensearch_client,
+            s3_client=s3_client,
+            archive_bucket=archive_bucket,
+            max_retries=max_retries,
+        )
 
-    logger.info("Starting ingestion worker", archive_bucket=archive_bucket)
-    worker.run()
+        logger.info("Starting ingestion worker", archive_bucket=archive_bucket)
+        worker.run()
+    except InfrastructureError as exc:
+        logger.critical(
+            "Infrastructure error — exiting for restart",
+            error=str(exc),
+            cause=str(exc.__cause__),
+        )
+        sys.exit(1)
+    except Exception as exc:
+        logger.critical("Unhandled exception — exiting", error=str(exc), exc_info=True)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
