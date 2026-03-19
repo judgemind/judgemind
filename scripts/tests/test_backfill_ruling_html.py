@@ -7,10 +7,16 @@ Tests cover:
 - process_batch with concurrency, dry-run, and error recovery
 - run_backfill end-to-end with mocked DB and LLM
 - CLI argument parsing
+
+The script depends on psycopg, anthropic, structlog, and the
+scraper-framework ingestion package, none of which are available in
+the lightweight CI scripts-tests environment.  We mock them in
+sys.modules before importing the script under test.
 """
 
 from __future__ import annotations
 
+import importlib
 import os
 import sys
 from datetime import datetime
@@ -18,23 +24,57 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-# Add scripts directory to path so we can import the module
-sys.path.insert(
-    0, os.path.join(os.path.dirname(__file__), "..", "..", "packages", "scraper-framework", "src")
-)
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+# ---------------------------------------------------------------------------
+# Pre-import mocking — the script imports psycopg, anthropic, structlog,
+# and ingestion.* at module level, which are not installed in the
+# scripts-tests CI environment.  We inject mocks before importing.
+# ---------------------------------------------------------------------------
 
 os.environ["_VENV_HELPER_SKIP"] = "1"
 
-from backfill_ruling_html import (
-    _CURSOR_MIN_TIMESTAMP,
-    _CURSOR_MIN_UUID,
-    count_pending,
-    fetch_batch,
-    format_one_ruling,
-    process_batch,
-    run_backfill,
-)
+# Add scripts directory to path
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
+# Create mock modules for third-party and ingestion dependencies
+_mock_psycopg = MagicMock()
+_mock_anthropic = MagicMock()
+_mock_structlog = MagicMock()
+_mock_structlog.get_logger.return_value = MagicMock()
+
+_mock_ingestion = MagicMock()
+_mock_ingestion_llm_providers = MagicMock()
+_mock_ingestion_ruling_formatter = MagicMock()
+
+_modules_to_mock = {
+    "psycopg": _mock_psycopg,
+    "anthropic": _mock_anthropic,
+    "structlog": _mock_structlog,
+    "ingestion": _mock_ingestion,
+    "ingestion.llm_providers": _mock_ingestion_llm_providers,
+    "ingestion.ruling_formatter": _mock_ingestion_ruling_formatter,
+}
+
+# Inject mocks, remembering any that already exist so we restore them later.
+_saved_modules: dict[str, object] = {}
+for mod_name, mock_mod in _modules_to_mock.items():
+    if mod_name in sys.modules:
+        _saved_modules[mod_name] = sys.modules[mod_name]
+    sys.modules[mod_name] = mock_mod
+
+# Now import the script under test — it will pick up our mocks.
+import backfill_ruling_html  # noqa: E402
+
+# Re-bind the real functions/constants we need from the now-imported module.
+# (The module-level `from ingestion.ruling_formatter import format_ruling_text`
+# bound a mock object.  We replace it with a fresh MagicMock that we can
+# configure per-test via @patch.)
+_CURSOR_MIN_TIMESTAMP = backfill_ruling_html._CURSOR_MIN_TIMESTAMP
+_CURSOR_MIN_UUID = backfill_ruling_html._CURSOR_MIN_UUID
+count_pending = backfill_ruling_html.count_pending
+fetch_batch = backfill_ruling_html.fetch_batch
+format_one_ruling = backfill_ruling_html.format_one_ruling
+process_batch = backfill_ruling_html.process_batch
+run_backfill = backfill_ruling_html.run_backfill
 
 
 # ---------------------------------------------------------------------------
@@ -356,9 +396,8 @@ def test_main_missing_database_url() -> None:
         # Remove DATABASE_URL if present
         os.environ.pop("DATABASE_URL", None)
         os.environ["_VENV_HELPER_SKIP"] = "1"
-        from backfill_ruling_html import main
 
         with pytest.raises(SystemExit) as exc_info:
             with patch("sys.argv", ["backfill_ruling_html.py"]):
-                main()
+                backfill_ruling_html.main()
         assert exc_info.value.code == 1
