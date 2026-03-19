@@ -1,6 +1,6 @@
 import type { FastifyInstance } from 'fastify';
 import type { Pool } from 'pg';
-import { S3Client, GetObjectCommand } from '@aws-sdk/client-s3';
+import { S3Client, GetObjectCommand, HeadObjectCommand, NoSuchKey } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 
 /** Presigned URL TTL in seconds (15 minutes). */
@@ -68,17 +68,40 @@ export function registerDocumentDownload(
 
       const contentType = FORMAT_CONTENT_TYPES[doc.format] ?? 'application/octet-stream';
 
-      const command = new GetObjectCommand({
-        Bucket: doc.s3_bucket,
-        Key: doc.s3_key,
-        ResponseContentType: contentType,
-      });
+      try {
+        // Verify the object exists before generating a presigned URL.
+        // getSignedUrl itself does not contact S3, so it cannot detect missing
+        // objects — a HeadObject call catches that early and lets us return a
+        // meaningful 404 instead of handing the client a URL that will 404 on
+        // S3 with an opaque XML error.
+        await s3.send(new HeadObjectCommand({
+          Bucket: doc.s3_bucket,
+          Key: doc.s3_key,
+        }));
 
-      const presignedUrl = await getSignedUrl(s3, command, {
-        expiresIn: PRESIGNED_URL_TTL,
-      });
+        const command = new GetObjectCommand({
+          Bucket: doc.s3_bucket,
+          Key: doc.s3_key,
+          ResponseContentType: contentType,
+        });
 
-      return reply.redirect(302, presignedUrl);
+        const presignedUrl = await getSignedUrl(s3, command, {
+          expiresIn: PRESIGNED_URL_TTL,
+        });
+
+        return reply.redirect(302, presignedUrl);
+      } catch (err) {
+        if (err instanceof NoSuchKey
+          || (err instanceof Error && (err.name === 'NoSuchKey' || err.name === 'NotFound'))) {
+          req.log.warn({ documentId: id, bucket: doc.s3_bucket, key: doc.s3_key },
+            'Document file not found in S3');
+          return reply.status(404).send({ error: 'Document file not found in storage' });
+        }
+
+        req.log.error({ err, documentId: id, bucket: doc.s3_bucket, key: doc.s3_key },
+          'Failed to generate presigned download URL');
+        return reply.status(500).send({ error: 'Failed to generate download URL' });
+      }
     },
   );
 }
