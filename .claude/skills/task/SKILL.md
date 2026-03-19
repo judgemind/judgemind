@@ -1,6 +1,6 @@
 ---
 description: Pick up and complete a Judgemind GitHub issue autonomously — from worktree setup through PR and review request. Usage: /task (next ready issue), /task #42 (specific issue), /task scrapers (natural-language filter).
-argument-hint: "[#issue | category | next]"
+argument-hint: "[#issue | category | next] [--max-workers N]"
 maxTurns: 200
 ---
 
@@ -17,6 +17,14 @@ Check whether you are already working inside a worktree (i.e. `{worktree}` is se
 ```
 scripts/start-worker.sh
 ```
+
+If a `--max-workers N` flag was passed in your arguments, pass it through to the script:
+
+```
+scripts/start-worker.sh --max-workers N
+```
+
+This provides a hard programmatic limit on the number of concurrent worker worktrees, enforced by the script itself. The orchestrator passes this flag to prevent exceeding its slot limit.
 
 This resolves the repo root, prunes stale worktrees, claims the lowest available worker number, creates the worktree, configures git hooks, and creates the `tmp/` directory.
 
