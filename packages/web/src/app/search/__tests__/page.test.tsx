@@ -5,6 +5,12 @@ vi.mock('../SearchPage', () => ({
   SearchPage: () => <div data-testid="search-page">Search component</div>,
 }));
 
+vi.mock('@/components/ui/skeleton', () => ({
+  Skeleton: ({ className }: { className?: string }) => (
+    <div data-testid="skeleton" className={className} />
+  ),
+}));
+
 import SearchRoute from '../page';
 
 describe('SearchRoute (SSR wrapper)', () => {

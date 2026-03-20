@@ -4,9 +4,26 @@ import { useState, useCallback, useEffect, useMemo } from 'react';
 import { useQuery, gql } from '@apollo/client';
 import { useRouter, useSearchParams } from 'next/navigation';
 import Link from 'next/link';
+import { Search, SlidersHorizontal, Calendar, Scale, Gavel } from 'lucide-react';
 import { formatDate } from '@/lib/display-helpers';
 import { Autocomplete } from '@/components/Autocomplete';
 import { useCountyOptions, useJudgeNameOptions } from '@/lib/filter-options';
+import { Card, CardContent } from '@/components/ui/card';
+import { Badge } from '@/components/ui/badge';
+import { Button } from '@/components/ui/button';
+import { Checkbox } from '@/components/ui/checkbox';
+import { Input } from '@/components/ui/input';
+import { Label } from '@/components/ui/label';
+import { Separator } from '@/components/ui/separator';
+import { Skeleton } from '@/components/ui/skeleton';
+import {
+  Sheet,
+  SheetContent,
+  SheetHeader,
+  SheetTitle,
+  SheetTrigger,
+  SheetDescription,
+} from '@/components/ui/sheet';
 
 const SEARCH_RULINGS_QUERY = gql`
   query SearchRulings(
@@ -32,6 +49,8 @@ const SEARCH_RULINGS_QUERY = gql`
           state
           judgeName
           hearingDate
+          motionType
+          outcome
           excerpt
           score
         }
@@ -83,6 +102,16 @@ export const OUTCOME_LABELS: Record<string, string> = {
   moot: 'Moot',
   continued: 'Continued',
   other: 'Other',
+};
+
+/** Badge variant mapping for outcomes. */
+const OUTCOME_BADGE_VARIANT: Record<string, 'default' | 'secondary' | 'destructive' | 'outline'> = {
+  granted: 'default',
+  denied: 'destructive',
+  granted_in_part: 'secondary',
+  moot: 'outline',
+  continued: 'outline',
+  other: 'outline',
 };
 
 /** Build URL search params from the current filter state. */
@@ -138,6 +167,8 @@ interface SearchHitNode {
   state: string | null;
   judgeName: string | null;
   hearingDate: string | null;
+  motionType: string | null;
+  outcome: string | null;
   excerpt: string | null;
   score: number | null;
 }
@@ -154,19 +185,242 @@ const PAGE_SIZE = 20;
 
 function SkeletonCard() {
   return (
-    <div className="animate-pulse rounded-lg border border-slate-200 p-4 dark:border-slate-700">
-      <div className="flex items-start justify-between">
-        <div className="flex-1 space-y-2">
-          <div className="h-4 w-2/3 rounded bg-slate-200 dark:bg-slate-700" />
-          <div className="h-3 w-1/3 rounded bg-slate-200 dark:bg-slate-700" />
+    <Card>
+      <CardContent className="p-4">
+        <div className="flex items-start justify-between gap-3">
+          <div className="min-w-0 flex-1 space-y-2">
+            <Skeleton className="h-5 w-2/3" />
+            <Skeleton className="h-3 w-1/3" />
+          </div>
+          <Skeleton className="h-5 w-16" />
         </div>
-        <div className="h-5 w-16 rounded bg-slate-200 dark:bg-slate-700" />
+        <div className="mt-3 flex gap-2">
+          <Skeleton className="h-5 w-14 rounded-full" />
+          <Skeleton className="h-5 w-16 rounded-full" />
+        </div>
+        <div className="mt-3 space-y-1.5">
+          <Skeleton className="h-3 w-full" />
+          <Skeleton className="h-3 w-4/5" />
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
+/** The filter sidebar content — shared between desktop sidebar and mobile sheet. */
+function FilterContent({
+  county,
+  setCounty,
+  judgeName,
+  setJudgeName,
+  dateFrom,
+  setDateFrom,
+  dateTo,
+  setDateTo,
+  motionTypes,
+  toggleMotionType,
+  outcomes: outcomeValues,
+  toggleOutcome,
+  countyOptions,
+  judgeNameOptions,
+}: {
+  county: string;
+  setCounty: (v: string) => void;
+  judgeName: string;
+  setJudgeName: (v: string) => void;
+  dateFrom: string;
+  setDateFrom: (v: string) => void;
+  dateTo: string;
+  setDateTo: (v: string) => void;
+  motionTypes: string[];
+  toggleMotionType: (mt: string) => void;
+  outcomes: string[];
+  toggleOutcome: (oc: string) => void;
+  countyOptions: string[];
+  judgeNameOptions: string[];
+}) {
+  return (
+    <div className="space-y-6">
+      <div>
+        <h2 className="flex items-center gap-2 text-sm font-semibold text-foreground">
+          <SlidersHorizontal className="h-4 w-4" />
+          Filters
+        </h2>
       </div>
-      <div className="mt-3 space-y-1.5">
-        <div className="h-3 w-full rounded bg-slate-200 dark:bg-slate-700" />
-        <div className="h-3 w-4/5 rounded bg-slate-200 dark:bg-slate-700" />
+
+      <Separator />
+
+      {/* County */}
+      <div className="space-y-2">
+        <Label htmlFor="filter-county">County</Label>
+        <Autocomplete
+          id="filter-county"
+          value={county}
+          onChange={setCounty}
+          options={countyOptions}
+          placeholder="e.g. Los Angeles"
+          aria-label="County"
+          className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+        />
+      </div>
+
+      {/* Judge */}
+      <div className="space-y-2">
+        <Label htmlFor="filter-judge">Judge</Label>
+        <Autocomplete
+          id="filter-judge"
+          value={judgeName}
+          onChange={setJudgeName}
+          options={judgeNameOptions}
+          placeholder="e.g. Smith, John"
+          aria-label="Judge"
+          className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+        />
+      </div>
+
+      <Separator />
+
+      {/* Motion type */}
+      <fieldset className="space-y-2">
+        <legend className="flex items-center gap-2 text-sm font-medium">
+          <Scale className="h-4 w-4 text-muted-foreground" />
+          Motion Type
+        </legend>
+        <div className="space-y-2">
+          {MOTION_TYPES.map((mt) => (
+            <div key={mt} className="flex items-center gap-2">
+              <Checkbox
+                id={`filter-mt-${mt}`}
+                checked={motionTypes.includes(mt)}
+                onCheckedChange={() => toggleMotionType(mt)}
+              />
+              <Label
+                htmlFor={`filter-mt-${mt}`}
+                className="text-sm font-normal text-foreground"
+              >
+                {MOTION_TYPE_LABELS[mt]}
+              </Label>
+            </div>
+          ))}
+        </div>
+      </fieldset>
+
+      <Separator />
+
+      {/* Outcome */}
+      <fieldset className="space-y-2">
+        <legend className="flex items-center gap-2 text-sm font-medium">
+          <Gavel className="h-4 w-4 text-muted-foreground" />
+          Outcome
+        </legend>
+        <div className="space-y-2">
+          {OUTCOMES.map((oc) => (
+            <div key={oc} className="flex items-center gap-2">
+              <Checkbox
+                id={`filter-oc-${oc}`}
+                checked={outcomeValues.includes(oc)}
+                onCheckedChange={() => toggleOutcome(oc)}
+              />
+              <Label
+                htmlFor={`filter-oc-${oc}`}
+                className="text-sm font-normal text-foreground"
+              >
+                {OUTCOME_LABELS[oc]}
+              </Label>
+            </div>
+          ))}
+        </div>
+      </fieldset>
+
+      <Separator />
+
+      {/* Date range */}
+      <div className="space-y-3">
+        <div className="flex items-center gap-2 text-sm font-medium">
+          <Calendar className="h-4 w-4 text-muted-foreground" />
+          Date Range
+        </div>
+        <div className="space-y-2">
+          <Label htmlFor="filter-date-from">Date from</Label>
+          <Input
+            id="filter-date-from"
+            type="date"
+            value={dateFrom}
+            onChange={(e) => setDateFrom(e.target.value)}
+          />
+        </div>
+        <div className="space-y-2">
+          <Label htmlFor="filter-date-to">Date to</Label>
+          <Input
+            id="filter-date-to"
+            type="date"
+            value={dateTo}
+            onChange={(e) => setDateTo(e.target.value)}
+          />
+        </div>
       </div>
     </div>
+  );
+}
+
+/** A single search result card. */
+function ResultCard({ node }: { node: SearchHitNode }) {
+  const motionLabel = node.motionType ? MOTION_TYPE_LABELS[node.motionType] ?? node.motionType : null;
+  const outcomeLabel = node.outcome ? OUTCOME_LABELS[node.outcome] ?? node.outcome : null;
+  const outcomeBadgeVariant = node.outcome ? (OUTCOME_BADGE_VARIANT[node.outcome] ?? 'outline') : 'outline';
+
+  return (
+    <Link href={`/rulings/${node.rulingId}`} className="block">
+      <Card className="transition-colors hover:bg-accent/50">
+        <CardContent className="p-4">
+          {/* Top row: case info + hearing date */}
+          <div className="flex items-start justify-between gap-3">
+            <div className="min-w-0 flex-1">
+              <h3 className="truncate text-base font-semibold text-foreground">
+                {node.caseTitle ?? node.caseNumber ?? 'Unknown Case'}
+              </h3>
+              {node.caseTitle && node.caseNumber && (
+                <p className="mt-0.5 truncate text-xs text-muted-foreground">
+                  {node.caseNumber}
+                </p>
+              )}
+            </div>
+            {node.hearingDate && (
+              <span className="shrink-0 text-xs text-muted-foreground">
+                {formatDate(node.hearingDate)}
+              </span>
+            )}
+          </div>
+
+          {/* Metadata row */}
+          <p className="mt-1 truncate text-sm text-muted-foreground">
+            {node.judgeName ? `Judge ${node.judgeName}` : ''}
+            {node.judgeName && node.county ? ' \u00B7 ' : ''}
+            {node.county ?? ''}
+          </p>
+
+          {/* Badges for motion type and outcome */}
+          {(motionLabel || outcomeLabel) && (
+            <div className="mt-2 flex flex-wrap gap-1.5">
+              {motionLabel && (
+                <Badge variant="secondary">{motionLabel}</Badge>
+              )}
+              {outcomeLabel && (
+                <Badge variant={outcomeBadgeVariant}>{outcomeLabel}</Badge>
+              )}
+            </div>
+          )}
+
+          {/* Excerpt */}
+          {node.excerpt && (
+            <p
+              className="mt-3 line-clamp-3 text-sm text-muted-foreground"
+              dangerouslySetInnerHTML={{ __html: node.excerpt }}
+            />
+          )}
+        </CardContent>
+      </Card>
+    </Link>
   );
 }
 
@@ -191,6 +445,7 @@ export function SearchPage() {
     initialState.motionTypes,
   );
   const [outcomes, setOutcomes] = useState<string[]>(initialState.outcomes);
+  const [mobileFiltersOpen, setMobileFiltersOpen] = useState(false);
 
   // Track whether the user has submitted a search
   const [hasSearched, setHasSearched] = useState(
@@ -306,177 +561,101 @@ export function SearchPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [county, judgeName, dateFrom, dateTo, motionTypes, outcomes]);
 
+  const filterProps = {
+    county,
+    setCounty,
+    judgeName,
+    setJudgeName,
+    dateFrom,
+    setDateFrom,
+    dateTo,
+    setDateTo,
+    motionTypes,
+    toggleMotionType,
+    outcomes,
+    toggleOutcome,
+    countyOptions,
+    judgeNameOptions,
+  };
+
   return (
-    <div className="mx-auto max-w-5xl">
-      <h1 className="text-2xl font-bold text-slate-900 dark:text-slate-100">
-        Search Rulings
-      </h1>
-      <p className="mt-2 text-sm text-slate-500 dark:text-slate-400">
-        Full-text search across California tentative rulings.
-      </p>
+    <div className="mx-auto max-w-6xl">
+      {/* Page header */}
+      <div className="mb-6">
+        <h1 className="text-2xl font-bold tracking-tight text-foreground">
+          Search Rulings
+        </h1>
+        <p className="mt-1 text-sm text-muted-foreground">
+          Full-text search across California tentative rulings.
+        </p>
+      </div>
 
       {/* Search bar */}
-      <form onSubmit={handleSubmit} className="mt-6">
+      <form onSubmit={handleSubmit}>
         <div className="flex gap-2">
-          <input
-            type="search"
-            value={q}
-            onChange={(e) => setQ(e.target.value)}
-            placeholder="Search by keyword, case number, judge, or party..."
-            className="flex-1 rounded-lg border border-slate-300 bg-white px-4 py-2.5 text-slate-900 placeholder-slate-400 focus:border-brand-500 focus:outline-none focus:ring-1 focus:ring-brand-500 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 dark:placeholder-slate-500"
-            aria-label="Search query"
-          />
-          <button
-            type="submit"
-            className="rounded-lg bg-brand-600 px-6 py-2.5 text-sm font-medium text-white hover:bg-brand-700 focus:outline-none focus:ring-2 focus:ring-brand-500 focus:ring-offset-2 dark:focus:ring-offset-slate-900"
-          >
-            Search
-          </button>
+          <div className="relative flex-1">
+            <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+            <Input
+              type="search"
+              value={q}
+              onChange={(e) => setQ(e.target.value)}
+              placeholder="Search by keyword, case number, judge, or party..."
+              className="pl-9"
+              aria-label="Search query"
+            />
+          </div>
+          <Button type="submit">Search</Button>
+          {/* Mobile filter toggle */}
+          <Sheet open={mobileFiltersOpen} onOpenChange={setMobileFiltersOpen}>
+            <SheetTrigger asChild>
+              <Button variant="outline" size="icon" className="lg:hidden" aria-label="Open filters">
+                <SlidersHorizontal className="h-4 w-4" />
+              </Button>
+            </SheetTrigger>
+            <SheetContent side="left" className="w-80 overflow-y-auto">
+              <SheetHeader>
+                <SheetTitle>Filters</SheetTitle>
+                <SheetDescription>Refine your search results</SheetDescription>
+              </SheetHeader>
+              <div className="mt-4">
+                <FilterContent {...filterProps} />
+              </div>
+            </SheetContent>
+          </Sheet>
         </div>
       </form>
 
       {/* Main content: sidebar filters + results */}
-      <div className="mt-6 flex flex-col gap-6 lg:flex-row">
-        {/* Filter panel (sidebar) */}
-        <aside className="w-full shrink-0 lg:w-64">
-          <div className="space-y-5 rounded-lg border border-slate-200 bg-white p-4 dark:border-slate-700 dark:bg-slate-800/50">
-            <h2 className="text-sm font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">
-              Filters
-            </h2>
-
-            {/* County */}
-            <div>
-              <label
-                htmlFor="filter-county"
-                className="mb-1 block text-xs font-medium text-slate-600 dark:text-slate-400"
-              >
-                County
-              </label>
-              <Autocomplete
-                id="filter-county"
-                value={county}
-                onChange={setCounty}
-                options={countyOptions}
-                placeholder="e.g. Los Angeles"
-                aria-label="County"
-                className="w-full rounded-md border border-slate-300 bg-white px-3 py-1.5 text-sm text-slate-900 placeholder-slate-400 focus:border-brand-500 focus:outline-none focus:ring-1 focus:ring-brand-500 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 dark:placeholder-slate-500"
-              />
-            </div>
-
-            {/* Judge */}
-            <div>
-              <label
-                htmlFor="filter-judge"
-                className="mb-1 block text-xs font-medium text-slate-600 dark:text-slate-400"
-              >
-                Judge
-              </label>
-              <Autocomplete
-                id="filter-judge"
-                value={judgeName}
-                onChange={setJudgeName}
-                options={judgeNameOptions}
-                placeholder="e.g. Smith, John"
-                aria-label="Judge"
-                className="w-full rounded-md border border-slate-300 bg-white px-3 py-1.5 text-sm text-slate-900 placeholder-slate-400 focus:border-brand-500 focus:outline-none focus:ring-1 focus:ring-brand-500 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 dark:placeholder-slate-500"
-              />
-            </div>
-
-            {/* Motion type */}
-            <fieldset>
-              <legend className="mb-1 text-xs font-medium text-slate-600 dark:text-slate-400">
-                Motion Type
-              </legend>
-              <div className="space-y-1">
-                {MOTION_TYPES.map((mt) => (
-                  <label key={mt} className="flex items-center gap-2 text-sm">
-                    <input
-                      type="checkbox"
-                      checked={motionTypes.includes(mt)}
-                      onChange={() => toggleMotionType(mt)}
-                      className="rounded border-slate-300 text-brand-600 focus:ring-brand-500 dark:border-slate-600"
-                    />
-                    <span className="text-slate-700 dark:text-slate-300">
-                      {MOTION_TYPE_LABELS[mt]}
-                    </span>
-                  </label>
-                ))}
-              </div>
-            </fieldset>
-
-            {/* Outcome */}
-            <fieldset>
-              <legend className="mb-1 text-xs font-medium text-slate-600 dark:text-slate-400">
-                Outcome
-              </legend>
-              <div className="space-y-1">
-                {OUTCOMES.map((oc) => (
-                  <label key={oc} className="flex items-center gap-2 text-sm">
-                    <input
-                      type="checkbox"
-                      checked={outcomes.includes(oc)}
-                      onChange={() => toggleOutcome(oc)}
-                      className="rounded border-slate-300 text-brand-600 focus:ring-brand-500 dark:border-slate-600"
-                    />
-                    <span className="text-slate-700 dark:text-slate-300">
-                      {OUTCOME_LABELS[oc]}
-                    </span>
-                  </label>
-                ))}
-              </div>
-            </fieldset>
-
-            {/* Date range */}
-            <div>
-              <label
-                htmlFor="filter-date-from"
-                className="mb-1 block text-xs font-medium text-slate-600 dark:text-slate-400"
-              >
-                Date from
-              </label>
-              <input
-                id="filter-date-from"
-                type="date"
-                value={dateFrom}
-                onChange={(e) => setDateFrom(e.target.value)}
-                className="w-full rounded-md border border-slate-300 bg-white px-3 py-1.5 text-sm text-slate-900 focus:border-brand-500 focus:outline-none focus:ring-1 focus:ring-brand-500 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100"
-              />
-            </div>
-            <div>
-              <label
-                htmlFor="filter-date-to"
-                className="mb-1 block text-xs font-medium text-slate-600 dark:text-slate-400"
-              >
-                Date to
-              </label>
-              <input
-                id="filter-date-to"
-                type="date"
-                value={dateTo}
-                onChange={(e) => setDateTo(e.target.value)}
-                className="w-full rounded-md border border-slate-300 bg-white px-3 py-1.5 text-sm text-slate-900 focus:border-brand-500 focus:outline-none focus:ring-1 focus:ring-brand-500 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100"
-              />
-            </div>
-          </div>
+      <div className="mt-6 flex gap-6">
+        {/* Desktop filter sidebar */}
+        <aside className="hidden w-64 shrink-0 lg:block">
+          <Card>
+            <CardContent className="p-4">
+              <FilterContent {...filterProps} />
+            </CardContent>
+          </Card>
         </aside>
 
         {/* Results area */}
         <div className="min-w-0 flex-1">
           {/* Before first search */}
           {!hasSearched && (
-            <div className="flex flex-col items-center justify-center rounded-lg border border-dashed border-slate-300 py-16 dark:border-slate-600">
-              <p className="text-lg font-medium text-slate-400 dark:text-slate-500">
-                Enter a search term to begin
-              </p>
-              <p className="mt-1 text-sm text-slate-400 dark:text-slate-500">
-                Search by keyword, case number, judge name, or party
-              </p>
-            </div>
+            <Card className="border-dashed">
+              <CardContent className="flex flex-col items-center justify-center py-16">
+                <Search className="mb-4 h-12 w-12 text-muted-foreground/50" />
+                <p className="text-lg font-medium text-muted-foreground">
+                  Enter a search term to begin
+                </p>
+                <p className="mt-1 text-sm text-muted-foreground">
+                  Search by keyword, case number, judge name, or party
+                </p>
+              </CardContent>
+            </Card>
           )}
 
           {/* Loading state */}
           {hasSearched && loading && edges.length === 0 && (
-            <div className="space-y-4">
+            <div className="space-y-3">
               {Array.from({ length: 5 }).map((_, i) => (
                 <SkeletonCard key={i} />
               ))}
@@ -485,11 +664,13 @@ export function SearchPage() {
 
           {/* Error state */}
           {hasSearched && error && (
-            <div className="rounded-lg border border-red-200 bg-red-50 p-6 text-center dark:border-red-800 dark:bg-red-900/20">
-              <p className="text-sm text-red-600 dark:text-red-400">
-                Failed to load search results. Please try again.
-              </p>
-            </div>
+            <Card className="border-destructive">
+              <CardContent className="py-6 text-center">
+                <p className="text-sm text-destructive">
+                  Failed to load search results. Please try again.
+                </p>
+              </CardContent>
+            </Card>
           )}
 
           {/* Empty results */}
@@ -498,19 +679,22 @@ export function SearchPage() {
             !error &&
             shouldQuery &&
             edges.length === 0 && (
-              <div className="flex flex-col items-center justify-center rounded-lg border border-dashed border-slate-300 py-16 dark:border-slate-600">
-                <p className="text-lg font-medium text-slate-500 dark:text-slate-400">
-                  No results for your search
-                </p>
-                <p className="mt-1 text-sm text-slate-400 dark:text-slate-500">
-                  Try broadening your filters or using different keywords
-                </p>
-              </div>
+              <Card className="border-dashed">
+                <CardContent className="flex flex-col items-center justify-center py-16">
+                  <Search className="mb-4 h-12 w-12 text-muted-foreground/50" />
+                  <p className="text-lg font-medium text-muted-foreground">
+                    No results for your search
+                  </p>
+                  <p className="mt-1 text-sm text-muted-foreground">
+                    Try broadening your filters or using different keywords
+                  </p>
+                </CardContent>
+              </Card>
             )}
 
           {/* Results header */}
           {hasSearched && edges.length > 0 && (
-            <p className="mb-4 text-sm text-slate-500 dark:text-slate-400">
+            <p className="mb-4 text-sm font-medium text-muted-foreground">
               {totalHits.toLocaleString()} result
               {totalHits !== 1 ? 's' : ''} found
             </p>
@@ -518,60 +702,24 @@ export function SearchPage() {
 
           {/* Result cards */}
           {edges.length > 0 && (
-            <div className="space-y-4">
+            <div className="space-y-3">
               {edges.map(({ node }) => (
-                <Link
-                  key={node.rulingId}
-                  href={`/rulings/${node.rulingId}`}
-                  className="block rounded-lg border border-slate-200 bg-white p-4 transition-colors hover:border-slate-300 hover:bg-slate-50 dark:border-slate-700 dark:bg-slate-800/50 dark:hover:border-slate-600 dark:hover:bg-slate-800"
-                >
-                  {/* Top row: case info + hearing date */}
-                  <div className="flex items-start justify-between gap-3">
-                    <div className="min-w-0 flex-1">
-                      <h3 className="truncate font-medium text-slate-900 dark:text-slate-100">
-                        {node.caseTitle ?? node.caseNumber ?? 'Unknown Case'}
-                      </h3>
-                      {node.caseTitle && node.caseNumber && (
-                        <p className="mt-0.5 truncate text-xs text-slate-400 dark:text-slate-500">
-                          {node.caseNumber}
-                        </p>
-                      )}
-                      <p className="mt-0.5 truncate text-sm text-slate-500 dark:text-slate-400">
-                        {node.judgeName ? `Judge ${node.judgeName}` : ''}
-                        {node.judgeName && node.county ? ' \u00B7 ' : ''}
-                        {node.county ?? ''}
-                      </p>
-                    </div>
-                    {node.hearingDate && (
-                      <span className="shrink-0 text-xs text-slate-400 dark:text-slate-500">
-                        {formatDate(node.hearingDate)}
-                      </span>
-                    )}
-                  </div>
-
-                  {/* Excerpt */}
-                  {node.excerpt && (
-                    <p
-                      className="mt-2 line-clamp-3 text-sm text-slate-600 dark:text-slate-400"
-                      dangerouslySetInnerHTML={{ __html: node.excerpt }}
-                    />
-                  )}
-                </Link>
+                <ResultCard key={node.rulingId} node={node} />
               ))}
 
               {/* Load more */}
               {pageInfo?.hasNextPage && (
                 <div className="flex justify-center pt-2">
-                  <button
+                  <Button
+                    variant="outline"
                     onClick={(e) => {
                       e.preventDefault();
                       handleLoadMore();
                     }}
                     disabled={loading}
-                    className="rounded-lg border border-slate-300 bg-white px-4 py-2 text-sm font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-50 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-300 dark:hover:bg-slate-700"
                   >
                     {loading ? 'Loading...' : 'Load more'}
-                  </button>
+                  </Button>
                 </div>
               )}
             </div>
