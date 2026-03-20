@@ -116,6 +116,23 @@ class TestSplitNorth:
         assert "Line 3 of ruling" in results[0].ruling_text
         assert "Line 1 of second ruling" in results[1].ruling_text
 
+    def test_split_text_shorter_than_full_page(self) -> None:
+        """Each split ruling must be shorter than the full input (#1182)."""
+        text = (
+            "101 Smith vs Jones Motion for Summary Judgment\n"
+            "Ruling text for Smith vs Jones.\n"
+            "The motion is GRANTED.\n"
+            "102 Doe vs Roe Demurrer to Complaint\n"
+            "Ruling text for Doe vs Roe.\n"
+            "The demurrer is OVERRULED.\n"
+        )
+        results = _split_north(text)
+        full_len = len(text)
+        for i, r in enumerate(results):
+            assert len(r.ruling_text) < full_len, (
+                f"Split [{i}] has {len(r.ruling_text)} chars, same as full text ({full_len})"
+            )
+
 
 # ---------------------------------------------------------------------------
 # Case-number-based splitting — synthetic tests
@@ -204,6 +221,25 @@ class TestSplitCaseNumberBased:
         assert len(results) == 2
         assert results[0].motion_type == "Motion for Summary Judgment"
         assert results[1].motion_type == "Demurrer to Complaint"
+
+    def test_split_text_shorter_than_full_page(self) -> None:
+        """Each split ruling must be shorter than the full input (#1182)."""
+        text = (
+            "TENTATIVE RULINGS\n"
+            "DEPT C25\n"
+            "1. Smith vs. Jones Motion for Summary Judgment\n"
+            "25-01455183\n"
+            "Detailed ruling text for the first case.\n"
+            "2. Doe vs. Roe Demurrer\n"
+            "24-01428812\n"
+            "Detailed ruling text for the second case.\n"
+        )
+        results = _split_case_number_based(text)
+        full_len = len(text)
+        for i, r in enumerate(results):
+            assert len(r.ruling_text) < full_len, (
+                f"Split [{i}] has {len(r.ruling_text)} chars, same as full text ({full_len})"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -331,6 +367,17 @@ class TestNorthFixture:
         # No two results should have identical text
         assert len(set(texts)) == len(texts)
 
+    def test_split_text_shorter_than_full_page(self, north_text: str) -> None:
+        """Each split ruling must be shorter than the full page (#1182)."""
+        results = _split_north(north_text)
+        full_len = len(north_text)
+        for i, r in enumerate(results):
+            assert len(r.ruling_text) < full_len, (
+                f"Split [{i}] has {len(r.ruling_text)} chars, "
+                f"same as full page ({full_len}). "
+                "Split ruling should contain only case-specific text."
+            )
+
     def test_all_entries_have_case_title_with_vs(self, north_text: str) -> None:
         results = _split_north(north_text)
         for r in results:
@@ -385,6 +432,16 @@ class TestCentralFixture:
         # C34 has 11 distinct cases; without sub-motion filtering we'd get more
         assert len(results) == 11
 
+    def test_split_text_shorter_than_full_page(self, central_text: str) -> None:
+        """Each split ruling must be shorter than the full page (#1182)."""
+        results = _split_case_number_based(central_text)
+        full_len = len(central_text)
+        for i, r in enumerate(results):
+            assert len(r.ruling_text) < full_len * 0.5, (
+                f"Split [{i}] (case={r.case_number}) has {len(r.ruling_text)} chars, "
+                f">= 50% of full page ({full_len}). Should be case-specific text only."
+            )
+
 
 class TestApkarianFixture:
     """Regression tests using Apkarian C25 fixture."""
@@ -403,19 +460,60 @@ class TestApkarianFixture:
         # First entry should be Okino vs. Ashe with case number 25-01455183
         assert results[0].case_number == "25-01455183"
 
-    def test_zavala_entry_has_own_ruling_text(self, apkarian_text: str) -> None:
-        """Acceptance criteria: Zavala v Becker would show only its ruling text."""
+    def test_no_entry_contains_other_case_text(self, apkarian_text: str) -> None:
+        """No split ruling should contain the first line of another entry (#1182).
+
+        This is a generalized version of the Zavala v Becker check — verifies
+        that boundary detection correctly isolates each case's text.
+        """
         results = _split_case_number_based(apkarian_text)
-        # Find the Zavala entry
-        zavala = [
-            r
-            for r in results
-            if "Zavala" in (r.case_title or "") or "Zavala" in r.ruling_text[:200]
-        ]
-        if zavala:
-            # The Zavala entry's ruling text should not contain text from other cases
-            # (e.g. "Okino" from entry 101 should not be in Zavala's text)
-            assert "Okino" not in zavala[0].ruling_text
+        for i, r in enumerate(results):
+            first_line = r.ruling_text.split("\n")[0].strip()
+            if not first_line:
+                continue
+            for j, other in enumerate(results):
+                if i == j:
+                    continue
+                assert first_line not in other.ruling_text, (
+                    f"First line of split [{i}] found in split [{j}]. "
+                    f"Entries should not overlap. Line: {first_line!r}"
+                )
+
+    def test_split_text_shorter_than_full_page(self, apkarian_text: str) -> None:
+        """Each split ruling must be shorter than the full page (#1182).
+
+        Regression test for the bug where split rulings retained the full
+        combined calendar page text instead of case-specific excerpts.
+        """
+        results = _split_case_number_based(apkarian_text)
+        full_len = len(apkarian_text)
+        for i, r in enumerate(results):
+            assert len(r.ruling_text) < full_len * 0.5, (
+                f"Split [{i}] (case={r.case_number}) has {len(r.ruling_text)} chars, "
+                f"which is >= 50% of the full page ({full_len} chars). "
+                "Split rulings should contain only case-specific text, not the full page."
+            )
+
+    def test_split_texts_do_not_overlap_across_cases(self, apkarian_text: str) -> None:
+        """No two split results should share significant text (#1182).
+
+        Verifies that boundaries are correctly identified and each ruling
+        contains only its own case text, not text from adjacent cases.
+        """
+        results = _split_case_number_based(apkarian_text)
+        # Check that the first line of each result does NOT appear in any other result.
+        # This verifies non-overlapping boundaries.
+        for i, r in enumerate(results):
+            first_line = r.ruling_text.split("\n")[0].strip()
+            if not first_line:
+                continue
+            for j, other in enumerate(results):
+                if i == j:
+                    continue
+                assert first_line not in other.ruling_text, (
+                    f"First line of split [{i}] found in split [{j}]. "
+                    f"Entries should not overlap. Line: {first_line!r}"
+                )
 
 
 class TestWestFixture:
@@ -433,6 +531,16 @@ class TestWestFixture:
     def test_first_entry_has_case_number(self, west_text: str) -> None:
         results = _split_case_number_based(west_text)
         assert results[0].case_number is not None
+
+    def test_split_text_shorter_than_full_page(self, west_text: str) -> None:
+        """Each split ruling must be shorter than the full page (#1182)."""
+        results = _split_case_number_based(west_text)
+        full_len = len(west_text)
+        for i, r in enumerate(results):
+            assert len(r.ruling_text) < full_len * 0.5, (
+                f"Split [{i}] (case={r.case_number}) has {len(r.ruling_text)} chars, "
+                f">= 50% of full page ({full_len}). Should be case-specific text only."
+            )
 
 
 class TestCostaMesaFixture:
@@ -452,6 +560,16 @@ class TestCostaMesaFixture:
         assert results[0].case_number is not None
         assert "2024-01437598" in results[0].case_number
 
+    def test_split_text_shorter_than_full_page(self, cm_text: str) -> None:
+        """Each split ruling must be shorter than the full page (#1182)."""
+        results = _split_case_number_based(cm_text)
+        full_len = len(cm_text)
+        for i, r in enumerate(results):
+            assert len(r.ruling_text) < full_len * 0.5, (
+                f"Split [{i}] (case={r.case_number}) has {len(r.ruling_text)} chars, "
+                f">= 50% of full page ({full_len}). Should be case-specific text only."
+            )
+
 
 class TestComplexFixture:
     """Regression tests using Complex fixture (oc_complex_cx.pdf)."""
@@ -469,6 +587,89 @@ class TestComplexFixture:
         results = _split_case_number_based(cx_text)
         assert results[0].case_number is not None
         assert "2023-01301305" in results[0].case_number
+
+    def test_split_text_shorter_than_full_page(self, cx_text: str) -> None:
+        """Each split ruling must be shorter than the full page (#1182)."""
+        results = _split_case_number_based(cx_text)
+        full_len = len(cx_text)
+        for i, r in enumerate(results):
+            assert len(r.ruling_text) < full_len * 0.5, (
+                f"Split [{i}] (case={r.case_number}) has {len(r.ruling_text)} chars, "
+                f">= 50% of full page ({full_len}). Should be case-specific text only."
+            )
+
+
+# ---------------------------------------------------------------------------
+# Cross-fixture text length regression tests (#1182)
+# ---------------------------------------------------------------------------
+
+
+class TestSplitRulingTextLengths:
+    """Regression tests verifying split rulings contain case-specific text,
+    not the full calendar page (#1182).
+
+    Root cause: between PRs #1156 and #1162, the OC splitter code existed but
+    was not registered at import time. Documents processed during that window
+    were stored unsplit with full page text. The splitter registration was
+    fixed in #1162 (``_load_county_splitters()``). These tests guard against
+    regressions in the splitting logic that could cause split results to
+    retain the full page text.
+    """
+
+    @pytest.fixture()
+    def north_text(self) -> str:
+        return _extract_pdf_text(_load_bytes("oc_north_n.pdf"))
+
+    @pytest.fixture()
+    def central_text(self) -> str:
+        return _extract_pdf_text(_load_bytes("oc_central_c34.pdf"))
+
+    @pytest.fixture()
+    def apkarian_text(self) -> str:
+        return _extract_pdf_text(_load_bytes("oc_apkarian_c25.pdf"))
+
+    def test_north_splits_sum_to_less_than_full_page(self, north_text: str) -> None:
+        """Total split text should not exceed the full page (no duplication)."""
+        results = _split_north(north_text)
+        total_split_len = sum(len(r.ruling_text) for r in results)
+        # Allow some overhead from shared header lines
+        assert total_split_len <= len(north_text) * 1.1, (
+            f"Total split text ({total_split_len}) exceeds full page ({len(north_text)}) "
+            "by more than 10%. Splits may be duplicating content."
+        )
+
+    def test_central_splits_sum_to_less_than_full_page(self, central_text: str) -> None:
+        """Total split text should not exceed the full page (no duplication)."""
+        results = _split_case_number_based(central_text)
+        total_split_len = sum(len(r.ruling_text) for r in results)
+        assert total_split_len <= len(central_text) * 1.1, (
+            f"Total split text ({total_split_len}) exceeds full page ({len(central_text)}) "
+            "by more than 10%. Splits may be duplicating content."
+        )
+
+    def test_framework_split_produces_case_specific_text(self, apkarian_text: str) -> None:
+        """End-to-end: split_document() through the framework produces
+        case-specific text, not full page text (#1182)."""
+        event = {
+            "state": "CA",
+            "county": "Orange",
+            "ruling_text": apkarian_text,
+            "department": "C25",
+            "case_title": None,
+            "case_number": None,
+            "motion_type": None,
+            "outcome": None,
+        }
+        results = split_document(event)
+        assert len(results) >= 2, "Expected multi-case document to be split"
+
+        full_len = len(apkarian_text)
+        for i, r in enumerate(results):
+            assert len(r.ruling_text) < full_len * 0.5, (
+                f"Framework split [{i}] has {len(r.ruling_text)} chars, "
+                f">= 50% of full page ({full_len}). "
+                "The split ruling should contain only case-specific text."
+            )
 
 
 class TestSingleCasePassthrough:
