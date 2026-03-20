@@ -99,25 +99,24 @@ describe('Sidebar', () => {
     mockAuthResult.user = makeUser('admin');
     render(<Sidebar />);
     const link = screen.getByText('Data Health');
-    // Next.js Link renders href; jsdom may strip trailing slash
     const href = link.closest('a')?.getAttribute('href') ?? '';
     expect(href).toMatch(/^\/admin\/data-quality\/?$/);
   });
 
-  it('highlights the active route', () => {
+  it('highlights the active route with accent styling', () => {
     mockPathname = '/search';
     render(<Sidebar />);
     const searchLink = screen.getByText('Search Rulings').closest('a');
-    expect(searchLink?.className).toContain('bg-slate-200');
+    expect(searchLink?.className).toContain('bg-accent');
+    expect(searchLink?.className).toContain('text-accent-foreground');
   });
 
-  it('does not highlight inactive routes', () => {
+  it('does not highlight inactive routes with accent styling', () => {
     mockPathname = '/search';
     render(<Sidebar />);
     const rulingsLink = screen.getByText('Latest Rulings').closest('a');
-    // The hover: variant contains bg-slate-200 too, so split into classes and check
     const classes = rulingsLink?.className.split(' ') ?? [];
-    expect(classes).not.toContain('bg-slate-200');
+    expect(classes).not.toContain('bg-accent');
   });
 
   it('calls onLinkClick when a link is clicked', async () => {
@@ -132,5 +131,18 @@ describe('Sidebar', () => {
     mockAuthResult.loading = true;
     render(<Sidebar />);
     expect(screen.queryByText('Admin')).not.toBeInTheDocument();
+  });
+
+  it('renders navigation icons alongside link text', () => {
+    render(<Sidebar />);
+    const searchLink = screen.getByText('Search Rulings').closest('a');
+    expect(searchLink?.querySelector('svg')).toBeInTheDocument();
+  });
+
+  it('uses shadcn Button components for navigation links', () => {
+    render(<Sidebar />);
+    const searchLink = screen.getByText('Search Rulings').closest('a');
+    expect(searchLink).toBeInTheDocument();
+    expect(searchLink?.className).toContain('justify-start');
   });
 });

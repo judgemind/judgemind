@@ -2,7 +2,11 @@
 
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
+import { Search, FileText, FolderOpen, Gavel, BarChart3 } from 'lucide-react';
 import { useAuth } from '@/providers/AuthProvider';
+import { Button } from '@/components/ui/button';
+import { Separator } from '@/components/ui/separator';
+import { cn } from '@/lib/utils';
 
 interface SidebarProps {
   /** Called when any navigation link is clicked (used by mobile menu to close). */
@@ -16,33 +20,57 @@ export function Sidebar({ onLinkClick }: SidebarProps) {
 
   return (
     <nav className="flex flex-col gap-1 p-4 text-sm">
-      <p className="mb-1 px-2 text-xs font-semibold uppercase tracking-wider text-slate-400 dark:text-slate-500">
+      <p className="mb-1 px-3 text-xs font-semibold uppercase tracking-wider text-muted-foreground">
         Explore
       </p>
-      <SidebarLink href="/search" active={pathname === '/search'} onClick={onLinkClick}>
+      <SidebarLink
+        href="/search"
+        icon={<Search className="h-4 w-4" />}
+        active={pathname === '/search'}
+        onClick={onLinkClick}
+      >
         Search Rulings
       </SidebarLink>
-      <SidebarLink href="/rulings" active={pathname === '/rulings'} onClick={onLinkClick}>
+      <SidebarLink
+        href="/rulings"
+        icon={<FileText className="h-4 w-4" />}
+        active={pathname === '/rulings'}
+        onClick={onLinkClick}
+      >
         Latest Rulings
       </SidebarLink>
 
-      <p className="mb-1 mt-4 px-2 text-xs font-semibold uppercase tracking-wider text-slate-400 dark:text-slate-500">
+      <Separator className="my-3" />
+
+      <p className="mb-1 px-3 text-xs font-semibold uppercase tracking-wider text-muted-foreground">
         Research
       </p>
-      <SidebarLink href="/cases" active={pathname === '/cases'} onClick={onLinkClick}>
+      <SidebarLink
+        href="/cases"
+        icon={<FolderOpen className="h-4 w-4" />}
+        active={pathname === '/cases'}
+        onClick={onLinkClick}
+      >
         Cases
       </SidebarLink>
-      <SidebarLink href="/judges" active={pathname === '/judges'} onClick={onLinkClick}>
+      <SidebarLink
+        href="/judges"
+        icon={<Gavel className="h-4 w-4" />}
+        active={pathname === '/judges'}
+        onClick={onLinkClick}
+      >
         Judges
       </SidebarLink>
 
       {isAdmin && (
         <>
-          <p className="mb-1 mt-4 border-t border-slate-200 pt-4 px-2 text-xs font-semibold uppercase tracking-wider text-slate-400 dark:border-slate-700 dark:text-slate-500">
+          <Separator className="my-3" />
+          <p className="mb-1 px-3 text-xs font-semibold uppercase tracking-wider text-muted-foreground">
             Admin
           </p>
           <SidebarLink
             href="/admin/data-quality/"
+            icon={<BarChart3 className="h-4 w-4" />}
             active={pathname.startsWith('/admin/data-quality')}
             onClick={onLinkClick}
           >
@@ -57,7 +85,7 @@ export function Sidebar({ onLinkClick }: SidebarProps) {
 /** Wraps the Sidebar in the desktop aside container. Used by the root layout. */
 export function DesktopSidebar() {
   return (
-    <aside className="sticky top-14 hidden h-[calc(100vh-3.5rem)] w-56 shrink-0 border-r border-slate-200 bg-slate-50 dark:border-slate-700 dark:bg-slate-900 lg:block">
+    <aside className="sticky top-14 hidden h-[calc(100vh-3.5rem)] w-56 shrink-0 border-r bg-muted/40 lg:block">
       <Sidebar />
     </aside>
   );
@@ -65,24 +93,31 @@ export function DesktopSidebar() {
 
 function SidebarLink({
   href,
+  icon,
   active,
   onClick,
   children,
 }: {
   href: string;
+  icon: React.ReactNode;
   active: boolean;
   onClick?: () => void;
   children: React.ReactNode;
 }) {
-  const baseClasses =
-    'rounded-md px-2 py-1.5 hover:bg-slate-200 hover:text-slate-900 dark:hover:bg-slate-800 dark:hover:text-slate-100';
-  const activeClasses = active
-    ? 'bg-slate-200 text-slate-900 dark:bg-slate-800 dark:text-slate-100'
-    : 'text-slate-700 dark:text-slate-300';
-
   return (
-    <Link href={href} className={`${baseClasses} ${activeClasses}`} onClick={onClick}>
-      {children}
-    </Link>
+    <Button
+      variant={active ? 'secondary' : 'ghost'}
+      size="sm"
+      className={cn(
+        'w-full justify-start gap-2',
+        active && 'bg-accent text-accent-foreground font-medium',
+      )}
+      asChild
+    >
+      <Link href={href} onClick={onClick}>
+        {icon}
+        {children}
+      </Link>
+    </Button>
   );
 }

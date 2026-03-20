@@ -337,15 +337,20 @@ describe('Auth lifecycle integration', () => {
 
       renderWithProviders(<Header />, mocks);
 
-      // Wait for ME_QUERY to resolve — should show "Log out"
+      // Wait for ME_QUERY to resolve — should show user menu (dropdown trigger)
       await waitFor(() => {
-        expect(screen.getByText('Log out')).toBeInTheDocument();
+        expect(screen.getByLabelText('User menu')).toBeInTheDocument();
       });
       expect(screen.queryByText('Log in')).not.toBeInTheDocument();
 
-      // Click logout
+      // Open the user dropdown (Radix needs pointer events, use userEvent)
+      const user = (await import('@testing-library/user-event')).default.setup();
+      await user.click(screen.getByLabelText('User menu'));
+      await waitFor(() => {
+        expect(screen.getByText('Log out')).toBeInTheDocument();
+      });
       await act(async () => {
-        fireEvent.click(screen.getByText('Log out'));
+        await user.click(screen.getByText('Log out'));
       });
 
       // After logout, should show "Log in" and token should be cleared
