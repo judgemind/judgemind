@@ -1,6 +1,15 @@
 'use client';
 
 import Link from 'next/link';
+import {
+  Card,
+  CardContent,
+  CardHeader,
+  CardTitle,
+} from '@/components/ui/card';
+import { Input } from '@/components/ui/input';
+import { Label } from '@/components/ui/label';
+import { Button } from '@/components/ui/button';
 
 interface AuthCardProps {
   title: string;
@@ -9,6 +18,7 @@ interface AuthCardProps {
 
 /**
  * Shared wrapper for auth pages — centered card with the Judgemind logo.
+ * Uses shadcn Card for consistent styling and dark mode support.
  */
 export function AuthCard({ title, children }: AuthCardProps) {
   return (
@@ -22,12 +32,12 @@ export function AuthCard({ title, children }: AuthCardProps) {
             Judgemind
           </Link>
         </div>
-        <div className="rounded-xl border border-slate-200 bg-white p-8 shadow-sm dark:border-slate-700 dark:bg-slate-800/50">
-          <h1 className="mb-6 text-xl font-semibold text-slate-900 dark:text-slate-100">
-            {title}
-          </h1>
-          {children}
-        </div>
+        <Card>
+          <CardHeader>
+            <CardTitle>{title}</CardTitle>
+          </CardHeader>
+          <CardContent>{children}</CardContent>
+        </Card>
       </div>
     </div>
   );
@@ -57,14 +67,9 @@ export function FormField({
   minLength,
 }: FormFieldProps) {
   return (
-    <div>
-      <label
-        htmlFor={id}
-        className="mb-1 block text-sm font-medium text-slate-700 dark:text-slate-300"
-      >
-        {label}
-      </label>
-      <input
+    <div className="space-y-2">
+      <Label htmlFor={id}>{label}</Label>
+      <Input
         id={id}
         name={id}
         type={type}
@@ -74,7 +79,6 @@ export function FormField({
         autoComplete={autoComplete}
         required={required}
         minLength={minLength}
-        className="w-full rounded-lg border border-slate-300 bg-white px-4 py-2.5 text-slate-900 placeholder-slate-400 focus:border-brand-500 focus:outline-none focus:ring-1 focus:ring-brand-500 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 dark:placeholder-slate-500"
       />
     </div>
   );
@@ -87,13 +91,36 @@ interface SubmitButtonProps {
 
 export function SubmitButton({ loading, children }: SubmitButtonProps) {
   return (
-    <button
-      type="submit"
-      disabled={loading}
-      className="w-full rounded-lg bg-brand-600 px-4 py-2.5 text-sm font-semibold text-white hover:bg-brand-700 focus:outline-none focus:ring-2 focus:ring-brand-500 focus:ring-offset-2 disabled:opacity-50 dark:focus:ring-offset-slate-800"
-    >
-      {loading ? 'Please wait...' : children}
-    </button>
+    <Button type="submit" disabled={loading} className="w-full">
+      {loading ? (
+        <span className="flex items-center gap-2">
+          <svg
+            className="h-4 w-4 animate-spin"
+            xmlns="http://www.w3.org/2000/svg"
+            fill="none"
+            viewBox="0 0 24 24"
+            aria-hidden="true"
+          >
+            <circle
+              className="opacity-25"
+              cx="12"
+              cy="12"
+              r="10"
+              stroke="currentColor"
+              strokeWidth="4"
+            />
+            <path
+              className="opacity-75"
+              fill="currentColor"
+              d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"
+            />
+          </svg>
+          Please wait...
+        </span>
+      ) : (
+        children
+      )}
+    </Button>
   );
 }
 
@@ -106,7 +133,7 @@ export function ErrorAlert({ message }: ErrorAlertProps) {
   return (
     <div
       role="alert"
-      className="rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700 dark:border-red-800 dark:bg-red-900/20 dark:text-red-400"
+      className="rounded-md border border-destructive/50 bg-destructive/10 px-4 py-3 text-sm text-destructive"
     >
       {message}
     </div>
@@ -122,7 +149,7 @@ export function SuccessAlert({ message }: SuccessAlertProps) {
   return (
     <div
       role="status"
-      className="rounded-lg border border-green-200 bg-green-50 px-4 py-3 text-sm text-green-700 dark:border-green-800 dark:bg-green-900/20 dark:text-green-400"
+      className="rounded-md border border-green-500/50 bg-green-500/10 px-4 py-3 text-sm text-green-700 dark:border-green-800 dark:bg-green-900/20 dark:text-green-400"
     >
       {message}
     </div>
