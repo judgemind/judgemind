@@ -932,6 +932,13 @@ class TestExtractCaseTitle:
 class TestLooksLikeMotionText:
     """Tests for _looks_like_motion_text() — rejects motion descriptions as case titles."""
 
+    def test_empty_string(self) -> None:
+        assert _looks_like_motion_text("") is False
+
+    def test_no_separator(self) -> None:
+        """Text without a v. separator is not motion text (nor case title)."""
+        assert _looks_like_motion_text("Motion to Compel Arbitration") is False
+
     def test_granting_motion_to(self) -> None:
         assert _looks_like_motion_text("Granting Motion To v. Disqualify Plaintiff") is True
 
