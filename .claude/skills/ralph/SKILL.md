@@ -151,7 +151,8 @@ The Claude reviewer prompt should be:
 > 4. Evaluate against these criteria:
 >    - **Correctness**: Does the implementation satisfy the acceptance criteria in task.md?
 >    - **Test coverage**: Are there tests for each acceptance criterion and obvious edge cases?
->    - **Scope**: Are there changes unrelated to the issue (scope creep, extra refactors, unrelated fixes)?
+>    - **Scope completeness**: Does the change need to be applied in other locations too? Search the codebase (using Grep) for other files that use, render, or implement the same pattern being changed. If the fix or feature was applied to one file but the same pattern exists elsewhere without the change, flag it as a REVISE reason. For example, if a rendering fix was applied to `ComponentA.tsx`, check whether `ComponentB.tsx` or other components render the same data and need the same fix.
+>    - **Scope creep**: Are there changes unrelated to the issue (extra refactors, unrelated fixes)?
 >    - **Code quality**: Does it follow existing patterns? Any debug code, hardcoded values, or forgotten TODOs?
 >    - **Missing pieces**: Are there files that should have been created or modified but weren't?
 >    - **Stale references**: Do comments, imports, or docstrings reference things that changed?

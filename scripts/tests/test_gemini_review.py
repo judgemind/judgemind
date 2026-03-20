@@ -54,6 +54,8 @@ class TestBuildPrompts:
         assert "cross-model code reviewer" in prompt
         assert "Correctness" in prompt
         assert "Test coverage" in prompt
+        assert "Scope completeness" in prompt
+        assert "Scope creep" in prompt
 
     def test_adversarial_prompt_contains_bug_hunting_focus(self) -> None:
         prompt = build_adversarial_prompt("task", "diff", "files")
