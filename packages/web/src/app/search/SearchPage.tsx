@@ -6,6 +6,7 @@ import { useRouter, useSearchParams } from 'next/navigation';
 import Link from 'next/link';
 import { Search, SlidersHorizontal, Calendar, Scale, Gavel } from 'lucide-react';
 import { formatDate } from '@/lib/display-helpers';
+import { sanitizeExcerptHtml } from '@/lib/sanitize-html';
 import { Autocomplete } from '@/components/Autocomplete';
 import { useCountyOptions, useJudgeNameOptions } from '@/lib/filter-options';
 import { Card, CardContent } from '@/components/ui/card';
@@ -415,7 +416,7 @@ function ResultCard({ node }: { node: SearchHitNode }) {
           {node.excerpt && (
             <p
               className="mt-3 line-clamp-3 text-sm text-muted-foreground"
-              dangerouslySetInnerHTML={{ __html: node.excerpt }}
+              dangerouslySetInnerHTML={{ __html: sanitizeExcerptHtml(node.excerpt) }}
             />
           )}
         </CardContent>
