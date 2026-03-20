@@ -536,5 +536,5 @@ scripts/end-worker.sh {worktree}
 - **No quoted strings with `&&` or `;`.** Split into separate tool calls.
 - **All temp files go in `{worktree}/tmp/`**, not `/tmp/`.
 - **Multi-line Python always goes in a `.py` file**, never `-c '...'`.
-- **Only use `run_in_background` for genuinely parallel work** (e.g., launching multiple reviews simultaneously). For commands the agent must wait on before proceeding (CI watches, test suites, deploy watches, sleeps), use foreground execution. Background commands generate `<task-notification>` messages that bubble up to the dispatcher and consume context window without providing any benefit.
+- **Do not use `run_in_background` in `/task` agents.** All commands — CI watches, test suites, deploy watches, and reviewer invocations — must run in the foreground. Background commands generate `<task-notification>` messages that bubble up to the dispatcher and consume context window without providing any benefit.
 - See CLAUDE.md §Unattended Operation Patterns for the full list.

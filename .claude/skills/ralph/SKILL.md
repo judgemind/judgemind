@@ -1,5 +1,5 @@
 ---
-description: Ralph loop — iterative work-review cycle with fresh context each iteration. Spawns a worker subagent to implement, then runs three reviewers in parallel (Gemini standard, Gemini adversarial, Claude). Loops until all reviewers agree to SHIP or max iterations reached. Called by /task for implementation tasks.
+description: Ralph loop — iterative work-review cycle with fresh context each iteration. Spawns a worker subagent to implement, then runs three reviewers sequentially (Gemini standard, Gemini adversarial, Claude). Loops until all reviewers agree to SHIP or max iterations reached. Called by /task for implementation tasks.
 argument-hint: ""
 maxTurns: 200
 ---
@@ -34,8 +34,8 @@ Create the state directory and seed the task file:
 ├── feedback.md                # reviewer feedback (empty initially, updated each cycle)
 ├── work-status.txt            # worker writes "COMPLETE" when done
 ├── review-result.txt          # Claude reviewer writes "SHIP" or "REVISE"
-├── diff.txt                   # git diff (pre-generated before parallel reviewers)
-├── changed_files.txt          # full content of changed files (pre-generated before parallel reviewers)
+├── diff.txt                   # git diff (pre-generated before reviewers)
+├── changed_files.txt          # full content of changed files (pre-generated before reviewers)
 ├── gemini-review-result.txt   # Gemini standard verdict: "SHIP", "REVISE", or "SKIPPED"
 ├── gemini-feedback.md         # Gemini standard detailed review feedback
 ├── adversarial-result.txt     # Gemini adversarial verdict: "SHIP", "REVISE", or "SKIPPED"
@@ -113,13 +113,15 @@ Spawn a **worker subagent** (using the Agent tool) with this prompt structure:
 After the worker subagent completes, read `{worktree}/tmp/ralph/work-status.txt`.
 
 - If **STUCK**: Stop the loop. Comment on the issue describing the blocker. Add `status/blocked`. Return to the caller with failure status.
-- If **COMPLETE**: Continue to the parallel review phase.
+- If **COMPLETE**: Continue to the sequential review phase.
 
-### 2b — Parallel review phase
+### 2b — Sequential review phase
 
-Write status: `phase: ralph-reviewer (iteration N)`, `summary: Running three parallel reviewers for iteration N`.
+Write status: `phase: ralph-reviewer (iteration N)`, `summary: Running three sequential reviewers for iteration N`.
 
-**Pre-generate diff and changed files before launching reviewers.** This must happen once, before any reviewer starts, to avoid a race condition where parallel Gemini reviewers truncate and overwrite the same files simultaneously. Run these two commands sequentially (as separate Bash tool calls):
+**All three reviewers run sequentially in the foreground.** This eliminates background `<task-notification>` noise that disrupts the dispatcher when multiple agents are running. Do **not** use `run_in_background` for any reviewer.
+
+**Pre-generate diff and changed files before launching reviewers.** This must happen once, before any reviewer starts. Run these two commands sequentially (as separate Bash tool calls):
 
 1. Generate `diff.txt`:
    ```
@@ -141,32 +143,30 @@ Write status: `phase: ralph-reviewer (iteration N)`, `summary: Running three par
 
 Both files must exist and be non-empty before launching reviewers. The `gemini-review.sh` script will skip its own diff generation when it detects these files already exist.
 
-**Launch all three reviewers simultaneously** (this is a legitimate use of `run_in_background` — the three reviewers are genuinely parallel work):
+**Run all three reviewers sequentially (foreground only — no `run_in_background`):**
 
-1. **Gemini standard review** — Run via Bash with `run_in_background: true` (genuinely parallel with other reviewers):
+1. **Gemini standard review** — Run in the foreground and wait for completion:
    ```
    scripts/gemini-review.sh {worktree}
    ```
 
-2. **Gemini adversarial review** — Run via Bash with `run_in_background: true` (genuinely parallel with other reviewers):
+2. **Gemini adversarial review** — Run in the foreground and wait for completion:
    ```
    scripts/gemini-review.sh {worktree} --adversarial
    ```
 
-3. **Claude reviewer subagent** — Spawn via the Agent tool (runs concurrently with the Gemini reviews).
+3. **Claude reviewer subagent** — Spawn via the Agent tool (foreground, after both Gemini reviews have completed).
 
 The Claude reviewer prompt should be:
 
 > You are reviewing a code change in a ralph loop (iteration N of max 5). Your job is to evaluate whether the implementation is ready to ship or needs revision. You are a fresh pair of eyes — you did not write this code.
 >
-> **Other reviewers are running in parallel.** Read any Gemini feedback files that are already available, but do not block on them — proceed with your own independent review regardless.
->
-> If available, read:
+> **Both Gemini reviews have already completed.** Read their feedback before starting your own review:
 > - `{worktree}/tmp/ralph/gemini-feedback.md` (Gemini standard review)
 > - `{worktree}/tmp/ralph/adversarial-feedback.md` (Gemini adversarial review)
 >
 > 1. Read the task requirements: `{worktree}/tmp/ralph/task.md`
-> 2. Read any available Gemini feedback files (they may not exist yet if Gemini hasn't finished).
+> 2. Read the Gemini feedback files (both should exist since they ran before you).
 > 3. Review the complete diff:
 >    ```
 >    git -C {worktree} diff
@@ -308,7 +308,8 @@ The code is ready for commit. Return control to the calling workflow (`/task` Pa
 - **Ralph is not task completion.** Ralph handles implementation and review only. The calling `/task` workflow handles process summary, commit, push, PR, CI, merge, deploy, and cleanup. Never exit after ralph without completing the full `/task` workflow.
 - **Unchecked test plan items are merge blockers.** Reviewers must flag unchecked test plan checkboxes as REVISE reasons. A PR with unchecked items is not ready to ship.
 - **Unmet acceptance criteria are always REVISE.** Reviewers must verify every acceptance criterion individually. Code quality alone is not sufficient for SHIP — all locally-verifiable acceptance criteria must be met.
-- **Only use `run_in_background` for genuinely parallel work.** The three parallel reviewers in step 2b are the only legitimate use of `run_in_background` in the ralph loop — they run concurrently by design. For everything else (test suites, lint, format checks, git commands), use foreground execution. The agent cannot proceed until these commands finish, so running them in the background just generates unnecessary `<task-notification>` noise that bubbles up to the dispatcher and wastes context window.
+- **All reviewers run sequentially in the foreground.** Do not use `run_in_background` for any reviewer. The sequential execution eliminates `<task-notification>` noise that disrupts the dispatcher when multiple agents are running concurrently. The time saved by parallelizing (~2-4 min per iteration) is not worth the dispatcher disruption.
+- **Do not use `run_in_background` anywhere in the ralph loop.** All commands — test suites, lint, format checks, git commands, and reviewer invocations — must run in the foreground. The agent cannot meaningfully proceed until each step completes.
 
 ---
 
