@@ -3341,3 +3341,183 @@ def test_process_event_already_split_no_re_split(mock_psycopg: MagicMock) -> Non
 
     # Should process normally without calling split_document
     mock_conn.commit.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Ruling summarization integration tests (#1099)
+# ---------------------------------------------------------------------------
+
+
+@patch("ingestion.worker.summarize_ruling")
+@patch("ingestion.worker.psycopg")
+def test_process_event_summarizes_ruling_when_enabled(
+    mock_psycopg: MagicMock,
+    mock_summarize: MagicMock,
+) -> None:
+    """When ENABLE_RULING_SUMMARIZATION is set, summarize_ruling is called."""
+    worker, os_mock = _make_worker()
+    worker._summarization_enabled = True
+    worker._summarization_client = MagicMock()
+    mock_summarize.return_value = ("The court granted the motion.", "claude-haiku-4-5-20251001")
+
+    mock_conn, mock_cur = _make_mock_conn()
+    mock_psycopg.connect.return_value = mock_conn
+    mock_cur.fetchone.side_effect = [
+        ("court-uuid-1",),  # upsert_court
+        ("case-uuid-1",),  # upsert_case
+        (True,),  # insert_document
+        None,  # resolve_judge: no existing alias
+        ("judge-uuid-1",),  # INSERT INTO judges
+    ]
+    mock_cur.fetchall.return_value = []
+
+    event = _make_event()
+    worker.process_event(event)
+
+    # Verify summarize_ruling was called with cleaned ruling text
+    mock_summarize.assert_called_once()
+    call_kwargs = mock_summarize.call_args
+    assert call_kwargs.kwargs["client"] is worker._summarization_client
+
+    # Verify insert_ruling received summary fields — check the SQL contains
+    # the summary columns
+    sql_calls = str(mock_cur.execute.call_args_list)
+    assert "summary" in sql_calls
+    assert "summary_model" in sql_calls
+    assert "summary_generated_at" in sql_calls
+
+
+@patch("ingestion.worker.summarize_ruling")
+@patch("ingestion.worker.psycopg")
+def test_process_event_summarization_disabled_by_default(
+    mock_psycopg: MagicMock,
+    mock_summarize: MagicMock,
+) -> None:
+    """When ENABLE_RULING_SUMMARIZATION is not set, summarize_ruling is not called."""
+    worker, os_mock = _make_worker()
+    # _summarization_enabled defaults to False
+    assert not worker._summarization_enabled
+
+    mock_conn, mock_cur = _make_mock_conn()
+    mock_psycopg.connect.return_value = mock_conn
+    mock_cur.fetchone.side_effect = [
+        ("court-uuid-1",),  # upsert_court
+        ("case-uuid-1",),  # upsert_case
+        (True,),  # insert_document
+        None,  # resolve_judge: no existing alias
+        ("judge-uuid-1",),  # INSERT INTO judges
+    ]
+    mock_cur.fetchall.return_value = []
+
+    event = _make_event()
+    worker.process_event(event)
+
+    mock_summarize.assert_not_called()
+
+
+@patch("ingestion.worker.summarize_ruling")
+@patch("ingestion.worker.psycopg")
+def test_process_event_summarization_failure_does_not_block_ingestion(
+    mock_psycopg: MagicMock,
+    mock_summarize: MagicMock,
+) -> None:
+    """Summary generation failure should not prevent ruling insertion."""
+    worker, os_mock = _make_worker()
+    worker._summarization_enabled = True
+    worker._summarization_client = MagicMock()
+    # Simulate summarization returning None (failure)
+    mock_summarize.return_value = (None, "claude-haiku-4-5-20251001")
+
+    mock_conn, mock_cur = _make_mock_conn()
+    mock_psycopg.connect.return_value = mock_conn
+    mock_cur.fetchone.side_effect = [
+        ("court-uuid-1",),  # upsert_court
+        ("case-uuid-1",),  # upsert_case
+        (True,),  # insert_document
+        None,  # resolve_judge: no existing alias
+        ("judge-uuid-1",),  # INSERT INTO judges
+    ]
+    mock_cur.fetchall.return_value = []
+
+    event = _make_event()
+    worker.process_event(event)
+
+    # Ruling should still be committed even though summary failed
+    mock_conn.commit.assert_called_once()
+
+
+@patch("ingestion.worker.summarize_ruling")
+@patch("ingestion.worker.psycopg")
+def test_process_event_summarization_includes_case_context(
+    mock_psycopg: MagicMock,
+    mock_summarize: MagicMock,
+) -> None:
+    """Case context (case_title, motion_type) is passed to summarize_ruling."""
+    worker, os_mock = _make_worker()
+    worker._summarization_enabled = True
+    worker._summarization_client = MagicMock()
+    mock_summarize.return_value = ("Summary text.", "claude-haiku-4-5-20251001")
+
+    mock_conn, mock_cur = _make_mock_conn()
+    mock_psycopg.connect.return_value = mock_conn
+    mock_cur.fetchone.side_effect = [
+        ("court-uuid-1",),  # upsert_court
+        ("case-uuid-1",),  # upsert_case
+        (True,),  # insert_document
+        None,  # resolve_judge: no existing alias
+        ("judge-uuid-1",),  # INSERT INTO judges
+    ]
+    mock_cur.fetchall.return_value = []
+
+    event = _make_event(
+        case_title="In re: Estate of Smith",
+        motion_type="Demurrer",
+        outcome="granted",
+    )
+    worker.process_event(event)
+
+    mock_summarize.assert_called_once()
+    call_kwargs = mock_summarize.call_args
+    case_context = call_kwargs.kwargs["case_context"]
+    assert case_context is not None
+    assert case_context["case_title"] == "In re: Estate of Smith"
+    assert case_context["motion_type"] == "Demurrer"
+
+
+@patch("ingestion.worker.summarize_ruling")
+@patch("ingestion.worker.psycopg")
+def test_process_event_summarization_no_case_context_when_missing(
+    mock_psycopg: MagicMock,
+    mock_summarize: MagicMock,
+) -> None:
+    """When case_title and motion_type are both None/absent, case_context is None."""
+    worker, os_mock = _make_worker()
+    worker._summarization_enabled = True
+    worker._summarization_client = MagicMock()
+    mock_summarize.return_value = ("Summary text.", "claude-haiku-4-5-20251001")
+
+    mock_conn, mock_cur = _make_mock_conn()
+    mock_psycopg.connect.return_value = mock_conn
+    mock_cur.fetchone.side_effect = [
+        ("court-uuid-1",),  # upsert_court
+        ("case-uuid-1",),  # upsert_case
+        (True,),  # insert_document
+        None,  # resolve_judge: no existing alias
+        ("judge-uuid-1",),  # INSERT INTO judges
+    ]
+    mock_cur.fetchall.return_value = []
+
+    # Use ruling text that won't trigger regex motion_type extraction
+    event = _make_event(
+        case_title=None,
+        ruling_text="The court has reviewed the matter and issues this order.",
+    )
+    # Remove motion_type and outcome from the event
+    event.pop("motion_type", None)
+    event.pop("outcome", None)
+    worker.process_event(event)
+
+    mock_summarize.assert_called_once()
+    call_kwargs = mock_summarize.call_args
+    # No case_title or motion_type available, so context should be None
+    assert call_kwargs.kwargs["case_context"] is None
