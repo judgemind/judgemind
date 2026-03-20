@@ -206,6 +206,8 @@ Not all `<task-notification>` messages require dispatcher action. The platform f
 
 When a `<task-notification>` arrives indicating an agent has completed:
 
+**Step 1 — Send Telegram notification:**
+
 **On success:**
 ```
 scripts/run-py.sh scripts/tg-notify.py task_completed <issue_number> "<summary>" <worker_number>
@@ -217,6 +219,20 @@ scripts/run-py.sh scripts/tg-notify.py task_failed <issue_number> "<error_summar
 ```
 
 Both commands update the status file automatically. Always send a notification immediately when an agent completes or fails — do not batch them.
+
+**Step 2 — Clean up the agent's worktree:**
+
+After sending the notification, immediately clean up the completed agent's worktree to free the slot for the next agent. Agents are supposed to clean up their own worktrees (step 4.11 in the `/task` skill), but they sometimes exit before reaching that step (context exhaustion, killed, errors). The dispatcher acts as a safety net.
+
+1. Derive the worktree path from the worker number: `{repo_root}/worktrees/worker-<N>`.
+2. Check if the worktree directory still exists. If it does not, the agent already cleaned up — skip to the next step.
+3. If it exists, remove it:
+   ```
+   scripts/end-worker.sh {repo_root}/worktrees/worker-<N>
+   ```
+4. If `end-worker.sh` fails (e.g. directory already partially removed), log the error but do not block the dispatch loop. The next `start-worker.sh` invocation will prune stale worktrees automatically.
+
+**This cleanup is critical for slot availability.** Without it, completed agents leave worktrees behind, and `start-worker.sh --max-workers` refuses to create new ones because it counts existing worktree directories. This was the root cause of repeated "max workers reached" failures in production (#1242).
 
 ---
 
