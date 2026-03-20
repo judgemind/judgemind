@@ -56,35 +56,42 @@ if [[ ! -d "$STATE_DIR" ]]; then
     exit 1
 fi
 
-# Generate diff.txt from the worktree
-if ! git -C "$WORKTREE" diff > "${STATE_DIR}/diff.txt" 2>&1; then
-    echo "ERROR: 'git diff' failed in worktree $WORKTREE" >&2
-    echo "SKIPPED" > "${STATE_DIR}/gemini-review-result.txt"
-    echo "Gemini review skipped: git diff failed." > "${STATE_DIR}/gemini-feedback.md"
-    exit 2
-fi
-if ! git -C "$WORKTREE" diff --cached >> "${STATE_DIR}/diff.txt" 2>&1; then
-    echo "WARNING: 'git diff --cached' failed — staged changes may be missing from review" >&2
-fi
-
-# Generate changed_files.txt — full content of files that have changes
-changed=$(git -C "$WORKTREE" diff --name-only HEAD) || true
-cached=$(git -C "$WORKTREE" diff --cached --name-only) || true
-untracked=$(git -C "$WORKTREE" ls-files --others --exclude-standard) || true
-
-# Combine and deduplicate
-all_files=$(echo -e "${changed}\n${cached}\n${untracked}" | sort -u | grep -v '^$' || true)
-
-# Write full content of each changed file
-> "${STATE_DIR}/changed_files.txt"
-for f in $all_files; do
-    filepath="${WORKTREE}/${f}"
-    if [[ -f "$filepath" ]]; then
-        echo "=== ${f} ===" >> "${STATE_DIR}/changed_files.txt"
-        cat "$filepath" >> "${STATE_DIR}/changed_files.txt"
-        echo "" >> "${STATE_DIR}/changed_files.txt"
+# Generate diff.txt and changed_files.txt from the worktree.
+# Skip generation if the files already exist and are non-empty — the ralph loop
+# pre-generates them once before launching parallel reviewers to avoid a race
+# condition where both standard and adversarial reviews truncate the same files.
+if [[ -s "${STATE_DIR}/diff.txt" && -s "${STATE_DIR}/changed_files.txt" ]]; then
+    echo "INFO: diff.txt and changed_files.txt already exist — skipping generation." >&2
+else
+    if ! git -C "$WORKTREE" diff > "${STATE_DIR}/diff.txt" 2>&1; then
+        echo "ERROR: 'git diff' failed in worktree $WORKTREE" >&2
+        echo "SKIPPED" > "${STATE_DIR}/gemini-review-result.txt"
+        echo "Gemini review skipped: git diff failed." > "${STATE_DIR}/gemini-feedback.md"
+        exit 2
     fi
-done
+    if ! git -C "$WORKTREE" diff --cached >> "${STATE_DIR}/diff.txt" 2>&1; then
+        echo "WARNING: 'git diff --cached' failed — staged changes may be missing from review" >&2
+    fi
+
+    # Generate changed_files.txt — full content of files that have changes
+    changed=$(git -C "$WORKTREE" diff --name-only HEAD) || true
+    cached=$(git -C "$WORKTREE" diff --cached --name-only) || true
+    untracked=$(git -C "$WORKTREE" ls-files --others --exclude-standard) || true
+
+    # Combine and deduplicate
+    all_files=$(echo -e "${changed}\n${cached}\n${untracked}" | sort -u | grep -v '^$' || true)
+
+    # Write full content of each changed file
+    > "${STATE_DIR}/changed_files.txt"
+    for f in $all_files; do
+        filepath="${WORKTREE}/${f}"
+        if [[ -f "$filepath" ]]; then
+            echo "=== ${f} ===" >> "${STATE_DIR}/changed_files.txt"
+            cat "$filepath" >> "${STATE_DIR}/changed_files.txt"
+            echo "" >> "${STATE_DIR}/changed_files.txt"
+        fi
+    done
+fi
 
 # Ensure a Python environment with google-genai is available.
 #
