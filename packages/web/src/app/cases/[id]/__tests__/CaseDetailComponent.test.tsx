@@ -248,7 +248,7 @@ describe('CaseDetail — ruling HTML rendering', () => {
     expect(rulingContent?.innerHTML).not.toContain('onerror');
   });
 
-  it('shows truncated plain text when collapsed and rulingTextHtml is present for long content', async () => {
+  it('shows formatted HTML with CSS truncation when collapsed for long content', async () => {
     // Create a long ruling text that exceeds RULING_TEXT_TRUNCATE_LENGTH (500)
     const longText = 'A'.repeat(600);
     const node = buildRulingNode({
@@ -258,14 +258,21 @@ describe('CaseDetail — ruling HTML rendering', () => {
     const mocks = buildMocks(buildCaseData(), buildRulingsData([node]));
     const { container } = renderWithProvider(mocks);
 
-    // Wait for data — when collapsed, should show truncated plain text, not HTML
+    // Wait for data — when collapsed, should show HTML with max-height truncation
     await screen.findByText('Show more', {}, { timeout: 3000 });
 
-    // Should show truncated plain text (not HTML) when collapsed
-    expect(container.querySelector('.ruling-content')).not.toBeInTheDocument();
+    // Should render formatted HTML even when collapsed (CSS truncation, not text truncation)
+    const rulingContent = container.querySelector('.ruling-content');
+    expect(rulingContent).toBeInTheDocument();
+    expect(rulingContent?.classList.contains('max-h-40')).toBe(true);
+    expect(rulingContent?.classList.contains('overflow-hidden')).toBe(true);
+
+    // Should show a fade-out gradient overlay
+    const gradient = container.querySelector('.bg-gradient-to-t');
+    expect(gradient).toBeInTheDocument();
   });
 
-  it('shows formatted HTML when expanded for long content', async () => {
+  it('shows formatted HTML without truncation when expanded for long content', async () => {
     const longText = 'A'.repeat(600);
     const node = buildRulingNode({
       rulingTextHtml: `<p><strong>${longText}</strong></p>`,
@@ -280,10 +287,14 @@ describe('CaseDetail — ruling HTML rendering', () => {
     // Click to expand
     fireEvent.click(showMoreButton);
 
-    // Now it should show formatted HTML
+    // Now it should show formatted HTML without max-height restriction
     const rulingContent = container.querySelector('.ruling-content');
     expect(rulingContent).toBeInTheDocument();
     expect(rulingContent?.innerHTML).toContain('<strong>');
+    expect(rulingContent?.classList.contains('max-h-40')).toBe(false);
+
+    // Fade gradient should be gone
+    expect(container.querySelector('.bg-gradient-to-t')).not.toBeInTheDocument();
   });
 
   it('renders only rulingTextHtml when rulingText is null', async () => {

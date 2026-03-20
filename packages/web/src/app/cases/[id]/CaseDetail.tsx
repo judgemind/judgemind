@@ -480,13 +480,20 @@ export function CaseDetail({ caseId }: { caseId: string }) {
                 {/* Ruling text — prefer formatted HTML, fall back to plain text */}
                 {hasText && (
                   <div className="px-4 pb-3">
-                    {node.rulingTextHtml && (!isLong || isExpanded) ? (
-                      <div
-                        className="ruling-content text-sm leading-relaxed text-slate-700 dark:text-slate-300"
-                        dangerouslySetInnerHTML={{
-                          __html: sanitizeRulingHtml(node.rulingTextHtml),
-                        }}
-                      />
+                    {node.rulingTextHtml ? (
+                      <div className="relative">
+                        <div
+                          className={`ruling-content text-sm leading-relaxed text-slate-700 dark:text-slate-300 overflow-hidden${
+                            isLong && !isExpanded ? ' max-h-40' : ''
+                          }`}
+                          dangerouslySetInnerHTML={{
+                            __html: sanitizeRulingHtml(node.rulingTextHtml),
+                          }}
+                        />
+                        {isLong && !isExpanded && (
+                          <div className="absolute bottom-0 left-0 right-0 h-12 bg-gradient-to-t from-white dark:from-slate-900 pointer-events-none" />
+                        )}
+                      </div>
                     ) : (
                       node.rulingText && (
                         <div className="space-y-3">
