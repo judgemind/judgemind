@@ -12,6 +12,7 @@ description = "Court data scraping framework for Judgemind"
 requires-python = ">=3.12"
 license = "Apache-2.0"
 dependencies = [
+    "charset-normalizer>=3.0",
     "httpx>=0.27",
     "playwright>=1.42",
     "beautifulsoup4>=4.12",

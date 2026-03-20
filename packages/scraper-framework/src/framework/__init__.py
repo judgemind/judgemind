@@ -3,6 +3,7 @@
 from .base import BaseScraper
 from .court_directory import CourtDirectory
 from .css_inliner import inline_css
+from .encoding import decode_response, detect_encoding
 from .event_bus import RedisEventBus
 from .events import EventBus
 from .hashing import content_changed, sha256_hex
@@ -26,6 +27,8 @@ __all__ = [
     "CourtDirectory",
     "CapturedDocument",
     "ContentFormat",
+    "decode_response",
+    "detect_encoding",
     "DocumentCapturedEvent",
     "EventBus",
     "IndexingConsumer",
