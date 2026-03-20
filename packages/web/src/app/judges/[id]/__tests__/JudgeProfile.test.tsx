@@ -14,6 +14,16 @@ vi.mock('next/link', () => ({
   ),
 }));
 
+// Mock lucide-react icons
+vi.mock('lucide-react', () => ({
+  BarChart3: ({ className }: { className?: string }) => (
+    <span data-testid="bar-chart-icon" className={className} />
+  ),
+  Scale: ({ className }: { className?: string }) => (
+    <span data-testid="scale-icon" className={className} />
+  ),
+}));
+
 // ---------------------------------------------------------------------------
 // GraphQL queries (must match the component's queries exactly)
 // ---------------------------------------------------------------------------
@@ -218,7 +228,6 @@ describe('JudgeProfile', () => {
       </MockedProvider>,
     );
 
-    // Wait for analytics to load
     await waitFor(() => {
       expect(screen.getByText('40%')).toBeInTheDocument();
     });
@@ -245,12 +254,11 @@ describe('JudgeProfile', () => {
     });
 
     expect(screen.getAllByText('Demurrer').length).toBeGreaterThanOrEqual(1);
-    // Check table header
     expect(screen.getByText('Motion Type')).toBeInTheDocument();
     expect(screen.getByText('Grant Rate')).toBeInTheDocument();
   });
 
-  it('renders date range in summary', async () => {
+  it('renders date range in stats card', async () => {
     const mocks = [
       buildAnalyticsMock('judge-1'),
       buildRulingsMock('judge-1'),
@@ -263,7 +271,7 @@ describe('JudgeProfile', () => {
     );
 
     await waitFor(() => {
-      expect(screen.getByText(/Based on 100 rulings from/)).toBeInTheDocument();
+      expect(screen.getByText('Date Range')).toBeInTheDocument();
     });
   });
 
@@ -283,11 +291,9 @@ describe('JudgeProfile', () => {
       expect(screen.getByText('24STCV12345')).toBeInTheDocument();
     });
 
-    // Check case link
     const caseLink = screen.getByText('24STCV12345').closest('a');
     expect(caseLink).toHaveAttribute('href', '/cases/case-1');
 
-    // Check outcome badges (may appear multiple times: analytics table header + ruling row)
     expect(screen.getAllByText('Granted').length).toBeGreaterThanOrEqual(1);
     expect(screen.getAllByText('Denied').length).toBeGreaterThanOrEqual(1);
   });
@@ -384,7 +390,7 @@ describe('JudgeProfile', () => {
     expect(screen.queryByText('Load more')).not.toBeInTheDocument();
   });
 
-  it('renders null analytics gracefully (judge not found via analytics)', async () => {
+  it('renders null analytics gracefully', async () => {
     const mocks: MockedResponse[] = [
       {
         request: {
@@ -409,7 +415,7 @@ describe('JudgeProfile', () => {
     });
   });
 
-  it('shows em-dash for ruling with no motion type or case', async () => {
+  it('shows em-dash for ruling with no case', async () => {
     const mocks = [
       buildAnalyticsMock('judge-sparse'),
       buildRulingsMock('judge-sparse', {
@@ -435,9 +441,44 @@ describe('JudgeProfile', () => {
     );
 
     await waitFor(() => {
-      // Em-dashes for null case and null motion type
       const dashes = screen.getAllByText('\u2014');
-      expect(dashes.length).toBeGreaterThanOrEqual(2);
+      expect(dashes.length).toBeGreaterThanOrEqual(1);
     });
+  });
+
+  it('renders ruling cards with shadcn Card components', async () => {
+    const mocks = [
+      buildAnalyticsMock('judge-1'),
+      buildRulingsMock('judge-1'),
+    ];
+
+    const { container } = render(
+      <MockedProvider mocks={mocks}>
+        <JudgeProfile judgeId="judge-1" />
+      </MockedProvider>,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByText('24STCV12345')).toBeInTheDocument();
+    });
+
+    const cards = container.querySelectorAll('.rounded-lg.border');
+    expect(cards.length).toBeGreaterThan(0);
+  });
+
+  it('renders section headings', async () => {
+    const mocks = [
+      buildAnalyticsMock('judge-1'),
+      buildRulingsMock('judge-1'),
+    ];
+
+    render(
+      <MockedProvider mocks={mocks}>
+        <JudgeProfile judgeId="judge-1" />
+      </MockedProvider>,
+    );
+
+    expect(screen.getByText('Analytics')).toBeInTheDocument();
+    expect(screen.getByText('Recent Rulings')).toBeInTheDocument();
   });
 });

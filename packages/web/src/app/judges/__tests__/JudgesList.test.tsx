@@ -24,6 +24,13 @@ vi.mock('next/link', () => ({
   ),
 }));
 
+// Mock lucide-react icons
+vi.mock('lucide-react', () => ({
+  Search: ({ className }: { className?: string }) => (
+    <span data-testid="search-icon" className={className} />
+  ),
+}));
+
 import { JudgesList } from '../JudgesList';
 
 const MOCK_JUDGES_DATA = {
@@ -214,7 +221,7 @@ describe('JudgesList', () => {
 
     render(<JudgesList />);
     expect(
-      screen.getByPlaceholderText(/Judge name/i),
+      screen.getByLabelText(/Judge name/i),
     ).toBeInTheDocument();
   });
 
@@ -227,10 +234,37 @@ describe('JudgesList', () => {
     });
 
     render(<JudgesList />);
-    const input = screen.getByPlaceholderText(/Judge name/i);
+    const input = screen.getByLabelText(/Judge name/i);
     fireEvent.change(input, { target: { value: 'Smith' } });
 
     expect(screen.getByText('Smith, John A.')).toBeInTheDocument();
     expect(screen.queryByText('Johnson, Robert M.')).not.toBeInTheDocument();
+  });
+
+  it('uses shadcn Table component', () => {
+    mockUseQuery.mockReturnValue({
+      data: MOCK_JUDGES_DATA,
+      loading: false,
+      error: undefined,
+      fetchMore: vi.fn(),
+    });
+
+    const { container } = render(<JudgesList />);
+    expect(container.querySelector('table')).toBeInTheDocument();
+  });
+
+  it('renders table column headers', () => {
+    mockUseQuery.mockReturnValue({
+      data: MOCK_JUDGES_DATA,
+      loading: false,
+      error: undefined,
+      fetchMore: vi.fn(),
+    });
+
+    render(<JudgesList />);
+    expect(screen.getByText('Judge')).toBeInTheDocument();
+    expect(screen.getByText('County')).toBeInTheDocument();
+    expect(screen.getByText('Dept.')).toBeInTheDocument();
+    expect(screen.getByText('Status')).toBeInTheDocument();
   });
 });
