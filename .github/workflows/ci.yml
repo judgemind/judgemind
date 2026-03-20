@@ -31,8 +31,8 @@ jobs:
       migrations: ${{ steps.changes.outputs.migrations }}
       any-testable: ${{ steps.any-testable.outputs.result }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: dorny/paths-filter@v3
+      - uses: actions/checkout@v6
+      - uses: dorny/paths-filter@v4
         id: changes
         with:
           filters: |
@@ -82,12 +82,12 @@ jobs:
       run:
         working-directory: packages/scraper-framework
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
         id: setup-python
         with:
           python-version: '3.12'
-      - uses: actions/cache@v4
+      - uses: actions/cache@v5
         id: venv-cache
         with:
           path: packages/scraper-framework/.venv
@@ -118,7 +118,7 @@ jobs:
           --ignore=tests/test_extract.py
       - name: Upload coverage
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: coverage-scraper-unit
           path: packages/scraper-framework/coverage.xml
@@ -139,12 +139,12 @@ jobs:
       run:
         working-directory: packages/scraper-framework
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
         id: setup-python
         with:
           python-version: '3.12'
-      - uses: actions/cache@v4
+      - uses: actions/cache@v5
         id: venv-cache
         with:
           path: packages/scraper-framework/.venv
@@ -172,7 +172,7 @@ jobs:
           -n 8 -v --tb=short
       - name: Upload coverage
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: coverage-scraper-ingestion
           path: packages/scraper-framework/coverage.xml
@@ -193,12 +193,12 @@ jobs:
       run:
         working-directory: packages/nlp-pipeline
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
         id: setup-python
         with:
           python-version: '3.12'
-      - uses: actions/cache@v4
+      - uses: actions/cache@v5
         id: venv-cache
         with:
           path: packages/nlp-pipeline/.venv
@@ -224,7 +224,7 @@ jobs:
         run: .venv/bin/pytest tests/ -v --tb=short
       - name: Upload coverage
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: coverage-nlp
           path: packages/nlp-pipeline/coverage.xml
@@ -275,8 +275,8 @@ jobs:
       DATABASE_URL: postgresql://judgemind:localdev@localhost:5432/judgemind
       OPENSEARCH_URL: http://localhost:9200
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
         with:
           node-version: '20'
       - name: Install dependencies
@@ -291,7 +291,7 @@ jobs:
         run: npx vitest run --coverage --passWithNoTests
       - name: Upload coverage
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: coverage-api
           path: packages/api/coverage/lcov.info
@@ -312,8 +312,8 @@ jobs:
       run:
         working-directory: packages/web
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
         with:
           node-version: '20'
       - name: Install dependencies
@@ -326,7 +326,7 @@ jobs:
         run: npx vitest run --coverage --passWithNoTests
       - name: Upload coverage
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: coverage-web
           path: packages/web/coverage/lcov.info
@@ -349,12 +349,12 @@ jobs:
       run:
         working-directory: packages/telegram-bridge
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
         id: setup-python
         with:
           python-version: '3.12'
-      - uses: actions/cache@v4
+      - uses: actions/cache@v5
         id: venv-cache
         with:
           path: packages/telegram-bridge/.venv
@@ -380,7 +380,7 @@ jobs:
         run: .venv/bin/pytest tests/ -v --tb=short
       - name: Upload coverage
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: coverage-telegram
           path: packages/telegram-bridge/coverage.xml
@@ -403,8 +403,8 @@ jobs:
       AWS_REGION: us-west-2
       TF_IN_AUTOMATION: true
     steps:
-      - uses: actions/checkout@v4
-      - uses: hashicorp/setup-terraform@v3
+      - uses: actions/checkout@v6
+      - uses: hashicorp/setup-terraform@v4
         with:
           terraform_version: '1.7'
       - name: Terraform fmt check
@@ -442,12 +442,12 @@ jobs:
       run:
         working-directory: ${{ matrix.lambda-dir }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
         id: setup-python
         with:
           python-version: '3.12'
-      - uses: actions/cache@v4
+      - uses: actions/cache@v5
         id: venv-cache
         with:
           path: ${{ matrix.lambda-dir }}/.venv
@@ -473,7 +473,7 @@ jobs:
         run: .venv/bin/pytest tests/ -v --tb=short
       - name: Upload coverage
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: coverage-lambda-telegram-bot
           path: ${{ matrix.lambda-dir }}/coverage.xml
@@ -493,8 +493,8 @@ jobs:
     env:
       PYTHONPATH: scripts
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
       - name: Install test dependencies
@@ -514,11 +514,11 @@ jobs:
     if: always() && github.event_name == 'pull_request' && needs.detect-changes.outputs.any-testable == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
 
@@ -527,7 +527,7 @@ jobs:
 
       # Download all coverage artifacts (each upload is optional — packages
       # that were skipped or had no tests will simply be missing).
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           pattern: coverage-*
           path: coverage-artifacts/
@@ -677,8 +677,8 @@ jobs:
   dq-baselines-validate:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
       - name: Validate data-quality-baselines.json
@@ -690,7 +690,7 @@ jobs:
   oneshot-imports-check:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Check for sibling imports in oneshot scripts
         run: scripts/check-oneshot-imports.sh
 
@@ -702,7 +702,7 @@ jobs:
     if: needs.detect-changes.outputs.ecs-oneshot == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Run ECS oneshot integration tests
         run: .github/ecs-oneshot-test/run-tests.sh
 
