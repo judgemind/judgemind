@@ -707,3 +707,156 @@ def test_extract_case_title_long_truncation() -> None:
     title = _extract_case_title(text)
     assert title is not None
     assert len(title) <= 200
+
+
+# ---------------------------------------------------------------------------
+# Judge name population from department mapping
+# ---------------------------------------------------------------------------
+
+
+@respx.mock
+def test_ventura_parse_document_populates_judge_name_from_dept_map() -> None:
+    """parse_document should populate judge_name from dept_judge_map when available."""
+    search_html = _load_html("ventura_search_page.html")
+    results_html = _load_html("ventura_results_page.html")
+    doc_content = b"<html><body><p>The motion is GRANTED.</p></body></html>"
+
+    respx.get(SEARCH_URL).mock(return_value=httpx.Response(200, text=search_html))
+    respx.post(SEARCH_URL).mock(return_value=httpx.Response(200, text=results_html))
+    respx.get(url__regex=r"/CaseInquiry/ViewFile/\d+").mock(
+        return_value=httpx.Response(
+            200,
+            content=doc_content,
+            headers={"content-type": "text/html"},
+        )
+    )
+
+    # Dept 20 -> Maureen M. Houska, Dept 42 -> Ronda J. McKaig, Dept 43 -> Benjamin F. Coats
+    dept_map = {"20": "Maureen M. Houska", "42": "Ronda J. McKaig", "43": "Benjamin F. Coats"}
+
+    config = ventura_default_config()
+    config.request_delay_seconds = 0
+    scraper = VenturaTentativeRulingsScraper(
+        config=config,
+        search_dates=[datetime(2026, 3, 11)],
+        dept_judge_map=dept_map,
+    )
+
+    docs = scraper.fetch_documents()
+    assert len(docs) == 6
+
+    # Parse each document — judge_name should be populated from the mapping
+    for doc in docs:
+        parsed = scraper.parse_document(doc)
+        if parsed.department in dept_map:
+            assert parsed.judge_name == dept_map[parsed.department], (
+                f"Expected judge_name={dept_map[parsed.department]} for dept={parsed.department}, "
+                f"got {parsed.judge_name}"
+            )
+
+
+@respx.mock
+def test_ventura_full_run_with_dept_map_populates_judge_names() -> None:
+    """Full scraper run with dept_judge_map should populate judge names on all docs."""
+    search_html = _load_html("ventura_search_page.html")
+    results_html = _load_html("ventura_results_page.html")
+    doc_content = b"<html><body><p>Smith v. Jones. The motion is GRANTED.</p></body></html>"
+
+    respx.get(SEARCH_URL).mock(return_value=httpx.Response(200, text=search_html))
+    respx.post(SEARCH_URL).mock(return_value=httpx.Response(200, text=results_html))
+    respx.get(url__regex=r"/CaseInquiry/ViewFile/\d+").mock(
+        return_value=httpx.Response(
+            200,
+            content=doc_content,
+            headers={"content-type": "text/html"},
+        )
+    )
+
+    dept_map = {"20": "Maureen M. Houska", "42": "Ronda J. McKaig", "43": "Benjamin F. Coats"}
+
+    config = ventura_default_config()
+    config.request_delay_seconds = 0
+    scraper = VenturaTentativeRulingsScraper(
+        config=config,
+        search_dates=[datetime(2026, 3, 11)],
+        dept_judge_map=dept_map,
+    )
+
+    health = scraper.run()
+    assert health.success is True
+    assert health.records_captured == 6
+
+
+def test_ventura_parse_document_no_dept_map_leaves_judge_none() -> None:
+    """Without a dept_judge_map, judge_name should remain None."""
+    from framework import CapturedDocument, ContentFormat
+
+    config = ventura_default_config()
+    scraper = VenturaTentativeRulingsScraper(config=config)
+
+    doc = CapturedDocument(
+        scraper_id=config.scraper_id,
+        state="CA",
+        county="Ventura",
+        court="Superior Court",
+        source_url="https://example.com",
+        capture_timestamp=datetime(2026, 3, 11),
+        content_format=ContentFormat.HTML,
+        raw_content=b"<html><body><p>The motion is GRANTED.</p></body></html>",
+        content_hash="abc123",
+    )
+    doc.department = "20"
+
+    result = scraper.parse_document(doc)
+    assert result.judge_name is None
+
+
+def test_ventura_parse_document_dept_map_unknown_dept() -> None:
+    """Dept not in mapping should leave judge_name as None."""
+    from framework import CapturedDocument, ContentFormat
+
+    config = ventura_default_config()
+    dept_map = {"42": "Ronda J. McKaig"}
+    scraper = VenturaTentativeRulingsScraper(config=config, dept_judge_map=dept_map)
+
+    doc = CapturedDocument(
+        scraper_id=config.scraper_id,
+        state="CA",
+        county="Ventura",
+        court="Superior Court",
+        source_url="https://example.com",
+        capture_timestamp=datetime(2026, 3, 11),
+        content_format=ContentFormat.HTML,
+        raw_content=b"<html><body><p>The motion is GRANTED.</p></body></html>",
+        content_hash="abc123",
+    )
+    doc.department = "99"
+
+    result = scraper.parse_document(doc)
+    assert result.judge_name is None
+
+
+def test_ventura_parse_document_preserves_existing_judge_name() -> None:
+    """If judge_name is already set, the mapping should not overwrite it."""
+    from framework import CapturedDocument, ContentFormat
+
+    config = ventura_default_config()
+    dept_map = {"20": "Maureen M. Houska"}
+    scraper = VenturaTentativeRulingsScraper(config=config, dept_judge_map=dept_map)
+
+    doc = CapturedDocument(
+        scraper_id=config.scraper_id,
+        state="CA",
+        county="Ventura",
+        court="Superior Court",
+        source_url="https://example.com",
+        capture_timestamp=datetime(2026, 3, 11),
+        content_format=ContentFormat.HTML,
+        raw_content=b"<html><body><p>The motion is GRANTED.</p></body></html>",
+        content_hash="abc123",
+    )
+    doc.department = "20"
+    doc.judge_name = "Pre-existing Name"
+
+    result = scraper.parse_document(doc)
+    assert result.judge_name == "Pre-existing Name"
