@@ -7,7 +7,7 @@
 #
 # Options:
 #   --max-workers N   Refuse to create a worker if N or more already exist.
-#                     Used by the orchestrator to enforce slot limits.
+#                     Used by the dispatcher to enforce slot limits.
 #
 # Safe to run from anywhere inside the repo, including from an existing worktree.
 

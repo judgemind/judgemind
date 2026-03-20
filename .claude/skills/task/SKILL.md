@@ -24,7 +24,7 @@ If a `--max-workers N` flag was passed in your arguments, pass it through to the
 scripts/start-worker.sh --max-workers N
 ```
 
-This provides a hard programmatic limit on the number of concurrent worker worktrees, enforced by the script itself. The orchestrator passes this flag to prevent exceeding its slot limit.
+This provides a hard programmatic limit on the number of concurrent worker worktrees, enforced by the script itself. The dispatcher passes this flag to prevent exceeding its slot limit.
 
 This resolves the repo root, prunes stale worktrees, claims the lowest available worker number, creates the worktree, configures git hooks, and creates the `tmp/` directory.
 
@@ -34,7 +34,7 @@ If you are already in a worktree, skip this step.
 
 ### Status file setup
 
-After creating or entering a worktree, set up the agent status file so the orchestrator can monitor progress. Derive the worker number from the worktree path (e.g. `worker-2` → `2`).
+After creating or entering a worktree, set up the agent status file so the dispatcher can monitor progress. Derive the worker number from the worktree path (e.g. `worker-2` → `2`).
 
 The status file lives at `{repo_root}/tmp/agent-status/worker-N.txt` (in the **repo root's** `tmp/`, not the worktree's `tmp/`). Create the directory if needed:
 

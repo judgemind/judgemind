@@ -82,7 +82,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash .claude/hooks/orchestrator-guard.sh",
+            "command": "bash .claude/hooks/dispatcher-guard.sh",
             "timeout": 5
           }
         ]

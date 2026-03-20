@@ -1,6 +1,6 @@
 # Telegram Integration — Agent Reference
 
-> **When to read this:** only when working on Telegram-related tasks, the orchestrator, or the responder daemon.
+> **When to read this:** only when working on Telegram-related tasks, the dispatcher, or the responder daemon.
 
 ## Overview
 
@@ -27,37 +27,37 @@ See `docs/telegram-setup.md` for end-to-end setup instructions.
 
 ## Session Triggers — Telegram Commands
 
-When Telegram is configured (bot token in Secrets Manager `judgemind/telegram/bot` and SQS queue `judgemind-telegram-inbound-dev`), the orchestrator can receive inbound commands from Telegram and send lifecycle notifications. Use `packages/telegram-bridge/` — specifically the `OrchestratorBridge` class.
+When Telegram is configured (bot token in Secrets Manager `judgemind/telegram/bot` and SQS queue `judgemind-telegram-inbound-dev`), the dispatcher can receive inbound commands from Telegram and send lifecycle notifications. Use `packages/telegram-bridge/` — specifically the `OrchestratorBridge` class.
 
 **Lifecycle notifications:** call `session_started()` when an interactive session begins, `task_started()` / `task_completed()` / `task_failed()` around `/task` agent invocations, and `session_ended()` when shutting down.
 
-**Inbound messages:** All Telegram messages are interpreted as free text by a Claude API call (Opus) in the responder daemon. The daemon responds directly with natural-language replies and extracts actionable commands (start, pause, resume, stop) for the orchestrator. No special command syntax is required — users can write naturally.
+**Inbound messages:** All Telegram messages are interpreted as free text by a Claude API call (Opus) in the responder daemon. The daemon responds directly with natural-language replies and extracts actionable commands (start, pause, resume, stop) for the dispatcher. No special command syntax is required — users can write naturally.
 
-The orchestrator uses `bridge.read_inbox()` to pick up commands from the file-based inbox. The responder daemon handles the interpretation and reply, so the orchestrator only sees pre-parsed actions.
+The dispatcher uses `bridge.read_inbox()` to pick up commands from the file-based inbox. The responder daemon handles the interpretation and reply, so the dispatcher only sees pre-parsed actions.
 
 If Telegram is not configured, all bridge calls are silent no-ops. No existing workflows are affected.
 
-## Orchestrator Status File
+## Dispatcher Status File
 
-The orchestrator must call `bridge.write_status()` after every state change (task start, complete, fail, pause, resume). This writes `tmp/orchestrator_status.json` containing:
+The dispatcher must call `bridge.write_status()` after every state change (task start, complete, fail, pause, resume). This writes `tmp/orchestrator_status.json` containing:
 - Active agents: issue number, title, worker number, phase
 - Open PRs: number, CI status, mergeable
 - Recently completed tasks: issue number, outcome
 - Queue: next issues by priority
 - Paused/stopped state
 
-The responder daemon reads this file to provide context to the Claude interpreter, enabling it to give informed, specific answers about orchestrator state.
+The responder daemon reads this file to provide context to the Claude interpreter, enabling it to give informed, specific answers about dispatcher state.
 
 ## Responder Daemon and State Files
 
-The standalone **responder daemon** (`scripts/tg-responder.py`) interprets all Telegram messages via a Claude API call (Opus). It receives the user's message and the current orchestrator status, generates a natural-language reply, and extracts any actionable commands. It communicates with the orchestrator via shared state files:
+The standalone **responder daemon** (`scripts/tg-responder.py`) interprets all Telegram messages via a Claude API call (Opus). It receives the user's message and the current dispatcher status, generates a natural-language reply, and extracts any actionable commands. It communicates with the dispatcher via shared state files:
 
 - **`tmp/orchestrator_status.json`** — written by `OrchestratorBridge.write_status()`. The responder reads this to provide context to the Claude interpreter. Contains active agents, open PRs, queue, and paused/stopped state.
-- **`tmp/orchestrator_state.json`** — the responder writes `paused` flag changes here. The orchestrator must call `bridge.refresh_state()` before each spawn decision to pick up `pause`/`resume` changes made out-of-loop.
-- **`tmp/stop_requests.json`** — the responder appends stop requests here (JSON array of `{"issue_number": N, "timestamp": "..."}`). The orchestrator reads and clears this file by calling `bridge.read_stop_requests()`, which returns newly stopped issue numbers and accumulates them in `bridge.stopped_issues`. Use `bridge.is_issue_stopped(N)` to check before spawning.
+- **`tmp/orchestrator_state.json`** — the responder writes `paused` flag changes here. The dispatcher must call `bridge.refresh_state()` before each spawn decision to pick up `pause`/`resume` changes made out-of-loop.
+- **`tmp/stop_requests.json`** — the responder appends stop requests here (JSON array of `{"issue_number": N, "timestamp": "..."}`). The dispatcher reads and clears this file by calling `bridge.read_stop_requests()`, which returns newly stopped issue numbers and accumulates them in `bridge.stopped_issues`. Use `bridge.is_issue_stopped(N)` to check before spawning.
 - **`tmp/tg_inbox.json`** — queued `start` commands extracted by the interpreter, read by `bridge.read_inbox()`.
 
-**Orchestrator spawn loop pattern:**
+**Dispatcher spawn loop pattern:**
 1. Call `bridge.write_status()` to update the status file for the responder.
 2. Call `bridge.refresh_state()` to pick up external `paused` changes.
 3. Call `bridge.read_stop_requests()` to consume new stop requests.

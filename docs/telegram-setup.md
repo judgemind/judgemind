@@ -160,16 +160,16 @@ If the message count is greater than 0, the webhook pipeline is working end-to-e
 
 ## Supported Commands
 
-Once the bridge is active, the orchestrator polls SQS and recognizes these commands:
+Once the bridge is active, the dispatcher polls SQS and recognizes these commands:
 
 | Command        | Action                                               |
 |----------------|------------------------------------------------------|
 | `status`       | Replies with a summary of running tasks              |
 | `start #N`     | Spawns a `/task #N` agent for that issue             |
 | `stop #N`      | Notes the stop request; avoids spawning more work    |
-| `pause`        | Stops the orchestrator from spawning new task agents |
+| `pause`        | Stops the dispatcher from spawning new task agents |
 | `resume`       | Resumes normal task spawning                         |
-| *(free text)*  | Forwarded to the orchestrator for interpretation     |
+| *(free text)*  | Forwarded to the dispatcher for interpretation     |
 
 ## Automated Testing
 

@@ -1,12 +1,12 @@
 # telegram-bridge
 
-Python client library for bidirectional communication between Judgemind's orchestrator agents and the maintainer via Telegram. Fully opt-in -- if no Telegram credentials are configured, all methods silently become no-ops.
+Python client library for bidirectional communication between Judgemind's dispatcher agents and the maintainer via Telegram. Fully opt-in -- if no Telegram credentials are configured, all methods silently become no-ops.
 
 ## Key Entry Points
 
 - **`src/telegram_bridge/client.py`** -- `TelegramBridge` class: async client for sending Telegram notifications and polling for inbound commands. Thread-safe.
-- **`src/telegram_bridge/orchestrator.py`** -- `OrchestratorBridge`: higher-level interface for the orchestrator agent. Manages command queues, pending replies, and status cards.
-- **`src/telegram_bridge/interpreter.py`** -- Natural language message interpretation using Claude. Converts free-text Telegram messages into structured orchestrator commands.
+- **`src/telegram_bridge/orchestrator.py`** -- `OrchestratorBridge`: higher-level interface for the dispatcher agent. Manages command queues, pending replies, and status cards.
+- **`src/telegram_bridge/interpreter.py`** -- Natural language message interpretation using Claude. Converts free-text Telegram messages into structured dispatcher commands.
 - **`src/telegram_bridge/formatting.py`** -- HTML formatting utilities for Telegram messages (escaping, GitHub ref linking, message splitting for the 4096-char limit).
 - **`src/telegram_bridge/validation.py`** -- Payload validation for inbound Telegram webhook events.
 
@@ -20,7 +20,7 @@ Python client library for bidirectional communication between Judgemind's orches
 ## What It Produces (Outputs)
 
 - **Telegram messages** -- Status updates, task notifications, and replies sent to the configured chat.
-- **Structured commands** -- Parsed orchestrator instructions (start task, pause, resume, status query) from natural language input.
+- **Structured commands** -- Parsed dispatcher instructions (start task, pause, resume, status query) from natural language input.
 
 ## Install, Test, and Run Locally
 

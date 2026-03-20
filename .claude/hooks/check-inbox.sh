@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # PostToolUse hook: check the subagent's worktree inbox for messages from the
-# orchestrator.  If messages are present, echo them to stdout (so they appear
+# dispatcher.  If messages are present, echo them to stdout (so they appear
 # in the agent's context) and truncate the file.
 #
 # This hook is designed to be extremely fast when no messages are pending:

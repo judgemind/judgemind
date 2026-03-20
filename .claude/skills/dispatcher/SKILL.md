@@ -1,21 +1,21 @@
 ---
-description: Opt-in autonomous work queue manager — launches /task agents, merges PRs, triages issues, and communicates via Telegram. Usage: /orchestrator (default 5 slots), /orchestrator 3 (custom slot count), /orchestrator #589 #590 (specific issues only).
+description: Opt-in autonomous work queue manager — launches /task agents, merges PRs, triages issues, and communicates via Telegram. Usage: /dispatcher (default 5 slots), /dispatcher 3 (custom slot count), /dispatcher #589 #590 (specific issues only).
 argument-hint: "[max-agents | #issue1 #issue2 ...]"
 ---
 
-# /orchestrator skill
+# /dispatcher skill
 
-Enable orchestrator mode for the current interactive session. This transforms the session into an autonomous work queue manager that continuously launches `/task` agents, merges completed PRs, triages issues, and communicates via Telegram.
+Enable dispatcher mode for the current interactive session. This transforms the session into an autonomous work queue manager that continuously launches `/task` agents, merges completed PRs, triages issues, and communicates via Telegram.
 
-**Orchestrator mode is opt-in.** Interactive sessions are general-purpose by default. The user invokes `/orchestrator` when they want autonomous queue management.
+**Dispatcher mode is opt-in.** Interactive sessions are general-purpose by default. The user invokes `/dispatcher` when they want autonomous queue management.
 
 ---
 
 ## Arguments
 
 - **No arguments** — run with default settings (5 concurrent agent slots, pick from `agent/ready` backlog by priority)
-- **`N`** (e.g. `/orchestrator 3`) — set max concurrent agent slots to N
-- **`#N1 #N2 ...`** (e.g. `/orchestrator #589 #590`) — work only on the specified issues, in order
+- **`N`** (e.g. `/dispatcher 3`) — set max concurrent agent slots to N
+- **`#N1 #N2 ...`** (e.g. `/dispatcher #589 #590`) — work only on the specified issues, in order
 
 ---
 
@@ -65,13 +65,13 @@ Handle any in-flight PRs before launching new work (see "PR Merge Policy" below)
 
 ### 4. Initialize audit counter
 
-Read `tmp/orchestrator_status.json` to recover the `prs_since_last_audit` counter from a previous session. If the file does not exist or the field is missing, initialize the counter to 0.
+Read `tmp/dispatcher_status.json` to recover the `prs_since_last_audit` counter from a previous session. If the file does not exist or the field is missing, initialize the counter to 0.
 
 ### 5. Initialize context rotation counter
 
 Initialize `loop_iterations` to 0. This counter tracks how many main loop iterations have elapsed in this session. It is used to trigger a graceful exit before the context window fills up and causes compaction-related forgetfulness (see "Context-Aware Rotation" below).
 
-Also read `session_number` from `tmp/orchestrator_status.json` (default to 0 if missing). Increment it by 1 and persist it back — this tracks how many times the orchestrator has been restarted by the outer `while :; do` loop. The first invocation is session 1.
+Also read `session_number` from `tmp/dispatcher_status.json` (default to 0 if missing). Increment it by 1 and persist it back — this tracks how many times the dispatcher has been restarted by the outer `while :; do` loop. The first invocation is session 1.
 
 ### 6. Store max_slots for enforcement
 
@@ -81,10 +81,10 @@ Store the max slot count (from the argument, or 5 if not specified) in a variabl
 
 ## Main Loop
 
-The orchestrator runs a continuous loop:
+The dispatcher runs a continuous loop:
 
 1. **Refresh state** — check Telegram inbox, stop requests, and pause state
-2. **Process orchestrator inbox** — read and execute subagent instructions (see "Subagent Instruction Channel" below)
+2. **Process dispatcher inbox** — read and execute subagent instructions (see "Subagent Instruction Channel" below)
 3. **Handle in-flight PRs** — merge any that are ready, fix any that are failing
 4. **Sync after merges** — pull latest main after each merge (see "Post-merge sync" in Rules)
 5. **Check audit trigger** — if `prs_since_last_audit >= 20`, spawn `/audit` (see "Periodic Audit" below)
@@ -99,7 +99,7 @@ The orchestrator runs a continuous loop:
 - Default max slots: **5** (overridable via argument)
 - Track active agents by worker number and issue number
 - When an agent completes, its slot opens immediately
-- **HARD RULE: Never exceed the max slot count.** The `start-worker.sh` script enforces this via `--max-workers`, but the orchestrator must ALSO check before spawning.
+- **HARD RULE: Never exceed the max slot count.** The `start-worker.sh` script enforces this via `--max-workers`, but the dispatcher must ALSO check before spawning.
 - Launch `/task` agents **without** `isolation: "worktree"` — the skill manages its own worktree
 
 ### Spawning agents — MANDATORY SLOT COUNT CHECK
@@ -110,7 +110,7 @@ The orchestrator runs a continuous loop:
 2. Compare: `active_agent_count >= max_slots`. If true, **DO NOT SPAWN**. Skip to the next step of the main loop. Log: "Slot limit reached (N active, limit M) — not spawning."
 3. Only if `active_agent_count < max_slots`, proceed to spawn.
 
-**Additionally**, `scripts/start-worker.sh` provides a hard backstop via `--max-workers`. The `/task` skill accepts `--max-workers` and passes it through to `start-worker.sh`. If the worktree count already meets the limit, the script will exit non-zero and the agent will fail to start. This is a safety net — the orchestrator's own count check (step 2 above) should prevent this from ever being reached.
+**Additionally**, `scripts/start-worker.sh` provides a hard backstop via `--max-workers`. The `/task` skill accepts `--max-workers` and passes it through to `start-worker.sh`. If the worktree count already meets the limit, the script will exit non-zero and the agent will fail to start. This is a safety net — the dispatcher's own count check (step 2 above) should prevent this from ever being reached.
 
 For each open slot, pick the next highest-priority unassigned `agent/ready` issue and spawn:
 
@@ -126,7 +126,7 @@ as a background subagent. Before spawning each agent:
 2. If `active_agent_count >= max_slots`: stop spawning. Do not spawn this agent or any more.
 3. Call `bridge.refresh_state()` to pick up external pause/resume changes
 4. Call `bridge.read_stop_requests()` to consume stop requests
-5. Call `bridge.read_orchestrator_inbox()` to process subagent instructions
+5. Call `bridge.read_dispatcher_inbox()` to process subagent instructions
 6. If `bridge.paused` is `True`, skip spawning
 7. If `bridge.is_issue_stopped(N)` is `True`, skip that issue
 8. Skip issues already being worked on by another slot
@@ -137,14 +137,14 @@ as a background subagent. Before spawning each agent:
 scripts/tg-notify.py task_started <issue_number> "<title>" <worker_number>
 ```
 
-This sends the Telegram message **and** updates `tmp/orchestrator_status.json` so the responder daemon has accurate context.
+This sends the Telegram message **and** updates `tmp/dispatcher_status.json` so the responder daemon has accurate context.
 
 ### Filtering task notifications
 
-Not all `<task-notification>` messages require orchestrator action. The platform fires notifications for both subagent completions and background command completions. The orchestrator **must** distinguish between the two:
+Not all `<task-notification>` messages require dispatcher action. The platform fires notifications for both subagent completions and background command completions. The dispatcher **must** distinguish between the two:
 
 - **Respond to:** Agent completions — notifications where the `<summary>` starts with `"Agent"` (e.g. `"Agent for task #42 completed"`, `"Agent for task #42 failed"`). These represent `/task` or `/audit` subagent results that require slot bookkeeping, Telegram notification, and potential backfill.
-- **Ignore silently:** Background command completions — notifications where the `<summary>` starts with `"Background command"` (e.g. `"Background command completed"`, `"Background command failed"`). These are internal operations run by subagents (Gemini reviews, `gh run watch`, test suites, lint runs, etc.) and need no orchestrator action.
+- **Ignore silently:** Background command completions — notifications where the `<summary>` starts with `"Background command"` (e.g. `"Background command completed"`, `"Background command failed"`). These are internal operations run by subagents (Gemini reviews, `gh run watch`, test suites, lint runs, etc.) and need no dispatcher action.
 
 **When a background command notification arrives, do nothing.** Do not acknowledge it, do not print a status message, do not send a Telegram notification. Simply continue the main loop. Responding to these creates noise in the conversation without adding value.
 
@@ -168,9 +168,9 @@ Both commands update the status file automatically. Always send a notification i
 
 ## Context-Aware Rotation
 
-**Problem:** The orchestrator runs in an outer `while :; do claude /orchestrator; done` loop. Over time, the conversation context fills up. When context compaction occurs, the LLM loses track of in-memory state (active workers, what it was doing, pending decisions), causing the orchestrator to become "forgetful" and unreliable.
+**Problem:** The dispatcher runs in an outer `while :; do claude /dispatcher; done` loop. Over time, the conversation context fills up. When context compaction occurs, the LLM loses track of in-memory state (active workers, what it was doing, pending decisions), causing the dispatcher to become "forgetful" and unreliable.
 
-**Solution:** The orchestrator proactively exits before context gets too large, allowing the outer loop to restart it with a fresh context. All state is persisted to files, so the new session picks up seamlessly.
+**Solution:** The dispatcher proactively exits before context gets too large, allowing the outer loop to restart it with a fresh context. All state is persisted to files, so the new session picks up seamlessly.
 
 ### When to rotate
 
@@ -179,23 +179,23 @@ At main loop step 9, increment `loop_iterations`. If **all** of these conditions
 1. `loop_iterations >= 40` — enough iterations have elapsed that context is likely getting large
 2. No agents are in the middle of spawning (all slots are either occupied by running agents or empty)
 
-The threshold of 40 iterations is conservative — each iteration adds tool calls, command outputs, and notification messages to the context. At typical orchestrator verbosity, 40 iterations approaches the context window limit. If you observe compaction happening earlier, reduce this threshold.
+The threshold of 40 iterations is conservative — each iteration adds tool calls, command outputs, and notification messages to the context. At typical dispatcher verbosity, 40 iterations approaches the context window limit. If you observe compaction happening earlier, reduce this threshold.
 
 **During the wind-down phase (after the threshold is hit):**
 
 1. **Stop launching new agents.** Set an internal `winding_down` flag. Do not fill empty slots.
 2. **Continue processing completions.** Handle `<task-notification>` messages, merge green PRs, send Telegram notifications — all as normal.
-3. **Continue processing Telegram commands.** Respond to `status`, `pause`, `resume`, `stop` commands as normal. For `start #N` commands, acknowledge receipt but note the orchestrator is about to restart and will pick it up in the next session.
+3. **Continue processing Telegram commands.** Respond to `status`, `pause`, `resume`, `stop` commands as normal. For `start #N` commands, acknowledge receipt but note the dispatcher is about to restart and will pick it up in the next session.
 4. **Wait for all active agents to complete.** Check active agent count each iteration. Once all agents have finished (or reported back), proceed to exit.
 5. **Merge any remaining green PRs.** Do one final sweep.
-6. **Persist all state.** Ensure `tmp/orchestrator_status.json` and `tmp/orchestrator_state.json` are up to date with: `prs_since_last_audit`, `session_number`, paused state, stopped issues, and recently completed tasks.
+6. **Persist all state.** Ensure `tmp/dispatcher_status.json` and `tmp/dispatcher_state.json` are up to date with: `prs_since_last_audit`, `session_number`, paused state, stopped issues, and recently completed tasks.
 7. **Send a rotation notification:**
    ```
-   scripts/tg-notify.py notify "Orchestrator rotating context (session N, M iterations). Restarting momentarily."
+   scripts/tg-notify.py notify "Dispatcher rotating context (session N, M iterations). Restarting momentarily."
    ```
-8. **Do NOT stop the responder daemon.** The outer loop will restart the orchestrator immediately, and the responder should keep running to avoid missing Telegram messages.
+8. **Do NOT stop the responder daemon.** The outer loop will restart the dispatcher immediately, and the responder should keep running to avoid missing Telegram messages.
 9. **Do NOT send `session_ended`.** This is a rotation, not a shutdown. The next session will continue seamlessly.
-10. **Exit.** Print a summary of what was accomplished in this session, then stop. The outer `while :; do` loop will restart the orchestrator with a fresh context.
+10. **Exit.** Print a summary of what was accomplished in this session, then stop. The outer `while :; do` loop will restart the dispatcher with a fresh context.
 
 ### State that persists across rotations
 
@@ -203,10 +203,10 @@ All of this state survives a rotation because it is file-backed:
 
 | State | File | Notes |
 |---|---|---|
-| Paused flag | `tmp/orchestrator_state.json` | New session reads on startup |
-| Active workers | `tmp/orchestrator_state.json` | New session discovers running agents via worktree list + status files |
-| PRs since last audit | `tmp/orchestrator_status.json` | Counter continues from where it left off |
-| Session number | `tmp/orchestrator_status.json` | Incremented on each startup |
+| Paused flag | `tmp/dispatcher_state.json` | New session reads on startup |
+| Active workers | `tmp/dispatcher_state.json` | New session discovers running agents via worktree list + status files |
+| PRs since last audit | `tmp/dispatcher_status.json` | Counter continues from where it left off |
+| Session number | `tmp/dispatcher_status.json` | Incremented on each startup |
 | Stopped issues | `tmp/stop_requests.json` | Persists across sessions |
 | Responder daemon | PID file in `tmp/` | Keeps running across rotations |
 | Telegram inbox | `tmp/tg_inbox.json` | New session picks up unprocessed commands |
@@ -223,25 +223,25 @@ All of this state survives a rotation because it is file-backed:
 
 ## Subagent Instruction Channel
 
-Subagents can request actions from the orchestrator by writing to `tmp/orchestrator_inbox.json`. This is a file-based instruction channel similar to `tmp/tg_inbox.json` (Telegram inbox), but for subagent-to-orchestrator communication.
+Subagents can request actions from the dispatcher by writing to `tmp/dispatcher_inbox.json`. This is a file-based instruction channel similar to `tmp/tg_inbox.json` (Telegram inbox), but for subagent-to-dispatcher communication.
 
 ### How subagents write instructions
 
-Subagents use `scripts/orchestrator-request.py` to append entries:
+Subagents use `scripts/dispatcher-request.py` to append entries:
 
 ```
-scripts/orchestrator-request.py restart_responder --reason "telegram-bridge code updated" --from-issue 733
-scripts/orchestrator-request.py notify --message "Found regression in OC scraper" --from-issue 600
-scripts/orchestrator-request.py terraform_apply --module telegram-bot --from-issue 712
-scripts/orchestrator-request.py run_script --script scripts/tg-set-webhook.sh --from-issue 725
-scripts/orchestrator-request.py file_issue --title "Bug report" --description "Details..." --priority p1 --labels area/scraping
+scripts/dispatcher-request.py restart_responder --reason "telegram-bridge code updated" --from-issue 733
+scripts/dispatcher-request.py notify --message "Found regression in OC scraper" --from-issue 600
+scripts/dispatcher-request.py terraform_apply --module telegram-bot --from-issue 712
+scripts/dispatcher-request.py run_script --script scripts/tg-set-webhook.sh --from-issue 725
+scripts/dispatcher-request.py file_issue --title "Bug report" --description "Details..." --priority p1 --labels area/scraping
 ```
 
 The script is stdlib-only (no venv needed) and uses file locking for safe concurrent access.
 
-### How the orchestrator reads instructions
+### How the dispatcher reads instructions
 
-In the main loop (step 2), call `bridge.read_orchestrator_inbox()` which returns a list of `OrchestratorInstruction` objects. For each instruction:
+In the main loop (step 2), call `bridge.read_dispatcher_inbox()` which returns a list of `DispatcherInstruction` objects. For each instruction:
 
 | Action | How to handle |
 |---|---|
@@ -259,7 +259,7 @@ In the main loop (step 2), call `bridge.read_orchestrator_inbox()` which returns
 
 ### Inbox file format
 
-`tmp/orchestrator_inbox.json` is a JSON array of instruction objects:
+`tmp/dispatcher_inbox.json` is a JSON array of instruction objects:
 
 ```json
 [
@@ -269,33 +269,33 @@ In the main loop (step 2), call `bridge.read_orchestrator_inbox()` which returns
 ]
 ```
 
-The file is atomically read and truncated by `read_orchestrator_inbox()`, just like `read_inbox()` and `read_stop_requests()`.
+The file is atomically read and truncated by `read_dispatcher_inbox()`, just like `read_inbox()` and `read_stop_requests()`.
 
 ---
 
-## Orchestrator-to-Subagent Message Channel
+## Dispatcher-to-Subagent Message Channel
 
-The orchestrator can send messages to running subagents via their worktree inbox. This is the reverse of the Subagent Instruction Channel above — it allows the orchestrator to push context to running agents without interrupting them.
+The dispatcher can send messages to running subagents via their worktree inbox. This is the reverse of the Subagent Instruction Channel above — it allows the dispatcher to push context to running agents without interrupting them.
 
-### How the orchestrator sends messages
+### How the dispatcher sends messages
 
-Use `scripts/orchestrator-send.py` to write messages to a subagent's worktree inbox:
+Use `scripts/dispatcher-send.py` to write messages to a subagent's worktree inbox:
 
 ```
-scripts/orchestrator-send.py --worktree /path/to/worktree "Rebase onto latest main, PR #100 touched your files"
-scripts/orchestrator-send.py --worktree /path/to/worktree "Issue #42 was deprioritized, finish current work but skip stretch goals"
+scripts/dispatcher-send.py --worktree /path/to/worktree "Rebase onto latest main, PR #100 touched your files"
+scripts/dispatcher-send.py --worktree /path/to/worktree "Issue #42 was deprioritized, finish current work but skip stretch goals"
 ```
 
 The script is stdlib-only (no venv needed) and uses file locking for safe concurrent access. Messages are written to `{worktree}/tmp/inbox.json`.
 
 ### How subagents receive messages
 
-A PostToolUse hook (`check-inbox.sh`) runs after every tool call in the subagent. When messages are present, it echoes them to stdout prefixed with `[orchestrator]`, then truncates the inbox file. The agent sees messages naturally as part of hook output — no special handling needed.
+A PostToolUse hook (`check-inbox.sh`) runs after every tool call in the subagent. When messages are present, it echoes them to stdout prefixed with `[dispatcher]`, then truncates the inbox file. The agent sees messages naturally as part of hook output — no special handling needed.
 
 The hook is designed for minimal overhead:
 - Checks file existence and size in pure bash (fast path: <1ms when no messages)
 - Only invokes Python for JSON parsing when the file has content
-- Uses file locking to avoid races with the orchestrator writing concurrently
+- Uses file locking to avoid races with the dispatcher writing concurrently
 
 ### When to send messages
 
@@ -303,7 +303,7 @@ Send a message to a running subagent when:
 - A PR just merged that touches the same files the agent is modifying (suggest a rebase)
 - A user sends a Telegram command relevant to a running agent's work
 - An issue's priority or scope changes while an agent is working on it
-- The orchestrator is winding down for context rotation and wants agents to wrap up
+- The dispatcher is winding down for context rotation and wants agents to wrap up
 - A dependency was unblocked or a new constraint was discovered that affects the agent's task
 
 ### Message format
@@ -319,7 +319,7 @@ Send a message to a running subagent when:
 
 ### Design constraints
 
-- **One-way only.** The agent does not reply through this channel — it already has `orchestrator-request.py` for orchestrator-bound communication.
+- **One-way only.** The agent does not reply through this channel — it already has `dispatcher-request.py` for dispatcher-bound communication.
 - **No guaranteed delivery.** If the agent finishes before checking, the message is lost (and that is fine).
 - **No interruption.** The agent sees the message at its next tool call, not immediately.
 - **Zero overhead when empty.** The hook exits in <1ms when no messages are pending.
@@ -329,7 +329,7 @@ Send a message to a running subagent when:
 
 ## PR Merge Policy
 
-The orchestrator proactively merges PRs when all conditions are met:
+The dispatcher proactively merges PRs when all conditions are met:
 
 1. **CI is green** — all required status checks show `SUCCESS` or `SKIPPED`
 2. **No merge conflicts** — `mergeable` is not `CONFLICTING`
@@ -350,7 +350,7 @@ After merging:
 - For deployed services, watch the deploy workflow to completion
 - **If PR touches `packages/telegram-bridge/` or `scripts/tg-responder.py`** — restart the responder daemon (see "Auto-restart responder daemon" below)
 - **If PR touches `infra/terraform/`** — run dev terraform apply (see "Auto-apply dev terraform" below)
-- **Increment `prs_since_last_audit`** and persist it to `tmp/orchestrator_status.json`. When the counter reaches 20, the next main loop iteration will trigger an audit (see "Periodic Audit" below).
+- **Increment `prs_since_last_audit`** and persist it to `tmp/dispatcher_status.json`. When the counter reaches 20, the next main loop iteration will trigger an audit (see "Periodic Audit" below).
 
 **Do not merge PRs from external contributors or PRs you did not create** unless the user explicitly asks.
 
@@ -363,7 +363,7 @@ If a PR's CI is failing:
   ```
   scripts/tg-notify.py notify "CI still failing on PR #<N> after agent exited — needs attention"
   ```
-- Do not attempt to fix another agent's PR from the orchestrator — spawn a new `/task` for it if needed
+- Do not attempt to fix another agent's PR from the dispatcher — spawn a new `/task` for it if needed
 
 ### Handling merge conflicts
 
@@ -373,7 +373,7 @@ If a PR has merge conflicts:
   ```
   scripts/tg-notify.py notify "PR #<N> has merge conflicts and agent has exited — needs attention"
   ```
-- The orchestrator does not rebase other agents' branches
+- The dispatcher does not rebase other agents' branches
 
 ### Auto-restart responder daemon
 
@@ -389,9 +389,9 @@ If the restart fails, file a p1 issue and notify via Telegram.
 
 ### Auto-apply dev terraform
 
-When a merged PR touches files under `infra/terraform/`, the orchestrator automatically applies the changes to the **dev environment only**. Production applies remain human-only. This runs inline in the orchestrator (not delegated to a subagent) because it is a short, well-defined operation.
+When a merged PR touches files under `infra/terraform/`, the dispatcher automatically applies the changes to the **dev environment only**. Production applies remain human-only. This runs inline in the dispatcher (not delegated to a subagent) because it is a short, well-defined operation.
 
-This same logic also handles `terraform_apply` instructions from the subagent instruction channel (when a subagent requests a targeted module apply via `scripts/orchestrator-request.py terraform_apply`).
+This same logic also handles `terraform_apply` instructions from the subagent instruction channel (when a subagent requests a targeted module apply via `scripts/dispatcher-request.py terraform_apply`).
 
 #### Detecting infra PRs
 
@@ -476,14 +476,14 @@ If the apply fails:
 
 ## Periodic Audit
 
-The orchestrator triggers a codebase health audit every 20 merged PRs using the `/audit` skill.
+The dispatcher triggers a codebase health audit every 20 merged PRs using the `/audit` skill.
 
 ### Counter management
 
-- Track `prs_since_last_audit` as an integer counter, persisted in `tmp/orchestrator_status.json`.
+- Track `prs_since_last_audit` as an integer counter, persisted in `tmp/dispatcher_status.json`.
 - After each PR merge, increment the counter by 1.
 - On startup, read the counter from the status file (default to 0 if missing).
-- The counter persists across orchestrator restarts via the status file.
+- The counter persists across dispatcher restarts via the status file.
 
 ### Trigger condition
 
@@ -492,7 +492,7 @@ In the main loop (step 5), after handling merges and syncing:
 1. Check if `prs_since_last_audit >= 20`.
 2. Check that no `/audit` agent is already running (avoid overlapping audits).
 3. If both conditions are met and a slot is available, spawn `/audit` as a background subagent.
-4. Reset `prs_since_last_audit` to 0 and persist to `tmp/orchestrator_status.json`.
+4. Reset `prs_since_last_audit` to 0 and persist to `tmp/dispatcher_status.json`.
 5. Send a Telegram notification:
    ```
    scripts/tg-notify.py notify "Launching periodic audit (20 PRs merged since last audit)"
@@ -510,15 +510,15 @@ The user can also trigger an audit manually via Telegram (`start audit`) or by i
 
 ## Issue Triage Policy
 
-The orchestrator proactively manages issues:
+The dispatcher proactively manages issues:
 
 ### Close done issues
 - If all sub-tasks of a parent issue are closed and the parent has no remaining work, close the parent
 - Comment with a summary of what was completed
 
 ### File new issues
-- If an agent reports a problem it cannot solve (blocked, needs human decision), the orchestrator notes it for Telegram notification
-- If the orchestrator discovers issues during monitoring (stale PRs, repeated CI failures), file tracking issues with appropriate labels
+- If an agent reports a problem it cannot solve (blocked, needs human decision), the dispatcher notes it for Telegram notification
+- If the dispatcher discovers issues during monitoring (stale PRs, repeated CI failures), file tracking issues with appropriate labels
 
 ### Unblock dependent issues
 - After a PR merges, the `unblock-issues` CI workflow handles this automatically
@@ -539,16 +539,16 @@ The orchestrator proactively manages issues:
 All outbound Telegram notifications MUST use the committed script `scripts/tg-notify.py`. This script wraps the `telegram_bridge` package and handles:
 
 - Sending the Telegram message via the bot API
-- Updating `tmp/orchestrator_status.json` so the responder daemon has accurate context
-- Persisting worker state to `tmp/orchestrator_state.json`
+- Updating `tmp/dispatcher_status.json` so the responder daemon has accurate context
+- Persisting worker state to `tmp/dispatcher_state.json`
 - Exiting silently (exit 0) when Telegram is not configured
 
 **Available commands:**
 
 | Command | Arguments | When to use |
 |---|---|---|
-| `scripts/tg-notify.py session_started` | (none) | Orchestrator startup |
-| `scripts/tg-notify.py session_ended` | (none) | Orchestrator shutdown |
+| `scripts/tg-notify.py session_started` | (none) | Dispatcher startup |
+| `scripts/tg-notify.py session_ended` | (none) | Dispatcher shutdown |
 | `scripts/tg-notify.py task_started` | `<issue> <title> <worker>` | After spawning a `/task` agent |
 | `scripts/tg-notify.py task_completed` | `<issue> <summary> <worker>` | Agent completed successfully |
 | `scripts/tg-notify.py task_failed` | `<issue> <error> <worker>` | Agent failed |
@@ -561,7 +561,7 @@ All outbound Telegram notifications MUST use the committed script `scripts/tg-no
 
 Send a notification for **every** lifecycle event:
 
-- [ ] **Session started** — at orchestrator startup
+- [ ] **Session started** — at dispatcher startup
 - [ ] **Agent launched** — after each `/task #N` spawn (include issue number, title, worker number)
 - [ ] **Agent completed** — when `<task-notification>` reports success (include issue number, summary, worker number)
 - [ ] **Agent failed** — when `<task-notification>` reports failure (include issue number, error, worker number)
@@ -571,7 +571,7 @@ Send a notification for **every** lifecycle event:
 - [ ] **Blocker encountered** — when an issue needs human decision
 - [ ] **Audit triggered** — when `/audit` is spawned (include PR count since last audit)
 - [ ] **Context rotation** — when winding down for a context rotation (include session number and iteration count)
-- [ ] **Session ended** — at orchestrator shutdown
+- [ ] **Session ended** — at dispatcher shutdown
 
 ### Inbound commands
 
@@ -590,7 +590,7 @@ Process commands from the Telegram inbox and responder daemon:
 | `do` | User wants an action performed (merge PR, check CI, etc.); execute the instruction and confirm via Telegram |
 | Free text | Interpret and reply via Telegram — check `result["needs_reply"]` |
 
-The `file_issue`, `discuss`, and `do` commands are classified by the Opus interpreter in the responder daemon and written to the inbox as structured entries with an `action` key. The orchestrator reads these via `bridge.read_inbox()` which returns `Command` objects with the appropriate `CommandKind`. Each command's result dict includes the metadata needed to act on it:
+The `file_issue`, `discuss`, and `do` commands are classified by the Opus interpreter in the responder daemon and written to the inbox as structured entries with an `action` key. The dispatcher reads these via `bridge.read_inbox()` which returns `Command` objects with the appropriate `CommandKind`. Each command's result dict includes the metadata needed to act on it:
 
 - **`file_issue`**: `result["description"]`, `result["priority"]`, `result["labels"]`, `result["reply_to"]`
 - **`discuss`**: `result["message"]`, `result["reply_to"]`, `result["needs_reply"]`
@@ -600,14 +600,14 @@ The `file_issue`, `discuss`, and `do` commands are classified by the Opus interp
 
 The responder daemon communicates via shared state files (see CLAUDE.md "Responder daemon and state files"):
 
-- Read `tmp/orchestrator_state.json` for pause/resume state
+- Read `tmp/dispatcher_state.json` for pause/resume state
 - Read `tmp/stop_requests.json` for stop requests
 - Read `tmp/tg_inbox.json` for queued commands (start, file_issue, discuss, do, and free text)
-- Read `tmp/orchestrator_inbox.json` for subagent instructions (restart_responder, terraform_apply, notify, run_script, file_issue)
+- Read `tmp/dispatcher_inbox.json` for subagent instructions (restart_responder, terraform_apply, notify, run_script, file_issue)
 
-**The orchestrator MUST update `tmp/orchestrator_status.json` after every state change.** The `scripts/tg-notify.py` script does this automatically for lifecycle events (`task_started`, `task_completed`, `task_failed`, `pr_merged`). For other state changes (pause, resume, slot changes), call `bridge.write_status()` directly or use `scripts/tg-notify.py notify` to trigger a status file update.
+**The dispatcher MUST update `tmp/dispatcher_status.json` after every state change.** The `scripts/tg-notify.py` script does this automatically for lifecycle events (`task_started`, `task_completed`, `task_failed`, `pr_merged`). For other state changes (pause, resume, slot changes), call `bridge.write_status()` directly or use `scripts/tg-notify.py notify` to trigger a status file update.
 
-The `tmp/orchestrator_status.json` file includes the `prs_since_last_audit` counter and `session_number` alongside the existing fields (`active_agents`, `open_prs`, `recently_completed`, `queue`, `paused`, `stopped_issues`, `updated_at`).
+The `tmp/dispatcher_status.json` file includes the `prs_since_last_audit` counter and `session_number` alongside the existing fields (`active_agents`, `open_prs`, `recently_completed`, `queue`, `paused`, `stopped_issues`, `updated_at`).
 
 ---
 
@@ -646,28 +646,28 @@ See "Context-Aware Rotation" above for the detailed wind-down steps. Key differe
 
 ## Rules
 
-### Responsiveness — the orchestrator's primary constraint
+### Responsiveness — the dispatcher's primary constraint
 
-The orchestrator must stay responsive to user interaction and Telegram commands at all times. A blocked orchestrator cannot process pause/resume commands, dispatch new work, merge PRs, or reply to Telegram messages.
+The dispatcher must stay responsive to user interaction and Telegram commands at all times. A blocked dispatcher cannot process pause/resume commands, dispatch new work, merge PRs, or reply to Telegram messages.
 
 - **Never do long-running work in the main agent — delegate to subagents.** "Long-running" means anything that might take more than ~10 seconds: code changes, investigations, deep codebase exploration, issue body rewrites, running tests, large file analysis, or multi-step research.
-- **The orchestrator's job is: read messages, make quick decisions, dispatch work, send updates.** It is a dispatcher, not an implementer.
+- **The dispatcher's job is: read messages, make quick decisions, dispatch work, send updates.** It is a dispatcher, not an implementer.
 - **Allowed in the main agent:** `gh` CLI calls, quick file reads, Telegram sends, short status checks, writing issue comments, updating labels, spawning subagents, terraform apply for dev environments.
 - **Everything else = spawn a subagent.** If you are unsure whether something is "quick enough," it is not — delegate it.
 - **Never block on a single long operation.** If a `gh run watch` or similar command could take minutes, run it in a way that does not prevent processing other events in the main loop. Prefer polling with short timeouts over blocking waits.
 
 ### No direct code changes on main
 
-The orchestrator MUST NOT make any code changes on `main` itself. All code changes must be delegated to `/task` subagents working in worktrees.
+The dispatcher MUST NOT make any code changes on `main` itself. All code changes must be delegated to `/task` subagents working in worktrees.
 
-- **Prohibited (code changes):** editing source files, modifying configs, writing scripts, updating documentation content, changing Terraform, or any operation that results in a `git commit` on the orchestrator's checkout. If it would show up in `git diff`, delegate it to a `/task` subagent.
+- **Prohibited (code changes):** editing source files, modifying configs, writing scripts, updating documentation content, changing Terraform, or any operation that results in a `git commit` on the dispatcher's checkout. If it would show up in `git diff`, delegate it to a `/task` subagent.
 - **Allowed (non-code operations):** `gh` CLI calls (issue comments, label changes, PR merges, issue creation/editing), reading files for decision-making, writing to `tmp/`, sending Telegram messages, running `git fetch`/`git pull`, running `terraform apply` for dev environments (applying already-merged code, not changing it). These do not modify committed code and are safe to run inline.
 
-If you catch yourself about to edit a file or stage a commit from the orchestrator agent, **stop and spawn a `/task` subagent instead.**
+If you catch yourself about to edit a file or stage a commit from the dispatcher agent, **stop and spawn a `/task` subagent instead.**
 
 ### Post-merge sync
 
-After each PR merge, the orchestrator MUST pull latest main so that subsequent `/task` agents start from the current tip of the codebase:
+After each PR merge, the dispatcher MUST pull latest main so that subsequent `/task` agents start from the current tip of the codebase:
 
 ```
 git fetch origin main

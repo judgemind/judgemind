@@ -8,7 +8,7 @@ Usage::
 
     python3 check-inbox-reader.py /path/to/inbox.json
 
-Prints each message prefixed with ``[orchestrator]`` to stdout, then truncates
+Prints each message prefixed with ``[dispatcher]`` to stdout, then truncates
 the file.  If the file is empty, contains invalid JSON, or has no messages,
 it exits silently.
 
@@ -56,7 +56,7 @@ def main() -> None:
             # Print messages to stdout
             for msg in messages:
                 if isinstance(msg, dict) and "message" in msg:
-                    print(f"[orchestrator] {msg['message']}")
+                    print(f"[dispatcher] {msg['message']}")
 
             # Truncate the file
             f.seek(0)
