@@ -30,12 +30,14 @@ Courthouse mapping (derived from dept code prefix):
 
 from __future__ import annotations
 
+import io
 import re
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
 import httpx
+import pdfplumber
 import structlog
 
 from framework import CapturedDocument, ScheduleWindow, ScraperConfig
@@ -251,6 +253,247 @@ def _oc_courthouse(dept: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Table-aware PDF text extraction (#1241)
+# ---------------------------------------------------------------------------
+#
+# OC calendar PDFs have a 3-column tabular layout:
+#   Column 1: Entry number (#)
+#   Column 2: Case name + case number
+#   Column 3: Tentative ruling text
+#
+# pdfplumber's default extract_text() reads left-to-right across the page,
+# interleaving column content.  For example, the case name and ruling text
+# get concatenated: "Illingworth vs. Before the court is an unopposed motion"
+#
+# Using pdfplumber's table detection (find_tables / extract), we can extract
+# each column separately and reconstruct the text so that case header info
+# stays separate from ruling body text.
+
+
+# OC calendar table header patterns — used to identify the calendar table.
+_TABLE_HEADER_RE = re.compile(
+    r"^(?:#|Case\s+Name|Tentative|MATTER)$",
+    re.IGNORECASE,
+)
+
+
+def _is_header_row(row: list[str | None]) -> bool:
+    """Return True if the row is a table header (e.g. # | Case Name | Tentative)."""
+    non_empty = [c.strip() for c in row if c and c.strip()]
+    if not non_empty:
+        return True  # empty row
+    return all(_TABLE_HEADER_RE.match(cell) for cell in non_empty)
+
+
+def _reconstruct_entry_text(
+    entry_num: str,
+    case_name_cell: str,
+    ruling_cell: str,
+) -> str:
+    """Reconstruct a single case entry with columns properly separated.
+
+    Produces text like:
+        {entry_num} {case_name_line1}
+        {case_name_continuation_lines}
+        {case_number}
+        {ruling_text}
+
+    This format is compatible with the existing OC splitter's entry-detection
+    regex patterns.
+    """
+    parts: list[str] = []
+
+    # Entry number + first part of case name on one line
+    case_lines = case_name_cell.strip().split("\n") if case_name_cell else []
+    if case_lines:
+        parts.append(f"{entry_num} {case_lines[0]}")
+        # Remaining case name lines (multi-line names, case numbers)
+        for line in case_lines[1:]:
+            parts.append(line)
+    else:
+        parts.append(entry_num)
+
+    # Ruling text as separate block
+    if ruling_cell:
+        parts.append(ruling_cell.strip())
+
+    return "\n".join(parts)
+
+
+def _extract_header_text_above_table(
+    page: pdfplumber.page.Page,
+    table_top: float,
+) -> str | None:
+    """Extract text from the region above the first table on a page.
+
+    OC calendar PDFs have headers (department, judge name, hearing date,
+    boilerplate instructions) above the case entry table.  When we use table
+    extraction for the entries, we need to separately extract this header text
+    so that the hearing date and other metadata are not lost.
+
+    Args:
+        page: The pdfplumber page.
+        table_top: The y-coordinate of the top of the first table.
+
+    Returns:
+        The extracted header text, or None if the region is empty or too small.
+    """
+    # Crop the page to the region above the table.
+    # pdfplumber uses (x0, top, x1, bottom) for crop coordinates.
+    if table_top < 20:
+        return None  # Table starts at the very top — no header to extract
+
+    header_region = page.within_bbox((0, 0, page.width, table_top))
+    text = header_region.extract_text()
+    if text and text.strip():
+        return text.strip()
+    return None
+
+
+def _extract_table_entries_from_page(
+    page: pdfplumber.page.Page,
+) -> tuple[list[str], str | None] | None:
+    """Extract case entries from a page using table detection.
+
+    Returns a tuple of (entries, header_text) if a calendar table is found,
+    where entries is a list of reconstructed text blocks (one per case entry)
+    and header_text is text from above the table (may be None).
+
+    Returns None if no table is detected on this page.
+
+    Continuation rows (where the entry number cell is empty) are appended to
+    the preceding entry's ruling text.
+    """
+    tables = page.find_tables()
+    if not tables:
+        return None
+
+    # Use the first (and usually only) table on the page.
+    table = tables[0]
+    rows = table.extract()
+
+    # Extract header text above the table (hearing date, boilerplate, etc.)
+    header_text = _extract_header_text_above_table(page, table.bbox[1])
+
+    if not rows:
+        return None
+
+    # Determine column layout.  OC tables typically have 3 logical columns
+    # (entry#, case name, tentative) but pdfplumber may detect more columns
+    # due to internal cell boundaries.  We identify the columns by grouping
+    # adjacent cells.
+    #
+    # Strategy: map each row to (entry_num, case_name, ruling_text) by
+    # looking at the first non-empty cell as entry_num, and collecting the
+    # remaining cells into case_name and ruling_text based on position.
+    entries: list[str] = []
+    current_ruling_continuation: list[str] = []
+
+    for row in rows:
+        if _is_header_row(row):
+            continue
+
+        # Collapse the row into 3 logical columns.
+        # Many OC PDFs have 3 cells; some have 9 (with None fillers).
+        # Group non-None cells by position.
+        cells = [c if c else "" for c in row]
+
+        # Try to identify the 3 logical groups:
+        # For 3-cell rows: straightforward
+        # For 9-cell rows: entry_num is cell[0], case_name is the first
+        #   non-empty cell in the middle, ruling is the last non-empty group
+        if len(cells) <= 3:
+            entry_num_cell = cells[0].strip() if len(cells) > 0 else ""
+            case_name_cell = cells[1].strip() if len(cells) > 1 else ""
+            ruling_cell = cells[2].strip() if len(cells) > 2 else ""
+        else:
+            # For wide tables (9+ cells), find non-empty groups
+            entry_num_cell = cells[0].strip()
+            # Find first substantial non-empty cell after entry_num
+            case_name_cell = ""
+            ruling_cell = ""
+            found_case = False
+            for c in cells[1:]:
+                cv = c.strip()
+                if not cv:
+                    continue
+                if not found_case:
+                    case_name_cell = cv
+                    found_case = True
+                else:
+                    ruling_cell = cv
+                    break
+
+        # Determine if this is a new entry or a continuation.
+        # New entries have a non-empty entry number (digit(s) optionally
+        # followed by a period, with possible & for combined entries).
+        is_new_entry = bool(entry_num_cell and re.match(r"^\d", entry_num_cell.replace("\n", " ")))
+
+        if is_new_entry:
+            # Flush any accumulated continuation text to the previous entry.
+            if current_ruling_continuation and entries:
+                entries[-1] = entries[-1] + "\n" + "\n".join(current_ruling_continuation)
+            current_ruling_continuation = []
+
+            # Clean up entry number (remove embedded newlines from multi-line
+            # combined entries like "1\n&\n2").
+            entry_num_clean = entry_num_cell.replace("\n", " ").strip()
+            # Remove trailing period for consistency
+            entry_num_clean = entry_num_clean.rstrip(".")
+
+            entry_text = _reconstruct_entry_text(entry_num_clean, case_name_cell, ruling_cell)
+            entries.append(entry_text)
+        else:
+            # Continuation of the previous entry's ruling text.
+            continuation_parts = []
+            if case_name_cell:
+                continuation_parts.append(case_name_cell)
+            if ruling_cell:
+                continuation_parts.append(ruling_cell)
+            if continuation_parts:
+                current_ruling_continuation.append("\n".join(continuation_parts))
+
+    # Flush final continuation
+    if current_ruling_continuation and entries:
+        entries[-1] = entries[-1] + "\n" + "\n".join(current_ruling_continuation)
+
+    if entries:
+        return entries, header_text
+    return None
+
+
+def _extract_oc_pdf_text(pdf_bytes: bytes) -> str:
+    """Extract text from an OC calendar PDF using table-aware extraction.
+
+    For pages with a detected table (the calendar layout), uses pdfplumber's
+    table extraction to properly separate the entry number, case name, and
+    ruling text columns.  For pages without tables (e.g. boilerplate header
+    pages), falls back to standard text extraction.
+
+    This fixes the column-merge bug (#1241) where ``extract_text()`` interleaved
+    columns, producing garbled case titles like "Illingworth vs. Before the
+    court is an unopposed motion".
+    """
+    lines: list[str] = []
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        for page in pdf.pages:
+            # Try table-aware extraction first.
+            result = _extract_table_entries_from_page(page)
+            if result is not None:
+                table_entries, header_text = result
+                # Include header text (hearing date, boilerplate) before entries.
+                if header_text:
+                    lines.append(header_text)
+                lines.extend(table_entries)
+            else:
+                # No table on this page — use standard extraction.
+                text = page.extract_text()
+                if text:
+                    lines.append(text)
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # Case number normalization — fix split-line and alternate formats
 # ---------------------------------------------------------------------------
 
@@ -338,9 +581,14 @@ class OCTentativeRulingsScraper(PdfLinkScraper):
     def parse_document(self, doc: CapturedDocument) -> CapturedDocument:
         """Extract case numbers, hearing date, and case titles from PDF text.
 
+        Uses table-aware PDF text extraction (#1241) to properly separate
+        the entry number, case name, and ruling text columns in the OC
+        calendar layout.  Falls back to standard extraction for non-tabular
+        pages.
+
         Pre-processes PDF text to rejoin case numbers split across lines by
-        pdfplumber's columnar extraction, then delegates to the base class for
-        regex matching. Also handles three-part case number formats
+        pdfplumber's columnar extraction, then does regex matching for case
+        numbers.  Also handles three-part case number formats
         (e.g. ``30-2024-01420730``) by extracting the full number including the
         location prefix.
 
@@ -349,7 +597,21 @@ class OCTentativeRulingsScraper(PdfLinkScraper):
         layout to extract case titles and motion types, making these records
         useful for legal research even without formal case numbers.
         """
-        doc = super().parse_document(doc)
+        # Use OC-specific table-aware extraction instead of the base class's
+        # simple left-to-right extraction.  This fixes the column-merge bug
+        # where case names got interleaved with ruling text (#1241).
+        try:
+            text = _extract_oc_pdf_text(doc.raw_content)
+            doc.ruling_text = text
+
+            case_numbers = self._pdf_config.case_number_re.findall(text)
+            if case_numbers:
+                doc.case_number = case_numbers[0]
+                if len(case_numbers) > 1:
+                    doc.extra["all_case_numbers"] = list(dict.fromkeys(case_numbers))
+        except Exception as exc:
+            logger.warning("OC PDF parse error, falling back to base", error=str(exc))
+            doc = super().parse_document(doc)
 
         # Post-process: normalize text to rejoin split-line case numbers,
         # then re-run case number extraction on the normalized text.
