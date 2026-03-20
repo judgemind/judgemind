@@ -130,8 +130,10 @@ _MOTION_KEYWORDS = (
     "HEARING",
 )
 
-# Matches the first line of a case entry: 3-digit line number + rest
-_ENTRY_START_RE = re.compile(r"^(\d{3})\s+(.+)", re.MULTILINE)
+# Matches the first line of a case entry: 1-3 digit line number + rest.
+# Most North departments use 3-digit numbers (101, 102, ...) but some
+# (e.g. N17) use single-digit (1, 2, 3, ...).
+_ENTRY_START_RE = re.compile(r"^(\d{1,3})\s+(.+)", re.MULTILINE)
 
 
 @dataclass
@@ -152,12 +154,16 @@ def _parse_north_case_entries(text: str) -> list[_NorthCaseEntry]:
     """
     lines = text.split("\n")
 
-    # Find all entry start positions
+    # Find all entry start positions.  Pre-filter by checking for "vs"
+    # in nearby text to avoid false positives from prose lines that start
+    # with a number (e.g. "10 calendar days", "2 and 3, Request for...").
     entry_positions: list[tuple[int, str, str]] = []
     for i, line in enumerate(lines):
         m = _ENTRY_START_RE.match(line)
         if m:
-            entry_positions.append((i, m.group(1), m.group(2)))
+            nearby = " ".join(lines[i : min(i + 6, len(lines))])
+            if re.search(r"\bvs\.?\b", nearby, re.IGNORECASE):
+                entry_positions.append((i, m.group(1), m.group(2)))
 
     entries: list[_NorthCaseEntry] = []
     for idx, (line_idx, line_num, first_line_rest) in enumerate(entry_positions):

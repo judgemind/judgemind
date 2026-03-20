@@ -210,6 +210,37 @@ def test_parse_north_entries_empty_text() -> None:
     assert _parse_north_case_entries("No case entries here") == []
 
 
+def test_parse_north_entries_single_digit() -> None:
+    """Single-digit entry numbers (N17 format) are parsed correctly (#1186)."""
+    text = (
+        "1 Zavala vs. Before the Court is the Motion for Attorneys' Fees\n"
+        "Becker et al. filed by Karl Mark Becker.\n"
+        "Tentative Ruling: The Motion is GRANTED.\n"
+        "2 Alpha Corp vs. Motion to Compel Discovery\n"
+        "Beta LLC\n"
+        "Tentative Ruling: The Motion is GRANTED.\n"
+    )
+    entries = _parse_north_case_entries(text)
+    assert len(entries) == 2
+    assert entries[0].line_num == "1"
+    assert "Zavala" in entries[0].case_title
+
+
+def test_parse_north_entries_prose_numbers_not_matched() -> None:
+    """Prose lines starting with numbers are not treated as entries (#1186)."""
+    text = (
+        "1 Zavala vs. Becker Motion for Attorneys' Fees\n"
+        "The Court grants the motion.\n"
+        "10 calendar days is insufficient notice.\n"
+        "2 Alpha vs. Beta Demurrer\n"
+        "The demurrer is OVERRULED.\n"
+    )
+    entries = _parse_north_case_entries(text)
+    assert len(entries) == 2
+    assert entries[0].line_num == "1"
+    assert entries[1].line_num == "2"
+
+
 # ---------------------------------------------------------------------------
 # _parse_north_case_entries — against real North PDF fixture
 # ---------------------------------------------------------------------------

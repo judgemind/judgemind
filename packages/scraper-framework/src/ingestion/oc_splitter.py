@@ -7,10 +7,11 @@ splitting framework via ``register_splitter("CA", "Orange", ...)``.
 Two sub-formats are handled:
 
 North Justice Center (departments starting with "N"):
-    Numbered 3-digit line entries (101, 102, ...) with case names containing
-    "vs".  No case numbers in the PDF text.  Uses the existing
-    ``_parse_north_case_entries()`` logic from the scraper to identify
-    boundaries, then extracts the ruling text between each boundary.
+    Numbered 1-3 digit line entries (1, 2, ... or 101, 102, ...) with case
+    names containing "vs".  No case numbers in the PDF text.  Entry boundaries
+    are identified by the numbered-entry pattern, pre-filtered to only include
+    lines where "vs" appears nearby (to avoid false positives from prose lines
+    that happen to start with a number).
 
 Central / West / Costa Mesa / Complex (all other OC departments):
     Numbered entries (1-digit, 2-digit, or 3-digit) where a case number
@@ -33,8 +34,10 @@ logger = structlog.get_logger(__name__)
 # North Justice Center splitting
 # ---------------------------------------------------------------------------
 
-# Reuse the entry-start regex from oc_tentatives — 3-digit line numbers.
-_NORTH_ENTRY_START_RE = re.compile(r"^(\d{3})\s+(.+)", re.MULTILINE)
+# Entry-start regex for North JC — 1-3 digit line numbers.
+# Most North departments use 3-digit numbers (101, 102, ...) but some
+# (e.g. N17, Judge Griffin) use single-digit (1, 2, 3, ...).
+_NORTH_ENTRY_START_RE = re.compile(r"^(\d{1,3})\s+(.+)", re.MULTILINE)
 
 # Motion-type keywords (same as oc_tentatives._MOTION_KEYWORDS).
 _MOTION_KEYWORDS = (
@@ -52,26 +55,41 @@ _MOTION_KEYWORDS = (
 )
 
 
+def _is_north_case_entry(lines: list[str], line_idx: int) -> bool:
+    """Return True if this numbered line looks like a North JC case entry.
+
+    Checks whether "vs" appears on this line or within the next few
+    continuation lines, which indicates a case name (plaintiff vs defendant).
+    This filters out false positives like "10 calendar days" or legal
+    citations like "151 Cal.App.4th 168".
+    """
+    # Check the entry line itself and up to 5 continuation lines.
+    search_end = min(line_idx + 6, len(lines))
+    nearby_text = " ".join(lines[line_idx:search_end])
+    return bool(re.search(r"\bvs\.?\b", nearby_text, re.IGNORECASE))
+
+
 def _split_north(text: str) -> list[SplitResult]:
     """Split a North Justice Center calendar page into per-case rulings.
 
-    Identifies case entry boundaries using the 3-digit line number pattern,
-    extracts the ruling text for each case, and parses case_title and
-    motion_type from the first line of each entry.
-
-    Only entries whose case names contain "vs" are included (filtering out
-    legal citations like "151 Cal.App.4th ...").
+    Identifies case entry boundaries using 1-3 digit line numbers, then
+    extracts the ruling text for each case.  Only entries whose nearby text
+    contains "vs" are treated as case entries (filtering out legal citations
+    and prose lines that happen to start with a number).
 
     Returns an empty list if fewer than 2 case entries are found (the caller
     treats this as "no splitting needed").
     """
     lines = text.split("\n")
 
-    # Find all entry start positions (line index, line number, rest of line).
+    # Find all entry start positions that look like actual case entries.
+    # Pre-filtering by "vs" is critical: with \d{1,3}, many prose lines
+    # match the regex (e.g. "10 calendar days", "2 and 3, Request for").
+    # Only lines where "vs" appears nearby are genuine case entries.
     entry_positions: list[tuple[int, str, str]] = []
     for i, line in enumerate(lines):
         m = _NORTH_ENTRY_START_RE.match(line)
-        if m:
+        if m and _is_north_case_entry(lines, i):
             entry_positions.append((i, m.group(1), m.group(2)))
 
     results: list[SplitResult] = []
