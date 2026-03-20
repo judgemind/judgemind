@@ -35,6 +35,7 @@ from typing import Any
 
 import structlog
 
+from ingestion.extract import _looks_like_motion_text
 from ingestion.splitter import SplitResult, register_splitter
 
 logger = structlog.get_logger(__name__)
@@ -78,6 +79,9 @@ def _extract_case_title(text: str) -> str | None:
 
     Looks for lines matching the 'X v. Y' pattern.  Returns the first match,
     or None if no title is found.
+
+    Rejects matches that look like motion descriptions rather than case
+    titles (#1245) — e.g. "Order Granting Motion to Disqualify Plaintiff".
     """
     for m in _CASE_TITLE_RE.finditer(text[:500]):
         line = m.group(1).strip()
@@ -87,8 +91,12 @@ def _extract_case_title(text: str) -> str | None:
         if line.startswith("Motion") or line.startswith("Movant"):
             continue
         # Must contain "v." or " v " to be a case title.
-        if re.search(r"\bv\.?\s", line, re.IGNORECASE):
-            return line
+        if not re.search(r"\bv\.?\s", line, re.IGNORECASE):
+            continue
+        # Reject motion descriptions masquerading as case titles (#1245).
+        if _looks_like_motion_text(line):
+            continue
+        return line
     return None
 
 
