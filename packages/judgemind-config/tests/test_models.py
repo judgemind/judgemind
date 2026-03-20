@@ -41,3 +41,40 @@ class TestDefaultHaikuModel:
 
         assert isinstance(DEFAULT_HAIKU_MODEL, str)
         assert "haiku" in DEFAULT_HAIKU_MODEL.lower()
+
+
+class TestDefaultOpusModel:
+    """Tests for DEFAULT_OPUS_MODEL constant."""
+
+    def test_default_value_is_set(self) -> None:
+        """The default Opus model ID is a non-empty string."""
+        from judgemind_config.models import DEFAULT_OPUS_MODEL
+
+        assert isinstance(DEFAULT_OPUS_MODEL, str)
+        assert len(DEFAULT_OPUS_MODEL) > 0
+
+    def test_default_value_contains_opus(self) -> None:
+        """The default model ID contains 'opus' to guard against accidental misconfiguration."""
+        from judgemind_config.models import DEFAULT_OPUS_MODEL
+
+        assert "opus" in DEFAULT_OPUS_MODEL.lower()
+
+    def test_env_var_override(self) -> None:
+        """Setting OPUS_MODEL env var overrides the default."""
+        with patch.dict("os.environ", {"OPUS_MODEL": "claude-opus-test-model"}):
+            import importlib
+
+            import judgemind_config.models
+
+            importlib.reload(judgemind_config.models)
+            assert judgemind_config.models.DEFAULT_OPUS_MODEL == "claude-opus-test-model"
+
+            # Restore the original
+            importlib.reload(judgemind_config.models)
+
+    def test_exported_from_package(self) -> None:
+        """DEFAULT_OPUS_MODEL is accessible from the top-level package."""
+        from judgemind_config import DEFAULT_OPUS_MODEL
+
+        assert isinstance(DEFAULT_OPUS_MODEL, str)
+        assert "opus" in DEFAULT_OPUS_MODEL.lower()

@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Any
 
 import anthropic
-from judgemind_config import DEFAULT_HAIKU_MODEL
+from judgemind_config import DEFAULT_HAIKU_MODEL, DEFAULT_OPUS_MODEL
 
 logger = logging.getLogger(__name__)
 
@@ -63,7 +63,7 @@ ALLOWED_PRIORITIES: frozenset[str] = frozenset({"p1", "p2", "p3"})
 _DEFAULT_MODEL = DEFAULT_HAIKU_MODEL
 
 # The model to use for full agent mode with tool use.
-OPUS_MODEL = "claude-opus-4-20250514"
+OPUS_MODEL = DEFAULT_OPUS_MODEL
 
 # Module-level client cache keyed by API key (or ``None`` for env-var default).
 # This avoids creating a new HTTP connection pool on every interpreter call.

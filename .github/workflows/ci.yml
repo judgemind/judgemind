@@ -516,6 +516,8 @@ jobs:
         run: scripts/tests/test_check_aws_bool_flags.sh
       - name: Test deprecated model checker
         run: scripts/tests/test_check_deprecated_models.sh
+      - name: Test hardcoded model checker
+        run: scripts/tests/test_check_hardcoded_models.sh
 
   # ---------------------------------------------------------------
   # Coverage gates: diff coverage (new lines) + overall floor ratchet
@@ -706,6 +708,16 @@ jobs:
         run: scripts/check-deprecated-models.sh
 
   # ---------------------------------------------------------------
+  # Hardcoded model guard: enforce model ID centralization
+  # ---------------------------------------------------------------
+  hardcoded-models-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Check for hardcoded Claude model identifiers
+        run: scripts/check-hardcoded-models.sh
+
+  # ---------------------------------------------------------------
   # ECS oneshot import guard: prevent scripts/ from importing siblings
   # ---------------------------------------------------------------
   oneshot-imports-check:
@@ -765,7 +777,7 @@ jobs:
   # Always runs. Reports success only when every applicable job passed or was
   # skipped (path filter did not match). Branch protection requires this check.
   ci-passed:
-    needs: [scraper-unit-tests, ingestion-tests, nlp-tests, api-tests, web-tests, telegram-bridge-tests, infra-validate, lambda-tests, scripts-tests, coverage-check, deprecated-models-check, oneshot-imports-check, dq-baselines-validate, ecs-oneshot-test]
+    needs: [scraper-unit-tests, ingestion-tests, nlp-tests, api-tests, web-tests, telegram-bridge-tests, infra-validate, lambda-tests, scripts-tests, coverage-check, deprecated-models-check, hardcoded-models-check, oneshot-imports-check, dq-baselines-validate, ecs-oneshot-test]
     if: always()
     runs-on: ubuntu-latest
     steps:
