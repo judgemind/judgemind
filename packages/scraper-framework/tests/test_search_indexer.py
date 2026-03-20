@@ -54,6 +54,10 @@ def sample_event() -> dict:
         "hearing_date": "2026-03-15",
         "content_hash": "abc123def456",
         "content_format": "html",
+        "motion_type": "Demurrer",
+        "outcome": "granted",
+        "case_title": "Smith v. Jones",
+        "summary": "Motion for demurrer is granted.",
     }
 
 
@@ -72,6 +76,45 @@ class TestIndexDocument:
         assert call_kwargs["id"] == "doc-001"
         assert call_kwargs["body"]["case_number"] == "BC123456"
         assert call_kwargs["body"]["ruling_text"] == "This is the ruling text from S3."
+
+    def test_indexes_motion_type_outcome_case_title_summary(
+        self, consumer: IndexingConsumer, mock_opensearch: MagicMock, sample_event: dict
+    ) -> None:
+        """New fields (motion_type, outcome, case_title, summary) are included in OS doc."""
+        mock_opensearch.get.side_effect = Exception("not found")
+
+        consumer.index_document(sample_event)
+
+        call_kwargs = mock_opensearch.index.call_args.kwargs
+        body = call_kwargs["body"]
+        assert body["motion_type"] == "Demurrer"
+        assert body["outcome"] == "granted"
+        assert body["case_title"] == "Smith v. Jones"
+        assert body["summary"] == "Motion for demurrer is granted."
+
+    def test_indexes_with_missing_new_fields(
+        self, consumer: IndexingConsumer, mock_opensearch: MagicMock
+    ) -> None:
+        """When new fields are absent from the event, they are None in the OS doc."""
+        mock_opensearch.get.side_effect = Exception("not found")
+
+        event = {
+            "document_id": "doc-minimal",
+            "case_number": "BC999",
+            "court": "Test Court",
+            "county": "Test",
+            "state": "CA",
+            "content_hash": "hash1",
+        }
+
+        consumer.index_document(event)
+
+        call_kwargs = mock_opensearch.index.call_args.kwargs
+        body = call_kwargs["body"]
+        assert body["motion_type"] is None
+        assert body["outcome"] is None
+        assert body["case_title"] is None
+        assert body["summary"] is None
 
     def test_skips_when_same_hash(
         self, consumer: IndexingConsumer, mock_opensearch: MagicMock, sample_event: dict

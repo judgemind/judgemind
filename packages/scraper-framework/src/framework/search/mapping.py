@@ -59,6 +59,19 @@ TENTATIVE_RULINGS_MAPPING: dict = {
             "hearing_date": {
                 "type": "date",
             },
+            "motion_type": {
+                "type": "keyword",
+            },
+            "outcome": {
+                "type": "keyword",
+            },
+            "case_title": {
+                "type": "keyword",
+            },
+            "summary": {
+                "type": "text",
+                "analyzer": "ruling_text_analyzer",
+            },
             "ruling_text": {
                 "type": "text",
                 "analyzer": "ruling_text_analyzer",
