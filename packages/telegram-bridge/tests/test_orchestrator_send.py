@@ -1,4 +1,4 @@
-"""Tests for the scripts/orchestrator-send.py CLI script."""
+"""Tests for the scripts/dispatcher-send.py CLI script."""
 
 from __future__ import annotations
 
@@ -9,20 +9,20 @@ from pathlib import Path
 
 
 def _script_path() -> str:
-    """Return the absolute path to orchestrator-send.py."""
-    return str(Path(__file__).resolve().parents[3] / "scripts" / "orchestrator-send.py")
+    """Return the absolute path to dispatcher-send.py."""
+    return str(Path(__file__).resolve().parents[3] / "scripts" / "dispatcher-send.py")
 
 
 def _run_send(
     *args: str,
 ) -> subprocess.CompletedProcess[str]:
-    """Run orchestrator-send.py with the given arguments."""
+    """Run dispatcher-send.py with the given arguments."""
     cmd = [sys.executable, _script_path()]
     cmd.extend(args)
     return subprocess.run(cmd, capture_output=True, text=True, timeout=10)
 
 
-class TestOrchestratorSend:
+class TestDispatcherSend:
     def test_basic_send(self, tmp_path: Path) -> None:
         """Test that a message is written to the inbox file."""
         worktree = tmp_path / "worktree"

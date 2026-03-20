@@ -752,7 +752,7 @@ def interpret_message_with_tools(
     )
 
 
-def build_orchestrator_status(
+def build_dispatcher_status(
     *,
     active_agents: list[dict[str, Any]] | None = None,
     open_prs: list[dict[str, Any]] | None = None,
@@ -799,3 +799,7 @@ def build_orchestrator_status(
         "session_number": session_number,
         "updated_at": datetime.datetime.now(datetime.UTC).isoformat(),
     }
+
+
+# Backward-compat alias — will be removed in a future release.
+build_orchestrator_status = build_dispatcher_status

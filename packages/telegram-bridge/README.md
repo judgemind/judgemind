@@ -5,7 +5,7 @@ Python client library for bidirectional communication between Judgemind's dispat
 ## Key Entry Points
 
 - **`src/telegram_bridge/client.py`** -- `TelegramBridge` class: async client for sending Telegram notifications and polling for inbound commands. Thread-safe.
-- **`src/telegram_bridge/orchestrator.py`** -- `OrchestratorBridge`: higher-level interface for the dispatcher agent. Manages command queues, pending replies, and status cards.
+- **`src/telegram_bridge/dispatcher.py`** -- `DispatcherBridge`: higher-level interface for the dispatcher agent. Manages command queues, pending replies, and status cards. (The old `orchestrator.py` is a backward-compat shim.)
 - **`src/telegram_bridge/interpreter.py`** -- Natural language message interpretation using Claude. Converts free-text Telegram messages into structured dispatcher commands.
 - **`src/telegram_bridge/formatting.py`** -- HTML formatting utilities for Telegram messages (escaping, GitHub ref linking, message splitting for the 4096-char limit).
 - **`src/telegram_bridge/validation.py`** -- Payload validation for inbound Telegram webhook events.

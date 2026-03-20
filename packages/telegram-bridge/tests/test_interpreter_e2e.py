@@ -15,7 +15,7 @@ from unittest.mock import MagicMock, patch
 
 from telegram_bridge.formatting import linkify_github_refs
 from telegram_bridge.interpreter import (
-    build_orchestrator_status,
+    build_dispatcher_status,
     interpret_message,
 )
 from telegram_bridge.validation import (
@@ -194,7 +194,7 @@ class TestInterpreterToPayloadPipeline:
             )
         )
 
-        status = build_orchestrator_status(
+        status = build_dispatcher_status(
             active_agents=[
                 {"worker": 1, "issue": 42, "phase": "ci-watch"},
                 {"worker": 2, "issue": 99, "phase": "implementing"},
