@@ -23,7 +23,7 @@ from telegram_bridge.interpreter import (
     _extract_json_object,
     _parse_response,
     _validate_action,
-    build_orchestrator_status,
+    build_dispatcher_status,
     clear_client_cache,
     get_client,
     interpret_message,
@@ -157,12 +157,12 @@ class TestParseResponse:
         assert result["actions"] == []
 
 
-# ── build_orchestrator_status() ──────────────────────────────────────────
+# ── build_dispatcher_status() ──────────────────────────────────────────
 
 
 class TestBuildOrchestratorStatus:
     def test_defaults(self) -> None:
-        status = build_orchestrator_status()
+        status = build_dispatcher_status()
         assert status["active_agents"] == []
         assert status["open_prs"] == []
         assert status["recently_completed"] == []
@@ -176,7 +176,7 @@ class TestBuildOrchestratorStatus:
     def test_with_data(self) -> None:
         agents = [{"worker": 1, "issue": 42, "phase": "ci-watch"}]
         prs = [{"number": 100, "ci_status": "green"}]
-        status = build_orchestrator_status(
+        status = build_dispatcher_status(
             active_agents=agents,
             open_prs=prs,
             paused=True,
@@ -195,7 +195,7 @@ class TestBuildOrchestratorStatus:
     def test_updated_at_is_iso_format(self) -> None:
         import datetime
 
-        status = build_orchestrator_status()
+        status = build_dispatcher_status()
         # Should be parseable as an ISO-8601 datetime.
         parsed = datetime.datetime.fromisoformat(status["updated_at"])
         assert parsed.tzinfo is not None or "T" in status["updated_at"]
@@ -258,7 +258,7 @@ class TestInterpretMessage:
             json.dumps({"reply": "2 agents running.", "actions": []})
         )
 
-        status = build_orchestrator_status(
+        status = build_dispatcher_status(
             active_agents=[
                 {"worker": 1, "issue": 42},
                 {"worker": 2, "issue": 99},
@@ -1143,7 +1143,7 @@ class TestInterpretMessageWithTools:
         response.content = [_make_text_block(json.dumps({"reply": "2 agents.", "actions": []}))]
         mock_client.messages.create.return_value = response
 
-        status = build_orchestrator_status(active_agents=[{"worker": 1}, {"worker": 2}])
+        status = build_dispatcher_status(active_agents=[{"worker": 1}, {"worker": 2}])
 
         interpret_message_with_tools(
             text="how many agents?",

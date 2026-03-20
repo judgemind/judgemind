@@ -1,4 +1,4 @@
-"""Tests for the scripts/orchestrator-request.py CLI script."""
+"""Tests for the scripts/dispatcher-request.py CLI script."""
 
 from __future__ import annotations
 
@@ -9,15 +9,15 @@ from pathlib import Path
 
 
 def _script_path() -> str:
-    """Return the absolute path to orchestrator-request.py."""
-    return str(Path(__file__).resolve().parents[3] / "scripts" / "orchestrator-request.py")
+    """Return the absolute path to dispatcher-request.py."""
+    return str(Path(__file__).resolve().parents[3] / "scripts" / "dispatcher-request.py")
 
 
 def _run_request(
     *args: str,
     inbox_file: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    """Run orchestrator-request.py with the given arguments."""
+    """Run dispatcher-request.py with the given arguments."""
     cmd = [sys.executable, _script_path()]
     cmd.extend(args)
     if inbox_file:
@@ -25,7 +25,7 @@ def _run_request(
     return subprocess.run(cmd, capture_output=True, text=True, timeout=10)
 
 
-class TestOrchestratorRequest:
+class TestDispatcherRequest:
     def test_restart_responder(self, tmp_path: Path) -> None:
         inbox = str(tmp_path / "inbox.json")
         result = _run_request(

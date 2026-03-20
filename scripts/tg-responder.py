@@ -322,7 +322,7 @@ def send_telegram_reply(
 def read_orchestrator_status(status_file: str) -> dict[str, Any] | None:
     """Read the orchestrator status JSON file.
 
-    This is the rich status file written by OrchestratorBridge.write_status(),
+    This is the rich status file written by DispatcherBridge.write_status(),
     containing active agents, open PRs, queue, etc.
 
     Returns ``None`` if the file is missing or corrupt.
@@ -1798,7 +1798,7 @@ def main() -> None:
     parser.add_argument(
         "--status-file",
         default="tmp/orchestrator_status.json",
-        help="Path to orchestrator status JSON file (written by OrchestratorBridge)",
+        help="Path to orchestrator status JSON file (written by DispatcherBridge)",
     )
     parser.add_argument(
         "--agent-status-dir",

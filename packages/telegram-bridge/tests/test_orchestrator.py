@@ -1,4 +1,4 @@
-"""Tests for the orchestrator integration module."""
+"""Tests for the dispatcher integration module."""
 
 from __future__ import annotations
 
@@ -14,12 +14,12 @@ from moto import mock_aws
 from telegram_bridge import (
     Command,
     CommandKind,
-    OrchestratorBridge,
+    DispatcherBridge,
     PendingReply,
     TelegramBridge,
-    create_orchestrator_bridge,
+    create_dispatcher_bridge,
 )
-from telegram_bridge.orchestrator import (
+from telegram_bridge.dispatcher import (
     InstructionKind,
     _parse_instruction,
     parse_command,
@@ -124,7 +124,7 @@ class TestLifecycleNotifications:
             )
 
             bridge = _make_bridge()
-            orch = OrchestratorBridge(bridge=bridge)
+            orch = DispatcherBridge(bridge=bridge)
             await orch.session_started()
             await bridge.close()
 
@@ -141,7 +141,7 @@ class TestLifecycleNotifications:
             )
 
             bridge = _make_bridge()
-            orch = OrchestratorBridge(bridge=bridge)
+            orch = DispatcherBridge(bridge=bridge)
             await orch.session_ended()
             await bridge.close()
 
@@ -158,7 +158,7 @@ class TestLifecycleNotifications:
             )
 
             bridge = _make_bridge()
-            orch = OrchestratorBridge(bridge=bridge)
+            orch = DispatcherBridge(bridge=bridge)
             await orch.task_started(issue_number=42, title="Fix the widget", worker=3)
             await bridge.close()
 
@@ -179,7 +179,7 @@ class TestLifecycleNotifications:
             )
 
             bridge = _make_bridge()
-            orch = OrchestratorBridge(bridge=bridge)
+            orch = DispatcherBridge(bridge=bridge)
             await orch.task_started(issue_number=42, title="Fix the widget", worker=3)
 
             workers = orch.get_workers()
@@ -196,7 +196,7 @@ class TestLifecycleNotifications:
             )
 
             bridge = _make_bridge()
-            orch = OrchestratorBridge(bridge=bridge)
+            orch = DispatcherBridge(bridge=bridge)
             await orch.task_started(issue_number=42, title="Fix the widget", worker=3)
             await orch.task_completed(issue_number=42, summary="PR merged.", worker=3)
 
@@ -211,7 +211,7 @@ class TestLifecycleNotifications:
             )
 
             bridge = _make_bridge()
-            orch = OrchestratorBridge(bridge=bridge)
+            orch = DispatcherBridge(bridge=bridge)
             await orch.task_started(issue_number=42, title="Fix the widget", worker=3)
             await orch.task_failed(issue_number=42, error="CI failed.", worker=3)
 
@@ -227,7 +227,7 @@ class TestNoOpMode:
         with mock_aws():
             # No secret → bridge will be disabled
             bridge = _make_bridge()
-            orch = OrchestratorBridge(bridge=bridge)
+            orch = DispatcherBridge(bridge=bridge)
 
             # These should all succeed silently
             await orch.session_started()
@@ -253,7 +253,7 @@ class TestHandleCommand:
             )
 
             bridge = _make_bridge()
-            orch = OrchestratorBridge(bridge=bridge)
+            orch = DispatcherBridge(bridge=bridge)
             result = await orch.handle_command(Command(kind=CommandKind.STATUS))
             await bridge.close()
 
@@ -269,7 +269,7 @@ class TestHandleCommand:
             )
 
             bridge = _make_bridge()
-            orch = OrchestratorBridge(bridge=bridge)
+            orch = DispatcherBridge(bridge=bridge)
             assert orch.paused is False
             await orch.handle_command(Command(kind=CommandKind.PAUSE))
             assert orch.paused is True
@@ -283,7 +283,7 @@ class TestHandleCommand:
             )
 
             bridge = _make_bridge()
-            orch = OrchestratorBridge(bridge=bridge, paused=True)
+            orch = DispatcherBridge(bridge=bridge, paused=True)
             await orch.handle_command(Command(kind=CommandKind.RESUME))
             assert orch.paused is False
 
@@ -296,7 +296,7 @@ class TestHandleCommand:
             )
 
             bridge = _make_bridge()
-            orch = OrchestratorBridge(bridge=bridge)
+            orch = DispatcherBridge(bridge=bridge)
             result = await orch.handle_command(
                 Command(kind=CommandKind.START, issue_number=42, raw_text="start #42")
             )
@@ -314,7 +314,7 @@ class TestHandleCommand:
             )
 
             bridge = _make_bridge()
-            orch = OrchestratorBridge(bridge=bridge)
+            orch = DispatcherBridge(bridge=bridge)
             result = await orch.handle_command(
                 Command(kind=CommandKind.STOP, issue_number=10, raw_text="stop #10")
             )
@@ -332,7 +332,7 @@ class TestHandleCommand:
             )
 
             bridge = _make_bridge()
-            orch = OrchestratorBridge(bridge=bridge)
+            orch = DispatcherBridge(bridge=bridge)
             result = await orch.handle_command(
                 Command(kind=CommandKind.FREE_TEXT, raw_text="check the scrapers")
             )
@@ -350,7 +350,7 @@ class TestHandleCommand:
             )
 
             bridge = _make_bridge()
-            orch = OrchestratorBridge(bridge=bridge)
+            orch = DispatcherBridge(bridge=bridge)
             result = await orch.handle_command(
                 Command(kind=CommandKind.FREE_TEXT, raw_text="how are scrapers doing?")
             )
@@ -367,7 +367,7 @@ class TestHandleCommand:
             )
 
             bridge = _make_bridge()
-            orch = OrchestratorBridge(bridge=bridge)
+            orch = DispatcherBridge(bridge=bridge)
             result = await orch.handle_command(Command(kind=CommandKind.STATUS))
             await bridge.close()
 
@@ -387,7 +387,7 @@ class TestReply:
             )
 
             bridge = _make_bridge()
-            orch = OrchestratorBridge(bridge=bridge)
+            orch = DispatcherBridge(bridge=bridge)
             await orch.reply("All scrapers are healthy.")
             await bridge.close()
 
@@ -399,7 +399,7 @@ class TestReply:
         with mock_aws():
             # No secret → bridge disabled
             bridge = _make_bridge()
-            orch = OrchestratorBridge(bridge=bridge)
+            orch = DispatcherBridge(bridge=bridge)
             # Should not raise
             await orch.reply("This should be silently dropped.")
 
@@ -412,7 +412,7 @@ class TestReply:
             )
 
             bridge = _make_bridge()
-            orch = OrchestratorBridge(bridge=bridge)
+            orch = DispatcherBridge(bridge=bridge)
             await orch.reply("See #42 for details.")
             await bridge.close()
 
@@ -424,7 +424,7 @@ class TestReply:
 
 
 class TestNotifyPassthrough:
-    """Tests for OrchestratorBridge.notify() delegation to TelegramBridge."""
+    """Tests for DispatcherBridge.notify() delegation to TelegramBridge."""
 
     @respx.mock
     async def test_notify_delegates_to_inner_bridge(self) -> None:
@@ -435,7 +435,7 @@ class TestNotifyPassthrough:
             )
 
             bridge = _make_bridge()
-            orch = OrchestratorBridge(bridge=bridge)
+            orch = DispatcherBridge(bridge=bridge)
             await orch.notify("Scraper run complete.")
             await bridge.close()
 
@@ -446,7 +446,7 @@ class TestNotifyPassthrough:
     async def test_notify_noop_when_disabled(self) -> None:
         with mock_aws():
             bridge = _make_bridge()
-            orch = OrchestratorBridge(bridge=bridge)
+            orch = DispatcherBridge(bridge=bridge)
             # Should not raise
             await orch.notify("This should be silently dropped.")
 
@@ -459,7 +459,7 @@ class TestNotifyPassthrough:
             )
 
             bridge = _make_bridge()
-            orch = OrchestratorBridge(bridge=bridge)
+            orch = DispatcherBridge(bridge=bridge)
             await orch.notify("See #10 for details.", repo="myorg/myrepo")
             await bridge.close()
 
@@ -472,7 +472,7 @@ class TestNotifyPassthrough:
 
 
 class TestStatusUpdatePassthrough:
-    """Tests for OrchestratorBridge.status_update() delegation to TelegramBridge."""
+    """Tests for DispatcherBridge.status_update() delegation to TelegramBridge."""
 
     @respx.mock
     async def test_status_update_delegates_to_inner_bridge(self) -> None:
@@ -483,7 +483,7 @@ class TestStatusUpdatePassthrough:
             )
 
             bridge = _make_bridge()
-            orch = OrchestratorBridge(bridge=bridge)
+            orch = DispatcherBridge(bridge=bridge)
             await orch.status_update(task="#99", state="complete", details="All done.")
             await bridge.close()
 
@@ -495,7 +495,7 @@ class TestStatusUpdatePassthrough:
     async def test_status_update_noop_when_disabled(self) -> None:
         with mock_aws():
             bridge = _make_bridge()
-            orch = OrchestratorBridge(bridge=bridge)
+            orch = DispatcherBridge(bridge=bridge)
             # Should not raise
             await orch.status_update(task="#1", state="failed", details="Error occurred.")
 
@@ -508,7 +508,7 @@ class TestStatusUpdatePassthrough:
             )
 
             bridge = _make_bridge()
-            orch = OrchestratorBridge(bridge=bridge)
+            orch = DispatcherBridge(bridge=bridge)
             await orch.status_update(
                 task="#5", state="in_progress", details="Working", repo="myorg/myrepo"
             )
@@ -530,7 +530,7 @@ class TestReplyStatus:
             )
 
             bridge = _make_bridge()
-            orch = OrchestratorBridge(bridge=bridge)
+            orch = DispatcherBridge(bridge=bridge)
             await orch.reply_status()
             await bridge.close()
 
@@ -546,7 +546,7 @@ class TestReplyStatus:
             )
 
             bridge = _make_bridge()
-            orch = OrchestratorBridge(bridge=bridge)
+            orch = DispatcherBridge(bridge=bridge)
             await orch.task_started(issue_number=42, title="Fix widget", worker=3)
 
             # Reset route call count
@@ -570,7 +570,7 @@ class TestReplyStatus:
             )
 
             bridge = _make_bridge()
-            orch = OrchestratorBridge(bridge=bridge, paused=True)
+            orch = DispatcherBridge(bridge=bridge, paused=True)
             await orch.reply_status()
             await bridge.close()
 
@@ -591,7 +591,7 @@ class TestUpdateWorker:
             )
 
             bridge = _make_bridge()
-            orch = OrchestratorBridge(bridge=bridge)
+            orch = DispatcherBridge(bridge=bridge)
             await orch.task_started(issue_number=42, title="Fix widget", worker=3)
 
             orch.update_worker(3, phase="ci-watch")
@@ -601,7 +601,7 @@ class TestUpdateWorker:
     def test_update_nonexistent_worker_is_noop(self) -> None:
         with mock_aws():
             bridge = _make_bridge()
-            orch = OrchestratorBridge(bridge=bridge)
+            orch = DispatcherBridge(bridge=bridge)
             orch.update_worker(99, phase="done")  # Should not raise
             assert orch.get_workers() == []
 
@@ -613,14 +613,14 @@ class TestReadInbox:
     def test_returns_empty_when_no_inbox_path(self) -> None:
         with mock_aws():
             bridge = _make_bridge()
-            orch = OrchestratorBridge(bridge=bridge)
+            orch = DispatcherBridge(bridge=bridge)
             assert orch.read_inbox() == []
 
     def test_returns_empty_when_file_missing(self, tmp_path: Path) -> None:
         with mock_aws():
             bridge = _make_bridge()
             inbox = str(tmp_path / "nonexistent.json")
-            orch = OrchestratorBridge(bridge=bridge, inbox_path=inbox)
+            orch = DispatcherBridge(bridge=bridge, inbox_path=inbox)
             assert orch.read_inbox() == []
 
     def test_returns_empty_when_file_empty(self, tmp_path: Path) -> None:
@@ -628,7 +628,7 @@ class TestReadInbox:
             bridge = _make_bridge()
             inbox_file = tmp_path / "inbox.json"
             inbox_file.write_text("")
-            orch = OrchestratorBridge(bridge=bridge, inbox_path=str(inbox_file))
+            orch = DispatcherBridge(bridge=bridge, inbox_path=str(inbox_file))
             assert orch.read_inbox() == []
 
     def test_reads_and_parses_commands(self, tmp_path: Path) -> None:
@@ -644,7 +644,7 @@ class TestReadInbox:
                     ]
                 )
             )
-            orch = OrchestratorBridge(bridge=bridge, inbox_path=str(inbox_file))
+            orch = DispatcherBridge(bridge=bridge, inbox_path=str(inbox_file))
             commands = orch.read_inbox()
 
             assert len(commands) == 3
@@ -658,7 +658,7 @@ class TestReadInbox:
             bridge = _make_bridge()
             inbox_file = tmp_path / "inbox.json"
             inbox_file.write_text(json.dumps([{"text": "status"}]))
-            orch = OrchestratorBridge(bridge=bridge, inbox_path=str(inbox_file))
+            orch = DispatcherBridge(bridge=bridge, inbox_path=str(inbox_file))
 
             commands = orch.read_inbox()
             assert len(commands) == 1
@@ -674,7 +674,7 @@ class TestReadInbox:
             bridge = _make_bridge()
             inbox_file = tmp_path / "inbox.json"
             inbox_file.write_text("not valid json{{{")
-            orch = OrchestratorBridge(bridge=bridge, inbox_path=str(inbox_file))
+            orch = DispatcherBridge(bridge=bridge, inbox_path=str(inbox_file))
 
             commands = orch.read_inbox()
             assert commands == []
@@ -686,7 +686,7 @@ class TestReadInbox:
             bridge = _make_bridge()
             inbox_file = tmp_path / "inbox.json"
             inbox_file.write_text(json.dumps([{"text": "pause"}]))
-            orch = OrchestratorBridge(bridge=bridge, inbox_path=str(inbox_file))
+            orch = DispatcherBridge(bridge=bridge, inbox_path=str(inbox_file))
 
             commands = orch.read_inbox()
             assert len(commands) == 1
@@ -708,7 +708,7 @@ class TestStatePersistence:
 
             state_file = str(tmp_path / "state.json")
             bridge = _make_bridge()
-            orch = OrchestratorBridge(bridge=bridge, state_file=state_file)
+            orch = DispatcherBridge(bridge=bridge, state_file=state_file)
             await orch.task_started(issue_number=42, title="Fix the widget", worker=3)
 
             # The file should exist and contain the worker.
@@ -719,7 +719,7 @@ class TestStatePersistence:
 
     @respx.mock
     async def test_new_instance_loads_persisted_workers(self, tmp_path: Path) -> None:
-        """A fresh OrchestratorBridge instance loads workers from the state file."""
+        """A fresh DispatcherBridge instance loads workers from the state file."""
         with mock_aws():
             _setup_secret()
             respx.post("https://api.telegram.org/botfake-bot-token/sendMessage").mock(
@@ -730,12 +730,12 @@ class TestStatePersistence:
 
             # First instance: start a task.
             bridge1 = _make_bridge()
-            orch1 = OrchestratorBridge(bridge=bridge1, state_file=state_file)
+            orch1 = DispatcherBridge(bridge=bridge1, state_file=state_file)
             await orch1.task_started(issue_number=42, title="Fix the widget", worker=3)
 
             # Second instance: should pick up the worker from disk.
             bridge2 = _make_bridge()
-            orch2 = OrchestratorBridge(bridge=bridge2, state_file=state_file)
+            orch2 = DispatcherBridge(bridge=bridge2, state_file=state_file)
             workers = orch2.get_workers()
             assert len(workers) == 1
             assert workers[0].issue_number == 42
@@ -752,7 +752,7 @@ class TestStatePersistence:
 
             state_file = str(tmp_path / "state.json")
             bridge = _make_bridge()
-            orch = OrchestratorBridge(bridge=bridge, state_file=state_file)
+            orch = DispatcherBridge(bridge=bridge, state_file=state_file)
             await orch.task_started(issue_number=42, title="Fix the widget", worker=3)
             await orch.task_completed(issue_number=42, summary="Done.", worker=3)
 
@@ -770,7 +770,7 @@ class TestStatePersistence:
 
             state_file = str(tmp_path / "state.json")
             bridge = _make_bridge()
-            orch = OrchestratorBridge(bridge=bridge, state_file=state_file)
+            orch = DispatcherBridge(bridge=bridge, state_file=state_file)
             await orch.task_started(issue_number=42, title="Fix the widget", worker=3)
             await orch.task_failed(issue_number=42, error="CI broke.", worker=3)
 
@@ -788,7 +788,7 @@ class TestStatePersistence:
 
             state_file = str(tmp_path / "state.json")
             bridge = _make_bridge()
-            orch = OrchestratorBridge(bridge=bridge, state_file=state_file)
+            orch = DispatcherBridge(bridge=bridge, state_file=state_file)
             await orch.task_started(issue_number=42, title="Fix widget", worker=3)
             orch.update_worker(3, phase="ci-watch")
 
@@ -806,7 +806,7 @@ class TestStatePersistence:
 
             state_file = str(tmp_path / "state.json")
             bridge = _make_bridge()
-            orch = OrchestratorBridge(bridge=bridge, state_file=state_file)
+            orch = DispatcherBridge(bridge=bridge, state_file=state_file)
             await orch.handle_command(Command(kind=CommandKind.PAUSE))
 
             data = json.loads(Path(state_file).read_text())
@@ -823,7 +823,7 @@ class TestStatePersistence:
 
             state_file = str(tmp_path / "state.json")
             bridge = _make_bridge()
-            orch = OrchestratorBridge(bridge=bridge, state_file=state_file, paused=True)
+            orch = DispatcherBridge(bridge=bridge, state_file=state_file, paused=True)
             await orch.handle_command(Command(kind=CommandKind.RESUME))
 
             data = json.loads(Path(state_file).read_text())
@@ -840,11 +840,11 @@ class TestStatePersistence:
 
             state_file = str(tmp_path / "state.json")
             bridge1 = _make_bridge()
-            orch1 = OrchestratorBridge(bridge=bridge1, state_file=state_file)
+            orch1 = DispatcherBridge(bridge=bridge1, state_file=state_file)
             await orch1.handle_command(Command(kind=CommandKind.PAUSE))
 
             bridge2 = _make_bridge()
-            orch2 = OrchestratorBridge(bridge=bridge2, state_file=state_file)
+            orch2 = DispatcherBridge(bridge=bridge2, state_file=state_file)
             assert orch2.paused is True
 
     @respx.mock
@@ -858,7 +858,7 @@ class TestStatePersistence:
 
             state_file = str(tmp_path / "state.json")
             bridge = _make_bridge()
-            orch = OrchestratorBridge(bridge=bridge, state_file=state_file)
+            orch = DispatcherBridge(bridge=bridge, state_file=state_file)
             await orch.task_started(issue_number=42, title="Fix widget", worker=3)
             assert Path(state_file).exists()
 
@@ -870,7 +870,7 @@ class TestStatePersistence:
         with mock_aws():
             state_file = str(tmp_path / "nonexistent.json")
             bridge = _make_bridge()
-            orch = OrchestratorBridge(bridge=bridge, state_file=state_file)
+            orch = DispatcherBridge(bridge=bridge, state_file=state_file)
             assert orch.get_workers() == []
             assert orch.paused is False
 
@@ -881,7 +881,7 @@ class TestStatePersistence:
             state_file.write_text("not valid json{{{")
 
             bridge = _make_bridge()
-            orch = OrchestratorBridge(bridge=bridge, state_file=str(state_file))
+            orch = DispatcherBridge(bridge=bridge, state_file=str(state_file))
             assert orch.get_workers() == []
             assert orch.paused is False
 
@@ -889,7 +889,7 @@ class TestStatePersistence:
         """Without state_file, behavior is unchanged (in-memory only)."""
         with mock_aws():
             bridge = _make_bridge()
-            orch = OrchestratorBridge(bridge=bridge)
+            orch = DispatcherBridge(bridge=bridge)
             # No state_file set — _save_state and _load_state should be no-ops.
             orch._save_state()
             orch._load_state()
@@ -908,7 +908,7 @@ class TestStatePersistence:
 
             # First process: start a task.
             bridge1 = _make_bridge()
-            orch1 = OrchestratorBridge(bridge=bridge1, state_file=state_file)
+            orch1 = DispatcherBridge(bridge=bridge1, state_file=state_file)
             await orch1.task_started(issue_number=42, title="Fix widget", worker=3)
 
             # Second process: reply_status should include the worker.
@@ -916,7 +916,7 @@ class TestStatePersistence:
             route.mock(return_value=httpx.Response(200, json={"ok": True}))
 
             bridge2 = _make_bridge()
-            orch2 = OrchestratorBridge(bridge=bridge2, state_file=state_file)
+            orch2 = DispatcherBridge(bridge=bridge2, state_file=state_file)
             await orch2.reply_status()
             await bridge2.close()
 
@@ -940,7 +940,7 @@ class TestRefreshState:
 
             state_file = str(tmp_path / "state.json")
             bridge = _make_bridge()
-            orch = OrchestratorBridge(bridge=bridge, state_file=state_file)
+            orch = DispatcherBridge(bridge=bridge, state_file=state_file)
             assert orch.paused is False
 
             # Simulate the responder daemon writing paused=True externally.
@@ -960,7 +960,7 @@ class TestRefreshState:
 
             state_file = str(tmp_path / "state.json")
             bridge = _make_bridge()
-            orch = OrchestratorBridge(bridge=bridge, state_file=state_file)
+            orch = DispatcherBridge(bridge=bridge, state_file=state_file)
             assert orch.get_workers() == []
 
             # Simulate another process adding a worker.
@@ -990,7 +990,7 @@ class TestRefreshState:
         """refresh_state() is a no-op when no state_file is set."""
         with mock_aws():
             bridge = _make_bridge()
-            orch = OrchestratorBridge(bridge=bridge)
+            orch = DispatcherBridge(bridge=bridge)
             # Should not raise.
             orch.refresh_state()
             assert orch.paused is False
@@ -1003,14 +1003,14 @@ class TestReadStopRequests:
     def test_returns_empty_when_no_path(self) -> None:
         with mock_aws():
             bridge = _make_bridge()
-            orch = OrchestratorBridge(bridge=bridge)
+            orch = DispatcherBridge(bridge=bridge)
             assert orch.read_stop_requests() == []
 
     def test_returns_empty_when_file_missing(self, tmp_path: Path) -> None:
         with mock_aws():
             bridge = _make_bridge()
             stop_file = str(tmp_path / "nonexistent.json")
-            orch = OrchestratorBridge(bridge=bridge, stop_requests_path=stop_file)
+            orch = DispatcherBridge(bridge=bridge, stop_requests_path=stop_file)
             assert orch.read_stop_requests() == []
 
     def test_returns_empty_when_file_empty(self, tmp_path: Path) -> None:
@@ -1018,7 +1018,7 @@ class TestReadStopRequests:
             bridge = _make_bridge()
             stop_file = tmp_path / "stop.json"
             stop_file.write_text("")
-            orch = OrchestratorBridge(bridge=bridge, stop_requests_path=str(stop_file))
+            orch = DispatcherBridge(bridge=bridge, stop_requests_path=str(stop_file))
             assert orch.read_stop_requests() == []
 
     def test_reads_and_clears_stop_requests(self, tmp_path: Path) -> None:
@@ -1033,7 +1033,7 @@ class TestReadStopRequests:
                     ]
                 )
             )
-            orch = OrchestratorBridge(bridge=bridge, stop_requests_path=str(stop_file))
+            orch = DispatcherBridge(bridge=bridge, stop_requests_path=str(stop_file))
             result = orch.read_stop_requests()
 
             assert result == [42, 99]
@@ -1047,7 +1047,7 @@ class TestReadStopRequests:
             bridge = _make_bridge()
             stop_file = tmp_path / "stop.json"
             stop_file.write_text(json.dumps([{"issue_number": 42}]))
-            orch = OrchestratorBridge(bridge=bridge, stop_requests_path=str(stop_file))
+            orch = DispatcherBridge(bridge=bridge, stop_requests_path=str(stop_file))
 
             orch.read_stop_requests()
             assert orch.is_issue_stopped(42)
@@ -1064,7 +1064,7 @@ class TestReadStopRequests:
             bridge = _make_bridge()
             stop_file = tmp_path / "stop.json"
             stop_file.write_text(json.dumps([{"issue_number": 10}, {"issue_number": 20}]))
-            orch = OrchestratorBridge(bridge=bridge, stop_requests_path=str(stop_file))
+            orch = DispatcherBridge(bridge=bridge, stop_requests_path=str(stop_file))
             orch.read_stop_requests()
 
             assert orch.stopped_issues == frozenset({10, 20})
@@ -1074,7 +1074,7 @@ class TestReadStopRequests:
             bridge = _make_bridge()
             stop_file = tmp_path / "stop.json"
             stop_file.write_text(json.dumps([{"issue_number": 42}]))
-            orch = OrchestratorBridge(bridge=bridge, stop_requests_path=str(stop_file))
+            orch = DispatcherBridge(bridge=bridge, stop_requests_path=str(stop_file))
             orch.read_stop_requests()
             assert orch.is_issue_stopped(42)
 
@@ -1087,7 +1087,7 @@ class TestReadStopRequests:
             bridge = _make_bridge()
             stop_file = tmp_path / "stop.json"
             stop_file.write_text("not valid json{{{")
-            orch = OrchestratorBridge(bridge=bridge, stop_requests_path=str(stop_file))
+            orch = DispatcherBridge(bridge=bridge, stop_requests_path=str(stop_file))
 
             result = orch.read_stop_requests()
             assert result == []
@@ -1109,18 +1109,18 @@ class TestReadStopRequests:
                     ]
                 )
             )
-            orch = OrchestratorBridge(bridge=bridge, stop_requests_path=str(stop_file))
+            orch = DispatcherBridge(bridge=bridge, stop_requests_path=str(stop_file))
             result = orch.read_stop_requests()
             assert result == [42, 99]
 
 
-# ── create_orchestrator_bridge with stop_requests_path ────────────────
+# ── create_dispatcher_bridge with stop_requests_path ────────────────
 
 
-class TestCreateOrchestratorBridgeStopRequests:
+class TestCreateDispatcherBridgeStopRequests:
     def test_factory_accepts_stop_requests_path(self) -> None:
         with mock_aws():
-            orch = create_orchestrator_bridge(stop_requests_path="/tmp/test_stop.json")
+            orch = create_dispatcher_bridge(stop_requests_path="/tmp/test_stop.json")
             assert orch.stop_requests_path == "/tmp/test_stop.json"
 
 
@@ -1133,7 +1133,7 @@ class TestWriteStatus:
         with mock_aws():
             status_file = str(tmp_path / "orchestrator_status.json")
             bridge = _make_bridge()
-            orch = OrchestratorBridge(bridge=bridge, status_file=status_file)
+            orch = DispatcherBridge(bridge=bridge, status_file=status_file)
             orch.write_status()
 
             data = json.loads(Path(status_file).read_text())
@@ -1157,7 +1157,7 @@ class TestWriteStatus:
 
             status_file = str(tmp_path / "status.json")
             bridge = _make_bridge()
-            orch = OrchestratorBridge(bridge=bridge, status_file=status_file)
+            orch = DispatcherBridge(bridge=bridge, status_file=status_file)
             await orch.task_started(issue_number=42, title="Fix widget", worker=3)
 
             data = json.loads(Path(status_file).read_text())
@@ -1177,7 +1177,7 @@ class TestWriteStatus:
 
             status_file = str(tmp_path / "status.json")
             bridge = _make_bridge()
-            orch = OrchestratorBridge(bridge=bridge, status_file=status_file)
+            orch = DispatcherBridge(bridge=bridge, status_file=status_file)
             await orch.task_started(issue_number=42, title="Fix widget", worker=3)
             await orch.task_completed(issue_number=42, summary="PR merged.", worker=3)
 
@@ -1198,7 +1198,7 @@ class TestWriteStatus:
 
             status_file = str(tmp_path / "status.json")
             bridge = _make_bridge()
-            orch = OrchestratorBridge(bridge=bridge, status_file=status_file)
+            orch = DispatcherBridge(bridge=bridge, status_file=status_file)
             await orch.task_started(issue_number=42, title="Fix widget", worker=3)
             await orch.task_failed(issue_number=42, error="CI broke.", worker=3)
 
@@ -1219,7 +1219,7 @@ class TestWriteStatus:
 
             status_file = str(tmp_path / "status.json")
             bridge = _make_bridge()
-            orch = OrchestratorBridge(bridge=bridge, status_file=status_file)
+            orch = DispatcherBridge(bridge=bridge, status_file=status_file)
             await orch.handle_command(Command(kind=CommandKind.PAUSE))
 
             data = json.loads(Path(status_file).read_text())
@@ -1236,7 +1236,7 @@ class TestWriteStatus:
 
             status_file = str(tmp_path / "status.json")
             bridge = _make_bridge()
-            orch = OrchestratorBridge(bridge=bridge, status_file=status_file, paused=True)
+            orch = DispatcherBridge(bridge=bridge, status_file=status_file, paused=True)
             await orch.handle_command(Command(kind=CommandKind.RESUME))
 
             data = json.loads(Path(status_file).read_text())
@@ -1247,7 +1247,7 @@ class TestWriteStatus:
         with mock_aws():
             status_file = str(tmp_path / "status.json")
             bridge = _make_bridge()
-            orch = OrchestratorBridge(bridge=bridge, status_file=status_file)
+            orch = DispatcherBridge(bridge=bridge, status_file=status_file)
             orch.write_status(
                 open_prs=[{"number": 100, "ci_status": "green", "mergeable": True}],
                 queue=[{"number": 650, "title": "Next task"}],
@@ -1263,7 +1263,7 @@ class TestWriteStatus:
         """write_status() is a no-op when status_file is not set."""
         with mock_aws():
             bridge = _make_bridge()
-            orch = OrchestratorBridge(bridge=bridge)
+            orch = DispatcherBridge(bridge=bridge)
             # Should not raise.
             orch.write_status()
 
@@ -1272,7 +1272,7 @@ class TestWriteStatus:
         with mock_aws():
             status_file = str(tmp_path / "nested" / "dir" / "status.json")
             bridge = _make_bridge()
-            orch = OrchestratorBridge(bridge=bridge, status_file=status_file)
+            orch = DispatcherBridge(bridge=bridge, status_file=status_file)
             orch.write_status()
 
             assert Path(status_file).exists()
@@ -1282,7 +1282,7 @@ class TestWriteStatus:
         with mock_aws():
             status_file = str(tmp_path / "status.json")
             bridge = _make_bridge()
-            orch = OrchestratorBridge(bridge=bridge, status_file=status_file)
+            orch = DispatcherBridge(bridge=bridge, status_file=status_file)
             orch._stopped_issues.add(99)
             orch._stopped_issues.add(101)
             orch.write_status()
@@ -1295,7 +1295,7 @@ class TestWriteStatus:
         with mock_aws():
             status_file = str(tmp_path / "status.json")
             bridge = _make_bridge()
-            orch = OrchestratorBridge(bridge=bridge, status_file=status_file)
+            orch = DispatcherBridge(bridge=bridge, status_file=status_file)
             orch.prs_since_last_audit = 15
             orch.write_status()
 
@@ -1307,7 +1307,7 @@ class TestWriteStatus:
         with mock_aws():
             status_file = str(tmp_path / "status.json")
             bridge = _make_bridge()
-            orch = OrchestratorBridge(bridge=bridge, status_file=status_file)
+            orch = DispatcherBridge(bridge=bridge, status_file=status_file)
             orch.write_status()
 
             data = json.loads(Path(status_file).read_text())
@@ -1320,12 +1320,12 @@ class TestWriteStatus:
             bridge = _make_bridge()
 
             # Save state with counter at 12
-            orch1 = OrchestratorBridge(bridge=bridge, state_file=state_file)
+            orch1 = DispatcherBridge(bridge=bridge, state_file=state_file)
             orch1.prs_since_last_audit = 12
             orch1._save_state()
 
             # Load into a new bridge
-            orch2 = OrchestratorBridge(bridge=bridge, state_file=state_file)
+            orch2 = DispatcherBridge(bridge=bridge, state_file=state_file)
             assert orch2.prs_since_last_audit == 12
 
     def test_session_number_persisted_across_sessions(self, tmp_path: Path) -> None:
@@ -1335,12 +1335,12 @@ class TestWriteStatus:
             bridge = _make_bridge()
 
             # Save state with session_number at 3
-            orch1 = OrchestratorBridge(bridge=bridge, state_file=state_file)
+            orch1 = DispatcherBridge(bridge=bridge, state_file=state_file)
             orch1.session_number = 3
             orch1._save_state()
 
             # Load into a new bridge — should pick up session_number
-            orch2 = OrchestratorBridge(bridge=bridge, state_file=state_file)
+            orch2 = DispatcherBridge(bridge=bridge, state_file=state_file)
             assert orch2.session_number == 3
 
     def test_session_number_defaults_to_zero(self, tmp_path: Path) -> None:
@@ -1350,7 +1350,7 @@ class TestWriteStatus:
             state_file.write_text(json.dumps({"paused": False, "workers": {}}))
 
             bridge = _make_bridge()
-            orch = OrchestratorBridge(bridge=bridge, state_file=str(state_file))
+            orch = DispatcherBridge(bridge=bridge, state_file=str(state_file))
             assert orch.session_number == 0
 
     def test_write_status_includes_session_number(self, tmp_path: Path) -> None:
@@ -1358,7 +1358,7 @@ class TestWriteStatus:
         with mock_aws():
             status_file = str(tmp_path / "status.json")
             bridge = _make_bridge()
-            orch = OrchestratorBridge(bridge=bridge, status_file=status_file)
+            orch = DispatcherBridge(bridge=bridge, status_file=status_file)
             orch.session_number = 5
             orch.write_status()
 
@@ -1390,7 +1390,7 @@ class TestParseInboxEntry:
                     ]
                 )
             )
-            orch = OrchestratorBridge(bridge=bridge, inbox_path=str(inbox_file))
+            orch = DispatcherBridge(bridge=bridge, inbox_path=str(inbox_file))
             commands = orch.read_inbox()
 
             assert len(commands) == 1
@@ -1417,7 +1417,7 @@ class TestParseInboxEntry:
                     ]
                 )
             )
-            orch = OrchestratorBridge(bridge=bridge, inbox_path=str(inbox_file))
+            orch = DispatcherBridge(bridge=bridge, inbox_path=str(inbox_file))
             commands = orch.read_inbox()
 
             assert len(commands) == 1
@@ -1442,7 +1442,7 @@ class TestParseInboxEntry:
                     ]
                 )
             )
-            orch = OrchestratorBridge(bridge=bridge, inbox_path=str(inbox_file))
+            orch = DispatcherBridge(bridge=bridge, inbox_path=str(inbox_file))
             commands = orch.read_inbox()
 
             assert len(commands) == 1
@@ -1466,7 +1466,7 @@ class TestParseInboxEntry:
                     ]
                 )
             )
-            orch = OrchestratorBridge(bridge=bridge, inbox_path=str(inbox_file))
+            orch = DispatcherBridge(bridge=bridge, inbox_path=str(inbox_file))
             commands = orch.read_inbox()
 
             assert len(commands) == 1
@@ -1493,7 +1493,7 @@ class TestParseInboxEntry:
                     ]
                 )
             )
-            orch = OrchestratorBridge(bridge=bridge, inbox_path=str(inbox_file))
+            orch = DispatcherBridge(bridge=bridge, inbox_path=str(inbox_file))
             commands = orch.read_inbox()
 
             assert len(commands) == 3
@@ -1517,7 +1517,7 @@ class TestParseInboxEntry:
                     ]
                 )
             )
-            orch = OrchestratorBridge(bridge=bridge, inbox_path=str(inbox_file))
+            orch = DispatcherBridge(bridge=bridge, inbox_path=str(inbox_file))
             commands = orch.read_inbox()
 
             assert len(commands) == 1
@@ -1541,7 +1541,7 @@ class TestParseInboxEntry:
                     ]
                 )
             )
-            orch = OrchestratorBridge(bridge=bridge, inbox_path=str(inbox_file))
+            orch = DispatcherBridge(bridge=bridge, inbox_path=str(inbox_file))
             commands = orch.read_inbox()
 
             assert len(commands) == 1
@@ -1565,7 +1565,7 @@ class TestParseInboxEntry:
                     ]
                 )
             )
-            orch = OrchestratorBridge(bridge=bridge, inbox_path=str(inbox_file))
+            orch = DispatcherBridge(bridge=bridge, inbox_path=str(inbox_file))
             commands = orch.read_inbox()
 
             assert len(commands) == 1
@@ -1589,7 +1589,7 @@ class TestParseInboxEntry:
                         ]
                     )
                 )
-                orch = OrchestratorBridge(bridge=bridge, inbox_path=str(inbox_file))
+                orch = DispatcherBridge(bridge=bridge, inbox_path=str(inbox_file))
                 commands = orch.read_inbox()
 
                 assert len(commands) == 1
@@ -1609,7 +1609,7 @@ class TestHandleCommandNewTypes:
             )
 
             bridge = _make_bridge()
-            orch = OrchestratorBridge(bridge=bridge)
+            orch = DispatcherBridge(bridge=bridge)
             result = await orch.handle_command(
                 Command(
                     kind=CommandKind.FILE_ISSUE,
@@ -1637,7 +1637,7 @@ class TestHandleCommandNewTypes:
             )
 
             bridge = _make_bridge()
-            orch = OrchestratorBridge(bridge=bridge)
+            orch = DispatcherBridge(bridge=bridge)
             result = await orch.handle_command(
                 Command(
                     kind=CommandKind.DISCUSS,
@@ -1664,7 +1664,7 @@ class TestHandleCommandNewTypes:
             )
 
             bridge = _make_bridge()
-            orch = OrchestratorBridge(bridge=bridge)
+            orch = DispatcherBridge(bridge=bridge)
             result = await orch.handle_command(
                 Command(
                     kind=CommandKind.DO,
@@ -1691,7 +1691,7 @@ class TestHandleCommandNewTypes:
             )
 
             bridge = _make_bridge()
-            orch = OrchestratorBridge(bridge=bridge)
+            orch = DispatcherBridge(bridge=bridge)
             result = await orch.handle_command(
                 Command(kind=CommandKind.FREE_TEXT, raw_text="how are scrapers doing?")
             )
@@ -1703,7 +1703,7 @@ class TestHandleCommandNewTypes:
             assert route.call_count == 0
 
 
-# ── OrchestratorInstruction parsing ────────────────────────────────────
+# ── DispatcherInstruction parsing ────────────────────────────────────
 
 
 class TestParseInstruction:
@@ -1799,30 +1799,30 @@ class TestParseInstruction:
         assert inst.timestamp == ""
 
 
-# ── read_orchestrator_inbox() ──────────────────────────────────────────
+# ── read_dispatcher_inbox() ──────────────────────────────────────────
 
 
-class TestReadOrchestratorInbox:
+class TestReadDispatcherInbox:
     def test_returns_empty_when_no_path(self) -> None:
         with mock_aws():
             bridge = _make_bridge()
-            orch = OrchestratorBridge(bridge=bridge)
-            assert orch.read_orchestrator_inbox() == []
+            orch = DispatcherBridge(bridge=bridge)
+            assert orch.read_dispatcher_inbox() == []
 
     def test_returns_empty_when_file_missing(self, tmp_path: Path) -> None:
         with mock_aws():
             bridge = _make_bridge()
             inbox = str(tmp_path / "nonexistent.json")
-            orch = OrchestratorBridge(bridge=bridge, orchestrator_inbox_path=inbox)
-            assert orch.read_orchestrator_inbox() == []
+            orch = DispatcherBridge(bridge=bridge, dispatcher_inbox_path=inbox)
+            assert orch.read_dispatcher_inbox() == []
 
     def test_returns_empty_when_file_empty(self, tmp_path: Path) -> None:
         with mock_aws():
             bridge = _make_bridge()
             inbox_file = tmp_path / "inbox.json"
             inbox_file.write_text("")
-            orch = OrchestratorBridge(bridge=bridge, orchestrator_inbox_path=str(inbox_file))
-            assert orch.read_orchestrator_inbox() == []
+            orch = DispatcherBridge(bridge=bridge, dispatcher_inbox_path=str(inbox_file))
+            assert orch.read_dispatcher_inbox() == []
 
     def test_reads_and_parses_instructions(self, tmp_path: Path) -> None:
         with mock_aws():
@@ -1848,8 +1848,8 @@ class TestReadOrchestratorInbox:
                     ]
                 )
             )
-            orch = OrchestratorBridge(bridge=bridge, orchestrator_inbox_path=str(inbox_file))
-            instructions = orch.read_orchestrator_inbox()
+            orch = DispatcherBridge(bridge=bridge, dispatcher_inbox_path=str(inbox_file))
+            instructions = orch.read_dispatcher_inbox()
 
             assert len(instructions) == 3
             assert instructions[0].kind == InstructionKind.RESTART_RESPONDER
@@ -1865,25 +1865,25 @@ class TestReadOrchestratorInbox:
             bridge = _make_bridge()
             inbox_file = tmp_path / "inbox.json"
             inbox_file.write_text(json.dumps([{"action": "notify", "message": "test"}]))
-            orch = OrchestratorBridge(bridge=bridge, orchestrator_inbox_path=str(inbox_file))
+            orch = DispatcherBridge(bridge=bridge, dispatcher_inbox_path=str(inbox_file))
 
-            instructions = orch.read_orchestrator_inbox()
+            instructions = orch.read_dispatcher_inbox()
             assert len(instructions) == 1
 
             # File should be empty now.
             assert inbox_file.read_text().strip() == ""
 
             # Second read returns empty.
-            assert orch.read_orchestrator_inbox() == []
+            assert orch.read_dispatcher_inbox() == []
 
     def test_handles_corrupt_file(self, tmp_path: Path) -> None:
         with mock_aws():
             bridge = _make_bridge()
             inbox_file = tmp_path / "inbox.json"
             inbox_file.write_text("not valid json{{{")
-            orch = OrchestratorBridge(bridge=bridge, orchestrator_inbox_path=str(inbox_file))
+            orch = DispatcherBridge(bridge=bridge, dispatcher_inbox_path=str(inbox_file))
 
-            instructions = orch.read_orchestrator_inbox()
+            instructions = orch.read_dispatcher_inbox()
             assert instructions == []
             # File should be cleared.
             assert inbox_file.read_text().strip() == ""
@@ -1901,8 +1901,8 @@ class TestReadOrchestratorInbox:
                     ]
                 )
             )
-            orch = OrchestratorBridge(bridge=bridge, orchestrator_inbox_path=str(inbox_file))
-            instructions = orch.read_orchestrator_inbox()
+            orch = DispatcherBridge(bridge=bridge, dispatcher_inbox_path=str(inbox_file))
+            instructions = orch.read_dispatcher_inbox()
             assert len(instructions) == 2
             assert instructions[0].kind == InstructionKind.NOTIFY
             assert instructions[1].kind == InstructionKind.RESTART_RESPONDER
@@ -1921,8 +1921,8 @@ class TestReadOrchestratorInbox:
                     ]
                 )
             )
-            orch = OrchestratorBridge(bridge=bridge, orchestrator_inbox_path=str(inbox_file))
-            instructions = orch.read_orchestrator_inbox()
+            orch = DispatcherBridge(bridge=bridge, dispatcher_inbox_path=str(inbox_file))
+            instructions = orch.read_dispatcher_inbox()
             assert len(instructions) == 2
 
     def test_handles_non_array_json(self, tmp_path: Path) -> None:
@@ -1930,19 +1930,19 @@ class TestReadOrchestratorInbox:
             bridge = _make_bridge()
             inbox_file = tmp_path / "inbox.json"
             inbox_file.write_text(json.dumps({"action": "notify"}))
-            orch = OrchestratorBridge(bridge=bridge, orchestrator_inbox_path=str(inbox_file))
-            instructions = orch.read_orchestrator_inbox()
+            orch = DispatcherBridge(bridge=bridge, dispatcher_inbox_path=str(inbox_file))
+            instructions = orch.read_dispatcher_inbox()
             assert instructions == []
 
 
-# ── create_orchestrator_bridge with orchestrator_inbox_path ────────────
+# ── create_dispatcher_bridge with dispatcher_inbox_path ────────────
 
 
-class TestCreateOrchestratorBridgeOrchestratorInbox:
-    def test_factory_accepts_orchestrator_inbox_path(self) -> None:
+class TestCreateDispatcherBridgeDispatcherInbox:
+    def test_factory_accepts_dispatcher_inbox_path(self) -> None:
         with mock_aws():
-            orch = create_orchestrator_bridge(orchestrator_inbox_path="/tmp/test_orch_inbox.json")
-            assert orch.orchestrator_inbox_path == "/tmp/test_orch_inbox.json"
+            orch = create_dispatcher_bridge(dispatcher_inbox_path="/tmp/test_orch_inbox.json")
+            assert orch.dispatcher_inbox_path == "/tmp/test_orch_inbox.json"
 
 
 # ── Pending reply tracking ──────────────────────────────────────────────
@@ -1961,7 +1961,7 @@ class TestPendingReplyTracking:
             )
 
             bridge = _make_bridge()
-            orch = OrchestratorBridge(bridge=bridge)
+            orch = DispatcherBridge(bridge=bridge)
             result = await orch.handle_command(
                 Command(
                     kind=CommandKind.DISCUSS,
@@ -1988,7 +1988,7 @@ class TestPendingReplyTracking:
             )
 
             bridge = _make_bridge()
-            orch = OrchestratorBridge(bridge=bridge)
+            orch = DispatcherBridge(bridge=bridge)
             result = await orch.handle_command(
                 Command(
                     kind=CommandKind.DO,
@@ -2013,7 +2013,7 @@ class TestPendingReplyTracking:
             )
 
             bridge = _make_bridge()
-            orch = OrchestratorBridge(bridge=bridge)
+            orch = DispatcherBridge(bridge=bridge)
             result = await orch.handle_command(
                 Command(kind=CommandKind.DISCUSS, message="test", reply_to=12345)
             )
@@ -2028,7 +2028,7 @@ class TestPendingReplyTracking:
     def test_resolve_unknown_command_id_returns_none(self) -> None:
         with mock_aws():
             bridge = _make_bridge()
-            orch = OrchestratorBridge(bridge=bridge)
+            orch = DispatcherBridge(bridge=bridge)
             assert orch.resolve_pending_reply("nonexistent") is None
 
     @respx.mock
@@ -2041,7 +2041,7 @@ class TestPendingReplyTracking:
             )
 
             bridge = _make_bridge()
-            orch = OrchestratorBridge(bridge=bridge)
+            orch = DispatcherBridge(bridge=bridge)
             result = await orch.handle_command(
                 Command(kind=CommandKind.DISCUSS, message="test", reply_to=12345)
             )
@@ -2062,7 +2062,7 @@ class TestPendingReplyTracking:
             )
 
             bridge = _make_bridge()
-            orch = OrchestratorBridge(bridge=bridge, reply_timeout_seconds=60.0)
+            orch = DispatcherBridge(bridge=bridge, reply_timeout_seconds=60.0)
 
             # Manually track a pending reply with a timestamp in the past.
             orch._pending_replies["test-cmd"] = PendingReply(
@@ -2094,7 +2094,7 @@ class TestPendingReplyTracking:
             )
 
             bridge = _make_bridge()
-            orch = OrchestratorBridge(bridge=bridge, reply_timeout_seconds=60.0)
+            orch = DispatcherBridge(bridge=bridge, reply_timeout_seconds=60.0)
 
             # Manually track a pending reply with a recent timestamp.
             orch._pending_replies["fresh-cmd"] = PendingReply(
@@ -2120,7 +2120,7 @@ class TestPendingReplyTracking:
             )
 
             bridge = _make_bridge()
-            orch = OrchestratorBridge(bridge=bridge, reply_timeout_seconds=60.0)
+            orch = DispatcherBridge(bridge=bridge, reply_timeout_seconds=60.0)
 
             orch._pending_replies["test-cmd"] = PendingReply(
                 command_id="test-cmd",
@@ -2151,7 +2151,7 @@ class TestPendingReplyTracking:
             )
 
             bridge = _make_bridge()
-            orch = OrchestratorBridge(bridge=bridge)
+            orch = DispatcherBridge(bridge=bridge)
             await orch.handle_command(Command(kind=CommandKind.STATUS))
             await orch.handle_command(Command(kind=CommandKind.PAUSE))
             await bridge.close()
@@ -2175,7 +2175,7 @@ class TestReplyToMessageId:
             )
 
             bridge = _make_bridge()
-            orch = OrchestratorBridge(bridge=bridge)
+            orch = DispatcherBridge(bridge=bridge)
             await orch.reply("Answering your question.", reply_to_message_id=42)
             await bridge.close()
 
@@ -2193,7 +2193,7 @@ class TestReplyToMessageId:
             )
 
             bridge = _make_bridge()
-            orch = OrchestratorBridge(bridge=bridge)
+            orch = DispatcherBridge(bridge=bridge)
             await orch.reply("Just a message.")
             await bridge.close()
 
@@ -2228,7 +2228,7 @@ class TestReplyToMessageId:
             )
 
             bridge = _make_bridge()
-            orch = OrchestratorBridge(bridge=bridge, reply_timeout_seconds=60.0)
+            orch = DispatcherBridge(bridge=bridge, reply_timeout_seconds=60.0)
 
             orch._pending_replies["test-cmd"] = PendingReply(
                 command_id="test-cmd",

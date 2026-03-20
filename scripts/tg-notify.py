@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 # venv: telegram-bridge
-"""Send a Telegram lifecycle notification for the orchestrator.
+"""Send a Telegram lifecycle notification for the dispatcher.
 
 This is a thin CLI wrapper around the ``telegram_bridge`` package's
 :class:`~telegram_bridge.client.TelegramBridge` and
-:class:`~telegram_bridge.orchestrator.OrchestratorBridge` classes.
+:class:`~telegram_bridge.dispatcher.DispatcherBridge` classes.
 
 Usage::
 
@@ -47,7 +47,7 @@ async def _main(args: list[str]) -> int:
     """Dispatch the notification based on the command-line action."""
     # Import here so missing deps produce a clear error at call time
     # rather than at module load.
-    from telegram_bridge.orchestrator import create_orchestrator_bridge
+    from telegram_bridge.dispatcher import create_dispatcher_bridge
 
     if len(args) < 1:
         print(_usage(), file=sys.stderr)
@@ -55,7 +55,7 @@ async def _main(args: list[str]) -> int:
 
     action = args[0]
 
-    bridge = create_orchestrator_bridge(
+    bridge = create_dispatcher_bridge(
         state_file="tmp/orchestrator_state.json",
         status_file="tmp/orchestrator_status.json",
         inbox_path="tmp/tg_inbox.json",
