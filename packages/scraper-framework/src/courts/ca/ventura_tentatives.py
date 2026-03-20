@@ -208,25 +208,55 @@ class VenturaTentativeRulingsScraper(BaseScraper):
     3. Parses structured fields directly from the HTML table (no PDF parsing needed)
     4. Downloads individual ruling documents via ViewFile endpoints
 
+    When a ``dept_judge_map`` or ``court_directory`` is provided, the scraper
+    uses the department-to-judge mapping to populate judge names on each ruling.
+
     Parameters
     ----------
     config : ScraperConfig
         Scraper configuration.
     search_dates : list[datetime] | None
         Specific dates to search. If None, searches today's date.
+    dept_judge_map : dict[str, str] | None
+        Pre-fetched department-to-judge mapping. Used as a fallback when
+        ``court_directory`` is not provided or for docs without hearing dates.
+    court_directory : VenturaCourtDirectory | None
+        Optional court directory instance for snapshotting and date-aware lookups.
     """
 
     def __init__(
         self,
         config: ScraperConfig,
         search_dates: list[datetime] | None = None,
+        dept_judge_map: dict[str, str] | None = None,
+        court_directory: object | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(config, **kwargs)
         self._search_dates = search_dates
+        self._dept_judge_map: dict[str, str] = dept_judge_map or {}
+        self._court_directory = court_directory
+        self._court_id: str = "ca_ventura"
 
     def fetch_documents(self) -> list[CapturedDocument]:
         """Fetch tentative rulings by searching for each configured date."""
+        # If a court directory is provided, snapshot it and use the result
+        # as the department-to-judge mapping for this scraper run.
+        if self._court_directory is not None:
+            from courts.ca.ventura_dept_judges import VenturaCourtDirectory
+
+            self._court_id = (
+                self._court_directory.COURT_ID
+                if isinstance(self._court_directory, VenturaCourtDirectory)
+                else "ca_ventura"
+            )
+            self._dept_judge_map = self._court_directory.fetch_and_snapshot(self._court_id)
+            self._log.info(
+                "Snapshotted court directory",
+                court_id=self._court_id,
+                departments=len(self._dept_judge_map),
+            )
+
         docs: list[CapturedDocument] = []
 
         search_dates = self._search_dates or [datetime.now()]
@@ -352,29 +382,56 @@ class VenturaTentativeRulingsScraper(BaseScraper):
 
         Most structured fields are already populated from the search results table.
         This method attempts to extract ruling text, outcome, and case title from
-        the document content itself.
+        the document content itself.  It also uses the department-to-judge mapping
+        (from ``dept_judge_map`` or ``court_directory``) to populate judge_name
+        when it is not already set.
         """
-        if not doc.raw_content:
-            return doc
+        if doc.raw_content:
+            try:
+                if doc.content_format == ContentFormat.PDF:
+                    text = _extract_pdf_text(doc.raw_content)
+                else:
+                    text = _extract_html_text(doc.raw_content)
 
-        try:
-            if doc.content_format == ContentFormat.PDF:
-                text = _extract_pdf_text(doc.raw_content)
-            else:
-                text = _extract_html_text(doc.raw_content)
+                if text:
+                    doc.ruling_text = text
+                    if not doc.outcome:
+                        doc.outcome = _extract_outcome(text)
+                    if not doc.case_title:
+                        doc.case_title = _extract_case_title(text)
+            except Exception as exc:
+                self._log.warning(
+                    "Document parse error",
+                    case_number=doc.case_number,
+                    error=str(exc),
+                )
 
-            if text:
-                doc.ruling_text = text
-                if not doc.outcome:
-                    doc.outcome = _extract_outcome(text)
-                if not doc.case_title:
-                    doc.case_title = _extract_case_title(text)
-        except Exception as exc:
-            self._log.warning(
-                "Document parse error",
-                case_number=doc.case_number,
-                error=str(exc),
-            )
+        # Use department-to-judge mapping as fallback for judge_name.
+        # When a court directory is available and the doc has a hearing
+        # date, use the historical snapshot closest to that date so that
+        # judge-to-department assignments are accurate for past rulings.
+        if doc.judge_name is None and doc.department:
+            from courts.ca.ventura_dept_judges import lookup_judge_for_department
+
+            effective_map = self._dept_judge_map
+            if self._court_directory is not None and doc.hearing_date is not None:
+                date_map = self._court_directory.get_mapping_for_date(
+                    self._court_id,
+                    doc.hearing_date,
+                    fallback=self._dept_judge_map,
+                )
+                if date_map is not None:
+                    effective_map = date_map
+
+            if effective_map:
+                mapped_name = lookup_judge_for_department(effective_map, doc.department)
+                if mapped_name:
+                    doc.judge_name = mapped_name
+                    self._log.debug(
+                        "Judge name populated from department mapping",
+                        department=doc.department,
+                        judge_name=mapped_name,
+                    )
 
         return doc
 

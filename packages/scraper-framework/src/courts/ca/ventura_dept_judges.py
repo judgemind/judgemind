@@ -28,12 +28,18 @@ Department numbers are normalized by stripping leading zeros for comparison
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import httpx
 import structlog
 from bs4 import BeautifulSoup
 
+from framework.court_directory import CourtDirectory
+
 from .la_dept_judges import normalize_department
+
+if TYPE_CHECKING:
+    import psycopg
 
 logger = structlog.get_logger(__name__)
 
@@ -187,24 +193,26 @@ def lookup_judge_for_department(
     return dept_map.get(norm)
 
 
-def fetch_department_judge_mapping(
+def _fetch_and_parse_directory(
     timeout: float = 30.0,
-) -> dict[str, str]:
-    """Fetch all Ventura judicial assignment pages and return a dept->judge mapping.
+) -> tuple[bytes, dict[str, str]]:
+    """Fetch and parse all Ventura judicial assignment pages (shared helper).
 
-    Makes HTTP GET requests to all three courthouse assignment pages (main,
-    juvenile, east county), parses the tables, and builds a combined mapping.
+    Makes HTTP GET requests to all three courthouse assignment pages,
+    parses the tables, and builds a combined department-to-judge mapping.
 
     Args:
         timeout: HTTP request timeout in seconds.
 
     Returns:
-        Dict mapping normalized department strings to judge names.
+        Tuple of (raw_response_bytes, dept_to_judge_mapping).
+        The raw bytes are the concatenated HTML of all three pages.
 
     Raises:
         httpx.HTTPStatusError: If any HTTP request fails.
     """
     all_entries: list[DepartmentJudge] = []
+    raw_parts: list[bytes] = []
 
     with httpx.Client(
         timeout=timeout,
@@ -215,9 +223,100 @@ def fetch_department_judge_mapping(
             logger.info("Fetching Ventura judicial assignments", url=url)
             response = client.get(url)
             response.raise_for_status()
+            raw_parts.append(response.content)
             entries = parse_assignments_page_html(response.text)
             all_entries.extend(entries)
 
+    raw = b"\n<!-- PAGE BOUNDARY -->\n".join(raw_parts)
     dept_map = build_department_judge_map(all_entries)
     logger.info("Built Ventura department-judge mapping", departments=len(dept_map))
+    return raw, dept_map
+
+
+def fetch_department_judge_mapping(
+    timeout: float = 30.0,
+) -> dict[str, str]:
+    """Fetch all Ventura judicial assignment pages and return a dept->judge mapping.
+
+    Makes HTTP GET requests to all three courthouse assignment pages (main,
+    juvenile, east county), parses the tables, and builds a combined mapping.
+
+    This is a convenience function that does **not** perform snapshotting.
+    For production use with archival, use :class:`VenturaCourtDirectory` instead.
+
+    Args:
+        timeout: HTTP request timeout in seconds.
+
+    Returns:
+        Dict mapping normalized department strings to judge names.
+
+    Raises:
+        httpx.HTTPStatusError: If any HTTP request fails.
+    """
+    _raw, dept_map = _fetch_and_parse_directory(timeout)
     return dept_map
+
+
+class VenturaCourtDirectory(CourtDirectory):
+    """Ventura County Superior Court department-to-judge directory with snapshotting.
+
+    Implements ``CourtDirectory.fetch_current()`` by scraping all three Ventura
+    courthouse judicial assignment pages and building a combined department-to-judge
+    mapping.  The base class handles S3 archival, DB storage, and content-hash
+    deduplication.
+
+    Parameters
+    ----------
+    s3_client : object
+        A boto3 S3 client for archiving raw directory responses.
+    s3_bucket : str
+        The S3 bucket name for archival.
+    db_conn : psycopg.Connection
+        A psycopg3 connection for reading/writing snapshots.
+    timeout : float
+        HTTP request timeout in seconds (default 30.0).
+    """
+
+    #: Court identifier used for S3 keys and DB records.
+    COURT_ID: str = "ca_ventura"
+
+    def __init__(
+        self,
+        s3_client: object,
+        s3_bucket: str,
+        db_conn: psycopg.Connection,
+        timeout: float = 30.0,
+    ) -> None:
+        super().__init__(s3_client, s3_bucket, db_conn)
+        self._timeout = timeout
+
+    def fetch_current(self) -> tuple[bytes, dict[str, str]]:
+        """Fetch the live Ventura judicial assignment directories.
+
+        Scrapes all three courthouse pages (main, juvenile, east county)
+        and builds a combined department-to-judge mapping.
+
+        Returns
+        -------
+        tuple[bytes, dict[str, str]]
+            A tuple of (raw_html_bytes, dept_to_judge_mapping).
+        """
+        return _fetch_and_parse_directory(self._timeout)
+
+    def fetch_and_snapshot(self, court_id: str | None = None) -> dict[str, str]:
+        """Fetch the live directory and save a snapshot.
+
+        Overrides the base class to default ``court_id`` to
+        :attr:`COURT_ID` (``"ca_ventura"``).
+
+        Parameters
+        ----------
+        court_id : str | None
+            The court identifier.  Defaults to ``COURT_ID``.
+
+        Returns
+        -------
+        dict[str, str]
+            The parsed {department: judge_name} mapping.
+        """
+        return super().fetch_and_snapshot(court_id or self.COURT_ID)
