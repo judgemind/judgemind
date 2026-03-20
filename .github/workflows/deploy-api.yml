@@ -7,6 +7,7 @@ on:
       - "packages/api/**"
       - ".github/workflows/deploy-api.yml"
       - ".github/actions/ecs-deploy/**"
+      - ".github/actions/ecs-oneshot/**"
   workflow_dispatch:
     inputs:
       image_tag:
@@ -190,136 +191,17 @@ jobs:
       - name: Run migrations via ECS oneshot task
         if: steps.check-migrations.outputs.has_migrations == 'true'
         id: run-migrations
-        env:
-          IMAGE_URI: ${{ needs.build-and-push.outputs.image_uri }}
-        run: |
-          # Get the API service's network configuration for the oneshot task
-          SERVICE_DESC=$(aws ecs describe-services \
-            --cluster "$ECS_CLUSTER" \
-            --services "$ECS_SERVICE" \
-            --query 'services[0]' \
-            --output json)
-
-          SUBNETS=$(echo "$SERVICE_DESC" | jq -r '.networkConfiguration.awsvpcConfiguration.subnets | join(",")')
-          SECURITY_GROUPS=$(echo "$SERVICE_DESC" | jq -r '.networkConfiguration.awsvpcConfiguration.securityGroups | join(",")')
-
-          # Get the execution role and task role from the current task definition
-          TASK_DEF=$(aws ecs describe-task-definition \
-            --task-definition "$TASK_FAMILY" \
-            --query 'taskDefinition' \
-            --output json)
-
-          EXECUTION_ROLE=$(echo "$TASK_DEF" | jq -r '.executionRoleArn')
-          TASK_ROLE=$(echo "$TASK_DEF" | jq -r '.taskRoleArn // empty')
-
-          # Self-heal: look up the task role by naming convention if the current
-          # revision lacks it (same logic as the ecs-deploy action).
-          if [ -z "$TASK_ROLE" ]; then
-            ROLE_NAME="judgemind-api-task-dev"
-            TASK_ROLE=$(aws iam get-role --role-name "$ROLE_NAME" --query 'Role.Arn' --output text 2>/dev/null || true)
-            if [ -n "$TASK_ROLE" ] && [ "$TASK_ROLE" != "None" ]; then
-              echo "Resolved task role for migration task: $TASK_ROLE"
-            else
-              TASK_ROLE=""
-            fi
-          fi
-
-          CONTAINER_DEF=$(echo "$TASK_DEF" | jq -c '.containerDefinitions[0]')
-
-          # Build a oneshot task definition using the newly deployed image.
-          # The API container already has node-pg-migrate and migration files.
-          SECRETS=$(echo "$CONTAINER_DEF" | jq -c '.secrets // []')
-          ENVIRONMENT_VARS=$(echo "$CONTAINER_DEF" | jq -c '.environment // []')
-          LOG_CONFIG=$(echo "$CONTAINER_DEF" | jq -c '.logConfiguration')
-
-          ONESHOT_CONTAINER=$(jq -n \
-            --arg image "$IMAGE_URI" \
-            --argjson secrets "$SECRETS" \
-            --argjson env_vars "$ENVIRONMENT_VARS" \
-            --argjson log_config "$LOG_CONFIG" \
-            '{
-              name: "api-migrate",
-              image: $image,
-              essential: true,
-              command: ["npx", "node-pg-migrate", "up", "--no-timestamp"],
-              environment: $env_vars,
-              secrets: $secrets,
-              logConfiguration: ($log_config | .options["awslogs-stream-prefix"] = "migrate")
-            }')
-
-          # Build register args
-          REGISTER_ARGS=(
-            --family "judgemind-api-migrate-dev"
-            --requires-compatibilities FARGATE
-            --network-mode awsvpc
-            --cpu 256
-            --memory 512
-            --execution-role-arn "$EXECUTION_ROLE"
-            --container-definitions "[$ONESHOT_CONTAINER]"
-          )
-
-          if [ -n "$TASK_ROLE" ]; then
-            REGISTER_ARGS+=(--task-role-arn "$TASK_ROLE")
-          fi
-
-          MIGRATE_TASK_DEF_ARN=$(aws ecs register-task-definition \
-            "${REGISTER_ARGS[@]}" \
-            --query 'taskDefinition.taskDefinitionArn' \
-            --output text)
-
-          echo "Registered migration task definition: $MIGRATE_TASK_DEF_ARN"
-          echo "task_def_arn=$MIGRATE_TASK_DEF_ARN" >> "$GITHUB_OUTPUT"
-
-          # Run the migration task
-          RUN_OUTPUT=$(aws ecs run-task \
-            --cluster "$ECS_CLUSTER" \
-            --task-definition "$MIGRATE_TASK_DEF_ARN" \
-            --launch-type FARGATE \
-            --network-configuration "awsvpcConfiguration={subnets=[$SUBNETS],securityGroups=[$SECURITY_GROUPS],assignPublicIp=DISABLED}" \
-            --output json)
-
-          TASK_ARN=$(echo "$RUN_OUTPUT" | jq -r '.tasks[0].taskArn // empty')
-
-          if [ -z "$TASK_ARN" ]; then
-            echo "Error: failed to launch migration task."
-            echo "$RUN_OUTPUT" | jq '.failures'
-            exit 1
-          fi
-
-          echo "Migration task launched: $TASK_ARN"
-          echo "task_arn=$TASK_ARN" >> "$GITHUB_OUTPUT"
-
-          # Wait for the task to complete (migrations should be fast — 5 min timeout)
-          echo "Waiting for migration task to complete..."
-          aws ecs wait tasks-stopped \
-            --cluster "$ECS_CLUSTER" \
-            --tasks "$TASK_ARN"
-
-          # Check exit code
-          TASK_DESC=$(aws ecs describe-tasks \
-            --cluster "$ECS_CLUSTER" \
-            --tasks "$TASK_ARN" \
-            --output json)
-
-          EXIT_CODE=$(echo "$TASK_DESC" | jq -r '.tasks[0].containers[0].exitCode // 1')
-          STOP_REASON=$(echo "$TASK_DESC" | jq -r '.tasks[0].stoppedReason // empty')
-
-          echo "Migration task exit code: $EXIT_CODE"
-          if [ -n "$STOP_REASON" ]; then
-            echo "Stop reason: $STOP_REASON"
-          fi
-
-          # Deregister the oneshot task definition (cleanup)
-          aws ecs deregister-task-definition \
-            --task-definition "$MIGRATE_TASK_DEF_ARN" \
-            --output text > /dev/null 2>&1 || true
-
-          if [ "$EXIT_CODE" != "0" ]; then
-            echo "Migration failed with exit code $EXIT_CODE"
-            exit 1
-          fi
-
-          echo "Migrations applied successfully."
+        uses: ./.github/actions/ecs-oneshot
+        with:
+          source-task-family: ${{ env.TASK_FAMILY }}
+          ecs-cluster: ${{ env.ECS_CLUSTER }}
+          ecs-service: ${{ env.ECS_SERVICE }}
+          image-uri: ${{ needs.build-and-push.outputs.image_uri }}
+          container-name: api-migrate
+          command: '["npx", "node-pg-migrate", "up", "--no-timestamp"]'
+          oneshot-family: judgemind-api-migrate-dev
+          log-stream-prefix: migrate
+          task-role-fallback: judgemind-api-task-dev
 
       - name: Set migration status
         if: always() && steps.check-migrations.outputs.has_migrations == 'true'
