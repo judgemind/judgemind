@@ -9,9 +9,16 @@ from datetime import datetime
 
 import structlog
 
+from .css_inliner import inline_css
 from .events import EventBus
 from .hashing import sha256_hex
-from .models import CapturedDocument, ScraperConfig, ScraperHealthEvent, ValidationStatus
+from .models import (
+    CapturedDocument,
+    ContentFormat,
+    ScraperConfig,
+    ScraperHealthEvent,
+    ValidationStatus,
+)
 from .retry import retry_sync
 from .storage import S3Archiver
 
@@ -132,7 +139,11 @@ class BaseScraper(abc.ABC):
     # ------------------------------------------------------------------
 
     def _process_document(self, doc: CapturedDocument) -> None:
-        """Hash → derive deterministic ID → parse → archive → emit for a single document.
+        """Inline CSS → hash → derive deterministic ID → parse → archive → emit.
+
+        For HTML-format documents, external CSS is inlined into the HTML before
+        hashing so that archived documents are self-contained and render
+        correctly when viewed directly.
 
         The document_id is derived deterministically from the content hash so
         that re-scraping the same content produces the same UUID. This makes
@@ -140,6 +151,19 @@ class BaseScraper(abc.ABC):
         insert_ruling (WHERE NOT EXISTS on document_id) idempotent across
         scraper runs — the same raw content always maps to the same document.
         """
+        # Inline CSS for HTML documents (makes archived HTML self-contained).
+        # TODO(perf): If a scraper produces many HTML docs per run, consider
+        # sharing an httpx.Client across calls to avoid per-document overhead.
+        if doc.content_format == ContentFormat.HTML:
+            try:
+                doc.raw_content = inline_css(doc.raw_content, base_url=doc.source_url)
+            except Exception as exc:
+                self._log.warning(
+                    "CSS inlining failed, continuing with original content",
+                    source_url=doc.source_url,
+                    error=str(exc),
+                )
+
         doc.content_hash = sha256_hex(doc.raw_content)
         # Deterministic document_id: same content → same UUID → dedup works.
         # uuid5 with NAMESPACE_URL is a standard way to derive reproducible
