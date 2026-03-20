@@ -46,7 +46,7 @@ ingest rates and scraper activity against baselines.
 
 ### Scraper Staleness
 - Checks the latest scraper run timestamp per county.
-- Flags daily scrapers stale after 6 hours, frequent scrapers after 2 hours.
+- Flags daily scrapers stale after 26 hours (24h cycle + 2h buffer), frequent scrapers after 2 hours.
 - Severity: **p1** if stale for >4x the threshold, **p2** otherwise.
 
 ---

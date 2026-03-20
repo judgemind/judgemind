@@ -330,8 +330,8 @@ class TestCheckScraperStaleness:
         assert len(alerts) == 0
 
     def test_stale_daily_scraper_alert(self) -> None:
-        """Alert when daily scraper hasn't run in >14 hours."""
-        stale_time = NOW - timedelta(hours=15)
+        """Alert when daily scraper hasn't run in >26 hours."""
+        stale_time = NOW - timedelta(hours=27)
         conn = FakeConnection(
             {
                 "scraper_runs": [("ca-la-tentatives-civil", "Los Angeles", stale_time, "success")],
@@ -365,9 +365,9 @@ class TestCheckScraperStaleness:
 
         last_seen_at is updated on every upsert (even for dedup'd documents),
         so the normal staleness threshold applies — no inflated multiplier.
-        A 15h gap exceeds the 14h daily threshold.
+        A 27h gap exceeds the 26h daily threshold.
         """
-        old_capture = NOW - timedelta(hours=15)
+        old_capture = NOW - timedelta(hours=27)
         conn = FakeConnection(
             {
                 "scraper_runs": [],  # No scraper_runs
@@ -384,9 +384,9 @@ class TestCheckScraperStaleness:
 
         Since last_seen_at accurately reflects scraper activity (unlike the
         old captured_at which only recorded first insert), the normal
-        threshold applies.  13h < 14h daily threshold = no alert.
+        threshold applies.  25h < 26h daily threshold = no alert.
         """
-        recent_capture = NOW - timedelta(hours=13)
+        recent_capture = NOW - timedelta(hours=25)
         conn = FakeConnection(
             {
                 "scraper_runs": [],
@@ -399,7 +399,7 @@ class TestCheckScraperStaleness:
 
     def test_very_stale_is_p1(self) -> None:
         """Very stale scrapers (>4x threshold) get p1 severity."""
-        very_stale = NOW - timedelta(hours=57)
+        very_stale = NOW - timedelta(hours=105)
         conn = FakeConnection(
             {
                 "scraper_runs": [("ca-la-tentatives-civil", "Los Angeles", very_stale, "success")],
@@ -413,7 +413,7 @@ class TestCheckScraperStaleness:
 
     def test_moderately_stale_is_p2(self) -> None:
         """Moderately stale scrapers get p2 severity."""
-        stale = NOW - timedelta(hours=15)
+        stale = NOW - timedelta(hours=27)
         conn = FakeConnection(
             {
                 "scraper_runs": [("ca-la-tentatives-civil", "Los Angeles", stale, "success")],
@@ -432,7 +432,7 @@ class TestCalculateStaleThreshold:
     def test_daily_no_posting_days_returns_default(self) -> None:
         """Without posting_days, returns DAILY_SCRAPER_STALE_HOURS."""
         threshold = _calculate_stale_threshold(NOW, "daily", None, None)
-        assert threshold == 14  # DAILY_SCRAPER_STALE_HOURS
+        assert threshold == 26  # DAILY_SCRAPER_STALE_HOURS
 
     def test_frequent_no_posting_days_returns_default(self) -> None:
         """Without posting_days, frequent schedule returns 2h."""
@@ -448,7 +448,7 @@ class TestCalculateStaleThreshold:
         """When today is a posting day, returns the base threshold."""
         # NOW is Tuesday 2026-03-11 12:00 UTC
         threshold = _calculate_stale_threshold(NOW, "daily", ["Mon", "Tue", "Wed", "Thu"], None)
-        assert threshold == 14  # Base threshold — today is a posting day
+        assert threshold == 26  # Base threshold — today is a posting day
 
     def test_saturday_with_weekday_posting(self) -> None:
         """Saturday check for Mon-Thu posting: last post was Thursday, 2 days ago."""
@@ -456,29 +456,29 @@ class TestCalculateStaleThreshold:
         threshold = _calculate_stale_threshold(
             saturday, "daily", ["Mon", "Tue", "Wed", "Thu"], None
         )
-        # Last posting day was Thursday (2 days ago) -> 48h + 14h buffer
-        assert threshold == 62.0
+        # Last posting day was Thursday (2 days ago) -> 48h + 26h buffer
+        assert threshold == 74.0
 
     def test_sunday_with_weekday_posting(self) -> None:
         """Sunday check for Mon-Thu posting: last post was Thursday, 3 days ago."""
         sunday = datetime(2026, 3, 15, 12, 0, 0, tzinfo=UTC)  # Sunday
         threshold = _calculate_stale_threshold(sunday, "daily", ["Mon", "Tue", "Wed", "Thu"], None)
-        # Last posting day was Thursday (3 days ago) -> 72h + 14h buffer
-        assert threshold == 86.0
+        # Last posting day was Thursday (3 days ago) -> 72h + 26h buffer
+        assert threshold == 98.0
 
     def test_monday_with_weekday_posting(self) -> None:
         """Monday check for Mon-Thu posting: today is a posting day."""
         monday = datetime(2026, 3, 16, 12, 0, 0, tzinfo=UTC)  # Monday
         threshold = _calculate_stale_threshold(monday, "daily", ["Mon", "Tue", "Wed", "Thu"], None)
         # Monday is a posting day -> base threshold
-        assert threshold == 14
+        assert threshold == 26
 
     def test_friday_with_mon_thu_posting(self) -> None:
         """Friday check for Mon-Thu posting: last post was Thursday, 1 day ago."""
         friday = datetime(2026, 3, 13, 12, 0, 0, tzinfo=UTC)  # Friday
         threshold = _calculate_stale_threshold(friday, "daily", ["Mon", "Tue", "Wed", "Thu"], None)
-        # Last posting day was Thursday (1 day ago) -> 24h + 14h buffer
-        assert threshold == 38.0
+        # Last posting day was Thursday (1 day ago) -> 24h + 26h buffer
+        assert threshold == 50.0
 
     def test_mon_to_fri_posting_on_saturday(self) -> None:
         """Saturday check for Mon-Fri posting: last post was Friday, 1 day ago."""
@@ -486,18 +486,18 @@ class TestCalculateStaleThreshold:
         threshold = _calculate_stale_threshold(
             saturday, "daily", ["Mon", "Tue", "Wed", "Thu", "Fri"], None
         )
-        # Last posting day was Friday (1 day ago) -> 24h + 14h buffer
-        assert threshold == 38.0
+        # Last posting day was Friday (1 day ago) -> 24h + 26h buffer
+        assert threshold == 50.0
 
     def test_empty_posting_days_returns_base(self) -> None:
         """Empty posting_days list falls back to base threshold."""
         threshold = _calculate_stale_threshold(NOW, "daily", [], None)
-        assert threshold == 14
+        assert threshold == 26
 
     def test_invalid_day_abbrevs_ignored(self) -> None:
         """Invalid day abbreviations are silently ignored."""
         threshold = _calculate_stale_threshold(NOW, "daily", ["Xyz", "Abc"], None)
-        assert threshold == 14  # Falls back to base — no valid days
+        assert threshold == 26  # Falls back to base — no valid days
 
 
 class TestScheduleAwareStaleness:
@@ -529,8 +529,8 @@ class TestScheduleAwareStaleness:
     def test_santa_clara_stale_on_posting_day(self) -> None:
         """Santa Clara should alert when stale on a posting day (Tuesday)."""
         tuesday = datetime(2026, 3, 11, 12, 0, 0, tzinfo=UTC)
-        # Last run was 15h ago — exceeds the 14h base threshold
-        last_run = tuesday - timedelta(hours=15)
+        # Last run was 27h ago — exceeds the 26h base threshold
+        last_run = tuesday - timedelta(hours=27)
         conn = FakeConnection(
             {
                 "scraper_runs": [("ca-sc-tentatives", "Santa Clara", last_run, "success")],
@@ -552,7 +552,7 @@ class TestScheduleAwareStaleness:
 
     def test_daily_county_unaffected(self) -> None:
         """Counties without posting_days still use the default threshold."""
-        stale_time = NOW - timedelta(hours=15)
+        stale_time = NOW - timedelta(hours=27)
         conn = FakeConnection(
             {
                 "scraper_runs": [("ca-la-tentatives-civil", "Los Angeles", stale_time, "success")],
@@ -566,7 +566,7 @@ class TestScheduleAwareStaleness:
 
     def test_max_gap_override(self) -> None:
         """max_expected_gap_hours overrides all other logic."""
-        # 40h gap — would be stale with 14h default, but not with 48h override
+        # 40h gap — would be stale with 26h default, but not with 48h override
         last_run = NOW - timedelta(hours=40)
         conn = FakeConnection(
             {
@@ -652,7 +652,7 @@ class TestRunChecks:
 
     def test_run_checks_returns_alerts(self) -> None:
         """run_checks combines ingest rate and staleness alerts."""
-        old_time = NOW - timedelta(hours=15)
+        old_time = NOW - timedelta(hours=27)
         conn = FakeConnection(
             {
                 # "LEFT JOIN rulings" must come before "d.created_at >=" so
@@ -751,9 +751,9 @@ _STALE_ALERT = Alert(
     county="Santa Clara",
     metric="scraper_stale",
     severity="p1",
-    expected="<14h",
-    actual="57.0h",
-    message="Santa Clara: scraper stale for 57.0h (threshold: 14h, source: scraper_runs)",
+    expected="<26h",
+    actual="105.0h",
+    message="Santa Clara: scraper stale for 105.0h (threshold: 26h, source: scraper_runs)",
 )
 
 
@@ -2198,9 +2198,9 @@ class TestStalenessCheckPrefersScraperRuns:
         with source=documents.last_seen_at.
 
         last_seen_at is updated on every upsert, so the normal threshold
-        applies.  15h exceeds the 14h daily threshold.
+        applies.  27h exceeds the 26h daily threshold.
         """
-        old_capture = NOW - timedelta(hours=15)
+        old_capture = NOW - timedelta(hours=27)
 
         conn = FakeConnection(
             {
@@ -2218,7 +2218,7 @@ class TestStalenessCheckPrefersScraperRuns:
     def test_scraper_runs_source_label(self) -> None:
         """When scraper_runs provides the data, the alert source should say
         'scraper_runs' if the scraper is stale."""
-        stale_run = NOW - timedelta(hours=20)
+        stale_run = NOW - timedelta(hours=27)
 
         conn = FakeConnection(
             {
@@ -2275,10 +2275,10 @@ class TestStalenessWithDedupedDocuments:
         """A genuinely stale scraper should still trigger an alert.
 
         Scenario: The scraper has actually stopped running. last_seen_at
-        hasn't been updated in 20h (well past the 14h daily threshold).
+        hasn't been updated in 27h (past the 26h daily threshold).
         This should trigger an alert.
         """
-        stale_last_seen = NOW - timedelta(hours=20)
+        stale_last_seen = NOW - timedelta(hours=27)
         conn = FakeConnection(
             {
                 "scraper_runs": [],
