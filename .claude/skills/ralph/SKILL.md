@@ -105,6 +105,7 @@ Spawn a **worker subagent** (using the Agent tool) with this prompt structure:
 > - No `$()` command substitution. No heredocs. No `python3 -c`. No quoted strings with `&&` or `;`.
 > - Do not commit, push, or create PRs. Only implement and verify locally.
 > - Follow existing code patterns. Type hints on all Python function signatures. Strict TypeScript mode.
+> - **Run all commands in the foreground** (do not use `run_in_background`). You must wait for test suites, lint, and format checks to complete before proceeding — their results determine your next step.
 
 After the worker subagent completes, read `{worktree}/tmp/ralph/work-status.txt`.
 
@@ -137,14 +138,14 @@ Write status: `phase: ralph-reviewer (iteration N)`, `summary: Running three par
 
 Both files must exist and be non-empty before launching reviewers. The `gemini-review.sh` script will skip its own diff generation when it detects these files already exist.
 
-**Launch all three reviewers simultaneously:**
+**Launch all three reviewers simultaneously** (this is a legitimate use of `run_in_background` — the three reviewers are genuinely parallel work):
 
-1. **Gemini standard review** — Run via Bash (in background):
+1. **Gemini standard review** — Run via Bash with `run_in_background: true` (genuinely parallel with other reviewers):
    ```
    scripts/gemini-review.sh {worktree}
    ```
 
-2. **Gemini adversarial review** — Run via Bash (in background):
+2. **Gemini adversarial review** — Run via Bash with `run_in_background: true` (genuinely parallel with other reviewers):
    ```
    scripts/gemini-review.sh {worktree} --adversarial
    ```
@@ -299,6 +300,7 @@ The code is ready for commit. Return control to the calling workflow (`/task` Pa
 - **Gemini reviews are best-effort.** If the Google API key is unavailable or an API call fails, the loop continues with the remaining reviewers. Gemini reviews never block the loop.
 - **Ralph is not task completion.** Ralph handles implementation and review only. The calling `/task` workflow handles commit, push, PR, CI, merge, deploy, and cleanup. Never exit after ralph without completing the full `/task` workflow.
 - **Unchecked test plan items are merge blockers.** Reviewers must flag unchecked test plan checkboxes as REVISE reasons. A PR with unchecked items is not ready to ship.
+- **Only use `run_in_background` for genuinely parallel work.** The three parallel reviewers in step 2b are the only legitimate use of `run_in_background` in the ralph loop — they run concurrently by design. For everything else (test suites, lint, format checks, git commands), use foreground execution. The agent cannot proceed until these commands finish, so running them in the background just generates unnecessary `<task-notification>` noise that bubbles up to the dispatcher and wastes context window.
 
 ---
 
