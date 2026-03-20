@@ -8,6 +8,7 @@ Tests cover:
   - split_document() graceful handling of splitter exceptions
   - make_split_document_id() determinism and uniqueness
   - register_splitter() overwrite behavior
+  - Registration completeness: all splitter modules are auto-imported
 """
 
 from __future__ import annotations
@@ -254,3 +255,74 @@ class TestRegisterSplitter:
         # Second registration should overwrite without error
         register_splitter("CA", "TestCounty", _mock_splitter)
         assert ("CA", "TestCounty") in _splitter_registry
+
+
+# ---------------------------------------------------------------------------
+# Registration completeness test
+# ---------------------------------------------------------------------------
+
+
+class TestSplitterRegistrationCompleteness:
+    """Verify all splitter modules are auto-imported by _load_county_splitters().
+
+    If a developer adds a new splitter module with a register_splitter() call
+    but forgets to import it in _load_county_splitters(), this test will fail.
+    """
+
+    def test_all_splitter_modules_are_registered(self) -> None:
+        """Every register_splitter() call in src/ingestion/ is reachable."""
+        import ast
+        from pathlib import Path
+
+        # Find the ingestion source directory.
+        ingestion_dir = Path(__file__).resolve().parent.parent / "src" / "ingestion"
+        assert ingestion_dir.is_dir(), f"Expected directory: {ingestion_dir}"
+
+        # Scan all Python files in ingestion/ for register_splitter() calls.
+        expected_pairs: set[tuple[str, str]] = set()
+        for py_file in sorted(ingestion_dir.glob("*.py")):
+            # Skip the module that *defines* register_splitter.
+            if py_file.name == "splitter.py":
+                continue
+
+            source = py_file.read_text()
+            try:
+                tree = ast.parse(source, filename=str(py_file))
+            except SyntaxError:
+                continue
+
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Call):
+                    continue
+                # Match both `register_splitter(...)` and `splitter.register_splitter(...)`.
+                func = node.func
+                name: str | None = None
+                if isinstance(func, ast.Name):
+                    name = func.id
+                elif isinstance(func, ast.Attribute):
+                    name = func.attr
+                if name != "register_splitter":
+                    continue
+                # Extract (state, county) from the first two positional args.
+                if len(node.args) < 2:
+                    continue
+                state_arg = node.args[0]
+                county_arg = node.args[1]
+                if isinstance(state_arg, ast.Constant) and isinstance(county_arg, ast.Constant):
+                    expected_pairs.add((state_arg.value, county_arg.value))
+
+        # Sanity: we should have found at least the known splitters.
+        assert len(expected_pairs) >= 2, (
+            f"Expected at least 2 register_splitter() calls in src/ingestion/, "
+            f"found {len(expected_pairs)}: {expected_pairs}"
+        )
+
+        # After importing ingestion.splitter (which happens at the top of this
+        # file), _load_county_splitters() has already run.  Verify every
+        # expected (state, county) pair is in the registry.
+        missing = expected_pairs - set(_splitter_registry.keys())
+        assert not missing, (
+            f"The following splitter(s) have register_splitter() calls but are "
+            f"NOT imported by _load_county_splitters() in splitter.py: {missing}. "
+            f"Add the missing import(s) to _load_county_splitters()."
+        )
