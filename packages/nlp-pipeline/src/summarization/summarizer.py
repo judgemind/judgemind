@@ -72,7 +72,7 @@ class RulingSummarizer:
         user_content += ruling_text
 
         response = self._client.messages.create(
-            model="claude-3-5-haiku-latest",
+            model="claude-haiku-4-5-20251001",
             max_tokens=512,
             system=_SYSTEM_PROMPT,
             messages=[

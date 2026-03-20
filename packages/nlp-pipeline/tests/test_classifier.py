@@ -335,7 +335,7 @@ class TestRulingClassifierApiInteraction:
         classifier.classify("Test ruling text")
 
         call_kwargs = mock_client.messages.create.call_args
-        assert call_kwargs.kwargs["model"] == "claude-3-5-haiku-latest"
+        assert call_kwargs.kwargs["model"] == "claude-haiku-4-5-20251001"
 
     @patch("classification.classifier.anthropic.Anthropic")
     def test_passes_ruling_text_in_message(self, mock_anthropic_cls: MagicMock) -> None:
