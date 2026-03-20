@@ -14,7 +14,7 @@ import {
   RULING_TEXT_TRUNCATE_LENGTH,
   truncateText,
 } from '../../../lib/display-helpers';
-import { sanitizeRulingHtml } from '../../rulings/[id]/RulingDetail';
+import { sanitizeRulingHtml } from '@/lib/sanitize-html';
 
 const CASE_QUERY = gql`
   query CaseDetail($id: ID!) {

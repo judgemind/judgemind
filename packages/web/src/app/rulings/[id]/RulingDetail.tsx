@@ -1,33 +1,8 @@
 'use client';
 
-import DOMPurify from 'isomorphic-dompurify';
 import Link from 'next/link';
 import { buildDownloadUrl, cleanRulingText, FORMAT_LABELS } from '@/lib/display-helpers';
-
-/**
- * Tags allowed through DOMPurify sanitization for ruling HTML.
- * Only structural and text-formatting tags needed by the ruling template.
- */
-const ALLOWED_TAGS = [
-  'div', 'section', 'article', 'header',
-  'span', 'p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6',
-  'strong', 'em', 'b', 'i', 'u', 'br',
-  'ul', 'ol', 'li',
-];
-
-/**
- * Attributes allowed through DOMPurify sanitization.
- * Only `class` is needed for CSS styling of ruling template elements.
- */
-const ALLOWED_ATTR = ['class'];
-
-/** Sanitize ruling HTML, stripping all tags/attributes not in the allowlist. */
-export function sanitizeRulingHtml(html: string): string {
-  return DOMPurify.sanitize(html, {
-    ALLOWED_TAGS,
-    ALLOWED_ATTR,
-  });
-}
+import { sanitizeRulingHtml } from '@/lib/sanitize-html';
 
 interface RulingProps {
   ruling: {
