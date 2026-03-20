@@ -187,3 +187,16 @@ def make_split_document_id(original_document_id: str, split_index: int) -> str:
         A UUID string suitable for use as ``rulings.document_id``.
     """
     return str(uuid.uuid5(_SPLIT_UUID_NAMESPACE, f"{original_document_id}:{split_index}"))
+
+
+def _load_county_splitters() -> None:
+    """Import county-specific splitter modules to trigger registration.
+
+    Each module calls ``register_splitter()`` at import time.  We import
+    them lazily to avoid circular imports (splitter modules import from
+    this module).
+    """
+    import ingestion.oc_splitter  # noqa: F401
+
+
+_load_county_splitters()
