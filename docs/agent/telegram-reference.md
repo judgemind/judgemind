@@ -39,7 +39,7 @@ If Telegram is not configured, all bridge calls are silent no-ops. No existing w
 
 ## Dispatcher Status File
 
-The dispatcher must call `bridge.write_status()` after every state change (task start, complete, fail, pause, resume). This writes `tmp/orchestrator_status.json` containing:
+The dispatcher must call `bridge.write_status()` after every state change (task start, complete, fail, pause, resume). This writes `tmp/dispatcher_status.json` containing:
 - Active agents: issue number, title, worker number, phase
 - Open PRs: number, CI status, mergeable
 - Recently completed tasks: issue number, outcome
@@ -52,8 +52,8 @@ The responder daemon reads this file to provide context to the Claude interprete
 
 The standalone **responder daemon** (`scripts/tg-responder.py`) interprets all Telegram messages via a Claude API call (Opus). It receives the user's message and the current dispatcher status, generates a natural-language reply, and extracts any actionable commands. It communicates with the dispatcher via shared state files:
 
-- **`tmp/orchestrator_status.json`** — written by `OrchestratorBridge.write_status()`. The responder reads this to provide context to the Claude interpreter. Contains active agents, open PRs, queue, and paused/stopped state.
-- **`tmp/orchestrator_state.json`** — the responder writes `paused` flag changes here. The dispatcher must call `bridge.refresh_state()` before each spawn decision to pick up `pause`/`resume` changes made out-of-loop.
+- **`tmp/dispatcher_status.json`** — written by `DispatcherBridge.write_status()`. The responder reads this to provide context to the Claude interpreter. Contains active agents, open PRs, queue, and paused/stopped state.
+- **`tmp/dispatcher_state.json`** — the responder writes `paused` flag changes here. The dispatcher must call `bridge.refresh_state()` before each spawn decision to pick up `pause`/`resume` changes made out-of-loop.
 - **`tmp/stop_requests.json`** — the responder appends stop requests here (JSON array of `{"issue_number": N, "timestamp": "..."}`). The dispatcher reads and clears this file by calling `bridge.read_stop_requests()`, which returns newly stopped issue numbers and accumulates them in `bridge.stopped_issues`. Use `bridge.is_issue_stopped(N)` to check before spawning.
 - **`tmp/tg_inbox.json`** — queued `start` commands extracted by the interpreter, read by `bridge.read_inbox()`.
 

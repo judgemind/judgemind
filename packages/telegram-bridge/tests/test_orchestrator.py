@@ -1129,9 +1129,9 @@ class TestCreateDispatcherBridgeStopRequests:
 
 class TestWriteStatus:
     def test_writes_status_json_to_file(self, tmp_path: Path) -> None:
-        """write_status() creates orchestrator_status.json with expected keys."""
+        """write_status() creates dispatcher_status.json with expected keys."""
         with mock_aws():
-            status_file = str(tmp_path / "orchestrator_status.json")
+            status_file = str(tmp_path / "dispatcher_status.json")
             bridge = _make_bridge()
             orch = DispatcherBridge(bridge=bridge, status_file=status_file)
             orch.write_status()

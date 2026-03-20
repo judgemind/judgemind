@@ -150,9 +150,9 @@ class TestSendTelegramReply:
 # ── State file reading ──────────────────────────────────────────────────
 
 
-class TestReadOrchestratorState:
+class TestReadDispatcherState:
     def test_reads_existing_state(self, tmp_path: Path) -> None:
-        state_file = tmp_path / "orchestrator_state.json"
+        state_file = tmp_path / "dispatcher_state.json"
         state_file.write_text(
             json.dumps(
                 {
@@ -170,14 +170,14 @@ class TestReadOrchestratorState:
             )
         )
         mod = _import_responder()
-        state = mod.read_orchestrator_state(str(state_file))
+        state = mod.read_dispatcher_state(str(state_file))
         assert state["paused"] is True
         assert "2" in state["workers"]
         assert state["workers"]["2"]["issue_number"] == 42
 
     def test_returns_default_when_missing(self, tmp_path: Path) -> None:
         mod = _import_responder()
-        state = mod.read_orchestrator_state(str(tmp_path / "nonexistent.json"))
+        state = mod.read_dispatcher_state(str(tmp_path / "nonexistent.json"))
         assert state["paused"] is False
         assert state["workers"] == {}
 
@@ -185,34 +185,34 @@ class TestReadOrchestratorState:
         state_file = tmp_path / "state.json"
         state_file.write_text("not json{{{")
         mod = _import_responder()
-        state = mod.read_orchestrator_state(str(state_file))
+        state = mod.read_dispatcher_state(str(state_file))
         assert state["paused"] is False
         assert state["workers"] == {}
 
 
-class TestReadOrchestratorStatus:
+class TestReadDispatcherStatus:
     def test_reads_status_file(self, tmp_path: Path) -> None:
-        status_file = tmp_path / "orchestrator_status.json"
+        status_file = tmp_path / "dispatcher_status.json"
         status_data = {
             "active_agents": [{"worker": 1, "issue": 42}],
             "paused": False,
         }
         status_file.write_text(json.dumps(status_data))
         mod = _import_responder()
-        result = mod.read_orchestrator_status(str(status_file))
+        result = mod.read_dispatcher_status(str(status_file))
         assert result is not None
         assert result["active_agents"][0]["issue"] == 42
 
     def test_returns_none_when_missing(self, tmp_path: Path) -> None:
         mod = _import_responder()
-        result = mod.read_orchestrator_status(str(tmp_path / "nonexistent.json"))
+        result = mod.read_dispatcher_status(str(tmp_path / "nonexistent.json"))
         assert result is None
 
     def test_returns_none_when_corrupt(self, tmp_path: Path) -> None:
         status_file = tmp_path / "status.json"
         status_file.write_text("not json{{{")
         mod = _import_responder()
-        result = mod.read_orchestrator_status(str(status_file))
+        result = mod.read_dispatcher_status(str(status_file))
         assert result is None
 
 
@@ -377,13 +377,13 @@ class TestMergeAgentStatusIntoOrchestrator:
             "active_agents": [],
             "updated_at": now_ts,
         }
-        result = mod.merge_agent_status_into_orchestrator(
+        result = mod.merge_agent_status_into_dispatcher(
             orch_status, [], staleness_threshold_seconds=120.0
         )
         assert "staleness_warning" not in result
 
     def test_does_not_mutate_input(self) -> None:
-        """The original orchestrator_status dict is not modified."""
+        """The original dispatcher_status dict is not modified."""
         mod = _import_responder()
         orch_status = {
             "active_agents": [
@@ -405,7 +405,7 @@ class TestMergeAgentStatusIntoOrchestrator:
                 "updated": "2026-03-10T19:10:00Z",
             }
         ]
-        mod.merge_agent_status_into_orchestrator(orch_status, agent_statuses)
+        mod.merge_agent_status_into_dispatcher(orch_status, agent_statuses)
         # Original dict should not be modified (active_agents list may be
         # shallow-copied but original list should have same length).
         assert len(orch_status["active_agents"]) == len(original_agents)
@@ -419,7 +419,7 @@ class TestDispatchMessageMergesAgentStatus:
     def test_merges_agent_status_when_status_file_exists(
         self, mock_interpret: MagicMock, tmp_path: Path
     ) -> None:
-        """Agent-status files supplement orchestrator_status.json."""
+        """Agent-status files supplement dispatcher_status.json."""
         from telegram_bridge.interpreter import InterpretedMessage
 
         mock_interpret.return_value = InterpretedMessage(
@@ -430,7 +430,7 @@ class TestDispatchMessageMergesAgentStatus:
             return_value=httpx.Response(200, json={"ok": True})
         )
 
-        # Write orchestrator status with one worker.
+        # Write dispatcher status with one worker.
         status_file = tmp_path / "status.json"
         status_data = {
             "active_agents": [
@@ -491,7 +491,7 @@ class TestDispatchMessageMergesAgentStatus:
             return_value=httpx.Response(200, json={"ok": True})
         )
 
-        # Orchestrator says worker-2 is in ci-watch (old).
+        # Dispatcher says worker-2 is in ci-watch (old).
         status_file = tmp_path / "status.json"
         status_data = {
             "active_agents": [
@@ -537,7 +537,7 @@ class TestDispatchMessageMergesAgentStatus:
     def test_staleness_warning_included_in_context(
         self, mock_interpret: MagicMock, tmp_path: Path
     ) -> None:
-        """Stale orchestrator status includes a warning in the context."""
+        """Stale dispatcher status includes a warning in the context."""
         from telegram_bridge.interpreter import InterpretedMessage
 
         mock_interpret.return_value = InterpretedMessage(
@@ -548,7 +548,7 @@ class TestDispatchMessageMergesAgentStatus:
             return_value=httpx.Response(200, json={"ok": True})
         )
 
-        # Write orchestrator status with a very old timestamp.
+        # Write dispatcher status with a very old timestamp.
         status_file = tmp_path / "status.json"
         status_data = {
             "active_agents": [],
@@ -923,9 +923,7 @@ class TestDispatchMessage:
 
     @respx.mock
     @patch("tg_responder.interpret_message")
-    def test_reads_orchestrator_status_file(
-        self, mock_interpret: MagicMock, tmp_path: Path
-    ) -> None:
+    def test_reads_dispatcher_status_file(self, mock_interpret: MagicMock, tmp_path: Path) -> None:
         from telegram_bridge.interpreter import InterpretedMessage
 
         mock_interpret.return_value = InterpretedMessage(
@@ -1999,7 +1997,7 @@ class TestStalenessTracker:
         assert "#100" in alert_text
         assert "completed" in alert_text
         assert old_ts in alert_text
-        assert "/orchestrator" in alert_text
+        assert "/dispatcher" in alert_text
         assert tracker.alert_sent is True
 
     def test_deduplication_only_one_alert_per_stale_period(self, tmp_path: Path) -> None:
@@ -2173,15 +2171,15 @@ class TestFormatStaleAlert:
         )
         assert "60 minute" in alert
         assert "expired or crashed" in alert
-        assert "/orchestrator" in alert
+        assert "/dispatcher" in alert
         assert "2026-03-10T10:00:00Z" in alert
 
     def test_alert_with_none_status(self) -> None:
-        """Alert works when orchestrator_status is None."""
+        """Alert works when dispatcher_status is None."""
         mod = _import_responder()
         alert = mod.format_stale_alert(300.0, None)
         assert "5 minute" in alert
-        assert "/orchestrator" in alert
+        assert "/dispatcher" in alert
 
     def test_alert_includes_active_agents(self) -> None:
         """Alert lists active agents when present."""

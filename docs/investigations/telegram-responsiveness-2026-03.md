@@ -37,8 +37,8 @@ The orchestrator spawns subagents via the Agent tool, which is a single long-run
 **How it works:**
 
 1. A new daemon script (`scripts/tg-responder.py`) polls SQS on a short interval (5 seconds).
-2. For `status` commands: reads `tmp/orchestrator_state.json` (already written by `OrchestratorBridge._save_state()`) and replies directly via the Telegram Bot API. Response time: ~5 seconds.
-3. For `pause` / `resume`: writes to `tmp/orchestrator_state.json` (the `paused` flag) and replies via Telegram. The orchestrator reads this file at its next check. Effect latency: bounded by orchestrator check interval, but the user gets an immediate acknowledgment.
+2. For `status` commands: reads `tmp/dispatcher_state.json` (already written by `DispatcherBridge._save_state()`) and replies directly via the Telegram Bot API. Response time: ~5 seconds.
+3. For `pause` / `resume`: writes to `tmp/dispatcher_state.json` (the `paused` flag) and replies via Telegram. The dispatcher reads this file at its next check. Effect latency: bounded by dispatcher check interval, but the user gets an immediate acknowledgment.
 4. For `stop #N`: writes to a stop-request file (`tmp/stop_requests.json`) and replies via Telegram. The orchestrator checks this file between tasks and avoids spawning new work for that issue.
 5. For `start #N` and free text: queues to `tmp/tg_inbox.json` as today. These inherently require the orchestrator and cannot be handled by a simple script.
 
@@ -104,7 +104,7 @@ Telegram -> API Gateway -> Lambda -> SQS
                     Direct reply            |
                     via Telegram API    Orchestrator reads
                          |              between tasks
-                    tmp/orchestrator_state.json
+                    tmp/dispatcher_state.json
                     (reads for status,
                      writes for pause)
 ```
@@ -113,9 +113,9 @@ Telegram -> API Gateway -> Lambda -> SQS
 
 1. **New script: `scripts/tg-responder.py`** -- replaces `tg-poll-daemon.py`.
    - Polls SQS every 5 seconds (short poll, not long poll, to keep latency low).
-   - Parses commands using the existing `parse_command()` from `telegram_bridge.orchestrator`.
-   - Handles `status`: reads `tmp/orchestrator_state.json`, also reads `tmp/agent-status/worker-*.txt` files for live worker state, formats a reply, sends via Telegram Bot API.
-   - Handles `pause` / `resume`: updates the `paused` flag in `tmp/orchestrator_state.json`, sends confirmation via Telegram.
+   - Parses commands using the existing `parse_command()` from `telegram_bridge.dispatcher`.
+   - Handles `status`: reads `tmp/dispatcher_state.json`, also reads `tmp/agent-status/worker-*.txt` files for live worker state, formats a reply, sends via Telegram Bot API.
+   - Handles `pause` / `resume`: updates the `paused` flag in `tmp/dispatcher_state.json`, sends confirmation via Telegram.
    - Handles `stop #N`: appends to `tmp/stop_requests.json`, sends confirmation via Telegram.
    - Handles `start #N` / free text: appends to `tmp/tg_inbox.json` (same as today), sends a "queued for orchestrator" acknowledgment via Telegram.
    - Uses the same daemon lifecycle pattern: PID file, stop file, signal handling.

@@ -4,9 +4,9 @@
 
 Polls the Telegram inbound SQS queue every few seconds and interprets all
 messages as free text using a lightweight Claude API call (Haiku).  The
-interpreter understands the current orchestrator state and can respond
+interpreter understands the current dispatcher state and can respond
 naturally to any question, while also extracting actionable commands
-(start, pause, resume, stop) for the orchestrator.
+(start, pause, resume, stop) for the dispatcher.
 
 This daemon **replaces** ``scripts/tg-poll-daemon.py``, which only queued
 messages without responding.
@@ -319,8 +319,8 @@ def send_telegram_reply(
 # ── State file helpers ──────────────────────────────────────────────────
 
 
-def read_orchestrator_status(status_file: str) -> dict[str, Any] | None:
-    """Read the orchestrator status JSON file.
+def read_dispatcher_status(status_file: str) -> dict[str, Any] | None:
+    """Read the dispatcher status JSON file.
 
     This is the rich status file written by DispatcherBridge.write_status(),
     containing active agents, open PRs, queue, etc.
@@ -333,12 +333,16 @@ def read_orchestrator_status(status_file: str) -> dict[str, Any] | None:
     try:
         return json.loads(path.read_text())
     except (json.JSONDecodeError, ValueError):
-        logger.warning("Corrupt orchestrator status file — ignoring.")
+        logger.warning("Corrupt dispatcher status file — ignoring.")
         return None
 
 
-def read_orchestrator_state(state_file: str) -> dict[str, object]:
-    """Read the orchestrator state file. Returns default state if missing/corrupt."""
+# Backward-compat alias — will be removed in a future release.
+read_orchestrator_status = read_dispatcher_status
+
+
+def read_dispatcher_state(state_file: str) -> dict[str, object]:
+    """Read the dispatcher state file. Returns default state if missing/corrupt."""
     default: dict[str, object] = {"paused": False, "workers": {}}
     path = Path(state_file)
     if not path.exists():
@@ -347,8 +351,12 @@ def read_orchestrator_state(state_file: str) -> dict[str, object]:
         data = json.loads(path.read_text())
         return data
     except (json.JSONDecodeError, ValueError):
-        logger.warning("Corrupt orchestrator state file — returning defaults.")
+        logger.warning("Corrupt dispatcher state file — returning defaults.")
         return default
+
+
+# Backward-compat alias — will be removed in a future release.
+read_orchestrator_state = read_dispatcher_state
 
 
 def _atomic_json_update(
@@ -942,13 +950,13 @@ class StalenessTracker:
 
 def format_stale_alert(
     staleness_secs: float,
-    orchestrator_status: dict[str, Any] | None,
+    dispatcher_status: dict[str, Any] | None,
 ) -> str:
-    """Format a proactive stale-orchestrator alert message.
+    """Format a proactive stale-dispatcher alert message.
 
     Args:
         staleness_secs: How many seconds the status has been stale.
-        orchestrator_status: The last-read orchestrator status dict,
+        dispatcher_status: The last-read dispatcher status dict,
             or ``None`` if the status file is missing.
 
     Returns:
@@ -956,17 +964,17 @@ def format_stale_alert(
     """
     minutes = staleness_secs / 60.0
     lines: list[str] = [
-        f"Warning: orchestrator status has not been updated for "
-        f"{minutes:.0f} minute(s). This likely means the orchestrator "
+        f"Warning: dispatcher status has not been updated for "
+        f"{minutes:.0f} minute(s). This likely means the dispatcher "
         f"session has expired or crashed — normal agent work cycles "
         f"update the status much more frequently than this.",
     ]
 
-    if orchestrator_status:
+    if dispatcher_status:
         # Include last known state.
-        paused = orchestrator_status.get("paused", False)
-        active_agents = orchestrator_status.get("active_agents", [])
-        recently_completed = orchestrator_status.get("recently_completed", [])
+        paused = dispatcher_status.get("paused", False)
+        active_agents = dispatcher_status.get("active_agents", [])
+        recently_completed = dispatcher_status.get("recently_completed", [])
 
         if paused:
             lines.append("Last known state: paused.")
@@ -993,24 +1001,24 @@ def format_stale_alert(
             lines.append("Recent tasks:")
             lines.extend(completion_lines)
 
-        updated_at = orchestrator_status.get("updated_at", "unknown")
+        updated_at = dispatcher_status.get("updated_at", "unknown")
         lines.append(f"Last heartbeat: {updated_at}")
 
     lines.append("")
     lines.append("Suggestions:")
-    lines.append("  - Check if the orchestrator session is still running")
-    lines.append("  - Restart with /orchestrator if needed")
+    lines.append("  - Check if the dispatcher session is still running")
+    lines.append("  - Restart with /dispatcher if needed")
 
     return "\n".join(lines)
 
 
-def check_orchestrator_staleness(
+def check_dispatcher_staleness(
     *,
     status_file: str,
     tracker: StalenessTracker,
     threshold_seconds: float = STALE_ALERT_THRESHOLD_SECONDS,
 ) -> tuple[bool, str, dict[str, Any] | None]:
-    """Check whether the orchestrator status is stale and an alert should be sent.
+    """Check whether the dispatcher status is stale and an alert should be sent.
 
     This function handles de-duplication: it only returns ``True`` the
     first time staleness is detected.  If the status file is updated
@@ -1018,29 +1026,29 @@ def check_orchestrator_staleness(
     can trigger a new alert.
 
     Args:
-        status_file: Path to the orchestrator status JSON file.
+        status_file: Path to the dispatcher status JSON file.
         tracker: Mutable :class:`StalenessTracker` that persists across
             poll cycles.
         threshold_seconds: Number of seconds after which the status is
             considered stale.
 
     Returns:
-        A tuple of ``(should_alert, alert_text, orchestrator_status)``.
+        A tuple of ``(should_alert, alert_text, dispatcher_status)``.
         ``should_alert`` is ``True`` only when an alert needs to be sent.
         ``alert_text`` is the formatted alert message (empty string if
-        no alert).  ``orchestrator_status`` is the parsed status dict
+        no alert).  ``dispatcher_status`` is the parsed status dict
         (or ``None`` if the file is missing/corrupt).
     """
-    orchestrator_status = read_orchestrator_status(status_file)
+    dispatcher_status = read_dispatcher_status(status_file)
 
-    if orchestrator_status is None:
+    if dispatcher_status is None:
         # No status file — nothing to check.  Don't alert about a missing
-        # file; the orchestrator may not have started yet.
+        # file; the dispatcher may not have started yet.
         return False, "", None
 
-    updated_at = str(orchestrator_status.get("updated_at", ""))
+    updated_at = str(dispatcher_status.get("updated_at", ""))
 
-    # If the updated_at has changed since we last checked, the orchestrator
+    # If the updated_at has changed since we last checked, the dispatcher
     # is alive — reset the tracker.
     if updated_at != tracker.last_seen_updated_at:
         tracker.alert_sent = False
@@ -1048,58 +1056,62 @@ def check_orchestrator_staleness(
 
     staleness = _staleness_seconds(updated_at)
     if staleness is None:
-        return False, "", orchestrator_status
+        return False, "", dispatcher_status
 
     if staleness <= threshold_seconds:
         # Status is fresh — no alert needed.
-        return False, "", orchestrator_status
+        return False, "", dispatcher_status
 
     # Status is stale.  Only alert if we haven't already.
     if tracker.alert_sent:
-        return False, "", orchestrator_status
+        return False, "", dispatcher_status
 
     tracker.alert_sent = True
-    alert_text = format_stale_alert(staleness, orchestrator_status)
-    return True, alert_text, orchestrator_status
+    alert_text = format_stale_alert(staleness, dispatcher_status)
+    return True, alert_text, dispatcher_status
 
 
-def merge_agent_status_into_orchestrator(
-    orchestrator_status: dict[str, Any],
+# Backward-compat alias — will be removed in a future release.
+check_orchestrator_staleness = check_dispatcher_staleness
+
+
+def merge_agent_status_into_dispatcher(
+    dispatcher_status: dict[str, Any],
     agent_statuses: list[dict[str, str]],
     *,
     staleness_threshold_seconds: float = 3600.0,
 ) -> dict[str, Any]:
-    """Merge per-worker agent-status files into the orchestrator status.
+    """Merge per-worker agent-status files into the dispatcher status.
 
     For each worker found in *agent_statuses*, if the agent-status file has
     a more recent ``updated`` timestamp than the corresponding entry in
-    ``orchestrator_status["active_agents"]``, the agent-status data is
+    ``dispatcher_status["active_agents"]``, the agent-status data is
     preferred.  Workers only present in agent-status files are added.
 
-    If the overall ``updated_at`` field on the orchestrator status is older
+    If the overall ``updated_at`` field on the dispatcher status is older
     than *staleness_threshold_seconds*, a ``staleness_warning`` key is added
     to the returned dict.
 
-    The input *orchestrator_status* dict is **not** mutated; a shallow copy
+    The input *dispatcher_status* dict is **not** mutated; a shallow copy
     is returned.
 
     Args:
-        orchestrator_status: The status dict read from
-            ``orchestrator_status.json``.
+        dispatcher_status: The status dict read from
+            ``dispatcher_status.json``.
         agent_statuses: List of dicts from :func:`read_agent_status_files`.
         staleness_threshold_seconds: Threshold (in seconds) above which
             a staleness warning is emitted.  Defaults to 3600 (60 minutes).
 
     Returns:
-        A (possibly enriched) copy of *orchestrator_status*.
+        A (possibly enriched) copy of *dispatcher_status*.
     """
-    result = dict(orchestrator_status)
+    result = dict(dispatcher_status)
     active_agents: list[dict[str, Any]] = list(result.get("active_agents", []))
 
     # Build a lookup of existing agents by worker name/number for comparison.
     agent_by_worker: dict[str, dict[str, Any]] = {}
     for agent in active_agents:
-        # orchestrator_status entries use "worker_number" as an int
+        # dispatcher_status entries use "worker_number" as an int
         worker_key = f"worker-{agent.get('worker_number', '')}"
         agent_by_worker[worker_key] = agent
 
@@ -1142,18 +1154,22 @@ def merge_agent_status_into_orchestrator(
 
     result["active_agents"] = active_agents
 
-    # Check overall staleness of orchestrator_status.json.
+    # Check overall staleness of dispatcher_status.json.
     overall_updated = result.get("updated_at", "")
     staleness = _staleness_seconds(overall_updated)
     if staleness is not None and staleness > staleness_threshold_seconds:
         minutes = staleness / 60.0
         result["staleness_warning"] = (
-            f"Note: orchestrator status may be stale — "
+            f"Note: dispatcher status may be stale — "
             f"last updated {minutes:.0f} minute(s) ago. "
             f"Agent-status files have been merged for fresher per-worker data."
         )
 
     return result
+
+
+# Backward-compat alias — will be removed in a future release.
+merge_agent_status_into_orchestrator = merge_agent_status_into_dispatcher
 
 
 def dispatch_message(
@@ -1181,7 +1197,7 @@ def dispatch_message(
     acknowledgment.
 
     Agent-status files (``worker-N.txt``) are always read and merged with
-    the orchestrator status, preferring whichever source has the more
+    the dispatcher status, preferring whichever source has the more
     recent timestamp per worker.  This ensures the interpreter always has
     the freshest possible view of each worker's state.
 
@@ -1235,26 +1251,26 @@ def dispatch_message(
         )
         return
 
-    # Read orchestrator status for context.
-    orchestrator_status = read_orchestrator_status(status_file)
+    # Read dispatcher status for context.
+    dispatcher_status = read_dispatcher_status(status_file)
 
     # Always read agent-status files for per-worker freshness.
     agent_statuses = read_agent_status_files(agent_status_dir)
 
     # If no status file exists, build a basic context from agent status files
-    # and orchestrator state.
-    if orchestrator_status is None:
-        state = read_orchestrator_state(state_file)
-        orchestrator_status = {
+    # and dispatcher state.
+    if dispatcher_status is None:
+        state = read_dispatcher_state(state_file)
+        dispatcher_status = {
             "active_agents": agent_statuses,
             "paused": state.get("paused", False),
             "workers": state.get("workers", {}),
         }
     else:
-        # Merge agent-status data into orchestrator status, preferring
+        # Merge agent-status data into dispatcher status, preferring
         # whichever source is more recent per worker.
-        orchestrator_status = merge_agent_status_into_orchestrator(
-            orchestrator_status, agent_statuses
+        dispatcher_status = merge_agent_status_into_dispatcher(
+            dispatcher_status, agent_statuses
         )
 
     # Call the Claude interpreter.
@@ -1263,14 +1279,14 @@ def dispatch_message(
             result = interpret_message_with_tools(
                 text=text,
                 repo_root=repo_root,
-                orchestrator_status=orchestrator_status,
+                orchestrator_status=dispatcher_status,
                 api_key=anthropic_api_key,
                 rate_limiter=rate_limiter,
             )
         else:
             result = interpret_message(
                 text=text,
-                orchestrator_status=orchestrator_status,
+                orchestrator_status=dispatcher_status,
                 api_key=anthropic_api_key,
                 rate_limiter=rate_limiter,
             )
@@ -1399,7 +1415,7 @@ def dispatch_command(
         bot_token=bot_token,
         chat_ids=chat_ids,
         state_file=state_file,
-        status_file="tmp/orchestrator_status.json",
+        status_file="tmp/dispatcher_status.json",
         agent_status_dir=agent_status_dir,
         stop_requests_file=stop_requests_file,
         inbox_file=inbox_file,
@@ -1740,12 +1756,12 @@ def run_daemon(
 
                 # Proactive staleness check — runs every cycle regardless
                 # of whether any messages were received.
-                should_alert, alert_text, _ = check_orchestrator_staleness(
+                should_alert, alert_text, _ = check_dispatcher_staleness(
                     status_file=status_file,
                     tracker=staleness_tracker,
                 )
                 if should_alert:
-                    logger.warning("Orchestrator status is stale — sending alert.")
+                    logger.warning("Dispatcher status is stale — sending alert.")
                     send_telegram_reply(
                         alert_text,
                         bot_token=bot_token,
@@ -1792,13 +1808,13 @@ def main() -> None:
     )
     parser.add_argument(
         "--state-file",
-        default="tmp/orchestrator_state.json",
-        help="Path to orchestrator state file",
+        default="tmp/dispatcher_state.json",
+        help="Path to dispatcher state file",
     )
     parser.add_argument(
         "--status-file",
-        default="tmp/orchestrator_status.json",
-        help="Path to orchestrator status JSON file (written by DispatcherBridge)",
+        default="tmp/dispatcher_status.json",
+        help="Path to dispatcher status JSON file (written by DispatcherBridge)",
     )
     parser.add_argument(
         "--agent-status-dir",
