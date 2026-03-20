@@ -63,4 +63,20 @@ jobs:
 
       - name: Terraform Plan (dev)
         if: ${{ env.AWS_ACCESS_KEY_ID != '' }}
-        run: terraform -chdir=infra/terraform/environments/dev plan -no-color -input=false
+        run: |
+          for attempt in 1 2 3; do
+            echo "::group::Plan attempt $attempt"
+            if terraform -chdir=infra/terraform/environments/dev plan \
+                -no-color -input=false -lock-timeout=120s; then
+              echo "::endgroup::"
+              exit 0
+            fi
+            ec=$?
+            echo "::endgroup::"
+            if [ "$attempt" -lt 3 ]; then
+              echo "Plan attempt $attempt failed (exit $ec), retrying in 10s..."
+              sleep 10
+            fi
+          done
+          echo "::error::Terraform plan failed after 3 attempts"
+          exit 1
