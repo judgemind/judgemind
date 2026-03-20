@@ -520,6 +520,8 @@ jobs:
         run: scripts/tests/test_check_hardcoded_models.sh
       - name: Test schema drift checker
         run: scripts/tests/test_check_schema_drift.sh
+      - name: Test gemini-review.sh smoke tests
+        run: scripts/tests/test_gemini_review.sh
 
   # ---------------------------------------------------------------
   # Coverage gates: diff coverage (new lines) + overall floor ratchet
