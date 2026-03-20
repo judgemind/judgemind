@@ -37,7 +37,47 @@ scripts/tg-notify.py session_started
 
 If Telegram is not configured, both commands exit silently (exit 0) — all bridge calls are no-ops when unconfigured.
 
-### 2. Scan the work queue
+### 2. Clean up stale issue assignments
+
+When a previous dispatcher or agent session ends unexpectedly (context window exhaustion, crash, terminal closed), issues assigned to the agent account may remain assigned with `agent/ready` but no agent working them. These look "in progress" but are actually abandoned, blocking future pickup.
+
+**Run this cleanup once at startup, before scanning the work queue.**
+
+1. List all open issues assigned to the agent account that have the `agent/ready` label:
+   ```
+   gh issue list --repo judgemind/judgemind \
+       --label agent/ready --state open --assignee @me \
+       --json number,title \
+       --limit 50
+   ```
+
+2. For each assigned issue, check whether an open PR exists that references it:
+   ```
+   gh pr list --repo judgemind/judgemind --state open \
+       --search "Closes #<N> OR Fixes #<N> OR Resolves #<N>" \
+       --json number --limit 1
+   ```
+   Alternatively, check the PR list from startup step 4 for branches containing the issue number.
+
+3. **If an open PR exists:** The work is partially complete. Unassign the issue so the next agent can adopt the existing PR, but leave the PR open as evidence of prior work.
+
+4. **If no open PR exists:** The assignment is fully stale — no work product exists. Unassign the issue:
+   ```
+   gh issue edit <N> --repo judgemind/judgemind --remove-assignee @me
+   ```
+
+5. Log each cleanup action. For example: `Cleaned up stale assignment: #107 "Fix OC scraper date parsing" (no open PR — unassigned)`
+
+6. After processing all stale issues, send a summary notification if any were cleaned up:
+   ```
+   scripts/tg-notify.py notify "Cleaned up N stale issue assignments: #X, #Y, #Z"
+   ```
+
+**Edge cases:**
+- An issue has an open PR but CI is failing and no agent is working it — still unassign so a fresh agent can pick it up and adopt the PR.
+- An issue was just assigned by another agent in the current session — unlikely at startup, but the "no open PR" heuristic handles this safely. New assignments will not have PRs yet, but the assigning agent will create one shortly. Even if the cleanup unassigns it prematurely, the agent will re-assign when it pushes its PR.
+
+### 3. Scan the work queue
 
 List all open `agent/ready` issues sorted by priority:
 
@@ -52,7 +92,7 @@ Priority order: `priority/p0` > `priority/p1` > `priority/p2` > `priority/p3`. W
 
 If specific issues were passed as arguments, filter to only those issues.
 
-### 3. Check for in-flight work
+### 4. Check for in-flight work
 
 Check for any existing open PRs or assigned issues that may need attention (stale CI, merge conflicts, etc.):
 
@@ -63,17 +103,17 @@ gh pr list --repo judgemind/judgemind --state open \
 
 Handle any in-flight PRs before launching new work (see "PR Merge Policy" below).
 
-### 4. Initialize audit counter
+### 5. Initialize audit counter
 
 Read `tmp/dispatcher_status.json` to recover the `prs_since_last_audit` counter from a previous session. If the file does not exist or the field is missing, initialize the counter to 0.
 
-### 5. Initialize context rotation counter
+### 6. Initialize context rotation counter
 
 Initialize `loop_iterations` to 0. This counter tracks how many main loop iterations have elapsed in this session. It is used to trigger a graceful exit before the context window fills up and causes compaction-related forgetfulness (see "Context-Aware Rotation" below).
 
 Also read `session_number` from `tmp/dispatcher_status.json` (default to 0 if missing). Increment it by 1 and persist it back — this tracks how many times the dispatcher has been restarted by the outer `while :; do` loop. The first invocation is session 1.
 
-### 6. Store max_slots for enforcement
+### 7. Store max_slots for enforcement
 
 Store the max slot count (from the argument, or 5 if not specified) in a variable `max_slots`. This value is used throughout the session for slot enforcement checks. **Do not change this value during the session** — it is set once at startup and used everywhere.
 
@@ -216,7 +256,7 @@ All of this state survives a rotation because it is file-backed:
 | State | Why it's OK |
 |---|---|
 | `loop_iterations` counter | Resets to 0 — that's the point of rotation |
-| In-memory `_recently_completed` list | Status file has a snapshot; startup step 3 re-scans open PRs for current state |
+| In-memory `_recently_completed` list | Status file has a snapshot; startup step 4 re-scans open PRs for current state |
 | Pending reply tracking | Responder daemon handles timeouts independently |
 
 ---
@@ -562,6 +602,7 @@ All outbound Telegram notifications MUST use the committed script `scripts/tg-no
 Send a notification for **every** lifecycle event:
 
 - [ ] **Session started** — at dispatcher startup
+- [ ] **Stale assignments cleaned** — after startup cleanup (if any were found)
 - [ ] **Agent launched** — after each `/task #N` spawn (include issue number, title, worker number)
 - [ ] **Agent completed** — when `<task-notification>` reports success (include issue number, summary, worker number)
 - [ ] **Agent failed** — when `<task-notification>` reports failure (include issue number, error, worker number)
