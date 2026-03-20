@@ -18,6 +18,7 @@ from courts.ca.la_dept_judges import (
     JUDICIAL_OFFICERS_URL,
     JudicialOfficer,
     LACourtDirectory,
+    _parse_combined_name,
     build_department_judge_map,
     fetch_department_judge_mapping,
     lookup_judge_for_department,
@@ -66,6 +67,33 @@ class TestNormalizeDepartment:
 
 
 # ---------------------------------------------------------------------------
+# _parse_combined_name — unit tests
+# ---------------------------------------------------------------------------
+
+
+class TestParseCombinedName:
+    def test_standard_name(self) -> None:
+        assert _parse_combined_name("Abeles, Jerrold") == ("Abeles", "Jerrold")
+
+    def test_hyphenated_last_name(self) -> None:
+        assert _parse_combined_name("Duffy-Lewis, Kerry") == ("Duffy-Lewis", "Kerry")
+
+    def test_middle_initial(self) -> None:
+        assert _parse_combined_name("Crowfoot, William A.") == ("Crowfoot", "William A.")
+
+    def test_no_comma_returns_whole_as_last(self) -> None:
+        assert _parse_combined_name("SingleName") == ("SingleName", "")
+
+    def test_extra_whitespace_stripped(self) -> None:
+        assert _parse_combined_name("  Kim ,  Helen I. ") == ("Kim", "Helen I.")
+
+    def test_multiple_commas_splits_on_first(self) -> None:
+        last, first = _parse_combined_name("Smith, Jr., John")
+        assert last == "Smith"
+        assert first == "Jr., John"
+
+
+# ---------------------------------------------------------------------------
 # parse_judicial_officers_html — against fixture
 # ---------------------------------------------------------------------------
 
@@ -101,6 +129,15 @@ class TestParseJudicialOfficersHtml:
 
     def test_empty_table_returns_empty(self) -> None:
         html = (
+            "<html><body><table class='joresultstable'>"
+            "<thead><tr><th>A</th></tr></thead>"
+            "</table></body></html>"
+        )
+        officers = parse_judicial_officers_html(html)
+        assert officers == []
+
+    def test_empty_legacy_table_returns_empty(self) -> None:
+        html = (
             "<html><body><table id='GridView1'>"
             "<thead><tr><th>A</th></tr></thead>"
             "</table></body></html>"
@@ -120,6 +157,37 @@ class TestParseJudicialOfficersHtml:
         crowfoot = [o for o in officers if o.last_name == "Crowfoot"]
         assert len(crowfoot) == 1
         assert crowfoot[0].department == "3"
+        assert crowfoot[0].courthouse == "Alhambra Courthouse"
+
+    def test_legacy_format_backward_compatible(self) -> None:
+        """Parser should still handle the old GridView1 table format."""
+        legacy_html = (
+            "<html><body><table id='GridView1'>"
+            "<thead><tr>"
+            "<th>Last Name</th><th>First Name</th><th>Title</th>"
+            "<th>Courthouse</th><th>Department</th><th>Phone</th>"
+            "<th>Primary Assignment</th>"
+            "</tr></thead>"
+            "<tbody><tr>"
+            "<td>Smith</td><td>John</td><td>Judge</td>"
+            "<td>Central</td><td>042</td><td>(555) 123-4567</td>"
+            "<td>Civil</td>"
+            "</tr></tbody></table></body></html>"
+        )
+        officers = parse_judicial_officers_html(legacy_html)
+        assert len(officers) == 1
+        assert officers[0].last_name == "Smith"
+        assert officers[0].first_name == "John"
+        assert officers[0].courthouse == "Central"
+        assert officers[0].department == "042"
+
+    def test_location_link_text_extracted(self) -> None:
+        """Location column may contain <a> tags — text should be extracted."""
+        html = _load("la_judicial_officers.html")
+        officers = parse_judicial_officers_html(html)
+        # Crowfoot's location is wrapped in an <a> tag
+        crowfoot = [o for o in officers if o.last_name == "Crowfoot"]
+        assert len(crowfoot) == 1
         assert crowfoot[0].courthouse == "Alhambra Courthouse"
 
 
