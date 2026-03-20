@@ -35,6 +35,7 @@ LOCAL_ONLY=(
     "log_ralph_summary.py"      # Ralph loop summary — runs locally in worktree
     "update-coverage-baselines.py"  # CI-only — runs in GitHub Actions runner
     "validate-dq-baselines.py"      # CI-only — validates baselines JSON structure
+    "run_judge_cleanup.py"          # Orchestrator — runs sibling scripts via subprocess
 )
 
 # ─── Discover sibling module names ─────────────────────────────────────────
