@@ -68,6 +68,7 @@ from .llm_extract import (
 )
 from .llm_providers import create_client as create_llm_client
 from .ruling_formatter import format_ruling_text
+from .splitter import make_split_document_id, split_document
 from .text_cleanup import clean_ruling_text
 
 if TYPE_CHECKING:
@@ -428,6 +429,47 @@ class IngestionWorker:
                     extra={"document_id": document_id},
                 )
 
+        # ------------------------------------------------------------------
+        # Document splitting — detect multi-case calendar pages
+        # ------------------------------------------------------------------
+        # Update ruling_text in event_data so the splitter sees PDF-extracted text.
+        if ruling_text != event_data.get("ruling_text"):
+            event_data = {**event_data, "ruling_text": ruling_text}
+
+        if not event_data.get("_split_processed"):
+            split_results = split_document(event_data)
+            if len(split_results) > 1:
+                logger.info(
+                    "Splitting document into %d individual rulings",
+                    len(split_results),
+                    extra={
+                        "document_id": document_id,
+                        "split_count": len(split_results),
+                    },
+                )
+                for idx, split in enumerate(split_results):
+                    split_doc_id = make_split_document_id(document_id, idx)
+                    split_event = {
+                        **event_data,
+                        "document_id": split_doc_id,
+                        "_original_document_id": document_id,
+                        "_split_processed": True,
+                        "_split_index": idx,
+                        "_split_count": len(split_results),
+                        "ruling_text": split.ruling_text,
+                    }
+                    # Override per-split fields only when the splitter provided them
+                    if split.case_title is not None:
+                        split_event["case_title"] = split.case_title
+                    if split.case_number is not None:
+                        split_event["case_number"] = split.case_number
+                    if split.motion_type is not None:
+                        split_event["motion_type"] = split.motion_type
+                    if split.outcome is not None:
+                        split_event["outcome"] = split.outcome
+                    self.process_event(split_event)
+                return
+
         # Parse timestamps
         capture_ts = _parse_datetime(event_data.get("capture_timestamp"))
         hearing_dt = _parse_date(event_data.get("hearing_date"))
@@ -649,6 +691,11 @@ class IngestionWorker:
                 },
             )
 
+        # For split events, use the original document_id for the documents table
+        # (one PDF = one document row) but the synthetic split ID for rulings.
+        original_document_id = event_data.get("_original_document_id", document_id)
+        is_split = event_data.get("_split_processed", False)
+
         conn = self._get_connection()
         try:
             # 1. Ensure court exists
@@ -666,9 +713,11 @@ class IngestionWorker:
             )
 
             # 3. Insert document (idempotent on document_id)
+            # For split rulings, use the original document_id so all splits
+            # share a single document row (one PDF = one document).
             is_new = insert_document(
                 conn,
-                document_id=document_id,
+                document_id=original_document_id,
                 case_id=case_id,
                 court_id=court_id,
                 content_format=content_format,
@@ -716,9 +765,12 @@ class IngestionWorker:
             conn.rollback()
             raise
 
-        if is_new:
-            # Index in OpenSearch — document_id is used as the OS doc id
-            # so rulings.document_id FK aligns with OpenSearch _id
+        # Index in OpenSearch.  For split rulings, always index (each split
+        # gets its own OS entry keyed by the synthetic split document_id).
+        # For non-split rulings, only index when the document is new.
+        should_index = is_new or is_split
+        if should_index:
+            # Use the ruling's document_id (synthetic for splits) as the OS _id
             self._indexer.index_document(
                 {
                     "document_id": document_id,
