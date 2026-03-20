@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, screen } from '@testing-library/react';
-import { RulingDetail, sanitizeRulingHtml } from '../RulingDetail';
+import { RulingDetail } from '../RulingDetail';
+import { sanitizeRulingHtml } from '@/lib/sanitize-html';
 
 // ---------------------------------------------------------------------------
 // Mock next/link — render as an anchor tag
