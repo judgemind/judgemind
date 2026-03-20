@@ -6,6 +6,7 @@ on:
     paths:
       - "packages/scraper-framework/**"
       - ".github/workflows/deploy-scraper.yml"
+      - ".github/actions/ecs-deploy/**"
   workflow_dispatch:
     inputs:
       image_tag:
@@ -89,6 +90,9 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
+      - name: Checkout (for composite action)
+        uses: actions/checkout@v4
+
       - name: Set pending deployment status
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -103,80 +107,15 @@ jobs:
               "context": "deploy/staging"
             }'
 
-      - name: Get current task definition
-        id: current-task-def
-        run: |
-          aws ecs describe-task-definition \
-            --task-definition "$TASK_FAMILY" \
-            --query 'taskDefinition' \
-            --output json > current-task-def.json
-
-          echo "Current task definition:"
-          cat current-task-def.json | jq '.taskDefinitionArn'
-
-      - name: Register new task definition revision
-        id: new-task-def
-        env:
-          IMAGE_URI: ${{ needs.build-and-push.outputs.image_uri }}
-        run: |
-          # Update the container image in the task definition
-          jq --arg image "$IMAGE_URI" --arg container "$CONTAINER_NAME" \
-            '.containerDefinitions |= map(if .name == $container then .image = $image else . end)' \
-            current-task-def.json > updated-containers.json
-
-          # Register the new revision, keeping only the fields accepted by register-task-definition
-          NEW_TASK_DEF_ARN=$(aws ecs register-task-definition \
-            --family "$TASK_FAMILY" \
-            --requires-compatibilities $(jq -r '.requiresCompatibilities[]' updated-containers.json) \
-            --network-mode $(jq -r '.networkMode' updated-containers.json) \
-            --cpu $(jq -r '.cpu' updated-containers.json) \
-            --memory $(jq -r '.memory' updated-containers.json) \
-            --execution-role-arn $(jq -r '.executionRoleArn' updated-containers.json) \
-            --task-role-arn $(jq -r '.taskRoleArn' updated-containers.json) \
-            --container-definitions "$(jq -c '.containerDefinitions' updated-containers.json)" \
-            --query 'taskDefinition.taskDefinitionArn' \
-            --output text)
-
-          echo "New task definition ARN: $NEW_TASK_DEF_ARN"
-          echo "arn=$NEW_TASK_DEF_ARN" >> "$GITHUB_OUTPUT"
-
-      - name: Update EventBridge Scheduler target
-        env:
-          NEW_TASK_DEF_ARN: ${{ steps.new-task-def.outputs.arn }}
-        run: |
-          # Get the current schedule configuration
-          SCHEDULE_JSON=$(aws scheduler get-schedule \
-            --name "$SCHEDULER_NAME" \
-            --output json)
-
-          # Update the task definition ARN in the target's ECS parameters
-          UPDATED_TARGET=$(echo "$SCHEDULE_JSON" | jq --arg arn "$NEW_TASK_DEF_ARN" \
-            '.Target.EcsParameters.TaskDefinitionArn = $arn | .Target')
-
-          # Extract schedule fields needed for update
-          SCHEDULE_EXPR=$(echo "$SCHEDULE_JSON" | jq -r '.ScheduleExpression')
-          SCHEDULE_TZ=$(echo "$SCHEDULE_JSON" | jq -r '.ScheduleExpressionTimezone')
-          STATE=$(echo "$SCHEDULE_JSON" | jq -r '.State')
-          FLEX_WINDOW=$(echo "$SCHEDULE_JSON" | jq -c '.FlexibleTimeWindow')
-          DESCRIPTION=$(echo "$SCHEDULE_JSON" | jq -r '.Description // empty')
-
-          # Build update-schedule command
-          UPDATE_ARGS=(
-            --name "$SCHEDULER_NAME"
-            --schedule-expression "$SCHEDULE_EXPR"
-            --schedule-expression-timezone "$SCHEDULE_TZ"
-            --state "$STATE"
-            --flexible-time-window "$FLEX_WINDOW"
-            --target "$UPDATED_TARGET"
-          )
-
-          if [ -n "$DESCRIPTION" ]; then
-            UPDATE_ARGS+=(--description "$DESCRIPTION")
-          fi
-
-          aws scheduler update-schedule "${UPDATE_ARGS[@]}"
-
-          echo "Updated scheduler '$SCHEDULER_NAME' to use task definition: $NEW_TASK_DEF_ARN"
+      - name: Deploy to ECS
+        id: deploy
+        uses: ./.github/actions/ecs-deploy
+        with:
+          task-family: ${{ env.TASK_FAMILY }}
+          container-name: ${{ env.CONTAINER_NAME }}
+          image-uri: ${{ needs.build-and-push.outputs.image_uri }}
+          deploy-mode: scheduler
+          scheduler-name: ${{ env.SCHEDULER_NAME }}
 
       - name: Set deployment status
         if: always()
@@ -214,6 +153,9 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
+      - name: Checkout (for composite action)
+        uses: actions/checkout@v4
+
       - name: Set pending deployment status
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -228,69 +170,16 @@ jobs:
               "context": "deploy/ingestion-worker-dev"
             }'
 
-      - name: Get current task definition
-        id: current-task-def
-        run: |
-          aws ecs describe-task-definition \
-            --task-definition "$INGESTION_TASK_FAMILY" \
-            --query 'taskDefinition' \
-            --output json > current-task-def.json
-
-          echo "Current task definition:"
-          cat current-task-def.json | jq '.taskDefinitionArn'
-
-      - name: Register new task definition revision
-        id: new-task-def
-        env:
-          IMAGE_URI: ${{ needs.build-and-push.outputs.image_uri }}
-        run: |
-          # Update the container image in the task definition
-          jq --arg image "$IMAGE_URI" --arg container "$INGESTION_CONTAINER" \
-            '.containerDefinitions |= map(if .name == $container then .image = $image else . end)' \
-            current-task-def.json > updated-containers.json
-
-          # Build register args, including task role if present
-          TASK_ROLE=$(jq -r '.taskRoleArn // empty' updated-containers.json)
-          REGISTER_ARGS=(
-            --family "$INGESTION_TASK_FAMILY"
-            --requires-compatibilities $(jq -r '.requiresCompatibilities[]' updated-containers.json)
-            --network-mode $(jq -r '.networkMode' updated-containers.json)
-            --cpu $(jq -r '.cpu' updated-containers.json)
-            --memory $(jq -r '.memory' updated-containers.json)
-            --execution-role-arn $(jq -r '.executionRoleArn' updated-containers.json)
-            --container-definitions "$(jq -c '.containerDefinitions' updated-containers.json)"
-          )
-
-          if [ -n "$TASK_ROLE" ]; then
-            REGISTER_ARGS+=(--task-role-arn "$TASK_ROLE")
-          fi
-
-          NEW_TASK_DEF_ARN=$(aws ecs register-task-definition \
-            "${REGISTER_ARGS[@]}" \
-            --query 'taskDefinition.taskDefinitionArn' \
-            --output text)
-
-          echo "New task definition ARN: $NEW_TASK_DEF_ARN"
-          echo "arn=$NEW_TASK_DEF_ARN" >> "$GITHUB_OUTPUT"
-
-      - name: Update ECS service
-        env:
-          NEW_TASK_DEF_ARN: ${{ steps.new-task-def.outputs.arn }}
-        run: |
-          aws ecs update-service \
-            --cluster "$ECS_CLUSTER" \
-            --service "$INGESTION_SERVICE" \
-            --task-definition "$NEW_TASK_DEF_ARN" \
-            --force-new-deployment \
-            --query 'service.serviceName' \
-            --output text
-
-          echo "Waiting for ingestion worker service to stabilize..."
-          aws ecs wait services-stable \
-            --cluster "$ECS_CLUSTER" \
-            --services "$INGESTION_SERVICE"
-
-          echo "Ingestion worker service updated successfully."
+      - name: Deploy to ECS
+        id: deploy
+        uses: ./.github/actions/ecs-deploy
+        with:
+          task-family: ${{ env.INGESTION_TASK_FAMILY }}
+          container-name: ${{ env.INGESTION_CONTAINER }}
+          image-uri: ${{ needs.build-and-push.outputs.image_uri }}
+          deploy-mode: service
+          ecs-cluster: ${{ env.ECS_CLUSTER }}
+          ecs-service: ${{ env.INGESTION_SERVICE }}
 
       - name: Set deployment status
         if: always()
