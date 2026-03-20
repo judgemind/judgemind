@@ -22,6 +22,7 @@ These are the most frequently violated rules. **A PreToolUse hook enforces the s
 - **NEVER** set `priority/p0` on issues unless explicitly told to by a human. `p0` is human-only.
 - **NEVER** skip pre-PR checks. Run lint, format, AND tests locally before pushing.
 - **NEVER** share venvs between worktrees. Each worktree gets its own `.venv`.
+- **NEVER** close a task or remove a worktree without posting a verification evidence comment on the issue. Every task completion requires concrete evidence that the change works (deployed services) or an explicit skip reason (docs/CI/tooling). See §4.10 Step 3.
 
 ### ALWAYS — Before Acting
 - **ALWAYS** Read a file before Writing to it (the Write tool fails on existing files you haven't read).
@@ -154,17 +155,21 @@ Diagnose, fix locally, push again, return to 4.4. Repeat until CI is green.
 
 #### 4.8 — Update the PR test plan
 
-Fetch the PR body, check off automated steps that passed in CI. Write updated body to `{worktree}/tmp/pr_body.txt` and update with `gh pr edit --body-file`.
+Fetch the PR body, check off **Automated checks** items that passed in CI. Do NOT check off **Post-deploy verification** items yet — those are checked after merge and deploy in step 4.10. Write updated body to `{worktree}/tmp/pr_body.txt` and update with `gh pr edit --body-file`.
+
+PR test plans must be structured with two sections:
+- **Automated checks** (lint, format, tests, CI) — checked when CI passes
+- **Post-deploy verification** (feature works on dev) — checked after deploy with concrete evidence
 
 #### 4.9 — Link the issue and request review
 
 Comment on the issue linking the PR. Add the `status/review` label.
 
-#### 4.10 — Verify deployment and functional health (after merge, deployed services only)
+#### 4.10 — Verify deployment and post evidence (after merge, deployed services only)
 
-**A task is NOT done when the PR merges. A task is done when the change is deployed AND verified working in the target environment.** The worktree stays alive until verification passes.
+**A task is NOT done when the PR merges. A task is done when the change is deployed, verified working, AND verification evidence is posted.** The worktree stays alive until verification passes.
 
-Skip this step only for pure library, tooling, docs, or CI-only changes that have no deployed component.
+Skip deploy watching only for pure library, tooling, docs, or CI-only changes that have no deployed component — but you must STILL post a verification evidence comment (see Step 3 below).
 
 **Step 1 — Watch the deploy workflow:**
 
@@ -178,19 +183,27 @@ For **web frontend** changes: Vercel deploys automatically — see `docs/agent/i
 
 A successful deploy only means the new image is running — not that the service works. Verify the feature is actually functional based on the change type:
 
-| Change type | Verification |
-|---|---|
-| **DB migration + code** | Confirm migration applied (column/table exists via `scripts/dev-db-query.sh`) AND service processes a request without errors |
-| **API endpoint** | Hit the endpoint on dev (`curl https://dev.api.judgemind.org/graphql`), confirm expected response shape and no errors |
-| **Ingestion pipeline** | Confirm the worker processes at least one message successfully (check ECS logs via `scripts/ecs-logs.sh /ecs/judgemind-ingestion-worker-dev --lines 50` for recent successful processing) |
-| **Scraper** | Check ECS logs for the next scheduled run, confirm documents are captured without errors |
-| **Frontend** | Confirm the affected page loads on `dev.judgemind.org` and renders the expected content |
-| **DX/tooling** | Run the tool in a representative scenario and confirm expected output |
-| **Backfill / data migration script** | Execute the script against dev via `scripts/ecs-run-task.sh` (or locally if appropriate). Confirm the expected data changes applied — e.g., query dev DB via `scripts/dev-db-query.sh` to check row counts, null rates, or sample records. |
+| Change type | Verification | Required evidence |
+|---|---|---|
+| **DB migration + code** | Confirm migration applied (column/table exists via `scripts/dev-db-query.sh`) AND service processes a request without errors | DB query output + successful request/response |
+| **API endpoint** | Hit the endpoint on dev (`curl https://dev.api.judgemind.org/graphql`), confirm expected response shape and no errors | Curl response (status code + relevant body snippet) |
+| **Ingestion pipeline** | Confirm the worker processes at least one message successfully (check ECS logs via `scripts/ecs-logs.sh /ecs/judgemind-ingestion-worker-dev --lines 50` for recent successful processing) | Log lines showing successful processing |
+| **Scraper** | Check ECS logs for the next scheduled run, confirm documents are captured without errors | Log lines showing successful capture |
+| **Frontend** | Confirm the affected page loads on `dev.judgemind.org` and renders the expected content | Screenshot or page content showing the feature |
+| **DX/tooling** | Run the tool in a representative scenario and confirm expected output | Command output showing correct behavior |
+| **Backfill / data migration script** | Execute the script against dev via `scripts/ecs-run-task.sh` (or locally if appropriate). Confirm the expected data changes applied — e.g., query dev DB via `scripts/dev-db-query.sh` to check row counts, null rates, or sample records. | DB query results showing the data changed |
 
 **Script-producing tasks:** If a task produces a backfill, migration, or one-off fixup script that is meant to be run, executing it on dev and verifying results is part of the definition of done. When filing issues that include "create a backfill script" or similar, always include "backfill executed on dev and results verified" in the acceptance criteria.
 
 If functional verification fails: diagnose the issue. If it's a simple fix, fix it in a follow-up PR. If it's complex, file a `priority/p1` issue with details of what's broken, reference the merged PR, and add `agent/ready`.
+
+**Step 3 — Post verification evidence comment (MANDATORY):**
+
+After verification succeeds (or after determining there is no deployed component), post a verification evidence comment on the issue. This is a hard gate — the task cannot proceed to 4.11 without this comment. Write the comment to `{worktree}/tmp/verification_evidence.txt`, then post it with `gh issue comment`.
+
+For deployed changes, include concrete evidence (curl output, DB query results, log lines, screenshots). For non-deployed changes, state the skip reason explicitly (e.g., "No deployed component — docs/CI only"). See `.claude/skills/task/SKILL.md` A.8 Step 3 for the full evidence format.
+
+After posting, update the PR test plan to check off the **Post-deploy verification** items.
 
 #### 4.11 — Remove your worktree
 
