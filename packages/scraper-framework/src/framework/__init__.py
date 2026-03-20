@@ -2,6 +2,7 @@
 
 from .base import BaseScraper
 from .court_directory import CourtDirectory
+from .css_inliner import inline_css
 from .event_bus import RedisEventBus
 from .events import EventBus
 from .hashing import content_changed, sha256_hex
@@ -37,6 +38,7 @@ __all__ = [
     "ValidationStatus",
     "build_s3_key",
     "content_changed",
+    "inline_css",
     "create_index",
     "get_scraper_ids",
     "run_scrapers",
