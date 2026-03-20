@@ -45,6 +45,7 @@ sys.path.insert(
 
 import anthropic  # noqa: E402
 import psycopg  # noqa: E402
+from judgemind_config import DEFAULT_HAIKU_MODEL  # noqa: E402
 
 logging.basicConfig(
     level=logging.INFO,
@@ -71,7 +72,7 @@ _SYSTEM_PROMPT = (
     "use it to make the summary more specific, but do not repeat it verbatim."
 )
 
-_SUMMARY_MODEL = "claude-haiku-4-5-20251001"
+_SUMMARY_MODEL = DEFAULT_HAIKU_MODEL
 
 # ---------------------------------------------------------------------------
 # SQL queries

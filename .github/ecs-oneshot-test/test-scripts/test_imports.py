@@ -26,6 +26,7 @@ REQUIRED_IMPORTS = {
     "opensearchpy": "opensearch-py",
     "psycopg": "psycopg",
     "anthropic": "anthropic",
+    "judgemind_config": "judgemind-config",
 }
 
 failures = []

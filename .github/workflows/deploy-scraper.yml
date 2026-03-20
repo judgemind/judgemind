@@ -70,7 +70,7 @@ jobs:
             TAGS+=("-t" "$IMAGE_BASE:$CUSTOM_TAG")
           fi
 
-          docker build "${TAGS[@]}" packages/scraper-framework/
+          docker build "${TAGS[@]}" -f packages/scraper-framework/Dockerfile .
           docker push "$IMAGE_BASE" --all-tags
 
           echo "image_uri=$IMAGE_BASE:$SHA_TAG" >> "$GITHUB_OUTPUT"

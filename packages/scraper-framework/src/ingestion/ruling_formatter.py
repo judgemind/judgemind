@@ -24,6 +24,7 @@ import html
 import re
 
 import structlog
+from judgemind_config import DEFAULT_HAIKU_MODEL
 
 from .llm_providers import LLMResponse, call_llm
 
@@ -43,7 +44,7 @@ _MIN_TEXT_LENGTH = 100
 _VALIDATION_THRESHOLD = 0.95
 
 # Default model for formatting — always Haiku for cost efficiency.
-_FORMATTING_MODEL = "claude-haiku-4-5-20251001"
+_FORMATTING_MODEL = DEFAULT_HAIKU_MODEL
 
 # Default max output tokens.  Haiku supports up to 8192 output tokens.
 _DEFAULT_MAX_TOKENS = 8192

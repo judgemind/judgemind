@@ -11,6 +11,7 @@ from __future__ import annotations
 import os
 
 import anthropic
+from judgemind_config import DEFAULT_HAIKU_MODEL
 
 _SYSTEM_PROMPT = (
     "You are summarizing a court tentative ruling for a legal research platform.\n"
@@ -72,7 +73,7 @@ class RulingSummarizer:
         user_content += ruling_text
 
         response = self._client.messages.create(
-            model="claude-haiku-4-5-20251001",
+            model=DEFAULT_HAIKU_MODEL,
             max_tokens=512,
             system=_SYSTEM_PROMPT,
             messages=[

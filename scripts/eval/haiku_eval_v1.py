@@ -33,6 +33,11 @@ from pathlib import Path
 import anthropic
 
 try:
+    from judgemind_config import DEFAULT_HAIKU_MODEL as _HAIKU_MODEL
+except ImportError:
+    _HAIKU_MODEL = "claude-haiku-4-5-20251001"
+
+try:
     import fitz  # pymupdf
 
     HAS_PYMUPDF = True
@@ -50,7 +55,7 @@ RESULTS_DIR = Path(__file__).resolve().parent / "results"
 
 # Models to test
 MODELS = {
-    "haiku": "claude-haiku-4-5-20251001",
+    "haiku": _HAIKU_MODEL,
     "sonnet": "claude-sonnet-4-6",
     "opus": "claude-opus-4-6",
 }

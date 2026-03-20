@@ -13,6 +13,7 @@ from unittest.mock import MagicMock, patch
 import anthropic
 import pytest
 from google import genai
+from judgemind_config import DEFAULT_HAIKU_MODEL
 
 from ingestion.llm_providers import (
     LLMResponse,
@@ -48,7 +49,7 @@ class TestCallAnthropic:
         result = _call_anthropic(
             system_prompt="You are a parser.",
             user_message="Extract fields.",
-            model="claude-haiku-4-5-20251001",
+            model=DEFAULT_HAIKU_MODEL,
             client=client,
         )
 
@@ -59,7 +60,7 @@ class TestCallAnthropic:
         assert result.output_tokens == 50
 
         call_kwargs = client.messages.create.call_args.kwargs
-        assert call_kwargs["model"] == "claude-haiku-4-5-20251001"
+        assert call_kwargs["model"] == DEFAULT_HAIKU_MODEL
         assert call_kwargs["temperature"] == 0
         assert call_kwargs["max_tokens"] == 4096
 

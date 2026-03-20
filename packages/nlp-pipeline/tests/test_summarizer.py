@@ -5,6 +5,7 @@ from __future__ import annotations
 from unittest.mock import MagicMock, patch
 
 import pytest
+from judgemind_config import DEFAULT_HAIKU_MODEL
 
 from summarization.summarizer import RulingSummarizer
 
@@ -354,7 +355,7 @@ class TestRulingSummarizerApiInteraction:
         summarizer.summarize("Test ruling text")
 
         call_kwargs = mock_client.messages.create.call_args
-        assert call_kwargs.kwargs["model"] == "claude-haiku-4-5-20251001"
+        assert call_kwargs.kwargs["model"] == DEFAULT_HAIKU_MODEL
 
     @patch("summarization.summarizer.anthropic.Anthropic")
     def test_passes_ruling_text_in_message(self, mock_anthropic_cls: MagicMock) -> None:

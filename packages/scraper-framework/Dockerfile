@@ -23,9 +23,15 @@ RUN groupadd --gid 1000 scraper \
 
 WORKDIR /app
 
+# Install shared judgemind-config package first (must be available
+# before pip resolves scraper-framework's dependencies).
+# Build context is the repo root (docker build -f packages/scraper-framework/Dockerfile .)
+COPY packages/judgemind-config /tmp/judgemind-config
+RUN pip install --no-cache-dir /tmp/judgemind-config && rm -rf /tmp/judgemind-config
+
 # Copy source before installing so hatchling can find the packages
-COPY pyproject.toml ./
-COPY src/ ./src/
+COPY packages/scraper-framework/pyproject.toml ./
+COPY packages/scraper-framework/src/ ./src/
 RUN pip install --no-cache-dir . \
     && pip uninstall -y google-generativeai 2>/dev/null || true
 RUN pip install --no-cache-dir playwright \

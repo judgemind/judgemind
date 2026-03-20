@@ -36,9 +36,22 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 _mock_psycopg = MagicMock()
 _mock_anthropic = MagicMock()
 
+# judgemind_config provides DEFAULT_HAIKU_MODEL.  If the real package is not
+# installed (lightweight CI environment), we provide a mock with the same
+# constant so the script can be imported.
+try:
+    import judgemind_config as _real_jc  # noqa: F401
+
+    _modules_to_mock_jc: dict[str, object] = {}
+except ImportError:
+    _mock_judgemind_config = MagicMock()
+    _mock_judgemind_config.DEFAULT_HAIKU_MODEL = "claude-haiku-4-5-20251001"
+    _modules_to_mock_jc = {"judgemind_config": _mock_judgemind_config}
+
 _modules_to_mock = {
     "psycopg": _mock_psycopg,
     "anthropic": _mock_anthropic,
+    **_modules_to_mock_jc,
 }
 
 # Inject mocks, remembering any that already exist so we restore them later.
@@ -172,9 +185,9 @@ def test_generate_summary_basic() -> None:
     result = generate_summary("Some ruling text", mock_client)
     assert result == "The court granted the motion."
 
-    # Verify correct model used
+    # Verify correct model used — uses the centralized constant
     call_kwargs = mock_client.messages.create.call_args
-    assert call_kwargs.kwargs["model"] == "claude-haiku-4-5-20251001"
+    assert call_kwargs.kwargs["model"] == backfill_summaries._SUMMARY_MODEL
 
 
 def test_generate_summary_with_context() -> None:

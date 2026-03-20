@@ -6,6 +6,7 @@ import json
 from unittest.mock import MagicMock, patch
 
 import pytest
+from judgemind_config import DEFAULT_HAIKU_MODEL
 
 from classification.classifier import (
     MOTION_TYPE_VALUES,
@@ -335,7 +336,7 @@ class TestRulingClassifierApiInteraction:
         classifier.classify("Test ruling text")
 
         call_kwargs = mock_client.messages.create.call_args
-        assert call_kwargs.kwargs["model"] == "claude-haiku-4-5-20251001"
+        assert call_kwargs.kwargs["model"] == DEFAULT_HAIKU_MODEL
 
     @patch("classification.classifier.anthropic.Anthropic")
     def test_passes_ruling_text_in_message(self, mock_anthropic_cls: MagicMock) -> None:
