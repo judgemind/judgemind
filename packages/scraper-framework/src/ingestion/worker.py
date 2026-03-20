@@ -838,7 +838,8 @@ class IngestionWorker:
                     "motion_type": motion_type,
                     "outcome": outcome,
                     "case_title": case_title,
-                    "summary": cleaned_ruling_text[:500] if cleaned_ruling_text else None,
+                    "summary": summary
+                    or (cleaned_ruling_text[:500] if cleaned_ruling_text else None),
                     "ruling_text": ruling_text,
                     "s3_key": s3_key,
                     "content_hash": content_hash,

@@ -3449,6 +3449,76 @@ def test_process_event_summarizes_ruling_when_enabled(
 
 @patch("ingestion.worker.summarize_ruling")
 @patch("ingestion.worker.psycopg")
+def test_process_event_opensearch_uses_llm_summary_when_available(
+    mock_psycopg: MagicMock,
+    mock_summarize: MagicMock,
+) -> None:
+    """OpenSearch indexed doc uses the LLM summary instead of truncated text (#1183)."""
+    worker, os_mock = _make_worker()
+    worker._summarization_enabled = True
+    worker._summarization_client = MagicMock()
+    llm_summary = "The court granted the motion for summary judgment."
+    mock_summarize.return_value = (llm_summary, "claude-haiku-4-5-20251001")
+
+    mock_conn, mock_cur = _make_mock_conn()
+    mock_psycopg.connect.return_value = mock_conn
+    mock_cur.fetchone.side_effect = [
+        ("court-uuid-1",),  # upsert_court
+        ("case-uuid-1",),  # upsert_case
+        (True,),  # insert_document
+        None,  # resolve_judge: no existing alias
+        ("judge-uuid-1",),  # INSERT INTO judges
+    ]
+    mock_cur.fetchall.return_value = []
+
+    event = _make_event()
+    worker.process_event(event)
+
+    os_mock.index.assert_called_once()
+    indexed_doc = os_mock.index.call_args.kwargs["body"]
+    assert indexed_doc["summary"] == llm_summary
+
+
+@patch("ingestion.worker.summarize_ruling")
+@patch("ingestion.worker.psycopg")
+def test_process_event_opensearch_falls_back_to_truncated_text_without_summary(
+    mock_psycopg: MagicMock,
+    mock_summarize: MagicMock,
+) -> None:
+    """OpenSearch uses truncated text when summarization is disabled (#1183)."""
+    worker, os_mock = _make_worker()
+    # summarization disabled by default
+
+    mock_conn, mock_cur = _make_mock_conn()
+    mock_psycopg.connect.return_value = mock_conn
+    mock_cur.fetchone.side_effect = [
+        ("court-uuid-1",),  # upsert_court
+        ("case-uuid-1",),  # upsert_case
+        (True,),  # insert_document
+        None,  # resolve_judge: no existing alias
+        None,  # resolve_judge: no canonical name match
+        ("judge-uuid-1",),  # resolve_judge: INSERT INTO judges
+    ]
+    mock_cur.fetchall.return_value = []
+    mock_cur.rowcount = 1
+
+    event = _make_event(
+        outcome="granted",
+        motion_type="demurrer",
+        case_title="In re Marriage of Smith",
+    )
+    worker.process_event(event)
+
+    os_mock.index.assert_called_once()
+    indexed_doc = os_mock.index.call_args.kwargs["body"]
+    # Should fall back to truncated cleaned_ruling_text
+    assert indexed_doc["summary"] is not None
+    assert len(indexed_doc["summary"]) <= 500
+    mock_summarize.assert_not_called()
+
+
+@patch("ingestion.worker.summarize_ruling")
+@patch("ingestion.worker.psycopg")
 def test_process_event_summarization_disabled_by_default(
     mock_psycopg: MagicMock,
     mock_summarize: MagicMock,
