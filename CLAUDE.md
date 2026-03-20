@@ -74,6 +74,7 @@ Subagents do the implementation work: worktree setup, coding, testing, PR, and r
 - **`/tdd`** — Test-driven implementation for code tasks (Python, TypeScript). Called by `/ralph` internally. **Not for** Terraform, DB migrations, CI/CD, docs, or investigation tasks.
 - **`/dispatcher`** — Opt-in autonomous work queue manager. See `.claude/skills/dispatcher/SKILL.md`.
 - **`/audit`** — Periodic codebase health audit. Reviews recent PRs, checks for dead code, test gaps, performance issues, security concerns, and dependency health. Files issues for findings. Triggered by the dispatcher every 20 merged PRs, or manually.
+- **`/spotcheck`** — Periodic data quality spot-check. Samples rulings across counties, runs automated DB queries for known issue patterns, screenshots case detail pages for visual inspection, cross-references existing issues, and files new issues for findings.
 
 ### Worktree setup (manual)
 
