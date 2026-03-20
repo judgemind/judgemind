@@ -1,8 +1,11 @@
 import { gql } from '@apollo/client';
 import { notFound } from 'next/navigation';
+import Link from 'next/link';
 import { createApolloClient } from '@/lib/apollo-client';
 import { formatDate, formatLabel, formatOutcome } from '@/lib/display-helpers';
 import { RulingDetail } from './RulingDetail';
+import { Card, CardContent } from '@/components/ui/card';
+import { Badge } from '@/components/ui/badge';
 
 const RULING_QUERY = gql`
   query RulingDetail($id: ID!) {
@@ -66,13 +69,13 @@ interface RulingData {
   } | null;
 }
 
-const OUTCOME_BADGE: Record<string, string> = {
-  granted: 'bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200',
-  denied: 'bg-red-100 text-red-800 dark:bg-red-900 dark:text-red-200',
+const OUTCOME_VARIANT: Record<string, string> = {
+  granted: 'bg-green-100 text-green-800 border-green-200 dark:bg-green-900 dark:text-green-200 dark:border-green-800',
+  denied: 'bg-red-100 text-red-800 border-red-200 dark:bg-red-900 dark:text-red-200 dark:border-red-800',
   granted_in_part:
-    'bg-yellow-100 text-yellow-800 dark:bg-yellow-900 dark:text-yellow-200',
+    'bg-yellow-100 text-yellow-800 border-yellow-200 dark:bg-yellow-900 dark:text-yellow-200 dark:border-yellow-800',
   denied_in_part:
-    'bg-yellow-100 text-yellow-800 dark:bg-yellow-900 dark:text-yellow-200',
+    'bg-yellow-100 text-yellow-800 border-yellow-200 dark:bg-yellow-900 dark:text-yellow-200 dark:border-yellow-800',
 };
 
 type Props = { params: { id: string } };
@@ -102,6 +105,15 @@ export default async function RulingDetailPage({ params }: Props) {
 
   return (
     <div className="mx-auto max-w-4xl">
+      {/* Breadcrumb */}
+      <nav className="mb-4 text-sm text-slate-500 dark:text-slate-400" aria-label="Breadcrumb">
+        <Link href="/rulings" className="hover:text-brand-600 dark:hover:text-brand-400">
+          Rulings
+        </Link>
+        <span className="mx-2">/</span>
+        <span className="text-slate-700 dark:text-slate-200">{motionLabel}</span>
+      </nav>
+
       {/* Heading */}
       <div className="flex flex-wrap items-start gap-3">
         <h1 className="text-2xl font-bold text-slate-900 dark:text-slate-100">
@@ -109,40 +121,116 @@ export default async function RulingDetailPage({ params }: Props) {
         </h1>
         <div className="flex flex-wrap gap-2 pt-1">
           {/* Outcome badge */}
-          <span
-            className={`inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-medium ${
-              rulingData.outcome && OUTCOME_BADGE[rulingData.outcome]
-                ? OUTCOME_BADGE[rulingData.outcome]
-                : 'bg-slate-100 text-slate-600 dark:bg-slate-700 dark:text-slate-300'
+          <Badge
+            className={`${
+              rulingData.outcome && OUTCOME_VARIANT[rulingData.outcome]
+                ? OUTCOME_VARIANT[rulingData.outcome]
+                : 'bg-slate-100 text-slate-600 border-slate-200 dark:bg-slate-700 dark:text-slate-300 dark:border-slate-600'
             }`}
           >
             {formatOutcome(rulingData.outcome)}
-          </span>
+          </Badge>
           {/* Tentative / Final badge */}
-          <span
-            className={`inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-medium ${
+          <Badge
+            className={
               rulingData.isTentative
-                ? 'bg-amber-100 text-amber-800 dark:bg-amber-900 dark:text-amber-200'
-                : 'bg-indigo-100 text-indigo-800 dark:bg-indigo-900 dark:text-indigo-200'
-            }`}
+                ? 'bg-amber-100 text-amber-800 border-amber-200 dark:bg-amber-900 dark:text-amber-200 dark:border-amber-800'
+                : 'bg-indigo-100 text-indigo-800 border-indigo-200 dark:bg-indigo-900 dark:text-indigo-200 dark:border-indigo-800'
+            }
           >
             {rulingData.isTentative ? 'Tentative' : 'Final'}
-          </span>
+          </Badge>
         </div>
       </div>
 
-      {/* Hearing date */}
-      <p className="mt-1 text-sm text-slate-500 dark:text-slate-400">
-        Hearing: {formatDate(rulingData.hearingDate)}
-        {rulingData.department ? ` \u00B7 Dept. ${rulingData.department}` : ''}
-      </p>
+      {/* Structured metadata Card */}
+      <Card className="mt-6">
+        <CardContent className="p-6">
+          <div className="grid grid-cols-2 gap-x-8 gap-y-4 sm:grid-cols-3">
+            {/* Judge */}
+            {rulingData.judge && (
+              <div>
+                <dt className="text-xs font-medium uppercase tracking-wide text-slate-500 dark:text-slate-400">
+                  Judge
+                </dt>
+                <dd className="mt-1 text-sm text-slate-900 dark:text-slate-100">
+                  {rulingData.judge.canonicalName}
+                </dd>
+              </div>
+            )}
 
-      {/* Court info */}
-      {rulingData.court && (
-        <p className="mt-0.5 text-sm text-slate-500 dark:text-slate-400">
-          {rulingData.court.courtName} &middot; {rulingData.court.county}
-        </p>
-      )}
+            {/* Court */}
+            {rulingData.court && (
+              <div>
+                <dt className="text-xs font-medium uppercase tracking-wide text-slate-500 dark:text-slate-400">
+                  Court
+                </dt>
+                <dd className="mt-1 text-sm text-slate-900 dark:text-slate-100">
+                  {rulingData.court.courtName}
+                </dd>
+              </div>
+            )}
+
+            {/* County */}
+            {rulingData.court && (
+              <div>
+                <dt className="text-xs font-medium uppercase tracking-wide text-slate-500 dark:text-slate-400">
+                  County
+                </dt>
+                <dd className="mt-1 text-sm text-slate-900 dark:text-slate-100">
+                  {rulingData.court.county}
+                </dd>
+              </div>
+            )}
+
+            {/* Department */}
+            {rulingData.department && (
+              <div>
+                <dt className="text-xs font-medium uppercase tracking-wide text-slate-500 dark:text-slate-400">
+                  Department
+                </dt>
+                <dd className="mt-1 text-sm text-slate-900 dark:text-slate-100">
+                  {rulingData.department}
+                </dd>
+              </div>
+            )}
+
+            {/* Hearing date */}
+            <div>
+              <dt className="text-xs font-medium uppercase tracking-wide text-slate-500 dark:text-slate-400">
+                Hearing Date
+              </dt>
+              <dd className="mt-1 text-sm text-slate-900 dark:text-slate-100">
+                {formatDate(rulingData.hearingDate)}
+              </dd>
+            </div>
+
+            {/* Motion type */}
+            {rulingData.motionType && (
+              <div>
+                <dt className="text-xs font-medium uppercase tracking-wide text-slate-500 dark:text-slate-400">
+                  Motion Type
+                </dt>
+                <dd className="mt-1 text-sm text-slate-900 dark:text-slate-100">
+                  {formatLabel(rulingData.motionType)}
+                </dd>
+              </div>
+            )}
+
+            {/* Case number */}
+            {rulingData.case && (
+              <div>
+                <dt className="text-xs font-medium uppercase tracking-wide text-slate-500 dark:text-slate-400">
+                  Case Number
+                </dt>
+                <dd className="mt-1 text-sm text-slate-900 dark:text-slate-100">
+                  {rulingData.case.caseNumber}
+                </dd>
+              </div>
+            )}
+          </div>
+        </CardContent>
+      </Card>
 
       {/* Client component handles ruling text, case link, judge link, document download */}
       <div className="mt-6">
