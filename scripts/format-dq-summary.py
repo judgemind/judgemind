@@ -231,6 +231,23 @@ def format_markdown_summary(data: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def get_max_severity(data: dict[str, Any]) -> str:
+    """Return the highest severity level present in the alert data.
+
+    Args:
+        data: Parsed JSON alert data with 'alerts' list.
+
+    Returns:
+        "p1" if any P1 alert exists, "p2" if only P2 alerts exist,
+        or "p2" as the default when no alerts are present.
+    """
+    alerts = data.get("alerts", [])
+    for alert in alerts:
+        if alert.get("severity") == "p1":
+            return "p1"
+    return "p2"
+
+
 def format_telegram_summary(data: dict[str, Any]) -> str:
     """Format alert data as a concise one-line Telegram summary.
 
@@ -260,10 +277,15 @@ def format_telegram_summary(data: dict[str, Any]) -> str:
 def main() -> None:
     """CLI entry point."""
     telegram_mode = "--telegram" in sys.argv
-    args = [a for a in sys.argv[1:] if a != "--telegram"]
+    max_severity_mode = "--max-severity" in sys.argv
+    flags = {"--telegram", "--max-severity"}
+    args = [a for a in sys.argv[1:] if a not in flags]
 
     if not args:
-        print("Usage: format-dq-summary.py [--telegram] <file|->", file=sys.stderr)
+        print(
+            "Usage: format-dq-summary.py [--telegram|--max-severity] <file|->",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
     file_path = args[0]
@@ -278,7 +300,9 @@ def main() -> None:
         print("Could not extract alert data from output.", file=sys.stderr)
         sys.exit(1)
 
-    if telegram_mode:
+    if max_severity_mode:
+        print(get_max_severity(data))
+    elif telegram_mode:
         print(format_telegram_summary(data))
     else:
         print(format_markdown_summary(data))

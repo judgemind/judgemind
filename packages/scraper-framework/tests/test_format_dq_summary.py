@@ -17,6 +17,7 @@ fds = import_module("format-dq-summary")
 extract_json_from_output = fds.extract_json_from_output
 format_markdown_summary = fds.format_markdown_summary
 format_telegram_summary = fds.format_telegram_summary
+get_max_severity = fds.get_max_severity
 
 
 class TestExtractJsonFromOutput:
@@ -250,6 +251,53 @@ class TestFormatMarkdownSummary:
         result = format_markdown_summary(data)
         assert "Zero rulings (24h): 1" in result
         assert "Field completeness regression: 1" in result
+
+
+class TestGetMaxSeverity:
+    """Tests for max severity extraction."""
+
+    def test_p1_when_p1_present(self) -> None:
+        """Return p1 when any P1 alert exists."""
+        data = {
+            "alerts": [
+                {"county": "LA", "severity": "p1", "metric": "zero_rulings", "message": "LA: zero"},
+                {"county": "OC", "severity": "p2", "metric": "ingest_rate", "message": "OC: drop"},
+            ]
+        }
+        assert get_max_severity(data) == "p1"
+
+    def test_p2_when_only_p2(self) -> None:
+        """Return p2 when only P2 alerts exist."""
+        data = {
+            "alerts": [
+                {
+                    "county": "OC",
+                    "severity": "p2",
+                    "metric": "ingest_rate",
+                    "message": "OC: drop",
+                },
+                {
+                    "county": "SD",
+                    "severity": "p2",
+                    "metric": "scraper_stale",
+                    "message": "SD: stale",
+                },
+            ]
+        }
+        assert get_max_severity(data) == "p2"
+
+    def test_p2_when_no_alerts(self) -> None:
+        """Return p2 as default when no alerts are present."""
+        assert get_max_severity({"alerts": []}) == "p2"
+
+    def test_p1_single_alert(self) -> None:
+        """Return p1 when a single P1 alert exists."""
+        data = {
+            "alerts": [
+                {"county": "LA", "severity": "p1", "metric": "zero_rulings", "message": "LA: zero"},
+            ]
+        }
+        assert get_max_severity(data) == "p1"
 
 
 class TestFormatTelegramSummary:
