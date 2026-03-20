@@ -275,8 +275,9 @@ _GARBAGE_NAME_RE = re.compile(
 #   U+00A0     non-breaking space (replaced with regular space, not stripped)
 #   U+00AD     soft hyphen
 #   U+0080-U+009F  C1 control characters (common Windows-1252 artifacts)
+#   U+200B     zero-width space
 # We handle NBSP separately (replace with space) to avoid merging words.
-_ENCODING_ARTIFACT_RE = re.compile(r"[\u00bf\u00ad\u0080-\u009f]")
+_ENCODING_ARTIFACT_RE = re.compile(r"[\u00bf\u00ad\u0080-\u009f\u200b]")
 _NBSP_RE = re.compile(r"\u00a0")
 
 # Known suffixes and initial patterns that are valid as a final word in a

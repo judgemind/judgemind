@@ -900,6 +900,17 @@ class TestNormalizeJudgeName:
     def test_returns_none_for_defendant(self) -> None:
         assert normalize_judge_name("Defendant Smith") is None
 
+    def test_strips_inverted_question_mark_artifacts(self) -> None:
+        raw = "\u00bf \u00bf\u00bf \u00bf \u00bf \u00bf Brock T. Hammond\u00bf\u00bf \u00bf"
+        assert normalize_judge_name(raw) == "Brock T. Hammond"
+
+    def test_returns_none_for_only_inverted_question_marks(self) -> None:
+        assert normalize_judge_name("\u00bf") is None
+
+    def test_strips_zero_width_spaces(self) -> None:
+        result = normalize_judge_name("John \u200bA. Smith")
+        assert result == "John A. Smith"
+
 
 # ---------------------------------------------------------------------------
 # _looks_like_valid_judge_name
@@ -1119,6 +1130,11 @@ class TestNormalizeJudgeNameEncodingArtifacts:
     def test_strips_multiple_artifacts(self) -> None:
         """Multiple encoding artifacts are stripped in one pass."""
         result = normalize_judge_name("\u00bfJohn\u00a0\u00adSmith\u00bf")
+        assert result == "John Smith"
+
+    def test_strips_zero_width_space(self) -> None:
+        """U+200B (zero-width space) is removed."""
+        result = normalize_judge_name("John\u200b Smith")
         assert result == "John Smith"
 
     def test_preserves_period_hyphen_apostrophe(self) -> None:
