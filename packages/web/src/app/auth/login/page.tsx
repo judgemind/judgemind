@@ -75,7 +75,7 @@ export default function LoginPage() {
         <SubmitButton loading={loading}>Log in</SubmitButton>
       </form>
 
-      <div className="mt-6 space-y-2 text-center text-sm">
+      <div className="mt-6 text-center text-sm">
         <p className="text-slate-500 dark:text-slate-400">
           Don&apos;t have an account?{' '}
           <Link
@@ -83,14 +83,6 @@ export default function LoginPage() {
             className="font-medium text-brand-600 hover:text-brand-700 dark:text-brand-500 dark:hover:text-brand-400"
           >
             Register
-          </Link>
-        </p>
-        <p>
-          <Link
-            href="/auth/forgot-password"
-            className="font-medium text-brand-600 hover:text-brand-700 dark:text-brand-500 dark:hover:text-brand-400"
-          >
-            Forgot password?
           </Link>
         </p>
       </div>
