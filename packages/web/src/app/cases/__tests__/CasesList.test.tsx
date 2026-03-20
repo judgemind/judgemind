@@ -8,6 +8,18 @@ vi.mock('@apollo/client', () => ({
   gql: (strings: TemplateStringsArray) => strings.join(''),
 }));
 
+const mockReplace = vi.fn();
+let mockSearchParamsValue = new URLSearchParams();
+
+vi.mock('next/navigation', () => ({
+  useRouter: () => ({
+    push: vi.fn(),
+    replace: mockReplace,
+    back: vi.fn(),
+  }),
+  useSearchParams: () => mockSearchParamsValue,
+}));
+
 vi.mock('next/link', () => ({
   default: ({
     children,
@@ -68,6 +80,7 @@ const MOCK_CASES_DATA = {
 describe('CasesList', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mockSearchParamsValue = new URLSearchParams();
   });
 
   it('renders skeleton rows while loading', () => {
@@ -199,7 +212,7 @@ describe('CasesList', () => {
     );
   });
 
-  it('renders filter inputs', () => {
+  it('renders filter inputs including case type dropdown', () => {
     mockUseQuery.mockReturnValue({
       data: MOCK_CASES_DATA,
       loading: false,
@@ -212,6 +225,7 @@ describe('CasesList', () => {
       screen.getByPlaceholderText(/Case number or title/i),
     ).toBeInTheDocument();
     expect(screen.getByLabelText(/Case status/i)).toBeInTheDocument();
+    expect(screen.getByLabelText(/Case type/i)).toBeInTheDocument();
   });
 
   it('filters cases client-side by case number', () => {
@@ -228,5 +242,96 @@ describe('CasesList', () => {
 
     expect(screen.getByText('24STCV01234')).toBeInTheDocument();
     expect(screen.queryByText('24NNCV05678')).not.toBeInTheDocument();
+  });
+
+  it('renders all case type options in the dropdown', () => {
+    mockUseQuery.mockReturnValue({
+      data: MOCK_CASES_DATA,
+      loading: false,
+      error: undefined,
+      fetchMore: vi.fn(),
+    });
+
+    render(<CasesList />);
+    const typeSelect = screen.getByLabelText(/Case type/i);
+    expect(typeSelect).toBeInTheDocument();
+
+    // Check that all case type options are present
+    // "Civil" appears both as a dropdown option and in the case type column for case-1
+    const civilElements = screen.getAllByText('Civil');
+    expect(civilElements.length).toBeGreaterThanOrEqual(2); // option + case row
+    expect(screen.getByText('Family')).toBeInTheDocument();
+    expect(screen.getByText('Probate')).toBeInTheDocument();
+    expect(screen.getByText('Small Claims')).toBeInTheDocument();
+    // "Other" appears in both the status badge fallback area and the type dropdown
+    const otherElements = screen.getAllByText('Other');
+    expect(otherElements.length).toBeGreaterThanOrEqual(1);
+  });
+
+  it('passes caseType to the GraphQL query when type filter is selected', () => {
+    mockUseQuery.mockReturnValue({
+      data: MOCK_CASES_DATA,
+      loading: false,
+      error: undefined,
+      fetchMore: vi.fn(),
+    });
+
+    render(<CasesList />);
+    const typeSelect = screen.getByLabelText(/Case type/i);
+    fireEvent.change(typeSelect, { target: { value: 'civil' } });
+
+    // Check that useQuery was called with caseType in the variables
+    const lastCall = mockUseQuery.mock.calls[mockUseQuery.mock.calls.length - 1];
+    expect(lastCall[1].variables.caseType).toBe('civil');
+  });
+
+  it('updates URL params when case type filter changes', () => {
+    mockUseQuery.mockReturnValue({
+      data: MOCK_CASES_DATA,
+      loading: false,
+      error: undefined,
+      fetchMore: vi.fn(),
+    });
+
+    render(<CasesList />);
+    const typeSelect = screen.getByLabelText(/Case type/i);
+    fireEvent.change(typeSelect, { target: { value: 'family' } });
+
+    expect(mockReplace).toHaveBeenCalledWith(
+      expect.stringContaining('caseType=family'),
+    );
+  });
+
+  it('initializes case type filter from URL params', () => {
+    mockSearchParamsValue = new URLSearchParams('caseType=probate');
+
+    mockUseQuery.mockReturnValue({
+      data: MOCK_CASES_DATA,
+      loading: false,
+      error: undefined,
+      fetchMore: vi.fn(),
+    });
+
+    render(<CasesList />);
+    const typeSelect = screen.getByLabelText(/Case type/i) as HTMLSelectElement;
+    expect(typeSelect.value).toBe('probate');
+
+    // Verify the query was called with the URL param value
+    const firstCall = mockUseQuery.mock.calls[0];
+    expect(firstCall[1].variables.caseType).toBe('probate');
+  });
+
+  it('does not pass caseType when "All types" is selected', () => {
+    mockUseQuery.mockReturnValue({
+      data: MOCK_CASES_DATA,
+      loading: false,
+      error: undefined,
+      fetchMore: vi.fn(),
+    });
+
+    render(<CasesList />);
+    // Default is "All types" (empty string)
+    const firstCall = mockUseQuery.mock.calls[0];
+    expect(firstCall[1].variables.caseType).toBeUndefined();
   });
 });

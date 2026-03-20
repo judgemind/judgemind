@@ -1,7 +1,8 @@
 'use client';
 
-import { useState } from 'react';
+import { useState, useCallback, useEffect } from 'react';
 import { useQuery, gql } from '@apollo/client';
+import { useRouter, useSearchParams } from 'next/navigation';
 import Link from 'next/link';
 import { formatLabel } from '@/lib/display-helpers';
 
@@ -61,6 +62,9 @@ interface CasesData {
 
 const PAGE_SIZE = 20;
 
+/** Known case type filter options. */
+const CASE_TYPES = ['civil', 'family', 'probate', 'small_claims', 'other'] as const;
+
 const STATUS_BADGE: Record<string, string> = {
   active: 'bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200',
   closed: 'bg-slate-100 text-slate-600 dark:bg-slate-700 dark:text-slate-300',
@@ -82,12 +86,36 @@ function SkeletonRow() {
 }
 
 export function CasesList() {
+  const router = useRouter();
+  const searchParams = useSearchParams();
+
   const [caseNumberFilter, setCaseNumberFilter] = useState('');
-  const [statusFilter, setStatusFilter] = useState('');
+  const [statusFilter, setStatusFilter] = useState(searchParams.get('status') ?? '');
+  const [typeFilter, setTypeFilter] = useState(searchParams.get('caseType') ?? '');
+
+  // Sync state from URL when search params change (e.g. browser back/forward)
+  useEffect(() => {
+    setStatusFilter(searchParams.get('status') ?? '');
+    setTypeFilter(searchParams.get('caseType') ?? '');
+  }, [searchParams]);
+
+  // Sync URL params when filters change
+  const updateUrl = useCallback(() => {
+    const params = new URLSearchParams();
+    if (statusFilter) params.set('status', statusFilter);
+    if (typeFilter) params.set('caseType', typeFilter);
+    const search = params.toString();
+    router.replace(search ? `/cases?${search}` : '/cases');
+  }, [statusFilter, typeFilter, router]);
+
+  useEffect(() => {
+    updateUrl();
+  }, [updateUrl]);
 
   const { data, loading, error, fetchMore } = useQuery<CasesData>(CASES_QUERY, {
     variables: {
       caseStatus: statusFilter || undefined,
+      caseType: typeFilter || undefined,
       first: PAGE_SIZE,
     },
     notifyOnNetworkStatusChange: true,
@@ -142,6 +170,19 @@ export function CasesList() {
           <option value="active">Active</option>
           <option value="closed">Closed</option>
           <option value="dismissed">Dismissed</option>
+        </select>
+        <select
+          value={typeFilter}
+          onChange={(e) => setTypeFilter(e.target.value)}
+          aria-label="Case type"
+          className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900 focus:border-brand-500 focus:outline-none focus:ring-1 focus:ring-brand-500 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100"
+        >
+          <option value="">All types</option>
+          {CASE_TYPES.map((ct) => (
+            <option key={ct} value={ct}>
+              {formatLabel(ct)}
+            </option>
+          ))}
         </select>
       </div>
 

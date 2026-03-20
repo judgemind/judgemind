@@ -1,3 +1,4 @@
+import { Suspense } from 'react';
 import { CasesList } from './CasesList';
 
 export default function CasesPage() {
@@ -8,7 +9,9 @@ export default function CasesPage() {
         Browse court cases across California.
       </p>
       <div className="mt-6">
-        <CasesList />
+        <Suspense>
+          <CasesList />
+        </Suspense>
       </div>
     </div>
   );
