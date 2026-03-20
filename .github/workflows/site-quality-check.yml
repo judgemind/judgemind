@@ -26,14 +26,14 @@ jobs:
       API_URL: https://dev.api.judgemind.org/graphql
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           sparse-checkout: |
             .github
             site-quality-baselines.json
             scripts/site-quality-check.py
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
 
