@@ -541,12 +541,18 @@ def test_cc_parse_document_no_hearing_date_extracts_from_pdf() -> None:
 
 @respx.mock
 def test_cc_full_run_mocked() -> None:
-    """Test a full scraper run with mocked HTTP responses."""
+    """Test a full scraper run with mocked HTTP responses.
+
+    Uses a mini index page fixture (3 departments, 9 links) instead of the
+    full 404-link page.  This reduces PDF download+parse iterations from 404
+    to 9 while still covering civil (Dept 16), Richmond (Dept 14), and
+    probate (Dept 30) code paths.  See #1219.
+    """
     config = cc_default_config()
     scraper = CCTentativeRulingsScraper(config)
 
-    # Mock the index page
-    index_html = _load_html("cc_index_page.html")
+    # Mock the index page — use mini fixture with 3 representative departments
+    index_html = _load_html("cc_index_page_mini.html")
     respx.get(INDEX_URL).mock(return_value=httpx.Response(200, text=index_html))
 
     # Mock PDF downloads — use dept 16 fixture for all PDFs
@@ -556,11 +562,14 @@ def test_cc_full_run_mocked() -> None:
     )
 
     docs = scraper.fetch_documents()
-    assert len(docs) > 0
+    # CC scraper fetches most-recent PDF per department: 3 depts -> 3 docs
+    assert len(docs) == 3
 
-    # Verify department extraction
+    # Verify department extraction — all 3 kept departments should appear
     depts = {d.department for d in docs if d.department}
-    assert len(depts) > 0
+    assert "14" in depts
+    assert "16" in depts
+    assert "30" in depts
 
     # Verify judge name extraction from URL path
     judges = {d.judge_name for d in docs if d.judge_name}
