@@ -229,7 +229,6 @@ For detailed patterns to avoid permission prompts, see `docs/agent/unattended-pa
 GitHub allows 5,000 API requests per hour. With multiple concurrent agents, this budget is shared and can be exhausted quickly.
 
 - **Always use `--interval 60` with `gh run watch`.** The default poll interval is 3 seconds, which burns through API budget fast. Use `gh run watch <id> --repo judgemind/judgemind --interval 60 --exit-status --compact` as the standard CI/deploy watch command.
-- **Use `scripts/gh-with-backoff.sh` for non-interactive gh commands.** It wraps `gh` with automatic retry on 403 (rate limit) responses and proactive budget checks. Example: `scripts/gh-with-backoff.sh pr view 42 --repo judgemind/judgemind --json mergeable`.
 - **Never retry 403 errors in a tight loop.** Always check the rate limit reset time and wait for it.
 
 ## Accounts & Infrastructure
