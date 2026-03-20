@@ -20,7 +20,7 @@ Capture a screenshot of a page on `dev.judgemind.org` and display it. This lets 
 Run the screenshot script from the repo root (or worktree root):
 
 ```
-python3 scripts/screenshot.py <path> [options]
+scripts/run-py.sh scripts/screenshot.py <path> [options]
 ```
 
 The script saves the screenshot and prints the absolute path. Then use the **Read tool** to view the image — Claude Code can read and analyze PNG images natively.
@@ -29,28 +29,28 @@ The script saves the screenshot and prints the absolute path. Then use the **Rea
 
 **Screenshot the rulings page:**
 ```
-python3 scripts/screenshot.py /rulings --output tmp/rulings.png
+scripts/run-py.sh scripts/screenshot.py /rulings --output tmp/rulings.png
 ```
 Then: `Read tmp/rulings.png`
 
 **Full-page screenshot (captures below the fold too):**
 ```
-python3 scripts/screenshot.py /rulings --full-page --output tmp/rulings-full.png
+scripts/run-py.sh scripts/screenshot.py /rulings --full-page --output tmp/rulings-full.png
 ```
 
 **Screenshot a specific element:**
 ```
-python3 scripts/screenshot.py /rulings --selector ".ruling-card" --output tmp/card.png
+scripts/run-py.sh scripts/screenshot.py /rulings --selector ".ruling-card" --output tmp/card.png
 ```
 
 **Custom viewport (e.g. mobile):**
 ```
-python3 scripts/screenshot.py /rulings --width 375 --height 812 --output tmp/mobile.png
+scripts/run-py.sh scripts/screenshot.py /rulings --width 375 --height 812 --output tmp/mobile.png
 ```
 
 **Longer wait for slow pages:**
 ```
-python3 scripts/screenshot.py /rulings --wait 5000 --output tmp/rulings.png
+scripts/run-py.sh scripts/screenshot.py /rulings --wait 5000 --output tmp/rulings.png
 ```
 
 ### Options

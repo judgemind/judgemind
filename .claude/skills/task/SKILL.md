@@ -363,7 +363,7 @@ A successful deploy only means the new image is running — not that the service
 | **API endpoint** | Hit the endpoint on dev (`curl https://dev.api.judgemind.org/graphql`), confirm expected response shape and no errors | The curl response (status code + relevant body snippet) |
 | **Ingestion pipeline** | Confirm the worker processes at least one message successfully (check ECS logs via `scripts/ecs-logs.sh /ecs/judgemind-ingestion-worker-dev --lines 50`) | Log lines showing successful message processing |
 | **Scraper** | Check ECS logs for the next scheduled run, confirm documents are captured without errors | Log lines showing successful document capture |
-| **Frontend** | Confirm the affected page loads on `dev.judgemind.org` and renders the expected content | Screenshot via `scripts/screenshot.py` or the page content showing the feature works |
+| **Frontend** | Confirm the affected page loads on `dev.judgemind.org` and renders the expected content | Screenshot via `scripts/run-py.sh scripts/screenshot.py` or the page content showing the feature works |
 | **DX/tooling** | Run the tool in a representative scenario and confirm expected output | Command output showing the tool works correctly |
 | **Backfill / data migration script** | Execute the script against dev via `scripts/ecs-run-task.sh` (or locally if appropriate). Confirm the expected data changes applied — e.g., query dev DB via `scripts/dev-db-query.sh` to check row counts, null rates, or sample records. | DB query results showing the data changed (e.g., "2444/2444 rulings now have ruling_text_html") |
 
