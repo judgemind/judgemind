@@ -20,6 +20,46 @@ describe('buildCaseHeading', () => {
     const result = buildCaseHeading(null, 'abc-123');
     expect(result).toBe('Case abc-123');
   });
+
+  it('falls back to caseTitle when caseNumber starts with UNKNOWN', () => {
+    const result = buildCaseHeading(
+      { caseNumber: 'UNKNOWN-d48444cd-33bd-5544-a515-e3806bcdf0d5', caseTitle: 'Flores v. Trimax Tire Corp.' },
+      'some-uuid',
+    );
+    expect(result).toBe('Flores v. Trimax Tire Corp.');
+  });
+
+  it('shows UNKNOWN caseNumber when caseTitle is null', () => {
+    const result = buildCaseHeading(
+      { caseNumber: 'UNKNOWN-abc123', caseTitle: null },
+      'some-uuid',
+    );
+    expect(result).toBe('UNKNOWN-abc123');
+  });
+
+  it('shows UNKNOWN caseNumber when caseTitle is undefined', () => {
+    const result = buildCaseHeading(
+      { caseNumber: 'UNKNOWN-abc123' },
+      'some-uuid',
+    );
+    expect(result).toBe('UNKNOWN-abc123');
+  });
+
+  it('shows UNKNOWN caseNumber when caseTitle is only whitespace', () => {
+    const result = buildCaseHeading(
+      { caseNumber: 'UNKNOWN-xyz789', caseTitle: '   ' },
+      'some-uuid',
+    );
+    expect(result).toBe('UNKNOWN-xyz789');
+  });
+
+  it('shows normal caseNumber even when caseTitle is present', () => {
+    const result = buildCaseHeading(
+      { caseNumber: '23STCV12345', caseTitle: 'Smith v. Jones' },
+      'some-uuid',
+    );
+    expect(result).toBe('23STCV12345');
+  });
 });
 
 describe('buildJudgeHeading', () => {

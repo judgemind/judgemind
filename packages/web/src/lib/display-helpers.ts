@@ -1,12 +1,14 @@
 /** Build a human-readable heading from case data.
- *  Always returns the case number as the heading.
- *  The case title (when available) should be rendered separately
- *  as a subtitle by the caller. */
+ *  Returns the case number as the heading, except for UNKNOWN placeholders
+ *  where it falls back to `caseTitle` when available. */
 export function buildCaseHeading(
-  caseData: { caseNumber: string } | null,
+  caseData: { caseNumber: string; caseTitle?: string | null } | null,
   fallbackId: string,
 ): string {
   if (!caseData) return `Case ${fallbackId}`;
+  if (caseData.caseNumber.startsWith('UNKNOWN') && caseData.caseTitle?.trim()) {
+    return caseData.caseTitle;
+  }
   return caseData.caseNumber;
 }
 
