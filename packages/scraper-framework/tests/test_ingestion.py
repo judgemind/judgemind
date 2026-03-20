@@ -3388,6 +3388,7 @@ def test_process_event_summarizes_ruling_when_enabled(
 def test_process_event_opensearch_uses_llm_summary_when_available(
     mock_psycopg: MagicMock,
     mock_summarize: MagicMock,
+    mock_resolve_judge: MagicMock,
 ) -> None:
     """OpenSearch indexed doc uses the LLM summary instead of truncated text (#1183)."""
     worker, os_mock = _make_worker()
@@ -3402,10 +3403,7 @@ def test_process_event_opensearch_uses_llm_summary_when_available(
         ("court-uuid-1",),  # upsert_court
         ("case-uuid-1",),  # upsert_case
         (True,),  # insert_document
-        None,  # resolve_judge: no existing alias
-        ("judge-uuid-1",),  # INSERT INTO judges
     ]
-    mock_cur.fetchall.return_value = []
 
     event = _make_event()
     worker.process_event(event)
@@ -3453,6 +3451,7 @@ def test_process_event_opensearch_falls_back_to_truncated_text_without_summary(
     mock_summarize.assert_not_called()
 
 
+@patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
 @patch("ingestion.worker.summarize_ruling")
 @patch("ingestion.worker.psycopg")
 def test_process_event_summarization_disabled_by_default(
