@@ -3,8 +3,13 @@
 Scrapes the judicial officer directory at:
     https://www.lacourt.ca.gov/judicialofficers/ui/SearchResult.aspx
 
-The page contains a sortable HTML table with columns:
-    Last Name, First Name, Title, Courthouse, Department, Phone, Primary Assignment
+The page contains a sortable HTML table (class ``joresultstable``) with columns:
+    Name, Title, Location, Dept, Phone, Primary Assignment, Litigation Areas
+
+The Name column contains "Last, First" in a single cell.  An older version of
+the page used a table with ``id="GridView1"`` and separate Last Name / First
+Name columns — the parser supports both formats for backward compatibility with
+archived snapshots.
 
 This module provides:
     - ``fetch_department_judge_mapping()`` — scrape the live page and return the mapping
@@ -38,8 +43,11 @@ logger = structlog.get_logger(__name__)
 
 JUDICIAL_OFFICERS_URL = "https://www.lacourt.ca.gov/judicialofficers/ui/SearchResult.aspx"
 
-# Table id on the judicial officers page
-TABLE_ID = "GridView1"
+# CSS class on the current (2025+) judicial officers table
+TABLE_CLASS = "joresultstable"
+
+# Legacy table id used before the 2025 redesign (kept for archived snapshots)
+LEGACY_TABLE_ID = "GridView1"
 
 
 @dataclass
@@ -80,24 +88,68 @@ def normalize_department(dept: str) -> str:
     return dept.strip()
 
 
-def parse_judicial_officers_html(html: str) -> list[JudicialOfficer]:
-    """Parse the judicial officers HTML page into a list of JudicialOfficer records.
+def _parse_combined_name(name_text: str) -> tuple[str, str]:
+    """Split a combined "Last, First" name into (last_name, first_name).
 
-    Expects a page containing a table with id ``GridView1`` and columns:
-    Last Name, First Name, Title, Courthouse, Department, Phone, Primary Assignment.
+    If there is no comma, the entire string is treated as the last name
+    and the first name is empty.
 
-    Returns an empty list if the table is not found or has no data rows.
+    Examples:
+        "Abeles, Jerrold" → ("Abeles", "Jerrold")
+        "Duffy-Lewis, Kerry" → ("Duffy-Lewis", "Kerry")
+        "Smith" → ("Smith", "")
     """
-    soup = BeautifulSoup(html, "lxml")
-    table = soup.find("table", id=TABLE_ID)
-    if table is None:
-        logger.warning("Judicial officers table not found", table_id=TABLE_ID)
-        return []
+    if "," in name_text:
+        last, first = name_text.split(",", 1)
+        return last.strip(), first.strip()
+    return name_text.strip(), ""
 
+
+def _parse_new_format(table: object) -> list[JudicialOfficer]:
+    """Parse the current (2025+) table format with class ``joresultstable``.
+
+    Columns: Name, Title, Location, Dept, Phone, Primary Assignment, Litigation Areas.
+    The table has a ``<thead>`` but no ``<tbody>``; data rows are direct ``<tr>``
+    children of the table.
+    """
     officers: list[JudicialOfficer] = []
-    # Skip the header row (thead/tr), iterate data rows in tbody
-    tbody = table.find("tbody")
-    rows = tbody.find_all("tr") if tbody else table.find_all("tr")[1:]
+    # Skip header rows inside <thead>
+    thead = table.find("thead")  # type: ignore[union-attr]
+    header_rows = set()
+    if thead:
+        for tr in thead.find_all("tr"):
+            header_rows.add(id(tr))
+
+    for row in table.find_all("tr"):  # type: ignore[union-attr]
+        if id(row) in header_rows:
+            continue
+        cells = row.find_all("td")
+        if len(cells) < 7:
+            continue
+
+        last_name, first_name = _parse_combined_name(cells[0].get_text(strip=True))
+        officer = JudicialOfficer(
+            last_name=last_name,
+            first_name=first_name,
+            title=cells[1].get_text(strip=True),
+            courthouse=cells[2].get_text(strip=True),
+            department=cells[3].get_text(strip=True),
+            phone=cells[4].get_text(strip=True),
+            primary_assignment=cells[5].get_text(strip=True),
+        )
+        officers.append(officer)
+    return officers
+
+
+def _parse_legacy_format(table: object) -> list[JudicialOfficer]:
+    """Parse the legacy (pre-2025) table format with id ``GridView1``.
+
+    Columns: Last Name, First Name, Title, Courthouse, Department, Phone,
+    Primary Assignment.  The table may have a ``<tbody>`` wrapping data rows.
+    """
+    officers: list[JudicialOfficer] = []
+    tbody = table.find("tbody")  # type: ignore[union-attr]
+    rows = tbody.find_all("tr") if tbody else table.find_all("tr")[1:]  # type: ignore[union-attr]
 
     for row in rows:
         cells = row.find_all("td")
@@ -114,9 +166,47 @@ def parse_judicial_officers_html(html: str) -> list[JudicialOfficer]:
             primary_assignment=cells[6].get_text(strip=True),
         )
         officers.append(officer)
-
-    logger.info("Parsed judicial officers", count=len(officers))
     return officers
+
+
+def parse_judicial_officers_html(html: str) -> list[JudicialOfficer]:
+    """Parse the judicial officers HTML page into a list of JudicialOfficer records.
+
+    Supports two table formats:
+
+    **Current (2025+):** ``<table class="joresultstable">`` with columns
+    Name, Title, Location, Dept, Phone, Primary Assignment, Litigation Areas.
+
+    **Legacy (pre-2025):** ``<table id="GridView1">`` with columns
+    Last Name, First Name, Title, Courthouse, Department, Phone, Primary Assignment.
+
+    The current format is tried first.  If not found, the parser falls back to
+    the legacy format for backward compatibility with archived snapshots.
+
+    Returns an empty list if neither table format is found or has no data rows.
+    """
+    soup = BeautifulSoup(html, "lxml")
+
+    # Try current format first
+    table = soup.find("table", class_=TABLE_CLASS)
+    if table is not None:
+        officers = _parse_new_format(table)
+        logger.info("Parsed judicial officers (new format)", count=len(officers))
+        return officers
+
+    # Fall back to legacy format
+    table = soup.find("table", id=LEGACY_TABLE_ID)
+    if table is not None:
+        officers = _parse_legacy_format(table)
+        logger.info("Parsed judicial officers (legacy format)", count=len(officers))
+        return officers
+
+    logger.warning(
+        "Judicial officers table not found",
+        table_class=TABLE_CLASS,
+        legacy_table_id=LEGACY_TABLE_ID,
+    )
+    return []
 
 
 def build_department_judge_map(
