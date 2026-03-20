@@ -130,8 +130,10 @@ _MOTION_KEYWORDS = (
     "HEARING",
 )
 
-# Matches the first line of a case entry: 3-digit line number + rest
-_ENTRY_START_RE = re.compile(r"^(\d{3})\s+(.+)", re.MULTILINE)
+# Matches the first line of a case entry: 1-3 digit line number + rest.
+# Some North JC departments (N14) use 3-digit numbers (101, 102, ...),
+# while others (N15-N18) use 1-2 digit numbers (1, 2, ...).
+_ENTRY_START_RE = re.compile(r"^(\d{1,3})\s+(.+)", re.MULTILINE)
 
 
 @dataclass
@@ -198,7 +200,7 @@ def _parse_north_case_entries(text: str) -> list[_NorthCaseEntry]:
         full_name = re.sub(r"\s+", " ", full_name).strip()
 
         # Only keep entries that contain "vs" — these are actual case names
-        if re.search(r"\bvs\.?\b", full_name, re.IGNORECASE):
+        if re.search(r"\b(?:vs\.?|v\.)", full_name, re.IGNORECASE):
             entries.append(
                 _NorthCaseEntry(
                     line_num=line_num,

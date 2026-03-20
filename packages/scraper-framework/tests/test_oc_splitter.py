@@ -135,6 +135,157 @@ class TestSplitNorth:
 
 
 # ---------------------------------------------------------------------------
+# North JC short-number splitting — 1-2 digit entry numbers (#1093)
+# ---------------------------------------------------------------------------
+
+
+class TestSplitNorthShortNumbers:
+    """Tests for North JC departments that use 1-2 digit entry numbers (N15-N18)."""
+
+    def test_single_digit_entries(self) -> None:
+        """1-digit entry numbers (N17 format) are split correctly."""
+        text = (
+            "TENTATIVE RULINGS\n"
+            "Judge Craig L. Griffin\n"
+            "Date: March 16, 2026\n"
+            "#\n"
+            "1 Zavala vs. Motion for Attorneys' Fees and Costs\n"
+            "Becker et al.\n"
+            "The Court will GRANT IN PART the motion.\n"
+            "Defendants are to give notice of this ruling.\n"
+            "2 Post vs. Chung The motion for summary judgment is DENIED.\n"
+            "As the party moving for summary judgment, defendant has the\n"
+            "burden to show it is entitled to judgment.\n"
+            "3 Alpha vs Beta Demurrer to Complaint\n"
+            "The demurrer is SUSTAINED.\n"
+        )
+        results = _split_north(text)
+        assert len(results) == 3
+
+        assert results[0].case_title is not None
+        assert "Zavala" in results[0].case_title
+        assert "GRANT" in results[0].ruling_text
+        # Ruling text should NOT contain other cases' text
+        assert "Post vs. Chung" not in results[0].ruling_text
+
+        assert results[1].case_title is not None
+        assert "Post" in results[1].case_title
+        assert "DENIED" in results[1].ruling_text
+
+        assert results[2].case_title is not None
+        assert "Alpha" in results[2].case_title
+
+    def test_two_digit_entries(self) -> None:
+        """2-digit entry numbers are split correctly."""
+        text = (
+            "10 Smith vs Jones Motion for Summary Judgment\n"
+            "The motion is GRANTED.\n"
+            "11 Doe vs Roe Demurrer\n"
+            "The demurrer is OVERRULED.\n"
+        )
+        results = _split_north(text)
+        assert len(results) == 2
+        assert results[0].case_title == "Smith vs Jones"
+        assert results[1].case_title == "Doe vs Roe"
+
+    def test_mixed_digit_lengths(self) -> None:
+        """Mix of 1-digit and 2-digit entries are split correctly."""
+        text = (
+            "1 Smith vs Jones Motion to Compel\n"
+            "Ruling for Smith.\n"
+            "2 Doe vs Roe Demurrer\n"
+            "Ruling for Doe.\n"
+            "10 Alpha vs Beta Application\n"
+            "Ruling for Alpha.\n"
+        )
+        results = _split_north(text)
+        assert len(results) == 3
+
+    def test_single_digit_single_entry_returns_empty(self) -> None:
+        """A single 1-digit entry means no splitting needed."""
+        text = "1 Smith vs Jones Motion for Summary Judgment\nRuling text here.\n"
+        results = _split_north(text)
+        assert len(results) < 2
+
+    def test_short_number_split_text_shorter_than_full(self) -> None:
+        """Each split ruling from short-number entries must be shorter than full text."""
+        text = (
+            "1 Zavala vs. Becker Motion for Attorneys' Fees\n"
+            "The Court will GRANT IN PART.\n"
+            "2 Post v. Chung Motion for Summary Judgment\n"
+            "The motion is DENIED.\n"
+        )
+        results = _split_north(text)
+        full_len = len(text)
+        for i, r in enumerate(results):
+            assert len(r.ruling_text) < full_len, (
+                f"Split [{i}] has {len(r.ruling_text)} chars, same as full text ({full_len})"
+            )
+
+    def test_short_number_with_multiline_case_name(self) -> None:
+        """Short-number entries with multi-line case names work correctly."""
+        text = (
+            "1 Zavala vs. Motion for Attorneys' Fees and Costs\n"
+            "Becker et al.\n"
+            "The Court will GRANT IN PART.\n"
+            "2 Post vs. Chung Motion for Summary Judgment\n"
+            "The motion is DENIED.\n"
+        )
+        results = _split_north(text)
+        assert len(results) == 2
+        assert "Zavala" in results[0].case_title
+
+    def test_v_dot_separator(self) -> None:
+        """'v.' (common legal abbreviation) is recognized as a case separator."""
+        text = (
+            "1 Zavala vs. Becker Motion for Attorneys' Fees\n"
+            "The Court will GRANT IN PART.\n"
+            "2 Post v. Chung Motion for Summary Judgment\n"
+            "The motion is DENIED.\n"
+            "3 Alpha vs Beta Demurrer\n"
+            "The demurrer is OVERRULED.\n"
+        )
+        results = _split_north(text)
+        assert len(results) == 3
+        assert "Zavala" in results[0].case_title
+        assert "Post" in results[1].case_title
+        assert "Alpha" in results[2].case_title
+
+    def test_legal_citation_not_matched(self) -> None:
+        """Numbers in legal citations (e.g. '45 Cal.App.4th') are not entries."""
+        text = (
+            "1 Smith vs Jones Motion for Summary Judgment\n"
+            "See 45 Cal.App.4th 705, 717 for the applicable standard.\n"
+            "The motion is GRANTED.\n"
+            "2 Doe vs Roe Demurrer\n"
+            "The demurrer is OVERRULED.\n"
+        )
+        results = _split_north(text)
+        assert len(results) == 2
+        # The "45 Cal.App.4th" line should NOT create a third entry
+        assert all("Cal.App" not in (r.case_title or "") for r in results)
+
+
+class TestSplitOcDocumentFallback:
+    """Tests for the North-to-case-number fallback in split_oc_document."""
+
+    def test_north_dept_falls_back_when_north_returns_empty(self) -> None:
+        """If North splitter returns empty, fall back to case-number-based."""
+        # Text with case numbers but no "vs" — North splitter filters by "vs"
+        # so it returns empty, triggering fallback to case-number-based.
+        text = (
+            "1 30-2024-01393434 Creditors Adjustment Bureau\n"
+            "Matter is continued to April 15.\n"
+            "2 30-2024-01447336 National Default Servicing\n"
+            "Matter is continued to May 1.\n"
+        )
+        event = {"ruling_text": text, "department": "N14"}
+        results = split_oc_document(event)
+        assert len(results) == 2
+        assert results[0].case_number is not None
+
+
+# ---------------------------------------------------------------------------
 # Case-number-based splitting — synthetic tests
 # ---------------------------------------------------------------------------
 

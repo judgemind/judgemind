@@ -7,10 +7,11 @@ splitting framework via ``register_splitter("CA", "Orange", ...)``.
 Two sub-formats are handled:
 
 North Justice Center (departments starting with "N"):
-    Numbered 3-digit line entries (101, 102, ...) with case names containing
-    "vs".  No case numbers in the PDF text.  Uses the existing
-    ``_parse_north_case_entries()`` logic from the scraper to identify
-    boundaries, then extracts the ruling text between each boundary.
+    Numbered 1-3 digit line entries (1, 2, ... or 101, 102, ...) with case
+    names containing "vs" or "v.".  No case numbers in the PDF text.  Uses
+    the existing ``_parse_north_case_entries()`` logic from the scraper to
+    identify boundaries, then extracts the ruling text between each boundary.
+    Falls back to case-number-based splitting if North parsing finds no entries.
 
 Central / West / Costa Mesa / Complex (all other OC departments):
     Numbered entries (1-digit, 2-digit, or 3-digit) where a case number
@@ -33,8 +34,10 @@ logger = structlog.get_logger(__name__)
 # North Justice Center splitting
 # ---------------------------------------------------------------------------
 
-# Reuse the entry-start regex from oc_tentatives — 3-digit line numbers.
-_NORTH_ENTRY_START_RE = re.compile(r"^(\d{3})\s+(.+)", re.MULTILINE)
+# Entry-start regex for North JC: 1-3 digit line numbers.
+# Some departments (N14) use 3-digit numbers (101, 102, ...), while others
+# (N15-N18) use 1-2 digit numbers (1, 2, ...).
+_NORTH_ENTRY_START_RE = re.compile(r"^(\d{1,3})\s+(.+)", re.MULTILINE)
 
 # Motion-type keywords (same as oc_tentatives._MOTION_KEYWORDS).
 _MOTION_KEYWORDS = (
@@ -55,12 +58,12 @@ _MOTION_KEYWORDS = (
 def _split_north(text: str) -> list[SplitResult]:
     """Split a North Justice Center calendar page into per-case rulings.
 
-    Identifies case entry boundaries using the 3-digit line number pattern,
+    Identifies case entry boundaries using the 1-3 digit line number pattern,
     extracts the ruling text for each case, and parses case_title and
     motion_type from the first line of each entry.
 
-    Only entries whose case names contain "vs" are included (filtering out
-    legal citations like "151 Cal.App.4th ...").
+    Only entries whose case names contain "vs" or "v." are included (filtering
+    out legal citations like "151 Cal.App.4th ...").
 
     Returns an empty list if fewer than 2 case entries are found (the caller
     treats this as "no splitting needed").
@@ -108,8 +111,9 @@ def _split_north(text: str) -> list[SplitResult]:
         full_name = " ".join(name_parts)
         full_name = re.sub(r"\s+", " ", full_name).strip()
 
-        # Only keep entries that contain "vs" — actual cases.
-        if not re.search(r"\bvs\.?\b", full_name, re.IGNORECASE):
+        # Only keep entries that contain "vs", "vs.", or "v." — actual cases.
+        # "v." is a common legal abbreviation (e.g. "Post v. Chung").
+        if not re.search(r"\b(?:vs\.?|v\.)", full_name, re.IGNORECASE):
             continue
 
         # Extract ruling text: everything from this entry to the next.
@@ -375,7 +379,14 @@ def split_oc_document(event_data: dict[str, Any]) -> list[SplitResult]:
                 department=department,
                 count=len(results),
             )
-        return results
+            return results
+        # North splitter found no entries — fall back to case-number-based
+        # splitting. Some North JC PDFs may use formats that the North-specific
+        # parser doesn't recognize but that have case numbers.
+        logger.debug(
+            "North splitter returned no results, falling back to case-number-based",
+            department=department,
+        )
 
     results = _split_case_number_based(ruling_text)
     if results:
