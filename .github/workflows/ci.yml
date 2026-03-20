@@ -518,6 +518,8 @@ jobs:
         run: scripts/tests/test_check_deprecated_models.sh
       - name: Test hardcoded model checker
         run: scripts/tests/test_check_hardcoded_models.sh
+      - name: Test schema drift checker
+        run: scripts/tests/test_check_schema_drift.sh
 
   # ---------------------------------------------------------------
   # Coverage gates: diff coverage (new lines) + overall floor ratchet
@@ -718,6 +720,16 @@ jobs:
         run: scripts/check-hardcoded-models.sh
 
   # ---------------------------------------------------------------
+  # Schema drift guard: migration tables must exist in schema.sql
+  # ---------------------------------------------------------------
+  schema-drift-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Check for schema.sql and migration table drift
+        run: scripts/check-schema-drift.sh
+
+  # ---------------------------------------------------------------
   # ECS oneshot import guard: prevent scripts/ from importing siblings
   # ---------------------------------------------------------------
   oneshot-imports-check:
@@ -777,7 +789,7 @@ jobs:
   # Always runs. Reports success only when every applicable job passed or was
   # skipped (path filter did not match). Branch protection requires this check.
   ci-passed:
-    needs: [scraper-unit-tests, ingestion-tests, nlp-tests, api-tests, web-tests, telegram-bridge-tests, infra-validate, lambda-tests, scripts-tests, coverage-check, deprecated-models-check, hardcoded-models-check, oneshot-imports-check, dq-baselines-validate, ecs-oneshot-test]
+    needs: [scraper-unit-tests, ingestion-tests, nlp-tests, api-tests, web-tests, telegram-bridge-tests, infra-validate, lambda-tests, scripts-tests, coverage-check, deprecated-models-check, hardcoded-models-check, oneshot-imports-check, schema-drift-check, dq-baselines-validate, ecs-oneshot-test]
     if: always()
     runs-on: ubuntu-latest
     steps:
