@@ -16,7 +16,7 @@ Implement the current task using a ralph loop: an iterative work-then-review cyc
 
 Do not ask for confirmation. Work autonomously through every step.
 
-**IMPORTANT — Ralph is NOT the end of the task.** When this skill completes, the calling `/task` workflow has 7 more mandatory steps remaining (A.3 through A.9: commit, push, PR, CI, merge, deploy, retrospective). Ralph completing means the code is ready — but the code has not been committed, pushed, reviewed by CI, or merged. Exiting after ralph is a known failure mode (#721).
+**IMPORTANT — Ralph is NOT the end of the task.** When this skill completes, the calling `/task` workflow has 8 more mandatory steps remaining (A.2b through A.9: process summary, commit, push, PR, CI, merge, deploy, retrospective). Ralph completing means the code is ready — but the code has not been committed, pushed, reviewed by CI, or merged. Exiting after ralph is a known failure mode (#721).
 
 ### Status file
 
@@ -47,7 +47,8 @@ Create the state directory and seed the task file:
 
 Write `task.md` with:
 - The full issue body
-- Acceptance criteria extracted from the issue
+- Acceptance criteria extracted from the issue (list each `- [ ]` checkbox individually)
+- Any issue comments from non-bot users (scope clarifications, additional criteria, implementation notes)
 - Relevant file paths and patterns from your initial codebase exploration
 - Which packages are involved and where their venvs/node_modules are
 - Any relevant context from `docs/specs/`
@@ -97,8 +98,10 @@ Spawn a **worker subagent** (using the Agent tool) with this prompt structure:
 >    - Python: `.venv/bin/ruff check src/ tests/`, `.venv/bin/ruff format --check src/ tests/`, `.venv/bin/pytest tests/ -v --tb=short`
 >    - TypeScript: `npm run lint`, `npm run typecheck`, `npm test`
 > 5. Fix any failures. Auto-fix lint with `.venv/bin/ruff check --fix src/ tests/` then `.venv/bin/ruff format src/ tests/`.
-> 6. When all checks pass, write "COMPLETE" to `{worktree}/tmp/ralph/work-status.txt`.
-> 7. If you cannot get checks passing after reasonable effort, write "STUCK" to `work-status.txt` and describe what's failing in `{worktree}/tmp/ralph/stuck-reason.txt`.
+> 6. **Self-verify acceptance criteria before completing.** Read `{worktree}/tmp/ralph/task.md` and find every acceptance criterion (the `- [ ]` checkboxes). For EACH criterion, describe how your implementation satisfies it — reference the specific file, function, or test. If any criterion cannot be verified locally (e.g., requires deployed data), note it as "requires post-deploy verification." If any criterion is NOT addressed by your implementation, do NOT write COMPLETE — instead, note the gap and continue implementing.
+> 7. Write your acceptance criteria self-check to `{worktree}/tmp/ralph/acceptance-check.txt` with a table mapping each criterion to its evidence.
+> 8. When all checks pass AND all locally-verifiable acceptance criteria are addressed, write "COMPLETE" to `{worktree}/tmp/ralph/work-status.txt`.
+> 9. If you cannot get checks passing after reasonable effort, write "STUCK" to `work-status.txt` and describe what's failing in `{worktree}/tmp/ralph/stuck-reason.txt`.
 >
 > Rules:
 > - All work happens in `{worktree}`. All temp files go in `{worktree}/tmp/`.
@@ -171,7 +174,11 @@ The Claude reviewer prompt should be:
 >    git -C {worktree} status
 >    ```
 >    Also read the actual changed files to understand context beyond the diff.
-> 4. Evaluate against these criteria:
+> 4. **Verify acceptance criteria (MANDATORY).** Extract every acceptance criterion from `task.md` (the `- [ ]` checkboxes). For EACH criterion:
+>    - Check whether the implementation satisfies it — look at the code, tests, and the worker's self-check in `{worktree}/tmp/ralph/acceptance-check.txt`.
+>    - Mark it as **met**, **not met**, or **requires post-deploy verification**.
+>    - If ANY locally-verifiable criterion is **not met**, the review MUST be **REVISE**, regardless of code quality. List the unmet criteria in your feedback.
+> 5. Evaluate against these additional criteria:
 >    - **Correctness**: Does the implementation satisfy the acceptance criteria in task.md?
 >    - **Test coverage**: Are there tests for each acceptance criterion and obvious edge cases?
 >    - **Scope completeness**: Does the change need to be applied in other locations too? Search the codebase (using Grep) for other files that use, render, or implement the same pattern being changed. If the fix or feature was applied to one file but the same pattern exists elsewhere without the change, flag it as a REVISE reason. For example, if a rendering fix was applied to `ComponentA.tsx`, check whether `ComponentB.tsx` or other components render the same data and need the same fix.
@@ -182,14 +189,14 @@ The Claude reviewer prompt should be:
 >    - **Documentation consistency**: If the change modifies behavior, configuration, or interfaces — do related docs (`docs/`, `CLAUDE.md`, `.claude/skills/`, `README.md`, `CONTRIBUTING.md`) need corresponding updates? Flag any docs that reference the old behavior.
 >    - **Performance**: Are there obvious bottlenecks? Sequential I/O that could be parallelized? O(n^2) patterns (e.g. LIMIT/OFFSET pagination, nested loops over large datasets)? Missing connection pooling or batching for network calls (DB, S3, HTTP)?
 >    - **Unchecked test plan items**: If the PR includes a test plan with checkboxes, any unchecked items are **merge blockers**. An unchecked item means something was not verified — flag it as a REVISE reason. The author must either check the item (verify it) or remove it (not applicable).
-> 5. Make a binary decision:
->    - **SHIP**: The implementation is correct, well-tested, properly scoped, and ready for PR. Write "SHIP" to `{worktree}/tmp/ralph/review-result.txt`.
->    - **REVISE**: Something needs to change. Write "REVISE" to `{worktree}/tmp/ralph/review-result.txt`. Then write specific, actionable feedback to `{worktree}/tmp/ralph/feedback.md` — describe exactly what needs to change and why. Be concrete: reference specific files, functions, and line numbers.
+> 6. Make a binary decision:
+>    - **SHIP**: The implementation is correct, well-tested, properly scoped, ALL locally-verifiable acceptance criteria are met, and ready for PR. Write "SHIP" to `{worktree}/tmp/ralph/review-result.txt`.
+>    - **REVISE**: Something needs to change. Write "REVISE" to `{worktree}/tmp/ralph/review-result.txt`. Then write specific, actionable feedback to `{worktree}/tmp/ralph/feedback.md` — describe exactly what needs to change and why. Be concrete: reference specific files, functions, and line numbers. **If any acceptance criterion is unmet, list it first in your feedback.**
 >
 > Rules:
 > - Be rigorous but not pedantic. Don't request style changes that don't affect correctness or readability.
 > - Don't request changes outside the scope of the task.
-> - If tests pass and the acceptance criteria are met, lean toward SHIP.
+> - **Unmet acceptance criteria are always REVISE.** Never SHIP if any locally-verifiable acceptance criterion is not satisfied.
 > - If you say REVISE, your feedback must be specific enough that the worker can act on it without guessing.
 > - **Unchecked test plan items are always blockers.** Never approve a PR with unchecked test plan checkboxes.
 
@@ -280,14 +287,14 @@ Write `{worktree}/tmp/ralph/ralph-done.txt` with exactly this content (substitut
 ```
 status: SHIP
 iterations: <N>
-next-steps: The /task workflow MUST now continue with: A.3 (stage, commit, push), A.4 (verify no merge conflicts), A.5 (monitor CI), A.6 (update PR test plan), A.7 (merge PR), A.8 (verify deployment and functional health if applicable), A.9 (retrospective). THE TASK IS NOT COMPLETE UNTIL ALL THESE STEPS FINISH.
+next-steps: The /task workflow MUST now continue with: A.2b (process summary), A.3 (stage, commit, push), A.4 (verify no merge conflicts), A.5 (monitor CI), A.6 (update PR test plan), A.7 (merge PR), A.8 (verify deployment, functional health, and acceptance criteria if applicable), A.9 (retrospective). THE TASK IS NOT COMPLETE UNTIL ALL THESE STEPS FINISH.
 ```
 
-The code is ready for commit. Return control to the calling workflow (`/task` Path A), which handles staging, committing, pushing, PR creation, CI monitoring, and cleanup.
+The code is ready for commit. Return control to the calling workflow (`/task` Path A), which handles process summary, staging, committing, pushing, PR creation, CI monitoring, and cleanup.
 
 **Do not commit, push, or open a PR from this skill.**
 
-**DO NOT EXIT OR STOP after writing this file.** The `/task` workflow has 7 more mandatory steps (A.3 through A.9) that MUST execute after ralph completes. Ralph completing is the HALFWAY POINT of the task, not the end. The code is implemented but has not been committed, pushed, or merged. Exiting here is a known failure mode — see issue #721. You MUST return control to the calling `/task` workflow so it can continue with commit, push, PR creation, CI monitoring, merge, deployment verification, and retrospective.
+**DO NOT EXIT OR STOP after writing this file.** The `/task` workflow has 8 more mandatory steps (A.2b through A.9) that MUST execute after ralph completes. Ralph completing is the HALFWAY POINT of the task, not the end. The code is implemented but has not been committed, pushed, or merged. Exiting here is a known failure mode — see issue #721. You MUST return control to the calling `/task` workflow so it can continue with process summary, commit, push, PR creation, CI monitoring, merge, deployment verification, and retrospective.
 
 ---
 
@@ -298,8 +305,9 @@ The code is ready for commit. Return control to the calling workflow (`/task` Pa
 - **File-based state only.** No information passes between iterations except through the ralph state files.
 - **All standard rules apply.** No `$()`, no heredocs, no inline Python, temp files in `{worktree}/tmp/`.
 - **Gemini reviews are best-effort.** If the Google API key is unavailable or an API call fails, the loop continues with the remaining reviewers. Gemini reviews never block the loop.
-- **Ralph is not task completion.** Ralph handles implementation and review only. The calling `/task` workflow handles commit, push, PR, CI, merge, deploy, and cleanup. Never exit after ralph without completing the full `/task` workflow.
+- **Ralph is not task completion.** Ralph handles implementation and review only. The calling `/task` workflow handles process summary, commit, push, PR, CI, merge, deploy, and cleanup. Never exit after ralph without completing the full `/task` workflow.
 - **Unchecked test plan items are merge blockers.** Reviewers must flag unchecked test plan checkboxes as REVISE reasons. A PR with unchecked items is not ready to ship.
+- **Unmet acceptance criteria are always REVISE.** Reviewers must verify every acceptance criterion individually. Code quality alone is not sufficient for SHIP — all locally-verifiable acceptance criteria must be met.
 - **Only use `run_in_background` for genuinely parallel work.** The three parallel reviewers in step 2b are the only legitimate use of `run_in_background` in the ralph loop — they run concurrently by design. For everything else (test suites, lint, format checks, git commands), use foreground execution. The agent cannot proceed until these commands finish, so running them in the background just generates unnecessary `<task-notification>` noise that bubbles up to the dispatcher and wastes context window.
 
 ---

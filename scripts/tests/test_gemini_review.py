@@ -57,6 +57,13 @@ class TestBuildPrompts:
         assert "Scope completeness" in prompt
         assert "Scope creep" in prompt
 
+    def test_standard_prompt_gates_on_acceptance_criteria(self) -> None:
+        prompt = build_review_prompt("task", "diff", "files")
+        assert "Acceptance criteria gate" in prompt
+        assert "locally-verifiable criterion is not met" in prompt
+        assert "review MUST be REVISE" in prompt
+        assert "Acceptance criteria checklist" in prompt
+
     def test_adversarial_prompt_contains_bug_hunting_focus(self) -> None:
         prompt = build_adversarial_prompt("task", "diff", "files")
         assert "adversarial code review" in prompt

@@ -74,7 +74,7 @@ Priority order: `priority/p0` > `priority/p1` > `priority/p2` > `priority/p3`. W
 ### `#N` (e.g. `/task #42`)
 Work on that specific issue regardless of its current labels or assignment. Fetch it:
 ```
-gh issue view 42 --repo judgemind/judgemind --json number,title,body,labels,assignees
+gh issue view 42 --repo judgemind/judgemind --json number,title,body,labels,assignees,comments
 ```
 
 ### Natural language (e.g. `/task scrapers`, `/task next perf bug`, `/task SF tentatives`)
@@ -108,14 +108,15 @@ After claiming the issue, create todos using `TaskCreate` to track your major wo
 **For implementation tasks (Path A):**
 1. "Set up dependencies" — venvs/node_modules for affected packages
 2. "Implement and review (ralph loop)" — the core implementation phase
-3. "Commit and push" — stage, commit, create PR
-4. "Watch CI and fix failures" — monitor CI, resolve any failures
-5. "Verify no merge conflicts" — check mergeable status
-6. "Update PR test plan" — check off test plan items
-7. "Merge PR" — squash merge after CI is green
-8. "Verify deployment and post evidence" — watch deploy, verify feature works, post evidence comment
-9. "Retrospective" — identify workflow efficiencies and preventative measures
-10. "Remove worktree" — cleanup
+3. "Post process summary" — map implementation to acceptance criteria
+4. "Commit and push" — stage, commit, create PR
+5. "Watch CI and fix failures" — monitor CI, resolve any failures
+6. "Verify no merge conflicts" — check mergeable status
+7. "Update PR test plan" — check off test plan items
+8. "Merge PR" — squash merge after CI is green
+9. "Verify deployment and post evidence" — watch deploy, verify feature works, post evidence comment
+10. "Retrospective" — identify workflow efficiencies and preventative measures
+11. "Remove worktree" — cleanup
 
 **For investigation tasks (Path B):**
 1. "Investigate and document findings"
@@ -133,6 +134,14 @@ Mark each todo `in_progress` when you start it and `completed` when done. If a t
 
 Read the issue body thoroughly, including linked issues. Check `docs/specs/` for relevant guidance. Look at existing code for patterns — be consistent with what's already there.
 
+**Fetch issue comments for full context.** Issue comments often contain scope clarifications, additional acceptance criteria, and implementation notes from prior attempts. Fetch them:
+
+```
+gh issue view <N> --repo judgemind/judgemind --json number,title,body,labels,assignees,comments
+```
+
+Include non-bot comments (filter out comments from `github-actions[bot]`, `judgemind-agent`, etc.) in the context passed to the worker's `task.md`. Append them under a `## Issue Comments` heading with the author and date for each comment.
+
 **Scope completeness check:** Before implementing, search the codebase for all locations affected by the change. If the issue mentions fixing or changing X in one file, grep for X across the entire codebase. List all locations that use, render, or implement the same pattern. If the issue's scope doesn't cover all of them, either expand scope to include them or file follow-up issues for the missed locations so they are tracked. Document the scope check results (what you searched for, what you found) in your implementation notes or the PR body.
 
 If the issue requires a maintainer decision before you can proceed: comment on it, add `status/blocked`, and stop. Do not guess on ambiguous requirements.
@@ -143,7 +152,7 @@ If the issue requires a maintainer decision before you can proceed: comment on i
 
 Follow the full PR Workflow defined in CLAUDE.md. **All commits must be on the worktree branch — never on `main`.** Summary of required substeps:
 
-**IMPORTANT — Completion contract:** This task is NOT done after implementation or after ralph says SHIP. The task requires completing ALL substeps A.1 through A.9. After ralph returns, you MUST continue with A.3 (commit/push), A.4 (merge conflicts), A.5 (CI), A.6 (PR update), A.7 (merge), A.8 (deploy verification), and A.9 (retrospective). Stopping after ralph is a bug — see issue #721.
+**IMPORTANT — Completion contract:** This task is NOT done after implementation or after ralph says SHIP. The task requires completing ALL substeps A.1 through A.9. After ralph returns, you MUST continue with A.2b (process summary), A.3 (commit/push), A.4 (merge conflicts), A.5 (CI), A.6 (PR update), A.7 (merge), A.8 (deploy verification), and A.9 (retrospective). Stopping after ralph is a bug — see issue #721.
 
 #### A.1 — Set up dependencies
 Write status: `phase: setup`, `summary: Installing dependencies for <packages>`.
@@ -166,14 +175,53 @@ Skip this for Terraform-only or docs-only tasks.
 **POST-RALPH CHECKPOINT — Do not skip this.** After `/ralph` returns:
 1. Read `{worktree}/tmp/ralph/ralph-done.txt` to confirm ralph completed with SHIP status.
 2. Read `{worktree}/tmp/ralph/review-result.txt` to verify the final verdict is SHIP.
-3. If both confirm SHIP, **immediately continue to A.3 below.** Do not stop, do not return, do not consider the task done. The code is implemented but not yet committed, pushed, or merged — the task is only halfway complete.
+3. If both confirm SHIP, **immediately continue to A.2b below.** Do not stop, do not return, do not consider the task done. The code is implemented but not yet committed, pushed, or merged — the task is only halfway complete.
 
-**POST-RALPH SELF-RECOVERY GUARD:** Before proceeding to A.3, verify that the task is genuinely incomplete by running these checks:
+**POST-RALPH SELF-RECOVERY GUARD:** Before proceeding to A.2b, verify that the task is genuinely incomplete by running these checks:
 1. Run `git -C {worktree} status` to confirm there are uncommitted changes (there should be — ralph implements but does not commit).
 2. Run `git -C {worktree} log --oneline -1` to see the latest commit — it should NOT contain the current issue number (the implementation hasn't been committed yet).
 3. Check whether a PR already exists for this branch: `gh pr list --repo judgemind/judgemind --head <branch-name> --json number --limit 1`. It should return an empty list (no PR yet).
 
-If any of these checks show that work remains (uncommitted changes exist, no PR yet), you MUST continue to A.3. Do not exit. Do not return. Do not consider the task done. Exiting at this point is a critical workflow failure (#721).
+If any of these checks show that work remains (uncommitted changes exist, no PR yet), you MUST continue to A.2b. Do not exit. Do not return. Do not consider the task done. Exiting at this point is a critical workflow failure (#721).
+
+#### A.2b — Post process summary on issue (MANDATORY)
+
+Before committing or creating a PR, post a process summary comment on the GitHub issue. This creates an auditable record and forces explicit verification of each acceptance criterion.
+
+**Step 1 — Extract acceptance criteria.** Read the issue body and identify all acceptance criteria (typically `- [ ]` checkboxes). Also check issue comments for any additional or modified criteria.
+
+**Step 2 — Map each criterion to the implementation.** For EACH acceptance criterion:
+- State whether it is **met**, **not met**, or **not applicable**.
+- If met: describe specifically how — reference the file(s), function(s), or test(s) that satisfy it.
+- If not met: explain why (e.g., out of scope, blocked on something, requires post-deploy verification).
+- If not applicable: explain why.
+
+**Step 3 — Write and post the summary.** Write the comment to `{worktree}/tmp/process_summary.txt` with this structure:
+
+```
+## Process Summary
+
+### What was implemented
+<Brief description of the approach — 2-4 sentences>
+
+### Acceptance criteria mapping
+
+| # | Criterion | Status | Evidence |
+|---|-----------|--------|----------|
+| 1 | <criterion text> | Met | <file/function/test that satisfies it> |
+| 2 | <criterion text> | Met | <file/function/test that satisfies it> |
+| 3 | <criterion text> | Not met | <reason — e.g., requires post-deploy verification> |
+
+### Scope decisions
+<Any intentional exclusions or scope boundaries — what was NOT done and why>
+```
+
+Post it:
+```
+gh issue comment <N> --repo judgemind/judgemind --body-file {worktree}/tmp/process_summary.txt
+```
+
+**GATE CHECK:** If any acceptance criterion is "not met" and the reason is NOT "requires post-deploy verification" or "not applicable," do NOT proceed to A.3. Go back to A.2 and address the gap first. The process summary is a self-check — if it reveals unmet criteria, the implementation is not complete.
 
 #### A.3 — Stage, commit, and push
 Write status: `phase: pushing`, `summary: Staging, committing, and pushing to remote`.
@@ -303,7 +351,7 @@ Write status: `phase: deploying`, `summary: Watching deploy pipeline for <workfl
 3. If the deploy **fails**: file a new `priority/p1` issue describing the deploy failure, reference the merged PR, and add `agent/ready`. Do NOT consider the original task complete — comment on the original issue noting the deploy failure and linking the new issue.
 4. If the deploy **succeeds**: continue to Step 2.
 
-**Step 2 — Functional verification (required):**
+**Step 2 — Functional verification and acceptance criteria re-check (required):**
 
 Write status: `phase: verifying`, `summary: Verifying feature works in dev environment`.
 
@@ -321,6 +369,18 @@ A successful deploy only means the new image is running — not that the service
 
 **Script-producing tasks:** If a task produces a backfill, migration, or one-off fixup script that is meant to be run, executing it on dev and verifying results is part of the definition of done. When filing issues that include "create a backfill script" or similar, always include "backfill executed on dev and results verified" in the acceptance criteria.
 
+**Acceptance criteria re-verification (MANDATORY for deployed changes):**
+
+After verifying deployment health, go back to the issue's acceptance criteria and verify EACH one against the live environment. This is distinct from the A.2b process summary (which verifies against code/tests) — this step verifies against deployed reality.
+
+For each acceptance criterion:
+- **Frontend criteria**: take a screenshot or fetch page content showing the criterion is met.
+- **Data criteria**: run the specific SQL query or API call that demonstrates the criterion.
+- **API criteria**: hit the specific endpoint and confirm the expected response.
+- **Behavior criteria**: trigger the specific scenario and capture the result.
+
+Include the per-criterion verification results in the evidence comment (Step 3).
+
 If functional verification **fails**: diagnose the issue. If it's a simple fix, fix it in a follow-up PR. If it's complex, file a `priority/p1` issue with details, reference the merged PR, and add `agent/ready`.
 
 **Step 3 — Post verification evidence comment (MANDATORY — no exceptions):**
@@ -332,7 +392,7 @@ Write the comment to `{worktree}/tmp/verification_evidence.txt`, then post it:
 gh issue comment <N> --repo judgemind/judgemind --body-file {worktree}/tmp/verification_evidence.txt
 ```
 
-**For deployed changes**, the comment must include concrete evidence from the verification table above. Example formats:
+**For deployed changes**, the comment must include concrete evidence from the verification table above AND per-criterion verification results. Example format:
 
 ```
 ## Verification Evidence
@@ -340,28 +400,19 @@ gh issue comment <N> --repo judgemind/judgemind --body-file {worktree}/tmp/verif
 **Change type:** API endpoint
 **Environment:** dev
 
-**Evidence:**
+**Deployment health:**
 curl response from dev.api.judgemind.org:
 - Status: 200
 - Response body (relevant snippet):
   {"data":{"ruling":{"id":"abc123","rulingTextHtml":"<p>The motion is GRANTED...</p>"}}}
 
-Post-deploy verification: PASSED
-```
+**Acceptance criteria verification:**
 
-```
-## Verification Evidence
-
-**Change type:** Backfill script
-**Environment:** dev
-
-**Evidence:**
-DB query after backfill:
-SELECT COUNT(*) FROM rulings WHERE ruling_text_html IS NOT NULL;
--- Result: 2444 (was 0 before backfill)
-
-SELECT COUNT(*) FROM rulings WHERE ruling_text_html IS NULL;
--- Result: 0
+| # | Criterion | Verified | Evidence |
+|---|-----------|----------|----------|
+| 1 | <criterion text> | Yes | <curl output, DB query result, or screenshot showing it works> |
+| 2 | <criterion text> | Yes | <specific evidence> |
+| 3 | <criterion text> | N/A (post-deploy) | <reason> |
 
 Post-deploy verification: PASSED
 ```
