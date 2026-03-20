@@ -55,26 +55,55 @@ _MOTION_KEYWORDS = (
 )
 
 
+def _is_north_case_entry(lines: list[str], line_idx: int, rest: str) -> bool:
+    """Return True if this numbered line looks like a North JC case entry.
+
+    Checks whether "vs", "vs.", or "v." appears on the first line or in the
+    short continuation lines that form the case name.  This filters out false
+    positives like "10 calendar days" or legal citations like
+    "151 Cal.App.4th 168".
+
+    The continuation-line heuristic mirrors ``_split_north``'s own case-name
+    parsing: only short (< 35 chars) non-empty lines without periods/parens
+    are treated as name fragments.
+    """
+    # Build the candidate case-name text from the entry line + continuations.
+    parts = [rest]
+    for j in range(line_idx + 1, min(line_idx + 6, len(lines))):
+        cand = lines[j].strip()
+        if not cand or cand.startswith("Page "):
+            break
+        if len(cand) >= 35:
+            break
+        if "." in cand or "(" in cand or ")" in cand:
+            break
+        parts.append(cand)
+
+    candidate = " ".join(parts)
+    return bool(re.search(r"\b(?:vs\.?|v\.)", candidate, re.IGNORECASE))
+
+
 def _split_north(text: str) -> list[SplitResult]:
     """Split a North Justice Center calendar page into per-case rulings.
 
-    Identifies case entry boundaries using the 1-3 digit line number pattern,
-    extracts the ruling text for each case, and parses case_title and
-    motion_type from the first line of each entry.
-
-    Only entries whose case names contain "vs" or "v." are included (filtering
-    out legal citations like "151 Cal.App.4th ...").
+    Identifies case entry boundaries using 1-3 digit line numbers, then
+    extracts the ruling text for each case.  Only entries whose nearby text
+    contains "vs" or "v." are treated as case entries (filtering out legal
+    citations and prose lines that happen to start with a number).
 
     Returns an empty list if fewer than 2 case entries are found (the caller
     treats this as "no splitting needed").
     """
     lines = text.split("\n")
 
-    # Find all entry start positions (line index, line number, rest of line).
+    # Find all entry start positions that look like actual case entries.
+    # Pre-filtering by "vs"/"v." is critical: with \d{1,3}, many prose lines
+    # match the regex (e.g. "10 calendar days", "2 and 3, Request for").
+    # Only lines where "vs"/"v." appears nearby are genuine case entries.
     entry_positions: list[tuple[int, str, str]] = []
     for i, line in enumerate(lines):
         m = _NORTH_ENTRY_START_RE.match(line)
-        if m:
+        if m and _is_north_case_entry(lines, i, m.group(2)):
             entry_positions.append((i, m.group(1), m.group(2)))
 
     results: list[SplitResult] = []

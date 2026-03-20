@@ -154,12 +154,29 @@ def _parse_north_case_entries(text: str) -> list[_NorthCaseEntry]:
     """
     lines = text.split("\n")
 
-    # Find all entry start positions
+    # Find all entry start positions.  Pre-filter by checking for "vs"/"v."
+    # in the first line and short continuation lines (case-name fragments)
+    # to avoid false positives from prose lines that start with a number
+    # (e.g. "10 calendar days", "2 and 3, Request for...").
     entry_positions: list[tuple[int, str, str]] = []
     for i, line in enumerate(lines):
         m = _ENTRY_START_RE.match(line)
         if m:
-            entry_positions.append((i, m.group(1), m.group(2)))
+            # Build candidate case-name text from entry line + continuations.
+            rest = m.group(2)
+            name_parts = [rest]
+            for j in range(i + 1, min(i + 6, len(lines))):
+                cand = lines[j].strip()
+                if not cand or cand.startswith("Page "):
+                    break
+                if len(cand) >= 35:
+                    break
+                if "." in cand or "(" in cand or ")" in cand:
+                    break
+                name_parts.append(cand)
+            candidate = " ".join(name_parts)
+            if re.search(r"\b(?:vs\.?|v\.)", candidate, re.IGNORECASE):
+                entry_positions.append((i, m.group(1), m.group(2)))
 
     entries: list[_NorthCaseEntry] = []
     for idx, (line_idx, line_num, first_line_rest) in enumerate(entry_positions):

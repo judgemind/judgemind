@@ -266,6 +266,120 @@ class TestSplitNorthShortNumbers:
         assert all("Cal.App" not in (r.case_title or "") for r in results)
 
 
+# ---------------------------------------------------------------------------
+# North JC prose-number pre-filter — regression tests (#1186)
+# ---------------------------------------------------------------------------
+
+
+class TestSplitNorthProseFilter:
+    """Tests that prose lines starting with numbers do not corrupt boundaries.
+
+    The root cause of #1186: with \\d{1,3}, lines like "10 calendar days" were
+    treated as entry boundaries, splitting ruling text at the wrong positions.
+    The _is_north_case_entry() pre-filter checks for "vs" nearby before
+    accepting a numbered line as a case entry boundary.
+    """
+
+    ZAVALA_STYLE_TEXT = (
+        "TENTATIVE RULINGS\n"
+        "Judge Craig L. Griffin\n"
+        "Date: March 16, 2026\n"
+        "Time: 2:00 PM\n"
+        "If you are submitting to the tentative, please call the Clerk.\n"
+        "#\n"
+        "1 Zavala vs. Before the Court is the Motion for Attorneys' Fees\n"
+        "Becker et al. filed by Karl Mark Becker.\n"
+        "\n"
+        "Plaintiff Riordan Zavala has belatedly filed an Opposition.\n"
+        "The Court therefore will not consider Plaintiff's untimely Opposition.\n"
+        "The Motion seeks attorneys' fees of $15,000.\n"
+        "Tentative Ruling: The Motion for Attorneys' Fees is GRANTED.\n"
+        "2 Alpha Corp vs. Motion to Compel Discovery\n"
+        "Beta LLC\n"
+        "\n"
+        "Defendant has failed to respond to discovery requests.\n"
+        "10 calendar days is insufficient notice.\n"
+        "Tentative Ruling: The Motion to Compel is GRANTED.\n"
+        "3 Gamma vs. Delta Demurrer to Complaint\n"
+        "\n"
+        "The Demurrer is SUSTAINED with 20 days leave to amend.\n"
+    )
+
+    def test_splits_three_single_digit_entries(self) -> None:
+        """Three single-digit entries with 'vs' are split correctly."""
+        results = _split_north(self.ZAVALA_STYLE_TEXT)
+        assert len(results) == 3
+
+    def test_first_entry_is_zavala(self) -> None:
+        results = _split_north(self.ZAVALA_STYLE_TEXT)
+        assert results[0].case_title is not None
+        assert "Zavala" in results[0].case_title
+
+    def test_zavala_ruling_text_contains_fees(self) -> None:
+        results = _split_north(self.ZAVALA_STYLE_TEXT)
+        assert "Attorneys' Fees is GRANTED" in results[0].ruling_text
+
+    def test_zavala_ruling_does_not_contain_other_cases(self) -> None:
+        """Zavala ruling text should not contain Alpha or Gamma text."""
+        results = _split_north(self.ZAVALA_STYLE_TEXT)
+        assert "Alpha Corp" not in results[0].ruling_text
+        assert "Gamma vs" not in results[0].ruling_text
+
+    def test_each_split_shorter_than_full_text(self) -> None:
+        results = _split_north(self.ZAVALA_STYLE_TEXT)
+        full_len = len(self.ZAVALA_STYLE_TEXT)
+        for i, r in enumerate(results):
+            assert len(r.ruling_text) < full_len, (
+                f"Split [{i}] has {len(r.ruling_text)} chars, same as full text ({full_len})"
+            )
+
+    def test_prose_numbers_not_treated_as_entries(self) -> None:
+        """Lines like '10 calendar days' should not be treated as entries."""
+        results = _split_north(self.ZAVALA_STYLE_TEXT)
+        # "10 calendar days" appears in Alpha Corp's ruling but should not
+        # create a separate entry or split boundary.
+        entry_nums = [r.ruling_text.split("\n")[0] for r in results]
+        for line in entry_nums:
+            assert "calendar days" not in line
+
+    def test_alpha_ruling_contains_calendar_days_line(self) -> None:
+        """The '10 calendar days' line belongs to Alpha Corp's ruling, not a new entry."""
+        results = _split_north(self.ZAVALA_STYLE_TEXT)
+        alpha = [r for r in results if "Alpha" in (r.case_title or "")]
+        assert len(alpha) == 1
+        assert "10 calendar days" in alpha[0].ruling_text
+
+    def test_motion_type_extracted(self) -> None:
+        results = _split_north(self.ZAVALA_STYLE_TEXT)
+        alpha = [r for r in results if "Alpha" in (r.case_title or "")]
+        assert len(alpha) == 1
+        assert alpha[0].motion_type is not None
+        assert "Motion to Compel" in alpha[0].motion_type
+
+    def test_framework_dispatch_for_north_dept(self) -> None:
+        """split_oc_document dispatches to North splitter for N17."""
+        event = {"ruling_text": self.ZAVALA_STYLE_TEXT, "department": "N17"}
+        results = split_oc_document(event)
+        assert len(results) == 3
+        assert results[0].case_number is None  # North has no case numbers
+
+    def test_framework_integration_end_to_end(self) -> None:
+        """split_document() through the framework splits N17 single-digit entries."""
+        event = {
+            "state": "CA",
+            "county": "Orange",
+            "ruling_text": self.ZAVALA_STYLE_TEXT,
+            "department": "N17",
+            "case_title": None,
+            "case_number": None,
+            "motion_type": None,
+            "outcome": None,
+        }
+        results = split_document(event)
+        assert len(results) == 3
+        assert "Zavala" in (results[0].case_title or "")
+
+
 class TestSplitOcDocumentFallback:
     """Tests for the North-to-case-number fallback in split_oc_document."""
 
