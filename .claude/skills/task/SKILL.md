@@ -307,7 +307,7 @@ Write status: `phase: ci-watch`, `summary: Watching CI run <run-id>`.
 **Run CI watches in the foreground** — do not use `run_in_background`. You cannot proceed until CI finishes, so background execution just generates unnecessary `<task-notification>` noise for the dispatcher.
 
 ```
-gh run watch <run-id> --repo judgemind/judgemind --exit-status --compact
+gh run watch <run-id> --repo judgemind/judgemind --interval 60 --exit-status --compact
 ```
 If CI fails: write status `phase: ci-fix`, `summary: Fixing CI failure: <brief reason>`. Diagnose, fix locally, push, return to A.4. Repeat until all checks pass.
 
@@ -346,7 +346,7 @@ Write status: `phase: deploying`, `summary: Watching deploy pipeline for <workfl
 2. **Run deploy watches in the foreground** — do not use `run_in_background`. You cannot proceed until the deploy finishes.
    ```
    gh run list --repo judgemind/judgemind --workflow "<deploy-workflow>.yml" --branch main --limit 1 --json databaseId -q '.[0].databaseId'
-   gh run watch <run-id> --repo judgemind/judgemind --exit-status --compact
+   gh run watch <run-id> --repo judgemind/judgemind --interval 60 --exit-status --compact
    ```
 3. If the deploy **fails**: file a new `priority/p1` issue describing the deploy failure, reference the merged PR, and add `agent/ready`. Do NOT consider the original task complete — comment on the original issue noting the deploy failure and linking the new issue.
 4. If the deploy **succeeds**: continue to Step 2.

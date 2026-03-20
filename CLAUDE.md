@@ -132,7 +132,7 @@ Before creating a PR, check for duplicates using `preflight_no_duplicate_pr` fro
 ```
 gh pr create --repo judgemind/judgemind ...
 gh run list --repo judgemind/judgemind --branch <branch> --limit 1 --json databaseId -q '.[0].databaseId'
-gh run watch <run-id> --repo judgemind/judgemind --exit-status --compact
+gh run watch <run-id> --repo judgemind/judgemind --interval 60 --exit-status --compact
 ```
 
 **Never leave the CI watch step unfinished.** If CI is green, continue to 4.5. If CI fails, go to 4.7.
@@ -226,11 +226,10 @@ For detailed patterns to avoid permission prompts, see `docs/agent/unattended-pa
 
 ### GitHub API Rate Limit Awareness
 
-GitHub allows 5,000 API requests per hour. With multiple concurrent agents, this budget is shared and can be exhausted quickly — especially by high-frequency polling commands like `gh run watch`.
+GitHub allows 5,000 API requests per hour. With multiple concurrent agents, this budget is shared and can be exhausted quickly.
 
-- **Check rate budget before expensive operations.** Run `preflight_rate_budget` (from `scripts/preflight.sh`) before `gh run watch` or any polling loop. If it returns 1 (low budget), use periodic `gh run view` with manual sleeps instead of continuous `gh run watch`.
+- **Always use `--interval 60` with `gh run watch`.** The default poll interval is 3 seconds, which burns through API budget fast. Use `gh run watch <id> --repo judgemind/judgemind --interval 60 --exit-status --compact` as the standard CI/deploy watch command.
 - **Use `scripts/gh-with-backoff.sh` for non-interactive gh commands.** It wraps `gh` with automatic retry on 403 (rate limit) responses and proactive budget checks. Example: `scripts/gh-with-backoff.sh pr view 42 --repo judgemind/judgemind --json mergeable`.
-- **Prefer `gh run view` over `gh run watch` when multiple agents are active.** `gh run watch` polls rapidly (every few seconds). Instead, poll with `gh run view <id> --json status --jq '.status'` in a loop with 30-60 second sleeps.
 - **Never retry 403 errors in a tight loop.** Always check the rate limit reset time and wait for it.
 
 ## Accounts & Infrastructure

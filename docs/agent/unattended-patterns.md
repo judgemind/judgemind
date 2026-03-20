@@ -27,11 +27,10 @@
 
 The GitHub API allows 5,000 requests per hour per authentication token. When multiple agents share the same token, this budget is consumed quickly.
 
-- **Pre-check before polling:** before running `gh run watch` or any command that polls repeatedly, call `preflight_rate_budget` from `scripts/preflight.sh`. If it returns 1, switch to manual polling with longer intervals.
+- **Always use `--interval 60` with `gh run watch`.** The default poll interval is 3 seconds, which burns through API budget fast. Use `gh run watch <id> --repo judgemind/judgemind --interval 60 --exit-status --compact` as the standard CI/deploy watch command. This achieves the same rate savings as manual polling loops with simpler code.
 - **Wrap gh commands with retry:** use `scripts/gh-with-backoff.sh <gh-subcommand> [args...]` for any `gh` command that might hit rate limits. It automatically detects 403 responses, checks the rate limit reset time, waits, and retries (up to 5 times by default).
 - **Environment variables for tuning:**
   - `GH_BACKOFF_MAX_RETRIES` — max retry attempts (default: 5)
   - `GH_BACKOFF_MIN_WAIT` — minimum wait in seconds per retry (default: 10)
   - `GH_BACKOFF_WARN_THRESHOLD` — warn threshold for remaining requests (default: 100)
-- **Prefer `gh run view` over `gh run watch`** in multi-agent scenarios. `gh run watch` makes a request every few seconds; manually polling with `gh run view <id> --json status` every 30-60 seconds uses far fewer requests.
 - **Never tight-loop on 403 errors.** If you get a rate limit response, always check the reset time via `gh api rate_limit` and sleep until it passes.
