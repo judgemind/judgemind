@@ -186,6 +186,9 @@ A successful deploy only means the new image is running — not that the service
 | **Scraper** | Check ECS logs for the next scheduled run, confirm documents are captured without errors |
 | **Frontend** | Confirm the affected page loads on `dev.judgemind.org` and renders the expected content |
 | **DX/tooling** | Run the tool in a representative scenario and confirm expected output |
+| **Backfill / data migration script** | Execute the script against dev via `scripts/ecs-run-task.sh` (or locally if appropriate). Confirm the expected data changes applied — e.g., query dev DB via `scripts/dev-db-query.sh` to check row counts, null rates, or sample records. |
+
+**Script-producing tasks:** If a task produces a backfill, migration, or one-off fixup script that is meant to be run, executing it on dev and verifying results is part of the definition of done. When filing issues that include "create a backfill script" or similar, always include "backfill executed on dev and results verified" in the acceptance criteria.
 
 If functional verification fails: diagnose the issue. If it's a simple fix, fix it in a follow-up PR. If it's complex, file a `priority/p1` issue with details of what's broken, reference the merged PR, and add `agent/ready`.
 
