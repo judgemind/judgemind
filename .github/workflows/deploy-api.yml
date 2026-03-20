@@ -128,15 +128,27 @@ jobs:
             '.containerDefinitions |= map(if .name == $container then .image = $image else . end)' \
             current-task-def.json > updated-containers.json
 
+          # Extract the task role ARN (may be null if not set)
+          TASK_ROLE=$(jq -r '.taskRoleArn // empty' updated-containers.json)
+
+          # Build register args — task role is conditional since older revisions may lack it
+          REGISTER_ARGS=(
+            --family "$TASK_FAMILY"
+            --requires-compatibilities $(jq -r '.requiresCompatibilities[]' updated-containers.json)
+            --network-mode $(jq -r '.networkMode' updated-containers.json)
+            --cpu $(jq -r '.cpu' updated-containers.json)
+            --memory $(jq -r '.memory' updated-containers.json)
+            --execution-role-arn $(jq -r '.executionRoleArn' updated-containers.json)
+            --container-definitions "$(jq -c '.containerDefinitions' updated-containers.json)"
+          )
+
+          if [ -n "$TASK_ROLE" ]; then
+            REGISTER_ARGS+=(--task-role-arn "$TASK_ROLE")
+          fi
+
           # Register the new revision, keeping only the fields accepted by register-task-definition
           NEW_TASK_DEF_ARN=$(aws ecs register-task-definition \
-            --family "$TASK_FAMILY" \
-            --requires-compatibilities $(jq -r '.requiresCompatibilities[]' updated-containers.json) \
-            --network-mode $(jq -r '.networkMode' updated-containers.json) \
-            --cpu $(jq -r '.cpu' updated-containers.json) \
-            --memory $(jq -r '.memory' updated-containers.json) \
-            --execution-role-arn $(jq -r '.executionRoleArn' updated-containers.json) \
-            --container-definitions "$(jq -c '.containerDefinitions' updated-containers.json)" \
+            "${REGISTER_ARGS[@]}" \
             --query 'taskDefinition.taskDefinitionArn' \
             --output text)
 

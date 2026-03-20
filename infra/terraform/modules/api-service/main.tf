@@ -272,9 +272,12 @@ resource "aws_iam_role_policy" "api_s3_read" {
     Version = "2012-10-17"
     Statement = [
       {
-        Sid      = "AllowDocumentDownload"
-        Effect   = "Allow"
-        Action   = "s3:GetObject"
+        Sid    = "AllowDocumentDownload"
+        Effect = "Allow"
+        Action = [
+          "s3:GetObject",
+          "s3:HeadObject",
+        ]
         Resource = "${var.document_archive_bucket_arn}/*"
       }
     ]
