@@ -256,6 +256,8 @@ Resolve conflicts, `git rebase --continue`, then push with `--force-with-lease`.
 #### A.5 — Monitor CI and iterate until green
 Write status: `phase: ci-watch`, `summary: Watching CI run <run-id>`.
 
+**Run CI watches in the foreground** — do not use `run_in_background`. You cannot proceed until CI finishes, so background execution just generates unnecessary `<task-notification>` noise for the dispatcher.
+
 ```
 gh run watch <run-id> --repo judgemind/judgemind --exit-status --compact
 ```
@@ -293,7 +295,7 @@ Write status: `phase: deploying`, `summary: Watching deploy pipeline for <workfl
    - `packages/scraper-framework/` or scraper code → `deploy-scraper.yml`
    - `packages/web/` or frontend → `deploy-production.yml`
    - `infra/terraform/` → `terraform.yml`
-2. Watch the deploy workflow that triggers on the merge to `main`:
+2. **Run deploy watches in the foreground** — do not use `run_in_background`. You cannot proceed until the deploy finishes.
    ```
    gh run list --repo judgemind/judgemind --workflow "<deploy-workflow>.yml" --branch main --limit 1 --json databaseId -q '.[0].databaseId'
    gh run watch <run-id> --repo judgemind/judgemind --exit-status --compact
@@ -483,4 +485,5 @@ scripts/end-worker.sh {worktree}
 - **No quoted strings with `&&` or `;`.** Split into separate tool calls.
 - **All temp files go in `{worktree}/tmp/`**, not `/tmp/`.
 - **Multi-line Python always goes in a `.py` file**, never `-c '...'`.
+- **Only use `run_in_background` for genuinely parallel work** (e.g., launching multiple reviews simultaneously). For commands the agent must wait on before proceeding (CI watches, test suites, deploy watches, sleeps), use foreground execution. Background commands generate `<task-notification>` messages that bubble up to the dispatcher and consume context window without providing any benefit.
 - See CLAUDE.md §Unattended Operation Patterns for the full list.
