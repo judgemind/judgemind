@@ -102,6 +102,7 @@ function makeRulingNode(overrides: Record<string, unknown> = {}) {
     department: '5',
     judge: { canonicalName: 'Smith, John' },
     rulingText: 'The motion for summary judgment is granted.',
+    rulingTextHtml: null,
     documentId: null,
     documentFormat: null,
     ...overrides,
@@ -231,7 +232,7 @@ describe('CaseDetail (render)', () => {
     expect(screen.getByText('Tentative')).toBeInTheDocument();
   });
 
-  it('renders ruling text', () => {
+  it('renders ruling text after expanding the ruling card', () => {
     mockCaseQueryResult.data = makeCaseData();
     mockRulingsQueryResult.data = {
       rulings: {
@@ -240,12 +241,23 @@ describe('CaseDetail (render)', () => {
       },
     };
     render(<CaseDetail caseId="case-1" />);
+
+    // Text is hidden before expanding
+    expect(
+      screen.queryByText('The motion for summary judgment is granted.'),
+    ).not.toBeInTheDocument();
+
+    // Expand the ruling card
+    const rulingBtn = screen.getByLabelText(/Ruling from/);
+    fireEvent.click(rulingBtn);
+
+    // Now text is visible
     expect(
       screen.getByText('The motion for summary judgment is granted.'),
     ).toBeInTheDocument();
   });
 
-  it('shows Show more button for long ruling text and toggles on click', () => {
+  it('shows full text when ruling card is expanded (card-based collapse)', () => {
     const longText = 'The court considered the arguments. '.repeat(30);
     mockCaseQueryResult.data = makeCaseData();
     mockRulingsQueryResult.data = {
@@ -256,15 +268,21 @@ describe('CaseDetail (render)', () => {
         pageInfo: { hasNextPage: false, endCursor: null },
       },
     };
-    render(<CaseDetail caseId="case-1" />);
-    const showMoreBtn = screen.getByText('Show more');
-    expect(showMoreBtn).toBeInTheDocument();
+    const { container } = render(<CaseDetail caseId="case-1" />);
 
-    fireEvent.click(showMoreBtn);
-    expect(screen.getByText('Show less')).toBeInTheDocument();
+    // Expand the ruling card
+    const rulingBtn = screen.getByLabelText(/Ruling from/);
+    fireEvent.click(rulingBtn);
+
+    // Full text should be visible — no CSS truncation in card layout
+    expect(screen.getByText(/The court considered the arguments/)).toBeInTheDocument();
+
+    // No gradient overlay or max-height truncation
+    expect(container.querySelector('.bg-gradient-to-t')).not.toBeInTheDocument();
+    expect(container.querySelector('.max-h-40')).not.toBeInTheDocument();
   });
 
-  it('renders download link when documentId is present', () => {
+  it('renders download link when documentId is present and card is expanded', () => {
     mockCaseQueryResult.data = makeCaseData();
     mockRulingsQueryResult.data = {
       rulings: {
@@ -281,6 +299,11 @@ describe('CaseDetail (render)', () => {
       },
     };
     render(<CaseDetail caseId="case-1" />);
+
+    // Expand the ruling card to see download link
+    const rulingBtn = screen.getByLabelText(/Ruling from/);
+    fireEvent.click(rulingBtn);
+
     expect(screen.getByText('Download original')).toBeInTheDocument();
     expect(screen.getByText('PDF')).toBeInTheDocument();
   });
@@ -336,7 +359,7 @@ describe('CaseDetail (render)', () => {
     ).toBeInTheDocument();
   });
 
-  it('renders download link for document without ruling text', () => {
+  it('renders download link for document without ruling text after expanding', () => {
     mockCaseQueryResult.data = makeCaseData();
     mockRulingsQueryResult.data = {
       rulings: {
@@ -345,6 +368,7 @@ describe('CaseDetail (render)', () => {
             cursor: 'c1',
             node: makeRulingNode({
               rulingText: null,
+              rulingTextHtml: null,
               documentId: 'doc-uuid-2',
               documentFormat: 'html',
             }),
@@ -354,6 +378,11 @@ describe('CaseDetail (render)', () => {
       },
     };
     render(<CaseDetail caseId="case-1" />);
+
+    // Expand the ruling card to see download link
+    const rulingBtn = screen.getByLabelText(/Ruling from/);
+    fireEvent.click(rulingBtn);
+
     expect(screen.getByText('Download original')).toBeInTheDocument();
     expect(screen.getByText('HTML')).toBeInTheDocument();
   });

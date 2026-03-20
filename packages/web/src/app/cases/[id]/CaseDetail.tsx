@@ -11,10 +11,12 @@ import {
   formatLabel,
   formatOutcome,
   groupParties,
-  RULING_TEXT_TRUNCATE_LENGTH,
-  truncateText,
 } from '../../../lib/display-helpers';
 import { sanitizeRulingHtml } from '@/lib/sanitize-html';
+import { Badge } from '@/components/ui/badge';
+import { Button } from '@/components/ui/button';
+import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
+import { Skeleton } from '@/components/ui/skeleton';
 
 const CASE_QUERY = gql`
   query CaseDetail($id: ID!) {
@@ -122,46 +124,33 @@ interface RulingsData {
   };
 }
 
-const OUTCOME_BADGE: Record<string, string> = {
-  granted: 'bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200',
-  denied: 'bg-red-100 text-red-800 dark:bg-red-900 dark:text-red-200',
-  granted_in_part:
-    'bg-yellow-100 text-yellow-800 dark:bg-yellow-900 dark:text-yellow-200',
-  denied_in_part:
-    'bg-yellow-100 text-yellow-800 dark:bg-yellow-900 dark:text-yellow-200',
+const OUTCOME_VARIANT: Record<string, 'default' | 'secondary' | 'destructive' | 'outline'> = {
+  granted: 'default',
+  denied: 'destructive',
+  granted_in_part: 'secondary',
+  denied_in_part: 'secondary',
 };
 
 const PAGE_SIZE = 20;
 
 function SkeletonBlock() {
   return (
-    <div className="animate-pulse space-y-4">
-      <div className="h-6 w-2/3 rounded bg-slate-200 dark:bg-slate-700" />
-      <div className="h-4 w-1/2 rounded bg-slate-200 dark:bg-slate-700" />
-      <div className="mt-6 grid grid-cols-2 gap-4 sm:grid-cols-3">
-        {Array.from({ length: 6 }).map((_, i) => (
-          <div key={i} className="space-y-2">
-            <div className="h-3 w-16 rounded bg-slate-200 dark:bg-slate-700" />
-            <div className="h-4 w-24 rounded bg-slate-200 dark:bg-slate-700" />
+    <div className="space-y-6">
+      <Card>
+        <CardHeader>
+          <Skeleton className="h-5 w-24" />
+        </CardHeader>
+        <CardContent>
+          <div className="grid grid-cols-2 gap-4 sm:grid-cols-3">
+            {Array.from({ length: 6 }).map((_, i) => (
+              <div key={i} className="space-y-2">
+                <Skeleton className="h-3 w-16" />
+                <Skeleton className="h-4 w-24" />
+              </div>
+            ))}
           </div>
-        ))}
-      </div>
-    </div>
-  );
-}
-
-function SkeletonRow() {
-  return (
-    <div className="flex animate-pulse gap-4 border-b border-slate-100 px-4 py-4 dark:border-slate-700">
-      <div className="w-24 shrink-0">
-        <div className="h-3 w-16 rounded bg-slate-200 dark:bg-slate-700" />
-      </div>
-      <div className="flex-1 space-y-2">
-        <div className="h-3 w-1/3 rounded bg-slate-200 dark:bg-slate-700" />
-      </div>
-      <div className="w-20 shrink-0">
-        <div className="h-5 rounded bg-slate-200 dark:bg-slate-700" />
-      </div>
+        </CardContent>
+      </Card>
     </div>
   );
 }
@@ -175,20 +164,20 @@ function PartyColumn({
 }) {
   return (
     <div>
-      <h3 className="text-xs font-medium uppercase tracking-wide text-slate-500 dark:text-slate-400">
+      <h3 className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
         {label}
       </h3>
       {parties.length === 0 ? (
-        <p className="mt-1 text-sm text-slate-400 dark:text-slate-500">
+        <p className="mt-1 text-sm text-muted-foreground">
           None listed
         </p>
       ) : (
         <ul className="mt-1 space-y-1">
           {parties.map((party) => (
-            <li key={party.id} className="text-sm text-slate-900 dark:text-slate-100">
+            <li key={party.id} className="text-sm text-foreground">
               {party.canonicalName}
               {party.partyType && (
-                <span className="ml-2 text-xs text-slate-500 dark:text-slate-400">
+                <span className="ml-2 text-xs text-muted-foreground">
                   ({formatLabel(party.partyType)})
                 </span>
               )}
@@ -254,37 +243,37 @@ export function CaseDetail({ caseId }: { caseId: string }) {
     });
   }
 
-  // Loading state
   if (caseLoading) {
     return <SkeletonBlock />;
   }
 
-  // Error state
   if (caseError) {
     return (
-      <div className="rounded-lg border border-red-200 bg-red-50 p-6 text-center dark:border-red-800 dark:bg-red-900/20">
-        <p className="text-sm text-red-600 dark:text-red-400">
-          Failed to load case details. Please try again.
-        </p>
-      </div>
+      <Card className="border-destructive">
+        <CardContent className="py-6 text-center">
+          <p className="text-sm text-destructive">
+            Failed to load case details. Please try again.
+          </p>
+        </CardContent>
+      </Card>
     );
   }
 
-  // Not found
   const caseRecord = caseData?.case;
   if (!caseRecord) {
     return (
-      <div className="rounded-lg border border-slate-200 p-6 text-center dark:border-slate-700">
-        <p className="text-sm text-slate-500 dark:text-slate-400">
-          Case not found.
-        </p>
-      </div>
+      <Card>
+        <CardContent className="py-6 text-center">
+          <p className="text-sm text-muted-foreground">
+            Case not found.
+          </p>
+        </CardContent>
+      </Card>
     );
   }
 
   const { plaintiffs, defendants, others } = groupParties(caseRecord.parties);
 
-  // Derive unique judges from rulings when the case-level judges list is empty.
   const judgesFromRulings = (() => {
     if (caseRecord.judges.length > 0) return [];
     const seen = new Set<string>();
@@ -293,7 +282,7 @@ export function CaseDetail({ caseId }: { caseId: string }) {
       if (node.judge && !seen.has(node.judge.canonicalName)) {
         seen.add(node.judge.canonicalName);
         result.push({
-          id: node.judge.canonicalName, // no judge id from rulings query
+          id: node.judge.canonicalName,
           canonicalName: node.judge.canonicalName,
           department: node.department,
         });
@@ -305,275 +294,236 @@ export function CaseDetail({ caseId }: { caseId: string }) {
   const displayJudges = caseRecord.judges.length > 0 ? caseRecord.judges : judgesFromRulings;
 
   return (
-    <div>
-      {/* Case metadata */}
-      <div className="grid grid-cols-2 gap-x-8 gap-y-4 sm:grid-cols-3">
-        {caseRecord.filedAt && (
-          <div>
-            <dt className="text-xs font-medium uppercase tracking-wide text-slate-500 dark:text-slate-400">
-              Filed Date
-            </dt>
-            <dd className="mt-1 text-sm text-slate-900 dark:text-slate-100">
-              {formatDate(caseRecord.filedAt)}
-            </dd>
-          </div>
-        )}
-        <div>
-          <dt className="text-xs font-medium uppercase tracking-wide text-slate-500 dark:text-slate-400">
-            Court
-          </dt>
-          <dd className="mt-1 text-sm text-slate-900 dark:text-slate-100">
-            {caseRecord.court?.courtName ?? '\u2014'}
-          </dd>
-        </div>
-        <div>
-          <dt className="text-xs font-medium uppercase tracking-wide text-slate-500 dark:text-slate-400">
-            County
-          </dt>
-          <dd className="mt-1 text-sm text-slate-900 dark:text-slate-100">
-            {caseRecord.court?.county ?? '\u2014'}
-          </dd>
-        </div>
-      </div>
-
-      {/* Parties — two-column layout (hidden when empty) */}
-      {caseRecord.parties.length > 0 && (
-        <section className="mt-8">
-          <h2 className="text-sm font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">
-            Parties
-          </h2>
-          <div className="mt-2 grid grid-cols-1 gap-6 sm:grid-cols-2">
-            <PartyColumn label="Plaintiffs" parties={plaintiffs} />
-            <PartyColumn label="Defendants" parties={defendants} />
-            {others.length > 0 && (
-              <PartyColumn label="Other Parties" parties={others} />
+    <div className="space-y-6">
+      <Card>
+        <CardHeader>
+          <CardTitle className="text-base">Case Details</CardTitle>
+        </CardHeader>
+        <CardContent>
+          <dl className="grid grid-cols-2 gap-x-8 gap-y-4 sm:grid-cols-3">
+            {caseRecord.filedAt && (
+              <div>
+                <dt className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                  Filed Date
+                </dt>
+                <dd className="mt-1 text-sm text-foreground">
+                  {formatDate(caseRecord.filedAt)}
+                </dd>
+              </div>
             )}
-          </div>
-        </section>
+            <div>
+              <dt className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                Court
+              </dt>
+              <dd className="mt-1 text-sm text-foreground">
+                {caseRecord.court?.courtName ?? '\u2014'}
+              </dd>
+            </div>
+            <div>
+              <dt className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                County
+              </dt>
+              <dd className="mt-1 text-sm text-foreground">
+                {caseRecord.court?.county ?? '\u2014'}
+              </dd>
+            </div>
+          </dl>
+        </CardContent>
+      </Card>
+
+      {caseRecord.parties.length > 0 && (
+        <Card>
+          <CardHeader>
+            <CardTitle className="text-base">Parties</CardTitle>
+          </CardHeader>
+          <CardContent>
+            <div className="grid grid-cols-1 gap-6 sm:grid-cols-2">
+              <PartyColumn label="Plaintiffs" parties={plaintiffs} />
+              <PartyColumn label="Defendants" parties={defendants} />
+              {others.length > 0 && (
+                <PartyColumn label="Other Parties" parties={others} />
+              )}
+            </div>
+          </CardContent>
+        </Card>
       )}
 
-      {/* Judges (hidden when empty) */}
       {displayJudges.length > 0 && (
-        <section className="mt-8">
-          <h2 className="text-sm font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">
-            Judges
-          </h2>
-          <ul className="mt-2 space-y-1">
-            {displayJudges.map((judge) => (
-              <li key={judge.id} className="text-sm text-slate-900 dark:text-slate-100">
-                <Link
-                  href={`/judges/${judge.id}`}
-                  className="hover:text-brand-600 dark:hover:text-brand-400"
-                >
-                  {judge.canonicalName}
-                </Link>
-                {judge.department && (
-                  <span className="ml-2 text-xs text-slate-500 dark:text-slate-400">
-                    Dept. {judge.department}
-                  </span>
-                )}
-              </li>
-            ))}
-          </ul>
-        </section>
+        <Card>
+          <CardHeader>
+            <CardTitle className="text-base">Judges</CardTitle>
+          </CardHeader>
+          <CardContent>
+            <ul className="space-y-1">
+              {displayJudges.map((judge) => (
+                <li key={judge.id} className="text-sm text-foreground">
+                  <Link
+                    href={`/judges/${judge.id}`}
+                    className="hover:text-primary"
+                  >
+                    {judge.canonicalName}
+                  </Link>
+                  {judge.department && (
+                    <span className="ml-2 text-xs text-muted-foreground">
+                      Dept. {judge.department}
+                    </span>
+                  )}
+                </li>
+              ))}
+            </ul>
+          </CardContent>
+        </Card>
       )}
 
-      {/* Rulings */}
-      <section className="mt-8">
-        <h2 className="text-sm font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">
+      <section>
+        <h2 className="mb-3 text-base font-semibold text-foreground">
           Rulings
         </h2>
 
-        <div className="mt-3 rounded-lg border border-slate-200 dark:border-slate-700">
-          {/* Header row */}
-          <div className="hidden grid-cols-[6rem_1fr_10rem_6rem_5.5rem] gap-4 border-b border-slate-200 px-4 py-2 text-xs font-semibold uppercase tracking-wide text-slate-500 dark:border-slate-700 dark:text-slate-400 sm:grid">
-            <span>Date</span>
-            <span>Motion</span>
-            <span>Judge</span>
-            <span>Outcome</span>
-            <span>Type</span>
+        {rulingsLoading && edges.length === 0 && (
+          <div className="space-y-3">
+            {Array.from({ length: 3 }).map((_, i) => (
+              <Card key={i}>
+                <CardContent className="py-4">
+                  <div className="flex items-center gap-4">
+                    <Skeleton className="h-4 w-20" />
+                    <Skeleton className="h-4 w-32" />
+                    <Skeleton className="h-5 w-16" />
+                  </div>
+                </CardContent>
+              </Card>
+            ))}
           </div>
+        )}
 
-          {/* Skeleton */}
-          {rulingsLoading && edges.length === 0 && (
-            <>
-              {Array.from({ length: 5 }).map((_, i) => (
-                <SkeletonRow key={i} />
-              ))}
-            </>
-          )}
+        {rulingsError && (
+          <Card className="border-destructive">
+            <CardContent className="py-6 text-center">
+              <p className="text-sm text-destructive">
+                Failed to load rulings. Please try again.
+              </p>
+            </CardContent>
+          </Card>
+        )}
 
-          {/* Error */}
-          {rulingsError && (
-            <p className="p-8 text-center text-sm text-red-500 dark:text-red-400">
-              Failed to load rulings. Please try again.
-            </p>
-          )}
+        {!rulingsLoading && !rulingsError && edges.length === 0 && (
+          <Card>
+            <CardContent className="py-6 text-center">
+              <p className="text-muted-foreground">
+                No rulings captured for this case.
+              </p>
+            </CardContent>
+          </Card>
+        )}
 
-          {/* Empty state */}
-          {!rulingsLoading && !rulingsError && edges.length === 0 && (
-            <p className="p-8 text-center text-slate-400 dark:text-slate-500">
-              No rulings captured for this case.
-            </p>
-          )}
-
-          {/* Rows */}
+        <div className="space-y-3">
           {edges.map(({ node }) => {
             const isExpanded = expandedRulings.has(node.id);
             const hasText = !!(node.rulingTextHtml || node.rulingText);
-            const isLong =
-              !!node.rulingText &&
-              node.rulingText.length > RULING_TEXT_TRUNCATE_LENGTH;
 
             return (
-              <div
-                key={node.id}
-                className="border-b border-slate-100 last:border-0 dark:border-slate-700"
-              >
-                {/* Metadata row */}
-                <div
-                  className="grid grid-cols-1 gap-1 px-4 py-3 hover:bg-slate-50 dark:hover:bg-slate-800/50 sm:grid-cols-[6rem_1fr_10rem_6rem_5.5rem] sm:items-center sm:gap-4"
+              <Card key={node.id}>
+                <button
+                  type="button"
+                  className="flex w-full flex-wrap items-center gap-x-4 gap-y-2 px-6 py-4 text-left hover:bg-muted/50"
+                  onClick={() => toggleRuling(node.id)}
+                  aria-expanded={isExpanded}
+                  aria-label={`Ruling from ${formatDate(node.hearingDate)}`}
                 >
-                  {/* Date */}
-                  <span className="text-xs text-slate-500 dark:text-slate-400">
+                  <span className="text-sm font-medium text-foreground">
                     {formatDate(node.hearingDate)}
                   </span>
-
-                  {/* Motion type */}
-                  <span className="text-sm text-slate-900 dark:text-slate-100">
+                  <span className="flex-1 text-sm text-muted-foreground">
                     {node.motionType ? formatLabel(node.motionType) : '\u2014'}
                     {node.department && (
-                      <span className="ml-2 text-xs text-slate-500 dark:text-slate-400">
+                      <span className="ml-2 text-xs">
                         Dept. {node.department}
                       </span>
                     )}
                   </span>
-
-                  {/* Judge */}
-                  <span className="text-sm text-slate-700 dark:text-slate-300">
-                    {node.judge?.canonicalName ?? '\u2014'}
+                  <span className="text-sm text-muted-foreground">
+                    {node.judge?.canonicalName ?? ''}
                   </span>
-
-                  {/* Outcome badge */}
-                  <span
-                    className={`inline-flex w-fit items-center rounded px-2 py-0.5 text-xs font-medium ${
-                      node.outcome && OUTCOME_BADGE[node.outcome]
-                        ? OUTCOME_BADGE[node.outcome]
-                        : 'bg-slate-100 text-slate-600 dark:bg-slate-700 dark:text-slate-300'
-                    }`}
+                  <Badge
+                    variant={
+                      node.outcome
+                        ? (OUTCOME_VARIANT[node.outcome] ?? 'outline')
+                        : 'outline'
+                    }
                   >
                     {formatOutcome(node.outcome)}
-                  </span>
-
-                  {/* Tentative / Final badge */}
-                  <span
-                    className={`inline-flex w-fit items-center rounded px-2 py-0.5 text-xs font-medium ${
-                      node.isTentative
-                        ? 'bg-amber-100 text-amber-800 dark:bg-amber-900 dark:text-amber-200'
-                        : 'bg-indigo-100 text-indigo-800 dark:bg-indigo-900 dark:text-indigo-200'
-                    }`}
-                  >
+                  </Badge>
+                  <Badge variant={node.isTentative ? 'secondary' : 'outline'}>
                     {node.isTentative ? 'Tentative' : 'Final'}
-                  </span>
-                </div>
-
-                {/* Ruling text — prefer formatted HTML, fall back to plain text */}
-                {hasText && (
-                  <div className="px-4 pb-3">
-                    {node.rulingTextHtml ? (
-                      <div className="relative">
-                        <div
-                          className={`ruling-content text-sm leading-relaxed text-slate-700 dark:text-slate-300 overflow-hidden${
-                            isLong && !isExpanded ? ' max-h-40' : ''
-                          }`}
-                          dangerouslySetInnerHTML={{
-                            __html: sanitizeRulingHtml(node.rulingTextHtml),
-                          }}
-                        />
-                        {isLong && !isExpanded && (
-                          <div className="absolute bottom-0 left-0 right-0 h-12 bg-gradient-to-t from-white dark:from-slate-900 pointer-events-none" />
+                  </Badge>
+                  <svg
+                    className={`h-4 w-4 shrink-0 text-muted-foreground transition-transform ${isExpanded ? 'rotate-180' : ''}`}
+                    xmlns="http://www.w3.org/2000/svg"
+                    viewBox="0 0 20 20"
+                    fill="currentColor"
+                  >
+                    <path fillRule="evenodd" d="M5.23 7.21a.75.75 0 011.06.02L10 11.168l3.71-3.938a.75.75 0 111.08 1.04l-4.25 4.5a.75.75 0 01-1.08 0l-4.25-4.5a.75.75 0 01.02-1.06z" clipRule="evenodd" />
+                  </svg>
+                </button>
+                {isExpanded && (
+                  <CardContent className="border-t pt-4">
+                    {hasText && (
+                      <div>
+                        {node.rulingTextHtml ? (
+                          <div
+                            className="ruling-content text-sm leading-relaxed text-muted-foreground"
+                            dangerouslySetInnerHTML={{
+                              __html: sanitizeRulingHtml(node.rulingTextHtml),
+                            }}
+                          />
+                        ) : (
+                          node.rulingText && (
+                            <div className="space-y-3">
+                              {cleanRulingText(node.rulingText).map((paragraph, idx) => (
+                                <p key={idx} className="text-sm leading-relaxed text-muted-foreground">
+                                  {paragraph}
+                                </p>
+                              ))}
+                            </div>
+                          )
                         )}
                       </div>
-                    ) : (
-                      node.rulingText && (
-                        <div className="space-y-3">
-                          {(() => {
-                            const displayText = isLong && !isExpanded
-                              ? truncateText(node.rulingText, RULING_TEXT_TRUNCATE_LENGTH)
-                              : node.rulingText;
-                            const paragraphs = cleanRulingText(displayText);
-                            return paragraphs.map((paragraph, idx) => (
-                              <p key={idx} className="text-sm leading-relaxed text-slate-700 dark:text-slate-300">
-                                {paragraph}
-                              </p>
-                            ));
-                          })()}
-                        </div>
-                      )
                     )}
-                    <div className="mt-1 flex items-center gap-3">
-                      {isLong && (
-                        <button
-                          onClick={() => toggleRuling(node.id)}
-                          className="text-xs font-medium text-brand-600 hover:text-brand-700 dark:text-brand-400 dark:hover:text-brand-300"
-                        >
-                          {isExpanded ? 'Show less' : 'Show more'}
-                        </button>
-                      )}
-                      {node.documentId && (
+                    {node.documentId && (
+                      <div className={hasText ? 'mt-3' : ''}>
                         <a
                           href={buildDownloadUrl(node.documentId)}
                           target="_blank"
                           rel="noopener noreferrer"
-                          className="inline-flex items-center gap-1 text-xs font-medium text-brand-600 hover:text-brand-700 dark:text-brand-400 dark:hover:text-brand-300"
+                          className="inline-flex items-center gap-1 text-xs font-medium text-primary hover:text-primary/80"
                         >
                           Download original
                           {node.documentFormat && (
-                            <span className="rounded bg-slate-100 px-1.5 py-0.5 text-[10px] font-semibold uppercase text-slate-600 dark:bg-slate-700 dark:text-slate-300">
+                            <Badge variant="secondary" className="ml-1 text-[10px]">
                               {FORMAT_LABELS[node.documentFormat] ?? node.documentFormat.toUpperCase()}
-                            </span>
+                            </Badge>
                           )}
                         </a>
-                      )}
-                    </div>
-                  </div>
+                      </div>
+                    )}
+                  </CardContent>
                 )}
-
-                {/* Download button when there is no ruling text but document exists */}
-                {!hasText && node.documentId && (
-                  <div className="px-4 pb-3">
-                    <a
-                      href={buildDownloadUrl(node.documentId)}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      className="inline-flex items-center gap-1 text-xs font-medium text-brand-600 hover:text-brand-700 dark:text-brand-400 dark:hover:text-brand-300"
-                    >
-                      Download original
-                      {node.documentFormat && (
-                        <span className="rounded bg-slate-100 px-1.5 py-0.5 text-[10px] font-semibold uppercase text-slate-600 dark:bg-slate-700 dark:text-slate-300">
-                          {FORMAT_LABELS[node.documentFormat] ?? node.documentFormat.toUpperCase()}
-                        </span>
-                      )}
-                    </a>
-                  </div>
-                )}
-              </div>
+              </Card>
             );
           })}
-
-          {/* Load more */}
-          {pageInfo?.hasNextPage && (
-            <div className="flex justify-center py-4">
-              <button
-                onClick={handleLoadMore}
-                disabled={rulingsLoading}
-                className="rounded-lg border border-slate-300 bg-white px-4 py-2 text-sm font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-50 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-300 dark:hover:bg-slate-700"
-              >
-                {rulingsLoading ? 'Loading\u2026' : 'Load more'}
-              </button>
-            </div>
-          )}
         </div>
+
+        {pageInfo?.hasNextPage && (
+          <div className="flex justify-center py-4">
+            <Button
+              variant="outline"
+              onClick={handleLoadMore}
+              disabled={rulingsLoading}
+            >
+              {rulingsLoading ? 'Loading\u2026' : 'Load more'}
+            </Button>
+          </div>
+        )}
       </section>
     </div>
   );
