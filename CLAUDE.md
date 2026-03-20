@@ -368,6 +368,30 @@ If a task naturally breaks into 2+ independent pieces of work, create child issu
 - Sub-tasks should be self-contained — another agent should be able to pick one up independently.
 - Label child issues appropriately and add `agent/ready` if fully specified.
 
+## Writing Acceptance Criteria
+
+When filing issues, acceptance criteria must be concrete and machine-checkable wherever possible. Vague criteria like "page looks correct" allow agents to hand-wave past verification. Instead, include specific verification commands and expected results.
+
+**Guidelines:**
+- **Data changes**: include the SQL query and expected result.
+- **Frontend changes**: include the URL and what should be visible (element, text, layout).
+- **API changes**: include the endpoint, request, and expected response shape.
+- **Behavior changes**: include the specific trigger and expected outcome.
+
+**Example — vague (bad):**
+```
+- [ ] Zavala v Becker shows only its ruling text
+```
+
+**Example — machine-checkable (good):**
+```
+- [ ] Zavala v Becker shows only its ruling text
+  Verify: `SELECT length(ruling_text) FROM rulings WHERE case_id = 'f51849ca-...'` returns values < 5000
+  Verify: Screenshot of /cases/f51849ca-... shows single-case content
+```
+
+Each criterion should have at least one `Verify:` line that an agent can execute to confirm the criterion is met. This applies to issues filed by both humans and agents. If a verification command is not possible (e.g., requires subjective judgment), note that explicitly so reviewers know it requires manual verification.
+
 ## Investigation Tasks
 
 Investigation tasks produce documentation, not code:

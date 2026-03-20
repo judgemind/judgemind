@@ -91,6 +91,17 @@ an independent perspective — a different AI model wrote this code.
 
 ## Review Criteria
 
+### Acceptance criteria gate (MANDATORY)
+
+Extract every acceptance criterion from the Task Requirements above (the `- [ ]` checkboxes).
+For EACH criterion, verify whether the implementation satisfies it based on the code, tests,
+and diff. List each criterion and mark it as: **met**, **not met**, or **requires post-deploy verification**.
+
+**If ANY locally-verifiable criterion is not met, the review MUST be REVISE**, regardless of
+code quality or test coverage. Unmet acceptance criteria always take priority.
+
+### Additional review criteria
+
 Evaluate the implementation against these criteria:
 
 1. **Correctness**: Does the implementation satisfy the acceptance criteria listed in the task?
@@ -111,15 +122,19 @@ Evaluate the implementation against these criteria:
 
 Start with a single word on the first line: either SHIP or REVISE.
 
-Then provide your detailed review:
-- If SHIP: briefly explain why the implementation meets the criteria.
-- If REVISE: list specific, actionable feedback. Reference exact files, functions,
-  and line numbers. Describe what needs to change and why. Be concrete — the implementer
+Then provide your detailed review. Your review MUST include:
+
+1. **Acceptance criteria checklist**: List each criterion and its status (met / not met / requires post-deploy).
+2. **Detailed findings**: Your analysis of the additional review criteria above.
+
+- If SHIP: briefly explain why the implementation meets ALL acceptance criteria and the review criteria.
+- If REVISE: list specific, actionable feedback. **List unmet acceptance criteria first.** Reference exact
+  files, functions, and line numbers. Describe what needs to change and why. Be concrete — the implementer
   must be able to act on your feedback without guessing.
 
 Be rigorous but not pedantic. Don't request style changes that don't affect correctness
 or readability. Don't request changes outside the scope of the task. If tests pass and
-acceptance criteria are met, lean toward SHIP."""
+ALL acceptance criteria are met, lean toward SHIP."""
 
 
 def build_adversarial_prompt(task_md: str, diff_text: str, changed_files: str) -> str:
