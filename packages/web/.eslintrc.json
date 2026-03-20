@@ -6,6 +6,12 @@
   },
   "overrides": [
     {
+      "files": ["src/app/**/*.{ts,tsx}", "src/components/**/*.{ts,tsx}"],
+      "rules": {
+        "local/no-ssr-incompatible-import": "error"
+      }
+    },
+    {
       "files": ["**/__tests__/**", "**/*.test.ts", "**/*.test.tsx", "tests/**"],
       "rules": {
         "local/no-client-utility-import": "off"
