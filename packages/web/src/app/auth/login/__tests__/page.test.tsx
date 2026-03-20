@@ -96,15 +96,13 @@ describe('LoginPage', () => {
     ).toBeInTheDocument();
   });
 
-  it('renders register and forgot password links', () => {
+  it('renders register link but no forgot password link', () => {
     render(<LoginPage />);
     expect(screen.getByText('Register').closest('a')).toHaveAttribute(
       'href',
       '/auth/register',
     );
-    expect(
-      screen.getByText('Forgot password?').closest('a'),
-    ).toHaveAttribute('href', '/auth/forgot-password');
+    expect(screen.queryByText('Forgot password?')).not.toBeInTheDocument();
   });
 
   it('submits the form and redirects on success', async () => {
