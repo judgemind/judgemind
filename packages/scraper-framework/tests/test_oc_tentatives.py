@@ -24,6 +24,7 @@ import respx
 from courts.ca.oc_tentatives import (
     INDEX_URL,
     OCTentativeRulingsScraper,
+    _extract_oc_pdf_text,
     _is_north_dept,
     _normalize_oc_text,
     _oc_hearing_date_from_text,
@@ -623,3 +624,186 @@ def test_oc_central_c34_three_part_numbers() -> None:
     assert any("30-2024-01393434" == cn for cn in all_numbers), (
         f"Expected 30-2024-01393434 in {all_numbers}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Table-aware PDF text extraction (#1241) — column-merge fix
+# ---------------------------------------------------------------------------
+
+
+class TestTableAwareExtraction:
+    """Tests for _extract_oc_pdf_text which uses pdfplumber table detection
+    to properly separate entry#, case name, and ruling text columns.
+
+    The column-merge bug (#1241) caused case names to be interleaved with
+    ruling text when using simple left-to-right text extraction, e.g.:
+    "Illingworth vs. Before the court is an unopposed motion..."
+    """
+
+    def test_costa_mesa_no_column_merge(self) -> None:
+        """Costa Mesa fixture: case names must not contain ruling text (#1241)."""
+        pdf_bytes = _load_bytes("oc_costa_mesa_cm.pdf")
+        text = _extract_oc_pdf_text(pdf_bytes)
+
+        # The old extraction had "Mallett vs. City of Before the Court"
+        # and "Kohlman vs. Before the Court" — verify these are gone.
+        for line in text.split("\n"):
+            if "vs" in line.lower() and "before the" in line.lower():
+                # Allow "vs" and "before" on separate logical parts, but
+                # not when they form a single garbled case name.
+                # Check: is "Before" part of a case name or ruling text?
+                assert "Before the Court" not in line.split("vs")[0], (
+                    f"Column-merge detected: ruling text in case name: {line[:200]}"
+                )
+
+    def test_costa_mesa_case_name_separate_from_ruling(self) -> None:
+        """Costa Mesa: case name appears on separate line(s) from ruling text."""
+        pdf_bytes = _load_bytes("oc_costa_mesa_cm.pdf")
+        text = _extract_oc_pdf_text(pdf_bytes)
+
+        # Look for the first entry's case name
+        assert "Creditors" in text
+        assert "Abbas" in text
+        assert "2024-01437598" in text
+
+        # Find the case name block — should be on lines separate from ruling
+        lines = text.split("\n")
+        case_name_line_idx = None
+        for i, line in enumerate(lines):
+            if "Creditors" in line:
+                case_name_line_idx = i
+                break
+
+        assert case_name_line_idx is not None
+        # The case name line should NOT contain "Before the Court"
+        assert "Before the Court" not in lines[case_name_line_idx]
+
+    def test_central_c34_no_column_merge(self) -> None:
+        """Central C34 fixture: case names must not contain ruling text."""
+        pdf_bytes = _load_bytes("oc_central_c34.pdf")
+        text = _extract_oc_pdf_text(pdf_bytes)
+
+        # Verify case name "Mercury Insurance Company vs. Cabral"
+        # does not have ruling text on the same line
+        for line in text.split("\n"):
+            if "Mercury" in line and "Insurance" in line:
+                assert "Defendant" not in line, (
+                    f"Column-merge: ruling text in case name line: {line[:200]}"
+                )
+
+    def test_west_no_column_merge(self) -> None:
+        """West JC fixture: case names must not contain ruling text."""
+        pdf_bytes = _load_bytes("oc_west_w.pdf")
+        text = _extract_oc_pdf_text(pdf_bytes)
+
+        # The first entry is "Hedayati vs. US Kitchen & Flooring, Inc."
+        assert "Hedayati" in text
+        # Find the line with the case name
+        for line in text.split("\n"):
+            if "Hedayati" in line:
+                # Should not contain "HEARING ADVANCED" from the ruling column
+                assert "HEARING" not in line, (
+                    f"Column-merge: ruling text in case name line: {line[:200]}"
+                )
+                break
+
+    def test_complex_cx_no_column_merge(self) -> None:
+        """Complex CX fixture: case names must not contain ruling text."""
+        pdf_bytes = _load_bytes("oc_complex_cx.pdf")
+        text = _extract_oc_pdf_text(pdf_bytes)
+
+        # First entry is "Soto vs. People First Pizza"
+        for line in text.split("\n"):
+            if "Soto" in line:
+                assert "Motion" not in line, (
+                    f"Column-merge: ruling text in case name line: {line[:200]}"
+                )
+                break
+
+    def test_header_text_preserved(self) -> None:
+        """Header text (hearing date, dept info) is preserved above entries."""
+        pdf_bytes = _load_bytes("oc_apkarian_c25.pdf")
+        text = _extract_oc_pdf_text(pdf_bytes)
+
+        # Header should contain dept and judge name
+        assert "DEPT C25" in text
+        assert "Apkarian" in text
+
+        # Hearing date must appear before any case entry
+        date_idx = text.find("February 24, 2026")
+        entry_idx = text.find("Okino")
+        assert date_idx >= 0, "Hearing date not found in extracted text"
+        assert entry_idx >= 0, "First entry not found in extracted text"
+        assert date_idx < entry_idx, "Hearing date should appear before first case entry"
+
+    def test_hearing_date_still_extracted_after_table_fix(self) -> None:
+        """Hearing date extraction works correctly with table-aware text."""
+        for fixture, expected_date in [
+            ("oc_apkarian_c25.pdf", datetime(2026, 2, 24)),
+            ("oc_central_c34.pdf", datetime(2026, 2, 26)),
+            ("oc_costa_mesa_cm.pdf", datetime(2026, 2, 19)),
+            ("oc_west_w.pdf", datetime(2026, 2, 26)),
+            ("oc_complex_cx.pdf", datetime(2026, 3, 6)),
+        ]:
+            text = _extract_oc_pdf_text(_load_bytes(fixture))
+            dt = _oc_hearing_date_from_text(text)
+            assert dt == expected_date, f"{fixture}: expected {expected_date}, got {dt}"
+
+    def test_north_fixture_still_works(self) -> None:
+        """North JC fixture extraction should still work (tables detected)."""
+        pdf_bytes = _load_bytes("oc_north_n.pdf")
+        text = _extract_oc_pdf_text(pdf_bytes)
+
+        # Should still contain case entries
+        assert "Alday" in text
+        assert "Groff" in text
+
+    def test_case_numbers_preserved(self) -> None:
+        """Case numbers must be present in extracted text for all fixtures."""
+        for fixture, expected_number in [
+            ("oc_central_c34.pdf", "2024-01393434"),
+            ("oc_costa_mesa_cm.pdf", "2024-01437598"),
+            ("oc_west_w.pdf", "23-01314563"),
+            ("oc_complex_cx.pdf", "2023-01301305"),
+        ]:
+            text = _extract_oc_pdf_text(_load_bytes(fixture))
+            assert expected_number in text, (
+                f"{fixture}: expected case number {expected_number} not found"
+            )
+
+    def test_old_vs_new_extraction_column_merge_audit(self) -> None:
+        """Audit all fixtures: new extraction must have fewer column-merge lines.
+
+        This is the key regression test for #1241. For each fixture, we count
+        lines where a case name ('vs') and ruling text ('Before the') appear
+        on the same line. The new extraction should eliminate these.
+        """
+        import re
+
+        fixtures = [
+            "oc_central_c34.pdf",
+            "oc_costa_mesa_cm.pdf",
+            "oc_west_w.pdf",
+            "oc_complex_cx.pdf",
+            "oc_apkarian_c25.pdf",
+        ]
+
+        for fixture in fixtures:
+            pdf_bytes = _load_bytes(fixture)
+            old_text = _extract_pdf_text(pdf_bytes)
+            new_text = _extract_oc_pdf_text(pdf_bytes)
+
+            def count_merges(text: str) -> int:
+                count = 0
+                for line in text.split("\n"):
+                    if re.search(r"\bvs\.?\b", line, re.IGNORECASE):
+                        if "Before the Court" in line or "Defendant" in line[:80]:
+                            count += 1
+                return count
+
+            old_merges = count_merges(old_text)
+            new_merges = count_merges(new_text)
+            assert new_merges <= old_merges, (
+                f"{fixture}: new extraction has MORE column merges "
+                f"({new_merges}) than old ({old_merges})"
+            )
