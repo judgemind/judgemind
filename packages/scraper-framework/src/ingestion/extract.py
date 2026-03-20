@@ -528,11 +528,19 @@ _TITLE_TRAILING_NOISE_RE = re.compile(
 )
 
 
+_DEPT_HEADER_BOILERPLATE_TITLE_RE = re.compile(
+    r"DEPARTMENT\s+\S+\s+LAW AND MOTION RULINGS",
+    re.IGNORECASE,
+)
+
+
 def extract_case_title(ruling_text: str) -> str | None:
     """Extract a case title from ruling text using regex patterns.
 
     Looks for "Plaintiff v. Defendant" patterns in the text.
     Returns the title in title case, or ``None`` if no pattern matches.
+
+    Rejects titles that contain department header boilerplate (#1244).
     """
     for pattern in _CASE_TITLE_PATTERNS:
         m = pattern.search(ruling_text)
@@ -540,6 +548,9 @@ def extract_case_title(ruling_text: str) -> str | None:
             title = m.group("title").strip()
             # Strip trailing case number references: ", No. 25STCV34748"
             title = _TITLE_TRAILING_NOISE_RE.sub("", title).strip()
+            # Reject titles containing department header boilerplate (#1244)
+            if _DEPT_HEADER_BOILERPLATE_TITLE_RE.search(title):
+                continue
             # Detect all-caps before normalizing the "v." separator.
             # Strip the separator and check if the remaining name parts
             # are all uppercase (the separator itself may be lowercase "vs").

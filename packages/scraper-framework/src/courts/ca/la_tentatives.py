@@ -134,6 +134,76 @@ _DEPT_HEADER_BOILERPLATE_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Entity descriptor phrases that should be stripped from party names in titles.
+# These inflate short-form "Smith v. Jones" into long captions.  Order matters:
+# longer/more-specific phrases first so they match before their substrings.
+_ENTITY_DESCRIPTOR_RE = re.compile(
+    r",?\s*(?:"
+    r"An Individual(?:\s+And Derivatively On Behalf Of [^,;]+)?"
+    r"|A (?:California|Delaware|Nevada|Texas|Colorado|New York|Florida|Minnesota"
+    r"|Georgia|Illinois|New Jersey|Oregon|Washington|Maryland|Ohio|Arizona)"
+    r" (?:Corporation|Limited Liability Company|Limited Partnership"
+    r"|General Partnership|Business Entity|Nonprofit Corporation|Public Entity)"
+    r"|A (?:Corporation|Limited Liability Company|Limited Partnership"
+    r"|General Partnership|Business Entity|Nonprofit Corporation|Public Entity)"
+    r"|Individually And As [^,;]+"
+    r"|By And Through [^,;]+"
+    r"|As Trustee Of [^,;]+"
+    r"|Successor In Interest To [^,;]+"
+    r"|Derivatively On Behalf Of [^,;]+"
+    r"|Form Unknown"
+    r"|Doe(?:s)? \d+ (?:To|Through) \d+(?:,? Inclusive)?"
+    r")",
+    re.IGNORECASE,
+)
+
+# Maximum length for a cleaned case title.  Titles longer than this after
+# entity-descriptor stripping still contain too much caption noise.
+_MAX_TITLE_LENGTH = 120
+
+
+def _sanitize_title(raw_title: str | None) -> str | None:
+    """Clean a raw case title: strip entity descriptors, header boilerplate, excess length.
+
+    Returns ``None`` if the title is invalid (contains department header
+    boilerplate, is too short after cleaning, or is empty).
+    """
+    if not raw_title:
+        return None
+
+    # Reject titles that contain department header boilerplate (#1244)
+    if _DEPT_HEADER_BOILERPLATE_RE.search(raw_title):
+        return None
+
+    title = raw_title
+
+    # Normalize "vs.", "vs", "V." etc. to " v. " so splitting works consistently.
+    title = re.sub(r"\s+[Vv][Ss]?\.?\s+", " v. ", title)
+
+    # Strip entity descriptors from each side of "v."
+    if " v. " in title:
+        parts = title.split(" v. ", 1)
+        cleaned_parts = []
+        for part in parts:
+            cleaned = _ENTITY_DESCRIPTOR_RE.sub("", part).strip()
+            # Strip trailing semicolons, commas, "and" connectors left by removal
+            cleaned = re.sub(r"[;,]\s*$", "", cleaned).strip()
+            cleaned = re.sub(r"\s+And\s*$", "", cleaned, flags=re.IGNORECASE).strip()
+            # Collapse "Et Al." variants
+            cleaned = re.sub(
+                r",?\s*Et\.?\s*Al\.?\s*$", ", et al.", cleaned, flags=re.IGNORECASE
+            ).strip()
+            # Remove dangling punctuation
+            cleaned = cleaned.strip(",;. ")
+            cleaned_parts.append(cleaned)
+        title = " v. ".join(cleaned_parts)
+
+    # Final length check
+    if len(title) > _MAX_TITLE_LENGTH or len(title) < 5:
+        return None
+
+    return title
+
 
 @dataclass
 class DropdownOption:
@@ -492,22 +562,28 @@ def _extract_case_title(content: BeautifulSoup) -> str | None:
     1. ``<a name="Parties">`` anchor with formal caption block (most reliable)
     2. Inline "Case Name:" or "Case Title:" field
     3. "MOVING PARTY:" / "RESPONDING PARTY:" fields
+
+    All results are passed through ``_sanitize_title`` to strip entity
+    descriptors and reject titles containing department header boilerplate.
     """
     # Strategy 1: Parties anchor with formal caption block
     title = _extract_title_from_parties_anchor(content)
-    if title is not None:
-        return title
+    sanitized = _sanitize_title(title)
+    if sanitized is not None:
+        return sanitized
 
     # For fallback strategies, work with the full text content
     full_text = content.get_text(separator="\n", strip=True)
 
     # Strategy 2: Inline "Case Name:" / "Case Title:" field
     title = _extract_title_from_case_name_field(full_text)
-    if title is not None:
-        return title
+    sanitized = _sanitize_title(title)
+    if sanitized is not None:
+        return sanitized
 
     # Strategy 3: MOVING PARTY / RESPONDING PARTY fields
-    return _extract_title_from_moving_responding(full_text)
+    title = _extract_title_from_moving_responding(full_text)
+    return _sanitize_title(title)
 
 
 def _extract_title_from_parties_anchor(content: BeautifulSoup) -> str | None:

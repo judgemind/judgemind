@@ -28,6 +28,7 @@ from courts.ca.la_tentatives import (
     _is_stale_viewstate_response,
     _parse_dropdown_options,
     _parse_option,
+    _sanitize_title,
     _split_cases_html,
     _split_party_names,
     default_config,
@@ -1113,3 +1114,189 @@ class TestDateAwareDirectoryLookup:
         )
         result = scraper.parse_document(doc)
         assert result.judge_name is None
+
+
+# ---------------------------------------------------------------------------
+# _sanitize_title — title cleanup (#1244)
+# ---------------------------------------------------------------------------
+
+
+def test_sanitize_title_rejects_department_header() -> None:
+    """Titles containing department header boilerplate are rejected."""
+    title = (
+        "Department I Law And Motion Rulings Case Number: 24Vecv05649 "
+        "Hearing Date: March 6, 2026 Dept: I Superior Court v. Someone"
+    )
+    assert _sanitize_title(title) is None
+
+
+def test_sanitize_title_strips_entity_descriptors() -> None:
+    """Entity descriptors like 'An Individual' are stripped from party names."""
+    title = "Jim Hilaski, An Individual v. Shaul Dina, An Individual"
+    result = _sanitize_title(title)
+    assert result is not None
+    assert "An Individual" not in result
+    assert "Hilaski" in result
+    assert "Dina" in result
+    assert " v. " in result
+
+
+def test_sanitize_title_strips_california_corporation() -> None:
+    """'A California Corporation' entity descriptors are stripped."""
+    title = (
+        "Old Master Products, Inc., A California Corporation v. Big Corp, A Delaware Corporation"
+    )
+    result = _sanitize_title(title)
+    assert result is not None
+    assert "A California Corporation" not in result
+    assert "A Delaware Corporation" not in result
+    assert "Old Master Products" in result
+
+
+def test_sanitize_title_strips_derivatively_on_behalf() -> None:
+    """'An Individual And Derivatively On Behalf Of...' is stripped."""
+    title = (
+        "Jim Hilaski, An Individual And Derivatively On Behalf Of Old Master Products, Inc."
+        " v. Shaul Dina, An Individual"
+    )
+    result = _sanitize_title(title)
+    assert result is not None
+    assert "Derivatively" not in result
+    assert "Hilaski" in result
+    assert "Dina" in result
+
+
+def test_sanitize_title_strips_does_1_to_20() -> None:
+    """'Does 1 To 20, Inclusive' is stripped."""
+    title = "Smith v. Jones; Does 1 To 20, Inclusive"
+    result = _sanitize_title(title)
+    assert result is not None
+    assert "Does" not in result
+    assert "Smith" in result
+    assert "Jones" in result
+
+
+def test_sanitize_title_normalizes_vs_separator() -> None:
+    """'vs.' and 'vs' separators are normalized to 'v.' before stripping."""
+    title = "Jim Hilaski, An Individual vs. Shaul Dina, An Individual"
+    result = _sanitize_title(title)
+    assert result is not None
+    assert "An Individual" not in result
+    assert " v. " in result
+    assert "vs." not in result
+
+
+def test_sanitize_title_passes_normal_title() -> None:
+    """Normal short titles pass through unchanged."""
+    title = "Aasi v. Honda"
+    assert _sanitize_title(title) == "Aasi v. Honda"
+
+
+def test_sanitize_title_rejects_none() -> None:
+    """None input returns None."""
+    assert _sanitize_title(None) is None
+
+
+def test_sanitize_title_rejects_empty() -> None:
+    """Empty string returns None."""
+    assert _sanitize_title("") is None
+
+
+def test_sanitize_title_rejects_too_short() -> None:
+    """Titles shorter than 5 chars after cleaning are rejected."""
+    assert _sanitize_title("A v.") is None
+
+
+def test_sanitize_title_rejects_too_long() -> None:
+    """Titles exceeding 120 chars after cleaning are rejected."""
+    long_title = "A" * 60 + " v. " + "B" * 60
+    assert _sanitize_title(long_title) is None
+
+
+# ---------------------------------------------------------------------------
+# Department header NOT in case title — regression test (#1244)
+# ---------------------------------------------------------------------------
+
+
+def test_extract_case_title_dept_header_fixture_no_header_in_title() -> None:
+    """Case title from dept I fixture must NOT contain department header boilerplate."""
+    from bs4 import BeautifulSoup
+
+    html = _load("la_ruling_dept_i_header_in_title.html")
+    soup = BeautifulSoup(html, "lxml")
+    content = soup.find("div", id="speechSynthesis")
+    title = _extract_case_title(content)
+    # Title should be extracted from MOVING/RESPONDING PARTY fields
+    # and NOT contain "Department" or "Law And Motion Rulings"
+    if title is not None:
+        assert "Department" not in title
+        assert "Law And Motion Rulings" not in title
+        assert "DEPARTMENT" not in title
+        assert "Superior Court" not in title
+
+
+def test_extract_case_title_dept_header_fixture_has_party_names() -> None:
+    """Case title from dept I fixture should contain actual party names."""
+    from bs4 import BeautifulSoup
+
+    html = _load("la_ruling_dept_i_header_in_title.html")
+    soup = BeautifulSoup(html, "lxml")
+    content = soup.find("div", id="speechSynthesis")
+    title = _extract_case_title(content)
+    assert title is not None
+    assert "Hilaski" in title or "hilaski" in title.lower()
+    assert " v. " in title
+
+
+def test_split_and_extract_dept_header_not_in_title() -> None:
+    """End-to-end: splitting + extraction for dept I fixture produces clean title."""
+    from bs4 import BeautifulSoup
+
+    html = _load("la_ruling_dept_i_header_in_title.html")
+    sections = _split_cases_html(html)
+    assert len(sections) == 1
+
+    doc = CapturedDocument(
+        scraper_id="test",
+        state="CA",
+        county="Los Angeles",
+        court="Superior Court",
+        source_url=CIVIL_URL,
+        capture_timestamp=datetime(2026, 3, 6),
+        content_format=ContentFormat.HTML,
+        raw_content=sections[0].encode("utf-8"),
+        content_hash="",
+    )
+    soup = BeautifulSoup(doc.raw_content, "lxml")
+    _extract_ruling_fields(soup, doc)
+    assert doc.case_title is not None
+    assert "Department" not in doc.case_title
+    assert "Law And Motion" not in doc.case_title
+    assert "Hilaski" in doc.case_title or "hilaski" in doc.case_title.lower()
+    # Entity descriptors should be stripped
+    assert "An Individual" not in doc.case_title
+    assert "A California Corporation" not in doc.case_title
+
+
+def test_existing_fixture_titles_not_affected_by_sanitize() -> None:
+    """Existing fixture titles (Aasi, Keichline, Porsche) are not broken by sanitization."""
+    from bs4 import BeautifulSoup
+
+    # la_ruling_response.html — Aasi v. Honda (uses Parties anchor)
+    html = _load("la_ruling_response.html")
+    sections = _split_cases_html(html)
+    assert len(sections) == 2
+
+    soup1 = BeautifulSoup(sections[0], "lxml")
+    content1 = soup1.find("div", id="speechSynthesis")
+    title1 = _extract_case_title(content1)
+    assert title1 is not None
+    assert "Aasi" in title1
+
+    # la_ruling_bh205.html — Porsche v. Mikia (uses Case Name field)
+    html_bh = _load("la_ruling_bh205.html")
+    soup_bh = BeautifulSoup(html_bh, "lxml")
+    content_bh = soup_bh.find("div", id="speechSynthesis")
+    title_bh = _extract_case_title(content_bh)
+    assert title_bh is not None
+    assert "Porsche" in title_bh or "Mikia" in title_bh
