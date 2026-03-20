@@ -71,7 +71,7 @@ _SYSTEM_PROMPT = (
     "use it to make the summary more specific, but do not repeat it verbatim."
 )
 
-_SUMMARY_MODEL = "claude-3-5-haiku-latest"
+_SUMMARY_MODEL = "claude-haiku-4-5-20251001"
 
 # ---------------------------------------------------------------------------
 # SQL queries

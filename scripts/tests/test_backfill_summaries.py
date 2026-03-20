@@ -174,7 +174,7 @@ def test_generate_summary_basic() -> None:
 
     # Verify correct model used
     call_kwargs = mock_client.messages.create.call_args
-    assert call_kwargs.kwargs["model"] == "claude-3-5-haiku-latest"
+    assert call_kwargs.kwargs["model"] == "claude-haiku-4-5-20251001"
 
 
 def test_generate_summary_with_context() -> None:
