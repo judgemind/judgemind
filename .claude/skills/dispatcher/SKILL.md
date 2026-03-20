@@ -134,21 +134,27 @@ The dispatcher runs a continuous loop:
 9. **Check context rotation** — increment `loop_iterations` and check if it is time to wind down (see "Context-Aware Rotation" below)
 10. **Repeat** until shutdown
 
-### Slot management
+### Slot management — global concurrent ceiling
+
+**`max_slots` is a global concurrent ceiling, not a per-batch limit.** "Up to N agents" means at most N agents running at the same time across all dispatch cycles — not N new agents per cycle. Multiple dispatch cycles must never stack agents additively (e.g. 5 + 5 + ...). Before each dispatch cycle, the dispatcher counts currently running agents and launches only enough to reach the ceiling: `max(0, max_slots - running_count)`.
+
+**Resource exhaustion warning:** Each subagent runs a full Claude Code process with its own worktree, venv installs, git operations, and test runs. On a dev laptop, 5 concurrent agents is already heavy. Exceeding the ceiling risks OOM kills, system freezes, or session-ending crashes. The ceiling exists to protect the host machine — respect it unconditionally.
 
 - Default max slots: **5** (overridable via argument)
 - Track active agents by worker number and issue number
 - When an agent completes, its slot opens immediately
-- **HARD RULE: Never exceed the max slot count.** The `start-worker.sh` script enforces this via `--max-workers`, but the dispatcher must ALSO check before spawning.
+- **HARD RULE: Never exceed `max_slots` total concurrent agents.** The `start-worker.sh` script enforces this via `--max-workers`, but the dispatcher must ALSO check before spawning.
 - Launch `/task` agents **without** `isolation: "worktree"` — the skill manages its own worktree
 
 ### Spawning agents — MANDATORY SLOT COUNT CHECK
 
 **Before spawning ANY new `/task` agent, you MUST perform this explicit slot count check. This is not optional. Skipping this check is a bug.**
 
-1. Count the number of currently active agents (agents you have spawned that have not yet completed or failed). This is the length of your tracked active agents list.
-2. Compare: `active_agent_count >= max_slots`. If true, **DO NOT SPAWN**. Skip to the next step of the main loop. Log: "Slot limit reached (N active, limit M) — not spawning."
-3. Only if `active_agent_count < max_slots`, proceed to spawn.
+1. **Count currently running agents** — count agents you have spawned that have not yet completed or failed. This is the length of your tracked active agents list.
+2. **Calculate available slots:** `available = max_slots - active_agent_count`. If `available <= 0`, **DO NOT SPAWN**. Skip to the next step of the main loop. Log: "Slot limit reached (N active, limit M) — not spawning."
+3. Only if `available > 0`, proceed to spawn — and spawn **at most `available`** agents in this cycle.
+
+**This check must happen at the start of every dispatch cycle, not just once per session.** The running count changes as agents complete or fail between cycles. Always use the live count, never a cached value.
 
 **Additionally**, `scripts/start-worker.sh` provides a hard backstop via `--max-workers`. The `/task` skill accepts `--max-workers` and passes it through to `start-worker.sh`. If the worktree count already meets the limit, the script will exit non-zero and the agent will fail to start. This is a safety net — the dispatcher's own count check (step 2 above) should prevent this from ever being reached.
 
