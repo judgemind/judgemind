@@ -43,6 +43,7 @@ _issue_body = dqc._issue_body
 _issue_labels = dqc._issue_labels
 _check_duplicate = dqc._check_duplicate
 _file_single_issue = dqc._file_single_issue
+_24h_overlaps_posting_day = dqc._24h_overlaps_posting_day
 
 NOW = datetime(2026, 3, 11, 12, 0, 0, tzinfo=UTC)
 
@@ -311,6 +312,151 @@ class TestCheckIngestRates:
         # LA is healthy (30 vs ~33 avg), Orange has zero -> 1 alert
         assert len(alerts) == 1
         assert alerts[0].county == "Orange"
+
+
+class Test24hOverlapsPostingDay:
+    """Tests for _24h_overlaps_posting_day helper."""
+
+    def test_none_posting_days_always_overlaps(self) -> None:
+        """No posting_days means every day is a posting day."""
+        friday = datetime(2026, 3, 20, 12, 0, 0, tzinfo=UTC)  # Friday
+        assert _24h_overlaps_posting_day(friday, None) is True
+
+    def test_empty_posting_days_always_overlaps(self) -> None:
+        """Empty list treated same as None."""
+        friday = datetime(2026, 3, 20, 12, 0, 0, tzinfo=UTC)
+        assert _24h_overlaps_posting_day(friday, []) is True
+
+    def test_today_is_posting_day(self) -> None:
+        """Returns True when today is a posting day."""
+        # 2026-03-19 is Thursday
+        thursday = datetime(2026, 3, 19, 12, 0, 0, tzinfo=UTC)
+        assert _24h_overlaps_posting_day(thursday, ["Mon", "Tue", "Wed", "Thu"]) is True
+
+    def test_yesterday_is_posting_day(self) -> None:
+        """Returns True when yesterday is a posting day (24h window reaches back)."""
+        # 2026-03-20 is Friday; Thursday (yesterday) is a posting day
+        friday = datetime(2026, 3, 20, 12, 0, 0, tzinfo=UTC)
+        assert _24h_overlaps_posting_day(friday, ["Mon", "Tue", "Wed", "Thu"]) is True
+
+    def test_neither_today_nor_yesterday_is_posting_day(self) -> None:
+        """Returns False when neither today nor yesterday is a posting day."""
+        # 2026-03-22 is Sunday; Saturday (yesterday) is also not a posting day
+        sunday = datetime(2026, 3, 22, 12, 0, 0, tzinfo=UTC)
+        assert _24h_overlaps_posting_day(sunday, ["Mon", "Tue", "Wed", "Thu"]) is False
+
+    def test_saturday_after_friday_non_posting(self) -> None:
+        """Saturday with Mon-Thu schedule: yesterday is Friday (not posting)."""
+        saturday = datetime(2026, 3, 21, 12, 0, 0, tzinfo=UTC)
+        assert _24h_overlaps_posting_day(saturday, ["Mon", "Tue", "Wed", "Thu"]) is False
+
+    def test_monday_after_sunday_non_posting(self) -> None:
+        """Monday is a posting day even though yesterday (Sunday) isn't."""
+        monday = datetime(2026, 3, 23, 12, 0, 0, tzinfo=UTC)
+        assert _24h_overlaps_posting_day(monday, ["Mon", "Tue", "Wed", "Thu"]) is True
+
+    def test_invalid_day_names_ignored(self) -> None:
+        """Invalid day names are silently skipped."""
+        friday = datetime(2026, 3, 20, 12, 0, 0, tzinfo=UTC)
+        assert _24h_overlaps_posting_day(friday, ["Xyz", "Abc"]) is True
+
+
+class TestCheckIngestRatesPostingDays:
+    """Tests for posting_days suppression in check_ingest_rates."""
+
+    def test_zero_rulings_suppressed_on_non_posting_day(self) -> None:
+        """No alert when county has zero rulings but today is not a posting day."""
+        # Sunday March 22 — not in Mon-Thu posting schedule,
+        # and yesterday (Saturday) isn't either.
+        sunday = datetime(2026, 3, 22, 12, 0, 0, tzinfo=UTC)
+        conn = FakeConnection(
+            {
+                "d.created_at <": [],
+                "d.created_at >=": [],
+                "DISTINCT ct.county": [("Santa Clara",)],
+            }
+        )
+        baselines = _make_baselines(
+            {
+                "Santa Clara": {
+                    "expected_daily_rulings": 1,
+                    "schedule_type": "daily",
+                    "posting_days": ["Mon", "Tue", "Wed", "Thu"],
+                },
+            }
+        )
+        alerts = check_ingest_rates(conn, sunday, baselines)
+        assert len(alerts) == 0
+
+    def test_zero_rulings_fires_on_posting_day(self) -> None:
+        """P1 alert still fires when today IS a posting day and zero rulings."""
+        # Thursday March 19 — a posting day
+        thursday = datetime(2026, 3, 19, 12, 0, 0, tzinfo=UTC)
+        conn = FakeConnection(
+            {
+                "d.created_at <": [],
+                "d.created_at >=": [],
+                "DISTINCT ct.county": [("Santa Clara",)],
+            }
+        )
+        baselines = _make_baselines(
+            {
+                "Santa Clara": {
+                    "expected_daily_rulings": 1,
+                    "schedule_type": "daily",
+                    "posting_days": ["Mon", "Tue", "Wed", "Thu"],
+                },
+            }
+        )
+        alerts = check_ingest_rates(conn, thursday, baselines)
+        assert len(alerts) == 1
+        assert alerts[0].metric == "zero_rulings"
+        assert alerts[0].severity == "p1"
+
+    def test_zero_rulings_fires_day_after_posting_day(self) -> None:
+        """P1 alert fires on Friday because yesterday (Thu) was a posting day."""
+        friday = datetime(2026, 3, 20, 12, 0, 0, tzinfo=UTC)
+        conn = FakeConnection(
+            {
+                "d.created_at <": [],
+                "d.created_at >=": [],
+                "DISTINCT ct.county": [("Santa Clara",)],
+            }
+        )
+        baselines = _make_baselines(
+            {
+                "Santa Clara": {
+                    "expected_daily_rulings": 1,
+                    "schedule_type": "daily",
+                    "posting_days": ["Mon", "Tue", "Wed", "Thu"],
+                },
+            }
+        )
+        alerts = check_ingest_rates(conn, friday, baselines)
+        assert len(alerts) == 1
+        assert alerts[0].metric == "zero_rulings"
+
+    def test_no_posting_days_config_always_alerts(self) -> None:
+        """Counties without posting_days config always alert on zero rulings."""
+        sunday = datetime(2026, 3, 22, 12, 0, 0, tzinfo=UTC)
+        conn = FakeConnection(
+            {
+                "d.created_at <": [("Los Angeles", 200)],
+                "d.created_at >=": [],
+                "DISTINCT ct.county": [("Los Angeles",)],
+            }
+        )
+        baselines = _make_baselines(
+            {
+                "Los Angeles": {
+                    "expected_daily_rulings": 50,
+                    "schedule_type": "daily",
+                },
+            }
+        )
+        alerts = check_ingest_rates(conn, sunday, baselines)
+        assert len(alerts) == 1
+        assert alerts[0].metric == "zero_rulings"
 
 
 class TestCheckScraperStaleness:

@@ -461,6 +461,38 @@ def _build_county_filter(county: str | None) -> tuple[str, tuple[str, ...]]:
     return "", ()
 
 
+def _24h_overlaps_posting_day(
+    now: datetime,
+    posting_days: list[str] | None,
+) -> bool:
+    """Return True if the 24h window ending at *now* overlaps a posting day.
+
+    When *posting_days* is ``None`` or empty, every day is considered a
+    posting day and the function returns ``True``.
+
+    The 24h window spans two calendar days: *today* and *yesterday*.  If
+    either is in the posting schedule, the court was expected to post
+    content that would appear in the window.
+    """
+    if not posting_days:
+        return True
+
+    # _DAY_ABBREVS is ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+    posting_weekdays: set[int] = set()
+    for day in posting_days:
+        try:
+            posting_weekdays.add(_DAY_ABBREVS.index(day))
+        except ValueError:
+            continue
+
+    if not posting_weekdays:
+        return True
+
+    today_wd = now.weekday()  # Mon=0 .. Sun=6
+    yesterday_wd = (today_wd - 1) % 7
+    return today_wd in posting_weekdays or yesterday_wd in posting_weekdays
+
+
 def check_ingest_rates(
     conn: psycopg.Connection,  # type: ignore[type-arg]
     now: datetime,
@@ -522,21 +554,26 @@ def check_ingest_rates(
         baseline = baselines.get(county_name)
         expected_daily = baseline.expected_daily_rulings if baseline else daily_avg
 
-        # Zero-ruling alert (critical)
+        # Zero-ruling alert (critical).
+        # Suppress on non-posting days: if the county has a posting_days
+        # schedule and the 24h window doesn't overlap any posting day,
+        # zero rulings is expected — not an alert.
+        posting_days = baseline.posting_days if baseline else None
         if count_24h == 0 and expected_daily > 0:
-            alerts.append(
-                Alert(
-                    county=county_name,
-                    metric="zero_rulings",
-                    severity="p1",
-                    expected=expected_daily,
-                    actual=0,
-                    message=(
-                        f"{county_name}: zero new rulings in 24h "
-                        f"(expected ~{expected_daily:.1f}/day)"
-                    ),
+            if _24h_overlaps_posting_day(now, posting_days):
+                alerts.append(
+                    Alert(
+                        county=county_name,
+                        metric="zero_rulings",
+                        severity="p1",
+                        expected=expected_daily,
+                        actual=0,
+                        message=(
+                            f"{county_name}: zero new rulings in 24h "
+                            f"(expected ~{expected_daily:.1f}/day)"
+                        ),
+                    )
                 )
-            )
         # Ingest rate drop alert
         elif daily_avg > 0 and count_24h < daily_avg * INGEST_DROP_THRESHOLD:
             alerts.append(
