@@ -2,6 +2,8 @@ import { gql } from '@apollo/client';
 import { notFound } from 'next/navigation';
 import { createApolloClient } from '@/lib/apollo-client';
 import { buildJudgeHeading } from '@/lib/display-helpers';
+import { Badge } from '@/components/ui/badge';
+import { Card, CardContent } from '@/components/ui/card';
 import { JudgeProfile } from './JudgeProfile';
 
 const JUDGE_QUERY = gql`
@@ -57,24 +59,24 @@ export default async function JudgeDetailPage({ params }: Props) {
 
   return (
     <div className="mx-auto max-w-4xl">
-      <div className="flex flex-wrap items-start gap-3">
-        <h1 className="text-2xl font-bold text-slate-900 dark:text-slate-100">{heading}</h1>
-        <span
-          className={`inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-medium ${
-            judgeData.isActive
-              ? 'bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200'
-              : 'bg-slate-100 text-slate-600 dark:bg-slate-700 dark:text-slate-300'
-          }`}
-        >
-          {judgeData.isActive ? 'Active' : 'Inactive'}
-        </span>
-      </div>
-      {judgeData.court && (
-        <p className="mt-1 text-sm text-slate-500 dark:text-slate-400">
-          {judgeData.court.courtName} &middot; {judgeData.court.county}
-          {judgeData.department ? ` \u00B7 Dept. ${judgeData.department}` : ''}
-        </p>
-      )}
+      {/* Profile header card */}
+      <Card>
+        <CardContent className="p-6">
+          <div className="flex flex-wrap items-start gap-3">
+            <h1 className="text-2xl font-bold tracking-tight text-foreground">{heading}</h1>
+            <Badge variant={judgeData.isActive ? 'default' : 'secondary'}>
+              {judgeData.isActive ? 'Active' : 'Inactive'}
+            </Badge>
+          </div>
+          {judgeData.court && (
+            <p className="mt-2 text-sm text-muted-foreground">
+              {judgeData.court.courtName} &middot; {judgeData.court.county}
+              {judgeData.department ? ` \u00B7 Dept. ${judgeData.department}` : ''}
+            </p>
+          )}
+        </CardContent>
+      </Card>
+
       <div className="mt-6">
         <JudgeProfile judgeId={id} />
       </div>

@@ -3,6 +3,19 @@
 import { useState } from 'react';
 import { useQuery, gql } from '@apollo/client';
 import Link from 'next/link';
+import { Search } from 'lucide-react';
+import { Badge } from '@/components/ui/badge';
+import { Button } from '@/components/ui/button';
+import { Input } from '@/components/ui/input';
+import { Skeleton } from '@/components/ui/skeleton';
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from '@/components/ui/table';
 
 const JUDGES_QUERY = gql`
   query Judges($first: Int!, $after: String) {
@@ -50,15 +63,20 @@ const PAGE_SIZE = 20;
 
 function SkeletonRow() {
   return (
-    <div className="flex animate-pulse gap-4 border-b border-slate-100 px-4 py-4 dark:border-slate-700">
-      <div className="flex-1 space-y-2">
-        <div className="h-3 w-1/3 rounded bg-slate-200 dark:bg-slate-700" />
-        <div className="h-3 w-1/4 rounded bg-slate-200 dark:bg-slate-700" />
-      </div>
-      <div className="w-16 shrink-0">
-        <div className="h-5 rounded bg-slate-200 dark:bg-slate-700" />
-      </div>
-    </div>
+    <TableRow>
+      <TableCell>
+        <Skeleton className="h-4 w-40" />
+      </TableCell>
+      <TableCell>
+        <Skeleton className="h-4 w-24" />
+      </TableCell>
+      <TableCell>
+        <Skeleton className="h-4 w-16" />
+      </TableCell>
+      <TableCell>
+        <Skeleton className="h-5 w-16 rounded-full" />
+      </TableCell>
+    </TableRow>
   );
 }
 
@@ -100,102 +118,104 @@ export function JudgesList() {
 
   return (
     <div>
-      {/* Filters */}
-      <div className="mb-4 flex flex-wrap gap-3">
-        <input
-          type="text"
-          placeholder="Judge name"
-          value={nameFilter}
-          onChange={(e) => setNameFilter(e.target.value)}
-          className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900 placeholder-slate-400 focus:border-brand-500 focus:outline-none focus:ring-1 focus:ring-brand-500 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 dark:placeholder-slate-500"
-        />
+      {/* Filter */}
+      <div className="mb-4">
+        <div className="relative max-w-sm">
+          <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+          <Input
+            type="text"
+            placeholder="Filter by judge name..."
+            value={nameFilter}
+            onChange={(e) => setNameFilter(e.target.value)}
+            className="pl-9"
+            aria-label="Judge name"
+          />
+        </div>
       </div>
 
       {/* Table */}
-      <div className="rounded-lg border border-slate-200 dark:border-slate-700">
-        {/* Header */}
-        <div className="hidden grid-cols-[1fr_10rem_6rem_5rem] gap-4 border-b border-slate-200 px-4 py-2 text-xs font-semibold uppercase tracking-wide text-slate-500 dark:border-slate-700 dark:text-slate-400 sm:grid">
-          <span>Judge</span>
-          <span>Court</span>
-          <span>Dept.</span>
-          <span>Status</span>
-        </div>
+      <div className="rounded-md border">
+        <Table>
+          <TableHeader>
+            <TableRow>
+              <TableHead>Judge</TableHead>
+              <TableHead>County</TableHead>
+              <TableHead>Dept.</TableHead>
+              <TableHead>Status</TableHead>
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {/* Loading skeleton */}
+            {loading && edges.length === 0 && (
+              <>
+                {Array.from({ length: 8 }).map((_, i) => (
+                  <SkeletonRow key={i} />
+                ))}
+              </>
+            )}
 
-        {/* Skeleton */}
-        {loading && edges.length === 0 && (
-          <>
-            {Array.from({ length: 8 }).map((_, i) => (
-              <SkeletonRow key={i} />
+            {/* Error */}
+            {error && (
+              <TableRow>
+                <TableCell colSpan={4} className="text-center">
+                  <p className="py-4 text-sm text-destructive">
+                    Failed to load judges. Please try again.
+                  </p>
+                </TableCell>
+              </TableRow>
+            )}
+
+            {/* Empty state */}
+            {!loading && !error && filteredEdges.length === 0 && (
+              <TableRow>
+                <TableCell colSpan={4} className="text-center">
+                  <p className="py-4 text-sm text-muted-foreground">
+                    No judges found. Try adjusting your filters.
+                  </p>
+                </TableCell>
+              </TableRow>
+            )}
+
+            {/* Data rows */}
+            {filteredEdges.map(({ node }) => (
+              <TableRow key={node.id}>
+                <TableCell className="font-medium">
+                  <Link
+                    href={`/judges/${node.id}`}
+                    className="hover:text-primary hover:underline"
+                  >
+                    {node.canonicalName}
+                  </Link>
+                </TableCell>
+                <TableCell className="text-muted-foreground">
+                  {node.court?.county ?? '\u2014'}
+                </TableCell>
+                <TableCell className="text-muted-foreground">
+                  {node.department ? `Dept. ${node.department}` : '\u2014'}
+                </TableCell>
+                <TableCell>
+                  <Badge variant={node.isActive ? 'default' : 'secondary'}>
+                    {node.isActive ? 'Active' : 'Inactive'}
+                  </Badge>
+                </TableCell>
+              </TableRow>
             ))}
-          </>
-        )}
-
-        {/* Error */}
-        {error && (
-          <p className="p-8 text-center text-sm text-red-500 dark:text-red-400">
-            Failed to load judges. Please try again.
-          </p>
-        )}
-
-        {/* Empty state */}
-        {!loading && !error && filteredEdges.length === 0 && (
-          <p className="p-8 text-center text-slate-400 dark:text-slate-500">
-            No judges found. Try adjusting your filters.
-          </p>
-        )}
-
-        {/* Rows */}
-        {filteredEdges.map(({ node }) => (
-          <div
-            key={node.id}
-            className="grid grid-cols-1 gap-1 border-b border-slate-100 px-4 py-3 last:border-0 hover:bg-slate-50 dark:border-slate-700 dark:hover:bg-slate-800/50 sm:grid-cols-[1fr_10rem_6rem_5rem] sm:items-center sm:gap-4"
-          >
-            {/* Judge name */}
-            <div className="min-w-0">
-              <Link
-                href={`/judges/${node.id}`}
-                className="block truncate font-medium text-slate-900 hover:text-brand-600 dark:text-slate-100 dark:hover:text-brand-400"
-              >
-                {node.canonicalName}
-              </Link>
-            </div>
-
-            {/* Court / County */}
-            <span className="text-sm text-slate-500 dark:text-slate-400">
-              {node.court?.county ?? '\u2014'}
-            </span>
-
-            {/* Department */}
-            <span className="text-sm text-slate-500 dark:text-slate-400">
-              {node.department ? `Dept. ${node.department}` : '\u2014'}
-            </span>
-
-            {/* Active/Inactive badge */}
-            <span
-              className={`inline-flex w-fit items-center rounded px-2 py-0.5 text-xs font-medium ${
-                node.isActive
-                  ? 'bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200'
-                  : 'bg-slate-100 text-slate-600 dark:bg-slate-700 dark:text-slate-300'
-              }`}
-            >
-              {node.isActive ? 'Active' : 'Inactive'}
-            </span>
-          </div>
-        ))}
-
-        {/* Load more */}
-        {pageInfo?.hasNextPage && (
-          <div className="flex justify-center py-4">
-            <button
-              onClick={handleLoadMore}
-              disabled={loading}
-              className="rounded-lg border border-slate-300 bg-white px-4 py-2 text-sm font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-50 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-300 dark:hover:bg-slate-700"
-            >
-              {loading ? 'Loading\u2026' : 'Load more'}
-            </button>
-          </div>
-        )}
+          </TableBody>
+        </Table>
       </div>
+
+      {/* Load more */}
+      {pageInfo?.hasNextPage && (
+        <div className="flex justify-center pt-4">
+          <Button
+            variant="outline"
+            onClick={handleLoadMore}
+            disabled={loading}
+          >
+            {loading ? 'Loading\u2026' : 'Load more'}
+          </Button>
+        </div>
+      )}
     </div>
   );
 }

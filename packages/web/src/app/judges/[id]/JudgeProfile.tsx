@@ -2,12 +2,25 @@
 
 import { useQuery, gql } from '@apollo/client';
 import Link from 'next/link';
+import { BarChart3, Scale } from 'lucide-react';
 import {
   formatDate,
   formatLabel,
   formatMotionType,
   formatOutcome,
 } from '../../../lib/display-helpers';
+import { Badge } from '@/components/ui/badge';
+import { Button } from '@/components/ui/button';
+import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
+import { Skeleton } from '@/components/ui/skeleton';
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from '@/components/ui/table';
 
 // ---------------------------------------------------------------------------
 // GraphQL queries
@@ -115,13 +128,12 @@ interface RulingsData {
 // Constants
 // ---------------------------------------------------------------------------
 
-const OUTCOME_BADGE: Record<string, string> = {
-  granted: 'bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200',
-  denied: 'bg-red-100 text-red-800 dark:bg-red-900 dark:text-red-200',
-  granted_in_part:
-    'bg-yellow-100 text-yellow-800 dark:bg-yellow-900 dark:text-yellow-200',
-  denied_in_part:
-    'bg-yellow-100 text-yellow-800 dark:bg-yellow-900 dark:text-yellow-200',
+/** Badge variant mapping for ruling outcomes. */
+const OUTCOME_BADGE_VARIANT: Record<string, 'default' | 'secondary' | 'destructive' | 'outline'> = {
+  granted: 'default',
+  denied: 'destructive',
+  granted_in_part: 'secondary',
+  denied_in_part: 'secondary',
 };
 
 const PAGE_SIZE = 20;
@@ -132,29 +144,37 @@ const PAGE_SIZE = 20;
 
 function AnalyticsSkeleton() {
   return (
-    <div className="animate-pulse space-y-4" data-testid="analytics-skeleton">
-      <div className="h-8 w-32 rounded bg-slate-200 dark:bg-slate-700" />
-      <div className="h-4 w-64 rounded bg-slate-200 dark:bg-slate-700" />
-      <div className="mt-4 space-y-2">
-        {Array.from({ length: 4 }).map((_, i) => (
-          <div key={i} className="h-6 w-full rounded bg-slate-200 dark:bg-slate-700" />
-        ))}
-      </div>
+    <div className="grid gap-4 sm:grid-cols-3" data-testid="analytics-skeleton">
+      {Array.from({ length: 3 }).map((_, i) => (
+        <Card key={i}>
+          <CardContent className="p-6">
+            <Skeleton className="mb-2 h-8 w-20" />
+            <Skeleton className="h-4 w-28" />
+          </CardContent>
+        </Card>
+      ))}
     </div>
   );
 }
 
 function RulingsSkeleton() {
   return (
-    <div className="animate-pulse space-y-2" data-testid="rulings-skeleton">
-      {Array.from({ length: 5 }).map((_, i) => (
-        <div key={i} className="flex gap-4 border-b border-slate-100 px-4 py-3 dark:border-slate-700">
-          <div className="h-4 w-20 rounded bg-slate-200 dark:bg-slate-700" />
-          <div className="h-4 w-32 rounded bg-slate-200 dark:bg-slate-700" />
-          <div className="h-4 w-24 rounded bg-slate-200 dark:bg-slate-700" />
-          <div className="h-4 w-16 rounded bg-slate-200 dark:bg-slate-700" />
-        </div>
-      ))}
+    <div data-testid="rulings-skeleton">
+      <div className="space-y-3">
+        {Array.from({ length: 5 }).map((_, i) => (
+          <Card key={i}>
+            <CardContent className="p-4">
+              <div className="flex items-start justify-between gap-3">
+                <div className="min-w-0 flex-1 space-y-2">
+                  <Skeleton className="h-4 w-48" />
+                  <Skeleton className="h-3 w-32" />
+                </div>
+                <Skeleton className="h-5 w-16 rounded-full" />
+              </div>
+            </CardContent>
+          </Card>
+        ))}
+      </div>
     </div>
   );
 }
@@ -241,21 +261,25 @@ export function JudgeProfile({ judgeId }: { judgeId: string }) {
 
     if (analyticsError) {
       return (
-        <div className="rounded-lg border border-red-200 bg-red-50 p-6 text-center dark:border-red-800 dark:bg-red-900/20">
-          <p className="text-sm text-red-600 dark:text-red-400">
-            Failed to load analytics. Please try again.
-          </p>
-        </div>
+        <Card className="border-destructive">
+          <CardContent className="py-6 text-center">
+            <p className="text-sm text-destructive">
+              Failed to load analytics. Please try again.
+            </p>
+          </CardContent>
+        </Card>
       );
     }
 
     if (!analytics || analytics.totalRulings === 0) {
       return (
-        <div className="rounded-lg border border-slate-200 p-6 text-center dark:border-slate-700">
-          <p className="text-sm text-slate-500 dark:text-slate-400">
-            No rulings captured for this judge yet. Check back after the next scrape.
-          </p>
-        </div>
+        <Card className="border-dashed">
+          <CardContent className="py-8 text-center">
+            <p className="text-sm text-muted-foreground">
+              No rulings captured for this judge yet. Check back after the next scrape.
+            </p>
+          </CardContent>
+        </Card>
       );
     }
 
@@ -263,82 +287,90 @@ export function JudgeProfile({ judgeId }: { judgeId: string }) {
     const dateRange = formatDateRange(analytics.earliestRuling, analytics.latestRuling);
 
     return (
-      <div>
-        {/* Summary stats */}
-        <div className="flex flex-wrap items-baseline gap-6">
+      <div className="space-y-6">
+        {/* Stats cards */}
+        <div className="grid gap-4 sm:grid-cols-3">
           {overallGrantRate !== null && (
-            <div>
-              <p className="text-3xl font-bold text-slate-900 dark:text-slate-100">
-                {Math.round(overallGrantRate * 100)}%
-              </p>
-              <p className="text-xs font-medium uppercase tracking-wide text-slate-500 dark:text-slate-400">
-                Overall Grant Rate
-              </p>
-            </div>
+            <Card>
+              <CardContent className="p-6">
+                <p className="text-3xl font-bold text-foreground">
+                  {Math.round(overallGrantRate * 100)}%
+                </p>
+                <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                  Overall Grant Rate
+                </p>
+              </CardContent>
+            </Card>
           )}
-          <div>
-            <p className="text-3xl font-bold text-slate-900 dark:text-slate-100">
-              {analytics.totalRulings.toLocaleString()}
-            </p>
-            <p className="text-xs font-medium uppercase tracking-wide text-slate-500 dark:text-slate-400">
-              Total Rulings
-            </p>
-          </div>
+          <Card>
+            <CardContent className="p-6">
+              <p className="text-3xl font-bold text-foreground">
+                {analytics.totalRulings.toLocaleString()}
+              </p>
+              <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                Total Rulings
+              </p>
+            </CardContent>
+          </Card>
+          {dateRange && (
+            <Card>
+              <CardContent className="p-6">
+                <p className="text-lg font-semibold text-foreground">
+                  {dateRange}
+                </p>
+                <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                  Date Range
+                </p>
+              </CardContent>
+            </Card>
+          )}
         </div>
-        {dateRange && (
-          <p className="mt-2 text-sm text-slate-500 dark:text-slate-400">
-            Based on {analytics.totalRulings.toLocaleString()} rulings from {dateRange}
-          </p>
-        )}
 
         {/* Motion type stats table */}
         {analytics.rulingsByMotionType.length > 0 && (
-          <div className="mt-6 overflow-x-auto">
-            <table className="w-full text-left text-sm">
-              <thead>
-                <tr className="border-b border-slate-200 text-xs font-semibold uppercase tracking-wide text-slate-500 dark:border-slate-700 dark:text-slate-400">
-                  <th className="py-2 pr-4">Motion Type</th>
-                  <th className="px-4 py-2 text-right">Total</th>
-                  <th className="px-4 py-2 text-right">Granted</th>
-                  <th className="px-4 py-2 text-right">Denied</th>
-                  <th className="px-4 py-2 text-right">Partial</th>
-                  <th className="px-4 py-2 text-right">Grant Rate</th>
-                </tr>
-              </thead>
-              <tbody>
-                {analytics.rulingsByMotionType.map((row) => (
-                  <tr
-                    key={row.motionType}
-                    className="border-b border-slate-100 dark:border-slate-700"
-                  >
-                    <td className="py-2 pr-4 font-medium text-slate-900 dark:text-slate-100">
-                      {formatMotionType(row.motionType)}
-                    </td>
-                    <td className="px-4 py-2 text-right text-slate-700 dark:text-slate-300">
-                      {row.total}
-                    </td>
-                    <td className="px-4 py-2 text-right text-slate-700 dark:text-slate-300">
-                      {row.granted}
-                    </td>
-                    <td className="px-4 py-2 text-right text-slate-700 dark:text-slate-300">
-                      {row.denied}
-                    </td>
-                    <td className="px-4 py-2 text-right text-slate-700 dark:text-slate-300">
-                      {row.grantedInPart}
-                    </td>
-                    <td className="px-4 py-2 text-right font-medium text-slate-900 dark:text-slate-100">
-                      {Math.round(row.grantRate * 100)}%
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
+          <Card>
+            <CardHeader className="pb-3">
+              <CardTitle className="flex items-center gap-2 text-base">
+                <Scale className="h-4 w-4 text-muted-foreground" />
+                Motion Type Breakdown
+              </CardTitle>
+            </CardHeader>
+            <CardContent className="pt-0">
+              <Table>
+                <TableHeader>
+                  <TableRow>
+                    <TableHead>Motion Type</TableHead>
+                    <TableHead className="text-right">Total</TableHead>
+                    <TableHead className="text-right">Granted</TableHead>
+                    <TableHead className="text-right">Denied</TableHead>
+                    <TableHead className="text-right">Partial</TableHead>
+                    <TableHead className="text-right">Grant Rate</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {analytics.rulingsByMotionType.map((row) => (
+                    <TableRow key={row.motionType}>
+                      <TableCell className="font-medium">
+                        {formatMotionType(row.motionType)}
+                      </TableCell>
+                      <TableCell className="text-right">{row.total}</TableCell>
+                      <TableCell className="text-right">{row.granted}</TableCell>
+                      <TableCell className="text-right">{row.denied}</TableCell>
+                      <TableCell className="text-right">{row.grantedInPart}</TableCell>
+                      <TableCell className="text-right font-medium">
+                        {Math.round(row.grantRate * 100)}%
+                      </TableCell>
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
+            </CardContent>
+          </Card>
         )}
 
         {/* No motion type data */}
         {analytics.rulingsByMotionType.length === 0 && (
-          <p className="mt-4 text-sm text-slate-500 dark:text-slate-400">
+          <p className="text-sm text-muted-foreground">
             Motion type breakdown is not yet available for this judge.
           </p>
         )}
@@ -351,93 +383,90 @@ export function JudgeProfile({ judgeId }: { judgeId: string }) {
   // -------------------------------------------------------------------------
 
   function renderRulings() {
+    if (rulingsLoading && edges.length === 0) return <RulingsSkeleton />;
+
+    if (rulingsError) {
+      return (
+        <Card className="border-destructive">
+          <CardContent className="py-6 text-center">
+            <p className="text-sm text-destructive">
+              Failed to load rulings. Please try again.
+            </p>
+          </CardContent>
+        </Card>
+      );
+    }
+
+    if (!rulingsLoading && edges.length === 0) {
+      return (
+        <Card className="border-dashed">
+          <CardContent className="py-8 text-center">
+            <p className="text-sm text-muted-foreground">
+              No rulings captured for this judge yet. Check back after the next scrape.
+            </p>
+          </CardContent>
+        </Card>
+      );
+    }
+
     return (
-      <div className="rounded-lg border border-slate-200 dark:border-slate-700">
-        {/* Header row */}
-        <div className="hidden grid-cols-[6rem_1fr_8rem_6rem] gap-4 border-b border-slate-200 px-4 py-2 text-xs font-semibold uppercase tracking-wide text-slate-500 dark:border-slate-700 dark:text-slate-400 sm:grid">
-          <span>Date</span>
-          <span>Case</span>
-          <span>Motion</span>
-          <span>Outcome</span>
-        </div>
-
-        {/* Skeleton */}
-        {rulingsLoading && edges.length === 0 && <RulingsSkeleton />}
-
-        {/* Error */}
-        {rulingsError && (
-          <p className="p-8 text-center text-sm text-red-500 dark:text-red-400">
-            Failed to load rulings. Please try again.
-          </p>
-        )}
-
-        {/* Empty state */}
-        {!rulingsLoading && !rulingsError && edges.length === 0 && (
-          <p className="p-8 text-center text-slate-400 dark:text-slate-500">
-            No rulings captured for this judge yet. Check back after the next scrape.
-          </p>
-        )}
-
-        {/* Rows */}
+      <div className="space-y-3">
         {edges.map(({ node }) => (
-          <div
-            key={node.id}
-            className="border-b border-slate-100 last:border-0 dark:border-slate-700"
-          >
-            <div className="grid grid-cols-1 gap-1 px-4 py-3 hover:bg-slate-50 dark:hover:bg-slate-800/50 sm:grid-cols-[6rem_1fr_8rem_6rem] sm:items-center sm:gap-4">
-              {/* Date */}
-              <span className="text-xs text-slate-500 dark:text-slate-400">
-                {formatDate(node.hearingDate)}
-              </span>
-
-              {/* Case */}
-              <span className="text-sm text-slate-900 dark:text-slate-100">
-                {node.case ? (
-                  <Link
-                    href={`/cases/${node.case.id}`}
-                    className="hover:text-brand-600 dark:hover:text-brand-400"
-                  >
-                    {node.case.caseNumber}
-                    {node.case.caseTitle && (
-                      <span className="ml-2 text-xs text-slate-500 dark:text-slate-400">
-                        {node.case.caseTitle}
-                      </span>
+          <Card key={node.id} className="transition-colors hover:bg-accent/50">
+            <CardContent className="p-4">
+              <div className="flex items-start justify-between gap-3">
+                <div className="min-w-0 flex-1">
+                  {node.case ? (
+                    <Link
+                      href={`/cases/${node.case.id}`}
+                      className="hover:underline"
+                    >
+                      <p className="truncate text-sm font-medium text-foreground">
+                        {node.case.caseNumber}
+                        {node.case.caseTitle && (
+                          <span className="ml-2 font-normal text-muted-foreground">
+                            {node.case.caseTitle}
+                          </span>
+                        )}
+                      </p>
+                    </Link>
+                  ) : (
+                    <p className="text-sm text-muted-foreground">{'\u2014'}</p>
+                  )}
+                  <div className="mt-1 flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+                    <span>{formatDate(node.hearingDate)}</span>
+                    {node.motionType && (
+                      <>
+                        <span>&middot;</span>
+                        <span>{formatLabel(node.motionType)}</span>
+                      </>
                     )}
-                  </Link>
-                ) : (
-                  '\u2014'
-                )}
-              </span>
-
-              {/* Motion type */}
-              <span className="text-sm text-slate-700 dark:text-slate-300">
-                {formatLabel(node.motionType)}
-              </span>
-
-              {/* Outcome badge */}
-              <span
-                className={`inline-flex w-fit items-center rounded px-2 py-0.5 text-xs font-medium ${
-                  node.outcome && OUTCOME_BADGE[node.outcome]
-                    ? OUTCOME_BADGE[node.outcome]
-                    : 'bg-slate-100 text-slate-600 dark:bg-slate-700 dark:text-slate-300'
-                }`}
-              >
-                {formatOutcome(node.outcome)}
-              </span>
-            </div>
-          </div>
+                  </div>
+                </div>
+                <Badge
+                  variant={
+                    node.outcome && OUTCOME_BADGE_VARIANT[node.outcome]
+                      ? OUTCOME_BADGE_VARIANT[node.outcome]
+                      : 'outline'
+                  }
+                >
+                  {formatOutcome(node.outcome)}
+                </Badge>
+              </div>
+            </CardContent>
+          </Card>
         ))}
 
         {/* Load more */}
         {pageInfo?.hasNextPage && (
-          <div className="flex justify-center py-4">
-            <button
+          <div className="flex justify-center pt-2">
+            <Button
+              variant="outline"
               onClick={handleLoadMore}
               disabled={rulingsLoading}
-              className="rounded-lg border border-slate-300 bg-white px-4 py-2 text-sm font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-50 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-300 dark:hover:bg-slate-700"
             >
               {rulingsLoading ? 'Loading\u2026' : 'Load more'}
-            </button>
+            </Button>
           </div>
         )}
       </div>
@@ -449,21 +478,22 @@ export function JudgeProfile({ judgeId }: { judgeId: string }) {
   // -------------------------------------------------------------------------
 
   return (
-    <div>
+    <div className="space-y-8">
       {/* Analytics section */}
       <section>
-        <h2 className="text-sm font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">
+        <h2 className="mb-3 flex items-center gap-2 text-sm font-semibold uppercase tracking-wide text-muted-foreground">
+          <BarChart3 className="h-4 w-4" />
           Analytics
         </h2>
-        <div className="mt-3">{renderAnalytics()}</div>
+        {renderAnalytics()}
       </section>
 
       {/* Recent rulings section */}
-      <section className="mt-8">
-        <h2 className="text-sm font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">
+      <section>
+        <h2 className="mb-3 text-sm font-semibold uppercase tracking-wide text-muted-foreground">
           Recent Rulings
         </h2>
-        <div className="mt-3">{renderRulings()}</div>
+        {renderRulings()}
       </section>
     </div>
   );

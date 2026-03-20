@@ -88,7 +88,7 @@ describe('JudgeDetailPage (SSR)', () => {
     vi.clearAllMocks();
   });
 
-  it('renders judge heading, status badge, and mounts JudgeProfile', async () => {
+  it('renders judge heading and mounts JudgeProfile', async () => {
     mockQuery.mockResolvedValueOnce({
       data: {
         judge: {
@@ -117,7 +117,7 @@ describe('JudgeDetailPage (SSR)', () => {
     expect(profile?.props?.judgeId).toBe('judge-1');
   });
 
-  it('renders active status badge for active judge', async () => {
+  it('renders active status Badge for active judge', async () => {
     mockQuery.mockResolvedValueOnce({
       data: {
         judge: {
@@ -131,17 +131,11 @@ describe('JudgeDetailPage (SSR)', () => {
     });
 
     const result = await JudgeDetailPage({ params: { id: 'judge-1' } });
-    const badges = findAllInTree(result, (n) =>
-      typeof n.props?.className === 'string' &&
-      n.props.className.includes('rounded-full') &&
-      n.type === 'span',
-    );
-    const activeBadge = badges.find((b) => b.props?.children === 'Active');
+    const activeBadge = findInTree(result, (n) => n.props?.children === 'Active');
     expect(activeBadge).toBeTruthy();
-    expect(activeBadge?.props?.className).toContain('bg-green-100');
   });
 
-  it('renders inactive status badge for inactive judge', async () => {
+  it('renders inactive status Badge for inactive judge', async () => {
     mockQuery.mockResolvedValueOnce({
       data: {
         judge: {
@@ -155,14 +149,8 @@ describe('JudgeDetailPage (SSR)', () => {
     });
 
     const result = await JudgeDetailPage({ params: { id: 'judge-2' } });
-    const badges = findAllInTree(result, (n) =>
-      typeof n.props?.className === 'string' &&
-      n.props.className.includes('rounded-full') &&
-      n.type === 'span',
-    );
-    const inactiveBadge = badges.find((b) => b.props?.children === 'Inactive');
+    const inactiveBadge = findInTree(result, (n) => n.props?.children === 'Inactive');
     expect(inactiveBadge).toBeTruthy();
-    expect(inactiveBadge?.props?.className).toContain('bg-slate-100');
   });
 
   it('calls notFound when GraphQL returns null judge', async () => {
@@ -177,7 +165,7 @@ describe('JudgeDetailPage (SSR)', () => {
   });
 
   it('calls notFound when GraphQL query throws', async () => {
-    mockQuery.mockRejectedValueOnce(new Error('Network error'));
+    mockQuery.mockResolvedValueOnce(Promise.reject(new Error('Network error')));
 
     await expect(
       JudgeDetailPage({ params: { id: 'error-judge' } }),
@@ -205,8 +193,35 @@ describe('JudgeDetailPage (SSR)', () => {
     const courtParagraph = findInTree(result, (n) =>
       n.type === 'p' &&
       typeof n.props?.className === 'string' &&
-      n.props.className.includes('text-slate-500'),
+      n.props.className.includes('text-muted-foreground'),
     );
     expect(courtParagraph).toBeTruthy();
+  });
+
+  it('wraps profile header in a Card component', async () => {
+    mockQuery.mockResolvedValueOnce({
+      data: {
+        judge: {
+          id: 'judge-1',
+          canonicalName: 'Hon. Jane Smith',
+          department: '12',
+          isActive: true,
+          court: {
+            courtName: 'Los Angeles Superior Court',
+            county: 'Los Angeles',
+          },
+        },
+      },
+    });
+
+    const result = await JudgeDetailPage({ params: { id: 'judge-1' } });
+    // The Card component wraps the header — find a forwardRef component with Card's displayName
+    const card = findInTree(result, (n) =>
+      typeof n.type === 'object' &&
+      n.type !== null &&
+      'displayName' in n.type &&
+      (n.type as { displayName?: string }).displayName === 'Card',
+    );
+    expect(card).toBeTruthy();
   });
 });
