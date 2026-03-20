@@ -183,6 +183,40 @@ def test_process_event_happy_path(mock_psycopg: MagicMock) -> None:
 
 
 @patch("ingestion.worker.psycopg")
+def test_process_event_indexes_new_fields_in_opensearch(mock_psycopg: MagicMock) -> None:
+    """motion_type, outcome, case_title, and summary are passed to OpenSearch."""
+    worker, os_mock = _make_worker()
+
+    mock_conn, mock_cur = _make_mock_conn()
+    mock_psycopg.connect.return_value = mock_conn
+    # Use a case_title without "v." to avoid party extraction which needs more mock calls
+    mock_cur.fetchone.side_effect = [
+        ("court-uuid-1",),  # upsert_court
+        ("case-uuid-1",),  # upsert_case
+        (True,),  # insert_document: RETURNING is_new = True
+        None,  # resolve_judge: no existing alias
+        ("judge-uuid-1",),  # resolve_judge: INSERT INTO judges
+    ]
+    mock_cur.rowcount = 1
+
+    event = _make_event(
+        outcome="granted",
+        motion_type="demurrer",
+        case_title="In re Marriage of Smith",
+    )
+    worker.process_event(event)
+
+    os_mock.index.assert_called_once()
+    indexed_doc = os_mock.index.call_args.kwargs["body"]
+    assert indexed_doc["motion_type"] == "demurrer"
+    assert indexed_doc["outcome"] == "granted"
+    assert indexed_doc["case_title"] == "In re Marriage of Smith"
+    # summary is a truncated version of the cleaned ruling text
+    assert indexed_doc["summary"] is not None
+    assert len(indexed_doc["summary"]) <= 500
+
+
+@patch("ingestion.worker.psycopg")
 def test_process_event_passes_outcome_and_motion_type_from_event(mock_psycopg: MagicMock) -> None:
     """When event carries outcome/motion_type, they are passed to insert_ruling."""
     worker, os_mock = _make_worker()

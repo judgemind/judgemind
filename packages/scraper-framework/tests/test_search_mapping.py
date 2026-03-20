@@ -58,6 +58,10 @@ class TestCreateIndex:
             "state",
             "judge_name",
             "hearing_date",
+            "motion_type",
+            "outcome",
+            "case_title",
+            "summary",
             "ruling_text",
             "document_id",
             "s3_key",
@@ -73,9 +77,23 @@ class TestCreateIndex:
 
     def test_keyword_fields(self) -> None:
         properties = TENTATIVE_RULINGS_MAPPING["mappings"]["properties"]
-        keyword_fields = ["case_number", "court", "county", "state", "judge_name", "document_id"]
+        keyword_fields = [
+            "case_number",
+            "court",
+            "county",
+            "state",
+            "judge_name",
+            "document_id",
+            "motion_type",
+            "outcome",
+            "case_title",
+        ]
         for field in keyword_fields:
             assert properties[field]["type"] == "keyword", f"{field} should be keyword"
+
+    def test_summary_uses_text_type(self) -> None:
+        properties = TENTATIVE_RULINGS_MAPPING["mappings"]["properties"]
+        assert properties["summary"]["type"] == "text"
 
 
 class TestSwapAlias:
