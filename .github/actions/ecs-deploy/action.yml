@@ -82,8 +82,27 @@ runs:
           '.containerDefinitions |= map(if .name == $container then .image = $image else . end)' \
           current-task-def.json > updated-containers.json
 
-        # Build register-task-definition args, always including task role if present
+        # Build register-task-definition args, always including task role if present.
+        # Self-heal: if the current revision lacks a task role (legacy revisions from
+        # before the IAM role was added), look it up by the Terraform naming convention
+        # so the role is attached on the next deploy.
         TASK_ROLE=$(jq -r '.taskRoleArn // empty' updated-containers.json)
+
+        if [ -z "$TASK_ROLE" ]; then
+          # Derive role name from task family: judgemind-<svc>-<env> -> judgemind-<svc>-task-<env>
+          ENV_SUFFIX="${TASK_FAMILY##*-}"
+          SVC_PREFIX="${TASK_FAMILY%-*}"
+          ROLE_NAME="${SVC_PREFIX}-task-${ENV_SUFFIX}"
+          echo "Task role ARN missing from current revision — looking up role '$ROLE_NAME'..."
+          TASK_ROLE=$(aws iam get-role --role-name "$ROLE_NAME" --query 'Role.Arn' --output text 2>/dev/null || true)
+          if [ -n "$TASK_ROLE" ] && [ "$TASK_ROLE" != "None" ]; then
+            echo "Resolved task role: $TASK_ROLE"
+          else
+            echo "WARNING: Could not resolve task role '$ROLE_NAME' — proceeding without it."
+            TASK_ROLE=""
+          fi
+        fi
+
         REGISTER_ARGS=(
           --family "$TASK_FAMILY"
           --requires-compatibilities $(jq -r '.requiresCompatibilities[]' updated-containers.json)
