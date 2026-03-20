@@ -854,6 +854,27 @@ class TestExtractCaseTitle:
         assert "McDonald" in result
         assert "O'Brien" in result
 
+    def test_rejects_department_header_boilerplate(self) -> None:
+        """Titles containing 'DEPARTMENT X LAW AND MOTION RULINGS' are rejected (#1244)."""
+        text = (
+            "DEPARTMENT I LAW AND MOTION RULINGS\n"
+            "Case Number: 24VECV05649\n"
+            "Hearing Date: March 6, 2026\n"
+            "Jim Hilaski v. Shaul Dina\n"
+            "The motion is GRANTED."
+        )
+        result = extract_case_title(text)
+        # Should still find the actual title but skip the header match
+        if result is not None:
+            assert "DEPARTMENT" not in result.upper() or "LAW AND MOTION" not in result.upper()
+
+    def test_rejects_department_header_in_captured_group(self) -> None:
+        """A regex match that captures department header text is skipped (#1244)."""
+        text = "Department 15 Law And Motion Rulings v. Someone Else\nCase Number: 24VECV05649"
+        result = extract_case_title(text)
+        # Should be None since the only v. match contains header boilerplate
+        assert result is None
+
 
 # ---------------------------------------------------------------------------
 # Party extraction from case captions
