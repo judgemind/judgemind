@@ -309,6 +309,12 @@ export const typeDefs = `#graphql
   type Query {
     health: String!
 
+    """Distinct county names from all active courts, sorted alphabetically. Used for autocomplete."""
+    distinctCounties: [String!]!
+
+    """Distinct canonical judge names from all active judges, sorted alphabetically. Used for autocomplete."""
+    distinctJudgeNames: [String!]!
+
     """Full-text + filtered search over tentative rulings via OpenSearch.
     Provide a \`query\` for full-text BM25 search, \`filters\` for metadata filtering, or both.
     An empty query with filters returns results sorted by hearing date descending.

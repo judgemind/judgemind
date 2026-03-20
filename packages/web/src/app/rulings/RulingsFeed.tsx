@@ -9,6 +9,8 @@ import {
   formatMotionType,
   formatJudgeName,
 } from '@/lib/display-helpers';
+import { Autocomplete } from '@/components/Autocomplete';
+import { useCountyOptions } from '@/lib/filter-options';
 
 const RULINGS_QUERY = gql`
   query Rulings(
@@ -112,6 +114,7 @@ export function RulingsFeed() {
   const [county, setCounty] = useState('');
   const [dateFrom, setDateFrom] = useState('');
   const [dateTo, setDateTo] = useState('');
+  const countyOptions = useCountyOptions();
 
   const { data, loading, error, fetchMore } = useQuery<RulingsData>(RULINGS_QUERY, {
     variables: {
@@ -174,11 +177,12 @@ export function RulingsFeed() {
     <div>
       {/* Filters */}
       <div className="mb-4 flex flex-wrap gap-3">
-        <input
-          type="text"
-          placeholder="County (e.g. Los Angeles)"
+        <Autocomplete
           value={county}
-          onChange={(e) => setCounty(e.target.value)}
+          onChange={setCounty}
+          options={countyOptions}
+          placeholder="County (e.g. Los Angeles)"
+          aria-label="County"
           className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900 placeholder-slate-400 focus:border-brand-500 focus:outline-none focus:ring-1 focus:ring-brand-500 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 dark:placeholder-slate-500"
         />
         <input

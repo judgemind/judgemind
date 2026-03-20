@@ -5,6 +5,8 @@ import { useQuery, gql } from '@apollo/client';
 import { useRouter, useSearchParams } from 'next/navigation';
 import Link from 'next/link';
 import { formatDate } from '@/lib/display-helpers';
+import { Autocomplete } from '@/components/Autocomplete';
+import { useCountyOptions, useJudgeNameOptions } from '@/lib/filter-options';
 
 const SEARCH_RULINGS_QUERY = gql`
   query SearchRulings(
@@ -171,6 +173,8 @@ function SkeletonCard() {
 export function SearchPage() {
   const router = useRouter();
   const searchParams = useSearchParams();
+  const countyOptions = useCountyOptions();
+  const judgeNameOptions = useJudgeNameOptions();
 
   // Parse initial state from URL
   const initialState = useMemo(
@@ -348,12 +352,13 @@ export function SearchPage() {
               >
                 County
               </label>
-              <input
+              <Autocomplete
                 id="filter-county"
-                type="text"
                 value={county}
-                onChange={(e) => setCounty(e.target.value)}
+                onChange={setCounty}
+                options={countyOptions}
                 placeholder="e.g. Los Angeles"
+                aria-label="County"
                 className="w-full rounded-md border border-slate-300 bg-white px-3 py-1.5 text-sm text-slate-900 placeholder-slate-400 focus:border-brand-500 focus:outline-none focus:ring-1 focus:ring-brand-500 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 dark:placeholder-slate-500"
               />
             </div>
@@ -366,12 +371,13 @@ export function SearchPage() {
               >
                 Judge
               </label>
-              <input
+              <Autocomplete
                 id="filter-judge"
-                type="text"
                 value={judgeName}
-                onChange={(e) => setJudgeName(e.target.value)}
+                onChange={setJudgeName}
+                options={judgeNameOptions}
                 placeholder="e.g. Smith, John"
+                aria-label="Judge"
                 className="w-full rounded-md border border-slate-300 bg-white px-3 py-1.5 text-sm text-slate-900 placeholder-slate-400 focus:border-brand-500 focus:outline-none focus:ring-1 focus:ring-brand-500 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 dark:placeholder-slate-500"
               />
             </div>
