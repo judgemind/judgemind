@@ -144,7 +144,7 @@ Include non-bot comments (filter out comments from `github-actions[bot]`, `judge
 
 **Scope completeness check:** Before implementing, search the codebase for all locations affected by the change. If the issue mentions fixing or changing X in one file, grep for X across the entire codebase. List all locations that use, render, or implement the same pattern. If the issue's scope doesn't cover all of them, either expand scope to include them or file follow-up issues for the missed locations so they are tracked. Document the scope check results (what you searched for, what you found) in your implementation notes or the PR body.
 
-If the issue requires a maintainer decision before you can proceed: comment on it, add `status/blocked`, and stop. Do not guess on ambiguous requirements.
+If the issue requires a maintainer decision before you can proceed: comment on it, block it with `scripts/block-issue.sh <issue> <blocker>` (if a specific blocking issue exists) or just add `status/blocked` manually, and stop. Do not guess on ambiguous requirements.
 
 ---
 
@@ -170,7 +170,7 @@ Skip this for Terraform-only or docs-only tasks.
 #### A.2 — Implement and review (ralph loop)
 - **For testable code tasks** (Python, TypeScript): use the `/ralph` loop — iterative work-then-review with fresh context each iteration. See `.claude/skills/ralph/SKILL.md`. This replaces the old `/tdd` + self-review steps. `/ralph` handles implementation (TDD), pre-PR checks, and cross-perspective review internally. It returns when the reviewer subagent says SHIP.
 - **For non-testable tasks** (Terraform, DB migrations, CI/CD, docs): implement directly, then run all applicable pre-PR checks (see CLAUDE.md §Pre-PR Checks) and review your own diff before continuing.
-- If `/ralph` exits with a blocker (STUCK or max iterations), the issue has already been commented on and labeled `status/blocked`. Clean up the worktree (`scripts/end-worker.sh {worktree}`) and stop.
+- If `/ralph` exits with a blocker (STUCK or max iterations), the issue has already been commented on and blocked (via `scripts/block-issue.sh` or `status/blocked` label). Clean up the worktree (`scripts/end-worker.sh {worktree}`) and stop.
 
 **POST-RALPH CHECKPOINT — Do not skip this.** After `/ralph` returns:
 1. Read `{worktree}/tmp/ralph/ralph-done.txt` to confirm ralph completed with SHIP status.

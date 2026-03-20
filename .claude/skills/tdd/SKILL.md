@@ -93,7 +93,7 @@ If any test fails:
 2. Fix the implementation (not the test, unless the test itself is wrong).
 3. Re-run the full suite.
 
-**Max 5 implementation-test cycles.** If you cannot get green after 5 attempts, stop and comment on the issue describing what's failing and why. Add `status/blocked` and request human input.
+**Max 5 implementation-test cycles.** If you cannot get green after 5 attempts, stop and comment on the issue describing what's failing and why. Block the issue with `scripts/block-issue.sh <issue> <blocker>` (if a specific blocker exists) or add `status/blocked` manually, and request human input.
 
 ---
 
