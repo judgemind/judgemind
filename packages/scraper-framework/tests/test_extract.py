@@ -979,6 +979,7 @@ class TestLooksLikeMotionText:
     def test_motion_to_compel(self) -> None:
         assert _looks_like_motion_text("Motion To Compel v. Quash Subpoena") is True
 
+
 # ---------------------------------------------------------------------------
 # Party extraction from case captions
 # ---------------------------------------------------------------------------
