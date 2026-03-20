@@ -6,6 +6,7 @@ import json
 from unittest.mock import MagicMock, patch
 
 import pytest
+from judgemind_config import DEFAULT_HAIKU_MODEL
 
 from entity_extraction.extractor import EntityExtractor, ExtractedEntities
 
@@ -458,7 +459,7 @@ class TestEntityExtractorApiInteraction:
         extractor.extract("Test ruling text")
 
         call_kwargs = mock_client.messages.create.call_args
-        assert call_kwargs.kwargs["model"] == "claude-haiku-4-5-20251001"
+        assert call_kwargs.kwargs["model"] == DEFAULT_HAIKU_MODEL
 
     @patch("entity_extraction.extractor.anthropic.Anthropic")
     def test_passes_ruling_text_in_message(self, mock_anthropic_cls: MagicMock) -> None:

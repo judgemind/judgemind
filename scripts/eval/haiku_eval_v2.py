@@ -34,6 +34,11 @@ from pathlib import Path
 import anthropic
 
 try:
+    from judgemind_config import DEFAULT_HAIKU_MODEL as _HAIKU_MODEL
+except ImportError:
+    _HAIKU_MODEL = "claude-haiku-4-5-20251001"
+
+try:
     import fitz  # pymupdf
 
     HAS_PYMUPDF = True
@@ -49,7 +54,7 @@ FIXTURES_DIR = REPO_ROOT / "packages" / "scraper-framework" / "tests" / "fixture
 EXPECTED_DIR = FIXTURES_DIR / "expected"
 RESULTS_DIR = Path(__file__).resolve().parent / "results"
 
-MODEL_ID = "claude-haiku-4-5-20251001"
+MODEL_ID = _HAIKU_MODEL
 MODEL_NAME = "haiku"
 
 # Fields we compare at the document level

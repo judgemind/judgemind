@@ -17,6 +17,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
+# Install shared judgemind-config package first
+COPY packages/judgemind-config /tmp/judgemind-config
+RUN pip install --no-cache-dir /tmp/judgemind-config && rm -rf /tmp/judgemind-config
+
 # Install scraper-framework deps (same as production image, minus playwright)
 COPY packages/scraper-framework/pyproject.toml ./pyproject.toml
 COPY packages/scraper-framework/src/ ./src/

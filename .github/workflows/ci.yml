@@ -36,10 +36,14 @@ jobs:
         id: changes
         with:
           filters: |
+            config:
+              - 'packages/judgemind-config/**'
             scraper:
               - 'packages/scraper-framework/**'
+              - 'packages/judgemind-config/**'
             nlp:
               - 'packages/nlp-pipeline/**'
+              - 'packages/judgemind-config/**'
             api:
               - 'packages/api/**'
             web:
@@ -48,6 +52,7 @@ jobs:
               - 'infra/**'
             telegram:
               - 'packages/telegram-bridge/**'
+              - 'packages/judgemind-config/**'
             infra-lambda:
               - 'infra/telegram-bot/**'
             scripts:
@@ -104,6 +109,7 @@ jobs:
         if: steps.venv-cache.outputs.cache-hit != 'true' || env.venv-invalid == 'true'
         run: |
           python -m venv .venv
+          .venv/bin/pip install -e ../../packages/judgemind-config
           .venv/bin/pip install -e ".[dev]"
       - name: Lint
         run: .venv/bin/ruff check src/ tests/
@@ -161,6 +167,7 @@ jobs:
         if: steps.venv-cache.outputs.cache-hit != 'true' || env.venv-invalid == 'true'
         run: |
           python -m venv .venv
+          .venv/bin/pip install -e ../../packages/judgemind-config
           .venv/bin/pip install -e ".[dev]"
       - name: Test
         run: >-
@@ -215,6 +222,7 @@ jobs:
         if: steps.venv-cache.outputs.cache-hit != 'true' || env.venv-invalid == 'true'
         run: |
           python -m venv .venv
+          .venv/bin/pip install -e ../../packages/judgemind-config
           .venv/bin/pip install -e ".[dev]"
       - name: Lint
         run: .venv/bin/ruff check src/ tests/
@@ -371,6 +379,7 @@ jobs:
         if: steps.venv-cache.outputs.cache-hit != 'true' || env.venv-invalid == 'true'
         run: |
           python -m venv .venv
+          .venv/bin/pip install -e ../../packages/judgemind-config
           .venv/bin/pip install -e ".[dev]"
       - name: Lint
         run: .venv/bin/ruff check src/ tests/
@@ -498,7 +507,7 @@ jobs:
         with:
           python-version: '3.12'
       - name: Install test dependencies
-        run: pip install pytest boto3
+        run: pip install pytest boto3 -e packages/judgemind-config
       - name: Test
         run: pytest scripts/tests/ -v --tb=short
       - name: Check AWS CLI boolean flag usage

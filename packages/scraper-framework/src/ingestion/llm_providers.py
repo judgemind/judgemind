@@ -19,6 +19,7 @@ from dataclasses import dataclass
 
 import anthropic
 import structlog
+from judgemind_config import DEFAULT_HAIKU_MODEL
 
 logger = structlog.get_logger(__name__)
 
@@ -27,7 +28,7 @@ logger = structlog.get_logger(__name__)
 # ---------------------------------------------------------------------------
 
 _PROVIDER_DEFAULT_MODELS: dict[str, str] = {
-    "anthropic": "claude-haiku-4-5-20251001",
+    "anthropic": DEFAULT_HAIKU_MODEL,
     "google": "gemini-2.5-flash-lite",
 }
 
@@ -260,7 +261,7 @@ def call_llm(
     resolved_model = (
         model
         or os.environ.get("LLM_MODEL")
-        or _PROVIDER_DEFAULT_MODELS.get(resolved_provider, "claude-haiku-4-5-20251001")
+        or _PROVIDER_DEFAULT_MODELS.get(resolved_provider, DEFAULT_HAIKU_MODEL)
     )
 
     if resolved_provider == "anthropic":

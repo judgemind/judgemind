@@ -10,6 +10,7 @@ import json
 from dataclasses import dataclass
 
 import anthropic
+from judgemind_config import DEFAULT_HAIKU_MODEL
 
 # Allowed values for ruling outcomes
 OUTCOME_VALUES = frozenset(
@@ -118,7 +119,7 @@ class RulingClassifier:
             raise ValueError("ruling_text must not be empty")
 
         response = self._client.messages.create(
-            model="claude-haiku-4-5-20251001",
+            model=DEFAULT_HAIKU_MODEL,
             max_tokens=256,
             system=_SYSTEM_PROMPT,
             messages=[

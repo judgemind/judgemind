@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any
 
 import anthropic
+from judgemind_config import DEFAULT_HAIKU_MODEL
 
 logger = logging.getLogger(__name__)
 
@@ -59,7 +60,7 @@ KNOWN_ACTION_TYPES: frozenset[str] = frozenset(_ACTION_SCHEMAS)
 ALLOWED_PRIORITIES: frozenset[str] = frozenset({"p1", "p2", "p3"})
 
 # The model to use for lightweight interpretation.  Haiku is fast and cheap.
-_DEFAULT_MODEL = "claude-haiku-4-5-20251001"
+_DEFAULT_MODEL = DEFAULT_HAIKU_MODEL
 
 # The model to use for full agent mode with tool use.
 OPUS_MODEL = "claude-opus-4-20250514"
