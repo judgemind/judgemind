@@ -56,6 +56,16 @@ if [[ ! -d "$STATE_DIR" ]]; then
     exit 1
 fi
 
+# Determine output filenames based on review mode (standard vs adversarial).
+# These must match the filenames used by gemini_review.py.
+if [[ "$ADVERSARIAL" == "true" ]]; then
+    RESULT_FILE="${STATE_DIR}/adversarial-result.txt"
+    FEEDBACK_FILE="${STATE_DIR}/adversarial-feedback.md"
+else
+    RESULT_FILE="${STATE_DIR}/gemini-review-result.txt"
+    FEEDBACK_FILE="${STATE_DIR}/gemini-feedback.md"
+fi
+
 # Generate diff.txt and changed_files.txt from the worktree.
 # Skip generation if the files already exist and are non-empty — the ralph loop
 # pre-generates them once before launching parallel reviewers to avoid a race
@@ -65,8 +75,8 @@ if [[ -s "${STATE_DIR}/diff.txt" && -s "${STATE_DIR}/changed_files.txt" ]]; then
 else
     if ! git -C "$WORKTREE" diff > "${STATE_DIR}/diff.txt" 2>&1; then
         echo "ERROR: 'git diff' failed in worktree $WORKTREE" >&2
-        echo "SKIPPED" > "${STATE_DIR}/gemini-review-result.txt"
-        echo "Gemini review skipped: git diff failed." > "${STATE_DIR}/gemini-feedback.md"
+        echo "SKIPPED" > "$RESULT_FILE"
+        echo "Gemini review skipped: git diff failed." > "$FEEDBACK_FILE"
         exit 2
     fi
     if ! git -C "$WORKTREE" diff --cached >> "${STATE_DIR}/diff.txt" 2>&1; then
@@ -99,49 +109,82 @@ fi
 # run-py.sh would use that venv.  But for non-scraper tasks (API, frontend,
 # infra), that venv may not exist.  In that case, create a lightweight
 # .venv-scripts venv with just the script dependencies.
+#
+# NOTE: Both the standard and adversarial reviews run this script in
+# parallel.  A lockfile prevents races when creating .venv-scripts.
 SCRAPER_VENV="${WORKTREE}/packages/scraper-framework/.venv/bin/python3"
-PYTHON="python3"
 
 if [[ -x "$SCRAPER_VENV" ]]; then
-    # Scraper-framework venv exists — use it directly
-    :
+    # Scraper-framework venv exists — use it directly.
+    PYTHON="$SCRAPER_VENV"
 else
-    # No scraper-framework venv — create/reuse a lightweight scripts venv
+    # No scraper-framework venv — create/reuse a lightweight scripts venv.
     SCRIPTS_VENV="${WORKTREE}/.venv-scripts"
-    if [[ ! -d "$SCRIPTS_VENV" ]]; then
-        echo "INFO: Creating scripts venv at ${SCRIPTS_VENV}..." >&2
-        BASE_PYTHON=""
-        for candidate in python3.12 python3.11 python3; do
-            if command -v "$candidate" &>/dev/null; then
-                BASE_PYTHON="$candidate"
+
+    if [[ ! -d "$SCRIPTS_VENV" ]] || ! "${SCRIPTS_VENV}/bin/python3" -c "from google import genai" 2>/dev/null; then
+        # Acquire a lock so parallel invocations don't race on venv creation.
+        # Uses mkdir as an atomic lock primitive (works on both Linux and macOS).
+        LOCKDIR="${SCRIPTS_VENV}.lock"
+        LOCK_ACQUIRED=false
+        for _attempt in $(seq 1 60); do
+            if mkdir "$LOCKDIR" 2>/dev/null; then
+                LOCK_ACQUIRED=true
                 break
             fi
+            sleep 2
         done
-        BASE_PYTHON="${BASE_PYTHON:-python3}"
-
-        "$BASE_PYTHON" -m venv "$SCRIPTS_VENV" || {
-            echo "WARNING: Could not create scripts venv. Skipping Gemini review." >&2
-            echo "SKIPPED" > "${STATE_DIR}/gemini-review-result.txt"
-            echo "Gemini review skipped: could not create scripts venv." > "${STATE_DIR}/gemini-feedback.md"
+        if [[ "$LOCK_ACQUIRED" != "true" ]]; then
+            echo "WARNING: Could not acquire venv lock after 120s. Skipping Gemini review." >&2
+            echo "SKIPPED" > "$RESULT_FILE"
+            echo "Gemini review skipped: could not acquire venv lock." > "$FEEDBACK_FILE"
             exit 2
-        }
+        fi
+        # Ensure the lock directory is removed on exit from this block.
+        trap 'rmdir "$LOCKDIR" 2>/dev/null || true' EXIT
+
+        # Re-check after acquiring the lock — the other process may have finished setup.
+        if [[ ! -d "$SCRIPTS_VENV" ]] || ! "${SCRIPTS_VENV}/bin/python3" -c "from google import genai" 2>/dev/null; then
+            echo "INFO: Creating scripts venv at ${SCRIPTS_VENV}..." >&2
+            BASE_PYTHON=""
+            for candidate in python3.12 python3.11 python3; do
+                if command -v "$candidate" &>/dev/null; then
+                    BASE_PYTHON="$candidate"
+                    break
+                fi
+            done
+            BASE_PYTHON="${BASE_PYTHON:-python3}"
+
+            "$BASE_PYTHON" -m venv "$SCRIPTS_VENV" || {
+                echo "WARNING: Could not create scripts venv. Skipping Gemini review." >&2
+                echo "SKIPPED" > "$RESULT_FILE"
+                echo "Gemini review skipped: could not create scripts venv." > "$FEEDBACK_FILE"
+                rmdir "$LOCKDIR" 2>/dev/null || true
+                exit 2
+            }
+
+            echo "INFO: Installing script dependencies into ${SCRIPTS_VENV}..." >&2
+            "${SCRIPTS_VENV}/bin/python3" -m pip install -r "${SCRIPT_DIR}/requirements.txt" --quiet 2>&1 || {
+                echo "WARNING: Could not install script dependencies. Skipping Gemini review." >&2
+                echo "SKIPPED" > "$RESULT_FILE"
+                echo "Gemini review skipped: google-genai package not available." > "$FEEDBACK_FILE"
+                rmdir "$LOCKDIR" 2>/dev/null || true
+                exit 2
+            }
+        fi
+
+        rmdir "$LOCKDIR" 2>/dev/null || true
+        trap - EXIT
     fi
 
     PYTHON="${SCRIPTS_VENV}/bin/python3"
+fi
 
-    # Install dependencies if google-genai is not yet available
-    if ! "$PYTHON" -c "from google import genai" 2>&1; then
-        echo "INFO: Installing script dependencies into ${SCRIPTS_VENV}..." >&2
-        "$PYTHON" -m pip install -r "${SCRIPT_DIR}/requirements.txt" --quiet || {
-            echo "WARNING: Could not install script dependencies. Skipping Gemini review." >&2
-            echo "SKIPPED" > "${STATE_DIR}/gemini-review-result.txt"
-            echo "Gemini review skipped: google-genai package not available." > "${STATE_DIR}/gemini-feedback.md"
-            exit 2
-        }
-    fi
-
-    # No special env vars needed — the `# venv:` header is just a comment
-    # when the script is invoked directly (not via run-py.sh).
+# Final sanity check — whichever Python we chose must be able to import genai.
+if ! "$PYTHON" -c "from google import genai" 2>/dev/null; then
+    echo "WARNING: google-genai not importable by ${PYTHON}. Skipping Gemini review." >&2
+    echo "SKIPPED" > "$RESULT_FILE"
+    echo "Gemini review skipped: google-genai not importable." > "$FEEDBACK_FILE"
+    exit 2
 fi
 
 # Run the review with the Google API key injected from Secrets Manager
