@@ -15,10 +15,9 @@
 #   AWS_REGION defaults to us-west-2 if not set.
 #
 # Exit codes:
-#   0  — message sent successfully (or no recipients configured)
+#   0  — message sent successfully to at least one recipient (or no recipients configured)
 #   1  — usage error or secret retrieval failure
-#   Note: individual send failures are logged but do not cause a non-zero exit,
-#   so this script is safe to use with continue-on-error in CI.
+#   2  — all sends failed (logged to stderr)
 
 set -euo pipefail
 
@@ -102,8 +101,17 @@ PAYLOAD_EOF
     fi
 done
 
-if [ "$SEND_FAILURES" -gt 0 ]; then
-    echo "$SCRIPT_NAME: $SEND_FAILURES send failure(s), but not failing the step" >&2
+# Count total recipients for comparison
+TOTAL_RECIPIENTS=0
+for _ in $USER_IDS; do
+    TOTAL_RECIPIENTS=$((TOTAL_RECIPIENTS + 1))
+done
+
+if [ "$SEND_FAILURES" -eq "$TOTAL_RECIPIENTS" ] && [ "$TOTAL_RECIPIENTS" -gt 0 ]; then
+    echo "$SCRIPT_NAME: all $SEND_FAILURES send(s) failed" >&2
+    exit 2
+elif [ "$SEND_FAILURES" -gt 0 ]; then
+    echo "$SCRIPT_NAME: $SEND_FAILURES of $TOTAL_RECIPIENTS send(s) failed (partial delivery)" >&2
 fi
 
 exit 0
