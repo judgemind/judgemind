@@ -1,5 +1,5 @@
 ---
-description: Periodic codebase health audit — reviews recent PRs, checks for dead code, test gaps, performance issues, security concerns, and dependency health. Files issues for findings. Triggered by the orchestrator every 20 merged PRs.
+description: Periodic codebase health audit — reviews recent PRs, checks for dead code, test gaps, performance issues, security concerns, and dependency health. Files issues for findings. Triggered by the dispatcher every 20 merged PRs.
 argument-hint: ""
 maxTurns: 200
 ---
@@ -8,7 +8,7 @@ maxTurns: 200
 
 Perform a comprehensive codebase health audit, filing GitHub issues for every actionable finding. This skill is read-only — it analyzes and reports but never modifies source code.
 
-**Trigger:** The orchestrator spawns `/audit` every 20 merged PRs (tracked via `prs_since_last_audit` in `tmp/orchestrator_status.json`). It can also be invoked manually.
+**Trigger:** The dispatcher spawns `/audit` every 20 merged PRs (tracked via `prs_since_last_audit` in `tmp/orchestrator_status.json`). It can also be invoked manually.
 
 **Prerequisites:** Must be in a worktree. No special dependencies required — the audit uses Read, Grep, Glob, and `gh` CLI only.
 

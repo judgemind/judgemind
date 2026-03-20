@@ -44,9 +44,9 @@ There is **no GitHub Actions deploy workflow** for the web frontend — Vercel h
 
 ### Terraform apply after merge
 
-**Dev apply is automated by the orchestrator.** When the orchestrator merges a PR that touches `infra/terraform/`, it automatically runs `terraform apply` for the dev environment. The orchestrator detects infra PRs by checking changed file paths, determines which environments need an apply, and handles init/plan/apply inline. See `.claude/skills/orchestrator/SKILL.md` "Auto-apply dev terraform" for the full procedure.
+**Dev apply is automated by the dispatcher.** When the dispatcher merges a PR that touches `infra/terraform/`, it automatically runs `terraform apply` for the dev environment. The dispatcher detects infra PRs by checking changed file paths, determines which environments need an apply, and handles init/plan/apply inline. See `.claude/skills/dispatcher/SKILL.md` "Auto-apply dev terraform" for the full procedure.
 
-**If the orchestrator is not running** (e.g., during interactive sessions), the subagent that authored the PR must apply to dev manually:
+**If the dispatcher is not running** (e.g., during interactive sessions), the subagent that authored the PR must apply to dev manually:
 ```
 terraform -chdir=$REPO_ROOT/infra/terraform/environments/dev apply -target=module.<module_name> -auto-approve
 ```

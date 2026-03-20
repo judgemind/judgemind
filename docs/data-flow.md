@@ -121,7 +121,7 @@ The `nlp-pipeline` package (`packages/nlp-pipeline/`) contains modules for class
 
 ## Telegram Bridge (telegram-bridge) -- Operational Tooling
 
-The `telegram-bridge` package is not part of the data pipeline. It provides bidirectional communication between orchestrator agents and the maintainer via Telegram for operational notifications and commands. Fully opt-in.
+The `telegram-bridge` package is not part of the data pipeline. It provides bidirectional communication between dispatcher agents and the maintainer via Telegram for operational notifications and commands. Fully opt-in.
 
 ## Reingestion
 

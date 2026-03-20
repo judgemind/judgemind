@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # PreToolUse hook for Edit and Write tools: warns when editing files on the main
-# branch, as a reminder to orchestrators to delegate via /task instead.
+# branch, as a reminder to dispatchers to delegate via /task instead.
 #
 # This hook receives the tool input as JSON on stdin. It extracts the file_path
 # and checks whether the current branch is main/master. If so, it prints a
@@ -16,7 +16,7 @@
 # directory and resolves the branch from there.
 #
 # Exceptions (no warning):
-#   - Files under tmp/          (orchestrator temp files)
+#   - Files under tmp/          (dispatcher temp files)
 #   - Files under ~/.claude/    (memory updates)
 #   - Files under .claude/      (settings/hook config)
 #

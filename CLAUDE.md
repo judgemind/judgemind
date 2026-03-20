@@ -60,7 +60,7 @@ Wait for the user's instruction before deciding what to do. Sessions fall into t
 
 ### Interactive sessions (human present)
 
-Interactive sessions are **general-purpose** — the user decides what the session is for. To enable autonomous work queue management, invoke `/orchestrator`. This is opt-in.
+Interactive sessions are **general-purpose** — the user decides what the session is for. To enable autonomous work queue management, invoke `/dispatcher`. This is opt-in.
 
 ### Autonomous sessions (subagent via `/task`)
 
@@ -71,8 +71,8 @@ Subagents do the implementation work: worktree setup, coding, testing, PR, and r
 - **`/task`** — Full autonomous pipeline: worktree, issue claim, implementation, PR, review. Accepts `#N`, natural language, or no argument (picks highest priority).
 - **`/ralph`** — Iterative work-review loop. Spawns worker (TDD) and reviewer subagents. Called by `/task` automatically for testable code tasks.
 - **`/tdd`** — Test-driven implementation for code tasks (Python, TypeScript). Called by `/ralph` internally. **Not for** Terraform, DB migrations, CI/CD, docs, or investigation tasks.
-- **`/orchestrator`** — Opt-in autonomous work queue manager. See `.claude/skills/orchestrator/SKILL.md`.
-- **`/audit`** — Periodic codebase health audit. Reviews recent PRs, checks for dead code, test gaps, performance issues, security concerns, and dependency health. Files issues for findings. Triggered by the orchestrator every 20 merged PRs, or manually.
+- **`/dispatcher`** — Opt-in autonomous work queue manager. See `.claude/skills/dispatcher/SKILL.md`.
+- **`/audit`** — Periodic codebase health audit. Reviews recent PRs, checks for dead code, test gaps, performance issues, security concerns, and dependency health. Files issues for findings. Triggered by the dispatcher every 20 merged PRs, or manually.
 
 ### Worktree setup (manual)
 
@@ -381,7 +381,7 @@ Key paths: framework in `packages/scraper-framework/src/framework/`, California 
 - Terraform for all AWS resources. Every resource must be in a module.
 - **Do NOT add `tags` blocks to individual resources** — the AWS provider's `default_tags` handles this.
 - Never commit AWS credentials or state files.
-- **Dev terraform apply is automated.** After a PR that touches `infra/terraform/` merges to main, the orchestrator automatically runs `terraform apply` for the dev environment. Production applies remain human-only. See `.claude/skills/orchestrator/SKILL.md` for the full apply procedure.
+- **Dev terraform apply is automated.** After a PR that touches `infra/terraform/` merges to main, the dispatcher automatically runs `terraform apply` for the dev environment. Production applies remain human-only. See `.claude/skills/dispatcher/SKILL.md` for the full apply procedure.
 
 For Terraform apply/deploy details, see `docs/agent/infrastructure-reference.md`.
 
@@ -401,7 +401,7 @@ When one of these tags arrives and you have a **pending question**: do not treat
 
 Telegram integration is opt-in. For full details, see `docs/agent/telegram-reference.md`.
 
-When the user asks to pick up work, invoke `/task` as a background subagent. To enable continuous autonomous work queue management, invoke `/orchestrator`.
+When the user asks to pick up work, invoke `/task` as a background subagent. To enable continuous autonomous work queue management, invoke `/dispatcher`.
 
 ## Improving the Agent Workflow
 

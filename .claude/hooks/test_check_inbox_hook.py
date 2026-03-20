@@ -97,7 +97,7 @@ def test_empty_json_array() -> None:
 
 
 def test_echoes_messages() -> None:
-    """Reader prints messages prefixed with [orchestrator]."""
+    """Reader prints messages prefixed with [dispatcher]."""
     with tempfile.TemporaryDirectory() as tmp:
         inbox = os.path.join(tmp, "inbox.json")
         messages = [
@@ -111,8 +111,8 @@ def test_echoes_messages() -> None:
         assert result.returncode == 0
         lines = result.stdout.strip().split("\n")
         assert len(lines) == 2, f"Expected 2 lines, got {len(lines)}: {lines}"
-        assert lines[0] == "[orchestrator] Rebase onto main"
-        assert lines[1] == "[orchestrator] PR #100 merged"
+        assert lines[0] == "[dispatcher] Rebase onto main"
+        assert lines[1] == "[dispatcher] PR #100 merged"
 
 
 def test_truncates_after_reading() -> None:
@@ -161,7 +161,7 @@ def test_handles_non_dict_entries() -> None:
         assert result.returncode == 0
         lines = result.stdout.strip().split("\n")
         assert len(lines) == 1, f"Expected 1 line, got {len(lines)}: {lines}"
-        assert lines[0] == "[orchestrator] valid message"
+        assert lines[0] == "[dispatcher] valid message"
 
 
 def test_no_arguments() -> None:
@@ -184,7 +184,7 @@ run_test("No inbox file — no output, exit 0", test_no_inbox_file)
 run_test("Empty inbox file — no output, exit 0", test_empty_inbox_file)
 run_test("Whitespace-only inbox — truncated, no output", test_whitespace_only_inbox_truncated)
 run_test("Empty JSON array — no output, truncates", test_empty_json_array)
-run_test("Echoes messages with [orchestrator] prefix", test_echoes_messages)
+run_test("Echoes messages with [dispatcher] prefix", test_echoes_messages)
 run_test("Truncates inbox after reading", test_truncates_after_reading)
 run_test("Handles malformed JSON gracefully", test_handles_malformed_json)
 run_test("Handles non-dict entries gracefully", test_handles_non_dict_entries)
