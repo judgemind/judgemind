@@ -5,6 +5,18 @@ import { useQuery, gql } from '@apollo/client';
 import { useRouter, useSearchParams } from 'next/navigation';
 import Link from 'next/link';
 import { formatLabel } from '@/lib/display-helpers';
+import { Badge } from '@/components/ui/badge';
+import { Button } from '@/components/ui/button';
+import { Input } from '@/components/ui/input';
+import { Skeleton } from '@/components/ui/skeleton';
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from '@/components/ui/table';
 
 const CASES_QUERY = gql`
   query Cases(
@@ -65,23 +77,25 @@ const PAGE_SIZE = 20;
 /** Known case type filter options. */
 const CASE_TYPES = ['civil', 'family', 'probate', 'small_claims', 'other'] as const;
 
-const STATUS_BADGE: Record<string, string> = {
-  active: 'bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200',
-  closed: 'bg-slate-100 text-slate-600 dark:bg-slate-700 dark:text-slate-300',
-  dismissed: 'bg-red-100 text-red-800 dark:bg-red-900 dark:text-red-200',
+const STATUS_VARIANT: Record<string, 'default' | 'secondary' | 'destructive' | 'outline'> = {
+  active: 'default',
+  closed: 'secondary',
+  dismissed: 'destructive',
 };
 
 function SkeletonRow() {
   return (
-    <div className="flex animate-pulse gap-4 border-b border-slate-100 px-4 py-4 dark:border-slate-700">
-      <div className="flex-1 space-y-2">
-        <div className="h-3 w-1/3 rounded bg-slate-200 dark:bg-slate-700" />
-        <div className="h-3 w-1/2 rounded bg-slate-200 dark:bg-slate-700" />
-      </div>
-      <div className="w-20 shrink-0">
-        <div className="h-5 rounded bg-slate-200 dark:bg-slate-700" />
-      </div>
-    </div>
+    <TableRow>
+      <TableCell>
+        <div className="flex animate-pulse flex-col gap-1">
+          <Skeleton className="h-4 w-32" />
+          <Skeleton className="h-3 w-48" />
+        </div>
+      </TableCell>
+      <TableCell><Skeleton className="h-3 w-24" /></TableCell>
+      <TableCell><Skeleton className="h-3 w-16" /></TableCell>
+      <TableCell><Skeleton className="h-5 w-14" /></TableCell>
+    </TableRow>
   );
 }
 
@@ -93,13 +107,11 @@ export function CasesList() {
   const [statusFilter, setStatusFilter] = useState(searchParams.get('status') ?? '');
   const [typeFilter, setTypeFilter] = useState(searchParams.get('caseType') ?? '');
 
-  // Sync state from URL when search params change (e.g. browser back/forward)
   useEffect(() => {
     setStatusFilter(searchParams.get('status') ?? '');
     setTypeFilter(searchParams.get('caseType') ?? '');
   }, [searchParams]);
 
-  // Sync URL params when filters change
   const updateUrl = useCallback(() => {
     const params = new URLSearchParams();
     if (statusFilter) params.set('status', statusFilter);
@@ -124,7 +136,6 @@ export function CasesList() {
   const edges = data?.cases.edges ?? [];
   const pageInfo = data?.cases.pageInfo;
 
-  // Client-side case number filter (the API doesn't support text search on cases)
   const filteredEdges = caseNumberFilter
     ? edges.filter(
         ({ node }) =>
@@ -151,20 +162,19 @@ export function CasesList() {
 
   return (
     <div>
-      {/* Filters */}
       <div className="mb-4 flex flex-wrap gap-3">
-        <input
+        <Input
           type="text"
           placeholder="Case number or title"
           value={caseNumberFilter}
           onChange={(e) => setCaseNumberFilter(e.target.value)}
-          className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900 placeholder-slate-400 focus:border-brand-500 focus:outline-none focus:ring-1 focus:ring-brand-500 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 dark:placeholder-slate-500"
+          className="w-auto"
         />
         <select
           value={statusFilter}
           onChange={(e) => setStatusFilter(e.target.value)}
           aria-label="Case status"
-          className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900 focus:border-brand-500 focus:outline-none focus:ring-1 focus:ring-brand-500 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100"
+          className="rounded-md border border-input bg-background px-3 py-2 text-sm text-foreground ring-offset-background focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2"
         >
           <option value="">All statuses</option>
           <option value="active">Active</option>
@@ -175,7 +185,7 @@ export function CasesList() {
           value={typeFilter}
           onChange={(e) => setTypeFilter(e.target.value)}
           aria-label="Case type"
-          className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900 focus:border-brand-500 focus:outline-none focus:ring-1 focus:ring-brand-500 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100"
+          className="rounded-md border border-input bg-background px-3 py-2 text-sm text-foreground ring-offset-background focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2"
         >
           <option value="">All types</option>
           {CASE_TYPES.map((ct) => (
@@ -186,93 +196,91 @@ export function CasesList() {
         </select>
       </div>
 
-      {/* Table */}
-      <div className="rounded-lg border border-slate-200 dark:border-slate-700">
-        {/* Header */}
-        <div className="hidden grid-cols-[1fr_10rem_8rem_6rem] gap-4 border-b border-slate-200 px-4 py-2 text-xs font-semibold uppercase tracking-wide text-slate-500 dark:border-slate-700 dark:text-slate-400 sm:grid">
-          <span>Case</span>
-          <span>Court</span>
-          <span>Type</span>
-          <span>Status</span>
-        </div>
+      <div className="rounded-lg border">
+        <Table>
+          <TableHeader>
+            <TableRow>
+              <TableHead>Case</TableHead>
+              <TableHead>Court</TableHead>
+              <TableHead>Type</TableHead>
+              <TableHead>Status</TableHead>
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {loading && edges.length === 0 && (
+              <>
+                {Array.from({ length: 8 }).map((_, i) => (
+                  <SkeletonRow key={i} />
+                ))}
+              </>
+            )}
 
-        {/* Skeleton */}
-        {loading && edges.length === 0 && (
-          <>
-            {Array.from({ length: 8 }).map((_, i) => (
-              <SkeletonRow key={i} />
+            {error && (
+              <TableRow>
+                <TableCell colSpan={4} className="text-center">
+                  <p className="py-4 text-sm text-destructive">
+                    Failed to load cases. Please try again.
+                  </p>
+                </TableCell>
+              </TableRow>
+            )}
+
+            {!loading && !error && filteredEdges.length === 0 && (
+              <TableRow>
+                <TableCell colSpan={4} className="text-center">
+                  <p className="py-4 text-muted-foreground">
+                    No cases found. Try adjusting your filters.
+                  </p>
+                </TableCell>
+              </TableRow>
+            )}
+
+            {filteredEdges.map(({ node }) => (
+              <TableRow key={node.id}>
+                <TableCell className="min-w-0">
+                  <Link
+                    href={`/cases/${node.id}`}
+                    className="block truncate font-medium text-foreground hover:text-primary"
+                  >
+                    {node.caseNumber}
+                  </Link>
+                  {node.caseTitle && (
+                    <p className="truncate text-sm text-muted-foreground">
+                      {node.caseTitle}
+                    </p>
+                  )}
+                </TableCell>
+                <TableCell className="text-sm text-muted-foreground">
+                  {node.court?.county ?? '\u2014'}
+                </TableCell>
+                <TableCell className="text-sm text-muted-foreground">
+                  {formatLabel(node.caseType)}
+                </TableCell>
+                <TableCell>
+                  <Badge
+                    variant={
+                      node.caseStatus
+                        ? (STATUS_VARIANT[node.caseStatus.toLowerCase()] ?? 'outline')
+                        : 'outline'
+                    }
+                  >
+                    {formatLabel(node.caseStatus)}
+                  </Badge>
+                </TableCell>
+              </TableRow>
             ))}
-          </>
-        )}
+          </TableBody>
+        </Table>
 
-        {/* Error */}
-        {error && (
-          <p className="p-8 text-center text-sm text-red-500 dark:text-red-400">
-            Failed to load cases. Please try again.
-          </p>
-        )}
-
-        {/* Empty state */}
-        {!loading && !error && filteredEdges.length === 0 && (
-          <p className="p-8 text-center text-slate-400 dark:text-slate-500">
-            No cases found. Try adjusting your filters.
-          </p>
-        )}
-
-        {/* Rows */}
-        {filteredEdges.map(({ node }) => (
-          <div
-            key={node.id}
-            className="grid grid-cols-1 gap-1 border-b border-slate-100 px-4 py-3 last:border-0 hover:bg-slate-50 dark:border-slate-700 dark:hover:bg-slate-800/50 sm:grid-cols-[1fr_10rem_8rem_6rem] sm:items-center sm:gap-4"
-          >
-            {/* Case number / title */}
-            <div className="min-w-0">
-              <Link
-                href={`/cases/${node.id}`}
-                className="block truncate font-medium text-slate-900 hover:text-brand-600 dark:text-slate-100 dark:hover:text-brand-400"
-              >
-                {node.caseNumber}
-              </Link>
-              {node.caseTitle && (
-                <p className="truncate text-sm text-slate-500 dark:text-slate-400">
-                  {node.caseTitle}
-                </p>
-              )}
-            </div>
-
-            {/* Court / County */}
-            <span className="text-sm text-slate-500 dark:text-slate-400">
-              {node.court?.county ?? '\u2014'}
-            </span>
-
-            {/* Case type */}
-            <span className="text-sm text-slate-500 dark:text-slate-400">
-              {formatLabel(node.caseType)}
-            </span>
-
-            {/* Status badge */}
-            <span
-              className={`inline-flex w-fit items-center rounded px-2 py-0.5 text-xs font-medium ${
-                node.caseStatus && STATUS_BADGE[node.caseStatus.toLowerCase()]
-                  ? STATUS_BADGE[node.caseStatus.toLowerCase()]
-                  : 'bg-slate-100 text-slate-600 dark:bg-slate-700 dark:text-slate-300'
-              }`}
-            >
-              {formatLabel(node.caseStatus)}
-            </span>
-          </div>
-        ))}
-
-        {/* Load more */}
         {pageInfo?.hasNextPage && (
           <div className="flex justify-center py-4">
-            <button
+            <Button
+              variant="outline"
               onClick={handleLoadMore}
               disabled={loading}
-              className="rounded-lg border border-slate-300 bg-white px-4 py-2 text-sm font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-50 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-300 dark:hover:bg-slate-700"
             >
               {loading ? 'Loading\u2026' : 'Load more'}
-            </button>
+            </Button>
           </div>
         )}
       </div>

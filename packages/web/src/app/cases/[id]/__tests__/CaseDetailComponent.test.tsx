@@ -171,9 +171,85 @@ function renderWithProvider(mocks: MockedResponse[]) {
   );
 }
 
+/** Helper: expand a ruling card by clicking its header button. */
+async function expandRuling(label: RegExp) {
+  const btn = await screen.findByLabelText(label, {}, { timeout: 3000 });
+  fireEvent.click(btn);
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+describe('CaseDetail — Card-based layout', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('renders case details in a Card', async () => {
+    const mocks = buildMocks(buildCaseData(), buildRulingsData([]));
+    renderWithProvider(mocks);
+
+    const heading = await screen.findByText('Case Details', {}, { timeout: 3000 });
+    expect(heading).toBeInTheDocument();
+    expect(screen.getByText('Los Angeles Superior Court')).toBeInTheDocument();
+    expect(screen.getByText('Los Angeles')).toBeInTheDocument();
+  });
+
+  it('renders parties in a Card', async () => {
+    const mocks = buildMocks(buildCaseData(), buildRulingsData([]));
+    renderWithProvider(mocks);
+
+    const heading = await screen.findByText('Parties', {}, { timeout: 3000 });
+    expect(heading).toBeInTheDocument();
+    expect(screen.getByText('Plaintiffs')).toBeInTheDocument();
+    expect(screen.getByText('Smith')).toBeInTheDocument();
+    expect(screen.getByText('Defendants')).toBeInTheDocument();
+    expect(screen.getByText('Jones')).toBeInTheDocument();
+  });
+
+  it('renders judges in a Card', async () => {
+    const mocks = buildMocks(buildCaseData(), buildRulingsData([]));
+    renderWithProvider(mocks);
+
+    const heading = await screen.findByText('Judges', {}, { timeout: 3000 });
+    expect(heading).toBeInTheDocument();
+    expect(screen.getByText('Johnson, Robert M.')).toBeInTheDocument();
+  });
+
+  it('renders rulings as Cards with expand/collapse', async () => {
+    const node = buildRulingNode();
+    const mocks = buildMocks(buildCaseData(), buildRulingsData([node]));
+    renderWithProvider(mocks);
+
+    // Ruling header should be visible
+    const rulingBtn = await screen.findByLabelText(/Ruling from/, {}, { timeout: 3000 });
+    expect(rulingBtn).toBeInTheDocument();
+    expect(rulingBtn.getAttribute('aria-expanded')).toBe('false');
+
+    // Ruling text should NOT be visible before expanding
+    expect(screen.queryByText('The motion is granted.')).not.toBeInTheDocument();
+
+    // Click to expand
+    fireEvent.click(rulingBtn);
+    expect(rulingBtn.getAttribute('aria-expanded')).toBe('true');
+
+    // Now ruling text should be visible
+    expect(screen.getByText('The motion is granted.')).toBeInTheDocument();
+  });
+
+  it('uses Badge components for outcome and tentative status', async () => {
+    const node = buildRulingNode();
+    const mocks = buildMocks(buildCaseData(), buildRulingsData([node]));
+    const { container } = renderWithProvider(mocks);
+
+    await screen.findByText('Granted', {}, { timeout: 3000 });
+
+    // Badge uses rounded-full class
+    expect(container.querySelectorAll('.rounded-full').length).toBeGreaterThan(0);
+    expect(screen.getByText('Tentative')).toBeInTheDocument();
+  });
+});
 
 describe('CaseDetail — ruling HTML rendering', () => {
   beforeEach(() => {
@@ -188,9 +264,8 @@ describe('CaseDetail — ruling HTML rendering', () => {
     const mocks = buildMocks(buildCaseData(), buildRulingsData([node]));
     const { container } = renderWithProvider(mocks);
 
-    // Wait for GraphQL data to resolve
-    const grantedEl = await screen.findByText('GRANTED', {}, { timeout: 3000 });
-    expect(grantedEl).toBeInTheDocument();
+    // Expand the ruling card first
+    await expandRuling(/Ruling from/);
 
     // Should render sanitized HTML via dangerouslySetInnerHTML
     const rulingContent = container.querySelector('.ruling-content');
@@ -206,8 +281,8 @@ describe('CaseDetail — ruling HTML rendering', () => {
     const mocks = buildMocks(buildCaseData(), buildRulingsData([node]));
     const { container } = renderWithProvider(mocks);
 
-    // Wait for data
-    await screen.findByText('The motion is granted.', {}, { timeout: 3000 });
+    // Expand the ruling card first
+    await expandRuling(/Ruling from/);
 
     // Should render as plain text paragraphs, not via dangerouslySetInnerHTML
     expect(container.querySelector('.ruling-content')).not.toBeInTheDocument();
@@ -223,7 +298,8 @@ describe('CaseDetail — ruling HTML rendering', () => {
     const mocks = buildMocks(buildCaseData(), buildRulingsData([node]));
     const { container } = renderWithProvider(mocks);
 
-    await screen.findByText('Safe content', {}, { timeout: 3000 });
+    // Expand the ruling card first
+    await expandRuling(/Ruling from/);
 
     const rulingContent = container.querySelector('.ruling-content');
     expect(rulingContent).toBeInTheDocument();
@@ -240,7 +316,8 @@ describe('CaseDetail — ruling HTML rendering', () => {
     const mocks = buildMocks(buildCaseData(), buildRulingsData([node]));
     const { container } = renderWithProvider(mocks);
 
-    await screen.findByText('Content', {}, { timeout: 3000 });
+    // Expand the ruling card first
+    await expandRuling(/Ruling from/);
 
     const rulingContent = container.querySelector('.ruling-content');
     expect(rulingContent).toBeInTheDocument();
@@ -248,8 +325,7 @@ describe('CaseDetail — ruling HTML rendering', () => {
     expect(rulingContent?.innerHTML).not.toContain('onerror');
   });
 
-  it('shows formatted HTML with CSS truncation when collapsed for long content', async () => {
-    // Create a long ruling text that exceeds RULING_TEXT_TRUNCATE_LENGTH (500)
+  it('shows full text when ruling card is expanded (card-based collapse)', async () => {
     const longText = 'A'.repeat(600);
     const node = buildRulingNode({
       rulingTextHtml: `<p>${longText}</p>`,
@@ -258,43 +334,17 @@ describe('CaseDetail — ruling HTML rendering', () => {
     const mocks = buildMocks(buildCaseData(), buildRulingsData([node]));
     const { container } = renderWithProvider(mocks);
 
-    // Wait for data — when collapsed, should show HTML with max-height truncation
-    await screen.findByText('Show more', {}, { timeout: 3000 });
+    // Expand the ruling card
+    await expandRuling(/Ruling from/);
 
-    // Should render formatted HTML even when collapsed (CSS truncation, not text truncation)
+    // Full content should be visible — no CSS truncation in the new Card layout
     const rulingContent = container.querySelector('.ruling-content');
     expect(rulingContent).toBeInTheDocument();
-    expect(rulingContent?.classList.contains('max-h-40')).toBe(true);
-    expect(rulingContent?.classList.contains('overflow-hidden')).toBe(true);
+    expect(rulingContent?.innerHTML).toContain(longText);
 
-    // Should show a fade-out gradient overlay
-    const gradient = container.querySelector('.bg-gradient-to-t');
-    expect(gradient).toBeInTheDocument();
-  });
-
-  it('shows formatted HTML without truncation when expanded for long content', async () => {
-    const longText = 'A'.repeat(600);
-    const node = buildRulingNode({
-      rulingTextHtml: `<p><strong>${longText}</strong></p>`,
-      rulingText: longText,
-    });
-    const mocks = buildMocks(buildCaseData(), buildRulingsData([node]));
-    const { container } = renderWithProvider(mocks);
-
-    // Wait for the Show more button
-    const showMoreButton = await screen.findByText('Show more', {}, { timeout: 3000 });
-
-    // Click to expand
-    fireEvent.click(showMoreButton);
-
-    // Now it should show formatted HTML without max-height restriction
-    const rulingContent = container.querySelector('.ruling-content');
-    expect(rulingContent).toBeInTheDocument();
-    expect(rulingContent?.innerHTML).toContain('<strong>');
-    expect(rulingContent?.classList.contains('max-h-40')).toBe(false);
-
-    // Fade gradient should be gone
+    // No gradient overlay or max-height truncation
     expect(container.querySelector('.bg-gradient-to-t')).not.toBeInTheDocument();
+    expect(rulingContent?.classList.contains('max-h-40')).not.toBe(true);
   });
 
   it('renders only rulingTextHtml when rulingText is null', async () => {
@@ -305,7 +355,8 @@ describe('CaseDetail — ruling HTML rendering', () => {
     const mocks = buildMocks(buildCaseData(), buildRulingsData([node]));
     const { container } = renderWithProvider(mocks);
 
-    await screen.findByText('Only HTML available', {}, { timeout: 3000 });
+    // Expand the ruling card
+    await expandRuling(/Ruling from/);
 
     const rulingContent = container.querySelector('.ruling-content');
     expect(rulingContent).toBeInTheDocument();
@@ -320,7 +371,7 @@ describe('CaseDetail — ruling HTML rendering', () => {
     const mocks = buildMocks(buildCaseData(), buildRulingsData([node]));
     const { container } = renderWithProvider(mocks);
 
-    // Wait for case data to load — CaseDetail renders court/judge info, not caseNumber
+    // Wait for case data to load
     await screen.findByText('Los Angeles Superior Court', {}, { timeout: 3000 });
 
     // No ruling content should be rendered

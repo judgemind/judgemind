@@ -1,7 +1,9 @@
 import { gql } from '@apollo/client';
 import { notFound } from 'next/navigation';
+import Link from 'next/link';
 import { createApolloClient } from '@/lib/apollo-client';
 import { buildCaseHeading, formatLabel } from '@/lib/display-helpers';
+import { Badge } from '@/components/ui/badge';
 import { CaseDetail } from './CaseDetail';
 
 const CASE_QUERY = gql`
@@ -34,10 +36,10 @@ interface CaseData {
   } | null;
 }
 
-const STATUS_BADGE: Record<string, string> = {
-  active: 'bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200',
-  closed: 'bg-slate-100 text-slate-600 dark:bg-slate-700 dark:text-slate-300',
-  dismissed: 'bg-red-100 text-red-800 dark:bg-red-900 dark:text-red-200',
+const STATUS_VARIANT: Record<string, 'default' | 'secondary' | 'destructive' | 'outline'> = {
+  active: 'default',
+  closed: 'secondary',
+  dismissed: 'destructive',
 };
 
 type Props = { params: { id: string } };
@@ -65,33 +67,40 @@ export default async function CaseDetailPage({ params }: Props) {
 
   return (
     <div className="mx-auto max-w-4xl">
+      <nav className="mb-4 text-sm text-muted-foreground">
+        <Link href="/cases" className="hover:text-primary">
+          Cases
+        </Link>
+        <span className="mx-2">/</span>
+        <span className="text-foreground">{caseData.caseNumber}</span>
+      </nav>
+
       <div className="flex flex-wrap items-start gap-3">
-        <h1 className="text-2xl font-bold text-slate-900 dark:text-slate-100">{heading}</h1>
+        <h1 className="text-2xl font-bold text-foreground">{heading}</h1>
         <div className="flex flex-wrap gap-2 pt-1">
           {caseData.caseType && (
-            <span className="inline-flex items-center rounded-full bg-blue-100 px-2.5 py-0.5 text-xs font-medium text-blue-800 dark:bg-blue-900 dark:text-blue-200">
+            <Badge variant="outline">
               {formatLabel(caseData.caseType)}
-            </span>
+            </Badge>
           )}
           {caseData.caseStatus && (
-            <span
-              className={`inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-medium ${
-                STATUS_BADGE[caseData.caseStatus.toLowerCase()] ??
-                'bg-slate-100 text-slate-600 dark:bg-slate-700 dark:text-slate-300'
-              }`}
+            <Badge
+              variant={
+                STATUS_VARIANT[caseData.caseStatus.toLowerCase()] ?? 'outline'
+              }
             >
               {formatLabel(caseData.caseStatus)}
-            </span>
+            </Badge>
           )}
         </div>
       </div>
       {caseData.caseTitle && (
-        <p className="mt-1 text-base text-slate-700 dark:text-slate-300">
+        <p className="mt-1 text-base text-muted-foreground">
           {caseData.caseTitle}
         </p>
       )}
       {caseData.court && (
-        <p className="mt-0.5 text-sm text-slate-500 dark:text-slate-400">
+        <p className="mt-0.5 text-sm text-muted-foreground">
           {caseData.court.courtName} &middot; {caseData.court.county}
         </p>
       )}
