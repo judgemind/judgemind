@@ -50,6 +50,24 @@ export const resolvers = {
     health: () => 'ok',
 
     // -----------------------------------------------------------------------
+    // distinctCounties / distinctJudgeNames — lightweight autocomplete lists
+    // -----------------------------------------------------------------------
+
+    distinctCounties: async (_: unknown, __: unknown, { pool }: Context) => {
+      const { rows } = await pool.query<{ county: string }>(
+        `SELECT DISTINCT county FROM courts WHERE is_active = true ORDER BY county ASC`,
+      );
+      return rows.map((r) => r.county);
+    },
+
+    distinctJudgeNames: async (_: unknown, __: unknown, { pool }: Context) => {
+      const { rows } = await pool.query<{ canonical_name: string }>(
+        `SELECT DISTINCT canonical_name FROM judges WHERE is_active = true ORDER BY canonical_name ASC`,
+      );
+      return rows.map((r) => r.canonical_name);
+    },
+
+    // -----------------------------------------------------------------------
     // searchRulings — full-text + filtered search via OpenSearch
     // -----------------------------------------------------------------------
 
