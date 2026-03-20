@@ -505,6 +505,8 @@ jobs:
         run: scripts/check-aws-bool-flags.sh
       - name: Test AWS CLI boolean flag checker
         run: scripts/tests/test_check_aws_bool_flags.sh
+      - name: Test deprecated model checker
+        run: scripts/tests/test_check_deprecated_models.sh
 
   # ---------------------------------------------------------------
   # Coverage gates: diff coverage (new lines) + overall floor ratchet
@@ -685,6 +687,16 @@ jobs:
         run: python scripts/validate-dq-baselines.py
 
   # ---------------------------------------------------------------
+  # Deprecated model guard: prevent use of deprecated Anthropic models
+  # ---------------------------------------------------------------
+  deprecated-models-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Check for deprecated Anthropic model identifiers
+        run: scripts/check-deprecated-models.sh
+
+  # ---------------------------------------------------------------
   # ECS oneshot import guard: prevent scripts/ from importing siblings
   # ---------------------------------------------------------------
   oneshot-imports-check:
@@ -744,7 +756,7 @@ jobs:
   # Always runs. Reports success only when every applicable job passed or was
   # skipped (path filter did not match). Branch protection requires this check.
   ci-passed:
-    needs: [scraper-unit-tests, ingestion-tests, nlp-tests, api-tests, web-tests, telegram-bridge-tests, infra-validate, lambda-tests, scripts-tests, coverage-check, oneshot-imports-check, dq-baselines-validate, ecs-oneshot-test]
+    needs: [scraper-unit-tests, ingestion-tests, nlp-tests, api-tests, web-tests, telegram-bridge-tests, infra-validate, lambda-tests, scripts-tests, coverage-check, deprecated-models-check, oneshot-imports-check, dq-baselines-validate, ecs-oneshot-test]
     if: always()
     runs-on: ubuntu-latest
     steps:
