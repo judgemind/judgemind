@@ -118,7 +118,7 @@ class RulingClassifier:
             raise ValueError("ruling_text must not be empty")
 
         response = self._client.messages.create(
-            model="claude-3-5-haiku-latest",
+            model="claude-haiku-4-5-20251001",
             max_tokens=256,
             system=_SYSTEM_PROMPT,
             messages=[
