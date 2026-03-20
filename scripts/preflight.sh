@@ -249,6 +249,57 @@ if data:
 }
 
 # --------------------------------------------------------------------------
+# preflight_rate_budget [threshold]
+#   Check the GitHub API rate limit and warn if remaining requests are below
+#   the given threshold (default: 100). Useful before expensive polling
+#   operations like `gh run watch`.
+#
+#   Returns 0 if budget is sufficient (remaining >= threshold).
+#   Returns 1 if budget is low (remaining < threshold).
+#   Returns 2 on error (e.g., gh CLI not available or API unreachable).
+#
+#   Prints remaining request count and reset time to stderr.
+#
+#   Usage:
+#     preflight_rate_budget         # warn if < 100 remaining
+#     preflight_rate_budget 200     # warn if < 200 remaining
+# --------------------------------------------------------------------------
+preflight_rate_budget() {
+    local threshold="${1:-100}"
+
+    if ! command -v gh &>/dev/null; then
+        echo "PREFLIGHT WARN: gh CLI not found — cannot check rate limit." >&2
+        return 2
+    fi
+
+    local rate_json
+    rate_json=$(gh api rate_limit --jq '.rate | "\(.remaining) \(.reset) \(.limit)"' 2>/dev/null) || {
+        echo "PREFLIGHT WARN: Could not query GitHub API rate limit." >&2
+        return 2
+    }
+
+    # Parse "remaining reset_epoch limit"
+    local remaining reset_epoch limit
+    remaining=$(echo "$rate_json" | awk '{print $1}')
+    reset_epoch=$(echo "$rate_json" | awk '{print $2}')
+    limit=$(echo "$rate_json" | awk '{print $3}')
+
+    if [[ -z "$remaining" || -z "$reset_epoch" ]]; then
+        echo "PREFLIGHT WARN: Could not parse rate limit response." >&2
+        return 2
+    fi
+
+    echo "GitHub API rate budget: $remaining/$limit remaining (resets at epoch $reset_epoch)." >&2
+
+    if [[ "$remaining" -lt "$threshold" ]]; then
+        echo "PREFLIGHT WARN: Rate budget low — $remaining requests remaining (threshold: $threshold)." >&2
+        return 1
+    fi
+
+    return 0
+}
+
+# --------------------------------------------------------------------------
 # preflight_no_forbidden_syntax <command_string>
 #   Check a command string for forbidden shell patterns. Mirrors the checks
 #   in .claude/hooks/preflight-bash.sh but can be called from scripts.
