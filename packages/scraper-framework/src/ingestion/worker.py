@@ -18,6 +18,7 @@ Environment variables:
     HEARTBEAT_INTERVAL — Empty poll cycles between heartbeat log messages (default: 60)
     HEARTBEAT_LOG_LEVEL — Log level for heartbeat messages: "DEBUG" or "INFO" (default: "INFO")
     ENABLE_RULING_FORMATTING — Enable LLM-powered ruling text formatting (default: disabled)
+    ENABLE_RULING_SUMMARIZATION — Enable LLM-powered ruling summarization (default: disabled)
 """
 
 from __future__ import annotations
@@ -68,6 +69,7 @@ from .llm_extract import (
 )
 from .llm_providers import create_client as create_llm_client
 from .ruling_formatter import format_ruling_text
+from .ruling_summarizer import summarize_ruling
 from .splitter import make_split_document_id, split_document
 from .text_cleanup import clean_ruling_text
 
@@ -247,6 +249,22 @@ class IngestionWorker:
                 logger.warning(
                     "Ruling formatting enabled but ANTHROPIC_API_KEY not set — "
                     "formatting will use <pre> fallback"
+                )
+
+        # Ruling summarization — uses a dedicated Anthropic client (always Haiku),
+        # separate from the field extraction LLM client which may use Google.
+        self._summarization_enabled = os.environ.get("ENABLE_RULING_SUMMARIZATION", "").lower() in (
+            "1",
+            "true",
+            "yes",
+        )
+        self._summarization_client: object | None = None
+        if self._summarization_enabled:
+            self._summarization_client = create_llm_client(provider="anthropic")
+            if self._summarization_client is None:
+                logger.warning(
+                    "Ruling summarization enabled but ANTHROPIC_API_KEY not set — "
+                    "summarization disabled"
                 )
 
         # LA County department-to-judge mapping — lazy-loaded on first LA event.
@@ -691,6 +709,40 @@ class IngestionWorker:
                 },
             )
 
+        # ------------------------------------------------------------------
+        # LLM-powered ruling summarization (opt-in via ENABLE_RULING_SUMMARIZATION)
+        # ------------------------------------------------------------------
+        summary: str | None = None
+        summary_model: str | None = None
+        summary_generated_at: datetime | None = None
+        if self._summarization_enabled and cleaned_ruling_text:
+            # Build case context for better summaries
+            case_context: dict[str, str] = {}
+            if case_title:
+                case_context["case_title"] = case_title
+            if motion_type:
+                case_context["motion_type"] = motion_type
+
+            t0_sum = time.monotonic()
+            summary, summary_model = summarize_ruling(
+                cleaned_ruling_text,
+                case_context=case_context if case_context else None,
+                client=self._summarization_client,
+                timeout=self._llm_timeout,
+            )
+            sum_latency_ms = round((time.monotonic() - t0_sum) * 1000)
+            if summary is not None:
+                summary_generated_at = datetime.utcnow()
+            logger.info(
+                "Ruling summarization completed",
+                extra={
+                    "document_id": document_id,
+                    "summarization_latency_ms": sum_latency_ms,
+                    "has_summary": summary is not None,
+                    "summary_length": len(summary) if summary else 0,
+                },
+            )
+
         # For split events, use the original document_id for the documents table
         # (one PDF = one document row) but the synthetic split ID for rulings.
         original_document_id = event_data.get("_original_document_id", document_id)
@@ -749,6 +801,9 @@ class IngestionWorker:
                     judge_id=judge_id,
                     outcome=outcome,
                     motion_type=motion_type,
+                    summary=summary,
+                    summary_model=summary_model,
+                    summary_generated_at=summary_generated_at,
                 )
             else:
                 logger.warning("No hearing_date for document %s — ruling row skipped", document_id)

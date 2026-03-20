@@ -489,6 +489,9 @@ def insert_ruling(
     outcome: str | None = None,
     motion_type: str | None = None,
     ruling_text_html: str | None = None,
+    summary: str | None = None,
+    summary_model: str | None = None,
+    summary_generated_at: datetime | None = None,
 ) -> None:
     """Upsert a ruling row linked to the document.
 
@@ -502,12 +505,17 @@ def insert_ruling(
     ``"granted"``, ``"denied"``) or ``None``.  ``motion_type`` is free-text.
 
     ``ruling_text_html`` is LLM-formatted semantic HTML for display.
+
+    ``summary``, ``summary_model``, and ``summary_generated_at`` are
+    AI-generated plain-English summaries produced at ingestion time
+    (gated behind ``ENABLE_RULING_SUMMARIZATION``).
     """
     ruling_text = _strip_nul(ruling_text)
     ruling_text_html = _strip_nul(ruling_text_html)
     department = _strip_nul(department)
     outcome = _strip_nul(outcome)
     motion_type = _strip_nul(motion_type)
+    summary = _strip_nul(summary)
     with conn.cursor() as cur:
         cur.execute(
             """
@@ -515,12 +523,14 @@ def insert_ruling(
                 document_id, case_id, court_id, judge_id,
                 hearing_date, ruling_text, ruling_text_html,
                 department, is_tentative,
-                outcome, motion_type
+                outcome, motion_type,
+                summary, summary_model, summary_generated_at
             )
             VALUES (
                 %s::uuid, %s::uuid, %s::uuid, %s::uuid, %s::date, %s, %s,
                 %s, TRUE,
-                %s::ruling_outcome, %s
+                %s::ruling_outcome, %s,
+                %s, %s, %s
             )
             ON CONFLICT (document_id) DO UPDATE SET
                 judge_id = COALESCE(EXCLUDED.judge_id, rulings.judge_id),
@@ -528,7 +538,12 @@ def insert_ruling(
                 motion_type = COALESCE(EXCLUDED.motion_type, rulings.motion_type),
                 ruling_text = COALESCE(EXCLUDED.ruling_text, rulings.ruling_text),
                 ruling_text_html = COALESCE(EXCLUDED.ruling_text_html, rulings.ruling_text_html),
-                department = COALESCE(EXCLUDED.department, rulings.department)
+                department = COALESCE(EXCLUDED.department, rulings.department),
+                summary = COALESCE(EXCLUDED.summary, rulings.summary),
+                summary_model = COALESCE(EXCLUDED.summary_model, rulings.summary_model),
+                summary_generated_at = COALESCE(
+                    EXCLUDED.summary_generated_at, rulings.summary_generated_at
+                )
             """,
             (
                 document_id,
@@ -541,6 +556,9 @@ def insert_ruling(
                 department,
                 outcome,
                 motion_type,
+                summary,
+                summary_model,
+                summary_generated_at,
             ),
         )
     logger.debug("insert_ruling: document_id=%s", document_id)
