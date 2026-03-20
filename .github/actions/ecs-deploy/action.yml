@@ -1,0 +1,171 @@
+name: "ECS Deploy"
+description: >
+  Shared ECS deployment logic: fetches the current task definition, updates
+  the container image, registers a new revision (preserving execution role,
+  task role, network mode, etc.), and either updates an ECS service or an
+  EventBridge Scheduler target.
+
+inputs:
+  task-family:
+    description: "ECS task definition family name"
+    required: true
+  container-name:
+    description: "Name of the container in the task definition to update"
+    required: true
+  image-uri:
+    description: "Full ECR image URI including tag (e.g. 123456.dkr.ecr.us-west-2.amazonaws.com/repo:tag)"
+    required: true
+  deploy-mode:
+    description: "'service' to update an ECS service, 'scheduler' to update an EventBridge Scheduler target"
+    required: true
+  ecs-cluster:
+    description: "ECS cluster name (required for 'service' mode)"
+    required: false
+    default: ""
+  ecs-service:
+    description: "ECS service name (required for 'service' mode)"
+    required: false
+    default: ""
+  scheduler-name:
+    description: "EventBridge Scheduler name (required for 'scheduler' mode)"
+    required: false
+    default: ""
+
+outputs:
+  task-definition-arn:
+    description: "ARN of the newly registered task definition"
+    value: ${{ steps.register.outputs.arn }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Validate inputs
+      shell: bash
+      run: |
+        if [ "${{ inputs.deploy-mode }}" = "service" ]; then
+          if [ -z "${{ inputs.ecs-cluster }}" ] || [ -z "${{ inputs.ecs-service }}" ]; then
+            echo "ERROR: 'ecs-cluster' and 'ecs-service' are required for deploy-mode=service"
+            exit 1
+          fi
+        elif [ "${{ inputs.deploy-mode }}" = "scheduler" ]; then
+          if [ -z "${{ inputs.scheduler-name }}" ]; then
+            echo "ERROR: 'scheduler-name' is required for deploy-mode=scheduler"
+            exit 1
+          fi
+        else
+          echo "ERROR: deploy-mode must be 'service' or 'scheduler', got '${{ inputs.deploy-mode }}'"
+          exit 1
+        fi
+
+    - name: Get current task definition
+      id: current-task-def
+      shell: bash
+      run: |
+        aws ecs describe-task-definition \
+          --task-definition "${{ inputs.task-family }}" \
+          --query 'taskDefinition' \
+          --output json > current-task-def.json
+
+        echo "Current task definition:"
+        cat current-task-def.json | jq '.taskDefinitionArn'
+
+    - name: Register new task definition revision
+      id: register
+      shell: bash
+      env:
+        IMAGE_URI: ${{ inputs.image-uri }}
+        CONTAINER_NAME: ${{ inputs.container-name }}
+        TASK_FAMILY: ${{ inputs.task-family }}
+      run: |
+        # Update the container image in the task definition
+        jq --arg image "$IMAGE_URI" --arg container "$CONTAINER_NAME" \
+          '.containerDefinitions |= map(if .name == $container then .image = $image else . end)' \
+          current-task-def.json > updated-containers.json
+
+        # Build register-task-definition args, always including task role if present
+        TASK_ROLE=$(jq -r '.taskRoleArn // empty' updated-containers.json)
+        REGISTER_ARGS=(
+          --family "$TASK_FAMILY"
+          --requires-compatibilities $(jq -r '.requiresCompatibilities[]' updated-containers.json)
+          --network-mode $(jq -r '.networkMode' updated-containers.json)
+          --cpu $(jq -r '.cpu' updated-containers.json)
+          --memory $(jq -r '.memory' updated-containers.json)
+          --execution-role-arn $(jq -r '.executionRoleArn' updated-containers.json)
+          --container-definitions "$(jq -c '.containerDefinitions' updated-containers.json)"
+        )
+
+        if [ -n "$TASK_ROLE" ]; then
+          REGISTER_ARGS+=(--task-role-arn "$TASK_ROLE")
+        fi
+
+        NEW_TASK_DEF_ARN=$(aws ecs register-task-definition \
+          "${REGISTER_ARGS[@]}" \
+          --query 'taskDefinition.taskDefinitionArn' \
+          --output text)
+
+        echo "New task definition ARN: $NEW_TASK_DEF_ARN"
+        echo "arn=$NEW_TASK_DEF_ARN" >> "$GITHUB_OUTPUT"
+
+    - name: Update ECS service
+      if: inputs.deploy-mode == 'service'
+      shell: bash
+      env:
+        NEW_TASK_DEF_ARN: ${{ steps.register.outputs.arn }}
+        ECS_CLUSTER: ${{ inputs.ecs-cluster }}
+        ECS_SERVICE: ${{ inputs.ecs-service }}
+      run: |
+        aws ecs update-service \
+          --cluster "$ECS_CLUSTER" \
+          --service "$ECS_SERVICE" \
+          --task-definition "$NEW_TASK_DEF_ARN" \
+          --force-new-deployment \
+          --query 'service.serviceName' \
+          --output text
+
+        echo "Waiting for service to stabilize..."
+        aws ecs wait services-stable \
+          --cluster "$ECS_CLUSTER" \
+          --services "$ECS_SERVICE"
+
+        echo "Service updated successfully."
+
+    - name: Update EventBridge Scheduler target
+      if: inputs.deploy-mode == 'scheduler'
+      shell: bash
+      env:
+        NEW_TASK_DEF_ARN: ${{ steps.register.outputs.arn }}
+        SCHEDULER_NAME: ${{ inputs.scheduler-name }}
+      run: |
+        # Get the current schedule configuration
+        SCHEDULE_JSON=$(aws scheduler get-schedule \
+          --name "$SCHEDULER_NAME" \
+          --output json)
+
+        # Update the task definition ARN in the target's ECS parameters
+        UPDATED_TARGET=$(echo "$SCHEDULE_JSON" | jq --arg arn "$NEW_TASK_DEF_ARN" \
+          '.Target.EcsParameters.TaskDefinitionArn = $arn | .Target')
+
+        # Extract schedule fields needed for update
+        SCHEDULE_EXPR=$(echo "$SCHEDULE_JSON" | jq -r '.ScheduleExpression')
+        SCHEDULE_TZ=$(echo "$SCHEDULE_JSON" | jq -r '.ScheduleExpressionTimezone')
+        STATE=$(echo "$SCHEDULE_JSON" | jq -r '.State')
+        FLEX_WINDOW=$(echo "$SCHEDULE_JSON" | jq -c '.FlexibleTimeWindow')
+        DESCRIPTION=$(echo "$SCHEDULE_JSON" | jq -r '.Description // empty')
+
+        # Build update-schedule command
+        UPDATE_ARGS=(
+          --name "$SCHEDULER_NAME"
+          --schedule-expression "$SCHEDULE_EXPR"
+          --schedule-expression-timezone "$SCHEDULE_TZ"
+          --state "$STATE"
+          --flexible-time-window "$FLEX_WINDOW"
+          --target "$UPDATED_TARGET"
+        )
+
+        if [ -n "$DESCRIPTION" ]; then
+          UPDATE_ARGS+=(--description "$DESCRIPTION")
+        fi
+
+        aws scheduler update-schedule "${UPDATE_ARGS[@]}"
+
+        echo "Updated scheduler '$SCHEDULER_NAME' to use task definition: $NEW_TASK_DEF_ARN"
