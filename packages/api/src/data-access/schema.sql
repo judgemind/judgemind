@@ -348,6 +348,29 @@ COMMENT ON TABLE  staging.ruled_items  IS 'Parsed rulings awaiting validation. O
 
 
 -- =============================================================================
+-- COURT DIRECTORY SNAPSHOTS
+-- Historical department-to-judge directory tracking. Each row captures a
+-- point-in-time snapshot of a court's directory mapping, enabling accurate
+-- historical judge assignment during backfills.
+-- See: https://github.com/judgemind/judgemind/issues/412
+-- =============================================================================
+
+CREATE TABLE court_directory_snapshots (
+    id              SERIAL          PRIMARY KEY,
+    court_id        TEXT            NOT NULL,
+    captured_at     TIMESTAMPTZ     NOT NULL,
+    s3_key          TEXT            NOT NULL,
+    mapping         JSONB           NOT NULL,
+    content_hash    TEXT            NOT NULL
+);
+
+COMMENT ON TABLE  court_directory_snapshots            IS 'Point-in-time snapshots of court dept-to-judge directories for historical lookups.';
+COMMENT ON COLUMN court_directory_snapshots.court_id   IS 'Court identifier (e.g. "ca_los_angeles"). TEXT, not FK, because it is a scraper-level id.';
+COMMENT ON COLUMN court_directory_snapshots.mapping    IS 'JSONB {department: judge_name} mapping parsed from the directory page.';
+COMMENT ON COLUMN court_directory_snapshots.content_hash IS 'SHA-256 of the raw directory response for content-change dedup.';
+
+
+-- =============================================================================
 -- SCRAPER HEALTH
 -- =============================================================================
 
@@ -503,6 +526,9 @@ CREATE INDEX idx_staging_captures_court_id  ON staging.captures(court_id);
 CREATE INDEX idx_staging_captures_status    ON staging.captures(validation_status);
 CREATE INDEX idx_staging_captures_at        ON staging.captures(captured_at DESC);
 CREATE INDEX idx_staging_ruled_status       ON staging.ruled_items(validation_status);
+
+-- Court directory snapshots — find most recent snapshot for a court before a date
+CREATE INDEX idx_court_dir_lookup           ON court_directory_snapshots(court_id, captured_at DESC);
 
 -- Scraper health — dashboard needs recent runs per scraper
 CREATE INDEX idx_scraper_runs_scraper_id    ON scraper_runs(scraper_id, started_at DESC);
