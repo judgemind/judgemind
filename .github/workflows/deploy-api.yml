@@ -232,6 +232,7 @@ jobs:
 
     env:
       API_URL: https://dev.api.judgemind.org/graphql
+      API_BASE_URL: https://dev.api.judgemind.org
 
     steps:
       - name: Wait for service to stabilize
@@ -294,12 +295,62 @@ jobs:
             exit 1
           fi
 
+      - name: Health check — document download
+        id: document-download
+        run: |
+          echo "Querying API for a ruling with a document ID to test download endpoint..."
+
+          # Fetch a documentId from a ruling via the GraphQL API
+          DOC_RESPONSE=$(curl -s --max-time 15 \
+            -X POST "$API_URL" \
+            -H 'Content-Type: application/json' \
+            -d '{"query":"{ rulings(first: 5) { edges { node { documentId } } } }"}')
+
+          DOC_ID=$(echo "$DOC_RESPONSE" | python3 -c "
+          import sys, json
+          data = json.load(sys.stdin)
+          edges = data.get('data', {}).get('rulings', {}).get('edges', [])
+          for edge in edges:
+              doc_id = edge.get('node', {}).get('documentId')
+              if doc_id:
+                  print(doc_id)
+                  sys.exit(0)
+          print('')
+          " 2>/dev/null) || DOC_ID=""
+
+          if [ -z "$DOC_ID" ]; then
+            echo "WARNING: No rulings with documents found in dev — skipping download smoke test."
+            echo "This is not a failure; the dev environment may not have documents yet."
+            exit 0
+          fi
+
+          echo "Testing download endpoint for document: $DOC_ID"
+
+          # Hit the download endpoint — expect 302 redirect
+          HTTP_CODE=$(curl -s -o /tmp/download_response.txt -w '%{http_code}' \
+            --max-time 15 \
+            --retry 2 \
+            --retry-delay 5 \
+            -X GET "$API_BASE_URL/api/documents/$DOC_ID/download")
+
+          echo "HTTP status: $HTTP_CODE"
+
+          if [ "$HTTP_CODE" = "302" ]; then
+            echo "Document download endpoint returned 302 redirect as expected."
+          elif [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 400 ]; then
+            echo "WARNING: Expected 302 but got $HTTP_CODE — endpoint is responding but behavior may differ."
+          else
+            echo "ERROR: Document download endpoint returned HTTP $HTTP_CODE"
+            cat /tmp/download_response.txt 2>/dev/null || true
+            exit 1
+          fi
+
       - name: Set health check status
         if: always()
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          HEALTH_STATUS: ${{ (steps.introspection.outcome == 'success' && steps.sample-query.outcome == 'success') && 'success' || 'failure' }}
-          HEALTH_DESC: ${{ (steps.introspection.outcome == 'success' && steps.sample-query.outcome == 'success') && 'API health check passed' || 'API health check failed' }}
+          HEALTH_STATUS: ${{ (steps.introspection.outcome == 'success' && steps.sample-query.outcome == 'success' && steps.document-download.outcome == 'success') && 'success' || 'failure' }}
+          HEALTH_DESC: ${{ (steps.introspection.outcome == 'success' && steps.sample-query.outcome == 'success' && steps.document-download.outcome == 'success') && 'API health check passed' || 'API health check failed' }}
         run: |
           curl -s -X POST \
             -H "Authorization: token $GH_TOKEN" \
