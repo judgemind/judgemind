@@ -93,14 +93,14 @@ describe('RulingDetail', () => {
     expect(screen.getByText('Judge')).toBeInTheDocument();
     expect(screen.getByText('Johnson, Robert M.')).toBeInTheDocument();
 
-    // Summary section
+    // Summary section (now in a Card)
     expect(screen.getByText('Summary')).toBeInTheDocument();
     expect(screen.getByText('Court grants MSJ in favor of plaintiff.')).toBeInTheDocument();
 
-    // Ruling text section
+    // Ruling text section (now in a Card)
     expect(screen.getByText('Ruling Text')).toBeInTheDocument();
 
-    // Document download section
+    // Document download button
     expect(screen.getByText('Download original document')).toBeInTheDocument();
     expect(screen.getByText('PDF')).toBeInTheDocument();
   });
@@ -121,7 +121,7 @@ describe('RulingDetail', () => {
     expect(judgeLink).toHaveAttribute('href', '/judges/judge-1');
   });
 
-  it('renders download link with correct href from buildDownloadUrl', () => {
+  it('renders download button with correct href from buildDownloadUrl', () => {
     const ruling = buildFullRuling();
     render(<RulingDetail ruling={ruling} />);
 
@@ -211,7 +211,7 @@ describe('RulingDetail', () => {
     expect(caseLink.textContent).toBe('25STCV99999');
   });
 
-  it('renders download link without format badge when documentFormat is null', () => {
+  it('renders download button without format badge when documentFormat is null', () => {
     const ruling = buildFullRuling();
     ruling.documentFormat = null;
     render(<RulingDetail ruling={ruling} />);

@@ -26,10 +26,10 @@ vi.mock('next/link', () => ({
 
 vi.mock('@/lib/display-helpers', () => ({
   formatDate: (d: string) => d,
-  formatOutcome: (o: string | null) => o ?? '—',
-  formatMotionType: (m: string | null) => m ?? '—',
+  formatOutcome: (o: string | null) => o ?? '\u2014',
+  formatMotionType: (m: string | null) => m ?? '\u2014',
   formatJudgeName: (j: { canonicalName: string } | null) =>
-    j?.canonicalName ?? '—',
+    j?.canonicalName ?? '\u2014',
 }));
 
 import { RulingsFeed } from '../RulingsFeed';
@@ -111,7 +111,7 @@ describe('RulingsFeed', () => {
     vi.clearAllMocks();
   });
 
-  it('renders skeleton rows while loading initial data', () => {
+  it('renders skeleton cards while loading initial data', () => {
     mockUseQuery.mockReturnValue({
       data: undefined,
       loading: true,
@@ -119,8 +119,8 @@ describe('RulingsFeed', () => {
       fetchMore: vi.fn(),
     });
 
-    const { container } = render(<RulingsFeed />);
-    const skeletons = container.querySelectorAll('.animate-pulse');
+    render(<RulingsFeed />);
+    const skeletons = screen.getAllByTestId('skeleton-card');
     expect(skeletons.length).toBe(8);
   });
 
@@ -153,7 +153,7 @@ describe('RulingsFeed', () => {
     expect(screen.getByText(/No rulings found/)).toBeInTheDocument();
   });
 
-  it('renders ruling rows with case data', () => {
+  it('renders ruling cards with case data', () => {
     mockUseQuery.mockReturnValue({
       data: MOCK_RULINGS_DATA,
       loading: false,
@@ -164,6 +164,22 @@ describe('RulingsFeed', () => {
     render(<RulingsFeed />);
     expect(screen.getByText(/23STCV12345/)).toBeInTheDocument();
     expect(screen.getByText(/23STCV67890/)).toBeInTheDocument();
+  });
+
+  it('renders outcome and motion type badges', () => {
+    mockUseQuery.mockReturnValue({
+      data: MOCK_RULINGS_DATA,
+      loading: false,
+      error: undefined,
+      fetchMore: vi.fn(),
+    });
+
+    render(<RulingsFeed />);
+    // Outcome badges
+    expect(screen.getByText('granted')).toBeInTheDocument();
+    expect(screen.getByText('denied')).toBeInTheDocument();
+    // Motion type badges
+    expect(screen.getAllByText('Demurrer').length).toBe(2);
   });
 
   it('renders sentinel element when hasNextPage is true', () => {
@@ -269,7 +285,7 @@ describe('RulingsFeed', () => {
     expect(mockFetchMore).not.toHaveBeenCalled();
   });
 
-  it('shows skeleton rows while fetching more results', () => {
+  it('shows skeleton cards while fetching more results', () => {
     mockUseQuery.mockReturnValue({
       data: MOCK_RULINGS_DATA,
       loading: true,
@@ -277,9 +293,9 @@ describe('RulingsFeed', () => {
       fetchMore: vi.fn(),
     });
 
-    const { container } = render(<RulingsFeed />);
-    // Should show 3 skeleton rows for loading more (not the initial 8)
-    const skeletons = container.querySelectorAll('.animate-pulse');
+    render(<RulingsFeed />);
+    // Should show 3 skeleton cards for loading more (not the initial 8)
+    const skeletons = screen.getAllByTestId('skeleton-card');
     expect(skeletons.length).toBe(3);
   });
 

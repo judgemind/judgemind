@@ -11,6 +11,9 @@ import {
 } from '@/lib/display-helpers';
 import { Autocomplete } from '@/components/Autocomplete';
 import { useCountyOptions } from '@/lib/filter-options';
+import { Card, CardContent } from '@/components/ui/card';
+import { Badge } from '@/components/ui/badge';
+import { Skeleton } from '@/components/ui/skeleton';
 
 const RULINGS_QUERY = gql`
   query Rulings(
@@ -86,27 +89,30 @@ interface RulingsData {
 
 const PAGE_SIZE = 20;
 
-const OUTCOME_BADGE: Record<string, string> = {
-  granted: 'bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200',
-  denied: 'bg-red-100 text-red-800 dark:bg-red-900 dark:text-red-200',
-  granted_in_part: 'bg-yellow-100 text-yellow-800 dark:bg-yellow-900 dark:text-yellow-200',
-  denied_in_part: 'bg-yellow-100 text-yellow-800 dark:bg-yellow-900 dark:text-yellow-200',
+const OUTCOME_VARIANT: Record<string, string> = {
+  granted: 'bg-green-100 text-green-800 border-green-200 dark:bg-green-900 dark:text-green-200 dark:border-green-800',
+  denied: 'bg-red-100 text-red-800 border-red-200 dark:bg-red-900 dark:text-red-200 dark:border-red-800',
+  granted_in_part: 'bg-yellow-100 text-yellow-800 border-yellow-200 dark:bg-yellow-900 dark:text-yellow-200 dark:border-yellow-800',
+  denied_in_part: 'bg-yellow-100 text-yellow-800 border-yellow-200 dark:bg-yellow-900 dark:text-yellow-200 dark:border-yellow-800',
 };
 
-function SkeletonRow() {
+function SkeletonCard() {
   return (
-    <div className="flex animate-pulse gap-4 border-b border-slate-100 px-4 py-4 dark:border-slate-700">
-      <div className="w-24 shrink-0 space-y-1">
-        <div className="h-3 w-16 rounded bg-slate-200 dark:bg-slate-700" />
-      </div>
-      <div className="flex-1 space-y-2">
-        <div className="h-3 w-1/3 rounded bg-slate-200 dark:bg-slate-700" />
-        <div className="h-3 w-1/2 rounded bg-slate-200 dark:bg-slate-700" />
-      </div>
-      <div className="w-20 shrink-0">
-        <div className="h-5 rounded bg-slate-200 dark:bg-slate-700" />
-      </div>
-    </div>
+    <Card data-testid="skeleton-card">
+      <CardContent className="p-4">
+        <div className="flex items-start justify-between gap-4">
+          <div className="min-w-0 flex-1 space-y-2">
+            <Skeleton className="h-4 w-2/3" />
+            <Skeleton className="h-3 w-1/2" />
+            <div className="flex gap-2 pt-1">
+              <Skeleton className="h-5 w-16 rounded-full" />
+              <Skeleton className="h-5 w-20 rounded-full" />
+            </div>
+          </div>
+          <Skeleton className="h-3 w-20 shrink-0" />
+        </div>
+      </CardContent>
+    </Card>
   );
 }
 
@@ -201,108 +207,97 @@ export function RulingsFeed() {
         />
       </div>
 
-      {/* Table */}
-      <div className="rounded-lg border border-slate-200 dark:border-slate-700">
-        {/* Header */}
-        <div className="hidden grid-cols-[6rem_1fr_10rem_10rem_6rem] gap-4 border-b border-slate-200 px-4 py-2 text-xs font-semibold uppercase tracking-wide text-slate-500 dark:border-slate-700 dark:text-slate-400 sm:grid">
-          <span>Date</span>
-          <span>Case / Court</span>
-          <span>Judge</span>
-          <span>Motion</span>
-          <span>Outcome</span>
+      {/* Skeleton loading state */}
+      {loading && edges.length === 0 && (
+        <div className="space-y-3">
+          {Array.from({ length: 8 }).map((_, i) => (
+            <SkeletonCard key={i} />
+          ))}
         </div>
+      )}
 
-        {/* Skeleton */}
-        {loading && edges.length === 0 && (
-          <>
-            {Array.from({ length: 8 }).map((_, i) => (
-              <SkeletonRow key={i} />
-            ))}
-          </>
-        )}
+      {/* Error */}
+      {error && (
+        <p className="p-8 text-center text-sm text-red-500 dark:text-red-400">
+          Failed to load rulings. Please try again.
+        </p>
+      )}
 
-        {/* Error */}
-        {error && (
-          <p className="p-8 text-center text-sm text-red-500 dark:text-red-400">
-            Failed to load rulings. Please try again.
-          </p>
-        )}
+      {/* Empty state */}
+      {!loading && !error && edges.length === 0 && (
+        <p className="p-8 text-center text-slate-400 dark:text-slate-500">
+          No rulings found. Try adjusting your filters, or check back after scrapers have run.
+        </p>
+      )}
 
-        {/* Empty state */}
-        {!loading && !error && edges.length === 0 && (
-          <p className="p-8 text-center text-slate-400 dark:text-slate-500">
-            No rulings found. Try adjusting your filters, or check back after scrapers have run.
-          </p>
-        )}
+      {/* Ruling cards */}
+      {edges.length > 0 && (
+        <div className="space-y-3">
+          {edges.map(({ node }) => (
+            <Card key={node.id} className="transition-colors hover:bg-accent/50">
+              <CardContent className="p-4">
+                <div className="flex items-start justify-between gap-4">
+                  {/* Left: case info, judge, badges */}
+                  <div className="min-w-0 flex-1">
+                    {node.case ? (
+                      <Link
+                        href={`/cases/${node.case.id}`}
+                        className="block truncate font-medium text-slate-900 hover:text-brand-600 dark:text-slate-100 dark:hover:text-brand-400"
+                      >
+                        {node.case.caseNumber}
+                        {node.case.caseTitle ? ` \u2014 ${node.case.caseTitle}` : ''}
+                      </Link>
+                    ) : (
+                      <span className="text-slate-400">{'\u2014'}</span>
+                    )}
 
-        {/* Rows */}
-        {edges.map(({ node }) => (
-          <div
-            key={node.id}
-            className="grid grid-cols-1 gap-1 border-b border-slate-100 px-4 py-3 last:border-0 hover:bg-slate-50 dark:border-slate-700 dark:hover:bg-slate-800/50 sm:grid-cols-[6rem_1fr_10rem_10rem_6rem] sm:items-center sm:gap-4"
-          >
-            {/* Date */}
-            <span className="text-xs text-slate-500 dark:text-slate-400">
-              {formatDate(node.hearingDate)}
-            </span>
+                    <div className="mt-0.5 flex flex-wrap items-center gap-x-2 text-xs text-slate-500 dark:text-slate-400">
+                      {node.case?.court && (
+                        <span>{node.case.court.county} {node.department ? `\u00B7 Dept. ${node.department}` : ''}</span>
+                      )}
+                      <span>{formatJudgeName(node.judge)}</span>
+                    </div>
 
-            {/* Case / Court */}
-            <div className="min-w-0">
-              {node.case ? (
-                <Link
-                  href={`/cases/${node.case.id}`}
-                  className="block truncate font-medium text-slate-900 hover:text-brand-600 dark:text-slate-100 dark:hover:text-brand-400"
-                >
-                  {node.case.caseNumber}
-                  {node.case.caseTitle ? ` — ${node.case.caseTitle}` : ''}
-                </Link>
-              ) : (
-                <span className="text-slate-400">—</span>
-              )}
-              {node.case?.court && (
-                <p className="truncate text-xs text-slate-500 dark:text-slate-400">
-                  {node.case.court.county} · {node.department ?? 'Dept unknown'}
-                </p>
-              )}
+                    <div className="mt-2 flex flex-wrap gap-2">
+                      <Badge
+                        className={`${
+                          node.outcome && OUTCOME_VARIANT[node.outcome]
+                            ? OUTCOME_VARIANT[node.outcome]
+                            : 'bg-slate-100 text-slate-600 border-slate-200 dark:bg-slate-700 dark:text-slate-300 dark:border-slate-600'
+                        }`}
+                      >
+                        {formatOutcome(node.outcome)}
+                      </Badge>
+                      <Badge variant="outline" className="text-slate-600 dark:text-slate-400">
+                        {formatMotionType(node.motionType)}
+                      </Badge>
+                    </div>
+                  </div>
+
+                  {/* Right: date */}
+                  <span className="shrink-0 text-xs text-slate-500 dark:text-slate-400">
+                    {formatDate(node.hearingDate)}
+                  </span>
+                </div>
+              </CardContent>
+            </Card>
+          ))}
+
+          {/* Loading indicator for infinite scroll */}
+          {loading && edges.length > 0 && (
+            <div className="space-y-3">
+              {Array.from({ length: 3 }).map((_, i) => (
+                <SkeletonCard key={`loading-${i}`} />
+              ))}
             </div>
+          )}
 
-            {/* Judge */}
-            <span className="text-sm text-slate-700 dark:text-slate-300">
-              {formatJudgeName(node.judge)}
-            </span>
-
-            {/* Motion type */}
-            <span className="text-sm text-slate-500 dark:text-slate-400">
-              {formatMotionType(node.motionType)}
-            </span>
-
-            {/* Outcome badge */}
-            <span
-              className={`inline-flex w-fit items-center rounded px-2 py-0.5 text-xs font-medium ${
-                node.outcome && OUTCOME_BADGE[node.outcome]
-                  ? OUTCOME_BADGE[node.outcome]
-                  : 'bg-slate-100 text-slate-600 dark:bg-slate-700 dark:text-slate-300'
-              }`}
-            >
-              {formatOutcome(node.outcome)}
-            </span>
-          </div>
-        ))}
-
-        {/* Loading indicator for infinite scroll */}
-        {loading && edges.length > 0 && (
-          <>
-            {Array.from({ length: 3 }).map((_, i) => (
-              <SkeletonRow key={`loading-${i}`} />
-            ))}
-          </>
-        )}
-
-        {/* Infinite scroll sentinel */}
-        {pageInfo?.hasNextPage && !loading && (
-          <div ref={sentinelRef} data-testid="scroll-sentinel" className="h-1" />
-        )}
-      </div>
+          {/* Infinite scroll sentinel */}
+          {pageInfo?.hasNextPage && !loading && (
+            <div ref={sentinelRef} data-testid="scroll-sentinel" className="h-1" />
+          )}
+        </div>
+      )}
     </div>
   );
 }
