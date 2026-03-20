@@ -95,12 +95,16 @@ Evaluate the implementation against these criteria:
 
 1. **Correctness**: Does the implementation satisfy the acceptance criteria listed in the task?
 2. **Test coverage**: Are there tests for each acceptance criterion and obvious edge cases?
-3. **Scope**: Are there changes unrelated to the task (scope creep, extra refactors, unrelated fixes)?
-4. **Code quality**: Does it follow existing patterns? Any debug code, hardcoded values, or forgotten TODOs?
-5. **Missing pieces**: Are there files that should have been created or modified but weren't?
-6. **Stale references**: Do comments, imports, or docstrings reference things that changed?
-7. **Documentation consistency**: If the change modifies behavior, configuration, or interfaces — do related docs (`docs/`, `CLAUDE.md`, `.claude/skills/`, `README.md`, `CONTRIBUTING.md`) need corresponding updates? Flag any docs that reference the old behavior.
-8. **Performance**: Are there obvious bottlenecks? Sequential I/O that could be parallelized?
+3. **Scope completeness**: Based on the diff and changed files, does the change need to be applied
+   in other locations too? Look at the patterns being changed — if a fix or feature was applied to
+   one file, check whether similar patterns exist in other files shown in the changed_files context
+   that should also be updated. Flag any incomplete scope as a REVISE reason.
+4. **Scope creep**: Are there changes unrelated to the task (extra refactors, unrelated fixes)?
+5. **Code quality**: Does it follow existing patterns? Any debug code, hardcoded values, or forgotten TODOs?
+6. **Missing pieces**: Are there files that should have been created or modified but weren't?
+7. **Stale references**: Do comments, imports, or docstrings reference things that changed?
+8. **Documentation consistency**: If the change modifies behavior, configuration, or interfaces — do related docs (`docs/`, `CLAUDE.md`, `.claude/skills/`, `README.md`, `CONTRIBUTING.md`) need corresponding updates? Flag any docs that reference the old behavior.
+9. **Performance**: Are there obvious bottlenecks? Sequential I/O that could be parallelized?
    O(n^2) patterns? Missing connection pooling or batching for network calls?
 
 ## Your Response

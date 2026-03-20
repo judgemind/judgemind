@@ -133,6 +133,8 @@ Mark each todo `in_progress` when you start it and `completed` when done. If a t
 
 Read the issue body thoroughly, including linked issues. Check `docs/specs/` for relevant guidance. Look at existing code for patterns — be consistent with what's already there.
 
+**Scope completeness check:** Before implementing, search the codebase for all locations affected by the change. If the issue mentions fixing or changing X in one file, grep for X across the entire codebase. List all locations that use, render, or implement the same pattern. If the issue's scope doesn't cover all of them, either expand scope to include them or file follow-up issues for the missed locations so they are tracked. Document the scope check results (what you searched for, what you found) in your implementation notes or the PR body.
+
 If the issue requires a maintainer decision before you can proceed: comment on it, add `status/blocked`, and stop. Do not guess on ambiguous requirements.
 
 ---
