@@ -112,7 +112,7 @@ Spawn a **worker subagent** (using the Agent tool) with this prompt structure:
 
 After the worker subagent completes, read `{worktree}/tmp/ralph/work-status.txt`.
 
-- If **STUCK**: Stop the loop. Comment on the issue describing the blocker. Add `status/blocked`. Return to the caller with failure status.
+- If **STUCK**: Stop the loop. Comment on the issue describing the blocker. Block the issue with `scripts/block-issue.sh <issue> <blocker>` (if a specific blocking issue exists) or add `status/blocked` manually. Return to the caller with failure status.
 - If **COMPLETE**: Continue to the sequential review phase.
 
 ### 2b — Sequential review phase
@@ -244,7 +244,7 @@ Run this script with any available Python 3 interpreter (e.g. a venv python from
 **All three reviewers must agree to SHIP:**
 
 - If Claude says **SHIP** AND (Gemini standard says **SHIP** or **SKIPPED**) AND (Gemini adversarial says **SHIP** or **SKIPPED**): The loop is done. Continue to Step 3.
-- If ANY reviewer says **REVISE**: Increment iteration. If `iteration > max_iterations`, stop the loop and comment on the issue that the ralph loop hit its max iterations — add `status/blocked` and return with failure. Otherwise:
+- If ANY reviewer says **REVISE**: Increment iteration. If `iteration > max_iterations`, stop the loop and comment on the issue that the ralph loop hit its max iterations — block the issue with `scripts/block-issue.sh <issue> <blocker>` (if applicable) or add `status/blocked` manually, and return with failure. Otherwise:
   - Consolidate feedback from ALL reviewers that said REVISE into `{worktree}/tmp/ralph/feedback.md`. Include feedback from `gemini-feedback.md`, `adversarial-feedback.md`, and/or `feedback.md` as appropriate.
   - Create new todos for the next iteration ("Ralph iteration N — worker", "Ralph iteration N — Gemini review", "Ralph iteration N — adversarial review", "Ralph iteration N — Claude review"), then return to 2a.
 
@@ -300,7 +300,7 @@ The code is ready for commit. Return control to the calling workflow (`/task` Pa
 
 ## Guardrails
 
-- **Max 5 iterations.** If the loop doesn't converge, escalate to human via issue comment + `status/blocked`.
+- **Max 5 iterations.** If the loop doesn't converge, escalate to human via issue comment and `scripts/block-issue.sh` (or `status/blocked` label).
 - **Worker and reviewers are separate.** Never combine them — the cross-perspective review is the point.
 - **File-based state only.** No information passes between iterations except through the ralph state files.
 - **All standard rules apply.** No `$()`, no heredocs, no inline Python, temp files in `{worktree}/tmp/`.

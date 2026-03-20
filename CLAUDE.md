@@ -113,7 +113,7 @@ git -C {worktree} rebase origin/main
 - Check `docs/specs/` for relevant guidance.
 - Look at existing code for patterns. Be consistent with what's already there.
 - **Scope completeness check:** Before implementing, search the codebase for all locations affected by the change. If the issue mentions fixing or changing X in one file, grep for X across the entire codebase. List all locations that use, render, or implement the same pattern. If the issue's scope doesn't cover all of them, either expand scope to include them or file follow-up issues for the missed locations so they are tracked. Document the scope check results (what you searched for, what you found) in your implementation notes.
-- If you need a decision from the maintainer, comment on the issue, label it `status/blocked`, and pick up a different task.
+- If you need a decision from the maintainer, comment on the issue, block it with `scripts/block-issue.sh <issue> <blocker>` (or just add `status/blocked` if there is no specific blocking issue), and pick up a different task.
 
 #### 4.3 — Implement and verify locally
 
@@ -351,6 +351,29 @@ Subagents MUST install dependencies, run ALL lint/format/test commands for every
 
 - Blocked issues carry `status/blocked` and do **not** have `agent/ready`. Agents skip them.
 - Dependencies are listed as `Blocked by #N` under a `## Dependencies` heading.
+
+### Marking an issue as blocked
+
+**Both pieces are required** — the `status/blocked` label AND a `Blocked by #N` line in the issue body. The `unblock-issues` CI workflow searches for `Blocked by #N` in the body to find issues to unblock when a PR merges. If the label is present but the body text is missing, the workflow never fires and the issue stays stuck forever.
+
+**Always use the helper script** to block an issue:
+
+```
+scripts/block-issue.sh <issue> <blocker>
+```
+
+This atomically: (1) adds `Blocked by #<blocker>` to the issue body's `## Dependencies` section (creating it if absent), (2) adds the `status/blocked` label, and (3) removes the `agent/ready` label.
+
+**Do NOT** block issues by only adding the `status/blocked` label, only posting a comment, or using `Parent: #N` without a `Blocked by` line. These patterns break auto-unblocking:
+
+| Pattern | Auto-unblock? | Correct? |
+|---|---|---|
+| `status/blocked` label + `Blocked by #N` in body | Yes | Yes |
+| `status/blocked` label + comment "Blocked by #N" (no body text) | **No** | **No** |
+| `Parent: #N` without `Blocked by #N` | **No** | **No** — `Parent:` is hierarchy, not dependency |
+| `status/blocked` label only (no body reference at all) | **No** | **No** |
+
+**Note:** `Parent: #N` expresses hierarchy (this is a sub-task of #N), not dependency. A sub-task can be worked on independently even while the parent is open. Only use `Blocked by #N` when the issue genuinely cannot proceed until #N is resolved.
 
 ### When you finish a task
 
