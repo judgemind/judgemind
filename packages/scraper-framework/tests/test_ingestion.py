@@ -142,8 +142,9 @@ def test_parse_date_none() -> None:
 # ---------------------------------------------------------------------------
 
 
+@patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
 @patch("ingestion.worker.psycopg")
-def test_process_event_happy_path(mock_psycopg: MagicMock) -> None:
+def test_process_event_happy_path(mock_psycopg: MagicMock, mock_resolve_judge: MagicMock) -> None:
     """Full happy-path: court, case, document, ruling all written; OS indexed."""
     worker, os_mock = _make_worker()
 
@@ -156,11 +157,7 @@ def test_process_event_happy_path(mock_psycopg: MagicMock) -> None:
         ("court-uuid-1",),  # upsert_court
         ("case-uuid-1",),  # upsert_case
         (True,),  # insert_document: RETURNING is_new = True
-        None,  # resolve_judge: no existing alias found
-        None,  # resolve_judge: no canonical name match
-        ("judge-uuid-1",),  # resolve_judge: INSERT INTO judges RETURNING id
     ]
-    mock_cur.fetchall.return_value = []  # no near-duplicates
     mock_cur.rowcount = 1
 
     event = _make_event()
@@ -177,15 +174,17 @@ def test_process_event_happy_path(mock_psycopg: MagicMock) -> None:
     assert indexed_doc["county"] == "Los Angeles"
     assert indexed_doc["ruling_text"] == "The motion for summary judgment is GRANTED."
 
-    # Verify judge resolution and ruling insertion with judge_id
+    # Verify judge was resolved and linked to case
+    mock_resolve_judge.assert_called_once()
     all_sql = " ".join(str(c) for c in mock_cur.execute.call_args_list)
-    assert "INSERT INTO judges" in all_sql
-    assert "INSERT INTO judge_aliases" in all_sql
     assert "INSERT INTO case_judges" in all_sql
 
 
+@patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
 @patch("ingestion.worker.psycopg")
-def test_process_event_indexes_new_fields_in_opensearch(mock_psycopg: MagicMock) -> None:
+def test_process_event_indexes_new_fields_in_opensearch(
+    mock_psycopg: MagicMock, mock_resolve_judge: MagicMock
+) -> None:
     """motion_type, outcome, case_title, and summary are passed to OpenSearch."""
     worker, os_mock = _make_worker()
 
@@ -196,11 +195,7 @@ def test_process_event_indexes_new_fields_in_opensearch(mock_psycopg: MagicMock)
         ("court-uuid-1",),  # upsert_court
         ("case-uuid-1",),  # upsert_case
         (True,),  # insert_document: RETURNING is_new = True
-        None,  # resolve_judge: no existing alias
-        None,  # resolve_judge: no canonical name match
-        ("judge-uuid-1",),  # resolve_judge: INSERT INTO judges
     ]
-    mock_cur.fetchall.return_value = []  # no near-duplicates
     mock_cur.rowcount = 1
 
     event = _make_event(
@@ -220,8 +215,11 @@ def test_process_event_indexes_new_fields_in_opensearch(mock_psycopg: MagicMock)
     assert len(indexed_doc["summary"]) <= 500
 
 
+@patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
 @patch("ingestion.worker.psycopg")
-def test_process_event_passes_outcome_and_motion_type_from_event(mock_psycopg: MagicMock) -> None:
+def test_process_event_passes_outcome_and_motion_type_from_event(
+    mock_psycopg: MagicMock, mock_resolve_judge: MagicMock
+) -> None:
     """When event carries outcome/motion_type, they are passed to insert_ruling."""
     worker, os_mock = _make_worker()
 
@@ -231,11 +229,7 @@ def test_process_event_passes_outcome_and_motion_type_from_event(mock_psycopg: M
         ("court-uuid-1",),  # upsert_court
         ("case-uuid-1",),  # upsert_case
         (True,),  # insert_document: RETURNING is_new = True
-        None,  # resolve_judge: no existing alias
-        None,  # resolve_judge: no canonical name match
-        ("judge-uuid-1",),  # resolve_judge: INSERT INTO judges
     ]
-    mock_cur.fetchall.return_value = []  # no near-duplicates
     mock_cur.rowcount = 1
 
     event = _make_event(outcome="denied", motion_type="demurrer")
@@ -250,8 +244,11 @@ def test_process_event_passes_outcome_and_motion_type_from_event(mock_psycopg: M
     assert "demurrer" in sql_args
 
 
+@patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
 @patch("ingestion.worker.psycopg")
-def test_process_event_extracts_outcome_from_ruling_text(mock_psycopg: MagicMock) -> None:
+def test_process_event_extracts_outcome_from_ruling_text(
+    mock_psycopg: MagicMock, mock_resolve_judge: MagicMock
+) -> None:
     """When event has no outcome/motion_type, regex extraction from ruling_text is used."""
     worker, os_mock = _make_worker()
 
@@ -261,11 +258,7 @@ def test_process_event_extracts_outcome_from_ruling_text(mock_psycopg: MagicMock
         ("court-uuid-1",),  # upsert_court
         ("case-uuid-1",),  # upsert_case
         (True,),  # insert_document: RETURNING is_new = True
-        None,  # resolve_judge: no existing alias
-        None,  # resolve_judge: no canonical name match
-        ("judge-uuid-1",),  # resolve_judge: INSERT INTO judges
     ]
-    mock_cur.fetchall.return_value = []  # no near-duplicates
     mock_cur.rowcount = 1
 
     event = _make_event(ruling_text="The motion for summary judgment is GRANTED.")
@@ -279,8 +272,11 @@ def test_process_event_extracts_outcome_from_ruling_text(mock_psycopg: MagicMock
     assert "msj" in sql_args
 
 
+@patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
 @patch("ingestion.worker.psycopg")
-def test_process_event_event_fields_override_regex(mock_psycopg: MagicMock) -> None:
+def test_process_event_event_fields_override_regex(
+    mock_psycopg: MagicMock, mock_resolve_judge: MagicMock
+) -> None:
     """Event-level outcome/motion_type take precedence over regex extraction."""
     worker, os_mock = _make_worker()
 
@@ -290,11 +286,7 @@ def test_process_event_event_fields_override_regex(mock_psycopg: MagicMock) -> N
         ("court-uuid-1",),  # upsert_court
         ("case-uuid-1",),  # upsert_case
         (True,),  # insert_document: RETURNING is_new = True
-        None,  # resolve_judge: no existing alias
-        None,  # resolve_judge: no canonical name match
-        ("judge-uuid-1",),  # resolve_judge: INSERT INTO judges
     ]
-    mock_cur.fetchall.return_value = []  # no near-duplicates
     mock_cur.rowcount = 1
 
     # ruling_text says "GRANTED" but event says "denied"
@@ -312,8 +304,11 @@ def test_process_event_event_fields_override_regex(mock_psycopg: MagicMock) -> N
     assert "demurrer" in sql_args
 
 
+@patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
 @patch("ingestion.worker.psycopg")
-def test_process_event_no_case_number_falls_back_to_unknown(mock_psycopg: MagicMock) -> None:
+def test_process_event_no_case_number_falls_back_to_unknown(
+    mock_psycopg: MagicMock, mock_resolve_judge: MagicMock
+) -> None:
     """Events without case_number AND no extractable case number in ruling_text
     use a synthetic UNKNOWN- case number."""
     worker, _ = _make_worker()
@@ -324,11 +319,7 @@ def test_process_event_no_case_number_falls_back_to_unknown(mock_psycopg: MagicM
         ("court-uuid-1",),  # upsert_court
         ("case-uuid-1",),  # upsert_case
         (True,),  # insert_document: RETURNING is_new = True
-        None,  # resolve_judge: no existing alias
-        None,  # resolve_judge: no canonical name match
-        ("judge-uuid-1",),  # resolve_judge: INSERT INTO judges
     ]
-    mock_cur.fetchall.return_value = []  # no near-duplicates
     mock_cur.rowcount = 1
 
     doc_id = "bbbbbbbb-0000-0000-0000-000000000002"
@@ -345,8 +336,11 @@ def test_process_event_no_case_number_falls_back_to_unknown(mock_psycopg: MagicM
     assert f"UNKNOWN-{doc_id}" in all_sql
 
 
+@patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
 @patch("ingestion.worker.psycopg")
-def test_process_event_extracts_case_number_from_ruling_text(mock_psycopg: MagicMock) -> None:
+def test_process_event_extracts_case_number_from_ruling_text(
+    mock_psycopg: MagicMock, mock_resolve_judge: MagicMock
+) -> None:
     """When case_number is None but ruling_text contains a case number,
     the fallback extraction should capture it."""
     worker, _ = _make_worker()
@@ -357,11 +351,7 @@ def test_process_event_extracts_case_number_from_ruling_text(mock_psycopg: Magic
         ("court-uuid-1",),  # upsert_court
         ("case-uuid-1",),  # upsert_case
         (True,),  # insert_document: RETURNING is_new = True
-        None,  # resolve_judge: no existing alias
-        None,  # resolve_judge: no canonical name match
-        ("judge-uuid-1",),  # resolve_judge: INSERT INTO judges
     ]
-    mock_cur.fetchall.return_value = []  # no near-duplicates
     mock_cur.rowcount = 1
 
     doc_id = "cccccccc-0000-0000-0000-000000000003"
@@ -378,8 +368,11 @@ def test_process_event_extracts_case_number_from_ruling_text(mock_psycopg: Magic
     assert f"UNKNOWN-{doc_id}" not in all_sql
 
 
+@patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
 @patch("ingestion.worker.psycopg")
-def test_process_event_extracts_judge_name_from_ruling_text(mock_psycopg: MagicMock) -> None:
+def test_process_event_extracts_judge_name_from_ruling_text(
+    mock_psycopg: MagicMock, mock_resolve_judge: MagicMock
+) -> None:
     """When judge_name is None but ruling_text contains a judge name,
     the fallback extraction should capture it (#401)."""
     worker, _ = _make_worker()
@@ -390,11 +383,7 @@ def test_process_event_extracts_judge_name_from_ruling_text(mock_psycopg: MagicM
         ("court-uuid-1",),  # upsert_court
         ("case-uuid-1",),  # upsert_case
         (True,),  # insert_document: RETURNING is_new = True
-        None,  # resolve_judge: no existing alias
-        None,  # resolve_judge: no canonical name match
-        ("judge-uuid-1",),  # resolve_judge: INSERT INTO judges
     ]
-    mock_cur.fetchall.return_value = []  # no near-duplicates
     mock_cur.rowcount = 1
 
     event = _make_event(
@@ -406,12 +395,14 @@ def test_process_event_extracts_judge_name_from_ruling_text(mock_psycopg: MagicM
     worker.process_event(event)
 
     # resolve_judge should have been called — judge name extracted from text
-    all_sql = " ".join(str(c) for c in mock_cur.execute.call_args_list)
-    assert "judges" in all_sql.lower() or "judge_aliases" in all_sql.lower()
+    mock_resolve_judge.assert_called_once()
 
 
+@patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
 @patch("ingestion.worker.psycopg")
-def test_process_event_no_hearing_date_skips_ruling(mock_psycopg: MagicMock) -> None:
+def test_process_event_no_hearing_date_skips_ruling(
+    mock_psycopg: MagicMock, mock_resolve_judge: MagicMock
+) -> None:
     """Events without hearing_date should still insert document but skip ruling."""
     worker, os_mock = _make_worker()
 
@@ -421,11 +412,7 @@ def test_process_event_no_hearing_date_skips_ruling(mock_psycopg: MagicMock) -> 
         ("court-uuid-1",),  # upsert_court
         ("case-uuid-1",),  # upsert_case
         (True,),  # insert_document: RETURNING is_new = True
-        None,  # resolve_judge: no existing alias
-        None,  # resolve_judge: no canonical name match
-        ("judge-uuid-1",),  # resolve_judge: INSERT INTO judges
     ]
-    mock_cur.fetchall.return_value = []  # no near-duplicates
     mock_cur.rowcount = 1
 
     event = _make_event(hearing_date=None)
@@ -444,8 +431,11 @@ def test_process_event_no_hearing_date_skips_ruling(mock_psycopg: MagicMock) -> 
     assert len(case_judge_calls) == 1
 
 
+@patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
 @patch("ingestion.worker.psycopg")
-def test_process_event_duplicate_skips_opensearch(mock_psycopg: MagicMock) -> None:
+def test_process_event_duplicate_skips_opensearch(
+    mock_psycopg: MagicMock, mock_resolve_judge: MagicMock
+) -> None:
     """If document_id already in Postgres, OpenSearch indexing is skipped."""
     worker, os_mock = _make_worker()
 
@@ -455,11 +445,7 @@ def test_process_event_duplicate_skips_opensearch(mock_psycopg: MagicMock) -> No
         ("court-uuid-1",),  # upsert_court
         ("case-uuid-1",),  # upsert_case
         (False,),  # insert_document: RETURNING is_new = False (existing doc, upsert updated)
-        None,  # resolve_judge: no existing alias
-        None,  # resolve_judge: no canonical name match
-        ("judge-uuid-1",),  # resolve_judge: INSERT INTO judges
     ]
-    mock_cur.fetchall.return_value = []  # no near-duplicates
     mock_cur.rowcount = 1  # upsert always returns rowcount=1
 
     worker.process_event(_make_event())
@@ -743,8 +729,11 @@ def test_get_connection_reconnects_when_closed(mock_psycopg: MagicMock) -> None:
     assert mock_psycopg.connect.call_count == 2
 
 
+@patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
 @patch("ingestion.worker.psycopg")
-def test_process_event_reuses_connection(mock_psycopg: MagicMock) -> None:
+def test_process_event_reuses_connection(
+    mock_psycopg: MagicMock, mock_resolve_judge: MagicMock
+) -> None:
     """Multiple process_event calls reuse the same DB connection."""
     worker, os_mock = _make_worker()
     mock_conn, mock_cur = _make_mock_conn()
@@ -754,14 +743,10 @@ def test_process_event_reuses_connection(mock_psycopg: MagicMock) -> None:
         ("court-uuid-1",),
         ("case-uuid-1",),
         (True,),
-        None,
-        ("judge-uuid-1",),
         # Second event
         ("court-uuid-1",),
         ("case-uuid-1",),
         (True,),
-        None,
-        ("judge-uuid-2",),
     ]
     mock_cur.rowcount = 1
 
@@ -1269,8 +1254,11 @@ def test_process_event_no_judge_name_leaves_judge_id_null(
     assert "case_judges" not in all_sql
 
 
+@patch("ingestion.worker.resolve_judge", return_value="existing-judge-uuid")
 @patch("ingestion.worker.psycopg")
-def test_process_event_with_existing_judge_alias(mock_psycopg: MagicMock) -> None:
+def test_process_event_with_existing_judge_alias(
+    mock_psycopg: MagicMock, mock_resolve_judge: MagicMock
+) -> None:
     """When judge alias already exists, reuse the existing judge_id."""
     worker, os_mock = _make_worker()
 
@@ -1280,7 +1268,6 @@ def test_process_event_with_existing_judge_alias(mock_psycopg: MagicMock) -> Non
         ("court-uuid-1",),  # upsert_court
         ("case-uuid-1",),  # upsert_case
         (True,),  # insert_document: RETURNING is_new = True
-        ("existing-judge-uuid",),  # resolve_judge: found existing alias
     ]
     mock_cur.rowcount = 1
 
@@ -1289,10 +1276,10 @@ def test_process_event_with_existing_judge_alias(mock_psycopg: MagicMock) -> Non
 
     mock_conn.commit.assert_called_once()
 
-    # Should not create a new judge
+    # resolve_judge was called and returned existing UUID
+    mock_resolve_judge.assert_called_once()
+    # Should still insert ruling and case_judges
     all_sql = " ".join(str(c) for c in mock_cur.execute.call_args_list)
-    assert "INSERT INTO judges" not in all_sql
-    # But should still insert ruling and case_judges
     assert "INTO rulings" in all_sql
     assert "INSERT INTO case_judges" in all_sql
 
@@ -1339,8 +1326,11 @@ def test_upsert_case_none_title_still_works() -> None:
 # ---------------------------------------------------------------------------
 
 
+@patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
 @patch("ingestion.worker.psycopg")
-def test_process_event_passes_case_title_to_upsert_case(mock_psycopg: MagicMock) -> None:
+def test_process_event_passes_case_title_to_upsert_case(
+    mock_psycopg: MagicMock, mock_resolve_judge: MagicMock
+) -> None:
     """When event carries case_title, it is passed to upsert_case."""
     worker, os_mock = _make_worker()
 
@@ -1350,14 +1340,10 @@ def test_process_event_passes_case_title_to_upsert_case(mock_psycopg: MagicMock)
         ("court-uuid-1",),  # upsert_court
         ("case-uuid-1",),  # upsert_case
         (True,),  # insert_document: RETURNING is_new = True
-        None,  # resolve_judge: no existing alias
-        None,  # resolve_judge: no canonical name match
-        ("judge-uuid-1",),  # resolve_judge: INSERT INTO judges
         # batch_upsert_parties: executemany RETURNING ids for caption-extracted parties
         ("party-uuid-1",),
         ("party-uuid-2",),
     ]
-    mock_cur.fetchall.return_value = []  # no near-duplicates
     # batch_upsert_parties SELECT returns no existing aliases
     mock_cur.fetchall.return_value = []
     # nextset for executemany returning
@@ -1374,8 +1360,11 @@ def test_process_event_passes_case_title_to_upsert_case(mock_psycopg: MagicMock)
     assert "Aasi v. American Honda" in sql_args
 
 
+@patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
 @patch("ingestion.worker.psycopg")
-def test_process_event_without_case_title_passes_none(mock_psycopg: MagicMock) -> None:
+def test_process_event_without_case_title_passes_none(
+    mock_psycopg: MagicMock, mock_resolve_judge: MagicMock
+) -> None:
     """When event has no case_title, None is passed to upsert_case."""
     worker, os_mock = _make_worker()
 
@@ -1385,11 +1374,7 @@ def test_process_event_without_case_title_passes_none(mock_psycopg: MagicMock) -
         ("court-uuid-1",),  # upsert_court
         ("case-uuid-1",),  # upsert_case
         (True,),  # insert_document: RETURNING is_new = True
-        None,  # resolve_judge: no existing alias
-        None,  # resolve_judge: no canonical name match
-        ("judge-uuid-1",),  # resolve_judge: INSERT INTO judges
     ]
-    mock_cur.fetchall.return_value = []  # no near-duplicates
     mock_cur.rowcount = 1
 
     event = _make_event()  # no case_title key
@@ -1509,8 +1494,9 @@ def test_upsert_case_party_executes_insert() -> None:
 # ---------------------------------------------------------------------------
 
 
+@patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
 @patch("ingestion.worker.psycopg")
-def test_process_event_with_parties(mock_psycopg: MagicMock) -> None:
+def test_process_event_with_parties(mock_psycopg: MagicMock, mock_resolve_judge: MagicMock) -> None:
     """When event carries parties, party records and case_party links are created."""
     worker, os_mock = _make_worker()
 
@@ -1520,14 +1506,10 @@ def test_process_event_with_parties(mock_psycopg: MagicMock) -> None:
         ("court-uuid-1",),  # upsert_court
         ("case-uuid-1",),  # upsert_case
         (True,),  # insert_document: RETURNING is_new = True
-        None,  # resolve_judge: no existing alias
-        None,  # resolve_judge: no canonical name match
-        ("judge-uuid-1",),  # resolve_judge: INSERT INTO judges
         # batch_upsert_parties: executemany RETURNING ids
         ("party-uuid-1",),
         ("party-uuid-2",),
     ]
-    mock_cur.fetchall.return_value = []  # no near-duplicates
     # batch_upsert_parties SELECT returns no existing aliases
     mock_cur.fetchall.return_value = []
     # nextset for executemany returning
@@ -1551,8 +1533,11 @@ def test_process_event_with_parties(mock_psycopg: MagicMock) -> None:
     assert "case_parties" in all_executemany_sql
 
 
+@patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
 @patch("ingestion.worker.psycopg")
-def test_process_event_without_parties_no_party_calls(mock_psycopg: MagicMock) -> None:
+def test_process_event_without_parties_no_party_calls(
+    mock_psycopg: MagicMock, mock_resolve_judge: MagicMock
+) -> None:
     """When event has no parties, no party DB calls are made."""
     worker, os_mock = _make_worker()
 
@@ -1562,11 +1547,7 @@ def test_process_event_without_parties_no_party_calls(mock_psycopg: MagicMock) -
         ("court-uuid-1",),  # upsert_court
         ("case-uuid-1",),  # upsert_case
         (True,),  # insert_document: RETURNING is_new = True
-        None,  # resolve_judge: no existing alias
-        None,  # resolve_judge: no canonical name match
-        ("judge-uuid-1",),  # resolve_judge: INSERT INTO judges
     ]
-    mock_cur.fetchall.return_value = []  # no near-duplicates
     mock_cur.rowcount = 1
 
     event = _make_event()  # no parties key
@@ -1576,8 +1557,11 @@ def test_process_event_without_parties_no_party_calls(mock_psycopg: MagicMock) -
     assert "INSERT INTO case_parties" not in all_sql
 
 
+@patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
 @patch("ingestion.worker.psycopg")
-def test_process_event_extracts_parties_from_case_title(mock_psycopg: MagicMock) -> None:
+def test_process_event_extracts_parties_from_case_title(
+    mock_psycopg: MagicMock, mock_resolve_judge: MagicMock
+) -> None:
     """When event has no parties but has a case_title with 'v.', parties are
     extracted from the caption as a fallback (#328)."""
     worker, os_mock = _make_worker()
@@ -1588,14 +1572,10 @@ def test_process_event_extracts_parties_from_case_title(mock_psycopg: MagicMock)
         ("court-uuid-1",),  # upsert_court
         ("case-uuid-1",),  # upsert_case
         (True,),  # insert_document: RETURNING is_new = True
-        None,  # resolve_judge: no existing alias
-        None,  # resolve_judge: no canonical name match
-        ("judge-uuid-1",),  # resolve_judge: INSERT INTO judges
         # batch_upsert_parties: executemany RETURNING ids
         ("party-uuid-1",),
         ("party-uuid-2",),
     ]
-    mock_cur.fetchall.return_value = []  # no near-duplicates
     # batch_upsert_parties SELECT returns no existing aliases
     mock_cur.fetchall.return_value = []
     # nextset for executemany returning
@@ -1737,11 +1717,13 @@ def test_insert_ruling_upsert_no_duplicate_document_id_param() -> None:
 # ---------------------------------------------------------------------------
 
 
+@patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
 @patch("ingestion.worker.extract_fields_llm")
 @patch("ingestion.worker.psycopg")
 def test_process_event_llm_extraction_populates_missing_fields(
     mock_psycopg: MagicMock,
     mock_llm: MagicMock,
+    mock_resolve_judge: MagicMock,
 ) -> None:
     """When LLM extraction returns results, missing fields are populated from LLM."""
     from ingestion.llm_extract import LLMExtractionResult, LLMRulingResult
@@ -1756,14 +1738,10 @@ def test_process_event_llm_extraction_populates_missing_fields(
         ("court-uuid-1",),  # upsert_court
         ("case-uuid-1",),  # upsert_case
         (True,),  # insert_document: RETURNING is_new = True
-        None,  # resolve_judge: no existing alias
-        None,  # resolve_judge: no canonical name match
-        ("judge-uuid-1",),  # resolve_judge: INSERT INTO judges
         # batch_upsert_parties: executemany RETURNING ids for LLM parties
         ("party-uuid-1",),
         ("party-uuid-2",),
     ]
-    mock_cur.fetchall.return_value = []  # no near-duplicates
     # batch_upsert_parties SELECT returns no existing aliases
     mock_cur.fetchall.return_value = []
     # nextset for executemany returning
@@ -1820,7 +1798,7 @@ def test_process_event_llm_extraction_populates_missing_fields(
     assert "msj" in sql_args
 
     # Judge was resolved (from LLM result)
-    assert "judges" in all_sql.lower()
+    mock_resolve_judge.assert_called_once()
 
     # Parties from LLM were written via batch_upsert_parties
     all_executemany_sql = " ".join(str(c) for c in mock_cur.executemany.call_args_list)
@@ -1828,11 +1806,13 @@ def test_process_event_llm_extraction_populates_missing_fields(
     assert "case_parties" in all_executemany_sql
 
 
+@patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
 @patch("ingestion.worker.extract_fields_llm")
 @patch("ingestion.worker.psycopg")
 def test_process_event_llm_failure_falls_back_to_regex(
     mock_psycopg: MagicMock,
     mock_llm: MagicMock,
+    mock_resolve_judge: MagicMock,
 ) -> None:
     """When LLM extraction returns None, regex extraction is used as fallback."""
     worker, os_mock = _make_worker()
@@ -1844,11 +1824,7 @@ def test_process_event_llm_failure_falls_back_to_regex(
         ("court-uuid-1",),  # upsert_court
         ("case-uuid-1",),  # upsert_case
         (True,),  # insert_document: RETURNING is_new = True
-        None,  # resolve_judge: no existing alias
-        None,  # resolve_judge: no canonical name match
-        ("judge-uuid-1",),  # resolve_judge: INSERT INTO judges
     ]
-    mock_cur.fetchall.return_value = []  # no near-duplicates
     mock_cur.rowcount = 1
 
     # LLM returns None (simulating API failure)
@@ -1872,9 +1848,11 @@ def test_process_event_llm_failure_falls_back_to_regex(
     assert "msj" in sql_args
 
 
+@patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
 @patch("ingestion.worker.psycopg")
 def test_process_event_no_anthropic_client_uses_regex_only(
     mock_psycopg: MagicMock,
+    mock_resolve_judge: MagicMock,
 ) -> None:
     """When anthropic client is None (no API key), regex-only mode is used."""
     worker, os_mock = _make_worker()
@@ -1887,11 +1865,7 @@ def test_process_event_no_anthropic_client_uses_regex_only(
         ("court-uuid-1",),  # upsert_court
         ("case-uuid-1",),  # upsert_case
         (True,),  # insert_document: RETURNING is_new = True
-        None,  # resolve_judge: no existing alias
-        None,  # resolve_judge: no canonical name match
-        ("judge-uuid-1",),  # resolve_judge: INSERT INTO judges
     ]
-    mock_cur.fetchall.return_value = []  # no near-duplicates
     mock_cur.rowcount = 1
 
     event = _make_event(
@@ -1909,11 +1883,13 @@ def test_process_event_no_anthropic_client_uses_regex_only(
     assert "msj" in sql_args
 
 
+@patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
 @patch("ingestion.worker.extract_fields_llm")
 @patch("ingestion.worker.psycopg")
 def test_process_event_llm_matches_ruling_by_case_number(
     mock_psycopg: MagicMock,
     mock_llm: MagicMock,
+    mock_resolve_judge: MagicMock,
 ) -> None:
     """When event has a case_number and LLM returns multiple rulings,
     the matching ruling is used."""
@@ -1928,14 +1904,10 @@ def test_process_event_llm_matches_ruling_by_case_number(
         ("court-uuid-1",),  # upsert_court
         ("case-uuid-1",),  # upsert_case
         (True,),  # insert_document: RETURNING is_new = True
-        None,  # resolve_judge: no existing alias
-        None,  # resolve_judge: no canonical name match
-        ("judge-uuid-1",),  # resolve_judge: INSERT INTO judges
         # batch_upsert_parties: executemany RETURNING ids for caption-extracted parties
         ("party-uuid-1",),
         ("party-uuid-2",),
     ]
-    mock_cur.fetchall.return_value = []  # no near-duplicates
     # batch_upsert_parties SELECT returns no existing aliases
     mock_cur.fetchall.return_value = []
     # nextset for executemany returning
@@ -1990,11 +1962,13 @@ def test_process_event_llm_matches_ruling_by_case_number(
     assert "Smith v. Jones" in case_args
 
 
+@patch("ingestion.worker.resolve_judge", return_value="existing-judge-uuid")
 @patch("ingestion.worker.extract_fields_llm")
 @patch("ingestion.worker.psycopg")
 def test_process_event_scraper_fields_take_precedence_over_llm(
     mock_psycopg: MagicMock,
     mock_llm: MagicMock,
+    mock_resolve_judge: MagicMock,
 ) -> None:
     """Scraper-provided fields are not overwritten by LLM results."""
     from ingestion.llm_extract import LLMExtractionResult, LLMRulingResult
@@ -2008,7 +1982,6 @@ def test_process_event_scraper_fields_take_precedence_over_llm(
         ("court-uuid-1",),  # upsert_court
         ("case-uuid-1",),  # upsert_case
         (True,),  # insert_document: RETURNING is_new = True
-        ("existing-judge-uuid",),  # resolve_judge: existing alias
         # batch_upsert_parties: executemany RETURNING id for LLM party
         ("party-uuid-1",),
     ]
@@ -2120,13 +2093,14 @@ def test_match_ruling_empty_rulings_returns_none() -> None:
 # ---------------------------------------------------------------------------
 
 
+@patch("ingestion.worker.resolve_judge", return_value="judge-uuid-dept")
 @patch(
     "ingestion.worker.fetch_department_judge_mapping",
     return_value={"1": "Jane Doe", "52": "John Smith"},
 )
 @patch("ingestion.worker.psycopg")
 def test_la_dept_lookup_resolves_judge_when_name_missing(
-    mock_psycopg: MagicMock, _mock_fetch_dept: MagicMock
+    mock_psycopg: MagicMock, _mock_fetch_dept: MagicMock, mock_resolve_judge: MagicMock
 ) -> None:
     """LA event with department but no judge_name resolves judge via dept map."""
     worker, os_mock = _make_worker()
@@ -2137,10 +2111,7 @@ def test_la_dept_lookup_resolves_judge_when_name_missing(
         ("court-uuid-1",),  # upsert_court
         ("case-uuid-1",),  # upsert_case
         (True,),  # insert_document: RETURNING is_new = True
-        None,  # resolve_judge: no existing alias
-        ("judge-uuid-dept",),  # resolve_judge: INSERT INTO judges
     ]
-    mock_cur.fetchall.return_value = []  # no near-duplicates
     mock_cur.rowcount = 1
 
     event = _make_event(judge_name=None, department="1")
@@ -2149,17 +2120,17 @@ def test_la_dept_lookup_resolves_judge_when_name_missing(
     mock_conn.commit.assert_called_once()
 
     # Judge resolution should have happened via dept lookup
-    all_sql = " ".join(str(c) for c in mock_cur.execute.call_args_list)
-    assert "judges" in all_sql.lower() or "judge_aliases" in all_sql.lower()
+    mock_resolve_judge.assert_called_once()
 
 
+@patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
 @patch(
     "ingestion.worker.fetch_department_judge_mapping",
     return_value={"1": "Jane Doe"},
 )
 @patch("ingestion.worker.psycopg")
 def test_la_dept_lookup_skipped_when_judge_name_present(
-    mock_psycopg: MagicMock, mock_fetch_dept: MagicMock
+    mock_psycopg: MagicMock, mock_fetch_dept: MagicMock, mock_resolve_judge: MagicMock
 ) -> None:
     """LA event with judge_name already present skips dept lookup entirely."""
     worker, os_mock = _make_worker()
@@ -2170,11 +2141,7 @@ def test_la_dept_lookup_skipped_when_judge_name_present(
         ("court-uuid-1",),  # upsert_court
         ("case-uuid-1",),  # upsert_case
         (True,),  # insert_document: RETURNING is_new = True
-        None,  # resolve_judge: no existing alias
-        None,  # resolve_judge: no canonical name match
-        ("judge-uuid-1",),  # resolve_judge: INSERT INTO judges
     ]
-    mock_cur.fetchall.return_value = []  # no near-duplicates
     mock_cur.rowcount = 1
 
     event = _make_event(judge_name="Already Known", department="1")
@@ -2242,13 +2209,14 @@ def test_la_dept_lookup_unmapped_dept_leaves_judge_null(
     assert "case_judges" not in all_sql
 
 
+@patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
 @patch(
     "ingestion.worker.fetch_department_judge_mapping",
     return_value={"1": "Jane Doe"},
 )
 @patch("ingestion.worker.psycopg")
 def test_la_dept_map_cached_across_events(
-    mock_psycopg: MagicMock, mock_fetch_dept: MagicMock
+    mock_psycopg: MagicMock, mock_fetch_dept: MagicMock, mock_resolve_judge: MagicMock
 ) -> None:
     """The dept map should be fetched once and reused for subsequent events."""
     worker, os_mock = _make_worker()
@@ -2262,11 +2230,7 @@ def test_la_dept_map_cached_across_events(
             ("court-uuid-1",),  # upsert_court
             ("case-uuid-1",),  # upsert_case
             (True,),  # insert_document
-            None,  # resolve_judge: no existing alias
-            None,  # resolve_judge: no canonical name match
-            ("judge-uuid-1",),  # resolve_judge: INSERT INTO judges
         ]
-        mock_cur.fetchall.return_value = []  # no near-duplicates
         mock_cur.rowcount = 1
         event = _make_event(document_id=doc_id, judge_name=None, department="1")
         worker.process_event(event)
@@ -2316,6 +2280,7 @@ def test_la_dept_map_fetch_failure_degrades_gracefully(
 # ---------------------------------------------------------------------------
 
 
+@patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
 @patch("ingestion.worker.extract_text_from_pdf")
 @patch("ingestion.worker.is_pdf_binary")
 @patch("ingestion.worker.extract_fields_llm")
@@ -2325,6 +2290,7 @@ def test_process_event_extracts_text_from_pdf_binary(
     mock_llm: MagicMock,
     mock_is_pdf: MagicMock,
     mock_extract_pdf: MagicMock,
+    mock_resolve_judge: MagicMock,
 ) -> None:
     """When ruling_text is raw PDF binary, text is extracted before LLM/regex processing."""
     worker, os_mock = _make_worker()
@@ -2336,11 +2302,7 @@ def test_process_event_extracts_text_from_pdf_binary(
         ("court-uuid-1",),  # upsert_court
         ("case-uuid-1",),  # upsert_case
         (True,),  # insert_document: RETURNING is_new = True
-        None,  # resolve_judge: no existing alias
-        None,  # resolve_judge: no canonical name match
-        ("judge-uuid-1",),  # resolve_judge: INSERT INTO judges
     ]
-    mock_cur.fetchall.return_value = []  # no near-duplicates
     mock_cur.rowcount = 1
 
     # Simulate raw PDF binary content
@@ -2372,6 +2334,7 @@ def test_process_event_extracts_text_from_pdf_binary(
     assert len(ruling_calls) == 1
 
 
+@patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
 @patch("ingestion.worker.extract_text_from_pdf")
 @patch("ingestion.worker.is_pdf_binary")
 @patch("ingestion.worker.extract_fields_llm")
@@ -2381,6 +2344,7 @@ def test_process_event_pdf_extraction_failure_continues(
     mock_llm: MagicMock,
     mock_is_pdf: MagicMock,
     mock_extract_pdf: MagicMock,
+    mock_resolve_judge: MagicMock,
 ) -> None:
     """When PDF text extraction returns None, processing continues with original text."""
     worker, os_mock = _make_worker()
@@ -2392,11 +2356,7 @@ def test_process_event_pdf_extraction_failure_continues(
         ("court-uuid-1",),  # upsert_court
         ("case-uuid-1",),  # upsert_case
         (True,),  # insert_document: RETURNING is_new = True
-        None,  # resolve_judge: no existing alias
-        None,  # resolve_judge: no canonical name match
-        ("judge-uuid-1",),  # resolve_judge: INSERT INTO judges
     ]
-    mock_cur.fetchall.return_value = []  # no near-duplicates
     mock_cur.rowcount = 1
 
     # Simulate PDF extraction failure
@@ -2423,6 +2383,7 @@ def test_process_event_pdf_extraction_failure_continues(
     mock_conn.commit.assert_called_once()
 
 
+@patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
 @patch("ingestion.worker.extract_text_from_pdf")
 @patch("ingestion.worker.is_pdf_binary")
 @patch("ingestion.worker.psycopg")
@@ -2430,6 +2391,7 @@ def test_process_event_non_pdf_skips_pdf_extraction(
     mock_psycopg: MagicMock,
     mock_is_pdf: MagicMock,
     mock_extract_pdf: MagicMock,
+    mock_resolve_judge: MagicMock,
 ) -> None:
     """HTML content does not trigger PDF extraction preprocessing."""
     worker, os_mock = _make_worker()
@@ -2440,11 +2402,7 @@ def test_process_event_non_pdf_skips_pdf_extraction(
         ("court-uuid-1",),  # upsert_court
         ("case-uuid-1",),  # upsert_case
         (True,),  # insert_document: RETURNING is_new = True
-        None,  # resolve_judge: no existing alias
-        None,  # resolve_judge: no canonical name match
-        ("judge-uuid-1",),  # resolve_judge: INSERT INTO judges
     ]
-    mock_cur.fetchall.return_value = []  # no near-duplicates
     mock_cur.rowcount = 1
 
     event = _make_event(
@@ -2669,11 +2627,13 @@ def test_run_loop_continues_on_generic_exception(mock_psycopg: MagicMock) -> Non
     assert worker._process_batch.call_count == 2
 
 
+@patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
 @patch("ingestion.worker.extract_fields_llm")
 @patch("ingestion.worker.psycopg")
 def test_process_event_llm_extraction_populates_case_type(
     mock_psycopg: MagicMock,
     mock_llm: MagicMock,
+    mock_resolve_judge: MagicMock,
 ) -> None:
     """When LLM extraction returns case_type, it populates the field (lines 440-441)."""
     from ingestion.llm_extract import LLMExtractionResult, LLMRulingResult
@@ -2687,11 +2647,7 @@ def test_process_event_llm_extraction_populates_case_type(
         ("court-uuid-1",),  # upsert_court
         ("case-uuid-1",),  # upsert_case
         (True,),  # insert_document: RETURNING is_new = True
-        None,  # resolve_judge: no existing alias
-        None,  # resolve_judge: no canonical name match
-        ("judge-uuid-1",),  # resolve_judge: INSERT INTO judges
     ]
-    mock_cur.fetchall.return_value = []  # no near-duplicates
     mock_cur.rowcount = 1
 
     # LLM returns case_type but nothing else new
@@ -2718,11 +2674,13 @@ def test_process_event_llm_extraction_populates_case_type(
     assert "civil" in all_sql
 
 
+@patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
 @patch("ingestion.worker.extract_hearing_date")
 @patch("ingestion.worker.psycopg")
 def test_process_event_regex_hearing_date_extraction(
     mock_psycopg: MagicMock,
     mock_extract_hd: MagicMock,
+    mock_resolve_judge: MagicMock,
 ) -> None:
     """When hearing_date is missing and regex extracts it, tracks it (lines 470-471)."""
     worker, os_mock = _make_worker()
@@ -2733,11 +2691,7 @@ def test_process_event_regex_hearing_date_extraction(
         ("court-uuid-1",),  # upsert_court
         ("case-uuid-1",),  # upsert_case
         (True,),  # insert_document: RETURNING is_new = True
-        None,  # resolve_judge: no existing alias
-        None,  # resolve_judge: no canonical name match
-        ("judge-uuid-1",),  # resolve_judge: INSERT INTO judges
     ]
-    mock_cur.fetchall.return_value = []  # no near-duplicates
     mock_cur.rowcount = 1
 
     # Regex extraction returns a date
@@ -2757,26 +2711,19 @@ def test_process_event_regex_hearing_date_extraction(
     assert len(ruling_calls) == 1
 
 
+@patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
 @patch("ingestion.worker.extract_case_title")
 @patch("ingestion.worker.psycopg")
 def test_process_event_regex_case_title_extraction(
     mock_psycopg: MagicMock,
     mock_extract_title: MagicMock,
+    mock_resolve_judge: MagicMock,
 ) -> None:
     """When case_title is missing and regex extracts it, extraction_methods tracks it (line 507)."""
     worker, os_mock = _make_worker()
 
     mock_conn, mock_cur = _make_mock_conn()
     mock_psycopg.connect.return_value = mock_conn
-    mock_cur.fetchone.side_effect = [
-        ("court-uuid-1",),  # upsert_court
-        ("case-uuid-1",),  # upsert_case
-        (True,),  # insert_document: RETURNING is_new = True
-        None,  # resolve_judge: no existing alias
-        None,  # resolve_judge: no canonical name match
-        ("judge-uuid-1",),  # resolve_judge: INSERT INTO judges
-    ]
-    mock_cur.fetchall.return_value = []  # no near-duplicates
     mock_cur.rowcount = 1
 
     # Regex returns a title
@@ -2788,14 +2735,10 @@ def test_process_event_regex_case_title_extraction(
         ("court-uuid-1",),  # upsert_court
         ("case-uuid-1",),  # upsert_case
         (True,),  # insert_document: RETURNING is_new = True
-        None,  # resolve_judge: no existing alias
-        None,  # resolve_judge: no canonical name match
-        ("judge-uuid-1",),  # resolve_judge: INSERT INTO judges
         # batch_upsert_parties: RETURNING ids for extracted parties
         ("party-uuid-1",),
         ("party-uuid-2",),
     ]
-    mock_cur.fetchall.return_value = []  # no near-duplicates
     # batch_upsert_parties SELECT returns no existing aliases
     mock_cur.fetchall.return_value = []
     mock_cur.nextset.side_effect = [True, False]
@@ -2978,11 +2921,13 @@ def test_insert_ruling_with_ruling_text_html_none() -> None:
 # ---------------------------------------------------------------------------
 
 
+@patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
 @patch("ingestion.worker.format_ruling_text")
 @patch("ingestion.worker.psycopg")
 def test_process_event_formats_ruling_when_enabled(
     mock_psycopg: MagicMock,
     mock_format: MagicMock,
+    mock_resolve_judge: MagicMock,
 ) -> None:
     """When ENABLE_RULING_FORMATTING is set, format_ruling_text is called."""
     worker, os_mock = _make_worker()
@@ -2997,11 +2942,7 @@ def test_process_event_formats_ruling_when_enabled(
         ("court-uuid-1",),  # upsert_court
         ("case-uuid-1",),  # upsert_case
         (True,),  # insert_document
-        None,  # resolve_judge: no existing alias
-        None,  # resolve_judge: no canonical name match
-        ("judge-uuid-1",),  # INSERT INTO judges
     ]
-    mock_cur.fetchall.return_value = []  # no near-duplicates
 
     event = _make_event()
     worker.process_event(event)
@@ -3014,11 +2955,13 @@ def test_process_event_formats_ruling_when_enabled(
     assert "ruling_text_html" in sql
 
 
+@patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
 @patch("ingestion.worker.format_ruling_text")
 @patch("ingestion.worker.psycopg")
 def test_process_event_formatting_disabled_by_default(
     mock_psycopg: MagicMock,
     mock_format: MagicMock,
+    mock_resolve_judge: MagicMock,
 ) -> None:
     """When ENABLE_RULING_FORMATTING is not set, format_ruling_text is not called."""
     worker, os_mock = _make_worker()
@@ -3031,11 +2974,7 @@ def test_process_event_formatting_disabled_by_default(
         ("court-uuid-1",),  # upsert_court
         ("case-uuid-1",),  # upsert_case
         (True,),  # insert_document
-        None,  # resolve_judge: no existing alias
-        None,  # resolve_judge: no canonical name match
-        ("judge-uuid-1",),  # INSERT INTO judges
     ]
-    mock_cur.fetchall.return_value = []  # no near-duplicates
 
     event = _make_event()
     worker.process_event(event)
@@ -3198,11 +3137,13 @@ def test_reclaim_pending_processes_multiple_messages(mock_psycopg: MagicMock) ->
 # ---------------------------------------------------------------------------
 
 
+@patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
 @patch("ingestion.worker.psycopg")
 @patch("ingestion.worker.split_document")
 def test_process_event_no_split_single_result(
     mock_split: MagicMock,
     mock_psycopg: MagicMock,
+    mock_resolve_judge: MagicMock,
 ) -> None:
     """When split_document returns a single result, process_event proceeds normally."""
     from ingestion.splitter import SplitResult
@@ -3214,8 +3155,6 @@ def test_process_event_no_split_single_result(
         ("court-uuid-1",),  # upsert_court
         ("case-uuid-1",),  # upsert_case
         (True,),  # insert_document
-        None,  # resolve_judge: no alias
-        ("judge-uuid-1",),  # resolve_judge: insert
     ]
 
     mock_split.return_value = [
@@ -3234,11 +3173,13 @@ def test_process_event_no_split_single_result(
     os_mock.index.assert_called_once()
 
 
+@patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
 @patch("ingestion.worker.psycopg")
 @patch("ingestion.worker.split_document")
 def test_process_event_split_creates_multiple_rulings(
     mock_split: MagicMock,
     mock_psycopg: MagicMock,
+    mock_resolve_judge: MagicMock,
 ) -> None:
     """When split_document returns multiple results, process_event creates
     multiple rulings with different document_ids."""
@@ -3248,21 +3189,17 @@ def test_process_event_split_creates_multiple_rulings(
     mock_conn, mock_cur = _make_mock_conn()
     mock_psycopg.connect.return_value = mock_conn
 
-    # Each split will go through court, case, document, judge resolution, and ruling
+    # Each split will go through court, case, document, and ruling
     # For 2 splits, we need 2 sets of fetchone results
     mock_cur.fetchone.side_effect = [
         # Split 0
         ("court-uuid-1",),  # upsert_court
         ("case-uuid-1",),  # upsert_case
         (True,),  # insert_document
-        None,  # resolve_judge: no alias
-        ("judge-uuid-1",),  # resolve_judge: insert
         # Split 1
         ("court-uuid-1",),  # upsert_court
         ("case-uuid-2",),  # upsert_case
         (False,),  # insert_document (same doc, already exists)
-        None,  # resolve_judge: no alias
-        ("judge-uuid-1",),  # resolve_judge: insert
     ]
 
     mock_split.return_value = [
@@ -3294,11 +3231,13 @@ def test_process_event_split_creates_multiple_rulings(
     assert indexed_docs[1]["ruling_text"] == "Second case text"
 
 
+@patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
 @patch("ingestion.worker.psycopg")
 @patch("ingestion.worker.split_document")
 def test_process_event_split_uses_original_document_id_for_documents_table(
     mock_split: MagicMock,
     mock_psycopg: MagicMock,
+    mock_resolve_judge: MagicMock,
 ) -> None:
     """Split rulings should use the original document_id for the documents table
     (one PDF = one document row) but synthetic IDs for the rulings table."""
@@ -3315,14 +3254,10 @@ def test_process_event_split_uses_original_document_id_for_documents_table(
         ("court-uuid-1",),
         ("case-uuid-1",),
         (True,),  # insert_document
-        None,
-        ("judge-uuid-1",),
         # Split 1
         ("court-uuid-1",),
         ("case-uuid-2",),
         (False,),  # insert_document (already exists)
-        None,
-        ("judge-uuid-1",),
     ]
 
     mock_split.return_value = [
@@ -3379,8 +3314,11 @@ def test_process_event_split_idempotent(
     assert id_1_first == id_1_second
 
 
+@patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
 @patch("ingestion.worker.psycopg")
-def test_process_event_already_split_no_re_split(mock_psycopg: MagicMock) -> None:
+def test_process_event_already_split_no_re_split(
+    mock_psycopg: MagicMock, mock_resolve_judge: MagicMock
+) -> None:
     """Events with _split_processed=True should NOT be split again."""
     worker, os_mock = _make_worker()
     mock_conn, mock_cur = _make_mock_conn()
@@ -3389,8 +3327,6 @@ def test_process_event_already_split_no_re_split(mock_psycopg: MagicMock) -> Non
         ("court-uuid-1",),
         ("case-uuid-1",),
         (True,),
-        None,
-        ("judge-uuid-1",),
     ]
 
     event = _make_event(
@@ -3408,11 +3344,13 @@ def test_process_event_already_split_no_re_split(mock_psycopg: MagicMock) -> Non
 # ---------------------------------------------------------------------------
 
 
+@patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
 @patch("ingestion.worker.summarize_ruling")
 @patch("ingestion.worker.psycopg")
 def test_process_event_summarizes_ruling_when_enabled(
     mock_psycopg: MagicMock,
     mock_summarize: MagicMock,
+    mock_resolve_judge: MagicMock,
 ) -> None:
     """When ENABLE_RULING_SUMMARIZATION is set, summarize_ruling is called."""
     worker, os_mock = _make_worker()
@@ -3426,10 +3364,7 @@ def test_process_event_summarizes_ruling_when_enabled(
         ("court-uuid-1",),  # upsert_court
         ("case-uuid-1",),  # upsert_case
         (True,),  # insert_document
-        None,  # resolve_judge: no existing alias
-        ("judge-uuid-1",),  # INSERT INTO judges
     ]
-    mock_cur.fetchall.return_value = []
 
     event = _make_event()
     worker.process_event(event)
@@ -3447,11 +3382,13 @@ def test_process_event_summarizes_ruling_when_enabled(
     assert "summary_generated_at" in sql_calls
 
 
+@patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
 @patch("ingestion.worker.summarize_ruling")
 @patch("ingestion.worker.psycopg")
 def test_process_event_summarization_disabled_by_default(
     mock_psycopg: MagicMock,
     mock_summarize: MagicMock,
+    mock_resolve_judge: MagicMock,
 ) -> None:
     """When ENABLE_RULING_SUMMARIZATION is not set, summarize_ruling is not called."""
     worker, os_mock = _make_worker()
@@ -3464,10 +3401,7 @@ def test_process_event_summarization_disabled_by_default(
         ("court-uuid-1",),  # upsert_court
         ("case-uuid-1",),  # upsert_case
         (True,),  # insert_document
-        None,  # resolve_judge: no existing alias
-        ("judge-uuid-1",),  # INSERT INTO judges
     ]
-    mock_cur.fetchall.return_value = []
 
     event = _make_event()
     worker.process_event(event)
@@ -3475,11 +3409,13 @@ def test_process_event_summarization_disabled_by_default(
     mock_summarize.assert_not_called()
 
 
+@patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
 @patch("ingestion.worker.summarize_ruling")
 @patch("ingestion.worker.psycopg")
 def test_process_event_summarization_failure_does_not_block_ingestion(
     mock_psycopg: MagicMock,
     mock_summarize: MagicMock,
+    mock_resolve_judge: MagicMock,
 ) -> None:
     """Summary generation failure should not prevent ruling insertion."""
     worker, os_mock = _make_worker()
@@ -3494,10 +3430,7 @@ def test_process_event_summarization_failure_does_not_block_ingestion(
         ("court-uuid-1",),  # upsert_court
         ("case-uuid-1",),  # upsert_case
         (True,),  # insert_document
-        None,  # resolve_judge: no existing alias
-        ("judge-uuid-1",),  # INSERT INTO judges
     ]
-    mock_cur.fetchall.return_value = []
 
     event = _make_event()
     worker.process_event(event)
@@ -3506,11 +3439,13 @@ def test_process_event_summarization_failure_does_not_block_ingestion(
     mock_conn.commit.assert_called_once()
 
 
+@patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
 @patch("ingestion.worker.summarize_ruling")
 @patch("ingestion.worker.psycopg")
 def test_process_event_summarization_includes_case_context(
     mock_psycopg: MagicMock,
     mock_summarize: MagicMock,
+    mock_resolve_judge: MagicMock,
 ) -> None:
     """Case context (case_title, motion_type) is passed to summarize_ruling."""
     worker, os_mock = _make_worker()
@@ -3524,10 +3459,7 @@ def test_process_event_summarization_includes_case_context(
         ("court-uuid-1",),  # upsert_court
         ("case-uuid-1",),  # upsert_case
         (True,),  # insert_document
-        None,  # resolve_judge: no existing alias
-        ("judge-uuid-1",),  # INSERT INTO judges
     ]
-    mock_cur.fetchall.return_value = []
 
     event = _make_event(
         case_title="In re: Estate of Smith",
@@ -3544,11 +3476,13 @@ def test_process_event_summarization_includes_case_context(
     assert case_context["motion_type"] == "Demurrer"
 
 
+@patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
 @patch("ingestion.worker.summarize_ruling")
 @patch("ingestion.worker.psycopg")
 def test_process_event_summarization_no_case_context_when_missing(
     mock_psycopg: MagicMock,
     mock_summarize: MagicMock,
+    mock_resolve_judge: MagicMock,
 ) -> None:
     """When case_title and motion_type are both None/absent, case_context is None."""
     worker, os_mock = _make_worker()
@@ -3562,10 +3496,7 @@ def test_process_event_summarization_no_case_context_when_missing(
         ("court-uuid-1",),  # upsert_court
         ("case-uuid-1",),  # upsert_case
         (True,),  # insert_document
-        None,  # resolve_judge: no existing alias
-        ("judge-uuid-1",),  # INSERT INTO judges
     ]
-    mock_cur.fetchall.return_value = []
 
     # Use ruling text that won't trigger regex motion_type extraction
     event = _make_event(
