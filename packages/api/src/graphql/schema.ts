@@ -171,6 +171,10 @@ export const typeDefs = `#graphql
     dateTo: String
     """Case number prefix, e.g. "24NNCV"."""
     caseNumber: String
+    """Motion types to filter by, e.g. ["demurrer", "msj"]. Matches any of the provided values."""
+    motionTypes: [String!]
+    """Outcomes to filter by, e.g. ["granted", "denied"]. Matches any of the provided values."""
+    outcomes: [String!]
   }
 
   """A single search hit from the tentative ruling search."""
@@ -178,12 +182,14 @@ export const typeDefs = `#graphql
     """Ruling ID in the database — use with the ruling(id) query for full details."""
     rulingId: ID!
     caseNumber: String
+    """Case title, e.g. "Smith v. Jones". May be null for older rulings."""
+    caseTitle: String
     court: String
     county: String
     state: String
     judgeName: String
     hearingDate: String
-    """Highlighted excerpt from the ruling text (HTML with <mark> tags)."""
+    """Highlighted excerpt from the ruling text (HTML with <mark> tags), or summary fallback for filter-only queries."""
     excerpt: String
     """Relevance score (only present for full-text queries)."""
     score: Float

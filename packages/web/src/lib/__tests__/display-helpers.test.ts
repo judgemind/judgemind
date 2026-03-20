@@ -3,6 +3,7 @@ import {
   buildDownloadUrl,
   detectParagraphs,
   FORMAT_LABELS,
+  formatDate,
   formatJudgeName,
   formatLabel,
   formatMotionType,
@@ -32,6 +33,36 @@ describe('formatLabel', () => {
 
   it('handles anti_slapp as a known compound label', () => {
     expect(formatLabel('anti_slapp')).toBe('Anti-SLAPP');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// formatDate (#1105 — graceful fallback for null/invalid dates)
+// ---------------------------------------------------------------------------
+
+describe('formatDate', () => {
+  it('formats a valid ISO date string', () => {
+    expect(formatDate('2026-03-05')).toBe('Mar 5, 2026');
+  });
+
+  it('returns "Date unknown" for null', () => {
+    expect(formatDate(null)).toBe('Date unknown');
+  });
+
+  it('returns "Date unknown" for undefined', () => {
+    expect(formatDate(undefined)).toBe('Date unknown');
+  });
+
+  it('returns "Date unknown" for empty string', () => {
+    expect(formatDate('')).toBe('Date unknown');
+  });
+
+  it('returns "Date unknown" for unparseable string', () => {
+    expect(formatDate('not-a-date')).toBe('Date unknown');
+  });
+
+  it('formats a date at year boundary correctly', () => {
+    expect(formatDate('2025-12-31')).toBe('Dec 31, 2025');
   });
 });
 

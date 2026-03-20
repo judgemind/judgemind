@@ -13,6 +13,8 @@ export interface RulingFilters {
   dateFrom?: string;
   dateTo?: string;
   caseNumber?: string;
+  motionTypes?: string[];
+  outcomes?: string[];
 }
 
 export interface SearchRulingsArgs {
@@ -26,6 +28,7 @@ export interface SearchRulingsArgs {
 export interface RulingSearchHit {
   rulingId: string;
   caseNumber: string | null;
+  caseTitle: string | null;
   court: string | null;
   county: string | null;
   state: string | null;
@@ -59,7 +62,8 @@ function decodeCursor(cursor: string): unknown[] {
   return JSON.parse(Buffer.from(cursor, 'base64').toString('utf8')) as unknown[];
 }
 
-function buildQuery(
+/** @internal Exported for unit testing. */
+export function buildQuery(
   query: string | undefined,
   filters: RulingFilters | undefined,
   includeFuture?: boolean,
@@ -77,6 +81,12 @@ function buildQuery(
     if (filters.state) filter.push({ term: { state: filters.state } });
     if (filters.judgeName) filter.push({ term: { judge_name: filters.judgeName } });
     if (filters.caseNumber) filter.push({ prefix: { case_number: filters.caseNumber } });
+    if (filters.motionTypes && filters.motionTypes.length > 0) {
+      filter.push({ terms: { motion_type: filters.motionTypes } });
+    }
+    if (filters.outcomes && filters.outcomes.length > 0) {
+      filter.push({ terms: { outcome: filters.outcomes } });
+    }
   }
 
   // Build a single hearing_date range filter that merges the user's date
@@ -126,7 +136,7 @@ export async function searchRulings(
     query: osQuery,
     sort,
     size: limit + 1, // fetch one extra to determine hasNextPage
-    _source: ['case_number', 'court', 'county', 'state', 'judge_name', 'hearing_date', 'document_id'],
+    _source: ['case_number', 'case_title', 'court', 'county', 'state', 'judge_name', 'hearing_date', 'document_id', 'summary'],
     track_total_hits: true,
   };
 
@@ -181,12 +191,13 @@ export async function searchRulings(
       node: {
         rulingId: rulingIdMap.get(docId) ?? docId,
         caseNumber: (src.case_number as string) ?? null,
+        caseTitle: (src.case_title as string) ?? null,
         court: (src.court as string) ?? null,
         county: (src.county as string) ?? null,
         state: (src.state as string) ?? null,
         judgeName: (src.judge_name as string) ?? null,
         hearingDate: (src.hearing_date as string) ?? null,
-        excerpt: hit.highlight?.ruling_text?.[0] ?? null,
+        excerpt: hit.highlight?.ruling_text?.[0] ?? (src.summary as string) ?? null,
         score: hit._score ?? null,
       },
       cursor: encodeCursor(hit.sort),

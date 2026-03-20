@@ -71,6 +71,8 @@ export const resolvers = {
           dateFrom?: string;
           dateTo?: string;
           caseNumber?: string;
+          motionTypes?: string[];
+          outcomes?: string[];
         };
         first?: number;
         after?: string;

@@ -24,6 +24,7 @@ const SEARCH_RULINGS_QUERY = gql`
         node {
           rulingId
           caseNumber
+          caseTitle
           court
           county
           state
@@ -129,6 +130,7 @@ export function parseSearchParams(params: URLSearchParams): {
 interface SearchHitNode {
   rulingId: string;
   caseNumber: string | null;
+  caseTitle: string | null;
   court: string | null;
   county: string | null;
   state: string | null;
@@ -192,21 +194,30 @@ export function SearchPage() {
       initialState.county !== '' ||
       initialState.judgeName !== '' ||
       initialState.dateFrom !== '' ||
-      initialState.dateTo !== '',
+      initialState.dateTo !== '' ||
+      initialState.motionTypes.length > 0 ||
+      initialState.outcomes.length > 0,
   );
 
   // Build GraphQL variables
   const hasFilters =
-    county !== '' || judgeName !== '' || dateFrom !== '' || dateTo !== '';
+    county !== '' ||
+    judgeName !== '' ||
+    dateFrom !== '' ||
+    dateTo !== '' ||
+    motionTypes.length > 0 ||
+    outcomes.length > 0;
 
   const filters = useMemo(() => {
-    const f: Record<string, string> = {};
+    const f: Record<string, string | string[]> = {};
     if (county) f.county = county;
     if (judgeName) f.judgeName = judgeName;
     if (dateFrom) f.dateFrom = dateFrom;
     if (dateTo) f.dateTo = dateTo;
+    if (motionTypes.length > 0) f.motionTypes = motionTypes;
+    if (outcomes.length > 0) f.outcomes = outcomes;
     return Object.keys(f).length > 0 ? f : undefined;
-  }, [county, judgeName, dateFrom, dateTo]);
+  }, [county, judgeName, dateFrom, dateTo, motionTypes, outcomes]);
 
   const shouldQuery = hasSearched && (q !== '' || hasFilters);
 
@@ -512,8 +523,13 @@ export function SearchPage() {
                   <div className="flex items-start justify-between gap-3">
                     <div className="min-w-0 flex-1">
                       <h3 className="truncate font-medium text-slate-900 dark:text-slate-100">
-                        {node.caseNumber ?? 'Unknown Case'}
+                        {node.caseTitle ?? node.caseNumber ?? 'Unknown Case'}
                       </h3>
+                      {node.caseTitle && node.caseNumber && (
+                        <p className="mt-0.5 truncate text-xs text-slate-400 dark:text-slate-500">
+                          {node.caseNumber}
+                        </p>
+                      )}
                       <p className="mt-0.5 truncate text-sm text-slate-500 dark:text-slate-400">
                         {node.judgeName ? `Judge ${node.judgeName}` : ''}
                         {node.judgeName && node.county ? ' \u00B7 ' : ''}

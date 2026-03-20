@@ -53,9 +53,12 @@ export function formatLabel(value: string | null): string {
 // Date & outcome formatting (shared between server & client components)
 // ---------------------------------------------------------------------------
 
-/** Format an ISO 8601 date string as a short readable date (e.g. "Mar 5, 2026"). */
-export function formatDate(iso: string): string {
+/** Format an ISO 8601 date string as a short readable date (e.g. "Mar 5, 2026").
+ *  Returns "Date unknown" for null, undefined, or unparseable inputs. */
+export function formatDate(iso: string | null | undefined): string {
+  if (!iso) return 'Date unknown';
   const d = new Date(iso + 'T00:00:00Z');
+  if (isNaN(d.getTime())) return 'Date unknown';
   return d.toLocaleDateString('en-US', {
     month: 'short',
     day: 'numeric',
