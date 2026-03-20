@@ -113,7 +113,7 @@ After claiming the issue, create todos using `TaskCreate` to track your major wo
 5. "Verify no merge conflicts" — check mergeable status
 6. "Update PR test plan" — check off test plan items
 7. "Merge PR" — squash merge after CI is green
-8. "Verify deployment and functional health" — watch deploy, then verify feature works in dev (deployed services only)
+8. "Verify deployment and post evidence" — watch deploy, verify feature works, post evidence comment
 9. "Retrospective" — identify workflow efficiencies and preventative measures
 10. "Remove worktree" — cleanup
 
@@ -199,7 +199,40 @@ preflight_no_duplicate_pr <N>
 - If it returns **1** (no duplicate), proceed to create the PR normally.
 - If it returns **2** (error), proceed to create the PR (fail-open).
 
-The PR body must include `Closes #N` so the unblock workflow fires on merge:
+The PR body must include `Closes #N` so the unblock workflow fires on merge.
+
+**PR body template — use this structure for all PRs:**
+
+Write the PR body to `{worktree}/tmp/pr_body.txt` using this template:
+
+```
+## Summary
+
+<1-3 sentences describing the change>
+
+Closes #<N>
+
+## Test plan
+
+### Automated checks
+- [ ] Lint passes
+- [ ] Format check passes
+- [ ] Tests pass
+- [ ] CI green
+
+### Post-deploy verification
+- [ ] <Verification step from the table in A.8, specific to this change type>
+- [ ] Verification evidence posted on issue (see A.8)
+```
+
+The **Post-deploy verification** section must include at least one concrete verification step appropriate for the change type (see the verification table in A.8). For changes with no deployed component (docs, CI config, tooling scripts not deployed), replace the post-deploy section with:
+
+```
+### Post-deploy verification
+- [ ] N/A — no deployed component (docs/CI/tooling only)
+```
+
+Create the PR:
 ```
 gh pr create --repo judgemind/judgemind \
     --title "..." \
@@ -227,7 +260,7 @@ gh run watch <run-id> --repo judgemind/judgemind --exit-status --compact
 If CI fails: write status `phase: ci-fix`, `summary: Fixing CI failure: <brief reason>`. Diagnose, fix locally, push, return to A.4. Repeat until all checks pass.
 
 #### A.6 — Update the PR test plan
-Fetch the current PR body, check off automated steps that passed in CI, run any manual smoke tests in a temporary smoketest worktree (see CLAUDE.md §4.8 for the pattern), write the updated body to `{worktree}/tmp/pr_body.txt`, then:
+Fetch the current PR body, check off the **Automated checks** items that passed in CI. Do NOT check off **Post-deploy verification** items yet — those are checked in A.8 after merge and deploy. Write the updated body to `{worktree}/tmp/pr_body.txt`, then:
 ```
 gh pr edit <PR-N> --repo judgemind/judgemind --body-file {worktree}/tmp/pr_body.txt
 ```
@@ -242,10 +275,14 @@ gh pr merge <PR-N> --repo judgemind/judgemind --squash --delete-branch
 
 **Dependent issues will be unblocked automatically** by the `unblock-issues` workflow when the PR merges. No manual unblocking needed.
 
-#### A.8 — Verify deployment and functional health (deployed services only)
+#### A.8 — Verify deployment and post evidence (MANDATORY)
 Write status: `phase: deploying`, `summary: Watching deploy pipeline for <workflow>`.
 
-**A task is NOT done when the PR merges. A task is done when the change is deployed AND verified working.** The worktree stays alive until verification passes. Skip this step only for pure library, tooling, docs, or CI-only changes.
+**A task is NOT done when the PR merges. A task is done when the change is deployed, verified working, AND verification evidence is posted.** The worktree stays alive until verification passes.
+
+**Determine if this change has a deployed component:**
+- Changes to `packages/api/`, `packages/scraper-framework/`, `packages/web/`, `infra/terraform/`, or scripts run via ECS → **has deployed component** → continue to Step 1.
+- Changes to docs, CI config, `.claude/`, tooling scripts, or library code with no deployed service → **no deployed component** → skip to the evidence comment (Step 3) and post a skip-reason comment.
 
 **Step 1 — Watch the deploy workflow:**
 
@@ -268,19 +305,80 @@ Write status: `phase: verifying`, `summary: Verifying feature works in dev envir
 
 A successful deploy only means the new image is running — not that the service works. Verify the feature is actually functional:
 
-| Change type | Verification |
-|---|---|
-| **DB migration + code** | Confirm migration applied (column/table exists via `scripts/dev-db-query.sh`) AND service processes a request without errors |
-| **API endpoint** | Hit the endpoint on dev (`curl https://dev.api.judgemind.org/graphql`), confirm expected response shape and no errors |
-| **Ingestion pipeline** | Confirm the worker processes at least one message successfully (check ECS logs via `scripts/ecs-logs.sh /ecs/judgemind-ingestion-worker-dev --lines 50`) |
-| **Scraper** | Check ECS logs for the next scheduled run, confirm documents are captured without errors |
-| **Frontend** | Confirm the affected page loads on `dev.judgemind.org` and renders the expected content |
-| **DX/tooling** | Run the tool in a representative scenario and confirm expected output |
-| **Backfill / data migration script** | Execute the script against dev via `scripts/ecs-run-task.sh` (or locally if appropriate). Confirm the expected data changes applied — e.g., query dev DB via `scripts/dev-db-query.sh` to check row counts, null rates, or sample records. |
+| Change type | Verification | Required evidence |
+|---|---|---|
+| **DB migration + code** | Confirm migration applied (column/table exists via `scripts/dev-db-query.sh`) AND service processes a request without errors | DB query output showing the column/table exists + a successful request/response |
+| **API endpoint** | Hit the endpoint on dev (`curl https://dev.api.judgemind.org/graphql`), confirm expected response shape and no errors | The curl response (status code + relevant body snippet) |
+| **Ingestion pipeline** | Confirm the worker processes at least one message successfully (check ECS logs via `scripts/ecs-logs.sh /ecs/judgemind-ingestion-worker-dev --lines 50`) | Log lines showing successful message processing |
+| **Scraper** | Check ECS logs for the next scheduled run, confirm documents are captured without errors | Log lines showing successful document capture |
+| **Frontend** | Confirm the affected page loads on `dev.judgemind.org` and renders the expected content | Screenshot via `scripts/screenshot.py` or the page content showing the feature works |
+| **DX/tooling** | Run the tool in a representative scenario and confirm expected output | Command output showing the tool works correctly |
+| **Backfill / data migration script** | Execute the script against dev via `scripts/ecs-run-task.sh` (or locally if appropriate). Confirm the expected data changes applied — e.g., query dev DB via `scripts/dev-db-query.sh` to check row counts, null rates, or sample records. | DB query results showing the data changed (e.g., "2444/2444 rulings now have ruling_text_html") |
 
 **Script-producing tasks:** If a task produces a backfill, migration, or one-off fixup script that is meant to be run, executing it on dev and verifying results is part of the definition of done. When filing issues that include "create a backfill script" or similar, always include "backfill executed on dev and results verified" in the acceptance criteria.
 
 If functional verification **fails**: diagnose the issue. If it's a simple fix, fix it in a follow-up PR. If it's complex, file a `priority/p1` issue with details, reference the merged PR, and add `agent/ready`.
+
+**Step 3 — Post verification evidence comment (MANDATORY — no exceptions):**
+
+After verification succeeds (or after determining the change has no deployed component), you MUST post a verification evidence comment on the issue. This is a hard gate — the task cannot proceed to A.9 without this comment.
+
+Write the comment to `{worktree}/tmp/verification_evidence.txt`, then post it:
+```
+gh issue comment <N> --repo judgemind/judgemind --body-file {worktree}/tmp/verification_evidence.txt
+```
+
+**For deployed changes**, the comment must include concrete evidence from the verification table above. Example formats:
+
+```
+## Verification Evidence
+
+**Change type:** API endpoint
+**Environment:** dev
+
+**Evidence:**
+curl response from dev.api.judgemind.org:
+- Status: 200
+- Response body (relevant snippet):
+  {"data":{"ruling":{"id":"abc123","rulingTextHtml":"<p>The motion is GRANTED...</p>"}}}
+
+Post-deploy verification: PASSED
+```
+
+```
+## Verification Evidence
+
+**Change type:** Backfill script
+**Environment:** dev
+
+**Evidence:**
+DB query after backfill:
+SELECT COUNT(*) FROM rulings WHERE ruling_text_html IS NOT NULL;
+-- Result: 2444 (was 0 before backfill)
+
+SELECT COUNT(*) FROM rulings WHERE ruling_text_html IS NULL;
+-- Result: 0
+
+Post-deploy verification: PASSED
+```
+
+**For non-deployed changes** (docs, CI, `.claude/`, tooling), the comment must state the skip reason:
+
+```
+## Verification Evidence
+
+**Change type:** Documentation / agent workflow
+**Skip reason:** No deployed component — changes are to .claude/skills/ and CLAUDE.md only.
+
+Post-deploy verification: N/A (no deployed component)
+```
+
+**GATE CHECK:** Do not proceed to A.9 until the verification evidence comment has been posted. A task closed without a verification evidence comment is a workflow failure.
+
+After posting, update the PR test plan to check off the post-deploy verification items:
+1. Fetch the current PR body.
+2. Check off the **Post-deploy verification** checkboxes.
+3. Write updated body to `{worktree}/tmp/pr_body.txt` and update with `gh pr edit --body-file`.
 
 #### A.9 — Proceed to retrospective
 
