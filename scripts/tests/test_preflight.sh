@@ -9,6 +9,7 @@
 #   - preflight_venv_local
 #   - preflight_tf_not_root
 #   - preflight_no_duplicate_pr (argument validation only — no gh CLI)
+#   - preflight_rate_budget (with mock gh)
 #   - preflight_no_forbidden_syntax
 #
 # Usage:
@@ -277,10 +278,85 @@ else
 fi
 
 # ══════════════════════════════════════════════════════════════════════════
+# preflight_rate_budget (with mock gh)
+# ══════════════════════════════════════════════════════════════════════════
+
+MOCK_BIN_DIR=$(mktemp -d)
+TEMP_DIRS+=("$MOCK_BIN_DIR")
+ORIG_PATH_SAVE="$PATH"
+
+# Test 16: Returns 0 when budget is sufficient
+cat > "$MOCK_BIN_DIR/gh" << 'MOCKGH'
+#!/usr/bin/env bash
+echo "4500 9999999999 5000"
+exit 0
+MOCKGH
+chmod +x "$MOCK_BIN_DIR/gh"
+export PATH="$MOCK_BIN_DIR:$ORIG_PATH_SAVE"
+
+exit_code=0
+preflight_rate_budget 100 > /dev/null 2>&1 || exit_code=$?
+if [[ "$exit_code" -eq 0 ]]; then
+    pass "preflight_rate_budget returns 0 when budget sufficient"
+else
+    fail "preflight_rate_budget returns 0 when budget sufficient" "exit code: $exit_code"
+fi
+
+# Test 17: Returns 1 when budget is low
+cat > "$MOCK_BIN_DIR/gh" << 'MOCKGH'
+#!/usr/bin/env bash
+echo "50 9999999999 5000"
+exit 0
+MOCKGH
+chmod +x "$MOCK_BIN_DIR/gh"
+
+exit_code=0
+preflight_rate_budget 100 > /dev/null 2>&1 || exit_code=$?
+if [[ "$exit_code" -eq 1 ]]; then
+    pass "preflight_rate_budget returns 1 when budget low"
+else
+    fail "preflight_rate_budget returns 1 when budget low" "expected exit 1, got $exit_code"
+fi
+
+# Test 18: Returns 2 when gh api fails
+cat > "$MOCK_BIN_DIR/gh" << 'MOCKGH'
+#!/usr/bin/env bash
+exit 1
+MOCKGH
+chmod +x "$MOCK_BIN_DIR/gh"
+
+exit_code=0
+preflight_rate_budget > /dev/null 2>&1 || exit_code=$?
+if [[ "$exit_code" -eq 2 ]]; then
+    pass "preflight_rate_budget returns 2 when gh api fails"
+else
+    fail "preflight_rate_budget returns 2 when gh api fails" "expected exit 2, got $exit_code"
+fi
+
+# Test 19: Uses default threshold of 100
+cat > "$MOCK_BIN_DIR/gh" << 'MOCKGH'
+#!/usr/bin/env bash
+echo "99 9999999999 5000"
+exit 0
+MOCKGH
+chmod +x "$MOCK_BIN_DIR/gh"
+
+exit_code=0
+preflight_rate_budget > /dev/null 2>&1 || exit_code=$?
+if [[ "$exit_code" -eq 1 ]]; then
+    pass "preflight_rate_budget uses default threshold of 100"
+else
+    fail "preflight_rate_budget uses default threshold of 100" "expected exit 1, got $exit_code"
+fi
+
+# Restore PATH
+export PATH="$ORIG_PATH_SAVE"
+
+# ══════════════════════════════════════════════════════════════════════════
 # preflight_no_forbidden_syntax
 # ══════════════════════════════════════════════════════════════════════════
 
-# Test 16: Detects $() substitution
+# Test 20: Detects $() substitution
 exit_code=0
 preflight_no_forbidden_syntax 'echo $(whoami)' > /dev/null 2>&1 || exit_code=$?
 if [[ "$exit_code" -ne 0 ]]; then
@@ -289,7 +365,7 @@ else
     fail "preflight_no_forbidden_syntax detects \$() substitution" "expected non-zero exit"
 fi
 
-# Test 17: Detects heredoc
+# Test 21: Detects heredoc
 exit_code=0
 preflight_no_forbidden_syntax 'cat <<EOF' > /dev/null 2>&1 || exit_code=$?
 if [[ "$exit_code" -ne 0 ]]; then
@@ -298,7 +374,7 @@ else
     fail "preflight_no_forbidden_syntax detects heredoc" "expected non-zero exit"
 fi
 
-# Test 18: Detects python -c
+# Test 22: Detects python -c
 exit_code=0
 preflight_no_forbidden_syntax 'python3 -c "print(1)"' > /dev/null 2>&1 || exit_code=$?
 if [[ "$exit_code" -ne 0 ]]; then
@@ -307,7 +383,7 @@ else
     fail "preflight_no_forbidden_syntax detects python -c" "expected non-zero exit"
 fi
 
-# Test 19: Allows safe commands
+# Test 23: Allows safe commands
 exit_code=0
 preflight_no_forbidden_syntax 'git status' > /dev/null 2>&1 || exit_code=$?
 if [[ "$exit_code" -eq 0 ]]; then
@@ -316,7 +392,7 @@ else
     fail "preflight_no_forbidden_syntax allows safe commands" "exit code: $exit_code"
 fi
 
-# Test 20: Allows commands with dollar signs that are not substitutions
+# Test 24: Allows commands with dollar signs that are not substitutions
 exit_code=0
 preflight_no_forbidden_syntax 'echo $HOME' > /dev/null 2>&1 || exit_code=$?
 if [[ "$exit_code" -eq 0 ]]; then

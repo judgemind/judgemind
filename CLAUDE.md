@@ -43,6 +43,7 @@ preflight_not_on_main       # Fail if on main/master branch
 preflight_branch_fresh      # Fail if behind origin/main (add --fetch to fetch first)
 preflight_venv_local        # Fail if .venv is missing or is a symlink
 preflight_no_duplicate_pr N # Check if open PR already exists for issue #N
+preflight_rate_budget       # Warn if GitHub API rate budget < 100 remaining
 ```
 
 ## Project Context
@@ -222,6 +223,15 @@ scripts/end-worker.sh {worktree}
 - `sudo` and `rm` always prompt; split commands to avoid triggering prompts.
 
 For detailed patterns to avoid permission prompts, see `docs/agent/unattended-patterns.md`.
+
+### GitHub API Rate Limit Awareness
+
+GitHub allows 5,000 API requests per hour. With multiple concurrent agents, this budget is shared and can be exhausted quickly — especially by high-frequency polling commands like `gh run watch`.
+
+- **Check rate budget before expensive operations.** Run `preflight_rate_budget` (from `scripts/preflight.sh`) before `gh run watch` or any polling loop. If it returns 1 (low budget), use periodic `gh run view` with manual sleeps instead of continuous `gh run watch`.
+- **Use `scripts/gh-with-backoff.sh` for non-interactive gh commands.** It wraps `gh` with automatic retry on 403 (rate limit) responses and proactive budget checks. Example: `scripts/gh-with-backoff.sh pr view 42 --repo judgemind/judgemind --json mergeable`.
+- **Prefer `gh run view` over `gh run watch` when multiple agents are active.** `gh run watch` polls rapidly (every few seconds). Instead, poll with `gh run view <id> --json status --jq '.status'` in a loop with 30-60 second sleeps.
+- **Never retry 403 errors in a tight loop.** Always check the rate limit reset time and wait for it.
 
 ## Accounts & Infrastructure
 
