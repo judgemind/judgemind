@@ -7,7 +7,7 @@ import { render, screen, fireEvent } from '@testing-library/react';
 
 const mockToggle = vi.fn();
 const mockLogout = vi.fn().mockResolvedValue(undefined);
-let mockUser: { id: string; email: string } | null = null;
+let mockUser: { id: string; email: string; displayName?: string | null } | null = null;
 let mockLoading = false;
 
 vi.mock('next/link', () => ({
@@ -37,6 +37,10 @@ vi.mock('@/providers/AuthProvider', () => ({
     setUser: vi.fn(),
     logout: mockLogout,
   }),
+}));
+
+vi.mock('next/navigation', () => ({
+  usePathname: () => '/search',
 }));
 
 import { Header } from '../Header';
@@ -81,17 +85,29 @@ describe('Header', () => {
     expect(loginLink.closest('a')).toHaveAttribute('href', '/auth/login');
   });
 
-  it('shows Log out button when authenticated', () => {
+  it('shows user menu button when authenticated', () => {
     mockUser = { id: '1', email: 'test@example.com' };
     render(<Header />);
-    expect(screen.getByText('Log out')).toBeInTheDocument();
+    expect(screen.getByLabelText('User menu')).toBeInTheDocument();
     expect(screen.queryByText('Log in')).not.toBeInTheDocument();
   });
 
-  it('calls logout when Log out is clicked', () => {
+  it('shows Log out in dropdown when user menu is clicked', async () => {
+    const user = await import('@testing-library/user-event');
+    const userEvent = user.default.setup();
     mockUser = { id: '1', email: 'test@example.com' };
     render(<Header />);
-    fireEvent.click(screen.getByText('Log out'));
+    await userEvent.click(screen.getByLabelText('User menu'));
+    expect(screen.getByText('Log out')).toBeInTheDocument();
+  });
+
+  it('calls logout when Log out is clicked in dropdown', async () => {
+    const user = await import('@testing-library/user-event');
+    const userEvent = user.default.setup();
+    mockUser = { id: '1', email: 'test@example.com' };
+    render(<Header />);
+    await userEvent.click(screen.getByLabelText('User menu'));
+    await userEvent.click(screen.getByText('Log out'));
     expect(mockLogout).toHaveBeenCalledOnce();
   });
 
@@ -99,6 +115,6 @@ describe('Header', () => {
     mockLoading = true;
     render(<Header />);
     expect(screen.queryByText('Log in')).not.toBeInTheDocument();
-    expect(screen.queryByText('Log out')).not.toBeInTheDocument();
+    expect(screen.queryByLabelText('User menu')).not.toBeInTheDocument();
   });
 });

@@ -1,126 +1,118 @@
 'use client';
 
-import { useCallback, useState } from 'react';
+import { useState } from 'react';
 import Link from 'next/link';
+import { Menu, Moon, Sun, LogOut, User } from 'lucide-react';
 import { useTheme } from '@/providers/ThemeProvider';
 import { useAuth } from '@/providers/AuthProvider';
 import { Sidebar } from '@/components/layout/Sidebar';
+import { Button } from '@/components/ui/button';
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu';
+import {
+  Sheet,
+  SheetContent,
+  SheetHeader,
+  SheetTitle,
+} from '@/components/ui/sheet';
 
 export function Header() {
   const { theme, toggle } = useTheme();
   const { user, loading, logout } = useAuth();
   const [menuOpen, setMenuOpen] = useState(false);
 
-  const closeMenu = useCallback(() => setMenuOpen(false), []);
-
   return (
     <>
-      <header className="sticky top-0 z-50 flex h-14 items-center border-b border-slate-200 bg-white px-4 dark:border-slate-700 dark:bg-slate-900">
+      <header className="sticky top-0 z-50 flex h-14 items-center border-b bg-background px-4">
         {/* Hamburger — visible only on mobile (below lg breakpoint) */}
-        <button
+        <Button
+          variant="ghost"
+          size="icon"
           onClick={() => setMenuOpen(true)}
           aria-label="Toggle menu"
-          className="mr-2 rounded-md p-2 text-slate-500 hover:bg-slate-100 dark:text-slate-400 dark:hover:bg-slate-800 lg:hidden"
+          className="mr-2 lg:hidden"
         >
-          <svg
-            xmlns="http://www.w3.org/2000/svg"
-            className="h-5 w-5"
-            fill="none"
-            viewBox="0 0 24 24"
-            stroke="currentColor"
-            strokeWidth={2}
-          >
-            <path strokeLinecap="round" strokeLinejoin="round" d="M4 6h16M4 12h16M4 18h16" />
-          </svg>
-        </button>
+          <Menu className="h-5 w-5" />
+        </Button>
 
         <Link href="/" className="mr-8 text-lg font-semibold text-brand-700 dark:text-brand-500">
           Judgemind
         </Link>
 
-        <nav className="flex flex-1 items-center gap-6 text-sm font-medium">
-          <Link
-            href="/search"
-            className="text-slate-600 hover:text-slate-900 dark:text-slate-400 dark:hover:text-slate-100"
-          >
-            Search
-          </Link>
-          <Link
-            href="/rulings"
-            className="text-slate-600 hover:text-slate-900 dark:text-slate-400 dark:hover:text-slate-100"
-          >
-            Rulings
-          </Link>
+        <nav className="hidden flex-1 items-center gap-1 text-sm font-medium md:flex">
+          <Button variant="ghost" size="sm" asChild>
+            <Link href="/search">Search</Link>
+          </Button>
+          <Button variant="ghost" size="sm" asChild>
+            <Link href="/rulings">Rulings</Link>
+          </Button>
         </nav>
 
-        <div className="flex items-center gap-2">
-          <button
+        {/* Spacer for mobile (no nav links shown) */}
+        <div className="flex-1 md:hidden" />
+
+        <div className="flex items-center gap-1">
+          <Button
+            variant="ghost"
+            size="icon"
             onClick={toggle}
             aria-label="Toggle dark mode"
-            className="rounded-md p-2 text-slate-500 hover:bg-slate-100 dark:text-slate-400 dark:hover:bg-slate-800"
           >
-            {theme === 'dark' ? '\u2600\uFE0F' : '\uD83C\uDF19'}
-          </button>
+            {theme === 'dark' ? (
+              <Sun className="h-5 w-5" />
+            ) : (
+              <Moon className="h-5 w-5" />
+            )}
+          </Button>
 
           {!loading && (
             <>
               {user ? (
-                <button
-                  onClick={() => void logout()}
-                  className="rounded-md px-3 py-1.5 text-sm font-medium text-slate-600 hover:bg-slate-100 dark:text-slate-400 dark:hover:bg-slate-800"
-                >
-                  Log out
-                </button>
+                <DropdownMenu>
+                  <DropdownMenuTrigger asChild>
+                    <Button variant="ghost" size="icon" aria-label="User menu">
+                      <User className="h-5 w-5" />
+                    </Button>
+                  </DropdownMenuTrigger>
+                  <DropdownMenuContent align="end" className="w-48">
+                    <DropdownMenuLabel className="font-normal">
+                      <p className="text-sm font-medium">{user.displayName ?? 'Account'}</p>
+                      <p className="text-xs text-muted-foreground">{user.email}</p>
+                    </DropdownMenuLabel>
+                    <DropdownMenuSeparator />
+                    <DropdownMenuItem onClick={() => void logout()}>
+                      <LogOut className="mr-2 h-4 w-4" />
+                      Log out
+                    </DropdownMenuItem>
+                  </DropdownMenuContent>
+                </DropdownMenu>
               ) : (
-                <Link
-                  href="/auth/login"
-                  className="rounded-md bg-brand-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-brand-700"
-                >
-                  Log in
-                </Link>
+                <Button size="sm" asChild>
+                  <Link href="/auth/login">Log in</Link>
+                </Button>
               )}
             </>
           )}
         </div>
       </header>
 
-      {/* Mobile slide-out menu */}
-      {menuOpen && (
-        <div role="dialog" aria-modal="true" className="fixed inset-0 z-[60] lg:hidden">
-          {/* Backdrop */}
-          <div
-            data-testid="mobile-menu-backdrop"
-            className="absolute inset-0 bg-black/40"
-            onClick={closeMenu}
-          />
-
-          {/* Slide-out panel */}
-          <aside className="absolute inset-y-0 left-0 w-64 border-r border-slate-200 bg-slate-50 dark:border-slate-700 dark:bg-slate-900">
-            <div className="flex h-14 items-center justify-between border-b border-slate-200 px-4 dark:border-slate-700">
-              <span className="text-lg font-semibold text-brand-700 dark:text-brand-500">
-                Judgemind
-              </span>
-              <button
-                onClick={closeMenu}
-                aria-label="Close menu"
-                className="rounded-md p-2 text-slate-500 hover:bg-slate-100 dark:text-slate-400 dark:hover:bg-slate-800"
-              >
-                <svg
-                  xmlns="http://www.w3.org/2000/svg"
-                  className="h-5 w-5"
-                  fill="none"
-                  viewBox="0 0 24 24"
-                  stroke="currentColor"
-                  strokeWidth={2}
-                >
-                  <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
-                </svg>
-              </button>
-            </div>
-            <Sidebar onLinkClick={closeMenu} />
-          </aside>
-        </div>
-      )}
+      {/* Mobile slide-out menu using shadcn Sheet */}
+      <Sheet open={menuOpen} onOpenChange={setMenuOpen}>
+        <SheetContent side="left" className="w-64 p-0">
+          <SheetHeader className="border-b px-4 py-3">
+            <SheetTitle className="text-lg font-semibold text-brand-700 dark:text-brand-500">
+              Judgemind
+            </SheetTitle>
+          </SheetHeader>
+          <Sidebar onLinkClick={() => setMenuOpen(false)} />
+        </SheetContent>
+      </Sheet>
     </>
   );
 }

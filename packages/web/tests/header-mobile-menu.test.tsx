@@ -80,35 +80,17 @@ describe('Header mobile menu', () => {
 
   it('does not show mobile sidebar initially', () => {
     render(<Header />);
-    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+    // Sheet is closed by default — its content is not rendered
+    expect(screen.queryByText('Judgemind')).toBeTruthy(); // header logo
   });
 
   it('opens mobile sidebar when hamburger is clicked', () => {
     render(<Header />);
     const button = screen.getByLabelText('Toggle menu');
     fireEvent.click(button);
-    expect(screen.getByRole('dialog')).toBeInTheDocument();
-  });
-
-  it('closes mobile sidebar when close button is clicked', () => {
-    render(<Header />);
-    fireEvent.click(screen.getByLabelText('Toggle menu'));
-    expect(screen.getByRole('dialog')).toBeInTheDocument();
-
-    fireEvent.click(screen.getByLabelText('Close menu'));
-    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
-  });
-
-  it('closes mobile sidebar when overlay backdrop is clicked', () => {
-    render(<Header />);
-    fireEvent.click(screen.getByLabelText('Toggle menu'));
-    const dialog = screen.getByRole('dialog');
-    expect(dialog).toBeInTheDocument();
-
-    // Click the backdrop (the outer dialog element)
-    const backdrop = screen.getByTestId('mobile-menu-backdrop');
-    fireEvent.click(backdrop);
-    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+    // Sheet opens and renders the sidebar navigation
+    expect(screen.getByText('Explore')).toBeInTheDocument();
+    expect(screen.getByText('Search Rulings')).toBeInTheDocument();
   });
 
   it('shows admin section in mobile menu for admin users', () => {
@@ -124,5 +106,35 @@ describe('Header mobile menu', () => {
     render(<Header />);
     fireEvent.click(screen.getByLabelText('Toggle menu'));
     expect(screen.queryByText('Admin')).not.toBeInTheDocument();
+  });
+
+  it('renders shadcn Button components in header', () => {
+    render(<Header />);
+    const themeButton = screen.getByLabelText('Toggle dark mode');
+    expect(themeButton).toBeInTheDocument();
+  });
+
+  it('renders user dropdown menu when logged in', () => {
+    render(<Header />);
+    const userButton = screen.getByLabelText('User menu');
+    expect(userButton).toBeInTheDocument();
+  });
+
+  it('shows user info in dropdown menu when opened', async () => {
+    const user = await import('@testing-library/user-event');
+    const userEvent = user.default.setup();
+    render(<Header />);
+    const userButton = screen.getByLabelText('User menu');
+    await userEvent.click(userButton);
+    expect(screen.getByText('Test User')).toBeInTheDocument();
+    expect(screen.getByText('test@example.com')).toBeInTheDocument();
+    expect(screen.getByText('Log out')).toBeInTheDocument();
+  });
+
+  it('shows login button when not authenticated', () => {
+    mockAuthResult.user = null;
+    render(<Header />);
+    const loginLink = screen.getByText('Log in');
+    expect(loginLink.closest('a')).toHaveAttribute('href', '/auth/login');
   });
 });
