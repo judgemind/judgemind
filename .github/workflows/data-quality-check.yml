@@ -95,18 +95,21 @@ jobs:
         if: steps.check.outputs.healthy == 'false'
         id: summary
         run: |
-          # Extract a markdown summary and a Telegram one-liner from the
-          # captured ECS task output. format-dq-summary.py parses the JSON
-          # alert payload emitted by data-quality-check.py.
+          # Extract a markdown summary, a Telegram one-liner, and the max
+          # severity from the captured ECS task output. format-dq-summary.py
+          # parses the JSON alert payload emitted by data-quality-check.py.
           MARKDOWN=$(python3 scripts/format-dq-summary.py /tmp/check_output.txt 2>/dev/null || echo "Could not extract alert details from check output.")
           TELEGRAM=$(python3 scripts/format-dq-summary.py --telegram /tmp/check_output.txt 2>/dev/null || echo "Alert details unavailable.")
+          MAX_SEVERITY=$(python3 scripts/format-dq-summary.py --max-severity /tmp/check_output.txt 2>/dev/null || echo "p1")
 
           # Write to files for downstream steps (avoids quoting issues in
           # GITHUB_OUTPUT for multi-line content).
           echo "$MARKDOWN" > /tmp/alert_summary.md
           echo "$TELEGRAM" > /tmp/alert_telegram.txt
 
-          echo "Alert summary extracted:"
+          echo "max_severity=$MAX_SEVERITY" >> "$GITHUB_OUTPUT"
+
+          echo "Alert summary extracted (max severity: $MAX_SEVERITY):"
           cat /tmp/alert_summary.md
 
       - name: Check for existing open issue
@@ -139,8 +142,14 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          MAX_SEVERITY: ${{ steps.summary.outputs.max_severity }}
         run: |
           TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+          # Use the max alert severity to set the issue priority label.
+          # p1 alerts (zero rulings, very stale) -> priority/p1
+          # p2-only alerts (ingest rate drops, moderately stale) -> priority/p2
+          PRIORITY_LABEL="priority/${MAX_SEVERITY:-p1}"
 
           {
             echo "## Data Quality Check Failure"
@@ -156,6 +165,7 @@ jobs:
             echo ""
             echo "- **Workflow run:** ${RUN_URL}"
             echo "- **Timestamp:** ${TIMESTAMP}"
+            echo "- **Max alert severity:** ${MAX_SEVERITY:-p1}"
             echo "- **Check script:** \`scripts/data-quality-check.py\`"
             echo "- **Baselines:** \`data-quality-baselines.json\`"
             echo ""
@@ -180,7 +190,7 @@ jobs:
             --repo "${{ github.repository }}" \
             --title "Data quality regression: collection health alerts on dev" \
             --body-file /tmp/issue_body.md \
-            --label "priority/p1,area/scraping,data-quality-failure,agent/ready")
+            --label "${PRIORITY_LABEL},area/scraping,data-quality-failure,agent/ready")
 
           echo "issue_url=$ISSUE_URL" >> "$GITHUB_OUTPUT"
           echo "created=true" >> "$GITHUB_OUTPUT"
