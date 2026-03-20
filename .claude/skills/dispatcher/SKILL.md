@@ -166,6 +166,14 @@ For each open slot, pick the next highest-priority unassigned `agent/ready` issu
 
 **Always pass `--max-workers <max_slots>`** when spawning `/task` agents. This enables the hard backstop in `start-worker.sh`.
 
+**Agent description format:** When spawning a `/task` subagent via the Agent tool, set the `description` parameter to include a truncated issue title so that task notifications are self-descriptive. Format: `"Task #<N>: <truncated title>"` (3-5 words from the title). Examples:
+
+- `description="Task #1138: rename IPC files"`
+- `description="Task #589: OC scraper date fix"`
+- `description="Task #42: add ruling text field"`
+
+Drop any `[AREA]` prefix tags from the issue title when truncating. This makes `<task-notification>` summaries like `Agent "Task #1138: rename IPC files" completed` readable without cross-referencing issue numbers.
+
 as a background subagent. Before spawning each agent:
 
 1. **Re-count active agents** — do not rely on a count from a previous loop iteration. Count NOW.
