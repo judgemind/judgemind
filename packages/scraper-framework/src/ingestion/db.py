@@ -268,6 +268,33 @@ _GARBAGE_NAME_RE = re.compile(
     r"|_{2,}",  # underscores (template placeholders)
 )
 
+# Regex to strip encoding artifacts from judge names.
+# Targets specific problematic characters that result from encoding
+# mismatches (e.g. Windows-1252 content served as UTF-8):
+#   U+00BF  ¿  inverted question mark
+#   U+00A0     non-breaking space (replaced with regular space, not stripped)
+#   U+00AD     soft hyphen
+#   U+0080-U+009F  C1 control characters (common Windows-1252 artifacts)
+# We handle NBSP separately (replace with space) to avoid merging words.
+_ENCODING_ARTIFACT_RE = re.compile(r"[\u00bf\u00ad\u0080-\u009f]")
+_NBSP_RE = re.compile(r"\u00a0")
+
+# Known suffixes and initial patterns that are valid as a final word in a
+# judge name, even though they are short (1-3 characters).
+_VALID_SHORT_FINAL_WORDS = {
+    "jr",
+    "jr.",
+    "sr",
+    "sr.",
+    "ii",
+    "iii",
+    "iv",
+}
+
+# Minimum length for the last word to be considered a plausible surname
+# (unless it matches a known suffix pattern above).
+_MIN_SURNAME_LENGTH = 3
+
 
 def normalize_judge_name(raw_name: str) -> str | None:
     """Normalize a raw judge name string to a canonical form.
@@ -283,10 +310,11 @@ def normalize_judge_name(raw_name: str) -> str | None:
       - "Jr. Edward B. Moreton" -> "Edward B. Moreton Jr."
 
     Returns ``None`` for names that are clearly invalid (garbage text,
-    too long, unicode junk, or single-word-only names without a first name).
+    too long, unicode junk, encoding artifacts, or single-word-only names
+    without a first name).
 
     Steps:
-      1. Strip unicode replacement characters (U+FFFD).
+      1. Strip unicode replacement characters (U+FFFD) and encoding artifacts.
       2. Strip leading/trailing whitespace and collapse internal whitespace.
       3. Reject strings > 80 chars or containing garbage patterns.
       4. Strip honorific prefixes (Hon., Judge, The Honorable, Arbitrator).
@@ -297,6 +325,12 @@ def normalize_judge_name(raw_name: str) -> str | None:
     """
     # Strip unicode replacement characters
     name = raw_name.replace("\ufffd", "").strip()
+
+    # Strip encoding artifacts: remove specific problematic characters
+    # that result from encoding mismatches (e.g. ¿, soft hyphen, C1 controls).
+    # Replace NBSP with a regular space to avoid merging words.
+    name = _NBSP_RE.sub(" ", name)
+    name = _ENCODING_ARTIFACT_RE.sub("", name)
 
     # Collapse multiple spaces to one
     name = re.sub(r"\s+", " ", name)
@@ -361,6 +395,7 @@ def _looks_like_valid_judge_name(name: str) -> bool:
     Rejects:
     - Single-word names (last name only, no first name)
     - Empty or whitespace-only strings
+    - Clearly truncated names (last word is suspiciously short, e.g. "Mc", "Kin")
 
     This guard prevents garbage entries from being created in the judges table.
     """
@@ -372,7 +407,65 @@ def _looks_like_valid_judge_name(name: str) -> bool:
     if len(words) < 2:
         return False
 
+    # Detect truncated names: if the last word is very short and isn't a
+    # known suffix (Jr., Sr., II, III, IV) or an initial (single letter
+    # with period like "A."), it's likely a truncated surname from
+    # fixed-width HTML fields.
+    last_word = words[-1]
+    last_word_stripped = last_word.rstrip(".")
+
+    # Single uppercase letter + optional period is an initial, not a surname.
+    # This is fine — the name might be "John Smith A." (unusual but not truncated).
+    # However, a name ending in just an initial suggests no surname at all,
+    # so we still reject it.
+    if len(last_word_stripped) == 1 and last_word_stripped.isalpha():
+        logger.warning("Rejecting judge name ending in bare initial: %r", name)
+        return False
+
+    # Check if last word is a known valid short word (suffix)
+    if last_word.lower() in _VALID_SHORT_FINAL_WORDS:
+        return True
+
+    # Reject if last word is too short to be a real surname
+    if len(last_word_stripped) < _MIN_SURNAME_LENGTH:
+        logger.warning(
+            "Rejecting likely truncated judge name (last word %r too short): %r",
+            last_word,
+            name,
+        )
+        return False
+
+    # Reject surnames with no vowels (likely truncated, e.g. "Bnk", "Sch")
+    # unless it's at least 4 chars (some real surnames lack vowels: "Ng", "Lv"
+    # — but those are 2-char and caught above; 4+ char consonant-only is suspicious)
+    vowels = set("aeiouAEIOU")
+    if len(last_word_stripped) < 5 and not any(c in vowels for c in last_word_stripped):
+        logger.warning(
+            "Rejecting likely truncated judge name (last word %r has no vowels): %r",
+            last_word,
+            name,
+        )
+        return False
+
     return True
+
+
+def _strip_middle_initials(name: str) -> str:
+    """Remove middle initials from a name for near-duplicate comparison.
+
+    Converts "Carmen R. Luege" -> "Carmen Luege" and
+    "John A. B. Smith" -> "John Smith".
+
+    A middle initial is defined as a single uppercase letter optionally
+    followed by a period, appearing between the first and last words.
+    """
+    words = name.split()
+    if len(words) <= 2:
+        return name
+    # Keep first and last words; filter out middle initials
+    middle = words[1:-1]
+    kept = [w for w in middle if not (len(w.rstrip(".")) == 1 and w[0].isupper())]
+    return " ".join([words[0], *kept, words[-1]])
 
 
 def resolve_judge(
@@ -385,12 +478,15 @@ def resolve_judge(
     Returns ``None`` if the raw name is invalid (garbage, too short, etc.)
     instead of creating a bad judge record.
 
-    Lookup strategy (simple — exact normalized name match within the same court):
+    Lookup strategy:
       1. Normalize the raw name and validate it.
       2. Search judge_aliases for a matching raw_name + court (via judge.court_id).
       3. If found, return the judge_id from the alias.
-      4. If not found, create a new judge with canonical_name = normalized name,
-         create a judge_alias linking raw_name to the new judge, and return the id.
+      4. Check judges table for exact (canonical_name, court_id) match.
+      5. If found, create an alias and return the existing judge_id.
+      6. Check for near-duplicates (missing middle initial) at the same court.
+      7. If near-match found, link to existing judge (prefer more complete name).
+      8. If no match at all, create a new judge with ON CONFLICT handling.
     """
     raw_name = _strip_nul(raw_name) or raw_name
     canonical = normalize_judge_name(raw_name)
@@ -409,7 +505,7 @@ def resolve_judge(
         return None
 
     with conn.cursor() as cur:
-        # Look up existing alias for this raw name at this court
+        # Step 1: Look up existing alias for this raw name at this court
         cur.execute(
             """
             SELECT ja.judge_id
@@ -426,11 +522,89 @@ def resolve_judge(
             logger.debug("resolve_judge: found existing alias for %r -> %s", raw_name, judge_id)
             return judge_id
 
-        # No alias found — create new judge and alias
+        # Step 2: Check judges table for exact canonical_name + court_id match
+        cur.execute(
+            """
+            SELECT id FROM judges
+            WHERE canonical_name = %s AND court_id = %s::uuid
+            LIMIT 1
+            """,
+            (canonical, court_id),
+        )
+        row = cur.fetchone()
+        if row is not None:
+            judge_id = str(row[0])
+            # Create alias linking this raw_name to the existing judge
+            cur.execute(
+                """
+                INSERT INTO judge_aliases (judge_id, raw_name, source, confidence, is_verified)
+                VALUES (%s::uuid, %s, 'scraper', 1.0, FALSE)
+                ON CONFLICT DO NOTHING
+                """,
+                (judge_id, raw_name),
+            )
+            logger.debug(
+                "resolve_judge: found existing judge by canonical name %r -> %s",
+                canonical,
+                judge_id,
+            )
+            return judge_id
+
+        # Step 3: Near-duplicate detection — check for names that differ
+        # only by middle initial(s) at the same court.
+        candidate_stripped = _strip_middle_initials(canonical)
+        cur.execute(
+            """
+            SELECT id, canonical_name FROM judges
+            WHERE court_id = %s::uuid
+            """,
+            (court_id,),
+        )
+        existing_judges = cur.fetchall()
+        for existing_id, existing_canonical in existing_judges:
+            existing_stripped = _strip_middle_initials(existing_canonical)
+            if candidate_stripped.lower() == existing_stripped.lower():
+                judge_id = str(existing_id)
+                # If the new name is more complete (longer), update canonical
+                if len(canonical) > len(existing_canonical):
+                    cur.execute(
+                        """
+                        UPDATE judges SET canonical_name = %s, updated_at = NOW()
+                        WHERE id = %s::uuid
+                        """,
+                        (canonical, judge_id),
+                    )
+                    logger.info(
+                        "resolve_judge: updated canonical name %r -> %r for judge %s",
+                        existing_canonical,
+                        canonical,
+                        judge_id,
+                    )
+                # Create alias for the new raw name
+                cur.execute(
+                    """
+                    INSERT INTO judge_aliases (judge_id, raw_name, source, confidence, is_verified)
+                    VALUES (%s::uuid, %s, 'scraper', 0.9, FALSE)
+                    ON CONFLICT DO NOTHING
+                    """,
+                    (judge_id, raw_name),
+                )
+                logger.debug(
+                    "resolve_judge: near-duplicate match %r ~ %r -> %s",
+                    canonical,
+                    existing_canonical,
+                    judge_id,
+                )
+                return judge_id
+
+        # Step 4: No match found — create new judge with ON CONFLICT
+        # handling for the UNIQUE constraint (race condition safety net).
         cur.execute(
             """
             INSERT INTO judges (canonical_name, court_id)
             VALUES (%s, %s::uuid)
+            ON CONFLICT (canonical_name, court_id) DO UPDATE
+                SET updated_at = NOW()
             RETURNING id
             """,
             (canonical, court_id),
@@ -446,6 +620,7 @@ def resolve_judge(
             """
             INSERT INTO judge_aliases (judge_id, raw_name, source, confidence, is_verified)
             VALUES (%s::uuid, %s, 'scraper', 1.0, FALSE)
+            ON CONFLICT DO NOTHING
             """,
             (judge_id, raw_name),
         )
