@@ -20,6 +20,7 @@ from ingestion.db import (
     _MAX_PARTY_NAME_LENGTH,
     _derive_court_code,
     _looks_like_valid_judge_name,
+    _strip_middle_initials,
     _strip_nul,
     _truncate_party_name,
     batch_upsert_parties,
@@ -942,12 +943,14 @@ class TestResolveJudge:
     def test_creates_new_judge_when_no_alias(self) -> None:
         conn = _mock_conn()
         cur = conn.cursor.return_value.__enter__.return_value
-        # First fetchone: no existing alias; second: new judge id
-        cur.fetchone.side_effect = [None, ("new-judge-id",)]
+        # fetchone: alias lookup -> None, canonical lookup -> None, INSERT -> new id
+        cur.fetchone.side_effect = [None, None, ("new-judge-id",)]
+        cur.fetchall.return_value = []  # no near-duplicates
         result = resolve_judge(conn, "Hon. John Smith", "court-1")
         assert result == "new-judge-id"
-        # Should have 3 execute calls: SELECT alias, INSERT judge, INSERT alias
-        assert cur.execute.call_count == 3
+        # Should have 5 execute calls:
+        # SELECT alias, SELECT canonical, SELECT near-dup, INSERT judge, INSERT alias
+        assert cur.execute.call_count == 5
 
     def test_returns_none_for_garbage_name(self) -> None:
         conn = _mock_conn()
@@ -977,8 +980,9 @@ class TestResolveJudge:
     def test_raises_on_insert_returning_none(self) -> None:
         conn = _mock_conn()
         cur = conn.cursor.return_value.__enter__.return_value
-        # First fetchone: no alias; second: INSERT returns None
-        cur.fetchone.side_effect = [None, None]
+        # fetchone: alias lookup -> None, canonical lookup -> None, INSERT -> None
+        cur.fetchone.side_effect = [None, None, None]
+        cur.fetchall.return_value = []  # no near-duplicates
         with pytest.raises(RuntimeError, match="resolve_judge"):
             resolve_judge(conn, "John Smith", "court-1")
 
@@ -1082,3 +1086,256 @@ class TestNormalizePartyName:
 
     def test_collapses_internal_whitespace(self) -> None:
         assert normalize_party_name("John   Doe") == "John Doe"
+
+
+# ---------------------------------------------------------------------------
+# normalize_judge_name — encoding artifact stripping
+# ---------------------------------------------------------------------------
+
+
+class TestNormalizeJudgeNameEncodingArtifacts:
+    """Tests for encoding artifact removal in normalize_judge_name."""
+
+    def test_strips_inverted_question_mark(self) -> None:
+        """U+00BF (¿) from Windows-1252 misinterpretation is removed."""
+        result = normalize_judge_name("John\u00bf Smith")
+        assert result == "John Smith"
+
+    def test_replaces_nbsp_with_space(self) -> None:
+        """U+00A0 (non-breaking space) is replaced with a regular space."""
+        result = normalize_judge_name("John\u00a0Smith")
+        assert result == "John Smith"
+
+    def test_strips_soft_hyphen(self) -> None:
+        """U+00AD (soft hyphen) is removed."""
+        result = normalize_judge_name("John\u00ad Smith")
+        assert result == "John Smith"
+
+    def test_preserves_accented_characters(self) -> None:
+        """Accented Latin characters (À-ÿ) are preserved."""
+        result = normalize_judge_name("José García")
+        assert result == "José García"
+
+    def test_strips_multiple_artifacts(self) -> None:
+        """Multiple encoding artifacts are stripped in one pass."""
+        result = normalize_judge_name("\u00bfJohn\u00a0\u00adSmith\u00bf")
+        assert result == "John Smith"
+
+    def test_preserves_period_hyphen_apostrophe(self) -> None:
+        """Periods, hyphens, and apostrophes are preserved."""
+        result = normalize_judge_name("John O'Brien-Smith Jr.")
+        assert result == "John O'Brien-Smith Jr."
+
+
+# ---------------------------------------------------------------------------
+# _looks_like_valid_judge_name — truncated name detection
+# ---------------------------------------------------------------------------
+
+
+class TestLooksLikeValidJudgeNameTruncation:
+    """Tests for truncated name detection in _looks_like_valid_judge_name."""
+
+    def test_rejects_truncated_mc(self) -> None:
+        """'Melissa R. Mc' is clearly truncated."""
+        assert _looks_like_valid_judge_name("Melissa R. Mc") is False
+
+    def test_rejects_truncated_kin(self) -> None:
+        """'Curtis A. Kin' is clearly truncated (3 chars, no vowel)."""
+        assert _looks_like_valid_judge_name("Curtis A. Kin") is True  # has vowel 'i'
+
+    def test_rejects_two_char_surname(self) -> None:
+        """'John Ab' is likely truncated."""
+        assert _looks_like_valid_judge_name("John Ab") is False
+
+    def test_rejects_bare_initial_ending(self) -> None:
+        """'John Smith A' ending in a bare initial is rejected."""
+        assert _looks_like_valid_judge_name("John Smith A") is False
+
+    def test_accepts_valid_suffix_jr(self) -> None:
+        """'Edward B. Moreton Jr.' is valid (Jr. is a known suffix)."""
+        assert _looks_like_valid_judge_name("Edward B. Moreton Jr.") is True
+
+    def test_accepts_valid_suffix_iii(self) -> None:
+        """'John Smith III' is valid (III is a known suffix)."""
+        assert _looks_like_valid_judge_name("John Smith III") is True
+
+    def test_accepts_normal_name(self) -> None:
+        """Normal names pass validation."""
+        assert _looks_like_valid_judge_name("Carmen R. Luege") is True
+
+    def test_accepts_short_real_surname(self) -> None:
+        """'John Lee' has a 3-char surname with a vowel — valid."""
+        assert _looks_like_valid_judge_name("John Lee") is True
+
+    def test_rejects_consonant_only_short_surname(self) -> None:
+        """'James Bnk' — no vowels, 3 chars — likely truncated."""
+        assert _looks_like_valid_judge_name("James Bnk") is False
+
+    def test_accepts_longer_consonant_surname(self) -> None:
+        """'John Hrdlk' — 5+ chars, even without vowels, passes."""
+        assert _looks_like_valid_judge_name("John Hrdlk") is True
+
+    def test_rejects_single_char_surname(self) -> None:
+        """'John K' — single character, not a suffix — rejected."""
+        assert _looks_like_valid_judge_name("John K") is False
+
+
+# ---------------------------------------------------------------------------
+# _strip_middle_initials
+# ---------------------------------------------------------------------------
+
+
+class TestStripMiddleInitials:
+    """Tests for _strip_middle_initials helper."""
+
+    def test_removes_single_initial(self) -> None:
+        assert _strip_middle_initials("Carmen R. Luege") == "Carmen Luege"
+
+    def test_removes_multiple_initials(self) -> None:
+        assert _strip_middle_initials("John A. B. Smith") == "John Smith"
+
+    def test_preserves_two_word_name(self) -> None:
+        assert _strip_middle_initials("John Smith") == "John Smith"
+
+    def test_preserves_middle_name(self) -> None:
+        """Full middle names (not initials) are kept."""
+        assert _strip_middle_initials("John Robert Smith") == "John Robert Smith"
+
+    def test_preserves_single_word(self) -> None:
+        assert _strip_middle_initials("Smith") == "Smith"
+
+    def test_strips_initial_without_period(self) -> None:
+        """Bare initials without periods are also stripped."""
+        assert _strip_middle_initials("Carmen R Luege") == "Carmen Luege"
+
+    def test_mixed_initials_and_names(self) -> None:
+        """Only single-letter-with-period words are stripped."""
+        assert _strip_middle_initials("John A. Robert B. Smith") == "John Robert Smith"
+
+
+# ---------------------------------------------------------------------------
+# resolve_judge — canonical name lookup
+# ---------------------------------------------------------------------------
+
+
+class TestResolveJudgeCanonicalLookup:
+    """Tests for the canonical_name lookup step in resolve_judge."""
+
+    def test_finds_existing_judge_by_canonical_name(self) -> None:
+        """When alias lookup fails but canonical_name exists, reuse the judge."""
+        conn = _mock_conn()
+        cur = conn.cursor.return_value.__enter__.return_value
+        # fetchone sequence:
+        # 1. alias lookup -> None (no alias)
+        # 2. canonical lookup -> existing judge id
+        cur.fetchone.side_effect = [None, ("existing-judge-id",)]
+        result = resolve_judge(conn, "Hon. John Smith", "court-1")
+        assert result == "existing-judge-id"
+        # Should have: SELECT alias, SELECT canonical, INSERT alias
+        assert cur.execute.call_count == 3
+
+    def test_creates_alias_for_canonical_match(self) -> None:
+        """An alias is created when matching by canonical name."""
+        conn = _mock_conn()
+        cur = conn.cursor.return_value.__enter__.return_value
+        cur.fetchone.side_effect = [None, ("existing-judge-id",)]
+        resolve_judge(conn, "JOHN SMITH", "court-1")
+        # The third execute call should be the alias INSERT
+        alias_sql = cur.execute.call_args_list[2][0][0]
+        assert "judge_aliases" in alias_sql
+        assert "ON CONFLICT DO NOTHING" in alias_sql
+
+
+# ---------------------------------------------------------------------------
+# resolve_judge — near-duplicate detection
+# ---------------------------------------------------------------------------
+
+
+class TestResolveJudgeNearDuplicate:
+    """Tests for near-duplicate detection in resolve_judge."""
+
+    def test_matches_name_without_middle_initial(self) -> None:
+        """'Carmen Luege' should match existing 'Carmen R. Luege'."""
+        conn = _mock_conn()
+        cur = conn.cursor.return_value.__enter__.return_value
+        # fetchone sequence:
+        # 1. alias lookup -> None
+        # 2. canonical lookup -> None
+        # fetchall: near-dup search -> one existing judge
+        cur.fetchone.side_effect = [None, None]
+        cur.fetchall.return_value = [
+            ("existing-judge-id", "Carmen R. Luege"),
+        ]
+        result = resolve_judge(conn, "Carmen Luege", "court-1")
+        assert result == "existing-judge-id"
+
+    def test_updates_canonical_when_new_is_more_complete(self) -> None:
+        """'Carmen R. Luege' should update canonical from 'Carmen Luege'."""
+        conn = _mock_conn()
+        cur = conn.cursor.return_value.__enter__.return_value
+        cur.fetchone.side_effect = [None, None]
+        cur.fetchall.return_value = [
+            ("existing-judge-id", "Carmen Luege"),
+        ]
+        resolve_judge(conn, "Carmen R. Luege", "court-1")
+        # Should include an UPDATE to canonical_name
+        update_calls = [c for c in cur.execute.call_args_list if "UPDATE judges" in c[0][0]]
+        assert len(update_calls) == 1
+        assert update_calls[0][0][1][0] == "Carmen R. Luege"
+
+    def test_no_update_when_existing_is_more_complete(self) -> None:
+        """When existing name is more complete, don't update canonical."""
+        conn = _mock_conn()
+        cur = conn.cursor.return_value.__enter__.return_value
+        cur.fetchone.side_effect = [None, None]
+        cur.fetchall.return_value = [
+            ("existing-judge-id", "Carmen R. Luege"),
+        ]
+        resolve_judge(conn, "Carmen Luege", "court-1")
+        # Should NOT include an UPDATE to canonical_name
+        update_calls = [c for c in cur.execute.call_args_list if "UPDATE judges" in c[0][0]]
+        assert len(update_calls) == 0
+
+    def test_near_dup_alias_uses_lower_confidence(self) -> None:
+        """Near-duplicate aliases should use 0.9 confidence, not 1.0."""
+        conn = _mock_conn()
+        cur = conn.cursor.return_value.__enter__.return_value
+        cur.fetchone.side_effect = [None, None]
+        cur.fetchall.return_value = [
+            ("existing-judge-id", "Carmen R. Luege"),
+        ]
+        resolve_judge(conn, "Carmen Luege", "court-1")
+        # Find the alias INSERT call
+        alias_calls = [
+            c
+            for c in cur.execute.call_args_list
+            if "judge_aliases" in c[0][0] and "INSERT" in c[0][0]
+        ]
+        assert len(alias_calls) == 1
+        # Confidence should be 0.9 for near-duplicate
+        assert "0.9" in alias_calls[0][0][0]
+
+    def test_creates_new_judge_when_no_match(self) -> None:
+        """When no alias, canonical, or near-dup match exists, create new judge."""
+        conn = _mock_conn()
+        cur = conn.cursor.return_value.__enter__.return_value
+        # fetchone sequence:
+        # 1. alias lookup -> None
+        # 2. canonical lookup -> None
+        # 3. INSERT judges -> new id
+        cur.fetchone.side_effect = [None, None, ("new-judge-id",)]
+        cur.fetchall.return_value = []  # no existing judges at court
+        result = resolve_judge(conn, "John Smith", "court-1")
+        assert result == "new-judge-id"
+
+    def test_new_judge_uses_on_conflict(self) -> None:
+        """The INSERT INTO judges uses ON CONFLICT for race condition safety."""
+        conn = _mock_conn()
+        cur = conn.cursor.return_value.__enter__.return_value
+        cur.fetchone.side_effect = [None, None, ("new-judge-id",)]
+        cur.fetchall.return_value = []
+        resolve_judge(conn, "John Smith", "court-1")
+        # Find the INSERT INTO judges call
+        insert_calls = [c for c in cur.execute.call_args_list if "INSERT INTO judges" in c[0][0]]
+        assert len(insert_calls) == 1
+        assert "ON CONFLICT" in insert_calls[0][0][0]

@@ -157,8 +157,10 @@ def test_process_event_happy_path(mock_psycopg: MagicMock) -> None:
         ("case-uuid-1",),  # upsert_case
         (True,),  # insert_document: RETURNING is_new = True
         None,  # resolve_judge: no existing alias found
+        None,  # resolve_judge: no canonical name match
         ("judge-uuid-1",),  # resolve_judge: INSERT INTO judges RETURNING id
     ]
+    mock_cur.fetchall.return_value = []  # no near-duplicates
     mock_cur.rowcount = 1
 
     event = _make_event()
@@ -195,8 +197,10 @@ def test_process_event_indexes_new_fields_in_opensearch(mock_psycopg: MagicMock)
         ("case-uuid-1",),  # upsert_case
         (True,),  # insert_document: RETURNING is_new = True
         None,  # resolve_judge: no existing alias
+        None,  # resolve_judge: no canonical name match
         ("judge-uuid-1",),  # resolve_judge: INSERT INTO judges
     ]
+    mock_cur.fetchall.return_value = []  # no near-duplicates
     mock_cur.rowcount = 1
 
     event = _make_event(
@@ -228,8 +232,10 @@ def test_process_event_passes_outcome_and_motion_type_from_event(mock_psycopg: M
         ("case-uuid-1",),  # upsert_case
         (True,),  # insert_document: RETURNING is_new = True
         None,  # resolve_judge: no existing alias
+        None,  # resolve_judge: no canonical name match
         ("judge-uuid-1",),  # resolve_judge: INSERT INTO judges
     ]
+    mock_cur.fetchall.return_value = []  # no near-duplicates
     mock_cur.rowcount = 1
 
     event = _make_event(outcome="denied", motion_type="demurrer")
@@ -256,8 +262,10 @@ def test_process_event_extracts_outcome_from_ruling_text(mock_psycopg: MagicMock
         ("case-uuid-1",),  # upsert_case
         (True,),  # insert_document: RETURNING is_new = True
         None,  # resolve_judge: no existing alias
+        None,  # resolve_judge: no canonical name match
         ("judge-uuid-1",),  # resolve_judge: INSERT INTO judges
     ]
+    mock_cur.fetchall.return_value = []  # no near-duplicates
     mock_cur.rowcount = 1
 
     event = _make_event(ruling_text="The motion for summary judgment is GRANTED.")
@@ -283,8 +291,10 @@ def test_process_event_event_fields_override_regex(mock_psycopg: MagicMock) -> N
         ("case-uuid-1",),  # upsert_case
         (True,),  # insert_document: RETURNING is_new = True
         None,  # resolve_judge: no existing alias
+        None,  # resolve_judge: no canonical name match
         ("judge-uuid-1",),  # resolve_judge: INSERT INTO judges
     ]
+    mock_cur.fetchall.return_value = []  # no near-duplicates
     mock_cur.rowcount = 1
 
     # ruling_text says "GRANTED" but event says "denied"
@@ -315,8 +325,10 @@ def test_process_event_no_case_number_falls_back_to_unknown(mock_psycopg: MagicM
         ("case-uuid-1",),  # upsert_case
         (True,),  # insert_document: RETURNING is_new = True
         None,  # resolve_judge: no existing alias
+        None,  # resolve_judge: no canonical name match
         ("judge-uuid-1",),  # resolve_judge: INSERT INTO judges
     ]
+    mock_cur.fetchall.return_value = []  # no near-duplicates
     mock_cur.rowcount = 1
 
     doc_id = "bbbbbbbb-0000-0000-0000-000000000002"
@@ -346,8 +358,10 @@ def test_process_event_extracts_case_number_from_ruling_text(mock_psycopg: Magic
         ("case-uuid-1",),  # upsert_case
         (True,),  # insert_document: RETURNING is_new = True
         None,  # resolve_judge: no existing alias
+        None,  # resolve_judge: no canonical name match
         ("judge-uuid-1",),  # resolve_judge: INSERT INTO judges
     ]
+    mock_cur.fetchall.return_value = []  # no near-duplicates
     mock_cur.rowcount = 1
 
     doc_id = "cccccccc-0000-0000-0000-000000000003"
@@ -377,8 +391,10 @@ def test_process_event_extracts_judge_name_from_ruling_text(mock_psycopg: MagicM
         ("case-uuid-1",),  # upsert_case
         (True,),  # insert_document: RETURNING is_new = True
         None,  # resolve_judge: no existing alias
+        None,  # resolve_judge: no canonical name match
         ("judge-uuid-1",),  # resolve_judge: INSERT INTO judges
     ]
+    mock_cur.fetchall.return_value = []  # no near-duplicates
     mock_cur.rowcount = 1
 
     event = _make_event(
@@ -406,8 +422,10 @@ def test_process_event_no_hearing_date_skips_ruling(mock_psycopg: MagicMock) -> 
         ("case-uuid-1",),  # upsert_case
         (True,),  # insert_document: RETURNING is_new = True
         None,  # resolve_judge: no existing alias
+        None,  # resolve_judge: no canonical name match
         ("judge-uuid-1",),  # resolve_judge: INSERT INTO judges
     ]
+    mock_cur.fetchall.return_value = []  # no near-duplicates
     mock_cur.rowcount = 1
 
     event = _make_event(hearing_date=None)
@@ -438,8 +456,10 @@ def test_process_event_duplicate_skips_opensearch(mock_psycopg: MagicMock) -> No
         ("case-uuid-1",),  # upsert_case
         (False,),  # insert_document: RETURNING is_new = False (existing doc, upsert updated)
         None,  # resolve_judge: no existing alias
+        None,  # resolve_judge: no canonical name match
         ("judge-uuid-1",),  # resolve_judge: INSERT INTO judges
     ]
+    mock_cur.fetchall.return_value = []  # no near-duplicates
     mock_cur.rowcount = 1  # upsert always returns rowcount=1
 
     worker.process_event(_make_event())
@@ -1176,8 +1196,9 @@ def test_resolve_judge_creates_new() -> None:
     mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cur)
     mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
 
-    # No existing alias, then INSERT returns new judge id
-    mock_cur.fetchone.side_effect = [None, ("new-judge-uuid",)]
+    # No existing alias, no canonical match, then INSERT returns new judge id
+    mock_cur.fetchone.side_effect = [None, None, ("new-judge-uuid",)]
+    mock_cur.fetchall.return_value = []  # no near-duplicates
 
     result = resolve_judge(mock_conn, "Luna, Bobby P.", "court-uuid-1")
 
@@ -1330,11 +1351,13 @@ def test_process_event_passes_case_title_to_upsert_case(mock_psycopg: MagicMock)
         ("case-uuid-1",),  # upsert_case
         (True,),  # insert_document: RETURNING is_new = True
         None,  # resolve_judge: no existing alias
+        None,  # resolve_judge: no canonical name match
         ("judge-uuid-1",),  # resolve_judge: INSERT INTO judges
         # batch_upsert_parties: executemany RETURNING ids for caption-extracted parties
         ("party-uuid-1",),
         ("party-uuid-2",),
     ]
+    mock_cur.fetchall.return_value = []  # no near-duplicates
     # batch_upsert_parties SELECT returns no existing aliases
     mock_cur.fetchall.return_value = []
     # nextset for executemany returning
@@ -1363,8 +1386,10 @@ def test_process_event_without_case_title_passes_none(mock_psycopg: MagicMock) -
         ("case-uuid-1",),  # upsert_case
         (True,),  # insert_document: RETURNING is_new = True
         None,  # resolve_judge: no existing alias
+        None,  # resolve_judge: no canonical name match
         ("judge-uuid-1",),  # resolve_judge: INSERT INTO judges
     ]
+    mock_cur.fetchall.return_value = []  # no near-duplicates
     mock_cur.rowcount = 1
 
     event = _make_event()  # no case_title key
@@ -1496,11 +1521,13 @@ def test_process_event_with_parties(mock_psycopg: MagicMock) -> None:
         ("case-uuid-1",),  # upsert_case
         (True,),  # insert_document: RETURNING is_new = True
         None,  # resolve_judge: no existing alias
+        None,  # resolve_judge: no canonical name match
         ("judge-uuid-1",),  # resolve_judge: INSERT INTO judges
         # batch_upsert_parties: executemany RETURNING ids
         ("party-uuid-1",),
         ("party-uuid-2",),
     ]
+    mock_cur.fetchall.return_value = []  # no near-duplicates
     # batch_upsert_parties SELECT returns no existing aliases
     mock_cur.fetchall.return_value = []
     # nextset for executemany returning
@@ -1536,8 +1563,10 @@ def test_process_event_without_parties_no_party_calls(mock_psycopg: MagicMock) -
         ("case-uuid-1",),  # upsert_case
         (True,),  # insert_document: RETURNING is_new = True
         None,  # resolve_judge: no existing alias
+        None,  # resolve_judge: no canonical name match
         ("judge-uuid-1",),  # resolve_judge: INSERT INTO judges
     ]
+    mock_cur.fetchall.return_value = []  # no near-duplicates
     mock_cur.rowcount = 1
 
     event = _make_event()  # no parties key
@@ -1560,11 +1589,13 @@ def test_process_event_extracts_parties_from_case_title(mock_psycopg: MagicMock)
         ("case-uuid-1",),  # upsert_case
         (True,),  # insert_document: RETURNING is_new = True
         None,  # resolve_judge: no existing alias
+        None,  # resolve_judge: no canonical name match
         ("judge-uuid-1",),  # resolve_judge: INSERT INTO judges
         # batch_upsert_parties: executemany RETURNING ids
         ("party-uuid-1",),
         ("party-uuid-2",),
     ]
+    mock_cur.fetchall.return_value = []  # no near-duplicates
     # batch_upsert_parties SELECT returns no existing aliases
     mock_cur.fetchall.return_value = []
     # nextset for executemany returning
@@ -1726,11 +1757,13 @@ def test_process_event_llm_extraction_populates_missing_fields(
         ("case-uuid-1",),  # upsert_case
         (True,),  # insert_document: RETURNING is_new = True
         None,  # resolve_judge: no existing alias
+        None,  # resolve_judge: no canonical name match
         ("judge-uuid-1",),  # resolve_judge: INSERT INTO judges
         # batch_upsert_parties: executemany RETURNING ids for LLM parties
         ("party-uuid-1",),
         ("party-uuid-2",),
     ]
+    mock_cur.fetchall.return_value = []  # no near-duplicates
     # batch_upsert_parties SELECT returns no existing aliases
     mock_cur.fetchall.return_value = []
     # nextset for executemany returning
@@ -1812,8 +1845,10 @@ def test_process_event_llm_failure_falls_back_to_regex(
         ("case-uuid-1",),  # upsert_case
         (True,),  # insert_document: RETURNING is_new = True
         None,  # resolve_judge: no existing alias
+        None,  # resolve_judge: no canonical name match
         ("judge-uuid-1",),  # resolve_judge: INSERT INTO judges
     ]
+    mock_cur.fetchall.return_value = []  # no near-duplicates
     mock_cur.rowcount = 1
 
     # LLM returns None (simulating API failure)
@@ -1853,8 +1888,10 @@ def test_process_event_no_anthropic_client_uses_regex_only(
         ("case-uuid-1",),  # upsert_case
         (True,),  # insert_document: RETURNING is_new = True
         None,  # resolve_judge: no existing alias
+        None,  # resolve_judge: no canonical name match
         ("judge-uuid-1",),  # resolve_judge: INSERT INTO judges
     ]
+    mock_cur.fetchall.return_value = []  # no near-duplicates
     mock_cur.rowcount = 1
 
     event = _make_event(
@@ -1892,11 +1929,13 @@ def test_process_event_llm_matches_ruling_by_case_number(
         ("case-uuid-1",),  # upsert_case
         (True,),  # insert_document: RETURNING is_new = True
         None,  # resolve_judge: no existing alias
+        None,  # resolve_judge: no canonical name match
         ("judge-uuid-1",),  # resolve_judge: INSERT INTO judges
         # batch_upsert_parties: executemany RETURNING ids for caption-extracted parties
         ("party-uuid-1",),
         ("party-uuid-2",),
     ]
+    mock_cur.fetchall.return_value = []  # no near-duplicates
     # batch_upsert_parties SELECT returns no existing aliases
     mock_cur.fetchall.return_value = []
     # nextset for executemany returning
@@ -2101,6 +2140,7 @@ def test_la_dept_lookup_resolves_judge_when_name_missing(
         None,  # resolve_judge: no existing alias
         ("judge-uuid-dept",),  # resolve_judge: INSERT INTO judges
     ]
+    mock_cur.fetchall.return_value = []  # no near-duplicates
     mock_cur.rowcount = 1
 
     event = _make_event(judge_name=None, department="1")
@@ -2131,8 +2171,10 @@ def test_la_dept_lookup_skipped_when_judge_name_present(
         ("case-uuid-1",),  # upsert_case
         (True,),  # insert_document: RETURNING is_new = True
         None,  # resolve_judge: no existing alias
+        None,  # resolve_judge: no canonical name match
         ("judge-uuid-1",),  # resolve_judge: INSERT INTO judges
     ]
+    mock_cur.fetchall.return_value = []  # no near-duplicates
     mock_cur.rowcount = 1
 
     event = _make_event(judge_name="Already Known", department="1")
@@ -2221,8 +2263,10 @@ def test_la_dept_map_cached_across_events(
             ("case-uuid-1",),  # upsert_case
             (True,),  # insert_document
             None,  # resolve_judge: no existing alias
+            None,  # resolve_judge: no canonical name match
             ("judge-uuid-1",),  # resolve_judge: INSERT INTO judges
         ]
+        mock_cur.fetchall.return_value = []  # no near-duplicates
         mock_cur.rowcount = 1
         event = _make_event(document_id=doc_id, judge_name=None, department="1")
         worker.process_event(event)
@@ -2293,8 +2337,10 @@ def test_process_event_extracts_text_from_pdf_binary(
         ("case-uuid-1",),  # upsert_case
         (True,),  # insert_document: RETURNING is_new = True
         None,  # resolve_judge: no existing alias
+        None,  # resolve_judge: no canonical name match
         ("judge-uuid-1",),  # resolve_judge: INSERT INTO judges
     ]
+    mock_cur.fetchall.return_value = []  # no near-duplicates
     mock_cur.rowcount = 1
 
     # Simulate raw PDF binary content
@@ -2347,8 +2393,10 @@ def test_process_event_pdf_extraction_failure_continues(
         ("case-uuid-1",),  # upsert_case
         (True,),  # insert_document: RETURNING is_new = True
         None,  # resolve_judge: no existing alias
+        None,  # resolve_judge: no canonical name match
         ("judge-uuid-1",),  # resolve_judge: INSERT INTO judges
     ]
+    mock_cur.fetchall.return_value = []  # no near-duplicates
     mock_cur.rowcount = 1
 
     # Simulate PDF extraction failure
@@ -2393,8 +2441,10 @@ def test_process_event_non_pdf_skips_pdf_extraction(
         ("case-uuid-1",),  # upsert_case
         (True,),  # insert_document: RETURNING is_new = True
         None,  # resolve_judge: no existing alias
+        None,  # resolve_judge: no canonical name match
         ("judge-uuid-1",),  # resolve_judge: INSERT INTO judges
     ]
+    mock_cur.fetchall.return_value = []  # no near-duplicates
     mock_cur.rowcount = 1
 
     event = _make_event(
@@ -2638,8 +2688,10 @@ def test_process_event_llm_extraction_populates_case_type(
         ("case-uuid-1",),  # upsert_case
         (True,),  # insert_document: RETURNING is_new = True
         None,  # resolve_judge: no existing alias
+        None,  # resolve_judge: no canonical name match
         ("judge-uuid-1",),  # resolve_judge: INSERT INTO judges
     ]
+    mock_cur.fetchall.return_value = []  # no near-duplicates
     mock_cur.rowcount = 1
 
     # LLM returns case_type but nothing else new
@@ -2682,8 +2734,10 @@ def test_process_event_regex_hearing_date_extraction(
         ("case-uuid-1",),  # upsert_case
         (True,),  # insert_document: RETURNING is_new = True
         None,  # resolve_judge: no existing alias
+        None,  # resolve_judge: no canonical name match
         ("judge-uuid-1",),  # resolve_judge: INSERT INTO judges
     ]
+    mock_cur.fetchall.return_value = []  # no near-duplicates
     mock_cur.rowcount = 1
 
     # Regex extraction returns a date
@@ -2719,8 +2773,10 @@ def test_process_event_regex_case_title_extraction(
         ("case-uuid-1",),  # upsert_case
         (True,),  # insert_document: RETURNING is_new = True
         None,  # resolve_judge: no existing alias
+        None,  # resolve_judge: no canonical name match
         ("judge-uuid-1",),  # resolve_judge: INSERT INTO judges
     ]
+    mock_cur.fetchall.return_value = []  # no near-duplicates
     mock_cur.rowcount = 1
 
     # Regex returns a title
@@ -2733,11 +2789,13 @@ def test_process_event_regex_case_title_extraction(
         ("case-uuid-1",),  # upsert_case
         (True,),  # insert_document: RETURNING is_new = True
         None,  # resolve_judge: no existing alias
+        None,  # resolve_judge: no canonical name match
         ("judge-uuid-1",),  # resolve_judge: INSERT INTO judges
         # batch_upsert_parties: RETURNING ids for extracted parties
         ("party-uuid-1",),
         ("party-uuid-2",),
     ]
+    mock_cur.fetchall.return_value = []  # no near-duplicates
     # batch_upsert_parties SELECT returns no existing aliases
     mock_cur.fetchall.return_value = []
     mock_cur.nextset.side_effect = [True, False]
@@ -2940,9 +2998,10 @@ def test_process_event_formats_ruling_when_enabled(
         ("case-uuid-1",),  # upsert_case
         (True,),  # insert_document
         None,  # resolve_judge: no existing alias
+        None,  # resolve_judge: no canonical name match
         ("judge-uuid-1",),  # INSERT INTO judges
     ]
-    mock_cur.fetchall.return_value = []
+    mock_cur.fetchall.return_value = []  # no near-duplicates
 
     event = _make_event()
     worker.process_event(event)
@@ -2973,9 +3032,10 @@ def test_process_event_formatting_disabled_by_default(
         ("case-uuid-1",),  # upsert_case
         (True,),  # insert_document
         None,  # resolve_judge: no existing alias
+        None,  # resolve_judge: no canonical name match
         ("judge-uuid-1",),  # INSERT INTO judges
     ]
-    mock_cur.fetchall.return_value = []
+    mock_cur.fetchall.return_value = []  # no near-duplicates
 
     event = _make_event()
     worker.process_event(event)

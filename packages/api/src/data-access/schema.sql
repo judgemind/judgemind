@@ -58,7 +58,8 @@ CREATE TABLE judges (
     biographical_notes  TEXT,                        -- From public records
     bio_reviewed_at     TIMESTAMPTZ,                 -- Last verified
     created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT judges_canonical_name_court_id_key UNIQUE (canonical_name, court_id)
 );
 
 CREATE TABLE judge_aliases (
