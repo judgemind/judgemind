@@ -193,7 +193,7 @@ cd packages/telegram-bridge
 
 ### Tier 2 — End-to-end smoke test with test bot
 
-The `scripts/tg-smoke-test.py` script validates the full pipeline by sending a real message through the Lambda webhook and verifying the bot's reply via the Telegram API.
+The `scripts/run-py.sh scripts/tg-smoke-test.py` command validates the full pipeline by sending a real message through the Lambda webhook and verifying the bot's reply via the Telegram API.
 
 #### Setting up a test bot
 
@@ -222,20 +222,20 @@ The `scripts/tg-smoke-test.py` script validates the full pipeline by sending a r
 TG_TEST_USER_ID=<test_bot_user_id> \
 TG_TEST_CHAT_ID=<chat_id> \
 WEBHOOK_URL=<api_gateway_url>/webhook \
-    scripts/tg-smoke-test.py
+    scripts/run-py.sh scripts/tg-smoke-test.py
 
 # Or with explicit token:
 TG_TEST_BOT_TOKEN=<token> \
 TG_TEST_USER_ID=<test_bot_user_id> \
 TG_TEST_CHAT_ID=<chat_id> \
 WEBHOOK_URL=<api_gateway_url>/webhook \
-    scripts/tg-smoke-test.py
+    scripts/run-py.sh scripts/tg-smoke-test.py
 
 # Validate configuration only (no messages sent):
-scripts/tg-smoke-test.py --dry-run --webhook-url <url>
+scripts/run-py.sh scripts/tg-smoke-test.py --dry-run --webhook-url <url>
 
 # Custom timeout:
-scripts/tg-smoke-test.py --timeout 60
+scripts/run-py.sh scripts/tg-smoke-test.py --timeout 60
 ```
 
 The script exits 0 on success, 1 on test failure, and 2 on configuration error.

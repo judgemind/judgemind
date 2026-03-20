@@ -218,7 +218,7 @@ Write a comprehensive summary to `{worktree}/tmp/audit/report.md`:
 Send a summary notification via Telegram:
 
 ```
-scripts/tg-notify.py notify "Audit complete: N findings, M issues filed. [critical: X, high: Y, medium: Z, low: W]"
+scripts/run-py.sh scripts/tg-notify.py notify "Audit complete: N findings, M issues filed. [critical: X, high: Y, medium: Z, low: W]"
 ```
 
 ---

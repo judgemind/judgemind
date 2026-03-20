@@ -50,7 +50,7 @@ The responder daemon reads this file to provide context to the Claude interprete
 
 ## Responder Daemon and State Files
 
-The standalone **responder daemon** (`scripts/tg-responder.py`) interprets all Telegram messages via a Claude API call (Opus). It receives the user's message and the current dispatcher status, generates a natural-language reply, and extracts any actionable commands. It communicates with the dispatcher via shared state files:
+The standalone **responder daemon** (`scripts/run-py.sh scripts/tg-responder.py`) interprets all Telegram messages via a Claude API call (Opus). It receives the user's message and the current dispatcher status, generates a natural-language reply, and extracts any actionable commands. It communicates with the dispatcher via shared state files:
 
 - **`tmp/dispatcher_status.json`** — written by `DispatcherBridge.write_status()`. The responder reads this to provide context to the Claude interpreter. Contains active agents, open PRs, queue, and paused/stopped state.
 - **`tmp/dispatcher_state.json`** — the responder writes `paused` flag changes here. The dispatcher must call `bridge.refresh_state()` before each spawn decision to pick up `pause`/`resume` changes made out-of-loop.
@@ -69,7 +69,7 @@ The standalone **responder daemon** (`scripts/tg-responder.py`) interprets all T
 - `judgemind/telegram/bot` — bot token and allowed user IDs (existing)
 - `judgemind/anthropic/api-key` — Anthropic API key for Claude interpreter, or set `ANTHROPIC_API_KEY` env var. If missing, the daemon falls back to simple acknowledgments.
 
-To start the responder daemon: `scripts/tg-responder.py`. To stop it: `scripts/tg-stop-responder.sh`.
+To start the responder daemon: `scripts/run-py.sh scripts/tg-responder.py`. To stop it: `scripts/tg-stop-responder.sh`.
 
 ## Unattended Operation Patterns — Telegram
 
