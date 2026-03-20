@@ -213,7 +213,7 @@ PYEOF
             echo "Retrying in ${_retry_wait}s..." >&2
             sleep "$_retry_wait"
         fi
-        if "$REPO_ROOT/scripts/ecs-logs.sh" "$LOGS_LOG_GROUP" --task "$TASK_ID_FROM_ARN" --lines 200 2>/dev/null; then
+        if "$REPO_ROOT/scripts/ecs-logs.sh" "$LOGS_LOG_GROUP" --task "$TASK_ID_FROM_ARN" --lines 200; then
             LOGS_OK=true
             break
         fi
@@ -708,7 +708,7 @@ find_log_stream() {
         --region "$REGION" \
         --output text \
         --query "logStreams[*].logStreamName" \
-        --no-cli-pager 2>/dev/null | tr '\t' '\n' | grep -F "$TASK_ID" | head -n 1 || true
+        --no-cli-pager | tr '\t' '\n' | grep -F "$TASK_ID" | head -n 1 || true
 }
 
 # stream_new_logs — Fetch and print any new log events since the last check.
@@ -744,7 +744,10 @@ stream_new_logs() {
     fi
 
     local result
-    result=$(aws "${args[@]}" 2>/dev/null) || return 0
+    result=$(aws "${args[@]}") || {
+        echo "WARNING: failed to fetch log events during live streaming" >&2
+        return 0
+    }
 
     # Extract log messages and forward token from the response
     local messages new_token
@@ -753,13 +756,19 @@ import sys, json
 data = json.load(sys.stdin)
 for event in data.get('events', []):
     print(event.get('message', '').rstrip())
-" 2>/dev/null) || true
+") || {
+        echo "WARNING: failed to parse live log events JSON" >&2
+        true
+    }
 
     new_token=$(echo "$result" | python3 -c "
 import sys, json
 data = json.load(sys.stdin)
 print(data.get('nextForwardToken', ''))
-" 2>/dev/null) || true
+") || {
+        echo "WARNING: failed to extract forward token from live log response" >&2
+        true
+    }
 
     if [[ -n "$messages" ]]; then
         echo "$messages"
@@ -776,7 +785,7 @@ while [[ $ELAPSED -lt $TIMEOUT ]]; do
         --tasks "$TASK_ARN" \
         --region "$REGION" \
         --output json \
-        --no-cli-pager 2>/dev/null)
+        --no-cli-pager)
 
     CURRENT_STATUS=$(echo "$DESCRIBE_OUTPUT" | python3 -c "import sys,json; t=json.load(sys.stdin)['tasks'][0]; print(t['lastStatus'])")
 
@@ -868,7 +877,10 @@ STOP_REASON=$(echo "$DESCRIBE_OUTPUT" | python3 -c "
 import sys, json
 task = json.load(sys.stdin)['tasks'][0]
 print(task.get('stoppedReason', ''))
-" 2>/dev/null) || true
+") || {
+    echo "WARNING: failed to extract stop reason from task description" >&2
+    STOP_REASON=""
+}
 
 echo "" >&2
 if [[ -n "$STOP_REASON" ]]; then
@@ -892,7 +904,7 @@ if [[ "$LOG_STREAMING" == "false" ]]; then
     for _log_wait in 5 10 15; do
         echo "Waiting ${_log_wait}s for CloudWatch log stream..." >&2
         sleep "$_log_wait"
-        if "$REPO_ROOT/scripts/ecs-logs.sh" "$LOG_GROUP" --task "$TASK_ID" --lines 200 2>/dev/null; then
+        if "$REPO_ROOT/scripts/ecs-logs.sh" "$LOG_GROUP" --task "$TASK_ID" --lines 200; then
             LOGS_RETRIEVED=true
             break
         fi

@@ -74,10 +74,13 @@ for spec in "${ENV_SPECS[@]}"; do
         --secret-id "$secret_id" \
         --query SecretString \
         --output text \
-        --region us-west-2 2>/dev/null)
+        --region us-west-2) || {
+        echo "Error: failed to retrieve secret '$secret_id' from AWS Secrets Manager" >&2
+        exit 1
+    }
 
-    if [[ $? -ne 0 || -z "$raw_secret" ]]; then
-        echo "Error: failed to retrieve secret '$secret_id'" >&2
+    if [[ -z "$raw_secret" ]]; then
+        echo "Error: secret '$secret_id' is empty" >&2
         exit 1
     fi
 
@@ -91,12 +94,10 @@ if key not in data:
     print(f'Error: key \"{key}\" not found in secret', file=sys.stderr)
     sys.exit(1)
 print(data[key], end='')
-" 2>/dev/null)
-
-        if [[ $? -ne 0 ]]; then
+") || {
             echo "Error: failed to extract field '$json_field' from secret '$secret_id'" >&2
             exit 1
-        fi
+        }
     else
         value="$raw_secret"
     fi

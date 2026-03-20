@@ -236,7 +236,10 @@ import sys, json
 data = json.load(sys.stdin)
 for event in data.get('events', []):
     print(event.get('message', '').rstrip())
-" 2>/dev/null) || true
+") || {
+        echo "WARNING: failed to parse log events JSON" >&2
+        true
+    }
 
     if [[ -n "$messages" ]]; then
         echo "$messages"
@@ -247,7 +250,10 @@ for event in data.get('events', []):
 import sys, json
 data = json.load(sys.stdin)
 print(data.get('nextForwardToken', ''))
-" 2>/dev/null) || true
+") || {
+        echo "WARNING: failed to extract forward token from log response" >&2
+        true
+    }
 }
 
 # Initial fetch

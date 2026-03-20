@@ -57,13 +57,20 @@ if [[ ! -d "$STATE_DIR" ]]; then
 fi
 
 # Generate diff.txt from the worktree
-git -C "$WORKTREE" diff > "${STATE_DIR}/diff.txt" 2>/dev/null || true
-git -C "$WORKTREE" diff --cached >> "${STATE_DIR}/diff.txt" 2>/dev/null || true
+if ! git -C "$WORKTREE" diff > "${STATE_DIR}/diff.txt" 2>&1; then
+    echo "ERROR: 'git diff' failed in worktree $WORKTREE" >&2
+    echo "SKIPPED" > "${STATE_DIR}/gemini-review-result.txt"
+    echo "Gemini review skipped: git diff failed." > "${STATE_DIR}/gemini-feedback.md"
+    exit 2
+fi
+if ! git -C "$WORKTREE" diff --cached >> "${STATE_DIR}/diff.txt" 2>&1; then
+    echo "WARNING: 'git diff --cached' failed — staged changes may be missing from review" >&2
+fi
 
 # Generate changed_files.txt — full content of files that have changes
-changed=$(git -C "$WORKTREE" diff --name-only HEAD 2>/dev/null || true)
-cached=$(git -C "$WORKTREE" diff --cached --name-only 2>/dev/null || true)
-untracked=$(git -C "$WORKTREE" ls-files --others --exclude-standard 2>/dev/null || true)
+changed=$(git -C "$WORKTREE" diff --name-only HEAD) || true
+cached=$(git -C "$WORKTREE" diff --cached --name-only) || true
+untracked=$(git -C "$WORKTREE" ls-files --others --exclude-standard) || true
 
 # Combine and deduplicate
 all_files=$(echo -e "${changed}\n${cached}\n${untracked}" | sort -u | grep -v '^$' || true)
@@ -105,7 +112,7 @@ else
         done
         BASE_PYTHON="${BASE_PYTHON:-python3}"
 
-        "$BASE_PYTHON" -m venv "$SCRIPTS_VENV" 2>/dev/null || {
+        "$BASE_PYTHON" -m venv "$SCRIPTS_VENV" || {
             echo "WARNING: Could not create scripts venv. Skipping Gemini review." >&2
             echo "SKIPPED" > "${STATE_DIR}/gemini-review-result.txt"
             echo "Gemini review skipped: could not create scripts venv." > "${STATE_DIR}/gemini-feedback.md"
@@ -116,9 +123,9 @@ else
     PYTHON="${SCRIPTS_VENV}/bin/python3"
 
     # Install dependencies if google-genai is not yet available
-    if ! "$PYTHON" -c "from google import genai" 2>/dev/null; then
+    if ! "$PYTHON" -c "from google import genai" 2>&1; then
         echo "INFO: Installing script dependencies into ${SCRIPTS_VENV}..." >&2
-        "$PYTHON" -m pip install -r "${SCRIPT_DIR}/requirements.txt" --quiet 2>/dev/null || {
+        "$PYTHON" -m pip install -r "${SCRIPT_DIR}/requirements.txt" --quiet || {
             echo "WARNING: Could not install script dependencies. Skipping Gemini review." >&2
             echo "SKIPPED" > "${STATE_DIR}/gemini-review-result.txt"
             echo "Gemini review skipped: google-genai package not available." > "${STATE_DIR}/gemini-feedback.md"

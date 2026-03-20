@@ -145,7 +145,7 @@ task_arn=$(aws ecs list-tasks \
     --desired-status RUNNING \
     --region "$REGION" \
     --query 'taskArns[0]' \
-    --output text 2>/dev/null)
+    --output text)
 
 if [[ -z "$task_arn" || "$task_arn" == "None" ]]; then
     echo "Error: no running task found for service $SERVICE in cluster $CLUSTER." >&2
