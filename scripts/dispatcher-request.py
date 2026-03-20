@@ -17,7 +17,7 @@ The script is stdlib-only and does not require any venv.  It uses file
 locking (``fcntl.flock``) to safely append entries even when the
 dispatcher is reading from the same file concurrently.
 
-The default inbox file is ``tmp/orchestrator_inbox.json`` relative to the
+The default inbox file is ``tmp/dispatcher_inbox.json`` relative to the
 repo root.  Override with ``--inbox-file``.
 """
 
@@ -157,7 +157,7 @@ def main() -> int:
     parser.add_argument(
         "--inbox-file",
         default=None,
-        help="Path to the inbox file (default: tmp/orchestrator_inbox.json).",
+        help="Path to the inbox file (default: tmp/dispatcher_inbox.json).",
     )
 
     args = parser.parse_args()
@@ -167,7 +167,7 @@ def main() -> int:
         inbox_file = args.inbox_file
     else:
         repo_root = _find_repo_root()
-        inbox_file = str(repo_root / "tmp" / "orchestrator_inbox.json")
+        inbox_file = str(repo_root / "tmp" / "dispatcher_inbox.json")
 
     # Build the entry.
     entry: dict[str, object] = {

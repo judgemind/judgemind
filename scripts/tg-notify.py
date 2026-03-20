@@ -56,8 +56,8 @@ async def _main(args: list[str]) -> int:
     action = args[0]
 
     bridge = create_dispatcher_bridge(
-        state_file="tmp/orchestrator_state.json",
-        status_file="tmp/orchestrator_status.json",
+        state_file="tmp/dispatcher_state.json",
+        status_file="tmp/dispatcher_status.json",
         inbox_path="tmp/tg_inbox.json",
         stop_requests_path="tmp/stop_requests.json",
     )

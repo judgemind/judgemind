@@ -251,7 +251,7 @@ class TestInterpretMessage:
         assert result.actions[0]["issue"] == 42
 
     @patch("telegram_bridge.interpreter.anthropic.Anthropic")
-    def test_with_orchestrator_status(self, mock_anthropic_cls: MagicMock) -> None:
+    def test_with_dispatcher_status(self, mock_anthropic_cls: MagicMock) -> None:
         mock_client = MagicMock()
         mock_anthropic_cls.return_value = mock_client
         mock_client.messages.create.return_value = _make_mock_response(
@@ -272,10 +272,10 @@ class TestInterpretMessage:
             rate_limiter=None,
         )
 
-        # Verify the orchestrator status was passed in the user message.
+        # Verify the dispatcher status was passed in the user message.
         call_args = mock_client.messages.create.call_args
         user_msg = call_args.kwargs["messages"][0]["content"]
-        assert "orchestrator_status.json" in user_msg.lower() or "Orchestrator Status" in user_msg
+        assert "dispatcher_status.json" in user_msg.lower() or "Dispatcher Status" in user_msg
 
     @patch("telegram_bridge.interpreter.anthropic.Anthropic")
     def test_api_key_passed(self, mock_anthropic_cls: MagicMock) -> None:
@@ -1133,8 +1133,8 @@ class TestInterpretMessageWithTools:
         assert "opus" in call_args.kwargs["model"].lower()
 
     @patch("telegram_bridge.interpreter.anthropic.Anthropic")
-    def test_orchestrator_status_in_user_message(self, mock_cls: MagicMock, tmp_path: Path) -> None:
-        """Orchestrator status is included in the user message."""
+    def test_dispatcher_status_in_user_message(self, mock_cls: MagicMock, tmp_path: Path) -> None:
+        """Dispatcher status is included in the user message."""
         mock_client = MagicMock()
         mock_cls.return_value = mock_client
 
@@ -1155,7 +1155,7 @@ class TestInterpretMessageWithTools:
 
         call_args = mock_client.messages.create.call_args
         user_msg = call_args.kwargs["messages"][0]["content"]
-        assert "Orchestrator Status" in user_msg
+        assert "Dispatcher Status" in user_msg
 
     @patch("telegram_bridge.interpreter.anthropic.Anthropic")
     def test_no_text_in_response_gives_fallback(self, mock_cls: MagicMock, tmp_path: Path) -> None:

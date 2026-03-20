@@ -17,7 +17,7 @@ The script is stdlib-only and does not require any venv.  It uses file
 locking (``fcntl.flock``) to safely append entries even when the
 orchestrator is reading from the same file concurrently.
 
-The default inbox file is ``tmp/orchestrator_inbox.json`` relative to the
+The default inbox file is ``tmp/dispatcher_inbox.json`` relative to the
 repo root.  Override with ``--inbox-file``.
 """
 
@@ -64,7 +64,7 @@ def _append_to_inbox(entry: dict[str, object], inbox_file: str) -> None:
     """Atomically append *entry* to the JSON array in *inbox_file*.
 
     Uses ``fcntl.flock`` for mutual exclusion with the orchestrator's
-    ``read_orchestrator_inbox()`` method.
+    ``read_dispatcher_inbox()`` method.
     """
     path = Path(inbox_file)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -157,7 +157,7 @@ def main() -> int:
     parser.add_argument(
         "--inbox-file",
         default=None,
-        help="Path to the inbox file (default: tmp/orchestrator_inbox.json).",
+        help="Path to the inbox file (default: tmp/dispatcher_inbox.json).",
     )
 
     args = parser.parse_args()
@@ -167,7 +167,7 @@ def main() -> int:
         inbox_file = args.inbox_file
     else:
         repo_root = _find_repo_root()
-        inbox_file = str(repo_root / "tmp" / "orchestrator_inbox.json")
+        inbox_file = str(repo_root / "tmp" / "dispatcher_inbox.json")
 
     # Build the entry.
     entry: dict[str, object] = {

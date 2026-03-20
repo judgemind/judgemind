@@ -284,12 +284,12 @@ def interpret_message(
     """Interpret a Telegram message using the Claude API.
 
     This makes a single-turn, synchronous API call to Claude Haiku to
-    interpret the user's message in the context of the current orchestrator
+    interpret the user's message in the context of the current dispatcher
     state.
 
     Args:
         text: The raw message text from Telegram.
-        orchestrator_status: Current orchestrator state (agents, PRs, queue,
+        orchestrator_status: Current dispatcher state (agents, PRs, queue,
             paused status).  Passed as context to the interpreter.
         api_key: Anthropic API key.  If ``None``, the ``ANTHROPIC_API_KEY``
             environment variable is used (standard anthropic SDK behavior).
@@ -316,11 +316,11 @@ def interpret_message(
     if client is None:
         client = get_client(api_key=api_key)
 
-    # Build the user message with orchestrator context.
+    # Build the user message with dispatcher context.
     user_parts: list[str] = []
     if orchestrator_status:
         user_parts.append(
-            "## Current Orchestrator Status\n```json\n"
+            "## Current Dispatcher Status\n```json\n"
             f"{json.dumps(orchestrator_status, indent=2, default=str)}\n```\n"
         )
     user_parts.append(f"## User Message\n{text}")
@@ -623,7 +623,7 @@ def interpret_message_with_tools(
     Args:
         text: The raw message text from Telegram.
         repo_root: Absolute path to the repository root for tool access.
-        orchestrator_status: Current orchestrator state.
+        orchestrator_status: Current dispatcher state.
         api_key: Anthropic API key (``None`` for env var default).
         client: Pre-created client for connection reuse.
         model: The Claude model to use.  Defaults to Opus.
@@ -654,11 +654,11 @@ def interpret_message_with_tools(
         },
     ]
 
-    # Build user message with orchestrator context.
+    # Build user message with dispatcher context.
     user_parts: list[str] = []
     if orchestrator_status:
         user_parts.append(
-            "## Current Orchestrator Status\n```json\n"
+            "## Current Dispatcher Status\n```json\n"
             f"{json.dumps(orchestrator_status, indent=2, default=str)}\n```\n"
         )
     user_parts.append(f"## User Message\n{text}")
@@ -763,10 +763,10 @@ def build_dispatcher_status(
     prs_since_last_audit: int = 0,
     session_number: int = 0,
 ) -> dict[str, Any]:
-    """Build the orchestrator status dict for the interpreter context.
+    """Build the dispatcher status dict for the interpreter context.
 
-    This is the canonical structure that the orchestrator should write to
-    ``tmp/orchestrator_status.json`` after every state change, and that the
+    This is the canonical structure that the dispatcher should write to
+    ``tmp/dispatcher_status.json`` after every state change, and that the
     responder daemon reads to provide context to the Claude interpreter.
 
     Args:
@@ -774,11 +774,11 @@ def build_dispatcher_status(
         open_prs: List of open PRs (number, CI status, mergeable).
         recently_completed: List of recently completed tasks.
         queue: Next issues by priority.
-        paused: Whether the orchestrator is paused.
+        paused: Whether the dispatcher is paused.
         stopped_issues: Issue numbers that have been stopped.
         prs_since_last_audit: Number of PRs merged since the last /audit run.
-            The orchestrator triggers an audit when this reaches 20.
-        session_number: How many times the orchestrator has been (re)started
+            The dispatcher triggers an audit when this reaches 20.
+        session_number: How many times the dispatcher has been (re)started
             by the outer ``while :; do`` loop.  Incremented on each startup
             and persisted so the next session continues the count.
 

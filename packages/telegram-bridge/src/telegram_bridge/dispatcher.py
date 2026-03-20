@@ -119,7 +119,7 @@ ALLOWED_INSTRUCTION_ACTIONS: frozenset[str] = frozenset(kind.value for kind in I
 class DispatcherInstruction:
     """A parsed instruction from a subagent to the dispatcher.
 
-    Subagents write these to ``tmp/orchestrator_inbox.json`` via
+    Subagents write these to ``tmp/dispatcher_inbox.json`` via
     ``scripts/dispatcher-request.py``.  The dispatcher reads them
     with :meth:`DispatcherBridge.read_dispatcher_inbox`.
     """
@@ -386,7 +386,7 @@ class DispatcherBridge:
     ) -> None:
         """Write the dispatcher status JSON for the responder daemon.
 
-        This writes ``orchestrator_status.json`` (at *status_file*) containing
+        This writes ``dispatcher_status.json`` (at *status_file*) containing
         the full dispatcher state -- active agents, open PRs, recently
         completed tasks, queue, and paused/stopped state.  The responder
         daemon reads this file to provide context to the Claude interpreter.
@@ -890,7 +890,7 @@ class DispatcherBridge:
         """Read and clear all instructions from the dispatcher inbox file.
 
         Subagents write instructions to *dispatcher_inbox_path* (typically
-        ``tmp/orchestrator_inbox.json``) using ``scripts/dispatcher-request.py``.
+        ``tmp/dispatcher_inbox.json``) using ``scripts/dispatcher-request.py``.
         This method reads that file, parses each entry into a
         :class:`DispatcherInstruction`, atomically truncates the file, and
         returns the parsed instructions.

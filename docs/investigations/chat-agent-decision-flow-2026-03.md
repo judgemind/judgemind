@@ -43,13 +43,13 @@ However, after the orchestrator actually processes the discussion or executes th
 
 ### 3. Status queries hit stale data
 
-**Problem:** When a user asks "what's going on?" or "status", the interpreter answers based on the `orchestrator_status.json` file content. This file is only updated when `tg-notify.py` is called at lifecycle events. Between events (which can be minutes apart during long-running tasks), the status is stale.
+**Problem:** When a user asks "what's going on?" or "status", the interpreter answers based on the `dispatcher_status.json` file content. This file is only updated when `tg-notify.py` is called at lifecycle events. Between events (which can be minutes apart during long-running tasks), the status is stale.
 
-The status file at review time showed 5 active agents with phases like "implementing" and "starting" — but these phase values are only as fresh as the last `tg-notify.py` call. The per-worker `tmp/agent-status/worker-N.txt` files are updated more frequently (at every phase transition within a task), and the responder does read these via `read_agent_status_files()`. However, it only uses them as a fallback when no `orchestrator_status.json` exists, not as a supplement to enrich stale status data.
+The status file at review time showed 5 active agents with phases like "implementing" and "starting" — but these phase values are only as fresh as the last `tg-notify.py` call. The per-worker `tmp/agent-status/worker-N.txt` files are updated more frequently (at every phase transition within a task), and the responder does read these via `read_agent_status_files()`. However, it only uses them as a fallback when no `dispatcher_status.json` exists, not as a supplement to enrich stale status data.
 
 **Impact:** Users get answers that are minutes behind reality. The agent might report a worker is "starting" when it's actually in "ci-watch".
 
-**Recommendation:** Always merge agent-status file data with orchestrator_status.json, preferring the more recently updated source for each worker. Add an `updated_at` timestamp check to warn if status is more than 2 minutes old.
+**Recommendation:** Always merge agent-status file data with dispatcher_status.json, preferring the more recently updated source for each worker. Add an `updated_at` timestamp check to warn if status is more than 2 minutes old.
 
 ### 4. No "help" or capability discovery
 
