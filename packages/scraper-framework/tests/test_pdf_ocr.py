@@ -340,3 +340,425 @@ class TestCallLlmWithImages:
         )
 
         assert result is None
+
+    def test_call_llm_with_images_routes_to_anthropic(self) -> None:
+        """Verify call_llm_with_images dispatches to anthropic provider."""
+        from ingestion.llm_providers import call_llm_with_images
+
+        with patch(
+            "ingestion.llm_providers._call_anthropic_with_images",
+            return_value=LLMResponse(text="result", input_tokens=10, output_tokens=5),
+        ) as mock_anthropic:
+            result = call_llm_with_images(
+                system_prompt="test",
+                text_message="test",
+                images=[(b"png", "image/png")],
+                provider="anthropic",
+            )
+
+        assert result is not None
+        assert result.text == "result"
+        mock_anthropic.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# _call_anthropic_with_images — error paths
+# ---------------------------------------------------------------------------
+
+
+class TestCallAnthropicWithImagesErrors:
+    """Tests for error handling in the Anthropic vision adapter."""
+
+    def test_client_creation_fallback(self) -> None:
+        """When no client passed, creates one from ANTHROPIC_API_KEY."""
+        from ingestion.llm_providers import _call_anthropic_with_images
+
+        text_block = MagicMock()
+        text_block.type = "text"
+        text_block.text = "response"
+        mock_response = MagicMock()
+        mock_response.content = [text_block]
+        mock_response.usage.input_tokens = 10
+        mock_response.usage.output_tokens = 5
+
+        mock_client_instance = MagicMock()
+        mock_client_instance.messages.create.return_value = mock_response
+
+        with patch("anthropic.Anthropic", return_value=mock_client_instance):
+            result = _call_anthropic_with_images(
+                system_prompt="sys",
+                text_message="user",
+                images=[(b"png", "image/png")],
+                model="test-model",
+                client=None,
+            )
+
+        assert result is not None
+        assert result.text == "response"
+
+    def test_client_creation_auth_error(self) -> None:
+        """AuthenticationError during client creation returns None."""
+        import anthropic
+
+        from ingestion.llm_providers import _call_anthropic_with_images
+
+        with patch(
+            "anthropic.Anthropic",
+            side_effect=anthropic.AuthenticationError(
+                message="Invalid key",
+                response=MagicMock(status_code=401, headers={}),
+                body=None,
+            ),
+        ):
+            result = _call_anthropic_with_images(
+                system_prompt="sys",
+                text_message="user",
+                images=[(b"png", "image/png")],
+                model="test-model",
+                client=None,
+            )
+
+        assert result is None
+
+    def test_timeout_with_value(self) -> None:
+        """Timeout value is forwarded to SDK create() call."""
+        from ingestion.llm_providers import _call_anthropic_with_images
+
+        text_block = MagicMock()
+        text_block.type = "text"
+        text_block.text = "ok"
+        mock_response = MagicMock()
+        mock_response.content = [text_block]
+        mock_response.usage.input_tokens = 10
+        mock_response.usage.output_tokens = 5
+
+        client = MagicMock()
+        client.messages.create.return_value = mock_response
+
+        _call_anthropic_with_images(
+            system_prompt="sys",
+            text_message="user",
+            images=[(b"png", "image/png")],
+            model="test-model",
+            client=client,
+            timeout=30.0,
+        )
+
+        call_kwargs = client.messages.create.call_args.kwargs
+        assert call_kwargs["timeout"] == 30.0
+
+    def test_timeout_error_returns_none(self) -> None:
+        """APITimeoutError returns None immediately."""
+        import anthropic
+
+        from ingestion.llm_providers import _call_anthropic_with_images
+
+        client = MagicMock()
+        client.messages.create.side_effect = anthropic.APITimeoutError(
+            request=MagicMock(),
+        )
+
+        result = _call_anthropic_with_images(
+            system_prompt="sys",
+            text_message="user",
+            images=[(b"png", "image/png")],
+            model="test-model",
+            client=client,
+        )
+
+        assert result is None
+
+    def test_rate_limit_retries_then_succeeds(self) -> None:
+        """RateLimitError retries once then succeeds."""
+        import anthropic
+
+        from ingestion.llm_providers import _call_anthropic_with_images
+
+        text_block = MagicMock()
+        text_block.type = "text"
+        text_block.text = "ok"
+        mock_response = MagicMock()
+        mock_response.content = [text_block]
+        mock_response.usage.input_tokens = 10
+        mock_response.usage.output_tokens = 5
+
+        rate_error = anthropic.RateLimitError(
+            message="Rate limited",
+            response=MagicMock(status_code=429, headers={}),
+            body=None,
+        )
+
+        client = MagicMock()
+        client.messages.create.side_effect = [rate_error, mock_response]
+
+        with patch("ingestion.llm_providers.time.sleep") as mock_sleep:
+            result = _call_anthropic_with_images(
+                system_prompt="sys",
+                text_message="user",
+                images=[(b"png", "image/png")],
+                model="test-model",
+                client=client,
+                max_retries=1,
+            )
+
+        assert result is not None
+        assert result.text == "ok"
+        mock_sleep.assert_called_once_with(1)
+
+    def test_rate_limit_exhausted_returns_none(self) -> None:
+        """Double rate limit returns None."""
+        import anthropic
+
+        from ingestion.llm_providers import _call_anthropic_with_images
+
+        rate_error = anthropic.RateLimitError(
+            message="Rate limited",
+            response=MagicMock(status_code=429, headers={}),
+            body=None,
+        )
+
+        client = MagicMock()
+        client.messages.create.side_effect = rate_error
+
+        with patch("ingestion.llm_providers.time.sleep"):
+            result = _call_anthropic_with_images(
+                system_prompt="sys",
+                text_message="user",
+                images=[(b"png", "image/png")],
+                model="test-model",
+                client=client,
+                max_retries=1,
+            )
+
+        assert result is None
+
+    def test_api_error_returns_none(self) -> None:
+        """Non-retryable APIError returns None."""
+        import anthropic
+
+        from ingestion.llm_providers import _call_anthropic_with_images
+
+        client = MagicMock()
+        client.messages.create.side_effect = anthropic.APIError(
+            message="Server error",
+            request=MagicMock(),
+            body=None,
+        )
+
+        result = _call_anthropic_with_images(
+            system_prompt="sys",
+            text_message="user",
+            images=[(b"png", "image/png")],
+            model="test-model",
+            client=client,
+        )
+
+        assert result is None
+
+    def test_response_with_no_text_blocks(self) -> None:
+        """Response with only non-text blocks returns empty text."""
+        from ingestion.llm_providers import _call_anthropic_with_images
+
+        # Mock a response with no text blocks (only image blocks)
+        image_block = MagicMock()
+        image_block.type = "image"
+        mock_response = MagicMock()
+        mock_response.content = [image_block]
+        mock_response.usage.input_tokens = 10
+        mock_response.usage.output_tokens = 5
+
+        client = MagicMock()
+        client.messages.create.return_value = mock_response
+
+        result = _call_anthropic_with_images(
+            system_prompt="sys",
+            text_message="user",
+            images=[(b"png", "image/png")],
+            model="test-model",
+            client=client,
+        )
+
+        assert result is not None
+        assert result.text == ""
+
+
+# ---------------------------------------------------------------------------
+# _call_google_with_images — error paths
+# ---------------------------------------------------------------------------
+
+
+class TestCallGoogleWithImagesErrors:
+    """Tests for error handling in the Google vision adapter."""
+
+    def test_client_creation_from_env(self) -> None:
+        """When no client passed, creates one from GOOGLE_API_KEY."""
+        from ingestion.llm_providers import _call_google_with_images
+
+        mock_response = MagicMock()
+        mock_response.text = "response"
+        mock_response.usage_metadata.prompt_token_count = 10
+        mock_response.usage_metadata.candidates_token_count = 5
+
+        mock_client_instance = MagicMock()
+        mock_client_instance.models.generate_content.return_value = mock_response
+
+        with (
+            patch.dict("os.environ", {"GOOGLE_API_KEY": "fake-key"}, clear=True),
+            patch("google.genai.Client", return_value=mock_client_instance),
+        ):
+            result = _call_google_with_images(
+                system_prompt="sys",
+                text_message="user",
+                images=[(b"png", "image/png")],
+                model="test-model",
+                client=None,
+            )
+
+        assert result is not None
+        assert result.text == "response"
+
+    def test_missing_api_key_returns_none(self) -> None:
+        """When no client and no GOOGLE_API_KEY, returns None."""
+        from ingestion.llm_providers import _call_google_with_images
+
+        with patch.dict("os.environ", {}, clear=True):
+            result = _call_google_with_images(
+                system_prompt="sys",
+                text_message="user",
+                images=[(b"png", "image/png")],
+                model="test-model",
+                client=None,
+            )
+
+        assert result is None
+
+    def test_incompatible_sdk_returns_none(self) -> None:
+        """If client.models lacks generate_content, returns None."""
+        from ingestion.llm_providers import _call_google_with_images
+
+        client = MagicMock()
+        del client.models.generate_content  # remove auto-created attr
+
+        result = _call_google_with_images(
+            system_prompt="sys",
+            text_message="user",
+            images=[(b"png", "image/png")],
+            model="test-model",
+            client=client,
+        )
+
+        assert result is None
+
+    def test_timeout_with_http_options(self) -> None:
+        """Timeout value creates HttpOptions config."""
+        from ingestion.llm_providers import _call_google_with_images
+
+        mock_response = MagicMock()
+        mock_response.text = "ok"
+        mock_response.usage_metadata.prompt_token_count = 10
+        mock_response.usage_metadata.candidates_token_count = 5
+
+        client = MagicMock()
+        client.models.generate_content.return_value = mock_response
+
+        result = _call_google_with_images(
+            system_prompt="sys",
+            text_message="user",
+            images=[(b"png", "image/png")],
+            model="test-model",
+            client=client,
+            timeout=30.0,
+        )
+
+        assert result is not None
+
+    def test_deadline_exceeded_returns_none(self) -> None:
+        """DeadlineExceeded error returns None immediately."""
+        from ingestion.llm_providers import _call_google_with_images
+
+        class DeadlineExceededError(Exception):
+            pass
+
+        client = MagicMock()
+        client.models.generate_content.side_effect = DeadlineExceededError("deadline exceeded")
+
+        result = _call_google_with_images(
+            system_prompt="sys",
+            text_message="user",
+            images=[(b"png", "image/png")],
+            model="test-model",
+            client=client,
+        )
+
+        assert result is None
+
+    def test_resource_exhausted_retries_then_succeeds(self) -> None:
+        """ResourceExhausted triggers retry, then succeeds."""
+        from ingestion.llm_providers import _call_google_with_images
+
+        class ResourceExhaustedError(Exception):
+            pass
+
+        mock_response = MagicMock()
+        mock_response.text = "ok"
+        mock_response.usage_metadata.prompt_token_count = 10
+        mock_response.usage_metadata.candidates_token_count = 5
+
+        client = MagicMock()
+        client.models.generate_content.side_effect = [
+            ResourceExhaustedError("quota exceeded"),
+            mock_response,
+        ]
+
+        with patch("ingestion.llm_providers.time.sleep") as mock_sleep:
+            result = _call_google_with_images(
+                system_prompt="sys",
+                text_message="user",
+                images=[(b"png", "image/png")],
+                model="test-model",
+                client=client,
+                max_retries=1,
+            )
+
+        assert result is not None
+        assert result.text == "ok"
+        mock_sleep.assert_called_once_with(1)
+
+    def test_resource_exhausted_no_retries_returns_none(self) -> None:
+        """ResourceExhausted with no retries left returns None."""
+        from ingestion.llm_providers import _call_google_with_images
+
+        class ResourceExhaustedError(Exception):
+            pass
+
+        client = MagicMock()
+        client.models.generate_content.side_effect = ResourceExhaustedError("quota exceeded")
+
+        with patch("ingestion.llm_providers.time.sleep"):
+            result = _call_google_with_images(
+                system_prompt="sys",
+                text_message="user",
+                images=[(b"png", "image/png")],
+                model="test-model",
+                client=client,
+                max_retries=0,
+            )
+
+        assert result is None
+
+    def test_generic_api_error_returns_none(self) -> None:
+        """Generic API error returns None."""
+        from ingestion.llm_providers import _call_google_with_images
+
+        client = MagicMock()
+        client.models.generate_content.side_effect = RuntimeError("API failed")
+
+        result = _call_google_with_images(
+            system_prompt="sys",
+            text_message="user",
+            images=[(b"png", "image/png")],
+            model="test-model",
+            client=client,
+        )
+
+        assert result is None
