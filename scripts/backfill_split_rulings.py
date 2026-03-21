@@ -257,20 +257,41 @@ def apply_split(
         split_doc_id = make_split_document_id(candidate.document_id, idx)
         split_doc_ids.append(split_doc_id)
 
-        # Determine case number and title for this split.
-        case_number = split.case_number or candidate.case_number
+        # Determine case title for this split.
         case_title = split.case_title or candidate.case_title
+
+        # Determine which case this split belongs to and what case_number
+        # to use for the case record.
+        #
+        # Three scenarios:
+        # 1. Splitter provided a case_number different from the original
+        #    -> create/find a case by that case_number.
+        # 2. Splitter provided NO case_number but a DIFFERENT case_title
+        #    (North JC: no case numbers in PDF, only case titles)
+        #    -> each unique case_title is a distinct legal case; use the
+        #       case_title as a synthetic case_number to create a separate
+        #       case record, matching how the live ingestion worker routes
+        #       North JC splits via UNKNOWN-{document_id}.
+        # 3. Neither case_number nor case_title differ from the original
+        #    -> this split belongs to the same case as the original.
+        if split.case_number and split.case_number != candidate.case_number:
+            case_number = split.case_number
+            case_id = _upsert_case(conn, case_number, candidate.court_id, case_title)
+        elif (
+            not split.case_number
+            and split.case_title
+            and split.case_title != candidate.case_title
+        ):
+            # North JC: use case_title as synthetic case_number so each
+            # split with a unique title gets its own case record.
+            case_number = split.case_title
+            case_id = _upsert_case(conn, case_number, candidate.court_id, case_title)
+        else:
+            case_number = split.case_number or candidate.case_number
+            case_id = candidate.case_id
+
         split_case_numbers.append(case_number)
         split_case_titles.append(case_title)
-
-        # If the splitter gave us a case number different from the original,
-        # upsert a new case record for it.
-        if split.case_number and split.case_number != candidate.case_number:
-            case_id = _upsert_case(
-                conn, split.case_number, candidate.court_id, case_title
-            )
-        else:
-            case_id = candidate.case_id
 
         # Upsert the document row for the split (shares original doc for archive).
         _upsert_split_document(conn, split_doc_id, case_id, candidate)
