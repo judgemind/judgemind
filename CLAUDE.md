@@ -442,6 +442,32 @@ Key paths: framework in `packages/scraper-framework/src/framework/`, California 
 
 For Terraform apply/deploy details, see `docs/agent/infrastructure-reference.md`.
 
+### Running Data Scripts on Dev
+
+The dev database is in a private VPC — it is **not reachable from localhost**. Never use `scripts/with-secret.sh` with `DATABASE_URL` to run data scripts locally; the connection will fail.
+
+| Tool | Use for | Reliability |
+|---|---|---|
+| `scripts/ecs-run-task.sh` | **All data scripts** (backfills, migrations, audits, one-off fixups) | Reliable — launches a standalone Fargate task with full VPC access and CloudWatch log streaming |
+| `scripts/dev-db-query.sh` | **Quick SQL queries** (SELECT, EXPLAIN) | Good for short queries — uses ECS Exec internally |
+| `scripts/ecs-run.sh` | **Interactive debugging only** (e.g., `ecs-run.sh bash`) | Unreliable — SSM sessions drop after seconds, losing all output. Never use for scripts that take more than a few seconds |
+
+**Standard patterns:**
+
+```
+# Run a data script on dev (preferred)
+scripts/ecs-run-task.sh scripts/backfill_example.py -- --dry-run
+
+# Quick SQL query
+scripts/dev-db-query.sh "SELECT COUNT(*) FROM rulings"
+
+# Long-running script: launch and check later
+scripts/ecs-run-task.sh --detach scripts/reingest_from_s3.py -- --all
+scripts/ecs-run-task.sh --logs <task-arn>
+```
+
+For full details and options, see `docs/agent/infrastructure-reference.md` §ECS Script Execution.
+
 ## Unattended Operation Patterns
 
 The Critical Rules above cover the most common patterns. For the full reference of permission-prompt workarounds (git, curl, secrets, `.claude/` writes, ECS, Telegram), see `docs/agent/unattended-patterns.md`.
