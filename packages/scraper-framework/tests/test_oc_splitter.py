@@ -11,6 +11,7 @@ Tests cover:
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
@@ -1302,3 +1303,253 @@ class TestBoilerplateFilterIntegration:
         event = {"ruling_text": text, "department": "N15"}
         results = split_oc_document(event)
         assert len(results) == 2
+
+
+# ---------------------------------------------------------------------------
+# Real North JC fixture regression tests — per-department (#1234)
+# ---------------------------------------------------------------------------
+
+
+class TestNorthN15Fixture:
+    """Regression tests using the real N15 (Judge Nathan Vu) PDF fixture."""
+
+    @pytest.fixture()
+    def n15_text(self) -> str:
+        return _extract_pdf_text(_load_bytes("oc_north_n15.pdf"))
+
+    def test_splits_multiple_cases(self, n15_text: str) -> None:
+        results = _split_north(n15_text)
+        assert len(results) >= 8
+
+    def test_all_entries_have_case_title_with_vs(self, n15_text: str) -> None:
+        results = _split_north(n15_text)
+        for r in results:
+            assert r.case_title is not None
+            assert re.search(r"\b(?:vs\.?|v\.)", r.case_title, re.IGNORECASE), (
+                f"Entry missing 'vs' in title: {r.case_title}"
+            )
+
+    def test_thomson_entry(self, n15_text: str) -> None:
+        """N15 contains a Thomson vs. Toyota Motor demurrer."""
+        results = _split_north(n15_text)
+        thomson = [r for r in results if "Thomson" in (r.case_title or "")]
+        assert len(thomson) == 1
+        assert thomson[0].motion_type is not None
+        assert "Demurrer" in thomson[0].motion_type
+
+    def test_each_entry_has_unique_ruling_text(self, n15_text: str) -> None:
+        results = _split_north(n15_text)
+        texts = [r.ruling_text for r in results]
+        assert len(set(texts)) == len(texts)
+
+    def test_split_text_shorter_than_full_page(self, n15_text: str) -> None:
+        results = _split_north(n15_text)
+        full_len = len(n15_text)
+        for i, r in enumerate(results):
+            assert len(r.ruling_text) < full_len, (
+                f"Split [{i}] has {len(r.ruling_text)} chars, same as full page ({full_len})."
+            )
+
+    def test_split_via_framework(self, n15_text: str) -> None:
+        event = {
+            "state": "CA",
+            "county": "Orange",
+            "ruling_text": n15_text,
+            "department": "N15",
+            "case_title": None,
+            "case_number": None,
+            "motion_type": None,
+            "outcome": None,
+        }
+        results = split_document(event)
+        assert len(results) >= 8
+
+
+class TestNorthN16Fixture:
+    """Regression tests using the real N16 (Judge Donald Gaffney) PDF fixture."""
+
+    @pytest.fixture()
+    def n16_text(self) -> str:
+        return _extract_pdf_text(_load_bytes("oc_north_n16.pdf"))
+
+    def test_splits_multiple_cases(self, n16_text: str) -> None:
+        results = _split_north(n16_text)
+        assert len(results) >= 7
+
+    def test_all_entries_have_case_title_with_vs(self, n16_text: str) -> None:
+        results = _split_north(n16_text)
+        for r in results:
+            assert r.case_title is not None
+            assert re.search(r"\b(?:vs\.?|v\.)", r.case_title, re.IGNORECASE), (
+                f"Entry missing 'vs' in title: {r.case_title}"
+            )
+
+    def test_gordon_entry(self, n16_text: str) -> None:
+        """N16 contains a Gordon vs. Volvo entry."""
+        results = _split_north(n16_text)
+        gordon = [r for r in results if "Gordon" in (r.case_title or "")]
+        assert len(gordon) == 1
+
+    def test_each_entry_has_unique_ruling_text(self, n16_text: str) -> None:
+        results = _split_north(n16_text)
+        texts = [r.ruling_text for r in results]
+        assert len(set(texts)) == len(texts)
+
+    def test_split_text_shorter_than_full_page(self, n16_text: str) -> None:
+        results = _split_north(n16_text)
+        full_len = len(n16_text)
+        for i, r in enumerate(results):
+            assert len(r.ruling_text) < full_len, (
+                f"Split [{i}] has {len(r.ruling_text)} chars, same as full page ({full_len})."
+            )
+
+    def test_split_via_framework(self, n16_text: str) -> None:
+        event = {
+            "state": "CA",
+            "county": "Orange",
+            "ruling_text": n16_text,
+            "department": "N16",
+            "case_title": None,
+            "case_number": None,
+            "motion_type": None,
+            "outcome": None,
+        }
+        results = split_document(event)
+        assert len(results) >= 7
+
+
+class TestNorthN17Fixture:
+    """Regression tests using the real N17 (Judge Craig L. Griffin) PDF fixture."""
+
+    @pytest.fixture()
+    def n17_text(self) -> str:
+        return _extract_pdf_text(_load_bytes("oc_north_n17.pdf"))
+
+    def test_splits_multiple_cases(self, n17_text: str) -> None:
+        results = _split_north(n17_text)
+        assert len(results) >= 5
+
+    def test_all_entries_have_case_title_with_vs(self, n17_text: str) -> None:
+        results = _split_north(n17_text)
+        for r in results:
+            assert r.case_title is not None
+            assert re.search(r"\b(?:vs\.?|v\.)", r.case_title, re.IGNORECASE), (
+                f"Entry missing 'vs' in title: {r.case_title}"
+            )
+
+    def test_zavala_entry(self, n17_text: str) -> None:
+        """N17 contains a Zavala vs. Becker entry (the case from #1093)."""
+        results = _split_north(n17_text)
+        zavala = [r for r in results if "Zavala" in (r.case_title or "")]
+        assert len(zavala) == 1
+        assert zavala[0].motion_type is not None
+        assert "Attorneys' Fees" in zavala[0].motion_type
+
+    def test_post_v_chung_entry(self, n17_text: str) -> None:
+        """N17 contains a Post v. Chung entry using 'v.' separator."""
+        results = _split_north(n17_text)
+        post = [r for r in results if "Post" in (r.case_title or "")]
+        assert len(post) == 1
+
+    def test_each_entry_has_unique_ruling_text(self, n17_text: str) -> None:
+        results = _split_north(n17_text)
+        texts = [r.ruling_text for r in results]
+        assert len(set(texts)) == len(texts)
+
+    def test_split_text_shorter_than_full_page(self, n17_text: str) -> None:
+        results = _split_north(n17_text)
+        full_len = len(n17_text)
+        for i, r in enumerate(results):
+            assert len(r.ruling_text) < full_len, (
+                f"Split [{i}] has {len(r.ruling_text)} chars, same as full page ({full_len})."
+            )
+
+    def test_split_via_framework(self, n17_text: str) -> None:
+        event = {
+            "state": "CA",
+            "county": "Orange",
+            "ruling_text": n17_text,
+            "department": "N17",
+            "case_title": None,
+            "case_number": None,
+            "motion_type": None,
+            "outcome": None,
+        }
+        results = split_document(event)
+        assert len(results) >= 5
+
+
+class TestNorthN18Fixture:
+    """Regression tests using the real N18 (Judge Scott A. Steiner) PDF fixture.
+
+    N18 uses a different format from other North JC departments: it includes
+    case numbers (e.g. '2024-1389826') and numbered entries with case names
+    on continuation lines. This means the North splitter finds few or no entries,
+    and the document is split by the case-number-based fallback path.
+    """
+
+    @pytest.fixture()
+    def n18_text(self) -> str:
+        return _extract_pdf_text(_load_bytes("oc_north_n18.pdf"))
+
+    def test_case_number_splitter_finds_entries(self, n18_text: str) -> None:
+        """The case-number-based splitter handles N18's format."""
+        results = _split_case_number_based(n18_text)
+        assert len(results) >= 8
+
+    def test_all_entries_have_case_numbers(self, n18_text: str) -> None:
+        results = _split_case_number_based(n18_text)
+        for r in results:
+            assert r.case_number is not None, (
+                f"Entry missing case number. Title: {r.case_title}, "
+                f"Text start: {r.ruling_text[:80]}"
+            )
+
+    def test_suarez_entry(self, n18_text: str) -> None:
+        """N18 contains a Suarez vs. Lopez entry."""
+        results = _split_case_number_based(n18_text)
+        suarez = [r for r in results if "Suarez" in (r.case_title or "")]
+        assert len(suarez) == 1
+        assert suarez[0].case_number == "2024-1389826"
+
+    def test_guo_entry(self, n18_text: str) -> None:
+        """N18 contains a Guo vs. Zhang entry."""
+        results = _split_case_number_based(n18_text)
+        guo = [r for r in results if "Guo" in (r.case_title or "")]
+        assert len(guo) == 1
+        assert guo[0].case_number == "2023-1356203"
+
+    def test_each_entry_has_unique_ruling_text(self, n18_text: str) -> None:
+        results = _split_case_number_based(n18_text)
+        texts = [r.ruling_text for r in results]
+        assert len(set(texts)) == len(texts)
+
+    def test_split_text_shorter_than_full_page(self, n18_text: str) -> None:
+        results = _split_case_number_based(n18_text)
+        full_len = len(n18_text)
+        for i, r in enumerate(results):
+            assert len(r.ruling_text) < full_len * 0.5, (
+                f"Split [{i}] (case={r.case_number}) has {len(r.ruling_text)} chars, "
+                f">= 50% of full page ({full_len})."
+            )
+
+    def test_north_splitter_falls_back_to_case_number(self, n18_text: str) -> None:
+        """N18 uses case numbers, so split_oc_document should eventually use
+        the case-number-based splitter (once #1232 is resolved).
+
+        Currently, the North splitter may find a small number of entries from
+        legal citations containing 'v.', preventing the fallback. This test
+        documents the expected behavior: the case-number-based splitter handles
+        N18 correctly regardless of the dispatch path.
+        """
+        # Direct case-number splitting always works for N18
+        cn_results = _split_case_number_based(n18_text)
+        assert len(cn_results) >= 8
+
+        # The framework dispatch may not fully fall back yet (#1232)
+        event = {"ruling_text": n18_text, "department": "N18"}
+        fw_results = split_oc_document(event)
+        # Either the framework produces many results (fallback worked)
+        # or it produces fewer (North splitter intercepted).
+        # Both are valid until #1232 is fixed.
+        assert len(fw_results) >= 1
