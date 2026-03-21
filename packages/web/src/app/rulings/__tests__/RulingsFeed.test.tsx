@@ -325,7 +325,7 @@ describe('RulingsFeed', () => {
     expect(mockDisconnect).toHaveBeenCalled();
   });
 
-  it('renders case links pointing to detail pages', () => {
+  it('renders ruling links pointing to ruling detail pages', () => {
     mockUseQuery.mockReturnValue({
       data: MOCK_RULINGS_DATA,
       loading: false,
@@ -335,7 +335,7 @@ describe('RulingsFeed', () => {
 
     render(<RulingsFeed />);
     const link = screen.getByText(/23STCV12345/).closest('a');
-    expect(link).toHaveAttribute('href', '/cases/case-1');
+    expect(link).toHaveAttribute('href', '/rulings/ruling-1');
   });
 
   it('renders filter inputs', () => {
