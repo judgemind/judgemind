@@ -357,7 +357,7 @@ fi
 git -C "$TEMP_REPO" worktree remove "$new_wt8" --force 2>/dev/null || true
 rm -f "$TEMP_REPO/tmp/worker-locks/worker-1.lock"
 
-# ── Test 20: concurrent start-worker.sh get different numbers (#1356) ──
+# ── Test 20: sequential start-worker.sh get different numbers (#1356) ──
 # Run two start-worker.sh in quick succession. They should get different
 # worker numbers thanks to the PID lock mechanism.
 wt_a=$(run_start 2>/dev/null | tail -1) || true
@@ -374,6 +374,38 @@ git -C "$TEMP_REPO" worktree remove "$wt_a" --force 2>/dev/null || true
 git -C "$TEMP_REPO" worktree remove "$wt_b" --force 2>/dev/null || true
 rm -f "$TEMP_REPO/tmp/worker-locks/worker-${wt_a_num}.lock"
 rm -f "$TEMP_REPO/tmp/worker-locks/worker-${wt_b_num}.lock"
+
+# ── Test 21: truly concurrent start-worker.sh get different numbers (#1422) ──
+# Launch two start-worker.sh processes simultaneously in the background.
+# They must each get a unique worker number thanks to the PID lock mechanism.
+# This validates the concurrency protection against the original race in #1334.
+mkdir -p "$TEMP_REPO/tmp"
+run_start 2>/dev/null > "$TEMP_REPO/tmp/concurrent_a.out" &
+pid_a=$!
+run_start 2>/dev/null > "$TEMP_REPO/tmp/concurrent_b.out" &
+pid_b=$!
+
+set +e
+wait "$pid_a"
+wait "$pid_b"
+set -e
+
+conc_wt_a=$(tail -1 "$TEMP_REPO/tmp/concurrent_a.out" 2>/dev/null || echo "")
+conc_wt_b=$(tail -1 "$TEMP_REPO/tmp/concurrent_b.out" 2>/dev/null || echo "")
+conc_a_num=$(basename "$conc_wt_a" | sed 's/worker-//')
+conc_b_num=$(basename "$conc_wt_b" | sed 's/worker-//')
+
+if [[ -n "$conc_a_num" && -n "$conc_b_num" && "$conc_a_num" != "$conc_b_num" ]]; then
+    pass "Two concurrent start-worker.sh get different worker numbers (#1422)"
+else
+    fail "Two concurrent start-worker.sh get different worker numbers (#1422)" "got worker-$conc_a_num and worker-$conc_b_num"
+fi
+# Clean up
+git -C "$TEMP_REPO" worktree remove "$conc_wt_a" --force 2>/dev/null || true
+git -C "$TEMP_REPO" worktree remove "$conc_wt_b" --force 2>/dev/null || true
+rm -f "$TEMP_REPO/tmp/worker-locks/worker-${conc_a_num}.lock"
+rm -f "$TEMP_REPO/tmp/worker-locks/worker-${conc_b_num}.lock"
+rm -f "$TEMP_REPO/tmp/concurrent_a.out" "$TEMP_REPO/tmp/concurrent_b.out"
 
 # ── Summary ──────────────────────────────────────────────────────────────
 
