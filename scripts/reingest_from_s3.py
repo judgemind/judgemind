@@ -229,6 +229,13 @@ def _build_filters(
     return " ".join(clauses), params
 
 
+def _is_real_case_number(case_number: str | None) -> bool:
+    """Return True if the case number is a real value, not an UNKNOWN placeholder."""
+    if not case_number:
+        return False
+    return not case_number.startswith("UNKNOWN-")
+
+
 def _fetch_s3_content(s3_client: object, bucket: str, key: str) -> bytes:
     """Fetch raw content from S3."""
     response = s3_client.get_object(Bucket=bucket, Key=key)  # type: ignore[union-attr]
@@ -453,6 +460,9 @@ def _reparse_document(
     ):
         val = extracted.get(field)
         if val and (not isinstance(val, list) or len(val) > 0):
+            # UNKNOWN-prefixed case numbers are placeholders, not real values.
+            if field == "case_number" and not _is_real_case_number(val):
+                continue
             extraction_methods[field] = "scraper"
 
     # ------------------------------------------------------------------
@@ -476,6 +486,8 @@ def _reparse_document(
             )
             if not extracted.get(f)
             or (isinstance(extracted.get(f), list) and len(extracted[f]) == 0)
+            # UNKNOWN-prefixed case numbers are placeholders, not real values.
+            or (f == "case_number" and not _is_real_case_number(extracted.get(f)))
         ]
         if not missing_fields and not force_llm:
             logger.info(
@@ -513,7 +525,10 @@ def _reparse_document(
 
                 # Apply ruling-level fields from the matched ruling
                 if ruling is not None:
-                    if not extracted["case_number"] and ruling.case_number:
+                    if (
+                        not _is_real_case_number(extracted["case_number"])
+                        and ruling.case_number
+                    ):
                         extracted["case_number"] = ruling.case_number
                         extraction_methods["case_number"] = "llm"
                     if not extracted["case_title"] and ruling.case_title:
