@@ -140,6 +140,18 @@ if [ -d "$WORKTREES_DIR" ]; then
         [ -d "$dir" ] || continue
         dir_num=$(basename "$dir" | sed 's/worker-//')
         if ! echo "$ACTIVE_WORKERS" | grep -qx "$dir_num"; then
+            # Check for a fresh agent lock before removing (#1254).
+            # An unregistered directory with a fresh lock means an agent is
+            # actively working — git metadata may have been pruned but the
+            # agent's session is still alive.
+            if [[ -f "$dir/.agent-lock" ]]; then
+                lock_mtime=$(stat -f %m "$dir/.agent-lock" 2>/dev/null || stat -c %Y "$dir/.agent-lock" 2>/dev/null || echo 0)
+                lock_age=$(( $(date +%s) - lock_mtime ))
+                if [[ "$lock_age" -lt 1800 ]]; then
+                    echo "Skipping unregistered directory $dir — agent lock is fresh (${lock_age}s old)" >&2
+                    continue
+                fi
+            fi
             echo "Removing stale directory (not a registered worktree): $dir" >&2
             rm -rf "$dir"
         fi
@@ -183,7 +195,7 @@ fi
 for attempt in $(seq 1 10); do
     git -C "$REPO_ROOT" worktree prune
 
-    # Extract existing worker numbers from worktree paths
+    # Extract existing worker numbers from registered worktree paths
     EXISTING=$(
         git -C "$REPO_ROOT" worktree list --porcelain \
             | awk '/^worktree / && $2 ~ /\/worktrees\/worker-[0-9]+/ {
@@ -193,6 +205,27 @@ for attempt in $(seq 1 10); do
             }' \
             | sort -n
     )
+
+    # Also treat unregistered directories with a fresh agent lock as "taken"
+    # so we never try to claim a worker number that another agent is using (#1254).
+    if [ -d "$WORKTREES_DIR" ]; then
+        for dir in "$WORKTREES_DIR"/worker-*; do
+            [ -d "$dir" ] || continue
+            dir_num=$(basename "$dir" | sed 's/worker-//')
+            # Skip if already in the registered set
+            if echo "$EXISTING" | grep -qx "$dir_num"; then
+                continue
+            fi
+            # Check for a fresh agent lock
+            if [[ -f "$dir/.agent-lock" ]]; then
+                lock_mtime=$(stat -f %m "$dir/.agent-lock" 2>/dev/null || stat -c %Y "$dir/.agent-lock" 2>/dev/null || echo 0)
+                lock_age=$(( $(date +%s) - lock_mtime ))
+                if [[ "$lock_age" -lt 1800 ]]; then
+                    EXISTING=$(printf '%s\n%s' "$EXISTING" "$dir_num" | sort -n)
+                fi
+            fi
+        done
+    fi
 
     # Find the lowest N >= 1 not already taken
     N=1
@@ -204,8 +237,18 @@ for attempt in $(seq 1 10); do
     BRANCH="worker-${N}/session-${TIMESTAMP}"
     WORKTREE="$REPO_ROOT/worktrees/worker-${N}"
 
-    # Clean up any leftover directory or branch that could block creation
+    # Clean up any leftover directory or branch that could block creation.
+    # At this point, $WORKTREE should not have a fresh lock (we skipped those
+    # above), but double-check as a safety net (#1254).
     if [ -d "$WORKTREE" ]; then
+        if [[ -f "$WORKTREE/.agent-lock" ]]; then
+            lock_mtime=$(stat -f %m "$WORKTREE/.agent-lock" 2>/dev/null || stat -c %Y "$WORKTREE/.agent-lock" 2>/dev/null || echo 0)
+            lock_age=$(( $(date +%s) - lock_mtime ))
+            if [[ "$lock_age" -lt 1800 ]]; then
+                echo "Skipping worker $N — agent lock is fresh (${lock_age}s old)" >&2
+                continue
+            fi
+        fi
         echo "Removing leftover directory blocking worker $N: $WORKTREE" >&2
         rm -rf "$WORKTREE"
     fi
