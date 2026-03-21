@@ -2,11 +2,12 @@
 
 import Link from 'next/link';
 import { buildDownloadUrl, cleanRulingText, FORMAT_LABELS } from '@/lib/display-helpers';
-import { sanitizeRulingHtml } from '@/lib/sanitize-html';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 
 interface RulingProps {
+  /** Pre-sanitized HTML from the server component (already run through DOMPurify). */
+  sanitizedRulingTextHtml?: string | null;
   ruling: {
     id: string;
     hearingDate: string;
@@ -36,7 +37,7 @@ interface RulingProps {
   };
 }
 
-export function RulingDetail({ ruling }: RulingProps) {
+export function RulingDetail({ ruling, sanitizedRulingTextHtml }: RulingProps) {
   return (
     <div className="space-y-6">
       {/* Linked case */}
@@ -87,7 +88,7 @@ export function RulingDetail({ ruling }: RulingProps) {
       )}
 
       {/* Ruling text in its own Card */}
-      {(ruling.rulingTextHtml || ruling.rulingText) && (
+      {(sanitizedRulingTextHtml || ruling.rulingText) && (
         <Card>
           <CardHeader className="pb-2">
             <CardTitle className="text-sm font-medium uppercase tracking-wide text-slate-500 dark:text-slate-400">
@@ -95,11 +96,11 @@ export function RulingDetail({ ruling }: RulingProps) {
             </CardTitle>
           </CardHeader>
           <CardContent className="prose prose-slate dark:prose-invert max-w-none">
-            {ruling.rulingTextHtml ? (
+            {sanitizedRulingTextHtml ? (
               <div
                 className="ruling-content text-sm leading-relaxed text-slate-700 dark:text-slate-300"
                 dangerouslySetInnerHTML={{
-                  __html: sanitizeRulingHtml(ruling.rulingTextHtml),
+                  __html: sanitizedRulingTextHtml,
                 }}
               />
             ) : (

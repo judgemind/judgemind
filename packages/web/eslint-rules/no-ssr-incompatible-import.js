@@ -7,9 +7,10 @@
  * (e.g. jsdom) that are unavailable during SSR.
  *
  * The canonical example is `isomorphic-dompurify` — its jsdom
- * dependency crashes in Vercel's serverless functions. The approved
- * pattern is to use the `@/lib/sanitize-html` utility, which defers
- * the import behind a `typeof window` guard.
+ * dependency crashes when webpack bundles it for SSR of client
+ * components. The approved pattern is to use the `@/lib/sanitize-html`
+ * utility and call it from a **server component** (where Node.js
+ * modules are resolved natively, not bundled by webpack).
  *
  * @see https://github.com/judgemind/judgemind/issues/1129
  * @see https://github.com/judgemind/judgemind/issues/1111
@@ -23,7 +24,7 @@
  */
 const SSR_INCOMPATIBLE_PACKAGES = {
   'isomorphic-dompurify':
-    'Use the @/lib/sanitize-html utility instead, which defers the import to avoid SSR crashes.',
+    'Use the @/lib/sanitize-html utility from a server component instead. Client components must receive pre-sanitized HTML as props.',
 };
 
 /** @type {import('eslint').Rule.RuleModule} */
