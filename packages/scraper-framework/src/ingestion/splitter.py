@@ -198,6 +198,7 @@ def _load_county_splitters() -> None:
     """
     import ingestion.oc_splitter  # noqa: F401
     import ingestion.sb_splitter  # noqa: F401
+    import ingestion.sc_splitter  # noqa: F401
     import ingestion.sf_splitter  # noqa: F401
 
 
