@@ -32,6 +32,7 @@ These are the most frequently violated rules. **A PreToolUse hook enforces the s
 - **ALWAYS** use dedicated tools (Read, Glob, Grep) instead of Bash for file operations.
 - **ALWAYS** watch CI to completion (`gh run watch`) before doing anything else after pushing.
 - **ALWAYS** create a PR immediately after your first push to a branch.
+- **ALWAYS** re-fetch GitHub issue or PR state before acting on it if more than a few minutes have elapsed since you last fetched it. Other agents may have closed, merged, or modified issues in the interim — acting on stale state causes incorrect cross-references, duplicate filings, and wasted work.
 
 ## Enforced Rules — Automated Checks
 
