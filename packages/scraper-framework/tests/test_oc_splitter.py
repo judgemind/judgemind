@@ -805,10 +805,6 @@ class TestNorthFixture:
             assert r.case_title is not None
             assert "vs" in r.case_title.lower(), f"Entry missing 'vs' in title: {r.case_title}"
 
-    @pytest.mark.xfail(
-        reason="Pre-existing bug: 'Castillo vs' has no defendant name",
-        strict=True,
-    )
     def test_case_titles_are_clean(self, north_text: str) -> None:
         """Case titles should be clean names, not garbled with ruling text (#1357)."""
         results = _split_north(north_text)
@@ -988,10 +984,6 @@ class TestApkarianFixture:
                     f"Entries should not overlap. Line: {first_line!r}"
                 )
 
-    @pytest.mark.xfail(
-        reason="Pre-existing bug: 'Saetern vs' has no defendant name",
-        strict=True,
-    )
     def test_case_titles_are_clean(self, apkarian_text: str) -> None:
         """Case titles should be clean names, not garbled with ruling text (#1357)."""
         results = _split_case_number_based(apkarian_text)
@@ -1147,10 +1139,6 @@ class TestComplexFixture:
                 f">= 50% of full page ({full_len}). Should be case-specific text only."
             )
 
-    @pytest.mark.xfail(
-        reason="Pre-existing bug: 'Valdez vs' has no defendant name",
-        strict=True,
-    )
     def test_case_titles_are_clean(self, cx_text: str) -> None:
         """Case titles should be clean names, not garbled with ruling text (#1357)."""
         results = _split_case_number_based(cx_text)
@@ -1517,10 +1505,6 @@ class TestNorthN15Fixture:
         texts = [r.ruling_text for r in results]
         assert len(set(texts)) == len(texts)
 
-    @pytest.mark.xfail(
-        reason="Pre-existing bug: N15 'A Plus Autobody' title garbled with ruling text (len=83)",
-        strict=True,
-    )
     def test_case_titles_are_clean(self, n15_text: str) -> None:
         """Case titles should be clean names, not garbled with ruling text (#1357)."""
         results = _split_north(n15_text)
