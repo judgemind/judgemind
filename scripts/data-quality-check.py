@@ -80,6 +80,11 @@ FIELD_DROP_P2_THRESHOLD = 5.0  # 5-10pp drop = p2
 # Window for recent-only field completeness checks (days).
 FIELD_COMPLETENESS_WINDOW_DAYS = 7
 
+# Minimum number of documents in the window for field completeness checks.
+# Counties with fewer than this many documents are skipped to avoid noisy
+# alerts from tiny sample sizes (e.g. 1 bad doc out of 3 total = 33% drop).
+MIN_FIELD_CHECK_SAMPLE_SIZE = 5
+
 
 @dataclass
 class Alert:
@@ -340,7 +345,7 @@ def _query_field_completeness(
     conn: psycopg.Connection,  # type: ignore[type-arg]
     now: datetime,
     county: str | None = None,
-) -> dict[str, dict[str, float]]:
+) -> tuple[dict[str, dict[str, float]], dict[str, int]]:
     """Query the database for current field completeness percentages.
 
     Only considers documents created within the last FIELD_COMPLETENESS_WINDOW_DAYS
@@ -352,11 +357,14 @@ def _query_field_completeness(
         county: Optional county filter.
 
     Returns:
-        Dict mapping county name to dict of field name -> percentage (0-100).
+        Tuple of:
+        - Dict mapping county name to dict of field name -> percentage (0-100).
+        - Dict mapping county name to total document count in the window.
     """
     county_filter, county_params = _build_county_filter(county)
     cutoff = now - timedelta(days=FIELD_COMPLETENESS_WINDOW_DAYS)
     result: dict[str, dict[str, float]] = {}
+    totals: dict[str, int] = {}
 
     with conn.cursor() as cur:
         cur.execute(
@@ -381,6 +389,8 @@ def _query_field_completeness(
             if total == 0:
                 continue
 
+            totals[county_name] = total
+
             counts = {
                 "ruling": has_ruling,
                 "judge": has_judge,
@@ -397,7 +407,7 @@ def _query_field_completeness(
                 field: round(count / total * 100, 1) for field, count in counts.items()
             }
 
-    return result
+    return result, totals
 
 
 def check_field_completeness(
@@ -407,6 +417,10 @@ def check_field_completeness(
     county: str | None = None,
 ) -> list[Alert]:
     """Check field completeness against baselines and flag regressions.
+
+    Counties with fewer than ``MIN_FIELD_CHECK_SAMPLE_SIZE`` documents in the
+    window are skipped to avoid noisy alerts from tiny sample sizes. A P2
+    informational alert is emitted instead so the county is not silently ignored.
 
     Args:
         conn: Database connection.
@@ -418,11 +432,30 @@ def check_field_completeness(
         List of alerts for field completeness regressions.
     """
     alerts: list[Alert] = []
-    current = _query_field_completeness(conn, now, county)
+    current, totals = _query_field_completeness(conn, now, county)
 
     for county_name, fields in current.items():
         county_baselines = field_baselines.get(county_name, {})
         if not county_baselines:
+            continue
+
+        total_docs = totals.get(county_name, 0)
+        if total_docs < MIN_FIELD_CHECK_SAMPLE_SIZE:
+            alerts.append(
+                Alert(
+                    county=county_name,
+                    metric="field_completeness_low_sample",
+                    severity="p2",
+                    expected=MIN_FIELD_CHECK_SAMPLE_SIZE,
+                    actual=total_docs,
+                    message=(
+                        f"{county_name}: only {total_docs} document(s) in "
+                        f"{FIELD_COMPLETENESS_WINDOW_DAYS}-day window, skipping "
+                        f"field completeness check "
+                        f"(minimum sample size: {MIN_FIELD_CHECK_SAMPLE_SIZE})"
+                    ),
+                )
+            )
             continue
 
         for field, current_pct in fields.items():
@@ -817,7 +850,7 @@ def _collect_county_metrics(
             result[county_name]["ruling_count_24h"] = count
 
     # Get field completeness
-    field_completeness = _query_field_completeness(conn, now, county)
+    field_completeness, _totals = _query_field_completeness(conn, now, county)
     for county_name, fields in field_completeness.items():
         if county_name not in result:
             result[county_name] = {}
@@ -908,7 +941,7 @@ def _collect_full_metrics(
             }
 
     # --- Field completeness ---
-    field_completeness = _query_field_completeness(conn, now, county)
+    field_completeness, _fc_totals = _query_field_completeness(conn, now, county)
 
     # Collect doc IDs with field gaps for metadata.
     gap_docs: dict[str, list[str]] = {}
@@ -1139,7 +1172,7 @@ def run_checks(
         alerts.extend(check_scraper_staleness(conn, now, baselines, county))
 
         if update_baselines:
-            current = _query_field_completeness(conn, now, county)
+            current, _totals = _query_field_completeness(conn, now, county)
             save_field_baselines(current, baselines_path)
         else:
             alerts.extend(check_field_completeness(conn, now, field_baselines, county))
@@ -1188,7 +1221,7 @@ def run_checks_full(
         alerts.extend(check_scraper_staleness(conn, now, baselines, county))
 
         if update_baselines:
-            current = _query_field_completeness(conn, now, county)
+            current, _totals = _query_field_completeness(conn, now, county)
             save_field_baselines(current, baselines_path)
         else:
             alerts.extend(check_field_completeness(conn, now, field_baselines, county))
