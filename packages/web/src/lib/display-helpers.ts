@@ -445,20 +445,318 @@ export function groupParties(
 }
 
 // ---------------------------------------------------------------------------
+// Metadata header stripping (display-time)
+// ---------------------------------------------------------------------------
+// Strips redundant metadata boilerplate from the beginning of ruling text.
+// Court ruling text often starts with a header block that repeats metadata
+// already displayed in the UI (date, department, judge, case number, parties,
+// motion type). This function removes those leading lines so the user sees
+// substantive content first.
+
+/** Metadata fields available for matching against ruling text headers. */
+export interface RulingMetadata {
+  caseNumber?: string;
+  caseTitle?: string;
+  judgeName?: string;
+  department?: string;
+  hearingDate?: string; // ISO 8601 (YYYY-MM-DD)
+  motionType?: string;  // snake_case (e.g. "motion_to_strike")
+}
+
+/** Month names for date format generation. */
+const MONTH_NAMES = [
+  'january', 'february', 'march', 'april', 'may', 'june',
+  'july', 'august', 'september', 'october', 'november', 'december',
+];
+
+/** Known header prefixes that introduce metadata blocks. */
+const HEADER_PREFIX_RE = /^\s*(?:tentative\s+ruling|tentative\s+case\s+management\s+order|probate\s+notes|minute\s+order|court\s+ruling)\b/i;
+
+/**
+ * Build an array of date format strings from an ISO date for matching.
+ * For "2026-03-20" produces: ["march 20, 2026", "03/20/2026", "3/20/2026", "2026-03-20", "march 20 2026", "mar 20, 2026", "mar 20 2026"].
+ */
+function buildDatePatterns(isoDate: string): string[] {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(isoDate);
+  if (!match) return [];
+  const year = match[1];
+  const monthNum = parseInt(match[2], 10);
+  const day = parseInt(match[3], 10);
+  const monthName = MONTH_NAMES[monthNum - 1];
+  const monthAbbrev = monthName.slice(0, 3);
+  const paddedMonth = match[2];
+  const paddedDay = match[3];
+
+  return [
+    `${monthName} ${day}, ${year}`,
+    `${monthName} ${day} ${year}`,
+    `${monthAbbrev} ${day}, ${year}`,
+    `${monthAbbrev} ${day} ${year}`,
+    `${paddedMonth}/${paddedDay}/${year}`,
+    `${monthNum}/${day}/${year}`,
+    isoDate,
+  ];
+}
+
+/**
+ * Format a snake_case motion type to a human-readable form for matching.
+ * E.g., "motion_to_strike" -> "motion to strike".
+ */
+function motionTypeToWords(motionType: string): string {
+  return motionType.toLowerCase().replace(/_/g, ' ');
+}
+
+/**
+ * Check whether a line looks like a metadata line given the ruling's known metadata.
+ *
+ * A line is metadata if:
+ * - It matches a known header prefix (e.g. "Tentative Ruling", "Probate Notes")
+ * - It contains the case number
+ * - It contains a date format matching the hearing date
+ * - It contains "department" followed by the department value
+ * - It contains the judge name (or "Judge" followed by parts of the name)
+ * - It looks like a party/case-title line (contains significant words from case title)
+ * - It starts with "Motion:" and contains the motion type words
+ * - It is a "Case No." / "Case Number:" line containing the case number
+ */
+/** Test whether `word` appears as a whole word in `text` (case-insensitive). */
+function containsWord(text: string, word: string): boolean {
+  return new RegExp(`\\b${escapeRegex(word)}\\b`, 'i').test(text);
+}
+
+function isMetadataLine(line: string, metadata: RulingMetadata): boolean {
+  const trimmed = line.trim();
+  if (trimmed.length === 0) return false; // blank lines are handled separately
+  const lower = trimmed.toLowerCase();
+
+  // Known header prefixes
+  if (HEADER_PREFIX_RE.test(trimmed)) return true;
+
+  // Case number match — use word boundary to avoid partial matches (e.g. "25" in "Rule 25.1")
+  if (metadata.caseNumber) {
+    const caseNumLower = metadata.caseNumber.toLowerCase();
+    if (containsWord(lower, caseNumLower)) return true;
+  }
+
+  // Date match — date strings are specific enough that substring is safe
+  if (metadata.hearingDate) {
+    const datePatterns = buildDatePatterns(metadata.hearingDate);
+    if (datePatterns.some((dp) => lower.includes(dp))) return true;
+    // Also check for "hearing date:" prefix
+    if (/^\s*hearing\s+date\s*:/i.test(trimmed)) return true;
+  }
+
+  // Department match — require "department" or "dept" prefix
+  if (metadata.department) {
+    const deptLower = metadata.department.toLowerCase();
+    const deptRe = new RegExp(`\\b(?:department|dept\\.?)\\s+${escapeRegex(deptLower)}\\b`, 'i');
+    if (deptRe.test(trimmed)) return true;
+  }
+
+  // Judge name match — use word boundaries to avoid "Smith" matching "blacksmith"
+  if (metadata.judgeName) {
+    const judgeLower = metadata.judgeName.toLowerCase();
+    if (containsWord(lower, judgeLower)) return true;
+    // Match "Judge LastName" pattern (just the last name)
+    const nameParts = judgeLower.split(/[\s,]+/).filter((p) => p.length > 2);
+    if (nameParts.length > 0 && /^\s*judge\s+/i.test(trimmed)) {
+      if (nameParts.some((part) => containsWord(lower, part))) return true;
+    }
+  }
+
+  // Case title / party names match — if enough significant words from the
+  // case title appear on this line, it's likely a party header line
+  if (metadata.caseTitle) {
+    // Filter out common non-substantive short words but preserve short names
+    const NOISE_WORDS = new Set([
+      'v', 'vs', 'et', 'al', 'in', 're', 'on', 'of', 'the', 'a', 'an', 'and', 'for', 'to',
+    ]);
+    const titleWords = metadata.caseTitle
+      .toLowerCase()
+      .split(/[\s,;.]+/)
+      .filter((w) => w.length > 1 && !NOISE_WORDS.has(w));
+    if (titleWords.length > 0) {
+      const matchCount = titleWords.filter((w) => containsWord(lower, w)).length;
+      // Require at least 2 matched words (or all words for single-word titles)
+      // to prevent false positives from common names appearing in substantive text
+      if (titleWords.length === 1 && matchCount === 1) return true;
+      if (titleWords.length > 1 && matchCount >= 2 && matchCount >= Math.ceil(titleWords.length * 0.5)) return true;
+    }
+  }
+
+  // Motion type match — "Motion:" prefix lines
+  if (metadata.motionType) {
+    const motionWords = motionTypeToWords(metadata.motionType);
+    if (/^\s*motion\s*:/i.test(trimmed) && containsWord(lower, motionWords)) return true;
+    // Also match lines that are just the motion type
+    if (lower === motionWords) return true;
+  }
+
+  return false;
+}
+
+/** Escape special regex characters in a string. */
+function escapeRegex(str: string): string {
+  return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
+ * Strip redundant metadata header from the beginning of ruling text.
+ *
+ * Examines lines from the start of the text. Lines that contain
+ * known metadata values (case number, date, department, judge name,
+ * party names, motion type) or match header prefixes are removed.
+ * Blank lines interspersed in the metadata header are also removed.
+ * Stripping stops at the first non-metadata, non-blank line.
+ *
+ * If ALL lines would be stripped, the original text is returned
+ * to avoid losing content entirely.
+ *
+ * @param text - The ruling text to clean
+ * @param metadata - Known metadata fields for matching
+ * @returns The text with the leading metadata header removed
+ */
+export function stripMetadataHeader(text: string, metadata: RulingMetadata): string {
+  if (!text) return text;
+
+  const hasAnyMetadata = Object.values(metadata).some((v) => v != null && v !== '');
+  if (!hasAnyMetadata) return text;
+
+  const lines = text.split('\n');
+  let stripUntil = 0;
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (line.trim().length === 0) {
+      // Blank line — might be within the metadata header or at its end.
+      // Look ahead: if the next non-blank line is also metadata, continue.
+      // Otherwise, this blank line marks the end of the header.
+      let nextNonBlank = i + 1;
+      while (nextNonBlank < lines.length && lines[nextNonBlank].trim().length === 0) {
+        nextNonBlank++;
+      }
+      if (nextNonBlank < lines.length && isMetadataLine(lines[nextNonBlank], metadata)) {
+        // Blank line within metadata — skip it
+        continue;
+      }
+      // Blank line at end of metadata header — include it in the strip range
+      stripUntil = i + 1;
+      break;
+    }
+
+    if (isMetadataLine(line, metadata)) {
+      stripUntil = i + 1;
+    } else {
+      // First non-metadata line — stop
+      break;
+    }
+  }
+
+  // If we would strip everything, return original
+  if (stripUntil >= lines.length) return text;
+
+  // Skip any leading blank lines after the stripped header
+  let start = stripUntil;
+  while (start < lines.length && lines[start].trim().length === 0) {
+    start++;
+  }
+
+  // If stripping would leave nothing, return original
+  if (start >= lines.length) return text;
+
+  return lines.slice(start).join('\n');
+}
+
+/**
+ * Strip leading HTML block elements whose text content matches metadata.
+ *
+ * Processes sanitized ruling HTML by removing leading `<p>`, `<div>`,
+ * `<h1>`-`<h6>` elements at the start of the HTML whose text content
+ * matches metadata patterns. Stops at the first block element that
+ * contains substantive (non-metadata) content.
+ *
+ * @param html - The sanitized ruling HTML
+ * @param metadata - Known metadata fields for matching
+ * @returns The HTML with leading metadata elements removed
+ */
+export function stripMetadataHeaderHtml(html: string, metadata: RulingMetadata): string {
+  if (!html) return html;
+
+  const hasAnyMetadata = Object.values(metadata).some((v) => v != null && v !== '');
+  if (!hasAnyMetadata) return html;
+
+  // Match leading block-level elements and check their text content.
+  // This regex captures the tag name and uses a backreference to ensure
+  // the closing tag matches the opening tag.
+  const blockTagRe = /^(\s*<((?:p|div|h[1-6]))(?:\s[^>]*)?>)([\s\S]*?)(<\/\2>)/i;
+  const leadingWhitespaceRe = /^\s*(?:<br\s*\/?>|\s)*/i;
+
+  let remaining = html.trimStart();
+  let strippedAny = false;
+
+  // Iteratively remove leading block elements that are metadata
+  for (let guard = 0; guard < 20; guard++) {
+    // Skip leading whitespace and <br> tags
+    remaining = remaining.replace(leadingWhitespaceRe, '');
+    if (!remaining) break;
+
+    const match = blockTagRe.exec(remaining);
+    if (!match) break;
+
+    // Extract text content (strip inner HTML tags, replace <br> with space first)
+    const innerHtml = match[3];
+    const textContent = innerHtml.replace(/<br\s*\/?>/gi, ' ').replace(/<[^>]*>/g, '').trim();
+
+    if (!textContent) {
+      // Empty element — skip it
+      remaining = remaining.slice(match[0].length);
+      strippedAny = true;
+      continue;
+    }
+
+    if (isMetadataLine(textContent, metadata)) {
+      remaining = remaining.slice(match[0].length);
+      strippedAny = true;
+    } else {
+      // Non-metadata element — stop stripping
+      break;
+    }
+  }
+
+  // If nothing was stripped, return original
+  if (!strippedAny) return html;
+
+  // If stripping would leave nothing, return original
+  const trimmedRemaining = remaining.trim();
+  if (!trimmedRemaining) return html;
+
+  return trimmedRemaining;
+}
+
+// ---------------------------------------------------------------------------
 // Ruling text cleanup (display-time)
 // ---------------------------------------------------------------------------
 
 /**
  * Clean ruling text for display.
  *
- * Applies encoding fixes, strips page numbers, detects paragraph
- * boundaries, and collapses excessive blank lines. Returns an array
- * of paragraph strings suitable for rendering as separate `<p>` elements.
+ * Applies encoding fixes, strips page numbers, metadata headers (when
+ * metadata is provided), boilerplate, detects paragraph boundaries, and
+ * collapses excessive blank lines. Returns an array of paragraph strings
+ * suitable for rendering as separate `<p>` elements.
+ *
+ * @param text - The raw ruling text
+ * @param metadata - Optional ruling metadata for header stripping
  */
-export function cleanRulingText(text: string): string[] {
+export function cleanRulingText(text: string, metadata?: RulingMetadata): string[] {
   let cleaned = fixEncoding(text);
   cleaned = stripPageNumbers(cleaned);
   cleaned = stripBoilerplate(cleaned);
+
+  // Strip metadata header if metadata is provided
+  if (metadata) {
+    cleaned = stripMetadataHeader(cleaned, metadata);
+  }
 
   // Detect paragraph boundaries for text that only has single newlines
   cleaned = detectParagraphs(cleaned);

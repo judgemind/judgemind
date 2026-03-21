@@ -1,7 +1,7 @@
 'use client';
 
 import Link from 'next/link';
-import { buildDownloadUrl, cleanRulingText, FORMAT_LABELS } from '@/lib/display-helpers';
+import { buildDownloadUrl, cleanRulingText, FORMAT_LABELS, stripMetadataHeaderHtml, type RulingMetadata } from '@/lib/display-helpers';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 
@@ -38,6 +38,16 @@ interface RulingProps {
 }
 
 export function RulingDetail({ ruling, sanitizedRulingTextHtml }: RulingProps) {
+  // Build metadata context for stripping redundant header boilerplate
+  const metadata: RulingMetadata = {
+    caseNumber: ruling.case?.caseNumber,
+    caseTitle: ruling.case?.caseTitle ?? undefined,
+    judgeName: ruling.judge?.canonicalName,
+    department: ruling.department ?? undefined,
+    hearingDate: ruling.hearingDate,
+    motionType: ruling.motionType ?? undefined,
+  };
+
   return (
     <div className="space-y-6">
       {/* Linked case */}
@@ -100,12 +110,12 @@ export function RulingDetail({ ruling, sanitizedRulingTextHtml }: RulingProps) {
               <div
                 className="ruling-content text-sm leading-relaxed text-slate-700 dark:text-slate-300"
                 dangerouslySetInnerHTML={{
-                  __html: sanitizedRulingTextHtml,
+                  __html: stripMetadataHeaderHtml(sanitizedRulingTextHtml, metadata),
                 }}
               />
             ) : (
               <div className="space-y-3">
-                {cleanRulingText(ruling.rulingText!).map((paragraph, idx) => (
+                {cleanRulingText(ruling.rulingText!, metadata).map((paragraph, idx) => (
                   <p
                     key={idx}
                     className="text-sm leading-relaxed text-slate-700 dark:text-slate-300"
