@@ -365,6 +365,94 @@ class TestExtractFromInlineVPattern:
 
 
 # ---------------------------------------------------------------------------
+# "In re" / "In the Matter of" / "Petition of" pattern tests (#1378)
+# ---------------------------------------------------------------------------
+
+
+class TestExtractFromInRePattern:
+    """Tests for the 'In re' / 'In the Matter of' extraction pattern (#1378)."""
+
+    def test_in_re_colon_simple(self) -> None:
+        """'In re: Name' format — common in probate/guardianship cases."""
+        text = (
+            "DEPARTMENT 3 LAW AND MOTION RULINGS\n"
+            "Case Number: 24STPB12345\n"
+            "In re: Estate of John Smith\n"
+            "The petition is GRANTED.\n"
+        )
+        result = backfill.extract_case_title(text)
+        assert result is not None
+        assert "In re" in result or "In Re" in result
+        assert "Estate of John Smith" in result
+
+    def test_in_re_no_colon(self) -> None:
+        """'In re Name' without colon."""
+        text = "In re Marriage of Garcia and Lopez\nThe court rules as follows."
+        result = backfill.extract_case_title(text)
+        assert result is not None
+        assert "Marriage of Garcia" in result
+
+    def test_in_the_matter_of(self) -> None:
+        """'In the Matter of Name' format."""
+        text = (
+            "Case Number: 24STPB00789\n"
+            "Hearing Date: March 5, 2026\n"
+            "In the Matter of the Estate of Margaret Williams\n"
+            "The petition for probate is GRANTED.\n"
+        )
+        result = backfill.extract_case_title(text)
+        assert result is not None
+        assert "Matter" in result
+        assert "Margaret Williams" in result
+
+    def test_petition_of(self) -> None:
+        """'Petition of Name' format."""
+        text = (
+            "Case Number: 24STPB01234\n"
+            "Petition of Robert Chen for Letters of Administration\n"
+            "The petition is GRANTED.\n"
+        )
+        result = backfill.extract_case_title(text)
+        assert result is not None
+        assert "Robert Chen" in result
+
+    def test_in_re_with_surrounding_text(self) -> None:
+        """'In re:' embedded in longer ruling text."""
+        text = (
+            "SUPERIOR COURT OF CALIFORNIA\n"
+            "COUNTY OF LOS ANGELES\n\n"
+            "DEPARTMENT 9\n"
+            "Case Number: 24STPB05678\n"
+            "Hearing Date: March 10, 2026\n\n"
+            "In re: Guardianship of Minor Child Davis\n\n"
+            "The court has reviewed the petition filed on February 1, 2026.\n"
+            "The petition is GRANTED.\n"
+        )
+        result = backfill.extract_case_title(text)
+        assert result is not None
+        assert "Guardianship" in result
+        assert "Davis" in result
+
+    def test_caption_block_preferred_over_in_re(self) -> None:
+        """Caption block should take priority over 'In re' pattern."""
+        text = (
+            "In re: Some Estate\nJOHN SMITH,\n  Plaintiff(s),\n  vs.\nJANE DOE,\n  Defendant(s).\n"
+        )
+        result = backfill.extract_case_title(text)
+        assert result is not None
+        # Caption block should win
+        assert "John Smith" in result
+        assert "Jane Doe" in result
+
+    def test_in_re_too_long_returns_none(self) -> None:
+        """Very long 'In re' text should be rejected (> 150 chars total)."""
+        long_name = "A" * 200
+        text = f"In re: {long_name}\nThe petition is granted."
+        result = backfill.extract_case_title(text)
+        assert result is None
+
+
+# ---------------------------------------------------------------------------
 # backfill_batch tests
 # ---------------------------------------------------------------------------
 

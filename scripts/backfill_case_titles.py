@@ -118,6 +118,22 @@ _CASE_NAME_FIELD_RE = re.compile(
     re.IGNORECASE | re.MULTILINE,
 )
 
+# ---------------------------------------------------------------------------
+# Pattern 5: "In re:" / "In the Matter of" / "Petition of" (#1378)
+# ---------------------------------------------------------------------------
+# Probate, guardianship, and family law cases often lack adversarial parties.
+# These use patterns like "In re: Estate of Smith" or "In the Matter of Jones".
+_IN_RE_RE = re.compile(
+    r"(?:^|\n)\s*(?P<title>(?:In\s+re:?\s+|In\s+the\s+Matter\s+of\s+)"
+    r"[A-Z][^\n]{2,})",
+    re.IGNORECASE | re.MULTILINE,
+)
+_PETITION_OF_RE = re.compile(
+    r"(?:^|\n)\s*(?P<title>Petition\s+of\s+[A-Z][^\n]{2,})",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
 # Descriptors that follow a party name and should be stripped.
 _DESCRIPTOR_RE = re.compile(
     r",?\s*(?:an individual|a (?:public|private|California|Delaware)"
@@ -263,6 +279,35 @@ def _extract_from_inline_v_pattern(ruling_text: str) -> str | None:
     return title
 
 
+def _extract_from_in_re_pattern(ruling_text: str) -> str | None:
+    """Extract a case title from 'In re' / 'In the Matter of' / 'Petition of' (#1378).
+
+    Probate, guardianship, and family law cases often lack adversarial parties.
+    These use patterns like:
+      - "In re: Estate of John Smith"
+      - "In re Marriage of Garcia and Lopez"
+      - "In the Matter of the Estate of Margaret Williams"
+      - "Petition of Robert Chen for Letters of Administration"
+    """
+    for pattern in (_IN_RE_RE, _PETITION_OF_RE):
+        m = pattern.search(ruling_text)
+        if m is None:
+            continue
+
+        title = m.group("title").strip()
+        # Collapse whitespace
+        title = " ".join(title.split())
+        # Strip trailing punctuation
+        title = title.rstrip(".,;: ")
+
+        if len(title) > 150 or len(title) < 5:
+            continue
+
+        return title
+
+    return None
+
+
 def extract_case_title(ruling_text: str) -> str | None:
     """Extract a case title from ruling text.
 
@@ -272,6 +317,7 @@ def extract_case_title(ruling_text: str) -> str | None:
     2. Inline "Case Name:" or "Case Title:" field — direct extraction
     3. "MOVING PARTY:" / "RESPONDING PARTY:" fields — construct from party names
     4. Inline "Name v. Name" pattern — broad fallback (#337)
+    5. "In re:" / "In the Matter of" / "Petition of" — non-adversarial cases (#1378)
 
     Returns a title like "Buenaventura v. City Of Pasadena", or None.
     """
@@ -291,7 +337,12 @@ def extract_case_title(ruling_text: str) -> str | None:
         return title
 
     # Strategy 4: Inline "Name v. Name" pattern — broad fallback (#337)
-    return _extract_from_inline_v_pattern(ruling_text)
+    title = _extract_from_inline_v_pattern(ruling_text)
+    if title is not None:
+        return title
+
+    # Strategy 5: "In re:" / "In the Matter of" / "Petition of" (#1378)
+    return _extract_from_in_re_pattern(ruling_text)
 
 
 def _extract_from_caption_block(ruling_text: str) -> str | None:
