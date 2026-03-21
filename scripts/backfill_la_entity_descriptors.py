@@ -30,6 +30,12 @@ import re
 import sys
 
 import psycopg
+from courts.ca.la_tentatives import (
+    _DEPT_HEADER_BOILERPLATE_RE,
+    _ENTITY_DESCRIPTOR_RE,
+    _MAX_TITLE_LENGTH,
+    _sanitize_title,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -37,43 +43,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-
-# ---------------------------------------------------------------------------
-# Entity descriptor stripping (inlined from la_tentatives.py for ECS oneshot)
-# ---------------------------------------------------------------------------
-
-_ENTITY_DESCRIPTOR_RE = re.compile(
-    r",?\s*(?:"
-    r"An Individual(?:\s+And Derivatively On Behalf Of [^,;]+)?"
-    r"|An? (?:Alabama|Alaska|Arizona|Arkansas|California|Colorado|Connecticut"
-    r"|Delaware|District of Columbia|Florida|Georgia|Hawaii|Idaho|Illinois"
-    r"|Indiana|Iowa|Kansas|Kentucky|Louisiana|Maine|Maryland|Massachusetts"
-    r"|Michigan|Minnesota|Mississippi|Missouri|Montana|Nebraska|Nevada"
-    r"|New Hampshire|New Jersey|New Mexico|New York|North Carolina"
-    r"|North Dakota|Ohio|Oklahoma|Oregon|Pennsylvania|Rhode Island"
-    r"|South Carolina|South Dakota|Tennessee|Texas|Utah|Vermont|Virginia"
-    r"|Washington|West Virginia|Wisconsin|Wyoming)"
-    r" (?:Corporation|Limited Liability Company|Limited Partnership"
-    r"|General Partnership|Business Entity|Nonprofit Corporation|Public Entity)"
-    r"|A (?:Corporation|Limited Liability Company|Limited Partnership"
-    r"|General Partnership|Business Entity|Nonprofit Corporation|Public Entity)"
-    r"|Individually And As [^,;]+"
-    r"|By And Through [^,;]+"
-    r"|As Trustee Of [^,;]+"
-    r"|Successor In Interest To [^,;]+"
-    r"|Derivatively On Behalf Of [^,;]+"
-    r"|Form Unknown"
-    r"|Doe(?:s)? \d+ (?:To|Through) \d+(?:,? Inclusive)?"
-    r")",
-    re.IGNORECASE,
-)
-
-_DEPT_HEADER_BOILERPLATE_RE = re.compile(
-    r"DEPARTMENT\s+\S+\s+LAW AND MOTION RULINGS",
-    re.IGNORECASE,
-)
-
-_MAX_TITLE_LENGTH = 120
 
 # For the backfill, we use a more lenient length limit.  The live scraper
 # enforces 120 chars, but for existing data we accept anything that is at
@@ -87,10 +56,9 @@ def sanitize_title(raw_title: str | None) -> str | None:
     Returns ``None`` if the title is invalid (contains department header
     boilerplate, is too short after cleaning, or is empty).
 
-    This is a standalone copy of ``la_tentatives._sanitize_title()`` to
-    satisfy the ECS oneshot constraint (no sibling imports).
+    Delegates to ``la_tentatives._sanitize_title()`` with the default max length.
     """
-    return _strip_descriptors(raw_title, max_length=_MAX_TITLE_LENGTH)
+    return _sanitize_title(raw_title)
 
 
 def sanitize_title_lenient(raw_title: str | None) -> str | None:
@@ -100,52 +68,7 @@ def sanitize_title_lenient(raw_title: str | None) -> str | None:
     because many multi-party LA cases are legitimately > 120 chars even
     after stripping entity descriptors.
     """
-    return _strip_descriptors(raw_title, max_length=_BACKFILL_MAX_TITLE_LENGTH)
-
-
-def _strip_descriptors(raw_title: str | None, *, max_length: int) -> str | None:
-    """Strip entity descriptors from a case title.
-
-    Returns ``None`` if the title is invalid (boilerplate, too short,
-    or exceeds *max_length* after cleaning).
-    """
-    if not raw_title:
-        return None
-
-    if _DEPT_HEADER_BOILERPLATE_RE.search(raw_title):
-        return None
-
-    title = raw_title
-
-    # Normalize "vs.", "vs", "V." etc. to " v. " so splitting works consistently.
-    title = re.sub(r"\s+[Vv][Ss]?\.?\s+", " v. ", title)
-
-    # Strip entity descriptors from each side of "v."
-    if " v. " in title:
-        parts = title.split(" v. ", 1)
-        cleaned_parts = []
-        for part in parts:
-            cleaned = _ENTITY_DESCRIPTOR_RE.sub("", part).strip()
-            # Strip trailing semicolons, commas, "and" connectors left by removal
-            cleaned = re.sub(r"[;,]\s*$", "", cleaned).strip()
-            cleaned = re.sub(r"\s+And\s*$", "", cleaned, flags=re.IGNORECASE).strip()
-            # Collapse "Et Al." variants
-            cleaned = re.sub(
-                r",?\s*Et\.?\s*Al\.?\s*$",
-                ", et al.",
-                cleaned,
-                flags=re.IGNORECASE,
-            ).strip()
-            # Remove dangling punctuation
-            cleaned = cleaned.strip(",;. ")
-            cleaned_parts.append(cleaned)
-        title = " v. ".join(cleaned_parts)
-
-    # Final length check
-    if len(title) > max_length or len(title) < 5:
-        return None
-
-    return title
+    return _sanitize_title(raw_title, max_length=_BACKFILL_MAX_TITLE_LENGTH)
 
 
 # ---------------------------------------------------------------------------
