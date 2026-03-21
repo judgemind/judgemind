@@ -50,6 +50,12 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Table-aware PDF text extraction — inlined from oc_tentatives.py (#1241)
 # (ECS oneshot constraint: scripts cannot import from courts/ modules)
+#
+# Source: packages/scraper-framework/src/courts/ca/oc_tentatives.py
+# Inlined functions: _is_header_row, _reconstruct_entry_text,
+#   _extract_header_text_above_table, _extract_table_entries_from_page,
+#   _extract_oc_pdf_text, _normalize_oc_text
+# Keep in sync — parity enforced by test_backfill_oc_ruling_text.py.
 # ---------------------------------------------------------------------------
 
 _TABLE_HEADER_RE = re.compile(
@@ -59,7 +65,10 @@ _TABLE_HEADER_RE = re.compile(
 
 
 def _is_header_row(row: list[str | None]) -> bool:
-    """Return True if the row is a table header."""
+    """Return True if the row is a table header.
+
+    Source: oc_tentatives.py::_is_header_row — keep in sync.
+    """
     non_empty = [c.strip() for c in row if c and c.strip()]
     if not non_empty:
         return True
@@ -75,6 +84,8 @@ def _reconstruct_entry_text(
     ruling_cell: str,
 ) -> str:
     """Reconstruct a single case entry with columns properly separated.
+
+    Source: oc_tentatives.py::_reconstruct_entry_text — keep in sync.
 
     Case name lines from the table cell are joined into a single line so that
     "Plaintiff vs." and "Defendant" (which pdfplumber splits across rows) are
@@ -107,7 +118,10 @@ def _extract_header_text_above_table(
     page: pdfplumber.page.Page,
     table_top: float,
 ) -> str | None:
-    """Extract text from the region above the first table on a page."""
+    """Extract text from the region above the first table on a page.
+
+    Source: oc_tentatives.py::_extract_header_text_above_table — keep in sync.
+    """
     if table_top < 20:
         return None
     header_region = page.within_bbox((0, 0, page.width, table_top))
@@ -120,7 +134,10 @@ def _extract_header_text_above_table(
 def _extract_table_entries_from_page(
     page: pdfplumber.page.Page,
 ) -> tuple[list[str], str | None] | None:
-    """Extract case entries from a page using table detection."""
+    """Extract case entries from a page using table detection.
+
+    Source: oc_tentatives.py::_extract_table_entries_from_page — keep in sync.
+    """
     tables = page.find_tables()
     if not tables:
         return None
@@ -197,7 +214,10 @@ def _extract_table_entries_from_page(
 
 
 def _extract_oc_pdf_text(pdf_bytes: bytes) -> str:
-    """Extract text from an OC calendar PDF using table-aware extraction."""
+    """Extract text from an OC calendar PDF using table-aware extraction.
+
+    Source: oc_tentatives.py::_extract_oc_pdf_text — keep in sync.
+    """
     lines: list[str] = []
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         for page in pdf.pages:
@@ -214,14 +234,17 @@ def _extract_oc_pdf_text(pdf_bytes: bytes) -> str:
     return "\n".join(lines)
 
 
-# Case number normalization — also inlined from oc_tentatives.py
+# Case number normalization — also inlined from oc_tentatives.py (keep in sync)
 _SPLIT_CASE_NUMBER_RE = re.compile(
     r"(\d{2,4})-\s*\n\s*(\d{7,8})\b",
 )
 
 
 def _normalize_oc_text(text: str) -> str:
-    """Pre-process extracted PDF text to rejoin case numbers split across lines."""
+    """Pre-process extracted PDF text to rejoin case numbers split across lines.
+
+    Source: oc_tentatives.py::_normalize_oc_text — keep in sync.
+    """
     return _SPLIT_CASE_NUMBER_RE.sub(r"\1-\2", text)
 
 
