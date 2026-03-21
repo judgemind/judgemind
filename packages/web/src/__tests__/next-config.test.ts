@@ -13,11 +13,12 @@ import path from 'path';
  * See: https://github.com/judgemind/judgemind/issues/1280
  */
 describe('next.config.js', () => {
-  it('externalises isomorphic-dompurify for server-side rendering', () => {
+  it('externalises isomorphic-dompurify and jsdom for server-side rendering', () => {
     const configPath = path.resolve(__dirname, '../../next.config.js');
     const nextConfig = require(configPath);
     const externals =
       nextConfig.experimental?.serverComponentsExternalPackages ?? [];
     expect(externals).toContain('isomorphic-dompurify');
+    expect(externals).toContain('jsdom');
   });
 });

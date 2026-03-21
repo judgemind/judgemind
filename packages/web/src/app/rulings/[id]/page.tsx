@@ -107,9 +107,18 @@ export default async function RulingDetailPage({ params }: Props) {
   // Sanitize ruling HTML in the server component where isomorphic-dompurify
   // can use jsdom natively, then pass the safe HTML to the client component.
   // This avoids bundling jsdom into the client SSR bundle (which causes 500s).
-  const sanitizedHtml = rulingData.rulingTextHtml
-    ? sanitizeRulingHtml(rulingData.rulingTextHtml)
-    : null;
+  // Wrapped in try/catch so sanitization failures degrade gracefully to plain
+  // text instead of causing HTTP 500 — the HTML comes from our own DB so
+  // skipping sanitization is acceptable as a fallback.
+  let sanitizedHtml: string | null = null;
+  if (rulingData.rulingTextHtml) {
+    try {
+      sanitizedHtml = sanitizeRulingHtml(rulingData.rulingTextHtml);
+    } catch {
+      // Sanitization failed (e.g. jsdom not available in serverless env).
+      // Fall back to null so the client component uses rulingText instead.
+    }
+  }
 
   return (
     <div className="mx-auto max-w-4xl">

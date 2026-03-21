@@ -140,4 +140,41 @@ describe('RulingDetailPage (SSR smoke)', () => {
       RulingDetailPage({ params: { id: 'error-ruling' } }),
     ).rejects.toThrow('NEXT_NOT_FOUND');
   });
+
+  it('renders when ruling has rulingTextHtml', async () => {
+    mockQuery.mockResolvedValueOnce({
+      data: {
+        ruling: {
+          ...FULL_RULING,
+          rulingTextHtml: '<p>The motion is <strong>granted</strong>.</p>',
+        },
+      },
+    });
+
+    const result = await RulingDetailPage({ params: { id: 'ruling-1' } });
+    expect(result).toBeTruthy();
+    expect(result.type).toBe('div');
+  });
+
+  it('degrades gracefully when sanitization throws', async () => {
+    // Override the mock to throw
+    const sanitizeMod = await import('@/lib/sanitize-html');
+    vi.spyOn(sanitizeMod, 'sanitizeRulingHtml').mockImplementation(() => {
+      throw new Error('jsdom not available');
+    });
+
+    mockQuery.mockResolvedValueOnce({
+      data: {
+        ruling: {
+          ...FULL_RULING,
+          rulingTextHtml: '<p>Some HTML</p>',
+        },
+      },
+    });
+
+    // Should NOT throw — the try/catch should handle the sanitization error
+    const result = await RulingDetailPage({ params: { id: 'ruling-1' } });
+    expect(result).toBeTruthy();
+    expect(result.type).toBe('div');
+  });
 });

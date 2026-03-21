@@ -6,7 +6,7 @@ const nextConfig = {
     // tells Next.js to resolve it at runtime from node_modules instead.
     // This fixes HTTP 500 errors on pages whose client components call
     // sanitizeRulingHtml / sanitizeExcerptHtml during SSR.
-    serverComponentsExternalPackages: ['isomorphic-dompurify'],
+    serverComponentsExternalPackages: ['isomorphic-dompurify', 'jsdom'],
   },
 };
 
