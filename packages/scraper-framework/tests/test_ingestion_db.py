@@ -28,6 +28,7 @@ from ingestion.db import (
     insert_ruling,
     normalize_judge_name,
     normalize_party_name,
+    normalize_ruling_text_hash,
     resolve_judge,
     upsert_case,
     upsert_case_judge,
@@ -76,9 +77,16 @@ def _mock_conn() -> MagicMock:
 
 
 def _get_execute_args(conn: MagicMock) -> tuple:
-    """Extract the parameter tuple from the last cursor.execute() call."""
+    """Extract the parameter tuple from the last cursor.execute() call that has params.
+
+    Skips calls without parameter tuples (e.g. SAVEPOINT, RELEASE SAVEPOINT).
+    """
     cur = conn.cursor.return_value.__enter__.return_value
-    return cur.execute.call_args[0][1]
+    # Iterate in reverse to find the last call with a params argument
+    for call in reversed(cur.execute.call_args_list):
+        if len(call[0]) > 1:
+            return call[0][1]
+    raise ValueError("No execute() call with params found")
 
 
 # ---------------------------------------------------------------------------
@@ -1355,3 +1363,272 @@ class TestResolveJudgeNearDuplicate:
         insert_calls = [c for c in cur.execute.call_args_list if "INSERT INTO judges" in c[0][0]]
         assert len(insert_calls) == 1
         assert "ON CONFLICT" in insert_calls[0][0][0]
+
+
+# ---------------------------------------------------------------------------
+# normalize_ruling_text_hash
+# ---------------------------------------------------------------------------
+
+
+class TestNormalizeRulingTextHash:
+    """Unit tests for normalize_ruling_text_hash."""
+
+    def test_returns_none_for_none(self) -> None:
+        assert normalize_ruling_text_hash(None) is None
+
+    def test_returns_none_for_empty_string(self) -> None:
+        assert normalize_ruling_text_hash("") is None
+
+    def test_returns_none_for_whitespace_only(self) -> None:
+        assert normalize_ruling_text_hash("   \n\t  ") is None
+
+    def test_same_text_different_case_produces_same_hash(self) -> None:
+        """Title Case and ALL CAPS produce the same hash."""
+        h1 = normalize_ruling_text_hash("Motion to Compel Discovery GRANTED")
+        h2 = normalize_ruling_text_hash("MOTION TO COMPEL DISCOVERY GRANTED")
+        h3 = normalize_ruling_text_hash("motion to compel discovery granted")
+        assert h1 == h2 == h3
+
+    def test_different_whitespace_produces_same_hash(self) -> None:
+        """Different whitespace patterns produce the same hash."""
+        h1 = normalize_ruling_text_hash("Motion  to   Compel")
+        h2 = normalize_ruling_text_hash("Motion to Compel")
+        h3 = normalize_ruling_text_hash("Motion\n\tto\nCompel")
+        h4 = normalize_ruling_text_hash("  Motion to Compel  ")
+        assert h1 == h2 == h3 == h4
+
+    def test_different_text_produces_different_hash(self) -> None:
+        h1 = normalize_ruling_text_hash("Motion GRANTED")
+        h2 = normalize_ruling_text_hash("Motion DENIED")
+        assert h1 != h2
+
+    def test_returns_hex_string(self) -> None:
+        """Returns a 64-char hex string (SHA-256)."""
+        result = normalize_ruling_text_hash("Some ruling text.")
+        assert result is not None
+        assert len(result) == 64
+        assert all(c in "0123456789abcdef" for c in result)
+
+
+# ---------------------------------------------------------------------------
+# insert_ruling — content-hash dedup
+# ---------------------------------------------------------------------------
+
+
+class TestInsertRulingContentDedup:
+    """Verify insert_ruling content-hash dedup behavior."""
+
+    def test_insert_includes_ruling_text_hash(self) -> None:
+        """The INSERT includes ruling_text_hash as the last parameter."""
+        conn = _mock_conn()
+        insert_ruling(
+            conn,
+            document_id="doc-1",
+            case_id="case-1",
+            court_id="court-1",
+            hearing_date=date(2026, 3, 5),
+            ruling_text="Motion GRANTED",
+            department="Dept. 1",
+        )
+
+        cur = conn.cursor.return_value.__enter__.return_value
+        # Find the INSERT call and check that ruling_text_hash is included
+        insert_calls = [c for c in cur.execute.call_args_list if "INSERT INTO rulings" in c[0][0]]
+        assert len(insert_calls) == 1
+        sql = insert_calls[0][0][0]
+        args = insert_calls[0][0][1]
+        assert "ruling_text_hash" in sql
+        # text_hash is the last argument
+        expected_hash = normalize_ruling_text_hash("Motion GRANTED")
+        assert args[-1] == expected_hash
+
+    def test_insert_with_none_ruling_text_has_null_hash(self) -> None:
+        """When ruling_text is None, ruling_text_hash should be None."""
+        conn = _mock_conn()
+        insert_ruling(
+            conn,
+            document_id="doc-1",
+            case_id="case-1",
+            court_id="court-1",
+            hearing_date=date(2026, 3, 5),
+            ruling_text=None,
+            department="Dept. 1",
+        )
+
+        cur = conn.cursor.return_value.__enter__.return_value
+        insert_calls = [c for c in cur.execute.call_args_list if "INSERT INTO rulings" in c[0][0]]
+        assert len(insert_calls) == 1
+        args = insert_calls[0][0][1]
+        # text_hash (last arg) should be None
+        assert args[-1] is None
+
+    def test_unique_violation_triggers_update_fallback(self) -> None:
+        """When UniqueViolation fires (content-hash conflict), fall back to UPDATE.
+
+        In tests without a real PG connection, diag.constraint_name is None.
+        The code treats None as the expected constraint (see db.py comment).
+        """
+        import psycopg.errors
+
+        conn = _mock_conn()
+        cur = conn.cursor.return_value.__enter__.return_value
+        exc = psycopg.errors.UniqueViolation("duplicate key value violates unique constraint")
+
+        def side_effect_execute(sql: str, params: tuple | None = None) -> None:
+            if "INSERT INTO rulings" in sql:
+                raise exc
+
+        cur.execute = MagicMock(side_effect=side_effect_execute)
+
+        insert_ruling(
+            conn,
+            document_id="new-doc-1",
+            case_id="case-1",
+            court_id="court-1",
+            hearing_date=date(2026, 3, 5),
+            ruling_text="Motion GRANTED",
+            department="Dept. 1",
+        )
+
+        # Verify: SAVEPOINT, INSERT (which raises), ROLLBACK TO SAVEPOINT, UPDATE
+        execute_calls = cur.execute.call_args_list
+        sql_stmts = [call[0][0] for call in execute_calls]
+        assert any("SAVEPOINT" in s for s in sql_stmts)
+        assert any("INSERT INTO rulings" in s for s in sql_stmts)
+        assert any("ROLLBACK TO SAVEPOINT" in s for s in sql_stmts)
+        assert any("UPDATE rulings SET" in s for s in sql_stmts)
+
+    def test_unique_violation_update_uses_coalesce(self) -> None:
+        """Fallback UPDATE uses COALESCE to preserve existing non-NULL fields."""
+        import psycopg.errors
+
+        conn = _mock_conn()
+        cur = conn.cursor.return_value.__enter__.return_value
+        exc = psycopg.errors.UniqueViolation("duplicate key value violates unique constraint")
+
+        def side_effect_execute(sql: str, params: tuple | None = None) -> None:
+            if "INSERT INTO rulings" in sql:
+                raise exc
+
+        cur.execute = MagicMock(side_effect=side_effect_execute)
+
+        insert_ruling(
+            conn,
+            document_id="new-doc-1",
+            case_id="case-1",
+            court_id="court-1",
+            hearing_date=date(2026, 3, 5),
+            ruling_text="Motion GRANTED",
+            department="Dept. 1",
+            judge_id="judge-1",
+            outcome="granted",
+        )
+
+        # Find the UPDATE call and verify COALESCE is used
+        update_calls = [c for c in cur.execute.call_args_list if "UPDATE rulings SET" in c[0][0]]
+        assert len(update_calls) == 1
+        sql = update_calls[0][0][0]
+        assert "COALESCE" in sql
+
+    def test_unknown_constraint_violation_is_reraised(self) -> None:
+        """UniqueViolation from an unrelated constraint should be re-raised.
+
+        We use a subclass to override the read-only diag property so that
+        constraint_name returns a non-matching value.
+        """
+        import psycopg.errors
+
+        class _MockViolation(psycopg.errors.UniqueViolation):
+            @property
+            def diag(self) -> MagicMock:
+                m = MagicMock()
+                m.constraint_name = "some_other_constraint"
+                return m
+
+        conn = _mock_conn()
+        cur = conn.cursor.return_value.__enter__.return_value
+        exc = _MockViolation("duplicate key value violates unique constraint")
+
+        def side_effect_execute(sql: str, params: tuple | None = None) -> None:
+            if "INSERT INTO rulings" in sql:
+                raise exc
+
+        cur.execute = MagicMock(side_effect=side_effect_execute)
+
+        with pytest.raises(psycopg.errors.UniqueViolation):
+            insert_ruling(
+                conn,
+                document_id="new-doc-1",
+                case_id="case-1",
+                court_id="court-1",
+                hearing_date=date(2026, 3, 5),
+                ruling_text="Motion GRANTED",
+                department="Dept. 1",
+            )
+
+    def test_fallback_update_logs_warning_on_zero_rowcount(self) -> None:
+        """When fallback UPDATE matches 0 rows, a warning should be logged."""
+        import psycopg.errors
+
+        conn = _mock_conn()
+        cur = conn.cursor.return_value.__enter__.return_value
+        exc = psycopg.errors.UniqueViolation("duplicate key value violates unique constraint")
+
+        # Track which SQL statement we're on to set rowcount on UPDATE
+        def side_effect_execute(sql: str, params: tuple | None = None) -> None:
+            if "INSERT INTO rulings" in sql:
+                raise exc
+            if "UPDATE rulings SET" in sql:
+                cur.rowcount = 0
+
+        cur.execute = MagicMock(side_effect=side_effect_execute)
+
+        # Should not raise — just log a warning
+        insert_ruling(
+            conn,
+            document_id="new-doc-1",
+            case_id="case-1",
+            court_id="court-1",
+            hearing_date=date(2026, 3, 5),
+            ruling_text="Motion GRANTED",
+            department="Dept. 1",
+        )
+
+    def test_on_conflict_document_id_preserves_ruling_text_hash(self) -> None:
+        """ON CONFLICT (document_id) DO UPDATE should preserve ruling_text_hash via COALESCE."""
+        conn = _mock_conn()
+        insert_ruling(
+            conn,
+            document_id="doc-1",
+            case_id="case-1",
+            court_id="court-1",
+            hearing_date=date(2026, 3, 5),
+            ruling_text="Motion GRANTED",
+            department="Dept. 1",
+        )
+
+        cur = conn.cursor.return_value.__enter__.return_value
+        insert_calls = [c for c in cur.execute.call_args_list if "INSERT INTO rulings" in c[0][0]]
+        assert len(insert_calls) == 1
+        sql = insert_calls[0][0][0]
+        assert "ruling_text_hash = COALESCE(" in sql
+        assert "EXCLUDED.ruling_text_hash, rulings.ruling_text_hash)" in sql
+
+    def test_savepoint_used_for_insert(self) -> None:
+        """INSERT uses a savepoint so UniqueViolation doesn't abort the transaction."""
+        conn = _mock_conn()
+        insert_ruling(
+            conn,
+            document_id="doc-1",
+            case_id="case-1",
+            court_id="court-1",
+            hearing_date=date(2026, 3, 5),
+            ruling_text="Motion GRANTED",
+            department="Dept. 1",
+        )
+
+        cur = conn.cursor.return_value.__enter__.return_value
+        execute_calls = cur.execute.call_args_list
+        sql_stmts = [call[0][0] for call in execute_calls]
+        assert "SAVEPOINT ruling_insert" in sql_stmts
+        assert "RELEASE SAVEPOINT ruling_insert" in sql_stmts

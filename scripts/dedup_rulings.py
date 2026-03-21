@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # venv: scraper-framework
-"""Deduplicate ruling rows that were created by non-idempotent scraper runs.
+"""Deduplicate ruling rows and backfill ruling_text_hash for content-based dedup.
 
 Prior to the deterministic document_id fix (#302), each scraper run generated
 a random UUID for document_id, causing insert_document and insert_ruling to
@@ -12,6 +12,9 @@ create new rows on every run instead of deduplicating. This script:
   4. Deletes orphaned document rows (documents whose only referencing ruling
      was deleted and which have no other references).
 
+Additionally, it can backfill the ``ruling_text_hash`` column (migration 11)
+for existing rulings so the content-based dedup index is fully populated.
+
 Usage:
     scripts/with-secret.sh \
         -e DATABASE_URL=judgemind/dev/db/connection:.url \
@@ -22,9 +25,15 @@ Usage:
         -e DATABASE_URL=judgemind/dev/db/connection:.url \
         -- packages/scraper-framework/.venv/bin/python3 scripts/dedup_rulings.py --dry-run
 
+    # Backfill ruling_text_hash for existing rulings:
+    scripts/with-secret.sh \
+        -e DATABASE_URL=judgemind/dev/db/connection:.url \
+        -- packages/scraper-framework/.venv/bin/python3 scripts/dedup_rulings.py --backfill-hashes
+
 Options:
-    --dry-run       Print what would be deleted without writing to the database.
-    --batch-size N  Number of duplicate groups to process per batch (default: 100).
+    --dry-run            Print what would be deleted without writing to the database.
+    --batch-size N       Number of duplicate groups to process per batch (default: 100).
+    --backfill-hashes    Backfill ruling_text_hash for rulings that have NULL hash.
 """
 
 from __future__ import annotations
@@ -42,6 +51,7 @@ sys.path.insert(
 )
 
 import psycopg  # noqa: E402
+from ingestion.db import normalize_ruling_text_hash  # noqa: E402
 
 logging.basicConfig(
     level=logging.INFO,
@@ -204,13 +214,179 @@ def run_dedup(
 
 
 # ---------------------------------------------------------------------------
+# Hash backfill logic
+# ---------------------------------------------------------------------------
+
+# Fetch a batch of rulings with NULL ruling_text_hash, ordered by id for
+# keyset pagination.
+FETCH_NULL_HASH_BATCH_QUERY = """
+    SELECT id, ruling_text
+    FROM rulings
+    WHERE ruling_text_hash IS NULL
+      AND ruling_text IS NOT NULL
+      AND id > %s::uuid
+    ORDER BY id
+    LIMIT %s
+"""
+
+COUNT_NULL_HASH_QUERY = """
+    SELECT COUNT(*)
+    FROM rulings
+    WHERE ruling_text_hash IS NULL
+      AND ruling_text IS NOT NULL
+"""
+
+
+def count_null_hashes(conn: psycopg.Connection) -> int:
+    """Count rulings with NULL ruling_text_hash that have ruling text."""
+    with conn.cursor() as cur:
+        cur.execute(COUNT_NULL_HASH_QUERY)
+        row = cur.fetchone()
+    return row[0] if row else 0
+
+
+def backfill_hash_batch(
+    conn: psycopg.Connection,
+    batch_size: int = 500,
+    cursor: str = _CURSOR_MIN_UUID,
+) -> tuple[int, str, int]:
+    """Backfill ruling_text_hash for one batch of rulings.
+
+    Uses individual UPDATEs with savepoints so that a UniqueViolation
+    (semantic duplicate — same case_id and identical normalized text)
+    can be caught per-row.  When a duplicate is found the newer ruling
+    (the one being backfilled) is deleted instead.
+
+    Returns ``(count_updated, next_cursor, dupes_deleted)``.
+    """
+    with conn.cursor() as cur:
+        cur.execute(FETCH_NULL_HASH_BATCH_QUERY, (cursor, batch_size))
+        rows = cur.fetchall()
+
+    if not rows:
+        return 0, cursor, 0
+
+    next_cursor = str(rows[-1][0])
+    updated = 0
+    dupes_deleted = 0
+
+    for ruling_id, ruling_text in rows:
+        text_hash = normalize_ruling_text_hash(ruling_text)
+        if text_hash is None:
+            continue
+        rid = str(ruling_id)
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SAVEPOINT backfill_row")
+                cur.execute(
+                    "UPDATE rulings SET ruling_text_hash = %s WHERE id = %s::uuid",
+                    (text_hash, rid),
+                )
+                cur.execute("RELEASE SAVEPOINT backfill_row")
+            updated += 1
+        except psycopg.errors.UniqueViolation:
+            # Another ruling for the same case already has this hash.
+            # This ruling is a semantic duplicate — delete it.
+            with conn.cursor() as cur:
+                cur.execute("ROLLBACK TO SAVEPOINT backfill_row")
+                # Get the document_id before deleting the ruling.
+                cur.execute(
+                    "SELECT document_id FROM rulings WHERE id = %s::uuid",
+                    (rid,),
+                )
+                doc_row = cur.fetchone()
+                doc_id = str(doc_row[0]) if doc_row else None
+                # Delete the duplicate ruling.
+                cur.execute(
+                    "DELETE FROM rulings WHERE id = %s::uuid",
+                    (rid,),
+                )
+                # Remove the orphaned document if no other ruling
+                # references it.
+                if doc_id is not None:
+                    cur.execute(
+                        "DELETE FROM documents WHERE id = %s::uuid "
+                        "AND NOT EXISTS ("
+                        "  SELECT 1 FROM rulings "
+                        "  WHERE document_id = %s::uuid"
+                        ")",
+                        (doc_id, doc_id),
+                    )
+            dupes_deleted += 1
+            logger.info(
+                "Backfill: deleted semantic duplicate ruling %s "
+                "(hash %s already exists for same case)",
+                rid,
+                text_hash,
+            )
+
+    return updated, next_cursor, dupes_deleted
+
+
+def run_backfill_hashes(
+    dsn: str,
+    *,
+    batch_size: int = 500,
+    dry_run: bool = False,
+) -> dict[str, int]:
+    """Backfill ruling_text_hash for all rulings with NULL hash.
+
+    Returns a dict with ``total_updated`` and ``total_dupes_deleted``.
+    """
+    totals: dict[str, int] = {
+        "total_updated": 0,
+        "total_dupes_deleted": 0,
+    }
+
+    with psycopg.connect(dsn) as conn:
+        null_count = count_null_hashes(conn)
+        logger.info("Found %d rulings needing ruling_text_hash backfill", null_count)
+
+        if null_count == 0:
+            return totals
+
+        cursor: str = _CURSOR_MIN_UUID
+        while True:
+            updated, cursor, dupes = backfill_hash_batch(conn, batch_size, cursor)
+
+            if updated == 0 and dupes == 0:
+                break
+
+            totals["total_updated"] += updated
+            totals["total_dupes_deleted"] += dupes
+
+            if dry_run:
+                conn.rollback()
+                logger.info(
+                    "Backfill batch: %d updated, %d dupes deleted "
+                    "(total: %d/%d) [dry-run, rolled back]",
+                    updated,
+                    dupes,
+                    totals["total_updated"],
+                    totals["total_dupes_deleted"],
+                )
+            else:
+                conn.commit()
+                logger.info(
+                    "Backfill batch: %d updated, %d dupes deleted "
+                    "(total: %d/%d) [committed]",
+                    updated,
+                    dupes,
+                    totals["total_updated"],
+                    totals["total_dupes_deleted"],
+                )
+
+    return totals
+
+
+# ---------------------------------------------------------------------------
 # CLI entrypoint
 # ---------------------------------------------------------------------------
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Deduplicate ruling rows created by non-idempotent scraper runs.",
+        description="Deduplicate ruling rows and backfill ruling_text_hash.",
     )
     parser.add_argument(
         "--dry-run",
@@ -223,12 +399,31 @@ def main() -> None:
         default=100,
         help="Number of duplicate groups per batch (default: 100).",
     )
+    parser.add_argument(
+        "--backfill-hashes",
+        action="store_true",
+        help="Backfill ruling_text_hash for rulings with NULL hash, then exit.",
+    )
     args = parser.parse_args()
 
     dsn = os.environ.get("DATABASE_URL")
     if not dsn:
         logger.error("DATABASE_URL environment variable is required")
         sys.exit(1)
+
+    if args.backfill_hashes:
+        totals = run_backfill_hashes(
+            dsn,
+            batch_size=args.batch_size,
+            dry_run=args.dry_run,
+        )
+        logger.info(
+            "Hash backfill complete: %d rulings updated, "
+            "%d semantic duplicates deleted",
+            totals["total_updated"],
+            totals["total_dupes_deleted"],
+        )
+        return
 
     stats = run_dedup(
         dsn,
