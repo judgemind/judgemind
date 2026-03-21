@@ -114,6 +114,7 @@ def test_main_dry_run_no_db_writes() -> None:
     doc_id = "test-doc-id"
     s3_key = "ca/orange/superior_court/raw/2026/03/01/test.pdf"
     s3_bucket = "judgemind-document-archive-dev"
+    captured_at = "2026-03-01T12:00:00+00:00"
 
     # Mock S3
     mock_s3 = MagicMock()
@@ -131,6 +132,7 @@ def test_main_dry_run_no_db_writes() -> None:
                     doc_id,
                     s3_key,
                     s3_bucket,
+                    captured_at,
                 )
             ],
             [],
@@ -175,6 +177,7 @@ def test_main_skips_unchanged_text() -> None:
     doc_id = "test-doc-id"
     s3_key = "ca/orange/superior_court/raw/2026/03/01/test.pdf"
     s3_bucket = "judgemind-document-archive-dev"
+    captured_at = "2026-03-01T12:00:00+00:00"
 
     mock_s3 = MagicMock()
     mock_s3.get_object.return_value = {"Body": MagicMock(read=lambda: pdf_bytes)}
@@ -184,7 +187,7 @@ def test_main_skips_unchanged_text() -> None:
     # The existing text already matches what extraction produces
     mock_cursor.fetchall = MagicMock(
         side_effect=[
-            [(ruling_id, expected_text, doc_id, s3_key, s3_bucket)],
+            [(ruling_id, expected_text, doc_id, s3_key, s3_bucket, captured_at)],
             [],
         ]
     )
@@ -206,3 +209,92 @@ def test_main_skips_unchanged_text() -> None:
     for call in mock_cursor.execute.call_args_list:
         query = call[0][0]
         assert "UPDATE" not in query, f"Unexpected UPDATE for unchanged text: {query}"
+
+
+def test_keyset_pagination_advances_cursor() -> None:
+    """Keyset pagination should advance cursor using last row's captured_at and id."""
+    pdf_path = os.path.join(FIXTURES_DIR, "oc_apkarian_c25.pdf")
+    if not os.path.exists(pdf_path):
+        pytest.skip("Fixture not found: oc_apkarian_c25.pdf")
+
+    with open(pdf_path, "rb") as f:
+        pdf_bytes = f.read()
+
+    s3_key = "ca/orange/superior_court/raw/2026/03/01/test.pdf"
+    s3_bucket = "judgemind-document-archive-dev"
+    batch1_captured_at = "2026-03-01T12:00:00+00:00"
+    batch2_captured_at = "2026-03-02T12:00:00+00:00"
+
+    mock_s3 = MagicMock()
+    mock_s3.get_object.return_value = {"Body": MagicMock(read=lambda: pdf_bytes)}
+
+    mock_conn = MagicMock()
+    mock_cursor = MagicMock()
+
+    # Two batches: batch 1 returns one row, batch 2 returns one row, batch 3 empty
+    mock_cursor.fetchall = MagicMock(
+        side_effect=[
+            [
+                (
+                    "ruling-1",
+                    "old text batch 1",
+                    "doc-1",
+                    s3_key,
+                    s3_bucket,
+                    batch1_captured_at,
+                )
+            ],
+            [
+                (
+                    "ruling-2",
+                    "old text batch 2",
+                    "doc-2",
+                    s3_key,
+                    s3_bucket,
+                    batch2_captured_at,
+                )
+            ],
+            [],
+        ]
+    )
+    mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cursor)
+    mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+
+    with (
+        patch.object(
+            sys,
+            "argv",
+            ["backfill_oc_ruling_text.py", "--dry-run", "--batch-size", "1"],
+        ),
+        patch.dict(os.environ, {"DATABASE_URL": "postgres://test"}),
+        patch("backfill_oc_ruling_text.boto3") as mock_boto3,
+        patch("backfill_oc_ruling_text.psycopg") as mock_psycopg,
+    ):
+        mock_boto3.client.return_value = mock_s3
+        mock_psycopg.connect.return_value = mock_conn
+
+        backfill_oc.main()
+
+    # Verify cursor advances: extract the SELECT query params from each call
+    select_calls = [call for call in mock_cursor.execute.call_args_list if "SELECT" in call[0][0]]
+    assert len(select_calls) == 3, f"Expected 3 SELECT calls, got {len(select_calls)}"
+
+    # First call should use minimum cursor values
+    first_params = select_calls[0][0][1]
+    assert first_params[0] == backfill_oc._CURSOR_MIN_TIMESTAMP
+    assert first_params[1] == backfill_oc._CURSOR_MIN_UUID
+
+    # Second call should use batch 1's last row cursor
+    second_params = select_calls[1][0][1]
+    assert second_params[0] == batch1_captured_at
+    assert second_params[1] == "ruling-1"
+
+    # Third call should use batch 2's last row cursor
+    third_params = select_calls[2][0][1]
+    assert third_params[0] == batch2_captured_at
+    assert third_params[1] == "ruling-2"
+
+
+def test_no_offset_in_query() -> None:
+    """The fetch query must not contain OFFSET (anti-pattern)."""
+    assert "OFFSET" not in backfill_oc.FETCH_RULINGS_QUERY
