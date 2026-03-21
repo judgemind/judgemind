@@ -19,23 +19,10 @@ import { join, basename } from 'node:path';
 import { execSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import pg from 'pg';
+import { parseDatabaseUrl } from '../dist/data-access/parse-database-url.js';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 const apiDir = join(__dirname, '..');
-
-// The pg driver (v8.x) maps sslmode=require to verify-full, which can fail
-// against RDS depending on the Node.js base image CA bundle. Strip the sslmode
-// parameter from the URL and configure SSL via the Client's ssl option instead,
-// using rejectUnauthorized: false (encrypt without certificate verification —
-// matching standard libpq sslmode=require semantics).
-// This mirrors the logic in src/data-access/db.ts.
-function parseDatabaseUrl(url) {
-  const needsSsl = /[?&]sslmode=/.test(url);
-  const connectionString = needsSsl
-    ? url.replace(/[?&]sslmode=[^&]*/g, '').replace(/\?$/, '')
-    : url;
-  return { connectionString, ssl: needsSsl ? { rejectUnauthorized: false } : false };
-}
 
 async function seedMigrations() {
   const dbUrl = process.env.DATABASE_URL;
@@ -129,9 +116,9 @@ async function main() {
     // so node-pg-migrate's internal pg connection uses SSL without certificate
     // verification. This avoids needing the global NODE_TLS_REJECT_UNAUTHORIZED=0.
     const dbUrl = process.env.DATABASE_URL;
-    const { connectionString } = parseDatabaseUrl(dbUrl);
+    const { connectionString, ssl } = parseDatabaseUrl(dbUrl);
     const migrateEnv = { ...process.env, DATABASE_URL: connectionString };
-    if (/[?&]sslmode=/.test(dbUrl)) {
+    if (ssl) {
       migrateEnv.PGSSLMODE = 'no-verify';
     }
     execSync('npx node-pg-migrate up --no-timestamp', {
