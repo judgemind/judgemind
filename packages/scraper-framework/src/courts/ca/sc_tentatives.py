@@ -27,7 +27,7 @@ PDF structure (all departments):
            "Honorable Firstname Lastname, Presiding"
   Date:    "DATE: Month DD, YYYY" or "Month DD, YYYY" (standalone line)
   Cases:   "LINE N  CASENO  CaseTitle  MotionType" followed by ruling text
-  Case numbers: DDCVDDDDDD format (e.g. 24CV443183, 25CV460465)
+  Case numbers: DD{CV,PR}DDDDDD format (e.g. 24CV443183, 25PR199782)
 
 Judge-to-department mapping is extracted from the landing page, where both
 "Dept. N" and "Judge Name" links share the same URL.
@@ -84,13 +84,13 @@ _DATE_RE = re.compile(
     r"|October|November|December)\s+\d{1,2},?\s+\d{4})",
 )
 
-# Case number: 2-digit year prefix + CV + 6 digits (e.g. 24CV443183, 25CV460465)
-_CASE_NUMBER_RE = re.compile(r"\b\d{2}CV\d{6}\b")
+# Case number: 2-digit year prefix + CV or PR + 6 digits (e.g. 24CV443183, 25PR199782)
+_CASE_NUMBER_RE = re.compile(r"\b\d{2}(?:CV|PR)\d{6}\b")
 
 # Case line in summary table: "LINE N CASENO CaseTitle MotionType/TentativeRuling"
 # Also handles lines like "9:00 24CV443183" and ";"-separated lines
 _CASE_LINE_RE = re.compile(
-    r"(?:LINE\s+)?(?:\d+[,;]?\s+)?(?P<case_number>\d{2}CV\d{6})\s+"
+    r"(?:LINE\s+)?(?:\d+[,;]?\s+)?(?P<case_number>\d{2}(?:CV|PR)\d{6})\s+"
     r"(?P<case_title>[^\n]+?)(?:\s{2,})(?P<motion_or_ruling>[^\n]+)",
 )
 

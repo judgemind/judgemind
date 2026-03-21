@@ -265,13 +265,34 @@ def test_sc_case_numbers_dept16() -> None:
 
 
 def test_sc_case_number_format() -> None:
-    """All extracted case numbers should match the expected format."""
+    """All extracted case numbers should match the expected format (CV or PR prefix)."""
     text = extract_pdf_text(_load_bytes("sc_dept6_tues.pdf"))
     case_numbers = parse_all_case_numbers(text)
     import re
 
     for cn in case_numbers:
-        assert re.match(r"\d{2}CV\d{6}$", cn), f"Unexpected format: {cn}"
+        assert re.match(r"\d{2}(?:CV|PR)\d{6}$", cn), f"Unexpected format: {cn}"
+
+
+def test_sc_case_number_probate_format() -> None:
+    """parse_case_number should recognize probate (PR) case numbers."""
+    assert parse_case_number("Case No.: 25PR199782") == "25PR199782"
+    assert parse_case_number("25PR200035") == "25PR200035"
+
+
+def test_sc_case_numbers_mixed_cv_and_pr() -> None:
+    """parse_all_case_numbers should find both CV and PR format numbers."""
+    text = "LINE 1 24CV443183 Smith v Jones  Demurrer\nLINE 2 25PR199782 Estate of Doe  Petition"
+    case_numbers = parse_all_case_numbers(text)
+    assert "24CV443183" in case_numbers
+    assert "25PR199782" in case_numbers
+    assert len(case_numbers) == 2
+
+
+def test_sc_case_number_probate_not_other_prefixes() -> None:
+    """Only CV and PR prefixes should be matched, not arbitrary two-letter codes."""
+    assert parse_case_number("25XX199782") is None
+    assert parse_case_number("25AB199782") is None
 
 
 # ---------------------------------------------------------------------------
