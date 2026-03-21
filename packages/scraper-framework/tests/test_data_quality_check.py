@@ -396,11 +396,13 @@ class Test24hOverlapsPostingDay:
         thursday = datetime(2026, 3, 19, 12, 0, 0, tzinfo=UTC)
         assert _24h_overlaps_posting_day(thursday, ["Mon", "Tue", "Wed", "Thu"]) is True
 
-    def test_yesterday_is_posting_day(self) -> None:
-        """Returns True when yesterday is a posting day (24h window reaches back)."""
-        # 2026-03-20 is Friday; Thursday (yesterday) is a posting day
+    def test_yesterday_is_posting_day_but_today_is_not(self) -> None:
+        """Returns False when yesterday was a posting day but today is not."""
+        # 2026-03-20 is Friday; Thursday (yesterday) was a posting day,
+        # but Friday is not in the Mon-Thu schedule.  Zero rulings on a
+        # non-posting day is expected — the staleness check covers gaps.
         friday = datetime(2026, 3, 20, 12, 0, 0, tzinfo=UTC)
-        assert _24h_overlaps_posting_day(friday, ["Mon", "Tue", "Wed", "Thu"]) is True
+        assert _24h_overlaps_posting_day(friday, ["Mon", "Tue", "Wed", "Thu"]) is False
 
     def test_neither_today_nor_yesterday_is_posting_day(self) -> None:
         """Returns False when neither today nor yesterday is a posting day."""
@@ -417,6 +419,13 @@ class Test24hOverlapsPostingDay:
         """Monday is a posting day even though yesterday (Sunday) isn't."""
         monday = datetime(2026, 3, 23, 12, 0, 0, tzinfo=UTC)
         assert _24h_overlaps_posting_day(monday, ["Mon", "Tue", "Wed", "Thu"]) is True
+
+    def test_saturday_with_mon_fri_posting(self) -> None:
+        """Saturday is NOT a posting day for Mon-Fri schedule (issue #1407)."""
+        # 2026-03-21 is Saturday at 16:49 UTC — simulates the Ventura
+        # false-positive scenario where Friday was the last posting day.
+        saturday = datetime(2026, 3, 21, 16, 49, 0, tzinfo=UTC)
+        assert _24h_overlaps_posting_day(saturday, ["Mon", "Tue", "Wed", "Thu", "Fri"]) is False
 
     def test_invalid_day_names_ignored(self) -> None:
         """Invalid day names are silently skipped."""
@@ -476,8 +485,13 @@ class TestCheckIngestRatesPostingDays:
         assert alerts[0].metric == "zero_rulings"
         assert alerts[0].severity == "p1"
 
-    def test_zero_rulings_fires_day_after_posting_day(self) -> None:
-        """P1 alert fires on Friday because yesterday (Thu) was a posting day."""
+    def test_zero_rulings_suppressed_day_after_posting_day(self) -> None:
+        """No alert on Friday (non-posting day) even though Thu was a posting day.
+
+        With Mon-Thu schedule, Friday is not a posting day.  Zero rulings
+        on a non-posting day is expected — the staleness check covers the
+        gap.  This prevents false positives like issue #1407.
+        """
         friday = datetime(2026, 3, 20, 12, 0, 0, tzinfo=UTC)
         conn = FakeConnection(
             {
@@ -496,8 +510,63 @@ class TestCheckIngestRatesPostingDays:
             }
         )
         alerts = check_ingest_rates(conn, friday, baselines)
+        assert len(alerts) == 0
+
+    def test_zero_rulings_fires_on_posting_day_after_posting_day(self) -> None:
+        """P1 alert fires on Tuesday (posting day) with zero rulings (#1407 criterion 3).
+
+        Tuesday is a posting day (Mon-Fri schedule).  Monday was also a
+        posting day.  Zero rulings should trigger the alert because today
+        is a posting day.
+        """
+        # 2026-03-24 is Tuesday
+        tuesday = datetime(2026, 3, 24, 12, 0, 0, tzinfo=UTC)
+        conn = FakeConnection(
+            {
+                "d.created_at <": [],
+                "d.created_at >=": [],
+                "DISTINCT ct.county": [("Ventura",)],
+            }
+        )
+        baselines = _make_baselines(
+            {
+                "Ventura": {
+                    "expected_daily_rulings": 5,
+                    "schedule_type": "daily",
+                    "posting_days": ["Mon", "Tue", "Wed", "Thu", "Fri"],
+                },
+            }
+        )
+        alerts = check_ingest_rates(conn, tuesday, baselines)
         assert len(alerts) == 1
         assert alerts[0].metric == "zero_rulings"
+        assert alerts[0].severity == "p1"
+
+    def test_zero_rulings_suppressed_saturday_mon_fri_schedule(self) -> None:
+        """No alert on Saturday for county with Mon-Fri posting schedule (#1407).
+
+        This is the exact false-positive scenario from the issue: Ventura
+        has Mon-Fri posting, Saturday 16:49 UTC should not fire.
+        """
+        saturday = datetime(2026, 3, 21, 16, 49, 0, tzinfo=UTC)
+        conn = FakeConnection(
+            {
+                "d.created_at <": [],
+                "d.created_at >=": [],
+                "DISTINCT ct.county": [("Ventura",)],
+            }
+        )
+        baselines = _make_baselines(
+            {
+                "Ventura": {
+                    "expected_daily_rulings": 5,
+                    "schedule_type": "daily",
+                    "posting_days": ["Mon", "Tue", "Wed", "Thu", "Fri"],
+                },
+            }
+        )
+        alerts = check_ingest_rates(conn, saturday, baselines)
+        assert len(alerts) == 0
 
     def test_no_posting_days_config_always_alerts(self) -> None:
         """Counties without posting_days config always alert on zero rulings."""

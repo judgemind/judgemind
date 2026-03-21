@@ -519,14 +519,15 @@ def _24h_overlaps_posting_day(
     now: datetime,
     posting_days: list[str] | None,
 ) -> bool:
-    """Return True if the 24h window ending at *now* overlaps a posting day.
+    """Return True if *today* is a posting day.
 
     When *posting_days* is ``None`` or empty, every day is considered a
     posting day and the function returns ``True``.
 
-    The 24h window spans two calendar days: *today* and *yesterday*.  If
-    either is in the posting schedule, the court was expected to post
-    content that would appear in the window.
+    Only today is checked — not yesterday.  On non-posting days, zero
+    new rulings is expected regardless of whether yesterday was a posting
+    day.  The separate staleness check handles the case where content is
+    too old.
     """
     if not posting_days:
         return True
@@ -543,8 +544,7 @@ def _24h_overlaps_posting_day(
         return True
 
     today_wd = now.weekday()  # Mon=0 .. Sun=6
-    yesterday_wd = (today_wd - 1) % 7
-    return today_wd in posting_weekdays or yesterday_wd in posting_weekdays
+    return today_wd in posting_weekdays
 
 
 def check_ingest_rates(
