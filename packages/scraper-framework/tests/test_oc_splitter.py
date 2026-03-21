@@ -17,6 +17,7 @@ import pytest
 
 from courts.ca.pdf_link_scraper import _extract_pdf_text
 from ingestion.oc_splitter import (
+    _is_boilerplate_only,
     _split_case_number_based,
     _split_north,
     split_oc_document,
@@ -974,3 +975,196 @@ class TestSingleCasePassthrough:
         }
         results = split_document(event)
         assert len(results) == 1
+
+
+# ---------------------------------------------------------------------------
+# Boilerplate-only filter tests (#1253)
+# ---------------------------------------------------------------------------
+
+
+class TestIsBoilerplateOnly:
+    """Tests for the _is_boilerplate_only() filter function (#1253).
+
+    The OC splitter sometimes produces split results that contain only
+    the calendar header boilerplate without any case-specific ruling text.
+    These boilerplate-only results should be filtered out.
+    """
+
+    def test_short_header_only_text_is_boilerplate(self) -> None:
+        """Text with only 'TENTATIVE RULINGS' header content is boilerplate."""
+        text = (
+            "TENTATIVE RULINGS\n"
+            "LAW & MOTION CALENDAR\n"
+            "Judge Deborah C. Servino\n"
+            "DEPT N15\n"
+            "Date: March 16, 2026\n"
+            "Time: 2:00 PM\n"
+            "If you are submitting to the tentative, please call the Clerk.\n"
+            "#  Case Name  Tentative\n"
+        )
+        assert _is_boilerplate_only(text) is True
+
+    def test_substantive_ruling_is_not_boilerplate(self) -> None:
+        """Text with actual ruling content is not boilerplate."""
+        text = (
+            "1 Avila vs. Southern California Motion for Summary Judgment\n"
+            "The Court has considered the moving, opposing, and reply papers.\n"
+            "The motion for summary judgment is DENIED.\n"
+            "Defendant has not met its burden of showing that there is no\n"
+            "triable issue of material fact. The Court finds that plaintiff\n"
+            "has raised a triable issue as to whether defendant was negligent\n"
+            "in its maintenance of the rail crossing.\n"
+            "Moving party to give notice.\n"
+        )
+        assert _is_boilerplate_only(text) is False
+
+    def test_long_header_text_is_boilerplate(self) -> None:
+        """Even slightly longer header text without case content is boilerplate."""
+        text = (
+            "TENTATIVE RULINGS\n"
+            "LAW & MOTION CALENDAR\n"
+            "Judge Deborah C. Servino\n"
+            "DEPT N15\n"
+            "Date: March 16, 2026\n"
+            "Time: 2:00 PM\n"
+            "North Justice Center\n"
+            "If you are submitting to the tentative, please call the\n"
+            "Clerk at (657) 622-5298.\n"
+            "Any party may request oral argument.\n"
+            "#  Case Name  Tentative\n"
+        )
+        assert _is_boilerplate_only(text) is True
+
+    def test_short_but_substantive_ruling_is_not_boilerplate(self) -> None:
+        """A short ruling with actual case content is not boilerplate."""
+        text = (
+            "1 Smith vs. Jones Demurrer\nThe demurrer is SUSTAINED with 10 days leave to amend.\n"
+        )
+        assert _is_boilerplate_only(text) is False
+
+    def test_empty_text_is_boilerplate(self) -> None:
+        """Empty text is treated as boilerplate."""
+        assert _is_boilerplate_only("") is True
+
+    def test_whitespace_only_is_boilerplate(self) -> None:
+        """Whitespace-only text is boilerplate."""
+        assert _is_boilerplate_only("   \n  \n  ") is True
+
+    def test_header_with_case_content_below_is_not_boilerplate(self) -> None:
+        """Header + actual ruling content is not boilerplate."""
+        text = (
+            "TENTATIVE RULINGS\n"
+            "LAW & MOTION CALENDAR\n"
+            "Judge Deborah C. Servino\n"
+            "1 Avila vs. Southern California Motion for Summary Judgment\n"
+            "The motion is DENIED. Defendant has not met its burden.\n"
+            "Moving party to give notice.\n"
+        )
+        assert _is_boilerplate_only(text) is False
+
+    def test_ruling_with_boilerplate_keyword_is_not_boilerplate(self) -> None:
+        """A ruling containing 'oral argument' is NOT boilerplate if it has outcome."""
+        text = (
+            "TENTATIVE RULINGS\n"
+            "The request for oral argument is denied; the motion is taken under submission.\n"
+        )
+        # Even though this contains "TENTATIVE RULINGS" and "oral argument",
+        # the second line also contains "denied" (a ruling keyword), so it
+        # should be counted as substantive.
+        assert _is_boilerplate_only(text) is False
+
+    def test_avila_boilerplate_example(self) -> None:
+        """The specific Avila boilerplate example from issue #1253."""
+        # ~598 chars of header only, as described in the issue
+        text = (
+            "TENTATIVE RULINGS\n"
+            "LAW & MOTION CALENDAR\n"
+            "Judge Deborah C. Servino\n"
+            "DEPT N15\n"
+            "Date: March 16, 2026\n"
+            "Time: 2:00 PM\n"
+            "North Justice Center\n"
+            "1141 N. Rice Street\n"
+            "Anaheim, CA 92801\n"
+            "If you are submitting to the tentative, please call the\n"
+            "Clerk at (657) 622-5298 by 3:30 p.m.\n"
+            "Any party may request oral argument.\n"
+            "If ALL parties submit to the tentative, oral argument will\n"
+            "not be scheduled.\n"
+            "#  Case Name  Tentative\n"
+        )
+        assert _is_boilerplate_only(text) is True
+
+
+class TestBoilerplateFilterIntegration:
+    """Tests that boilerplate-only results are filtered out of split results (#1253)."""
+
+    def test_north_split_filters_boilerplate_header(self) -> None:
+        """When a North split produces a boilerplate-only entry, it is removed."""
+        # Simulate a document where the header area might create a false
+        # boundary before the real case entries.
+        text = (
+            "TENTATIVE RULINGS\n"
+            "LAW & MOTION CALENDAR\n"
+            "Judge Deborah C. Servino\n"
+            "DEPT N15\n"
+            "Date: March 16, 2026\n"
+            "#\n"
+            "1 Avila vs. Southern California Motion for Summary Judgment\n"
+            "The motion is DENIED.\n"
+            "Defendant has not met its burden of showing no triable issue.\n"
+            "2 Smith vs. Jones Demurrer to Complaint\n"
+            "The demurrer is SUSTAINED with 10 days leave to amend.\n"
+        )
+        event = {"ruling_text": text, "department": "N15"}
+        results = split_oc_document(event)
+        # Should have 2 results, not 3 (no boilerplate-only entry)
+        assert len(results) == 2
+        for r in results:
+            assert not _is_boilerplate_only(r.ruling_text)
+
+    def test_case_number_split_filters_boilerplate_header(self) -> None:
+        """When a case-number split produces a boilerplate header, it is removed."""
+        text = (
+            "TENTATIVE RULINGS\n"
+            "LAW & MOTION CALENDAR\n"
+            "DEPT C25\n"
+            "Date: March 16, 2026\n"
+            "#  Case Name  Tentative\n"
+            "1. Smith vs. Jones Motion for Summary Judgment\n"
+            "25-01455183\n"
+            "The motion is GRANTED in its entirety.\n"
+            "Defendant shall prepare a proposed order.\n"
+            "2. Doe vs. Roe Demurrer to Complaint\n"
+            "24-01428812\n"
+            "The demurrer is OVERRULED.\n"
+        )
+        event = {"ruling_text": text, "department": "C25"}
+        results = split_oc_document(event)
+        # All results should have substantive content
+        for r in results:
+            assert not _is_boilerplate_only(r.ruling_text)
+
+    def test_all_boilerplate_returns_empty(self) -> None:
+        """If all split results are boilerplate, return empty (triggers pass-through)."""
+        # This is a degenerate case — shouldn't happen in practice but we
+        # should handle it gracefully.
+        text = "TENTATIVE RULINGS\nLAW & MOTION CALENDAR\nDEPT N15\n"
+        event = {"ruling_text": text, "department": "N15"}
+        results = split_oc_document(event)
+        # _split_north returns empty for < 2 entries, so split_oc_document
+        # falls through to _split_case_number_based which also returns empty.
+        # The framework's split_document() then passes through unchanged.
+        assert len(results) == 0 or all(not _is_boilerplate_only(r.ruling_text) for r in results)
+
+    def test_filter_preserves_legitimate_short_rulings(self) -> None:
+        """Short rulings with actual case content are NOT filtered out."""
+        text = (
+            "1 Alpha vs. Beta Demurrer\n"
+            "The demurrer is SUSTAINED.\n"
+            "2 Gamma vs. Delta OSC\n"
+            "Continued to April 15, 2026.\n"
+        )
+        event = {"ruling_text": text, "department": "N15"}
+        results = split_oc_document(event)
+        assert len(results) == 2
