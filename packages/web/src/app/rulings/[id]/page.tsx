@@ -3,6 +3,7 @@ import { notFound } from 'next/navigation';
 import Link from 'next/link';
 import { createApolloClient } from '@/lib/apollo-client';
 import { formatDate, formatLabel, formatOutcome } from '@/lib/display-helpers';
+import { sanitizeRulingHtml } from '@/lib/sanitize-html';
 import { RulingDetail } from './RulingDetail';
 import { Card, CardContent } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
@@ -102,6 +103,13 @@ export default async function RulingDetailPage({ params }: Props) {
   const motionLabel = rulingData.motionType
     ? formatLabel(rulingData.motionType)
     : 'Ruling';
+
+  // Sanitize ruling HTML in the server component where isomorphic-dompurify
+  // can use jsdom natively, then pass the safe HTML to the client component.
+  // This avoids bundling jsdom into the client SSR bundle (which causes 500s).
+  const sanitizedHtml = rulingData.rulingTextHtml
+    ? sanitizeRulingHtml(rulingData.rulingTextHtml)
+    : null;
 
   return (
     <div className="mx-auto max-w-4xl">
@@ -234,7 +242,7 @@ export default async function RulingDetailPage({ params }: Props) {
 
       {/* Client component handles ruling text, case link, judge link, document download */}
       <div className="mt-6">
-        <RulingDetail ruling={rulingData} />
+        <RulingDetail ruling={rulingData} sanitizedRulingTextHtml={sanitizedHtml} />
       </div>
     </div>
   );

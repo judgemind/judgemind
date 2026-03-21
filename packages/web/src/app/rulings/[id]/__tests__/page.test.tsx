@@ -27,6 +27,12 @@ vi.mock('next/navigation', () => ({
   useSearchParams: () => new URLSearchParams(),
 }));
 
+// Stub sanitize-html — the server component calls sanitizeRulingHtml
+// before passing HTML to the client component
+vi.mock('@/lib/sanitize-html', () => ({
+  sanitizeRulingHtml: (html: string) => html,
+}));
+
 // Stub client-side component used inside the page
 vi.mock('../RulingDetail', () => ({
   RulingDetail: () => null,
