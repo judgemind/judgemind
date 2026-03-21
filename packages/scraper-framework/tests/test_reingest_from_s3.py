@@ -1708,6 +1708,25 @@ class TestExtractTextFromContent:
         assert result == "some text content"
 
 
+class TestIsRealCaseNumber:
+    """Tests for the _is_real_case_number helper."""
+
+    def test_none_is_not_real(self) -> None:
+        assert reingest._is_real_case_number(None) is False
+
+    def test_empty_string_is_not_real(self) -> None:
+        assert reingest._is_real_case_number("") is False
+
+    def test_unknown_prefix_is_not_real(self) -> None:
+        assert reingest._is_real_case_number("UNKNOWN-107555aa-80bf") is False
+
+    def test_real_case_number(self) -> None:
+        assert reingest._is_real_case_number("25PR199782") is True
+
+    def test_cv_case_number(self) -> None:
+        assert reingest._is_real_case_number("24CV123456") is True
+
+
 # ---------------------------------------------------------------------------
 # _reparse_document tests — PdfLinkScraper subclasses
 # ---------------------------------------------------------------------------
