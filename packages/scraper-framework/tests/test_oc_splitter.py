@@ -19,6 +19,7 @@ import pytest
 from courts.ca.pdf_link_scraper import _extract_pdf_text
 from ingestion.oc_splitter import (
     _clean_case_title,
+    _complete_truncated_vs_title,
     _extract_case_title_from_entry,
     _extract_leading_name_fragment,
     _extract_multiline_case_title,
@@ -805,10 +806,6 @@ class TestNorthFixture:
             assert r.case_title is not None
             assert "vs" in r.case_title.lower(), f"Entry missing 'vs' in title: {r.case_title}"
 
-    @pytest.mark.xfail(
-        reason="Pre-existing bug: 'Castillo vs' has no defendant name",
-        strict=True,
-    )
     def test_case_titles_are_clean(self, north_text: str) -> None:
         """Case titles should be clean names, not garbled with ruling text (#1357)."""
         results = _split_north(north_text)
@@ -988,10 +985,6 @@ class TestApkarianFixture:
                     f"Entries should not overlap. Line: {first_line!r}"
                 )
 
-    @pytest.mark.xfail(
-        reason="Pre-existing bug: 'Saetern vs' has no defendant name",
-        strict=True,
-    )
     def test_case_titles_are_clean(self, apkarian_text: str) -> None:
         """Case titles should be clean names, not garbled with ruling text (#1357)."""
         results = _split_case_number_based(apkarian_text)
@@ -1147,10 +1140,6 @@ class TestComplexFixture:
                 f">= 50% of full page ({full_len}). Should be case-specific text only."
             )
 
-    @pytest.mark.xfail(
-        reason="Pre-existing bug: 'Valdez vs' has no defendant name",
-        strict=True,
-    )
     def test_case_titles_are_clean(self, cx_text: str) -> None:
         """Case titles should be clean names, not garbled with ruling text (#1357)."""
         results = _split_case_number_based(cx_text)
@@ -1517,10 +1506,6 @@ class TestNorthN15Fixture:
         texts = [r.ruling_text for r in results]
         assert len(set(texts)) == len(texts)
 
-    @pytest.mark.xfail(
-        reason="Pre-existing bug: N15 'A Plus Autobody' title garbled with ruling text (len=83)",
-        strict=True,
-    )
     def test_case_titles_are_clean(self, n15_text: str) -> None:
         """Case titles should be clean names, not garbled with ruling text (#1357)."""
         results = _split_north(n15_text)
@@ -2050,6 +2035,166 @@ class TestCleanCaseTitle:
         result = _clean_case_title(raw)
         assert "GRANTED" not in result
         assert "Compel" not in result
+
+
+class TestCleanCaseTitleRulingTextStart:
+    """Tests for _clean_case_title ruling-text-start phrase truncation (#1390)."""
+
+    def test_strips_there_is_no(self) -> None:
+        raw = "A Plus Autobody, Inc. vs. Ly There is no full written tentative ruling"
+        result = _clean_case_title(raw)
+        assert result == "A Plus Autobody, Inc. vs. Ly"
+
+    def test_strips_before_the_court_with_defendant(self) -> None:
+        raw = "Corzine v. Riemann Before the Court at present is the unopposed"
+        result = _clean_case_title(raw)
+        assert "Before the Court" not in result
+        assert "Riemann" in result
+
+    def test_preserves_before_court_as_defendant(self) -> None:
+        # When "Before the Court" immediately follows "v.", it might be the
+        # defendant name — should not be truncated.
+        raw = "Myers v. Before the Court is a demurrer"
+        result = _clean_case_title(raw)
+        # The title should not lose text after "v." when there's no defendant
+        # name between "v." and the phrase.
+        assert "v." in result
+
+    def test_strips_the_motion(self) -> None:
+        raw = "Smith vs. Jones The motion is hereby granted"
+        result = _clean_case_title(raw)
+        assert "motion" not in result.lower()
+
+    def test_strips_moves_the_court(self) -> None:
+        raw = "Garcia vs. Lopez moves the court for an order"
+        result = _clean_case_title(raw)
+        assert "moves the court" not in result
+
+    def test_strips_is_set_for(self) -> None:
+        raw = "Brown vs. White is set for hearing on April 5"
+        result = _clean_case_title(raw)
+        assert "set for" not in result
+
+    def test_strips_order_to_show_cause(self) -> None:
+        raw = "Tong vs. Le Order to Show Cause re: Preliminary Injunction"
+        result = _clean_case_title(raw)
+        assert result == "Tong vs. Le"
+
+    def test_no_vs_truncation(self) -> None:
+        # When there's no "vs" in the title, ruling text should still be
+        # stripped (covers line 310 — the "no vs" branch).
+        raw = "Some Title Before the Court is the motion"
+        result = _clean_case_title(raw)
+        assert "Before the Court" not in result
+
+
+class TestCompleteTruncatedVsTitle:
+    """Tests for _complete_truncated_vs_title — finding defendant on next lines (#1390)."""
+
+    def test_finds_defendant_on_next_line(self) -> None:
+        lines = [
+            "1 Smith vs Demurrer to Complaint",
+            "Jones",
+            "Defendant Jones demurs to the complaint.",
+        ]
+        result = _complete_truncated_vs_title("Smith vs", lines, 0, 3)
+        assert result == "Smith vs Jones"
+
+    def test_returns_unchanged_if_not_truncated(self) -> None:
+        lines = ["1 Smith vs Jones Demurrer"]
+        result = _complete_truncated_vs_title("Smith vs Jones", lines, 0, 1)
+        assert result == "Smith vs Jones"
+
+    def test_skips_empty_lines(self) -> None:
+        lines = [
+            "1 Smith vs Demurrer",
+            "",
+            "Jones",
+        ]
+        result = _complete_truncated_vs_title("Smith vs", lines, 0, 3)
+        assert result == "Smith vs Jones"
+
+    def test_skips_ruling_text_prefixes(self) -> None:
+        lines = [
+            "1 Smith vs Motion to Compel",
+            "The court grants the motion.",
+            "Johnson",
+        ]
+        result = _complete_truncated_vs_title("Smith vs", lines, 0, 3)
+        # "The court" is a ruling-text prefix — should be skipped.
+        # "Johnson" is the defendant.
+        assert result == "Smith vs Johnson"
+
+    def test_skips_case_numbers(self) -> None:
+        lines = [
+            "1 Smith vs Motion",
+            "30-2024-01393434",
+            "Jones",
+        ]
+        result = _complete_truncated_vs_title("Smith vs", lines, 0, 3)
+        assert result == "Smith vs Jones"
+
+    def test_skips_digit_starting_lines(self) -> None:
+        lines = [
+            "1 Smith vs Motion",
+            "2025, is granted.",
+            "Jones",
+        ]
+        result = _complete_truncated_vs_title("Smith vs", lines, 0, 3)
+        assert result == "Smith vs Jones"
+
+    def test_stops_at_stopwords(self) -> None:
+        lines = [
+            "1 Smith vs Demurrer",
+            "Jones the defendant demurs",
+        ]
+        result = _complete_truncated_vs_title("Smith vs", lines, 0, 2)
+        assert result == "Smith vs Jones"
+
+    def test_stops_at_motion_keywords_case_insensitive(self) -> None:
+        lines = [
+            "1 Smith vs some text",
+            "Motion to Compel Arbitration",
+        ]
+        result = _complete_truncated_vs_title("Smith vs", lines, 0, 2)
+        # "Motion to" is a motion keyword — no name words.
+        # Should return original title.
+        assert result == "Smith vs"
+
+    def test_caps_at_3_words(self) -> None:
+        lines = [
+            "1 Smith vs some text",
+            "Johnson Baker Clark Davis Extra",
+        ]
+        result = _complete_truncated_vs_title("Smith vs", lines, 0, 2)
+        # Should cap at 3 words max.
+        assert result == "Smith vs Johnson Baker Clark"
+
+    def test_returns_unchanged_when_no_defendant_found(self) -> None:
+        lines = [
+            "1 Smith vs Demurrer",
+            "The court rules as follows.",
+            "Plaintiff is granted relief.",
+        ]
+        result = _complete_truncated_vs_title("Smith vs", lines, 0, 3)
+        # All continuation lines start with ruling-text prefixes.
+        assert result == "Smith vs"
+
+    def test_handles_vs_dot(self) -> None:
+        lines = [
+            "1 Smith vs. Motion to Extend",
+            "Jones",
+        ]
+        result = _complete_truncated_vs_title("Smith vs.", lines, 0, 2)
+        assert result == "Smith vs. Jones"
+
+    def test_strips_word_punctuation(self) -> None:
+        lines = [
+            "1 Smith vs Motion",
+            "Jones,",
+        ]
+        result = _complete_truncated_vs_title("Smith vs", lines, 0, 2)
+        assert result == "Smith vs Jones"
 
 
 class TestExtractCaseTitleFromEntry:

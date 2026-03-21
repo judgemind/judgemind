@@ -157,6 +157,16 @@ def _split_north(text: str) -> list[SplitResult]:
         # Clean ruling/motion text that may have leaked into the case name.
         clean_name = _clean_case_title(full_name)
 
+        # If the cleaned title ends with "vs"/"vs." (defendant name missing
+        # because it was on a continuation line that the original parsing
+        # didn't capture), try to find the defendant on subsequent lines.
+        clean_name = _complete_truncated_vs_title(
+            clean_name,
+            lines,
+            line_idx,
+            next_entry_line,
+        )
+
         results.append(
             SplitResult(
                 ruling_text=ruling_text,
@@ -273,8 +283,110 @@ def _clean_case_title(raw_title: str) -> str:
         flags=re.IGNORECASE,
     ).strip()
 
+    # Truncate at ruling-text-start phrases that leak from the right column
+    # of two-column PDF layouts (e.g. "There is no full written tentative
+    # ruling", "Before the Court at present is").
+    # Only apply when there's a defendant name after "vs"/"v." — if the phrase
+    # immediately follows "vs."/"v.", it might BE the defendant name (e.g.
+    # "Myers v. Before the Court..." where cutting would lose the defendant).
+    _ruling_text_start = re.compile(
+        r"\s+(?:There\s+is\s+no|Before\s+the\s+Court|"
+        r"The\s+(?:motion|demurrer|petition|court|matter|case)|"
+        r"(?:moves|moved)\s+the\s+court|"
+        r"is\s+set\s+for)\b.*",
+        re.IGNORECASE,
+    )
+    ruling_match = _ruling_text_start.search(title)
+    if ruling_match:
+        # Check if there's a defendant name between "vs"/"v." and this phrase.
+        vs_match = re.search(r"\b(?:vs\.?|v\.)\s*", title, re.IGNORECASE)
+        if vs_match:
+            text_between = title[vs_match.end() : ruling_match.start()].strip()
+            # Only truncate if there's at least one word of defendant name.
+            if text_between:
+                title = title[: ruling_match.start()].strip()
+        else:
+            # No "vs" — safe to truncate.
+            title = title[: ruling_match.start()].strip()
+
+    # Truncate at "Order to Show Cause" which is a motion description that
+    # may not be caught by _MOTION_KEYWORDS if it appears mid-title.
+    title = re.sub(
+        r"\s+Order\s+to\s+Show\s+Cause\b.*",
+        "",
+        title,
+        flags=re.IGNORECASE,
+    ).strip()
+
     # Remove trailing punctuation and whitespace.
     title = title.rstrip(".,;:() ")
+
+    return title
+
+
+def _complete_truncated_vs_title(
+    title: str,
+    lines: list[str],
+    entry_line_idx: int,
+    next_entry_line_idx: int,
+) -> str:
+    """Complete a case title that ends with 'vs'/'vs.' by finding the defendant name.
+
+    When a motion keyword appears immediately after "vs." on the same line
+    (e.g. ``"Saetern vs. Motion to Extend..."``) or the defendant name wraps
+    to the next line in a two-column PDF, the title ends up truncated to just
+    ``"Plaintiff vs"``.  This function scans subsequent lines for a short
+    defendant-name fragment and appends it.
+
+    Returns the original title unchanged if it does not end with "vs"/"vs.",
+    or if no suitable defendant name is found on subsequent lines.
+    """
+    # Check if title ends with "vs", "vs.", or "v."
+    if not re.search(r"\b(?:vs\.?|v\.)\s*$", title, re.IGNORECASE):
+        return title
+
+    # Scan the next few lines for a defendant name.
+    max_scan = min(entry_line_idx + 8, next_entry_line_idx)
+    for j in range(entry_line_idx + 1, max_scan):
+        cand = lines[j].strip()
+        if not cand:
+            continue
+
+        # Skip lines that start with ruling-text indicators.
+        if _NOT_NAME_PREFIXES_RE.match(cand):
+            continue
+
+        # Skip lines that are case numbers.
+        if _CASE_NUMBER_RE.match(cand) or _THREE_PART_RE.match(cand):
+            continue
+
+        # Skip lines that start with a digit (sub-item numbers, dates).
+        if re.match(r"^\d", cand):
+            continue
+
+        # Take the first word(s) that look like a name.  Stop at stopwords,
+        # motion keywords, or ruling-text indicators.
+        words = cand.split()
+        name_words: list[str] = []
+        for w in words:
+            clean_w = _strip_possessive(w)
+            if not clean_w:
+                continue
+            if clean_w.lower() in _DEFENDANT_STOP_WORDS:
+                break
+            # Check if this starts a motion keyword phrase (case-insensitive).
+            remaining = " ".join(words[len(name_words) :])
+            remaining_lower = remaining.lower()
+            if any(remaining_lower.startswith(kw.lower()) for kw in _MOTION_KEYWORDS):
+                break
+            name_words.append(w.rstrip(".,;:()"))
+            # Cap at 3 words to avoid grabbing ruling text.
+            if len(name_words) >= 3:
+                break
+
+        if name_words:
+            defendant = " ".join(name_words)
+            return f"{title.rstrip()} {defendant}"
 
     return title
 
@@ -690,6 +802,16 @@ def _split_case_number_based(text: str) -> list[SplitResult]:
             )
             if title_is_incomplete:
                 case_title = multiline_title
+
+        # If the title still ends with "vs"/"vs." after all extraction
+        # attempts, try to find the defendant name on subsequent lines.
+        if case_title is not None:
+            case_title = _complete_truncated_vs_title(
+                case_title,
+                lines,
+                line_idx,
+                next_line_idx,
+            )
 
         # Extract motion type from the first line.
         motion_type: str | None = None
