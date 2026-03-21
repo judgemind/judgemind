@@ -316,16 +316,18 @@ def run_backfill(
 
                 for party in new_parties:
                     try:
+                        conn.execute("SAVEPOINT party_upsert")
                         _upsert_party_and_link(
                             conn, case_id_str, party["name"], party["role"]
                         )
+                        conn.execute("RELEASE SAVEPOINT party_upsert")
                     except Exception:
                         logger.warning(
-                            "Failed to upsert party %r for case %s, rolling back",
+                            "Failed to upsert party %r for case %s, rolling back to savepoint",
                             party["name"],
                             case_id_str,
                         )
-                        conn.rollback()
+                        conn.execute("ROLLBACK TO SAVEPOINT party_upsert")
 
             if stats["total_cases"] % 100 == 0:
                 if not dry_run:
