@@ -50,16 +50,19 @@ describe('sanitizeRulingHtml', () => {
     expect(sanitizeRulingHtml('')).toBe('');
   });
 
-  it('returns raw HTML during SSR (window undefined)', async () => {
+  it('sanitizes HTML during SSR (window undefined)', async () => {
     // Simulate server environment by removing window
     // @ts-expect-error -- intentionally removing window to simulate SSR
     delete globalThis.window;
 
     const { sanitizeRulingHtml } = await import('../sanitize-html');
-    const html = '<p>Raw content</p><script>alert("xss")</script>';
+    const html = '<p>Safe content</p><script>alert("xss")</script>';
     const result = sanitizeRulingHtml(html);
-    // On the server, the HTML should be returned as-is
-    expect(result).toBe(html);
+    // SSR now sanitizes too — script tags must be stripped
+    expect(result).toContain('Safe content');
+    expect(result).toContain('<p>');
+    expect(result).not.toContain('script');
+    expect(result).not.toContain('alert');
   });
 });
 
@@ -146,7 +149,7 @@ describe('sanitizeExcerptHtml', () => {
     const { sanitizeExcerptHtml } = await import('../sanitize-html');
     const html = 'Unsafe <script>alert("xss")</script>';
     const result = sanitizeExcerptHtml(html);
-    // Unlike sanitizeRulingHtml, excerpt sanitization runs on the server too
+    // Excerpt sanitization runs on the server too
     expect(result).not.toContain('script');
     expect(result).not.toContain('alert');
     expect(result).toContain('Unsafe');
