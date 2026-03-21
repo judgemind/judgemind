@@ -212,6 +212,42 @@ class TestCourtListenerClient:
         assert "Authorization" not in request.headers
         client.close()
 
+    def test_no_token_creates_client_without_auth(self) -> None:
+        """Client without token does not set Authorization header and does not raise."""
+        client = CourtListenerClient(request_delay=0)
+        # Verify internal state: no token means no auth header
+        assert "Authorization" not in client._client.headers
+        client.close()
+
+    @respx.mock
+    def test_401_raises_with_clear_message(self) -> None:
+        """Client raises HTTPStatusError on 401 with diagnostic logging."""
+        import pytest
+
+        body = {"detail": "Authentication credentials were not provided."}
+        respx.get(f"{API_BASE_URL}/clusters/").mock(return_value=httpx.Response(401, json=body))
+
+        client = CourtListenerClient(request_delay=0)
+        with pytest.raises(httpx.HTTPStatusError) as exc_info:
+            client.fetch_clusters(date_modified_after="2026-03-01")
+        assert exc_info.value.response.status_code == 401
+        client.close()
+
+    @respx.mock
+    def test_401_with_token_raises(self) -> None:
+        """Client raises HTTPStatusError on 401 even when token is configured."""
+        import pytest
+
+        respx.get(f"{API_BASE_URL}/clusters/").mock(
+            return_value=httpx.Response(401, json={"detail": "Invalid token."})
+        )
+
+        client = CourtListenerClient(api_token="expired-token", request_delay=0)
+        with pytest.raises(httpx.HTTPStatusError) as exc_info:
+            client.fetch_clusters(date_modified_after="2026-03-01")
+        assert exc_info.value.response.status_code == 401
+        client.close()
+
     @respx.mock
     def test_request_count_tracking(self) -> None:
         """Client tracks total request count."""

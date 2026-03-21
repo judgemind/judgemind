@@ -6,10 +6,14 @@
 # The compute schedule is enabled. The EventBridge Scheduler triggers a daily
 # scraper run at 6 AM PT.
 
-# Look up the residential proxy secret so we can pass its ARN to the compute
-# module without hardcoding the random Secrets Manager suffix.
+# Look up secrets so we can pass their ARNs to the compute module
+# without hardcoding the random Secrets Manager suffix.
 data "aws_secretsmanager_secret" "residential_proxy" {
   name = "judgemind/proxy/residential"
+}
+
+data "aws_secretsmanager_secret" "courtlistener_api_token" {
+  name = "judgemind/courtlistener/api-token"
 }
 
 module "networking" {
@@ -53,14 +57,15 @@ module "cache" {
 module "compute" {
   source = "../../modules/compute"
 
-  environment             = "production"
-  vpc_id                  = module.networking.vpc_id
-  private_subnet_ids      = module.networking.private_subnet_ids
-  ecr_repository_url      = module.ecr.repository_url
-  scraper_task_role_arn   = module.iam_scraper.role_arn
-  redis_url               = "redis://${module.cache.redis_endpoint}:${module.cache.redis_port}"
-  document_archive_bucket = module.document_archive.bucket_id
-  proxy_secret_arn        = data.aws_secretsmanager_secret.residential_proxy.arn
+  environment                        = "production"
+  vpc_id                             = module.networking.vpc_id
+  private_subnet_ids                 = module.networking.private_subnet_ids
+  ecr_repository_url                 = module.ecr.repository_url
+  scraper_task_role_arn              = module.iam_scraper.role_arn
+  redis_url                          = "redis://${module.cache.redis_endpoint}:${module.cache.redis_port}"
+  document_archive_bucket            = module.document_archive.bucket_id
+  proxy_secret_arn                   = data.aws_secretsmanager_secret.residential_proxy.arn
+  courtlistener_api_token_secret_arn = data.aws_secretsmanager_secret.courtlistener_api_token.arn
 
   # Production: 1 vCPU, 2 GB RAM, daily schedule at 6 AM PT
   task_cpu            = 1024
