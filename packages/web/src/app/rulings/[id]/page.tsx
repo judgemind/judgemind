@@ -2,7 +2,7 @@ import { gql } from '@apollo/client';
 import { notFound } from 'next/navigation';
 import Link from 'next/link';
 import { createApolloClient } from '@/lib/apollo-client';
-import { formatDate, formatLabel, formatOutcome } from '@/lib/display-helpers';
+import { formatDate, formatLabel, formatOutcome, getOutcomeBadgeClass } from '@/lib/display-helpers';
 import { sanitizeRulingHtml } from '@/lib/sanitize-html';
 import { RulingDetail } from './RulingDetail';
 import { Card, CardContent } from '@/components/ui/card';
@@ -70,14 +70,6 @@ interface RulingData {
   } | null;
 }
 
-const OUTCOME_VARIANT: Record<string, string> = {
-  granted: 'bg-green-100 text-green-800 border-green-200 dark:bg-green-900 dark:text-green-200 dark:border-green-800',
-  denied: 'bg-red-100 text-red-800 border-red-200 dark:bg-red-900 dark:text-red-200 dark:border-red-800',
-  granted_in_part:
-    'bg-yellow-100 text-yellow-800 border-yellow-200 dark:bg-yellow-900 dark:text-yellow-200 dark:border-yellow-800',
-  denied_in_part:
-    'bg-yellow-100 text-yellow-800 border-yellow-200 dark:bg-yellow-900 dark:text-yellow-200 dark:border-yellow-800',
-};
 
 type Props = { params: { id: string } };
 
@@ -139,11 +131,7 @@ export default async function RulingDetailPage({ params }: Props) {
         <div className="flex flex-wrap gap-2 pt-1">
           {/* Outcome badge */}
           <Badge
-            className={`${
-              rulingData.outcome && OUTCOME_VARIANT[rulingData.outcome]
-                ? OUTCOME_VARIANT[rulingData.outcome]
-                : 'bg-slate-100 text-slate-600 border-slate-200 dark:bg-slate-700 dark:text-slate-300 dark:border-slate-600'
-            }`}
+            className={getOutcomeBadgeClass(rulingData.outcome)}
           >
             {formatOutcome(rulingData.outcome)}
           </Badge>

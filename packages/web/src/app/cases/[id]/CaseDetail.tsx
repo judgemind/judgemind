@@ -10,6 +10,7 @@ import {
   formatDate,
   formatLabel,
   formatOutcome,
+  getOutcomeBadgeVariant,
   groupParties,
   stripMetadataHeaderHtml,
   type RulingMetadata,
@@ -126,12 +127,6 @@ interface RulingsData {
   };
 }
 
-const OUTCOME_VARIANT: Record<string, 'default' | 'secondary' | 'destructive' | 'outline'> = {
-  granted: 'default',
-  denied: 'destructive',
-  granted_in_part: 'secondary',
-  denied_in_part: 'secondary',
-};
 
 const PAGE_SIZE = 20;
 
@@ -455,11 +450,7 @@ export function CaseDetail({ caseId }: { caseId: string }) {
                     {node.judge?.canonicalName ?? ''}
                   </span>
                   <Badge
-                    variant={
-                      node.outcome
-                        ? (OUTCOME_VARIANT[node.outcome] ?? 'outline')
-                        : 'outline'
-                    }
+                    variant={getOutcomeBadgeVariant(node.outcome)}
                   >
                     {formatOutcome(node.outcome)}
                   </Badge>

@@ -5,7 +5,7 @@ import { useQuery, gql } from '@apollo/client';
 import { useRouter, useSearchParams } from 'next/navigation';
 import Link from 'next/link';
 import { Search, SlidersHorizontal, Calendar, Scale, Gavel } from 'lucide-react';
-import { formatDate } from '@/lib/display-helpers';
+import { formatDate, getOutcomeBadgeVariant } from '@/lib/display-helpers';
 import { sanitizeExcerptHtml } from '@/lib/sanitize-html';
 import { Autocomplete } from '@/components/Autocomplete';
 import { useCountyOptions, useJudgeNameOptions } from '@/lib/filter-options';
@@ -105,15 +105,6 @@ export const OUTCOME_LABELS: Record<string, string> = {
   other: 'Other',
 };
 
-/** Badge variant mapping for outcomes. */
-const OUTCOME_BADGE_VARIANT: Record<string, 'default' | 'secondary' | 'destructive' | 'outline'> = {
-  granted: 'default',
-  denied: 'destructive',
-  granted_in_part: 'secondary',
-  moot: 'outline',
-  continued: 'outline',
-  other: 'outline',
-};
 
 /** Build URL search params from the current filter state. */
 export function buildSearchParams(state: {
@@ -368,7 +359,7 @@ function FilterContent({
 function ResultCard({ node }: { node: SearchHitNode }) {
   const motionLabel = node.motionType ? MOTION_TYPE_LABELS[node.motionType] ?? node.motionType : null;
   const outcomeLabel = node.outcome ? OUTCOME_LABELS[node.outcome] ?? node.outcome : null;
-  const outcomeBadgeVariant = node.outcome ? (OUTCOME_BADGE_VARIANT[node.outcome] ?? 'outline') : 'outline';
+  const outcomeBadgeVariant = getOutcomeBadgeVariant(node.outcome);
 
   return (
     <Link href={`/rulings/${node.rulingId}`} className="block">
