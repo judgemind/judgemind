@@ -2,11 +2,13 @@
   "counties": {
     "Los Angeles": {
       "expected_daily_rulings": 50,
-      "schedule_type": "daily"
+      "schedule_type": "daily",
+      "posting_days": ["Mon", "Tue", "Wed", "Thu", "Fri"]
     },
     "Orange": {
       "expected_daily_rulings": 20,
-      "schedule_type": "daily"
+      "schedule_type": "daily",
+      "posting_days": ["Mon", "Tue", "Wed", "Thu", "Fri"]
     },
     "Santa Clara": {
       "expected_daily_rulings": 0.1,
@@ -20,15 +22,18 @@
     },
     "Riverside": {
       "expected_daily_rulings": 15,
-      "schedule_type": "daily"
+      "schedule_type": "daily",
+      "posting_days": ["Mon", "Tue", "Wed", "Thu", "Fri"]
     },
     "San Bernardino": {
       "expected_daily_rulings": 10,
-      "schedule_type": "daily"
+      "schedule_type": "daily",
+      "posting_days": ["Mon", "Tue", "Wed", "Thu", "Fri"]
     },
     "Ventura": {
       "expected_daily_rulings": 8,
-      "schedule_type": "daily"
+      "schedule_type": "daily",
+      "posting_days": ["Mon", "Tue", "Wed", "Thu", "Fri"]
     }
   },
   "field_completeness": {
