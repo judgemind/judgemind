@@ -24,7 +24,7 @@ from datetime import date
 
 import structlog
 
-from .llm_providers import call_llm
+from .llm_providers import call_llm, call_llm_with_images
 
 logger = structlog.get_logger(__name__)
 
@@ -175,6 +175,9 @@ def extract_text_from_pdf(content: str | bytes) -> str | None:
     Accepts either raw ``bytes`` or a ``str`` that was produced by decoding
     raw PDF bytes (common when PDF content is stored as a text field).
 
+    When pdfplumber returns no text (image-only PDF), falls back to OCR
+    via the LLM vision API (see ``ocr_pdf_text``).
+
     Returns the extracted text, or ``None`` if extraction fails or produces
     no text.  On failure, logs a warning and returns ``None`` so callers can
     fall back gracefully.
@@ -197,16 +200,218 @@ def extract_text_from_pdf(content: str | bytes) -> str | None:
 
     try:
         pages_text: list[str] = []
+        has_pages = False
         with pdfplumber.open(io.BytesIO(raw_bytes)) as pdf:
+            has_pages = len(pdf.pages) > 0
             for page in pdf.pages:
                 text = page.extract_text()
                 if text:
                     pages_text.append(text)
         if pages_text:
             return "\n\f\n".join(pages_text)
+
+        # No text extracted but the PDF has pages — likely an image-only PDF.
+        # Try OCR fallback via LLM vision API (#1332).
+        if has_pages:
+            logger.info(
+                "pdf_extraction.no_text_layer",
+                pdf_size=len(raw_bytes),
+                fallback="ocr_llm_vision",
+            )
+            ocr_result = ocr_pdf_text(raw_bytes)
+            if ocr_result:
+                return ocr_result
+
         return None
     except Exception:
         logger.warning("PDF text extraction failed", exc_info=True)
+        return None
+
+
+# ---------------------------------------------------------------------------
+# OCR fallback for image-only PDFs (#1332)
+# ---------------------------------------------------------------------------
+
+# Maximum number of PDF pages to OCR.  Prevents excessive LLM costs on
+# very large scanned documents.
+_OCR_MAX_PAGES = 10
+
+# Resolution (DPI) for rendering PDF pages to images for OCR.
+# 150 DPI balances readability with image size (token cost).
+_OCR_RESOLUTION = 150
+
+# Per-page timeout for the LLM vision call (seconds).
+_OCR_PAGE_TIMEOUT = 30.0
+
+# Total timeout for all pages combined (seconds).
+_OCR_TOTAL_TIMEOUT = 120.0
+
+_OCR_SYSTEM_PROMPT = (
+    "You are an OCR system for court documents. "
+    "Extract ALL text from the provided image of a court document page. "
+    "Preserve the original formatting as closely as possible: "
+    "line breaks, paragraph breaks, indentation, and spacing. "
+    "Do NOT interpret, summarize, or restructure the text. "
+    "Output ONLY the raw text content of the page, nothing else. "
+    "If the image is blank or unreadable, output an empty string."
+)
+
+
+def ocr_pdf_text(
+    pdf_bytes: bytes,
+    *,
+    max_pages: int = _OCR_MAX_PAGES,
+    page_timeout: float = _OCR_PAGE_TIMEOUT,
+    total_timeout: float = _OCR_TOTAL_TIMEOUT,
+) -> str | None:
+    """Extract text from an image-only PDF using LLM vision API.
+
+    Renders each PDF page to a PNG image using pdfplumber, then sends the
+    image to the configured LLM provider's vision API for OCR.
+
+    This is a fallback for PDFs where ``pdfplumber.extract_text()`` returns
+    no text (scanned/image-only documents).
+
+    Args:
+        pdf_bytes: Raw PDF file bytes.
+        max_pages: Maximum number of pages to OCR (default: 10).
+        page_timeout: Per-page LLM call timeout in seconds (default: 30).
+        total_timeout: Total timeout across all pages in seconds (default: 120).
+
+    Returns:
+        Extracted text joined with form-feed separators, or ``None`` if OCR
+        fails or returns no text.
+    """
+    import time as time_mod
+
+    start_time = time_mod.monotonic()
+
+    try:
+        page_images = _render_pdf_pages(pdf_bytes, max_pages)
+    except Exception:
+        logger.warning("ocr_pdf_text.render_failed", exc_info=True)
+        return None
+
+    if not page_images:
+        logger.warning("ocr_pdf_text.no_pages_rendered")
+        return None
+
+    logger.info(
+        "ocr_pdf_text.starting",
+        page_count=len(page_images),
+        max_pages=max_pages,
+    )
+
+    pages_text: list[str] = []
+    for i, (image_bytes, media_type) in enumerate(page_images):
+        # Check total timeout
+        elapsed = time_mod.monotonic() - start_time
+        if elapsed >= total_timeout:
+            logger.warning(
+                "ocr_pdf_text.total_timeout",
+                pages_completed=i,
+                total_pages=len(page_images),
+                elapsed_seconds=round(elapsed, 1),
+            )
+            break
+
+        remaining = total_timeout - elapsed
+        effective_timeout = min(page_timeout, remaining)
+
+        text = _ocr_single_page(image_bytes, media_type, page_index=i, timeout=effective_timeout)
+        if text:
+            pages_text.append(text)
+
+    if pages_text:
+        result = "\n\f\n".join(pages_text)
+        logger.info(
+            "ocr_pdf_text.success",
+            pages_ocrd=len(pages_text),
+            total_pages=len(page_images),
+            text_length=len(result),
+        )
+        return result
+
+    logger.warning(
+        "ocr_pdf_text.no_text_extracted",
+        pages_attempted=len(page_images),
+    )
+    return None
+
+
+def _render_pdf_pages(
+    pdf_bytes: bytes,
+    max_pages: int,
+) -> list[tuple[bytes, str]]:
+    """Render PDF pages to PNG images using pdfplumber.
+
+    Returns a list of ``(png_bytes, media_type)`` tuples.
+    """
+    import pdfplumber
+
+    results: list[tuple[bytes, str]] = []
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        for i, page in enumerate(pdf.pages):
+            if i >= max_pages:
+                logger.info(
+                    "ocr_pdf_text.page_limit_reached",
+                    max_pages=max_pages,
+                    total_pages=len(pdf.pages),
+                )
+                break
+
+            # Render page to image using pdfplumber
+            page_image = page.to_image(resolution=_OCR_RESOLUTION)
+            # Convert PIL Image to PNG bytes
+            img_buffer = io.BytesIO()
+            page_image.original.save(img_buffer, format="PNG")
+            png_bytes = img_buffer.getvalue()
+            results.append((png_bytes, "image/png"))
+
+    return results
+
+
+def _ocr_single_page(
+    image_bytes: bytes,
+    media_type: str,
+    *,
+    page_index: int,
+    timeout: float,
+) -> str | None:
+    """OCR a single page image via the LLM vision API.
+
+    Returns the extracted text, or ``None`` on failure.
+    """
+    try:
+        response = call_llm_with_images(
+            system_prompt=_OCR_SYSTEM_PROMPT,
+            text_message=f"Extract all text from this court document page (page {page_index + 1}).",
+            images=[(image_bytes, media_type)],
+            timeout=timeout,
+        )
+        if response is None:
+            logger.warning(
+                "ocr_pdf_text.page_failed",
+                page_index=page_index,
+            )
+            return None
+
+        text = response.text.strip()
+        if text:
+            logger.debug(
+                "ocr_pdf_text.page_success",
+                page_index=page_index,
+                text_length=len(text),
+                input_tokens=response.input_tokens,
+                output_tokens=response.output_tokens,
+            )
+        return text if text else None
+    except Exception:
+        logger.warning(
+            "ocr_pdf_text.page_error",
+            page_index=page_index,
+            exc_info=True,
+        )
         return None
 
 
