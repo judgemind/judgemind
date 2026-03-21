@@ -23,52 +23,16 @@ import re
 import sys
 
 import psycopg
+from courts.ca.la_tentatives import (
+    _DEPT_HEADER_BOILERPLATE_RE as _DEPT_HEADER_RE,
+    _ENTITY_DESCRIPTOR_RE,
+)
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)-8s %(message)s",
 )
 logger = logging.getLogger(__name__)
-
-# ---------------------------------------------------------------------------
-# Department header boilerplate detection
-# ---------------------------------------------------------------------------
-
-_DEPT_HEADER_RE = re.compile(
-    r"DEPARTMENT\s+\S+\s+LAW AND MOTION RULINGS",
-    re.IGNORECASE,
-)
-
-# ---------------------------------------------------------------------------
-# Title extraction from ruling text (inline to satisfy ECS oneshot constraint)
-# ---------------------------------------------------------------------------
-
-# Entity descriptor phrases to strip from party names.
-_ENTITY_DESCRIPTOR_RE = re.compile(
-    r",?\s*(?:"
-    r"An Individual(?:\s+And Derivatively On Behalf Of [^,;]+)?"
-    r"|An? (?:Alabama|Alaska|Arizona|Arkansas|California|Colorado|Connecticut"
-    r"|Delaware|District of Columbia|Florida|Georgia|Hawaii|Idaho|Illinois"
-    r"|Indiana|Iowa|Kansas|Kentucky|Louisiana|Maine|Maryland|Massachusetts"
-    r"|Michigan|Minnesota|Mississippi|Missouri|Montana|Nebraska|Nevada"
-    r"|New Hampshire|New Jersey|New Mexico|New York|North Carolina"
-    r"|North Dakota|Ohio|Oklahoma|Oregon|Pennsylvania|Rhode Island"
-    r"|South Carolina|South Dakota|Tennessee|Texas|Utah|Vermont|Virginia"
-    r"|Washington|West Virginia|Wisconsin|Wyoming)"
-    r" (?:Corporation|Limited Liability Company|Limited Partnership"
-    r"|General Partnership|Business Entity|Nonprofit Corporation|Public Entity)"
-    r"|A (?:Corporation|Limited Liability Company|Limited Partnership"
-    r"|General Partnership|Business Entity|Nonprofit Corporation|Public Entity)"
-    r"|Individually And As [^,;]+"
-    r"|By And Through [^,;]+"
-    r"|As Trustee Of [^,;]+"
-    r"|Successor In Interest To [^,;]+"
-    r"|Derivatively On Behalf Of [^,;]+"
-    r"|Form Unknown"
-    r"|Doe(?:s)? \d+ (?:To|Through) \d+(?:,? Inclusive)?"
-    r")",
-    re.IGNORECASE,
-)
 
 # Caption block: "NAME, Plaintiff(s), vs. NAME, Defendant(s)."
 _P_ROLE_RE = re.compile(

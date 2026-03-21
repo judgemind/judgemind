@@ -168,12 +168,25 @@ _ENTITY_DESCRIPTOR_RE = re.compile(
 _MAX_TITLE_LENGTH = 120
 
 
-def _sanitize_title(raw_title: str | None) -> str | None:
+def _sanitize_title(
+    raw_title: str | None,
+    *,
+    max_length: int | None = None,
+) -> str | None:
     """Clean a raw case title: strip entity descriptors, header boilerplate, excess length.
 
     Returns ``None`` if the title is invalid (contains department header
     boilerplate, is too short after cleaning, or is empty).
+
+    Args:
+        raw_title: The raw case title to clean.
+        max_length: Maximum allowed title length after cleaning.  Defaults to
+            ``_MAX_TITLE_LENGTH`` (120).  Callers that need a different limit
+            (e.g. backfill scripts with lenient thresholds) can override this.
     """
+    if max_length is None:
+        max_length = _MAX_TITLE_LENGTH
+
     if not raw_title:
         return None
 
@@ -205,7 +218,7 @@ def _sanitize_title(raw_title: str | None) -> str | None:
         title = " v. ".join(cleaned_parts)
 
     # Final length check
-    if len(title) > _MAX_TITLE_LENGTH or len(title) < 5:
+    if len(title) > max_length or len(title) < 5:
         return None
 
     return title

@@ -36,6 +36,8 @@ LOCAL_ONLY=(
     "update-coverage-baselines.py"  # CI-only — runs in GitHub Actions runner
     "validate-dq-baselines.py"      # CI-only — validates baselines JSON structure
     "run_judge_cleanup.py"          # Orchestrator — runs sibling scripts via subprocess
+    "backfill_la_entity_descriptors.py"  # One-off backfill — imports from scraper-framework (#1397)
+    "backfill_la_header_titles.py"       # One-off backfill — imports from scraper-framework (#1397)
 )
 
 # ─── Discover sibling module names ─────────────────────────────────────────
