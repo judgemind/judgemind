@@ -69,6 +69,11 @@ _DEPT_HEADER_BOILERPLATE_RE = re.compile(
 
 _MAX_TITLE_LENGTH = 120
 
+# For the backfill, we use a more lenient length limit.  The live scraper
+# enforces 120 chars, but for existing data we accept anything that is at
+# least shorter than the original title after stripping entity descriptors.
+_BACKFILL_MAX_TITLE_LENGTH = 250
+
 
 def sanitize_title(raw_title: str | None) -> str | None:
     """Clean a raw case title: strip entity descriptors, excess length.
@@ -78,6 +83,25 @@ def sanitize_title(raw_title: str | None) -> str | None:
 
     This is a standalone copy of ``la_tentatives._sanitize_title()`` to
     satisfy the ECS oneshot constraint (no sibling imports).
+    """
+    return _strip_descriptors(raw_title, max_length=_MAX_TITLE_LENGTH)
+
+
+def sanitize_title_lenient(raw_title: str | None) -> str | None:
+    """Like ``sanitize_title`` but with a lenient max-length for backfill use.
+
+    Accepts titles up to ``_BACKFILL_MAX_TITLE_LENGTH`` after cleaning,
+    because many multi-party LA cases are legitimately > 120 chars even
+    after stripping entity descriptors.
+    """
+    return _strip_descriptors(raw_title, max_length=_BACKFILL_MAX_TITLE_LENGTH)
+
+
+def _strip_descriptors(raw_title: str | None, *, max_length: int) -> str | None:
+    """Strip entity descriptors from a case title.
+
+    Returns ``None`` if the title is invalid (boilerplate, too short,
+    or exceeds *max_length* after cleaning).
     """
     if not raw_title:
         return None
@@ -112,7 +136,7 @@ def sanitize_title(raw_title: str | None) -> str | None:
         title = " v. ".join(cleaned_parts)
 
     # Final length check
-    if len(title) > _MAX_TITLE_LENGTH or len(title) < 5:
+    if len(title) > max_length or len(title) < 5:
         return None
 
     return title
@@ -253,8 +277,8 @@ def clean_case_title(
 
     Returns ``None`` if no clean title can be determined.
     """
-    # Strategy 1: sanitize the existing title directly
-    cleaned = sanitize_title(old_title)
+    # Strategy 1: sanitize the existing title directly (lenient length for backfill)
+    cleaned = sanitize_title_lenient(old_title)
     if cleaned is not None:
         return cleaned
 
