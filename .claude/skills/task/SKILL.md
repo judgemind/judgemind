@@ -57,6 +57,28 @@ Phases (in typical order): `claiming`, `setup`, `ralph-worker (iteration N)`, `r
 
 **Write a status update at every major step transition** — use the Write tool to overwrite the status file. The first update should be written immediately after worktree setup with phase `claiming`.
 
+### Phase timing instrumentation
+
+At every phase transition, also record the timing via `scripts/phase_timer.py`. This tracks wall-clock duration for each phase so we can identify bottlenecks and answer questions like "how long does CI take?" or "what's the overhead of worktree setup vs actual implementation?"
+
+**At each phase start** (alongside the status file write), run:
+```
+python3 {worktree}/scripts/phase_timer.py start {worktree} <phase>
+```
+
+The timer automatically closes the previous phase when a new one starts, so you only need `start` calls at each transition — no explicit `end` calls are needed during normal flow.
+
+**For ralph-reviewer phases**, after all three reviewers complete, end the phase with per-reviewer timing detail (see the ralph SKILL.md for how to capture per-reviewer seconds):
+```
+python3 {worktree}/scripts/phase_timer.py end {worktree} --detail '{"gemini_standard": <secs>, "gemini_adversarial": <secs>, "claude": <secs>}'
+```
+
+**At task completion** (in Step 5d, before removing the worktree), generate the timing summary:
+```
+python3 {worktree}/scripts/phase_timer.py summarize {worktree} {repo_root} <issue_number>
+```
+This writes `{worktree}/tmp/timing.json` with the full phase breakdown and appends a one-line summary to `{repo_root}/tmp/task-timings.jsonl`.
+
 ---
 
 ## Step 1 — Identify the issue
@@ -158,6 +180,7 @@ Follow the full PR Workflow defined in CLAUDE.md. **All commits must be on the w
 
 #### A.1 — Set up dependencies
 Write status: `phase: setup`, `summary: Installing dependencies for <packages>`.
+Also start the phase timer: `python3 {worktree}/scripts/phase_timer.py start {worktree} setup`
 
 For Python packages you will touch, create a venv:
 ```
@@ -227,6 +250,7 @@ gh issue comment <N> --repo judgemind/judgemind --body-file {worktree}/tmp/proce
 
 #### A.3 — Stage, commit, and push
 Write status: `phase: pushing`, `summary: Staging, committing, and pushing to remote`.
+Also start the phase timer: `python3 {worktree}/scripts/phase_timer.py start {worktree} pushing`
 
 Stage the files you changed (prefer naming specific files over `git add .`):
 ```
@@ -305,13 +329,14 @@ Resolve conflicts, `git rebase --continue`, then push with `--force-with-lease`.
 
 #### A.5 — Monitor CI and iterate until green
 Write status: `phase: ci-watch`, `summary: Watching CI run <run-id>`.
+Also start the phase timer: `python3 {worktree}/scripts/phase_timer.py start {worktree} "ci-watch (1)"`
 
 **Run CI watches in the foreground** — do not use `run_in_background`. You cannot proceed until CI finishes, so background execution just generates unnecessary `<task-notification>` noise for the dispatcher.
 
 ```
 gh run watch <run-id> --repo judgemind/judgemind --interval 60 --exit-status --compact
 ```
-If CI fails: write status `phase: ci-fix`, `summary: Fixing CI failure: <brief reason>`. Diagnose, fix locally, push, return to A.4. Repeat until all checks pass.
+If CI fails: write status `phase: ci-fix`, `summary: Fixing CI failure: <brief reason>`. Also start the phase timer: `python3 {worktree}/scripts/phase_timer.py start {worktree} ci-fix`. Diagnose, fix locally, push, return to A.4. On the next CI watch, increment the attempt number in the phase name (e.g. `ci-watch (2)`). Repeat until all checks pass.
 
 #### A.6 — Update the PR test plan
 Fetch the current PR body, check off the **Automated checks** items that passed in CI. Do NOT check off **Post-deploy verification** items yet — those are checked in A.8 after merge and deploy. Write the updated body to `{worktree}/tmp/pr_body.txt`, then:
@@ -321,6 +346,7 @@ gh pr edit <PR-N> --repo judgemind/judgemind --body-file {worktree}/tmp/pr_body.
 
 #### A.7 — Merge the PR
 Write status: `phase: merging`, `summary: Squash merging PR #<N>`.
+Also start the phase timer: `python3 {worktree}/scripts/phase_timer.py start {worktree} merging`
 
 The PR has passed the ralph loop review (A.2) and CI is green. Merge it:
 ```
@@ -331,6 +357,7 @@ gh pr merge <PR-N> --repo judgemind/judgemind --squash --delete-branch
 
 #### A.8 — Verify deployment and post evidence (MANDATORY)
 Write status: `phase: deploying`, `summary: Watching deploy pipeline for <workflow>`.
+Also start the phase timer: `python3 {worktree}/scripts/phase_timer.py start {worktree} deploying`
 
 **A task is NOT done when the PR merges. A task is done when the change is deployed, verified working, AND verification evidence is posted.** The worktree stays alive until verification passes.
 
@@ -356,6 +383,7 @@ Write status: `phase: deploying`, `summary: Watching deploy pipeline for <workfl
 **Step 2 — Functional verification and acceptance criteria re-check (required):**
 
 Write status: `phase: verifying`, `summary: Verifying feature works in dev environment`.
+Also start the phase timer: `python3 {worktree}/scripts/phase_timer.py start {worktree} verifying`
 
 A successful deploy only means the new image is running — not that the service works. Verify the feature is actually functional:
 
@@ -489,6 +517,7 @@ If you only create sub-tasks and do not pick one up in this session, clean up: `
 ## Step 5 — Retrospective
 
 Write status: `phase: retrospective`, `summary: Filing retro issues`.
+Also start the phase timer: `python3 {worktree}/scripts/phase_timer.py start {worktree} retrospective`
 
 After completing a task (Path A or Path B), reflect on the work before cleaning up. This step produces concrete improvements to the codebase and workflow — not just observations.
 
@@ -520,9 +549,15 @@ For each actionable finding from 5a and 5b:
 
 If the task was trivial and there are genuinely no improvements to make, that's fine — skip filing. But default to filing. The bar is "would this save time or prevent bugs across future tasks?"
 
-### 5d — Remove worktree
+### 5d — Generate timing summary and remove worktree
 
 Write status: `phase: done`, `summary: Task complete. Removing worktree.`
+
+**Generate the timing summary before removing the worktree:**
+```
+python3 {worktree}/scripts/phase_timer.py summarize {worktree} {repo_root} <issue_number>
+```
+This writes `{worktree}/tmp/timing.json` with the full phase breakdown and appends a one-line summary to `{repo_root}/tmp/task-timings.jsonl`. The dispatcher can aggregate these across tasks to identify systemic bottlenecks.
 
 **Only remove the worktree after deployment verification passes** (or after confirming the change has no deployed component). Never clean up immediately after merge — the worktree is needed for debugging if verification fails.
 

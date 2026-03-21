@@ -81,6 +81,7 @@ Set `iteration = 1` and `max_iterations = 5`.
 ### 2a — Worker phase
 
 Write status: `phase: ralph-worker (iteration N)`, `summary: Worker implementing iteration N`.
+Also start the phase timer: `python3 {worktree}/scripts/phase_timer.py start {worktree} "ralph-worker (N)"`
 
 **Write the current iteration number** to `{worktree}/tmp/ralph/iteration.txt` (just the number, e.g. `1`). This file is read by `gemini_review.py` to tag its log records with the correct iteration.
 
@@ -120,6 +121,7 @@ After the worker subagent completes, read `{worktree}/tmp/ralph/work-status.txt`
 ### 2b — Sequential review phase
 
 Write status: `phase: ralph-reviewer (iteration N)`, `summary: Running three sequential reviewers for iteration N`.
+Also start the phase timer: `python3 {worktree}/scripts/phase_timer.py start {worktree} "ralph-reviewer (N)"`
 
 **All three reviewers run sequentially in the foreground.** This eliminates background `<task-notification>` noise that disrupts the dispatcher when multiple agents are running. Do **not** use `run_in_background` for any reviewer.
 
@@ -145,19 +147,35 @@ Write status: `phase: ralph-reviewer (iteration N)`, `summary: Running three seq
 
 Both files must exist and be non-empty before launching reviewers. The `gemini-review.sh` script will skip its own diff generation when it detects these files already exist.
 
-**Run all three reviewers sequentially (foreground only — no `run_in_background`):**
+**Run all three reviewers sequentially (foreground only — no `run_in_background`), capturing per-reviewer wall-clock time:**
 
-1. **Gemini standard review** — Run in the foreground and wait for completion:
+Before each reviewer starts, note the current time (run `date +%s` to get epoch seconds). After each reviewer completes, run `date +%s` again and compute the delta. Store the per-reviewer seconds for the timing detail.
+
+1. **Gemini standard review** — Capture start time, run in the foreground and wait for completion, capture end time:
    ```
+   date +%s
    scripts/gemini-review.sh {worktree}
+   date +%s
    ```
+   Compute: `gemini_standard_secs = end - start`
 
-2. **Gemini adversarial review** — Run in the foreground and wait for completion:
+2. **Gemini adversarial review** — Capture start time, run in the foreground and wait for completion, capture end time:
    ```
+   date +%s
    scripts/gemini-review.sh {worktree} --adversarial
+   date +%s
    ```
+   Compute: `gemini_adversarial_secs = end - start`
 
-3. **Claude reviewer subagent** — Spawn via the Agent tool (foreground, after both Gemini reviews have completed).
+3. **Claude reviewer subagent** — Capture start time, spawn via the Agent tool (foreground, after both Gemini reviews have completed), capture end time after the agent completes:
+   ```
+   date +%s
+   ```
+   (Run Claude reviewer agent)
+   ```
+   date +%s
+   ```
+   Compute: `claude_secs = end - start`
 
 The Claude reviewer prompt should be:
 
@@ -202,6 +220,11 @@ The Claude reviewer prompt should be:
 > - If you say REVISE, your feedback must be specific enough that the worker can act on it without guessing.
 > - **Unchecked test plan items are always blockers.** Never approve a PR with unchecked test plan checkboxes.
 > - **Do not use `run_in_background` on any command.** You are a subagent — all commands must run in the foreground.
+
+**After all three reviewers complete**, end the reviewer phase with per-reviewer timing detail:
+```
+python3 {worktree}/scripts/phase_timer.py end {worktree} --detail '{"gemini_standard": <gemini_standard_secs>, "gemini_adversarial": <gemini_adversarial_secs>, "claude": <claude_secs>}'
+```
 
 ### 2c — Collect results
 
