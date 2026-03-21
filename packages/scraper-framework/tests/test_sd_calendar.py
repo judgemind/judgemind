@@ -1,7 +1,7 @@
 """Tests for San Diego County civil calendar scraper (Phase 1).
 
 Fixtures are realistic HTML pages based on the real calendar structure
-captured from http://www.sandiego.courts.ca.gov/portal/online/calendar/.
+captured from https://www.sandiego.courts.ca.gov/portal/online/calendar/.
 
 Fixture files:
   sd_calendar_central.html — Central Division with multiple departments and

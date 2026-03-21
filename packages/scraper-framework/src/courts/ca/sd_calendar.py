@@ -8,12 +8,12 @@ This is Phase 1 of a two-phase scraper. Phase 1 enumerates cases from the
 calendar; Phase 2 (future) retrieves tentative rulings from the Odyssey ROA
 portal via Playwright.
 
-Verified against live site 2026-03-11:
-  URL: http://www.sandiego.courts.ca.gov/portal/online/calendar/
+Verified against live site 2026-03-21:
+  URL: https://www.sandiego.courts.ca.gov/portal/online/calendar/
   4 divisions: Central, North County, East County, South County
   5-day rolling window per division (f_svcal{1-5}.html, etc.)
-  No bot protection — plain HTTP GET returns full HTML
-  No CAPTCHA, no cookies, no JavaScript required
+  Site is behind Cloudflare — HTTPS required (HTTP times out from AWS)
+  No CAPTCHA, no cookies, no JavaScript required for HTTPS requests
 
 Calendar HTML structure:
   <h1>CIVIL CALENDAR For Friday, 03/13/2026</h1>
@@ -57,7 +57,7 @@ from framework.storage import S3Archiver
 
 logger = structlog.get_logger(__name__)
 
-CALENDAR_BASE_URL = "http://www.sandiego.courts.ca.gov/portal/online/calendar"
+CALENDAR_BASE_URL = "https://www.sandiego.courts.ca.gov/portal/online/calendar"
 
 # Division URL patterns: (division_name, filename_prefix)
 # Each division has pages numbered 1-5 for the rolling 5-business-day window.
