@@ -140,14 +140,14 @@ const SUMMARY_HEADING_RE = /^#{1,6}\s+.*\n*/;
  * Each regex matches a full line (anchored with ^ and terminated by newline or end).
  */
 const SUMMARY_METADATA_LINE_PATTERNS: RegExp[] = [
-  /^\s*\*{0,2}(?:case\s+(?:number|no\.?)|case\s*#)\s*[:;]\*{0,2}\s*.+$/im,
-  /^\s*\*{0,2}judge\s*[:;]\*{0,2}\s*.+$/im,
-  /^\s*\*{0,2}(?:parties|party)\s*[:;]\*{0,2}\s*.+$/im,
-  /^\s*\*{0,2}court\s*[:;]\*{0,2}\s*.+$/im,
-  /^\s*\*{0,2}department\s*[:;]\*{0,2}\s*.+$/im,
-  /^\s*\*{0,2}hearing\s+date\s*[:;]\*{0,2}\s*.+$/im,
-  /^\s*\*{0,2}county\s*[:;]\*{0,2}\s*.+$/im,
-  /^\s*\*{0,2}motion\s+type\s*[:;]\*{0,2}\s*.+$/im,
+  /^\s*\*{0,2}(?:case\s+(?:number|no\.?)|case\s*#)\s*[:;]\*{0,2}\s*.+$/gim,
+  /^\s*\*{0,2}judge\s*[:;]\*{0,2}\s*.+$/gim,
+  /^\s*\*{0,2}(?:parties|party)\s*[:;]\*{0,2}\s*.+$/gim,
+  /^\s*\*{0,2}court\s*[:;]\*{0,2}\s*.+$/gim,
+  /^\s*\*{0,2}department\s*[:;]\*{0,2}\s*.+$/gim,
+  /^\s*\*{0,2}hearing\s+date\s*[:;]\*{0,2}\s*.+$/gim,
+  /^\s*\*{0,2}county\s*[:;]\*{0,2}\s*.+$/gim,
+  /^\s*\*{0,2}motion\s+type\s*[:;]\*{0,2}\s*.+$/gim,
 ];
 
 /**

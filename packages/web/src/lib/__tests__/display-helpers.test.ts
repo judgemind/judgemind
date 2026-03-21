@@ -107,6 +107,17 @@ describe('cleanSummary', () => {
     const summary = 'In this case, the motion was denied due to insufficient evidence.';
     expect(cleanSummary(summary)).toBe(summary);
   });
+
+  it('strips duplicate metadata lines of the same type (#1320)', () => {
+    const summary = 'Judge: Smith\nJudge: Jones\nThe motion is granted.';
+    expect(cleanSummary(summary)).toBe('The motion is granted.');
+  });
+
+  it('strips duplicate metadata lines across different types (#1320)', () => {
+    const summary =
+      'Case Number: 25STCV12345\nJudge: Smith\nCase Number: 25STCV67890\nJudge: Jones\nThe ruling stands.';
+    expect(cleanSummary(summary)).toBe('The ruling stands.');
+  });
 });
 
 // ---------------------------------------------------------------------------
