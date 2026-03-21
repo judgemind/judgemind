@@ -309,6 +309,245 @@ def _extract_case_title_from_entry(first_line_rest: str) -> str | None:
     return cleaned.strip() if cleaned else None
 
 
+# ---------------------------------------------------------------------------
+# Multi-line case title extraction for two-column PDF formats (#1331)
+# ---------------------------------------------------------------------------
+
+# Stopwords that signal the end of a defendant name and the start of
+# ruling text or motion descriptions.
+_DEFENDANT_STOP_WORDS = frozenset(
+    {
+        "the",
+        "a",
+        "an",
+        "is",
+        "are",
+        "was",
+        "were",
+        "and",
+        "or",
+        "for",
+        "of",
+        "in",
+        "on",
+        "to",
+        "by",
+        "at",
+        "from",
+        "with",
+        "that",
+        "this",
+        "not",
+        "but",
+        "all",
+        "any",
+        "its",
+        "his",
+        "her",
+        "their",
+        "our",
+        "may",
+        "shall",
+        "will",
+        "can",
+        "seeking",
+        "alleging",
+        "asserting",
+        "contending",
+        "fourth",
+        "third",
+        "second",
+        "first",
+        "fifth",
+        "sixth",
+        "cause",
+        "action",
+        "motion",
+        "moves",
+        "defendant",
+        "plaintiff",
+        "breach",
+        "implied",
+        "warranty",
+        "case",
+        "status",
+        "conference",
+        "management",
+        "demurrer",
+        "hearing",
+        "calendar",
+        "order",
+    }
+)
+
+# Lines that start with these prefixes are not case-name fragments.
+_NOT_NAME_PREFIXES_RE = re.compile(
+    r"^(?:The |A |An |This |If |As |In |For |Under |Here|"
+    r"Plaintiff|Defendant|Court|Motion|Demurrer|OSC|"
+    r"Application|Petition|Status|Case Management|CMC|"
+    r"OFF CALENDAR|HEARING|Page |\()",
+)
+
+
+def _strip_possessive(word: str) -> str:
+    """Strip possessive suffix and trailing punctuation from a word."""
+    return re.sub(r"[\u2019']s$|[.,;:()]+$", "", word)
+
+
+def _collect_defendant_name_words(words: list[str]) -> list[str]:
+    """Collect defendant name words from after 'vs.', stopping at ruling text.
+
+    Used by ``_extract_leading_name_fragment`` to parse the defendant name
+    from a line like ``"vs. FCA fourth cause of action..."``, returning
+    ``["FCA"]``.
+    """
+    name_words: list[str] = []
+    for idx, w in enumerate(words):
+        clean_w = _strip_possessive(w)
+        if clean_w.lower() in _DEFENDANT_STOP_WORDS:
+            break
+        if len(clean_w) > 3 and clean_w[0].islower():
+            break
+        remaining = " ".join(words[idx:])
+        is_motion = any(remaining.startswith(kw) for kw in _MOTION_KEYWORDS)
+        if is_motion:
+            break
+        name_words.append(_strip_possessive(w))
+        if len(name_words) >= 3:
+            break
+    return name_words
+
+
+def _extract_leading_name_fragment(line: str) -> str | None:
+    """Extract a short case-name fragment from the start of a continuation line.
+
+    In N18's two-column PDF format, continuation lines look like::
+
+        "Suarez vs. seeking relief from the Order of dismissal..."
+        "Lopez 2025, is granted."
+
+    The left column is the case name fragment and the right column is the
+    ruling text.  This function extracts just the left-column fragment.
+
+    Returns the fragment if it looks like a name part, otherwise None.
+    """
+    stripped = line.strip()
+    if not stripped:
+        return None
+
+    # Very short lines (< 30 chars) with no sentence-like structure are
+    # likely standalone name fragments (e.g. "Lopez", "Myrick", "Potter").
+    if len(stripped) < 30 and not re.search(r"[.;:!?](?:\s|$)", stripped):
+        if _NOT_NAME_PREFIXES_RE.match(stripped):
+            return None
+        if re.match(r"^\d", stripped) and not re.search(r"\bvs\.?\b", stripped, re.IGNORECASE):
+            return None
+        return stripped
+
+    # For longer lines, look for "vs" in the first ~30 chars.
+    vs_match = re.search(r"\bvs\.?\b", stripped[:30], re.IGNORECASE)
+    if vs_match:
+        after_vs = vs_match.end()
+        rest = stripped[after_vs:].lstrip()
+        words_after = rest.split()
+        name_words = _collect_defendant_name_words(words_after)
+        fragment = stripped[: vs_match.end()].rstrip()
+        if name_words:
+            fragment += " " + " ".join(name_words)
+        return fragment.strip().rstrip(".,;:()")
+
+    # No "vs" — check if the line starts with a short name-like fragment.
+    words = stripped.split()
+    if not words:
+        return None
+    first_clean = _strip_possessive(words[0])
+    if first_clean.lower() in _DEFENDANT_STOP_WORDS:
+        return None
+    name_words_list: list[str] = []
+    for w in words[:4]:
+        clean_w = _strip_possessive(w)
+        if not clean_w:
+            continue
+        if clean_w.lower() in _DEFENDANT_STOP_WORDS:
+            break
+        if clean_w[0].isupper() or clean_w in ("vs.", "vs", "v."):
+            name_words_list.append(clean_w)
+        else:
+            break
+    if not name_words_list or len(name_words_list) > 4:
+        return None
+    fragment = " ".join(name_words_list)
+    if len(fragment) < len(stripped) * 0.5 and len(fragment) < 30:
+        return fragment
+    return None
+
+
+def _extract_multiline_case_title(
+    lines: list[str],
+    entry_line_idx: int,
+    next_entry_line_idx: int,
+) -> str | None:
+    """Extract a case title that spans multiple continuation lines (#1331).
+
+    In N18's two-column PDF format, the case name appears in the left column
+    of continuation lines below the entry line, while the ruling text appears
+    in the right column.  For example::
+
+        2. 2024-1389826 The motion by Plaintiff Andres Suarez for an order
+        Suarez vs. seeking relief from the Order of dismissal...
+        Lopez 2025, is granted.
+
+    The case title "Suarez vs. Lopez" is assembled from fragments at the
+    start of the continuation lines.
+
+    Returns the cleaned case title, or None if no multi-line title is found.
+    """
+    max_lines = min(entry_line_idx + 6, next_entry_line_idx)
+    fragments: list[str] = []
+    found_vs = False
+    vs_has_defendant = False
+
+    for j in range(entry_line_idx + 1, max_lines):
+        frag = _extract_leading_name_fragment(lines[j])
+        if frag is None:
+            if not found_vs:
+                continue
+            break
+        fragments.append(frag)
+        if re.search(r"\bvs\.?\b", frag, re.IGNORECASE):
+            found_vs = True
+            vs_m = re.search(r"\bvs\.?\s+", frag, re.IGNORECASE)
+            if vs_m:
+                after_vs_text = frag[vs_m.end() :].strip()
+                if after_vs_text and len(after_vs_text) >= 2:
+                    vs_has_defendant = True
+        elif found_vs:
+            if vs_has_defendant:
+                # The vs fragment already has defendant text.  Only accept
+                # this continuation if it doesn't duplicate existing words
+                # and is very short (1-2 words).
+                frag_words = frag.split()
+                existing_words = {
+                    _strip_possessive(w).lower() for w in " ".join(fragments[:-1]).split()
+                }
+                first_word_clean = _strip_possessive(frag_words[0]).lower()
+                if frag_words and first_word_clean in existing_words:
+                    fragments.pop()
+                    break
+                if len(frag_words) > 2:
+                    fragments.pop()
+                    break
+            break
+
+    if not fragments or not found_vs:
+        return None
+
+    raw_title = " ".join(fragments)
+    raw_title = re.sub(r"\s+", " ", raw_title).strip()
+    cleaned = _clean_case_title(raw_title)
+    return cleaned.strip() if cleaned else None
+
+
 def _is_sub_motion_line(rest: str) -> bool:
     """Return True if the line text looks like a sub-motion item, not a case entry.
 
@@ -429,6 +668,28 @@ def _split_case_number_based(text: str) -> list[SplitResult]:
         # substantive ruling content).
         if _is_boilerplate_only(ruling_text):
             continue
+
+        # Try multi-line case title extraction (#1331).  In two-column PDF
+        # formats (e.g. N18), the case name appears on continuation lines
+        # and single-line extraction produces garbled results.  Use the
+        # multi-line result when:
+        #   - The single-line title is missing, OR
+        #   - The single-line title ends with "vs"/"vs." (incomplete), OR
+        #   - The single-line title is very long (> 40 chars, likely has
+        #     ruling text in it), and the multi-line title is shorter.
+        multiline_title = _extract_multiline_case_title(
+            lines,
+            line_idx,
+            next_line_idx,
+        )
+        if multiline_title:
+            title_is_incomplete = (
+                case_title is None
+                or re.search(r"\bvs\.?\s*$", case_title, re.IGNORECASE)
+                or (len(case_title) > 40 and len(multiline_title) < len(case_title))
+            )
+            if title_is_incomplete:
+                case_title = multiline_title
 
         # Extract motion type from the first line.
         motion_type: str | None = None
