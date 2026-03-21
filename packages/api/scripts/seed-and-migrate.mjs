@@ -92,8 +92,8 @@ async function seedMigrations() {
     for (const name of names) {
       await client.query(
         `INSERT INTO pgmigrations (name, run_on)
-         SELECT $1, $2::timestamp
-         WHERE NOT EXISTS (SELECT 1 FROM pgmigrations WHERE name = $1)`,
+         SELECT $1::varchar, $2::timestamp
+         WHERE NOT EXISTS (SELECT 1 FROM pgmigrations WHERE name = $1::varchar)`,
         [name, now]
       );
     }
