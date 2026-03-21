@@ -1153,6 +1153,33 @@ def test_sanitize_title_strips_california_corporation() -> None:
     assert "Old Master Products" in result
 
 
+def test_sanitize_title_strips_new_states() -> None:
+    """Entity descriptors for newly added states are stripped."""
+    title = (
+        "Acme Corp, A Connecticut Corporation v. Widget LLC, An Arkansas Limited Liability Company"
+    )
+    result = _sanitize_title(title)
+    assert result is not None
+    assert "A Connecticut Corporation" not in result
+    assert "An Arkansas Limited Liability Company" not in result
+    assert "Acme Corp" in result
+
+    title2 = "Smith v. Dakota Holdings, A South Dakota Corporation"
+    result2 = _sanitize_title(title2)
+    assert result2 is not None
+    assert "A South Dakota Corporation" not in result2
+    assert "Dakota Holdings" in result2
+
+
+def test_sanitize_title_strips_district_of_columbia() -> None:
+    """Entity descriptors for District of Columbia are stripped."""
+    title = "Fed Agency v. DC Corp, A District of Columbia Corporation"
+    result = _sanitize_title(title)
+    assert result is not None
+    assert "A District of Columbia Corporation" not in result
+    assert "DC Corp" in result
+
+
 def test_sanitize_title_strips_derivatively_on_behalf() -> None:
     """'An Individual And Derivatively On Behalf Of...' is stripped."""
     title = (
