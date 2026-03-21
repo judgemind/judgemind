@@ -17,6 +17,7 @@ import pytest
 
 from courts.ca.pdf_link_scraper import _extract_pdf_text
 from ingestion.oc_splitter import (
+    _is_boilerplate_only,
     _split_case_number_based,
     _split_north,
     split_oc_document,
@@ -30,6 +31,137 @@ FIXTURES = Path(__file__).parent / "fixtures"
 
 def _load_bytes(name: str) -> bytes:
     return (FIXTURES / name).read_bytes()
+
+
+# ---------------------------------------------------------------------------
+# Boilerplate detection tests
+# ---------------------------------------------------------------------------
+
+
+class TestIsBoilerplateOnly:
+    """Tests for the _is_boilerplate_only() helper."""
+
+    def test_header_only_text_is_boilerplate(self) -> None:
+        """Calendar header with no substantive content is boilerplate."""
+        text = (
+            "TENTATIVE RULINGS\n"
+            "LAW & MOTION CALENDAR\n"
+            "DEPT N17\n"
+            "Judge Craig L. Griffin\n"
+            "Date: March 16, 2026\n"
+            "Time: 2:00 PM\n"
+            "#\n"
+        )
+        assert _is_boilerplate_only(text) is True
+
+    def test_header_with_submit_instructions_is_boilerplate(self) -> None:
+        text = (
+            "TENTATIVE RULINGS\n"
+            "LAW & MOTION\n"
+            "DEPT C25\n"
+            "Judge Gassia Apkarian\n"
+            "Date: March 10, 2026\n"
+            "If you are submitting to the tentative, please call the Clerk.\n"
+        )
+        assert _is_boilerplate_only(text) is True
+
+    def test_ruling_text_is_not_boilerplate(self) -> None:
+        """Actual ruling content is not boilerplate."""
+        text = (
+            "101 Smith vs Jones Motion for Summary Judgment\n"
+            "The Court has reviewed the moving papers, opposition, and reply.\n"
+            "The motion is GRANTED. Defendant has failed to raise a triable\n"
+            "issue of material fact.\n"
+        )
+        assert _is_boilerplate_only(text) is False
+
+    def test_short_substantive_text_is_not_boilerplate(self) -> None:
+        """Even short ruling text with real content is not boilerplate."""
+        text = "The motion is GRANTED. Defendant to give notice of this ruling."
+        assert _is_boilerplate_only(text) is False
+
+    def test_empty_text_is_boilerplate(self) -> None:
+        assert _is_boilerplate_only("") is True
+
+    def test_only_whitespace_is_boilerplate(self) -> None:
+        assert _is_boilerplate_only("   \n  \n  ") is True
+
+    def test_page_numbers_only_is_boilerplate(self) -> None:
+        text = "Page 1 of 12\n\nPage 2 of 12\n"
+        assert _is_boilerplate_only(text) is True
+
+    def test_judge_prose_line_is_not_boilerplate(self) -> None:
+        """A line like 'Judge Smith's prior ruling is instructive' is NOT boilerplate."""
+        text = "Judge Smith's prior ruling is instructive and controls the outcome here."
+        assert _is_boilerplate_only(text) is False
+
+    def test_dept_in_prose_is_not_boilerplate(self) -> None:
+        """A line mentioning a department in context is NOT boilerplate."""
+        text = "The case was transferred from Dept C25 to the current department for trial."
+        assert _is_boilerplate_only(text) is False
+
+
+class TestBoilerplateFiltering:
+    """Tests that boilerplate-only fragments are filtered from split results."""
+
+    def test_north_filters_boilerplate_fragments(self) -> None:
+        """North splitter filters out fragments that have only boilerplate.
+
+        Entry 1 has "vs" (so it passes the _is_north_case_entry check) but
+        its ruling text is only a short entry line plus calendar headers —
+        below the _MIN_SUBSTANTIVE_CHARS threshold.  Entry 2 has real content.
+        The splitter should filter out entry 1 and return only entry 2.
+        """
+        text = (
+            "1 A vs B\n"
+            "TENTATIVE RULINGS\n"
+            "LAW & MOTION CALENDAR\n"
+            "DEPT N17\n"
+            "Judge Craig L. Griffin\n"
+            "2 Post v. Chung Motion for Summary Judgment\n"
+            "The motion is DENIED as defendant has failed to meet its burden.\n"
+        )
+        results = _split_north(text)
+        # Entry 1 ("A vs B" + boilerplate) should be filtered out.
+        assert len(results) == 1
+        assert "Post v. Chung" in results[0].case_title
+
+    def test_north_keeps_all_real_entries(self) -> None:
+        """North splitter preserves all entries with real ruling content."""
+        text = (
+            "1 Zavala vs. Becker Motion for Attorneys' Fees\n"
+            "The Court will GRANT IN PART the motion.\n"
+            "Defendants are to give notice of this ruling.\n"
+            "2 Post v. Chung Motion for Summary Judgment\n"
+            "The motion is DENIED as defendant has failed to meet its burden.\n"
+        )
+        results = _split_north(text)
+        assert len(results) == 2
+        for r in results:
+            assert not _is_boilerplate_only(r.ruling_text)
+
+    def test_case_number_based_filters_boilerplate(self) -> None:
+        """Case-number splitter filters out boilerplate-only fragments.
+
+        Entry 1 has a case number but only calendar header boilerplate for
+        its ruling text (no substantive content).  Entry 2 has real content.
+        The splitter should filter out entry 1 and return only entry 2.
+        """
+        text = (
+            "1 25-01455183\n"
+            "TENTATIVE RULINGS\n"
+            "LAW & MOTION CALENDAR\n"
+            "DEPT C25\n"
+            "Judge Gassia Apkarian\n"
+            "2 Smith vs. Jones Motion for Summary Judgment\n"
+            "24-01428812\n"
+            "The motion is GRANTED.\n"
+            "Defendant's motion is without merit.\n"
+        )
+        results = _split_case_number_based(text)
+        # Entry 1 (case number + boilerplate) should be filtered out.
+        assert len(results) == 1
+        assert results[0].case_number == "24-01428812"
 
 
 # ---------------------------------------------------------------------------

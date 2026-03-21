@@ -385,15 +385,16 @@ class TestApplySplit:
         # Original ruling should be deleted.
         assert action.original_ruling_id == candidate.ruling_id
 
-    def test_uses_original_case_when_no_split_case_number(self) -> None:
-        """When split has no case_number, uses the original case_id."""
+    def test_uses_original_case_when_no_split_case_number_same_title(self) -> None:
+        """When split has no case_number and same case_title, keeps original case_id."""
         candidate = _make_candidate(
             case_id="original-case-id",
             case_number="ORIG-001",
+            case_title="A v. B",
         )
         splits = [
             SplitResult(ruling_text="Text A", case_title="A v. B"),
-            SplitResult(ruling_text="Text B", case_title="C v. D"),
+            SplitResult(ruling_text="Text B", case_title="A v. B"),
         ]
 
         conn = MagicMock()
@@ -403,7 +404,64 @@ class TestApplySplit:
 
         action = apply_split(conn, candidate, splits)
 
-        # Case numbers should fall back to original.
+        # Both splits have the same title as the original -> same case_number.
+        assert action.split_case_numbers == ["ORIG-001", "ORIG-001"]
+
+    def test_north_jc_splits_create_separate_cases(self) -> None:
+        """North JC: splits with different case_titles but no case_numbers create separate cases.
+
+        This is the core fix for #1186: when the splitter provides no
+        case_number (North JC PDFs have no case numbers) but each split has
+        a unique case_title, each split should get its own case record.
+        """
+        candidate = _make_candidate(
+            case_id="original-case-id",
+            case_number="Zavala v. Becker",
+            case_title="Zavala v. Becker",
+            department="N17",
+        )
+        splits = [
+            SplitResult(ruling_text="Text for Zavala", case_title="Zavala v. Becker"),
+            SplitResult(ruling_text="Text for Post", case_title="Post v. Chung"),
+            SplitResult(ruling_text="Text for Alpha", case_title="Alpha v. Beta"),
+        ]
+
+        conn = MagicMock()
+        mock_cursor = MagicMock()
+        # _upsert_case returns a unique case_id for each call.
+        mock_cursor.fetchone.return_value = ("new-case-id-uuid",)
+        conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cursor)
+        conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+
+        action = apply_split(conn, candidate, splits)
+
+        assert action.split_count == 3
+        # First split has same title as original -> keeps original case_number.
+        assert action.split_case_numbers[0] == "Zavala v. Becker"
+        # Other splits have different titles -> use title as synthetic case_number.
+        assert action.split_case_numbers[1] == "Post v. Chung"
+        assert action.split_case_numbers[2] == "Alpha v. Beta"
+
+    def test_north_jc_split_no_title_keeps_original(self) -> None:
+        """When split has no case_number AND no case_title, keeps original case."""
+        candidate = _make_candidate(
+            case_id="original-case-id",
+            case_number="ORIG-001",
+            case_title="Original Title",
+        )
+        splits = [
+            SplitResult(ruling_text="Text A"),
+            SplitResult(ruling_text="Text B"),
+        ]
+
+        conn = MagicMock()
+        mock_cursor = MagicMock()
+        conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cursor)
+        conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+
+        action = apply_split(conn, candidate, splits)
+
+        # No case_number or case_title on splits -> fall back to original.
         assert action.split_case_numbers == ["ORIG-001", "ORIG-001"]
 
 

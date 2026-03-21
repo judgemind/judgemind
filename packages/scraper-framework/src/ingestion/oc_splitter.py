@@ -31,6 +31,64 @@ from ingestion.splitter import SplitResult, register_splitter
 logger = structlog.get_logger(__name__)
 
 # ---------------------------------------------------------------------------
+# Boilerplate detection
+# ---------------------------------------------------------------------------
+
+# Header lines commonly found at the top of OC calendar pages.
+# A fragment that contains ONLY these patterns (no substantive ruling text)
+# is considered boilerplate and should be filtered out.
+_BOILERPLATE_RE = re.compile(
+    r"^(?:"
+    r"TENTATIVE RULINGS?$|"
+    r"LAW\s*[&]\s*MOTION(?:\s+CALENDAR)?$|"
+    r"DEPT\.?\s+\S+$|"
+    r"Date:\s*\S.*$|"
+    r"Time:\s*\S.*$|"
+    r"#\s*$|"
+    r"Page \d+ of \d+$|"
+    r"If you (?:are submitting|wish to submit).*$|"
+    r"please (?:call|contact).*$|"
+    r"\s*$"
+    r")",
+    re.IGNORECASE,
+)
+
+# Short lines starting with "Judge" that are just a name header (< 40 chars).
+# Prose sentences starting with "Judge" are longer and won't match.
+_JUDGE_HEADER_RE = re.compile(r"^Judge\s+\S", re.IGNORECASE)
+
+# Minimum number of non-boilerplate content characters for a split to be
+# considered substantive.  Fragments below this threshold are filtered out.
+# Set conservatively low — the goal is only to catch fragments that are
+# purely header text (< 20 chars of non-boilerplate), not short but
+# legitimate ruling snippets like "The motion is GRANTED."
+_MIN_SUBSTANTIVE_CHARS = 20
+
+
+def _is_boilerplate_only(text: str) -> bool:
+    """Return True if the text contains only calendar header boilerplate.
+
+    Strips lines that match common header patterns (TENTATIVE RULINGS,
+    LAW & MOTION, Judge name, Date, etc.) and checks whether any
+    substantive content remains.
+    """
+    remaining = []
+    for line in text.split("\n"):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if _BOILERPLATE_RE.match(stripped):
+            continue
+        # Short lines starting with "Judge" are header name lines;
+        # longer lines with "Judge" in prose are substantive content.
+        if _JUDGE_HEADER_RE.match(stripped) and len(stripped) < 40:
+            continue
+        remaining.append(stripped)
+    substantive = " ".join(remaining).strip()
+    return len(substantive) < _MIN_SUBSTANTIVE_CHARS
+
+
+# ---------------------------------------------------------------------------
 # North Justice Center splitting
 # ---------------------------------------------------------------------------
 
@@ -148,6 +206,11 @@ def _split_north(text: str) -> list[SplitResult]:
         # Extract ruling text: everything from this entry to the next.
         ruling_lines = lines[line_idx:next_entry_line]
         ruling_text = "\n".join(ruling_lines).strip()
+
+        # Skip boilerplate-only fragments (e.g. calendar headers with no
+        # substantive ruling content).
+        if _is_boilerplate_only(ruling_text):
+            continue
 
         results.append(
             SplitResult(
@@ -347,6 +410,11 @@ def _split_case_number_based(text: str) -> list[SplitResult]:
             next_line_idx = len(lines)
 
         ruling_text = "\n".join(lines[line_idx:next_line_idx]).strip()
+
+        # Skip boilerplate-only fragments (e.g. calendar headers with no
+        # substantive ruling content).
+        if _is_boilerplate_only(ruling_text):
+            continue
 
         # Extract motion type from the first line.
         motion_type: str | None = None
