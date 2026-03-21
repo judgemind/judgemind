@@ -295,6 +295,19 @@ def test_sc_case_number_probate_not_other_prefixes() -> None:
     assert parse_case_number("25AB199782") is None
 
 
+def test_sc_case_number_case_insensitive() -> None:
+    """parse_case_number should match lowercase input and return uppercase."""
+    assert parse_case_number("25pr199782") == "25PR199782"
+    assert parse_case_number("24cv443183") == "24CV443183"
+    assert parse_case_number("25Pr199782") == "25PR199782"
+
+
+def test_sc_case_numbers_case_insensitive() -> None:
+    """parse_all_case_numbers should match lowercase input and return uppercase."""
+    result = parse_all_case_numbers("24cv443183 25pr199782")
+    assert result == ["24CV443183", "25PR199782"]
+
+
 # ---------------------------------------------------------------------------
 # Outcome extraction
 # ---------------------------------------------------------------------------

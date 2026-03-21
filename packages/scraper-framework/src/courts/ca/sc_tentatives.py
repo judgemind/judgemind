@@ -85,13 +85,14 @@ _DATE_RE = re.compile(
 )
 
 # Case number: 2-digit year prefix + CV or PR + 6 digits (e.g. 24CV443183, 25PR199782)
-_CASE_NUMBER_RE = re.compile(r"\b\d{2}(?:CV|PR)\d{6}\b")
+_CASE_NUMBER_RE = re.compile(r"\b\d{2}(?:CV|PR)\d{6}\b", re.IGNORECASE)
 
 # Case line in summary table: "LINE N CASENO CaseTitle MotionType/TentativeRuling"
 # Also handles lines like "9:00 24CV443183" and ";"-separated lines
 _CASE_LINE_RE = re.compile(
     r"(?:LINE\s+)?(?:\d+[,;]?\s+)?(?P<case_number>\d{2}(?:CV|PR)\d{6})\s+"
     r"(?P<case_title>[^\n]+?)(?:\s{2,})(?P<motion_or_ruling>[^\n]+)",
+    re.IGNORECASE,
 )
 
 # Outcome keywords
@@ -305,14 +306,20 @@ def parse_hearing_date(text: str) -> Any:
 
 
 def parse_case_number(text: str) -> str | None:
-    """Extract the first case number from PDF text."""
+    """Extract the first case number from PDF text.
+
+    The match is case-insensitive; the returned value is always uppercase.
+    """
     m = _CASE_NUMBER_RE.search(text)
-    return m.group(0) if m else None
+    return m.group(0).upper() if m else None
 
 
 def parse_all_case_numbers(text: str) -> list[str]:
-    """Extract all unique case numbers from PDF text."""
-    return list(dict.fromkeys(_CASE_NUMBER_RE.findall(text)))
+    """Extract all unique case numbers from PDF text.
+
+    The match is case-insensitive; returned values are always uppercase.
+    """
+    return list(dict.fromkeys(cn.upper() for cn in _CASE_NUMBER_RE.findall(text)))
 
 
 def parse_outcome(text: str) -> str | None:
