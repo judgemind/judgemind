@@ -80,6 +80,10 @@ FIELD_DROP_P2_THRESHOLD = 5.0  # 5-10pp drop = p2
 # Window for recent-only field completeness checks (days).
 FIELD_COMPLETENESS_WINDOW_DAYS = 7
 
+# Grace period (minutes) — exclude documents created this recently so the
+# ingestion pipeline has time to process them before they are evaluated.
+FIELD_COMPLETENESS_GRACE_MINUTES = 30
+
 # Minimum number of documents in the window for field completeness checks.
 # Counties with fewer than this many documents are skipped to avoid noisy
 # alerts from tiny sample sizes (e.g. 1 bad doc out of 3 total = 33% drop).
@@ -238,6 +242,7 @@ FIELD_GAP_DOCS_QUERY = """
     LEFT JOIN cases c ON c.id = d.case_id
     WHERE d.status = 'active'
       AND d.created_at >= %s
+      AND d.created_at <= %s
       AND (
           r.judge_id IS NULL
           OR r.motion_type IS NULL
@@ -274,6 +279,7 @@ FIELD_COMPLETENESS_QUERY = """
     LEFT JOIN cases c ON c.id = d.case_id
     WHERE d.status = 'active'
       AND d.created_at >= %s
+      AND d.created_at <= %s
     {county_filter}
     GROUP BY ct.county ORDER BY ct.county
 """
@@ -349,7 +355,9 @@ def _query_field_completeness(
     """Query the database for current field completeness percentages.
 
     Only considers documents created within the last FIELD_COMPLETENESS_WINDOW_DAYS
-    to focus on recent regressions and keep the query fast.
+    and at least FIELD_COMPLETENESS_GRACE_MINUTES ago, to focus on recent
+    regressions while excluding documents still being processed by the
+    ingestion pipeline.
 
     Args:
         conn: Database connection.
@@ -363,13 +371,14 @@ def _query_field_completeness(
     """
     county_filter, county_params = _build_county_filter(county)
     cutoff = now - timedelta(days=FIELD_COMPLETENESS_WINDOW_DAYS)
+    grace_cutoff = now - timedelta(minutes=FIELD_COMPLETENESS_GRACE_MINUTES)
     result: dict[str, dict[str, float]] = {}
     totals: dict[str, int] = {}
 
     with conn.cursor() as cur:
         cur.execute(
             FIELD_COMPLETENESS_QUERY.format(county_filter=county_filter),
-            (cutoff, *county_params),
+            (cutoff, grace_cutoff, *county_params),
         )
         for row in cur.fetchall():
             (
@@ -948,7 +957,11 @@ def _collect_full_metrics(
     with conn.cursor() as cur:
         cur.execute(
             FIELD_GAP_DOCS_QUERY.format(county_filter=county_filter),
-            (now - timedelta(days=FIELD_COMPLETENESS_WINDOW_DAYS), *county_params),
+            (
+                now - timedelta(days=FIELD_COMPLETENESS_WINDOW_DAYS),
+                now - timedelta(minutes=FIELD_COMPLETENESS_GRACE_MINUTES),
+                *county_params,
+            ),
         )
         for row in cur.fetchall():
             county_name, doc_id = row[0], str(row[1])
