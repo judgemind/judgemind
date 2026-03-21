@@ -36,8 +36,10 @@ from datetime import datetime
 from typing import Any
 
 import psycopg
+import psycopg.errors
 
 # Import from the installed scraper-framework package.
+from ingestion.db import normalize_ruling_text_hash
 from ingestion.splitter import SplitResult, make_split_document_id, split_document
 
 logging.basicConfig(
@@ -252,6 +254,7 @@ def apply_split(
     split_doc_ids: list[str] = []
     split_case_numbers: list[str | None] = []
     split_case_titles: list[str | None] = []
+    skipped = 0
 
     for idx, split in enumerate(splits):
         split_doc_id = make_split_document_id(candidate.document_id, idx)
@@ -296,10 +299,11 @@ def apply_split(
         # Upsert the document row for the split (shares original doc for archive).
         _upsert_split_document(conn, split_doc_id, case_id, candidate)
 
-        # Insert the split ruling.
+        # Insert the split ruling.  Returns False if a duplicate already exists
+        # (same case_id + ruling_text_hash from a previous backfill run).
         outcome = split.outcome or candidate.outcome
         motion_type = split.motion_type or candidate.motion_type
-        _insert_split_ruling(
+        inserted = _insert_split_ruling(
             conn,
             document_id=split_doc_id,
             case_id=case_id,
@@ -310,6 +314,16 @@ def apply_split(
             department=candidate.department,
             outcome=outcome,
             motion_type=motion_type,
+        )
+        if not inserted:
+            skipped += 1
+
+    if skipped:
+        logger.info(
+            "Skipped %d/%d splits for %s (duplicates already exist)",
+            skipped,
+            len(splits),
+            candidate.ruling_id,
         )
 
     # Delete the original combined ruling.
@@ -420,43 +434,71 @@ def _insert_split_ruling(
     department: str | None,
     outcome: str | None,
     motion_type: str | None,
-) -> None:
+) -> bool:
     """Insert a ruling row for a split ruling.
 
-    Uses ON CONFLICT (document_id) DO UPDATE for idempotency.
+    Uses ON CONFLICT (document_id) DO UPDATE for idempotency on same-document
+    reruns.  Also handles the (case_id, ruling_text_hash) unique constraint
+    to prevent duplicates when the same content is re-ingested with a different
+    parent document_id (the root cause of #1233).
+
+    Returns True if the ruling was inserted/updated, False if it was skipped
+    because an identical ruling already exists for the same case.
     """
+    text_hash = normalize_ruling_text_hash(ruling_text)
     with conn.cursor() as cur:
-        cur.execute(
-            """
-            INSERT INTO rulings (
-                document_id, case_id, court_id, judge_id,
-                hearing_date, ruling_text, department, is_tentative,
-                outcome, motion_type
+        # Use a savepoint so a UniqueViolation on the (case_id, ruling_text_hash)
+        # index doesn't abort the entire transaction.
+        cur.execute("SAVEPOINT insert_split_ruling")
+        try:
+            cur.execute(
+                """
+                INSERT INTO rulings (
+                    document_id, case_id, court_id, judge_id,
+                    hearing_date, ruling_text, ruling_text_hash,
+                    department, is_tentative,
+                    outcome, motion_type
+                )
+                VALUES (
+                    %s::uuid, %s::uuid, %s::uuid, %s::uuid,
+                    %s::date, %s, %s,
+                    %s, TRUE,
+                    %s::ruling_outcome, %s
+                )
+                ON CONFLICT (document_id) DO UPDATE SET
+                    ruling_text = EXCLUDED.ruling_text,
+                    ruling_text_hash = EXCLUDED.ruling_text_hash,
+                    judge_id = COALESCE(EXCLUDED.judge_id, rulings.judge_id),
+                    outcome = COALESCE(EXCLUDED.outcome, rulings.outcome),
+                    motion_type = COALESCE(EXCLUDED.motion_type, rulings.motion_type),
+                    department = COALESCE(EXCLUDED.department, rulings.department)
+                """,
+                (
+                    document_id,
+                    case_id,
+                    court_id,
+                    judge_id,
+                    hearing_date,
+                    ruling_text,
+                    text_hash,
+                    department,
+                    outcome,
+                    motion_type,
+                ),
             )
-            VALUES (
-                %s::uuid, %s::uuid, %s::uuid, %s::uuid,
-                %s::date, %s, %s, TRUE,
-                %s::ruling_outcome, %s
-            )
-            ON CONFLICT (document_id) DO UPDATE SET
-                ruling_text = EXCLUDED.ruling_text,
-                judge_id = COALESCE(EXCLUDED.judge_id, rulings.judge_id),
-                outcome = COALESCE(EXCLUDED.outcome, rulings.outcome),
-                motion_type = COALESCE(EXCLUDED.motion_type, rulings.motion_type),
-                department = COALESCE(EXCLUDED.department, rulings.department)
-            """,
-            (
-                document_id,
+            cur.execute("RELEASE SAVEPOINT insert_split_ruling")
+        except psycopg.errors.UniqueViolation:
+            # A ruling with the same (case_id, ruling_text_hash) already exists
+            # from a previous backfill run with a different parent document_id.
+            # This is expected — just skip the duplicate insert.
+            cur.execute("ROLLBACK TO SAVEPOINT insert_split_ruling")
+            logger.info(
+                "Skipping duplicate ruling for case_id=%s (text_hash=%s already exists)",
                 case_id,
-                court_id,
-                judge_id,
-                hearing_date,
-                ruling_text,
-                department,
-                outcome,
-                motion_type,
-            ),
-        )
+                text_hash,
+            )
+            return False
+    return True
 
 
 def _delete_original_ruling(

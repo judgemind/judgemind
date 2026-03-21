@@ -18,7 +18,9 @@ import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
+
+import psycopg.errors
 
 from ingestion.splitter import SplitResult, _splitter_registry, register_splitter
 
@@ -46,6 +48,7 @@ try_split = backfill_mod.try_split
 apply_split = backfill_mod.apply_split
 process_batch = backfill_mod.process_batch
 fetch_candidates = backfill_mod.fetch_candidates
+_insert_split_ruling = backfill_mod._insert_split_ruling
 _CURSOR_MIN_TIMESTAMP = backfill_mod._CURSOR_MIN_TIMESTAMP
 _CURSOR_MIN_UUID = backfill_mod._CURSOR_MIN_UUID
 
@@ -577,3 +580,198 @@ class TestRunBackfill:
         stats = backfill_mod.run_backfill("postgresql://test", dry_run=True, limit=2)
 
         assert stats["total_checked"] == 2
+
+
+# ---------------------------------------------------------------------------
+# Idempotency tests (#1233)
+# ---------------------------------------------------------------------------
+
+
+class TestInsertSplitRulingIdempotency:
+    """Tests for _insert_split_ruling handling duplicate content gracefully."""
+
+    def test_returns_true_on_successful_insert(self) -> None:
+        """Normal insert returns True."""
+        conn = MagicMock()
+        mock_cursor = MagicMock()
+        conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cursor)
+        conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+
+        result = _insert_split_ruling(
+            conn,
+            document_id="dddddddd-0000-0000-0000-000000000001",
+            case_id="cccccccc-0000-0000-0000-000000000001",
+            court_id="tttttttt-0000-0000-0000-000000000001",
+            judge_id=None,
+            hearing_date="2026-03-15",
+            ruling_text="Some ruling text",
+            department="N15",
+            outcome=None,
+            motion_type=None,
+        )
+        assert result is True
+
+    def test_returns_false_on_unique_violation(self) -> None:
+        """When UniqueViolation is raised (duplicate text hash), returns False."""
+        conn = MagicMock()
+        mock_cursor = MagicMock()
+        conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cursor)
+        conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+
+        # First call is SAVEPOINT, second call is the INSERT which raises.
+        call_count = 0
+
+        def side_effect(*args: Any, **kwargs: Any) -> None:
+            nonlocal call_count
+            call_count += 1
+            if call_count == 2:
+                raise psycopg.errors.UniqueViolation("duplicate key")
+
+        mock_cursor.execute.side_effect = side_effect
+
+        result = _insert_split_ruling(
+            conn,
+            document_id="dddddddd-0000-0000-0000-000000000002",
+            case_id="cccccccc-0000-0000-0000-000000000001",
+            court_id="tttttttt-0000-0000-0000-000000000001",
+            judge_id=None,
+            hearing_date="2026-03-15",
+            ruling_text="Some ruling text",
+            department="N15",
+            outcome=None,
+            motion_type=None,
+        )
+        assert result is False
+
+    def test_savepoint_rollback_on_unique_violation(self) -> None:
+        """On UniqueViolation, the savepoint is rolled back (not the transaction)."""
+        conn = MagicMock()
+        mock_cursor = MagicMock()
+        conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cursor)
+        conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+
+        call_count = 0
+
+        def side_effect(*args: Any, **kwargs: Any) -> None:
+            nonlocal call_count
+            call_count += 1
+            if call_count == 2:
+                raise psycopg.errors.UniqueViolation("duplicate key")
+
+        mock_cursor.execute.side_effect = side_effect
+
+        _insert_split_ruling(
+            conn,
+            document_id="dddddddd-0000-0000-0000-000000000002",
+            case_id="cccccccc-0000-0000-0000-000000000001",
+            court_id="tttttttt-0000-0000-0000-000000000001",
+            judge_id=None,
+            hearing_date="2026-03-15",
+            ruling_text="Some ruling text",
+            department="N15",
+            outcome=None,
+            motion_type=None,
+        )
+
+        # Verify: SAVEPOINT, INSERT (raises), ROLLBACK TO SAVEPOINT
+        execute_calls = mock_cursor.execute.call_args_list
+        assert execute_calls[0] == call("SAVEPOINT insert_split_ruling")
+        assert execute_calls[2] == call("ROLLBACK TO SAVEPOINT insert_split_ruling")
+
+    def test_includes_ruling_text_hash_in_insert(self) -> None:
+        """The INSERT includes ruling_text_hash for dedup."""
+        conn = MagicMock()
+        mock_cursor = MagicMock()
+        conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cursor)
+        conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+
+        _insert_split_ruling(
+            conn,
+            document_id="dddddddd-0000-0000-0000-000000000001",
+            case_id="cccccccc-0000-0000-0000-000000000001",
+            court_id="tttttttt-0000-0000-0000-000000000001",
+            judge_id=None,
+            hearing_date="2026-03-15",
+            ruling_text="Some ruling text",
+            department="N15",
+            outcome=None,
+            motion_type=None,
+        )
+
+        # The INSERT SQL should mention ruling_text_hash.
+        insert_call = mock_cursor.execute.call_args_list[1]
+        sql = insert_call[0][0]
+        assert "ruling_text_hash" in sql
+
+
+class TestApplySplitIdempotency:
+    """Tests for apply_split skipping duplicates gracefully (#1233)."""
+
+    def setup_method(self) -> None:
+        self._saved_registry = dict(_splitter_registry)
+        _splitter_registry.clear()
+
+    def teardown_method(self) -> None:
+        _splitter_registry.clear()
+        _splitter_registry.update(self._saved_registry)
+
+    @patch("backfill_split_rulings._insert_split_ruling")
+    @patch("backfill_split_rulings._upsert_split_document")
+    @patch("backfill_split_rulings._delete_original_ruling")
+    def test_skips_duplicate_splits_and_still_deletes_original(
+        self,
+        mock_delete: MagicMock,
+        mock_upsert_doc: MagicMock,
+        mock_insert: MagicMock,
+    ) -> None:
+        """When all splits are duplicates, apply_split still deletes the original."""
+        # _insert_split_ruling returns False for all splits (all are duplicates).
+        mock_insert.return_value = False
+
+        candidate = _make_candidate(
+            ruling_id="rrrrrrrr-0000-0000-0000-000000000099",
+            case_id="cccccccc-0000-0000-0000-000000000001",
+            case_number="ORIG-001",
+            case_title="A v. B",
+        )
+        splits = [
+            SplitResult(ruling_text="Text A", case_title="A v. B"),
+            SplitResult(ruling_text="Text B", case_title="A v. B"),
+        ]
+
+        conn = MagicMock()
+        action = apply_split(conn, candidate, splits)
+
+        # Original should still be deleted even though all splits were skipped.
+        mock_delete.assert_called_once()
+        delete_args = mock_delete.call_args[0]
+        assert delete_args[1] == "rrrrrrrr-0000-0000-0000-000000000099"
+        # Action should still report 2 splits.
+        assert action.split_count == 2
+
+    @patch("backfill_split_rulings._insert_split_ruling")
+    @patch("backfill_split_rulings._upsert_split_document")
+    @patch("backfill_split_rulings._delete_original_ruling")
+    def test_partial_duplicates_inserts_new_ones(
+        self,
+        mock_delete: MagicMock,
+        mock_upsert_doc: MagicMock,
+        mock_insert: MagicMock,
+    ) -> None:
+        """When some splits are duplicates and some are new, new ones are inserted."""
+        # First split is a duplicate, second is new.
+        mock_insert.side_effect = [False, True]
+
+        candidate = _make_candidate(
+            case_number="ORIG-001",
+            case_title="A v. B",
+        )
+        splits = [
+            SplitResult(ruling_text="Text A (duplicate)", case_title="A v. B"),
+            SplitResult(ruling_text="Text B (new)", case_title="A v. B"),
+        ]
+
+        action = apply_split(MagicMock(), candidate, splits)
+
+        assert mock_insert.call_count == 2
+        assert action.split_count == 2
