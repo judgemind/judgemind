@@ -107,6 +107,45 @@ class TestSanitizeTitle:
 
 
 # ---------------------------------------------------------------------------
+# sanitize_title_lenient — lenient length for backfill
+# ---------------------------------------------------------------------------
+
+
+class TestSanitizeTitleLenient:
+    """Tests for the sanitize_title_lenient() function."""
+
+    def test_accepts_title_between_120_and_250(self) -> None:
+        """Titles > 120 chars but <= 250 chars pass the lenient check."""
+        # Build a title that is > 120 chars after cleaning
+        long_plaintiff = "Smith, Jones, Williams, Brown, Davis, Miller, Wilson, Thompson, Garcia"
+        long_defendant = "Anderson, Taylor, Thomas, Jackson, White, Harris, Martin, Robinson, Clark"
+        title = f"{long_plaintiff} v. {long_defendant}"
+        assert len(title) > 120
+        assert len(title) <= 250
+        result = backfill.sanitize_title_lenient(title)
+        assert result is not None
+        assert result == title
+
+    def test_rejects_title_over_250(self) -> None:
+        """Titles > 250 chars are rejected even with lenient check."""
+        title = "A" * 125 + " v. " + "B" * 125
+        assert backfill.sanitize_title_lenient(title) is None
+
+    def test_strips_descriptors_from_long_title(self) -> None:
+        """Entity descriptors are stripped from multi-party titles."""
+        title = (
+            "Safoura Majma, An Individual, Kaveh Majma, An Individual "
+            "v. Oak Enterprises, A California Corporation, Bob Smith, An Individual"
+        )
+        result = backfill.sanitize_title_lenient(title)
+        assert result is not None
+        assert "An Individual" not in result
+        assert "A California Corporation" not in result
+        assert "Safoura Majma" in result
+        assert "Oak Enterprises" in result
+
+
+# ---------------------------------------------------------------------------
 # clean_case_title — combined strategy
 # ---------------------------------------------------------------------------
 
@@ -123,8 +162,8 @@ class TestCleanCaseTitle:
 
     def test_strategy2_fallback_to_caption(self) -> None:
         """When sanitize_title returns None, extract from ruling text caption."""
-        # A title too long even after sanitization (> 120 chars cleaned)
-        old = "A" * 200
+        # A title too long even for lenient sanitization (> 250 chars)
+        old = "A" * 260
         ruling_text = (
             "Smith\n  Plaintiff(s),\n  vs.\n  Jones\n  Defendant(s).\nMOVING PARTY: Someone"
         )
@@ -135,7 +174,7 @@ class TestCleanCaseTitle:
 
     def test_strategy2_fallback_to_moving_responding(self) -> None:
         """When caption fails, fall back to MOVING/RESPONDING PARTY fields."""
-        old = "A" * 200
+        old = "A" * 260
         ruling_text = (
             "MOVING PARTY: Plaintiff Alice Walker.\nRESPONDING PARTY: Defendant Bob Smith.\n"
         )
@@ -146,15 +185,26 @@ class TestCleanCaseTitle:
 
     def test_returns_none_when_all_fail(self) -> None:
         """Returns None when both strategies fail."""
-        old = "A" * 200
+        old = "A" * 260
         result = backfill.clean_case_title(old, ruling_text="no useful content")
         assert result is None
 
     def test_returns_none_no_ruling_text(self) -> None:
         """Returns None when sanitize fails and no ruling text available."""
-        old = "A" * 200
+        old = "A" * 260
         result = backfill.clean_case_title(old, ruling_text=None)
         assert result is None
+
+    def test_lenient_sanitize_preferred_over_ruling_text(self) -> None:
+        """Multi-party titles > 120 chars are cleaned via lenient sanitize."""
+        old = (
+            "Safoura Majma, An Individual, Kaveh Majma, An Individual "
+            "v. Oak Enterprises, A California Corporation, Bob Smith, An Individual"
+        )
+        result = backfill.clean_case_title(old, ruling_text=None)
+        assert result is not None
+        assert "An Individual" not in result
+        assert "A California Corporation" not in result
 
 
 # ---------------------------------------------------------------------------
