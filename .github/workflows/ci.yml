@@ -520,6 +520,8 @@ jobs:
         run: scripts/tests/test_check_hardcoded_models.sh
       - name: Test schema drift checker
         run: scripts/tests/test_check_schema_drift.sh
+      - name: Test duplicate function checker
+        run: scripts/tests/test_check_duplicate_functions.sh
       - name: Test gemini-review.sh smoke tests
         run: scripts/tests/test_gemini_review.sh
 
@@ -742,6 +744,16 @@ jobs:
         run: scripts/check-oneshot-imports.sh
 
   # ---------------------------------------------------------------
+  # Duplicate function guard: detect shadowed function definitions
+  # ---------------------------------------------------------------
+  duplicate-functions-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Check for duplicate function definitions in Python
+        run: scripts/check-duplicate-functions.sh
+
+  # ---------------------------------------------------------------
   # ECS oneshot Docker integration test: run scripts in a container
   # ---------------------------------------------------------------
   ecs-oneshot-test:
@@ -791,7 +803,7 @@ jobs:
   # Always runs. Reports success only when every applicable job passed or was
   # skipped (path filter did not match). Branch protection requires this check.
   ci-passed:
-    needs: [scraper-unit-tests, ingestion-tests, nlp-tests, api-tests, web-tests, telegram-bridge-tests, infra-validate, lambda-tests, scripts-tests, coverage-check, deprecated-models-check, hardcoded-models-check, oneshot-imports-check, schema-drift-check, dq-baselines-validate, ecs-oneshot-test]
+    needs: [scraper-unit-tests, ingestion-tests, nlp-tests, api-tests, web-tests, telegram-bridge-tests, infra-validate, lambda-tests, scripts-tests, coverage-check, deprecated-models-check, hardcoded-models-check, oneshot-imports-check, duplicate-functions-check, schema-drift-check, dq-baselines-validate, ecs-oneshot-test]
     if: always()
     runs-on: ubuntu-latest
     steps:
