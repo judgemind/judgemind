@@ -84,6 +84,7 @@ from ingestion.llm_extract import (  # noqa: E402
     LLMExtractionResult,
     LLMRulingResult,
     extract_fields_llm,
+    extract_text_from_pdf,
 )
 from ingestion.llm_providers import create_client as create_llm_client  # noqa: E402
 
@@ -300,17 +301,25 @@ def _extract_text_from_content(
     approach using ``PyThreadState_SetAsyncExc`` could not interrupt
     pdfplumber's C PDF parser, leading to hung threads and blocked batches.
 
+    When pdfplumber returns no text (image-only PDFs), falls back to OCR
+    via the framework's ``extract_text_from_pdf()`` which uses LLM vision.
+
     For other formats (HTML, plain text), decodes as UTF-8.
     """
     if doc_format == "pdf":
         text = _extract_pdf_text_subprocess(raw_content, timeout=pdf_timeout)
         if text and text.strip():
             return text
-        # Subprocess failed (timeout, crash, or empty output) — fall back
-        # to UTF-8 decode rather than risking an in-process hang.
-        logger.debug(
-            "PDF subprocess extraction returned no text, falling back to UTF-8"
-        )
+        # Subprocess returned no text — likely an image-only PDF.
+        # Try OCR fallback via the framework's extract_text_from_pdf(),
+        # which renders pages and uses LLM vision for OCR (#1334).
+        # Pass the original raw bytes to avoid lossy UTF-8 round-trip.
+        logger.debug("PDF subprocess extraction returned no text, trying OCR fallback")
+        ocr_text = extract_text_from_pdf(raw_content)
+        if ocr_text and ocr_text.strip():
+            return ocr_text
+        # OCR also failed — fall back to UTF-8 decode as last resort.
+        logger.debug("OCR fallback returned no text, falling back to UTF-8")
     return raw_content.decode("utf-8", errors="replace")
 
 

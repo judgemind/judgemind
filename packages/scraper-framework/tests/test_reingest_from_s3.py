@@ -1657,6 +1657,50 @@ class TestExtractTextFromContent:
         result = reingest._extract_text_from_content(fake_pdf, "pdf")
         assert result == "not a real pdf"
 
+    def test_pdf_ocr_fallback_for_image_only_pdf(self) -> None:
+        """Image-only PDF uses OCR fallback instead of lossy UTF-8 decode."""
+        # Simulate a valid PDF where pdfplumber returns no text (image-only).
+        # The subprocess returns None, then extract_text_from_pdf (OCR) is called.
+        fake_pdf = b"%PDF-1.4 fake image-only pdf content"
+        ocr_text = "OCR extracted text from court document"
+
+        with (
+            patch.object(
+                reingest,
+                "_extract_pdf_text_subprocess",
+                return_value=None,
+            ),
+            patch(
+                "reingest_from_s3.extract_text_from_pdf",
+                return_value=ocr_text,
+            ) as mock_ocr,
+        ):
+            result = reingest._extract_text_from_content(fake_pdf, "pdf")
+
+        # Should use OCR result, not garbled UTF-8 decode
+        assert result == ocr_text
+        mock_ocr.assert_called_once_with(fake_pdf)
+
+    def test_pdf_falls_back_to_utf8_when_ocr_also_fails(self) -> None:
+        """When both pdfplumber and OCR fail, falls back to UTF-8 decode."""
+        fake_pdf = b"not a real pdf"
+
+        with (
+            patch.object(
+                reingest,
+                "_extract_pdf_text_subprocess",
+                return_value=None,
+            ),
+            patch(
+                "reingest_from_s3.extract_text_from_pdf",
+                return_value=None,
+            ),
+        ):
+            result = reingest._extract_text_from_content(fake_pdf, "pdf")
+
+        # Should fall back to UTF-8 decode
+        assert result == "not a real pdf"
+
     def test_unknown_format_decoded_as_utf8(self) -> None:
         """Unknown format is decoded as UTF-8."""
         content = b"some text content"
