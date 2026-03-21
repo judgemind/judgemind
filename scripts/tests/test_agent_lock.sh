@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# test_agent_lock.sh — Tests for the agent lock file mechanism (#1260, #1254)
+# test_agent_lock.sh — Tests for the agent lock file mechanism (#1260, #1254, #1356)
 #
 # Tests:
 #   - start-worker.sh creates .agent-lock in new worktrees
@@ -11,6 +11,10 @@
 #   - start-worker.sh preserves unregistered dirs with fresh locks (#1254)
 #   - start-worker.sh skips worker numbers with fresh-locked dirs (#1254)
 #   - start-worker.sh reclaims worker numbers after stale/missing locks (#1254)
+#   - start-worker.sh creates PID lock file (#1356)
+#   - start-worker.sh skips PID-locked worker numbers (#1356)
+#   - start-worker.sh reclaims worker numbers with dead-PID locks (#1356)
+#   - end-worker.sh removes PID lock file (#1356)
 #
 # Usage:
 #   scripts/tests/test_agent_lock.sh
@@ -285,6 +289,91 @@ else
 fi
 # Clean up
 git -C "$TEMP_REPO" worktree remove "$new_wt5" --force 2>/dev/null || true
+
+# ── Test 15: start-worker.sh creates PID lock file (#1356) ────────────
+new_wt6=$(run_start 2>/dev/null | tail -1) || true
+new_wt6_num=$(basename "$new_wt6" | sed 's/worker-//')
+pid_lock="$TEMP_REPO/tmp/worker-locks/worker-${new_wt6_num}.lock"
+if [[ -f "$pid_lock" ]]; then
+    pass "start-worker.sh creates PID lock file (#1356)"
+else
+    fail "start-worker.sh creates PID lock file (#1356)" "lock not found at $pid_lock"
+fi
+
+# ── Test 16: PID lock file contains pid and timestamp (#1356) ─────────
+if [[ -f "$pid_lock" ]]; then
+    pid_line=$(head -1 "$pid_lock" 2>/dev/null)
+    ts_line=$(sed -n '2p' "$pid_lock" 2>/dev/null)
+    if [[ "$pid_line" =~ ^pid:\ [0-9]+ ]] && [[ "$ts_line" =~ ^timestamp:\ [0-9]{4}- ]]; then
+        pass "PID lock file contains pid and timestamp (#1356)"
+    else
+        fail "PID lock file contains pid and timestamp (#1356)" "content: '$pid_line' / '$ts_line'"
+    fi
+fi
+
+# ── Test 17: end-worker.sh removes PID lock file (#1356) ─────────────
+run_end "$new_wt6" --force > /dev/null 2>&1
+if [[ ! -f "$pid_lock" ]]; then
+    pass "end-worker.sh removes PID lock file (#1356)"
+else
+    fail "end-worker.sh removes PID lock file (#1356)" "lock file still exists at $pid_lock"
+fi
+
+# ── Test 18: start-worker.sh skips PID-locked worker numbers (#1356) ──
+# Create a worktree for worker-1, then create a PID lock with our current
+# shell's PID (which is alive). A new start-worker should skip worker-1.
+create_worker 1
+date -u +%Y-%m-%dT%H:%M:%SZ > "$TEMP_REPO/worktrees/worker-1/.agent-lock"
+mkdir -p "$TEMP_REPO/tmp/worker-locks"
+# Use $$ (the test script's PID) which is guaranteed alive
+printf 'pid: %s\ntimestamp: %s\n' "$$" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$TEMP_REPO/tmp/worker-locks/worker-1.lock"
+
+new_wt7=$(run_start 2>/dev/null | tail -1) || true
+new_wt7_num=$(basename "$new_wt7" | sed 's/worker-//')
+if [[ "$new_wt7_num" != "1" ]]; then
+    pass "start-worker.sh skips PID-locked worker number (#1356)"
+else
+    fail "start-worker.sh skips PID-locked worker number (#1356)" "got worker-1, expected different number"
+fi
+# Clean up
+git -C "$TEMP_REPO" worktree remove "$new_wt7" --force 2>/dev/null || true
+git -C "$TEMP_REPO" worktree remove "$TEMP_REPO/worktrees/worker-1" --force 2>/dev/null || true
+rm -f "$TEMP_REPO/tmp/worker-locks/worker-1.lock"
+
+# ── Test 19: start-worker.sh reclaims worker with dead-PID lock (#1356) ──
+# Write a lock file with a PID that does not exist. start-worker should
+# reclaim that number.
+mkdir -p "$TEMP_REPO/tmp/worker-locks"
+printf 'pid: 99999999\ntimestamp: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$TEMP_REPO/tmp/worker-locks/worker-1.lock"
+
+new_wt8=$(run_start 2>/dev/null | tail -1) || true
+new_wt8_num=$(basename "$new_wt8" | sed 's/worker-//')
+if [[ "$new_wt8_num" == "1" ]]; then
+    pass "start-worker.sh reclaims worker number with dead-PID lock (#1356)"
+else
+    fail "start-worker.sh reclaims worker number with dead-PID lock (#1356)" "got worker-$new_wt8_num, expected worker-1"
+fi
+# Clean up
+git -C "$TEMP_REPO" worktree remove "$new_wt8" --force 2>/dev/null || true
+rm -f "$TEMP_REPO/tmp/worker-locks/worker-1.lock"
+
+# ── Test 20: concurrent start-worker.sh get different numbers (#1356) ──
+# Run two start-worker.sh in quick succession. They should get different
+# worker numbers thanks to the PID lock mechanism.
+wt_a=$(run_start 2>/dev/null | tail -1) || true
+wt_b=$(run_start 2>/dev/null | tail -1) || true
+wt_a_num=$(basename "$wt_a" | sed 's/worker-//')
+wt_b_num=$(basename "$wt_b" | sed 's/worker-//')
+if [[ "$wt_a_num" != "$wt_b_num" && -n "$wt_a_num" && -n "$wt_b_num" ]]; then
+    pass "Two sequential start-worker.sh get different worker numbers (#1356)"
+else
+    fail "Two sequential start-worker.sh get different worker numbers (#1356)" "got worker-$wt_a_num and worker-$wt_b_num"
+fi
+# Clean up
+git -C "$TEMP_REPO" worktree remove "$wt_a" --force 2>/dev/null || true
+git -C "$TEMP_REPO" worktree remove "$wt_b" --force 2>/dev/null || true
+rm -f "$TEMP_REPO/tmp/worker-locks/worker-${wt_a_num}.lock"
+rm -f "$TEMP_REPO/tmp/worker-locks/worker-${wt_b_num}.lock"
 
 # ── Summary ──────────────────────────────────────────────────────────────
 
