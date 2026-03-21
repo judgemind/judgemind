@@ -274,9 +274,10 @@ resource "aws_scheduler_schedule" "scraper" {
     role_arn = aws_iam_role.scheduler_execution.arn
 
     ecs_parameters {
-      task_definition_arn = aws_ecs_task_definition.scraper.arn
-      launch_type         = "FARGATE"
-      task_count          = 1
+      task_definition_arn    = aws_ecs_task_definition.scraper.arn
+      launch_type            = "FARGATE"
+      task_count             = 1
+      enable_execute_command = true
 
       network_configuration {
         subnets          = var.private_subnet_ids
