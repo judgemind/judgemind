@@ -16,6 +16,7 @@ Fixtures captured from live site 2026-03-02:
 
 from __future__ import annotations
 
+import re
 from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
@@ -32,6 +33,7 @@ from courts.ca.riverside_tentatives import (
     _extract_case_title_from_ruling,
     _extract_motion_type,
     _extract_outcome,
+    _filter_entry_matches,
     _is_no_tentative_rulings,
     _normalize_motion_type,
     _riv_courthouse,
@@ -1218,3 +1220,183 @@ def test_extract_case_title_psc_prefix() -> None:
     text = "PSC2101234 JOHNSON vs WILLIAMS Application for Protective Order"
     result = _extract_case_title_from_ruling(text)
     assert result == "Johnson v. Williams"
+
+
+# ---------------------------------------------------------------------------
+# _filter_entry_matches — spurious body entries (#1410)
+# ---------------------------------------------------------------------------
+
+
+class TestFilterEntryMatches:
+    """Verify _filter_entry_matches filters out numbered points in ruling body text."""
+
+    _ENTRY_RE = re.compile(r"^(?P<num>\d{1,3})\.\s*$", re.MULTILINE)
+
+    def test_no_spurious_entries(self) -> None:
+        """Normal entries (no body numbering) are kept as-is."""
+        text = (
+            "1.\nCVPS2306157 YELDELL vs HENSS\nTentative Ruling: Granted.\n"
+            "2.\nCVPS2306202 CRUMP vs IRWIN\nTentative Ruling: Denied.\n"
+        )
+        matches = list(self._ENTRY_RE.finditer(text))
+        result = _filter_entry_matches(matches, text)
+        assert len(result) == 2
+        assert [int(m.group("num")) for m in result] == [1, 2]
+
+    def test_body_numbered_points_filtered(self) -> None:
+        """Numbered points inside ruling body (no case number) are filtered out (#1410)."""
+        text = (
+            "1.\n"
+            "CVSW2405000 GERARDI vs MILO  Motion for Summary Judgment\n"
+            "Tentative Ruling: The Court rules as follows:\n"
+            "1.\n"
+            "The motion is granted as to the first cause of action.\n"
+            "2.\n"
+            "The motion is denied as to the second cause of action.\n"
+            "2.\n"
+            "CVSW2405417 REYNOLDS VS CITY OF TEMECULA  Motion for New Trial\n"
+            "Tentative Ruling: Hearing required.\n"
+        )
+        matches = list(self._ENTRY_RE.finditer(text))
+        assert len(matches) == 4  # raw: 1, 1, 2, 2
+
+        result = _filter_entry_matches(matches, text)
+        assert len(result) == 2  # only the real entries
+        assert [int(m.group("num")) for m in result] == [1, 2]
+
+    def test_body_numbered_points_different_numbers(self) -> None:
+        """Body points whose numbers differ from real entries are still filtered."""
+        text = (
+            "1.\n"
+            "CVSW2405000 GERARDI vs MILO  Motion\n"
+            "The court finds:\n"
+            "1.\n"
+            "Point one.\n"
+            "2.\n"
+            "Point two.\n"
+            "3.\n"
+            "CVSW2405417 REYNOLDS  Motion for New Trial\n"
+        )
+        matches = list(self._ENTRY_RE.finditer(text))
+        result = _filter_entry_matches(matches, text)
+        # Entry "1." kept, body "1." and "2." skipped, gap at 3 (expected 2) stops.
+        assert len(result) == 1
+        assert int(result[0].group("num")) == 1
+
+    def test_empty_matches(self) -> None:
+        """Empty match list returns empty."""
+        assert _filter_entry_matches([], "some text") == []
+
+    def test_single_entry(self) -> None:
+        """Single valid entry is kept."""
+        text = "1.\nCVPS2306157 YELDELL vs HENSS\nTentative Ruling: Granted.\n"
+        matches = list(self._ENTRY_RE.finditer(text))
+        result = _filter_entry_matches(matches, text)
+        assert len(result) == 1
+
+
+# ---------------------------------------------------------------------------
+# _split_rulings — ruling-to-case assignment regression tests (#1410)
+# ---------------------------------------------------------------------------
+
+
+class TestSplitRulingsNoMisAssignment:
+    """Verify ruling text is never assigned to the wrong case (#1410).
+
+    The root cause was that numbered points in ruling body text
+    (e.g. "The court finds:\\n1.\\nMotion is granted") matched the
+    ``_RULING_ENTRY_RE`` pattern, creating spurious split boundaries
+    that shifted ruling text to the wrong case.
+    """
+
+    def test_body_points_do_not_shift_ruling_assignment(self) -> None:
+        """Numbered body points do not cause off-by-one assignment."""
+        text = (
+            "Tentative Rulings for March 2, 2026\n"
+            "Department SW1\n\n"
+            "1.\n"
+            "CVSW2405000 GERARDI vs MILO  Motion for Summary Judgment\n"
+            "Tentative Ruling: The Court rules as follows:\n"
+            "1.\n"
+            "The motion is granted as to the first cause of action.\n"
+            "2.\n"
+            "The motion is denied as to the second cause of action.\n"
+            "2.\n"
+            "CVSW2405417 REYNOLDS VS CITY OF TEMECULA  Motion for New Trial\n"
+            "Tentative Ruling: Hearing required.\n"
+        )
+        rulings = _split_rulings(text)
+        assert len(rulings) == 2
+
+        # Ruling 1 belongs to Gerardi
+        assert rulings[0].case_number == "CVSW2405000"
+        assert "GERARDI" in rulings[0].ruling_text
+        # Ruling 1's text includes the body points (they are part of the ruling)
+        assert "The motion is granted" in rulings[0].ruling_text
+        assert "The motion is denied" in rulings[0].ruling_text
+
+        # Ruling 2 belongs to Reynolds — NOT Gerardi
+        assert rulings[1].case_number == "CVSW2405417"
+        assert "REYNOLDS" in rulings[1].ruling_text
+        assert "GERARDI" not in rulings[1].ruling_text
+
+    def test_three_entries_with_body_points_in_middle(self) -> None:
+        """Numbered body points in the middle entry do not shift later entries."""
+        text = (
+            "1.\n"
+            "CVRI2401443 HULL VS GENERAL MOTORS, LLC.\n"
+            "Tentative Ruling: Granted.\n"
+            "2.\n"
+            "CVRI2501821 CHO VS JAGUAR LAND ROVER\n"
+            "Tentative Ruling: The court orders:\n"
+            "1.\n"
+            "Discovery responses within 10 days.\n"
+            "2.\n"
+            "Sanctions of $500.\n"
+            "3.\n"
+            "CVRI2504487 GARCIA VS REYES\n"
+            "Tentative Ruling: Granted.\n"
+        )
+        rulings = _split_rulings(text)
+        assert len(rulings) == 3
+
+        assert rulings[0].case_number == "CVRI2401443"
+        assert "HULL" in rulings[0].ruling_text
+
+        assert rulings[1].case_number == "CVRI2501821"
+        assert "CHO" in rulings[1].ruling_text
+        # Body points are included in CHO's ruling text
+        assert "Discovery responses" in rulings[1].ruling_text
+
+        assert rulings[2].case_number == "CVRI2504487"
+        assert "GARCIA" in rulings[2].ruling_text
+
+    def test_each_ruling_contains_only_its_own_case_number(self) -> None:
+        """No ruling text contains another ruling's case number."""
+        text = (
+            "1.\n"
+            "CVSW2405000 GERARDI vs MILO  Motion\n"
+            "Tentative Ruling: Granted.\n"
+            "The court orders:\n"
+            "1.\n"
+            "Pay costs within 30 days.\n"
+            "2.\n"
+            "CVSW2405417 REYNOLDS  Motion for New Trial\n"
+            "Tentative Ruling: Hearing required.\n"
+            "3.\n"
+            "CVSW2405794 COFFELT vs STINSON  Motion\n"
+            "Tentative Ruling: Off Calendar.\n"
+        )
+        rulings = _split_rulings(text)
+        assert len(rulings) == 3
+
+        case_numbers = [r.case_number for r in rulings]
+        assert case_numbers == ["CVSW2405000", "CVSW2405417", "CVSW2405794"]
+
+        for i, ruling in enumerate(rulings):
+            for j, other in enumerate(rulings):
+                if i != j and other.case_number:
+                    assert other.case_number not in ruling.ruling_text, (
+                        f"Ruling {i} ({ruling.case_number}) contains "
+                        f"case number from ruling {j} ({other.case_number})"
+                    )
