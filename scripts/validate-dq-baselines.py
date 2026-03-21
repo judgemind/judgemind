@@ -10,7 +10,7 @@ Validations:
   3. Required fields are present in each ``field_completeness`` entry.
   4. ``schedule_type`` values are valid ("daily" or "frequent").
   5. ``expected_daily_rulings`` is non-negative.
-  6. ``posting_days`` values (if present) are valid day abbreviations.
+  6. ``posting_days`` is present and contains valid day abbreviations.
 
 Usage:
     scripts/validate-dq-baselines.py                      # default path
@@ -226,22 +226,23 @@ def validate_county_config(counties: dict[str, Any]) -> list[str]:
                 f"County '{county}' has negative expected_daily_rulings: {edr}"
             )
 
-        # posting_days validation
+        # posting_days validation — required for all counties
         posting_days = cfg.get("posting_days")
-        if posting_days is not None:
-            if not isinstance(posting_days, list):
+        if posting_days is None:
+            errors.append(f"County '{county}' is missing required 'posting_days' field")
+        elif not isinstance(posting_days, list):
+            errors.append(
+                f"County '{county}' posting_days must be a list, "
+                f"got {type(posting_days).__name__}"
+            )
+        else:
+            invalid_days = set(posting_days) - VALID_POSTING_DAYS
+            if invalid_days:
                 errors.append(
-                    f"County '{county}' posting_days must be a list, "
-                    f"got {type(posting_days).__name__}"
+                    f"County '{county}' has invalid posting_days: "
+                    f"{', '.join(sorted(invalid_days))} "
+                    f"(valid: {', '.join(sorted(VALID_POSTING_DAYS))})"
                 )
-            else:
-                invalid_days = set(posting_days) - VALID_POSTING_DAYS
-                if invalid_days:
-                    errors.append(
-                        f"County '{county}' has invalid posting_days: "
-                        f"{', '.join(sorted(invalid_days))} "
-                        f"(valid: {', '.join(sorted(VALID_POSTING_DAYS))})"
-                    )
 
     return errors
 

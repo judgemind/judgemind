@@ -33,10 +33,12 @@ def _valid_baselines() -> dict[str, Any]:
             "Los Angeles": {
                 "expected_daily_rulings": 50,
                 "schedule_type": "daily",
+                "posting_days": ["Mon", "Tue", "Wed", "Thu", "Fri"],
             },
             "Orange": {
                 "expected_daily_rulings": 20,
                 "schedule_type": "daily",
+                "posting_days": ["Mon", "Tue", "Wed", "Thu", "Fri"],
             },
         },
         "field_completeness": {
@@ -252,6 +254,7 @@ class TestValidateCountyConfig:
             "BadSchedule": {
                 "expected_daily_rulings": 5,
                 "schedule_type": "weekly",
+                "posting_days": ["Mon", "Tue", "Wed", "Thu", "Fri"],
             },
         }
         errors = validate_county_config(counties)
@@ -264,6 +267,7 @@ class TestValidateCountyConfig:
             "Negative County": {
                 "expected_daily_rulings": -1,
                 "schedule_type": "daily",
+                "posting_days": ["Mon", "Tue", "Wed", "Thu", "Fri"],
             },
         }
         errors = validate_county_config(counties)
@@ -313,10 +317,38 @@ class TestValidateCountyConfig:
             "Frequent County": {
                 "expected_daily_rulings": 10,
                 "schedule_type": "frequent",
+                "posting_days": ["Mon", "Tue", "Wed", "Thu", "Fri"],
             },
         }
         errors = validate_county_config(counties)
         assert errors == []
+
+    def test_missing_posting_days_flagged(self) -> None:
+        """County without posting_days should be flagged."""
+        counties = {
+            "NoDays County": {
+                "expected_daily_rulings": 5,
+                "schedule_type": "daily",
+            },
+        }
+        errors = validate_county_config(counties)
+        assert len(errors) == 1
+        assert "NoDays County" in errors[0]
+        assert "posting_days" in errors[0]
+
+    def test_missing_posting_days_does_not_mask_other_errors(self) -> None:
+        """Missing posting_days and invalid schedule_type produce separate errors."""
+        counties = {
+            "BadCounty": {
+                "expected_daily_rulings": 5,
+                "schedule_type": "weekly",
+            },
+        }
+        errors = validate_county_config(counties)
+        assert len(errors) == 2
+        messages = " ".join(errors)
+        assert "posting_days" in messages
+        assert "weekly" in messages
 
 
 class TestValidateIntegration:
@@ -357,6 +389,23 @@ class TestValidateIntegration:
         data = load_baselines_json(baselines_path)
         errors = validate(data)
         assert errors == [], f"Real baselines file has errors: {errors}"
+
+    def test_real_baselines_all_counties_have_posting_days(self) -> None:
+        """Every county in the real baselines file must have posting_days set."""
+        baselines_path = _REPO_ROOT / "data-quality-baselines.json"
+        if not baselines_path.exists():
+            return  # Skip if running outside repo context
+        data = load_baselines_json(baselines_path)
+        counties = data.get("counties", {})
+        missing = [
+            name
+            for name, cfg in counties.items()
+            if isinstance(cfg, dict) and "posting_days" not in cfg
+        ]
+        assert missing == [], (
+            f"Counties missing 'posting_days': {missing}. "
+            f"See #1372 for context on why this field is required."
+        )
 
 
 class TestLoadBaselinesJson:
