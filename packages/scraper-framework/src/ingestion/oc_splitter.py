@@ -437,6 +437,113 @@ def _split_case_number_based(text: str) -> list[SplitResult]:
 
 
 # ---------------------------------------------------------------------------
+# Boilerplate-only filter (#1253)
+# ---------------------------------------------------------------------------
+
+# Patterns that indicate calendar header boilerplate — not case-specific content.
+_BOILERPLATE_PATTERNS = re.compile(
+    r"(?:TENTATIVE RULINGS|LAW\s*[&]\s*MOTION\s*CALENDAR|"
+    r"Justice Center|If you are submitting|please call the Clerk|"
+    r"oral argument|not be scheduled|"
+    r"If ALL parties submit|"
+    r"Clerk at \(\d{3}\)|"
+    r"#\s+Case\s+Name\s+Tentative|"
+    r"#\s+CASE\s+NAME)",
+    re.IGNORECASE,
+)
+
+# Metadata lines that appear in calendar headers but don't match
+# _BOILERPLATE_PATTERNS.  These are generic header metadata (address, phone,
+# department, judge name, date/time, page numbers, etc.).
+# Ruling outcome keywords — lines containing these are substantive even if they
+# also contain a boilerplate phrase (e.g. "oral argument is DENIED").
+_RULING_KEYWORDS_RE = re.compile(
+    r"\b(?:granted|denied|sustained|overruled|continued|vacated|affirmed|"
+    r"reversed|remanded|dismissed|under submission|moot)\b",
+    re.IGNORECASE,
+)
+
+_METADATA_LINE_RE = re.compile(
+    r"^(?:"
+    r"DEPT\s|Judge\s|JUDGE\s|Date:|Time:|Page \d|"
+    r"North\s|Central\s|West\s|Costa Mesa|Complex|"
+    r"\d+\s+[NSEW]\.?\s+\w|"  # Address lines like "1141 N. Rice Street"
+    r"\w+,\s*CA\s+\d{5}|"  # City, CA ZIP
+    r"\(?\d{3}\)?\s*[-.]?\s*\d{3}\s*[-.]?\s*\d{4}|"  # Phone numbers
+    r"#\s*$"  # Bare "#" lines
+    r")",
+    re.IGNORECASE,
+)
+
+
+def _is_boilerplate_only(text: str) -> bool:
+    """Return True if the text contains only calendar header boilerplate.
+
+    Used to filter out split results that capture only the page header
+    (e.g. "TENTATIVE RULINGS / LAW & MOTION CALENDAR / Judge ...") without
+    any case-specific ruling content.
+
+    A result is boilerplate-only if it contains a boilerplate marker
+    (like "TENTATIVE RULINGS" or "LAW & MOTION") AND after removing
+    boilerplate/metadata lines, zero substantive lines remain.
+
+    Results without any boilerplate markers are never classified as
+    boilerplate — this prevents legitimate short rulings from being
+    filtered out.  Lines containing both boilerplate phrases and ruling
+    outcome keywords (e.g. "oral argument is DENIED") are treated as
+    substantive.
+    """
+    stripped = text.strip()
+    if not stripped:
+        return True
+
+    # Must contain at least one boilerplate marker to be considered
+    # boilerplate-only.  This prevents filtering legitimate short rulings
+    # that just happen to be brief (e.g. "The demurrer is SUSTAINED.").
+    if not _BOILERPLATE_PATTERNS.search(stripped):
+        return False
+
+    # Count non-boilerplate, non-blank lines.
+    non_boilerplate_lines = 0
+    for line in stripped.split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        # Skip lines that look like header metadata (DEPT, JUDGE, Date:, Time:,
+        # Page N of M, address/phone lines, bare # markers).
+        if _METADATA_LINE_RE.match(line):
+            continue
+        # Skip lines that match boilerplate patterns, but only if they do NOT
+        # also contain ruling keywords.  A line like "oral argument is DENIED"
+        # is substantive even though it contains "oral argument".
+        if _BOILERPLATE_PATTERNS.search(line):
+            if not _RULING_KEYWORDS_RE.search(line):
+                continue
+        non_boilerplate_lines += 1
+
+    # If no substantive (non-boilerplate) lines remain, it's header-only.
+    # Even a single substantive line means there is case-specific content.
+    return non_boilerplate_lines == 0
+
+
+def _filter_boilerplate(results: list[SplitResult]) -> list[SplitResult]:
+    """Remove boilerplate-only entries from split results (#1253).
+
+    Some split operations produce a result whose ruling_text contains only
+    the calendar page header (department name, judge, date, instructions)
+    without any case-specific content.  These are filtered out so they don't
+    become empty ruling records in the database.
+    """
+    filtered = [r for r in results if not _is_boilerplate_only(r.ruling_text)]
+    if len(filtered) < len(results):
+        logger.info(
+            "Filtered %d boilerplate-only split results",
+            len(results) - len(filtered),
+        )
+    return filtered
+
+
+# ---------------------------------------------------------------------------
 # Main OC splitter dispatch
 # ---------------------------------------------------------------------------
 
@@ -471,6 +578,7 @@ def split_oc_document(event_data: dict[str, Any]) -> list[SplitResult]:
     if _is_north_dept(department):
         results = _split_north(ruling_text)
         if results:
+            results = _filter_boilerplate(results)
             logger.info(
                 "Split North JC document",
                 department=department,
@@ -487,6 +595,7 @@ def split_oc_document(event_data: dict[str, Any]) -> list[SplitResult]:
 
     results = _split_case_number_based(ruling_text)
     if results:
+        results = _filter_boilerplate(results)
         logger.info(
             "Split OC document by case number",
             department=department,
