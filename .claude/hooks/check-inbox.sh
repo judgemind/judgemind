@@ -20,6 +20,12 @@ if [ -z "$TOPLEVEL" ]; then
     exit 0
 fi
 
+# Refresh the agent lock file if it exists, keeping it fresh while the agent
+# is actively running.  This runs after every tool call (~every few seconds),
+# so the lock never becomes stale while the agent is alive.
+AGENT_LOCK="${TOPLEVEL}/.agent-lock"
+[ -f "$AGENT_LOCK" ] && touch "$AGENT_LOCK"
+
 INBOX="${TOPLEVEL}/tmp/inbox.json"
 
 # Fast path: no inbox file or empty file — nothing to do

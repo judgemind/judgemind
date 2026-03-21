@@ -228,7 +228,7 @@ After sending the notification, immediately clean up the completed agent's workt
 2. Check if the worktree directory still exists. If it does not, the agent already cleaned up — skip to the next step.
 3. If it exists, remove it:
    ```
-   scripts/end-worker.sh {repo_root}/worktrees/worker-<N>
+   scripts/end-worker.sh {repo_root}/worktrees/worker-<N> --force
    ```
 4. If `end-worker.sh` fails (e.g. directory already partially removed), log the error but do not block the dispatch loop. The next `start-worker.sh` invocation will prune stale worktrees automatically.
 
