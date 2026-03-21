@@ -1768,6 +1768,26 @@ class TestNormalizeCaseTitle:
         result = normalize_case_title("SMITH AND JONES")
         assert result == "Smith And Jones"
 
+    def test_newline_in_title_stripped(self) -> None:
+        """Literal newline characters should be replaced with a single space."""
+        result = normalize_case_title("Husain\nv. McDonald")
+        assert result == "Husain v. McDonald"
+
+    def test_carriage_return_in_title_stripped(self) -> None:
+        """Carriage return characters should be replaced with a single space."""
+        result = normalize_case_title("Husain\r\nv. McDonald")
+        assert result == "Husain v. McDonald"
+
+    def test_tab_in_title_stripped(self) -> None:
+        """Tab characters should be replaced with a single space."""
+        result = normalize_case_title("Husain\tv. McDonald")
+        assert result == "Husain v. McDonald"
+
+    def test_multiple_newlines_collapsed(self) -> None:
+        """Multiple newlines should be collapsed to a single space."""
+        result = normalize_case_title("Smith\n\nv.\n\nJones")
+        assert result == "Smith v. Jones"
+
     def test_upsert_case_applies_normalization(self) -> None:
         """upsert_case should normalize ALL CAPS case titles."""
         conn = _mock_conn()
