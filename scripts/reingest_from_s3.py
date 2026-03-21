@@ -26,6 +26,11 @@ Options:
     --concurrency N     Number of parallel S3 fetch threads (default: 10).
     --parse-workers N   Number of parallel scraper parse threads (default: 4).
     --parse-timeout N   Per-document parse timeout in seconds (default: 60).
+    --case-title-regex PATTERN
+                        Only re-ingest documents whose current case_title
+                        matches this PostgreSQL regex (~ operator).  Useful
+                        for targeting garbled titles, e.g.
+                        --case-title-regex 'vs\\.?\\s*$|(?i)(Before the Court|moves the)'
     --no-llm            Disable LLM extraction, use regex-only mode.
     --llm-timeout N     Per-call LLM API timeout in seconds (default: 60).
     --force-llm         Force LLM even when all fields are already populated.
@@ -213,6 +218,7 @@ def _build_filters(
     county: str | None,
     date_from: date | None,
     date_to: date | None,
+    case_title_regex: str | None = None,
 ) -> tuple[str, list]:
     """Build WHERE clause fragments and params for the document query."""
     clauses = []
@@ -226,6 +232,9 @@ def _build_filters(
     if date_to:
         clauses.append("AND d.captured_at <= %s")
         params.append(datetime.combine(date_to, datetime.max.time()))
+    if case_title_regex:
+        clauses.append("AND c.case_title ~ %s")
+        params.append(case_title_regex)
     return " ".join(clauses), params
 
 
@@ -1274,9 +1283,12 @@ def run_reingest(
     llm_timeout: float | None = 60.0,
     force_llm: bool = False,
     full_reparse: bool = False,
+    case_title_regex: str | None = None,
 ) -> dict[str, int]:
     """Run the full reingest. Returns summary stats."""
-    filters, filter_params = _build_filters(county, date_from, date_to)
+    filters, filter_params = _build_filters(
+        county, date_from, date_to, case_title_regex=case_title_regex
+    )
 
     s3_client = boto3.client("s3")
 
@@ -1471,6 +1483,16 @@ def main() -> None:
             "original unsplit document. Deterministic IDs ensure idempotency."
         ),
     )
+    parser.add_argument(
+        "--case-title-regex",
+        type=str,
+        default=None,
+        help=(
+            "Only re-ingest documents whose current case_title matches this "
+            "PostgreSQL regex (~ operator). Useful for targeting garbled "
+            "titles, e.g. 'vs\\.?\\s*$' to find truncated titles."
+        ),
+    )
     args = parser.parse_args()
 
     dsn = os.environ.get("DATABASE_URL")
@@ -1496,6 +1518,7 @@ def main() -> None:
         llm_timeout=args.llm_timeout,
         force_llm=args.force_llm,
         full_reparse=args.full_reparse,
+        case_title_regex=args.case_title_regex,
     )
 
     logger.info(

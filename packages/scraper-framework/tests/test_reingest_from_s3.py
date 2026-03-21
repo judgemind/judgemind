@@ -1205,6 +1205,67 @@ class TestRunReingest:
         assert "AND d.captured_at >= %s" in filters_arg
         assert "AND d.captured_at <= %s" in filters_arg
 
+    @patch("reingest_from_s3.boto3")
+    @patch("reingest_from_s3.psycopg")
+    @patch("reingest_from_s3.reingest_batch")
+    def test_case_title_regex_filter_passed_through(
+        self,
+        mock_batch: MagicMock,
+        mock_psycopg: MagicMock,
+        mock_boto3: MagicMock,
+    ) -> None:
+        mock_conn = MagicMock()
+        mock_conn.__enter__ = MagicMock(return_value=mock_conn)
+        mock_conn.__exit__ = MagicMock(return_value=False)
+        mock_psycopg.connect.return_value = mock_conn
+
+        mock_batch.return_value = _make_batch_result()
+
+        regex = r"vs\.?\s*$"
+        reingest.run_reingest(
+            "postgresql://test",
+            county="Orange",
+            case_title_regex=regex,
+        )
+
+        call_args = mock_batch.call_args_list[0]
+        filters_arg = call_args[0][4]
+        filter_params_arg = call_args[0][5]
+        assert "AND c.case_title ~ %s" in filters_arg
+        assert regex in filter_params_arg
+
+
+# ---------------------------------------------------------------------------
+# _build_filters
+# ---------------------------------------------------------------------------
+
+
+class TestBuildFilters:
+    """Unit tests for the _build_filters helper."""
+
+    def test_no_filters_returns_empty(self) -> None:
+        clauses, params = reingest._build_filters(None, None, None)
+        assert clauses == ""
+        assert params == []
+
+    def test_county_only(self) -> None:
+        clauses, params = reingest._build_filters("Orange", None, None)
+        assert "AND ct.county = %s" in clauses
+        assert params == ["Orange"]
+
+    def test_case_title_regex_adds_clause(self) -> None:
+        regex = r"vs\.?\s*$"
+        clauses, params = reingest._build_filters(None, None, None, case_title_regex=regex)
+        assert "AND c.case_title ~ %s" in clauses
+        assert regex in params
+
+    def test_county_and_case_title_regex_combined(self) -> None:
+        regex = r"(?i)(Before the Court|moves the)"
+        clauses, params = reingest._build_filters("Orange", None, None, case_title_regex=regex)
+        assert "AND ct.county = %s" in clauses
+        assert "AND c.case_title ~ %s" in clauses
+        assert params == ["Orange", regex]
+
 
 # ---------------------------------------------------------------------------
 # Cursor minimum values
