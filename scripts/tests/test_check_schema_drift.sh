@@ -148,6 +148,201 @@ else
     FAILURES=$((FAILURES + 1))
 fi
 
+# =========================================================================
+# CONSTRAINT DRIFT TESTS
+# =========================================================================
+
+# ─── Test 10: Inline UNIQUE constraint covered by migration — should pass
+setup_repo
+printf '%s\n' \
+    "CREATE TABLE case_parties (" \
+    "    id UUID PRIMARY KEY," \
+    "    case_id UUID NOT NULL," \
+    "    party_id UUID NOT NULL," \
+    "    role TEXT NOT NULL," \
+    "    UNIQUE (case_id, party_id, role)" \
+    ");" \
+    > "$TMPDIR_TEST/packages/api/src/data-access/schema.sql"
+printf '%s\n' \
+    "-- Up Migration" \
+    "CREATE TABLE case_parties (" \
+    "    id UUID PRIMARY KEY," \
+    "    case_id UUID NOT NULL," \
+    "    party_id UUID NOT NULL," \
+    "    role TEXT NOT NULL," \
+    "    UNIQUE (case_id, party_id, role)" \
+    ");" \
+    "-- Down Migration" \
+    "DROP TABLE case_parties;" \
+    > "$TMPDIR_TEST/packages/api/migrations/1_initial.sql"
+assert_passes "Inline UNIQUE constraint covered by inline in migration"
+
+# ─── Test 11: Inline UNIQUE covered by ALTER TABLE in migration — pass
+setup_repo
+printf '%s\n' \
+    "CREATE TABLE case_parties (" \
+    "    id UUID PRIMARY KEY," \
+    "    case_id UUID NOT NULL," \
+    "    party_id UUID NOT NULL," \
+    "    role TEXT NOT NULL," \
+    "    UNIQUE (case_id, party_id, role)" \
+    ");" \
+    > "$TMPDIR_TEST/packages/api/src/data-access/schema.sql"
+printf '%s\n' \
+    "-- Up Migration" \
+    "CREATE TABLE case_parties (" \
+    "    id UUID PRIMARY KEY," \
+    "    case_id UUID NOT NULL," \
+    "    party_id UUID NOT NULL," \
+    "    role TEXT NOT NULL" \
+    ");" \
+    "-- Down Migration" \
+    "DROP TABLE case_parties;" \
+    > "$TMPDIR_TEST/packages/api/migrations/1_initial.sql"
+printf '%s\n' \
+    "-- Up Migration" \
+    "ALTER TABLE case_parties" \
+    "    ADD CONSTRAINT uq_cp UNIQUE (case_id, party_id, role);" \
+    "-- Down Migration" \
+    "ALTER TABLE case_parties DROP CONSTRAINT uq_cp;" \
+    > "$TMPDIR_TEST/packages/api/migrations/2_add-constraint.sql"
+assert_passes "Inline UNIQUE covered by ALTER TABLE ADD CONSTRAINT in migration"
+
+# ─── Test 12: UNIQUE constraint missing from migrations — should fail
+setup_repo
+printf '%s\n' \
+    "CREATE TABLE case_parties (" \
+    "    id UUID PRIMARY KEY," \
+    "    case_id UUID NOT NULL," \
+    "    party_id UUID NOT NULL," \
+    "    role TEXT NOT NULL," \
+    "    UNIQUE (case_id, party_id, role)" \
+    ");" \
+    > "$TMPDIR_TEST/packages/api/src/data-access/schema.sql"
+printf '%s\n' \
+    "-- Up Migration" \
+    "CREATE TABLE case_parties (" \
+    "    id UUID PRIMARY KEY," \
+    "    case_id UUID NOT NULL," \
+    "    party_id UUID NOT NULL," \
+    "    role TEXT NOT NULL" \
+    ");" \
+    "-- Down Migration" \
+    "DROP TABLE case_parties;" \
+    > "$TMPDIR_TEST/packages/api/migrations/1_initial.sql"
+assert_fails "UNIQUE constraint in schema.sql but not in any migration is detected"
+
+# ─── Test 13: Named CONSTRAINT in schema.sql — should pass when covered
+setup_repo
+printf '%s\n' \
+    "CREATE TABLE judges (" \
+    "    id UUID PRIMARY KEY," \
+    "    canonical_name TEXT NOT NULL," \
+    "    court_id UUID NOT NULL," \
+    "    CONSTRAINT judges_canonical_name_court_id_key UNIQUE (canonical_name, court_id)" \
+    ");" \
+    > "$TMPDIR_TEST/packages/api/src/data-access/schema.sql"
+printf '%s\n' \
+    "-- Up Migration" \
+    "CREATE TABLE judges (" \
+    "    id UUID PRIMARY KEY," \
+    "    canonical_name TEXT NOT NULL," \
+    "    court_id UUID NOT NULL" \
+    ");" \
+    "-- Down Migration" \
+    "DROP TABLE judges;" \
+    > "$TMPDIR_TEST/packages/api/migrations/1_initial.sql"
+printf '%s\n' \
+    "-- Up Migration" \
+    "ALTER TABLE judges" \
+    "    ADD CONSTRAINT judges_canonical_name_court_id_key UNIQUE (canonical_name, court_id);" \
+    "-- Down Migration" \
+    "ALTER TABLE judges DROP CONSTRAINT judges_canonical_name_court_id_key;" \
+    > "$TMPDIR_TEST/packages/api/migrations/2_add-unique.sql"
+assert_passes "Named CONSTRAINT UNIQUE covered by ALTER TABLE migration"
+
+# ─── Test 14: Single-column UNIQUE is ignored (not multi-column) ──────
+setup_repo
+printf '%s\n' \
+    "CREATE TABLE users (" \
+    "    id UUID PRIMARY KEY," \
+    "    email TEXT NOT NULL UNIQUE" \
+    ");" \
+    > "$TMPDIR_TEST/packages/api/src/data-access/schema.sql"
+printf '%s\n' \
+    "-- Up Migration" \
+    "CREATE TABLE users (" \
+    "    id UUID PRIMARY KEY," \
+    "    email TEXT NOT NULL" \
+    ");" \
+    "-- Down Migration" \
+    "DROP TABLE users;" \
+    > "$TMPDIR_TEST/packages/api/migrations/1_initial.sql"
+assert_passes "Single-column UNIQUE on column definition is ignored"
+
+# ─── Test 15: Constraint output shows table and columns ───────────────
+setup_repo
+printf '%s\n' \
+    "CREATE TABLE case_parties (" \
+    "    id UUID PRIMARY KEY," \
+    "    case_id UUID NOT NULL," \
+    "    party_id UUID NOT NULL," \
+    "    role TEXT NOT NULL," \
+    "    UNIQUE (case_id, party_id, role)" \
+    ");" \
+    > "$TMPDIR_TEST/packages/api/src/data-access/schema.sql"
+printf '%s\n' \
+    "-- Up Migration" \
+    "CREATE TABLE case_parties (" \
+    "    id UUID PRIMARY KEY" \
+    ");" \
+    "-- Down Migration" \
+    "DROP TABLE case_parties;" \
+    > "$TMPDIR_TEST/packages/api/migrations/1_initial.sql"
+TESTS=$((TESTS + 1))
+output=$("$CHECK_SCRIPT" "$TMPDIR_TEST" 2>&1 || true)
+if echo "$output" | grep -q "case_parties.*UNIQUE.*case_id.*party_id.*role"; then
+    echo "PASS: Constraint drift output shows table and columns"
+else
+    echo "FAIL: Constraint drift output does not show table and columns"
+    echo "  Got: $output"
+    FAILURES=$((FAILURES + 1))
+fi
+
+# ─── Test 16: Multi-line ALTER TABLE / ADD CONSTRAINT / UNIQUE — pass
+# Handles real-world migrations where ALTER, ADD CONSTRAINT, and UNIQUE
+# are on three separate lines (e.g. migration 10).
+setup_repo
+printf '%s\n' \
+    "CREATE TABLE judges (" \
+    "    id UUID PRIMARY KEY," \
+    "    canonical_name TEXT NOT NULL," \
+    "    court_id UUID NOT NULL," \
+    "    CONSTRAINT judges_name_court_key UNIQUE (canonical_name, court_id)" \
+    ");" \
+    > "$TMPDIR_TEST/packages/api/src/data-access/schema.sql"
+printf '%s\n' \
+    "-- Up Migration" \
+    "CREATE TABLE judges (" \
+    "    id UUID PRIMARY KEY," \
+    "    canonical_name TEXT NOT NULL," \
+    "    court_id UUID NOT NULL" \
+    ");" \
+    "-- Down Migration" \
+    "DROP TABLE judges;" \
+    > "$TMPDIR_TEST/packages/api/migrations/1_initial.sql"
+printf '%s\n' \
+    "-- Up Migration" \
+    "" \
+    "ALTER TABLE judges" \
+    "    ADD CONSTRAINT judges_name_court_key" \
+    "    UNIQUE (canonical_name, court_id);" \
+    "" \
+    "-- Down Migration" \
+    "ALTER TABLE judges DROP CONSTRAINT judges_name_court_key;" \
+    > "$TMPDIR_TEST/packages/api/migrations/2_add-unique.sql"
+assert_passes "Multi-line ALTER TABLE / ADD CONSTRAINT / UNIQUE (3 lines)"
+
 # ─── Summary ──────────────────────────────────────────────────────────
 echo ""
 echo "Results: $((TESTS - FAILURES))/$TESTS passed"
