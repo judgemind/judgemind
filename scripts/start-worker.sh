@@ -94,6 +94,18 @@ while read -r wt_path branch; do
     fi
 
     if [[ "$stale" == true ]]; then
+        # Check for a fresh agent lock before destroying the worktree.
+        # A lock file younger than 30 minutes means an agent is actively
+        # working — destroying it would wipe uncommitted changes (#1260).
+        if [[ -f "$wt_path/.agent-lock" ]]; then
+            lock_mtime=$(stat -f %m "$wt_path/.agent-lock" 2>/dev/null || stat -c %Y "$wt_path/.agent-lock" 2>/dev/null || echo 0)
+            lock_age=$(( $(date +%s) - lock_mtime ))
+            if [[ "$lock_age" -lt 1800 ]]; then
+                echo "Skipping stale worktree $wt_path — agent lock is fresh (${lock_age}s old)" >&2
+                continue
+            fi
+            echo "Agent lock in $wt_path is stale (${lock_age}s old) — proceeding with removal" >&2
+        fi
         echo "Removing stale worktree: $wt_path (branch: $branch)" >&2
         git -C "$REPO_ROOT" worktree remove "$wt_path" --force
     fi
@@ -207,6 +219,9 @@ for attempt in $(seq 1 10); do
     if git -C "$REPO_ROOT" worktree add "$WORKTREE" -b "$BRANCH" origin/main 2>/dev/null; then
         git -C "$WORKTREE" config core.hooksPath .githooks
         mkdir -p "$WORKTREE/tmp"
+        # Create agent lock file to protect this worktree from being
+        # destroyed by another agent or the dispatcher (#1260).
+        date -u +%Y-%m-%dT%H:%M:%SZ > "$WORKTREE/.agent-lock"
         echo "$WORKTREE"
         exit 0
     fi

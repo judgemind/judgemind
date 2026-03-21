@@ -70,3 +70,6 @@ tmp/
 
 # Agent worktrees (isolated git worktrees, never committed)
 worktrees/
+
+# Agent lock files (per-worktree, ephemeral)
+.agent-lock
