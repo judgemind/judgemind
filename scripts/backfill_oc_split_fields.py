@@ -219,18 +219,23 @@ def _upsert_party_and_link(
             # Create alias
             cur.execute(
                 """INSERT INTO party_aliases (party_id, raw_name, source, confidence, is_verified)
-                   VALUES (%s::uuid, %s, 'backfill', 1.0, FALSE)
-                   ON CONFLICT DO NOTHING""",
+                   VALUES (%s::uuid, %s, 'backfill', 1.0, FALSE)""",
                 (party_id, name),
             )
 
-        # Link party to case
+        # Link party to case (check-then-insert for re-run safety).
         cur.execute(
-            """INSERT INTO case_parties (case_id, party_id, role)
-               VALUES (%s::uuid, %s::uuid, %s)
-               ON CONFLICT (case_id, party_id, role) DO NOTHING""",
+            """SELECT 1 FROM case_parties
+               WHERE case_id = %s::uuid AND party_id = %s::uuid AND role = %s
+               LIMIT 1""",
             (case_id, party_id, role),
         )
+        if cur.fetchone() is None:
+            cur.execute(
+                """INSERT INTO case_parties (case_id, party_id, role)
+                   VALUES (%s::uuid, %s::uuid, %s)""",
+                (case_id, party_id, role),
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -316,9 +321,17 @@ def run_backfill(
                             )
 
                 for party in new_parties:
-                    _upsert_party_and_link(
-                        conn, case_id_str, party["name"], party["role"]
-                    )
+                    try:
+                        _upsert_party_and_link(
+                            conn, case_id_str, party["name"], party["role"]
+                        )
+                    except Exception:
+                        logger.warning(
+                            "Failed to upsert party %r for case %s, rolling back",
+                            party["name"],
+                            case_id_str,
+                        )
+                        conn.rollback()
 
             if stats["total_cases"] % 100 == 0:
                 if not dry_run:
