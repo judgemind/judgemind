@@ -1,7 +1,7 @@
 'use client';
 
 import Link from 'next/link';
-import { buildDownloadUrl, cleanRulingText, FORMAT_LABELS, stripMetadataHeaderHtml, type RulingMetadata } from '@/lib/display-helpers';
+import { buildDownloadUrl, cleanRulingText, cleanSummary, FORMAT_LABELS, stripMetadataHeaderHtml, type RulingMetadata } from '@/lib/display-helpers';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 
@@ -47,6 +47,7 @@ export function RulingDetail({ ruling, sanitizedRulingTextHtml }: RulingProps) {
     hearingDate: ruling.hearingDate,
     motionType: ruling.motionType ?? undefined,
   };
+  const displaySummary = ruling.summary ? cleanSummary(ruling.summary) : null;
 
   return (
     <div className="space-y-6">
@@ -82,7 +83,7 @@ export function RulingDetail({ ruling, sanitizedRulingTextHtml }: RulingProps) {
       )}
 
       {/* Summary (AI-generated) — highlighted in a Card */}
-      {ruling.summary && (
+      {displaySummary && (
         <Card>
           <CardHeader className="pb-2">
             <CardTitle className="text-sm font-medium uppercase tracking-wide text-slate-500 dark:text-slate-400">
@@ -91,7 +92,7 @@ export function RulingDetail({ ruling, sanitizedRulingTextHtml }: RulingProps) {
           </CardHeader>
           <CardContent>
             <p className="text-sm leading-relaxed text-slate-700 dark:text-slate-300">
-              {ruling.summary}
+              {displaySummary}
             </p>
           </CardContent>
         </Card>
@@ -100,10 +101,27 @@ export function RulingDetail({ ruling, sanitizedRulingTextHtml }: RulingProps) {
       {/* Ruling text in its own Card */}
       {(sanitizedRulingTextHtml || ruling.rulingText) && (
         <Card>
-          <CardHeader className="pb-2">
+          <CardHeader className="flex flex-row items-center justify-between pb-2">
             <CardTitle className="text-sm font-medium uppercase tracking-wide text-slate-500 dark:text-slate-400">
               Ruling Text
             </CardTitle>
+            {ruling.documentId && (
+              <Button variant="outline" size="sm" asChild>
+                <a
+                  href={buildDownloadUrl(ruling.documentId)}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                >
+                  Download original document
+                  {ruling.documentFormat && (
+                    <span className="ml-1.5 rounded bg-slate-100 px-1.5 py-0.5 text-[10px] font-semibold uppercase text-slate-600 dark:bg-slate-700 dark:text-slate-300">
+                      {FORMAT_LABELS[ruling.documentFormat] ??
+                        ruling.documentFormat.toUpperCase()}
+                    </span>
+                  )}
+                </a>
+              </Button>
+            )}
           </CardHeader>
           <CardContent className="prose prose-slate dark:prose-invert max-w-none">
             {sanitizedRulingTextHtml ? (
@@ -129,8 +147,8 @@ export function RulingDetail({ ruling, sanitizedRulingTextHtml }: RulingProps) {
         </Card>
       )}
 
-      {/* Document download */}
-      {ruling.documentId && (
+      {/* Document download — shown standalone when there is no ruling text */}
+      {ruling.documentId && !sanitizedRulingTextHtml && !ruling.rulingText && (
         <section>
           <Button variant="outline" size="sm" asChild>
             <a

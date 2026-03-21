@@ -76,6 +76,55 @@ export function formatOutcome(outcome: string | null): string {
 }
 
 // ---------------------------------------------------------------------------
+// Summary cleanup (display-time)
+// ---------------------------------------------------------------------------
+
+/** Pattern for leading markdown headings like "# Summary", "## Summary", etc. */
+const SUMMARY_HEADING_RE = /^#{1,6}\s+.*\n*/;
+
+/**
+ * Patterns that repeat metadata already shown in the ruling page header.
+ * Each regex matches a full line (anchored with ^ and terminated by newline or end).
+ */
+const SUMMARY_METADATA_LINE_PATTERNS: RegExp[] = [
+  /^\s*\*{0,2}(?:case\s+(?:number|no\.?)|case\s*#)\s*[:;]\*{0,2}\s*.+$/im,
+  /^\s*\*{0,2}judge\s*[:;]\*{0,2}\s*.+$/im,
+  /^\s*\*{0,2}(?:parties|party)\s*[:;]\*{0,2}\s*.+$/im,
+  /^\s*\*{0,2}court\s*[:;]\*{0,2}\s*.+$/im,
+  /^\s*\*{0,2}department\s*[:;]\*{0,2}\s*.+$/im,
+  /^\s*\*{0,2}hearing\s+date\s*[:;]\*{0,2}\s*.+$/im,
+  /^\s*\*{0,2}county\s*[:;]\*{0,2}\s*.+$/im,
+  /^\s*\*{0,2}motion\s+type\s*[:;]\*{0,2}\s*.+$/im,
+];
+
+/**
+ * Clean an AI-generated summary for display on the ruling detail page.
+ *
+ * - Strips leading markdown headings (`# Summary`, `## Summary`, etc.)
+ * - Strips lines that repeat metadata already shown in the page header
+ *   (case number, judge, parties, court, department, hearing date, county, motion type)
+ * - Collapses excessive whitespace
+ */
+export function cleanSummary(summary: string): string {
+  if (!summary) return summary;
+
+  let cleaned = summary;
+
+  // Strip leading markdown heading (e.g. "# Summary\n")
+  cleaned = cleaned.replace(SUMMARY_HEADING_RE, '');
+
+  // Strip metadata lines that duplicate the page header
+  for (const pattern of SUMMARY_METADATA_LINE_PATTERNS) {
+    cleaned = cleaned.replace(pattern, '');
+  }
+
+  // Collapse multiple blank lines into one and trim
+  cleaned = cleaned.replace(/\n{3,}/g, '\n\n').trim();
+
+  return cleaned;
+}
+
+// ---------------------------------------------------------------------------
 // Ruling text cleanup (display-time)
 // ---------------------------------------------------------------------------
 // Cleans ruling text for display in the frontend. This is a safety net for
