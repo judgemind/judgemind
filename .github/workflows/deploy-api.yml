@@ -149,29 +149,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v6
-        with:
-          fetch-depth: 2
-
-      - name: Check for migration changes
-        id: check-migrations
-        run: |
-          # Check if any migration files were added or modified in this push.
-          # Compare against the parent commit to detect new migrations.
-          # fetch-depth: 2 ensures HEAD~1 is available for squash merges.
-          if ! MIGRATION_CHANGES=$(git diff --name-only HEAD~1 HEAD -- packages/api/migrations/); then
-            echo "WARNING: git diff failed (shallow clone or merge commit). Running migrations as a safety measure."
-            echo "has_migrations=true" >> "$GITHUB_OUTPUT"
-          elif [ -n "$MIGRATION_CHANGES" ]; then
-            echo "has_migrations=true" >> "$GITHUB_OUTPUT"
-            echo "Migration files changed:"
-            echo "$MIGRATION_CHANGES"
-          else
-            echo "has_migrations=false" >> "$GITHUB_OUTPUT"
-            echo "No migration file changes detected."
-          fi
 
       - name: Configure AWS credentials
-        if: steps.check-migrations.outputs.has_migrations == 'true'
         uses: aws-actions/configure-aws-credentials@v6
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
@@ -179,7 +158,6 @@ jobs:
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Set pending migration status
-        if: steps.check-migrations.outputs.has_migrations == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -194,7 +172,6 @@ jobs:
             }'
 
       - name: Run migrations via ECS oneshot task
-        if: steps.check-migrations.outputs.has_migrations == 'true'
         id: run-migrations
         uses: ./.github/actions/ecs-oneshot
         with:
@@ -209,11 +186,11 @@ jobs:
           task-role-fallback: judgemind-api-task-dev
 
       - name: Set migration status
-        if: always() && steps.check-migrations.outputs.has_migrations == 'true'
+        if: always()
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           MIGRATE_STATUS: ${{ steps.run-migrations.outcome == 'success' && 'success' || 'failure' }}
-          MIGRATE_DESC: ${{ steps.run-migrations.outcome == 'success' && 'Dev migrations applied' || 'Dev migration failed' }}
+          MIGRATE_DESC: ${{ steps.run-migrations.outcome == 'success' && 'Dev migrations applied (no pending)' || 'Dev migration failed' }}
         run: |
           curl -s -X POST \
             -H "Authorization: token $GH_TOKEN" \
@@ -224,10 +201,6 @@ jobs:
               \"description\": \"$MIGRATE_DESC\",
               \"context\": \"deploy/api-dev-migrations\"
             }"
-
-      - name: Skip notification (no migrations)
-        if: steps.check-migrations.outputs.has_migrations == 'false'
-        run: echo "No migration changes in this deploy — skipping migration step."
 
   post-deploy-health-check:
     name: Post-Deploy Health Check
