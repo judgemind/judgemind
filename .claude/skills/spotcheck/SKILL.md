@@ -180,16 +180,47 @@ Record visual findings in `{worktree}/tmp/spotcheck/visual_findings.md` with:
 
 ## Step 4 — Cross-reference existing issues
 
-Before filing anything, compare each finding against the open issues fetched in Step 0:
+**Do not rely on the Step 0 snapshot.** The open issues list fetched at the start of the spotcheck may be stale — other agents may have closed or modified issues during Steps 1-3. Re-fetch the current state before cross-referencing.
 
-1. For each finding, search the open issues list for:
-   - Issues mentioning the same county + problem type.
-   - Issues mentioning the same case ID.
-   - Issues with similar titles (e.g., "garbled titles in [county]", "duplicate rulings in [county]").
-2. Mark each finding as:
-   - **New** — no existing issue covers this pattern or county.
-   - **Known (extends)** — an existing issue covers the same pattern but this finding adds new affected counties or examples. Comment on the existing issue instead of filing a new one.
-   - **Known (duplicate)** — an existing issue already covers this exact finding. Skip.
+### 4.1 — Re-fetch open issues
+
+Re-run the same queries from Step 0 to get a fresh list of open issues:
+
+```
+gh issue list --repo judgemind/judgemind --state open \
+    --label "type/bug" \
+    --json number,title,body,labels --limit 200
+```
+
+```
+gh issue list --repo judgemind/judgemind --state open \
+    --search "data quality" \
+    --json number,title,body,labels --limit 100
+```
+
+Combine and deduplicate as in Step 0, overwriting `{worktree}/tmp/spotcheck/open_issues.json` with the fresh data.
+
+### 4.2 — Verify individual issue state before classifying as "known"
+
+Before marking any finding as **Known (extends)** or **Known (duplicate)** based on a matching issue #N, verify that #N is still open:
+
+```
+gh issue view <N> --repo judgemind/judgemind --json state -q '.state'
+```
+
+If the issue has been closed since the list was fetched, treat the finding as **New** instead. Do not reference closed issues as "known" — the fix may have already shipped, or the issue may have been closed as stale.
+
+### 4.3 — Classify findings
+
+For each finding, search the refreshed open issues list for:
+- Issues mentioning the same county + problem type.
+- Issues mentioning the same case ID.
+- Issues with similar titles (e.g., "garbled titles in [county]", "duplicate rulings in [county]").
+
+Mark each finding as:
+- **New** — no existing open issue covers this pattern or county.
+- **Known (extends)** — an existing open issue covers the same pattern but this finding adds new affected counties or examples. Comment on the existing issue instead of filing a new one.
+- **Known (duplicate)** — an existing open issue already covers this exact finding. Skip.
 
 Write the cross-reference results to `{worktree}/tmp/spotcheck/crossref.md`.
 
