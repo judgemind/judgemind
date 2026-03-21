@@ -24,6 +24,10 @@ data "aws_secretsmanager_secret" "residential_proxy" {
   name = "judgemind/proxy/residential"
 }
 
+data "aws_secretsmanager_secret" "courtlistener_api_token" {
+  name = "judgemind/courtlistener/api-token"
+}
+
 module "networking" {
   source      = "../../modules/networking"
   environment = "dev"
@@ -74,20 +78,21 @@ module "cache" {
 module "compute" {
   source = "../../modules/compute"
 
-  environment                       = "dev"
-  vpc_id                            = module.networking.vpc_id
-  private_subnet_ids                = module.networking.private_subnet_ids
-  ecr_repository_url                = module.ecr.repository_url
-  scraper_task_role_arn             = module.iam_scraper.role_arn
-  redis_url                         = "redis://${module.cache.redis_endpoint}:${module.cache.redis_port}"
-  document_archive_bucket           = module.document_archive.bucket_id
-  db_connection_secret_arn          = module.database.db_connection_secret_arn
-  opensearch_url                    = "https://${module.search.domain_endpoint}"
-  opensearch_credentials_secret_arn = module.search.master_credentials_secret_arn
-  llm_provider                      = "anthropic"
-  anthropic_api_key_secret_arn      = data.aws_secretsmanager_secret.anthropic_api_key.arn
-  google_api_key_secret_arn         = data.aws_secretsmanager_secret.google_api_key.arn
-  proxy_secret_arn                  = data.aws_secretsmanager_secret.residential_proxy.arn
+  environment                        = "dev"
+  vpc_id                             = module.networking.vpc_id
+  private_subnet_ids                 = module.networking.private_subnet_ids
+  ecr_repository_url                 = module.ecr.repository_url
+  scraper_task_role_arn              = module.iam_scraper.role_arn
+  redis_url                          = "redis://${module.cache.redis_endpoint}:${module.cache.redis_port}"
+  document_archive_bucket            = module.document_archive.bucket_id
+  db_connection_secret_arn           = module.database.db_connection_secret_arn
+  opensearch_url                     = "https://${module.search.domain_endpoint}"
+  opensearch_credentials_secret_arn  = module.search.master_credentials_secret_arn
+  llm_provider                       = "anthropic"
+  anthropic_api_key_secret_arn       = data.aws_secretsmanager_secret.anthropic_api_key.arn
+  google_api_key_secret_arn          = data.aws_secretsmanager_secret.google_api_key.arn
+  proxy_secret_arn                   = data.aws_secretsmanager_secret.residential_proxy.arn
+  courtlistener_api_token_secret_arn = data.aws_secretsmanager_secret.courtlistener_api_token.arn
 
   # Dev: 0.5 vCPU, 1 GB RAM, daily schedule at 6 AM PT
   task_cpu            = 512

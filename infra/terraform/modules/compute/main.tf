@@ -164,6 +164,12 @@ resource "aws_ecs_task_definition" "scraper" {
       )
 
       secrets = concat(
+        var.courtlistener_api_token_secret_arn != "" ? [
+          {
+            name      = "COURTLISTENER_API_TOKEN"
+            valueFrom = var.courtlistener_api_token_secret_arn
+          }
+        ] : [],
         var.proxy_secret_arn != "" ? [
           {
             name      = "SD_PROXY_URL"
@@ -341,6 +347,27 @@ resource "aws_iam_role_policy" "ecs_task_execution_proxy_secret" {
         Effect   = "Allow"
         Action   = "secretsmanager:GetSecretValue"
         Resource = var.proxy_secret_arn
+      }
+    ]
+  })
+}
+
+# Allow the task execution role to fetch the CourtListener API token secret
+# so ECS can inject COURTLISTENER_API_TOKEN into the scraper container.
+resource "aws_iam_role_policy" "ecs_task_execution_courtlistener_secret" {
+  count = var.courtlistener_api_token_secret_arn != "" ? 1 : 0
+
+  name = "judgemind-ecs-execution-courtlistener-secret-${var.environment}"
+  role = aws_iam_role.ecs_task_execution.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid      = "ReadCourtListenerSecret"
+        Effect   = "Allow"
+        Action   = "secretsmanager:GetSecretValue"
+        Resource = var.courtlistener_api_token_secret_arn
       }
     ]
   })

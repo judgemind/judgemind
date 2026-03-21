@@ -71,6 +71,12 @@ class CourtListenerClient:
         headers: dict[str, str] = {"Accept": "application/json"}
         if self._api_token:
             headers["Authorization"] = f"Token {self._api_token}"
+        else:
+            logger.warning(
+                "No CourtListener API token configured. "
+                "Set COURTLISTENER_API_TOKEN env var. "
+                "Requests will fail if the API requires authentication.",
+            )
         self._client = httpx.Client(
             base_url=API_BASE_URL,
             headers=headers,
@@ -102,6 +108,15 @@ class CourtListenerClient:
         else:
             response = self._client.get(url, params=params)
 
+        if response.status_code == 401:
+            token_status = "configured" if self._api_token else "NOT configured"
+            logger.error(
+                "CourtListener API returned 401 Unauthorized. "
+                "The API token may be expired, revoked, or missing. "
+                "Update the COURTLISTENER_API_TOKEN secret in AWS Secrets Manager.",
+                api_token_status=token_status,
+                url=str(response.url),
+            )
         response.raise_for_status()
         result: dict[str, Any] = response.json()
         return result
