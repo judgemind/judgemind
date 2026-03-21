@@ -1327,3 +1327,143 @@ def test_existing_fixture_titles_not_affected_by_sanitize() -> None:
     title_bh = _extract_case_title(content_bh)
     assert title_bh is not None
     assert "Porsche" in title_bh or "Mikia" in title_bh
+
+
+# ---------------------------------------------------------------------------
+# Role-label stripping — _clean_party_name and title extraction (#1425)
+# ---------------------------------------------------------------------------
+
+
+def test_clean_party_name_strips_role_prefix_with_comma() -> None:
+    """_clean_party_name strips 'Defendant, ' prefix (comma+space)."""
+    from courts.ca.la_tentatives import _clean_party_name
+
+    assert _clean_party_name("Defendant, Albery Arevalo") == "Albery Arevalo"
+    result = _clean_party_name("Plaintiffs, Daniel And Priscila Stanton")
+    assert result == "Daniel And Priscila Stanton"
+    result2 = _clean_party_name("Defendants, White Pickle Llc And Adam Grandmaison")
+    assert result2 == "White Pickle Llc And Adam Grandmaison"
+
+
+def test_clean_party_name_strips_role_prefix_with_space() -> None:
+    """_clean_party_name still strips 'Defendant ' prefix (space only)."""
+    from courts.ca.la_tentatives import _clean_party_name
+
+    assert _clean_party_name("Defendant Big Corp") == "Big Corp"
+    assert _clean_party_name("Plaintiffs Alpha Beta") == "Alpha Beta"
+
+
+def test_clean_party_name_rejects_bare_role_label() -> None:
+    """_clean_party_name returns empty string for bare role labels."""
+    from courts.ca.la_tentatives import _clean_party_name
+
+    assert _clean_party_name("Defendant") == ""
+    assert _clean_party_name("Plaintiff") == ""
+    assert _clean_party_name("Defendants") == ""
+    assert _clean_party_name("Plaintiffs") == ""
+    assert _clean_party_name("Petitioner") == ""
+    assert _clean_party_name("Respondent") == ""
+
+
+def test_extract_title_rejects_defendant_v_plaintiff() -> None:
+    """Caption block with only role labels produces None title."""
+    from bs4 import BeautifulSoup
+
+    # Simulate a caption where only "Defendant" and "Plaintiff" appear as names
+    html = (
+        '<div id="speechSynthesis">'
+        "<table><tr><td>"
+        '<a name="Parties"></a>'
+        "Defendant,\n  Plaintiff(s),\n  vs.\n  Plaintiff,\n  Defendant(s)."
+        "</td></tr></table>"
+        "</div>"
+    )
+    soup = BeautifulSoup(html, "lxml")
+    content = soup.find("div", id="speechSynthesis")
+    title = _extract_case_title(content)
+    # Should be None because after stripping role labels, names are empty
+    assert title is None
+
+
+def test_extract_title_strips_role_prefix_from_caption() -> None:
+    """Caption with 'Defendant, Name' format strips the role prefix."""
+    from bs4 import BeautifulSoup
+
+    html = (
+        '<div id="speechSynthesis">'
+        "<table><tr><td>"
+        '<a name="Parties"></a>'
+        "Defendant, STATE FARM AUTOMOBILE INSURANCE COMPANY,\n"
+        "  Plaintiff(s),\n  vs.\n"
+        "  Plaintiff, KEITH JOHNSON,\n  Defendant(s)."
+        "</td></tr></table>"
+        "</div>"
+    )
+    soup = BeautifulSoup(html, "lxml")
+    content = soup.find("div", id="speechSynthesis")
+    title = _extract_case_title(content)
+    assert title is not None
+    assert "Defendant" not in title
+    assert "Plaintiff" not in title
+    assert "State Farm" in title
+    assert "Keith Johnson" in title
+    assert " v. " in title
+
+
+def test_extract_parties_rejects_bare_role_labels() -> None:
+    """Party extraction skips bare role-label names (#1425)."""
+    from bs4 import BeautifulSoup
+
+    html = (
+        '<div id="speechSynthesis">'
+        "<table><tr><td>"
+        '<a name="Parties"></a>'
+        "Defendant,\n  Plaintiff(s),\n  vs.\n  Plaintiff,\n  Defendant(s)."
+        "</td></tr></table>"
+        "</div>"
+    )
+    soup = BeautifulSoup(html, "lxml")
+    content = soup.find("div", id="speechSynthesis")
+    parties = _extract_parties(content)
+    # All names would be bare role labels — should be filtered out
+    for party in parties:
+        assert party["name"].lower() not in {
+            "defendant",
+            "plaintiff",
+            "defendants",
+            "plaintiffs",
+        }
+
+
+def test_extract_parties_strips_role_prefix_comma() -> None:
+    """Party extraction strips 'Defendant, ' prefix from names (#1425)."""
+    from bs4 import BeautifulSoup
+
+    html = (
+        '<div id="speechSynthesis">'
+        "<table><tr><td>"
+        '<a name="Parties"></a>'
+        "Defendant, ALBERY AREVALO,\n  Plaintiff(s),\n  vs.\n"
+        "  Plaintiffs, DANIEL AND PRISCILA STANTON,\n  Defendant(s)."
+        "</td></tr></table>"
+        "</div>"
+    )
+    soup = BeautifulSoup(html, "lxml")
+    content = soup.find("div", id="speechSynthesis")
+    parties = _extract_parties(content)
+    for party in parties:
+        assert "Defendant" not in party["name"]
+        assert "Plaintiff" not in party["name"]
+
+
+def test_role_label_title_blocked_by_extract_not_sanitize() -> None:
+    """Role-label titles like 'Defendant v. Plaintiff' are blocked by upstream
+    extraction (_extract_title_from_parties_anchor calls _clean_party_name),
+    not by _sanitize_title itself. _sanitize_title only cleans entity
+    descriptors and checks length — it does not know about role labels."""
+    # _sanitize_title does NOT reject "Defendant v. Plaintiff" — it's a
+    # valid-looking title by length/format. The protection is upstream.
+    result = _sanitize_title("Defendant v. Plaintiff")
+    # This passes through _sanitize_title (it's a short, valid-looking string).
+    # The actual blocking happens in _extract_title_from_parties_anchor.
+    assert result is not None  # sanitize does not reject it

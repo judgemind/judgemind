@@ -112,8 +112,27 @@ _RESPONDING_PARTY_RE = re.compile(
 )
 _ROLE_PREFIX_RE = re.compile(
     r"^(?:Defendants?|Plaintiffs?|Petitioners?|Respondents?"
-    r"|Cross-Complainants?|Cross-Defendants?)\s+",
+    r"|Cross-Complainants?|Cross-Defendants?)[,\s]+",
     re.IGNORECASE,
+)
+
+# Role labels that should never appear as standalone party names.
+_BARE_ROLE_LABELS = frozenset(
+    w.lower()
+    for w in (
+        "Defendant",
+        "Defendants",
+        "Plaintiff",
+        "Plaintiffs",
+        "Petitioner",
+        "Petitioners",
+        "Respondent",
+        "Respondents",
+        "Cross-Complainant",
+        "Cross-Complainants",
+        "Cross-Defendant",
+        "Cross-Defendants",
+    )
 )
 
 # Pattern 3: "Case Name: [text]" or "Case Title: [text]"
@@ -621,8 +640,8 @@ def _extract_title_from_parties_anchor(content: BeautifulSoup) -> str | None:
     if m is None:
         return None
 
-    plaintiff = " ".join(m.group("plaintiff").split()).strip().rstrip(",")
-    defendant = " ".join(m.group("defendant").split()).strip().rstrip(",")
+    plaintiff = _clean_party_name(m.group("plaintiff"))
+    defendant = _clean_party_name(m.group("defendant"))
 
     if not plaintiff or not defendant:
         return None
@@ -632,14 +651,22 @@ def _extract_title_from_parties_anchor(content: BeautifulSoup) -> str | None:
 
 def _clean_party_name(raw: str) -> str:
     """Normalise a captured party name: collapse whitespace, strip role prefix,
-    strip trailing commas/et al, and clean up punctuation."""
+    strip trailing commas/et al, and clean up punctuation.
+
+    Returns an empty string if the result is a bare role label (e.g.
+    "Defendant", "Plaintiffs") with no actual litigant name.
+    """
     name = " ".join(raw.split()).strip()
-    # Strip role prefixes like "Defendant " or "Plaintiffs "
+    # Strip role prefixes like "Defendant " or "Defendant, " or "Plaintiffs "
     name = _ROLE_PREFIX_RE.sub("", name)
     # Strip "et al." suffix
     name = re.sub(r",?\s*et\s+al\.?\s*$", "", name, flags=re.IGNORECASE).strip()
     # Remove stray leading/trailing punctuation
     name = name.strip(")(,.; ")
+    # Reject bare role labels that slipped through (e.g. captured text was
+    # just "Defendant" with no actual party name following it).
+    if name.lower() in _BARE_ROLE_LABELS:
+        return ""
     return name
 
 
