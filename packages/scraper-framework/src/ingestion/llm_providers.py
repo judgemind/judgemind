@@ -289,6 +289,241 @@ def call_llm(
         return None
 
 
+def call_llm_with_images(
+    system_prompt: str,
+    text_message: str,
+    images: list[tuple[bytes, str]],
+    *,
+    provider: str | None = None,
+    model: str | None = None,
+    client: object | None = None,
+    max_retries: int = 1,
+    timeout: float | None = None,
+    max_tokens: int = 4096,
+) -> LLMResponse | None:
+    """Call an LLM provider with text and image content (vision API).
+
+    Similar to ``call_llm`` but includes inline images in the request.
+    Used for OCR fallback when PDF pages have no text layer and must be
+    "read" visually by the model.
+
+    Args:
+        system_prompt: System prompt text.
+        text_message: Text portion of the user message.
+        images: List of ``(image_bytes, media_type)`` tuples.
+            ``media_type`` is e.g. ``"image/png"`` or ``"image/jpeg"``.
+        provider: Provider name — ``"google"`` or ``"anthropic"``.
+        model: Model ID.
+        client: Optional pre-created provider client.
+        max_retries: Number of retries on rate-limit errors.
+        timeout: Per-call timeout in seconds.
+        max_tokens: Maximum output tokens.
+
+    Returns:
+        An ``LLMResponse`` or ``None`` on failure.
+    """
+    resolved_provider = provider or os.environ.get("LLM_PROVIDER", "google")
+    resolved_model = (
+        model
+        or os.environ.get("LLM_MODEL")
+        or _PROVIDER_DEFAULT_MODELS.get(resolved_provider, DEFAULT_HAIKU_MODEL)
+    )
+
+    if resolved_provider == "anthropic":
+        return _call_anthropic_with_images(
+            system_prompt,
+            text_message,
+            images,
+            resolved_model,
+            client=client,
+            max_retries=max_retries,
+            timeout=timeout,
+            max_tokens=max_tokens,
+        )
+    elif resolved_provider == "google":
+        return _call_google_with_images(
+            system_prompt,
+            text_message,
+            images,
+            resolved_model,
+            client=client,
+            max_retries=max_retries,
+            timeout=timeout,
+            max_tokens=max_tokens,
+        )
+    else:
+        logger.error("llm_providers.unknown_provider", provider=resolved_provider)
+        return None
+
+
+def _call_anthropic_with_images(
+    system_prompt: str,
+    text_message: str,
+    images: list[tuple[bytes, str]],
+    model: str,
+    *,
+    client: object | None = None,
+    max_retries: int = 1,
+    timeout: float | None = None,
+    max_tokens: int = 4096,
+) -> LLMResponse | None:
+    """Call the Anthropic Messages API with image content blocks."""
+    import base64
+
+    if client is None:
+        try:
+            client = anthropic.Anthropic()
+        except anthropic.AuthenticationError:
+            logger.warning("llm_providers.anthropic_auth_error")
+            return None
+
+    # Build content blocks: images first, then text
+    content: list[dict] = []
+    for image_bytes, media_type in images:
+        content.append(
+            {
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": media_type,
+                    "data": base64.b64encode(image_bytes).decode("ascii"),
+                },
+            }
+        )
+    content.append({"type": "text", "text": text_message})
+
+    timeout_kwargs: dict = {}
+    if timeout is not None:
+        timeout_kwargs["timeout"] = timeout
+
+    for attempt in range(1 + max_retries):
+        try:
+            response = client.messages.create(
+                model=model,
+                max_tokens=max_tokens,
+                temperature=0,
+                system=system_prompt,
+                messages=[{"role": "user", "content": content}],
+                **timeout_kwargs,
+            )
+            # Vision responses may contain non-text blocks; find the first
+            # text block rather than assuming content[0] is text.
+            text_content = ""
+            for block in response.content:
+                if hasattr(block, "type") and block.type == "text":
+                    text_content = block.text
+                    break
+            return LLMResponse(
+                text=text_content.strip(),
+                input_tokens=response.usage.input_tokens,
+                output_tokens=response.usage.output_tokens,
+            )
+        except anthropic.APITimeoutError:
+            logger.warning(
+                "llm_providers.anthropic_vision_timeout",
+                timeout=timeout,
+                attempt=attempt + 1,
+            )
+            return None
+        except anthropic.RateLimitError:
+            if attempt < max_retries:
+                logger.warning(
+                    "llm_providers.anthropic_vision_rate_limit",
+                    attempt=attempt + 1,
+                )
+                time.sleep(1)
+                continue
+            logger.warning("llm_providers.anthropic_vision_rate_limit_exhausted")
+            return None
+        except anthropic.APIError as exc:
+            logger.warning("llm_providers.anthropic_vision_api_error", error=str(exc))
+            return None
+    return None  # pragma: no cover — defensive unreachable
+
+
+def _call_google_with_images(
+    system_prompt: str,
+    text_message: str,
+    images: list[tuple[bytes, str]],
+    model: str,
+    *,
+    client: object | None = None,
+    max_retries: int = 1,
+    timeout: float | None = None,
+    max_tokens: int = 4096,
+) -> LLMResponse | None:
+    """Call the Google GenAI API with image content (multimodal)."""
+    from google import genai
+    from google.genai import types
+
+    if client is None:
+        api_key = os.environ.get("GOOGLE_API_KEY")
+        if not api_key:
+            logger.warning("llm_providers.google_missing_api_key")
+            return None
+        client = genai.Client(api_key=api_key)
+
+    if not hasattr(client.models, "generate_content"):
+        logger.error(
+            "llm_providers.google_sdk_incompatible",
+            models_type=type(client.models).__qualname__,
+        )
+        return None
+
+    # Build multimodal content: images + text
+    parts: list[types.Part] = []
+    for image_bytes, media_type in images:
+        parts.append(types.Part.from_bytes(data=image_bytes, mime_type=media_type))
+    parts.append(types.Part.from_text(text=text_message))
+
+    config_kwargs: dict = {
+        "system_instruction": system_prompt,
+        "temperature": 0,
+        "max_output_tokens": max_tokens,
+    }
+    if timeout is not None:
+        config_kwargs["http_options"] = types.HttpOptions(timeout=int(timeout * 1000))
+    config = types.GenerateContentConfig(**config_kwargs)
+
+    for attempt in range(1 + max_retries):
+        try:
+            response = client.models.generate_content(
+                model=model,
+                contents=parts,
+                config=config,
+            )
+            input_tokens = 0
+            output_tokens = 0
+            if response.usage_metadata:
+                input_tokens = response.usage_metadata.prompt_token_count or 0
+                output_tokens = response.usage_metadata.candidates_token_count or 0
+
+            return LLMResponse(
+                text=response.text.strip() if response.text else "",
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+            )
+        except Exception as exc:  # noqa: BLE001
+            exc_name = type(exc).__name__
+            if "DeadlineExceeded" in exc_name or "Timeout" in exc_name:
+                logger.warning(
+                    "llm_providers.google_vision_timeout",
+                    timeout=timeout,
+                    error=str(exc),
+                )
+                return None
+            if "ResourceExhausted" in exc_name and attempt < max_retries:
+                logger.warning(
+                    "llm_providers.google_vision_rate_limit",
+                    attempt=attempt + 1,
+                )
+                time.sleep(1)
+                continue
+            logger.warning("llm_providers.google_vision_api_error", error=str(exc))
+            return None
+    return None  # pragma: no cover — defensive unreachable
+
+
 def _try_create(provider: str) -> object | None:
     """Try to create an LLM client for a single provider.
 
