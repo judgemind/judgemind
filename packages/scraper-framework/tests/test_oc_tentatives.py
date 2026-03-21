@@ -29,6 +29,7 @@ from courts.ca.oc_tentatives import (
     _normalize_oc_text,
     _oc_hearing_date_from_text,
     _parse_north_case_entries,
+    _reconstruct_entry_text,
 )
 from courts.ca.oc_tentatives import default_config as oc_default_config
 from courts.ca.pdf_link_scraper import _extract_pdf_text
@@ -807,3 +808,151 @@ class TestTableAwareExtraction:
                 f"{fixture}: new extraction has MORE column merges "
                 f"({new_merges}) than old ({old_merges})"
             )
+
+
+# ---------------------------------------------------------------------------
+# _reconstruct_entry_text — case name joining (#1360)
+# ---------------------------------------------------------------------------
+
+
+class TestReconstructEntryText:
+    """Tests for _reconstruct_entry_text joining multi-line case names."""
+
+    def test_multiline_case_name_joined(self) -> None:
+        """Case name split across lines is joined into one line (#1360)."""
+        result = _reconstruct_entry_text(
+            "102",
+            "Saetern vs.\nWearmouth\n25-01475675",
+            "Motion to Extend Time",
+        )
+        lines = result.split("\n")
+        assert lines[0] == "102 Saetern vs. Wearmouth"
+        assert lines[1] == "25-01475675"
+        assert lines[2] == "Motion to Extend Time"
+
+    def test_plaintiff_on_separate_line(self) -> None:
+        """Plaintiff and 'vs. Defendant' on separate lines are joined (#1360)."""
+        result = _reconstruct_entry_text(
+            "103",
+            "Reyes-Schiller\nvs. Hoffman\n23-01364350",
+            "Motion to Set Aside",
+        )
+        lines = result.split("\n")
+        assert lines[0] == "103 Reyes-Schiller vs. Hoffman"
+        assert lines[1] == "23-01364350"
+
+    def test_multiword_defendant_joined(self) -> None:
+        """Multi-word defendant name is joined with plaintiff (#1360)."""
+        result = _reconstruct_entry_text(
+            "114",
+            "Coulter vs.\nGeneral Motors,\nLLC\n23-01367354",
+            "Motion for Hearing",
+        )
+        lines = result.split("\n")
+        assert lines[0] == "114 Coulter vs. General Motors, LLC"
+        assert lines[1] == "23-01367354"
+
+    def test_single_line_case_name_unchanged(self) -> None:
+        """Case name already on one line is not changed."""
+        result = _reconstruct_entry_text(
+            "110",
+            "Tong vs. Le\n25-01523131",
+            "OSC re: Preliminary Injunction",
+        )
+        lines = result.split("\n")
+        assert lines[0] == "110 Tong vs. Le"
+        assert lines[1] == "25-01523131"
+
+    def test_no_case_number_all_name(self) -> None:
+        """Entry with no case number in the cell."""
+        result = _reconstruct_entry_text(
+            "5",
+            "Smith vs.\nJones",
+            "Demurrer",
+        )
+        lines = result.split("\n")
+        assert lines[0] == "5 Smith vs. Jones"
+        assert lines[1] == "Demurrer"
+
+    def test_long_company_name(self) -> None:
+        """Long company names with commas are joined properly (#1360)."""
+        case_cell = (
+            "Prime Healthcare\nServices - Garden\n"
+            "Grove, LLC vs.\nOptumcare\nManagement,\nLLC\n"
+            "23-01357480"
+        )
+        result = _reconstruct_entry_text("109", case_cell, "Motion to Seal")
+        lines = result.split("\n")
+        expected = "Prime Healthcare Services - Garden Grove, LLC vs. Optumcare Management, LLC"
+        assert expected in lines[0]
+        assert lines[1] == "23-01357480"
+
+    def test_empty_case_name_cell(self) -> None:
+        """Empty case name cell produces just the entry number."""
+        result = _reconstruct_entry_text("1", "", "Ruling text")
+        lines = result.split("\n")
+        assert lines[0] == "1"
+        assert lines[1] == "Ruling text"
+
+
+# ---------------------------------------------------------------------------
+# Fixture regression — no truncated case titles (#1360)
+# ---------------------------------------------------------------------------
+
+
+class TestNoCaseTitleTruncation:
+    """Regression tests ensuring no case titles are truncated at 'vs' (#1360)."""
+
+    @pytest.mark.parametrize(
+        "fixture",
+        [
+            "oc_apkarian_c25.pdf",
+            "oc_central_c34.pdf",
+            "oc_complex_cx.pdf",
+            "oc_costa_mesa_cm.pdf",
+            "oc_west_w.pdf",
+        ],
+    )
+    def test_no_titles_ending_in_vs(self, fixture: str) -> None:
+        """No case titles should end with 'vs' or 'vs.' after extraction."""
+        import re
+
+        from ingestion.oc_splitter import _split_case_number_based
+
+        pdf_bytes = _load_bytes(fixture)
+        text = _extract_oc_pdf_text(pdf_bytes)
+        results = _split_case_number_based(text)
+
+        truncated = [
+            r.case_title
+            for r in results
+            if r.case_title and re.search(r"\bvs\.?\s*$", r.case_title, re.IGNORECASE)
+        ]
+        assert truncated == [], f"{fixture}: found case titles ending in 'vs': {truncated}"
+
+    @pytest.mark.parametrize(
+        "fixture",
+        [
+            "oc_apkarian_c25.pdf",
+            "oc_central_c34.pdf",
+            "oc_complex_cx.pdf",
+            "oc_costa_mesa_cm.pdf",
+            "oc_west_w.pdf",
+        ],
+    )
+    def test_no_titles_starting_with_vs(self, fixture: str) -> None:
+        """No case titles should start with 'vs' or 'vs.' after extraction."""
+        import re
+
+        from ingestion.oc_splitter import _split_case_number_based
+
+        pdf_bytes = _load_bytes(fixture)
+        text = _extract_oc_pdf_text(pdf_bytes)
+        results = _split_case_number_based(text)
+
+        truncated = [
+            r.case_title
+            for r in results
+            if r.case_title and re.search(r"^vs\.?\s", r.case_title, re.IGNORECASE)
+        ]
+        assert truncated == [], f"{fixture}: found case titles starting with 'vs': {truncated}"

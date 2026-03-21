@@ -66,17 +66,35 @@ def _is_header_row(row: list[str | None]) -> bool:
     return all(_TABLE_HEADER_RE.match(cell) for cell in non_empty)
 
 
+_CASE_NAME_CASE_NUMBER_RE = re.compile(r"^\d{2,4}-\d{7,8}$")
+
+
 def _reconstruct_entry_text(
     entry_num: str,
     case_name_cell: str,
     ruling_cell: str,
 ) -> str:
-    """Reconstruct a single case entry with columns properly separated."""
+    """Reconstruct a single case entry with columns properly separated.
+
+    Case name lines from the table cell are joined into a single line so that
+    "Plaintiff vs." and "Defendant" (which pdfplumber splits across rows) are
+    reunited.  Case number lines are kept on separate lines (#1360).
+    """
     parts: list[str] = []
     case_lines = case_name_cell.strip().split("\n") if case_name_cell else []
     if case_lines:
-        parts.append(f"{entry_num} {case_lines[0]}")
-        for line in case_lines[1:]:
+        name_fragments: list[str] = []
+        other_lines: list[str] = []
+        for line in case_lines:
+            stripped = line.strip()
+            if _CASE_NAME_CASE_NUMBER_RE.match(stripped):
+                other_lines.append(stripped)
+            else:
+                name_fragments.append(stripped)
+        joined_name = " ".join(name_fragments)
+        joined_name = re.sub(r"\s+", " ", joined_name).strip()
+        parts.append(f"{entry_num} {joined_name}" if joined_name else entry_num)
+        for line in other_lines:
             parts.append(line)
     else:
         parts.append(entry_num)

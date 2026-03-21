@@ -285,6 +285,9 @@ def _is_header_row(row: list[str | None]) -> bool:
     return all(_TABLE_HEADER_RE.match(cell) for cell in non_empty)
 
 
+_CASE_NAME_CASE_NUMBER_RE = re.compile(r"^\d{2,4}-\d{7,8}$")
+
+
 def _reconstruct_entry_text(
     entry_num: str,
     case_name_cell: str,
@@ -293,22 +296,42 @@ def _reconstruct_entry_text(
     """Reconstruct a single case entry with columns properly separated.
 
     Produces text like:
-        {entry_num} {case_name_line1}
-        {case_name_continuation_lines}
+        {entry_num} {case_title_joined_on_one_line}
         {case_number}
         {ruling_text}
+
+    Case name lines from the table cell are joined into a single line so that
+    "Plaintiff vs." and "Defendant" (which pdfplumber splits across rows in the
+    case-name column) are reunited.  Case number lines (matching
+    ``\\d{2,4}-\\d{7,8}``) are kept on separate lines so the splitter can find
+    them.  This fixes truncated case titles like "Saetern vs" (#1360).
 
     This format is compatible with the existing OC splitter's entry-detection
     regex patterns.
     """
     parts: list[str] = []
 
-    # Entry number + first part of case name on one line
     case_lines = case_name_cell.strip().split("\n") if case_name_cell else []
     if case_lines:
-        parts.append(f"{entry_num} {case_lines[0]}")
-        # Remaining case name lines (multi-line names, case numbers)
-        for line in case_lines[1:]:
+        # Separate case name text from case number lines.  Case numbers are
+        # lines matching DD-DDDDDDDD or DDDD-DDDDDDDD (optionally with a
+        # location prefix like 30-2024-01420730).
+        name_fragments: list[str] = []
+        other_lines: list[str] = []
+        for line in case_lines:
+            stripped = line.strip()
+            if _CASE_NAME_CASE_NUMBER_RE.match(stripped):
+                other_lines.append(stripped)
+            else:
+                name_fragments.append(stripped)
+
+        # Join name fragments into a single line with the entry number.
+        joined_name = " ".join(name_fragments)
+        joined_name = re.sub(r"\s+", " ", joined_name).strip()
+        parts.append(f"{entry_num} {joined_name}" if joined_name else entry_num)
+
+        # Case number(s) on separate lines.
+        for line in other_lines:
             parts.append(line)
     else:
         parts.append(entry_num)
