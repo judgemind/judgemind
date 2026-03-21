@@ -235,16 +235,22 @@ FETCH_RULINGS_QUERY = """
         r.ruling_text,
         d.id AS document_id,
         d.s3_key,
-        d.s3_bucket
+        d.s3_bucket,
+        d.captured_at
     FROM rulings r
     JOIN documents d ON r.document_id = d.id
     WHERE d.scraper_id = 'ca-oc-tentatives-civil'
       AND d.format = 'pdf'
       AND d.s3_key IS NOT NULL
       AND d.s3_bucket IS NOT NULL
+      AND (d.captured_at, r.id) > (%s, %s)
     ORDER BY d.captured_at, r.id
-    LIMIT %s OFFSET %s
+    LIMIT %s
 """
+
+# Minimum cursor values for the first batch.
+_CURSOR_MIN_TIMESTAMP = "1970-01-01T00:00:00+00:00"
+_CURSOR_MIN_UUID = "00000000-0000-0000-0000-000000000000"
 
 
 def main() -> None:
@@ -267,7 +273,8 @@ def main() -> None:
     total_updated = 0
     total_unchanged = 0
     total_errors = 0
-    offset = 0
+    cursor_captured_at = _CURSOR_MIN_TIMESTAMP
+    cursor_ruling_id = _CURSOR_MIN_UUID
 
     try:
         while True:
@@ -279,16 +286,27 @@ def main() -> None:
                 effective_limit = min(args.batch_size, remaining)
 
             with conn.cursor() as cur:
-                cur.execute(FETCH_RULINGS_QUERY, (effective_limit, offset))
+                cur.execute(
+                    FETCH_RULINGS_QUERY,
+                    (cursor_captured_at, cursor_ruling_id, effective_limit),
+                )
                 rows = cur.fetchall()
 
             if not rows:
                 break
 
-            offset += len(rows)
-            logger.info("Processing batch of %d rulings (offset=%d)", len(rows), offset)
+            # Advance cursor to the last row in this batch
+            last_row = rows[-1]
+            cursor_captured_at = last_row[5]  # d.captured_at
+            cursor_ruling_id = last_row[0]  # r.id
+            logger.info(
+                "Processing batch of %d rulings (cursor=%s/%s)",
+                len(rows),
+                cursor_captured_at,
+                cursor_ruling_id,
+            )
 
-            for ruling_id, old_text, doc_id, s3_key, s3_bucket in rows:
+            for ruling_id, old_text, doc_id, s3_key, s3_bucket, _captured_at in rows:
                 total_processed += 1
 
                 try:
