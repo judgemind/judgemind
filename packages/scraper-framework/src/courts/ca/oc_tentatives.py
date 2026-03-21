@@ -278,7 +278,11 @@ _TABLE_HEADER_RE = re.compile(
 
 
 def _is_header_row(row: list[str | None]) -> bool:
-    """Return True if the row is a table header (e.g. # | Case Name | Tentative)."""
+    """Return True if the row is a table header (e.g. # | Case Name | Tentative).
+
+    NOTE: Inlined in scripts/backfill_oc_ruling_text.py (ECS oneshot constraint).
+    If you modify this function, update the inlined copy too.
+    """
     non_empty = [c.strip() for c in row if c and c.strip()]
     if not non_empty:
         return True  # empty row
@@ -294,6 +298,9 @@ def _reconstruct_entry_text(
     ruling_cell: str,
 ) -> str:
     """Reconstruct a single case entry with columns properly separated.
+
+    NOTE: Inlined in scripts/backfill_oc_ruling_text.py (ECS oneshot constraint).
+    If you modify this function, update the inlined copy too.
 
     Produces text like:
         {entry_num} {case_title_joined_on_one_line}
@@ -349,6 +356,9 @@ def _extract_header_text_above_table(
 ) -> str | None:
     """Extract text from the region above the first table on a page.
 
+    NOTE: Inlined in scripts/backfill_oc_ruling_text.py (ECS oneshot constraint).
+    If you modify this function, update the inlined copy too.
+
     OC calendar PDFs have headers (department, judge name, hearing date,
     boilerplate instructions) above the case entry table.  When we use table
     extraction for the entries, we need to separately extract this header text
@@ -377,6 +387,9 @@ def _extract_table_entries_from_page(
     page: pdfplumber.page.Page,
 ) -> tuple[list[str], str | None] | None:
     """Extract case entries from a page using table detection.
+
+    NOTE: Inlined in scripts/backfill_oc_ruling_text.py (ECS oneshot constraint).
+    If you modify this function, update the inlined copy too.
 
     Returns a tuple of (entries, header_text) if a calendar table is found,
     where entries is a list of reconstructed text blocks (one per case entry)
@@ -488,6 +501,9 @@ def _extract_table_entries_from_page(
 def _extract_oc_pdf_text(pdf_bytes: bytes) -> str:
     """Extract text from an OC calendar PDF using table-aware extraction.
 
+    NOTE: Inlined in scripts/backfill_oc_ruling_text.py (ECS oneshot constraint).
+    If you modify this function, update the inlined copy too.
+
     For pages with a detected table (the calendar layout), uses pdfplumber's
     table extraction to properly separate the entry number, case name, and
     ruling text columns.  For pages without tables (e.g. boilerplate header
@@ -535,6 +551,9 @@ _THREE_PART_CASE_NUMBER_RE = re.compile(
 
 def _normalize_oc_text(text: str) -> str:
     """Pre-process extracted PDF text to rejoin case numbers split across lines.
+
+    NOTE: Inlined in scripts/backfill_oc_ruling_text.py (ECS oneshot constraint).
+    If you modify this function, update the inlined copy too.
 
     pdfplumber's columnar layout extraction can split case numbers like
     "2024-01428785" across two lines:
