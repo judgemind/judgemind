@@ -805,6 +805,34 @@ class TestNorthFixture:
             assert r.case_title is not None
             assert "vs" in r.case_title.lower(), f"Entry missing 'vs' in title: {r.case_title}"
 
+    @pytest.mark.xfail(
+        reason="Pre-existing bug: 'Castillo vs' has no defendant name",
+        strict=True,
+    )
+    def test_case_titles_are_clean(self, north_text: str) -> None:
+        """Case titles should be clean names, not garbled with ruling text (#1357)."""
+        results = _split_north(north_text)
+        ruling_keywords = ["granted", "denied", "relief"]
+        for r in results:
+            title = r.case_title or ""
+            title_lower = title.lower()
+            for kw in ruling_keywords:
+                assert kw not in title_lower, (
+                    f"Case title contains ruling text keyword {kw!r}: "
+                    f"{title!r} (case_number={r.case_number})"
+                )
+            assert len(title) <= 80, (
+                f"Case title too long (likely garbled): "
+                f"{title!r} (len={len(title)}, case_number={r.case_number})"
+            )
+            # Titles containing 'vs' should have a non-empty defendant name
+            vs_match = re.search(r"\b(?:vs\.?|v\.)\s*$", title, re.IGNORECASE)
+            if vs_match and "vs" in title_lower:
+                assert False, (
+                    f"Case title ends with 'vs' and no defendant: "
+                    f"{title!r} (case_number={r.case_number})"
+                )
+
     def test_split_via_framework(self, north_text: str) -> None:
         """Verify the full framework pipeline works for North JC."""
         event = {
@@ -862,6 +890,30 @@ class TestCentralFixture:
                 f"Split [{i}] (case={r.case_number}) has {len(r.ruling_text)} chars, "
                 f">= 50% of full page ({full_len}). Should be case-specific text only."
             )
+
+    def test_case_titles_are_clean(self, central_text: str) -> None:
+        """Case titles should be clean names, not garbled with ruling text (#1357)."""
+        results = _split_case_number_based(central_text)
+        ruling_keywords = ["granted", "denied", "relief"]
+        for r in results:
+            title = r.case_title or ""
+            title_lower = title.lower()
+            for kw in ruling_keywords:
+                assert kw not in title_lower, (
+                    f"Case title contains ruling text keyword {kw!r}: "
+                    f"{title!r} (case_number={r.case_number})"
+                )
+            assert len(title) <= 80, (
+                f"Case title too long (likely garbled): "
+                f"{title!r} (len={len(title)}, case_number={r.case_number})"
+            )
+            # Titles containing 'vs' should have a non-empty defendant name
+            vs_match = re.search(r"\b(?:vs\.?|v\.)\s*$", title, re.IGNORECASE)
+            if vs_match and "vs" in title_lower:
+                assert False, (
+                    f"Case title ends with 'vs' and no defendant: "
+                    f"{title!r} (case_number={r.case_number})"
+                )
 
 
 class TestApkarianFixture:
@@ -936,6 +988,34 @@ class TestApkarianFixture:
                     f"Entries should not overlap. Line: {first_line!r}"
                 )
 
+    @pytest.mark.xfail(
+        reason="Pre-existing bug: 'Saetern vs' has no defendant name",
+        strict=True,
+    )
+    def test_case_titles_are_clean(self, apkarian_text: str) -> None:
+        """Case titles should be clean names, not garbled with ruling text (#1357)."""
+        results = _split_case_number_based(apkarian_text)
+        ruling_keywords = ["granted", "denied", "relief"]
+        for r in results:
+            title = r.case_title or ""
+            title_lower = title.lower()
+            for kw in ruling_keywords:
+                assert kw not in title_lower, (
+                    f"Case title contains ruling text keyword {kw!r}: "
+                    f"{title!r} (case_number={r.case_number})"
+                )
+            assert len(title) <= 80, (
+                f"Case title too long (likely garbled): "
+                f"{title!r} (len={len(title)}, case_number={r.case_number})"
+            )
+            # Titles containing 'vs' should have a non-empty defendant name
+            vs_match = re.search(r"\b(?:vs\.?|v\.)\s*$", title, re.IGNORECASE)
+            if vs_match and "vs" in title_lower:
+                assert False, (
+                    f"Case title ends with 'vs' and no defendant: "
+                    f"{title!r} (case_number={r.case_number})"
+                )
+
 
 class TestWestFixture:
     """Regression tests using West JC fixture (oc_west_w.pdf)."""
@@ -962,6 +1042,30 @@ class TestWestFixture:
                 f"Split [{i}] (case={r.case_number}) has {len(r.ruling_text)} chars, "
                 f">= 50% of full page ({full_len}). Should be case-specific text only."
             )
+
+    def test_case_titles_are_clean(self, west_text: str) -> None:
+        """Case titles should be clean names, not garbled with ruling text (#1357)."""
+        results = _split_case_number_based(west_text)
+        ruling_keywords = ["granted", "denied", "relief"]
+        for r in results:
+            title = r.case_title or ""
+            title_lower = title.lower()
+            for kw in ruling_keywords:
+                assert kw not in title_lower, (
+                    f"Case title contains ruling text keyword {kw!r}: "
+                    f"{title!r} (case_number={r.case_number})"
+                )
+            assert len(title) <= 80, (
+                f"Case title too long (likely garbled): "
+                f"{title!r} (len={len(title)}, case_number={r.case_number})"
+            )
+            # Titles containing 'vs' should have a non-empty defendant name
+            vs_match = re.search(r"\b(?:vs\.?|v\.)\s*$", title, re.IGNORECASE)
+            if vs_match and "vs" in title_lower:
+                assert False, (
+                    f"Case title ends with 'vs' and no defendant: "
+                    f"{title!r} (case_number={r.case_number})"
+                )
 
 
 class TestCostaMesaFixture:
@@ -991,6 +1095,30 @@ class TestCostaMesaFixture:
                 f">= 50% of full page ({full_len}). Should be case-specific text only."
             )
 
+    def test_case_titles_are_clean(self, cm_text: str) -> None:
+        """Case titles should be clean names, not garbled with ruling text (#1357)."""
+        results = _split_case_number_based(cm_text)
+        ruling_keywords = ["granted", "denied", "relief"]
+        for r in results:
+            title = r.case_title or ""
+            title_lower = title.lower()
+            for kw in ruling_keywords:
+                assert kw not in title_lower, (
+                    f"Case title contains ruling text keyword {kw!r}: "
+                    f"{title!r} (case_number={r.case_number})"
+                )
+            assert len(title) <= 80, (
+                f"Case title too long (likely garbled): "
+                f"{title!r} (len={len(title)}, case_number={r.case_number})"
+            )
+            # Titles containing 'vs' should have a non-empty defendant name
+            vs_match = re.search(r"\b(?:vs\.?|v\.)\s*$", title, re.IGNORECASE)
+            if vs_match and "vs" in title_lower:
+                assert False, (
+                    f"Case title ends with 'vs' and no defendant: "
+                    f"{title!r} (case_number={r.case_number})"
+                )
+
 
 class TestComplexFixture:
     """Regression tests using Complex fixture (oc_complex_cx.pdf)."""
@@ -1018,6 +1146,34 @@ class TestComplexFixture:
                 f"Split [{i}] (case={r.case_number}) has {len(r.ruling_text)} chars, "
                 f">= 50% of full page ({full_len}). Should be case-specific text only."
             )
+
+    @pytest.mark.xfail(
+        reason="Pre-existing bug: 'Valdez vs' has no defendant name",
+        strict=True,
+    )
+    def test_case_titles_are_clean(self, cx_text: str) -> None:
+        """Case titles should be clean names, not garbled with ruling text (#1357)."""
+        results = _split_case_number_based(cx_text)
+        ruling_keywords = ["granted", "denied", "relief"]
+        for r in results:
+            title = r.case_title or ""
+            title_lower = title.lower()
+            for kw in ruling_keywords:
+                assert kw not in title_lower, (
+                    f"Case title contains ruling text keyword {kw!r}: "
+                    f"{title!r} (case_number={r.case_number})"
+                )
+            assert len(title) <= 80, (
+                f"Case title too long (likely garbled): "
+                f"{title!r} (len={len(title)}, case_number={r.case_number})"
+            )
+            # Titles containing 'vs' should have a non-empty defendant name
+            vs_match = re.search(r"\b(?:vs\.?|v\.)\s*$", title, re.IGNORECASE)
+            if vs_match and "vs" in title_lower:
+                assert False, (
+                    f"Case title ends with 'vs' and no defendant: "
+                    f"{title!r} (case_number={r.case_number})"
+                )
 
 
 # ---------------------------------------------------------------------------
@@ -1361,6 +1517,34 @@ class TestNorthN15Fixture:
         texts = [r.ruling_text for r in results]
         assert len(set(texts)) == len(texts)
 
+    @pytest.mark.xfail(
+        reason="Pre-existing bug: N15 'A Plus Autobody' title garbled with ruling text (len=83)",
+        strict=True,
+    )
+    def test_case_titles_are_clean(self, n15_text: str) -> None:
+        """Case titles should be clean names, not garbled with ruling text (#1357)."""
+        results = _split_north(n15_text)
+        ruling_keywords = ["granted", "denied", "relief"]
+        for r in results:
+            title = r.case_title or ""
+            title_lower = title.lower()
+            for kw in ruling_keywords:
+                assert kw not in title_lower, (
+                    f"Case title contains ruling text keyword {kw!r}: "
+                    f"{title!r} (case_number={r.case_number})"
+                )
+            assert len(title) <= 80, (
+                f"Case title too long (likely garbled): "
+                f"{title!r} (len={len(title)}, case_number={r.case_number})"
+            )
+            # Titles containing 'vs' should have a non-empty defendant name
+            vs_match = re.search(r"\b(?:vs\.?|v\.)\s*$", title, re.IGNORECASE)
+            if vs_match and "vs" in title_lower:
+                assert False, (
+                    f"Case title ends with 'vs' and no defendant: "
+                    f"{title!r} (case_number={r.case_number})"
+                )
+
     def test_split_text_shorter_than_full_page(self, n15_text: str) -> None:
         results = _split_north(n15_text)
         full_len = len(n15_text)
@@ -1413,6 +1597,30 @@ class TestNorthN16Fixture:
         results = _split_north(n16_text)
         texts = [r.ruling_text for r in results]
         assert len(set(texts)) == len(texts)
+
+    def test_case_titles_are_clean(self, n16_text: str) -> None:
+        """Case titles should be clean names, not garbled with ruling text (#1357)."""
+        results = _split_north(n16_text)
+        ruling_keywords = ["granted", "denied", "relief"]
+        for r in results:
+            title = r.case_title or ""
+            title_lower = title.lower()
+            for kw in ruling_keywords:
+                assert kw not in title_lower, (
+                    f"Case title contains ruling text keyword {kw!r}: "
+                    f"{title!r} (case_number={r.case_number})"
+                )
+            assert len(title) <= 80, (
+                f"Case title too long (likely garbled): "
+                f"{title!r} (len={len(title)}, case_number={r.case_number})"
+            )
+            # Titles containing 'vs' should have a non-empty defendant name
+            vs_match = re.search(r"\b(?:vs\.?|v\.)\s*$", title, re.IGNORECASE)
+            if vs_match and "vs" in title_lower:
+                assert False, (
+                    f"Case title ends with 'vs' and no defendant: "
+                    f"{title!r} (case_number={r.case_number})"
+                )
 
     def test_split_text_shorter_than_full_page(self, n16_text: str) -> None:
         results = _split_north(n16_text)
@@ -1474,6 +1682,30 @@ class TestNorthN17Fixture:
         results = _split_north(n17_text)
         texts = [r.ruling_text for r in results]
         assert len(set(texts)) == len(texts)
+
+    def test_case_titles_are_clean(self, n17_text: str) -> None:
+        """Case titles should be clean names, not garbled with ruling text (#1357)."""
+        results = _split_north(n17_text)
+        ruling_keywords = ["granted", "denied", "relief"]
+        for r in results:
+            title = r.case_title or ""
+            title_lower = title.lower()
+            for kw in ruling_keywords:
+                assert kw not in title_lower, (
+                    f"Case title contains ruling text keyword {kw!r}: "
+                    f"{title!r} (case_number={r.case_number})"
+                )
+            assert len(title) <= 80, (
+                f"Case title too long (likely garbled): "
+                f"{title!r} (len={len(title)}, case_number={r.case_number})"
+            )
+            # Titles containing 'vs' should have a non-empty defendant name
+            vs_match = re.search(r"\b(?:vs\.?|v\.)\s*$", title, re.IGNORECASE)
+            if vs_match and "vs" in title_lower:
+                assert False, (
+                    f"Case title ends with 'vs' and no defendant: "
+                    f"{title!r} (case_number={r.case_number})"
+                )
 
     def test_split_text_shorter_than_full_page(self, n17_text: str) -> None:
         results = _split_north(n17_text)
