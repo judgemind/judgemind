@@ -87,6 +87,132 @@ def normalize_ruling_text_hash(text: str | None) -> str | None:
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 
+# Legal acronyms that should be preserved when title-casing case titles.
+# After str.title() these would become e.g. "Llc", "Llp" — we restore them.
+_LEGAL_ACRONYMS: dict[str, str] = {
+    "llc": "LLC",
+    "llp": "LLP",
+    "dba": "DBA",
+    "inc": "Inc.",
+    "inc.": "Inc.",
+    "corp": "Corp.",
+    "corp.": "Corp.",
+    "ltd": "Ltd.",
+    "ltd.": "Ltd.",
+    "l.p.": "L.P.",
+    "lp": "LP",
+    "n.a.": "N.A.",
+    "na": "NA",
+    "pc": "PC",
+    "p.c.": "P.C.",
+    "pllc": "PLLC",
+    "gp": "GP",
+    "pa": "PA",
+    "p.a.": "P.A.",
+    "co": "Co.",
+    "co.": "Co.",
+    "ii": "II",
+    "iii": "III",
+    "iv": "IV",
+    "d/b/a": "d/b/a",
+}
+
+
+def _is_all_caps_title(title: str) -> bool:
+    """Return True if a case title is ALL CAPS (ignoring the separator and short words).
+
+    Splits on the "v." / "vs." / "vs" separator and checks whether all
+    name parts are fully uppercased.  Single-character words and known
+    legal acronyms are ignored — we only care about multi-word party names
+    being in ALL CAPS.
+
+    A title must have at least one part longer than 1 character to qualify.
+    """
+    # Split on the "v." / "vs." / "vs" separator
+    parts = re.split(r"\s+[Vv][Ss]?\.?\s+", title)
+    if not parts:
+        return False
+
+    has_alpha_part = False
+    for part in parts:
+        stripped = part.strip()
+        if not stripped:
+            continue
+        # Check if all alphabetic characters are uppercase
+        alpha_chars = [c for c in stripped if c.isalpha()]
+        if not alpha_chars:
+            continue
+        has_alpha_part = True
+        if not all(c.isupper() for c in alpha_chars):
+            return False
+
+    return has_alpha_part
+
+
+def normalize_case_title(title: str | None) -> str | None:
+    """Normalize an ALL CAPS case title to title case.
+
+    Detects ALL CAPS titles and converts them to title case while
+    preserving legal acronyms (LLC, LLP, DBA, Inc., Corp., etc.)
+    and the "v." separator.
+
+    Mixed-case or already-normalized titles are returned unchanged
+    (only whitespace normalization is applied).
+
+    Returns ``None`` if the input is ``None`` or empty after stripping.
+
+    Examples:
+        "SMITH VS JONES"  -> "Smith v. Jones"
+        "ACME LLC VS DOE" -> "Acme LLC v. Jones"
+        "Smith v. Jones"  -> "Smith v. Jones"  (unchanged)
+        None              -> None
+    """
+    if title is None:
+        return None
+
+    # Normalize whitespace
+    title = re.sub(r"\s+", " ", title).strip()
+    if not title:
+        return None
+
+    if not _is_all_caps_title(title):
+        return title
+
+    # Normalize the separator to "v." before title-casing
+    title = re.sub(r"\s+[Vv][Ss]?\.?\s+", " v. ", title)
+
+    # Split on "v." to title-case each side independently
+    parts = title.split(" v. ")
+    normalized_parts: list[str] = []
+
+    for part in parts:
+        # Apply title case
+        tc = part.title()
+        # Restore legal acronyms
+        words = tc.split()
+        restored: list[str] = []
+        for word in words:
+            # Strip trailing punctuation for lookup, then reattach
+            stripped_word = word.rstrip(",;:.")
+            trailing = word[len(stripped_word) :]
+            canonical = _LEGAL_ACRONYMS.get(stripped_word.lower())
+            if canonical is None:
+                # Also try with the trailing punctuation included
+                canonical = _LEGAL_ACRONYMS.get(word.lower().rstrip(",;:"))
+            if canonical is not None:
+                # Avoid double punctuation: if canonical already ends with
+                # the same char as trailing, skip the trailing
+                if trailing and canonical.endswith(trailing[0]):
+                    restored.append(canonical + trailing[1:])
+                else:
+                    restored.append(canonical + trailing)
+            else:
+                restored.append(word)
+        normalized_parts.append(" ".join(restored))
+
+    return " v. ".join(normalized_parts)
+
+
 def _derive_court_code(state: str, county: str) -> str:
     """Derive a URL-safe court code from state + county.
 
@@ -147,7 +273,7 @@ def upsert_case(
     only when a non-NULL value is provided (COALESCE preserves existing values).
     """
     normalized = case_number.strip().lower().replace(" ", "").replace("-", "")
-    case_title = _strip_nul(case_title)
+    case_title = normalize_case_title(_strip_nul(case_title))
     case_type = _strip_nul(case_type)
     with conn.cursor() as cur:
         cur.execute(

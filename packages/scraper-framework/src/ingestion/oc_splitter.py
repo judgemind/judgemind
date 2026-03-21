@@ -442,7 +442,7 @@ def _split_case_number_based(text: str) -> list[SplitResult]:
 
 # Patterns that indicate calendar header boilerplate — not case-specific content.
 _BOILERPLATE_PATTERNS = re.compile(
-    r"(?:TENTATIVE RULINGS|LAW\s*[&]\s*MOTION\s*CALENDAR|"
+    r"(?:TENTATIVE RULINGS|LAW\s*[&]\s*MOTION(?:\s*CALENDAR)?|"
     r"Justice Center|If you are submitting|please call the Clerk|"
     r"oral argument|not be scheduled|"
     r"If ALL parties submit|"

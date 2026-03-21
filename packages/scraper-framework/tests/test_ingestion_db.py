@@ -19,6 +19,7 @@ import pytest
 from ingestion.db import (
     _MAX_PARTY_NAME_LENGTH,
     _derive_court_code,
+    _is_all_caps_title,
     _looks_like_valid_judge_name,
     _strip_middle_initials,
     _strip_nul,
@@ -26,6 +27,7 @@ from ingestion.db import (
     batch_upsert_parties,
     insert_document,
     insert_ruling,
+    normalize_case_title,
     normalize_judge_name,
     normalize_party_name,
     normalize_ruling_text_hash,
@@ -1632,3 +1634,149 @@ class TestInsertRulingContentDedup:
         sql_stmts = [call[0][0] for call in execute_calls]
         assert "SAVEPOINT ruling_insert" in sql_stmts
         assert "RELEASE SAVEPOINT ruling_insert" in sql_stmts
+
+
+# ---------------------------------------------------------------------------
+# _is_all_caps_title
+# ---------------------------------------------------------------------------
+
+
+class TestIsAllCapsTitle:
+    """Tests for _is_all_caps_title helper."""
+
+    def test_all_caps_with_vs(self) -> None:
+        assert _is_all_caps_title("SMITH VS JONES") is True
+
+    def test_all_caps_with_v_dot(self) -> None:
+        assert _is_all_caps_title("SMITH v. JONES") is True
+
+    def test_mixed_case_is_not_all_caps(self) -> None:
+        assert _is_all_caps_title("Smith v. Jones") is False
+
+    def test_title_case_is_not_all_caps(self) -> None:
+        assert _is_all_caps_title("Current And Former Employees v. Priti Prabha") is False
+
+    def test_long_all_caps(self) -> None:
+        assert _is_all_caps_title("CURRENT AND FORMER AGGRIEVED EMPLOYEES vs PRITI PRABHA") is True
+
+    def test_empty_string(self) -> None:
+        assert _is_all_caps_title("") is False
+
+    def test_all_caps_with_punctuation(self) -> None:
+        assert _is_all_caps_title("ACME, LLC vs DOE") is True
+
+
+# ---------------------------------------------------------------------------
+# normalize_case_title
+# ---------------------------------------------------------------------------
+
+
+class TestNormalizeCaseTitle:
+    """Tests for normalize_case_title function."""
+
+    def test_none_returns_none(self) -> None:
+        assert normalize_case_title(None) is None
+
+    def test_empty_string_returns_none(self) -> None:
+        assert normalize_case_title("") is None
+
+    def test_whitespace_only_returns_none(self) -> None:
+        assert normalize_case_title("   ") is None
+
+    def test_all_caps_normalized_to_title_case(self) -> None:
+        result = normalize_case_title("SMITH VS JONES")
+        assert result == "Smith v. Jones"
+
+    def test_all_caps_long_title(self) -> None:
+        result = normalize_case_title("CURRENT AND FORMER AGGRIEVED EMPLOYEES vs PRITI PRABHA")
+        assert result == "Current And Former Aggrieved Employees v. Priti Prabha"
+
+    def test_preserves_llc(self) -> None:
+        result = normalize_case_title("ACME LLC VS DOE")
+        assert result == "Acme LLC v. Doe"
+
+    def test_preserves_llp(self) -> None:
+        result = normalize_case_title("SMITH LLP VS JONES")
+        assert result == "Smith LLP v. Jones"
+
+    def test_preserves_dba(self) -> None:
+        result = normalize_case_title("DOE DBA ACME VS SMITH")
+        assert result == "Doe DBA Acme v. Smith"
+
+    def test_preserves_inc(self) -> None:
+        result = normalize_case_title("ACME INC VS DOE")
+        assert result == "Acme Inc. v. Doe"
+
+    def test_preserves_corp(self) -> None:
+        result = normalize_case_title("ACME CORP VS DOE")
+        assert result == "Acme Corp. v. Doe"
+
+    def test_preserves_ltd(self) -> None:
+        result = normalize_case_title("ACME LTD VS DOE")
+        assert result == "Acme Ltd. v. Doe"
+
+    def test_preserves_lp(self) -> None:
+        result = normalize_case_title("ACME LP VS DOE")
+        assert result == "Acme LP v. Doe"
+
+    def test_preserves_na(self) -> None:
+        result = normalize_case_title("BANK N.A. VS DOE")
+        assert result == "Bank N.A. v. Doe"
+
+    def test_preserves_pc(self) -> None:
+        result = normalize_case_title("LAW FIRM PC VS DOE")
+        assert result == "Law Firm PC v. Doe"
+
+    def test_preserves_pllc(self) -> None:
+        result = normalize_case_title("LAW FIRM PLLC VS DOE")
+        assert result == "Law Firm PLLC v. Doe"
+
+    def test_mixed_case_unchanged(self) -> None:
+        """Mixed-case titles should not be modified."""
+        title = "Smith v. Jones"
+        assert normalize_case_title(title) == title
+
+    def test_title_case_unchanged(self) -> None:
+        """Already title-cased titles should not be modified."""
+        title = "Current And Former Employees v. Priti Prabha"
+        assert normalize_case_title(title) == title
+
+    def test_normalizes_vs_separator(self) -> None:
+        """'VS' should become 'v.' in the normalized output."""
+        result = normalize_case_title("SMITH VS JONES")
+        assert " v. " in result
+
+    def test_normalizes_vs_dot_separator(self) -> None:
+        """'VS.' should become 'v.' in the normalized output."""
+        result = normalize_case_title("SMITH VS. JONES")
+        assert " v. " in result
+
+    def test_whitespace_collapsed(self) -> None:
+        result = normalize_case_title("SMITH   VS   JONES")
+        assert result == "Smith v. Jones"
+
+    def test_real_example_hussnain(self) -> None:
+        result = normalize_case_title("SYED HUSSNAIN v. FORD MOTOR CO.")
+        assert result == "Syed Hussnain v. Ford Motor Co."
+
+    def test_preserves_multiple_acronyms(self) -> None:
+        result = normalize_case_title("ACME LLC DBA WIDGETS VS DOE CORP")
+        assert result == "Acme LLC DBA Widgets v. Doe Corp."
+
+    def test_no_separator_all_caps(self) -> None:
+        """A title without v./vs. that is all caps should still be normalized."""
+        result = normalize_case_title("SMITH AND JONES")
+        assert result == "Smith And Jones"
+
+    def test_upsert_case_applies_normalization(self) -> None:
+        """upsert_case should normalize ALL CAPS case titles."""
+        conn = _mock_conn()
+        cur = conn.cursor.return_value.__enter__.return_value
+        cur.fetchone.return_value = ("case-id-1",)
+
+        upsert_case(conn, "24CV123456", "court-1", case_title="SMITH VS JONES")
+
+        # The SQL params should contain the normalized title
+        call_args = cur.execute.call_args[0][1]
+        # case_title is the 4th parameter (index 3)
+        assert call_args[3] == "Smith v. Jones"

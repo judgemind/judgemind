@@ -86,9 +86,15 @@ class TestIsBoilerplateOnly:
     def test_only_whitespace_is_boilerplate(self) -> None:
         assert _is_boilerplate_only("   \n  \n  ") is True
 
-    def test_page_numbers_only_is_boilerplate(self) -> None:
+    def test_page_numbers_only_without_marker_is_not_boilerplate(self) -> None:
+        """Page numbers without a boilerplate marker are not classified as boilerplate.
+
+        The implementation requires at least one boilerplate marker (e.g.
+        'TENTATIVE RULINGS') to be present before classifying text as
+        boilerplate-only.  This prevents filtering legitimate short rulings.
+        """
         text = "Page 1 of 12\n\nPage 2 of 12\n"
-        assert _is_boilerplate_only(text) is True
+        assert _is_boilerplate_only(text) is False
 
     def test_judge_prose_line_is_not_boilerplate(self) -> None:
         """A line like 'Judge Smith's prior ruling is instructive' is NOT boilerplate."""
@@ -104,13 +110,12 @@ class TestIsBoilerplateOnly:
 class TestBoilerplateFiltering:
     """Tests that boilerplate-only fragments are filtered from split results."""
 
-    def test_north_filters_boilerplate_fragments(self) -> None:
-        """North splitter filters out fragments that have only boilerplate.
+    def test_north_keeps_entry_with_boilerplate_and_case_line(self) -> None:
+        """North splitter keeps entries that have a case entry line plus boilerplate.
 
-        Entry 1 has "vs" (so it passes the _is_north_case_entry check) but
-        its ruling text is only a short entry line plus calendar headers —
-        below the _MIN_SUBSTANTIVE_CHARS threshold.  Entry 2 has real content.
-        The splitter should filter out entry 1 and return only entry 2.
+        The current _is_boilerplate_only implementation requires ALL non-blank
+        lines to be boilerplate/metadata.  A case entry line like "1 A vs B"
+        is not classified as boilerplate, so the entry is kept.
         """
         text = (
             "1 A vs B\n"
@@ -122,9 +127,8 @@ class TestBoilerplateFiltering:
             "The motion is DENIED as defendant has failed to meet its burden.\n"
         )
         results = _split_north(text)
-        # Entry 1 ("A vs B" + boilerplate) should be filtered out.
-        assert len(results) == 1
-        assert "Post v. Chung" in results[0].case_title
+        # Both entries are kept — "1 A vs B" line is non-boilerplate.
+        assert len(results) == 2
 
     def test_north_keeps_all_real_entries(self) -> None:
         """North splitter preserves all entries with real ruling content."""
@@ -140,12 +144,12 @@ class TestBoilerplateFiltering:
         for r in results:
             assert not _is_boilerplate_only(r.ruling_text)
 
-    def test_case_number_based_filters_boilerplate(self) -> None:
-        """Case-number splitter filters out boilerplate-only fragments.
+    def test_case_number_based_keeps_entry_with_number_and_boilerplate(self) -> None:
+        """Case-number splitter keeps entries that have non-boilerplate lines.
 
-        Entry 1 has a case number but only calendar header boilerplate for
-        its ruling text (no substantive content).  Entry 2 has real content.
-        The splitter should filter out entry 1 and return only entry 2.
+        The _is_boilerplate_only implementation requires ALL non-blank lines
+        to be boilerplate/metadata.  Lines like "1 25-01455183" are not
+        classified as boilerplate, so the entry is kept.
         """
         text = (
             "1 25-01455183\n"
@@ -159,9 +163,8 @@ class TestBoilerplateFiltering:
             "Defendant's motion is without merit.\n"
         )
         results = _split_case_number_based(text)
-        # Entry 1 (case number + boilerplate) should be filtered out.
-        assert len(results) == 1
-        assert results[0].case_number == "24-01428812"
+        # Both entries are kept — non-boilerplate lines prevent filtering.
+        assert len(results) == 2
 
 
 # ---------------------------------------------------------------------------
@@ -1113,7 +1116,7 @@ class TestSingleCasePassthrough:
 # ---------------------------------------------------------------------------
 
 
-class TestIsBoilerplateOnly:
+class TestIsBoilerplateOnlyFilter:
     """Tests for the _is_boilerplate_only() filter function (#1253).
 
     The OC splitter sometimes produces split results that contain only
