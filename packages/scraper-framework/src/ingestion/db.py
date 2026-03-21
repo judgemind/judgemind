@@ -1017,12 +1017,13 @@ def upsert_party(
     canonical = normalize_party_name(raw_name)
 
     with conn.cursor() as cur:
-        # Look up existing alias for this raw name
+        # Look up existing alias for this raw name (case-insensitive to prevent
+        # duplicate party records when the same name arrives in different casing)
         cur.execute(
             """
             SELECT pa.party_id
             FROM party_aliases pa
-            WHERE pa.raw_name = %s
+            WHERE LOWER(pa.raw_name) = LOWER(%s)
             LIMIT 1
             """,
             (raw_name,),
@@ -1138,15 +1139,17 @@ def batch_upsert_parties(
     new_count = 0
 
     with conn.cursor() as cur:
-        # Step 1: Batch-lookup existing aliases — single SELECT for all names
+        # Step 1: Batch-lookup existing aliases — case-insensitive to prevent
+        # duplicate party records when the same name arrives in different casing.
         cur.execute(
-            "SELECT raw_name, party_id FROM party_aliases WHERE raw_name = ANY(%s)",
-            (raw_names,),
+            "SELECT LOWER(raw_name), party_id FROM party_aliases WHERE LOWER(raw_name) = ANY(%s)",
+            ([rn.lower() for rn in raw_names],),
         )
         existing: dict[str, str] = {row[0]: str(row[1]) for row in cur.fetchall()}
 
-        # Step 2: Insert new parties + aliases for names not yet in the DB
-        new_entries = [(rn, cn) for rn, cn, _role in entries if rn not in existing]
+        # Step 2: Insert new parties + aliases for names not yet in the DB.
+        # Use lowercased key for lookup to match the case-insensitive query above.
+        new_entries = [(rn, cn) for rn, cn, _role in entries if rn.lower() not in existing]
         new_count = len(new_entries)
         if new_entries:
             # Insert each new party and collect its ID.  We use executemany with
@@ -1175,14 +1178,14 @@ def batch_upsert_parties(
                 [(pid, rn, alias_source) for (rn, _cn), pid in zip(new_entries, new_ids)],
             )
 
-            # Merge new IDs into the lookup dict
+            # Merge new IDs into the lookup dict (lowercased keys)
             for (rn, _cn), pid in zip(new_entries, new_ids):
-                existing[rn] = pid
+                existing[rn.lower()] = pid
 
         # Step 3: Batch-insert case_party links
         link_params = []
         for raw_name, _canonical, role in entries:
-            party_id = existing.get(raw_name)
+            party_id = existing.get(raw_name.lower())
             if party_id and role:
                 link_params.append((case_id, party_id, role))
 
