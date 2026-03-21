@@ -65,7 +65,15 @@ See `docs/terraform-checklist.md` for the full checklist.
 
 ## ECS Script Execution
 
-Prefer `ecs-run-task.sh` over `ecs-run.sh`. `scripts/ecs-run.sh` uses ECS Exec (SSM sessions) which frequently disconnects within seconds, losing all output. Use `scripts/ecs-run-task.sh` instead — it launches a clean Fargate task and streams logs reliably from CloudWatch. Reserve `ecs-run.sh` only for quick interactive debugging (e.g. `scripts/ecs-run.sh bash`).
+> **Important:** The dev database is in a private VPC and is not reachable from localhost. Do not attempt to connect to it locally using `scripts/with-secret.sh` with `DATABASE_URL` — the connection will fail. All data scripts must run inside the VPC via `ecs-run-task.sh`.
+
+**Always use `ecs-run-task.sh` for data scripts.** It launches a standalone Fargate task with full VPC access, streams logs from CloudWatch, and handles cleanup automatically. `scripts/ecs-run.sh` uses ECS Exec (SSM sessions) which frequently disconnects within seconds, losing all output. Reserve `ecs-run.sh` only for quick interactive debugging (e.g. `scripts/ecs-run.sh bash`).
+
+| Tool | Use for | Reliability | Notes |
+|---|---|---|---|
+| `scripts/ecs-run-task.sh` | All data scripts (backfills, migrations, audits) | Reliable | Standalone Fargate task, CloudWatch logs, no session timeout |
+| `scripts/dev-db-query.sh` | Quick SQL queries | Good for short queries | Uses ECS Exec internally; may drop on long queries |
+| `scripts/ecs-run.sh` | Interactive debugging only | Unreliable | SSM sessions drop after seconds; never use for scripts |
 
 ```
 # Run a script and wait for completion (default)
