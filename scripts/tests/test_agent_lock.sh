@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# test_agent_lock.sh — Tests for the agent lock file mechanism (#1260)
+# test_agent_lock.sh — Tests for the agent lock file mechanism (#1260, #1254)
 #
 # Tests:
 #   - start-worker.sh creates .agent-lock in new worktrees
@@ -8,6 +8,9 @@
 #   - end-worker.sh ignores stale locks (> 30 min)
 #   - start-worker.sh skips stale worktrees with fresh locks during cleanup
 #   - refresh-agent-lock.sh creates/updates the lock file
+#   - start-worker.sh preserves unregistered dirs with fresh locks (#1254)
+#   - start-worker.sh skips worker numbers with fresh-locked dirs (#1254)
+#   - start-worker.sh reclaims worker numbers after stale/missing locks (#1254)
 #
 # Usage:
 #   scripts/tests/test_agent_lock.sh
@@ -226,6 +229,62 @@ fi
 # Clean up
 git -C "$TEMP_REPO" worktree remove "$new_wt2" --force 2>/dev/null || true
 git -C "$TEMP_REPO" worktree remove "$TEMP_REPO/worktrees/worker-14" --force 2>/dev/null || true
+
+# ── Test 12: start-worker.sh skips unregistered dir with fresh lock (#1254) ──
+# Create an unregistered directory (not a git worktree) with a fresh lock.
+# start-worker.sh Step 1d should NOT remove it, and Step 2 should skip its
+# worker number.
+mkdir -p "$TEMP_REPO/worktrees/worker-1"
+date -u +%Y-%m-%dT%H:%M:%SZ > "$TEMP_REPO/worktrees/worker-1/.agent-lock"
+
+new_wt3=$(run_start 2>/dev/null | tail -1) || true
+if [[ -d "$TEMP_REPO/worktrees/worker-1" ]]; then
+    pass "start-worker.sh preserves unregistered dir with fresh lock (Step 1d) (#1254)"
+else
+    fail "start-worker.sh preserves unregistered dir with fresh lock (Step 1d) (#1254)" "worker-1 directory was removed"
+fi
+
+# Verify the new worktree was assigned a DIFFERENT number (not worker-1)
+new_wt3_num=$(basename "$new_wt3" | sed 's/worker-//')
+if [[ "$new_wt3_num" != "1" ]]; then
+    pass "start-worker.sh assigns different worker number when locked dir exists (Step 2) (#1254)"
+else
+    fail "start-worker.sh assigns different worker number when locked dir exists (Step 2) (#1254)" "got worker-1, expected a different number"
+fi
+
+# Clean up
+git -C "$TEMP_REPO" worktree remove "$new_wt3" --force 2>/dev/null || true
+rm -rf "$TEMP_REPO/worktrees/worker-1"
+
+# ── Test 13: start-worker.sh removes unregistered dir with stale lock (#1254) ──
+# An unregistered directory with a stale lock (> 30 min) should be cleaned up.
+mkdir -p "$TEMP_REPO/worktrees/worker-1"
+date -u +%Y-%m-%dT%H:%M:%SZ > "$TEMP_REPO/worktrees/worker-1/.agent-lock"
+touch -t "$(date -v-31M +%Y%m%d%H%M.%S 2>/dev/null || date -d '31 minutes ago' +%Y%m%d%H%M.%S)" "$TEMP_REPO/worktrees/worker-1/.agent-lock"
+
+new_wt4=$(run_start 2>/dev/null | tail -1) || true
+new_wt4_num=$(basename "$new_wt4" | sed 's/worker-//')
+if [[ "$new_wt4_num" == "1" ]]; then
+    pass "start-worker.sh reclaims worker number after stale lock removal (#1254)"
+else
+    fail "start-worker.sh reclaims worker number after stale lock removal (#1254)" "got worker-$new_wt4_num, expected worker-1"
+fi
+# Clean up
+git -C "$TEMP_REPO" worktree remove "$new_wt4" --force 2>/dev/null || true
+
+# ── Test 14: start-worker.sh removes unregistered dir without lock (#1254) ──
+# An unregistered directory with no lock at all should be cleaned up normally.
+mkdir -p "$TEMP_REPO/worktrees/worker-1"
+
+new_wt5=$(run_start 2>/dev/null | tail -1) || true
+new_wt5_num=$(basename "$new_wt5" | sed 's/worker-//')
+if [[ "$new_wt5_num" == "1" ]]; then
+    pass "start-worker.sh reclaims worker number from unregistered dir without lock (#1254)"
+else
+    fail "start-worker.sh reclaims worker number from unregistered dir without lock (#1254)" "got worker-$new_wt5_num, expected worker-1"
+fi
+# Clean up
+git -C "$TEMP_REPO" worktree remove "$new_wt5" --force 2>/dev/null || true
 
 # ── Summary ──────────────────────────────────────────────────────────────
 
