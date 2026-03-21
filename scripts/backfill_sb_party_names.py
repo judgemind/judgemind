@@ -90,9 +90,7 @@ def _find_affected_cases(
     Returns list of (case_id, case_title, ruling_text) tuples.
     """
     # Build OR clause for all motion patterns
-    pattern_clauses = " OR ".join(
-        "c.case_title ILIKE %s" for _ in _MOTION_SQL_PATTERNS
-    )
+    pattern_clauses = " OR ".join("c.case_title ILIKE %s" for _ in _MOTION_SQL_PATTERNS)
     query = f"""
         SELECT c.id, c.case_title, r.ruling_text
         FROM cases c
@@ -160,25 +158,40 @@ def _fix_case(
         if new_title:
             parties = extract_parties_from_caption(new_title)
             for party in parties:
-                # Upsert party name
+                raw_name = party["name"]
+
+                # Look up existing alias for this raw name
                 cur.execute(
                     """
-                    INSERT INTO parties (name)
-                    VALUES (%s)
-                    ON CONFLICT (name) DO NOTHING
-                    RETURNING id
+                    SELECT pa.party_id
+                    FROM party_aliases pa
+                    WHERE pa.raw_name = %s
+                    LIMIT 1
                     """,
-                    (party["name"],),
+                    (raw_name,),
                 )
                 row = cur.fetchone()
                 if row:
                     party_id = row[0]
                 else:
+                    # No alias found — create new party and alias
                     cur.execute(
-                        "SELECT id FROM parties WHERE name = %s",
-                        (party["name"],),
+                        """
+                        INSERT INTO parties (canonical_name, party_type)
+                        VALUES (%s, NULL)
+                        RETURNING id
+                        """,
+                        (raw_name,),
                     )
                     party_id = cur.fetchone()[0]
+                    cur.execute(
+                        """
+                        INSERT INTO party_aliases
+                            (party_id, raw_name, source, confidence, is_verified)
+                        VALUES (%s::uuid, %s, 'backfill', 1.0, FALSE)
+                        """,
+                        (str(party_id), raw_name),
+                    )
 
                 # Link party to case
                 cur.execute(
@@ -187,7 +200,7 @@ def _fix_case(
                     VALUES (%s, %s, %s)
                     ON CONFLICT (case_id, party_id, role) DO NOTHING
                     """,
-                    (case_id, party_id, party["role"]),
+                    (case_id, str(party_id), party["role"]),
                 )
 
     return {
