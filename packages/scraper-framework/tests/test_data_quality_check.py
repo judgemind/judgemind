@@ -44,6 +44,7 @@ _issue_labels = dqc._issue_labels
 _check_duplicate = dqc._check_duplicate
 _file_single_issue = dqc._file_single_issue
 _24h_overlaps_posting_day = dqc._24h_overlaps_posting_day
+MIN_FIELD_CHECK_SAMPLE_SIZE = dqc.MIN_FIELD_CHECK_SAMPLE_SIZE
 
 NOW = datetime(2026, 3, 11, 12, 0, 0, tzinfo=UTC)
 
@@ -1502,11 +1503,12 @@ class TestQueryFieldCompleteness:
                 ],
             }
         )
-        result = _query_field_completeness(conn, NOW)
+        result, totals = _query_field_completeness(conn, NOW)
         assert "Los Angeles" in result
         assert result["Los Angeles"]["ruling"] == 100.0
         assert result["Los Angeles"]["judge"] == 95.0
         assert result["Los Angeles"]["parties"] == 80.0
+        assert totals["Los Angeles"] == 200
 
     def test_skips_zero_total_counties(self) -> None:
         """Skips counties with zero total documents."""
@@ -1529,8 +1531,9 @@ class TestQueryFieldCompleteness:
                 ],
             }
         )
-        result = _query_field_completeness(conn, NOW)
+        result, totals = _query_field_completeness(conn, NOW)
         assert "Empty County" not in result
+        assert "Empty County" not in totals
 
     def test_multiple_counties(self) -> None:
         """Returns results for multiple counties."""
@@ -1542,10 +1545,12 @@ class TestQueryFieldCompleteness:
                 ],
             }
         )
-        result = _query_field_completeness(conn, NOW)
+        result, totals = _query_field_completeness(conn, NOW)
         assert len(result) == 2
         assert result["Los Angeles"]["judge"] == 95.0
         assert result["Orange"]["judge"] == 80.0
+        assert totals["Los Angeles"] == 100
+        assert totals["Orange"] == 50
 
 
 class TestCheckFieldCompleteness:
@@ -1750,6 +1755,157 @@ class TestCheckFieldCompleteness:
         assert alert.expected == 95.0
         assert alert.actual == 80.0
         assert "15.0pp drop" in alert.message
+
+    def test_skips_low_sample_size_county(self) -> None:
+        """Counties with fewer than MIN_FIELD_CHECK_SAMPLE_SIZE docs are skipped."""
+        conn = FakeConnection(
+            {
+                "case_parties": [
+                    _make_field_completeness_row(
+                        "Santa Clara",
+                        total=2,
+                        judge=0,  # 0% judge = 95pp drop, would be P1 normally
+                    ),
+                ],
+            }
+        )
+        field_baselines = {
+            "Santa Clara": {
+                "judge": 95.0,
+                "ruling": 100.0,
+                "motion_type": 90.0,
+                "outcome": 90.0,
+                "case_title": 100.0,
+                "case_number": 100.0,
+                "parties": 80.0,
+                "hearing_date": 100.0,
+                "case_type": 85.0,
+            },
+        }
+        alerts = check_field_completeness(conn, NOW, field_baselines)
+        # Should NOT produce a P1 field_completeness alert.
+        p1_alerts = [a for a in alerts if a.severity == "p1"]
+        assert len(p1_alerts) == 0
+        # Should produce a P2 informational low-sample-size alert.
+        low_sample = [a for a in alerts if a.metric == "field_completeness_low_sample"]
+        assert len(low_sample) == 1
+        assert low_sample[0].severity == "p2"
+        assert low_sample[0].county == "Santa Clara"
+        assert low_sample[0].actual == 2
+        assert "only 2 document(s)" in low_sample[0].message
+        assert "skipping field completeness check" in low_sample[0].message
+
+    def test_low_sample_emits_informational_alert(self) -> None:
+        """The informational alert includes the sample size and minimum threshold."""
+        conn = FakeConnection(
+            {
+                "case_parties": [
+                    _make_field_completeness_row(
+                        "Santa Clara",
+                        total=3,
+                        judge=1,
+                    ),
+                ],
+            }
+        )
+        field_baselines = {
+            "Santa Clara": {"judge": 95.0},
+        }
+        alerts = check_field_completeness(conn, NOW, field_baselines)
+        low_sample = [a for a in alerts if a.metric == "field_completeness_low_sample"]
+        assert len(low_sample) == 1
+        alert = low_sample[0]
+        assert alert.expected == MIN_FIELD_CHECK_SAMPLE_SIZE
+        assert alert.actual == 3
+        assert f"minimum sample size: {MIN_FIELD_CHECK_SAMPLE_SIZE}" in alert.message
+
+    def test_exact_threshold_not_skipped(self) -> None:
+        """County with exactly MIN_FIELD_CHECK_SAMPLE_SIZE docs is NOT skipped."""
+        conn = FakeConnection(
+            {
+                "case_parties": [
+                    _make_field_completeness_row(
+                        "Santa Clara",
+                        total=MIN_FIELD_CHECK_SAMPLE_SIZE,
+                        judge=0,  # 0% judge vs 95% baseline = huge drop
+                    ),
+                ],
+            }
+        )
+        field_baselines = {
+            "Santa Clara": {
+                "judge": 95.0,
+                "ruling": 100.0,
+                "motion_type": 90.0,
+                "outcome": 90.0,
+                "case_title": 100.0,
+                "case_number": 100.0,
+                "parties": 80.0,
+                "hearing_date": 100.0,
+                "case_type": 85.0,
+            },
+        }
+        alerts = check_field_completeness(conn, NOW, field_baselines)
+        # Should NOT produce a low-sample alert.
+        low_sample = [a for a in alerts if a.metric == "field_completeness_low_sample"]
+        assert len(low_sample) == 0
+        # Should produce a normal P1 field_completeness alert.
+        p1_alerts = [a for a in alerts if a.severity == "p1"]
+        assert len(p1_alerts) >= 1
+
+    def test_mixed_counties_low_and_normal_sample(self) -> None:
+        """Low-sample county is skipped while normal-sample county is checked."""
+        conn = FakeConnection(
+            {
+                "case_parties": [
+                    _make_field_completeness_row(
+                        "Santa Clara",
+                        total=2,
+                        judge=0,
+                    ),
+                    _make_field_completeness_row(
+                        "Los Angeles",
+                        total=100,
+                        judge=80,
+                    ),
+                ],
+            }
+        )
+        field_baselines = {
+            "Santa Clara": {
+                "judge": 95.0,
+                "ruling": 100.0,
+                "motion_type": 90.0,
+                "outcome": 90.0,
+                "case_title": 100.0,
+                "case_number": 100.0,
+                "parties": 80.0,
+                "hearing_date": 100.0,
+                "case_type": 85.0,
+            },
+            "Los Angeles": {
+                "judge": 95.0,
+                "ruling": 100.0,
+                "motion_type": 90.0,
+                "outcome": 90.0,
+                "case_title": 100.0,
+                "case_number": 100.0,
+                "parties": 80.0,
+                "hearing_date": 100.0,
+                "case_type": 85.0,
+            },
+        }
+        alerts = check_field_completeness(conn, NOW, field_baselines)
+        # Santa Clara: low sample → informational alert only.
+        sc_alerts = [a for a in alerts if a.county == "Santa Clara"]
+        assert len(sc_alerts) == 1
+        assert sc_alerts[0].metric == "field_completeness_low_sample"
+        # Los Angeles: normal sample → field regression alert.
+        la_alerts = [
+            a for a in alerts if a.county == "Los Angeles" and a.metric == "field_completeness"
+        ]
+        assert len(la_alerts) >= 1
+        assert any(a.severity == "p1" for a in la_alerts)
 
 
 # ---------------------------------------------------------------------------
