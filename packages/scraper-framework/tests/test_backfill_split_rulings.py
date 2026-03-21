@@ -9,6 +9,7 @@ Tests cover:
   - run_backfill() end-to-end with mocked DB
   - SplitAction dataclass correctness
   - Cursor-based pagination
+  - Missing ruling document detection (--check-missing)
 """
 
 from __future__ import annotations
@@ -42,12 +43,15 @@ _spec.loader.exec_module(backfill_mod)
 
 # Pull in the names we need.
 CandidateRuling = backfill_mod.CandidateRuling
+MissingRulingDocument = backfill_mod.MissingRulingDocument
 SplitAction = backfill_mod.SplitAction
 build_candidate_query = backfill_mod.build_candidate_query
 try_split = backfill_mod.try_split
 apply_split = backfill_mod.apply_split
 process_batch = backfill_mod.process_batch
 fetch_candidates = backfill_mod.fetch_candidates
+find_missing_ruling_documents = backfill_mod.find_missing_ruling_documents
+report_missing_rulings = backfill_mod.report_missing_rulings
 _insert_split_ruling = backfill_mod._insert_split_ruling
 _CURSOR_MIN_TIMESTAMP = backfill_mod._CURSOR_MIN_TIMESTAMP
 _CURSOR_MIN_UUID = backfill_mod._CURSOR_MIN_UUID
@@ -798,3 +802,186 @@ class TestApplySplitIdempotency:
 
         assert mock_insert.call_count == 2
         assert action.split_count == 2
+
+
+# ---------------------------------------------------------------------------
+# Missing ruling document detection tests (--check-missing)
+# ---------------------------------------------------------------------------
+
+
+class TestFindMissingRulingDocuments:
+    """Tests for find_missing_ruling_documents()."""
+
+    def test_returns_empty_when_no_missing(self) -> None:
+        """When query returns no rows, returns empty list."""
+        conn = MagicMock()
+        mock_cursor = MagicMock()
+        mock_cursor.fetchall.return_value = []
+        conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cursor)
+        conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+
+        result = find_missing_ruling_documents(conn)
+        assert result == []
+
+    def test_returns_documents_when_missing(self) -> None:
+        """When query returns rows, returns MissingRulingDocument instances."""
+        conn = MagicMock()
+        mock_cursor = MagicMock()
+        mock_cursor.fetchall.return_value = [
+            (
+                "dddddddd-0000-0000-0000-000000000001",  # document_id
+                "rulings/2026/03/15/doc.pdf",  # s3_key
+                "judgemind-archive",  # s3_bucket
+                "https://example.com/ruling.pdf",  # source_url
+                "oc-tentatives",  # scraper_id
+                "2026-03-15T10:00:00",  # captured_at
+                "2026-03-15",  # hearing_date
+                "CA",  # state
+                "Orange",  # county
+                "30-2024-01393434",  # case_number
+                "Smith v. Jones",  # case_title
+            ),
+        ]
+        conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cursor)
+        conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+
+        result = find_missing_ruling_documents(conn)
+        assert len(result) == 1
+        doc = result[0]
+        assert doc.document_id == "dddddddd-0000-0000-0000-000000000001"
+        assert doc.county == "Orange"
+        assert doc.case_number == "30-2024-01393434"
+        assert doc.s3_key == "rulings/2026/03/15/doc.pdf"
+
+    def test_county_filter_passes_single_county(self) -> None:
+        """When county is specified, query includes single county param."""
+        conn = MagicMock()
+        mock_cursor = MagicMock()
+        mock_cursor.fetchall.return_value = []
+        conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cursor)
+        conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+
+        find_missing_ruling_documents(conn, county="Orange", limit=50)
+
+        # Check the SQL was called with county param
+        execute_call = mock_cursor.execute.call_args
+        sql = execute_call[0][0]
+        params = execute_call[0][1]
+        assert "ct.county = %s" in sql
+        assert params == ["Orange", 50]
+
+    def test_no_county_uses_splittable_counties(self) -> None:
+        """When no county specified, query uses IN clause for splittable counties."""
+        conn = MagicMock()
+        mock_cursor = MagicMock()
+        mock_cursor.fetchall.return_value = []
+        conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cursor)
+        conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+
+        find_missing_ruling_documents(conn, county=None, limit=100)
+
+        execute_call = mock_cursor.execute.call_args
+        sql = execute_call[0][0]
+        assert "ct.county IN" in sql
+
+    def test_handles_null_fields_gracefully(self) -> None:
+        """Null fields in the query result are handled gracefully."""
+        conn = MagicMock()
+        mock_cursor = MagicMock()
+        mock_cursor.fetchall.return_value = [
+            (
+                "dddddddd-0000-0000-0000-000000000002",
+                "rulings/2026/03/15/doc.pdf",
+                None,  # s3_bucket is None
+                None,  # source_url is None
+                None,  # scraper_id is None
+                None,  # captured_at is None
+                None,  # hearing_date is None
+                "CA",
+                "Orange",
+                None,  # case_number is None
+                None,  # case_title is None
+            ),
+        ]
+        conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cursor)
+        conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+
+        result = find_missing_ruling_documents(conn)
+        assert len(result) == 1
+        doc = result[0]
+        assert doc.s3_bucket is None
+        assert doc.source_url == ""
+        assert doc.hearing_date is None
+        assert doc.case_number is None
+
+
+class TestReportMissingRulings:
+    """Tests for report_missing_rulings()."""
+
+    @patch("backfill_split_rulings.find_missing_ruling_documents")
+    @patch("psycopg.connect")
+    def test_returns_zero_when_no_missing(
+        self, mock_connect: MagicMock, mock_find: MagicMock
+    ) -> None:
+        """Returns 0 when no documents are missing rulings."""
+        mock_find.return_value = []
+        mock_conn = MagicMock()
+        mock_connect.return_value.__enter__ = MagicMock(return_value=mock_conn)
+        mock_connect.return_value.__exit__ = MagicMock(return_value=False)
+
+        count = report_missing_rulings("postgresql://test")
+        assert count == 0
+
+    @patch("backfill_split_rulings.find_missing_ruling_documents")
+    @patch("psycopg.connect")
+    def test_returns_count_when_missing(
+        self, mock_connect: MagicMock, mock_find: MagicMock
+    ) -> None:
+        """Returns the count of missing-ruling documents."""
+        mock_find.return_value = [
+            MissingRulingDocument(
+                document_id="d1",
+                s3_key="key1",
+                s3_bucket="bucket",
+                source_url="https://example.com",
+                scraper_id="oc-tentatives",
+                captured_at="2026-03-15T10:00:00",
+                hearing_date="2026-03-15",
+                state="CA",
+                county="Orange",
+                case_number="30-2024-001",
+                case_title="Smith v. Jones",
+            ),
+            MissingRulingDocument(
+                document_id="d2",
+                s3_key="key2",
+                s3_bucket="bucket",
+                source_url="https://example.com",
+                scraper_id="oc-tentatives",
+                captured_at="2026-03-16T10:00:00",
+                hearing_date="2026-03-16",
+                state="CA",
+                county="Orange",
+                case_number="30-2024-002",
+                case_title="Doe v. Roe",
+            ),
+        ]
+        mock_conn = MagicMock()
+        mock_connect.return_value.__enter__ = MagicMock(return_value=mock_conn)
+        mock_connect.return_value.__exit__ = MagicMock(return_value=False)
+
+        count = report_missing_rulings("postgresql://test")
+        assert count == 2
+
+    @patch("backfill_split_rulings.find_missing_ruling_documents")
+    @patch("psycopg.connect")
+    def test_passes_county_and_limit(self, mock_connect: MagicMock, mock_find: MagicMock) -> None:
+        """County and limit are passed through to find_missing_ruling_documents."""
+        mock_find.return_value = []
+        mock_conn = MagicMock()
+        mock_connect.return_value.__enter__ = MagicMock(return_value=mock_conn)
+        mock_connect.return_value.__exit__ = MagicMock(return_value=False)
+
+        report_missing_rulings("postgresql://test", county="Orange", limit=50)
+
+        mock_find.assert_called_once_with(mock_conn, county="Orange", limit=50)
