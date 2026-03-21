@@ -43,6 +43,10 @@ inputs:
     description: "IAM role name to look up if the source task definition lacks a task role (self-heal for legacy revisions)"
     required: false
     default: ""
+  extra-env:
+    description: "JSON array of extra environment variables to add/override (e.g. [{\"name\":\"FOO\",\"value\":\"bar\"}])"
+    required: false
+    default: "[]"
 
 outputs:
   exit-code:
@@ -117,13 +121,22 @@ runs:
         MEMORY: ${{ inputs.memory }}
         EXECUTION_ROLE: ${{ steps.source.outputs.execution_role }}
         TASK_ROLE: ${{ steps.source.outputs.task_role }}
+        EXTRA_ENV: ${{ inputs.extra-env }}
       run: |
         # Extract secrets, environment, and log config from the source container
         CONTAINER_DEF=$(jq -c '.containerDefinitions[0]' source-task-def.json)
 
         SECRETS=$(echo "$CONTAINER_DEF" | jq -c '.secrets // []')
-        ENVIRONMENT_VARS=$(echo "$CONTAINER_DEF" | jq -c '.environment // []')
+        BASE_ENV=$(echo "$CONTAINER_DEF" | jq -c '.environment // []')
         LOG_CONFIG=$(echo "$CONTAINER_DEF" | jq -c '.logConfiguration')
+
+        # Merge extra env vars (extra-env values override base vars with the same name)
+        ENVIRONMENT_VARS=$(jq -nc \
+          --argjson base "$BASE_ENV" \
+          --argjson extra "$EXTRA_ENV" \
+          '($extra | map(.name)) as $names |
+           [$base[] | select(.name as $n | $names | index($n) | not)] + $extra'
+        )
 
         # Build the oneshot container definition
         ONESHOT_CONTAINER=$(jq -n \
