@@ -121,7 +121,7 @@ describe('RulingDetail', () => {
     expect(judgeLink).toHaveAttribute('href', '/judges/judge-1');
   });
 
-  it('renders download button with correct href from buildDownloadUrl', () => {
+  it('renders download button with correct href from buildDownloadUrl in ruling text header', () => {
     const ruling = buildFullRuling();
     render(<RulingDetail ruling={ruling} />);
 
@@ -168,12 +168,62 @@ describe('RulingDetail', () => {
     expect(screen.queryByText('Ruling Text')).not.toBeInTheDocument();
   });
 
-  it('does not render download section when documentId is null', () => {
+  it('does not render download button when documentId is null', () => {
     const ruling = buildFullRuling();
     ruling.documentId = null;
     render(<RulingDetail ruling={ruling} />);
 
     expect(screen.queryByText('Download original document')).not.toBeInTheDocument();
+  });
+
+  // -------------------------------------------------------------------------
+  // Download link placement (#1236)
+  // -------------------------------------------------------------------------
+
+  it('renders download button inside the ruling text card header when ruling text exists', () => {
+    const ruling = buildFullRuling();
+    const { container } = render(<RulingDetail ruling={ruling} />);
+
+    // The CardHeader containing "Ruling Text" should also contain the download link
+    const rulingTextHeading = screen.getByText('Ruling Text');
+    const cardHeader = rulingTextHeading.parentElement;
+    expect(cardHeader).toBeInTheDocument();
+    // Download link should be a descendant of the same card header
+    const downloadLink = screen.getByText('Download original document').closest('a');
+    expect(cardHeader!.contains(downloadLink)).toBe(true);
+  });
+
+  it('renders standalone download button when there is no ruling text but a document exists', () => {
+    const ruling = buildFullRuling();
+    ruling.rulingText = null;
+    ruling.rulingTextHtml = null;
+    render(<RulingDetail ruling={ruling} sanitizedRulingTextHtml={null} />);
+
+    // Download button should still be visible even without ruling text
+    expect(screen.getByText('Download original document')).toBeInTheDocument();
+  });
+
+  // -------------------------------------------------------------------------
+  // Summary cleanup (#1236)
+  // -------------------------------------------------------------------------
+
+  it('strips "# Summary" heading from summary text', () => {
+    const ruling = buildFullRuling();
+    ruling.summary = '# Summary\nCourt grants MSJ in favor of plaintiff.';
+    render(<RulingDetail ruling={ruling} />);
+
+    expect(screen.queryByText(/# Summary/)).not.toBeInTheDocument();
+    expect(screen.getByText('Court grants MSJ in favor of plaintiff.')).toBeInTheDocument();
+  });
+
+  it('strips redundant metadata lines from summary', () => {
+    const ruling = buildFullRuling();
+    ruling.summary = 'Case Number: 25STCV12345\nJudge: Johnson\nThe ruling is favorable to plaintiff.';
+    render(<RulingDetail ruling={ruling} />);
+
+    expect(screen.queryByText(/Case Number:/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/^Judge:/)).not.toBeInTheDocument();
+    expect(screen.getByText('The ruling is favorable to plaintiff.')).toBeInTheDocument();
   });
 
   // -------------------------------------------------------------------------

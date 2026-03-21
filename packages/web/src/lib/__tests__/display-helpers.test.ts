@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import {
   buildDownloadUrl,
+  cleanSummary,
   detectParagraphs,
   FORMAT_LABELS,
   formatDate,
@@ -15,6 +16,96 @@ import {
   truncateText,
   cleanRulingText,
 } from '../display-helpers';
+
+// ---------------------------------------------------------------------------
+// cleanSummary (#1236 — strip heading, reduce redundancy)
+// ---------------------------------------------------------------------------
+
+describe('cleanSummary', () => {
+  it('strips leading "# Summary" heading', () => {
+    const summary = '# Summary\nThe court grants the motion.';
+    expect(cleanSummary(summary)).toBe('The court grants the motion.');
+  });
+
+  it('strips leading "## Summary" heading', () => {
+    const summary = '## Summary\nThe court denies the motion.';
+    expect(cleanSummary(summary)).toBe('The court denies the motion.');
+  });
+
+  it('strips any leading markdown heading', () => {
+    const summary = '### Ruling Overview\nThe motion is granted in part.';
+    expect(cleanSummary(summary)).toBe('The motion is granted in part.');
+  });
+
+  it('returns empty string for empty input', () => {
+    expect(cleanSummary('')).toBe('');
+  });
+
+  it('returns text unchanged when no heading is present', () => {
+    const summary = 'The court grants the motion for summary judgment.';
+    expect(cleanSummary(summary)).toBe(summary);
+  });
+
+  it('strips "Case Number:" metadata line', () => {
+    const summary = 'Case Number: 25STCV12345\nThe motion is granted.';
+    expect(cleanSummary(summary)).toBe('The motion is granted.');
+  });
+
+  it('strips "Case No.:" metadata line', () => {
+    const summary = 'Case No.: 25STCV12345\nThe motion is granted.';
+    expect(cleanSummary(summary)).toBe('The motion is granted.');
+  });
+
+  it('strips "Judge:" metadata line', () => {
+    const summary = 'Judge: Johnson, Robert M.\nThe motion is denied.';
+    expect(cleanSummary(summary)).toBe('The motion is denied.');
+  });
+
+  it('strips "Parties:" metadata line', () => {
+    const summary = 'Parties: Smith v. Jones\nThe ruling is as follows.';
+    expect(cleanSummary(summary)).toBe('The ruling is as follows.');
+  });
+
+  it('strips "Court:" metadata line', () => {
+    const summary = 'Court: Los Angeles Superior Court\nMotion granted.';
+    expect(cleanSummary(summary)).toBe('Motion granted.');
+  });
+
+  it('strips "Department:" metadata line', () => {
+    const summary = 'Department: 12\nThe motion is denied.';
+    expect(cleanSummary(summary)).toBe('The motion is denied.');
+  });
+
+  it('strips "Hearing Date:" metadata line', () => {
+    const summary = 'Hearing Date: March 10, 2026\nMotion granted.';
+    expect(cleanSummary(summary)).toBe('Motion granted.');
+  });
+
+  it('strips bold markdown metadata lines', () => {
+    const summary = '**Case Number:** 25STCV12345\n**Judge:** Smith\nThe motion is granted.';
+    expect(cleanSummary(summary)).toBe('The motion is granted.');
+  });
+
+  it('strips heading and metadata lines together', () => {
+    const summary = '# Summary\nCase Number: 25STCV12345\nJudge: Smith\nThe motion is granted.';
+    expect(cleanSummary(summary)).toBe('The motion is granted.');
+  });
+
+  it('collapses excessive blank lines after stripping', () => {
+    const summary = '# Summary\n\n\n\nThe motion is granted.';
+    expect(cleanSummary(summary)).toBe('The motion is granted.');
+  });
+
+  it('preserves substantive content that mentions a judge contextually', () => {
+    const summary = 'The judge ruled in favor of the plaintiff on all counts.';
+    expect(cleanSummary(summary)).toBe(summary);
+  });
+
+  it('does not strip lines where "case" is used in context', () => {
+    const summary = 'In this case, the motion was denied due to insufficient evidence.';
+    expect(cleanSummary(summary)).toBe(summary);
+  });
+});
 
 // ---------------------------------------------------------------------------
 // formatLabel (shared between server & client — regression test for #643)
