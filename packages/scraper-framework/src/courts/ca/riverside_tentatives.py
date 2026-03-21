@@ -173,6 +173,74 @@ class SplitRuling:
         self.outcome = outcome
 
 
+def _filter_entry_matches(
+    matches: list[re.Match[str]],
+    text: str,
+) -> list[re.Match[str]]:
+    """Filter regex matches to only keep real ruling entry markers.
+
+    Riverside PDFs number their rulings sequentially (1, 2, 3, ...).
+    However, the ruling *body* text sometimes contains numbered points
+    (e.g., "The court finds:\\n1.\\nThe motion is granted...") that also
+    match the ``_RULING_ENTRY_RE`` pattern.  These spurious matches cause
+    ruling text to be assigned to the wrong case (#1410).
+
+    Strategy: for each candidate match, check whether the text between it
+    and the *next* candidate (or end of text) contains a Riverside case
+    number.  Real ruling entries always contain a case number in their
+    text block; numbered body points do not.  Matches whose text block
+    lacks a case number are discarded as spurious.
+
+    After filtering, the selected matches are re-checked to ensure they
+    form a consecutive 1-based sequence (1, 2, 3, ...).  Any gap in the
+    sequence causes the function to stop — better to return fewer rulings
+    than to mis-assign text.
+    """
+    if not matches:
+        return []
+
+    # Pass 1: keep only matches whose text block contains a case number.
+    kept: list[re.Match[str]] = []
+    for i, m in enumerate(matches):
+        block_start = m.end()
+        # Text block runs until the next match or end of text.
+        block_end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+        block = text[block_start:block_end]
+        if _CASE_NUMBER_RE.search(block):
+            kept.append(m)
+        else:
+            logger.debug(
+                "Skipping spurious entry match",
+                entry_num=m.group("num"),
+                position=m.start(),
+            )
+
+    if not kept:
+        return []
+
+    # Pass 2: verify consecutive 1-based numbering.
+    selected: list[re.Match[str]] = []
+    expected = 1
+    for m in kept:
+        num = int(m.group("num"))
+        if num == expected:
+            selected.append(m)
+            expected += 1
+        elif num > expected:
+            # Gap — stop to avoid mis-assignment.
+            logger.warning(
+                "Entry sequence gap; stopping split",
+                expected=expected,
+                found=num,
+                position=m.start(),
+            )
+            break
+        # num < expected means a duplicate (e.g. two matches for "1.");
+        # skip the later duplicate silently.
+
+    return selected
+
+
 def _split_rulings(text: str) -> list[SplitRuling]:
     """Split PDF text containing multiple numbered rulings into individual SplitRuling objects.
 
@@ -187,9 +255,19 @@ def _split_rulings(text: str) -> list[SplitRuling]:
 
     Returns an empty list if no numbered entries are found.
     Returns a single-element list if only one entry exists.
+
+    .. note:: Numbered points inside ruling body text (e.g.
+       "1.\\nThe motion is granted") are filtered out by
+       ``_filter_entry_matches`` to prevent off-by-one mis-assignment
+       of ruling text to cases (#1410).
     """
     # Find all numbered entry positions
-    matches = list(_RULING_ENTRY_RE.finditer(text))
+    all_matches = list(_RULING_ENTRY_RE.finditer(text))
+    if not all_matches:
+        return []
+
+    # Filter to only real entry markers (skip numbered points in body text)
+    matches = _filter_entry_matches(all_matches, text)
     if not matches:
         return []
 
