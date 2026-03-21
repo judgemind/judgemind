@@ -106,7 +106,7 @@ _RESPONDING_PARTY_RE = re.compile(
 # Role prefixes to strip from moving/responding party names.
 _ROLE_PREFIX_RE = re.compile(
     r"^(?:Defendants?|Plaintiffs?|Petitioners?|Respondents?"
-    r"|Cross-Complainants?|Cross-Defendants?)\s+",
+    r"|Cross-Complainants?|Cross-Defendants?)[,\s]+",
     re.IGNORECASE,
 )
 
