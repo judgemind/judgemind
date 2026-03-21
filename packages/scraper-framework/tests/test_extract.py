@@ -7,6 +7,7 @@ from datetime import date
 
 from ingestion.extract import (
     _is_name_fragment,
+    _looks_like_motion_text,
     _looks_like_person_name,
     _split_caption_names,
     extract_case_number,
@@ -874,6 +875,109 @@ class TestExtractCaseTitle:
         result = extract_case_title(text)
         # Should be None since the only v. match contains header boilerplate
         assert result is None
+
+    def test_motion_text_rejected_granting_motion(self) -> None:
+        """Motion descriptions containing 'Granting Motion' should not be case titles (#1245)."""
+        text = "Granting Motion To v. Disqualify Plaintiff\nThe court rules."
+        result = extract_case_title(text)
+        assert result is None
+
+    def test_motion_text_rejected_order_denying(self) -> None:
+        """'Order Denying Motion' text should not be a case title."""
+        text = "Order Denying Motion To v. Compel Arbitration\nDetails follow."
+        result = extract_case_title(text)
+        assert result is None
+
+    def test_motion_text_rejected_ruling_on(self) -> None:
+        """'Ruling On Motion' text should not be a case title."""
+        text = "Ruling On Demurrer v. Strike Answer\nDetails."
+        result = extract_case_title(text)
+        assert result is None
+
+    def test_motion_text_rejected_summary_judgment(self) -> None:
+        """Motion for summary judgment text should not be a case title."""
+        text = "Motion For Summary Judgment v. Dismiss Complaint\nDetails."
+        result = extract_case_title(text)
+        assert result is None
+
+    def test_real_case_title_still_extracted(self) -> None:
+        """Real case titles should still be extracted after motion filtering."""
+        text = "Hussnain v. Ford Motor Co.\nThe motion is granted."
+        result = extract_case_title(text)
+        assert result is not None
+        assert "Hussnain" in result
+        assert "Ford" in result
+
+    def test_extracts_real_title_after_rejecting_motion_text(self) -> None:
+        """A valid title should be found even if a motion line appears first (#1245)."""
+        text = (
+            "Some introductory text.\n"
+            "Order Denying Motion To v. Compel Arbitration\n"
+            "Hussnain v. Ford Motor Co.\n"
+            "The court rules as follows."
+        )
+        result = extract_case_title(text)
+        assert result is not None
+        assert "Hussnain" in result
+        assert "Ford" in result
+        assert "Motion" not in result
+        assert "Compel" not in result
+
+
+# ---------------------------------------------------------------------------
+# Motion text detection (#1245)
+# ---------------------------------------------------------------------------
+
+
+class TestLooksLikeMotionText:
+    """Tests for _looks_like_motion_text() — rejects motion descriptions as case titles."""
+
+    def test_empty_string(self) -> None:
+        assert _looks_like_motion_text("") is False
+
+    def test_no_separator(self) -> None:
+        """Text without a v. separator is not motion text (nor case title)."""
+        assert _looks_like_motion_text("Motion to Compel Arbitration") is False
+
+    def test_granting_motion_to(self) -> None:
+        assert _looks_like_motion_text("Granting Motion To v. Disqualify Plaintiff") is True
+
+    def test_order_denying_motion(self) -> None:
+        assert _looks_like_motion_text("Order Denying Motion To v. Compel Arbitration") is True
+
+    def test_motion_for_summary_judgment(self) -> None:
+        assert _looks_like_motion_text("Motion For Summary Judgment v. Dismiss") is True
+
+    def test_ruling_on_demurrer(self) -> None:
+        assert _looks_like_motion_text("Ruling On Demurrer v. Strike Answer") is True
+
+    def test_petition_for_writ(self) -> None:
+        assert _looks_like_motion_text("Petition For Writ v. Mandate Relief") is True
+
+    def test_application_to_vacate(self) -> None:
+        assert _looks_like_motion_text("Application To Vacate v. Set Aside Default") is True
+
+    def test_real_case_title_not_rejected(self) -> None:
+        assert _looks_like_motion_text("Hussnain v. Ford Motor Co.") is False
+
+    def test_real_case_title_with_et_al(self) -> None:
+        assert _looks_like_motion_text("Caldera, et al. v. Techno-Advanced, Inc.") is False
+
+    def test_all_caps_case_title(self) -> None:
+        assert _looks_like_motion_text("SMITH V. JONES") is False
+
+    def test_corporate_parties(self) -> None:
+        assert _looks_like_motion_text("Golden State v. Suraj Victorville, LLC") is False
+
+    def test_default_judgment_text(self) -> None:
+        assert _looks_like_motion_text("Default Judgment v. Strike Claims") is True
+
+    def test_ex_parte_application(self) -> None:
+        text = "Ex Parte Application v. Temporary Restraining Order"
+        assert _looks_like_motion_text(text) is True
+
+    def test_motion_to_compel(self) -> None:
+        assert _looks_like_motion_text("Motion To Compel v. Quash Subpoena") is True
 
 
 # ---------------------------------------------------------------------------

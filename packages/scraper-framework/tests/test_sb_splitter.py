@@ -100,6 +100,47 @@ class TestSplitFormat1:
         assert results[0].case_number == "CIVSB2600001"
         assert results[1].case_number == "CIVSB2600002"
 
+    def test_motion_text_not_extracted_as_case_title(self) -> None:
+        """Motion descriptions should not be extracted as case titles (#1245)."""
+        text = (
+            "TENTATIVE RULING FOR CIVSB2416631\n"
+            "Department S24 - Judge Carlos M. Cabrera\n"
+            "Order Granting Motion To v. Disqualify Plaintiff\n"
+            "Hussnain v. Ford Motor Co.\n"
+            "The motion is GRANTED.\n"
+            "TENTATIVE RULING FOR CIVSB2426325\n"
+            "Department S24 - Judge Carlos M. Cabrera\n"
+            "Godinez et al v. Keating, et al\n"
+            "Motion: Leave to Amend\n"
+            "The motion is DENIED.\n"
+        )
+        results = _split_format1(text)
+        assert len(results) == 2
+        # First case: should pick up real title, not motion description
+        assert results[0].case_title is not None
+        assert "Motion" not in results[0].case_title
+        assert "Disqualify" not in results[0].case_title
+        assert "Hussnain" in results[0].case_title or "Ford" in results[0].case_title
+
+    def test_motion_text_rejected_format1_ruling_on(self) -> None:
+        """'Ruling On...' text should not be a case title in Format 1 (#1245)."""
+        text = (
+            "TENTATIVE RULING FOR CIVSB2400001\n"
+            "Department S22\n"
+            "Ruling On Demurrer v. Strike Answer\n"
+            "Smith v. Jones\n"
+            "The demurrer is sustained.\n"
+            "TENTATIVE RULING FOR CIVSB2400002\n"
+            "Department S22\n"
+            "Alpha v. Beta\n"
+            "The motion is DENIED.\n"
+        )
+        results = _split_format1(text)
+        assert len(results) == 2
+        assert results[0].case_title is not None
+        assert "Demurrer" not in results[0].case_title
+        assert "Strike" not in results[0].case_title
+
 
 # ---------------------------------------------------------------------------
 # Format 2 splitting (S22 style) — synthetic tests

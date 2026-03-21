@@ -468,6 +468,58 @@ def _looks_like_person_name(name: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Motion text detection (#1245)
+# ---------------------------------------------------------------------------
+
+# Keywords that indicate a line is a motion description rather than a case
+# title.  When any of these appear in text that matched the "X v. Y" pattern,
+# we reject it as a false positive.  Compiled once at module load time.
+_MOTION_KEYWORD_RE = re.compile(
+    r"\b(?:"
+    r"MOTION|GRANTING|DENYING|ORDER|RULING|RULING\s+ON"
+    r"|DISQUALIFY|COMPEL|STRIKE|DISMISS|DEMURRER"
+    r"|PETITION|APPLICATION|JUDGMENT|SUMMARY"
+    r"|RELIEF|VACATE|QUASH|SANCTIONS|DEFAULT"
+    r"|LEAVE|AMEND|RECONSIDERATION|INJUNCTION"
+    r"|ARBITRATION|BIFURCATE|CONSOLIDATE|SEVER"
+    r"|EX\s+PARTE|PROTECTIVE\s+ORDER"
+    r"|WRIT|MANDATE|HABEAS|ATTORNEY.?S?\s+FEES"
+    r"|CONTINUANCE|RECLASSIF"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_motion_text(text: str) -> bool:
+    """Return True if *text* looks like a motion description rather than a case title.
+
+    This guards against false positives where legal motion text like
+    "Order Granting Motion to Disqualify Plaintiff's Designated Expert"
+    is split at "v." and matched as a case title (#1245).
+
+    The check looks for motion/legal keywords on either side of the "v."
+    separator.  Real case titles have person/entity names on both sides;
+    motion descriptions have legal procedure keywords.
+    """
+    if not text:
+        return False
+
+    # Split on "v." / "vs" / "vs." separator to get the two sides
+    sides = re.split(r"\s+[Vv][Ss]?\.?\s+", text, maxsplit=1)
+    if len(sides) < 2:
+        # No "v." separator found — not a case title pattern at all
+        return False
+
+    # If EITHER side contains motion keywords, this is likely a motion
+    # description, not a case title.
+    for side in sides:
+        if _MOTION_KEYWORD_RE.search(side):
+            return True
+
+    return False
+
+
+# ---------------------------------------------------------------------------
 # Case title extraction
 # ---------------------------------------------------------------------------
 
@@ -541,15 +593,22 @@ def extract_case_title(ruling_text: str) -> str | None:
     Returns the title in title case, or ``None`` if no pattern matches.
 
     Rejects titles that contain department header boilerplate (#1244).
+    Rejects matches that look like motion descriptions rather than case
+    titles (#1245) — e.g. "Granting Motion To v. Disqualify Plaintiff".
     """
     for pattern in _CASE_TITLE_PATTERNS:
-        m = pattern.search(ruling_text)
-        if m:
+        # Use finditer to check all matches for this pattern, not just the
+        # first.  If the first match is a motion description, we skip it and
+        # try subsequent matches rather than abandoning the pattern (#1245).
+        for m in pattern.finditer(ruling_text):
             title = m.group("title").strip()
             # Strip trailing case number references: ", No. 25STCV34748"
             title = _TITLE_TRAILING_NOISE_RE.sub("", title).strip()
             # Reject titles containing department header boilerplate (#1244)
             if _DEPT_HEADER_BOILERPLATE_TITLE_RE.search(title):
+                continue
+            # Reject motion descriptions masquerading as case titles (#1245).
+            if _looks_like_motion_text(title):
                 continue
             # Detect all-caps before normalizing the "v." separator.
             # Strip the separator and check if the remaining name parts
