@@ -213,7 +213,7 @@ def default_config(s3_bucket: str = "") -> ScraperConfig:
         county="San Diego",
         court="Superior Court",
         target_urls=[
-            "http://www.sandiego.courts.ca.gov/portal/online/calendar",
+            "https://www.sandiego.courts.ca.gov/portal/online/calendar",
             "https://odyroa.sdcourt.ca.gov",
         ],
         poll_interval_seconds=86400,  # daily
