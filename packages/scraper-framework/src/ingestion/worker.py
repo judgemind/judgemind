@@ -446,6 +446,13 @@ class IngestionWorker:
                     "PDF text extraction returned no text — LLM may fail",
                     extra={"document_id": document_id},
                 )
+                # When extraction returned empty (not None), normalize to
+                # empty string so the downstream "no ruling text" warning
+                # fires correctly (#1335).  When extraction returned None
+                # (complete failure), keep the original raw binary so
+                # existing behavior is preserved.
+                if extracted_pdf_text is not None:
+                    ruling_text = ""
 
         # ------------------------------------------------------------------
         # Document splitting — detect multi-case calendar pages
@@ -685,6 +692,20 @@ class IngestionWorker:
                 extra={
                     "document_id": document_id,
                     "extraction_methods": extraction_methods,
+                },
+            )
+
+        # ------------------------------------------------------------------
+        # Warn when a PDF document has no ruling text after all extraction
+        # attempts — likely an image-only PDF that yielded no text (#1335).
+        # ------------------------------------------------------------------
+        if not ruling_text and content_format == "pdf":
+            logger.warning(
+                "PDF document has no ruling text after all extraction attempts",
+                extra={
+                    "document_id": document_id,
+                    "source_url": source_url,
+                    "scraper_id": scraper_id,
                 },
             )
 

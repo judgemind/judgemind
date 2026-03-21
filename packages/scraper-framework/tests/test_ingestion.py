@@ -3590,3 +3590,165 @@ def test_process_event_summarization_no_case_context_when_missing(
     call_kwargs = mock_summarize.call_args
     # No case_title or motion_type available, so context should be None
     assert call_kwargs.kwargs["case_context"] is None
+
+
+# ---------------------------------------------------------------------------
+# PDF empty ruling_text warning (#1335)
+# ---------------------------------------------------------------------------
+
+
+@patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
+@patch("ingestion.worker.psycopg")
+def test_process_event_warns_on_pdf_with_no_ruling_text(
+    mock_psycopg: MagicMock,
+    mock_resolve_judge: MagicMock,
+    caplog: object,
+) -> None:
+    """When a PDF document has no ruling_text after all extraction attempts,
+    the worker should log a warning (#1335)."""
+    worker, os_mock = _make_worker()
+
+    mock_conn, mock_cur = _make_mock_conn()
+    mock_psycopg.connect.return_value = mock_conn
+    mock_cur.fetchone.side_effect = [
+        ("court-uuid-1",),  # upsert_court
+        ("case-uuid-1",),  # upsert_case
+        (True,),  # insert_document
+    ]
+    mock_cur.rowcount = 1
+
+    event = _make_event(
+        ruling_text=None,
+        content_format="pdf",
+    )
+    worker.process_event(event)
+
+    import logging as _logging
+
+    warning_records = [
+        r
+        for r in caplog.records  # type: ignore[attr-defined]
+        if r.levelno >= _logging.WARNING and "no ruling text after all extraction" in r.getMessage()
+    ]
+    assert len(warning_records) >= 1, (
+        f"Expected warning about PDF with no ruling text, got: "
+        f"{[r.getMessage() for r in caplog.records]}"  # type: ignore[attr-defined]
+    )
+
+
+@patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
+@patch("ingestion.worker.psycopg")
+def test_process_event_no_warning_when_pdf_has_ruling_text(
+    mock_psycopg: MagicMock,
+    mock_resolve_judge: MagicMock,
+    caplog: object,
+) -> None:
+    """When a PDF document has ruling_text, no empty-text warning should fire."""
+    worker, os_mock = _make_worker()
+
+    mock_conn, mock_cur = _make_mock_conn()
+    mock_psycopg.connect.return_value = mock_conn
+    mock_cur.fetchone.side_effect = [
+        ("court-uuid-1",),  # upsert_court
+        ("case-uuid-1",),  # upsert_case
+        (True,),  # insert_document
+    ]
+    mock_cur.rowcount = 1
+
+    event = _make_event(
+        ruling_text="The motion for summary judgment is GRANTED.",
+        content_format="pdf",
+    )
+    worker.process_event(event)
+
+    import logging as _logging
+
+    warning_records = [
+        r
+        for r in caplog.records  # type: ignore[attr-defined]
+        if r.levelno >= _logging.WARNING and "no ruling text after all extraction" in r.getMessage()
+    ]
+    assert len(warning_records) == 0, "No warning expected when PDF has ruling text"
+
+
+@patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
+@patch("ingestion.worker.psycopg")
+def test_process_event_no_pdf_warning_for_html_without_ruling_text(
+    mock_psycopg: MagicMock,
+    mock_resolve_judge: MagicMock,
+    caplog: object,
+) -> None:
+    """When an HTML document has no ruling_text, the PDF-specific warning should NOT fire."""
+    worker, os_mock = _make_worker()
+
+    mock_conn, mock_cur = _make_mock_conn()
+    mock_psycopg.connect.return_value = mock_conn
+    mock_cur.fetchone.side_effect = [
+        ("court-uuid-1",),  # upsert_court
+        ("case-uuid-1",),  # upsert_case
+        (True,),  # insert_document
+    ]
+    mock_cur.rowcount = 1
+
+    event = _make_event(
+        ruling_text=None,
+        content_format="html",
+    )
+    worker.process_event(event)
+
+    import logging as _logging
+
+    warning_records = [
+        r
+        for r in caplog.records  # type: ignore[attr-defined]
+        if r.levelno >= _logging.WARNING and "no ruling text after all extraction" in r.getMessage()
+    ]
+    assert len(warning_records) == 0, "No PDF warning expected for HTML documents"
+
+
+@patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
+@patch("ingestion.worker.extract_text_from_pdf", return_value="")
+@patch("ingestion.worker.is_pdf_binary", return_value=True)
+@patch("ingestion.worker.extract_fields_llm", return_value=None)
+@patch("ingestion.worker.psycopg")
+def test_process_event_warns_on_raw_pdf_binary_with_empty_extraction(
+    mock_psycopg: MagicMock,
+    mock_llm: MagicMock,
+    mock_is_pdf: MagicMock,
+    mock_extract_pdf: MagicMock,
+    mock_resolve_judge: MagicMock,
+    caplog: object,
+) -> None:
+    """When raw PDF binary is sent and text extraction returns empty string,
+    the 'no ruling text' warning should still fire (#1335)."""
+    worker, os_mock = _make_worker()
+    worker._llm_client = MagicMock()
+
+    mock_conn, mock_cur = _make_mock_conn()
+    mock_psycopg.connect.return_value = mock_conn
+    mock_cur.fetchone.side_effect = [
+        ("court-uuid-1",),  # upsert_court
+        ("case-uuid-1",),  # upsert_case
+        (True,),  # insert_document
+    ]
+    mock_cur.rowcount = 1
+
+    event = _make_event(
+        ruling_text="%PDF-1.4 image-only binary",
+        content_format="pdf",
+        outcome=None,
+        motion_type=None,
+    )
+    worker.process_event(event)
+
+    import logging as _logging
+
+    warning_records = [
+        r
+        for r in caplog.records  # type: ignore[attr-defined]
+        if r.levelno >= _logging.WARNING and "no ruling text after all extraction" in r.getMessage()
+    ]
+    assert len(warning_records) >= 1, (
+        f"Expected warning about PDF with no ruling text after raw binary extraction, "
+        f"got: {[r.getMessage() for r in caplog.records]}"  # type: ignore[attr-defined]
+    )
