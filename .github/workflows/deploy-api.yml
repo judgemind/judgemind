@@ -180,7 +180,7 @@ jobs:
           ecs-service: ${{ env.ECS_SERVICE }}
           image-uri: ${{ needs.build-and-push.outputs.image_uri }}
           container-name: api-migrate
-          command: '["npx", "node-pg-migrate", "up", "--no-timestamp"]'
+          command: '["node", "scripts/seed-and-migrate.mjs"]'
           oneshot-family: judgemind-api-migrate-dev
           log-stream-prefix: migrate
           task-role-fallback: judgemind-api-task-dev
