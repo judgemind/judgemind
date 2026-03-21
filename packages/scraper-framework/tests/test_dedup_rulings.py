@@ -259,3 +259,190 @@ def test_query_uses_keyset_not_offset() -> None:
 
     assert "OFFSET" not in FIND_DUPLICATES_QUERY
     assert "id > %s::uuid" in FIND_DUPLICATES_QUERY
+
+
+# ---------------------------------------------------------------------------
+# Hash backfill tests
+# ---------------------------------------------------------------------------
+
+
+def test_count_null_hashes() -> None:
+    """count_null_hashes should return the count from the query."""
+    from dedup_rulings import count_null_hashes
+
+    mock_conn, mock_cur = _make_mock_conn()
+    mock_cur.fetchone.return_value = (150,)
+
+    result = count_null_hashes(mock_conn)
+
+    assert result == 150
+    mock_cur.execute.assert_called_once()
+    sql = str(mock_cur.execute.call_args)
+    assert "ruling_text_hash IS NULL" in sql
+
+
+def test_backfill_hash_batch_updates_rows() -> None:
+    """backfill_hash_batch should compute and update ruling_text_hash."""
+    from dedup_rulings import backfill_hash_batch
+
+    mock_conn = MagicMock()
+    cursors: list[MagicMock] = []
+    call_idx = [0]
+
+    def cursor_factory() -> MagicMock:
+        cur = MagicMock()
+        cursors.append(cur)
+        ctx = MagicMock()
+        ctx.__enter__ = MagicMock(return_value=cur)
+        ctx.__exit__ = MagicMock(return_value=False)
+
+        idx = call_idx[0]
+        call_idx[0] += 1
+
+        if idx == 0:
+            # FETCH_NULL_HASH_BATCH_QUERY
+            cur.fetchall.return_value = [
+                ("ruling-1", "Motion GRANTED"),
+                ("ruling-2", "Motion DENIED"),
+            ]
+        return ctx
+
+    mock_conn.cursor.side_effect = cursor_factory
+
+    count, next_cursor, dupes = backfill_hash_batch(mock_conn, batch_size=500)
+
+    assert count == 2
+    assert dupes == 0
+    assert next_cursor == "ruling-2"
+    # Individual UPDATEs use separate cursors (with savepoints)
+    # Cursor 0: fetch batch; then per-row cursors for savepoint + update
+    assert len(cursors) >= 2
+
+
+def test_backfill_hash_batch_returns_zero_when_empty() -> None:
+    """backfill_hash_batch should return 0 when no rows need backfill."""
+    from dedup_rulings import backfill_hash_batch
+
+    mock_conn, mock_cur = _make_mock_conn()
+    mock_cur.fetchall.return_value = []
+
+    count, next_cursor, dupes = backfill_hash_batch(mock_conn)
+
+    assert count == 0
+    assert dupes == 0
+    assert next_cursor == _CURSOR_MIN_UUID
+
+
+def test_backfill_hash_batch_handles_unique_violation() -> None:
+    """When a UniqueViolation occurs, the duplicate ruling is deleted."""
+    import psycopg.errors
+    from dedup_rulings import backfill_hash_batch
+
+    mock_conn = MagicMock()
+    cursors: list[MagicMock] = []
+    call_idx = [0]
+    raise_on_update = [False, True]  # second row triggers violation
+
+    def cursor_factory() -> MagicMock:
+        cur = MagicMock()
+        cursors.append(cur)
+        ctx = MagicMock()
+        ctx.__enter__ = MagicMock(return_value=cur)
+        ctx.__exit__ = MagicMock(return_value=False)
+
+        idx = call_idx[0]
+        call_idx[0] += 1
+
+        if idx == 0:
+            # FETCH_NULL_HASH_BATCH_QUERY
+            cur.fetchall.return_value = [
+                ("ruling-1", "Same text here"),
+                ("ruling-2", "Same text here"),
+            ]
+        return ctx
+
+    # Track execute calls to raise on the right UPDATE
+    update_count = [0]
+    original_cursor_factory = cursor_factory
+
+    def cursor_with_violation() -> MagicMock:
+        ctx = original_cursor_factory()
+        cur = cursors[-1]
+
+        original_execute = cur.execute
+
+        def smart_execute(sql: str, params: object = None) -> None:
+            if "UPDATE rulings SET ruling_text_hash" in str(sql):
+                idx = update_count[0]
+                update_count[0] += 1
+                if idx < len(raise_on_update) and raise_on_update[idx]:
+                    raise psycopg.errors.UniqueViolation(
+                        "duplicate key value violates unique constraint"
+                    )
+            return original_execute(sql, params)
+
+        cur.execute = MagicMock(side_effect=smart_execute)
+        # For the violation handler, need fetchone to return doc_id
+        cur.fetchone.return_value = ("doc-uuid-2",)
+        return ctx
+
+    mock_conn.cursor.side_effect = cursor_with_violation
+
+    count, next_cursor, dupes = backfill_hash_batch(mock_conn, batch_size=500)
+
+    assert count == 1  # first row updated
+    assert dupes == 1  # second row deleted as duplicate
+    assert next_cursor == "ruling-2"
+
+
+@patch("dedup_rulings.psycopg")
+def test_run_backfill_hashes_dry_run(mock_psycopg: MagicMock) -> None:
+    """Dry-run mode should rollback instead of commit."""
+    from dedup_rulings import run_backfill_hashes
+
+    mock_conn = MagicMock()
+    mock_conn.__enter__ = MagicMock(return_value=mock_conn)
+    mock_conn.__exit__ = MagicMock(return_value=False)
+    mock_psycopg.connect.return_value = mock_conn
+
+    call_idx = [0]
+
+    def cursor_factory() -> MagicMock:
+        cur = MagicMock()
+        ctx = MagicMock()
+        ctx.__enter__ = MagicMock(return_value=cur)
+        ctx.__exit__ = MagicMock(return_value=False)
+
+        idx = call_idx[0]
+        call_idx[0] += 1
+
+        if idx == 0:
+            # count_null_hashes
+            cur.fetchone.return_value = (2,)
+        elif idx == 1:
+            # First batch: FETCH_NULL_HASH_BATCH_QUERY
+            cur.fetchall.return_value = [
+                ("r1", "Ruling text one"),
+                ("r2", "Ruling text two"),
+            ]
+        else:
+            # Subsequent batches: no more rows
+            cur.fetchall.return_value = []
+        return ctx
+
+    mock_conn.cursor.side_effect = cursor_factory
+
+    totals = run_backfill_hashes("postgresql://localhost/test", dry_run=True)
+
+    assert totals["total_updated"] == 2
+    assert totals["total_dupes_deleted"] == 0
+    mock_conn.rollback.assert_called()
+    mock_conn.commit.assert_not_called()
+
+
+def test_backfill_query_uses_keyset_not_offset() -> None:
+    """The FETCH_NULL_HASH_BATCH_QUERY must use keyset pagination, not OFFSET."""
+    from dedup_rulings import FETCH_NULL_HASH_BATCH_QUERY
+
+    assert "OFFSET" not in FETCH_NULL_HASH_BATCH_QUERY
+    assert "id > %s::uuid" in FETCH_NULL_HASH_BATCH_QUERY

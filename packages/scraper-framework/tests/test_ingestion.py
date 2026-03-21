@@ -1678,7 +1678,10 @@ def test_insert_ruling_upsert_uses_on_conflict() -> None:
         motion_type="msj",
     )
 
-    sql = str(mock_cur.execute.call_args)
+    # Find the INSERT INTO rulings call (not SAVEPOINT/RELEASE)
+    insert_calls = [c for c in mock_cur.execute.call_args_list if "INSERT INTO rulings" in str(c)]
+    assert len(insert_calls) == 1
+    sql = str(insert_calls[0])
     assert "ON CONFLICT (document_id) DO UPDATE" in sql
     assert "COALESCE" in sql
     # Verify all updatable fields are in the ON CONFLICT clause
@@ -1706,8 +1709,10 @@ def test_insert_ruling_upsert_no_duplicate_document_id_param() -> None:
         department="Dept. 1",
     )
 
-    # The old pattern had document_id twice in the args tuple. New pattern has it once.
-    sql_args = mock_cur.execute.call_args[0][1]
+    # Find the INSERT INTO rulings call and check its args
+    insert_calls = [c for c in mock_cur.execute.call_args_list if "INSERT INTO rulings" in str(c)]
+    assert len(insert_calls) == 1
+    sql_args = insert_calls[0][0][1]
     doc_id_count = sum(1 for a in sql_args if a == "doc-uuid-1")
     assert doc_id_count == 1
 
@@ -2890,9 +2895,13 @@ def test_insert_ruling_with_ruling_text_html() -> None:
         ruling_text_html='<div class="ruling"><p>Motion <strong>GRANTED</strong>.</p></div>',
     )
 
-    sql = str(mock_cur.execute.call_args)
+    # Find the INSERT INTO rulings call (not SAVEPOINT/RELEASE)
+    insert_calls = [c for c in mock_cur.execute.call_args_list if "INSERT INTO rulings" in str(c)]
+    assert len(insert_calls) == 1
+    sql = str(insert_calls[0])
     assert "ruling_text_html" in sql
-    assert "COALESCE(EXCLUDED.ruling_text_html, rulings.ruling_text_html)" in sql
+    assert "EXCLUDED.ruling_text_html" in sql
+    assert "rulings.ruling_text_html" in sql
 
 
 def test_insert_ruling_with_ruling_text_html_none() -> None:
@@ -2912,8 +2921,8 @@ def test_insert_ruling_with_ruling_text_html_none() -> None:
         department="Dept. 1",
     )
 
-    # Should still pass — ruling_text_html defaults to None
-    mock_cur.execute.assert_called_once()
+    # Should have: SAVEPOINT, INSERT, RELEASE SAVEPOINT = 3 execute calls
+    assert mock_cur.execute.call_count == 3
 
 
 # ---------------------------------------------------------------------------

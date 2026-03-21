@@ -14,10 +14,13 @@ Write order per event:
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import re
 from datetime import date, datetime
 from typing import TYPE_CHECKING
+
+import psycopg.errors
 
 if TYPE_CHECKING:
     import psycopg
@@ -61,6 +64,27 @@ def _strip_nul(value: str | None) -> str | None:
     if value is None:
         return None
     return value.replace("\x00", "")
+
+
+def normalize_ruling_text_hash(text: str | None) -> str | None:
+    """Compute a SHA-256 hash of normalized ruling text for deduplication.
+
+    Normalization steps:
+      1. Lowercase the text.
+      2. Collapse all whitespace (including newlines, tabs) to single spaces.
+      3. Strip leading and trailing whitespace.
+
+    This ensures that rulings with identical content but different casing
+    or whitespace produce the same hash, preventing semantic duplicates.
+
+    Returns ``None`` if the input is ``None`` or empty after normalization.
+    """
+    if text is None:
+        return None
+    normalized = re.sub(r"\s+", " ", text.lower()).strip()
+    if not normalized:
+        return None
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 
 def _derive_court_code(state: str, county: str) -> str:
@@ -669,13 +693,26 @@ def insert_ruling(
     summary_model: str | None = None,
     summary_generated_at: datetime | None = None,
 ) -> None:
-    """Upsert a ruling row linked to the document.
+    """Upsert a ruling row linked to the document, with content-based dedup.
 
-    On conflict (same document_id), updates extracted fields using COALESCE
-    so that non-NULL existing values are preserved unless the new value is
-    also non-NULL (allowing improved extraction to overwrite).
+    Deduplication has two layers:
 
-    Requires a UNIQUE constraint on rulings.document_id (migration 3).
+    1. **Exact match** (``ON CONFLICT (document_id)``): same scraper document
+       produces the same deterministic document_id, so the INSERT becomes an
+       UPDATE of extracted fields.  This is the fast path.
+
+    2. **Content match** (savepoint + UniqueViolation on ``ruling_text_hash``):
+       if a ruling with the same ``case_id`` and normalized text hash already
+       exists (from a prior scrape that produced different raw bytes but
+       semantically identical text), the unique index
+       ``uq_rulings_case_text_hash`` raises a UniqueViolation.  We catch it
+       inside a savepoint and fall back to an UPDATE of the existing row.
+       The hash is a SHA-256 of the lowercased, whitespace-collapsed ruling
+       text (see ``normalize_ruling_text_hash``).
+
+    Requires a UNIQUE constraint on ``rulings.document_id`` (migration 3) and
+    a partial UNIQUE index on ``(case_id, ruling_text_hash)`` where
+    ``ruling_text_hash IS NOT NULL`` (migration 11).
 
     ``outcome`` must be a valid ``ruling_outcome`` enum value (e.g.
     ``"granted"``, ``"denied"``) or ``None``.  ``motion_type`` is free-text.
@@ -692,52 +729,135 @@ def insert_ruling(
     outcome = _strip_nul(outcome)
     motion_type = _strip_nul(motion_type)
     summary = _strip_nul(summary)
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            INSERT INTO rulings (
-                document_id, case_id, court_id, judge_id,
-                hearing_date, ruling_text, ruling_text_html,
-                department, is_tentative,
-                outcome, motion_type,
-                summary, summary_model, summary_generated_at
-            )
-            VALUES (
-                %s::uuid, %s::uuid, %s::uuid, %s::uuid, %s::date, %s, %s,
-                %s, TRUE,
-                %s::ruling_outcome, %s,
-                %s, %s, %s
-            )
-            ON CONFLICT (document_id) DO UPDATE SET
-                judge_id = COALESCE(EXCLUDED.judge_id, rulings.judge_id),
-                outcome = COALESCE(EXCLUDED.outcome, rulings.outcome),
-                motion_type = COALESCE(EXCLUDED.motion_type, rulings.motion_type),
-                ruling_text = COALESCE(EXCLUDED.ruling_text, rulings.ruling_text),
-                ruling_text_html = COALESCE(EXCLUDED.ruling_text_html, rulings.ruling_text_html),
-                department = COALESCE(EXCLUDED.department, rulings.department),
-                summary = COALESCE(EXCLUDED.summary, rulings.summary),
-                summary_model = COALESCE(EXCLUDED.summary_model, rulings.summary_model),
-                summary_generated_at = COALESCE(
-                    EXCLUDED.summary_generated_at, rulings.summary_generated_at
+
+    text_hash = normalize_ruling_text_hash(ruling_text)
+
+    # Attempt the INSERT inside a savepoint so that a UniqueViolation from the
+    # content-hash index (uq_rulings_case_text_hash) does not abort the
+    # surrounding transaction.  The ON CONFLICT (document_id) handles exact
+    # document_id matches.  A content-hash collision (different document_id,
+    # same normalized text for the same case) triggers the savepoint rollback
+    # and falls through to the UPDATE below.
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SAVEPOINT ruling_insert")
+            cur.execute(
+                """
+                INSERT INTO rulings (
+                    document_id, case_id, court_id, judge_id,
+                    hearing_date, ruling_text, ruling_text_html,
+                    department, is_tentative,
+                    outcome, motion_type,
+                    summary, summary_model, summary_generated_at,
+                    ruling_text_hash
                 )
-            """,
-            (
-                document_id,
-                case_id,
-                court_id,
-                judge_id,
-                hearing_date,
-                ruling_text,
-                ruling_text_html,
-                department,
-                outcome,
-                motion_type,
-                summary,
-                summary_model,
-                summary_generated_at,
-            ),
+                VALUES (
+                    %s::uuid, %s::uuid, %s::uuid, %s::uuid, %s::date, %s, %s,
+                    %s, TRUE,
+                    %s::ruling_outcome, %s,
+                    %s, %s, %s,
+                    %s
+                )
+                ON CONFLICT (document_id) DO UPDATE SET
+                    judge_id = COALESCE(EXCLUDED.judge_id, rulings.judge_id),
+                    outcome = COALESCE(EXCLUDED.outcome, rulings.outcome),
+                    motion_type = COALESCE(EXCLUDED.motion_type, rulings.motion_type),
+                    ruling_text = COALESCE(EXCLUDED.ruling_text, rulings.ruling_text),
+                    ruling_text_html = COALESCE(
+                        EXCLUDED.ruling_text_html, rulings.ruling_text_html
+                    ),
+                    department = COALESCE(EXCLUDED.department, rulings.department),
+                    summary = COALESCE(EXCLUDED.summary, rulings.summary),
+                    summary_model = COALESCE(EXCLUDED.summary_model, rulings.summary_model),
+                    summary_generated_at = COALESCE(
+                        EXCLUDED.summary_generated_at, rulings.summary_generated_at
+                    ),
+                    ruling_text_hash = COALESCE(EXCLUDED.ruling_text_hash, rulings.ruling_text_hash)
+                """,
+                (
+                    document_id,
+                    case_id,
+                    court_id,
+                    judge_id,
+                    hearing_date,
+                    ruling_text,
+                    ruling_text_html,
+                    department,
+                    outcome,
+                    motion_type,
+                    summary,
+                    summary_model,
+                    summary_generated_at,
+                    text_hash,
+                ),
+            )
+            cur.execute("RELEASE SAVEPOINT ruling_insert")
+        logger.debug("insert_ruling: document_id=%s ruling_text_hash=%s", document_id, text_hash)
+        return
+    except psycopg.errors.UniqueViolation as exc:
+        # Roll back the savepoint regardless of which constraint was violated.
+        with conn.cursor() as cur:
+            cur.execute("ROLLBACK TO SAVEPOINT ruling_insert")
+
+        # Only handle the content-hash constraint; re-raise anything else.
+        # When constraint_name is None (e.g. in tests without a real PG
+        # connection), we assume it's the expected constraint since the
+        # ON CONFLICT (document_id) clause handles the other unique index.
+        constraint = getattr(exc.diag, "constraint_name", None)
+        if constraint is not None and constraint != "uq_rulings_case_text_hash":
+            raise
+
+        # Content-hash collision — a ruling with the same normalized text
+        # already exists for this case under a different document_id.
+        # Update the existing row instead.
+
+    # Fallback: update the existing ruling that has the same content hash.
+    if text_hash is not None:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE rulings SET
+                    judge_id = COALESCE(%s::uuid, judge_id),
+                    outcome = COALESCE(%s::ruling_outcome, outcome),
+                    motion_type = COALESCE(%s, motion_type),
+                    ruling_text = COALESCE(%s, ruling_text),
+                    ruling_text_html = COALESCE(%s, ruling_text_html),
+                    department = COALESCE(%s, department),
+                    summary = COALESCE(%s, summary),
+                    summary_model = COALESCE(%s, summary_model),
+                    summary_generated_at = COALESCE(%s, summary_generated_at),
+                    updated_at = NOW()
+                WHERE case_id = %s::uuid AND ruling_text_hash = %s
+                """,
+                (
+                    judge_id,
+                    outcome,
+                    motion_type,
+                    ruling_text,
+                    ruling_text_html,
+                    department,
+                    summary,
+                    summary_model,
+                    summary_generated_at,
+                    case_id,
+                    text_hash,
+                ),
+            )
+            if cur.rowcount == 0:
+                logger.warning(
+                    "insert_ruling: fallback UPDATE matched 0 rows — "
+                    "conflicting row may have been deleted concurrently "
+                    "(document_id=%s, case_id=%s, text_hash=%s)",
+                    document_id,
+                    case_id,
+                    text_hash,
+                )
+        logger.info(
+            "insert_ruling: content-hash dedup — updated existing ruling "
+            "instead of inserting duplicate (document_id=%s, case_id=%s)",
+            document_id,
+            case_id,
         )
-    logger.debug("insert_ruling: document_id=%s", document_id)
 
 
 def normalize_party_name(raw_name: str) -> str:
