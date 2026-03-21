@@ -106,14 +106,17 @@ export function createLoaders(pool: Pool) {
     return grouped;
   });
 
-  /** Batch-load parties for multiple cases via the case_parties join table. */
+  /** Batch-load parties for multiple cases via the case_parties join table.
+   *  Deduplicates by (canonical_name, role) to avoid showing the same party
+   *  name multiple times when duplicate party records exist (#1426). */
   const casePartiesLoader = new DataLoader<string, Row[]>(async (caseIds) => {
     const { rows } = await pool.query<Row>(
-      `SELECT DISTINCT ON (cp.case_id, p.id, cp.role) p.*, cp.role, cp.case_id
+      `SELECT DISTINCT ON (cp.case_id, LOWER(p.canonical_name), cp.role)
+              p.*, cp.role, cp.case_id
        FROM parties p
        JOIN case_parties cp ON cp.party_id = p.id
        WHERE cp.case_id = ANY($1)
-       ORDER BY cp.case_id, p.id, cp.role`,
+       ORDER BY cp.case_id, LOWER(p.canonical_name), cp.role, p.created_at`,
       [caseIds],
     );
     const grouped = groupByKey(rows, 'case_id', caseIds);

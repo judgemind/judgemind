@@ -279,10 +279,10 @@ class TestBatchUpsertParties:
     def test_all_existing_parties_no_insert(self) -> None:
         """When all parties already exist, no INSERT into parties is needed."""
         conn, cur = _mock_conn_for_batch()
-        # The SELECT returns both parties as already existing
+        # The SELECT returns both parties as already existing (lowercased keys)
         cur.fetchall.return_value = [
-            ("John Doe", "party-1"),
-            ("Jane Smith", "party-2"),
+            ("john doe", "party-1"),
+            ("jane smith", "party-2"),
         ]
 
         batch_upsert_parties(
@@ -351,9 +351,9 @@ class TestBatchUpsertParties:
     def test_mixed_existing_and_new(self) -> None:
         """Mix of existing and new parties only inserts the new ones."""
         conn, cur = _mock_conn_for_batch()
-        # SELECT returns one existing alias
+        # SELECT returns one existing alias (lowercased key from LOWER(raw_name))
         cur.fetchall.side_effect = [
-            [("John Doe", "existing-pid")],  # batch alias lookup
+            [("john doe", "existing-pid")],  # batch alias lookup
         ]
         # fetchone for the one new party
         cur.fetchone.side_effect = [("new-pid",)]
@@ -452,10 +452,38 @@ class TestBatchUpsertParties:
         aliases_params = cur.executemany.call_args_list[1][0][1]
         assert aliases_params[0][2] == "backfill"
 
+    def test_case_insensitive_alias_lookup(self) -> None:
+        """Verify batch alias lookup is case-insensitive (#1426).
+
+        When a party alias exists as "John Doe" and we ingest "JOHN DOE",
+        the existing party should be reused instead of creating a new one.
+        """
+        conn, cur = _mock_conn_for_batch()
+        # Alias exists for lowercase "john doe"
+        cur.fetchall.return_value = [("john doe", "existing-pid")]
+
+        batch_upsert_parties(
+            conn,
+            "case-1",
+            [{"name": "JOHN DOE", "role": "plaintiff"}],
+        )
+
+        # Should NOT insert any new parties — only the SELECT + case_party link
+        assert cur.execute.call_count == 1  # SELECT only
+        assert cur.executemany.call_count == 1  # case_parties link only
+
+        # The SELECT query should use LOWER() for case-insensitive matching
+        sql_select = cur.execute.call_args_list[0][0][0]
+        assert "LOWER" in sql_select
+
+        # The lowercased name list should be passed as the parameter
+        select_params = cur.execute.call_args_list[0][0][1]
+        assert select_params == (["john doe"],)
+
     def test_case_party_links_use_on_conflict(self) -> None:
         """Verify case_parties INSERT uses ON CONFLICT DO NOTHING (#873)."""
         conn, cur = _mock_conn_for_batch()
-        cur.fetchall.return_value = [("John Doe", "party-1")]
+        cur.fetchall.return_value = [("john doe", "party-1")]
 
         batch_upsert_parties(
             conn,
@@ -1059,6 +1087,15 @@ class TestUpsertPartyExistingAlias:
         cur.fetchone.side_effect = [None, None]
         with pytest.raises(RuntimeError, match="upsert_party"):
             upsert_party(conn, raw_name="John Doe", party_type="plaintiff")
+
+    def test_lookup_uses_case_insensitive_match(self) -> None:
+        """Verify alias lookup uses LOWER() for case-insensitive matching (#1426)."""
+        conn = _mock_conn()
+        cur = conn.cursor.return_value.__enter__.return_value
+        cur.fetchone.return_value = ("existing-party-id",)
+        upsert_party(conn, raw_name="JOHN DOE", party_type="plaintiff")
+        sql = cur.execute.call_args_list[0][0][0]
+        assert "LOWER" in sql
 
 
 # ---------------------------------------------------------------------------

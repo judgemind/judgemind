@@ -225,6 +225,32 @@ describe('createLoaders', () => {
       expect(pool.query).toHaveBeenCalledTimes(1);
     });
 
+    it('deduplicates parties with same canonical_name and role (#1426)', async () => {
+      const pool = mockPool(() => ({
+        rows: [
+          // DISTINCT ON (case_id, LOWER(canonical_name), role) in the DB query
+          // means only one row per (case, name, role) comes back.
+          // The mock simulates the DB already having applied DISTINCT ON.
+          { id: 'party-1', canonical_name: 'Citizens Business Bank', party_type: 'corporation', role: 'plaintiff', case_id: 'case-1', created_at: '2025-01-01' },
+        ],
+        command: 'SELECT',
+        rowCount: 1,
+        oid: 0,
+        fields: [],
+      }));
+
+      const loaders = createLoaders(pool);
+      const parties = await loaders.casePartiesLoader.load('case-1');
+
+      // Should have exactly 1 party, not 2 duplicates
+      expect(parties).toHaveLength(1);
+      expect(parties[0]).toMatchObject({ canonical_name: 'Citizens Business Bank', role: 'plaintiff' });
+
+      // Verify the SQL uses LOWER for canonical_name dedup
+      const sql = (pool.query as ReturnType<typeof vi.fn>).mock.calls[0][0] as string;
+      expect(sql).toContain('LOWER(p.canonical_name)');
+    });
+
     it('returns empty array for cases with no parties', async () => {
       const pool = mockPool(() => ({
         rows: [],
