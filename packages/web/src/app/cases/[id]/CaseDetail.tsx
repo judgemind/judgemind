@@ -11,6 +11,8 @@ import {
   formatLabel,
   formatOutcome,
   groupParties,
+  stripMetadataHeaderHtml,
+  type RulingMetadata,
 } from '../../../lib/display-helpers';
 import { sanitizeRulingHtml } from '@/lib/sanitize-html';
 import { Badge } from '@/components/ui/badge';
@@ -420,6 +422,14 @@ export function CaseDetail({ caseId }: { caseId: string }) {
           {edges.map(({ node }) => {
             const isExpanded = expandedRulings.has(node.id);
             const hasText = !!(node.rulingTextHtml || node.rulingText);
+            const rulingMetadata: RulingMetadata = {
+              caseNumber: caseRecord.caseNumber,
+              caseTitle: caseRecord.caseTitle ?? undefined,
+              judgeName: node.judge?.canonicalName,
+              department: node.department ?? undefined,
+              hearingDate: node.hearingDate,
+              motionType: node.motionType ?? undefined,
+            };
 
             return (
               <Card key={node.id}>
@@ -473,13 +483,16 @@ export function CaseDetail({ caseId }: { caseId: string }) {
                           <div
                             className="ruling-content text-sm leading-relaxed text-muted-foreground"
                             dangerouslySetInnerHTML={{
-                              __html: sanitizeRulingHtml(node.rulingTextHtml),
+                              __html: stripMetadataHeaderHtml(
+                                sanitizeRulingHtml(node.rulingTextHtml),
+                                rulingMetadata,
+                              ),
                             }}
                           />
                         ) : (
                           node.rulingText && (
                             <div className="space-y-3">
-                              {cleanRulingText(node.rulingText).map((paragraph, idx) => (
+                              {cleanRulingText(node.rulingText, rulingMetadata).map((paragraph, idx) => (
                                 <p key={idx} className="text-sm leading-relaxed text-muted-foreground">
                                   {paragraph}
                                 </p>

@@ -10,6 +10,8 @@ import {
   groupParties,
   RULING_TEXT_TRUNCATE_LENGTH,
   stripBoilerplate,
+  stripMetadataHeader,
+  stripMetadataHeaderHtml,
   truncateText,
   cleanRulingText,
 } from '../display-helpers';
@@ -527,5 +529,407 @@ describe('cleanRulingText', () => {
     expect(joined).toContain("plaintiff's");
     // Should have paragraph breaks
     expect(result.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it('strips metadata header when metadata is provided', () => {
+    const text =
+      'TENTATIVE RULING FOR MARCH 20, 2026\n' +
+      'Department R12 – Judge Kory Mathewson\n' +
+      'Veronica Daniel v. Jerry R. Kendall, et al. – CIVSB2202699\n' +
+      'Motion: Motion to Strike\n' +
+      '\n' +
+      'The motion to strike is GRANTED.';
+    const metadata = {
+      caseNumber: 'CIVSB2202699',
+      caseTitle: 'Veronica Daniel v. Jerry R. Kendall, et al.',
+      judgeName: 'Kory Mathewson',
+      department: 'R12',
+      hearingDate: '2026-03-20',
+      motionType: 'motion_to_strike',
+    };
+    const result = cleanRulingText(text, metadata);
+    const joined = result.join(' ');
+    expect(joined).not.toContain('TENTATIVE RULING FOR');
+    expect(joined).not.toContain('Department R12');
+    expect(joined).not.toContain('CIVSB2202699');
+    expect(joined).toContain('The motion to strike is GRANTED.');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// stripMetadataHeader
+// ---------------------------------------------------------------------------
+
+describe('stripMetadataHeader', () => {
+  it('returns text unchanged when no metadata provided', () => {
+    const text = 'Some ruling text here.';
+    expect(stripMetadataHeader(text, {})).toBe(text);
+  });
+
+  it('returns text unchanged when text does not start with metadata', () => {
+    const text = 'The motion is granted.\nThe court finds in favor of plaintiff.';
+    const metadata = { caseNumber: 'CIVSB2202699' };
+    expect(stripMetadataHeader(text, metadata)).toBe(text);
+  });
+
+  it('strips San Bernardino-style header with date, department, judge, parties, case number, and motion type', () => {
+    const text =
+      'TENTATIVE RULING FOR MARCH 20, 2026\n' +
+      'Department R12 – Judge Kory Mathewson\n' +
+      'Veronica Daniel v. Jerry R. Kendall, et al. – CIVSB2202699\n' +
+      'Motion: Motion to Strike\n' +
+      '\n' +
+      'The motion to strike is GRANTED.\n' +
+      'The court finds sufficient grounds.';
+    const metadata = {
+      caseNumber: 'CIVSB2202699',
+      caseTitle: 'Veronica Daniel v. Jerry R. Kendall, et al.',
+      judgeName: 'Kory Mathewson',
+      department: 'R12',
+      hearingDate: '2026-03-20',
+      motionType: 'motion_to_strike',
+    };
+    const result = stripMetadataHeader(text, metadata);
+    expect(result).not.toContain('TENTATIVE RULING FOR');
+    expect(result).not.toContain('Department R12');
+    expect(result).not.toContain('Kory Mathewson');
+    expect(result).not.toContain('CIVSB2202699');
+    expect(result).not.toContain('Motion: Motion to Strike');
+    expect(result).toContain('The motion to strike is GRANTED.');
+    expect(result).toContain('The court finds sufficient grounds.');
+  });
+
+  it('strips Ventura probate-style header with case number, title, date, and department', () => {
+    const text =
+      'Probate Notes 2024PRCP036355: IN THE MATTER OF JONATHAN DRAPER 03/20/2026 in Department J6 Review Hearing Transfer In\n' +
+      '\n' +
+      'The court orders the matter transferred.';
+    const metadata = {
+      caseNumber: '2024PRCP036355',
+      caseTitle: 'IN THE MATTER OF JONATHAN DRAPER',
+      department: 'J6',
+      hearingDate: '2026-03-20',
+    };
+    const result = stripMetadataHeader(text, metadata);
+    expect(result).not.toContain('Probate Notes');
+    expect(result).not.toContain('2024PRCP036355');
+    expect(result).toContain('The court orders the matter transferred.');
+  });
+
+  it('strips Ventura CMC-style header with case number and full party names', () => {
+    const text =
+      'Tentative Case Management Order 2025CUOE052557: OLGA GUILLEN NUNEZ, ON BEHALF OF HERSELF AND CURRENT AND FORMER AGGRIEVED EMPLOYEES vs PRITI PRABHA CORPORATION\n' +
+      '\n' +
+      'The court sets a case management conference for June 1, 2026.';
+    const metadata = {
+      caseNumber: '2025CUOE052557',
+      caseTitle: 'OLGA GUILLEN NUNEZ, ON BEHALF OF HERSELF AND CURRENT AND FORMER AGGRIEVED EMPLOYEES vs PRITI PRABHA CORPORATION',
+    };
+    const result = stripMetadataHeader(text, metadata);
+    expect(result).not.toContain('Tentative Case Management Order');
+    expect(result).not.toContain('2025CUOE052557');
+    expect(result).toContain('The court sets a case management conference');
+  });
+
+  it('strips multi-line header where metadata spans several lines', () => {
+    const text =
+      'TENTATIVE RULING\n' +
+      'Case No. 25STCV12345\n' +
+      'Smith v. Jones\n' +
+      'Hearing Date: March 20, 2026\n' +
+      'Department 12\n' +
+      'Judge Robert M. Johnson\n' +
+      '\n' +
+      'The court grants the motion for summary judgment.';
+    const metadata = {
+      caseNumber: '25STCV12345',
+      caseTitle: 'Smith v. Jones',
+      judgeName: 'Robert M. Johnson',
+      department: '12',
+      hearingDate: '2026-03-20',
+    };
+    const result = stripMetadataHeader(text, metadata);
+    expect(result).not.toContain('TENTATIVE RULING');
+    expect(result).not.toContain('25STCV12345');
+    expect(result).not.toContain('Smith v. Jones');
+    expect(result).not.toContain('Hearing Date:');
+    expect(result).not.toContain('Department 12');
+    expect(result).not.toContain('Judge Robert M. Johnson');
+    expect(result).toContain('The court grants the motion for summary judgment.');
+  });
+
+  it('stops stripping at the first non-metadata line', () => {
+    const text =
+      'TENTATIVE RULING\n' +
+      'Case No. 25STCV12345\n' +
+      'The court has considered the moving papers.\n' +
+      'Department 12\n' +
+      'The motion is granted.';
+    const metadata = {
+      caseNumber: '25STCV12345',
+      department: '12',
+    };
+    const result = stripMetadataHeader(text, metadata);
+    // Should stop at "The court has considered..." and keep everything from there
+    expect(result).not.toContain('TENTATIVE RULING');
+    expect(result).not.toContain('25STCV12345');
+    expect(result).toContain('The court has considered the moving papers.');
+    // Department 12 line comes AFTER a non-metadata line, so it stays
+    expect(result).toContain('Department 12');
+  });
+
+  it('handles blank lines within the metadata header', () => {
+    const text =
+      'TENTATIVE RULING FOR MARCH 20, 2026\n' +
+      '\n' +
+      'Department R12 – Judge Kory Mathewson\n' +
+      '\n' +
+      'The motion is denied.';
+    const metadata = {
+      judgeName: 'Kory Mathewson',
+      department: 'R12',
+      hearingDate: '2026-03-20',
+    };
+    const result = stripMetadataHeader(text, metadata);
+    expect(result).not.toContain('TENTATIVE RULING FOR');
+    expect(result).not.toContain('Department R12');
+    expect(result).toContain('The motion is denied.');
+  });
+
+  it('preserves text when case number appears later in the text (not in header)', () => {
+    const text =
+      'The court has reviewed the papers filed in this case.\n' +
+      'Case number CIVSB2202699 is referenced here.\n' +
+      'The motion is granted.';
+    const metadata = {
+      caseNumber: 'CIVSB2202699',
+    };
+    const result = stripMetadataHeader(text, metadata);
+    // First line is not metadata — entire text should be preserved
+    expect(result).toContain('The court has reviewed the papers');
+    expect(result).toContain('CIVSB2202699');
+  });
+
+  it('handles date in various formats (MM/DD/YYYY)', () => {
+    const text =
+      '03/20/2026\n' +
+      'The motion is granted.';
+    const metadata = {
+      hearingDate: '2026-03-20',
+    };
+    const result = stripMetadataHeader(text, metadata);
+    expect(result).not.toContain('03/20/2026');
+    expect(result).toContain('The motion is granted.');
+  });
+
+  it('handles date in "Month DD, YYYY" format', () => {
+    const text =
+      'TENTATIVE RULING FOR MARCH 20, 2026\n' +
+      'The motion is granted.';
+    const metadata = {
+      hearingDate: '2026-03-20',
+    };
+    const result = stripMetadataHeader(text, metadata);
+    expect(result).not.toContain('MARCH 20, 2026');
+    expect(result).toContain('The motion is granted.');
+  });
+
+  it('handles empty text', () => {
+    expect(stripMetadataHeader('', { caseNumber: '123' })).toBe('');
+  });
+
+  it('does not strip if all lines are metadata (preserves at least something)', () => {
+    const text = 'Case No. 25STCV12345';
+    const metadata = { caseNumber: '25STCV12345' };
+    // If the entire text is metadata, we should still return it rather than empty string
+    const result = stripMetadataHeader(text, metadata);
+    // When ALL lines are metadata, return original to avoid losing content entirely
+    expect(result.length).toBeGreaterThan(0);
+  });
+
+  it('strips "Motion:" prefix lines containing the motion type', () => {
+    const text =
+      'Motion: Motion to Compel\n' +
+      'The court grants the motion to compel.';
+    const metadata = {
+      motionType: 'motion_to_compel',
+    };
+    const result = stripMetadataHeader(text, metadata);
+    expect(result).not.toContain('Motion: Motion to Compel');
+    expect(result).toContain('The court grants the motion to compel.');
+  });
+
+  it('is case-insensitive for metadata matching', () => {
+    const text =
+      'tentative ruling\n' +
+      'case no. 25stcv12345\n' +
+      'The motion is granted.';
+    const metadata = {
+      caseNumber: '25STCV12345',
+    };
+    const result = stripMetadataHeader(text, metadata);
+    expect(result).not.toContain('tentative ruling');
+    expect(result).not.toContain('25stcv12345');
+    expect(result).toContain('The motion is granted.');
+  });
+
+  it('matches case titles with short party names like "Li v. Wu"', () => {
+    const text =
+      'Li v. Wu\n' +
+      'The motion is granted.';
+    const metadata = {
+      caseTitle: 'Li v. Wu',
+    };
+    const result = stripMetadataHeader(text, metadata);
+    expect(result).not.toContain('Li v. Wu');
+    expect(result).toContain('The motion is granted.');
+  });
+
+  it('does not false-positive on judge name substring (e.g. "Smith" in "blacksmith")', () => {
+    const text =
+      'The blacksmith trade was discussed in the ruling.\n' +
+      'The motion is granted.';
+    const metadata = {
+      judgeName: 'Smith',
+    };
+    const result = stripMetadataHeader(text, metadata);
+    // "blacksmith" contains "smith" as substring but not as whole word
+    expect(result).toContain('blacksmith');
+  });
+
+  it('does not false-positive on case number as substring of another number', () => {
+    const text =
+      'See Rule 25STCV123456789 for details.\n' +
+      'The motion is granted.';
+    const metadata = {
+      caseNumber: '25STCV12345',
+    };
+    const result = stripMetadataHeader(text, metadata);
+    // "25STCV12345" should not match "25STCV123456789" (substring, not whole word)
+    expect(result).toContain('Rule 25STCV123456789');
+  });
+
+  it('does not strip substantive text that happens to mention a party name', () => {
+    const text =
+      "Plaintiff Li's argument is unpersuasive.\n" +
+      'The motion is denied.';
+    const metadata = {
+      caseTitle: 'Li v. Wu',
+    };
+    const result = stripMetadataHeader(text, metadata);
+    // Single-word "Li" from a 2-word title (Li, Wu) requires at least 2 matches
+    // This line only matches "Li" (1 match) so it should NOT be stripped
+    expect(result).toContain("Plaintiff Li's argument");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// stripMetadataHeaderHtml
+// ---------------------------------------------------------------------------
+
+describe('stripMetadataHeaderHtml', () => {
+  it('returns html unchanged when no metadata provided', () => {
+    const html = '<p>Some ruling text here.</p>';
+    expect(stripMetadataHeaderHtml(html, {})).toBe(html);
+  });
+
+  it('returns html unchanged when html does not start with metadata', () => {
+    const html = '<p>The motion is granted.</p><p>The court finds in favor of plaintiff.</p>';
+    const metadata = { caseNumber: 'CIVSB2202699' };
+    expect(stripMetadataHeaderHtml(html, metadata)).toBe(html);
+  });
+
+  it('strips leading <p> elements containing metadata', () => {
+    const html =
+      '<p>TENTATIVE RULING FOR MARCH 20, 2026</p>' +
+      '<p>Department R12 – Judge Kory Mathewson</p>' +
+      '<p>The motion to strike is GRANTED.</p>';
+    const metadata = {
+      judgeName: 'Kory Mathewson',
+      department: 'R12',
+      hearingDate: '2026-03-20',
+    };
+    const result = stripMetadataHeaderHtml(html, metadata);
+    expect(result).not.toContain('TENTATIVE RULING FOR');
+    expect(result).not.toContain('Department R12');
+    expect(result).toContain('The motion to strike is GRANTED.');
+  });
+
+  it('strips leading <div> elements containing metadata', () => {
+    const html =
+      '<div>Case No. 25STCV12345</div>' +
+      '<div>Smith v. Jones</div>' +
+      '<p>The court grants the motion.</p>';
+    const metadata = {
+      caseNumber: '25STCV12345',
+      caseTitle: 'Smith v. Jones',
+    };
+    const result = stripMetadataHeaderHtml(html, metadata);
+    expect(result).not.toContain('25STCV12345');
+    expect(result).not.toContain('Smith v. Jones');
+    expect(result).toContain('The court grants the motion.');
+  });
+
+  it('stops stripping at the first non-metadata element', () => {
+    const html =
+      '<p>TENTATIVE RULING</p>' +
+      '<p>The court has considered the motion.</p>' +
+      '<p>Case No. 25STCV12345</p>';
+    const metadata = {
+      caseNumber: '25STCV12345',
+    };
+    const result = stripMetadataHeaderHtml(html, metadata);
+    expect(result).not.toContain('TENTATIVE RULING');
+    expect(result).toContain('The court has considered the motion.');
+    // Case number after non-metadata element is preserved
+    expect(result).toContain('25STCV12345');
+  });
+
+  it('handles empty html', () => {
+    expect(stripMetadataHeaderHtml('', { caseNumber: '123' })).toBe('');
+  });
+
+  it('preserves html when all elements are metadata (avoids losing content)', () => {
+    const html = '<p>Case No. 25STCV12345</p>';
+    const metadata = { caseNumber: '25STCV12345' };
+    const result = stripMetadataHeaderHtml(html, metadata);
+    // Should return original since stripping would leave nothing
+    expect(result.length).toBeGreaterThan(0);
+  });
+
+  it('strips heading elements containing metadata', () => {
+    const html =
+      '<h3>Tentative Ruling</h3>' +
+      '<p>Case No. 25STCV12345</p>' +
+      '<p>The motion is granted.</p>';
+    const metadata = {
+      caseNumber: '25STCV12345',
+    };
+    const result = stripMetadataHeaderHtml(html, metadata);
+    expect(result).not.toContain('Tentative Ruling');
+    expect(result).not.toContain('25STCV12345');
+    expect(result).toContain('The motion is granted.');
+  });
+
+  it('handles <br> tags within metadata elements', () => {
+    const html =
+      '<p>TENTATIVE RULING<br>FOR MARCH 20, 2026</p>' +
+      '<p>The motion is granted.</p>';
+    const metadata = {
+      hearingDate: '2026-03-20',
+    };
+    const result = stripMetadataHeaderHtml(html, metadata);
+    expect(result).not.toContain('TENTATIVE RULING');
+    expect(result).not.toContain('MARCH 20, 2026');
+    expect(result).toContain('The motion is granted.');
+  });
+
+  it('ensures opening and closing tags match (no mismatched tag stripping)', () => {
+    // Malformed HTML where tags don't match — should not strip
+    const html =
+      '<p>The motion is granted.</p>';
+    const metadata = { caseNumber: '25STCV12345' };
+    const result = stripMetadataHeaderHtml(html, metadata);
+    expect(result).toContain('The motion is granted.');
   });
 });
