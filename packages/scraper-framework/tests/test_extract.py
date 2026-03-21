@@ -925,6 +925,60 @@ class TestExtractCaseTitle:
 
 
 # ---------------------------------------------------------------------------
+# "In re" / "In the Matter of" patterns (#1378)
+# ---------------------------------------------------------------------------
+
+
+class TestExtractCaseTitleInRe:
+    """Tests for 'In re' / 'In the Matter of' case title extraction (#1378)."""
+
+    def test_in_re_colon(self) -> None:
+        """'In re: Name' format — probate/guardianship cases."""
+        text = "In re: Estate of John Smith\nThe petition is GRANTED."
+        result = extract_case_title(text)
+        assert result is not None
+        assert "In re" in result or "In Re" in result
+        assert "Estate of John Smith" in result
+
+    def test_in_re_no_colon(self) -> None:
+        """'In re Name' without colon."""
+        text = "In re Marriage of Garcia and Lopez\nThe court rules."
+        result = extract_case_title(text)
+        assert result is not None
+        assert "Marriage of Garcia" in result
+
+    def test_in_the_matter_of(self) -> None:
+        """'In the Matter of Name' format."""
+        text = "In the Matter of the Estate of Margaret Williams\nThe petition is GRANTED."
+        result = extract_case_title(text)
+        assert result is not None
+        assert "Matter" in result
+        assert "Margaret Williams" in result
+
+    def test_petition_of(self) -> None:
+        """'Petition of Name' format."""
+        text = "Petition of Robert Chen for Letters of Administration\nGranted."
+        result = extract_case_title(text)
+        assert result is not None
+        assert "Robert Chen" in result
+
+    def test_v_pattern_preferred_over_in_re(self) -> None:
+        """When both 'v.' and 'In re' exist, 'v.' patterns should win."""
+        text = "Case Name: Smith v. Jones\nIn re: Some Estate\n"
+        result = extract_case_title(text)
+        assert result is not None
+        assert "Smith" in result
+        assert "Jones" in result
+
+    def test_in_re_too_long_rejected(self) -> None:
+        """Very long 'In re' text should be rejected."""
+        long_name = "A" * 200
+        text = f"In re: {long_name}\nGranted."
+        result = extract_case_title(text)
+        assert result is None
+
+
+# ---------------------------------------------------------------------------
 # Motion text detection (#1245)
 # ---------------------------------------------------------------------------
 

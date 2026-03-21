@@ -585,17 +585,41 @@ _DEPT_HEADER_BOILERPLATE_TITLE_RE = re.compile(
     re.IGNORECASE,
 )
 
+# ---------------------------------------------------------------------------
+# "In re" / "In the Matter of" / "Petition of" patterns (#1378)
+# ---------------------------------------------------------------------------
+# Non-adversarial cases (probate, guardianship, family law) that lack
+# "Plaintiff v. Defendant" structure.  Used as a fallback after all
+# "v." patterns have been tried.
+_IN_RE_PATTERNS: list[re.Pattern[str]] = [
+    # "In re: Name" or "In re Name" (with or without colon)
+    re.compile(
+        r"(?:^|\n)\s*(?P<title>(?:In\s+re:?\s+|In\s+the\s+Matter\s+of\s+)"
+        r"[A-Z][^\n]{2,})",
+        re.IGNORECASE | re.MULTILINE,
+    ),
+    # "Petition of Name ..."
+    re.compile(
+        r"(?:^|\n)\s*(?P<title>Petition\s+of\s+[A-Z][^\n]{2,})",
+        re.IGNORECASE | re.MULTILINE,
+    ),
+]
+
 
 def extract_case_title(ruling_text: str) -> str | None:
     """Extract a case title from ruling text using regex patterns.
 
-    Looks for "Plaintiff v. Defendant" patterns in the text.
+    Looks for "Plaintiff v. Defendant" patterns in the text first, then
+    falls back to "In re" / "In the Matter of" / "Petition of" patterns
+    for non-adversarial cases (#1378).
+
     Returns the title in title case, or ``None`` if no pattern matches.
 
     Rejects titles that contain department header boilerplate (#1244).
     Rejects matches that look like motion descriptions rather than case
     titles (#1245) — e.g. "Granting Motion To v. Disqualify Plaintiff".
     """
+    # Try "v." patterns first (most common case title format)
     for pattern in _CASE_TITLE_PATTERNS:
         # Use finditer to check all matches for this pattern, not just the
         # first.  If the first match is a motion description, we skip it and
@@ -625,6 +649,19 @@ def extract_case_title(ruling_text: str) -> str | None:
             title = title.rstrip(".,;: ")
             if len(title) >= 5:
                 return title
+
+    # Fallback: "In re" / "In the Matter of" / "Petition of" (#1378)
+    for pattern in _IN_RE_PATTERNS:
+        m = pattern.search(ruling_text)
+        if m is not None:
+            title = m.group("title").strip()
+            # Collapse whitespace
+            title = " ".join(title.split())
+            # Strip trailing punctuation
+            title = title.rstrip(".,;: ")
+            if 5 <= len(title) <= 150:
+                return title
+
     return None
 
 
