@@ -16,6 +16,9 @@ Usage:
     # Apply changes
     scripts/run-py.sh scripts/backfill_split_rulings.py --apply
 
+    # Check for documents that have S3 content but no ruling records
+    scripts/run-py.sh scripts/backfill_split_rulings.py --check-missing
+
 Options:
     --apply           Execute changes (default is dry-run).
     --batch-size N    Number of rulings to process per batch (default: 50).
@@ -23,6 +26,28 @@ Options:
     --county NAME     Restrict to a specific county (default: all counties with splitters).
     --department CODE Restrict to a specific department (e.g. N18).
     --min-length N    Minimum ruling_text length to consider (default: 5000).
+    --check-missing   Report documents with S3 content but no ruling records,
+                      then exit. Use this to identify documents that need
+                      re-ingestion before splitting (see below).
+
+When ruling records have been deleted:
+    This script only operates on *existing* ruling records. If rulings were
+    previously deleted (e.g. during a cleanup or verification step), this script
+    will find 0 candidates and do nothing.
+
+    To handle deleted rulings, use the two-step workflow:
+
+    Step 1 — Re-ingest from S3 to recreate ruling records:
+        scripts/ecs-run-task.sh scripts/reingest_from_s3.py -- \
+            --county "Orange" --full-reparse
+
+    Step 2 — Run this script to split the re-created multi-case rulings:
+        scripts/ecs-run-task.sh scripts/backfill_split_rulings.py -- \
+            --county Orange --apply
+
+    Use --check-missing to identify which documents need re-ingestion before
+    running the two-step workflow. It reports documents that have S3 content
+    archived but no corresponding ruling records in the database.
 """
 
 # venv: scraper-framework
@@ -146,6 +171,141 @@ CANDIDATE_QUERY = """
 SPLITTABLE_COUNTIES = [
     ("CA", "Orange"),
 ]
+
+
+# ---------------------------------------------------------------------------
+# Missing-ruling detection (--check-missing)
+# ---------------------------------------------------------------------------
+
+MISSING_RULINGS_QUERY = """
+    SELECT
+        d.id AS document_id,
+        d.s3_key,
+        d.s3_bucket,
+        d.source_url,
+        d.scraper_id,
+        d.captured_at,
+        d.hearing_date,
+        ct.state,
+        ct.county,
+        c.case_number,
+        c.case_title
+    FROM documents d
+    JOIN courts ct ON ct.id = d.court_id
+    LEFT JOIN cases c ON c.id = d.case_id
+    LEFT JOIN rulings r ON r.document_id = d.id
+    WHERE d.status = 'active'
+    AND d.s3_key IS NOT NULL
+    AND r.id IS NULL
+    {county_filter}
+    ORDER BY d.captured_at DESC
+    LIMIT %s
+"""
+
+
+@dataclass
+class MissingRulingDocument:
+    """A document that has S3 content but no ruling records."""
+
+    document_id: str
+    s3_key: str
+    s3_bucket: str | None
+    source_url: str
+    scraper_id: str
+    captured_at: str
+    hearing_date: str | None
+    state: str
+    county: str
+    case_number: str | None
+    case_title: str | None
+
+
+def find_missing_ruling_documents(
+    conn: psycopg.Connection,
+    county: str | None = None,
+    limit: int = 100,
+) -> list[MissingRulingDocument]:
+    """Find documents with S3 content but no ruling records.
+
+    These are documents where the ruling was likely deleted and needs
+    re-ingestion from S3 before the split backfill can process them.
+    """
+    if county:
+        county_filter = "AND ct.county = %s"
+        params: list[Any] = [county, limit]
+    else:
+        counties = [c[1] for c in SPLITTABLE_COUNTIES]
+        placeholders = ", ".join(["%s"] * len(counties))
+        county_filter = f"AND ct.county IN ({placeholders})"
+        params = list(counties) + [limit]
+
+    query = MISSING_RULINGS_QUERY.format(county_filter=county_filter)
+
+    with conn.cursor() as cur:
+        cur.execute(query, params)
+        rows = cur.fetchall()
+
+    return [
+        MissingRulingDocument(
+            document_id=str(row[0]),
+            s3_key=row[1] or "",
+            s3_bucket=row[2],
+            source_url=row[3] or "",
+            scraper_id=row[4] or "",
+            captured_at=str(row[5]) if row[5] else "",
+            hearing_date=str(row[6]) if row[6] else None,
+            state=row[7],
+            county=row[8],
+            case_number=row[9],
+            case_title=row[10],
+        )
+        for row in rows
+    ]
+
+
+def report_missing_rulings(
+    dsn: str,
+    county: str | None = None,
+    limit: int = 100,
+) -> int:
+    """Report documents with S3 content but no ruling records.
+
+    Returns the number of missing-ruling documents found.
+    """
+    with psycopg.connect(dsn) as conn:
+        docs = find_missing_ruling_documents(conn, county=county, limit=limit)
+
+    if not docs:
+        logger.info("No documents found with missing ruling records.")
+        return 0
+
+    logger.info(
+        "Found %d document(s) with S3 content but no ruling records:",
+        len(docs),
+    )
+    for doc in docs:
+        logger.info(
+            "  %s  county=%s  case=%s  hearing=%s  captured=%s  s3=%s",
+            doc.document_id,
+            doc.county,
+            doc.case_number or "?",
+            doc.hearing_date or "?",
+            doc.captured_at or "?",
+            doc.s3_key,
+        )
+
+    logger.info("")
+    logger.info("To re-ingest these documents, run:")
+    counties_found = sorted({doc.county for doc in docs})
+    for c in counties_found:
+        logger.info(
+            '  scripts/ecs-run-task.sh scripts/reingest_from_s3.py -- --county "%s" --full-reparse',
+            c,
+        )
+    logger.info("")
+    logger.info("Then re-run this script with --apply to split them.")
+
+    return len(docs)
 
 
 def build_candidate_query(
@@ -735,12 +895,24 @@ def main() -> None:
         default=5000,
         help="Minimum ruling_text length to consider (default: 5000).",
     )
+    parser.add_argument(
+        "--check-missing",
+        action="store_true",
+        help=(
+            "Report documents with S3 content but no ruling records, then exit. "
+            "Use this to identify documents needing re-ingestion before splitting."
+        ),
+    )
     args = parser.parse_args()
 
     dsn = os.environ.get("DATABASE_URL")
     if not dsn:
         logger.error("DATABASE_URL environment variable is required")
         sys.exit(1)
+
+    if args.check_missing:
+        count = report_missing_rulings(dsn, county=args.county, limit=args.limit or 100)
+        sys.exit(0 if count == 0 else 1)
 
     dry_run = not args.apply
     if dry_run:
