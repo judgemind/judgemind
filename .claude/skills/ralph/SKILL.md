@@ -101,10 +101,16 @@ Spawn a **worker subagent** (using the Agent tool) with this prompt structure:
 >    - Python: `.venv/bin/ruff check src/ tests/`, `.venv/bin/ruff format --check src/ tests/`, `.venv/bin/pytest tests/ -v --tb=short`
 >    - TypeScript: `npm run lint`, `npm run typecheck`, `npm test`
 > 5. Fix any failures. Auto-fix lint with `.venv/bin/ruff check --fix src/ tests/` then `.venv/bin/ruff format src/ tests/`.
-> 6. **Self-verify acceptance criteria before completing.** Read `{worktree}/tmp/ralph/task.md` and find every acceptance criterion (the `- [ ]` checkboxes). For EACH criterion, describe how your implementation satisfies it — reference the specific file, function, or test. If any criterion cannot be verified locally (e.g., requires deployed data), note it as "requires post-deploy verification." If any criterion is NOT addressed by your implementation, do NOT write COMPLETE — instead, note the gap and continue implementing.
-> 7. Write your acceptance criteria self-check to `{worktree}/tmp/ralph/acceptance-check.txt` with a table mapping each criterion to its evidence.
-> 8. When all checks pass AND all locally-verifiable acceptance criteria are addressed, write "COMPLETE" to `{worktree}/tmp/ralph/work-status.txt`.
-> 9. If you cannot get checks passing after reasonable effort, write "STUCK" to `work-status.txt` and describe what's failing in `{worktree}/tmp/ralph/stuck-reason.txt`.
+> 6. **Run diff-coverage check for every Python package you touched** (catches CI diff-coverage failures locally):
+>    - Install diff-cover if not already available: `.venv/bin/pip install diff-cover --quiet`
+>    - Ensure pytest generated `coverage.xml` (re-run with `--cov --cov-report=xml` if needed): `.venv/bin/pytest tests/ -v --tb=short --cov=src --cov-report=xml`
+>    - Run: `.venv/bin/diff-cover coverage.xml --compare-branch=origin/main --fail-under=90`
+>    - If diff-coverage is below 90%, add tests for the uncovered lines before proceeding. The output shows exactly which lines lack coverage — write tests that exercise those code paths.
+>    - For TypeScript packages, run: `npx diff-cover coverage/lcov.info --compare-branch=origin/main --fail-under=90` (install with `npm install diff-cover` if needed).
+> 7. **Self-verify acceptance criteria before completing.** Read `{worktree}/tmp/ralph/task.md` and find every acceptance criterion (the `- [ ]` checkboxes). For EACH criterion, describe how your implementation satisfies it — reference the specific file, function, or test. If any criterion cannot be verified locally (e.g., requires deployed data), note it as "requires post-deploy verification." If any criterion is NOT addressed by your implementation, do NOT write COMPLETE — instead, note the gap and continue implementing.
+> 8. Write your acceptance criteria self-check to `{worktree}/tmp/ralph/acceptance-check.txt` with a table mapping each criterion to its evidence.
+> 9. When all checks pass (including diff-coverage >= 90%) AND all locally-verifiable acceptance criteria are addressed, write "COMPLETE" to `{worktree}/tmp/ralph/work-status.txt`.
+> 10. If you cannot get checks passing after reasonable effort, write "STUCK" to `work-status.txt` and describe what's failing in `{worktree}/tmp/ralph/stuck-reason.txt`.
 >
 > Rules:
 > - All work happens in `{worktree}`. All temp files go in `{worktree}/tmp/`.
