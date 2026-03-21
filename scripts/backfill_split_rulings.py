@@ -17,11 +17,12 @@ Usage:
     scripts/run-py.sh scripts/backfill_split_rulings.py --apply
 
 Options:
-    --apply         Execute changes (default is dry-run).
-    --batch-size N  Number of rulings to process per batch (default: 50).
-    --limit N       Maximum total rulings to process (default: unlimited).
-    --county NAME   Restrict to a specific county (default: all counties with splitters).
-    --min-length N  Minimum ruling_text length to consider (default: 5000).
+    --apply           Execute changes (default is dry-run).
+    --batch-size N    Number of rulings to process per batch (default: 50).
+    --limit N         Maximum total rulings to process (default: unlimited).
+    --county NAME     Restrict to a specific county (default: all counties with splitters).
+    --department CODE Restrict to a specific department (e.g. N18).
+    --min-length N    Minimum ruling_text length to consider (default: 5000).
 """
 
 # venv: scraper-framework
@@ -136,6 +137,7 @@ CANDIDATE_QUERY = """
     WHERE LENGTH(r.ruling_text) >= %s
     AND (r.created_at, r.id) > (%s, %s)
     {county_filter}
+    {department_filter}
     ORDER BY r.created_at, r.id
     LIMIT %s
 """
@@ -146,20 +148,39 @@ SPLITTABLE_COUNTIES = [
 ]
 
 
-def build_candidate_query(county: str | None = None) -> tuple[str, bool]:
-    """Build the candidate query with optional county filter.
+def build_candidate_query(
+    county: str | None = None,
+    department: str | None = None,
+) -> tuple[str, bool, bool]:
+    """Build the candidate query with optional county and department filters.
 
-    Returns (query_string, has_county_param) — if has_county_param is True,
-    the caller must include county as an extra parameter.
+    Returns (query_string, has_county_param, has_department_param).
+    If has_county_param is True, the caller must include county as an extra
+    parameter.  If has_department_param is True, the caller must include
+    department as an extra parameter.
     """
     if county:
-        county_filter = "AND ct.county = %s"
-        return CANDIDATE_QUERY.format(county_filter=county_filter), True
-    # Default: restrict to counties that have splitters.
-    counties = [c[1] for c in SPLITTABLE_COUNTIES]
-    placeholders = ", ".join(["%s"] * len(counties))
-    county_filter = f"AND ct.county IN ({placeholders})"
-    return CANDIDATE_QUERY.format(county_filter=county_filter), False
+        county_part = "AND ct.county = %s"
+        has_county = True
+    else:
+        # Default: restrict to counties that have splitters.
+        counties = [c[1] for c in SPLITTABLE_COUNTIES]
+        placeholders = ", ".join(["%s"] * len(counties))
+        county_part = f"AND ct.county IN ({placeholders})"
+        has_county = False
+
+    if department:
+        dept_part = "AND r.department = %s"
+        has_dept = True
+    else:
+        dept_part = ""
+        has_dept = False
+
+    query = CANDIDATE_QUERY.format(
+        county_filter=county_part,
+        department_filter=dept_part,
+    )
+    return query, has_county, has_dept
 
 
 def fetch_candidates(
@@ -168,15 +189,18 @@ def fetch_candidates(
     min_length: int,
     county: str | None,
     cursor: tuple[datetime, str],
+    department: str | None = None,
 ) -> list[CandidateRuling]:
     """Fetch one batch of candidate rulings for splitting."""
-    query, has_single_county = build_candidate_query(county)
+    query, has_single_county, has_dept = build_candidate_query(county, department)
 
     params: list[Any] = [min_length, cursor[0], cursor[1]]
     if has_single_county:
         params.append(county)
     else:
         params.extend(c[1] for c in SPLITTABLE_COUNTIES)
+    if has_dept:
+        params.append(department)
     params.append(batch_size)
 
     with conn.cursor() as cur:
@@ -525,12 +549,20 @@ def process_batch(
     county: str | None,
     cursor: tuple[datetime, str],
     dry_run: bool,
+    department: str | None = None,
 ) -> tuple[int, int, int, list[SplitAction], tuple[datetime, str]]:
     """Process one batch of candidate rulings.
 
     Returns (candidates_checked, split_count, new_rulings_count, actions, next_cursor).
     """
-    candidates = fetch_candidates(conn, batch_size, min_length, county, cursor)
+    candidates = fetch_candidates(
+        conn,
+        batch_size,
+        min_length,
+        county,
+        cursor,
+        department=department,
+    )
     if not candidates:
         return 0, 0, 0, [], cursor
 
@@ -586,6 +618,7 @@ def run_backfill(
     limit: int | None = None,
     min_length: int = 5000,
     county: str | None = None,
+    department: str | None = None,
     dry_run: bool = True,
 ) -> dict[str, int]:
     """Run the full backfill. Returns summary stats."""
@@ -605,7 +638,13 @@ def run_backfill(
                 effective_batch = min(batch_size, remaining)
 
             checked, split_count, new_rulings, actions, cursor = process_batch(
-                conn, effective_batch, min_length, county, cursor, dry_run
+                conn,
+                effective_batch,
+                min_length,
+                county,
+                cursor,
+                dry_run,
+                department=department,
             )
             total_checked += checked
             total_split += split_count
@@ -685,6 +724,12 @@ def main() -> None:
         help="Restrict to a specific county.",
     )
     parser.add_argument(
+        "--department",
+        type=str,
+        default=None,
+        help="Restrict to a specific department (e.g. N18).",
+    )
+    parser.add_argument(
         "--min-length",
         type=int,
         default=5000,
@@ -709,6 +754,7 @@ def main() -> None:
         limit=args.limit,
         min_length=args.min_length,
         county=args.county,
+        department=args.department,
         dry_run=dry_run,
     )
 
