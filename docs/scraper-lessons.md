@@ -8,6 +8,26 @@ Common issues found during audits and fixes. Consult this when writing or review
 - **Use `re.MULTILINE`** when anchoring with `^` or `$` in multi-line PDF text.
 - **Normalize whitespace before matching.** PDFs often have extra spaces, line breaks mid-word, or non-breaking spaces (`\xa0`). Use `" ".join(text.split())` on extracted groups.
 
+## Regex Patterns for Natural Language
+
+When writing regex for legal text, natural language variants are easy to miss. Use this checklist before shipping any regex that matches human-written text:
+
+### Checklist
+
+1. **Singular/plural.** Always use optional suffixes: `rulings?`, `orders?`, `motions?`, `departments?`. Never assume the text uses only one form.
+2. **Abbreviations and alternate spellings.** Courts use abbreviations inconsistently: `dept` vs `department`, `no.` vs `number`, `vs.` vs `v.`, `assn` vs `association`. Use alternation groups: `(?:dept|department)`.
+3. **Case variations.** Court documents appear in ALL CAPS, Title Case, and lowercase — often within the same page. Always use `re.IGNORECASE` (or the `(?i)` inline flag) for any pattern matching natural language. Use `\b` word boundaries to prevent false matches.
+4. **Optional punctuation and whitespace.** Periods, colons, and hyphens are inconsistent: `Case No.`, `Case No`, `Case Number`. Use optional markers: `no\.?`, `\s*`, `[-\s]?`.
+5. **Word boundaries.** Use `\b` to avoid matching substrings — `\bruling\b` prevents matching "overruling".
+
+### Case study: "Tentative Ruling" vs "Tentative Rulings"
+
+In #1247, a header-stripping regex used `tentative\s+ruling\b` to remove page headers from ruling text. This matched "Tentative Ruling" but not "Tentative Rulings" — the plural form that some courts use. The bug was not caught until post-deploy verification, requiring a follow-up PR (#1297) to fix.
+
+The fix was simple — `tentative\s+rulings?\b` — but the missed variant caused incorrect ruling text to be served to users until the fix deployed.
+
+**Lesson:** When writing regex for any term that appears in court documents, always grep existing fixtures and production data for variants before committing to a pattern. A 30-second search for `tentative ruling` across fixtures would have revealed both forms immediately.
+
 ## Field Extraction
 
 - **The ingestion worker gates ruling rows on `hearing_date`.** If a scraper doesn't extract `hearing_date`, no ruling row is created — which means judge, outcome, motion_type are all lost too. Hearing date extraction is the single most important field.
