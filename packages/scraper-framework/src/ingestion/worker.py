@@ -710,6 +710,20 @@ class IngestionWorker:
             )
 
         # ------------------------------------------------------------------
+        # Warn when case_title is still NULL after all extraction attempts
+        # — the case will be stored without a title (#1359).
+        # ------------------------------------------------------------------
+        if not case_title:
+            logger.warning(
+                "No case_title extracted after all attempts — case will have NULL title",
+                extra={
+                    "document_id": document_id,
+                    "case_number": case_number,
+                    "scraper_id": scraper_id,
+                },
+            )
+
+        # ------------------------------------------------------------------
         # LLM-powered ruling text formatting (opt-in via ENABLE_RULING_FORMATTING)
         # ------------------------------------------------------------------
         ruling_text_html: str | None = None

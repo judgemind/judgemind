@@ -3752,3 +3752,136 @@ def test_process_event_warns_on_raw_pdf_binary_with_empty_extraction(
         f"Expected warning about PDF with no ruling text after raw binary extraction, "
         f"got: {[r.getMessage() for r in caplog.records]}"  # type: ignore[attr-defined]
     )
+
+
+# ---------------------------------------------------------------------------
+# Null case_title warning (#1359)
+# ---------------------------------------------------------------------------
+
+
+@patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
+@patch("ingestion.worker.psycopg")
+def test_process_event_warns_on_null_case_title(
+    mock_psycopg: MagicMock,
+    mock_resolve_judge: MagicMock,
+    caplog: object,
+) -> None:
+    """When case_title remains None after all extraction attempts,
+    the worker should log a warning (#1359)."""
+    worker, os_mock = _make_worker()
+
+    mock_conn, mock_cur = _make_mock_conn()
+    mock_psycopg.connect.return_value = mock_conn
+    mock_cur.fetchone.side_effect = [
+        ("court-uuid-1",),  # upsert_court
+        ("case-uuid-1",),  # upsert_case
+        (True,),  # insert_document
+    ]
+    mock_cur.rowcount = 1
+
+    # Ruling text that does NOT contain any parseable party names or title
+    event = _make_event(
+        case_title=None,
+        ruling_text="This is a ruling with no party names or case title.",
+    )
+    worker.process_event(event)
+
+    import logging as _logging
+
+    warning_records = [
+        r
+        for r in caplog.records  # type: ignore[attr-defined]
+        if r.levelno >= _logging.WARNING and "NULL title" in r.getMessage()
+    ]
+    assert len(warning_records) >= 1, (
+        f"Expected warning about NULL case_title, got: {[r.getMessage() for r in caplog.records]}"  # type: ignore[attr-defined]
+    )
+
+
+@patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
+@patch("ingestion.worker.psycopg")
+def test_process_event_no_warning_when_case_title_present(
+    mock_psycopg: MagicMock,
+    mock_resolve_judge: MagicMock,
+    caplog: object,
+) -> None:
+    """When case_title is provided, no null-title warning should fire."""
+    worker, os_mock = _make_worker()
+
+    mock_conn, mock_cur = _make_mock_conn()
+    mock_psycopg.connect.return_value = mock_conn
+    mock_cur.rowcount = 1
+
+    event = _make_event(
+        case_title="Smith v. Jones",
+        ruling_text="The motion for summary judgment is GRANTED.",
+    )
+    # "Smith v. Jones" triggers party extraction from caption -> batch_upsert_parties
+    mock_cur.fetchone.side_effect = [
+        ("court-uuid-1",),  # upsert_court
+        ("case-uuid-1",),  # upsert_case
+        (True,),  # insert_document
+        ("party-uuid-1",),  # batch_upsert_parties: Smith
+        ("party-uuid-2",),  # batch_upsert_parties: Jones
+    ]
+    mock_cur.fetchall.return_value = []
+    mock_cur.nextset.side_effect = [True, False]
+    worker.process_event(event)
+
+    import logging as _logging
+
+    warning_records = [
+        r
+        for r in caplog.records  # type: ignore[attr-defined]
+        if r.levelno >= _logging.WARNING and "NULL title" in r.getMessage()
+    ]
+    assert len(warning_records) == 0, "No warning expected when case_title is present"
+
+
+@patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
+@patch("ingestion.worker.psycopg")
+def test_process_event_no_warning_when_case_title_extracted_from_text(
+    mock_psycopg: MagicMock,
+    mock_resolve_judge: MagicMock,
+    caplog: object,
+) -> None:
+    """When case_title is extracted from ruling text via regex fallback,
+    no null-title warning should fire."""
+    worker, os_mock = _make_worker()
+
+    mock_conn, mock_cur = _make_mock_conn()
+    mock_psycopg.connect.return_value = mock_conn
+    mock_cur.rowcount = 1
+
+    # Ruling text that contains an extractable case title via regex fallback
+    # Use "Case Name:" format which extract.py's extract_case_title() can parse
+    event = _make_event(
+        case_title=None,
+        ruling_text=(
+            "Case Name: Buenaventura v. City Of Pasadena\n"
+            "Case Number: 23STCV12345\n"
+            "The motion for summary judgment is GRANTED."
+        ),
+    )
+    # Regex fallback will extract title and then parties from caption
+    mock_cur.fetchone.side_effect = [
+        ("court-uuid-1",),  # upsert_court
+        ("case-uuid-1",),  # upsert_case
+        (True,),  # insert_document
+        ("party-uuid-1",),  # batch_upsert_parties: Buenaventura
+        ("party-uuid-2",),  # batch_upsert_parties: City Of Pasadena
+    ]
+    mock_cur.fetchall.return_value = []
+    mock_cur.nextset.side_effect = [True, False]
+    worker.process_event(event)
+
+    import logging as _logging
+
+    warning_records = [
+        r
+        for r in caplog.records  # type: ignore[attr-defined]
+        if r.levelno >= _logging.WARNING and "NULL title" in r.getMessage()
+    ]
+    assert len(warning_records) == 0, (
+        "No warning expected when case_title is extracted from ruling text"
+    )
