@@ -116,25 +116,48 @@ def _multi_case_splitter(event_data: dict[str, Any]) -> list[SplitResult]:
 class TestBuildCandidateQuery:
     def test_with_specific_county(self) -> None:
         """When county is specified, query includes single county filter."""
-        query, has_single = build_candidate_query(county="Orange")
+        query, has_single, _has_dept = build_candidate_query(county="Orange")
         assert has_single is True
         assert "ct.county = %s" in query
 
     def test_without_county(self) -> None:
         """When no county is specified, query includes IN clause for all splittable counties."""
-        query, has_single = build_candidate_query(county=None)
+        query, has_single, _has_dept = build_candidate_query(county=None)
         assert has_single is False
         assert "ct.county IN" in query
 
     def test_query_orders_by_cursor(self) -> None:
         """Query uses cursor-based pagination with (created_at, id) ordering."""
-        query, _ = build_candidate_query()
+        query, _, _ = build_candidate_query()
         assert "ORDER BY r.created_at, r.id" in query
 
     def test_query_has_length_filter(self) -> None:
         """Query filters by minimum ruling_text length."""
-        query, _ = build_candidate_query()
+        query, _, _ = build_candidate_query()
         assert "LENGTH(r.ruling_text)" in query
+
+    def test_with_department(self) -> None:
+        """When department is specified, query includes department filter."""
+        query, _has_county, has_dept = build_candidate_query(department="N18")
+        assert has_dept is True
+        assert "r.department = %s" in query
+
+    def test_without_department(self) -> None:
+        """When no department is specified, query has no department filter."""
+        query, _has_county, has_dept = build_candidate_query(department=None)
+        assert has_dept is False
+        assert "r.department = %s" not in query
+
+    def test_with_county_and_department(self) -> None:
+        """Both county and department filters can be applied together."""
+        query, has_county, has_dept = build_candidate_query(
+            county="Orange",
+            department="N18",
+        )
+        assert has_county is True
+        assert has_dept is True
+        assert "ct.county = %s" in query
+        assert "r.department = %s" in query
 
 
 # ---------------------------------------------------------------------------
