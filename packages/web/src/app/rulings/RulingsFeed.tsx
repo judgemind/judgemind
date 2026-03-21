@@ -241,7 +241,7 @@ export function RulingsFeed() {
                   <div className="min-w-0 flex-1">
                     {node.case ? (
                       <Link
-                        href={`/cases/${node.case.id}`}
+                        href={`/rulings/${node.id}`}
                         className="block truncate font-medium text-slate-900 hover:text-brand-600 dark:text-slate-100 dark:hover:text-brand-400"
                       >
                         {node.case.caseNumber}
