@@ -20,6 +20,8 @@ from courts.ca.pdf_link_scraper import _extract_pdf_text
 from ingestion.oc_splitter import (
     _clean_case_title,
     _extract_case_title_from_entry,
+    _extract_leading_name_fragment,
+    _extract_multiline_case_title,
     _is_boilerplate_only,
     _split_case_number_based,
     _split_north,
@@ -1590,6 +1592,152 @@ class TestNorthN18Fixture:
         }
         results = split_document(event)
         assert len(results) >= 8
+
+    def test_n18_case_titles_are_clean(self, n18_text: str) -> None:
+        """N18 case titles should be clean 'X vs Y' format, not garbled (#1331).
+
+        Before the fix, the two-column PDF layout caused ruling text to leak
+        into case titles (e.g. "Suarez vs. seeking relief from the Order...").
+        After the fix, titles should be clean names like "Suarez vs Lopez".
+        """
+        results = _split_case_number_based(n18_text)
+        for r in results:
+            title = r.case_title or ""
+            # Titles should not contain ruling-text keywords.
+            assert "granted" not in title.lower(), (
+                f"Case title contains ruling text: {title!r} (case_number={r.case_number})"
+            )
+            assert "denied" not in title.lower(), (
+                f"Case title contains ruling text: {title!r} (case_number={r.case_number})"
+            )
+            assert "motion" not in title.lower(), (
+                f"Case title contains ruling text: {title!r} (case_number={r.case_number})"
+            )
+            # Titles should be reasonably short (not garbled with ruling text).
+            assert len(title) < 60, (
+                f"Case title too long (likely garbled): {title!r} (case_number={r.case_number})"
+            )
+
+    def test_n18_suarez_title_is_clean(self, n18_text: str) -> None:
+        """Suarez entry should have a clean title, not garbled ruling text."""
+        results = _split_case_number_based(n18_text)
+        suarez = [r for r in results if "Suarez" in (r.case_title or "")]
+        assert len(suarez) == 1
+        title = suarez[0].case_title
+        assert title is not None
+        assert "Lopez" in title, f"Title should contain 'Lopez': {title!r}"
+        assert "seeking" not in title, f"Title has ruling text: {title!r}"
+        assert "relief" not in title, f"Title has ruling text: {title!r}"
+
+    def test_n18_zahab_title_is_clean(self, n18_text: str) -> None:
+        """Zahab entry should include defendant name Myrick."""
+        results = _split_case_number_based(n18_text)
+        zahab = [r for r in results if "Zahab" in (r.case_title or "")]
+        assert len(zahab) == 1
+        title = zahab[0].case_title
+        assert title is not None
+        assert "Myrick" in title, f"Title should contain 'Myrick': {title!r}"
+
+    def test_n18_kamell_title_is_clean(self, n18_text: str) -> None:
+        """Kamell entry should include defendant name Habashi."""
+        results = _split_case_number_based(n18_text)
+        kamell = [r for r in results if "Kamell" in (r.case_title or "")]
+        assert len(kamell) == 1
+        title = kamell[0].case_title
+        assert title is not None
+        assert "Habashi" in title, f"Title should contain 'Habashi': {title!r}"
+
+
+# ---------------------------------------------------------------------------
+# Multi-line case title extraction tests (#1331)
+# ---------------------------------------------------------------------------
+
+
+class TestExtractLeadingNameFragment:
+    """Tests for _extract_leading_name_fragment."""
+
+    def test_short_name_fragment(self) -> None:
+        assert _extract_leading_name_fragment("Lopez") == "Lopez"
+
+    def test_short_name_with_vs(self) -> None:
+        result = _extract_leading_name_fragment("Zahab vs. Case Management Conference")
+        assert result is not None
+        assert "Zahab vs" in result
+        assert "Management" not in result
+
+    def test_vs_with_defendant_name(self) -> None:
+        result = _extract_leading_name_fragment("Guo vs. Zhang Case Management Conference")
+        assert result is not None
+        assert "Zhang" in result
+        assert "Management" not in result
+
+    def test_ruling_text_line_returns_none(self) -> None:
+        assert _extract_leading_name_fragment("The motion is granted.") is None
+
+    def test_plaintiff_line_returns_none(self) -> None:
+        assert _extract_leading_name_fragment("Plaintiff filed a motion to compel.") is None
+
+    def test_defendant_line_returns_none(self) -> None:
+        assert _extract_leading_name_fragment("Defendant Bo Zhang's motion to dismiss...") is None
+
+    def test_empty_line_returns_none(self) -> None:
+        assert _extract_leading_name_fragment("") is None
+
+    def test_blank_line_returns_none(self) -> None:
+        assert _extract_leading_name_fragment("   ") is None
+
+
+class TestExtractMultilineCaseTitle:
+    """Tests for _extract_multiline_case_title."""
+
+    def test_two_line_case_name(self) -> None:
+        """Case name split across two continuation lines."""
+        lines = [
+            "2. 2024-1389826 The motion by Plaintiff Andres Suarez for an order",
+            "Suarez vs. seeking relief from the Order of dismissal",
+            "Lopez 2025, is granted.",
+            "As an initial matter, the Court notes...",
+        ]
+        result = _extract_multiline_case_title(lines, 0, len(lines))
+        assert result is not None
+        assert "Suarez" in result
+        assert "Lopez" in result
+        assert "seeking" not in result
+
+    def test_single_line_with_vs_and_defendant(self) -> None:
+        """Case name on a single continuation line with complete vs."""
+        lines = [
+            "10. 2023-1356203",
+            "Guo vs. Zhang Case Management Conference",
+            "Defendant Bo Zhang's motion to dismiss...",
+        ]
+        result = _extract_multiline_case_title(lines, 0, len(lines))
+        assert result is not None
+        assert "Guo" in result
+        assert "Zhang" in result
+        assert "Defendant" not in result
+
+    def test_no_vs_returns_none(self) -> None:
+        """Lines without 'vs' produce no title."""
+        lines = [
+            "1. 2024-1234567 Motion for summary judgment",
+            "The court grants the motion.",
+        ]
+        assert _extract_multiline_case_title(lines, 0, len(lines)) is None
+
+    def test_vs_with_separate_defendant_line(self) -> None:
+        """Defendant name on a separate short line after the vs line."""
+        lines = [
+            "12. 2022-1264619",
+            "Kamell vs. Case Management Conference",
+            "Habashi",
+            "Plaintiff Rafik Y. Kamell's Motion...",
+        ]
+        result = _extract_multiline_case_title(lines, 0, len(lines))
+        assert result is not None
+        assert "Kamell" in result
+        assert "Habashi" in result
+        assert "Management" not in result
 
 
 # ---------------------------------------------------------------------------
