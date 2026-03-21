@@ -230,3 +230,116 @@ def test_document_id_is_valid_uuid() -> None:
     # Should parse as a valid UUID without raising
     parsed = uuid.UUID(captured[0].document_id)
     assert parsed.version == 5
+
+
+# ---------------------------------------------------------------------------
+# PDF empty text warning (#1335)
+# ---------------------------------------------------------------------------
+
+
+def test_process_document_warns_on_empty_pdf_text(capsys: object) -> None:
+    """When a PDF document has non-empty raw_content but parse_document yields
+    no ruling_text, _process_document should log a warning about a possible
+    image-only PDF.
+    """
+    config = _make_config()
+    pdf_bytes = b"%PDF-1.4 fake image-only content"
+
+    doc = CapturedDocument(
+        scraper_id=config.scraper_id,
+        state=config.state,
+        county=config.county,
+        court=config.court,
+        source_url="https://example.com/ruling.pdf",
+        capture_timestamp=datetime.utcnow(),
+        content_format=ContentFormat.PDF,
+        raw_content=pdf_bytes,
+        content_hash="",
+    )
+
+    class EmptyPdfScraper(BaseScraper):
+        def fetch_documents(self) -> list[CapturedDocument]:
+            return [doc]
+
+        def parse_document(self, d: CapturedDocument) -> CapturedDocument:
+            # Simulate image-only PDF: text extraction returns empty
+            d.ruling_text = ""
+            return d
+
+    scraper = EmptyPdfScraper(config=config)
+    health = scraper.run()
+
+    assert health.success is True
+    assert health.records_captured == 1
+
+    # structlog writes to stdout — verify the warning message appeared
+    captured = capsys.readouterr()  # type: ignore[attr-defined]
+    assert "image-only PDF" in captured.out, (
+        f"Expected warning about image-only PDF in stdout, got: {captured.out!r}"
+    )
+    assert "[warning" in captured.out.lower()
+
+
+def test_process_document_no_warning_when_pdf_has_text(capsys: object) -> None:
+    """When a PDF document has extracted ruling_text, no warning should be logged."""
+    config = _make_config()
+    pdf_bytes = b"%PDF-1.4 real content with text"
+
+    doc = CapturedDocument(
+        scraper_id=config.scraper_id,
+        state=config.state,
+        county=config.county,
+        court=config.court,
+        source_url="https://example.com/ruling.pdf",
+        capture_timestamp=datetime.utcnow(),
+        content_format=ContentFormat.PDF,
+        raw_content=pdf_bytes,
+        content_hash="",
+    )
+
+    class TextPdfScraper(BaseScraper):
+        def fetch_documents(self) -> list[CapturedDocument]:
+            return [doc]
+
+        def parse_document(self, d: CapturedDocument) -> CapturedDocument:
+            d.ruling_text = "The motion is GRANTED."
+            return d
+
+    scraper = TextPdfScraper(config=config)
+    health = scraper.run()
+
+    assert health.success is True
+
+    captured = capsys.readouterr()  # type: ignore[attr-defined]
+    assert "image-only PDF" not in captured.out, "No warning should be logged when PDF has text"
+
+
+def test_process_document_no_warning_for_html_without_text(capsys: object) -> None:
+    """When an HTML document has no ruling_text, no PDF-specific warning should fire."""
+    config = _make_config()
+
+    doc = CapturedDocument(
+        scraper_id=config.scraper_id,
+        state=config.state,
+        county=config.county,
+        court=config.court,
+        source_url="https://example.com/ruling.html",
+        capture_timestamp=datetime.utcnow(),
+        content_format=ContentFormat.HTML,
+        raw_content=b"<html>empty page</html>",
+        content_hash="",
+    )
+
+    class NoTextScraper(BaseScraper):
+        def fetch_documents(self) -> list[CapturedDocument]:
+            return [doc]
+
+        def parse_document(self, d: CapturedDocument) -> CapturedDocument:
+            d.ruling_text = ""
+            return d
+
+    scraper = NoTextScraper(config=config)
+    scraper.run()
+
+    captured = capsys.readouterr()  # type: ignore[attr-defined]
+    assert "image-only PDF" not in captured.out, "No PDF warning for HTML documents"

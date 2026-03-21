@@ -171,6 +171,15 @@ class BaseScraper(abc.ABC):
         doc.document_id = str(uuid.uuid5(uuid.NAMESPACE_URL, doc.content_hash))
         doc = self.parse_document(doc)
 
+        # Warn when a non-empty PDF yields no extracted text — likely an
+        # image-only PDF that pdfplumber cannot OCR (#1335).
+        if doc.content_format == ContentFormat.PDF and doc.raw_content and not doc.ruling_text:
+            self._log.warning(
+                "PDF text extraction returned empty — possible image-only PDF",
+                source_url=doc.source_url,
+                pdf_size=len(doc.raw_content),
+            )
+
         if self._archiver:
             doc.s3_key = self._archiver.archive(doc)
             doc.s3_bucket = self._archiver.bucket
