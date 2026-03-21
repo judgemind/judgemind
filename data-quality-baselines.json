@@ -32,8 +32,8 @@
     }
   },
   "field_completeness": {
-    "_updated": "2026-03-20",
-    "_note": "Baselines lowered for OC (document splitting backfill #1174 created ~1300 split docs missing parties/case_type), SC (low sample size), Riverside (outcome gap from old PDF backfill). See #1301 for triage details.",
+    "_updated": "2026-03-21",
+    "_note": "OC baselines raised after backfill #1304 (parties 35->80%, case_type 30->97%). SC (low sample size), Riverside (outcome gap from old PDF backfill) unchanged.",
     "Los Angeles": {
       "total_documents": 748,
       "ruling": 100.0,
@@ -47,20 +47,19 @@
       "case_type": 99.9
     },
     "Orange": {
-      "total_documents": 1412,
+      "total_documents": 1772,
       "ruling": 100.0,
       "judge": 100.0,
       "motion_type": 100.0,
       "outcome": 100.0,
       "case_title": 100.0,
       "case_number": 84.4,
-      "parties": 35.0,
+      "parties": 80.0,
       "hearing_date": 100.0,
-      "case_type": 30.0,
+      "case_type": 97.0,
       "_known_gaps": {
         "case_number": "21 UNKNOWN cases from OC North JC PDFs that structurally lack case numbers",
-        "parties": "~850 split docs from backfill #1174 missing party extraction. Tracked in follow-up issue.",
-        "case_type": "~910 split docs from backfill #1174 missing case_type extraction. Tracked in follow-up issue."
+        "parties": "~310 split docs with case titles that lack recognizable 'vs.' pattern for party extraction"
       }
     },
     "Riverside": {
