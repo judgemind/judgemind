@@ -184,6 +184,7 @@ jobs:
           oneshot-family: judgemind-api-migrate-dev
           log-stream-prefix: migrate
           task-role-fallback: judgemind-api-task-dev
+          extra-env: '[{"name":"NODE_TLS_REJECT_UNAUTHORIZED","value":"0"}]'
 
       - name: Set migration status
         if: always()
