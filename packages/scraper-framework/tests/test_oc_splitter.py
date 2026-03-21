@@ -203,7 +203,23 @@ class TestSplitNorth:
         """A single entry means no splitting needed — return empty list."""
         text = "101 Smith vs Jones Motion for Summary Judgment\nRuling text here.\n"
         results = _split_north(text)
-        assert len(results) < 2
+        assert results == []
+
+    def test_single_surviving_entry_returns_empty(self) -> None:
+        """If only 1 entry survives filtering, return empty (#1232).
+
+        This covers the N18-like scenario where legal citations containing
+        'v.' create a single false-positive entry.  The < 2 minimum ensures
+        the caller falls through to a different splitting strategy.
+        """
+        text = (
+            "Some introductory boilerplate text.\n"
+            "24 Cal.4th 83, 114; Mercuro v. Superior Court (2002) 96\n"
+            "Cal.App.4th 167, 174-175.\n"
+            "Procedural Unconscionability analysis continues here.\n"
+        )
+        results = _split_north(text)
+        assert results == []
 
     def test_no_vs_entries_skipped(self) -> None:
         """Lines without 'vs' (legal citations) are not treated as entries."""
@@ -1091,10 +1107,9 @@ class TestSingleCasePassthrough:
             "outcome": None,
         }
         results = split_document(event)
-        # Single entry means no splitting — pass through
+        # Single entry means no splitting — pass through with original text
         assert len(results) == 1
-        assert results[0].ruling_text == text.rstrip()  # from splitter
-        # With only 1 result, framework returns it unchanged
+        assert results[0].ruling_text == text
 
     def test_single_central_entry_not_split(self) -> None:
         text = (
@@ -1536,25 +1551,45 @@ class TestNorthN18Fixture:
             )
 
     def test_north_splitter_falls_back_to_case_number(self, n18_text: str) -> None:
-        """N18 uses case numbers, so split_oc_document should eventually use
-        the case-number-based splitter (once #1232 is resolved).
+        """N18 uses case numbers, so split_oc_document falls through to the
+        case-number-based splitter (#1232).
 
-        Currently, the North splitter may find a small number of entries from
-        legal citations containing 'v.', preventing the fallback. This test
-        documents the expected behavior: the case-number-based splitter handles
-        N18 correctly regardless of the dispatch path.
+        The North splitter returns empty for N18 because it finds fewer than 2
+        entries matching the "vs" pattern (any stray legal citations like
+        'Mercuro v. Superior Court' are filtered by the < 2 minimum).  The
+        framework then falls back to _split_case_number_based which correctly
+        handles N18's format (period after entry number, case number prefix).
         """
-        # Direct case-number splitting always works for N18
+        # North splitter returns empty for N18 (< 2 valid entries)
+        north_results = _split_north(n18_text)
+        assert len(north_results) == 0
+
+        # Case-number-based splitter handles N18 correctly
         cn_results = _split_case_number_based(n18_text)
         assert len(cn_results) >= 8
 
-        # The framework dispatch may not fully fall back yet (#1232)
+        # Framework dispatch falls through to case-number-based splitting
         event = {"ruling_text": n18_text, "department": "N18"}
         fw_results = split_oc_document(event)
-        # Either the framework produces many results (fallback worked)
-        # or it produces fewer (North splitter intercepted).
-        # Both are valid until #1232 is fixed.
-        assert len(fw_results) >= 1
+        assert len(fw_results) >= 8
+        # All entries should have case numbers (N18 includes them)
+        for r in fw_results:
+            assert r.case_number is not None
+
+    def test_split_via_framework(self, n18_text: str) -> None:
+        """Verify the full framework pipeline works for N18."""
+        event = {
+            "state": "CA",
+            "county": "Orange",
+            "ruling_text": n18_text,
+            "department": "N18",
+            "case_title": None,
+            "case_number": None,
+            "motion_type": None,
+            "outcome": None,
+        }
+        results = split_document(event)
+        assert len(results) >= 8
 
 
 # ---------------------------------------------------------------------------

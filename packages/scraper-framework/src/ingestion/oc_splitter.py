@@ -166,6 +166,13 @@ def _split_north(text: str) -> list[SplitResult]:
             )
         )
 
+    # Enforce minimum: fewer than 2 results means no meaningful splitting.
+    # This ensures formats like N18 (which use case numbers + periods after
+    # entry numbers instead of the standard North format) fall through to
+    # the case-number-based splitter via split_oc_document().
+    if len(results) < 2:
+        return []
+
     return results
 
 
