@@ -110,12 +110,23 @@ Run every applicable check for every package you touched:
 .venv/bin/pytest tests/ -v --tb=short
 ```
 
+**Run diff-coverage check for every Python package you touched** (catches CI diff-coverage failures locally):
+- Install diff-cover if not already available: `.venv/bin/pip install diff-cover --quiet`
+- Generate coverage XML (if not already present): `.venv/bin/pytest tests/ -v --tb=short --cov=src --cov-report=xml`
+- Run: `.venv/bin/diff-cover coverage.xml --compare-branch=origin/main --fail-under=90`
+- If diff-coverage is below 90%, add tests for the uncovered lines before proceeding. The output shows exactly which lines lack coverage — write tests that exercise those code paths.
+
 **TypeScript:**
 ```
 npm run lint
 npm run typecheck
 npm test
 ```
+
+**Run diff-coverage check for every TypeScript package you touched:**
+- Install diff-cover if not already available: `npm install diff-cover`
+- Run: `npx diff-cover coverage/lcov.info --compare-branch=origin/main --fail-under=90`
+- If diff-coverage is below 90%, add tests for the uncovered lines before proceeding.
 
 Fix any failures. Auto-fix lint with `.venv/bin/ruff check --fix src/ tests/` then `.venv/bin/ruff format src/ tests/`.
 
