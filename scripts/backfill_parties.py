@@ -269,16 +269,13 @@ def _upsert_case_party(
     party_id: str,
     role: str,
 ) -> None:
-    """Link a party to a case (idempotent)."""
+    """Link a party to a case — idempotent via unique constraint."""
     with conn.cursor() as cur:
         cur.execute(
             """INSERT INTO case_parties (case_id, party_id, role)
-               SELECT %s::uuid, %s::uuid, %s
-               WHERE NOT EXISTS (
-                   SELECT 1 FROM case_parties
-                   WHERE case_id = %s::uuid AND party_id = %s::uuid AND role = %s
-               )""",
-            (case_id, party_id, role, case_id, party_id, role),
+               VALUES (%s::uuid, %s::uuid, %s)
+               ON CONFLICT (case_id, party_id, role) DO NOTHING""",
+            (case_id, party_id, role),
         )
 
 
@@ -309,9 +306,7 @@ def backfill_batch(
             continue
 
         try:
-            batch_upsert_parties(
-                conn, str(case_id), parties, alias_source="backfill"
-            )
+            batch_upsert_parties(conn, str(case_id), parties, alias_source="backfill")
         except psycopg.errors.ProgramLimitExceeded:
             logger.warning(
                 "Skipping parties with name too long for index (case %s)",

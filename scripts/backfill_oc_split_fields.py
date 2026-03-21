@@ -223,19 +223,13 @@ def _upsert_party_and_link(
                 (party_id, name),
             )
 
-        # Link party to case (check-then-insert for re-run safety).
+        # Link party to case — idempotent via unique constraint.
         cur.execute(
-            """SELECT 1 FROM case_parties
-               WHERE case_id = %s::uuid AND party_id = %s::uuid AND role = %s
-               LIMIT 1""",
+            """INSERT INTO case_parties (case_id, party_id, role)
+               VALUES (%s::uuid, %s::uuid, %s)
+               ON CONFLICT (case_id, party_id, role) DO NOTHING""",
             (case_id, party_id, role),
         )
-        if cur.fetchone() is None:
-            cur.execute(
-                """INSERT INTO case_parties (case_id, party_id, role)
-                   VALUES (%s::uuid, %s::uuid, %s)""",
-                (case_id, party_id, role),
-            )
 
 
 # ---------------------------------------------------------------------------
