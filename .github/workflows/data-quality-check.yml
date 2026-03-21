@@ -62,6 +62,13 @@ jobs:
           if [ -n "${{ inputs.county }}" ]; then
             ARGS="$ARGS --county ${{ inputs.county }}"
           fi
+          # Pass baselines as base64 so they are available on ECS oneshot
+          # (only the script file is uploaded, not the baselines JSON file).
+          # Base64 encoding avoids shell quoting issues with JSON content.
+          if [ -f "data-quality-baselines.json" ]; then
+            BASELINES_B64=$(base64 -w0 < data-quality-baselines.json)
+            ARGS="$ARGS --baselines-base64 ${BASELINES_B64}"
+          fi
           echo "script_args=$ARGS" >> "$GITHUB_OUTPUT"
 
       - name: Run data quality check on ECS

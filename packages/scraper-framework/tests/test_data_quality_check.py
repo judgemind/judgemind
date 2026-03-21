@@ -210,6 +210,61 @@ class TestLoadBaselines:
         assert result["Custom"].posting_days is None
         assert result["Custom"].max_expected_gap_hours == 72.0
 
+    def test_load_from_raw_dict(self) -> None:
+        """Loads baselines from a pre-parsed raw dict (no file needed)."""
+        raw = {
+            "counties": {
+                "Los Angeles": {
+                    "expected_daily_rulings": 50,
+                    "schedule_type": "daily",
+                },
+                "Santa Clara": {
+                    "expected_daily_rulings": 0.1,
+                    "schedule_type": "daily",
+                    "posting_days": ["Mon", "Tue", "Wed", "Thu"],
+                },
+            }
+        }
+        result = load_baselines(raw=raw)
+        assert "Los Angeles" in result
+        assert result["Los Angeles"].expected_daily_rulings == 50
+        assert "Santa Clara" in result
+        assert result["Santa Clara"].expected_daily_rulings == 0.1
+        assert result["Santa Clara"].posting_days == ["Mon", "Tue", "Wed", "Thu"]
+
+    def test_raw_dict_takes_priority_over_file(self, tmp_path: Path) -> None:
+        """When both raw dict and file path are provided, raw dict wins."""
+        baselines_file = tmp_path / "baselines.json"
+        baselines_file.write_text(
+            json.dumps(
+                {
+                    "counties": {
+                        "FileCounty": {
+                            "expected_daily_rulings": 99,
+                            "schedule_type": "daily",
+                        }
+                    }
+                }
+            )
+        )
+        raw = {
+            "counties": {
+                "RawCounty": {
+                    "expected_daily_rulings": 42,
+                    "schedule_type": "daily",
+                }
+            }
+        }
+        result = load_baselines(baselines_file, raw=raw)
+        assert "RawCounty" in result
+        assert "FileCounty" not in result
+
+    def test_raw_dict_empty_counties(self) -> None:
+        """Returns empty dict when raw dict has no counties."""
+        raw = {"counties": {}}
+        result = load_baselines(raw=raw)
+        assert result == {}
+
 
 class TestCheckIngestRates:
     """Tests for check_ingest_rates function."""
@@ -1309,6 +1364,37 @@ class TestLoadFieldBaselines:
         baselines_file = tmp_path / "baselines.json"
         baselines_file.write_text(json.dumps({"counties": {}}))
         result = load_field_baselines(baselines_file)
+        assert result == {}
+
+    def test_load_from_raw_dict(self) -> None:
+        """Loads field baselines from a pre-parsed raw dict."""
+        raw = {
+            "field_completeness": {
+                "Los Angeles": {"ruling": 100.0, "judge": 38.4},
+                "Orange": {"ruling": 100.0, "judge": 100.0},
+            }
+        }
+        result = load_field_baselines(raw=raw)
+        assert "Los Angeles" in result
+        assert result["Los Angeles"]["ruling"] == 100.0
+        assert result["Los Angeles"]["judge"] == 38.4
+        assert "Orange" in result
+
+    def test_raw_dict_takes_priority_over_file(self, tmp_path: Path) -> None:
+        """When both raw dict and file path are provided, raw dict wins."""
+        baselines_file = tmp_path / "baselines.json"
+        baselines_file.write_text(
+            json.dumps({"field_completeness": {"FileCounty": {"ruling": 99.0}}})
+        )
+        raw = {"field_completeness": {"RawCounty": {"ruling": 50.0}}}
+        result = load_field_baselines(baselines_file, raw=raw)
+        assert "RawCounty" in result
+        assert "FileCounty" not in result
+
+    def test_raw_dict_no_field_completeness(self) -> None:
+        """Returns empty dict when raw dict lacks field_completeness key."""
+        raw = {"counties": {"Test": {}}}
+        result = load_field_baselines(raw=raw)
         assert result == {}
 
 

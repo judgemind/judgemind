@@ -24,6 +24,7 @@ Exit code: 0 if all healthy, 1 if alerts found.
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import logging
 import os
@@ -102,23 +103,30 @@ class Baselines:
     max_expected_gap_hours: float | None = None  # explicit override
 
 
-def load_baselines(path: Path | None = None) -> dict[str, Baselines]:
-    """Load per-county baselines from JSON config file.
+def load_baselines(
+    path: Path | None = None,
+    raw: dict[str, Any] | None = None,
+) -> dict[str, Baselines]:
+    """Load per-county baselines from JSON config file or pre-parsed dict.
 
     Args:
         path: Path to baselines JSON file. Defaults to repo root.
+        raw: Pre-parsed baselines dict (takes priority over file path).
+            Useful when running as an ECS oneshot where the file is unavailable.
 
     Returns:
         Dict mapping county name to Baselines.
     """
-    baselines_path = path or DEFAULT_BASELINES_PATH
-    if not baselines_path.exists():
-        logger.warning(
-            "Baselines file not found at %s, using empty baselines", baselines_path
-        )
-        return {}
-    with open(baselines_path) as f:
-        raw = json.load(f)
+    if raw is None:
+        baselines_path = path or DEFAULT_BASELINES_PATH
+        if not baselines_path.exists():
+            logger.warning(
+                "Baselines file not found at %s, using empty baselines",
+                baselines_path,
+            )
+            return {}
+        with open(baselines_path) as f:
+            raw = json.load(f)
     result: dict[str, Baselines] = {}
     for county, config in raw.get("counties", {}).items():
         result[county] = Baselines(
@@ -268,20 +276,24 @@ FIELD_COMPLETENESS_QUERY = """
 
 def load_field_baselines(
     path: Path | None = None,
+    raw: dict[str, Any] | None = None,
 ) -> dict[str, dict[str, float]]:
-    """Load per-county field completeness baselines from JSON config file.
+    """Load per-county field completeness baselines from JSON config file or dict.
 
     Args:
         path: Path to baselines JSON file. Defaults to repo root.
+        raw: Pre-parsed baselines dict (takes priority over file path).
+            Useful when running as an ECS oneshot where the file is unavailable.
 
     Returns:
         Dict mapping county name to dict of field name -> baseline percentage.
     """
-    baselines_path = path or DEFAULT_BASELINES_PATH
-    if not baselines_path.exists():
-        return {}
-    with open(baselines_path) as f:
-        raw = json.load(f)
+    if raw is None:
+        baselines_path = path or DEFAULT_BASELINES_PATH
+        if not baselines_path.exists():
+            return {}
+        with open(baselines_path) as f:
+            raw = json.load(f)
     return raw.get("field_completeness", {})
 
 
@@ -1097,6 +1109,7 @@ def run_checks(
     *,
     county: str | None = None,
     baselines_path: Path | None = None,
+    baselines_raw: dict[str, Any] | None = None,
     now: datetime | None = None,
     update_baselines: bool = False,
 ) -> list[Alert]:
@@ -1106,6 +1119,7 @@ def run_checks(
         dsn: Database connection string.
         county: Optional county name filter.
         baselines_path: Path to baselines JSON file.
+        baselines_raw: Pre-parsed baselines dict (takes priority over path).
         now: Override current time (for testing).
         update_baselines: If True, snapshot current field completeness
             as baselines (ratchet up only) and skip alerting.
@@ -1116,8 +1130,8 @@ def run_checks(
     if now is None:
         now = datetime.now(UTC)
 
-    baselines = load_baselines(baselines_path)
-    field_baselines = load_field_baselines(baselines_path)
+    baselines = load_baselines(baselines_path, raw=baselines_raw)
+    field_baselines = load_field_baselines(baselines_path, raw=baselines_raw)
     alerts: list[Alert] = []
 
     with psycopg.connect(dsn) as conn:
@@ -1138,6 +1152,7 @@ def run_checks_full(
     *,
     county: str | None = None,
     baselines_path: Path | None = None,
+    baselines_raw: dict[str, Any] | None = None,
     now: datetime | None = None,
     update_baselines: bool = False,
     persist: bool = False,
@@ -1152,6 +1167,7 @@ def run_checks_full(
         dsn: Database connection string.
         county: Optional county name filter.
         baselines_path: Path to baselines JSON file.
+        baselines_raw: Pre-parsed baselines dict (takes priority over path).
         now: Override current time (for testing).
         update_baselines: If True, snapshot current field completeness
             as baselines (ratchet up only) and skip alerting.
@@ -1163,8 +1179,8 @@ def run_checks_full(
     if now is None:
         now = datetime.now(UTC)
 
-    baselines = load_baselines(baselines_path)
-    field_baselines = load_field_baselines(baselines_path)
+    baselines = load_baselines(baselines_path, raw=baselines_raw)
+    field_baselines = load_field_baselines(baselines_path, raw=baselines_raw)
     alerts: list[Alert] = []
 
     with psycopg.connect(dsn) as conn:
@@ -1516,6 +1532,26 @@ def main() -> None:
         help="Path to baselines JSON file.",
     )
     parser.add_argument(
+        "--baselines-json",
+        type=str,
+        default=None,
+        help=(
+            "Baselines as an inline JSON string. Takes priority over --baselines. "
+            "Useful for ECS oneshot where the baselines file is unavailable."
+        ),
+    )
+    parser.add_argument(
+        "--baselines-base64",
+        type=str,
+        default=None,
+        help=(
+            "Baselines as a base64-encoded JSON string. Takes priority over "
+            "--baselines and --baselines-json. Avoids shell quoting issues "
+            "when passing JSON through multiple shell layers (e.g. GitHub "
+            "Actions -> ecs-run-task.sh -> ECS container)."
+        ),
+    )
+    parser.add_argument(
         "--file-issues",
         action="store_true",
         default=False,
@@ -1573,12 +1609,32 @@ def main() -> None:
 
     baselines_path = Path(args.baselines) if args.baselines else None
 
+    # Parse inline baselines if provided (takes priority over file path).
+    # This is used when running as an ECS oneshot where the baselines file
+    # is not available alongside the script.
+    # Priority: --baselines-base64 > --baselines-json > --baselines (file path).
+    baselines_raw: dict[str, Any] | None = None
+    if args.baselines_base64:
+        try:
+            decoded = base64.b64decode(args.baselines_base64).decode("utf-8")
+            baselines_raw = json.loads(decoded)
+        except (ValueError, json.JSONDecodeError) as exc:
+            logger.error("Failed to decode --baselines-base64: %s", exc)
+            sys.exit(1)
+    elif args.baselines_json:
+        try:
+            baselines_raw = json.loads(args.baselines_json)
+        except json.JSONDecodeError:
+            logger.error("Failed to parse --baselines-json as JSON")
+            sys.exit(1)
+
     if args.store_results or args.persist_metrics:
         # Use run_checks_full to also collect county metrics for storage.
         check_result = run_checks_full(
             dsn,
             county=args.county,
             baselines_path=baselines_path,
+            baselines_raw=baselines_raw,
             update_baselines=args.update_baselines,
             persist=args.persist_metrics,
         )
@@ -1615,6 +1671,7 @@ def main() -> None:
             dsn,
             county=args.county,
             baselines_path=baselines_path,
+            baselines_raw=baselines_raw,
             update_baselines=args.update_baselines,
         )
 
