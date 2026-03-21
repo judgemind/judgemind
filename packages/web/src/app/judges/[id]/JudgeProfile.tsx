@@ -8,6 +8,7 @@ import {
   formatLabel,
   formatMotionType,
   formatOutcome,
+  getOutcomeBadgeVariant,
 } from '../../../lib/display-helpers';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
@@ -128,13 +129,6 @@ interface RulingsData {
 // Constants
 // ---------------------------------------------------------------------------
 
-/** Badge variant mapping for ruling outcomes. */
-const OUTCOME_BADGE_VARIANT: Record<string, 'default' | 'secondary' | 'destructive' | 'outline'> = {
-  granted: 'default',
-  denied: 'destructive',
-  granted_in_part: 'secondary',
-  denied_in_part: 'secondary',
-};
 
 const PAGE_SIZE = 20;
 
@@ -444,11 +438,7 @@ export function JudgeProfile({ judgeId }: { judgeId: string }) {
                   </div>
                 </div>
                 <Badge
-                  variant={
-                    node.outcome && OUTCOME_BADGE_VARIANT[node.outcome]
-                      ? OUTCOME_BADGE_VARIANT[node.outcome]
-                      : 'outline'
-                  }
+                  variant={getOutcomeBadgeVariant(node.outcome)}
                 >
                   {formatOutcome(node.outcome)}
                 </Badge>

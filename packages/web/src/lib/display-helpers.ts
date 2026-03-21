@@ -76,6 +76,59 @@ export function formatOutcome(outcome: string | null): string {
 }
 
 // ---------------------------------------------------------------------------
+// Outcome badge styling (shared across all components)
+// ---------------------------------------------------------------------------
+
+/** Badge variant type matching shadcn Badge component. */
+export type OutcomeBadgeVariant = 'default' | 'secondary' | 'destructive' | 'outline';
+
+/** Mapping from outcome code to shadcn Badge variant. */
+const OUTCOME_VARIANT_MAP: Record<string, OutcomeBadgeVariant> = {
+  granted: 'default',
+  denied: 'destructive',
+  granted_in_part: 'secondary',
+  denied_in_part: 'secondary',
+  moot: 'outline',
+  continued: 'outline',
+  other: 'outline',
+};
+
+/**
+ * Get the shadcn Badge variant for a ruling outcome.
+ * Returns 'outline' for null or unknown outcomes.
+ */
+export function getOutcomeBadgeVariant(outcome: string | null): OutcomeBadgeVariant {
+  if (!outcome) return 'outline';
+  return OUTCOME_VARIANT_MAP[outcome] ?? 'outline';
+}
+
+/** Mapping from outcome code to Tailwind CSS class strings (with dark mode). */
+const OUTCOME_CLASS_MAP: Record<string, string> = {
+  granted:
+    'bg-green-100 text-green-800 border-green-200 dark:bg-green-900 dark:text-green-200 dark:border-green-800',
+  denied:
+    'bg-red-100 text-red-800 border-red-200 dark:bg-red-900 dark:text-red-200 dark:border-red-800',
+  granted_in_part:
+    'bg-yellow-100 text-yellow-800 border-yellow-200 dark:bg-yellow-900 dark:text-yellow-200 dark:border-yellow-800',
+  denied_in_part:
+    'bg-yellow-100 text-yellow-800 border-yellow-200 dark:bg-yellow-900 dark:text-yellow-200 dark:border-yellow-800',
+};
+
+/** Default CSS class for outcomes with no specific styling. */
+const OUTCOME_CLASS_FALLBACK =
+  'bg-slate-100 text-slate-600 border-slate-200 dark:bg-slate-700 dark:text-slate-300 dark:border-slate-600';
+
+/**
+ * Get the Tailwind CSS class string for a ruling outcome badge.
+ * Used by components not yet migrated to shadcn Badge variants.
+ * Returns a neutral slate style for null or unknown outcomes.
+ */
+export function getOutcomeBadgeClass(outcome: string | null): string {
+  if (!outcome) return OUTCOME_CLASS_FALLBACK;
+  return OUTCOME_CLASS_MAP[outcome] ?? OUTCOME_CLASS_FALLBACK;
+}
+
+// ---------------------------------------------------------------------------
 // Summary cleanup (display-time)
 // ---------------------------------------------------------------------------
 

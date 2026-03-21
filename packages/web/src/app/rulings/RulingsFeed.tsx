@@ -8,6 +8,7 @@ import {
   formatOutcome,
   formatMotionType,
   formatJudgeName,
+  getOutcomeBadgeClass,
 } from '@/lib/display-helpers';
 import { Autocomplete } from '@/components/Autocomplete';
 import { useCountyOptions } from '@/lib/filter-options';
@@ -89,12 +90,6 @@ interface RulingsData {
 
 const PAGE_SIZE = 20;
 
-const OUTCOME_VARIANT: Record<string, string> = {
-  granted: 'bg-green-100 text-green-800 border-green-200 dark:bg-green-900 dark:text-green-200 dark:border-green-800',
-  denied: 'bg-red-100 text-red-800 border-red-200 dark:bg-red-900 dark:text-red-200 dark:border-red-800',
-  granted_in_part: 'bg-yellow-100 text-yellow-800 border-yellow-200 dark:bg-yellow-900 dark:text-yellow-200 dark:border-yellow-800',
-  denied_in_part: 'bg-yellow-100 text-yellow-800 border-yellow-200 dark:bg-yellow-900 dark:text-yellow-200 dark:border-yellow-800',
-};
 
 function SkeletonCard() {
   return (
@@ -260,11 +255,7 @@ export function RulingsFeed() {
 
                     <div className="mt-2 flex flex-wrap gap-2">
                       <Badge
-                        className={`${
-                          node.outcome && OUTCOME_VARIANT[node.outcome]
-                            ? OUTCOME_VARIANT[node.outcome]
-                            : 'bg-slate-100 text-slate-600 border-slate-200 dark:bg-slate-700 dark:text-slate-300 dark:border-slate-600'
-                        }`}
+                        className={getOutcomeBadgeClass(node.outcome)}
                       >
                         {formatOutcome(node.outcome)}
                       </Badge>
