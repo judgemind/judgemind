@@ -14,7 +14,7 @@
     "test:unit": "vitest run --passWithNoTests .unit.test",
     "test:integration": "vitest run --passWithNoTests .integration.test",
     "test:watch": "vitest",
-    "db:migrate": "node-pg-migrate up --no-timestamp",
+    "db:migrate": "node scripts/seed-and-migrate.mjs",
     "db:migrate:down": "node-pg-migrate down --no-timestamp",
     "db:migrate:create": "node-pg-migrate create --migration-file-language sql --no-timestamp"
   },
