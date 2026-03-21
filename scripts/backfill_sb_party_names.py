@@ -197,8 +197,8 @@ def _fix_case(
                 cur.execute(
                     """
                     INSERT INTO case_parties (case_id, party_id, role)
-                    VALUES (%s, %s, %s)
-                    ON CONFLICT (case_id, party_id, role) DO NOTHING
+                    VALUES (%s::uuid, %s::uuid, %s)
+                    ON CONFLICT DO NOTHING
                     """,
                     (case_id, str(party_id), party["role"]),
                 )
