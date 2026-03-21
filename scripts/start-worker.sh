@@ -190,8 +190,35 @@ fi
 # ---------------------------------------------------------------------------
 # Step 2 — Claim the lowest available worker number and create the worktree
 #
+# Uses a PID-based lock file in {repo_root}/tmp/worker-locks/ to prevent
+# two agents from claiming the same worker number concurrently (#1356).
 # Retries up to 10 times in case of a race with another agent.
 # ---------------------------------------------------------------------------
+LOCK_DIR="$REPO_ROOT/tmp/worker-locks"
+mkdir -p "$LOCK_DIR"
+
+# Helper: check if a worker number is locked by an active process.
+# Returns 0 (true) if locked, 1 (false) if not locked.
+is_worker_locked() {
+    local num="$1"
+    local lock_file="$LOCK_DIR/worker-${num}.lock"
+    if [[ ! -f "$lock_file" ]]; then
+        return 1
+    fi
+    local locked_pid
+    locked_pid=$(head -1 "$lock_file" 2>/dev/null | sed -n 's/^pid: *//p')
+    if [[ -z "$locked_pid" ]]; then
+        return 1
+    fi
+    # Check if the PID is still alive
+    if kill -0 "$locked_pid" 2>/dev/null; then
+        return 0
+    fi
+    # PID is dead — remove the stale lock file
+    rm -f "$lock_file"
+    return 1
+}
+
 for attempt in $(seq 1 10); do
     git -C "$REPO_ROOT" worktree prune
 
@@ -227,6 +254,19 @@ for attempt in $(seq 1 10); do
         done
     fi
 
+    # Also treat PID-locked worker numbers as "taken" (#1356).
+    for lock_file in "$LOCK_DIR"/worker-*.lock; do
+        [ -f "$lock_file" ] || continue
+        lock_num=$(basename "$lock_file" | sed 's/^worker-//;s/\.lock$//')
+        # Skip if already in the registered set
+        if echo "$EXISTING" | grep -qx "$lock_num"; then
+            continue
+        fi
+        if is_worker_locked "$lock_num"; then
+            EXISTING=$(printf '%s\n%s' "$EXISTING" "$lock_num" | sort -n)
+        fi
+    done
+
     # Find the lowest N >= 1 not already taken
     N=1
     while echo "$EXISTING" | grep -qx "$N"; do
@@ -259,6 +299,19 @@ for attempt in $(seq 1 10); do
         git -C "$REPO_ROOT" branch -D "$old_branch" 2>/dev/null || true
     done < <(git -C "$REPO_ROOT" branch --list "worker-${N}/*" | sed 's/^[* ]*//')
 
+    # Atomically claim this worker number via PID lock file (#1356).
+    # Write our PID to the lock file. If another process wrote it first,
+    # we detect that on the next iteration.
+    LOCK_FILE="$LOCK_DIR/worker-${N}.lock"
+    printf 'pid: %s\ntimestamp: %s\n' "$$" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$LOCK_FILE"
+    # Re-read to verify we own it (basic last-writer-wins check)
+    claimed_pid=$(head -1 "$LOCK_FILE" 2>/dev/null | sed -n 's/^pid: *//p')
+    if [[ "$claimed_pid" != "$$" ]]; then
+        echo "Worker $N lock was taken by PID $claimed_pid, retrying... (attempt $attempt)" >&2
+        sleep 0.5
+        continue
+    fi
+
     if git -C "$REPO_ROOT" worktree add "$WORKTREE" -b "$BRANCH" origin/main 2>/dev/null; then
         git -C "$WORKTREE" config core.hooksPath .githooks
         mkdir -p "$WORKTREE/tmp"
@@ -269,6 +322,8 @@ for attempt in $(seq 1 10); do
         exit 0
     fi
 
+    # Worktree creation failed — release the PID lock and retry
+    rm -f "$LOCK_FILE"
     echo "Worker $N was claimed concurrently, retrying... (attempt $attempt)" >&2
     sleep 0.5
 done

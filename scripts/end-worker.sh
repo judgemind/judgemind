@@ -47,6 +47,15 @@ if [[ "$FORCE" != true && -f "$WORKTREE/.agent-lock" ]]; then
     echo "Agent lock in $WORKTREE is stale (${lock_age}s old) — proceeding with removal" >&2
 fi
 
+# ── Remove PID lock file (#1356) ──────────────────────────────────────
+# Extract worker number from path (e.g. /path/to/worktrees/worker-3 → 3)
+WORKER_NUM=$(basename "$WORKTREE" | sed 's/worker-//')
+LOCK_FILE="$REPO_ROOT/tmp/worker-locks/worker-${WORKER_NUM}.lock"
+if [[ -f "$LOCK_FILE" ]]; then
+    rm -f "$LOCK_FILE"
+    echo "Removed PID lock: $LOCK_FILE" >&2
+fi
+
 # cd to the repo root before removing the worktree so that bash's cwd is not
 # inside the directory being deleted. Without this, bash emits a spurious
 # "pwd: getcwd: No such file or directory" error and exits non-zero.
