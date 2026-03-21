@@ -45,6 +45,8 @@ _check_duplicate = dqc._check_duplicate
 _file_single_issue = dqc._file_single_issue
 _24h_overlaps_posting_day = dqc._24h_overlaps_posting_day
 MIN_FIELD_CHECK_SAMPLE_SIZE = dqc.MIN_FIELD_CHECK_SAMPLE_SIZE
+FIELD_COMPLETENESS_GRACE_MINUTES = dqc.FIELD_COMPLETENESS_GRACE_MINUTES
+FIELD_COMPLETENESS_WINDOW_DAYS = dqc.FIELD_COMPLETENESS_WINDOW_DAYS
 
 NOW = datetime(2026, 3, 11, 12, 0, 0, tzinfo=UTC)
 
@@ -104,9 +106,11 @@ class FakeCursor:
     def __init__(self, query_results: dict[str, list[tuple[Any, ...]]]) -> None:
         self._query_results = query_results
         self._results: list[tuple[Any, ...]] = []
+        self.captured_calls: list[tuple[str, tuple[Any, ...]]] = []
 
     def execute(self, query: str, params: tuple[Any, ...] = ()) -> None:
         """Match query to stored results by checking key substrings."""
+        self.captured_calls.append((query, params))
         for key, results in self._query_results.items():
             if key in query:
                 self._results = results
@@ -129,10 +133,13 @@ class FakeConnection:
 
     def __init__(self, query_results: dict[str, list[tuple[Any, ...]]]) -> None:
         self._query_results = query_results
+        self.cursors: list[FakeCursor] = []
 
     def cursor(self) -> FakeCursor:
         """Return a cursor with the same query results."""
-        return FakeCursor(self._query_results)
+        c = FakeCursor(self._query_results)
+        self.cursors.append(c)
+        return c
 
     def __enter__(self) -> FakeConnection:
         return self
@@ -1552,6 +1559,32 @@ class TestQueryFieldCompleteness:
         assert totals["Los Angeles"] == 100
         assert totals["Orange"] == 50
 
+    def test_passes_grace_period_cutoff(self) -> None:
+        """Passes both window cutoff and grace period cutoff as query params."""
+        conn = FakeConnection(
+            {
+                "case_parties": [
+                    _make_field_completeness_row("Los Angeles", total=100),
+                ],
+            }
+        )
+        _query_field_completeness(conn, NOW)
+
+        # The cursor should have been called with (cutoff, grace_cutoff) params.
+        assert len(conn.cursors) == 1
+        cursor = conn.cursors[0]
+        assert len(cursor.captured_calls) == 1
+        _query, params = cursor.captured_calls[0]
+
+        expected_cutoff = NOW - timedelta(days=FIELD_COMPLETENESS_WINDOW_DAYS)
+        expected_grace = NOW - timedelta(minutes=FIELD_COMPLETENESS_GRACE_MINUTES)
+        assert params[0] == expected_cutoff
+        assert params[1] == expected_grace
+
+    def test_grace_period_constant_is_30_minutes(self) -> None:
+        """Grace period constant is set to 30 minutes."""
+        assert FIELD_COMPLETENESS_GRACE_MINUTES == 30
+
 
 class TestCheckFieldCompleteness:
     """Tests for check_field_completeness function."""
@@ -2118,6 +2151,38 @@ class TestCollectFullMetrics:
         assert "docs_with_gaps" in metadata
         assert "doc-abc-123" in metadata["docs_with_gaps"]
         assert "doc-def-456" in metadata["docs_with_gaps"]
+
+    def test_field_gap_docs_query_passes_grace_period(self) -> None:
+        """FIELD_GAP_DOCS_QUERY receives both window cutoff and grace cutoff."""
+        conn = FakeConnection(
+            {
+                "created_at < %s": [],
+                "AS ruling_count": [],
+                "d.document_type": [],
+                "has_ruling": [],
+                "r.judge_id IS NULL": [],
+                "ranked_runs": [],
+                "success_count": [],
+            }
+        )
+        _collect_full_metrics(conn, NOW)
+
+        # Find the cursor call that ran FIELD_GAP_DOCS_QUERY.
+        found = False
+        for cursor in conn.cursors:
+            for query, params in cursor.captured_calls:
+                if "r.judge_id IS NULL" in query:
+                    found = True
+                    expected_cutoff = NOW - timedelta(
+                        days=FIELD_COMPLETENESS_WINDOW_DAYS,
+                    )
+                    expected_grace = NOW - timedelta(
+                        minutes=FIELD_COMPLETENESS_GRACE_MINUTES,
+                    )
+                    assert params[0] == expected_cutoff
+                    assert params[1] == expected_grace
+                    break
+        assert found, "FIELD_GAP_DOCS_QUERY was not executed"
 
 
 # ---------------------------------------------------------------------------
