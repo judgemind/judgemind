@@ -18,6 +18,8 @@ import pytest
 
 from courts.ca.pdf_link_scraper import _extract_pdf_text
 from ingestion.oc_splitter import (
+    _clean_case_title,
+    _extract_case_title_from_entry,
     _is_boilerplate_only,
     _split_case_number_based,
     _split_north,
@@ -1553,3 +1555,112 @@ class TestNorthN18Fixture:
         # or it produces fewer (North splitter intercepted).
         # Both are valid until #1232 is fixed.
         assert len(fw_results) >= 1
+
+
+# ---------------------------------------------------------------------------
+# Case title cleaning tests (#1304)
+# ---------------------------------------------------------------------------
+
+
+class TestCleanCaseTitle:
+    """Tests for _clean_case_title — stripping ruling text from case titles."""
+
+    def test_strips_is_granted(self) -> None:
+        raw = "Gonzalez vs. Attorney\u2019s Fees in the Sum of $1,038,085.00 is GRANTED"
+        result = _clean_case_title(raw)
+        assert "GRANTED" not in result
+
+    def test_strips_is_denied(self) -> None:
+        raw = "Miranda vs. Chiron, Strike is DENIED."
+        assert "DENIED" not in _clean_case_title(raw)
+
+    def test_strips_is_sustained_overruled(self) -> None:
+        raw = "vs. Azzalino Union\u2019s Complaint is OVERRULED is part and SUSTAINED in part"
+        result = _clean_case_title(raw)
+        assert "OVERRULED" not in result
+        assert "SUSTAINED" not in result
+
+    def test_strips_continued(self) -> None:
+        raw = "One LLP vs. CONTINUED TO APRIL 21, 2026, AT 9:00 A.M., IN"
+        # "CONTINUED" pattern: the text after "vs." starts with it
+        # The cleaning should at least remove the ruling text
+        result = _clean_case_title(raw)
+        assert "APRIL 21" not in result
+
+    def test_strips_for_attorney_fees(self) -> None:
+        raw = "vs. Kelley for Attorney Fees is GRANTED in the reduced amount of $67,746.32."
+        result = _clean_case_title(raw)
+        assert "GRANTED" not in result
+        assert "Attorney Fees" not in result
+
+    def test_strips_approval_of_class_action(self) -> None:
+        raw = "Jones vs. Saddle Creek of Class Action and PAGA Settlement is GRANTED IN"
+        result = _clean_case_title(raw)
+        assert "GRANTED" not in result
+        assert "Class Action" not in result
+
+    def test_strips_possessive_plaintiff(self) -> None:
+        raw = "Robles vs. Bally Plaintiff\u2019s"
+        result = _clean_case_title(raw)
+        assert "Plaintiff" not in result
+
+    def test_strips_possessive_defendant(self) -> None:
+        raw = "Keller vs. System Defendant\u2019s"
+        result = _clean_case_title(raw)
+        assert "Defendant" not in result
+
+    def test_strips_cross_defendant(self) -> None:
+        raw = "Desaluna vs. WL Cross- Defendant\u2019s"
+        result = _clean_case_title(raw)
+        assert "Defendant" not in result
+
+    def test_preserves_clean_title(self) -> None:
+        raw = "Gomez vs. Black Lion Farms, LLC"
+        assert _clean_case_title(raw) == "Gomez vs. Black Lion Farms, LLC"
+
+    def test_preserves_simple_vs_title(self) -> None:
+        raw = "Smith vs. Jones"
+        assert _clean_case_title(raw) == "Smith vs. Jones"
+
+    def test_empty_string(self) -> None:
+        assert _clean_case_title("") == ""
+
+    def test_strips_settlement_funds(self) -> None:
+        raw = "Hoerner vs. Hoag settlement funds has been made in accordance with the"
+        result = _clean_case_title(raw)
+        assert "settlement funds" not in result
+
+    def test_strips_to_compel(self) -> None:
+        raw = "Hallum vs. Restaurant to Compel Arbitration is GRANTED. IT IS ORDERED"
+        result = _clean_case_title(raw)
+        assert "GRANTED" not in result
+        assert "Compel" not in result
+
+
+class TestExtractCaseTitleFromEntry:
+    """Tests for _extract_case_title_from_entry with garbled title cleanup."""
+
+    def test_basic_vs_with_case_number(self) -> None:
+        line = "30-2024-01393434 Smith vs. Jones Motion for Summary Judgment"
+        result = _extract_case_title_from_entry(line)
+        assert result is not None
+        assert "Smith" in result
+        assert "Jones" in result
+        assert "Motion" not in result
+
+    def test_garbled_with_granted(self) -> None:
+        line = "30-2024-01393434 Jones vs. Creek of Class Action is GRANTED"
+        result = _extract_case_title_from_entry(line)
+        assert result is not None
+        assert "GRANTED" not in result
+
+    def test_no_vs_returns_none(self) -> None:
+        line = "30-2024-01393434 Motion for Summary Judgment"
+        result = _extract_case_title_from_entry(line)
+        assert result is None
+
+    def test_cleans_possessive_role(self) -> None:
+        line = "30-2025-01477814 Keller vs. System Defendant\u2019s"
+        result = _extract_case_title_from_entry(line)
+        assert result is not None
+        assert "Defendant" not in result

@@ -154,10 +154,13 @@ def _split_north(text: str) -> list[SplitResult]:
         if _is_boilerplate_only(ruling_text):
             continue
 
+        # Clean ruling/motion text that may have leaked into the case name.
+        clean_name = _clean_case_title(full_name)
+
         results.append(
             SplitResult(
                 ruling_text=ruling_text,
-                case_title=full_name,
+                case_title=clean_name or full_name,
                 case_number=None,  # North JC PDFs have no case numbers
                 motion_type=motion_type,
             )
@@ -212,6 +215,63 @@ def _find_case_number_near(lines: list[str], start: int, end: int) -> str | None
     return None
 
 
+def _clean_case_title(raw_title: str) -> str:
+    """Strip ruling text, motion descriptions, and other junk from a case title.
+
+    OC calendar PDFs pack the case name, motion type, and ruling outcome onto
+    a single line.  The splitter already tries to cut at motion keywords, but
+    ruling outcome text (``is GRANTED``, ``is DENIED``, possessive role labels
+    like ``Plaintiff's``, ``Defendant's``) can leak through.  This function
+    catches those leftovers so the stored ``case_title`` is just
+    ``Plaintiff vs. Defendant``.
+    """
+    # Truncate at ruling outcome phrases like "is GRANTED", "is DENIED", etc.
+    title = re.sub(
+        r"\b(?:is|are|was|were|hereby)\s+(?:GRANTED|DENIED|SUSTAINED|OVERRULED|"
+        r"CONTINUED|VACATED|MOOT|AFFIRMED|DISMISSED)\b.*",
+        "",
+        raw_title,
+        flags=re.IGNORECASE,
+    ).strip()
+
+    # Truncate at standalone ALL-CAPS ruling keywords (e.g. "CONTINUED TO ...").
+    # Case-sensitive to avoid matching names like "Grant".
+    title = re.sub(
+        r"\b(?:GRANTED|DENIED|SUSTAINED|OVERRULED|CONTINUED|VACATED|MOOT|"
+        r"AFFIRMED|DISMISSED)\b.*",
+        "",
+        title,
+    ).strip()
+
+    # Truncate at possessive role labels (e.g. "Plaintiff's", "Defendant's",
+    # "Cross-Defendant's") that introduce motion descriptions.
+    title = re.sub(
+        r"\s+(?:Plaintiffs?|Defendants?|Petitioners?|Respondents?|"
+        r"Cross-\s*(?:Complainants?|Defendants?))"
+        r"(?:\u2019s|'s|\(s\))?\s*$",
+        "",
+        title,
+        flags=re.IGNORECASE,
+    ).strip()
+
+    # Truncate at common motion-description phrases that aren't in
+    # _MOTION_KEYWORDS (e.g. "for Attorney Fees", "to Compel", "of Class").
+    title = re.sub(
+        r"\s+(?:for\s+(?:Attorney|Summary|Leave|Relief|Approval|Default)|"
+        r"to\s+(?:Compel|Set\s+Aside|Strike|Dismiss|Quash|Vacate|Tax)|"
+        r"of\s+(?:Class\s+Action|Default|Settlement)|"
+        r"settlement\s+funds)\b.*",
+        "",
+        title,
+        flags=re.IGNORECASE,
+    ).strip()
+
+    # Remove trailing punctuation and whitespace.
+    title = title.rstrip(".,;:() ")
+
+    return title
+
+
 def _extract_case_title_from_entry(first_line_rest: str) -> str | None:
     """Extract a case title (plaintiff vs defendant) from a numbered entry line.
 
@@ -232,7 +292,12 @@ def _extract_case_title_from_entry(first_line_rest: str) -> str | None:
     for kw in _MOTION_KEYWORDS:
         pos = cleaned.find(kw)
         if pos > 0:
-            return cleaned[:pos].strip()
+            cleaned = cleaned[:pos].strip()
+            break
+
+    # Clean up any remaining ruling text / motion descriptions that leaked
+    # past the keyword check.
+    cleaned = _clean_case_title(cleaned)
 
     return cleaned.strip() if cleaned else None
 
