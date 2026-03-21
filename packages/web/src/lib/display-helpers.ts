@@ -470,7 +470,7 @@ const MONTH_NAMES = [
 ];
 
 /** Known header prefixes that introduce metadata blocks. */
-const HEADER_PREFIX_RE = /^\s*(?:tentative\s+ruling|tentative\s+case\s+management\s+order|probate\s+notes|minute\s+order|court\s+ruling)\b/i;
+const HEADER_PREFIX_RE = /^\s*(?:tentative\s+rulings?|tentative\s+case\s+management\s+order|probate\s+notes|minute\s+order|court\s+rulings?)\b/i;
 
 /**
  * Build an array of date format strings from an ISO date for matching.

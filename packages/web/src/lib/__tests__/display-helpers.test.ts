@@ -773,6 +773,28 @@ describe('stripMetadataHeader', () => {
     expect(result).toContain('The motion is granted.');
   });
 
+  it('matches plural header prefixes like "Tentative Rulings" and "Court Rulings"', () => {
+    const text =
+      'Tentative Rulings\n' +
+      'Case No. 25STCV12345\n' +
+      'The motion is granted.';
+    const metadata = {
+      caseNumber: '25STCV12345',
+    };
+    const result = stripMetadataHeader(text, metadata);
+    expect(result).not.toContain('Tentative Rulings');
+    expect(result).toContain('The motion is granted.');
+
+    // Also test "Court Rulings" plural
+    const text2 =
+      'Court Rulings\n' +
+      'Case No. 25STCV12345\n' +
+      'The court grants the motion.';
+    const result2 = stripMetadataHeader(text2, metadata);
+    expect(result2).not.toContain('Court Rulings');
+    expect(result2).toContain('The court grants the motion.');
+  });
+
   it('matches case titles with short party names like "Li v. Wu"', () => {
     const text =
       'Li v. Wu\n' +
