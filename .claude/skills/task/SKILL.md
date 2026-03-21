@@ -8,6 +8,8 @@ maxTurns: 200
 
 Pick up one issue from the Judgemind backlog and complete it autonomously. Do not ask for confirmation at any point — work through every step and stop only when the PR is green and review has been requested (or when an investigation task has posted its findings and unblocked any dependents).
 
+**IMPORTANT — No backgrounding.** Do not use `run_in_background` on any Bash command, Agent tool call, or any other operation anywhere in a `/task` agent. All work runs synchronously in the foreground. The `/task` agent is already a background subagent from the dispatcher's perspective — further backgrounding causes completion notifications to surface in the wrong context (the dispatcher), leading to confusion and lost results.
+
 ---
 
 ## Step 0 — Ensure worktree exists
@@ -536,5 +538,5 @@ scripts/end-worker.sh {worktree}
 - **No quoted strings with `&&` or `;`.** Split into separate tool calls.
 - **All temp files go in `{worktree}/tmp/`**, not `/tmp/`.
 - **Multi-line Python always goes in a `.py` file**, never `-c '...'`.
-- **Do not use `run_in_background` in `/task` agents.** All commands — CI watches, test suites, deploy watches, and reviewer invocations — must run in the foreground. Background commands generate `<task-notification>` messages that bubble up to the dispatcher and consume context window without providing any benefit.
+- **No `run_in_background`.** All commands — CI watches, test suites, deploy watches, and reviewer invocations — must run in the foreground. Subagents are already background tasks from the parent's perspective. Further backgrounding causes `<task-notification>` messages to surface in the wrong context, leading to confusion and lost results.
 - See CLAUDE.md §Unattended Operation Patterns for the full list.

@@ -15,6 +15,8 @@ Do not ask for confirmation. Work autonomously through every step.
 
 **This skill covers the implementation phase only** (CLAUDE.md substep 4.3). After completing /tdd, return to the caller (/task or manual workflow) for the commit, push, PR, and CI steps.
 
+**IMPORTANT — No backgrounding.** Do not use `run_in_background` on any Bash command or tool call. All work runs synchronously in the foreground. You are a subagent — backgrounding causes completion notifications to surface in the wrong context (the parent agent), leading to confusion and lost results.
+
 ---
 
 ## Step 1 — Create todo list for TDD steps
@@ -131,6 +133,7 @@ All checks pass. The implementation phase is complete. **Do not commit, push, or
 - **Always run the full suite**, not just new tests. Regressions in existing tests are bugs.
 - **Max 5 implementation cycles.** Escalate to human after 5 failures.
 - **Test coverage**: every new public function/method must have at least one test.
+- **Do not use `run_in_background`.** All commands must run in the foreground. You are a subagent — backgrounding causes notifications to surface in the wrong context.
 
 ---
 
@@ -140,3 +143,4 @@ All checks pass. The implementation phase is complete. **Do not commit, push, or
 - **No quoted strings with `&&` or `;`.** Split into separate tool calls.
 - **All temp files go in `{worktree}/tmp/`**, not `/tmp/`.
 - **Always Read before Write** for existing files.
+- **No `run_in_background`.** All work runs synchronously — see Guardrails above.

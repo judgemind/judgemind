@@ -18,6 +18,8 @@ Do not ask for confirmation. Work autonomously through every step.
 
 **IMPORTANT — Ralph is NOT the end of the task.** When this skill completes, the calling `/task` workflow has 8 more mandatory steps remaining (A.2b through A.9: process summary, commit, push, PR, CI, merge, deploy, retrospective). Ralph completing means the code is ready — but the code has not been committed, pushed, reviewed by CI, or merged. Exiting after ralph is a known failure mode (#721).
 
+**IMPORTANT — No backgrounding.** Do not use `run_in_background` on any Bash command, Agent tool call, or any other operation anywhere in the ralph loop. All work runs synchronously in the foreground. Subagents (worker, reviewer) are already background tasks from the parent's perspective — further backgrounding causes completion notifications to surface in the wrong context and leads to lost results.
+
 ### Status file
 
 The `/task` skill sets up a status file at `{repo_root}/tmp/agent-status/worker-N.txt`. The `/ralph` skill writes status updates to this file at each worker/reviewer phase transition using the Write tool. The format is defined in `/task` Step 0. Derive the status file path from the worktree path (e.g. `worktrees/worker-2` -> `{repo_root}/tmp/agent-status/worker-2.txt`).
@@ -108,7 +110,7 @@ Spawn a **worker subagent** (using the Agent tool) with this prompt structure:
 > - No `$()` command substitution. No heredocs. No `python3 -c`. No quoted strings with `&&` or `;`.
 > - Do not commit, push, or create PRs. Only implement and verify locally.
 > - Follow existing code patterns. Type hints on all Python function signatures. Strict TypeScript mode.
-> - **Run all commands in the foreground** (do not use `run_in_background`). You must wait for test suites, lint, and format checks to complete before proceeding — their results determine your next step.
+> - **Do not use `run_in_background` on any command.** Run all commands (test suites, lint, format checks) in the foreground and wait for their results before proceeding. You are a subagent — backgrounding causes notifications to surface in the wrong context.
 
 After the worker subagent completes, read `{worktree}/tmp/ralph/work-status.txt`.
 
@@ -199,6 +201,7 @@ The Claude reviewer prompt should be:
 > - **Unmet acceptance criteria are always REVISE.** Never SHIP if any locally-verifiable acceptance criterion is not satisfied.
 > - If you say REVISE, your feedback must be specific enough that the worker can act on it without guessing.
 > - **Unchecked test plan items are always blockers.** Never approve a PR with unchecked test plan checkboxes.
+> - **Do not use `run_in_background` on any command.** You are a subagent — all commands must run in the foreground.
 
 ### 2c — Collect results
 
@@ -308,8 +311,7 @@ The code is ready for commit. Return control to the calling workflow (`/task` Pa
 - **Ralph is not task completion.** Ralph handles implementation and review only. The calling `/task` workflow handles process summary, commit, push, PR, CI, merge, deploy, and cleanup. Never exit after ralph without completing the full `/task` workflow.
 - **Unchecked test plan items are merge blockers.** Reviewers must flag unchecked test plan checkboxes as REVISE reasons. A PR with unchecked items is not ready to ship.
 - **Unmet acceptance criteria are always REVISE.** Reviewers must verify every acceptance criterion individually. Code quality alone is not sufficient for SHIP — all locally-verifiable acceptance criteria must be met.
-- **All reviewers run sequentially in the foreground.** Do not use `run_in_background` for any reviewer. The sequential execution eliminates `<task-notification>` noise that disrupts the dispatcher when multiple agents are running concurrently. The time saved by parallelizing (~2-4 min per iteration) is not worth the dispatcher disruption.
-- **Do not use `run_in_background` anywhere in the ralph loop.** All commands — test suites, lint, format checks, git commands, and reviewer invocations — must run in the foreground. The agent cannot meaningfully proceed until each step completes.
+- **Do not use `run_in_background` anywhere in the ralph loop.** All commands — test suites, lint, format checks, git commands, reviewer invocations, and worker subagents — must run in the foreground. Subagents are already running as background tasks from the parent's perspective. Further backgrounding causes completion notifications to route to the wrong context, leading to confusion and lost results.
 
 ---
 
@@ -319,3 +321,4 @@ The code is ready for commit. Return control to the calling workflow (`/task` Pa
 - **No quoted strings with `&&` or `;`.** Split into separate tool calls.
 - **All temp files go in `{worktree}/tmp/`**, not `/tmp/`.
 - **Always Read before Write** for existing files.
+- **No `run_in_background`.** All work runs synchronously — see Guardrails above.
