@@ -15,6 +15,7 @@ from .enrichment import (
 from .event_bus import RedisEventBus
 from .events import EventBus
 from .hashing import content_changed, sha256_hex
+from .llm_extractor import LlmExtractor
 from .llm_schema import (
     EXTRACTION_SYSTEM_PROMPT,
     ConfidenceLevel,
@@ -43,6 +44,7 @@ from .storage import S3Archiver, build_s3_key
 __all__ = [
     "BaseScraper",
     "ConfidenceLevel",
+    "LlmExtractor",
     "CourtDirectory",
     "CourtPortalLookup",
     "CapturedDocument",
