@@ -1,6 +1,12 @@
 import { describe, it, expect, vi } from 'vitest';
 import { render, screen } from '@testing-library/react';
 
+const mockPathname = vi.fn().mockReturnValue('/');
+
+vi.mock('next/navigation', () => ({
+  usePathname: () => mockPathname(),
+}));
+
 vi.mock('next/link', () => ({
   default: ({
     children,
@@ -57,5 +63,22 @@ describe('Sidebar', () => {
     const headingTexts = headings.map((h) => h.textContent);
     expect(headingTexts).toContain('Explore');
     expect(headingTexts).toContain('Research');
+  });
+
+  it('active sidebar link has left border accent', () => {
+    mockPathname.mockReturnValue('/judges');
+    render(<Sidebar />);
+    const judgesLink = screen.getByText('Judges').closest('a');
+    expect(judgesLink).toBeTruthy();
+    expect(judgesLink?.className).toContain('border-l-2');
+    expect(judgesLink?.className).toContain('border-primary');
+  });
+
+  it('non-active sidebar link does not have left border accent', () => {
+    mockPathname.mockReturnValue('/judges');
+    render(<Sidebar />);
+    const casesLink = screen.getByText('Cases').closest('a');
+    expect(casesLink).toBeTruthy();
+    expect(casesLink?.className).not.toContain('border-l-2');
   });
 });

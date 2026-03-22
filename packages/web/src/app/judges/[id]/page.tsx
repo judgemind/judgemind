@@ -64,9 +64,9 @@ export default async function JudgeDetailPage({ params }: Props) {
         <CardContent className="p-6">
           <div className="flex flex-wrap items-start gap-3">
             <h1 className="text-2xl font-bold tracking-tight text-foreground">{heading}</h1>
-            <Badge variant={judgeData.isActive ? 'default' : 'secondary'}>
-              {judgeData.isActive ? 'Active' : 'Inactive'}
-            </Badge>
+            {!judgeData.isActive && (
+              <Badge variant="secondary">Inactive</Badge>
+            )}
           </div>
           {judgeData.court && (
             <p className="mt-2 text-sm text-muted-foreground">
