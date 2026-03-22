@@ -280,6 +280,10 @@ class EnrichmentEngine:
     min_party_overlap : float
         Minimum party overlap (Jaccard similarity) required for a fuzzy
         case number match to be accepted. Default is 0.3 (30%).
+    max_fuzzy_candidates : int
+        Maximum number of candidate rows returned by the fuzzy case
+        query.  Acts as a safety cap to prevent fetching thousands of
+        rows for courts with large case inventories.  Default is 500.
     """
 
     def __init__(
@@ -289,11 +293,13 @@ class EnrichmentEngine:
         court_portal: CourtPortalLookup | None = None,
         max_levenshtein: int = 2,
         min_party_overlap: float = 0.3,
+        max_fuzzy_candidates: int = 500,
     ) -> None:
         self._conn = conn
         self._court_portal = court_portal
         self._max_levenshtein = max_levenshtein
         self._min_party_overlap = min_party_overlap
+        self._max_fuzzy_candidates = max_fuzzy_candidates
 
     # ------------------------------------------------------------------
     # Case number matching
@@ -440,6 +446,13 @@ class EnrichmentEngine:
             row = cur.fetchone()
         return str(row[0]) if row else None
 
+    # Minimum case-number length required to apply the prefix filter.
+    # Shorter case numbers risk false negatives from an overly-narrow prefix.
+    _PREFIX_FILTER_MIN_LEN = 4
+
+    # Number of leading characters used for the prefix filter.
+    _PREFIX_LENGTH = 2
+
     def _fuzzy_case_candidates(
         self,
         db_normalized: str,
@@ -447,9 +460,23 @@ class EnrichmentEngine:
     ) -> list[tuple[str, str, list[str]]]:
         """Fetch candidate cases from the same court for fuzzy matching.
 
-        Returns a list of (case_id, case_number, party_names) tuples.
+        Returns a list of ``(case_id, case_number, party_names)`` tuples.
         Uses the ``case_number_normalized`` column for efficient length-based
-        filtering, avoiding per-row function calls.
+        and prefix-based filtering, avoiding per-row function calls.
+
+        The query applies two selectivity improvements beyond the original
+        length-only filter:
+
+        1. **Prefix filter** — when the normalized case number is at least
+           ``_PREFIX_FILTER_MIN_LEN`` characters long, the query requires
+           candidates to share the same leading ``_PREFIX_LENGTH`` characters.
+           This exploits the fact that case numbers typically start with a
+           year or type prefix (e.g. ``"24nncv..."``), dramatically reducing
+           the candidate set for large courts.
+        2. **Row cap** — the query is always limited to ``max_fuzzy_candidates``
+           rows (default 500) as a safety net.  A warning is logged when
+           the cap is reached, since the true best match may have been
+           excluded.
 
         Parameters
         ----------
@@ -461,9 +488,36 @@ class EnrichmentEngine:
         min_len = max(1, len(db_normalized) - self._max_levenshtein)
         max_len = len(db_normalized) + self._max_levenshtein
 
-        with self._conn.cursor() as cur:
-            cur.execute(
-                """
+        use_prefix = len(db_normalized) >= self._PREFIX_FILTER_MIN_LEN
+        prefix = db_normalized[: self._PREFIX_LENGTH] if use_prefix else ""
+
+        if use_prefix:
+            query = """
+                SELECT c.id, c.case_number,
+                       COALESCE(
+                           ARRAY_AGG(p.canonical_name) FILTER (WHERE p.canonical_name IS NOT NULL),
+                           ARRAY[]::text[]
+                       ) AS party_names
+                FROM cases c
+                LEFT JOIN case_parties cp ON cp.case_id = c.id
+                LEFT JOIN parties p ON p.id = cp.party_id
+                WHERE c.court_id = %s::uuid
+                  AND LENGTH(c.case_number_normalized) BETWEEN %s AND %s
+                  AND LEFT(c.case_number_normalized, %s) = %s
+                GROUP BY c.id, c.case_number
+                ORDER BY c.id
+                LIMIT %s
+            """
+            params: tuple[object, ...] = (
+                court_id,
+                min_len,
+                max_len,
+                self._PREFIX_LENGTH,
+                prefix,
+                self._max_fuzzy_candidates,
+            )
+        else:
+            query = """
                 SELECT c.id, c.case_number,
                        COALESCE(
                            ARRAY_AGG(p.canonical_name) FILTER (WHERE p.canonical_name IS NOT NULL),
@@ -476,10 +530,22 @@ class EnrichmentEngine:
                   AND LENGTH(c.case_number_normalized) BETWEEN %s AND %s
                 GROUP BY c.id, c.case_number
                 ORDER BY c.id
-                """,
-                (court_id, min_len, max_len),
-            )
+                LIMIT %s
+            """
+            params = (court_id, min_len, max_len, self._max_fuzzy_candidates)
+
+        with self._conn.cursor() as cur:
+            cur.execute(query, params)
             rows = cur.fetchall()
+
+        if len(rows) >= self._max_fuzzy_candidates:
+            logger.warning(
+                "Fuzzy candidate set hit row cap — best match may be excluded",
+                court_id=court_id,
+                case_number=db_normalized,
+                cap=self._max_fuzzy_candidates,
+                prefix_used=prefix if use_prefix else None,
+            )
 
         result: list[tuple[str, str, list[str]]] = []
         for row in rows:
