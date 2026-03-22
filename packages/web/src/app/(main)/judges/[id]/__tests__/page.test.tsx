@@ -200,7 +200,7 @@ describe('JudgeDetailPage (SSR)', () => {
     expect(courtParagraph).toBeTruthy();
   });
 
-  it('wraps profile header in a Card component', async () => {
+  it('renders a breadcrumb with Judges link and judge name', async () => {
     mockQuery.mockResolvedValueOnce({
       data: {
         judge: {
@@ -217,13 +217,53 @@ describe('JudgeDetailPage (SSR)', () => {
     });
 
     const result = await JudgeDetailPage({ params: { id: 'judge-1' } });
-    // The Card component wraps the header — find a forwardRef component with Card's displayName
+    // Find the breadcrumb nav element
+    const breadcrumb = findInTree(result, (n) =>
+      n.type === 'nav' &&
+      n.props?.['aria-label'] === 'Breadcrumb',
+    );
+    expect(breadcrumb).toBeTruthy();
+
+    // Find the Judges link inside the breadcrumb (Link may be a function or forwardRef object)
+    const judgesLink = findInTree(breadcrumb, (n) =>
+      n.props?.href === '/judges',
+    );
+    expect(judgesLink).toBeTruthy();
+
+    // Find the judge name text in the breadcrumb
+    const judgeName = findInTree(breadcrumb, (n) =>
+      n.type === 'span' &&
+      typeof n.props?.className === 'string' &&
+      n.props.className.includes('text-foreground') &&
+      n.props?.children === 'Hon. Jane Smith',
+    );
+    expect(judgeName).toBeTruthy();
+  });
+
+  it('does not wrap profile header in a Card component', async () => {
+    mockQuery.mockResolvedValueOnce({
+      data: {
+        judge: {
+          id: 'judge-1',
+          canonicalName: 'Hon. Jane Smith',
+          department: '12',
+          isActive: true,
+          court: {
+            courtName: 'Los Angeles Superior Court',
+            county: 'Los Angeles',
+          },
+        },
+      },
+    });
+
+    const result = await JudgeDetailPage({ params: { id: 'judge-1' } });
+    // No Card component should be present in the header area
     const card = findInTree(result, (n) =>
       typeof n.type === 'object' &&
       n.type !== null &&
       'displayName' in n.type &&
       (n.type as { displayName?: string }).displayName === 'Card',
     );
-    expect(card).toBeTruthy();
+    expect(card).toBeNull();
   });
 });

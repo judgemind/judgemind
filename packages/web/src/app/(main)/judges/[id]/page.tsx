@@ -1,10 +1,10 @@
 import { gql } from '@apollo/client';
 import { notFound } from 'next/navigation';
+import Link from 'next/link';
 import { createApolloClient } from '@/lib/apollo-client';
 import { buildJudgeHeading } from '@/lib/display-helpers';
 import { PAGE_TITLE } from '@/lib/typography';
 import { Badge } from '@/components/ui/badge';
-import { Card, CardContent } from '@/components/ui/card';
 import { JudgeProfile } from './JudgeProfile';
 
 const JUDGE_QUERY = gql`
@@ -60,23 +60,30 @@ export default async function JudgeDetailPage({ params }: Props) {
 
   return (
     <div className="mx-auto max-w-4xl space-y-6">
-      {/* Profile header card */}
-      <Card>
-        <CardContent className="p-6">
-          <div className="flex flex-wrap items-start gap-3">
-            <h1 className={PAGE_TITLE}>{heading}</h1>
-            {!judgeData.isActive && (
-              <Badge variant="secondary">Inactive</Badge>
-            )}
-          </div>
-          {judgeData.court && (
-            <p className="mt-2 text-sm text-muted-foreground">
-              {judgeData.court.courtName} &middot; {judgeData.court.county}
-              {judgeData.department ? ` \u00B7 Dept. ${judgeData.department}` : ''}
-            </p>
+      {/* Breadcrumb */}
+      <nav className="text-sm text-muted-foreground" aria-label="Breadcrumb">
+        <Link href="/judges" className="hover:text-primary">
+          Judges
+        </Link>
+        <span className="mx-2">/</span>
+        <span className="text-foreground">{judgeData.canonicalName}</span>
+      </nav>
+
+      {/* Profile header */}
+      <div>
+        <div className="flex flex-wrap items-start gap-3">
+          <h1 className={PAGE_TITLE}>{heading}</h1>
+          {!judgeData.isActive && (
+            <Badge variant="secondary">Inactive</Badge>
           )}
-        </CardContent>
-      </Card>
+        </div>
+        {judgeData.court && (
+          <p className="mt-2 text-sm text-muted-foreground">
+            {judgeData.court.courtName} &middot; {judgeData.court.county}
+            {judgeData.department ? ` \u00B7 Dept. ${judgeData.department}` : ''}
+          </p>
+        )}
+      </div>
 
       <JudgeProfile judgeId={id} />
     </div>
