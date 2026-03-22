@@ -24,12 +24,12 @@ function SkeletonGrid() {
     <div>
       <div className="mb-6 grid grid-cols-1 gap-4 sm:grid-cols-3">
         {Array.from({ length: 3 }).map((_, i) => (
-          <div key={i} className="h-24 animate-pulse rounded-lg bg-slate-200 dark:bg-slate-700" />
+          <div key={i} className="h-24 animate-pulse motion-reduce:animate-none rounded-lg bg-slate-200 dark:bg-slate-700" />
         ))}
       </div>
       <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5">
         {Array.from({ length: 10 }).map((_, i) => (
-          <div key={i} className="h-20 animate-pulse rounded-lg bg-slate-200 dark:bg-slate-700" />
+          <div key={i} className="h-20 animate-pulse motion-reduce:animate-none rounded-lg bg-slate-200 dark:bg-slate-700" />
         ))}
       </div>
     </div>
@@ -131,7 +131,7 @@ export function DataQualityDashboard() {
       {metricsLoading ? (
         <div className="space-y-4">
           {Array.from({ length: 3 }).map((_, i) => (
-            <div key={i} className="h-80 animate-pulse rounded-lg bg-slate-200 dark:bg-slate-700" />
+            <div key={i} className="h-80 animate-pulse motion-reduce:animate-none rounded-lg bg-slate-200 dark:bg-slate-700" />
           ))}
         </div>
       ) : (

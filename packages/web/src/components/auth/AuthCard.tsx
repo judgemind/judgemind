@@ -95,7 +95,7 @@ export function SubmitButton({ loading, children }: SubmitButtonProps) {
       {loading ? (
         <span className="flex items-center gap-2">
           <svg
-            className="h-4 w-4 animate-spin"
+            className="h-4 w-4 animate-spin motion-reduce:animate-none"
             xmlns="http://www.w3.org/2000/svg"
             fill="none"
             viewBox="0 0 24 24"

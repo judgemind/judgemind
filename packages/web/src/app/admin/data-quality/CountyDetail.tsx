@@ -129,7 +129,7 @@ export function CountyDetail({ county, overview, onBack }: CountyDetailProps) {
       {loading && (
         <div className="space-y-4">
           {Array.from({ length: 3 }).map((_, i) => (
-            <div key={i} className="h-80 animate-pulse rounded-lg bg-slate-200 dark:bg-slate-700" />
+            <div key={i} className="h-80 animate-pulse motion-reduce:animate-none rounded-lg bg-slate-200 dark:bg-slate-700" />
           ))}
         </div>
       )}

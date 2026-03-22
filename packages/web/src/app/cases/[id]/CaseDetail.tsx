@@ -458,7 +458,7 @@ export function CaseDetail({ caseId }: { caseId: string }) {
                     {node.isTentative ? 'Tentative' : 'Final'}
                   </Badge>
                   <svg
-                    className={`h-4 w-4 shrink-0 text-muted-foreground transition-transform ${isExpanded ? 'rotate-180' : ''}`}
+                    className={`h-4 w-4 shrink-0 text-muted-foreground transition-transform motion-reduce:transition-none ${isExpanded ? 'rotate-180' : ''}`}
                     xmlns="http://www.w3.org/2000/svg"
                     viewBox="0 0 20 20"
                     fill="currentColor"

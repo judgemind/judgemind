@@ -65,10 +65,19 @@ describe('RootLayout', () => {
     expect(screen.getByTestId('sidebar')).toBeInTheDocument();
   });
 
-  it('wraps content in a main element', () => {
+  it('wraps content in a main element with id main-content', () => {
     render(<RootLayout>Page content</RootLayout>);
     const main = screen.getByRole('main');
     expect(main).toBeInTheDocument();
     expect(main).toHaveTextContent('Page content');
+    expect(main).toHaveAttribute('id', 'main-content');
+  });
+
+  it('renders a skip-to-main-content link as the first child of body', () => {
+    render(<RootLayout>Content</RootLayout>);
+    const skipLink = screen.getByText('Skip to main content');
+    expect(skipLink).toBeInTheDocument();
+    expect(skipLink.tagName).toBe('A');
+    expect(skipLink).toHaveAttribute('href', '#main-content');
   });
 });
