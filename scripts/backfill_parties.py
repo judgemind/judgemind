@@ -45,6 +45,15 @@ _FRAMEWORK_SRC = os.path.join(
 )
 sys.path.insert(0, os.path.normpath(_FRAMEWORK_SRC))
 
+from framework.la_parser_utils import (  # noqa: E402
+    CASE_PARTIES_RE as _CASE_PARTIES_RE,
+    MAX_PARTY_NAME_LENGTH,
+    MOVING_PARTY_RE as _MOVING_PARTY_RE,
+    RESPONDING_PARTY_RE as _RESPONDING_PARTY_RE,
+    ROLE_MAP as _ROLE_MAP,
+    ROLE_PREFIX_RE as _ROLE_PREFIX_RE,
+    SKIP_RESPONDING_PHRASES as _SKIP_RESPONDING_PHRASES,
+)
 from framework.party_utils import is_name_fragment as _is_name_fragment  # noqa: E402, F401 — re-exported for tests
 from framework.party_utils import split_party_names as _split_party_names  # noqa: E402
 from ingestion.db import batch_upsert_parties  # noqa: E402
@@ -57,42 +66,9 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Party extraction regex — shared utilities imported from framework.party_utils.
-# Regex patterns that are specific to this script remain here.
+# Party extraction regex — shared patterns imported from framework.la_parser_utils.
+# See #1465 for deduplication rationale.
 # ---------------------------------------------------------------------------
-
-_CASE_PARTIES_RE = re.compile(
-    r"^(?P<plaintiff>.+?),?\s*\n\s*(?P<p_role>Plaintiff|Petitioner|Cross-Complainant)\(?s?\)?,?"
-    r"\s+vs\.\s+"
-    r"(?P<defendant>.+?),?\s*\n\s*(?P<d_role>Defendant|Respondent|Cross-Defendant)\(?s?\)?\.?",
-    re.DOTALL | re.MULTILINE,
-)
-
-_ROLE_MAP: dict[str, str] = {
-    "plaintiff": "plaintiff",
-    "petitioner": "petitioner",
-    "cross-complainant": "cross_complainant",
-    "defendant": "defendant",
-    "respondent": "respondent",
-    "cross-defendant": "cross_defendant",
-}
-
-_MOVING_PARTY_RE = re.compile(
-    r"MOVING PART(?:Y|IES)\s*:\s*(?P<name>.+?)(?:\.|$)",
-    re.IGNORECASE | re.MULTILINE,
-)
-_RESPONDING_PARTY_RE = re.compile(
-    r"(?:RESPONDING|OPPOSING) PART(?:Y|IES)\s*:\s*(?P<name>.+?)(?:\.|$)",
-    re.IGNORECASE | re.MULTILINE,
-)
-_ROLE_PREFIX_RE = re.compile(
-    r"^(?:Defendants?|Plaintiffs?|Petitioners?|Respondents?"
-    r"|Cross-Complainants?|Cross-Defendants?)[,\s]+",
-    re.IGNORECASE,
-)
-
-
-MAX_PARTY_NAME_LENGTH = 500  # btree index limit is ~900 chars; stay well under
 
 
 def _clean_party_name(raw: str) -> str:
@@ -163,7 +139,7 @@ def _extract_from_moving_responding(text: str) -> list[dict[str, str]]:
     moving_raw = m_match.group("name").strip()
     responding_raw = r_match.group("name").strip()
 
-    skip_phrases = ("no opposition", "none", "no response", "unopposed")
+    skip_phrases = _SKIP_RESPONDING_PHRASES
     for phrase in skip_phrases:
         if phrase in responding_raw.lower():
             return []

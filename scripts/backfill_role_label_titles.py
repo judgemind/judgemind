@@ -27,6 +27,22 @@ import re
 import sys
 
 import psycopg
+from framework.la_parser_utils import (
+    BARE_ROLE_LABELS as _BARE_ROLE_LABELS,
+    CASE_PARTIES_RE as _CASE_PARTIES_RE,
+    D_ROLE_RE as _D_ROLE_RE,
+    ENTITY_DESCRIPTOR_RE as _ENTITY_DESCRIPTOR_RE,
+    MAX_PARTY_NAME_LENGTH,
+    MOVING_PARTY_RE as _MOVING_PARTY_RE,
+    P_ROLE_RE as _P_ROLE_RE,
+    RESPONDING_PARTY_RE as _RESPONDING_PARTY_RE,
+    ROLE_MAP as _ROLE_MAP,
+    ROLE_PREFIX_RE as _ROLE_PREFIX_RE,
+    SKIP_RESPONDING_PHRASES as _SKIP_RESPONDING_PHRASES,
+    VS_RE as _VS_RE,
+)
+from framework.party_utils import is_name_fragment as _is_name_fragment
+from framework.party_utils import split_party_names as _split_party_names
 
 logging.basicConfig(
     level=logging.INFO,
@@ -34,157 +50,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Role labels that should never be party names.
-_BARE_ROLE_LABELS = frozenset(
-    w.lower()
-    for w in (
-        "Defendant",
-        "Defendants",
-        "Plaintiff",
-        "Plaintiffs",
-        "Petitioner",
-        "Petitioners",
-        "Respondent",
-        "Respondents",
-        "Cross-Complainant",
-        "Cross-Complainants",
-        "Cross-Defendant",
-        "Cross-Defendants",
-    )
-)
-
-# Role prefix regex — matches role labels followed by comma and/or whitespace.
-_ROLE_PREFIX_RE = re.compile(
-    r"^(?:Defendants?|Plaintiffs?|Petitioners?|Respondents?"
-    r"|Cross-Complainants?|Cross-Defendants?)[,\s]+",
-    re.IGNORECASE,
-)
-
-# Pattern to match MOVING PARTY / RESPONDING PARTY fields.
-_MOVING_PARTY_RE = re.compile(
-    r"MOVING PART(?:Y|IES)\s*:\s*(?P<name>.+?)(?:\.|$)",
-    re.IGNORECASE | re.MULTILINE,
-)
-_RESPONDING_PARTY_RE = re.compile(
-    r"(?:RESPONDING|OPPOSING) PART(?:Y|IES)\s*:\s*(?P<name>.+?)(?:\.|$)",
-    re.IGNORECASE | re.MULTILINE,
-)
-
-# Entity descriptor regex for title cleaning (same as la_tentatives.py).
-_ENTITY_DESCRIPTOR_RE = re.compile(
-    r",?\s*(?:"
-    r"An Individual(?:\s+And Derivatively On Behalf Of [^,;]+)?"
-    r"|An? (?:Alabama|Alaska|Arizona|Arkansas|California|Colorado|Connecticut"
-    r"|Delaware|District of Columbia|Florida|Georgia|Hawaii|Idaho|Illinois"
-    r"|Indiana|Iowa|Kansas|Kentucky|Louisiana|Maine|Maryland|Massachusetts"
-    r"|Michigan|Minnesota|Mississippi|Missouri|Montana|Nebraska|Nevada"
-    r"|New Hampshire|New Jersey|New Mexico|New York|North Carolina"
-    r"|North Dakota|Ohio|Oklahoma|Oregon|Pennsylvania|Rhode Island"
-    r"|South Carolina|South Dakota|Tennessee|Texas|Utah|Vermont|Virginia"
-    r"|Washington|West Virginia|Wisconsin|Wyoming)"
-    r" (?:Corporation|Limited Liability Company|Limited Partnership"
-    r"|General Partnership|Business Entity|Nonprofit Corporation|Public Entity)"
-    r"|A (?:Corporation|Limited Liability Company|Limited Partnership"
-    r"|General Partnership|Business Entity|Nonprofit Corporation|Public Entity)"
-    r"|Individually And As [^,;]+"
-    r"|By And Through [^,;]+"
-    r"|As Trustee Of [^,;]+"
-    # Hyphenated and non-hyphenated variants of successor/administrator phrases
-    r"|Successor[- ]In[- ]Interest To(?:\s+And [^,;]+)?"
-    r"|Administrator Of [^,;]+"
-    r"|As Administrator [^,;]+"
-    r"|Derivatively On Behalf Of [^,;]+"
-    r"|As An Individual"
-    r"|Form Unknown"
-    r"|Doe(?:s)? \d+ (?:To|Through) \d+(?:,? Inclusive)?"
-    r")",
-    re.IGNORECASE,
-)
-
-# Plaintiff/defendant role markers in caption blocks.
-_P_ROLE_RE = re.compile(
-    r"(?:^|\n)\s*(?:Plaintiff|Petitioner|Cross-Complainant)\(?s?\)?\s*[,.\n)]",
-    re.MULTILINE,
-)
-_D_ROLE_RE = re.compile(
-    r"(?:^|\n)\s*(?:Defendant|Respondent|Cross-Defendant)\(?s?\)?\s*[,.\n)]",
-    re.MULTILINE,
-)
-_VS_RE = re.compile(r"\bv(?:s)?\.", re.IGNORECASE)
-
-# Caption block regex for party extraction.
-_CASE_PARTIES_RE = re.compile(
-    r"^(?P<plaintiff>.+?),?\s*\n\s*"
-    r"(?P<p_role>Plaintiff|Petitioner|Cross-Complainant)\(?s?\)?,?"
-    r"\s+vs\.\s+"
-    r"(?P<defendant>.+?),?\s*\n\s*"
-    r"(?P<d_role>Defendant|Respondent|Cross-Defendant)\(?s?\)?\.?",
-    re.DOTALL | re.MULTILINE,
-)
-
-_ROLE_MAP: dict[str, str] = {
-    "plaintiff": "plaintiff",
-    "petitioner": "petitioner",
-    "cross-complainant": "cross_complainant",
-    "defendant": "defendant",
-    "respondent": "respondent",
-    "cross-defendant": "cross_defendant",
-}
-
-# Corporate suffix patterns — protect from comma splitting.
-_CORP_SUFFIX_RE = re.compile(
-    r",\s*(?:Inc|LLC|LLP|L\.?P\.?|Corp|Corporation|Ltd|Co|Company"
-    r"|N\.?A\.?|P\.?C\.?|PLLC|PLC)\.?(?=\s*(?:,|$))",
-    re.IGNORECASE,
-)
+# Shared regex patterns, constants, and utility functions are imported from
+# framework.la_parser_utils, framework.party_utils, and courts.ca.la_tentatives
+# above.  See #1465 for deduplication rationale.
 
 _MAX_TITLE_LENGTH = 120
-MAX_PARTY_NAME_LENGTH = 500
-
-
-def _is_name_fragment(name: str) -> bool:
-    """Return True if name is a fragment that should not be standalone."""
-    stripped = name.strip().rstrip(".,;: ")
-    if not stripped:
-        return True
-    upper = stripped.upper().rstrip(".")
-    corp_suffixes = {
-        "INC",
-        "LLC",
-        "LLP",
-        "LP",
-        "CORP",
-        "CORPORATION",
-        "LTD",
-        "CO",
-        "COMPANY",
-        "NA",
-        "PC",
-        "PLLC",
-        "PLC",
-    }
-    if upper in corp_suffixes:
-        return True
-    if " " not in stripped and len(stripped) < 4:
-        return True
-    return False
-
-
-def _split_party_names(text: str) -> list[str]:
-    """Split a multi-party string into individual names."""
-    placeholder = "\x00"
-    protected = _CORP_SUFFIX_RE.sub(
-        lambda m: m.group(0).replace(",", placeholder, 1), text
-    )
-    parts = re.split(r",\s+and\s+|,\s+", protected)
-    if len(parts) == 1:
-        parts = re.split(r"\s+and\s+", protected)
-    result: list[str] = []
-    for p in parts:
-        restored = p.replace(placeholder, ",").strip()
-        if restored and not _is_name_fragment(restored):
-            result.append(restored)
-    return result
 
 
 def _clean_name(raw: str) -> str:
@@ -254,7 +124,7 @@ def extract_title_from_moving_responding(ruling_text: str) -> str | None:
     moving_raw = m_match.group("name").strip()
     responding_raw = r_match.group("name").strip()
 
-    skip_phrases = ("no opposition", "none", "no response", "unopposed")
+    skip_phrases = _SKIP_RESPONDING_PHRASES
     for phrase in skip_phrases:
         if phrase in responding_raw.lower():
             return None
@@ -338,7 +208,7 @@ def _extract_parties_from_moving_responding(
     moving_raw = m_match.group("name").strip()
     responding_raw = r_match.group("name").strip()
 
-    skip_phrases = ("no opposition", "none", "no response", "unopposed")
+    skip_phrases = _SKIP_RESPONDING_PHRASES
     for phrase in skip_phrases:
         if phrase in responding_raw.lower():
             return []
