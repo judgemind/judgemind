@@ -27,6 +27,7 @@ def run_test(
     expect_exit: int,
     timeout: int | None = None,
     run_in_background: bool = False,
+    cwd_override: str | None = None,
 ) -> None:
     """Run the hook with a given command and assert the exit code."""
     global passed, failed
@@ -36,11 +37,15 @@ def run_test(
     if run_in_background:
         tool_input["run_in_background"] = True
     input_json = json.dumps({"tool_input": tool_input})
+    env = os.environ.copy()
+    if cwd_override is not None:
+        env["PREFLIGHT_CWD"] = cwd_override
     result = subprocess.run(
         ["bash", HOOK],
         input=input_json,
         capture_output=True,
         text=True,
+        env=env,
     )
     if result.returncode == expect_exit:
         print(f"  PASS: {description}")
@@ -241,17 +246,20 @@ run_test(
 )
 
 # Commands that SHOULD be allowed with run_in_background=true even without timeout
+# (only when NOT in a worktree — see check 9)
 run_test(
-    "pytest with run_in_background=true allowed (no timeout needed)",
+    "pytest with run_in_background=true allowed (no timeout needed, main repo)",
     ".venv/bin/pytest tests/ -v",
     0,
     run_in_background=True,
+    cwd_override="/Users/drewthaler/judgemind/judgemind-bootstrap",
 )
 run_test(
-    "gh run watch with run_in_background=true allowed",
+    "gh run watch with run_in_background=true allowed (main repo)",
     "gh run watch 12345 --interval 60",
     0,
     run_in_background=True,
+    cwd_override="/Users/drewthaler/judgemind/judgemind-bootstrap",
 )
 
 # Commands that should NOT trigger the timeout check
@@ -279,6 +287,82 @@ run_test(
     "ruff format allowed without timeout",
     ".venv/bin/ruff format --check src/ tests/",
     0,
+)
+
+# --- Check 9: run_in_background inside worktree subagents ---
+print("\nCheck 9: run_in_background inside worktree subagents")
+
+WORKTREE_CWD = "/Users/drewthaler/judgemind/judgemind-bootstrap/.claude/worktrees/agent-abc123"
+MAIN_REPO_CWD = "/Users/drewthaler/judgemind/judgemind-bootstrap"
+
+# Commands with run_in_background=true inside a worktree — should be BLOCKED
+run_test(
+    "gh run watch with run_in_background in worktree blocked",
+    "gh run watch 12345 --repo judgemind/judgemind --interval 60",
+    2,
+    timeout=600000,
+    run_in_background=True,
+    cwd_override=WORKTREE_CWD,
+)
+run_test(
+    "pytest with run_in_background in worktree blocked",
+    ".venv/bin/pytest tests/ -v",
+    2,
+    timeout=600000,
+    run_in_background=True,
+    cwd_override=WORKTREE_CWD,
+)
+run_test(
+    "simple command with run_in_background in worktree blocked",
+    "echo hello",
+    2,
+    run_in_background=True,
+    cwd_override=WORKTREE_CWD,
+)
+run_test(
+    "git status with run_in_background in worktree blocked",
+    "git status",
+    2,
+    run_in_background=True,
+    cwd_override=WORKTREE_CWD,
+)
+run_test(
+    "run_in_background in worker-N worktree blocked",
+    "echo test",
+    2,
+    run_in_background=True,
+    cwd_override="/Users/drewthaler/judgemind/judgemind-bootstrap/.claude/worktrees/worker-3",
+)
+
+# Commands with run_in_background=true from main repo — should be ALLOWED
+run_test(
+    "run_in_background from main repo allowed (tg-responder use case)",
+    "scripts/tg-responder.sh",
+    0,
+    run_in_background=True,
+    cwd_override=MAIN_REPO_CWD,
+)
+run_test(
+    "gh run watch with run_in_background from main repo allowed",
+    "gh run watch 12345 --interval 60",
+    0,
+    run_in_background=True,
+    cwd_override=MAIN_REPO_CWD,
+)
+
+# Commands WITHOUT run_in_background inside a worktree — should be ALLOWED
+run_test(
+    "gh run watch without run_in_background in worktree allowed (with timeout)",
+    "gh run watch 12345 --repo judgemind/judgemind --interval 60",
+    0,
+    timeout=600000,
+    cwd_override=WORKTREE_CWD,
+)
+run_test(
+    "simple command without run_in_background in worktree allowed",
+    "echo hello",
+    0,
+    cwd_override=WORKTREE_CWD,
 )
 
 # --- Summary ---

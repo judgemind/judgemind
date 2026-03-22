@@ -25,6 +25,9 @@ fi
 TIMEOUT=$(echo "$INPUT" | python3 -c "import sys,json; d=json.load(sys.stdin); t=d.get('tool_input',{}).get('timeout'); print(t if t is not None else 'none')" 2>/dev/null)
 RUN_IN_BG=$(echo "$INPUT" | python3 -c "import sys,json; d=json.load(sys.stdin); print(str(d.get('tool_input',{}).get('run_in_background', False)).lower())" 2>/dev/null)
 
+# Allow tests to override the working directory for check 9.
+EFFECTIVE_CWD="${PREFLIGHT_CWD:-$PWD}"
+
 # --- Forbidden pattern checks ---
 # Note: uses grep -E (POSIX extended regex) for macOS compatibility. Do NOT use grep -P.
 
@@ -182,6 +185,19 @@ if [ "$RUN_IN_BG" != "true" ]; then
                 exit 2
             fi
         fi
+    fi
+fi
+
+# 9. run_in_background inside worktree subagents.
+#    Subagents spawned with isolation: "worktree" are already background tasks.
+#    Further backgrounding causes completion notifications to surface in the wrong
+#    context (the parent/dispatcher), leading to confusion and lost results.
+#    Detection: cwd contains ".claude/worktrees/" in its path.
+#    Exception: the tg-responder daemon runs from the main repo, not a worktree.
+if [ "$RUN_IN_BG" = "true" ]; then
+    if echo "$EFFECTIVE_CWD" | grep -qE '\.claude/worktrees/' ; then
+        echo "BLOCKED: run_in_background is not allowed inside worktree subagents. Use timeout: 600000 instead. See CLAUDE.md §Critical Rules." >&2
+        exit 2
     fi
 fi
 
