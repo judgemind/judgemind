@@ -131,26 +131,37 @@ FAKEPY
     chmod +x "$venv_dir/bin/python3"
 }
 
-# Run gemini-review.sh with the mock scripts directory prepended to PATH
-# so that with-secret.sh is intercepted. Also override SCRIPT_DIR
-# resolution by creating a symlink structure.
+# Run gemini-review.sh with mock scripts so that with-secret.sh and
+# gemini_review.py are intercepted. Each invocation gets its own copy
+# of the mock scripts directory to avoid races when two invocations
+# run in parallel (Test 7).
 run_gemini_review() {
     local worktree="$1"
     shift
-    local mock_scripts="$worktree/_mock_scripts"
+    local base_mock="$worktree/_mock_scripts"
+
+    # Create a per-invocation copy of the mock scripts directory so that
+    # parallel invocations do not race on cp/chmod/exec of the same file.
+    local run_dir
+    run_dir=$(mktemp -d "${base_mock}_run.XXXXXX")
+    TEMP_DIRS+=("$run_dir")
+
+    # Copy all mock helpers (with-secret.sh, gemini_review.py) from the
+    # base mock directory that setup_fake_worktree created.
+    cp -R "$base_mock"/* "$run_dir/"
 
     # The script uses SCRIPT_DIR based on its own location. We need the
     # script to find our mock with-secret.sh and mock gemini_review.py.
-    # Strategy: copy gemini-review.sh into the mock scripts dir and run
-    # from there so SCRIPT_DIR resolves to mock_scripts.
-    cp "$GEMINI_REVIEW" "$mock_scripts/gemini-review.sh"
-    chmod +x "$mock_scripts/gemini-review.sh"
+    # Strategy: copy gemini-review.sh into the per-invocation dir and run
+    # from there so SCRIPT_DIR resolves to run_dir.
+    cp "$GEMINI_REVIEW" "$run_dir/gemini-review.sh"
+    chmod +x "$run_dir/gemini-review.sh"
 
     # Also create a mock requirements.txt in case the fallback venv path
     # tries to install from it.
-    touch "$mock_scripts/requirements.txt"
+    touch "$run_dir/requirements.txt"
 
-    "$mock_scripts/gemini-review.sh" "$worktree" "$@" 2>&1
+    "$run_dir/gemini-review.sh" "$worktree" "$@" 2>&1
 }
 
 # ── Tests ────────────────────────────────────────────────────────────────────
