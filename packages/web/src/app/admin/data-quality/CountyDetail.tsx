@@ -116,7 +116,7 @@ export function CountyDetail({ county, overview, onBack }: CountyDetailProps) {
             onClick={() => setDaysRange(d)}
             className={`rounded-md px-3 py-1.5 text-sm ${
               daysRange === d
-                ? 'bg-brand-600 text-white'
+                ? 'bg-brand-accent text-white'
                 : 'border border-slate-300 text-slate-700 hover:bg-slate-50 dark:border-slate-600 dark:text-slate-300 dark:hover:bg-slate-800'
             }`}
           >

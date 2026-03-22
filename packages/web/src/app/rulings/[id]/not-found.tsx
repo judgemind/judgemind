@@ -12,7 +12,7 @@ export default function RulingNotFound() {
         </p>
         <Link
           href="/rulings"
-          className="mt-4 inline-block rounded-lg bg-brand-600 px-4 py-2 text-sm font-medium text-white hover:bg-brand-700"
+          className="mt-4 inline-block rounded-lg bg-brand-accent px-4 py-2 text-sm font-medium text-white hover:bg-brand-accent-hover"
         >
           Back to Rulings
         </Link>

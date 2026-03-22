@@ -185,7 +185,7 @@ export function Autocomplete({
               }}
               className={`cursor-pointer px-3 py-2 text-sm ${
                 i === activeIndex
-                  ? 'bg-brand-100 text-brand-900 dark:bg-brand-800 dark:text-brand-100'
+                  ? 'bg-brand-accent-surface text-amber-900 dark:bg-amber-900/30 dark:text-amber-100'
                   : 'text-slate-900 hover:bg-slate-100 dark:text-slate-100 dark:hover:bg-slate-700'
               }`}
             >

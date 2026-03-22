@@ -41,7 +41,7 @@ export function Header() {
           <Menu className="h-5 w-5" aria-hidden="true" />
         </Button>
 
-        <Link href="/" className="mr-8 rounded-md text-lg font-semibold text-brand-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 dark:text-brand-500">
+        <Link href="/" className="mr-8 rounded-md text-lg font-semibold text-brand-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 dark:text-brand-accent-light">
           Judgemind
         </Link>
 
@@ -106,7 +106,7 @@ export function Header() {
       <Sheet open={menuOpen} onOpenChange={setMenuOpen}>
         <SheetContent side="left" className="w-64 p-0">
           <SheetHeader className="border-b px-4 py-3">
-            <SheetTitle className="text-lg font-semibold text-brand-700 dark:text-brand-500">
+            <SheetTitle className="text-lg font-semibold text-brand-accent dark:text-brand-accent-light">
               Judgemind
             </SheetTitle>
           </SheetHeader>
