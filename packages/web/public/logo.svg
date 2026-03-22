@@ -1,0 +1,39 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="480" viewBox="0 0 900 480" role="img" aria-label="judgemind logo">
+  <g fill="#292524" stroke-linecap="round" stroke-linejoin="round">
+    <!-- vertical axis -->
+    <line x1="300" y1="52" x2="300" y2="280" stroke="#292524" stroke-width="7"/>
+    <!-- scale bar -->
+    <line x1="200" y1="120" x2="400" y2="120" stroke="#292524" stroke-width="7"/>
+    <!-- left chain -->
+    <line x1="200" y1="120" x2="168" y2="195" stroke="#292524" stroke-width="4"/>
+    <line x1="200" y1="120" x2="232" y2="195" stroke="#292524" stroke-width="4"/>
+    <!-- left tray -->
+    <line x1="168" y1="195" x2="232" y2="195" stroke="#292524" stroke-width="8"/>
+    <!-- right chain -->
+    <line x1="400" y1="120" x2="368" y2="195" stroke="#292524" stroke-width="4"/>
+    <line x1="400" y1="120" x2="432" y2="195" stroke="#292524" stroke-width="4"/>
+    <!-- right tray -->
+    <line x1="368" y1="195" x2="432" y2="195" stroke="#292524" stroke-width="8"/>
+    <!-- base -->
+    <line x1="245" y1="280" x2="355" y2="280" stroke="#292524" stroke-width="8"/>
+
+    <!-- nodes -->
+    <circle cx="300" cy="52" r="13"/>
+    <circle cx="300" cy="120" r="14"/>
+    <circle cx="200" cy="120" r="11"/>
+    <circle cx="400" cy="120" r="11"/>
+    <circle cx="168" cy="195" r="9"/>
+    <circle cx="232" cy="195" r="9"/>
+    <circle cx="368" cy="195" r="9"/>
+    <circle cx="432" cy="195" r="9"/>
+    <circle cx="245" cy="280" r="10"/>
+    <circle cx="355" cy="280" r="10"/>
+  </g>
+
+  <!-- Wordmark -->
+  <text x="300" y="400" text-anchor="middle"
+        font-family="Inter, Helvetica, Arial, sans-serif"
+        font-size="80" letter-spacing="0.5">
+    <tspan fill="#292524" font-weight="300">judge</tspan><tspan fill="#b45309" font-weight="600">mind</tspan>
+  </text>
+</svg>
