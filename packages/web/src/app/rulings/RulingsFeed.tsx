@@ -207,7 +207,7 @@ export function RulingsFeed() {
           options={countyOptions}
           placeholder="County (e.g. Los Angeles)"
           aria-label="County"
-          className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900 placeholder-slate-400 focus:border-brand-500 focus:outline-none focus:ring-1 focus:ring-brand-500 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 dark:placeholder-slate-500"
+          className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900 placeholder-slate-400 focus-visible:border-brand-500 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-brand-500 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 dark:placeholder-slate-500"
         />
         <input
           type="date"
@@ -216,7 +216,7 @@ export function RulingsFeed() {
           onChange={(e) => setDateFrom(e.target.value)}
           aria-label="Hearings from"
           title="Hearings from"
-          className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900 focus:border-brand-500 focus:outline-none focus:ring-1 focus:ring-brand-500 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100"
+          className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900 focus-visible:border-brand-500 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-brand-500 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100"
         />
         <input
           type="date"
@@ -225,7 +225,7 @@ export function RulingsFeed() {
           onChange={(e) => setDateTo(e.target.value)}
           aria-label="Hearings to"
           title="Hearings to"
-          className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900 focus:border-brand-500 focus:outline-none focus:ring-1 focus:ring-brand-500 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100"
+          className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900 focus-visible:border-brand-500 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-brand-500 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100"
         />
       </div>
 
@@ -264,7 +264,7 @@ export function RulingsFeed() {
                     {node.case ? (
                       <Link
                         href={`/rulings/${node.id}`}
-                        className="block truncate font-medium text-slate-900 hover:text-brand-600 dark:text-slate-100 dark:hover:text-brand-400"
+                        className="block truncate rounded-sm font-medium text-slate-900 hover:text-brand-600 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring dark:text-slate-100 dark:hover:text-brand-400"
                       >
                         {node.case.caseNumber}
                         {node.case.caseTitle ? ` \u2014 ${node.case.caseTitle}` : ''}

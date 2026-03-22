@@ -140,7 +140,7 @@ export function JudgesList() {
       {/* Filter */}
       <div className="mb-4">
         <div className="relative max-w-sm">
-          <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+          <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" aria-hidden="true" />
           <Input
             type="text"
             name="judgeName"
@@ -202,7 +202,7 @@ export function JudgesList() {
                 <TableCell className="font-medium">
                   <Link
                     href={`/judges/${node.id}`}
-                    className="hover:text-primary hover:underline"
+                    className="rounded-sm hover:text-primary hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
                   >
                     {node.canonicalName}
                   </Link>

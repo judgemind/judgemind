@@ -235,7 +235,7 @@ function FilterContent({
     <div className="space-y-6">
       <div>
         <h2 className="flex items-center gap-2 text-sm font-semibold text-foreground">
-          <SlidersHorizontal className="h-4 w-4" />
+          <SlidersHorizontal className="h-4 w-4" aria-hidden="true" />
           Filters
         </h2>
       </div>
@@ -275,7 +275,7 @@ function FilterContent({
       {/* Motion type */}
       <fieldset className="space-y-2">
         <legend className="flex items-center gap-2 text-sm font-medium">
-          <Scale className="h-4 w-4 text-muted-foreground" />
+          <Scale className="h-4 w-4 text-muted-foreground" aria-hidden="true" />
           Motion Type
         </legend>
         <div className="space-y-2">
@@ -302,7 +302,7 @@ function FilterContent({
       {/* Outcome */}
       <fieldset className="space-y-2">
         <legend className="flex items-center gap-2 text-sm font-medium">
-          <Gavel className="h-4 w-4 text-muted-foreground" />
+          <Gavel className="h-4 w-4 text-muted-foreground" aria-hidden="true" />
           Outcome
         </legend>
         <div className="space-y-2">
@@ -329,7 +329,7 @@ function FilterContent({
       {/* Date range */}
       <div className="space-y-3">
         <div className="flex items-center gap-2 text-sm font-medium">
-          <Calendar className="h-4 w-4 text-muted-foreground" />
+          <Calendar className="h-4 w-4 text-muted-foreground" aria-hidden="true" />
           Date Range
         </div>
         <div className="space-y-2">
@@ -362,7 +362,7 @@ function ResultCard({ node }: { node: SearchHitNode }) {
   const outcomeBadgeVariant = getOutcomeBadgeVariant(node.outcome);
 
   return (
-    <Link href={`/rulings/${node.rulingId}`} className="block">
+    <Link href={`/rulings/${node.rulingId}`} className="block rounded-lg focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2">
       <Card className="transition-colors hover:bg-accent/50">
         <CardContent className="p-4">
           {/* Top row: case info + hearing date */}
@@ -586,7 +586,7 @@ export function SearchPage() {
       <form onSubmit={handleSubmit}>
         <div className="flex gap-2">
           <div className="relative flex-1">
-            <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+            <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" aria-hidden="true" />
             <Input
               type="search"
               value={q}
@@ -601,7 +601,7 @@ export function SearchPage() {
           <Sheet open={mobileFiltersOpen} onOpenChange={setMobileFiltersOpen}>
             <SheetTrigger asChild>
               <Button variant="outline" size="icon" className="lg:hidden" aria-label="Open filters">
-                <SlidersHorizontal className="h-4 w-4" />
+                <SlidersHorizontal className="h-4 w-4" aria-hidden="true" />
               </Button>
             </SheetTrigger>
             <SheetContent side="left" className="w-80 overflow-y-auto">
@@ -634,7 +634,7 @@ export function SearchPage() {
           {!hasSearched && (
             <Card className="border-dashed">
               <CardContent className="flex flex-col items-center justify-center py-16">
-                <Search className="mb-4 h-12 w-12 text-muted-foreground/50" />
+                <Search className="mb-4 h-12 w-12 text-muted-foreground/50" aria-hidden="true" />
                 <p className="text-lg font-medium text-muted-foreground">
                   Enter a search term to begin
                 </p>
@@ -673,7 +673,7 @@ export function SearchPage() {
             edges.length === 0 && (
               <Card className="border-dashed">
                 <CardContent className="flex flex-col items-center justify-center py-16">
-                  <Search className="mb-4 h-12 w-12 text-muted-foreground/50" />
+                  <Search className="mb-4 h-12 w-12 text-muted-foreground/50" aria-hidden="true" />
                   <p className="text-lg font-medium text-muted-foreground">
                     No results for your search
                   </p>

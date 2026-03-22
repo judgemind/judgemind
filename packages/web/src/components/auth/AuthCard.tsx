@@ -27,7 +27,7 @@ export function AuthCard({ title, children }: AuthCardProps) {
         <div className="mb-8 text-center">
           <Link
             href="/"
-            className="text-2xl font-bold text-brand-700 dark:text-brand-500"
+            className="rounded-md text-2xl font-bold text-brand-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 dark:text-brand-500"
           >
             Judgemind
           </Link>

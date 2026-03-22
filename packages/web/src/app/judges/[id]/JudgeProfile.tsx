@@ -325,7 +325,7 @@ export function JudgeProfile({ judgeId }: { judgeId: string }) {
           <Card>
             <CardHeader className="pb-3">
               <CardTitle className="flex items-center gap-2 text-base">
-                <Scale className="h-4 w-4 text-muted-foreground" />
+                <Scale className="h-4 w-4 text-muted-foreground" aria-hidden="true" />
                 Motion Type Breakdown
               </CardTitle>
             </CardHeader>
@@ -413,7 +413,7 @@ export function JudgeProfile({ judgeId }: { judgeId: string }) {
                   {node.case ? (
                     <Link
                       href={`/cases/${node.case.id}`}
-                      className="hover:underline"
+                      className="rounded-sm hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
                     >
                       <p className="truncate text-sm font-medium text-foreground">
                         {node.case.caseNumber}
@@ -472,7 +472,7 @@ export function JudgeProfile({ judgeId }: { judgeId: string }) {
       {/* Analytics section */}
       <section>
         <h2 className="mb-3 flex items-center gap-2 text-sm font-semibold uppercase tracking-wide text-muted-foreground">
-          <BarChart3 className="h-4 w-4" />
+          <BarChart3 className="h-4 w-4" aria-hidden="true" />
           Analytics
         </h2>
         {renderAnalytics()}
