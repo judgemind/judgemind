@@ -1298,8 +1298,8 @@ _QUALITY_QUERIES: dict[str, str] = {
         SELECT COUNT(DISTINCT c.id) FROM cases c
         JOIN documents d ON d.case_id = c.id AND d.status = 'active'
         JOIN courts ct ON ct.id = d.court_id
-        LEFT JOIN parties p ON p.case_id = c.id
-        WHERE p.id IS NULL
+        LEFT JOIN case_parties cp ON cp.case_id = c.id
+        WHERE cp.id IS NULL
         {county_filter}
     """,
     "all_caps_titles": """
