@@ -30,6 +30,7 @@ jobs:
       infra-lambda: ${{ steps.changes.outputs.infra-lambda }}
       scripts: ${{ steps.changes.outputs.scripts }}
       ecs-oneshot: ${{ steps.changes.outputs.ecs-oneshot }}
+      dockerfile: ${{ steps.changes.outputs.dockerfile }}
       migrations: ${{ steps.changes.outputs.migrations }}
       any-testable: ${{ steps.any-testable.outputs.result }}
     steps:
@@ -79,6 +80,9 @@ jobs:
               - 'packages/scraper-framework/Dockerfile'
               - 'packages/scraper-framework/pyproject.toml'
               - '.github/ecs-oneshot-test/**'
+            dockerfile:
+              - 'packages/scraper-framework/Dockerfile'
+              - '.github/playwright-browser-check/**'
             migrations:
               - 'packages/api/migrations/**'
       - name: Check if any coverage-producing package changed
@@ -902,6 +906,35 @@ jobs:
         run: .github/ecs-oneshot-test/run-tests.sh
 
   # ---------------------------------------------------------------
+  # Playwright browser binary accessibility check (#1637)
+  # Builds the scraper-framework Docker image and verifies the
+  # non-root scraper user can resolve the Chromium binary path.
+  # Catches regressions like #1625 before they reach production.
+  # ---------------------------------------------------------------
+  playwright-browser-check:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.dockerfile == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Build scraper-framework Docker image
+        run: |
+          docker build \
+            -f packages/scraper-framework/Dockerfile \
+            -t judgemind/scraper-framework:ci-test \
+            .
+
+      - name: Verify Playwright Chromium binary accessible as scraper user
+        run: |
+          docker run --rm \
+            --entrypoint python3 \
+            -v "$PWD/.github/playwright-browser-check/verify_browser.py:/tmp/verify_browser.py:ro" \
+            judgemind/scraper-framework:ci-test \
+            /tmp/verify_browser.py
+
+  # ---------------------------------------------------------------
   # Migration notice: comment on PRs that include migration changes
   # ---------------------------------------------------------------
   migration-notice:
@@ -939,7 +972,7 @@ jobs:
   # Always runs. Reports success only when every applicable job passed or was
   # skipped (path filter did not match). Branch protection requires this check.
   ci-passed:
-    needs: [scraper-framework-tests, scraper-court-tests, ingestion-tests, nlp-tests, api-tests, web-tests, telegram-bridge-tests, infra-validate, lambda-tests, scripts-tests, coverage-check, deprecated-models-check, hardcoded-models-check, hardcoded-colors-check, oneshot-imports-check, duplicate-functions-check, schema-drift-check, dq-baselines-validate, ecs-oneshot-test, migration-files-check, sql-conflict-check]
+    needs: [scraper-framework-tests, scraper-court-tests, ingestion-tests, nlp-tests, api-tests, web-tests, telegram-bridge-tests, infra-validate, lambda-tests, scripts-tests, coverage-check, deprecated-models-check, hardcoded-models-check, hardcoded-colors-check, oneshot-imports-check, duplicate-functions-check, schema-drift-check, dq-baselines-validate, ecs-oneshot-test, migration-files-check, sql-conflict-check, playwright-browser-check]
     if: always()
     runs-on: ubuntu-latest
     steps:
