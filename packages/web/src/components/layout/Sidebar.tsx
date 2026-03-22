@@ -110,7 +110,7 @@ function SidebarLink({
       size="sm"
       className={cn(
         'w-full justify-start gap-2',
-        active && 'bg-accent text-accent-foreground font-medium',
+        active && 'bg-accent text-accent-foreground font-medium border-l-2 border-primary',
       )}
       asChild
     >

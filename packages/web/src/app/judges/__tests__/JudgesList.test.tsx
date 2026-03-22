@@ -152,7 +152,7 @@ describe('JudgesList', () => {
     expect(screen.getByText(/Orange/)).toBeInTheDocument();
   });
 
-  it('renders active/inactive badges', () => {
+  it('only renders badge for inactive judges, not active ones', () => {
     mockUseQuery.mockReturnValue({
       data: MOCK_JUDGES_DATA,
       loading: false,
@@ -161,7 +161,7 @@ describe('JudgesList', () => {
     });
 
     render(<JudgesList />);
-    expect(screen.getByText('Active')).toBeInTheDocument();
+    expect(screen.queryByText('Active')).not.toBeInTheDocument();
     expect(screen.getByText('Inactive')).toBeInTheDocument();
   });
 

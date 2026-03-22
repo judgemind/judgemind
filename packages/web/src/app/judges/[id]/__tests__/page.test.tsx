@@ -117,7 +117,7 @@ describe('JudgeDetailPage (SSR)', () => {
     expect(profile?.props?.judgeId).toBe('judge-1');
   });
 
-  it('renders active status Badge for active judge', async () => {
+  it('does not render badge for active judge', async () => {
     mockQuery.mockResolvedValueOnce({
       data: {
         judge: {
@@ -132,7 +132,9 @@ describe('JudgeDetailPage (SSR)', () => {
 
     const result = await JudgeDetailPage({ params: { id: 'judge-1' } });
     const activeBadge = findInTree(result, (n) => n.props?.children === 'Active');
-    expect(activeBadge).toBeTruthy();
+    expect(activeBadge).toBeNull();
+    const inactiveBadge = findInTree(result, (n) => n.props?.children === 'Inactive');
+    expect(inactiveBadge).toBeNull();
   });
 
   it('renders inactive status Badge for inactive judge', async () => {

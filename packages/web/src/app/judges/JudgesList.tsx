@@ -214,9 +214,9 @@ export function JudgesList() {
                   {node.department ? `Dept. ${node.department}` : '\u2014'}
                 </TableCell>
                 <TableCell>
-                  <Badge variant={node.isActive ? 'default' : 'secondary'}>
-                    {node.isActive ? 'Active' : 'Inactive'}
-                  </Badge>
+                  {!node.isActive && (
+                    <Badge variant="secondary">Inactive</Badge>
+                  )}
                 </TableCell>
               </TableRow>
             ))}
