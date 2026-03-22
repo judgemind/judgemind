@@ -28,11 +28,27 @@ vi.mock('@/components/layout/Header', () => ({
   Header: () => <header data-testid="header">Header</header>,
 }));
 
-import RootLayout from '../layout';
+import RootLayout, { metadata } from '../layout';
 
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+describe('metadata', () => {
+  it('sets metadataBase to NEXT_PUBLIC_SITE_URL or default dev domain', () => {
+    expect(metadata.metadataBase).toBeInstanceOf(URL);
+    // Without NEXT_PUBLIC_SITE_URL env var, falls back to dev domain
+    expect(metadata.metadataBase?.toString()).toBe('https://dev.judgemind.org/');
+  });
+
+  it('includes openGraph metadata with an OG image', () => {
+    expect(metadata.openGraph).toBeDefined();
+    const og = metadata.openGraph as { images: Array<{ url: string }> };
+    expect(og.images).toBeDefined();
+    expect(og.images.length).toBeGreaterThan(0);
+    expect(og.images[0].url).toBe('/og-image.png');
+  });
+});
 
 describe('RootLayout', () => {
   it('renders children within the provider stack', () => {

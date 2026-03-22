@@ -36,6 +36,11 @@ resource "vercel_project" "web" {
       value  = var.graphql_url
       target = ["production", "preview"]
     },
+    {
+      key    = "NEXT_PUBLIC_SITE_URL"
+      value  = var.site_url
+      target = ["production", "preview"]
+    },
   ]
 }
 
