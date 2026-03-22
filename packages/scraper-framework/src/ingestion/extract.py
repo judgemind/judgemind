@@ -390,6 +390,79 @@ _CASE_TYPE_PREFIX_PATTERNS: list[tuple[re.Pattern[str], str]] = [
 ]
 
 
+def is_valid_case_number(value: str) -> bool:
+    """Return True if *value* looks like a valid case number, not a case title.
+
+    Rejects values that contain adversarial party indicators ("vs", "v."),
+    legal citation patterns, or prose text.  These are common false positives
+    from LLM extraction on documents that lack formal case numbers (e.g. OC
+    North Justice Center PDFs).
+
+    Examples of invalid "case numbers" this catches:
+        - "Smith v. Kia" (case title)
+        - "Catalan v. FCA" (case title)
+        - "Cal. App. 4th 1, 20; DuPont Merck" (legal citation)
+        - "Tuinenburg v. Before the Court is a demurrer" (case title + ruling text)
+    """
+    if not value or not value.strip():
+        return False
+    stripped = value.strip()
+    # Reject if it contains "vs", "vs.", or "v." — this is a case title
+    if re.search(r"\bvs?\.?\s", stripped, re.IGNORECASE):
+        return False
+    # Reject if it contains ruling text indicators
+    if re.search(
+        r"\b(?:the court|motion|demurrer|granted|denied|hearing|ruling|"
+        r"tentative|calendar|petition|application)\b",
+        stripped,
+        re.IGNORECASE,
+    ):
+        return False
+    # Reject legal citations (e.g. "Cal. App. 4th 1, 20")
+    if re.search(r"\bCal\.\s*App\b|\bF\.\s*Supp\b|\bF\.\s*\d", stripped, re.IGNORECASE):
+        return False
+    # Reject if it's very long (case numbers are short, titles are long)
+    if len(stripped) > 30:
+        return False
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Case type extraction from scraper ID
+# ---------------------------------------------------------------------------
+
+# Maps scraper_id substrings to case_type values.  The scraper_id encodes
+# the court and case category (e.g. "ca-oc-tentatives-civil" -> civil).
+_SCRAPER_ID_CASE_TYPE_MAP: list[tuple[str, str]] = [
+    ("civil", "civil"),
+    ("family", "family"),
+    ("probate", "probate"),
+    ("criminal", "criminal"),
+    ("small-claims", "small_claims"),
+    ("juvenile", "juvenile"),
+    ("traffic", "traffic"),
+]
+
+
+def extract_case_type_from_scraper_id(scraper_id: str) -> str | None:
+    """Infer case type from a scraper_id string.
+
+    This is a zero-cost fallback when neither the LLM nor the case number
+    prefix yields a case_type.  Scraper IDs encode the case category in
+    their suffix (e.g. ``ca-oc-tentatives-civil``).
+
+    Returns one of the case type strings, or ``None`` if the scraper_id
+    does not contain a recognized case type indicator.
+    """
+    if not scraper_id:
+        return None
+    scraper_lower = scraper_id.lower()
+    for keyword, case_type in _SCRAPER_ID_CASE_TYPE_MAP:
+        if keyword in scraper_lower:
+            return case_type
+    return None
+
+
 def extract_case_type_from_number(case_number: str) -> str | None:
     """Infer case type from a California case number prefix.
 

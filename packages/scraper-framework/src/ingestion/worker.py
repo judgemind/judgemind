@@ -55,11 +55,13 @@ from .extract import (
     extract_case_number,
     extract_case_title,
     extract_case_type_from_number,
+    extract_case_type_from_scraper_id,
     extract_hearing_date,
     extract_judge_name,
     extract_motion_type,
     extract_outcome,
     extract_parties_from_caption,
+    is_valid_case_number,
 )
 from .extraction_config import ExtractionMethod, get_extraction_method
 from .llm_extract import (
@@ -608,8 +610,23 @@ class IngestionWorker:
                 # Apply ruling-level fields from the matched ruling
                 if ruling is not None:
                     if not case_number and ruling.case_number:
-                        case_number = ruling.case_number
-                        extraction_methods["case_number"] = "llm"
+                        if is_valid_case_number(ruling.case_number):
+                            case_number = ruling.case_number
+                            extraction_methods["case_number"] = "llm"
+                        else:
+                            # LLM returned a case title as case_number —
+                            # use it as case_title instead (#1524).
+                            logger.warning(
+                                "LLM case_number looks like a case title — "
+                                "redirecting to case_title",
+                                extra={
+                                    "document_id": document_id,
+                                    "rejected_case_number": ruling.case_number[:80],
+                                },
+                            )
+                            if not case_title:
+                                case_title = ruling.case_number
+                                extraction_methods["case_title"] = "llm_redirect"
                     if not case_title and ruling.case_title:
                         case_title = ruling.case_title
                         extraction_methods["case_title"] = "llm"
@@ -748,6 +765,15 @@ class IngestionWorker:
             case_type = extract_case_type_from_number(case_number)
             if case_type:
                 extraction_methods.setdefault("case_type", "regex")
+
+        # Fallback case_type from scraper_id (#1524).
+        # When the case number is absent or doesn't encode a type prefix
+        # (e.g. OC North JC PDFs have no case numbers), infer from the
+        # scraper_id which encodes the case category in its suffix.
+        if case_type is None and scraper_id:
+            case_type = extract_case_type_from_scraper_id(scraper_id)
+            if case_type:
+                extraction_methods.setdefault("case_type", "scraper_id")
 
         if extraction_methods:
             logger.info(

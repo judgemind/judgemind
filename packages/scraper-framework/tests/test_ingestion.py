@@ -2043,6 +2043,79 @@ def test_process_event_scraper_fields_take_precedence_over_llm(
 
 
 # ---------------------------------------------------------------------------
+# LLM invalid case_number redirect (#1524)
+# ---------------------------------------------------------------------------
+
+
+@patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
+@patch("ingestion.worker.extract_fields_llm")
+@patch("ingestion.worker.psycopg")
+def test_process_event_llm_invalid_case_number_redirected_to_title(
+    mock_psycopg: MagicMock,
+    mock_llm: MagicMock,
+    mock_resolve_judge: MagicMock,
+) -> None:
+    """When LLM returns a case title as case_number, it should be redirected
+    to case_title and not used as case_number (#1524)."""
+    from ingestion.llm_extract import LLMExtractionResult, LLMRulingResult
+
+    worker, os_mock = _make_worker()
+    worker._llm_client = MagicMock()
+
+    mock_conn, mock_cur = _make_mock_conn()
+    mock_psycopg.connect.return_value = mock_conn
+    mock_cur.fetchone.side_effect = [
+        ("court-uuid-1",),  # upsert_court
+        ("case-uuid-1",),  # upsert_case
+        (True,),  # insert_document: RETURNING is_new = True
+        # batch_upsert_parties: executemany RETURNING ids for caption parties
+        ("party-uuid-1",),
+        ("party-uuid-2",),
+    ]
+    # batch_upsert_parties SELECT returns no existing aliases
+    mock_cur.fetchall.return_value = []
+    # nextset for executemany returning
+    mock_cur.nextset.side_effect = [True, False]
+    mock_cur.rowcount = 1
+
+    # LLM returns a case title ("Smith v. Kia") as case_number
+    mock_llm.return_value = LLMExtractionResult(
+        judge_name="Ellis",
+        hearing_date=date(2026, 3, 10),
+        department="56",
+        case_count=1,
+        rulings=[
+            LLMRulingResult(
+                case_number="Smith v. Kia",  # Invalid — this is a title
+                case_title=None,
+                outcome="granted",
+                motion_type="msj",
+                parties=[],
+            )
+        ],
+    )
+
+    event = _make_event(
+        case_number=None,
+        case_title=None,
+        outcome=None,
+        motion_type=None,
+        ruling_text="The motion is granted.",
+    )
+    worker.process_event(event)
+
+    # The invalid case_number should NOT appear as case_number in the SQL
+    case_calls = [c for c in mock_cur.execute.call_args_list if "INSERT INTO cases" in str(c)]
+    assert len(case_calls) == 1
+    case_args = case_calls[0][0][1]
+    # "Smith v. Kia" should be used as case_title, not as case_number
+    # The case_number should be UNKNOWN-<doc_id> (from the fallback)
+    assert "Smith v. Kia" not in str(case_args[0])  # case_number is first arg
+    # The case_title should contain the redirected value
+    assert "Smith v. Kia" in str(case_args)
+
+
+# ---------------------------------------------------------------------------
 # _match_ruling unit tests
 # ---------------------------------------------------------------------------
 
