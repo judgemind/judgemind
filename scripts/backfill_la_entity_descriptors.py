@@ -26,16 +26,11 @@ from __future__ import annotations
 import argparse
 import logging
 import os
-import re
 import sys
 
 import psycopg
-from courts.ca.la_tentatives import (
-    _DEPT_HEADER_BOILERPLATE_RE,
-    _ENTITY_DESCRIPTOR_RE,
-    _MAX_TITLE_LENGTH,
-    _sanitize_title,
-)
+from courts.ca.la_tentatives import _sanitize_title
+from courts.ca.la_title_utils import extract_clean_title
 
 logging.basicConfig(
     level=logging.INFO,
@@ -71,130 +66,6 @@ def sanitize_title_lenient(raw_title: str | None) -> str | None:
     return _sanitize_title(raw_title, max_length=_BACKFILL_MAX_TITLE_LENGTH)
 
 
-# ---------------------------------------------------------------------------
-# Title extraction from ruling text (fallback strategies)
-# ---------------------------------------------------------------------------
-
-_P_ROLE_RE = re.compile(
-    r"(?:^|\n)\s*(?:Plaintiff|Petitioner|Cross-Complainant)\(?s?\)?\s*[,.\n)]",
-    re.MULTILINE,
-)
-_D_ROLE_RE = re.compile(
-    r"(?:^|\n)\s*(?:Defendant|Respondent|Cross-Defendant)\(?s?\)?\s*[,.\n)]",
-    re.MULTILINE,
-)
-_VS_RE = re.compile(r"\bv(?:s)?\.", re.IGNORECASE)
-
-_MOVING_PARTY_RE = re.compile(
-    r"MOVING PART(?:Y|IES)\s*:\s*(?P<name>.+?)(?:\.|$)",
-    re.IGNORECASE | re.MULTILINE,
-)
-_RESPONDING_PARTY_RE = re.compile(
-    r"(?:RESPONDING|OPPOSING) PART(?:Y|IES)\s*:\s*(?P<name>.+?)(?:\.|$)",
-    re.IGNORECASE | re.MULTILINE,
-)
-_ROLE_PREFIX_RE = re.compile(
-    r"^(?:Defendants?|Plaintiffs?|Petitioners?|Respondents?"
-    r"|Cross-Complainants?|Cross-Defendants?)[,\s]+",
-    re.IGNORECASE,
-)
-
-
-def _clean_name(raw: str) -> str:
-    """Clean a party name: strip descriptors, whitespace, punctuation."""
-    name = " ".join(raw.split()).strip()
-    name = _ENTITY_DESCRIPTOR_RE.sub("", name).strip()
-    name = re.sub(r"[;,]\s*$", "", name).strip()
-    name = re.sub(r"\s+And\s*$", "", name, flags=re.IGNORECASE).strip()
-    name = re.sub(
-        r",?\s*Et\.?\s*Al\.?\s*$", ", et al.", name, flags=re.IGNORECASE
-    ).strip()
-    name = name.strip(")(,.; ")
-    return name
-
-
-def extract_title_from_caption(ruling_text: str) -> str | None:
-    """Extract title from formal plaintiff/defendant caption block."""
-    p_match = _P_ROLE_RE.search(ruling_text)
-    d_match = _D_ROLE_RE.search(ruling_text)
-    vs_match = _VS_RE.search(ruling_text)
-
-    if not (p_match and d_match and vs_match):
-        return None
-
-    # Plaintiff name: text before the plaintiff role marker
-    p_start = max(0, p_match.start() - 500)
-    p_text = ruling_text[p_start : p_match.start()]
-    lines = [ln.strip() for ln in p_text.split("\n") if ln.strip()]
-    if not lines:
-        return None
-    plaintiff_raw = lines[-1].rstrip(",")
-
-    # Defendant name: text between vs. and defendant role marker
-    vs_end = vs_match.end()
-    d_start = d_match.start()
-    if vs_end >= d_start:
-        return None
-    defendant_raw = ruling_text[vs_end:d_start].strip()
-    d_lines = [ln.strip() for ln in defendant_raw.split("\n") if ln.strip()]
-    if not d_lines:
-        return None
-    defendant_raw = " ".join(d_lines).rstrip(",")
-
-    plaintiff = _clean_name(plaintiff_raw)
-    defendant = _clean_name(defendant_raw)
-
-    if not plaintiff or not defendant:
-        return None
-
-    title = f"{plaintiff.title()} v. {defendant.title()}"
-    if len(title) > _MAX_TITLE_LENGTH or len(title) < 5:
-        return None
-    return title
-
-
-def extract_title_from_moving_responding(ruling_text: str) -> str | None:
-    """Extract title from MOVING PARTY / RESPONDING PARTY fields."""
-    m_match = _MOVING_PARTY_RE.search(ruling_text)
-    if m_match is None:
-        return None
-    r_match = _RESPONDING_PARTY_RE.search(ruling_text)
-    if r_match is None:
-        return None
-
-    moving_raw = m_match.group("name").strip()
-    responding_raw = r_match.group("name").strip()
-
-    skip_phrases = ("no opposition", "none", "no response", "unopposed")
-    for phrase in skip_phrases:
-        if phrase in responding_raw.lower():
-            return None
-
-    moving = _clean_name(_ROLE_PREFIX_RE.sub("", moving_raw))
-    responding = _clean_name(_ROLE_PREFIX_RE.sub("", responding_raw))
-
-    if not moving or not responding:
-        return None
-
-    title = f"{moving.title()} v. {responding.title()}"
-    if len(title) > _MAX_TITLE_LENGTH or len(title) < 5:
-        return None
-    return title
-
-
-def extract_clean_title(ruling_text: str) -> str | None:
-    """Try multiple strategies to extract a clean case title from ruling text."""
-    title = extract_title_from_caption(ruling_text)
-    if title and not _DEPT_HEADER_BOILERPLATE_RE.search(title):
-        return title
-
-    title = extract_title_from_moving_responding(ruling_text)
-    if title and not _DEPT_HEADER_BOILERPLATE_RE.search(title):
-        return title
-
-    return None
-
-
 def clean_case_title(
     old_title: str,
     ruling_text: str | None,
@@ -211,9 +82,10 @@ def clean_case_title(
     if cleaned is not None:
         return cleaned
 
-    # Strategy 2: re-extract from ruling text
+    # Strategy 2: re-extract from ruling text (use lenient max length so the
+    # fallback path accepts the same range of titles as strategy 1)
     if ruling_text:
-        return extract_clean_title(ruling_text)
+        return extract_clean_title(ruling_text, max_length=_BACKFILL_MAX_TITLE_LENGTH)
 
     return None
 
