@@ -17,6 +17,7 @@
     -d @{worktree}/tmp/query.json
   ```
 - **No quoted strings in compound shell commands:** a hook rejects commands that contain quoted characters combined with `&&` or `;`. Split into separate tool calls.
+- **Backgrounding long-running processes (daemons, watchers):** NEVER use shell `&`, `nohup`, `disown`, or multicommand tricks like `cmd 2>&1 & echo "done"`. These require compound commands that cannot be allowlisted and always trigger permission prompts. Use the Bash tool's `run_in_background: true` parameter instead — it runs the command as a background task natively, with no shell tricks needed. Example: `Bash(command="scripts/run-py.sh scripts/tg-responder.py", run_in_background=true)`.
 - **Writing to `.claude/` directories (skills, hooks, settings):** The Claude Code platform has a built-in deny on the `.claude/` directory — the Edit and Write tools will fail on any path under `.claude/`. This is a CLI-level restriction, not a user permission setting. To modify files in `.claude/`:
   1. Write the content to `{worktree}/tmp/` using the Write tool.
   2. Copy it into place: `scripts/write-claude-file.sh {worktree}/tmp/file.md {worktree}/.claude/target/file.md`

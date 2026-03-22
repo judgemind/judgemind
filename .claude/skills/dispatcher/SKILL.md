@@ -23,14 +23,15 @@ Enable dispatcher mode for the current interactive session. This transforms the 
 
 ### 1. Telegram setup (if configured)
 
-Initialize the Telegram bridge and start the responder daemon. **Use the Bash tool's `run_in_background: true` parameter** to launch it as a background process — do not append shell `&` or `2>&1 &` to the command, as that changes the command string and breaks the `Bash(scripts/*)` permission glob match:
+Initialize the Telegram bridge and start the responder daemon using the Bash tool with `run_in_background: true`:
 
 ```
-scripts/run-py.sh scripts/tg-responder.py
+Bash(command="scripts/run-py.sh scripts/tg-responder.py", run_in_background=true)
 ```
-(with `run_in_background: true` on the Bash tool call)
 
-Send a `session_started` notification:
+**NEVER use shell `&`, `nohup`, or multicommand patterns to background the responder.** The Bash tool's `run_in_background` parameter is the only supported way. Shell backgrounding requires compound commands that cannot be allowlisted and always trigger permission prompts.
+
+Send a `session_started` notification (this one runs synchronously — it exits immediately):
 
 ```
 scripts/run-py.sh scripts/tg-notify.py session_started
@@ -325,7 +326,7 @@ In the main loop (step 2), call `bridge.read_dispatcher_inbox()` which returns a
 
 | Action | How to handle |
 |---|---|
-| `restart_responder` | Run `scripts/tg-stop-responder.sh`, reinstall telegram-bridge deps, restart `scripts/run-py.sh scripts/tg-responder.py` (with `run_in_background: true` on the Bash tool) |
+| `restart_responder` | Run `scripts/tg-stop-responder.sh`, reinstall telegram-bridge deps, restart responder via `Bash(command="scripts/run-py.sh scripts/tg-responder.py", run_in_background=true)` — **never** use shell `&` |
 | `terraform_apply` | Run dev terraform apply for the specified module (see "Auto-apply dev terraform" below) |
 | `notify` | Send a Telegram notification via `scripts/run-py.sh scripts/tg-notify.py notify "<message>"` |
 | `run_script` | Execute the specified script (validate it starts with `scripts/` for safety) |
@@ -461,7 +462,7 @@ When a merged PR modifies the responder code (`packages/telegram-bridge/` or `sc
 
 1. Run `scripts/tg-stop-responder.sh` (sends SIGTERM, waits for exit, cleans up PID/stop files)
 2. Reinstall telegram-bridge deps if needed
-3. Launch `scripts/run-py.sh scripts/tg-responder.py` with `run_in_background: true` on the Bash tool (do not use shell `&` — it breaks the permission glob match)
+3. Launch the responder using the Bash tool with `run_in_background: true`: `Bash(command="scripts/run-py.sh scripts/tg-responder.py", run_in_background=true)`. **NEVER use shell `&` or multicommand patterns.**
 4. Verify new PID file exists
 5. Send Telegram notification: "Responder daemon restarted after PR #N merged"
 

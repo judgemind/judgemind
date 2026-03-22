@@ -12,6 +12,7 @@ These are the most frequently violated rules. **A PreToolUse hook enforces the s
 - **NEVER** use `python3 -c "..."` for inline scripts. Write to `{worktree}/tmp/script.py` and run the file.
 - **NEVER** combine quoted strings with `&&` or `;`. Split into separate tool calls.
 - **NEVER** prefix scripts with `bash` — run `scripts/start-worker.sh`, not `bash scripts/start-worker.sh`.
+- **NEVER** use shell `&`, `nohup`, `disown`, or multicommand tricks to background a process. Use the Bash tool's `run_in_background: true` parameter instead. Shell backgrounding requires compound commands that cannot be allowlisted and always trigger permission prompts.
 - **NEVER** use Edit or Write tools on files inside `.claude/`. The CLI blocks these operations. Write content to `{worktree}/tmp/` first, then copy it into place with `scripts/write-claude-file.sh {worktree}/tmp/file.md {worktree}/.claude/target/file.md`.
 
 ### NEVER — Workflow

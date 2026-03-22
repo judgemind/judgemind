@@ -69,7 +69,7 @@ The standalone **responder daemon** (`scripts/run-py.sh scripts/tg-responder.py`
 - `judgemind/telegram/bot` — bot token and allowed user IDs (existing)
 - `judgemind/anthropic/api-key` — Anthropic API key for Claude interpreter, or set `ANTHROPIC_API_KEY` env var. If missing, the daemon falls back to simple acknowledgments.
 
-To start the responder daemon: `scripts/run-py.sh scripts/tg-responder.py`. To stop it: `scripts/tg-stop-responder.sh`.
+To start the responder daemon, use the Bash tool with `run_in_background: true`: `Bash(command="scripts/run-py.sh scripts/tg-responder.py", run_in_background=true)`. **NEVER use shell `&`, `nohup`, or multicommand patterns** — they require compound commands that cannot be allowlisted. To stop it: `scripts/tg-stop-responder.sh`.
 
 ## Unattended Operation Patterns — Telegram
 
