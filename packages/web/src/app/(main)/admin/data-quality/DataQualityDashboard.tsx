@@ -12,6 +12,7 @@ import {
   type DataQualityOverviewData,
   type DataQualityMetricsData,
 } from '@/lib/data-quality-queries';
+import { SECTION_HEADING } from '@/lib/typography';
 
 function daysAgo(n: number): string {
   const d = new Date();
@@ -78,7 +79,7 @@ export function DataQualityDashboard() {
   if (!user || user.role !== 'admin') {
     return (
       <div className="rounded-lg border border-border p-8 text-center">
-        <h2 className="text-lg font-semibold text-foreground">Access Denied</h2>
+        <h2 className={SECTION_HEADING}>Access Denied</h2>
         <p className="mt-2 text-sm text-muted-foreground">
           This page is restricted to admin users. Please log in with an admin account.
         </p>

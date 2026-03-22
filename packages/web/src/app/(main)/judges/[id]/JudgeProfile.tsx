@@ -11,6 +11,7 @@ import {
   getOutcomeBadgeVariant,
   getOutcomeBadgeListClass,
 } from '@/lib/display-helpers';
+import { SECTION_HEADING, SECTION_LABEL } from '@/lib/typography';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
@@ -310,7 +311,7 @@ export function JudgeProfile({ judgeId }: { judgeId: string }) {
           {dateRange && (
             <Card>
               <CardContent className="p-6">
-                <p className="text-lg font-semibold text-foreground">
+                <p className={SECTION_HEADING}>
                   {dateRange}
                 </p>
                 <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
@@ -473,7 +474,7 @@ export function JudgeProfile({ judgeId }: { judgeId: string }) {
     <div className="space-y-6">
       {/* Analytics section */}
       <section>
-        <h2 className="mb-3 flex items-center gap-2 text-sm font-semibold uppercase tracking-wide text-muted-foreground">
+        <h2 className={`mb-3 flex items-center gap-2 ${SECTION_LABEL}`}>
           <BarChart3 className="h-4 w-4" aria-hidden="true" />
           Analytics
         </h2>
@@ -482,7 +483,7 @@ export function JudgeProfile({ judgeId }: { judgeId: string }) {
 
       {/* Recent rulings section */}
       <section>
-        <h2 className="mb-3 text-sm font-semibold uppercase tracking-wide text-muted-foreground">
+        <h2 className={`mb-3 ${SECTION_LABEL}`}>
           Recent Rulings
         </h2>
         {renderRulings()}

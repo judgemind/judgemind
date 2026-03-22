@@ -18,6 +18,7 @@ import {
   type RulingMetadata,
 } from '@/lib/display-helpers';
 import { sanitizeRulingHtml } from '@/lib/sanitize-html';
+import { SECTION_HEADING, SECTION_LABEL } from '@/lib/typography';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
@@ -163,7 +164,7 @@ function PartyColumn({
 }) {
   return (
     <div>
-      <h3 className="text-sm font-semibold uppercase tracking-wide text-muted-foreground">
+      <h3 className={SECTION_LABEL}>
         {label}
       </h3>
       {parties.length === 0 ? (
@@ -302,7 +303,7 @@ export function CaseDetail({ caseId }: { caseId: string }) {
           <dl className="grid grid-cols-2 gap-x-8 gap-y-4 sm:grid-cols-3">
             {caseRecord.filedAt && (
               <div>
-                <dt className="text-sm font-semibold uppercase tracking-wide text-muted-foreground">
+                <dt className={SECTION_LABEL}>
                   Filed Date
                 </dt>
                 <dd className="mt-1 text-sm text-foreground">
@@ -311,7 +312,7 @@ export function CaseDetail({ caseId }: { caseId: string }) {
               </div>
             )}
             <div>
-              <dt className="text-sm font-semibold uppercase tracking-wide text-muted-foreground">
+              <dt className={SECTION_LABEL}>
                 Court
               </dt>
               <dd className="mt-1 text-sm text-foreground">
@@ -319,7 +320,7 @@ export function CaseDetail({ caseId }: { caseId: string }) {
               </dd>
             </div>
             <div>
-              <dt className="text-sm font-semibold uppercase tracking-wide text-muted-foreground">
+              <dt className={SECTION_LABEL}>
                 County
               </dt>
               <dd className="mt-1 text-sm text-foreground">
@@ -375,7 +376,7 @@ export function CaseDetail({ caseId }: { caseId: string }) {
       )}
 
       <section>
-        <h2 className="mb-3 text-lg font-semibold text-foreground">
+        <h2 className={`mb-3 ${SECTION_HEADING}`}>
           Rulings
         </h2>
 

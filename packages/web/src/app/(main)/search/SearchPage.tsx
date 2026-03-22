@@ -6,6 +6,7 @@ import { useRouter, useSearchParams } from 'next/navigation';
 import Link from 'next/link';
 import { Search, SlidersHorizontal, Calendar, Scale, Gavel } from 'lucide-react';
 import { formatDate, getOutcomeBadgeVariant, getOutcomeBadgeListClass } from '@/lib/display-helpers';
+import { PAGE_TITLE, SECTION_LABEL } from '@/lib/typography';
 import { sanitizeExcerptHtml } from '@/lib/sanitize-html';
 import { Autocomplete } from '@/components/Autocomplete';
 import { useCountyOptions, useJudgeNameOptions } from '@/lib/filter-options';
@@ -234,7 +235,7 @@ function FilterContent({
   return (
     <div className="space-y-6">
       <div>
-        <h2 className="flex items-center gap-2 text-sm font-semibold uppercase tracking-wide text-muted-foreground">
+        <h2 className={`flex items-center gap-2 ${SECTION_LABEL}`}>
           <SlidersHorizontal className="h-4 w-4" aria-hidden="true" />
           Filters
         </h2>
@@ -574,7 +575,7 @@ export function SearchPage() {
     <div className="mx-auto max-w-6xl space-y-6">
       {/* Page header */}
       <div>
-        <h1 className="text-2xl font-bold tracking-tight text-foreground">
+        <h1 className={PAGE_TITLE}>
           Search Rulings
         </h1>
         <p className="mt-1 text-sm text-muted-foreground">
