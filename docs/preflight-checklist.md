@@ -11,6 +11,7 @@ Machine-readable checklist of rules extracted from CLAUDE.md. Agents should vali
 | E-03 | Must be in a worktree during task work | Manual / script check | `preflight_in_worktree` |
 | E-04 | Venv must be local to worktree | Manual / script check | `preflight_venv_local` |
 | E-05 | Never push to main/master | PreToolUse hook blocks | `preflight_not_on_main` |
+| E-06 | No `git worktree add` inside worktrees | PreToolUse hook blocks | — |
 
 ## Shell Command Rules
 
@@ -69,6 +70,7 @@ Machine-readable checklist of rules extracted from CLAUDE.md. Agents should vali
 | TW-05 | Never deploy to production | Production deploys are human-only |
 | TW-06 | Venv isolation per worktree | Never share venvs between worktrees |
 | TW-07 | Never exit after ralph without completing A.3-A.9 | Ralph = halfway done. Must commit, push, PR, CI, merge, deploy, retrospective. Verify with `git status` and `gh pr list` (#721) |
+| TW-08 | Never create child worktrees from inside a worktree | Use `git checkout -- .` or `git clean -fd` to fix a dirty worktree instead of creating a new one |
 
 ## Security Rules
 

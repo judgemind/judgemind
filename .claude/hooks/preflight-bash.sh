@@ -25,7 +25,7 @@ fi
 TIMEOUT=$(echo "$INPUT" | python3 -c "import sys,json; d=json.load(sys.stdin); t=d.get('tool_input',{}).get('timeout'); print(t if t is not None else 'none')" 2>/dev/null)
 RUN_IN_BG=$(echo "$INPUT" | python3 -c "import sys,json; d=json.load(sys.stdin); print(str(d.get('tool_input',{}).get('run_in_background', False)).lower())" 2>/dev/null)
 
-# Allow tests to override the working directory for check 9.
+# Allow tests to override the working directory for check 9 and 10.
 EFFECTIVE_CWD="${PREFLIGHT_CWD:-$PWD}"
 
 # --- Forbidden pattern checks ---
@@ -197,6 +197,19 @@ fi
 if [ "$RUN_IN_BG" = "true" ]; then
     if echo "$EFFECTIVE_CWD" | grep -qE '\.claude/worktrees/' ; then
         echo "BLOCKED: run_in_background is not allowed inside worktree subagents. Use timeout: 1200000 instead. See CLAUDE.md §Critical Rules." >&2
+        exit 2
+    fi
+fi
+
+# 10. git worktree add inside an existing worktree.
+#     Subagents must work in their assigned worktree only. Creating child worktrees
+#     causes orphaned worktrees that cleanup_worktree.py cannot track and the
+#     dispatcher does not know about. If the worktree is in a bad state, the agent
+#     should fix it (git checkout -- ., git clean -fd) instead of creating a new one.
+#     Detection: command is "git worktree add" AND cwd contains ".claude/worktrees/".
+if echo "$COMMAND" | grep -qE '\bgit\b(\s+-C\s+\S+)?\s+worktree\s+add\b' ; then
+    if echo "$EFFECTIVE_CWD" | grep -qE '\.claude/worktrees/' ; then
+        echo "BLOCKED: git worktree add is not allowed inside an existing worktree. Subagents must work in their assigned worktree only. If your worktree is in a bad state, fix it with 'git checkout -- .' or 'git clean -fd'. See CLAUDE.md §Critical Rules." >&2
         exit 2
     fi
 fi

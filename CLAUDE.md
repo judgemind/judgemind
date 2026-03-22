@@ -24,6 +24,7 @@ These are the most frequently violated rules. **A PreToolUse hook enforces the s
 - **NEVER** set `priority/p0` on issues unless explicitly told to by a human. `p0` is human-only.
 - **NEVER** skip pre-PR checks. Run lint, format, AND tests locally before pushing.
 - **NEVER** share venvs between worktrees. Each worktree gets its own `.venv`.
+- **NEVER** create additional worktrees from inside a worktree via `git worktree add`. Subagents must work in their assigned worktree only. If the worktree gets into a bad state, fix it (e.g., `git checkout -- .`, `git clean -fd`) rather than creating a new one. Child worktrees become orphaned — `cleanup_worktree.py` cannot track them, and the dispatcher does not know about them.
 - **NEVER** close a task or remove a worktree without posting a verification evidence comment on the issue. Every task completion requires concrete evidence that the change works (deployed services) or an explicit skip reason (docs/CI/tooling). See §4.10 Step 3.
 
 ### ALWAYS — Before Acting
@@ -38,7 +39,7 @@ These are the most frequently violated rules. **A PreToolUse hook enforces the s
 
 ## Enforced Rules — Automated Checks
 
-The PreToolUse hook (`.claude/hooks/preflight-bash.sh`) and `scripts/preflight.sh` automatically enforce the Critical Rules above. The hook blocks `$(`, `<<EOF`, `python -c`, and `git push` to main. Runtime checks:
+The PreToolUse hook (`.claude/hooks/preflight-bash.sh`) and `scripts/preflight.sh` automatically enforce the Critical Rules above. The hook blocks `$(`, `<<EOF`, `python -c`, `git push` to main, and `git worktree add` inside worktrees. Runtime checks:
 
 ```bash
 source scripts/preflight.sh
