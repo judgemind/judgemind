@@ -11,12 +11,14 @@ const config: Config = {
   theme: {
     extend: {
       colors: {
-        brand: {
-          50: '#eff6ff',
-          500: '#3b82f6',
-          600: '#2563eb',
-          700: '#1d4ed8',
-          900: '#1e3a8a',
+        /* Brand accent palette — warm amber (#1443) */
+        'brand-accent': {
+          DEFAULT: '#b45309',  // amber-700
+          hover: '#92400e',    // amber-800
+          light: '#d97706',    // amber-600
+          lighter: '#f59e0b',  // amber-500
+          surface: '#fef3c7',  // amber-100
+          foreground: '#ffffff',
         },
         border: 'hsl(var(--border))',
         input: 'hsl(var(--input))',

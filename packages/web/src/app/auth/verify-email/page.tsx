@@ -77,7 +77,7 @@ function VerifyEmailContent() {
           <div className="mt-4 text-center">
             <Link
               href="/auth/login"
-              className="text-sm font-medium text-brand-600 hover:text-brand-700 dark:text-brand-500 dark:hover:text-brand-400"
+              className="text-sm font-medium text-brand-accent hover:text-brand-accent-hover dark:text-brand-accent-light dark:hover:text-brand-accent-lighter"
             >
               Go to login
             </Link>
@@ -91,7 +91,7 @@ function VerifyEmailContent() {
           <div className="mt-4 text-center">
             <Link
               href="/auth/login"
-              className="text-sm font-medium text-brand-600 hover:text-brand-700 dark:text-brand-500 dark:hover:text-brand-400"
+              className="text-sm font-medium text-brand-accent hover:text-brand-accent-hover dark:text-brand-accent-light dark:hover:text-brand-accent-lighter"
             >
               Go to login
             </Link>

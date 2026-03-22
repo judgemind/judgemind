@@ -60,7 +60,7 @@ export function OverviewGrid({ items, onCountyClick, selectedCounty }: OverviewG
             onClick={() => onCountyClick(item.county)}
             className={`rounded-lg border p-3 text-left transition-shadow hover:shadow-md ${
               STATUS_COLORS[item.healthStatus] ?? STATUS_COLORS.red
-            } ${selectedCounty === item.county ? 'ring-2 ring-brand-500 ring-offset-1 dark:ring-offset-slate-900' : ''}`}
+            } ${selectedCounty === item.county ? 'ring-2 ring-brand-accent-lighter ring-offset-1 dark:ring-offset-stone-900' : ''}`}
           >
             <div className="flex items-center gap-2">
               <span className={`inline-block h-2.5 w-2.5 rounded-full ${STATUS_DOT[item.healthStatus] ?? STATUS_DOT.red}`} />
