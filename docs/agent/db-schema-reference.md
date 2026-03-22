@@ -93,15 +93,15 @@ ON CONFLICT (case_id, party_id) DO UPDATE ...
 ## Automated check
 
 CI runs `scripts/check-sql-conflicts.py` which validates all `ON CONFLICT`
-targets against the `UNIQUE_CONSTRAINTS` map. If a migration adds or removes
-a constraint, update the map in the script.
+targets against the `UNIQUE_CONSTRAINTS` map. This map is **auto-generated**
+from `schema.sql` and migration files at startup — no manual updates needed.
 
 ## Keeping this document in sync
 
 When you add a migration that creates or drops a UNIQUE constraint:
 
-1. Update `scripts/check-sql-conflicts.py` — add or remove the constraint
-   in the `UNIQUE_CONSTRAINTS` dict.
+1. `scripts/check-sql-conflicts.py` will automatically detect the new
+   constraint from `schema.sql` and migration files — no manual update needed.
 2. Update this table above.
 3. If the constraint should also be in `schema.sql` for local dev, update
    that file too (and the `check-schema-drift.sh` check will enforce it).

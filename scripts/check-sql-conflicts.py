@@ -28,11 +28,11 @@ from io import StringIO
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
-# Schema: known UNIQUE constraints per table
+# Schema: auto-generated UNIQUE constraints per table
 # ---------------------------------------------------------------------------
-# This map is the source of truth for what ON CONFLICT targets are valid.
-# It is derived from schema.sql + migration files.  When a new migration adds
-# or removes a UNIQUE constraint, update this map.
+# This map is auto-generated from schema.sql + migration files at startup.
+# It is never manually maintained.  See _extract_unique_constraints_from_sql()
+# and build_unique_constraints() for the parsing logic.
 #
 # Format:  table_name -> list of frozenset(column_names)
 #   - Each frozenset represents one UNIQUE constraint.
@@ -40,86 +40,274 @@ from pathlib import Path
 #   - "ON CONFLICT DO NOTHING" (no target) is always valid if the table has
 #     at least one unique constraint -- Postgres will use any constraint.
 
-UNIQUE_CONSTRAINTS: dict[str, list[frozenset[str]]] = {
-    "courts": [
-        frozenset({"id"}),
-        frozenset({"court_code"}),
-    ],
-    "judges": [
-        frozenset({"id"}),
-        frozenset({"canonical_name", "court_id"}),
-    ],
-    "judge_aliases": [
-        frozenset({"id"}),
-    ],
-    "attorneys": [
-        frozenset({"id"}),
-    ],
-    "attorney_aliases": [
-        frozenset({"id"}),
-    ],
-    "parties": [
-        frozenset({"id"}),
-    ],
-    "party_aliases": [
-        frozenset({"id"}),
-    ],
-    "cases": [
-        frozenset({"id"}),
-        frozenset({"court_id", "case_number"}),
-    ],
-    "case_judges": [
-        frozenset({"case_id", "judge_id"}),
-    ],
-    "case_attorneys": [
-        frozenset({"id"}),
-        frozenset({"case_id", "attorney_id", "role"}),
-    ],
-    "case_parties": [
-        frozenset({"id"}),
-        frozenset({"case_id", "party_id", "role"}),
-    ],
-    "documents": [
-        frozenset({"id"}),
-    ],
-    "rulings": [
-        frozenset({"id"}),
-        frozenset({"document_id"}),
-        # Partial unique index: (case_id, ruling_text_hash) WHERE ruling_text_hash IS NOT NULL
-        frozenset({"case_id", "ruling_text_hash"}),
-    ],
-    "staging.captures": [
-        frozenset({"id"}),
-    ],
-    "staging.ruled_items": [
-        frozenset({"id"}),
-    ],
-    "court_directory_snapshots": [
-        frozenset({"id"}),
-    ],
-    "scraper_runs": [
-        frozenset({"id"}),
-    ],
-    "data_quality_metrics": [
-        frozenset({"id"}),
-    ],
-    "users": [
-        frozenset({"id"}),
-        frozenset({"email"}),
-        frozenset({"google_id"}),
-        frozenset({"api_key"}),
-    ],
-    "refresh_tokens": [
-        frozenset({"id"}),
-        frozenset({"token_hash"}),
-    ],
-    "alert_subscriptions": [
-        frozenset({"id"}),
-    ],
-    "alert_events": [
-        frozenset({"id"}),
-    ],
-}
+
+def _up_migration_portion(sql: str) -> str:
+    """Return only the up-migration portion of a SQL file.
+
+    Strips everything after ``-- Down Migration`` (case-insensitive) so
+    that DROP and rollback statements are not parsed.  If the marker is
+    absent the full text is returned.
+    """
+    for i, line in enumerate(sql.splitlines()):
+        if line.strip().lower().startswith("-- down migration"):
+            return "\n".join(sql.splitlines()[:i])
+    return sql
+
+
+def _normalize_sql_statements(sql: str) -> list[str]:
+    """Split SQL into logical statements with continuation lines joined.
+
+    Each returned string is a single logical SQL statement (lowercased) with
+    multi-line continuations collapsed into one line.  Comments and blank
+    lines are removed.  This allows regexes to match patterns that span
+    multiple physical lines in the source.
+    """
+    lower = sql.lower()
+    statements: list[str] = []
+    current: list[str] = []
+
+    # SQL keywords that start a new top-level statement
+    _stmt_start_re = re.compile(
+        r"^\s*(create|alter|insert|delete|update|drop|comment|grant|revoke)\b"
+    )
+
+    for line in lower.splitlines():
+        stripped = line.strip()
+        # Skip comments and blank lines
+        if not stripped or stripped.startswith("--"):
+            if current:
+                statements.append(" ".join(current))
+                current = []
+            continue
+
+        if _stmt_start_re.match(stripped) and current:
+            # New statement starting -- flush the previous one
+            statements.append(" ".join(current))
+            current = [stripped]
+        elif current:
+            # Continuation line
+            current.append(stripped)
+        else:
+            # First line of a new statement
+            current.append(stripped)
+
+    if current:
+        statements.append(" ".join(current))
+
+    return statements
+
+
+def _extract_unique_constraints_from_sql(
+    sql: str,
+) -> dict[str, list[frozenset[str]]]:
+    """Parse SQL text and extract all UNIQUE constraints.
+
+    Handles:
+      1. ``col TYPE PRIMARY KEY``           -- single-column inline PK
+      2. ``PRIMARY KEY (col1, col2)``        -- composite PK
+      3. ``col TYPE UNIQUE``                 -- single-column inline UNIQUE
+      4. ``UNIQUE (col1, col2)``             -- anonymous multi-column UNIQUE
+      5. ``CONSTRAINT name UNIQUE (cols)``   -- named UNIQUE constraint
+      6. ``ALTER TABLE t ADD CONSTRAINT name UNIQUE (cols)``
+      7. ``CREATE UNIQUE INDEX ... ON t (cols)``
+
+    Only processes the up-migration portion (before ``-- Down Migration``).
+
+    Returns a dict of table -> list[frozenset[str]].  Each frozenset is one
+    constraint's column set.  Duplicate constraints are de-duplicated.
+    """
+    sql = _up_migration_portion(sql)
+    constraints: dict[str, list[frozenset[str]]] = {}
+
+    def _add(table: str, cols: frozenset[str]) -> None:
+        table = table.lower().strip()
+        lst = constraints.setdefault(table, [])
+        if cols not in lst:
+            lst.append(cols)
+
+    # Pre-compile regexes used below
+    # Regex: CREATE TABLE [IF NOT EXISTS] [schema.]name
+    _create_table_re = re.compile(
+        r"create\s+table\s+(?:if\s+not\s+exists\s+)?"
+        r"([a-z_]+(?:\.[a-z_]+)?)",
+    )
+    # Regex: ALTER TABLE t ADD CONSTRAINT name UNIQUE (cols)
+    _alter_unique_re = re.compile(
+        r"alter\s+table\s+([a-z_]+(?:\.[a-z_]+)?)\s+"
+        r"add\s+constraint\s+\S+\s+unique\s*\(\s*([^)]+)\)",
+    )
+    # Regex: CREATE UNIQUE INDEX ... ON t (cols)
+    _create_unique_idx_re = re.compile(
+        r"create\s+unique\s+index\s+(?:if\s+not\s+exists\s+)?\S+\s+"
+        r"on\s+([a-z_]+(?:\.[a-z_]+)?)\s*\(\s*([^)]+)\)",
+    )
+
+    # --- Pass 1: Handle ALTER TABLE and CREATE UNIQUE INDEX ------------------
+    # These are top-level statements that may span multiple lines.
+    # We use _normalize_sql_statements to join continuation lines.
+    for stmt in _normalize_sql_statements(sql):
+        # ALTER TABLE ... ADD CONSTRAINT ... UNIQUE (cols)
+        m = _alter_unique_re.search(stmt)
+        if m:
+            table = m.group(1)
+            cols = frozenset(c.strip() for c in m.group(2).split(",") if c.strip())
+            _add(table, cols)
+            continue
+
+        # CREATE UNIQUE INDEX ... ON table (cols)
+        m = _create_unique_idx_re.search(stmt)
+        if m:
+            table = m.group(1)
+            cols = frozenset(c.strip() for c in m.group(2).split(",") if c.strip())
+            _add(table, cols)
+            continue
+
+    # --- Pass 2: Handle CREATE TABLE blocks ----------------------------------
+    # Process line-by-line to track paren depth and attribute inline
+    # constraints to the correct table.
+    lower = sql.lower()
+    current_table: str | None = None
+    paren_depth = 0
+
+    # Regex: column definition with inline PRIMARY KEY
+    _col_pk_re = re.compile(
+        r"^\s*([a-z_]+)\s+\S+.*\bprimary\s+key\b",
+    )
+    # Regex: column definition with inline UNIQUE
+    _col_unique_re = re.compile(
+        r"^\s*([a-z_]+)\s+\S+.*\bunique\b",
+    )
+    # Regex: table-level PRIMARY KEY (col1, col2, ...)
+    _table_pk_re = re.compile(
+        r"\bprimary\s+key\s*\(\s*([^)]+)\)",
+    )
+    # Regex: table-level UNIQUE (col1, col2) or CONSTRAINT name UNIQUE (cols)
+    _table_unique_re = re.compile(
+        r"(?:constraint\s+\S+\s+)?unique\s*\(\s*([^)]+)\)",
+    )
+
+    # SQL keywords that should not be mistaken for column names
+    _sql_keywords = frozenset(
+        {
+            "primary",
+            "unique",
+            "constraint",
+            "check",
+            "foreign",
+            "references",
+            "create",
+            "alter",
+            "not",
+            "null",
+            "default",
+        }
+    )
+
+    for line in lower.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("--"):
+            continue
+
+        # Detect entering a CREATE TABLE block
+        m = _create_table_re.search(stripped)
+        if m:
+            current_table = m.group(1)
+            paren_depth = stripped.count("(") - stripped.count(")")
+        else:
+            if current_table is not None:
+                paren_depth += stripped.count("(") - stripped.count(")")
+
+        # Inside a CREATE TABLE block
+        if current_table is not None and paren_depth >= 1:
+            is_col_def = False
+
+            # Inline PRIMARY KEY on a column
+            m = _col_pk_re.match(stripped)
+            if m:
+                col = m.group(1)
+                if col not in _sql_keywords:
+                    _add(current_table, frozenset({col}))
+                    is_col_def = True
+
+            # Inline UNIQUE on a column
+            m = _col_unique_re.match(stripped)
+            if m:
+                col = m.group(1)
+                if col not in _sql_keywords:
+                    _add(current_table, frozenset({col}))
+                    is_col_def = True
+
+            # Table-level PRIMARY KEY (col1, col2)
+            m = _table_pk_re.search(stripped)
+            if m:
+                cols = frozenset(c.strip() for c in m.group(1).split(",") if c.strip())
+                _add(current_table, cols)
+
+            # Table-level UNIQUE or CONSTRAINT name UNIQUE
+            # Only if this is NOT a column definition (to avoid
+            # double-counting "email TEXT UNIQUE" as a table-level UNIQUE).
+            if not is_col_def:
+                for m in _table_unique_re.finditer(stripped):
+                    cols = frozenset(
+                        c.strip() for c in m.group(1).split(",") if c.strip()
+                    )
+                    _add(current_table, cols)
+
+        # Detect leaving the CREATE TABLE block
+        if current_table is not None and paren_depth <= 0:
+            current_table = None
+
+    return constraints
+
+
+def build_unique_constraints(
+    repo_root: Path,
+) -> dict[str, list[frozenset[str]]]:
+    """Build the UNIQUE_CONSTRAINTS map from schema.sql and migration files.
+
+    Parses all SQL sources and merges the results.  The schema.sql file is
+    the primary source; migration files contribute constraints added via
+    ALTER TABLE or CREATE UNIQUE INDEX that might not appear in schema.sql.
+
+    Returns the merged map of table -> list[frozenset[str]].
+    """
+    schema_path = repo_root / "packages" / "api" / "src" / "data-access" / "schema.sql"
+    migrations_dir = repo_root / "packages" / "api" / "migrations"
+
+    merged: dict[str, list[frozenset[str]]] = {}
+
+    def _merge(source: dict[str, list[frozenset[str]]]) -> None:
+        for table, constraint_list in source.items():
+            lst = merged.setdefault(table, [])
+            for cols in constraint_list:
+                if cols not in lst:
+                    lst.append(cols)
+
+    # Parse schema.sql (always present for local dev)
+    if schema_path.is_file():
+        _merge(
+            _extract_unique_constraints_from_sql(
+                schema_path.read_text(encoding="utf-8")
+            )
+        )
+
+    # Parse migration files
+    if migrations_dir.is_dir():
+        for migration_file in sorted(migrations_dir.glob("*.sql")):
+            _merge(
+                _extract_unique_constraints_from_sql(
+                    migration_file.read_text(encoding="utf-8")
+                )
+            )
+
+    return merged
+
+
+# Build the map once at import time.  This replaces the old hardcoded dict.
+# Uses repo_root derived from this script's location.
+UNIQUE_CONSTRAINTS: dict[str, list[frozenset[str]]] = build_unique_constraints(
+    Path(__file__).resolve().parent.parent
+)
 
 # ---------------------------------------------------------------------------
 # Patterns
@@ -324,8 +512,9 @@ def main() -> int:
             f"\nFound {len(all_errors)} invalid ON CONFLICT target(s).\n"
             "Fix: check the table's UNIQUE constraints in schema.sql and\n"
             "docs/agent/db-schema-reference.md before writing ON CONFLICT clauses.\n"
-            "If a new constraint was added via migration, update the\n"
-            "UNIQUE_CONSTRAINTS map in scripts/check-sql-conflicts.py.\n"
+            "The UNIQUE_CONSTRAINTS map is auto-generated from schema.sql and\n"
+            "migration files -- if a new constraint was added, ensure it appears\n"
+            "in schema.sql or a migration file.\n"
             "\nSee https://github.com/judgemind/judgemind/issues/1566 for context."
         )
         return 1
