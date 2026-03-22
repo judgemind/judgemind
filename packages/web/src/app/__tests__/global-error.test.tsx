@@ -33,36 +33,36 @@ describe('GlobalError (root-level error boundary)', () => {
     expect(mockReset).toHaveBeenCalledOnce();
   });
 
-  it('applies dark mode classes to the body', () => {
+  it('applies semantic token classes to the body', () => {
     const { container } = render(
       <GlobalError error={mockError} reset={mockReset} />,
     );
     const renderedBody = container.querySelector('body');
     expect(renderedBody).not.toBeNull();
-    expect(renderedBody!.className).toContain('dark:bg-slate-900');
-    expect(renderedBody!.className).toContain('dark:text-slate-50');
+    expect(renderedBody!.className).toContain('bg-background');
+    expect(renderedBody!.className).toContain('text-foreground');
   });
 
-  it('applies dark mode classes to the card border', () => {
+  it('applies semantic token classes to the card border', () => {
     const { container } = render(
       <GlobalError error={mockError} reset={mockReset} />,
     );
     const card = container.querySelector('.rounded-lg');
-    expect(card?.className).toContain('dark:border-slate-700');
+    expect(card?.className).toContain('border-border');
   });
 
-  it('applies dark mode classes to the heading', () => {
+  it('applies semantic token classes to the heading', () => {
     render(<GlobalError error={mockError} reset={mockReset} />);
     const heading = screen.getByText('Something went wrong');
-    expect(heading.className).toContain('dark:text-slate-100');
+    expect(heading.className).toContain('text-foreground');
   });
 
-  it('applies dark mode classes to the description', () => {
+  it('applies semantic token classes to the description', () => {
     render(<GlobalError error={mockError} reset={mockReset} />);
     const desc = screen.getByText(
       'A critical error occurred. Please try again.',
     );
-    expect(desc.className).toContain('dark:text-slate-400');
+    expect(desc.className).toContain('text-muted-foreground');
   });
 
   it('includes theme detection script in head', () => {

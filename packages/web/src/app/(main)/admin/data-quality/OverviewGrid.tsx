@@ -29,26 +29,26 @@ export function OverviewGrid({ items, onCountyClick, selectedCounty }: OverviewG
     <div>
       {/* Summary stats */}
       <div className="mb-6 grid grid-cols-1 gap-4 sm:grid-cols-3">
-        <div className="rounded-lg border border-slate-200 bg-white p-4 dark:border-slate-700 dark:bg-slate-800">
-          <p className="text-sm text-slate-500 dark:text-slate-400">System Health Score</p>
-          <p className="mt-1 text-3xl font-bold text-slate-900 dark:text-slate-100">{healthScore}%</p>
-          <p className="mt-1 text-xs text-slate-400 dark:text-slate-500">
+        <div className="rounded-lg border border-border bg-card p-4">
+          <p className="text-sm text-muted-foreground">System Health Score</p>
+          <p className="mt-1 text-3xl font-bold text-foreground">{healthScore}%</p>
+          <p className="mt-1 text-xs text-muted-foreground">
             {greenCount} of {items.length} counties healthy
           </p>
         </div>
-        <div className="rounded-lg border border-slate-200 bg-white p-4 dark:border-slate-700 dark:bg-slate-800">
-          <p className="text-sm text-slate-500 dark:text-slate-400">Active Alerts</p>
-          <p className={`mt-1 text-3xl font-bold ${redCount > 0 ? 'text-red-600 dark:text-red-400' : 'text-slate-900 dark:text-slate-100'}`}>
+        <div className="rounded-lg border border-border bg-card p-4">
+          <p className="text-sm text-muted-foreground">Active Alerts</p>
+          <p className={`mt-1 text-3xl font-bold ${redCount > 0 ? 'text-red-600 dark:text-red-400' : 'text-foreground'}`}>
             {redCount}
           </p>
-          <p className="mt-1 text-xs text-slate-400 dark:text-slate-500">
+          <p className="mt-1 text-xs text-muted-foreground">
             counties in red status
           </p>
         </div>
-        <div className="rounded-lg border border-slate-200 bg-white p-4 dark:border-slate-700 dark:bg-slate-800">
-          <p className="text-sm text-slate-500 dark:text-slate-400">Total Counties</p>
-          <p className="mt-1 text-3xl font-bold text-slate-900 dark:text-slate-100">{items.length}</p>
-          <p className="mt-1 text-xs text-slate-400 dark:text-slate-500">monitored</p>
+        <div className="rounded-lg border border-border bg-card p-4">
+          <p className="text-sm text-muted-foreground">Total Counties</p>
+          <p className="mt-1 text-3xl font-bold text-foreground">{items.length}</p>
+          <p className="mt-1 text-xs text-muted-foreground">monitored</p>
         </div>
       </div>
 

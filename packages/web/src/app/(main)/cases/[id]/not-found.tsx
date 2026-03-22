@@ -3,11 +3,11 @@ import Link from 'next/link';
 export default function CaseNotFound() {
   return (
     <div className="mx-auto max-w-4xl">
-      <div className="rounded-lg border border-slate-200 p-8 text-center dark:border-slate-700">
-        <h1 className="text-xl font-bold text-slate-900 dark:text-slate-100">
+      <div className="rounded-lg border border-border p-8 text-center">
+        <h1 className="text-xl font-bold text-foreground">
           Case Not Found
         </h1>
-        <p className="mt-2 text-sm text-slate-500 dark:text-slate-400">
+        <p className="mt-2 text-sm text-muted-foreground">
           The case you are looking for does not exist or has not been captured yet.
         </p>
         <Link

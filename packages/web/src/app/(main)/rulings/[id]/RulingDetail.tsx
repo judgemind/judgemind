@@ -114,7 +114,7 @@ export function RulingDetail({ ruling, sanitizedRulingTextHtml }: RulingProps) {
                 >
                   Download original document
                   {ruling.documentFormat && (
-                    <span className="ml-1.5 rounded bg-slate-100 px-1.5 py-0.5 text-[10px] font-semibold uppercase text-slate-600 dark:bg-slate-700 dark:text-slate-300">
+                    <span className="ml-1.5 rounded bg-muted px-1.5 py-0.5 text-[10px] font-semibold uppercase text-muted-foreground">
                       {FORMAT_LABELS[ruling.documentFormat] ??
                         ruling.documentFormat.toUpperCase()}
                     </span>
@@ -158,7 +158,7 @@ export function RulingDetail({ ruling, sanitizedRulingTextHtml }: RulingProps) {
             >
               Download original document
               {ruling.documentFormat && (
-                <span className="ml-1.5 rounded bg-slate-100 px-1.5 py-0.5 text-[10px] font-semibold uppercase text-slate-600 dark:bg-slate-700 dark:text-slate-300">
+                <span className="ml-1.5 rounded bg-muted px-1.5 py-0.5 text-[10px] font-semibold uppercase text-muted-foreground">
                   {FORMAT_LABELS[ruling.documentFormat] ??
                     ruling.documentFormat.toUpperCase()}
                 </span>

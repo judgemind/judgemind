@@ -171,7 +171,7 @@ export function Autocomplete({
           ref={listboxRef}
           id={listboxId}
           role="listbox"
-          className="absolute z-50 mt-1 max-h-60 w-full overflow-auto rounded-md border border-slate-200 bg-white shadow-lg dark:border-slate-600 dark:bg-slate-800"
+          className="absolute z-50 mt-1 max-h-60 w-full overflow-auto rounded-md border border-border bg-popover shadow-lg"
         >
           {filtered.map((opt, i) => (
             <li
@@ -186,7 +186,7 @@ export function Autocomplete({
               className={`cursor-pointer px-3 py-2 text-sm ${
                 i === activeIndex
                   ? 'bg-brand-accent-surface text-amber-900 dark:bg-amber-900/30 dark:text-amber-100'
-                  : 'text-slate-900 hover:bg-slate-100 dark:text-slate-100 dark:hover:bg-slate-700'
+                  : 'text-popover-foreground hover:bg-accent'
               }`}
             >
               {opt}

@@ -249,7 +249,7 @@ export function RulingsFeed() {
 
       {/* Empty state */}
       {!loading && !error && edges.length === 0 && (
-        <p className="p-8 text-center text-slate-400 dark:text-slate-500">
+        <p className="p-8 text-center text-muted-foreground">
           No rulings found. Try adjusting your filters, or check back after scrapers have run.
         </p>
       )}
