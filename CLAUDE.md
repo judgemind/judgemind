@@ -39,7 +39,7 @@ These are the most frequently violated rules. **A PreToolUse hook enforces the s
 
 ## Enforced Rules — Automated Checks
 
-The PreToolUse hook (`.claude/hooks/preflight-bash.sh`) and `scripts/preflight.sh` automatically enforce the Critical Rules above. The hook blocks `$(`, `<<EOF`, `python -c`, `git push` to main, and `git worktree add` inside worktrees. Runtime checks:
+The PreToolUse hook (`.claude/hooks/preflight-bash.sh`) and `scripts/preflight.sh` automatically enforce the Critical Rules above. The hook blocks `$(`, `<<EOF`, `python -c`, `git push` to main, and `git worktree add` inside worktrees. A separate PreToolUse hook (`.claude/hooks/agent-worktree-guard.sh`) blocks Agent tool calls with `isolation: "worktree"` when cwd has drifted into an existing worktree, preventing nested worktree creation. Runtime checks:
 
 ```bash
 source scripts/preflight.sh
