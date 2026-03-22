@@ -17,9 +17,10 @@ batches are preserved and the script can be safely re-run (it is
 idempotent — it only updates rows that still have NULL fields).
 
 Options:
-    --dry-run       Print what would be updated without writing to the database.
-    --batch-size N  Number of rulings to process per batch (default: 100).
-    --limit N       Maximum total rulings to process (default: unlimited).
+    --dry-run            Print what would be updated without writing to the database.
+    --batch-size N       Number of rulings to process per batch (default: 100).
+    --limit N            Maximum total rulings to process (default: unlimited).
+    --validate-schema    Validate SQL column references against live DB before running.
 """
 
 from __future__ import annotations
@@ -42,6 +43,7 @@ import psycopg  # noqa: E402
 
 from ingestion.db import resolve_judge, upsert_case_judge  # noqa: E402
 from ingestion.extract import extract_judge_name, extract_motion_type, extract_outcome  # noqa: E402
+from validation.schema import add_validate_schema_flag, validate_script_queries  # noqa: E402
 
 logging.basicConfig(
     level=logging.INFO,
@@ -298,12 +300,22 @@ def main() -> None:
         default=None,
         help="Maximum total rulings to process.",
     )
+    add_validate_schema_flag(parser)
     args = parser.parse_args()
 
     dsn = os.environ.get("DATABASE_URL")
     if not dsn:
         logger.error("DATABASE_URL environment variable is required")
         sys.exit(1)
+
+    if args.validate_schema:
+        with psycopg.connect(dsn) as conn:
+            errors = validate_script_queries(conn, sys.modules[__name__])
+        if errors:
+            for e in errors:
+                logger.error("Schema validation failed: %s", e)
+            sys.exit(1)
+        logger.info("Schema validation passed — all column references are valid")
 
     stats = run_backfill(
         dsn,
