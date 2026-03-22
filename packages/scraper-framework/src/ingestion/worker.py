@@ -38,6 +38,7 @@ from courts.ca.la_dept_judges import (
     fetch_department_judge_mapping,
     lookup_judge_for_department,
 )
+from framework.llm_extractor import LlmExtractor
 from framework.search.indexer import IndexingConsumer
 from framework.search.mapping import TENTATIVE_RULINGS_ALIAS
 
@@ -60,6 +61,7 @@ from .extract import (
     extract_outcome,
     extract_parties_from_caption,
 )
+from .extraction_config import ExtractionMethod, get_extraction_method
 from .llm_extract import (
     LLMExtractionResult,
     LLMRulingResult,
@@ -267,6 +269,11 @@ class IngestionWorker:
                     "summarization disabled"
                 )
 
+        # Framework-level LLM extractor — lazy-initialized on first use by
+        # a county configured with extraction_method=llm.  Uses the Anthropic
+        # API (always Haiku) and is separate from the per-field LLM client above.
+        self._framework_extractor: LlmExtractor | None = None
+
         # LA County department-to-judge mapping — lazy-loaded on first LA event.
         # None means "not yet fetched"; empty dict means "fetch failed or empty".
         self._la_dept_map: dict[str, str] | None = None
@@ -274,6 +281,23 @@ class IngestionWorker:
     # ------------------------------------------------------------------
     # Public interface
     # ------------------------------------------------------------------
+
+    def _get_framework_extractor(self) -> LlmExtractor | None:
+        """Return the framework-level LlmExtractor, creating lazily on first call.
+
+        Returns None if the Anthropic API key is not available (the county
+        will fall back to regex extraction with a warning).
+        """
+        if self._framework_extractor is None:
+            try:
+                self._framework_extractor = LlmExtractor()
+                logger.info("Initialized framework LlmExtractor for LLM extraction path")
+            except Exception as exc:
+                logger.warning(
+                    "Failed to initialize LlmExtractor — LLM extraction path unavailable: %s",
+                    exc,
+                )
+        return self._framework_extractor
 
     def _get_la_dept_map(self) -> dict[str, str]:
         """Return the LA County department-to-judge mapping, fetching lazily on first call.
@@ -461,7 +485,28 @@ class IngestionWorker:
         if ruling_text != event_data.get("ruling_text"):
             event_data = {**event_data, "ruling_text": ruling_text}
 
+        # Determine extraction method for this county (#1473).
+        extraction_method = get_extraction_method(state, county)
+
         if not event_data.get("_split_processed"):
+            if extraction_method == ExtractionMethod.LLM:
+                # LLM extraction path: use framework LlmExtractor to split
+                # and extract all fields in one pass.
+                llm_split = self._llm_split_document(
+                    event_data, document_id, ruling_text, state, county
+                )
+                if llm_split:
+                    # LLM extractor returned results — recurse with split events.
+                    return
+                # LLM extractor failed — fall through to regex path.
+                logger.warning(
+                    "LLM extraction path failed for %s/%s — falling back to regex",
+                    state,
+                    county,
+                    extra={"document_id": document_id},
+                )
+
+            # Regex splitting path (default).
             split_results = split_document(event_data)
             if len(split_results) > 1:
                 logger.info(
@@ -512,11 +557,20 @@ class IngestionWorker:
         # Track which method populated each extracted field for logging
         extraction_methods: dict[str, str] = {}
 
+        # When the event was produced by the LLM extraction path (_llm_extracted),
+        # all fields are already populated — skip per-field LLM and regex extraction.
+        is_llm_extracted = event_data.get("_llm_extracted", False)
+        if is_llm_extracted:
+            # Mark all populated fields as "llm" for the extraction methods log.
+            for field in EXTRACTABLE_FIELDS:
+                if event_data.get(field):
+                    extraction_methods[field] = "llm_extractor"
+
         # ------------------------------------------------------------------
         # LLM extraction — primary method for missing fields
         # ------------------------------------------------------------------
         llm_result: LLMExtractionResult | None = None
-        if missing_fields and ruling_text and self._llm_client is not None:
+        if not is_llm_extracted and missing_fields and ruling_text and self._llm_client is not None:
             metadata = {
                 "link_text": event_data.get("extra", {}).get("link_text")
                 if isinstance(event_data.get("extra"), dict)
@@ -593,7 +647,9 @@ class IngestionWorker:
         # ------------------------------------------------------------------
         # Regex fallback — fill any fields still missing after LLM
         # ------------------------------------------------------------------
-        if hearing_dt is None and ruling_text:
+        # Skip regex fallback when the event was pre-populated by the
+        # framework LlmExtractor (_llm_extracted=True).
+        if not is_llm_extracted and hearing_dt is None and ruling_text:
             hearing_dt = extract_hearing_date(ruling_text)
             if hearing_dt is not None:
                 extraction_methods.setdefault("hearing_date", "regex")
@@ -602,7 +658,7 @@ class IngestionWorker:
                     extra={"document_id": document_id, "hearing_date": str(hearing_dt)},
                 )
 
-        if ruling_text and (outcome is None or motion_type is None):
+        if not is_llm_extracted and ruling_text and (outcome is None or motion_type is None):
             if outcome is None:
                 outcome = extract_outcome(ruling_text)
                 if outcome is not None:
@@ -619,7 +675,7 @@ class IngestionWorker:
         court_name = f"{court}, County of {county}"
 
         # Fallback case number extraction (regex)
-        if not case_number and ruling_text:
+        if not is_llm_extracted and not case_number and ruling_text:
             extracted = extract_case_number(ruling_text)
             if extracted:
                 extraction_methods.setdefault("case_number", "regex")
@@ -630,13 +686,13 @@ class IngestionWorker:
                 case_number = extracted
 
         # Fallback case_title extraction (regex)
-        if not case_title and ruling_text:
+        if not is_llm_extracted and not case_title and ruling_text:
             case_title = extract_case_title(ruling_text)
             if case_title:
                 extraction_methods.setdefault("case_title", "regex")
 
         # Fallback judge_name extraction from ruling text (#401).
-        if not judge_name and ruling_text:
+        if not is_llm_extracted and not judge_name and ruling_text:
             judge_name = extract_judge_name(ruling_text)
             if judge_name:
                 extraction_methods.setdefault("judge_name", "regex")
@@ -650,7 +706,14 @@ class IngestionWorker:
         # department is available, look up the judge via the LA judicial officer
         # directory mapping. This handles rulings where the judge name isn't
         # present in the text but the department is known.
-        if not judge_name and department and state == "CA" and county == "Los Angeles":
+        la_dept_eligible = (
+            not is_llm_extracted
+            and not judge_name
+            and department
+            and state == "CA"
+            and county == "Los Angeles"
+        )
+        if la_dept_eligible:
             dept_map = self._get_la_dept_map()
             dept_judge = lookup_judge_for_department(dept_map, department)
             if dept_judge:
@@ -668,7 +731,7 @@ class IngestionWorker:
         # Fallback: if no parties yet but we have a case title with "v.",
         # extract plaintiff/defendant from the caption.
         effective_title = case_title or event_data.get("case_title")
-        if not parties_data and effective_title:
+        if not is_llm_extracted and not parties_data and effective_title:
             parties_data = extract_parties_from_caption(effective_title)
             if parties_data:
                 extraction_methods.setdefault("parties", "regex")
@@ -681,7 +744,7 @@ class IngestionWorker:
                 )
 
         # Fallback case_type from case number prefix (#706).
-        if case_type is None and case_number:
+        if not is_llm_extracted and case_type is None and case_number:
             case_type = extract_case_type_from_number(case_number)
             if case_type:
                 extraction_methods.setdefault("case_type", "regex")
@@ -883,6 +946,149 @@ class IngestionWorker:
             )
         else:
             logger.debug("Document %s already in Postgres — skipping OpenSearch index", document_id)
+
+    # ------------------------------------------------------------------
+    # LLM extraction path (#1473)
+    # ------------------------------------------------------------------
+
+    def _llm_split_document(
+        self,
+        event_data: dict[str, Any],
+        document_id: str,
+        ruling_text: str | None,
+        state: str,
+        county: str,
+    ) -> bool:
+        """Use the framework LlmExtractor to split and extract a document.
+
+        When a county is configured with ``extraction_method=llm``, this method
+        replaces both the regex splitter AND the per-field LLM extraction. The
+        framework ``LlmExtractor`` extracts all structured fields in a single
+        API call, producing one ``ExtractedRuling`` per case in the document.
+
+        Each extracted ruling is re-injected as a synthetic split event with all
+        fields pre-populated (``_llm_extracted=True``), so the normal
+        ``process_event`` flow handles DB writes and indexing without redundant
+        LLM calls.
+
+        Parameters
+        ----------
+        event_data : dict
+            The full event dict.
+        document_id : str
+            The document's unique ID.
+        ruling_text : str | None
+            The document's text content (may be PDF-extracted).
+        state : str
+            Two-letter state code.
+        county : str
+            County name.
+
+        Returns
+        -------
+        bool
+            True if the LLM extractor succeeded and split events were
+            dispatched. False if extraction failed and the caller should
+            fall back to the regex path.
+        """
+        if not ruling_text:
+            return False
+
+        extractor = self._get_framework_extractor()
+        if extractor is None:
+            return False
+
+        # Build metadata from scraper-provided fields.
+        metadata: dict[str, str] = {}
+        if event_data.get("judge_name"):
+            metadata["judge_name"] = event_data["judge_name"]
+        if event_data.get("department"):
+            metadata["department"] = event_data["department"]
+        if event_data.get("hearing_date"):
+            metadata["hearing_date"] = str(event_data["hearing_date"])
+
+        t0 = time.monotonic()
+        try:
+            extracted_rulings = extractor.extract(ruling_text, metadata=metadata or None)
+        except Exception as exc:
+            llm_latency_ms = round((time.monotonic() - t0) * 1000)
+            logger.error(
+                "LLM extraction path failed",
+                extra={
+                    "document_id": document_id,
+                    "error": str(exc),
+                    "llm_latency_ms": llm_latency_ms,
+                    "extraction_method": "llm",
+                },
+            )
+            return False
+
+        llm_latency_ms = round((time.monotonic() - t0) * 1000)
+
+        if not extracted_rulings:
+            logger.warning(
+                "LLM extraction returned no rulings",
+                extra={
+                    "document_id": document_id,
+                    "llm_latency_ms": llm_latency_ms,
+                    "extraction_method": "llm",
+                },
+            )
+            return False
+
+        logger.info(
+            "LLM extraction path: extracted %d ruling(s)",
+            len(extracted_rulings),
+            extra={
+                "document_id": document_id,
+                "ruling_count": len(extracted_rulings),
+                "llm_latency_ms": llm_latency_ms,
+                "extraction_method": "llm",
+                "county": county,
+                "state": state,
+            },
+        )
+
+        # Convert ExtractedRuling objects to split events. For single-ruling
+        # documents, keep the original document_id (no split prefix).
+        is_multi = len(extracted_rulings) > 1
+
+        for idx, ruling in enumerate(extracted_rulings):
+            split_doc_id = make_split_document_id(document_id, idx) if is_multi else document_id
+
+            # Build parties list in the format expected by batch_upsert_parties.
+            parties_data: list[dict[str, str]] = []
+            for party in ruling.extracted_parties:
+                parties_data.append({"name": party.name, "role": party.role})
+
+            # Map outcome enum to string value for the DB.
+            outcome_str: str | None = None
+            if ruling.outcome is not None:
+                outcome_str = ruling.outcome.value
+
+            split_event: dict[str, Any] = {
+                **event_data,
+                "document_id": split_doc_id,
+                "_original_document_id": document_id,
+                "_split_processed": True,
+                "_llm_extracted": True,
+                "_split_index": idx,
+                "_split_count": len(extracted_rulings),
+                # Fields from LLM extraction:
+                "ruling_text": ruling.ruling_text or ruling_text,
+                "case_number": ruling.extracted_case_number or event_data.get("case_number"),
+                "case_title": ruling.extracted_case_title or event_data.get("case_title"),
+                "judge_name": ruling.extracted_judge_name or event_data.get("judge_name"),
+                "department": ruling.department or event_data.get("department"),
+                "motion_type": ruling.motion_type or event_data.get("motion_type"),
+                "outcome": outcome_str or event_data.get("outcome"),
+                "hearing_date": ruling.hearing_date or event_data.get("hearing_date"),
+                "parties": parties_data if parties_data else event_data.get("parties", []),
+            }
+
+            self.process_event(split_event)
+
+        return True
 
     # ------------------------------------------------------------------
     # Internal helpers
