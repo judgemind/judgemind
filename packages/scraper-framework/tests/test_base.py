@@ -6,6 +6,8 @@ import uuid
 from datetime import datetime
 from unittest.mock import MagicMock
 
+import structlog.testing
+
 from framework import BaseScraper, CapturedDocument, ContentFormat, ScraperConfig
 from framework.hashing import sha256_hex
 
@@ -237,10 +239,14 @@ def test_document_id_is_valid_uuid() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_process_document_warns_on_empty_pdf_text(capsys: object) -> None:
+def test_process_document_warns_on_empty_pdf_text() -> None:
     """When a PDF document has non-empty raw_content but parse_document yields
     no ruling_text, _process_document should log a warning about a possible
     image-only PDF.
+
+    Uses ``structlog.testing.capture_logs()`` instead of ``capsys`` so
+    the assertion is independent of structlog's global renderer config
+    (which other tests may change by importing ``ingestion.__main__``).
     """
     config = _make_config()
     pdf_bytes = b"%PDF-1.4 fake image-only content"
@@ -267,20 +273,22 @@ def test_process_document_warns_on_empty_pdf_text(capsys: object) -> None:
             return d
 
     scraper = EmptyPdfScraper(config=config)
-    health = scraper.run()
+
+    with structlog.testing.capture_logs() as cap_logs:
+        health = scraper.run()
 
     assert health.success is True
     assert health.records_captured == 1
 
-    # structlog writes to stdout — verify the warning message appeared
-    captured = capsys.readouterr()  # type: ignore[attr-defined]
-    assert "image-only PDF" in captured.out, (
-        f"Expected warning about image-only PDF in stdout, got: {captured.out!r}"
-    )
-    assert "[warning" in captured.out.lower()
+    warnings = [
+        e
+        for e in cap_logs
+        if e.get("log_level") == "warning" and "image-only PDF" in e.get("event", "")
+    ]
+    assert warnings, f"Expected a warning about image-only PDF, captured events: {cap_logs!r}"
 
 
-def test_process_document_no_warning_when_pdf_has_text(capsys: object) -> None:
+def test_process_document_no_warning_when_pdf_has_text() -> None:
     """When a PDF document has extracted ruling_text, no warning should be logged."""
     config = _make_config()
     pdf_bytes = b"%PDF-1.4 real content with text"
@@ -306,15 +314,17 @@ def test_process_document_no_warning_when_pdf_has_text(capsys: object) -> None:
             return d
 
     scraper = TextPdfScraper(config=config)
-    health = scraper.run()
+
+    with structlog.testing.capture_logs() as cap_logs:
+        health = scraper.run()
 
     assert health.success is True
 
-    captured = capsys.readouterr()  # type: ignore[attr-defined]
-    assert "image-only PDF" not in captured.out, "No warning should be logged when PDF has text"
+    pdf_warnings = [e for e in cap_logs if "image-only PDF" in e.get("event", "")]
+    assert not pdf_warnings, "No warning should be logged when PDF has text"
 
 
-def test_process_document_no_warning_for_html_without_text(capsys: object) -> None:
+def test_process_document_no_warning_for_html_without_text() -> None:
     """When an HTML document has no ruling_text, no PDF-specific warning should fire."""
     config = _make_config()
 
@@ -339,7 +349,9 @@ def test_process_document_no_warning_for_html_without_text(capsys: object) -> No
             return d
 
     scraper = NoTextScraper(config=config)
-    scraper.run()
 
-    captured = capsys.readouterr()  # type: ignore[attr-defined]
-    assert "image-only PDF" not in captured.out, "No PDF warning for HTML documents"
+    with structlog.testing.capture_logs() as cap_logs:
+        scraper.run()
+
+    pdf_warnings = [e for e in cap_logs if "image-only PDF" in e.get("event", "")]
+    assert not pdf_warnings, "No PDF warning for HTML documents"
