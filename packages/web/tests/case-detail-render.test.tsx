@@ -51,7 +51,7 @@ vi.mock('@apollo/client', async () => {
   };
 });
 
-import { CaseDetail } from '../src/app/cases/[id]/CaseDetail';
+import { CaseDetail } from '../src/app/(main)/cases/[id]/CaseDetail';
 
 // ---------------------------------------------------------------------------
 // Helpers

@@ -49,7 +49,7 @@ vi.mock('@apollo/client', async () => {
   };
 });
 
-import { SearchPage } from '../src/app/search/SearchPage';
+import { SearchPage } from '../src/app/(main)/search/SearchPage';
 
 // ---------------------------------------------------------------------------
 // Helpers

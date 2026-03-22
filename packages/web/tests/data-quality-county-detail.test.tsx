@@ -33,7 +33,7 @@ vi.mock('recharts', () => ({
   Legend: () => <div />,
 }));
 
-import { CountyDetail } from '../src/app/admin/data-quality/CountyDetail';
+import { CountyDetail } from '../src/app/(main)/admin/data-quality/CountyDetail';
 import type { DataQualityOverviewItem } from '../src/lib/data-quality-queries';
 
 // ---------------------------------------------------------------------------

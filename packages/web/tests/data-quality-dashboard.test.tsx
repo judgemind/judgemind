@@ -57,7 +57,7 @@ vi.mock('recharts', () => ({
   Legend: () => <div />,
 }));
 
-import { DataQualityDashboard } from '../src/app/admin/data-quality/DataQualityDashboard';
+import { DataQualityDashboard } from '../src/app/(main)/admin/data-quality/DataQualityDashboard';
 
 // ---------------------------------------------------------------------------
 // Helpers

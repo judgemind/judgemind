@@ -6,7 +6,7 @@ import {
   MOTION_TYPE_LABELS,
   OUTCOMES,
   OUTCOME_LABELS,
-} from '../src/app/search/SearchPage';
+} from '../src/app/(main)/search/SearchPage';
 
 describe('buildSearchParams', () => {
   it('returns empty params when all fields are empty', () => {

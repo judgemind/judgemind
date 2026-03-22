@@ -2,6 +2,7 @@
 
 import { useState } from 'react';
 import Link from 'next/link';
+import { usePathname } from 'next/navigation';
 import { Menu, Moon, Sun, LogOut, User } from 'lucide-react';
 import { useTheme } from '@/providers/ThemeProvider';
 import { useAuth } from '@/providers/AuthProvider';
@@ -25,21 +26,25 @@ import {
 export function Header() {
   const { theme, toggle } = useTheme();
   const { user, loading, logout } = useAuth();
+  const pathname = usePathname();
+  const isAuthPage = pathname.startsWith('/auth');
   const [menuOpen, setMenuOpen] = useState(false);
 
   return (
     <>
       <header className="sticky top-0 z-50 flex h-14 items-center border-b bg-background px-4">
-        {/* Hamburger — visible only on mobile (below lg breakpoint) */}
-        <Button
-          variant="ghost"
-          size="icon"
-          onClick={() => setMenuOpen(true)}
-          aria-label="Toggle menu"
-          className="mr-2 lg:hidden"
-        >
-          <Menu className="h-5 w-5" aria-hidden="true" />
-        </Button>
+        {/* Hamburger — visible only on mobile (below lg breakpoint), hidden on auth pages */}
+        {!isAuthPage && (
+          <Button
+            variant="ghost"
+            size="icon"
+            onClick={() => setMenuOpen(true)}
+            aria-label="Toggle menu"
+            className="mr-2 lg:hidden"
+          >
+            <Menu className="h-5 w-5" aria-hidden="true" />
+          </Button>
+        )}
 
         <Link href="/" className="mr-8 rounded-md text-lg font-semibold text-brand-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 dark:text-brand-accent-light">
           Judgemind
@@ -93,17 +98,19 @@ export function Header() {
         </div>
       </header>
 
-      {/* Mobile slide-out menu using shadcn Sheet */}
-      <Sheet open={menuOpen} onOpenChange={setMenuOpen}>
-        <SheetContent side="left" className="w-64 p-0">
-          <SheetHeader className="border-b px-4 py-3">
-            <SheetTitle className="text-lg font-semibold text-brand-accent dark:text-brand-accent-light">
-              Judgemind
-            </SheetTitle>
-          </SheetHeader>
-          <Sidebar onLinkClick={() => setMenuOpen(false)} />
-        </SheetContent>
-      </Sheet>
+      {/* Mobile slide-out menu using shadcn Sheet — hidden on auth pages */}
+      {!isAuthPage && (
+        <Sheet open={menuOpen} onOpenChange={setMenuOpen}>
+          <SheetContent side="left" className="w-64 p-0">
+            <SheetHeader className="border-b px-4 py-3">
+              <SheetTitle className="text-lg font-semibold text-brand-accent dark:text-brand-accent-light">
+                Judgemind
+              </SheetTitle>
+            </SheetHeader>
+            <Sidebar onLinkClick={() => setMenuOpen(false)} />
+          </SheetContent>
+        </Sheet>
+      )}
     </>
   );
 }

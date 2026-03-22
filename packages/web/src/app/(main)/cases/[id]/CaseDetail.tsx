@@ -16,7 +16,7 @@ import {
   groupParties,
   stripMetadataHeaderHtml,
   type RulingMetadata,
-} from '../../../lib/display-helpers';
+} from '@/lib/display-helpers';
 import { sanitizeRulingHtml } from '@/lib/sanitize-html';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';

@@ -29,6 +29,7 @@ const mockPush = vi.fn();
 vi.mock('next/navigation', () => ({
   useRouter: () => ({ push: mockPush, replace: vi.fn(), back: vi.fn() }),
   useSearchParams: () => new URLSearchParams(),
+  usePathname: () => '/auth/login',
 }));
 
 vi.mock('next/link', () => ({
@@ -73,9 +74,9 @@ vi.mock('recharts', () => ({
 
 import { AuthProvider, useAuth } from '@/providers/AuthProvider';
 import { Header } from '@/components/layout/Header';
-import LoginPage from '@/app/auth/login/page';
-import RegisterPage from '@/app/auth/register/page';
-import { DataQualityDashboard } from '@/app/admin/data-quality/DataQualityDashboard';
+import LoginPage from '@/app/(auth)/auth/login/page';
+import RegisterPage from '@/app/(auth)/auth/register/page';
+import { DataQualityDashboard } from '@/app/(main)/admin/data-quality/DataQualityDashboard';
 import {
   LOGIN_MUTATION,
   REGISTER_MUTATION,
