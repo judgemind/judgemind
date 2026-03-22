@@ -34,8 +34,16 @@ COPY packages/scraper-framework/pyproject.toml ./
 COPY packages/scraper-framework/src/ ./src/
 RUN pip install --no-cache-dir . \
     && pip uninstall -y google-generativeai 2>/dev/null || true
+# Install Playwright and its Chromium browser into a shared path so that
+# both root (build-time) and the non-root scraper user (runtime) resolve
+# the same browser binaries.  Without this, `playwright install` writes
+# to /root/.cache/ms-playwright/ but the runtime USER looks in
+# /home/scraper/.cache/ms-playwright/ and fails with "Executable doesn't
+# exist" (see #1625).
+ENV PLAYWRIGHT_BROWSERS_PATH=/opt/playwright-browsers
 RUN pip install --no-cache-dir playwright \
-    && playwright install chromium --with-deps
+    && playwright install chromium --with-deps \
+    && chmod -R o+rx /opt/playwright-browsers
 
 # Fail the build if the conflicting old Google AI SDK crept back in.
 # google-generativeai and google-genai share the google.genai namespace;
