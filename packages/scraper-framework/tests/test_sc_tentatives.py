@@ -446,6 +446,16 @@ def test_sc_case_title_allows_real_vs_party_name() -> None:
     assert "Jones" in title
 
 
+def test_sc_case_title_truncates_long_vs_match() -> None:
+    """Fallback 'v.' pattern truncates matches longer than 200 characters."""
+    long_plaintiff = "A" * 120
+    long_defendant = "B" * 120
+    text = f"{long_plaintiff} vs {long_defendant} Demurrer is GRANTED.\n"
+    title = parse_case_title(text)
+    assert title is not None
+    assert len(title) == 200
+
+
 # ---------------------------------------------------------------------------
 # Full scraper run — mocked HTTP using real fixtures
 # ---------------------------------------------------------------------------
