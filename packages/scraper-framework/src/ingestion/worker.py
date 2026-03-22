@@ -64,7 +64,6 @@ from .extract import (
     extract_parties_from_caption,
     is_valid_case_number,
 )
-from .extraction_config import ExtractionMethod, get_extraction_method
 from .llm_extract import (
     LLMExtractionResult,
     LLMRulingResult,
@@ -75,7 +74,7 @@ from .llm_extract import (
 from .llm_providers import create_client as create_llm_client
 from .ruling_formatter import format_ruling_text
 from .ruling_summarizer import summarize_ruling
-from .splitter import make_split_document_id, split_document
+from .split_ids import make_split_document_id
 from .text_cleanup import clean_ruling_text
 
 if TYPE_CHECKING:
@@ -228,7 +227,7 @@ class IngestionWorker:
         if self._llm_client is None:
             self._llm_client = create_llm_client(provider=self._llm_provider)
         if self._llm_client is None:
-            logger.warning("LLM API key not set — LLM extraction disabled, using regex-only mode")
+            logger.warning("LLM API key not set — per-field LLM extraction disabled")
 
         # Heartbeat tracking — periodic log when idle to prove the worker is alive.
         heartbeat_interval_env = os.environ.get("HEARTBEAT_INTERVAL")
@@ -272,9 +271,9 @@ class IngestionWorker:
                     "summarization disabled"
                 )
 
-        # Framework-level LLM extractor — lazy-initialized on first use by
-        # a county configured with extraction_method=llm.  Uses the Anthropic
-        # API (always Haiku) and is separate from the per-field LLM client above.
+        # Framework-level LLM extractor — lazy-initialized on first use.
+        # Uses the Anthropic API (always Haiku) and is separate from the
+        # per-field LLM client above.
         self._framework_extractor: LlmExtractor | None = None
 
         # LA County department-to-judge mapping — lazy-loaded on first LA event.
@@ -482,66 +481,25 @@ class IngestionWorker:
                     ruling_text = ""
 
         # ------------------------------------------------------------------
-        # Document splitting — detect multi-case calendar pages
+        # Document splitting — detect multi-case calendar pages (#1475)
         # ------------------------------------------------------------------
-        # Update ruling_text in event_data so the splitter sees PDF-extracted text.
+        # Update ruling_text in event_data so the LLM extractor sees
+        # PDF-extracted text.
         if ruling_text != event_data.get("ruling_text"):
             event_data = {**event_data, "ruling_text": ruling_text}
 
-        # Determine extraction method for this county (#1473).
-        extraction_method = get_extraction_method(state, county)
-
+        # LLM extraction is the sole path for document splitting and
+        # structured field extraction.  The legacy regex splitter framework
+        # was removed in #1475.
         if not event_data.get("_split_processed"):
-            if extraction_method == ExtractionMethod.LLM:
-                # LLM extraction path: use framework LlmExtractor to split
-                # and extract all fields in one pass.
-                llm_split = self._llm_split_document(
-                    event_data, document_id, ruling_text, state, county
-                )
-                if llm_split:
-                    # LLM extractor returned results — recurse with split events.
-                    return
-                # LLM extractor failed — fall through to regex path.
-                logger.warning(
-                    "LLM extraction path failed for %s/%s — falling back to regex",
-                    state,
-                    county,
-                    extra={"document_id": document_id},
-                )
-
-            # Regex splitting path (default).
-            split_results = split_document(event_data)
-            if len(split_results) > 1:
-                logger.info(
-                    "Splitting document into %d individual rulings",
-                    len(split_results),
-                    extra={
-                        "document_id": document_id,
-                        "split_count": len(split_results),
-                    },
-                )
-                for idx, split in enumerate(split_results):
-                    split_doc_id = make_split_document_id(document_id, idx)
-                    split_event = {
-                        **event_data,
-                        "document_id": split_doc_id,
-                        "_original_document_id": document_id,
-                        "_split_processed": True,
-                        "_split_index": idx,
-                        "_split_count": len(split_results),
-                        "ruling_text": split.ruling_text,
-                    }
-                    # Override per-split fields only when the splitter provided them
-                    if split.case_title is not None:
-                        split_event["case_title"] = split.case_title
-                    if split.case_number is not None:
-                        split_event["case_number"] = split.case_number
-                    if split.motion_type is not None:
-                        split_event["motion_type"] = split.motion_type
-                    if split.outcome is not None:
-                        split_event["outcome"] = split.outcome
-                    self.process_event(split_event)
+            llm_split = self._llm_split_document(
+                event_data, document_id, ruling_text, state, county
+            )
+            if llm_split:
+                # LLM extractor returned results — recurse with split events.
                 return
+            # LLM extractor failed or returned nothing — continue with
+            # single-document processing and per-field extraction below.
 
         # Parse timestamps
         capture_ts = _parse_datetime(event_data.get("capture_timestamp"))
@@ -1060,7 +1018,7 @@ class IngestionWorker:
             logger.debug("Document %s already in Postgres — skipping OpenSearch index", document_id)
 
     # ------------------------------------------------------------------
-    # LLM extraction path (#1473)
+    # LLM extraction path (#1473, #1475)
     # ------------------------------------------------------------------
 
     def _llm_split_document(
@@ -1073,10 +1031,10 @@ class IngestionWorker:
     ) -> bool:
         """Use the framework LlmExtractor to split and extract a document.
 
-        When a county is configured with ``extraction_method=llm``, this method
-        replaces both the regex splitter AND the per-field LLM extraction. The
-        framework ``LlmExtractor`` extracts all structured fields in a single
-        API call, producing one ``ExtractedRuling`` per case in the document.
+        The framework ``LlmExtractor`` extracts all structured fields in a
+        single API call, producing one ``ExtractedRuling`` per case in the
+        document.  This is the sole splitting/extraction path since #1475
+        removed the legacy regex splitter framework.
 
         Each extracted ruling is re-injected as a synthetic split event with all
         fields pre-populated (``_llm_extracted=True``), so the normal
@@ -1101,7 +1059,7 @@ class IngestionWorker:
         bool
             True if the LLM extractor succeeded and split events were
             dispatched. False if extraction failed and the caller should
-            fall back to the regex path.
+            continue with single-document processing.
         """
         if not ruling_text:
             return False

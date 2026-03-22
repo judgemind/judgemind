@@ -64,6 +64,8 @@ Each field is populated using the first tier that provides a value:
 - `case_title` (e.g., "Smith v. Jones")
 - `parties` (extracted names and roles, written to `case_parties`)
 
+**Multi-ruling documents:** Documents containing multiple cases (e.g. calendar PDFs) are split into individual ruling events by the framework-level `LlmExtractor` before per-field extraction. Each split ruling is re-injected with all fields pre-populated, skipping Tiers 2 and 3. Deterministic UUID5 IDs (`ingestion/split_ids.py`) ensure idempotent re-processing.
+
 **Extraction logging:** The worker tracks which tier populated each field in an `extraction_methods` dict (`"scraper"`, `"llm"`, `"regex"`), enabling monitoring of extraction quality per court.
 
 **Database writes (PostgreSQL):**
