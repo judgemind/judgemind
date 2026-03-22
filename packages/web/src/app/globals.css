@@ -99,7 +99,7 @@
 
   /* Body content area */
   .ruling-content .ruling-body {
-    @apply space-y-3;
+    @apply space-y-4;
   }
 
   .ruling-content .ruling-body p {
@@ -107,11 +107,11 @@
   }
 
   .ruling-content .ruling-body h3 {
-    @apply mt-4 mb-2 text-base font-semibold text-slate-800 dark:text-slate-200;
+    @apply mt-4 mb-2 text-base font-semibold leading-snug text-slate-800 dark:text-slate-200;
   }
 
   .ruling-content .ruling-body h4 {
-    @apply mt-3 mb-1 text-sm font-semibold text-slate-700 dark:text-slate-300;
+    @apply mt-3 mb-1 text-sm font-semibold leading-snug text-slate-700 dark:text-slate-300;
   }
 
   /* Lists */

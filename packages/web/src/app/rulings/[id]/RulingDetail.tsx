@@ -132,7 +132,7 @@ export function RulingDetail({ ruling, sanitizedRulingTextHtml }: RulingProps) {
                 }}
               />
             ) : (
-              <div className="space-y-3">
+              <div className="space-y-4">
                 {cleanRulingText(ruling.rulingText!, metadata).map((paragraph, idx) => (
                   <p
                     key={idx}
