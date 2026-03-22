@@ -96,7 +96,8 @@ describe('transcodeToUtf8', () => {
     expect(result).toBe('\u201cHello\u201d');
   });
 
-  it('falls back to utf-8 for unsupported charsets', () => {
+  it('falls back to latin1 for unsupported charsets', () => {
+    // ASCII-compatible bytes decode the same in latin1 and UTF-8
     const buf = Buffer.from('Hello', 'utf-8');
     const result = transcodeToUtf8(buf, 'totally-fake-charset-12345');
     expect(result).toBe('Hello');

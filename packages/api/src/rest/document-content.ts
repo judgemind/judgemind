@@ -32,16 +32,67 @@ export function detectCharset(html: string): string | null {
 }
 
 /**
+ * Windows-1252 to Unicode mapping for the 0x80-0x9F range.
+ * These bytes differ from ISO-8859-1 / Latin-1. Latin-1 maps them to
+ * C1 control characters, but Windows-1252 maps them to printable characters.
+ */
+const WIN1252_MAP: Record<number, number> = {
+  0x80: 0x20ac, // Euro sign
+  0x82: 0x201a, // Single low-9 quotation mark
+  0x83: 0x0192, // Latin small f with hook
+  0x84: 0x201e, // Double low-9 quotation mark
+  0x85: 0x2026, // Horizontal ellipsis
+  0x86: 0x2020, // Dagger
+  0x87: 0x2021, // Double dagger
+  0x88: 0x02c6, // Modifier letter circumflex accent
+  0x89: 0x2030, // Per mille sign
+  0x8a: 0x0160, // Latin capital S with caron
+  0x8b: 0x2039, // Single left-pointing angle quotation mark
+  0x8c: 0x0152, // Latin capital ligature OE
+  0x8e: 0x017d, // Latin capital Z with caron
+  0x91: 0x2018, // Left single quotation mark
+  0x92: 0x2019, // Right single quotation mark
+  0x93: 0x201c, // Left double quotation mark
+  0x94: 0x201d, // Right double quotation mark
+  0x95: 0x2022, // Bullet
+  0x96: 0x2013, // En dash
+  0x97: 0x2014, // Em dash
+  0x98: 0x02dc, // Small tilde
+  0x99: 0x2122, // Trade mark sign
+  0x9a: 0x0161, // Latin small s with caron
+  0x9b: 0x203a, // Single right-pointing angle quotation mark
+  0x9c: 0x0153, // Latin small ligature oe
+  0x9e: 0x017e, // Latin small z with caron
+  0x9f: 0x0178, // Latin capital Y with diaeresis
+};
+
+/**
  * Transcode a Buffer from a given charset to UTF-8.
- * Uses the standard TextDecoder API which supports most legacy charsets.
+ *
+ * Uses a manual mapping for Windows-1252 (the most common legacy charset in
+ * court HTML) because Node.js's TextDecoder may not support it without full
+ * ICU data. Falls back to TextDecoder for other charsets, then to latin1.
  */
 export function transcodeToUtf8(buffer: Buffer, charset: string): string {
+  const lower = charset.toLowerCase().replace(/[^a-z0-9]/g, '');
+
+  // Windows-1252: use manual byte-by-byte mapping
+  if (lower === 'windows1252' || lower === 'cp1252' || lower === 'win1252') {
+    const codePoints: number[] = [];
+    for (const byte of buffer) {
+      const mapped = WIN1252_MAP[byte];
+      codePoints.push(mapped !== undefined ? mapped : byte);
+    }
+    return String.fromCodePoint(...codePoints);
+  }
+
+  // Try TextDecoder for other charsets (iso-8859-1, etc.)
   try {
-    const decoder = new TextDecoder(charset);
+    const decoder = new TextDecoder(charset, { fatal: true });
     return decoder.decode(buffer);
   } catch {
-    // If the charset is not supported by TextDecoder, fall back to UTF-8
-    return buffer.toString('utf-8');
+    // If the charset is not supported by TextDecoder, fall back to latin1
+    return buffer.toString('latin1');
   }
 }
 
