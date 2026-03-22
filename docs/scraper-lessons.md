@@ -52,6 +52,42 @@ The fix was simple — `tentative\s+rulings?\b` — but the missed variant cause
 
 - **Always use `autojunk=False` with `difflib.SequenceMatcher` when comparing legal text.** The default `autojunk=True` marks frequently-repeated characters as "junk" to speed up matching on short strings. Legal documents are highly repetitive (standard phrases like "The motion for summary judgment is GRANTED." appear many times), causing the heuristic to treat common characters as junk. This produces wildly incorrect similarity scores — e.g. 0.19 instead of 0.99 for texts that differ only by whitespace. Discovered during #978 (ruling text formatter validation). Always pass `SequenceMatcher(None, a, b, autojunk=False)`.
 
+## Node.js Charset Handling
+
+Node.js `TextDecoder` only supports a limited set of charsets without full ICU data (`--with-intl=full-icu`). In CI and production, Node.js is typically built with the default "small ICU" configuration, which restricts `TextDecoder` to:
+
+- **UTF-8** (and aliases like `utf8`)
+- **UTF-16LE** / **UTF-16BE**
+- **ISO-8859-1** (Latin-1)
+
+Charsets like **Windows-1252** (CP1252) — the most common legacy charset in California court HTML documents — are **not available** in small-ICU builds. Code that works locally (where full ICU is often installed) will **silently fail or throw** in CI and production.
+
+### The Windows-1252 problem
+
+Windows-1252 and ISO-8859-1 (Latin-1) are identical for bytes 0x00-0x7F and 0xA0-0xFF, but differ in the 0x80-0x9F range. Latin-1 maps those bytes to C1 control characters (invisible/unprintable), while Windows-1252 maps them to commonly used printable characters:
+
+- Smart quotes: `\u201c` `\u201d` `\u2018` `\u2019`
+- Em dash: `\u2014`, en dash: `\u2013`
+- Ellipsis: `\u2026`
+- Euro sign: `\u20ac`
+- Bullet: `\u2022`
+
+Using `buffer.toString('latin1')` as a fallback is tempting but incorrect for Windows-1252 content — any bytes in the 0x80-0x9F range will be decoded to the wrong Unicode code points.
+
+### Established pattern: manual byte mapping
+
+The solution used in this codebase is a manual byte-by-byte mapping table for the 27 Windows-1252-specific characters. See `packages/api/src/rest/document-content.ts`:
+
+- `WIN1252_MAP` — maps each 0x80-0x9F byte to its correct Unicode code point
+- `transcodeToUtf8()` — uses the map for Windows-1252, falls back to `TextDecoder` for other charsets, then to `latin1` as a last resort
+- `detectCharset()` — parses `<meta charset="...">` and `<meta http-equiv="Content-Type">` tags to discover the declared encoding
+
+When adding charset transcoding in Node.js code, **always use this pattern** rather than `new TextDecoder('windows-1252')`. The TextDecoder approach will pass all local tests but break in CI/production.
+
+### Python is not affected
+
+Python's `codecs` module ships with Windows-1252 support by default (`'cp1252'` or `'windows-1252'`). The scraper framework's encoding module (`packages/scraper-framework/src/framework/encoding.py`) handles charset detection and decoding on the Python side without this limitation. This issue is **Node.js-specific**.
+
 ## Testing
 
 - **Every scraper needs regression tests against real fixtures.** Save actual PDFs/HTML to `tests/fixtures/` and test field extraction against them.
