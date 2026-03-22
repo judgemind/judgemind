@@ -79,7 +79,7 @@ When a previous dispatcher or agent session ends unexpectedly (context window ex
 - An issue has an open PR but CI is failing and no agent is working it — still unassign so a fresh agent can pick it up and adopt the PR.
 - An issue was just assigned by another agent in the current session — unlikely at startup, but the "no open PR" heuristic handles this safely. New assignments will not have PRs yet, but the assigning agent will create one shortly. Even if the cleanup unassigns it prematurely, the agent will re-assign when it pushes its PR.
 
-### 3. Scan the work queue
+### 3. Scan the work queue (startup only)
 
 List all open `agent/ready` issues sorted by priority:
 
@@ -93,6 +93,8 @@ gh issue list --repo judgemind/judgemind \
 Priority order: `priority/p0` > `priority/p1` > `priority/p2` > `priority/p3`. Within the same priority, prefer lower issue numbers (older first).
 
 If specific issues were passed as arguments, filter to only those issues.
+
+**This initial scan is for startup orientation only.** Do NOT cache this list for use in later dispatch cycles. Each dispatch cycle in the main loop (step 6) must run its own fresh query. Issues may be unblocked, relabeled, or closed between cycles — working from a stale list causes the dispatcher to miss newly-available high-priority work.
 
 ### 4. Check for in-flight work
 
@@ -130,7 +132,7 @@ The dispatcher runs a continuous loop:
 3. **Handle in-flight PRs** — merge any that are ready, fix any that are failing
 4. **Sync after merges** — pull latest main after each merge (see "Post-merge sync" in Rules)
 5. **Check audit trigger** — if `prs_since_last_audit >= 20`, spawn `/audit` (see "Periodic Audit" below)
-6. **Fill agent slots** — launch `/task` agents for the next highest-priority issues (see "Spawning agents" for the **mandatory slot count check**)
+6. **Fill agent slots** — **run a fresh `gh issue list --label agent/ready` query**, then launch `/task` agents for the highest-priority issues (see "Spawning agents" for the **mandatory fresh query and slot count check**)
 7. **Process completions** — handle agent completion/failure notifications
 8. **Triage** — close done issues, file new issues for discovered problems
 9. **Check context rotation** — increment `loop_iterations` and check if it is time to wind down (see "Context-Aware Rotation" below)
@@ -148,17 +150,34 @@ The dispatcher runs a continuous loop:
 - **HARD RULE: Never exceed `max_slots` total concurrent agents.** The dispatcher's own slot count check is the primary enforcement mechanism.
 - Launch `/task` agents **with** `isolation: "worktree"` — Claude Code creates a unique worktree at `.claude/worktrees/agent-<id>/` automatically, eliminating worker number contention and race conditions
 
-### Spawning agents — MANDATORY SLOT COUNT CHECK
+### Spawning agents — MANDATORY FRESH QUERY AND SLOT COUNT CHECK
 
-**Before spawning ANY new `/task` agent, you MUST perform this explicit slot count check. This is not optional. Skipping this check is a bug.**
+**Before spawning ANY new `/task` agent, you MUST perform BOTH a fresh issue query AND a slot count check. These are not optional. Skipping either check is a bug.**
 
-1. **Count currently running agents** — count agents you have spawned that have not yet completed or failed. This is the length of your tracked active agents list.
-2. **Calculate available slots:** `available = max_slots - active_agent_count`. If `available <= 0`, **DO NOT SPAWN**. Skip to the next step of the main loop. Log: "Slot limit reached (N active, limit M) — not spawning."
-3. Only if `available > 0`, proceed to spawn — and spawn **at most `available`** agents in this cycle.
+**Step 0 — Fresh issue query (MANDATORY):**
 
-**This check must happen at the start of every dispatch cycle, not just once per session.** The running count changes as agents complete or fail between cycles. Always use the live count, never a cached value.
+**NEVER work from a cached or in-memory issue list.** The work queue changes constantly — issues get unblocked by the `unblock-issues` CI workflow, new issues are filed, priorities change, and other agents claim work. A cached list from startup or a previous cycle will miss newly-available high-priority issues.
 
-For each open slot, pick the next highest-priority unassigned `agent/ready` issue and spawn a `/task` agent using the Agent tool with `isolation: "worktree"`:
+Run a fresh query every dispatch cycle:
+
+```
+gh issue list --repo judgemind/judgemind \
+    --label agent/ready --state open \
+    --json number,title,assignees,labels \
+    --limit 50
+```
+
+Use the results of THIS query — not the startup scan, not a previous cycle's results — to pick the next issue to dispatch. Apply the same priority ordering: `priority/p0` > `priority/p1` > `priority/p2` > `priority/p3`, lower issue numbers first within the same priority.
+
+**Step 1 — Count currently running agents** — count agents you have spawned that have not yet completed or failed. This is the length of your tracked active agents list.
+
+**Step 2 — Calculate available slots:** `available = max_slots - active_agent_count`. If `available <= 0`, **DO NOT SPAWN**. Skip to the next step of the main loop. Log: "Slot limit reached (N active, limit M) — not spawning."
+
+**Step 3 —** Only if `available > 0`, proceed to spawn — and spawn **at most `available`** agents in this cycle.
+
+**Both the fresh query and the slot count check must happen at the start of every dispatch cycle, not just once per session.** The issue list and running count both change as issues are unblocked, agents complete, or agents fail between cycles. Always use live data, never cached values.
+
+For each open slot, pick the next highest-priority unassigned `agent/ready` issue from the fresh query results and spawn a `/task` agent using the Agent tool with `isolation: "worktree"`:
 
 ```
 Agent tool with:
