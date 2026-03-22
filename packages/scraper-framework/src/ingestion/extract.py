@@ -593,17 +593,241 @@ def _looks_like_motion_text(text: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Case title extraction
+# Case title extraction — caption block helpers (merged from backfill #1405)
+# ---------------------------------------------------------------------------
+# These helpers extract titles from structured caption blocks commonly found
+# in LA and other county rulings.  They were previously duplicated in
+# scripts/backfill_case_titles.py and are now the single source of truth.
+
+# Formal plaintiff/defendant role designations on their own line.
+_P_ROLE_RE = re.compile(
+    r"(?:^|\n)\s*(?:Plaintiff|Petitioner|Cross-Complainant)\(?s?\)?\s*[,.\n)]",
+    re.MULTILINE,
+)
+_D_ROLE_RE = re.compile(
+    r"(?:^|\n)\s*(?:Defendant|Respondent|Cross-Defendant)\(?s?\)?\s*[,.\n)]",
+    re.MULTILINE,
+)
+# Inline format: ", Plaintiff(s), vs."
+_P_ROLE_INLINE_RE = re.compile(
+    r",\s*(?:Plaintiff|Petitioner|Cross-Complainant)\(?s?\)?\s*,",
+)
+_D_ROLE_INLINE_RE = re.compile(
+    r",\s*(?:Defendant|Respondent|Cross-Defendant)\(?s?\)?[,.]",
+)
+_VS_RE = re.compile(r"\bv(?:s)?\.", re.IGNORECASE)
+
+# Descriptors that follow a party name and should be stripped.
+_DESCRIPTOR_RE = re.compile(
+    r",?\s*(?:an individual|a (?:public|private|California|Delaware)"
+    r"[\w\s,]*?(?:entity|company|corporation|trust|llc|inc\.?))"
+    r"[\s,]*$",
+    re.IGNORECASE,
+)
+
+# MOVING PARTY / RESPONDING PARTY field patterns.
+_MOVING_PARTY_RE = re.compile(
+    r"MOVING PART(?:Y|IES)\s*:\s*(?P<name>.+?)(?:\.|$)",
+    re.IGNORECASE | re.MULTILINE,
+)
+_RESPONDING_PARTY_RE = re.compile(
+    r"(?:RESPONDING|OPPOSING) PART(?:Y|IES)\s*:\s*(?P<name>.+?)(?:\.|$)",
+    re.IGNORECASE | re.MULTILINE,
+)
+# Role prefixes to strip from moving/responding party names.
+_ROLE_PREFIX_RE = re.compile(
+    r"^(?:Defendants?|Plaintiffs?|Petitioners?|Respondents?"
+    r"|Cross-Complainants?|Cross-Defendants?)[,\s]+",
+    re.IGNORECASE,
+)
+
+# "Case Name:" / "Case Title:" inline field.
+_CASE_NAME_FIELD_RE = re.compile(
+    r"CASE\s+(?:NAME|TITLE)\s*:\s*(?P<title>.+?)(?:\s+CASE\s+NUMBER|\s*$)",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def _clean_caption_party_name(raw: str) -> str:
+    """Normalise a captured party name from a caption block.
+
+    Collapses whitespace, strips trailing commas/et al., removes
+    descriptors like "an individual", and title-cases.
+    """
+    name = " ".join(raw.split()).strip()
+    # Strip descriptors like ", an individual" or ", a public entity"
+    name = _DESCRIPTOR_RE.sub("", name).strip().rstrip(",").strip()
+    # Strip "et al." suffix
+    name = re.sub(r",?\s*et\s+al\.?\s*$", "", name, flags=re.IGNORECASE).strip()
+    # Remove stray leading/trailing punctuation
+    name = name.strip(")(,.; ")
+    return name
+
+
+def _extract_from_caption_block(ruling_text: str) -> str | None:
+    """Extract a case title from the formal Plaintiff/Defendant caption block.
+
+    Looks for line-anchored Plaintiff/Defendant keywords (which distinguish
+    the caption block from body text), then extracts names from the
+    surrounding text.
+    """
+    # Step 1: find "Plaintiff" as a standalone role designation.
+    p_match = _P_ROLE_RE.search(ruling_text)
+    if p_match is None:
+        p_match = _P_ROLE_INLINE_RE.search(ruling_text)
+    if p_match is None:
+        return None
+
+    # Step 2: find "vs." or "v." after the plaintiff role.
+    vs_match = _VS_RE.search(ruling_text, p_match.end())
+    if vs_match is None:
+        return None
+    if vs_match.start() - p_match.end() > 30:
+        return None
+
+    # Step 3: find "Defendant" after vs.
+    d_match = _D_ROLE_RE.search(ruling_text, vs_match.end())
+    if d_match is None:
+        d_match = _D_ROLE_INLINE_RE.search(ruling_text, vs_match.end())
+    if d_match is None:
+        return None
+    if d_match.start() - vs_match.end() > 300:
+        return None
+
+    # Step 4: extract plaintiff name — text before the Plaintiff line.
+    search_start = max(0, p_match.start() - 300)
+    plaintiff_raw = ruling_text[search_start : p_match.start()]
+    lines = plaintiff_raw.split("\n")
+
+    name_lines: list[str] = []
+    for line in reversed(lines):
+        stripped = line.strip()
+        if not stripped or stripped == ",":
+            if name_lines:
+                break
+            continue
+        upper = stripped.upper()
+        # Stop at structural header lines
+        if (
+            upper in ("DISTRICT", "CALIFORNIA", "DEPARTMENT")
+            or upper.startswith("SUPERIOR COURT")
+            or upper.startswith("FOR THE")
+            or upper.startswith("COUNTY OF")
+        ):
+            break
+        # Stop at single-char/number lines (department designators)
+        if len(stripped) <= 2 and not stripped.endswith(","):
+            break
+        if len(name_lines) >= 4:
+            break
+        name_lines.append(stripped)
+
+    if not name_lines:
+        return None
+
+    name_lines.reverse()
+    plaintiff = " ".join(name_lines)
+
+    # Step 5: extract defendant name — text between vs. and Defendant line
+    defendant_raw = ruling_text[vs_match.end() : d_match.start()]
+
+    plaintiff = _clean_caption_party_name(plaintiff)
+    defendant = _clean_caption_party_name(defendant_raw)
+
+    if not plaintiff or not defendant:
+        return None
+
+    title = f"{plaintiff.title()} v. {defendant.title()}"
+
+    if len(title) > 150:
+        return None
+
+    return title
+
+
+def _extract_from_moving_responding(ruling_text: str) -> str | None:
+    """Extract a case title from MOVING PARTY / RESPONDING PARTY fields.
+
+    Many LA rulings list parties as::
+
+        MOVING PARTY: Defendant Acme Corp.
+        RESPONDING PARTY: Plaintiffs John Doe and Jane Doe
+
+    Strips the role prefix (Defendant/Plaintiffs/etc.) and constructs
+    "[Moving Party] v. [Responding Party]".
+    """
+    m_match = _MOVING_PARTY_RE.search(ruling_text)
+    if m_match is None:
+        return None
+    r_match = _RESPONDING_PARTY_RE.search(ruling_text)
+    if r_match is None:
+        return None
+
+    moving_raw = m_match.group("name").strip()
+    responding_raw = r_match.group("name").strip()
+
+    # Reject non-party content like "No opposition filed"
+    skip_phrases = ("no opposition", "none", "no response", "unopposed")
+    for phrase in skip_phrases:
+        if phrase in responding_raw.lower():
+            return None
+
+    # Strip role prefixes like "Defendant " or "Plaintiffs "
+    moving_name = _ROLE_PREFIX_RE.sub("", moving_raw)
+    responding_name = _ROLE_PREFIX_RE.sub("", responding_raw)
+
+    moving_name = _clean_caption_party_name(moving_name)
+    responding_name = _clean_caption_party_name(responding_name)
+
+    if not moving_name or not responding_name:
+        return None
+
+    title = f"{moving_name.title()} v. {responding_name.title()}"
+
+    if len(title) > 150:
+        return None
+
+    return title
+
+
+def _extract_from_case_name_field(ruling_text: str) -> str | None:
+    """Extract a case title from an inline 'Case Name:' or 'Case Title:' field.
+
+    Some LA rulings include a metadata field like::
+
+        CASE NAME: Porsche Leasing Ltd. et al. v. Tsisana Mikia, et al.
+    """
+    m = _CASE_NAME_FIELD_RE.search(ruling_text)
+    if m is None:
+        return None
+
+    raw_title = m.group("title").strip()
+
+    # Must contain "v." to be a real case name (not just a description)
+    if not re.search(r"\bv\.?\s", raw_title):
+        return None
+
+    title = " ".join(raw_title.split())
+    title = title.rstrip(".,;: ")
+
+    if len(title) > 150 or len(title) < 5:
+        return None
+
+    return title
+
+
+# ---------------------------------------------------------------------------
+# Case title extraction — regex patterns
 # ---------------------------------------------------------------------------
 
 # Patterns to extract case titles ("Plaintiff v. Defendant") from ruling text.
 # Ordered by specificity — most anchored patterns first.
 _CASE_TITLE_PATTERNS: list[re.Pattern[str]] = [
-    # "Case Name: X v. Y" or "Case Title: X v. Y"
-    re.compile(
-        r"(?:Case\s+(?:Name|Title))\s*:\s*(?P<title>[^\n]{5,150})",
-        re.IGNORECASE,
-    ),
+    # NOTE: "Case Name: X v. Y" was previously here but is now handled by
+    # Strategy 2 (_extract_from_case_name_field) which includes a "v." check
+    # to avoid returning non-adversarial content like "Motion for Summary
+    # Judgment" as a case title.  See #1405.
+    #
     # "PLAINTIFF vs DEFENDANT" with case number prefix, Riverside-style
     # e.g. "CVPS2306157 YELDELL vs HENSS Hearing re: Demurrer"
     re.compile(
@@ -680,19 +904,38 @@ _IN_RE_PATTERNS: list[re.Pattern[str]] = [
 
 
 def extract_case_title(ruling_text: str) -> str | None:
-    """Extract a case title from ruling text using regex patterns.
+    """Extract a case title from ruling text.
 
-    Looks for "Plaintiff v. Defendant" patterns in the text first, then
-    falls back to "In re" / "In the Matter of" / "Petition of" patterns
-    for non-adversarial cases (#1378).
+    Tries multiple extraction strategies in order of reliability (#1405):
 
-    Returns the title in title case, or ``None`` if no pattern matches.
+    1. Formal caption block (Plaintiff vs. Defendant) — most reliable
+    2. Inline "Case Name:" or "Case Title:" field — direct extraction
+    3. "MOVING PARTY:" / "RESPONDING PARTY:" fields — construct from party names
+    4. Regex "X v. Y" patterns — broad fallback with boilerplate/motion filtering
+    5. "In re:" / "In the Matter of" / "Petition of" — non-adversarial cases (#1378)
+
+    Returns a title like ``"Buenaventura v. City Of Pasadena"``, or ``None``.
 
     Rejects titles that contain department header boilerplate (#1244).
     Rejects matches that look like motion descriptions rather than case
     titles (#1245) — e.g. "Granting Motion To v. Disqualify Plaintiff".
     """
-    # Try "v." patterns first (most common case title format)
+    # Strategy 1: Formal caption block (Plaintiff vs. Defendant)
+    title = _extract_from_caption_block(ruling_text)
+    if title is not None:
+        return title
+
+    # Strategy 2: Inline "Case Name:" / "Case Title:" field
+    title = _extract_from_case_name_field(ruling_text)
+    if title is not None:
+        return title
+
+    # Strategy 3: MOVING PARTY / RESPONDING PARTY fields
+    title = _extract_from_moving_responding(ruling_text)
+    if title is not None:
+        return title
+
+    # Strategy 4: Regex "X v. Y" patterns — broad fallback
     for pattern in _CASE_TITLE_PATTERNS:
         # Use finditer to check all matches for this pattern, not just the
         # first.  If the first match is a motion description, we skip it and
@@ -723,7 +966,7 @@ def extract_case_title(ruling_text: str) -> str | None:
             if len(title) >= 5:
                 return title
 
-    # Fallback: "In re" / "In the Matter of" / "Petition of" (#1378)
+    # Strategy 5: "In re" / "In the Matter of" / "Petition of" (#1378)
     for pattern in _IN_RE_PATTERNS:
         m = pattern.search(ruling_text)
         if m is not None:
