@@ -144,7 +144,7 @@ export function JudgesList() {
           <Input
             type="text"
             name="judgeName"
-            placeholder="Filter by judge name..."
+            placeholder="Filter by judge name\u2026"
             value={nameFilter}
             onChange={(e) => setNameFilter(e.target.value)}
             className="pl-9"

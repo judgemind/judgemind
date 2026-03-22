@@ -347,11 +347,11 @@ export function JudgeProfile({ judgeId }: { judgeId: string }) {
                       <TableCell className="font-medium">
                         {formatMotionType(row.motionType)}
                       </TableCell>
-                      <TableCell className="text-right">{row.total}</TableCell>
-                      <TableCell className="text-right">{row.granted}</TableCell>
-                      <TableCell className="text-right">{row.denied}</TableCell>
-                      <TableCell className="text-right">{row.grantedInPart}</TableCell>
-                      <TableCell className="text-right font-medium">
+                      <TableCell className="text-right tabular-nums">{row.total}</TableCell>
+                      <TableCell className="text-right tabular-nums">{row.granted}</TableCell>
+                      <TableCell className="text-right tabular-nums">{row.denied}</TableCell>
+                      <TableCell className="text-right tabular-nums">{row.grantedInPart}</TableCell>
+                      <TableCell className="text-right tabular-nums font-medium">
                         {Math.round(row.grantRate * 100)}%
                       </TableCell>
                     </TableRow>
