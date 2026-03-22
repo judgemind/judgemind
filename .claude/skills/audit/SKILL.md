@@ -133,11 +133,34 @@ Review dependency freshness and hygiene:
 
 ## Step 2 — Deduplicate findings
 
-Before filing issues, compare each finding against the open issues list fetched in Step 0:
+**Do not rely on the Step 0 snapshot.** The open issues list fetched at the start of the audit may be stale — other agents may have closed or modified issues during Step 1, which can take 30+ minutes. Re-fetch the current state before cross-referencing.
 
-1. For each finding, search `open_issues.json` for issues with similar titles or descriptions.
+### 2.1 — Re-fetch open issues
+
+Re-run the same query from Step 0 to get a fresh list of open issues:
+
+```
+gh issue list --repo judgemind/judgemind --state open \
+    --json number,title,body,labels --limit 200
+```
+
+Overwrite `{worktree}/tmp/audit/open_issues.json` with the fresh data.
+
+### 2.2 — Verify individual issue state before classifying as duplicate
+
+Before marking any finding as "skipped — duplicate of #N" based on a matching issue #N, verify that #N is still open:
+
+```
+gh issue view <N> --repo judgemind/judgemind --json state -q '.state'
+```
+
+If the issue has been closed since the list was fetched, treat the finding as new instead. Do not reference closed issues as duplicates — the fix may have already shipped, or the issue may have been closed as stale.
+
+### 2.3 — Compare findings against refreshed issue list
+
+1. For each finding, search the refreshed `open_issues.json` for issues with similar titles or descriptions.
 2. Also search for existing TODO comments in the codebase that reference the same problem (with issue numbers).
-3. If a duplicate exists, note it in `findings.md` as "skipped — duplicate of #N" and do not file a new issue.
+3. If a duplicate exists (and is verified as still open per 2.2), note it in `findings.md` as "skipped — duplicate of #N" and do not file a new issue.
 4. If a finding is related to but not a duplicate of an existing issue, note the related issue in the new issue body.
 
 ---
