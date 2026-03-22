@@ -402,6 +402,50 @@ def test_sc_case_title_none_for_empty() -> None:
     assert parse_case_title("") is None
 
 
+def test_sc_case_title_case_name_field() -> None:
+    """Strategy 1: 'Case Name:' field (Dept 7 probate format)."""
+    text = "Tentative Ruling\nCase Name: The Estate of Anthony Intravaia\nCase No.: 25PR199782\n"
+    assert parse_case_title(text) == "The Estate of Anthony Intravaia"
+
+
+def test_sc_case_title_line_entry_with_dashes() -> None:
+    """Strategy 2: 'LINE N - CASENO – Title' in ruling body."""
+    text = (
+        "LINE # CASE # CASE TITLE RULING\n"
+        "LINE 1 24PR196490 In re the Klein Living Trust summary text\n"
+        "SUPERIOR COURT\n"
+        "LINE 1 - 24PR196490 \u2013 In re the Klein Living Trust Dated 6/5/1980\n"
+        "Petitioner cites Lee v. Swansboro (2007) 151 Cal.App.4th 575\n"
+    )
+    title = parse_case_title(text)
+    assert title is not None
+    assert "Klein Living Trust" in title
+    assert "Petitioner" not in title
+    assert "Swansboro" not in title
+
+
+def test_sc_case_title_rejects_legal_citation() -> None:
+    """The fallback vs_re must not match legal citations in ruling text."""
+    text = (
+        "The court's analysis begins.\n"
+        "Petitioner cites Lee v. Swansboro Country Property Owners Assn. "
+        "(2007) 151 Cal.App.4th 575\n"
+        "for the proposition that trust modifications require consent.\n"
+    )
+    title = parse_case_title(text)
+    # Should return None because the only "v." is a legal citation
+    assert title is None
+
+
+def test_sc_case_title_allows_real_vs_party_name() -> None:
+    """Real party-vs-party titles should still match the fallback pattern."""
+    text = "Smith vs Jones  Demurrer is GRANTED.\n"
+    title = parse_case_title(text)
+    assert title is not None
+    assert "Smith" in title
+    assert "Jones" in title
+
+
 # ---------------------------------------------------------------------------
 # Full scraper run — mocked HTTP using real fixtures
 # ---------------------------------------------------------------------------

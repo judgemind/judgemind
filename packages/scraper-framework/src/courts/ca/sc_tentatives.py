@@ -352,29 +352,67 @@ def parse_motion_type(text: str) -> str | None:
 def parse_case_title(text: str) -> str | None:
     """Extract case title (party names) from ruling text.
 
-    Looks for patterns like "CaseName vs CaseName" or structured case lines.
+    Tries multiple strategies in order of specificity:
+    1. "Case Name: ..." or "Case Title: ..." (Dept 7 probate format)
+    2. "LINE N - CASENO – Title" (Dept 2 probate body format)
+    3. Structured LINE table entry (civil calendar format)
+    4. Fallback: "Party v. Party" pattern (excluding legal citations)
     """
-    # Try the structured LINE format first: "LINE N CASENO CaseTitle MotionType"
+    # Strategy 1: "Case Name:" or "Case Title:" field (Dept 7 probate format)
+    case_name_match = re.search(
+        r"Case\s+(?:Name|Title)\s*:\s*(?P<title>[^\n]{5,150})",
+        text,
+        re.IGNORECASE,
+    )
+    if case_name_match:
+        title = " ".join(case_name_match.group("title").strip().split())
+        if title and len(title) > 3:
+            return title
+
+    # Strategy 2: "LINE N - CASENO – Title" (appears in ruling body, not the
+    # summary table).  This handles the Dept 2 probate format where the case
+    # line in the body uses dashes/en-dashes as separators.  The dash between
+    # LINE N and the case number is required to distinguish from the summary
+    # table format (which uses spaces only).
+    line_entry_match = re.search(
+        r"LINE\s+\d+\s*[-–]\s*\d{2}(?:CV|PR)\d{6}\s*[-–]\s*(?P<title>[^\n]+)",
+        text,
+        re.IGNORECASE,
+    )
+    if line_entry_match:
+        title = " ".join(line_entry_match.group("title").strip().split())
+        if title and len(title) > 3:
+            return title
+
+    # Strategy 3: Structured LINE table: "LINE N CASENO CaseTitle  MotionOrRuling"
     m = _CASE_LINE_RE.search(text)
     if m:
         title = m.group("case_title").strip()
-        # Clean up extra whitespace
         title = " ".join(title.split())
         if title and len(title) > 3:
             return title
 
-    # Fallback: look for "Plaintiff, ... vs. Defendant, ..."
+    # Strategy 4: Fallback "Party v. Party" pattern.
+    # Exclude matches that start with procedural/legal-citation words like
+    # "Petitioner", "Plaintiff", "Defendant" etc. — those indicate ruling
+    # body text referencing case law, not the case title.
+    citation_starters = re.compile(
+        r"^(?:Petitioner|Plaintiff|Defendant|Respondent|Movant|The\s+Court"
+        r"|See\s+|cf\.\s+|In\s+re\s+the\s+(?:Matter|Application))",
+        re.IGNORECASE,
+    )
     vs_re = re.compile(
         r"(?:^|\n)\s*(?P<title>[A-Z][^\n]{3,}?\s+v[s]?\.?\s+[A-Z][^\n]{3,})",
         re.MULTILINE,
     )
-    m2 = vs_re.search(text)
-    if m2:
-        title = " ".join(m2.group("title").strip().split())
-        # Truncate at reasonable length
-        if len(title) > 200:
-            title = title[:200]
-        return title
+    for m2 in vs_re.finditer(text):
+        candidate = " ".join(m2.group("title").strip().split())
+        # Skip legal citations that match "v." but aren't the case title
+        if citation_starters.match(candidate):
+            continue
+        if len(candidate) > 200:
+            candidate = candidate[:200]
+        return candidate
 
     return None
 
