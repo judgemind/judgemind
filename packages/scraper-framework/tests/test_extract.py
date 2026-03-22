@@ -13,11 +13,13 @@ from ingestion.extract import (
     extract_case_number,
     extract_case_title,
     extract_case_type_from_number,
+    extract_case_type_from_scraper_id,
     extract_hearing_date,
     extract_judge_name,
     extract_motion_type,
     extract_outcome,
     extract_parties_from_caption,
+    is_valid_case_number,
 )
 
 # ---------------------------------------------------------------------------
@@ -1489,3 +1491,103 @@ class TestExtractPartiesFromCaptionAdditional:
         plaintiffs = [p for p in parties if p["role"] == "plaintiff"]
         # "Inc" is a corporate suffix fragment — should be filtered
         assert len(plaintiffs) == 0
+
+
+# ---------------------------------------------------------------------------
+# is_valid_case_number (#1524)
+# ---------------------------------------------------------------------------
+
+
+class TestIsValidCaseNumber:
+    """Tests for is_valid_case_number() — validates LLM-returned case numbers."""
+
+    def test_valid_oc_numeric(self) -> None:
+        assert is_valid_case_number("2024-01393434") is True
+
+    def test_valid_la_format(self) -> None:
+        assert is_valid_case_number("24NNCV02551") is True
+
+    def test_valid_riverside(self) -> None:
+        assert is_valid_case_number("CVPS2306157") is True
+
+    def test_valid_sf(self) -> None:
+        assert is_valid_case_number("FPT-25-378624") is True
+
+    def test_valid_sb(self) -> None:
+        assert is_valid_case_number("CIVRS2502080") is True
+
+    def test_valid_oc_three_part(self) -> None:
+        assert is_valid_case_number("30-2024-01370288") is True
+
+    def test_rejects_case_title_vs(self) -> None:
+        assert is_valid_case_number("Smith v. Kia") is False
+
+    def test_rejects_case_title_vs_dot(self) -> None:
+        assert is_valid_case_number("Catalan v. FCA") is False
+
+    def test_rejects_case_title_vs_no_dot(self) -> None:
+        assert is_valid_case_number("Tamadon vs Choe") is False
+
+    def test_rejects_case_title_vs_long(self) -> None:
+        assert is_valid_case_number("Youssef vs. BCKG Beach Properties, LLC") is False
+
+    def test_rejects_ruling_text_in_title(self) -> None:
+        assert is_valid_case_number("Tuinenburg v. Before the Court is a demurrer") is False
+
+    def test_rejects_legal_citation(self) -> None:
+        assert is_valid_case_number("Cal. App. 4th 1, 20; DuPont Merck") is False
+
+    def test_rejects_fsupp_citation(self) -> None:
+        assert is_valid_case_number("F.Supp.3d 1101, 1113") is False
+
+    def test_rejects_very_long_string(self) -> None:
+        assert is_valid_case_number("A" * 31) is False
+
+    def test_rejects_ruling_keywords(self) -> None:
+        assert (
+            is_valid_case_number("Dilani vs. Guaranteed Property Inspections, LLC TENTATIVE RULING")
+            is False
+        )
+
+    def test_rejects_empty(self) -> None:
+        assert is_valid_case_number("") is False
+
+    def test_rejects_none_like(self) -> None:
+        assert is_valid_case_number("   ") is False
+
+    def test_accepts_unknown_prefix(self) -> None:
+        assert is_valid_case_number("UNKNOWN-abc123") is True
+
+
+# ---------------------------------------------------------------------------
+# extract_case_type_from_scraper_id (#1524)
+# ---------------------------------------------------------------------------
+
+
+class TestExtractCaseTypeFromScraperId:
+    """Tests for extract_case_type_from_scraper_id()."""
+
+    def test_oc_civil(self) -> None:
+        assert extract_case_type_from_scraper_id("ca-oc-tentatives-civil") == "civil"
+
+    def test_oc_family(self) -> None:
+        assert extract_case_type_from_scraper_id("ca-oc-tentatives-family") == "family"
+
+    def test_oc_probate(self) -> None:
+        assert extract_case_type_from_scraper_id("ca-oc-tentatives-probate") == "probate"
+
+    def test_la_tentatives(self) -> None:
+        # LA scraper doesn't have a case type suffix
+        assert extract_case_type_from_scraper_id("ca-la-tentatives") is None
+
+    def test_empty_string(self) -> None:
+        assert extract_case_type_from_scraper_id("") is None
+
+    def test_none(self) -> None:
+        assert extract_case_type_from_scraper_id(None) is None
+
+    def test_criminal(self) -> None:
+        assert extract_case_type_from_scraper_id("ca-foo-criminal") == "criminal"
+
+    def test_small_claims(self) -> None:
+        assert extract_case_type_from_scraper_id("ca-foo-small-claims") == "small_claims"
