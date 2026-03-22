@@ -161,8 +161,8 @@ export function CasesList() {
   }
 
   return (
-    <div>
-      <div className="mb-4 flex flex-wrap gap-3">
+    <div className="space-y-6">
+      <div className="flex flex-wrap gap-3">
         <Input
           type="text"
           name="caseFilter"

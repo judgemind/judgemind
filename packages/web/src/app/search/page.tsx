@@ -6,13 +6,13 @@ export default function SearchRoute() {
   return (
     <Suspense
       fallback={
-        <div className="mx-auto max-w-6xl">
-          <div className="mb-6">
+        <div className="mx-auto max-w-6xl space-y-6">
+          <div>
             <Skeleton className="h-8 w-48" />
             <Skeleton className="mt-2 h-4 w-72" />
           </div>
           <Skeleton className="h-10 w-full" />
-          <div className="mt-6 flex gap-6">
+          <div className="flex gap-6">
             <div className="hidden w-64 shrink-0 lg:block">
               <Skeleton className="h-96 w-full rounded-lg" />
             </div>

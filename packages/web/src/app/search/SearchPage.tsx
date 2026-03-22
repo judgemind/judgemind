@@ -234,7 +234,7 @@ function FilterContent({
   return (
     <div className="space-y-6">
       <div>
-        <h2 className="flex items-center gap-2 text-sm font-semibold text-foreground">
+        <h2 className="flex items-center gap-2 text-sm font-semibold uppercase tracking-wide text-muted-foreground">
           <SlidersHorizontal className="h-4 w-4" aria-hidden="true" />
           Filters
         </h2>
@@ -571,9 +571,9 @@ export function SearchPage() {
   };
 
   return (
-    <div className="mx-auto max-w-6xl">
+    <div className="mx-auto max-w-6xl space-y-6">
       {/* Page header */}
-      <div className="mb-6">
+      <div>
         <h1 className="text-2xl font-bold tracking-tight text-foreground">
           Search Rulings
         </h1>
@@ -618,7 +618,7 @@ export function SearchPage() {
       </form>
 
       {/* Main content: sidebar filters + results */}
-      <div className="mt-6 flex gap-6">
+      <div className="flex gap-6">
         {/* Desktop filter sidebar */}
         <aside aria-label="Search filters" className="hidden w-64 shrink-0 lg:block">
           <Card>

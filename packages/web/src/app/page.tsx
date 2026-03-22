@@ -2,16 +2,18 @@ import Link from 'next/link';
 
 export default function HomePage() {
   return (
-    <div className="mx-auto max-w-3xl">
-      <h1 className="text-3xl font-bold text-balance text-slate-900 dark:text-slate-100">
-        Free legal research for everyone
-      </h1>
-      <p className="mt-4 text-lg text-slate-600 dark:text-slate-400">
-        Judgemind captures California tentative rulings and judicial analytics — open source,
-        free forever.
-      </p>
+    <div className="mx-auto max-w-3xl space-y-6">
+      <div>
+        <h1 className="text-2xl font-bold tracking-tight text-foreground">
+          Free legal research for everyone
+        </h1>
+        <p className="mt-4 text-lg text-muted-foreground">
+          Judgemind captures California tentative rulings and judicial analytics — open source,
+          free forever.
+        </p>
+      </div>
 
-      <div className="mt-8 flex gap-4">
+      <div className="flex gap-3">
         <Link
           href="/search"
           className="rounded-lg bg-brand-600 px-5 py-2.5 text-sm font-semibold text-white hover:bg-brand-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"

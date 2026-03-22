@@ -66,8 +66,8 @@ export default async function CaseDetailPage({ params }: Props) {
   const heading = buildCaseHeading(caseData, id);
 
   return (
-    <div className="mx-auto max-w-4xl">
-      <nav className="mb-4 text-sm text-muted-foreground" aria-label="Breadcrumb">
+    <div className="mx-auto max-w-4xl space-y-6">
+      <nav className="text-sm text-muted-foreground" aria-label="Breadcrumb">
         <Link href="/cases" className="hover:text-primary">
           Cases
         </Link>
@@ -75,38 +75,38 @@ export default async function CaseDetailPage({ params }: Props) {
         <span className="text-foreground">{caseData.caseNumber}</span>
       </nav>
 
-      <div className="flex flex-wrap items-start gap-3">
-        <h1 className="text-2xl font-bold text-foreground">{heading}</h1>
-        <div className="flex flex-wrap gap-2 pt-1">
-          {caseData.caseType && (
-            <Badge variant="outline">
-              {formatLabel(caseData.caseType)}
-            </Badge>
-          )}
-          {caseData.caseStatus && (
-            <Badge
-              variant={
-                STATUS_VARIANT[caseData.caseStatus.toLowerCase()] ?? 'outline'
-              }
-            >
-              {formatLabel(caseData.caseStatus)}
-            </Badge>
-          )}
+      <div>
+        <div className="flex flex-wrap items-start gap-3">
+          <h1 className="text-2xl font-bold tracking-tight text-foreground">{heading}</h1>
+          <div className="flex flex-wrap gap-2 pt-1">
+            {caseData.caseType && (
+              <Badge variant="outline">
+                {formatLabel(caseData.caseType)}
+              </Badge>
+            )}
+            {caseData.caseStatus && (
+              <Badge
+                variant={
+                  STATUS_VARIANT[caseData.caseStatus.toLowerCase()] ?? 'outline'
+                }
+              >
+                {formatLabel(caseData.caseStatus)}
+              </Badge>
+            )}
+          </div>
         </div>
+        {caseData.caseTitle && (
+          <p className="mt-1 text-base text-muted-foreground">
+            {caseData.caseTitle}
+          </p>
+        )}
+        {caseData.court && (
+          <p className="mt-0.5 text-sm text-muted-foreground">
+            {caseData.court.courtName} &middot; {caseData.court.county}
+          </p>
+        )}
       </div>
-      {caseData.caseTitle && (
-        <p className="mt-1 text-base text-muted-foreground">
-          {caseData.caseTitle}
-        </p>
-      )}
-      {caseData.court && (
-        <p className="mt-0.5 text-sm text-muted-foreground">
-          {caseData.court.courtName} &middot; {caseData.court.county}
-        </p>
-      )}
-      <div className="mt-6">
-        <CaseDetail caseId={id} />
-      </div>
+      <CaseDetail caseId={id} />
     </div>
   );
 }
