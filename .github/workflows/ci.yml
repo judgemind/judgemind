@@ -709,9 +709,11 @@ jobs:
         run: |
           # Merge coverage from all three split scraper test jobs.
           # Uses separate baselines for partial vs full runs:
-          #   - "packages/scraper-framework" (combined) when court tests ran
-          #   - "packages/scraper-framework:framework-only" when only
-          #     framework + ingestion tests ran (courts skipped)
+          #   - "packages/scraper-framework" (combined) when ALL three test
+          #     jobs (framework, courts, ingestion) produced coverage
+          #   - "packages/scraper-framework:framework-only" (partial) when
+          #     any test job was skipped (e.g. courts-only or
+          #     framework-only changes)
           COV_ARGS=""
           COV_FRAMEWORK="coverage-artifacts/coverage-scraper-framework/coverage.xml"
           COV_COURTS="coverage-artifacts/coverage-scraper-courts/coverage.xml"
@@ -731,13 +733,17 @@ jobs:
             echo "Neither framework nor court coverage available — skipping"
             exit 0
           fi
-          # Choose baseline key based on whether court tests ran
+          # Choose baseline key based on which test jobs ran.
+          # Use the combined (strict) baseline only when ALL three test
+          # jobs produced coverage artifacts.  If any job was skipped
+          # (e.g. courts-only or framework-only changes), use the
+          # partial baseline to avoid false failures.
           BASELINE_KEY="packages/scraper-framework"
-          if [ ! -f "$COV_COURTS" ]; then
-            BASELINE_KEY="packages/scraper-framework:framework-only"
-            echo "Court tests skipped — enforcing framework-only baseline"
-          else
+          if [ -f "$COV_FRAMEWORK" ] && [ -f "$COV_COURTS" ] && [ -f "$COV_INGEST" ]; then
             echo "All test jobs ran — enforcing combined baseline"
+          else
+            BASELINE_KEY="packages/scraper-framework:framework-only"
+            echo "Partial test run (not all jobs produced coverage) — enforcing partial baseline"
           fi
           python scripts/update-coverage-baselines.py \
             --package packages/scraper-framework \
