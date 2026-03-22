@@ -12,6 +12,12 @@
       }
     },
     {
+      "files": ["src/app/**/*.{ts,tsx}"],
+      "rules": {
+        "local/prefer-path-alias": "error"
+      }
+    },
+    {
       "files": ["**/__tests__/**", "**/*.test.ts", "**/*.test.tsx", "tests/**"],
       "rules": {
         "local/no-client-utility-import": "off"

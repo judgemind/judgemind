@@ -278,6 +278,7 @@ Run scripts via `scripts/run-py.sh scripts/<name>.py` — it reads the header an
 - Node.js 20+ for API; activate with `source ~/.nvm/nvm.sh && nvm install 20 --no-progress`
 - Next.js 14+ for frontend
 - ESLint + Prettier
+- In `packages/web/src/app/`, use `@/` path aliases instead of deep relative imports (`../../` or deeper). The `local/prefer-path-alias` ESLint rule enforces this. Deep relative imports break when route groups are reorganised.
 - Jest or Vitest for testing
 
 ### General
