@@ -518,6 +518,8 @@ CREATE INDEX idx_documents_active       ON documents(status) WHERE status = 'act
 CREATE INDEX idx_judge_aliases_raw_name     ON judge_aliases(lower(raw_name));
 CREATE INDEX idx_attorney_aliases_raw_name  ON attorney_aliases(lower(raw_name));
 CREATE INDEX idx_party_aliases_raw_name     ON party_aliases(lower(raw_name));
+-- Functional index for DISTINCT ON dedup in casePartiesLoader (#1504)
+CREATE INDEX idx_parties_canonical_name_lower ON parties(LOWER(canonical_name));
 -- Bar number lookup for attorney dedup
 CREATE INDEX idx_attorneys_bar              ON attorneys(bar_state, bar_number)
     WHERE bar_number IS NOT NULL;
