@@ -5,6 +5,7 @@
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { resolvers } from '../src/graphql/resolvers';
+import { clearPlatformStatsCache } from '../src/graphql/platform-stats-cache';
 
 // ---------------------------------------------------------------------------
 // Mock context
@@ -35,6 +36,7 @@ function createContext(pool: ReturnType<typeof createMockPool>) {
 describe('platformStats resolver', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    clearPlatformStatsCache();
   });
 
   it('returns aggregate counts from courts, rulings, and judges tables', async () => {
