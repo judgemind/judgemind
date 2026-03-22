@@ -87,7 +87,7 @@ function SkeletonRow() {
   return (
     <TableRow>
       <TableCell>
-        <div className="flex animate-pulse flex-col gap-1">
+        <div className="flex animate-pulse motion-reduce:animate-none flex-col gap-1">
           <Skeleton className="h-4 w-32" />
           <Skeleton className="h-3 w-48" />
         </div>

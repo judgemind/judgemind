@@ -26,6 +26,7 @@ describe('ThemeProvider', () => {
     vi.clearAllMocks();
     localStorage.clear();
     document.documentElement.classList.remove('dark');
+    document.documentElement.style.colorScheme = '';
     // Default: prefers light
     Object.defineProperty(window, 'matchMedia', {
       writable: true,
@@ -73,6 +74,7 @@ describe('ThemeProvider', () => {
       expect(screen.getByTestId('theme').textContent).toBe('dark');
     });
     expect(document.documentElement.classList.contains('dark')).toBe(true);
+    expect(document.documentElement.style.colorScheme).toBe('dark');
   });
 
   it('respects prefers-color-scheme: dark when no stored theme', async () => {
@@ -114,6 +116,7 @@ describe('ThemeProvider', () => {
 
     expect(screen.getByTestId('theme').textContent).toBe('dark');
     expect(document.documentElement.classList.contains('dark')).toBe(true);
+    expect(document.documentElement.style.colorScheme).toBe('dark');
     expect(localStorage.getItem('theme')).toBe('dark');
   });
 
@@ -135,7 +138,19 @@ describe('ThemeProvider', () => {
 
     expect(screen.getByTestId('theme').textContent).toBe('light');
     expect(document.documentElement.classList.contains('dark')).toBe(false);
+    expect(document.documentElement.style.colorScheme).toBe('light');
     expect(localStorage.getItem('theme')).toBe('light');
+  });
+
+  it('sets color-scheme to light on initial render when no stored theme', async () => {
+    render(
+      <ThemeProvider>
+        <ThemeConsumer />
+      </ThemeProvider>,
+    );
+    await vi.waitFor(() => {
+      expect(document.documentElement.style.colorScheme).toBe('light');
+    });
   });
 });
 
