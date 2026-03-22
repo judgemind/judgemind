@@ -180,12 +180,12 @@ For Python packages you will touch, create a venv:
 ```
 python3.12 -m venv {worktree}/packages/<pkg>/.venv
 ```
-Then install (use `timeout: 600000` as pip install may exceed 2 minutes):
+Then install (use `timeout: 1200000` as pip install may exceed 2 minutes):
 ```
 .venv/bin/pip install -e ".[dev]" --quiet
 ```
 
-For TypeScript packages (use `timeout: 600000` as npm install may exceed 2 minutes):
+For TypeScript packages (use `timeout: 1200000` as npm install may exceed 2 minutes):
 ```
 npm install
 ```
@@ -331,7 +331,7 @@ Resolve conflicts, `git rebase --continue`, then push with `--force-with-lease`.
 Write status: `phase: ci-watch`, `summary: Watching CI run <run-id>`.
 Also start the phase timer: `python3 {worktree}/scripts/phase_timer.py start {worktree} "ci-watch (1)"`
 
-**Run CI watches in the foreground** — do not use `run_in_background`. You cannot proceed until CI finishes, so background execution just generates unnecessary `<task-notification>` noise for the dispatcher. **Use `timeout: 600000`** as CI runs typically take 10-25 minutes.
+**Run CI watches in the foreground** — do not use `run_in_background`. You cannot proceed until CI finishes, so background execution just generates unnecessary `<task-notification>` noise for the dispatcher. **Use `timeout: 1200000`** as CI runs typically take 10-25 minutes.
 
 ```
 gh run watch <run-id> --repo judgemind/judgemind --interval 60 --exit-status --compact
@@ -372,7 +372,7 @@ Also start the phase timer: `python3 {worktree}/scripts/phase_timer.py start {wo
    - `packages/scraper-framework/` or scraper code → `deploy-scraper.yml`
    - `packages/web/` or frontend → `deploy-production.yml`
    - `infra/terraform/` → `terraform.yml`
-2. **Run deploy watches in the foreground** — do not use `run_in_background`. **Use `timeout: 600000`** as deploys can take several minutes.
+2. **Run deploy watches in the foreground** — do not use `run_in_background`. **Use `timeout: 1200000`** as deploys can take several minutes.
    ```
    gh run list --repo judgemind/judgemind --workflow "<deploy-workflow>.yml" --branch main --limit 1 --json databaseId -q '.[0].databaseId'
    gh run watch <run-id> --repo judgemind/judgemind --interval 60 --exit-status --compact
@@ -570,5 +570,5 @@ Worktree cleanup is handled automatically by Claude Code (if spawned with `isola
 - **All temp files go in `{worktree}/tmp/`**, not `/tmp/`.
 - **Multi-line Python always goes in a `.py` file**, never `-c '...'`.
 - **No `run_in_background`.** All commands — CI watches, test suites, deploy watches, and reviewer invocations — must run in the foreground. Subagents are already background tasks from the parent's perspective. Further backgrounding causes `<task-notification>` messages to surface in the wrong context, leading to confusion and lost results.
-- **Use `timeout: 600000`** on Bash commands that may exceed 2 minutes: `pytest`, `gh run watch`, `pip install`, `npm install`, `npm run build`, `terraform apply`, `ruff check` on large codebases, and any data-processing script.
+- **Use `timeout: 1200000`** on Bash commands that may exceed 2 minutes: `pytest`, `gh run watch`, `pip install`, `npm install`, `npm run build`, `terraform apply`, `ruff check` on large codebases, and any data-processing script.
 - See CLAUDE.md §Unattended Operation Patterns for the full list.
