@@ -156,19 +156,17 @@ function AnalyticsSkeleton() {
 function RulingsSkeleton() {
   return (
     <div data-testid="rulings-skeleton">
-      <div className="space-y-3">
+      <div className="divide-y rounded-lg border">
         {Array.from({ length: 5 }).map((_, i) => (
-          <Card key={i}>
-            <CardContent className="p-4">
-              <div className="flex items-start justify-between gap-3">
-                <div className="min-w-0 flex-1 space-y-2">
-                  <Skeleton className="h-4 w-48" />
-                  <Skeleton className="h-3 w-32" />
-                </div>
-                <Skeleton className="h-5 w-16 rounded-full" />
+          <div key={i} className="px-4 py-3">
+            <div className="flex items-start justify-between gap-3">
+              <div className="min-w-0 flex-1 space-y-2">
+                <Skeleton className="h-4 w-48" />
+                <Skeleton className="h-3 w-32" />
               </div>
-            </CardContent>
-          </Card>
+              <Skeleton className="h-5 w-16 rounded-full" />
+            </div>
+          </div>
         ))}
       </div>
     </div>
@@ -406,10 +404,10 @@ export function JudgeProfile({ judgeId }: { judgeId: string }) {
     }
 
     return (
-      <div className="space-y-3">
-        {edges.map(({ node }) => (
-          <Card key={node.id} className="transition-colors hover:bg-accent/50">
-            <CardContent className="p-4">
+      <div>
+        <div className="divide-y rounded-lg border">
+          {edges.map(({ node }) => (
+            <div key={node.id} className="px-4 py-3 transition-colors hover:bg-accent/50">
               <div className="flex items-start justify-between gap-3">
                 <div className="min-w-0 flex-1">
                   {node.case ? (
@@ -446,9 +444,9 @@ export function JudgeProfile({ judgeId }: { judgeId: string }) {
                   {formatOutcome(node.outcome)}
                 </Badge>
               </div>
-            </CardContent>
-          </Card>
-        ))}
+            </div>
+          ))}
+        </div>
 
         {/* Load more */}
         {pageInfo?.hasNextPage && (

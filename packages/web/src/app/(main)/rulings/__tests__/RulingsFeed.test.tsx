@@ -131,7 +131,7 @@ describe('RulingsFeed', () => {
     });
 
     render(<RulingsFeed />);
-    const skeletons = screen.getAllByTestId('skeleton-card');
+    const skeletons = screen.getAllByTestId('skeleton-row');
     expect(skeletons.length).toBe(8);
   });
 
@@ -306,7 +306,7 @@ describe('RulingsFeed', () => {
 
     render(<RulingsFeed />);
     // Should show 3 skeleton cards for loading more (not the initial 8)
-    const skeletons = screen.getAllByTestId('skeleton-card');
+    const skeletons = screen.getAllByTestId('skeleton-row');
     expect(skeletons.length).toBe(3);
   });
 

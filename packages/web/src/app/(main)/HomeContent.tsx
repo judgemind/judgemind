@@ -171,20 +171,18 @@ function RecentRulings() {
       </div>
 
       {loading && edges.length === 0 && (
-        <div className="space-y-3">
+        <div className="divide-y rounded-lg border">
           {Array.from({ length: 3 }).map((_, i) => (
-            <Card key={i}>
-              <CardContent className="p-4">
-                <div className="space-y-2">
-                  <Skeleton className="h-4 w-2/3" />
-                  <Skeleton className="h-3 w-1/2" />
-                  <div className="flex gap-2 pt-1">
-                    <Skeleton className="h-5 w-16 rounded-full" />
-                    <Skeleton className="h-5 w-20 rounded-full" />
-                  </div>
+            <div key={i} className="px-4 py-3">
+              <div className="space-y-2">
+                <Skeleton className="h-4 w-2/3" />
+                <Skeleton className="h-3 w-1/2" />
+                <div className="flex gap-2 pt-1">
+                  <Skeleton className="h-5 w-16 rounded-full" />
+                  <Skeleton className="h-5 w-20 rounded-full" />
                 </div>
-              </CardContent>
-            </Card>
+              </div>
+            </div>
           ))}
         </div>
       )}
@@ -202,50 +200,48 @@ function RecentRulings() {
       )}
 
       {edges.length > 0 && (
-        <div className="space-y-3">
+        <div className="divide-y rounded-lg border">
           {edges.map(({ node }) => (
-            <Card key={node.id} className="transition-colors hover:bg-accent/50">
-              <CardContent className="p-4">
-                <div className="flex items-start justify-between gap-4">
-                  <div className="min-w-0 flex-1">
-                    {node.case ? (
-                      <Link
-                        href={`/rulings/${node.id}`}
-                        className="block truncate rounded-sm font-medium text-foreground hover:text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                      >
-                        {node.case.caseNumber}
-                        {node.case.caseTitle ? ` \u2014 ${node.case.caseTitle}` : ''}
-                      </Link>
-                    ) : (
-                      <span className="text-muted-foreground">{'\u2014'}</span>
+            <div key={node.id} className="px-4 py-3 transition-colors hover:bg-accent/50">
+              <div className="flex items-start justify-between gap-4">
+                <div className="min-w-0 flex-1">
+                  {node.case ? (
+                    <Link
+                      href={`/rulings/${node.id}`}
+                      className="block truncate rounded-sm font-medium text-foreground hover:text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                    >
+                      {node.case.caseNumber}
+                      {node.case.caseTitle ? ` \u2014 ${node.case.caseTitle}` : ''}
+                    </Link>
+                  ) : (
+                    <span className="text-muted-foreground">{'\u2014'}</span>
+                  )}
+
+                  <div className="mt-0.5 flex flex-wrap items-center gap-x-2 text-xs text-muted-foreground">
+                    {node.case?.court && (
+                      <span>{node.case.court.county} {node.department ? `\u00B7 Dept. ${node.department}` : ''}</span>
                     )}
-
-                    <div className="mt-0.5 flex flex-wrap items-center gap-x-2 text-xs text-muted-foreground">
-                      {node.case?.court && (
-                        <span>{node.case.court.county} {node.department ? `\u00B7 Dept. ${node.department}` : ''}</span>
-                      )}
-                      <span>{formatJudgeName(node.judge)}</span>
-                    </div>
-
-                    <div className="mt-2 flex flex-wrap gap-2">
-                      <Badge
-                        variant={getOutcomeBadgeVariant(node.outcome)}
-                        className={getOutcomeBadgeListClass(node.outcome)}
-                      >
-                        {formatOutcome(node.outcome)}
-                      </Badge>
-                      <Badge variant="outline" className="text-muted-foreground">
-                        {formatMotionType(node.motionType)}
-                      </Badge>
-                    </div>
+                    <span>{formatJudgeName(node.judge)}</span>
                   </div>
 
-                  <span className="shrink-0 text-xs text-muted-foreground">
-                    {formatDate(node.hearingDate)}
-                  </span>
+                  <div className="mt-2 flex flex-wrap gap-2">
+                    <Badge
+                      variant={getOutcomeBadgeVariant(node.outcome)}
+                      className={getOutcomeBadgeListClass(node.outcome)}
+                    >
+                      {formatOutcome(node.outcome)}
+                    </Badge>
+                    <Badge variant="outline" className="text-muted-foreground">
+                      {formatMotionType(node.motionType)}
+                    </Badge>
+                  </div>
                 </div>
-              </CardContent>
-            </Card>
+
+                <span className="shrink-0 text-xs text-muted-foreground">
+                  {formatDate(node.hearingDate)}
+                </span>
+              </div>
+            </div>
           ))}
         </div>
       )}

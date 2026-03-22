@@ -7,15 +7,6 @@ vi.mock('@/components/ui/skeleton', () => ({
   ),
 }));
 
-vi.mock('@/components/ui/card', () => ({
-  Card: ({ children, ...props }: { children: React.ReactNode }) => (
-    <div data-testid="card" {...props}>{children}</div>
-  ),
-  CardContent: ({ children, className }: { children: React.ReactNode; className?: string }) => (
-    <div data-testid="card-content" className={className}>{children}</div>
-  ),
-}));
-
 import RulingsLoading from '../loading';
 
 describe('RulingsLoading', () => {
@@ -24,15 +15,18 @@ describe('RulingsLoading', () => {
     expect(container).toBeTruthy();
   });
 
-  it('renders skeleton cards', () => {
+  it('renders skeleton elements', () => {
     render(<RulingsLoading />);
     const skeletons = screen.getAllByTestId('skeleton');
     expect(skeletons.length).toBeGreaterThan(0);
   });
 
-  it('renders 8 skeleton cards', () => {
-    render(<RulingsLoading />);
-    const cards = screen.getAllByTestId('card');
-    expect(cards).toHaveLength(8);
+  it('renders 8 skeleton rows inside a bordered container', () => {
+    const { container } = render(<RulingsLoading />);
+    const borderedContainer = container.querySelector('.divide-y.rounded-lg.border');
+    expect(borderedContainer).toBeTruthy();
+    // Each skeleton row is a direct child div with px-4 py-3
+    const rows = borderedContainer?.querySelectorAll(':scope > div');
+    expect(rows).toHaveLength(8);
   });
 });

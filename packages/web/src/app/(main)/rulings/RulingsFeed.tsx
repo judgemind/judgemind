@@ -14,7 +14,6 @@ import {
 } from '@/lib/display-helpers';
 import { Autocomplete } from '@/components/Autocomplete';
 import { useCountyOptions } from '@/lib/filter-options';
-import { Card, CardContent } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
 import { Input } from '@/components/ui/input';
 import { Skeleton } from '@/components/ui/skeleton';
@@ -94,23 +93,21 @@ interface RulingsData {
 const PAGE_SIZE = 20;
 
 
-function SkeletonCard() {
+function SkeletonRow() {
   return (
-    <Card data-testid="skeleton-card">
-      <CardContent className="p-4">
-        <div className="flex items-start justify-between gap-4">
-          <div className="min-w-0 flex-1 space-y-2">
-            <Skeleton className="h-4 w-2/3" />
-            <Skeleton className="h-3 w-1/2" />
-            <div className="flex gap-2 pt-1">
-              <Skeleton className="h-5 w-16 rounded-full" />
-              <Skeleton className="h-5 w-20 rounded-full" />
-            </div>
+    <div data-testid="skeleton-row" className="px-4 py-3">
+      <div className="flex items-start justify-between gap-4">
+        <div className="min-w-0 flex-1 space-y-2">
+          <Skeleton className="h-4 w-2/3" />
+          <Skeleton className="h-3 w-1/2" />
+          <div className="flex gap-2 pt-1">
+            <Skeleton className="h-5 w-16 rounded-full" />
+            <Skeleton className="h-5 w-20 rounded-full" />
           </div>
-          <Skeleton className="h-3 w-20 shrink-0" />
         </div>
-      </CardContent>
-    </Card>
+        <Skeleton className="h-3 w-20 shrink-0" />
+      </div>
+    </div>
   );
 }
 
@@ -233,9 +230,9 @@ export function RulingsFeed() {
 
       {/* Skeleton loading state */}
       {loading && edges.length === 0 && (
-        <div className="space-y-3">
+        <div className="divide-y rounded-lg border">
           {Array.from({ length: 8 }).map((_, i) => (
-            <SkeletonCard key={i} />
+            <SkeletonRow key={i} />
           ))}
         </div>
       )}
@@ -254,12 +251,12 @@ export function RulingsFeed() {
         </p>
       )}
 
-      {/* Ruling cards */}
+      {/* Ruling rows */}
       {edges.length > 0 && (
-        <div className="space-y-3">
-          {edges.map(({ node }) => (
-            <Card key={node.id} className="transition-colors hover:bg-accent/50">
-              <CardContent className="p-4">
+        <div>
+          <div className="divide-y rounded-lg border">
+            {edges.map(({ node }) => (
+              <div key={node.id} className="px-4 py-3 transition-colors hover:bg-accent/50">
                 <div className="flex items-start justify-between gap-4">
                   {/* Left: case info, judge, badges */}
                   <div className="min-w-0 flex-1">
@@ -300,15 +297,15 @@ export function RulingsFeed() {
                     {formatDate(node.hearingDate)}
                   </span>
                 </div>
-              </CardContent>
-            </Card>
-          ))}
+              </div>
+            ))}
+          </div>
 
           {/* Loading indicator for infinite scroll */}
           {loading && edges.length > 0 && (
-            <div className="space-y-3">
+            <div className="mt-3 divide-y rounded-lg border">
               {Array.from({ length: 3 }).map((_, i) => (
-                <SkeletonCard key={`loading-${i}`} />
+                <SkeletonRow key={`loading-${i}`} />
               ))}
             </div>
           )}
