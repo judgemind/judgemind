@@ -295,6 +295,34 @@ describe('GET /api/documents/:id/content', () => {
     });
   });
 
+  it('returns 413 when streaming body exceeds max size without ContentLength header', async () => {
+    // Simulate an S3 response with no ContentLength header whose body exceeds 5 MB.
+    // We use multiple chunks that together exceed MAX_CONTENT_SIZE (5 * 1024 * 1024).
+    const chunkSize = 1024 * 1024; // 1 MB per chunk
+    const chunkCount = 6; // 6 MB total — exceeds the 5 MB limit
+    const chunks: Buffer[] = [];
+    for (let i = 0; i < chunkCount; i++) {
+      chunks.push(Buffer.alloc(chunkSize, 0x41)); // Fill with 'A'
+    }
+
+    const s3Client = createMockS3Client(() =>
+      Promise.resolve({
+        Body: Readable.from(chunks),
+        // No ContentLength — simulates chunked transfer encoding
+      }),
+    );
+
+    const server = await buildTestApp([HTML_DOC], s3Client);
+    const res = await server.inject({
+      method: 'GET',
+      url: '/api/documents/00000000-0000-0000-0000-000000000001/content',
+    });
+    expect(res.statusCode).toBe(413);
+    expect(JSON.parse(res.body)).toEqual({
+      error: 'Document is too large for inline viewing. Use /download instead.',
+    });
+  });
+
   it('returns 404 when S3 response body is empty', async () => {
     const s3Client = createMockS3Client(() =>
       Promise.resolve({ Body: null, ContentLength: 0 }),
