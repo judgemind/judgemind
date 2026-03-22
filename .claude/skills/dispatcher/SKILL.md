@@ -219,15 +219,28 @@ scripts/run-py.sh scripts/tg-notify.py task_failed <issue_number> "<error_summar
 
 Both commands update the status file automatically. Always send a notification immediately when an agent completes or fails — do not batch them.
 
-**Step 2 — Clean up the agent's worktree (if needed):**
+**Step 2 — Re-anchor cwd (MANDATORY):**
+
+**Known quirk:** When a subagent is spawned with `isolation: "worktree"`, the parent process's working directory can drift into the agent's worktree (`.claude/worktrees/agent-<id>/`). After the agent completes and the worktree is removed, the parent's cwd becomes invalid, causing `getcwd` errors and broken git commands.
+
+After every agent completion notification, verify and re-anchor the dispatcher's cwd to the main repo root:
+
+```
+pwd
+cd <repo_root>
+```
+
+If `pwd` shows a path containing `.claude/worktrees/`, the cwd has drifted. The `cd` command corrects it. Always run both commands — the `cd` is a no-op if the cwd is already correct, and it is essential if the cwd has drifted.
+
+**Step 3 — Clean up the agent's worktree (if needed):**
 
 When agents are spawned with `isolation: "worktree"`, Claude Code automatically cleans up worktrees with no uncommitted changes when the agent exits. However, worktrees with uncommitted changes (e.g., from a failed agent) may remain.
 
 1. Check if the agent's worktree still exists. Claude Code worktrees live at `.claude/worktrees/agent-<id>/`. The agent ID can be derived from the task notification or tracked when spawning.
 2. If the worktree does not exist, the agent (or Claude Code) already cleaned up — skip to the next step.
-3. If it exists and has uncommitted changes, force-remove it:
+3. If it exists and has uncommitted changes, force-remove it. Use `git -C <repo_root>` to avoid cwd issues:
    ```
-   git worktree remove --force .claude/worktrees/agent-<id>
+   git -C <repo_root> worktree remove --force .claude/worktrees/agent-<id>
    ```
 4. If removal fails, log the error but do not block the dispatch loop. Stale worktrees do not affect slot counting (slots are tracked by the dispatcher's own agent list, not by worktree directory count).
 
@@ -735,11 +748,11 @@ If you catch yourself about to edit a file or stage a commit from the dispatcher
 
 ### Post-merge sync
 
-After each PR merge, the dispatcher MUST pull latest main so that subsequent `/task` agents start from the current tip of the codebase:
+After each PR merge, the dispatcher MUST pull latest main so that subsequent `/task` agents start from the current tip of the codebase. **Always use `git -C <repo_root>`** to ensure commands work even if the dispatcher's cwd has drifted (see "Processing agent completions" above):
 
 ```
-git fetch origin main
-git pull origin main --ff-only
+git -C <repo_root> fetch origin main
+git -C <repo_root> pull origin main --ff-only
 ```
 
 Do this **immediately** after every `gh pr merge` call, before spawning new agents or processing the next item in the loop. Without this step, new worktrees created by `/task` agents will be based on stale code, leading to merge conflicts or missed changes.
