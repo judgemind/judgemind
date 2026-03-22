@@ -37,7 +37,7 @@ gh run watch <run-id> --repo judgemind/judgemind --interval 60 --exit-status --c
 ```
 
 The `vercel-deploy-status.yml` GitHub Action runs on every push to `main`. It detects whether `packages/web/` changed:
-- **Web changed:** polls the Vercel Deployments API until the deploy completes, then exits with success/failure.
+- **Web changed:** polls the Vercel Deployments API until the deploy completes, then exits with success/failure. It first queries by exact commit SHA; if the deployment is not found after 5 attempts (handles squash merges where Vercel stores the branch SHA, not the merge commit SHA), it falls back to querying recent production deployments by timestamp.
 - **No web changes:** exits immediately with success (so the workflow stays green).
 
 This lets agents use the standard `gh run watch` pattern instead of polling the Vercel API in a loop.
