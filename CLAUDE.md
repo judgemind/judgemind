@@ -18,8 +18,8 @@ These are the most frequently violated rules. **A PreToolUse hook enforces the s
 ### NEVER — Workflow
 - **NEVER** use `run_in_background` in any subagent (`/task`, `/ralph`, `/tdd`, or any Agent-spawned worker/reviewer). Subagents are already running as background tasks — further backgrounding causes completion notifications to surface in the wrong context (the parent agent), leading to confusion and lost results. All commands inside subagents run synchronously.
 - **NEVER** commit directly to `main` during autonomous task work. All `/task` work happens on worktree branches via PRs. (The user may direct you to commit to `main` during interactive sessions — that's fine.)
-- **You MAY merge your own PRs** if the PR has passed the `/ralph` review loop (A.2) and CI is green. Use `gh pr merge <N> --repo judgemind/judgemind --squash --delete-branch`.
-- **NEVER** exit or stop after `/ralph` completes without finishing the full `/task` workflow (A.3 through A.9). Ralph completing means the code is ready — but uncommitted, unpushed, and unmerged. The task is only halfway done. See #721.
+- **You MAY merge your own PRs** if the PR has passed the `/ralph` review loop (§4.3) and CI is green. Use `gh pr merge <N> --repo judgemind/judgemind --squash --delete-branch`.
+- **NEVER** exit or stop after `/ralph` completes without finishing the full `/task` workflow (steps 4.4 through 4.11 in this document; A.3 through A.9 in the task skill). Ralph completing means the code is ready — but uncommitted, unpushed, and unmerged. The task is only halfway done. See #721.
 - **NEVER** deploy to production. Production deploys are human-only.
 - **NEVER** set `priority/p0` on issues unless explicitly told to by a human. `p0` is human-only.
 - **NEVER** skip pre-PR checks. Run lint, format, AND tests locally before pushing.
