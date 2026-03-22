@@ -789,10 +789,16 @@ class TestTableAwareExtraction:
             "oc_apkarian_c25.pdf",
         ]
 
+        any_differ = False
         for fixture in fixtures:
             pdf_bytes = _load_bytes(fixture)
             old_text = _extract_pdf_text(pdf_bytes)
             new_text = _extract_oc_pdf_text(pdf_bytes)
+
+            # Guard against cache collision (#1545): if both extractors
+            # return identical text the comparison is meaningless.
+            if old_text != new_text:
+                any_differ = True
 
             def count_merges(text: str) -> int:
                 count = 0
@@ -808,6 +814,31 @@ class TestTableAwareExtraction:
                 f"{fixture}: new extraction has MORE column merges "
                 f"({new_merges}) than old ({old_merges})"
             )
+
+        # At least some fixtures must produce different text from the two
+        # extractors, otherwise this test is comparing identical outputs
+        # and the column-merge comparison is vacuously true.
+        assert any_differ, (
+            "All fixtures produced identical text from both extractors — "
+            "possible cache collision bug (see #1545)"
+        )
+
+    def test_extractors_return_different_results_for_same_pdf(self) -> None:
+        """Different extractors on the same PDF must return different text (#1545).
+
+        This guards against a cache-key collision where both
+        ``_extract_pdf_text`` (simple left-to-right) and
+        ``_extract_oc_pdf_text`` (table-aware) are keyed by
+        ``sha256(pdf_bytes)`` alone, causing the second caller to get
+        the first caller's cached result.
+        """
+        pdf_bytes = _load_bytes("oc_apkarian_c25.pdf")
+        simple_text = _extract_pdf_text(pdf_bytes)
+        table_text = _extract_oc_pdf_text(pdf_bytes)
+        assert simple_text != table_text, (
+            "Simple and table-aware extractors returned identical text "
+            "for oc_apkarian_c25.pdf — cache key collision?"
+        )
 
 
 # ---------------------------------------------------------------------------
