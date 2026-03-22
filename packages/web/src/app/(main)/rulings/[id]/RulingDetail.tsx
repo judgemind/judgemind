@@ -1,7 +1,6 @@
 'use client';
 
 import { useState, useCallback } from 'react';
-import Link from 'next/link';
 import { buildDocumentContentUrl, buildDownloadUrl, cleanRulingText, cleanSummary, FORMAT_LABELS, stripMetadataHeaderHtml, type RulingMetadata } from '@/lib/display-helpers';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
@@ -92,37 +91,6 @@ export function RulingDetail({ ruling, sanitizedRulingTextHtml }: RulingProps) {
 
   return (
     <div className="space-y-6">
-      {/* Linked case */}
-      {ruling.case && (
-        <section>
-          <h2 className="text-sm font-semibold uppercase tracking-wide text-muted-foreground">
-            Case
-          </h2>
-          <Link
-            href={`/cases/${ruling.case.id}`}
-            className="mt-1 block rounded-sm text-sm font-medium text-foreground hover:text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-          >
-            {ruling.case.caseNumber}
-            {ruling.case.caseTitle ? ` \u2014 ${ruling.case.caseTitle}` : ''}
-          </Link>
-        </section>
-      )}
-
-      {/* Judge */}
-      {ruling.judge && (
-        <section>
-          <h2 className="text-sm font-semibold uppercase tracking-wide text-muted-foreground">
-            Judge
-          </h2>
-          <Link
-            href={`/judges/${ruling.judge.id}`}
-            className="mt-1 block rounded-sm text-sm font-medium text-foreground hover:text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-          >
-            {ruling.judge.canonicalName}
-          </Link>
-        </section>
-      )}
-
       {/* Summary (AI-generated) — highlighted in a Card */}
       {displaySummary && (
         <Card>

@@ -159,7 +159,12 @@ export default async function RulingDetailPage({ params }: Props) {
                   Judge
                 </dt>
                 <dd className="mt-1 text-sm text-foreground">
-                  {rulingData.judge.canonicalName}
+                  <Link
+                    href={`/judges/${rulingData.judge.id}`}
+                    className="hover:text-primary hover:underline"
+                  >
+                    {rulingData.judge.canonicalName}
+                  </Link>
                 </dd>
               </div>
             )}
@@ -171,7 +176,12 @@ export default async function RulingDetailPage({ params }: Props) {
                   Court
                 </dt>
                 <dd className="mt-1 text-sm text-foreground">
-                  {rulingData.court.courtName}
+                  <Link
+                    href={`/rulings?county=${encodeURIComponent(rulingData.court.county)}`}
+                    className="hover:text-primary hover:underline"
+                  >
+                    {rulingData.court.courtName}
+                  </Link>
                 </dd>
               </div>
             )}
@@ -183,7 +193,12 @@ export default async function RulingDetailPage({ params }: Props) {
                   County
                 </dt>
                 <dd className="mt-1 text-sm text-foreground">
-                  {rulingData.court.county}
+                  <Link
+                    href={`/rulings?county=${encodeURIComponent(rulingData.court.county)}`}
+                    className="hover:text-primary hover:underline"
+                  >
+                    {rulingData.court.county}
+                  </Link>
                 </dd>
               </div>
             )}
@@ -229,7 +244,12 @@ export default async function RulingDetailPage({ params }: Props) {
                   Case Number
                 </dt>
                 <dd className="mt-1 text-sm text-foreground">
-                  {rulingData.case.caseNumber}
+                  <Link
+                    href={`/cases/${rulingData.case.id}`}
+                    className="hover:text-primary hover:underline"
+                  >
+                    {rulingData.case.caseNumber}
+                  </Link>
                 </dd>
               </div>
             )}

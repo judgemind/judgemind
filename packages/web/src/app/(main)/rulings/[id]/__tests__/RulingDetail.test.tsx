@@ -3,15 +3,7 @@ import { render, screen, fireEvent, waitFor } from '@testing-library/react';
 import { RulingDetail } from '../RulingDetail';
 import { sanitizeRulingHtml } from '@/lib/sanitize-html';
 
-// ---------------------------------------------------------------------------
-// Mock next/link — render as an anchor tag
-// ---------------------------------------------------------------------------
-
-vi.mock('next/link', () => ({
-  default: ({ href, children, ...props }: { href: string; children: React.ReactNode }) => (
-    <a href={href} {...props}>{children}</a>
-  ),
-}));
+// next/link mock removed — RulingDetail no longer uses Link (#1515)
 
 // ---------------------------------------------------------------------------
 // Test data factories
@@ -84,14 +76,10 @@ describe('RulingDetail', () => {
     const ruling = buildFullRuling();
     render(<RulingDetail ruling={ruling} />);
 
-    // Case section
-    expect(screen.getByText('Case')).toBeInTheDocument();
-    expect(screen.getByText(/25STCV12345/)).toBeInTheDocument();
-    expect(screen.getByText(/Smith v. Jones/)).toBeInTheDocument();
-
-    // Judge section
-    expect(screen.getByText('Judge')).toBeInTheDocument();
-    expect(screen.getByText('Johnson, Robert M.')).toBeInTheDocument();
+    // Case and Judge sections are rendered in the server component metadata card,
+    // not in RulingDetail (removed as part of #1515 deduplication)
+    expect(screen.queryByText('Case')).not.toBeInTheDocument();
+    expect(screen.queryByText('Judge')).not.toBeInTheDocument();
 
     // Summary section (now in a Card)
     expect(screen.getByText('Summary')).toBeInTheDocument();
@@ -105,21 +93,8 @@ describe('RulingDetail', () => {
     expect(screen.getByText('PDF')).toBeInTheDocument();
   });
 
-  it('renders case link with correct href', () => {
-    const ruling = buildFullRuling();
-    render(<RulingDetail ruling={ruling} />);
-
-    const caseLink = screen.getByText(/25STCV12345/).closest('a');
-    expect(caseLink).toHaveAttribute('href', '/cases/case-1');
-  });
-
-  it('renders judge link with correct href', () => {
-    const ruling = buildFullRuling();
-    render(<RulingDetail ruling={ruling} />);
-
-    const judgeLink = screen.getByText('Johnson, Robert M.').closest('a');
-    expect(judgeLink).toHaveAttribute('href', '/judges/judge-1');
-  });
+  // Case and Judge links are now in the server component metadata card (page.tsx),
+  // not in RulingDetail. See page.test.tsx for link tests. (#1515)
 
   it('renders download button with correct href from buildDownloadUrl in ruling text header', () => {
     const ruling = buildFullRuling();
@@ -135,21 +110,8 @@ describe('RulingDetail', () => {
   // Partial data — missing optional sections
   // -------------------------------------------------------------------------
 
-  it('does not render case section when case is null', () => {
-    const ruling = buildFullRuling();
-    ruling.case = null;
-    render(<RulingDetail ruling={ruling} />);
-
-    expect(screen.queryByText('Case')).not.toBeInTheDocument();
-  });
-
-  it('does not render judge section when judge is null', () => {
-    const ruling = buildFullRuling();
-    ruling.judge = null;
-    render(<RulingDetail ruling={ruling} />);
-
-    expect(screen.queryByText('Judge')).not.toBeInTheDocument();
-  });
+  // Case and Judge null-handling tests removed — those sections are now in the
+  // server component metadata card (page.tsx), not in RulingDetail. (#1515)
 
   it('does not render summary section when summary is null', () => {
     const ruling = buildFullRuling();
@@ -234,9 +196,7 @@ describe('RulingDetail', () => {
     const ruling = buildMinimalRuling();
     const { container } = render(<RulingDetail ruling={ruling} />);
 
-    // No section headings should be rendered
-    expect(screen.queryByText('Case')).not.toBeInTheDocument();
-    expect(screen.queryByText('Judge')).not.toBeInTheDocument();
+    // No section headings should be rendered (Case/Judge are in page.tsx metadata card)
     expect(screen.queryByText('Summary')).not.toBeInTheDocument();
     expect(screen.queryByText('Ruling Text')).not.toBeInTheDocument();
     expect(screen.queryByText('Download original document')).not.toBeInTheDocument();
@@ -250,16 +210,8 @@ describe('RulingDetail', () => {
   // Edge cases
   // -------------------------------------------------------------------------
 
-  it('renders case number without title when caseTitle is null', () => {
-    const ruling = buildFullRuling();
-    ruling.case = { id: 'case-2', caseNumber: '25STCV99999', caseTitle: null };
-    render(<RulingDetail ruling={ruling} />);
-
-    const caseLink = screen.getByText('25STCV99999');
-    expect(caseLink).toBeInTheDocument();
-    // Should not contain an em-dash separator since there is no title
-    expect(caseLink.textContent).toBe('25STCV99999');
-  });
+  // Case number edge case tests removed — case display is now in the server
+  // component metadata card (page.tsx), not in RulingDetail. (#1515)
 
   it('renders download button without format badge when documentFormat is null', () => {
     const ruling = buildFullRuling();
@@ -298,15 +250,8 @@ describe('RulingDetail', () => {
     expect(screen.getByText('Third paragraph.')).toBeInTheDocument();
   });
 
-  it('renders case number with em-dash and title when caseTitle is present', () => {
-    const ruling = buildFullRuling();
-    render(<RulingDetail ruling={ruling} />);
-
-    // The component concatenates: caseNumber + " — " + caseTitle
-    const caseLink = screen.getByText(/25STCV12345/).closest('a');
-    expect(caseLink?.textContent).toContain('\u2014');
-    expect(caseLink?.textContent).toContain('Smith v. Jones');
-  });
+  // Case number em-dash test removed — case display is now in the server
+  // component metadata card (page.tsx), not in RulingDetail. (#1515)
 
   // -------------------------------------------------------------------------
   // Formatted HTML rendering (sanitizedRulingTextHtml prop)

@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { render, screen } from '@testing-library/react';
 
 // ---------------------------------------------------------------------------
 // Mocks — must be declared before importing the page module
@@ -31,6 +32,13 @@ vi.mock('next/navigation', () => ({
 // before passing HTML to the client component
 vi.mock('@/lib/sanitize-html', () => ({
   sanitizeRulingHtml: (html: string) => html,
+}));
+
+// Mock next/link — render as a plain anchor for testability
+vi.mock('next/link', () => ({
+  default: ({ href, children, ...props }: { href: string; children: React.ReactNode }) => (
+    <a href={href} {...props}>{children}</a>
+  ),
 }));
 
 // Stub client-side component used inside the page
@@ -176,5 +184,79 @@ describe('RulingDetailPage (SSR smoke)', () => {
     const result = await RulingDetailPage({ params: { id: 'ruling-1' } });
     expect(result).toBeTruthy();
     expect(result.type).toBe('div');
+  });
+
+  // -------------------------------------------------------------------------
+  // Metadata card entity links (#1515)
+  // -------------------------------------------------------------------------
+
+  it('renders judge name as a link to the judge profile page', async () => {
+    mockQuery.mockResolvedValueOnce({
+      data: { ruling: FULL_RULING },
+    });
+
+    const jsx = await RulingDetailPage({ params: { id: 'ruling-1' } });
+    render(jsx);
+
+    const judgeLink = screen.getByText('Johnson, Robert M.').closest('a');
+    expect(judgeLink).toHaveAttribute('href', '/judges/judge-1');
+  });
+
+  it('renders case number as a link to the case detail page', async () => {
+    mockQuery.mockResolvedValueOnce({
+      data: { ruling: FULL_RULING },
+    });
+
+    const jsx = await RulingDetailPage({ params: { id: 'ruling-1' } });
+    render(jsx);
+
+    const caseLink = screen.getByText('25STCV12345').closest('a');
+    expect(caseLink).toHaveAttribute('href', '/cases/case-1');
+  });
+
+  it('renders county as a link to the rulings feed filtered by county', async () => {
+    mockQuery.mockResolvedValueOnce({
+      data: { ruling: FULL_RULING },
+    });
+
+    const jsx = await RulingDetailPage({ params: { id: 'ruling-1' } });
+    render(jsx);
+
+    const countyLink = screen.getByText('Los Angeles').closest('a');
+    expect(countyLink).toHaveAttribute('href', '/rulings?county=Los%20Angeles');
+  });
+
+  it('renders court name as a link to the rulings feed filtered by county', async () => {
+    mockQuery.mockResolvedValueOnce({
+      data: { ruling: FULL_RULING },
+    });
+
+    const jsx = await RulingDetailPage({ params: { id: 'ruling-1' } });
+    render(jsx);
+
+    const courtLink = screen.getByText('Los Angeles Superior Court').closest('a');
+    expect(courtLink).toHaveAttribute('href', '/rulings?county=Los%20Angeles');
+  });
+
+  it('does not render entity links when judge, case, and court are null', async () => {
+    mockQuery.mockResolvedValueOnce({
+      data: {
+        ruling: {
+          ...FULL_RULING,
+          judge: null,
+          case: null,
+          court: null,
+        },
+      },
+    });
+
+    const jsx = await RulingDetailPage({ params: { id: 'ruling-1' } });
+    render(jsx);
+
+    // No entity links should exist in the metadata card
+    expect(screen.queryByText('Johnson, Robert M.')).not.toBeInTheDocument();
+    expect(screen.queryByText('25STCV12345')).not.toBeInTheDocument();
+    expect(screen.queryByText('Los Angeles')).not.toBeInTheDocument();
+    expect(screen.queryByText('Los Angeles Superior Court')).not.toBeInTheDocument();
   });
 });
