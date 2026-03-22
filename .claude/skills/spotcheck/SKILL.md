@@ -307,11 +307,7 @@ Print the report to stdout as well.
 
 ## Step 7 — Clean up
 
-The spotcheck skill does not create a PR or modify code. Clean up:
-
-```
-scripts/end-worker.sh {worktree}
-```
+The spotcheck skill does not create a PR or modify code. Worktree cleanup is handled automatically by Claude Code when the agent exits (if spawned with `isolation: "worktree"`). For manual worktrees, run `scripts/end-worker.sh {worktree}`.
 
 ---
 

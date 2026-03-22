@@ -33,6 +33,7 @@ These are the most frequently violated rules. **A PreToolUse hook enforces the s
 - **ALWAYS** watch CI to completion (`gh run watch`) before doing anything else after pushing.
 - **ALWAYS** create a PR immediately after your first push to a branch.
 - **ALWAYS** re-fetch GitHub issue or PR state before acting on it if more than a few minutes have elapsed since you last fetched it. Other agents may have closed, merged, or modified issues in the interim — acting on stale state causes incorrect cross-references, duplicate filings, and wasted work.
+- **ALWAYS** set `timeout: 600000` (10 minutes) on Bash commands that may take longer than 2 minutes. The default 2-minute timeout causes the platform to auto-background the command, which violates the no-background rule for subagents and causes lost results. Commands that need this: `pytest`, `gh run watch`, `terraform apply`, `pip install`, `npm install`, `npm run build`, `ruff check` on large codebases, and any script that processes data.
 
 ## Enforced Rules — Automated Checks
 
@@ -78,13 +79,13 @@ Subagents do the implementation work: worktree setup, coding, testing, PR, and r
 - **`/audit`** — Periodic codebase health audit. Reviews recent PRs, checks for dead code, test gaps, performance issues, security concerns, and dependency health. Files issues for findings. Triggered by the dispatcher every 20 merged PRs, or manually.
 - **`/spotcheck`** — Periodic data quality spot-check. Samples rulings across counties, runs automated DB queries for known issue patterns, screenshots case detail pages for visual inspection, cross-references existing issues, and files new issues for findings.
 
-### Worktree setup (manual)
+### Worktree setup
 
-```
-scripts/start-worker.sh
-```
+**Automated (via dispatcher):** The dispatcher spawns `/task` agents with `isolation: "worktree"` on the Agent tool. Claude Code automatically creates a unique worktree at `.claude/worktrees/agent-<id>/`. No locking, no number contention, no races.
 
-Claims a worker number, creates the worktree from latest `origin/main`, configures git hooks, and creates `tmp/`. All work happens inside `{worktree}`. Each worktree gets its own `.venv` per package:
+**Manual (interactive sessions):** Use `scripts/start-worker.sh` for manual worktree setup when not using the dispatcher. This claims a worker number, creates the worktree, configures git hooks, and creates `tmp/`.
+
+Each worktree gets its own `.venv` per package:
 
 ```
 python3.12 -m venv {worktree}/packages/<pkg>/.venv
@@ -214,6 +215,8 @@ After posting, update the PR test plan to check off the **Post-deploy verificati
 
 **Only remove the worktree after deployment verification passes** (or after confirming the change has no deployed component). Never clean up immediately after merge — the worktree is needed for debugging if verification fails.
 
+For agents spawned with `isolation: "worktree"`, Claude Code handles cleanup automatically when the agent exits. For manual worktrees, run:
+
 ```
 scripts/end-worker.sh {worktree}
 ```
@@ -336,9 +339,9 @@ terraform validate
 
 #### Worktree Isolation
 
-**Do NOT use `isolation: "worktree"` on the Agent tool for `/task` subagents.** The `/task` skill creates its own worktree internally. The Agent tool's worktree isolation breaks project permissions.
+**Spawn `/task` agents with `isolation: "worktree"` on the Agent tool.** Claude Code creates a unique worktree at `.claude/worktrees/agent-<id>/` automatically — no locking, no number contention, no races. The `/task` agent detects it is already in a worktree and skips manual worktree setup.
 
-Spawn `/task` agents **without** `isolation: "worktree"`. For non-`/task` subagents needing branch isolation (rare), create a worktree manually. **Never run `git checkout` or `git switch` in the parent's working directory from a subagent.**
+For non-`/task` subagents needing branch isolation (rare), create a worktree manually. **Never run `git checkout` or `git switch` in the parent's working directory from a subagent.**
 
 #### Pre-PR Checks
 

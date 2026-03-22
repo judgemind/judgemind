@@ -1,6 +1,6 @@
 ---
-description: Pick up and complete a Judgemind GitHub issue autonomously — from worktree setup through PR and review request. Usage: /task (next ready issue), /task #42 (specific issue), /task scrapers (natural-language filter).
-argument-hint: "[#issue | category | next] [--max-workers N]"
+description: Pick up and complete a Judgemind GitHub issue autonomously — from issue claim through PR and review request. Usage: /task (next ready issue), /task #42 (specific issue), /task scrapers (natural-language filter).
+argument-hint: "[#issue | category | next]"
 maxTurns: 200
 ---
 
@@ -12,33 +12,29 @@ Pick up one issue from the Judgemind backlog and complete it autonomously. Do no
 
 ---
 
-## Step 0 — Ensure worktree exists
+## Step 0 — Verify worktree exists
 
-Check whether you are already working inside a worktree (i.e. `{worktree}` is set and the directory exists). If not, run the setup script:
+When spawned by the dispatcher with `isolation: "worktree"`, Claude Code automatically creates a unique worktree at `.claude/worktrees/agent-<id>/`. The agent is already inside this worktree when it starts.
+
+**Verify you are in a worktree** by checking that your working directory contains `.claude/worktrees/` or `worktrees/worker-` in the path. If not, and you were launched interactively (not by the dispatcher), fall back to manual setup:
 
 ```
 scripts/start-worker.sh
 ```
 
-If a `--max-workers N` flag was passed in your arguments, pass it through to the script:
+**Record the working directory** — it is `{worktree}` for the rest of the session. All subsequent work happens inside `{worktree}`.
+
+Create `{worktree}/tmp/` if it does not already exist:
 
 ```
-scripts/start-worker.sh --max-workers N
+mkdir -p {worktree}/tmp
 ```
-
-This provides a hard programmatic limit on the number of concurrent worker worktrees, enforced by the script itself. The dispatcher passes this flag to prevent exceeding its slot limit.
-
-This resolves the repo root, prunes stale worktrees, claims the lowest available worker number, creates the worktree, configures git hooks, and creates the `tmp/` directory.
-
-**Record the printed worktree path** — it is `{worktree}` for the rest of the session. All subsequent work happens inside `{worktree}`.
-
-If you are already in a worktree, skip this step.
 
 ### Status file setup
 
-After creating or entering a worktree, set up the agent status file so the dispatcher can monitor progress. Derive the worker number from the worktree path (e.g. `worker-2` → `2`).
+After confirming the worktree, set up the agent status file so the dispatcher can monitor progress. Derive an identifier from the worktree path (e.g. `agent-ab4722a2` from `.claude/worktrees/agent-ab4722a2`, or `worker-2` from `worktrees/worker-2`).
 
-The status file lives at `{repo_root}/tmp/agent-status/worker-N.txt` (in the **repo root's** `tmp/`, not the worktree's `tmp/`). Create the directory if needed:
+The status file lives at `{repo_root}/tmp/agent-status/{agent-id}.txt` (in the **repo root's** `tmp/`, not the worktree's `tmp/`). Create the directory if needed:
 
 ```
 mkdir -p {repo_root}/tmp/agent-status
@@ -73,7 +69,7 @@ The timer automatically closes the previous phase when a new one starts, so you 
 python3 {worktree}/scripts/phase_timer.py end {worktree} --detail '{"gemini_standard": <secs>, "gemini_adversarial": <secs>, "claude": <secs>}'
 ```
 
-**At task completion** (in Step 5d, before removing the worktree), generate the timing summary:
+**At task completion** (in Step 5d, before cleanup), generate the timing summary:
 ```
 python3 {worktree}/scripts/phase_timer.py summarize {worktree} {repo_root} <issue_number>
 ```
@@ -117,7 +113,7 @@ Write the claim comment to a temp file, then post it:
 ```
 gh issue comment <N> --repo judgemind/judgemind --body-file {worktree}/tmp/claim_comment.txt
 ```
-Comment content: `Picking this up in worker-N.`
+Comment content: `Picking this up in {agent-id}.`
 
 **Rename this conversation** so it is identifiable in the sidebar:
 - Format: `#<N> — <short title>` (drop any `[AREA]` prefix tag from the issue title)
@@ -140,7 +136,6 @@ After claiming the issue, create todos using `TaskCreate` to track your major wo
 8. "Merge PR" — squash merge after CI is green
 9. "Verify deployment and post evidence" — watch deploy, verify feature works, post evidence comment
 10. "Retrospective" — identify workflow efficiencies and preventative measures
-11. "Remove worktree" — cleanup
 
 **For investigation tasks (Path B):**
 1. "Investigate and document findings"
@@ -148,7 +143,6 @@ After claiming the issue, create todos using `TaskCreate` to track your major wo
 3. "Post summary and request review"
 4. "Unblock dependent issues"
 5. "Retrospective" — identify workflow efficiencies and preventative measures
-6. "Remove worktree"
 
 Mark each todo `in_progress` when you start it and `completed` when done. If a task has fewer than 3 steps total (e.g. a trivial fix), skip todo creation.
 
@@ -186,16 +180,22 @@ For Python packages you will touch, create a venv:
 ```
 python3.12 -m venv {worktree}/packages/<pkg>/.venv
 ```
-Then install: `.venv/bin/pip install -e ".[dev]" --quiet`
+Then install (use `timeout: 600000` as pip install may exceed 2 minutes):
+```
+.venv/bin/pip install -e ".[dev]" --quiet
+```
 
-For TypeScript packages: `npm install` from the package directory.
+For TypeScript packages (use `timeout: 600000` as npm install may exceed 2 minutes):
+```
+npm install
+```
 
 Skip this for Terraform-only or docs-only tasks.
 
 #### A.2 — Implement and review (ralph loop)
 - **For testable code tasks** (Python, TypeScript): use the `/ralph` loop — iterative work-then-review with fresh context each iteration. See `.claude/skills/ralph/SKILL.md`. This replaces the old `/tdd` + self-review steps. `/ralph` handles implementation (TDD), pre-PR checks, and cross-perspective review internally. It returns when the reviewer subagent says SHIP.
 - **For non-testable tasks** (Terraform, DB migrations, CI/CD, docs): implement directly, then run all applicable pre-PR checks (see CLAUDE.md §Pre-PR Checks) and review your own diff before continuing.
-- If `/ralph` exits with a blocker (STUCK or max iterations), the issue has already been commented on and blocked (via `scripts/block-issue.sh` or `status/blocked` label). Clean up the worktree (`scripts/end-worker.sh {worktree}`) and stop.
+- If `/ralph` exits with a blocker (STUCK or max iterations), the issue has already been commented on and blocked (via `scripts/block-issue.sh` or `status/blocked` label). Stop — the worktree will be cleaned up automatically by Claude Code (if spawned with `isolation: "worktree"`) or by the dispatcher.
 
 **POST-RALPH CHECKPOINT — Do not skip this.** After `/ralph` returns:
 1. Read `{worktree}/tmp/ralph/ralph-done.txt` to confirm ralph completed with SHIP status.
@@ -331,7 +331,7 @@ Resolve conflicts, `git rebase --continue`, then push with `--force-with-lease`.
 Write status: `phase: ci-watch`, `summary: Watching CI run <run-id>`.
 Also start the phase timer: `python3 {worktree}/scripts/phase_timer.py start {worktree} "ci-watch (1)"`
 
-**Run CI watches in the foreground** — do not use `run_in_background`. You cannot proceed until CI finishes, so background execution just generates unnecessary `<task-notification>` noise for the dispatcher.
+**Run CI watches in the foreground** — do not use `run_in_background`. You cannot proceed until CI finishes, so background execution just generates unnecessary `<task-notification>` noise for the dispatcher. **Use `timeout: 600000`** as CI runs typically take 10-25 minutes.
 
 ```
 gh run watch <run-id> --repo judgemind/judgemind --interval 60 --exit-status --compact
@@ -372,7 +372,7 @@ Also start the phase timer: `python3 {worktree}/scripts/phase_timer.py start {wo
    - `packages/scraper-framework/` or scraper code → `deploy-scraper.yml`
    - `packages/web/` or frontend → `deploy-production.yml`
    - `infra/terraform/` → `terraform.yml`
-2. **Run deploy watches in the foreground** — do not use `run_in_background`. You cannot proceed until the deploy finishes.
+2. **Run deploy watches in the foreground** — do not use `run_in_background`. **Use `timeout: 600000`** as deploys can take several minutes.
    ```
    gh run list --repo judgemind/judgemind --workflow "<deploy-workflow>.yml" --branch main --limit 1 --json databaseId -q '.[0].databaseId'
    gh run watch <run-id> --repo judgemind/judgemind --interval 60 --exit-status --compact
@@ -510,7 +510,7 @@ Continue to Step 5.
 
 Break into sub-tasks first (see CLAUDE.md §Creating Sub-Tasks), label them `agent/ready`, then pick up the first sub-task (restart from Step 1).
 
-If you only create sub-tasks and do not pick one up in this session, clean up: `scripts/end-worker.sh {worktree}` (skip Step 5 — no retrospective needed for task breakdown).
+If you only create sub-tasks and do not pick one up in this session, stop — the worktree will be cleaned up automatically by Claude Code (if spawned with `isolation: "worktree"`) or by the dispatcher. Skip Step 5 — no retrospective needed for task breakdown.
 
 ---
 
@@ -549,21 +549,17 @@ For each actionable finding from 5a and 5b:
 
 If the task was trivial and there are genuinely no improvements to make, that's fine — skip filing. But default to filing. The bar is "would this save time or prevent bugs across future tasks?"
 
-### 5d — Generate timing summary and remove worktree
+### 5d — Generate timing summary
 
-Write status: `phase: done`, `summary: Task complete. Removing worktree.`
+Write status: `phase: done`, `summary: Task complete.`
 
-**Generate the timing summary before removing the worktree:**
+**Generate the timing summary before the agent exits:**
 ```
 python3 {worktree}/scripts/phase_timer.py summarize {worktree} {repo_root} <issue_number>
 ```
 This writes `{worktree}/tmp/timing.json` with the full phase breakdown and appends a one-line summary to `{repo_root}/tmp/task-timings.jsonl`. The dispatcher can aggregate these across tasks to identify systemic bottlenecks.
 
-**Only remove the worktree after deployment verification passes** (or after confirming the change has no deployed component). Never clean up immediately after merge — the worktree is needed for debugging if verification fails.
-
-```
-scripts/end-worker.sh {worktree}
-```
+Worktree cleanup is handled automatically by Claude Code (if spawned with `isolation: "worktree"`) when the agent exits. For manual worktrees, run `scripts/end-worker.sh {worktree}`.
 
 ---
 
@@ -574,4 +570,5 @@ scripts/end-worker.sh {worktree}
 - **All temp files go in `{worktree}/tmp/`**, not `/tmp/`.
 - **Multi-line Python always goes in a `.py` file**, never `-c '...'`.
 - **No `run_in_background`.** All commands — CI watches, test suites, deploy watches, and reviewer invocations — must run in the foreground. Subagents are already background tasks from the parent's perspective. Further backgrounding causes `<task-notification>` messages to surface in the wrong context, leading to confusion and lost results.
+- **Use `timeout: 600000`** on Bash commands that may exceed 2 minutes: `pytest`, `gh run watch`, `pip install`, `npm install`, `npm run build`, `terraform apply`, `ruff check` on large codebases, and any data-processing script.
 - See CLAUDE.md §Unattended Operation Patterns for the full list.
