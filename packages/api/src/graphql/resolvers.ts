@@ -8,6 +8,7 @@ import { alertResolvers } from './alert-resolvers';
 import { dataQualityResolvers } from './data-quality';
 import { searchRulings } from '../search/search-rulings';
 import { getJudgeAnalytics } from './judge-analytics';
+import { getPlatformStats } from './platform-stats-cache';
 
 interface Context {
   pool: Pool;
@@ -54,20 +55,7 @@ export const resolvers = {
     // -----------------------------------------------------------------------
 
     platformStats: async (_: unknown, __: unknown, { pool }: Context) => {
-      const [countiesResult, rulingsResult, judgesResult] = await Promise.all([
-        pool.query<{ count: string }>(
-          `SELECT COUNT(DISTINCT county) AS count FROM courts WHERE is_active = true`,
-        ),
-        pool.query<{ count: string }>(`SELECT COUNT(*) AS count FROM rulings`),
-        pool.query<{ count: string }>(
-          `SELECT COUNT(*) AS count FROM judges WHERE is_active = true`,
-        ),
-      ]);
-      return {
-        countiesCount: parseInt(countiesResult.rows[0].count, 10),
-        rulingsCount: parseInt(rulingsResult.rows[0].count, 10),
-        judgesCount: parseInt(judgesResult.rows[0].count, 10),
-      };
+      return getPlatformStats(pool);
     },
 
     // -----------------------------------------------------------------------
