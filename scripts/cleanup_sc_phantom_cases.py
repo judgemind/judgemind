@@ -101,9 +101,9 @@ def main() -> None:
                 )
                 doc_count = cur.fetchone()[0]
 
-                # Check for parties linked to this phantom case
+                # Check for case_parties linked to this phantom case
                 cur.execute(
-                    "SELECT COUNT(*) FROM parties WHERE case_id = %s",
+                    "SELECT COUNT(*) FROM case_parties WHERE case_id = %s",
                     (str(case_id),),
                 )
                 party_count = cur.fetchone()[0]
@@ -123,7 +123,7 @@ def main() -> None:
                     case_id=str(case_id),
                     rulings=ruling_count,
                     documents=doc_count,
-                    parties=party_count,
+                    case_parties=party_count,
                     case_judges=case_judge_count,
                 )
 
@@ -135,7 +135,7 @@ def main() -> None:
                     )
                     continue
 
-                # Delete in order: rulings, documents, parties,
+                # Delete in order: rulings, documents, case_parties,
                 # case_judges, then the case itself
                 if ruling_count > 0:
                     cur.execute(
@@ -153,10 +153,10 @@ def main() -> None:
 
                 if party_count > 0:
                     cur.execute(
-                        "DELETE FROM parties WHERE case_id = %s",
+                        "DELETE FROM case_parties WHERE case_id = %s",
                         (str(case_id),),
                     )
-                    logger.info("Deleted parties", count=party_count)
+                    logger.info("Deleted case_parties", count=party_count)
 
                 if case_judge_count > 0:
                     cur.execute(
