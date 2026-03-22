@@ -84,6 +84,9 @@ function makeCaseData(overrides: Record<string, unknown> = {}) {
           role: 'defendant',
         },
       ],
+      judges: [
+        { id: 'j1', canonicalName: 'Smith, John' },
+      ],
       ...overrides,
     },
   };
@@ -148,7 +151,7 @@ describe('CaseDetail (render)', () => {
     expect(screen.getByText('Case not found.')).toBeInTheDocument();
   });
 
-  it('renders filed date in the sidebar', () => {
+  it('renders filed date in the header area', () => {
     mockCaseQueryResult.data = makeCaseData();
     mockRulingsQueryResult.data = {
       rulings: {
@@ -157,12 +160,11 @@ describe('CaseDetail (render)', () => {
       },
     };
     render(<CaseDetail caseId="case-1" />);
-    // Filed date appears in the sidebar (rendered twice: mobile + desktop)
-    const filedDates = screen.getAllByText('Jun 15, 2025');
-    expect(filedDates.length).toBeGreaterThanOrEqual(1);
+    // Filed date appears once in the parties header area
+    expect(screen.getByText('Jun 15, 2025')).toBeInTheDocument();
   });
 
-  it('renders parties grouped by role in the sidebar', () => {
+  it('renders parties grouped by role in the header area', () => {
     mockCaseQueryResult.data = makeCaseData();
     mockRulingsQueryResult.data = {
       rulings: {
@@ -171,15 +173,11 @@ describe('CaseDetail (render)', () => {
       },
     };
     render(<CaseDetail caseId="case-1" />);
-    // Parties appear in both mobile and desktop sidebar (rendered twice)
-    const plaintiffLabels = screen.getAllByText('Plaintiffs');
-    expect(plaintiffLabels.length).toBeGreaterThanOrEqual(1);
-    const aliceInstances = screen.getAllByText('Alice Smith');
-    expect(aliceInstances.length).toBeGreaterThanOrEqual(1);
-    const defendantLabels = screen.getAllByText('Defendants');
-    expect(defendantLabels.length).toBeGreaterThanOrEqual(1);
-    const bobInstances = screen.getAllByText('Bob Jones');
-    expect(bobInstances.length).toBeGreaterThanOrEqual(1);
+    // Parties appear once in the header area (no sidebar duplication)
+    expect(screen.getByText('Plaintiffs')).toBeInTheDocument();
+    expect(screen.getByText('Alice Smith')).toBeInTheDocument();
+    expect(screen.getByText('Defendants')).toBeInTheDocument();
+    expect(screen.getByText('Bob Jones')).toBeInTheDocument();
   });
 
   it('does not render separate Case Details or Judges cards', () => {
@@ -377,7 +375,7 @@ describe('CaseDetail (render)', () => {
     expect(screen.getByText('HTML')).toBeInTheDocument();
   });
 
-  it('renders 2-column grid layout with sidebar', () => {
+  it('renders single-column layout (no sidebar grid)', () => {
     mockCaseQueryResult.data = makeCaseData();
     mockRulingsQueryResult.data = {
       rulings: {
@@ -386,8 +384,10 @@ describe('CaseDetail (render)', () => {
       },
     };
     const { container } = render(<CaseDetail caseId="case-1" />);
-    const gridEl = container.querySelector('.grid');
-    expect(gridEl).toBeInTheDocument();
-    expect(gridEl?.classList.contains('sm:grid-cols-[1fr_280px]')).toBe(true);
+    // Should NOT have a sidebar grid layout
+    const gridEl = container.querySelector('.sm\\:grid-cols-\\[1fr_280px\\]');
+    expect(gridEl).not.toBeInTheDocument();
+    // Should NOT have an aside element
+    expect(container.querySelector('aside')).not.toBeInTheDocument();
   });
 });

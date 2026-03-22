@@ -42,6 +42,10 @@ const CASE_QUERY = gql`
         partyType
         role
       }
+      judges {
+        id
+        canonicalName
+      }
     }
   }
 `;
@@ -92,6 +96,10 @@ interface CaseData {
       canonicalName: string;
       partyType: string | null;
       role: string | null;
+    }>;
+    judges: Array<{
+      id: string;
+      canonicalName: string;
     }>;
   } | null;
 }
@@ -175,10 +183,10 @@ function PartyList({
 }
 
 /**
- * Sidebar content: parties, filed date, and related metadata.
- * Rendered as a compact aside on desktop and inline above rulings on mobile.
+ * Parties header: displays plaintiffs, defendants, other parties, and filed date
+ * in the case header area (above rulings), not in a sidebar.
  */
-function PartiesSidebar({
+function PartiesHeader({
   plaintiffs,
   defendants,
   others,
@@ -194,15 +202,15 @@ function PartiesSidebar({
   if (!hasParties && !filedAt) return null;
 
   return (
-    <div className="space-y-4" data-testid="parties-sidebar">
+    <div className="flex flex-wrap gap-x-8 gap-y-4" data-testid="parties-header">
       {hasParties && (
-        <div className="space-y-4">
+        <>
           <PartyList label="Plaintiffs" parties={plaintiffs} />
           <PartyList label="Defendants" parties={defendants} />
           {others.length > 0 && (
             <PartyList label="Other Parties" parties={others} />
           )}
-        </div>
+        </>
       )}
       {filedAt && (
         <div>
@@ -300,6 +308,7 @@ export function CaseDetail({ caseId }: { caseId: string }) {
   }
 
   const { plaintiffs, defendants, others } = groupParties(caseRecord.parties);
+  const caseJudgeNames = new Set((caseRecord.judges ?? []).map((j) => j.canonicalName));
 
   const rulingsSection = (
     <section>
@@ -366,15 +375,12 @@ export function CaseDetail({ caseId }: { caseId: string }) {
                 </span>
                 <span className="flex-1 text-sm text-muted-foreground">
                   {node.motionType ? formatLabel(node.motionType) : '\u2014'}
-                  {node.department && (
-                    <span className="ml-2 text-xs">
-                      Dept. {node.department}
-                    </span>
-                  )}
                 </span>
-                <span className="text-sm text-muted-foreground">
-                  {node.judge?.canonicalName ?? ''}
-                </span>
+                {node.judge?.canonicalName && !caseJudgeNames.has(node.judge.canonicalName) && (
+                  <span className="text-sm text-muted-foreground" data-testid="ruling-judge">
+                    {node.judge.canonicalName}
+                  </span>
+                )}
                 <Badge
                   variant={getOutcomeBadgeVariant(node.outcome)}
                   className={getOutcomeBadgeListClass(node.outcome)}
@@ -454,31 +460,15 @@ export function CaseDetail({ caseId }: { caseId: string }) {
     </section>
   );
 
-  const sidebarContent = (
-    <PartiesSidebar
-      plaintiffs={plaintiffs}
-      defendants={defendants}
-      others={others}
-      filedAt={caseRecord.filedAt}
-    />
-  );
-
   return (
-    <div className="grid grid-cols-1 gap-6 sm:grid-cols-[1fr_280px]">
-      {/* Mobile: sidebar content above rulings */}
-      <div className="sm:hidden">
-        {sidebarContent}
-      </div>
-
-      {/* Main column: rulings */}
-      <div className="min-w-0">
-        {rulingsSection}
-      </div>
-
-      {/* Desktop aside: parties sidebar */}
-      <aside className="hidden sm:block" aria-label="Case parties">
-        {sidebarContent}
-      </aside>
+    <div className="space-y-6">
+      <PartiesHeader
+        plaintiffs={plaintiffs}
+        defendants={defendants}
+        others={others}
+        filedAt={caseRecord.filedAt}
+      />
+      {rulingsSection}
     </div>
   );
 }
