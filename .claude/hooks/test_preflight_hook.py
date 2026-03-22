@@ -367,6 +367,69 @@ run_test(
     cwd_override=WORKTREE_CWD,
 )
 
+# --- Check 10: git worktree add inside an existing worktree ---
+print("\nCheck 10: git worktree add inside worktree subagents")
+
+# Commands that SHOULD be blocked — git worktree add from inside a worktree
+run_test(
+    "git worktree add blocked inside worktree",
+    "git worktree add /path/to/new-worktree feature-branch",
+    2,
+    cwd_override=WORKTREE_CWD,
+)
+run_test(
+    "git worktree add with -b flag blocked inside worktree",
+    "git worktree add -b new-branch /path/to/new-worktree",
+    2,
+    cwd_override=WORKTREE_CWD,
+)
+run_test(
+    "git -C <path> worktree add blocked inside worktree",
+    "git -C /some/repo worktree add /path/to/new-worktree",
+    2,
+    cwd_override=WORKTREE_CWD,
+)
+run_test(
+    "git worktree add blocked inside nested worktree",
+    "git worktree add ../agent-new-worktree new-branch",
+    2,
+    cwd_override=os.path.join(REPO_ROOT, ".claude/worktrees/agent-abc123/.claude/worktrees/agent-def456"),
+)
+
+# Commands that SHOULD be allowed — git worktree add from main repo
+run_test(
+    "git worktree add allowed from main repo",
+    "git worktree add /path/to/new-worktree feature-branch",
+    0,
+    cwd_override=MAIN_REPO_CWD,
+)
+run_test(
+    "git worktree add with -b flag allowed from main repo",
+    "git worktree add -b new-branch /path/to/new-worktree",
+    0,
+    cwd_override=MAIN_REPO_CWD,
+)
+
+# Commands that SHOULD be allowed — git worktree list/remove/prune from worktree
+run_test(
+    "git worktree list allowed inside worktree",
+    "git worktree list",
+    0,
+    cwd_override=WORKTREE_CWD,
+)
+run_test(
+    "git worktree remove allowed inside worktree",
+    "git worktree remove /path/to/old-worktree",
+    0,
+    cwd_override=WORKTREE_CWD,
+)
+run_test(
+    "git worktree prune allowed inside worktree",
+    "git worktree prune",
+    0,
+    cwd_override=WORKTREE_CWD,
+)
+
 # --- Summary ---
 print(f"\n{'='*50}")
 print(f"Results: {passed} passed, {failed} failed")
