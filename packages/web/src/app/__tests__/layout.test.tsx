@@ -28,11 +28,6 @@ vi.mock('@/components/layout/Header', () => ({
   Header: () => <header data-testid="header">Header</header>,
 }));
 
-vi.mock('@/components/layout/Sidebar', () => ({
-  Sidebar: () => <aside data-testid="sidebar">Sidebar</aside>,
-  DesktopSidebar: () => <aside data-testid="sidebar">Sidebar</aside>,
-}));
-
 import RootLayout from '../layout';
 
 // ---------------------------------------------------------------------------
@@ -60,17 +55,16 @@ describe('RootLayout', () => {
     expect(screen.getByTestId('header')).toBeInTheDocument();
   });
 
-  it('renders the Sidebar component', () => {
+  it('does not render the Sidebar (sidebar is in route group layouts)', () => {
     render(<RootLayout>Content</RootLayout>);
-    expect(screen.getByTestId('sidebar')).toBeInTheDocument();
+    expect(screen.queryByTestId('sidebar')).not.toBeInTheDocument();
   });
 
-  it('wraps content in a main element with id main-content', () => {
+  it('does not render a main element (main is in route group layouts)', () => {
     render(<RootLayout>Page content</RootLayout>);
-    const main = screen.getByRole('main');
-    expect(main).toBeInTheDocument();
-    expect(main).toHaveTextContent('Page content');
-    expect(main).toHaveAttribute('id', 'main-content');
+    expect(screen.queryByRole('main')).not.toBeInTheDocument();
+    // Children are still rendered directly
+    expect(screen.getByText('Page content')).toBeInTheDocument();
   });
 
   it('renders a skip-to-main-content link as the first child of body', () => {

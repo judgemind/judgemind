@@ -39,8 +39,9 @@ vi.mock('@/providers/AuthProvider', () => ({
   }),
 }));
 
+let mockPathname = '/search';
 vi.mock('next/navigation', () => ({
-  usePathname: () => '/search',
+  usePathname: () => mockPathname,
 }));
 
 import { Header } from '../Header';
@@ -54,6 +55,7 @@ describe('Header', () => {
     vi.clearAllMocks();
     mockUser = null;
     mockLoading = false;
+    mockPathname = '/search';
   });
 
   it('renders the Judgemind logo', () => {
@@ -124,5 +126,23 @@ describe('Header', () => {
     render(<Header />);
     expect(screen.queryByText('Log in')).not.toBeInTheDocument();
     expect(screen.queryByLabelText('User menu')).not.toBeInTheDocument();
+  });
+
+  it('renders hamburger menu on non-auth pages', () => {
+    mockPathname = '/rulings';
+    render(<Header />);
+    expect(screen.getByLabelText('Toggle menu')).toBeInTheDocument();
+  });
+
+  it('hides hamburger menu on auth pages', () => {
+    mockPathname = '/auth/login';
+    render(<Header />);
+    expect(screen.queryByLabelText('Toggle menu')).not.toBeInTheDocument();
+  });
+
+  it('hides hamburger menu on auth register page', () => {
+    mockPathname = '/auth/register';
+    render(<Header />);
+    expect(screen.queryByLabelText('Toggle menu')).not.toBeInTheDocument();
   });
 });

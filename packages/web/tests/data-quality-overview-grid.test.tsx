@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, screen, fireEvent } from '@testing-library/react';
 
-import { OverviewGrid } from '../src/app/admin/data-quality/OverviewGrid';
+import { OverviewGrid } from '../src/app/(main)/admin/data-quality/OverviewGrid';
 import type { DataQualityOverviewItem } from '../src/lib/data-quality-queries';
 
 // ---------------------------------------------------------------------------

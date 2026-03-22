@@ -48,7 +48,7 @@ vi.mock('@apollo/client', async () => {
   };
 });
 
-import { RulingsFeed } from '../src/app/rulings/RulingsFeed';
+import { RulingsFeed } from '../src/app/(main)/rulings/RulingsFeed';
 
 // ---------------------------------------------------------------------------
 // Helpers

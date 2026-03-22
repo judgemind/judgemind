@@ -34,7 +34,7 @@ vi.mock('@/lib/display-helpers', () => ({
   getOutcomeBadgeListClass: () => '',
 }));
 
-import HomePage from '../page';
+import HomePage from '../(main)/page';
 
 const MOCK_STATS = {
   platformStats: {
