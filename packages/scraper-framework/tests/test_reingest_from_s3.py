@@ -29,6 +29,8 @@ _SRC_DIR = os.path.join(os.path.dirname(__file__), "..", "src")
 if _SRC_DIR not in sys.path:
     sys.path.insert(0, os.path.abspath(_SRC_DIR))
 
+from ingestion.splitter import make_split_document_id  # noqa: E402
+
 reingest = importlib.import_module("reingest_from_s3")
 
 
@@ -3170,43 +3172,28 @@ class TestProgressLogging:
 
 
 # ---------------------------------------------------------------------------
-# _make_split_document_id tests
+# split document ID unification tests
 # ---------------------------------------------------------------------------
 
 
-class TestMakeSplitDocumentId:
-    """Tests for deterministic split document ID generation."""
+class TestSplitDocumentIdUnification:
+    """Tests that reingest uses the canonical make_split_document_id from ingestion.splitter."""
 
-    def test_deterministic_same_inputs(self) -> None:
-        """Same content_hash + ruling_index always produces the same UUID."""
-        id1 = reingest._make_split_document_id("abc123", 1)
-        id2 = reingest._make_split_document_id("abc123", 1)
-        assert id1 == id2
+    def test_reingest_uses_splitter_make_split_document_id(self) -> None:
+        """reingest_from_s3 imports make_split_document_id from ingestion.splitter."""
+        assert reingest.make_split_document_id is make_split_document_id
 
-    def test_different_ruling_index_different_id(self) -> None:
-        """Different ruling indices produce different UUIDs."""
-        id1 = reingest._make_split_document_id("abc123", 1)
-        id2 = reingest._make_split_document_id("abc123", 2)
-        assert id1 != id2
+    def test_no_local_make_split_document_id(self) -> None:
+        """reingest_from_s3 does not define its own _make_split_document_id."""
+        assert not hasattr(reingest, "_make_split_document_id")
 
-    def test_different_content_hash_different_id(self) -> None:
-        """Different content hashes produce different UUIDs."""
-        id1 = reingest._make_split_document_id("abc123", 1)
-        id2 = reingest._make_split_document_id("def456", 1)
-        assert id1 != id2
-
-    def test_returns_valid_uuid_string(self) -> None:
-        """The returned string is a valid UUID."""
-        result = reingest._make_split_document_id("abc123", 1)
-        parsed = uuid.UUID(result)
-        assert str(parsed) == result
-
-    def test_different_from_unsplit_id(self) -> None:
-        """Split document ID differs from the standard unsplit ID."""
-        content_hash = "abc123"
-        unsplit_id = str(uuid.uuid5(uuid.NAMESPACE_URL, content_hash))
-        split_id = reingest._make_split_document_id(content_hash, 1)
-        assert split_id != unsplit_id
+    def test_reingest_produces_same_ids_as_worker(self) -> None:
+        """IDs from reingest match what the ingestion worker would produce."""
+        doc_id = str(uuid.uuid4())
+        for idx in range(5):
+            worker_id = make_split_document_id(doc_id, idx)
+            reingest_id = reingest.make_split_document_id(doc_id, idx)
+            assert worker_id == reingest_id
 
 
 # ---------------------------------------------------------------------------
@@ -3690,8 +3677,13 @@ class TestReingestBatchFullReparse:
         mock_batch_parties: MagicMock,
         mock_supersede: MagicMock,
     ) -> None:
-        """Split document IDs (not original doc ID) are used for document+ruling inserts."""
+        """Original doc ID used for insert_document; split IDs for insert_ruling.
+
+        Matches ingestion worker behavior: one PDF = one document row, but
+        each split ruling gets its own ruling row with a split_document_id.
+        """
         row = _make_document_row()
+        original_doc_id = str(row[0])
         conn = _mock_conn_with_rows([row])
 
         mock_fetch_s3.return_value = b"pdf content"
@@ -3742,12 +3734,11 @@ class TestReingestBatchFullReparse:
             full_reparse=True,
         )
 
-        # Check insert_document was called with split IDs
+        # insert_document uses the ORIGINAL document_id (one PDF = one document row)
         doc_ids = [c[1]["document_id"] for c in mock_insert_doc.call_args_list]
-        assert "split-doc-aaa" in doc_ids
-        assert "split-doc-bbb" in doc_ids
+        assert all(did == original_doc_id for did in doc_ids)
 
-        # Check insert_ruling was called with split IDs
+        # insert_ruling uses split document IDs
         ruling_doc_ids = [c[1]["document_id"] for c in mock_insert_ruling.call_args_list]
         assert "split-doc-aaa" in ruling_doc_ids
         assert "split-doc-bbb" in ruling_doc_ids
