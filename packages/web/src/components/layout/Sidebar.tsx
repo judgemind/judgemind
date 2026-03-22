@@ -25,7 +25,7 @@ export function Sidebar({ onLinkClick }: SidebarProps) {
       </h2>
       <SidebarLink
         href="/search"
-        icon={<Search className="h-4 w-4" />}
+        icon={<Search className="h-4 w-4" aria-hidden="true" />}
         active={pathname === '/search'}
         onClick={onLinkClick}
       >
@@ -33,7 +33,7 @@ export function Sidebar({ onLinkClick }: SidebarProps) {
       </SidebarLink>
       <SidebarLink
         href="/rulings"
-        icon={<FileText className="h-4 w-4" />}
+        icon={<FileText className="h-4 w-4" aria-hidden="true" />}
         active={pathname === '/rulings'}
         onClick={onLinkClick}
       >
@@ -47,7 +47,7 @@ export function Sidebar({ onLinkClick }: SidebarProps) {
       </h2>
       <SidebarLink
         href="/cases"
-        icon={<FolderOpen className="h-4 w-4" />}
+        icon={<FolderOpen className="h-4 w-4" aria-hidden="true" />}
         active={pathname === '/cases'}
         onClick={onLinkClick}
       >
@@ -55,7 +55,7 @@ export function Sidebar({ onLinkClick }: SidebarProps) {
       </SidebarLink>
       <SidebarLink
         href="/judges"
-        icon={<Gavel className="h-4 w-4" />}
+        icon={<Gavel className="h-4 w-4" aria-hidden="true" />}
         active={pathname === '/judges'}
         onClick={onLinkClick}
       >
@@ -70,7 +70,7 @@ export function Sidebar({ onLinkClick }: SidebarProps) {
           </h2>
           <SidebarLink
             href="/admin/data-quality/"
-            icon={<BarChart3 className="h-4 w-4" />}
+            icon={<BarChart3 className="h-4 w-4" aria-hidden="true" />}
             active={pathname.startsWith('/admin/data-quality')}
             onClick={onLinkClick}
           >

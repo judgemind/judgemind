@@ -59,7 +59,7 @@ export function RulingDetail({ ruling, sanitizedRulingTextHtml }: RulingProps) {
           </h2>
           <Link
             href={`/cases/${ruling.case.id}`}
-            className="mt-1 block text-sm font-medium text-slate-900 hover:text-brand-600 dark:text-slate-100 dark:hover:text-brand-400"
+            className="mt-1 block rounded-sm text-sm font-medium text-slate-900 hover:text-brand-600 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring dark:text-slate-100 dark:hover:text-brand-400"
           >
             {ruling.case.caseNumber}
             {ruling.case.caseTitle ? ` \u2014 ${ruling.case.caseTitle}` : ''}
@@ -75,7 +75,7 @@ export function RulingDetail({ ruling, sanitizedRulingTextHtml }: RulingProps) {
           </h2>
           <Link
             href={`/judges/${ruling.judge.id}`}
-            className="mt-1 block text-sm font-medium text-slate-900 hover:text-brand-600 dark:text-slate-100 dark:hover:text-brand-400"
+            className="mt-1 block rounded-sm text-sm font-medium text-slate-900 hover:text-brand-600 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring dark:text-slate-100 dark:hover:text-brand-400"
           >
             {ruling.judge.canonicalName}
           </Link>

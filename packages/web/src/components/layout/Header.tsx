@@ -38,10 +38,10 @@ export function Header() {
           aria-label="Toggle menu"
           className="mr-2 lg:hidden"
         >
-          <Menu className="h-5 w-5" />
+          <Menu className="h-5 w-5" aria-hidden="true" />
         </Button>
 
-        <Link href="/" className="mr-8 text-lg font-semibold text-brand-700 dark:text-brand-500">
+        <Link href="/" className="mr-8 rounded-md text-lg font-semibold text-brand-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 dark:text-brand-500">
           Judgemind
         </Link>
 
@@ -65,9 +65,9 @@ export function Header() {
             aria-label="Toggle dark mode"
           >
             {theme === 'dark' ? (
-              <Sun className="h-5 w-5" />
+              <Sun className="h-5 w-5" aria-hidden="true" />
             ) : (
-              <Moon className="h-5 w-5" />
+              <Moon className="h-5 w-5" aria-hidden="true" />
             )}
           </Button>
 
@@ -77,7 +77,7 @@ export function Header() {
                 <DropdownMenu>
                   <DropdownMenuTrigger asChild>
                     <Button variant="ghost" size="icon" aria-label="User menu">
-                      <User className="h-5 w-5" />
+                      <User className="h-5 w-5" aria-hidden="true" />
                     </Button>
                   </DropdownMenuTrigger>
                   <DropdownMenuContent align="end" className="w-48">
@@ -87,7 +87,7 @@ export function Header() {
                     </DropdownMenuLabel>
                     <DropdownMenuSeparator />
                     <DropdownMenuItem onClick={() => void logout()}>
-                      <LogOut className="mr-2 h-4 w-4" />
+                      <LogOut className="mr-2 h-4 w-4" aria-hidden="true" />
                       Log out
                     </DropdownMenuItem>
                   </DropdownMenuContent>

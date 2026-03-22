@@ -357,7 +357,7 @@ export function CaseDetail({ caseId }: { caseId: string }) {
                 <li key={judge.id} className="text-sm text-foreground">
                   <Link
                     href={`/judges/${judge.id}`}
-                    className="hover:text-primary"
+                    className="rounded-sm hover:text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
                   >
                     {judge.canonicalName}
                   </Link>
@@ -431,7 +431,7 @@ export function CaseDetail({ caseId }: { caseId: string }) {
               <Card key={node.id}>
                 <button
                   type="button"
-                  className="flex w-full flex-wrap items-center gap-x-4 gap-y-2 px-6 py-4 text-left hover:bg-muted/50"
+                  className="flex w-full flex-wrap items-center gap-x-4 gap-y-2 rounded-md px-6 py-4 text-left hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
                   onClick={() => toggleRuling(node.id)}
                   aria-expanded={isExpanded}
                   aria-label={`Ruling from ${formatDate(node.hearingDate)}`}
@@ -460,6 +460,7 @@ export function CaseDetail({ caseId }: { caseId: string }) {
                   </Badge>
                   <ChevronDown
                     className={`h-4 w-4 shrink-0 text-muted-foreground transition-transform motion-reduce:transition-none ${isExpanded ? 'rotate-180' : ''}`}
+                    aria-hidden="true"
                   />
                 </button>
                 {isExpanded && (
@@ -495,7 +496,7 @@ export function CaseDetail({ caseId }: { caseId: string }) {
                           href={buildDownloadUrl(node.documentId)}
                           target="_blank"
                           rel="noopener noreferrer"
-                          className="inline-flex items-center gap-1 text-xs font-medium text-primary hover:text-primary/80"
+                          className="inline-flex items-center gap-1 rounded-sm text-xs font-medium text-primary hover:text-primary/80 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
                         >
                           Download original
                           {node.documentFormat && (

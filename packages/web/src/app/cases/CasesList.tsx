@@ -177,7 +177,7 @@ export function CasesList() {
           value={statusFilter}
           onChange={(e) => setStatusFilter(e.target.value)}
           aria-label="Case status"
-          className="rounded-md border border-input bg-background px-3 py-2 text-sm text-foreground ring-offset-background focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2"
+          className="rounded-md border border-input bg-background px-3 py-2 text-sm text-foreground ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
         >
           <option value="">All statuses</option>
           <option value="active">Active</option>
@@ -189,7 +189,7 @@ export function CasesList() {
           value={typeFilter}
           onChange={(e) => setTypeFilter(e.target.value)}
           aria-label="Case type"
-          className="rounded-md border border-input bg-background px-3 py-2 text-sm text-foreground ring-offset-background focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2"
+          className="rounded-md border border-input bg-background px-3 py-2 text-sm text-foreground ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
         >
           <option value="">All types</option>
           {CASE_TYPES.map((ct) => (
@@ -244,7 +244,7 @@ export function CasesList() {
                 <TableCell className="min-w-0">
                   <Link
                     href={`/cases/${node.id}`}
-                    className="block truncate font-medium text-foreground hover:text-primary"
+                    className="block truncate rounded-sm font-medium text-foreground hover:text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
                   >
                     {node.caseNumber}
                   </Link>
