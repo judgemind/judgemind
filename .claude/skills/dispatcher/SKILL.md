@@ -248,12 +248,11 @@ Both commands update the status file automatically. Always send a notification i
 After every agent completion notification, run the cleanup script to validate the agent is finished and remove its worktree, then re-anchor cwd:
 
 ```
-scripts/cleanup_worktree.sh .claude/worktrees/agent-<id>
-cd <repo_root>
-pwd  # verify
+. scripts/cleanup_worktree.sh .claude/worktrees/agent-<id>
+pwd  # verify — cwd is now at repo root
 ```
 
-The cleanup script checks the agent's JSONL session log to confirm the agent has truly finished before removing the worktree. It will refuse to remove worktrees where the agent is still running. **Do NOT** manually `git worktree remove`, `rm -rf`, or `cd /` to work around cwd drift.
+The cleanup script must be **sourced** (`. scripts/...` or `source scripts/...`), not executed, so that the `cd` to repo root persists in the caller's shell. It checks the agent's JSONL session log to confirm the agent has truly finished before removing the worktree. It will refuse to remove worktrees where the agent is still running. **Do NOT** manually `git worktree remove`, `rm -rf`, or `cd /` to work around cwd drift.
 
 All subsequent git commands should use `git -C <repo_root>` regardless, as a defense-in-depth measure against cwd drift.
 
@@ -345,7 +344,7 @@ This minimal comment still provides value by alerting the next agent that a prio
 
 **Step 4 — Clean up the agent's worktree (if needed):**
 
-Worktree cleanup is handled in Step 2 via `scripts/cleanup_worktree.sh`. If the script reports the worktree is already gone, no further action is needed. If cleanup failed in Step 2 (e.g., the script returned an error), log it but do not block the dispatch loop. Stale worktrees do not affect slot counting (slots are tracked by the dispatcher's own agent list, not by worktree directory count).
+Worktree cleanup is handled in Step 2 via `. scripts/cleanup_worktree.sh` (sourced, not executed). If the script reports the worktree is already gone, no further action is needed. If cleanup failed in Step 2 (e.g., the script returned an error), log it but do not block the dispatch loop. Stale worktrees do not affect slot counting (slots are tracked by the dispatcher's own agent list, not by worktree directory count).
 
 ---
 
