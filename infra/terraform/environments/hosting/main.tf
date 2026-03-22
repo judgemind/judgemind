@@ -12,6 +12,9 @@ module "web_dev" {
 
   # API deployed to ECS Fargate behind ALB (Issue #182).
   graphql_url = "https://dev.api.judgemind.org/graphql"
+
+  # Used as metadataBase for OG image URLs (Issue #1538).
+  site_url = "https://dev.judgemind.org"
 }
 
 output "web_dev_project_id" {

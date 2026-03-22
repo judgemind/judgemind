@@ -6,6 +6,7 @@ import { AuthProvider } from '@/providers/AuthProvider';
 import { ThemeProvider } from '@/providers/ThemeProvider';
 
 export const metadata: Metadata = {
+  metadataBase: new URL(process.env.NEXT_PUBLIC_SITE_URL || 'https://dev.judgemind.org'),
   title: 'Judgemind — Legal Research Platform',
   description: 'Free, open-source California court ruling research and judge analytics.',
   manifest: '/manifest.json',
