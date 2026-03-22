@@ -45,7 +45,7 @@ from framework import CapturedDocument, ContentFormat
 
 pytestmark = pytest.mark.regression
 
-FIXTURES = Path(__file__).parent / "fixtures"
+FIXTURES = Path(__file__).parent.parent / "fixtures"
 
 
 def _load_html(name: str) -> str:

@@ -42,7 +42,7 @@ from framework.hashing import sha256_hex
 
 pytestmark = pytest.mark.regression
 
-FIXTURES = Path(__file__).parent / "fixtures"
+FIXTURES = Path(__file__).parent.parent / "fixtures"
 
 
 def _load_html(name: str) -> str:

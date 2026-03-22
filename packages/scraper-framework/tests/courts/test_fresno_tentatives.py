@@ -41,7 +41,7 @@ from courts.ca.pdf_link_scraper import _extract_pdf_links, _extract_pdf_text
 
 pytestmark = pytest.mark.regression
 
-FIXTURES = Path(__file__).parent / "fixtures"
+FIXTURES = Path(__file__).parent.parent / "fixtures"
 
 
 def _load_html(name: str) -> str:
