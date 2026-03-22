@@ -102,10 +102,8 @@ describe('HomePage', () => {
   });
 
   it('renders the stats bar when data is loaded', () => {
-    let callCount = 0;
-    mockUseQuery.mockImplementation(() => {
-      callCount++;
-      if (callCount === 1) {
+    mockUseQuery.mockImplementation((query: string) => {
+      if (query.includes('PlatformStats')) {
         return { data: MOCK_STATS, loading: false, error: null };
       }
       return { data: MOCK_RULINGS, loading: false, error: null };
@@ -118,10 +116,8 @@ describe('HomePage', () => {
   });
 
   it('renders stat values formatted correctly', () => {
-    let callCount = 0;
-    mockUseQuery.mockImplementation(() => {
-      callCount++;
-      if (callCount === 1) {
+    mockUseQuery.mockImplementation((query: string) => {
+      if (query.includes('PlatformStats')) {
         return { data: MOCK_STATS, loading: false, error: null };
       }
       return { data: MOCK_RULINGS, loading: false, error: null };
@@ -136,10 +132,8 @@ describe('HomePage', () => {
   });
 
   it('renders recent rulings section', () => {
-    let callCount = 0;
-    mockUseQuery.mockImplementation(() => {
-      callCount++;
-      if (callCount === 1) {
+    mockUseQuery.mockImplementation((query: string) => {
+      if (query.includes('PlatformStats')) {
         return { data: MOCK_STATS, loading: false, error: null };
       }
       return { data: MOCK_RULINGS, loading: false, error: null };
@@ -151,10 +145,8 @@ describe('HomePage', () => {
   });
 
   it('renders ruling cards with case info', () => {
-    let callCount = 0;
-    mockUseQuery.mockImplementation(() => {
-      callCount++;
-      if (callCount === 1) {
+    mockUseQuery.mockImplementation((query: string) => {
+      if (query.includes('PlatformStats')) {
         return { data: MOCK_STATS, loading: false, error: null };
       }
       return { data: MOCK_RULINGS, loading: false, error: null };
@@ -182,10 +174,8 @@ describe('HomePage', () => {
   });
 
   it('shows error state for recent rulings', () => {
-    let callCount = 0;
-    mockUseQuery.mockImplementation(() => {
-      callCount++;
-      if (callCount === 1) {
+    mockUseQuery.mockImplementation((query: string) => {
+      if (query.includes('PlatformStats')) {
         return { data: MOCK_STATS, loading: false, error: null };
       }
       return { data: null, loading: false, error: new Error('Network error') };
@@ -195,10 +185,8 @@ describe('HomePage', () => {
   });
 
   it('shows empty state for recent rulings', () => {
-    let callCount = 0;
-    mockUseQuery.mockImplementation(() => {
-      callCount++;
-      if (callCount === 1) {
+    mockUseQuery.mockImplementation((query: string) => {
+      if (query.includes('PlatformStats')) {
         return { data: MOCK_STATS, loading: false, error: null };
       }
       return {
