@@ -222,6 +222,34 @@ while read -r local_ref local_sha remote_sha _rest; do
     done
 
     # ---------------------------------------------------------------
+    # Diff coverage check for Python packages (after tests generate coverage.xml)
+    # ---------------------------------------------------------------
+    for pkg in $python_pkgs_with_code; do
+        if [[ "$pkg" == infra/* ]]; then
+            pkg_dir="$pkg"
+        else
+            pkg_dir="packages/$pkg"
+        fi
+
+        cov_file="$pkg_dir/coverage.xml"
+        diff_cover_cmd="$pkg_dir/.venv/bin/diff-cover"
+        if [ -f "$cov_file" ] && [ -x "$diff_cover_cmd" ]; then
+            echo "pre-push: checking diff coverage for '$pkg'..." >&2
+            if ! "$diff_cover_cmd" "$cov_file" \
+                    --compare-branch=origin/main \
+                    --fail-under=90 \
+                    --diff-range-notation='..' 2>&1; then
+                echo "" >&2
+                echo "  FAILED: diff coverage for $pkg" >&2
+                echo "  New/changed lines have < 90% test coverage." >&2
+                echo "  Run: scripts/check-diff-coverage.sh $pkg --skip-tests" >&2
+                echo "  to see exactly which lines need tests." >&2
+                failures=$((failures + 1))
+            fi
+        fi
+    done
+
+    # ---------------------------------------------------------------
     # Run checks for TypeScript packages
     # ---------------------------------------------------------------
     for pkg in $changed_ts_pkgs; do
@@ -288,6 +316,40 @@ while read -r local_ref local_sha remote_sha _rest; do
                 echo "  FAILED: coverage floor check for $pkg" >&2
                 echo "  Coverage has dropped below the baseline in coverage-baselines.json." >&2
                 echo "  Add tests to restore coverage before pushing." >&2
+                failures=$((failures + 1))
+            fi
+        fi
+    done
+
+    # ---------------------------------------------------------------
+    # Diff coverage check for TypeScript packages (after tests generate lcov.info)
+    # ---------------------------------------------------------------
+    for pkg in $ts_pkgs_with_code; do
+        pkg_dir="packages/$pkg"
+        cov_file="$pkg_dir/coverage/lcov.info"
+        # Try to find diff-cover from any available Python venv
+        diff_cover_cmd=""
+        if command -v diff-cover &>/dev/null; then
+            diff_cover_cmd="diff-cover"
+        else
+            for venv_dir in packages/*/.venv infra/*/.venv; do
+                if [ -x "$venv_dir/bin/diff-cover" ]; then
+                    diff_cover_cmd="$venv_dir/bin/diff-cover"
+                    break
+                fi
+            done
+        fi
+        if [ -f "$cov_file" ] && [ -n "$diff_cover_cmd" ]; then
+            echo "pre-push: checking diff coverage for '$pkg'..." >&2
+            if ! "$diff_cover_cmd" "$cov_file" \
+                    --compare-branch=origin/main \
+                    --fail-under=90 \
+                    --diff-range-notation='..' 2>&1; then
+                echo "" >&2
+                echo "  FAILED: diff coverage for $pkg" >&2
+                echo "  New/changed lines have < 90% test coverage." >&2
+                echo "  Run: scripts/check-diff-coverage.sh $pkg --skip-tests" >&2
+                echo "  to see exactly which lines need tests." >&2
                 failures=$((failures + 1))
             fi
         fi

@@ -52,9 +52,11 @@ Machine-readable checklist of rules extracted from CLAUDE.md. Agents should vali
 | PR-01 | Python lint | `.venv/bin/ruff check src/ tests/` |
 | PR-02 | Python format | `.venv/bin/ruff format --check src/ tests/` |
 | PR-03 | Python tests | `.venv/bin/pytest tests/ -v --tb=short` |
+| PR-03b | Python diff coverage | `scripts/check-diff-coverage.sh <package> --skip-tests` (after PR-03) |
 | PR-04 | TypeScript lint | `npm run lint` |
 | PR-05 | TypeScript typecheck | `npm run typecheck` |
 | PR-06 | TypeScript tests | `npm test` |
+| PR-06b | TypeScript diff coverage | `scripts/check-diff-coverage.sh <package> --skip-tests` (after PR-06) |
 | PR-07 | TypeScript build (web) | `npm run build` (for `packages/web/` only) |
 | PR-08 | Terraform format | `terraform fmt -check -recursive` |
 | PR-09 | Terraform validate | `terraform init -backend=false && terraform validate` |
