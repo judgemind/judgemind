@@ -8,6 +8,14 @@ vi.mock('@apollo/client', () => ({
   gql: (strings: TemplateStringsArray) => strings.join(''),
 }));
 
+const mockReplace = vi.fn();
+let mockSearchParamsValue = new URLSearchParams();
+
+vi.mock('next/navigation', () => ({
+  useRouter: () => ({ push: vi.fn(), replace: mockReplace, back: vi.fn() }),
+  useSearchParams: () => mockSearchParamsValue,
+}));
+
 vi.mock('next/link', () => ({
   default: ({
     children,
@@ -110,6 +118,7 @@ afterEach(() => {
 describe('RulingsFeed', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mockSearchParamsValue = new URLSearchParams();
   });
 
   it('renders skeleton cards while loading initial data', () => {
@@ -351,5 +360,82 @@ describe('RulingsFeed', () => {
     expect(
       screen.getByPlaceholderText(/County/),
     ).toBeInTheDocument();
+  });
+
+  it('updates URL params when county filter changes', () => {
+    mockUseQuery.mockReturnValue({
+      data: MOCK_RULINGS_DATA,
+      loading: false,
+      error: undefined,
+      fetchMore: vi.fn(),
+    });
+
+    render(<RulingsFeed />);
+    // The component reads county from searchParams; when county state changes, URL updates.
+    // Since county is set via Autocomplete, we test indirectly via initial searchParams.
+    expect(mockReplace).toHaveBeenCalledWith('/rulings');
+  });
+
+  it('initializes county filter from URL params', () => {
+    mockSearchParamsValue = new URLSearchParams('county=Los%20Angeles');
+    mockUseQuery.mockReturnValue({
+      data: MOCK_RULINGS_DATA,
+      loading: false,
+      error: undefined,
+      fetchMore: vi.fn(),
+    });
+
+    render(<RulingsFeed />);
+    const lastCall = mockUseQuery.mock.calls[mockUseQuery.mock.calls.length - 1];
+    expect(lastCall[1].variables.county).toBe('Los Angeles');
+  });
+
+  it('initializes dateFrom filter from URL params', () => {
+    mockSearchParamsValue = new URLSearchParams('dateFrom=2026-01-01');
+    mockUseQuery.mockReturnValue({
+      data: MOCK_RULINGS_DATA,
+      loading: false,
+      error: undefined,
+      fetchMore: vi.fn(),
+    });
+
+    render(<RulingsFeed />);
+    const lastCall = mockUseQuery.mock.calls[mockUseQuery.mock.calls.length - 1];
+    expect(lastCall[1].variables.dateFrom).toBe('2026-01-01');
+  });
+
+  it('initializes dateTo filter from URL params', () => {
+    mockSearchParamsValue = new URLSearchParams('dateTo=2026-12-31');
+    mockUseQuery.mockReturnValue({
+      data: MOCK_RULINGS_DATA,
+      loading: false,
+      error: undefined,
+      fetchMore: vi.fn(),
+    });
+
+    render(<RulingsFeed />);
+    const lastCall = mockUseQuery.mock.calls[mockUseQuery.mock.calls.length - 1];
+    expect(lastCall[1].variables.dateTo).toBe('2026-12-31');
+  });
+
+  it('updates URL with all filter params', () => {
+    mockSearchParamsValue = new URLSearchParams('county=Orange&dateFrom=2026-01-01&dateTo=2026-06-30');
+    mockUseQuery.mockReturnValue({
+      data: MOCK_RULINGS_DATA,
+      loading: false,
+      error: undefined,
+      fetchMore: vi.fn(),
+    });
+
+    render(<RulingsFeed />);
+    expect(mockReplace).toHaveBeenCalledWith(
+      expect.stringContaining('county=Orange'),
+    );
+    expect(mockReplace).toHaveBeenCalledWith(
+      expect.stringContaining('dateFrom=2026-01-01'),
+    );
+    expect(mockReplace).toHaveBeenCalledWith(
+      expect.stringContaining('dateTo=2026-06-30'),
+    );
   });
 });

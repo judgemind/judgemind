@@ -1,7 +1,8 @@
 'use client';
 
-import { useState } from 'react';
+import { useState, useCallback, useEffect } from 'react';
 import { useQuery, gql } from '@apollo/client';
+import { useRouter, useSearchParams } from 'next/navigation';
 import Link from 'next/link';
 import { Search } from 'lucide-react';
 import { Badge } from '@/components/ui/badge';
@@ -81,7 +82,25 @@ function SkeletonRow() {
 }
 
 export function JudgesList() {
-  const [nameFilter, setNameFilter] = useState('');
+  const router = useRouter();
+  const searchParams = useSearchParams();
+
+  const [nameFilter, setNameFilter] = useState(searchParams.get('name') ?? '');
+
+  useEffect(() => {
+    setNameFilter(searchParams.get('name') ?? '');
+  }, [searchParams]);
+
+  const updateUrl = useCallback(() => {
+    const params = new URLSearchParams();
+    if (nameFilter) params.set('name', nameFilter);
+    const search = params.toString();
+    router.replace(search ? `/judges?${search}` : '/judges');
+  }, [nameFilter, router]);
+
+  useEffect(() => {
+    updateUrl();
+  }, [updateUrl]);
 
   const { data, loading, error, fetchMore } = useQuery<JudgesData>(JUDGES_QUERY, {
     variables: {
