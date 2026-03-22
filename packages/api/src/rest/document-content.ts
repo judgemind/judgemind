@@ -177,12 +177,38 @@ export function registerDocumentContent(
           });
         }
 
-        // Read the full body into a buffer
+        // Read the full body into a buffer with a streaming size guard.
+        // ContentLength may be absent (e.g. Transfer-Encoding: chunked),
+        // so we also enforce the limit while reading chunks.
         const chunks: Buffer[] = [];
         const stream = response.Body as Readable;
-        for await (const chunk of stream) {
-          chunks.push(Buffer.from(chunk));
+        let totalBytes = 0;
+        let payloadTooLarge = false;
+
+        try {
+          for await (const chunk of stream) {
+            totalBytes += chunk.length;
+            if (totalBytes > MAX_CONTENT_SIZE) {
+              payloadTooLarge = true;
+              stream.destroy();
+              break;
+            }
+            chunks.push(chunk as Buffer);
+          }
+        } catch (streamErr) {
+          // When we intentionally destroy the stream, an AbortError is expected
+          // from the for-await loop. Any other error should be re-thrown.
+          if (!payloadTooLarge || (streamErr instanceof Error && streamErr.name !== 'AbortError')) {
+            throw streamErr;
+          }
         }
+
+        if (payloadTooLarge) {
+          return reply.status(413).send({
+            error: 'Document is too large for inline viewing. Use /download instead.',
+          });
+        }
+
         const buffer = Buffer.concat(chunks);
 
         // Detect charset from the HTML content, using a preliminary UTF-8 parse
