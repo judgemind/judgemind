@@ -21,10 +21,21 @@ passed = 0
 failed = 0
 
 
-def run_test(description: str, command: str, expect_exit: int) -> None:
+def run_test(
+    description: str,
+    command: str,
+    expect_exit: int,
+    timeout: int | None = None,
+    run_in_background: bool = False,
+) -> None:
     """Run the hook with a given command and assert the exit code."""
     global passed, failed
-    input_json = json.dumps({"tool_input": {"command": command}})
+    tool_input: dict = {"command": command}
+    if timeout is not None:
+        tool_input["timeout"] = timeout
+    if run_in_background:
+        tool_input["run_in_background"] = True
+    input_json = json.dumps({"tool_input": tool_input})
     result = subprocess.run(
         ["bash", HOOK],
         input=input_json,
@@ -130,6 +141,145 @@ run_test(
 run_test("normal command no quotes", "git status", 0)
 run_test("normal command with path", "git -C /path/to/repo status", 0)
 run_test("git commit with -F flag", "git commit -F /tmp/msg.txt", 0)
+
+# --- Check 8: long-running commands without timeout ---
+print("\nCheck 8: Long-running commands without timeout")
+
+# Commands that SHOULD be blocked without timeout
+run_test(
+    "pytest without timeout blocked",
+    ".venv/bin/pytest tests/ -v",
+    2,
+)
+run_test(
+    "gh run watch without timeout blocked",
+    "gh run watch 12345 --repo judgemind/judgemind --interval 60 --exit-status",
+    2,
+)
+run_test(
+    "pip install without timeout blocked",
+    ".venv/bin/pip install -e .[dev] --quiet",
+    2,
+)
+run_test(
+    "npm install without timeout blocked",
+    "npm install",
+    2,
+)
+run_test(
+    "npm run build without timeout blocked",
+    "npm run build",
+    2,
+)
+run_test(
+    "ruff check on src/ without timeout blocked",
+    ".venv/bin/ruff check src/ tests/",
+    2,
+)
+run_test(
+    "terraform apply without timeout blocked",
+    "terraform -chdir=infra/terraform/environments/dev apply -auto-approve",
+    2,
+)
+
+# Commands that SHOULD be blocked with too-low timeout
+run_test(
+    "pytest with timeout 120000 blocked (too low)",
+    ".venv/bin/pytest tests/ -v",
+    2,
+    timeout=120000,
+)
+run_test(
+    "pip install with timeout 60000 blocked (too low)",
+    ".venv/bin/pip install -e .[dev]",
+    2,
+    timeout=60000,
+)
+
+# Commands that SHOULD be allowed with sufficient timeout
+run_test(
+    "pytest with timeout 600000 allowed",
+    ".venv/bin/pytest tests/ -v",
+    0,
+    timeout=600000,
+)
+run_test(
+    "gh run watch with timeout 600000 allowed",
+    "gh run watch 12345 --repo judgemind/judgemind --interval 60",
+    0,
+    timeout=600000,
+)
+run_test(
+    "pip install with timeout 300000 allowed (at minimum)",
+    ".venv/bin/pip install -e .[dev]",
+    0,
+    timeout=300000,
+)
+run_test(
+    "npm install with timeout 600000 allowed",
+    "npm install",
+    0,
+    timeout=600000,
+)
+run_test(
+    "npm run build with timeout 600000 allowed",
+    "npm run build",
+    0,
+    timeout=600000,
+)
+run_test(
+    "ruff check src/ with timeout 600000 allowed",
+    ".venv/bin/ruff check src/",
+    0,
+    timeout=600000,
+)
+run_test(
+    "terraform apply with timeout 600000 allowed",
+    "terraform -chdir=infra/terraform/environments/dev apply -auto-approve",
+    0,
+    timeout=600000,
+)
+
+# Commands that SHOULD be allowed with run_in_background=true even without timeout
+run_test(
+    "pytest with run_in_background=true allowed (no timeout needed)",
+    ".venv/bin/pytest tests/ -v",
+    0,
+    run_in_background=True,
+)
+run_test(
+    "gh run watch with run_in_background=true allowed",
+    "gh run watch 12345 --interval 60",
+    0,
+    run_in_background=True,
+)
+
+# Commands that should NOT trigger the timeout check
+run_test(
+    "ruff check on a single file (no large path) allowed without timeout",
+    ".venv/bin/ruff check src/courts/ca/la.py",
+    0,
+)
+run_test(
+    "npm run lint allowed without timeout",
+    "npm run lint",
+    0,
+)
+run_test(
+    "npm test allowed without timeout",
+    "npm test",
+    0,
+)
+run_test(
+    "git status allowed without timeout",
+    "git status",
+    0,
+)
+run_test(
+    "ruff format allowed without timeout",
+    ".venv/bin/ruff format --check src/ tests/",
+    0,
+)
 
 # --- Summary ---
 print(f"\n{'='*50}")
