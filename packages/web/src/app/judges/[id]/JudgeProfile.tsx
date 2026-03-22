@@ -9,6 +9,7 @@ import {
   formatMotionType,
   formatOutcome,
   getOutcomeBadgeVariant,
+  getOutcomeBadgeListClass,
 } from '../../../lib/display-helpers';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
@@ -439,6 +440,7 @@ export function JudgeProfile({ judgeId }: { judgeId: string }) {
                 </div>
                 <Badge
                   variant={getOutcomeBadgeVariant(node.outcome)}
+                  className={getOutcomeBadgeListClass(node.outcome)}
                 >
                   {formatOutcome(node.outcome)}
                 </Badge>
