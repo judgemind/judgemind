@@ -20,6 +20,8 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       scraper: ${{ steps.changes.outputs.scraper }}
+      scraper-framework: ${{ steps.changes.outputs.scraper-framework }}
+      scraper-courts: ${{ steps.changes.outputs.scraper-courts }}
       nlp: ${{ steps.changes.outputs.nlp }}
       api: ${{ steps.changes.outputs.api }}
       web: ${{ steps.changes.outputs.web }}
@@ -40,6 +42,19 @@ jobs:
               - 'packages/judgemind-config/**'
             scraper:
               - 'packages/scraper-framework/**'
+              - 'packages/judgemind-config/**'
+            scraper-framework:
+              - 'packages/scraper-framework/src/framework/**'
+              - 'packages/scraper-framework/src/ingestion/**'
+              - 'packages/scraper-framework/src/templates/**'
+              - 'packages/scraper-framework/src/validation/**'
+              - 'packages/scraper-framework/tests/**'
+              - 'packages/scraper-framework/pyproject.toml'
+              - 'packages/judgemind-config/**'
+            scraper-courts:
+              - 'packages/scraper-framework/src/courts/**'
+              - 'packages/scraper-framework/tests/**'
+              - 'packages/scraper-framework/pyproject.toml'
               - 'packages/judgemind-config/**'
             nlp:
               - 'packages/nlp-pipeline/**'
@@ -79,9 +94,9 @@ jobs:
             echo "result=false" >> "$GITHUB_OUTPUT"
           fi
 
-  scraper-unit-tests:
+  scraper-framework-tests:
     needs: detect-changes
-    if: needs.detect-changes.outputs.scraper == 'true'
+    if: needs.detect-changes.outputs.scraper-framework == 'true'
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -122,11 +137,30 @@ jobs:
           --ignore=tests/test_reingest_registry.py
           --ignore=tests/test_ingestion.py
           --ignore=tests/test_extract.py
+          --ignore=tests/test_cc_tentatives.py
+          --ignore=tests/test_fresno_tentatives.py
+          --ignore=tests/test_la_tentatives.py
+          --ignore=tests/test_la_dept_judges.py
+          --ignore=tests/test_oc_tentatives.py
+          --ignore=tests/test_oc_family_law_tentatives.py
+          --ignore=tests/test_oc_probate_tentatives.py
+          --ignore=tests/test_pdf_link_scraper.py
+          --ignore=tests/test_riverside_tentatives.py
+          --ignore=tests/test_riverside_dept_judges.py
+          --ignore=tests/test_sb_tentatives.py
+          --ignore=tests/test_sc_tentatives.py
+          --ignore=tests/test_sd_tentatives.py
+          --ignore=tests/test_sd_calendar.py
+          --ignore=tests/test_sd_pipeline.py
+          --ignore=tests/test_sf_tentatives.py
+          --ignore=tests/test_ventura_tentatives.py
+          --ignore=tests/test_ventura_dept_judges.py
+          --ignore=tests/test_courtlistener.py
       - name: Upload coverage
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: coverage-scraper-unit
+          name: coverage-scraper-framework
           path: packages/scraper-framework/coverage.xml
       - name: Upload to Codecov
         if: always() && hashFiles('packages/scraper-framework/coverage.xml') != ''
@@ -134,7 +168,81 @@ jobs:
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: packages/scraper-framework/coverage.xml
-          flags: scraper-unit
+          flags: scraper-framework
+          fail_ci_if_error: false
+
+  scraper-court-tests:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.scraper-courts == 'true'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: packages/scraper-framework
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        id: setup-python
+        with:
+          python-version: '3.12'
+      - uses: actions/cache@v5
+        id: venv-cache
+        with:
+          path: packages/scraper-framework/.venv
+          key: venv-scraper-${{ runner.os }}-py${{ steps.setup-python.outputs.python-version }}-${{ hashFiles('packages/scraper-framework/pyproject.toml') }}
+      - name: Validate cached venv
+        if: steps.venv-cache.outputs.cache-hit == 'true'
+        run: |
+          if ! .venv/bin/python --version > /dev/null 2>&1; then
+            echo "Cached venv is invalid (Python version mismatch), recreating..."
+            rm -rf .venv
+            echo "venv-invalid=true" >> "$GITHUB_ENV"
+          fi
+      - name: Install dependencies
+        if: steps.venv-cache.outputs.cache-hit != 'true' || env.venv-invalid == 'true'
+        run: |
+          python -m venv .venv
+          .venv/bin/pip install -e ../../packages/judgemind-config
+          .venv/bin/pip install -e ".[dev]"
+      - name: Lint
+        run: .venv/bin/ruff check src/ tests/
+      - name: Format check
+        run: .venv/bin/ruff format --check src/ tests/
+      - name: Test
+        run: >-
+          .venv/bin/pytest
+          tests/test_cc_tentatives.py
+          tests/test_fresno_tentatives.py
+          tests/test_la_tentatives.py
+          tests/test_la_dept_judges.py
+          tests/test_oc_tentatives.py
+          tests/test_oc_family_law_tentatives.py
+          tests/test_oc_probate_tentatives.py
+          tests/test_pdf_link_scraper.py
+          tests/test_riverside_tentatives.py
+          tests/test_riverside_dept_judges.py
+          tests/test_sb_tentatives.py
+          tests/test_sc_tentatives.py
+          tests/test_sd_tentatives.py
+          tests/test_sd_calendar.py
+          tests/test_sd_pipeline.py
+          tests/test_sf_tentatives.py
+          tests/test_ventura_tentatives.py
+          tests/test_ventura_dept_judges.py
+          tests/test_courtlistener.py
+          -n auto -v --tb=short
+      - name: Upload coverage
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage-scraper-courts
+          path: packages/scraper-framework/coverage.xml
+      - name: Upload to Codecov
+        if: always() && hashFiles('packages/scraper-framework/coverage.xml') != ''
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: packages/scraper-framework/coverage.xml
+          flags: scraper-courts
           fail_ci_if_error: false
 
   ingestion-tests:
@@ -531,7 +639,7 @@ jobs:
   # Coverage gates: diff coverage (new lines) + overall floor ratchet
   # ---------------------------------------------------------------
   coverage-check:
-    needs: [detect-changes, scraper-unit-tests, ingestion-tests, nlp-tests, api-tests, web-tests, telegram-bridge-tests, lambda-tests]
+    needs: [detect-changes, scraper-framework-tests, scraper-court-tests, ingestion-tests, nlp-tests, api-tests, web-tests, telegram-bridge-tests, lambda-tests]
     if: always() && github.event_name == 'pull_request' && needs.detect-changes.outputs.any-testable == 'true'
     runs-on: ubuntu-latest
     steps:
@@ -562,10 +670,12 @@ jobs:
       - name: Diff coverage — scraper-framework
         if: needs.detect-changes.outputs.scraper == 'true'
         run: |
-          COV_UNIT="coverage-artifacts/coverage-scraper-unit/coverage.xml"
+          COV_FRAMEWORK="coverage-artifacts/coverage-scraper-framework/coverage.xml"
+          COV_COURTS="coverage-artifacts/coverage-scraper-courts/coverage.xml"
           COV_INGEST="coverage-artifacts/coverage-scraper-ingestion/coverage.xml"
           COV_FILES=""
-          if [ -f "$COV_UNIT" ]; then COV_FILES="$COV_UNIT"; fi
+          if [ -f "$COV_FRAMEWORK" ]; then COV_FILES="$COV_FRAMEWORK"; fi
+          if [ -f "$COV_COURTS" ]; then COV_FILES="$COV_FILES $COV_COURTS"; fi
           if [ -f "$COV_INGEST" ]; then COV_FILES="$COV_FILES $COV_INGEST"; fi
           if [ -n "$COV_FILES" ]; then
             diff-cover $COV_FILES --compare-branch=origin/main --fail-under=90 --diff-range-notation='..'
@@ -629,7 +739,11 @@ jobs:
       - name: Coverage floor ratchet — scraper-framework
         if: needs.detect-changes.outputs.scraper == 'true'
         run: |
-          COV_FILE="coverage-artifacts/coverage-scraper-unit/coverage.xml"
+          # Use framework coverage as the primary baseline; fall back to courts
+          COV_FILE="coverage-artifacts/coverage-scraper-framework/coverage.xml"
+          if [ ! -f "$COV_FILE" ]; then
+            COV_FILE="coverage-artifacts/coverage-scraper-courts/coverage.xml"
+          fi
           if [ -f "$COV_FILE" ]; then
             python scripts/update-coverage-baselines.py \
               --package packages/scraper-framework \
@@ -817,7 +931,7 @@ jobs:
   # Always runs. Reports success only when every applicable job passed or was
   # skipped (path filter did not match). Branch protection requires this check.
   ci-passed:
-    needs: [scraper-unit-tests, ingestion-tests, nlp-tests, api-tests, web-tests, telegram-bridge-tests, infra-validate, lambda-tests, scripts-tests, coverage-check, deprecated-models-check, hardcoded-models-check, oneshot-imports-check, duplicate-functions-check, schema-drift-check, dq-baselines-validate, ecs-oneshot-test, migration-files-check]
+    needs: [scraper-framework-tests, scraper-court-tests, ingestion-tests, nlp-tests, api-tests, web-tests, telegram-bridge-tests, infra-validate, lambda-tests, scripts-tests, coverage-check, deprecated-models-check, hardcoded-models-check, oneshot-imports-check, duplicate-functions-check, schema-drift-check, dq-baselines-validate, ecs-oneshot-test, migration-files-check]
     if: always()
     runs-on: ubuntu-latest
     steps:
