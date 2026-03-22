@@ -1,5 +1,5 @@
 ---
-description: Periodic codebase health audit — reviews recent PRs, checks for dead code, test gaps, performance issues, security concerns, and dependency health. Files issues for findings. Triggered by the dispatcher every 20 merged PRs.
+description: Periodic codebase health audit — reviews recent PRs, checks for dead code, test gaps, performance issues, security concerns, dependency health, and CI pipeline health. Files issues for findings. Triggered by the dispatcher every 20 merged PRs.
 argument-hint: ""
 maxTurns: 200
 ---
@@ -129,6 +129,49 @@ Review dependency freshness and hygiene:
 3. **Unused dev dependencies** — dev-only packages that are never imported in test files.
 4. **Version conflicts** — different packages pinning incompatible versions of the same dependency.
 
+### 1.8 — CI health
+
+Monitor CI pipeline performance to detect slow jobs before they bottleneck agent throughput. Every `/task` agent blocks on `gh run watch` during the PR cycle, so slow CI directly impacts overall velocity.
+
+#### Data collection
+
+1. Fetch the last 10 successful CI runs on `main`:
+
+```
+gh run list --repo judgemind/judgemind --branch main \
+    --status success --workflow ci.yml --limit 10 \
+    --json databaseId,createdAt,updatedAt
+```
+
+2. For each run, fetch job-level timing:
+
+```
+gh run view <id> --repo judgemind/judgemind --json jobs
+```
+
+3. For each job, compute:
+   - **Job duration** — `completedAt - startedAt` for each job.
+   - **Total wall clock** — time from the earliest job `startedAt` to the `ci-passed` job `completedAt` (or the latest `completedAt` if no `ci-passed` job exists).
+
+#### Threshold checks
+
+Flag a finding if any of the following are true:
+
+- **Single job exceeds 10 minutes.** Any individual job taking longer than 10 minutes is a threshold violation.
+- **Total wall clock exceeds 15 minutes.** The end-to-end CI time from first job start to final completion exceeds 15 minutes.
+- **Upward trend detected.** Split the 10 runs into two groups: the 5 most recent vs. the 5 before that. If the mean duration for any job increased by more than 20% between groups, flag it as a trend regression.
+
+#### Filing issues
+
+For each threshold violation or trend regression, file a `priority/p1` `type/dx` issue with:
+
+- Which job(s) are slow and their current duration (mean and max over the sampled runs).
+- Historical comparison — what the duration was in the older group vs. the recent group.
+- The specific run IDs and timestamps so the issue is traceable.
+- Suggested investigation steps: check for new heavy test files, fixture bloat, missing parallelism, runner size, or unnecessary sequential steps.
+
+**Deduplication:** Before filing, check for existing open issues related to CI performance (e.g., #1243 tracks CI runner size / test splitting). If an existing issue covers the same job or concern, note it as "skipped — duplicate of #N" rather than filing a new one. Only file a new issue if the finding is distinct from existing tracked work.
+
 ---
 
 ## Step 2 — Deduplicate findings
@@ -227,6 +270,9 @@ Write a comprehensive summary to `{worktree}/tmp/audit/report.md`:
 [List findings or "No issues found"]
 
 ### 7. Dependency Health
+[List findings or "No issues found"]
+
+### 8. CI Health
 [List findings or "No issues found"]
 
 ## Issues Filed
