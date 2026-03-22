@@ -233,7 +233,93 @@ cd <repo_root>
 
 Do not bother checking `pwd` first — cwd drift is a known quirk of `isolation: "worktree"`, so just unconditionally `cd` back. The `cd` is a no-op if the cwd is already correct, and it is essential if the cwd has drifted. All subsequent git commands should use `git -C <repo_root>` regardless, as a defense-in-depth measure against cwd drift.
 
-**Step 3 — Clean up the agent's worktree (if needed):**
+**Step 3 — Post context comment for failed/incomplete agents:**
+
+When an agent fails or exits without completing its task, implementation context is lost. The next agent picking up the same issue starts from scratch with no knowledge of what the previous agent tried. This step preserves that context by posting a structured comment on the issue.
+
+**When to run this step:** Only for agent failures or incomplete completions. Skip for successful completions where the PR was merged and verification passed. To determine if the agent left work unfinished:
+
+1. Check whether the issue was closed (a merged PR with `Closes #N` would have closed it).
+2. Check the agent's status file at `tmp/agent-status/<agent-id>.txt` — the `phase` field indicates where the agent stopped.
+3. Check if the agent's worktree still exists at `.claude/worktrees/<agent-id>/` — a remaining worktree with uncommitted changes is a strong signal of incomplete work.
+
+If the issue is still open and the agent did not complete successfully, proceed with context extraction.
+
+**Context extraction — check these artifacts in order:**
+
+The dispatcher reads available artifacts from the agent's worktree and status file to build a context summary. Not all artifacts will exist — extract what is available.
+
+1. **Status file** (`tmp/agent-status/<agent-id>.txt`): Read the `phase` and `summary` fields to determine where the agent stopped and what it was doing.
+
+2. **Ralph review result** (`{worktree}/tmp/ralph/review-result.txt`): If this file exists, read it to determine whether the implementation passed review. A `SHIP` verdict means the approach was validated.
+
+3. **Ralph done marker** (`{worktree}/tmp/ralph/ralph-done.txt`): If this file exists, ralph completed — the implementation is likely sound even if the agent died before committing.
+
+4. **Process summary** (`{worktree}/tmp/process_summary.txt`): If this file exists, the agent already mapped acceptance criteria to implementation. Include relevant parts.
+
+5. **Changed files** (`git -C {worktree} diff --name-only` and `git -C {worktree} diff --cached --name-only`): List the files the agent modified to give the next agent a head start on understanding the approach.
+
+6. **Git diff summary** (`git -C {worktree} diff --stat`): A concise summary of the scope of changes (files changed, insertions, deletions).
+
+7. **Task notification summary**: The `<summary>` text from the `<task-notification>` itself often contains useful context about what the agent accomplished or why it failed.
+
+**Compose and post the context comment:**
+
+Write the comment to `tmp/failed_agent_context_<issue>.txt` using this format:
+
+```
+## Prior Agent Context (auto-generated)
+
+A previous agent attempted this issue and made progress before exiting.
+
+**Agent:** <agent-id>
+**Phase when stopped:** <phase from status file, or "unknown">
+**Failure mode:** <premature end_turn / context exhaustion / crash / unknown>
+
+**What was done:**
+<Summary extracted from status file, process summary, or task notification. If ralph completed, note that the implementation approach passed review.>
+
+**Review status:** <SHIP / iterating (iteration N) / not started>
+
+**Files changed:**
+<List of files from git diff --name-only, or "no changes detected">
+
+**Guidance for next agent:** <Based on what was accomplished:>
+- If ralph passed (SHIP): "The implementation approach above passed review. Reimplement it (do not try to adopt the old worktree) and continue from the step where the previous agent stopped."
+- If ralph was iterating: "The implementation was in progress. Review the approach described above and continue iterating."
+- If no implementation started: "No implementation progress was made. Start fresh."
+```
+
+Post the comment:
+```
+gh issue comment <N> --repo judgemind/judgemind --body-file tmp/failed_agent_context_<issue>.txt
+```
+
+**Determining the failure mode:**
+
+- **Premature end_turn:** The task notification summary mentions the agent completing normally, but the issue is still open and no PR exists. The agent likely emitted text instead of a tool call.
+- **Context exhaustion:** The task notification mentions context window limits or compaction.
+- **Crash:** The task notification mentions an error or exception.
+- **Unknown:** None of the above signals are present. Use "unknown" and include whatever information is available.
+
+**Fallback for unparseable or missing context:**
+
+If the worktree does not exist (already cleaned up) and the status file is missing or empty, post a minimal comment:
+
+```
+## Prior Agent Context (auto-generated)
+
+A previous agent (<agent-id>) attempted this issue but exited before completing.
+
+**Phase when stopped:** unknown
+**Failure mode:** <inferred from task notification, or "unknown">
+
+No implementation artifacts were recoverable. The next agent should start fresh.
+```
+
+This minimal comment still provides value by alerting the next agent that a prior attempt was made, preventing it from being surprised by any partial state (stale branches, open PRs, etc.).
+
+**Step 4 — Clean up the agent's worktree (if needed):**
 
 When agents are spawned with `isolation: "worktree"`, Claude Code automatically cleans up worktrees with no uncommitted changes when the agent exits. However, worktrees with uncommitted changes (e.g., from a failed agent) may remain.
 
