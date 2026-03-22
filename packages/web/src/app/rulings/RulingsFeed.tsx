@@ -2,6 +2,7 @@
 
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { useQuery, gql } from '@apollo/client';
+import { useRouter, useSearchParams } from 'next/navigation';
 import Link from 'next/link';
 import {
   formatDate,
@@ -112,10 +113,32 @@ function SkeletonCard() {
 }
 
 export function RulingsFeed() {
-  const [county, setCounty] = useState('');
-  const [dateFrom, setDateFrom] = useState('');
-  const [dateTo, setDateTo] = useState('');
+  const router = useRouter();
+  const searchParams = useSearchParams();
+
+  const [county, setCounty] = useState(searchParams.get('county') ?? '');
+  const [dateFrom, setDateFrom] = useState(searchParams.get('dateFrom') ?? '');
+  const [dateTo, setDateTo] = useState(searchParams.get('dateTo') ?? '');
   const countyOptions = useCountyOptions();
+
+  useEffect(() => {
+    setCounty(searchParams.get('county') ?? '');
+    setDateFrom(searchParams.get('dateFrom') ?? '');
+    setDateTo(searchParams.get('dateTo') ?? '');
+  }, [searchParams]);
+
+  const updateUrl = useCallback(() => {
+    const params = new URLSearchParams();
+    if (county) params.set('county', county);
+    if (dateFrom) params.set('dateFrom', dateFrom);
+    if (dateTo) params.set('dateTo', dateTo);
+    const search = params.toString();
+    router.replace(search ? `/rulings?${search}` : '/rulings');
+  }, [county, dateFrom, dateTo, router]);
+
+  useEffect(() => {
+    updateUrl();
+  }, [updateUrl]);
 
   const { data, loading, error, fetchMore } = useQuery<RulingsData>(RULINGS_QUERY, {
     variables: {

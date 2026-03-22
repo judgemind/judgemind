@@ -8,6 +8,14 @@ vi.mock('@apollo/client', () => ({
   gql: (strings: TemplateStringsArray) => strings.join(''),
 }));
 
+const mockReplace = vi.fn();
+let mockSearchParamsValue = new URLSearchParams();
+
+vi.mock('next/navigation', () => ({
+  useRouter: () => ({ push: vi.fn(), replace: mockReplace, back: vi.fn() }),
+  useSearchParams: () => mockSearchParamsValue,
+}));
+
 vi.mock('next/link', () => ({
   default: ({
     children,
@@ -73,6 +81,7 @@ const MOCK_JUDGES_DATA = {
 describe('JudgesList', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mockSearchParamsValue = new URLSearchParams();
   });
 
   it('renders skeleton rows while loading', () => {
@@ -266,5 +275,48 @@ describe('JudgesList', () => {
     expect(screen.getByText('County')).toBeInTheDocument();
     expect(screen.getByText('Dept.')).toBeInTheDocument();
     expect(screen.getByText('Status')).toBeInTheDocument();
+  });
+
+  it('updates URL params when name filter changes', () => {
+    mockUseQuery.mockReturnValue({
+      data: MOCK_JUDGES_DATA,
+      loading: false,
+      error: undefined,
+      fetchMore: vi.fn(),
+    });
+
+    render(<JudgesList />);
+    const input = screen.getByLabelText(/Judge name/i);
+    fireEvent.change(input, { target: { value: 'Smith' } });
+    expect(mockReplace).toHaveBeenCalledWith(expect.stringContaining('name=Smith'));
+  });
+
+  it('initializes name filter from URL params', () => {
+    mockSearchParamsValue = new URLSearchParams('name=Johnson');
+    mockUseQuery.mockReturnValue({
+      data: MOCK_JUDGES_DATA,
+      loading: false,
+      error: undefined,
+      fetchMore: vi.fn(),
+    });
+
+    render(<JudgesList />);
+    expect((screen.getByLabelText(/Judge name/i) as HTMLInputElement).value).toBe('Johnson');
+    // Should filter to only Johnson
+    expect(screen.getByText('Johnson, Robert M.')).toBeInTheDocument();
+    expect(screen.queryByText('Smith, John A.')).not.toBeInTheDocument();
+  });
+
+  it('clears URL params when name filter is cleared', () => {
+    mockUseQuery.mockReturnValue({
+      data: MOCK_JUDGES_DATA,
+      loading: false,
+      error: undefined,
+      fetchMore: vi.fn(),
+    });
+
+    render(<JudgesList />);
+    // Initially no name param
+    expect(mockReplace).toHaveBeenCalledWith('/judges');
   });
 });

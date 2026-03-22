@@ -17,6 +17,11 @@ let intersectionCallback: IntersectionObserverCallback;
 let mockObserve: ReturnType<typeof vi.fn>;
 let mockDisconnect: ReturnType<typeof vi.fn>;
 
+vi.mock('next/navigation', () => ({
+  useRouter: () => ({ push: vi.fn(), replace: vi.fn(), back: vi.fn() }),
+  useSearchParams: () => new URLSearchParams(),
+}));
+
 vi.mock('next/link', () => ({
   default: ({
     children,

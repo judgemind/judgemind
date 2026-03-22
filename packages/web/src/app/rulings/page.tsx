@@ -1,3 +1,4 @@
+import { Suspense } from 'react';
 import { RulingsFeed } from './RulingsFeed';
 
 export default function RulingsPage() {
@@ -8,7 +9,9 @@ export default function RulingsPage() {
         Tentative rulings captured today across California courts.
       </p>
       <div className="mt-6">
-        <RulingsFeed />
+        <Suspense>
+          <RulingsFeed />
+        </Suspense>
       </div>
     </div>
   );
