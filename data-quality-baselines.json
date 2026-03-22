@@ -13,12 +13,14 @@
     "Santa Clara": {
       "expected_daily_rulings": 0.1,
       "schedule_type": "daily",
-      "posting_days": ["Mon", "Tue", "Wed", "Thu"]
+      "posting_days": ["Mon", "Tue", "Wed", "Thu"],
+      "low_volume": true
     },
     "San Francisco": {
       "expected_daily_rulings": 0.5,
       "schedule_type": "daily",
-      "posting_days": ["Tue", "Thu"]
+      "posting_days": ["Tue", "Thu"],
+      "low_volume": true
     },
     "Riverside": {
       "expected_daily_rulings": 15,

@@ -110,6 +110,7 @@ class Baselines:
     schedule_type: str  # daily, frequent
     posting_days: list[str] | None = None  # e.g. ["Mon", "Tue", "Wed", "Thu"]
     max_expected_gap_hours: float | None = None  # explicit override
+    low_volume: bool = False  # Suppress field_completeness_low_sample alerts
 
 
 def load_baselines(
@@ -143,6 +144,7 @@ def load_baselines(
             schedule_type=config.get("schedule_type", "daily"),
             posting_days=config.get("posting_days"),
             max_expected_gap_hours=config.get("max_expected_gap_hours"),
+            low_volume=config.get("low_volume", False),
         )
     return result
 
@@ -443,18 +445,25 @@ def check_field_completeness(
     now: datetime,
     field_baselines: dict[str, dict[str, float]],
     county: str | None = None,
+    baselines: dict[str, Baselines] | None = None,
 ) -> list[Alert]:
     """Check field completeness against baselines and flag regressions.
 
     Counties with fewer than ``MIN_FIELD_CHECK_SAMPLE_SIZE`` documents in the
     window are skipped to avoid noisy alerts from tiny sample sizes. A P2
-    informational alert is emitted instead so the county is not silently ignored.
+    informational alert is emitted instead so the county is not silently
+    ignored — unless the county is marked ``low_volume`` in the baselines,
+    in which case the alert is suppressed (logged at DEBUG) since the low
+    sample size is expected and permanent.
 
     Args:
         conn: Database connection.
         now: Current timestamp for time calculations.
         field_baselines: Per-county, per-field baseline percentages.
         county: Optional county filter.
+        baselines: Per-county baseline configurations (used to check the
+            ``low_volume`` flag). If *None*, all counties emit the
+            informational alert (backward-compatible default).
 
     Returns:
         List of alerts for field completeness regressions.
@@ -463,31 +472,45 @@ def check_field_completeness(
     current, totals = _query_field_completeness(conn, now, county)
 
     for county_name, fields in current.items():
-        county_baselines = field_baselines.get(county_name, {})
-        if not county_baselines:
+        county_field_baselines = field_baselines.get(county_name, {})
+        if not county_field_baselines:
             continue
 
         total_docs = totals.get(county_name, 0)
         if total_docs < MIN_FIELD_CHECK_SAMPLE_SIZE:
-            alerts.append(
-                Alert(
-                    county=county_name,
-                    metric="field_completeness_low_sample",
-                    severity="p2",
-                    expected=MIN_FIELD_CHECK_SAMPLE_SIZE,
-                    actual=total_docs,
-                    message=(
-                        f"{county_name}: only {total_docs} document(s) in "
-                        f"{FIELD_COMPLETENESS_WINDOW_DAYS}-day window, skipping "
-                        f"field completeness check "
-                        f"(minimum sample size: {MIN_FIELD_CHECK_SAMPLE_SIZE})"
-                    ),
+            # Check if this county is marked as low_volume — if so, suppress
+            # the informational alert since low sample size is expected.
+            county_config = baselines.get(county_name) if baselines else None
+            if county_config and county_config.low_volume:
+                logger.debug(
+                    "%s: only %d document(s) in %d-day window, skipping "
+                    "field completeness check (low_volume county, "
+                    "minimum sample size: %d)",
+                    county_name,
+                    total_docs,
+                    FIELD_COMPLETENESS_WINDOW_DAYS,
+                    MIN_FIELD_CHECK_SAMPLE_SIZE,
                 )
-            )
+            else:
+                alerts.append(
+                    Alert(
+                        county=county_name,
+                        metric="field_completeness_low_sample",
+                        severity="p2",
+                        expected=MIN_FIELD_CHECK_SAMPLE_SIZE,
+                        actual=total_docs,
+                        message=(
+                            f"{county_name}: only {total_docs} document(s) in "
+                            f"{FIELD_COMPLETENESS_WINDOW_DAYS}-day window, skipping "
+                            f"field completeness check "
+                            f"(minimum sample size: {MIN_FIELD_CHECK_SAMPLE_SIZE})"
+                        ),
+                    )
+                )
             continue
 
         for field, current_pct in fields.items():
-            baseline_pct = county_baselines.get(field, 0.0)
+            baseline_pct = county_field_baselines.get(field, 0.0)
 
             # Ignore fields with 0% baseline (county genuinely lacks the field).
             if baseline_pct == 0.0:
@@ -1269,7 +1292,9 @@ def run_checks(
             current, _totals = _query_field_completeness(conn, now, county)
             save_field_baselines(current, baselines_path)
         else:
-            alerts.extend(check_field_completeness(conn, now, field_baselines, county))
+            alerts.extend(
+                check_field_completeness(conn, now, field_baselines, county, baselines)
+            )
 
         alerts.extend(check_orphaned_documents(conn, now, county))
 
@@ -1320,7 +1345,9 @@ def run_checks_full(
             current, _totals = _query_field_completeness(conn, now, county)
             save_field_baselines(current, baselines_path)
         else:
-            alerts.extend(check_field_completeness(conn, now, field_baselines, county))
+            alerts.extend(
+                check_field_completeness(conn, now, field_baselines, county, baselines)
+            )
 
         alerts.extend(check_orphaned_documents(conn, now, county))
 
