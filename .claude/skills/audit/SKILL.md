@@ -225,11 +225,7 @@ scripts/run-py.sh scripts/tg-notify.py notify "Audit complete: N findings, M iss
 
 ## Step 6 — Clean up
 
-Remove the worktree:
-
-```
-scripts/end-worker.sh {worktree}
-```
+Worktree cleanup is handled automatically by Claude Code when the agent exits (if spawned with `isolation: "worktree"`). For manual worktrees, run `scripts/end-worker.sh {worktree}`.
 
 ---
 

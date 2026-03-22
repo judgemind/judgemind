@@ -22,7 +22,7 @@ Do not ask for confirmation. Work autonomously through every step.
 
 ### Status file
 
-The `/task` skill sets up a status file at `{repo_root}/tmp/agent-status/worker-N.txt`. The `/ralph` skill writes status updates to this file at each worker/reviewer phase transition using the Write tool. The format is defined in `/task` Step 0. Derive the status file path from the worktree path (e.g. `worktrees/worker-2` -> `{repo_root}/tmp/agent-status/worker-2.txt`).
+The `/task` skill sets up a status file at `{repo_root}/tmp/agent-status/{agent-id}.txt`. The `/ralph` skill writes status updates to this file at each worker/reviewer phase transition using the Write tool. The format is defined in `/task` Step 0. Derive the status file path from the worktree path (e.g. `.claude/worktrees/agent-ab4722a2` -> `{repo_root}/tmp/agent-status/agent-ab4722a2.txt`, or `worktrees/worker-2` -> `{repo_root}/tmp/agent-status/worker-2.txt`).
 
 ---
 

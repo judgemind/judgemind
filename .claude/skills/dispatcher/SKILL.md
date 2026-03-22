@@ -141,10 +141,10 @@ The dispatcher runs a continuous loop:
 **Resource exhaustion warning:** Each subagent runs a full Claude Code process with its own worktree, venv installs, git operations, and test runs. On a dev laptop, 5 concurrent agents is already heavy. Exceeding the ceiling risks OOM kills, system freezes, or session-ending crashes. The ceiling exists to protect the host machine — respect it unconditionally.
 
 - Default max slots: **5** (overridable via argument)
-- Track active agents by worker number and issue number
+- Track active agents by agent ID and issue number
 - When an agent completes, its slot opens immediately
-- **HARD RULE: Never exceed `max_slots` total concurrent agents.** The `start-worker.sh` script enforces this via `--max-workers`, but the dispatcher must ALSO check before spawning.
-- Launch `/task` agents **without** `isolation: "worktree"` — the skill manages its own worktree
+- **HARD RULE: Never exceed `max_slots` total concurrent agents.** The dispatcher's own slot count check is the primary enforcement mechanism.
+- Launch `/task` agents **with** `isolation: "worktree"` — Claude Code creates a unique worktree at `.claude/worktrees/agent-<id>/` automatically, eliminating worker number contention and race conditions
 
 ### Spawning agents — MANDATORY SLOT COUNT CHECK
 
@@ -156,15 +156,14 @@ The dispatcher runs a continuous loop:
 
 **This check must happen at the start of every dispatch cycle, not just once per session.** The running count changes as agents complete or fail between cycles. Always use the live count, never a cached value.
 
-**Additionally**, `scripts/start-worker.sh` provides a hard backstop via `--max-workers`. The `/task` skill accepts `--max-workers` and passes it through to `start-worker.sh`. If the worktree count already meets the limit, the script will exit non-zero and the agent will fail to start. This is a safety net — the dispatcher's own count check (step 2 above) should prevent this from ever being reached.
-
-For each open slot, pick the next highest-priority unassigned `agent/ready` issue and spawn:
+For each open slot, pick the next highest-priority unassigned `agent/ready` issue and spawn a `/task` agent using the Agent tool with `isolation: "worktree"`:
 
 ```
-/task #N --max-workers <max_slots>
+Agent tool with:
+  isolation: "worktree"
+  prompt: "/task #N"
+  description: "Task #N: <truncated title>"
 ```
-
-**Always pass `--max-workers <max_slots>`** when spawning `/task` agents. This enables the hard backstop in `start-worker.sh`.
 
 **Agent description format:** When spawning a `/task` subagent via the Agent tool, set the `description` parameter to include a truncated issue title so that task notifications are self-descriptive. Format: `"Task #<N>: <truncated title>"` (3-5 words from the title). Examples:
 
@@ -188,7 +187,7 @@ as a background subagent. Before spawning each agent:
 **After spawning each agent**, send a `task_started` notification and update the status file:
 
 ```
-scripts/run-py.sh scripts/tg-notify.py task_started <issue_number> "<title>" <worker_number>
+scripts/run-py.sh scripts/tg-notify.py task_started <issue_number> "<title>" <agent_id>
 ```
 
 This sends the Telegram message **and** updates `tmp/dispatcher_status.json` so the responder daemon has accurate context.
@@ -220,19 +219,17 @@ scripts/run-py.sh scripts/tg-notify.py task_failed <issue_number> "<error_summar
 
 Both commands update the status file automatically. Always send a notification immediately when an agent completes or fails — do not batch them.
 
-**Step 2 — Clean up the agent's worktree:**
+**Step 2 — Clean up the agent's worktree (if needed):**
 
-After sending the notification, immediately clean up the completed agent's worktree to free the slot for the next agent. Agents are supposed to clean up their own worktrees (step 4.11 in the `/task` skill), but they sometimes exit before reaching that step (context exhaustion, killed, errors). The dispatcher acts as a safety net.
+When agents are spawned with `isolation: "worktree"`, Claude Code automatically cleans up worktrees with no uncommitted changes when the agent exits. However, worktrees with uncommitted changes (e.g., from a failed agent) may remain.
 
-1. Derive the worktree path from the worker number: `{repo_root}/worktrees/worker-<N>`.
-2. Check if the worktree directory still exists. If it does not, the agent already cleaned up — skip to the next step.
-3. If it exists, remove it:
+1. Check if the agent's worktree still exists. Claude Code worktrees live at `.claude/worktrees/agent-<id>/`. The agent ID can be derived from the task notification or tracked when spawning.
+2. If the worktree does not exist, the agent (or Claude Code) already cleaned up — skip to the next step.
+3. If it exists and has uncommitted changes, force-remove it:
    ```
-   scripts/end-worker.sh {repo_root}/worktrees/worker-<N> --force
+   git worktree remove --force .claude/worktrees/agent-<id>
    ```
-4. If `end-worker.sh` fails (e.g. directory already partially removed), log the error but do not block the dispatch loop. The next `start-worker.sh` invocation will prune stale worktrees automatically.
-
-**This cleanup is critical for slot availability.** Without it, completed agents leave worktrees behind, and `start-worker.sh --max-workers` refuses to create new ones because it counts existing worktree directories. This was the root cause of repeated "max workers reached" failures in production (#1242).
+4. If removal fails, log the error but do not block the dispatch loop. Stale worktrees do not affect slot counting (slots are tracked by the dispatcher's own agent list, not by worktree directory count).
 
 ---
 
