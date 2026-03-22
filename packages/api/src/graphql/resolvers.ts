@@ -50,6 +50,27 @@ export const resolvers = {
     health: () => 'ok',
 
     // -----------------------------------------------------------------------
+    // platformStats — aggregate counts for the home page
+    // -----------------------------------------------------------------------
+
+    platformStats: async (_: unknown, __: unknown, { pool }: Context) => {
+      const [countiesResult, rulingsResult, judgesResult] = await Promise.all([
+        pool.query<{ count: string }>(
+          `SELECT COUNT(DISTINCT county) AS count FROM courts WHERE is_active = true`,
+        ),
+        pool.query<{ count: string }>(`SELECT COUNT(*) AS count FROM rulings`),
+        pool.query<{ count: string }>(
+          `SELECT COUNT(*) AS count FROM judges WHERE is_active = true`,
+        ),
+      ]);
+      return {
+        countiesCount: parseInt(countiesResult.rows[0].count, 10),
+        rulingsCount: parseInt(rulingsResult.rows[0].count, 10),
+        judgesCount: parseInt(judgesResult.rows[0].count, 10),
+      };
+    },
+
+    // -----------------------------------------------------------------------
     // distinctCounties / distinctJudgeNames — lightweight autocomplete lists
     // -----------------------------------------------------------------------
 

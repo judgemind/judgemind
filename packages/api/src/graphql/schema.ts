@@ -302,12 +302,25 @@ export const typeDefs = `#graphql
     pageInfo: PageInfo!
   }
 
+  """Aggregate platform-level statistics for the home page."""
+  type PlatformStats {
+    """Number of active counties with courts."""
+    countiesCount: Int!
+    """Total number of rulings captured."""
+    rulingsCount: Int!
+    """Number of active judges tracked."""
+    judgesCount: Int!
+  }
+
   # ---------------------------------------------------------------------------
   # Queries
   # ---------------------------------------------------------------------------
 
   type Query {
     health: String!
+
+    """Aggregate platform statistics (counties, rulings, judges). Lightweight, cacheable."""
+    platformStats: PlatformStats!
 
     """Distinct county names from all active courts, sorted alphabetically. Used for autocomplete."""
     distinctCounties: [String!]!
