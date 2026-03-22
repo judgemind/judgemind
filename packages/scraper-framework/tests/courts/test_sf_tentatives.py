@@ -30,7 +30,7 @@ from courts.ca.sf_tentatives import default_config as sf_default_config
 
 pytestmark = pytest.mark.regression
 
-FIXTURES = Path(__file__).parent / "fixtures"
+FIXTURES = Path(__file__).parent.parent / "fixtures"
 
 
 def _load_html(name: str) -> str:

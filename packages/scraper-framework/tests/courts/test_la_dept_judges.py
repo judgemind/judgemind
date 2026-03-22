@@ -31,7 +31,7 @@ from framework.models import CapturedDocument
 
 pytestmark = pytest.mark.regression
 
-FIXTURES = Path(__file__).parent / "fixtures"
+FIXTURES = Path(__file__).parent.parent / "fixtures"
 
 
 def _load(name: str) -> str:

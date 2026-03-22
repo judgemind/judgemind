@@ -29,7 +29,7 @@ from courts.ca.ventura_tentatives import default_config as ventura_default_confi
 
 pytestmark = pytest.mark.regression
 
-FIXTURES = Path(__file__).parent / "fixtures"
+FIXTURES = Path(__file__).parent.parent / "fixtures"
 
 
 def _load_html(name: str) -> str:

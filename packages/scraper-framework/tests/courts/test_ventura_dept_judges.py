@@ -29,7 +29,7 @@ from courts.ca.ventura_dept_judges import (
 
 pytestmark = pytest.mark.regression
 
-FIXTURES = Path(__file__).parent / "fixtures"
+FIXTURES = Path(__file__).parent.parent / "fixtures"
 
 
 def _load(name: str) -> str:

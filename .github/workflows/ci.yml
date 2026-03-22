@@ -53,7 +53,8 @@ jobs:
               - 'packages/judgemind-config/**'
             scraper-courts:
               - 'packages/scraper-framework/src/courts/**'
-              - 'packages/scraper-framework/tests/**'
+              - 'packages/scraper-framework/tests/courts/**'
+              - 'packages/scraper-framework/tests/conftest.py'
               - 'packages/scraper-framework/pyproject.toml'
               - 'packages/judgemind-config/**'
             nlp:
@@ -133,29 +134,11 @@ jobs:
       - name: Test
         run: >-
           .venv/bin/pytest tests/ -n auto -v --tb=short
+          --ignore=tests/courts/
           --ignore=tests/test_reingest_from_s3.py
           --ignore=tests/test_reingest_registry.py
           --ignore=tests/test_ingestion.py
           --ignore=tests/test_extract.py
-          --ignore=tests/test_cc_tentatives.py
-          --ignore=tests/test_fresno_tentatives.py
-          --ignore=tests/test_la_tentatives.py
-          --ignore=tests/test_la_dept_judges.py
-          --ignore=tests/test_oc_tentatives.py
-          --ignore=tests/test_oc_family_law_tentatives.py
-          --ignore=tests/test_oc_probate_tentatives.py
-          --ignore=tests/test_pdf_link_scraper.py
-          --ignore=tests/test_riverside_tentatives.py
-          --ignore=tests/test_riverside_dept_judges.py
-          --ignore=tests/test_sb_tentatives.py
-          --ignore=tests/test_sc_tentatives.py
-          --ignore=tests/test_sd_tentatives.py
-          --ignore=tests/test_sd_calendar.py
-          --ignore=tests/test_sd_pipeline.py
-          --ignore=tests/test_sf_tentatives.py
-          --ignore=tests/test_ventura_tentatives.py
-          --ignore=tests/test_ventura_dept_judges.py
-          --ignore=tests/test_courtlistener.py
       - name: Upload coverage
         if: always()
         uses: actions/upload-artifact@v7
@@ -208,28 +191,7 @@ jobs:
       - name: Format check
         run: .venv/bin/ruff format --check src/ tests/
       - name: Test
-        run: >-
-          .venv/bin/pytest
-          tests/test_cc_tentatives.py
-          tests/test_fresno_tentatives.py
-          tests/test_la_tentatives.py
-          tests/test_la_dept_judges.py
-          tests/test_oc_tentatives.py
-          tests/test_oc_family_law_tentatives.py
-          tests/test_oc_probate_tentatives.py
-          tests/test_pdf_link_scraper.py
-          tests/test_riverside_tentatives.py
-          tests/test_riverside_dept_judges.py
-          tests/test_sb_tentatives.py
-          tests/test_sc_tentatives.py
-          tests/test_sd_tentatives.py
-          tests/test_sd_calendar.py
-          tests/test_sd_pipeline.py
-          tests/test_sf_tentatives.py
-          tests/test_ventura_tentatives.py
-          tests/test_ventura_dept_judges.py
-          tests/test_courtlistener.py
-          -n auto -v --tb=short
+        run: .venv/bin/pytest tests/courts/ -n auto -v --tb=short
       - name: Upload coverage
         if: always()
         uses: actions/upload-artifact@v7
