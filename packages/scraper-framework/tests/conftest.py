@@ -224,3 +224,47 @@ def _fast_retry_sleeps() -> Generator[None, None, None]:
     """
     with patch("framework.retry.time.sleep"):
         yield
+
+
+@pytest.fixture(autouse=True)
+def _mock_enrichment_engine() -> Generator[None, None, None]:
+    """Auto-mock ``EnrichmentEngine`` in the ingestion worker for all tests.
+
+    The enrichment engine performs DB queries via the psycopg connection.
+    Existing tests mock psycopg with carefully ordered ``fetchone`` side
+    effects that don't account for enrichment queries.  This fixture
+    patches the ``EnrichmentEngine`` class in the worker module so that
+    ``enrich()`` returns a no-op result (exact case match, no judge
+    changes, no flags) — preserving all existing test behaviour.
+
+    Tests that specifically test enrichment wiring (``test_enrichment_wiring.py``)
+    apply their own patch which takes precedence over this autouse fixture.
+    """
+    from framework.enrichment import CaseMatch, EnrichmentResult, JudgeResolution
+
+    def _noop_enrich(**kwargs: object) -> EnrichmentResult:
+        case_number = kwargs.get("case_number", "")
+        return EnrichmentResult(
+            case_match=CaseMatch(
+                case_id="",
+                case_number=str(case_number),
+                match_type="exact",
+                confidence=1.0,
+            ),
+            judge_resolution=JudgeResolution(
+                judge_id=None,
+                canonical_name=None,
+                match_type="new",
+                confidence=0.0,
+            ),
+            party_resolutions=[],
+            flags=[],
+        )
+
+    from unittest.mock import MagicMock
+
+    mock_engine = MagicMock()
+    mock_engine.enrich.side_effect = _noop_enrich
+
+    with patch("ingestion.worker.EnrichmentEngine", return_value=mock_engine):
+        yield

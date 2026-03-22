@@ -38,6 +38,7 @@ from courts.ca.la_dept_judges import (
     fetch_department_judge_mapping,
     lookup_judge_for_department,
 )
+from framework.enrichment import EnrichmentEngine
 from framework.llm_extractor import LlmExtractor
 from framework.search.indexer import IndexingConsumer
 from framework.search.mapping import TENTATIVE_RULINGS_ALIAS
@@ -876,6 +877,91 @@ class IngestionWorker:
         try:
             # 1. Ensure court exists
             court_id = upsert_court(conn, state, county, court_name)
+
+            # 1b. Enrichment — resolve extracted fields against DB data (#1576).
+            # Skip enrichment when case_number is empty/synthetic or hearing_date
+            # is missing, as there is insufficient data for meaningful matching.
+            _skip_enrichment = (
+                not case_number or case_number.startswith("UNKNOWN-") or hearing_dt is None
+            )
+            if not _skip_enrichment:
+                enrichment_engine = EnrichmentEngine(conn)
+                party_names = [p.get("name") for p in parties_data if p.get("name")]
+                enrich_result = enrichment_engine.enrich(
+                    case_number=case_number,
+                    court_id=court_id,
+                    judge_name=judge_name,
+                    department=department,
+                    hearing_date=hearing_dt,
+                    parties=party_names,
+                )
+
+                # Apply case number correction from fuzzy match.
+                if (
+                    enrich_result.case_match is not None
+                    and enrich_result.case_match.match_type == "fuzzy"
+                ):
+                    original_case_number = case_number
+                    case_number = enrich_result.case_match.case_number
+                    logger.info(
+                        "Enrichment corrected case_number via fuzzy match",
+                        extra={
+                            "document_id": document_id,
+                            "original_case_number": original_case_number,
+                            "corrected_case_number": case_number,
+                            "confidence": enrich_result.case_match.confidence,
+                            "levenshtein_distance": enrich_result.case_match.levenshtein_distance,
+                            "party_overlap": enrich_result.case_match.party_overlap,
+                        },
+                    )
+
+                # Capture original judge name before any enrichment updates so
+                # that all log messages consistently reference the scraper's
+                # original extracted value, not a post-enrichment canonical name.
+                _original_judge_name = judge_name
+
+                # Apply judge name resolution from alias match.
+                if (
+                    enrich_result.judge_resolution is not None
+                    and enrich_result.judge_resolution.match_type == "alias"
+                    and enrich_result.judge_resolution.canonical_name
+                ):
+                    judge_name = enrich_result.judge_resolution.canonical_name
+                    if _original_judge_name != judge_name:
+                        logger.info(
+                            "Enrichment resolved judge via alias",
+                            extra={
+                                "document_id": document_id,
+                                "original_judge_name": _original_judge_name,
+                                "canonical_name": judge_name,
+                                "confidence": enrich_result.judge_resolution.confidence,
+                            },
+                        )
+
+                # Log directory mismatches as warnings (do NOT override judge).
+                if (
+                    enrich_result.judge_resolution is not None
+                    and enrich_result.judge_resolution.directory_mismatch
+                ):
+                    logger.warning(
+                        "Enrichment: judge/directory mismatch — flagged for review",
+                        extra={
+                            "document_id": document_id,
+                            "extracted_judge": _original_judge_name,
+                            "directory_judge": enrich_result.judge_resolution.directory_judge,
+                            "department": department,
+                        },
+                    )
+
+                # Log enrichment flags for human review.
+                if enrich_result.flags:
+                    logger.info(
+                        "Enrichment flags for human review",
+                        extra={
+                            "document_id": document_id,
+                            "flags": enrich_result.flags,
+                        },
+                    )
 
             # 2. Ensure case exists — use document_id as synthetic case_number if absent
             effective_case_number = case_number or f"UNKNOWN-{document_id}"
