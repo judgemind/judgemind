@@ -69,16 +69,26 @@ def sanitize_title_lenient(raw_title: str | None) -> str | None:
 def clean_case_title(
     old_title: str,
     ruling_text: str | None,
+    *,
+    max_length: int | None = None,
 ) -> str | None:
     """Determine the best cleaned title for a case.
 
-    Strategy 1: Apply ``sanitize_title()`` directly to the existing title.
+    Strategy 1: Apply ``_sanitize_title()`` directly to the existing title.
     Strategy 2: Re-extract from ruling text using caption/party patterns.
+
+    Args:
+        old_title: The current case title.
+        ruling_text: The ruling text for fallback extraction, or None.
+        max_length: Maximum allowed title length after cleaning.  Defaults to
+            ``_BACKFILL_MAX_TITLE_LENGTH`` (250).
 
     Returns ``None`` if no clean title can be determined.
     """
-    # Strategy 1: sanitize the existing title directly (lenient length for backfill)
-    cleaned = sanitize_title_lenient(old_title)
+    target = max_length if max_length is not None else _BACKFILL_MAX_TITLE_LENGTH
+
+    # Strategy 1: sanitize the existing title directly
+    cleaned = _sanitize_title(old_title, max_length=target)
     if cleaned is not None:
         return cleaned
 
@@ -103,7 +113,15 @@ def main() -> None:
         "--threshold",
         type=int,
         default=150,
-        help="Title length threshold (default: 150)",
+        help="Title length threshold for fetching cases (default: 150)",
+    )
+    parser.add_argument(
+        "--target-length",
+        type=int,
+        default=150,
+        help="Max allowed title length after cleaning (default: 150). "
+        "Titles still exceeding this after descriptor stripping are "
+        "truncated to first party + et al.",
     )
     args = parser.parse_args()
 
@@ -153,7 +171,9 @@ def main() -> None:
                 row = cur.fetchone()
 
             ruling_text = row[0] if row and row[0] else None
-            new_title = clean_case_title(old_title, ruling_text)
+            new_title = clean_case_title(
+                old_title, ruling_text, max_length=args.target_length
+            )
 
             if new_title is None:
                 logger.warning(
