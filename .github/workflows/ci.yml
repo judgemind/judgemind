@@ -960,6 +960,16 @@ jobs:
         run: python3 scripts/check-sql-conflicts.py
 
   # ---------------------------------------------------------------
+  # Shard coverage guard: all court test files listed in shard config
+  # ---------------------------------------------------------------
+  shard-coverage-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Check all court test files are in shard config
+        run: scripts/check-shard-coverage.sh
+
+  # ---------------------------------------------------------------
   # ECS oneshot Docker integration test: run scripts in a container
   # ---------------------------------------------------------------
   ecs-oneshot-test:
@@ -1038,7 +1048,7 @@ jobs:
   # Always runs. Reports success only when every applicable job passed or was
   # skipped (path filter did not match). Branch protection requires this check.
   ci-passed:
-    needs: [scraper-framework-tests, scraper-court-tests, ingestion-tests, nlp-tests, api-tests, web-tests, telegram-bridge-tests, infra-validate, lambda-tests, scripts-tests, coverage-check, deprecated-models-check, hardcoded-models-check, hardcoded-colors-check, oneshot-imports-check, oneshot-repo-paths-check, duplicate-functions-check, schema-drift-check, dq-baselines-validate, ecs-oneshot-test, migration-files-check, sql-conflict-check, playwright-browser-check]
+    needs: [scraper-framework-tests, scraper-court-tests, ingestion-tests, nlp-tests, api-tests, web-tests, telegram-bridge-tests, infra-validate, lambda-tests, scripts-tests, coverage-check, deprecated-models-check, hardcoded-models-check, hardcoded-colors-check, oneshot-imports-check, oneshot-repo-paths-check, duplicate-functions-check, schema-drift-check, dq-baselines-validate, ecs-oneshot-test, migration-files-check, sql-conflict-check, playwright-browser-check, shard-coverage-check]
     if: always()
     runs-on: ubuntu-latest
     steps:
