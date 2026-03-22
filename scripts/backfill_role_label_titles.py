@@ -89,8 +89,12 @@ _ENTITY_DESCRIPTOR_RE = re.compile(
     r"|Individually And As [^,;]+"
     r"|By And Through [^,;]+"
     r"|As Trustee Of [^,;]+"
-    r"|Successor In Interest To [^,;]+"
+    # Hyphenated and non-hyphenated variants of successor/administrator phrases
+    r"|Successor[- ]In[- ]Interest To(?:\s+And [^,;]+)?"
+    r"|Administrator Of [^,;]+"
+    r"|As Administrator [^,;]+"
     r"|Derivatively On Behalf Of [^,;]+"
+    r"|As An Individual"
     r"|Form Unknown"
     r"|Doe(?:s)? \d+ (?:To|Through) \d+(?:,? Inclusive)?"
     r")",

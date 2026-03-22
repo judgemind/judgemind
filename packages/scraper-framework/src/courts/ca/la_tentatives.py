@@ -174,8 +174,12 @@ _ENTITY_DESCRIPTOR_RE = re.compile(
     r"|Individually And As [^,;]+"
     r"|By And Through [^,;]+"
     r"|As Trustee Of [^,;]+"
-    r"|Successor In Interest To [^,;]+"
+    # Hyphenated and non-hyphenated variants of successor/administrator phrases
+    r"|Successor[- ]In[- ]Interest To(?:\s+And [^,;]+)?"
+    r"|Administrator Of [^,;]+"
+    r"|As Administrator [^,;]+"
     r"|Derivatively On Behalf Of [^,;]+"
+    r"|As An Individual"
     r"|Form Unknown"
     r"|Doe(?:s)? \d+ (?:To|Through) \d+(?:,? Inclusive)?"
     r")",
@@ -187,6 +191,37 @@ _ENTITY_DESCRIPTOR_RE = re.compile(
 _MAX_TITLE_LENGTH = 120
 
 
+def _truncate_party_list(party_side: str) -> str:
+    """Truncate a multi-party string to the first party + ", et al.".
+
+    When a side of a case title lists multiple parties separated by semicolons
+    or ", and" connectors, keep only the first party and append ", et al.".
+    If there is only one party, return it unchanged.
+
+    Args:
+        party_side: One side (plaintiff or defendant) of a case title, after
+            entity descriptors have been stripped.
+
+    Returns:
+        The truncated party string.
+    """
+    # Split on semicolons first (most common multi-party separator)
+    parts = re.split(r"\s*;\s*", party_side)
+    if len(parts) > 1:
+        first = parts[0].strip().rstrip(",; ")
+        if first:
+            return f"{first}, et al."
+
+    # Also try splitting on ", and " for "Alice, and Bob" style lists
+    parts = re.split(r",\s+[Aa]nd\s+", party_side)
+    if len(parts) > 1:
+        first = parts[0].strip().rstrip(",; ")
+        if first:
+            return f"{first}, et al."
+
+    return party_side
+
+
 def _sanitize_title(
     raw_title: str | None,
     *,
@@ -196,6 +231,10 @@ def _sanitize_title(
 
     Returns ``None`` if the title is invalid (contains department header
     boilerplate, is too short after cleaning, or is empty).
+
+    When a title is still too long after entity-descriptor stripping (due to
+    many parties), it is truncated to "First Party, et al. v. First Party,
+    et al.".  If even that exceeds ``max_length``, the title is rejected.
 
     Args:
         raw_title: The raw case title to clean.
@@ -235,6 +274,11 @@ def _sanitize_title(
             cleaned = cleaned.strip(",;. ")
             cleaned_parts.append(cleaned)
         title = " v. ".join(cleaned_parts)
+
+        # If still too long, truncate multi-party sides to first party + et al.
+        if len(title) > max_length:
+            truncated_parts = [_truncate_party_list(p) for p in cleaned_parts]
+            title = " v. ".join(truncated_parts)
 
     # Final length check
     if len(title) > max_length or len(title) < 5:
