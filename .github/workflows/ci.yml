@@ -639,6 +639,8 @@ jobs:
         run: scripts/tests/test_gemini_review.sh
       - name: Test adopt-pr.sh
         run: scripts/tests/test_adopt_pr.sh
+      - name: Test oneshot repo-path checker
+        run: scripts/tests/test_check_oneshot_repo_paths.sh
 
   # ---------------------------------------------------------------
   # Coverage gates: diff coverage (new lines) + overall floor ratchet
@@ -927,6 +929,17 @@ jobs:
         run: scripts/check-oneshot-imports.sh
 
   # ---------------------------------------------------------------
+  # ECS oneshot repo-path guard: flag scripts that use REPO_ROOT
+  # without a validated fallback for when the repo is unavailable (#1277)
+  # ---------------------------------------------------------------
+  oneshot-repo-paths-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Check for unvalidated REPO_ROOT references in oneshot scripts
+        run: scripts/check-oneshot-repo-paths.sh
+
+  # ---------------------------------------------------------------
   # Duplicate function guard: detect shadowed function definitions
   # ---------------------------------------------------------------
   duplicate-functions-check:
@@ -1025,7 +1038,7 @@ jobs:
   # Always runs. Reports success only when every applicable job passed or was
   # skipped (path filter did not match). Branch protection requires this check.
   ci-passed:
-    needs: [scraper-framework-tests, scraper-court-tests, ingestion-tests, nlp-tests, api-tests, web-tests, telegram-bridge-tests, infra-validate, lambda-tests, scripts-tests, coverage-check, deprecated-models-check, hardcoded-models-check, hardcoded-colors-check, oneshot-imports-check, duplicate-functions-check, schema-drift-check, dq-baselines-validate, ecs-oneshot-test, migration-files-check, sql-conflict-check, playwright-browser-check]
+    needs: [scraper-framework-tests, scraper-court-tests, ingestion-tests, nlp-tests, api-tests, web-tests, telegram-bridge-tests, infra-validate, lambda-tests, scripts-tests, coverage-check, deprecated-models-check, hardcoded-models-check, hardcoded-colors-check, oneshot-imports-check, oneshot-repo-paths-check, duplicate-functions-check, schema-drift-check, dq-baselines-validate, ecs-oneshot-test, migration-files-check, sql-conflict-check, playwright-browser-check]
     if: always()
     runs-on: ubuntu-latest
     steps:
