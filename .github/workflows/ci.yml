@@ -739,15 +739,23 @@ jobs:
       - name: Coverage floor ratchet — scraper-framework
         if: needs.detect-changes.outputs.scraper == 'true'
         run: |
-          # Use framework coverage as the primary baseline; fall back to courts
-          COV_FILE="coverage-artifacts/coverage-scraper-framework/coverage.xml"
-          if [ ! -f "$COV_FILE" ]; then
-            COV_FILE="coverage-artifacts/coverage-scraper-courts/coverage.xml"
-          fi
-          if [ -f "$COV_FILE" ]; then
+          # Merge coverage from all three split scraper test jobs.
+          # Each --coverage-file is optional — the script skips missing files.
+          COV_ARGS=""
+          COV_FRAMEWORK="coverage-artifacts/coverage-scraper-framework/coverage.xml"
+          COV_COURTS="coverage-artifacts/coverage-scraper-courts/coverage.xml"
+          COV_INGEST="coverage-artifacts/coverage-scraper-ingestion/coverage.xml"
+          HAS_ANY=false
+          for f in "$COV_FRAMEWORK" "$COV_COURTS" "$COV_INGEST"; do
+            if [ -f "$f" ]; then
+              COV_ARGS="$COV_ARGS --coverage-file $f"
+              HAS_ANY=true
+            fi
+          done
+          if [ "$HAS_ANY" = "true" ]; then
             python scripts/update-coverage-baselines.py \
               --package packages/scraper-framework \
-              --coverage-file "$COV_FILE" \
+              $COV_ARGS \
               --dry-run
           fi
 
