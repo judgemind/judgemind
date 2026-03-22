@@ -31,11 +31,6 @@ const CASE_QUERY = gql`
         courtName
         county
       }
-      judges {
-        id
-        canonicalName
-        department
-      }
       parties {
         id
         canonicalName
@@ -87,14 +82,11 @@ function buildCaseData() {
       caseTitle: 'Smith v. Jones',
       caseType: 'civil',
       caseStatus: 'open',
-      filedAt: '2025-01-15',
+      filedAt: '2025-01-15' as string | null,
       court: {
         courtName: 'Los Angeles Superior Court',
         county: 'Los Angeles',
       },
-      judges: [
-        { id: 'judge-1', canonicalName: 'Johnson, Robert M.', department: '12' },
-      ],
       parties: [
         { id: 'p1', canonicalName: 'Smith', partyType: null, role: 'plaintiff' },
         { id: 'p2', canonicalName: 'Jones', partyType: null, role: 'defendant' },
@@ -181,40 +173,88 @@ async function expandRuling(label: RegExp) {
 // Tests
 // ---------------------------------------------------------------------------
 
-describe('CaseDetail — Card-based layout', () => {
+describe('CaseDetail — sidebar layout (no Case Details or Judges cards)', () => {
   beforeEach(() => {
     vi.clearAllMocks();
   });
 
-  it('renders case details in a Card', async () => {
+  it('does NOT render a "Case Details" card', async () => {
     const mocks = buildMocks(buildCaseData(), buildRulingsData([]));
     renderWithProvider(mocks);
 
-    const heading = await screen.findByText('Case Details', {}, { timeout: 3000 });
-    expect(heading).toBeInTheDocument();
-    expect(screen.getByText('Los Angeles Superior Court')).toBeInTheDocument();
-    expect(screen.getByText('Los Angeles')).toBeInTheDocument();
+    // Wait for data to load — parties render twice (mobile + desktop)
+    await screen.findAllByText('Plaintiffs', {}, { timeout: 3000 });
+
+    // The "Case Details" heading should NOT be present
+    expect(screen.queryByText('Case Details')).not.toBeInTheDocument();
   });
 
-  it('renders parties in a Card', async () => {
+  it('does NOT render a "Judges" card', async () => {
     const mocks = buildMocks(buildCaseData(), buildRulingsData([]));
     renderWithProvider(mocks);
 
-    const heading = await screen.findByText('Parties', {}, { timeout: 3000 });
-    expect(heading).toBeInTheDocument();
-    expect(screen.getByText('Plaintiffs')).toBeInTheDocument();
-    expect(screen.getByText('Smith')).toBeInTheDocument();
-    expect(screen.getByText('Defendants')).toBeInTheDocument();
-    expect(screen.getByText('Jones')).toBeInTheDocument();
+    await screen.findAllByText('Plaintiffs', {}, { timeout: 3000 });
+
+    // The "Judges" card heading should NOT be present
+    expect(screen.queryByRole('heading', { name: 'Judges' })).not.toBeInTheDocument();
   });
 
-  it('renders judges in a Card', async () => {
+  it('renders parties in a sidebar (not in a Card)', async () => {
+    const mocks = buildMocks(buildCaseData(), buildRulingsData([]));
+    const { container } = renderWithProvider(mocks);
+
+    // Parties render twice (mobile + desktop sidebar)
+    await screen.findAllByText('Plaintiffs', {}, { timeout: 3000 });
+    const smithInstances = screen.getAllByText('Smith');
+    expect(smithInstances.length).toBeGreaterThanOrEqual(1);
+    const defLabels = screen.getAllByText('Defendants');
+    expect(defLabels.length).toBeGreaterThanOrEqual(1);
+    const jonesInstances = screen.getAllByText('Jones');
+    expect(jonesInstances.length).toBeGreaterThanOrEqual(1);
+
+    // Parties sidebar should exist (data-testid)
+    expect(container.querySelector('[data-testid="parties-sidebar"]')).toBeInTheDocument();
+  });
+
+  it('renders filed date in the sidebar', async () => {
     const mocks = buildMocks(buildCaseData(), buildRulingsData([]));
     renderWithProvider(mocks);
 
-    const heading = await screen.findByText('Judges', {}, { timeout: 3000 });
+    // Filed Date renders twice (mobile + desktop)
+    const filedLabels = await screen.findAllByText('Filed Date', {}, { timeout: 3000 });
+    expect(filedLabels.length).toBeGreaterThanOrEqual(1);
+  });
+
+  it('uses a 2-column grid layout on desktop', async () => {
+    const mocks = buildMocks(buildCaseData(), buildRulingsData([]));
+    const { container } = renderWithProvider(mocks);
+
+    await screen.findAllByText('Plaintiffs', {}, { timeout: 3000 });
+
+    // The root layout element should have the responsive grid classes
+    const gridEl = container.querySelector('.grid');
+    expect(gridEl).toBeInTheDocument();
+    expect(gridEl?.classList.contains('sm:grid-cols-[1fr_280px]')).toBe(true);
+  });
+
+  it('renders an aside element for desktop sidebar', async () => {
+    const mocks = buildMocks(buildCaseData(), buildRulingsData([]));
+    const { container } = renderWithProvider(mocks);
+
+    await screen.findAllByText('Plaintiffs', {}, { timeout: 3000 });
+
+    const aside = container.querySelector('aside');
+    expect(aside).toBeInTheDocument();
+    expect(aside?.getAttribute('aria-label')).toBe('Case parties');
+  });
+
+  it('renders rulings section', async () => {
+    const node = buildRulingNode();
+    const mocks = buildMocks(buildCaseData(), buildRulingsData([node]));
+    renderWithProvider(mocks);
+
+    const heading = await screen.findByText('Rulings', {}, { timeout: 3000 });
     expect(heading).toBeInTheDocument();
-    expect(screen.getByText('Johnson, Robert M.')).toBeInTheDocument();
   });
 
   it('renders rulings as Cards with expand/collapse', async () => {
@@ -248,6 +288,20 @@ describe('CaseDetail — Card-based layout', () => {
     // Badge uses rounded-full class
     expect(container.querySelectorAll('.rounded-full').length).toBeGreaterThan(0);
     expect(screen.getByText('Tentative')).toBeInTheDocument();
+  });
+
+  it('does not render sidebar when no parties and no filedAt', async () => {
+    const caseData = buildCaseData();
+    caseData.case.parties = [];
+    caseData.case.filedAt = null;
+    const mocks = buildMocks(caseData, buildRulingsData([]));
+    const { container } = renderWithProvider(mocks);
+
+    // Wait for rulings heading to confirm component is loaded
+    await screen.findByText('Rulings', {}, { timeout: 3000 });
+
+    // Sidebar should not exist since there are no parties or filed date
+    expect(container.querySelector('[data-testid="parties-sidebar"]')).not.toBeInTheDocument();
   });
 });
 
@@ -371,8 +425,8 @@ describe('CaseDetail — ruling HTML rendering', () => {
     const mocks = buildMocks(buildCaseData(), buildRulingsData([node]));
     const { container } = renderWithProvider(mocks);
 
-    // Wait for case data to load
-    await screen.findByText('Los Angeles Superior Court', {}, { timeout: 3000 });
+    // Wait for case data to load — parties render twice (mobile + desktop)
+    await screen.findAllByText('Plaintiffs', {}, { timeout: 3000 });
 
     // No ruling content should be rendered
     expect(container.querySelector('.ruling-content')).not.toBeInTheDocument();

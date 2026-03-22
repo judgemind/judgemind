@@ -19,6 +19,11 @@ const CASE_QUERY = gql`
         courtName
         county
       }
+      judges {
+        id
+        canonicalName
+        department
+      }
     }
   }
 `;
@@ -34,6 +39,11 @@ interface CaseData {
       courtName: string;
       county: string;
     } | null;
+    judges: Array<{
+      id: string;
+      canonicalName: string;
+      department: string | null;
+    }>;
   } | null;
 }
 
@@ -67,7 +77,7 @@ export default async function CaseDetailPage({ params }: Props) {
   const heading = buildCaseHeading(caseData, id);
 
   return (
-    <div className="mx-auto max-w-4xl space-y-6">
+    <div className="mx-auto max-w-5xl space-y-6">
       <nav className="text-sm text-muted-foreground" aria-label="Breadcrumb">
         <Link href="/cases" className="hover:text-primary">
           Cases
@@ -104,6 +114,26 @@ export default async function CaseDetailPage({ params }: Props) {
         {caseData.court && (
           <p className="mt-0.5 text-sm text-muted-foreground">
             {caseData.court.courtName} &middot; {caseData.court.county}
+          </p>
+        )}
+        {caseData.judges.length > 0 && (
+          <p className="mt-0.5 text-sm text-muted-foreground">
+            {caseData.judges.map((judge, idx) => (
+              <span key={judge.id}>
+                {idx > 0 && ' · '}
+                <Link
+                  href={`/judges/${judge.id}`}
+                  className="rounded-sm hover:text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                >
+                  Judge {judge.canonicalName}
+                </Link>
+                {judge.department && (
+                  <span className="ml-1 text-xs">
+                    Dept. {judge.department}
+                  </span>
+                )}
+              </span>
+            ))}
           </p>
         )}
       </div>

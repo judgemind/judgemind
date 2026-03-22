@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { render, screen } from '@testing-library/react';
 
 // ---------------------------------------------------------------------------
 // Mocks — must be declared before importing the page module
@@ -33,11 +34,27 @@ vi.mock('../CaseDetail', () => ({
   CaseDetail: () => null,
 }));
 
+// Mock next/link as a plain anchor
+vi.mock('next/link', () => ({
+  default: ({ href, children, ...props }: { href: string; children: React.ReactNode }) => (
+    <a href={href} {...props}>{children}</a>
+  ),
+}));
+
 // ---------------------------------------------------------------------------
 // Import the page under test (must come after mocks)
 // ---------------------------------------------------------------------------
 
 import CaseDetailPage from '../page';
+
+// ---------------------------------------------------------------------------
+// Helper: render the async server component
+// ---------------------------------------------------------------------------
+
+async function renderPage(id: string) {
+  const jsx = await CaseDetailPage({ params: { id } });
+  return render(jsx);
+}
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -61,6 +78,9 @@ describe('CaseDetailPage (SSR smoke)', () => {
             courtName: 'Los Angeles Superior Court',
             county: 'Los Angeles',
           },
+          judges: [
+            { id: 'judge-1', canonicalName: 'Johnson, Robert M.', department: '12' },
+          ],
         },
       },
     });
@@ -81,6 +101,7 @@ describe('CaseDetailPage (SSR smoke)', () => {
           caseType: null,
           caseStatus: null,
           court: null,
+          judges: [],
         },
       },
     });
@@ -106,5 +127,80 @@ describe('CaseDetailPage (SSR smoke)', () => {
     await expect(
       CaseDetailPage({ params: { id: 'error-case' } }),
     ).rejects.toThrow('NEXT_NOT_FOUND');
+  });
+
+  it('includes judge names in the rendered output', async () => {
+    mockQuery.mockResolvedValueOnce({
+      data: {
+        case: {
+          id: 'case-3',
+          caseNumber: '25HR054887C',
+          caseTitle: 'Turner vs Decker',
+          caseType: 'civil',
+          caseStatus: 'active',
+          court: {
+            courtName: 'Superior Court',
+            county: 'San Diego',
+          },
+          judges: [
+            { id: 'judge-reid', canonicalName: 'Chandra Reid', department: 'C21' },
+          ],
+        },
+      },
+    });
+
+    await renderPage('case-3');
+    expect(screen.getByText(/Judge Chandra Reid/)).toBeInTheDocument();
+    expect(screen.getByText(/Dept\. C21/)).toBeInTheDocument();
+    // Judge link should point to judge detail page
+    const judgeLink = screen.getByText(/Judge Chandra Reid/).closest('a');
+    expect(judgeLink?.getAttribute('href')).toBe('/judges/judge-reid');
+  });
+
+  it('renders multiple judges', async () => {
+    mockQuery.mockResolvedValueOnce({
+      data: {
+        case: {
+          id: 'case-5',
+          caseNumber: '25STCV00002',
+          caseTitle: null,
+          caseType: null,
+          caseStatus: null,
+          court: null,
+          judges: [
+            { id: 'judge-a', canonicalName: 'Judge A', department: null },
+            { id: 'judge-b', canonicalName: 'Judge B', department: '5' },
+          ],
+        },
+      },
+    });
+
+    await renderPage('case-5');
+    expect(screen.getByText(/Judge Judge A/)).toBeInTheDocument();
+    expect(screen.getByText(/Judge Judge B/)).toBeInTheDocument();
+    // Both judge links should be present
+    const linkA = screen.getByText(/Judge Judge A/).closest('a');
+    expect(linkA?.getAttribute('href')).toBe('/judges/judge-a');
+    const linkB = screen.getByText(/Judge Judge B/).closest('a');
+    expect(linkB?.getAttribute('href')).toBe('/judges/judge-b');
+  });
+
+  it('does not render judges line when no judges', async () => {
+    mockQuery.mockResolvedValueOnce({
+      data: {
+        case: {
+          id: 'case-6',
+          caseNumber: '25STCV00003',
+          caseTitle: null,
+          caseType: null,
+          caseStatus: null,
+          court: null,
+          judges: [],
+        },
+      },
+    });
+
+    await renderPage('case-6');
+    expect(screen.queryByText(/Judge /)).not.toBeInTheDocument();
   });
 });

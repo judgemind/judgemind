@@ -70,9 +70,6 @@ function makeCaseData(overrides: Record<string, unknown> = {}) {
         courtName: 'Los Angeles Superior Court',
         county: 'Los Angeles',
       },
-      judges: [
-        { id: 'j1', canonicalName: 'Smith, John', department: '5' },
-      ],
       parties: [
         {
           id: 'p1',
@@ -151,7 +148,7 @@ describe('CaseDetail (render)', () => {
     expect(screen.getByText('Case not found.')).toBeInTheDocument();
   });
 
-  it('renders case metadata: court and county', () => {
+  it('renders filed date in the sidebar', () => {
     mockCaseQueryResult.data = makeCaseData();
     mockRulingsQueryResult.data = {
       rulings: {
@@ -160,13 +157,12 @@ describe('CaseDetail (render)', () => {
       },
     };
     render(<CaseDetail caseId="case-1" />);
-    expect(
-      screen.getByText('Los Angeles Superior Court'),
-    ).toBeInTheDocument();
-    expect(screen.getByText('Los Angeles')).toBeInTheDocument();
+    // Filed date appears in the sidebar (rendered twice: mobile + desktop)
+    const filedDates = screen.getAllByText('Jun 15, 2025');
+    expect(filedDates.length).toBeGreaterThanOrEqual(1);
   });
 
-  it('renders filed date', () => {
+  it('renders parties grouped by role in the sidebar', () => {
     mockCaseQueryResult.data = makeCaseData();
     mockRulingsQueryResult.data = {
       rulings: {
@@ -175,10 +171,18 @@ describe('CaseDetail (render)', () => {
       },
     };
     render(<CaseDetail caseId="case-1" />);
-    expect(screen.getByText('Jun 15, 2025')).toBeInTheDocument();
+    // Parties appear in both mobile and desktop sidebar (rendered twice)
+    const plaintiffLabels = screen.getAllByText('Plaintiffs');
+    expect(plaintiffLabels.length).toBeGreaterThanOrEqual(1);
+    const aliceInstances = screen.getAllByText('Alice Smith');
+    expect(aliceInstances.length).toBeGreaterThanOrEqual(1);
+    const defendantLabels = screen.getAllByText('Defendants');
+    expect(defendantLabels.length).toBeGreaterThanOrEqual(1);
+    const bobInstances = screen.getAllByText('Bob Jones');
+    expect(bobInstances.length).toBeGreaterThanOrEqual(1);
   });
 
-  it('renders parties grouped by role', () => {
+  it('does not render separate Case Details or Judges cards', () => {
     mockCaseQueryResult.data = makeCaseData();
     mockRulingsQueryResult.data = {
       rulings: {
@@ -187,27 +191,13 @@ describe('CaseDetail (render)', () => {
       },
     };
     render(<CaseDetail caseId="case-1" />);
-    expect(screen.getByText('Plaintiffs')).toBeInTheDocument();
-    expect(screen.getByText('Alice Smith')).toBeInTheDocument();
-    expect(screen.getByText('Defendants')).toBeInTheDocument();
-    expect(screen.getByText('Bob Jones')).toBeInTheDocument();
-  });
-
-  it('renders judges section', () => {
-    mockCaseQueryResult.data = makeCaseData();
-    mockRulingsQueryResult.data = {
-      rulings: {
-        edges: [],
-        pageInfo: { hasNextPage: false, endCursor: null },
-      },
-    };
-    render(<CaseDetail caseId="case-1" />);
-    expect(screen.getByText('Judges')).toBeInTheDocument();
-    expect(screen.getByText('Smith, John')).toBeInTheDocument();
+    // Case Details and Judges card headings should NOT exist
+    expect(screen.queryByText('Case Details')).not.toBeInTheDocument();
+    expect(screen.queryByRole('heading', { name: 'Judges' })).not.toBeInTheDocument();
   });
 
   it('hides parties section when no parties', () => {
-    mockCaseQueryResult.data = makeCaseData({ parties: [] });
+    mockCaseQueryResult.data = makeCaseData({ parties: [], filedAt: null });
     mockRulingsQueryResult.data = {
       rulings: {
         edges: [],
@@ -387,17 +377,17 @@ describe('CaseDetail (render)', () => {
     expect(screen.getByText('HTML')).toBeInTheDocument();
   });
 
-  it('uses em-dash for court when null', () => {
-    mockCaseQueryResult.data = makeCaseData({ court: null });
+  it('renders 2-column grid layout with sidebar', () => {
+    mockCaseQueryResult.data = makeCaseData();
     mockRulingsQueryResult.data = {
       rulings: {
         edges: [],
         pageInfo: { hasNextPage: false, endCursor: null },
       },
     };
-    render(<CaseDetail caseId="case-1" />);
-    // Two em-dashes: one for court, one for county
-    const dashes = screen.getAllByText('\u2014');
-    expect(dashes.length).toBeGreaterThanOrEqual(2);
+    const { container } = render(<CaseDetail caseId="case-1" />);
+    const gridEl = container.querySelector('.grid');
+    expect(gridEl).toBeInTheDocument();
+    expect(gridEl?.classList.contains('sm:grid-cols-[1fr_280px]')).toBe(true);
   });
 });
