@@ -3,6 +3,7 @@ import { notFound } from 'next/navigation';
 import Link from 'next/link';
 import { createApolloClient } from '@/lib/apollo-client';
 import { buildCaseHeading, formatLabel } from '@/lib/display-helpers';
+import { PAGE_TITLE } from '@/lib/typography';
 import { Badge } from '@/components/ui/badge';
 import { CaseDetail } from './CaseDetail';
 
@@ -77,7 +78,7 @@ export default async function CaseDetailPage({ params }: Props) {
 
       <div>
         <div className="flex flex-wrap items-start gap-3">
-          <h1 className="text-2xl font-bold tracking-tight text-foreground">{heading}</h1>
+          <h1 className={PAGE_TITLE}>{heading}</h1>
           <div className="flex flex-wrap gap-2 pt-1">
             {caseData.caseType && (
               <Badge variant="outline">

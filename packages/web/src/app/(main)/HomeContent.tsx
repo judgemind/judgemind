@@ -14,6 +14,7 @@ import {
   getOutcomeBadgeVariant,
   getOutcomeBadgeListClass,
 } from '@/lib/display-helpers';
+import { PAGE_TITLE, SECTION_HEADING } from '@/lib/typography';
 
 const PLATFORM_STATS_QUERY = gql`
   query PlatformStats {
@@ -160,7 +161,7 @@ function RecentRulings() {
   return (
     <section data-testid="recent-rulings">
       <div className="mb-3 flex items-center justify-between">
-        <h2 className="text-lg font-semibold text-foreground">Recent rulings</h2>
+        <h2 className={SECTION_HEADING}>Recent rulings</h2>
         <Link
           href="/rulings"
           className="text-sm font-medium text-primary hover:underline"
@@ -276,7 +277,7 @@ const HOW_IT_WORKS_STEPS = [
 function HowItWorks() {
   return (
     <section data-testid="how-it-works">
-      <h2 className="mb-3 text-lg font-semibold text-foreground">How it works</h2>
+      <h2 className={`mb-3 ${SECTION_HEADING}`}>How it works</h2>
       <div className="grid gap-4 sm:grid-cols-3">
         {HOW_IT_WORKS_STEPS.map((item) => (
           <Card key={item.step}>
@@ -296,7 +297,7 @@ export function HomeContent() {
   return (
     <div className="mx-auto max-w-3xl space-y-8">
       <div>
-        <h1 className="text-2xl font-bold tracking-tight text-foreground">
+        <h1 className={PAGE_TITLE}>
           Free legal research for everyone
         </h1>
         <p className="mt-4 text-lg text-muted-foreground">

@@ -3,6 +3,7 @@ import { notFound } from 'next/navigation';
 import Link from 'next/link';
 import { createApolloClient } from '@/lib/apollo-client';
 import { formatDate, formatLabel, formatOutcome, getOutcomeBadgeClass } from '@/lib/display-helpers';
+import { PAGE_TITLE, SECTION_LABEL } from '@/lib/typography';
 import { sanitizeRulingHtml } from '@/lib/sanitize-html';
 import { RulingDetail } from './RulingDetail';
 import { Card, CardContent } from '@/components/ui/card';
@@ -125,7 +126,7 @@ export default async function RulingDetailPage({ params }: Props) {
 
       {/* Heading */}
       <div className="flex flex-wrap items-start gap-3">
-        <h1 className="text-2xl font-bold tracking-tight text-foreground">
+        <h1 className={PAGE_TITLE}>
           {motionLabel}
         </h1>
         <div className="flex flex-wrap gap-2 pt-1">
@@ -155,7 +156,7 @@ export default async function RulingDetailPage({ params }: Props) {
             {/* Judge */}
             {rulingData.judge && (
               <div>
-                <dt className="text-sm font-semibold uppercase tracking-wide text-muted-foreground">
+                <dt className={SECTION_LABEL}>
                   Judge
                 </dt>
                 <dd className="mt-1 text-sm text-foreground">
@@ -172,7 +173,7 @@ export default async function RulingDetailPage({ params }: Props) {
             {/* Court */}
             {rulingData.court && (
               <div>
-                <dt className="text-sm font-semibold uppercase tracking-wide text-muted-foreground">
+                <dt className={SECTION_LABEL}>
                   Court
                 </dt>
                 <dd className="mt-1 text-sm text-foreground">
@@ -189,7 +190,7 @@ export default async function RulingDetailPage({ params }: Props) {
             {/* County */}
             {rulingData.court && (
               <div>
-                <dt className="text-sm font-semibold uppercase tracking-wide text-muted-foreground">
+                <dt className={SECTION_LABEL}>
                   County
                 </dt>
                 <dd className="mt-1 text-sm text-foreground">
@@ -206,7 +207,7 @@ export default async function RulingDetailPage({ params }: Props) {
             {/* Department */}
             {rulingData.department && (
               <div>
-                <dt className="text-sm font-semibold uppercase tracking-wide text-muted-foreground">
+                <dt className={SECTION_LABEL}>
                   Department
                 </dt>
                 <dd className="mt-1 text-sm text-foreground">
@@ -217,7 +218,7 @@ export default async function RulingDetailPage({ params }: Props) {
 
             {/* Hearing date */}
             <div>
-              <dt className="text-sm font-semibold uppercase tracking-wide text-muted-foreground">
+              <dt className={SECTION_LABEL}>
                 Hearing Date
               </dt>
               <dd className="mt-1 text-sm text-foreground">
@@ -228,7 +229,7 @@ export default async function RulingDetailPage({ params }: Props) {
             {/* Motion type */}
             {rulingData.motionType && (
               <div>
-                <dt className="text-sm font-semibold uppercase tracking-wide text-muted-foreground">
+                <dt className={SECTION_LABEL}>
                   Motion Type
                 </dt>
                 <dd className="mt-1 text-sm text-foreground">
@@ -240,7 +241,7 @@ export default async function RulingDetailPage({ params }: Props) {
             {/* Case number */}
             {rulingData.case && (
               <div>
-                <dt className="text-sm font-semibold uppercase tracking-wide text-muted-foreground">
+                <dt className={SECTION_LABEL}>
                   Case Number
                 </dt>
                 <dd className="mt-1 text-sm text-foreground">

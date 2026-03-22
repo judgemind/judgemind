@@ -2,6 +2,7 @@ import { gql } from '@apollo/client';
 import { notFound } from 'next/navigation';
 import { createApolloClient } from '@/lib/apollo-client';
 import { buildJudgeHeading } from '@/lib/display-helpers';
+import { PAGE_TITLE } from '@/lib/typography';
 import { Badge } from '@/components/ui/badge';
 import { Card, CardContent } from '@/components/ui/card';
 import { JudgeProfile } from './JudgeProfile';
@@ -63,7 +64,7 @@ export default async function JudgeDetailPage({ params }: Props) {
       <Card>
         <CardContent className="p-6">
           <div className="flex flex-wrap items-start gap-3">
-            <h1 className="text-2xl font-bold tracking-tight text-foreground">{heading}</h1>
+            <h1 className={PAGE_TITLE}>{heading}</h1>
             {!judgeData.isActive && (
               <Badge variant="secondary">Inactive</Badge>
             )}

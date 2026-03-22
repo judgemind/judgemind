@@ -2,6 +2,7 @@
 
 import { useState, useCallback } from 'react';
 import { buildDocumentContentUrl, buildDownloadUrl, cleanRulingText, cleanSummary, FORMAT_LABELS, stripMetadataHeaderHtml, type RulingMetadata } from '@/lib/display-helpers';
+import { SECTION_HEADING } from '@/lib/typography';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 
@@ -95,7 +96,7 @@ export function RulingDetail({ ruling, sanitizedRulingTextHtml }: RulingProps) {
       {displaySummary && (
         <Card>
           <CardHeader className="pb-2">
-            <CardTitle className="text-lg font-semibold text-foreground">
+            <CardTitle className={SECTION_HEADING}>
               Summary
             </CardTitle>
           </CardHeader>
@@ -111,7 +112,7 @@ export function RulingDetail({ ruling, sanitizedRulingTextHtml }: RulingProps) {
       {(sanitizedRulingTextHtml || ruling.rulingText) && (
         <Card>
           <CardHeader className="flex flex-row items-center justify-between pb-2">
-            <CardTitle className="text-lg font-semibold text-foreground">
+            <CardTitle className={SECTION_HEADING}>
               Ruling Text
             </CardTitle>
             {ruling.documentId && (
