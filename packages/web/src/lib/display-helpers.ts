@@ -501,6 +501,14 @@ export function buildDownloadUrl(documentId: string): string {
   return `${baseUrl}/api/documents/${documentId}/download`;
 }
 
+/** Build the content URL for an HTML document. Returns the raw HTML content
+ *  with encoding fixed server-side. Only works for HTML-format documents. */
+export function buildDocumentContentUrl(documentId: string): string {
+  const graphqlUrl = process.env.NEXT_PUBLIC_GRAPHQL_URL ?? 'http://localhost:3001/graphql';
+  const baseUrl = graphqlUrl.replace(/\/graphql$/, '');
+  return `${baseUrl}/api/documents/${documentId}/content`;
+}
+
 // ---------------------------------------------------------------------------
 // Text truncation
 // ---------------------------------------------------------------------------

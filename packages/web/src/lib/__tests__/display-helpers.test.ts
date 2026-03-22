@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import {
+  buildDocumentContentUrl,
   buildDownloadUrl,
   cleanSummary,
   detectParagraphs,
@@ -238,6 +239,22 @@ describe('buildDownloadUrl', () => {
     const original = process.env.NEXT_PUBLIC_GRAPHQL_URL;
     delete process.env.NEXT_PUBLIC_GRAPHQL_URL;
     expect(buildDownloadUrl('doc-456')).toBe('http://localhost:3001/api/documents/doc-456/download');
+    process.env.NEXT_PUBLIC_GRAPHQL_URL = original;
+  });
+});
+
+describe('buildDocumentContentUrl', () => {
+  it('builds content URL from NEXT_PUBLIC_GRAPHQL_URL env var', () => {
+    const original = process.env.NEXT_PUBLIC_GRAPHQL_URL;
+    process.env.NEXT_PUBLIC_GRAPHQL_URL = 'https://api.example.com/graphql';
+    expect(buildDocumentContentUrl('doc-123')).toBe('https://api.example.com/api/documents/doc-123/content');
+    process.env.NEXT_PUBLIC_GRAPHQL_URL = original;
+  });
+
+  it('falls back to localhost when env var is unset', () => {
+    const original = process.env.NEXT_PUBLIC_GRAPHQL_URL;
+    delete process.env.NEXT_PUBLIC_GRAPHQL_URL;
+    expect(buildDocumentContentUrl('doc-456')).toBe('http://localhost:3001/api/documents/doc-456/content');
     process.env.NEXT_PUBLIC_GRAPHQL_URL = original;
   });
 });
