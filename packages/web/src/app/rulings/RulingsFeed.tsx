@@ -16,6 +16,7 @@ import { Autocomplete } from '@/components/Autocomplete';
 import { useCountyOptions } from '@/lib/filter-options';
 import { Card, CardContent } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
+import { Input } from '@/components/ui/input';
 import { Skeleton } from '@/components/ui/skeleton';
 
 const RULINGS_QUERY = gql`
@@ -208,25 +209,25 @@ export function RulingsFeed() {
           options={countyOptions}
           placeholder="County (e.g. Los Angeles)"
           aria-label="County"
-          className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900 placeholder-slate-400 focus-visible:border-brand-accent-lighter focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-brand-accent-lighter dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 dark:placeholder-slate-500"
+          className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
         />
-        <input
+        <Input
           type="date"
           name="dateFrom"
           value={dateFrom}
           onChange={(e) => setDateFrom(e.target.value)}
           aria-label="Hearings from"
           title="Hearings from"
-          className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900 focus-visible:border-brand-accent-lighter focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-brand-accent-lighter dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100"
+          className="w-auto"
         />
-        <input
+        <Input
           type="date"
           name="dateTo"
           value={dateTo}
           onChange={(e) => setDateTo(e.target.value)}
           aria-label="Hearings to"
           title="Hearings to"
-          className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900 focus-visible:border-brand-accent-lighter focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-brand-accent-lighter dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100"
+          className="w-auto"
         />
       </div>
 

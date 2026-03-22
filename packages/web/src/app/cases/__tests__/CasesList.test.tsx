@@ -1,5 +1,16 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, screen, fireEvent } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
+
+// Radix UI Select uses pointer events and pointer capture, which jsdom does not support.
+// Stub the missing methods so Radix doesn't throw in tests.
+beforeEach(() => {
+  Element.prototype.hasPointerCapture = vi.fn().mockReturnValue(false);
+  Element.prototype.setPointerCapture = vi.fn();
+  Element.prototype.releasePointerCapture = vi.fn();
+  // Radix Select also uses scrollIntoView
+  Element.prototype.scrollIntoView = vi.fn();
+});
 
 const mockUseQuery = vi.fn();
 vi.mock('@apollo/client', () => ({
@@ -72,8 +83,10 @@ describe('CasesList', () => {
   it('renders status badges for cases', () => {
     mockUseQuery.mockReturnValue({ data: MOCK_CASES_DATA, loading: false, error: undefined, fetchMore: vi.fn() });
     render(<CasesList />);
-    expect(screen.getAllByText('Active').length).toBeGreaterThanOrEqual(2);
-    expect(screen.getAllByText('Closed').length).toBeGreaterThanOrEqual(2);
+    // With shadcn Select, option text is rendered in a portal (not visible until opened),
+    // so "Active" / "Closed" appear only in status badges
+    expect(screen.getAllByText('Active').length).toBeGreaterThanOrEqual(1);
+    expect(screen.getAllByText('Closed').length).toBeGreaterThanOrEqual(1);
   });
 
   it('renders case links pointing to detail pages', () => {
@@ -96,23 +109,25 @@ describe('CasesList', () => {
     expect(mockFetchMore).toHaveBeenCalledWith(expect.objectContaining({ variables: { after: 'cursor-2' } }));
   });
 
-  it('renders filter inputs including case type dropdown', () => {
+  it('renders filter inputs including shadcn Select triggers for status and type', () => {
     mockUseQuery.mockReturnValue({ data: MOCK_CASES_DATA, loading: false, error: undefined, fetchMore: vi.fn() });
     render(<CasesList />);
     expect(screen.getByPlaceholderText(/Case number or title/i)).toBeInTheDocument();
+    // shadcn Select renders as button triggers with aria-label
     expect(screen.getByLabelText(/Case status/i)).toBeInTheDocument();
     expect(screen.getByLabelText(/Case type/i)).toBeInTheDocument();
   });
 
-  it('filter inputs have name and aria-label attributes', () => {
+  it('filter inputs have aria-label attributes', () => {
     mockUseQuery.mockReturnValue({ data: MOCK_CASES_DATA, loading: false, error: undefined, fetchMore: vi.fn() });
     render(<CasesList />);
     const caseFilter = screen.getByLabelText('Case number or title');
     expect(caseFilter).toHaveAttribute('name', 'caseFilter');
-    const statusSelect = screen.getByLabelText('Case status');
-    expect(statusSelect).toHaveAttribute('name', 'caseStatus');
-    const typeSelect = screen.getByLabelText('Case type');
-    expect(typeSelect).toHaveAttribute('name', 'caseType');
+    // shadcn Select triggers are buttons with aria-label
+    const statusTrigger = screen.getByLabelText('Case status');
+    expect(statusTrigger.tagName.toLowerCase()).toBe('button');
+    const typeTrigger = screen.getByLabelText('Case type');
+    expect(typeTrigger.tagName.toLowerCase()).toBe('button');
   });
 
   it('filters cases client-side by case number', () => {
@@ -123,43 +138,62 @@ describe('CasesList', () => {
     expect(screen.queryByText('24NNCV05678')).not.toBeInTheDocument();
   });
 
-  it('renders all case type options in the dropdown', () => {
+  it('renders shadcn Select triggers showing default placeholder text', () => {
     mockUseQuery.mockReturnValue({ data: MOCK_CASES_DATA, loading: false, error: undefined, fetchMore: vi.fn() });
     render(<CasesList />);
-    expect(screen.getAllByText('Civil').length).toBeGreaterThanOrEqual(2);
-    expect(screen.getByText('Family')).toBeInTheDocument();
-    expect(screen.getByText('Probate')).toBeInTheDocument();
-    expect(screen.getByText('Small Claims')).toBeInTheDocument();
-    expect(screen.getAllByText('Other').length).toBeGreaterThanOrEqual(1);
+    // Both triggers show "All statuses" / "All types" by default (since value is "all")
+    expect(screen.getByText('All statuses')).toBeInTheDocument();
+    expect(screen.getByText('All types')).toBeInTheDocument();
   });
 
-  it('passes caseType to the GraphQL query when type filter is selected', () => {
+  it('does not use raw select elements (uses shadcn Select)', () => {
     mockUseQuery.mockReturnValue({ data: MOCK_CASES_DATA, loading: false, error: undefined, fetchMore: vi.fn() });
-    render(<CasesList />);
-    fireEvent.change(screen.getByLabelText(/Case type/i), { target: { value: 'civil' } });
-    const lastCall = mockUseQuery.mock.calls[mockUseQuery.mock.calls.length - 1];
-    expect(lastCall[1].variables.caseType).toBe('civil');
+    const { container } = render(<CasesList />);
+    // No native <select> elements should exist
+    expect(container.querySelectorAll('select').length).toBe(0);
   });
 
-  it('updates URL params when case type filter changes', () => {
-    mockUseQuery.mockReturnValue({ data: MOCK_CASES_DATA, loading: false, error: undefined, fetchMore: vi.fn() });
-    render(<CasesList />);
-    fireEvent.change(screen.getByLabelText(/Case type/i), { target: { value: 'family' } });
-    expect(mockReplace).toHaveBeenCalledWith(expect.stringContaining('caseType=family'));
-  });
-
-  it('initializes case type filter from URL params', () => {
+  it('initializes case type filter from URL params and passes to query', () => {
     mockSearchParamsValue = new URLSearchParams('caseType=probate');
     mockUseQuery.mockReturnValue({ data: MOCK_CASES_DATA, loading: false, error: undefined, fetchMore: vi.fn() });
     render(<CasesList />);
-    expect((screen.getByLabelText(/Case type/i) as HTMLSelectElement).value).toBe('probate');
+    // Verify the query is called with the correct caseType from URL
     expect(mockUseQuery.mock.calls[0][1].variables.caseType).toBe('probate');
+    // Verify the Select trigger shows the selected value (Probate)
+    expect(screen.getByText('Probate')).toBeInTheDocument();
+  });
+
+  it('initializes status filter from URL params and passes to query', () => {
+    mockSearchParamsValue = new URLSearchParams('status=active');
+    mockUseQuery.mockReturnValue({ data: MOCK_CASES_DATA, loading: false, error: undefined, fetchMore: vi.fn() });
+    render(<CasesList />);
+    expect(mockUseQuery.mock.calls[0][1].variables.caseStatus).toBe('active');
+  });
+
+  it('updates URL when status filter is set via URL params', () => {
+    mockSearchParamsValue = new URLSearchParams('status=dismissed');
+    mockUseQuery.mockReturnValue({ data: MOCK_CASES_DATA, loading: false, error: undefined, fetchMore: vi.fn() });
+    render(<CasesList />);
+    expect(mockReplace).toHaveBeenCalledWith(expect.stringContaining('status=dismissed'));
+  });
+
+  it('updates URL when case type filter is set via URL params', () => {
+    mockSearchParamsValue = new URLSearchParams('caseType=family');
+    mockUseQuery.mockReturnValue({ data: MOCK_CASES_DATA, loading: false, error: undefined, fetchMore: vi.fn() });
+    render(<CasesList />);
+    expect(mockReplace).toHaveBeenCalledWith(expect.stringContaining('caseType=family'));
   });
 
   it('does not pass caseType when "All types" is selected', () => {
     mockUseQuery.mockReturnValue({ data: MOCK_CASES_DATA, loading: false, error: undefined, fetchMore: vi.fn() });
     render(<CasesList />);
     expect(mockUseQuery.mock.calls[0][1].variables.caseType).toBeUndefined();
+  });
+
+  it('does not pass caseStatus when no status filter is set', () => {
+    mockUseQuery.mockReturnValue({ data: MOCK_CASES_DATA, loading: false, error: undefined, fetchMore: vi.fn() });
+    render(<CasesList />);
+    expect(mockUseQuery.mock.calls[0][1].variables.caseStatus).toBeUndefined();
   });
 
   it('uses shadcn Table component structure', () => {
@@ -174,5 +208,45 @@ describe('CasesList', () => {
     mockUseQuery.mockReturnValue({ data: MOCK_CASES_DATA, loading: false, error: undefined, fetchMore: vi.fn() });
     const { container } = render(<CasesList />);
     expect(container.querySelectorAll('.rounded-full').length).toBeGreaterThan(0);
+  });
+
+  it('updates query variables when status filter is changed via user interaction', async () => {
+    const user = userEvent.setup();
+    mockUseQuery.mockReturnValue({ data: MOCK_CASES_DATA, loading: false, error: undefined, fetchMore: vi.fn() });
+    render(<CasesList />);
+
+    // Click the status select trigger to open the dropdown
+    await user.click(screen.getByLabelText(/Case status/i));
+
+    // Click on the 'Active' option
+    const activeOption = await screen.findByRole('option', { name: 'Active' });
+    await user.click(activeOption);
+
+    // Assert query was re-run with new caseStatus variable
+    const lastCall = mockUseQuery.mock.calls[mockUseQuery.mock.calls.length - 1];
+    expect(lastCall[1].variables.caseStatus).toBe('active');
+
+    // Assert URL was updated
+    expect(mockReplace).toHaveBeenCalledWith(expect.stringContaining('status=active'));
+  });
+
+  it('updates query variables when case type filter is changed via user interaction', async () => {
+    const user = userEvent.setup();
+    mockUseQuery.mockReturnValue({ data: MOCK_CASES_DATA, loading: false, error: undefined, fetchMore: vi.fn() });
+    render(<CasesList />);
+
+    // Click the case type select trigger to open the dropdown
+    await user.click(screen.getByLabelText(/Case type/i));
+
+    // Click on the 'Family' option
+    const familyOption = await screen.findByRole('option', { name: 'Family' });
+    await user.click(familyOption);
+
+    // Assert query was re-run with new caseType variable
+    const lastCall = mockUseQuery.mock.calls[mockUseQuery.mock.calls.length - 1];
+    expect(lastCall[1].variables.caseType).toBe('family');
+
+    // Assert URL was updated
+    expect(mockReplace).toHaveBeenCalledWith(expect.stringContaining('caseType=family'));
   });
 });
