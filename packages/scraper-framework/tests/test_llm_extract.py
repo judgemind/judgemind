@@ -21,6 +21,7 @@ from ingestion.llm_extract import (
     _merge_results,
     _normalize_case_number,
     _normalize_department,
+    _parse_confidence,
     _parse_response,
     _split_text_into_chunks,
     extract_fields_llm,
@@ -1762,3 +1763,198 @@ class TestOutcomeTaxonomyClarity:
         result = _parse_response(response_json, None)
         assert result is not None
         assert result.rulings[0].outcome == "granted"
+
+
+# ---------------------------------------------------------------------------
+# _parse_confidence
+# ---------------------------------------------------------------------------
+
+
+class TestParseConfidence:
+    """Tests for the _parse_confidence helper function."""
+
+    def test_none_returns_defaults(self) -> None:
+        fc = _parse_confidence(None)
+        assert fc.case_number.value == "high"
+        assert fc.judge.value == "high"
+
+    def test_empty_dict_returns_defaults(self) -> None:
+        fc = _parse_confidence({})
+        assert fc.case_number.value == "high"
+
+    def test_valid_confidence_scores(self) -> None:
+        raw = {
+            "case_number": "high",
+            "case_title": "medium",
+            "parties": "low",
+            "judge": "high",
+            "ruling_text": "high",
+            "outcome": "medium",
+        }
+        fc = _parse_confidence(raw)
+        assert fc.case_number.value == "high"
+        assert fc.case_title.value == "medium"
+        assert fc.parties.value == "low"
+        assert fc.outcome.value == "medium"
+
+    def test_invalid_value_defaults_to_high(self) -> None:
+        raw = {"case_number": "very_high", "judge": "unknown"}
+        fc = _parse_confidence(raw)
+        assert fc.case_number.value == "high"
+        assert fc.judge.value == "high"
+
+    def test_non_dict_returns_defaults(self) -> None:
+        fc = _parse_confidence("not a dict")  # type: ignore[arg-type]
+        assert fc.case_number.value == "high"
+
+
+# ---------------------------------------------------------------------------
+# _parse_response with new extracted_ field names
+# ---------------------------------------------------------------------------
+
+
+class TestParseResponseNewFieldNames:
+    """Tests for _parse_response handling of new extracted_ prefix field names."""
+
+    def test_extracted_prefix_fields_parsed(self) -> None:
+        response_json = json.dumps(
+            {
+                "extracted_judge_name": "Rodriguez",
+                "hearing_date": "2026-03-03",
+                "department": "205",
+                "rulings": [
+                    {
+                        "extracted_case_number": "22SMCV01940",
+                        "extracted_case_title": "Smith v. Jones",
+                        "case_type": "civil",
+                        "outcome": "granted",
+                        "motion_type": "msj",
+                        "extracted_parties": [
+                            {"name": "Smith", "role": "plaintiff"},
+                            {"name": "Jones", "role": "defendant"},
+                        ],
+                        "confidence": {
+                            "case_number": "high",
+                            "case_title": "medium",
+                            "parties": "high",
+                            "judge": "low",
+                            "ruling_text": "high",
+                            "outcome": "high",
+                        },
+                    }
+                ],
+            }
+        )
+        result = _parse_response(response_json, None)
+        assert result is not None
+        assert result.judge_name == "Rodriguez"
+        assert result.rulings[0].case_number == "22SMCV01940"
+        assert result.rulings[0].case_title == "Smith v. Jones"
+        assert len(result.rulings[0].parties) == 2
+        assert result.rulings[0].confidence.case_title.value == "medium"
+        assert result.rulings[0].confidence.judge.value == "low"
+
+    def test_old_field_names_still_work(self) -> None:
+        """Backward compatibility: old field names without extracted_ prefix."""
+        response_json = json.dumps(
+            {
+                "judge_name": "Smith",
+                "hearing_date": "2026-01-01",
+                "department": "1",
+                "rulings": [
+                    {
+                        "case_number": "ABC123",
+                        "case_title": "A v. B",
+                        "outcome": "denied",
+                        "parties": [{"name": "A", "role": "plaintiff"}],
+                    }
+                ],
+            }
+        )
+        result = _parse_response(response_json, None)
+        assert result is not None
+        assert result.judge_name == "Smith"
+        assert result.rulings[0].case_number == "ABC123"
+        assert result.rulings[0].case_title == "A v. B"
+
+    def test_confidence_defaults_when_missing(self) -> None:
+        """When confidence is not in the response, defaults to all high."""
+        response_json = json.dumps(
+            {
+                "judge_name": "Test",
+                "rulings": [
+                    {
+                        "case_number": "123",
+                        "outcome": "granted",
+                        "parties": [],
+                    }
+                ],
+            }
+        )
+        result = _parse_response(response_json, None)
+        assert result is not None
+        assert result.rulings[0].confidence.case_number.value == "high"
+        assert result.rulings[0].confidence.judge.value == "high"
+
+    def test_per_party_confidence_parsed(self) -> None:
+        """Per-party confidence scores should be preserved when provided."""
+        response_json = json.dumps(
+            {
+                "judge_name": "Test",
+                "rulings": [
+                    {
+                        "case_number": "123",
+                        "outcome": "granted",
+                        "extracted_parties": [
+                            {"name": "Alice", "role": "plaintiff", "confidence": "high"},
+                            {"name": "Bob", "role": "defendant", "confidence": "low"},
+                        ],
+                    }
+                ],
+            }
+        )
+        result = _parse_response(response_json, None)
+        assert result is not None
+        assert len(result.rulings[0].parties) == 2
+        assert result.rulings[0].parties[0]["confidence"] == "high"
+        assert result.rulings[0].parties[1]["confidence"] == "low"
+
+    def test_per_party_confidence_omitted_when_absent(self) -> None:
+        """When party has no confidence field, it should not be in the dict."""
+        response_json = json.dumps(
+            {
+                "judge_name": "Test",
+                "rulings": [
+                    {
+                        "case_number": "123",
+                        "outcome": "granted",
+                        "parties": [
+                            {"name": "Alice", "role": "plaintiff"},
+                        ],
+                    }
+                ],
+            }
+        )
+        result = _parse_response(response_json, None)
+        assert result is not None
+        assert "confidence" not in result.rulings[0].parties[0]
+
+    def test_per_party_invalid_confidence_ignored(self) -> None:
+        """Invalid per-party confidence values should be omitted."""
+        response_json = json.dumps(
+            {
+                "judge_name": "Test",
+                "rulings": [
+                    {
+                        "case_number": "123",
+                        "outcome": "granted",
+                        "extracted_parties": [
+                            {"name": "Alice", "role": "plaintiff", "confidence": "very_sure"},
+                        ],
+                    }
+                ],
+            }
+        )
+        result = _parse_response(response_json, None)
+        assert result is not None
+        assert "confidence" not in result.rulings[0].parties[0]

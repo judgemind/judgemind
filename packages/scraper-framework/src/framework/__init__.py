@@ -7,6 +7,16 @@ from .encoding import decode_response, detect_encoding
 from .event_bus import RedisEventBus
 from .events import EventBus
 from .hashing import content_changed, sha256_hex
+from .llm_schema import (
+    EXTRACTION_SYSTEM_PROMPT,
+    ConfidenceLevel,
+    ExtractedParty,
+    ExtractedRuling,
+    ExtractionCaseType,
+    ExtractionOutcome,
+    ExtractionResult,
+    FieldConfidence,
+)
 from .models import (
     CapturedDocument,
     ContentFormat,
@@ -24,9 +34,17 @@ from .storage import S3Archiver, build_s3_key
 
 __all__ = [
     "BaseScraper",
+    "ConfidenceLevel",
     "CourtDirectory",
     "CapturedDocument",
     "ContentFormat",
+    "EXTRACTION_SYSTEM_PROMPT",
+    "ExtractionCaseType",
+    "ExtractionOutcome",
+    "ExtractionResult",
+    "ExtractedParty",
+    "ExtractedRuling",
+    "FieldConfidence",
     "decode_response",
     "detect_encoding",
     "DocumentCapturedEvent",

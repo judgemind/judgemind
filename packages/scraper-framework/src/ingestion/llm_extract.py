@@ -24,6 +24,12 @@ from datetime import date
 
 import structlog
 
+from framework.llm_schema import (
+    EXTRACTION_SYSTEM_PROMPT,
+    ConfidenceLevel,
+    FieldConfidence,
+)
+
 from .llm_providers import call_llm, call_llm_with_images
 
 logger = structlog.get_logger(__name__)
@@ -78,6 +84,7 @@ class LLMRulingResult:
     outcome: str | None = None  # Uses ruling_outcome enum values
     motion_type: str | None = None
     parties: list[dict[str, str]] = field(default_factory=list)
+    confidence: FieldConfidence = field(default_factory=FieldConfidence)
 
 
 @dataclass
@@ -416,141 +423,13 @@ def _ocr_single_page(
 
 
 # ---------------------------------------------------------------------------
-# System prompt (v2 — from evaluation)
+# System prompt — now sourced from framework.llm_schema (co-located with the
+# Pydantic schema so they stay in sync).  The ``_SYSTEM_PROMPT`` name is kept
+# as a module-level alias for backward compatibility with existing tests and
+# callers that import it directly.
 # ---------------------------------------------------------------------------
 
-_SYSTEM_PROMPT = (  # noqa: E501 — prompt text sent to LLM, line length irrelevant
-    "You are a legal document parser for California court "
-    "tentative rulings.\n\n"
-    "Given a court ruling document, extract ALL structured "
-    "fields into JSON.\n\n"
-    "## Rules\n\n"
-    "1. **Multi-ruling documents:** A single document may "
-    "contain rulings for MANY cases (sometimes 10+). You MUST "
-    "return an array of ALL cases found in the entire document. "
-    "Read through the ENTIRE document systematically — do not "
-    "stop after the first few cases. Count every case number "
-    "you find. Common patterns: numbered lists (#1, #2, ...), "
-    "case headers with case numbers, or page breaks between "
-    "cases.\n\n"
-    "2. **Multi-department documents:** Some documents contain "
-    "rulings from multiple departments (e.g. Dept N14 on page 1, "
-    "Dept N6 on page 15). Extract ALL rulings from ALL "
-    "departments. The top-level judge_name and department should "
-    "reflect the FIRST department in the document. If different "
-    "departments have different judges, note the judge for each "
-    "department in the rulings where applicable.\n\n"
-    "3. **Outcome taxonomy** — use EXACTLY one of these "
-    "values:\n"
-    "   - granted — motion was fully granted, INCLUDING "
-    "'granted with conditions'\n"
-    "   - denied — motion was fully denied, INCLUDING "
-    "'denied without prejudice'\n"
-    "   - granted_in_part — motion was partially granted "
-    "and partially denied\n"
-    "   - denied_in_part — motion was partially denied\n"
-    "   - moot — motion is moot (no longer relevant)\n"
-    "   - continued — hearing was postponed to a future date\n"
-    "   - off_calendar — the hearing was REMOVED from the "
-    "calendar entirely. This is NOT the same as 'continued'. "
-    "'Off calendar' means the matter will not be heard. "
-    "Look for phrases like 'taken off calendar', "
-    "'off calendar', 'removed from calendar', "
-    "'OCAL', 'OC', or 'vacated'.\n"
-    "   - submitted — matter was taken under submission "
-    "for the judge to decide later\n"
-    "   - other (only if none of the above fit)\n\n"
-    "4. **Case number normalization:** Strip any county "
-    "prefix digits before the year. For example, "
-    '"30-2024-01393434" becomes "2024-01393434". '
-    "Keep the full number for formats like "
-    '"24NNCV02551".\n\n'
-    "5. **Department normalization:** Preserve the department "
-    "identifier exactly as it appears in the document, "
-    "INCLUDING leading zeros. For example, 'CM02' stays "
-    "'CM02' (do NOT simplify to 'CM2'). 'CM05' stays "
-    "'CM05'. 'N14' stays 'N14'.\n\n"
-    "6. **Parties:** Extract plaintiff(s) and defendant(s) "
-    "from case captions. Each party is "
-    '{"name": "...", "role": "plaintiff"} or '
-    '{"name": "...", "role": "defendant"}.\n\n'
-    "7. **Case type:** Classify the case using EXACTLY one "
-    "of these values:\n"
-    "   - civil (general civil litigation, torts, contracts, "
-    "employment, PI — includes 'unlimited civil' and "
-    "'limited civil')\n"
-    "   - criminal\n"
-    "   - family (divorce, custody, domestic violence)\n"
-    "   - probate (wills, estates, conservatorships, "
-    "guardianships)\n"
-    "   - small_claims\n"
-    "   - juvenile\n"
-    "   - traffic\n"
-    "   - other (only if none of the above fit)\n\n"
-    "   Inference hints: case numbers starting with SC or "
-    "containing 'SC' often indicate small claims; "
-    "'CV', 'CIV', 'STCV' indicate civil; "
-    "'CR', 'F' indicate criminal; "
-    "'FL', 'DV' indicate family; "
-    "'PR', 'BP' indicate probate. "
-    "Motion types like 'demurrer', 'msj', 'anti_slapp' "
-    "are civil. "
-    "If the case type cannot be determined, use null.\n\n"
-    "8. **Motion type:** Use a short descriptive label. "
-    "Common values: "
-    '"msj" (summary judgment), '
-    '"msj_partial" (summary adjudication), '
-    '"mtd" (motion to dismiss), '
-    '"mil" (motion in limine), '
-    '"demurrer", "motion_to_compel", '
-    '"motion_to_strike", "anti_slapp", '
-    '"preliminary_injunction", '
-    '"ex_parte_application", "petition", '
-    '"default_judgment", '
-    '"motion_for_attorney_fees", '
-    '"motion_to_be_relieved_as_counsel", '
-    '"motion_for_leave_to_amend", '
-    '"motion_for_sanctions", '
-    '"motion_for_judgment_on_the_pleadings", '
-    '"motion_for_protective_order", '
-    '"osc" (order to show cause), "other".\n\n'
-    "9. **Hearing date:** Return as ISO format "
-    '"YYYY-MM-DD".\n\n'
-    "10. **Judge name:** Extract the judge's full name. "
-    'Do not include titles like "Hon.", "Judge", or '
-    '"Commissioner". Check ALL of these locations for '
-    "the judge's name:\n"
-    "   - Document headers and footers\n"
-    "   - Department headings (e.g. 'DEPT C25 / "
-    "Judge Gassia Apkarian')\n"
-    "   - Signature blocks at the end of rulings\n"
-    "   - PDF metadata or page headers\n"
-    "   - The ruling text itself\n"
-    "   If no judge name is found anywhere, return null.\n\n"
-    "11. If metadata is provided (judge_name, department), "
-    "treat it as authoritative — use it directly rather "
-    "than extracting from the document.\n\n"
-    "## Output format\n\n"
-    "Respond with ONLY a JSON object, no other text:\n\n"
-    "{\n"
-    '  "judge_name": "First M. Last" or null,\n'
-    '  "hearing_date": "YYYY-MM-DD" or null,\n'
-    '  "department": "C25" or "N14" or "CM02" or null,\n'
-    '  "rulings": [\n'
-    "    {\n"
-    '      "case_number": "24NNCV02551" or null,\n'
-    '      "case_title": "Smith v. Jones" or null,\n'
-    '      "case_type": "civil" or null,\n'
-    '      "outcome": "granted" or null,\n'
-    '      "motion_type": "msj" or null,\n'
-    '      "parties": [\n'
-    '        {"name": "John Smith", "role": "plaintiff"},\n'
-    '        {"name": "Jane Jones", "role": "defendant"}\n'
-    "      ]\n"
-    "    }\n"
-    "  ]\n"
-    "}"
-)
+_SYSTEM_PROMPT = EXTRACTION_SYSTEM_PROMPT
 
 
 # ---------------------------------------------------------------------------
@@ -967,6 +846,34 @@ def _build_user_message(
     return "\n\n".join(user_parts)
 
 
+_VALID_CONFIDENCE_LEVELS = frozenset({"high", "medium", "low"})
+
+
+def _parse_confidence(raw: dict[str, str] | None) -> FieldConfidence:
+    """Parse a confidence dict from the LLM response into a ``FieldConfidence``.
+
+    Unknown or invalid confidence values are defaulted to ``ConfidenceLevel.HIGH``
+    (the default assumption when the LLM does not explicitly flag uncertainty).
+    """
+    if not raw or not isinstance(raw, dict):
+        return FieldConfidence()
+
+    def _level(key: str) -> ConfidenceLevel:
+        val = raw.get(key, "high")
+        if val in _VALID_CONFIDENCE_LEVELS:
+            return ConfidenceLevel(val)
+        return ConfidenceLevel.HIGH
+
+    return FieldConfidence(
+        case_number=_level("case_number"),
+        case_title=_level("case_title"),
+        parties=_level("parties"),
+        judge=_level("judge"),
+        ruling_text=_level("ruling_text"),
+        outcome=_level("outcome"),
+    )
+
+
 def _parse_response(
     raw_text: str,
     metadata: dict[str, str] | None,
@@ -985,8 +892,10 @@ def _parse_response(
         logger.warning("llm_extract.json_parse_error", error=str(exc), raw=raw_text[:200])
         return None
 
-    # Extract top-level fields
-    judge_name = parsed.get("judge_name")
+    # Extract top-level fields — support both old field names (judge_name)
+    # and new extracted_ prefix names (extracted_judge_name) for backward
+    # compatibility during the transition.
+    judge_name = parsed.get("extracted_judge_name") or parsed.get("judge_name")
     hearing_date = _parse_date(parsed.get("hearing_date"))
     department = parsed.get("department")
 
@@ -1011,10 +920,13 @@ def _parse_response(
         if not isinstance(r, dict):
             continue
 
-        # Normalize case number
-        case_number = r.get("case_number")
+        # Normalize case number — support both old and new field names
+        case_number = r.get("extracted_case_number") or r.get("case_number")
         if case_number:
             case_number = _normalize_case_number(str(case_number))
+
+        # Case title — support both old and new field names
+        case_title = r.get("extracted_case_title") or r.get("case_title")
 
         # Validate case_type against enum
         case_type = r.get("case_type")
@@ -1026,10 +938,10 @@ def _parse_response(
         if outcome and outcome not in OUTCOME_VALUES:
             outcome = "other"
 
-        # Parse parties — validate that names are plausible (not
-        # garbage text blocks).  Real party names are well under 200
-        # chars and never contain newlines.
-        raw_parties = r.get("parties", [])
+        # Parse parties — support both old (parties) and new
+        # (extracted_parties) field names.  Validate that names are
+        # plausible (not garbage text blocks).
+        raw_parties = r.get("extracted_parties") or r.get("parties", [])
         parties: list[dict[str, str]] = []
         if isinstance(raw_parties, list):
             for p in raw_parties:
@@ -1042,16 +954,29 @@ def _parse_response(
                             preview=name[:80],
                         )
                         continue
-                    parties.append({"name": name, "role": str(p["role"])})
+                    party_entry: dict[str, str] = {
+                        "name": name,
+                        "role": str(p["role"]),
+                    }
+                    # Preserve per-party confidence if provided by the LLM
+                    raw_party_conf = p.get("confidence")
+                    if raw_party_conf and raw_party_conf in _VALID_CONFIDENCE_LEVELS:
+                        party_entry["confidence"] = raw_party_conf
+                    parties.append(party_entry)
+
+        # Parse confidence scores (new in schema v3)
+        raw_confidence = r.get("confidence", {})
+        confidence = _parse_confidence(raw_confidence)
 
         rulings.append(
             LLMRulingResult(
                 case_number=case_number,
-                case_title=r.get("case_title"),
+                case_title=case_title,
                 case_type=case_type,
                 outcome=outcome,
                 motion_type=r.get("motion_type"),
                 parties=parties,
+                confidence=confidence,
             )
         )
 
