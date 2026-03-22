@@ -66,17 +66,33 @@ jobs:
           MAX_ATTEMPTS=60
           POLL_INTERVAL=15
           ATTEMPT=0
+          # After this many NOT_FOUND attempts with the exact SHA, fall back
+          # to querying recent deployments without the SHA filter. This handles
+          # squash merges where Vercel stores the original branch SHA, not the
+          # merge commit SHA that github.sha provides.
+          FALLBACK_AFTER=5
+          USING_FALLBACK=false
+          # Record workflow start time (epoch ms) for fallback timestamp check
+          START_TIME_MS=$(date +%s)000
 
           while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
             ATTEMPT=$((ATTEMPT + 1))
             echo "Poll attempt $ATTEMPT / $MAX_ATTEMPTS"
 
-            # Query Vercel deployments API for this commit
-            RESPONSE=$(curl -s \
-              -H "Authorization: Bearer $VERCEL_TOKEN" \
-              "https://api.vercel.com/v6/deployments?projectId=$VERCEL_PROJECT&teamId=$VERCEL_TEAM_SLUG&meta-githubCommitSha=$COMMIT_SHA&limit=1")
+            if [ "$USING_FALLBACK" = "true" ]; then
+              # Fallback: query recent deployments for the project without SHA filter
+              echo "Using fallback query (recent deployments, no SHA filter)"
+              RESPONSE=$(curl -s \
+                -H "Authorization: Bearer $VERCEL_TOKEN" \
+                "https://api.vercel.com/v6/deployments?projectId=$VERCEL_PROJECT&teamId=$VERCEL_TEAM_SLUG&target=production&limit=5&since=$START_TIME_MS")
+            else
+              # Primary: query by exact commit SHA
+              RESPONSE=$(curl -s \
+                -H "Authorization: Bearer $VERCEL_TOKEN" \
+                "https://api.vercel.com/v6/deployments?projectId=$VERCEL_PROJECT&teamId=$VERCEL_TEAM_SLUG&meta-githubCommitSha=$COMMIT_SHA&limit=1")
+            fi
 
-            # Check if we got a deployment
+            # Parse deployment state and URL from the response
             DEPLOY_STATE=$(echo "$RESPONSE" | python3 -c "
           import sys, json
           try:
@@ -117,6 +133,11 @@ jobs:
                 exit 1
                 ;;
               NOT_FOUND|QUEUED|BUILDING|INITIALIZING)
+                # Switch to fallback after several NOT_FOUND attempts with exact SHA
+                if [ "$USING_FALLBACK" = "false" ] && [ "$DEPLOY_STATE" = "NOT_FOUND" ] && [ "$ATTEMPT" -ge "$FALLBACK_AFTER" ]; then
+                  echo "Commit SHA not found after $ATTEMPT attempts — switching to fallback (recent deployments)"
+                  USING_FALLBACK=true
+                fi
                 echo "Deployment in progress ($DEPLOY_STATE), waiting ${POLL_INTERVAL}s..."
                 sleep $POLL_INTERVAL
                 ;;
