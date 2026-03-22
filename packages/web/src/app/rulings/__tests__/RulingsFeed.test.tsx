@@ -38,7 +38,8 @@ vi.mock('@/lib/display-helpers', () => ({
   formatMotionType: (m: string | null) => m ?? '\u2014',
   formatJudgeName: (j: { canonicalName: string } | null) =>
     j?.canonicalName ?? '\u2014',
-  getOutcomeBadgeClass: () => 'bg-slate-100 text-slate-600',
+  getOutcomeBadgeVariant: () => 'outline',
+  getOutcomeBadgeListClass: () => '',
 }));
 
 import { RulingsFeed } from '../RulingsFeed';

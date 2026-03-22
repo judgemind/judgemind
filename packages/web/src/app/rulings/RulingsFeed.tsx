@@ -9,7 +9,8 @@ import {
   formatOutcome,
   formatMotionType,
   formatJudgeName,
-  getOutcomeBadgeClass,
+  getOutcomeBadgeVariant,
+  getOutcomeBadgeListClass,
 } from '@/lib/display-helpers';
 import { Autocomplete } from '@/components/Autocomplete';
 import { useCountyOptions } from '@/lib/filter-options';
@@ -282,7 +283,8 @@ export function RulingsFeed() {
 
                     <div className="mt-2 flex flex-wrap gap-2">
                       <Badge
-                        className={getOutcomeBadgeClass(node.outcome)}
+                        variant={getOutcomeBadgeVariant(node.outcome)}
+                        className={getOutcomeBadgeListClass(node.outcome)}
                       >
                         {formatOutcome(node.outcome)}
                       </Badge>

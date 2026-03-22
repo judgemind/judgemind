@@ -9,6 +9,7 @@ import {
   formatLabel,
   formatMotionType,
   getOutcomeBadgeClass,
+  getOutcomeBadgeListClass,
   getOutcomeBadgeVariant,
   groupParties,
   RULING_TEXT_TRUNCATE_LENGTH,
@@ -1065,20 +1066,20 @@ describe('stripMetadataHeaderHtml', () => {
 // ---------------------------------------------------------------------------
 
 describe('getOutcomeBadgeVariant', () => {
-  it('returns "default" for granted', () => {
-    expect(getOutcomeBadgeVariant('granted')).toBe('default');
+  it('returns "outline" for granted (soft variant for feed/list views)', () => {
+    expect(getOutcomeBadgeVariant('granted')).toBe('outline');
   });
 
-  it('returns "destructive" for denied', () => {
-    expect(getOutcomeBadgeVariant('denied')).toBe('destructive');
+  it('returns "outline" for denied (soft variant for feed/list views)', () => {
+    expect(getOutcomeBadgeVariant('denied')).toBe('outline');
   });
 
-  it('returns "secondary" for granted_in_part', () => {
-    expect(getOutcomeBadgeVariant('granted_in_part')).toBe('secondary');
+  it('returns "outline" for granted_in_part', () => {
+    expect(getOutcomeBadgeVariant('granted_in_part')).toBe('outline');
   });
 
-  it('returns "secondary" for denied_in_part', () => {
-    expect(getOutcomeBadgeVariant('denied_in_part')).toBe('secondary');
+  it('returns "outline" for denied_in_part', () => {
+    expect(getOutcomeBadgeVariant('denied_in_part')).toBe('outline');
   });
 
   it('returns "outline" for moot', () => {
@@ -1136,5 +1137,49 @@ describe('getOutcomeBadgeClass', () => {
 
   it('returns slate fallback for moot (no specific CSS mapping)', () => {
     expect(getOutcomeBadgeClass('moot')).toContain('bg-slate-100');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// getOutcomeBadgeListClass (#1449 — subtle semantic tints for feed/list views)
+// ---------------------------------------------------------------------------
+
+describe('getOutcomeBadgeListClass', () => {
+  it('returns green tint classes for granted', () => {
+    expect(getOutcomeBadgeListClass('granted')).toContain('text-green-700');
+    expect(getOutcomeBadgeListClass('granted')).toContain('border-green-300');
+    expect(getOutcomeBadgeListClass('granted')).toContain('dark:text-green-400');
+  });
+
+  it('returns red tint classes for denied', () => {
+    expect(getOutcomeBadgeListClass('denied')).toContain('text-red-700');
+    expect(getOutcomeBadgeListClass('denied')).toContain('border-red-300');
+    expect(getOutcomeBadgeListClass('denied')).toContain('dark:text-red-400');
+  });
+
+  it('returns yellow tint classes for granted_in_part', () => {
+    expect(getOutcomeBadgeListClass('granted_in_part')).toContain('text-yellow-700');
+    expect(getOutcomeBadgeListClass('granted_in_part')).toContain('border-yellow-300');
+  });
+
+  it('returns yellow tint classes for denied_in_part', () => {
+    expect(getOutcomeBadgeListClass('denied_in_part')).toContain('text-yellow-700');
+    expect(getOutcomeBadgeListClass('denied_in_part')).toContain('border-yellow-300');
+  });
+
+  it('returns empty string for null', () => {
+    expect(getOutcomeBadgeListClass(null)).toBe('');
+  });
+
+  it('returns empty string for unknown outcome', () => {
+    expect(getOutcomeBadgeListClass('something_unknown')).toBe('');
+  });
+
+  it('returns empty string for moot (no specific tint)', () => {
+    expect(getOutcomeBadgeListClass('moot')).toBe('');
+  });
+
+  it('returns empty string for continued (no specific tint)', () => {
+    expect(getOutcomeBadgeListClass('continued')).toBe('');
   });
 });

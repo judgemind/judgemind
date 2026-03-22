@@ -82,12 +82,16 @@ export function formatOutcome(outcome: string | null): string {
 /** Badge variant type matching shadcn Badge component. */
 export type OutcomeBadgeVariant = 'default' | 'secondary' | 'destructive' | 'outline';
 
-/** Mapping from outcome code to shadcn Badge variant. */
+/**
+ * Mapping from outcome code to shadcn Badge variant.
+ * All outcomes use 'outline' for a softer visual weight on feed/list views.
+ * Semantic coloring is provided via getOutcomeBadgeListClass() instead.
+ */
 const OUTCOME_VARIANT_MAP: Record<string, OutcomeBadgeVariant> = {
-  granted: 'default',
-  denied: 'destructive',
-  granted_in_part: 'secondary',
-  denied_in_part: 'secondary',
+  granted: 'outline',
+  denied: 'outline',
+  granted_in_part: 'outline',
+  denied_in_part: 'outline',
   moot: 'outline',
   continued: 'outline',
   other: 'outline',
@@ -126,6 +130,29 @@ const OUTCOME_CLASS_FALLBACK =
 export function getOutcomeBadgeClass(outcome: string | null): string {
   if (!outcome) return OUTCOME_CLASS_FALLBACK;
   return OUTCOME_CLASS_MAP[outcome] ?? OUTCOME_CLASS_FALLBACK;
+}
+
+/** Mapping from outcome code to subtle semantic tint classes for outline badges on feed/list views. */
+const OUTCOME_LIST_CLASS_MAP: Record<string, string> = {
+  granted:
+    'text-green-700 border-green-300 dark:text-green-400 dark:border-green-700',
+  denied:
+    'text-red-700 border-red-300 dark:text-red-400 dark:border-red-700',
+  granted_in_part:
+    'text-yellow-700 border-yellow-300 dark:text-yellow-400 dark:border-yellow-700',
+  denied_in_part:
+    'text-yellow-700 border-yellow-300 dark:text-yellow-400 dark:border-yellow-700',
+};
+
+/**
+ * Get subtle semantic tint classes for outcome badges on feed/list views.
+ * Intended to be used alongside `variant="outline"` (from getOutcomeBadgeVariant)
+ * to provide semantic coloring without the visual heaviness of filled badges.
+ * Returns an empty string for outcomes with no specific tint (moot, continued, etc.).
+ */
+export function getOutcomeBadgeListClass(outcome: string | null): string {
+  if (!outcome) return '';
+  return OUTCOME_LIST_CLASS_MAP[outcome] ?? '';
 }
 
 // ---------------------------------------------------------------------------

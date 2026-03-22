@@ -5,7 +5,7 @@ import { useQuery, gql } from '@apollo/client';
 import { useRouter, useSearchParams } from 'next/navigation';
 import Link from 'next/link';
 import { Search, SlidersHorizontal, Calendar, Scale, Gavel } from 'lucide-react';
-import { formatDate, getOutcomeBadgeVariant } from '@/lib/display-helpers';
+import { formatDate, getOutcomeBadgeVariant, getOutcomeBadgeListClass } from '@/lib/display-helpers';
 import { sanitizeExcerptHtml } from '@/lib/sanitize-html';
 import { Autocomplete } from '@/components/Autocomplete';
 import { useCountyOptions, useJudgeNameOptions } from '@/lib/filter-options';
@@ -398,7 +398,7 @@ function ResultCard({ node }: { node: SearchHitNode }) {
                 <Badge variant="secondary">{motionLabel}</Badge>
               )}
               {outcomeLabel && (
-                <Badge variant={outcomeBadgeVariant}>{outcomeLabel}</Badge>
+                <Badge variant={outcomeBadgeVariant} className={getOutcomeBadgeListClass(node.outcome)}>{outcomeLabel}</Badge>
               )}
             </div>
           )}

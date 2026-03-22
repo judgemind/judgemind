@@ -12,6 +12,7 @@ import {
   formatLabel,
   formatOutcome,
   getOutcomeBadgeVariant,
+  getOutcomeBadgeListClass,
   groupParties,
   stripMetadataHeaderHtml,
   type RulingMetadata,
@@ -452,6 +453,7 @@ export function CaseDetail({ caseId }: { caseId: string }) {
                   </span>
                   <Badge
                     variant={getOutcomeBadgeVariant(node.outcome)}
+                    className={getOutcomeBadgeListClass(node.outcome)}
                   >
                     {formatOutcome(node.outcome)}
                   </Badge>
