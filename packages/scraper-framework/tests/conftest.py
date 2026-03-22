@@ -11,13 +11,18 @@ Phase 1 (#1207) added a per-worker in-memory LRU cache.  Phase 2 (#1219)
 replaces it with a **disk-based, cross-worker cache** so that all pytest-xdist
 workers share extracted text.  The cache uses ``tmp_path_factory`` to locate
 the shared temp root (the parent of per-worker temp dirs).  Each entry is
-keyed by the SHA-256 hash of the input PDF bytes; the first worker to parse a
-given PDF writes the result to disk and all subsequent workers (including from
-other xdist processes) read from it.
+keyed by the combination of the extraction function's ``__qualname__`` and the
+SHA-256 hash of the input PDF bytes; the first worker to parse a given PDF
+writes the result to disk and all subsequent workers (including from other
+xdist processes) read from it.
+
+Including the function identifier in the key prevents collisions between
+different extractors called on the same PDF bytes (e.g. ``_extract_pdf_text``
+vs ``_extract_oc_pdf_text``).
 
 No external dependencies are needed — the cache uses stdlib ``hashlib`` and
 ``pathlib``.  Race conditions between workers writing the same key are harmless
-because the output is deterministic (same bytes -> same text).
+because the output is deterministic (same function + same bytes -> same text).
 
 Additionally, ``time.sleep`` in the retry module is replaced with a no-op so
 that retry-backoff tests (which sleep 2 s + 4 s = 6 s by default) complete
@@ -27,9 +32,12 @@ instantly.
 from __future__ import annotations
 
 import hashlib
+import importlib
 import os
+import sys
 from collections.abc import Callable, Generator
 from pathlib import Path
+from types import ModuleType
 from unittest.mock import patch
 
 import pytest
@@ -41,6 +49,27 @@ from courts.ca import pdf_link_scraper as _pls
 from courts.ca import riverside_tentatives as _riv
 from courts.ca import sc_tentatives as _sc
 from courts.ca import ventura_tentatives as _ven
+
+# ---------------------------------------------------------------------------
+# Backfill module — imported lazily for caching its _extract_oc_pdf_text
+# ---------------------------------------------------------------------------
+
+_SCRIPTS_DIR = str(Path(__file__).resolve().parent.parent.parent.parent / "scripts")
+
+
+def _import_backfill_oc() -> ModuleType | None:
+    """Import the backfill_oc_ruling_text script as a module.
+
+    Returns ``None`` if the script is not found (e.g. running tests from
+    a partial checkout).  The caller should skip patching in that case.
+    """
+    if _SCRIPTS_DIR not in sys.path:
+        sys.path.insert(0, _SCRIPTS_DIR)
+    try:
+        return importlib.import_module("backfill_oc_ruling_text")
+    except (ImportError, ModuleNotFoundError):
+        return None
+
 
 # ---------------------------------------------------------------------------
 # Disk-based cross-worker PDF text cache
@@ -56,8 +85,16 @@ def _make_disk_cached(
     """Wrap a PDF extraction function with a disk-backed cache.
 
     On cache miss the real function is called and the result is written to
-    ``<cache_dir>/<sha256>.txt``.  On cache hit the file is read directly.
+    ``<cache_dir>/<fn_qualname>_<sha256>.txt``.  On cache hit the file is
+    read directly.
+
+    The cache key includes ``real_fn.__qualname__`` so that different
+    extractors called on the same PDF bytes get separate cache entries.
+    Without this, e.g. ``_extract_pdf_text`` and ``_extract_oc_pdf_text``
+    on the same bytes would collide — whichever ran first would win the
+    cache slot and the other would silently return the wrong result.
     """
+    fn_id = real_fn.__qualname__
 
     def _cached(pdf_bytes: bytes) -> str:
         cache_dir = _pdf_cache_dir
@@ -66,7 +103,7 @@ def _make_disk_cached(
             return real_fn(pdf_bytes)
 
         key = hashlib.sha256(pdf_bytes).hexdigest()
-        cache_file = cache_dir / f"{key}.txt"
+        cache_file = cache_dir / f"{fn_id}_{key}.txt"
 
         # Fast path: cache hit
         if cache_file.exists():
@@ -155,6 +192,19 @@ def _cache_pdf_text_extraction(
         patch.object(_ven, "_extract_pdf_text", _cached_ven),
         patch.object(_oc, "_extract_oc_pdf_text", _cached_oc),
     ]
+
+    # --- backfill_oc_ruling_text._extract_oc_pdf_text (inlined copy) ---
+    # The backfill script has its own copy of the OC extraction logic.
+    # Without this patch, tests in test_backfill_oc_ruling_text.py do
+    # uncached pdfplumber parses (~5s each), wasting ~30s total.
+    _backfill_mod = _import_backfill_oc()
+    if _backfill_mod is not None:
+        _cached_backfill_oc = _make_disk_cached(
+            _backfill_mod._extract_oc_pdf_text,
+        )
+        patches.append(
+            patch.object(_backfill_mod, "_extract_oc_pdf_text", _cached_backfill_oc),
+        )
 
     for p in patches:
         p.start()
