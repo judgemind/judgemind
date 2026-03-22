@@ -26,6 +26,13 @@ Example:
         --coverage-file coverage-artifacts/coverage-scraper-framework/coverage.xml \
         --coverage-file coverage-artifacts/coverage-scraper-courts/coverage.xml \
         --coverage-file coverage-artifacts/coverage-scraper-ingestion/coverage.xml
+
+    # Use a different baseline key for partial runs (framework-only, no courts):
+    scripts/update-coverage-baselines.py \
+        --package packages/scraper-framework \
+        --baseline-key packages/scraper-framework:framework-only \
+        --coverage-file coverage-artifacts/coverage-scraper-framework/coverage.xml \
+        --coverage-file coverage-artifacts/coverage-scraper-ingestion/coverage.xml
 """
 
 import argparse
@@ -128,6 +135,13 @@ def main() -> None:
         help="Package path relative to repo root (e.g. packages/scraper-framework)",
     )
     parser.add_argument(
+        "--baseline-key",
+        default=None,
+        help="Override the baselines dict key (default: use --package value). "
+        "Useful for tracking separate baselines for partial test runs, e.g. "
+        "'packages/scraper-framework:framework-only'.",
+    )
+    parser.add_argument(
         "--coverage-file",
         required=True,
         action="append",
@@ -194,7 +208,7 @@ def main() -> None:
     with open(baselines_path) as f:
         baselines = json.load(f)
 
-    pkg = args.package
+    pkg = args.baseline_key if args.baseline_key else args.package
     previous = baselines.get(pkg, 0)
 
     if current > previous:
