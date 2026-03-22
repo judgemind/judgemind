@@ -175,13 +175,13 @@ if [ "$RUN_IN_BG" != "true" ]; then
     if [ "$NEEDS_TIMEOUT" -eq 1 ]; then
         # Check if timeout is set and >= 300000
         if [ "$TIMEOUT" = "none" ]; then
-            echo "BLOCKED: This command may exceed the default 2-minute timeout and get auto-backgrounded. Retry with timeout: 600000 (10 minutes). See CLAUDE.md §Critical Rules." >&2
+            echo "BLOCKED: This command may exceed the default 2-minute timeout and get auto-backgrounded. Retry with timeout: 1200000 (20 minutes). See CLAUDE.md §Critical Rules." >&2
             exit 2
         fi
         # Check if timeout is a number and >= 300000
         if echo "$TIMEOUT" | grep -qE '^[0-9]+$' ; then
             if [ "$TIMEOUT" -lt 300000 ]; then
-                echo "BLOCKED: Timeout $TIMEOUT is too low for this long-running command (minimum 300000 / 5 minutes). Retry with timeout: 600000 (10 minutes). See CLAUDE.md §Critical Rules." >&2
+                echo "BLOCKED: Timeout $TIMEOUT is too low for this long-running command (minimum 300000 / 5 minutes). Retry with timeout: 1200000 (20 minutes). See CLAUDE.md §Critical Rules." >&2
                 exit 2
             fi
         fi
@@ -196,7 +196,7 @@ fi
 #    Exception: the tg-responder daemon runs from the main repo, not a worktree.
 if [ "$RUN_IN_BG" = "true" ]; then
     if echo "$EFFECTIVE_CWD" | grep -qE '\.claude/worktrees/' ; then
-        echo "BLOCKED: run_in_background is not allowed inside worktree subagents. Use timeout: 600000 instead. See CLAUDE.md §Critical Rules." >&2
+        echo "BLOCKED: run_in_background is not allowed inside worktree subagents. Use timeout: 1200000 instead. See CLAUDE.md §Critical Rules." >&2
         exit 2
     fi
 fi

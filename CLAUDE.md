@@ -34,7 +34,7 @@ These are the most frequently violated rules. **A PreToolUse hook enforces the s
 - **ALWAYS** watch CI to completion (`gh run watch`) before doing anything else after pushing.
 - **ALWAYS** create a PR immediately after your first push to a branch.
 - **ALWAYS** re-fetch GitHub issue or PR state before acting on it if more than a few minutes have elapsed since you last fetched it. Other agents may have closed, merged, or modified issues in the interim — acting on stale state causes incorrect cross-references, duplicate filings, and wasted work.
-- **ALWAYS** set `timeout: 600000` (10 minutes) on Bash commands that may take longer than 2 minutes. The default 2-minute timeout causes the platform to auto-background the command, which violates the no-background rule for subagents and causes lost results. Commands that need this: `pytest`, `gh run watch`, `terraform apply`, `pip install`, `npm install`, `npm run build`, `ruff check` on large codebases, and any script that processes data.
+- **ALWAYS** set `timeout: 1200000` (20 minutes) on Bash commands that may take longer than 2 minutes. The default 2-minute timeout causes the platform to auto-background the command, which violates the no-background rule for subagents and causes lost results. Commands that need this: `pytest`, `gh run watch`, `terraform apply`, `pip install`, `npm install`, `npm run build`, `ruff check` on large codebases, and any script that processes data.
 
 ## Enforced Rules — Automated Checks
 

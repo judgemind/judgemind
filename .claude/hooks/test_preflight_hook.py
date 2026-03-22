@@ -205,16 +205,16 @@ run_test(
 
 # Commands that SHOULD be allowed with sufficient timeout
 run_test(
-    "pytest with timeout 600000 allowed",
+    "pytest with timeout 1200000 allowed",
     ".venv/bin/pytest tests/ -v",
     0,
-    timeout=600000,
+    timeout=1200000,
 )
 run_test(
-    "gh run watch with timeout 600000 allowed",
+    "gh run watch with timeout 1200000 allowed",
     "gh run watch 12345 --repo judgemind/judgemind --interval 60",
     0,
-    timeout=600000,
+    timeout=1200000,
 )
 run_test(
     "pip install with timeout 300000 allowed (at minimum)",
@@ -223,28 +223,28 @@ run_test(
     timeout=300000,
 )
 run_test(
-    "npm install with timeout 600000 allowed",
+    "npm install with timeout 1200000 allowed",
     "npm install",
     0,
-    timeout=600000,
+    timeout=1200000,
 )
 run_test(
-    "npm run build with timeout 600000 allowed",
+    "npm run build with timeout 1200000 allowed",
     "npm run build",
     0,
-    timeout=600000,
+    timeout=1200000,
 )
 run_test(
-    "ruff check src/ with timeout 600000 allowed",
+    "ruff check src/ with timeout 1200000 allowed",
     ".venv/bin/ruff check src/",
     0,
-    timeout=600000,
+    timeout=1200000,
 )
 run_test(
-    "terraform apply with timeout 600000 allowed",
+    "terraform apply with timeout 1200000 allowed",
     "terraform -chdir=infra/terraform/environments/dev apply -auto-approve",
     0,
-    timeout=600000,
+    timeout=1200000,
 )
 
 # Commands that SHOULD be allowed with run_in_background=true even without timeout
@@ -302,7 +302,7 @@ run_test(
     "gh run watch with run_in_background in worktree blocked",
     "gh run watch 12345 --repo judgemind/judgemind --interval 60",
     2,
-    timeout=600000,
+    timeout=1200000,
     run_in_background=True,
     cwd_override=WORKTREE_CWD,
 )
@@ -310,7 +310,7 @@ run_test(
     "pytest with run_in_background in worktree blocked",
     ".venv/bin/pytest tests/ -v",
     2,
-    timeout=600000,
+    timeout=1200000,
     run_in_background=True,
     cwd_override=WORKTREE_CWD,
 )
@@ -357,7 +357,7 @@ run_test(
     "gh run watch without run_in_background in worktree allowed (with timeout)",
     "gh run watch 12345 --repo judgemind/judgemind --interval 60",
     0,
-    timeout=600000,
+    timeout=1200000,
     cwd_override=WORKTREE_CWD,
 )
 run_test(
