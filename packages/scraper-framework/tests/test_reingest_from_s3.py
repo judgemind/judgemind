@@ -29,7 +29,7 @@ _SRC_DIR = os.path.join(os.path.dirname(__file__), "..", "src")
 if _SRC_DIR not in sys.path:
     sys.path.insert(0, os.path.abspath(_SRC_DIR))
 
-from ingestion.splitter import make_split_document_id  # noqa: E402
+from ingestion.split_ids import make_split_document_id  # noqa: E402
 
 reingest = importlib.import_module("reingest_from_s3")
 
@@ -3181,10 +3181,10 @@ class TestProgressLogging:
 
 
 class TestSplitDocumentIdUnification:
-    """Tests that reingest uses the canonical make_split_document_id from ingestion.splitter."""
+    """Tests that reingest uses the canonical make_split_document_id from ingestion.split_ids."""
 
-    def test_reingest_uses_splitter_make_split_document_id(self) -> None:
-        """reingest_from_s3 imports make_split_document_id from ingestion.splitter."""
+    def test_reingest_uses_split_ids_make_split_document_id(self) -> None:
+        """reingest_from_s3 imports make_split_document_id from ingestion.split_ids."""
         assert reingest.make_split_document_id is make_split_document_id
 
     def test_no_local_make_split_document_id(self) -> None:

@@ -93,7 +93,7 @@ from ingestion.llm_extract import (  # noqa: E402
     extract_text_from_pdf,
 )
 from ingestion.llm_providers import create_client as create_llm_client  # noqa: E402
-from ingestion.splitter import make_split_document_id  # noqa: E402
+from ingestion.split_ids import make_split_document_id  # noqa: E402
 
 structlog.configure(
     processors=[

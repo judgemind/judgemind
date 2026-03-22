@@ -1,26 +1,20 @@
-"""Tests for the LLM extraction path in the ingestion worker (#1473).
+"""Tests for the LLM extraction path in the ingestion worker (#1473, #1475).
 
 Verifies that:
-1. Counties configured with extraction_method=llm use the framework
-   LlmExtractor instead of regex splitters.
-2. The LLM extraction path correctly splits multi-ruling documents.
-3. Fallback to regex path works when LLM extraction fails.
-4. The _llm_extracted flag skips redundant per-field extraction.
+1. The LLM extraction path correctly splits multi-ruling documents.
+2. When LLM extraction fails, single-document processing continues with
+   per-field LLM + regex fallback.
+3. The _llm_extracted flag skips redundant per-field extraction.
 """
 
 from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
-import pytest
-
 from framework.llm_schema import (
     ExtractedParty,
     ExtractedRuling,
     ExtractionOutcome,
-)
-from ingestion.extraction_config import (
-    reset_extraction_methods,
 )
 from ingestion.worker import IngestionWorker
 
@@ -77,31 +71,24 @@ def _make_worker() -> tuple[IngestionWorker, MagicMock]:
     return worker, os_mock
 
 
-@pytest.fixture(autouse=True)
-def _reset_config() -> None:  # noqa: ANN202
-    """Reset extraction method config after each test."""
-    yield
-    reset_extraction_methods()
-
-
 # ---------------------------------------------------------------------------
-# Tests: extraction_method routing
+# Tests: LLM extraction path
 # ---------------------------------------------------------------------------
 
 
-class TestExtractionMethodRouting:
-    """Verify the worker routes to the correct extraction path based on config."""
+class TestLlmExtractionPath:
+    """Tests for _llm_split_document and the LLM extraction flow."""
 
     @patch("ingestion.worker.batch_upsert_parties")
     @patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
     @patch("ingestion.worker.psycopg")
-    def test_llm_path_called_for_oc(
+    def test_llm_path_called_for_all_counties(
         self,
         mock_psycopg: MagicMock,
         mock_resolve_judge: MagicMock,
         mock_batch_upsert: MagicMock,
     ) -> None:
-        """Orange County events use the LLM extraction path."""
+        """All counties use the LLM extraction path (no per-county routing)."""
         worker, _ = _make_worker()
 
         mock_conn, mock_cur = _make_mock_conn()
@@ -137,44 +124,6 @@ class TestExtractionMethodRouting:
 
         # The framework extractor should have been called.
         mock_extractor.extract.assert_called_once()
-
-    @patch("ingestion.worker.batch_upsert_parties")
-    @patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
-    @patch("ingestion.worker.psycopg")
-    def test_regex_path_for_la(
-        self,
-        mock_psycopg: MagicMock,
-        mock_resolve_judge: MagicMock,
-        mock_batch_upsert: MagicMock,
-    ) -> None:
-        """Los Angeles events use the regex extraction path (default)."""
-        worker, _ = _make_worker()
-
-        mock_conn, mock_cur = _make_mock_conn()
-        mock_psycopg.connect.return_value = mock_conn
-        mock_cur.fetchone.side_effect = [
-            ("court-uuid-1",),
-            ("case-uuid-1",),
-            (True,),
-        ]
-
-        mock_extractor = MagicMock()
-        worker._framework_extractor = mock_extractor
-
-        event = _make_event(
-            state="CA",
-            county="Los Angeles",
-            case_number="23STCV12345",
-            judge_name="Smith, John A.",
-        )
-        worker.process_event(event)
-
-        # The framework extractor should NOT have been called.
-        mock_extractor.extract.assert_not_called()
-
-
-class TestLlmExtractionPath:
-    """Tests for _llm_split_document and the LLM extraction flow."""
 
     @patch("ingestion.worker.batch_upsert_parties")
     @patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
@@ -227,18 +176,14 @@ class TestLlmExtractionPath:
 
     @patch("ingestion.worker.batch_upsert_parties")
     @patch("ingestion.worker.resolve_judge", return_value=None)
-    @patch("ingestion.worker.split_document")
     @patch("ingestion.worker.psycopg")
-    def test_fallback_to_regex_on_llm_failure(
+    def test_continues_on_llm_failure(
         self,
         mock_psycopg: MagicMock,
-        mock_split_document: MagicMock,
         mock_resolve_judge: MagicMock,
         mock_batch_upsert: MagicMock,
     ) -> None:
-        """When LLM extraction fails, fall back to regex path."""
-        from ingestion.splitter import SplitResult
-
+        """When LLM extraction fails, single-document processing continues."""
         worker, _ = _make_worker()
 
         mock_conn, mock_cur = _make_mock_conn()
@@ -254,34 +199,25 @@ class TestLlmExtractionPath:
         mock_extractor.extract.side_effect = Exception("API error")
         worker._framework_extractor = mock_extractor
 
-        # Regex splitter returns a single result (pass-through).
-        mock_split_document.return_value = [
-            SplitResult(
-                ruling_text="The motion is GRANTED.",
-                case_number="2024-01234567",
-            )
-        ]
-
-        event = _make_event()
+        event = _make_event(
+            case_number="2024-01234567",
+            case_title="Smith v. Jones",
+        )
         worker.process_event(event)
 
-        # Regex splitter should have been called as fallback.
-        mock_split_document.assert_called_once()
+        # Should still process the document (single-document path).
+        mock_conn.commit.assert_called_once()
 
     @patch("ingestion.worker.batch_upsert_parties")
     @patch("ingestion.worker.resolve_judge", return_value=None)
-    @patch("ingestion.worker.split_document")
     @patch("ingestion.worker.psycopg")
-    def test_fallback_on_empty_llm_results(
+    def test_continues_on_empty_llm_results(
         self,
         mock_psycopg: MagicMock,
-        mock_split_document: MagicMock,
         mock_resolve_judge: MagicMock,
         mock_batch_upsert: MagicMock,
     ) -> None:
-        """When LLM extraction returns no rulings, fall back to regex."""
-        from ingestion.splitter import SplitResult
-
+        """When LLM extraction returns no rulings, single-document processing continues."""
         worker, _ = _make_worker()
 
         mock_conn, mock_cur = _make_mock_conn()
@@ -296,12 +232,14 @@ class TestLlmExtractionPath:
         mock_extractor.extract.return_value = []
         worker._framework_extractor = mock_extractor
 
-        mock_split_document.return_value = [SplitResult(ruling_text="The motion is GRANTED.")]
-
-        event = _make_event()
+        event = _make_event(
+            case_number="2024-01234567",
+            case_title="Smith v. Jones",
+        )
         worker.process_event(event)
 
-        mock_split_document.assert_called_once()
+        # Should still process the document.
+        mock_conn.commit.assert_called_once()
 
     @patch("ingestion.worker.batch_upsert_parties")
     @patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
@@ -435,10 +373,6 @@ class TestLlmExtractedFlag:
             outcome="granted",
             motion_type="Motion for Summary Judgment",
         )
-        # Force it to use regex path (LA county) to verify the flag
-        # takes precedence over extraction method.
-        event["county"] = "Los Angeles"
-        event["state"] = "CA"
 
         worker.process_event(event)
 
@@ -480,7 +414,6 @@ class TestLlmExtractedFlag:
             judge_name="Hon. Jane Doe",
             outcome="granted",
         )
-        event["county"] = "Los Angeles"
 
         worker.process_event(event)
 
@@ -515,7 +448,7 @@ class TestFrameworkExtractorInit:
             result1 = worker._get_framework_extractor()
             result2 = worker._get_framework_extractor()
             assert result1 is result2
-            # Only called once — second call returns cached.
+            # Only called once -- second call returns cached.
             mock_extractor_cls.assert_called_once()
 
     def test_lazy_init_failure_returns_none(self) -> None:
@@ -525,61 +458,3 @@ class TestFrameworkExtractorInit:
         with patch("ingestion.worker.LlmExtractor", side_effect=Exception("No API key")):
             result = worker._get_framework_extractor()
             assert result is None
-
-
-class TestExtractionMethodOnScraperConfig:
-    """Tests for the ExtractionMethod field on ScraperConfig."""
-
-    def test_default_is_regex(self) -> None:
-        from framework.models import ExtractionMethod, ScraperConfig
-
-        config = ScraperConfig(
-            scraper_id="test",
-            state="CA",
-            county="Orange",
-            court="Superior Court",
-            target_urls=["https://example.com"],
-        )
-        assert config.extraction_method == ExtractionMethod.REGEX
-
-    def test_set_to_llm(self) -> None:
-        from framework.models import ExtractionMethod, ScraperConfig
-
-        config = ScraperConfig(
-            scraper_id="test",
-            state="CA",
-            county="Orange",
-            court="Superior Court",
-            target_urls=["https://example.com"],
-            extraction_method=ExtractionMethod.LLM,
-        )
-        assert config.extraction_method == ExtractionMethod.LLM
-
-    def test_serialization(self) -> None:
-        from framework.models import ExtractionMethod, ScraperConfig
-
-        config = ScraperConfig(
-            scraper_id="test",
-            state="CA",
-            county="Orange",
-            court="Superior Court",
-            target_urls=["https://example.com"],
-            extraction_method=ExtractionMethod.LLM,
-        )
-        data = config.model_dump()
-        assert data["extraction_method"] == "llm"
-
-    def test_deserialization(self) -> None:
-        from framework.models import ExtractionMethod, ScraperConfig
-
-        config = ScraperConfig.model_validate(
-            {
-                "scraper_id": "test",
-                "state": "CA",
-                "county": "Orange",
-                "court": "Superior Court",
-                "target_urls": ["https://example.com"],
-                "extraction_method": "llm",
-            }
-        )
-        assert config.extraction_method == ExtractionMethod.LLM

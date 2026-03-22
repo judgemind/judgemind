@@ -3221,183 +3221,6 @@ def test_reclaim_pending_processes_multiple_messages(mock_psycopg: MagicMock) ->
 
 @patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
 @patch("ingestion.worker.psycopg")
-@patch("ingestion.worker.split_document")
-def test_process_event_no_split_single_result(
-    mock_split: MagicMock,
-    mock_psycopg: MagicMock,
-    mock_resolve_judge: MagicMock,
-) -> None:
-    """When split_document returns a single result, process_event proceeds normally."""
-    from ingestion.splitter import SplitResult
-
-    worker, os_mock = _make_worker()
-    mock_conn, mock_cur = _make_mock_conn()
-    mock_psycopg.connect.return_value = mock_conn
-    mock_cur.fetchone.side_effect = [
-        ("court-uuid-1",),  # upsert_court
-        ("case-uuid-1",),  # upsert_case
-        (True,),  # insert_document
-    ]
-
-    mock_split.return_value = [
-        SplitResult(
-            ruling_text="The motion is GRANTED.",
-            case_title="Smith v. Jones",
-            case_number="23STCV12345",
-        )
-    ]
-
-    event = _make_event()
-    worker.process_event(event)
-
-    # Normal processing: one commit, one OS index
-    mock_conn.commit.assert_called_once()
-    os_mock.index.assert_called_once()
-
-
-@patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
-@patch("ingestion.worker.psycopg")
-@patch("ingestion.worker.split_document")
-def test_process_event_split_creates_multiple_rulings(
-    mock_split: MagicMock,
-    mock_psycopg: MagicMock,
-    mock_resolve_judge: MagicMock,
-) -> None:
-    """When split_document returns multiple results, process_event creates
-    multiple rulings with different document_ids."""
-    from ingestion.splitter import SplitResult
-
-    worker, os_mock = _make_worker()
-    mock_conn, mock_cur = _make_mock_conn()
-    mock_psycopg.connect.return_value = mock_conn
-
-    # Each split will go through court, case, document, and ruling
-    # For 2 splits, we need 2 sets of fetchone results
-    mock_cur.fetchone.side_effect = [
-        # Split 0
-        ("court-uuid-1",),  # upsert_court
-        ("case-uuid-1",),  # upsert_case
-        (True,),  # insert_document
-        # Split 1
-        ("court-uuid-1",),  # upsert_court
-        ("case-uuid-2",),  # upsert_case
-        (False,),  # insert_document (same doc, already exists)
-    ]
-
-    mock_split.return_value = [
-        SplitResult(
-            ruling_text="First case text",
-            case_title="Case One",
-            case_number="CASE-0001",
-            motion_type="msj",
-        ),
-        SplitResult(
-            ruling_text="Second case text",
-            case_title="Case Two",
-            case_number="CASE-0002",
-            outcome="denied",
-        ),
-    ]
-
-    event = _make_event()
-    worker.process_event(event)
-
-    # Two commits (one per split), both indexed in OpenSearch
-    assert mock_conn.commit.call_count == 2
-    assert os_mock.index.call_count == 2
-
-    # Verify both splits were indexed with different document_ids
-    indexed_docs = [call.kwargs["body"] for call in os_mock.index.call_args_list]
-    assert indexed_docs[0]["document_id"] != indexed_docs[1]["document_id"]
-    assert indexed_docs[0]["ruling_text"] == "First case text"
-    assert indexed_docs[1]["ruling_text"] == "Second case text"
-
-
-@patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
-@patch("ingestion.worker.psycopg")
-@patch("ingestion.worker.split_document")
-def test_process_event_split_uses_original_document_id_for_documents_table(
-    mock_split: MagicMock,
-    mock_psycopg: MagicMock,
-    mock_resolve_judge: MagicMock,
-) -> None:
-    """Split rulings should use the original document_id for the documents table
-    (one PDF = one document row) but synthetic IDs for the rulings table."""
-    from ingestion.splitter import SplitResult, make_split_document_id
-
-    worker, os_mock = _make_worker()
-    mock_conn, mock_cur = _make_mock_conn()
-    mock_psycopg.connect.return_value = mock_conn
-
-    original_doc_id = "aaaaaaaa-0000-0000-0000-000000000001"
-
-    mock_cur.fetchone.side_effect = [
-        # Split 0
-        ("court-uuid-1",),
-        ("case-uuid-1",),
-        (True,),  # insert_document
-        # Split 1
-        ("court-uuid-1",),
-        ("case-uuid-2",),
-        (False,),  # insert_document (already exists)
-    ]
-
-    mock_split.return_value = [
-        SplitResult(ruling_text="Case 1 text", case_title="Case 1"),
-        SplitResult(ruling_text="Case 2 text", case_title="Case 2"),
-    ]
-
-    event = _make_event(document_id=original_doc_id)
-    worker.process_event(event)
-
-    # Find INSERT INTO documents calls
-    doc_calls = [c for c in mock_cur.execute.call_args_list if "INSERT INTO documents" in str(c)]
-    assert len(doc_calls) == 2
-
-    # Both should use the original document_id, not synthetic split IDs
-    for call in doc_calls:
-        sql_args = call[0][1]
-        assert original_doc_id in sql_args
-
-    # Find INSERT INTO rulings calls — should use synthetic split IDs
-    ruling_calls = [c for c in mock_cur.execute.call_args_list if "INSERT INTO rulings" in str(c)]
-    assert len(ruling_calls) == 2
-    split_id_0 = make_split_document_id(original_doc_id, 0)
-    split_id_1 = make_split_document_id(original_doc_id, 1)
-    ruling_args_0 = ruling_calls[0][0][1]
-    ruling_args_1 = ruling_calls[1][0][1]
-    assert split_id_0 in ruling_args_0
-    assert split_id_1 in ruling_args_1
-
-
-@patch("ingestion.worker.psycopg")
-@patch("ingestion.worker.split_document")
-def test_process_event_split_idempotent(
-    mock_split: MagicMock,
-    mock_psycopg: MagicMock,
-) -> None:
-    """Re-processing the same document produces the same synthetic document_ids."""
-    from ingestion.splitter import SplitResult, make_split_document_id
-
-    original_doc_id = "aaaaaaaa-0000-0000-0000-000000000001"
-
-    mock_split.return_value = [
-        SplitResult(ruling_text="Case 1 text"),
-        SplitResult(ruling_text="Case 2 text"),
-    ]
-
-    # Verify deterministic IDs
-    id_0_first = make_split_document_id(original_doc_id, 0)
-    id_1_first = make_split_document_id(original_doc_id, 1)
-    id_0_second = make_split_document_id(original_doc_id, 0)
-    id_1_second = make_split_document_id(original_doc_id, 1)
-
-    assert id_0_first == id_0_second
-    assert id_1_first == id_1_second
-
-
-@patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
-@patch("ingestion.worker.psycopg")
 def test_process_event_already_split_no_re_split(
     mock_psycopg: MagicMock, mock_resolve_judge: MagicMock
 ) -> None:
@@ -3417,8 +3240,18 @@ def test_process_event_already_split_no_re_split(
     )
     worker.process_event(event)
 
-    # Should process normally without calling split_document
+    # Should process normally without trying to split again
     mock_conn.commit.assert_called_once()
+
+
+def test_make_split_document_id_deterministic() -> None:
+    """make_split_document_id produces the same ID for the same inputs."""
+    from ingestion.split_ids import make_split_document_id
+
+    doc_id = "aaaaaaaa-0000-0000-0000-000000000001"
+    assert make_split_document_id(doc_id, 0) == make_split_document_id(doc_id, 0)
+    assert make_split_document_id(doc_id, 1) == make_split_document_id(doc_id, 1)
+    assert make_split_document_id(doc_id, 0) != make_split_document_id(doc_id, 1)
 
 
 # ---------------------------------------------------------------------------

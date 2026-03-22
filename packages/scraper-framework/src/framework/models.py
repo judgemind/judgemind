@@ -14,18 +14,6 @@ from pydantic import BaseModel, Field
 # ---------------------------------------------------------------------------
 
 
-class ExtractionMethod(StrEnum):
-    """Method used to extract structured fields from raw court documents.
-
-    ``REGEX`` uses county-specific regex splitters and regex field extraction.
-    ``LLM`` uses the framework-level ``LlmExtractor`` + ``EnrichmentEngine``
-    for structured extraction via the Anthropic API.
-    """
-
-    REGEX = "regex"
-    LLM = "llm"
-
-
 class ScraperPhase(StrEnum):
     """Lifecycle phase of a scraper per Architecture Spec §3.5.1."""
 
@@ -83,11 +71,6 @@ class ScraperConfig(BaseModel):
 
     # Lifecycle
     phase: ScraperPhase = ScraperPhase.DEVELOPMENT
-
-    # Extraction method — controls how structured fields are extracted from
-    # raw documents during ingestion.  "regex" (default) uses county-specific
-    # regex splitters; "llm" uses LlmExtractor + EnrichmentEngine.
-    extraction_method: ExtractionMethod = ExtractionMethod.REGEX
 
     # S3 archival
     s3_bucket: str = ""
