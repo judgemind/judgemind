@@ -1,7 +1,8 @@
 'use client';
 
+import { useState, useCallback } from 'react';
 import Link from 'next/link';
-import { buildDownloadUrl, cleanRulingText, cleanSummary, FORMAT_LABELS, stripMetadataHeaderHtml, type RulingMetadata } from '@/lib/display-helpers';
+import { buildDocumentContentUrl, buildDownloadUrl, cleanRulingText, cleanSummary, FORMAT_LABELS, stripMetadataHeaderHtml, type RulingMetadata } from '@/lib/display-helpers';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 
@@ -37,6 +38,13 @@ interface RulingProps {
   };
 }
 
+/** State for the HTML document viewer. */
+type ViewerState =
+  | { status: 'idle' }
+  | { status: 'loading' }
+  | { status: 'loaded'; html: string }
+  | { status: 'error'; message: string };
+
 export function RulingDetail({ ruling, sanitizedRulingTextHtml }: RulingProps) {
   // Build metadata context for stripping redundant header boilerplate
   const metadata: RulingMetadata = {
@@ -48,6 +56,39 @@ export function RulingDetail({ ruling, sanitizedRulingTextHtml }: RulingProps) {
     motionType: ruling.motionType ?? undefined,
   };
   const displaySummary = ruling.summary ? cleanSummary(ruling.summary) : null;
+
+  const isHtmlDocument = ruling.documentFormat === 'html';
+
+  const [viewerState, setViewerState] = useState<ViewerState>({ status: 'idle' });
+
+  const handleViewOriginal = useCallback(async () => {
+    if (!ruling.documentId) return;
+
+    if (viewerState.status === 'loaded') {
+      // Toggle off — hide the viewer
+      setViewerState({ status: 'idle' });
+      return;
+    }
+
+    setViewerState({ status: 'loading' });
+
+    try {
+      const url = buildDocumentContentUrl(ruling.documentId);
+      const response = await fetch(url);
+
+      if (!response.ok) {
+        const errorData = await response.json().catch(() => null);
+        const errorMessage = errorData?.error ?? `Failed to load document (HTTP ${response.status})`;
+        setViewerState({ status: 'error', message: errorMessage });
+        return;
+      }
+
+      const html = await response.text();
+      setViewerState({ status: 'loaded', html });
+    } catch {
+      setViewerState({ status: 'error', message: 'Failed to load document. Please try again.' });
+    }
+  }, [ruling.documentId, viewerState.status]);
 
   return (
     <div className="space-y-6">
@@ -106,23 +147,64 @@ export function RulingDetail({ ruling, sanitizedRulingTextHtml }: RulingProps) {
               Ruling Text
             </CardTitle>
             {ruling.documentId && (
-              <Button variant="outline" size="sm" asChild>
-                <a
-                  href={buildDownloadUrl(ruling.documentId)}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                >
-                  Download original document
-                  {ruling.documentFormat && (
-                    <span className="ml-1.5 rounded bg-muted px-1.5 py-0.5 text-[10px] font-semibold uppercase text-muted-foreground">
-                      {FORMAT_LABELS[ruling.documentFormat] ??
-                        ruling.documentFormat.toUpperCase()}
-                    </span>
-                  )}
-                </a>
-              </Button>
+              <div className="flex items-center gap-2">
+                {isHtmlDocument && (
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={handleViewOriginal}
+                    disabled={viewerState.status === 'loading'}
+                    data-testid="view-original-button"
+                  >
+                    {viewerState.status === 'loading'
+                      ? 'Loading\u2026'
+                      : viewerState.status === 'loaded'
+                        ? 'Hide original'
+                        : 'View original'}
+                  </Button>
+                )}
+                <Button variant="outline" size="sm" asChild>
+                  <a
+                    href={buildDownloadUrl(ruling.documentId)}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                  >
+                    Download original document
+                    {ruling.documentFormat && (
+                      <span className="ml-1.5 rounded bg-muted px-1.5 py-0.5 text-[10px] font-semibold uppercase text-muted-foreground">
+                        {FORMAT_LABELS[ruling.documentFormat] ??
+                          ruling.documentFormat.toUpperCase()}
+                      </span>
+                    )}
+                  </a>
+                </Button>
+              </div>
             )}
           </CardHeader>
+
+          {/* Original HTML document viewer (sandboxed iframe) */}
+          {viewerState.status === 'loaded' && (
+            <CardContent className="border-t pt-4">
+              <iframe
+                srcDoc={viewerState.html}
+                sandbox=""
+                className="w-full rounded border"
+                style={{ height: '600px' }}
+                title="Original court document"
+                data-testid="original-document-iframe"
+              />
+            </CardContent>
+          )}
+
+          {/* Error state */}
+          {viewerState.status === 'error' && (
+            <CardContent className="border-t pt-4">
+              <p className="text-sm text-destructive" data-testid="viewer-error">
+                {viewerState.message}
+              </p>
+            </CardContent>
+          )}
+
           <CardContent className="prose prose-slate dark:prose-invert max-w-none">
             {sanitizedRulingTextHtml ? (
               <div
@@ -150,21 +232,59 @@ export function RulingDetail({ ruling, sanitizedRulingTextHtml }: RulingProps) {
       {/* Document download — shown standalone when there is no ruling text */}
       {ruling.documentId && !sanitizedRulingTextHtml && !ruling.rulingText && (
         <section>
-          <Button variant="outline" size="sm" asChild>
-            <a
-              href={buildDownloadUrl(ruling.documentId)}
-              target="_blank"
-              rel="noopener noreferrer"
-            >
-              Download original document
-              {ruling.documentFormat && (
-                <span className="ml-1.5 rounded bg-muted px-1.5 py-0.5 text-[10px] font-semibold uppercase text-muted-foreground">
-                  {FORMAT_LABELS[ruling.documentFormat] ??
-                    ruling.documentFormat.toUpperCase()}
-                </span>
-              )}
-            </a>
-          </Button>
+          <div className="flex items-center gap-2">
+            {isHtmlDocument && (
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={handleViewOriginal}
+                disabled={viewerState.status === 'loading'}
+                data-testid="view-original-button"
+              >
+                {viewerState.status === 'loading'
+                  ? 'Loading\u2026'
+                  : viewerState.status === 'loaded'
+                    ? 'Hide original'
+                    : 'View original'}
+              </Button>
+            )}
+            <Button variant="outline" size="sm" asChild>
+              <a
+                href={buildDownloadUrl(ruling.documentId)}
+                target="_blank"
+                rel="noopener noreferrer"
+              >
+                Download original document
+                {ruling.documentFormat && (
+                  <span className="ml-1.5 rounded bg-muted px-1.5 py-0.5 text-[10px] font-semibold uppercase text-muted-foreground">
+                    {FORMAT_LABELS[ruling.documentFormat] ??
+                      ruling.documentFormat.toUpperCase()}
+                  </span>
+                )}
+              </a>
+            </Button>
+          </div>
+
+          {/* Original HTML document viewer (sandboxed iframe) — standalone */}
+          {viewerState.status === 'loaded' && (
+            <div className="mt-4">
+              <iframe
+                srcDoc={viewerState.html}
+                sandbox=""
+                className="w-full rounded border"
+                style={{ height: '600px' }}
+                title="Original court document"
+                data-testid="original-document-iframe"
+              />
+            </div>
+          )}
+
+          {/* Error state — standalone */}
+          {viewerState.status === 'error' && (
+            <p className="mt-4 text-sm text-destructive" data-testid="viewer-error">
+              {viewerState.message}
+            </p>
+          )}
         </section>
       )}
     </div>

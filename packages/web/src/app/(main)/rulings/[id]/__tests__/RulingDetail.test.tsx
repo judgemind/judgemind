@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { render, screen } from '@testing-library/react';
+import { render, screen, fireEvent, waitFor } from '@testing-library/react';
 import { RulingDetail } from '../RulingDetail';
 import { sanitizeRulingHtml } from '@/lib/sanitize-html';
 
@@ -449,6 +449,166 @@ describe('RulingDetail', () => {
     expect(rulingContent?.innerHTML).not.toContain('form');
     expect(rulingContent?.innerHTML).not.toContain('input');
     expect(rulingContent?.innerHTML).toContain('Content');
+  });
+
+  // -------------------------------------------------------------------------
+  // HTML document viewer (#1476)
+  // -------------------------------------------------------------------------
+
+  it('shows "View original" button for HTML-format documents', () => {
+    const ruling = buildFullRuling();
+    ruling.documentFormat = 'html';
+    render(<RulingDetail ruling={ruling} />);
+
+    expect(screen.getByTestId('view-original-button')).toBeInTheDocument();
+    expect(screen.getByTestId('view-original-button')).toHaveTextContent('View original');
+  });
+
+  it('does not show "View original" button for PDF-format documents', () => {
+    const ruling = buildFullRuling();
+    ruling.documentFormat = 'pdf';
+    render(<RulingDetail ruling={ruling} />);
+
+    expect(screen.queryByTestId('view-original-button')).not.toBeInTheDocument();
+  });
+
+  it('does not show "View original" button when documentId is null', () => {
+    const ruling = buildFullRuling();
+    ruling.documentFormat = 'html';
+    ruling.documentId = null;
+    render(<RulingDetail ruling={ruling} />);
+
+    expect(screen.queryByTestId('view-original-button')).not.toBeInTheDocument();
+  });
+
+  it('loads and displays iframe on "View original" click', async () => {
+    const ruling = buildFullRuling();
+    ruling.documentFormat = 'html';
+    const htmlContent = '<html><body><p>Court ruling content</p></body></html>';
+
+    // Mock fetch
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(
+      new Response(htmlContent, {
+        status: 200,
+        headers: { 'Content-Type': 'text/html; charset=utf-8' },
+      }),
+    );
+
+    render(<RulingDetail ruling={ruling} />);
+
+    // Click "View original"
+    fireEvent.click(screen.getByTestId('view-original-button'));
+
+    // Wait for iframe to appear
+    await waitFor(() => {
+      expect(screen.getByTestId('original-document-iframe')).toBeInTheDocument();
+    });
+
+    const iframe = screen.getByTestId('original-document-iframe');
+    expect(iframe).toHaveAttribute('sandbox', '');
+    expect(iframe.getAttribute('srcdoc')).toBe(htmlContent);
+    expect(iframe).toHaveAttribute('title', 'Original court document');
+
+    // Button text should change to "Hide original"
+    expect(screen.getByTestId('view-original-button')).toHaveTextContent('Hide original');
+
+    fetchSpy.mockRestore();
+  });
+
+  it('hides iframe when "Hide original" is clicked', async () => {
+    const ruling = buildFullRuling();
+    ruling.documentFormat = 'html';
+    const htmlContent = '<html><body><p>Content</p></body></html>';
+
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(
+      new Response(htmlContent, { status: 200 }),
+    );
+
+    render(<RulingDetail ruling={ruling} />);
+
+    // Click "View original"
+    fireEvent.click(screen.getByTestId('view-original-button'));
+
+    // Wait for iframe to appear
+    await waitFor(() => {
+      expect(screen.getByTestId('original-document-iframe')).toBeInTheDocument();
+    });
+
+    // Click "Hide original"
+    fireEvent.click(screen.getByTestId('view-original-button'));
+
+    // Iframe should be gone
+    expect(screen.queryByTestId('original-document-iframe')).not.toBeInTheDocument();
+    // Button should revert to "View original"
+    expect(screen.getByTestId('view-original-button')).toHaveTextContent('View original');
+
+    fetchSpy.mockRestore();
+  });
+
+  it('shows error message when document content fetch fails', async () => {
+    const ruling = buildFullRuling();
+    ruling.documentFormat = 'html';
+
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(
+      new Response(JSON.stringify({ error: 'Document not found' }), {
+        status: 404,
+        headers: { 'Content-Type': 'application/json' },
+      }),
+    );
+
+    render(<RulingDetail ruling={ruling} />);
+
+    fireEvent.click(screen.getByTestId('view-original-button'));
+
+    await waitFor(() => {
+      expect(screen.getByTestId('viewer-error')).toBeInTheDocument();
+    });
+
+    expect(screen.getByTestId('viewer-error')).toHaveTextContent('Document not found');
+
+    fetchSpy.mockRestore();
+  });
+
+  it('shows error message on network failure', async () => {
+    const ruling = buildFullRuling();
+    ruling.documentFormat = 'html';
+
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockRejectedValueOnce(
+      new Error('Network error'),
+    );
+
+    render(<RulingDetail ruling={ruling} />);
+
+    fireEvent.click(screen.getByTestId('view-original-button'));
+
+    await waitFor(() => {
+      expect(screen.getByTestId('viewer-error')).toBeInTheDocument();
+    });
+
+    expect(screen.getByTestId('viewer-error')).toHaveTextContent('Failed to load document. Please try again.');
+
+    fetchSpy.mockRestore();
+  });
+
+  it('keeps download link alongside "View original" for HTML documents', () => {
+    const ruling = buildFullRuling();
+    ruling.documentFormat = 'html';
+    render(<RulingDetail ruling={ruling} />);
+
+    // Both buttons should be present
+    expect(screen.getByTestId('view-original-button')).toBeInTheDocument();
+    expect(screen.getByText('Download original document')).toBeInTheDocument();
+  });
+
+  it('shows "View original" button in standalone section when no ruling text exists but HTML doc does', () => {
+    const ruling = buildFullRuling();
+    ruling.documentFormat = 'html';
+    ruling.rulingText = null;
+    ruling.rulingTextHtml = null;
+    render(<RulingDetail ruling={ruling} sanitizedRulingTextHtml={null} />);
+
+    expect(screen.getByTestId('view-original-button')).toBeInTheDocument();
+    expect(screen.getByText('Download original document')).toBeInTheDocument();
   });
 });
 
