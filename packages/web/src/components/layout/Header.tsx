@@ -45,7 +45,7 @@ export function Header() {
           Judgemind
         </Link>
 
-        <nav className="hidden flex-1 items-center gap-1 text-sm font-medium md:flex">
+        <nav aria-label="Main" className="hidden flex-1 items-center gap-1 text-sm font-medium md:flex">
           <Button variant="ghost" size="sm" asChild>
             <Link href="/search">Search</Link>
           </Button>

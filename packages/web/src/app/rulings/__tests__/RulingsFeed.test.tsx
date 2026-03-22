@@ -362,6 +362,21 @@ describe('RulingsFeed', () => {
     ).toBeInTheDocument();
   });
 
+  it('date inputs have name and aria-label attributes', () => {
+    mockUseQuery.mockReturnValue({
+      data: MOCK_RULINGS_DATA,
+      loading: false,
+      error: undefined,
+      fetchMore: vi.fn(),
+    });
+
+    render(<RulingsFeed />);
+    const dateFrom = screen.getByLabelText('Hearings from');
+    expect(dateFrom).toHaveAttribute('name', 'dateFrom');
+    const dateTo = screen.getByLabelText('Hearings to');
+    expect(dateTo).toHaveAttribute('name', 'dateTo');
+  });
+
   it('updates URL params when county filter changes', () => {
     mockUseQuery.mockReturnValue({
       data: MOCK_RULINGS_DATA,

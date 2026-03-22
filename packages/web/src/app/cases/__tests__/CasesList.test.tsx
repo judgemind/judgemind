@@ -104,6 +104,17 @@ describe('CasesList', () => {
     expect(screen.getByLabelText(/Case type/i)).toBeInTheDocument();
   });
 
+  it('filter inputs have name and aria-label attributes', () => {
+    mockUseQuery.mockReturnValue({ data: MOCK_CASES_DATA, loading: false, error: undefined, fetchMore: vi.fn() });
+    render(<CasesList />);
+    const caseFilter = screen.getByLabelText('Case number or title');
+    expect(caseFilter).toHaveAttribute('name', 'caseFilter');
+    const statusSelect = screen.getByLabelText('Case status');
+    expect(statusSelect).toHaveAttribute('name', 'caseStatus');
+    const typeSelect = screen.getByLabelText('Case type');
+    expect(typeSelect).toHaveAttribute('name', 'caseType');
+  });
+
   it('filters cases client-side by case number', () => {
     mockUseQuery.mockReturnValue({ data: MOCK_CASES_DATA, loading: false, error: undefined, fetchMore: vi.fn() });
     render(<CasesList />);

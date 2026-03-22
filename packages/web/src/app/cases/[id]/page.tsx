@@ -67,7 +67,7 @@ export default async function CaseDetailPage({ params }: Props) {
 
   return (
     <div className="mx-auto max-w-4xl">
-      <nav className="mb-4 text-sm text-muted-foreground">
+      <nav className="mb-4 text-sm text-muted-foreground" aria-label="Breadcrumb">
         <Link href="/cases" className="hover:text-primary">
           Cases
         </Link>
