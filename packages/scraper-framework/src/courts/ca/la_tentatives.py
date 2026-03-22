@@ -30,6 +30,33 @@ from bs4 import BeautifulSoup
 from framework import BaseScraper, CapturedDocument, ContentFormat, ScraperConfig
 from framework.court_directory import CourtDirectory
 from framework.events import EventBus
+from framework.la_parser_utils import (
+    BARE_ROLE_LABELS as _BARE_ROLE_LABELS,
+)
+from framework.la_parser_utils import (
+    CASE_NAME_FIELD_RE as _CASE_NAME_FIELD_RE,
+)
+from framework.la_parser_utils import (
+    CASE_PARTIES_RE as _CASE_PARTIES_RE,
+)
+from framework.la_parser_utils import (
+    ENTITY_DESCRIPTOR_RE as _ENTITY_DESCRIPTOR_RE,
+)
+from framework.la_parser_utils import (
+    MOVING_PARTY_RE as _MOVING_PARTY_RE,
+)
+from framework.la_parser_utils import (
+    RESPONDING_PARTY_RE as _RESPONDING_PARTY_RE,
+)
+from framework.la_parser_utils import (
+    ROLE_MAP as _ROLE_MAP,
+)
+from framework.la_parser_utils import (
+    ROLE_PREFIX_RE as _ROLE_PREFIX_RE,
+)
+from framework.la_parser_utils import (
+    SKIP_RESPONDING_PHRASES as _SKIP_RESPONDING_PHRASES,
+)
 from framework.party_utils import (
     is_name_fragment as _is_name_fragment,  # noqa: F401 — re-exported for tests
 )
@@ -79,67 +106,9 @@ _CASE_TITLE_RE = re.compile(
     re.DOTALL | re.MULTILINE,
 )
 
-# Like _CASE_TITLE_RE but also captures the role keywords so we can map names to roles.
-_CASE_PARTIES_RE = re.compile(
-    r"^(?P<plaintiff>.+?),?\s*\n\s*(?P<p_role>Plaintiff|Petitioner|Cross-Complainant)\(?s?\)?,?"
-    r"\s+vs\.\s+"
-    r"(?P<defendant>.+?),?\s*\n\s*(?P<d_role>Defendant|Respondent|Cross-Defendant)\(?s?\)?\.?",
-    re.DOTALL | re.MULTILINE,
-)
-
-# Map caption role keywords to normalized role values for the case_parties table.
-_ROLE_MAP: dict[str, str] = {
-    "plaintiff": "plaintiff",
-    "petitioner": "petitioner",
-    "cross-complainant": "cross_complainant",
-    "defendant": "defendant",
-    "respondent": "respondent",
-    "cross-defendant": "cross_defendant",
-}
-
-# ---------------------------------------------------------------------------
-# Fallback title extraction patterns (text-based, for rulings without anchors)
-# ---------------------------------------------------------------------------
-
-# Pattern 2: "MOVING PARTY: [name]" / "RESPONDING PARTY: [name]"
-_MOVING_PARTY_RE = re.compile(
-    r"MOVING PART(?:Y|IES)\s*:\s*(?P<name>.+?)(?:\.|$)",
-    re.IGNORECASE | re.MULTILINE,
-)
-_RESPONDING_PARTY_RE = re.compile(
-    r"(?:RESPONDING|OPPOSING) PART(?:Y|IES)\s*:\s*(?P<name>.+?)(?:\.|$)",
-    re.IGNORECASE | re.MULTILINE,
-)
-_ROLE_PREFIX_RE = re.compile(
-    r"^(?:Defendants?|Plaintiffs?|Petitioners?|Respondents?"
-    r"|Cross-Complainants?|Cross-Defendants?)[,\s]+",
-    re.IGNORECASE,
-)
-
-# Role labels that should never appear as standalone party names.
-_BARE_ROLE_LABELS = frozenset(
-    w.lower()
-    for w in (
-        "Defendant",
-        "Defendants",
-        "Plaintiff",
-        "Plaintiffs",
-        "Petitioner",
-        "Petitioners",
-        "Respondent",
-        "Respondents",
-        "Cross-Complainant",
-        "Cross-Complainants",
-        "Cross-Defendant",
-        "Cross-Defendants",
-    )
-)
-
-# Pattern 3: "Case Name: [text]" or "Case Title: [text]"
-_CASE_NAME_FIELD_RE = re.compile(
-    r"CASE\s+(?:NAME|TITLE)\s*:\s*(?P<title>.+?)(?:\s+CASE\s+NUMBER|\s*$)",
-    re.IGNORECASE | re.MULTILINE,
-)
+# _CASE_PARTIES_RE, _ROLE_MAP, _MOVING_PARTY_RE, _RESPONDING_PARTY_RE,
+# _ROLE_PREFIX_RE, _BARE_ROLE_LABELS, _CASE_NAME_FIELD_RE are imported from
+# framework.la_parser_utils above.  See #1465 for deduplication rationale.
 
 # Marker present in the LA Court stale-ViewState error page (HTTP 200, ~8KB).
 # When the POST uses an expired ViewState or a dropdown option that no longer
@@ -153,38 +122,7 @@ _DEPT_HEADER_BOILERPLATE_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Entity descriptor phrases that should be stripped from party names in titles.
-# These inflate short-form "Smith v. Jones" into long captions.  Order matters:
-# longer/more-specific phrases first so they match before their substrings.
-_ENTITY_DESCRIPTOR_RE = re.compile(
-    r",?\s*(?:"
-    r"An Individual(?:\s+And Derivatively On Behalf Of [^,;]+)?"
-    r"|An? (?:Alabama|Alaska|Arizona|Arkansas|California|Colorado|Connecticut"
-    r"|Delaware|District of Columbia|Florida|Georgia|Hawaii|Idaho|Illinois"
-    r"|Indiana|Iowa|Kansas|Kentucky|Louisiana|Maine|Maryland|Massachusetts"
-    r"|Michigan|Minnesota|Mississippi|Missouri|Montana|Nebraska|Nevada"
-    r"|New Hampshire|New Jersey|New Mexico|New York|North Carolina"
-    r"|North Dakota|Ohio|Oklahoma|Oregon|Pennsylvania|Rhode Island"
-    r"|South Carolina|South Dakota|Tennessee|Texas|Utah|Vermont|Virginia"
-    r"|Washington|West Virginia|Wisconsin|Wyoming)"
-    r" (?:Corporation|Limited Liability Company|Limited Partnership"
-    r"|General Partnership|Business Entity|Nonprofit Corporation|Public Entity)"
-    r"|A (?:Corporation|Limited Liability Company|Limited Partnership"
-    r"|General Partnership|Business Entity|Nonprofit Corporation|Public Entity)"
-    r"|Individually And As [^,;]+"
-    r"|By And Through [^,;]+"
-    r"|As Trustee Of [^,;]+"
-    # Hyphenated and non-hyphenated variants of successor/administrator phrases
-    r"|Successor[- ]In[- ]Interest To(?:\s+And [^,;]+)?"
-    r"|Administrator Of [^,;]+"
-    r"|As Administrator [^,;]+"
-    r"|Derivatively On Behalf Of [^,;]+"
-    r"|As An Individual"
-    r"|Form Unknown"
-    r"|Doe(?:s)? \d+ (?:To|Through) \d+(?:,? Inclusive)?"
-    r")",
-    re.IGNORECASE,
-)
+# _ENTITY_DESCRIPTOR_RE is imported from framework.la_parser_utils above.
 
 # Maximum length for a cleaned case title.  Titles longer than this after
 # entity-descriptor stripping still contain too much caption noise.
@@ -727,7 +665,7 @@ def _extract_title_from_moving_responding(text: str) -> str | None:
     responding_raw = r_match.group("name").strip()
 
     # Reject non-party content like "No opposition filed"
-    skip_phrases = ("no opposition", "none", "no response", "unopposed")
+    skip_phrases = _SKIP_RESPONDING_PHRASES
     for phrase in skip_phrases:
         if phrase in responding_raw.lower():
             return None
@@ -866,7 +804,7 @@ def _extract_parties_from_moving_responding(text: str) -> list[dict[str, str]]:
     responding_raw = r_match.group("name").strip()
 
     # Reject non-party content like "No opposition filed"
-    skip_phrases = ("no opposition", "none", "no response", "unopposed")
+    skip_phrases = _SKIP_RESPONDING_PHRASES
     for phrase in skip_phrases:
         if phrase in responding_raw.lower():
             return []
