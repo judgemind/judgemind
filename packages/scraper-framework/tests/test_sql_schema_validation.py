@@ -63,9 +63,7 @@ _EXCLUDED_SCRIPTS: set[str] = {
 # schema.sql). These are marked as xfail in the column-reference
 # validation test so they surface visually but don't block CI.
 # Each entry maps a script name to the reason for the drift.
-_KNOWN_SCHEMA_DRIFT: dict[str, str] = {
-    "dedup_split_rulings": "uses r.ruling_text_hash which is not in schema.sql",
-}
+_KNOWN_SCHEMA_DRIFT: dict[str, str] = {}
 
 
 def _get_schema() -> dict[str, set[str]]:
