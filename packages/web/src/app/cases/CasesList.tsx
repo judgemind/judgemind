@@ -166,7 +166,7 @@ export function CasesList() {
         <Input
           type="text"
           name="caseFilter"
-          placeholder="Case number or title"
+          placeholder="Case number or title\u2026"
           value={caseNumberFilter}
           onChange={(e) => setCaseNumberFilter(e.target.value)}
           className="w-auto"

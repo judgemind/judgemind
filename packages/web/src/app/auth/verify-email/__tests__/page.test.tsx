@@ -73,7 +73,7 @@ describe('VerifyEmailPage', () => {
     mockMutate = vi.fn().mockReturnValue(new Promise(() => {}));
     render(<VerifyEmailPage />);
     expect(
-      screen.getByText('Verifying your email...'),
+      screen.getByText('Verifying your email\u2026'),
     ).toBeInTheDocument();
   });
 

@@ -591,7 +591,7 @@ export function SearchPage() {
               type="search"
               value={q}
               onChange={(e) => setQ(e.target.value)}
-              placeholder="Search by keyword, case number, judge, or party..."
+              placeholder="Search by keyword, case number, judge, or party\u2026"
               className="pl-9"
               aria-label="Search query"
             />
@@ -710,7 +710,7 @@ export function SearchPage() {
                     }}
                     disabled={loading}
                   >
-                    {loading ? 'Loading...' : 'Load more'}
+                    {loading ? 'Loading\u2026' : 'Load more'}
                   </Button>
                 </div>
               )}
