@@ -36,6 +36,7 @@ import pytest
 
 from courts.ca import cc_tentatives as _cc
 from courts.ca import fresno_tentatives as _fresno
+from courts.ca import oc_tentatives as _oc
 from courts.ca import pdf_link_scraper as _pls
 from courts.ca import riverside_tentatives as _riv
 from courts.ca import sc_tentatives as _sc
@@ -141,6 +142,9 @@ def _cache_pdf_text_extraction(
     # --- ventura_tentatives._extract_pdf_text (local copy) ---
     _cached_ven = _make_disk_cached(_ven._extract_pdf_text)
 
+    # --- oc_tentatives._extract_oc_pdf_text (pdfplumber table detection) ---
+    _cached_oc = _make_disk_cached(_oc._extract_oc_pdf_text)
+
     # Patch every module that holds its own reference to the function.
     patches = [
         patch.object(_pls, "_extract_pdf_text", _cached_pls),
@@ -149,6 +153,7 @@ def _cache_pdf_text_extraction(
         patch.object(_fresno, "_extract_pdf_text", _cached_pls),
         patch.object(_sc, "extract_pdf_text", _cached_sc),
         patch.object(_ven, "_extract_pdf_text", _cached_ven),
+        patch.object(_oc, "_extract_oc_pdf_text", _cached_oc),
     ]
 
     for p in patches:
