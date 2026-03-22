@@ -92,6 +92,7 @@ from ingestion.llm_extract import (  # noqa: E402
     extract_text_from_pdf,
 )
 from ingestion.llm_providers import create_client as create_llm_client  # noqa: E402
+from ingestion.splitter import make_split_document_id  # noqa: E402
 
 structlog.configure(
     processors=[
@@ -627,21 +628,6 @@ def _reparse_document(
     return extracted
 
 
-def _make_split_document_id(content_hash: str, ruling_index: int) -> str:
-    """Generate a deterministic document UUID for a split ruling.
-
-    Uses ``uuid5(NAMESPACE_URL, content_hash + ":ruling:" + index)`` so that
-    the same PDF content + ruling index always produces the same UUID.
-    This ensures idempotency: re-running full-reparse on the same S3
-    document produces the same document IDs and upserts harmlessly.
-
-    The ``:ruling:`` separator prevents collisions with the base
-    ``uuid5(NAMESPACE_URL, content_hash)`` used for unsplit documents.
-    """
-    key = f"{content_hash}:ruling:{ruling_index}"
-    return str(uuid.uuid5(uuid.NAMESPACE_URL, key))
-
-
 def _full_reparse_document(
     raw_content: bytes,
     scraper_id: str,
@@ -789,7 +775,7 @@ def _full_reparse_document(
     results: list[dict] = []
     for ruling in split_results:
         ruling_index = ruling.ruling_index
-        split_doc_id = _make_split_document_id(content_hash, ruling_index)
+        split_doc_id = make_split_document_id(doc_meta["document_id"], ruling_index)
 
         extracted: dict = {
             "ruling_text": ruling.ruling_text.replace("\x00", "")
@@ -1147,7 +1133,10 @@ def reingest_batch(
                 any_split = any(e.get("is_split") for e in extracted_list)
 
                 for extracted in extracted_list:
-                    # Use split_document_id if available, otherwise original
+                    # For rulings, use split_document_id if available;
+                    # for documents, always use original document_id
+                    # (matching ingestion worker behavior — one PDF = one
+                    # document row).
                     effective_doc_id = extracted.get("split_document_id", doc_id_str)
                     effective_case_number = (
                         extracted["case_number"]
@@ -1181,7 +1170,7 @@ def reingest_batch(
 
                     insert_document(
                         conn,
-                        document_id=effective_doc_id,
+                        document_id=doc_id_str,
                         case_id=new_case_id,
                         court_id=court_id_str,
                         content_format=doc_meta["format"],
