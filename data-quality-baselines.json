@@ -31,9 +31,9 @@
       "posting_days": ["Mon", "Tue", "Wed", "Thu", "Fri"]
     },
     "Ventura": {
-      "expected_daily_rulings": 8,
+      "expected_daily_rulings": 5,
       "schedule_type": "daily",
-      "posting_days": ["Mon", "Tue", "Wed", "Thu", "Fri"]
+      "posting_days": ["Tue", "Wed", "Thu", "Fri"]
     }
   },
   "field_completeness": {
