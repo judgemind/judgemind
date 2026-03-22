@@ -19,6 +19,7 @@ parse_cobertura_xml = update_coverage_baselines.parse_cobertura_xml
 parse_cobertura_xml_lines = update_coverage_baselines.parse_cobertura_xml_lines
 merge_cobertura_coverage = update_coverage_baselines.merge_cobertura_coverage
 parse_lcov = update_coverage_baselines.parse_lcov
+main = update_coverage_baselines.main
 
 
 # -- Cobertura XML fixtures --
@@ -327,8 +328,166 @@ class TestMainCliMultipleFiles:
             "exists.xml",
             {"framework/scraper.py": [(1, 1), (2, 1)]},
         )
-        missing = tmp_path / "does-not-exist.xml"
+        _missing = tmp_path / "does-not-exist.xml"  # noqa: F841
 
         # parse_cobertura_xml_lines should work with just the existing file
         result = merge_cobertura_coverage([str(path1)])
         assert result == pytest.approx(100.0, abs=0.1)
+
+
+class TestBaselineKeyOverride:
+    """Tests for the --baseline-key option."""
+
+    def test_baseline_key_uses_override_key(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """--baseline-key should check against the override key, not --package."""
+        # Coverage: 75% (3 of 4 lines covered)
+        path1 = _make_cobertura_xml(
+            tmp_path,
+            "framework.xml",
+            {"framework/scraper.py": [(1, 1), (2, 1), (3, 1), (4, 0)]},
+        )
+
+        # Baselines: combined is 80% (would fail), framework-only is 70% (should pass)
+        baselines = {
+            "packages/scraper-framework": 80.0,
+            "packages/scraper-framework:framework-only": 70.0,
+        }
+        baselines_path = tmp_path / "coverage-baselines.json"
+        baselines_path.write_text(json.dumps(baselines), encoding="utf-8")
+
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                "update-coverage-baselines.py",
+                "--package",
+                "packages/scraper-framework",
+                "--baseline-key",
+                "packages/scraper-framework:framework-only",
+                "--coverage-file",
+                str(path1),
+                "--baselines-file",
+                str(baselines_path),
+                "--dry-run",
+            ],
+        )
+
+        # Should pass: 75% > 70% framework-only baseline
+        main()
+
+    def test_baseline_key_fails_when_below_override_baseline(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """--baseline-key should fail when coverage drops below the override key baseline."""
+        # Coverage: 50% (1 of 2 lines covered)
+        path1 = _make_cobertura_xml(
+            tmp_path,
+            "framework.xml",
+            {"framework/scraper.py": [(1, 1), (2, 0)]},
+        )
+
+        # Baselines: framework-only is 60% (should fail since 50% < 60%)
+        baselines = {
+            "packages/scraper-framework": 80.0,
+            "packages/scraper-framework:framework-only": 60.0,
+        }
+        baselines_path = tmp_path / "coverage-baselines.json"
+        baselines_path.write_text(json.dumps(baselines), encoding="utf-8")
+
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                "update-coverage-baselines.py",
+                "--package",
+                "packages/scraper-framework",
+                "--baseline-key",
+                "packages/scraper-framework:framework-only",
+                "--coverage-file",
+                str(path1),
+                "--baselines-file",
+                str(baselines_path),
+                "--dry-run",
+            ],
+        )
+
+        # Should fail: 50% < 60% framework-only baseline
+        with pytest.raises(SystemExit, match="1"):
+            main()
+
+    def test_without_baseline_key_uses_package(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Without --baseline-key, should use --package as the key (backward compat)."""
+        # Coverage: 100%
+        path1 = _make_cobertura_xml(
+            tmp_path,
+            "framework.xml",
+            {"framework/scraper.py": [(1, 1), (2, 1)]},
+        )
+
+        baselines = {"packages/scraper-framework": 80.0}
+        baselines_path = tmp_path / "coverage-baselines.json"
+        baselines_path.write_text(json.dumps(baselines), encoding="utf-8")
+
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                "update-coverage-baselines.py",
+                "--package",
+                "packages/scraper-framework",
+                "--coverage-file",
+                str(path1),
+                "--baselines-file",
+                str(baselines_path),
+                "--dry-run",
+            ],
+        )
+
+        # Should pass: 100% > 80% combined baseline
+        main()
+
+    def test_baseline_key_updates_correct_key(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """When not in dry-run mode, --baseline-key should update the override key."""
+        # Coverage: 75%
+        path1 = _make_cobertura_xml(
+            tmp_path,
+            "framework.xml",
+            {"framework/scraper.py": [(1, 1), (2, 1), (3, 1), (4, 0)]},
+        )
+
+        baselines = {
+            "packages/scraper-framework": 80.0,
+            "packages/scraper-framework:framework-only": 50.0,
+        }
+        baselines_path = tmp_path / "coverage-baselines.json"
+        baselines_path.write_text(json.dumps(baselines), encoding="utf-8")
+
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                "update-coverage-baselines.py",
+                "--package",
+                "packages/scraper-framework",
+                "--baseline-key",
+                "packages/scraper-framework:framework-only",
+                "--coverage-file",
+                str(path1),
+                "--baselines-file",
+                str(baselines_path),
+            ],
+        )
+
+        # Run without --dry-run so it actually updates
+        main()
+
+        # Verify the framework-only key was updated but combined was NOT
+        updated = json.loads(baselines_path.read_text(encoding="utf-8"))
+        assert updated["packages/scraper-framework:framework-only"] == 75.0
+        assert updated["packages/scraper-framework"] == 80.0

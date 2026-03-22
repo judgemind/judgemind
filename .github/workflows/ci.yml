@@ -702,11 +702,10 @@ jobs:
         if: needs.detect-changes.outputs.scraper == 'true'
         run: |
           # Merge coverage from all three split scraper test jobs.
-          # Only enforce the floor ratchet when both framework AND court
-          # coverage files are present.  When court tests are skipped
-          # (because no court files changed), the partial coverage from
-          # framework-only tests is lower than the combined baseline and
-          # would false-fail the check.  Diff-cover still guards new lines.
+          # Uses separate baselines for partial vs full runs:
+          #   - "packages/scraper-framework" (combined) when court tests ran
+          #   - "packages/scraper-framework:framework-only" when only
+          #     framework + ingestion tests ran (courts skipped)
           COV_ARGS=""
           COV_FRAMEWORK="coverage-artifacts/coverage-scraper-framework/coverage.xml"
           COV_COURTS="coverage-artifacts/coverage-scraper-courts/coverage.xml"
@@ -722,18 +721,21 @@ jobs:
             echo "No coverage artifacts found — skipping floor ratchet"
             exit 0
           fi
-          # Skip floor ratchet if court tests didn't run (partial coverage
-          # would be lower than the combined baseline).
           if [ ! -f "$COV_COURTS" ] && [ ! -f "$COV_FRAMEWORK" ]; then
             echo "Neither framework nor court coverage available — skipping"
             exit 0
           fi
+          # Choose baseline key based on whether court tests ran
+          BASELINE_KEY="packages/scraper-framework"
           if [ ! -f "$COV_COURTS" ]; then
-            echo "Court test coverage missing (court tests skipped) — skipping floor ratchet to avoid false failure from partial coverage"
-            exit 0
+            BASELINE_KEY="packages/scraper-framework:framework-only"
+            echo "Court tests skipped — enforcing framework-only baseline"
+          else
+            echo "All test jobs ran — enforcing combined baseline"
           fi
           python scripts/update-coverage-baselines.py \
             --package packages/scraper-framework \
+            --baseline-key "$BASELINE_KEY" \
             $COV_ARGS \
             --dry-run
 
