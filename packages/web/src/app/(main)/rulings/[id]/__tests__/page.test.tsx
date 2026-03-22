@@ -187,10 +187,10 @@ describe('RulingDetailPage (SSR smoke)', () => {
   });
 
   // -------------------------------------------------------------------------
-  // Metadata card entity links (#1515)
+  // Header subtitle entity links (#1515, consolidated in #1643)
   // -------------------------------------------------------------------------
 
-  it('renders judge name as a link to the judge profile page', async () => {
+  it('renders judge name as a link to the judge profile page in the subtitle', async () => {
     mockQuery.mockResolvedValueOnce({
       data: { ruling: FULL_RULING },
     });
@@ -202,7 +202,7 @@ describe('RulingDetailPage (SSR smoke)', () => {
     expect(judgeLink).toHaveAttribute('href', '/judges/judge-1');
   });
 
-  it('renders case number as a link to the case detail page', async () => {
+  it('renders case number as a link to the case detail page in the subtitle', async () => {
     mockQuery.mockResolvedValueOnce({
       data: { ruling: FULL_RULING },
     });
@@ -210,23 +210,12 @@ describe('RulingDetailPage (SSR smoke)', () => {
     const jsx = await RulingDetailPage({ params: { id: 'ruling-1' } });
     render(jsx);
 
-    const caseLink = screen.getByText('25STCV12345').closest('a');
+    // Case number now has "Case " prefix in the subtitle
+    const caseLink = screen.getByText(/25STCV12345/).closest('a');
     expect(caseLink).toHaveAttribute('href', '/cases/case-1');
   });
 
-  it('renders county as a link to the rulings feed filtered by county', async () => {
-    mockQuery.mockResolvedValueOnce({
-      data: { ruling: FULL_RULING },
-    });
-
-    const jsx = await RulingDetailPage({ params: { id: 'ruling-1' } });
-    render(jsx);
-
-    const countyLink = screen.getByText('Los Angeles').closest('a');
-    expect(countyLink).toHaveAttribute('href', '/rulings?county=Los%20Angeles');
-  });
-
-  it('renders court name as a link to the rulings feed filtered by county', async () => {
+  it('renders court name as a link to the rulings feed filtered by county in the subtitle', async () => {
     mockQuery.mockResolvedValueOnce({
       data: { ruling: FULL_RULING },
     });
@@ -236,6 +225,115 @@ describe('RulingDetailPage (SSR smoke)', () => {
 
     const courtLink = screen.getByText('Los Angeles Superior Court').closest('a');
     expect(courtLink).toHaveAttribute('href', '/rulings?county=Los%20Angeles');
+  });
+
+  it('does not display county as a separate field from court (#1643)', async () => {
+    mockQuery.mockResolvedValueOnce({
+      data: { ruling: FULL_RULING },
+    });
+
+    const jsx = await RulingDetailPage({ params: { id: 'ruling-1' } });
+    render(jsx);
+
+    // "Los Angeles" as county is part of the court name "Los Angeles Superior Court",
+    // so it should not appear as a separate standalone text node.
+    // The court name link should exist, but there should be no separate "County" label.
+    const allDts = document.querySelectorAll('dt');
+    const dtTexts = Array.from(allDts).map((dt) => dt.textContent);
+    expect(dtTexts).not.toContain('County');
+  });
+
+  it('appends county name when not contained in court name', async () => {
+    mockQuery.mockResolvedValueOnce({
+      data: {
+        ruling: {
+          ...FULL_RULING,
+          court: {
+            courtName: 'Superior Court',
+            county: 'San Diego',
+          },
+        },
+      },
+    });
+
+    const jsx = await RulingDetailPage({ params: { id: 'ruling-1' } });
+    render(jsx);
+
+    // When court name doesn't contain the county, both should appear in the link
+    const courtLink = screen.getByText(/Superior Court/).closest('a');
+    expect(courtLink).toHaveAttribute('href', '/rulings?county=San%20Diego');
+    expect(courtLink?.textContent).toContain('San Diego');
+  });
+
+  it('does not append county when court name already contains it', async () => {
+    mockQuery.mockResolvedValueOnce({
+      data: {
+        ruling: {
+          ...FULL_RULING,
+          court: {
+            courtName: 'Superior Court, County of San Diego',
+            county: 'San Diego',
+          },
+        },
+      },
+    });
+
+    const jsx = await RulingDetailPage({ params: { id: 'ruling-1' } });
+    render(jsx);
+
+    const courtLink = screen.getByText('Superior Court, County of San Diego').closest('a');
+    expect(courtLink).toHaveAttribute('href', '/rulings?county=San%20Diego');
+    // Should not duplicate "San Diego" — the county is already in the court name
+    expect(courtLink?.textContent).toBe('Superior Court, County of San Diego');
+  });
+
+  it('renders hearing date in the subtitle', async () => {
+    mockQuery.mockResolvedValueOnce({
+      data: { ruling: FULL_RULING },
+    });
+
+    const jsx = await RulingDetailPage({ params: { id: 'ruling-1' } });
+    render(jsx);
+
+    // Hearing date should appear in the subtitle, not in the metadata card
+    expect(screen.getByText(/Mar(ch)?\s+10,\s+2026/)).toBeInTheDocument();
+    // No "Hearing Date" label in the metadata card
+    const allDts = document.querySelectorAll('dt');
+    const dtTexts = Array.from(allDts).map((dt) => dt.textContent);
+    expect(dtTexts).not.toContain('Hearing Date');
+  });
+
+  it('does not render metadata card when department is null', async () => {
+    mockQuery.mockResolvedValueOnce({
+      data: {
+        ruling: {
+          ...FULL_RULING,
+          department: null,
+        },
+      },
+    });
+
+    const jsx = await RulingDetailPage({ params: { id: 'ruling-1' } });
+    render(jsx);
+
+    // No metadata card labels should be present — Motion Type is shown in the
+    // heading (motionLabel) so it is not duplicated in the metadata card.
+    const allDts = document.querySelectorAll('dt');
+    expect(allDts).toHaveLength(0);
+  });
+
+  it('does not show Motion Type in metadata card (already in heading)', async () => {
+    mockQuery.mockResolvedValueOnce({
+      data: { ruling: FULL_RULING },
+    });
+
+    const jsx = await RulingDetailPage({ params: { id: 'ruling-1' } });
+    render(jsx);
+
+    // Motion Type should NOT appear as a label in the metadata card
+    const allDts = document.querySelectorAll('dt');
+    const dtTexts = Array.from(allDts).map((dt) => dt.textContent);
+    expect(dtTexts).not.toContain('Motion Type');
   });
 
   it('does not render entity links when judge, case, and court are null', async () => {
@@ -253,10 +351,9 @@ describe('RulingDetailPage (SSR smoke)', () => {
     const jsx = await RulingDetailPage({ params: { id: 'ruling-1' } });
     render(jsx);
 
-    // No entity links should exist in the metadata card
+    // No entity links should exist in the subtitle
     expect(screen.queryByText('Johnson, Robert M.')).not.toBeInTheDocument();
-    expect(screen.queryByText('25STCV12345')).not.toBeInTheDocument();
-    expect(screen.queryByText('Los Angeles')).not.toBeInTheDocument();
+    expect(screen.queryByText(/25STCV12345/)).not.toBeInTheDocument();
     expect(screen.queryByText('Los Angeles Superior Court')).not.toBeInTheDocument();
   });
 });

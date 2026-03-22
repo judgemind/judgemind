@@ -124,88 +124,86 @@ export default async function RulingDetailPage({ params }: Props) {
         <span className="text-foreground">{motionLabel}</span>
       </nav>
 
-      {/* Heading */}
-      <div className="flex flex-wrap items-start gap-3">
-        <h1 className={PAGE_TITLE}>
-          {motionLabel}
-        </h1>
-        <div className="flex flex-wrap gap-2 pt-1">
-          {/* Outcome badge */}
-          <Badge
-            className={getOutcomeBadgeClass(rulingData.outcome)}
-          >
-            {formatOutcome(rulingData.outcome)}
-          </Badge>
-          {/* Tentative / Final badge */}
-          <Badge
-            className={
-              rulingData.isTentative
-                ? 'bg-amber-100 text-amber-800 border-amber-200 dark:bg-amber-900 dark:text-amber-200 dark:border-amber-800'
-                : 'bg-indigo-100 text-indigo-800 border-indigo-200 dark:bg-indigo-900 dark:text-indigo-200 dark:border-indigo-800'
-            }
-          >
-            {rulingData.isTentative ? 'Tentative' : 'Final'}
-          </Badge>
+      {/* Heading + subtitle */}
+      <div>
+        <div className="flex flex-wrap items-start gap-3">
+          <h1 className={PAGE_TITLE}>
+            {motionLabel}
+          </h1>
+          <div className="flex flex-wrap gap-2 pt-1">
+            {/* Outcome badge */}
+            <Badge
+              className={getOutcomeBadgeClass(rulingData.outcome)}
+            >
+              {formatOutcome(rulingData.outcome)}
+            </Badge>
+            {/* Tentative / Final badge */}
+            <Badge
+              className={
+                rulingData.isTentative
+                  ? 'bg-amber-100 text-amber-800 border-amber-200 dark:bg-amber-900 dark:text-amber-200 dark:border-amber-800'
+                  : 'bg-indigo-100 text-indigo-800 border-indigo-200 dark:bg-indigo-900 dark:text-indigo-200 dark:border-indigo-800'
+              }
+            >
+              {rulingData.isTentative ? 'Tentative' : 'Final'}
+            </Badge>
+          </div>
         </div>
+
+        {/* Subtitle line 1: Judge · Court (combined with county) */}
+        {(rulingData.judge || rulingData.court) && (
+          <p className="mt-1 text-sm text-muted-foreground">
+            {rulingData.judge && (
+              <Link
+                href={`/judges/${rulingData.judge.id}`}
+                className="hover:text-primary hover:underline"
+              >
+                {rulingData.judge.canonicalName}
+              </Link>
+            )}
+            {rulingData.judge && rulingData.court && (
+              <span aria-hidden="true"> &middot; </span>
+            )}
+            {rulingData.court && (
+              <Link
+                href={`/rulings?county=${encodeURIComponent(rulingData.court.county)}`}
+                className="hover:text-primary hover:underline"
+              >
+                {rulingData.court.courtName}
+                {!rulingData.court.courtName.toLowerCase().includes(rulingData.court.county.toLowerCase()) && (
+                  <>, {rulingData.court.county}</>
+                )}
+              </Link>
+            )}
+          </p>
+        )}
+
+        {/* Subtitle line 2: Case number · Hearing date */}
+        {(rulingData.case || rulingData.hearingDate) && (
+          <p className="mt-0.5 text-sm text-muted-foreground">
+            {rulingData.case && (
+              <Link
+                href={`/cases/${rulingData.case.id}`}
+                className="hover:text-primary hover:underline"
+              >
+                Case {rulingData.case.caseNumber}
+              </Link>
+            )}
+            {rulingData.case && rulingData.hearingDate && (
+              <span aria-hidden="true"> &middot; </span>
+            )}
+            {rulingData.hearingDate && formatDate(rulingData.hearingDate)}
+          </p>
+        )}
       </div>
 
-      {/* Structured metadata Card */}
-      <Card>
-        <CardContent className="p-6">
-          <div className="grid grid-cols-2 gap-x-8 gap-y-4 sm:grid-cols-3">
-            {/* Judge */}
-            {rulingData.judge && (
-              <div>
-                <dt className={SECTION_LABEL}>
-                  Judge
-                </dt>
-                <dd className="mt-1 text-sm text-foreground">
-                  <Link
-                    href={`/judges/${rulingData.judge.id}`}
-                    className="hover:text-primary hover:underline"
-                  >
-                    {rulingData.judge.canonicalName}
-                  </Link>
-                </dd>
-              </div>
-            )}
-
-            {/* Court */}
-            {rulingData.court && (
-              <div>
-                <dt className={SECTION_LABEL}>
-                  Court
-                </dt>
-                <dd className="mt-1 text-sm text-foreground">
-                  <Link
-                    href={`/rulings?county=${encodeURIComponent(rulingData.court.county)}`}
-                    className="hover:text-primary hover:underline"
-                  >
-                    {rulingData.court.courtName}
-                  </Link>
-                </dd>
-              </div>
-            )}
-
-            {/* County */}
-            {rulingData.court && (
-              <div>
-                <dt className={SECTION_LABEL}>
-                  County
-                </dt>
-                <dd className="mt-1 text-sm text-foreground">
-                  <Link
-                    href={`/rulings?county=${encodeURIComponent(rulingData.court.county)}`}
-                    className="hover:text-primary hover:underline"
-                  >
-                    {rulingData.court.county}
-                  </Link>
-                </dd>
-              </div>
-            )}
-
-            {/* Department */}
-            {rulingData.department && (
+      {/* Structured metadata Card — only rendered when department is present.
+          Motion Type is already shown in the page heading (motionLabel), so it
+          is not duplicated here. */}
+      {rulingData.department && (
+        <Card>
+          <CardContent className="p-6">
+            <div className="grid grid-cols-2 gap-x-8 gap-y-4 sm:grid-cols-3">
               <div>
                 <dt className={SECTION_LABEL}>
                   Department
@@ -214,49 +212,10 @@ export default async function RulingDetailPage({ params }: Props) {
                   {rulingData.department}
                 </dd>
               </div>
-            )}
-
-            {/* Hearing date */}
-            <div>
-              <dt className={SECTION_LABEL}>
-                Hearing Date
-              </dt>
-              <dd className="mt-1 text-sm text-foreground">
-                {formatDate(rulingData.hearingDate)}
-              </dd>
             </div>
-
-            {/* Motion type */}
-            {rulingData.motionType && (
-              <div>
-                <dt className={SECTION_LABEL}>
-                  Motion Type
-                </dt>
-                <dd className="mt-1 text-sm text-foreground">
-                  {formatLabel(rulingData.motionType)}
-                </dd>
-              </div>
-            )}
-
-            {/* Case number */}
-            {rulingData.case && (
-              <div>
-                <dt className={SECTION_LABEL}>
-                  Case Number
-                </dt>
-                <dd className="mt-1 text-sm text-foreground">
-                  <Link
-                    href={`/cases/${rulingData.case.id}`}
-                    className="hover:text-primary hover:underline"
-                  >
-                    {rulingData.case.caseNumber}
-                  </Link>
-                </dd>
-              </div>
-            )}
-          </div>
-        </CardContent>
-      </Card>
+          </CardContent>
+        </Card>
+      )}
 
       {/* Client component handles ruling text, case link, judge link, document download */}
       <RulingDetail ruling={rulingData} sanitizedRulingTextHtml={sanitizedHtml} />
