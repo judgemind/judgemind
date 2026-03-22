@@ -136,7 +136,8 @@ The dispatcher runs a continuous loop:
 7. **Process completions** — handle agent completion/failure notifications
 8. **Triage** — close done issues, file new issues for discovered problems
 9. **Check context rotation** — increment `loop_iterations` and check if it is time to wind down (see "Context-Aware Rotation" below)
-10. **Repeat** until shutdown
+10. **Write checkpoint** — overwrite `tmp/dispatcher_checkpoint.md` with current state and behavioral rules (see "Dispatcher Checkpoint File" below)
+11. **Repeat** until shutdown
 
 ### Slot management — global concurrent ceiling
 
@@ -392,6 +393,7 @@ All of this state survives a rotation because it is file-backed:
 | Stopped issues | `tmp/stop_requests.json` | Persists across sessions |
 | Responder daemon | PID file in `tmp/` | Keeps running across rotations |
 | Telegram inbox | `tmp/tg_inbox.json` | New session picks up unprocessed commands |
+| Dispatcher checkpoint | `tmp/dispatcher_checkpoint.md` | Behavioral context for compaction recovery (see below) |
 
 ### State that does NOT persist (and that's OK)
 
@@ -400,6 +402,123 @@ All of this state survives a rotation because it is file-backed:
 | `loop_iterations` counter | Resets to 0 — that's the point of rotation |
 | In-memory `_recently_completed` list | Status file has a snapshot; startup step 4 re-scans open PRs for current state |
 | Pending reply tracking | Responder daemon handles timeouts independently |
+
+---
+
+## Dispatcher Checkpoint File
+
+The dispatcher writes `tmp/dispatcher_checkpoint.md` at the end of every main loop iteration (step 10). This file contains both **state** and **behavioral context** — it is the primary recovery mechanism when context compaction occurs or when a new session starts after rotation.
+
+### Why a checkpoint file?
+
+The existing state files (`tmp/dispatcher_status.json`, `tmp/dispatcher_state.json`) track data: agent IDs, counters, pause flags. But they do not encode **what the dispatcher should be doing** — the behavioral rules that prevent degenerate patterns like sleep-and-poll loops, racing agents to merge, or burning context on redundant CI checks. After compaction, the LLM retains the data but loses the discipline. The checkpoint file closes that gap.
+
+### Checkpoint format
+
+The checkpoint is a Markdown file (human-readable, easy for the LLM to parse) with a fixed structure. Overwrite it completely each iteration — do not append.
+
+```markdown
+# Dispatcher Checkpoint
+
+## Session
+- Session: <session_number>, Loop iteration: <loop_iterations>
+- Started: <session_start_time ISO-8601>
+- PRs since last audit: <prs_since_last_audit>/<20>
+- Winding down: <yes/no>
+
+## Active Agents (mine)
+- <agent_id> -> #<issue> "<title>" (<priority>) -- spawned <time>
+- <agent_id> -> #<issue> "<title>" (<priority>) -- spawned <time>
+(or "None" if no agents are running)
+
+## Waiting For
+- task-notification events from the <N> active agents above
+(or "Nothing -- no agents running, ready to dispatch" if slots are empty)
+
+## Do NOT
+- Sleep-and-poll for PR CI status -- agents manage their own PRs
+- Merge PRs while agents are still running -- only merge orphaned PRs
+- Proactively check CI on agent PRs -- wait for task-notification, then check if needed
+- Clean up worktrees proactively -- only after specific agent completion
+- Run code changes on main -- delegate to /task subagents
+- Block on long-running operations -- stay responsive to Telegram and events
+
+## Next Actions
+- Process next task-notification -> cleanup worktree, re-anchor cwd, send Telegram, free slot
+- When slot opens -> fresh `gh issue list --label agent/ready` query, dispatch highest priority
+- If prs_since_last_audit >= 20 -> spawn /audit
+- Check Telegram inbox for user commands
+(adjust based on current state -- e.g., if winding down, note "waiting for agents to finish before exiting")
+```
+
+### Writing the checkpoint
+
+At main loop step 10, use the Write tool to overwrite `tmp/dispatcher_checkpoint.md`. The content is assembled from the dispatcher's current in-memory state:
+
+- **Session metadata:** `session_number`, `loop_iterations`, `prs_since_last_audit`, `winding_down` flag
+- **Active agents:** from the tracked agent list (agent ID, issue number, title, priority, spawn time)
+- **Waiting for:** derived from the active agent list
+- **Do NOT:** a fixed set of behavioral rules (copy the list above verbatim — these do not change between iterations)
+- **Next actions:** derived from current state (e.g., if all slots are full, "wait for completions"; if winding down, "wait for agents to finish")
+
+The write is cheap — the file is small (~500 bytes) and overwritten each iteration. It does not require any API calls or external queries.
+
+---
+
+## Resume After Compaction
+
+When the dispatcher's context is compacted by the platform (or when a new session starts after rotation), in-memory behavioral discipline is lost. The continuation summary provides data ("5 agents running") but not rules ("wait for events, don't poll"). This section defines how to recover.
+
+### First action after compaction or session start
+
+**Before doing anything else in a new session or after detecting compaction**, read `tmp/dispatcher_checkpoint.md`:
+
+1. **Read the checkpoint file.** If `tmp/dispatcher_checkpoint.md` exists, read it in full. This is the authoritative source of both state and behavioral context.
+2. **If the file does not exist** (first-ever session, or file was deleted), proceed with normal startup — there is nothing to recover.
+
+### Reconstruct active agent list
+
+The checkpoint's "Active Agents" section lists every agent spawned in the previous session (or before compaction). Cross-reference this with the current worktree list to determine which agents are still running:
+
+```
+git worktree list
+```
+
+For each agent listed in the checkpoint:
+- If its worktree still exists in `git worktree list` — the agent is likely still running. Add it to the tracked active agent list.
+- If its worktree is gone — the agent has completed (or was cleaned up). Do not track it.
+
+Also check `tmp/agent-status/<agent-id>.txt` for each agent — the `phase` field indicates whether the agent is still working or has finished.
+
+### Re-establish behavioral discipline
+
+Read the "Do NOT" section of the checkpoint and **internalize every rule**. These rules exist because the dispatcher has historically fallen into these exact degenerate patterns after compaction:
+
+- **Do NOT sleep-and-poll for PR CI status.** Agents manage their own PRs through the full CI-fix-push cycle. The dispatcher only needs to merge orphaned PRs (where the agent has exited but CI is green).
+- **Do NOT merge PRs while agents are still running.** An agent that is still alive will merge its own PR after ralph review and CI pass. If the dispatcher races to merge, it can merge before the agent finishes verification, causing the agent to fail on a missing branch.
+- **Do NOT proactively check CI on agent PRs.** This burns context and API budget on redundant checks. Wait for task-notification events — they signal when an agent is done and its PR needs attention.
+- **Do NOT clean up worktrees proactively.** Only clean up after a specific agent completion notification confirms the agent is finished.
+- **Do NOT run code changes on main.** All code changes are delegated to `/task` subagents.
+- **Do NOT block on long-running operations.** Stay responsive to Telegram commands and task-notification events.
+
+### Resume the main loop
+
+After reading the checkpoint and reconstructing state:
+
+1. **Check Telegram inbox** — messages may have accumulated during compaction. Process any pending commands.
+2. **Do NOT re-scan PRs or merge anything immediately.** Wait for the next task-notification event to arrive before taking action on PRs. Agents that are still running will manage their own PRs.
+3. **Do NOT launch new agents immediately** unless slots are empty and no agents are running. If agents from the previous context are still active (worktrees exist), wait for their completions first.
+4. **Continue the main loop from step 1.** The checkpoint has restored enough context to resume normal operation.
+
+### Compaction detection
+
+The dispatcher cannot directly detect when compaction occurs mid-session. However, these signals suggest it may have happened:
+
+- The conversation context suddenly feels "reset" — tool outputs from earlier iterations are no longer visible
+- In-memory variables (active agent list, loop counter) are unexpectedly empty or zero
+- The dispatcher finds itself about to do something the checkpoint's "Do NOT" list prohibits
+
+If you suspect compaction has occurred mid-session, **read the checkpoint file immediately** before continuing. It is always safe to re-read — the file reflects the state as of the most recent main loop iteration.
 
 ---
 
