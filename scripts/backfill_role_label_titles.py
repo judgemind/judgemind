@@ -145,8 +145,19 @@ def _is_name_fragment(name: str) -> bool:
         return True
     upper = stripped.upper().rstrip(".")
     corp_suffixes = {
-        "INC", "LLC", "LLP", "LP", "CORP", "CORPORATION",
-        "LTD", "CO", "COMPANY", "NA", "PC", "PLLC", "PLC",
+        "INC",
+        "LLC",
+        "LLP",
+        "LP",
+        "CORP",
+        "CORPORATION",
+        "LTD",
+        "CO",
+        "COMPANY",
+        "NA",
+        "PC",
+        "PLLC",
+        "PLC",
     }
     if upper in corp_suffixes:
         return True
@@ -288,27 +299,23 @@ def _extract_parties_from_caption(ruling_text: str) -> list[dict[str, str]]:
 
         if plaintiff_name:
             if len(plaintiff_name) > MAX_PARTY_NAME_LENGTH:
-                plaintiff_name = plaintiff_name[:MAX_PARTY_NAME_LENGTH].rsplit(
-                    " ", 1
-                )[0]
+                plaintiff_name = plaintiff_name[:MAX_PARTY_NAME_LENGTH].rsplit(" ", 1)[
+                    0
+                ]
             key = plaintiff_name.lower()
             if key not in seen:
                 seen.add(key)
-                parties.append(
-                    {"name": plaintiff_name.title(), "role": p_role}
-                )
+                parties.append({"name": plaintiff_name.title(), "role": p_role})
 
         if defendant_name:
             if len(defendant_name) > MAX_PARTY_NAME_LENGTH:
-                defendant_name = defendant_name[:MAX_PARTY_NAME_LENGTH].rsplit(
-                    " ", 1
-                )[0]
+                defendant_name = defendant_name[:MAX_PARTY_NAME_LENGTH].rsplit(" ", 1)[
+                    0
+                ]
             key = defendant_name.lower()
             if key not in seen:
                 seen.add(key)
-                parties.append(
-                    {"name": defendant_name.title(), "role": d_role}
-                )
+                parties.append({"name": defendant_name.title(), "role": d_role})
 
     return parties
 
@@ -459,26 +466,34 @@ def main() -> None:
                     )
 
                     for party in new_parties:
-                        # Upsert into parties table.
+                        # Look up existing party by canonical_name, or create.
+                        # parties table has no UNIQUE on canonical_name, so we
+                        # SELECT first to avoid duplicates (#1566).
                         cur.execute(
-                            """
-                            INSERT INTO parties (canonical_name)
-                            VALUES (%s)
-                            ON CONFLICT (canonical_name) DO UPDATE
-                              SET canonical_name = EXCLUDED.canonical_name
-                            RETURNING id
-                            """,
+                            "SELECT id FROM parties WHERE canonical_name = %s LIMIT 1",
                             (party["name"],),
                         )
-                        party_id = cur.fetchone()[0]
+                        row = cur.fetchone()
+                        if row:
+                            party_id = row[0]
+                        else:
+                            cur.execute(
+                                """
+                                INSERT INTO parties (canonical_name)
+                                VALUES (%s)
+                                RETURNING id
+                                """,
+                                (party["name"],),
+                            )
+                            party_id = cur.fetchone()[0]
 
-                        # Insert case_parties association.
+                        # Link party to case — idempotent via unique
+                        # constraint on (case_id, party_id, role).
                         cur.execute(
                             """
                             INSERT INTO case_parties (case_id, party_id, role)
                             VALUES (%s, %s, %s)
-                            ON CONFLICT (case_id, party_id) DO UPDATE
-                              SET role = EXCLUDED.role
+                            ON CONFLICT (case_id, party_id, role) DO NOTHING
                             """,
                             (case_id, party_id, party["role"]),
                         )
@@ -491,9 +506,7 @@ def main() -> None:
                 )
                 logger.info("  PARTIES: %s", party_desc)
             else:
-                logger.warning(
-                    "  No parties re-extracted for case %s", case_id
-                )
+                logger.warning("  No parties re-extracted for case %s", case_id)
 
             fixed_titles += 1
 
