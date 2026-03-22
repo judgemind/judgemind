@@ -892,6 +892,16 @@ jobs:
         run: scripts/check-duplicate-functions.sh
 
   # ---------------------------------------------------------------
+  # SQL ON CONFLICT target validation: verify conflict targets match schema
+  # ---------------------------------------------------------------
+  sql-conflict-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Validate ON CONFLICT targets against schema constraints
+        run: python3 scripts/check-sql-conflicts.py
+
+  # ---------------------------------------------------------------
   # ECS oneshot Docker integration test: run scripts in a container
   # ---------------------------------------------------------------
   ecs-oneshot-test:
@@ -941,7 +951,7 @@ jobs:
   # Always runs. Reports success only when every applicable job passed or was
   # skipped (path filter did not match). Branch protection requires this check.
   ci-passed:
-    needs: [scraper-framework-tests, scraper-court-tests, ingestion-tests, nlp-tests, api-tests, web-tests, telegram-bridge-tests, infra-validate, lambda-tests, scripts-tests, coverage-check, deprecated-models-check, hardcoded-models-check, hardcoded-colors-check, oneshot-imports-check, duplicate-functions-check, schema-drift-check, dq-baselines-validate, ecs-oneshot-test, migration-files-check]
+    needs: [scraper-framework-tests, scraper-court-tests, ingestion-tests, nlp-tests, api-tests, web-tests, telegram-bridge-tests, infra-validate, lambda-tests, scripts-tests, coverage-check, deprecated-models-check, hardcoded-models-check, hardcoded-colors-check, oneshot-imports-check, duplicate-functions-check, schema-drift-check, dq-baselines-validate, ecs-oneshot-test, migration-files-check, sql-conflict-check]
     if: always()
     runs-on: ubuntu-latest
     steps:
