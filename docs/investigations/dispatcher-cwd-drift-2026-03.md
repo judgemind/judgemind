@@ -34,9 +34,9 @@ This is **not fixable in-repo** via code changes to the dispatcher or hooks. The
 
 The following workarounds are already documented and implemented:
 
-1. **`cleanup_worktree.sh`** -- Removes the agent's worktree after completion, which eliminates the drift target. Called in the dispatcher's "Processing agent completions" Step 2.
+1. **`. scripts/cleanup_worktree.sh`** (sourced) -- Removes the agent's worktree after completion AND `cd`s to repo root in the caller's shell, eliminating both the drift target and the stale cwd. Called in the dispatcher's "Processing agent completions" Step 2. Must be sourced (not executed) so the `cd` persists.
 
-2. **`cd <repo_root>` after cleanup** -- Explicit re-anchor after worktree removal. Works reliably once the directory is gone.
+2. **`cd <repo_root>` after cleanup** -- No longer needed as a separate step when the cleanup script is sourced, since the script's `cd` persists in the caller's shell. Kept as defense-in-depth if the script is accidentally executed instead of sourced.
 
 3. **`git -C <repo_root>` defense-in-depth** -- All git commands in the dispatcher use `-C` to operate from the repo root regardless of shell cwd. Documented in `docs/agent/unattended-patterns.md`.
 
@@ -67,7 +67,7 @@ The disambiguation problem can be solved by checking an environment variable or 
 ## Recommended Approach
 
 ### Tier 1: Already done (keep as-is)
-- `cleanup_worktree.sh` + `cd <repo_root>` after completions
+- `. scripts/cleanup_worktree.sh` (sourced) — handles both removal and cwd re-anchor
 - `git -C <repo_root>` for all dispatcher git commands
 - Documentation in dispatcher SKILL.md and unattended-patterns.md
 
@@ -89,4 +89,4 @@ The ideal fix is for Claude Code to preserve the parent's cwd when spawning/comp
 | Reliable way to prevent cwd drift | **No** -- this is a Claude Code platform behavior. Not fixable in-repo. |
 | Document workaround pattern | **Already done** -- documented in dispatcher SKILL.md and unattended-patterns.md |
 | PostToolUse hook on Agent completions | **Feasible** -- would add visibility but cannot prevent drift. Filed as follow-up. |
-| Dispatcher can run 5+ agent completions without manual cwd fixups | **Already achievable** with current cleanup_worktree.sh + cd pattern. The hook would add redundancy. |
+| Dispatcher can run 5+ agent completions without manual cwd fixups | **Already achievable** with sourced `. scripts/cleanup_worktree.sh` pattern. The hook would add redundancy. |

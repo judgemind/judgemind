@@ -2,15 +2,18 @@
 # Safely clean up a completed agent worktree.
 #
 # Validates that the agent has truly finished by checking its JSONL session
-# log before removing the worktree directory. Because this is a shell script
-# (not Python), the final "cd" actually affects the parent Bash process,
-# preventing pwd failures after the worktree directory is deleted.
+# log before removing the worktree directory. When sourced (not executed),
+# the final "cd" persists in the caller's shell, preventing pwd failures
+# after the worktree directory is deleted.
 #
-# Usage:
+# Usage (preferred — cd persists in caller's shell):
+#     . scripts/cleanup_worktree.sh <worktree-path>
+#     source scripts/cleanup_worktree.sh <worktree-path>
+#
+# Usage (legacy — cd only affects child process):
 #     scripts/cleanup_worktree.sh <worktree-path>
-#     scripts/cleanup_worktree.sh .claude/worktrees/agent-a9d29d9e
 #
-# Exit codes:
+# Exit/return codes:
 #     0: success (removed or already gone)
 #     1: error (agent still running, no session log, bad path, removal failed)
 #
@@ -19,9 +22,21 @@
 #     2. Agent session JSONL must exist
 #     3. Last JSONL entry must be an assistant message with text (= agent finished)
 #     4. If checks pass, git worktree remove --force, falling back to rm -rf + prune
-#     5. cd to repo root before exiting so the parent shell's cwd is valid
+#     5. cd to repo root so the shell's cwd is valid (only persists when sourced)
 
-set -euo pipefail
+# Detect whether we are being sourced or executed.
+# When sourced, $0 is the caller's script (or bash/zsh), not this file.
+# BASH_SOURCE[0] always points to this file regardless.
+_CLEANUP_SOURCED=0
+if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
+    _CLEANUP_SOURCED=1
+fi
+
+# Only set shell options when executed (not sourced), to avoid
+# modifying the caller's shell environment.
+if [[ "$_CLEANUP_SOURCED" -eq 0 ]]; then
+    set -euo pipefail
+fi
 
 # --- Find repo root ---
 find_repo_root() {
@@ -145,7 +160,7 @@ main() {
 
     local worktree_arg="$1"
     local repo_root
-    repo_root="$(find_repo_root)" || exit 1
+    repo_root="$(find_repo_root)" || return 1
 
     # Resolve worktree path (allow relative to repo root)
     local worktree_path
@@ -208,4 +223,8 @@ main() {
     return 1
 }
 
+# When executed directly, $@ has the script's arguments.
+# When sourced, $@ has the *caller's* arguments — but the caller passes
+# the worktree path as arguments to the source command, so $@ works in
+# both cases (e.g., `. scripts/cleanup_worktree.sh /path/to/worktree`).
 main "$@"
