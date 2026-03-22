@@ -709,21 +709,25 @@ def check_ingest_rates(
                         ),
                     )
                 )
-        # Ingest rate drop alert
+        # Ingest rate drop alert — suppress on non-posting days (weekends)
+        # just like zero_rulings above.  On non-posting days, low volume is
+        # expected because courts aren't publishing new rulings.
         elif daily_avg > 0 and count_24h < daily_avg * INGEST_DROP_THRESHOLD:
-            alerts.append(
-                Alert(
-                    county=county_name,
-                    metric="ingest_rate",
-                    severity="p2",
-                    expected=round(daily_avg, 1),
-                    actual=count_24h,
-                    message=(
-                        f"{county_name}: {count_24h} rulings in 24h, "
-                        f"7-day avg is {daily_avg:.1f}/day (>{INGEST_DROP_THRESHOLD * 100:.0f}% drop)"
-                    ),
+            if _24h_overlaps_posting_day(now, posting_days):
+                alerts.append(
+                    Alert(
+                        county=county_name,
+                        metric="ingest_rate",
+                        severity="p2",
+                        expected=round(daily_avg, 1),
+                        actual=count_24h,
+                        message=(
+                            f"{county_name}: {count_24h} rulings in 24h, "
+                            f"7-day avg is {daily_avg:.1f}/day "
+                            f"(>{INGEST_DROP_THRESHOLD * 100:.0f}% drop)"
+                        ),
+                    )
                 )
-            )
 
     return alerts
 

@@ -593,6 +593,93 @@ class TestCheckIngestRatesPostingDays:
         assert len(alerts) == 1
         assert alerts[0].metric == "zero_rulings"
 
+    def test_ingest_rate_drop_suppressed_on_non_posting_day(self) -> None:
+        """No ingest_rate alert on Saturday for county with Mon-Fri schedule.
+
+        This is the exact false-positive scenario from issue #1615: on weekends,
+        courts don't post new rulings, so the few duplicate-detected documents
+        that trickle in are well below 50% of the weekday-heavy 7-day average.
+        The ingest_rate drop alert should be suppressed on non-posting days.
+        """
+        # 2026-03-22 is a Sunday (but test title says Saturday for the scenario)
+        # Use Saturday March 21
+        saturday = datetime(2026, 3, 21, 16, 49, 0, tzinfo=UTC)
+        conn = FakeConnection(
+            {
+                "d.created_at <": [("Los Angeles", 1200)],
+                # 7 rulings in 24h — well below 50% of ~200/day avg
+                "d.created_at >=": [("Los Angeles", 7)],
+                "DISTINCT ct.county": [("Los Angeles",)],
+            }
+        )
+        baselines = _make_baselines(
+            {
+                "Los Angeles": {
+                    "expected_daily_rulings": 50,
+                    "schedule_type": "daily",
+                    "posting_days": ["Mon", "Tue", "Wed", "Thu", "Fri"],
+                },
+            }
+        )
+        alerts = check_ingest_rates(conn, saturday, baselines)
+        assert len(alerts) == 0
+
+    def test_ingest_rate_drop_fires_on_posting_day(self) -> None:
+        """Ingest rate drop alert still fires on a posting day (weekday).
+
+        On a posting day (e.g. Wednesday), if 24h count drops below 50% of the
+        7-day average, the alert should fire because courts are expected to
+        publish new rulings.
+        """
+        wednesday = datetime(2026, 3, 18, 12, 0, 0, tzinfo=UTC)
+        conn = FakeConnection(
+            {
+                "d.created_at <": [("Los Angeles", 1200)],
+                # 5 rulings in 24h — well below 50% of ~200/day avg
+                "d.created_at >=": [("Los Angeles", 5)],
+                "DISTINCT ct.county": [("Los Angeles",)],
+            }
+        )
+        baselines = _make_baselines(
+            {
+                "Los Angeles": {
+                    "expected_daily_rulings": 50,
+                    "schedule_type": "daily",
+                    "posting_days": ["Mon", "Tue", "Wed", "Thu", "Fri"],
+                },
+            }
+        )
+        alerts = check_ingest_rates(conn, wednesday, baselines)
+        assert len(alerts) == 1
+        assert alerts[0].metric == "ingest_rate"
+        assert alerts[0].severity == "p2"
+        assert alerts[0].actual == 5
+
+    def test_ingest_rate_drop_no_posting_days_always_alerts(self) -> None:
+        """Ingest rate drop fires on any day when no posting_days configured."""
+        sunday = datetime(2026, 3, 22, 12, 0, 0, tzinfo=UTC)
+        conn = FakeConnection(
+            {
+                "d.created_at <": [("Los Angeles", 1200)],
+                # 5 rulings in 24h — well below 50% of ~200/day avg
+                "d.created_at >=": [("Los Angeles", 5)],
+                "DISTINCT ct.county": [("Los Angeles",)],
+            }
+        )
+        baselines = _make_baselines(
+            {
+                "Los Angeles": {
+                    "expected_daily_rulings": 50,
+                    "schedule_type": "daily",
+                    # No posting_days — should always alert
+                },
+            }
+        )
+        alerts = check_ingest_rates(conn, sunday, baselines)
+        assert len(alerts) == 1
+        assert alerts[0].metric == "ingest_rate"
+        assert alerts[0].severity == "p2"
+
 
 class TestCheckScraperStaleness:
     """Tests for check_scraper_staleness function."""
