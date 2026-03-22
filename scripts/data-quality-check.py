@@ -95,7 +95,7 @@ class Alert:
     """A single data quality alert."""
 
     county: str
-    metric: str  # ingest_rate, scraper_stale, zero_rulings, field_completeness
+    metric: str  # ingest_rate, scraper_stale, zero_rulings, field_completeness, orphaned_documents
     severity: str  # p1, p2
     expected: float | int | str
     actual: float | int | str
@@ -238,7 +238,7 @@ FIELD_GAP_DOCS_QUERY = """
     SELECT ct.county, d.id AS doc_id
     FROM documents d
     JOIN courts ct ON ct.id = d.court_id
-    LEFT JOIN rulings r ON r.document_id = d.id
+    JOIN rulings r ON r.document_id = d.id
     LEFT JOIN cases c ON c.id = d.case_id
     WHERE d.status = 'active'
       AND d.created_at >= %s
@@ -275,8 +275,27 @@ FIELD_COMPLETENESS_QUERY = """
         COUNT(c.case_type) AS has_case_type
     FROM documents d
     JOIN courts ct ON ct.id = d.court_id
-    LEFT JOIN rulings r ON r.document_id = d.id
+    JOIN rulings r ON r.document_id = d.id
     LEFT JOIN cases c ON c.id = d.case_id
+    WHERE d.status = 'active'
+      AND d.created_at >= %s
+      AND d.created_at <= %s
+    {county_filter}
+    GROUP BY ct.county ORDER BY ct.county
+"""
+
+# Threshold for orphaned document alerts (percentage of documents with no ruling).
+ORPHANED_DOCS_P1_THRESHOLD = 20.0  # >20% orphaned = p1
+ORPHANED_DOCS_P2_THRESHOLD = 5.0  # 5-20% orphaned = p2
+
+ORPHANED_DOCUMENTS_QUERY = """
+    SELECT
+        ct.county,
+        COUNT(d.id) AS total_docs,
+        COUNT(CASE WHEN r.id IS NULL THEN 1 END) AS orphaned_docs
+    FROM documents d
+    JOIN courts ct ON ct.id = d.court_id
+    LEFT JOIN rulings r ON r.document_id = d.id
     WHERE d.status = 'active'
       AND d.created_at >= %s
       AND d.created_at <= %s
@@ -494,6 +513,68 @@ def check_field_completeness(
                         f"{county_name}: {field} completeness dropped from "
                         f"{baseline_pct:.1f}% to {current_pct:.1f}% "
                         f"({drop:.1f}pp drop)"
+                    ),
+                )
+            )
+
+    return alerts
+
+
+def check_orphaned_documents(
+    conn: psycopg.Connection,  # type: ignore[type-arg]
+    now: datetime,
+    county: str | None = None,
+) -> list[Alert]:
+    """Check for orphaned documents (documents with no ruling reference).
+
+    Orphaned documents indicate data integrity issues — typically from
+    backfill scripts that created document rows without corresponding
+    ruling rows.  This check surfaces the problem as a dedicated alert
+    instead of letting it pollute field completeness metrics.
+
+    Args:
+        conn: Database connection.
+        now: Current timestamp for time calculations.
+        county: Optional county filter.
+
+    Returns:
+        List of alerts for orphaned documents.
+    """
+    alerts: list[Alert] = []
+    county_filter, county_params = _build_county_filter(county)
+    cutoff = now - timedelta(days=FIELD_COMPLETENESS_WINDOW_DAYS)
+    grace_cutoff = now - timedelta(minutes=FIELD_COMPLETENESS_GRACE_MINUTES)
+
+    with conn.cursor() as cur:
+        cur.execute(
+            ORPHANED_DOCUMENTS_QUERY.format(county_filter=county_filter),
+            (cutoff, grace_cutoff, *county_params),
+        )
+        for row in cur.fetchall():
+            county_name, total_docs, orphaned_count = row
+
+            if total_docs == 0 or orphaned_count == 0:
+                continue
+
+            orphaned_pct = round(orphaned_count / total_docs * 100, 1)
+
+            if orphaned_pct > ORPHANED_DOCS_P1_THRESHOLD:
+                severity = "p1"
+            elif orphaned_pct > ORPHANED_DOCS_P2_THRESHOLD:
+                severity = "p2"
+            else:
+                continue
+
+            alerts.append(
+                Alert(
+                    county=county_name,
+                    metric="orphaned_documents",
+                    severity=severity,
+                    expected=0,
+                    actual=orphaned_count,
+                    message=(
+                        f"{county_name}: {orphaned_count} of {total_docs} "
+                        f"documents ({orphaned_pct}%) have no ruling reference"
                     ),
                 )
             )
@@ -1190,6 +1271,8 @@ def run_checks(
         else:
             alerts.extend(check_field_completeness(conn, now, field_baselines, county))
 
+        alerts.extend(check_orphaned_documents(conn, now, county))
+
     return alerts
 
 
@@ -1238,6 +1321,8 @@ def run_checks_full(
             save_field_baselines(current, baselines_path)
         else:
             alerts.extend(check_field_completeness(conn, now, field_baselines, county))
+
+        alerts.extend(check_orphaned_documents(conn, now, county))
 
         # Single metric collection pass — _collect_full_metrics is a
         # superset of _collect_county_metrics.  We derive the legacy
@@ -1298,6 +1383,7 @@ _METRIC_DISPLAY_NAMES: dict[str, str] = {
     "zero_rulings": "zero rulings",
     "ingest_rate": "ingest rate drop",
     "scraper_stale": "scraper stale",
+    "orphaned_documents": "orphaned documents",
 }
 
 # Default GitHub repo for issue filing.
