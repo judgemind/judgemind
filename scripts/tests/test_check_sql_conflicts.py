@@ -17,6 +17,11 @@ _spec.loader.exec_module(check_sql_conflicts)
 _extract_string_tokens = check_sql_conflicts._extract_string_tokens
 _extract_conflicts_from_strings = check_sql_conflicts._extract_conflicts_from_strings
 _validate_conflict = check_sql_conflicts._validate_conflict
+_extract_unique_constraints_from_sql = (
+    check_sql_conflicts._extract_unique_constraints_from_sql
+)
+_normalize_sql_statements = check_sql_conflicts._normalize_sql_statements
+build_unique_constraints = check_sql_conflicts.build_unique_constraints
 scan_file = check_sql_conflicts.scan_file
 UNIQUE_CONSTRAINTS = check_sql_conflicts.UNIQUE_CONSTRAINTS
 
@@ -197,8 +202,235 @@ def foo():
         assert errors == []
 
 
+class TestNormalizeSqlStatements:
+    """Tests for _normalize_sql_statements."""
+
+    def test_single_line_statement(self) -> None:
+        sql = "ALTER TABLE foo ADD COLUMN bar TEXT;"
+        stmts = _normalize_sql_statements(sql)
+        assert len(stmts) == 1
+        assert "alter table foo add column bar text;" in stmts[0]
+
+    def test_multi_line_statement_joined(self) -> None:
+        sql = "ALTER TABLE judges\n    ADD CONSTRAINT uq UNIQUE (a, b);"
+        stmts = _normalize_sql_statements(sql)
+        assert len(stmts) == 1
+        assert "alter table judges add constraint uq unique (a, b);" in stmts[0]
+
+    def test_comments_and_blanks_flush_statement(self) -> None:
+        sql = "ALTER TABLE a ADD COLUMN x TEXT;\n\n-- comment\nALTER TABLE b ADD COLUMN y TEXT;"
+        stmts = _normalize_sql_statements(sql)
+        assert len(stmts) == 2
+
+    def test_create_unique_index_multi_line(self) -> None:
+        sql = (
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_test\n"
+            "    ON rulings (case_id, ruling_text_hash)\n"
+            "    WHERE ruling_text_hash IS NOT NULL;"
+        )
+        stmts = _normalize_sql_statements(sql)
+        assert len(stmts) == 1
+        assert "on rulings (case_id, ruling_text_hash)" in stmts[0]
+
+
+class TestExtractUniqueConstraintsFromSql:
+    """Tests for _extract_unique_constraints_from_sql."""
+
+    def test_primary_key_inline(self) -> None:
+        sql = "CREATE TABLE foo (\n    id UUID PRIMARY KEY\n);"
+        result = _extract_unique_constraints_from_sql(sql)
+        assert frozenset({"id"}) in result["foo"]
+
+    def test_primary_key_composite(self) -> None:
+        sql = (
+            "CREATE TABLE case_judges (\n"
+            "    case_id UUID NOT NULL,\n"
+            "    judge_id UUID NOT NULL,\n"
+            "    PRIMARY KEY (case_id, judge_id)\n"
+            ");"
+        )
+        result = _extract_unique_constraints_from_sql(sql)
+        assert frozenset({"case_id", "judge_id"}) in result["case_judges"]
+
+    def test_inline_unique_column(self) -> None:
+        sql = (
+            "CREATE TABLE courts (\n"
+            "    id UUID PRIMARY KEY,\n"
+            "    court_code TEXT UNIQUE NOT NULL\n"
+            ");"
+        )
+        result = _extract_unique_constraints_from_sql(sql)
+        assert frozenset({"court_code"}) in result["courts"]
+        assert frozenset({"id"}) in result["courts"]
+
+    def test_constraint_unique_inside_create_table(self) -> None:
+        sql = (
+            "CREATE TABLE judges (\n"
+            "    id UUID PRIMARY KEY,\n"
+            "    canonical_name TEXT NOT NULL,\n"
+            "    court_id UUID NOT NULL,\n"
+            "    CONSTRAINT judges_key UNIQUE (canonical_name, court_id)\n"
+            ");"
+        )
+        result = _extract_unique_constraints_from_sql(sql)
+        assert frozenset({"canonical_name", "court_id"}) in result["judges"]
+        assert frozenset({"id"}) in result["judges"]
+
+    def test_anonymous_unique_multi_column(self) -> None:
+        sql = (
+            "CREATE TABLE cases (\n"
+            "    id UUID PRIMARY KEY,\n"
+            "    court_id UUID NOT NULL,\n"
+            "    case_number TEXT NOT NULL,\n"
+            "    UNIQUE (court_id, case_number)\n"
+            ");"
+        )
+        result = _extract_unique_constraints_from_sql(sql)
+        assert frozenset({"court_id", "case_number"}) in result["cases"]
+
+    def test_alter_table_add_constraint_unique(self) -> None:
+        sql = (
+            "-- Up Migration\n"
+            "ALTER TABLE rulings\n"
+            "    ADD CONSTRAINT uq_rulings_document_id UNIQUE (document_id);\n"
+            "\n"
+            "-- Down Migration\n"
+            "ALTER TABLE rulings DROP CONSTRAINT IF EXISTS uq_rulings_document_id;"
+        )
+        result = _extract_unique_constraints_from_sql(sql)
+        assert frozenset({"document_id"}) in result["rulings"]
+
+    def test_create_unique_index(self) -> None:
+        sql = (
+            "-- Up Migration\n"
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_test\n"
+            "    ON rulings (case_id, ruling_text_hash)\n"
+            "    WHERE ruling_text_hash IS NOT NULL;\n"
+        )
+        result = _extract_unique_constraints_from_sql(sql)
+        assert frozenset({"case_id", "ruling_text_hash"}) in result["rulings"]
+
+    def test_schema_prefixed_table(self) -> None:
+        sql = (
+            "CREATE TABLE staging.captures (\n"
+            "    id UUID PRIMARY KEY DEFAULT gen_random_uuid()\n"
+            ");"
+        )
+        result = _extract_unique_constraints_from_sql(sql)
+        assert frozenset({"id"}) in result["staging.captures"]
+
+    def test_down_migration_ignored(self) -> None:
+        sql = (
+            "-- Up Migration\n"
+            "ALTER TABLE foo ADD CONSTRAINT uq UNIQUE (bar);\n"
+            "\n"
+            "-- Down Migration\n"
+            "ALTER TABLE baz ADD CONSTRAINT uq2 UNIQUE (qux);"
+        )
+        result = _extract_unique_constraints_from_sql(sql)
+        assert "foo" in result
+        assert "baz" not in result
+
+    def test_serial_primary_key(self) -> None:
+        sql = "CREATE TABLE t (\n    id SERIAL PRIMARY KEY\n);"
+        result = _extract_unique_constraints_from_sql(sql)
+        assert frozenset({"id"}) in result["t"]
+
+    def test_bigserial_primary_key(self) -> None:
+        sql = "CREATE TABLE t (\n    id BIGSERIAL PRIMARY KEY\n);"
+        result = _extract_unique_constraints_from_sql(sql)
+        assert frozenset({"id"}) in result["t"]
+
+    def test_deduplication(self) -> None:
+        """Same constraint from schema.sql and migration should not duplicate."""
+        sql = (
+            "CREATE TABLE judges (\n"
+            "    id UUID PRIMARY KEY,\n"
+            "    CONSTRAINT uq UNIQUE (canonical_name, court_id)\n"
+            ");\n"
+        )
+        result = _extract_unique_constraints_from_sql(sql)
+        # Should have exactly two constraints: id and the named one
+        assert len(result["judges"]) == 2
+
+
+class TestBuildUniqueConstraints:
+    """Tests for build_unique_constraints with synthetic schema files."""
+
+    def test_from_schema_and_migrations(self, tmp_path: Path) -> None:
+        """Build constraints from a synthetic schema.sql + migration file."""
+        # Create directory structure
+        api_dir = tmp_path / "packages" / "api" / "src" / "data-access"
+        api_dir.mkdir(parents=True)
+        mig_dir = tmp_path / "packages" / "api" / "migrations"
+        mig_dir.mkdir(parents=True)
+
+        schema = (
+            "CREATE TABLE courts (\n"
+            "    id UUID PRIMARY KEY,\n"
+            "    court_code TEXT UNIQUE NOT NULL\n"
+            ");\n"
+            "CREATE TABLE judges (\n"
+            "    id UUID PRIMARY KEY,\n"
+            "    canonical_name TEXT NOT NULL,\n"
+            "    court_id UUID NOT NULL,\n"
+            "    CONSTRAINT uq UNIQUE (canonical_name, court_id)\n"
+            ");\n"
+        )
+        (api_dir / "schema.sql").write_text(schema)
+
+        migration = (
+            "-- Up Migration\n"
+            "ALTER TABLE courts\n"
+            "    ADD CONSTRAINT uq_courts_state UNIQUE (state);\n"
+            "\n"
+            "-- Down Migration\n"
+            "ALTER TABLE courts DROP CONSTRAINT IF EXISTS uq_courts_state;\n"
+        )
+        (mig_dir / "2_add-state-unique.sql").write_text(migration)
+
+        result = build_unique_constraints(tmp_path)
+
+        # courts: id (PK) + court_code (inline UNIQUE) + state (from migration)
+        assert frozenset({"id"}) in result["courts"]
+        assert frozenset({"court_code"}) in result["courts"]
+        assert frozenset({"state"}) in result["courts"]
+
+        # judges: id (PK) + (canonical_name, court_id) from CONSTRAINT UNIQUE
+        assert frozenset({"id"}) in result["judges"]
+        assert frozenset({"canonical_name", "court_id"}) in result["judges"]
+
+    def test_missing_schema_file(self, tmp_path: Path) -> None:
+        """Gracefully handle missing schema.sql."""
+        result = build_unique_constraints(tmp_path)
+        assert result == {}
+
+    def test_constraint_not_lost_when_removed_from_hardcoded_map(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Acceptance criterion: a constraint from schema.sql is detected even
+        if someone hypothetically removed it from a hardcoded map."""
+        api_dir = tmp_path / "packages" / "api" / "src" / "data-access"
+        api_dir.mkdir(parents=True)
+        mig_dir = tmp_path / "packages" / "api" / "migrations"
+        mig_dir.mkdir(parents=True)
+
+        schema = (
+            "CREATE TABLE courts (\n"
+            "    id UUID PRIMARY KEY,\n"
+            "    court_code TEXT UNIQUE NOT NULL\n"
+            ");\n"
+        )
+        (api_dir / "schema.sql").write_text(schema)
+
+        result = build_unique_constraints(tmp_path)
+        # Even without any hardcoded map, the constraint is detected
+        assert frozenset({"court_code"}) in result["courts"]
+
+
 class TestUniqueConstraintsCompleteness:
-    """Verify the UNIQUE_CONSTRAINTS map covers expected tables."""
+    """Verify the auto-generated UNIQUE_CONSTRAINTS map covers expected tables."""
 
     def test_has_core_tables(self) -> None:
         expected = {
@@ -229,3 +461,35 @@ class TestUniqueConstraintsCompleteness:
         assert "role" in multi_col[0], (
             "case_parties unique constraint must include role column"
         )
+
+    def test_rulings_has_document_id_unique(self) -> None:
+        """Verify rulings has document_id from migration 3."""
+        constraints = UNIQUE_CONSTRAINTS["rulings"]
+        assert frozenset({"document_id"}) in constraints
+
+    def test_rulings_has_case_text_hash_unique(self) -> None:
+        """Verify rulings has (case_id, ruling_text_hash) from migration 11."""
+        constraints = UNIQUE_CONSTRAINTS["rulings"]
+        assert frozenset({"case_id", "ruling_text_hash"}) in constraints
+
+    def test_judges_has_canonical_name_court_id(self) -> None:
+        """Verify judges has (canonical_name, court_id) from schema.sql."""
+        constraints = UNIQUE_CONSTRAINTS["judges"]
+        assert frozenset({"canonical_name", "court_id"}) in constraints
+
+    def test_users_has_all_unique_columns(self) -> None:
+        """Verify users has email, google_id, and api_key UNIQUE constraints."""
+        constraints = UNIQUE_CONSTRAINTS["users"]
+        assert frozenset({"email"}) in constraints
+        assert frozenset({"google_id"}) in constraints
+        assert frozenset({"api_key"}) in constraints
+
+    def test_constraints_are_auto_generated(self) -> None:
+        """Verify the map is built from schema files, not hardcoded.
+
+        This is the key acceptance criterion: if we build from a fresh
+        repo root, we get the same result as the module-level variable.
+        """
+        repo_root = Path(__file__).resolve().parent.parent.parent
+        fresh = build_unique_constraints(repo_root)
+        assert fresh == UNIQUE_CONSTRAINTS
