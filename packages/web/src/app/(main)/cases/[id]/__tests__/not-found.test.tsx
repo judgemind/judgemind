@@ -32,9 +32,9 @@ describe('CaseNotFound', () => {
     ).toBeInTheDocument();
   });
 
-  it('renders a link back to home', () => {
+  it('renders a link back to cases', () => {
     render(<CaseNotFound />);
-    const link = screen.getByText('Back to Home').closest('a');
-    expect(link).toHaveAttribute('href', '/');
+    const link = screen.getByText('Back to Cases').closest('a');
+    expect(link).toHaveAttribute('href', '/cases');
   });
 });

@@ -267,13 +267,9 @@ export function JudgeProfile({ judgeId }: { judgeId: string }) {
 
     if (!analytics || analytics.totalRulings === 0) {
       return (
-        <Card className="border-dashed">
-          <CardContent className="py-8 text-center">
-            <p className="text-sm text-muted-foreground">
-              No rulings captured for this judge yet. Check back after the next scrape.
-            </p>
-          </CardContent>
-        </Card>
+        <p className="py-8 text-center text-sm text-muted-foreground">
+          No rulings captured for this judge yet. Check back after the next scrape.
+        </p>
       );
     }
 
@@ -393,13 +389,9 @@ export function JudgeProfile({ judgeId }: { judgeId: string }) {
 
     if (!rulingsLoading && edges.length === 0) {
       return (
-        <Card className="border-dashed">
-          <CardContent className="py-8 text-center">
-            <p className="text-sm text-muted-foreground">
-              No rulings captured for this judge yet. Check back after the next scrape.
-            </p>
-          </CardContent>
-        </Card>
+        <p className="py-8 text-center text-sm text-muted-foreground">
+          No rulings captured for this judge yet. Check back after the next scrape.
+        </p>
       );
     }
 

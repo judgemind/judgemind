@@ -32,9 +32,9 @@ describe('JudgeNotFound', () => {
     ).toBeInTheDocument();
   });
 
-  it('renders a link back to home', () => {
+  it('renders a link back to judges', () => {
     render(<JudgeNotFound />);
-    const link = screen.getByText('Back to Home').closest('a');
-    expect(link).toHaveAttribute('href', '/');
+    const link = screen.getByText('Back to Judges').closest('a');
+    expect(link).toHaveAttribute('href', '/judges');
   });
 });
