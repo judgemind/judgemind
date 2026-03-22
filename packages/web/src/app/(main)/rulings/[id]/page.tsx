@@ -3,10 +3,9 @@ import { notFound } from 'next/navigation';
 import Link from 'next/link';
 import { createApolloClient } from '@/lib/apollo-client';
 import { formatDate, formatLabel, formatOutcome, getOutcomeBadgeClass } from '@/lib/display-helpers';
-import { PAGE_TITLE, SECTION_LABEL } from '@/lib/typography';
+import { PAGE_TITLE } from '@/lib/typography';
 import { sanitizeRulingHtml } from '@/lib/sanitize-html';
 import { RulingDetail } from './RulingDetail';
-import { Card, CardContent } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
 
 const RULING_QUERY = gql`
@@ -150,8 +149,8 @@ export default async function RulingDetailPage({ params }: Props) {
           </div>
         </div>
 
-        {/* Subtitle line 1: Judge · Court (combined with county) */}
-        {(rulingData.judge || rulingData.court) && (
+        {/* Subtitle line 1: Judge · Court (combined with county) · Dept. */}
+        {(rulingData.judge || rulingData.court || rulingData.department) && (
           <p className="mt-1 text-sm text-muted-foreground">
             {rulingData.judge && (
               <Link
@@ -175,6 +174,12 @@ export default async function RulingDetailPage({ params }: Props) {
                 )}
               </Link>
             )}
+            {rulingData.department && (
+              <>
+                <span aria-hidden="true"> &middot; </span>
+                <span>Dept. {rulingData.department}</span>
+              </>
+            )}
           </p>
         )}
 
@@ -196,26 +201,6 @@ export default async function RulingDetailPage({ params }: Props) {
           </p>
         )}
       </div>
-
-      {/* Structured metadata Card — only rendered when department is present.
-          Motion Type is already shown in the page heading (motionLabel), so it
-          is not duplicated here. */}
-      {rulingData.department && (
-        <Card>
-          <CardContent className="p-6">
-            <div className="grid grid-cols-2 gap-x-8 gap-y-4 sm:grid-cols-3">
-              <div>
-                <dt className={SECTION_LABEL}>
-                  Department
-                </dt>
-                <dd className="mt-1 text-sm text-foreground">
-                  {rulingData.department}
-                </dd>
-              </div>
-            </div>
-          </CardContent>
-        </Card>
-      )}
 
       {/* Client component handles ruling text, case link, judge link, document download */}
       <RulingDetail ruling={rulingData} sanitizedRulingTextHtml={sanitizedHtml} />

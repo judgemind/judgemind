@@ -303,7 +303,24 @@ describe('RulingDetailPage (SSR smoke)', () => {
     expect(dtTexts).not.toContain('Hearing Date');
   });
 
-  it('does not render metadata card when department is null', async () => {
+  it('renders department inline in the subtitle when present', async () => {
+    mockQuery.mockResolvedValueOnce({
+      data: { ruling: FULL_RULING },
+    });
+
+    const jsx = await RulingDetailPage({ params: { id: 'ruling-1' } });
+    render(jsx);
+
+    // Department should appear as "Dept. 12" inline in the subtitle
+    expect(screen.getByText('Dept. 12')).toBeInTheDocument();
+
+    // No standalone department card (no <dt> elements for Department)
+    const allDts = document.querySelectorAll('dt');
+    const dtTexts = Array.from(allDts).map((dt) => dt.textContent);
+    expect(dtTexts).not.toContain('Department');
+  });
+
+  it('does not render department text when department is null', async () => {
     mockQuery.mockResolvedValueOnce({
       data: {
         ruling: {
@@ -316,13 +333,30 @@ describe('RulingDetailPage (SSR smoke)', () => {
     const jsx = await RulingDetailPage({ params: { id: 'ruling-1' } });
     render(jsx);
 
-    // No metadata card labels should be present — Motion Type is shown in the
-    // heading (motionLabel) so it is not duplicated in the metadata card.
-    const allDts = document.querySelectorAll('dt');
-    expect(allDts).toHaveLength(0);
+    // No "Dept." text should appear anywhere
+    expect(screen.queryByText(/Dept\./)).not.toBeInTheDocument();
   });
 
-  it('does not show Motion Type in metadata card (already in heading)', async () => {
+  it('renders department inline even without judge or court', async () => {
+    mockQuery.mockResolvedValueOnce({
+      data: {
+        ruling: {
+          ...FULL_RULING,
+          judge: null,
+          court: null,
+          department: 'C',
+        },
+      },
+    });
+
+    const jsx = await RulingDetailPage({ params: { id: 'ruling-1' } });
+    render(jsx);
+
+    // Department should still appear when judge and court are null
+    expect(screen.getByText('Dept. C')).toBeInTheDocument();
+  });
+
+  it('does not render standalone department card (removed)', async () => {
     mockQuery.mockResolvedValueOnce({
       data: { ruling: FULL_RULING },
     });
@@ -330,10 +364,9 @@ describe('RulingDetailPage (SSR smoke)', () => {
     const jsx = await RulingDetailPage({ params: { id: 'ruling-1' } });
     render(jsx);
 
-    // Motion Type should NOT appear as a label in the metadata card
+    // No <dt> elements should exist — the standalone metadata card is removed
     const allDts = document.querySelectorAll('dt');
-    const dtTexts = Array.from(allDts).map((dt) => dt.textContent);
-    expect(dtTexts).not.toContain('Motion Type');
+    expect(allDts).toHaveLength(0);
   });
 
   it('does not render entity links when judge, case, and court are null', async () => {
