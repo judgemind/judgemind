@@ -45,17 +45,8 @@ export function Header() {
           Judgemind
         </Link>
 
-        <nav aria-label="Main" className="hidden flex-1 items-center gap-1 text-sm font-medium md:flex">
-          <Button variant="ghost" size="sm" asChild>
-            <Link href="/search">Search</Link>
-          </Button>
-          <Button variant="ghost" size="sm" asChild>
-            <Link href="/rulings">Rulings</Link>
-          </Button>
-        </nav>
-
-        {/* Spacer for mobile (no nav links shown) */}
-        <div className="flex-1 md:hidden" />
+        {/* Spacer — sidebar owns all navigation */}
+        <div className="flex-1" />
 
         <div className="flex items-center gap-1">
           <Button
@@ -93,7 +84,7 @@ export function Header() {
                   </DropdownMenuContent>
                 </DropdownMenu>
               ) : (
-                <Button size="sm" asChild>
+                <Button variant="outline" size="sm" asChild>
                   <Link href="/auth/login">Log in</Link>
                 </Button>
               )}

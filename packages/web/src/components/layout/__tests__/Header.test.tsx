@@ -65,15 +65,9 @@ describe('Header', () => {
     );
   });
 
-  it('renders navigation links', () => {
+  it('does not render duplicate nav links (sidebar owns navigation)', () => {
     render(<Header />);
-    expect(screen.getByText('Search')).toBeInTheDocument();
-    expect(screen.getByText('Rulings')).toBeInTheDocument();
-  });
-
-  it('has aria-label on nav element', () => {
-    render(<Header />);
-    expect(screen.getByRole('navigation', { name: 'Main' })).toBeInTheDocument();
+    expect(screen.queryByRole('navigation', { name: 'Main' })).not.toBeInTheDocument();
   });
 
   it('renders dark mode toggle', () => {
@@ -88,6 +82,15 @@ describe('Header', () => {
     render(<Header />);
     const loginLink = screen.getByText('Log in');
     expect(loginLink.closest('a')).toHaveAttribute('href', '/auth/login');
+  });
+
+  it('renders Log in button with outline variant', () => {
+    render(<Header />);
+    const loginLink = screen.getByText('Log in');
+    // The outline variant button wrapping the link should not use the default/primary style
+    const button = loginLink.closest('a');
+    expect(button?.className).toContain('border');
+    expect(button?.className).not.toContain('bg-primary');
   });
 
   it('shows user menu button when authenticated', () => {
