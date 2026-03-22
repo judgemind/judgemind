@@ -1549,6 +1549,13 @@ class TestIsValidCaseNumber:
             is False
         )
 
+    def test_rejects_ruling_keyword_without_vs(self) -> None:
+        """Ruling keywords like 'motion' should be rejected even without 'v.' pattern."""
+        assert is_valid_case_number("Motion to Compel") is False
+
+    def test_rejects_hearing_keyword(self) -> None:
+        assert is_valid_case_number("Hearing on Demurrer") is False
+
     def test_rejects_empty(self) -> None:
         assert is_valid_case_number("") is False
 
