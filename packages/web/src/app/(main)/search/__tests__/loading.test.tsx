@@ -21,11 +21,15 @@ describe('SearchLoading', () => {
     expect(skeletons.length).toBeGreaterThan(0);
   });
 
-  it('renders 5 skeleton result placeholders', () => {
-    render(<SearchLoading />);
+  it('renders skeleton result row placeholders inside bordered container', () => {
+    const { container } = render(<SearchLoading />);
     const skeletons = screen.getAllByTestId('skeleton');
-    // Header skeleton (h-8) + subtitle (h-4) + search bar (h-10) + sidebar (h-96) + 5 results (h-32)
-    // = 10 skeletons total on desktop
-    expect(skeletons.length).toBeGreaterThanOrEqual(9);
+    // Header (h-8) + subtitle (h-4) + search bar (h-10) + sidebar (h-96) = 4 chrome skeletons
+    // + 5 result rows x 7 skeletons each (title, subtitle, date, 2 badges, 2 excerpt lines) = 35
+    // = 39 total
+    expect(skeletons.length).toBeGreaterThanOrEqual(30);
+    // Verify the bordered container pattern is used
+    const borderedContainer = container.querySelector('.divide-y.rounded-lg.border');
+    expect(borderedContainer).toBeTruthy();
   });
 });

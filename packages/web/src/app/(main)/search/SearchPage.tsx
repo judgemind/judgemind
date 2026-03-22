@@ -176,27 +176,25 @@ interface SearchData {
 
 const PAGE_SIZE = 20;
 
-function SkeletonCard() {
+function SkeletonRow() {
   return (
-    <Card>
-      <CardContent className="p-4">
-        <div className="flex items-start justify-between gap-3">
-          <div className="min-w-0 flex-1 space-y-2">
-            <Skeleton className="h-5 w-2/3" />
-            <Skeleton className="h-3 w-1/3" />
-          </div>
-          <Skeleton className="h-5 w-16" />
+    <div className="px-4 py-3">
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0 flex-1 space-y-2">
+          <Skeleton className="h-5 w-2/3" />
+          <Skeleton className="h-3 w-1/3" />
         </div>
-        <div className="mt-3 flex gap-2">
-          <Skeleton className="h-5 w-14 rounded-full" />
-          <Skeleton className="h-5 w-16 rounded-full" />
-        </div>
-        <div className="mt-3 space-y-1.5">
-          <Skeleton className="h-3 w-full" />
-          <Skeleton className="h-3 w-4/5" />
-        </div>
-      </CardContent>
-    </Card>
+        <Skeleton className="h-5 w-16" />
+      </div>
+      <div className="mt-3 flex gap-2">
+        <Skeleton className="h-5 w-14 rounded-full" />
+        <Skeleton className="h-5 w-16 rounded-full" />
+      </div>
+      <div className="mt-3 space-y-1.5">
+        <Skeleton className="h-3 w-full" />
+        <Skeleton className="h-3 w-4/5" />
+      </div>
+    </div>
   );
 }
 
@@ -356,63 +354,61 @@ function FilterContent({
   );
 }
 
-/** A single search result card. */
-function ResultCard({ node }: { node: SearchHitNode }) {
+/** A single search result row. */
+function ResultRow({ node }: { node: SearchHitNode }) {
   const motionLabel = node.motionType ? MOTION_TYPE_LABELS[node.motionType] ?? node.motionType : null;
   const outcomeLabel = node.outcome ? OUTCOME_LABELS[node.outcome] ?? node.outcome : null;
   const outcomeBadgeVariant = getOutcomeBadgeVariant(node.outcome);
 
   return (
-    <Link href={`/rulings/${node.rulingId}`} className="block rounded-lg focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2">
-      <Card className="transition-colors hover:bg-accent/50">
-        <CardContent className="p-4">
-          {/* Top row: case info + hearing date */}
-          <div className="flex items-start justify-between gap-3">
-            <div className="min-w-0 flex-1">
-              <h3 className="truncate text-base font-semibold text-foreground">
-                {node.caseTitle ?? node.caseNumber ?? 'Unknown Case'}
-              </h3>
-              {node.caseTitle && node.caseNumber && (
-                <p className="mt-0.5 truncate text-xs text-muted-foreground">
-                  {node.caseNumber}
-                </p>
-              )}
-            </div>
-            {node.hearingDate && (
-              <span className="shrink-0 text-xs text-muted-foreground">
-                {formatDate(node.hearingDate)}
-              </span>
+    <Link href={`/rulings/${node.rulingId}`} className="block transition-colors hover:bg-accent/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2">
+      <div className="px-4 py-3">
+        {/* Top row: case info + hearing date */}
+        <div className="flex items-start justify-between gap-3">
+          <div className="min-w-0 flex-1">
+            <h3 className="truncate text-base font-semibold text-foreground">
+              {node.caseTitle ?? node.caseNumber ?? 'Unknown Case'}
+            </h3>
+            {node.caseTitle && node.caseNumber && (
+              <p className="mt-0.5 truncate text-xs text-muted-foreground">
+                {node.caseNumber}
+              </p>
             )}
           </div>
-
-          {/* Metadata row */}
-          <p className="mt-1 truncate text-sm text-muted-foreground">
-            {node.judgeName ? `Judge ${node.judgeName}` : ''}
-            {node.judgeName && node.county ? ' \u00B7 ' : ''}
-            {node.county ?? ''}
-          </p>
-
-          {/* Badges for motion type and outcome */}
-          {(motionLabel || outcomeLabel) && (
-            <div className="mt-2 flex flex-wrap gap-1.5">
-              {motionLabel && (
-                <Badge variant="secondary">{motionLabel}</Badge>
-              )}
-              {outcomeLabel && (
-                <Badge variant={outcomeBadgeVariant} className={getOutcomeBadgeListClass(node.outcome)}>{outcomeLabel}</Badge>
-              )}
-            </div>
+          {node.hearingDate && (
+            <span className="shrink-0 text-xs text-muted-foreground">
+              {formatDate(node.hearingDate)}
+            </span>
           )}
+        </div>
 
-          {/* Excerpt */}
-          {node.excerpt && (
-            <p
-              className="mt-3 line-clamp-3 text-sm text-muted-foreground"
-              dangerouslySetInnerHTML={{ __html: sanitizeExcerptHtml(node.excerpt) }}
-            />
-          )}
-        </CardContent>
-      </Card>
+        {/* Metadata row */}
+        <p className="mt-1 truncate text-sm text-muted-foreground">
+          {node.judgeName ? `Judge ${node.judgeName}` : ''}
+          {node.judgeName && node.county ? ' \u00B7 ' : ''}
+          {node.county ?? ''}
+        </p>
+
+        {/* Badges for motion type and outcome */}
+        {(motionLabel || outcomeLabel) && (
+          <div className="mt-2 flex flex-wrap gap-1.5">
+            {motionLabel && (
+              <Badge variant="secondary">{motionLabel}</Badge>
+            )}
+            {outcomeLabel && (
+              <Badge variant={outcomeBadgeVariant} className={getOutcomeBadgeListClass(node.outcome)}>{outcomeLabel}</Badge>
+            )}
+          </div>
+        )}
+
+        {/* Excerpt */}
+        {node.excerpt && (
+          <p
+            className="mt-3 line-clamp-3 text-sm text-muted-foreground"
+            dangerouslySetInnerHTML={{ __html: sanitizeExcerptHtml(node.excerpt) }}
+          />
+        )}
+      </div>
     </Link>
   );
 }
@@ -648,9 +644,9 @@ export function SearchPage() {
 
           {/* Loading state */}
           {hasSearched && loading && edges.length === 0 && (
-            <div className="space-y-3">
+            <div className="divide-y rounded-lg border">
               {Array.from({ length: 5 }).map((_, i) => (
-                <SkeletonCard key={i} />
+                <SkeletonRow key={i} />
               ))}
             </div>
           )}
@@ -693,16 +689,18 @@ export function SearchPage() {
             </p>
           )}
 
-          {/* Result cards */}
+          {/* Result rows */}
           {edges.length > 0 && (
-            <div className="space-y-3">
-              {edges.map(({ node }) => (
-                <ResultCard key={node.rulingId} node={node} />
-              ))}
+            <div>
+              <div className="divide-y rounded-lg border">
+                {edges.map(({ node }) => (
+                  <ResultRow key={node.rulingId} node={node} />
+                ))}
+              </div>
 
               {/* Load more */}
               {pageInfo?.hasNextPage && (
-                <div className="flex justify-center pt-2">
+                <div className="flex justify-center pt-4">
                   <Button
                     variant="outline"
                     onClick={(e) => {
