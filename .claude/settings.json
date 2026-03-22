@@ -97,6 +97,16 @@
             "timeout": 5
           }
         ]
+      },
+      {
+        "matcher": "Agent",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash .claude/hooks/agent-cwd-guard.sh",
+            "timeout": 5
+          }
+        ]
       }
     ],
     "SessionStart": [
