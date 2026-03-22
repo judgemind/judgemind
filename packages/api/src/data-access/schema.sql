@@ -261,6 +261,7 @@ CREATE TABLE rulings (
     -- Ruling content
     ruling_text     TEXT,                   -- Extracted plain text
     ruling_text_html TEXT,                  -- Original HTML (preserved for re-parsing)
+    ruling_text_hash TEXT,                  -- SHA-256 of normalized text (for content-based dedup)
     outcome         ruling_outcome,
     motion_type     TEXT,
     -- Scheduling
@@ -282,6 +283,7 @@ CREATE TABLE rulings (
 COMMENT ON TABLE  rulings             IS 'Tentative and final rulings. is_tentative=TRUE is the primary data type.';
 COMMENT ON COLUMN rulings.judge_id    IS 'Nullable: populated by entity resolution after initial capture.';
 COMMENT ON COLUMN rulings.ruling_text IS 'Extracted text. Never modify — re-parse from document_id if needed.';
+COMMENT ON COLUMN rulings.ruling_text_hash IS 'SHA-256 of normalized (lowercased, whitespace-collapsed) ruling text. Used for content-based dedup.';
 COMMENT ON COLUMN rulings.summary     IS 'Cached AI summary. Never re-generated; served from cache on every request.';
 
 
@@ -502,6 +504,9 @@ CREATE INDEX idx_rulings_hearing_date   ON rulings(hearing_date DESC);
 CREATE INDEX idx_rulings_posted_at      ON rulings(posted_at DESC);
 CREATE INDEX idx_rulings_outcome        ON rulings(outcome);
 CREATE INDEX idx_rulings_motion_type    ON rulings(motion_type);
+-- Content-based dedup: partial unique index on (case_id, ruling_text_hash)
+CREATE UNIQUE INDEX uq_rulings_case_text_hash ON rulings(case_id, ruling_text_hash)
+    WHERE ruling_text_hash IS NOT NULL;
 -- Composite: judge analytics (most common aggregation pattern)
 CREATE INDEX idx_rulings_judge_outcome  ON rulings(judge_id, outcome, hearing_date DESC);
 CREATE INDEX idx_rulings_judge_motion   ON rulings(judge_id, motion_type, outcome);

@@ -52,7 +52,7 @@ The same entity/junction split applies to other relationships:
 | `documents` | `(id)` PK | schema.sql |
 | `rulings` | `(id)` PK | schema.sql |
 | `rulings` | `(document_id)` | migration 3 |
-| `rulings` | `(case_id, ruling_text_hash)` partial | migration 11 |
+| `rulings` | `(case_id, ruling_text_hash)` partial | schema.sql |
 | `users` | `(id)` PK | schema.sql |
 | `users` | `(email)` | schema.sql |
 | `users` | `(google_id)` | migration 2 |
