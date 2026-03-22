@@ -24,12 +24,12 @@ function SkeletonGrid() {
     <div>
       <div className="mb-6 grid grid-cols-1 gap-4 sm:grid-cols-3">
         {Array.from({ length: 3 }).map((_, i) => (
-          <div key={i} className="h-24 animate-pulse motion-reduce:animate-none rounded-lg bg-slate-200 dark:bg-slate-700" />
+          <div key={i} className="h-24 animate-pulse motion-reduce:animate-none rounded-lg bg-muted" />
         ))}
       </div>
       <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5">
         {Array.from({ length: 10 }).map((_, i) => (
-          <div key={i} className="h-20 animate-pulse motion-reduce:animate-none rounded-lg bg-slate-200 dark:bg-slate-700" />
+          <div key={i} className="h-20 animate-pulse motion-reduce:animate-none rounded-lg bg-muted" />
         ))}
       </div>
     </div>
@@ -77,9 +77,9 @@ export function DataQualityDashboard() {
   // Not authenticated or not admin
   if (!user || user.role !== 'admin') {
     return (
-      <div className="rounded-lg border border-slate-200 p-8 text-center dark:border-slate-700">
-        <h2 className="text-lg font-semibold text-slate-900 dark:text-slate-100">Access Denied</h2>
-        <p className="mt-2 text-sm text-slate-500 dark:text-slate-400">
+      <div className="rounded-lg border border-border p-8 text-center">
+        <h2 className="text-lg font-semibold text-foreground">Access Denied</h2>
+        <p className="mt-2 text-sm text-muted-foreground">
           This page is restricted to admin users. Please log in with an admin account.
         </p>
       </div>
@@ -131,7 +131,7 @@ export function DataQualityDashboard() {
       {metricsLoading ? (
         <div className="space-y-4">
           {Array.from({ length: 3 }).map((_, i) => (
-            <div key={i} className="h-80 animate-pulse motion-reduce:animate-none rounded-lg bg-slate-200 dark:bg-slate-700" />
+            <div key={i} className="h-80 animate-pulse motion-reduce:animate-none rounded-lg bg-muted" />
           ))}
         </div>
       ) : (

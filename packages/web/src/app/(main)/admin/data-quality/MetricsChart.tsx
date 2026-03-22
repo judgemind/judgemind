@@ -47,9 +47,9 @@ export function MetricsChart({ metrics, metricName, title, yAxisLabel, county }:
 
   if (chartData.length === 0) {
     return (
-      <div className="rounded-lg border border-slate-200 bg-white p-4 dark:border-slate-700 dark:bg-slate-800">
-        <h3 className="text-sm font-semibold text-slate-900 dark:text-slate-100">{title}</h3>
-        <p className="mt-4 text-center text-sm text-slate-400 dark:text-slate-500">
+      <div className="rounded-lg border border-border bg-card p-4">
+        <h3 className="text-sm font-semibold text-foreground">{title}</h3>
+        <p className="mt-4 text-center text-sm text-muted-foreground">
           No data available for this time range.
         </p>
       </div>
@@ -57,8 +57,8 @@ export function MetricsChart({ metrics, metricName, title, yAxisLabel, county }:
   }
 
   return (
-    <div className="rounded-lg border border-slate-200 bg-white p-4 dark:border-slate-700 dark:bg-slate-800">
-      <h3 className="mb-4 text-sm font-semibold text-slate-900 dark:text-slate-100">{title}</h3>
+    <div className="rounded-lg border border-border bg-card p-4">
+      <h3 className="mb-4 text-sm font-semibold text-foreground">{title}</h3>
       <ResponsiveContainer width="100%" height={300}>
         <LineChart data={chartData}>
           <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" />

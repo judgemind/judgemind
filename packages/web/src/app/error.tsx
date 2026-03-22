@@ -15,11 +15,11 @@ export default function ErrorPage({
 
   return (
     <div className="mx-auto max-w-4xl">
-      <div className="rounded-lg border border-slate-200 p-8 text-center dark:border-slate-700">
-        <h1 className="text-xl font-bold text-slate-900 dark:text-slate-100">
+      <div className="rounded-lg border border-border p-8 text-center">
+        <h1 className="text-xl font-bold text-foreground">
           Something went wrong
         </h1>
-        <p className="mt-2 text-sm text-slate-500 dark:text-slate-400">
+        <p className="mt-2 text-sm text-muted-foreground">
           An unexpected error occurred. Please try again.
         </p>
         <button

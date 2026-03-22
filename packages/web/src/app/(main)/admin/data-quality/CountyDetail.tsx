@@ -74,11 +74,11 @@ export function CountyDetail({ county, overview, onBack }: CountyDetailProps) {
       <div className="mb-6 flex items-center gap-4">
         <button
           onClick={onBack}
-          className="rounded-md border border-slate-300 px-3 py-1.5 text-sm text-slate-700 hover:bg-slate-50 dark:border-slate-600 dark:text-slate-300 dark:hover:bg-slate-800"
+          className="rounded-md border border-border px-3 py-1.5 text-sm text-foreground hover:bg-muted"
         >
           Back to overview
         </button>
-        <h2 className="text-xl font-bold text-slate-900 dark:text-slate-100">{county}</h2>
+        <h2 className="text-xl font-bold text-foreground">{county}</h2>
         <span className={`rounded-full px-2.5 py-0.5 text-xs font-medium ${STATUS_BADGE[overview.healthStatus] ?? ''}`}>
           {overview.healthStatus.toUpperCase()}
         </span>
@@ -86,21 +86,21 @@ export function CountyDetail({ county, overview, onBack }: CountyDetailProps) {
 
       {/* Current metrics summary */}
       <div className="mb-6 grid grid-cols-1 gap-4 sm:grid-cols-3">
-        <div className="rounded-lg border border-slate-200 bg-white p-4 dark:border-slate-700 dark:bg-slate-800">
-          <p className="text-sm text-slate-500 dark:text-slate-400">Rulings (24h)</p>
-          <p className="mt-1 text-2xl font-bold text-slate-900 dark:text-slate-100">
+        <div className="rounded-lg border border-border bg-card p-4">
+          <p className="text-sm text-muted-foreground">Rulings (24h)</p>
+          <p className="mt-1 text-2xl font-bold text-foreground">
             {overview.rulingCount24h !== null ? overview.rulingCount24h : '\u2014'}
           </p>
         </div>
-        <div className="rounded-lg border border-slate-200 bg-white p-4 dark:border-slate-700 dark:bg-slate-800">
-          <p className="text-sm text-slate-500 dark:text-slate-400">Field Completeness</p>
-          <p className="mt-1 text-2xl font-bold text-slate-900 dark:text-slate-100">
+        <div className="rounded-lg border border-border bg-card p-4">
+          <p className="text-sm text-muted-foreground">Field Completeness</p>
+          <p className="mt-1 text-2xl font-bold text-foreground">
             {overview.fieldCompletenessPct !== null ? `${Math.round(overview.fieldCompletenessPct)}%` : '\u2014'}
           </p>
         </div>
-        <div className="rounded-lg border border-slate-200 bg-white p-4 dark:border-slate-700 dark:bg-slate-800">
-          <p className="text-sm text-slate-500 dark:text-slate-400">Scraper Age</p>
-          <p className="mt-1 text-2xl font-bold text-slate-900 dark:text-slate-100">
+        <div className="rounded-lg border border-border bg-card p-4">
+          <p className="text-sm text-muted-foreground">Scraper Age</p>
+          <p className="mt-1 text-2xl font-bold text-foreground">
             {overview.scraperLastSuccessAgeHours !== null
               ? `${Math.round(overview.scraperLastSuccessAgeHours)}h`
               : '\u2014'}
@@ -117,7 +117,7 @@ export function CountyDetail({ county, overview, onBack }: CountyDetailProps) {
             className={`rounded-md px-3 py-1.5 text-sm ${
               daysRange === d
                 ? 'bg-brand-accent text-white'
-                : 'border border-slate-300 text-slate-700 hover:bg-slate-50 dark:border-slate-600 dark:text-slate-300 dark:hover:bg-slate-800'
+                : 'border border-border text-foreground hover:bg-muted'
             }`}
           >
             {d}d
@@ -129,7 +129,7 @@ export function CountyDetail({ county, overview, onBack }: CountyDetailProps) {
       {loading && (
         <div className="space-y-4">
           {Array.from({ length: 3 }).map((_, i) => (
-            <div key={i} className="h-80 animate-pulse motion-reduce:animate-none rounded-lg bg-slate-200 dark:bg-slate-700" />
+            <div key={i} className="h-80 animate-pulse motion-reduce:animate-none rounded-lg bg-muted" />
           ))}
         </div>
       )}
@@ -169,8 +169,8 @@ export function CountyDetail({ county, overview, onBack }: CountyDetailProps) {
 
       {/* Field-level breakdown */}
       {fieldBreakdown && (
-        <div className="mt-6 rounded-lg border border-slate-200 bg-white p-4 dark:border-slate-700 dark:bg-slate-800">
-          <h3 className="mb-3 text-sm font-semibold text-slate-900 dark:text-slate-100">
+        <div className="mt-6 rounded-lg border border-border bg-card p-4">
+          <h3 className="mb-3 text-sm font-semibold text-foreground">
             Field-Level Completeness
           </h3>
           <div className="grid grid-cols-2 gap-2 sm:grid-cols-3 md:grid-cols-4">
@@ -178,7 +178,7 @@ export function CountyDetail({ county, overview, onBack }: CountyDetailProps) {
               .sort(([, a], [, b]) => a - b)
               .map(([field, pct]) => (
                 <div key={field} className="flex items-center gap-2">
-                  <div className="h-2 flex-1 overflow-hidden rounded-full bg-slate-200 dark:bg-slate-700">
+                  <div className="h-2 flex-1 overflow-hidden rounded-full bg-muted">
                     <div
                       className={`h-full rounded-full ${
                         pct >= 90 ? 'bg-green-500' : pct >= 70 ? 'bg-yellow-500' : 'bg-red-500'
@@ -186,10 +186,10 @@ export function CountyDetail({ county, overview, onBack }: CountyDetailProps) {
                       style={{ width: `${Math.min(100, pct)}%` }}
                     />
                   </div>
-                  <span className="w-20 text-xs text-slate-600 dark:text-slate-400">
+                  <span className="w-20 text-xs text-muted-foreground">
                     {field.replace(/_/g, ' ')}
                   </span>
-                  <span className="w-10 text-right text-xs font-medium text-slate-700 dark:text-slate-300">
+                  <span className="w-10 text-right text-xs font-medium text-foreground">
                     {Math.round(pct)}%
                   </span>
                 </div>

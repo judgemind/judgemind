@@ -115,7 +115,7 @@ export default function RegisterPage() {
         <SubmitButton loading={loading}>Create account</SubmitButton>
       </form>
 
-      <div className="mt-6 text-center text-sm text-slate-500 dark:text-slate-400">
+      <div className="mt-6 text-center text-sm text-muted-foreground">
         Already have an account?{' '}
         <Link
           href="/auth/login"
