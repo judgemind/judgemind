@@ -18,6 +18,7 @@ import html
 import io
 import json
 import re
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import date
@@ -33,6 +34,68 @@ from framework.llm_schema import (
 from .llm_providers import call_llm, call_llm_with_images
 
 logger = structlog.get_logger(__name__)
+
+# ---------------------------------------------------------------------------
+# Token tracking — thread-safe accumulator for cost monitoring
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class TokenTracker:
+    """Thread-safe accumulator for LLM token usage across multiple calls.
+
+    Pass an instance to ``extract_fields_llm()`` via the *token_tracker*
+    parameter.  After all calls complete, read the totals and call
+    ``estimated_cost()`` to get an approximate USD cost.
+    """
+
+    input_tokens: int = 0
+    output_tokens: int = 0
+    api_calls: int = 0
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+
+    def add(self, input_tokens: int, output_tokens: int) -> None:
+        """Atomically add token counts from a single LLM call."""
+        with self._lock:
+            self.input_tokens += input_tokens
+            self.output_tokens += output_tokens
+            self.api_calls += 1
+
+    def estimated_cost(
+        self,
+        *,
+        input_price_per_mtok: float | None = None,
+        output_price_per_mtok: float | None = None,
+        provider: str | None = None,
+    ) -> float:
+        """Estimate USD cost based on token counts and provider pricing.
+
+        If *input_price_per_mtok* and *output_price_per_mtok* are given,
+        they are used directly (dollars per 1M tokens).  Otherwise,
+        pricing is looked up from ``_PROVIDER_PRICING`` using *provider*.
+
+        Returns the estimated cost in USD.
+        """
+        if input_price_per_mtok is not None and output_price_per_mtok is not None:
+            inp_price = input_price_per_mtok
+            out_price = output_price_per_mtok
+        else:
+            inp_price, out_price = _PROVIDER_PRICING.get(
+                provider or "google",
+                _PROVIDER_PRICING["google"],
+            )
+        return (
+            self.input_tokens * inp_price / 1_000_000 + self.output_tokens * out_price / 1_000_000
+        )
+
+
+# Provider pricing: (input $/1M tokens, output $/1M tokens)
+# These are approximate list prices as of 2026-03.
+_PROVIDER_PRICING: dict[str, tuple[float, float]] = {
+    "google": (0.075, 0.30),  # Gemini 2.5 Flash Lite
+    "anthropic": (0.80, 4.00),  # Claude Haiku 4.5
+}
+
 
 # ---------------------------------------------------------------------------
 # Outcome taxonomy — matches the ``ruling_outcome`` PostgreSQL enum
@@ -697,6 +760,7 @@ def extract_fields_llm(
     max_chars: int = _DEFAULT_MAX_CHARS,
     timeout: float | None = None,
     max_total_chars: int | None = None,
+    token_tracker: TokenTracker | None = None,
 ) -> LLMExtractionResult | None:
     """Extract structured fields from a court ruling via a configurable LLM.
 
@@ -735,6 +799,9 @@ def extract_fields_llm(
             size.  Documents exceeding this are skipped entirely and the
             function returns ``None``.  Default: ``None`` (no limit —
             documents of any size are processed via chunking).
+        token_tracker: Optional ``TokenTracker`` to accumulate token usage
+            across multiple calls.  Thread-safe — can be shared across
+            concurrent ``extract_fields_llm()`` invocations.
 
     Returns:
         An ``LLMExtractionResult`` with extracted fields, or ``None`` if
@@ -800,6 +867,8 @@ def extract_fields_llm(
         if llm_response is None:
             logger.warning("llm_extract.chunk_api_failure", chunk_index=i)
             return None
+        if token_tracker is not None:
+            token_tracker.add(llm_response.input_tokens, llm_response.output_tokens)
         return _parse_response(llm_response.text, metadata)
 
     if len(chunks) == 1:

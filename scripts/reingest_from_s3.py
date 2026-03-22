@@ -88,6 +88,7 @@ from ingestion.extract import (  # noqa: E402
 from ingestion.llm_extract import (  # noqa: E402
     LLMExtractionResult,
     LLMRulingResult,
+    TokenTracker,
     extract_fields_llm,
     extract_text_from_pdf,
 )
@@ -370,6 +371,7 @@ def _reparse_document(
     llm_model: str | None = None,
     llm_timeout: float | None = 60.0,
     force_llm: bool = False,
+    token_tracker: TokenTracker | None = None,
 ) -> dict:
     """Re-parse a document using a three-tier extraction strategy.
 
@@ -516,6 +518,7 @@ def _reparse_document(
                 provider=llm_provider,
                 model=llm_model,
                 timeout=llm_timeout,
+                token_tracker=token_tracker,
             )
             llm_latency_ms = round((time.monotonic() - t0) * 1000)
 
@@ -638,6 +641,7 @@ def _full_reparse_document(
     llm_model: str | None = None,
     llm_timeout: float | None = 60.0,
     force_llm: bool = False,
+    token_tracker: TokenTracker | None = None,
 ) -> list[dict]:
     """Re-parse a document with full splitting logic.
 
@@ -671,6 +675,7 @@ def _full_reparse_document(
             llm_model=llm_model,
             llm_timeout=llm_timeout,
             force_llm=force_llm,
+            token_tracker=token_tracker,
         )
         result["ruling_index"] = 0
         result["split_document_id"] = doc_meta["document_id"]
@@ -700,6 +705,7 @@ def _full_reparse_document(
             llm_model=llm_model,
             llm_timeout=llm_timeout,
             force_llm=force_llm,
+            token_tracker=token_tracker,
         )
         result["ruling_index"] = 0
         result["split_document_id"] = doc_meta["document_id"]
@@ -852,6 +858,7 @@ def reingest_batch(
     running_processed: int = 0,
     running_updated: int = 0,
     batch_number: int = 0,
+    token_tracker: TokenTracker | None = None,
 ) -> dict[str, Any]:
     """Process one batch. Returns a dict of batch stats.
 
@@ -1043,6 +1050,7 @@ def reingest_batch(
                 llm_model,
                 llm_timeout,
                 force_llm,
+                token_tracker,
             )
             parse_futures[future] = (idx, doc_meta)
 
@@ -1256,6 +1264,102 @@ def reingest_batch(
     }
 
 
+# ---------------------------------------------------------------------------
+# Quality metrics queries — spotcheck data quality before/after reingest
+# ---------------------------------------------------------------------------
+
+# SQL queries for data quality metrics.  Each returns a single integer count.
+# All queries filter on active documents only.
+_QUALITY_QUERIES: dict[str, str] = {
+    "truncated_vs_titles": """
+        SELECT COUNT(*) FROM cases c
+        JOIN documents d ON d.case_id = c.id AND d.status = 'active'
+        JOIN courts ct ON ct.id = d.court_id
+        WHERE c.case_title ~ 'vs\\.?\\s*$'
+        {county_filter}
+    """,
+    "header_merge_titles": """
+        SELECT COUNT(*) FROM cases c
+        JOIN documents d ON d.case_id = c.id AND d.status = 'active'
+        JOIN courts ct ON ct.id = d.court_id
+        WHERE c.case_title ~ '(?i)(Before the Court|moves the|Hearing on|Motion for)'
+          AND c.case_title ~ ' vs?\\.? '
+          AND length(c.case_title) > 100
+        {county_filter}
+    """,
+    "null_case_titles": """
+        SELECT COUNT(*) FROM cases c
+        JOIN documents d ON d.case_id = c.id AND d.status = 'active'
+        JOIN courts ct ON ct.id = d.court_id
+        WHERE c.case_title IS NULL
+        {county_filter}
+    """,
+    "missing_parties": """
+        SELECT COUNT(DISTINCT c.id) FROM cases c
+        JOIN documents d ON d.case_id = c.id AND d.status = 'active'
+        JOIN courts ct ON ct.id = d.court_id
+        LEFT JOIN parties p ON p.case_id = c.id
+        WHERE p.id IS NULL
+        {county_filter}
+    """,
+    "all_caps_titles": """
+        SELECT COUNT(*) FROM cases c
+        JOIN documents d ON d.case_id = c.id AND d.status = 'active'
+        JOIN courts ct ON ct.id = d.court_id
+        WHERE c.case_title = upper(c.case_title)
+          AND c.case_title IS NOT NULL
+          AND length(c.case_title) > 5
+        {county_filter}
+    """,
+    "short_ruling_text": """
+        SELECT COUNT(*) FROM rulings r
+        JOIN documents d ON d.id::text = r.document_id::text AND d.status = 'active'
+        JOIN courts ct ON ct.id = d.court_id
+        WHERE length(r.ruling_text) < 20
+        {county_filter}
+    """,
+    "long_ruling_text": """
+        SELECT COUNT(*) FROM rulings r
+        JOIN documents d ON d.id::text = r.document_id::text AND d.status = 'active'
+        JOIN courts ct ON ct.id = d.court_id
+        WHERE length(r.ruling_text) > 30000
+        {county_filter}
+    """,
+    "total_rulings": """
+        SELECT COUNT(*) FROM rulings r
+        JOIN documents d ON d.id::text = r.document_id::text AND d.status = 'active'
+        JOIN courts ct ON ct.id = d.court_id
+        WHERE 1=1
+        {county_filter}
+    """,
+}
+
+
+def _run_quality_queries(
+    conn: psycopg.Connection,
+    county: str | None = None,
+) -> dict[str, int]:
+    """Execute all spotcheck quality queries and return results.
+
+    If *county* is given, each query is scoped to that county.
+    Returns a dict mapping metric name to its integer count.
+    """
+    county_filter = ""
+    params: list[str] = []
+    if county:
+        county_filter = "AND ct.county = %s"
+        params = [county]
+
+    results: dict[str, int] = {}
+    with conn.cursor() as cur:
+        for name, query_template in _QUALITY_QUERIES.items():
+            query = query_template.format(county_filter=county_filter)
+            cur.execute(query, params)
+            row = cur.fetchone()
+            results[name] = row[0] if row else 0
+    return results
+
+
 def run_reingest(
     dsn: str,
     *,
@@ -1273,8 +1377,9 @@ def run_reingest(
     force_llm: bool = False,
     full_reparse: bool = False,
     case_title_regex: str | None = None,
-) -> dict[str, int]:
-    """Run the full reingest. Returns summary stats."""
+    report_metrics: bool = False,
+) -> dict[str, Any]:
+    """Run the full reingest. Returns summary stats including cost."""
     filters, filter_params = _build_filters(
         county, date_from, date_to, case_title_regex=case_title_regex
     )
@@ -1300,6 +1405,10 @@ def run_reingest(
     else:
         reason = "--no-llm flag" if no_llm else "no API key for configured provider"
         logger.info("LLM extraction disabled, using regex-only mode", reason=reason)
+
+    # Token tracking for cost estimation.
+    tracker = TokenTracker()
+
     total_processed = 0
     total_updated = 0
     total_llm_skipped = 0
@@ -1310,6 +1419,13 @@ def run_reingest(
     total_llm_failure = 0
     cursor: tuple[datetime, str] = (_CURSOR_MIN_TIMESTAMP, _CURSOR_MIN_UUID)
     t0 = time.monotonic()
+
+    # Collect quality metrics before reingest if requested.
+    before_metrics: dict[str, int] | None = None
+    if report_metrics:
+        with psycopg.connect(dsn) as metrics_conn:
+            before_metrics = _run_quality_queries(metrics_conn, county)
+            logger.info("quality_metrics_before", **before_metrics)
 
     with psycopg.connect(dsn) as conn:
         while True:
@@ -1348,6 +1464,7 @@ def run_reingest(
                 running_processed=total_processed,
                 running_updated=total_updated,
                 batch_number=total_batches,
+                token_tracker=tracker,
             )
             processed = batch_result["processed"]
             updated = batch_result["updated"]
@@ -1380,6 +1497,23 @@ def run_reingest(
 
     wall_time = round(time.monotonic() - t0, 2)
 
+    # Compute cost estimate.
+    estimated_cost_usd = tracker.estimated_cost(provider=llm_provider)
+
+    # Collect quality metrics after reingest if requested.
+    after_metrics: dict[str, int] | None = None
+    metrics_delta: dict[str, int] | None = None
+    if report_metrics:
+        with psycopg.connect(dsn) as metrics_conn:
+            after_metrics = _run_quality_queries(metrics_conn, county)
+            logger.info("quality_metrics_after", **after_metrics)
+        if before_metrics is not None and after_metrics is not None:
+            metrics_delta = {
+                k: after_metrics.get(k, 0) - before_metrics.get(k, 0)
+                for k in before_metrics
+            }
+            logger.info("quality_metrics_delta", **metrics_delta)
+
     logger.info(
         "reingest_complete",
         total_processed=total_processed,
@@ -1391,9 +1525,13 @@ def run_reingest(
         llm_success=total_llm_success,
         llm_failure=total_llm_failure,
         wall_time_seconds=wall_time,
+        input_tokens=tracker.input_tokens,
+        output_tokens=tracker.output_tokens,
+        llm_api_calls=tracker.api_calls,
+        estimated_cost_usd=round(estimated_cost_usd, 4),
     )
 
-    return {
+    result: dict[str, Any] = {
         "total_processed": total_processed,
         "total_updated": total_updated,
         "total_llm_skipped": total_llm_skipped,
@@ -1403,7 +1541,18 @@ def run_reingest(
         "llm_success": total_llm_success,
         "llm_failure": total_llm_failure,
         "wall_time_seconds": wall_time,
+        "input_tokens": tracker.input_tokens,
+        "output_tokens": tracker.output_tokens,
+        "llm_api_calls": tracker.api_calls,
+        "estimated_cost_usd": round(estimated_cost_usd, 4),
     }
+    if before_metrics is not None:
+        result["quality_before"] = before_metrics
+    if after_metrics is not None:
+        result["quality_after"] = after_metrics
+    if metrics_delta is not None:
+        result["quality_delta"] = metrics_delta
+    return result
 
 
 def main() -> None:
@@ -1482,6 +1631,16 @@ def main() -> None:
             "titles, e.g. 'vs\\.?\\s*$' to find truncated titles."
         ),
     )
+    parser.add_argument(
+        "--report-metrics",
+        action="store_true",
+        help=(
+            "Run data quality spotcheck queries before and after reingest "
+            "and report the comparison. Checks truncated titles, header-merge "
+            "titles, null titles, missing parties, ALL CAPS titles, "
+            "short/long ruling text, and total ruling counts."
+        ),
+    )
     args = parser.parse_args()
 
     dsn = os.environ.get("DATABASE_URL")
@@ -1508,6 +1667,7 @@ def main() -> None:
         force_llm=args.force_llm,
         full_reparse=args.full_reparse,
         case_title_regex=args.case_title_regex,
+        report_metrics=args.report_metrics,
     )
 
     logger.info(
@@ -1515,6 +1675,10 @@ def main() -> None:
         total_processed=stats["total_processed"],
         total_updated=stats["total_updated"],
         total_llm_skipped=stats["total_llm_skipped"],
+        input_tokens=stats.get("input_tokens", 0),
+        output_tokens=stats.get("output_tokens", 0),
+        llm_api_calls=stats.get("llm_api_calls", 0),
+        estimated_cost_usd=stats.get("estimated_cost_usd", 0),
     )
 
 

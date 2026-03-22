@@ -18,6 +18,7 @@ from ingestion.llm_extract import (
     CASE_TYPE_VALUES,
     LLMExtractionResult,
     LLMRulingResult,
+    TokenTracker,
     _merge_results,
     _normalize_case_number,
     _normalize_department,
@@ -1958,3 +1959,213 @@ class TestParseResponseNewFieldNames:
         result = _parse_response(response_json, None)
         assert result is not None
         assert "confidence" not in result.rulings[0].parties[0]
+
+
+# ---------------------------------------------------------------------------
+# TokenTracker tests
+# ---------------------------------------------------------------------------
+
+
+class TestTokenTracker:
+    """Tests for the TokenTracker dataclass."""
+
+    def test_initial_values(self) -> None:
+        """New tracker starts with all zeros."""
+        tracker = TokenTracker()
+        assert tracker.input_tokens == 0
+        assert tracker.output_tokens == 0
+        assert tracker.api_calls == 0
+
+    def test_add_accumulates(self) -> None:
+        """add() accumulates token counts and increments api_calls."""
+        tracker = TokenTracker()
+        tracker.add(100, 50)
+        assert tracker.input_tokens == 100
+        assert tracker.output_tokens == 50
+        assert tracker.api_calls == 1
+
+        tracker.add(200, 75)
+        assert tracker.input_tokens == 300
+        assert tracker.output_tokens == 125
+        assert tracker.api_calls == 2
+
+    def test_thread_safety(self) -> None:
+        """Concurrent add() calls produce correct totals."""
+        tracker = TokenTracker()
+        num_threads = 10
+        adds_per_thread = 100
+
+        def worker() -> None:
+            for _ in range(adds_per_thread):
+                tracker.add(10, 5)
+
+        threads = [threading.Thread(target=worker) for _ in range(num_threads)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        expected_calls = num_threads * adds_per_thread
+        assert tracker.api_calls == expected_calls
+        assert tracker.input_tokens == expected_calls * 10
+        assert tracker.output_tokens == expected_calls * 5
+
+    def test_estimated_cost_google_default(self) -> None:
+        """Default provider (google) uses Gemini Flash Lite pricing."""
+        tracker = TokenTracker()
+        tracker.add(1_000_000, 1_000_000)
+        cost = tracker.estimated_cost()
+        # Google pricing: $0.075/1M input + $0.30/1M output
+        expected = 0.075 + 0.30
+        assert abs(cost - expected) < 0.001
+
+    def test_estimated_cost_anthropic(self) -> None:
+        """Anthropic provider uses Haiku pricing."""
+        tracker = TokenTracker()
+        tracker.add(1_000_000, 1_000_000)
+        cost = tracker.estimated_cost(provider="anthropic")
+        # Anthropic pricing: $0.80/1M input + $4.00/1M output
+        expected = 0.80 + 4.00
+        assert abs(cost - expected) < 0.001
+
+    def test_estimated_cost_custom_pricing(self) -> None:
+        """Custom pricing overrides provider defaults."""
+        tracker = TokenTracker()
+        tracker.add(1_000_000, 1_000_000)
+        cost = tracker.estimated_cost(
+            input_price_per_mtok=1.0,
+            output_price_per_mtok=2.0,
+        )
+        assert abs(cost - 3.0) < 0.001
+
+    def test_estimated_cost_zero_tokens(self) -> None:
+        """Zero tokens produces zero cost."""
+        tracker = TokenTracker()
+        assert tracker.estimated_cost() == 0.0
+
+    def test_estimated_cost_unknown_provider_defaults_to_google(self) -> None:
+        """Unknown provider falls back to google pricing."""
+        tracker = TokenTracker()
+        tracker.add(1_000_000, 1_000_000)
+        cost_unknown = tracker.estimated_cost(provider="unknown_provider")
+        cost_google = tracker.estimated_cost(provider="google")
+        assert abs(cost_unknown - cost_google) < 0.001
+
+
+class TestTokenTrackerIntegration:
+    """Test that token_tracker is threaded through extract_fields_llm."""
+
+    def test_single_chunk_tracks_tokens(self) -> None:
+        """Token tracker accumulates tokens from a single-chunk extraction."""
+        response_json = json.dumps(
+            {
+                "judge_name": "Test Judge",
+                "rulings": [
+                    {
+                        "case_number": "123",
+                        "case_title": "A v. B",
+                        "outcome": "granted",
+                    }
+                ],
+            }
+        )
+        mock_fn = MagicMock(
+            return_value=LLMResponse(
+                text=response_json,
+                input_tokens=500,
+                output_tokens=200,
+            )
+        )
+        tracker = TokenTracker()
+        with patch("ingestion.llm_extract.call_llm", mock_fn):
+            result = extract_fields_llm(
+                document_text="Short ruling text.",
+                content_format="pdf",
+                token_tracker=tracker,
+            )
+        assert result is not None
+        assert tracker.input_tokens == 500
+        assert tracker.output_tokens == 200
+        assert tracker.api_calls == 1
+
+    def test_multi_chunk_tracks_tokens(self) -> None:
+        """Token tracker accumulates tokens across multiple chunks."""
+        response_json = json.dumps(
+            {
+                "judge_name": "Test Judge",
+                "rulings": [
+                    {
+                        "case_number": "123",
+                        "case_title": "A v. B",
+                        "outcome": "granted",
+                    }
+                ],
+            }
+        )
+        call_count = 0
+
+        def mock_call_llm(**kwargs: object) -> LLMResponse:
+            nonlocal call_count
+            call_count += 1
+            return LLMResponse(
+                text=response_json,
+                input_tokens=300,
+                output_tokens=100,
+            )
+
+        tracker = TokenTracker()
+        # Create text large enough to be chunked (>80K chars)
+        long_text = "A" * 90_000 + "\n\n" + "B" * 90_000
+        with patch("ingestion.llm_extract.call_llm", side_effect=mock_call_llm):
+            result = extract_fields_llm(
+                document_text=long_text,
+                content_format="pdf",
+                max_chars=80_000,
+                token_tracker=tracker,
+            )
+        assert result is not None
+        assert call_count >= 2
+        assert tracker.api_calls == call_count
+        assert tracker.input_tokens == 300 * call_count
+        assert tracker.output_tokens == 100 * call_count
+
+    def test_no_tracker_does_not_error(self) -> None:
+        """Passing no token_tracker (default) does not raise errors."""
+        response_json = json.dumps(
+            {
+                "judge_name": "Test Judge",
+                "rulings": [
+                    {
+                        "case_number": "123",
+                        "outcome": "granted",
+                    }
+                ],
+            }
+        )
+        mock_fn = MagicMock(
+            return_value=LLMResponse(
+                text=response_json,
+                input_tokens=100,
+                output_tokens=50,
+            )
+        )
+        with patch("ingestion.llm_extract.call_llm", mock_fn):
+            result = extract_fields_llm(
+                document_text="Some text.",
+                content_format="pdf",
+            )
+        assert result is not None
+
+    def test_failed_llm_call_does_not_track(self) -> None:
+        """When LLM call returns None, no tokens are tracked."""
+        tracker = TokenTracker()
+        with patch("ingestion.llm_extract.call_llm", return_value=None):
+            result = extract_fields_llm(
+                document_text="Some text.",
+                content_format="pdf",
+                token_tracker=tracker,
+            )
+        assert result is None
+        assert tracker.input_tokens == 0
+        assert tracker.output_tokens == 0
+        assert tracker.api_calls == 0

@@ -2910,6 +2910,10 @@ class TestProgressLogging:
             "llm_success",
             "llm_failure",
             "wall_time_seconds",
+            "input_tokens",
+            "output_tokens",
+            "llm_api_calls",
+            "estimated_cost_usd",
         }
         assert set(stats.keys()) == expected_keys
 
@@ -3764,3 +3768,201 @@ class TestSplitRegistry:
         scraper_id = "ca-riverside-tentatives-civil"
         assert scraper_id in reingest._SPLIT_REGISTRY
         assert callable(reingest._SPLIT_REGISTRY[scraper_id])
+
+
+# ---------------------------------------------------------------------------
+# Cost tracking tests
+# ---------------------------------------------------------------------------
+
+
+class TestCostTracking:
+    """Tests for token tracking and cost estimation in run_reingest."""
+
+    @patch.object(reingest, "_load_scraper_registry")
+    @patch("reingest_from_s3.create_llm_client")
+    @patch("reingest_from_s3.boto3")
+    @patch("reingest_from_s3.psycopg")
+    def test_run_reingest_returns_cost_fields(
+        self,
+        mock_psycopg: MagicMock,
+        mock_boto3: MagicMock,
+        mock_create_llm: MagicMock,
+        mock_registry: MagicMock,
+    ) -> None:
+        """run_reingest() returns token counts and cost estimate."""
+        # Mock empty result set so reingest completes immediately
+        mock_conn = MagicMock()
+        mock_cur = MagicMock()
+        mock_cur.fetchall.return_value = []
+        ctx = MagicMock()
+        ctx.__enter__ = MagicMock(return_value=mock_cur)
+        ctx.__exit__ = MagicMock(return_value=False)
+        mock_conn.cursor.return_value = ctx
+        mock_psycopg.connect.return_value.__enter__ = MagicMock(return_value=mock_conn)
+        mock_psycopg.connect.return_value.__exit__ = MagicMock(return_value=False)
+
+        mock_create_llm.return_value = MagicMock()
+
+        stats = reingest.run_reingest("postgresql://test")
+
+        assert "input_tokens" in stats
+        assert "output_tokens" in stats
+        assert "llm_api_calls" in stats
+        assert "estimated_cost_usd" in stats
+        # No documents processed, so all should be zero
+        assert stats["input_tokens"] == 0
+        assert stats["output_tokens"] == 0
+        assert stats["llm_api_calls"] == 0
+        assert stats["estimated_cost_usd"] == 0.0
+
+    def test_token_tracker_passed_to_reparse(self) -> None:
+        """_reparse_document forwards token_tracker to extract_fields_llm."""
+        from ingestion.llm_extract import TokenTracker
+
+        tracker = TokenTracker()
+        raw_content = b"<html>Some ruling text about motion</html>"
+        doc_meta = {
+            "document_id": str(uuid.uuid4()),
+            "state": "CA",
+            "county": "Test",
+            "court_name": "Test Court",
+            "source_url": "https://test.example.com",
+            "captured_at": datetime(2026, 3, 1),
+            "content_hash": "abc123",
+            "format": "html",
+            "case_number": None,
+            "case_title": None,
+            "hearing_date": None,
+            "court_id": str(uuid.uuid4()),
+            "scraper_id": "test-scraper",
+        }
+
+        with (
+            patch.object(reingest, "_load_scraper_registry"),
+            patch(
+                "reingest_from_s3.extract_fields_llm",
+                return_value=None,
+            ) as mock_extract,
+        ):
+            reingest._reparse_document(
+                raw_content,
+                "test-scraper",
+                doc_meta,
+                llm_client=MagicMock(),
+                token_tracker=tracker,
+            )
+
+            # Verify extract_fields_llm was called with the tracker
+            mock_extract.assert_called_once()
+            call_kwargs = mock_extract.call_args
+            assert call_kwargs.kwargs.get("token_tracker") is tracker
+
+
+# ---------------------------------------------------------------------------
+# Quality metrics tests
+# ---------------------------------------------------------------------------
+
+
+class TestQualityMetrics:
+    """Tests for _run_quality_queries and report_metrics integration."""
+
+    def test_run_quality_queries_returns_all_metrics(self) -> None:
+        """_run_quality_queries returns a dict with all expected metric keys."""
+        mock_conn = MagicMock()
+        mock_cur = MagicMock()
+        mock_cur.fetchone.return_value = (42,)
+        ctx = MagicMock()
+        ctx.__enter__ = MagicMock(return_value=mock_cur)
+        ctx.__exit__ = MagicMock(return_value=False)
+        mock_conn.cursor.return_value = ctx
+
+        result = reingest._run_quality_queries(mock_conn)
+
+        expected_keys = {
+            "truncated_vs_titles",
+            "header_merge_titles",
+            "null_case_titles",
+            "missing_parties",
+            "all_caps_titles",
+            "short_ruling_text",
+            "long_ruling_text",
+            "total_rulings",
+        }
+        assert set(result.keys()) == expected_keys
+        # All values should be 42 (from mock)
+        for val in result.values():
+            assert val == 42
+
+    def test_run_quality_queries_with_county_filter(self) -> None:
+        """_run_quality_queries applies county filter when specified."""
+        mock_conn = MagicMock()
+        mock_cur = MagicMock()
+        mock_cur.fetchone.return_value = (5,)
+        ctx = MagicMock()
+        ctx.__enter__ = MagicMock(return_value=mock_cur)
+        ctx.__exit__ = MagicMock(return_value=False)
+        mock_conn.cursor.return_value = ctx
+
+        reingest._run_quality_queries(mock_conn, county="Los Angeles")
+
+        # Should have been called with county param
+        for call in mock_cur.execute.call_args_list:
+            args = call[0]
+            assert len(args) == 2
+            # The params list should contain the county name
+            assert args[1] == ["Los Angeles"]
+
+    def test_quality_queries_dict_has_correct_keys(self) -> None:
+        """_QUALITY_QUERIES has the expected metric names."""
+        expected_keys = {
+            "truncated_vs_titles",
+            "header_merge_titles",
+            "null_case_titles",
+            "missing_parties",
+            "all_caps_titles",
+            "short_ruling_text",
+            "long_ruling_text",
+            "total_rulings",
+        }
+        assert set(reingest._QUALITY_QUERIES.keys()) == expected_keys
+
+    @patch.object(reingest, "_load_scraper_registry")
+    @patch("reingest_from_s3.create_llm_client")
+    @patch("reingest_from_s3.boto3")
+    @patch("reingest_from_s3.psycopg")
+    def test_report_metrics_includes_quality_data(
+        self,
+        mock_psycopg: MagicMock,
+        mock_boto3: MagicMock,
+        mock_create_llm: MagicMock,
+        mock_registry: MagicMock,
+    ) -> None:
+        """When report_metrics=True, stats include quality_before/after/delta."""
+        # First connection: quality_before queries
+        # Second connection: reingest (empty)
+        # Third connection: quality_after queries
+        mock_conn = MagicMock()
+        mock_cur = MagicMock()
+        mock_cur.fetchall.return_value = []
+        mock_cur.fetchone.return_value = (0,)
+        ctx = MagicMock()
+        ctx.__enter__ = MagicMock(return_value=mock_cur)
+        ctx.__exit__ = MagicMock(return_value=False)
+        mock_conn.cursor.return_value = ctx
+
+        mock_psycopg.connect.return_value.__enter__ = MagicMock(return_value=mock_conn)
+        mock_psycopg.connect.return_value.__exit__ = MagicMock(return_value=False)
+
+        mock_create_llm.return_value = MagicMock()
+
+        stats = reingest.run_reingest(
+            "postgresql://test",
+            report_metrics=True,
+        )
+
+        assert "quality_before" in stats
+        assert "quality_after" in stats
+        assert "quality_delta" in stats
+        assert isinstance(stats["quality_before"], dict)
+        assert isinstance(stats["quality_after"], dict)
+        assert isinstance(stats["quality_delta"], dict)
