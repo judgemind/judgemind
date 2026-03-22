@@ -430,6 +430,22 @@ Investigation tasks produce documentation, not code:
 - **Always file follow-up issues** for every actionable finding. Label them `agent/ready` if fully specified. Reference the investigation issue as the parent.
 - After documenting findings and filing follow-ups, close the investigation issue unless human judgment is genuinely needed.
 
+## Ingestion Pipeline — Separation of Concerns
+
+The ingestion pipeline has three stages. **Each stage does one job. Do not mix responsibilities.**
+
+| Stage | Responsibility | Does NOT do |
+|---|---|---|
+| **Capture** (scraper) | Fetch raw content, extract metadata from website structure (link text, HTML headers, URL params), archive to S3 | Parse PDF content, extract fields from unstructured text |
+| **Transcription** | Convert raw content to clean text per case, split multi-case documents, mark cross-page continuations | Extract structured fields (case_number, outcome, etc.) |
+| **Enrichment** | Extract structured fields from text using three-tier strategy (scraper metadata > LLM > regex) | Fetch content, parse PDFs |
+
+**Transcription** varies by format:
+- **HTML** (e.g., LA): BeautifulSoup parsing, no LLM needed.
+- **PDF** (e.g., OC, Riverside): multimodal LLM sees page images, returns `ruling_text` per case + `continued` markers. One page per LLM call, join results across pages. Does NOT extract case_number, case_title, outcome, etc. — that's enrichment.
+
+See `docs/specs/architecture-spec-v1.md` Section 5.2 for the full specification.
+
 ## Scraper Development Rules
 
 Key paths: framework in `packages/scraper-framework/src/framework/`, California courts in `packages/scraper-framework/src/courts/ca/`.
@@ -438,7 +454,8 @@ Key paths: framework in `packages/scraper-framework/src/framework/`, California 
 - Every scraper must implement the base `Scraper` class, report health metrics, and use SHA-256 content hashing.
 - Raw content is always archived to object storage before processing.
 - Scraper configurations (URLs, selectors, schedules) are separate from scraper logic.
-- **Field extraction completeness is a hard requirement.** Required fields: **judge name, motion type, case title, hearing date, outcome, parties**. Write regression tests against real fixtures for every field.
+- **Scrapers extract metadata from website structure only** — judge name from link text, department from URL parameters, etc. They do NOT parse PDF content or extract fields from unstructured text. Field extraction from document content happens downstream in enrichment.
+- **Field extraction completeness is a hard requirement.** Required fields: **judge name, motion type, case title, hearing date, outcome, parties**. These must be populated by the end of the enrichment pipeline (not necessarily by the scraper). Write regression tests against real fixtures for every field.
 
 ## Infrastructure Code
 

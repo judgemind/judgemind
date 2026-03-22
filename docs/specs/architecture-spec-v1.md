@@ -258,29 +258,50 @@ Phase 2 (Months 6–12): If Tier 1 costs exceed ~$3,000/month (indicating ~10,00
 
 Ongoing: Tier 2 and Tier 3 remain on hosted commercial APIs indefinitely. Their per-call costs scale with users, not data volume, and quality requirements justify premium models. Rate limiting on AI features prevents runaway costs.
 
-## 5.2 NLP Pipeline (Tier 1) — Three-Tier Extraction
+## 5.2 Ingestion Pipeline
 
-Every ingested document passes through a three-tier field extraction pipeline during ingestion. The pipeline fills in structured fields (judge name, hearing date, case number, case title, outcome, motion type, parties, department) using increasingly broad methods until all available information is captured.
+The ingestion pipeline converts raw captured content into structured ruling records. It has three stages, each with a clear responsibility. **No stage should do the work of another stage** — scrapers capture, transcription converts format, enrichment populates fields.
 
-### 5.2.1 Extraction Tiers (Implemented)
+### 5.2.1 Three-Stage Pipeline
 
-The ingestion worker (`packages/scraper-framework/src/ingestion/worker.py`) applies three tiers in priority order for each field:
+| Stage | Responsibility | Inputs | Outputs |
+|---|---|---|---|
+| **Capture** (scraper) | Fetch raw content, extract metadata from website structure, archive to S3 | Court website HTML/PDF | Raw content bytes, structural metadata (judge_name, department from link text/HTML headers), source URL, content hash |
+| **Transcription** | Convert raw content to clean text, split multi-case documents, mark cross-page continuations | Raw PDF bytes or HTML | Ruling text per case, case boundaries, continuation markers |
+| **Enrichment** | Extract structured fields from text | Ruling text + scraper metadata | case_number, case_title, hearing_date, motion_type, outcome, parties, case_type |
 
-**Tier 1 — Scraper-provided fields (highest priority).** Scrapers extract structured data directly from the court website's HTML/PDF structure during `parse_document()`. These values are authoritative because they come from the source's own structured data (e.g., a case number in a URL parameter, a judge name in a page header). Any field the scraper populates is used as-is and not overwritten by later tiers.
+**Capture** is format-agnostic. The scraper's job is to reliably fetch and archive raw content, plus extract whatever metadata the website's *own structure* provides (e.g., a judge name in link text, a department in a URL parameter). Scrapers do NOT parse PDF content or extract fields from unstructured text — that's enrichment's job.
 
-**Tier 2 — LLM extraction.** For fields the scraper did not populate, the ingestion worker calls a configurable LLM to extract them from the document text. The LLM receives a structured JSON extraction prompt with the document content and any authoritative metadata from the scraper (judge name, department) as context. The LLM returns structured JSON with all extractable fields, which are applied only to fields still missing after Tier 1. On any API failure, the LLM tier returns `None` and the worker falls through to Tier 3.
+**Transcription** varies by content format:
+- **HTML documents** (e.g., LA County): text is extracted directly from HTML markup. No LLM needed — BeautifulSoup parsing is sufficient. Case splitting uses HTML structure (dividers, headings).
+- **PDF documents** (e.g., OC, Riverside, Santa Clara): pages are rendered as images and sent to a multimodal LLM (one page per call) for text transcription and case splitting. The LLM returns the visible text per case and marks cases that continue from the previous page. A join step merges cross-page cases. This replaces pdfplumber-based text extraction, which fails on complex tabular layouts.
+
+The transcription LLM prompt is deliberately simple — it asks only for:
+```json
+{
+  "rulings": [
+    {"continued": false, "ruling_text": "transcribed text..."},
+    {"continued": true, "ruling_text": "continuation text..."}
+  ]
+}
+```
+It does NOT ask the LLM to extract case numbers, titles, outcomes, or other structured fields. That is enrichment's job.
+
+**Enrichment** applies a three-tier extraction strategy to each ruling's text:
+
+**Tier 1 — Scraper-provided fields (highest priority).** Values the scraper extracted from website structure (not from document content). These are authoritative — e.g., a judge name from link text, a department from a URL parameter. Used as-is, never overwritten by later tiers.
+
+**Tier 2 — LLM extraction.** For fields not provided by the scraper, the ingestion worker calls a configurable LLM to extract them from the ruling text. The LLM receives a structured JSON extraction prompt with the text and any Tier 1 metadata as context. Returns structured JSON with all extractable fields, applied only to fields still missing after Tier 1. On API failure, falls through to Tier 3.
 
 Key implementation details:
 - **Provider-agnostic adapter** (`packages/scraper-framework/src/ingestion/llm_providers.py`): supports Anthropic and Google GenAI via `LLM_PROVIDER` and `LLM_MODEL` environment variables. Default: Claude Haiku (defined centrally in `packages/judgemind-config/src/judgemind_config/models.py`, overridable via `HAIKU_MODEL` env var).
-- **Document chunking** (`packages/scraper-framework/src/ingestion/llm_extract.py`): documents exceeding the per-chunk character budget (80K chars) are split at natural boundaries (form feeds for PDFs, `<HR>` tags or case-number headers for HTML, paragraph breaks as fallback). Up to 5 chunks per document, with 500-character overlap for context continuity. Results are merged with deduplication by case number.
 - **Connection reuse:** the worker creates a single LLM client at startup and reuses it across all documents in the session, amortizing connection overhead.
 - **Rate-limit retry:** each provider adapter retries once on rate-limit errors (HTTP 429 / ResourceExhausted) with a 1-second backoff.
-- **Multi-ruling documents:** a single document may contain rulings for multiple cases (e.g. department calendar PDFs with all tentative rulings for a hearing date). The framework-level ``LlmExtractor`` (``packages/scraper-framework/src/framework/llm_extractor.py``) handles both splitting and structured field extraction in a single API call. Each extracted ruling is re-injected as a synthetic split event with all fields pre-populated, so per-field LLM and regex extraction are skipped for these events. Deterministic UUID5-based document IDs (``ingestion/split_ids.py``) ensure idempotent re-processing. Note: the legacy county-specific regex *splitter* framework (which performed document-level splitting before LLM extraction was available) was removed in #1475. Per-field regex extraction (Tier 3 below) remains.
 - **Cost:** approximately $47/month on Anthropic Haiku at current ingestion volume (~1,000 documents/day).
 
 **Tier 3 — Regex fallback.** For fields still missing after LLM extraction (or when the LLM API is unavailable), the worker applies court-specific regex patterns (`packages/scraper-framework/src/ingestion/extract.py`). These cover outcome classification, motion type identification, case number extraction, case title parsing, judge name extraction, hearing date extraction, and party extraction from case captions. The regex patterns are drawn from real California court formatting and are ordered by specificity to minimize false positives.
 
-### 5.2.2 Extraction Logging
+### 5.2.2 Enrichment Logging
 
 The worker tracks which tier populated each field in an `extraction_methods` dict (values: `"scraper"`, `"llm"`, `"regex"`) and logs a summary for every document. This enables monitoring of extraction quality and identifying courts where scrapers should be improved to reduce LLM dependency.
 
