@@ -18,6 +18,7 @@ Verified against live site 2026-03-02:
 
 from __future__ import annotations
 
+import functools
 import re
 import time
 from dataclasses import dataclass
@@ -91,6 +92,11 @@ _CASE_SPLIT_RE = re.compile(
     r"<HR[^>]*>\s*(?:<P>)?\s*(?=<B>\s*Case Number:\s*</B>)",
     re.IGNORECASE,
 )
+
+# Lightweight HTML tag stripper used in _split_cases_html instead of a full
+# BeautifulSoup parse.  Only needs to be accurate enough for a "Case Number:"
+# substring check, not for rendering.
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
 
 # Judge name: "<div>William A. Crowfoot Judge of the Superior Court</div>"
 _JUDGE_DIV_RE = re.compile(r"(.+?)\s+Judge of the Superior Court", re.DOTALL)
@@ -472,8 +478,12 @@ def _is_dept_header_boilerplate(html: str) -> bool:
     These pages contain text like "DEPARTMENT 15 LAW AND MOTION RULINGS"
     but no actual ruling content (no ``Case Number:`` present).  They
     should not be stored as ruling rows.
+
+    Uses a lightweight regex tag-strip instead of a full BeautifulSoup
+    parse — this is called once per department response and only needs
+    to check for two simple patterns.
     """
-    text = BeautifulSoup(html, "lxml").get_text()
+    text = _HTML_TAG_RE.sub("", html)
     if _CASE_NUMBER_RE.search(text):
         return False
     return bool(_DEPT_HEADER_BOILERPLATE_RE.search(text))
@@ -490,11 +500,26 @@ def _split_cases_html(ruling_html: str) -> list[str]:
     ``<div id="speechSynthesis">`` so downstream parsing works unchanged.
     Returns an empty list when no valid case sections are found (e.g.
     department header boilerplate pages with no ``Case Number:`` present).
+
+    Results are cached by input HTML to avoid redundant BeautifulSoup
+    parses when the same department response is processed multiple times
+    (e.g. during concurrent scraper runs or test loops).
+    """
+    # Delegate to the cached implementation (returns a tuple for hashability).
+    return list(_split_cases_html_cached(ruling_html))
+
+
+@functools.lru_cache(maxsize=256)
+def _split_cases_html_cached(ruling_html: str) -> tuple[str, ...]:
+    """Cached implementation of _split_cases_html.
+
+    Returns a tuple (hashable for lru_cache).  The public wrapper
+    converts back to a list for API compatibility.
     """
     soup = BeautifulSoup(ruling_html, "lxml")
     speech_div = soup.find("div", id="speechSynthesis")
     if speech_div is None:
-        return []
+        return ()
 
     inner_html = speech_div.decode_contents()
 
@@ -509,9 +534,11 @@ def _split_cases_html(ruling_html: str) -> list[str]:
         if not stripped:
             continue
         # A section is valid only if it contains a Case Number header.
-        # Check against plain text since the HTML may have tags between
-        # "Case Number:" and the actual number.
-        section_text = BeautifulSoup(stripped, "lxml").get_text()
+        # Use a lightweight regex tag-strip instead of a full BeautifulSoup
+        # parse — this is called once per section per department (hundreds
+        # of times in a full run) and the tag-strip only needs to be
+        # accurate enough for the "Case Number:" substring check.
+        section_text = _HTML_TAG_RE.sub("", stripped)
         if not _CASE_NUMBER_RE.search(section_text):
             continue
         # Wrap each section back in the speechSynthesis div and a minimal
@@ -524,9 +551,9 @@ def _split_cases_html(ruling_html: str) -> list[str]:
     # RULINGS") with no actual rulings.  Return an empty list so these
     # pages are not stored as ruling rows.
     if not result:
-        return []
+        return ()
 
-    return result
+    return tuple(result)
 
 
 def _extract_ruling_fields(soup: BeautifulSoup, doc: CapturedDocument) -> None:

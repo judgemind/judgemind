@@ -7,6 +7,7 @@ Fixtures captured from live site 2026-03-02:
 
 from __future__ import annotations
 
+import functools
 from datetime import datetime
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -42,6 +43,7 @@ pytestmark = pytest.mark.regression
 FIXTURES = Path(__file__).parent.parent / "fixtures"
 
 
+@functools.cache
 def _load(name: str) -> str:
     return (FIXTURES / name).read_text(encoding="utf-8")
 
