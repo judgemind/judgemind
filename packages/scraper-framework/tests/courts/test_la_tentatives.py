@@ -31,6 +31,7 @@ from courts.ca.la_tentatives import (
     _sanitize_title,
     _split_cases_html,
     _split_party_names,
+    _truncate_party_list,
     default_config,
 )
 from framework import ContentFormat
@@ -1238,6 +1239,124 @@ def test_sanitize_title_rejects_too_long() -> None:
     """Titles exceeding 120 chars after cleaning are rejected."""
     long_title = "A" * 60 + " v. " + "B" * 60
     assert _sanitize_title(long_title) is None
+
+
+def test_sanitize_title_strips_hyphenated_successor_in_interest() -> None:
+    """Hyphenated 'Successor-In-Interest To' is stripped (#1375)."""
+    title = "Smith, Successor-In-Interest To John Doe v. Jones"
+    result = _sanitize_title(title)
+    assert result is not None
+    assert "Successor" not in result
+    assert "Smith" in result
+    assert "Jones" in result
+
+
+def test_sanitize_title_strips_successor_in_interest_and_administrator() -> None:
+    """'Successor In Interest To And Administrator Of The Estate Of' is stripped (#1375)."""
+    title = (
+        "Smith, Successor In Interest To And Administrator Of The Estate Of Robert Brown v. Jones"
+    )
+    result = _sanitize_title(title)
+    assert result is not None
+    assert "Successor" not in result
+    assert "Administrator" not in result
+    assert "Estate" not in result
+    assert "Smith" in result
+    assert "Jones" in result
+
+
+def test_sanitize_title_strips_administrator_of_estate() -> None:
+    """'Administrator Of The Estate Of [name]' is stripped (#1375)."""
+    title = "Smith, Administrator Of The Estate Of John Doe v. Jones"
+    result = _sanitize_title(title)
+    assert result is not None
+    assert "Administrator" not in result
+    assert "Smith" in result
+    assert "Jones" in result
+
+
+def test_sanitize_title_strips_as_an_individual() -> None:
+    """'As An Individual' is stripped (#1375)."""
+    title = "Smith, As An Individual v. Jones, As An Individual"
+    result = _sanitize_title(title)
+    assert result is not None
+    assert "As An Individual" not in result
+    assert "Smith" in result
+    assert "Jones" in result
+
+
+def test_sanitize_title_truncates_multi_party_with_semicolons() -> None:
+    """Multi-party titles with semicolons are truncated to first party + et al. (#1375)."""
+    # Build a title that is > 120 chars after descriptor stripping but has semicolons
+    title = (
+        "John Erickson, An Individual; Yao Mou, An Individual; "
+        "Sandra Richardson, An Individual; Peter Wellington, An Individual "
+        "v. Jason Wei, An Individual; Tiffany Wang, An Individual; "
+        "Robert Henderson, An Individual; Victoria Chamberlain, An Individual"
+    )
+    result = _sanitize_title(title)
+    assert result is not None
+    assert len(result) <= 120
+    assert "Erickson" in result
+    assert "et al." in result
+
+
+def test_sanitize_title_truncates_many_defendants() -> None:
+    """Titles with many defendants are truncated to first + et al. (#1375)."""
+    # Build a title that is > 120 chars after cleaning with many parties
+    title = (
+        "Alice Margaret Walker-Thompson v. Bob Smith; Carol Jones-Williams; "
+        "David James Brown; Eve Stephanie Wilson; Frank Harrison Miller; "
+        "Grace Catherine Lee; Henry Robert Davis"
+    )
+    result = _sanitize_title(title)
+    assert result is not None
+    assert len(result) <= 120
+    assert "Walker-Thompson" in result
+    assert "Smith" in result
+    assert "et al." in result
+
+
+def test_sanitize_title_no_truncation_when_short_enough() -> None:
+    """Short multi-party titles are not truncated."""
+    title = "Smith; Jones v. Brown; Davis"
+    result = _sanitize_title(title)
+    assert result is not None
+    # Short enough — no truncation needed
+    assert result == "Smith; Jones v. Brown; Davis"
+
+
+def test_sanitize_title_strips_guardian_ad_litem() -> None:
+    """'By And Through His Guardian Ad Litem [name]' is stripped (#1375)."""
+    title = "Minor Child, By And Through His Guardian Ad Litem John Smith v. Jones"
+    result = _sanitize_title(title)
+    assert result is not None
+    assert "Guardian" not in result
+    assert "By And Through" not in result
+    assert "Minor Child" in result
+    assert "Jones" in result
+
+
+# ---------------------------------------------------------------------------
+# _truncate_party_list — multi-party truncation (#1375)
+# ---------------------------------------------------------------------------
+
+
+def test_truncate_party_list_single_party() -> None:
+    """A single party is returned unchanged."""
+    assert _truncate_party_list("John Smith") == "John Smith"
+
+
+def test_truncate_party_list_semicolons() -> None:
+    """Multiple parties separated by semicolons are truncated."""
+    result = _truncate_party_list("John Smith; Jane Doe; Bob Brown")
+    assert result == "John Smith, et al."
+
+
+def test_truncate_party_list_and_connector() -> None:
+    """Parties separated by ', and' are truncated."""
+    result = _truncate_party_list("John Smith, and Jane Doe")
+    assert result == "John Smith, et al."
 
 
 # ---------------------------------------------------------------------------
