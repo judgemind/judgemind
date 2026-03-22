@@ -19,6 +19,14 @@ HOOK = os.path.join(SCRIPT_DIR, "preflight-bash.sh")
 # Derive the repo root (two levels up from .claude/hooks/)
 REPO_ROOT = os.path.dirname(os.path.dirname(SCRIPT_DIR))
 
+# Synthetic path for "main repo" cwd overrides.  When this test file lives
+# inside a worktree (e.g., .claude/worktrees/agent-abc123/.claude/hooks/),
+# REPO_ROOT itself contains ".claude/worktrees/" which makes checks 9 and 10
+# falsely trigger.  Using a synthetic path that never contains that substring
+# ensures the tests validate the hook's pattern matching correctly regardless
+# of where the test is run from.
+SYNTHETIC_MAIN_REPO = "/Users/test/judgemind/judgemind-bootstrap"
+
 passed = 0
 failed = 0
 
@@ -254,14 +262,14 @@ run_test(
     ".venv/bin/pytest tests/ -v",
     0,
     run_in_background=True,
-    cwd_override=REPO_ROOT,
+    cwd_override=SYNTHETIC_MAIN_REPO,
 )
 run_test(
     "gh run watch with run_in_background=true allowed (main repo)",
     "gh run watch 12345 --interval 60",
     0,
     run_in_background=True,
-    cwd_override=REPO_ROOT,
+    cwd_override=SYNTHETIC_MAIN_REPO,
 )
 
 # Commands that should NOT trigger the timeout check
@@ -294,8 +302,11 @@ run_test(
 # --- Check 9: run_in_background inside worktree subagents ---
 print("\nCheck 9: run_in_background inside worktree subagents")
 
-MAIN_REPO_CWD = REPO_ROOT
-WORKTREE_CWD = os.path.join(REPO_ROOT, ".claude/worktrees/agent-abc123")
+# Use synthetic paths so the tests work regardless of whether this test file
+# is run from the main repo or from inside a worktree.  The hook checks for
+# ".claude/worktrees/" in the cwd path — it doesn't need real directories.
+MAIN_REPO_CWD = SYNTHETIC_MAIN_REPO
+WORKTREE_CWD = SYNTHETIC_MAIN_REPO + "/.claude/worktrees/agent-abc123"
 
 # Commands with run_in_background=true inside a worktree — should be BLOCKED
 run_test(
@@ -333,7 +344,7 @@ run_test(
     "echo test",
     2,
     run_in_background=True,
-    cwd_override=os.path.join(REPO_ROOT, ".claude/worktrees/worker-3"),
+    cwd_override=SYNTHETIC_MAIN_REPO + "/.claude/worktrees/worker-3",
 )
 
 # Commands with run_in_background=true from main repo — should be ALLOWED
@@ -393,7 +404,7 @@ run_test(
     "git worktree add blocked inside nested worktree",
     "git worktree add ../agent-new-worktree new-branch",
     2,
-    cwd_override=os.path.join(REPO_ROOT, ".claude/worktrees/agent-abc123/.claude/worktrees/agent-def456"),
+    cwd_override=SYNTHETIC_MAIN_REPO + "/.claude/worktrees/agent-abc123/.claude/worktrees/agent-def456",
 )
 
 # Commands that SHOULD be allowed — git worktree add from main repo
