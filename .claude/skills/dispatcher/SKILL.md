@@ -23,11 +23,12 @@ Enable dispatcher mode for the current interactive session. This transforms the 
 
 ### 1. Telegram setup (if configured)
 
-Initialize the Telegram bridge and start the responder daemon:
+Initialize the Telegram bridge and start the responder daemon. **Use the Bash tool's `run_in_background: true` parameter** to launch it as a background process — do not append shell `&` or `2>&1 &` to the command, as that changes the command string and breaks the `Bash(scripts/*)` permission glob match:
 
 ```
 scripts/run-py.sh scripts/tg-responder.py
 ```
+(with `run_in_background: true` on the Bash tool call)
 
 Send a `session_started` notification:
 
@@ -325,7 +326,7 @@ In the main loop (step 2), call `bridge.read_dispatcher_inbox()` which returns a
 
 | Action | How to handle |
 |---|---|
-| `restart_responder` | Run `scripts/tg-stop-responder.sh`, reinstall telegram-bridge deps, restart `scripts/run-py.sh scripts/tg-responder.py` |
+| `restart_responder` | Run `scripts/tg-stop-responder.sh`, reinstall telegram-bridge deps, restart `scripts/run-py.sh scripts/tg-responder.py` (with `run_in_background: true` on the Bash tool) |
 | `terraform_apply` | Run dev terraform apply for the specified module (see "Auto-apply dev terraform" below) |
 | `notify` | Send a Telegram notification via `scripts/run-py.sh scripts/tg-notify.py notify "<message>"` |
 | `run_script` | Execute the specified script (validate it starts with `scripts/` for safety) |
@@ -461,7 +462,7 @@ When a merged PR modifies the responder code (`packages/telegram-bridge/` or `sc
 
 1. Run `scripts/tg-stop-responder.sh` (sends SIGTERM, waits for exit, cleans up PID/stop files)
 2. Reinstall telegram-bridge deps if needed
-3. Launch `scripts/run-py.sh scripts/tg-responder.py` (inherits current flags/config)
+3. Launch `scripts/run-py.sh scripts/tg-responder.py` with `run_in_background: true` on the Bash tool (do not use shell `&` — it breaks the permission glob match)
 4. Verify new PID file exists
 5. Send Telegram notification: "Responder daemon restarted after PR #N merged"
 
