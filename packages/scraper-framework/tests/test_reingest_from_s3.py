@@ -3966,3 +3966,292 @@ class TestQualityMetrics:
         assert isinstance(stats["quality_before"], dict)
         assert isinstance(stats["quality_after"], dict)
         assert isinstance(stats["quality_delta"], dict)
+
+
+# ---------------------------------------------------------------------------
+# Schema validation for _QUALITY_QUERIES
+# ---------------------------------------------------------------------------
+
+_SCHEMA_SQL_PATH = os.path.join(
+    os.path.dirname(__file__),
+    "..",
+    "..",
+    "api",
+    "src",
+    "data-access",
+    "schema.sql",
+)
+
+
+def _parse_schema_tables(schema_path: str) -> dict[str, set[str]]:
+    """Parse schema.sql to extract {table_name: {column_names}}.
+
+    Only parses public-schema ``CREATE TABLE`` blocks (skips staging.*).
+    """
+    import re
+
+    with open(schema_path, encoding="utf-8") as f:
+        sql = f.read()
+
+    tables: dict[str, set[str]] = {}
+
+    # Match CREATE TABLE <name> ( ... );  — skip staging schema tables
+    create_re = re.compile(
+        r"CREATE\s+TABLE\s+(?!staging\.)(\w+)\s*\((.*?)\);",
+        re.DOTALL | re.IGNORECASE,
+    )
+
+    for match in create_re.finditer(sql):
+        table_name = match.group(1).lower()
+        body = match.group(2)
+        columns: set[str] = set()
+
+        for line in body.split("\n"):
+            line = line.strip()
+            # Skip empty lines, comments, constraints, and PRIMARY KEY lines
+            if not line or line.startswith("--"):
+                continue
+            if re.match(r"(?i)(CONSTRAINT|PRIMARY\s+KEY|UNIQUE|CHECK|FOREIGN\s+KEY)\b", line):
+                continue
+            # First word is the column name (if it's a valid identifier)
+            col_match = re.match(r"(\w+)\s+", line)
+            if col_match:
+                col_name = col_match.group(1).lower()
+                # Skip SQL keywords that aren't column names
+                if col_name in {"constraint", "primary", "unique", "check", "foreign"}:
+                    continue
+                columns.add(col_name)
+
+        if columns:
+            tables[table_name] = columns
+
+    return tables
+
+
+def _parse_query_references(
+    query: str,
+) -> tuple[dict[str, str], list[tuple[str, str]]]:
+    """Parse a SQL query to extract table aliases and column references.
+
+    Handles both aliased tables (``FROM cases c``) and unaliased tables
+    (``FROM cases WHERE ...``).  When no alias is present, the table name
+    itself is used as the lookup key so that ``cases.id`` is validated.
+
+    Returns:
+        aliases: {alias_or_table_name -> table_name}
+        column_refs: [(alias_or_table_name, column_name), ...]
+    """
+    import re
+
+    # Normalise whitespace (collapse newlines/tabs into spaces)
+    query = " ".join(query.split())
+
+    # Strip the {county_filter} placeholder so it doesn't confuse parsing
+    query = query.replace("{county_filter}", "")
+
+    aliases: dict[str, str] = {}
+
+    # SQL clause keywords — if one of these follows a table name, it means
+    # the table has no explicit alias.
+    clause_keywords = {
+        "on",
+        "where",
+        "left",
+        "right",
+        "inner",
+        "outer",
+        "cross",
+        "join",
+        "group",
+        "order",
+        "having",
+        "limit",
+        "and",
+        "or",
+        "not",
+        "set",
+    }
+
+    # Extract FROM/JOIN table references with an optional alias.
+    # Group 1 = table name, Group 2 = next token (alias or keyword, optional).
+    table_re = re.compile(
+        r"(?:FROM|JOIN)\s+(\w+)(?:\s+(?:AS\s+)?(\w+))?",
+        re.IGNORECASE,
+    )
+    for m in table_re.finditer(query):
+        table_name = m.group(1).lower()
+        potential_alias = m.group(2)
+
+        if potential_alias and potential_alias.lower() not in clause_keywords:
+            # Explicit alias present (e.g. ``FROM cases c``)
+            aliases[potential_alias.lower()] = table_name
+        else:
+            # No alias or next token is a keyword — use table name itself
+            # so that ``table.column`` references are still validated.
+            aliases[table_name] = table_name
+
+    # Extract column references: alias.column patterns
+    col_ref_re = re.compile(r"\b(\w+)\.(\w+)\b")
+    column_refs: list[tuple[str, str]] = []
+    for m in col_ref_re.finditer(query):
+        alias = m.group(1).lower()
+        column = m.group(2).lower()
+        # Only include references whose prefix matches a known alias/table
+        if alias in aliases:
+            column_refs.append((alias, column))
+
+    return aliases, column_refs
+
+
+class TestQualityQueriesSchemaValidation:
+    """Validate that _QUALITY_QUERIES reference only columns that exist in the schema.
+
+    This test parses schema.sql to get the authoritative table/column definitions,
+    then parses each SQL query in _QUALITY_QUERIES to extract table aliases and
+    column references, and validates that every referenced column exists.
+
+    This would have caught the parties.case_id bug: the parties table has no
+    case_id column (the relationship goes through the case_parties junction table).
+    """
+
+    def test_schema_sql_exists(self) -> None:
+        """schema.sql must exist for schema validation to work."""
+        assert os.path.isfile(_SCHEMA_SQL_PATH), f"schema.sql not found at {_SCHEMA_SQL_PATH}"
+
+    def test_schema_parser_extracts_known_tables(self) -> None:
+        """The schema parser should find the key tables used by quality queries."""
+        tables = _parse_schema_tables(_SCHEMA_SQL_PATH)
+        for expected_table in (
+            "cases",
+            "documents",
+            "courts",
+            "rulings",
+            "parties",
+            "case_parties",
+        ):
+            assert expected_table in tables, (
+                f"Expected table '{expected_table}' not found in parsed schema"
+            )
+
+    def test_schema_parser_extracts_columns(self) -> None:
+        """The schema parser should extract correct columns for key tables."""
+        tables = _parse_schema_tables(_SCHEMA_SQL_PATH)
+
+        # Verify key columns exist where expected
+        assert "case_title" in tables["cases"]
+        assert "case_id" in tables["documents"]
+        assert "county" in tables["courts"]
+        assert "ruling_text" in tables["rulings"]
+        assert "case_id" in tables["case_parties"]
+
+        # The critical check: parties does NOT have case_id
+        assert "case_id" not in tables["parties"], (
+            "parties table should NOT have a case_id column — "
+            "the relationship goes through case_parties"
+        )
+
+    def test_query_parser_extracts_aliases(self) -> None:
+        """The query parser should correctly extract table aliases."""
+        query = """
+            SELECT COUNT(*) FROM cases c
+            JOIN documents d ON d.case_id = c.id AND d.status = 'active'
+            JOIN courts ct ON ct.id = d.court_id
+            WHERE c.case_title IS NULL
+        """
+        aliases, _ = _parse_query_references(query)
+        assert aliases == {"c": "cases", "d": "documents", "ct": "courts"}
+
+    def test_query_parser_handles_unaliased_tables(self) -> None:
+        """The query parser handles tables without an explicit alias."""
+        query = """
+            SELECT COUNT(*) FROM cases
+            WHERE cases.case_title IS NULL
+        """
+        aliases, col_refs = _parse_query_references(query)
+        # The table name itself should be used as the key
+        assert aliases == {"cases": "cases"}
+        assert ("cases", "case_title") in col_refs
+
+    def test_query_parser_extracts_column_refs(self) -> None:
+        """The query parser should correctly extract alias.column references."""
+        query = """
+            SELECT COUNT(*) FROM cases c
+            JOIN documents d ON d.case_id = c.id AND d.status = 'active'
+            WHERE c.case_title IS NULL
+        """
+        aliases, col_refs = _parse_query_references(query)
+        # Check that key references are found
+        assert ("d", "case_id") in col_refs
+        assert ("c", "id") in col_refs
+        assert ("d", "status") in col_refs
+        assert ("c", "case_title") in col_refs
+
+    def test_all_quality_queries_reference_valid_columns(self) -> None:
+        """Every column reference in _QUALITY_QUERIES must exist in the schema.
+
+        This is the primary regression test. If a query references a column
+        that does not exist on the target table (like parties.case_id), this
+        test fails with a clear error message.
+        """
+        tables = _parse_schema_tables(_SCHEMA_SQL_PATH)
+        errors: list[str] = []
+
+        for query_name, query_sql in reingest._QUALITY_QUERIES.items():
+            aliases, col_refs = _parse_query_references(query_sql)
+
+            for alias, column in col_refs:
+                table_name = aliases.get(alias)
+                if table_name is None:
+                    # Alias not recognized — skip (could be a subquery alias)
+                    continue
+                if table_name not in tables:
+                    errors.append(
+                        f"Query '{query_name}': table '{table_name}' "
+                        f"(alias '{alias}') not found in schema"
+                    )
+                    continue
+                if column not in tables[table_name]:
+                    errors.append(
+                        f"Query '{query_name}': column '{table_name}.{column}' "
+                        f"does not exist (alias '{alias}.{column}'). "
+                        f"Available columns: {sorted(tables[table_name])}"
+                    )
+
+        assert not errors, "Quality queries reference invalid columns:\n" + "\n".join(
+            f"  - {e}" for e in errors
+        )
+
+    def test_would_catch_parties_case_id_bug(self) -> None:
+        """Verify that the validation approach catches the original bug.
+
+        The original bug used ``parties p ... p.case_id`` but the parties
+        table has no case_id column. This test constructs such a buggy query
+        and confirms the validation catches it.
+        """
+        tables = _parse_schema_tables(_SCHEMA_SQL_PATH)
+
+        # Simulate the original buggy query
+        buggy_query = """
+            SELECT COUNT(DISTINCT c.id) FROM cases c
+            JOIN documents d ON d.case_id = c.id AND d.status = 'active'
+            JOIN courts ct ON ct.id = d.court_id
+            LEFT JOIN parties p ON p.case_id = c.id
+            WHERE p.id IS NULL
+        """
+        aliases, col_refs = _parse_query_references(buggy_query)
+
+        # The alias 'p' should map to 'parties'
+        assert aliases.get("p") == "parties"
+
+        # Validate: parties.case_id should be flagged as invalid
+        invalid_refs = []
+        for alias, column in col_refs:
+            table_name = aliases.get(alias)
+            if table_name and table_name in tables:
+                if column not in tables[table_name]:
+                    invalid_refs.append(f"{table_name}.{column}")
+
+        assert "parties.case_id" in invalid_refs, (
+            "The validation should catch 'parties.case_id' as invalid. "
+            f"Invalid refs found: {invalid_refs}"
+        )
