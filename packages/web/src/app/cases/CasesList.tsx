@@ -8,6 +8,13 @@ import { formatLabel } from '@/lib/display-helpers';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select';
 import { Skeleton } from '@/components/ui/skeleton';
 import {
   Table,
@@ -172,32 +179,36 @@ export function CasesList() {
           className="w-auto"
           aria-label="Case number or title"
         />
-        <select
-          name="caseStatus"
-          value={statusFilter}
-          onChange={(e) => setStatusFilter(e.target.value)}
-          aria-label="Case status"
-          className="rounded-md border border-input bg-background px-3 py-2 text-sm text-foreground ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+        <Select
+          value={statusFilter || 'all'}
+          onValueChange={(v) => setStatusFilter(v === 'all' ? '' : v)}
         >
-          <option value="">All statuses</option>
-          <option value="active">Active</option>
-          <option value="closed">Closed</option>
-          <option value="dismissed">Dismissed</option>
-        </select>
-        <select
-          name="caseType"
-          value={typeFilter}
-          onChange={(e) => setTypeFilter(e.target.value)}
-          aria-label="Case type"
-          className="rounded-md border border-input bg-background px-3 py-2 text-sm text-foreground ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+          <SelectTrigger className="w-auto min-w-[140px]" aria-label="Case status" name="caseStatus">
+            <SelectValue placeholder="All statuses" />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="all">All statuses</SelectItem>
+            <SelectItem value="active">Active</SelectItem>
+            <SelectItem value="closed">Closed</SelectItem>
+            <SelectItem value="dismissed">Dismissed</SelectItem>
+          </SelectContent>
+        </Select>
+        <Select
+          value={typeFilter || 'all'}
+          onValueChange={(v) => setTypeFilter(v === 'all' ? '' : v)}
         >
-          <option value="">All types</option>
-          {CASE_TYPES.map((ct) => (
-            <option key={ct} value={ct}>
-              {formatLabel(ct)}
-            </option>
-          ))}
-        </select>
+          <SelectTrigger className="w-auto min-w-[140px]" aria-label="Case type" name="caseType">
+            <SelectValue placeholder="All types" />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="all">All types</SelectItem>
+            {CASE_TYPES.map((ct) => (
+              <SelectItem key={ct} value={ct}>
+                {formatLabel(ct)}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
       </div>
 
       <div className="rounded-lg border">
