@@ -20,6 +20,7 @@ Options:
 
 Exit code: 0 if all fields are 100%, 1 otherwise.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -53,7 +54,7 @@ AUDIT_QUERY = """
         COUNT(c.case_type) AS has_case_type
     FROM documents d
     JOIN courts ct ON ct.id = d.court_id
-    LEFT JOIN rulings r ON r.document_id = d.id
+    JOIN rulings r ON r.document_id = d.id
     LEFT JOIN cases c ON c.id = d.case_id
     WHERE d.status = 'active'
     {county_filter}
@@ -65,10 +66,9 @@ VERBOSE_QUERY = """
         ct.county,
         d.id AS document_id,
         c.case_number,
-        CASE WHEN r.id IS NULL THEN 'ruling' ELSE NULL END AS missing_ruling,
-        CASE WHEN r.judge_id IS NULL AND r.id IS NOT NULL THEN 'judge' ELSE NULL END AS missing_judge,
-        CASE WHEN r.motion_type IS NULL AND r.id IS NOT NULL THEN 'motion_type' ELSE NULL END AS missing_motion_type,
-        CASE WHEN r.outcome IS NULL AND r.id IS NOT NULL THEN 'outcome' ELSE NULL END AS missing_outcome,
+        CASE WHEN r.judge_id IS NULL THEN 'judge' ELSE NULL END AS missing_judge,
+        CASE WHEN r.motion_type IS NULL THEN 'motion_type' ELSE NULL END AS missing_motion_type,
+        CASE WHEN r.outcome IS NULL THEN 'outcome' ELSE NULL END AS missing_outcome,
         CASE WHEN c.case_title IS NULL THEN 'case_title' ELSE NULL END AS missing_title,
         CASE WHEN c.case_number LIKE 'UNKNOWN-%%' THEN 'case_number' ELSE NULL END AS missing_case_number,
         CASE WHEN NOT EXISTS (
@@ -78,7 +78,7 @@ VERBOSE_QUERY = """
         CASE WHEN c.case_type IS NULL THEN 'case_type' ELSE NULL END AS missing_case_type
     FROM documents d
     JOIN courts ct ON ct.id = d.court_id
-    LEFT JOIN rulings r ON r.document_id = d.id
+    JOIN rulings r ON r.document_id = d.id
     LEFT JOIN cases c ON c.id = d.case_id
     WHERE d.status = 'active'
     {county_filter}
