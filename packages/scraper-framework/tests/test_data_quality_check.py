@@ -2102,6 +2102,252 @@ class TestCheckFieldCompleteness:
         assert any(a.severity == "p1" for a in la_alerts)
 
 
+class TestLowVolumeCountySuppression:
+    """Tests for low_volume flag suppressing field_completeness_low_sample alerts."""
+
+    def test_low_volume_county_no_alert(self) -> None:
+        """Low-volume county with low sample size does NOT emit an alert."""
+        conn = FakeConnection(
+            {
+                "case_parties": [
+                    _make_field_completeness_row(
+                        "San Francisco",
+                        total=2,
+                        judge=0,
+                    ),
+                ],
+            }
+        )
+        field_baselines = {
+            "San Francisco": {"judge": 100.0, "ruling": 100.0},
+        }
+        baselines_with_low_volume = {
+            "San Francisco": Baselines(
+                expected_daily_rulings=0.5,
+                schedule_type="daily",
+                low_volume=True,
+            ),
+        }
+        alerts = check_field_completeness(
+            conn, NOW, field_baselines, baselines=baselines_with_low_volume
+        )
+        # Should NOT produce any alerts — low_volume suppresses low_sample.
+        assert len(alerts) == 0
+
+    def test_non_low_volume_county_still_alerts(self) -> None:
+        """Non-low-volume county with low sample size still emits the alert."""
+        conn = FakeConnection(
+            {
+                "case_parties": [
+                    _make_field_completeness_row(
+                        "Ventura",
+                        total=3,
+                        judge=0,
+                    ),
+                ],
+            }
+        )
+        field_baselines = {
+            "Ventura": {"judge": 100.0, "ruling": 100.0},
+        }
+        baselines_without_low_volume = {
+            "Ventura": Baselines(
+                expected_daily_rulings=5,
+                schedule_type="daily",
+                low_volume=False,
+            ),
+        }
+        alerts = check_field_completeness(
+            conn, NOW, field_baselines, baselines=baselines_without_low_volume
+        )
+        low_sample = [a for a in alerts if a.metric == "field_completeness_low_sample"]
+        assert len(low_sample) == 1
+        assert low_sample[0].county == "Ventura"
+
+    def test_low_volume_does_not_affect_field_regression_detection(self) -> None:
+        """Low-volume flag only suppresses low_sample alerts, not regressions.
+
+        If a low-volume county actually has enough docs, field completeness
+        regressions are still detected normally.
+        """
+        conn = FakeConnection(
+            {
+                "case_parties": [
+                    _make_field_completeness_row(
+                        "San Francisco",
+                        total=10,  # Above MIN_FIELD_CHECK_SAMPLE_SIZE
+                        judge=8,  # 8/10 = 80% → 20pp drop from 100% baseline → P1
+                    ),
+                ],
+            }
+        )
+        field_baselines = {
+            "San Francisco": {"judge": 100.0},
+        }
+        baselines_with_low_volume = {
+            "San Francisco": Baselines(
+                expected_daily_rulings=0.5,
+                schedule_type="daily",
+                low_volume=True,
+            ),
+        }
+        alerts = check_field_completeness(
+            conn, NOW, field_baselines, baselines=baselines_with_low_volume
+        )
+        # Should still produce a field_completeness regression alert.
+        p1_alerts = [a for a in alerts if a.metric == "field_completeness"]
+        assert len(p1_alerts) == 1
+        assert p1_alerts[0].severity == "p1"
+
+    def test_no_baselines_param_backward_compatible(self) -> None:
+        """When baselines param is None (not provided), alerts still fire."""
+        conn = FakeConnection(
+            {
+                "case_parties": [
+                    _make_field_completeness_row(
+                        "Santa Clara",
+                        total=2,
+                        judge=0,
+                    ),
+                ],
+            }
+        )
+        field_baselines = {
+            "Santa Clara": {"judge": 95.0},
+        }
+        # Call without baselines param → backward-compatible behavior.
+        alerts = check_field_completeness(conn, NOW, field_baselines)
+        low_sample = [a for a in alerts if a.metric == "field_completeness_low_sample"]
+        assert len(low_sample) == 1
+        assert low_sample[0].county == "Santa Clara"
+
+    def test_mixed_low_volume_and_normal_counties(self) -> None:
+        """Low-volume county suppressed, normal county alerts as usual."""
+        conn = FakeConnection(
+            {
+                "case_parties": [
+                    _make_field_completeness_row(
+                        "San Francisco",
+                        total=2,
+                        judge=0,
+                    ),
+                    _make_field_completeness_row(
+                        "Ventura",
+                        total=3,
+                        judge=0,
+                    ),
+                ],
+            }
+        )
+        field_baselines = {
+            "San Francisco": {"judge": 100.0, "ruling": 100.0},
+            "Ventura": {"judge": 100.0, "ruling": 100.0},
+        }
+        baselines_mixed = {
+            "San Francisco": Baselines(
+                expected_daily_rulings=0.5,
+                schedule_type="daily",
+                low_volume=True,
+            ),
+            "Ventura": Baselines(
+                expected_daily_rulings=5,
+                schedule_type="daily",
+                low_volume=False,
+            ),
+        }
+        alerts = check_field_completeness(conn, NOW, field_baselines, baselines=baselines_mixed)
+        # San Francisco: suppressed (low_volume).
+        sf_alerts = [a for a in alerts if a.county == "San Francisco"]
+        assert len(sf_alerts) == 0
+        # Ventura: not low_volume, should get the alert.
+        v_alerts = [a for a in alerts if a.county == "Ventura"]
+        assert len(v_alerts) == 1
+        assert v_alerts[0].metric == "field_completeness_low_sample"
+
+    def test_county_not_in_baselines_still_alerts(self) -> None:
+        """County present in field_baselines but missing from baselines dict still alerts."""
+        conn = FakeConnection(
+            {
+                "case_parties": [
+                    _make_field_completeness_row(
+                        "Unknown County",
+                        total=2,
+                        judge=0,
+                    ),
+                ],
+            }
+        )
+        field_baselines = {
+            "Unknown County": {"judge": 95.0},
+        }
+        # baselines does not include "Unknown County" at all.
+        baselines_empty = {}
+        alerts = check_field_completeness(conn, NOW, field_baselines, baselines=baselines_empty)
+        low_sample = [a for a in alerts if a.metric == "field_completeness_low_sample"]
+        assert len(low_sample) == 1
+        assert low_sample[0].county == "Unknown County"
+
+
+class TestLoadBaselinesLowVolume:
+    """Tests for low_volume flag in load_baselines."""
+
+    def test_load_low_volume_true(self, tmp_path: Path) -> None:
+        """Loads low_volume=True from baselines JSON."""
+        baselines_file = tmp_path / "baselines.json"
+        baselines_file.write_text(
+            json.dumps(
+                {
+                    "counties": {
+                        "San Francisco": {
+                            "expected_daily_rulings": 0.5,
+                            "schedule_type": "daily",
+                            "low_volume": True,
+                        },
+                    }
+                }
+            )
+        )
+        result = load_baselines(baselines_file)
+        assert result["San Francisco"].low_volume is True
+
+    def test_load_low_volume_default_false(self, tmp_path: Path) -> None:
+        """Low_volume defaults to False when not specified."""
+        baselines_file = tmp_path / "baselines.json"
+        baselines_file.write_text(
+            json.dumps(
+                {
+                    "counties": {
+                        "Los Angeles": {
+                            "expected_daily_rulings": 50,
+                            "schedule_type": "daily",
+                        },
+                    }
+                }
+            )
+        )
+        result = load_baselines(baselines_file)
+        assert result["Los Angeles"].low_volume is False
+
+    def test_load_low_volume_from_raw_dict(self) -> None:
+        """Loads low_volume flag from pre-parsed raw dict."""
+        raw = {
+            "counties": {
+                "Santa Clara": {
+                    "expected_daily_rulings": 0.1,
+                    "schedule_type": "daily",
+                    "low_volume": True,
+                },
+                "Orange": {
+                    "expected_daily_rulings": 20,
+                    "schedule_type": "daily",
+                },
+            }
+        }
+        result = load_baselines(raw=raw)
+        assert result["Santa Clara"].low_volume is True
+        assert result["Orange"].low_volume is False
+
+
 # ---------------------------------------------------------------------------
 # Tests for check_orphaned_documents
 # ---------------------------------------------------------------------------
