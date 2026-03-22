@@ -108,6 +108,26 @@ describe('transcodeToUtf8', () => {
     const result = transcodeToUtf8(buf, 'utf-8');
     expect(result).toBe('Hello \u201cWorld\u201d');
   });
+
+  it('handles Windows-1252 documents larger than 65KB without throwing', () => {
+    // V8 limits spread arguments to ~65,536. A buffer larger than that would
+    // crash the old implementation with RangeError: Maximum call stack size exceeded.
+    const size = 100_000; // 100 KB — well above the V8 spread limit
+    const buf = Buffer.alloc(size);
+    // Fill with ASCII 'A' (0x41) and sprinkle some Windows-1252 special chars
+    buf.fill(0x41);
+    buf[0] = 0x93;   // left double quote -> U+201C
+    buf[size - 1] = 0x94; // right double quote -> U+201D
+
+    const result = transcodeToUtf8(buf, 'windows-1252');
+
+    expect(result.length).toBe(size);
+    expect(result[0]).toBe('\u201c');
+    expect(result[size - 1]).toBe('\u201d');
+    // Middle chars should all be 'A'
+    expect(result[1]).toBe('A');
+    expect(result[size - 2]).toBe('A');
+  });
 });
 
 // ---------------------------------------------------------------------------

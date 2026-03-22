@@ -76,14 +76,17 @@ const WIN1252_MAP: Record<number, number> = {
 export function transcodeToUtf8(buffer: Buffer, charset: string): string {
   const lower = charset.toLowerCase().replace(/[^a-z0-9]/g, '');
 
-  // Windows-1252: use manual byte-by-byte mapping
+  // Windows-1252: use manual byte-by-byte mapping.
+  // Build the string per-character to avoid spreading a large array as function
+  // arguments (V8 limits spread to ~65 536 args, but documents can be up to 5 MB).
   if (lower === 'windows1252' || lower === 'cp1252' || lower === 'win1252') {
-    const codePoints: number[] = [];
-    for (const byte of buffer) {
+    const parts: string[] = new Array(buffer.length);
+    for (let i = 0; i < buffer.length; i++) {
+      const byte = buffer[i];
       const mapped = WIN1252_MAP[byte];
-      codePoints.push(mapped !== undefined ? mapped : byte);
+      parts[i] = String.fromCharCode(mapped !== undefined ? mapped : byte);
     }
-    return String.fromCodePoint(...codePoints);
+    return parts.join('');
   }
 
   // Try TextDecoder for other charsets (iso-8859-1, etc.)
