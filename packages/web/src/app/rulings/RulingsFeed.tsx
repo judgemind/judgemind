@@ -199,9 +199,9 @@ export function RulingsFeed() {
   }, []);
 
   return (
-    <div>
+    <div className="space-y-6">
       {/* Filters */}
-      <div className="mb-4 flex flex-wrap gap-3">
+      <div className="flex flex-wrap gap-3">
         <Autocomplete
           value={county}
           onChange={setCounty}
@@ -265,16 +265,16 @@ export function RulingsFeed() {
                     {node.case ? (
                       <Link
                         href={`/rulings/${node.id}`}
-                        className="block truncate rounded-sm font-medium text-slate-900 hover:text-brand-600 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring dark:text-slate-100 dark:hover:text-brand-400"
+                        className="block truncate rounded-sm font-medium text-foreground hover:text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
                       >
                         {node.case.caseNumber}
                         {node.case.caseTitle ? ` \u2014 ${node.case.caseTitle}` : ''}
                       </Link>
                     ) : (
-                      <span className="text-slate-400">{'\u2014'}</span>
+                      <span className="text-muted-foreground">{'\u2014'}</span>
                     )}
 
-                    <div className="mt-0.5 flex flex-wrap items-center gap-x-2 text-xs text-slate-500 dark:text-slate-400">
+                    <div className="mt-0.5 flex flex-wrap items-center gap-x-2 text-xs text-muted-foreground">
                       {node.case?.court && (
                         <span>{node.case.court.county} {node.department ? `\u00B7 Dept. ${node.department}` : ''}</span>
                       )}
@@ -288,14 +288,14 @@ export function RulingsFeed() {
                       >
                         {formatOutcome(node.outcome)}
                       </Badge>
-                      <Badge variant="outline" className="text-slate-600 dark:text-slate-400">
+                      <Badge variant="outline" className="text-muted-foreground">
                         {formatMotionType(node.motionType)}
                       </Badge>
                     </div>
                   </div>
 
                   {/* Right: date */}
-                  <span className="shrink-0 text-xs text-slate-500 dark:text-slate-400">
+                  <span className="shrink-0 text-xs text-muted-foreground">
                     {formatDate(node.hearingDate)}
                   </span>
                 </div>

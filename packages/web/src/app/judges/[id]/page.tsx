@@ -58,7 +58,7 @@ export default async function JudgeDetailPage({ params }: Props) {
   const heading = buildJudgeHeading(judgeData, id);
 
   return (
-    <div className="mx-auto max-w-4xl">
+    <div className="mx-auto max-w-4xl space-y-6">
       {/* Profile header card */}
       <Card>
         <CardContent className="p-6">
@@ -77,9 +77,7 @@ export default async function JudgeDetailPage({ params }: Props) {
         </CardContent>
       </Card>
 
-      <div className="mt-6">
-        <JudgeProfile judgeId={id} />
-      </div>
+      <JudgeProfile judgeId={id} />
     </div>
   );
 }

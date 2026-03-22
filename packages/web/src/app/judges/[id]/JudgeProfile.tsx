@@ -470,7 +470,7 @@ export function JudgeProfile({ judgeId }: { judgeId: string }) {
   // -------------------------------------------------------------------------
 
   return (
-    <div className="space-y-8">
+    <div className="space-y-6">
       {/* Analytics section */}
       <section>
         <h2 className="mb-3 flex items-center gap-2 text-sm font-semibold uppercase tracking-wide text-muted-foreground">

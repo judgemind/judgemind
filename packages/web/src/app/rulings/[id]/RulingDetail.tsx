@@ -54,12 +54,12 @@ export function RulingDetail({ ruling, sanitizedRulingTextHtml }: RulingProps) {
       {/* Linked case */}
       {ruling.case && (
         <section>
-          <h2 className="text-xs font-medium uppercase tracking-wide text-slate-500 dark:text-slate-400">
+          <h2 className="text-sm font-semibold uppercase tracking-wide text-muted-foreground">
             Case
           </h2>
           <Link
             href={`/cases/${ruling.case.id}`}
-            className="mt-1 block rounded-sm text-sm font-medium text-slate-900 hover:text-brand-600 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring dark:text-slate-100 dark:hover:text-brand-400"
+            className="mt-1 block rounded-sm text-sm font-medium text-foreground hover:text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
           >
             {ruling.case.caseNumber}
             {ruling.case.caseTitle ? ` \u2014 ${ruling.case.caseTitle}` : ''}
@@ -70,12 +70,12 @@ export function RulingDetail({ ruling, sanitizedRulingTextHtml }: RulingProps) {
       {/* Judge */}
       {ruling.judge && (
         <section>
-          <h2 className="text-xs font-medium uppercase tracking-wide text-slate-500 dark:text-slate-400">
+          <h2 className="text-sm font-semibold uppercase tracking-wide text-muted-foreground">
             Judge
           </h2>
           <Link
             href={`/judges/${ruling.judge.id}`}
-            className="mt-1 block rounded-sm text-sm font-medium text-slate-900 hover:text-brand-600 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring dark:text-slate-100 dark:hover:text-brand-400"
+            className="mt-1 block rounded-sm text-sm font-medium text-foreground hover:text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
           >
             {ruling.judge.canonicalName}
           </Link>
@@ -86,12 +86,12 @@ export function RulingDetail({ ruling, sanitizedRulingTextHtml }: RulingProps) {
       {displaySummary && (
         <Card>
           <CardHeader className="pb-2">
-            <CardTitle className="text-sm font-medium uppercase tracking-wide text-slate-500 dark:text-slate-400">
+            <CardTitle className="text-lg font-semibold text-foreground">
               Summary
             </CardTitle>
           </CardHeader>
           <CardContent>
-            <p className="text-sm leading-relaxed text-slate-700 dark:text-slate-300">
+            <p className="text-sm leading-relaxed text-foreground">
               {displaySummary}
             </p>
           </CardContent>
@@ -102,7 +102,7 @@ export function RulingDetail({ ruling, sanitizedRulingTextHtml }: RulingProps) {
       {(sanitizedRulingTextHtml || ruling.rulingText) && (
         <Card>
           <CardHeader className="flex flex-row items-center justify-between pb-2">
-            <CardTitle className="text-sm font-medium uppercase tracking-wide text-slate-500 dark:text-slate-400">
+            <CardTitle className="text-lg font-semibold text-foreground">
               Ruling Text
             </CardTitle>
             {ruling.documentId && (
@@ -126,7 +126,7 @@ export function RulingDetail({ ruling, sanitizedRulingTextHtml }: RulingProps) {
           <CardContent className="prose prose-slate dark:prose-invert max-w-none">
             {sanitizedRulingTextHtml ? (
               <div
-                className="ruling-content text-sm leading-relaxed text-slate-700 dark:text-slate-300"
+                className="ruling-content text-sm leading-relaxed text-foreground"
                 dangerouslySetInnerHTML={{
                   __html: stripMetadataHeaderHtml(sanitizedRulingTextHtml, metadata),
                 }}
@@ -136,7 +136,7 @@ export function RulingDetail({ ruling, sanitizedRulingTextHtml }: RulingProps) {
                 {cleanRulingText(ruling.rulingText!, metadata).map((paragraph, idx) => (
                   <p
                     key={idx}
-                    className="text-sm leading-relaxed text-slate-700 dark:text-slate-300"
+                    className="text-sm leading-relaxed text-foreground"
                   >
                     {paragraph}
                   </p>

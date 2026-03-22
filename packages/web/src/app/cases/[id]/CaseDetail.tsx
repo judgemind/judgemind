@@ -163,7 +163,7 @@ function PartyColumn({
 }) {
   return (
     <div>
-      <h3 className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+      <h3 className="text-sm font-semibold uppercase tracking-wide text-muted-foreground">
         {label}
       </h3>
       {parties.length === 0 ? (
@@ -296,13 +296,13 @@ export function CaseDetail({ caseId }: { caseId: string }) {
     <div className="space-y-6">
       <Card>
         <CardHeader>
-          <CardTitle className="text-base">Case Details</CardTitle>
+          <CardTitle className="text-lg font-semibold">Case Details</CardTitle>
         </CardHeader>
         <CardContent>
           <dl className="grid grid-cols-2 gap-x-8 gap-y-4 sm:grid-cols-3">
             {caseRecord.filedAt && (
               <div>
-                <dt className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                <dt className="text-sm font-semibold uppercase tracking-wide text-muted-foreground">
                   Filed Date
                 </dt>
                 <dd className="mt-1 text-sm text-foreground">
@@ -311,7 +311,7 @@ export function CaseDetail({ caseId }: { caseId: string }) {
               </div>
             )}
             <div>
-              <dt className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+              <dt className="text-sm font-semibold uppercase tracking-wide text-muted-foreground">
                 Court
               </dt>
               <dd className="mt-1 text-sm text-foreground">
@@ -319,7 +319,7 @@ export function CaseDetail({ caseId }: { caseId: string }) {
               </dd>
             </div>
             <div>
-              <dt className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+              <dt className="text-sm font-semibold uppercase tracking-wide text-muted-foreground">
                 County
               </dt>
               <dd className="mt-1 text-sm text-foreground">
@@ -333,7 +333,7 @@ export function CaseDetail({ caseId }: { caseId: string }) {
       {caseRecord.parties.length > 0 && (
         <Card>
           <CardHeader>
-            <CardTitle className="text-base">Parties</CardTitle>
+            <CardTitle className="text-lg font-semibold">Parties</CardTitle>
           </CardHeader>
           <CardContent>
             <div className="grid grid-cols-1 gap-6 sm:grid-cols-2">
@@ -350,7 +350,7 @@ export function CaseDetail({ caseId }: { caseId: string }) {
       {displayJudges.length > 0 && (
         <Card>
           <CardHeader>
-            <CardTitle className="text-base">Judges</CardTitle>
+            <CardTitle className="text-lg font-semibold">Judges</CardTitle>
           </CardHeader>
           <CardContent>
             <ul className="space-y-1">
@@ -375,7 +375,7 @@ export function CaseDetail({ caseId }: { caseId: string }) {
       )}
 
       <section>
-        <h2 className="mb-3 text-base font-semibold text-foreground">
+        <h2 className="mb-3 text-lg font-semibold text-foreground">
           Rulings
         </h2>
 

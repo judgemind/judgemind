@@ -113,19 +113,19 @@ export default async function RulingDetailPage({ params }: Props) {
   }
 
   return (
-    <div className="mx-auto max-w-4xl">
+    <div className="mx-auto max-w-4xl space-y-6">
       {/* Breadcrumb */}
-      <nav className="mb-4 text-sm text-slate-500 dark:text-slate-400" aria-label="Breadcrumb">
-        <Link href="/rulings" className="hover:text-brand-600 dark:hover:text-brand-400">
+      <nav className="text-sm text-muted-foreground" aria-label="Breadcrumb">
+        <Link href="/rulings" className="hover:text-primary">
           Rulings
         </Link>
         <span className="mx-2">/</span>
-        <span className="text-slate-700 dark:text-slate-200">{motionLabel}</span>
+        <span className="text-foreground">{motionLabel}</span>
       </nav>
 
       {/* Heading */}
       <div className="flex flex-wrap items-start gap-3">
-        <h1 className="text-2xl font-bold text-slate-900 dark:text-slate-100">
+        <h1 className="text-2xl font-bold tracking-tight text-foreground">
           {motionLabel}
         </h1>
         <div className="flex flex-wrap gap-2 pt-1">
@@ -149,16 +149,16 @@ export default async function RulingDetailPage({ params }: Props) {
       </div>
 
       {/* Structured metadata Card */}
-      <Card className="mt-6">
+      <Card>
         <CardContent className="p-6">
           <div className="grid grid-cols-2 gap-x-8 gap-y-4 sm:grid-cols-3">
             {/* Judge */}
             {rulingData.judge && (
               <div>
-                <dt className="text-xs font-medium uppercase tracking-wide text-slate-500 dark:text-slate-400">
+                <dt className="text-sm font-semibold uppercase tracking-wide text-muted-foreground">
                   Judge
                 </dt>
-                <dd className="mt-1 text-sm text-slate-900 dark:text-slate-100">
+                <dd className="mt-1 text-sm text-foreground">
                   {rulingData.judge.canonicalName}
                 </dd>
               </div>
@@ -167,10 +167,10 @@ export default async function RulingDetailPage({ params }: Props) {
             {/* Court */}
             {rulingData.court && (
               <div>
-                <dt className="text-xs font-medium uppercase tracking-wide text-slate-500 dark:text-slate-400">
+                <dt className="text-sm font-semibold uppercase tracking-wide text-muted-foreground">
                   Court
                 </dt>
-                <dd className="mt-1 text-sm text-slate-900 dark:text-slate-100">
+                <dd className="mt-1 text-sm text-foreground">
                   {rulingData.court.courtName}
                 </dd>
               </div>
@@ -179,10 +179,10 @@ export default async function RulingDetailPage({ params }: Props) {
             {/* County */}
             {rulingData.court && (
               <div>
-                <dt className="text-xs font-medium uppercase tracking-wide text-slate-500 dark:text-slate-400">
+                <dt className="text-sm font-semibold uppercase tracking-wide text-muted-foreground">
                   County
                 </dt>
-                <dd className="mt-1 text-sm text-slate-900 dark:text-slate-100">
+                <dd className="mt-1 text-sm text-foreground">
                   {rulingData.court.county}
                 </dd>
               </div>
@@ -191,10 +191,10 @@ export default async function RulingDetailPage({ params }: Props) {
             {/* Department */}
             {rulingData.department && (
               <div>
-                <dt className="text-xs font-medium uppercase tracking-wide text-slate-500 dark:text-slate-400">
+                <dt className="text-sm font-semibold uppercase tracking-wide text-muted-foreground">
                   Department
                 </dt>
-                <dd className="mt-1 text-sm text-slate-900 dark:text-slate-100">
+                <dd className="mt-1 text-sm text-foreground">
                   {rulingData.department}
                 </dd>
               </div>
@@ -202,10 +202,10 @@ export default async function RulingDetailPage({ params }: Props) {
 
             {/* Hearing date */}
             <div>
-              <dt className="text-xs font-medium uppercase tracking-wide text-slate-500 dark:text-slate-400">
+              <dt className="text-sm font-semibold uppercase tracking-wide text-muted-foreground">
                 Hearing Date
               </dt>
-              <dd className="mt-1 text-sm text-slate-900 dark:text-slate-100">
+              <dd className="mt-1 text-sm text-foreground">
                 {formatDate(rulingData.hearingDate)}
               </dd>
             </div>
@@ -213,10 +213,10 @@ export default async function RulingDetailPage({ params }: Props) {
             {/* Motion type */}
             {rulingData.motionType && (
               <div>
-                <dt className="text-xs font-medium uppercase tracking-wide text-slate-500 dark:text-slate-400">
+                <dt className="text-sm font-semibold uppercase tracking-wide text-muted-foreground">
                   Motion Type
                 </dt>
-                <dd className="mt-1 text-sm text-slate-900 dark:text-slate-100">
+                <dd className="mt-1 text-sm text-foreground">
                   {formatLabel(rulingData.motionType)}
                 </dd>
               </div>
@@ -225,10 +225,10 @@ export default async function RulingDetailPage({ params }: Props) {
             {/* Case number */}
             {rulingData.case && (
               <div>
-                <dt className="text-xs font-medium uppercase tracking-wide text-slate-500 dark:text-slate-400">
+                <dt className="text-sm font-semibold uppercase tracking-wide text-muted-foreground">
                   Case Number
                 </dt>
-                <dd className="mt-1 text-sm text-slate-900 dark:text-slate-100">
+                <dd className="mt-1 text-sm text-foreground">
                   {rulingData.case.caseNumber}
                 </dd>
               </div>
@@ -238,9 +238,7 @@ export default async function RulingDetailPage({ params }: Props) {
       </Card>
 
       {/* Client component handles ruling text, case link, judge link, document download */}
-      <div className="mt-6">
-        <RulingDetail ruling={rulingData} sanitizedRulingTextHtml={sanitizedHtml} />
-      </div>
+      <RulingDetail ruling={rulingData} sanitizedRulingTextHtml={sanitizedHtml} />
     </div>
   );
 }
