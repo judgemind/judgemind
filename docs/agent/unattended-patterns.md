@@ -23,6 +23,18 @@
 
   The script uses Python's `shutil.copy2()` internally, which bypasses the platform restriction. **Do not use `cp` directly** — it may also be blocked. This pattern applies to skill definitions (`SKILL.md`), hook scripts, and any other file under `.claude/`.
 
+## Dispatcher CWD Drift and `git -C`
+
+When the dispatcher spawns subagents with `isolation: "worktree"`, the parent process's working directory can drift into the agent's worktree (`.claude/worktrees/agent-<id>/`). After the agent completes and the worktree is removed, the parent's cwd becomes invalid, causing `getcwd` errors and broken git commands.
+
+**Mitigations:**
+
+1. **Always use `git -C <repo_root>` for all git commands in the dispatcher.** This makes git operate relative to the repo root regardless of what the shell's cwd is. Never use bare `git` commands (without `-C`) in the dispatcher — they will fail or operate on the wrong directory if cwd has drifted.
+2. **Unconditionally `cd <repo_root>` after every agent completion.** Do not check `pwd` first — cwd drift is a known quirk, so just always re-anchor. The `cd` is a no-op if cwd is correct and essential if it has drifted.
+3. **Use `run_in_background: true` on the Bash tool** (not shell `&` or `2>&1 &`) when launching background processes like the Telegram responder daemon. Shell operators change the command string and break the `Bash(scripts/*)` permission glob match.
+
+These patterns apply to any long-running orchestrator agent that spawns subagents with worktree isolation — not just the dispatcher.
+
 ## GitHub API Rate Limit Handling
 
 The GitHub API allows 5,000 requests per hour per authentication token. When multiple agents share the same token, this budget is consumed quickly.
