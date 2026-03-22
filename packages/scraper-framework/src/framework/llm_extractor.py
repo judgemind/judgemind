@@ -2,14 +2,16 @@
 
 The ``LlmExtractor`` class is the framework-level entry point for
 converting raw court calendar text into structured ``ExtractedRuling``
-models via the Anthropic API.
+models via a configurable LLM provider (Anthropic or Google GenAI).
 
 Design principles:
 
 - **Stateless**: no DB access, no side effects.  Pure function:
   text in, structured data out.
-- **Configurable**: model and API key are configurable; defaults to
-  Claude Haiku 4.5 for cost efficiency.
+- **Configurable**: provider, model, and API key are configurable;
+  defaults to Anthropic Claude Haiku 4.5 for cost efficiency.
+- **Multimodal**: supports both text extraction (``extract()``) and
+  PDF image extraction (``extract_from_pdf()``).
 - **Resilient**: retries on transient API errors (429, 500, 529) with
   exponential backoff.
 - **Observable**: logs token usage per call for cost monitoring.
@@ -19,6 +21,7 @@ Design principles:
 
 from __future__ import annotations
 
+import io
 import json
 import re
 import time
@@ -100,11 +103,17 @@ _COUNTY_PREFIX_RE = re.compile(r"^\d{2,4}-(\d{4}-\d+)$")
 class LlmExtractor:
     """Stateless extractor that converts raw court calendar text to structured data.
 
+    Supports both text-based extraction via ``extract()`` and multimodal
+    PDF image extraction via ``extract_from_pdf()``.  The provider can be
+    ``"anthropic"`` (default) or ``"google"``.
+
     Args:
-        model: Anthropic model ID.  Defaults to Claude Haiku 4.5.
-        api_key: Anthropic API key.  If ``None``, the ``ANTHROPIC_API_KEY``
-            environment variable is used (standard ``anthropic.Anthropic()``
-            behavior).
+        provider: LLM provider — ``"anthropic"`` (default) or ``"google"``.
+        model: Model ID.  Defaults to Claude Haiku 4.5 for Anthropic or
+            ``"gemini-2.5-flash-lite"`` for Google.
+        api_key: Provider API key.  For Anthropic, if ``None`` the
+            ``ANTHROPIC_API_KEY`` env var is used.  For Google, the
+            ``GOOGLE_API_KEY`` env var is used.
         max_retries: Number of retries on transient API failures (429, 500, 529).
         base_delay: Initial backoff delay in seconds.
         max_delay: Maximum backoff delay in seconds.
@@ -115,12 +124,23 @@ class LlmExtractor:
 
         extractor = LlmExtractor()
         rulings = extractor.extract("Case No. 22SMCV01940 ...")
+
+        # Multimodal extraction from PDF images
+        extractor = LlmExtractor(provider="google", model="gemini-2.5-flash-lite")
+        rulings = extractor.extract_from_pdf(pdf_bytes)
     """
+
+    # Default models per provider.
+    _PROVIDER_DEFAULT_MODELS: dict[str, str] = {
+        "anthropic": DEFAULT_HAIKU_MODEL,
+        "google": "gemini-2.5-flash-lite",
+    }
 
     def __init__(
         self,
         *,
-        model: str = DEFAULT_HAIKU_MODEL,
+        provider: str = "anthropic",
+        model: str | None = None,
         api_key: str | None = None,
         max_retries: int = _DEFAULT_MAX_RETRIES,
         base_delay: float = _DEFAULT_BASE_DELAY,
@@ -128,18 +148,23 @@ class LlmExtractor:
         max_output_tokens: int = 4096,
         max_chars_per_chunk: int = _DEFAULT_MAX_CHARS,
     ) -> None:
-        self._model = model
+        self._provider = provider
+        self._model = model or self._PROVIDER_DEFAULT_MODELS.get(provider, DEFAULT_HAIKU_MODEL)
         self._max_retries = max_retries
         self._base_delay = base_delay
         self._max_delay = max_delay
         self._max_output_tokens = max_output_tokens
         self._max_chars_per_chunk = max_chars_per_chunk
 
-        # Create client — raises if no API key is available.
-        client_kwargs: dict[str, str] = {}
-        if api_key is not None:
-            client_kwargs["api_key"] = api_key
-        self._client = anthropic.Anthropic(**client_kwargs)
+        # Create provider-specific client.
+        if provider == "google":
+            self._client = _create_google_client(api_key=api_key)
+        else:
+            # Default to Anthropic.
+            client_kwargs: dict[str, str] = {}
+            if api_key is not None:
+                client_kwargs["api_key"] = api_key
+            self._client = anthropic.Anthropic(**client_kwargs)
 
     # ------------------------------------------------------------------
     # Public API
@@ -199,6 +224,49 @@ class LlmExtractor:
 
         merged = self._merge_results(all_results)
         return merged.rulings
+
+    def extract_from_pdf(
+        self,
+        pdf_bytes: bytes,
+        *,
+        metadata: dict[str, str] | None = None,
+        max_pages: int = 20,
+    ) -> list[ExtractedRuling]:
+        """Extract structured rulings from PDF page images (multimodal).
+
+        Renders each PDF page to a PNG image using pdfplumber, sends all
+        page images to the configured LLM provider in a single API call,
+        and parses the JSON response into ``ExtractedRuling`` models.
+
+        This is the multimodal counterpart of ``extract()`` — use it when
+        the source document is a raw PDF (e.g., OC tentative ruling volumes)
+        rather than pre-extracted text.
+
+        Args:
+            pdf_bytes: Raw PDF file content.
+            metadata: Optional dict with authoritative scraper-provided
+                context.  Supported keys: ``judge_name``, ``department``,
+                ``hearing_date``.
+            max_pages: Maximum number of PDF pages to render.  Pages beyond
+                this limit are silently skipped.
+
+        Returns:
+            A list of ``ExtractedRuling`` instances.  Returns an empty list
+            if the PDF is empty, rendering fails, or the API call fails
+            after retries.
+        """
+        if not pdf_bytes:
+            return []
+
+        page_images = _render_pdf_pages(pdf_bytes, max_pages)
+        if not page_images:
+            logger.warning("llm_extractor.no_pages_rendered")
+            return []
+
+        usage = TokenUsage()
+        result = self._extract_images(page_images, metadata=metadata, usage=usage)
+        self._log_usage(usage)
+        return result.rulings if result else []
 
     # ------------------------------------------------------------------
     # Internal: API call with retries
@@ -319,6 +387,81 @@ class LlmExtractor:
 
         return None  # pragma: no cover — defensive
 
+    def _extract_images(
+        self,
+        images: list[tuple[bytes, str]],
+        *,
+        metadata: dict[str, str] | None = None,
+        usage: TokenUsage,
+    ) -> ExtractionResult | None:
+        """Send page images to the LLM and parse the extraction result.
+
+        All images are sent in a single API call (no chunking needed for
+        typical OC tentative ruling volumes).
+
+        Uses the ``call_llm_with_images`` adapter from ``ingestion.llm_providers``
+        to support both Anthropic and Google providers.
+        """
+        from ingestion.llm_providers import call_llm_with_images
+
+        text_message = self._build_user_message_for_images(metadata)
+        delay = self._base_delay
+
+        for attempt in range(1, self._max_retries + 1):
+            try:
+                response = call_llm_with_images(
+                    system_prompt=EXTRACTION_SYSTEM_PROMPT,
+                    text_message=text_message,
+                    images=images,
+                    provider=self._provider,
+                    model=self._model,
+                    client=self._client,
+                    max_retries=0,  # We handle retries ourselves.
+                    max_tokens=self._max_output_tokens,
+                )
+
+                if response is None:
+                    if attempt < self._max_retries:
+                        wait = min(delay, self._max_delay)
+                        logger.warning(
+                            "llm_extractor.image_api_failure",
+                            attempt=attempt,
+                            max_retries=self._max_retries,
+                            retry_in=wait,
+                        )
+                        time.sleep(wait)
+                        delay *= 2
+                        continue
+                    logger.error("llm_extractor.image_api_exhausted")
+                    return None
+
+                usage.input_tokens += response.input_tokens
+                usage.output_tokens += response.output_tokens
+                usage.api_calls += 1
+
+                return self._parse_response(response.text, metadata)
+
+            except Exception:  # noqa: BLE001
+                if attempt < self._max_retries:
+                    wait = min(delay, self._max_delay)
+                    logger.warning(
+                        "llm_extractor.image_extract_error",
+                        attempt=attempt,
+                        max_retries=self._max_retries,
+                        retry_in=wait,
+                        exc_info=True,
+                    )
+                    time.sleep(wait)
+                    delay *= 2
+                    continue
+                logger.error(
+                    "llm_extractor.image_extract_exhausted",
+                    exc_info=True,
+                )
+                return None
+
+        return None  # pragma: no cover — defensive
+
     # ------------------------------------------------------------------
     # Internal: message building
     # ------------------------------------------------------------------
@@ -342,6 +485,30 @@ class LlmExtractor:
                 parts.append("Metadata from scraper:\n" + "\n".join(meta_lines))
 
         parts.append(f"Document:\n\n{text}")
+        return "\n\n".join(parts)
+
+    @staticmethod
+    def _build_user_message_for_images(
+        metadata: dict[str, str] | None,
+    ) -> str:
+        """Build the text portion of the user message for multimodal extraction."""
+        parts: list[str] = []
+        if metadata:
+            meta_lines: list[str] = []
+            if metadata.get("judge_name"):
+                meta_lines.append(f"Judge name (authoritative): {metadata['judge_name']}")
+            if metadata.get("department"):
+                meta_lines.append(f"Department (authoritative): {metadata['department']}")
+            if metadata.get("hearing_date"):
+                meta_lines.append(f"Hearing date (authoritative): {metadata['hearing_date']}")
+            if meta_lines:
+                parts.append("Metadata from scraper:\n" + "\n".join(meta_lines))
+
+        parts.append(
+            "Extract ALL structured fields from the attached court ruling "
+            "document page images.  The images are pages from a single PDF "
+            "document.  Read every page and extract every case found."
+        )
         return "\n\n".join(parts)
 
     # ------------------------------------------------------------------
@@ -627,3 +794,68 @@ def _force_split(text: str, max_chars: int) -> list[str]:
         chunks.append(text[pos:end])
         pos = end - _CHUNK_OVERLAP if end < len(text) else end
     return chunks
+
+
+# ---------------------------------------------------------------------------
+# PDF page rendering
+# ---------------------------------------------------------------------------
+
+# Resolution for rendering PDF pages to images (DPI).
+_PDF_RENDER_RESOLUTION = 150
+
+
+def _render_pdf_pages(
+    pdf_bytes: bytes,
+    max_pages: int,
+) -> list[tuple[bytes, str]]:
+    """Render PDF pages to PNG images using pdfplumber.
+
+    Returns a list of ``(png_bytes, media_type)`` tuples.
+    """
+    import pdfplumber
+
+    results: list[tuple[bytes, str]] = []
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        for i, page in enumerate(pdf.pages):
+            if i >= max_pages:
+                logger.info(
+                    "llm_extractor.page_limit_reached",
+                    max_pages=max_pages,
+                    total_pages=len(pdf.pages),
+                )
+                break
+
+            page_image = page.to_image(resolution=_PDF_RENDER_RESOLUTION)
+            img_buffer = io.BytesIO()
+            page_image.original.save(img_buffer, format="PNG")
+            png_bytes = img_buffer.getvalue()
+            results.append((png_bytes, "image/png"))
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Google client factory
+# ---------------------------------------------------------------------------
+
+
+def _create_google_client(*, api_key: str | None = None) -> object:
+    """Create a Google GenAI client.
+
+    If *api_key* is provided, uses it directly.  Otherwise falls back to
+    the ``GOOGLE_API_KEY`` environment variable.
+
+    Raises ``ValueError`` if no API key is available.
+    """
+    import os
+
+    from google import genai
+
+    resolved_key = api_key or os.environ.get("GOOGLE_API_KEY")
+    if not resolved_key:
+        msg = (
+            "No Google API key provided — pass api_key= or set "
+            "the GOOGLE_API_KEY environment variable."
+        )
+        raise ValueError(msg)
+    return genai.Client(api_key=resolved_key)
