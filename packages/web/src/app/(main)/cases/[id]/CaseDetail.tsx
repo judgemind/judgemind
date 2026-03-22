@@ -334,13 +334,9 @@ export function CaseDetail({ caseId }: { caseId: string }) {
       )}
 
       {!rulingsLoading && !rulingsError && edges.length === 0 && (
-        <Card>
-          <CardContent className="py-6 text-center">
-            <p className="text-muted-foreground">
-              No rulings captured for this case.
-            </p>
-          </CardContent>
-        </Card>
+        <p className="py-6 text-center text-muted-foreground">
+          No rulings captured for this case.
+        </p>
       )}
 
       <div className="space-y-3">

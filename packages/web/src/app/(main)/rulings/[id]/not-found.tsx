@@ -1,4 +1,5 @@
 import Link from 'next/link';
+import { Button } from '@/components/ui/button';
 
 export default function RulingNotFound() {
   return (
@@ -10,12 +11,11 @@ export default function RulingNotFound() {
         <p className="mt-2 text-sm text-muted-foreground">
           The ruling you are looking for does not exist or has not been captured yet.
         </p>
-        <Link
-          href="/rulings"
-          className="mt-4 inline-block rounded-lg bg-brand-accent px-4 py-2 text-sm font-medium text-white hover:bg-brand-accent-hover"
-        >
-          Back to Rulings
-        </Link>
+        <div className="mt-4">
+          <Button asChild variant="outline">
+            <Link href="/rulings">Back to Rulings</Link>
+          </Button>
+        </div>
       </div>
     </div>
   );
