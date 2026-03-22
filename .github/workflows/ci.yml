@@ -137,7 +137,7 @@ jobs:
         run: .venv/bin/ruff format --check src/ tests/
       - name: Test
         run: >-
-          .venv/bin/pytest tests/ -n auto -v --tb=short
+          .venv/bin/pytest tests/ -n auto -v --tb=short --durations=30
           --ignore=tests/courts/
           --ignore=tests/test_reingest_from_s3.py
           --ignore=tests/test_reingest_registry.py
@@ -162,6 +162,39 @@ jobs:
     needs: detect-changes
     if: needs.detect-changes.outputs.scraper-courts == 'true'
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Shard 1: PDF-heavy courts (CC, Fresno, OC variants, PDF link scraper,
+          # Riverside, Santa Barbara). These tests involve PDF parsing and are
+          # individually slower.
+          - shard: 1
+            test-paths: >-
+              tests/courts/test_cc_tentatives.py
+              tests/courts/test_fresno_tentatives.py
+              tests/courts/test_oc_tentatives.py
+              tests/courts/test_oc_family_law_tentatives.py
+              tests/courts/test_oc_probate_tentatives.py
+              tests/courts/test_pdf_link_scraper.py
+              tests/courts/test_riverside_tentatives.py
+              tests/courts/test_riverside_dept_judges.py
+              tests/courts/test_sb_tentatives.py
+          # Shard 2: HTML-based and other courts (CourtListener, LA, Santa Cruz,
+          # San Diego, SF, Ventura, plus utility tests).
+          - shard: 2
+            test-paths: >-
+              tests/courts/test_courtlistener.py
+              tests/courts/test_la_tentatives.py
+              tests/courts/test_la_dept_judges.py
+              tests/courts/ca/
+              tests/courts/test_sc_tentatives.py
+              tests/courts/test_sd_tentatives.py
+              tests/courts/test_sd_calendar.py
+              tests/courts/test_sd_pipeline.py
+              tests/courts/test_sf_tentatives.py
+              tests/courts/test_ventura_tentatives.py
+              tests/courts/test_ventura_dept_judges.py
     defaults:
       run:
         working-directory: packages/scraper-framework
@@ -191,16 +224,20 @@ jobs:
           .venv/bin/pip install -e ../../packages/judgemind-config
           .venv/bin/pip install -e ".[dev]"
       - name: Lint
+        if: matrix.shard == 1
         run: .venv/bin/ruff check src/ tests/
       - name: Format check
+        if: matrix.shard == 1
         run: .venv/bin/ruff format --check src/ tests/
       - name: Test
-        run: .venv/bin/pytest tests/courts/ -n auto -v --tb=short
+        run: >-
+          .venv/bin/pytest ${{ matrix.test-paths }}
+          -n auto -v --tb=short --durations=30
       - name: Upload coverage
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: coverage-scraper-courts
+          name: coverage-scraper-courts-${{ matrix.shard }}
           path: packages/scraper-framework/coverage.xml
       - name: Upload to Codecov
         if: always() && hashFiles('packages/scraper-framework/coverage.xml') != ''
@@ -208,7 +245,7 @@ jobs:
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: packages/scraper-framework/coverage.xml
-          flags: scraper-courts
+          flags: scraper-courts-${{ matrix.shard }}
           fail_ci_if_error: false
 
   ingestion-tests:
@@ -250,7 +287,7 @@ jobs:
           tests/test_reingest_registry.py
           tests/test_ingestion.py
           tests/test_extract.py
-          -n auto -v --tb=short
+          -n auto -v --tb=short --durations=30
       - name: Upload coverage
         if: always()
         uses: actions/upload-artifact@v7
@@ -639,12 +676,13 @@ jobs:
         if: needs.detect-changes.outputs.scraper == 'true'
         run: |
           COV_FRAMEWORK="coverage-artifacts/coverage-scraper-framework/coverage.xml"
-          COV_COURTS="coverage-artifacts/coverage-scraper-courts/coverage.xml"
+          COV_COURTS_1="coverage-artifacts/coverage-scraper-courts-1/coverage.xml"
+          COV_COURTS_2="coverage-artifacts/coverage-scraper-courts-2/coverage.xml"
           COV_INGEST="coverage-artifacts/coverage-scraper-ingestion/coverage.xml"
           COV_FILES=""
-          if [ -f "$COV_FRAMEWORK" ]; then COV_FILES="$COV_FRAMEWORK"; fi
-          if [ -f "$COV_COURTS" ]; then COV_FILES="$COV_FILES $COV_COURTS"; fi
-          if [ -f "$COV_INGEST" ]; then COV_FILES="$COV_FILES $COV_INGEST"; fi
+          for f in "$COV_FRAMEWORK" "$COV_COURTS_1" "$COV_COURTS_2" "$COV_INGEST"; do
+            if [ -f "$f" ]; then COV_FILES="$COV_FILES $f"; fi
+          done
           if [ -n "$COV_FILES" ]; then
             diff-cover $COV_FILES --compare-branch=origin/main --fail-under=90 --diff-range-notation='..'
           else
@@ -707,7 +745,8 @@ jobs:
       - name: Coverage floor ratchet — scraper-framework
         if: needs.detect-changes.outputs.scraper == 'true'
         run: |
-          # Merge coverage from all three split scraper test jobs.
+          # Merge coverage from all split scraper test jobs (framework,
+          # court shard 1, court shard 2, ingestion).
           # Uses separate baselines for partial vs full runs:
           #   - "packages/scraper-framework" (combined) when ALL three test
           #     jobs (framework, courts, ingestion) produced coverage
@@ -716,20 +755,26 @@ jobs:
           #     framework-only changes)
           COV_ARGS=""
           COV_FRAMEWORK="coverage-artifacts/coverage-scraper-framework/coverage.xml"
-          COV_COURTS="coverage-artifacts/coverage-scraper-courts/coverage.xml"
+          COV_COURTS_1="coverage-artifacts/coverage-scraper-courts-1/coverage.xml"
+          COV_COURTS_2="coverage-artifacts/coverage-scraper-courts-2/coverage.xml"
           COV_INGEST="coverage-artifacts/coverage-scraper-ingestion/coverage.xml"
           HAS_ANY=false
-          for f in "$COV_FRAMEWORK" "$COV_COURTS" "$COV_INGEST"; do
+          HAS_COURTS=false
+          for f in "$COV_FRAMEWORK" "$COV_COURTS_1" "$COV_COURTS_2" "$COV_INGEST"; do
             if [ -f "$f" ]; then
               COV_ARGS="$COV_ARGS --coverage-file $f"
               HAS_ANY=true
             fi
           done
+          # Check if either court shard produced coverage
+          if [ -f "$COV_COURTS_1" ] || [ -f "$COV_COURTS_2" ]; then
+            HAS_COURTS=true
+          fi
           if [ "$HAS_ANY" = "false" ]; then
             echo "No coverage artifacts found — skipping floor ratchet"
             exit 0
           fi
-          if [ ! -f "$COV_COURTS" ] && [ ! -f "$COV_FRAMEWORK" ]; then
+          if [ "$HAS_COURTS" = "false" ] && [ ! -f "$COV_FRAMEWORK" ]; then
             echo "Neither framework nor court coverage available — skipping"
             exit 0
           fi
@@ -739,7 +784,7 @@ jobs:
           # (e.g. courts-only or framework-only changes), use the
           # partial baseline to avoid false failures.
           BASELINE_KEY="packages/scraper-framework"
-          if [ -f "$COV_FRAMEWORK" ] && [ -f "$COV_COURTS" ] && [ -f "$COV_INGEST" ]; then
+          if [ -f "$COV_FRAMEWORK" ] && [ "$HAS_COURTS" = "true" ] && [ -f "$COV_INGEST" ]; then
             echo "All test jobs ran — enforcing combined baseline"
           else
             BASELINE_KEY="packages/scraper-framework:framework-only"

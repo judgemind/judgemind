@@ -20,11 +20,12 @@ Example:
         --package packages/scraper-framework \
         --coverage-file packages/scraper-framework/coverage.xml
 
-    # Merge split scraper test coverage:
+    # Merge split scraper test coverage (courts are split into two shards):
     scripts/update-coverage-baselines.py \
         --package packages/scraper-framework \
         --coverage-file coverage-artifacts/coverage-scraper-framework/coverage.xml \
-        --coverage-file coverage-artifacts/coverage-scraper-courts/coverage.xml \
+        --coverage-file coverage-artifacts/coverage-scraper-courts-1/coverage.xml \
+        --coverage-file coverage-artifacts/coverage-scraper-courts-2/coverage.xml \
         --coverage-file coverage-artifacts/coverage-scraper-ingestion/coverage.xml
 
     # Use a different baseline key for partial runs (framework-only, no courts):
