@@ -1035,6 +1035,15 @@ class TestResolveJudge:
         with pytest.raises(RuntimeError, match="resolve_judge"):
             resolve_judge(conn, "John Smith", "court-1")
 
+    def test_lookup_uses_case_insensitive_match(self) -> None:
+        """Verify alias lookup uses LOWER() for case-insensitive matching (#1453)."""
+        conn = _mock_conn()
+        cur = conn.cursor.return_value.__enter__.return_value
+        cur.fetchone.return_value = ("existing-judge-id",)
+        resolve_judge(conn, "HON. JOHN SMITH", "court-1")
+        sql = cur.execute.call_args_list[0][0][0]
+        assert "LOWER" in sql
+
 
 # ---------------------------------------------------------------------------
 # upsert_case_judge
