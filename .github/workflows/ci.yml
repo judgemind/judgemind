@@ -641,6 +641,8 @@ jobs:
         run: scripts/tests/test_adopt_pr.sh
       - name: Test oneshot repo-path checker
         run: scripts/tests/test_check_oneshot_repo_paths.sh
+      - name: Test run-scraper.sh
+        run: scripts/tests/test_run_scraper.sh
 
   # ---------------------------------------------------------------
   # Coverage gates: diff coverage (new lines) + overall floor ratchet
