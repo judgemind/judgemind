@@ -236,37 +236,45 @@ def run_backfill(conn: psycopg.Connection, *, dry_run: bool = True) -> dict[str,
                     if not dry_run:
                         for party in parties:
                             with conn.cursor() as cur:
-                                # Upsert party
+                                # Find or create party by canonical_name
                                 cur.execute(
-                                    """
-                                    INSERT INTO parties (canonical_name, party_type)
-                                    VALUES (%s, 'unknown')
-                                    ON CONFLICT (canonical_name) DO UPDATE
-                                        SET updated_at = NOW()
-                                    RETURNING id
-                                    """,
+                                    "SELECT id FROM parties "
+                                    "WHERE canonical_name = %s LIMIT 1",
                                     (party["name"],),
                                 )
                                 party_row = cur.fetchone()
                                 if party_row:
                                     party_id = str(party_row[0])
-                                    # Link party to case
+                                else:
                                     cur.execute(
-                                        """
-                                        INSERT INTO case_parties (case_id, party_id, role)
-                                        VALUES (%s::uuid, %s::uuid, %s)
-                                        ON CONFLICT (case_id, party_id, role) DO NOTHING
-                                        """,
-                                        (case_id, party_id, party["role"]),
+                                        "INSERT INTO parties (canonical_name, party_type) "
+                                        "VALUES (%s, 'unknown') RETURNING id",
+                                        (party["name"],),
                                     )
-                                    # Add alias
+                                    party_id = str(cur.fetchone()[0])
+
+                                # Link party to case
+                                cur.execute(
+                                    """
+                                    INSERT INTO case_parties (case_id, party_id, role)
+                                    VALUES (%s::uuid, %s::uuid, %s)
+                                    ON CONFLICT (case_id, party_id, role) DO NOTHING
+                                    """,
+                                    (case_id, party_id, party["role"]),
+                                )
+                                # Add alias (skip if one already exists
+                                # for this party with the same raw_name)
+                                cur.execute(
+                                    "SELECT 1 FROM party_aliases "
+                                    "WHERE party_id = %s::uuid "
+                                    "AND LOWER(raw_name) = LOWER(%s) LIMIT 1",
+                                    (party_id, party["name"]),
+                                )
+                                if not cur.fetchone():
                                     cur.execute(
-                                        """
-                                        INSERT INTO party_aliases (party_id, raw_name, source,
-                                                                   confidence, is_verified)
-                                        VALUES (%s::uuid, %s, 'backfill', 1.0, FALSE)
-                                        ON CONFLICT DO NOTHING
-                                        """,
+                                        "INSERT INTO party_aliases "
+                                        "(party_id, raw_name, source, confidence, is_verified) "
+                                        "VALUES (%s::uuid, %s, 'backfill', 1.0, FALSE)",
                                         (party_id, party["name"]),
                                     )
                     stats["parties_added"] += len(parties)
