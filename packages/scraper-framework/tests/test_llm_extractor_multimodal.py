@@ -531,6 +531,137 @@ class TestMultimodalTokenUsage:
 
 
 # ---------------------------------------------------------------------------
+# Retry and error handling in _extract_images
+# ---------------------------------------------------------------------------
+
+
+class TestExtractImagesRetry:
+    """Tests for retry and error handling in the multimodal image extraction path."""
+
+    def test_retries_on_none_response(self, sample_pdf_bytes: bytes) -> None:
+        """When LLM returns None, retries before giving up."""
+        with patch.object(anthropic, "Anthropic"):
+            ext = LlmExtractor(api_key="test-key")
+        ext._base_delay = 0.01
+        ext._max_retries = 3
+
+        mock_response = _make_llm_response(SINGLE_RULING_JSON)
+        # First two calls return None, third succeeds.
+        with (
+            patch(
+                "framework.llm_extractor._render_pdf_pages",
+                return_value=[(b"\x89PNG_fake", "image/png")],
+            ),
+            patch(
+                "ingestion.llm_providers.call_llm_with_images",
+                side_effect=[None, None, mock_response],
+            ) as mock_call,
+        ):
+            rulings = ext.extract_from_pdf(sample_pdf_bytes)
+
+        assert len(rulings) == 1
+        assert mock_call.call_count == 3
+
+    def test_exhausts_retries_on_none_response(self, sample_pdf_bytes: bytes) -> None:
+        """When all retries return None, returns empty list."""
+        with patch.object(anthropic, "Anthropic"):
+            ext = LlmExtractor(api_key="test-key")
+        ext._base_delay = 0.01
+        ext._max_retries = 2
+
+        with (
+            patch(
+                "framework.llm_extractor._render_pdf_pages",
+                return_value=[(b"\x89PNG_fake", "image/png")],
+            ),
+            patch(
+                "ingestion.llm_providers.call_llm_with_images",
+                return_value=None,
+            ),
+        ):
+            rulings = ext.extract_from_pdf(sample_pdf_bytes)
+
+        assert rulings == []
+
+    def test_retries_on_exception(self, sample_pdf_bytes: bytes) -> None:
+        """When LLM call raises an exception, retries before giving up."""
+        with patch.object(anthropic, "Anthropic"):
+            ext = LlmExtractor(api_key="test-key")
+        ext._base_delay = 0.01
+        ext._max_retries = 3
+
+        mock_response = _make_llm_response(SINGLE_RULING_JSON)
+        with (
+            patch(
+                "framework.llm_extractor._render_pdf_pages",
+                return_value=[(b"\x89PNG_fake", "image/png")],
+            ),
+            patch(
+                "ingestion.llm_providers.call_llm_with_images",
+                side_effect=[RuntimeError("network"), RuntimeError("timeout"), mock_response],
+            ) as mock_call,
+        ):
+            rulings = ext.extract_from_pdf(sample_pdf_bytes)
+
+        assert len(rulings) == 1
+        assert mock_call.call_count == 3
+
+    def test_exhausts_retries_on_exception(self, sample_pdf_bytes: bytes) -> None:
+        """When all retries raise exceptions, returns empty list."""
+        with patch.object(anthropic, "Anthropic"):
+            ext = LlmExtractor(api_key="test-key")
+        ext._base_delay = 0.01
+        ext._max_retries = 2
+
+        with (
+            patch(
+                "framework.llm_extractor._render_pdf_pages",
+                return_value=[(b"\x89PNG_fake", "image/png")],
+            ),
+            patch(
+                "ingestion.llm_providers.call_llm_with_images",
+                side_effect=RuntimeError("persistent failure"),
+            ),
+        ):
+            rulings = ext.extract_from_pdf(sample_pdf_bytes)
+
+        assert rulings == []
+
+
+# ---------------------------------------------------------------------------
+# _build_user_message_for_images
+# ---------------------------------------------------------------------------
+
+
+class TestBuildUserMessageForImages:
+    """Tests for the image extraction text message builder."""
+
+    def test_no_metadata(self) -> None:
+        """Without metadata, produces a generic extraction message."""
+        msg = LlmExtractor._build_user_message_for_images(None)
+        assert "Extract ALL structured fields" in msg
+
+    def test_with_all_metadata(self) -> None:
+        """With all metadata keys, includes them in the message."""
+        msg = LlmExtractor._build_user_message_for_images(
+            {
+                "judge_name": "Test Judge",
+                "department": "D99",
+                "hearing_date": "2026-03-01",
+            }
+        )
+        assert "Test Judge" in msg
+        assert "D99" in msg
+        assert "2026-03-01" in msg
+        assert "Extract ALL structured fields" in msg
+
+    def test_with_hearing_date_only(self) -> None:
+        """With only hearing_date, includes it in the message."""
+        msg = LlmExtractor._build_user_message_for_images({"hearing_date": "2026-04-15"})
+        assert "2026-04-15" in msg
+
+
+# ---------------------------------------------------------------------------
 # ExtractedRuling ruling_text field
 # ---------------------------------------------------------------------------
 
