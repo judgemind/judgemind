@@ -64,7 +64,6 @@ _EXCLUDED_SCRIPTS: set[str] = {
 # validation test so they surface visually but don't block CI.
 # Each entry maps a script name to the reason for the drift.
 _KNOWN_SCHEMA_DRIFT: dict[str, str] = {
-    "backfill_css_inlining": "uses d.content_format instead of d.format",
     "dedup_split_rulings": "uses r.ruling_text_hash which is not in schema.sql",
 }
 

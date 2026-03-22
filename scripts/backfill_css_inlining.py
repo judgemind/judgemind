@@ -52,7 +52,7 @@ logger = logging.getLogger(__name__)
 FETCH_QUERY = """
     SELECT d.id, d.s3_key, d.s3_bucket, d.source_url
     FROM documents d
-    WHERE d.content_format = 'html'
+    WHERE d.format = 'html'
       AND d.s3_key IS NOT NULL
       AND d.id > %s
     ORDER BY d.id
@@ -62,7 +62,7 @@ FETCH_QUERY = """
 FETCH_QUERY_WITH_COUNTY = """
     SELECT d.id, d.s3_key, d.s3_bucket, d.source_url
     FROM documents d
-    WHERE d.content_format = 'html'
+    WHERE d.format = 'html'
       AND d.s3_key IS NOT NULL
       AND d.county = %s
       AND d.id > %s
@@ -73,14 +73,14 @@ FETCH_QUERY_WITH_COUNTY = """
 COUNT_QUERY = """
     SELECT COUNT(*)
     FROM documents d
-    WHERE d.content_format = 'html'
+    WHERE d.format = 'html'
       AND d.s3_key IS NOT NULL
 """
 
 COUNT_QUERY_WITH_COUNTY = """
     SELECT COUNT(*)
     FROM documents d
-    WHERE d.content_format = 'html'
+    WHERE d.format = 'html'
       AND d.s3_key IS NOT NULL
       AND d.county = %s
 """
@@ -239,7 +239,13 @@ def run_backfill(
 
             for doc_id, s3_key, s3_bucket, source_url in rows:
                 result = process_document(
-                    s3_client, http_client, doc_id, s3_key, s3_bucket, source_url, dry_run
+                    s3_client,
+                    http_client,
+                    doc_id,
+                    s3_key,
+                    s3_bucket,
+                    source_url,
+                    dry_run,
                 )
                 stats["total_processed"] += 1
 
