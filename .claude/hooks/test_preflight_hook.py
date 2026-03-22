@@ -13,9 +13,11 @@ import os
 import subprocess
 import sys
 
-# Resolve the hook relative to this test file's location.
+# Resolve paths relative to this test file's location.
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 HOOK = os.path.join(SCRIPT_DIR, "preflight-bash.sh")
+# Derive the repo root (two levels up from .claude/hooks/)
+REPO_ROOT = os.path.dirname(os.path.dirname(SCRIPT_DIR))
 
 passed = 0
 failed = 0
@@ -252,14 +254,14 @@ run_test(
     ".venv/bin/pytest tests/ -v",
     0,
     run_in_background=True,
-    cwd_override="/Users/drewthaler/judgemind/judgemind-bootstrap",
+    cwd_override=REPO_ROOT,
 )
 run_test(
     "gh run watch with run_in_background=true allowed (main repo)",
     "gh run watch 12345 --interval 60",
     0,
     run_in_background=True,
-    cwd_override="/Users/drewthaler/judgemind/judgemind-bootstrap",
+    cwd_override=REPO_ROOT,
 )
 
 # Commands that should NOT trigger the timeout check
@@ -292,8 +294,8 @@ run_test(
 # --- Check 9: run_in_background inside worktree subagents ---
 print("\nCheck 9: run_in_background inside worktree subagents")
 
-WORKTREE_CWD = "/Users/drewthaler/judgemind/judgemind-bootstrap/.claude/worktrees/agent-abc123"
-MAIN_REPO_CWD = "/Users/drewthaler/judgemind/judgemind-bootstrap"
+MAIN_REPO_CWD = REPO_ROOT
+WORKTREE_CWD = os.path.join(REPO_ROOT, ".claude/worktrees/agent-abc123")
 
 # Commands with run_in_background=true inside a worktree — should be BLOCKED
 run_test(
@@ -331,7 +333,7 @@ run_test(
     "echo test",
     2,
     run_in_background=True,
-    cwd_override="/Users/drewthaler/judgemind/judgemind-bootstrap/.claude/worktrees/worker-3",
+    cwd_override=os.path.join(REPO_ROOT, ".claude/worktrees/worker-3"),
 )
 
 # Commands with run_in_background=true from main repo — should be ALLOWED
