@@ -18,28 +18,18 @@ import re
 
 from courts.ca.la_tentatives import (
     _DEPT_HEADER_BOILERPLATE_RE,
-    _ENTITY_DESCRIPTOR_RE,
     _MAX_TITLE_LENGTH,
-    _MOVING_PARTY_RE,
-    _RESPONDING_PARTY_RE,
-    _ROLE_PREFIX_RE,
 )
-
-# ---------------------------------------------------------------------------
-# Caption block extraction patterns (not in la_tentatives.py, which uses a
-# different _CASE_TITLE_RE regex for structured anchor-based extraction).
-# These patterns work against plain-text ruling content.
-# ---------------------------------------------------------------------------
-
-P_ROLE_RE = re.compile(
-    r"(?:^|\n)\s*(?:Plaintiff|Petitioner|Cross-Complainant)\(?s?\)?\s*[,.\n)]",
-    re.MULTILINE,
+from framework.la_parser_utils import (
+    D_ROLE_RE,
+    ENTITY_DESCRIPTOR_RE,
+    MOVING_PARTY_RE,
+    P_ROLE_RE,
+    RESPONDING_PARTY_RE,
+    ROLE_PREFIX_RE,
+    SKIP_RESPONDING_PHRASES,
+    VS_RE,
 )
-D_ROLE_RE = re.compile(
-    r"(?:^|\n)\s*(?:Defendant|Respondent|Cross-Defendant)\(?s?\)?\s*[,.\n)]",
-    re.MULTILINE,
-)
-VS_RE = re.compile(r"\bv(?:s)?\.", re.IGNORECASE)
 
 
 def clean_name(raw: str) -> str:
@@ -50,7 +40,7 @@ def clean_name(raw: str) -> str:
     descriptor stripping to ``_sanitize_title``).
     """
     name = " ".join(raw.split()).strip()
-    name = _ENTITY_DESCRIPTOR_RE.sub("", name).strip()
+    name = ENTITY_DESCRIPTOR_RE.sub("", name).strip()
     name = re.sub(r"[;,]\s*$", "", name).strip()
     name = re.sub(r"\s+And\s*$", "", name, flags=re.IGNORECASE).strip()
     name = re.sub(r",?\s*Et\.?\s*Al\.?\s*$", ", et al.", name, flags=re.IGNORECASE).strip()
@@ -120,23 +110,22 @@ def extract_title_from_moving_responding(
         max_length: Maximum allowed title length.  Defaults to
             ``_MAX_TITLE_LENGTH`` (120).
     """
-    m_match = _MOVING_PARTY_RE.search(ruling_text)
+    m_match = MOVING_PARTY_RE.search(ruling_text)
     if m_match is None:
         return None
-    r_match = _RESPONDING_PARTY_RE.search(ruling_text)
+    r_match = RESPONDING_PARTY_RE.search(ruling_text)
     if r_match is None:
         return None
 
     moving_raw = m_match.group("name").strip()
     responding_raw = r_match.group("name").strip()
 
-    skip_phrases = ("no opposition", "none", "no response", "unopposed")
-    for phrase in skip_phrases:
+    for phrase in SKIP_RESPONDING_PHRASES:
         if phrase in responding_raw.lower():
             return None
 
-    moving = clean_name(_ROLE_PREFIX_RE.sub("", moving_raw))
-    responding = clean_name(_ROLE_PREFIX_RE.sub("", responding_raw))
+    moving = clean_name(ROLE_PREFIX_RE.sub("", moving_raw))
+    responding = clean_name(ROLE_PREFIX_RE.sub("", responding_raw))
 
     if not moving or not responding:
         return None
