@@ -211,15 +211,19 @@ export function RulingsFeed() {
         />
         <input
           type="date"
+          name="dateFrom"
           value={dateFrom}
           onChange={(e) => setDateFrom(e.target.value)}
+          aria-label="Hearings from"
           title="Hearings from"
           className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900 focus:border-brand-500 focus:outline-none focus:ring-1 focus:ring-brand-500 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100"
         />
         <input
           type="date"
+          name="dateTo"
           value={dateTo}
           onChange={(e) => setDateTo(e.target.value)}
+          aria-label="Hearings to"
           title="Hearings to"
           className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900 focus:border-brand-500 focus:outline-none focus:ring-1 focus:ring-brand-500 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100"
         />

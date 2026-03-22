@@ -71,6 +71,11 @@ describe('Header', () => {
     expect(screen.getByText('Rulings')).toBeInTheDocument();
   });
 
+  it('has aria-label on nav element', () => {
+    render(<Header />);
+    expect(screen.getByRole('navigation', { name: 'Main' })).toBeInTheDocument();
+  });
+
   it('renders dark mode toggle', () => {
     render(<Header />);
     const toggleBtn = screen.getByLabelText('Toggle dark mode');

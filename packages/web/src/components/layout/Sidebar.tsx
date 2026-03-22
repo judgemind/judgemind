@@ -19,10 +19,10 @@ export function Sidebar({ onLinkClick }: SidebarProps) {
   const isAdmin = !loading && user?.role === 'admin';
 
   return (
-    <nav className="flex flex-col gap-1 p-4 text-sm">
-      <p className="mb-1 px-3 text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+    <nav aria-label="Sidebar" className="flex flex-col gap-1 p-4 text-sm">
+      <h2 className="mb-1 px-3 text-xs font-semibold uppercase tracking-wider text-muted-foreground">
         Explore
-      </p>
+      </h2>
       <SidebarLink
         href="/search"
         icon={<Search className="h-4 w-4" />}
@@ -42,9 +42,9 @@ export function Sidebar({ onLinkClick }: SidebarProps) {
 
       <Separator className="my-3" />
 
-      <p className="mb-1 px-3 text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+      <h2 className="mb-1 px-3 text-xs font-semibold uppercase tracking-wider text-muted-foreground">
         Research
-      </p>
+      </h2>
       <SidebarLink
         href="/cases"
         icon={<FolderOpen className="h-4 w-4" />}
@@ -65,9 +65,9 @@ export function Sidebar({ onLinkClick }: SidebarProps) {
       {isAdmin && (
         <>
           <Separator className="my-3" />
-          <p className="mb-1 px-3 text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+          <h2 className="mb-1 px-3 text-xs font-semibold uppercase tracking-wider text-muted-foreground">
             Admin
-          </p>
+          </h2>
           <SidebarLink
             href="/admin/data-quality/"
             icon={<BarChart3 className="h-4 w-4" />}
@@ -85,7 +85,7 @@ export function Sidebar({ onLinkClick }: SidebarProps) {
 /** Wraps the Sidebar in the desktop aside container. Used by the root layout. */
 export function DesktopSidebar() {
   return (
-    <aside className="sticky top-14 hidden h-[calc(100vh-3.5rem)] w-56 shrink-0 border-r bg-muted/40 lg:block">
+    <aside aria-label="Sidebar navigation" className="sticky top-14 hidden h-[calc(100vh-3.5rem)] w-56 shrink-0 border-r bg-muted/40 lg:block">
       <Sidebar />
     </aside>
   );

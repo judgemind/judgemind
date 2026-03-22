@@ -620,7 +620,7 @@ export function SearchPage() {
       {/* Main content: sidebar filters + results */}
       <div className="mt-6 flex gap-6">
         {/* Desktop filter sidebar */}
-        <aside className="hidden w-64 shrink-0 lg:block">
+        <aside aria-label="Search filters" className="hidden w-64 shrink-0 lg:block">
           <Card>
             <CardContent className="p-4">
               <FilterContent {...filterProps} />

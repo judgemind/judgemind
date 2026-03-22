@@ -45,4 +45,17 @@ describe('Sidebar', () => {
     const rulingsLink = screen.getByText('Latest Rulings');
     expect(rulingsLink.closest('a')).toHaveAttribute('href', '/rulings');
   });
+
+  it('has aria-label on nav element', () => {
+    render(<Sidebar />);
+    expect(screen.getByRole('navigation', { name: 'Sidebar' })).toBeInTheDocument();
+  });
+
+  it('renders section labels as headings', () => {
+    render(<Sidebar />);
+    const headings = screen.getAllByRole('heading', { level: 2 });
+    const headingTexts = headings.map((h) => h.textContent);
+    expect(headingTexts).toContain('Explore');
+    expect(headingTexts).toContain('Research');
+  });
 });

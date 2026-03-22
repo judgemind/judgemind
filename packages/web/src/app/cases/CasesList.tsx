@@ -165,12 +165,15 @@ export function CasesList() {
       <div className="mb-4 flex flex-wrap gap-3">
         <Input
           type="text"
+          name="caseFilter"
           placeholder="Case number or title"
           value={caseNumberFilter}
           onChange={(e) => setCaseNumberFilter(e.target.value)}
           className="w-auto"
+          aria-label="Case number or title"
         />
         <select
+          name="caseStatus"
           value={statusFilter}
           onChange={(e) => setStatusFilter(e.target.value)}
           aria-label="Case status"
@@ -182,6 +185,7 @@ export function CasesList() {
           <option value="dismissed">Dismissed</option>
         </select>
         <select
+          name="caseType"
           value={typeFilter}
           onChange={(e) => setTypeFilter(e.target.value)}
           aria-label="Case type"

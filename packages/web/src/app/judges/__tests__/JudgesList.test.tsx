@@ -234,6 +234,19 @@ describe('JudgesList', () => {
     ).toBeInTheDocument();
   });
 
+  it('filter input has name attribute', () => {
+    mockUseQuery.mockReturnValue({
+      data: MOCK_JUDGES_DATA,
+      loading: false,
+      error: undefined,
+      fetchMore: vi.fn(),
+    });
+
+    render(<JudgesList />);
+    const input = screen.getByLabelText(/Judge name/i);
+    expect(input).toHaveAttribute('name', 'judgeName');
+  });
+
   it('filters judges client-side by name', () => {
     mockUseQuery.mockReturnValue({
       data: MOCK_JUDGES_DATA,
