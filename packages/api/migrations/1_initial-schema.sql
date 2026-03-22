@@ -87,6 +87,10 @@ CREATE TABLE attorney_aliases (
 -- CANONICAL ENTITIES — PARTIES
 -- =============================================================================
 
+-- NOTE: `parties` is the party *entity* table (one row per unique person/org).
+-- It has NO `case_id` column.  To find parties for a case, use the
+-- `case_parties` junction table below.  See docs/agent/db-schema-reference.md
+-- for the full explanation and correct JOIN patterns.
 CREATE TABLE parties (
     id              UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
     canonical_name  TEXT        NOT NULL,
@@ -144,6 +148,9 @@ CREATE TABLE case_attorneys (
     withdrew_at DATE
 );
 
+-- Junction table linking cases to parties.  This is where `case_id` lives —
+-- NOT on the `parties` entity table.  UNIQUE(case_id, party_id, role) added
+-- in migration 7.
 CREATE TABLE case_parties (
     id          UUID    PRIMARY KEY DEFAULT gen_random_uuid(),
     case_id     UUID    NOT NULL REFERENCES cases(id) ON DELETE CASCADE,
