@@ -5,7 +5,9 @@
 -- LOWER(canonical_name), PostgreSQL must perform a full sort of all matched rows.
 -- This index allows PostgreSQL to use an index scan for the ORDER BY / DISTINCT ON.
 --
+-- ~1,400 rows — no need for CONCURRENTLY; runs in the migration transaction.
+--
 -- See: #1504, #1434
 
-CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_parties_canonical_name_lower
+CREATE INDEX IF NOT EXISTS idx_parties_canonical_name_lower
     ON parties(LOWER(canonical_name));
