@@ -15,7 +15,7 @@
 
 ## Web Frontend (Vercel)
 
-The Next.js web app (`packages/web/`) is deployed on **Vercel** with automatic Git-based deployments. Vercel watches the `judgemind/judgemind` repo and deploys on every push to `main` (production) and on every PR branch (preview).
+The Next.js web app (`packages/web/`) is deployed on **Vercel** with automatic Git-based deployments. Vercel watches the `judgemind/judgemind` repo and deploys when `packages/web/` changes on push to `main` (production) or any PR branch (preview). Non-web commits (scrapers, infra, docs) are automatically skipped via the Vercel `ignore_command` in Terraform.
 
 **Infrastructure:** managed by Terraform module `vercel-web` in `infra/terraform/environments/hosting/`. The Vercel API token is stored in Secrets Manager at `judgemind/vercel/api-token`.
 
@@ -23,13 +23,26 @@ The Next.js web app (`packages/web/`) is deployed on **Vercel** with automatic G
 
 | Environment | URL | Vercel project | Trigger |
 |---|---|---|---|
-| Dev | `dev.judgemind.org` | `judgemind-web-dev` | Push to `main` |
-| Preview | `*.vercel.app` (auto-generated) | `judgemind-web-dev` | Push to any PR branch |
+| Dev | `dev.judgemind.org` | `judgemind-web-dev` | Push to `main` (only when `packages/web/` changed) |
+| Preview | `*.vercel.app` (auto-generated) | `judgemind-web-dev` | Push to any PR branch (only when `packages/web/` changed) |
 
 **Environment variables** (set in Vercel project, managed by Terraform):
 - `NEXT_PUBLIC_GRAPHQL_URL` = `https://dev.api.judgemind.org/graphql`
 
-**Checking deploy status:**
+**Checking deploy status (preferred — use `gh run watch`):**
+```
+# Watch the Vercel deploy status workflow (standard agent pattern)
+gh run list --repo judgemind/judgemind --workflow vercel-deploy-status.yml --branch main --limit 1 --json databaseId -q '.[0].databaseId'
+gh run watch <run-id> --repo judgemind/judgemind --interval 60 --exit-status --compact
+```
+
+The `vercel-deploy-status.yml` GitHub Action runs on every push to `main`. It detects whether `packages/web/` changed:
+- **Web changed:** polls the Vercel Deployments API until the deploy completes, then exits with success/failure.
+- **No web changes:** exits immediately with success (so the workflow stays green).
+
+This lets agents use the standard `gh run watch` pattern instead of polling the Vercel API in a loop.
+
+**Fallback (manual check):**
 ```
 # List recent deployments (requires Vercel CLI: npm i -g vercel)
 vercel list judgemind-web-dev --token "$VERCEL_API_TOKEN"
@@ -37,8 +50,6 @@ vercel list judgemind-web-dev --token "$VERCEL_API_TOKEN"
 # Or check from the Vercel dashboard:
 # https://vercel.com/judgemind2026-7926s-projects/judgemind-web-dev/deployments
 ```
-
-There is **no GitHub Actions deploy workflow** for the web frontend — Vercel handles deployments directly via its GitHub App integration. The `deploy-production.yml` workflow is for the scraper (ECS), not the web app. To check whether a frontend deploy succeeded after merging to `main`, check the Vercel dashboard or the commit status checks on the merge commit (Vercel posts deployment status as a GitHub commit status).
 
 ## Terraform
 

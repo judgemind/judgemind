@@ -154,4 +154,5 @@ module "vercel_web" {
   environment   = var.environment
   custom_domain = "dev.judgemind.org"
   graphql_url   = "https://dev.api.judgemind.org/graphql"
+  site_url      = "https://dev.judgemind.org"
 }

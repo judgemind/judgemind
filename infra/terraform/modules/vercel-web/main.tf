@@ -25,6 +25,10 @@ resource "vercel_project" "web" {
   # Monorepo: Next.js app lives in packages/web/
   root_directory = "packages/web"
 
+  # Skip builds when packages/web/ hasn't changed (saves build minutes for
+  # non-web commits like scrapers, infra, docs).
+  ignore_command = "git diff HEAD^ HEAD --quiet -- ."
+
   git_repository = {
     type = "github"
     repo = var.github_repo

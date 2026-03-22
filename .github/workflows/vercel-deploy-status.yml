@@ -1,0 +1,173 @@
+name: Vercel Deploy Status
+
+# Provides a GitHub Actions run that agents can `gh run watch` to track
+# Vercel deployments, instead of polling the Vercel API in a loop.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  statuses: write
+
+concurrency:
+  group: vercel-deploy-status-${{ github.sha }}
+  cancel-in-progress: true
+
+jobs:
+  check-web-changes:
+    name: Check for web changes
+    runs-on: ubuntu-latest
+    outputs:
+      web_changed: ${{ steps.changes.outputs.web }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 2
+      - uses: dorny/paths-filter@v4
+        id: changes
+        with:
+          filters: |
+            web:
+              - 'packages/web/**'
+
+  wait-for-vercel:
+    name: Wait for Vercel Deploy
+    needs: check-web-changes
+    runs-on: ubuntu-latest
+    if: needs.check-web-changes.outputs.web_changed == 'true'
+
+    steps:
+      - name: Set pending status
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          curl -s -X POST \
+            -H "Authorization: token $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/statuses/${{ github.sha }}" \
+            -d '{
+              "state": "pending",
+              "description": "Waiting for Vercel deployment...",
+              "context": "deploy/vercel-web"
+            }'
+
+      - name: Wait for Vercel deployment
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_API_TOKEN }}
+          VERCEL_PROJECT: judgemind-web-dev
+          VERCEL_TEAM_SLUG: judgemind2026-7926s-projects
+          COMMIT_SHA: ${{ github.sha }}
+        run: |
+          echo "Waiting for Vercel deployment for commit ${COMMIT_SHA}..."
+
+          MAX_ATTEMPTS=60
+          POLL_INTERVAL=15
+          ATTEMPT=0
+
+          while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
+            ATTEMPT=$((ATTEMPT + 1))
+            echo "Poll attempt $ATTEMPT / $MAX_ATTEMPTS"
+
+            # Query Vercel deployments API for this commit
+            RESPONSE=$(curl -s \
+              -H "Authorization: Bearer $VERCEL_TOKEN" \
+              "https://api.vercel.com/v6/deployments?projectId=$VERCEL_PROJECT&teamId=$VERCEL_TEAM_SLUG&meta-githubCommitSha=$COMMIT_SHA&limit=1")
+
+            # Check if we got a deployment
+            DEPLOY_STATE=$(echo "$RESPONSE" | python3 -c "
+          import sys, json
+          try:
+              data = json.load(sys.stdin)
+              deployments = data.get('deployments', [])
+              if not deployments:
+                  print('NOT_FOUND')
+              else:
+                  d = deployments[0]
+                  state = d.get('state', d.get('readyState', 'UNKNOWN'))
+                  print(state.upper())
+          except Exception:
+              print('ERROR')
+          " 2>/dev/null) || DEPLOY_STATE="ERROR"
+
+            DEPLOY_URL=$(echo "$RESPONSE" | python3 -c "
+          import sys, json
+          try:
+              data = json.load(sys.stdin)
+              deployments = data.get('deployments', [])
+              if deployments:
+                  print(deployments[0].get('url', ''))
+              else:
+                  print('')
+          except Exception:
+              print('')
+          " 2>/dev/null) || DEPLOY_URL=""
+
+            echo "Deployment state: $DEPLOY_STATE"
+
+            case "$DEPLOY_STATE" in
+              READY)
+                echo "Vercel deployment is READY at https://$DEPLOY_URL"
+                exit 0
+                ;;
+              ERROR|CANCELED)
+                echo "ERROR: Vercel deployment failed with state: $DEPLOY_STATE"
+                exit 1
+                ;;
+              NOT_FOUND|QUEUED|BUILDING|INITIALIZING)
+                echo "Deployment in progress ($DEPLOY_STATE), waiting ${POLL_INTERVAL}s..."
+                sleep $POLL_INTERVAL
+                ;;
+              *)
+                echo "Unknown state: $DEPLOY_STATE, waiting ${POLL_INTERVAL}s..."
+                sleep $POLL_INTERVAL
+                ;;
+            esac
+          done
+
+          echo "ERROR: Timed out waiting for Vercel deployment after $MAX_ATTEMPTS attempts"
+          exit 1
+
+      - name: Set final status
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DEPLOY_STATUS: ${{ job.status == 'success' && 'success' || 'failure' }}
+          DEPLOY_DESC: ${{ job.status == 'success' && 'Vercel deployment succeeded' || 'Vercel deployment failed' }}
+        run: |
+          curl -s -X POST \
+            -H "Authorization: token $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/statuses/${{ github.sha }}" \
+            -d "{
+              \"state\": \"$DEPLOY_STATUS\",
+              \"description\": \"$DEPLOY_DESC\",
+              \"context\": \"deploy/vercel-web\"
+            }"
+
+  skip-no-web-changes:
+    name: Vercel Deploy (skipped)
+    needs: check-web-changes
+    runs-on: ubuntu-latest
+    if: needs.check-web-changes.outputs.web_changed != 'true'
+
+    steps:
+      - name: No web changes — skip
+        run: |
+          echo "No changes in packages/web/ — Vercel deploy check skipped."
+
+      - name: Set skip status
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          curl -s -X POST \
+            -H "Authorization: token $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/statuses/${{ github.sha }}" \
+            -d '{
+              "state": "success",
+              "description": "No web changes — Vercel build skipped",
+              "context": "deploy/vercel-web"
+            }'
