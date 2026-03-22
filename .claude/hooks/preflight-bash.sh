@@ -21,6 +21,10 @@ if [ -z "$COMMAND" ]; then
     exit 0
 fi
 
+# Extract timeout and run_in_background for check 8 (long-running commands).
+TIMEOUT=$(echo "$INPUT" | python3 -c "import sys,json; d=json.load(sys.stdin); t=d.get('tool_input',{}).get('timeout'); print(t if t is not None else 'none')" 2>/dev/null)
+RUN_IN_BG=$(echo "$INPUT" | python3 -c "import sys,json; d=json.load(sys.stdin); print(str(d.get('tool_input',{}).get('run_in_background', False)).lower())" 2>/dev/null)
+
 # --- Forbidden pattern checks ---
 # Note: uses grep -E (POSIX extended regex) for macOS compatibility. Do NOT use grep -P.
 
@@ -118,6 +122,63 @@ if echo "$COMMAND" | grep -qE '\bterraform\b' ; then
         if echo "$COMMAND" | grep -qE 'infra/terraform' ; then
             if ! echo "$COMMAND" | grep -qE 'infra/terraform/environments/' ; then
                 echo "BLOCKED: terraform apply/destroy from root infra/terraform/ is forbidden. The root state creates duplicate resources. Use an environment-specific path: infra/terraform/environments/dev/ (or staging/production). See CLAUDE.md §Infrastructure Code." >&2
+                exit 2
+            fi
+        fi
+    fi
+fi
+
+# 8. Long-running commands without sufficient timeout.
+#    When timeout is missing or below 300000 (5 minutes), commands that typically
+#    exceed the default 2-minute timeout get auto-backgrounded by the platform,
+#    which violates the no-background rule for subagents and causes lost results.
+#    Skip this check if run_in_background is true (already background, no auto-bg).
+if [ "$RUN_IN_BG" != "true" ]; then
+    NEEDS_TIMEOUT=0
+
+    # pytest (any invocation)
+    if echo "$COMMAND" | grep -qE '\bpytest\b' ; then
+        NEEDS_TIMEOUT=1
+    fi
+    # gh run watch
+    if echo "$COMMAND" | grep -qE '\bgh\s+run\s+watch\b' ; then
+        NEEDS_TIMEOUT=1
+    fi
+    # pip install
+    if echo "$COMMAND" | grep -qE '\bpip\s+install\b' ; then
+        NEEDS_TIMEOUT=1
+    fi
+    # npm install (but not npm run or npm test)
+    if echo "$COMMAND" | grep -qE '\bnpm\s+install\b' ; then
+        NEEDS_TIMEOUT=1
+    fi
+    # npm run build
+    if echo "$COMMAND" | grep -qE '\bnpm\s+run\s+build\b' ; then
+        NEEDS_TIMEOUT=1
+    fi
+    # ruff check on large paths (src/, tests/, or .)
+    #   Match "src/" or "tests/" only as standalone directory args (followed by
+    #   space or end-of-line), not as prefixes of deeper paths like "src/foo.py".
+    if echo "$COMMAND" | grep -qE '\bruff\s+check\b' ; then
+        if echo "$COMMAND" | grep -qE '\bsrc/(\s|$)|\btests/(\s|$)|\s\.$' ; then
+            NEEDS_TIMEOUT=1
+        fi
+    fi
+    # terraform apply
+    if echo "$COMMAND" | grep -qE '\bterraform\b.*\bapply\b' ; then
+        NEEDS_TIMEOUT=1
+    fi
+
+    if [ "$NEEDS_TIMEOUT" -eq 1 ]; then
+        # Check if timeout is set and >= 300000
+        if [ "$TIMEOUT" = "none" ]; then
+            echo "BLOCKED: This command may exceed the default 2-minute timeout and get auto-backgrounded. Retry with timeout: 600000 (10 minutes). See CLAUDE.md §Critical Rules." >&2
+            exit 2
+        fi
+        # Check if timeout is a number and >= 300000
+        if echo "$TIMEOUT" | grep -qE '^[0-9]+$' ; then
+            if [ "$TIMEOUT" -lt 300000 ]; then
+                echo "BLOCKED: Timeout $TIMEOUT is too low for this long-running command (minimum 300000 / 5 minutes). Retry with timeout: 600000 (10 minutes). See CLAUDE.md §Critical Rules." >&2
                 exit 2
             fi
         fi
