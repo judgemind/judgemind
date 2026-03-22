@@ -8,6 +8,12 @@ import { ThemeProvider } from '@/providers/ThemeProvider';
 export const metadata: Metadata = {
   title: 'Judgemind — Legal Research Platform',
   description: 'Free, open-source California court ruling research and judge analytics.',
+  manifest: '/manifest.json',
+  openGraph: {
+    title: 'Judgemind — Legal Research Platform',
+    description: 'Free, open-source California court ruling research and judge analytics.',
+    images: [{ url: '/og-image.png', width: 1200, height: 630, alt: 'Judgemind' }],
+  },
 };
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
