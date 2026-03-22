@@ -276,6 +276,7 @@ EXTRACTION_SYSTEM_PROMPT = (
     '      "case_type": "civil" or null,\n'
     '      "outcome": "granted" or null,\n'
     '      "motion_type": "msj" or null,\n'
+    '      "ruling_text": "The motion for summary judgment is GRANTED..." or null,\n'
     '      "extracted_parties": [\n'
     '        {"name": "John Smith", "role": "plaintiff", "confidence": "high"},\n'
     '        {"name": "Jane Jones", "role": "defendant", "confidence": "high"}\n'
