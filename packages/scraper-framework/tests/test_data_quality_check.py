@@ -31,6 +31,7 @@ check_ingest_rates = dqc.check_ingest_rates
 check_scraper_staleness = dqc.check_scraper_staleness
 _calculate_stale_threshold = dqc._calculate_stale_threshold
 check_field_completeness = dqc.check_field_completeness
+check_orphaned_documents = dqc.check_orphaned_documents
 _query_field_completeness = dqc._query_field_completeness
 _collect_full_metrics = dqc._collect_full_metrics
 _format_metrics_for_snapshot = dqc._format_metrics_for_snapshot
@@ -47,6 +48,8 @@ _24h_overlaps_posting_day = dqc._24h_overlaps_posting_day
 MIN_FIELD_CHECK_SAMPLE_SIZE = dqc.MIN_FIELD_CHECK_SAMPLE_SIZE
 FIELD_COMPLETENESS_GRACE_MINUTES = dqc.FIELD_COMPLETENESS_GRACE_MINUTES
 FIELD_COMPLETENESS_WINDOW_DAYS = dqc.FIELD_COMPLETENESS_WINDOW_DAYS
+ORPHANED_DOCS_P1_THRESHOLD = dqc.ORPHANED_DOCS_P1_THRESHOLD
+ORPHANED_DOCS_P2_THRESHOLD = dqc.ORPHANED_DOCS_P2_THRESHOLD
 
 NOW = datetime(2026, 3, 11, 12, 0, 0, tzinfo=UTC)
 
@@ -933,11 +936,11 @@ class TestRunChecks:
         old_time = NOW - timedelta(hours=27)
         conn = FakeConnection(
             {
-                # "LEFT JOIN rulings" must come before "d.created_at >=" so
-                # the field completeness query matches it first (both queries
-                # contain "d.created_at >=" but only the field completeness
-                # query contains "LEFT JOIN rulings").
-                "LEFT JOIN rulings": [],
+                # "has_ruling" matches FIELD_COMPLETENESS_QUERY (uses INNER
+                # JOIN, so "LEFT JOIN rulings" no longer works for it).
+                "has_ruling": [],
+                # "orphaned_docs" matches ORPHANED_DOCUMENTS_QUERY.
+                "orphaned_docs": [],
                 "d.created_at <": [("Los Angeles", 200)],
                 "d.created_at >=": [],
                 "DISTINCT ct.county": [("Los Angeles",)],
@@ -970,8 +973,10 @@ class TestRunChecks:
         recent = NOW - timedelta(hours=1)
         conn = FakeConnection(
             {
-                # "LEFT JOIN rulings" must come first — see comment in test above.
-                "LEFT JOIN rulings": [],
+                # "has_ruling" matches FIELD_COMPLETENESS_QUERY.
+                "has_ruling": [],
+                # "orphaned_docs" matches ORPHANED_DOCUMENTS_QUERY.
+                "orphaned_docs": [],
                 "d.created_at <": [
                     ("Los Angeles", 200),
                     ("Orange", 100),
@@ -2011,6 +2016,170 @@ class TestCheckFieldCompleteness:
 
 
 # ---------------------------------------------------------------------------
+# Tests for check_orphaned_documents
+# ---------------------------------------------------------------------------
+
+
+def _make_orphaned_docs_row(
+    county: str,
+    total: int = 100,
+    orphaned: int = 0,
+) -> tuple[Any, ...]:
+    """Create a row matching the ORPHANED_DOCUMENTS_QUERY result shape."""
+    return (county, total, orphaned)
+
+
+class TestCheckOrphanedDocuments:
+    """Tests for check_orphaned_documents function."""
+
+    def test_no_orphans_no_alert(self) -> None:
+        """No alerts when all documents have ruling references."""
+        conn = FakeConnection(
+            {"orphaned_docs": [_make_orphaned_docs_row("Los Angeles", total=100, orphaned=0)]}
+        )
+        alerts = check_orphaned_documents(conn, NOW)
+        assert len(alerts) == 0
+
+    def test_p2_alert_above_5pct(self) -> None:
+        """P2 alert when orphaned percentage exceeds 5% threshold."""
+        conn = FakeConnection(
+            {"orphaned_docs": [_make_orphaned_docs_row("Orange", total=100, orphaned=10)]}
+        )
+        alerts = check_orphaned_documents(conn, NOW)
+        assert len(alerts) == 1
+        assert alerts[0].county == "Orange"
+        assert alerts[0].metric == "orphaned_documents"
+        assert alerts[0].severity == "p2"
+        assert alerts[0].actual == 10
+        assert "10 of 100" in alerts[0].message
+        assert "10.0%" in alerts[0].message
+
+    def test_p1_alert_above_20pct(self) -> None:
+        """P1 alert when orphaned percentage exceeds 20% threshold."""
+        conn = FakeConnection(
+            {"orphaned_docs": [_make_orphaned_docs_row("Orange", total=100, orphaned=25)]}
+        )
+        alerts = check_orphaned_documents(conn, NOW)
+        assert len(alerts) == 1
+        assert alerts[0].severity == "p1"
+
+    def test_below_threshold_no_alert(self) -> None:
+        """No alert when orphaned percentage is below 5% threshold."""
+        conn = FakeConnection(
+            {"orphaned_docs": [_make_orphaned_docs_row("Los Angeles", total=100, orphaned=3)]}
+        )
+        alerts = check_orphaned_documents(conn, NOW)
+        assert len(alerts) == 0
+
+    def test_zero_total_docs_no_alert(self) -> None:
+        """No alert when a county has zero documents."""
+        conn = FakeConnection(
+            {"orphaned_docs": [_make_orphaned_docs_row("Empty", total=0, orphaned=0)]}
+        )
+        alerts = check_orphaned_documents(conn, NOW)
+        assert len(alerts) == 0
+
+    def test_multiple_counties(self) -> None:
+        """Alerts generated for multiple counties independently."""
+        conn = FakeConnection(
+            {
+                "orphaned_docs": [
+                    _make_orphaned_docs_row("Los Angeles", total=100, orphaned=0),
+                    _make_orphaned_docs_row("Orange", total=100, orphaned=30),
+                    _make_orphaned_docs_row("San Bernardino", total=50, orphaned=5),
+                ],
+            }
+        )
+        alerts = check_orphaned_documents(conn, NOW)
+        assert len(alerts) == 2
+        counties = {a.county for a in alerts}
+        assert counties == {"Orange", "San Bernardino"}
+
+    def test_passes_time_window_params(self) -> None:
+        """Passes window cutoff and grace period cutoff as query params."""
+        conn = FakeConnection(
+            {"orphaned_docs": [_make_orphaned_docs_row("Los Angeles", total=100, orphaned=0)]}
+        )
+        check_orphaned_documents(conn, NOW)
+
+        assert len(conn.cursors) == 1
+        cursor = conn.cursors[0]
+        assert len(cursor.captured_calls) == 1
+        _query, params = cursor.captured_calls[0]
+
+        expected_cutoff = NOW - timedelta(days=FIELD_COMPLETENESS_WINDOW_DAYS)
+        expected_grace = NOW - timedelta(minutes=FIELD_COMPLETENESS_GRACE_MINUTES)
+        assert params[0] == expected_cutoff
+        assert params[1] == expected_grace
+
+    def test_county_filter(self) -> None:
+        """County filter limits results to a single county."""
+        conn = FakeConnection(
+            {
+                "orphaned_docs": [
+                    _make_orphaned_docs_row("Orange", total=100, orphaned=30),
+                ],
+            }
+        )
+        check_orphaned_documents(conn, NOW, county="Orange")
+
+        assert len(conn.cursors) == 1
+        cursor = conn.cursors[0]
+        _query, params = cursor.captured_calls[0]
+        # County param should be the last param
+        assert params[-1] == "Orange"
+
+    def test_orphaned_docs_scenario_from_issue(self) -> None:
+        """Simulates the scenario described in issue #1492.
+
+        Orphaned documents created by a backfill script should trigger
+        an orphaned_documents alert rather than polluting field completeness.
+        Field completeness should remain high because orphaned docs are
+        excluded from that query via INNER JOIN.
+        """
+        # Field completeness: only documents WITH rulings are counted
+        # (INNER JOIN means 100 docs with rulings show good completeness)
+        field_conn = FakeConnection(
+            {
+                "case_parties": [
+                    _make_field_completeness_row("Orange", total=100, ruling=100, judge=95),
+                ],
+            }
+        )
+        field_baselines = {
+            "Orange": {
+                "ruling": 100.0,
+                "judge": 95.0,
+                "motion_type": 90.0,
+                "outcome": 90.0,
+                "case_title": 100.0,
+                "case_number": 100.0,
+                "parties": 80.0,
+                "hearing_date": 100.0,
+                "case_type": 85.0,
+            },
+        }
+        field_alerts = check_field_completeness(field_conn, NOW, field_baselines)
+        # No field completeness regression because orphaned docs are excluded
+        fc_regression = [a for a in field_alerts if a.metric == "field_completeness"]
+        assert len(fc_regression) == 0
+
+        # Orphaned documents check: 1500 orphaned out of 1600 total
+        orphan_conn = FakeConnection(
+            {
+                "orphaned_docs": [
+                    _make_orphaned_docs_row("Orange", total=1600, orphaned=1500),
+                ],
+            }
+        )
+        orphan_alerts = check_orphaned_documents(orphan_conn, NOW)
+        # Should fire a P1 orphaned_documents alert
+        assert len(orphan_alerts) == 1
+        assert orphan_alerts[0].metric == "orphaned_documents"
+        assert orphan_alerts[0].severity == "p1"
+
+
+# ---------------------------------------------------------------------------
 # Tests for _collect_full_metrics
 # ---------------------------------------------------------------------------
 
@@ -2599,6 +2768,7 @@ class TestSqlSchemaValidation:
             "RULING_COUNT_BY_TYPE_QUERY",
             "FIELD_GAP_DOCS_QUERY",
             "FIELD_COMPLETENESS_QUERY",
+            "ORPHANED_DOCUMENTS_QUERY",
             "INSERT_METRICS_QUERY",
         }
         for name in expected:
