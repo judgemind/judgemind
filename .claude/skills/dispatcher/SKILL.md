@@ -224,14 +224,13 @@ Both commands update the status file automatically. Always send a notification i
 
 **Known quirk:** When a subagent is spawned with `isolation: "worktree"`, the parent process's working directory can drift into the agent's worktree (`.claude/worktrees/agent-<id>/`). After the agent completes and the worktree is removed, the parent's cwd becomes invalid, causing `getcwd` errors and broken git commands.
 
-After every agent completion notification, verify and re-anchor the dispatcher's cwd to the main repo root:
+After every agent completion notification, unconditionally re-anchor the dispatcher's cwd to the main repo root:
 
 ```
-pwd
 cd <repo_root>
 ```
 
-If `pwd` shows a path containing `.claude/worktrees/`, the cwd has drifted. The `cd` command corrects it. Always run both commands — the `cd` is a no-op if the cwd is already correct, and it is essential if the cwd has drifted.
+Do not bother checking `pwd` first — cwd drift is a known quirk of `isolation: "worktree"`, so just unconditionally `cd` back. The `cd` is a no-op if the cwd is already correct, and it is essential if the cwd has drifted. All subsequent git commands should use `git -C <repo_root>` regardless, as a defense-in-depth measure against cwd drift.
 
 **Step 3 — Clean up the agent's worktree (if needed):**
 
@@ -742,8 +741,8 @@ The dispatcher must stay responsive to user interaction and Telegram commands at
 
 The dispatcher MUST NOT make any code changes on `main` itself. All code changes must be delegated to `/task` subagents working in worktrees.
 
-- **Prohibited (code changes):** editing source files, modifying configs, writing scripts, updating documentation content, changing Terraform, or any operation that results in a `git commit` on the dispatcher's checkout. If it would show up in `git diff`, delegate it to a `/task` subagent.
-- **Allowed (non-code operations):** `gh` CLI calls (issue comments, label changes, PR merges, issue creation/editing), reading files for decision-making, writing to `tmp/`, sending Telegram messages, running `git fetch`/`git pull`, running `terraform apply` for dev environments (applying already-merged code, not changing it). These do not modify committed code and are safe to run inline.
+- **Prohibited (code changes):** editing source files, modifying configs, writing scripts, updating documentation content, changing Terraform, or any operation that results in a `git -C <repo_root> commit` on the dispatcher's checkout. If it would show up in `git -C <repo_root> diff`, delegate it to a `/task` subagent.
+- **Allowed (non-code operations):** `gh` CLI calls (issue comments, label changes, PR merges, issue creation/editing), reading files for decision-making, writing to `tmp/`, sending Telegram messages, running `git -C <repo_root> fetch`/`git -C <repo_root> pull`, running `terraform apply` for dev environments (applying already-merged code, not changing it). These do not modify committed code and are safe to run inline.
 
 If you catch yourself about to edit a file or stage a commit from the dispatcher agent, **stop and spawn a `/task` subagent instead.**
 
