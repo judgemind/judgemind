@@ -3,6 +3,32 @@
 Quick-reference for agents writing SQL scripts. **Always check this before using
 `ON CONFLICT`** — the target must match an existing UNIQUE constraint.
 
+## Commonly Confused Tables
+
+### `parties` vs `case_parties`
+
+These two tables serve different purposes. Confusing them causes bugs
+(see #1455 / #1559 where a script queried `parties.case_id`, which does not exist).
+
+| Table | Purpose | Key columns | Has `case_id`? |
+|---|---|---|---|
+| `parties` | **Party entity table** — one row per unique party (person or org) | `id`, `canonical_name`, `party_type` | **No** |
+| `case_parties` | **Junction table** — links a case to a party with a role | `id`, `case_id`, `party_id`, `role` | **Yes** |
+
+**Rules of thumb:**
+- To find which parties are in a case: query `case_parties WHERE case_id = ...`
+- To look up a party by name: query `parties WHERE canonical_name = ...`
+- To get parties for a case with names: `JOIN case_parties cp ON cp.case_id = c.id JOIN parties p ON p.id = cp.party_id`
+- **Never** write `parties.case_id` or `JOIN parties p ON p.case_id = ...` — the column does not exist.
+
+The same entity/junction split applies to other relationships:
+
+| Entity table | Junction table |
+|---|---|
+| `judges` | `case_judges` |
+| `attorneys` | `case_attorneys` |
+| `parties` | `case_parties` |
+
 ## Unique Constraints by Table
 
 | Table | Unique constraint columns | Source |
