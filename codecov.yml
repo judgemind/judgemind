@@ -27,7 +27,11 @@ coverage:
 
 # Flag definitions for per-package tracking
 flags:
-  scraper-unit:
+  scraper-framework:
+    paths:
+      - packages/scraper-framework/
+    carryforward: true
+  scraper-courts:
     paths:
       - packages/scraper-framework/
     carryforward: true
