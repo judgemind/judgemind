@@ -230,6 +230,11 @@ export function JudgeProfile({ judgeId }: { judgeId: string }) {
   const edges = rulingsData?.rulings.edges ?? [];
   const pageInfo = rulingsData?.rulings.pageInfo;
 
+  // Coordinate loading states: only show empty messages when both queries
+  // have completed. If one returns empty while the other is still loading,
+  // show a skeleton instead of the contradictory "No rulings captured" message.
+  const bothLoaded = !analyticsLoading && !rulingsLoading;
+
   function handleLoadMore() {
     if (!pageInfo?.endCursor) return;
     fetchMore({
@@ -266,6 +271,9 @@ export function JudgeProfile({ judgeId }: { judgeId: string }) {
     }
 
     if (!analytics || analytics.totalRulings === 0) {
+      // If the other query is still loading, show skeleton instead of
+      // the empty message to avoid contradictory UI states.
+      if (!bothLoaded) return <AnalyticsSkeleton />;
       return (
         <p className="py-8 text-center text-sm text-muted-foreground">
           No rulings captured for this judge yet. Check back after the next scrape.
@@ -388,6 +396,9 @@ export function JudgeProfile({ judgeId }: { judgeId: string }) {
     }
 
     if (!rulingsLoading && edges.length === 0) {
+      // If the other query is still loading, show skeleton instead of
+      // the empty message to avoid contradictory UI states.
+      if (!bothLoaded) return <RulingsSkeleton />;
       return (
         <p className="py-8 text-center text-sm text-muted-foreground">
           No rulings captured for this judge yet. Check back after the next scrape.

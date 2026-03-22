@@ -98,6 +98,7 @@ function buildAnalyticsMock(
     earliestRuling: string | null;
     latestRuling: string | null;
   }> = {},
+  options: { delay?: number } = {},
 ): MockedResponse {
   return {
     request: {
@@ -139,6 +140,7 @@ function buildAnalyticsMock(
         },
       },
     },
+    ...(options.delay !== undefined ? { delay: options.delay } : {}),
   };
 }
 
@@ -158,6 +160,7 @@ function buildRulingsMock(
     hasNextPage: boolean;
     endCursor: string | null;
   }> = {},
+  options: { delay?: number } = {},
 ): MockedResponse {
   return {
     request: {
@@ -204,6 +207,7 @@ function buildRulingsMock(
         },
       },
     },
+    ...(options.delay !== undefined ? { delay: options.delay } : {}),
   };
 }
 
@@ -480,5 +484,113 @@ describe('JudgeProfile', () => {
 
     expect(screen.getByText('Analytics')).toBeInTheDocument();
     expect(screen.getByText('Recent Rulings')).toBeInTheDocument();
+  });
+
+  // -------------------------------------------------------------------------
+  // Coordinated loading state tests (#1668)
+  // -------------------------------------------------------------------------
+
+  it('shows analytics skeleton when analytics is empty but rulings still loading', async () => {
+    // Analytics resolves immediately with empty data; rulings takes a long time
+    const mocks: MockedResponse[] = [
+      buildAnalyticsMock(
+        'judge-coord-1',
+        { totalRulings: 0, rulingsByOutcome: [], rulingsByMotionType: [], earliestRuling: null, latestRuling: null },
+      ),
+      buildRulingsMock('judge-coord-1', { edges: [] }, { delay: 1_000_000 }),
+    ];
+
+    render(
+      <MockedProvider mocks={mocks}>
+        <JudgeProfile judgeId="judge-coord-1" />
+      </MockedProvider>,
+    );
+
+    // Wait for analytics to resolve (instant) while rulings is still loading
+    await waitFor(() => {
+      // Analytics should show skeleton (not empty message) because rulings hasn't loaded
+      const skeletons = screen.getAllByTestId('analytics-skeleton');
+      expect(skeletons.length).toBeGreaterThanOrEqual(1);
+    });
+
+    // The "No rulings captured" message should NOT appear for the analytics section
+    // (rulings section still has its own skeleton since it's loading)
+    expect(screen.queryByText(/No rulings captured for this judge yet/)).not.toBeInTheDocument();
+  });
+
+  it('shows rulings skeleton when rulings is empty but analytics still loading', async () => {
+    // Rulings resolves immediately with empty data; analytics takes a long time
+    const mocks: MockedResponse[] = [
+      buildAnalyticsMock(
+        'judge-coord-2',
+        { totalRulings: 0, rulingsByOutcome: [], rulingsByMotionType: [], earliestRuling: null, latestRuling: null },
+        { delay: 1_000_000 },
+      ),
+      buildRulingsMock('judge-coord-2', { edges: [] }),
+    ];
+
+    render(
+      <MockedProvider mocks={mocks}>
+        <JudgeProfile judgeId="judge-coord-2" />
+      </MockedProvider>,
+    );
+
+    // Wait for rulings to resolve (instant) while analytics is still loading
+    await waitFor(() => {
+      // Rulings should show skeleton (not empty message) because analytics hasn't loaded
+      const skeletons = screen.getAllByTestId('rulings-skeleton');
+      expect(skeletons.length).toBeGreaterThanOrEqual(1);
+    });
+
+    // The "No rulings captured" message should NOT appear
+    expect(screen.queryByText(/No rulings captured for this judge yet/)).not.toBeInTheDocument();
+  });
+
+  it('shows empty messages only when both queries complete with empty data', async () => {
+    // Both resolve quickly with empty data
+    const mocks: MockedResponse[] = [
+      buildAnalyticsMock(
+        'judge-coord-3',
+        { totalRulings: 0, rulingsByOutcome: [], rulingsByMotionType: [], earliestRuling: null, latestRuling: null },
+      ),
+      buildRulingsMock('judge-coord-3', { edges: [] }),
+    ];
+
+    render(
+      <MockedProvider mocks={mocks}>
+        <JudgeProfile judgeId="judge-coord-3" />
+      </MockedProvider>,
+    );
+
+    // Wait for both to resolve, then both should show the empty message
+    await waitFor(() => {
+      expect(screen.getAllByText(/No rulings captured for this judge yet/)).toHaveLength(2);
+    });
+
+    // Skeletons should be gone
+    expect(screen.queryByTestId('analytics-skeleton')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('rulings-skeleton')).not.toBeInTheDocument();
+  });
+
+  it('does not show empty message for analytics when analytics has data regardless of rulings loading', async () => {
+    // Analytics has data, rulings takes forever
+    const mocks = [
+      buildAnalyticsMock('judge-coord-4'),
+      buildRulingsMock('judge-coord-4', { edges: [] }, { delay: 1_000_000 }),
+    ];
+
+    render(
+      <MockedProvider mocks={mocks}>
+        <JudgeProfile judgeId="judge-coord-4" />
+      </MockedProvider>,
+    );
+
+    // Analytics should show real data (not empty message or skeleton)
+    await waitFor(() => {
+      expect(screen.getByText('100')).toBeInTheDocument();
+    });
+
+    // No empty message should be visible
+    expect(screen.queryByText(/No rulings captured for this judge yet/)).not.toBeInTheDocument();
   });
 });
