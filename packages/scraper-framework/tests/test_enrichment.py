@@ -347,6 +347,188 @@ class TestMatchCaseNumber:
 
 
 # ---------------------------------------------------------------------------
+# EnrichmentEngine — Fuzzy candidate query filtering
+# ---------------------------------------------------------------------------
+
+
+class TestFuzzyCaseCandidates:
+    """Tests for _fuzzy_case_candidates prefix filtering and row cap."""
+
+    def test_prefix_filter_applied_for_long_case_numbers(self) -> None:
+        """Verify that the SQL includes a prefix filter when the case number >= 4 chars."""
+        conn = _make_mock_conn()
+        cursor = conn.cursor().__enter__()
+        cursor.fetchall.return_value = []
+
+        engine = EnrichmentEngine(conn)
+        # "civ2024001" is 10 chars — well above the 4-char minimum for prefix filtering
+        engine._fuzzy_case_candidates("civ2024001", "court-uuid")
+
+        # The query should have been called with 6 params (court_id, min_len, max_len,
+        # prefix_length, prefix, limit) instead of the old 3 (court_id, min_len, max_len)
+        call_args = cursor.execute.call_args
+        params = call_args[0][1]
+        assert len(params) == 6
+        # Prefix should be "ci" (first 2 chars of "civ2024001")
+        assert params[4] == "ci"
+
+    def test_prefix_filter_skipped_for_short_case_numbers(self) -> None:
+        """Verify that short case numbers (< 4 chars) skip the prefix filter."""
+        conn = _make_mock_conn()
+        cursor = conn.cursor().__enter__()
+        cursor.fetchall.return_value = []
+
+        engine = EnrichmentEngine(conn)
+        # "abc" is only 3 chars — below the 4-char threshold
+        engine._fuzzy_case_candidates("abc", "court-uuid")
+
+        call_args = cursor.execute.call_args
+        params = call_args[0][1]
+        # Without prefix filter: (court_id, min_len, max_len, limit) = 4 params
+        assert len(params) == 4
+
+    def test_limit_applied_to_query(self) -> None:
+        """Verify that the LIMIT clause is present in the query."""
+        conn = _make_mock_conn()
+        cursor = conn.cursor().__enter__()
+        cursor.fetchall.return_value = []
+
+        engine = EnrichmentEngine(conn, max_fuzzy_candidates=100)
+        engine._fuzzy_case_candidates("civ2024001", "court-uuid")
+
+        call_args = cursor.execute.call_args
+        query_sql = call_args[0][0]
+        params = call_args[0][1]
+        assert "LIMIT" in query_sql
+        # The last param is the limit value
+        assert params[-1] == 100
+
+    def test_default_max_fuzzy_candidates_is_500(self) -> None:
+        """Verify the default cap is 500."""
+        conn = _make_mock_conn()
+        engine = EnrichmentEngine(conn)
+        assert engine._max_fuzzy_candidates == 500
+
+    def test_custom_max_fuzzy_candidates(self) -> None:
+        """Verify the cap is configurable via constructor."""
+        conn = _make_mock_conn()
+        engine = EnrichmentEngine(conn, max_fuzzy_candidates=200)
+        assert engine._max_fuzzy_candidates == 200
+
+    def test_warning_logged_when_cap_reached(self) -> None:
+        """Verify a warning is logged when the result set hits the cap."""
+        conn = _make_mock_conn()
+        cursor = conn.cursor().__enter__()
+        # Return exactly max_fuzzy_candidates rows to trigger the warning
+        cap = 3
+        cursor.fetchall.return_value = [(f"uuid-{i}", f"CIV202400{i}", []) for i in range(cap)]
+
+        engine = EnrichmentEngine(conn, max_fuzzy_candidates=cap)
+        with patch("framework.enrichment.logger") as mock_logger:
+            engine._fuzzy_case_candidates("civ2024001", "court-uuid")
+            mock_logger.warning.assert_called_once()
+            call_kwargs = mock_logger.warning.call_args[1]
+            assert call_kwargs["cap"] == cap
+
+    def test_no_warning_when_below_cap(self) -> None:
+        """Verify no warning when results are below the cap."""
+        conn = _make_mock_conn()
+        cursor = conn.cursor().__enter__()
+        cursor.fetchall.return_value = [
+            ("uuid-1", "CIV2024001", []),
+        ]
+
+        engine = EnrichmentEngine(conn, max_fuzzy_candidates=500)
+        with patch("framework.enrichment.logger") as mock_logger:
+            engine._fuzzy_case_candidates("civ2024001", "court-uuid")
+            mock_logger.warning.assert_not_called()
+
+    def test_prefix_filter_uses_correct_prefix(self) -> None:
+        """Verify the prefix is extracted correctly from different case numbers."""
+        conn = _make_mock_conn()
+        cursor = conn.cursor().__enter__()
+        cursor.fetchall.return_value = []
+
+        engine = EnrichmentEngine(conn)
+
+        # "24nncv02551" -> prefix "24"
+        engine._fuzzy_case_candidates("24nncv02551", "court-uuid")
+        params = cursor.execute.call_args[0][1]
+        assert params[4] == "24"
+
+        # "civ2024001" -> prefix "ci"
+        engine._fuzzy_case_candidates("civ2024001", "court-uuid")
+        params = cursor.execute.call_args[0][1]
+        assert params[4] == "ci"
+
+    def test_end_to_end_fuzzy_with_prefix_filter(self) -> None:
+        """End-to-end: match_case_number with prefix-filtered candidates."""
+        conn = _make_mock_conn()
+        cursor = conn.cursor().__enter__()
+        cursor.fetchone.return_value = None  # No exact match
+        cursor.fetchall.return_value = [
+            ("case-uuid-456", "CIV2024002", ["alice"]),
+        ]
+
+        engine = EnrichmentEngine(conn, max_fuzzy_candidates=100)
+        result = engine.match_case_number(
+            "CIV-2024-001",
+            "court-uuid",
+            extracted_parties=["Alice"],
+        )
+
+        # Should still find the fuzzy match
+        assert result.match_type == "fuzzy"
+        assert result.case_id == "case-uuid-456"
+
+    def test_results_correctly_parsed(self) -> None:
+        """Verify that _fuzzy_case_candidates parses DB rows correctly."""
+        conn = _make_mock_conn()
+        cursor = conn.cursor().__enter__()
+        cursor.fetchall.return_value = [
+            ("uuid-1", "CIV2024001", ["Alice", "Bob"]),
+            ("uuid-2", "CIV2024002", None),
+        ]
+
+        engine = EnrichmentEngine(conn)
+        results = engine._fuzzy_case_candidates("civ2024001", "court-uuid")
+
+        assert len(results) == 2
+        assert results[0] == ("uuid-1", "CIV2024001", ["Alice", "Bob"])
+        assert results[1] == ("uuid-2", "CIV2024002", [])
+
+    def test_exact_boundary_prefix_filter_min_len(self) -> None:
+        """Verify prefix filter is applied at exactly the minimum length (4 chars)."""
+        conn = _make_mock_conn()
+        cursor = conn.cursor().__enter__()
+        cursor.fetchall.return_value = []
+
+        engine = EnrichmentEngine(conn)
+        # Exactly 4 chars — should use prefix filter
+        engine._fuzzy_case_candidates("abcd", "court-uuid")
+        params = cursor.execute.call_args[0][1]
+        assert len(params) == 6  # prefix filter applied
+        assert params[4] == "ab"  # first 2 chars
+
+    def test_length_filter_still_applied(self) -> None:
+        """Verify the length filter (LENGTH BETWEEN) is still present."""
+        conn = _make_mock_conn()
+        cursor = conn.cursor().__enter__()
+        cursor.fetchall.return_value = []
+
+        engine = EnrichmentEngine(conn, max_levenshtein=2)
+        engine._fuzzy_case_candidates("civ2024001", "court-uuid")
+
+        call_args = cursor.execute.call_args
+        query_sql = call_args[0][0]
+        params = call_args[0][1]
+        assert "BETWEEN" in query_sql
+        # min_len = max(1, 10 - 2) = 8, max_len = 10 + 2 = 12
+        assert params[1] == 8
+        assert params[2] == 12
+
+
+# ---------------------------------------------------------------------------
 # EnrichmentEngine — Judge resolution
 # ---------------------------------------------------------------------------
 
