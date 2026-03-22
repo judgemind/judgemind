@@ -240,17 +240,21 @@ scripts/run-py.sh scripts/tg-notify.py task_failed <issue_number> "<error_summar
 
 Both commands update the status file automatically. Always send a notification immediately when an agent completes or fails — do not batch them.
 
-**Step 2 — Re-anchor cwd (MANDATORY):**
+**Step 2 — Clean up worktree and re-anchor cwd (MANDATORY):**
 
-**Known quirk:** When a subagent is spawned with `isolation: "worktree"`, the parent process's working directory can drift into the agent's worktree (`.claude/worktrees/agent-<id>/`). After the agent completes and the worktree is removed, the parent's cwd becomes invalid, causing `getcwd` errors and broken git commands.
+**Known quirk:** When a subagent is spawned with `isolation: "worktree"`, the parent process's working directory can drift into the agent's worktree (`.claude/worktrees/agent-<id>/`). Claude Code does not always clean up worktrees promptly, and `cd` resolves back into the stale directory until the worktree is removed.
 
-After every agent completion notification, unconditionally re-anchor the dispatcher's cwd to the main repo root:
+After every agent completion notification, run the cleanup script to validate the agent is finished and remove its worktree, then re-anchor cwd:
 
 ```
+python3 scripts/cleanup_worktree.py .claude/worktrees/agent-<id>
 cd <repo_root>
+pwd  # verify
 ```
 
-Do not bother checking `pwd` first — cwd drift is a known quirk of `isolation: "worktree"`, so just unconditionally `cd` back. The `cd` is a no-op if the cwd is already correct, and it is essential if the cwd has drifted. All subsequent git commands should use `git -C <repo_root>` regardless, as a defense-in-depth measure against cwd drift.
+The cleanup script checks the agent's JSONL session log to confirm the agent has truly finished before removing the worktree. It will refuse to remove worktrees where the agent is still running. **Do NOT** manually `git worktree remove`, `rm -rf`, or `cd /` to work around cwd drift.
+
+All subsequent git commands should use `git -C <repo_root>` regardless, as a defense-in-depth measure against cwd drift.
 
 **Step 3 — Post context comment for failed/incomplete agents:**
 
@@ -340,15 +344,7 @@ This minimal comment still provides value by alerting the next agent that a prio
 
 **Step 4 — Clean up the agent's worktree (if needed):**
 
-When agents are spawned with `isolation: "worktree"`, Claude Code automatically cleans up worktrees with no uncommitted changes when the agent exits. However, worktrees with uncommitted changes (e.g., from a failed agent) may remain.
-
-1. Check if the agent's worktree still exists. Claude Code worktrees live at `.claude/worktrees/agent-<id>/`. The agent ID can be derived from the task notification or tracked when spawning.
-2. If the worktree does not exist, the agent (or Claude Code) already cleaned up — skip to the next step.
-3. If it exists and has uncommitted changes, force-remove it. Use `git -C <repo_root>` to avoid cwd issues:
-   ```
-   git -C <repo_root> worktree remove --force .claude/worktrees/agent-<id>
-   ```
-4. If removal fails, log the error but do not block the dispatch loop. Stale worktrees do not affect slot counting (slots are tracked by the dispatcher's own agent list, not by worktree directory count).
+Worktree cleanup is handled in Step 2 via `scripts/cleanup_worktree.py`. If the script reports the worktree is already gone, no further action is needed. If cleanup failed in Step 2 (e.g., the script returned an error), log it but do not block the dispatch loop. Stale worktrees do not affect slot counting (slots are tracked by the dispatcher's own agent list, not by worktree directory count).
 
 ---
 
