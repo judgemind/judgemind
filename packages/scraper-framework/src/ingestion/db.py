@@ -657,12 +657,14 @@ def resolve_judge(
 
     with conn.cursor() as cur:
         # Step 1: Look up existing alias for this raw name at this court
+        # (case-insensitive to prevent duplicate judge records when the
+        # same name arrives in different casing — see #1453)
         cur.execute(
             """
             SELECT ja.judge_id
             FROM judge_aliases ja
             JOIN judges j ON j.id = ja.judge_id
-            WHERE ja.raw_name = %s AND j.court_id = %s::uuid
+            WHERE LOWER(ja.raw_name) = LOWER(%s) AND j.court_id = %s::uuid
             LIMIT 1
             """,
             (raw_name, court_id),
