@@ -203,7 +203,7 @@ fi
 
 # 10. git worktree add inside an existing worktree.
 #     Subagents must work in their assigned worktree only. Creating child worktrees
-#     causes orphaned worktrees that cleanup_worktree.py cannot track and the
+#     causes orphaned worktrees that cleanup_worktree.sh cannot track and the
 #     dispatcher does not know about. If the worktree is in a bad state, the agent
 #     should fix it (git checkout -- ., git clean -fd) instead of creating a new one.
 #     Detection: command is "git worktree add" AND cwd contains ".claude/worktrees/".

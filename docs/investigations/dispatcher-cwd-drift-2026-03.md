@@ -34,7 +34,7 @@ This is **not fixable in-repo** via code changes to the dispatcher or hooks. The
 
 The following workarounds are already documented and implemented:
 
-1. **`cleanup_worktree.py`** -- Removes the agent's worktree after completion, which eliminates the drift target. Called in the dispatcher's "Processing agent completions" Step 2.
+1. **`cleanup_worktree.sh`** -- Removes the agent's worktree after completion, which eliminates the drift target. Called in the dispatcher's "Processing agent completions" Step 2.
 
 2. **`cd <repo_root>` after cleanup** -- Explicit re-anchor after worktree removal. Works reliably once the directory is gone.
 
@@ -67,7 +67,7 @@ The disambiguation problem can be solved by checking an environment variable or 
 ## Recommended Approach
 
 ### Tier 1: Already done (keep as-is)
-- `cleanup_worktree.py` + `cd <repo_root>` after completions
+- `cleanup_worktree.sh` + `cd <repo_root>` after completions
 - `git -C <repo_root>` for all dispatcher git commands
 - Documentation in dispatcher SKILL.md and unattended-patterns.md
 
@@ -89,4 +89,4 @@ The ideal fix is for Claude Code to preserve the parent's cwd when spawning/comp
 | Reliable way to prevent cwd drift | **No** -- this is a Claude Code platform behavior. Not fixable in-repo. |
 | Document workaround pattern | **Already done** -- documented in dispatcher SKILL.md and unattended-patterns.md |
 | PostToolUse hook on Agent completions | **Feasible** -- would add visibility but cannot prevent drift. Filed as follow-up. |
-| Dispatcher can run 5+ agent completions without manual cwd fixups | **Already achievable** with current cleanup_worktree.py + cd pattern. The hook would add redundancy. |
+| Dispatcher can run 5+ agent completions without manual cwd fixups | **Already achievable** with current cleanup_worktree.sh + cd pattern. The hook would add redundancy. |
