@@ -600,6 +600,8 @@ jobs:
         run: scripts/tests/test_check_migration_files.sh
       - name: Test gemini-review.sh smoke tests
         run: scripts/tests/test_gemini_review.sh
+      - name: Test adopt-pr.sh
+        run: scripts/tests/test_adopt_pr.sh
 
   # ---------------------------------------------------------------
   # Coverage gates: diff coverage (new lines) + overall floor ratchet
