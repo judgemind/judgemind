@@ -248,7 +248,7 @@ Both commands update the status file automatically. Always send a notification i
 After every agent completion notification, run the cleanup script to validate the agent is finished and remove its worktree, then re-anchor cwd:
 
 ```
-python3 scripts/cleanup_worktree.py .claude/worktrees/agent-<id>
+scripts/cleanup_worktree.sh .claude/worktrees/agent-<id>
 cd <repo_root>
 pwd  # verify
 ```
@@ -345,7 +345,7 @@ This minimal comment still provides value by alerting the next agent that a prio
 
 **Step 4 — Clean up the agent's worktree (if needed):**
 
-Worktree cleanup is handled in Step 2 via `scripts/cleanup_worktree.py`. If the script reports the worktree is already gone, no further action is needed. If cleanup failed in Step 2 (e.g., the script returned an error), log it but do not block the dispatch loop. Stale worktrees do not affect slot counting (slots are tracked by the dispatcher's own agent list, not by worktree directory count).
+Worktree cleanup is handled in Step 2 via `scripts/cleanup_worktree.sh`. If the script reports the worktree is already gone, no further action is needed. If cleanup failed in Step 2 (e.g., the script returned an error), log it but do not block the dispatch loop. Stale worktrees do not affect slot counting (slots are tracked by the dispatcher's own agent list, not by worktree directory count).
 
 ---
 
