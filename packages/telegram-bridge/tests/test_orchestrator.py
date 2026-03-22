@@ -22,6 +22,7 @@ from telegram_bridge import (
 from telegram_bridge.dispatcher import (
     InstructionKind,
     _parse_instruction,
+    _worker_label,
     parse_command,
 )
 
@@ -2244,3 +2245,192 @@ class TestReplyToMessageId:
             assert route.call_count == 1
             body = json.loads(route.calls[0].request.content)
             assert body.get("reply_to_message_id") == 42
+
+
+# ── _worker_label() ──────────────────────────────────────────────────────
+
+
+class TestWorkerLabel:
+    """Tests for the _worker_label helper."""
+
+    def test_int_worker_number(self) -> None:
+        assert _worker_label(3) == "Worker-3"
+
+    def test_string_agent_id_truncated(self) -> None:
+        assert _worker_label("agent-ab4722a2") == "Agent-ab47"
+
+    def test_short_agent_id_not_truncated(self) -> None:
+        # agent IDs with 10 chars or fewer are not truncated
+        assert _worker_label("agent-abcd") == "agent-abcd"
+
+    def test_non_agent_string_passthrough(self) -> None:
+        assert _worker_label("custom-worker") == "custom-worker"
+
+
+# ── Agent ID support (int | str worker) ──────────────────────────────────
+
+
+class TestAgentIdWorkerSupport:
+    """Tests that string agent IDs work for task_started/completed/failed."""
+
+    @respx.mock
+    async def test_task_started_with_agent_id(self) -> None:
+        with mock_aws():
+            _setup_secret()
+            route = respx.post("https://api.telegram.org/botfake-bot-token/sendMessage").mock(
+                return_value=httpx.Response(200, json={"ok": True})
+            )
+
+            bridge = _make_bridge()
+            orch = DispatcherBridge(bridge=bridge)
+            await orch.task_started(
+                issue_number=42, title="Fix the widget", worker="agent-ab4722a2"
+            )
+
+            workers = orch.get_workers()
+            assert len(workers) == 1
+            assert workers[0].worker_number == "agent-ab4722a2"
+            assert workers[0].issue_number == 42
+
+            body = json.loads(route.calls[0].request.content)
+            assert "Agent\\-ab47" in body["text"] or "Agent-ab47" in body["text"]
+
+    @respx.mock
+    async def test_task_completed_with_agent_id(self) -> None:
+        with mock_aws():
+            _setup_secret()
+            respx.post("https://api.telegram.org/botfake-bot-token/sendMessage").mock(
+                return_value=httpx.Response(200, json={"ok": True})
+            )
+
+            bridge = _make_bridge()
+            orch = DispatcherBridge(bridge=bridge)
+            await orch.task_started(
+                issue_number=42, title="Fix the widget", worker="agent-ab4722a2"
+            )
+            await orch.task_completed(
+                issue_number=42, summary="PR merged.", worker="agent-ab4722a2"
+            )
+
+            assert orch.get_workers() == []
+
+    @respx.mock
+    async def test_task_failed_with_agent_id(self) -> None:
+        with mock_aws():
+            _setup_secret()
+            respx.post("https://api.telegram.org/botfake-bot-token/sendMessage").mock(
+                return_value=httpx.Response(200, json={"ok": True})
+            )
+
+            bridge = _make_bridge()
+            orch = DispatcherBridge(bridge=bridge)
+            await orch.task_started(
+                issue_number=42, title="Fix the widget", worker="agent-ab4722a2"
+            )
+            await orch.task_failed(issue_number=42, error="CI broke.", worker="agent-ab4722a2")
+
+            assert orch.get_workers() == []
+
+    @respx.mock
+    async def test_update_worker_with_agent_id(self) -> None:
+        with mock_aws():
+            _setup_secret()
+            respx.post("https://api.telegram.org/botfake-bot-token/sendMessage").mock(
+                return_value=httpx.Response(200, json={"ok": True})
+            )
+
+            bridge = _make_bridge()
+            orch = DispatcherBridge(bridge=bridge)
+            await orch.task_started(issue_number=42, title="Fix widget", worker="agent-ab4722a2")
+
+            orch.update_worker("agent-ab4722a2", phase="ci-watch")
+            workers = orch.get_workers()
+            assert workers[0].phase == "ci-watch"
+
+    @respx.mock
+    async def test_reply_status_with_agent_id(self) -> None:
+        with mock_aws():
+            _setup_secret()
+            route = respx.post("https://api.telegram.org/botfake-bot-token/sendMessage").mock(
+                return_value=httpx.Response(200, json={"ok": True})
+            )
+
+            bridge = _make_bridge()
+            orch = DispatcherBridge(bridge=bridge)
+            await orch.task_started(issue_number=42, title="Fix widget", worker="agent-ab4722a2")
+
+            route.reset()
+            route.mock(return_value=httpx.Response(200, json={"ok": True}))
+
+            await orch.reply_status()
+            await bridge.close()
+
+            body = json.loads(route.calls[0].request.content)
+            assert "Agent\\-ab47" in body["text"] or "Agent-ab47" in body["text"]
+
+    @respx.mock
+    async def test_state_persistence_with_agent_id(self, tmp_path: Path) -> None:
+        """Agent ID worker state round-trips through save/load."""
+        state_file = str(tmp_path / "state.json")
+        with mock_aws():
+            _setup_secret()
+            respx.post("https://api.telegram.org/botfake-bot-token/sendMessage").mock(
+                return_value=httpx.Response(200, json={"ok": True})
+            )
+
+            bridge1 = _make_bridge()
+            orch1 = DispatcherBridge(bridge=bridge1, state_file=state_file)
+            await orch1.task_started(
+                issue_number=42, title="Fix the widget", worker="agent-ab4722a2"
+            )
+
+            # Load from the file in a new instance.
+            bridge2 = _make_bridge()
+            orch2 = DispatcherBridge(bridge=bridge2, state_file=state_file)
+            workers = orch2.get_workers()
+            assert len(workers) == 1
+            assert workers[0].worker_number == "agent-ab4722a2"
+            assert workers[0].issue_number == 42
+
+    @respx.mock
+    async def test_status_file_includes_agent_label(self, tmp_path: Path) -> None:
+        """write_status() should include agent_label in active_agents."""
+        status_file = str(tmp_path / "status.json")
+        with mock_aws():
+            _setup_secret()
+            respx.post("https://api.telegram.org/botfake-bot-token/sendMessage").mock(
+                return_value=httpx.Response(200, json={"ok": True})
+            )
+
+            bridge = _make_bridge()
+            orch = DispatcherBridge(bridge=bridge, status_file=status_file)
+            await orch.task_started(issue_number=42, title="Fix widget", worker="agent-ab4722a2")
+
+            data = json.loads(Path(status_file).read_text())
+            assert len(data["active_agents"]) == 1
+            agent = data["active_agents"][0]
+            assert agent["worker_number"] == "agent-ab4722a2"
+            assert agent["agent_label"] == "Agent-ab47"
+
+    @respx.mock
+    async def test_mixed_int_and_string_workers(self) -> None:
+        """Dispatcher should handle a mix of integer and agent-ID workers."""
+        with mock_aws():
+            _setup_secret()
+            respx.post("https://api.telegram.org/botfake-bot-token/sendMessage").mock(
+                return_value=httpx.Response(200, json={"ok": True})
+            )
+
+            bridge = _make_bridge()
+            orch = DispatcherBridge(bridge=bridge)
+            await orch.task_started(issue_number=1, title="Int worker", worker=3)
+            await orch.task_started(issue_number=2, title="Agent worker", worker="agent-deadbeef")
+
+            workers = orch.get_workers()
+            assert len(workers) == 2
+
+            # Complete the int worker, agent worker should remain.
+            await orch.task_completed(issue_number=1, summary="Done.", worker=3)
+            workers = orch.get_workers()
+            assert len(workers) == 1
+            assert workers[0].worker_number == "agent-deadbeef"

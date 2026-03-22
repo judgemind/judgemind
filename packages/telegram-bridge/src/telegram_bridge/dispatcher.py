@@ -178,6 +178,21 @@ def _extract_issue_number(fragment: str) -> int | None:
         return None
 
 
+def _worker_label(worker: int | str) -> str:
+    """Return a human-readable label for a worker identifier.
+
+    Integer worker numbers produce ``Worker-3``.
+    String agent IDs like ``agent-ab4722a2`` produce ``Agent-ab47``
+    (truncated to the first 4 hex chars for readability).
+    """
+    if isinstance(worker, int):
+        return f"Worker-{worker}"
+    s = str(worker)
+    if s.startswith("agent-") and len(s) > 10:
+        return f"Agent-{s[6:10]}"
+    return s
+
+
 def _parse_inbox_entry(entry: dict[str, Any]) -> Command:
     """Parse a structured inbox entry written by the responder daemon.
 
@@ -271,7 +286,7 @@ class PendingReply:
 class WorkerInfo:
     """Snapshot of a running worker for status reporting."""
 
-    worker_number: int
+    worker_number: int | str
     issue_number: int
     issue_title: str
     phase: str
@@ -309,7 +324,7 @@ class DispatcherBridge:
     dispatcher_inbox_path: str | None = None
     prs_since_last_audit: int = 0
     session_number: int = 0
-    _workers: dict[int, WorkerInfo] = field(default_factory=dict)
+    _workers: dict[int | str, WorkerInfo] = field(default_factory=dict)
     _stopped_issues: set[int] = field(default_factory=set)
     _recently_completed: list[dict[str, Any]] = field(default_factory=list)
     _pending_replies: dict[str, PendingReply] = field(default_factory=dict)
@@ -404,6 +419,7 @@ class DispatcherBridge:
         active_agents = [
             {
                 "worker_number": w.worker_number,
+                "agent_label": _worker_label(w.worker_number),
                 "issue_number": w.issue_number,
                 "issue_title": w.issue_title,
                 "phase": w.phase,
@@ -512,7 +528,7 @@ class DispatcherBridge:
         self._clear_state_file()
         await self.bridge.notify("Orchestrator session ended.")
 
-    async def task_started(self, *, issue_number: int, title: str, worker: int) -> None:
+    async def task_started(self, *, issue_number: int, title: str, worker: int | str) -> None:
         """Notify that a task agent has been spawned."""
         self._workers[worker] = WorkerInfo(
             worker_number=worker,
@@ -523,14 +539,15 @@ class DispatcherBridge:
         )
         self._save_state()
         self.write_status()
+        label = _worker_label(worker)
         await self.bridge.status_update(
             task=f"#{issue_number}",
             state="in_progress",
-            details=f"Starting: {title} (worker-{worker})",
+            details=f"Starting: {title} ({label})",
             repo=self.repo,
         )
 
-    async def task_completed(self, *, issue_number: int, summary: str, worker: int) -> None:
+    async def task_completed(self, *, issue_number: int, summary: str, worker: int | str) -> None:
         """Notify that a task agent has completed successfully."""
         self._workers.pop(worker, None)
         self._recently_completed.append(
@@ -550,7 +567,7 @@ class DispatcherBridge:
             repo=self.repo,
         )
 
-    async def task_failed(self, *, issue_number: int, error: str, worker: int) -> None:
+    async def task_failed(self, *, issue_number: int, error: str, worker: int | str) -> None:
         """Notify that a task agent has failed."""
         self._workers.pop(worker, None)
         self._recently_completed.append(
@@ -572,7 +589,7 @@ class DispatcherBridge:
 
     # ── Worker tracking ─────────────────────────────────────────────────
 
-    def update_worker(self, worker: int, *, phase: str) -> None:
+    def update_worker(self, worker: int | str, *, phase: str) -> None:
         """Update the tracked phase for *worker*."""
         if worker in self._workers:
             self._workers[worker].phase = phase
@@ -721,9 +738,8 @@ class DispatcherBridge:
 
         lines = []
         for w in workers:
-            lines.append(
-                f"Worker-{w.worker_number}: #{w.issue_number} ({w.phase}) \u2014 {w.issue_title}"
-            )
+            label = _worker_label(w.worker_number)
+            lines.append(f"{label}: #{w.issue_number} ({w.phase}) \u2014 {w.issue_title}")
         summary = "\n".join(lines)
         if self.paused:
             summary += "\n\n(paused \u2014 not spawning new work)"

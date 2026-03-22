@@ -8,13 +8,16 @@ This is a thin CLI wrapper around the ``telegram_bridge`` package's
 
 Usage::
 
-    scripts/tg-notify.py task_started <issue> <title> <worker>
-    scripts/tg-notify.py task_completed <issue> <summary> <worker>
-    scripts/tg-notify.py task_failed <issue> <error> <worker>
+    scripts/tg-notify.py task_started <issue> <title> <worker_or_agent_id>
+    scripts/tg-notify.py task_completed <issue> <summary> <worker_or_agent_id>
+    scripts/tg-notify.py task_failed <issue> <error> <worker_or_agent_id>
     scripts/tg-notify.py pr_merged <pr_number> <title>
     scripts/tg-notify.py session_started
     scripts/tg-notify.py session_ended
     scripts/tg-notify.py notify <message>
+
+The ``<worker_or_agent_id>`` parameter accepts either an integer worker
+number (e.g. ``3``) or a string agent ID (e.g. ``agent-ab4722a2``).
 
 The script exits silently (exit 0) when Telegram is not configured,
 so it is safe to call unconditionally.
@@ -30,12 +33,20 @@ import asyncio
 import sys
 
 
+def _parse_worker(value: str) -> int | str:
+    """Parse a worker identifier — integer worker number or string agent ID."""
+    try:
+        return int(value)
+    except ValueError:
+        return value
+
+
 def _usage() -> str:
     return (
         "Usage:\n"
-        "  scripts/tg-notify.py task_started <issue> <title> <worker>\n"
-        "  scripts/tg-notify.py task_completed <issue> <summary> <worker>\n"
-        "  scripts/tg-notify.py task_failed <issue> <error> <worker>\n"
+        "  scripts/tg-notify.py task_started <issue> <title> <worker_or_agent_id>\n"
+        "  scripts/tg-notify.py task_completed <issue> <summary> <worker_or_agent_id>\n"
+        "  scripts/tg-notify.py task_failed <issue> <error> <worker_or_agent_id>\n"
         "  scripts/tg-notify.py pr_merged <pr_number> <title>\n"
         "  scripts/tg-notify.py session_started\n"
         "  scripts/tg-notify.py session_ended\n"
@@ -78,7 +89,7 @@ async def _main(args: list[str]) -> int:
                 return 1
             issue = int(args[1])
             title = args[2]
-            worker = int(args[3])
+            worker = _parse_worker(args[3])
             await bridge.task_started(issue_number=issue, title=title, worker=worker)
 
         elif action == "task_completed":
@@ -90,7 +101,7 @@ async def _main(args: list[str]) -> int:
                 return 1
             issue = int(args[1])
             summary = args[2]
-            worker = int(args[3])
+            worker = _parse_worker(args[3])
             await bridge.task_completed(issue_number=issue, summary=summary, worker=worker)
 
         elif action == "task_failed":
@@ -102,7 +113,7 @@ async def _main(args: list[str]) -> int:
                 return 1
             issue = int(args[1])
             error = args[2]
-            worker = int(args[3])
+            worker = _parse_worker(args[3])
             await bridge.task_failed(issue_number=issue, error=error, worker=worker)
 
         elif action == "pr_merged":
