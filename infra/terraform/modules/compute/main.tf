@@ -18,11 +18,6 @@ data "aws_caller_identity" "current" {}
 resource "aws_cloudwatch_log_group" "scraper" {
   name              = "/ecs/judgemind-scraper-${var.environment}"
   retention_in_days = var.log_retention_days
-
-  tags = {
-    project     = "judgemind"
-    environment = var.environment
-  }
 }
 
 # ─── ECS Cluster ────────────────────────────────────────────────────────────
@@ -44,22 +39,12 @@ resource "aws_ecs_cluster" "main" {
       }
     }
   }
-
-  tags = {
-    project     = "judgemind"
-    environment = var.environment
-  }
 }
 
 # CloudWatch log group for ECS Exec session output.
 resource "aws_cloudwatch_log_group" "ecs_exec" {
   name              = "/ecs/judgemind-exec-${var.environment}"
   retention_in_days = var.log_retention_days
-
-  tags = {
-    project     = "judgemind"
-    environment = var.environment
-  }
 }
 
 # ─── Task Execution Role ───────────────────────────────────────────────────
@@ -80,11 +65,6 @@ resource "aws_iam_role" "ecs_task_execution" {
       }
     ]
   })
-
-  tags = {
-    project     = "judgemind"
-    environment = var.environment
-  }
 }
 
 resource "aws_iam_role_policy_attachment" "ecs_task_execution" {
@@ -123,11 +103,6 @@ resource "aws_security_group" "scraper" {
     to_port     = 5432
     protocol    = "tcp"
     cidr_blocks = ["0.0.0.0/0"]
-  }
-
-  tags = {
-    project     = "judgemind"
-    environment = var.environment
   }
 }
 
@@ -202,11 +177,6 @@ resource "aws_ecs_task_definition" "scraper" {
       }
     }
   ])
-
-  tags = {
-    project     = "judgemind"
-    environment = var.environment
-  }
 }
 
 # ─── EventBridge Scheduler ──────────────────────────────────────────────────
@@ -228,11 +198,6 @@ resource "aws_iam_role" "scheduler_execution" {
       }
     ]
   })
-
-  tags = {
-    project     = "judgemind"
-    environment = var.environment
-  }
 }
 
 resource "aws_iam_policy" "scheduler_run_task" {
@@ -264,11 +229,6 @@ resource "aws_iam_policy" "scheduler_run_task" {
       }
     ]
   })
-
-  tags = {
-    project     = "judgemind"
-    environment = var.environment
-  }
 }
 
 resource "aws_iam_role_policy_attachment" "scheduler_run_task" {
@@ -392,11 +352,6 @@ resource "aws_cloudwatch_log_group" "ingestion_worker" {
 
   name              = "/ecs/judgemind-ingestion-worker-${var.environment}"
   retention_in_days = var.log_retention_days
-
-  tags = {
-    project     = "judgemind"
-    environment = var.environment
-  }
 }
 
 # The ingestion worker needs outbound access to Redis (6379), Postgres (5432),
@@ -430,11 +385,6 @@ resource "aws_security_group" "ingestion_worker" {
     to_port     = 5432
     protocol    = "tcp"
     cidr_blocks = ["0.0.0.0/0"]
-  }
-
-  tags = {
-    project     = "judgemind"
-    environment = var.environment
   }
 }
 
@@ -509,11 +459,6 @@ resource "aws_ecs_task_definition" "ingestion_worker" {
       }
     }
   ])
-
-  tags = {
-    project     = "judgemind"
-    environment = var.environment
-  }
 }
 
 resource "aws_ecs_service" "ingestion_worker" {
@@ -543,11 +488,6 @@ resource "aws_ecs_service" "ingestion_worker" {
   # don't trigger a Terraform diff on every plan.
   lifecycle {
     ignore_changes = [task_definition]
-  }
-
-  tags = {
-    project     = "judgemind"
-    environment = var.environment
   }
 }
 
@@ -600,11 +540,6 @@ resource "aws_sns_topic" "scraper_alerts" {
   count = var.enable_alerts ? 1 : 0
 
   name = "judgemind-scraper-alerts-${var.environment}"
-
-  tags = {
-    project     = "judgemind"
-    environment = var.environment
-  }
 }
 
 resource "aws_sns_topic_subscription" "scraper_alerts_email" {
@@ -653,11 +588,6 @@ resource "aws_cloudwatch_metric_alarm" "scraper_no_success" {
 
   alarm_actions = [aws_sns_topic.scraper_alerts[0].arn]
   ok_actions    = [aws_sns_topic.scraper_alerts[0].arn]
-
-  tags = {
-    project     = "judgemind"
-    environment = var.environment
-  }
 }
 
 # ─── Data Quality Check Alerts ───────────────────────────────────────────────
@@ -700,11 +630,6 @@ resource "aws_cloudwatch_metric_alarm" "data_quality_no_run" {
 
   alarm_actions = [aws_sns_topic.scraper_alerts[0].arn]
   ok_actions    = [aws_sns_topic.scraper_alerts[0].arn]
-
-  tags = {
-    project     = "judgemind"
-    environment = var.environment
-  }
 }
 
 # ─── Ingestion Worker Crash-Loop Alerts ──────────────────────────────────────
@@ -750,9 +675,4 @@ resource "aws_cloudwatch_metric_alarm" "ingestion_worker_crash_loop" {
 
   alarm_actions = [aws_sns_topic.scraper_alerts[0].arn]
   ok_actions    = [aws_sns_topic.scraper_alerts[0].arn]
-
-  tags = {
-    project     = "judgemind"
-    environment = var.environment
-  }
 }
