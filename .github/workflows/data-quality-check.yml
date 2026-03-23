@@ -90,6 +90,11 @@ jobs:
 
           echo "exit_code=$EXIT_CODE" >> "$GITHUB_OUTPUT"
 
+          # Extract the ECS task ID from the captured output so downstream
+          # steps can fetch logs directly from CloudWatch if needed.
+          TASK_ID=$(grep 'Task ID:' /tmp/check_output.txt | tail -1 | awk '{print $NF}' || true)
+          echo "task_id=$TASK_ID" >> "$GITHUB_OUTPUT"
+
           if [ "$EXIT_CODE" -eq 0 ]; then
             echo "healthy=true" >> "$GITHUB_OUTPUT"
             echo "Data quality check passed: all counties healthy."
@@ -118,6 +123,80 @@ jobs:
 
           echo "Alert summary extracted (max severity: $MAX_SEVERITY):"
           cat /tmp/alert_summary.md
+
+      - name: Retry alert extraction from CloudWatch logs
+        id: retry-extraction
+        if: >-
+          steps.check.outputs.healthy == 'false' &&
+          steps.check.outputs.task_id != ''
+        env:
+          TASK_ID: ${{ steps.check.outputs.task_id }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          # If the initial extraction produced the fallback message, it means
+          # format-dq-summary.py could not parse the captured ECS output.
+          # This typically happens when CloudWatch log delivery is delayed —
+          # ecs-run-task.sh streams logs in real-time but may miss the final
+          # output lines.
+          #
+          # Defense-in-depth: independently retrieve logs from CloudWatch
+          # post-hoc and re-run the extraction.
+          if ! grep -q "Could not extract alert details" /tmp/alert_summary.md 2>/dev/null; then
+            echo "Initial extraction succeeded — no retry needed."
+            exit 0
+          fi
+
+          echo "Initial extraction failed — retrying via CloudWatch logs."
+          LOG_GROUP="/ecs/judgemind-ingestion-worker-dev"
+          MAX_RETRIES=3
+          RETRY=0
+          EXTRACTED=false
+
+          while [ "$RETRY" -lt "$MAX_RETRIES" ]; do
+            RETRY=$((RETRY + 1))
+            # Exponential backoff: 15s, 30s, 60s
+            WAIT=$((15 * (1 << (RETRY - 1))))
+            echo "Retry $RETRY/$MAX_RETRIES: waiting ${WAIT}s for CloudWatch log delivery..."
+            sleep "$WAIT"
+
+            # Fetch logs directly from CloudWatch using the task ID
+            if scripts/ecs-logs.sh "$LOG_GROUP" --task "$TASK_ID" --lines 200 > /tmp/retry_output.txt 2>/dev/null; then
+              echo "Retrieved $(wc -l < /tmp/retry_output.txt) lines from CloudWatch."
+
+              # Re-run format-dq-summary.py on the fresh output
+              RETRY_MARKDOWN=$(python3 scripts/format-dq-summary.py /tmp/retry_output.txt 2>/dev/null || true)
+              if [ -n "$RETRY_MARKDOWN" ]; then
+                echo "Retry $RETRY: extraction succeeded."
+                echo "$RETRY_MARKDOWN" > /tmp/alert_summary.md
+
+                RETRY_TELEGRAM=$(python3 scripts/format-dq-summary.py --telegram /tmp/retry_output.txt 2>/dev/null || echo "Alert details unavailable.")
+                echo "$RETRY_TELEGRAM" > /tmp/alert_telegram.txt
+
+                RETRY_SEVERITY=$(python3 scripts/format-dq-summary.py --max-severity /tmp/retry_output.txt 2>/dev/null || echo "p1")
+                echo "max_severity=$RETRY_SEVERITY" >> "$GITHUB_OUTPUT"
+
+                EXTRACTED=true
+                break
+              else
+                echo "Retry $RETRY: extraction still failed — log content may be incomplete."
+              fi
+            else
+              echo "Retry $RETRY: could not retrieve logs from CloudWatch."
+            fi
+          done
+
+          if [ "$EXTRACTED" = "false" ]; then
+            echo "All $MAX_RETRIES retries failed. Adding extraction failure note."
+            {
+              echo "**Warning:** Could not extract alert details from check output."
+              echo "CloudWatch log retrieval failed after $MAX_RETRIES retries."
+              echo ""
+              echo "Inspect the workflow run logs manually for alert details:"
+              echo "${RUN_URL}"
+            } > /tmp/alert_summary.md
+
+            echo "Alert details unavailable — see workflow run logs." > /tmp/alert_telegram.txt
+          fi
 
       - name: Check for existing open issue
         if: steps.check.outputs.healthy == 'false'
@@ -149,14 +228,20 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-          MAX_SEVERITY: ${{ steps.summary.outputs.max_severity }}
+          MAX_SEVERITY_SUMMARY: ${{ steps.summary.outputs.max_severity }}
+          MAX_SEVERITY_RETRY: ${{ steps.retry-extraction.outputs.max_severity }}
         run: |
           TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+          # Use the retry step's severity if available (it ran after the initial
+          # extraction and may have updated the value). Fall back to the initial
+          # extraction's severity, then default to p1.
+          MAX_SEVERITY="${MAX_SEVERITY_RETRY:-${MAX_SEVERITY_SUMMARY:-p1}}"
 
           # Use the max alert severity to set the issue priority label.
           # p1 alerts (zero rulings, very stale) -> priority/p1
           # p2-only alerts (ingest rate drops, moderately stale) -> priority/p2
-          PRIORITY_LABEL="priority/${MAX_SEVERITY:-p1}"
+          PRIORITY_LABEL="priority/${MAX_SEVERITY}"
 
           {
             echo "## Data Quality Check Failure"
