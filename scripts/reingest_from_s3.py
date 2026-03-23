@@ -83,6 +83,7 @@ from ingestion.db import (  # noqa: E402
 from ingestion.extract import (  # noqa: E402
     extract_case_number,
     extract_case_title,
+    extract_case_type_from_motion_type,
     extract_case_type_from_number,
     extract_hearing_date,
     extract_judge_name,
@@ -627,6 +628,17 @@ def _reparse_document(
         if val:
             extracted["case_type"] = val
             extraction_methods.setdefault("case_type", "regex")
+
+    # Fallback case_type from motion_type (#1731).
+    # Final fallback for cases where the case number has no embedded
+    # type code (e.g. Ventura's all-digit case numbers like
+    # 202300574258).  Many civil motion types unambiguously identify
+    # the case type.
+    if not extracted["case_type"] and extracted["motion_type"]:
+        val = extract_case_type_from_motion_type(extracted["motion_type"])
+        if val:
+            extracted["case_type"] = val
+            extraction_methods.setdefault("case_type", "motion_type")
 
     if extraction_methods:
         logger.info(
