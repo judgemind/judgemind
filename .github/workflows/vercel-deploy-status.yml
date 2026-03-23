@@ -57,8 +57,8 @@ jobs:
       - name: Wait for Vercel deployment
         env:
           VERCEL_TOKEN: ${{ secrets.VERCEL_API_TOKEN }}
-          VERCEL_PROJECT: judgemind-web-dev
-          VERCEL_TEAM_SLUG: judgemind2026-7926s-projects
+          VERCEL_PROJECT_ID: prj_tJb9qtGPh8GUPitBb1Y4UpoW31r8
+          VERCEL_TEAM_ID: team_m3MypOYIqhxoQkSHVe8Vkket
           COMMIT_SHA: ${{ github.sha }}
         run: |
           echo "Waiting for Vercel deployment for commit ${COMMIT_SHA}..."
@@ -84,12 +84,12 @@ jobs:
               echo "Using fallback query (recent deployments, no SHA filter)"
               RESPONSE=$(curl -s \
                 -H "Authorization: Bearer $VERCEL_TOKEN" \
-                "https://api.vercel.com/v6/deployments?projectId=$VERCEL_PROJECT&teamId=$VERCEL_TEAM_SLUG&target=production&limit=5&since=$START_TIME_MS")
+                "https://api.vercel.com/v6/deployments?projectId=$VERCEL_PROJECT_ID&teamId=$VERCEL_TEAM_ID&target=production&limit=5&since=$START_TIME_MS")
             else
               # Primary: query by exact commit SHA
               RESPONSE=$(curl -s \
                 -H "Authorization: Bearer $VERCEL_TOKEN" \
-                "https://api.vercel.com/v6/deployments?projectId=$VERCEL_PROJECT&teamId=$VERCEL_TEAM_SLUG&meta-githubCommitSha=$COMMIT_SHA&limit=1")
+                "https://api.vercel.com/v6/deployments?projectId=$VERCEL_PROJECT_ID&teamId=$VERCEL_TEAM_ID&meta-githubCommitSha=$COMMIT_SHA&limit=1")
             fi
 
             # Parse deployment state and URL from the response
