@@ -32,6 +32,12 @@
       "schedule_type": "daily",
       "posting_days": ["Mon", "Tue", "Wed", "Thu", "Fri"]
     },
+    "San Diego": {
+      "expected_daily_rulings": 0,
+      "schedule_type": "daily",
+      "posting_days": [],
+      "low_volume": true
+    },
     "Ventura": {
       "expected_daily_rulings": 5,
       "schedule_type": "daily",
@@ -96,6 +102,21 @@
       "parties": 100.0,
       "hearing_date": 100.0,
       "case_type": 100.0
+    },
+    "San Diego": {
+      "total_documents": 1,
+      "ruling": 0.0,
+      "judge": 0.0,
+      "motion_type": 0.0,
+      "outcome": 0.0,
+      "case_title": 0.0,
+      "case_number": 0.0,
+      "parties": 0.0,
+      "hearing_date": 0.0,
+      "case_type": 0.0,
+      "_known_gaps": {
+        "_note": "No active scraper for San Diego yet. Only 1 ruling in DB. Baselines zeroed to prevent false alerts."
+      }
     },
     "San Francisco": {
       "total_documents": 39,

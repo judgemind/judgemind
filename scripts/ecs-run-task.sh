@@ -695,6 +695,7 @@ LOG_GROUP="/ecs/judgemind-ingestion-worker-${ENVIRONMENT}"
 LOG_STREAM_NAME=""
 LOG_NEXT_TOKEN=""
 LOG_STREAMING=false
+LOG_EVENTS_EMITTED=false
 
 # find_log_stream — Locate the CloudWatch log stream for this task.
 # The stream name follows the pattern: oneshot/oneshot/<task-id>
@@ -772,6 +773,7 @@ print(data.get('nextForwardToken', ''))
 
     if [[ -n "$messages" ]]; then
         echo "$messages"
+        LOG_EVENTS_EMITTED=true
     fi
 
     if [[ -n "$new_token" ]]; then
@@ -889,11 +891,14 @@ fi
 
 # ─── Step 8: Retrieve and display CloudWatch logs (fallback) ─────────────────
 
-# If live streaming was active, logs were already shown above. Only do the
-# full post-hoc retrieval if we never managed to stream (e.g. log stream
-# wasn't found during the poll loop, or the task was very short-lived).
+# Fall through to the post-hoc retrieval if:
+#   (a) live streaming was never established (log stream not found), OR
+#   (b) live streaming was established but no events were ever emitted.
+# Case (b) happens for short-lived tasks: the log stream is created, but
+# CloudWatch hasn't ingested the events yet during the brief final flush.
+# Without this fallback, the script output would be silently lost.
 
-if [[ "$LOG_STREAMING" == "false" ]]; then
+if [[ "$LOG_STREAMING" == "false" || "$LOG_EVENTS_EMITTED" == "false" ]]; then
     echo "" >&2
     echo "─── Task Logs ───────────────────────────────────────────────────" >&2
 
