@@ -64,13 +64,15 @@ async function seedData(): Promise<void> {
     { county: 'San Diego', metric_name: 'scraper_last_success_age_hours', metric_value: 48, recorded_at: '2026-03-01T10:00:00Z' },
     // Older LA metric (for time range filtering test)
     { county: 'Los Angeles', metric_name: 'ruling_count_24h', metric_value: 30, recorded_at: '2026-02-01T10:00:00Z' },
-    // Additional hourly data for aggregation tests — same 4-hour bucket (08:00-11:59)
-    { county: 'Los Angeles', metric_name: 'ruling_count_24h', metric_value: 38, recorded_at: '2026-03-01T11:00:00Z' },
+    // --- Aggregation test data: uses "Riverside" county to avoid polluting existing tests ---
+    // Same 4-hour bucket (08:00-11:59): two hourly records
+    { county: 'Riverside', metric_name: 'ruling_count_24h', metric_value: 42, recorded_at: '2026-03-01T10:00:00Z' },
+    { county: 'Riverside', metric_name: 'ruling_count_24h', metric_value: 38, recorded_at: '2026-03-01T11:00:00Z' },
     // Different 4-hour bucket (12:00-15:59)
-    { county: 'Los Angeles', metric_name: 'ruling_count_24h', metric_value: 50, recorded_at: '2026-03-01T13:00:00Z' },
+    { county: 'Riverside', metric_name: 'ruling_count_24h', metric_value: 50, recorded_at: '2026-03-01T13:00:00Z' },
     // Second day for daily aggregation tests
-    { county: 'Los Angeles', metric_name: 'ruling_count_24h', metric_value: 60, recorded_at: '2026-03-02T10:00:00Z' },
-    { county: 'Los Angeles', metric_name: 'ruling_count_24h', metric_value: 40, recorded_at: '2026-03-02T14:00:00Z' },
+    { county: 'Riverside', metric_name: 'ruling_count_24h', metric_value: 60, recorded_at: '2026-03-02T10:00:00Z' },
+    { county: 'Riverside', metric_name: 'ruling_count_24h', metric_value: 40, recorded_at: '2026-03-02T14:00:00Z' },
   ];
 
   for (const m of metricsData) {
@@ -303,7 +305,7 @@ describe('dataQualityMetrics', () => {
     const body = await gql(
       `{
         dataQualityMetrics(
-          county: "Los Angeles"
+          county: "Riverside"
           metricName: "ruling_count_24h"
           startDate: "2026-03-01T00:00:00Z"
           endDate: "2026-03-01T23:59:59Z"
@@ -319,16 +321,16 @@ describe('dataQualityMetrics', () => {
     expect(body.errors).toBeUndefined();
     const conn = body.data?.dataQualityMetrics as Record<string, unknown>;
     const edges = conn.edges as Array<{ node: { id: string; recordedAt: string; metricValue: number; county: string; metricName: string }; cursor: string }>;
-    // March 1 has three LA ruling_count_24h entries:
+    // March 1 has three Riverside ruling_count_24h entries:
     //   10:00 (42), 11:00 (38) → same 08:00 bucket → avg = 40
     //   13:00 (50) → 12:00 bucket → avg = 50
     expect(edges.length).toBe(2);
     // Ordered by bucket DESC — 12:00 bucket first, then 08:00 bucket
     expect(edges[0].node.metricValue).toBe(50);
     expect(edges[1].node.metricValue).toBe(40);
-    // Both should be LA ruling_count_24h
+    // Both should be Riverside ruling_count_24h
     edges.forEach((e) => {
-      expect(e.node.county).toBe('Los Angeles');
+      expect(e.node.county).toBe('Riverside');
       expect(e.node.metricName).toBe('ruling_count_24h');
     });
     // Cursors should be present
@@ -343,7 +345,7 @@ describe('dataQualityMetrics', () => {
     const body = await gql(
       `{
         dataQualityMetrics(
-          county: "Los Angeles"
+          county: "Riverside"
           metricName: "ruling_count_24h"
           startDate: "2026-03-01T00:00:00Z"
           endDate: "2026-03-02T23:59:59Z"
@@ -374,7 +376,7 @@ describe('dataQualityMetrics', () => {
     const body = await gql(
       `{
         dataQualityMetrics(
-          county: "Los Angeles"
+          county: "Riverside"
           metricName: "ruling_count_24h"
           startDate: "2026-03-01T00:00:00Z"
           endDate: "2026-03-01T23:59:59Z"
@@ -400,7 +402,7 @@ describe('dataQualityMetrics', () => {
     const page1 = await gql(
       `{
         dataQualityMetrics(
-          county: "Los Angeles"
+          county: "Riverside"
           metricName: "ruling_count_24h"
           startDate: "2026-03-01T00:00:00Z"
           endDate: "2026-03-02T23:59:59Z"
@@ -425,7 +427,7 @@ describe('dataQualityMetrics', () => {
     const page2 = await gql(
       `query($after: String) {
         dataQualityMetrics(
-          county: "Los Angeles"
+          county: "Riverside"
           metricName: "ruling_count_24h"
           startDate: "2026-03-01T00:00:00Z"
           endDate: "2026-03-02T23:59:59Z"
