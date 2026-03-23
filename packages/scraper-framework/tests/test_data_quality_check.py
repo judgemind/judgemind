@@ -282,14 +282,14 @@ class TestCheckIngestRates:
 
     def test_healthy_county_no_alerts(self) -> None:
         """No alerts when 24h count is above 50% of 7-day average."""
-        # Use unique keys: the 7d query contains "AND d.created_at <" which
+        # Use unique keys: the 7d query contains "AND d.captured_at <" which
         # is NOT in the 24h query. The 24h query uses a unique substring.
         conn = FakeConnection(
             {
-                # 7d query — key matches "d.created_at <" (unique to 7d query)
-                "d.created_at <": [("Los Angeles", 200)],
-                # 24h query — key matches "d.created_at >=" (in both, but 7d matched first)
-                "d.created_at >=": [("Los Angeles", 30)],
+                # 7d query — key matches "d.captured_at <" (unique to 7d query)
+                "d.captured_at <": [("Los Angeles", 200)],
+                # 24h query — key matches "d.captured_at >=" (in both, but 7d matched first)
+                "d.captured_at >=": [("Los Angeles", 30)],
                 # Active counties
                 "DISTINCT ct.county": [("Los Angeles",)],
             }
@@ -302,8 +302,8 @@ class TestCheckIngestRates:
         """P1 alert when county has zero rulings in 24h but expects some."""
         conn = FakeConnection(
             {
-                "d.created_at <": [("Los Angeles", 200)],
-                "d.created_at >=": [],  # 0 rulings in 24h
+                "d.captured_at <": [("Los Angeles", 200)],
+                "d.captured_at >=": [],  # 0 rulings in 24h
                 "DISTINCT ct.county": [("Los Angeles",)],
             }
         )
@@ -319,9 +319,9 @@ class TestCheckIngestRates:
         """P2 alert when 24h count is below 50% of 7-day average."""
         conn = FakeConnection(
             {
-                "d.created_at <": [("Los Angeles", 200)],
+                "d.captured_at <": [("Los Angeles", 200)],
                 # 5 rulings in 24h — well below 50% of ~33/day avg
-                "d.created_at >=": [("Los Angeles", 5)],
+                "d.captured_at >=": [("Los Angeles", 5)],
                 "DISTINCT ct.county": [("Los Angeles",)],
             }
         )
@@ -336,8 +336,8 @@ class TestCheckIngestRates:
         """Only checks the specified county when filter is provided."""
         conn = FakeConnection(
             {
-                "d.created_at <": [],
-                "d.created_at >=": [],
+                "d.captured_at <": [],
+                "d.captured_at >=": [],
                 "DISTINCT ct.county": [("Orange",)],
             }
         )
@@ -351,8 +351,8 @@ class TestCheckIngestRates:
         """Uses 7-day average when no baseline exists for the county."""
         conn = FakeConnection(
             {
-                "d.created_at <": [("Unknown County", 100)],
-                "d.created_at >=": [],  # 0 rulings
+                "d.captured_at <": [("Unknown County", 100)],
+                "d.captured_at >=": [],  # 0 rulings
                 "DISTINCT ct.county": [("Unknown County",)],
             }
         )
@@ -365,11 +365,11 @@ class TestCheckIngestRates:
         """Checks multiple counties and generates appropriate alerts."""
         conn = FakeConnection(
             {
-                "d.created_at <": [
+                "d.captured_at <": [
                     ("Los Angeles", 200),
                     ("Orange", 100),
                 ],
-                "d.created_at >=": [("Los Angeles", 30), ("Orange", 0)],
+                "d.captured_at >=": [("Los Angeles", 30), ("Orange", 0)],
                 "DISTINCT ct.county": [("Los Angeles",), ("Orange",)],
             }
         )
@@ -446,8 +446,8 @@ class TestCheckIngestRatesPostingDays:
         sunday = datetime(2026, 3, 22, 12, 0, 0, tzinfo=UTC)
         conn = FakeConnection(
             {
-                "d.created_at <": [],
-                "d.created_at >=": [],
+                "d.captured_at <": [],
+                "d.captured_at >=": [],
                 "DISTINCT ct.county": [("Santa Clara",)],
             }
         )
@@ -469,8 +469,8 @@ class TestCheckIngestRatesPostingDays:
         thursday = datetime(2026, 3, 19, 12, 0, 0, tzinfo=UTC)
         conn = FakeConnection(
             {
-                "d.created_at <": [],
-                "d.created_at >=": [],
+                "d.captured_at <": [],
+                "d.captured_at >=": [],
                 "DISTINCT ct.county": [("Santa Clara",)],
             }
         )
@@ -498,8 +498,8 @@ class TestCheckIngestRatesPostingDays:
         friday = datetime(2026, 3, 20, 12, 0, 0, tzinfo=UTC)
         conn = FakeConnection(
             {
-                "d.created_at <": [],
-                "d.created_at >=": [],
+                "d.captured_at <": [],
+                "d.captured_at >=": [],
                 "DISTINCT ct.county": [("Santa Clara",)],
             }
         )
@@ -526,8 +526,8 @@ class TestCheckIngestRatesPostingDays:
         tuesday = datetime(2026, 3, 24, 12, 0, 0, tzinfo=UTC)
         conn = FakeConnection(
             {
-                "d.created_at <": [],
-                "d.created_at >=": [],
+                "d.captured_at <": [],
+                "d.captured_at >=": [],
                 "DISTINCT ct.county": [("Ventura",)],
             }
         )
@@ -554,8 +554,8 @@ class TestCheckIngestRatesPostingDays:
         saturday = datetime(2026, 3, 21, 16, 49, 0, tzinfo=UTC)
         conn = FakeConnection(
             {
-                "d.created_at <": [],
-                "d.created_at >=": [],
+                "d.captured_at <": [],
+                "d.captured_at >=": [],
                 "DISTINCT ct.county": [("Ventura",)],
             }
         )
@@ -576,8 +576,8 @@ class TestCheckIngestRatesPostingDays:
         sunday = datetime(2026, 3, 22, 12, 0, 0, tzinfo=UTC)
         conn = FakeConnection(
             {
-                "d.created_at <": [("Los Angeles", 200)],
-                "d.created_at >=": [],
+                "d.captured_at <": [("Los Angeles", 200)],
+                "d.captured_at >=": [],
                 "DISTINCT ct.county": [("Los Angeles",)],
             }
         )
@@ -606,9 +606,9 @@ class TestCheckIngestRatesPostingDays:
         saturday = datetime(2026, 3, 21, 16, 49, 0, tzinfo=UTC)
         conn = FakeConnection(
             {
-                "d.created_at <": [("Los Angeles", 1200)],
+                "d.captured_at <": [("Los Angeles", 1200)],
                 # 7 rulings in 24h — well below 50% of ~200/day avg
-                "d.created_at >=": [("Los Angeles", 7)],
+                "d.captured_at >=": [("Los Angeles", 7)],
                 "DISTINCT ct.county": [("Los Angeles",)],
             }
         )
@@ -634,9 +634,9 @@ class TestCheckIngestRatesPostingDays:
         wednesday = datetime(2026, 3, 18, 12, 0, 0, tzinfo=UTC)
         conn = FakeConnection(
             {
-                "d.created_at <": [("Los Angeles", 1200)],
+                "d.captured_at <": [("Los Angeles", 1200)],
                 # 5 rulings in 24h — well below 50% of ~200/day avg
-                "d.created_at >=": [("Los Angeles", 5)],
+                "d.captured_at >=": [("Los Angeles", 5)],
                 "DISTINCT ct.county": [("Los Angeles",)],
             }
         )
@@ -660,9 +660,9 @@ class TestCheckIngestRatesPostingDays:
         sunday = datetime(2026, 3, 22, 12, 0, 0, tzinfo=UTC)
         conn = FakeConnection(
             {
-                "d.created_at <": [("Los Angeles", 1200)],
+                "d.captured_at <": [("Los Angeles", 1200)],
                 # 5 rulings in 24h — well below 50% of ~200/day avg
-                "d.created_at >=": [("Los Angeles", 5)],
+                "d.captured_at >=": [("Los Angeles", 5)],
                 "DISTINCT ct.county": [("Los Angeles",)],
             }
         )
@@ -679,6 +679,121 @@ class TestCheckIngestRatesPostingDays:
         assert len(alerts) == 1
         assert alerts[0].metric == "ingest_rate"
         assert alerts[0].severity == "p2"
+
+
+class TestBackfillSpikeResilience:
+    """Tests that ingest rate checks are resilient to backfill spikes.
+
+    These tests verify the fix for #1693: when a backfill/catch-up creates
+    many documents in a short period, the 7-day rolling average should NOT
+    be inflated because the queries use ``captured_at`` (court posting time)
+    rather than ``created_at`` (pipeline processing time).
+    """
+
+    def test_backfill_spike_does_not_inflate_average(self) -> None:
+        """Normal 24h count should not trigger alert even after a backfill.
+
+        Scenario: OC had a backfill that caught up 953 documents in 2 days.
+        With captured_at, the 7-day window reflects actual court posting
+        dates (spread across the week), not the spike of pipeline processing.
+        A normal day of 20 captures should be healthy against a normal average.
+        """
+        conn = FakeConnection(
+            {
+                # 7d window: 120 total over 6 days = ~20/day average
+                # (reflects actual court posting dates, not backfill spike)
+                "d.captured_at <": [("Orange", 120)],
+                # 24h: 18 captures — within normal range
+                "d.captured_at >=": [("Orange", 18)],
+                "DISTINCT ct.county": [("Orange",)],
+            }
+        )
+        baselines = _make_baselines(
+            {
+                "Orange": {
+                    "expected_daily_rulings": 20,
+                    "schedule_type": "daily",
+                    "posting_days": ["Mon", "Tue", "Wed", "Thu", "Fri"],
+                },
+            }
+        )
+        wednesday = datetime(2026, 3, 18, 12, 0, 0, tzinfo=UTC)
+        alerts = check_ingest_rates(conn, wednesday, baselines)
+        assert len(alerts) == 0
+
+    def test_genuine_scraper_failure_still_detected(self) -> None:
+        """A real scraper failure (0 captures on a weekday) still fires alert.
+
+        Even with captured_at-based averaging, a genuine outage where zero
+        new rulings appear on an expected posting day must be detected.
+        """
+        conn = FakeConnection(
+            {
+                # 7d window: normal volume
+                "d.captured_at <": [("Orange", 120)],
+                # 24h: zero captures — scraper is down
+                "d.captured_at >=": [],
+                "DISTINCT ct.county": [("Orange",)],
+            }
+        )
+        baselines = _make_baselines(
+            {
+                "Orange": {
+                    "expected_daily_rulings": 20,
+                    "schedule_type": "daily",
+                    "posting_days": ["Mon", "Tue", "Wed", "Thu", "Fri"],
+                },
+            }
+        )
+        wednesday = datetime(2026, 3, 18, 12, 0, 0, tzinfo=UTC)
+        alerts = check_ingest_rates(conn, wednesday, baselines)
+        assert len(alerts) == 1
+        assert alerts[0].metric == "zero_rulings"
+        assert alerts[0].severity == "p1"
+        assert alerts[0].county == "Orange"
+        assert alerts[0].actual == 0
+
+    def test_genuine_rate_drop_still_detected(self) -> None:
+        """A genuine ingest rate drop (not a backfill artifact) still fires.
+
+        If the court actually posted fewer rulings than normal (not just a
+        backfill timing artifact), the alert should fire on a posting day.
+        """
+        conn = FakeConnection(
+            {
+                # 7d window: 120 over 6 days = ~20/day
+                "d.captured_at <": [("Orange", 120)],
+                # 24h: only 5 captures — well below 50% of 20/day
+                "d.captured_at >=": [("Orange", 5)],
+                "DISTINCT ct.county": [("Orange",)],
+            }
+        )
+        baselines = _make_baselines(
+            {
+                "Orange": {
+                    "expected_daily_rulings": 20,
+                    "schedule_type": "daily",
+                    "posting_days": ["Mon", "Tue", "Wed", "Thu", "Fri"],
+                },
+            }
+        )
+        wednesday = datetime(2026, 3, 18, 12, 0, 0, tzinfo=UTC)
+        alerts = check_ingest_rates(conn, wednesday, baselines)
+        assert len(alerts) == 1
+        assert alerts[0].metric == "ingest_rate"
+        assert alerts[0].severity == "p2"
+        assert alerts[0].actual == 5
+
+    def test_queries_use_captured_at_not_created_at(self) -> None:
+        """Verify both SQL queries reference captured_at, not created_at.
+
+        This is a direct regression test for #1693: the queries must use
+        d.captured_at to avoid backfill spikes inflating the rolling average.
+        """
+        assert "d.captured_at" in dqc.RULING_COUNTS_24H_QUERY
+        assert "d.created_at" not in dqc.RULING_COUNTS_24H_QUERY
+        assert "d.captured_at" in dqc.RULING_COUNTS_7D_QUERY
+        assert "d.created_at" not in dqc.RULING_COUNTS_7D_QUERY
 
 
 class TestCheckScraperStaleness:
@@ -1028,8 +1143,8 @@ class TestRunChecks:
                 "has_ruling": [],
                 # "orphaned_docs" matches ORPHANED_DOCUMENTS_QUERY.
                 "orphaned_docs": [],
-                "d.created_at <": [("Los Angeles", 200)],
-                "d.created_at >=": [],
+                "d.captured_at <": [("Los Angeles", 200)],
+                "d.captured_at >=": [],
                 "DISTINCT ct.county": [("Los Angeles",)],
                 "scraper_runs": [("ca-la-tentatives-civil", "Los Angeles", old_time, "success")],
                 "MAX(d.captured_at)": [],
@@ -1064,11 +1179,11 @@ class TestRunChecks:
                 "has_ruling": [],
                 # "orphaned_docs" matches ORPHANED_DOCUMENTS_QUERY.
                 "orphaned_docs": [],
-                "d.created_at <": [
+                "d.captured_at <": [
                     ("Los Angeles", 200),
                     ("Orange", 100),
                 ],
-                "d.created_at >=": [("Los Angeles", 40), ("Orange", 15)],
+                "d.captured_at >=": [("Los Angeles", 40), ("Orange", 15)],
                 "DISTINCT ct.county": [("Los Angeles",), ("Orange",)],
                 "scraper_runs": [
                     ("ca-la-tentatives-civil", "Los Angeles", recent, "success"),
@@ -2526,8 +2641,8 @@ class TestCollectFullMetrics:
         # Order matters: more specific keys first so they match before generic ones.
         conn = FakeConnection(
             {
-                # RULING_COUNTS_7D_QUERY (has "created_at < %s", 24h query does not)
-                "created_at < %s": [],
+                # RULING_COUNTS_7D_QUERY (has "captured_at < %s", 24h query does not)
+                "captured_at < %s": [],
                 # RULING_COUNTS_24H_QUERY (generic "ruling_count" matches this)
                 "AS ruling_count": [("Los Angeles", 42)],
                 # RULING_COUNT_BY_TYPE_QUERY
@@ -2556,8 +2671,8 @@ class TestCollectFullMetrics:
         """Collects ruling_count_7d_avg from 7-day window."""
         conn = FakeConnection(
             {
-                # 7d query matches first via "created_at < %s"
-                "created_at < %s": [("Orange", 120)],
+                # 7d query matches first via "captured_at < %s"
+                "captured_at < %s": [("Orange", 120)],
                 # 24h query matches via "AS ruling_count"
                 "AS ruling_count": [],
                 "d.document_type": [],
@@ -2577,7 +2692,7 @@ class TestCollectFullMetrics:
         """Collects overall and per-field completeness metrics."""
         conn = FakeConnection(
             {
-                "created_at < %s": [],
+                "captured_at < %s": [],
                 "AS ruling_count": [],
                 "d.document_type": [],
                 "has_ruling": [
@@ -2619,7 +2734,7 @@ class TestCollectFullMetrics:
         two_hours_ago = NOW - timedelta(hours=2)
         conn = FakeConnection(
             {
-                "created_at < %s": [],
+                "captured_at < %s": [],
                 "AS ruling_count": [],
                 "d.document_type": [],
                 "has_ruling": [],
@@ -2636,7 +2751,7 @@ class TestCollectFullMetrics:
         """Collects scraper_run_success_rate_24h with error metadata."""
         conn = FakeConnection(
             {
-                "created_at < %s": [],
+                "captured_at < %s": [],
                 "AS ruling_count": [],
                 "d.document_type": [],
                 "has_ruling": [],
@@ -2666,7 +2781,7 @@ class TestCollectFullMetrics:
         """Handles None error_details (all runs succeeded)."""
         conn = FakeConnection(
             {
-                "created_at < %s": [],
+                "captured_at < %s": [],
                 "AS ruling_count": [],
                 "d.document_type": [],
                 "has_ruling": [],
@@ -2684,7 +2799,7 @@ class TestCollectFullMetrics:
         """Collects metrics for multiple counties."""
         conn = FakeConnection(
             {
-                "created_at < %s": [],
+                "captured_at < %s": [],
                 "AS ruling_count": [("Los Angeles", 40), ("Orange", 15)],
                 "d.document_type": [],
                 "has_ruling": [],
@@ -2703,7 +2818,7 @@ class TestCollectFullMetrics:
         """Includes document IDs with gaps in field completeness metadata."""
         conn = FakeConnection(
             {
-                "created_at < %s": [],
+                "captured_at < %s": [],
                 "AS ruling_count": [],
                 "d.document_type": [],
                 "has_ruling": [
@@ -2727,7 +2842,7 @@ class TestCollectFullMetrics:
         """FIELD_GAP_DOCS_QUERY receives both window cutoff and grace cutoff."""
         conn = FakeConnection(
             {
-                "created_at < %s": [],
+                "captured_at < %s": [],
                 "AS ruling_count": [],
                 "d.document_type": [],
                 "has_ruling": [],
@@ -2922,7 +3037,7 @@ class TestPersistMetrics:
         two_hours_ago = NOW - timedelta(hours=2)
         conn = FakeConnection(
             {
-                "created_at < %s": [("TestCounty", 210)],
+                "captured_at < %s": [("TestCounty", 210)],
                 "AS ruling_count": [("TestCounty", 50)],
                 "d.document_type": [("TestCounty", "ruling", 50)],
                 "has_ruling": [
