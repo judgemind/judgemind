@@ -3800,7 +3800,7 @@ class TestFullReparseDocument:
             )
 
             # First ruling: split-provided fields should NOT be overwritten
-            assert result[0]["outcome"] == "Granted"  # from split, not regex "denied"
+            assert result[0]["outcome"] == "granted"  # from split (normalized), not regex "denied"
             assert result[0]["case_title"] == "Yeldell V. Henss"
             assert result[0]["motion_type"] == "Demurrer"
             assert result[0]["extraction_methods"]["outcome"] == "split"
