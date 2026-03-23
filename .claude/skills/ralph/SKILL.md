@@ -221,9 +221,15 @@ The Claude reviewer prompt should be:
 >    - **SHIP**: The implementation is correct, well-tested, properly scoped, ALL locally-verifiable acceptance criteria are met, and ready for PR. Write "SHIP" to `{worktree}/tmp/ralph/review-result.txt`.
 >    - **REVISE**: Something needs to change. Write "REVISE" to `{worktree}/tmp/ralph/review-result.txt`. Then write specific, actionable feedback to `{worktree}/tmp/ralph/feedback.md` — describe exactly what needs to change and why. Be concrete: reference specific files, functions, and line numbers. **If any acceptance criterion is unmet, list it first in your feedback.**
 >
+> Scope boundaries:
+> - **Only flag issues introduced or modified by this diff.** Pre-existing code patterns that were not changed in this PR are out of scope — even if they look questionable. The worker is not responsible for fixing code they did not touch.
+> - **Check the architecture spec before flagging missing functionality.** The system has multiple pipeline stages (capture, transcription, enrichment). If you think a feature is missing, it may be handled by a different stage. Do not flag "missing extraction" in a transcription module if extraction is an enrichment responsibility, for example.
+> - **Do not flag cross-concern gaps** unless the diff explicitly claims to address them. If the task requirements say "implement X," do not REVISE because Y is also missing — Y is a separate task.
+>
 > Rules:
 > - Be rigorous but not pedantic. Don't request style changes that don't affect correctness or readability.
 > - Don't request changes outside the scope of the task.
+> - Don't flag pre-existing patterns not introduced by this diff.
 > - **Unmet acceptance criteria are always REVISE.** Never SHIP if any locally-verifiable acceptance criterion is not satisfied.
 > - If you say REVISE, your feedback must be specific enough that the worker can act on it without guessing.
 > - **Unchecked test plan items are always blockers.** Never approve a PR with unchecked test plan checkboxes.
