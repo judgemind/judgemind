@@ -274,18 +274,14 @@ The ingestion pipeline converts raw captured content into structured ruling reco
 
 **Transcription** varies by content format:
 - **HTML documents** (e.g., LA County): text is extracted directly from HTML markup. No LLM needed — BeautifulSoup parsing is sufficient. Case splitting uses HTML structure (dividers, headings).
-- **PDF documents** (e.g., OC, Riverside, Santa Clara): pages are rendered as images and sent to a multimodal LLM (one page per call) for text transcription and case splitting. The LLM returns the visible text per case and marks cases that continue from the previous page. A join step merges cross-page cases. This replaces pdfplumber-based text extraction, which fails on complex tabular layouts.
+- **Tabular PDF documents** (e.g., OC): pages are rendered as images and sent to a multimodal LLM (one page per call). The prompt describes the visual structure of the page — column positions relative to ruled lines, column widths, row separators — so the LLM reads the table like a human would. The LLM returns structured JSON per table row with `entry_number`, `case_info`, and `ruling_text` fields. A post-processing join step merges rows across pages: a new case is detected when a row has both a valid integer entry number AND case identification (case number or adversarial case name) in the case_info column. Rows without both signals are merged as continuations of the previous case.
+- **Text-based PDF documents** (e.g., Riverside): pdfplumber/pymupdf text extraction is reliable (no column layout issues), so extracted text is sent to the LLM rather than page images. The LLM's job is splitting numbered entries and extracting ruling text per case.
 
-The transcription LLM prompt is deliberately simple — it asks only for:
-```json
-{
-  "rulings": [
-    {"continued": false, "ruling_text": "transcribed text..."},
-    {"continued": true, "ruling_text": "continuation text..."}
-  ]
-}
-```
-It does NOT ask the LLM to extract case numbers, titles, outcomes, or other structured fields. That is enrichment's job.
+The transcription LLM prompt describes **visual structure, not text heuristics**. For tabular PDFs, it describes column positions relative to vertical ruled lines and row separators. For text-based PDFs, it describes the numbered entry format. The prompt never references specific case number formats, date patterns, or other fragile text patterns — those vary by court division and break when formats change. See `docs/scraper-lessons.md` §LLM Extraction for the full approach and lessons learned.
+
+Each county's prompt is validated through an iterative eval loop before production integration: build an eval script against test fixtures, iterate the prompt until 100% lenient case count accuracy, then integrate. The rollout plan (#1467) is: OC → Riverside → SB → LA → SF/SC/Ventura.
+
+The transcription LLM does NOT extract case numbers, titles, outcomes, or other structured fields. That is enrichment's job.
 
 **Enrichment** applies a three-tier extraction strategy to each ruling's text:
 

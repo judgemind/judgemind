@@ -145,6 +145,109 @@ When adding charset transcoding in Node.js code, **always use this pattern** rat
 
 Python's `codecs` module ships with Windows-1252 support by default (`'cp1252'` or `'windows-1252'`). The scraper framework's encoding module (`packages/scraper-framework/src/framework/encoding.py`) handles charset detection and decoding on the Python side without this limitation. This issue is **Node.js-specific**.
 
+## LLM Extraction — Approach and Lessons
+
+LLM-based extraction replaces fragile regex splitters for multi-case PDF transcription. The rollout plan is OC → Riverside → SB → LA → SF/SC/Ventura (#1467). Each county follows the same phased approach.
+
+### The proven process
+
+Each county goes through three phases, each in its own issue/PR:
+
+1. **Eval phase** — Build a standalone eval script (`scripts/eval/eval_<county>_*.py`) that runs the LLM against all test fixtures and measures case count accuracy. Iterate on the prompt and join logic until **100% lenient accuracy** (exact or ±1 on every fixture). The eval IS the deliverable of this phase. Do not proceed until it passes.
+2. **Integration phase** — Port the validated prompt and join logic from the eval script into the production `LlmExtractor`. Configure the county as `ExtractionMethod.LLM` in `extraction_config.py`. Remove the old regex splitter code.
+3. **Backfill phase** — Re-ingest historical data through the improved pipeline and verify no regressions.
+
+**Never skip the eval phase.** The iterative loop of "run eval → diagnose failures → adjust prompt → re-run" is what produces reliable prompts. A prompt that looks reasonable but hasn't been validated against every fixture will fail on edge cases.
+
+### Prompt design: visual structure, not text heuristics
+
+**Describe what a human would see, not what a regex would match.** Court PDFs have consistent visual structure — columns, ruled lines, entry numbers, indentation. A prompt that describes the visual layout is robust to the text variations that break regex.
+
+**OC example (tabular PDFs with ruled lines):**
+
+The OC prompt describes three columns by their visual position relative to vertical ruled lines, column widths, and row separators. It says nothing about case number formats, "continued" markers, or text patterns. Key elements:
+
+- "THREE COLUMNS separated by TWO VERTICAL RULED LINES that run the full height of the page"
+- Column 1 is "VERY NARROW... at the far left, LEFT of the first vertical line"
+- Column 3 is "the WIDEST column, taking up most of the page width"
+- "Most text on the page is in column 3. When in doubt about column membership, the text is in column 3."
+
+**What NOT to do:**
+
+- Don't tell the LLM to look for specific case number formats — formats vary by court division (probate uses standalone 8-digit numbers, North JC uses "vs" without case numbers)
+- Don't use a "continued" flag for cross-page detection — Flash Lite can't reliably determine continuations. Use post-processing join logic instead
+- Don't tell the LLM to extract structured fields (case_number, outcome, etc.) — that's the enrichment layer's job. The LLM's job is transcription and splitting
+
+### Per-page processing
+
+Send one page at a time to the LLM, not the entire PDF. This:
+
+- Stays within output token limits (8192 for Flash Lite)
+- Gives deterministic page-level results
+- Makes failures diagnosable (you know exactly which page failed)
+- Allows parallel page processing for latency
+
+### Join logic: entry_number + case_info validation
+
+The LLM returns per-page rows. Join logic merges them into complete rulings across pages. The key insight from OC: **a new case requires BOTH a valid entry number AND real case identification**.
+
+```python
+# A new case needs:
+# 1. entry_number is a valid integer (column 1 has content)
+# 2. case_info contains a case identifier (column 2 has content)
+has_valid_entry = (
+    bool(entry_num)
+    and _is_valid_entry_number(entry_num)
+    and looks_like_case
+)
+```
+
+This two-signal approach filters out false positives where the LLM misattributes section headings (e.g., "2. Second Cause of Action") to column 1 — they have an entry number but no case_info.
+
+**Case identification patterns** (for the `looks_like_case` check):
+
+| Pattern | Regex | Example |
+|---|---|---|
+| Year-prefixed case number | `\d{2,4}-\d{5,8}` | `2024-01393434`, `30-2024-01420730` |
+| Standalone case number (probate) | `\b\d{7,8}\b` | `01430606` |
+| Adversarial case name | `\bvs?\.?\b` (case-insensitive) | `Smith vs Jones`, `Estate of Smith v. Jones` |
+
+### Model selection
+
+Use the cheapest model that achieves 100% accuracy. For OC, Gemini 2.5 Flash Lite ($0.075/M input, $0.30/M output) achieves 100% lenient accuracy — significantly cheaper than Claude Haiku or full Flash. Always eval at least two models and report cost per fixture.
+
+### Eval script structure
+
+Follow the pattern in `scripts/eval/eval_oc_multimodal.py`:
+
+- **Ground truth from fixtures:** expected case counts in `tests/fixtures/expected/<fixture>.json`
+- **Three accuracy buckets:** exact match, off-by-one (lenient), wrong (>1 off)
+- **Per-fixture breakdown:** shows which fixtures fail and by how much
+- **Cost tracking:** input/output tokens and estimated monthly cost per model
+- **Retry logic:** 20s timeout per API call, 3 retries with exponential backoff for 503s
+- **Multiple models:** eval the same fixtures across models to compare accuracy and cost
+
+### Text-based vs multimodal extraction
+
+Choose the extraction mode based on the PDF format:
+
+| PDF format | Mode | LLM receives | Example counties |
+|---|---|---|---|
+| Tabular with ruled lines | Multimodal (page images) | PNG image per page | OC |
+| Structured text (numbered entries) | Text-based | Extracted text via pdfplumber/pymupdf | Riverside |
+| HTML (not PDF) | No LLM needed | BeautifulSoup parsing | LA |
+
+For text-based PDFs, use `LlmExtractor.extract(text)`. For tabular PDFs, use `LlmExtractor.extract_from_pdf()` with page images. The eval script should match the production extraction mode.
+
+### Common failure modes and fixes
+
+| Symptom | Root cause | Fix |
+|---|---|---|
+| Over-counting cases | Section headings ("1. First Cause of Action") misattributed to column 1 | Require both entry_number AND case_info for new case detection |
+| Under-counting cases | LLM not returning entry_numbers on many pages | Check if prompt clearly describes column 1; add case_info validation as second signal |
+| Case number regex too narrow | Different divisions use different formats (probate: standalone 8-digit; North JC: "vs" only) | Add multiple case identifier patterns, don't assume one format |
+| Wrong text assigned to cases | Regex splitter boundary calculation fails with duplicate case numbers | This is exactly why LLM extraction exists — replace the regex splitter |
+
 ## Testing
 
 - **Every scraper needs regression tests against real fixtures.** Save actual PDFs/HTML to `tests/fixtures/` and test field extraction against them.
