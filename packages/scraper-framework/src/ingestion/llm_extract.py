@@ -336,7 +336,7 @@ def ocr_pdf_text(
 ) -> str | None:
     """Extract text from an image-only PDF using LLM vision API.
 
-    Renders each PDF page to a PNG image using pdfplumber, then sends the
+    Renders each PDF page to a PNG image using pymupdf, then sends the
     image to the configured LLM provider's vision API for OCR.
 
     This is a fallback for PDFs where ``pdfplumber.extract_text()`` returns
@@ -413,29 +413,32 @@ def _render_pdf_pages(
     pdf_bytes: bytes,
     max_pages: int,
 ) -> list[tuple[bytes, str]]:
-    """Render PDF pages to PNG images using pdfplumber.
+    """Render PDF pages to PNG images using pymupdf.
+
+    Uses pymupdf (fitz) for higher quality image rendering compared to
+    pdfplumber, matching the implementation in ``llm_extractor.py``
+    (validated in the OC multimodal eval, PR #1692).
 
     Returns a list of ``(png_bytes, media_type)`` tuples.
     """
-    import pdfplumber
+    import pymupdf
 
     results: list[tuple[bytes, str]] = []
-    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-        for i, page in enumerate(pdf.pages):
+    with pymupdf.open(stream=pdf_bytes, filetype="pdf") as doc:
+        zoom = _OCR_RESOLUTION / 72.0
+        matrix = pymupdf.Matrix(zoom, zoom)
+
+        for i, page in enumerate(doc):
             if i >= max_pages:
                 logger.info(
                     "ocr_pdf_text.page_limit_reached",
                     max_pages=max_pages,
-                    total_pages=len(pdf.pages),
+                    total_pages=len(doc),
                 )
                 break
 
-            # Render page to image using pdfplumber
-            page_image = page.to_image(resolution=_OCR_RESOLUTION)
-            # Convert PIL Image to PNG bytes
-            img_buffer = io.BytesIO()
-            page_image.original.save(img_buffer, format="PNG")
-            png_bytes = img_buffer.getvalue()
+            pix = page.get_pixmap(matrix=matrix)
+            png_bytes = pix.tobytes("png")
             results.append((png_bytes, "image/png"))
 
     return results
