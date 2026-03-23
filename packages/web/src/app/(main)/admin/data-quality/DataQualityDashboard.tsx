@@ -59,10 +59,12 @@ export function DataQualityDashboard() {
       variables: {
         startDate: overviewDateRange.startDate,
         endDate: overviewDateRange.endDate,
-        // 7 days × 24 hourly snapshots × 8 counties × 8 metrics ≈ 10,752 rows.
-        // Use 2000 to get enough data for meaningful charts while staying
-        // within the API's page-size cap.
-        first: 2000,
+        // Server-side aggregation into 4-hour buckets reduces 7 days of data
+        // from ~10,752 rows (hourly) to ~2,688 rows (8 counties × 8 metrics
+        // × 42 four-hour buckets).  This scales to more counties/metrics
+        // without hitting row limits.
+        resolution: 'four_hour',
+        first: 5000,
       },
       skip: !user || user.role !== 'admin',
     },

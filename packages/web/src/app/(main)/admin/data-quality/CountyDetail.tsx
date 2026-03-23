@@ -36,6 +36,18 @@ export function CountyDetail({ county, overview, onBack }: CountyDetailProps) {
     return { startDate: start, endDate: end };
   }, [daysRange]);
 
+  // Choose resolution based on time range to keep response size manageable.
+  // Single county: 8 metrics × buckets.
+  //   7d  hourly   → 8 × 168 = 1,344 rows (fits in 5000 cap)
+  //   14d four_hour → 8 × 84  =   672 rows
+  //   30d four_hour → 8 × 180 = 1,440 rows
+  //   90d daily     → 8 × 90  =   720 rows
+  const resolution = useMemo(() => {
+    if (daysRange <= 7) return 'hourly';
+    if (daysRange <= 30) return 'four_hour';
+    return 'daily';
+  }, [daysRange]);
+
   const { data, loading, error } = useQuery<DataQualityMetricsData>(
     DATA_QUALITY_METRICS_QUERY,
     {
@@ -43,9 +55,8 @@ export function CountyDetail({ county, overview, onBack }: CountyDetailProps) {
         county,
         startDate: dateRange.startDate,
         endDate: dateRange.endDate,
-        // Single county × up to 90 days × 24h × 8 metrics.  2000 rows
-        // covers ~10 days of hourly data; enough for most views.
-        first: 2000,
+        resolution,
+        first: 5000,
       },
     },
   );

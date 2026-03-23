@@ -267,6 +267,16 @@ export const typeDefs = `#graphql
   # Data Quality Metrics — admin-only monitoring dashboard
   # ---------------------------------------------------------------------------
 
+  """Time resolution for aggregated metrics. Controls server-side bucketing."""
+  enum MetricResolution {
+    """Raw hourly data points (default)."""
+    hourly
+    """Aggregated to 4-hour buckets using AVG."""
+    four_hour
+    """Aggregated to daily buckets using AVG."""
+    daily
+  }
+
   """A single data quality metric measurement."""
   type DataQualityMetric {
     id: ID!
@@ -405,7 +415,9 @@ export const typeDefs = `#graphql
     myAlerts: [AlertSubscription!]!
 
     """Time-series data quality metrics with filtering. Admin only.
-    Returns metrics ordered by recorded_at DESC with keyset pagination."""
+    Returns metrics ordered by recorded_at DESC with keyset pagination.
+    Use the resolution parameter to aggregate data into time buckets for
+    longer time ranges (e.g. four_hour for 7-day views, daily for 90-day views)."""
     dataQualityMetrics(
       """Filter by county name."""
       county: String
@@ -415,7 +427,9 @@ export const typeDefs = `#graphql
       startDate: String!
       """End of time range (ISO 8601). Required."""
       endDate: String!
-      """Max results (default 20, max 100)."""
+      """Time resolution for aggregation. Defaults to hourly (raw data)."""
+      resolution: MetricResolution
+      """Max results (default 20, max 5000)."""
       first: Int
       """Opaque cursor from a previous response's pageInfo.endCursor."""
       after: String

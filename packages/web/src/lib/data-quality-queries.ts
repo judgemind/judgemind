@@ -19,6 +19,7 @@ export const DATA_QUALITY_METRICS_QUERY = gql`
     $metricName: String
     $startDate: String!
     $endDate: String!
+    $resolution: MetricResolution
     $first: Int
     $after: String
   ) {
@@ -27,6 +28,7 @@ export const DATA_QUALITY_METRICS_QUERY = gql`
       metricName: $metricName
       startDate: $startDate
       endDate: $endDate
+      resolution: $resolution
       first: $first
       after: $after
     ) {

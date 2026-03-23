@@ -28,18 +28,20 @@ vi.mock('@/providers/AuthProvider', () => ({
   useAuth: () => mockAuthResult,
 }));
 
-// Track which query is being called
+// Track which query is being called and capture variables
 let queryCallCount = 0;
+let lastMetricsVariables: Record<string, unknown> | undefined;
 vi.mock('@apollo/client', async () => {
   const actual = await vi.importActual<typeof import('@apollo/client')>(
     '@apollo/client',
   );
   return {
     ...actual,
-    useQuery: () => {
+    useQuery: (_query: unknown, options?: { variables?: Record<string, unknown> }) => {
       queryCallCount++;
       // First useQuery call is overview, second is metrics
       if (queryCallCount % 2 === 1) return mockOverviewQueryResult;
+      lastMetricsVariables = options?.variables;
       return mockMetricsQueryResult;
     },
   };
@@ -113,6 +115,7 @@ describe('DataQualityDashboard', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     queryCallCount = 0;
+    lastMetricsVariables = undefined;
     mockAuthResult = {
       user: makeAdminUser(),
       loading: false,
@@ -208,5 +211,18 @@ describe('DataQualityDashboard', () => {
     expect(screen.getByText('Ruling Ingest Rate (7 days)')).toBeInTheDocument();
     expect(screen.getByText('Field Completeness Trends (7 days)')).toBeInTheDocument();
     expect(screen.getByText('Scraper Uptime (7 days)')).toBeInTheDocument();
+  });
+
+  it('passes resolution: four_hour and first: 5000 for metrics query', () => {
+    mockOverviewQueryResult.data = makeOverviewData();
+    mockMetricsQueryResult.data = {
+      dataQualityMetrics: { edges: [], pageInfo: { hasNextPage: false, endCursor: null } },
+    };
+    render(<DataQualityDashboard />);
+    expect(lastMetricsVariables).toBeDefined();
+    expect(lastMetricsVariables!.resolution).toBe('four_hour');
+    expect(lastMetricsVariables!.first).toBe(5000);
+    expect(lastMetricsVariables!.startDate).toBeDefined();
+    expect(lastMetricsVariables!.endDate).toBeDefined();
   });
 });
