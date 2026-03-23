@@ -48,6 +48,63 @@ The fix was simple — `tentative\s+rulings?\b` — but the missed variant cause
 - **The worker has fallback chains for critical fields.** If the scraper event doesn't include hearing_date, case_number, or case_title, the worker tries `extract_hearing_date()`, `extract_case_number()`, and `extract_case_title()` from ruling text before giving up. This is a safety net, not a substitute for proper scraper extraction.
 - **Party extraction is the hardest field.** Only LA implements it (structured HTML with role labels). PDF-based courts don't have reliable party structure. This remains an open problem.
 
+## `None` vs Empty Collection — The Falsy Sentinel Antipattern
+
+When a function uses `None` as a sentinel to mean "operation failed" and an empty collection (`[]`, `{}`) to mean "operation succeeded but found nothing," testing the result with `if not result:` is a bug. Both `None` and `[]` are falsy in Python, so the check conflates failure with empty success.
+
+### The rule
+
+**Use `if result is None:` when `None` is a distinct sentinel value.** Use `if not result:` only when you genuinely want to treat `None` and empty the same way (e.g., early-return guards on input parameters).
+
+### Case study: multimodal extraction fallback (#1590)
+
+In the ingestion worker, multimodal PDF extraction returns `None` on failure and `[]` when extraction succeeds but the PDF contains no rulings (e.g., a boilerplate page). The fallback condition was:
+
+```python
+# Bug: treats [] (no rulings found) the same as None (extraction failed)
+if not extracted_rulings:
+    # Falls back to text-based extraction even when multimodal succeeded
+```
+
+The fix:
+
+```python
+# Correct: only fall back when extraction actually failed
+if extracted_rulings is None:
+    # Fall back to text-based extraction
+```
+
+Without this fix, a PDF with zero rulings (legitimate empty result from multimodal) would trigger unnecessary text-based fallback, wasting LLM tokens and potentially producing incorrect results from a less capable extraction path.
+
+### Where this pattern appears in the codebase
+
+Functions that return `T | None` where `None` means failure:
+
+| Function | Returns | `None` means |
+|---|---|---|
+| `extract_fields_llm()` (`ingestion/llm_extract.py`) | `LLMExtractionResult \| None` | API call failed or text was empty — caller should fall back to regex |
+| `_extract_chunk()` (`framework/llm_extractor.py`) | `ExtractionResult \| None` | Single chunk extraction failed — skip this chunk |
+| `ruling_formatter` / `ruling_summarizer` LLM calls | `str \| None` | LLM call failed — skip formatting/summarizing |
+| `CourtPortalClient.lookup_case()` (`framework/enrichment.py`) | `dict \| None` | Case not found or portal unavailable |
+
+Callers of these functions must use `is None` checks, not truthiness checks.
+
+### When `if not` is correct
+
+`if not result:` is appropriate when:
+
+- **Guarding input parameters** — `if not text:` to reject both `None` and `""` before processing.
+- **The variable is always a collection** (never `None`) — e.g., a locally constructed list that is never assigned `None`.
+- **You explicitly want to treat empty and absent the same** — e.g., `if not parties_data:` in `insert_parties()` where both `None` and `[]` mean "nothing to insert."
+
+### Review checklist
+
+When reviewing code that checks a return value with `if not`:
+
+1. What is the return type of the function? If it's `T | None`, `if not` is likely wrong.
+2. Does the caller need to distinguish "operation failed" from "operation succeeded with empty result"? If yes, use `is None`.
+3. Is there a fallback or retry path? If `if not` triggers a fallback, an empty success will cause unnecessary (and potentially harmful) retries.
+
 ## Text Comparison
 
 - **Always use `autojunk=False` with `difflib.SequenceMatcher` when comparing legal text.** The default `autojunk=True` marks frequently-repeated characters as "junk" to speed up matching on short strings. Legal documents are highly repetitive (standard phrases like "The motion for summary judgment is GRANTED." appear many times), causing the heuristic to treat common characters as junk. This produces wildly incorrect similarity scores — e.g. 0.19 instead of 0.99 for texts that differ only by whitespace. Discovered during #978 (ruling text formatter validation). Always pass `SequenceMatcher(None, a, b, autojunk=False)`.
