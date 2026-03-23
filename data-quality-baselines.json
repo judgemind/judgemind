@@ -32,6 +32,11 @@
       "schedule_type": "daily",
       "posting_days": ["Mon", "Tue", "Wed", "Thu", "Fri"]
     },
+    "San Diego": {
+      "expected_daily_rulings": 0,
+      "schedule_type": "daily",
+      "low_volume": true
+    },
     "Ventura": {
       "expected_daily_rulings": 5,
       "schedule_type": "daily",
