@@ -46,11 +46,10 @@ function decodeCursor(cursor: string): string[] {
 
 function pageSize(first: number | undefined | null): number {
   const n = first ?? 20;
-  // Cap raised from 100 to 2000 so the data quality dashboard can fetch a
-  // full 7-day window of metrics (8 counties * 8 metrics * 168 hourly
-  // snapshots ≈ 10,752 rows).  The old 100-row cap meant charts received
-  // only ~1 hour of data, making them appear nearly empty.
-  return Math.min(Math.max(1, n), 2000);
+  // Cap at 5000 — with server-side aggregation (four_hour or daily buckets),
+  // a 7-day all-counties view needs ~2,700 rows (8 counties * 8 metrics * 42
+  // four-hour buckets).  5000 gives headroom for more counties/metrics.
+  return Math.min(Math.max(1, n), 5000);
 }
 
 // ---------------------------------------------------------------------------
@@ -103,13 +102,33 @@ export function computeHealthStatus(metrics: CountyMetrics): string {
 // Data access — dataQualityMetrics
 // ---------------------------------------------------------------------------
 
+type MetricResolution = 'hourly' | 'four_hour' | 'daily';
+
 interface MetricsArgs {
   county?: string;
   metricName?: string;
   startDate: string;
   endDate: string;
+  resolution?: MetricResolution;
   first?: number;
   after?: string;
+}
+
+/**
+ * SQL expression for time-bucket truncation.  For `four_hour` we truncate to
+ * the nearest 4-hour boundary (00:00, 04:00, 08:00, …).  PostgreSQL's
+ * `date_trunc` does not natively support 4-hour intervals, so we compute
+ * `date_trunc('hour', recorded_at) - (extract(hour …) % 4) * interval '1h'`.
+ */
+function bucketExpression(resolution: MetricResolution): string | null {
+  switch (resolution) {
+    case 'four_hour':
+      return `(date_trunc('hour', recorded_at) - (EXTRACT(HOUR FROM recorded_at)::int % 4) * INTERVAL '1 hour')`;
+    case 'daily':
+      return `date_trunc('day', recorded_at)`;
+    default:
+      return null; // hourly — no aggregation
+  }
 }
 
 async function queryMetrics(
@@ -120,11 +139,19 @@ async function queryMetrics(
   pageInfo: { hasNextPage: boolean; endCursor: string | null };
 }> {
   const limit = pageSize(args.first);
+  const resolution: MetricResolution = args.resolution ?? 'hourly';
+  const bucket = bucketExpression(resolution);
+
+  // --- Aggregated path (four_hour / daily) ---
+  if (bucket) {
+    return queryAggregatedMetrics(pool, args, bucket, limit);
+  }
+
+  // --- Raw (hourly) path — original behaviour ---
   const conditions: string[] = [];
   const params: unknown[] = [];
   let i = 1;
 
-  // Required time range filter
   conditions.push(`recorded_at >= $${i++}::timestamptz`);
   params.push(args.startDate);
   conditions.push(`recorded_at <= $${i++}::timestamptz`);
@@ -167,6 +194,109 @@ async function queryMetrics(
           ? encodeCursor([
               String(edges[edges.length - 1].recorded_at),
               String(edges[edges.length - 1].id),
+            ])
+          : null,
+    },
+  };
+}
+
+/**
+ * Aggregated query: groups rows into time buckets and returns AVG(metric_value).
+ * Metadata from the most recent record within each bucket is preserved so
+ * field-level completeness breakdowns still render in the UI.
+ *
+ * Cursor pagination is based on (bucket DESC, county DESC, metric_name DESC)
+ * since individual row ids are lost during aggregation.  The synthetic id
+ * returned to GraphQL is a deterministic string so the client can key on it.
+ */
+async function queryAggregatedMetrics(
+  pool: Pool,
+  args: MetricsArgs,
+  bucketExpr: string,
+  limit: number,
+): Promise<{
+  edges: Array<{ node: Row; cursor: string }>;
+  pageInfo: { hasNextPage: boolean; endCursor: string | null };
+}> {
+  const conditions: string[] = [];
+  const params: unknown[] = [];
+  let i = 1;
+
+  conditions.push(`recorded_at >= $${i++}::timestamptz`);
+  params.push(args.startDate);
+  conditions.push(`recorded_at <= $${i++}::timestamptz`);
+  params.push(args.endDate);
+
+  if (args.county) {
+    conditions.push(`county = $${i++}`);
+    params.push(args.county);
+  }
+  if (args.metricName) {
+    conditions.push(`metric_name = $${i++}`);
+    params.push(args.metricName);
+  }
+
+  const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
+
+  // HAVING clause for cursor-based pagination on aggregated results.
+  // We paginate on (bucket DESC, county DESC, metric_name DESC).
+  let havingClause = '';
+  if (args.after) {
+    const [curBucket, curCounty, curMetric] = decodeCursor(args.after);
+    havingClause = `HAVING (${bucketExpr}, county, metric_name) < ($${i++}::timestamptz, $${i++}, $${i++})`;
+    params.push(curBucket, curCounty, curMetric);
+  }
+
+  params.push(limit + 1);
+
+  const sql = `
+    SELECT
+      ${bucketExpr} AS bucket,
+      county,
+      metric_name,
+      AVG(metric_value) AS metric_value,
+      (array_agg(metadata ORDER BY recorded_at DESC))[1] AS metadata
+    FROM data_quality_metrics
+    ${where}
+    GROUP BY bucket, county, metric_name
+    ${havingClause}
+    ORDER BY bucket DESC, county DESC, metric_name DESC
+    LIMIT $${i}
+  `;
+
+  const { rows } = await pool.query<Row>(sql, params);
+
+  const hasNextPage = rows.length > limit;
+  const edges = rows.slice(0, limit);
+
+  return {
+    edges: edges.map((row) => {
+      const cursorStr = encodeCursor([
+        String(row.bucket),
+        String(row.county),
+        String(row.metric_name),
+      ]);
+      return {
+        node: {
+          // Synthetic id from the bucket key — deterministic and unique per bucket
+          id: Buffer.from(`${row.bucket}|${row.county}|${row.metric_name}`).toString('base64'),
+          recorded_at: row.bucket,
+          county: row.county,
+          metric_name: row.metric_name,
+          metric_value: row.metric_value,
+          metadata: row.metadata ?? null,
+        },
+        cursor: cursorStr,
+      };
+    }),
+    pageInfo: {
+      hasNextPage,
+      endCursor:
+        edges.length > 0
+          ? encodeCursor([
+              String(edges[edges.length - 1].bucket),
+              String(edges[edges.length - 1].county),
+              String(edges[edges.length - 1].metric_name),
             ])
           : null,
     },
@@ -274,4 +404,4 @@ export const dataQualityResolvers = {
 };
 
 // Export for testing
-export { requireAdmin, type CountyMetrics };
+export { requireAdmin, type CountyMetrics, type MetricResolution };

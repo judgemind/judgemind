@@ -11,13 +11,17 @@ let mockMetricsQueryResult: {
   error: Error | undefined;
 };
 
+let lastQueryVariables: Record<string, unknown> | undefined;
 vi.mock('@apollo/client', async () => {
   const actual = await vi.importActual<typeof import('@apollo/client')>(
     '@apollo/client',
   );
   return {
     ...actual,
-    useQuery: () => mockMetricsQueryResult,
+    useQuery: (_query: unknown, options?: { variables?: Record<string, unknown> }) => {
+      lastQueryVariables = options?.variables;
+      return mockMetricsQueryResult;
+    },
   };
 });
 
@@ -104,6 +108,7 @@ describe('CountyDetail', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     onBack = vi.fn();
+    lastQueryVariables = undefined;
     mockMetricsQueryResult = {
       data: undefined,
       loading: false,
@@ -208,5 +213,39 @@ describe('CountyDetail', () => {
     expect(screen.getByText('14d')).toBeInTheDocument();
     expect(screen.getByText('30d')).toBeInTheDocument();
     expect(screen.getByText('90d')).toBeInTheDocument();
+  });
+
+  it('passes resolution and first variables for metrics query', () => {
+    mockMetricsQueryResult.data = makeMetricsData();
+    render(
+      <CountyDetail county="Los Angeles" overview={makeOverview()} onBack={onBack} />,
+    );
+    // Default is 30d range → resolution should be four_hour
+    expect(lastQueryVariables).toBeDefined();
+    expect(lastQueryVariables!.resolution).toBe('four_hour');
+    expect(lastQueryVariables!.first).toBe(5000);
+    expect(lastQueryVariables!.county).toBe('Los Angeles');
+  });
+
+  it('uses hourly resolution for 7d range', () => {
+    mockMetricsQueryResult.data = makeMetricsData();
+    render(
+      <CountyDetail county="Los Angeles" overview={makeOverview()} onBack={onBack} />,
+    );
+    // Click 7d button to switch time range
+    fireEvent.click(screen.getByText('7d'));
+    expect(lastQueryVariables).toBeDefined();
+    expect(lastQueryVariables!.resolution).toBe('hourly');
+  });
+
+  it('uses daily resolution for 90d range', () => {
+    mockMetricsQueryResult.data = makeMetricsData();
+    render(
+      <CountyDetail county="Los Angeles" overview={makeOverview()} onBack={onBack} />,
+    );
+    // Click 90d button
+    fireEvent.click(screen.getByText('90d'));
+    expect(lastQueryVariables).toBeDefined();
+    expect(lastQueryVariables!.resolution).toBe('daily');
   });
 });

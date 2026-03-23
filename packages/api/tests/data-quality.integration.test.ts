@@ -64,6 +64,15 @@ async function seedData(): Promise<void> {
     { county: 'San Diego', metric_name: 'scraper_last_success_age_hours', metric_value: 48, recorded_at: '2026-03-01T10:00:00Z' },
     // Older LA metric (for time range filtering test)
     { county: 'Los Angeles', metric_name: 'ruling_count_24h', metric_value: 30, recorded_at: '2026-02-01T10:00:00Z' },
+    // --- Aggregation test data: uses "Riverside" county to avoid polluting existing tests ---
+    // Same 4-hour bucket (08:00-11:59): two hourly records
+    { county: 'Riverside', metric_name: 'ruling_count_24h', metric_value: 42, recorded_at: '2026-03-01T10:00:00Z' },
+    { county: 'Riverside', metric_name: 'ruling_count_24h', metric_value: 38, recorded_at: '2026-03-01T11:00:00Z' },
+    // Different 4-hour bucket (12:00-15:59)
+    { county: 'Riverside', metric_name: 'ruling_count_24h', metric_value: 50, recorded_at: '2026-03-01T13:00:00Z' },
+    // Second day for daily aggregation tests
+    { county: 'Riverside', metric_name: 'ruling_count_24h', metric_value: 60, recorded_at: '2026-03-02T10:00:00Z' },
+    { county: 'Riverside', metric_name: 'ruling_count_24h', metric_value: 40, recorded_at: '2026-03-02T14:00:00Z' },
   ];
 
   for (const m of metricsData) {
@@ -290,6 +299,156 @@ describe('dataQualityMetrics', () => {
     // Page 2 should have different IDs than page 1
     const p1Ids = p1Edges.map((e) => e.node.id);
     p2Edges.forEach((e) => expect(p1Ids).not.toContain(e.node.id));
+  });
+
+  it('aggregates with four_hour resolution', async () => {
+    const body = await gql(
+      `{
+        dataQualityMetrics(
+          county: "Riverside"
+          metricName: "ruling_count_24h"
+          startDate: "2026-03-01T00:00:00Z"
+          endDate: "2026-03-01T23:59:59Z"
+          resolution: four_hour
+        ) {
+          edges { node { id recordedAt county metricName metricValue } cursor }
+          pageInfo { hasNextPage endCursor }
+        }
+      }`,
+      undefined,
+      adminToken,
+    );
+    expect(body.errors).toBeUndefined();
+    const conn = body.data?.dataQualityMetrics as Record<string, unknown>;
+    const edges = conn.edges as Array<{ node: { id: string; recordedAt: string; metricValue: number; county: string; metricName: string }; cursor: string }>;
+    // March 1 has three Riverside ruling_count_24h entries:
+    //   10:00 (42), 11:00 (38) → same 08:00 bucket → avg = 40
+    //   13:00 (50) → 12:00 bucket → avg = 50
+    expect(edges.length).toBe(2);
+    // Ordered by bucket DESC — 12:00 bucket first, then 08:00 bucket
+    expect(edges[0].node.metricValue).toBe(50);
+    expect(edges[1].node.metricValue).toBe(40);
+    // Both should be Riverside ruling_count_24h
+    edges.forEach((e) => {
+      expect(e.node.county).toBe('Riverside');
+      expect(e.node.metricName).toBe('ruling_count_24h');
+    });
+    // Cursors should be present
+    expect(edges[0].cursor).toBeTruthy();
+    expect(edges[1].cursor).toBeTruthy();
+    // Synthetic IDs should be present and distinct
+    expect(edges[0].node.id).toBeTruthy();
+    expect(edges[0].node.id).not.toBe(edges[1].node.id);
+  });
+
+  it('aggregates with daily resolution', async () => {
+    const body = await gql(
+      `{
+        dataQualityMetrics(
+          county: "Riverside"
+          metricName: "ruling_count_24h"
+          startDate: "2026-03-01T00:00:00Z"
+          endDate: "2026-03-02T23:59:59Z"
+          resolution: daily
+        ) {
+          edges { node { recordedAt metricValue } }
+          pageInfo { hasNextPage }
+        }
+      }`,
+      undefined,
+      adminToken,
+    );
+    expect(body.errors).toBeUndefined();
+    const conn = body.data?.dataQualityMetrics as Record<string, unknown>;
+    const edges = conn.edges as Array<{ node: { recordedAt: string; metricValue: number } }>;
+    // Two days of data:
+    //   March 1: 42 + 38 + 50 = avg 43.333...
+    //   March 2: 60 + 40 = avg 50
+    expect(edges.length).toBe(2);
+    // Ordered by bucket DESC — March 2 first
+    expect(edges[0].node.metricValue).toBe(50);
+    // March 1 average: (42 + 38 + 50) / 3 ≈ 43.33
+    expect(edges[1].node.metricValue).toBeCloseTo(43.33, 1);
+  });
+
+  it('defaults to hourly resolution when not specified', async () => {
+    // Without resolution parameter, should return raw rows (same as before)
+    const body = await gql(
+      `{
+        dataQualityMetrics(
+          county: "Riverside"
+          metricName: "ruling_count_24h"
+          startDate: "2026-03-01T00:00:00Z"
+          endDate: "2026-03-01T23:59:59Z"
+        ) {
+          edges { node { metricValue } }
+          pageInfo { hasNextPage }
+        }
+      }`,
+      undefined,
+      adminToken,
+    );
+    expect(body.errors).toBeUndefined();
+    const conn = body.data?.dataQualityMetrics as Record<string, unknown>;
+    const edges = conn.edges as Array<{ node: { metricValue: number } }>;
+    // Three individual hourly rows for March 1
+    expect(edges.length).toBe(3);
+    // Raw values — not averaged
+    const values = edges.map((e) => e.node.metricValue).sort();
+    expect(values).toEqual([38, 42, 50]);
+  });
+
+  it('supports cursor pagination with aggregated resolution', async () => {
+    const page1 = await gql(
+      `{
+        dataQualityMetrics(
+          county: "Riverside"
+          metricName: "ruling_count_24h"
+          startDate: "2026-03-01T00:00:00Z"
+          endDate: "2026-03-02T23:59:59Z"
+          resolution: daily
+          first: 1
+        ) {
+          edges { node { recordedAt metricValue } cursor }
+          pageInfo { hasNextPage endCursor }
+        }
+      }`,
+      undefined,
+      adminToken,
+    );
+    expect(page1.errors).toBeUndefined();
+    const p1 = page1.data?.dataQualityMetrics as Record<string, unknown>;
+    const p1Edges = p1.edges as Array<{ node: { recordedAt: string; metricValue: number }; cursor: string }>;
+    expect(p1Edges).toHaveLength(1);
+    expect((p1.pageInfo as Record<string, unknown>).hasNextPage).toBe(true);
+
+    // Fetch page 2 using cursor
+    const cursor = (p1.pageInfo as Record<string, unknown>).endCursor as string;
+    const page2 = await gql(
+      `query($after: String) {
+        dataQualityMetrics(
+          county: "Riverside"
+          metricName: "ruling_count_24h"
+          startDate: "2026-03-01T00:00:00Z"
+          endDate: "2026-03-02T23:59:59Z"
+          resolution: daily
+          first: 1
+          after: $after
+        ) {
+          edges { node { recordedAt metricValue } }
+          pageInfo { hasNextPage }
+        }
+      }`,
+      { after: cursor },
+      adminToken,
+    );
+    expect(page2.errors).toBeUndefined();
+    const p2 = page2.data?.dataQualityMetrics as Record<string, unknown>;
+    const p2Edges = p2.edges as Array<{ node: { recordedAt: string; metricValue: number } }>;
+    expect(p2Edges).toHaveLength(1);
+    // Page 1 should be March 2 (50), page 2 should be March 1 (~43.33)
+    expect(p1Edges[0].node.metricValue).toBe(50);
+    expect(p2Edges[0].node.metricValue).toBeCloseTo(43.33, 1);
   });
 });
 
