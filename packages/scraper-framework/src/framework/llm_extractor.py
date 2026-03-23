@@ -23,7 +23,6 @@ Design principles:
 
 from __future__ import annotations
 
-import io
 import json
 import re
 import time
@@ -102,32 +101,47 @@ _COUNTY_PREFIX_RE = re.compile(r"^\d{2,4}-(\d{4}-\d+)$")
 
 # System prompt for per-page extraction from OC-style 3-column PDF tables.
 # Each page is sent individually.  The LLM returns a JSON array of table rows.
+# This is the visual-structure prompt validated in PR #1692 (eval achieved 100%
+# lenient accuracy across all OC fixtures).
 PDF_PER_PAGE_PROMPT = (
-    "You are parsing a single page from a California court tentative ruling PDF.\n\n"
-    "The page contains a table with ruled lines separating columns:\n"
-    "  Column 1 (narrow, left): Entry number (integer)\n"
-    "  Column 2 (middle): Case information (case number, parties, motion type)\n"
-    "  Column 3 (wide, right): Ruling text\n\n"
-    "Extract EVERY row visible on this page as a JSON array of objects.\n"
-    "Each object has exactly three fields:\n"
-    '  - "entry_number": integer or null (the number in column 1)\n'
-    '  - "case_info": string (all text from column 2 for this row)\n'
-    '  - "ruling_text": string (all text from column 3 for this row)\n\n'
-    "Rules:\n"
-    "- If a row spans multiple visual lines, combine all lines into one entry.\n"
-    "- If text continues from a previous page (no entry number, partial text), "
-    "include it as a row with entry_number: null.\n"
-    "- Transcribe text VERBATIM — do not summarize or rephrase.\n"
-    "- If the page contains only headers or no table rows, return [].\n"
-    "- If the page has a department/judge header above the table, "
-    "include it as a separate entry with entry_number: null and "
-    "empty ruling_text.\n\n"
-    "Respond with ONLY a JSON array, no other text:\n"
-    '[{"entry_number": 1, "case_info": "...", "ruling_text": "..."}, ...]'
+    "You are a court ruling transcriber. You will receive a single page "
+    "image from a California court tentative ruling PDF.\n\n"
+    "The page contains a TABLE with THREE COLUMNS separated by TWO "
+    "VERTICAL RULED LINES that run the full height of the page. ROWS "
+    "are separated by HORIZONTAL RULED LINES.\n\n"
+    "Use the VISUAL POSITION of text relative to the ruled lines to "
+    "determine which column it belongs to:\n\n"
+    "- Column 1 (entry_number): VERY NARROW column at the far left, "
+    "LEFT of the first vertical line. Usually blank.\n"
+    "- Column 2 (case_info): MEDIUM column BETWEEN the two vertical "
+    "lines. Contains case name and case number.\n"
+    "- Column 3 (ruling_text): the WIDEST column, taking up most "
+    "of the page width, RIGHT of the second vertical line. Contains "
+    "the full ruling text including all paragraphs, headings, and "
+    "numbered sections.\n\n"
+    "Most text on the page is in column 3. When in doubt about "
+    "column membership, the text is in column 3.\n\n"
+    "## Rules\n\n"
+    "- Return ONE JSON object per ROW (between horizontal lines).\n"
+    "- Read each column by its POSITION relative to the vertical "
+    "lines.\n"
+    "- Transcribe text VERBATIM. Do not summarize or omit.\n"
+    "- If a column is blank in a row, set its value to empty string.\n"
+    "- SKIP page headers, footers, and page numbers.\n\n"
+    "{\n"
+    '  "rulings": [\n'
+    '    {"entry_number": "101", "case_info": "Smith vs Jones\\n'
+    '25-01455183",\n'
+    '     "ruling_text": "Full text of the ruling including all '
+    'paragraphs and sub-sections..."},\n'
+    '    {"entry_number": "", "case_info": "",\n'
+    '     "ruling_text": "continuation from previous page..."}\n'
+    "  ]\n"
+    "}"
 )
 
 # Pattern to detect case numbers in OC format.
-_CASE_NUMBER_RE = re.compile(r"\d{2,4}-\d{5,8}|\d{7,8}")
+_CASE_NUMBER_RE = re.compile(r"\d{2,4}-\d{5,8}|\b\d{7,8}\b")
 
 # Pattern to detect case titles (vs / v.).
 _VS_RE = re.compile(r"\bv(?:s)?\.?\s", re.IGNORECASE)
@@ -568,7 +582,8 @@ class LlmExtractor:
                 parts.append("Context:\n" + "\n".join(meta_lines))
 
         parts.append(
-            "Extract all table rows from this page image. Return a JSON array of row objects."
+            "Transcribe all rows of the ruling table on this page. "
+            "One entry per row. Skip page headers and footers."
         )
         return "\n\n".join(parts)
 
@@ -899,8 +914,8 @@ def _parse_page_rows(raw_text: str, page_index: int) -> list[dict]:
 
     # Handle both list and dict responses.
     if isinstance(parsed, dict):
-        # Some models wrap the array in a dict.
-        rows_raw = parsed.get("rows", parsed.get("entries", [parsed]))
+        # Some models wrap the array in a dict (keys: "rulings", "rows", "entries").
+        rows_raw = parsed.get("rulings", parsed.get("rows", parsed.get("entries", [parsed])))
     elif isinstance(parsed, list):
         rows_raw = parsed
     else:
@@ -1068,27 +1083,31 @@ def _render_pdf_pages(
     pdf_bytes: bytes,
     max_pages: int,
 ) -> list[tuple[bytes, str]]:
-    """Render PDF pages to PNG images using pdfplumber.
+    """Render PDF pages to PNG images using pymupdf.
+
+    Uses pymupdf (fitz) for higher quality image rendering compared to
+    pdfplumber, which was validated in the OC multimodal eval (PR #1692).
 
     Returns a list of ``(png_bytes, media_type)`` tuples.
     """
-    import pdfplumber
+    import pymupdf
 
     results: list[tuple[bytes, str]] = []
-    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-        for i, page in enumerate(pdf.pages):
+    with pymupdf.open(stream=pdf_bytes, filetype="pdf") as doc:
+        zoom = _PDF_RENDER_RESOLUTION / 72.0
+        matrix = pymupdf.Matrix(zoom, zoom)
+
+        for i, page in enumerate(doc):
             if i >= max_pages:
                 logger.info(
                     "llm_extractor.page_limit_reached",
                     max_pages=max_pages,
-                    total_pages=len(pdf.pages),
+                    total_pages=len(doc),
                 )
                 break
 
-            page_image = page.to_image(resolution=_PDF_RENDER_RESOLUTION)
-            img_buffer = io.BytesIO()
-            page_image.original.save(img_buffer, format="PNG")
-            png_bytes = img_buffer.getvalue()
+            pix = page.get_pixmap(matrix=matrix)
+            png_bytes = pix.tobytes("png")
             results.append((png_bytes, "image/png"))
 
     return results
