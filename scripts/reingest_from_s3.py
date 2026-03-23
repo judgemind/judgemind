@@ -31,6 +31,11 @@ Options:
                         matches this PostgreSQL regex (~ operator).  Useful
                         for targeting garbled titles, e.g.
                         --case-title-regex 'vs\\.?\\s*$|(?i)(Before the Court|moves the)'
+    --null-motion-type  Only re-ingest documents whose associated rulings
+                        have NULL motion_type.  Useful after a normalization
+                        backfill that set unmappable motion types to NULL —
+                        re-ingestion lets the enrichment pipeline extract
+                        motion_type from ruling text.
     --no-llm            Disable LLM extraction, use regex-only mode.
     --llm-timeout N     Per-call LLM API timeout in seconds (default: 60).
     --force-llm         Force LLM even when all fields are already populated.
@@ -50,7 +55,6 @@ import subprocess
 import sys
 import tempfile
 import time
-import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime
 from typing import Any
@@ -221,6 +225,7 @@ def _build_filters(
     date_from: date | None,
     date_to: date | None,
     case_title_regex: str | None = None,
+    null_motion_type: bool = False,
 ) -> tuple[str, list]:
     """Build WHERE clause fragments and params for the document query."""
     clauses = []
@@ -237,6 +242,11 @@ def _build_filters(
     if case_title_regex:
         clauses.append("AND c.case_title ~ %s")
         params.append(case_title_regex)
+    if null_motion_type:
+        clauses.append(
+            "AND EXISTS (SELECT 1 FROM rulings r"
+            " WHERE r.document_id = d.id AND r.motion_type IS NULL)"
+        )
     return " ".join(clauses), params
 
 
@@ -1377,11 +1387,16 @@ def run_reingest(
     force_llm: bool = False,
     full_reparse: bool = False,
     case_title_regex: str | None = None,
+    null_motion_type: bool = False,
     report_metrics: bool = False,
 ) -> dict[str, Any]:
     """Run the full reingest. Returns summary stats including cost."""
     filters, filter_params = _build_filters(
-        county, date_from, date_to, case_title_regex=case_title_regex
+        county,
+        date_from,
+        date_to,
+        case_title_regex=case_title_regex,
+        null_motion_type=null_motion_type,
     )
 
     s3_client = boto3.client("s3")
@@ -1632,6 +1647,16 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--null-motion-type",
+        action="store_true",
+        help=(
+            "Only re-ingest documents whose associated rulings have NULL "
+            "motion_type. Useful after a normalization backfill that set "
+            "unmappable motion types to NULL — re-ingestion lets the "
+            "enrichment pipeline extract motion_type from ruling text."
+        ),
+    )
+    parser.add_argument(
         "--report-metrics",
         action="store_true",
         help=(
@@ -1667,6 +1692,7 @@ def main() -> None:
         force_llm=args.force_llm,
         full_reparse=args.full_reparse,
         case_title_regex=args.case_title_regex,
+        null_motion_type=args.null_motion_type,
         report_metrics=args.report_metrics,
     )
 
