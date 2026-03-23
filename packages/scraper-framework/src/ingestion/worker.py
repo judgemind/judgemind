@@ -64,6 +64,7 @@ from .extract import (
     extract_outcome,
     extract_parties_from_caption,
     is_valid_case_number,
+    normalize_motion_type,
 )
 from .llm_extract import (
     LLMExtractionResult,
@@ -544,7 +545,22 @@ class IngestionWorker:
         hearing_dt = _parse_date(event_data.get("hearing_date"))
 
         outcome: str | None = event_data.get("outcome")
-        motion_type: str | None = event_data.get("motion_type")
+        raw_motion_type: str | None = event_data.get("motion_type")
+        # Normalize scraper-provided motion_type to snake_case (#1712).
+        # If the value cannot be mapped, set to None so the regex
+        # fallback below can extract from ruling_text instead.
+        motion_type: str | None = (
+            normalize_motion_type(raw_motion_type) if raw_motion_type else None
+        )
+        if raw_motion_type and motion_type != raw_motion_type:
+            logger.info(
+                "Normalized motion_type",
+                extra={
+                    "document_id": document_id,
+                    "raw_motion_type": raw_motion_type,
+                    "normalized_motion_type": motion_type,
+                },
+            )
         case_type: str | None = event_data.get("case_type")
         parties_data: list[dict[str, str]] = event_data.get("parties", [])
 

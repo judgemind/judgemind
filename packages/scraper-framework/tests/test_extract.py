@@ -21,6 +21,7 @@ from ingestion.extract import (
     extract_outcome,
     extract_parties_from_caption,
     is_valid_case_number,
+    normalize_motion_type,
 )
 
 # ---------------------------------------------------------------------------
@@ -1849,3 +1850,107 @@ class TestExtractCaseTypeFromMotionType:
 
     def test_unknown_motion_type(self) -> None:
         assert extract_case_type_from_motion_type("unknown_motion") is None
+
+
+# ---------------------------------------------------------------------------
+# normalize_motion_type
+# ---------------------------------------------------------------------------
+
+
+class TestNormalizeMotionType:
+    """Tests for normalize_motion_type() — #1712."""
+
+    # --- Already-normalized values pass through ---
+
+    def test_already_normalized_motion_to_compel(self) -> None:
+        assert normalize_motion_type("motion_to_compel") == "motion_to_compel"
+
+    def test_already_normalized_demurrer(self) -> None:
+        assert normalize_motion_type("demurrer") == "demurrer"
+
+    def test_already_normalized_msj(self) -> None:
+        assert normalize_motion_type("msj") == "msj"
+
+    def test_already_normalized_mil(self) -> None:
+        assert normalize_motion_type("mil") == "mil"
+
+    def test_already_normalized_ex_parte(self) -> None:
+        assert normalize_motion_type("ex_parte_application") == "ex_parte_application"
+
+    # --- SD calendar event types ---
+
+    def test_sd_calendar_motion_hearing(self) -> None:
+        """Generic 'Motion Hearing' cannot be mapped — return None."""
+        assert normalize_motion_type("Motion Hearing") is None
+
+    def test_sd_calendar_demurrer_motion_to_strike(self) -> None:
+        """Composite 'Demurrer/Motion to Strike' matches demurrer first."""
+        assert normalize_motion_type("Demurrer/Motion to Strike") == "demurrer"
+
+    def test_sd_calendar_summary_judgment(self) -> None:
+        assert normalize_motion_type("Summary Judgment/Summary Adjudication") == "msj_partial"
+
+    def test_sd_calendar_discovery_hearing(self) -> None:
+        """Generic 'Discovery Hearing' cannot be mapped — return None."""
+        assert normalize_motion_type("Discovery Hearing") is None
+
+    def test_sd_calendar_motion_to_quash(self) -> None:
+        assert normalize_motion_type("Motion to Quash") == "motion_to_quash"
+
+    def test_sd_calendar_motion_for_sanctions(self) -> None:
+        assert normalize_motion_type("Motion for Sanctions") == "motion_for_sanctions"
+
+    def test_sd_calendar_class_action(self) -> None:
+        """Generic class action certify/decertify cannot be mapped."""
+        assert normalize_motion_type("Motion Hearing to Certify/Decertify Class Action") is None
+
+    # --- SD tentatives title-case values ---
+
+    def test_sd_tentatives_motion_to_compel(self) -> None:
+        assert normalize_motion_type("Motion to Compel Further Responses") == "motion_to_compel"
+
+    def test_sd_tentatives_demurrer(self) -> None:
+        assert normalize_motion_type("Demurrer to Complaint") == "demurrer"
+
+    def test_sd_tentatives_summary_judgment(self) -> None:
+        assert normalize_motion_type("Motion for Summary Judgment") == "msj"
+
+    def test_sd_tentatives_motion_to_strike(self) -> None:
+        assert normalize_motion_type("Motion to Strike") == "motion_to_strike"
+
+    def test_sd_tentatives_preliminary_injunction(self) -> None:
+        assert normalize_motion_type("Preliminary Injunction") == "preliminary_injunction"
+
+    # --- Riverside title-case values ---
+
+    def test_riverside_summary_adjudication(self) -> None:
+        assert normalize_motion_type("Summary Adjudication") == "msj_partial"
+
+    def test_riverside_motion_to_compel(self) -> None:
+        assert normalize_motion_type("Motion to Compel") == "motion_to_compel"
+
+    def test_riverside_attorneys_fees_standalone(self) -> None:
+        """Standalone 'Attorney's Fees' cannot be mapped (no 'motion for' prefix)."""
+        assert normalize_motion_type("Attorney's Fees") is None
+
+    def test_motion_for_attorneys_fees(self) -> None:
+        """'Motion for Attorney's Fees' maps correctly."""
+        assert normalize_motion_type("Motion for Attorney's Fees") == "motion_for_attorney_fees"
+
+    # --- Edge cases ---
+
+    def test_empty_string(self) -> None:
+        assert normalize_motion_type("") is None
+
+    def test_none(self) -> None:
+        assert normalize_motion_type(None) is None  # type: ignore[arg-type]
+
+    def test_whitespace_only(self) -> None:
+        assert normalize_motion_type("   ") is None
+
+    def test_whitespace_stripped(self) -> None:
+        assert normalize_motion_type("  motion_to_compel  ") == "motion_to_compel"
+
+    def test_unknown_value(self) -> None:
+        """An unrecognizable value returns None."""
+        assert normalize_motion_type("Some Random Hearing Type") is None
