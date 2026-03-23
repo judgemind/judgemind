@@ -1236,6 +1236,34 @@ class TestRunReingest:
         assert "AND c.case_title ~ %s" in filters_arg
         assert regex in filter_params_arg
 
+    @patch("reingest_from_s3.boto3")
+    @patch("reingest_from_s3.psycopg")
+    @patch("reingest_from_s3.reingest_batch")
+    def test_null_motion_type_filter_passed_through(
+        self,
+        mock_batch: MagicMock,
+        mock_psycopg: MagicMock,
+        mock_boto3: MagicMock,
+    ) -> None:
+        mock_conn = MagicMock()
+        mock_conn.__enter__ = MagicMock(return_value=mock_conn)
+        mock_conn.__exit__ = MagicMock(return_value=False)
+        mock_psycopg.connect.return_value = mock_conn
+
+        mock_batch.return_value = _make_batch_result()
+
+        reingest.run_reingest(
+            "postgresql://test",
+            county="San Diego",
+            null_motion_type=True,
+        )
+
+        call_args = mock_batch.call_args_list[0]
+        filters_arg = call_args[0][4]
+        assert "AND ct.county = %s" in filters_arg
+        assert "AND EXISTS" in filters_arg
+        assert "r.motion_type IS NULL" in filters_arg
+
 
 # ---------------------------------------------------------------------------
 # _build_filters
@@ -1267,6 +1295,36 @@ class TestBuildFilters:
         assert "AND ct.county = %s" in clauses
         assert "AND c.case_title ~ %s" in clauses
         assert params == ["Orange", regex]
+
+    def test_null_motion_type_adds_exists_subquery(self) -> None:
+        clauses, params = reingest._build_filters(None, None, None, null_motion_type=True)
+        assert "AND EXISTS" in clauses
+        assert "r.motion_type IS NULL" in clauses
+        # No additional params needed for this filter
+        assert params == []
+
+    def test_null_motion_type_false_no_clause(self) -> None:
+        clauses, params = reingest._build_filters(None, None, None, null_motion_type=False)
+        assert clauses == ""
+        assert params == []
+
+    def test_null_motion_type_with_county(self) -> None:
+        clauses, params = reingest._build_filters("San Diego", None, None, null_motion_type=True)
+        assert "AND ct.county = %s" in clauses
+        assert "AND EXISTS" in clauses
+        assert "r.motion_type IS NULL" in clauses
+        assert params == ["San Diego"]
+
+    def test_null_motion_type_with_county_and_case_title_regex(self) -> None:
+        regex = r"vs\.?\s*$"
+        clauses, params = reingest._build_filters(
+            "San Diego", None, None, case_title_regex=regex, null_motion_type=True
+        )
+        assert "AND ct.county = %s" in clauses
+        assert "AND c.case_title ~ %s" in clauses
+        assert "AND EXISTS" in clauses
+        assert "r.motion_type IS NULL" in clauses
+        assert params == ["San Diego", regex]
 
 
 # ---------------------------------------------------------------------------
