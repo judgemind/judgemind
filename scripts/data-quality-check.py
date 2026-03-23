@@ -158,7 +158,7 @@ RULING_COUNTS_24H_QUERY = """
     FROM documents d
     JOIN courts ct ON ct.id = d.court_id
     WHERE d.status = 'active'
-      AND d.created_at >= %s
+      AND d.captured_at >= %s
       {county_filter}
     GROUP BY ct.county
 """
@@ -169,8 +169,8 @@ RULING_COUNTS_7D_QUERY = """
     FROM documents d
     JOIN courts ct ON ct.id = d.court_id
     WHERE d.status = 'active'
-      AND d.created_at >= %s
-      AND d.created_at < %s
+      AND d.captured_at >= %s
+      AND d.captured_at < %s
       {county_filter}
     GROUP BY ct.county
 """
@@ -231,7 +231,7 @@ RULING_COUNT_BY_TYPE_QUERY = """
     FROM documents d
     JOIN courts ct ON ct.id = d.court_id
     WHERE d.status = 'active'
-      AND d.created_at >= %s
+      AND d.captured_at >= %s
       {county_filter}
     GROUP BY ct.county, d.document_type
 """
@@ -658,6 +658,11 @@ def check_ingest_rates(
     county: str | None = None,
 ) -> list[Alert]:
     """Check ruling ingest rates against 7-day averages.
+
+    Uses ``captured_at`` (when the court posted the ruling) rather than
+    ``created_at`` (when the pipeline processed it) so that backfill or
+    catch-up batches do not inflate the rolling average with artificial
+    spikes.
 
     Args:
         conn: Database connection.
@@ -1467,7 +1472,7 @@ def _issue_body(alert: Alert) -> str:
         f'`scripts/dev-db-query.sh "SELECT COUNT(*) FROM documents d '
         f"JOIN courts c ON c.id = d.court_id "
         f"WHERE c.county = '{alert.county}' "
-        f"AND d.created_at >= NOW() - INTERVAL '24 hours'\"`",
+        f"AND d.captured_at >= NOW() - INTERVAL '24 hours'\"`",
         "",
         "## Context",
         "",
