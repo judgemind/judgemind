@@ -1400,3 +1400,208 @@ class TestSplitRulingsNoMisAssignment:
                         f"Ruling {i} ({ruling.case_number}) contains "
                         f"case number from ruling {j} ({other.case_number})"
                     )
+
+
+# ---------------------------------------------------------------------------
+# _split_rulings / _filter_entry_matches — duplicate case number with
+# body-text numbered analysis referencing case numbers (#1716)
+# ---------------------------------------------------------------------------
+
+
+class TestSplitRulingsDuplicateCaseNumber:
+    """Verify correct splitting when multiple entries share a case number
+    and the body text of a long ruling contains numbered analytical
+    paragraphs that reference case numbers (#1716).
+
+    The bug: a 6-page ruling for entry #1 (CVRI2403055) contained numbered
+    analysis points ("1.\\n...", "2.\\n...", "3.\\n...") that also mentioned
+    the case number.  The old ``_filter_entry_matches`` kept these spurious
+    matches because their blocks contained a case number, and the consecutive-
+    numbering pass treated the real entries #2 and #3 as duplicates, silently
+    discarding them.  This caused entry #1's text to be truncated and later
+    entries' text to be mis-assigned.
+    """
+
+    # Synthetic text matching the structure from the bug report:
+    # 6 entries, entries 1-3 share CVRI2403055, and entry 1's body text
+    # has numbered analytical paragraphs that reference the case number.
+    _TEXT = (
+        "Tentative Rulings for March 23, 2026\n"
+        "Department 2\n\n"
+        "1.\n"
+        "CVRI2403055 SMITH vs JONES Hearing re: Motion to Compel\n"
+        "Tentative Ruling: Summary of Ruling: The Court grants all three "
+        "motions to compel.\n\n"
+        "The Court's analysis follows:\n\n"
+        "1.\n"
+        "Motion to Compel Interrogatories (CVRI2403055): Plaintiff failed to "
+        "respond. The motion is granted.\n\n"
+        "2.\n"
+        "Motion to Compel Production (CVRI2403055): Plaintiff also failed to "
+        "respond. The motion is granted.\n\n"
+        "3.\n"
+        "Motion to Deem Admissions (CVRI2403055): Under CCP 2033.280, the "
+        "motion is granted.\n\n"
+        "Monetary sanctions awarded: $1,500.\n\n"
+        "2.\n"
+        "CVRI2403055 SMITH vs JONES Hearing re: Motion to Compel Further\n"
+        "Tentative Ruling: See #1 Above\n\n"
+        "3.\n"
+        "CVRI2403055 SMITH vs JONES Hearing re: Motion to Deem Admissions\n"
+        "Tentative Ruling: See #1 Above\n\n"
+        "4.\n"
+        "CVRI2404378 GARCIA vs MARTINEZ Hearing re: Motion for Sanctions\n"
+        "Tentative Ruling: The motion for sanctions is denied.\n\n"
+        "5.\n"
+        "CVRI2406848 DOE vs ROE Hearing re: Motion to Continue\n"
+        "Tentative Ruling: Motion withdrawn.\n\n"
+        "6.\n"
+        "CVRI2506271 BLACK vs WHITE Hearing re: Motion for Summary Judgment\n"
+        "Tentative Ruling: Motion Granted. No opposition filed.\n"
+    )
+
+    def test_all_six_entries_captured(self) -> None:
+        """All 6 numbered entries are captured as separate rulings."""
+        rulings = _split_rulings(self._TEXT)
+        assert len(rulings) == 6
+
+    def test_entry_indices_sequential(self) -> None:
+        """Ruling indices are 1 through 6."""
+        rulings = _split_rulings(self._TEXT)
+        assert [r.ruling_index for r in rulings] == [1, 2, 3, 4, 5, 6]
+
+    def test_case_numbers_correct(self) -> None:
+        """Each ruling has the correct case number."""
+        rulings = _split_rulings(self._TEXT)
+        case_numbers = [r.case_number for r in rulings]
+        assert case_numbers == [
+            "CVRI2403055",
+            "CVRI2403055",
+            "CVRI2403055",
+            "CVRI2404378",
+            "CVRI2406848",
+            "CVRI2506271",
+        ]
+
+    def test_entry_1_has_full_ruling_text(self) -> None:
+        """Entry #1 (CVRI2403055) gets the full detailed ruling, not a truncated or
+        wrong one (#1716)."""
+        rulings = _split_rulings(self._TEXT)
+        ruling_1 = rulings[0]
+        assert ruling_1.case_number == "CVRI2403055"
+        # The ruling text must contain the full analysis, including the
+        # numbered analytical points and the sanctions award.
+        assert "grants all three motions" in ruling_1.ruling_text
+        assert "Motion to Compel Interrogatories" in ruling_1.ruling_text
+        assert "Motion to Compel Production" in ruling_1.ruling_text
+        assert "Motion to Deem Admissions" in ruling_1.ruling_text
+        assert "Monetary sanctions awarded" in ruling_1.ruling_text
+
+    def test_entry_1_does_not_have_other_entries_text(self) -> None:
+        """Entry #1's text does not spill into other entries' text."""
+        rulings = _split_rulings(self._TEXT)
+        ruling_1 = rulings[0]
+        # Should NOT contain text from entries 4-6 (different case numbers)
+        assert "CVRI2404378" not in ruling_1.ruling_text
+        assert "CVRI2406848" not in ruling_1.ruling_text
+        assert "CVRI2506271" not in ruling_1.ruling_text
+
+    def test_see_above_entries_have_correct_text(self) -> None:
+        """Entries #2 and #3 ('See #1 Above') have short cross-reference text."""
+        rulings = _split_rulings(self._TEXT)
+        ruling_2 = rulings[1]
+        ruling_3 = rulings[2]
+        assert "See #1 Above" in ruling_2.ruling_text
+        assert "See #1 Above" in ruling_3.ruling_text
+        # They should NOT have entry #1's full analysis text
+        assert "Monetary sanctions awarded" not in ruling_2.ruling_text
+        assert "Monetary sanctions awarded" not in ruling_3.ruling_text
+
+    def test_entry_6_not_misassigned_to_entry_1(self) -> None:
+        """Entry #6's text (CVRI2506271) is NOT assigned to entry #1 (#1716 root cause)."""
+        rulings = _split_rulings(self._TEXT)
+        ruling_1 = rulings[0]
+        ruling_6 = rulings[5]
+        # Entry 6 has its own text
+        assert ruling_6.case_number == "CVRI2506271"
+        assert "Motion Granted" in ruling_6.ruling_text
+        # Entry 1 should NOT have entry 6's text
+        assert "CVRI2506271" not in ruling_1.ruling_text
+        assert "No opposition filed" not in ruling_1.ruling_text
+
+    def test_later_entries_have_correct_text(self) -> None:
+        """Entries #4, #5, #6 each have their own correct ruling text."""
+        rulings = _split_rulings(self._TEXT)
+        # Entry 4: CVRI2404378 — sanctions denied
+        assert rulings[3].case_number == "CVRI2404378"
+        assert "sanctions is denied" in rulings[3].ruling_text
+        # Entry 5: CVRI2406848 — motion withdrawn
+        assert rulings[4].case_number == "CVRI2406848"
+        assert "withdrawn" in rulings[4].ruling_text
+        # Entry 6: CVRI2506271 — motion granted
+        assert rulings[5].case_number == "CVRI2506271"
+        assert "Granted" in rulings[5].ruling_text
+
+
+class TestFilterEntryMatchesDuplicatesWithCaseRefs:
+    """Test _filter_entry_matches when body-text numbered points reference
+    case numbers, creating ambiguity between real and spurious matches (#1716).
+    """
+
+    _ENTRY_RE = re.compile(r"^(?P<num>\d{1,3})\.\s*$", re.MULTILINE)
+
+    def test_prefers_match_with_tentative_ruling(self) -> None:
+        """When two candidates exist for the same entry number, the one
+        with 'Tentative Ruling:' in its block is chosen."""
+        text = (
+            "1.\n"
+            "CVRI2403055 SMITH vs JONES\n"
+            "Tentative Ruling: Granted.\n"
+            "Analysis:\n"
+            "2.\n"
+            "Point about CVRI2403055 motion.\n"
+            "2.\n"
+            "CVRI2404378 DOE vs ROE\n"
+            "Tentative Ruling: Denied.\n"
+        )
+        matches = list(self._ENTRY_RE.finditer(text))
+        result = _filter_entry_matches(matches, text)
+        # Should select 2 entries: real "1." and real "2." (the one with
+        # "Tentative Ruling: Denied.")
+        assert len(result) == 2
+        assert int(result[0].group("num")) == 1
+        assert int(result[1].group("num")) == 2
+        # Verify the second match is the REAL entry (later position),
+        # not the spurious body-text "2."
+        assert result[1].start() > result[0].start()
+        # The block after the selected "2." should contain CVRI2404378
+        block_after_2 = text[result[1].end() :]
+        assert "CVRI2404378" in block_after_2
+
+    def test_spurious_matches_skipped_when_no_tentative_ruling(self) -> None:
+        """Body-text numbered points that reference case numbers but lack
+        'Tentative Ruling:' are skipped in favour of real entries."""
+        text = (
+            "1.\n"
+            "CVRI2403055 SMITH vs JONES\n"
+            "Tentative Ruling: The Court grants the motions.\n"
+            "1.\n"
+            "First motion (CVRI2403055): granted.\n"
+            "2.\n"
+            "Second motion (CVRI2403055): granted.\n"
+            "2.\n"
+            "CVRI2403055 SMITH vs JONES\n"
+            "Tentative Ruling: See #1 Above\n"
+            "3.\n"
+            "CVRI2404378 DOE vs ROE\n"
+            "Tentative Ruling: Denied.\n"
+        )
+        matches = list(self._ENTRY_RE.finditer(text))
+        result = _filter_entry_matches(matches, text)
+        assert len(result) == 3
+        # Verify the real entries were selected (not the body-text ones)
+        nums = [int(m.group("num")) for m in result]
+        assert nums == [1, 2, 3]
+        # The "2." should be the real entry (with "Tentative Ruling: See #1 Above")
+        block_after_2 = text[result[1].end() : result[2].start()]
+        assert "See #1 Above" in block_after_2
