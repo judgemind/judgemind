@@ -257,6 +257,21 @@ class TestParsePageRows:
         rows = _parse_page_rows(raw, page_index=0)
         assert len(rows) == 1
 
+    def test_handles_dict_with_rulings_key(self) -> None:
+        """Handles dict response with 'rulings' key (visual-structure prompt format)."""
+        raw = json.dumps(
+            {
+                "rulings": [
+                    {"entry_number": "101", "case_info": "Smith vs Jones", "ruling_text": "t"},
+                    {"entry_number": "", "case_info": "", "ruling_text": "continuation"},
+                ]
+            }
+        )
+        rows = _parse_page_rows(raw, page_index=0)
+        assert len(rows) == 2
+        assert rows[0]["entry_number"] == 101
+        assert rows[1]["entry_number"] is None
+
     def test_handles_invalid_json(self) -> None:
         """Invalid JSON returns empty list."""
         rows = _parse_page_rows("not json at all", page_index=0)
@@ -1084,7 +1099,7 @@ class TestBuildUserMessageForPage:
     def test_no_metadata(self) -> None:
         """Without metadata, produces a generic extraction message."""
         msg = LlmExtractor._build_user_message_for_page(None)
-        assert "Extract all table rows" in msg
+        assert "Transcribe all rows" in msg
 
     def test_with_all_metadata(self) -> None:
         """With all metadata keys, includes them in the message."""
@@ -1179,8 +1194,17 @@ class TestPerPagePrompt:
         assert "case_info" in PDF_PER_PAGE_PROMPT
         assert "ruling_text" in PDF_PER_PAGE_PROMPT
 
-    def test_per_page_prompt_requests_json_array(self) -> None:
-        """The per-page prompt asks for a JSON array."""
+    def test_per_page_prompt_requests_json_output(self) -> None:
+        """The per-page prompt asks for JSON output with rulings key."""
         from framework.llm_extractor import PDF_PER_PAGE_PROMPT
 
-        assert "JSON array" in PDF_PER_PAGE_PROMPT
+        assert "rulings" in PDF_PER_PAGE_PROMPT
+
+    def test_per_page_prompt_uses_visual_structure(self) -> None:
+        """The per-page prompt describes visual position relative to ruled lines."""
+        from framework.llm_extractor import PDF_PER_PAGE_PROMPT
+
+        assert "VERTICAL RULED LINES" in PDF_PER_PAGE_PROMPT
+        assert "VISUAL POSITION" in PDF_PER_PAGE_PROMPT
+        assert "WIDEST column" in PDF_PER_PAGE_PROMPT
+        assert "When in doubt" in PDF_PER_PAGE_PROMPT
