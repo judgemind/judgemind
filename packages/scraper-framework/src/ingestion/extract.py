@@ -365,6 +365,11 @@ _CASE_TYPE_PREFIX_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     # Matches: CVRI, CVME, CVPS, CVSW, CVCO, 24CV, 24NNCV, 23STCV, CIV*, etc.
     (re.compile(r"^(?:\d{2,4})?(?:[A-Z]{2})?CV", re.IGNORECASE), "civil"),
     (re.compile(r"^CIV", re.IGNORECASE), "civil"),
+    # Ventura civil codes: CU (Civil Unlimited), CL (Civil Limited)
+    # Format: 4-digit year + CU/CL + 2-letter subtype + 6 digits
+    # e.g. 2025CUBC042098, 2024CLCL035410
+    (re.compile(r"^\d{4}CU", re.IGNORECASE), "civil"),
+    (re.compile(r"^\d{4}CL[A-Z]", re.IGNORECASE), "civil"),
     # Family law prefixes
     (re.compile(r"^(?:\d{2,4})?FL", re.IGNORECASE), "family"),
     (re.compile(r"^(?:\d{2,4})?DV", re.IGNORECASE), "family"),

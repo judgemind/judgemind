@@ -1319,6 +1319,24 @@ class TestExtractCaseTypeFromNumber:
     def test_oc_civil_short_format(self) -> None:
         assert extract_case_type_from_number("2024-01380242") == "civil"
 
+    # Ventura civil codes: CU (Civil Unlimited), CL (Civil Limited)
+
+    def test_ventura_cu_civil_unlimited(self) -> None:
+        """Ventura CU = Civil Unlimited: 2025CUBC042098."""
+        assert extract_case_type_from_number("2025CUBC042098") == "civil"
+
+    def test_ventura_cu_personal_property(self) -> None:
+        """Ventura CU = Civil Unlimited (PP subtype): 2025CUPP039974."""
+        assert extract_case_type_from_number("2025CUPP039974") == "civil"
+
+    def test_ventura_cu_mm_subtype(self) -> None:
+        """Ventura CU with MM subtype: 2025CUMM040123."""
+        assert extract_case_type_from_number("2025CUMM040123") == "civil"
+
+    def test_ventura_cl_civil_limited(self) -> None:
+        """Ventura CL = Civil Limited: 2024CLCL035410."""
+        assert extract_case_type_from_number("2024CLCL035410") == "civil"
+
     # --- Family law prefixes ---
 
     def test_family_fl(self) -> None:
@@ -1342,6 +1360,10 @@ class TestExtractCaseTypeFromNumber:
     def test_la_probate_cp(self) -> None:
         """LA complex/probate: 26NNCP00062."""
         assert extract_case_type_from_number("26NNCP00062") == "probate"
+
+    def test_ventura_probate(self) -> None:
+        """Ventura PR = Probate: 2025PRMA042345."""
+        assert extract_case_type_from_number("2025PRMA042345") == "probate"
 
     # --- Small claims ---
 
