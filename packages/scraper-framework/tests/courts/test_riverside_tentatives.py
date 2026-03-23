@@ -35,7 +35,6 @@ from courts.ca.riverside_tentatives import (
     _extract_outcome,
     _filter_entry_matches,
     _is_no_tentative_rulings,
-    _normalize_motion_type,
     _riv_courthouse,
     _riv_hearing_date_from_text,
     _split_rulings,
@@ -304,22 +303,30 @@ def test_split_rulings_ps1_case_titles() -> None:
 
 
 def test_split_rulings_ps1_motion_types() -> None:
-    """PS1 rulings have extractable motion types."""
+    """PS1 rulings have extractable motion types (raw, not normalized)."""
     text = _extract_pdf_text(_load_bytes("riv_ps1.pdf"))
     rulings = _split_rulings(text)
+    # Raw motion types — normalization is handled downstream by the ingestion worker
     assert rulings[0].motion_type == "Demurrer"
-    assert rulings[1].motion_type == "Terminating Sanctions"
-    assert rulings[2].motion_type == "Motion to Compel"
+    assert rulings[1].motion_type == "Terminating"
+    assert rulings[2].motion_type == (
+        "Compel Plaintiff's Responses to Request for Production, Set One"
+    )
     assert rulings[3].motion_type == "Production of Documents"
 
 
 def test_split_rulings_moreno_valley_motion_types() -> None:
-    """MV1 rulings have extractable motion types."""
+    """MV1 rulings have extractable motion types (raw, not normalized)."""
     text = _extract_pdf_text(_load_bytes("riv_moreno_valley.pdf"))
     rulings = _split_rulings(text)
-    assert rulings[0].motion_type == "Deem Admissions Admitted"
-    assert rulings[1].motion_type == "Judgment on the Pleadings"
-    assert rulings[2].motion_type == "Judgment on the Pleadings"
+    # Raw motion types — normalization is handled downstream by the ingestion worker
+    assert rulings[0].motion_type == "DEEM REQUESTS FOR WELLS FARGO BANK, N.A."
+    assert rulings[1].motion_type == (
+        "JUDGMENT ON THE PLEADINGS ON COMPLAINT FOR BANK OF AMERICA, N.A."
+    )
+    assert rulings[2].motion_type == (
+        "JUDGMENT ON THE PLEADINGS ON COMPLAINT FOR BANK OF AMERICA, N.A."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -425,7 +432,7 @@ def test_extract_motion_type_demurrer() -> None:
 
 def test_extract_motion_type_motion_to_compel() -> None:
     text = "Motion to Compel Plaintiff's Responses\nto Request for Production"
-    assert _extract_motion_type(text) == "Motion to Compel"
+    assert _extract_motion_type(text) == "Compel Plaintiff's Responses to Request for Production"
 
 
 def test_extract_case_title_simple() -> None:
@@ -807,14 +814,14 @@ def test_extract_motion_type_all_caps_pattern() -> None:
         "MOTION TO DEEM REQUESTS FOR ADMISSIONS ADMITTED BY PLAINTIFF\nTentative Ruling: Granted."
     )
     result = _extract_motion_type(text)
-    assert result == "Deem Admissions Admitted"
+    assert result == "DEEM REQUESTS FOR ADMISSIONS ADMITTED"
 
 
 def test_extract_motion_type_all_caps_no_by_of() -> None:
     """All-caps MOTION TO without 'BY' or 'OF' suffix."""
     text = "MOTION TO STRIKE\nTentative Ruling: Granted."
     result = _extract_motion_type(text)
-    assert result == "Motion to Strike"
+    assert result == "STRIKE"
 
 
 def test_extract_motion_type_all_caps_empty_returns_none() -> None:
@@ -825,23 +832,6 @@ def test_extract_motion_type_all_caps_empty_returns_none() -> None:
     result = _extract_motion_type(text)
     # Pattern 2 matches; verify the function doesn't crash
     assert result is None or isinstance(result, str)
-
-
-# ---------------------------------------------------------------------------
-# _normalize_motion_type — fallback to title case (line 403)
-# ---------------------------------------------------------------------------
-
-
-def test_normalize_motion_type_unknown_pattern() -> None:
-    """Unknown motion type falls back to title-cased raw text."""
-    result = _normalize_motion_type("some unusual motion description")
-    assert result == "Some Unusual Motion Description"
-
-
-def test_normalize_motion_type_with_trailing_punctuation() -> None:
-    """Trailing punctuation is stripped from the fallback."""
-    result = _normalize_motion_type("something unusual,;:")
-    assert result == "Something Unusual"
 
 
 # ---------------------------------------------------------------------------
