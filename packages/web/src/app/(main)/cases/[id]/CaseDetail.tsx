@@ -1,9 +1,10 @@
 'use client';
 
-import { useState } from 'react';
+import { useState, useCallback } from 'react';
 import { useQuery, gql } from '@apollo/client';
 import { ChevronDown } from 'lucide-react';
 import {
+  buildDocumentContentUrl,
   buildDownloadUrl,
   cleanRulingText,
   FORMAT_LABELS,
@@ -127,6 +128,12 @@ interface RulingsData {
   };
 }
 
+/** State for the HTML document viewer, per ruling. */
+type ViewerState =
+  | { status: 'idle' }
+  | { status: 'loading' }
+  | { status: 'loaded'; html: string }
+  | { status: 'error'; message: string };
 
 const PAGE_SIZE = 20;
 
@@ -246,6 +253,42 @@ export function CaseDetail({ caseId }: { caseId: string }) {
   const [expandedRulings, setExpandedRulings] = useState<Set<string>>(
     new Set(),
   );
+
+  const [viewerStates, setViewerStates] = useState<Record<string, ViewerState>>(
+    {},
+  );
+
+  const handleViewOriginal = useCallback(async (rulingId: string, documentId: string) => {
+    const current = viewerStates[rulingId];
+
+    if (current?.status === 'loaded') {
+      // Toggle off — hide the viewer
+      setViewerStates((prev) => ({ ...prev, [rulingId]: { status: 'idle' } }));
+      return;
+    }
+
+    setViewerStates((prev) => ({ ...prev, [rulingId]: { status: 'loading' } }));
+
+    try {
+      const url = buildDocumentContentUrl(documentId);
+      const response = await fetch(url);
+
+      if (!response.ok) {
+        const errorData = await response.json().catch(() => null);
+        const errorMessage = errorData?.error ?? `Failed to load document (HTTP ${response.status})`;
+        setViewerStates((prev) => ({ ...prev, [rulingId]: { status: 'error', message: errorMessage } }));
+        return;
+      }
+
+      const html = await response.text();
+      setViewerStates((prev) => ({ ...prev, [rulingId]: { status: 'loaded', html } }));
+    } catch {
+      setViewerStates((prev) => ({
+        ...prev,
+        [rulingId]: { status: 'error', message: 'Failed to load document. Please try again.' },
+      }));
+    }
+  }, [viewerStates]);
 
   function toggleRuling(id: string) {
     setExpandedRulings((prev) => {
@@ -422,23 +465,65 @@ export function CaseDetail({ caseId }: { caseId: string }) {
                       )}
                     </div>
                   )}
-                  {node.documentId && (
-                    <div className={hasText ? 'mt-3' : ''}>
-                      <a
-                        href={buildDownloadUrl(node.documentId)}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        className="inline-flex items-center gap-1 rounded-sm text-xs font-medium text-primary hover:text-primary/80 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                      >
-                        Download original
-                        {node.documentFormat && (
-                          <Badge variant="secondary" className="ml-1 text-[10px]">
-                            {FORMAT_LABELS[node.documentFormat] ?? node.documentFormat.toUpperCase()}
-                          </Badge>
+                  {node.documentId && (() => {
+                    const viewerState = viewerStates[node.id] ?? { status: 'idle' };
+                    const isHtmlDocument = node.documentFormat === 'html';
+                    return (
+                      <div className={hasText ? 'mt-3' : ''}>
+                        <div className="flex items-center gap-3">
+                          {isHtmlDocument && (
+                            <button
+                              type="button"
+                              className="inline-flex items-center gap-1 rounded-sm text-xs font-medium text-primary hover:text-primary/80 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                              onClick={() => handleViewOriginal(node.id, node.documentId!)}
+                              disabled={viewerState.status === 'loading'}
+                              data-testid={`view-original-button-${node.id}`}
+                            >
+                              {viewerState.status === 'loading'
+                                ? 'Loading\u2026'
+                                : viewerState.status === 'loaded'
+                                  ? 'Hide original'
+                                  : 'View original'}
+                            </button>
+                          )}
+                          <a
+                            href={buildDownloadUrl(node.documentId)}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="inline-flex items-center gap-1 rounded-sm text-xs font-medium text-primary hover:text-primary/80 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                          >
+                            Download original
+                            {node.documentFormat && (
+                              <Badge variant="secondary" className="ml-1 text-[10px]">
+                                {FORMAT_LABELS[node.documentFormat] ?? node.documentFormat.toUpperCase()}
+                              </Badge>
+                            )}
+                          </a>
+                        </div>
+
+                        {/* Original HTML document viewer (sandboxed iframe) */}
+                        {viewerState.status === 'loaded' && (
+                          <div className="mt-3">
+                            <iframe
+                              srcDoc={viewerState.html}
+                              sandbox=""
+                              className="w-full rounded border"
+                              style={{ height: '600px' }}
+                              title="Original court document"
+                              data-testid={`original-document-iframe-${node.id}`}
+                            />
+                          </div>
                         )}
-                      </a>
-                    </div>
-                  )}
+
+                        {/* Error state */}
+                        {viewerState.status === 'error' && (
+                          <p className="mt-3 text-sm text-destructive" data-testid={`viewer-error-${node.id}`}>
+                            {viewerState.message}
+                          </p>
+                        )}
+                      </div>
+                    );
+                  })()}
                 </CardContent>
               )}
             </Card>
