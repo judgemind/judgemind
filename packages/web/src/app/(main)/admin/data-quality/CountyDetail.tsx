@@ -43,7 +43,9 @@ export function CountyDetail({ county, overview, onBack }: CountyDetailProps) {
         county,
         startDate: dateRange.startDate,
         endDate: dateRange.endDate,
-        first: 100,
+        // Single county × up to 90 days × 24h × 8 metrics.  2000 rows
+        // covers ~10 days of hourly data; enough for most views.
+        first: 2000,
       },
     },
   );
