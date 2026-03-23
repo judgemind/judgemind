@@ -393,6 +393,64 @@ class DispatcherBridge:
         if path.exists():
             path.unlink()
 
+    def prune_stale_state(self) -> None:
+        """Clear stale workers and stop requests from a previous session.
+
+        Call this once at dispatcher startup, before any ``tg-notify.py``
+        calls.  It:
+
+        1. Clears ``_workers`` — no workers from a previous session are
+           still running.  The startup worktree scan re-discovers any that
+           are.
+        2. Clears ``_stopped_issues`` — stop requests are session-scoped
+           decisions; a new session starts fresh.
+        3. Preserves ``paused``, ``prs_since_last_audit``, and
+           ``session_number`` across sessions.
+        4. Saves the pruned state to *state_file*.
+        5. Writes a clean *status_file* with ``active_agents: []``.
+        6. Truncates *stop_requests_path* to an empty JSON array.
+
+        Safe to call multiple times.  No-op when the relevant file paths
+        are not configured.
+        """
+        # 1-2: Clear in-memory workers and stop requests.
+        self._workers.clear()
+        self._stopped_issues.clear()
+
+        # 3-4: Persist the pruned state (preserves paused, counters).
+        self._save_state()
+
+        # 5: Write a clean status file with no active agents.
+        # Preserve recently_completed from the existing status file so
+        # the responder daemon can still report recent task outcomes.
+        if self.status_file:
+            status_path = Path(self.status_file)
+            if status_path.exists():
+                try:
+                    existing = json.loads(status_path.read_text())
+                    self._recently_completed = existing.get("recently_completed", [])
+                except (json.JSONDecodeError, TypeError):
+                    pass  # Start fresh if the file is corrupt.
+        self.write_status()
+
+        # 6: Truncate stop_requests file to empty array.
+        if self.stop_requests_path:
+            path = Path(self.stop_requests_path)
+            if path.exists():
+                try:
+                    fd = os.open(str(path), os.O_RDWR)
+                    with os.fdopen(fd, "r+") as f:
+                        fcntl.flock(f, fcntl.LOCK_EX)
+                        f.seek(0)
+                        f.write("[]")
+                        f.truncate()
+                except Exception:
+                    logger.warning(
+                        "Failed to truncate stop_requests file %s",
+                        self.stop_requests_path,
+                        exc_info=True,
+                    )
+
     def write_status(
         self,
         *,

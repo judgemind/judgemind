@@ -2434,3 +2434,381 @@ class TestAgentIdWorkerSupport:
             workers = orch.get_workers()
             assert len(workers) == 1
             assert workers[0].worker_number == "agent-deadbeef"
+
+
+# ── prune_stale_state() ────────────────────────────────────────────────
+
+
+class TestPruneStaleState:
+    """Tests for DispatcherBridge.prune_stale_state()."""
+
+    def test_clears_stale_workers_from_state_file(self, tmp_path: Path) -> None:
+        """prune_stale_state() removes all workers from the state file."""
+        with mock_aws():
+            state_file = tmp_path / "state.json"
+            state_file.write_text(
+                json.dumps(
+                    {
+                        "paused": False,
+                        "prs_since_last_audit": 5,
+                        "session_number": 3,
+                        "workers": {
+                            "3": {
+                                "worker_number": 3,
+                                "issue_number": 42,
+                                "issue_title": "Stale task A",
+                                "phase": "ci-watch",
+                                "updated": "2026-03-13T10:00:00",
+                            },
+                            "agent-abc12345": {
+                                "worker_number": "agent-abc12345",
+                                "issue_number": 99,
+                                "issue_title": "Stale task B",
+                                "phase": "implementing",
+                                "updated": "2026-03-13T11:00:00",
+                            },
+                        },
+                    }
+                )
+            )
+
+            bridge = _make_bridge()
+            orch = DispatcherBridge(bridge=bridge, state_file=str(state_file))
+            # Before pruning: 2 stale workers loaded.
+            assert len(orch.get_workers()) == 2
+
+            orch.prune_stale_state()
+
+            # After pruning: no workers in memory.
+            assert orch.get_workers() == []
+
+            # State file on disk also has empty workers.
+            data = json.loads(state_file.read_text())
+            assert data["workers"] == {}
+
+    def test_preserves_counters_across_prune(self, tmp_path: Path) -> None:
+        """prune_stale_state() preserves prs_since_last_audit and session_number."""
+        with mock_aws():
+            state_file = tmp_path / "state.json"
+            state_file.write_text(
+                json.dumps(
+                    {
+                        "paused": True,
+                        "prs_since_last_audit": 17,
+                        "session_number": 5,
+                        "workers": {
+                            "1": {
+                                "worker_number": 1,
+                                "issue_number": 10,
+                                "issue_title": "Old",
+                                "phase": "done",
+                                "updated": "",
+                            },
+                        },
+                    }
+                )
+            )
+
+            bridge = _make_bridge()
+            orch = DispatcherBridge(bridge=bridge, state_file=str(state_file))
+            orch.prune_stale_state()
+
+            data = json.loads(state_file.read_text())
+            assert data["prs_since_last_audit"] == 17
+            assert data["session_number"] == 5
+            assert data["paused"] is True
+            assert data["workers"] == {}
+
+    def test_clears_stopped_issues(self, tmp_path: Path) -> None:
+        """prune_stale_state() clears the in-memory stopped issues set."""
+        with mock_aws():
+            bridge = _make_bridge()
+            orch = DispatcherBridge(bridge=bridge)
+            # Manually add stopped issues.
+            orch._stopped_issues.add(42)
+            orch._stopped_issues.add(99)
+            assert len(orch.stopped_issues) == 2
+
+            orch.prune_stale_state()
+
+            assert len(orch.stopped_issues) == 0
+
+    def test_truncates_stop_requests_file(self, tmp_path: Path) -> None:
+        """prune_stale_state() truncates stop_requests.json to an empty array."""
+        with mock_aws():
+            stop_file = tmp_path / "stop_requests.json"
+            stop_file.write_text(
+                json.dumps(
+                    [
+                        {"issue_number": 954, "stopped_at": "2026-03-13T10:00:00"},
+                        {"issue_number": 973, "stopped_at": "2026-03-13T11:00:00"},
+                    ]
+                )
+            )
+
+            bridge = _make_bridge()
+            orch = DispatcherBridge(
+                bridge=bridge,
+                stop_requests_path=str(stop_file),
+            )
+            orch.prune_stale_state()
+
+            content = json.loads(stop_file.read_text())
+            assert content == []
+
+    def test_writes_clean_status_file(self, tmp_path: Path) -> None:
+        """prune_stale_state() writes a status file with empty active_agents."""
+        with mock_aws():
+            state_file = tmp_path / "state.json"
+            status_file = tmp_path / "status.json"
+            state_file.write_text(
+                json.dumps(
+                    {
+                        "paused": False,
+                        "prs_since_last_audit": 0,
+                        "session_number": 1,
+                        "workers": {
+                            "3": {
+                                "worker_number": 3,
+                                "issue_number": 42,
+                                "issue_title": "Stale",
+                                "phase": "done",
+                                "updated": "",
+                            },
+                        },
+                    }
+                )
+            )
+
+            bridge = _make_bridge()
+            orch = DispatcherBridge(
+                bridge=bridge,
+                state_file=str(state_file),
+                status_file=str(status_file),
+            )
+            orch.prune_stale_state()
+
+            data = json.loads(status_file.read_text())
+            assert data["active_agents"] == []
+
+    def test_preserves_recently_completed_from_status_file(self, tmp_path: Path) -> None:
+        """prune_stale_state() preserves recently_completed from the existing status file."""
+        with mock_aws():
+            state_file = tmp_path / "state.json"
+            status_file = tmp_path / "status.json"
+            state_file.write_text(
+                json.dumps(
+                    {
+                        "paused": False,
+                        "prs_since_last_audit": 5,
+                        "session_number": 2,
+                        "workers": {
+                            "1": {
+                                "worker_number": 1,
+                                "issue_number": 10,
+                                "issue_title": "Old",
+                                "phase": "done",
+                                "updated": "",
+                            },
+                        },
+                    }
+                )
+            )
+            old_completed = [
+                {
+                    "issue_number": 42,
+                    "outcome": "completed",
+                    "summary": "Fixed the widget",
+                    "timestamp": "2026-03-22T10:00:00",
+                },
+                {
+                    "issue_number": 99,
+                    "outcome": "failed",
+                    "error": "CI broke",
+                    "timestamp": "2026-03-22T11:00:00",
+                },
+            ]
+            status_file.write_text(
+                json.dumps(
+                    {
+                        "active_agents": [
+                            {
+                                "worker_number": 1,
+                                "issue_number": 10,
+                                "issue_title": "Old",
+                                "phase": "done",
+                            }
+                        ],
+                        "recently_completed": old_completed,
+                        "open_prs": [],
+                        "queue": [],
+                        "paused": False,
+                        "stopped_issues": [],
+                    }
+                )
+            )
+
+            bridge = _make_bridge()
+            orch = DispatcherBridge(
+                bridge=bridge,
+                state_file=str(state_file),
+                status_file=str(status_file),
+            )
+            orch.prune_stale_state()
+
+            data = json.loads(status_file.read_text())
+            assert data["active_agents"] == []
+            assert data["recently_completed"] == old_completed
+
+    @respx.mock
+    async def test_task_started_after_prune_has_only_new_worker(self, tmp_path: Path) -> None:
+        """After pruning, task_started() writes only the new worker to status."""
+        with mock_aws():
+            _setup_secret()
+            respx.post("https://api.telegram.org/botfake-bot-token/sendMessage").mock(
+                return_value=httpx.Response(200, json={"ok": True})
+            )
+
+            state_file = tmp_path / "state.json"
+            status_file = tmp_path / "status.json"
+            state_file.write_text(
+                json.dumps(
+                    {
+                        "paused": False,
+                        "prs_since_last_audit": 0,
+                        "session_number": 1,
+                        "workers": {
+                            "1": {
+                                "worker_number": 1,
+                                "issue_number": 100,
+                                "issue_title": "Old stale task",
+                                "phase": "verifying",
+                                "updated": "",
+                            },
+                            "2": {
+                                "worker_number": 2,
+                                "issue_number": 200,
+                                "issue_title": "Another stale task",
+                                "phase": "ci-watch",
+                                "updated": "",
+                            },
+                        },
+                    }
+                )
+            )
+
+            bridge = _make_bridge()
+            orch = DispatcherBridge(
+                bridge=bridge,
+                state_file=str(state_file),
+                status_file=str(status_file),
+            )
+            orch.prune_stale_state()
+            await orch.task_started(issue_number=300, title="New task", worker="agent-new12345")
+
+            # Status file should contain exactly 1 active agent.
+            data = json.loads(status_file.read_text())
+            assert len(data["active_agents"]) == 1
+            assert data["active_agents"][0]["issue_number"] == 300
+            assert data["active_agents"][0]["worker_number"] == "agent-new12345"
+
+            # State file should also contain exactly 1 worker.
+            state_data = json.loads(state_file.read_text())
+            assert len(state_data["workers"]) == 1
+
+    def test_noop_without_files_configured(self) -> None:
+        """prune_stale_state() is a no-op when no file paths are set."""
+        with mock_aws():
+            bridge = _make_bridge()
+            orch = DispatcherBridge(bridge=bridge)
+            # Should not raise.
+            orch.prune_stale_state()
+            assert orch.get_workers() == []
+
+    def test_noop_when_stop_requests_file_missing(self, tmp_path: Path) -> None:
+        """prune_stale_state() handles missing stop_requests file gracefully."""
+        with mock_aws():
+            bridge = _make_bridge()
+            orch = DispatcherBridge(
+                bridge=bridge,
+                stop_requests_path=str(tmp_path / "nonexistent.json"),
+            )
+            # Should not raise.
+            orch.prune_stale_state()
+
+    def test_corrupt_status_file_does_not_break_prune(self, tmp_path: Path) -> None:
+        """prune_stale_state() handles a corrupt status file gracefully."""
+        with mock_aws():
+            state_file = tmp_path / "state.json"
+            status_file = tmp_path / "status.json"
+            state_file.write_text(json.dumps({"paused": False, "workers": {}}))
+            status_file.write_text("not valid json{{{")
+
+            bridge = _make_bridge()
+            orch = DispatcherBridge(
+                bridge=bridge,
+                state_file=str(state_file),
+                status_file=str(status_file),
+            )
+            # Should not raise — falls back to empty recently_completed.
+            orch.prune_stale_state()
+
+            data = json.loads(status_file.read_text())
+            assert data["active_agents"] == []
+            assert data["recently_completed"] == []
+
+    def test_stop_requests_truncate_error_is_logged(self, tmp_path: Path) -> None:
+        """prune_stale_state() logs a warning if stop_requests truncation fails."""
+        with mock_aws():
+            # Point to a directory instead of a file to trigger an OS error.
+            stop_dir = tmp_path / "stop_requests.json"
+            stop_dir.mkdir()
+
+            bridge = _make_bridge()
+            orch = DispatcherBridge(
+                bridge=bridge,
+                stop_requests_path=str(stop_dir),
+            )
+            # Should not raise — the error is logged.
+            orch.prune_stale_state()
+
+    def test_idempotent(self, tmp_path: Path) -> None:
+        """Calling prune_stale_state() multiple times is safe."""
+        with mock_aws():
+            state_file = tmp_path / "state.json"
+            stop_file = tmp_path / "stop_requests.json"
+            state_file.write_text(
+                json.dumps(
+                    {
+                        "paused": False,
+                        "prs_since_last_audit": 3,
+                        "session_number": 2,
+                        "workers": {
+                            "1": {
+                                "worker_number": 1,
+                                "issue_number": 10,
+                                "issue_title": "Task",
+                                "phase": "done",
+                                "updated": "",
+                            },
+                        },
+                    }
+                )
+            )
+            stop_file.write_text(json.dumps([{"issue_number": 42}]))
+
+            bridge = _make_bridge()
+            orch = DispatcherBridge(
+                bridge=bridge,
+                state_file=str(state_file),
+                stop_requests_path=str(stop_file),
+            )
+            orch.prune_stale_state()
+            orch.prune_stale_state()
+
+            assert orch.get_workers() == []
+            assert len(orch.stopped_issues) == 0
+            data = json.loads(state_file.read_text())
+            assert data["workers"] == {}
+            assert data["prs_since_last_audit"] == 3
+            assert json.loads(stop_file.read_text()) == []
