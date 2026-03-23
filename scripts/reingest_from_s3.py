@@ -851,13 +851,27 @@ def _supersede_document(
     Sets ``documents.status = 'superseded'`` so the original unsplit
     document is excluded from future queries and reingest runs.
     The row is preserved for audit trail purposes.
+
+    Also deletes any ruling rows that reference the original document,
+    since the split children create their own ruling rows with correct
+    per-ruling text.  Without this, the old single-ruling row (with
+    corrupted or merged text) would persist alongside the new split rows.
     """
     with conn.cursor() as cur:
+        cur.execute(
+            "DELETE FROM rulings WHERE document_id = %s::uuid",
+            (document_id,),
+        )
+        deleted = cur.rowcount
         cur.execute(
             "UPDATE documents SET status = 'superseded' WHERE id = %s::uuid",
             (document_id,),
         )
-    logger.debug("Superseded document %s", document_id)
+    logger.debug(
+        "Superseded document %s (deleted %d old ruling(s))",
+        document_id,
+        deleted,
+    )
 
 
 def reingest_batch(
@@ -1200,7 +1214,7 @@ def reingest_batch(
 
                     insert_document(
                         conn,
-                        document_id=doc_id_str,
+                        document_id=effective_doc_id,
                         case_id=new_case_id,
                         court_id=court_id_str,
                         content_format=doc_meta["format"],
