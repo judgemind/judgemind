@@ -82,6 +82,24 @@ class TestBuildPrompts:
         prompt = build_adversarial_prompt("task", "diff", "files")
         assert "Style preferences" in prompt or "style" in prompt.lower()
 
+    def test_adversarial_prompt_contains_scope_boundaries(self) -> None:
+        prompt = build_adversarial_prompt("task", "diff", "files")
+        assert "Scope Boundaries" in prompt
+        assert "introduced or modified by this diff" in prompt
+        assert "Pre-existing" in prompt or "pre-existing" in prompt
+        assert "out of scope" in prompt
+        assert "architecture spec" in prompt or "pipeline stages" in prompt
+        assert "cross-concern" in prompt.lower()
+
+    def test_standard_prompt_contains_scope_boundaries(self) -> None:
+        prompt = build_review_prompt("task", "diff", "files")
+        assert "Scope Boundaries" in prompt
+        assert "introduced or modified by this diff" in prompt
+        assert "Pre-existing" in prompt or "pre-existing" in prompt
+        assert "out of scope" in prompt
+        assert "architecture spec" in prompt or "pipeline stages" in prompt
+        assert "cross-concern" in prompt.lower()
+
 
 @pytest.fixture()
 def state_dir(tmp_path: Path) -> Path:

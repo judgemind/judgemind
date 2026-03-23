@@ -132,6 +132,18 @@ Then provide your detailed review. Your review MUST include:
   files, functions, and line numbers. Describe what needs to change and why. Be concrete — the implementer
   must be able to act on your feedback without guessing.
 
+## Scope Boundaries
+
+- **Only flag issues introduced or modified by this diff.** Pre-existing code patterns that were not
+  changed in this PR are out of scope — even if they look questionable. The worker is not responsible
+  for fixing code they did not touch.
+- **Check the architecture spec before flagging missing functionality.** The system has multiple
+  pipeline stages (capture, transcription, enrichment). If you think a feature is missing, it may be
+  handled by a different stage. Do not flag "missing extraction" in a transcription module if
+  extraction is an enrichment responsibility, for example.
+- **Do not flag cross-concern gaps** unless the diff explicitly claims to address them. If the task
+  requirements say "implement X," do not REVISE because Y is also missing — Y is a separate task.
+
 Be rigorous but not pedantic. Don't request style changes that don't affect correctness
 or readability. Don't request changes outside the scope of the task. If tests pass and
 ALL acceptance criteria are met, lean toward SHIP."""
@@ -174,11 +186,24 @@ Start with a single word on the first line: either SHIP or REVISE.
   - Why it matters (what could go wrong in production)
   - A concrete fix suggestion
 
+## Scope Boundaries
+
+- **Only flag issues introduced or modified by this diff.** Pre-existing code patterns that were not
+  changed in this PR are out of scope — even if they look questionable. The worker is not responsible
+  for fixing code they did not touch.
+- **Check the architecture spec before flagging missing functionality.** The system has multiple
+  pipeline stages (capture, transcription, enrichment). If you think a feature is missing, it may be
+  handled by a different stage. Do not flag "missing extraction" in a transcription module if
+  extraction is an enrichment responsibility, for example.
+- **Do not flag cross-concern gaps** unless the diff explicitly claims to address them. If the task
+  requirements say "implement X," do not REVISE because Y is also missing — Y is a separate task.
+
 Only flag real bugs and correctness issues. Do NOT flag:
 - Style preferences or naming conventions
 - Missing documentation
 - Suggestions that are nice-to-have but not bugs
-- Changes outside the scope of the task"""
+- Changes outside the scope of the task
+- Pre-existing patterns not introduced by this diff"""
 
 
 def _read_iteration(state_dir: Path) -> int:
