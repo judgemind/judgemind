@@ -458,3 +458,191 @@ class TestFrameworkExtractorInit:
         with patch("ingestion.worker.LlmExtractor", side_effect=Exception("No API key")):
             result = worker._get_framework_extractor()
             assert result is None
+
+
+class TestMultimodalExtractorInit:
+    """Tests for lazy initialization of the multimodal LlmExtractor."""
+
+    def test_lazy_init_success(self) -> None:
+        """_get_multimodal_extractor creates extractor on first call."""
+        worker, _ = _make_worker()
+        assert worker._multimodal_extractor is None
+
+        with patch("ingestion.worker.LlmExtractor") as mock_cls:
+            mock_instance = MagicMock()
+            mock_cls.return_value = mock_instance
+
+            result = worker._get_multimodal_extractor()
+            assert result is mock_instance
+            mock_cls.assert_called_once_with(
+                provider="google",
+                model="gemini-2.5-flash-lite",
+            )
+
+    def test_lazy_init_caches(self) -> None:
+        """_get_multimodal_extractor returns cached instance on subsequent calls."""
+        worker, _ = _make_worker()
+
+        with patch("ingestion.worker.LlmExtractor") as mock_cls:
+            mock_instance = MagicMock()
+            mock_cls.return_value = mock_instance
+
+            result1 = worker._get_multimodal_extractor()
+            result2 = worker._get_multimodal_extractor()
+            assert result1 is result2
+            mock_cls.assert_called_once()
+
+    def test_lazy_init_failure_returns_none(self) -> None:
+        """_get_multimodal_extractor returns None if init fails."""
+        worker, _ = _make_worker()
+
+        with patch(
+            "ingestion.worker.LlmExtractor",
+            side_effect=Exception("No Google API key"),
+        ):
+            result = worker._get_multimodal_extractor()
+            assert result is None
+
+
+class TestMultimodalExtractionPath:
+    """Tests for the multimodal extraction path in _llm_split_document."""
+
+    @patch("ingestion.worker.batch_upsert_parties")
+    @patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
+    @patch("ingestion.worker.psycopg")
+    def test_multimodal_path_used_for_pdf_with_raw_bytes(
+        self,
+        mock_psycopg: MagicMock,
+        mock_resolve_judge: MagicMock,
+        mock_batch_upsert: MagicMock,
+    ) -> None:
+        """When raw_pdf_bytes are available, multimodal extraction is used."""
+        worker, _ = _make_worker()
+
+        mock_conn, mock_cur = _make_mock_conn()
+        mock_psycopg.connect.return_value = mock_conn
+        mock_cur.fetchone.side_effect = [
+            ("court-uuid-1",),
+            ("case-uuid-1",),
+            (True,),
+        ]
+
+        # Set up multimodal extractor mock.
+        mock_multimodal = MagicMock()
+        mock_multimodal.extract_from_pdf.return_value = [
+            ExtractedRuling(
+                extracted_case_number="2024-01234567",
+                extracted_case_title="Smith v. Jones",
+                ruling_text="The motion is GRANTED.",
+                outcome=ExtractionOutcome.GRANTED,
+            ),
+        ]
+        worker._multimodal_extractor = mock_multimodal
+
+        # Also set up text extractor (should NOT be called).
+        mock_text = MagicMock()
+        worker._framework_extractor = mock_text
+
+        event = _make_event(
+            content_format="pdf",
+            ruling_text="PDF binary content here",
+        )
+        # Simulate raw PDF bytes by patching is_pdf_binary.
+        with patch("ingestion.worker.is_pdf_binary", return_value=True):
+            worker.process_event(event)
+
+        # Multimodal extractor should have been called.
+        mock_multimodal.extract_from_pdf.assert_called_once()
+        # Text extractor should NOT have been called.
+        mock_text.extract.assert_not_called()
+
+    @patch("ingestion.worker.batch_upsert_parties")
+    @patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
+    @patch("ingestion.worker.psycopg")
+    def test_multimodal_failure_falls_back_to_text(
+        self,
+        mock_psycopg: MagicMock,
+        mock_resolve_judge: MagicMock,
+        mock_batch_upsert: MagicMock,
+    ) -> None:
+        """When multimodal extraction fails, text-based extraction is used."""
+        worker, _ = _make_worker()
+
+        mock_conn, mock_cur = _make_mock_conn()
+        mock_psycopg.connect.return_value = mock_conn
+        mock_cur.fetchone.side_effect = [
+            ("court-uuid-1",),
+            ("case-uuid-1",),
+            (True,),
+        ]
+
+        # Set up multimodal extractor that fails.
+        mock_multimodal = MagicMock()
+        mock_multimodal.extract_from_pdf.side_effect = Exception("API error")
+        worker._multimodal_extractor = mock_multimodal
+
+        # Set up text extractor (should be called as fallback).
+        mock_text = MagicMock()
+        mock_text.extract.return_value = [
+            ExtractedRuling(
+                extracted_case_number="2024-01234567",
+                extracted_case_title="Smith v. Jones",
+                ruling_text="The motion is GRANTED.",
+                outcome=ExtractionOutcome.GRANTED,
+            ),
+        ]
+        worker._framework_extractor = mock_text
+
+        event = _make_event(
+            content_format="pdf",
+            ruling_text="PDF binary content here",
+        )
+        with patch("ingestion.worker.is_pdf_binary", return_value=True):
+            worker.process_event(event)
+
+        # Text extractor should have been called as fallback.
+        mock_text.extract.assert_called_once()
+        # Document should still be processed.
+        mock_conn.commit.assert_called_once()
+
+    @patch("ingestion.worker.batch_upsert_parties")
+    @patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
+    @patch("ingestion.worker.psycopg")
+    def test_empty_multimodal_result_does_not_fallback(
+        self,
+        mock_psycopg: MagicMock,
+        mock_resolve_judge: MagicMock,
+        mock_batch_upsert: MagicMock,
+    ) -> None:
+        """When multimodal returns empty list, text fallback is NOT used."""
+        worker, _ = _make_worker()
+
+        mock_conn, mock_cur = _make_mock_conn()
+        mock_psycopg.connect.return_value = mock_conn
+        mock_cur.fetchone.side_effect = [
+            ("court-uuid-1",),
+            ("case-uuid-1",),
+            (True,),
+        ]
+
+        # Multimodal extractor returns empty list (no rulings found).
+        mock_multimodal = MagicMock()
+        mock_multimodal.extract_from_pdf.return_value = []
+        worker._multimodal_extractor = mock_multimodal
+
+        # Text extractor should NOT be called.
+        mock_text = MagicMock()
+        worker._framework_extractor = mock_text
+
+        event = _make_event(
+            content_format="pdf",
+            ruling_text="PDF binary content here",
+        )
+        with patch("ingestion.worker.is_pdf_binary", return_value=True):
+            worker.process_event(event)
+
+        # Multimodal was called.
+        mock_multimodal.extract_from_pdf.assert_called_once()
+        # Text extractor should NOT have been called — empty list
+        # from multimodal is authoritative.
+        mock_text.extract.assert_not_called()
