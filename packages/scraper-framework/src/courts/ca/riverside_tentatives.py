@@ -114,15 +114,6 @@ _OUTCOME_RE = re.compile(
     re.IGNORECASE | re.MULTILINE,
 )
 
-# Motion type from the text between the entry number and "Tentative Ruling:".
-# Common patterns: "Hearing re: Demurrer...", "Motion to Compel...",
-# "Motion for Judgment on the Pleadings...", etc.
-_MOTION_TYPE_RE = re.compile(
-    r"(?:Hearing re:\s*|(?:MOTION|Motion)\s+(?:to|for|re)\s+)"
-    r"(?P<motion_type>[^\n]+?)(?:\s+(?:by|of|on)\s|\s*$)",
-    re.IGNORECASE | re.MULTILINE,
-)
-
 
 _NO_TENTATIVE_RULINGS_RE = re.compile(
     r"^\s*No\s+Tentative\s+Rulings?\b",
