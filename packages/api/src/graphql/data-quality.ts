@@ -46,7 +46,11 @@ function decodeCursor(cursor: string): string[] {
 
 function pageSize(first: number | undefined | null): number {
   const n = first ?? 20;
-  return Math.min(Math.max(1, n), 100);
+  // Cap raised from 100 to 2000 so the data quality dashboard can fetch a
+  // full 7-day window of metrics (8 counties * 8 metrics * 168 hourly
+  // snapshots ≈ 10,752 rows).  The old 100-row cap meant charts received
+  // only ~1 hour of data, making them appear nearly empty.
+  return Math.min(Math.max(1, n), 2000);
 }
 
 // ---------------------------------------------------------------------------

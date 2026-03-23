@@ -59,7 +59,10 @@ export function DataQualityDashboard() {
       variables: {
         startDate: overviewDateRange.startDate,
         endDate: overviewDateRange.endDate,
-        first: 100,
+        // 7 days × 24 hourly snapshots × 8 counties × 8 metrics ≈ 10,752 rows.
+        // Use 2000 to get enough data for meaningful charts while staying
+        // within the API's page-size cap.
+        first: 2000,
       },
       skip: !user || user.role !== 'admin',
     },

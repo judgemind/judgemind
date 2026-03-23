@@ -137,7 +137,16 @@ export function createApolloClient(): ApolloClient<unknown> {
     // build it after constructing the client with a placeholder link, then
     // swap in the full chain.
     link: ApolloLink.from([authLink, httpLink]),
-    cache: new InMemoryCache(),
+    cache: new InMemoryCache({
+      typePolicies: {
+        // DataQualityOverview has no `id` field — without explicit keyFields
+        // Apollo cannot distinguish array items and may collapse them into a
+        // single cache entry, causing the dashboard to render only one county.
+        DataQualityOverview: {
+          keyFields: ['county'],
+        },
+      },
+    }),
   });
 
   // Now that we have the client, create the error link and rebuild the chain.
