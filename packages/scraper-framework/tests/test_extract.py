@@ -1337,6 +1337,10 @@ class TestExtractCaseTypeFromNumber:
         """Ventura CL = Civil Limited: 2024CLCL035410."""
         assert extract_case_type_from_number("2024CLCL035410") == "civil"
 
+    def test_ventura_cu_old_format(self) -> None:
+        """Ventura older format with longer digit prefix: 202200570068CUMM."""
+        assert extract_case_type_from_number("202200570068CUMM") == "civil"
+
     # --- Family law prefixes ---
 
     def test_family_fl(self) -> None:

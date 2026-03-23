@@ -33,9 +33,9 @@ logger = logging.getLogger(__name__)
 
 # Ventura case number type code patterns (positions 5-6 after 4-digit year).
 _VENTURA_TYPE_MAP: list[tuple[re.Pattern[str], str]] = [
-    (re.compile(r"^\d{4}CU", re.IGNORECASE), "civil"),
-    (re.compile(r"^\d{4}CL[A-Z]", re.IGNORECASE), "civil"),
-    (re.compile(r"^\d{4}PR", re.IGNORECASE), "probate"),
+    (re.compile(r"^\d{4,}CU", re.IGNORECASE), "civil"),
+    (re.compile(r"^\d{4,}CL[A-Z]", re.IGNORECASE), "civil"),
+    (re.compile(r"^\d{4,}PR", re.IGNORECASE), "probate"),
 ]
 
 
