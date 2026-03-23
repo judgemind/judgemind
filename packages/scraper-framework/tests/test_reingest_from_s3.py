@@ -3541,7 +3541,7 @@ class TestFullReparseDocument:
             assert result[0]["ruling_text"] == "Ruling 1 text"
             assert result[0]["case_title"] == "Yeldell V. Henss"
             assert result[0]["motion_type"] == "Demurrer"
-            assert result[0]["outcome"] == "Granted"
+            assert result[0]["outcome"] == "granted"
 
             # Second ruling
             assert result[1]["is_split"] is True
@@ -3806,6 +3806,44 @@ class TestFullReparseDocument:
             assert result[0]["extraction_methods"]["outcome"] == "split"
         finally:
             reingest._SPLIT_REGISTRY.pop("test-no-overwrite", None)
+
+
+# ---------------------------------------------------------------------------
+# _normalize_outcome tests
+# ---------------------------------------------------------------------------
+
+
+class TestNormalizeOutcome:
+    """Tests for _normalize_outcome()."""
+
+    def test_none_returns_none(self) -> None:
+        assert reingest._normalize_outcome(None) is None
+
+    def test_empty_returns_none(self) -> None:
+        assert reingest._normalize_outcome("") is None
+
+    def test_lowercase_passes_through(self) -> None:
+        assert reingest._normalize_outcome("granted") == "granted"
+        assert reingest._normalize_outcome("denied") == "denied"
+        assert reingest._normalize_outcome("continued") == "continued"
+
+    def test_title_case_normalized(self) -> None:
+        assert reingest._normalize_outcome("Granted") == "granted"
+        assert reingest._normalize_outcome("Denied") == "denied"
+        assert reingest._normalize_outcome("Continued") == "continued"
+
+    def test_no_tentative_ruling_maps_to_other(self) -> None:
+        assert reingest._normalize_outcome("No Tentative Ruling") == "other"
+        assert reingest._normalize_outcome("no tentative ruling") == "other"
+
+    def test_granted_in_part(self) -> None:
+        assert reingest._normalize_outcome("Granted in Part") == "granted_in_part"
+
+    def test_withdrawn_maps_to_off_calendar(self) -> None:
+        assert reingest._normalize_outcome("Withdrawn") == "off_calendar"
+
+    def test_unknown_returns_none(self) -> None:
+        assert reingest._normalize_outcome("some random string") is None
 
 
 # ---------------------------------------------------------------------------
