@@ -117,6 +117,14 @@ resource "aws_security_group" "scraper" {
     cidr_blocks = ["0.0.0.0/0"]
   }
 
+  egress {
+    description = "PostgreSQL database (scraper run recording)"
+    from_port   = 5432
+    to_port     = 5432
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
   tags = {
     project     = "judgemind"
     environment = var.environment
@@ -164,6 +172,12 @@ resource "aws_ecs_task_definition" "scraper" {
       )
 
       secrets = concat(
+        var.db_connection_secret_arn != "" ? [
+          {
+            name      = "DATABASE_URL"
+            valueFrom = "${var.db_connection_secret_arn}:url::"
+          }
+        ] : [],
         var.courtlistener_api_token_secret_arn != "" ? [
           {
             name      = "COURTLISTENER_API_TOKEN"
