@@ -2181,10 +2181,14 @@ class TestReparseDocumentLLM:
 
         # LLM was called but returned None — regex should have been tried
         mock_llm.assert_called_once()
-        # extraction_methods should use regex for whatever regex found
+        # extraction_methods should use regex for whatever regex found,
+        # except case_type which may be derived from motion_type (#1731).
         methods = result["extraction_methods"]
-        for field_method in methods.values():
-            assert field_method == "regex"
+        for field, method in methods.items():
+            if field == "case_type":
+                assert method in ("regex", "motion_type")
+            else:
+                assert method == "regex"
 
     @patch.object(reingest, "_load_scraper_registry")
     @patch("reingest_from_s3.extract_fields_llm")
@@ -2251,6 +2255,145 @@ class TestReparseDocumentLLM:
         result = reingest._reparse_document(raw, "unknown-scraper", self._doc_meta())
         assert "extraction_methods" in result
         assert isinstance(result["extraction_methods"], dict)
+
+
+# ---------------------------------------------------------------------------
+# case_type from motion_type fallback (#1731)
+# ---------------------------------------------------------------------------
+
+
+class TestReparseDocumentCaseTypeFromMotionType:
+    """Tests for the motion_type -> case_type fallback in _reparse_document."""
+
+    def _doc_meta(
+        self,
+        case_number: str | None = None,
+        case_type: str | None = None,
+    ) -> dict:
+        return {
+            "document_id": str(_DOC_ID_1),
+            "state": "CA",
+            "county": "Ventura",
+            "court_name": "Ventura Superior Court",
+            "source_url": "https://court.example.com/ruling",
+            "captured_at": _CAPTURED_AT_1,
+            "content_hash": "abc123",
+            "format": "html",
+            "case_number": case_number,
+            "case_title": None,
+            "hearing_date": None,
+            "court_id": str(_COURT_ID),
+            "scraper_id": "unknown-scraper",
+            "s3_key": "docs/test.html",
+            "s3_bucket": "test-bucket",
+            "case_type": case_type,
+        }
+
+    @patch.object(reingest, "_load_scraper_registry")
+    def test_case_type_derived_from_motion_type(
+        self,
+        mock_registry: MagicMock,
+    ) -> None:
+        """case_type is derived from motion_type when case number has no type prefix."""
+        # Ventura all-digit case number has no type prefix, so
+        # extract_case_type_from_number returns None.  The regex
+        # extracts motion_to_compel from the text, and the new
+        # fallback should derive case_type = "civil".
+        raw = b"<html>Motion to Compel is GRANTED</html>"
+        result = reingest._reparse_document(
+            raw,
+            "unknown-scraper",
+            self._doc_meta(case_number="202300574258"),
+        )
+
+        assert result["motion_type"] == "motion_to_compel"
+        assert result["case_type"] == "civil"
+
+    @patch.object(reingest, "_load_scraper_registry")
+    def test_extraction_methods_records_motion_type(
+        self,
+        mock_registry: MagicMock,
+    ) -> None:
+        """extraction_methods records 'motion_type' for case_type when fallback is used."""
+        raw = b"<html>Motion to Compel is GRANTED</html>"
+        result = reingest._reparse_document(
+            raw,
+            "unknown-scraper",
+            self._doc_meta(case_number="202300574258"),
+        )
+
+        assert result["extraction_methods"]["case_type"] == "motion_type"
+
+    @patch.object(reingest, "_load_scraper_registry")
+    def test_petition_derives_probate(
+        self,
+        mock_registry: MagicMock,
+    ) -> None:
+        """petition motion_type derives case_type = 'probate'."""
+        raw = b"<html>Petition for letters of administration</html>"
+        result = reingest._reparse_document(
+            raw,
+            "unknown-scraper",
+            self._doc_meta(case_number="25HR054887C"),
+        )
+
+        assert result["motion_type"] == "petition"
+        assert result["case_type"] == "probate"
+        assert result["extraction_methods"]["case_type"] == "motion_type"
+
+    @patch.object(reingest, "_load_scraper_registry")
+    def test_case_number_prefix_takes_priority(
+        self,
+        mock_registry: MagicMock,
+    ) -> None:
+        """case_type from case number prefix is NOT overridden by motion_type fallback."""
+        # CVRI2502741 has "CV" prefix -> "civil" from case number.
+        # The motion_type fallback should not overwrite it.
+        raw = b"<html>Motion to Compel is GRANTED</html>"
+        result = reingest._reparse_document(
+            raw,
+            "unknown-scraper",
+            self._doc_meta(case_number="CVRI2502741"),
+        )
+
+        assert result["case_type"] == "civil"
+        # Should be "regex" (from case number), not "motion_type"
+        assert result["extraction_methods"]["case_type"] == "regex"
+
+    @patch.object(reingest, "_load_scraper_registry")
+    def test_no_fallback_when_motion_type_ambiguous(
+        self,
+        mock_registry: MagicMock,
+    ) -> None:
+        """case_type remains None when motion_type is ambiguous (e.g. ex_parte)."""
+        raw = b"<html>Ex Parte Application for temporary restraining order</html>"
+        result = reingest._reparse_document(
+            raw,
+            "unknown-scraper",
+            self._doc_meta(case_number="202300574258"),
+        )
+
+        assert result["motion_type"] == "ex_parte_application"
+        assert result["case_type"] is None
+
+    @patch.object(reingest, "_load_scraper_registry")
+    def test_no_fallback_when_case_type_from_metadata(
+        self,
+        mock_registry: MagicMock,
+    ) -> None:
+        """case_type from doc metadata is NOT overridden by motion_type fallback."""
+        raw = b"<html>Motion to Compel is GRANTED</html>"
+        result = reingest._reparse_document(
+            raw,
+            "unknown-scraper",
+            self._doc_meta(case_number="202300574258", case_type="family"),
+        )
+
+        # Metadata case_type should be preserved
+        assert result["case_type"] == "family"
+        # The extraction method should NOT be "motion_type" — it should
+        # be "scraper" (from the doc metadata) or absent.
+        assert result["extraction_methods"].get("case_type") != "motion_type"
 
 
 # ---------------------------------------------------------------------------
