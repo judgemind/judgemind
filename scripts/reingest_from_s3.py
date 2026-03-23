@@ -199,6 +199,63 @@ def _load_scraper_registry() -> None:
             )
 
 
+# Valid ruling_outcome PostgreSQL enum values.  Raw outcomes from scraper
+# split functions (e.g. "Granted", "No Tentative Ruling") need normalizing
+# before insertion.
+_VALID_OUTCOMES: frozenset[str] = frozenset(
+    {
+        "granted",
+        "denied",
+        "granted_in_part",
+        "denied_in_part",
+        "moot",
+        "continued",
+        "off_calendar",
+        "submitted",
+        "other",
+    }
+)
+
+_OUTCOME_ALIAS: dict[str, str] = {
+    "no tentative ruling": "other",
+    "no tentative": "other",
+    "withdrawn": "off_calendar",
+    "vacated": "off_calendar",
+}
+
+
+def _normalize_outcome(raw: str | None) -> str | None:
+    """Normalize a raw outcome string to a valid ruling_outcome enum value.
+
+    Returns ``None`` if the input is ``None``, empty, or cannot be mapped to
+    a valid enum value.  Handles title-case, uppercase, and common aliases
+    (e.g. "No Tentative Ruling" -> "other").
+    """
+    if not raw:
+        return None
+    lower = raw.strip().lower()
+    # Direct match after lowercasing
+    if lower in _VALID_OUTCOMES:
+        return lower
+    # Check aliases
+    if lower in _OUTCOME_ALIAS:
+        return _OUTCOME_ALIAS[lower]
+    # Partial match: e.g. "granted in part" within longer text
+    for outcome in (
+        "granted_in_part",
+        "denied_in_part",
+        "granted",
+        "denied",
+        "moot",
+        "continued",
+        "off_calendar",
+        "submitted",
+    ):
+        if outcome.replace("_", " ") in lower:
+            return outcome
+    return None
+
+
 FETCH_DOCUMENTS_QUERY = """
     SELECT
         d.id, d.case_id, d.court_id, d.s3_key, d.s3_bucket,
@@ -813,7 +870,7 @@ def _full_reparse_document(
             "case_title": ruling.case_title or doc_meta.get("case_title"),
             "case_type": doc_meta.get("case_type"),
             "judge_name": doc_judge_name,
-            "outcome": ruling.outcome,
+            "outcome": _normalize_outcome(ruling.outcome),
             "motion_type": ruling.motion_type,
             "department": doc_department,
             "parties": [],
