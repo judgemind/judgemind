@@ -431,51 +431,9 @@ def _extract_motion_type(text: str) -> str | None:
         raw = raw.rstrip(" ,;:(")
         if len(raw) > 80:
             raw = raw[:80]
-        return _normalize_motion_type(raw) if raw else None
+        return raw or None
 
     return None
-
-
-# Known motion type patterns for normalization.
-# Maps a regex pattern to the canonical motion type name.
-_MOTION_TYPE_MAP: list[tuple[re.Pattern, str]] = [
-    (re.compile(r"demurrer", re.IGNORECASE), "Demurrer"),
-    (re.compile(r"judgment\s+on\s+the\s+pleadings", re.IGNORECASE), "Judgment on the Pleadings"),
-    (re.compile(r"summary\s+judgment", re.IGNORECASE), "Summary Judgment"),
-    (re.compile(r"summary\s+adjudication", re.IGNORECASE), "Summary Adjudication"),
-    (re.compile(r"compel", re.IGNORECASE), "Motion to Compel"),
-    (re.compile(r"deem\b.*\badmission", re.IGNORECASE), "Deem Admissions Admitted"),
-    (re.compile(r"deem\s+requests?\b", re.IGNORECASE), "Deem Admissions Admitted"),
-    (re.compile(r"terminating\s+sanctions?", re.IGNORECASE), "Terminating Sanctions"),
-    (re.compile(r"monetary\s+sanctions?", re.IGNORECASE), "Monetary Sanctions"),
-    (re.compile(r"production\s+of\s+documents?", re.IGNORECASE), "Production of Documents"),
-    (re.compile(r"protective\s+order", re.IGNORECASE), "Protective Order"),
-    (re.compile(r"preliminary\s+injunction", re.IGNORECASE), "Preliminary Injunction"),
-    (re.compile(r"attorney.?s?\s+fees?", re.IGNORECASE), "Attorney's Fees"),
-    (re.compile(r"strike", re.IGNORECASE), "Motion to Strike"),
-    (re.compile(r"quash", re.IGNORECASE), "Motion to Quash"),
-    (re.compile(r"relief\s+from\s+default", re.IGNORECASE), "Relief from Default"),
-    (re.compile(r"leave\s+to\s+amend", re.IGNORECASE), "Leave to Amend"),
-    (re.compile(r"terminating", re.IGNORECASE), "Terminating Sanctions"),
-]
-
-
-def _normalize_motion_type(raw: str) -> str:
-    """Normalize a raw motion type string against known patterns.
-
-    Prefers matches that appear earliest in the text (the primary motion type).
-    Falls back to title-cased raw text if no known pattern matches.
-    """
-    best_match: tuple[int, str] | None = None
-    for pattern, canonical in _MOTION_TYPE_MAP:
-        m = pattern.search(raw)
-        if m:
-            pos = m.start()
-            if best_match is None or pos < best_match[0]:
-                best_match = (pos, canonical)
-    if best_match is not None:
-        return best_match[1]
-    return raw.title().rstrip(" ,;:")
 
 
 def _extract_outcome(text: str) -> str | None:
