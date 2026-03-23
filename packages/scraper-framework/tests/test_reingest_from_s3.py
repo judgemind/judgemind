@@ -3614,6 +3614,199 @@ class TestFullReparseDocument:
         finally:
             reingest._SPLIT_REGISTRY.pop("test-nul", None)
 
+    @patch.object(reingest, "_load_scraper_registry")
+    @patch.object(reingest, "_extract_text_from_content")
+    def test_split_path_applies_case_type_from_number_fallback(
+        self,
+        mock_extract: MagicMock,
+        mock_registry: MagicMock,
+    ) -> None:
+        """Split rulings with recognisable case number prefix get case_type (#1749)."""
+        from courts.ca.riverside_tentatives import SplitRuling
+
+        # CVPS prefix => civil case type
+        rulings = [
+            SplitRuling(1, "CVPS2306157", "Ruling text", "Smith v. Jones", "Demurrer", "Granted"),
+            SplitRuling(2, "FL2301234", "Family ruling", "Doe v. Doe", None, None),
+        ]
+        mock_split = MagicMock(return_value=rulings)
+        reingest._SPLIT_REGISTRY["test-ct-num"] = mock_split
+        reingest._SCRAPER_REGISTRY.pop("test-ct-num", None)
+        mock_extract.return_value = "pdf text"
+
+        try:
+            result = reingest._full_reparse_document(
+                b"raw pdf",
+                "test-ct-num",
+                self._doc_meta(scraper_id="test-ct-num", case_type=None),
+            )
+
+            assert len(result) == 2
+            # CVPS => civil
+            assert result[0]["case_type"] == "civil"
+            assert result[0]["extraction_methods"]["case_type"] == "regex"
+            # FL => family
+            assert result[1]["case_type"] == "family"
+            assert result[1]["extraction_methods"]["case_type"] == "regex"
+        finally:
+            reingest._SPLIT_REGISTRY.pop("test-ct-num", None)
+
+    @patch.object(reingest, "_load_scraper_registry")
+    @patch.object(reingest, "_extract_text_from_content")
+    def test_split_path_applies_case_type_from_motion_type_fallback(
+        self,
+        mock_extract: MagicMock,
+        mock_registry: MagicMock,
+    ) -> None:
+        """Ventura-style all-digit case numbers fall back to motion_type for case_type (#1749).
+
+        When the case number has no embedded type code (e.g. Ventura's
+        ``202300574258``), the case_type should be derived from the
+        motion_type via ``extract_case_type_from_motion_type()``.
+        """
+        from courts.ca.riverside_tentatives import SplitRuling
+
+        # All-digit case numbers that won't match any prefix pattern
+        rulings = [
+            SplitRuling(1, "202300574258", "Ruling text", "Smith v. Jones", "demurrer", None),
+            SplitRuling(2, "202300574259", "Other ruling", "Doe v. Roe", "petition", None),
+        ]
+        mock_split = MagicMock(return_value=rulings)
+        reingest._SPLIT_REGISTRY["test-ct-mt"] = mock_split
+        reingest._SCRAPER_REGISTRY.pop("test-ct-mt", None)
+        mock_extract.return_value = "pdf text"
+
+        try:
+            result = reingest._full_reparse_document(
+                b"raw pdf",
+                "test-ct-mt",
+                self._doc_meta(scraper_id="test-ct-mt", case_type=None),
+            )
+
+            assert len(result) == 2
+            # demurrer => civil
+            assert result[0]["case_type"] == "civil"
+            assert result[0]["extraction_methods"]["case_type"] == "motion_type"
+            # petition => probate
+            assert result[1]["case_type"] == "probate"
+            assert result[1]["extraction_methods"]["case_type"] == "motion_type"
+        finally:
+            reingest._SPLIT_REGISTRY.pop("test-ct-mt", None)
+
+    @patch.object(reingest, "_load_scraper_registry")
+    @patch.object(reingest, "_extract_text_from_content")
+    def test_split_path_applies_regex_fallbacks_for_missing_fields(
+        self,
+        mock_extract: MagicMock,
+        mock_registry: MagicMock,
+    ) -> None:
+        """Split rulings with missing fields get regex fallback extraction (#1749).
+
+        Verifies that outcome, case_title, and hearing_date regex
+        fallbacks fire on the per-ruling text when the split result
+        does not provide them.
+        """
+        from courts.ca.riverside_tentatives import SplitRuling
+
+        ruling_text_with_fields = (
+            "Case No. 24STCV99999\n"
+            "Smith v. Jones\n"
+            "Hearing Date: March 5, 2026\n"
+            "Motion for Summary Judgment\n"
+            "The motion is GRANTED.\n"
+        )
+
+        # Split result has case_number but is missing outcome, case_title, hearing_date
+        rulings = [
+            SplitRuling(
+                ruling_index=1,
+                case_number=None,
+                ruling_text=ruling_text_with_fields,
+                case_title=None,
+                motion_type=None,
+                outcome=None,
+            ),
+        ]
+        mock_split = MagicMock(
+            return_value=[
+                rulings[0],
+                SplitRuling(2, "DUMMY", "dummy", None, None, None),
+            ]
+        )
+        reingest._SPLIT_REGISTRY["test-regex"] = mock_split
+        reingest._SCRAPER_REGISTRY.pop("test-regex", None)
+        mock_extract.return_value = "pdf text"
+
+        try:
+            result = reingest._full_reparse_document(
+                b"raw pdf",
+                "test-regex",
+                self._doc_meta(
+                    scraper_id="test-regex",
+                    case_number=None,
+                    case_title=None,
+                    case_type=None,
+                    hearing_date=None,
+                ),
+            )
+
+            first = result[0]
+            # Regex should have extracted outcome from ruling text
+            assert first["outcome"] is not None, "outcome should be extracted by regex"
+            assert first["extraction_methods"].get("outcome") == "regex"
+            # case_type should be derived from the case number prefix (24STCV => civil)
+            assert first["case_type"] == "civil"
+        finally:
+            reingest._SPLIT_REGISTRY.pop("test-regex", None)
+
+    @patch.object(reingest, "_load_scraper_registry")
+    @patch.object(reingest, "_extract_text_from_content")
+    def test_split_path_does_not_overwrite_existing_fields_with_regex(
+        self,
+        mock_extract: MagicMock,
+        mock_registry: MagicMock,
+    ) -> None:
+        """Regex fallback should NOT overwrite fields already set by split results (#1749)."""
+        from courts.ca.riverside_tentatives import SplitRuling
+
+        rulings = [
+            SplitRuling(
+                ruling_index=1,
+                case_number="CVPS2306157",
+                ruling_text="The motion is DENIED.\nSome judge ruling text.",
+                case_title="Yeldell V. Henss",
+                motion_type="Demurrer",
+                outcome="Granted",  # split says Granted, text says DENIED
+            ),
+            SplitRuling(
+                ruling_index=2,
+                case_number="CVPS2306202",
+                ruling_text="Another ruling",
+                case_title=None,
+                motion_type=None,
+                outcome=None,
+            ),
+        ]
+        mock_split = MagicMock(return_value=rulings)
+        reingest._SPLIT_REGISTRY["test-no-overwrite"] = mock_split
+        reingest._SCRAPER_REGISTRY.pop("test-no-overwrite", None)
+        mock_extract.return_value = "pdf text"
+
+        try:
+            result = reingest._full_reparse_document(
+                b"raw pdf",
+                "test-no-overwrite",
+                self._doc_meta(scraper_id="test-no-overwrite", case_type=None),
+            )
+
+            # First ruling: split-provided fields should NOT be overwritten
+            assert result[0]["outcome"] == "Granted"  # from split, not regex "denied"
+            assert result[0]["case_title"] == "Yeldell V. Henss"
+            assert result[0]["motion_type"] == "Demurrer"
+            assert result[0]["extraction_methods"]["outcome"] == "split"
+        finally:
+            reingest._SPLIT_REGISTRY.pop("test-no-overwrite", None)
+
 
 # ---------------------------------------------------------------------------
 # _supersede_document tests
