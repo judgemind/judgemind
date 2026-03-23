@@ -3457,7 +3457,8 @@ def test_process_event_summarization_includes_case_context(
     case_context = call_kwargs.kwargs["case_context"]
     assert case_context is not None
     assert case_context["case_title"] == "In re: Estate of Smith"
-    assert case_context["motion_type"] == "Demurrer"
+    # "Demurrer" (title-case from scraper) is normalized to "demurrer" (#1712)
+    assert case_context["motion_type"] == "demurrer"
 
 
 @patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
@@ -3831,3 +3832,71 @@ def test_process_event_motion_type_fallback_populates_case_type(
     # The upsert_case call should include case_type='civil'
     all_sql = " ".join(str(c) for c in mock_cur.execute.call_args_list)
     assert "civil" in all_sql
+
+
+@patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
+@patch("ingestion.worker.psycopg")
+def test_process_event_normalizes_title_case_motion_type(
+    mock_psycopg: MagicMock,
+    mock_resolve_judge: MagicMock,
+) -> None:
+    """Title-case motion_type from scraper is normalized to snake_case (#1712)."""
+    worker, os_mock = _make_worker()
+
+    mock_conn, mock_cur = _make_mock_conn()
+    mock_psycopg.connect.return_value = mock_conn
+    mock_cur.fetchone.side_effect = [
+        ("court-uuid-1",),  # upsert_court
+        ("case-uuid-1",),  # upsert_case
+        (True,),  # insert_document: RETURNING is_new = True
+    ]
+    mock_cur.rowcount = 1
+
+    # SD-like event with un-normalized motion_type from scraper
+    event = _make_event(
+        motion_type="Motion to Compel Further Responses",
+        ruling_text="The motion to compel further responses is GRANTED.",
+    )
+    worker.process_event(event)
+
+    # The normalized "motion_to_compel" should be in the ruling insert, not the raw value
+    ruling_calls = [c for c in mock_cur.execute.call_args_list if "INSERT INTO rulings" in str(c)]
+    assert len(ruling_calls) == 1
+    sql_args = ruling_calls[0][0][1]
+    assert "motion_to_compel" in sql_args
+    # The raw title-case value should NOT be stored
+    assert "Motion to Compel Further Responses" not in sql_args
+
+
+@patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
+@patch("ingestion.worker.psycopg")
+def test_process_event_unmappable_motion_type_falls_back_to_regex(
+    mock_psycopg: MagicMock,
+    mock_resolve_judge: MagicMock,
+) -> None:
+    """When motion_type cannot be normalized, regex extracts from ruling_text (#1712)."""
+    worker, os_mock = _make_worker()
+
+    mock_conn, mock_cur = _make_mock_conn()
+    mock_psycopg.connect.return_value = mock_conn
+    mock_cur.fetchone.side_effect = [
+        ("court-uuid-1",),  # upsert_court
+        ("case-uuid-1",),  # upsert_case
+        (True,),  # insert_document: RETURNING is_new = True
+    ]
+    mock_cur.rowcount = 1
+
+    # SD calendar "Motion Hearing" cannot be normalized but ruling text
+    # contains "motion for summary judgment" which can be extracted
+    event = _make_event(
+        motion_type="Motion Hearing",
+        ruling_text="The motion for summary judgment is DENIED.",
+    )
+    worker.process_event(event)
+
+    # Should extract "msj" from ruling text, not store "Motion Hearing"
+    ruling_calls = [c for c in mock_cur.execute.call_args_list if "INSERT INTO rulings" in str(c)]
+    assert len(ruling_calls) == 1
+    sql_args = ruling_calls[0][0][1]
+    assert "msj" in sql_args
+    assert "Motion Hearing" not in sql_args

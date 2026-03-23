@@ -215,6 +215,57 @@ def extract_motion_type(ruling_text: str) -> str | None:
     return None
 
 
+# Set of all known normalized (snake_case) motion type values.
+_KNOWN_MOTION_TYPES: frozenset[str] = frozenset(value for _, value in _MOTION_TYPE_PATTERNS)
+
+
+def normalize_motion_type(motion_type: str) -> str | None:
+    """Normalize a motion type string to its canonical snake_case form.
+
+    Scrapers may produce motion types in various formats — title case
+    (e.g. ``"Motion to Compel"``), calendar event names
+    (e.g. ``"Motion Hearing"``), or composite types
+    (e.g. ``"Demurrer/Motion to Strike"``).  This function converts any
+    such value to the canonical snake_case form used by the enrichment
+    pipeline and ``_MOTION_TYPE_CASE_TYPE_MAP``.
+
+    Parameters
+    ----------
+    motion_type : str
+        The raw motion type value from a scraper or event payload.
+
+    Returns
+    -------
+    str | None
+        The normalized snake_case value (e.g. ``"motion_to_compel"``),
+        or ``None`` if the value cannot be mapped to a known type.
+        Returning ``None`` allows the caller to fall back to regex
+        extraction from ruling text.
+    """
+    if not motion_type:
+        return None
+
+    stripped = motion_type.strip()
+    if not stripped:
+        return None
+
+    # Already normalized — return as-is.
+    if stripped in _KNOWN_MOTION_TYPES:
+        return stripped
+
+    # Try matching against the regex patterns.  This handles title-case
+    # values like "Motion to Compel Further Responses" or "Demurrer to
+    # Complaint" as well as composite calendar event types like
+    # "Demurrer/Motion to Strike" (the first matching pattern wins).
+    matched = extract_motion_type(stripped)
+    if matched is not None:
+        return matched
+
+    # No known mapping — return None so the caller can fall back to
+    # ruling text extraction.
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Judge name extraction
 # ---------------------------------------------------------------------------
