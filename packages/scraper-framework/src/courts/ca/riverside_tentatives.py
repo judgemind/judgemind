@@ -36,6 +36,7 @@ Courthouse mapping (best-effort — Riverside has many locations):
 from __future__ import annotations
 
 import re
+from collections import defaultdict
 from datetime import datetime
 from typing import Any
 
@@ -183,31 +184,42 @@ def _filter_entry_matches(
     However, the ruling *body* text sometimes contains numbered points
     (e.g., "The court finds:\\n1.\\nThe motion is granted...") that also
     match the ``_RULING_ENTRY_RE`` pattern.  These spurious matches cause
-    ruling text to be assigned to the wrong case (#1410).
+    ruling text to be assigned to the wrong case (#1410, #1716).
 
-    Strategy: for each candidate match, check whether the text between it
-    and the *next* candidate (or end of text) contains a Riverside case
-    number.  Real ruling entries always contain a case number in their
-    text block; numbered body points do not.  Matches whose text block
-    lacks a case number are discarded as spurious.
+    Strategy (three passes):
 
-    After filtering, the selected matches are re-checked to ensure they
-    form a consecutive 1-based sequence (1, 2, 3, ...).  Any gap in the
-    sequence causes the function to stop — better to return fewer rulings
-    than to mis-assign text.
+    **Pass 1** — keep only matches whose text block contains a Riverside
+    case number.  This eliminates most spurious matches (body-text
+    numbered points that don't mention any case number).
+
+    **Pass 2** — group surviving candidates by entry number and pick the
+    best match for each number.  When there are *duplicate* matches for
+    the same entry number (e.g. two "2." matches — one from body text
+    and one real entry), prefer the match whose block also contains
+    "Tentative Ruling:" (#1716).  This handles the case where a long
+    ruling's body text has numbered analytical paragraphs that reference
+    case numbers (e.g. "1.\\nMotion re CVRI2403055:..."), which pass the
+    case-number-only check but are not real entry markers.
+
+    **Pass 3** — verify the selected matches form a consecutive 1-based
+    sequence and are in ascending positional order.  Any gap causes the
+    function to stop — better to return fewer rulings than to mis-assign
+    text.
     """
     if not matches:
         return []
 
     # Pass 1: keep only matches whose text block contains a case number.
-    kept: list[re.Match[str]] = []
+    # Also record whether the block contains "Tentative Ruling:" for use
+    # as a quality signal in Pass 2.
+    kept: list[tuple[re.Match[str], int, bool]] = []  # (match, idx, has_tentative)
     for i, m in enumerate(matches):
         block_start = m.end()
-        # Text block runs until the next match or end of text.
         block_end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
         block = text[block_start:block_end]
         if _CASE_NUMBER_RE.search(block):
-            kept.append(m)
+            has_tentative = "tentative ruling" in block.lower()
+            kept.append((m, i, has_tentative))
         else:
             logger.debug(
                 "Skipping spurious entry match",
@@ -218,25 +230,42 @@ def _filter_entry_matches(
     if not kept:
         return []
 
-    # Pass 2: verify consecutive 1-based numbering.
+    # Pass 2: group by entry number and pick the best candidate for each.
+    # Prefer matches whose block contains "Tentative Ruling:".  Among
+    # equally-qualified matches, prefer the first (lowest position).
+    by_num: dict[int, list[tuple[re.Match[str], bool]]] = defaultdict(list)
+    for m, _idx, has_tentative in kept:
+        num = int(m.group("num"))
+        by_num[num].append((m, has_tentative))
+
+    best: dict[int, re.Match[str]] = {}
+    for num, candidates in by_num.items():
+        # Prefer candidates with "Tentative Ruling:"; among those, first by position.
+        with_tr = [(m, ht) for m, ht in candidates if ht]
+        if with_tr:
+            best[num] = with_tr[0][0]
+        else:
+            best[num] = candidates[0][0]
+
+    # Pass 3: build consecutive 1-based sequence from best picks,
+    # verifying ascending positional order.
     selected: list[re.Match[str]] = []
     expected = 1
-    for m in kept:
-        num = int(m.group("num"))
-        if num == expected:
-            selected.append(m)
-            expected += 1
-        elif num > expected:
-            # Gap — stop to avoid mis-assignment.
+    last_pos = -1
+    while expected in best:
+        m = best[expected]
+        if m.start() <= last_pos:
+            # Position is not ascending — would cause overlapping text blocks.
             logger.warning(
-                "Entry sequence gap; stopping split",
+                "Entry position not ascending; stopping split",
                 expected=expected,
-                found=num,
                 position=m.start(),
+                last_pos=last_pos,
             )
             break
-        # num < expected means a duplicate (e.g. two matches for "1.");
-        # skip the later duplicate silently.
+        selected.append(m)
+        last_pos = m.start()
+        expected += 1
 
     return selected
 
