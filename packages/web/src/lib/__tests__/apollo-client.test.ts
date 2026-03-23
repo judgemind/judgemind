@@ -69,6 +69,408 @@ describe('createApolloClient', () => {
     expect(client.cache).toBeDefined();
   });
 
+  it('caches multiple OutcomeCount items without deduplication', async () => {
+    const { createApolloClient } = await import('../apollo-client');
+    const client = createApolloClient();
+
+    const { gql: clientGql } = await import('@apollo/client');
+    client.cache.writeQuery({
+      query: clientGql`
+        query JudgeAnalytics($judgeId: ID!) {
+          judgeAnalytics(judgeId: $judgeId) {
+            judgeId
+            totalRulings
+            rulingsByOutcome {
+              outcome
+              count
+            }
+            rulingsByMotionType {
+              motionType
+              total
+              granted
+              denied
+              grantedInPart
+              other
+              grantRate
+            }
+            earliestRuling
+            latestRuling
+          }
+        }
+      `,
+      variables: { judgeId: 'judge-1' },
+      data: {
+        judgeAnalytics: {
+          __typename: 'JudgeAnalytics',
+          judgeId: 'judge-1',
+          totalRulings: 10,
+          rulingsByOutcome: [
+            { __typename: 'OutcomeCount', outcome: 'granted', count: 5 },
+            { __typename: 'OutcomeCount', outcome: 'denied', count: 3 },
+            { __typename: 'OutcomeCount', outcome: 'other', count: 2 },
+          ],
+          rulingsByMotionType: [
+            {
+              __typename: 'MotionStats',
+              motionType: 'msj',
+              total: 6,
+              granted: 3,
+              denied: 2,
+              grantedInPart: 1,
+              other: 0,
+              grantRate: 0.5,
+            },
+            {
+              __typename: 'MotionStats',
+              motionType: 'demurrer',
+              total: 4,
+              granted: 2,
+              denied: 1,
+              grantedInPart: 0,
+              other: 1,
+              grantRate: 0.67,
+            },
+          ],
+          earliestRuling: '2025-01-01',
+          latestRuling: '2026-03-01',
+        },
+      },
+    });
+
+    const result = client.cache.readQuery<{
+      judgeAnalytics: {
+        rulingsByOutcome: Array<{ outcome: string; count: number }>;
+      };
+    }>({
+      query: clientGql`
+        query JudgeAnalytics($judgeId: ID!) {
+          judgeAnalytics(judgeId: $judgeId) {
+            judgeId
+            totalRulings
+            rulingsByOutcome {
+              outcome
+              count
+            }
+            rulingsByMotionType {
+              motionType
+              total
+              granted
+              denied
+              grantedInPart
+              other
+              grantRate
+            }
+            earliestRuling
+            latestRuling
+          }
+        }
+      `,
+      variables: { judgeId: 'judge-1' },
+    });
+
+    expect(result).not.toBeNull();
+    expect(result!.judgeAnalytics.rulingsByOutcome).toHaveLength(3);
+    const outcomes = result!.judgeAnalytics.rulingsByOutcome.map(
+      (o) => o.outcome,
+    );
+    expect(outcomes).toContain('granted');
+    expect(outcomes).toContain('denied');
+    expect(outcomes).toContain('other');
+  });
+
+  it('caches multiple MotionStats items without deduplication', async () => {
+    const { createApolloClient } = await import('../apollo-client');
+    const client = createApolloClient();
+
+    const { gql: clientGql } = await import('@apollo/client');
+    client.cache.writeQuery({
+      query: clientGql`
+        query JudgeAnalytics($judgeId: ID!) {
+          judgeAnalytics(judgeId: $judgeId) {
+            judgeId
+            totalRulings
+            rulingsByOutcome {
+              outcome
+              count
+            }
+            rulingsByMotionType {
+              motionType
+              total
+              granted
+              denied
+              grantedInPart
+              other
+              grantRate
+            }
+            earliestRuling
+            latestRuling
+          }
+        }
+      `,
+      variables: { judgeId: 'judge-2' },
+      data: {
+        judgeAnalytics: {
+          __typename: 'JudgeAnalytics',
+          judgeId: 'judge-2',
+          totalRulings: 8,
+          rulingsByOutcome: [
+            { __typename: 'OutcomeCount', outcome: 'granted', count: 4 },
+          ],
+          rulingsByMotionType: [
+            {
+              __typename: 'MotionStats',
+              motionType: 'msj',
+              total: 3,
+              granted: 2,
+              denied: 1,
+              grantedInPart: 0,
+              other: 0,
+              grantRate: 0.67,
+            },
+            {
+              __typename: 'MotionStats',
+              motionType: 'demurrer',
+              total: 3,
+              granted: 1,
+              denied: 1,
+              grantedInPart: 1,
+              other: 0,
+              grantRate: 0.33,
+            },
+            {
+              __typename: 'MotionStats',
+              motionType: 'mtd',
+              total: 2,
+              granted: 1,
+              denied: 0,
+              grantedInPart: 0,
+              other: 1,
+              grantRate: 1.0,
+            },
+          ],
+          earliestRuling: '2025-06-01',
+          latestRuling: '2026-02-15',
+        },
+      },
+    });
+
+    const result = client.cache.readQuery<{
+      judgeAnalytics: {
+        rulingsByMotionType: Array<{ motionType: string; total: number }>;
+      };
+    }>({
+      query: clientGql`
+        query JudgeAnalytics($judgeId: ID!) {
+          judgeAnalytics(judgeId: $judgeId) {
+            judgeId
+            totalRulings
+            rulingsByOutcome {
+              outcome
+              count
+            }
+            rulingsByMotionType {
+              motionType
+              total
+              granted
+              denied
+              grantedInPart
+              other
+              grantRate
+            }
+            earliestRuling
+            latestRuling
+          }
+        }
+      `,
+      variables: { judgeId: 'judge-2' },
+    });
+
+    expect(result).not.toBeNull();
+    expect(result!.judgeAnalytics.rulingsByMotionType).toHaveLength(3);
+    const motionTypes = result!.judgeAnalytics.rulingsByMotionType.map(
+      (m) => m.motionType,
+    );
+    expect(motionTypes).toContain('msj');
+    expect(motionTypes).toContain('demurrer');
+    expect(motionTypes).toContain('mtd');
+  });
+
+  it('caches JudgeAnalytics for different judges as distinct entries', async () => {
+    const { createApolloClient } = await import('../apollo-client');
+    const client = createApolloClient();
+
+    const { gql: clientGql } = await import('@apollo/client');
+    const analyticsQuery = clientGql`
+      query JudgeAnalytics($judgeId: ID!) {
+        judgeAnalytics(judgeId: $judgeId) {
+          judgeId
+          totalRulings
+          rulingsByOutcome {
+            outcome
+            count
+          }
+          rulingsByMotionType {
+            motionType
+            total
+            granted
+            denied
+            grantedInPart
+            other
+            grantRate
+          }
+          earliestRuling
+          latestRuling
+        }
+      }
+    `;
+
+    // Write analytics for judge-1
+    client.cache.writeQuery({
+      query: analyticsQuery,
+      variables: { judgeId: 'judge-1' },
+      data: {
+        judgeAnalytics: {
+          __typename: 'JudgeAnalytics',
+          judgeId: 'judge-1',
+          totalRulings: 50,
+          rulingsByOutcome: [
+            { __typename: 'OutcomeCount', outcome: 'granted', count: 30 },
+          ],
+          rulingsByMotionType: [],
+          earliestRuling: '2024-01-01',
+          latestRuling: '2026-01-01',
+        },
+      },
+    });
+
+    // Write analytics for judge-2
+    client.cache.writeQuery({
+      query: analyticsQuery,
+      variables: { judgeId: 'judge-2' },
+      data: {
+        judgeAnalytics: {
+          __typename: 'JudgeAnalytics',
+          judgeId: 'judge-2',
+          totalRulings: 25,
+          rulingsByOutcome: [
+            { __typename: 'OutcomeCount', outcome: 'denied', count: 15 },
+          ],
+          rulingsByMotionType: [],
+          earliestRuling: '2025-01-01',
+          latestRuling: '2026-02-01',
+        },
+      },
+    });
+
+    // Read back judge-1 — should not be overwritten by judge-2
+    const result1 = client.cache.readQuery<{
+      judgeAnalytics: { judgeId: string; totalRulings: number };
+    }>({
+      query: analyticsQuery,
+      variables: { judgeId: 'judge-1' },
+    });
+
+    const result2 = client.cache.readQuery<{
+      judgeAnalytics: { judgeId: string; totalRulings: number };
+    }>({
+      query: analyticsQuery,
+      variables: { judgeId: 'judge-2' },
+    });
+
+    expect(result1).not.toBeNull();
+    expect(result1!.judgeAnalytics.judgeId).toBe('judge-1');
+    expect(result1!.judgeAnalytics.totalRulings).toBe(50);
+
+    expect(result2).not.toBeNull();
+    expect(result2!.judgeAnalytics.judgeId).toBe('judge-2');
+    expect(result2!.judgeAnalytics.totalRulings).toBe(25);
+  });
+
+  it('caches multiple CaseEdge items without deduplication (keyFields: false)', async () => {
+    const { createApolloClient } = await import('../apollo-client');
+    const client = createApolloClient();
+
+    const { gql: clientGql } = await import('@apollo/client');
+    const casesQuery = clientGql`
+      query Cases {
+        cases {
+          edges {
+            cursor
+            node {
+              id
+              caseNumber
+            }
+          }
+          pageInfo {
+            hasNextPage
+            endCursor
+          }
+        }
+      }
+    `;
+
+    client.cache.writeQuery({
+      query: casesQuery,
+      data: {
+        cases: {
+          __typename: 'CaseConnection',
+          edges: [
+            {
+              __typename: 'CaseEdge',
+              cursor: 'cursor-aaa',
+              node: {
+                __typename: 'Case',
+                id: 'case-1',
+                caseNumber: '24STCV00001',
+              },
+            },
+            {
+              __typename: 'CaseEdge',
+              cursor: 'cursor-bbb',
+              node: {
+                __typename: 'Case',
+                id: 'case-2',
+                caseNumber: '24STCV00002',
+              },
+            },
+            {
+              __typename: 'CaseEdge',
+              cursor: 'cursor-ccc',
+              node: {
+                __typename: 'Case',
+                id: 'case-3',
+                caseNumber: '24STCV00003',
+              },
+            },
+          ],
+          pageInfo: {
+            __typename: 'PageInfo',
+            hasNextPage: true,
+            endCursor: 'cursor-ccc',
+          },
+        },
+      },
+    });
+
+    const result = client.cache.readQuery<{
+      cases: {
+        edges: Array<{
+          cursor: string;
+          node: { id: string; caseNumber: string };
+        }>;
+      };
+    }>({ query: casesQuery });
+
+    expect(result).not.toBeNull();
+    expect(result!.cases.edges).toHaveLength(3);
+    expect(result!.cases.edges[0].cursor).toBe('cursor-aaa');
+    expect(result!.cases.edges[1].cursor).toBe('cursor-bbb');
+    expect(result!.cases.edges[2].cursor).toBe('cursor-ccc');
+    expect(result!.cases.edges[0].node.id).toBe('case-1');
+    expect(result!.cases.edges[1].node.id).toBe('case-2');
+    expect(result!.cases.edges[2].node.id).toBe('case-3');
+  });
+
   it('caches multiple DataQualityOverview items without deduplication', async () => {
     const { createApolloClient } = await import('../apollo-client');
     const client = createApolloClient();

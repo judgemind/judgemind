@@ -139,12 +139,56 @@ export function createApolloClient(): ApolloClient<unknown> {
     link: ApolloLink.from([authLink, httpLink]),
     cache: new InMemoryCache({
       typePolicies: {
-        // DataQualityOverview has no `id` field — without explicit keyFields
-        // Apollo cannot distinguish array items and may collapse them into a
-        // single cache entry, causing the dashboard to render only one county.
+        // ---------------------------------------------------------------------
+        // Types without `id` that appear in arrays — keyFields required to
+        // prevent Apollo from collapsing distinct items into a single cache
+        // entry (see #1542, #1762).
+        // ---------------------------------------------------------------------
+
         DataQualityOverview: {
           keyFields: ['county'],
         },
+        OutcomeCount: {
+          keyFields: ['outcome'],
+        },
+        MotionStats: {
+          keyFields: ['motionType'],
+        },
+
+        // RulingSearchHit uses `rulingId` instead of `id` as its unique key.
+        RulingSearchHit: {
+          keyFields: ['rulingId'],
+        },
+        // JudgeAnalytics is a single-response type but uses `judgeId` instead
+        // of `id`. Explicit keyFields lets Apollo cache analytics for multiple
+        // judges without collisions.
+        JudgeAnalytics: {
+          keyFields: ['judgeId'],
+        },
+
+        // ---------------------------------------------------------------------
+        // Edge types — keyFields: false disables normalization so they stay
+        // embedded in their parent connection rather than being individually
+        // cached. Edges have no natural unique key (cursor is positional, not
+        // identity-based).
+        // ---------------------------------------------------------------------
+
+        RulingSearchEdge: { keyFields: false },
+        CaseEdge: { keyFields: false },
+        JudgeEdge: { keyFields: false },
+        RulingEdge: { keyFields: false },
+        DataQualityMetricEdge: { keyFields: false },
+
+        // ---------------------------------------------------------------------
+        // Types that intentionally do NOT need keyFields:
+        //
+        // - AuthPayload: single response from login/register, not in arrays.
+        // - PlatformStats: single response from platformStats query.
+        // - PageInfo: embedded single object within each connection.
+        // - *Connection types (RulingSearchConnection, CaseConnection,
+        //   JudgeConnection, RulingConnection, DataQualityMetricConnection):
+        //   connection wrappers, not array items themselves.
+        // ---------------------------------------------------------------------
       },
     }),
   });
