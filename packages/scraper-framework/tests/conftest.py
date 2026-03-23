@@ -18,7 +18,7 @@ xdist processes) read from it.
 
 Including the function identifier in the key prevents collisions between
 different extractors called on the same PDF bytes (e.g. ``_extract_pdf_text``
-vs ``_extract_oc_pdf_text``).
+for different courts).
 
 No external dependencies are needed — the cache uses stdlib ``hashlib`` and
 ``pathlib``.  Race conditions between workers writing the same key are harmless
@@ -32,44 +32,19 @@ instantly.
 from __future__ import annotations
 
 import hashlib
-import importlib
 import os
-import sys
 from collections.abc import Callable, Generator
 from pathlib import Path
-from types import ModuleType
 from unittest.mock import patch
 
 import pytest
 
 from courts.ca import cc_tentatives as _cc
 from courts.ca import fresno_tentatives as _fresno
-from courts.ca import oc_tentatives as _oc
 from courts.ca import pdf_link_scraper as _pls
 from courts.ca import riverside_tentatives as _riv
 from courts.ca import sc_tentatives as _sc
 from courts.ca import ventura_tentatives as _ven
-
-# ---------------------------------------------------------------------------
-# Backfill module — imported lazily for caching its _extract_oc_pdf_text
-# ---------------------------------------------------------------------------
-
-_SCRIPTS_DIR = str(Path(__file__).resolve().parent.parent.parent.parent / "scripts")
-
-
-def _import_backfill_oc() -> ModuleType | None:
-    """Import the backfill_oc_ruling_text script as a module.
-
-    Returns ``None`` if the script is not found (e.g. running tests from
-    a partial checkout).  The caller should skip patching in that case.
-    """
-    if _SCRIPTS_DIR not in sys.path:
-        sys.path.insert(0, _SCRIPTS_DIR)
-    try:
-        return importlib.import_module("backfill_oc_ruling_text")
-    except (ImportError, ModuleNotFoundError):
-        return None
-
 
 # ---------------------------------------------------------------------------
 # Disk-based cross-worker PDF text cache
@@ -170,7 +145,7 @@ def _cache_pdf_text_extraction(
     must be patched so that the imported reference in each module's
     namespace is replaced.
     """
-    # --- pdf_link_scraper._extract_pdf_text (OC, Riverside, SB, Fresno, CC) ---
+    # --- pdf_link_scraper._extract_pdf_text (Riverside, SB, Fresno, CC) ---
     _cached_pls = _make_disk_cached(_pls._extract_pdf_text)
 
     # --- sc_tentatives.extract_pdf_text (Santa Clara) ---
@@ -178,9 +153,6 @@ def _cache_pdf_text_extraction(
 
     # --- ventura_tentatives._extract_pdf_text (local copy) ---
     _cached_ven = _make_disk_cached(_ven._extract_pdf_text)
-
-    # --- oc_tentatives._extract_oc_pdf_text (pdfplumber table detection) ---
-    _cached_oc = _make_disk_cached(_oc._extract_oc_pdf_text)
 
     # Patch every module that holds its own reference to the function.
     patches = [
@@ -190,21 +162,7 @@ def _cache_pdf_text_extraction(
         patch.object(_fresno, "_extract_pdf_text", _cached_pls),
         patch.object(_sc, "extract_pdf_text", _cached_sc),
         patch.object(_ven, "_extract_pdf_text", _cached_ven),
-        patch.object(_oc, "_extract_oc_pdf_text", _cached_oc),
     ]
-
-    # --- backfill_oc_ruling_text._extract_oc_pdf_text (inlined copy) ---
-    # The backfill script has its own copy of the OC extraction logic.
-    # Without this patch, tests in test_backfill_oc_ruling_text.py do
-    # uncached pdfplumber parses (~5s each), wasting ~30s total.
-    _backfill_mod = _import_backfill_oc()
-    if _backfill_mod is not None:
-        _cached_backfill_oc = _make_disk_cached(
-            _backfill_mod._extract_oc_pdf_text,
-        )
-        patches.append(
-            patch.object(_backfill_mod, "_extract_oc_pdf_text", _cached_backfill_oc),
-        )
 
     for p in patches:
         p.start()

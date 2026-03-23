@@ -311,7 +311,8 @@ def test_oc_run_populates_judge_and_dept() -> None:
 
 
 @respx.mock
-def test_oc_run_extracts_case_numbers() -> None:
+def test_oc_parse_document_is_noop() -> None:
+    """OC parse_document is a no-op — field extraction is handled by LLM pipeline."""
     html = _load_html("oc_civil_page.html")
     pdf_bytes = _load_bytes("oc_apkarian_c25.pdf")
 
@@ -323,11 +324,11 @@ def test_oc_run_extracts_case_numbers() -> None:
     scraper = OCTentativeRulingsScraper(config=config)
 
     docs = scraper.fetch_documents()
-    # parse_document populates case numbers from PDF text
+    # parse_document is a no-op for OC — returns doc unchanged
     parsed = [scraper.parse_document(d) for d in docs]
-    # The Apkarian PDF has case numbers
+    # No case numbers should be populated (extraction handled by LLM pipeline)
     has_case_number = [d for d in parsed if d.case_number]
-    assert len(has_case_number) > 0
+    assert len(has_case_number) == 0
 
 
 @respx.mock

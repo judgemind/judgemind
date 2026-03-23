@@ -103,10 +103,12 @@ def test_la_all_docs_have_case_number() -> None:
 
 
 @respx.mock
-def test_oc_civil_docs_with_case_numbers_fixture() -> None:
-    """OC Civil: fixture with case numbers (apkarian_c25) — all docs must have case_number.
+def test_oc_civil_parse_document_is_noop() -> None:
+    """OC Civil: parse_document is a no-op — field extraction handled by LLM pipeline.
 
-    The oc_apkarian_c25.pdf has 14 case numbers in DD-DDDDDDDD format.
+    OC multimodal extraction is validated and deployed. The scraper captures
+    raw PDF content only; case_number extraction happens in the ingestion
+    pipeline via LLM page-image analysis.
     """
     from courts.ca.oc_tentatives import (
         INDEX_URL,
@@ -130,7 +132,12 @@ def test_oc_civil_docs_with_case_numbers_fixture() -> None:
     parsed = [scraper.parse_document(d) for d in docs]
 
     assert len(parsed) > 0, "Expected at least one parsed document"
-    _assert_all_have_case_number(parsed, "OC Civil (apkarian_c25)")
+    # All documents should have case_number=None — parse_document is a no-op
+    none_count = sum(1 for d in parsed if d.case_number is None)
+    assert none_count == len(parsed), (
+        f"OC Civil: expected all {len(parsed)} docs to have case_number=None "
+        f"(parse_document is a no-op), but {len(parsed) - none_count} had values"
+    )
 
 
 @respx.mock
