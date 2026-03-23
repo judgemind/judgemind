@@ -3623,10 +3623,11 @@ class TestFullReparseDocument:
 class TestSupersedeDocument:
     """Tests for _supersede_document()."""
 
-    def test_executes_update_query(self) -> None:
-        """Calls UPDATE on documents with status='superseded'."""
+    def test_executes_delete_and_update_queries(self) -> None:
+        """Deletes old rulings then marks document as superseded."""
         conn = MagicMock()
         cur = MagicMock()
+        cur.rowcount = 1
         ctx = MagicMock()
         ctx.__enter__ = MagicMock(return_value=cur)
         ctx.__exit__ = MagicMock(return_value=False)
@@ -3634,12 +3635,20 @@ class TestSupersedeDocument:
 
         reingest._supersede_document(conn, str(_DOC_ID_1))
 
-        cur.execute.assert_called_once()
-        sql = cur.execute.call_args[0][0]
-        assert "UPDATE documents" in sql
-        assert "superseded" in sql
-        params = cur.execute.call_args[0][1]
-        assert params == (str(_DOC_ID_1),)
+        assert cur.execute.call_count == 2
+
+        # First call: DELETE old rulings referencing the parent document
+        delete_sql = cur.execute.call_args_list[0][0][0]
+        assert "DELETE FROM rulings" in delete_sql
+        delete_params = cur.execute.call_args_list[0][0][1]
+        assert delete_params == (str(_DOC_ID_1),)
+
+        # Second call: UPDATE document status to superseded
+        update_sql = cur.execute.call_args_list[1][0][0]
+        assert "UPDATE documents" in update_sql
+        assert "superseded" in update_sql
+        update_params = cur.execute.call_args_list[1][0][1]
+        assert update_params == (str(_DOC_ID_1),)
 
 
 # ---------------------------------------------------------------------------
@@ -3882,13 +3891,13 @@ class TestReingestBatchFullReparse:
         mock_batch_parties: MagicMock,
         mock_supersede: MagicMock,
     ) -> None:
-        """Original doc ID used for insert_document; split IDs for insert_ruling.
+        """Split doc IDs used for both insert_document and insert_ruling.
 
-        Matches ingestion worker behavior: one PDF = one document row, but
-        each split ruling gets its own ruling row with a split_document_id.
+        Each split ruling gets its own document row (so the FK
+        rulings.document_id -> documents.id is satisfied) and its own
+        ruling row.  The original parent document is superseded.
         """
         row = _make_document_row()
-        original_doc_id = str(row[0])
         conn = _mock_conn_with_rows([row])
 
         mock_fetch_s3.return_value = b"pdf content"
@@ -3939,11 +3948,13 @@ class TestReingestBatchFullReparse:
             full_reparse=True,
         )
 
-        # insert_document uses the ORIGINAL document_id (one PDF = one document row)
+        # insert_document uses split document IDs so each ruling's FK is
+        # satisfied (rulings.document_id REFERENCES documents.id).
         doc_ids = [c[1]["document_id"] for c in mock_insert_doc.call_args_list]
-        assert all(did == original_doc_id for did in doc_ids)
+        assert "split-doc-aaa" in doc_ids
+        assert "split-doc-bbb" in doc_ids
 
-        # insert_ruling uses split document IDs
+        # insert_ruling also uses split document IDs
         ruling_doc_ids = [c[1]["document_id"] for c in mock_insert_ruling.call_args_list]
         assert "split-doc-aaa" in ruling_doc_ids
         assert "split-doc-bbb" in ruling_doc_ids
