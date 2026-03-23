@@ -55,7 +55,7 @@ function makeOverview(): DataQualityOverviewItem {
   };
 }
 
-function makeMetricsData() {
+function makeMetricsData(): { dataQualityMetrics: { edges: Array<{ cursor: string; node: { id: string; recordedAt: string; county: string; metricName: string; metricValue: number; metadata: string | null } }>; pageInfo: { hasNextPage: boolean; endCursor: string | null } } } {
   return {
     dataQualityMetrics: {
       edges: [
@@ -220,7 +220,7 @@ describe('CountyDetail', () => {
     render(
       <CountyDetail county="Los Angeles" overview={makeOverview()} onBack={onBack} />,
     );
-    // Default is 30d range → resolution should be four_hour
+    // Default is 30d range -> resolution should be four_hour
     expect(lastQueryVariables).toBeDefined();
     expect(lastQueryVariables!.resolution).toBe('four_hour');
     expect(lastQueryVariables!.first).toBe(5000);
@@ -247,5 +247,25 @@ describe('CountyDetail', () => {
     fireEvent.click(screen.getByText('90d'));
     expect(lastQueryVariables).toBeDefined();
     expect(lastQueryVariables!.resolution).toBe('daily');
+  });
+
+  it('shows truncation warning when hasNextPage is true', () => {
+    const truncatedData = makeMetricsData();
+    truncatedData.dataQualityMetrics.pageInfo = { hasNextPage: true, endCursor: 'c3' };
+    mockMetricsQueryResult.data = truncatedData;
+    render(
+      <CountyDetail county="Los Angeles" overview={makeOverview()} onBack={onBack} />,
+    );
+    expect(screen.getByRole('alert')).toBeInTheDocument();
+    expect(screen.getByText(/Some data may be truncated/)).toBeInTheDocument();
+  });
+
+  it('does not show truncation warning when hasNextPage is false', () => {
+    mockMetricsQueryResult.data = makeMetricsData();
+    render(
+      <CountyDetail county="Los Angeles" overview={makeOverview()} onBack={onBack} />,
+    );
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    expect(screen.queryByText(/Some data may be truncated/)).not.toBeInTheDocument();
   });
 });

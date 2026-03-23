@@ -225,4 +225,54 @@ describe('DataQualityDashboard', () => {
     expect(lastMetricsVariables!.startDate).toBeDefined();
     expect(lastMetricsVariables!.endDate).toBeDefined();
   });
+
+  it('shows truncation warning when hasNextPage is true', () => {
+    mockOverviewQueryResult.data = makeOverviewData();
+    mockMetricsQueryResult.data = {
+      dataQualityMetrics: {
+        edges: [
+          {
+            cursor: 'c1',
+            node: {
+              id: '1',
+              recordedAt: '2026-03-11T10:00:00Z',
+              county: 'Los Angeles',
+              metricName: 'ruling_count_24h',
+              metricValue: 42,
+              metadata: null,
+            },
+          },
+        ],
+        pageInfo: { hasNextPage: true, endCursor: 'c1' },
+      },
+    };
+    render(<DataQualityDashboard />);
+    expect(screen.getByRole('alert')).toBeInTheDocument();
+    expect(screen.getByText(/Some data may be truncated/)).toBeInTheDocument();
+  });
+
+  it('does not show truncation warning when hasNextPage is false', () => {
+    mockOverviewQueryResult.data = makeOverviewData();
+    mockMetricsQueryResult.data = {
+      dataQualityMetrics: {
+        edges: [
+          {
+            cursor: 'c1',
+            node: {
+              id: '1',
+              recordedAt: '2026-03-11T10:00:00Z',
+              county: 'Los Angeles',
+              metricName: 'ruling_count_24h',
+              metricValue: 42,
+              metadata: null,
+            },
+          },
+        ],
+        pageInfo: { hasNextPage: false, endCursor: null },
+      },
+    };
+    render(<DataQualityDashboard />);
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    expect(screen.queryByText(/Some data may be truncated/)).not.toBeInTheDocument();
+  });
 });
