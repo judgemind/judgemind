@@ -39,6 +39,17 @@ scripts/run-py.sh scripts/tg-notify.py session_started
 
 If Telegram is not configured, both commands exit silently (exit 0) — all bridge calls are no-ops when unconfigured.
 
+
+### 1b. Prune stale local state files
+
+Local state files (`tmp/dispatcher_state.json`, `tmp/dispatcher_status.json`, `tmp/stop_requests.json`) accumulate stale entries across sessions. Prune them once at startup, **before any `tg-notify.py` lifecycle calls** (which load the state file and could write stale workers back to the status file).
+
+```
+scripts/run-py.sh scripts/tg-notify.py prune_state
+```
+
+This clears stale workers from `dispatcher_state.json`, resets `active_agents` in `dispatcher_status.json`, and truncates `stop_requests.json` to `[]`. Counters like `prs_since_last_audit` and `session_number` are preserved across sessions.
+
 ### 2. Clean up stale issue assignments
 
 When a previous dispatcher or agent session ends unexpectedly (context window exhaustion, crash, terminal closed), issues assigned to the agent account may remain assigned with `agent/ready` but no agent working them. These look "in progress" but are actually abandoned, blocking future pickup.
@@ -386,10 +397,10 @@ All of this state survives a rotation because it is file-backed:
 | State | File | Notes |
 |---|---|---|
 | Paused flag | `tmp/dispatcher_state.json` | New session reads on startup |
-| Active workers | `tmp/dispatcher_state.json` | New session discovers running agents via worktree list + status files |
+| Active workers | `tmp/dispatcher_state.json` | Pruned on startup (step 1b); new session re-discovers running agents via worktree list + status files |
 | PRs since last audit | `tmp/dispatcher_status.json` | Counter continues from where it left off |
 | Session number | `tmp/dispatcher_status.json` | Incremented on each startup |
-| Stopped issues | `tmp/stop_requests.json` | Persists across sessions |
+| Stopped issues | `tmp/stop_requests.json` | Cleared on startup (step 1b); stop requests are session-scoped |
 | Responder daemon | PID file in `tmp/` | Keeps running across rotations |
 | Telegram inbox | `tmp/tg_inbox.json` | New session picks up unprocessed commands |
 | Dispatcher checkpoint | `tmp/dispatcher_checkpoint.md` | Behavioral context for compaction recovery (see below) |
@@ -854,6 +865,7 @@ All outbound Telegram notifications MUST use the committed script `scripts/run-p
 | `scripts/run-py.sh scripts/tg-notify.py task_failed` | `<issue> <error> <worker>` | Agent failed |
 | `scripts/run-py.sh scripts/tg-notify.py pr_merged` | `<pr_number> <title>` | After squash-merging a PR |
 | `scripts/run-py.sh scripts/tg-notify.py notify` | `<message>` | Free-form notification (blockers, CI issues, deploy status) |
+| `scripts/run-py.sh scripts/tg-notify.py prune_state` | (none) | Dispatcher startup (step 1b) — clears stale workers and stop requests |
 
 **IMPORTANT:** Always call `scripts/run-py.sh scripts/tg-notify.py` after every lifecycle event. Do not rely on remembering to send notifications manually — the script handles both the Telegram message and the status file update atomically. If you skip the notification, the responder daemon will have stale status and give incorrect answers to user queries.
 

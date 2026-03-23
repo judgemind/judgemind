@@ -15,6 +15,7 @@ Usage::
     scripts/tg-notify.py session_started
     scripts/tg-notify.py session_ended
     scripts/tg-notify.py notify <message>
+    scripts/tg-notify.py prune_state
 
 The ``<worker_or_agent_id>`` parameter accepts either an integer worker
 number (e.g. ``3``) or a string agent ID (e.g. ``agent-ab4722a2``).
@@ -51,6 +52,7 @@ def _usage() -> str:
         "  scripts/tg-notify.py session_started\n"
         "  scripts/tg-notify.py session_ended\n"
         "  scripts/tg-notify.py notify <message>\n"
+        "  scripts/tg-notify.py prune_state\n"
     )
 
 
@@ -134,6 +136,9 @@ async def _main(args: list[str]) -> int:
                 return 1
             message = " ".join(args[1:])
             await bridge.notify(message)
+
+        elif action == "prune_state":
+            bridge.prune_stale_state()
 
         else:
             print(f"Unknown action: {action}\n\n{_usage()}", file=sys.stderr)
