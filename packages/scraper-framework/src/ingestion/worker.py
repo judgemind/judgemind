@@ -55,6 +55,7 @@ from .db import (
 from .extract import (
     extract_case_number,
     extract_case_title,
+    extract_case_type_from_motion_type,
     extract_case_type_from_number,
     extract_case_type_from_scraper_id,
     extract_hearing_date,
@@ -770,6 +771,16 @@ class IngestionWorker:
             case_type = extract_case_type_from_scraper_id(scraper_id)
             if case_type:
                 extraction_methods.setdefault("case_type", "scraper_id")
+
+        # Fallback case_type from motion_type (#1702).
+        # Final fallback for cases where the case number has no embedded
+        # type code and the scraper_id is generic (e.g. Ventura's
+        # all-digit case numbers like 202300574258).  Many civil motion
+        # types unambiguously identify the case type.
+        if case_type is None and motion_type:
+            case_type = extract_case_type_from_motion_type(motion_type)
+            if case_type:
+                extraction_methods.setdefault("case_type", "motion_type")
 
         if extraction_methods:
             logger.info(

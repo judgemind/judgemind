@@ -469,6 +469,73 @@ def extract_case_type_from_scraper_id(scraper_id: str) -> str | None:
     return None
 
 
+# ---------------------------------------------------------------------------
+# Case type extraction from motion type (#1702)
+# ---------------------------------------------------------------------------
+
+# Maps normalized motion_type values to case_type values.  This is a final
+# fallback when case number prefix and scraper_id fail to determine the type.
+# Only motion types that unambiguously identify a case type are included.
+_MOTION_TYPE_CASE_TYPE_MAP: dict[str, str] = {
+    # Civil motion types
+    "msj": "civil",
+    "msj_partial": "civil",
+    "mtd": "civil",
+    "demurrer": "civil",
+    "motion_to_compel": "civil",
+    "anti_slapp": "civil",
+    "motion_to_strike": "civil",
+    "preliminary_injunction": "civil",
+    "motion_for_protective_order": "civil",
+    "motion_for_attorney_fees": "civil",
+    "motion_to_set_aside_default": "civil",
+    "motion_to_vacate": "civil",
+    "default_judgment": "civil",
+    "motion_to_be_relieved_as_counsel": "civil",
+    "motion_for_leave_to_amend": "civil",
+    "motion_for_sanctions": "civil",
+    "motion_for_relief": "civil",
+    "motion_pro_hac_vice": "civil",
+    "motion_to_substitute": "civil",
+    "motion_to_tax_costs": "civil",
+    "motion_for_new_trial": "civil",
+    "motion_for_reconsideration": "civil",
+    "motion_to_quash": "civil",
+    "class_action_settlement": "civil",
+    "writ_of_possession": "civil",
+    "mil": "civil",
+    # Probate-specific motion types
+    "petition": "probate",
+    # Ex parte and OSC can appear in multiple case types — excluded.
+    # "petition_writ_of_mandate" and "petition_habeas_corpus" are civil/criminal
+    # and ambiguous enough to exclude.
+}
+
+
+def extract_case_type_from_motion_type(motion_type: str) -> str | None:
+    """Infer case type from a normalized motion type string.
+
+    This is a final fallback when case number prefix, LLM extraction, and
+    scraper_id all fail to determine the case type.  Only unambiguous motion
+    types are mapped; motion types that can appear across multiple case types
+    (e.g. ``ex_parte_application``, ``osc``) return ``None``.
+
+    Parameters
+    ----------
+    motion_type : str
+        The normalized motion type value (e.g. ``"motion_to_compel"``).
+
+    Returns
+    -------
+    str | None
+        One of the case type strings, or ``None`` if the motion type is
+        ambiguous or not recognized.
+    """
+    if not motion_type:
+        return None
+    return _MOTION_TYPE_CASE_TYPE_MAP.get(motion_type.strip())
+
+
 def extract_case_type_from_number(case_number: str) -> str | None:
     """Infer case type from a California case number prefix.
 
