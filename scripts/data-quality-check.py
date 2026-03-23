@@ -937,50 +937,6 @@ class CheckResult:
     county_metrics: dict[str, dict[str, Any]]
 
 
-def _collect_county_metrics(
-    conn: psycopg.Connection,  # type: ignore[type-arg]
-    now: datetime,
-    county: str | None = None,
-) -> dict[str, dict[str, Any]]:
-    """Collect per-county metrics for snapshot storage.
-
-    Gathers ruling counts and field completeness into a dict suitable
-    for storing as a snapshot.
-
-    Args:
-        conn: Database connection.
-        now: Current timestamp for time calculations.
-        county: Optional county filter.
-
-    Returns:
-        Dict mapping county name to metrics dict.
-    """
-    county_filter, county_params = _build_county_filter(county)
-    result: dict[str, dict[str, Any]] = {}
-
-    # Get 24h ruling counts
-    cutoff_24h = now - timedelta(hours=24)
-    with conn.cursor() as cur:
-        cur.execute(
-            RULING_COUNTS_24H_QUERY.format(county_filter=county_filter),
-            (cutoff_24h, *county_params),
-        )
-        for row in cur.fetchall():
-            county_name, count = row[0], row[1]
-            if county_name not in result:
-                result[county_name] = {}
-            result[county_name]["ruling_count_24h"] = count
-
-    # Get field completeness
-    field_completeness, _totals = _query_field_completeness(conn, now, county)
-    for county_name, fields in field_completeness.items():
-        if county_name not in result:
-            result[county_name] = {}
-        result[county_name]["field_completeness"] = fields
-
-    return result
-
-
 def _collect_full_metrics(
     conn: psycopg.Connection,  # type: ignore[type-arg]
     now: datetime,
@@ -988,7 +944,7 @@ def _collect_full_metrics(
 ) -> dict[str, dict[str, Any]]:
     """Collect all per-county metrics for persistence to data_quality_metrics.
 
-    Extends ``_collect_county_metrics`` with 7-day averages, scraper health,
+    Collects ruling counts, 7-day averages, field completeness, scraper health,
     and metadata suitable for the data_quality_metrics table.
 
     Args:
@@ -1167,10 +1123,10 @@ def _format_metrics_for_snapshot(
 ) -> dict[str, dict[str, Any]]:
     """Convert ``_collect_full_metrics`` output to the legacy snapshot format.
 
-    The S3 trend-storage layer expects the simpler structure produced by
-    the old ``_collect_county_metrics``: ``{county: {ruling_count_24h: int,
-    field_completeness: {field: pct, ...}}}``.  This helper adapts the
-    richer ``_collect_full_metrics`` output to that format.
+    The S3 trend-storage layer expects a simpler structure:
+    ``{county: {ruling_count_24h: int, field_completeness: {field: pct,
+    ...}}}``.  This helper adapts the richer ``_collect_full_metrics``
+    output to that format.
 
     Args:
         full_metrics: Output of ``_collect_full_metrics``.
@@ -1360,9 +1316,8 @@ def run_checks_full(
 
         alerts.extend(check_orphaned_documents(conn, now, county))
 
-        # Single metric collection pass — _collect_full_metrics is a
-        # superset of _collect_county_metrics.  We derive the legacy
-        # snapshot format from the full metrics to avoid duplicate queries.
+        # Single metric collection pass — we derive the legacy snapshot
+        # format from the full metrics to avoid duplicate queries.
         full_metrics = _collect_full_metrics(conn, now, county)
         county_metrics = _format_metrics_for_snapshot(full_metrics)
 
