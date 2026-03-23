@@ -11,7 +11,9 @@ Design principles:
 - **Configurable**: provider, model, and API key are configurable;
   defaults to Anthropic Claude Haiku 4.5 for cost efficiency.
 - **Multimodal**: supports both text extraction (``extract()``) and
-  PDF image extraction (``extract_from_pdf()``).
+  PDF image extraction (``extract_from_pdf()``).  PDF extraction uses
+  **per-page** LLM calls (one page per call, then joins results) to
+  stay within output token limits and improve accuracy.
 - **Resilient**: retries on transient API errors (429, 500, 529) with
   exponential backoff.
 - **Observable**: logs token usage per call for cost monitoring.
@@ -93,6 +95,42 @@ _CASE_BOUNDARY_RE = re.compile(
 
 # OC-style county prefix: "30-2024-01393434" -> "2024-01393434"
 _COUNTY_PREFIX_RE = re.compile(r"^\d{2,4}-(\d{4}-\d+)$")
+
+# ---------------------------------------------------------------------------
+# Per-page PDF extraction prompt and join patterns (#1590)
+# ---------------------------------------------------------------------------
+
+# System prompt for per-page extraction from OC-style 3-column PDF tables.
+# Each page is sent individually.  The LLM returns a JSON array of table rows.
+PDF_PER_PAGE_PROMPT = (
+    "You are parsing a single page from a California court tentative ruling PDF.\n\n"
+    "The page contains a table with ruled lines separating columns:\n"
+    "  Column 1 (narrow, left): Entry number (integer)\n"
+    "  Column 2 (middle): Case information (case number, parties, motion type)\n"
+    "  Column 3 (wide, right): Ruling text\n\n"
+    "Extract EVERY row visible on this page as a JSON array of objects.\n"
+    "Each object has exactly three fields:\n"
+    '  - "entry_number": integer or null (the number in column 1)\n'
+    '  - "case_info": string (all text from column 2 for this row)\n'
+    '  - "ruling_text": string (all text from column 3 for this row)\n\n'
+    "Rules:\n"
+    "- If a row spans multiple visual lines, combine all lines into one entry.\n"
+    "- If text continues from a previous page (no entry number, partial text), "
+    "include it as a row with entry_number: null.\n"
+    "- Transcribe text VERBATIM — do not summarize or rephrase.\n"
+    "- If the page contains only headers or no table rows, return [].\n"
+    "- If the page has a department/judge header above the table, "
+    "include it as a separate entry with entry_number: null and "
+    "empty ruling_text.\n\n"
+    "Respond with ONLY a JSON array, no other text:\n"
+    '[{"entry_number": 1, "case_info": "...", "ruling_text": "..."}, ...]'
+)
+
+# Pattern to detect case numbers in OC format.
+_CASE_NUMBER_RE = re.compile(r"\d{2,4}-\d{5,8}|\d{7,8}")
+
+# Pattern to detect case titles (vs / v.).
+_VS_RE = re.compile(r"\bv(?:s)?\.?\s", re.IGNORECASE)
 
 
 # ---------------------------------------------------------------------------
@@ -234,13 +272,15 @@ class LlmExtractor:
     ) -> list[ExtractedRuling]:
         """Extract structured rulings from PDF page images (multimodal).
 
-        Renders each PDF page to a PNG image using pdfplumber, sends all
-        page images to the configured LLM provider in a single API call,
-        and parses the JSON response into ``ExtractedRuling`` models.
+        Renders each PDF page to a PNG image, sends **one page per LLM
+        call** with a per-page prompt, collects all table rows, and joins
+        cross-page results into ``ExtractedRuling`` models using
+        entry-number + case-info heuristics.
 
-        This is the multimodal counterpart of ``extract()`` — use it when
-        the source document is a raw PDF (e.g., OC tentative ruling volumes)
-        rather than pre-extracted text.
+        This per-page approach (a) stays within the Flash Lite 8192 output
+        token limit, (b) produces more reliable row extraction than
+        multi-page calls, and (c) enables accurate cross-page continuation
+        detection via the entry_number field.
 
         Args:
             pdf_bytes: Raw PDF file content.
@@ -264,9 +304,23 @@ class LlmExtractor:
             return []
 
         usage = TokenUsage()
-        result = self._extract_images(page_images, metadata=metadata, usage=usage)
+
+        # Per-page extraction: one LLM call per page.
+        all_rows: list[dict] = []
+        for page_idx, (img_bytes, media_type) in enumerate(page_images):
+            page_rows = self._extract_single_page(
+                img_bytes, media_type, metadata=metadata, usage=usage, page_index=page_idx
+            )
+            all_rows.extend(page_rows)
+
         self._log_usage(usage)
-        return result.rulings if result else []
+
+        if not all_rows:
+            logger.warning("llm_extractor.no_rows_extracted", page_count=len(page_images))
+            return []
+
+        # Join rows into cases and convert to ExtractedRuling objects.
+        return _join_page_rows(all_rows, metadata=metadata)
 
     # ------------------------------------------------------------------
     # Internal: API call with retries
@@ -387,80 +441,89 @@ class LlmExtractor:
 
         return None  # pragma: no cover — defensive
 
-    def _extract_images(
+    def _extract_single_page(
         self,
-        images: list[tuple[bytes, str]],
+        img_bytes: bytes,
+        media_type: str,
         *,
         metadata: dict[str, str] | None = None,
         usage: TokenUsage,
-    ) -> ExtractionResult | None:
-        """Send page images to the LLM and parse the extraction result.
+        page_index: int = 0,
+    ) -> list[dict]:
+        """Send a single page image to the LLM and return extracted table rows.
 
-        All images are sent in a single API call (no chunking needed for
-        typical OC tentative ruling volumes).
+        Uses the ``PDF_PER_PAGE_PROMPT`` to extract rows from OC-style
+        three-column table PDFs.  Each row is a dict with keys
+        ``entry_number``, ``case_info``, and ``ruling_text``.
 
-        Uses the ``call_llm_with_images`` adapter from ``ingestion.llm_providers``
-        to support both Anthropic and Google providers.
+        Returns an empty list if the API call fails or the page has no rows.
         """
         from ingestion.llm_providers import call_llm_with_images
 
-        text_message = self._build_user_message_for_images(metadata)
+        text_message = self._build_user_message_for_page(metadata)
         delay = self._base_delay
 
         for attempt in range(1, self._max_retries + 1):
             try:
                 response = call_llm_with_images(
-                    system_prompt=EXTRACTION_SYSTEM_PROMPT,
+                    system_prompt=PDF_PER_PAGE_PROMPT,
                     text_message=text_message,
-                    images=images,
+                    images=[(img_bytes, media_type)],
                     provider=self._provider,
                     model=self._model,
                     client=self._client,
                     max_retries=0,  # We handle retries ourselves.
                     max_tokens=self._max_output_tokens,
+                    timeout=20.0,
                 )
 
                 if response is None:
                     if attempt < self._max_retries:
                         wait = min(delay, self._max_delay)
                         logger.warning(
-                            "llm_extractor.image_api_failure",
+                            "llm_extractor.page_api_failure",
                             attempt=attempt,
                             max_retries=self._max_retries,
                             retry_in=wait,
+                            page_index=page_index,
                         )
                         time.sleep(wait)
                         delay *= 2
                         continue
-                    logger.error("llm_extractor.image_api_exhausted")
-                    return None
+                    logger.error(
+                        "llm_extractor.page_api_exhausted",
+                        page_index=page_index,
+                    )
+                    return []
 
                 usage.input_tokens += response.input_tokens
                 usage.output_tokens += response.output_tokens
                 usage.api_calls += 1
 
-                return self._parse_response(response.text, metadata)
+                return _parse_page_rows(response.text, page_index)
 
             except Exception:  # noqa: BLE001
                 if attempt < self._max_retries:
                     wait = min(delay, self._max_delay)
                     logger.warning(
-                        "llm_extractor.image_extract_error",
+                        "llm_extractor.page_extract_error",
                         attempt=attempt,
                         max_retries=self._max_retries,
                         retry_in=wait,
+                        page_index=page_index,
                         exc_info=True,
                     )
                     time.sleep(wait)
                     delay *= 2
                     continue
                 logger.error(
-                    "llm_extractor.image_extract_exhausted",
+                    "llm_extractor.page_extract_exhausted",
+                    page_index=page_index,
                     exc_info=True,
                 )
-                return None
+                return []
 
-        return None  # pragma: no cover — defensive
+        return []  # pragma: no cover — defensive
 
     # ------------------------------------------------------------------
     # Internal: message building
@@ -488,26 +551,24 @@ class LlmExtractor:
         return "\n\n".join(parts)
 
     @staticmethod
-    def _build_user_message_for_images(
+    def _build_user_message_for_page(
         metadata: dict[str, str] | None,
     ) -> str:
-        """Build the text portion of the user message for multimodal extraction."""
+        """Build the text portion of the user message for per-page extraction."""
         parts: list[str] = []
         if metadata:
             meta_lines: list[str] = []
             if metadata.get("judge_name"):
-                meta_lines.append(f"Judge name (authoritative): {metadata['judge_name']}")
+                meta_lines.append(f"Judge name: {metadata['judge_name']}")
             if metadata.get("department"):
-                meta_lines.append(f"Department (authoritative): {metadata['department']}")
+                meta_lines.append(f"Department: {metadata['department']}")
             if metadata.get("hearing_date"):
-                meta_lines.append(f"Hearing date (authoritative): {metadata['hearing_date']}")
+                meta_lines.append(f"Hearing date: {metadata['hearing_date']}")
             if meta_lines:
-                parts.append("Metadata from scraper:\n" + "\n".join(meta_lines))
+                parts.append("Context:\n" + "\n".join(meta_lines))
 
         parts.append(
-            "Extract ALL structured fields from the attached court ruling "
-            "document page images.  The images are pages from a single PDF "
-            "document.  Read every page and extract every case found."
+            "Extract all table rows from this page image. Return a JSON array of row objects."
         )
         return "\n\n".join(parts)
 
@@ -794,6 +855,205 @@ def _force_split(text: str, max_chars: int) -> list[str]:
         chunks.append(text[pos:end])
         pos = end - _CHUNK_OVERLAP if end < len(text) else end
     return chunks
+
+
+# ---------------------------------------------------------------------------
+# Per-page row parsing and join logic (#1590)
+# ---------------------------------------------------------------------------
+
+
+def _parse_page_rows(raw_text: str, page_index: int) -> list[dict]:
+    """Parse LLM response for a single page into a list of row dicts.
+
+    Each row has ``entry_number`` (int or None), ``case_info`` (str),
+    and ``ruling_text`` (str).  Invalid entries are filtered out.
+    """
+    cleaned = raw_text.strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```\w*\n?", "", cleaned)
+        cleaned = re.sub(r"\n?```$", "", cleaned)
+
+    try:
+        parsed = json.loads(cleaned)
+    except json.JSONDecodeError:
+        # Try to find a JSON array in the response.
+        start_idx = cleaned.find("[")
+        end_idx = cleaned.rfind("]") + 1
+        if start_idx >= 0 and end_idx > start_idx:
+            try:
+                parsed = json.loads(cleaned[start_idx:end_idx])
+            except json.JSONDecodeError:
+                logger.warning(
+                    "llm_extractor.page_parse_error",
+                    page_index=page_index,
+                    raw_preview=raw_text[:200],
+                )
+                return []
+        else:
+            logger.warning(
+                "llm_extractor.page_parse_error",
+                page_index=page_index,
+                raw_preview=raw_text[:200],
+            )
+            return []
+
+    # Handle both list and dict responses.
+    if isinstance(parsed, dict):
+        # Some models wrap the array in a dict.
+        rows_raw = parsed.get("rows", parsed.get("entries", [parsed]))
+    elif isinstance(parsed, list):
+        rows_raw = parsed
+    else:
+        return []
+
+    rows: list[dict] = []
+    for item in rows_raw:
+        if not isinstance(item, dict):
+            continue
+        entry_number = item.get("entry_number")
+        if entry_number is not None:
+            # Normalize: strip trailing period, convert to int.
+            try:
+                entry_number = int(str(entry_number).rstrip(".").strip())
+            except (ValueError, TypeError):
+                entry_number = None
+        rows.append(
+            {
+                "entry_number": entry_number,
+                "case_info": str(item.get("case_info", "")).strip(),
+                "ruling_text": str(item.get("ruling_text", "")).strip(),
+            }
+        )
+
+    return rows
+
+
+def _is_new_case(row: dict) -> bool:
+    """Determine if a row starts a new case based on entry_number and case_info.
+
+    A new case is detected when:
+    1. ``entry_number`` is a valid integer, AND
+    2. ``case_info`` contains a case number pattern or "vs"/"v."
+    """
+    if row["entry_number"] is None:
+        return False
+
+    case_info = row["case_info"]
+    if not case_info:
+        return False
+
+    # Check for case number pattern.
+    if _CASE_NUMBER_RE.search(case_info):
+        return True
+
+    # Check for "vs" / "v." pattern.
+    if _VS_RE.search(case_info):
+        return True
+
+    return False
+
+
+def _extract_case_number_from_info(case_info: str) -> str | None:
+    """Extract a case number from the case_info string."""
+    m = _CASE_NUMBER_RE.search(case_info)
+    if m:
+        raw = m.group(0)
+        return _normalize_case_number(raw)
+    return None
+
+
+def _extract_case_title_from_info(case_info: str) -> str | None:
+    """Extract a case title from the case_info string.
+
+    Looks for patterns like "Smith v. Jones" or "Smith vs Jones" after
+    the case number.
+    """
+    # Remove the case number portion to isolate the title.
+    cleaned = _CASE_NUMBER_RE.sub("", case_info).strip()
+    # Remove leading/trailing punctuation and whitespace.
+    cleaned = cleaned.strip(" -;,\n\t")
+    if cleaned:
+        return cleaned
+    return None
+
+
+def _join_page_rows(
+    rows: list[dict],
+    *,
+    metadata: dict[str, str] | None = None,
+) -> list[ExtractedRuling]:
+    """Join per-page rows into ``ExtractedRuling`` objects.
+
+    Uses the entry_number + case_info heuristic to detect case boundaries.
+    Rows without a valid entry_number or without a case identifier in
+    case_info are treated as continuations of the previous case.
+    """
+    if not rows:
+        return []
+
+    # Group rows into cases.
+    cases: list[dict] = []  # Each: {case_info, ruling_text}
+
+    for row in rows:
+        # Skip header rows (e.g., department/judge headers) that the LLM
+        # may include with entry_number=null and empty ruling_text.  These
+        # would otherwise be merged into adjacent cases, corrupting data.
+        if row["entry_number"] is None and not row["ruling_text"]:
+            continue
+
+        if _is_new_case(row):
+            cases.append(
+                {
+                    "case_info": row["case_info"],
+                    "ruling_text": row["ruling_text"],
+                }
+            )
+        elif cases:
+            # Continuation: merge into previous case.
+            if row["case_info"]:
+                cases[-1]["case_info"] += "\n" + row["case_info"]
+            if row["ruling_text"]:
+                cases[-1]["ruling_text"] += "\n" + row["ruling_text"]
+        else:
+            # No previous case to merge into — start a new case if there's
+            # meaningful content.  This handles continuations from a previous
+            # page's last case or header rows.
+            if row["case_info"] or row["ruling_text"]:
+                cases.append(
+                    {
+                        "case_info": row["case_info"],
+                        "ruling_text": row["ruling_text"],
+                    }
+                )
+
+    # Convert to ExtractedRuling objects.
+    rulings: list[ExtractedRuling] = []
+    for case in cases:
+        case_number = _extract_case_number_from_info(case["case_info"])
+        case_title = _extract_case_title_from_info(case["case_info"])
+        ruling_text = case["ruling_text"].strip() or None
+
+        # Apply metadata overrides for judge_name, department, hearing_date.
+        judge_name: str | None = None
+        department: str | None = None
+        hearing_date: str | None = None
+        if metadata:
+            judge_name = metadata.get("judge_name")
+            department = metadata.get("department")
+            hearing_date = metadata.get("hearing_date")
+
+        rulings.append(
+            ExtractedRuling(
+                extracted_case_number=case_number,
+                extracted_case_title=case_title,
+                extracted_judge_name=judge_name,
+                department=department,
+                hearing_date=hearing_date,
+                ruling_text=ruling_text,
+            )
+        )
+
+    return rulings
 
 
 # ---------------------------------------------------------------------------

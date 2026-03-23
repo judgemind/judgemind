@@ -1,12 +1,14 @@
-"""Tests for multimodal extraction in LlmExtractor (#1589).
+"""Tests for multimodal extraction in LlmExtractor (#1589, #1590).
 
 Validates:
 1. LlmExtractor accepts provider parameter ("anthropic" or "google").
-2. extract_from_pdf() renders pages and sends images to the configured provider.
-3. Existing extract(text) path remains unchanged.
-4. Error handling (empty PDF, render failures, API failures).
-5. _render_pdf_pages helper.
-6. _create_google_client helper.
+2. extract_from_pdf() renders pages and sends ONE image per LLM call.
+3. Per-page row parsing (_parse_page_rows).
+4. Join logic (_is_new_case, _join_page_rows) for cross-page continuations.
+5. Existing extract(text) path remains unchanged.
+6. Error handling (empty PDF, render failures, API failures).
+7. _render_pdf_pages helper.
+8. _create_google_client helper.
 """
 
 from __future__ import annotations
@@ -21,10 +23,12 @@ import pytest
 from framework.llm_extractor import (
     LlmExtractor,
     _create_google_client,
+    _extract_case_number_from_info,
+    _extract_case_title_from_info,
+    _is_new_case,
+    _join_page_rows,
+    _parse_page_rows,
     _render_pdf_pages,
-)
-from framework.llm_schema import (
-    ExtractionOutcome,
 )
 
 # ---------------------------------------------------------------------------
@@ -34,6 +38,49 @@ from framework.llm_schema import (
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 SAMPLE_PDF_PATH = FIXTURES_DIR / "sample_ruling.pdf"
 
+# Per-page row JSON responses (new per-page format).
+SINGLE_PAGE_ROWS_JSON = json.dumps(
+    [
+        {
+            "entry_number": 1,
+            "case_info": "2024-01393434 Martinez v. ABC Manufacturing Inc.",
+            "ruling_text": "The motion for summary adjudication is DENIED.",
+        }
+    ]
+)
+
+MULTI_CASE_PAGE_ROWS_JSON = json.dumps(
+    [
+        {
+            "entry_number": 1,
+            "case_info": "2024-01393434 Martinez v. ABC Manufacturing Inc.",
+            "ruling_text": "The motion for summary adjudication is DENIED.",
+        },
+        {
+            "entry_number": 2,
+            "case_info": "2024-00567890 Garcia v. State Farm Insurance",
+            "ruling_text": "The motion is GRANTED.",
+        },
+    ]
+)
+
+# Continuation rows (no entry number, partial text from a case that spans pages).
+CONTINUATION_PAGE_ROWS_JSON = json.dumps(
+    [
+        {
+            "entry_number": None,
+            "case_info": "",
+            "ruling_text": "...the court finds that the motion lacks merit.",
+        },
+        {
+            "entry_number": 3,
+            "case_info": "2024-00999999 Thompson v. City of Palm Springs",
+            "ruling_text": "The demurrer is OVERRULED.",
+        },
+    ]
+)
+
+# Legacy full-document JSON (used for backward compat tests).
 SINGLE_RULING_JSON = json.dumps(
     {
         "extracted_judge_name": "Gassia Apkarian",
@@ -65,34 +112,6 @@ SINGLE_RULING_JSON = json.dumps(
                     "outcome": "high",
                 },
             }
-        ],
-    }
-)
-
-MULTI_RULING_JSON = json.dumps(
-    {
-        "extracted_judge_name": "Arthur Hester III",
-        "hearing_date": "2026-03-02",
-        "department": "PS1",
-        "rulings": [
-            {
-                "extracted_case_number": "CVPS2306157",
-                "extracted_case_title": "Garcia v. State Farm Insurance",
-                "case_type": "civil",
-                "outcome": "granted",
-                "motion_type": "motion_to_compel",
-                "ruling_text": "The motion is GRANTED.",
-                "hearing_date": "2026-03-02",
-            },
-            {
-                "extracted_case_number": "CVPS2400892",
-                "extracted_case_title": "Thompson v. City of Palm Springs",
-                "case_type": "civil",
-                "outcome": "denied",
-                "motion_type": "demurrer",
-                "ruling_text": "The demurrer is OVERRULED.",
-                "hearing_date": "2026-03-02",
-            },
         ],
     }
 )
@@ -175,12 +194,365 @@ class TestProviderParameter:
 
 
 # ---------------------------------------------------------------------------
-# extract_from_pdf tests
+# _parse_page_rows tests
+# ---------------------------------------------------------------------------
+
+
+class TestParsePageRows:
+    """Tests for the _parse_page_rows helper."""
+
+    def test_parses_valid_json_array(self) -> None:
+        """Parses a valid JSON array of row objects."""
+        rows = _parse_page_rows(SINGLE_PAGE_ROWS_JSON, page_index=0)
+        assert len(rows) == 1
+        assert rows[0]["entry_number"] == 1
+        assert "Martinez" in rows[0]["case_info"]
+        assert "DENIED" in rows[0]["ruling_text"]
+
+    def test_parses_multi_row_array(self) -> None:
+        """Parses multiple rows from a single page."""
+        rows = _parse_page_rows(MULTI_CASE_PAGE_ROWS_JSON, page_index=0)
+        assert len(rows) == 2
+        assert rows[0]["entry_number"] == 1
+        assert rows[1]["entry_number"] == 2
+
+    def test_handles_null_entry_number(self) -> None:
+        """Null entry_number is preserved."""
+        rows = _parse_page_rows(CONTINUATION_PAGE_ROWS_JSON, page_index=0)
+        assert rows[0]["entry_number"] is None
+        assert rows[1]["entry_number"] == 3
+
+    def test_strips_trailing_period_from_entry_number(self) -> None:
+        """Entry numbers with trailing periods are normalized."""
+        raw = json.dumps([{"entry_number": "5.", "case_info": "test", "ruling_text": "text"}])
+        rows = _parse_page_rows(raw, page_index=0)
+        assert rows[0]["entry_number"] == 5
+
+    def test_handles_string_entry_number(self) -> None:
+        """String entry numbers are converted to int."""
+        raw = json.dumps([{"entry_number": "12", "case_info": "test", "ruling_text": "text"}])
+        rows = _parse_page_rows(raw, page_index=0)
+        assert rows[0]["entry_number"] == 12
+
+    def test_handles_invalid_entry_number(self) -> None:
+        """Non-numeric entry numbers become None."""
+        raw = json.dumps([{"entry_number": "abc", "case_info": "test", "ruling_text": "text"}])
+        rows = _parse_page_rows(raw, page_index=0)
+        assert rows[0]["entry_number"] is None
+
+    def test_handles_empty_array(self) -> None:
+        """Empty array returns empty list."""
+        rows = _parse_page_rows("[]", page_index=0)
+        assert rows == []
+
+    def test_handles_markdown_code_fences(self) -> None:
+        """Strips markdown code fences from response."""
+        raw = "```json\n" + SINGLE_PAGE_ROWS_JSON + "\n```"
+        rows = _parse_page_rows(raw, page_index=0)
+        assert len(rows) == 1
+
+    def test_handles_dict_with_rows_key(self) -> None:
+        """Handles dict response with 'rows' key."""
+        raw = json.dumps({"rows": [{"entry_number": 1, "case_info": "test", "ruling_text": "t"}]})
+        rows = _parse_page_rows(raw, page_index=0)
+        assert len(rows) == 1
+
+    def test_handles_invalid_json(self) -> None:
+        """Invalid JSON returns empty list."""
+        rows = _parse_page_rows("not json at all", page_index=0)
+        assert rows == []
+
+    def test_filters_non_dict_entries(self) -> None:
+        """Non-dict entries in the array are filtered out."""
+        raw = json.dumps(
+            [
+                {"entry_number": 1, "case_info": "test", "ruling_text": "t"},
+                "not a dict",
+                42,
+                None,
+            ]
+        )
+        rows = _parse_page_rows(raw, page_index=0)
+        assert len(rows) == 1
+
+    def test_missing_case_info_defaults_empty(self) -> None:
+        """Missing case_info defaults to empty string."""
+        raw = json.dumps([{"entry_number": 1, "ruling_text": "text"}])
+        rows = _parse_page_rows(raw, page_index=0)
+        assert rows[0]["case_info"] == ""
+
+    def test_invalid_json_with_brackets_but_bad_content(self) -> None:
+        """JSON with brackets but invalid content inside returns empty list."""
+        raw = "Some preamble [invalid json content] trailing text"
+        rows = _parse_page_rows(raw, page_index=0)
+        assert rows == []
+
+    def test_parsed_number_returns_empty(self) -> None:
+        """If parsed JSON is a bare number, returns empty list."""
+        rows = _parse_page_rows("42", page_index=0)
+        assert rows == []
+
+    def test_parsed_string_returns_empty(self) -> None:
+        """If parsed JSON is a bare string, returns empty list."""
+        rows = _parse_page_rows('"just a string"', page_index=0)
+        assert rows == []
+
+
+# ---------------------------------------------------------------------------
+# _is_new_case tests
+# ---------------------------------------------------------------------------
+
+
+class TestIsNewCase:
+    """Tests for the _is_new_case helper."""
+
+    def test_valid_entry_with_case_number(self) -> None:
+        """Entry with valid number and case number pattern is new case."""
+        row = {"entry_number": 1, "case_info": "2024-01393434 Smith v. Jones", "ruling_text": "t"}
+        assert _is_new_case(row) is True
+
+    def test_valid_entry_with_vs_pattern(self) -> None:
+        """Entry with valid number and vs pattern is new case."""
+        row = {"entry_number": 1, "case_info": "Smith v. Jones", "ruling_text": "t"}
+        assert _is_new_case(row) is True
+
+    def test_valid_entry_with_vs_dot_pattern(self) -> None:
+        """Entry with 'vs.' pattern is new case."""
+        row = {"entry_number": 2, "case_info": "Smith vs. Jones", "ruling_text": "t"}
+        assert _is_new_case(row) is True
+
+    def test_null_entry_number_is_continuation(self) -> None:
+        """Null entry_number means continuation."""
+        row = {"entry_number": None, "case_info": "2024-01393434", "ruling_text": "t"}
+        assert _is_new_case(row) is False
+
+    def test_entry_without_case_info_is_continuation(self) -> None:
+        """Entry with number but no case info is continuation."""
+        row = {"entry_number": 1, "case_info": "", "ruling_text": "t"}
+        assert _is_new_case(row) is False
+
+    def test_entry_with_only_text_is_continuation(self) -> None:
+        """Entry with number but only text (no case number, no vs) is continuation."""
+        row = {"entry_number": 1, "case_info": "some random text", "ruling_text": "t"}
+        assert _is_new_case(row) is False
+
+    def test_seven_digit_case_number(self) -> None:
+        """Seven-digit case number pattern is recognized."""
+        row = {"entry_number": 1, "case_info": "0012345 Smith v. Jones", "ruling_text": "t"}
+        assert _is_new_case(row) is True
+
+    def test_eight_digit_case_number(self) -> None:
+        """Eight-digit case number pattern is recognized."""
+        row = {"entry_number": 1, "case_info": "30012345 Smith v. Jones", "ruling_text": "t"}
+        assert _is_new_case(row) is True
+
+
+# ---------------------------------------------------------------------------
+# _extract_case_number_from_info tests
+# ---------------------------------------------------------------------------
+
+
+class TestExtractCaseNumberFromInfo:
+    """Tests for case number extraction from case_info."""
+
+    def test_extracts_oc_format(self) -> None:
+        """Extracts OC-style case number."""
+        result = _extract_case_number_from_info("2024-01393434 Smith v. Jones")
+        assert result == "2024-01393434"
+
+    def test_extracts_seven_digit(self) -> None:
+        """Extracts seven-digit case number."""
+        result = _extract_case_number_from_info("0012345 Smith v. Jones")
+        assert result == "0012345"
+
+    def test_no_case_number(self) -> None:
+        """Returns None when no case number is found."""
+        result = _extract_case_number_from_info("Smith v. Jones only")
+        assert result is None
+
+    def test_strips_county_prefix(self) -> None:
+        """County prefix is stripped from case number."""
+        result = _extract_case_number_from_info("30-2024-01393434 Smith v. Jones")
+        assert result == "2024-01393434"
+
+
+# ---------------------------------------------------------------------------
+# _extract_case_title_from_info tests
+# ---------------------------------------------------------------------------
+
+
+class TestExtractCaseTitleFromInfo:
+    """Tests for case title extraction from case_info."""
+
+    def test_extracts_title_after_number(self) -> None:
+        """Extracts title after case number."""
+        result = _extract_case_title_from_info("2024-01393434 Smith v. Jones")
+        assert result == "Smith v. Jones"
+
+    def test_full_case_info(self) -> None:
+        """Extracts title from full case_info string."""
+        result = _extract_case_title_from_info("Smith v. Jones")
+        assert result == "Smith v. Jones"
+
+    def test_empty_after_number(self) -> None:
+        """Returns None when only number is present."""
+        result = _extract_case_title_from_info("2024-01393434")
+        assert result is None
+
+
+# ---------------------------------------------------------------------------
+# _join_page_rows tests
+# ---------------------------------------------------------------------------
+
+
+class TestJoinPageRows:
+    """Tests for the _join_page_rows function."""
+
+    def test_single_case(self) -> None:
+        """Single case produces one ExtractedRuling."""
+        rows = [
+            {
+                "entry_number": 1,
+                "case_info": "2024-01393434 Smith v. Jones",
+                "ruling_text": "GRANTED.",
+            },
+        ]
+        rulings = _join_page_rows(rows)
+        assert len(rulings) == 1
+        assert rulings[0].extracted_case_number == "2024-01393434"
+        assert rulings[0].extracted_case_title == "Smith v. Jones"
+        assert rulings[0].ruling_text == "GRANTED."
+
+    def test_multiple_cases(self) -> None:
+        """Multiple cases produce multiple ExtractedRulings."""
+        rows = [
+            {"entry_number": 1, "case_info": "2024-00001 Alpha v. Beta", "ruling_text": "GRANTED."},
+            {"entry_number": 2, "case_info": "2024-00002 Gamma v. Delta", "ruling_text": "DENIED."},
+        ]
+        rulings = _join_page_rows(rows)
+        assert len(rulings) == 2
+        assert rulings[0].extracted_case_number == "2024-00001"
+        assert rulings[1].extracted_case_number == "2024-00002"
+
+    def test_continuation_merges_into_previous(self) -> None:
+        """Continuation rows merge into the previous case."""
+        rows = [
+            {
+                "entry_number": 1,
+                "case_info": "2024-00001 Alpha v. Beta",
+                "ruling_text": "The motion is",
+            },
+            {
+                "entry_number": None,
+                "case_info": "",
+                "ruling_text": "GRANTED with conditions.",
+            },
+        ]
+        rulings = _join_page_rows(rows)
+        assert len(rulings) == 1
+        assert "The motion is\nGRANTED with conditions." == rulings[0].ruling_text
+
+    def test_cross_page_continuation(self) -> None:
+        """Case spanning pages: continuation from previous page then new case."""
+        rows = [
+            # Continuation from previous page (no entry number).
+            {
+                "entry_number": None,
+                "case_info": "",
+                "ruling_text": "...remaining text from previous case.",
+            },
+            # New case starts.
+            {
+                "entry_number": 3,
+                "case_info": "2024-00999999 Thompson v. City",
+                "ruling_text": "OVERRULED.",
+            },
+        ]
+        rulings = _join_page_rows(rows)
+        assert len(rulings) == 2
+        assert rulings[0].ruling_text == "...remaining text from previous case."
+        assert rulings[1].extracted_case_number == "2024-00999999"
+
+    def test_metadata_applied(self) -> None:
+        """Metadata (judge_name, department, hearing_date) is applied to all rulings."""
+        rows = [
+            {"entry_number": 1, "case_info": "2024-00001 Alpha v. Beta", "ruling_text": "GRANTED."},
+        ]
+        metadata = {"judge_name": "Test Judge", "department": "C25", "hearing_date": "2026-03-01"}
+        rulings = _join_page_rows(rows, metadata=metadata)
+        assert rulings[0].extracted_judge_name == "Test Judge"
+        assert rulings[0].department == "C25"
+        assert rulings[0].hearing_date == "2026-03-01"
+
+    def test_empty_rows_returns_empty(self) -> None:
+        """Empty row list returns empty ruling list."""
+        assert _join_page_rows([]) == []
+
+    def test_case_info_merging_for_continuation(self) -> None:
+        """Continuation case_info is appended to previous case."""
+        rows = [
+            {"entry_number": 1, "case_info": "2024-00001 Alpha v. Beta", "ruling_text": "Part 1"},
+            {"entry_number": None, "case_info": "Additional info", "ruling_text": "Part 2"},
+        ]
+        rulings = _join_page_rows(rows)
+        assert len(rulings) == 1
+        assert "Additional info" in rulings[0].extracted_case_title
+
+    def test_header_rows_skipped(self) -> None:
+        """Header rows (null entry_number, empty ruling_text) are filtered out."""
+        rows = [
+            # Header row — should be skipped.
+            {
+                "entry_number": None,
+                "case_info": "Department C25 - Hon. Jane Doe",
+                "ruling_text": "",
+            },
+            # Real case.
+            {
+                "entry_number": 1,
+                "case_info": "2024-00001 Alpha v. Beta",
+                "ruling_text": "GRANTED.",
+            },
+        ]
+        rulings = _join_page_rows(rows)
+        assert len(rulings) == 1
+        assert rulings[0].extracted_case_number == "2024-00001"
+        # Header text should NOT appear in the case title.
+        assert "Department C25" not in (rulings[0].extracted_case_title or "")
+
+    def test_header_between_cases_skipped(self) -> None:
+        """Header row between real cases does not corrupt either case."""
+        rows = [
+            {
+                "entry_number": 1,
+                "case_info": "2024-00001 Alpha v. Beta",
+                "ruling_text": "GRANTED.",
+            },
+            # Mid-page header.
+            {
+                "entry_number": None,
+                "case_info": "Department C25 - Hon. Jane Doe",
+                "ruling_text": "",
+            },
+            {
+                "entry_number": 2,
+                "case_info": "2024-00002 Gamma v. Delta",
+                "ruling_text": "DENIED.",
+            },
+        ]
+        rulings = _join_page_rows(rows)
+        assert len(rulings) == 2
+        assert "Department C25" not in (rulings[0].extracted_case_title or "")
+        assert rulings[1].extracted_case_number == "2024-00002"
+
+
+# ---------------------------------------------------------------------------
+# extract_from_pdf tests (per-page extraction)
 # ---------------------------------------------------------------------------
 
 
 class TestExtractFromPdf:
-    """Tests for the multimodal extract_from_pdf method."""
+    """Tests for the multimodal extract_from_pdf method (per-page)."""
 
     def test_empty_bytes_returns_empty(self) -> None:
         """Empty PDF bytes should return empty list."""
@@ -188,32 +560,8 @@ class TestExtractFromPdf:
             ext = LlmExtractor(api_key="test-key")
         assert ext.extract_from_pdf(b"") == []
 
-    def test_renders_pages_and_calls_llm(self, sample_pdf_bytes: bytes) -> None:
-        """extract_from_pdf renders pages to images and sends them to the LLM."""
-        with patch.object(anthropic, "Anthropic"):
-            ext = LlmExtractor(api_key="test-key")
-
-        mock_response = _make_llm_response(SINGLE_RULING_JSON)
-        with (
-            patch(
-                "framework.llm_extractor._render_pdf_pages",
-                return_value=[(b"\x89PNG_fake", "image/png")],
-            ) as mock_render,
-            patch(
-                "ingestion.llm_providers.call_llm_with_images",
-                return_value=mock_response,
-            ) as mock_call,
-        ):
-            rulings = ext.extract_from_pdf(sample_pdf_bytes)
-
-        mock_render.assert_called_once_with(sample_pdf_bytes, 20)
-        mock_call.assert_called_once()
-        assert len(rulings) == 1
-        assert rulings[0].extracted_case_number == "2024-01393434"
-        assert rulings[0].ruling_text == "The motion for summary adjudication is DENIED."
-
-    def test_images_passed_to_llm_call(self, sample_pdf_bytes: bytes) -> None:
-        """Page images are passed as the images argument to call_llm_with_images."""
+    def test_one_call_per_page(self, sample_pdf_bytes: bytes) -> None:
+        """extract_from_pdf sends ONE LLM call per page, not all pages at once."""
         with patch.object(anthropic, "Anthropic"):
             ext = LlmExtractor(api_key="test-key")
 
@@ -221,29 +569,55 @@ class TestExtractFromPdf:
             (b"\x89PNG_page1", "image/png"),
             (b"\x89PNG_page2", "image/png"),
         ]
-        mock_response = _make_llm_response(MULTI_RULING_JSON)
+        mock_response = _make_llm_response(SINGLE_PAGE_ROWS_JSON)
         with (
             patch(
                 "framework.llm_extractor._render_pdf_pages",
                 return_value=fake_images,
-            ),
+            ) as mock_render,
             patch(
                 "ingestion.llm_providers.call_llm_with_images",
                 return_value=mock_response,
             ) as mock_call,
         ):
-            rulings = ext.extract_from_pdf(sample_pdf_bytes)
+            ext.extract_from_pdf(sample_pdf_bytes)
 
-        call_kwargs = mock_call.call_args
-        assert call_kwargs.kwargs["images"] == fake_images
-        assert len(rulings) == 2
+        mock_render.assert_called_once_with(sample_pdf_bytes, 20)
+        # One call per page = 2 calls for 2 pages.
+        assert mock_call.call_count == 2
+        # Each call should have exactly one image.
+        for call in mock_call.call_args_list:
+            images_arg = call.kwargs["images"]
+            assert len(images_arg) == 1
 
-    def test_multi_ruling_pdf(self, sample_pdf_bytes: bytes) -> None:
-        """extract_from_pdf handles multiple rulings in one PDF."""
+    def test_single_page_single_ruling(self, sample_pdf_bytes: bytes) -> None:
+        """Single page with one case produces one ruling."""
         with patch.object(anthropic, "Anthropic"):
             ext = LlmExtractor(api_key="test-key")
 
-        mock_response = _make_llm_response(MULTI_RULING_JSON)
+        mock_response = _make_llm_response(SINGLE_PAGE_ROWS_JSON)
+        with (
+            patch(
+                "framework.llm_extractor._render_pdf_pages",
+                return_value=[(b"\x89PNG_fake", "image/png")],
+            ),
+            patch(
+                "ingestion.llm_providers.call_llm_with_images",
+                return_value=mock_response,
+            ),
+        ):
+            rulings = ext.extract_from_pdf(sample_pdf_bytes)
+
+        assert len(rulings) == 1
+        assert rulings[0].extracted_case_number == "2024-01393434"
+        assert rulings[0].ruling_text == "The motion for summary adjudication is DENIED."
+
+    def test_multi_case_single_page(self, sample_pdf_bytes: bytes) -> None:
+        """Single page with multiple cases produces multiple rulings."""
+        with patch.object(anthropic, "Anthropic"):
+            ext = LlmExtractor(api_key="test-key")
+
+        mock_response = _make_llm_response(MULTI_CASE_PAGE_ROWS_JSON)
         with (
             patch(
                 "framework.llm_extractor._render_pdf_pages",
@@ -257,10 +631,41 @@ class TestExtractFromPdf:
             rulings = ext.extract_from_pdf(sample_pdf_bytes)
 
         assert len(rulings) == 2
-        assert rulings[0].extracted_case_number == "CVPS2306157"
-        assert rulings[0].outcome == ExtractionOutcome.GRANTED
-        assert rulings[1].extracted_case_number == "CVPS2400892"
-        assert rulings[1].outcome == ExtractionOutcome.DENIED
+        assert rulings[0].extracted_case_number == "2024-01393434"
+        assert rulings[1].extracted_case_number == "2024-00567890"
+
+    def test_cross_page_continuation(self, sample_pdf_bytes: bytes) -> None:
+        """Cases spanning pages are correctly joined."""
+        with patch.object(anthropic, "Anthropic"):
+            ext = LlmExtractor(api_key="test-key")
+
+        # Page 1: one complete case.
+        page1_response = _make_llm_response(SINGLE_PAGE_ROWS_JSON)
+        # Page 2: continuation + new case.
+        page2_response = _make_llm_response(CONTINUATION_PAGE_ROWS_JSON)
+
+        with (
+            patch(
+                "framework.llm_extractor._render_pdf_pages",
+                return_value=[
+                    (b"\x89PNG_page1", "image/png"),
+                    (b"\x89PNG_page2", "image/png"),
+                ],
+            ),
+            patch(
+                "ingestion.llm_providers.call_llm_with_images",
+                side_effect=[page1_response, page2_response],
+            ),
+        ):
+            rulings = ext.extract_from_pdf(sample_pdf_bytes)
+
+        # Page 1 case + continuation merged, plus page 2 new case = 2 rulings.
+        assert len(rulings) == 2
+        # First ruling should have merged text.
+        assert "DENIED" in rulings[0].ruling_text
+        assert "lacks merit" in rulings[0].ruling_text
+        # Second ruling is the new case from page 2.
+        assert rulings[1].extracted_case_number == "2024-00999999"
 
     def test_render_failure_returns_empty(self, sample_pdf_bytes: bytes) -> None:
         """If page rendering returns no pages, returns empty list."""
@@ -276,7 +681,7 @@ class TestExtractFromPdf:
         assert rulings == []
 
     def test_llm_failure_returns_empty(self, sample_pdf_bytes: bytes) -> None:
-        """If the LLM API call fails, returns empty list."""
+        """If the LLM API call fails on all pages, returns empty list."""
         with patch.object(anthropic, "Anthropic"):
             ext = LlmExtractor(api_key="test-key")
         ext._base_delay = 0.01
@@ -301,7 +706,7 @@ class TestExtractFromPdf:
         with patch.object(anthropic, "Anthropic"):
             ext = LlmExtractor(api_key="test-key")
 
-        mock_response = _make_llm_response(SINGLE_RULING_JSON)
+        mock_response = _make_llm_response(SINGLE_PAGE_ROWS_JSON)
         with (
             patch(
                 "framework.llm_extractor._render_pdf_pages",
@@ -327,7 +732,7 @@ class TestExtractFromPdf:
         with patch.object(anthropic, "Anthropic"):
             ext = LlmExtractor(api_key="test-key")
 
-        mock_response = _make_llm_response(SINGLE_RULING_JSON)
+        mock_response = _make_llm_response(SINGLE_PAGE_ROWS_JSON)
         with (
             patch(
                 "framework.llm_extractor._render_pdf_pages",
@@ -348,7 +753,7 @@ class TestExtractFromPdf:
         with patch("framework.llm_extractor._create_google_client", return_value=mock_client):
             ext = LlmExtractor(provider="google", api_key="test-key")
 
-        mock_response = _make_llm_response(SINGLE_RULING_JSON)
+        mock_response = _make_llm_response(SINGLE_PAGE_ROWS_JSON)
         with (
             patch(
                 "framework.llm_extractor._render_pdf_pages",
@@ -365,12 +770,14 @@ class TestExtractFromPdf:
         assert call_kwargs["provider"] == "google"
         assert call_kwargs["model"] == "gemini-2.5-flash-lite"
 
-    def test_ruling_text_in_results(self, sample_pdf_bytes: bytes) -> None:
-        """ruling_text field is populated in extraction results."""
+    def test_per_page_prompt_used(self, sample_pdf_bytes: bytes) -> None:
+        """The per-page prompt (PDF_PER_PAGE_PROMPT) is used, not the full extraction prompt."""
+        from framework.llm_extractor import PDF_PER_PAGE_PROMPT
+
         with patch.object(anthropic, "Anthropic"):
             ext = LlmExtractor(api_key="test-key")
 
-        mock_response = _make_llm_response(SINGLE_RULING_JSON)
+        mock_response = _make_llm_response(SINGLE_PAGE_ROWS_JSON)
         with (
             patch(
                 "framework.llm_extractor._render_pdf_pages",
@@ -379,12 +786,12 @@ class TestExtractFromPdf:
             patch(
                 "ingestion.llm_providers.call_llm_with_images",
                 return_value=mock_response,
-            ),
+            ) as mock_call,
         ):
-            rulings = ext.extract_from_pdf(sample_pdf_bytes)
+            ext.extract_from_pdf(sample_pdf_bytes)
 
-        assert len(rulings) == 1
-        assert rulings[0].ruling_text == "The motion for summary adjudication is DENIED."
+        call_kwargs = mock_call.call_args.kwargs
+        assert call_kwargs["system_prompt"] == PDF_PER_PAGE_PROMPT
 
 
 # ---------------------------------------------------------------------------
@@ -497,14 +904,14 @@ class TestCreateGoogleClient:
 
 
 class TestMultimodalTokenUsage:
-    """Tests for token usage tracking in the multimodal path."""
+    """Tests for token usage tracking in the per-page multimodal path."""
 
     def test_token_usage_logged(self, sample_pdf_bytes: bytes) -> None:
         """Token usage is logged after multimodal extraction."""
         with patch.object(anthropic, "Anthropic"):
             ext = LlmExtractor(api_key="test-key")
 
-        mock_response = _make_llm_response(SINGLE_RULING_JSON)
+        mock_response = _make_llm_response(SINGLE_PAGE_ROWS_JSON)
         with (
             patch(
                 "framework.llm_extractor._render_pdf_pages",
@@ -529,23 +936,56 @@ class TestMultimodalTokenUsage:
         assert usage_calls[0].kwargs["output_tokens"] == 200
         assert usage_calls[0].kwargs["api_calls"] == 1
 
+    def test_token_usage_aggregated_across_pages(self, sample_pdf_bytes: bytes) -> None:
+        """Token usage is accumulated across all page calls."""
+        with patch.object(anthropic, "Anthropic"):
+            ext = LlmExtractor(api_key="test-key")
+
+        mock_response = _make_llm_response(SINGLE_PAGE_ROWS_JSON)
+        with (
+            patch(
+                "framework.llm_extractor._render_pdf_pages",
+                return_value=[
+                    (b"\x89PNG_page1", "image/png"),
+                    (b"\x89PNG_page2", "image/png"),
+                ],
+            ),
+            patch(
+                "ingestion.llm_providers.call_llm_with_images",
+                return_value=mock_response,
+            ),
+            patch("framework.llm_extractor.logger") as mock_logger,
+        ):
+            ext.extract_from_pdf(sample_pdf_bytes)
+
+        usage_calls = [
+            c
+            for c in mock_logger.info.call_args_list
+            if c.args and c.args[0] == "llm_extractor.token_usage"
+        ]
+        assert len(usage_calls) == 1
+        # 2 pages * 500 input tokens each = 1000 total.
+        assert usage_calls[0].kwargs["input_tokens"] == 1000
+        assert usage_calls[0].kwargs["output_tokens"] == 400
+        assert usage_calls[0].kwargs["api_calls"] == 2
+
 
 # ---------------------------------------------------------------------------
-# Retry and error handling in _extract_images
+# Retry and error handling in _extract_single_page
 # ---------------------------------------------------------------------------
 
 
-class TestExtractImagesRetry:
-    """Tests for retry and error handling in the multimodal image extraction path."""
+class TestExtractSinglePageRetry:
+    """Tests for retry and error handling in the per-page extraction path."""
 
     def test_retries_on_none_response(self, sample_pdf_bytes: bytes) -> None:
-        """When LLM returns None, retries before giving up."""
+        """When LLM returns None for a page, retries before giving up."""
         with patch.object(anthropic, "Anthropic"):
             ext = LlmExtractor(api_key="test-key")
         ext._base_delay = 0.01
         ext._max_retries = 3
 
-        mock_response = _make_llm_response(SINGLE_RULING_JSON)
+        mock_response = _make_llm_response(SINGLE_PAGE_ROWS_JSON)
         # First two calls return None, third succeeds.
         with (
             patch(
@@ -590,7 +1030,7 @@ class TestExtractImagesRetry:
         ext._base_delay = 0.01
         ext._max_retries = 3
 
-        mock_response = _make_llm_response(SINGLE_RULING_JSON)
+        mock_response = _make_llm_response(SINGLE_PAGE_ROWS_JSON)
         with (
             patch(
                 "framework.llm_extractor._render_pdf_pages",
@@ -606,44 +1046,49 @@ class TestExtractImagesRetry:
         assert len(rulings) == 1
         assert mock_call.call_count == 3
 
-    def test_exhausts_retries_on_exception(self, sample_pdf_bytes: bytes) -> None:
-        """When all retries raise exceptions, returns empty list."""
+    def test_partial_page_failure(self, sample_pdf_bytes: bytes) -> None:
+        """If one page fails, other pages' results are still used."""
         with patch.object(anthropic, "Anthropic"):
             ext = LlmExtractor(api_key="test-key")
         ext._base_delay = 0.01
-        ext._max_retries = 2
+        ext._max_retries = 1
 
+        page1_response = _make_llm_response(SINGLE_PAGE_ROWS_JSON)
         with (
             patch(
                 "framework.llm_extractor._render_pdf_pages",
-                return_value=[(b"\x89PNG_fake", "image/png")],
+                return_value=[
+                    (b"\x89PNG_page1", "image/png"),
+                    (b"\x89PNG_page2", "image/png"),
+                ],
             ),
             patch(
                 "ingestion.llm_providers.call_llm_with_images",
-                side_effect=RuntimeError("persistent failure"),
+                side_effect=[page1_response, None],
             ),
         ):
             rulings = ext.extract_from_pdf(sample_pdf_bytes)
 
-        assert rulings == []
+        # Page 1 succeeded, page 2 failed — should still get page 1 results.
+        assert len(rulings) == 1
 
 
 # ---------------------------------------------------------------------------
-# _build_user_message_for_images
+# _build_user_message_for_page
 # ---------------------------------------------------------------------------
 
 
-class TestBuildUserMessageForImages:
-    """Tests for the image extraction text message builder."""
+class TestBuildUserMessageForPage:
+    """Tests for the per-page extraction text message builder."""
 
     def test_no_metadata(self) -> None:
         """Without metadata, produces a generic extraction message."""
-        msg = LlmExtractor._build_user_message_for_images(None)
-        assert "Extract ALL structured fields" in msg
+        msg = LlmExtractor._build_user_message_for_page(None)
+        assert "Extract all table rows" in msg
 
     def test_with_all_metadata(self) -> None:
         """With all metadata keys, includes them in the message."""
-        msg = LlmExtractor._build_user_message_for_images(
+        msg = LlmExtractor._build_user_message_for_page(
             {
                 "judge_name": "Test Judge",
                 "department": "D99",
@@ -653,12 +1098,16 @@ class TestBuildUserMessageForImages:
         assert "Test Judge" in msg
         assert "D99" in msg
         assert "2026-03-01" in msg
-        assert "Extract ALL structured fields" in msg
 
     def test_with_hearing_date_only(self) -> None:
         """With only hearing_date, includes it in the message."""
-        msg = LlmExtractor._build_user_message_for_images({"hearing_date": "2026-04-15"})
+        msg = LlmExtractor._build_user_message_for_page({"hearing_date": "2026-04-15"})
         assert "2026-04-15" in msg
+
+
+# ---------------------------------------------------------------------------
+# _build_user_message_for_images (backward compat)
+# ---------------------------------------------------------------------------
 
 
 # ---------------------------------------------------------------------------
@@ -705,3 +1154,33 @@ class TestSystemPromptRulingText:
         # Check both the rule about ruling text and the output format
         assert "ruling_text" in EXTRACTION_SYSTEM_PROMPT
         assert "The motion for summary judgment is GRANTED..." in EXTRACTION_SYSTEM_PROMPT
+
+
+# ---------------------------------------------------------------------------
+# Per-page prompt content
+# ---------------------------------------------------------------------------
+
+
+class TestPerPagePrompt:
+    """Verify the per-page prompt is well-formed."""
+
+    def test_per_page_prompt_exists(self) -> None:
+        """PDF_PER_PAGE_PROMPT is a non-empty string."""
+        from framework.llm_extractor import PDF_PER_PAGE_PROMPT
+
+        assert isinstance(PDF_PER_PAGE_PROMPT, str)
+        assert len(PDF_PER_PAGE_PROMPT) > 100
+
+    def test_per_page_prompt_describes_three_columns(self) -> None:
+        """The per-page prompt describes the three-column table format."""
+        from framework.llm_extractor import PDF_PER_PAGE_PROMPT
+
+        assert "entry_number" in PDF_PER_PAGE_PROMPT
+        assert "case_info" in PDF_PER_PAGE_PROMPT
+        assert "ruling_text" in PDF_PER_PAGE_PROMPT
+
+    def test_per_page_prompt_requests_json_array(self) -> None:
+        """The per-page prompt asks for a JSON array."""
+        from framework.llm_extractor import PDF_PER_PAGE_PROMPT
+
+        assert "JSON array" in PDF_PER_PAGE_PROMPT

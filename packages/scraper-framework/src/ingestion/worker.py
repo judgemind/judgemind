@@ -276,6 +276,11 @@ class IngestionWorker:
         # per-field LLM client above.
         self._framework_extractor: LlmExtractor | None = None
 
+        # Multimodal LLM extractor for PDF page-image extraction (#1590).
+        # Uses Google Gemini Flash Lite for cost-effective per-page extraction.
+        # Lazy-initialized on first use; None means "not yet created".
+        self._multimodal_extractor: LlmExtractor | None = None
+
         # LA County department-to-judge mapping — lazy-loaded on first LA event.
         # None means "not yet fetched"; empty dict means "fetch failed or empty".
         self._la_dept_map: dict[str, str] | None = None
@@ -300,6 +305,26 @@ class IngestionWorker:
                     exc,
                 )
         return self._framework_extractor
+
+    def _get_multimodal_extractor(self) -> LlmExtractor | None:
+        """Return the multimodal LlmExtractor for PDF extraction, creating lazily.
+
+        Uses Google Gemini Flash Lite for cost-effective per-page image
+        extraction.  Returns None if the Google API key is not available.
+        """
+        if self._multimodal_extractor is None:
+            try:
+                self._multimodal_extractor = LlmExtractor(
+                    provider="google",
+                    model="gemini-2.5-flash-lite",
+                )
+                logger.info("Initialized multimodal LlmExtractor (Google Flash Lite)")
+            except Exception as exc:
+                logger.warning(
+                    "Failed to initialize multimodal LlmExtractor — PDF extraction unavailable: %s",
+                    exc,
+                )
+        return self._multimodal_extractor
 
     def _get_la_dept_map(self) -> dict[str, str]:
         """Return the LA County department-to-judge mapping, fetching lazily on first call.
@@ -455,7 +480,14 @@ class IngestionWorker:
         # PDF preprocessing: if ruling_text is raw PDF binary, extract text first.
         # This handles documents where the scraper stored raw PDF bytes instead of
         # extracted text (e.g. Riverside, Orange county PDFs).
+        #
+        # Preserve the raw PDF bytes before text extraction so the multimodal
+        # extraction path (per-page image LLM calls) can use them (#1590).
+        raw_pdf_bytes: bytes | None = None
         if ruling_text and content_format == "pdf" and is_pdf_binary(ruling_text):
+            raw_pdf_bytes = (
+                ruling_text.encode("latin-1") if isinstance(ruling_text, str) else ruling_text
+            )
             extracted_pdf_text = extract_text_from_pdf(ruling_text)
             if extracted_pdf_text:
                 logger.info(
@@ -493,7 +525,12 @@ class IngestionWorker:
         # was removed in #1475.
         if not event_data.get("_split_processed"):
             llm_split = self._llm_split_document(
-                event_data, document_id, ruling_text, state, county
+                event_data,
+                document_id,
+                ruling_text,
+                state,
+                county,
+                raw_pdf_bytes=raw_pdf_bytes,
             )
             if llm_split:
                 # LLM extractor returned results — recurse with split events.
@@ -1028,6 +1065,8 @@ class IngestionWorker:
         ruling_text: str | None,
         state: str,
         county: str,
+        *,
+        raw_pdf_bytes: bytes | None = None,
     ) -> bool:
         """Use the framework LlmExtractor to split and extract a document.
 
@@ -1035,6 +1074,11 @@ class IngestionWorker:
         single API call, producing one ``ExtractedRuling`` per case in the
         document.  This is the sole splitting/extraction path since #1475
         removed the legacy regex splitter framework.
+
+        When ``raw_pdf_bytes`` are available, uses multimodal per-page
+        extraction via ``extract_from_pdf()`` for more accurate results
+        on image-based PDFs (e.g., OC tentative rulings).  Falls back to
+        text-based extraction via ``extract()`` if multimodal is unavailable.
 
         Each extracted ruling is re-injected as a synthetic split event with all
         fields pre-populated (``_llm_extracted=True``), so the normal
@@ -1053,6 +1097,10 @@ class IngestionWorker:
             Two-letter state code.
         county : str
             County name.
+        raw_pdf_bytes : bytes | None
+            Raw PDF file content for multimodal extraction.  When provided,
+            the multimodal path is attempted first; on failure, falls back
+            to text-based extraction.
 
         Returns
         -------
@@ -1061,11 +1109,7 @@ class IngestionWorker:
             dispatched. False if extraction failed and the caller should
             continue with single-document processing.
         """
-        if not ruling_text:
-            return False
-
-        extractor = self._get_framework_extractor()
-        if extractor is None:
+        if not ruling_text and not raw_pdf_bytes:
             return False
 
         # Build metadata from scraper-provided fields.
@@ -1078,20 +1122,61 @@ class IngestionWorker:
             metadata["hearing_date"] = str(event_data["hearing_date"])
 
         t0 = time.monotonic()
-        try:
-            extracted_rulings = extractor.extract(ruling_text, metadata=metadata or None)
-        except Exception as exc:
-            llm_latency_ms = round((time.monotonic() - t0) * 1000)
-            logger.error(
-                "LLM extraction path failed",
-                extra={
-                    "document_id": document_id,
-                    "error": str(exc),
-                    "llm_latency_ms": llm_latency_ms,
-                    "extraction_method": "llm",
-                },
-            )
-            return False
+        extracted_rulings = None
+        extraction_method = "llm"  # Track which path was used for logging.
+
+        # Multimodal path: per-page image extraction from raw PDF (#1590).
+        if raw_pdf_bytes is not None:
+            multimodal_extractor = self._get_multimodal_extractor()
+            if multimodal_extractor is not None:
+                try:
+                    extracted_rulings = multimodal_extractor.extract_from_pdf(
+                        raw_pdf_bytes, metadata=metadata or None
+                    )
+                    extraction_method = "multimodal"
+                    if extracted_rulings:
+                        logger.info(
+                            "Multimodal extraction succeeded",
+                            extra={
+                                "document_id": document_id,
+                                "ruling_count": len(extracted_rulings),
+                                "extraction_method": "multimodal",
+                            },
+                        )
+                except Exception as exc:
+                    logger.warning(
+                        "Multimodal extraction failed — falling back to text",
+                        extra={
+                            "document_id": document_id,
+                            "error": str(exc),
+                            "extraction_method": "multimodal",
+                        },
+                    )
+                    extracted_rulings = None
+
+        # Text-based fallback (or primary path when no raw PDF available).
+        # Use `is None` to distinguish between failed extraction (None) and
+        # successful extraction that found no results ([]).  An empty list
+        # from multimodal extraction is authoritative — do not retry with text.
+        if extracted_rulings is None and ruling_text:
+            extraction_method = "llm"  # Falling back to text-based.
+            extractor = self._get_framework_extractor()
+            if extractor is None:
+                return False
+            try:
+                extracted_rulings = extractor.extract(ruling_text, metadata=metadata or None)
+            except Exception as exc:
+                llm_latency_ms = round((time.monotonic() - t0) * 1000)
+                logger.error(
+                    "LLM extraction path failed",
+                    extra={
+                        "document_id": document_id,
+                        "error": str(exc),
+                        "llm_latency_ms": llm_latency_ms,
+                        "extraction_method": "llm",
+                    },
+                )
+                return False
 
         llm_latency_ms = round((time.monotonic() - t0) * 1000)
 
@@ -1101,7 +1186,7 @@ class IngestionWorker:
                 extra={
                     "document_id": document_id,
                     "llm_latency_ms": llm_latency_ms,
-                    "extraction_method": "llm",
+                    "extraction_method": extraction_method,
                 },
             )
             return False
@@ -1113,7 +1198,7 @@ class IngestionWorker:
                 "document_id": document_id,
                 "ruling_count": len(extracted_rulings),
                 "llm_latency_ms": llm_latency_ms,
-                "extraction_method": "llm",
+                "extraction_method": extraction_method,
                 "county": county,
                 "state": state,
             },
