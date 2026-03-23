@@ -12,6 +12,7 @@ from ingestion.extract import (
     _split_caption_names,
     extract_case_number,
     extract_case_title,
+    extract_case_type_from_motion_type,
     extract_case_type_from_number,
     extract_case_type_from_scraper_id,
     extract_hearing_date,
@@ -1771,3 +1772,80 @@ class TestExtractCaseTypeFromScraperId:
 
     def test_small_claims(self) -> None:
         assert extract_case_type_from_scraper_id("ca-foo-small-claims") == "small_claims"
+
+
+# ---------------------------------------------------------------------------
+# extract_case_type_from_motion_type (#1702)
+# ---------------------------------------------------------------------------
+
+
+class TestExtractCaseTypeFromMotionType:
+    """Tests for extract_case_type_from_motion_type()."""
+
+    # --- Civil motion types ---
+
+    def test_motion_to_compel(self) -> None:
+        """motion_to_compel is unambiguously civil (issue #1702 trigger case)."""
+        assert extract_case_type_from_motion_type("motion_to_compel") == "civil"
+
+    def test_msj(self) -> None:
+        assert extract_case_type_from_motion_type("msj") == "civil"
+
+    def test_msj_partial(self) -> None:
+        assert extract_case_type_from_motion_type("msj_partial") == "civil"
+
+    def test_demurrer(self) -> None:
+        assert extract_case_type_from_motion_type("demurrer") == "civil"
+
+    def test_motion_to_strike(self) -> None:
+        assert extract_case_type_from_motion_type("motion_to_strike") == "civil"
+
+    def test_anti_slapp(self) -> None:
+        assert extract_case_type_from_motion_type("anti_slapp") == "civil"
+
+    def test_preliminary_injunction(self) -> None:
+        assert extract_case_type_from_motion_type("preliminary_injunction") == "civil"
+
+    def test_default_judgment(self) -> None:
+        assert extract_case_type_from_motion_type("default_judgment") == "civil"
+
+    def test_mil(self) -> None:
+        assert extract_case_type_from_motion_type("mil") == "civil"
+
+    def test_motion_for_attorney_fees(self) -> None:
+        assert extract_case_type_from_motion_type("motion_for_attorney_fees") == "civil"
+
+    def test_motion_for_sanctions(self) -> None:
+        assert extract_case_type_from_motion_type("motion_for_sanctions") == "civil"
+
+    def test_class_action_settlement(self) -> None:
+        assert extract_case_type_from_motion_type("class_action_settlement") == "civil"
+
+    # --- Probate motion types ---
+
+    def test_petition(self) -> None:
+        assert extract_case_type_from_motion_type("petition") == "probate"
+
+    # --- Ambiguous motion types (should return None) ---
+
+    def test_ex_parte_application(self) -> None:
+        """Ex parte applications appear in civil, family, and probate cases."""
+        assert extract_case_type_from_motion_type("ex_parte_application") is None
+
+    def test_osc(self) -> None:
+        """OSCs appear across multiple case types."""
+        assert extract_case_type_from_motion_type("osc") is None
+
+    # --- Edge cases ---
+
+    def test_empty_string(self) -> None:
+        assert extract_case_type_from_motion_type("") is None
+
+    def test_none(self) -> None:
+        assert extract_case_type_from_motion_type(None) is None  # type: ignore[arg-type]
+
+    def test_whitespace_stripped(self) -> None:
+        assert extract_case_type_from_motion_type("  motion_to_compel  ") == "civil"
+
+    def test_unknown_motion_type(self) -> None:
+        assert extract_case_type_from_motion_type("unknown_motion") is None

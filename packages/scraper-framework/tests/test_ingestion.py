@@ -3791,3 +3791,43 @@ def test_process_event_no_warning_when_case_title_extracted_from_text(
     assert len(warning_records) == 0, (
         "No warning expected when case_title is extracted from ruling text"
     )
+
+
+# ---------------------------------------------------------------------------
+# Motion-type case_type fallback (#1702)
+# ---------------------------------------------------------------------------
+
+
+@patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
+@patch("ingestion.worker.psycopg")
+def test_process_event_motion_type_fallback_populates_case_type(
+    mock_psycopg: MagicMock,
+    mock_resolve_judge: MagicMock,
+) -> None:
+    """When case number has no type code and scraper_id is generic,
+    motion_type fallback infers case_type (#1702)."""
+    worker, os_mock = _make_worker()
+
+    mock_conn, mock_cur = _make_mock_conn()
+    mock_psycopg.connect.return_value = mock_conn
+    mock_cur.fetchone.side_effect = [
+        ("court-uuid-1",),  # upsert_court
+        ("case-uuid-1",),  # upsert_case
+        (True,),  # insert_document: RETURNING is_new = True
+    ]
+    mock_cur.rowcount = 1
+
+    # Ventura-like event: all-digit case number, generic scraper_id,
+    # but with a civil motion_type.
+    event = _make_event(
+        scraper_id="ca-ventura-tentatives",
+        case_number="202300574258",
+        motion_type="motion_to_compel",
+        case_type=None,
+        ruling_text="The motion to compel is GRANTED.",
+    )
+    worker.process_event(event)
+
+    # The upsert_case call should include case_type='civil'
+    all_sql = " ".join(str(c) for c in mock_cur.execute.call_args_list)
+    assert "civil" in all_sql
