@@ -545,6 +545,75 @@ describe('RulingDetail', () => {
     expect(screen.getByText('Download original document')).toBeInTheDocument();
   });
 
+  it('handles rapid toggle: load, hide, re-load without stale closure', async () => {
+    const ruling = buildFullRuling();
+    ruling.documentFormat = 'html';
+    const htmlContent = '<html><body><p>Content</p></body></html>';
+
+    // Mock two successful fetches (one for initial load, one for re-load)
+    const fetchSpy = vi.spyOn(globalThis, 'fetch')
+      .mockResolvedValueOnce(new Response(htmlContent, { status: 200 }))
+      .mockResolvedValueOnce(new Response(htmlContent, { status: 200 }));
+
+    render(<RulingDetail ruling={ruling} />);
+
+    const btn = screen.getByTestId('view-original-button');
+
+    // 1. Click "View original" — starts loading
+    fireEvent.click(btn);
+    await waitFor(() => {
+      expect(screen.getByTestId('original-document-iframe')).toBeInTheDocument();
+    });
+    expect(btn).toHaveTextContent('Hide original');
+
+    // 2. Click "Hide original" — toggles off
+    fireEvent.click(btn);
+    expect(screen.queryByTestId('original-document-iframe')).not.toBeInTheDocument();
+    expect(btn).toHaveTextContent('View original');
+
+    // 3. Click "View original" again — should load a second time, not stay stuck
+    fireEvent.click(btn);
+    await waitFor(() => {
+      expect(screen.getByTestId('original-document-iframe')).toBeInTheDocument();
+    });
+    expect(btn).toHaveTextContent('Hide original');
+
+    // Verify fetch was called twice (once per "View original" click)
+    expect(fetchSpy).toHaveBeenCalledTimes(2);
+
+    fetchSpy.mockRestore();
+  });
+
+  it('ignores duplicate clicks while loading (button is disabled)', async () => {
+    const ruling = buildFullRuling();
+    ruling.documentFormat = 'html';
+    const htmlContent = '<html><body><p>Content</p></body></html>';
+
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(
+      new Response(htmlContent, { status: 200 }),
+    );
+
+    render(<RulingDetail ruling={ruling} />);
+
+    const btn = screen.getByTestId('view-original-button');
+
+    // Fire two clicks back-to-back without awaiting — the button becomes
+    // disabled after the first click triggers a re-render, so the second
+    // click should be a no-op.
+    fireEvent.click(btn);
+    fireEvent.click(btn);
+
+    // Wait for the document to load
+    await waitFor(() => {
+      expect(screen.getByTestId('original-document-iframe')).toBeInTheDocument();
+    });
+
+    // Only one fetch should have been made
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+
+    fetchSpy.mockRestore();
+  });
+
   it('shows "View original" button in standalone section when no ruling text exists but HTML doc does', () => {
     const ruling = buildFullRuling();
     ruling.documentFormat = 'html';
