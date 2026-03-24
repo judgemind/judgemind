@@ -97,6 +97,7 @@ from ingestion.extract import (  # noqa: E402
     extract_motion_type,
     extract_outcome,
     extract_parties_from_caption,
+    normalize_motion_type,
 )
 from ingestion.llm_extract import (  # noqa: E402
     LLMExtractionResult,
@@ -597,7 +598,14 @@ def _reparse_document(
             extracted["case_title"] = parsed.case_title or extracted["case_title"]
             extracted["judge_name"] = parsed.judge_name
             extracted["outcome"] = parsed.outcome
-            extracted["motion_type"] = parsed.motion_type
+            # Normalize scraper-provided motion_type to snake_case (#1849).
+            # Mirrors the normalization in worker.py so reingest produces
+            # the same canonical values as live ingestion.
+            extracted["motion_type"] = (
+                normalize_motion_type(parsed.motion_type)
+                if parsed.motion_type
+                else None
+            )
             extracted["department"] = parsed.department
             extracted["parties"] = parsed.parties
             if parsed.hearing_date:
@@ -709,8 +717,11 @@ def _reparse_document(
                         extracted["outcome"] = ruling.outcome
                         extraction_methods["outcome"] = "llm"
                     if not extracted["motion_type"] and ruling.motion_type:
-                        extracted["motion_type"] = ruling.motion_type
-                        extraction_methods["motion_type"] = "llm"
+                        # Normalize LLM-provided motion_type (#1849).
+                        normalized = normalize_motion_type(ruling.motion_type)
+                        if normalized:
+                            extracted["motion_type"] = normalized
+                            extraction_methods["motion_type"] = "llm"
                     if not extracted["case_type"] and ruling.case_type:
                         extracted["case_type"] = ruling.case_type
                         extraction_methods["case_type"] = "llm"
@@ -928,7 +939,12 @@ def _full_reparse_document(
             "case_type": doc_meta.get("case_type"),
             "judge_name": doc_judge_name,
             "outcome": _normalize_outcome(ruling.outcome),
-            "motion_type": ruling.motion_type,
+            # Normalize split-provided motion_type to snake_case (#1849).
+            "motion_type": (
+                normalize_motion_type(ruling.motion_type)
+                if ruling.motion_type
+                else None
+            ),
             "department": doc_department,
             "parties": [],
             "hearing_date": doc_hearing_date,
@@ -1128,7 +1144,12 @@ def _reparse_document_multimodal(
             "case_type": ruling.case_type.value if ruling.case_type else None,
             "judge_name": ruling.extracted_judge_name,
             "outcome": outcome_str,
-            "motion_type": ruling.motion_type,
+            # Normalize multimodal-provided motion_type to snake_case (#1849).
+            "motion_type": (
+                normalize_motion_type(ruling.motion_type)
+                if ruling.motion_type
+                else None
+            ),
             "department": ruling.department,
             "parties": parties_data,
             "hearing_date": hearing_date_val,

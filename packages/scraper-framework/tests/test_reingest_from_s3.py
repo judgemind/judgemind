@@ -276,6 +276,146 @@ class TestReparseDocumentNulBytes:
 
 
 # ---------------------------------------------------------------------------
+# _reparse_document tests — motion_type normalization (#1849)
+# ---------------------------------------------------------------------------
+
+
+class TestReparseDocumentMotionTypeNormalization:
+    """Verify that scraper-provided motion_type is normalized via
+    normalize_motion_type() to match the behavior of worker.py (#1849)."""
+
+    def _doc_meta(self) -> dict:
+        return {
+            "document_id": str(_DOC_ID_1),
+            "state": "CA",
+            "county": "Los Angeles",
+            "court_name": "Los Angeles Superior Court",
+            "source_url": "https://court.example.com/ruling",
+            "captured_at": _CAPTURED_AT_1,
+            "content_hash": "abc123",
+            "format": "html",
+            "case_number": "24STCV12345",
+            "case_title": "Smith v. Jones",
+            "hearing_date": _HEARING_DATE,
+            "court_id": str(_COURT_ID),
+            "scraper_id": "ca-la-tentatives-civil",
+            "s3_key": "docs/test.html",
+            "s3_bucket": "test-bucket",
+        }
+
+    @patch.object(reingest, "_load_scraper_registry")
+    def test_title_case_motion_type_normalized(
+        self,
+        mock_registry: MagicMock,
+    ) -> None:
+        """A scraper returning 'Motion to Compel' gets normalized to
+        'motion_to_compel'."""
+        raw = b"<html>ruling</html>"
+        mock_scraper_cls = MagicMock()
+        mock_parsed = MagicMock()
+        mock_parsed.ruling_text = "The motion is granted."
+        mock_parsed.case_number = "24STCV12345"
+        mock_parsed.case_title = "Smith v. Jones"
+        mock_parsed.judge_name = "Judge Test"
+        mock_parsed.outcome = "granted"
+        mock_parsed.motion_type = "Motion to Compel"
+        mock_parsed.department = "1"
+        mock_parsed.parties = []
+        mock_parsed.hearing_date = None
+        mock_scraper_cls.return_value.parse_document.return_value = mock_parsed
+        reingest._SCRAPER_REGISTRY["test-scraper"] = mock_scraper_cls
+
+        try:
+            result = reingest._reparse_document(raw, "test-scraper", self._doc_meta())
+            assert result["motion_type"] == "motion_to_compel"
+        finally:
+            reingest._SCRAPER_REGISTRY.pop("test-scraper", None)
+
+    @patch.object(reingest, "_load_scraper_registry")
+    def test_already_normalized_motion_type_passes_through(
+        self,
+        mock_registry: MagicMock,
+    ) -> None:
+        """A scraper returning already-normalized 'demurrer' passes through."""
+        raw = b"<html>ruling</html>"
+        mock_scraper_cls = MagicMock()
+        mock_parsed = MagicMock()
+        mock_parsed.ruling_text = "The demurrer is sustained."
+        mock_parsed.case_number = "24STCV12345"
+        mock_parsed.case_title = "Smith v. Jones"
+        mock_parsed.judge_name = "Judge Test"
+        mock_parsed.outcome = "sustained"
+        mock_parsed.motion_type = "demurrer"
+        mock_parsed.department = "1"
+        mock_parsed.parties = []
+        mock_parsed.hearing_date = None
+        mock_scraper_cls.return_value.parse_document.return_value = mock_parsed
+        reingest._SCRAPER_REGISTRY["test-scraper"] = mock_scraper_cls
+
+        try:
+            result = reingest._reparse_document(raw, "test-scraper", self._doc_meta())
+            assert result["motion_type"] == "demurrer"
+        finally:
+            reingest._SCRAPER_REGISTRY.pop("test-scraper", None)
+
+    @patch.object(reingest, "_load_scraper_registry")
+    def test_unmappable_motion_type_returns_none(
+        self,
+        mock_registry: MagicMock,
+    ) -> None:
+        """A scraper returning an unmappable motion type gets normalized to
+        None, allowing regex fallback to extract from ruling text."""
+        raw = b"<html>ruling</html>"
+        mock_scraper_cls = MagicMock()
+        mock_parsed = MagicMock()
+        mock_parsed.ruling_text = "The motion is granted."
+        mock_parsed.case_number = "24STCV12345"
+        mock_parsed.case_title = "Smith v. Jones"
+        mock_parsed.judge_name = "Judge Test"
+        mock_parsed.outcome = "granted"
+        mock_parsed.motion_type = "Some Random Hearing Type"
+        mock_parsed.department = "1"
+        mock_parsed.parties = []
+        mock_parsed.hearing_date = None
+        mock_scraper_cls.return_value.parse_document.return_value = mock_parsed
+        reingest._SCRAPER_REGISTRY["test-scraper"] = mock_scraper_cls
+
+        try:
+            result = reingest._reparse_document(raw, "test-scraper", self._doc_meta())
+            # normalize_motion_type returns None for unmappable values
+            assert result["motion_type"] is None
+        finally:
+            reingest._SCRAPER_REGISTRY.pop("test-scraper", None)
+
+    @patch.object(reingest, "_load_scraper_registry")
+    def test_none_motion_type_stays_none(
+        self,
+        mock_registry: MagicMock,
+    ) -> None:
+        """A scraper returning None motion_type keeps it as None."""
+        raw = b"<html>ruling</html>"
+        mock_scraper_cls = MagicMock()
+        mock_parsed = MagicMock()
+        mock_parsed.ruling_text = "The motion is granted."
+        mock_parsed.case_number = "24STCV12345"
+        mock_parsed.case_title = "Smith v. Jones"
+        mock_parsed.judge_name = "Judge Test"
+        mock_parsed.outcome = "granted"
+        mock_parsed.motion_type = None
+        mock_parsed.department = "1"
+        mock_parsed.parties = []
+        mock_parsed.hearing_date = None
+        mock_scraper_cls.return_value.parse_document.return_value = mock_parsed
+        reingest._SCRAPER_REGISTRY["test-scraper"] = mock_scraper_cls
+
+        try:
+            result = reingest._reparse_document(raw, "test-scraper", self._doc_meta())
+            assert result["motion_type"] is None
+        finally:
+            reingest._SCRAPER_REGISTRY.pop("test-scraper", None)
+
+
+# ---------------------------------------------------------------------------
 # reingest_batch tests — cursor pagination
 # ---------------------------------------------------------------------------
 
@@ -2269,6 +2409,86 @@ class TestReparseDocumentLLM:
 
     @patch.object(reingest, "_load_scraper_registry")
     @patch("reingest_from_s3.extract_fields_llm")
+    def test_llm_motion_type_normalized(
+        self,
+        mock_llm: MagicMock,
+        mock_registry: MagicMock,
+    ) -> None:
+        """LLM-provided title-case motion_type is normalized to snake_case (#1849)."""
+        from ingestion.llm_extract import LLMExtractionResult, LLMRulingResult
+
+        mock_llm.return_value = LLMExtractionResult(
+            judge_name="Jane Doe",
+            hearing_date=date(2026, 3, 5),
+            department="12",
+            case_count=1,
+            rulings=[
+                LLMRulingResult(
+                    case_number="24STCV99999",
+                    case_title="Doe v. Smith",
+                    outcome="granted",
+                    motion_type="Motion to Compel",  # title case from LLM
+                    parties=[],
+                )
+            ],
+        )
+
+        raw = b"<html>ruling text with motion is granted</html>"
+        client = MagicMock()
+        result = reingest._reparse_document(
+            raw, "unknown-scraper", self._doc_meta(), llm_client=client
+        )
+
+        assert result["motion_type"] == "motion_to_compel"
+        assert result["extraction_methods"]["motion_type"] == "llm"
+
+    @patch.object(reingest, "_load_scraper_registry")
+    @patch("reingest_from_s3.extract_fields_llm")
+    def test_llm_unmappable_motion_type_not_stored(
+        self,
+        mock_llm: MagicMock,
+        mock_registry: MagicMock,
+    ) -> None:
+        """LLM-provided unmappable motion_type is not stored (#1849).
+
+        When normalize_motion_type returns None for an LLM value, the
+        motion_type field should remain unfilled so regex fallback can
+        attempt extraction from the ruling text.
+        """
+        from ingestion.llm_extract import LLMExtractionResult, LLMRulingResult
+
+        mock_llm.return_value = LLMExtractionResult(
+            judge_name="Jane Doe",
+            hearing_date=date(2026, 3, 5),
+            department="12",
+            case_count=1,
+            rulings=[
+                LLMRulingResult(
+                    case_number="24STCV99999",
+                    case_title="Doe v. Smith",
+                    outcome="granted",
+                    motion_type="Some Random Hearing Type",  # unmappable
+                    parties=[],
+                )
+            ],
+        )
+
+        raw = b"<html>ruling text with motion is granted</html>"
+        client = MagicMock()
+        result = reingest._reparse_document(
+            raw, "unknown-scraper", self._doc_meta(), llm_client=client
+        )
+
+        # normalize_motion_type returns None for unmappable values,
+        # so the field should not be set by the LLM path.
+        # It may still be filled by regex fallback from ruling text.
+        assert (
+            "motion_type" not in result.get("extraction_methods", {})
+            or result["extraction_methods"].get("motion_type") != "llm"
+        )
+
+    @patch.object(reingest, "_load_scraper_registry")
+    @patch("reingest_from_s3.extract_fields_llm")
     def test_llm_not_called_without_client(
         self,
         mock_llm: MagicMock,
@@ -4073,7 +4293,7 @@ class TestFullReparseDocument:
             assert result[0]["case_number"] == "CVPS2306157"
             assert result[0]["ruling_text"] == "Ruling 1 text"
             assert result[0]["case_title"] == "Yeldell V. Henss"
-            assert result[0]["motion_type"] == "Demurrer"
+            assert result[0]["motion_type"] == "demurrer"  # normalized (#1849)
             assert result[0]["outcome"] == "granted"
 
             # Second ruling
@@ -4335,7 +4555,7 @@ class TestFullReparseDocument:
             # First ruling: split-provided fields should NOT be overwritten
             assert result[0]["outcome"] == "granted"  # from split (normalized), not regex "denied"
             assert result[0]["case_title"] == "Yeldell V. Henss"
-            assert result[0]["motion_type"] == "Demurrer"
+            assert result[0]["motion_type"] == "demurrer"  # normalized (#1849)
             assert result[0]["extraction_methods"]["outcome"] == "split"
         finally:
             reingest._SPLIT_REGISTRY.pop("test-no-overwrite", None)
@@ -4457,7 +4677,7 @@ class TestReingestBatchFullReparse:
                 "case_title": "Yeldell v. Henss",
                 "judge_name": "Arthur Hester III",
                 "outcome": "granted",
-                "motion_type": "Demurrer",
+                "motion_type": "demurrer",  # normalized (#1849)
                 "department": "PS1",
                 "parties": [],
                 "hearing_date": _HEARING_DATE,
@@ -4473,7 +4693,7 @@ class TestReingestBatchFullReparse:
                 "case_title": "Crump v. Irwin",
                 "judge_name": "Arthur Hester III",
                 "outcome": "denied",
-                "motion_type": "Motion to Compel",
+                "motion_type": "motion_to_compel",  # normalized (#1849)
                 "department": "PS1",
                 "parties": [],
                 "hearing_date": _HEARING_DATE,
@@ -4665,7 +4885,7 @@ class TestReingestBatchFullReparse:
                 "case_title": None,
                 "judge_name": "Judge X",
                 "outcome": "granted",
-                "motion_type": "Demurrer",
+                "motion_type": "demurrer",  # normalized (#1849)
                 "department": "PS1",
                 "parties": [],
                 "hearing_date": _HEARING_DATE,
@@ -5269,7 +5489,7 @@ class TestReparseDocumentMultimodal:
                 "case_type": None,
                 "judge_name": "Judge Smith",
                 "outcome": "granted",
-                "motion_type": "Demurrer",
+                "motion_type": "demurrer",  # normalized (#1849)
                 "department": "D1",
                 "parties": [],
                 "hearing_date": date(2026, 3, 5),
