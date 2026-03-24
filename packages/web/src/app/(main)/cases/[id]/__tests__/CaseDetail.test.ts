@@ -43,7 +43,7 @@ describe('truncateText', () => {
     const text = 'The quick brown fox jumps over the lazy dog';
     const result = truncateText(text, 25);
     expect(result.length).toBeLessThanOrEqual(30); // max + ellipsis char
-    expect(result).toContain('\u2026');
+    expect(result).toContain('…');
   });
 
   it('returns original when length equals maxLen', () => {

@@ -173,7 +173,7 @@ export function CasesList() {
         <Input
           type="text"
           name="caseFilter"
-          placeholder="Case number or title\u2026"
+          placeholder="Case number or title…"
           value={caseNumberFilter}
           onChange={(e) => setCaseNumberFilter(e.target.value)}
           className="w-auto"
@@ -294,7 +294,7 @@ export function CasesList() {
               onClick={handleLoadMore}
               disabled={loading}
             >
-              {loading ? 'Loading\u2026' : 'Load more'}
+              {loading ? 'Loading…' : 'Load more'}
             </Button>
           </div>
         )}

@@ -490,7 +490,7 @@ export function CaseDetail({ caseId }: { caseId: string }) {
                               data-testid={`view-original-button-${node.id}`}
                             >
                               {viewerState.status === 'loading'
-                                ? 'Loading\u2026'
+                                ? 'Loading…'
                                 : viewerState.status === 'loaded'
                                   ? 'Hide original'
                                   : 'View original'}
@@ -548,7 +548,7 @@ export function CaseDetail({ caseId }: { caseId: string }) {
             onClick={handleLoadMore}
             disabled={rulingsLoading}
           >
-            {rulingsLoading ? 'Loading\u2026' : 'Load more'}
+            {rulingsLoading ? 'Loading…' : 'Load more'}
           </Button>
         </div>
       )}
