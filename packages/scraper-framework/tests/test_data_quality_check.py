@@ -379,6 +379,63 @@ class TestCheckIngestRates:
         assert len(alerts) == 1
         assert alerts[0].county == "Orange"
 
+    def test_zero_expected_daily_suppresses_ingest_rate_drop(self) -> None:
+        """No ingest_rate alert when expected_daily_rulings is zero (#1768).
+
+        Counties like San Diego with expected_daily_rulings=0 and
+        posting_days=[] have no active scraper. A small non-zero 7-day
+        average (from historical data) should NOT trigger an ingest rate
+        drop alert — same guard that zero_rulings already uses.
+        """
+        conn = FakeConnection(
+            {
+                # Small historical 7d count: 1 ruling over 6 days -> avg 0.17/day
+                "d.captured_at <": [("San Diego", 1)],
+                # 0 rulings in last 24h -> below 50% of 0.17, but expected is 0
+                "d.captured_at >=": [],
+                "DISTINCT ct.county": [("San Diego",)],
+            }
+        )
+        baselines = _make_baselines(
+            {
+                "San Diego": {
+                    "expected_daily_rulings": 0,
+                    "schedule_type": "daily",
+                    "posting_days": [],
+                },
+            }
+        )
+        alerts = check_ingest_rates(conn, NOW, baselines)
+        # Neither zero_rulings (expected_daily=0) nor ingest_rate should fire
+        assert len(alerts) == 0
+
+    def test_zero_expected_daily_with_nonzero_24h_no_alert(self) -> None:
+        """Ingest rate drop suppressed even with nonzero 24h count (#1768).
+
+        When expected_daily is 0 but there is some incidental activity
+        (nonzero 24h count that still falls below the 7d average), the
+        ingest_rate check should still be suppressed because the county
+        has no active scraper — any data is incidental.
+        """
+        conn = FakeConnection(
+            {
+                "d.captured_at <": [("San Diego", 18)],  # avg = 3/day
+                "d.captured_at >=": [("San Diego", 1)],  # 1 in 24h; 1 < 3*0.5
+                "DISTINCT ct.county": [("San Diego",)],
+            }
+        )
+        baselines = _make_baselines(
+            {
+                "San Diego": {
+                    "expected_daily_rulings": 0,
+                    "schedule_type": "daily",
+                    "posting_days": [],
+                },
+            }
+        )
+        alerts = check_ingest_rates(conn, NOW, baselines)
+        assert len(alerts) == 0
+
 
 class Test24hOverlapsPostingDay:
     """Tests for _24h_overlaps_posting_day helper."""
