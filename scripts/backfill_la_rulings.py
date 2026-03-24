@@ -56,8 +56,7 @@ from courts.ca.la_tentatives import (  # noqa: E402
     _split_cases_html,
 )
 from ingestion.db import (  # noqa: E402
-    insert_document,
-    insert_ruling,
+    insert_document_and_ruling,
     resolve_judge,
     upsert_case,
     upsert_case_judge,
@@ -359,11 +358,13 @@ def _create_split_ruling(
     # Upsert case
     case_id = upsert_case(conn, case_number, court_id, case_title=bag.case_title)
 
-    # Create a new document record
+    # Create document + ruling via shared helper (#1790).
+    # The helper guarantees the same document_id is passed to both
+    # insert_document and insert_ruling, preventing FK divergence (#1775).
     new_doc_id = str(uuid.uuid4())
     content_hash = hashlib.sha256(html.encode("utf-8")).hexdigest()
 
-    is_new = insert_document(
+    insert_document_and_ruling(
         conn,
         document_id=new_doc_id,
         case_id=case_id,
@@ -376,26 +377,12 @@ def _create_split_ruling(
         scraper_id=scraper_id,
         captured_at=captured_at or datetime.now(UTC),
         hearing_date=hearing_date,
+        ruling_text=cleaned_text,
+        department=department,
+        judge_id=judge_id,
+        outcome=outcome,
+        motion_type=motion_type,
     )
-
-    if not is_new:
-        logger.debug("Document %s already exists — skipping ruling insert", new_doc_id)
-        return
-
-    # Insert ruling
-    if hearing_date is not None:
-        insert_ruling(
-            conn,
-            document_id=new_doc_id,
-            case_id=case_id,
-            court_id=court_id,
-            hearing_date=hearing_date,
-            ruling_text=cleaned_text,
-            department=department,
-            judge_id=judge_id,
-            outcome=outcome,
-            motion_type=motion_type,
-        )
 
     # Link judge to case
     if judge_id:

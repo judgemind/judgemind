@@ -223,8 +223,7 @@ class TestProcessRuling:
         # Case judge link should have been created
         mock_cj.assert_called_once()
 
-    @patch("backfill_la_rulings.insert_ruling")
-    @patch("backfill_la_rulings.insert_document")
+    @patch("backfill_la_rulings.insert_document_and_ruling")
     @patch("backfill_la_rulings.upsert_case")
     @patch("backfill_la_rulings.upsert_case_party")
     @patch("backfill_la_rulings.upsert_party")
@@ -239,15 +238,14 @@ class TestProcessRuling:
         mock_up: MagicMock,
         mock_ucp: MagicMock,
         mock_upsert_case: MagicMock,
-        mock_insert_doc: MagicMock,
-        mock_insert_ruling: MagicMock,
+        mock_insert_doc_and_ruling: MagicMock,
     ) -> None:
         """Multi-case ruling creates new records for additional cases."""
         mock_fetch.return_value = MULTI_CASE_HTML.encode("utf-8")
         mock_resolve.return_value = "judge-uuid-123"
         mock_up.return_value = "party-uuid-456"
         mock_upsert_case.return_value = str(uuid.uuid4())
-        mock_insert_doc.return_value = True  # new document
+        mock_insert_doc_and_ruling.return_value = True  # new document
 
         conn = MagicMock()
         cur = MagicMock()
@@ -280,11 +278,14 @@ class TestProcessRuling:
         # upsert_case called for the split-out case
         mock_upsert_case.assert_called_once()
 
-        # insert_document called for the new split document
-        mock_insert_doc.assert_called_once()
+        # insert_document_and_ruling called for the new split document+ruling
+        mock_insert_doc_and_ruling.assert_called_once()
 
-        # insert_ruling called for the new split ruling
-        mock_insert_ruling.assert_called_once()
+        # Verify the helper received both document and ruling fields
+        call_kwargs = mock_insert_doc_and_ruling.call_args
+        assert call_kwargs.kwargs["content_format"] == "html"
+        assert call_kwargs.kwargs["hearing_date"] == _HEARING_DATE
+        assert call_kwargs.kwargs["ruling_text"] is not None
 
     @patch("backfill_la_rulings.fetch_s3_content")
     def test_s3_fetch_failure_skips(self, mock_fetch: MagicMock) -> None:
