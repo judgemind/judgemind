@@ -48,7 +48,7 @@ _check_duplicate = dqc._check_duplicate
 _file_single_issue = dqc._file_single_issue
 _24h_overlaps_posting_day = dqc._24h_overlaps_posting_day
 _count_posting_days_in_window = dqc._count_posting_days_in_window
-_compute_median_daily = dqc._compute_median_daily
+_compute_baseline_daily = dqc._compute_baseline_daily
 MIN_FIELD_CHECK_SAMPLE_SIZE = dqc.MIN_FIELD_CHECK_SAMPLE_SIZE
 FIELD_COMPLETENESS_GRACE_MINUTES = dqc.FIELD_COMPLETENESS_GRACE_MINUTES
 FIELD_COMPLETENESS_WINDOW_DAYS = dqc.FIELD_COMPLETENESS_WINDOW_DAYS
@@ -393,15 +393,16 @@ class TestLoadBaselines:
 class TestCheckIngestRates:
     """Tests for check_ingest_rates function.
 
-    Since #1771, check_ingest_rates uses a per-day query and computes the
-    **median** daily count (not the mean) for the 7-day baseline.  Test
-    data uses ``"AT TIME ZONE"`` as the FakeConnection key for the
-    per-day query, with (county, date_str, count) tuples.
+    Since #1866, check_ingest_rates uses the **25th percentile** (lower
+    quartile) of per-day counts for the 7-day baseline, making it robust
+    to backfill spikes.  Test data uses ``"AT TIME ZONE"`` as the
+    FakeConnection key for the per-day query, with (county, date_str,
+    count) tuples.
     """
 
     def test_healthy_county_no_alerts(self) -> None:
-        """No alerts when 24h count is above 50% of 7-day median."""
-        # Uniform 200 across 6 days -> median ~33/day.  30 >= 33*0.5 = 16.5.
+        """No alerts when 24h count is above 50% of 7-day baseline."""
+        # Uniform 200 across 6 days -> Q1 ~33/day.  30 >= 33*0.5 = 16.5.
         conn = FakeConnection(
             {
                 "AT TIME ZONE": _uniform_per_day_rows("Los Angeles", 200, NOW),
@@ -431,8 +432,8 @@ class TestCheckIngestRates:
         assert alerts[0].actual == 0
 
     def test_ingest_rate_drop_p2_alert(self) -> None:
-        """P2 alert when 24h count is below 50% of 7-day median."""
-        # Uniform 200 across 6 days -> median ~33/day.  5 < 33*0.5 = 16.5.
+        """P2 alert when 24h count is below 50% of 7-day baseline."""
+        # Uniform 200 across 6 days -> Q1 ~33/day.  5 < 33*0.5 = 16.5.
         conn = FakeConnection(
             {
                 "AT TIME ZONE": _uniform_per_day_rows("Los Angeles", 200, NOW),
@@ -462,8 +463,8 @@ class TestCheckIngestRates:
         assert len(alerts) == 1
         assert alerts[0].county == "Orange"
 
-    def test_no_baseline_uses_median(self) -> None:
-        """Uses 7-day median when no baseline exists for the county."""
+    def test_no_baseline_uses_computed_baseline(self) -> None:
+        """Uses 7-day computed baseline when no config exists for the county."""
         conn = FakeConnection(
             {
                 "AT TIME ZONE": _uniform_per_day_rows("Unknown County", 100, NOW),
@@ -471,7 +472,7 @@ class TestCheckIngestRates:
                 "DISTINCT ct.county": [("Unknown County",)],
             }
         )
-        # No baselines for "Unknown County" — should use daily median from 7d
+        # No baselines for "Unknown County" — should use daily baseline from 7d
         alerts = check_ingest_rates(conn, NOW, {})
         assert len(alerts) == 1
         assert alerts[0].metric == "zero_rulings"
@@ -489,7 +490,7 @@ class TestCheckIngestRates:
         )
         baselines = _make_baselines()
         alerts = check_ingest_rates(conn, NOW, baselines)
-        # LA is healthy (30 vs ~33 median), Orange has zero -> 1 alert
+        # LA is healthy (30 vs ~33 baseline), Orange has zero -> 1 alert
         assert len(alerts) == 1
         assert alerts[0].county == "Orange"
 
@@ -498,10 +499,10 @@ class TestCheckIngestRates:
 
         Counties like San Diego with expected_daily_rulings=0 and
         posting_days=[] have no active scraper. A small non-zero 7-day
-        median (from historical data) should NOT trigger an ingest rate
+        baseline (from historical data) should NOT trigger an ingest rate
         drop alert — same guard that zero_rulings already uses.
         """
-        # 1 ruling on one day -> median = 0 (most days have 0)
+        # 1 ruling on one day -> baseline = 0 (most days have 0)
         conn = FakeConnection(
             {
                 "AT TIME ZONE": _make_per_day_rows("San Diego", [1, 0, 0, 0, 0, 0], NOW),
@@ -526,7 +527,7 @@ class TestCheckIngestRates:
         """Ingest rate drop suppressed even with nonzero 24h count (#1768).
 
         When expected_daily is 0 but there is some incidental activity
-        (nonzero 24h count that still falls below the 7d median), the
+        (nonzero 24h count that still falls below the 7d baseline), the
         ingest_rate check should still be suppressed because the county
         has no active scraper — any data is incidental.
         """
@@ -888,14 +889,14 @@ class TestCheckIngestRatesPostingDays:
         """Ingest rate drop alert still fires on a posting day (weekday).
 
         On a posting day (e.g. Wednesday), if 24h count drops below 50% of the
-        7-day median, the alert should fire because courts are expected to
+        7-day baseline, the alert should fire because courts are expected to
         publish new rulings.
         """
         wednesday = datetime(2026, 3, 18, 12, 0, 0, tzinfo=UTC)
         conn = FakeConnection(
             {
                 "AT TIME ZONE": _uniform_per_day_rows("Los Angeles", 1200, wednesday),
-                # 5 rulings in 24h — well below 50% of ~200/day median
+                # 5 rulings in 24h — well below 50% of ~200/day baseline
                 "d.captured_at >=": [("Los Angeles", 5)],
                 "DISTINCT ct.county": [("Los Angeles",)],
             }
@@ -921,7 +922,7 @@ class TestCheckIngestRatesPostingDays:
         conn = FakeConnection(
             {
                 "AT TIME ZONE": _uniform_per_day_rows("Los Angeles", 1200, sunday),
-                # 5 rulings in 24h — well below 50% of ~200/day median
+                # 5 rulings in 24h — well below 50% of ~200/day baseline
                 "d.captured_at >=": [("Los Angeles", 5)],
                 "DISTINCT ct.county": [("Los Angeles",)],
             }
@@ -941,24 +942,24 @@ class TestCheckIngestRatesPostingDays:
         assert alerts[0].severity == "p2"
 
 
-class TestPostingDayAwareMedian:
-    """Tests that the 7-day median uses posting days, not calendar days.
+class TestPostingDayAwareBaseline:
+    """Tests that the 7-day baseline uses posting days, not calendar days.
 
-    Since #1771, check_ingest_rates uses the median of per-day counts.
-    For counties with posting_days, only posting days contribute to the
-    median calculation.
+    Since #1866, check_ingest_rates uses the 25th percentile of per-day
+    counts.  For counties with posting_days, only posting days contribute
+    to the baseline calculation.
 
     Fixes #1784: for a Mon-Fri county, the 7-day baseline should account
     for posting days to avoid being artificially deflated by weekends.
     """
 
-    def test_mon_fri_county_median_uses_posting_days(self) -> None:
-        """For a Mon-Fri county, 7d median uses only posting days.
+    def test_mon_fri_county_baseline_uses_posting_days(self) -> None:
+        """For a Mon-Fri county, 7d baseline uses only posting days.
 
         Window [now-7d, now-24h) on Wednesday 2026-03-18 = Wed-Mon = 6 cal days.
         Days: Wed 3/11(post), Thu 3/12(post), Fri 3/13(post),
               Sat 3/14(skip), Sun 3/15(skip), Mon 3/16(post) = 4 posting days.
-        50 rulings per posting day -> median = 50.  45 >= 50*0.5 = 25. No alert.
+        50 rulings per posting day -> Q1 = 50.  45 >= 50*0.5 = 25. No alert.
         """
         wednesday = datetime(2026, 3, 18, 12, 0, 0, tzinfo=UTC)
         conn = FakeConnection(
@@ -985,10 +986,10 @@ class TestPostingDayAwareMedian:
         alerts = check_ingest_rates(conn, wednesday, baselines)
         assert len(alerts) == 0
 
-    def test_mon_fri_county_detects_real_drop_with_accurate_median(self) -> None:
-        """A real drop is detected against the posting-day-aware median.
+    def test_mon_fri_county_detects_real_drop_with_accurate_baseline(self) -> None:
+        """A real drop is detected against the posting-day-aware baseline.
 
-        50 rulings per posting day -> median = 50.
+        50 rulings per posting day -> Q1 = 50.
         20 < 50 * 0.5 = 25 -> alert fires.
         """
         wednesday = datetime(2026, 3, 18, 12, 0, 0, tzinfo=UTC)
@@ -1019,9 +1020,9 @@ class TestPostingDayAwareMedian:
         assert alerts[0].expected == 50.0
 
     def test_no_posting_days_uses_all_calendar_days(self) -> None:
-        """Without posting_days config, median uses all calendar days."""
+        """Without posting_days config, baseline uses all calendar days."""
         wednesday = datetime(2026, 3, 18, 12, 0, 0, tzinfo=UTC)
-        # 20 per day across all 6 days -> median = 20
+        # 20 per day across all 6 days -> Q1 = 20
         conn = FakeConnection(
             {
                 "AT TIME ZONE": _uniform_per_day_rows("TestCounty", 120, wednesday),
@@ -1038,17 +1039,18 @@ class TestPostingDayAwareMedian:
             }
         )
         alerts = check_ingest_rates(conn, wednesday, baselines)
-        # median = 20. 5 < 20 * 0.5 = 10. Alert fires.
+        # Q1 = 20. 5 < 20 * 0.5 = 10. Alert fires.
         assert len(alerts) == 1
         assert alerts[0].expected == 20.0
 
-    def test_tue_thu_county_median(self) -> None:
-        """A Tue/Thu-only posting county gets correct posting-day median.
+    def test_tue_thu_county_baseline(self) -> None:
+        """A Tue/Thu-only posting county uses min fallback for small samples.
 
         On Thursday 2026-03-19, the 6-day window [Thu 3/12 - Tue 3/17]
         contains 2 posting days (Thu 3/12, Tue 3/17).  50 rulings on Tue ->
-        posting-day values [0, 50] -> median = 25.  45 >= 25*0.5 = 12.5.
-        No alert.
+        posting-day values [0, 50] -> only 2 values, falls back to min = 0.
+        daily_baseline = 0, so ingest_rate condition (daily_baseline > 0)
+        is False -> no ingest_rate alert.  45 > 0 so no zero_rulings either.
         """
         thursday = datetime(2026, 3, 19, 12, 0, 0, tzinfo=UTC)
         conn = FakeConnection(
@@ -1100,25 +1102,26 @@ class TestPostingDayAwareMedian:
 class TestBackfillSpikeResilience:
     """Tests that ingest rate checks are resilient to backfill spikes.
 
-    Since #1771, the ingest rate check uses the **median** of per-day counts
-    rather than the mean.  A single-day spike from a bulk re-ingest does not
-    inflate the median, preventing false-positive drop alerts.
+    Since #1866, the ingest rate check uses the **25th percentile** of
+    per-day counts.  A single-day spike (or even multiple spike days) from
+    a bulk re-ingest does not inflate the baseline, preventing false-positive
+    drop alerts.
 
     Also verifies the fix for #1693: queries use ``captured_at`` (court
     posting time) rather than ``created_at`` (pipeline processing time).
     """
 
-    def test_backfill_spike_does_not_inflate_median(self) -> None:
+    def test_backfill_spike_does_not_inflate_baseline(self) -> None:
         """Normal 24h count should not trigger alert even after a backfill.
 
         Scenario: OC had a backfill that created 274 docs on one day.
-        With median-based baseline, the spike day is an outlier that
+        With 25th-percentile baseline, the spike day is an outlier that
         doesn't inflate the baseline.  Normal days have ~20 rulings.
         """
         wednesday = datetime(2026, 3, 18, 12, 0, 0, tzinfo=UTC)
         # Window: Wed-Mon.  Posting days: Wed, Thu, Fri, Mon (4 days).
         # Normal: 20/day on 3 days, spike: 274 on 1 day.
-        # Daily counts on posting days: [20, 20, 20, 274] -> median = 20.
+        # Daily counts on posting days: [20, 20, 20, 274] -> Q1 = 20.
         conn = FakeConnection(
             {
                 "AT TIME ZONE": _make_per_day_rows(
@@ -1141,16 +1144,16 @@ class TestBackfillSpikeResilience:
             }
         )
         alerts = check_ingest_rates(conn, wednesday, baselines)
-        # Median of [20, 20, 20, 274] = 20. 18 >= 20*0.5 = 10. No alert.
+        # Q1 of [20, 20, 20, 274] = 20. 18 >= 20*0.5 = 10. No alert.
         assert len(alerts) == 0
 
-    def test_spike_inflated_mean_would_have_fired_but_median_does_not(self) -> None:
-        """Exact scenario from #1771: OC 274-doc spike inflates mean, not median.
+    def test_spike_inflated_mean_would_have_fired_but_baseline_does_not(self) -> None:
+        """OC 274-doc spike inflates mean, not 25th percentile baseline.
 
         On 2026-03-20, 274 OC documents were re-ingested. On 2026-03-23,
         7 rulings appeared. With the old mean: (274+7*5)/6 = 51.5/day,
-        threshold = 25.75, 7 < 25.75 -> false positive. With median:
-        per-day counts [7,7,7,7,7,274] -> median = 7, 7 >= 7*0.5 = 3.5 -> no alert.
+        threshold = 25.75, 7 < 25.75 -> false positive. With 25th percentile:
+        per-day counts [7,7,274,7,7] -> Q1 = 7, 7 >= 7*0.5 = 3.5 -> no alert.
         """
         # 2026-03-23 is a Sunday, but let's test on a posting day for
         # the ingest_rate check to fire (posting day suppression is tested
@@ -1179,8 +1182,8 @@ class TestBackfillSpikeResilience:
             }
         )
         alerts = check_ingest_rates(conn, monday, baselines)
-        # Posting-day values: [7, 7, 274, 7, 7] -> median = 7.
-        # 7 >= 7 * 0.5 = 3.5 -> no alert. The spike does NOT inflate the median.
+        # Posting-day values: [7, 7, 274, 7, 7] -> Q1 = 7.
+        # 7 >= 7 * 0.5 = 3.5 -> no alert. The spike does NOT inflate the baseline.
         assert len(alerts) == 0
 
     def test_genuine_scraper_failure_still_detected(self) -> None:
@@ -1247,11 +1250,16 @@ class TestBackfillSpikeResilience:
         assert "d.created_at" not in dqc.RULING_COUNTS_7D_PER_DAY_QUERY
 
 
-class TestComputeMedianDaily:
-    """Tests for _compute_median_daily helper function."""
+class TestComputeBaselineDaily:
+    """Tests for _compute_baseline_daily helper function.
+
+    Uses the 25th percentile (lower quartile) for >= 4 data points,
+    and falls back to min() for < 4 data points.  This makes the
+    baseline more resistant to backfill spikes than the median (#1866).
+    """
 
     def test_uniform_distribution(self) -> None:
-        """Median of uniform counts equals each day's count."""
+        """25th percentile of uniform counts equals each day's count."""
         window_start = datetime(2026, 3, 4, 12, 0, 0, tzinfo=UTC)
         window_end = datetime(2026, 3, 10, 12, 0, 0, tzinfo=UTC)
         per_day = {
@@ -1262,11 +1270,11 @@ class TestComputeMedianDaily:
             "2026-03-08": 20,
             "2026-03-09": 20,
         }
-        result = _compute_median_daily(per_day, None, window_start, window_end)
+        result = _compute_baseline_daily(per_day, None, window_start, window_end)
         assert result == 20.0
 
-    def test_spike_day_does_not_skew_median(self) -> None:
-        """A single spike day does not inflate the median."""
+    def test_spike_day_does_not_skew_baseline(self) -> None:
+        """A single spike day does not inflate the 25th percentile."""
         window_start = datetime(2026, 3, 4, 12, 0, 0, tzinfo=UTC)
         window_end = datetime(2026, 3, 10, 12, 0, 0, tzinfo=UTC)
         per_day = {
@@ -1277,12 +1285,32 @@ class TestComputeMedianDaily:
             "2026-03-08": 20,
             "2026-03-09": 20,
         }
-        result = _compute_median_daily(per_day, None, window_start, window_end)
-        # Sorted: [20, 20, 20, 20, 20, 274] -> median = (20+20)/2 = 20.0
+        result = _compute_baseline_daily(per_day, None, window_start, window_end)
+        # Sorted: [20, 20, 20, 20, 20, 274] -> Q1 = 20.0
+        assert result == 20.0
+
+    def test_multiple_spike_days_do_not_inflate_baseline(self) -> None:
+        """Multiple spike days still don't inflate the 25th percentile (#1866).
+
+        This is the key improvement over the median: even with 2 spike days
+        out of 6, the 25th percentile stays at the normal rate.
+        """
+        window_start = datetime(2026, 3, 4, 12, 0, 0, tzinfo=UTC)
+        window_end = datetime(2026, 3, 10, 12, 0, 0, tzinfo=UTC)
+        per_day = {
+            "2026-03-04": 20,
+            "2026-03-05": 828,  # backfill spike
+            "2026-03-06": 20,
+            "2026-03-07": 866,  # backfill spike
+            "2026-03-08": 20,
+            "2026-03-09": 20,
+        }
+        result = _compute_baseline_daily(per_day, None, window_start, window_end)
+        # Sorted: [20, 20, 20, 20, 828, 866] -> Q1 = 20.0
         assert result == 20.0
 
     def test_posting_days_filter(self) -> None:
-        """Only posting days contribute to the median."""
+        """Only posting days contribute to the baseline."""
         # Window: Wed 3/4 - Mon 3/10, posting days Mon-Fri
         # Days: Wed(post), Thu(post), Fri(post), Sat(skip), Sun(skip), Mon(post)
         window_start = datetime(2026, 3, 4, 12, 0, 0, tzinfo=UTC)  # Wed
@@ -1296,40 +1324,81 @@ class TestComputeMedianDaily:
             "2026-03-09": 50,  # Mon
         }
         posting_days = ["Mon", "Tue", "Wed", "Thu", "Fri"]
-        result = _compute_median_daily(per_day, posting_days, window_start, window_end)
-        # Posting-day values: [50, 50, 50, 50] -> median = 50.0
+        result = _compute_baseline_daily(per_day, posting_days, window_start, window_end)
+        # Posting-day values: [50, 50, 50, 50] -> Q1 = 50.0
         assert result == 50.0
 
     def test_missing_days_filled_with_zero(self) -> None:
-        """Days with no data count as zero in the median."""
+        """Days with no data count as zero in the baseline."""
         window_start = datetime(2026, 3, 4, 12, 0, 0, tzinfo=UTC)
         window_end = datetime(2026, 3, 10, 12, 0, 0, tzinfo=UTC)
         per_day = {
             "2026-03-04": 50,
         }
-        result = _compute_median_daily(per_day, None, window_start, window_end)
-        # Values: [50, 0, 0, 0, 0, 0] -> sorted: [0,0,0,0,0,50] -> median = 0
+        result = _compute_baseline_daily(per_day, None, window_start, window_end)
+        # Values: [50, 0, 0, 0, 0, 0] -> sorted: [0,0,0,0,0,50] -> Q1 = 0.0
         assert result == 0.0
 
     def test_empty_window_returns_zero(self) -> None:
         """Empty or zero-width window returns 0."""
         t = datetime(2026, 3, 4, 12, 0, 0, tzinfo=UTC)
-        result = _compute_median_daily({}, None, t, t)
+        result = _compute_baseline_daily({}, None, t, t)
         assert result == 0.0
 
-    def test_single_posting_day_in_window(self) -> None:
-        """With only one posting day in the window, median equals that day's count."""
+    def test_small_sample_falls_back_to_min(self) -> None:
+        """With fewer than 4 posting days, falls back to min value."""
         window_start = datetime(2026, 3, 14, 12, 0, 0, tzinfo=UTC)  # Sat
         window_end = datetime(2026, 3, 20, 12, 0, 0, tzinfo=UTC)  # Fri (excl)
-        # Only Tue 3/17 is a posting day in [Sat-Thu]
         per_day = {
-            "2026-03-17": 42,
+            "2026-03-17": 42,  # Tue
         }
-        result = _compute_median_daily(per_day, ["Tue", "Thu"], window_start, window_end)
-        # Posting days in window: Tue(42), Thu(0) -> median = 21.0
-        # Actually: Sat 3/14, Sun 3/15, Mon 3/16, Tue 3/17, Wed 3/18, Thu 3/19
-        # Tue and Thu are posting days. Tue=42, Thu=0 -> median = (0+42)/2 = 21.0
-        assert result == 21.0
+        result = _compute_baseline_daily(per_day, ["Tue", "Thu"], window_start, window_end)
+        # Posting days in window: Tue(42), Thu(0) -> only 2 values, < 4
+        # Falls back to min([42, 0]) = 0.0
+        assert result == 0.0
+
+    def test_three_posting_days_falls_back_to_min(self) -> None:
+        """With exactly 3 posting days, still falls back to min value."""
+        # Window: Wed 3/4 - Sat 3/7 (3 days), posting days Mon-Fri
+        window_start = datetime(2026, 3, 5, 12, 0, 0, tzinfo=UTC)  # Thu
+        window_end = datetime(2026, 3, 8, 12, 0, 0, tzinfo=UTC)  # Sun (excl)
+        per_day = {
+            "2026-03-05": 30,  # Thu
+            "2026-03-06": 25,  # Fri
+            "2026-03-07": 0,  # Sat (skipped)
+        }
+        posting_days = ["Mon", "Tue", "Wed", "Thu", "Fri"]
+        result = _compute_baseline_daily(per_day, posting_days, window_start, window_end)
+        # Posting days: Thu(30), Fri(25) -> only 2 values, < 4
+        # Falls back to min([30, 25]) = 25.0
+        assert result == 25.0
+
+    def test_exact_issue_1866_scenario_oc(self) -> None:
+        """Exact scenario from #1866: OC 866-doc backfill spike.
+
+        On 2026-03-23, OC had 7 rulings in 24h. The 7-day window had a
+        866-ruling backfill day. With median, the baseline was 36/day
+        (inflated). With 25th percentile, the baseline stays near the
+        normal 20/day rate.
+        """
+        # 2026-03-23 is Sunday. Window: [3/16 Mon - 3/22 Sun)
+        # 3/16 is Monday. Posting days Mon-Fri:
+        # Mon 3/16, Tue 3/17, Wed 3/18, Thu 3/19, Fri 3/20 = 5 posting days
+        monday = datetime(2026, 3, 23, 12, 0, 0, tzinfo=UTC)
+        window_start = monday - timedelta(days=7)  # 3/16 Mon
+        window_end = monday - timedelta(days=1)  # 3/22 Sun
+        per_day = {
+            "2026-03-16": 20,  # Mon - normal
+            "2026-03-17": 20,  # Tue - normal
+            "2026-03-18": 20,  # Wed - normal
+            "2026-03-19": 866,  # Thu - backfill spike
+            "2026-03-20": 20,  # Fri - normal
+        }
+        posting_days = ["Mon", "Tue", "Wed", "Thu", "Fri"]
+        result = _compute_baseline_daily(per_day, posting_days, window_start, window_end)
+        # Posting-day values: [20, 20, 20, 866, 20]
+        # Sorted: [20, 20, 20, 20, 866] -> Q1 = 20.0
+        assert result == 20.0
 
 
 class TestCheckScraperStaleness:
@@ -1818,7 +1887,7 @@ _P2_ALERT = Alert(
     severity="p2",
     expected=20.0,
     actual=5,
-    message="Orange: 5 rulings in 24h, 7-day median is 20.0/day (>50% drop)",
+    message="Orange: 5 rulings in 24h, 7-day baseline is 20.0/day (>50% drop)",
 )
 
 _STALE_ALERT = Alert(
@@ -3279,20 +3348,21 @@ class TestCollectFullMetrics:
         m = result["Orange"]["ruling_count_7d_avg"]
         assert m["value"] == round(120 / 6.0, 2)  # No baselines = calendar days
         assert m["metadata"]["total_7d_window"] == 120
-        # Median should also be present in metadata.
-        assert "median_7d" in m["metadata"]
-        assert m["metadata"]["median_7d"] == 20.0
+        # Baseline (25th percentile) should also be present in metadata.
+        assert "baseline_7d" in m["metadata"]
+        assert m["metadata"]["baseline_7d"] == 20.0
 
     def test_collects_ruling_count_7d_avg_with_posting_days(self) -> None:
         """7d average uses posting days when baselines are provided (#1784)."""
         # NOW is 2026-03-11 12:00 (Wednesday).
         # 7d window = [Mar 4 12:00, Mar 10 12:00) = 6 calendar days.
-        # Days: Tue Mar 4, Wed Mar 5, Thu Mar 6, Fri Mar 7, Sat Mar 8, Sun Mar 9
-        # Mon-Fri posting days in window: Tue, Wed, Thu, Fri = 4
+        # Days: Wed Mar 4, Thu Mar 5, Fri Mar 6, Sat Mar 7, Sun Mar 8, Mon Mar 9
+        # Mon-Fri posting days in window: Wed, Thu, Fri, Mon = 4
         conn = FakeConnection(
             {
-                # Per-day: 30/day on posting days, 0 on weekends
-                "AT TIME ZONE": _make_per_day_rows("Orange", [30, 30, 30, 30, 0, 0], NOW),
+                # Per-day: 30/day on posting days (Wed-Fri + Mon), 0 on weekends
+                # Indices: Wed=30, Thu=30, Fri=30, Sat=0, Sun=0, Mon=30
+                "AT TIME ZONE": _make_per_day_rows("Orange", [30, 30, 30, 0, 0, 30], NOW),
                 "captured_at < %s": [("Orange", 120)],
                 "AS ruling_count": [],
                 "d.document_type": [],
@@ -3318,7 +3388,8 @@ class TestCollectFullMetrics:
         assert m["value"] == 30.0
         assert m["metadata"]["total_7d_window"] == 120
         assert m["metadata"]["window_days"] == 4.0
-        assert m["metadata"]["median_7d"] == 30.0
+        # Posting-day values: [30, 30, 30, 30] -> Q1 = 30.0
+        assert m["metadata"]["baseline_7d"] == 30.0
 
     def test_collects_field_completeness_metrics(self) -> None:
         """Collects overall and per-field completeness metrics."""

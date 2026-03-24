@@ -896,18 +896,29 @@ def _count_posting_days_in_window(
     return max(float(count), 1.0)
 
 
-def _compute_median_daily(
+def _compute_baseline_daily(
     per_day_counts: dict[str, int],
     posting_days: list[str] | None,
     window_start: datetime,
     window_end: datetime,
 ) -> float:
-    """Compute the median daily ruling count over a date window.
+    """Compute a spike-resistant daily baseline for ingest rate comparison.
 
-    Fills in zero-count days for dates with no rulings so that the median
+    Uses the **25th percentile** (lower quartile) of per-day ruling counts
+    over the window.  The 25th percentile is more robust to backfill spikes
+    than the median: even if 50% of days in the window have inflated counts
+    (e.g. from bulk re-ingests), the 25th percentile stays near the normal
+    daily rate.  This directly addresses the false-positive alerts described
+    in #1866 where a single 800+ ruling backfill day inflated the median.
+
+    Fills in zero-count days for dates with no rulings so that the percentile
     correctly accounts for inactive days.  For counties with *posting_days*,
     only posting days are included (non-posting days are expected to be zero
     and should not dilute the baseline).
+
+    For small samples (fewer than 4 posting days in the window), falls back
+    to the minimum value — the most conservative approach to prevent false
+    positives when there are very few data points.
 
     Args:
         per_day_counts: Mapping of ISO date string (``YYYY-MM-DD``) to
@@ -918,8 +929,8 @@ def _compute_median_daily(
         window_end: End of the window (exclusive).
 
     Returns:
-        Median daily ruling count.  Returns 0.0 when no relevant days
-        exist in the window.
+        25th percentile daily ruling count (or minimum for small samples).
+        Returns 0.0 when no relevant days exist in the window.
     """
     total_days = (window_end - window_start).days
     if total_days <= 0:
@@ -947,7 +958,17 @@ def _compute_median_daily(
     if not daily_values:
         return 0.0
 
-    return float(statistics.median(daily_values))
+    # For small samples (< 4 values), statistics.quantiles requires at
+    # least 2 data points with n=4 method, but produces unreliable
+    # percentiles.  Fall back to the minimum which is the most
+    # conservative baseline (least likely to cause false positives).
+    if len(daily_values) < 4:
+        return float(min(daily_values))
+
+    # statistics.quantiles(data, n=4) returns [Q1, Q2, Q3].
+    # Q1 (25th percentile) is index 0.
+    quartiles = statistics.quantiles(daily_values, n=4)
+    return float(quartiles[0])
 
 
 def check_ingest_rates(
@@ -956,12 +977,13 @@ def check_ingest_rates(
     baselines: dict[str, Baselines],
     county: str | None = None,
 ) -> list[Alert]:
-    """Check ruling ingest rates against 7-day median baseline.
+    """Check ruling ingest rates against 7-day 25th-percentile baseline.
 
-    Uses the **median** of per-day ruling counts over the 7-day window
-    rather than the mean.  The median is naturally resistant to single-day
-    spikes caused by bulk re-ingests (#1771), while still detecting real
-    sustained drops in ingestion.
+    Uses the **25th percentile** (lower quartile) of per-day ruling counts
+    over the 7-day window.  The 25th percentile is more robust than the
+    median to backfill spikes (#1866): even if multiple days in the window
+    have inflated counts from bulk re-ingests, the 25th percentile stays
+    near the normal daily rate.
 
     Uses ``captured_at`` (when the court posted the ruling) rather than
     ``created_at`` (when the pipeline processed it) so that backfill or
@@ -994,8 +1016,8 @@ def check_ingest_rates(
             counts_24h[row[0]] = row[1]
 
     # Get 7-day per-day counts (excluding last 24h for the baseline).
-    # Returns (county, date, count) rows; used to compute the median
-    # per-day count which is resistant to single-day spikes (#1771).
+    # Returns (county, date, count) rows; used to compute the 25th
+    # percentile per-day count which is robust to backfill spikes (#1866).
     per_day_7d: dict[str, dict[str, int]] = {}
     with conn.cursor() as cur:
         cur.execute(
@@ -1027,17 +1049,17 @@ def check_ingest_rates(
         count_24h = counts_24h.get(county_name, 0)
         baseline = baselines.get(county_name)
 
-        # Compute the median of per-day counts over the 7-day window.
-        # The median is resistant to single-day spikes from bulk
-        # re-ingests (#1771).  For counties with posting_days, only
-        # posting days contribute to the median calculation.
+        # Compute the 25th percentile of per-day counts over the 7-day
+        # window.  The 25th percentile is robust to backfill spikes —
+        # even multiple spike days will not inflate the baseline (#1866).
+        # For counties with posting_days, only posting days contribute.
         posting_days = baseline.posting_days if baseline else None
         county_per_day = per_day_7d.get(county_name, {})
-        daily_median = _compute_median_daily(
+        daily_baseline = _compute_baseline_daily(
             county_per_day, posting_days, cutoff_7d, cutoff_24h
         )
 
-        expected_daily = baseline.expected_daily_rulings if baseline else daily_median
+        expected_daily = baseline.expected_daily_rulings if baseline else daily_baseline
 
         # Zero-ruling alert (critical).
         # Suppress on non-posting days: if the county has a posting_days
@@ -1064,8 +1086,8 @@ def check_ingest_rates(
         # (weekends) just like zero_rulings above.
         elif (
             expected_daily > 0
-            and daily_median > 0
-            and count_24h < daily_median * INGEST_DROP_THRESHOLD
+            and daily_baseline > 0
+            and count_24h < daily_baseline * INGEST_DROP_THRESHOLD
         ):
             if _24h_overlaps_posting_day(now, posting_days):
                 alerts.append(
@@ -1073,11 +1095,11 @@ def check_ingest_rates(
                         county=county_name,
                         metric="ingest_rate",
                         severity="p2",
-                        expected=round(daily_median, 1),
+                        expected=round(daily_baseline, 1),
                         actual=count_24h,
                         message=(
                             f"{county_name}: {count_24h} rulings in 24h, "
-                            f"7-day median is {daily_median:.1f}/day "
+                            f"7-day baseline is {daily_baseline:.1f}/day "
                             f"(>{INGEST_DROP_THRESHOLD * 100:.0f}% drop)"
                         ),
                     )
@@ -1329,8 +1351,8 @@ def _collect_full_metrics(
                 "by_doc_type": breakdown,
             }
 
-    # --- Ruling count 7d average (mean + median) ---
-    # First collect per-day counts for the median computation.
+    # --- Ruling count 7d average (mean + baseline) ---
+    # First collect per-day counts for the baseline computation.
     per_day_7d: dict[str, dict[str, int]] = {}
     with conn.cursor() as cur:
         cur.execute(
@@ -1365,8 +1387,8 @@ def _collect_full_metrics(
                 posting_days_cfg,
             )
             avg = round(total_7d / window_posting_days, 2)
-            median_val = round(
-                _compute_median_daily(
+            baseline_val = round(
+                _compute_baseline_daily(
                     per_day_7d.get(county_name, {}),
                     posting_days_cfg,
                     cutoff_7d,
@@ -1379,7 +1401,7 @@ def _collect_full_metrics(
                 "metadata": {
                     "total_7d_window": total_7d,
                     "window_days": window_posting_days,
-                    "median_7d": median_val,
+                    "baseline_7d": baseline_val,
                 },
             }
 
