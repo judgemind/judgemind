@@ -4514,6 +4514,95 @@ class TestSqlSchemaValidation:
 
 
 # ---------------------------------------------------------------------------
+# Timezone safety: DATE() calls must use explicit AT TIME ZONE (#1844)
+# ---------------------------------------------------------------------------
+
+
+class TestTimezoneExplicitness:
+    """Verify that SQL queries handle timezones correctly (#1844).
+
+    - Any DATE() call on a TIMESTAMPTZ column must include
+      ``AT TIME ZONE 'UTC'`` to avoid session-timezone dependence.
+    - Bare TIMESTAMPTZ comparisons (>=, <, <=) are inherently safe and
+      should NOT have ``AT TIME ZONE`` added.
+    """
+
+    def test_date_calls_have_explicit_timezone(self) -> None:
+        """Every DATE(column) in a query must use AT TIME ZONE 'UTC'."""
+        import re
+
+        queries = _get_all_query_constants()
+        violations: list[str] = []
+        # Match DATE(<anything>) that does NOT include "AT TIME ZONE"
+        # inside the parentheses.
+        pattern = re.compile(r"DATE\(([^)]+)\)", re.IGNORECASE)
+        for name, sql in queries.items():
+            for match in pattern.finditer(sql):
+                inner = match.group(1)
+                if "AT TIME ZONE" not in inner.upper():
+                    violations.append(f"{name}: DATE({inner}) missing AT TIME ZONE 'UTC'")
+        assert not violations, (
+            "DATE() calls on TIMESTAMPTZ columns must include "
+            "AT TIME ZONE 'UTC' to avoid session-timezone dependence:\n"
+            + "\n".join(f"  - {v}" for v in violations)
+        )
+
+    def test_no_bare_date_cast_on_timestamptz(self) -> None:
+        """No query should cast a timestamptz column to date via ::date."""
+        import re
+
+        queries = _get_all_query_constants()
+        violations: list[str] = []
+        # Match alias.column::date patterns (e.g. d.captured_at::date)
+        pattern = re.compile(r"\b\w+\.\w+::date\b", re.IGNORECASE)
+        for name, sql in queries.items():
+            for match in pattern.finditer(sql):
+                violations.append(f"{name}: {match.group(0)}")
+        assert not violations, (
+            "::date casts on TIMESTAMPTZ columns are session-timezone-dependent. "
+            "Use DATE(col AT TIME ZONE 'UTC') instead:\n"
+            + "\n".join(f"  - {v}" for v in violations)
+        )
+
+    def test_per_day_query_uses_explicit_utc(self) -> None:
+        """RULING_COUNTS_7D_PER_DAY_QUERY must use AT TIME ZONE 'UTC'."""
+        sql = dqc.RULING_COUNTS_7D_PER_DAY_QUERY
+        assert "AT TIME ZONE 'UTC'" in sql, (
+            "RULING_COUNTS_7D_PER_DAY_QUERY DATE() grouping must use "
+            "AT TIME ZONE 'UTC' for timezone-safe date conversion"
+        )
+
+    def test_safe_timestamptz_queries_do_not_use_at_time_zone(self) -> None:
+        """Queries with only timezone-safe TIMESTAMPTZ operations should NOT add AT TIME ZONE.
+
+        This includes comparisons (>=, <, <=), ordering (ORDER BY), and
+        aggregations/functions (MAX, GREATEST).  Adding AT TIME ZONE to
+        any of these would convert the column to timestamp-without-timezone,
+        changing the operation's semantics.  This test guards against
+        well-intentioned but incorrect 'fixes'.
+        """
+        # These queries use only timezone-safe timestamptz operations, not DATE().
+        safe_timestamptz_queries = [
+            ("RULING_COUNTS_24H_QUERY", dqc.RULING_COUNTS_24H_QUERY),
+            ("RULING_COUNTS_7D_QUERY", dqc.RULING_COUNTS_7D_QUERY),
+            ("SCRAPER_SUCCESS_RATE_24H_QUERY", dqc.SCRAPER_SUCCESS_RATE_24H_QUERY),
+            ("RULING_COUNT_BY_TYPE_QUERY", dqc.RULING_COUNT_BY_TYPE_QUERY),
+            ("FIELD_GAP_DOCS_QUERY", dqc.FIELD_GAP_DOCS_QUERY),
+            ("FIELD_COMPLETENESS_QUERY", dqc.FIELD_COMPLETENESS_QUERY),
+            ("ORPHANED_DOCUMENTS_QUERY", dqc.ORPHANED_DOCUMENTS_QUERY),
+            ("LATEST_SCRAPER_RUN_QUERY", dqc.LATEST_SCRAPER_RUN_QUERY),
+            ("LATEST_CAPTURE_PER_COUNTY_QUERY", dqc.LATEST_CAPTURE_PER_COUNTY_QUERY),
+        ]
+        for name, sql in safe_timestamptz_queries:
+            assert "AT TIME ZONE" not in sql, (
+                f"{name} uses only timezone-safe TIMESTAMPTZ operations which "
+                f"are inherently safe.  Do NOT add AT TIME ZONE — "
+                f"it converts the column to timestamp-without-timezone and "
+                f"changes the operation's semantics."
+            )
+
+
+# ---------------------------------------------------------------------------
 # Integration: staleness check prefers scraper_runs over captured_at (#894)
 # ---------------------------------------------------------------------------
 

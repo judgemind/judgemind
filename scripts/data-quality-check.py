@@ -162,6 +162,25 @@ def load_baselines(
 # ---------------------------------------------------------------------------
 # DB queries
 # ---------------------------------------------------------------------------
+#
+# Timezone safety note (#1844):
+#
+# All timestamp columns (captured_at, created_at, last_seen_at, started_at)
+# are TIMESTAMPTZ.  Comparisons between TIMESTAMPTZ values (e.g.
+# ``d.captured_at >= %s`` with a timezone-aware Python datetime parameter)
+# are inherently timezone-safe — PostgreSQL compares the underlying UTC
+# values regardless of the session timezone setting.
+#
+# The only session-timezone-dependent operation is converting a TIMESTAMPTZ
+# to a date or timestamp-without-timezone, such as ``DATE(captured_at)``.
+# Any such conversion MUST use ``AT TIME ZONE 'UTC'`` explicitly.
+# Currently only RULING_COUNTS_7D_PER_DAY_QUERY uses DATE(), and it
+# already includes the explicit timezone qualifier.
+#
+# Do NOT add ``AT TIME ZONE 'UTC'`` to bare TIMESTAMPTZ comparisons — that
+# would convert the column to timestamp-without-timezone and change the
+# comparison semantics incorrectly.
+# ---------------------------------------------------------------------------
 
 RULING_COUNTS_24H_QUERY = """
     SELECT ct.county, COUNT(d.id) AS ruling_count
