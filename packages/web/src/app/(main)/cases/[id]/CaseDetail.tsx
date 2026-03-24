@@ -14,11 +14,11 @@ import {
   stripMetadataHeaderHtml,
   type RulingMetadata,
 } from '@/lib/display-helpers';
+import { InfiniteScrollTrigger } from '@/components/InfiniteScrollTrigger';
 import { OutcomeBadge } from '@/components/OutcomeBadge';
 import { sanitizeRulingHtml } from '@/lib/sanitize-html';
 import { SECTION_HEADING, SECTION_LABEL } from '@/lib/typography';
 import { Badge } from '@/components/ui/badge';
-import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
 import { Skeleton } from '@/components/ui/skeleton';
 
@@ -312,9 +312,11 @@ export function CaseDetail({ caseId }: { caseId: string }) {
 
   const edges = rulingsData?.rulings.edges ?? [];
   const pageInfo = rulingsData?.rulings.pageInfo;
+  const fetchingMore = useRef(false);
 
-  function handleLoadMore() {
-    if (!pageInfo?.endCursor) return;
+  const handleLoadMore = useCallback(() => {
+    if (!pageInfo?.endCursor || rulingsLoading || fetchingMore.current) return;
+    fetchingMore.current = true;
     fetchMore({
       variables: { after: pageInfo.endCursor },
       updateQuery(prev, { fetchMoreResult }) {
@@ -326,8 +328,10 @@ export function CaseDetail({ caseId }: { caseId: string }) {
           },
         };
       },
+    }).finally(() => {
+      fetchingMore.current = false;
     });
-  }
+  }, [pageInfo?.endCursor, rulingsLoading, fetchMore]);
 
   if (caseLoading) {
     return <SkeletonBlock />;
@@ -534,17 +538,29 @@ export function CaseDetail({ caseId }: { caseId: string }) {
         })}
       </div>
 
-      {pageInfo?.hasNextPage && (
-        <div className="flex justify-center py-4">
-          <Button
-            variant="outline"
-            onClick={handleLoadMore}
-            disabled={rulingsLoading}
-          >
-            {rulingsLoading ? 'Loading…' : 'Load more'}
-          </Button>
+      {/* Loading indicator for infinite scroll */}
+      {rulingsLoading && edges.length > 0 && (
+        <div className="mt-3 space-y-3">
+          {Array.from({ length: 3 }).map((_, i) => (
+            <Card key={`loading-${i}`}>
+              <CardContent className="py-4">
+                <div className="flex items-center gap-4">
+                  <Skeleton className="h-4 w-20" />
+                  <Skeleton className="h-4 w-32" />
+                  <Skeleton className="h-5 w-16" />
+                </div>
+              </CardContent>
+            </Card>
+          ))}
         </div>
       )}
+
+      {/* Infinite scroll sentinel */}
+      <InfiniteScrollTrigger
+        hasNextPage={pageInfo?.hasNextPage ?? false}
+        loading={rulingsLoading}
+        onLoadMore={handleLoadMore}
+      />
     </section>
   );
 

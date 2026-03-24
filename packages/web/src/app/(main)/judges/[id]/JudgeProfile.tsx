@@ -1,6 +1,6 @@
 'use client';
 
-import { useRef, useCallback, useEffect } from 'react';
+import { useRef, useCallback } from 'react';
 import { useQuery, gql } from '@apollo/client';
 import Link from 'next/link';
 import { BarChart3, Scale } from 'lucide-react';
@@ -9,6 +9,7 @@ import {
   formatLabel,
   formatMotionType,
 } from '@/lib/display-helpers';
+import { InfiniteScrollTrigger } from '@/components/InfiniteScrollTrigger';
 import { OutcomeBadge } from '@/components/OutcomeBadge';
 import { SECTION_HEADING, SECTION_LABEL } from '@/lib/typography';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
@@ -227,7 +228,6 @@ export function JudgeProfile({ judgeId }: { judgeId: string }) {
   const edges = rulingsData?.rulings.edges ?? [];
   const pageInfo = rulingsData?.rulings.pageInfo;
   const fetchingMore = useRef(false);
-  const observer = useRef<IntersectionObserver | null>(null);
 
   // Coordinate loading states: only show empty messages when both queries
   // have completed. If one returns empty while the other is still loading,
@@ -252,29 +252,6 @@ export function JudgeProfile({ judgeId }: { judgeId: string }) {
       fetchingMore.current = false;
     });
   }, [pageInfo?.endCursor, rulingsLoading, fetchMore]);
-
-  const sentinelRef = useCallback(
-    (node: HTMLDivElement | null) => {
-      if (observer.current) observer.current.disconnect();
-      if (!node) return;
-      observer.current = new IntersectionObserver(
-        (entries) => {
-          if (entries[0]?.isIntersecting) {
-            handleLoadMore();
-          }
-        },
-        { rootMargin: '200px' },
-      );
-      observer.current.observe(node);
-    },
-    [handleLoadMore],
-  );
-
-  useEffect(() => {
-    return () => {
-      if (observer.current) observer.current.disconnect();
-    };
-  }, []);
 
   // -------------------------------------------------------------------------
   // Analytics section
@@ -489,9 +466,11 @@ export function JudgeProfile({ judgeId }: { judgeId: string }) {
         )}
 
         {/* Infinite scroll sentinel */}
-        {pageInfo?.hasNextPage && !rulingsLoading && (
-          <div ref={sentinelRef} data-testid="scroll-sentinel" className="h-1" />
-        )}
+        <InfiniteScrollTrigger
+          hasNextPage={pageInfo?.hasNextPage ?? false}
+          loading={rulingsLoading}
+          onLoadMore={handleLoadMore}
+        />
       </div>
     );
   }

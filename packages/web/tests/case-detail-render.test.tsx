@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { render, screen, fireEvent } from '@testing-library/react';
 
 // ---------------------------------------------------------------------------
@@ -19,6 +19,28 @@ let mockRulingsQueryResult: {
 
 // Track which queries were called
 let queryCallCount = 0;
+
+// IntersectionObserver mock
+let mockObserve: ReturnType<typeof vi.fn>;
+let mockDisconnect: ReturnType<typeof vi.fn>;
+
+beforeEach(() => {
+  mockObserve = vi.fn();
+  mockDisconnect = vi.fn();
+
+  vi.stubGlobal(
+    'IntersectionObserver',
+    vi.fn((_callback: IntersectionObserverCallback) => ({
+      observe: mockObserve,
+      disconnect: mockDisconnect,
+      unobserve: vi.fn(),
+    })),
+  );
+});
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+});
 
 vi.mock('next/link', () => ({
   default: ({
@@ -333,7 +355,7 @@ describe('CaseDetail (render)', () => {
     ).toBeInTheDocument();
   });
 
-  it('renders load more button for rulings', () => {
+  it('renders infinite scroll sentinel when hasNextPage is true', () => {
     mockCaseQueryResult.data = makeCaseData();
     mockRulingsQueryResult.data = {
       rulings: {
@@ -342,9 +364,21 @@ describe('CaseDetail (render)', () => {
       },
     };
     render(<CaseDetail caseId="case-1" />);
-    expect(
-      screen.getByRole('button', { name: 'Load more' }),
-    ).toBeInTheDocument();
+    expect(screen.getByTestId('scroll-sentinel')).toBeInTheDocument();
+    // No "Load more" button — infinite scroll only
+    expect(screen.queryByRole('button', { name: 'Load more' })).not.toBeInTheDocument();
+  });
+
+  it('does not render sentinel when hasNextPage is false', () => {
+    mockCaseQueryResult.data = makeCaseData();
+    mockRulingsQueryResult.data = {
+      rulings: {
+        edges: [{ cursor: 'c1', node: makeRulingNode() }],
+        pageInfo: { hasNextPage: false, endCursor: null },
+      },
+    };
+    render(<CaseDetail caseId="case-1" />);
+    expect(screen.queryByTestId('scroll-sentinel')).not.toBeInTheDocument();
   });
 
   it('renders download link for document without ruling text after expanding', () => {

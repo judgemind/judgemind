@@ -10,6 +10,7 @@ import {
   formatJudgeName,
 } from '@/lib/display-helpers';
 import { Autocomplete } from '@/components/Autocomplete';
+import { InfiniteScrollTrigger } from '@/components/InfiniteScrollTrigger';
 import { OutcomeBadge } from '@/components/OutcomeBadge';
 import { useCountyOptions } from '@/lib/filter-options';
 import { Badge } from '@/components/ui/badge';
@@ -150,7 +151,6 @@ export function RulingsFeed() {
   const edges = data?.rulings.edges ?? [];
   const pageInfo = data?.rulings.pageInfo;
   const fetchingMore = useRef(false);
-  const observer = useRef<IntersectionObserver | null>(null);
 
   const handleLoadMore = useCallback(() => {
     if (!pageInfo?.endCursor || loading || fetchingMore.current) return;
@@ -170,29 +170,6 @@ export function RulingsFeed() {
       fetchingMore.current = false;
     });
   }, [pageInfo?.endCursor, loading, fetchMore]);
-
-  const sentinelRef = useCallback(
-    (node: HTMLDivElement | null) => {
-      if (observer.current) observer.current.disconnect();
-      if (!node) return;
-      observer.current = new IntersectionObserver(
-        (entries) => {
-          if (entries[0]?.isIntersecting) {
-            handleLoadMore();
-          }
-        },
-        { rootMargin: '200px' },
-      );
-      observer.current.observe(node);
-    },
-    [handleLoadMore],
-  );
-
-  useEffect(() => {
-    return () => {
-      if (observer.current) observer.current.disconnect();
-    };
-  }, []);
 
   return (
     <div className="space-y-6">
@@ -304,9 +281,11 @@ export function RulingsFeed() {
           )}
 
           {/* Infinite scroll sentinel */}
-          {pageInfo?.hasNextPage && !loading && (
-            <div ref={sentinelRef} data-testid="scroll-sentinel" className="h-1" />
-          )}
+          <InfiniteScrollTrigger
+            hasNextPage={pageInfo?.hasNextPage ?? false}
+            loading={loading}
+            onLoadMore={handleLoadMore}
+          />
         </div>
       )}
     </div>

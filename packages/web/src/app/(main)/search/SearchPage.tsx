@@ -9,6 +9,7 @@ import { formatDate } from '@/lib/display-helpers';
 import { PAGE_TITLE, SECTION_LABEL } from '@/lib/typography';
 import { sanitizeExcerptHtml } from '@/lib/sanitize-html';
 import { Autocomplete } from '@/components/Autocomplete';
+import { InfiniteScrollTrigger } from '@/components/InfiniteScrollTrigger';
 import { OutcomeBadge } from '@/components/OutcomeBadge';
 import { useCountyOptions, useJudgeNameOptions } from '@/lib/filter-options';
 import { Card, CardContent } from '@/components/ui/card';
@@ -486,7 +487,6 @@ export function SearchPage() {
   const pageInfo = data?.searchRulings.pageInfo;
   const totalHits = data?.searchRulings.totalHits ?? 0;
   const fetchingMore = useRef(false);
-  const observerRef = useRef<IntersectionObserver | null>(null);
   const queryGeneration = useRef(0);
 
   // Increment generation when filters that refetch data change,
@@ -544,29 +544,6 @@ export function SearchPage() {
       fetchingMore.current = false;
     });
   }, [pageInfo?.endCursor, loading, fetchMore]);
-
-  const sentinelRef = useCallback(
-    (node: HTMLDivElement | null) => {
-      if (observerRef.current) observerRef.current.disconnect();
-      if (!node) return;
-      observerRef.current = new IntersectionObserver(
-        (entries) => {
-          if (entries[0]?.isIntersecting) {
-            handleLoadMore();
-          }
-        },
-        { rootMargin: '200px' },
-      );
-      observerRef.current.observe(node);
-    },
-    [handleLoadMore],
-  );
-
-  useEffect(() => {
-    return () => {
-      if (observerRef.current) observerRef.current.disconnect();
-    };
-  }, []);
 
   function toggleMotionType(mt: string) {
     setMotionTypes((prev) =>
@@ -746,9 +723,11 @@ export function SearchPage() {
               )}
 
               {/* Infinite scroll sentinel */}
-              {pageInfo?.hasNextPage && !loading && (
-                <div ref={sentinelRef} data-testid="scroll-sentinel" className="h-1" />
-              )}
+              <InfiniteScrollTrigger
+                hasNextPage={pageInfo?.hasNextPage ?? false}
+                loading={loading}
+                onLoadMore={handleLoadMore}
+              />
             </div>
           )}
         </div>
