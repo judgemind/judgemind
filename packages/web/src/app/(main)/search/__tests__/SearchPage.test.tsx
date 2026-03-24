@@ -6,8 +6,8 @@ import {
   MOTION_TYPES,
   MOTION_TYPE_LABELS,
   OUTCOMES,
-  OUTCOME_LABELS,
 } from '../SearchPage';
+import { OUTCOME_LABELS } from '@/lib/display-helpers';
 
 // ---------------------------------------------------------------------------
 // buildSearchParams — URL encoding of filter state (#1105)
@@ -193,9 +193,13 @@ vi.mock('lucide-react', async (importOriginal) => {
   };
 });
 
-vi.mock('@/lib/display-helpers', () => ({
-  formatDate: (d: string) => d,
-}));
+vi.mock('@/lib/display-helpers', async () => {
+  const actual = await vi.importActual('@/lib/display-helpers');
+  return {
+    ...actual,
+    formatDate: (d: string) => d,
+  };
+});
 
 vi.mock('@/lib/typography', () => ({
   PAGE_TITLE: 'text-2xl font-bold',
