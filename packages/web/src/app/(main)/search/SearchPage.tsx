@@ -5,7 +5,7 @@ import { useQuery, gql } from '@apollo/client';
 import { useRouter, useSearchParams } from 'next/navigation';
 import Link from 'next/link';
 import { Search, SlidersHorizontal, Calendar, Scale, Gavel } from 'lucide-react';
-import { formatDate } from '@/lib/display-helpers';
+import { formatDate, OUTCOME_LABELS } from '@/lib/display-helpers';
 import { PAGE_TITLE, SECTION_LABEL } from '@/lib/typography';
 import { sanitizeExcerptHtml } from '@/lib/sanitize-html';
 import { Autocomplete } from '@/components/Autocomplete';
@@ -97,17 +97,6 @@ export const OUTCOMES = [
   'continued',
   'other',
 ] as const;
-
-/** Human-readable labels for outcomes.
- *  Labels must match formatOutcome() output for consistency with OutcomeBadge. */
-export const OUTCOME_LABELS: Record<string, string> = {
-  granted: 'Granted',
-  denied: 'Denied',
-  granted_in_part: 'Granted In Part',
-  moot: 'Moot',
-  continued: 'Continued',
-  other: 'Other',
-};
 
 
 /** Build URL search params from the current filter state. */

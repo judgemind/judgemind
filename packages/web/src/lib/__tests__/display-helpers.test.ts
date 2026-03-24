@@ -9,10 +9,12 @@ import {
   formatJudgeName,
   formatLabel,
   formatMotionType,
+  formatOutcome,
   getOutcomeBadgeClass,
   getOutcomeBadgeListClass,
   getOutcomeBadgeVariant,
   groupParties,
+  OUTCOME_LABELS,
   RULING_TEXT_TRUNCATE_LENGTH,
   stripBoilerplate,
   stripMetadataHeader,
@@ -1210,5 +1212,46 @@ describe('getOutcomeBadgeListClass', () => {
 
   it('returns empty string for unknown outcome', () => {
     expect(getOutcomeBadgeListClass('something_unknown')).toBe('');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// OUTCOME_LABELS — canonical outcome label map (#1883)
+// ---------------------------------------------------------------------------
+
+describe('OUTCOME_LABELS', () => {
+  it('maps all standard outcome codes to human-readable labels', () => {
+    expect(OUTCOME_LABELS['granted']).toBe('Granted');
+    expect(OUTCOME_LABELS['denied']).toBe('Denied');
+    expect(OUTCOME_LABELS['granted_in_part']).toBe('Granted In Part');
+    expect(OUTCOME_LABELS['denied_in_part']).toBe('Denied In Part');
+    expect(OUTCOME_LABELS['moot']).toBe('Moot');
+    expect(OUTCOME_LABELS['continued']).toBe('Continued');
+    expect(OUTCOME_LABELS['other']).toBe('Other');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// formatOutcome — uses OUTCOME_LABELS for known codes (#1883)
+// ---------------------------------------------------------------------------
+
+describe('formatOutcome', () => {
+  it('returns "Not classified" for null', () => {
+    expect(formatOutcome(null)).toBe('Not classified');
+  });
+
+  it('returns the canonical label for known outcome codes', () => {
+    expect(formatOutcome('granted')).toBe('Granted');
+    expect(formatOutcome('denied')).toBe('Denied');
+    expect(formatOutcome('granted_in_part')).toBe('Granted In Part');
+    expect(formatOutcome('denied_in_part')).toBe('Denied In Part');
+    expect(formatOutcome('moot')).toBe('Moot');
+    expect(formatOutcome('continued')).toBe('Continued');
+    expect(formatOutcome('other')).toBe('Other');
+  });
+
+  it('falls back to title-casing for unknown outcome codes', () => {
+    expect(formatOutcome('sustained')).toBe('Sustained');
+    expect(formatOutcome('overruled_in_part')).toBe('Overruled In Part');
   });
 });

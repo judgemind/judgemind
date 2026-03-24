@@ -67,10 +67,26 @@ export function formatDate(iso: string | null | undefined): string {
   });
 }
 
-/** Convert a snake_case outcome code to a human-readable label. Returns "Not classified" for null. */
+/**
+ * Canonical human-readable labels for all known outcome codes.
+ * Every surface that displays outcome names (badges, filters, detail pages)
+ * must use this map — never define local outcome label constants.
+ */
+export const OUTCOME_LABELS: Record<string, string> = {
+  granted: 'Granted',
+  denied: 'Denied',
+  granted_in_part: 'Granted In Part',
+  denied_in_part: 'Denied In Part',
+  moot: 'Moot',
+  continued: 'Continued',
+  other: 'Other',
+};
+
+/** Convert a snake_case outcome code to a human-readable label. Returns "Not classified" for null.
+ *  Uses the canonical OUTCOME_LABELS map for known outcomes, falling back to generic title-casing. */
 export function formatOutcome(outcome: string | null): string {
   if (!outcome) return 'Not classified';
-  return outcome
+  return OUTCOME_LABELS[outcome] ?? outcome
     .replace(/_/g, ' ')
     .replace(/\b\w/g, (c) => c.toUpperCase());
 }
