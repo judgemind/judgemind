@@ -3245,26 +3245,23 @@ def test_process_event_already_split_no_re_split(
 
 
 @patch("ingestion.worker.batch_upsert_parties")
-@patch("ingestion.worker.insert_ruling")
-@patch("ingestion.worker.insert_document", return_value=True)
+@patch("ingestion.worker.insert_document_and_ruling", return_value=True)
 @patch("ingestion.worker.upsert_case", return_value="case-uuid-1")
 @patch("ingestion.worker.upsert_court", return_value="court-uuid-1")
 @patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
 @patch("ingestion.worker.psycopg")
-def test_split_event_insert_document_uses_split_id(
+def test_split_event_insert_document_and_ruling_uses_split_id(
     mock_psycopg: MagicMock,
     mock_resolve_judge: MagicMock,
     mock_upsert_court: MagicMock,
     mock_upsert_case: MagicMock,
-    mock_insert_document: MagicMock,
-    mock_insert_ruling: MagicMock,
+    mock_insert_doc_and_ruling: MagicMock,
     mock_batch_upsert: MagicMock,
 ) -> None:
-    """Split events must pass the split document_id to both insert_document and insert_ruling.
+    """Split events must pass the split document_id to insert_document_and_ruling.
 
-    Regression test for #1775: previously insert_document used the original
-    (parent) document_id while insert_ruling used the split document_id,
-    causing an FK violation.
+    Regression test for #1775/#1790: the shared helper guarantees the same
+    document_id is used for both insert_document and insert_ruling internally.
     """
     import hashlib
 
@@ -3286,28 +3283,19 @@ def test_split_event_insert_document_uses_split_id(
     )
     worker.process_event(event)
 
-    # insert_document must receive the split doc ID, NOT the original
-    mock_insert_document.assert_called_once()
-    doc_call_kwargs = mock_insert_document.call_args
-    assert doc_call_kwargs.kwargs["document_id"] == split_doc_id
-
-    # insert_ruling must also receive the split doc ID
-    mock_insert_ruling.assert_called_once()
-    ruling_call_kwargs = mock_insert_ruling.call_args
-    assert ruling_call_kwargs.kwargs["document_id"] == split_doc_id
-
-    # Both must use the SAME document_id (FK integrity)
-    assert doc_call_kwargs.kwargs["document_id"] == ruling_call_kwargs.kwargs["document_id"]
+    # insert_document_and_ruling must receive the split doc ID
+    mock_insert_doc_and_ruling.assert_called_once()
+    call_kwargs = mock_insert_doc_and_ruling.call_args
+    assert call_kwargs.kwargs["document_id"] == split_doc_id
 
     # content_hash must be a synthetic per-split hash, not the parent hash
     expected_hash = hashlib.sha256(f"{parent_hash}:ruling:{split_index}".encode()).hexdigest()
-    assert doc_call_kwargs.kwargs["content_hash"] == expected_hash
-    assert doc_call_kwargs.kwargs["content_hash"] != parent_hash
+    assert call_kwargs.kwargs["content_hash"] == expected_hash
+    assert call_kwargs.kwargs["content_hash"] != parent_hash
 
 
 @patch("ingestion.worker.batch_upsert_parties")
-@patch("ingestion.worker.insert_ruling")
-@patch("ingestion.worker.insert_document", return_value=True)
+@patch("ingestion.worker.insert_document_and_ruling", return_value=True)
 @patch("ingestion.worker.upsert_case", return_value="case-uuid-1")
 @patch("ingestion.worker.upsert_court", return_value="court-uuid-1")
 @patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
@@ -3317,8 +3305,7 @@ def test_non_split_event_uses_original_document_id(
     mock_resolve_judge: MagicMock,
     mock_upsert_court: MagicMock,
     mock_upsert_case: MagicMock,
-    mock_insert_document: MagicMock,
-    mock_insert_ruling: MagicMock,
+    mock_insert_doc_and_ruling: MagicMock,
     mock_batch_upsert: MagicMock,
 ) -> None:
     """Non-split events should still use the original document_id and content_hash unchanged."""
@@ -3332,16 +3319,12 @@ def test_non_split_event_uses_original_document_id(
     event = _make_event(document_id=doc_id, content_hash=original_hash)
     worker.process_event(event)
 
-    # insert_document must receive the original document_id
-    mock_insert_document.assert_called_once()
-    assert mock_insert_document.call_args.kwargs["document_id"] == doc_id
+    # insert_document_and_ruling must receive the original document_id
+    mock_insert_doc_and_ruling.assert_called_once()
+    assert mock_insert_doc_and_ruling.call_args.kwargs["document_id"] == doc_id
 
     # content_hash must be unchanged (no synthetic hash for non-splits)
-    assert mock_insert_document.call_args.kwargs["content_hash"] == original_hash
-
-    # insert_ruling must also use the same document_id
-    mock_insert_ruling.assert_called_once()
-    assert mock_insert_ruling.call_args.kwargs["document_id"] == doc_id
+    assert mock_insert_doc_and_ruling.call_args.kwargs["content_hash"] == original_hash
 
 
 def test_make_split_document_id_deterministic() -> None:
@@ -3443,10 +3426,10 @@ def test_process_event_opensearch_falls_back_to_truncated_text_without_summary(
     mock_cur.fetchone.side_effect = [
         ("court-uuid-1",),  # upsert_court
         ("case-uuid-1",),  # upsert_case
-        (True,),  # insert_document
         None,  # resolve_judge: no existing alias
         None,  # resolve_judge: no canonical name match
         ("judge-uuid-1",),  # resolve_judge: INSERT INTO judges
+        (True,),  # insert_document (via insert_document_and_ruling)
     ]
     mock_cur.fetchall.return_value = []
     mock_cur.rowcount = 1
