@@ -146,6 +146,27 @@ _CASE_NUMBER_RE = re.compile(r"\d{2,4}-\d{5,8}|\b\d{7,8}\b")
 # Pattern to detect case titles (vs / v.).
 _VS_RE = re.compile(r"\bv(?:s)?\.?\s", re.IGNORECASE)
 
+# Patterns for cleaning case title fragments from multimodal extraction.
+# OC case numbers follow the format: {county}-{year}-{seq}-{type}-{division}
+# e.g., 30-2024-01393434-CU-OR-CJC.  The LLM sometimes splits these across
+# newlines in case_info, leaving orphaned fragments.
+_CASE_NUMBER_FRAGMENT_RE = re.compile(
+    r"""
+    \b\d{2,4}-\d{4}-     # county-year prefix with trailing dash (e.g. "30-2024-")
+    | \b\d{2,4}-(?=\s|$)  # bare county prefix residual (e.g. "30-")
+    | -[A-Z]{2,4}-        # type code fragment (e.g. "-CU-", "-CL-", "-PR-")
+    | \b[A-Z]{2}-[A-Z]{3}\b  # division-court suffix (e.g. "OR-CJC")
+    """,
+    re.VERBOSE,
+)
+
+# Court and county name fragments that sometimes appear in case_info.
+_COURT_NAME_RE = re.compile(
+    r"Superior\s+Court\s+of\s+(?:the\s+)?(?:State\s+of\s+)?California"
+    r"|County\s+of\s+\w+",
+    re.IGNORECASE,
+)
+
 
 # ---------------------------------------------------------------------------
 # LlmExtractor
@@ -981,12 +1002,22 @@ def _extract_case_title_from_info(case_info: str) -> str | None:
     """Extract a case title from the case_info string.
 
     Looks for patterns like "Smith v. Jones" or "Smith vs Jones" after
-    the case number.
+    the case number.  Cleans up common artifacts from multimodal
+    extraction: embedded newlines, case number fragments, and court
+    name fragments.
     """
-    # Remove the case number portion to isolate the title.
-    cleaned = _CASE_NUMBER_RE.sub("", case_info).strip()
-    # Remove leading/trailing punctuation and whitespace.
-    cleaned = cleaned.strip(" -;,\n\t")
+    # 1. Replace newlines with spaces so multi-line case_info is joined.
+    cleaned = case_info.replace("\n", " ")
+    # 2. Remove complete case numbers.
+    cleaned = _CASE_NUMBER_RE.sub("", cleaned)
+    # 3. Remove case number fragments (partial prefixes, type codes, suffixes).
+    cleaned = _CASE_NUMBER_FRAGMENT_RE.sub("", cleaned)
+    # 4. Remove court / county name fragments.
+    cleaned = _COURT_NAME_RE.sub("", cleaned)
+    # 5. Collapse multiple whitespace to single space.
+    cleaned = re.sub(r"\s{2,}", " ", cleaned)
+    # 6. Remove leading/trailing punctuation and whitespace.
+    cleaned = cleaned.strip(" -;,\t")
     if cleaned:
         return cleaned
     return None
