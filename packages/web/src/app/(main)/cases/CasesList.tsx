@@ -1,12 +1,10 @@
 'use client';
 
-import { useState, useCallback, useEffect } from 'react';
+import { useState, useCallback, useEffect, useRef } from 'react';
 import { useQuery, gql } from '@apollo/client';
 import { useRouter, useSearchParams } from 'next/navigation';
 import Link from 'next/link';
 import { formatLabel } from '@/lib/display-helpers';
-import { Badge } from '@/components/ui/badge';
-import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import {
   Select,
@@ -27,13 +25,11 @@ import {
 
 const CASES_QUERY = gql`
   query Cases(
-    $caseStatus: String
     $caseType: String
     $first: Int!
     $after: String
   ) {
     cases(
-      caseStatus: $caseStatus
       caseType: $caseType
       first: $first
       after: $after
@@ -84,12 +80,6 @@ const PAGE_SIZE = 20;
 /** Known case type filter options. */
 const CASE_TYPES = ['civil', 'family', 'probate', 'small_claims', 'other'] as const;
 
-const STATUS_VARIANT: Record<string, 'default' | 'secondary' | 'destructive' | 'outline'> = {
-  active: 'default',
-  closed: 'secondary',
-  dismissed: 'destructive',
-};
-
 function SkeletonRow() {
   return (
     <TableRow>
@@ -99,9 +89,7 @@ function SkeletonRow() {
           <Skeleton className="h-3 w-48" />
         </div>
       </TableCell>
-      <TableCell><Skeleton className="h-3 w-24" /></TableCell>
       <TableCell><Skeleton className="h-3 w-16" /></TableCell>
-      <TableCell><Skeleton className="h-5 w-14" /></TableCell>
     </TableRow>
   );
 }
@@ -111,21 +99,18 @@ export function CasesList() {
   const searchParams = useSearchParams();
 
   const [caseNumberFilter, setCaseNumberFilter] = useState('');
-  const [statusFilter, setStatusFilter] = useState(searchParams.get('status') ?? '');
   const [typeFilter, setTypeFilter] = useState(searchParams.get('caseType') ?? '');
 
   useEffect(() => {
-    setStatusFilter(searchParams.get('status') ?? '');
     setTypeFilter(searchParams.get('caseType') ?? '');
   }, [searchParams]);
 
   const updateUrl = useCallback(() => {
     const params = new URLSearchParams();
-    if (statusFilter) params.set('status', statusFilter);
     if (typeFilter) params.set('caseType', typeFilter);
     const search = params.toString();
     router.replace(search ? `/cases?${search}` : '/cases');
-  }, [statusFilter, typeFilter, router]);
+  }, [typeFilter, router]);
 
   useEffect(() => {
     updateUrl();
@@ -133,7 +118,6 @@ export function CasesList() {
 
   const { data, loading, error, fetchMore } = useQuery<CasesData>(CASES_QUERY, {
     variables: {
-      caseStatus: statusFilter || undefined,
       caseType: typeFilter || undefined,
       first: PAGE_SIZE,
     },
@@ -142,6 +126,15 @@ export function CasesList() {
 
   const edges = data?.cases.edges ?? [];
   const pageInfo = data?.cases.pageInfo;
+  const fetchingMore = useRef(false);
+  const observer = useRef<IntersectionObserver | null>(null);
+  const queryGeneration = useRef(0);
+
+  // Increment generation when a filter that refetches data changes,
+  // so in-flight fetchMore calls don't corrupt the new results.
+  useEffect(() => {
+    queryGeneration.current += 1;
+  }, [typeFilter]);
 
   const filteredEdges = caseNumberFilter
     ? edges.filter(
@@ -151,12 +144,16 @@ export function CasesList() {
       )
     : edges;
 
-  function handleLoadMore() {
-    if (!pageInfo?.endCursor) return;
+  const handleLoadMore = useCallback(() => {
+    if (!pageInfo?.endCursor || loading || fetchingMore.current) return;
+    fetchingMore.current = true;
+    const currentGeneration = queryGeneration.current;
     fetchMore({
       variables: { after: pageInfo.endCursor },
       updateQuery(prev, { fetchMoreResult }) {
         if (!fetchMoreResult) return prev;
+        // If filters changed since this fetch started, discard the stale results
+        if (queryGeneration.current !== currentGeneration) return prev;
         return {
           cases: {
             ...fetchMoreResult.cases,
@@ -164,8 +161,33 @@ export function CasesList() {
           },
         };
       },
+    }).finally(() => {
+      fetchingMore.current = false;
     });
-  }
+  }, [pageInfo?.endCursor, loading, fetchMore]);
+
+  const sentinelRef = useCallback(
+    (node: HTMLDivElement | null) => {
+      if (observer.current) observer.current.disconnect();
+      if (!node) return;
+      observer.current = new IntersectionObserver(
+        (entries) => {
+          if (entries[0]?.isIntersecting) {
+            handleLoadMore();
+          }
+        },
+        { rootMargin: '200px' },
+      );
+      observer.current.observe(node);
+    },
+    [handleLoadMore],
+  );
+
+  useEffect(() => {
+    return () => {
+      if (observer.current) observer.current.disconnect();
+    };
+  }, []);
 
   return (
     <div className="space-y-6">
@@ -179,20 +201,6 @@ export function CasesList() {
           className="w-auto"
           aria-label="Case number or title"
         />
-        <Select
-          value={statusFilter || 'all'}
-          onValueChange={(v) => setStatusFilter(v === 'all' ? '' : v)}
-        >
-          <SelectTrigger className="w-auto min-w-[140px]" aria-label="Case status" name="caseStatus">
-            <SelectValue placeholder="All statuses" />
-          </SelectTrigger>
-          <SelectContent>
-            <SelectItem value="all">All statuses</SelectItem>
-            <SelectItem value="active">Active</SelectItem>
-            <SelectItem value="closed">Closed</SelectItem>
-            <SelectItem value="dismissed">Dismissed</SelectItem>
-          </SelectContent>
-        </Select>
         <Select
           value={typeFilter || 'all'}
           onValueChange={(v) => setTypeFilter(v === 'all' ? '' : v)}
@@ -211,14 +219,12 @@ export function CasesList() {
         </Select>
       </div>
 
-      <div className="rounded-lg border">
-        <Table>
+      <div className="overflow-hidden rounded-lg border">
+        <Table className="table-fixed">
           <TableHeader>
             <TableRow>
               <TableHead>Case</TableHead>
-              <TableHead>Court</TableHead>
-              <TableHead>Type</TableHead>
-              <TableHead>Status</TableHead>
+              <TableHead className="w-28">Type</TableHead>
             </TableRow>
           </TableHeader>
           <TableBody>
@@ -232,7 +238,7 @@ export function CasesList() {
 
             {error && (
               <TableRow>
-                <TableCell colSpan={4} className="text-center">
+                <TableCell colSpan={2} className="text-center">
                   <p className="py-4 text-sm text-destructive">
                     Failed to load cases. Please try again.
                   </p>
@@ -242,7 +248,7 @@ export function CasesList() {
 
             {!loading && !error && filteredEdges.length === 0 && (
               <TableRow>
-                <TableCell colSpan={4} className="text-center">
+                <TableCell colSpan={2} className="text-center">
                   <p className="py-4 text-muted-foreground">
                     No cases found. Try adjusting your filters.
                   </p>
@@ -257,7 +263,7 @@ export function CasesList() {
                     href={`/cases/${node.id}`}
                     className="block truncate rounded-sm font-medium text-foreground hover:text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
                   >
-                    {node.caseNumber}
+                    {node.court?.county ? `${node.court.county} – ` : ''}{node.caseNumber}
                   </Link>
                   {node.caseTitle && (
                     <p className="truncate text-sm text-muted-foreground">
@@ -266,37 +272,25 @@ export function CasesList() {
                   )}
                 </TableCell>
                 <TableCell className="text-sm text-muted-foreground">
-                  {node.court?.county ?? '\u2014'}
-                </TableCell>
-                <TableCell className="text-sm text-muted-foreground">
                   {formatLabel(node.caseType)}
-                </TableCell>
-                <TableCell>
-                  <Badge
-                    variant={
-                      node.caseStatus
-                        ? (STATUS_VARIANT[node.caseStatus.toLowerCase()] ?? 'outline')
-                        : 'outline'
-                    }
-                  >
-                    {formatLabel(node.caseStatus)}
-                  </Badge>
                 </TableCell>
               </TableRow>
             ))}
+
+            {/* Loading indicator for infinite scroll */}
+            {loading && edges.length > 0 && (
+              <>
+                {Array.from({ length: 3 }).map((_, i) => (
+                  <SkeletonRow key={`loading-${i}`} />
+                ))}
+              </>
+            )}
           </TableBody>
         </Table>
 
-        {pageInfo?.hasNextPage && (
-          <div className="flex justify-center py-4">
-            <Button
-              variant="outline"
-              onClick={handleLoadMore}
-              disabled={loading}
-            >
-              {loading ? 'Loading…' : 'Load more'}
-            </Button>
-          </div>
+        {/* Infinite scroll sentinel */}
+        {pageInfo?.hasNextPage && !loading && (
+          <div ref={sentinelRef} data-testid="scroll-sentinel" className="h-1" />
         )}
       </div>
     </div>

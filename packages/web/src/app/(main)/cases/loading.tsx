@@ -18,13 +18,7 @@ function SkeletonRow() {
         </div>
       </TableCell>
       <TableCell>
-        <Skeleton className="h-3 w-24" />
-      </TableCell>
-      <TableCell>
         <Skeleton className="h-3 w-16" />
-      </TableCell>
-      <TableCell>
-        <Skeleton className="h-5 w-14" />
       </TableCell>
     </TableRow>
   );
@@ -39,16 +33,13 @@ export default function CasesLoading() {
         <div className="mb-4 flex flex-wrap gap-3">
           <Skeleton className="h-10 w-48" />
           <Skeleton className="h-10 w-32" />
-          <Skeleton className="h-10 w-32" />
         </div>
-        <div className="rounded-lg border">
-          <Table>
+        <div className="overflow-hidden rounded-lg border">
+          <Table className="table-fixed">
             <TableHeader>
               <TableRow>
                 <TableHead>Case</TableHead>
-                <TableHead>Court</TableHead>
-                <TableHead>Type</TableHead>
-                <TableHead>Status</TableHead>
+                <TableHead className="w-28">Type</TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
