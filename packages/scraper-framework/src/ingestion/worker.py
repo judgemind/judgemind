@@ -23,6 +23,7 @@ Environment variables:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -890,10 +891,15 @@ class IngestionWorker:
                 },
             )
 
-        # For split events, use the original document_id for the documents table
-        # (one PDF = one document row) but the synthetic split ID for rulings.
-        original_document_id = event_data.get("_original_document_id", document_id)
+        # For split events, each split ruling gets its own document row keyed
+        # by the synthetic split document_id.  This ensures the FK from
+        # insert_ruling(document_id=...) is satisfied.  See #1775, PR #1755.
         is_split = event_data.get("_split_processed", False)
+        if is_split:
+            split_index = event_data.get("_split_index", 0)
+            content_hash = hashlib.sha256(
+                f"{content_hash}:ruling:{split_index}".encode()
+            ).hexdigest()
 
         conn = self._get_connection()
         try:
@@ -997,11 +1003,11 @@ class IngestionWorker:
             )
 
             # 3. Insert document (idempotent on document_id)
-            # For split rulings, use the original document_id so all splits
-            # share a single document row (one PDF = one document).
+            # Each split ruling gets its own document row keyed by the
+            # split document_id, so the FK from rulings is satisfied (#1775).
             is_new = insert_document(
                 conn,
-                document_id=original_document_id,
+                document_id=document_id,
                 case_id=case_id,
                 court_id=court_id,
                 content_format=content_format,
