@@ -5,7 +5,7 @@ from __future__ import annotations
 import abc
 import time
 import uuid
-from datetime import datetime
+from datetime import UTC, datetime
 
 import structlog
 
@@ -85,7 +85,7 @@ class BaseScraper(abc.ABC):
     def run(self) -> ScraperHealthEvent:
         """Execute a full scraper run: fetch → hash → archive → emit → health report."""
         start = time.monotonic()
-        run_timestamp = datetime.utcnow()
+        run_timestamp = datetime.now(UTC)
         records_captured = 0
         error_message: str | None = None
 
@@ -199,7 +199,7 @@ class BaseScraper(abc.ABC):
             county=self.config.county,
             court=self.config.court,
             source_url=source_url,
-            capture_timestamp=datetime.utcnow(),
+            capture_timestamp=datetime.now(UTC),
             content_format=content_format,
             raw_content=raw_content,
             content_hash="",  # filled in by _process_document

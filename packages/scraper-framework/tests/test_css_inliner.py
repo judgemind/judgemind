@@ -281,7 +281,7 @@ def test_inline_css_large_css_size_limit() -> None:
 
 def test_base_scraper_inlines_css_for_html_docs() -> None:
     """BaseScraper._process_document should inline CSS for HTML-format docs."""
-    from datetime import datetime
+    from datetime import UTC, datetime
 
     from framework import BaseScraper, CapturedDocument, ContentFormat, ScraperConfig
 
@@ -304,7 +304,7 @@ def test_base_scraper_inlines_css_for_html_docs() -> None:
         county=config.county,
         court=config.court,
         source_url="https://court.example.com/rulings/page.html",
-        capture_timestamp=datetime.utcnow(),
+        capture_timestamp=datetime.now(UTC),
         content_format=ContentFormat.HTML,
         raw_content=html_with_css,
         content_hash="",
@@ -332,7 +332,7 @@ def test_base_scraper_inlines_css_for_html_docs() -> None:
 
 def test_base_scraper_does_not_inline_css_for_pdf_docs() -> None:
     """BaseScraper._process_document should NOT inline CSS for PDF-format docs."""
-    from datetime import datetime
+    from datetime import UTC, datetime
 
     from framework import BaseScraper, CapturedDocument, ContentFormat, ScraperConfig
 
@@ -349,7 +349,7 @@ def test_base_scraper_does_not_inline_css_for_pdf_docs() -> None:
         county=config.county,
         court=config.court,
         source_url="https://court.example.com/rulings/file.pdf",
-        capture_timestamp=datetime.utcnow(),
+        capture_timestamp=datetime.now(UTC),
         content_format=ContentFormat.PDF,
         raw_content=b"%PDF-1.4 fake pdf content",
         content_hash="",
@@ -370,7 +370,7 @@ def test_base_scraper_does_not_inline_css_for_pdf_docs() -> None:
 
 def test_base_scraper_continues_if_css_inlining_fails() -> None:
     """If CSS inlining raises, the document should still be processed."""
-    from datetime import datetime
+    from datetime import UTC, datetime
 
     from framework import BaseScraper, CapturedDocument, ContentFormat, ScraperConfig
     from framework.hashing import sha256_hex
@@ -390,7 +390,7 @@ def test_base_scraper_continues_if_css_inlining_fails() -> None:
         county=config.county,
         court=config.court,
         source_url="https://court.example.com/page.html",
-        capture_timestamp=datetime.utcnow(),
+        capture_timestamp=datetime.now(UTC),
         content_format=ContentFormat.HTML,
         raw_content=html,
         content_hash="",

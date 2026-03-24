@@ -29,7 +29,7 @@ import logging
 import os
 import socket
 import time
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 from typing import TYPE_CHECKING, Any
 
 import psycopg
@@ -908,7 +908,7 @@ class IngestionWorker:
             )
             sum_latency_ms = round((time.monotonic() - t0_sum) * 1000)
             if summary is not None:
-                summary_generated_at = datetime.utcnow()
+                summary_generated_at = datetime.now(UTC)
             logger.info(
                 "Ruling summarization completed",
                 extra={
@@ -1049,7 +1049,7 @@ class IngestionWorker:
                 s3_bucket=s3_bucket,
                 source_url=source_url,
                 scraper_id=scraper_id,
-                captured_at=capture_ts or datetime.utcnow(),
+                captured_at=capture_ts or datetime.now(UTC),
                 hearing_date=hearing_dt,
                 ruling_text=cleaned_ruling_text,
                 ruling_text_html=ruling_text_html,
