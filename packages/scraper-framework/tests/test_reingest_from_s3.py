@@ -56,6 +56,8 @@ def _make_document_row(
     scraper_id: str = "ca-la-tentatives-civil",
     case_number: str = "24STCV12345",
     case_title: str = "Smith v. Jones",
+    hearing_date: date | None = _HEARING_DATE,
+    ruling_hearing_date: date | None = _HEARING_DATE,
 ) -> tuple:
     """Return a tuple matching the FETCH_DOCUMENTS_QUERY columns."""
     return (
@@ -68,13 +70,14 @@ def _make_document_row(
         "https://court.example.com/ruling",  # d.source_url
         scraper_id,  # d.scraper_id
         captured_at,  # d.captured_at
-        _HEARING_DATE,  # d.hearing_date
+        hearing_date,  # d.hearing_date
         "html",  # d.format
         "CA",  # ct.state
         "Los Angeles",  # ct.county
         "Los Angeles Superior Court",  # ct.court_name
         case_number,  # c.case_number
         case_title,  # c.case_title
+        ruling_hearing_date,  # ruling_hearing_date (subquery)
     )
 
 
@@ -574,6 +577,166 @@ class TestReingestBatchDBWrites:
             "pipeline-judge-id",
             _HEARING_DATE,
         )
+
+    @patch("reingest_from_s3.batch_upsert_parties")
+    @patch("reingest_from_s3.upsert_case_judge")
+    @patch("reingest_from_s3.resolve_judge")
+    @patch("reingest_from_s3.insert_document_and_ruling")
+    @patch("reingest_from_s3.upsert_case")
+    @patch("reingest_from_s3._reparse_document")
+    @patch("reingest_from_s3._fetch_s3_content")
+    def test_motion_type_persisted_through_pipeline(
+        self,
+        mock_fetch_s3: MagicMock,
+        mock_reparse: MagicMock,
+        mock_upsert_case: MagicMock,
+        mock_insert_doc_and_ruling: MagicMock,
+        mock_resolve_judge: MagicMock,
+        mock_upsert_cj: MagicMock,
+        mock_batch_parties: MagicMock,
+    ) -> None:
+        """Extracted motion_type flows to insert_document_and_ruling (#1834)."""
+        row = _make_document_row()
+        conn = _mock_conn_with_rows([row])
+
+        mock_fetch_s3.return_value = b"<html>Motion to Compel is GRANTED</html>"
+        mock_reparse.return_value = {
+            "ruling_text": "Motion to Compel is GRANTED",
+            "case_number": "23STCV01234",
+            "case_title": "Smith v. Jones",
+            "judge_name": "Judge Doe",
+            "outcome": "granted",
+            "motion_type": "motion_to_compel",
+            "department": "1",
+            "parties": [],
+            "hearing_date": _HEARING_DATE,
+        }
+        mock_upsert_case.return_value = "case-id"
+        mock_resolve_judge.return_value = "judge-id"
+
+        reingest.reingest_batch(
+            conn,
+            MagicMock(),
+            batch_size=10,
+            cursor=_DEFAULT_CURSOR,
+            filters="",
+            filter_params=[],
+        )
+
+        call_kwargs = mock_insert_doc_and_ruling.call_args[1]
+        assert call_kwargs["motion_type"] == "motion_to_compel"
+        assert call_kwargs["outcome"] == "granted"
+
+    @patch("reingest_from_s3.batch_upsert_parties")
+    @patch("reingest_from_s3.upsert_case_judge")
+    @patch("reingest_from_s3.resolve_judge")
+    @patch("reingest_from_s3.insert_document_and_ruling")
+    @patch("reingest_from_s3.upsert_case")
+    @patch("reingest_from_s3._reparse_document")
+    @patch("reingest_from_s3._fetch_s3_content")
+    def test_null_doc_hearing_date_falls_back_to_ruling_hearing_date(
+        self,
+        mock_fetch_s3: MagicMock,
+        mock_reparse: MagicMock,
+        mock_upsert_case: MagicMock,
+        mock_insert_doc_and_ruling: MagicMock,
+        mock_resolve_judge: MagicMock,
+        mock_upsert_cj: MagicMock,
+        mock_batch_parties: MagicMock,
+    ) -> None:
+        """When documents.hearing_date is NULL, use ruling hearing_date (#1834).
+
+        OC PDF documents may have NULL hearing_date on the document row
+        (the scraper doesn't capture it) while the ruling row has a
+        hearing_date from LLM/regex extraction.  Without the fallback,
+        insert_document_and_ruling skips the ruling insert because
+        hearing_date is None, silently losing extracted fields like
+        motion_type.
+        """
+        row = _make_document_row(hearing_date=None, ruling_hearing_date=_HEARING_DATE)
+        conn = _mock_conn_with_rows([row])
+
+        mock_fetch_s3.return_value = b"<html>Motion to Compel is GRANTED</html>"
+        mock_reparse.return_value = {
+            "ruling_text": "Motion to Compel is GRANTED",
+            "case_number": "23STCV01234",
+            "case_title": "Smith v. Jones",
+            "judge_name": "Judge Doe",
+            "outcome": "granted",
+            "motion_type": "motion_to_compel",
+            "department": "1",
+            "parties": [],
+            "hearing_date": None,
+        }
+        mock_upsert_case.return_value = "case-id"
+        mock_resolve_judge.return_value = "judge-id"
+
+        result = reingest.reingest_batch(
+            conn,
+            MagicMock(),
+            batch_size=10,
+            cursor=_DEFAULT_CURSOR,
+            filters="",
+            filter_params=[],
+        )
+
+        assert result["updated"] == 1
+        mock_insert_doc_and_ruling.assert_called_once()
+        call_kwargs = mock_insert_doc_and_ruling.call_args[1]
+        # The ruling's hearing_date should be used as fallback
+        assert call_kwargs["hearing_date"] == _HEARING_DATE
+        # motion_type should flow through to the DB write
+        assert call_kwargs["motion_type"] == "motion_to_compel"
+
+    @patch("reingest_from_s3.batch_upsert_parties")
+    @patch("reingest_from_s3.upsert_case_judge")
+    @patch("reingest_from_s3.resolve_judge")
+    @patch("reingest_from_s3.insert_document_and_ruling")
+    @patch("reingest_from_s3.upsert_case")
+    @patch("reingest_from_s3._reparse_document")
+    @patch("reingest_from_s3._fetch_s3_content")
+    def test_null_doc_and_ruling_hearing_date_skips_ruling(
+        self,
+        mock_fetch_s3: MagicMock,
+        mock_reparse: MagicMock,
+        mock_upsert_case: MagicMock,
+        mock_insert_doc_and_ruling: MagicMock,
+        mock_resolve_judge: MagicMock,
+        mock_upsert_cj: MagicMock,
+        mock_batch_parties: MagicMock,
+    ) -> None:
+        """When both document and ruling hearing_dates are NULL, ruling is still skipped."""
+        row = _make_document_row(hearing_date=None, ruling_hearing_date=None)
+        conn = _mock_conn_with_rows([row])
+
+        mock_fetch_s3.return_value = b"<html>text</html>"
+        mock_reparse.return_value = {
+            "ruling_text": "text",
+            "case_number": "23STCV01234",
+            "case_title": "Smith v. Jones",
+            "judge_name": None,
+            "outcome": None,
+            "motion_type": None,
+            "department": None,
+            "parties": [],
+            "hearing_date": None,
+        }
+        mock_upsert_case.return_value = "case-id"
+
+        result = reingest.reingest_batch(
+            conn,
+            MagicMock(),
+            batch_size=10,
+            cursor=_DEFAULT_CURSOR,
+            filters="",
+            filter_params=[],
+        )
+
+        assert result["updated"] == 1
+        mock_insert_doc_and_ruling.assert_called_once()
+        call_kwargs = mock_insert_doc_and_ruling.call_args[1]
+        # Both are None — insert_document_and_ruling will skip the ruling insert
+        assert call_kwargs["hearing_date"] is None
 
 
 # ---------------------------------------------------------------------------

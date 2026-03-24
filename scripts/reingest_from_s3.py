@@ -248,7 +248,9 @@ FETCH_DOCUMENTS_QUERY = """
         d.content_hash, d.source_url, d.scraper_id, d.captured_at,
         d.hearing_date, d.format,
         ct.state, ct.county, ct.court_name,
-        c.case_number, c.case_title
+        c.case_number, c.case_title,
+        (SELECT r.hearing_date FROM rulings r
+         WHERE r.document_id = d.id LIMIT 1) AS ruling_hearing_date
     FROM documents d
     JOIN courts ct ON ct.id = d.court_id
     LEFT JOIN cases c ON c.id = d.case_id
@@ -1076,6 +1078,7 @@ def reingest_batch(
             court_name,
             case_number,
             case_title,
+            ruling_hearing_date,
         ) = row
         processed += 1
         doc_id_str = str(doc_id)
@@ -1094,6 +1097,17 @@ def reingest_batch(
             skipped += 1
             continue
 
+        # Use document hearing_date, falling back to the ruling's
+        # hearing_date.  documents.hearing_date is nullable; some
+        # scrapers (e.g. OC PDF) don't provide hearing_date in the
+        # capture event.  When the ingestion worker later extracts it
+        # via LLM/regex, it stores the date on the ruling row
+        # (rulings.hearing_date NOT NULL) but the document row may
+        # remain NULL.  Without this fallback, insert_ruling is
+        # silently skipped during reingest because
+        # insert_document_and_ruling guards on hearing_date != None.
+        effective_doc_hearing = hearing_date or ruling_hearing_date
+
         doc_meta = {
             "document_id": doc_id_str,
             "state": state,
@@ -1105,7 +1119,7 @@ def reingest_batch(
             "format": doc_format,
             "case_number": case_number,
             "case_title": case_title,
-            "hearing_date": hearing_date,
+            "hearing_date": effective_doc_hearing,
             "court_id": str(court_id),
             "scraper_id": scraper_id,
             "s3_key": s3_key,
