@@ -651,6 +651,55 @@ def _24h_overlaps_posting_day(
     return today_wd in posting_weekdays
 
 
+def _count_posting_days_in_window(
+    start: datetime,
+    end: datetime,
+    posting_days: list[str] | None,
+) -> float:
+    """Count the number of posting days in a date range.
+
+    The window is inclusive of the start date and exclusive of the end date,
+    matching the half-open interval ``[start, end)`` used by the 7-day query.
+
+    When *posting_days* is ``None`` or empty, every day is considered a
+    posting day and the function returns the number of calendar days in the
+    window.
+
+    Args:
+        start: Start of the window (inclusive).
+        end: End of the window (exclusive).
+        posting_days: List of day abbreviations (Mon-Sun) when the court
+            posts content, or ``None`` for "every day".
+
+    Returns:
+        Number of posting days in the window.  Always >= 1.0 to prevent
+        division-by-zero in the caller.
+    """
+    total_days = (end - start).days
+    if total_days <= 0:
+        return 1.0
+
+    if not posting_days:
+        return float(total_days)
+
+    posting_weekdays: set[int] = set()
+    for day in posting_days:
+        if day in _DAY_ABBREVS:
+            posting_weekdays.add(_DAY_ABBREVS.index(day))
+
+    if not posting_weekdays:
+        return float(total_days)
+
+    count = 0
+    for offset in range(total_days):
+        day_wd = (start + timedelta(days=offset)).weekday()
+        if day_wd in posting_weekdays:
+            count += 1
+
+    # Return at least 1.0 to avoid division by zero.
+    return max(float(count), 1.0)
+
+
 def check_ingest_rates(
     conn: psycopg.Connection,  # type: ignore[type-arg]
     now: datetime,
@@ -690,17 +739,17 @@ def check_ingest_rates(
             counts_24h[row[0]] = row[1]
 
     # Get 7-day counts (excluding last 24h for the average baseline).
-    # The window is [now-7d, now-24h) = exactly 6 days.
-    avg_daily: dict[str, float] = {}
+    # The window is [now-7d, now-24h) = exactly 6 calendar days.
+    # The per-county posting-day-aware average is computed below in the
+    # per-county loop where baselines are available.
+    totals_7d: dict[str, int] = {}
     with conn.cursor() as cur:
         cur.execute(
             RULING_COUNTS_7D_QUERY.format(county_filter=county_filter),
             (cutoff_7d, cutoff_24h, *county_params),
         )
         for row in cur.fetchall():
-            county_name = row[0]
-            total_7d = row[1]
-            avg_daily[county_name] = total_7d / ROLLING_WINDOW_DAYS
+            totals_7d[row[0]] = row[1]
 
     # Get all active counties to check for zeros
     all_counties: list[str] = []
@@ -713,8 +762,21 @@ def check_ingest_rates(
 
     for county_name in all_counties:
         count_24h = counts_24h.get(county_name, 0)
-        daily_avg = avg_daily.get(county_name, 0.0)
         baseline = baselines.get(county_name)
+
+        # Compute the posting-day-aware 7-day average.  For counties with
+        # posting_days, divide total rulings by the number of posting days
+        # in the window (not calendar days) to avoid deflating the average
+        # on weekends.  See #1784.
+        total_7d = totals_7d.get(county_name, 0)
+        posting_days = baseline.posting_days if baseline else None
+        window_posting_days = _count_posting_days_in_window(
+            cutoff_7d,
+            cutoff_24h,
+            posting_days,
+        )
+        daily_avg = total_7d / window_posting_days
+
         expected_daily = baseline.expected_daily_rulings if baseline else daily_avg
 
         # Zero-ruling alert (critical).
@@ -945,6 +1007,7 @@ def _collect_full_metrics(
     conn: psycopg.Connection,  # type: ignore[type-arg]
     now: datetime,
     county: str | None = None,
+    baselines: dict[str, Baselines] | None = None,
 ) -> dict[str, dict[str, Any]]:
     """Collect all per-county metrics for persistence to data_quality_metrics.
 
@@ -955,6 +1018,8 @@ def _collect_full_metrics(
         conn: Database connection.
         now: Current timestamp for time calculations.
         county: Optional county filter.
+        baselines: Per-county baseline configurations. When provided, the
+            7-day average divides by posting days instead of calendar days.
 
     Returns:
         Dict mapping county name to a flat metrics dict.  Each value dict
@@ -1013,12 +1078,20 @@ def _collect_full_metrics(
         for row in cur.fetchall():
             county_name = row[0]
             total_7d = row[1]
-            avg = round(total_7d / ROLLING_WINDOW_DAYS, 2)
+            # Use posting-day-aware denominator when baselines are available.
+            county_baseline = baselines.get(county_name) if baselines else None
+            posting_days_cfg = county_baseline.posting_days if county_baseline else None
+            window_posting_days = _count_posting_days_in_window(
+                cutoff_7d,
+                cutoff_24h,
+                posting_days_cfg,
+            )
+            avg = round(total_7d / window_posting_days, 2)
             _ensure(county_name)["ruling_count_7d_avg"] = {
                 "value": avg,
                 "metadata": {
                     "total_7d_window": total_7d,
-                    "window_days": ROLLING_WINDOW_DAYS,
+                    "window_days": window_posting_days,
                 },
             }
 
@@ -1322,7 +1395,7 @@ def run_checks_full(
 
         # Single metric collection pass — we derive the legacy snapshot
         # format from the full metrics to avoid duplicate queries.
-        full_metrics = _collect_full_metrics(conn, now, county)
+        full_metrics = _collect_full_metrics(conn, now, county, baselines)
         county_metrics = _format_metrics_for_snapshot(full_metrics)
 
         if persist:

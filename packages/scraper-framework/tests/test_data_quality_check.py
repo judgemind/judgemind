@@ -45,6 +45,7 @@ _issue_labels = dqc._issue_labels
 _check_duplicate = dqc._check_duplicate
 _file_single_issue = dqc._file_single_issue
 _24h_overlaps_posting_day = dqc._24h_overlaps_posting_day
+_count_posting_days_in_window = dqc._count_posting_days_in_window
 MIN_FIELD_CHECK_SAMPLE_SIZE = dqc.MIN_FIELD_CHECK_SAMPLE_SIZE
 FIELD_COMPLETENESS_GRACE_MINUTES = dqc.FIELD_COMPLETENESS_GRACE_MINUTES
 FIELD_COMPLETENESS_WINDOW_DAYS = dqc.FIELD_COMPLETENESS_WINDOW_DAYS
@@ -93,6 +94,7 @@ def _make_baselines(
             schedule_type=cfg.get("schedule_type", "daily"),
             posting_days=cfg.get("posting_days"),
             max_expected_gap_hours=cfg.get("max_expected_gap_hours"),
+            low_volume=cfg.get("low_volume", False),
         )
         for name, cfg in counties.items()
     }
@@ -493,6 +495,99 @@ class Test24hOverlapsPostingDay:
         assert _24h_overlaps_posting_day(friday, ["Xyz", "Abc"]) is True
 
 
+class TestCountPostingDaysInWindow:
+    """Tests for _count_posting_days_in_window helper."""
+
+    def test_none_posting_days_returns_calendar_days(self) -> None:
+        """No posting_days means all calendar days are posting days."""
+        start = datetime(2026, 3, 16, 12, 0, 0, tzinfo=UTC)  # Monday
+        end = datetime(2026, 3, 22, 12, 0, 0, tzinfo=UTC)  # Sunday
+        assert _count_posting_days_in_window(start, end, None) == 6.0
+
+    def test_empty_posting_days_returns_calendar_days(self) -> None:
+        """Empty list treated same as None."""
+        start = datetime(2026, 3, 16, 12, 0, 0, tzinfo=UTC)
+        end = datetime(2026, 3, 22, 12, 0, 0, tzinfo=UTC)
+        assert _count_posting_days_in_window(start, end, []) == 6.0
+
+    def test_mon_fri_over_full_week(self) -> None:
+        """Mon-Fri posting over a 6-day window starting Monday has 5 posting days.
+
+        Window [Mon Mar 16, Sun Mar 22) = Mon, Tue, Wed, Thu, Fri, Sat
+        Posting days: Mon, Tue, Wed, Thu, Fri = 5.
+        """
+        start = datetime(2026, 3, 16, 12, 0, 0, tzinfo=UTC)  # Monday
+        end = datetime(2026, 3, 22, 12, 0, 0, tzinfo=UTC)  # Sunday
+        posting_days = ["Mon", "Tue", "Wed", "Thu", "Fri"]
+        assert _count_posting_days_in_window(start, end, posting_days) == 5.0
+
+    def test_mon_fri_window_starting_wednesday(self) -> None:
+        """6-day window starting Wed: Wed, Thu, Fri, Sat, Sun, Mon = 4 posting days."""
+        start = datetime(2026, 3, 18, 12, 0, 0, tzinfo=UTC)  # Wednesday
+        end = datetime(2026, 3, 24, 12, 0, 0, tzinfo=UTC)  # Monday
+        posting_days = ["Mon", "Tue", "Wed", "Thu", "Fri"]
+        assert _count_posting_days_in_window(start, end, posting_days) == 4.0
+
+    def test_mon_thu_over_6_day_window(self) -> None:
+        """Mon-Thu posting over a 6-day window starting Monday.
+
+        Window: Mon, Tue, Wed, Thu, Fri, Sat = 4 posting days.
+        """
+        start = datetime(2026, 3, 16, 12, 0, 0, tzinfo=UTC)  # Monday
+        end = datetime(2026, 3, 22, 12, 0, 0, tzinfo=UTC)  # Sunday
+        posting_days = ["Mon", "Tue", "Wed", "Thu"]
+        assert _count_posting_days_in_window(start, end, posting_days) == 4.0
+
+    def test_tue_thu_sparse_posting(self) -> None:
+        """Tue/Thu posting over 6-day window starting Monday.
+
+        Window: Mon, Tue, Wed, Thu, Fri, Sat = 2 posting days (Tue, Thu).
+        """
+        start = datetime(2026, 3, 16, 12, 0, 0, tzinfo=UTC)  # Monday
+        end = datetime(2026, 3, 22, 12, 0, 0, tzinfo=UTC)  # Sunday
+        posting_days = ["Tue", "Thu"]
+        assert _count_posting_days_in_window(start, end, posting_days) == 2.0
+
+    def test_no_posting_days_in_window_returns_one(self) -> None:
+        """Window with zero posting days returns 1.0 (prevents division by zero).
+
+        Window [Sat, Mon) = Sat, Sun = 0 posting days for Mon-Fri schedule.
+        Returns 1.0 as floor.
+        """
+        start = datetime(2026, 3, 21, 12, 0, 0, tzinfo=UTC)  # Saturday
+        end = datetime(2026, 3, 23, 12, 0, 0, tzinfo=UTC)  # Monday
+        posting_days = ["Mon", "Tue", "Wed", "Thu", "Fri"]
+        assert _count_posting_days_in_window(start, end, posting_days) == 1.0
+
+    def test_zero_or_negative_window_returns_one(self) -> None:
+        """Zero-length or negative window returns 1.0."""
+        ts = datetime(2026, 3, 18, 12, 0, 0, tzinfo=UTC)
+        assert _count_posting_days_in_window(ts, ts, ["Mon"]) == 1.0
+        # Negative window (start > end)
+        start = datetime(2026, 3, 20, 12, 0, 0, tzinfo=UTC)
+        end = datetime(2026, 3, 18, 12, 0, 0, tzinfo=UTC)
+        assert _count_posting_days_in_window(start, end, ["Mon"]) == 1.0
+
+    def test_invalid_day_names_ignored(self) -> None:
+        """Invalid day names are silently skipped, falls back to calendar days."""
+        start = datetime(2026, 3, 16, 12, 0, 0, tzinfo=UTC)
+        end = datetime(2026, 3, 22, 12, 0, 0, tzinfo=UTC)
+        assert _count_posting_days_in_window(start, end, ["Xyz", "Abc"]) == 6.0
+
+    def test_single_day_window_posting_day(self) -> None:
+        """Single-day window on a posting day returns 1.0."""
+        start = datetime(2026, 3, 16, 12, 0, 0, tzinfo=UTC)  # Monday
+        end = datetime(2026, 3, 17, 12, 0, 0, tzinfo=UTC)  # Tuesday
+        assert _count_posting_days_in_window(start, end, ["Mon"]) == 1.0
+
+    def test_single_day_window_non_posting_day(self) -> None:
+        """Single-day window on a non-posting day returns 1.0 (floor)."""
+        start = datetime(2026, 3, 21, 12, 0, 0, tzinfo=UTC)  # Saturday
+        end = datetime(2026, 3, 22, 12, 0, 0, tzinfo=UTC)  # Sunday
+        posting_days = ["Mon", "Tue", "Wed", "Thu", "Fri"]
+        assert _count_posting_days_in_window(start, end, posting_days) == 1.0
+
+
 class TestCheckIngestRatesPostingDays:
     """Tests for posting_days suppression in check_ingest_rates."""
 
@@ -736,6 +831,161 @@ class TestCheckIngestRatesPostingDays:
         assert len(alerts) == 1
         assert alerts[0].metric == "ingest_rate"
         assert alerts[0].severity == "p2"
+
+
+class TestPostingDayAwareAverage:
+    """Tests that the 7-day average divides by posting days, not calendar days.
+
+    Fixes #1784: for a Mon-Fri county, the 7-day average should divide by
+    the number of posting days in the window (typically 4-5), not by 6
+    calendar days.  This prevents the average from being artificially
+    deflated by weekends.
+    """
+
+    def test_mon_fri_county_average_divides_by_posting_days(self) -> None:
+        """For a Mon-Fri county, 7d average should use posting days not calendar days.
+
+        Window [now-7d, now-24h) on a Wednesday = Wed-Mon = 6 calendar days.
+        Days: Wed(post), Thu(post), Fri(post), Sat(skip), Sun(skip), Mon(post) = 4 posting days.
+        With 200 rulings in the window: avg should be 200/4 = 50, not 200/6 = 33.3.
+        """
+        # 2026-03-18 is Wednesday
+        wednesday = datetime(2026, 3, 18, 12, 0, 0, tzinfo=UTC)
+        conn = FakeConnection(
+            {
+                # 7d window: 200 rulings total
+                "d.captured_at <": [("Los Angeles", 200)],
+                # 24h: 45 rulings — normal for a posting day
+                "d.captured_at >=": [("Los Angeles", 45)],
+                "DISTINCT ct.county": [("Los Angeles",)],
+            }
+        )
+        baselines = _make_baselines(
+            {
+                "Los Angeles": {
+                    "expected_daily_rulings": 50,
+                    "schedule_type": "daily",
+                    "posting_days": ["Mon", "Tue", "Wed", "Thu", "Fri"],
+                },
+            }
+        )
+        alerts = check_ingest_rates(conn, wednesday, baselines)
+        # 200 / 4 posting days = 50/day avg. 45 is >= 50 * 0.5 = 25. No alert.
+        assert len(alerts) == 0
+
+    def test_mon_fri_county_detects_real_drop_with_accurate_average(self) -> None:
+        """A real drop is still detected with posting-day-aware average.
+
+        With 200 rulings in 4 posting days: avg = 50/day.
+        If today's count (20) is below 50 * 0.5 = 25, alert fires.
+        With the old calendar-day average: 200/6 = 33.3, threshold = 16.65,
+        so 20 would NOT trigger — the old code missed this real drop.
+        """
+        wednesday = datetime(2026, 3, 18, 12, 0, 0, tzinfo=UTC)
+        conn = FakeConnection(
+            {
+                "d.captured_at <": [("Los Angeles", 200)],
+                # 20 rulings — below 50% of posting-day avg (50), but above
+                # 50% of old calendar avg (33.3)
+                "d.captured_at >=": [("Los Angeles", 20)],
+                "DISTINCT ct.county": [("Los Angeles",)],
+            }
+        )
+        baselines = _make_baselines(
+            {
+                "Los Angeles": {
+                    "expected_daily_rulings": 50,
+                    "schedule_type": "daily",
+                    "posting_days": ["Mon", "Tue", "Wed", "Thu", "Fri"],
+                },
+            }
+        )
+        alerts = check_ingest_rates(conn, wednesday, baselines)
+        # 200 / 4 = 50/day avg. 20 < 50 * 0.5 = 25. Should alert.
+        assert len(alerts) == 1
+        assert alerts[0].metric == "ingest_rate"
+        assert alerts[0].actual == 20
+        assert alerts[0].expected == 50.0
+
+    def test_no_posting_days_uses_calendar_days(self) -> None:
+        """Without posting_days config, falls back to calendar days (backward compat)."""
+        wednesday = datetime(2026, 3, 18, 12, 0, 0, tzinfo=UTC)
+        conn = FakeConnection(
+            {
+                "d.captured_at <": [("TestCounty", 120)],
+                "d.captured_at >=": [("TestCounty", 5)],
+                "DISTINCT ct.county": [("TestCounty",)],
+            }
+        )
+        baselines = _make_baselines(
+            {
+                "TestCounty": {
+                    "expected_daily_rulings": 20,
+                    "schedule_type": "daily",
+                    # No posting_days
+                },
+            }
+        )
+        alerts = check_ingest_rates(conn, wednesday, baselines)
+        # 120 / 6.0 = 20/day. 5 < 20 * 0.5 = 10. Alert fires.
+        assert len(alerts) == 1
+        assert alerts[0].expected == 20.0
+
+    def test_tue_thu_county_average(self) -> None:
+        """A Tue/Thu-only posting county gets correct posting-day average.
+
+        On Thursday, the 6-day window [Fri-Wed] contains 1 posting day (Tue).
+        50 rulings / 1 = 50/day. If 24h count is 45, no alert.
+        """
+        thursday = datetime(2026, 3, 19, 12, 0, 0, tzinfo=UTC)
+        conn = FakeConnection(
+            {
+                "d.captured_at <": [("San Francisco", 50)],
+                "d.captured_at >=": [("San Francisco", 45)],
+                "DISTINCT ct.county": [("San Francisco",)],
+            }
+        )
+        baselines = _make_baselines(
+            {
+                "San Francisco": {
+                    "expected_daily_rulings": 0.5,
+                    "schedule_type": "daily",
+                    "posting_days": ["Tue", "Thu"],
+                },
+            }
+        )
+        alerts = check_ingest_rates(conn, thursday, baselines)
+        assert len(alerts) == 0
+
+    def test_low_volume_county_not_broken(self) -> None:
+        """Low-volume counties with posting_days still work correctly.
+
+        This ensures the posting-day-aware average doesn't break
+        low_volume county handling (acceptance criterion 4).
+        """
+        # Thursday is a posting day for Santa Clara (Mon-Thu)
+        thursday = datetime(2026, 3, 19, 12, 0, 0, tzinfo=UTC)
+        conn = FakeConnection(
+            {
+                "d.captured_at <": [("Santa Clara", 1)],
+                "d.captured_at >=": [],
+                "DISTINCT ct.county": [("Santa Clara",)],
+            }
+        )
+        baselines = _make_baselines(
+            {
+                "Santa Clara": {
+                    "expected_daily_rulings": 0.1,
+                    "schedule_type": "daily",
+                    "posting_days": ["Mon", "Tue", "Wed", "Thu"],
+                    "low_volume": True,
+                },
+            }
+        )
+        alerts = check_ingest_rates(conn, thursday, baselines)
+        # Zero rulings on a posting day with expected > 0 should fire
+        assert len(alerts) == 1
+        assert alerts[0].metric == "zero_rulings"
 
 
 class TestBackfillSpikeResilience:
@@ -2725,7 +2975,7 @@ class TestCollectFullMetrics:
         assert m["metadata"]["by_doc_type"]["minute_order"] == 12
 
     def test_collects_ruling_count_7d_avg(self) -> None:
-        """Collects ruling_count_7d_avg from 7-day window."""
+        """Collects ruling_count_7d_avg from 7-day window (no baselines = calendar days)."""
         conn = FakeConnection(
             {
                 # 7d query matches first via "captured_at < %s"
@@ -2742,8 +2992,42 @@ class TestCollectFullMetrics:
         result = _collect_full_metrics(conn, NOW)
         assert "Orange" in result
         m = result["Orange"]["ruling_count_7d_avg"]
-        assert m["value"] == round(120 / 6.0, 2)  # ROLLING_WINDOW_DAYS = 6
+        assert m["value"] == round(120 / 6.0, 2)  # No baselines = calendar days
         assert m["metadata"]["total_7d_window"] == 120
+
+    def test_collects_ruling_count_7d_avg_with_posting_days(self) -> None:
+        """7d average uses posting days when baselines are provided (#1784)."""
+        # NOW is 2026-03-11 12:00 (Wednesday).
+        # 7d window = [Mar 4 12:00, Mar 10 12:00) = 6 calendar days.
+        # Days: Tue Mar 4, Wed Mar 5, Thu Mar 6, Fri Mar 7, Sat Mar 8, Sun Mar 9
+        # Mon-Fri posting days in window: Tue, Wed, Thu, Fri = 4
+        conn = FakeConnection(
+            {
+                "captured_at < %s": [("Orange", 120)],
+                "AS ruling_count": [],
+                "d.document_type": [],
+                "has_ruling": [],
+                "r.judge_id IS NULL": [],
+                "ranked_runs": [],
+                "success_count": [],
+            }
+        )
+        orange_baselines = _make_baselines(
+            {
+                "Orange": {
+                    "expected_daily_rulings": 20,
+                    "schedule_type": "daily",
+                    "posting_days": ["Mon", "Tue", "Wed", "Thu", "Fri"],
+                },
+            }
+        )
+        result = _collect_full_metrics(conn, NOW, baselines=orange_baselines)
+        assert "Orange" in result
+        m = result["Orange"]["ruling_count_7d_avg"]
+        # 120 / 4 posting days = 30.0
+        assert m["value"] == 30.0
+        assert m["metadata"]["total_7d_window"] == 120
+        assert m["metadata"]["window_days"] == 4.0
 
     def test_collects_field_completeness_metrics(self) -> None:
         """Collects overall and per-field completeness metrics."""
