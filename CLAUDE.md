@@ -60,6 +60,19 @@ Judgemind is a free, open-source legal research platform replacing Trellis.law. 
 - **Self-funded and free.** Every architecture decision must consider cost. Prefer fixed-cost over usage-based. Never assume unlimited budget.
 - **API-first.** The web app is a client of the API. Every UI feature has an API endpoint.
 
+### Key Documentation
+
+Consult these docs before making changes in their domain:
+
+| Document | When to consult |
+|----------|-----------------|
+| `docs/specs/product-spec-v3.md` | Product requirements, feature priorities, scope decisions |
+| `docs/specs/user-journeys.md` | UI/UX decisions, feature design, evaluating what to build |
+| `docs/specs/architecture-spec-v1.md` | Ingestion pipeline, data model, infrastructure decisions |
+| `docs/web-patterns.md` | **All frontend work** — page layout patterns, component usage, consistency rules |
+| `docs/BRAND.md` | Colors, typography, design principles for all visual work |
+| `docs/web-lessons.md` | Frontend incident lessons, server component error handling |
+
 ## Starting a New Session
 
 Wait for the user's instruction before deciding what to do. Sessions fall into two modes:
@@ -280,6 +293,7 @@ Run scripts via `scripts/run-py.sh scripts/<name>.py` — it reads the header an
 - Next.js 14+ for frontend
 - ESLint + Prettier
 - In `packages/web/src/app/`, use `@/` path aliases instead of deep relative imports (`../../` or deeper). The `local/prefer-path-alias` ESLint rule enforces this. Deep relative imports break when route groups are reorganised.
+- **Follow `docs/web-patterns.md`** for all page layout, component usage, and consistency decisions. This is mandatory for frontend work.
 - Jest or Vitest for testing
 
 ### General
