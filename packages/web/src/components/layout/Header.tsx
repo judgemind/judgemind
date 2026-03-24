@@ -7,6 +7,7 @@ import { Menu, Moon, Sun, LogOut, User } from 'lucide-react';
 import { useTheme } from '@/providers/ThemeProvider';
 import { useAuth } from '@/providers/AuthProvider';
 import { Sidebar } from '@/components/layout/Sidebar';
+import { Wordmark } from '@/components/Wordmark';
 import { Button } from '@/components/ui/button';
 import {
   DropdownMenu,
@@ -46,8 +47,8 @@ export function Header() {
           </Button>
         )}
 
-        <Link href="/" className="mr-8 rounded-md text-lg font-semibold text-brand-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 dark:text-brand-accent-light">
-          Judgemind
+        <Link href="/" className="mr-8 rounded-md focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2">
+          <Wordmark size="sm" />
         </Link>
 
         {/* Spacer — sidebar owns all navigation */}
@@ -103,8 +104,8 @@ export function Header() {
         <Sheet open={menuOpen} onOpenChange={setMenuOpen}>
           <SheetContent side="left" className="w-64 p-0">
             <SheetHeader className="border-b px-4 py-3">
-              <SheetTitle className="text-lg font-semibold text-brand-accent dark:text-brand-accent-light">
-                Judgemind
+              <SheetTitle>
+                <Wordmark size="sm" />
               </SheetTitle>
             </SheetHeader>
             <Sidebar onLinkClick={() => setMenuOpen(false)} />

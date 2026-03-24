@@ -81,7 +81,8 @@ describe('Header mobile menu', () => {
   it('does not show mobile sidebar initially', () => {
     render(<Header />);
     // Sheet is closed by default — its content is not rendered
-    expect(screen.queryByText('Judgemind')).toBeTruthy(); // header logo
+    // The wordmark renders "judge" and "mind" as separate spans
+    expect(screen.queryByText('judge')).toBeTruthy(); // header logo
   });
 
   it('opens mobile sidebar when hamburger is clicked', () => {
