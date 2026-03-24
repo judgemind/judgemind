@@ -249,7 +249,7 @@ describe('SearchPage (render)', () => {
     render(<SearchPage />);
     expect(screen.getByText('Granted')).toBeInTheDocument();
     expect(screen.getByText('Denied')).toBeInTheDocument();
-    expect(screen.getByText('Partial')).toBeInTheDocument();
+    expect(screen.getByText('Granted In Part')).toBeInTheDocument();
     expect(screen.getByText('Moot')).toBeInTheDocument();
     expect(screen.getByText('Continued')).toBeInTheDocument();
   });

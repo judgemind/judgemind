@@ -132,16 +132,29 @@ export function getOutcomeBadgeClass(outcome: string | null): string {
   return OUTCOME_CLASS_MAP[outcome] ?? OUTCOME_CLASS_FALLBACK;
 }
 
-/** Mapping from outcome code to subtle semantic tint classes for outline badges on feed/list views. */
+/** Mapping from outcome code to subtle semantic tint classes for outline badges on feed/list views.
+ *  Colors follow BRAND.md semantic palette:
+ *  - Green 700 (#15803d) for granted outcomes (including granted_in_part)
+ *  - Red 700 (#b91c1c) for denied outcomes (including denied_in_part)
+ *  - Stone 500 (#78716c) for neutral/moot outcomes
+ */
 const OUTCOME_LIST_CLASS_MAP: Record<string, string> = {
   granted:
     'text-green-700 border-green-300 dark:text-green-400 dark:border-green-700',
   denied:
     'text-red-700 border-red-300 dark:text-red-400 dark:border-red-700',
   granted_in_part:
-    'text-yellow-700 border-yellow-300 dark:text-yellow-400 dark:border-yellow-700',
+    'text-green-700 border-green-300 dark:text-green-400 dark:border-green-700',
   denied_in_part:
-    'text-yellow-700 border-yellow-300 dark:text-yellow-400 dark:border-yellow-700',
+    'text-red-700 border-red-300 dark:text-red-400 dark:border-red-700',
+  moot:
+    'text-stone-500 border-stone-300 dark:text-stone-400 dark:border-stone-600',
+  continued:
+    'text-stone-500 border-stone-300 dark:text-stone-400 dark:border-stone-600',
+  off_calendar:
+    'text-stone-500 border-stone-300 dark:text-stone-400 dark:border-stone-600',
+  other:
+    'text-stone-500 border-stone-300 dark:text-stone-400 dark:border-stone-600',
 };
 
 /**

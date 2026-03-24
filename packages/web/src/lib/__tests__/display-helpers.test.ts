@@ -1174,14 +1174,34 @@ describe('getOutcomeBadgeListClass', () => {
     expect(getOutcomeBadgeListClass('denied')).toContain('dark:text-red-400');
   });
 
-  it('returns yellow tint classes for granted_in_part', () => {
-    expect(getOutcomeBadgeListClass('granted_in_part')).toContain('text-yellow-700');
-    expect(getOutcomeBadgeListClass('granted_in_part')).toContain('border-yellow-300');
+  it('returns green tint classes for granted_in_part (#1740 — BRAND.md semantic colors)', () => {
+    expect(getOutcomeBadgeListClass('granted_in_part')).toContain('text-green-700');
+    expect(getOutcomeBadgeListClass('granted_in_part')).toContain('border-green-300');
   });
 
-  it('returns yellow tint classes for denied_in_part', () => {
-    expect(getOutcomeBadgeListClass('denied_in_part')).toContain('text-yellow-700');
-    expect(getOutcomeBadgeListClass('denied_in_part')).toContain('border-yellow-300');
+  it('returns red tint classes for denied_in_part (#1740 — BRAND.md semantic colors)', () => {
+    expect(getOutcomeBadgeListClass('denied_in_part')).toContain('text-red-700');
+    expect(getOutcomeBadgeListClass('denied_in_part')).toContain('border-red-300');
+  });
+
+  it('returns stone tint classes for moot (#1740 — BRAND.md neutral outcomes)', () => {
+    expect(getOutcomeBadgeListClass('moot')).toContain('text-stone-500');
+    expect(getOutcomeBadgeListClass('moot')).toContain('border-stone-300');
+  });
+
+  it('returns stone tint classes for continued (#1740 — BRAND.md neutral outcomes)', () => {
+    expect(getOutcomeBadgeListClass('continued')).toContain('text-stone-500');
+    expect(getOutcomeBadgeListClass('continued')).toContain('border-stone-300');
+  });
+
+  it('returns stone tint classes for off_calendar (#1740 — BRAND.md neutral outcomes)', () => {
+    expect(getOutcomeBadgeListClass('off_calendar')).toContain('text-stone-500');
+    expect(getOutcomeBadgeListClass('off_calendar')).toContain('border-stone-300');
+  });
+
+  it('returns stone tint classes for other (#1740 — BRAND.md neutral outcomes)', () => {
+    expect(getOutcomeBadgeListClass('other')).toContain('text-stone-500');
+    expect(getOutcomeBadgeListClass('other')).toContain('border-stone-300');
   });
 
   it('returns empty string for null', () => {
@@ -1190,13 +1210,5 @@ describe('getOutcomeBadgeListClass', () => {
 
   it('returns empty string for unknown outcome', () => {
     expect(getOutcomeBadgeListClass('something_unknown')).toBe('');
-  });
-
-  it('returns empty string for moot (no specific tint)', () => {
-    expect(getOutcomeBadgeListClass('moot')).toBe('');
-  });
-
-  it('returns empty string for continued (no specific tint)', () => {
-    expect(getOutcomeBadgeListClass('continued')).toBe('');
   });
 });

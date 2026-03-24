@@ -8,12 +8,10 @@ import { Badge } from '@/components/ui/badge';
 import { Skeleton } from '@/components/ui/skeleton';
 import {
   formatDate,
-  formatOutcome,
   formatMotionType,
   formatJudgeName,
-  getOutcomeBadgeVariant,
-  getOutcomeBadgeListClass,
 } from '@/lib/display-helpers';
+import { OutcomeBadge } from '@/components/OutcomeBadge';
 import { Wordmark } from '@/components/Wordmark';
 import { PAGE_TITLE, SECTION_HEADING } from '@/lib/typography';
 
@@ -226,12 +224,7 @@ function RecentRulings() {
                   </div>
 
                   <div className="mt-2 flex flex-wrap gap-2">
-                    <Badge
-                      variant={getOutcomeBadgeVariant(node.outcome)}
-                      className={getOutcomeBadgeListClass(node.outcome)}
-                    >
-                      {formatOutcome(node.outcome)}
-                    </Badge>
+                    <OutcomeBadge outcome={node.outcome} />
                     <Badge variant="outline" className="text-muted-foreground">
                       {formatMotionType(node.motionType)}
                     </Badge>
