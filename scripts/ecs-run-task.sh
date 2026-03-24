@@ -208,7 +208,7 @@ PYEOF
 
     # Retry log retrieval — CloudWatch may still be ingesting events
     LOGS_OK=false
-    for _retry_wait in 0 5 10; do
+    for _retry_wait in 0 5 10 15; do
         if [[ "$_retry_wait" -gt 0 ]]; then
             echo "Retrying in ${_retry_wait}s..." >&2
             sleep "$_retry_wait"
@@ -540,7 +540,9 @@ container = {
     "essential": True,
     "entryPoint": ["bash", "-c"],
     "command": [command_str],
-    "environment": source_container.get("environment", []),
+    "environment": source_container.get("environment", []) + [
+        {"name": "PYTHONUNBUFFERED", "value": "1"},
+    ],
     "secrets": source_container.get("secrets", []),
     "logConfiguration": {
         "logDriver": "awslogs",
@@ -829,8 +831,8 @@ done
 # short-lived tasks), retry a few times with a brief delay — CloudWatch
 # may still be creating the stream.
 if [[ "$LOG_STREAMING" == "false" ]]; then
-    for _retry in 1 2 3; do
-        sleep 3
+    for _stream_wait in 3 5 7 10; do
+        sleep "$_stream_wait"
         LOG_STREAM_NAME=$(find_log_stream)
         if [[ -n "$LOG_STREAM_NAME" ]]; then
             echo "Log stream: ${LOG_STREAM_NAME}" >&2
@@ -906,7 +908,7 @@ if [[ "$LOG_STREAMING" == "false" || "$LOG_EVENTS_EMITTED" == "false" ]]; then
     # 10-30 seconds to create the log stream after task completion,
     # especially for short-lived tasks.
     LOGS_RETRIEVED=false
-    for _log_wait in 5 10 15; do
+    for _log_wait in 5 10 30; do
         echo "Waiting ${_log_wait}s for CloudWatch log stream..." >&2
         sleep "$_log_wait"
         if "$REPO_ROOT/scripts/ecs-logs.sh" "$LOG_GROUP" --task "$TASK_ID" --lines 200; then
