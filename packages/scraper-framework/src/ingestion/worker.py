@@ -724,6 +724,16 @@ class IngestionWorker:
                 judge_name = extract_judge_name(ruling_text)
                 if judge_name is not None:
                     extraction_methods["judge_name"] = "regex_post_llm"
+            if not parties_data:
+                eff_title = case_title or event_data.get("case_title")
+                if eff_title:
+                    parties_data = extract_parties_from_caption(eff_title)
+                    if parties_data:
+                        extraction_methods["parties"] = "regex_post_llm"
+            if case_type is None and case_number:
+                case_type = extract_case_type_from_number(case_number)
+                if case_type:
+                    extraction_methods["case_type"] = "regex_post_llm"
 
         # Clean ruling text for display — extraction uses raw text above for
         # better regex matching; the cleaned version is stored in Postgres.

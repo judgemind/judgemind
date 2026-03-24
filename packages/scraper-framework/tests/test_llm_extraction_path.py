@@ -684,6 +684,171 @@ class TestLlmExtractedFlag:
         # judge_name regex extractor should NOT have been called.
         mock_extract_judge.assert_not_called()
 
+    @patch("ingestion.worker.batch_upsert_parties")
+    @patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
+    @patch(
+        "ingestion.worker.extract_parties_from_caption",
+        return_value=[{"name": "Smith", "role": "plaintiff"}],
+    )
+    @patch("ingestion.worker.psycopg")
+    def test_llm_extracted_applies_regex_for_missing_parties(
+        self,
+        mock_psycopg: MagicMock,
+        mock_extract_parties: MagicMock,
+        mock_resolve_judge: MagicMock,
+        mock_batch_upsert: MagicMock,
+    ) -> None:
+        """_llm_extracted events missing parties get regex fallback (#1824)."""
+        worker, _ = _make_worker()
+
+        mock_conn, mock_cur = _make_mock_conn()
+        mock_psycopg.connect.return_value = mock_conn
+        mock_cur.fetchone.side_effect = [
+            ("court-uuid-1",),
+            ("case-uuid-1",),
+            (True,),
+        ]
+
+        # Simulate multimodal event missing parties but having a case title.
+        event = _make_event(
+            _split_processed=True,
+            _llm_extracted=True,
+            case_number="2024-01234567",
+            case_title="Smith v. Jones",
+            judge_name="Hon. Jane Doe",
+            ruling_text="The motion is GRANTED.",
+            outcome="granted",
+            motion_type="demurrer",
+        )
+
+        worker.process_event(event)
+
+        # extract_parties_from_caption should have been called.
+        mock_extract_parties.assert_called_once_with("Smith v. Jones")
+
+    @patch("ingestion.worker.batch_upsert_parties")
+    @patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
+    @patch("ingestion.worker.extract_parties_from_caption")
+    @patch("ingestion.worker.psycopg")
+    def test_llm_extracted_skips_parties_regex_when_populated(
+        self,
+        mock_psycopg: MagicMock,
+        mock_extract_parties: MagicMock,
+        mock_resolve_judge: MagicMock,
+        mock_batch_upsert: MagicMock,
+    ) -> None:
+        """_llm_extracted events with parties already populated skip regex fallback."""
+        worker, _ = _make_worker()
+
+        mock_conn, mock_cur = _make_mock_conn()
+        mock_psycopg.connect.return_value = mock_conn
+        mock_cur.fetchone.side_effect = [
+            ("court-uuid-1",),
+            ("case-uuid-1",),
+            (True,),
+        ]
+
+        # Event already has parties from LLM extraction.
+        event = _make_event(
+            _split_processed=True,
+            _llm_extracted=True,
+            case_number="2024-01234567",
+            case_title="Smith v. Jones",
+            judge_name="Hon. Jane Doe",
+            ruling_text="The motion is GRANTED.",
+            outcome="granted",
+            motion_type="demurrer",
+            parties=[{"name": "Smith", "role": "plaintiff"}],
+        )
+
+        worker.process_event(event)
+
+        # extract_parties_from_caption should NOT have been called.
+        mock_extract_parties.assert_not_called()
+
+    @patch("ingestion.worker.batch_upsert_parties")
+    @patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
+    @patch(
+        "ingestion.worker.extract_case_type_from_number",
+        return_value="civil",
+    )
+    @patch("ingestion.worker.psycopg")
+    def test_llm_extracted_applies_regex_for_missing_case_type(
+        self,
+        mock_psycopg: MagicMock,
+        mock_extract_case_type: MagicMock,
+        mock_resolve_judge: MagicMock,
+        mock_batch_upsert: MagicMock,
+    ) -> None:
+        """_llm_extracted events missing case_type get regex fallback (#1824)."""
+        worker, _ = _make_worker()
+
+        mock_conn, mock_cur = _make_mock_conn()
+        mock_psycopg.connect.return_value = mock_conn
+        mock_cur.fetchone.side_effect = [
+            ("court-uuid-1",),
+            ("case-uuid-1",),
+            (True,),
+        ]
+
+        # Simulate multimodal event missing case_type but having case_number.
+        event = _make_event(
+            _split_processed=True,
+            _llm_extracted=True,
+            case_number="23STCV12345",
+            case_title="Smith v. Jones",
+            judge_name="Hon. Jane Doe",
+            ruling_text="The motion is GRANTED.",
+            outcome="granted",
+            motion_type="demurrer",
+        )
+
+        worker.process_event(event)
+
+        # extract_case_type_from_number should have been called.
+        mock_extract_case_type.assert_called_once_with("23STCV12345")
+
+    @patch("ingestion.worker.batch_upsert_parties")
+    @patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
+    @patch("ingestion.worker.extract_case_type_from_number")
+    @patch("ingestion.worker.psycopg")
+    def test_llm_extracted_skips_case_type_regex_when_populated(
+        self,
+        mock_psycopg: MagicMock,
+        mock_extract_case_type: MagicMock,
+        mock_resolve_judge: MagicMock,
+        mock_batch_upsert: MagicMock,
+    ) -> None:
+        """_llm_extracted events with case_type already populated skip regex fallback."""
+        worker, _ = _make_worker()
+
+        mock_conn, mock_cur = _make_mock_conn()
+        mock_psycopg.connect.return_value = mock_conn
+        mock_cur.fetchone.side_effect = [
+            ("court-uuid-1",),
+            ("case-uuid-1",),
+            (True,),
+        ]
+
+        # Event already has case_type.
+        event = _make_event(
+            _split_processed=True,
+            _llm_extracted=True,
+            case_number="23STCV12345",
+            case_title="Smith v. Jones",
+            judge_name="Hon. Jane Doe",
+            ruling_text="The motion is GRANTED.",
+            outcome="granted",
+            motion_type="demurrer",
+            case_type="civil",
+        )
+
+        worker.process_event(event)
+
+        # extract_case_type_from_number should NOT have been called
+        # in the post-LLM fallback block.
+        mock_extract_case_type.assert_not_called()
+
 
 class TestFrameworkExtractorInit:
     """Tests for lazy initialization of the framework LlmExtractor."""
