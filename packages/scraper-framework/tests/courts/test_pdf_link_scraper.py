@@ -50,6 +50,11 @@ pytestmark = pytest.mark.regression
 
 FIXTURES = Path(__file__).parent.parent / "fixtures"
 
+# Expected number of PDF links processed from riv_page.html after filtering.
+# The fixture has 17 links; 1 is excluded by ``link_text_re`` (#1845), leaving 16.
+# Mirrors _RIV_EXPECTED_PROCESSED_PDFS in test_riverside_tentatives.py — keep in sync.
+_RIV_EXPECTED_PROCESSED_PDFS = 16
+
 
 def _load_html(name: str) -> str:
     return (FIXTURES / name).read_text(encoding="utf-8")
@@ -391,9 +396,8 @@ def test_riv_full_run() -> None:
     health = scraper.run()
 
     assert health.success is True
-    # PS1 fixture has 4 rulings; 16 matching PDFs * 4 rulings = 64 records
-    # (1 of 17 links — "Department 260" — is filtered by link_text_re, #1845)
-    assert health.records_captured == 64
+    # PS1 fixture has 4 rulings per PDF; all matching PDFs * 4 = total records
+    assert health.records_captured == _RIV_EXPECTED_PROCESSED_PDFS * 4
 
 
 @respx.mock
@@ -409,9 +413,8 @@ def test_riv_run_populates_judge_and_dept() -> None:
     scraper = RiversideTentativeRulingsScraper(config=config)
 
     docs = scraper.fetch_documents()
-    # PS1 fixture has 4 rulings; 16 matching PDFs * 4 rulings = 64 after splitting
-    # (1 of 17 links — "Department 260" — is filtered by link_text_re, #1845)
-    assert len(docs) == 64
+    # PS1 fixture has 4 rulings per PDF; all matching PDFs * 4 = total after splitting
+    assert len(docs) == _RIV_EXPECTED_PROCESSED_PDFS * 4
 
     # PS1 docs should all have judge Hester (4 split rulings from PS1 PDF)
     ps1_docs = [d for d in docs if d.department == "PS1"]
@@ -529,7 +532,8 @@ def test_riv_filters_non_matching_dept_260_link() -> None:
 
     The riv_page.html fixture contains 17 PDF links, but 'Department 260'
     does not match the Riverside link_text_re pattern because it lacks
-    '- Honorable <name>'.  It should be skipped, leaving 16 links.
+    '- Honorable <name>'.  It should be skipped, leaving
+    ``_RIV_EXPECTED_PROCESSED_PDFS`` links.
     """
     html = _load_html("riv_page.html")
     pdf_bytes = _load_bytes("riv_ps1.pdf")
@@ -542,8 +546,8 @@ def test_riv_filters_non_matching_dept_260_link() -> None:
     scraper = RiversideTentativeRulingsScraper(config=config)
     docs = scraper.fetch_documents()
 
-    # 17 links on page, 1 filtered ("Department 260"), 16 * 4 rulings = 64
-    assert len(docs) == 64
+    # Filtered links * 4 rulings per PDF = total docs
+    assert len(docs) == _RIV_EXPECTED_PROCESSED_PDFS * 4
     # Verify no document has a null department (all matched the regex)
     assert all(d.department is not None for d in docs)
     assert all(d.department != "" for d in docs)
