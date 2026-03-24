@@ -261,6 +261,45 @@ class TestExtractMotionType:
         text = "Petition for Preliminary Approval of Settlement"
         assert extract_motion_type(text) == "class_action_settlement"
 
+    def test_paga_settlement(self) -> None:
+        text = "Motion for Approval of PAGA Settlement"
+        assert extract_motion_type(text) == "paga_settlement"
+
+    def test_paga_settlement_standalone(self) -> None:
+        text = "PAGA settlement is GRANTED"
+        assert extract_motion_type(text) == "paga_settlement"
+
+    def test_paga_settlement_continued(self) -> None:
+        text = "Motion \u2013 Approval of PAGA Settlement is CONTINUED"
+        assert extract_motion_type(text) == "paga_settlement"
+
+    def test_settlement_agreement(self) -> None:
+        text = "See Settlement Agreement \u00b6 II.C."
+        assert extract_motion_type(text) == "settlement_approval"
+
+    def test_settlement_approval(self) -> None:
+        text = "Motion for Settlement Approval"
+        assert extract_motion_type(text) == "settlement_approval"
+
+    def test_settlement_hearing(self) -> None:
+        text = "The court will hold a settlement hearing on March 1"
+        assert extract_motion_type(text) == "settlement_approval"
+
+    def test_approval_of_paga(self) -> None:
+        """'Approval of PAGA' variant matches paga_settlement."""
+        text = "Motion for Approval of PAGA Agreement"
+        assert extract_motion_type(text) == "paga_settlement"
+
+    def test_approval_of_global_settlement(self) -> None:
+        """'Approval of X settlement' variant matches settlement_approval."""
+        text = "Motion for Approval of the Global Settlement"
+        assert extract_motion_type(text) == "settlement_approval"
+
+    def test_class_action_before_settlement(self) -> None:
+        """Class action settlement should match before generic settlement."""
+        text = "Motion for Class Action Settlement Approval"
+        assert extract_motion_type(text) == "class_action_settlement"
+
     def test_motion_for_sanctions(self) -> None:
         text = "Motion for Sanctions under CCP 128.7"
         assert extract_motion_type(text) == "motion_for_sanctions"
@@ -1921,6 +1960,12 @@ class TestExtractCaseTypeFromMotionType:
     def test_class_action_settlement(self) -> None:
         assert extract_case_type_from_motion_type("class_action_settlement") == "civil"
 
+    def test_paga_settlement(self) -> None:
+        assert extract_case_type_from_motion_type("paga_settlement") == "civil"
+
+    def test_settlement_approval(self) -> None:
+        assert extract_case_type_from_motion_type("settlement_approval") == "civil"
+
     def test_motion_for_judgment_on_the_pleadings(self) -> None:
         assert extract_case_type_from_motion_type("motion_for_judgment_on_the_pleadings") == "civil"
 
@@ -2178,6 +2223,26 @@ class TestNormalizeMotionType:
 
     def test_already_normalized_trust_petition(self) -> None:
         assert normalize_motion_type("trust_petition") == "trust_petition"
+
+    # --- PAGA settlement and settlement approval (#1815) ---
+
+    def test_paga_settlement_title_case(self) -> None:
+        assert normalize_motion_type("PAGA Settlement") == "paga_settlement"
+
+    def test_paga_settlement_already_normalized(self) -> None:
+        assert normalize_motion_type("paga_settlement") == "paga_settlement"
+
+    def test_settlement_approval_title_case(self) -> None:
+        assert normalize_motion_type("Settlement Approval") == "settlement_approval"
+
+    def test_settlement_agreement_title_case(self) -> None:
+        assert normalize_motion_type("Settlement Agreement") == "settlement_approval"
+
+    def test_settlement_hearing_title_case(self) -> None:
+        assert normalize_motion_type("Settlement Hearing") == "settlement_approval"
+
+    def test_settlement_approval_already_normalized(self) -> None:
+        assert normalize_motion_type("settlement_approval") == "settlement_approval"
 
 
 # ---------------------------------------------------------------------------
