@@ -321,7 +321,7 @@ If unsure whether a perf pattern matters at current scale, add a `# TODO(perf):`
 **Python packages** (from the package directory):
 
 ```
-.venv/bin/ruff check src/ tests/           # Lint (rules: E, F, I, N, UP, ANN)
+.venv/bin/ruff check src/ tests/           # Lint (rules: E, F, I, N, UP, ANN, DTZ)
 .venv/bin/ruff format --check src/ tests/   # Format check
 .venv/bin/pytest tests/ -v --tb=short       # Tests with coverage
 ```
