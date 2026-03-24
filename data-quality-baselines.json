@@ -28,9 +28,10 @@
       "posting_days": ["Mon", "Tue", "Wed", "Thu", "Fri"]
     },
     "San Bernardino": {
-      "expected_daily_rulings": 10,
+      "expected_daily_rulings": 3,
       "schedule_type": "daily",
-      "posting_days": ["Mon", "Tue", "Wed", "Thu", "Fri"]
+      "posting_days": ["Mon", "Tue", "Wed", "Thu", "Fri"],
+      "_note": "Lowered from 10 to 3 (#1769): court posts 1-4 new PDFs/hearing day. Spikes (20+) occur when existing PDFs are updated, not from new postings. 49 PDFs on index page spanning ~4 weeks."
     },
     "San Diego": {
       "expected_daily_rulings": 0,
