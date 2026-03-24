@@ -58,6 +58,7 @@ def _make_document_row(
     case_title: str = "Smith v. Jones",
     hearing_date: date | None = _HEARING_DATE,
     ruling_hearing_date: date | None = _HEARING_DATE,
+    stored_ruling_text: str | None = None,
 ) -> tuple:
     """Return a tuple matching the FETCH_DOCUMENTS_QUERY columns."""
     return (
@@ -78,6 +79,7 @@ def _make_document_row(
         case_number,  # c.case_number
         case_title,  # c.case_title
         ruling_hearing_date,  # ruling_hearing_date (subquery)
+        stored_ruling_text,  # stored_ruling_text (subquery)
     )
 
 
@@ -5652,3 +5654,230 @@ class TestCLIMultimodalFlag:
         parser.add_argument("--multimodal", action="store_true")
         args = parser.parse_args([])
         assert args.multimodal is False
+
+
+# ---------------------------------------------------------------------------
+# Stored ruling_text preservation tests (#1848)
+# ---------------------------------------------------------------------------
+
+
+class TestStoredRulingTextPreservation:
+    """Verify that stored ruling_text is used for regex extraction and preserved
+    during reingest, rather than being overwritten by full PDF text (#1848)."""
+
+    def _doc_meta(self, *, stored_ruling_text: str | None = None) -> dict:
+        return {
+            "document_id": str(_DOC_ID_1),
+            "state": "CA",
+            "county": "Los Angeles",
+            "court_name": "Los Angeles Superior Court",
+            "source_url": "https://court.example.com/ruling",
+            "captured_at": _CAPTURED_AT_1,
+            "content_hash": "abc123",
+            "format": "html",
+            "case_number": "24STCV12345",
+            "case_title": "Smith v. Jones",
+            "hearing_date": _HEARING_DATE,
+            "court_id": str(_COURT_ID),
+            "scraper_id": "ca-la-tentatives-civil",
+            "s3_key": "docs/test.html",
+            "s3_bucket": "test-bucket",
+            "stored_ruling_text": stored_ruling_text,
+        }
+
+    @patch.object(reingest, "_load_scraper_registry")
+    def test_stored_ruling_text_used_for_regex_extraction(
+        self,
+        mock_registry: MagicMock,
+    ) -> None:
+        """When stored ruling_text exists, regex extraction runs against it,
+        not against the full document text from pdfplumber."""
+        # Full PDF text contains "motion to compel" which is GRANTED — this
+        # belongs to a different case in the same PDF.  The stored
+        # ruling_text for THIS case contains "demurrer" which is DENIED.
+        # If regex runs against the full text, motion_type would be
+        # "motion_to_compel" and outcome "granted".  If regex runs against
+        # stored text (correct), motion_type is "demurrer" and outcome
+        # "denied".
+        full_pdf_text = "Motion to Compel is GRANTED."
+        stored_text = "Demurrer to the complaint is DENIED."
+
+        raw = full_pdf_text.encode()
+        meta = self._doc_meta(stored_ruling_text=stored_text)
+
+        result = reingest._reparse_document(raw, "unknown-scraper", meta)
+
+        # motion_type should come from the stored ruling text (demurrer),
+        # NOT from the full PDF (which would yield motion_to_compel).
+        assert result["motion_type"] == "demurrer"
+        # outcome should come from the stored ruling text (denied),
+        # NOT from the full PDF (which would yield granted).
+        assert result["outcome"] == "denied"
+
+    @patch.object(reingest, "_load_scraper_registry")
+    def test_stored_ruling_text_preserved_in_output(
+        self,
+        mock_registry: MagicMock,
+    ) -> None:
+        """When stored ruling_text exists, it is preserved as the output
+        ruling_text instead of being replaced by the full PDF text."""
+        full_pdf_text = "Full PDF with 77000 chars of multiple rulings..."
+        stored_text = "Individual case ruling text (~1K chars)."
+
+        raw = full_pdf_text.encode()
+        meta = self._doc_meta(stored_ruling_text=stored_text)
+
+        result = reingest._reparse_document(raw, "unknown-scraper", meta)
+
+        assert result["ruling_text"] == stored_text
+
+    @patch.object(reingest, "_load_scraper_registry")
+    def test_full_text_used_when_no_stored_ruling_text(
+        self,
+        mock_registry: MagicMock,
+    ) -> None:
+        """When no stored ruling_text exists, the full PDF text is used as
+        before (backward compatible)."""
+        full_text = "Full ruling text from pdfplumber. Demurrer is GRANTED."
+
+        raw = full_text.encode()
+        meta = self._doc_meta(stored_ruling_text=None)
+
+        result = reingest._reparse_document(raw, "unknown-scraper", meta)
+
+        assert result["ruling_text"] == full_text
+        assert result["outcome"] == "granted"
+        assert result["motion_type"] == "demurrer"
+
+    @patch.object(reingest, "_load_scraper_registry")
+    def test_stored_ruling_text_nul_bytes_stripped(
+        self,
+        mock_registry: MagicMock,
+    ) -> None:
+        """NUL bytes in stored ruling_text are stripped."""
+        stored_text = "Ruling\x00 text with NUL bytes"
+
+        raw = b"<html>full doc text</html>"
+        meta = self._doc_meta(stored_ruling_text=stored_text)
+
+        result = reingest._reparse_document(raw, "unknown-scraper", meta)
+
+        assert "\x00" not in result["ruling_text"]
+        assert result["ruling_text"] == "Ruling text with NUL bytes"
+
+    def test_fetch_query_includes_stored_ruling_text(self) -> None:
+        """FETCH_DOCUMENTS_QUERY must include stored_ruling_text subquery."""
+        assert "stored_ruling_text" in reingest.FETCH_DOCUMENTS_QUERY
+
+    def test_make_document_row_includes_stored_ruling_text(self) -> None:
+        """_make_document_row supports stored_ruling_text parameter."""
+        row = _make_document_row(stored_ruling_text="test ruling")
+        # stored_ruling_text is the last element in the tuple
+        assert row[-1] == "test ruling"
+
+    def test_make_document_row_default_stored_ruling_text_is_none(self) -> None:
+        """_make_document_row defaults stored_ruling_text to None."""
+        row = _make_document_row()
+        assert row[-1] is None
+
+    @patch("reingest_from_s3.batch_upsert_parties")
+    @patch("reingest_from_s3.upsert_case_judge")
+    @patch("reingest_from_s3.resolve_judge")
+    @patch("reingest_from_s3.insert_document_and_ruling")
+    @patch("reingest_from_s3.upsert_case")
+    @patch("reingest_from_s3._reparse_document")
+    @patch("reingest_from_s3._fetch_s3_content")
+    def test_stored_ruling_text_threaded_to_doc_meta(
+        self,
+        mock_fetch_s3: MagicMock,
+        mock_reparse: MagicMock,
+        mock_upsert_case: MagicMock,
+        mock_insert_doc_and_ruling: MagicMock,
+        mock_resolve_judge: MagicMock,
+        mock_upsert_cj: MagicMock,
+        mock_batch_parties: MagicMock,
+    ) -> None:
+        """stored_ruling_text from the DB query flows into doc_meta."""
+        stored_text = "Individual ruling for this case"
+        row = _make_document_row(stored_ruling_text=stored_text)
+        conn = _mock_conn_with_rows([row])
+
+        mock_fetch_s3.return_value = b"<html>full PDF text</html>"
+        mock_reparse.return_value = {
+            "ruling_text": stored_text,
+            "case_number": "24STCV12345",
+            "case_title": "Smith v. Jones",
+            "judge_name": "Judge Doe",
+            "outcome": "granted",
+            "motion_type": "demurrer",
+            "department": "1",
+            "parties": [],
+            "hearing_date": _HEARING_DATE,
+        }
+        mock_upsert_case.return_value = "case-id"
+        mock_resolve_judge.return_value = "judge-id"
+
+        reingest.reingest_batch(
+            conn,
+            MagicMock(),
+            batch_size=10,
+            cursor=_DEFAULT_CURSOR,
+            filters="",
+            filter_params=[],
+        )
+
+        # Verify _reparse_document received doc_meta with stored_ruling_text
+        call_args = mock_reparse.call_args
+        doc_meta_arg = call_args[0][2]  # Third positional arg is doc_meta
+        assert doc_meta_arg["stored_ruling_text"] == stored_text
+
+    @patch("reingest_from_s3.batch_upsert_parties")
+    @patch("reingest_from_s3.upsert_case_judge")
+    @patch("reingest_from_s3.resolve_judge")
+    @patch("reingest_from_s3.insert_document_and_ruling")
+    @patch("reingest_from_s3.upsert_case")
+    @patch("reingest_from_s3._reparse_document")
+    @patch("reingest_from_s3._fetch_s3_content")
+    def test_ruling_text_preserved_in_db_write(
+        self,
+        mock_fetch_s3: MagicMock,
+        mock_reparse: MagicMock,
+        mock_upsert_case: MagicMock,
+        mock_insert_doc_and_ruling: MagicMock,
+        mock_resolve_judge: MagicMock,
+        mock_upsert_cj: MagicMock,
+        mock_batch_parties: MagicMock,
+    ) -> None:
+        """ruling_text passed to insert_document_and_ruling should be the
+        stored (individual) text, not the full PDF text."""
+        stored_text = "Individual ruling: Demurrer is SUSTAINED."
+        row = _make_document_row(stored_ruling_text=stored_text)
+        conn = _mock_conn_with_rows([row])
+
+        mock_fetch_s3.return_value = b"<html>Full 77K PDF with many rulings</html>"
+        # _reparse_document should return the stored text as ruling_text
+        mock_reparse.return_value = {
+            "ruling_text": stored_text,
+            "case_number": "24STCV12345",
+            "case_title": "Smith v. Jones",
+            "judge_name": "Judge Doe",
+            "outcome": "sustained",
+            "motion_type": "demurrer",
+            "department": "1",
+            "parties": [],
+            "hearing_date": _HEARING_DATE,
+        }
+        mock_upsert_case.return_value = "case-id"
+        mock_resolve_judge.return_value = "judge-id"
+
+        reingest.reingest_batch(
+            conn,
+            MagicMock(),
+            batch_size=10,
+            cursor=_DEFAULT_CURSOR,
+            filters="",
+            filter_params=[],
+        )
+
+        call_kwargs = mock_insert_doc_and_ruling.call_args[1]
+        assert call_kwargs["ruling_text"] == stored_text
