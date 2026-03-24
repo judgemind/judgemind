@@ -2329,7 +2329,7 @@ class TestReparseDocumentCaseTypeFromMotionType:
         self,
         mock_registry: MagicMock,
     ) -> None:
-        """petition motion_type derives case_type = 'probate'."""
+        """petition_for_probate motion_type derives case_type = 'probate'."""
         raw = b"<html>Petition for letters of administration</html>"
         result = reingest._reparse_document(
             raw,
@@ -2337,7 +2337,7 @@ class TestReparseDocumentCaseTypeFromMotionType:
             self._doc_meta(case_number="25HR054887C"),
         )
 
-        assert result["motion_type"] == "petition"
+        assert result["motion_type"] == "petition_for_probate"
         assert result["case_type"] == "probate"
         assert result["extraction_methods"]["case_type"] == "motion_type"
 

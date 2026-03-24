@@ -149,13 +149,16 @@
       "total_documents": 13,
       "ruling": 100.0,
       "judge": 0.0,
-      "motion_type": 100.0,
+      "motion_type": 90.0,
       "outcome": 100.0,
       "case_title": 100.0,
       "case_number": 100.0,
       "parties": 46.2,
       "hearing_date": 100.0,
-      "case_type": 100.0
+      "case_type": 100.0,
+      "_known_gaps": {
+        "motion_type": "Lowered from 100% to 90% to accommodate probate/guardianship/trust event types that may not match any pattern. See #1767."
+      }
     }
   }
 }

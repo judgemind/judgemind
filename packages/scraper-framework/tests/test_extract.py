@@ -307,6 +307,75 @@ class TestExtractMotionType:
         text = "Motion for New Trial"
         assert extract_motion_type(text) == "motion_for_new_trial"
 
+    # --- Probate/non-standard event type patterns (issue #1767) ---
+
+    def test_petition_for_probate(self) -> None:
+        text = "Petition for Probate"
+        assert extract_motion_type(text) == "petition_for_probate"
+
+    def test_petition_for_probate_in_sentence(self) -> None:
+        text = "The Petition for Probate of Will is set for hearing."
+        assert extract_motion_type(text) == "petition_for_probate"
+
+    def test_petition_probate_short(self) -> None:
+        text = "Petition Probate"
+        assert extract_motion_type(text) == "petition_for_probate"
+
+    def test_petition_to_administer_estate(self) -> None:
+        text = "Petition to Administer Estate"
+        assert extract_motion_type(text) == "petition_for_probate"
+
+    def test_petition_for_letters(self) -> None:
+        text = "Petition for Letters of Administration"
+        assert extract_motion_type(text) == "petition_for_probate"
+
+    def test_guardianship_petition(self) -> None:
+        text = "Guardianship Petition"
+        assert extract_motion_type(text) == "guardianship_petition"
+
+    def test_petition_for_guardianship(self) -> None:
+        text = "Petition for Guardianship of the Person"
+        assert extract_motion_type(text) == "guardianship_petition"
+
+    def test_petition_for_conservatorship(self) -> None:
+        text = "Petition for Conservatorship"
+        assert extract_motion_type(text) == "guardianship_petition"
+
+    def test_accounting(self) -> None:
+        text = "Accounting"
+        assert extract_motion_type(text) == "accounting"
+
+    def test_accounting_in_sentence(self) -> None:
+        text = "First and Final Accounting by personal representative"
+        assert extract_motion_type(text) == "accounting"
+
+    def test_show_cause_hearing(self) -> None:
+        text = "Show Cause Hearing"
+        assert extract_motion_type(text) == "show_cause_hearing"
+
+    def test_show_cause_hearing_in_sentence(self) -> None:
+        text = "Show Cause Hearing re: contempt"
+        assert extract_motion_type(text) == "show_cause_hearing"
+
+    def test_trust_petition(self) -> None:
+        text = "Trust Petition for modification"
+        assert extract_motion_type(text) == "trust_petition"
+
+    def test_order_to_show_cause_still_osc(self) -> None:
+        """Existing 'Order to Show Cause' should still match osc, not show_cause_hearing."""
+        text = "Order to Show Cause re: Contempt"
+        assert extract_motion_type(text) == "osc"
+
+    def test_petition_for_probate_before_generic_petition(self) -> None:
+        """'Petition for Probate' should match specific pattern, not generic 'petition'."""
+        text = "Petition for Probate"
+        assert extract_motion_type(text) == "petition_for_probate"
+
+    def test_generic_petition_still_works(self) -> None:
+        """Generic 'Petition' without probate/guardianship qualifiers should still match."""
+        text = "Petition to confirm arbitration award"
+        assert extract_motion_type(text) == "petition"
+
 
 # ---------------------------------------------------------------------------
 # Judge name extraction
@@ -1827,7 +1896,24 @@ class TestExtractCaseTypeFromMotionType:
     def test_petition(self) -> None:
         assert extract_case_type_from_motion_type("petition") == "probate"
 
+    def test_petition_for_probate(self) -> None:
+        assert extract_case_type_from_motion_type("petition_for_probate") == "probate"
+
+    def test_guardianship_petition(self) -> None:
+        assert extract_case_type_from_motion_type("guardianship_petition") == "probate"
+
+    def test_trust_petition(self) -> None:
+        assert extract_case_type_from_motion_type("trust_petition") == "probate"
+
     # --- Ambiguous motion types (should return None) ---
+
+    def test_accounting(self) -> None:
+        """Accounting appears in both probate and civil cases."""
+        assert extract_case_type_from_motion_type("accounting") is None
+
+    def test_show_cause_hearing(self) -> None:
+        """Show cause hearings appear in multiple case types."""
+        assert extract_case_type_from_motion_type("show_cause_hearing") is None
 
     def test_ex_parte_application(self) -> None:
         """Ex parte applications appear in civil, family, and probate cases."""
@@ -1954,3 +2040,41 @@ class TestNormalizeMotionType:
     def test_unknown_value(self) -> None:
         """An unrecognizable value returns None."""
         assert normalize_motion_type("Some Random Hearing Type") is None
+
+    # --- Ventura probate/non-standard event types (#1767) ---
+
+    def test_ventura_petition_for_probate(self) -> None:
+        assert normalize_motion_type("Petition for Probate") == "petition_for_probate"
+
+    def test_ventura_accounting(self) -> None:
+        assert normalize_motion_type("Accounting") == "accounting"
+
+    def test_ventura_show_cause_hearing(self) -> None:
+        assert normalize_motion_type("Show Cause Hearing") == "show_cause_hearing"
+
+    def test_ventura_guardianship_petition(self) -> None:
+        assert normalize_motion_type("Guardianship Petition") == "guardianship_petition"
+
+    def test_ventura_petition_for_guardianship(self) -> None:
+        assert normalize_motion_type("Petition for Guardianship") == "guardianship_petition"
+
+    def test_ventura_petition_for_conservatorship(self) -> None:
+        assert normalize_motion_type("Petition for Conservatorship") == "guardianship_petition"
+
+    def test_ventura_trust_petition(self) -> None:
+        assert normalize_motion_type("Trust Petition") == "trust_petition"
+
+    def test_already_normalized_petition_for_probate(self) -> None:
+        assert normalize_motion_type("petition_for_probate") == "petition_for_probate"
+
+    def test_already_normalized_accounting(self) -> None:
+        assert normalize_motion_type("accounting") == "accounting"
+
+    def test_already_normalized_show_cause_hearing(self) -> None:
+        assert normalize_motion_type("show_cause_hearing") == "show_cause_hearing"
+
+    def test_already_normalized_guardianship_petition(self) -> None:
+        assert normalize_motion_type("guardianship_petition") == "guardianship_petition"
+
+    def test_already_normalized_trust_petition(self) -> None:
+        assert normalize_motion_type("trust_petition") == "trust_petition"

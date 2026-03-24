@@ -100,6 +100,35 @@ _MOTION_TYPE_PATTERNS: list[tuple[re.Pattern[str], str]] = [
         ),
         "class_action_settlement",
     ),
+    # --- New patterns added for issue #1767 (probate/non-standard event types) ---
+    (
+        re.compile(
+            r"\bpetition\s+(?:for\s+)?(?:probate|to\s+administer\s+estate"
+            r"|for\s+letters)\b",
+            re.IGNORECASE,
+        ),
+        "petition_for_probate",
+    ),
+    (
+        re.compile(
+            r"\b(?:guardianship\s+petition|petition\s+for\s+"
+            r"(?:guardianship|conservatorship))\b",
+            re.IGNORECASE,
+        ),
+        "guardianship_petition",
+    ),
+    (
+        re.compile(r"\baccounting\b", re.IGNORECASE),
+        "accounting",
+    ),
+    (
+        re.compile(r"\bshow\s+cause\s+hearing\b", re.IGNORECASE),
+        "show_cause_hearing",
+    ),
+    (
+        re.compile(r"\btrust\s+petition\b", re.IGNORECASE),
+        "trust_petition",
+    ),
     (
         re.compile(r"\bpetition\b", re.IGNORECASE),
         "petition",
@@ -557,6 +586,10 @@ _MOTION_TYPE_CASE_TYPE_MAP: dict[str, str] = {
     "mil": "civil",
     # Probate-specific motion types
     "petition": "probate",
+    "petition_for_probate": "probate",
+    "guardianship_petition": "probate",
+    "trust_petition": "probate",
+    # Accounting and show cause hearing can appear in multiple case types — excluded.
     # Ex parte and OSC can appear in multiple case types — excluded.
     # "petition_writ_of_mandate" and "petition_habeas_corpus" are civil/criminal
     # and ambiguous enough to exclude.
