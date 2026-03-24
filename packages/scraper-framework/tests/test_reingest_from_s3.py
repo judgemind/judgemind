@@ -470,9 +470,8 @@ class TestReingestBatchDBWrites:
 
     @patch("reingest_from_s3.batch_upsert_parties")
     @patch("reingest_from_s3.upsert_case_judge")
-    @patch("reingest_from_s3.insert_ruling")
     @patch("reingest_from_s3.resolve_judge")
-    @patch("reingest_from_s3.insert_document")
+    @patch("reingest_from_s3.insert_document_and_ruling")
     @patch("reingest_from_s3.upsert_case")
     @patch("reingest_from_s3._reparse_document")
     @patch("reingest_from_s3._fetch_s3_content")
@@ -481,9 +480,8 @@ class TestReingestBatchDBWrites:
         mock_fetch_s3: MagicMock,
         mock_reparse: MagicMock,
         mock_upsert_case: MagicMock,
-        mock_insert_doc: MagicMock,
+        mock_insert_doc_and_ruling: MagicMock,
         mock_resolve_judge: MagicMock,
-        mock_insert_ruling: MagicMock,
         mock_upsert_cj: MagicMock,
         mock_batch_parties: MagicMock,
     ) -> None:
@@ -519,15 +517,13 @@ class TestReingestBatchDBWrites:
         assert result["updated"] == 1
         conn.transaction.assert_called_once()
         mock_upsert_case.assert_called_once()
-        mock_insert_doc.assert_called_once()
+        mock_insert_doc_and_ruling.assert_called_once()
         mock_resolve_judge.assert_called_once()
-        mock_insert_ruling.assert_called_once()
         mock_upsert_cj.assert_called_once()
 
     @patch("reingest_from_s3.upsert_case_judge")
-    @patch("reingest_from_s3.insert_ruling")
     @patch("reingest_from_s3.resolve_judge")
-    @patch("reingest_from_s3.insert_document")
+    @patch("reingest_from_s3.insert_document_and_ruling")
     @patch("reingest_from_s3.upsert_case")
     @patch("reingest_from_s3._reparse_document")
     @patch("reingest_from_s3._fetch_s3_content")
@@ -536,12 +532,11 @@ class TestReingestBatchDBWrites:
         mock_fetch_s3: MagicMock,
         mock_reparse: MagicMock,
         mock_upsert_case: MagicMock,
-        mock_insert_doc: MagicMock,
+        mock_insert_doc_and_ruling: MagicMock,
         mock_resolve_judge: MagicMock,
-        mock_insert_ruling: MagicMock,
         mock_upsert_cj: MagicMock,
     ) -> None:
-        """The case_id from upsert_case flows to insert_document and insert_ruling."""
+        """The case_id from upsert_case flows to insert_document_and_ruling."""
         row = _make_document_row()
         conn = _mock_conn_with_rows([row])
 
@@ -569,12 +564,9 @@ class TestReingestBatchDBWrites:
             filter_params=[],
         )
 
-        insert_doc_kwargs = mock_insert_doc.call_args[1]
-        assert insert_doc_kwargs["case_id"] == "pipeline-case-id"
-
-        insert_ruling_kwargs = mock_insert_ruling.call_args[1]
-        assert insert_ruling_kwargs["case_id"] == "pipeline-case-id"
-        assert insert_ruling_kwargs["judge_id"] == "pipeline-judge-id"
+        call_kwargs = mock_insert_doc_and_ruling.call_args[1]
+        assert call_kwargs["case_id"] == "pipeline-case-id"
+        assert call_kwargs["judge_id"] == "pipeline-judge-id"
 
         mock_upsert_cj.assert_called_once_with(
             conn,
@@ -594,9 +586,8 @@ class TestReingestBatchPerDocumentCommit:
 
     @patch("reingest_from_s3.batch_upsert_parties")
     @patch("reingest_from_s3.upsert_case_judge")
-    @patch("reingest_from_s3.insert_ruling")
     @patch("reingest_from_s3.resolve_judge")
-    @patch("reingest_from_s3.insert_document")
+    @patch("reingest_from_s3.insert_document_and_ruling")
     @patch("reingest_from_s3.upsert_case")
     @patch("reingest_from_s3._reparse_document")
     @patch("reingest_from_s3._fetch_s3_content")
@@ -605,9 +596,8 @@ class TestReingestBatchPerDocumentCommit:
         mock_fetch_s3: MagicMock,
         mock_reparse: MagicMock,
         mock_upsert_case: MagicMock,
-        mock_insert_doc: MagicMock,
+        mock_insert_doc_and_ruling: MagicMock,
         mock_resolve_judge: MagicMock,
-        mock_insert_ruling: MagicMock,
         mock_upsert_cj: MagicMock,
         mock_batch_parties: MagicMock,
     ) -> None:
@@ -649,9 +639,8 @@ class TestReingestBatchPerDocumentCommit:
 
     @patch("reingest_from_s3.batch_upsert_parties")
     @patch("reingest_from_s3.upsert_case_judge")
-    @patch("reingest_from_s3.insert_ruling")
     @patch("reingest_from_s3.resolve_judge")
-    @patch("reingest_from_s3.insert_document")
+    @patch("reingest_from_s3.insert_document_and_ruling")
     @patch("reingest_from_s3.upsert_case")
     @patch("reingest_from_s3._reparse_document")
     @patch("reingest_from_s3._fetch_s3_content")
@@ -660,9 +649,8 @@ class TestReingestBatchPerDocumentCommit:
         mock_fetch_s3: MagicMock,
         mock_reparse: MagicMock,
         mock_upsert_case: MagicMock,
-        mock_insert_doc: MagicMock,
+        mock_insert_doc_and_ruling: MagicMock,
         mock_resolve_judge: MagicMock,
-        mock_insert_ruling: MagicMock,
         mock_upsert_cj: MagicMock,
         mock_batch_parties: MagicMock,
     ) -> None:
@@ -724,9 +712,8 @@ class TestReingestBatchPerDocumentCommit:
 
     @patch("reingest_from_s3.batch_upsert_parties")
     @patch("reingest_from_s3.upsert_case_judge")
-    @patch("reingest_from_s3.insert_ruling")
     @patch("reingest_from_s3.resolve_judge")
-    @patch("reingest_from_s3.insert_document")
+    @patch("reingest_from_s3.insert_document_and_ruling")
     @patch("reingest_from_s3.upsert_case")
     @patch("reingest_from_s3._reparse_document")
     @patch("reingest_from_s3._fetch_s3_content")
@@ -735,9 +722,8 @@ class TestReingestBatchPerDocumentCommit:
         mock_fetch_s3: MagicMock,
         mock_reparse: MagicMock,
         mock_upsert_case: MagicMock,
-        mock_insert_doc: MagicMock,
+        mock_insert_doc_and_ruling: MagicMock,
         mock_resolve_judge: MagicMock,
-        mock_insert_ruling: MagicMock,
         mock_upsert_cj: MagicMock,
         mock_batch_parties: MagicMock,
     ) -> None:
@@ -2606,9 +2592,8 @@ class TestReingestBatchPerDocumentErrorHandling:
 
     @patch("reingest_from_s3.batch_upsert_parties")
     @patch("reingest_from_s3.upsert_case_judge")
-    @patch("reingest_from_s3.insert_ruling")
     @patch("reingest_from_s3.resolve_judge")
-    @patch("reingest_from_s3.insert_document")
+    @patch("reingest_from_s3.insert_document_and_ruling")
     @patch("reingest_from_s3.upsert_case")
     @patch("reingest_from_s3._reparse_document")
     @patch("reingest_from_s3._fetch_s3_content")
@@ -2617,9 +2602,8 @@ class TestReingestBatchPerDocumentErrorHandling:
         mock_fetch_s3: MagicMock,
         mock_reparse: MagicMock,
         mock_upsert_case: MagicMock,
-        mock_insert_doc: MagicMock,
+        mock_insert_doc_and_ruling: MagicMock,
         mock_resolve_judge: MagicMock,
-        mock_insert_ruling: MagicMock,
         mock_upsert_cj: MagicMock,
         mock_batch_parties: MagicMock,
     ) -> None:
@@ -2682,9 +2666,8 @@ class TestReingestBatchPerDocumentErrorHandling:
 
     @patch("reingest_from_s3.batch_upsert_parties")
     @patch("reingest_from_s3.upsert_case_judge")
-    @patch("reingest_from_s3.insert_ruling")
     @patch("reingest_from_s3.resolve_judge")
-    @patch("reingest_from_s3.insert_document")
+    @patch("reingest_from_s3.insert_document_and_ruling")
     @patch("reingest_from_s3.upsert_case")
     @patch("reingest_from_s3._reparse_document")
     @patch("reingest_from_s3._fetch_s3_content")
@@ -2693,9 +2676,8 @@ class TestReingestBatchPerDocumentErrorHandling:
         mock_fetch_s3: MagicMock,
         mock_reparse: MagicMock,
         mock_upsert_case: MagicMock,
-        mock_insert_doc: MagicMock,
+        mock_insert_doc_and_ruling: MagicMock,
         mock_resolve_judge: MagicMock,
-        mock_insert_ruling: MagicMock,
         mock_upsert_cj: MagicMock,
         mock_batch_parties: MagicMock,
     ) -> None:
@@ -3893,9 +3875,8 @@ class TestReingestBatchFullReparse:
     @patch("reingest_from_s3._supersede_document")
     @patch("reingest_from_s3.batch_upsert_parties")
     @patch("reingest_from_s3.upsert_case_judge")
-    @patch("reingest_from_s3.insert_ruling")
     @patch("reingest_from_s3.resolve_judge")
-    @patch("reingest_from_s3.insert_document")
+    @patch("reingest_from_s3.insert_document_and_ruling")
     @patch("reingest_from_s3.upsert_case")
     @patch("reingest_from_s3._full_reparse_document")
     @patch("reingest_from_s3._fetch_s3_content")
@@ -3904,9 +3885,8 @@ class TestReingestBatchFullReparse:
         mock_fetch_s3: MagicMock,
         mock_full_reparse: MagicMock,
         mock_upsert_case: MagicMock,
-        mock_insert_doc: MagicMock,
+        mock_insert_doc_and_ruling: MagicMock,
         mock_resolve_judge: MagicMock,
-        mock_insert_ruling: MagicMock,
         mock_upsert_cj: MagicMock,
         mock_batch_parties: MagicMock,
         mock_supersede: MagicMock,
@@ -3968,10 +3948,8 @@ class TestReingestBatchFullReparse:
 
         assert result["processed"] == 1
         assert result["updated"] == 1
-        # insert_document called twice — one per split ruling
-        assert mock_insert_doc.call_count == 2
-        # insert_ruling called twice
-        assert mock_insert_ruling.call_count == 2
+        # insert_document_and_ruling called twice — one per split ruling
+        assert mock_insert_doc_and_ruling.call_count == 2
         # Original document superseded
         mock_supersede.assert_called_once()
         # upsert_case called twice (different case numbers)
@@ -3980,9 +3958,8 @@ class TestReingestBatchFullReparse:
     @patch("reingest_from_s3._supersede_document")
     @patch("reingest_from_s3.batch_upsert_parties")
     @patch("reingest_from_s3.upsert_case_judge")
-    @patch("reingest_from_s3.insert_ruling")
     @patch("reingest_from_s3.resolve_judge")
-    @patch("reingest_from_s3.insert_document")
+    @patch("reingest_from_s3.insert_document_and_ruling")
     @patch("reingest_from_s3.upsert_case")
     @patch("reingest_from_s3._full_reparse_document")
     @patch("reingest_from_s3._fetch_s3_content")
@@ -3991,9 +3968,8 @@ class TestReingestBatchFullReparse:
         mock_fetch_s3: MagicMock,
         mock_full_reparse: MagicMock,
         mock_upsert_case: MagicMock,
-        mock_insert_doc: MagicMock,
+        mock_insert_doc_and_ruling: MagicMock,
         mock_resolve_judge: MagicMock,
-        mock_insert_ruling: MagicMock,
         mock_upsert_cj: MagicMock,
         mock_batch_parties: MagicMock,
         mock_supersede: MagicMock,
@@ -4104,9 +4080,8 @@ class TestReingestBatchFullReparse:
     @patch("reingest_from_s3._supersede_document")
     @patch("reingest_from_s3.batch_upsert_parties")
     @patch("reingest_from_s3.upsert_case_judge")
-    @patch("reingest_from_s3.insert_ruling")
     @patch("reingest_from_s3.resolve_judge")
-    @patch("reingest_from_s3.insert_document")
+    @patch("reingest_from_s3.insert_document_and_ruling")
     @patch("reingest_from_s3.upsert_case")
     @patch("reingest_from_s3._full_reparse_document")
     @patch("reingest_from_s3._fetch_s3_content")
@@ -4115,18 +4090,18 @@ class TestReingestBatchFullReparse:
         mock_fetch_s3: MagicMock,
         mock_full_reparse: MagicMock,
         mock_upsert_case: MagicMock,
-        mock_insert_doc: MagicMock,
+        mock_insert_doc_and_ruling: MagicMock,
         mock_resolve_judge: MagicMock,
-        mock_insert_ruling: MagicMock,
         mock_upsert_cj: MagicMock,
         mock_batch_parties: MagicMock,
         mock_supersede: MagicMock,
     ) -> None:
-        """Split doc IDs used for both insert_document and insert_ruling.
+        """Split doc IDs used for insert_document_and_ruling.
 
         Each split ruling gets its own document row (so the FK
         rulings.document_id -> documents.id is satisfied) and its own
-        ruling row.  The original parent document is superseded.
+        ruling row via the shared helper.  The original parent document
+        is superseded.
         """
         row = _make_document_row()
         conn = _mock_conn_with_rows([row])
@@ -4179,16 +4154,12 @@ class TestReingestBatchFullReparse:
             full_reparse=True,
         )
 
-        # insert_document uses split document IDs so each ruling's FK is
-        # satisfied (rulings.document_id REFERENCES documents.id).
-        doc_ids = [c[1]["document_id"] for c in mock_insert_doc.call_args_list]
+        # insert_document_and_ruling uses split document IDs so each ruling's
+        # FK is satisfied (the helper passes the same document_id to both
+        # insert_document and insert_ruling internally).
+        doc_ids = [c[1]["document_id"] for c in mock_insert_doc_and_ruling.call_args_list]
         assert "split-doc-aaa" in doc_ids
         assert "split-doc-bbb" in doc_ids
-
-        # insert_ruling also uses split document IDs
-        ruling_doc_ids = [c[1]["document_id"] for c in mock_insert_ruling.call_args_list]
-        assert "split-doc-aaa" in ruling_doc_ids
-        assert "split-doc-bbb" in ruling_doc_ids
 
 
 # ---------------------------------------------------------------------------

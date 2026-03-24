@@ -46,8 +46,7 @@ from framework.search.mapping import TENTATIVE_RULINGS_ALIAS
 
 from .db import (
     batch_upsert_parties,
-    insert_document,
-    insert_ruling,
+    insert_document_and_ruling,
     resolve_judge,
     upsert_case,
     upsert_case_judge,
@@ -1031,10 +1030,15 @@ class IngestionWorker:
                 conn, effective_case_number, court_id, case_title=case_title, case_type=case_type
             )
 
-            # 3. Insert document (idempotent on document_id)
-            # Each split ruling gets its own document row keyed by the
-            # split document_id, so the FK from rulings is satisfied (#1775).
-            is_new = insert_document(
+            # 3. Resolve judge name to canonical judge record
+            judge_id: str | None = None
+            if judge_name:
+                judge_id = resolve_judge(conn, judge_name, court_id)
+
+            # 4. Insert document + ruling via shared helper (#1790).
+            # The helper guarantees the same document_id is passed to both
+            # insert_document and insert_ruling, preventing FK divergence (#1775).
+            is_new = insert_document_and_ruling(
                 conn,
                 document_id=document_id,
                 case_id=case_id,
@@ -1047,39 +1051,22 @@ class IngestionWorker:
                 scraper_id=scraper_id,
                 captured_at=capture_ts or datetime.utcnow(),
                 hearing_date=hearing_dt,
+                ruling_text=cleaned_ruling_text,
+                ruling_text_html=ruling_text_html,
+                department=department,
+                judge_id=judge_id,
+                outcome=outcome,
+                motion_type=motion_type,
+                summary=summary,
+                summary_model=summary_model,
+                summary_generated_at=summary_generated_at,
             )
 
-            # 4. Resolve judge name to canonical judge record
-            judge_id: str | None = None
-            if judge_name:
-                judge_id = resolve_judge(conn, judge_name, court_id)
-
-            # 5. Insert ruling (only if hearing_date is known)
-            if hearing_dt is not None:
-                insert_ruling(
-                    conn,
-                    document_id=document_id,
-                    case_id=case_id,
-                    court_id=court_id,
-                    hearing_date=hearing_dt,
-                    ruling_text=cleaned_ruling_text,
-                    ruling_text_html=ruling_text_html,
-                    department=department,
-                    judge_id=judge_id,
-                    outcome=outcome,
-                    motion_type=motion_type,
-                    summary=summary,
-                    summary_model=summary_model,
-                    summary_generated_at=summary_generated_at,
-                )
-            else:
-                logger.warning("No hearing_date for document %s — ruling row skipped", document_id)
-
-            # 6. Link case to judge
+            # 5. Link case to judge
             if judge_id is not None:
                 upsert_case_judge(conn, case_id, judge_id, hearing_dt)
 
-            # 7. Create party records and link to case (batched — O(1) queries)
+            # 6. Create party records and link to case (batched — O(1) queries)
             batch_upsert_parties(conn, case_id, parties_data)
 
             conn.commit()

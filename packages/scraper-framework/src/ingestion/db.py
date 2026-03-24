@@ -988,6 +988,86 @@ def insert_ruling(
         )
 
 
+def insert_document_and_ruling(
+    conn: psycopg.Connection,
+    *,
+    document_id: str,
+    case_id: str,
+    court_id: str,
+    content_format: str,
+    content_hash: str,
+    s3_key: str | None,
+    s3_bucket: str | None,
+    source_url: str,
+    scraper_id: str,
+    captured_at: datetime,
+    hearing_date: date | None,
+    ruling_text: str | None = None,
+    ruling_text_html: str | None = None,
+    department: str | None = None,
+    judge_id: str | None = None,
+    outcome: str | None = None,
+    motion_type: str | None = None,
+    summary: str | None = None,
+    summary_model: str | None = None,
+    summary_generated_at: datetime | None = None,
+) -> bool:
+    """Insert a document and its associated ruling in a single call.
+
+    Encapsulates the ``insert_document`` + ``insert_ruling`` pair so that the
+    same ``document_id`` is guaranteed to be passed to both operations.  This
+    prevents the FK divergence fixed in #1775 by construction: callers no
+    longer need to remember to thread the same ID through two separate calls.
+
+    Parameters match the union of ``insert_document`` and ``insert_ruling``.
+    ``hearing_date`` controls whether a ruling row is created — if ``None``,
+    only the document is inserted (matching the existing behaviour where the
+    worker logs a warning and skips the ruling).
+
+    Returns ``True`` if the document row was newly inserted, ``False`` if it
+    already existed (same semantics as ``insert_document``).
+    """
+    is_new = insert_document(
+        conn,
+        document_id=document_id,
+        case_id=case_id,
+        court_id=court_id,
+        content_format=content_format,
+        content_hash=content_hash,
+        s3_key=s3_key,
+        s3_bucket=s3_bucket,
+        source_url=source_url,
+        scraper_id=scraper_id,
+        captured_at=captured_at,
+        hearing_date=hearing_date,
+    )
+
+    if hearing_date is not None:
+        insert_ruling(
+            conn,
+            document_id=document_id,
+            case_id=case_id,
+            court_id=court_id,
+            hearing_date=hearing_date,
+            ruling_text=ruling_text,
+            ruling_text_html=ruling_text_html,
+            department=department,
+            judge_id=judge_id,
+            outcome=outcome,
+            motion_type=motion_type,
+            summary=summary,
+            summary_model=summary_model,
+            summary_generated_at=summary_generated_at,
+        )
+    else:
+        logger.warning(
+            "insert_document_and_ruling: no hearing_date — ruling row skipped (document_id=%s)",
+            document_id,
+        )
+
+    return is_new
+
+
 def normalize_party_name(raw_name: str) -> str:
     """Normalize a raw party name string to a canonical form.
 

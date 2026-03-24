@@ -74,8 +74,7 @@ from framework.logging import configure_structlog  # noqa: E402
 from framework.models import CapturedDocument, ContentFormat, ScraperConfig  # noqa: E402
 from ingestion.db import (  # noqa: E402
     batch_upsert_parties,
-    insert_document,
-    insert_ruling,
+    insert_document_and_ruling,
     resolve_judge,
     upsert_case,
     upsert_case_judge,
@@ -1306,7 +1305,23 @@ def reingest_batch(
                     else:
                         split_hash = doc_meta["content_hash"]
 
-                    insert_document(
+                    # Resolve judge
+                    judge_id = None
+                    if extracted["judge_name"]:
+                        judge_id = resolve_judge(
+                            conn, extracted["judge_name"], court_id_str
+                        )
+
+                    # Truncate excessively long ruling text
+                    ruling_text = extracted["ruling_text"]
+                    if ruling_text and len(ruling_text) > 50000:
+                        ruling_text = ruling_text[:50000]
+
+                    # Insert document + ruling via shared helper (#1790).
+                    # The helper guarantees the same document_id is passed
+                    # to both insert_document and insert_ruling, preventing
+                    # FK divergence (#1775).
+                    insert_document_and_ruling(
                         conn,
                         document_id=effective_doc_id,
                         case_id=new_case_id,
@@ -1319,33 +1334,12 @@ def reingest_batch(
                         scraper_id=doc_meta["scraper_id"],
                         captured_at=doc_meta["captured_at"],
                         hearing_date=effective_hearing,
+                        ruling_text=ruling_text,
+                        department=extracted["department"],
+                        judge_id=judge_id,
+                        outcome=extracted["outcome"],
+                        motion_type=extracted["motion_type"],
                     )
-
-                    # Resolve judge
-                    judge_id = None
-                    if extracted["judge_name"]:
-                        judge_id = resolve_judge(
-                            conn, extracted["judge_name"], court_id_str
-                        )
-
-                    # Upsert ruling
-                    if effective_hearing is not None:
-                        ruling_text = extracted["ruling_text"]
-                        if ruling_text and len(ruling_text) > 50000:
-                            ruling_text = ruling_text[:50000]
-
-                        insert_ruling(
-                            conn,
-                            document_id=effective_doc_id,
-                            case_id=new_case_id,
-                            court_id=court_id_str,
-                            hearing_date=effective_hearing,
-                            ruling_text=ruling_text,
-                            department=extracted["department"],
-                            judge_id=judge_id,
-                            outcome=extracted["outcome"],
-                            motion_type=extracted["motion_type"],
-                        )
 
                     if judge_id:
                         upsert_case_judge(

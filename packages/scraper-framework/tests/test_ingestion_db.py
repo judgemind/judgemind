@@ -26,6 +26,7 @@ from ingestion.db import (
     _truncate_party_name,
     batch_upsert_parties,
     insert_document,
+    insert_document_and_ruling,
     insert_ruling,
     normalize_case_title,
     normalize_judge_name,
@@ -1846,3 +1847,203 @@ class TestNormalizeCaseTitle:
         call_args = cur.execute.call_args[0][1]
         # case_title is the 4th parameter (index 3)
         assert call_args[3] == "Smith v. Jones"
+
+
+# ---------------------------------------------------------------------------
+# insert_document_and_ruling — shared helper (#1790)
+# ---------------------------------------------------------------------------
+
+
+class TestInsertDocumentAndRuling:
+    """Tests for the insert_document_and_ruling helper that wraps
+    insert_document + insert_ruling with a consistent document_id."""
+
+    def test_calls_insert_document_with_correct_document_id(self) -> None:
+        """The helper passes document_id to insert_document."""
+        conn = _mock_conn()
+        cur = conn.cursor.return_value.__enter__.return_value
+        cur.fetchone.return_value = (True,)  # is_new = True
+
+        insert_document_and_ruling(
+            conn,
+            document_id="doc-123",
+            case_id="case-1",
+            court_id="court-1",
+            content_format="html",
+            content_hash="hash-abc",
+            s3_key="rulings/doc.html",
+            s3_bucket="bucket-1",
+            source_url="https://example.com",
+            scraper_id="scraper-1",
+            captured_at=datetime(2026, 3, 5, 10, 0, 0),
+            hearing_date=date(2026, 3, 10),
+            ruling_text="The motion is granted.",
+            department="Dept 42",
+        )
+
+        # The first execute call (with params) is insert_document.
+        # Verify the first param (document_id) is correct.
+        calls_with_params = [c for c in cur.execute.call_args_list if len(c[0]) > 1]
+        assert len(calls_with_params) >= 1
+        # insert_document: first param is document_id
+        assert calls_with_params[0][0][1][0] == "doc-123"
+
+    def test_calls_insert_ruling_with_same_document_id(self) -> None:
+        """The helper passes the same document_id to both insert_document
+        and insert_ruling, preventing FK divergence (#1775)."""
+        conn = _mock_conn()
+        cur = conn.cursor.return_value.__enter__.return_value
+        cur.fetchone.return_value = (True,)
+
+        insert_document_and_ruling(
+            conn,
+            document_id="doc-456",
+            case_id="case-2",
+            court_id="court-2",
+            content_format="pdf",
+            content_hash="hash-xyz",
+            s3_key="rulings/doc.pdf",
+            s3_bucket="bucket-2",
+            source_url="https://example.com/ruling.pdf",
+            scraper_id="scraper-oc",
+            captured_at=datetime(2026, 3, 5),
+            hearing_date=date(2026, 3, 10),
+            ruling_text="Motion denied.",
+            department="Dept 5",
+            judge_id="judge-1",
+            outcome="denied",
+            motion_type="Motion to Compel",
+        )
+
+        # Collect all execute calls with params (skip SAVEPOINT/RELEASE).
+        calls_with_params = [c for c in cur.execute.call_args_list if len(c[0]) > 1]
+        # At minimum: insert_document (1 call) + insert_ruling (1 call)
+        assert len(calls_with_params) >= 2
+
+        # Both should have "doc-456" as first param (document_id)
+        insert_doc_params = calls_with_params[0][0][1]
+        insert_ruling_params = calls_with_params[1][0][1]
+        assert insert_doc_params[0] == "doc-456"
+        assert insert_ruling_params[0] == "doc-456"
+
+    def test_skips_ruling_when_hearing_date_is_none(self) -> None:
+        """When hearing_date is None, only insert_document is called."""
+        conn = _mock_conn()
+        cur = conn.cursor.return_value.__enter__.return_value
+        cur.fetchone.return_value = (True,)
+
+        result = insert_document_and_ruling(
+            conn,
+            document_id="doc-no-hearing",
+            case_id="case-3",
+            court_id="court-3",
+            content_format="html",
+            content_hash="hash-noh",
+            s3_key=None,
+            s3_bucket=None,
+            source_url="https://example.com",
+            scraper_id="scraper-1",
+            captured_at=datetime(2026, 3, 5),
+            hearing_date=None,
+            ruling_text="Some text",
+        )
+
+        assert result is True
+        # Only insert_document should have been called (1 execute with params).
+        calls_with_params = [c for c in cur.execute.call_args_list if len(c[0]) > 1]
+        assert len(calls_with_params) == 1
+
+    def test_returns_is_new_true_for_new_document(self) -> None:
+        conn = _mock_conn()
+        cur = conn.cursor.return_value.__enter__.return_value
+        cur.fetchone.return_value = (True,)
+
+        result = insert_document_and_ruling(
+            conn,
+            document_id="doc-new",
+            case_id="case-4",
+            court_id="court-4",
+            content_format="html",
+            content_hash="hash-new",
+            s3_key="rulings/new.html",
+            s3_bucket="bucket-1",
+            source_url="https://example.com",
+            scraper_id="scraper-1",
+            captured_at=datetime(2026, 3, 5),
+            hearing_date=date(2026, 3, 10),
+            ruling_text="Granted.",
+        )
+        assert result is True
+
+    def test_returns_is_new_false_for_existing_document(self) -> None:
+        conn = _mock_conn()
+        cur = conn.cursor.return_value.__enter__.return_value
+        cur.fetchone.return_value = (False,)
+
+        result = insert_document_and_ruling(
+            conn,
+            document_id="doc-existing",
+            case_id="case-5",
+            court_id="court-5",
+            content_format="pdf",
+            content_hash="hash-exist",
+            s3_key="rulings/exist.pdf",
+            s3_bucket="bucket-1",
+            source_url="https://example.com",
+            scraper_id="scraper-1",
+            captured_at=datetime(2026, 3, 5),
+            hearing_date=date(2026, 3, 10),
+            ruling_text="Denied.",
+        )
+        assert result is False
+
+    def test_passes_all_ruling_fields(self) -> None:
+        """All optional ruling fields (ruling_text_html, summary, etc.)
+        are forwarded to insert_ruling."""
+        conn = _mock_conn()
+        cur = conn.cursor.return_value.__enter__.return_value
+        cur.fetchone.return_value = (True,)
+
+        summary_ts = datetime(2026, 3, 5, 12, 0, 0)
+        insert_document_and_ruling(
+            conn,
+            document_id="doc-full",
+            case_id="case-6",
+            court_id="court-6",
+            content_format="html",
+            content_hash="hash-full",
+            s3_key="rulings/full.html",
+            s3_bucket="bucket-1",
+            source_url="https://example.com",
+            scraper_id="scraper-1",
+            captured_at=datetime(2026, 3, 5),
+            hearing_date=date(2026, 3, 10),
+            ruling_text="The motion is granted.",
+            ruling_text_html="<p>The motion is granted.</p>",
+            department="Dept 42",
+            judge_id="judge-1",
+            outcome="granted",
+            motion_type="Demurrer",
+            summary="Motion was granted.",
+            summary_model="gemini-2.0-flash",
+            summary_generated_at=summary_ts,
+        )
+
+        # Find the insert_ruling SQL call (contains 'INSERT INTO rulings').
+        ruling_calls = [
+            c
+            for c in cur.execute.call_args_list
+            if len(c[0]) > 0 and "INSERT INTO rulings" in str(c[0][0])
+        ]
+        assert len(ruling_calls) == 1
+        ruling_params = ruling_calls[0][0][1]
+        # ruling params: (document_id, case_id, court_id, judge_id,
+        #                 hearing_date, ruling_text, ruling_text_html,
+        #                 department, outcome, motion_type,
+        #                 summary, summary_model, summary_generated_at,
+        #                 text_hash)
+        assert ruling_params[0] == "doc-full"  # document_id
+        assert ruling_params[6] == "<p>The motion is granted.</p>"  # ruling_text_html
+        assert ruling_params[10] == "Motion was granted."  # summary
+        assert ruling_params[11] == "gemini-2.0-flash"  # summary_model
+        assert ruling_params[12] == summary_ts  # summary_generated_at
