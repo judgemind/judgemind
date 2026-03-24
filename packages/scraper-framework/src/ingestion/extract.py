@@ -100,6 +100,22 @@ _MOTION_TYPE_PATTERNS: list[tuple[re.Pattern[str], str]] = [
         ),
         "class_action_settlement",
     ),
+    # --- New patterns added for issue #1815 (remaining OC null motion_type) ---
+    (
+        re.compile(
+            r"\bPAGA\s+settlement\b|\bapproval\s+of\s+PAGA\b",
+            re.IGNORECASE,
+        ),
+        "paga_settlement",
+    ),
+    (
+        re.compile(
+            r"\bsettlement\s+(?:agreement|approval|hearing)\b"
+            r"|\bapproval\s+of\s+(?:\w+\s+)*?settlement\b",
+            re.IGNORECASE,
+        ),
+        "settlement_approval",
+    ),
     # --- New patterns added for issue #1767 (probate/non-standard event types) ---
     (
         re.compile(
@@ -319,6 +335,12 @@ _PREFIX_LESS_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"\bpro\s+hac\s+vice\b", re.IGNORECASE), "motion_pro_hac_vice"),
     (re.compile(r"\btax\s+costs\b", re.IGNORECASE), "motion_to_tax_costs"),
     (re.compile(r"\bvacate\b", re.IGNORECASE), "motion_to_vacate"),
+    # Settlement patterns (#1815) — more specific before broader.
+    (re.compile(r"\bPAGA\s+settlement\b", re.IGNORECASE), "paga_settlement"),
+    (
+        re.compile(r"\bsettlement\s+(?:agreement|approval|hearing)\b", re.IGNORECASE),
+        "settlement_approval",
+    ),
     # Broad sanctions fallback — must come after more specific standalone patterns
     # to avoid shadowing "strike", "compel", "quash", etc. when the input
     # contains multiple keywords (e.g. "Strike and Sanctions").
@@ -671,6 +693,8 @@ _MOTION_TYPE_CASE_TYPE_MAP: dict[str, str] = {
     "motion_for_judgment_on_the_pleadings": "civil",
     "deem_admissions_admitted": "civil",
     "class_action_settlement": "civil",
+    "paga_settlement": "civil",
+    "settlement_approval": "civil",
     "writ_of_possession": "civil",
     "mil": "civil",
     # Probate-specific motion types
