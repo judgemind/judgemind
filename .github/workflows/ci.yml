@@ -643,6 +643,8 @@ jobs:
         run: scripts/tests/test_check_oneshot_repo_paths.sh
       - name: Test run-scraper.sh
         run: scripts/tests/test_run_scraper.sh
+      - name: Test ecs-task-logs.sh
+        run: scripts/tests/test_ecs_task_logs.sh
 
   # ---------------------------------------------------------------
   # Coverage gates: diff coverage (new lines) + overall floor ratchet
