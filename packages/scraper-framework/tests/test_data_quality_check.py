@@ -965,6 +965,60 @@ class TestCheckScraperStaleness:
         assert len(alerts) == 1
         assert alerts[0].severity == "p2"
 
+    def test_staleness_county_filter(self) -> None:
+        """County filter works without SQL errors (#1792).
+
+        The county filter (AND ct.county = %s) must appear inside the CTE
+        where the ``ct`` alias is available, not in the outer query where
+        only CTE columns exist.
+        """
+        stale = NOW - timedelta(hours=27)
+        conn = FakeConnection(
+            {
+                "scraper_runs": [("ca-sd-tentatives-civil", "San Diego", stale, "success")],
+                "MAX(d.captured_at)": [],
+            }
+        )
+        baselines = _make_baselines(
+            {"San Diego": {"expected_daily_rulings": 10, "schedule_type": "daily"}}
+        )
+        alerts = check_scraper_staleness(conn, NOW, baselines, county="San Diego")
+        assert len(alerts) == 1
+        assert alerts[0].county == "San Diego"
+        assert alerts[0].metric == "scraper_stale"
+
+        # Verify the SQL: county filter must be inside the CTE (before the
+        # outer SELECT), not after ``WHERE rn = 1`` in the outer query.
+        scraper_query = conn.cursors[0].captured_calls[0][0]
+        # Split on the outer SELECT to separate CTE body from outer query
+        outer_select_pos = scraper_query.rfind("SELECT scraper_id")
+        assert outer_select_pos > 0, "Expected outer SELECT in query"
+        cte_body = scraper_query[:outer_select_pos]
+        outer_query = scraper_query[outer_select_pos:]
+        # The county filter should appear inside the CTE body
+        assert "ct.county" in cte_body, (
+            "county filter must be inside the CTE where ct alias is available"
+        )
+        # The outer query should NOT reference ct.county
+        assert "ct.county" not in outer_query, (
+            "county filter must NOT be in the outer query — ct alias is undefined there"
+        )
+
+    def test_staleness_county_filter_fresh_no_alert(self) -> None:
+        """County filter with a fresh scraper produces no alert."""
+        recent = NOW - timedelta(hours=1)
+        conn = FakeConnection(
+            {
+                "scraper_runs": [("ca-sd-tentatives-civil", "San Diego", recent, "success")],
+                "MAX(d.captured_at)": [],
+            }
+        )
+        baselines = _make_baselines(
+            {"San Diego": {"expected_daily_rulings": 10, "schedule_type": "daily"}}
+        )
+        alerts = check_scraper_staleness(conn, NOW, baselines, county="San Diego")
+        assert len(alerts) == 0
+
 
 class TestCalculateStaleThreshold:
     """Tests for _calculate_stale_threshold helper."""
