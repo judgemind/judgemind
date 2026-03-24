@@ -59,7 +59,7 @@
   ],
   "field_completeness": {
     "_updated": "2026-03-24",
-    "_note": "Riverside baselines updated after LLM backfill #1856 (total_documents 66->358 docs with rulings, field rates adjusted). OC baselines raised after backfill #1304 (parties 35->80%, case_type 30->97%). SC (low sample size) unchanged.",
+    "_note": "Ventura total_documents updated 13->145 after bulk ingest (#1908). OC judge baseline lowered 100->84.2% to reflect OC North JC structural gap (#1917). OC/Ventura field ratchets applied from 7-day window query.",
     "Los Angeles": {
       "total_documents": 748,
       "ruling": 100.0,
@@ -73,18 +73,19 @@
       "case_type": 99.9
     },
     "Orange": {
-      "total_documents": 1772,
+      "total_documents": 1082,
       "ruling": 100.0,
-      "judge": 100.0,
+      "judge": 84.2,
       "motion_type": 100.0,
       "outcome": 100.0,
       "case_title": 100.0,
-      "case_number": 84.4,
-      "parties": 80.0,
+      "case_number": 85.5,
+      "parties": 91.1,
       "hearing_date": 100.0,
-      "case_type": 97.0,
+      "case_type": 100.0,
       "_known_gaps": {
         "case_number": "21 UNKNOWN cases from OC North JC PDFs that structurally lack case numbers",
+        "judge": "OC North JC PDFs structurally lack judge identification. 7-day window shows ~84% judge completeness.",
         "parties": "~310 split docs with case titles that lack recognizable 'vs.' pattern for party extraction"
       }
     },
@@ -160,14 +161,14 @@
       }
     },
     "Ventura": {
-      "total_documents": 13,
+      "total_documents": 145,
       "ruling": 100.0,
-      "judge": 0.0,
+      "judge": 100.0,
       "motion_type": 90.0,
       "outcome": 100.0,
       "case_title": 100.0,
       "case_number": 100.0,
-      "parties": 46.2,
+      "parties": 97.9,
       "hearing_date": 100.0,
       "case_type": 100.0,
       "_known_gaps": {
