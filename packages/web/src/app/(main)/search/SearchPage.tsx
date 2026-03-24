@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useCallback, useEffect, useMemo } from 'react';
+import { useState, useCallback, useEffect, useMemo, useRef } from 'react';
 import { useQuery, gql } from '@apollo/client';
 import { useRouter, useSearchParams } from 'next/navigation';
 import Link from 'next/link';
@@ -485,6 +485,15 @@ export function SearchPage() {
   const edges = data?.searchRulings.edges ?? [];
   const pageInfo = data?.searchRulings.pageInfo;
   const totalHits = data?.searchRulings.totalHits ?? 0;
+  const fetchingMore = useRef(false);
+  const observerRef = useRef<IntersectionObserver | null>(null);
+  const queryGeneration = useRef(0);
+
+  // Increment generation when filters that refetch data change,
+  // so in-flight fetchMore calls don't corrupt the new results.
+  useEffect(() => {
+    queryGeneration.current += 1;
+  }, [q, county, judgeName, dateFrom, dateTo, motionTypes, outcomes, hasSearched]);
 
   // Sync URL params when search is submitted
   const updateUrl = useCallback(
@@ -511,12 +520,16 @@ export function SearchPage() {
     updateUrl();
   }
 
-  function handleLoadMore() {
-    if (!pageInfo?.endCursor) return;
+  const handleLoadMore = useCallback(() => {
+    if (!pageInfo?.endCursor || loading || fetchingMore.current) return;
+    fetchingMore.current = true;
+    const currentGeneration = queryGeneration.current;
     fetchMore({
       variables: { after: pageInfo.endCursor },
       updateQuery(prev, { fetchMoreResult }) {
         if (!fetchMoreResult) return prev;
+        // If filters changed since this fetch started, discard the stale results
+        if (queryGeneration.current !== currentGeneration) return prev;
         return {
           searchRulings: {
             ...fetchMoreResult.searchRulings,
@@ -527,8 +540,33 @@ export function SearchPage() {
           },
         };
       },
+    }).finally(() => {
+      fetchingMore.current = false;
     });
-  }
+  }, [pageInfo?.endCursor, loading, fetchMore]);
+
+  const sentinelRef = useCallback(
+    (node: HTMLDivElement | null) => {
+      if (observerRef.current) observerRef.current.disconnect();
+      if (!node) return;
+      observerRef.current = new IntersectionObserver(
+        (entries) => {
+          if (entries[0]?.isIntersecting) {
+            handleLoadMore();
+          }
+        },
+        { rootMargin: '200px' },
+      );
+      observerRef.current.observe(node);
+    },
+    [handleLoadMore],
+  );
+
+  useEffect(() => {
+    return () => {
+      if (observerRef.current) observerRef.current.disconnect();
+    };
+  }, []);
 
   function toggleMotionType(mt: string) {
     setMotionTypes((prev) =>
@@ -698,20 +736,18 @@ export function SearchPage() {
                 ))}
               </div>
 
-              {/* Load more */}
-              {pageInfo?.hasNextPage && (
-                <div className="flex justify-center pt-4">
-                  <Button
-                    variant="outline"
-                    onClick={(e) => {
-                      e.preventDefault();
-                      handleLoadMore();
-                    }}
-                    disabled={loading}
-                  >
-                    {loading ? 'Loading…' : 'Load more'}
-                  </Button>
+              {/* Loading indicator for infinite scroll */}
+              {loading && edges.length > 0 && (
+                <div className="mt-3 divide-y rounded-lg border">
+                  {Array.from({ length: 3 }).map((_, i) => (
+                    <SkeletonRow key={`loading-${i}`} />
+                  ))}
                 </div>
+              )}
+
+              {/* Infinite scroll sentinel */}
+              {pageInfo?.hasNextPage && !loading && (
+                <div ref={sentinelRef} data-testid="scroll-sentinel" className="h-1" />
               )}
             </div>
           )}

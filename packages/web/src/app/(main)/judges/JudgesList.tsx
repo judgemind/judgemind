@@ -1,12 +1,11 @@
 'use client';
 
-import { useState, useCallback, useEffect } from 'react';
+import { useState, useCallback, useEffect, useRef } from 'react';
 import { useQuery, gql } from '@apollo/client';
 import { useRouter, useSearchParams } from 'next/navigation';
 import Link from 'next/link';
 import { Search } from 'lucide-react';
 import { Badge } from '@/components/ui/badge';
-import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Skeleton } from '@/components/ui/skeleton';
 import {
@@ -111,6 +110,8 @@ export function JudgesList() {
 
   const edges = data?.judges.edges ?? [];
   const pageInfo = data?.judges.pageInfo;
+  const fetchingMore = useRef(false);
+  const observer = useRef<IntersectionObserver | null>(null);
 
   // Client-side name filter (the API doesn't support text search on judges)
   const filteredEdges = nameFilter
@@ -119,8 +120,9 @@ export function JudgesList() {
       )
     : edges;
 
-  function handleLoadMore() {
-    if (!pageInfo?.endCursor) return;
+  const handleLoadMore = useCallback(() => {
+    if (!pageInfo?.endCursor || loading || fetchingMore.current) return;
+    fetchingMore.current = true;
     fetchMore({
       variables: { after: pageInfo.endCursor },
       updateQuery(prev, { fetchMoreResult }) {
@@ -132,8 +134,33 @@ export function JudgesList() {
           },
         };
       },
+    }).finally(() => {
+      fetchingMore.current = false;
     });
-  }
+  }, [pageInfo?.endCursor, loading, fetchMore]);
+
+  const sentinelRef = useCallback(
+    (node: HTMLDivElement | null) => {
+      if (observer.current) observer.current.disconnect();
+      if (!node) return;
+      observer.current = new IntersectionObserver(
+        (entries) => {
+          if (entries[0]?.isIntersecting) {
+            handleLoadMore();
+          }
+        },
+        { rootMargin: '200px' },
+      );
+      observer.current.observe(node);
+    },
+    [handleLoadMore],
+  );
+
+  useEffect(() => {
+    return () => {
+      if (observer.current) observer.current.disconnect();
+    };
+  }, []);
 
   return (
     <div className="space-y-6">
@@ -220,22 +247,23 @@ export function JudgesList() {
                 </TableCell>
               </TableRow>
             ))}
+
+            {/* Loading indicator for infinite scroll */}
+            {loading && edges.length > 0 && (
+              <>
+                {Array.from({ length: 3 }).map((_, i) => (
+                  <SkeletonRow key={`loading-${i}`} />
+                ))}
+              </>
+            )}
           </TableBody>
         </Table>
-      </div>
 
-      {/* Load more */}
-      {pageInfo?.hasNextPage && (
-        <div className="flex justify-center pt-4">
-          <Button
-            variant="outline"
-            onClick={handleLoadMore}
-            disabled={loading}
-          >
-            {loading ? 'Loading…' : 'Load more'}
-          </Button>
-        </div>
-      )}
+        {/* Infinite scroll sentinel */}
+        {pageInfo?.hasNextPage && !loading && (
+          <div ref={sentinelRef} data-testid="scroll-sentinel" className="h-1" />
+        )}
+      </div>
     </div>
   );
 }

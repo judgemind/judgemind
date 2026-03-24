@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { render, screen, fireEvent } from '@testing-library/react';
 
 // Mock Apollo client
@@ -38,6 +38,32 @@ vi.mock('lucide-react', () => ({
     <span data-testid="search-icon" className={className} />
   ),
 }));
+
+// IntersectionObserver mock
+let intersectionCallback: IntersectionObserverCallback;
+let mockObserve: ReturnType<typeof vi.fn>;
+let mockDisconnect: ReturnType<typeof vi.fn>;
+
+beforeEach(() => {
+  mockObserve = vi.fn();
+  mockDisconnect = vi.fn();
+
+  vi.stubGlobal(
+    'IntersectionObserver',
+    vi.fn((callback: IntersectionObserverCallback) => {
+      intersectionCallback = callback;
+      return {
+        observe: mockObserve,
+        disconnect: mockDisconnect,
+        unobserve: vi.fn(),
+      };
+    }),
+  );
+});
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+});
 
 import { JudgesList } from '../JudgesList';
 
@@ -190,7 +216,7 @@ describe('JudgesList', () => {
     expect(link).toHaveAttribute('href', '/judges/judge-1');
   });
 
-  it('renders Load more button when hasNextPage is true', () => {
+  it('renders sentinel element when hasNextPage is true (infinite scroll)', () => {
     mockUseQuery.mockReturnValue({
       data: MOCK_JUDGES_DATA,
       loading: false,
@@ -199,11 +225,44 @@ describe('JudgesList', () => {
     });
 
     render(<JudgesList />);
-    expect(screen.getByText('Load more')).toBeInTheDocument();
+    expect(screen.getByTestId('scroll-sentinel')).toBeInTheDocument();
   });
 
-  it('calls fetchMore when Load more is clicked', () => {
-    const mockFetchMore = vi.fn();
+  it('does not render sentinel when hasNextPage is false', () => {
+    mockUseQuery.mockReturnValue({
+      data: {
+        judges: {
+          ...MOCK_JUDGES_DATA.judges,
+          pageInfo: { hasNextPage: false, endCursor: null },
+        },
+      },
+      loading: false,
+      error: undefined,
+      fetchMore: vi.fn(),
+    });
+
+    render(<JudgesList />);
+    expect(screen.queryByTestId('scroll-sentinel')).not.toBeInTheDocument();
+  });
+
+  it('sets up IntersectionObserver on the sentinel element', () => {
+    mockUseQuery.mockReturnValue({
+      data: MOCK_JUDGES_DATA,
+      loading: false,
+      error: undefined,
+      fetchMore: vi.fn(),
+    });
+
+    render(<JudgesList />);
+    expect(IntersectionObserver).toHaveBeenCalledWith(
+      expect.any(Function),
+      { rootMargin: '200px' },
+    );
+    expect(mockObserve).toHaveBeenCalled();
+  });
+
+  it('calls fetchMore when sentinel becomes visible', () => {
+    const mockFetchMore = vi.fn().mockResolvedValue({});
     mockUseQuery.mockReturnValue({
       data: MOCK_JUDGES_DATA,
       loading: false,
@@ -212,12 +271,75 @@ describe('JudgesList', () => {
     });
 
     render(<JudgesList />);
-    fireEvent.click(screen.getByText('Load more'));
+
+    // Simulate the sentinel becoming visible
+    intersectionCallback(
+      [{ isIntersecting: true } as IntersectionObserverEntry],
+      {} as IntersectionObserver,
+    );
+
     expect(mockFetchMore).toHaveBeenCalledWith(
       expect.objectContaining({
         variables: { after: 'cursor-2' },
       }),
     );
+  });
+
+  it('does not call fetchMore when sentinel is not intersecting', () => {
+    const mockFetchMore = vi.fn().mockResolvedValue({});
+    mockUseQuery.mockReturnValue({
+      data: MOCK_JUDGES_DATA,
+      loading: false,
+      error: undefined,
+      fetchMore: mockFetchMore,
+    });
+
+    render(<JudgesList />);
+
+    intersectionCallback(
+      [{ isIntersecting: false } as IntersectionObserverEntry],
+      {} as IntersectionObserver,
+    );
+
+    expect(mockFetchMore).not.toHaveBeenCalled();
+  });
+
+  it('does not render sentinel while loading more results', () => {
+    mockUseQuery.mockReturnValue({
+      data: MOCK_JUDGES_DATA,
+      loading: true,
+      error: undefined,
+      fetchMore: vi.fn(),
+    });
+
+    render(<JudgesList />);
+    // Sentinel hidden during loading to prevent duplicate fetches
+    expect(screen.queryByTestId('scroll-sentinel')).not.toBeInTheDocument();
+  });
+
+  it('disconnects observer on unmount', () => {
+    mockUseQuery.mockReturnValue({
+      data: MOCK_JUDGES_DATA,
+      loading: false,
+      error: undefined,
+      fetchMore: vi.fn(),
+    });
+
+    const { unmount } = render(<JudgesList />);
+    unmount();
+    expect(mockDisconnect).toHaveBeenCalled();
+  });
+
+  it('does not render a "Load more" button (uses infinite scroll instead)', () => {
+    mockUseQuery.mockReturnValue({
+      data: MOCK_JUDGES_DATA,
+      loading: false,
+      error: undefined,
+      fetchMore: vi.fn(),
+    });
+
+    render(<JudgesList />);
+    expect(screen.queryByText('Load more')).not.toBeInTheDocument();
   });
 
   it('renders filter input for name search', () => {

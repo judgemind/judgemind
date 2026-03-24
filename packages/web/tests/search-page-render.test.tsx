@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { render, screen, fireEvent, waitFor } from '@testing-library/react';
 
 // ---------------------------------------------------------------------------
@@ -50,6 +50,30 @@ vi.mock('@apollo/client', async () => {
 });
 
 import { SearchPage } from '../src/app/(main)/search/SearchPage';
+
+// IntersectionObserver mock
+let mockObserve: ReturnType<typeof vi.fn>;
+let mockDisconnect: ReturnType<typeof vi.fn>;
+
+beforeEach(() => {
+  mockObserve = vi.fn();
+  mockDisconnect = vi.fn();
+
+  vi.stubGlobal(
+    'IntersectionObserver',
+    vi.fn((callback: IntersectionObserverCallback) => {
+      return {
+        observe: mockObserve,
+        disconnect: mockDisconnect,
+        unobserve: vi.fn(),
+      };
+    }),
+  );
+});
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+});
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -207,7 +231,7 @@ describe('SearchPage (render)', () => {
     expect(screen.getByText('Unknown Case')).toBeInTheDocument();
   });
 
-  it('renders load more button when hasNextPage', () => {
+  it('renders sentinel element when hasNextPage (infinite scroll)', () => {
     mockSearchParamsValue = new URLSearchParams('q=motion');
     mockQueryResult.data = {
       searchRulings: {
@@ -217,23 +241,22 @@ describe('SearchPage (render)', () => {
       },
     };
     render(<SearchPage />);
-    expect(
-      screen.getByRole('button', { name: 'Load more' }),
-    ).toBeInTheDocument();
+    expect(screen.getByTestId('scroll-sentinel')).toBeInTheDocument();
+    // No Load more button
+    expect(screen.queryByText('Load more')).not.toBeInTheDocument();
   });
 
-  it('calls fetchMore when load more is clicked', () => {
+  it('does not render sentinel when hasNextPage is false', () => {
     mockSearchParamsValue = new URLSearchParams('q=motion');
     mockQueryResult.data = {
       searchRulings: {
         edges: [{ cursor: 'c1', node: makeSearchHit() }],
-        pageInfo: { hasNextPage: true, endCursor: 'cursor-1' },
-        totalHits: 50,
+        pageInfo: { hasNextPage: false, endCursor: null },
+        totalHits: 1,
       },
     };
     render(<SearchPage />);
-    fireEvent.click(screen.getByRole('button', { name: 'Load more' }));
-    expect(mockQueryResult.fetchMore).toHaveBeenCalled();
+    expect(screen.queryByTestId('scroll-sentinel')).not.toBeInTheDocument();
   });
 
   it('renders motion type filter checkboxes', () => {

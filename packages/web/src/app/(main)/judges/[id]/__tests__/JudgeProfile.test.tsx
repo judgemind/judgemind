@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { render, screen, waitFor } from '@testing-library/react';
 import { MockedProvider, MockedResponse } from '@apollo/client/testing';
 import { gql } from '@apollo/client';
@@ -23,6 +23,32 @@ vi.mock('lucide-react', () => ({
     <span data-testid="scale-icon" className={className} />
   ),
 }));
+
+// IntersectionObserver mock
+let mockObserve: ReturnType<typeof vi.fn>;
+let mockDisconnect: ReturnType<typeof vi.fn>;
+
+beforeEach(() => {
+  mockObserve = vi.fn();
+  mockDisconnect = vi.fn();
+
+  vi.stubGlobal(
+    'IntersectionObserver',
+    vi.fn((callback: IntersectionObserverCallback) => {
+      // Store callback for potential use in tests
+      (globalThis as Record<string, unknown>).__intersectionCallback = callback;
+      return {
+        observe: mockObserve,
+        disconnect: mockDisconnect,
+        unobserve: vi.fn(),
+      };
+    }),
+  );
+});
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+});
 
 // ---------------------------------------------------------------------------
 // GraphQL queries (must match the component's queries exactly)
@@ -358,7 +384,7 @@ describe('JudgeProfile', () => {
     });
   });
 
-  it('renders load more button when hasNextPage is true', async () => {
+  it('renders sentinel element when hasNextPage is true (infinite scroll)', async () => {
     const mocks = [
       buildAnalyticsMock('judge-pag'),
       buildRulingsMock('judge-pag', { hasNextPage: true, endCursor: 'cursor-1' }),
@@ -371,11 +397,18 @@ describe('JudgeProfile', () => {
     );
 
     await waitFor(() => {
-      expect(screen.getByText('Load more')).toBeInTheDocument();
+      expect(screen.getByTestId('scroll-sentinel')).toBeInTheDocument();
     });
+
+    // IntersectionObserver should be set up
+    expect(IntersectionObserver).toHaveBeenCalledWith(
+      expect.any(Function),
+      { rootMargin: '200px' },
+    );
+    expect(mockObserve).toHaveBeenCalled();
   });
 
-  it('does not render load more button when hasNextPage is false', async () => {
+  it('does not render sentinel or Load more when hasNextPage is false', async () => {
     const mocks = [
       buildAnalyticsMock('judge-1'),
       buildRulingsMock('judge-1', { hasNextPage: false }),
@@ -392,6 +425,109 @@ describe('JudgeProfile', () => {
     });
 
     expect(screen.queryByText('Load more')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('scroll-sentinel')).not.toBeInTheDocument();
+  });
+
+  it('does not render a "Load more" button (uses infinite scroll instead)', async () => {
+    const mocks = [
+      buildAnalyticsMock('judge-pag'),
+      buildRulingsMock('judge-pag', { hasNextPage: true, endCursor: 'cursor-1' }),
+    ];
+
+    render(
+      <MockedProvider mocks={mocks}>
+        <JudgeProfile judgeId="judge-pag" />
+      </MockedProvider>,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByTestId('scroll-sentinel')).toBeInTheDocument();
+    });
+
+    expect(screen.queryByText('Load more')).not.toBeInTheDocument();
+  });
+
+  it('calls fetchMore when sentinel becomes visible', async () => {
+    const mocks: MockedResponse[] = [
+      buildAnalyticsMock('judge-fetch'),
+      buildRulingsMock('judge-fetch', { hasNextPage: true, endCursor: 'cursor-fetch' }),
+      // fetchMore response for the second page
+      {
+        request: {
+          query: JUDGE_RULINGS_QUERY,
+          variables: { judgeId: 'judge-fetch', first: 20, after: 'cursor-fetch' },
+        },
+        result: {
+          data: {
+            rulings: {
+              edges: [
+                {
+                  cursor: 'c3',
+                  node: {
+                    id: 'r3',
+                    hearingDate: '2026-01-01',
+                    motionType: 'msj',
+                    outcome: 'granted',
+                    case: {
+                      id: 'case-3',
+                      caseNumber: '24STCV99999',
+                      caseTitle: 'Page Two Case',
+                    },
+                  },
+                },
+              ],
+              pageInfo: {
+                hasNextPage: false,
+                endCursor: null,
+              },
+            },
+          },
+        },
+      },
+    ];
+
+    render(
+      <MockedProvider mocks={mocks}>
+        <JudgeProfile judgeId="judge-fetch" />
+      </MockedProvider>,
+    );
+
+    // Wait for initial data to load and sentinel to appear
+    await waitFor(() => {
+      expect(screen.getByTestId('scroll-sentinel')).toBeInTheDocument();
+    });
+
+    // Simulate the sentinel becoming visible
+    const callback = (globalThis as Record<string, unknown>).__intersectionCallback as IntersectionObserverCallback;
+    callback(
+      [{ isIntersecting: true } as IntersectionObserverEntry],
+      {} as IntersectionObserver,
+    );
+
+    // After fetchMore, the second page data should appear
+    await waitFor(() => {
+      expect(screen.getByText('24STCV99999')).toBeInTheDocument();
+    });
+  });
+
+  it('disconnects observer on unmount', async () => {
+    const mocks = [
+      buildAnalyticsMock('judge-pag'),
+      buildRulingsMock('judge-pag', { hasNextPage: true, endCursor: 'cursor-1' }),
+    ];
+
+    const { unmount } = render(
+      <MockedProvider mocks={mocks}>
+        <JudgeProfile judgeId="judge-pag" />
+      </MockedProvider>,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByTestId('scroll-sentinel')).toBeInTheDocument();
+    });
+
+    unmount();
+    expect(mockDisconnect).toHaveBeenCalled();
   });
 
   it('renders null analytics gracefully', async () => {

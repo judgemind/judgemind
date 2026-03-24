@@ -1,5 +1,6 @@
 'use client';
 
+import { useRef, useCallback, useEffect } from 'react';
 import { useQuery, gql } from '@apollo/client';
 import Link from 'next/link';
 import { BarChart3, Scale } from 'lucide-react';
@@ -10,7 +11,6 @@ import {
 } from '@/lib/display-helpers';
 import { OutcomeBadge } from '@/components/OutcomeBadge';
 import { SECTION_HEADING, SECTION_LABEL } from '@/lib/typography';
-import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Skeleton } from '@/components/ui/skeleton';
 import {
@@ -226,14 +226,17 @@ export function JudgeProfile({ judgeId }: { judgeId: string }) {
   const analytics = analyticsData?.judgeAnalytics;
   const edges = rulingsData?.rulings.edges ?? [];
   const pageInfo = rulingsData?.rulings.pageInfo;
+  const fetchingMore = useRef(false);
+  const observer = useRef<IntersectionObserver | null>(null);
 
   // Coordinate loading states: only show empty messages when both queries
   // have completed. If one returns empty while the other is still loading,
   // show a skeleton instead of the contradictory "No rulings captured" message.
   const bothLoaded = !analyticsLoading && !rulingsLoading;
 
-  function handleLoadMore() {
-    if (!pageInfo?.endCursor) return;
+  const handleLoadMore = useCallback(() => {
+    if (!pageInfo?.endCursor || rulingsLoading || fetchingMore.current) return;
+    fetchingMore.current = true;
     fetchMore({
       variables: { after: pageInfo.endCursor },
       updateQuery(prev, { fetchMoreResult }) {
@@ -245,8 +248,33 @@ export function JudgeProfile({ judgeId }: { judgeId: string }) {
           },
         };
       },
+    }).finally(() => {
+      fetchingMore.current = false;
     });
-  }
+  }, [pageInfo?.endCursor, rulingsLoading, fetchMore]);
+
+  const sentinelRef = useCallback(
+    (node: HTMLDivElement | null) => {
+      if (observer.current) observer.current.disconnect();
+      if (!node) return;
+      observer.current = new IntersectionObserver(
+        (entries) => {
+          if (entries[0]?.isIntersecting) {
+            handleLoadMore();
+          }
+        },
+        { rootMargin: '200px' },
+      );
+      observer.current.observe(node);
+    },
+    [handleLoadMore],
+  );
+
+  useEffect(() => {
+    return () => {
+      if (observer.current) observer.current.disconnect();
+    };
+  }, []);
 
   // -------------------------------------------------------------------------
   // Analytics section
@@ -443,17 +471,26 @@ export function JudgeProfile({ judgeId }: { judgeId: string }) {
           ))}
         </div>
 
-        {/* Load more */}
-        {pageInfo?.hasNextPage && (
-          <div className="flex justify-center pt-2">
-            <Button
-              variant="outline"
-              onClick={handleLoadMore}
-              disabled={rulingsLoading}
-            >
-              {rulingsLoading ? 'Loading…' : 'Load more'}
-            </Button>
+        {/* Loading indicator for infinite scroll */}
+        {rulingsLoading && edges.length > 0 && (
+          <div className="mt-3 divide-y rounded-lg border">
+            {Array.from({ length: 3 }).map((_, i) => (
+              <div key={`loading-${i}`} className="px-4 py-3">
+                <div className="flex items-start justify-between gap-3">
+                  <div className="min-w-0 flex-1 space-y-2">
+                    <Skeleton className="h-4 w-48" />
+                    <Skeleton className="h-3 w-32" />
+                  </div>
+                  <Skeleton className="h-5 w-16 rounded-full" />
+                </div>
+              </div>
+            ))}
           </div>
+        )}
+
+        {/* Infinite scroll sentinel */}
+        {pageInfo?.hasNextPage && !rulingsLoading && (
+          <div ref={sentinelRef} data-testid="scroll-sentinel" className="h-1" />
         )}
       </div>
     );
