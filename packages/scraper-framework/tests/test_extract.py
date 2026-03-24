@@ -376,6 +376,34 @@ class TestExtractMotionType:
         text = "Petition to confirm arbitration award"
         assert extract_motion_type(text) == "petition"
 
+    # --- New patterns (issue #1783) ---
+
+    def test_judgment_on_the_pleadings(self) -> None:
+        text = "Motion for Judgment on the Pleadings"
+        assert extract_motion_type(text) == "motion_for_judgment_on_the_pleadings"
+
+    def test_judgment_on_the_pleadings_without_prefix(self) -> None:
+        """Prefix-less 'judgment on the pleadings' should NOT match in ruling text.
+
+        Prefix-less matching is intentionally handled by _PREFIX_LESS_PATTERNS
+        in normalize_motion_type() only, to avoid false positives in full text.
+        """
+        text = "The court rules on judgment on the pleadings."
+        assert extract_motion_type(text) is None
+
+    def test_deem_admissions_admitted(self) -> None:
+        text = "Motion to Deem Requests for Admissions Admitted"
+        assert extract_motion_type(text) == "deem_admissions_admitted"
+
+    def test_deem_requests_short(self) -> None:
+        text = "Motion to Deem Requests for Wells Fargo Bank"
+        assert extract_motion_type(text) == "deem_admissions_admitted"
+
+    def test_deem_admission_admitted_prefix_less(self) -> None:
+        """Prefix-less 'deem admission admitted' should NOT match in ruling text."""
+        text = "Deem admission admitted"
+        assert extract_motion_type(text) is None
+
 
 # ---------------------------------------------------------------------------
 # Judge name extraction
@@ -1891,6 +1919,12 @@ class TestExtractCaseTypeFromMotionType:
     def test_class_action_settlement(self) -> None:
         assert extract_case_type_from_motion_type("class_action_settlement") == "civil"
 
+    def test_motion_for_judgment_on_the_pleadings(self) -> None:
+        assert extract_case_type_from_motion_type("motion_for_judgment_on_the_pleadings") == "civil"
+
+    def test_deem_admissions_admitted(self) -> None:
+        assert extract_case_type_from_motion_type("deem_admissions_admitted") == "civil"
+
     # --- Probate motion types ---
 
     def test_petition(self) -> None:
@@ -2016,12 +2050,76 @@ class TestNormalizeMotionType:
         assert normalize_motion_type("Motion to Compel") == "motion_to_compel"
 
     def test_riverside_attorneys_fees_standalone(self) -> None:
-        """Standalone 'Attorney's Fees' cannot be mapped (no 'motion for' prefix)."""
-        assert normalize_motion_type("Attorney's Fees") is None
+        """Standalone 'Attorney's Fees' maps via prefix-less fallback (#1783)."""
+        assert normalize_motion_type("Attorney's Fees") == "motion_for_attorney_fees"
+
+    def test_riverside_attorneys_fees_plural_possessive(self) -> None:
+        """Plural possessive 'Attorneys' Fees' maps correctly (#1783)."""
+        assert normalize_motion_type("Attorneys' Fees") == "motion_for_attorney_fees"
 
     def test_motion_for_attorneys_fees(self) -> None:
         """'Motion for Attorney's Fees' maps correctly."""
         assert normalize_motion_type("Motion for Attorney's Fees") == "motion_for_attorney_fees"
+
+    # --- Riverside prefix-less values (#1783) ---
+
+    def test_riverside_compel_plaintiffs_responses(self) -> None:
+        assert normalize_motion_type("Compel Plaintiff's Responses") == "motion_to_compel"
+
+    def test_riverside_compel_further_responses(self) -> None:
+        assert (
+            normalize_motion_type("Compel Plaintiff's Responses to Request for Production")
+            == "motion_to_compel"
+        )
+
+    def test_riverside_new_trial(self) -> None:
+        assert normalize_motion_type("New Trial") == "motion_for_new_trial"
+
+    def test_riverside_judgment_on_the_pleadings(self) -> None:
+        assert (
+            normalize_motion_type("Judgment on the Pleadings")
+            == "motion_for_judgment_on_the_pleadings"
+        )
+
+    def test_riverside_deem_requests_admitted(self) -> None:
+        assert (
+            normalize_motion_type("Deem Requests for Admissions Admitted")
+            == "deem_admissions_admitted"
+        )
+
+    def test_riverside_deem_requests_short(self) -> None:
+        """Short 'DEEM REQUESTS FOR WELLS FARGO' matches deem_requests pattern."""
+        assert (
+            normalize_motion_type("DEEM REQUESTS FOR WELLS FARGO BANK, N.A.")
+            == "deem_admissions_admitted"
+        )
+
+    def test_riverside_terminating(self) -> None:
+        assert normalize_motion_type("Terminating Sanctions") == "motion_for_sanctions"
+
+    def test_riverside_terminating_standalone(self) -> None:
+        assert normalize_motion_type("Terminating") == "motion_for_sanctions"
+
+    def test_riverside_monetary_sanctions(self) -> None:
+        assert normalize_motion_type("Monetary Sanctions") == "motion_for_sanctions"
+
+    def test_riverside_production_of_documents(self) -> None:
+        assert normalize_motion_type("Production of Documents") == "motion_to_compel"
+
+    def test_riverside_protective_order(self) -> None:
+        assert normalize_motion_type("Protective Order") == "motion_for_protective_order"
+
+    def test_riverside_strike_standalone(self) -> None:
+        assert normalize_motion_type("Strike") == "motion_to_strike"
+
+    def test_riverside_quash_standalone(self) -> None:
+        assert normalize_motion_type("Quash") == "motion_to_quash"
+
+    def test_riverside_relief_from_default(self) -> None:
+        assert normalize_motion_type("Relief from Default") == "motion_to_set_aside_default"
+
+    def test_riverside_leave_to_amend(self) -> None:
+        assert normalize_motion_type("Leave to Amend") == "motion_for_leave_to_amend"
 
     # --- Edge cases ---
 
