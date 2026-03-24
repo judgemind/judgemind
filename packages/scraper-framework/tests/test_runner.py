@@ -71,7 +71,7 @@ def _make_doc() -> CapturedDocument:
         county="Test",
         court="Superior Court",
         source_url="https://example.com/ruling",
-        capture_timestamp=datetime.utcnow(),
+        capture_timestamp=datetime.now(UTC),
         content_format=ContentFormat.HTML,
         raw_content=b"<html>ruling</html>",
         content_hash="",
@@ -598,7 +598,7 @@ class TestHealthReportedFailure:
                     records_captured=0,
                     response_time_seconds=0.1,
                     error_message="site returned 500",
-                    run_timestamp=datetime.utcnow(),
+                    run_timestamp=datetime.now(UTC),
                 )
 
         entries = [("health-fail", HealthFailScraper, _stub_config)]
@@ -627,7 +627,7 @@ class TestHealthReportedFailure:
                     records_captured=0,
                     response_time_seconds=0.1,
                     error_message="failed",
-                    run_timestamp=datetime.utcnow(),
+                    run_timestamp=datetime.now(UTC),
                 )
 
         ran = []

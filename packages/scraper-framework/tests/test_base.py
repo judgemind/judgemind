@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import uuid
-from datetime import datetime
+from datetime import UTC, datetime
 from unittest.mock import MagicMock
 
 import structlog.testing
@@ -44,7 +44,7 @@ def _make_doc(config: ScraperConfig) -> CapturedDocument:
         county=config.county,
         court=config.court,
         source_url="https://example.com/ruling/1",
-        capture_timestamp=datetime.utcnow(),
+        capture_timestamp=datetime.now(UTC),
         content_format=ContentFormat.HTML,
         raw_content=b"<html>tentative ruling text</html>",
         content_hash="",
@@ -257,7 +257,7 @@ def test_process_document_warns_on_empty_pdf_text() -> None:
         county=config.county,
         court=config.court,
         source_url="https://example.com/ruling.pdf",
-        capture_timestamp=datetime.utcnow(),
+        capture_timestamp=datetime.now(UTC),
         content_format=ContentFormat.PDF,
         raw_content=pdf_bytes,
         content_hash="",
@@ -299,7 +299,7 @@ def test_process_document_no_warning_when_pdf_has_text() -> None:
         county=config.county,
         court=config.court,
         source_url="https://example.com/ruling.pdf",
-        capture_timestamp=datetime.utcnow(),
+        capture_timestamp=datetime.now(UTC),
         content_format=ContentFormat.PDF,
         raw_content=pdf_bytes,
         content_hash="",
@@ -334,7 +334,7 @@ def test_process_document_no_warning_for_html_without_text() -> None:
         county=config.county,
         court=config.court,
         source_url="https://example.com/ruling.html",
-        capture_timestamp=datetime.utcnow(),
+        capture_timestamp=datetime.now(UTC),
         content_format=ContentFormat.HTML,
         raw_content=b"<html>empty page</html>",
         content_hash="",

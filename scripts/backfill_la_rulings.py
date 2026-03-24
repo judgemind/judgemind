@@ -37,7 +37,7 @@ import logging
 import os
 import sys
 import uuid
-from datetime import datetime
+from datetime import UTC, datetime
 
 # Ensure the scraper-framework source is importable
 sys.path.insert(
@@ -374,7 +374,7 @@ def _create_split_ruling(
         s3_bucket=bucket,
         source_url=source_url,
         scraper_id=scraper_id,
-        captured_at=captured_at or datetime.utcnow(),
+        captured_at=captured_at or datetime.now(UTC),
         hearing_date=hearing_date,
     )
 
