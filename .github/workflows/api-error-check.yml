@@ -138,14 +138,20 @@ jobs:
       - name: Extract alert summary
         if: steps.check.outputs.healthy == 'false'
         id: summary
+        env:
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           # Parse the JSON output and produce a markdown summary
           python3 -c "
-          import json, sys
+          import json, os, sys
           try:
               data = json.load(open('/tmp/check_output.txt'))
           except Exception:
-              print('Could not parse check output.', file=sys.stderr)
+              run_url = os.environ.get('RUN_URL', '')
+              print('**Warning:** Could not parse check output.')
+              print('')
+              print('Inspect the workflow run logs manually for alert details:')
+              print(run_url)
               sys.exit(0)
 
           lines = ['| Metric | Value | Threshold | Status |', '| --- | --- | --- | --- |']
@@ -166,20 +172,21 @@ jobs:
               lines.append(f'| {label} | {val} | {threshold} | {status} |')
 
           print('\n'.join(lines))
-          " > /tmp/alert_summary.md 2>/dev/null || echo "Could not extract alert details." > /tmp/alert_summary.md
+          " > /tmp/alert_summary.md 2>/dev/null || echo "**Warning:** Could not extract alert details. See workflow run: ${RUN_URL}" > /tmp/alert_summary.md
 
           # Telegram one-liner
           python3 -c "
-          import json, sys
+          import json, os, sys
           try:
               data = json.load(open('/tmp/check_output.txt'))
           except Exception:
-              print('Alert details unavailable.')
+              run_url = os.environ.get('RUN_URL', '')
+              print(f'Alert details unavailable — see workflow run: {run_url}')
               sys.exit(0)
           alerts = data.get('alerts', [])
           parts = [a['message'] for a in alerts]
           print('; '.join(parts) if parts else 'Unknown alert')
-          " > /tmp/alert_telegram.txt 2>/dev/null || echo "Alert details unavailable." > /tmp/alert_telegram.txt
+          " > /tmp/alert_telegram.txt 2>/dev/null || echo "Alert details unavailable — see workflow run: ${RUN_URL}" > /tmp/alert_telegram.txt
 
           echo "Alert summary:"
           cat /tmp/alert_summary.md
