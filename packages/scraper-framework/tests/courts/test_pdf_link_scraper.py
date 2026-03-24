@@ -391,8 +391,9 @@ def test_riv_full_run() -> None:
     health = scraper.run()
 
     assert health.success is True
-    # PS1 fixture has 4 rulings; 17 PDFs * 4 rulings = 68 records after splitting
-    assert health.records_captured == 68
+    # PS1 fixture has 4 rulings; 16 matching PDFs * 4 rulings = 64 records
+    # (1 of 17 links — "Department 260" — is filtered by link_text_re, #1845)
+    assert health.records_captured == 64
 
 
 @respx.mock
@@ -408,14 +409,178 @@ def test_riv_run_populates_judge_and_dept() -> None:
     scraper = RiversideTentativeRulingsScraper(config=config)
 
     docs = scraper.fetch_documents()
-    # PS1 fixture has 4 rulings; 17 PDFs * 4 rulings = 68 after splitting
-    assert len(docs) == 68
+    # PS1 fixture has 4 rulings; 16 matching PDFs * 4 rulings = 64 after splitting
+    # (1 of 17 links — "Department 260" — is filtered by link_text_re, #1845)
+    assert len(docs) == 64
 
     # PS1 docs should all have judge Hester (4 split rulings from PS1 PDF)
     ps1_docs = [d for d in docs if d.department == "PS1"]
     assert len(ps1_docs) == 4
     assert all("Hester" in (d.judge_name or "") for d in ps1_docs)
     assert all(d.courthouse == "Palm Springs Courthouse" for d in ps1_docs)
+
+
+# ---------------------------------------------------------------------------
+# Link text filtering (#1845) — non-matching links are skipped
+# ---------------------------------------------------------------------------
+
+
+@respx.mock
+def test_link_text_filter_skips_non_matching_links() -> None:
+    """PDF links whose text does not match link_text_re are skipped (#1845).
+
+    Uses a synthetic HTML page with both matching and non-matching links
+    to verify only matching links produce documents.
+    """
+    import re
+
+    from courts.ca.pdf_link_scraper import PdfLinkConfig, PdfLinkScraper
+    from framework import ScraperConfig
+
+    html = (
+        "<html><body>"
+        '<a href="/rulings/dept1.pdf">Department 1 - Honorable Jane Doe</a>'
+        '<a href="/rulings/dept2.pdf">Department 2 - Honorable John Smith</a>'
+        '<a href="/rulings/escheat.pdf">Escheat Notice - January 2026</a>'
+        '<a href="/rulings/claims.pdf">Small Claims Forms</a>'
+        "</body></html>"
+    )
+
+    config = ScraperConfig(
+        scraper_id="test",
+        state="CA",
+        county="Test",
+        court="Superior Court",
+        target_urls=["http://example.com"],
+        request_delay_seconds=0,
+        s3_bucket="",
+    )
+    pdf_config = PdfLinkConfig(
+        index_url="http://example.com/rulings",
+        pdf_base_url="http://example.com/rulings",
+        link_text_re=re.compile(
+            r"Department\s+(?P<department>\S+)\s*-\s*Honorable\s+(?P<judge_name>.+)",
+            re.IGNORECASE,
+        ),
+    )
+    scraper = PdfLinkScraper(config=config, pdf_config=pdf_config)
+
+    # Mock the index page and all PDF responses
+    respx.get("http://example.com/rulings").mock(return_value=httpx.Response(200, text=html))
+    respx.get(url__regex=r"\.pdf$").mock(
+        return_value=httpx.Response(200, content=b"%PDF-1.4 fake pdf content")
+    )
+
+    docs = scraper.fetch_documents()
+
+    # Only 2 matching links should produce documents; escheat + claims skipped
+    assert len(docs) == 2
+    departments = {d.department for d in docs}
+    assert departments == {"1", "2"}
+
+
+@respx.mock
+def test_link_text_filter_logs_warning_for_skipped_links(caplog: pytest.LogCaptureFixture) -> None:
+    """A warning is logged when a non-matching PDF link is skipped (#1845)."""
+    import re
+
+    from courts.ca.pdf_link_scraper import PdfLinkConfig, PdfLinkScraper
+    from framework import ScraperConfig
+
+    html = (
+        '<html><body><a href="/rulings/escheat.pdf">Escheat Notice - January 2026</a></body></html>'
+    )
+
+    config = ScraperConfig(
+        scraper_id="test",
+        state="CA",
+        county="Test",
+        court="Superior Court",
+        target_urls=["http://example.com"],
+        request_delay_seconds=0,
+        s3_bucket="",
+    )
+    pdf_config = PdfLinkConfig(
+        index_url="http://example.com/rulings",
+        pdf_base_url="http://example.com/rulings",
+        link_text_re=re.compile(
+            r"Department\s+(?P<department>\S+)\s*-\s*Honorable\s+(?P<judge_name>.+)",
+            re.IGNORECASE,
+        ),
+    )
+    scraper = PdfLinkScraper(config=config, pdf_config=pdf_config)
+
+    respx.get("http://example.com/rulings").mock(return_value=httpx.Response(200, text=html))
+
+    import structlog
+
+    structlog.configure(
+        wrapper_class=structlog.make_filtering_bound_logger(0),
+    )
+
+    docs = scraper.fetch_documents()
+
+    assert len(docs) == 0
+
+
+@respx.mock
+def test_riv_filters_non_matching_dept_260_link() -> None:
+    """Riverside 'Department 260' link (no judge name) is filtered out (#1845).
+
+    The riv_page.html fixture contains 17 PDF links, but 'Department 260'
+    does not match the Riverside link_text_re pattern because it lacks
+    '- Honorable <name>'.  It should be skipped, leaving 16 links.
+    """
+    html = _load_html("riv_page.html")
+    pdf_bytes = _load_bytes("riv_ps1.pdf")
+
+    respx.get(RIV_INDEX_URL).mock(return_value=httpx.Response(200, text=html))
+    respx.get(url__regex=r"\.pdf$").mock(return_value=httpx.Response(200, content=pdf_bytes))
+
+    config = riv_default_config()
+    config.request_delay_seconds = 0
+    scraper = RiversideTentativeRulingsScraper(config=config)
+    docs = scraper.fetch_documents()
+
+    # 17 links on page, 1 filtered ("Department 260"), 16 * 4 rulings = 64
+    assert len(docs) == 64
+    # Verify no document has a null department (all matched the regex)
+    assert all(d.department is not None for d in docs)
+    assert all(d.department != "" for d in docs)
+
+
+@respx.mock
+def test_riv_escheat_style_link_filtered() -> None:
+    """Riverside-style escheat notice link text is filtered out (#1845).
+
+    This simulates the real-world scenario where an escheat notice PDF
+    appears on the Riverside tentative rulings page with link text like
+    'Escheat Notice - Unclaimed Property' instead of the expected
+    'Department X - Honorable Y' pattern.
+    """
+    # HTML with one real ruling link and one escheat-style link
+    html = (
+        "<html><body>"
+        '<a href="/system/files/2026-02/PS1ruling.pdf">'
+        "Department PS1 - Honorable Arthur Hester III</a>"
+        '<a href="/system/files/2026-02/escheat_notice.pdf">'
+        "Escheat Notice - Unclaimed Property January 2026</a>"
+        "</body></html>"
+    )
+    pdf_bytes = _load_bytes("riv_ps1.pdf")
+
+    respx.get(RIV_INDEX_URL).mock(return_value=httpx.Response(200, text=html))
+    respx.get(url__regex=r"\.pdf$").mock(return_value=httpx.Response(200, content=pdf_bytes))
+
+    config = riv_default_config()
+    config.request_delay_seconds = 0
+    scraper = RiversideTentativeRulingsScraper(config=config)
+    docs = scraper.fetch_documents()
+
+    # Only the PS1 link should produce documents; escheat is filtered
+    assert len(docs) == 4  # PS1 has 4 split rulings
+    assert all(d.department == "PS1" for d in docs)
+    assert all("Hester" in (d.judge_name or "") for d in docs)
 
 
 # ---------------------------------------------------------------------------

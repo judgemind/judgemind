@@ -333,6 +333,7 @@ class CCTentativeRulingsScraper(PdfLinkScraper):
             link_text_re=re.compile(r"(?P<department>UNUSED)(?P<judge_name>UNUSED)"),
             courthouse_from_dept=_cc_courthouse,
             verify_ssl=True,
+            filter_by_link_text=False,  # CC overrides fetch_documents entirely
             case_number_re=_CASE_NUMBER_RE,
         )
         super().__init__(config, pdf_config=pdf_config, **kwargs)

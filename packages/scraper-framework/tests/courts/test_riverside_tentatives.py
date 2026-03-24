@@ -19,13 +19,14 @@ from __future__ import annotations
 import re
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 from unittest.mock import patch
 
 import httpx
 import pytest
 import respx
 
-from courts.ca.pdf_link_scraper import _extract_pdf_text
+from courts.ca.pdf_link_scraper import PdfLinkScraper, _extract_pdf_text
 from courts.ca.riverside_tentatives import (
     _CASE_NUMBER_RE,
     INDEX_URL,
@@ -472,8 +473,9 @@ def test_riv_run_splits_multi_ruling_pdfs() -> None:
     scraper = RiversideTentativeRulingsScraper(config=config)
 
     docs = scraper.fetch_documents()
-    # 17 PDF links on the index page, each mocked with the 4-ruling PS1 PDF
-    assert len(docs) == 17 * 4
+    # 16 matching PDF links on the index page (1 filtered by link_text_re, #1845),
+    # each mocked with the 4-ruling PS1 PDF
+    assert len(docs) == 16 * 4
 
     # All split docs have pre_split flag
     assert all(d.extra.get("pre_split") for d in docs)
@@ -613,26 +615,31 @@ def test_riv_run_skips_murrieta_no_tentative_rulings() -> None:
 # ---------------------------------------------------------------------------
 
 
-def _html_without_judge_names() -> str:
-    """Return modified index HTML where link text lacks judge names.
+def _html_with_single_matching_link(
+    link_text: str = "Department PS1 - Honorable Arthur Hester III",
+) -> str:
+    """Return a minimal HTML page with a single matching PDF link.
 
-    Replaces 'Department PS1 - Honorable Arthur Hester III' with
-    just 'Department PS1' to simulate links without judge info.
+    Used by judge-fallback tests that need precise control over link text
+    without depending on the full riv_page.html fixture (#1845).
     """
-    import re
-
-    html = _load_html("riv_page.html")
-    return re.sub(
-        r"(Department\s+\S+)\s*-\s*Honorable\s+[^<]+",
-        r"\1",
-        html,
+    return (
+        "<html><body>"
+        f'<a href="/system/files/2026-02/PS1ruling030226.pdf">{link_text}</a>'
+        "</body></html>"
     )
 
 
 @respx.mock
 def test_riv_pdf_judge_fallback_when_link_text_has_no_name() -> None:
-    """When link text lacks judge name, extract_judge_name is called on PDF text (#411)."""
-    html = _html_without_judge_names()
+    """When link text lacks judge name, extract_judge_name is called on PDF text (#411).
+
+    Uses a single-link synthetic HTML page to isolate the fallback test from
+    the link_text_re filter (#1845). The link text matches the filter pattern
+    but we mock _fetch_one_pdf to return a doc with judge_name=None to
+    exercise the PDF-text fallback path.
+    """
+    html = _html_with_single_matching_link("Department PS1 - Honorable Arthur Hester III")
     pdf_bytes = _load_bytes("riv_ps1.pdf")
 
     respx.get(INDEX_URL).mock(return_value=httpx.Response(200, text=html))
@@ -644,13 +651,24 @@ def test_riv_pdf_judge_fallback_when_link_text_has_no_name() -> None:
     config.request_delay_seconds = 0
     scraper = RiversideTentativeRulingsScraper(config=config)
 
+    # Patch _fetch_one_pdf to clear the judge name (simulate missing link-text judge)
+    original_fetch = PdfLinkScraper._fetch_one_pdf
+
+    def _fetch_no_judge(self: PdfLinkScraper, client: Any, href: str, link_text: str) -> Any:
+        doc = original_fetch(self, client, href, link_text)
+        doc.judge_name = None
+        return doc
+
     # Mock extract_judge_name to return a judge name from the PDF text
-    with patch(
-        "courts.ca.riverside_tentatives.extract_judge_name",
-        return_value="Arthur Hester III",
-    ) as mock_extract:
+    with (
+        patch.object(PdfLinkScraper, "_fetch_one_pdf", _fetch_no_judge),
+        patch(
+            "courts.ca.riverside_tentatives.extract_judge_name",
+            return_value="Arthur Hester III",
+        ) as mock_extract,
+    ):
         docs = scraper.fetch_documents()
-        # extract_judge_name should have been called (once per PDF with no link-text judge)
+        # extract_judge_name should have been called
         assert mock_extract.call_count > 0
 
     # All split docs should have the fallback judge name
@@ -689,8 +707,13 @@ def test_riv_pdf_judge_fallback_preserves_link_text_judge_name() -> None:
 
 @respx.mock
 def test_riv_pdf_judge_fallback_none_when_no_judge_in_pdf() -> None:
-    """When neither link text nor PDF content has a judge name, judge_name stays None (#411)."""
-    html = _html_without_judge_names()
+    """When neither link text nor PDF content has a judge name, judge_name stays None (#411).
+
+    Uses a single-link synthetic HTML page to isolate the test from the
+    link_text_re filter (#1845). Mocks _fetch_one_pdf to return a doc with
+    judge_name=None, then verifies the fallback also returns None.
+    """
+    html = _html_with_single_matching_link("Department PS1 - Honorable Arthur Hester III")
     pdf_bytes = _load_bytes("riv_ps1.pdf")
 
     respx.get(INDEX_URL).mock(return_value=httpx.Response(200, text=html))
@@ -702,10 +725,21 @@ def test_riv_pdf_judge_fallback_none_when_no_judge_in_pdf() -> None:
     config.request_delay_seconds = 0
     scraper = RiversideTentativeRulingsScraper(config=config)
 
+    # Patch _fetch_one_pdf to clear the judge name
+    original_fetch = PdfLinkScraper._fetch_one_pdf
+
+    def _fetch_no_judge(self: PdfLinkScraper, client: Any, href: str, link_text: str) -> Any:
+        doc = original_fetch(self, client, href, link_text)
+        doc.judge_name = None
+        return doc
+
     # extract_judge_name returns None (no judge found in PDF text)
-    with patch(
-        "courts.ca.riverside_tentatives.extract_judge_name",
-        return_value=None,
+    with (
+        patch.object(PdfLinkScraper, "_fetch_one_pdf", _fetch_no_judge),
+        patch(
+            "courts.ca.riverside_tentatives.extract_judge_name",
+            return_value=None,
+        ),
     ):
         docs = scraper.fetch_documents()
 
@@ -896,7 +930,8 @@ def test_riv_fetch_documents_pdf_extraction_failure() -> None:
 
     docs = scraper.fetch_documents()
     # Despite extraction failures, docs are still returned (unsplit)
-    assert len(docs) == 17  # one per PDF link, no splitting
+    # 16 matching links (1 filtered by link_text_re, #1845)
+    assert len(docs) == 16  # one per PDF link, no splitting
 
 
 # ---------------------------------------------------------------------------
@@ -986,8 +1021,9 @@ def test_riv_fetch_documents_single_ruling_not_split() -> None:
     ):
         docs = scraper.fetch_documents()
 
-    # Each of the 17 PDFs returns as a single doc (not split)
-    assert len(docs) == 17
+    # Each of the 16 matching PDFs returns as a single doc (not split)
+    # (1 of 17 links filtered by link_text_re, #1845)
+    assert len(docs) == 16
     # None should have pre_split flag
     assert all(not d.extra.get("pre_split") for d in docs)
 
