@@ -459,7 +459,7 @@ export function JudgeProfile({ judgeId }: { judgeId: string }) {
               onClick={handleLoadMore}
               disabled={rulingsLoading}
             >
-              {rulingsLoading ? 'Loading\u2026' : 'Load more'}
+              {rulingsLoading ? 'Loading…' : 'Load more'}
             </Button>
           </div>
         )}

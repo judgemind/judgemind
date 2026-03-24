@@ -67,7 +67,7 @@ function VerifyEmailContent() {
     <AuthCard title="Email verification">
       {status === 'loading' && (
         <p className="text-center text-sm text-muted-foreground">
-          {'Verifying your email\u2026'}
+          {'Verifying your email…'}
         </p>
       )}
 
@@ -108,7 +108,7 @@ export default function VerifyEmailPage() {
       fallback={
         <AuthCard title="Email verification">
           <p className="text-center text-sm text-muted-foreground">
-            {'Loading\u2026'}
+            {'Loading…'}
           </p>
         </AuthCard>
       }

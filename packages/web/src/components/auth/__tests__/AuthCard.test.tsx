@@ -160,9 +160,9 @@ describe('SubmitButton', () => {
     expect(screen.getByRole('button')).toHaveTextContent('Log in');
   });
 
-  it('shows "Please wait\u2026" when loading', () => {
+  it('shows "Please wait…" when loading', () => {
     render(<SubmitButton loading={true}>Log in</SubmitButton>);
-    expect(screen.getByRole('button')).toHaveTextContent('Please wait\u2026');
+    expect(screen.getByRole('button')).toHaveTextContent('Please wait…');
   });
 
   it('is disabled when loading', () => {

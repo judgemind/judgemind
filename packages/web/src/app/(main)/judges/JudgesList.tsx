@@ -144,7 +144,7 @@ export function JudgesList() {
           <Input
             type="text"
             name="judgeName"
-            placeholder="Filter by judge name\u2026"
+            placeholder="Filter by judge name…"
             value={nameFilter}
             onChange={(e) => setNameFilter(e.target.value)}
             className="pl-9"
@@ -232,7 +232,7 @@ export function JudgesList() {
             onClick={handleLoadMore}
             disabled={loading}
           >
-            {loading ? 'Loading\u2026' : 'Load more'}
+            {loading ? 'Loading…' : 'Load more'}
           </Button>
         </div>
       )}

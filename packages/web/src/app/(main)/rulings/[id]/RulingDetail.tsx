@@ -136,7 +136,7 @@ export function RulingDetail({ ruling, sanitizedRulingTextHtml }: RulingProps) {
                     data-testid="view-original-button"
                   >
                     {viewerState.status === 'loading'
-                      ? 'Loading\u2026'
+                      ? 'Loading…'
                       : viewerState.status === 'loaded'
                         ? 'Hide original'
                         : 'View original'}
@@ -221,7 +221,7 @@ export function RulingDetail({ ruling, sanitizedRulingTextHtml }: RulingProps) {
                 data-testid="view-original-button"
               >
                 {viewerState.status === 'loading'
-                  ? 'Loading\u2026'
+                  ? 'Loading…'
                   : viewerState.status === 'loaded'
                     ? 'Hide original'
                     : 'View original'}
