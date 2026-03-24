@@ -75,6 +75,8 @@ export function DataQualityDashboard() {
     [metricsData],
   );
 
+  const metricsTruncated = metricsData?.dataQualityMetrics?.pageInfo?.hasNextPage ?? false;
+
   // Auth loading
   if (authLoading) {
     return <SkeletonGrid />;
@@ -132,6 +134,16 @@ export function DataQualityDashboard() {
         onCountyClick={setSelectedCounty}
         selectedCounty={selectedCounty}
       />
+
+      {/* Truncation warning */}
+      {!metricsLoading && metricsTruncated && (
+        <div
+          role="alert"
+          className="rounded-lg border border-yellow-300 bg-yellow-100 px-4 py-3 text-sm text-yellow-800 dark:border-yellow-700 dark:bg-yellow-900 dark:text-yellow-200"
+        >
+          Showing first {metrics.length.toLocaleString()} data points. Some data may be truncated.
+        </div>
+      )}
 
       {/* Time series charts */}
       {metricsLoading ? (

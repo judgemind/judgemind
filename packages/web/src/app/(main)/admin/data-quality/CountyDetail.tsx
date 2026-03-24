@@ -66,6 +66,8 @@ export function CountyDetail({ county, overview, onBack }: CountyDetailProps) {
     [data],
   );
 
+  const metricsTruncated = data?.dataQualityMetrics?.pageInfo?.hasNextPage ?? false;
+
   // Parse field-level completeness from metadata if available
   const fieldBreakdown = useMemo(() => {
     const completenessMetrics = metrics.filter(
@@ -137,6 +139,16 @@ export function CountyDetail({ county, overview, onBack }: CountyDetailProps) {
           </button>
         ))}
       </div>
+
+      {/* Truncation warning */}
+      {!loading && metricsTruncated && (
+        <div
+          role="alert"
+          className="mb-4 rounded-lg border border-yellow-300 bg-yellow-100 px-4 py-3 text-sm text-yellow-800 dark:border-yellow-700 dark:bg-yellow-900 dark:text-yellow-200"
+        >
+          Showing first {metrics.length.toLocaleString()} data points. Some data may be truncated.
+        </div>
+      )}
 
       {/* Loading and error states */}
       {loading && (
