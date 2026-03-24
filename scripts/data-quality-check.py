@@ -1065,8 +1065,13 @@ def check_ingest_rates(
         # Suppress on non-posting days: if the county has a posting_days
         # schedule and the 24h window doesn't overlap any posting day,
         # zero rulings is expected — not an alert.
+        # Also suppress for low_volume counties (expected_daily < 1.0 or
+        # low_volume flag): zero-count days are statistically normal for
+        # counties like Santa Clara (0.1/day) — see #1886.
         posting_days = baseline.posting_days if baseline else None
-        if count_24h == 0 and expected_daily > 0:
+        is_low_volume = baseline.low_volume if baseline else False
+        suppress_zero_rulings = is_low_volume or expected_daily < 1.0
+        if count_24h == 0 and expected_daily > 0 and not suppress_zero_rulings:
             if _24h_overlaps_posting_day(now, posting_days):
                 alerts.append(
                     Alert(

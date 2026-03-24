@@ -1074,8 +1074,13 @@ class TestPostingDayAwareBaseline:
         alerts = check_ingest_rates(conn, thursday, baselines)
         assert len(alerts) == 0
 
-    def test_low_volume_county_not_broken(self) -> None:
-        """Low-volume counties with posting_days still work correctly."""
+    def test_low_volume_county_suppresses_zero_rulings(self) -> None:
+        """Low-volume counties with low_volume=True do NOT trigger P1 zero_rulings.
+
+        A county like Santa Clara (0.1 rulings/day) will have zero new
+        rulings on ~90% of days.  Firing a P1 alert for this is a false
+        positive — see #1886.
+        """
         thursday = datetime(2026, 3, 19, 12, 0, 0, tzinfo=UTC)
         conn = FakeConnection(
             {
@@ -1095,8 +1100,66 @@ class TestPostingDayAwareBaseline:
             }
         )
         alerts = check_ingest_rates(conn, thursday, baselines)
+        assert len(alerts) == 0
+
+    def test_non_low_volume_county_still_fires_zero_rulings(self) -> None:
+        """Non-low-volume counties still trigger P1 zero_rulings alert.
+
+        San Bernardino (3/day, not low_volume) should fire P1 on zero-count
+        posting days to catch genuine scraper failures.
+        """
+        # Wednesday is a posting day for San Bernardino
+        wednesday = datetime(2026, 3, 18, 12, 0, 0, tzinfo=UTC)
+        conn = FakeConnection(
+            {
+                "AT TIME ZONE": _make_per_day_rows("San Bernardino", [3, 2, 4, 3, 2, 3], wednesday),
+                "d.captured_at >=": [],
+                "DISTINCT ct.county": [("San Bernardino",)],
+            }
+        )
+        baselines = _make_baselines(
+            {
+                "San Bernardino": {
+                    "expected_daily_rulings": 3,
+                    "schedule_type": "daily",
+                    "posting_days": ["Mon", "Tue", "Wed", "Thu", "Fri"],
+                },
+            }
+        )
+        alerts = check_ingest_rates(conn, wednesday, baselines)
         assert len(alerts) == 1
         assert alerts[0].metric == "zero_rulings"
+        assert alerts[0].severity == "p1"
+        assert alerts[0].county == "San Bernardino"
+
+    def test_low_expected_daily_suppresses_without_flag(self) -> None:
+        """Counties with expected_daily < 1.0 are suppressed even without low_volume flag.
+
+        A county with expected_daily_rulings=0.2 but no explicit low_volume=True
+        should still be suppressed — zero-count days are statistically normal
+        when the expectation is well below 1 ruling per day.  This threshold
+        guard prevents false P1 alerts if someone forgets the flag (#1886).
+        """
+        thursday = datetime(2026, 3, 19, 12, 0, 0, tzinfo=UTC)
+        conn = FakeConnection(
+            {
+                "AT TIME ZONE": _make_per_day_rows("New County", [0, 0, 1, 0, 0, 0], thursday),
+                "d.captured_at >=": [],
+                "DISTINCT ct.county": [("New County",)],
+            }
+        )
+        baselines = _make_baselines(
+            {
+                "New County": {
+                    "expected_daily_rulings": 0.2,
+                    "schedule_type": "daily",
+                    "posting_days": ["Mon", "Tue", "Wed", "Thu", "Fri"],
+                    # low_volume NOT set — defaults to False
+                },
+            }
+        )
+        alerts = check_ingest_rates(conn, thursday, baselines)
+        assert len(alerts) == 0
 
 
 class TestBackfillSpikeResilience:
