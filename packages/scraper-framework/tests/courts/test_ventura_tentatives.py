@@ -860,3 +860,50 @@ def test_ventura_parse_document_preserves_existing_judge_name() -> None:
 
     result = scraper.parse_document(doc)
     assert result.judge_name == "Pre-existing Name"
+
+
+# ---------------------------------------------------------------------------
+# Default search_dates uses timezone-aware datetime (Pacific)
+# ---------------------------------------------------------------------------
+
+
+@respx.mock
+def test_ventura_default_search_dates_uses_pacific_timezone() -> None:
+    """When no search_dates are provided, the scraper should default to
+    the current date in America/Los_Angeles timezone."""
+    from unittest.mock import patch
+    from zoneinfo import ZoneInfo
+
+    search_html = _load_html("ventura_search_page.html")
+    results_html = _load_html("ventura_results_page.html")
+    doc_content = b"<html><body><p>The motion is GRANTED.</p></body></html>"
+
+    respx.get(SEARCH_URL).mock(return_value=httpx.Response(200, text=search_html))
+    respx.post(SEARCH_URL).mock(return_value=httpx.Response(200, text=results_html))
+    respx.get(url__regex=r"/CaseInquiry/ViewFile/\d+").mock(
+        return_value=httpx.Response(
+            200,
+            content=doc_content,
+            headers={"content-type": "text/html"},
+        )
+    )
+
+    pacific_now = datetime(2026, 3, 11, 14, 0, tzinfo=ZoneInfo("America/Los_Angeles"))
+    with patch("courts.ca.ventura_tentatives.datetime") as mock_dt:
+        mock_dt.now.return_value = pacific_now
+        # Ensure strftime still works on the returned datetime
+        mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
+
+        config = ventura_default_config()
+        config.request_delay_seconds = 0
+        scraper = VenturaTentativeRulingsScraper(config=config)
+
+        docs = scraper.fetch_documents()
+
+        # Verify datetime.now was called with Pacific timezone
+        mock_dt.now.assert_called_once()
+        call_args = mock_dt.now.call_args
+        tz_arg = call_args[0][0] if call_args[0] else call_args[1].get("tz")
+        assert str(tz_arg) == "America/Los_Angeles"
+
+    assert len(docs) == 6
