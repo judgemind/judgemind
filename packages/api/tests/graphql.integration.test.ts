@@ -16,6 +16,11 @@ import { Pool, types } from 'pg';
 import type { FastifyInstance } from 'fastify';
 import { buildApp } from '../src/app';
 import { applyMigrations } from './setup-db';
+import { TEST_COUNTY_REGISTRY } from './test-counties';
+
+// Extract county/court_code from registry for compile-time enforcement
+const [GQL_COUNTY] = TEST_COUNTY_REGISTRY.graphql.counties;
+const [GQL_COURT_CODE] = TEST_COUNTY_REGISTRY.graphql.courtCodes;
 
 // Match the type parsers registered in src/data-access/db.ts so DATE columns
 // come back as 'YYYY-MM-DD' strings rather than millisecond timestamps.
@@ -43,7 +48,7 @@ const insertedDocIds: string[] = [];
 async function seedData(): Promise<void> {
   const { rows: cRows } = await pool.query<{ id: string }>(
     `INSERT INTO courts (state, county, court_name, court_code, timezone)
-     VALUES ('CA', 'Los Angeles', 'Superior Court of California, County of Los Angeles', 'ca-la-test', 'America/Los_Angeles')
+     VALUES ('CA', '${GQL_COUNTY}', 'Superior Court of California, County of ${GQL_COUNTY}', '${GQL_COURT_CODE}', 'America/Los_Angeles')
      RETURNING id`,
   );
   courtId = cRows[0].id;
@@ -232,10 +237,10 @@ describe('GraphQL schema — integration', () => {
       );
       expect(body.errors).toBeUndefined();
       expect((body.data?.case as Record<string, unknown>).court).toMatchObject({
-        courtName: 'Superior Court of California, County of Los Angeles',
-        county: 'Los Angeles',
+        courtName: `Superior Court of California, County of ${GQL_COUNTY}`,
+        county: GQL_COUNTY,
         state: 'CA',
-        courtCode: 'ca-la-test',
+        courtCode: GQL_COURT_CODE,
       });
     });
 
@@ -339,7 +344,7 @@ describe('GraphQL schema — integration', () => {
         { id: judgeId },
       );
       expect(body.errors).toBeUndefined();
-      expect((body.data?.judge as Record<string, unknown>).court).toMatchObject({ courtCode: 'ca-la-test' });
+      expect((body.data?.judge as Record<string, unknown>).court).toMatchObject({ courtCode: GQL_COURT_CODE });
     });
 
     it('judges returns JudgeConnection', async () => {
@@ -386,8 +391,8 @@ describe('GraphQL schema — integration', () => {
       );
       expect(body.errors).toBeUndefined();
       expect((body.data?.ruling as Record<string, unknown>).court).toMatchObject({
-        courtCode: 'ca-la-test',
-        county: 'Los Angeles',
+        courtCode: GQL_COURT_CODE,
+        county: GQL_COUNTY,
       });
     });
 
@@ -442,7 +447,7 @@ describe('GraphQL schema — integration', () => {
     });
 
     it('filters by county', async () => {
-      const body = await gql(`{ rulings(county: "Los Angeles") { edges { node { id } } } }`);
+      const body = await gql(`{ rulings(county: "${GQL_COUNTY}") { edges { node { id } } } }`);
       expect(body.errors).toBeUndefined();
       const edges = ((body.data?.rulings as Record<string, unknown>).edges as Array<{ node: { id: string } }>);
       expect(edges.some((e) => e.node.id === rulingId)).toBe(true);

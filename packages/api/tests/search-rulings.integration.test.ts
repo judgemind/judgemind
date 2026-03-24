@@ -20,6 +20,11 @@ import { Client } from '@opensearch-project/opensearch';
 import type { FastifyInstance } from 'fastify';
 import { buildApp } from '../src/app';
 import { applyMigrations } from './setup-db';
+import { TEST_COUNTY_REGISTRY } from './test-counties';
+
+// Extract county/court_code from registry for compile-time enforcement
+const [SEARCH_COUNTY] = TEST_COUNTY_REGISTRY.searchRulings.counties;
+const [SEARCH_COURT_CODE] = TEST_COUNTY_REGISTRY.searchRulings.courtCodes;
 
 // Match date type parsers from src/data-access/db.ts
 types.setTypeParser(1082, (val: string) => val);
@@ -58,7 +63,7 @@ let docId2: string;
 async function seedPgData(): Promise<void> {
   const { rows: cRows } = await pool.query<{ id: string }>(
     `INSERT INTO courts (state, county, court_name, court_code, timezone)
-     VALUES ('CA', 'Los Angeles', 'Superior Court of California, County of Los Angeles', 'ca-la-search-test', 'America/Los_Angeles')
+     VALUES ('CA', '${SEARCH_COUNTY}', 'Superior Court of California, County of ${SEARCH_COUNTY}', '${SEARCH_COURT_CODE}', 'America/Los_Angeles')
      RETURNING id`,
   );
   courtId = cRows[0].id;
@@ -178,8 +183,8 @@ async function seedOpenSearch(): Promise<void> {
     {
       _id: docId1,
       case_number: '23STCV01234',
-      court: 'Superior Court of California, County of Los Angeles',
-      county: 'Los Angeles',
+      court: `Superior Court of California, County of ${SEARCH_COUNTY}`,
+      county: SEARCH_COUNTY,
       state: 'CA',
       judge_name: 'Johnson, Robert M.',
       hearing_date: '2026-02-10',
@@ -193,8 +198,8 @@ async function seedOpenSearch(): Promise<void> {
     {
       _id: docId2,
       case_number: '23STCV01234',
-      court: 'Superior Court of California, County of Los Angeles',
-      county: 'Los Angeles',
+      court: `Superior Court of California, County of ${SEARCH_COUNTY}`,
+      county: SEARCH_COUNTY,
       state: 'CA',
       judge_name: 'Johnson, Robert M.',
       hearing_date: '2026-02-11',
@@ -322,7 +327,7 @@ describe('searchRulings — integration', () => {
   describe('filter-only queries', () => {
     it('returns results filtered by county', async () => {
       const body = await gql(`{
-        searchRulings(filters: { county: "Los Angeles" }) {
+        searchRulings(filters: { county: "${SEARCH_COUNTY}" }) {
           edges { node { rulingId county hearingDate } }
           totalHits
         }
@@ -409,7 +414,7 @@ describe('searchRulings — integration', () => {
   describe('combined query + filters', () => {
     it('combines full-text query with county filter', async () => {
       const body = await gql(`{
-        searchRulings(query: "summary judgment", filters: { county: "Los Angeles" }) {
+        searchRulings(query: "summary judgment", filters: { county: "${SEARCH_COUNTY}" }) {
           edges { node { rulingId county } }
           totalHits
         }
@@ -424,7 +429,7 @@ describe('searchRulings — integration', () => {
   describe('pagination', () => {
     it('respects first parameter', async () => {
       const body = await gql(`{
-        searchRulings(filters: { county: "Los Angeles" }, first: 1) {
+        searchRulings(filters: { county: "${SEARCH_COUNTY}" }, first: 1) {
           edges { node { rulingId } cursor }
           pageInfo { hasNextPage endCursor }
           totalHits
@@ -442,7 +447,7 @@ describe('searchRulings — integration', () => {
     it('cursor-based pagination: first page then next page', async () => {
       // Page 1
       const page1 = await gql(`{
-        searchRulings(filters: { county: "Los Angeles" }, first: 1) {
+        searchRulings(filters: { county: "${SEARCH_COUNTY}" }, first: 1) {
           edges { node { rulingId } cursor }
           pageInfo { hasNextPage endCursor }
         }
@@ -455,7 +460,7 @@ describe('searchRulings — integration', () => {
       // Page 2
       const page2 = await gql(
         `query($after: String) {
-          searchRulings(filters: { county: "Los Angeles" }, first: 1, after: $after) {
+          searchRulings(filters: { county: "${SEARCH_COUNTY}" }, first: 1, after: $after) {
             edges { node { rulingId } }
             pageInfo { hasNextPage }
           }
@@ -474,7 +479,7 @@ describe('searchRulings — integration', () => {
   describe('result structure', () => {
     it('returns all expected fields in RulingSearchHit', async () => {
       const body = await gql(`{
-        searchRulings(filters: { county: "Los Angeles" }) {
+        searchRulings(filters: { county: "${SEARCH_COUNTY}" }) {
           edges {
             node {
               rulingId caseNumber court county state
@@ -497,7 +502,7 @@ describe('searchRulings — integration', () => {
       const node = edges[0].node;
       expect(node.rulingId).toBeDefined();
       expect(node.caseNumber).toBe('23STCV01234');
-      expect(node.county).toBe('Los Angeles');
+      expect(node.county).toBe(SEARCH_COUNTY);
       expect(node.state).toBe('CA');
       expect(node.judgeName).toBe('Johnson, Robert M.');
       expect(node.hearingDate).toBeDefined();

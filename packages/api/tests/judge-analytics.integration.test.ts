@@ -15,6 +15,11 @@ import { Pool, types } from 'pg';
 import type { FastifyInstance } from 'fastify';
 import { buildApp } from '../src/app';
 import { applyMigrations } from './setup-db';
+import { TEST_COUNTY_REGISTRY } from './test-counties';
+
+// Extract county/court_code from registry for compile-time enforcement
+const [JA_COUNTY] = TEST_COUNTY_REGISTRY.judgeAnalytics.counties;
+const [JA_COURT_CODE] = TEST_COUNTY_REGISTRY.judgeAnalytics.courtCodes;
 
 // Match type parsers from src/data-access/db.ts
 types.setTypeParser(1082, (val: string) => val);
@@ -36,8 +41,8 @@ async function seedData(): Promise<void> {
   // Court
   const { rows: cRows } = await pool.query<{ id: string }>(
     `INSERT INTO courts (state, county, court_name, court_code, timezone)
-     VALUES ('CA', 'San Francisco', 'Superior Court of California, County of San Francisco',
-             'ca-sf-analytics-test', 'America/Los_Angeles')
+     VALUES ('CA', '${JA_COUNTY}', 'Superior Court of California, County of ${JA_COUNTY}',
+             '${JA_COURT_CODE}', 'America/Los_Angeles')
      RETURNING id`,
   );
   courtId = cRows[0].id;
