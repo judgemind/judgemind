@@ -21,6 +21,12 @@ import type { FastifyInstance } from 'fastify';
 import { buildApp } from '../src/app';
 import { applyMigrations } from './setup-db';
 import { signAccessToken } from '../src/auth';
+import { TEST_COUNTY_REGISTRY } from './test-counties';
+
+// Extract county names from registry for compile-time enforcement.
+// The `as const` tuple type ensures TypeScript will error if the registry
+// order changes and the types no longer match usage below.
+const [DQ_LA, DQ_OC, DQ_SD, DQ_RIVERSIDE] = TEST_COUNTY_REGISTRY.dataQuality.counties;
 
 // Match type parsers from src/data-access/db.ts
 types.setTypeParser(1082, (val: string) => val);
@@ -61,27 +67,27 @@ async function seedData(): Promise<void> {
   // Insert data quality metrics
   const metricsData = [
     // Los Angeles metrics — healthy
-    { county: 'Los Angeles', metric_name: 'ruling_count_24h', metric_value: 42, recorded_at: '2026-03-01T10:00:00Z' },
-    { county: 'Los Angeles', metric_name: 'field_completeness_pct', metric_value: 95, recorded_at: '2026-03-01T10:00:00Z' },
-    { county: 'Los Angeles', metric_name: 'scraper_last_success_age_hours', metric_value: 2, recorded_at: '2026-03-01T10:00:00Z' },
+    { county: DQ_LA, metric_name: 'ruling_count_24h', metric_value: 42, recorded_at: '2026-03-01T10:00:00Z' },
+    { county: DQ_LA, metric_name: 'field_completeness_pct', metric_value: 95, recorded_at: '2026-03-01T10:00:00Z' },
+    { county: DQ_LA, metric_name: 'scraper_last_success_age_hours', metric_value: 2, recorded_at: '2026-03-01T10:00:00Z' },
     // Orange metrics — degraded (yellow)
-    { county: 'Orange', metric_name: 'ruling_count_24h', metric_value: 5, recorded_at: '2026-03-01T10:00:00Z' },
-    { county: 'Orange', metric_name: 'field_completeness_pct', metric_value: 80, recorded_at: '2026-03-01T10:00:00Z' },
-    { county: 'Orange', metric_name: 'scraper_last_success_age_hours', metric_value: 3, recorded_at: '2026-03-01T10:00:00Z' },
+    { county: DQ_OC, metric_name: 'ruling_count_24h', metric_value: 5, recorded_at: '2026-03-01T10:00:00Z' },
+    { county: DQ_OC, metric_name: 'field_completeness_pct', metric_value: 80, recorded_at: '2026-03-01T10:00:00Z' },
+    { county: DQ_OC, metric_name: 'scraper_last_success_age_hours', metric_value: 3, recorded_at: '2026-03-01T10:00:00Z' },
     // San Diego metrics — unhealthy (red: scraper down)
-    { county: 'San Diego', metric_name: 'ruling_count_24h', metric_value: 0, recorded_at: '2026-03-01T10:00:00Z' },
-    { county: 'San Diego', metric_name: 'scraper_last_success_age_hours', metric_value: 48, recorded_at: '2026-03-01T10:00:00Z' },
+    { county: DQ_SD, metric_name: 'ruling_count_24h', metric_value: 0, recorded_at: '2026-03-01T10:00:00Z' },
+    { county: DQ_SD, metric_name: 'scraper_last_success_age_hours', metric_value: 48, recorded_at: '2026-03-01T10:00:00Z' },
     // Older LA metric (for time range filtering test)
-    { county: 'Los Angeles', metric_name: 'ruling_count_24h', metric_value: 30, recorded_at: '2026-02-01T10:00:00Z' },
+    { county: DQ_LA, metric_name: 'ruling_count_24h', metric_value: 30, recorded_at: '2026-02-01T10:00:00Z' },
     // --- Aggregation test data: uses "Riverside" county to avoid polluting existing tests ---
     // Same 4-hour bucket (08:00-11:59): two hourly records
-    { county: 'Riverside', metric_name: 'ruling_count_24h', metric_value: 42, recorded_at: '2026-03-01T10:00:00Z' },
-    { county: 'Riverside', metric_name: 'ruling_count_24h', metric_value: 38, recorded_at: '2026-03-01T11:00:00Z' },
+    { county: DQ_RIVERSIDE, metric_name: 'ruling_count_24h', metric_value: 42, recorded_at: '2026-03-01T10:00:00Z' },
+    { county: DQ_RIVERSIDE, metric_name: 'ruling_count_24h', metric_value: 38, recorded_at: '2026-03-01T11:00:00Z' },
     // Different 4-hour bucket (12:00-15:59)
-    { county: 'Riverside', metric_name: 'ruling_count_24h', metric_value: 50, recorded_at: '2026-03-01T13:00:00Z' },
+    { county: DQ_RIVERSIDE, metric_name: 'ruling_count_24h', metric_value: 50, recorded_at: '2026-03-01T13:00:00Z' },
     // Second day for daily aggregation tests
-    { county: 'Riverside', metric_name: 'ruling_count_24h', metric_value: 60, recorded_at: '2026-03-02T10:00:00Z' },
-    { county: 'Riverside', metric_name: 'ruling_count_24h', metric_value: 40, recorded_at: '2026-03-02T14:00:00Z' },
+    { county: DQ_RIVERSIDE, metric_name: 'ruling_count_24h', metric_value: 60, recorded_at: '2026-03-02T10:00:00Z' },
+    { county: DQ_RIVERSIDE, metric_name: 'ruling_count_24h', metric_value: 40, recorded_at: '2026-03-02T14:00:00Z' },
   ];
 
   for (const m of metricsData) {
@@ -201,7 +207,7 @@ describe('dataQualityMetrics', () => {
     const body = await gql(
       `{
         dataQualityMetrics(
-          county: "Los Angeles"
+          county: "${DQ_LA}"
           startDate: "2026-01-01T00:00:00Z"
           endDate: "2026-12-31T23:59:59Z"
         ) {
@@ -216,7 +222,7 @@ describe('dataQualityMetrics', () => {
     const conn = body.data?.dataQualityMetrics as Record<string, unknown>;
     const edges = conn.edges as Array<{ node: { county: string } }>;
     expect(edges.length).toBeGreaterThan(0);
-    edges.forEach((e) => expect(e.node.county).toBe('Los Angeles'));
+    edges.forEach((e) => expect(e.node.county).toBe(DQ_LA));
   });
 
   it('filters by metricName', async () => {
@@ -245,7 +251,7 @@ describe('dataQualityMetrics', () => {
     const body = await gql(
       `{
         dataQualityMetrics(
-          county: "Los Angeles"
+          county: "${DQ_LA}"
           metricName: "ruling_count_24h"
           startDate: "2026-02-15T00:00:00Z"
           endDate: "2026-12-31T23:59:59Z"
@@ -314,7 +320,7 @@ describe('dataQualityMetrics', () => {
     const body = await gql(
       `{
         dataQualityMetrics(
-          county: "Riverside"
+          county: "${DQ_RIVERSIDE}"
           metricName: "ruling_count_24h"
           startDate: "2026-03-01T00:00:00Z"
           endDate: "2026-03-01T23:59:59Z"
@@ -339,7 +345,7 @@ describe('dataQualityMetrics', () => {
     expect(edges[1].node.metricValue).toBe(40);
     // Both should be Riverside ruling_count_24h
     edges.forEach((e) => {
-      expect(e.node.county).toBe('Riverside');
+      expect(e.node.county).toBe(DQ_RIVERSIDE);
       expect(e.node.metricName).toBe('ruling_count_24h');
     });
     // Cursors should be present
@@ -354,7 +360,7 @@ describe('dataQualityMetrics', () => {
     const body = await gql(
       `{
         dataQualityMetrics(
-          county: "Riverside"
+          county: "${DQ_RIVERSIDE}"
           metricName: "ruling_count_24h"
           startDate: "2026-03-01T00:00:00Z"
           endDate: "2026-03-02T23:59:59Z"
@@ -385,7 +391,7 @@ describe('dataQualityMetrics', () => {
     const body = await gql(
       `{
         dataQualityMetrics(
-          county: "Riverside"
+          county: "${DQ_RIVERSIDE}"
           metricName: "ruling_count_24h"
           startDate: "2026-03-01T00:00:00Z"
           endDate: "2026-03-01T23:59:59Z"
@@ -411,7 +417,7 @@ describe('dataQualityMetrics', () => {
     const page1 = await gql(
       `{
         dataQualityMetrics(
-          county: "Riverside"
+          county: "${DQ_RIVERSIDE}"
           metricName: "ruling_count_24h"
           startDate: "2026-03-01T00:00:00Z"
           endDate: "2026-03-02T23:59:59Z"
@@ -436,7 +442,7 @@ describe('dataQualityMetrics', () => {
     const page2 = await gql(
       `query($after: String) {
         dataQualityMetrics(
-          county: "Riverside"
+          county: "${DQ_RIVERSIDE}"
           metricName: "ruling_count_24h"
           startDate: "2026-03-01T00:00:00Z"
           endDate: "2026-03-02T23:59:59Z"
@@ -496,9 +502,9 @@ describe('dataQualityOverview', () => {
     expect(overview.length).toBeGreaterThanOrEqual(3);
 
     // Find our seeded counties
-    const la = overview.find((o) => o.county === 'Los Angeles');
-    const oc = overview.find((o) => o.county === 'Orange');
-    const sd = overview.find((o) => o.county === 'San Diego');
+    const la = overview.find((o) => o.county === DQ_LA);
+    const oc = overview.find((o) => o.county === DQ_OC);
+    const sd = overview.find((o) => o.county === DQ_SD);
 
     expect(la).toBeDefined();
     expect(la!.healthStatus).toBe('green');

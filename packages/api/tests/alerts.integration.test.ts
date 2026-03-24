@@ -19,6 +19,11 @@ import { signAccessToken } from '../src/auth/tokens';
 import { evaluateAlerts } from '../src/alerts/evaluate';
 import { sendAlertDigests } from '../src/alerts/digest';
 import { applyMigrations } from './setup-db';
+import { TEST_COUNTY_REGISTRY } from './test-counties';
+
+// Extract county/court_code from registry for compile-time enforcement
+const [ALERT_COUNTY] = TEST_COUNTY_REGISTRY.alerts.counties;
+const [ALERT_COURT_CODE] = TEST_COUNTY_REGISTRY.alerts.courtCodes;
 
 // Match the type parsers registered in src/data-access/db.ts so DATE columns
 // come back as 'YYYY-MM-DD' strings rather than millisecond timestamps.
@@ -65,7 +70,7 @@ async function seedData(): Promise<void> {
   // Create court
   const { rows: cRows } = await pool.query<{ id: string }>(
     `INSERT INTO courts (state, county, court_name, court_code, timezone)
-     VALUES ('CA', 'Test Alert County', 'Test Alert Court', 'ca-alert-test', 'America/Los_Angeles')
+     VALUES ('CA', '${ALERT_COUNTY}', 'Test Alert Court', '${ALERT_COURT_CODE}', 'America/Los_Angeles')
      RETURNING id`,
   );
   courtId = cRows[0].id;
