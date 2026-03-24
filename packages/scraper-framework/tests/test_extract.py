@@ -5,6 +5,8 @@ from __future__ import annotations
 
 from datetime import date
 
+import pytest
+
 from ingestion.extract import (
     _is_name_fragment,
     _looks_like_motion_text,
@@ -2176,3 +2178,200 @@ class TestNormalizeMotionType:
 
     def test_already_normalized_trust_petition(self) -> None:
         assert normalize_motion_type("trust_petition") == "trust_petition"
+
+
+# ---------------------------------------------------------------------------
+# normalize_motion_type — integration tests against real scraper outputs
+# ---------------------------------------------------------------------------
+#
+# These parameterized tests act as a contract: if a refactoring changes how
+# values flow through normalization, these tests catch incompatible inputs.
+# Each sample is a (raw_value, expected_normalized) pair drawn from actual
+# scraper output.  If normalize_motion_type() returns None for any value
+# listed here, the normalization pipeline has a regression.
+#
+# Reference: issue #1785.
+
+# -- Riverside raw descriptions (prefix-less forms from ruling headers) ------
+_RIVERSIDE_SAMPLES: list[tuple[str, str]] = [
+    ("Attorney's Fees", "motion_for_attorney_fees"),
+    ("Attorneys' Fees", "motion_for_attorney_fees"),
+    ("Compel Plaintiff's Responses", "motion_to_compel"),
+    ("Compel Plaintiff's Responses to Request for Production", "motion_to_compel"),
+    ("New Trial", "motion_for_new_trial"),
+    ("Judgment on the Pleadings", "motion_for_judgment_on_the_pleadings"),
+    ("Deem Requests for Admissions Admitted", "deem_admissions_admitted"),
+    ("Terminating Sanctions", "motion_for_sanctions"),
+    ("Monetary Sanctions", "motion_for_sanctions"),
+    ("Production of Documents", "motion_to_compel"),
+    ("Protective Order", "motion_for_protective_order"),
+    ("Strike", "motion_to_strike"),
+    ("Quash", "motion_to_quash"),
+    ("Relief from Default", "motion_to_set_aside_default"),
+    ("Leave to Amend", "motion_for_leave_to_amend"),
+    ("Demurrer", "demurrer"),
+]
+
+# -- Ventura event types (from search results table) -------------------------
+_VENTURA_SAMPLES: list[tuple[str, str]] = [
+    ("Demurrer to Complaint", "demurrer"),
+    ("Motion to Compel Further Responses", "motion_to_compel"),
+    ("Motion for Summary Judgment", "msj"),
+    ("Motion to Strike", "motion_to_strike"),
+    ("Demurrer to First Amended Complaint", "demurrer"),
+    ("Demurrer", "demurrer"),
+    ("Preliminary Injunction", "preliminary_injunction"),
+    ("Summary Adjudication", "msj_partial"),
+    ("Hearing on Demurrer", "demurrer"),
+]
+
+# -- LA link text forms (from HTML ruling pages) ------------------------------
+# LA does not set motion_type at the scraper level; these values come from
+# the enrichment pipeline's extract_motion_type() applied to ruling text.
+# Including them here as they represent realistic inputs to normalize.
+_LA_SAMPLES: list[tuple[str, str]] = [
+    ("Motion to Compel", "motion_to_compel"),
+    ("Motion for Summary Judgment", "msj"),
+    ("Motion to Strike Punitive Damages", "motion_to_strike"),
+    ("Demurrer to the First Amended Complaint", "demurrer"),
+    ("Anti-SLAPP Motion (CCP 425.16)", "anti_slapp"),
+    ("Motion for Preliminary Injunction", "preliminary_injunction"),
+    ("Motion for Reconsideration", "motion_for_reconsideration"),
+    ("Motion for Attorney's Fees", "motion_for_attorney_fees"),
+]
+
+# -- OC formats (civil from LLM, probate and family law from scraper) --------
+_OC_SAMPLES: list[tuple[str, str]] = [
+    ("Petition for Probate", "petition_for_probate"),
+    ("Accounting", "accounting"),
+    ("Guardianship Petition", "guardianship_petition"),
+    ("Petition for Conservatorship", "guardianship_petition"),
+    ("Trust Petition", "trust_petition"),
+    ("Show Cause Hearing", "show_cause_hearing"),
+]
+
+# -- SD Calendar event types (from calendar hearings) -------------------------
+_SD_CALENDAR_SAMPLES: list[tuple[str, str]] = [
+    ("Demurrer/Motion to Strike", "demurrer"),
+    ("Motion to Quash", "motion_to_quash"),
+    ("Motion for Sanctions", "motion_for_sanctions"),
+]
+
+# -- SD Tentatives (from parse_motion_type in sc_tentatives.py) ---------------
+_SD_TENTATIVES_SAMPLES: list[tuple[str, str]] = [
+    ("Motion to Compel Further Responses", "motion_to_compel"),
+    ("Demurrer to Complaint", "demurrer"),
+    ("Motion for Summary Judgment", "msj"),
+    ("Motion to Strike", "motion_to_strike"),
+]
+
+# -- Santa Clara (from parse_motion_type) -------------------------------------
+_SC_SAMPLES: list[tuple[str, str]] = [
+    ("Demurrer", "demurrer"),
+    ("Summary Judgment", "msj"),
+    ("Motion to Compel", "motion_to_compel"),
+    ("Motion to Dismiss", "mtd"),
+    ("Motion to Strike", "motion_to_strike"),
+    ("Motion to Quash", "motion_to_quash"),
+]
+
+# -- Contra Costa (from _cc_extract_motion_type) ------------------------------
+# CC produces values like "Leave To File Cross-Complaint" and "Case Management
+# Conference" which legitimately return None (niche types without canonical
+# forms).  Only values with a known mapping are included here.
+_CC_SAMPLES: list[tuple[str, str]] = [
+    ("Order To Show Cause", "osc"),
+]
+
+# -- Fresno (from _extract_motion_type "Motion:" header line) -----------------
+_FRESNO_SAMPLES: list[tuple[str, str]] = [
+    ("Demurrer to First Amended Complaint", "demurrer"),
+    ("Motion to Compel Further Responses", "motion_to_compel"),
+]
+
+# Combine all samples with county labels for clear failure messages.
+_ALL_INTEGRATION_SAMPLES: list[tuple[str, str, str]] = [
+    (county, raw, expected)
+    for county, samples in [
+        ("riverside", _RIVERSIDE_SAMPLES),
+        ("ventura", _VENTURA_SAMPLES),
+        ("la", _LA_SAMPLES),
+        ("oc", _OC_SAMPLES),
+        ("sd_calendar", _SD_CALENDAR_SAMPLES),
+        ("sd_tentatives", _SD_TENTATIVES_SAMPLES),
+        ("sc", _SC_SAMPLES),
+        ("cc", _CC_SAMPLES),
+        ("fresno", _FRESNO_SAMPLES),
+    ]
+    for raw, expected in samples
+]
+
+
+@pytest.mark.normalization_integration
+class TestNormalizationIntegration:
+    """Integration tests: normalize_motion_type() against real scraper outputs.
+
+    These tests act as a contract between the centralized normalization
+    function and the county scrapers that produce motion_type values.  If a
+    refactoring changes how ``normalize_motion_type()`` works, any scraper
+    whose output becomes incompatible will show up as a failure here.
+
+    Reference: #1785 (preventative measure for the #1783 regression).
+
+    Run with: ``pytest tests/test_extract.py -k normalization_integration -v``
+    """
+
+    @pytest.mark.parametrize(
+        ("county", "raw_value", "expected"),
+        _ALL_INTEGRATION_SAMPLES,
+        ids=[f"{county}:{raw}" for county, raw, _ in _ALL_INTEGRATION_SAMPLES],
+    )
+    def test_normalize_known_scraper_output(
+        self, county: str, raw_value: str, expected: str
+    ) -> None:
+        """normalize_motion_type() must return a non-None value for every
+        known-good scraper output, and it must match the expected canonical
+        form."""
+        result = normalize_motion_type(raw_value)
+        assert result is not None, (
+            f"normalize_motion_type({raw_value!r}) returned None — "
+            f"{county} scraper output would lose its motion_type"
+        )
+        assert result == expected, (
+            f"normalize_motion_type({raw_value!r}) returned {result!r}, "
+            f"expected {expected!r} (county: {county})"
+        )
+
+    def test_minimum_sample_count(self) -> None:
+        """The integration suite covers at least 20 distinct motion type
+        values, as required by the acceptance criteria."""
+        distinct_raw_values = {raw for _, raw, _ in _ALL_INTEGRATION_SAMPLES}
+        assert len(distinct_raw_values) >= 20, (
+            f"Expected >= 20 distinct motion type values, got {len(distinct_raw_values)}"
+        )
+
+    def test_all_counties_represented(self) -> None:
+        """Every county that produces motion_type at the scraper level is
+        represented in the integration samples."""
+        counties = {county for county, _, _ in _ALL_INTEGRATION_SAMPLES}
+        # Counties whose scrapers set doc.motion_type directly
+        expected_counties = {
+            "riverside",
+            "ventura",
+            "sd_calendar",
+            "sd_tentatives",
+            "sc",
+            "cc",
+            "fresno",
+            "oc",
+        }
+        # LA values come from enrichment, included for broader coverage
+        assert expected_counties.issubset(counties), (
+            f"Missing counties: {expected_counties - counties}"
+        )
+
+    def test_none_returns_none(self) -> None:
+        """normalize_motion_type() still returns None for values that genuinely
+        have no mapping — the integration samples are not a catch-all."""
+        assert normalize_motion_type("Some Random Hearing Type") is None
+        assert normalize_motion_type("Case Management Conference") is None

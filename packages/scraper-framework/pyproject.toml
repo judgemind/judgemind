@@ -59,4 +59,5 @@ asyncio_mode = "auto"
 addopts = "--cov=framework --cov=courts --cov=templates --cov=validation --cov=ingestion --cov-report=term --cov-report=html:htmlcov --cov-report=xml:coverage.xml"
 markers = [
     "regression: scraper regression tests against archived fixtures",
+    "normalization_integration: contract tests for normalize_motion_type vs scraper outputs",
 ]
