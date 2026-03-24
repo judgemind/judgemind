@@ -267,6 +267,85 @@ def extract_outcome(ruling_text: str) -> str | None:
     return None
 
 
+# ---------------------------------------------------------------------------
+# Outcome normalization
+# ---------------------------------------------------------------------------
+
+# Valid ruling_outcome enum values in PostgreSQL.
+_VALID_OUTCOMES: frozenset[str] = frozenset(
+    {
+        "granted",
+        "denied",
+        "granted_in_part",
+        "denied_in_part",
+        "moot",
+        "continued",
+        "off_calendar",
+        "submitted",
+        "other",
+    }
+)
+
+# Aliases for common non-standard outcome strings produced by scrapers.
+_OUTCOME_ALIAS: dict[str, str] = {
+    "no tentative ruling": "other",
+    "no tentative": "other",
+    "no appearance required": "other",
+    "withdrawn": "off_calendar",
+    "vacated": "off_calendar",
+    "sustained": "granted",
+    "overruled": "denied",
+    "off calendar": "off_calendar",
+    "granted in part": "granted_in_part",
+    "denied in part": "denied_in_part",
+    "denied without prejudice": "denied",
+    "sustained without leave to amend": "granted",
+    "sustained with leave to amend": "granted",
+}
+
+# Ordered so more specific outcomes match first (e.g. "granted in part"
+# before "granted") when doing partial substring matching.
+_OUTCOME_PARTIAL_ORDER: list[str] = [
+    "granted_in_part",
+    "denied_in_part",
+    "granted",
+    "denied",
+    "moot",
+    "continued",
+    "off_calendar",
+    "submitted",
+]
+
+
+def normalize_outcome(raw: str | None) -> str | None:
+    """Normalize a raw outcome string to a valid ``ruling_outcome`` enum value.
+
+    Handles title-case, uppercase, common aliases (e.g. ``"No Tentative
+    Ruling"`` -> ``"other"``), and partial substring matching.  Returns
+    ``None`` if the input is ``None``, empty, or cannot be mapped.
+
+    This is the single canonical normalization function — used by both the
+    live ingestion worker and the reingest pipeline.
+    """
+    if not raw:
+        return None
+    lower = raw.strip().lower()
+    if not lower:
+        return None
+    # Direct match after lowercasing (e.g. "Granted" -> "granted").
+    if lower in _VALID_OUTCOMES:
+        return lower
+    # Check aliases (e.g. "No Tentative Ruling" -> "other").
+    if lower in _OUTCOME_ALIAS:
+        return _OUTCOME_ALIAS[lower]
+    # Partial match: e.g. "granted in part" within longer text.
+    # Uses word boundaries to avoid false positives on substrings.
+    for outcome in _OUTCOME_PARTIAL_ORDER:
+        if re.search(r"\b" + re.escape(outcome.replace("_", " ")) + r"\b", lower):
+            return outcome
+    return None
+
+
 def extract_motion_type(ruling_text: str) -> str | None:
     """Extract a motion type from text using regex patterns.
 

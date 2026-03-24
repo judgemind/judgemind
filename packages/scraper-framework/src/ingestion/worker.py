@@ -65,6 +65,7 @@ from .extract import (
     extract_parties_from_caption,
     is_valid_case_number,
     normalize_motion_type,
+    normalize_outcome,
 )
 from .llm_extract import (
     LLMExtractionResult,
@@ -544,7 +545,18 @@ class IngestionWorker:
         capture_ts = _parse_datetime(event_data.get("capture_timestamp"))
         hearing_dt = _parse_date(event_data.get("hearing_date"))
 
-        outcome: str | None = event_data.get("outcome")
+        raw_outcome: str | None = event_data.get("outcome")
+        # Normalize scraper-provided outcome to lowercase enum value (#1878).
+        outcome: str | None = normalize_outcome(raw_outcome) if raw_outcome else None
+        if raw_outcome and outcome != raw_outcome:
+            logger.info(
+                "Normalized outcome",
+                extra={
+                    "document_id": document_id,
+                    "raw_outcome": raw_outcome,
+                    "normalized_outcome": outcome,
+                },
+            )
         raw_motion_type: str | None = event_data.get("motion_type")
         # Normalize scraper-provided motion_type to snake_case (#1712).
         # If the value cannot be mapped, set to None so the regex

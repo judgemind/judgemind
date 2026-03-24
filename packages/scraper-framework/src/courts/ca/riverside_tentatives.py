@@ -594,17 +594,20 @@ RIVERSIDE_SYSTEM_PROMPT = (
 _RIV_LLM_PROVIDER = "google"
 _RIV_LLM_MODEL = "gemini-2.5-flash-lite"
 
-# Map LLM outcome values to the format used by the existing regex pipeline.
+# Map LLM outcome values to lowercase enum values matching the DB schema.
+# Previously mapped to title-case which caused InvalidTextRepresentation
+# errors at the DB cast (#1878).  Also preserves partial-grant/deny
+# distinction instead of collapsing to "granted"/"denied".
 _OUTCOME_MAP: dict[str | None, str | None] = {
-    "granted": "Granted",
-    "denied": "Denied",
-    "granted_in_part": "Granted",
-    "denied_in_part": "Denied",
-    "moot": "Moot",
-    "continued": "Continued",
-    "off_calendar": "Off Calendar",
-    "submitted": "Submitted",
-    "other": "No Tentative Ruling",
+    "granted": "granted",
+    "denied": "denied",
+    "granted_in_part": "granted_in_part",
+    "denied_in_part": "denied_in_part",
+    "moot": "moot",
+    "continued": "continued",
+    "off_calendar": "off_calendar",
+    "submitted": "submitted",
+    "other": "other",
     None: None,
 }
 
