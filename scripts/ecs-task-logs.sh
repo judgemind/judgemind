@@ -101,4 +101,4 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 LOG_GROUP="/ecs/judgemind-ingestion-worker-${ENVIRONMENT}"
 
-exec "$SCRIPT_DIR/ecs-logs.sh" "$LOG_GROUP" --task "$TASK_ID" "${EXTRA_ARGS[@]}"
+exec "$SCRIPT_DIR/ecs-logs.sh" "$LOG_GROUP" --task "$TASK_ID" ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}
