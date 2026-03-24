@@ -121,6 +121,7 @@ class Baselines:
     posting_days: list[str] | None = None  # e.g. ["Mon", "Tue", "Wed", "Thu"]
     max_expected_gap_hours: float | None = None  # explicit override
     low_volume: bool = False  # Suppress field_completeness_low_sample alerts
+    min_days_zero_before_alert: int = 1  # Consecutive zero days needed for P1 (#1916)
 
 
 def load_baselines(
@@ -155,6 +156,7 @@ def load_baselines(
             posting_days=config.get("posting_days"),
             max_expected_gap_hours=config.get("max_expected_gap_hours"),
             low_volume=config.get("low_volume", False),
+            min_days_zero_before_alert=config.get("min_days_zero_before_alert", 1),
         )
     return result
 
@@ -1226,19 +1228,45 @@ def check_ingest_rates(
         suppress_zero_rulings = is_low_volume or expected_daily < 1.0
         if count_24h == 0 and expected_daily > 0 and not suppress_zero_rulings:
             if _24h_overlaps_posting_day(now, posting_days):
-                alerts.append(
-                    Alert(
-                        county=county_name,
-                        metric="zero_rulings",
-                        severity="p1",
-                        expected=expected_daily,
-                        actual=0,
-                        message=(
-                            f"{county_name}: zero new rulings in 24h "
-                            f"(expected ~{expected_daily:.1f}/day)"
-                        ),
+                # Check min_days_zero_before_alert (#1916): for counties
+                # requiring multiple consecutive zero days before a P1,
+                # count recent consecutive zero days from per_day_7d and
+                # downgrade to P2 if the threshold is not met.
+                min_days = baseline.min_days_zero_before_alert if baseline else 1
+                consecutive_zeros = _count_consecutive_zero_days(county_per_day, now)
+                # consecutive_zeros counts zero days *before* today;
+                # today itself is also zero, so total = consecutive_zeros + 1.
+                if consecutive_zeros + 1 >= min_days:
+                    alerts.append(
+                        Alert(
+                            county=county_name,
+                            metric="zero_rulings",
+                            severity="p1",
+                            expected=expected_daily,
+                            actual=0,
+                            message=(
+                                f"{county_name}: zero new rulings in 24h "
+                                f"(expected ~{expected_daily:.1f}/day)"
+                            ),
+                        )
                     )
-                )
+                elif min_days > 1:
+                    # Single zero day for a county that requires multiple
+                    # consecutive zeros — downgrade to P2 informational.
+                    alerts.append(
+                        Alert(
+                            county=county_name,
+                            metric="zero_rulings",
+                            severity="p2",
+                            expected=expected_daily,
+                            actual=0,
+                            message=(
+                                f"{county_name}: zero new rulings in 24h "
+                                f"(expected ~{expected_daily:.1f}/day, "
+                                f"P1 requires {min_days} consecutive zero days)"
+                            ),
+                        )
+                    )
         # Ingest rate drop alert — suppress when expected_daily is zero
         # (no active scraper, e.g. San Diego) and on non-posting days
         # (weekends) just like zero_rulings above.
@@ -1264,6 +1292,45 @@ def check_ingest_rates(
                 )
 
     return alerts
+
+
+def _count_consecutive_zero_days(
+    county_per_day: dict[str, int],
+    now: datetime,
+) -> int:
+    """Count consecutive zero-ruling days working backwards from 2 days ago.
+
+    Examines per-day counts in the 7-day window ``[now-7d, now-24h)``.
+    Days absent from ``county_per_day`` are treated as zero-count days.
+    Starts from ``now - 2d`` (the last full day guaranteed to be in the
+    7-day window, since the window excludes the last 24 hours) and counts
+    backwards until a nonzero day is found or the window is exhausted.
+
+    Note: the caller already knows today (the last 24h) has zero rulings
+    via ``count_24h == 0``.  This function counts additional consecutive
+    zero days *before* today to determine whether the multi-day threshold
+    is met.
+
+    Args:
+        county_per_day: Mapping of ``YYYY-MM-DD`` date strings to ruling
+            counts for a single county over the 7-day lookback window.
+        now: Current timestamp (used to determine window boundaries).
+
+    Returns:
+        Number of consecutive zero-ruling days before today (from the
+        7-day window data).
+    """
+    count = 0
+    # Start from 2 days ago — "yesterday" (now-1d) falls partially in the
+    # 24h exclusion zone and may not be in per_day_7d.  The 7D query covers
+    # [now-7d, now-24h), so now-2d is the last reliable full day.
+    for days_back in range(2, 8):
+        day = now - timedelta(days=days_back)
+        day_key = day.strftime("%Y-%m-%d")
+        if county_per_day.get(day_key, 0) > 0:
+            break
+        count += 1
+    return count
 
 
 # Day-of-week abbreviations used in posting_days config.

@@ -104,9 +104,13 @@ def _make_baselines(
             posting_days=cfg.get("posting_days"),
             max_expected_gap_hours=cfg.get("max_expected_gap_hours"),
             low_volume=cfg.get("low_volume", False),
+            min_days_zero_before_alert=cfg.get("min_days_zero_before_alert", 1),
         )
         for name, cfg in counties.items()
     }
+
+
+_count_consecutive_zero_days = dqc._count_consecutive_zero_days
 
 
 class TestMakeBaselinesFieldForwarding:
@@ -123,6 +127,7 @@ class TestMakeBaselinesFieldForwarding:
         "posting_days": ["Mon", "Wed", "Fri"],
         "max_expected_gap_hours": 72.0,
         "low_volume": True,
+        "min_days_zero_before_alert": 3,
     }
 
     def test_make_baselines_forwards_all_fields(self) -> None:
@@ -1162,6 +1167,245 @@ class TestPostingDayAwareBaseline:
         )
         alerts = check_ingest_rates(conn, thursday, baselines)
         assert len(alerts) == 0
+
+
+class TestCountConsecutiveZeroDays:
+    """Tests for _count_consecutive_zero_days helper function.
+
+    The function examines per_day_7d data which covers [now-7d, now-24h).
+    It starts counting from now-2d (the last reliable full day in the window)
+    and works backwards.
+    """
+
+    def test_all_zero_days(self) -> None:
+        """Returns 6 when all days in the 7-day window had zero rulings."""
+        now = datetime(2026, 3, 19, 12, 0, 0, tzinfo=UTC)
+        assert _count_consecutive_zero_days({}, now) == 6
+
+    def test_two_days_ago_nonzero(self) -> None:
+        """Returns 0 when the most recent day in the 7d window had rulings."""
+        now = datetime(2026, 3, 19, 12, 0, 0, tzinfo=UTC)
+        two_days_ago = (now - timedelta(days=2)).strftime("%Y-%m-%d")
+        assert _count_consecutive_zero_days({two_days_ago: 5}, now) == 0
+
+    def test_two_zero_days_then_nonzero(self) -> None:
+        """Returns 2 when two days in the window were zero, then a nonzero day."""
+        now = datetime(2026, 3, 19, 12, 0, 0, tzinfo=UTC)
+        # now-2d and now-3d are zero, now-4d has rulings
+        four_days_ago = (now - timedelta(days=4)).strftime("%Y-%m-%d")
+        county_per_day = {four_days_ago: 3}
+        assert _count_consecutive_zero_days(county_per_day, now) == 2
+
+    def test_one_zero_day_then_nonzero(self) -> None:
+        """Returns 1 when only the most recent day is zero, day before had rulings."""
+        now = datetime(2026, 3, 19, 12, 0, 0, tzinfo=UTC)
+        # now-2d is zero, now-3d has rulings
+        three_days_ago = (now - timedelta(days=3)).strftime("%Y-%m-%d")
+        county_per_day = {three_days_ago: 10}
+        assert _count_consecutive_zero_days(county_per_day, now) == 1
+
+
+class TestMinDaysZeroBeforeAlert:
+    """Tests for min_days_zero_before_alert parameter (#1916).
+
+    Counties with ``min_days_zero_before_alert > 1`` require multiple
+    consecutive zero-ruling days before a P1 alert fires.  A single zero
+    day is downgraded to P2 informational.
+    """
+
+    def test_sb_single_zero_day_fires_p2_not_p1(self) -> None:
+        """San Bernardino with min_days_zero=2: single zero day => P2."""
+        # Wednesday is a posting day for SB
+        wednesday = datetime(2026, 3, 18, 12, 0, 0, tzinfo=UTC)
+        # Yesterday (Tuesday) had 3 rulings — only today is zero
+        conn = FakeConnection(
+            {
+                "AT TIME ZONE": _make_per_day_rows("San Bernardino", [3, 2, 4, 3, 2, 3], wednesday),
+                "d.captured_at >=": [],
+                "DISTINCT ct.county": [("San Bernardino",)],
+            }
+        )
+        baselines = _make_baselines(
+            {
+                "San Bernardino": {
+                    "expected_daily_rulings": 3,
+                    "schedule_type": "daily",
+                    "posting_days": ["Mon", "Tue", "Wed", "Thu", "Fri"],
+                    "min_days_zero_before_alert": 2,
+                },
+            }
+        )
+        alerts = check_ingest_rates(conn, wednesday, baselines)
+        assert len(alerts) == 1
+        assert alerts[0].metric == "zero_rulings"
+        assert alerts[0].severity == "p2"
+        assert alerts[0].county == "San Bernardino"
+        assert "P1 requires 2 consecutive zero days" in alerts[0].message
+
+    def test_sb_two_consecutive_zero_days_fires_p1(self) -> None:
+        """San Bernardino with min_days_zero=2: two zero days => P1."""
+        wednesday = datetime(2026, 3, 18, 12, 0, 0, tzinfo=UTC)
+        # Yesterday (Tuesday) also had 0 rulings — two consecutive zeros
+        conn = FakeConnection(
+            {
+                "AT TIME ZONE": _make_per_day_rows("San Bernardino", [3, 2, 4, 3, 0, 0], wednesday),
+                "d.captured_at >=": [],
+                "DISTINCT ct.county": [("San Bernardino",)],
+            }
+        )
+        baselines = _make_baselines(
+            {
+                "San Bernardino": {
+                    "expected_daily_rulings": 3,
+                    "schedule_type": "daily",
+                    "posting_days": ["Mon", "Tue", "Wed", "Thu", "Fri"],
+                    "min_days_zero_before_alert": 2,
+                },
+            }
+        )
+        alerts = check_ingest_rates(conn, wednesday, baselines)
+        assert len(alerts) == 1
+        assert alerts[0].metric == "zero_rulings"
+        assert alerts[0].severity == "p1"
+        assert alerts[0].county == "San Bernardino"
+
+    def test_la_single_zero_day_still_fires_p1(self) -> None:
+        """LA with default min_days_zero=1: single zero day => P1."""
+        wednesday = datetime(2026, 3, 18, 12, 0, 0, tzinfo=UTC)
+        conn = FakeConnection(
+            {
+                "AT TIME ZONE": _make_per_day_rows(
+                    "Los Angeles", [50, 45, 55, 48, 52, 50], wednesday
+                ),
+                "d.captured_at >=": [],
+                "DISTINCT ct.county": [("Los Angeles",)],
+            }
+        )
+        baselines = _make_baselines(
+            {
+                "Los Angeles": {
+                    "expected_daily_rulings": 50,
+                    "schedule_type": "daily",
+                    "posting_days": ["Mon", "Tue", "Wed", "Thu", "Fri"],
+                    # no min_days_zero_before_alert — defaults to 1
+                },
+            }
+        )
+        alerts = check_ingest_rates(conn, wednesday, baselines)
+        assert len(alerts) == 1
+        assert alerts[0].metric == "zero_rulings"
+        assert alerts[0].severity == "p1"
+        assert alerts[0].county == "Los Angeles"
+
+    def test_oc_single_zero_day_still_fires_p1(self) -> None:
+        """OC with default min_days_zero=1: single zero day => P1."""
+        wednesday = datetime(2026, 3, 18, 12, 0, 0, tzinfo=UTC)
+        conn = FakeConnection(
+            {
+                "AT TIME ZONE": _make_per_day_rows("Orange", [20, 18, 22, 19, 21, 20], wednesday),
+                "d.captured_at >=": [],
+                "DISTINCT ct.county": [("Orange",)],
+            }
+        )
+        baselines = _make_baselines(
+            {
+                "Orange": {
+                    "expected_daily_rulings": 20,
+                    "schedule_type": "daily",
+                    "posting_days": ["Mon", "Tue", "Wed", "Thu", "Fri"],
+                },
+            }
+        )
+        alerts = check_ingest_rates(conn, wednesday, baselines)
+        assert len(alerts) == 1
+        assert alerts[0].metric == "zero_rulings"
+        assert alerts[0].severity == "p1"
+        assert alerts[0].county == "Orange"
+
+    def test_three_consecutive_zero_days_with_threshold_3(self) -> None:
+        """County with min_days_zero=3: three zero days => P1."""
+        wednesday = datetime(2026, 3, 18, 12, 0, 0, tzinfo=UTC)
+        # Last 3 days all zero (days 4, 5, 6 in the 6-day window)
+        conn = FakeConnection(
+            {
+                "AT TIME ZONE": _make_per_day_rows("TestCounty", [5, 5, 5, 0, 0, 0], wednesday),
+                "d.captured_at >=": [],
+                "DISTINCT ct.county": [("TestCounty",)],
+            }
+        )
+        baselines = _make_baselines(
+            {
+                "TestCounty": {
+                    "expected_daily_rulings": 5,
+                    "schedule_type": "daily",
+                    "posting_days": ["Mon", "Tue", "Wed", "Thu", "Fri"],
+                    "min_days_zero_before_alert": 3,
+                },
+            }
+        )
+        alerts = check_ingest_rates(conn, wednesday, baselines)
+        assert len(alerts) == 1
+        assert alerts[0].severity == "p1"
+
+    def test_two_consecutive_zero_days_with_threshold_3_fires_p2(self) -> None:
+        """County with min_days_zero=3: only 2 zero days (today + 1) => P2."""
+        wednesday = datetime(2026, 3, 18, 12, 0, 0, tzinfo=UTC)
+        # Only the most recent day in 7d window (now-2d) is zero, plus today = 2 total
+        conn = FakeConnection(
+            {
+                "AT TIME ZONE": _make_per_day_rows("TestCounty", [5, 5, 5, 5, 5, 0], wednesday),
+                "d.captured_at >=": [],
+                "DISTINCT ct.county": [("TestCounty",)],
+            }
+        )
+        baselines = _make_baselines(
+            {
+                "TestCounty": {
+                    "expected_daily_rulings": 5,
+                    "schedule_type": "daily",
+                    "posting_days": ["Mon", "Tue", "Wed", "Thu", "Fri"],
+                    "min_days_zero_before_alert": 3,
+                },
+            }
+        )
+        alerts = check_ingest_rates(conn, wednesday, baselines)
+        assert len(alerts) == 1
+        assert alerts[0].severity == "p2"
+
+    def test_no_baseline_defaults_to_min_days_1(self) -> None:
+        """County without baselines defaults to min_days=1 and fires P1."""
+        wednesday = datetime(2026, 3, 18, 12, 0, 0, tzinfo=UTC)
+        conn = FakeConnection(
+            {
+                "AT TIME ZONE": _make_per_day_rows("Unknown County", [5, 5, 5, 5, 5, 5], wednesday),
+                "d.captured_at >=": [],
+                "DISTINCT ct.county": [("Unknown County",)],
+            }
+        )
+        # No baselines at all — the function uses daily_baseline from 7d data
+        alerts = check_ingest_rates(conn, wednesday, {})
+        assert len(alerts) == 1
+        assert alerts[0].metric == "zero_rulings"
+        assert alerts[0].severity == "p1"
+
+    def test_load_baselines_reads_min_days_field(self) -> None:
+        """load_baselines correctly reads min_days_zero_before_alert from JSON."""
+        raw = {
+            "counties": {
+                "San Bernardino": {
+                    "expected_daily_rulings": 3,
+                    "schedule_type": "daily",
+                    "min_days_zero_before_alert": 2,
+                },
+                "Los Angeles": {
+                    "expected_daily_rulings": 50,
+                    "schedule_type": "daily",
+                },
+            }
+        }
+        result = load_baselines(raw=raw)
+        assert result["San Bernardino"].min_days_zero_before_alert == 2
+        assert result["Los Angeles"].min_days_zero_before_alert == 1  # default
 
 
 class TestBackfillSpikeResilience:
