@@ -58,8 +58,8 @@
     }
   ],
   "field_completeness": {
-    "_updated": "2026-03-21",
-    "_note": "OC baselines raised after backfill #1304 (parties 35->80%, case_type 30->97%). SC (low sample size), Riverside (outcome gap from old PDF backfill) unchanged.",
+    "_updated": "2026-03-23",
+    "_note": "Riverside total_documents raised 66->2510 after LLM backfill #1856 (+2444 docs). OC baselines raised after backfill #1304 (parties 35->80%, case_type 30->97%). SC (low sample size), Riverside (outcome gap from old PDF backfill) unchanged.",
     "Los Angeles": {
       "total_documents": 748,
       "ruling": 100.0,
@@ -89,7 +89,7 @@
       }
     },
     "Riverside": {
-      "total_documents": 66,
+      "total_documents": 2510,
       "ruling": 100.0,
       "judge": 57.6,
       "motion_type": 97.0,
