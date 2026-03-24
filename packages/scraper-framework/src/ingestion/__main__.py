@@ -34,6 +34,7 @@ structlog.configure(
     processors=[
         structlog.processors.add_log_level,
         structlog.processors.TimeStamper(fmt="iso"),
+        structlog.processors.format_exc_info,
         structlog.processors.JSONRenderer(),
     ],
 )
@@ -51,6 +52,7 @@ _formatter = structlog.stdlib.ProcessorFormatter(
         structlog.stdlib.ExtraAdder(),
         structlog.stdlib.ProcessorFormatter.remove_processors_meta,
         structlog.processors.TimeStamper(fmt="iso"),
+        structlog.processors.format_exc_info,
         structlog.processors.JSONRenderer(),
     ],
 )
