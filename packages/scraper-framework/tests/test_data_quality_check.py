@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import copy
+import dataclasses
 import json
 import subprocess
 import sys
@@ -98,6 +100,52 @@ def _make_baselines(
         )
         for name, cfg in counties.items()
     }
+
+
+class TestMakeBaselinesFieldForwarding:
+    """Validate that _make_baselines forwards every Baselines dataclass field.
+
+    If a new field is added to Baselines but _make_baselines is not updated
+    to forward it, these tests will fail.  See #1817.
+    """
+
+    # Build a config dict with a distinctive, non-default value for every field.
+    _ALL_FIELDS_CONFIG: dict[str, object] = {
+        "expected_daily_rulings": 99.0,
+        "schedule_type": "frequent",
+        "posting_days": ["Mon", "Wed", "Fri"],
+        "max_expected_gap_hours": 72.0,
+        "low_volume": True,
+    }
+
+    def test_make_baselines_forwards_all_fields(self) -> None:
+        """Every Baselines field must appear in the _make_baselines constructor call."""
+        baselines_fields = {f.name for f in dataclasses.fields(Baselines)}
+        config_fields = set(self._ALL_FIELDS_CONFIG.keys())
+
+        # If a new field is in Baselines but not in our config, this assertion
+        # forces the developer to add it here AND in _make_baselines.
+        assert baselines_fields == config_fields, (
+            f"Baselines has fields not covered by _ALL_FIELDS_CONFIG: "
+            f"{baselines_fields - config_fields}.  "
+            f"_ALL_FIELDS_CONFIG has fields not in Baselines: "
+            f"{config_fields - baselines_fields}."
+        )
+
+    def test_make_baselines_values_pass_through(self) -> None:
+        """Values provided in the county config must appear on the Baselines object."""
+        # Deep-copy to prevent shared mutable state (e.g. the posting_days list).
+        county_config = copy.deepcopy(self._ALL_FIELDS_CONFIG)
+        result = _make_baselines({"TestCounty": county_config})
+        baseline = result["TestCounty"]
+
+        for field in dataclasses.fields(Baselines):
+            expected = county_config[field.name]
+            actual = getattr(baseline, field.name)
+            assert actual == expected, (
+                f"Field {field.name!r}: expected {expected!r}, got {actual!r}. "
+                f"_make_baselines may not be forwarding this field."
+            )
 
 
 class FakeCursor:
