@@ -1,9 +1,10 @@
 """San Bernardino Superior Court — Civil Tentative Rulings Scraper (Pattern 2).
 
-Verified against live site 2026-03-02:
+Verified against live site 2026-03-23:
   URL:  https://old.sb-court.org/GeneralInfo/TentativeRulings.aspx
-  52 PDF links found on index page (spanning ~30 days)
+  49 PDF links found on index page (spanning ~4 weeks)
   No Playwright required; httpx fetch works directly.
+  Typical posting rate: 1-4 new PDFs per hearing day (#1769).
 
 Link text format: filename only — e.g. "CVS24030426.pdf"
   No judge name or dept in link text; both extracted later from PDF text.
