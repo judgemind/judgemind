@@ -28,6 +28,7 @@ import base64
 import json
 import logging
 import os
+import statistics
 import subprocess
 import sys
 import tempfile
@@ -173,6 +174,23 @@ RULING_COUNTS_7D_QUERY = """
       AND d.captured_at < %s
       {county_filter}
     GROUP BY ct.county
+"""
+
+# Per-day counts for the 7-day window — used for median-based baseline.
+# Explicit ``AT TIME ZONE 'UTC'`` ensures the date grouping matches the
+# Python code's UTC-based window calculations, regardless of the database
+# session timezone setting.
+RULING_COUNTS_7D_PER_DAY_QUERY = """
+    SELECT ct.county,
+           DATE(d.captured_at AT TIME ZONE 'UTC') AS capture_date,
+           COUNT(d.id) AS ruling_count
+    FROM documents d
+    JOIN courts ct ON ct.id = d.court_id
+    WHERE d.status = 'active'
+      AND d.captured_at >= %s
+      AND d.captured_at < %s
+      {county_filter}
+    GROUP BY ct.county, DATE(d.captured_at AT TIME ZONE 'UTC')
 """
 
 # The 7-day window spans [now-7d, now-24h) = exactly 6 days.
@@ -701,13 +719,72 @@ def _count_posting_days_in_window(
     return max(float(count), 1.0)
 
 
+def _compute_median_daily(
+    per_day_counts: dict[str, int],
+    posting_days: list[str] | None,
+    window_start: datetime,
+    window_end: datetime,
+) -> float:
+    """Compute the median daily ruling count over a date window.
+
+    Fills in zero-count days for dates with no rulings so that the median
+    correctly accounts for inactive days.  For counties with *posting_days*,
+    only posting days are included (non-posting days are expected to be zero
+    and should not dilute the baseline).
+
+    Args:
+        per_day_counts: Mapping of ISO date string (``YYYY-MM-DD``) to
+            ruling count for that day.
+        posting_days: Optional list of day abbreviations (Mon-Sun) when
+            the court posts content, or ``None`` for "every day".
+        window_start: Start of the window (inclusive).
+        window_end: End of the window (exclusive).
+
+    Returns:
+        Median daily ruling count.  Returns 0.0 when no relevant days
+        exist in the window.
+    """
+    total_days = (window_end - window_start).days
+    if total_days <= 0:
+        return 0.0
+
+    posting_weekdays: set[int] | None = None
+    if posting_days:
+        posting_weekdays = set()
+        for day in posting_days:
+            if day in _DAY_ABBREVS:
+                posting_weekdays.add(_DAY_ABBREVS.index(day))
+        # If no valid posting days parsed, treat as "every day".
+        if not posting_weekdays:
+            posting_weekdays = None
+
+    daily_values: list[int] = []
+    for offset in range(total_days):
+        day_dt = window_start + timedelta(days=offset)
+        # Skip non-posting days when posting_days is configured.
+        if posting_weekdays is not None and day_dt.weekday() not in posting_weekdays:
+            continue
+        date_key = day_dt.strftime("%Y-%m-%d")
+        daily_values.append(per_day_counts.get(date_key, 0))
+
+    if not daily_values:
+        return 0.0
+
+    return float(statistics.median(daily_values))
+
+
 def check_ingest_rates(
     conn: psycopg.Connection,  # type: ignore[type-arg]
     now: datetime,
     baselines: dict[str, Baselines],
     county: str | None = None,
 ) -> list[Alert]:
-    """Check ruling ingest rates against 7-day averages.
+    """Check ruling ingest rates against 7-day median baseline.
+
+    Uses the **median** of per-day ruling counts over the 7-day window
+    rather than the mean.  The median is naturally resistant to single-day
+    spikes caused by bulk re-ingests (#1771), while still detecting real
+    sustained drops in ingestion.
 
     Uses ``captured_at`` (when the court posted the ruling) rather than
     ``created_at`` (when the pipeline processed it) so that backfill or
@@ -739,18 +816,26 @@ def check_ingest_rates(
         for row in cur.fetchall():
             counts_24h[row[0]] = row[1]
 
-    # Get 7-day counts (excluding last 24h for the average baseline).
-    # The window is [now-7d, now-24h) = exactly 6 calendar days.
-    # The per-county posting-day-aware average is computed below in the
-    # per-county loop where baselines are available.
-    totals_7d: dict[str, int] = {}
+    # Get 7-day per-day counts (excluding last 24h for the baseline).
+    # Returns (county, date, count) rows; used to compute the median
+    # per-day count which is resistant to single-day spikes (#1771).
+    per_day_7d: dict[str, dict[str, int]] = {}
     with conn.cursor() as cur:
         cur.execute(
-            RULING_COUNTS_7D_QUERY.format(county_filter=county_filter),
+            RULING_COUNTS_7D_PER_DAY_QUERY.format(county_filter=county_filter),
             (cutoff_7d, cutoff_24h, *county_params),
         )
         for row in cur.fetchall():
-            totals_7d[row[0]] = row[1]
+            county_name_row = row[0]
+            # The date may come back as a date object or string depending
+            # on the driver; normalise to YYYY-MM-DD string.
+            date_val = row[1]
+            date_key = (
+                date_val.isoformat()
+                if hasattr(date_val, "isoformat")
+                else str(date_val)
+            )
+            per_day_7d.setdefault(county_name_row, {})[date_key] = row[2]
 
     # Get all active counties to check for zeros
     all_counties: list[str] = []
@@ -765,20 +850,17 @@ def check_ingest_rates(
         count_24h = counts_24h.get(county_name, 0)
         baseline = baselines.get(county_name)
 
-        # Compute the posting-day-aware 7-day average.  For counties with
-        # posting_days, divide total rulings by the number of posting days
-        # in the window (not calendar days) to avoid deflating the average
-        # on weekends.  See #1784.
-        total_7d = totals_7d.get(county_name, 0)
+        # Compute the median of per-day counts over the 7-day window.
+        # The median is resistant to single-day spikes from bulk
+        # re-ingests (#1771).  For counties with posting_days, only
+        # posting days contribute to the median calculation.
         posting_days = baseline.posting_days if baseline else None
-        window_posting_days = _count_posting_days_in_window(
-            cutoff_7d,
-            cutoff_24h,
-            posting_days,
+        county_per_day = per_day_7d.get(county_name, {})
+        daily_median = _compute_median_daily(
+            county_per_day, posting_days, cutoff_7d, cutoff_24h
         )
-        daily_avg = total_7d / window_posting_days
 
-        expected_daily = baseline.expected_daily_rulings if baseline else daily_avg
+        expected_daily = baseline.expected_daily_rulings if baseline else daily_median
 
         # Zero-ruling alert (critical).
         # Suppress on non-posting days: if the county has a posting_days
@@ -805,8 +887,8 @@ def check_ingest_rates(
         # (weekends) just like zero_rulings above.
         elif (
             expected_daily > 0
-            and daily_avg > 0
-            and count_24h < daily_avg * INGEST_DROP_THRESHOLD
+            and daily_median > 0
+            and count_24h < daily_median * INGEST_DROP_THRESHOLD
         ):
             if _24h_overlaps_posting_day(now, posting_days):
                 alerts.append(
@@ -814,11 +896,11 @@ def check_ingest_rates(
                         county=county_name,
                         metric="ingest_rate",
                         severity="p2",
-                        expected=round(daily_avg, 1),
+                        expected=round(daily_median, 1),
                         actual=count_24h,
                         message=(
                             f"{county_name}: {count_24h} rulings in 24h, "
-                            f"7-day avg is {daily_avg:.1f}/day "
+                            f"7-day median is {daily_median:.1f}/day "
                             f"(>{INGEST_DROP_THRESHOLD * 100:.0f}% drop)"
                         ),
                     )
@@ -1070,7 +1152,25 @@ def _collect_full_metrics(
                 "by_doc_type": breakdown,
             }
 
-    # --- Ruling count 7d average ---
+    # --- Ruling count 7d average (mean + median) ---
+    # First collect per-day counts for the median computation.
+    per_day_7d: dict[str, dict[str, int]] = {}
+    with conn.cursor() as cur:
+        cur.execute(
+            RULING_COUNTS_7D_PER_DAY_QUERY.format(county_filter=county_filter),
+            (cutoff_7d, cutoff_24h, *county_params),
+        )
+        for row in cur.fetchall():
+            cn = row[0]
+            date_val = row[1]
+            date_key = (
+                date_val.isoformat()
+                if hasattr(date_val, "isoformat")
+                else str(date_val)
+            )
+            per_day_7d.setdefault(cn, {})[date_key] = row[2]
+
+    # Also collect totals for the mean (backwards compatibility).
     with conn.cursor() as cur:
         cur.execute(
             RULING_COUNTS_7D_QUERY.format(county_filter=county_filter),
@@ -1088,11 +1188,21 @@ def _collect_full_metrics(
                 posting_days_cfg,
             )
             avg = round(total_7d / window_posting_days, 2)
+            median_val = round(
+                _compute_median_daily(
+                    per_day_7d.get(county_name, {}),
+                    posting_days_cfg,
+                    cutoff_7d,
+                    cutoff_24h,
+                ),
+                2,
+            )
             _ensure(county_name)["ruling_count_7d_avg"] = {
                 "value": avg,
                 "metadata": {
                     "total_7d_window": total_7d,
                     "window_days": window_posting_days,
+                    "median_7d": median_val,
                 },
             }
 

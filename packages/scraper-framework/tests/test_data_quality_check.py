@@ -48,6 +48,7 @@ _check_duplicate = dqc._check_duplicate
 _file_single_issue = dqc._file_single_issue
 _24h_overlaps_posting_day = dqc._24h_overlaps_posting_day
 _count_posting_days_in_window = dqc._count_posting_days_in_window
+_compute_median_daily = dqc._compute_median_daily
 MIN_FIELD_CHECK_SAMPLE_SIZE = dqc.MIN_FIELD_CHECK_SAMPLE_SIZE
 FIELD_COMPLETENESS_GRACE_MINUTES = dqc.FIELD_COMPLETENESS_GRACE_MINUTES
 FIELD_COMPLETENESS_WINDOW_DAYS = dqc.FIELD_COMPLETENESS_WINDOW_DAYS
@@ -146,6 +147,64 @@ class TestMakeBaselinesFieldForwarding:
                 f"Field {field.name!r}: expected {expected!r}, got {actual!r}. "
                 f"_make_baselines may not be forwarding this field."
             )
+
+
+def _make_per_day_rows(
+    county: str,
+    daily_counts: list[int],
+    now: datetime,
+) -> list[tuple[str, str, int]]:
+    """Generate per-day (county, date, count) rows for the 7D per-day query.
+
+    Creates rows for each day in the 7-day window [now-7d, now-24h) that
+    has a nonzero count.  ``daily_counts`` maps to the 6 calendar days
+    in the window, oldest first.
+
+    Args:
+        county: County name.
+        daily_counts: List of up to 6 counts, one per calendar day in the
+            window [now-7d, now-24h).  Oldest day first.
+        now: The "now" timestamp used for the check.
+
+    Returns:
+        List of (county, date_str, count) tuples for nonzero days.
+    """
+    cutoff_7d = now - timedelta(days=7)
+    rows: list[tuple[str, str, int]] = []
+    for i, count in enumerate(daily_counts):
+        if count > 0:
+            day = cutoff_7d + timedelta(days=i)
+            rows.append((county, day.strftime("%Y-%m-%d"), count))
+    return rows
+
+
+def _uniform_per_day_rows(
+    county: str,
+    total: int,
+    now: datetime,
+    num_days: int = 6,
+) -> list[tuple[str, str, int]]:
+    """Distribute a total count uniformly across the 7D window days.
+
+    This is a convenience for converting old total-based test data to
+    per-day format.  The median of a uniform distribution equals the mean,
+    so existing test assertions about thresholds remain valid.
+
+    Args:
+        county: County name.
+        total: Total count across the window.
+        now: The "now" timestamp used for the check.
+        num_days: Number of days in the window (default 6).
+
+    Returns:
+        List of (county, date_str, count) tuples.
+    """
+    if total == 0 or num_days == 0:
+        return []
+    per_day = total // num_days
+    remainder = total % num_days
+    daily = [per_day + (1 if i < remainder else 0) for i in range(num_days)]
+    return _make_per_day_rows(county, daily, now)
 
 
 class FakeCursor:
@@ -328,19 +387,21 @@ class TestLoadBaselines:
 
 
 class TestCheckIngestRates:
-    """Tests for check_ingest_rates function."""
+    """Tests for check_ingest_rates function.
+
+    Since #1771, check_ingest_rates uses a per-day query and computes the
+    **median** daily count (not the mean) for the 7-day baseline.  Test
+    data uses ``"AT TIME ZONE"`` as the FakeConnection key for the
+    per-day query, with (county, date_str, count) tuples.
+    """
 
     def test_healthy_county_no_alerts(self) -> None:
-        """No alerts when 24h count is above 50% of 7-day average."""
-        # Use unique keys: the 7d query contains "AND d.captured_at <" which
-        # is NOT in the 24h query. The 24h query uses a unique substring.
+        """No alerts when 24h count is above 50% of 7-day median."""
+        # Uniform 200 across 6 days -> median ~33/day.  30 >= 33*0.5 = 16.5.
         conn = FakeConnection(
             {
-                # 7d query — key matches "d.captured_at <" (unique to 7d query)
-                "d.captured_at <": [("Los Angeles", 200)],
-                # 24h query — key matches "d.captured_at >=" (in both, but 7d matched first)
+                "AT TIME ZONE": _uniform_per_day_rows("Los Angeles", 200, NOW),
                 "d.captured_at >=": [("Los Angeles", 30)],
-                # Active counties
                 "DISTINCT ct.county": [("Los Angeles",)],
             }
         )
@@ -352,7 +413,7 @@ class TestCheckIngestRates:
         """P1 alert when county has zero rulings in 24h but expects some."""
         conn = FakeConnection(
             {
-                "d.captured_at <": [("Los Angeles", 200)],
+                "AT TIME ZONE": _uniform_per_day_rows("Los Angeles", 200, NOW),
                 "d.captured_at >=": [],  # 0 rulings in 24h
                 "DISTINCT ct.county": [("Los Angeles",)],
             }
@@ -366,11 +427,11 @@ class TestCheckIngestRates:
         assert alerts[0].actual == 0
 
     def test_ingest_rate_drop_p2_alert(self) -> None:
-        """P2 alert when 24h count is below 50% of 7-day average."""
+        """P2 alert when 24h count is below 50% of 7-day median."""
+        # Uniform 200 across 6 days -> median ~33/day.  5 < 33*0.5 = 16.5.
         conn = FakeConnection(
             {
-                "d.captured_at <": [("Los Angeles", 200)],
-                # 5 rulings in 24h — well below 50% of ~33/day avg
+                "AT TIME ZONE": _uniform_per_day_rows("Los Angeles", 200, NOW),
                 "d.captured_at >=": [("Los Angeles", 5)],
                 "DISTINCT ct.county": [("Los Angeles",)],
             }
@@ -386,7 +447,7 @@ class TestCheckIngestRates:
         """Only checks the specified county when filter is provided."""
         conn = FakeConnection(
             {
-                "d.captured_at <": [],
+                "AT TIME ZONE": [],
                 "d.captured_at >=": [],
                 "DISTINCT ct.county": [("Orange",)],
             }
@@ -397,35 +458,34 @@ class TestCheckIngestRates:
         assert len(alerts) == 1
         assert alerts[0].county == "Orange"
 
-    def test_no_baseline_uses_avg(self) -> None:
-        """Uses 7-day average when no baseline exists for the county."""
+    def test_no_baseline_uses_median(self) -> None:
+        """Uses 7-day median when no baseline exists for the county."""
         conn = FakeConnection(
             {
-                "d.captured_at <": [("Unknown County", 100)],
+                "AT TIME ZONE": _uniform_per_day_rows("Unknown County", 100, NOW),
                 "d.captured_at >=": [],  # 0 rulings
                 "DISTINCT ct.county": [("Unknown County",)],
             }
         )
-        # No baselines for "Unknown County" — should use daily_avg from 7d
+        # No baselines for "Unknown County" — should use daily median from 7d
         alerts = check_ingest_rates(conn, NOW, {})
         assert len(alerts) == 1
         assert alerts[0].metric == "zero_rulings"
 
     def test_multiple_counties(self) -> None:
         """Checks multiple counties and generates appropriate alerts."""
+        la_rows = _uniform_per_day_rows("Los Angeles", 200, NOW)
+        og_rows = _uniform_per_day_rows("Orange", 100, NOW)
         conn = FakeConnection(
             {
-                "d.captured_at <": [
-                    ("Los Angeles", 200),
-                    ("Orange", 100),
-                ],
+                "AT TIME ZONE": la_rows + og_rows,
                 "d.captured_at >=": [("Los Angeles", 30), ("Orange", 0)],
                 "DISTINCT ct.county": [("Los Angeles",), ("Orange",)],
             }
         )
         baselines = _make_baselines()
         alerts = check_ingest_rates(conn, NOW, baselines)
-        # LA is healthy (30 vs ~33 avg), Orange has zero -> 1 alert
+        # LA is healthy (30 vs ~33 median), Orange has zero -> 1 alert
         assert len(alerts) == 1
         assert alerts[0].county == "Orange"
 
@@ -434,14 +494,13 @@ class TestCheckIngestRates:
 
         Counties like San Diego with expected_daily_rulings=0 and
         posting_days=[] have no active scraper. A small non-zero 7-day
-        average (from historical data) should NOT trigger an ingest rate
+        median (from historical data) should NOT trigger an ingest rate
         drop alert — same guard that zero_rulings already uses.
         """
+        # 1 ruling on one day -> median = 0 (most days have 0)
         conn = FakeConnection(
             {
-                # Small historical 7d count: 1 ruling over 6 days -> avg 0.17/day
-                "d.captured_at <": [("San Diego", 1)],
-                # 0 rulings in last 24h -> below 50% of 0.17, but expected is 0
+                "AT TIME ZONE": _make_per_day_rows("San Diego", [1, 0, 0, 0, 0, 0], NOW),
                 "d.captured_at >=": [],
                 "DISTINCT ct.county": [("San Diego",)],
             }
@@ -463,14 +522,14 @@ class TestCheckIngestRates:
         """Ingest rate drop suppressed even with nonzero 24h count (#1768).
 
         When expected_daily is 0 but there is some incidental activity
-        (nonzero 24h count that still falls below the 7d average), the
+        (nonzero 24h count that still falls below the 7d median), the
         ingest_rate check should still be suppressed because the county
         has no active scraper — any data is incidental.
         """
         conn = FakeConnection(
             {
-                "d.captured_at <": [("San Diego", 18)],  # avg = 3/day
-                "d.captured_at >=": [("San Diego", 1)],  # 1 in 24h; 1 < 3*0.5
+                "AT TIME ZONE": _uniform_per_day_rows("San Diego", 18, NOW),
+                "d.captured_at >=": [("San Diego", 1)],
                 "DISTINCT ct.county": [("San Diego",)],
             }
         )
@@ -646,7 +705,7 @@ class TestCheckIngestRatesPostingDays:
         sunday = datetime(2026, 3, 22, 12, 0, 0, tzinfo=UTC)
         conn = FakeConnection(
             {
-                "d.captured_at <": [],
+                "AT TIME ZONE": [],
                 "d.captured_at >=": [],
                 "DISTINCT ct.county": [("Santa Clara",)],
             }
@@ -669,7 +728,7 @@ class TestCheckIngestRatesPostingDays:
         thursday = datetime(2026, 3, 19, 12, 0, 0, tzinfo=UTC)
         conn = FakeConnection(
             {
-                "d.captured_at <": [],
+                "AT TIME ZONE": [],
                 "d.captured_at >=": [],
                 "DISTINCT ct.county": [("Santa Clara",)],
             }
@@ -698,7 +757,7 @@ class TestCheckIngestRatesPostingDays:
         friday = datetime(2026, 3, 20, 12, 0, 0, tzinfo=UTC)
         conn = FakeConnection(
             {
-                "d.captured_at <": [],
+                "AT TIME ZONE": [],
                 "d.captured_at >=": [],
                 "DISTINCT ct.county": [("Santa Clara",)],
             }
@@ -726,7 +785,7 @@ class TestCheckIngestRatesPostingDays:
         tuesday = datetime(2026, 3, 24, 12, 0, 0, tzinfo=UTC)
         conn = FakeConnection(
             {
-                "d.captured_at <": [],
+                "AT TIME ZONE": [],
                 "d.captured_at >=": [],
                 "DISTINCT ct.county": [("Ventura",)],
             }
@@ -754,7 +813,7 @@ class TestCheckIngestRatesPostingDays:
         saturday = datetime(2026, 3, 21, 16, 49, 0, tzinfo=UTC)
         conn = FakeConnection(
             {
-                "d.captured_at <": [],
+                "AT TIME ZONE": [],
                 "d.captured_at >=": [],
                 "DISTINCT ct.county": [("Ventura",)],
             }
@@ -776,7 +835,7 @@ class TestCheckIngestRatesPostingDays:
         sunday = datetime(2026, 3, 22, 12, 0, 0, tzinfo=UTC)
         conn = FakeConnection(
             {
-                "d.captured_at <": [("Los Angeles", 200)],
+                "AT TIME ZONE": _uniform_per_day_rows("Los Angeles", 200, sunday),
                 "d.captured_at >=": [],
                 "DISTINCT ct.county": [("Los Angeles",)],
             }
@@ -801,13 +860,10 @@ class TestCheckIngestRatesPostingDays:
         that trickle in are well below 50% of the weekday-heavy 7-day average.
         The ingest_rate drop alert should be suppressed on non-posting days.
         """
-        # 2026-03-22 is a Sunday (but test title says Saturday for the scenario)
-        # Use Saturday March 21
         saturday = datetime(2026, 3, 21, 16, 49, 0, tzinfo=UTC)
         conn = FakeConnection(
             {
-                "d.captured_at <": [("Los Angeles", 1200)],
-                # 7 rulings in 24h — well below 50% of ~200/day avg
+                "AT TIME ZONE": _uniform_per_day_rows("Los Angeles", 1200, saturday),
                 "d.captured_at >=": [("Los Angeles", 7)],
                 "DISTINCT ct.county": [("Los Angeles",)],
             }
@@ -828,14 +884,14 @@ class TestCheckIngestRatesPostingDays:
         """Ingest rate drop alert still fires on a posting day (weekday).
 
         On a posting day (e.g. Wednesday), if 24h count drops below 50% of the
-        7-day average, the alert should fire because courts are expected to
+        7-day median, the alert should fire because courts are expected to
         publish new rulings.
         """
         wednesday = datetime(2026, 3, 18, 12, 0, 0, tzinfo=UTC)
         conn = FakeConnection(
             {
-                "d.captured_at <": [("Los Angeles", 1200)],
-                # 5 rulings in 24h — well below 50% of ~200/day avg
+                "AT TIME ZONE": _uniform_per_day_rows("Los Angeles", 1200, wednesday),
+                # 5 rulings in 24h — well below 50% of ~200/day median
                 "d.captured_at >=": [("Los Angeles", 5)],
                 "DISTINCT ct.county": [("Los Angeles",)],
             }
@@ -860,8 +916,8 @@ class TestCheckIngestRatesPostingDays:
         sunday = datetime(2026, 3, 22, 12, 0, 0, tzinfo=UTC)
         conn = FakeConnection(
             {
-                "d.captured_at <": [("Los Angeles", 1200)],
-                # 5 rulings in 24h — well below 50% of ~200/day avg
+                "AT TIME ZONE": _uniform_per_day_rows("Los Angeles", 1200, sunday),
+                # 5 rulings in 24h — well below 50% of ~200/day median
                 "d.captured_at >=": [("Los Angeles", 5)],
                 "DISTINCT ct.county": [("Los Angeles",)],
             }
@@ -881,29 +937,34 @@ class TestCheckIngestRatesPostingDays:
         assert alerts[0].severity == "p2"
 
 
-class TestPostingDayAwareAverage:
-    """Tests that the 7-day average divides by posting days, not calendar days.
+class TestPostingDayAwareMedian:
+    """Tests that the 7-day median uses posting days, not calendar days.
 
-    Fixes #1784: for a Mon-Fri county, the 7-day average should divide by
-    the number of posting days in the window (typically 4-5), not by 6
-    calendar days.  This prevents the average from being artificially
-    deflated by weekends.
+    Since #1771, check_ingest_rates uses the median of per-day counts.
+    For counties with posting_days, only posting days contribute to the
+    median calculation.
+
+    Fixes #1784: for a Mon-Fri county, the 7-day baseline should account
+    for posting days to avoid being artificially deflated by weekends.
     """
 
-    def test_mon_fri_county_average_divides_by_posting_days(self) -> None:
-        """For a Mon-Fri county, 7d average should use posting days not calendar days.
+    def test_mon_fri_county_median_uses_posting_days(self) -> None:
+        """For a Mon-Fri county, 7d median uses only posting days.
 
-        Window [now-7d, now-24h) on a Wednesday = Wed-Mon = 6 calendar days.
-        Days: Wed(post), Thu(post), Fri(post), Sat(skip), Sun(skip), Mon(post) = 4 posting days.
-        With 200 rulings in the window: avg should be 200/4 = 50, not 200/6 = 33.3.
+        Window [now-7d, now-24h) on Wednesday 2026-03-18 = Wed-Mon = 6 cal days.
+        Days: Wed 3/11(post), Thu 3/12(post), Fri 3/13(post),
+              Sat 3/14(skip), Sun 3/15(skip), Mon 3/16(post) = 4 posting days.
+        50 rulings per posting day -> median = 50.  45 >= 50*0.5 = 25. No alert.
         """
-        # 2026-03-18 is Wednesday
         wednesday = datetime(2026, 3, 18, 12, 0, 0, tzinfo=UTC)
         conn = FakeConnection(
             {
-                # 7d window: 200 rulings total
-                "d.captured_at <": [("Los Angeles", 200)],
-                # 24h: 45 rulings — normal for a posting day
+                "AT TIME ZONE": _make_per_day_rows(
+                    "Los Angeles",
+                    # Wed=50, Thu=50, Fri=50, Sat=0, Sun=0, Mon=50
+                    [50, 50, 50, 0, 0, 50],
+                    wednesday,
+                ),
                 "d.captured_at >=": [("Los Angeles", 45)],
                 "DISTINCT ct.county": [("Los Angeles",)],
             }
@@ -918,23 +979,22 @@ class TestPostingDayAwareAverage:
             }
         )
         alerts = check_ingest_rates(conn, wednesday, baselines)
-        # 200 / 4 posting days = 50/day avg. 45 is >= 50 * 0.5 = 25. No alert.
         assert len(alerts) == 0
 
-    def test_mon_fri_county_detects_real_drop_with_accurate_average(self) -> None:
-        """A real drop is still detected with posting-day-aware average.
+    def test_mon_fri_county_detects_real_drop_with_accurate_median(self) -> None:
+        """A real drop is detected against the posting-day-aware median.
 
-        With 200 rulings in 4 posting days: avg = 50/day.
-        If today's count (20) is below 50 * 0.5 = 25, alert fires.
-        With the old calendar-day average: 200/6 = 33.3, threshold = 16.65,
-        so 20 would NOT trigger — the old code missed this real drop.
+        50 rulings per posting day -> median = 50.
+        20 < 50 * 0.5 = 25 -> alert fires.
         """
         wednesday = datetime(2026, 3, 18, 12, 0, 0, tzinfo=UTC)
         conn = FakeConnection(
             {
-                "d.captured_at <": [("Los Angeles", 200)],
-                # 20 rulings — below 50% of posting-day avg (50), but above
-                # 50% of old calendar avg (33.3)
+                "AT TIME ZONE": _make_per_day_rows(
+                    "Los Angeles",
+                    [50, 50, 50, 0, 0, 50],
+                    wednesday,
+                ),
                 "d.captured_at >=": [("Los Angeles", 20)],
                 "DISTINCT ct.county": [("Los Angeles",)],
             }
@@ -949,18 +1009,18 @@ class TestPostingDayAwareAverage:
             }
         )
         alerts = check_ingest_rates(conn, wednesday, baselines)
-        # 200 / 4 = 50/day avg. 20 < 50 * 0.5 = 25. Should alert.
         assert len(alerts) == 1
         assert alerts[0].metric == "ingest_rate"
         assert alerts[0].actual == 20
         assert alerts[0].expected == 50.0
 
-    def test_no_posting_days_uses_calendar_days(self) -> None:
-        """Without posting_days config, falls back to calendar days (backward compat)."""
+    def test_no_posting_days_uses_all_calendar_days(self) -> None:
+        """Without posting_days config, median uses all calendar days."""
         wednesday = datetime(2026, 3, 18, 12, 0, 0, tzinfo=UTC)
+        # 20 per day across all 6 days -> median = 20
         conn = FakeConnection(
             {
-                "d.captured_at <": [("TestCounty", 120)],
+                "AT TIME ZONE": _uniform_per_day_rows("TestCounty", 120, wednesday),
                 "d.captured_at >=": [("TestCounty", 5)],
                 "DISTINCT ct.county": [("TestCounty",)],
             }
@@ -970,25 +1030,28 @@ class TestPostingDayAwareAverage:
                 "TestCounty": {
                     "expected_daily_rulings": 20,
                     "schedule_type": "daily",
-                    # No posting_days
                 },
             }
         )
         alerts = check_ingest_rates(conn, wednesday, baselines)
-        # 120 / 6.0 = 20/day. 5 < 20 * 0.5 = 10. Alert fires.
+        # median = 20. 5 < 20 * 0.5 = 10. Alert fires.
         assert len(alerts) == 1
         assert alerts[0].expected == 20.0
 
-    def test_tue_thu_county_average(self) -> None:
-        """A Tue/Thu-only posting county gets correct posting-day average.
+    def test_tue_thu_county_median(self) -> None:
+        """A Tue/Thu-only posting county gets correct posting-day median.
 
-        On Thursday, the 6-day window [Fri-Wed] contains 1 posting day (Tue).
-        50 rulings / 1 = 50/day. If 24h count is 45, no alert.
+        On Thursday 2026-03-19, the 6-day window [Thu 3/12 - Tue 3/17]
+        contains 2 posting days (Thu 3/12, Tue 3/17).  50 rulings on Tue ->
+        posting-day values [0, 50] -> median = 25.  45 >= 25*0.5 = 12.5.
+        No alert.
         """
         thursday = datetime(2026, 3, 19, 12, 0, 0, tzinfo=UTC)
         conn = FakeConnection(
             {
-                "d.captured_at <": [("San Francisco", 50)],
+                # Only Tuesday (day index 5 from Thu 3/12) has data.
+                # Thu=0, Fri=0, Sat=0, Sun=0, Mon=0, Tue=50
+                "AT TIME ZONE": _make_per_day_rows("San Francisco", [0, 0, 0, 0, 0, 50], thursday),
                 "d.captured_at >=": [("San Francisco", 45)],
                 "DISTINCT ct.county": [("San Francisco",)],
             }
@@ -1006,16 +1069,11 @@ class TestPostingDayAwareAverage:
         assert len(alerts) == 0
 
     def test_low_volume_county_not_broken(self) -> None:
-        """Low-volume counties with posting_days still work correctly.
-
-        This ensures the posting-day-aware average doesn't break
-        low_volume county handling (acceptance criterion 4).
-        """
-        # Thursday is a posting day for Santa Clara (Mon-Thu)
+        """Low-volume counties with posting_days still work correctly."""
         thursday = datetime(2026, 3, 19, 12, 0, 0, tzinfo=UTC)
         conn = FakeConnection(
             {
-                "d.captured_at <": [("Santa Clara", 1)],
+                "AT TIME ZONE": _make_per_day_rows("Santa Clara", [0, 0, 0, 1, 0, 0], thursday),
                 "d.captured_at >=": [],
                 "DISTINCT ct.county": [("Santa Clara",)],
             }
@@ -1031,7 +1089,6 @@ class TestPostingDayAwareAverage:
             }
         )
         alerts = check_ingest_rates(conn, thursday, baselines)
-        # Zero rulings on a posting day with expected > 0 should fire
         assert len(alerts) == 1
         assert alerts[0].metric == "zero_rulings"
 
@@ -1039,26 +1096,33 @@ class TestPostingDayAwareAverage:
 class TestBackfillSpikeResilience:
     """Tests that ingest rate checks are resilient to backfill spikes.
 
-    These tests verify the fix for #1693: when a backfill/catch-up creates
-    many documents in a short period, the 7-day rolling average should NOT
-    be inflated because the queries use ``captured_at`` (court posting time)
-    rather than ``created_at`` (pipeline processing time).
+    Since #1771, the ingest rate check uses the **median** of per-day counts
+    rather than the mean.  A single-day spike from a bulk re-ingest does not
+    inflate the median, preventing false-positive drop alerts.
+
+    Also verifies the fix for #1693: queries use ``captured_at`` (court
+    posting time) rather than ``created_at`` (pipeline processing time).
     """
 
-    def test_backfill_spike_does_not_inflate_average(self) -> None:
+    def test_backfill_spike_does_not_inflate_median(self) -> None:
         """Normal 24h count should not trigger alert even after a backfill.
 
-        Scenario: OC had a backfill that caught up 953 documents in 2 days.
-        With captured_at, the 7-day window reflects actual court posting
-        dates (spread across the week), not the spike of pipeline processing.
-        A normal day of 20 captures should be healthy against a normal average.
+        Scenario: OC had a backfill that created 274 docs on one day.
+        With median-based baseline, the spike day is an outlier that
+        doesn't inflate the baseline.  Normal days have ~20 rulings.
         """
+        wednesday = datetime(2026, 3, 18, 12, 0, 0, tzinfo=UTC)
+        # Window: Wed-Mon.  Posting days: Wed, Thu, Fri, Mon (4 days).
+        # Normal: 20/day on 3 days, spike: 274 on 1 day.
+        # Daily counts on posting days: [20, 20, 20, 274] -> median = 20.
         conn = FakeConnection(
             {
-                # 7d window: 120 total over 6 days = ~20/day average
-                # (reflects actual court posting dates, not backfill spike)
-                "d.captured_at <": [("Orange", 120)],
-                # 24h: 18 captures — within normal range
+                "AT TIME ZONE": _make_per_day_rows(
+                    "Orange",
+                    # Wed=20, Thu=20, Fri=20, Sat=0, Sun=0, Mon=274
+                    [20, 20, 20, 0, 0, 274],
+                    wednesday,
+                ),
                 "d.captured_at >=": [("Orange", 18)],
                 "DISTINCT ct.county": [("Orange",)],
             }
@@ -1072,21 +1136,55 @@ class TestBackfillSpikeResilience:
                 },
             }
         )
-        wednesday = datetime(2026, 3, 18, 12, 0, 0, tzinfo=UTC)
         alerts = check_ingest_rates(conn, wednesday, baselines)
+        # Median of [20, 20, 20, 274] = 20. 18 >= 20*0.5 = 10. No alert.
+        assert len(alerts) == 0
+
+    def test_spike_inflated_mean_would_have_fired_but_median_does_not(self) -> None:
+        """Exact scenario from #1771: OC 274-doc spike inflates mean, not median.
+
+        On 2026-03-20, 274 OC documents were re-ingested. On 2026-03-23,
+        7 rulings appeared. With the old mean: (274+7*5)/6 = 51.5/day,
+        threshold = 25.75, 7 < 25.75 -> false positive. With median:
+        per-day counts [7,7,7,7,7,274] -> median = 7, 7 >= 7*0.5 = 3.5 -> no alert.
+        """
+        # 2026-03-23 is a Sunday, but let's test on a posting day for
+        # the ingest_rate check to fire (posting day suppression is tested
+        # separately). Use a Monday for the scenario.
+        monday = datetime(2026, 3, 23, 12, 0, 0, tzinfo=UTC)
+        # Window [3/16 Mon - 3/22 Sun) = Mon,Tue,Wed,Thu,Fri,Sat = 6 days
+        # Mon-Fri posting: Mon=7, Tue=7, Wed=274, Thu=7, Fri=7, Sat=skip
+        conn = FakeConnection(
+            {
+                "AT TIME ZONE": _make_per_day_rows(
+                    "Orange",
+                    [7, 7, 274, 7, 7, 0],
+                    monday,
+                ),
+                "d.captured_at >=": [("Orange", 7)],
+                "DISTINCT ct.county": [("Orange",)],
+            }
+        )
+        baselines = _make_baselines(
+            {
+                "Orange": {
+                    "expected_daily_rulings": 20,
+                    "schedule_type": "daily",
+                    "posting_days": ["Mon", "Tue", "Wed", "Thu", "Fri"],
+                },
+            }
+        )
+        alerts = check_ingest_rates(conn, monday, baselines)
+        # Posting-day values: [7, 7, 274, 7, 7] -> median = 7.
+        # 7 >= 7 * 0.5 = 3.5 -> no alert. The spike does NOT inflate the median.
         assert len(alerts) == 0
 
     def test_genuine_scraper_failure_still_detected(self) -> None:
-        """A real scraper failure (0 captures on a weekday) still fires alert.
-
-        Even with captured_at-based averaging, a genuine outage where zero
-        new rulings appear on an expected posting day must be detected.
-        """
+        """A real scraper failure (0 captures on a weekday) still fires alert."""
+        wednesday = datetime(2026, 3, 18, 12, 0, 0, tzinfo=UTC)
         conn = FakeConnection(
             {
-                # 7d window: normal volume
-                "d.captured_at <": [("Orange", 120)],
-                # 24h: zero captures — scraper is down
+                "AT TIME ZONE": _uniform_per_day_rows("Orange", 120, wednesday),
                 "d.captured_at >=": [],
                 "DISTINCT ct.county": [("Orange",)],
             }
@@ -1100,7 +1198,6 @@ class TestBackfillSpikeResilience:
                 },
             }
         )
-        wednesday = datetime(2026, 3, 18, 12, 0, 0, tzinfo=UTC)
         alerts = check_ingest_rates(conn, wednesday, baselines)
         assert len(alerts) == 1
         assert alerts[0].metric == "zero_rulings"
@@ -1109,16 +1206,11 @@ class TestBackfillSpikeResilience:
         assert alerts[0].actual == 0
 
     def test_genuine_rate_drop_still_detected(self) -> None:
-        """A genuine ingest rate drop (not a backfill artifact) still fires.
-
-        If the court actually posted fewer rulings than normal (not just a
-        backfill timing artifact), the alert should fire on a posting day.
-        """
+        """A genuine ingest rate drop (not a backfill artifact) still fires."""
+        wednesday = datetime(2026, 3, 18, 12, 0, 0, tzinfo=UTC)
         conn = FakeConnection(
             {
-                # 7d window: 120 over 6 days = ~20/day
-                "d.captured_at <": [("Orange", 120)],
-                # 24h: only 5 captures — well below 50% of 20/day
+                "AT TIME ZONE": _uniform_per_day_rows("Orange", 120, wednesday),
                 "d.captured_at >=": [("Orange", 5)],
                 "DISTINCT ct.county": [("Orange",)],
             }
@@ -1132,7 +1224,6 @@ class TestBackfillSpikeResilience:
                 },
             }
         )
-        wednesday = datetime(2026, 3, 18, 12, 0, 0, tzinfo=UTC)
         alerts = check_ingest_rates(conn, wednesday, baselines)
         assert len(alerts) == 1
         assert alerts[0].metric == "ingest_rate"
@@ -1140,15 +1231,101 @@ class TestBackfillSpikeResilience:
         assert alerts[0].actual == 5
 
     def test_queries_use_captured_at_not_created_at(self) -> None:
-        """Verify both SQL queries reference captured_at, not created_at.
+        """Verify SQL queries reference captured_at, not created_at.
 
-        This is a direct regression test for #1693: the queries must use
-        d.captured_at to avoid backfill spikes inflating the rolling average.
+        Regression test for #1693: the queries must use d.captured_at.
         """
         assert "d.captured_at" in dqc.RULING_COUNTS_24H_QUERY
         assert "d.created_at" not in dqc.RULING_COUNTS_24H_QUERY
         assert "d.captured_at" in dqc.RULING_COUNTS_7D_QUERY
         assert "d.created_at" not in dqc.RULING_COUNTS_7D_QUERY
+        assert "d.captured_at" in dqc.RULING_COUNTS_7D_PER_DAY_QUERY
+        assert "d.created_at" not in dqc.RULING_COUNTS_7D_PER_DAY_QUERY
+
+
+class TestComputeMedianDaily:
+    """Tests for _compute_median_daily helper function."""
+
+    def test_uniform_distribution(self) -> None:
+        """Median of uniform counts equals each day's count."""
+        window_start = datetime(2026, 3, 4, 12, 0, 0, tzinfo=UTC)
+        window_end = datetime(2026, 3, 10, 12, 0, 0, tzinfo=UTC)
+        per_day = {
+            "2026-03-04": 20,
+            "2026-03-05": 20,
+            "2026-03-06": 20,
+            "2026-03-07": 20,
+            "2026-03-08": 20,
+            "2026-03-09": 20,
+        }
+        result = _compute_median_daily(per_day, None, window_start, window_end)
+        assert result == 20.0
+
+    def test_spike_day_does_not_skew_median(self) -> None:
+        """A single spike day does not inflate the median."""
+        window_start = datetime(2026, 3, 4, 12, 0, 0, tzinfo=UTC)
+        window_end = datetime(2026, 3, 10, 12, 0, 0, tzinfo=UTC)
+        per_day = {
+            "2026-03-04": 20,
+            "2026-03-05": 20,
+            "2026-03-06": 274,  # spike
+            "2026-03-07": 20,
+            "2026-03-08": 20,
+            "2026-03-09": 20,
+        }
+        result = _compute_median_daily(per_day, None, window_start, window_end)
+        # Sorted: [20, 20, 20, 20, 20, 274] -> median = (20+20)/2 = 20.0
+        assert result == 20.0
+
+    def test_posting_days_filter(self) -> None:
+        """Only posting days contribute to the median."""
+        # Window: Wed 3/4 - Mon 3/10, posting days Mon-Fri
+        # Days: Wed(post), Thu(post), Fri(post), Sat(skip), Sun(skip), Mon(post)
+        window_start = datetime(2026, 3, 4, 12, 0, 0, tzinfo=UTC)  # Wed
+        window_end = datetime(2026, 3, 10, 12, 0, 0, tzinfo=UTC)  # Mon (excl)
+        per_day = {
+            "2026-03-04": 50,  # Wed
+            "2026-03-05": 50,  # Thu
+            "2026-03-06": 50,  # Fri
+            "2026-03-07": 10,  # Sat (will be skipped)
+            "2026-03-08": 10,  # Sun (will be skipped)
+            "2026-03-09": 50,  # Mon
+        }
+        posting_days = ["Mon", "Tue", "Wed", "Thu", "Fri"]
+        result = _compute_median_daily(per_day, posting_days, window_start, window_end)
+        # Posting-day values: [50, 50, 50, 50] -> median = 50.0
+        assert result == 50.0
+
+    def test_missing_days_filled_with_zero(self) -> None:
+        """Days with no data count as zero in the median."""
+        window_start = datetime(2026, 3, 4, 12, 0, 0, tzinfo=UTC)
+        window_end = datetime(2026, 3, 10, 12, 0, 0, tzinfo=UTC)
+        per_day = {
+            "2026-03-04": 50,
+        }
+        result = _compute_median_daily(per_day, None, window_start, window_end)
+        # Values: [50, 0, 0, 0, 0, 0] -> sorted: [0,0,0,0,0,50] -> median = 0
+        assert result == 0.0
+
+    def test_empty_window_returns_zero(self) -> None:
+        """Empty or zero-width window returns 0."""
+        t = datetime(2026, 3, 4, 12, 0, 0, tzinfo=UTC)
+        result = _compute_median_daily({}, None, t, t)
+        assert result == 0.0
+
+    def test_single_posting_day_in_window(self) -> None:
+        """With only one posting day in the window, median equals that day's count."""
+        window_start = datetime(2026, 3, 14, 12, 0, 0, tzinfo=UTC)  # Sat
+        window_end = datetime(2026, 3, 20, 12, 0, 0, tzinfo=UTC)  # Fri (excl)
+        # Only Tue 3/17 is a posting day in [Sat-Thu]
+        per_day = {
+            "2026-03-17": 42,
+        }
+        result = _compute_median_daily(per_day, ["Tue", "Thu"], window_start, window_end)
+        # Posting days in window: Tue(42), Thu(0) -> median = 21.0
+        # Actually: Sat 3/14, Sun 3/15, Mon 3/16, Tue 3/17, Wed 3/18, Thu 3/19
+        # Tue and Thu are posting days. Tue=42, Thu=0 -> median = (0+42)/2 = 21.0
+        assert result == 21.0
 
 
 class TestCheckScraperStaleness:
@@ -1552,7 +1729,7 @@ class TestRunChecks:
                 "has_ruling": [],
                 # "orphaned_docs" matches ORPHANED_DOCUMENTS_QUERY.
                 "orphaned_docs": [],
-                "d.captured_at <": [("Los Angeles", 200)],
+                "AT TIME ZONE": _uniform_per_day_rows("Los Angeles", 200, NOW),
                 "d.captured_at >=": [],
                 "DISTINCT ct.county": [("Los Angeles",)],
                 "scraper_runs": [("ca-la-tentatives-civil", "Los Angeles", old_time, "success")],
@@ -1582,16 +1759,15 @@ class TestRunChecks:
     def test_run_checks_healthy(self) -> None:
         """run_checks returns empty list when everything is healthy."""
         recent = NOW - timedelta(hours=1)
+        la_rows = _uniform_per_day_rows("Los Angeles", 200, NOW)
+        og_rows = _uniform_per_day_rows("Orange", 100, NOW)
         conn = FakeConnection(
             {
                 # "has_ruling" matches FIELD_COMPLETENESS_QUERY.
                 "has_ruling": [],
                 # "orphaned_docs" matches ORPHANED_DOCUMENTS_QUERY.
                 "orphaned_docs": [],
-                "d.captured_at <": [
-                    ("Los Angeles", 200),
-                    ("Orange", 100),
-                ],
+                "AT TIME ZONE": la_rows + og_rows,
                 "d.captured_at >=": [("Los Angeles", 40), ("Orange", 15)],
                 "DISTINCT ct.county": [("Los Angeles",), ("Orange",)],
                 "scraper_runs": [
@@ -1638,7 +1814,7 @@ _P2_ALERT = Alert(
     severity="p2",
     expected=20.0,
     actual=5,
-    message="Orange: 5 rulings in 24h, 7-day avg is 20.0/day (>50% drop)",
+    message="Orange: 5 rulings in 24h, 7-day median is 20.0/day (>50% drop)",
 )
 
 _STALE_ALERT = Alert(
@@ -3050,6 +3226,8 @@ class TestCollectFullMetrics:
         # Order matters: more specific keys first so they match before generic ones.
         conn = FakeConnection(
             {
+                # RULING_COUNTS_7D_PER_DAY_QUERY (matched first by "AT TIME ZONE")
+                "AT TIME ZONE": [],
                 # RULING_COUNTS_7D_QUERY (has "captured_at < %s", 24h query does not)
                 "captured_at < %s": [],
                 # RULING_COUNTS_24H_QUERY (generic "ruling_count" matches this)
@@ -3080,6 +3258,7 @@ class TestCollectFullMetrics:
         """Collects ruling_count_7d_avg from 7-day window (no baselines = calendar days)."""
         conn = FakeConnection(
             {
+                "AT TIME ZONE": _uniform_per_day_rows("Orange", 120, NOW),
                 # 7d query matches first via "captured_at < %s"
                 "captured_at < %s": [("Orange", 120)],
                 # 24h query matches via "AS ruling_count"
@@ -3096,6 +3275,9 @@ class TestCollectFullMetrics:
         m = result["Orange"]["ruling_count_7d_avg"]
         assert m["value"] == round(120 / 6.0, 2)  # No baselines = calendar days
         assert m["metadata"]["total_7d_window"] == 120
+        # Median should also be present in metadata.
+        assert "median_7d" in m["metadata"]
+        assert m["metadata"]["median_7d"] == 20.0
 
     def test_collects_ruling_count_7d_avg_with_posting_days(self) -> None:
         """7d average uses posting days when baselines are provided (#1784)."""
@@ -3105,6 +3287,8 @@ class TestCollectFullMetrics:
         # Mon-Fri posting days in window: Tue, Wed, Thu, Fri = 4
         conn = FakeConnection(
             {
+                # Per-day: 30/day on posting days, 0 on weekends
+                "AT TIME ZONE": _make_per_day_rows("Orange", [30, 30, 30, 30, 0, 0], NOW),
                 "captured_at < %s": [("Orange", 120)],
                 "AS ruling_count": [],
                 "d.document_type": [],
@@ -3130,11 +3314,13 @@ class TestCollectFullMetrics:
         assert m["value"] == 30.0
         assert m["metadata"]["total_7d_window"] == 120
         assert m["metadata"]["window_days"] == 4.0
+        assert m["metadata"]["median_7d"] == 30.0
 
     def test_collects_field_completeness_metrics(self) -> None:
         """Collects overall and per-field completeness metrics."""
         conn = FakeConnection(
             {
+                "AT TIME ZONE": [],
                 "captured_at < %s": [],
                 "AS ruling_count": [],
                 "d.document_type": [],
@@ -3177,6 +3363,7 @@ class TestCollectFullMetrics:
         two_hours_ago = NOW - timedelta(hours=2)
         conn = FakeConnection(
             {
+                "AT TIME ZONE": [],
                 "captured_at < %s": [],
                 "AS ruling_count": [],
                 "d.document_type": [],
@@ -3194,6 +3381,7 @@ class TestCollectFullMetrics:
         """Collects scraper_run_success_rate_24h with error metadata."""
         conn = FakeConnection(
             {
+                "AT TIME ZONE": [],
                 "captured_at < %s": [],
                 "AS ruling_count": [],
                 "d.document_type": [],
@@ -3224,6 +3412,7 @@ class TestCollectFullMetrics:
         """Handles None error_details (all runs succeeded)."""
         conn = FakeConnection(
             {
+                "AT TIME ZONE": [],
                 "captured_at < %s": [],
                 "AS ruling_count": [],
                 "d.document_type": [],
@@ -3242,6 +3431,7 @@ class TestCollectFullMetrics:
         """Collects metrics for multiple counties."""
         conn = FakeConnection(
             {
+                "AT TIME ZONE": [],
                 "captured_at < %s": [],
                 "AS ruling_count": [("Los Angeles", 40), ("Orange", 15)],
                 "d.document_type": [],
@@ -3261,6 +3451,7 @@ class TestCollectFullMetrics:
         """Includes document IDs with gaps in field completeness metadata."""
         conn = FakeConnection(
             {
+                "AT TIME ZONE": [],
                 "captured_at < %s": [],
                 "AS ruling_count": [],
                 "d.document_type": [],
@@ -3285,6 +3476,7 @@ class TestCollectFullMetrics:
         """FIELD_GAP_DOCS_QUERY receives both window cutoff and grace cutoff."""
         conn = FakeConnection(
             {
+                "AT TIME ZONE": [],
                 "captured_at < %s": [],
                 "AS ruling_count": [],
                 "d.document_type": [],
@@ -3480,6 +3672,7 @@ class TestPersistMetrics:
         two_hours_ago = NOW - timedelta(hours=2)
         conn = FakeConnection(
             {
+                "AT TIME ZONE": _uniform_per_day_rows("TestCounty", 210, NOW),
                 "captured_at < %s": [("TestCounty", 210)],
                 "AS ruling_count": [("TestCounty", 50)],
                 "d.document_type": [("TestCounty", "ruling", 50)],
