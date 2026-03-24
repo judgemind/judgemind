@@ -2038,8 +2038,8 @@ def test_riv_fetch_documents_uses_llm_extraction(monkeypatch: pytest.MonkeyPatch
     scraper = RiversideTentativeRulingsScraper(config=config)
 
     docs = scraper.fetch_documents()
-    # 17 PDF links, each returns 4 rulings from LLM
-    assert len(docs) == 17 * 4
+    # 16 PDF links (1 of 17 skipped by link pattern), each returns 4 rulings from LLM
+    assert len(docs) == 16 * 4
 
     # Check that per-ruling fields come from LLM output
     batch = docs[:4]
@@ -2074,8 +2074,8 @@ def test_riv_fetch_documents_falls_back_to_regex_on_llm_failure() -> None:
     scraper = RiversideTentativeRulingsScraper(config=config)
 
     docs = scraper.fetch_documents()
-    # Regex fallback produces 4 rulings per PDF, 17 PDFs total
-    assert len(docs) == 17 * 4
+    # Regex fallback produces 4 rulings per PDF, 16 PDFs total (1 skipped by link pattern)
+    assert len(docs) == 16 * 4
 
     # Verify the regex extraction still works correctly
     batch = docs[:4]
@@ -2116,7 +2116,7 @@ def test_riv_fetch_documents_llm_single_ruling_not_split(
     scraper = RiversideTentativeRulingsScraper(config=config)
 
     docs = scraper.fetch_documents()
-    # Single ruling means each PDF returns 1 unsplit doc
-    assert len(docs) == 17
+    # Single ruling means each PDF returns 1 unsplit doc (16 PDFs, 1 skipped by link pattern)
+    assert len(docs) == 16
     # Should NOT have pre_split flag
     assert all(not d.extra.get("pre_split") for d in docs)
