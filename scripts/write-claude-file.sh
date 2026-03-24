@@ -34,9 +34,24 @@ fi
 DST_DIR=$(dirname "$DST")
 mkdir -p "$DST_DIR"
 
+# Check if destination file is already executable (before overwrite)
+DST_WAS_EXECUTABLE=false
+if [ -f "$DST" ] && [ -x "$DST" ]; then
+    DST_WAS_EXECUTABLE=true
+fi
+
 # Use Python to copy — this bypasses the platform's .claude/ write protection
 python3 -c "
 import shutil, sys
 shutil.copy2(sys.argv[1], sys.argv[2])
 print(f'Copied {sys.argv[1]} -> {sys.argv[2]}')
 " "$SRC" "$DST"
+
+# Restore executable permission if the destination was previously executable.
+# The Write tool (used to create source files in tmp/) does not set the execute
+# bit, so shutil.copy2 copies the source's non-executable mode. This preserves
+# the original permission to avoid spurious git mode changes (100755 -> 100644).
+if [ "$DST_WAS_EXECUTABLE" = true ]; then
+    chmod +x "$DST"
+    echo "Preserved executable permission on $DST"
+fi
