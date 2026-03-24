@@ -14,13 +14,15 @@
       "expected_daily_rulings": 0.1,
       "schedule_type": "daily",
       "posting_days": ["Mon", "Tue", "Wed", "Thu"],
-      "low_volume": true
+      "low_volume": true,
+      "min_days_zero_before_alert": 2
     },
     "San Francisco": {
       "expected_daily_rulings": 0.5,
       "schedule_type": "daily",
       "posting_days": ["Tue", "Thu"],
-      "low_volume": true
+      "low_volume": true,
+      "min_days_zero_before_alert": 2
     },
     "Riverside": {
       "expected_daily_rulings": 15,
@@ -31,6 +33,7 @@
       "expected_daily_rulings": 3,
       "schedule_type": "daily",
       "posting_days": ["Mon", "Tue", "Wed", "Thu", "Fri"],
+      "min_days_zero_before_alert": 2,
       "_note": "Lowered from 10 to 3 (#1769): court posts 1-4 new PDFs/hearing day. Spikes (20+) occur when existing PDFs are updated, not from new postings. 49 PDFs on index page spanning ~4 weeks."
     },
     "San Diego": {
