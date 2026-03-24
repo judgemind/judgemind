@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useRef } from 'react';
 import { buildDocumentContentUrl, buildDownloadUrl, cleanRulingText, cleanSummary, FORMAT_LABELS, stripMetadataHeaderHtml, type RulingMetadata } from '@/lib/display-helpers';
 import { SECTION_HEADING } from '@/lib/typography';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
@@ -61,12 +61,22 @@ export function RulingDetail({ ruling, sanitizedRulingTextHtml }: RulingProps) {
 
   const [viewerState, setViewerState] = useState<ViewerState>({ status: 'idle' });
 
+  // Ref mirrors latest viewerState so the stable callback can read current
+  // values without capturing stale closures or depending on viewerState.
+  const viewerStateRef = useRef(viewerState);
+  viewerStateRef.current = viewerState;
+
   const handleViewOriginal = useCallback(async () => {
     if (!ruling.documentId) return;
 
-    if (viewerState.status === 'loaded') {
+    if (viewerStateRef.current.status === 'loaded') {
       // Toggle off — hide the viewer
       setViewerState({ status: 'idle' });
+      return;
+    }
+
+    if (viewerStateRef.current.status === 'loading') {
+      // Already loading — ignore duplicate clicks
       return;
     }
 
@@ -88,7 +98,7 @@ export function RulingDetail({ ruling, sanitizedRulingTextHtml }: RulingProps) {
     } catch {
       setViewerState({ status: 'error', message: 'Failed to load document. Please try again.' });
     }
-  }, [ruling.documentId, viewerState.status]);
+  }, [ruling.documentId]);
 
   return (
     <div className="space-y-6">

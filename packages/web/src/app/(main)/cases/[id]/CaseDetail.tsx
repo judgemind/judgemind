@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useRef } from 'react';
 import { useQuery, gql } from '@apollo/client';
 import { ChevronDown } from 'lucide-react';
 import {
@@ -258,12 +258,22 @@ export function CaseDetail({ caseId }: { caseId: string }) {
     {},
   );
 
+  // Ref mirrors latest viewerStates so the stable callback can read current
+  // values without capturing stale closures or depending on viewerStates.
+  const viewerStatesRef = useRef(viewerStates);
+  viewerStatesRef.current = viewerStates;
+
   const handleViewOriginal = useCallback(async (rulingId: string, documentId: string) => {
-    const current = viewerStates[rulingId];
+    const current = viewerStatesRef.current[rulingId];
 
     if (current?.status === 'loaded') {
       // Toggle off — hide the viewer
       setViewerStates((prev) => ({ ...prev, [rulingId]: { status: 'idle' } }));
+      return;
+    }
+
+    if (current?.status === 'loading') {
+      // Already loading — ignore duplicate clicks
       return;
     }
 
@@ -288,7 +298,7 @@ export function CaseDetail({ caseId }: { caseId: string }) {
         [rulingId]: { status: 'error', message: 'Failed to load document. Please try again.' },
       }));
     }
-  }, [viewerStates]);
+  }, []);
 
   function toggleRuling(id: string) {
     setExpandedRulings((prev) => {
