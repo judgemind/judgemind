@@ -8,8 +8,8 @@ vi.mock('@/components/ui/skeleton', () => ({
 }));
 
 vi.mock('@/components/ui/table', () => ({
-  Table: ({ children }: { children: React.ReactNode }) => (
-    <table data-testid="table">{children}</table>
+  Table: ({ children, className }: { children: React.ReactNode; className?: string }) => (
+    <table data-testid="table" className={className}>{children}</table>
   ),
   TableHeader: ({ children }: { children: React.ReactNode }) => (
     <thead>{children}</thead>
@@ -20,8 +20,8 @@ vi.mock('@/components/ui/table', () => ({
   TableRow: ({ children }: { children: React.ReactNode }) => (
     <tr data-testid="table-row">{children}</tr>
   ),
-  TableHead: ({ children }: { children: React.ReactNode }) => (
-    <th>{children}</th>
+  TableHead: ({ children, className }: { children: React.ReactNode; className?: string }) => (
+    <th className={className}>{children}</th>
   ),
   TableCell: ({ children }: { children: React.ReactNode }) => (
     <td>{children}</td>
@@ -41,12 +41,13 @@ describe('CasesLoading', () => {
     expect(screen.getByTestId('table')).toBeInTheDocument();
   });
 
-  it('renders table headers', () => {
+  it('renders table headers for Case and Type only', () => {
     render(<CasesLoading />);
     expect(screen.getByText('Case')).toBeInTheDocument();
-    expect(screen.getByText('Court')).toBeInTheDocument();
     expect(screen.getByText('Type')).toBeInTheDocument();
-    expect(screen.getByText('Status')).toBeInTheDocument();
+    // Status and Court columns should not exist
+    expect(screen.queryByText('Court')).not.toBeInTheDocument();
+    expect(screen.queryByText('Status')).not.toBeInTheDocument();
   });
 
   it('renders 8 skeleton rows plus 1 header row', () => {

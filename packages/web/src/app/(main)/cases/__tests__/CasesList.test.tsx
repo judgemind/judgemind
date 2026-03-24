@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { render, screen, fireEvent } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 
@@ -31,6 +31,32 @@ vi.mock('next/link', () => ({
     <a href={href} {...props}>{children}</a>
   ),
 }));
+
+// IntersectionObserver mock
+let intersectionCallback: IntersectionObserverCallback;
+let mockObserve: ReturnType<typeof vi.fn>;
+let mockDisconnect: ReturnType<typeof vi.fn>;
+
+beforeEach(() => {
+  mockObserve = vi.fn();
+  mockDisconnect = vi.fn();
+
+  vi.stubGlobal(
+    'IntersectionObserver',
+    vi.fn((callback: IntersectionObserverCallback) => {
+      intersectionCallback = callback;
+      return {
+        observe: mockObserve,
+        disconnect: mockDisconnect,
+        unobserve: vi.fn(),
+      };
+    }),
+  );
+});
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+});
 
 import { CasesList } from '../CasesList';
 
@@ -65,56 +91,133 @@ describe('CasesList', () => {
     expect(screen.getByText(/No cases found/)).toBeInTheDocument();
   });
 
-  it('renders case rows with case numbers and titles', () => {
+  it('renders case rows with county prefixed to case numbers and titles', () => {
     mockUseQuery.mockReturnValue({ data: MOCK_CASES_DATA, loading: false, error: undefined, fetchMore: vi.fn() });
     render(<CasesList />);
-    expect(screen.getByText('24STCV01234')).toBeInTheDocument();
+    // County should be prefixed to case number
+    expect(screen.getByText(/Los Angeles .+ 24STCV01234/)).toBeInTheDocument();
     expect(screen.getByText('Smith v. Jones')).toBeInTheDocument();
-    expect(screen.getByText('24NNCV05678')).toBeInTheDocument();
+    expect(screen.getByText(/San Bernardino .+ 24NNCV05678/)).toBeInTheDocument();
   });
 
-  it('renders court info for each case', () => {
+  it('renders county inline with case number (not in separate column)', () => {
     mockUseQuery.mockReturnValue({ data: MOCK_CASES_DATA, loading: false, error: undefined, fetchMore: vi.fn() });
-    render(<CasesList />);
-    expect(screen.getByText(/Los Angeles/)).toBeInTheDocument();
-    expect(screen.getByText(/San Bernardino/)).toBeInTheDocument();
-  });
-
-  it('renders status badges for cases', () => {
-    mockUseQuery.mockReturnValue({ data: MOCK_CASES_DATA, loading: false, error: undefined, fetchMore: vi.fn() });
-    render(<CasesList />);
-    // With shadcn Select, option text is rendered in a portal (not visible until opened),
-    // so "Active" / "Closed" appear only in status badges
-    expect(screen.getAllByText('Active').length).toBeGreaterThanOrEqual(1);
-    expect(screen.getAllByText('Closed').length).toBeGreaterThanOrEqual(1);
+    const { container } = render(<CasesList />);
+    // Only 2 column headers: Case and Type (no Court or Status columns)
+    const headers = container.querySelectorAll('th');
+    expect(headers.length).toBe(2);
+    expect(headers[0].textContent).toBe('Case');
+    expect(headers[1].textContent).toBe('Type');
   });
 
   it('renders case links pointing to detail pages', () => {
     mockUseQuery.mockReturnValue({ data: MOCK_CASES_DATA, loading: false, error: undefined, fetchMore: vi.fn() });
     render(<CasesList />);
-    expect(screen.getByText('24STCV01234').closest('a')).toHaveAttribute('href', '/cases/case-1');
+    expect(screen.getByText(/24STCV01234/).closest('a')).toHaveAttribute('href', '/cases/case-1');
   });
 
-  it('renders Load more button when hasNextPage is true', () => {
+  it('renders sentinel element when hasNextPage is true (infinite scroll)', () => {
     mockUseQuery.mockReturnValue({ data: MOCK_CASES_DATA, loading: false, error: undefined, fetchMore: vi.fn() });
     render(<CasesList />);
-    expect(screen.getByText('Load more')).toBeInTheDocument();
+    expect(screen.getByTestId('scroll-sentinel')).toBeInTheDocument();
   });
 
-  it('calls fetchMore when Load more is clicked', () => {
-    const mockFetchMore = vi.fn();
+  it('does not render sentinel when hasNextPage is false', () => {
+    mockUseQuery.mockReturnValue({
+      data: {
+        cases: {
+          ...MOCK_CASES_DATA.cases,
+          pageInfo: { hasNextPage: false, endCursor: null },
+        },
+      },
+      loading: false,
+      error: undefined,
+      fetchMore: vi.fn(),
+    });
+    render(<CasesList />);
+    expect(screen.queryByTestId('scroll-sentinel')).not.toBeInTheDocument();
+  });
+
+  it('sets up IntersectionObserver on the sentinel element', () => {
+    mockUseQuery.mockReturnValue({ data: MOCK_CASES_DATA, loading: false, error: undefined, fetchMore: vi.fn() });
+    render(<CasesList />);
+    expect(IntersectionObserver).toHaveBeenCalledWith(
+      expect.any(Function),
+      { rootMargin: '200px' },
+    );
+    expect(mockObserve).toHaveBeenCalled();
+  });
+
+  it('calls fetchMore when sentinel becomes visible', () => {
+    const mockFetchMore = vi.fn().mockResolvedValue({});
     mockUseQuery.mockReturnValue({ data: MOCK_CASES_DATA, loading: false, error: undefined, fetchMore: mockFetchMore });
     render(<CasesList />);
-    fireEvent.click(screen.getByText('Load more'));
-    expect(mockFetchMore).toHaveBeenCalledWith(expect.objectContaining({ variables: { after: 'cursor-2' } }));
+
+    // Simulate the sentinel becoming visible
+    intersectionCallback(
+      [{ isIntersecting: true } as IntersectionObserverEntry],
+      {} as IntersectionObserver,
+    );
+
+    expect(mockFetchMore).toHaveBeenCalledWith(
+      expect.objectContaining({
+        variables: { after: 'cursor-2' },
+      }),
+    );
   });
 
-  it('renders filter inputs including shadcn Select triggers for status and type', () => {
+  it('does not call fetchMore when sentinel is not intersecting', () => {
+    const mockFetchMore = vi.fn().mockResolvedValue({});
+    mockUseQuery.mockReturnValue({ data: MOCK_CASES_DATA, loading: false, error: undefined, fetchMore: mockFetchMore });
+    render(<CasesList />);
+
+    intersectionCallback(
+      [{ isIntersecting: false } as IntersectionObserverEntry],
+      {} as IntersectionObserver,
+    );
+
+    expect(mockFetchMore).not.toHaveBeenCalled();
+  });
+
+  it('does not render sentinel while loading more results', () => {
+    mockUseQuery.mockReturnValue({ data: MOCK_CASES_DATA, loading: true, error: undefined, fetchMore: vi.fn() });
+    render(<CasesList />);
+    // Sentinel hidden during loading to prevent duplicate fetches
+    expect(screen.queryByTestId('scroll-sentinel')).not.toBeInTheDocument();
+  });
+
+  it('disconnects observer on unmount', () => {
+    mockUseQuery.mockReturnValue({ data: MOCK_CASES_DATA, loading: false, error: undefined, fetchMore: vi.fn() });
+    const { unmount } = render(<CasesList />);
+    unmount();
+    expect(mockDisconnect).toHaveBeenCalled();
+  });
+
+  it('does not render a "Load more" button (uses infinite scroll instead)', () => {
+    mockUseQuery.mockReturnValue({ data: MOCK_CASES_DATA, loading: false, error: undefined, fetchMore: vi.fn() });
+    render(<CasesList />);
+    expect(screen.queryByText('Load more')).not.toBeInTheDocument();
+  });
+
+  it('does not have a Status column', () => {
+    mockUseQuery.mockReturnValue({ data: MOCK_CASES_DATA, loading: false, error: undefined, fetchMore: vi.fn() });
+    const { container } = render(<CasesList />);
+    const headers = Array.from(container.querySelectorAll('th')).map((h) => h.textContent);
+    expect(headers).not.toContain('Status');
+  });
+
+  it('does not have a Court column', () => {
+    mockUseQuery.mockReturnValue({ data: MOCK_CASES_DATA, loading: false, error: undefined, fetchMore: vi.fn() });
+    const { container } = render(<CasesList />);
+    const headers = Array.from(container.querySelectorAll('th')).map((h) => h.textContent);
+    expect(headers).not.toContain('Court');
+  });
+
+  it('renders filter inputs with case type Select trigger', () => {
     mockUseQuery.mockReturnValue({ data: MOCK_CASES_DATA, loading: false, error: undefined, fetchMore: vi.fn() });
     render(<CasesList />);
     expect(screen.getByPlaceholderText(/Case number or title/i)).toBeInTheDocument();
     // shadcn Select renders as button triggers with aria-label
-    expect(screen.getByLabelText(/Case status/i)).toBeInTheDocument();
     expect(screen.getByLabelText(/Case type/i)).toBeInTheDocument();
   });
 
@@ -124,8 +227,6 @@ describe('CasesList', () => {
     const caseFilter = screen.getByLabelText('Case number or title');
     expect(caseFilter).toHaveAttribute('name', 'caseFilter');
     // shadcn Select triggers are buttons with aria-label
-    const statusTrigger = screen.getByLabelText('Case status');
-    expect(statusTrigger.tagName.toLowerCase()).toBe('button');
     const typeTrigger = screen.getByLabelText('Case type');
     expect(typeTrigger.tagName.toLowerCase()).toBe('button');
   });
@@ -134,15 +235,13 @@ describe('CasesList', () => {
     mockUseQuery.mockReturnValue({ data: MOCK_CASES_DATA, loading: false, error: undefined, fetchMore: vi.fn() });
     render(<CasesList />);
     fireEvent.change(screen.getByPlaceholderText(/Case number or title/i), { target: { value: '24STCV' } });
-    expect(screen.getByText('24STCV01234')).toBeInTheDocument();
-    expect(screen.queryByText('24NNCV05678')).not.toBeInTheDocument();
+    expect(screen.getByText(/24STCV01234/)).toBeInTheDocument();
+    expect(screen.queryByText(/24NNCV05678/)).not.toBeInTheDocument();
   });
 
-  it('renders shadcn Select triggers showing default placeholder text', () => {
+  it('renders shadcn Select trigger showing default placeholder text', () => {
     mockUseQuery.mockReturnValue({ data: MOCK_CASES_DATA, loading: false, error: undefined, fetchMore: vi.fn() });
     render(<CasesList />);
-    // Both triggers show "All statuses" / "All types" by default (since value is "all")
-    expect(screen.getByText('All statuses')).toBeInTheDocument();
     expect(screen.getByText('All types')).toBeInTheDocument();
   });
 
@@ -163,20 +262,6 @@ describe('CasesList', () => {
     expect(screen.getByText('Probate')).toBeInTheDocument();
   });
 
-  it('initializes status filter from URL params and passes to query', () => {
-    mockSearchParamsValue = new URLSearchParams('status=active');
-    mockUseQuery.mockReturnValue({ data: MOCK_CASES_DATA, loading: false, error: undefined, fetchMore: vi.fn() });
-    render(<CasesList />);
-    expect(mockUseQuery.mock.calls[0][1].variables.caseStatus).toBe('active');
-  });
-
-  it('updates URL when status filter is set via URL params', () => {
-    mockSearchParamsValue = new URLSearchParams('status=dismissed');
-    mockUseQuery.mockReturnValue({ data: MOCK_CASES_DATA, loading: false, error: undefined, fetchMore: vi.fn() });
-    render(<CasesList />);
-    expect(mockReplace).toHaveBeenCalledWith(expect.stringContaining('status=dismissed'));
-  });
-
   it('updates URL when case type filter is set via URL params', () => {
     mockSearchParamsValue = new URLSearchParams('caseType=family');
     mockUseQuery.mockReturnValue({ data: MOCK_CASES_DATA, loading: false, error: undefined, fetchMore: vi.fn() });
@@ -190,12 +275,6 @@ describe('CasesList', () => {
     expect(mockUseQuery.mock.calls[0][1].variables.caseType).toBeUndefined();
   });
 
-  it('does not pass caseStatus when no status filter is set', () => {
-    mockUseQuery.mockReturnValue({ data: MOCK_CASES_DATA, loading: false, error: undefined, fetchMore: vi.fn() });
-    render(<CasesList />);
-    expect(mockUseQuery.mock.calls[0][1].variables.caseStatus).toBeUndefined();
-  });
-
   it('uses shadcn Table component structure', () => {
     mockUseQuery.mockReturnValue({ data: MOCK_CASES_DATA, loading: false, error: undefined, fetchMore: vi.fn() });
     const { container } = render(<CasesList />);
@@ -204,30 +283,18 @@ describe('CasesList', () => {
     expect(container.querySelector('tbody')).toBeInTheDocument();
   });
 
-  it('uses shadcn Badge for status', () => {
+  it('uses table-fixed to prevent horizontal overflow', () => {
     mockUseQuery.mockReturnValue({ data: MOCK_CASES_DATA, loading: false, error: undefined, fetchMore: vi.fn() });
     const { container } = render(<CasesList />);
-    expect(container.querySelectorAll('.rounded-full').length).toBeGreaterThan(0);
+    const table = container.querySelector('table');
+    expect(table?.className).toContain('table-fixed');
   });
 
-  it('updates query variables when status filter is changed via user interaction', async () => {
-    const user = userEvent.setup();
+  it('wraps table in overflow-hidden container', () => {
     mockUseQuery.mockReturnValue({ data: MOCK_CASES_DATA, loading: false, error: undefined, fetchMore: vi.fn() });
-    render(<CasesList />);
-
-    // Click the status select trigger to open the dropdown
-    await user.click(screen.getByLabelText(/Case status/i));
-
-    // Click on the 'Active' option
-    const activeOption = await screen.findByRole('option', { name: 'Active' });
-    await user.click(activeOption);
-
-    // Assert query was re-run with new caseStatus variable
-    const lastCall = mockUseQuery.mock.calls[mockUseQuery.mock.calls.length - 1];
-    expect(lastCall[1].variables.caseStatus).toBe('active');
-
-    // Assert URL was updated
-    expect(mockReplace).toHaveBeenCalledWith(expect.stringContaining('status=active'));
+    const { container } = render(<CasesList />);
+    const tableWrapper = container.querySelector('table')?.closest('.overflow-hidden');
+    expect(tableWrapper).toBeInTheDocument();
   });
 
   it('updates query variables when case type filter is changed via user interaction', async () => {
@@ -248,5 +315,15 @@ describe('CasesList', () => {
 
     // Assert URL was updated
     expect(mockReplace).toHaveBeenCalledWith(expect.stringContaining('caseType=family'));
+  });
+
+  it('search placeholder shows actual ellipsis character, not unicode escape', () => {
+    mockUseQuery.mockReturnValue({ data: MOCK_CASES_DATA, loading: false, error: undefined, fetchMore: vi.fn() });
+    render(<CasesList />);
+    const input = screen.getByPlaceholderText(/Case number or title/i);
+    // The placeholder should contain the actual ellipsis character (U+2026)
+    expect(input.getAttribute('placeholder')).toContain('\u2026');
+    // And should NOT contain a literal backslash-u escape
+    expect(input.getAttribute('placeholder')).not.toContain('\\u');
   });
 });
