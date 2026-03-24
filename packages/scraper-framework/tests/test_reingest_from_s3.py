@@ -5218,3 +5218,437 @@ class TestQualityQueriesSchemaValidation:
             "The validation should catch 'parties.case_id' as invalid. "
             f"Invalid refs found: {invalid_refs}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Multimodal extraction tests (#1719)
+# ---------------------------------------------------------------------------
+
+
+class TestReparseDocumentMultimodal:
+    """Tests for ``_reparse_document_multimodal()``."""
+
+    def _make_doc_meta(
+        self,
+        doc_id: str = "test-doc-id",
+        doc_format: str = "pdf",
+    ) -> dict:
+        return {
+            "document_id": doc_id,
+            "state": "CA",
+            "county": "Orange",
+            "court_name": "Orange County Superior Court",
+            "source_url": "https://court.example.com/ruling.pdf",
+            "captured_at": datetime(2026, 3, 1, 10, 0, 0),
+            "content_hash": "abc123hash",
+            "format": doc_format,
+            "case_number": None,
+            "case_title": None,
+            "hearing_date": date(2026, 3, 5),
+            "court_id": "court-id-1",
+            "scraper_id": "ca-oc-tentatives-civil",
+            "s3_key": "docs/test.pdf",
+            "s3_bucket": "test-bucket",
+        }
+
+    def test_non_pdf_falls_back_to_text_reparse(self) -> None:
+        """Non-PDF documents should fall back to _reparse_document."""
+        doc_meta = self._make_doc_meta(doc_format="html")
+        mock_extractor = MagicMock()
+
+        with (
+            patch.object(reingest, "_reparse_document") as mock_reparse,
+            patch.object(reingest, "_load_scraper_registry"),
+        ):
+            mock_reparse.return_value = {
+                "ruling_text": "test ruling",
+                "case_number": "24STCV12345",
+                "case_title": "Smith v. Jones",
+                "case_type": None,
+                "judge_name": "Judge Smith",
+                "outcome": "granted",
+                "motion_type": "Demurrer",
+                "department": "D1",
+                "parties": [],
+                "hearing_date": date(2026, 3, 5),
+                "extraction_methods": {},
+                "llm_skipped": False,
+                "llm_outcome": "success",
+            }
+
+            results = reingest._reparse_document_multimodal(
+                b"<html>ruling</html>",
+                "ca-la-tentatives-civil",
+                doc_meta,
+                mock_extractor,
+            )
+
+        assert len(results) == 1
+        assert results[0]["case_number"] == "24STCV12345"
+        assert results[0]["ruling_index"] == 0
+        assert results[0]["is_split"] is False
+        mock_extractor.extract_from_pdf.assert_not_called()
+        mock_reparse.assert_called_once()
+
+    def test_pdf_uses_multimodal_extraction(self) -> None:
+        """PDF documents should use extract_from_pdf on the multimodal extractor."""
+        from framework.llm_schema import ExtractedRuling
+
+        doc_meta = self._make_doc_meta()
+        mock_extractor = MagicMock()
+        mock_extractor.extract_from_pdf.return_value = [
+            ExtractedRuling(
+                extracted_case_number="30-2024-01234567",
+                extracted_case_title="Smith v. Jones",
+                ruling_text="The motion is GRANTED.",
+            ),
+        ]
+
+        with patch.object(reingest, "_apply_regex_fallbacks"):
+            results = reingest._reparse_document_multimodal(
+                b"%PDF-1.4 fake pdf",
+                "ca-oc-tentatives-civil",
+                doc_meta,
+                mock_extractor,
+            )
+
+        assert len(results) == 1
+        assert results[0]["case_number"] == "30-2024-01234567"
+        assert results[0]["case_title"] == "Smith v. Jones"
+        assert results[0]["ruling_text"] == "The motion is GRANTED."
+        assert results[0]["llm_outcome"] == "multimodal_success"
+        assert results[0]["is_split"] is False
+        assert results[0]["ruling_index"] == 0
+        mock_extractor.extract_from_pdf.assert_called_once()
+
+    def test_pdf_multimodal_multiple_rulings(self) -> None:
+        """Multi-ruling PDFs should produce split documents."""
+        from framework.llm_schema import ExtractedRuling
+
+        doc_meta = self._make_doc_meta()
+        mock_extractor = MagicMock()
+        mock_extractor.extract_from_pdf.return_value = [
+            ExtractedRuling(
+                extracted_case_number="30-2024-00000001",
+                extracted_case_title="Ruling One",
+                ruling_text="First ruling text.",
+            ),
+            ExtractedRuling(
+                extracted_case_number="30-2024-00000002",
+                extracted_case_title="Ruling Two",
+                ruling_text="Second ruling text.",
+            ),
+        ]
+
+        with patch.object(reingest, "_apply_regex_fallbacks"):
+            results = reingest._reparse_document_multimodal(
+                b"%PDF-1.4 fake pdf",
+                "ca-oc-tentatives-civil",
+                doc_meta,
+                mock_extractor,
+            )
+
+        assert len(results) == 2
+        assert results[0]["case_number"] == "30-2024-00000001"
+        assert results[0]["is_split"] is True
+        assert results[0]["ruling_index"] == 0
+        assert results[1]["case_number"] == "30-2024-00000002"
+        assert results[1]["is_split"] is True
+        assert results[1]["ruling_index"] == 1
+        # Split documents should have different split_document_ids
+        assert results[0]["split_document_id"] != results[1]["split_document_id"]
+
+    def test_pdf_multimodal_failure_falls_back(self) -> None:
+        """Multimodal extraction failure should fall back to text-based."""
+        doc_meta = self._make_doc_meta()
+        mock_extractor = MagicMock()
+        mock_extractor.extract_from_pdf.side_effect = RuntimeError("API error")
+
+        with (
+            patch.object(reingest, "_reparse_document") as mock_reparse,
+            patch.object(reingest, "_load_scraper_registry"),
+        ):
+            mock_reparse.return_value = {
+                "ruling_text": "fallback text",
+                "case_number": "UNKNOWN-test-doc-id",
+                "case_title": None,
+                "case_type": None,
+                "judge_name": None,
+                "outcome": None,
+                "motion_type": None,
+                "department": None,
+                "parties": [],
+                "hearing_date": date(2026, 3, 5),
+                "extraction_methods": {},
+                "llm_skipped": False,
+                "llm_outcome": "failure",
+            }
+
+            results = reingest._reparse_document_multimodal(
+                b"%PDF-1.4 fake pdf",
+                "ca-oc-tentatives-civil",
+                doc_meta,
+                mock_extractor,
+            )
+
+        assert len(results) == 1
+        assert results[0]["llm_outcome"] == "multimodal_fallback"
+        mock_reparse.assert_called_once()
+
+    def test_pdf_multimodal_empty_results_falls_back(self) -> None:
+        """Empty multimodal results should fall back to text-based."""
+        doc_meta = self._make_doc_meta()
+        mock_extractor = MagicMock()
+        mock_extractor.extract_from_pdf.return_value = []
+
+        with (
+            patch.object(reingest, "_reparse_document") as mock_reparse,
+            patch.object(reingest, "_load_scraper_registry"),
+        ):
+            mock_reparse.return_value = {
+                "ruling_text": "fallback text",
+                "case_number": "UNKNOWN-test-doc-id",
+                "case_title": None,
+                "case_type": None,
+                "judge_name": None,
+                "outcome": None,
+                "motion_type": None,
+                "department": None,
+                "parties": [],
+                "hearing_date": date(2026, 3, 5),
+                "extraction_methods": {},
+                "llm_skipped": False,
+                "llm_outcome": "failure",
+            }
+
+            results = reingest._reparse_document_multimodal(
+                b"%PDF-1.4 fake pdf",
+                "ca-oc-tentatives-civil",
+                doc_meta,
+                mock_extractor,
+            )
+
+        assert len(results) == 1
+        assert results[0]["llm_outcome"] == "multimodal_fallback"
+
+    def test_metadata_passed_to_extractor(self) -> None:
+        """Metadata (judge_name, department, hearing_date) should be passed."""
+        from framework.llm_schema import ExtractedRuling
+
+        doc_meta = self._make_doc_meta()
+        doc_meta["judge_name"] = "Judge Williams"
+        doc_meta["department"] = "C32"
+        mock_extractor = MagicMock()
+        mock_extractor.extract_from_pdf.return_value = [
+            ExtractedRuling(
+                extracted_case_number="30-2024-01234567",
+                ruling_text="Granted.",
+            ),
+        ]
+
+        with patch.object(reingest, "_apply_regex_fallbacks"):
+            reingest._reparse_document_multimodal(
+                b"%PDF-1.4 fake pdf",
+                "ca-oc-tentatives-civil",
+                doc_meta,
+                mock_extractor,
+            )
+
+        call_kwargs = mock_extractor.extract_from_pdf.call_args
+        metadata = call_kwargs.kwargs.get("metadata") or call_kwargs[1].get("metadata")
+        assert metadata["judge_name"] == "Judge Williams"
+        assert metadata["department"] == "C32"
+        assert metadata["hearing_date"] == "2026-03-05"
+
+    def test_outcome_enum_converted_to_string(self) -> None:
+        """ExtractionOutcome enum values should be converted to strings."""
+        from framework.llm_schema import ExtractedRuling, ExtractionOutcome
+
+        doc_meta = self._make_doc_meta()
+        mock_extractor = MagicMock()
+        mock_extractor.extract_from_pdf.return_value = [
+            ExtractedRuling(
+                extracted_case_number="30-2024-01234567",
+                ruling_text="The motion is GRANTED.",
+                outcome=ExtractionOutcome.GRANTED,
+            ),
+        ]
+
+        with patch.object(reingest, "_apply_regex_fallbacks"):
+            results = reingest._reparse_document_multimodal(
+                b"%PDF-1.4 fake pdf",
+                "ca-oc-tentatives-civil",
+                doc_meta,
+                mock_extractor,
+            )
+
+        assert results[0]["outcome"] == "granted"
+
+    def test_regex_fallbacks_applied(self) -> None:
+        """Regex fallbacks should fill missing fields from ruling text."""
+        from framework.llm_schema import ExtractedRuling
+
+        doc_meta = self._make_doc_meta()
+        mock_extractor = MagicMock()
+        mock_extractor.extract_from_pdf.return_value = [
+            ExtractedRuling(
+                extracted_case_number="30-2024-01234567",
+                ruling_text="MOTION TO COMPEL is GRANTED. Judge Wilson presiding.",
+            ),
+        ]
+
+        with patch.object(reingest, "_apply_regex_fallbacks") as mock_fallback:
+            reingest._reparse_document_multimodal(
+                b"%PDF-1.4 fake pdf",
+                "ca-oc-tentatives-civil",
+                doc_meta,
+                mock_extractor,
+            )
+
+        mock_fallback.assert_called_once()
+        call_args = mock_fallback.call_args
+        assert call_args[0][0]["ruling_text"] == (
+            "MOTION TO COMPEL is GRANTED. Judge Wilson presiding."
+        )
+
+    def test_parties_extracted(self) -> None:
+        """Parties from ExtractedRuling should be converted to dict format."""
+        from framework.llm_schema import ExtractedParty, ExtractedRuling
+
+        doc_meta = self._make_doc_meta()
+        mock_extractor = MagicMock()
+        mock_extractor.extract_from_pdf.return_value = [
+            ExtractedRuling(
+                extracted_case_number="30-2024-01234567",
+                ruling_text="Granted.",
+                extracted_parties=[
+                    ExtractedParty(name="Smith", role="plaintiff"),
+                    ExtractedParty(name="Jones", role="defendant"),
+                ],
+            ),
+        ]
+
+        with patch.object(reingest, "_apply_regex_fallbacks"):
+            results = reingest._reparse_document_multimodal(
+                b"%PDF-1.4 fake pdf",
+                "ca-oc-tentatives-civil",
+                doc_meta,
+                mock_extractor,
+            )
+
+        assert len(results[0]["parties"]) == 2
+        assert results[0]["parties"][0] == {"name": "Smith", "role": "plaintiff"}
+        assert results[0]["parties"][1] == {"name": "Jones", "role": "defendant"}
+
+
+class TestReingestBatchMultimodal:
+    """Tests for reingest_batch with multimodal extraction enabled."""
+
+    def test_multimodal_extractor_used_for_pdf_docs(self) -> None:
+        """When multimodal_extractor is provided, it should be used for parsing."""
+        from framework.llm_schema import ExtractedRuling
+
+        row = _make_document_row(
+            scraper_id="ca-oc-tentatives-civil",
+        )
+        # Override format to pdf
+        row_list = list(row)
+        row_list[10] = "pdf"  # format column
+        row_list[11] = "CA"
+        row_list[12] = "Orange"
+        row = tuple(row_list)
+
+        conn = _mock_conn_with_rows([row])
+        s3 = _mock_s3_client(b"%PDF-1.4 fake pdf content")
+        mock_extractor = MagicMock()
+        mock_extractor.extract_from_pdf.return_value = [
+            ExtractedRuling(
+                extracted_case_number="30-2024-01234567",
+                extracted_case_title="Smith v. Jones",
+                ruling_text="The motion is GRANTED.",
+            ),
+        ]
+
+        with (
+            patch.object(reingest, "_apply_regex_fallbacks"),
+            patch.object(reingest, "upsert_case", return_value="case-id"),
+            patch.object(reingest, "resolve_judge", return_value=None),
+            patch.object(reingest, "insert_document_and_ruling"),
+            patch.object(reingest, "batch_upsert_parties"),
+        ):
+            result = reingest.reingest_batch(
+                conn,
+                s3,
+                25,
+                (reingest._CURSOR_MIN_TIMESTAMP, reingest._CURSOR_MIN_UUID),
+                "",
+                [],
+                multimodal_extractor=mock_extractor,
+            )
+
+        assert result["processed"] == 1
+        mock_extractor.extract_from_pdf.assert_called_once()
+
+    def test_multimodal_flag_not_present_uses_standard_path(self) -> None:
+        """Without multimodal_extractor, standard text parsing should be used."""
+        row = _make_document_row()
+        conn = _mock_conn_with_rows([row])
+        s3 = _mock_s3_client()
+
+        with (
+            patch.object(reingest, "_reparse_document") as mock_reparse,
+            patch.object(reingest, "_load_scraper_registry"),
+            patch.object(reingest, "upsert_case", return_value="case-id"),
+            patch.object(reingest, "resolve_judge", return_value=None),
+            patch.object(reingest, "insert_document_and_ruling"),
+            patch.object(reingest, "batch_upsert_parties"),
+        ):
+            mock_reparse.return_value = {
+                "ruling_text": "test",
+                "case_number": "24STCV12345",
+                "case_title": "Smith v. Jones",
+                "case_type": None,
+                "judge_name": None,
+                "outcome": None,
+                "motion_type": None,
+                "department": None,
+                "parties": [],
+                "hearing_date": date(2026, 3, 5),
+                "extraction_methods": {},
+                "llm_skipped": False,
+                "llm_outcome": "not_attempted",
+            }
+            result = reingest.reingest_batch(
+                conn,
+                s3,
+                25,
+                (reingest._CURSOR_MIN_TIMESTAMP, reingest._CURSOR_MIN_UUID),
+                "",
+                [],
+            )
+
+        assert result["processed"] == 1
+        mock_reparse.assert_called_once()
+
+
+class TestCLIMultimodalFlag:
+    """Verify --multimodal CLI flag is parsed correctly."""
+
+    def test_multimodal_flag_parsed(self) -> None:
+        """--multimodal should set args.multimodal to True."""
+        import argparse
+
+        # Build a minimal parser with just the flag
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--multimodal", action="store_true")
+        args = parser.parse_args(["--multimodal"])
+        assert args.multimodal is True
+
+    def test_multimodal_flag_default_false(self) -> None:
+        """Without --multimodal, args.multimodal should be False."""
+        import argparse
+
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--multimodal", action="store_true")
+        args = parser.parse_args([])
+        assert args.multimodal is False

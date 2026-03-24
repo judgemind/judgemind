@@ -43,6 +43,11 @@ Options:
                         Creates individual ruling records for each ruling in
                         a multi-ruling PDF and supersedes the original unsplit
                         document. Uses deterministic IDs for idempotency.
+    --multimodal        Use multimodal per-page LLM extraction for PDF
+                        documents. Sends page images directly to Google
+                        Flash Lite, bypassing pdfplumber. Produces more
+                        accurate results for OC tentative rulings.
+                        Requires GOOGLE_API_KEY environment variable.
 """
 
 from __future__ import annotations
@@ -61,15 +66,15 @@ from typing import Any
 # Ensure the scraper-framework source is importable
 sys.path.insert(
     0,
-    os.path.join(
-        os.path.dirname(__file__), "..", "packages", "scraper-framework", "src"
-    ),
+    os.path.join(os.path.dirname(__file__), "..", "packages", "scraper-framework", "src"),
 )
 
 import boto3  # noqa: E402
 import psycopg  # noqa: E402
 import structlog  # noqa: E402
 
+from framework.llm_extractor import LlmExtractor  # noqa: E402
+from framework.llm_schema import ExtractedRuling  # noqa: E402
 from framework.logging import configure_structlog  # noqa: E402
 from framework.models import CapturedDocument, ContentFormat, ScraperConfig  # noqa: E402
 from ingestion.db import (  # noqa: E402
@@ -141,9 +146,7 @@ def _load_scraper_registry() -> None:
 
     from framework.base import BaseScraper  # noqa: E402
 
-    for importer, modname, ispkg in pkgutil.walk_packages(
-        courts.__path__, prefix="courts."
-    ):
+    for importer, modname, ispkg in pkgutil.walk_packages(courts.__path__, prefix="courts."):
         if ispkg:
             continue
         try:
@@ -182,9 +185,7 @@ def _load_scraper_registry() -> None:
             if split_fn is not None and callable(split_fn):
                 _SPLIT_REGISTRY[config.scraper_id] = split_fn
         except Exception:
-            logger.warning(
-                "default_config() failed, skipping", module=modname, exc_info=True
-            )
+            logger.warning("default_config() failed, skipping", module=modname, exc_info=True)
 
 
 # Valid ruling_outcome PostgreSQL enum values.  Raw outcomes from scraper
@@ -541,9 +542,9 @@ def _reparse_document(
     _load_scraper_registry()
 
     doc_format = doc_meta.get("format", "html")
-    text = _extract_text_from_content(
-        raw_content, doc_format, pdf_timeout=pdf_timeout
-    ).replace("\x00", "")
+    text = _extract_text_from_content(raw_content, doc_format, pdf_timeout=pdf_timeout).replace(
+        "\x00", ""
+    )
     extracted: dict = {
         "ruling_text": text,
         "case_number": doc_meta.get("case_number"),
@@ -687,10 +688,7 @@ def _reparse_document(
 
                 # Apply ruling-level fields from the matched ruling
                 if ruling is not None:
-                    if (
-                        not _is_real_case_number(extracted["case_number"])
-                        and ruling.case_number
-                    ):
+                    if not _is_real_case_number(extracted["case_number"]) and ruling.case_number:
                         extracted["case_number"] = ruling.case_number
                         extraction_methods["case_number"] = "llm"
                     if not extracted["case_title"] and ruling.case_title:
@@ -895,9 +893,7 @@ def _full_reparse_document(
         split_doc_id = make_split_document_id(doc_meta["document_id"], ruling_index)
 
         extracted: dict = {
-            "ruling_text": ruling.ruling_text.replace("\x00", "")
-            if ruling.ruling_text
-            else "",
+            "ruling_text": ruling.ruling_text.replace("\x00", "") if ruling.ruling_text else "",
             "case_number": ruling.case_number or doc_meta.get("case_number"),
             "case_title": ruling.case_title or doc_meta.get("case_title"),
             "case_type": doc_meta.get("case_type"),
@@ -930,11 +926,204 @@ def _full_reparse_document(
         # Regex fallback — fill any fields still missing after split (#1749)
         # Uses the shared helper to stay in sync with _reparse_document().
         # ------------------------------------------------------------------
-        _apply_regex_fallbacks(
-            extracted, extracted["ruling_text"], scraper_id=scraper_id
-        )
+        _apply_regex_fallbacks(extracted, extracted["ruling_text"], scraper_id=scraper_id)
 
         results.append(extracted)
+
+    return results
+
+
+def _reparse_document_multimodal(
+    raw_content: bytes,
+    scraper_id: str,
+    doc_meta: dict,
+    multimodal_extractor: LlmExtractor,
+    pdf_timeout: float = 30.0,
+    llm_client: object | None = None,
+    llm_provider: str | None = None,
+    llm_model: str | None = None,
+    llm_timeout: float | None = 60.0,
+    force_llm: bool = False,
+    token_tracker: TokenTracker | None = None,
+) -> list[dict]:
+    """Re-parse a PDF document using multimodal per-page extraction.
+
+    Uses ``LlmExtractor.extract_from_pdf()`` to send page images directly
+    to a multimodal LLM, bypassing pdfplumber text extraction entirely.
+    This produces more accurate results for image-based PDFs (e.g., OC
+    tentative rulings) where pdfplumber frequently garbles text.
+
+    Falls back to ``_reparse_document()`` if the document format is not
+    PDF or if multimodal extraction returns no results.
+
+    Returns a list of extracted-field dicts (one per ruling), in the same
+    format as ``_full_reparse_document()``.
+
+    Parameters
+    ----------
+    raw_content : bytes
+        Raw document content from S3.
+    scraper_id : str
+        The scraper ID (e.g., ``"ca-oc-tentatives-civil"``).
+    doc_meta : dict
+        Document metadata from the DB query row.
+    multimodal_extractor : LlmExtractor
+        Pre-configured ``LlmExtractor`` instance (Google Flash Lite)
+        for multimodal extraction.
+    pdf_timeout : float
+        Timeout for pdfplumber subprocess (used in text fallback).
+    llm_client : object | None
+        LLM client for text-based fallback extraction.
+    llm_provider : str | None
+        LLM provider name for text-based fallback.
+    llm_model : str | None
+        LLM model name for text-based fallback.
+    llm_timeout : float | None
+        Per-call LLM timeout for text-based fallback.
+    force_llm : bool
+        Force LLM even when all fields are present (text fallback).
+    token_tracker : TokenTracker | None
+        Token tracker for cost estimation.
+    """
+    doc_format = doc_meta.get("format", "html")
+
+    # Multimodal extraction only works for PDF documents.
+    if doc_format != "pdf":
+        result = _reparse_document(
+            raw_content,
+            scraper_id,
+            doc_meta,
+            pdf_timeout=pdf_timeout,
+            llm_client=llm_client,
+            llm_provider=llm_provider,
+            llm_model=llm_model,
+            llm_timeout=llm_timeout,
+            force_llm=force_llm,
+            token_tracker=token_tracker,
+        )
+        result["ruling_index"] = 0
+        result["split_document_id"] = doc_meta["document_id"]
+        result["is_split"] = False
+        return [result]
+
+    # Build metadata for multimodal extraction (judge_name, department,
+    # hearing_date from the scraper/DB).
+    metadata: dict[str, str] = {}
+    if doc_meta.get("judge_name"):
+        metadata["judge_name"] = str(doc_meta["judge_name"])
+    if doc_meta.get("department"):
+        metadata["department"] = str(doc_meta["department"])
+    if doc_meta.get("hearing_date"):
+        metadata["hearing_date"] = str(doc_meta["hearing_date"])
+
+    # Try multimodal extraction.
+    extracted_rulings: list[ExtractedRuling] = []
+    try:
+        extracted_rulings = multimodal_extractor.extract_from_pdf(
+            raw_content, metadata=metadata or None
+        )
+    except Exception:
+        logger.warning(
+            "Multimodal extraction failed, falling back to text-based",
+            document_id=doc_meta["document_id"],
+            exc_info=True,
+        )
+
+    if not extracted_rulings:
+        # Multimodal extraction returned nothing — fall back to text-based.
+        logger.info(
+            "Multimodal extraction returned no rulings, falling back",
+            document_id=doc_meta["document_id"],
+        )
+        result = _reparse_document(
+            raw_content,
+            scraper_id,
+            doc_meta,
+            pdf_timeout=pdf_timeout,
+            llm_client=llm_client,
+            llm_provider=llm_provider,
+            llm_model=llm_model,
+            llm_timeout=llm_timeout,
+            force_llm=force_llm,
+            token_tracker=token_tracker,
+        )
+        result["ruling_index"] = 0
+        result["split_document_id"] = doc_meta["document_id"]
+        result["is_split"] = False
+        result["llm_outcome"] = "multimodal_fallback"
+        return [result]
+
+    # Convert ExtractedRuling objects to the dict format used by reingest.
+    content_hash = doc_meta.get("content_hash", "")
+    if not content_hash:
+        content_hash = hashlib.sha256(raw_content).hexdigest()
+
+    is_multi = len(extracted_rulings) > 1
+    results: list[dict] = []
+
+    for idx, ruling in enumerate(extracted_rulings):
+        # Map outcome enum to string value.
+        outcome_str: str | None = None
+        if ruling.outcome is not None:
+            outcome_str = ruling.outcome.value
+
+        # Build parties list.
+        parties_data: list[dict[str, str]] = []
+        for party in ruling.extracted_parties:
+            parties_data.append({"name": party.name, "role": party.role})
+
+        # Parse hearing_date from string to date if present.
+        hearing_date_val = doc_meta.get("hearing_date")
+        if ruling.hearing_date:
+            try:
+                hearing_date_val = date.fromisoformat(ruling.hearing_date)
+            except (ValueError, TypeError):
+                pass
+
+        # Determine document ID for this ruling.
+        if is_multi:
+            split_doc_id = make_split_document_id(doc_meta["document_id"], idx)
+        else:
+            split_doc_id = doc_meta["document_id"]
+
+        extracted: dict = {
+            "ruling_text": ruling.ruling_text or "",
+            "case_number": (
+                ruling.extracted_case_number
+                or doc_meta.get("case_number")
+                or f"UNKNOWN-{split_doc_id}"
+            ),
+            "case_title": ruling.extracted_case_title or doc_meta.get("case_title"),
+            "case_type": ruling.case_type.value if ruling.case_type else None,
+            "judge_name": ruling.extracted_judge_name,
+            "outcome": outcome_str,
+            "motion_type": ruling.motion_type,
+            "department": ruling.department,
+            "parties": parties_data,
+            "hearing_date": hearing_date_val,
+            "extraction_methods": {"_all": "multimodal"},
+            "llm_skipped": False,
+            "llm_outcome": "multimodal_success",
+            "ruling_index": idx,
+            "split_document_id": split_doc_id,
+            "is_split": is_multi,
+        }
+
+        # Apply regex fallbacks for any fields still missing.
+        # The multimodal pipeline extracts ruling_text, case_number,
+        # and case_title from page images.  Other fields (judge_name,
+        # outcome, motion_type) may still be missing and can be filled
+        # by regex extraction from the ruling text.
+        if extracted["ruling_text"]:
+            _apply_regex_fallbacks(extracted, extracted["ruling_text"], scraper_id=scraper_id)
+
+        results.append(extracted)
+
+    logger.info(
+        "Multimodal extraction completed",
+        document_id=doc_meta["document_id"],
+        ruling_count=len(results),
+    )
 
     return results
 
@@ -992,6 +1181,7 @@ def reingest_batch(
     running_updated: int = 0,
     batch_number: int = 0,
     token_tracker: TokenTracker | None = None,
+    multimodal_extractor: LlmExtractor | None = None,
 ) -> dict[str, Any]:
     """Process one batch. Returns a dict of batch stats.
 
@@ -1112,9 +1302,7 @@ def reingest_batch(
         next_cursor = (captured_at, doc_id_str)
 
         if not s3_key or not s3_bucket:
-            logger.warning(
-                "Document has no S3 key/bucket, skipping", document_id=doc_id_str
-            )
+            logger.warning("Document has no S3 key/bucket, skipping", document_id=doc_id_str)
             skipped += 1
             continue
 
@@ -1179,24 +1367,45 @@ def reingest_batch(
     # (one per split ruling).  parsed_docs stores (doc_meta, [extracted, ...]).
     parsed_docs: list[tuple[dict, list[dict]]] = []
 
-    parse_fn = _full_reparse_document if full_reparse else _reparse_document
+    if multimodal_extractor is not None:
+        parse_fn = _reparse_document_multimodal
+    elif full_reparse:
+        parse_fn = _full_reparse_document
+    else:
+        parse_fn = _reparse_document
 
     with ThreadPoolExecutor(max_workers=parse_workers) as pool:
         parse_futures = {}
         for idx, doc_meta, raw_content in parseable:
-            future = pool.submit(
-                parse_fn,
-                raw_content,
-                doc_meta["scraper_id"],
-                doc_meta,
-                parse_timeout,
-                llm_client,
-                llm_provider,
-                llm_model,
-                llm_timeout,
-                force_llm,
-                token_tracker,
-            )
+            if multimodal_extractor is not None:
+                future = pool.submit(
+                    parse_fn,
+                    raw_content,
+                    doc_meta["scraper_id"],
+                    doc_meta,
+                    multimodal_extractor,
+                    parse_timeout,
+                    llm_client,
+                    llm_provider,
+                    llm_model,
+                    llm_timeout,
+                    force_llm,
+                    token_tracker,
+                )
+            else:
+                future = pool.submit(
+                    parse_fn,
+                    raw_content,
+                    doc_meta["scraper_id"],
+                    doc_meta,
+                    parse_timeout,
+                    llm_client,
+                    llm_provider,
+                    llm_model,
+                    llm_timeout,
+                    force_llm,
+                    token_tracker,
+                )
             parse_futures[future] = (idx, doc_meta)
 
         for doc_index, future in enumerate(as_completed(parse_futures)):
@@ -1304,9 +1513,7 @@ def reingest_batch(
                         case_type=extracted.get("case_type"),
                     )
 
-                    effective_hearing = (
-                        extracted["hearing_date"] or doc_meta["hearing_date"]
-                    )
+                    effective_hearing = extracted["hearing_date"] or doc_meta["hearing_date"]
 
                     # For split documents, generate a synthetic content hash
                     # by incorporating the ruling index.  All split children
@@ -1324,9 +1531,7 @@ def reingest_batch(
                     # Resolve judge
                     judge_id = None
                     if extracted["judge_name"]:
-                        judge_id = resolve_judge(
-                            conn, extracted["judge_name"], court_id_str
-                        )
+                        judge_id = resolve_judge(conn, extracted["judge_name"], court_id_str)
 
                     # Truncate excessively long ruling text
                     ruling_text = extracted["ruling_text"]
@@ -1358,14 +1563,10 @@ def reingest_batch(
                     )
 
                     if judge_id:
-                        upsert_case_judge(
-                            conn, new_case_id, judge_id, effective_hearing
-                        )
+                        upsert_case_judge(conn, new_case_id, judge_id, effective_hearing)
 
                     # Parties
-                    batch_upsert_parties(
-                        conn, new_case_id, extracted.get("parties", [])
-                    )
+                    batch_upsert_parties(conn, new_case_id, extracted.get("parties", []))
 
                 # If the document was split, supersede the original
                 if any_split:
@@ -1519,6 +1720,7 @@ def run_reingest(
     case_title_regex: str | None = None,
     null_motion_type: bool = False,
     report_metrics: bool = False,
+    multimodal: bool = False,
 ) -> dict[str, Any]:
     """Run the full reingest. Returns summary stats including cost."""
     filters, filter_params = _build_filters(
@@ -1550,6 +1752,22 @@ def run_reingest(
     else:
         reason = "--no-llm flag" if no_llm else "no API key for configured provider"
         logger.info("LLM extraction disabled, using regex-only mode", reason=reason)
+
+    # Create multimodal extractor for per-page PDF extraction (#1719).
+    multimodal_extractor: LlmExtractor | None = None
+    if multimodal:
+        try:
+            multimodal_extractor = LlmExtractor(provider="google")
+            logger.info(
+                "Multimodal extraction enabled (Google Flash Lite)",
+                model=multimodal_extractor._model,
+            )
+        except Exception:
+            logger.error(
+                "Failed to initialize multimodal LlmExtractor — GOOGLE_API_KEY may be missing",
+                exc_info=True,
+            )
+            sys.exit(1)
 
     # Token tracking for cost estimation.
     tracker = TokenTracker()
@@ -1610,6 +1828,7 @@ def run_reingest(
                 running_updated=total_updated,
                 batch_number=total_batches,
                 token_tracker=tracker,
+                multimodal_extractor=multimodal_extractor,
             )
             processed = batch_result["processed"]
             updated = batch_result["updated"]
@@ -1654,8 +1873,7 @@ def run_reingest(
             logger.info("quality_metrics_after", **after_metrics)
         if before_metrics is not None and after_metrics is not None:
             metrics_delta = {
-                k: after_metrics.get(k, 0) - before_metrics.get(k, 0)
-                for k in before_metrics
+                k: after_metrics.get(k, 0) - before_metrics.get(k, 0) for k in before_metrics
             }
             logger.info("quality_metrics_delta", **metrics_delta)
 
@@ -1704,24 +1922,12 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Re-ingest documents from S3 with improved extraction.",
     )
-    parser.add_argument(
-        "--county", type=str, default=None, help="Scope to this county."
-    )
-    parser.add_argument(
-        "--date-from", type=str, default=None, help="YYYY-MM-DD start date."
-    )
-    parser.add_argument(
-        "--date-to", type=str, default=None, help="YYYY-MM-DD end date."
-    )
-    parser.add_argument(
-        "--dry-run", action="store_true", help="Parse but don't update DB."
-    )
-    parser.add_argument(
-        "--batch-size", type=int, default=25, help="Batch size (default: 25)."
-    )
-    parser.add_argument(
-        "--limit", type=int, default=None, help="Max documents to process."
-    )
+    parser.add_argument("--county", type=str, default=None, help="Scope to this county.")
+    parser.add_argument("--date-from", type=str, default=None, help="YYYY-MM-DD start date.")
+    parser.add_argument("--date-to", type=str, default=None, help="YYYY-MM-DD end date.")
+    parser.add_argument("--dry-run", action="store_true", help="Parse but don't update DB.")
+    parser.add_argument("--batch-size", type=int, default=25, help="Batch size (default: 25).")
+    parser.add_argument("--limit", type=int, default=None, help="Max documents to process.")
     parser.add_argument(
         "--concurrency",
         type=int,
@@ -1796,6 +2002,17 @@ def main() -> None:
             "short/long ruling text, and total ruling counts."
         ),
     )
+    parser.add_argument(
+        "--multimodal",
+        action="store_true",
+        help=(
+            "Use multimodal per-page LLM extraction for PDF documents. "
+            "Sends page images directly to a multimodal LLM (Google Flash "
+            "Lite), bypassing pdfplumber text extraction. Produces more "
+            "accurate results for image-based PDFs like OC tentative "
+            "rulings. Requires GOOGLE_API_KEY environment variable."
+        ),
+    )
     args = parser.parse_args()
 
     dsn = os.environ.get("DATABASE_URL")
@@ -1824,6 +2041,7 @@ def main() -> None:
         case_title_regex=args.case_title_regex,
         null_motion_type=args.null_motion_type,
         report_metrics=args.report_metrics,
+        multimodal=args.multimodal,
     )
 
     logger.info(
