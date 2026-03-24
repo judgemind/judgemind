@@ -212,6 +212,25 @@ _MOTION_TYPE_PATTERNS: list[tuple[re.Pattern[str], str]] = [
         re.compile(r"\bmotion\s+for\s+new\s+trial\b", re.IGNORECASE),
         "motion_for_new_trial",
     ),
+    # --- New patterns added for issue #1783 ---
+    (
+        re.compile(
+            r"\bmotion\s+for\s+judgment\s+on\s+the\s+pleadings\b",
+            re.IGNORECASE,
+        ),
+        "motion_for_judgment_on_the_pleadings",
+    ),
+    (
+        re.compile(
+            r"\bmotion\s+to\s+deem\b.*\badmissions?\s+admitted\b",
+            re.IGNORECASE,
+        ),
+        "deem_admissions_admitted",
+    ),
+    (
+        re.compile(r"\bmotion\s+to\s+deem\s+requests?\b", re.IGNORECASE),
+        "deem_admissions_admitted",
+    ),
     # Broad ex parte fallback — must come after specific ex_parte_application/motion
     (
         re.compile(r"\bex\s+parte\b", re.IGNORECASE),
@@ -248,15 +267,76 @@ def extract_motion_type(ruling_text: str) -> str | None:
 _KNOWN_MOTION_TYPES: frozenset[str] = frozenset(value for _, value in _MOTION_TYPE_PATTERNS)
 
 
+# ---------------------------------------------------------------------------
+# Prefix-less motion type patterns (#1783)
+# ---------------------------------------------------------------------------
+# Some scrapers (notably Riverside) produce motion type descriptions without
+# the "motion to/for" prefix — e.g. "Attorney's Fees" instead of "Motion for
+# Attorney's Fees", or "Compel Plaintiff's Responses" instead of "Motion to
+# Compel Plaintiff's Responses".  These patterns are used ONLY by
+# normalize_motion_type() as a fallback after the standard
+# extract_motion_type() patterns fail.  They are intentionally broader than
+# _MOTION_TYPE_PATTERNS because false positives are unlikely in scraper
+# metadata (short strings) whereas they would be problematic in full ruling
+# text.
+
+_PREFIX_LESS_PATTERNS: list[tuple[re.Pattern[str], str]] = [
+    # Order: more specific patterns before broader ones.
+    (
+        re.compile(r"\battorney['\u2018\u2019]?s?['\u2018\u2019]?\s*fees?\b", re.IGNORECASE),
+        "motion_for_attorney_fees",
+    ),
+    (re.compile(r"\bnew\s+trial\b", re.IGNORECASE), "motion_for_new_trial"),
+    (
+        re.compile(r"\bjudgment\s+on\s+the\s+pleadings\b", re.IGNORECASE),
+        "motion_for_judgment_on_the_pleadings",
+    ),
+    (
+        re.compile(r"\bdeem\b.*\badmissions?\s+admitted\b", re.IGNORECASE),
+        "deem_admissions_admitted",
+    ),
+    (re.compile(r"\bdeem\s+requests?\b", re.IGNORECASE), "deem_admissions_admitted"),
+    (
+        re.compile(r"\bterminating\s+sanctions?\b", re.IGNORECASE),
+        "motion_for_sanctions",
+    ),
+    (re.compile(r"\bterminating\b", re.IGNORECASE), "motion_for_sanctions"),
+    (
+        re.compile(r"\bmonetary\s+sanctions?\b", re.IGNORECASE),
+        "motion_for_sanctions",
+    ),
+    (re.compile(r"\bcompel\b", re.IGNORECASE), "motion_to_compel"),
+    (
+        re.compile(r"\bproduction\s+of\s+documents?\b", re.IGNORECASE),
+        "motion_to_compel",
+    ),
+    (re.compile(r"\bprotective\s+order\b", re.IGNORECASE), "motion_for_protective_order"),
+    (re.compile(r"\brelief\s+from\s+default\b", re.IGNORECASE), "motion_to_set_aside_default"),
+    (re.compile(r"\bleave\s+to\s+amend\b", re.IGNORECASE), "motion_for_leave_to_amend"),
+    (re.compile(r"\bstrike\b", re.IGNORECASE), "motion_to_strike"),
+    (re.compile(r"\bquash\b", re.IGNORECASE), "motion_to_quash"),
+    (re.compile(r"\breconsideration\b", re.IGNORECASE), "motion_for_reconsideration"),
+    (re.compile(r"\bpro\s+hac\s+vice\b", re.IGNORECASE), "motion_pro_hac_vice"),
+    (re.compile(r"\btax\s+costs\b", re.IGNORECASE), "motion_to_tax_costs"),
+    (re.compile(r"\bvacate\b", re.IGNORECASE), "motion_to_vacate"),
+    # Broad sanctions fallback — must come after more specific standalone patterns
+    # to avoid shadowing "strike", "compel", "quash", etc. when the input
+    # contains multiple keywords (e.g. "Strike and Sanctions").
+    (re.compile(r"\bsanctions?\b", re.IGNORECASE), "motion_for_sanctions"),
+]
+
+
 def normalize_motion_type(motion_type: str) -> str | None:
     """Normalize a motion type string to its canonical snake_case form.
 
     Scrapers may produce motion types in various formats — title case
     (e.g. ``"Motion to Compel"``), calendar event names
     (e.g. ``"Motion Hearing"``), or composite types
-    (e.g. ``"Demurrer/Motion to Strike"``).  This function converts any
-    such value to the canonical snake_case form used by the enrichment
-    pipeline and ``_MOTION_TYPE_CASE_TYPE_MAP``.
+    (e.g. ``"Demurrer/Motion to Strike"``).  Some scrapers (notably
+    Riverside) also produce prefix-less descriptions like
+    ``"Attorney's Fees"`` or ``"Compel Plaintiff's Responses"``.  This
+    function converts any such value to the canonical snake_case form
+    used by the enrichment pipeline and ``_MOTION_TYPE_CASE_TYPE_MAP``.
 
     Parameters
     ----------
@@ -289,6 +369,13 @@ def normalize_motion_type(motion_type: str) -> str | None:
     matched = extract_motion_type(stripped)
     if matched is not None:
         return matched
+
+    # Try prefix-less patterns (#1783).  These are broader patterns that
+    # handle scraper metadata missing the "motion to/for" prefix — e.g.
+    # "Attorney's Fees", "Compel Plaintiff's Responses", "New Trial".
+    for pattern, value in _PREFIX_LESS_PATTERNS:
+        if pattern.search(stripped):
+            return value
 
     # No known mapping — return None so the caller can fall back to
     # ruling text extraction.
@@ -581,6 +668,8 @@ _MOTION_TYPE_CASE_TYPE_MAP: dict[str, str] = {
     "motion_for_new_trial": "civil",
     "motion_for_reconsideration": "civil",
     "motion_to_quash": "civil",
+    "motion_for_judgment_on_the_pleadings": "civil",
+    "deem_admissions_admitted": "civil",
     "class_action_settlement": "civil",
     "writ_of_possession": "civil",
     "mil": "civil",
