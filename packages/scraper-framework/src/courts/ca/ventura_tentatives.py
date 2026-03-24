@@ -37,6 +37,7 @@ import re
 import time
 from datetime import datetime
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import httpx
 import structlog
@@ -259,7 +260,9 @@ class VenturaTentativeRulingsScraper(BaseScraper):
 
         docs: list[CapturedDocument] = []
 
-        search_dates = self._search_dates or [datetime.now()]
+        search_dates = self._search_dates or [
+            datetime.now(ZoneInfo("America/Los_Angeles")).replace(tzinfo=None)
+        ]
 
         with httpx.Client(
             timeout=self.config.request_timeout_seconds,
