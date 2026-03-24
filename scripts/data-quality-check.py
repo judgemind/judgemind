@@ -192,11 +192,12 @@ LATEST_SCRAPER_RUN_QUERY = """
                ROW_NUMBER() OVER(PARTITION BY sr.scraper_id ORDER BY sr.started_at DESC) AS rn
         FROM scraper_runs sr
         JOIN courts ct ON ct.id = sr.court_id
+        WHERE 1=1
+        {county_filter}
     )
     SELECT scraper_id, county, started_at, status
     FROM ranked_runs
     WHERE rn = 1
-    {county_filter}
 """
 
 LATEST_CAPTURE_PER_COUNTY_QUERY = """
