@@ -14,13 +14,7 @@ resource "aws_s3_bucket" "document_archive" {
   # Set to true for production; cannot be changed after creation.
   object_lock_enabled = var.enable_object_lock
 
-  tags = merge(
-    {
-      project     = "judgemind"
-      environment = var.environment
-    },
-    var.tags,
-  )
+  tags = var.tags
 }
 
 # Block all public access — court documents are served through the API, never
