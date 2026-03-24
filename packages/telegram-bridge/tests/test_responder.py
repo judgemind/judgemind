@@ -3380,6 +3380,300 @@ class TestDownloadTelegramFile:
         assert result.endswith(".ogg")
 
 
+# ── Agent worktree liveness tracking (#1857) ───────────────────────────
+
+
+class TestReadAgentStatusFilesIncludesAgentNames:
+    """read_agent_status_files() reads both worker-*.txt and agent-*.txt."""
+
+    def test_reads_agent_status_files(self, tmp_path: Path) -> None:
+        status_dir = tmp_path / "agent-status"
+        status_dir.mkdir()
+        (status_dir / "agent-ab9ac63f.txt").write_text(
+            "issue: #1857\nphase: ci-watch\nupdated: 2026-03-10T19:00:00Z\nsummary: Watching CI\n"
+        )
+        mod = _import_responder()
+        statuses = mod.read_agent_status_files(str(status_dir))
+        assert len(statuses) == 1
+        assert statuses[0]["worker"] == "agent-ab9ac63f"
+        assert statuses[0]["issue"] == "#1857"
+
+    def test_reads_both_worker_and_agent_files(self, tmp_path: Path) -> None:
+        status_dir = tmp_path / "agent-status"
+        status_dir.mkdir()
+        (status_dir / "worker-2.txt").write_text(
+            "issue: #42\nphase: implementing\nupdated: 2026-03-10T19:00:00Z\n"
+        )
+        (status_dir / "agent-abc12345.txt").write_text(
+            "issue: #99\nphase: ci-watch\nupdated: 2026-03-10T19:05:00Z\n"
+        )
+        mod = _import_responder()
+        statuses = mod.read_agent_status_files(str(status_dir))
+        assert len(statuses) == 2
+        workers = {s["worker"] for s in statuses}
+        assert "worker-2" in workers
+        assert "agent-abc12345" in workers
+
+
+class TestListActiveWorktrees:
+    """list_active_worktrees() returns directory names for both naming styles."""
+
+    def test_finds_worker_worktrees(self, tmp_path: Path) -> None:
+        (tmp_path / "worktrees" / "worker-1").mkdir(parents=True)
+        (tmp_path / "worktrees" / "worker-3").mkdir(parents=True)
+        mod = _import_responder()
+        names = mod.list_active_worktrees(str(tmp_path))
+        assert names == {"worker-1", "worker-3"}
+
+    def test_finds_agent_worktrees(self, tmp_path: Path) -> None:
+        (tmp_path / ".claude" / "worktrees" / "agent-ab9ac63f").mkdir(parents=True)
+        (tmp_path / ".claude" / "worktrees" / "agent-def45678").mkdir(parents=True)
+        mod = _import_responder()
+        names = mod.list_active_worktrees(str(tmp_path))
+        assert names == {"agent-ab9ac63f", "agent-def45678"}
+
+    def test_finds_both_styles(self, tmp_path: Path) -> None:
+        (tmp_path / "worktrees" / "worker-1").mkdir(parents=True)
+        (tmp_path / ".claude" / "worktrees" / "agent-ab9ac63f").mkdir(parents=True)
+        mod = _import_responder()
+        names = mod.list_active_worktrees(str(tmp_path))
+        assert names == {"worker-1", "agent-ab9ac63f"}
+
+    def test_returns_empty_when_no_worktrees(self, tmp_path: Path) -> None:
+        mod = _import_responder()
+        names = mod.list_active_worktrees(str(tmp_path))
+        assert names == set()
+
+    def test_ignores_non_worker_directories(self, tmp_path: Path) -> None:
+        (tmp_path / "worktrees" / "some-other-dir").mkdir(parents=True)
+        (tmp_path / ".claude" / "worktrees" / "not-an-agent").mkdir(parents=True)
+        mod = _import_responder()
+        names = mod.list_active_worktrees(str(tmp_path))
+        assert names == set()
+
+
+class TestFilterAgentsByWorktrees:
+    """filter_agents_by_worktrees() filters out stale agents."""
+
+    def test_keeps_agents_with_live_worktrees(self) -> None:
+        agents = [
+            {"worker_number": 1, "issue_number": 42, "phase": "ci-watch"},
+            {"worker_number": "agent-ab9ac63f", "issue_number": 99, "phase": "implementing"},
+        ]
+        live = {"worker-1", "agent-ab9ac63f"}
+        mod = _import_responder()
+        filtered = mod.filter_agents_by_worktrees(agents, live)
+        assert len(filtered) == 2
+
+    def test_removes_agents_without_worktrees(self) -> None:
+        agents = [
+            {"worker_number": 1, "issue_number": 42, "phase": "ci-watch"},
+            {"worker_number": 5, "issue_number": 99, "phase": "done"},
+            {"worker_number": "agent-ab9ac63f", "issue_number": 77, "phase": "merging"},
+        ]
+        # Only worker-1 has a live worktree
+        live = {"worker-1"}
+        mod = _import_responder()
+        filtered = mod.filter_agents_by_worktrees(agents, live)
+        assert len(filtered) == 1
+        assert filtered[0]["issue_number"] == 42
+
+    def test_returns_empty_when_no_live_worktrees(self) -> None:
+        agents = [
+            {"worker_number": 1, "issue_number": 42, "phase": "ci-watch"},
+        ]
+        mod = _import_responder()
+        filtered = mod.filter_agents_by_worktrees(agents, set())
+        assert filtered == []
+
+    def test_handles_agent_prefix_worktrees(self) -> None:
+        agents = [
+            {"worker_number": "agent-ab9ac63f", "issue_number": 99, "phase": "implementing"},
+            {"worker_number": "agent-deadbeef", "issue_number": 100, "phase": "done"},
+        ]
+        live = {"agent-ab9ac63f"}
+        mod = _import_responder()
+        filtered = mod.filter_agents_by_worktrees(agents, live)
+        assert len(filtered) == 1
+        assert filtered[0]["issue_number"] == 99
+
+
+class TestMergeWithAgentWorktreeEntries:
+    """merge_agent_status_into_dispatcher() handles agent-* entries."""
+
+    def test_adds_agent_worktree_entry(self) -> None:
+        """Agent-* entries from status files are added correctly."""
+        mod = _import_responder()
+        orch_status = {
+            "active_agents": [],
+            "updated_at": "2026-03-10T19:00:00Z",
+        }
+        agent_statuses = [
+            {
+                "worker": "agent-ab9ac63f",
+                "issue": "#1857",
+                "phase": "ci-watch",
+                "updated": "2026-03-10T19:10:00Z",
+                "summary": "Watching CI",
+            }
+        ]
+        result = mod.merge_agent_status_into_dispatcher(orch_status, agent_statuses)
+        agents = result["active_agents"]
+        assert len(agents) == 1
+        assert agents[0]["worker_number"] == "agent-ab9ac63f"
+        assert agents[0]["issue_number"] == "#1857"
+        assert agents[0]["source"] == "agent-status-file"
+
+    def test_matches_agent_entry_in_dispatcher_status(self) -> None:
+        """Existing agent-* entries in dispatcher_status can be updated."""
+        mod = _import_responder()
+        orch_status = {
+            "active_agents": [
+                {
+                    "worker_number": "agent-ab9ac63f",
+                    "issue_number": 1857,
+                    "phase": "implementing",
+                    "updated": "2026-03-10T19:00:00Z",
+                }
+            ],
+            "updated_at": "2026-03-10T19:00:00Z",
+        }
+        agent_statuses = [
+            {
+                "worker": "agent-ab9ac63f",
+                "issue": "#1857",
+                "phase": "merging",
+                "updated": "2026-03-10T19:30:00Z",
+                "summary": "Squash merging PR",
+            }
+        ]
+        result = mod.merge_agent_status_into_dispatcher(orch_status, agent_statuses)
+        agents = result["active_agents"]
+        assert len(agents) == 1
+        assert agents[0]["phase"] == "merging"
+        assert agents[0]["source"] == "agent-status-file"
+
+
+class TestDispatchMessageFiltersStaleAgents:
+    """dispatch_message filters active_agents by worktree existence."""
+
+    @respx.mock
+    @patch("tg_responder.interpret_message")
+    def test_stale_agents_without_worktrees_are_filtered(
+        self, mock_interpret: MagicMock, tmp_path: Path
+    ) -> None:
+        """Agents in dispatcher_status with no matching worktree are removed."""
+        from telegram_bridge.interpreter import InterpretedMessage
+
+        mock_interpret.return_value = InterpretedMessage(
+            reply="One agent running.",
+            actions=[],
+        )
+        respx.post("https://api.telegram.org/botfake-token/sendMessage").mock(
+            return_value=httpx.Response(200, json={"ok": True})
+        )
+
+        # Dispatcher status claims 3 agents but only 1 has a live worktree.
+        status_file = tmp_path / "status.json"
+        status_data = {
+            "active_agents": [
+                {
+                    "worker_number": "agent-ab9ac63f",
+                    "issue_number": 42,
+                    "phase": "ci-watch",
+                    "updated": "2026-03-10T19:00:00Z",
+                },
+                {
+                    "worker_number": "agent-deadbeef",
+                    "issue_number": 99,
+                    "phase": "implementing",
+                    "updated": "2026-03-10T19:00:00Z",
+                },
+                {
+                    "worker_number": "agent-cafebabe",
+                    "issue_number": 100,
+                    "phase": "merging",
+                    "updated": "2026-03-10T19:00:00Z",
+                },
+            ],
+            "paused": False,
+            "updated_at": "2026-03-10T19:00:00Z",
+        }
+        status_file.write_text(json.dumps(status_data))
+
+        # Only one worktree actually exists.
+        repo_root = tmp_path / "repo"
+        repo_root.mkdir()
+        (repo_root / ".claude" / "worktrees" / "agent-ab9ac63f").mkdir(parents=True)
+
+        mod = _import_responder()
+        mod.dispatch_message(
+            message={"text": "how many agents?", "user_id": 12345},
+            bot_token="fake-token",
+            chat_ids=[12345],
+            state_file=str(tmp_path / "state.json"),
+            status_file=str(status_file),
+            agent_status_dir=str(tmp_path / "agent-status"),
+            stop_requests_file=str(tmp_path / "stop.json"),
+            inbox_file=str(tmp_path / "inbox.json"),
+            anthropic_api_key="test-key",
+            repo_root=repo_root,
+        )
+
+        call_kwargs = mock_interpret.call_args.kwargs
+        agents = call_kwargs["orchestrator_status"]["active_agents"]
+        # Only agent-ab9ac63f should remain — the other two have no worktree.
+        assert len(agents) == 1
+        assert agents[0]["issue_number"] == 42
+
+    @respx.mock
+    @patch("tg_responder.interpret_message")
+    def test_no_filtering_when_repo_root_not_provided(
+        self, mock_interpret: MagicMock, tmp_path: Path
+    ) -> None:
+        """Without repo_root, all agents are passed through unfiltered."""
+        from telegram_bridge.interpreter import InterpretedMessage
+
+        mock_interpret.return_value = InterpretedMessage(
+            reply="Three agents running.",
+            actions=[],
+        )
+        respx.post("https://api.telegram.org/botfake-token/sendMessage").mock(
+            return_value=httpx.Response(200, json={"ok": True})
+        )
+
+        status_file = tmp_path / "status.json"
+        status_data = {
+            "active_agents": [
+                {"worker_number": "agent-abc", "issue_number": 1, "phase": "ci-watch"},
+                {"worker_number": "agent-def", "issue_number": 2, "phase": "ci-watch"},
+                {"worker_number": "agent-ghi", "issue_number": 3, "phase": "ci-watch"},
+            ],
+            "paused": False,
+            "updated_at": "2026-03-10T19:00:00Z",
+        }
+        status_file.write_text(json.dumps(status_data))
+
+        mod = _import_responder()
+        mod.dispatch_message(
+            message={"text": "how many agents?", "user_id": 12345},
+            bot_token="fake-token",
+            chat_ids=[12345],
+            state_file=str(tmp_path / "state.json"),
+            status_file=str(status_file),
+            agent_status_dir=str(tmp_path / "agent-status"),
+            stop_requests_file=str(tmp_path / "stop.json"),
+            inbox_file=str(tmp_path / "inbox.json"),
+            anthropic_api_key="test-key",
+            # No repo_root — filtering should not happen.
+        )
+
+        call_kwargs = mock_interpret.call_args.kwargs
+        agents = call_kwargs["orchestrator_status"]["active_agents"]
+        # All 3 agents should be passed through since no repo_root.
+        assert len(agents) == 3
+
+
 # ── Old daemon removed ──────────────────────────────────────────────────
 # The deprecated tg-poll-daemon.py was removed in #646. The responder
 # daemon (scripts/tg-responder.py) fully replaces it.

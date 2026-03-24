@@ -402,7 +402,7 @@ def _atomic_json_update(
 
 
 def read_agent_status_files(status_dir: str) -> list[dict[str, str]]:
-    """Read all worker-N.txt files from the agent status directory.
+    """Read all worker-N.txt and agent-*.txt files from the agent status directory.
 
     Returns a list of dicts with keys: worker, issue, phase, summary, updated.
     """
@@ -411,7 +411,9 @@ def read_agent_status_files(status_dir: str) -> list[dict[str, str]]:
         return []
 
     statuses: list[dict[str, str]] = []
-    for f in sorted(path.glob("worker-*.txt")):
+    # Read both worker-*.txt (old naming) and agent-*.txt (new naming).
+    files = sorted(set(path.glob("worker-*.txt")) | set(path.glob("agent-*.txt")))
+    for f in files:
         try:
             content = f.read_text()
             entry: dict[str, str] = {"worker": f.stem}
@@ -423,6 +425,80 @@ def read_agent_status_files(status_dir: str) -> list[dict[str, str]]:
         except OSError:
             continue
     return statuses
+
+
+def list_active_worktrees(repo_root: str) -> set[str]:
+    """List worktree directory names that actually exist on disk.
+
+    Scans both the old ``worktrees/worker-N`` and new
+    ``.claude/worktrees/agent-*`` locations.  Returns directory basenames
+    (e.g. ``{"worker-2", "agent-ab9ac63f"}``) that can be used as ground
+    truth for agent liveness.
+
+    Args:
+        repo_root: Absolute path to the repository root.
+
+    Returns:
+        A set of directory basenames for existing worktrees.
+    """
+    root = Path(repo_root)
+    names: set[str] = set()
+
+    # Old-style: worktrees/worker-N
+    old_dir = root / "worktrees"
+    if old_dir.is_dir():
+        for d in old_dir.iterdir():
+            if d.is_dir() and d.name.startswith("worker-"):
+                names.add(d.name)
+
+    # New-style: .claude/worktrees/agent-*
+    new_dir = root / ".claude" / "worktrees"
+    if new_dir.is_dir():
+        for d in new_dir.iterdir():
+            if d.is_dir() and d.name.startswith("agent-"):
+                names.add(d.name)
+
+    return names
+
+
+def filter_agents_by_worktrees(
+    active_agents: list[dict[str, Any]],
+    live_worktrees: set[str],
+) -> list[dict[str, Any]]:
+    """Filter active_agents to only those with a matching live worktree.
+
+    Uses worktree existence as ground truth for agent liveness.  An agent
+    entry is kept if its worker identifier (derived from ``worker_number``)
+    matches a directory in *live_worktrees*.
+
+    Agents added from agent-status files (``source == "agent-status-file"``)
+    are also filtered — the status file may persist after the worktree is
+    removed.
+
+    Args:
+        active_agents: The ``active_agents`` list from dispatcher status.
+        live_worktrees: Set of directory basenames from
+            :func:`list_active_worktrees`.
+
+    Returns:
+        A filtered copy of *active_agents* containing only entries with
+        matching worktrees.
+    """
+    if not live_worktrees:
+        return []
+
+    filtered: list[dict[str, Any]] = []
+    for agent in active_agents:
+        worker_num = agent.get("worker_number", "")
+        worker_str = str(worker_num)
+        # Determine the expected worktree directory name.
+        if worker_str.startswith("agent-"):
+            worktree_name = worker_str
+        else:
+            worktree_name = f"worker-{worker_str}"
+        if worktree_name in live_worktrees:
+            filtered.append(agent)
+    return filtered
 
 
 # ── Command handlers ────────────────────────────────────────────────────
@@ -1109,10 +1185,16 @@ def merge_agent_status_into_dispatcher(
     active_agents: list[dict[str, Any]] = list(result.get("active_agents", []))
 
     # Build a lookup of existing agents by worker name/number for comparison.
+    # Handles both old naming (worker-N) and new naming (agent-<hex>).
     agent_by_worker: dict[str, dict[str, Any]] = {}
     for agent in active_agents:
-        # dispatcher_status entries use "worker_number" as an int
-        worker_key = f"worker-{agent.get('worker_number', '')}"
+        worker_num = agent.get("worker_number", "")
+        worker_str = str(worker_num)
+        # Agent entries may use "agent-xxx" as worker_number directly.
+        if worker_str.startswith("agent-"):
+            worker_key = worker_str
+        else:
+            worker_key = f"worker-{worker_str}"
         agent_by_worker[worker_key] = agent
 
     for status in agent_statuses:
@@ -1134,9 +1216,14 @@ def merge_agent_status_into_dispatcher(
             phase = status.get("phase", "")
             if phase == "done":
                 continue
+            # Preserve the worker name as-is for agent-* entries.
+            if worker_name.startswith("agent-"):
+                worker_number_value: int | str = worker_name
+            else:
+                worker_number_value = worker_name.replace("worker-", "")
             active_agents.append(
                 {
-                    "worker_number": worker_name.replace("worker-", ""),
+                    "worker_number": worker_number_value,
                     "issue_number": status.get("issue", "?"),
                     "issue_title": status.get("summary", ""),
                     "phase": phase,
@@ -1272,6 +1359,19 @@ def dispatch_message(
         dispatcher_status = merge_agent_status_into_dispatcher(
             dispatcher_status, agent_statuses
         )
+
+    # Filter active_agents against actual worktree existence to prevent
+    # stale entries from inflating the agent count.  This uses directory
+    # existence as ground truth — only agents with a live worktree on
+    # disk are included.
+    if repo_root is not None:
+        live_worktrees = list_active_worktrees(str(repo_root))
+        if live_worktrees or dispatcher_status.get("active_agents"):
+            dispatcher_status = dict(dispatcher_status)
+            dispatcher_status["active_agents"] = filter_agents_by_worktrees(
+                dispatcher_status.get("active_agents", []),
+                live_worktrees,
+            )
 
     # Call the Claude interpreter.
     try:
