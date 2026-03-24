@@ -5,6 +5,7 @@ import { useQuery, gql } from '@apollo/client';
 import { useRouter, useSearchParams } from 'next/navigation';
 import Link from 'next/link';
 import { Search } from 'lucide-react';
+import { InfiniteScrollTrigger } from '@/components/InfiniteScrollTrigger';
 import { Badge } from '@/components/ui/badge';
 import { Input } from '@/components/ui/input';
 import { Skeleton } from '@/components/ui/skeleton';
@@ -111,7 +112,6 @@ export function JudgesList() {
   const edges = data?.judges.edges ?? [];
   const pageInfo = data?.judges.pageInfo;
   const fetchingMore = useRef(false);
-  const observer = useRef<IntersectionObserver | null>(null);
 
   // Client-side name filter (the API doesn't support text search on judges)
   const filteredEdges = nameFilter
@@ -138,29 +138,6 @@ export function JudgesList() {
       fetchingMore.current = false;
     });
   }, [pageInfo?.endCursor, loading, fetchMore]);
-
-  const sentinelRef = useCallback(
-    (node: HTMLDivElement | null) => {
-      if (observer.current) observer.current.disconnect();
-      if (!node) return;
-      observer.current = new IntersectionObserver(
-        (entries) => {
-          if (entries[0]?.isIntersecting) {
-            handleLoadMore();
-          }
-        },
-        { rootMargin: '200px' },
-      );
-      observer.current.observe(node);
-    },
-    [handleLoadMore],
-  );
-
-  useEffect(() => {
-    return () => {
-      if (observer.current) observer.current.disconnect();
-    };
-  }, []);
 
   return (
     <div className="space-y-6">
@@ -260,9 +237,11 @@ export function JudgesList() {
         </Table>
 
         {/* Infinite scroll sentinel */}
-        {pageInfo?.hasNextPage && !loading && (
-          <div ref={sentinelRef} data-testid="scroll-sentinel" className="h-1" />
-        )}
+        <InfiniteScrollTrigger
+          hasNextPage={pageInfo?.hasNextPage ?? false}
+          loading={loading}
+          onLoadMore={handleLoadMore}
+        />
       </div>
     </div>
   );
