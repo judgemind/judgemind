@@ -2484,6 +2484,111 @@ class TestSaveFieldBaselines:
         assert raw["field_completeness"]["Los Angeles"]["ruling"] == 99.0
         assert raw["field_completeness"]["Orange"]["ruling"] == 98.0
 
+    def test_updates_total_documents(self, tmp_path: Path) -> None:
+        """Updates total_documents for each county when totals dict provided."""
+        baselines_file = tmp_path / "baselines.json"
+        baselines_file.write_text(
+            json.dumps(
+                {
+                    "counties": {},
+                    "field_completeness": {
+                        "Los Angeles": {
+                            "total_documents": 500,
+                            "ruling": 99.0,
+                        },
+                        "Orange": {
+                            "total_documents": 100,
+                            "ruling": 98.0,
+                        },
+                    },
+                }
+            )
+        )
+        current = {"Los Angeles": {"ruling": 99.5}, "Orange": {"ruling": 97.0}}
+        totals = {"Los Angeles": 748, "Orange": 1772}
+        save_field_baselines(current, baselines_file, totals=totals)
+
+        with open(baselines_file) as f:
+            raw = json.load(f)
+        fc = raw["field_completeness"]
+        # total_documents should be overwritten (not ratcheted)
+        assert fc["Los Angeles"]["total_documents"] == 748
+        assert fc["Orange"]["total_documents"] == 1772
+        # Field percentages still ratchet up only
+        assert fc["Los Angeles"]["ruling"] == 99.5  # Updated (higher)
+        assert fc["Orange"]["ruling"] == 98.0  # Kept old (higher)
+
+    def test_total_documents_overwrites_even_when_lower(self, tmp_path: Path) -> None:
+        """total_documents is overwritten even when the new value is lower."""
+        baselines_file = tmp_path / "baselines.json"
+        baselines_file.write_text(
+            json.dumps(
+                {
+                    "counties": {},
+                    "field_completeness": {
+                        "Los Angeles": {
+                            "total_documents": 1000,
+                            "ruling": 99.0,
+                        },
+                    },
+                }
+            )
+        )
+        current = {"Los Angeles": {"ruling": 99.0}}
+        totals = {"Los Angeles": 500}
+        save_field_baselines(current, baselines_file, totals=totals)
+
+        with open(baselines_file) as f:
+            raw = json.load(f)
+        # total_documents lowered from 1000 to 500
+        assert raw["field_completeness"]["Los Angeles"]["total_documents"] == 500
+
+    def test_total_documents_adds_to_new_county(self, tmp_path: Path) -> None:
+        """total_documents is set for a new county not yet in baselines."""
+        baselines_file = tmp_path / "baselines.json"
+        baselines_file.write_text(
+            json.dumps(
+                {
+                    "counties": {},
+                    "field_completeness": {},
+                }
+            )
+        )
+        current = {"Riverside": {"ruling": 100.0}}
+        totals = {"Riverside": 358}
+        save_field_baselines(current, baselines_file, totals=totals)
+
+        with open(baselines_file) as f:
+            raw = json.load(f)
+        assert raw["field_completeness"]["Riverside"]["total_documents"] == 358
+        assert raw["field_completeness"]["Riverside"]["ruling"] == 100.0
+
+    def test_no_totals_preserves_existing_total_documents(self, tmp_path: Path) -> None:
+        """When totals is None, existing total_documents values are preserved."""
+        baselines_file = tmp_path / "baselines.json"
+        baselines_file.write_text(
+            json.dumps(
+                {
+                    "counties": {},
+                    "field_completeness": {
+                        "Los Angeles": {
+                            "total_documents": 748,
+                            "ruling": 99.0,
+                        },
+                    },
+                }
+            )
+        )
+        current = {"Los Angeles": {"ruling": 99.5}}
+        # No totals parameter — backward compatible
+        save_field_baselines(current, baselines_file)
+
+        with open(baselines_file) as f:
+            raw = json.load(f)
+        # total_documents should remain unchanged
+        assert raw["field_completeness"]["Los Angeles"]["total_documents"] == 748
+        assert raw["field_completeness"]["Los Angeles"]["ruling"] == 99.5
+
 
 class TestQueryFieldCompleteness:
     """Tests for _query_field_completeness function."""
