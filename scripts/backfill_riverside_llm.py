@@ -53,6 +53,7 @@ sys.path.insert(
 from framework.llm_extractor import LlmExtractor  # noqa: E402
 from framework.llm_schema import ExtractedRuling  # noqa: E402
 from framework.logging import configure_structlog  # noqa: E402
+from ingestion.extract import normalize_outcome  # noqa: E402
 
 configure_structlog(contextvars=True)
 logger = structlog.get_logger()
@@ -63,54 +64,6 @@ logger = structlog.get_logger()
 # ---------------------------------------------------------------------------
 
 SCRAPER_ID = "ca-riverside-tentatives-civil"
-
-# Valid ruling_outcome PostgreSQL enum values
-VALID_OUTCOMES: frozenset[str] = frozenset(
-    {
-        "granted",
-        "denied",
-        "granted_in_part",
-        "denied_in_part",
-        "moot",
-        "continued",
-        "off_calendar",
-        "submitted",
-        "other",
-    }
-)
-
-OUTCOME_ALIAS: dict[str, str] = {
-    "no tentative ruling": "other",
-    "no tentative": "other",
-    "withdrawn": "off_calendar",
-    "vacated": "off_calendar",
-    "overruled": "denied",
-    "sustained": "granted",
-}
-
-
-def normalize_outcome(raw: str | None) -> str | None:
-    """Normalize a raw outcome string to a valid ruling_outcome enum value."""
-    if not raw:
-        return None
-    lower = raw.strip().lower()
-    if lower in VALID_OUTCOMES:
-        return lower
-    if lower in OUTCOME_ALIAS:
-        return OUTCOME_ALIAS[lower]
-    for outcome in (
-        "granted_in_part",
-        "denied_in_part",
-        "granted",
-        "denied",
-        "moot",
-        "continued",
-        "off_calendar",
-        "submitted",
-    ):
-        if outcome.replace("_", " ") in lower:
-            return outcome
-    return None
 
 
 # ---------------------------------------------------------------------------

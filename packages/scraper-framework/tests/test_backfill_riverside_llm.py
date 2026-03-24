@@ -1,7 +1,7 @@
 """Tests for the Riverside LLM backfill script.
 
 Tests cover:
-  - normalize_outcome: mapping raw outcomes to valid PostgreSQL enum values
+  - normalize_outcome: verifies shared import from ingestion.extract
   - match_llm_to_db_rulings: matching LLM extractions to existing DB records
   - compute_ruling_text_hash: consistent hashing for dedup
   - run_backfill: end-to-end with mocked DB, S3, and LLM
@@ -13,12 +13,11 @@ import os
 import sys
 from unittest.mock import MagicMock, patch
 
-import pytest
-
 # Add scripts/ to sys.path so we can import the backfill module.
 _SCRIPTS_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "..", "scripts")
 sys.path.insert(0, os.path.normpath(_SCRIPTS_DIR))
 
+import backfill_riverside_llm  # noqa: E402
 from backfill_riverside_llm import (  # noqa: E402
     compute_ruling_text_hash,
     match_llm_to_db_rulings,
@@ -39,51 +38,25 @@ from framework.llm_schema import (  # noqa: E402
 
 
 class TestNormalizeOutcome:
-    """Test outcome normalization to PostgreSQL enum values."""
+    """Tests that backfill uses the shared normalize_outcome from ingestion.extract.
 
-    @pytest.mark.parametrize(
-        "raw,expected",
-        [
-            ("granted", "granted"),
-            ("Granted", "granted"),
-            ("GRANTED", "granted"),
-            ("denied", "denied"),
-            ("granted_in_part", "granted_in_part"),
-            ("denied_in_part", "denied_in_part"),
-            ("moot", "moot"),
-            ("continued", "continued"),
-            ("off_calendar", "off_calendar"),
-            ("submitted", "submitted"),
-            ("other", "other"),
-        ],
-    )
-    def test_valid_outcomes(self, raw: str, expected: str) -> None:
-        assert normalize_outcome(raw) == expected
+    Comprehensive unit tests for normalize_outcome() live in test_extract.py.
+    These tests verify the backfill module correctly imports and uses the shared
+    function (not a local copy).
+    """
 
-    @pytest.mark.parametrize(
-        "raw,expected",
-        [
-            ("overruled", "denied"),
-            ("sustained", "granted"),
-            ("no tentative ruling", "other"),
-            ("withdrawn", "off_calendar"),
-            ("vacated", "off_calendar"),
-        ],
-    )
-    def test_aliases(self, raw: str, expected: str) -> None:
-        assert normalize_outcome(raw) == expected
+    def test_backfill_uses_shared_normalize_outcome(self) -> None:
+        """backfill_riverside_llm.normalize_outcome should be the same function as
+        ingestion.extract.normalize_outcome."""
+        from ingestion.extract import normalize_outcome as shared_fn
 
-    def test_none_returns_none(self) -> None:
+        assert backfill_riverside_llm.normalize_outcome is shared_fn
+
+    def test_basic_normalization_via_backfill(self) -> None:
+        """Spot-check that the shared function works when called via the backfill module."""
+        assert normalize_outcome("Granted") == "granted"
+        assert normalize_outcome("No Tentative Ruling") == "other"
         assert normalize_outcome(None) is None
-
-    def test_empty_returns_none(self) -> None:
-        assert normalize_outcome("") is None
-
-    def test_whitespace_handling(self) -> None:
-        assert normalize_outcome("  granted  ") == "granted"
-
-    def test_partial_match(self) -> None:
-        assert normalize_outcome("The motion is granted in part") == "granted_in_part"
 
 
 # ---------------------------------------------------------------------------
