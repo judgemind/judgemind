@@ -66,7 +66,9 @@ from typing import Any
 # Ensure the scraper-framework source is importable
 sys.path.insert(
     0,
-    os.path.join(os.path.dirname(__file__), "..", "packages", "scraper-framework", "src"),
+    os.path.join(
+        os.path.dirname(__file__), "..", "packages", "scraper-framework", "src"
+    ),
 )
 
 import boto3  # noqa: E402
@@ -146,7 +148,9 @@ def _load_scraper_registry() -> None:
 
     from framework.base import BaseScraper  # noqa: E402
 
-    for importer, modname, ispkg in pkgutil.walk_packages(courts.__path__, prefix="courts."):
+    for importer, modname, ispkg in pkgutil.walk_packages(
+        courts.__path__, prefix="courts."
+    ):
         if ispkg:
             continue
         try:
@@ -185,7 +189,9 @@ def _load_scraper_registry() -> None:
             if split_fn is not None and callable(split_fn):
                 _SPLIT_REGISTRY[config.scraper_id] = split_fn
         except Exception:
-            logger.warning("default_config() failed, skipping", module=modname, exc_info=True)
+            logger.warning(
+                "default_config() failed, skipping", module=modname, exc_info=True
+            )
 
 
 # Valid ruling_outcome PostgreSQL enum values.  Raw outcomes from scraper
@@ -253,7 +259,9 @@ FETCH_DOCUMENTS_QUERY = """
         ct.state, ct.county, ct.court_name,
         c.case_number, c.case_title,
         (SELECT r.hearing_date FROM rulings r
-         WHERE r.document_id = d.id LIMIT 1) AS ruling_hearing_date
+         WHERE r.document_id = d.id LIMIT 1) AS ruling_hearing_date,
+        (SELECT r.ruling_text FROM rulings r
+         WHERE r.document_id = d.id LIMIT 1) AS stored_ruling_text
     FROM documents d
     JOIN courts ct ON ct.id = d.court_id
     LEFT JOIN cases c ON c.id = d.case_id
@@ -542,9 +550,9 @@ def _reparse_document(
     _load_scraper_registry()
 
     doc_format = doc_meta.get("format", "html")
-    text = _extract_text_from_content(raw_content, doc_format, pdf_timeout=pdf_timeout).replace(
-        "\x00", ""
-    )
+    text = _extract_text_from_content(
+        raw_content, doc_format, pdf_timeout=pdf_timeout
+    ).replace("\x00", "")
     extracted: dict = {
         "ruling_text": text,
         "case_number": doc_meta.get("case_number"),
@@ -688,7 +696,10 @@ def _reparse_document(
 
                 # Apply ruling-level fields from the matched ruling
                 if ruling is not None:
-                    if not _is_real_case_number(extracted["case_number"]) and ruling.case_number:
+                    if (
+                        not _is_real_case_number(extracted["case_number"])
+                        and ruling.case_number
+                    ):
                         extracted["case_number"] = ruling.case_number
                         extraction_methods["case_number"] = "llm"
                     if not extracted["case_title"] and ruling.case_title:
@@ -723,10 +734,26 @@ def _reparse_document(
                 )
 
     # ------------------------------------------------------------------
+    # Prefer stored ruling_text for regex extraction and DB persistence
+    # ------------------------------------------------------------------
+    # When stored_ruling_text exists (from a prior LLM transcription), it
+    # is scoped to the *individual* case's ruling (e.g. ~1K chars).  The
+    # pdfplumber ``text`` is the *full* multi-ruling PDF (e.g. 77K chars).
+    # Using the full PDF for regex extraction produces wrong matches
+    # (motion_type from a different case) and overwrites the scoped
+    # ruling_text in the DB via the ON CONFLICT upsert.  See #1848.
+    stored = doc_meta.get("stored_ruling_text")
+    if stored:
+        extracted["ruling_text"] = stored.replace("\x00", "") if stored else stored
+        regex_text = extracted["ruling_text"]
+    else:
+        regex_text = text
+
+    # ------------------------------------------------------------------
     # Regex fallback — fill any fields still missing after scraper + LLM
     # ------------------------------------------------------------------
     extracted["extraction_methods"] = extraction_methods
-    _apply_regex_fallbacks(extracted, text, scraper_id=scraper_id)
+    _apply_regex_fallbacks(extracted, regex_text, scraper_id=scraper_id)
 
     if extraction_methods:
         logger.info(
@@ -893,7 +920,9 @@ def _full_reparse_document(
         split_doc_id = make_split_document_id(doc_meta["document_id"], ruling_index)
 
         extracted: dict = {
-            "ruling_text": ruling.ruling_text.replace("\x00", "") if ruling.ruling_text else "",
+            "ruling_text": ruling.ruling_text.replace("\x00", "")
+            if ruling.ruling_text
+            else "",
             "case_number": ruling.case_number or doc_meta.get("case_number"),
             "case_title": ruling.case_title or doc_meta.get("case_title"),
             "case_type": doc_meta.get("case_type"),
@@ -926,7 +955,9 @@ def _full_reparse_document(
         # Regex fallback — fill any fields still missing after split (#1749)
         # Uses the shared helper to stay in sync with _reparse_document().
         # ------------------------------------------------------------------
-        _apply_regex_fallbacks(extracted, extracted["ruling_text"], scraper_id=scraper_id)
+        _apply_regex_fallbacks(
+            extracted, extracted["ruling_text"], scraper_id=scraper_id
+        )
 
         results.append(extracted)
 
@@ -1115,7 +1146,9 @@ def _reparse_document_multimodal(
         # outcome, motion_type) may still be missing and can be filled
         # by regex extraction from the ruling text.
         if extracted["ruling_text"]:
-            _apply_regex_fallbacks(extracted, extracted["ruling_text"], scraper_id=scraper_id)
+            _apply_regex_fallbacks(
+                extracted, extracted["ruling_text"], scraper_id=scraper_id
+            )
 
         results.append(extracted)
 
@@ -1296,13 +1329,16 @@ def reingest_batch(
             case_number,
             case_title,
             ruling_hearing_date,
+            stored_ruling_text,
         ) = row
         processed += 1
         doc_id_str = str(doc_id)
         next_cursor = (captured_at, doc_id_str)
 
         if not s3_key or not s3_bucket:
-            logger.warning("Document has no S3 key/bucket, skipping", document_id=doc_id_str)
+            logger.warning(
+                "Document has no S3 key/bucket, skipping", document_id=doc_id_str
+            )
             skipped += 1
             continue
 
@@ -1339,6 +1375,7 @@ def reingest_batch(
             "scraper_id": scraper_id,
             "s3_key": s3_key,
             "s3_bucket": s3_bucket,
+            "stored_ruling_text": stored_ruling_text,
         }
 
         parseable.append((idx, doc_meta, raw_content))
@@ -1513,7 +1550,9 @@ def reingest_batch(
                         case_type=extracted.get("case_type"),
                     )
 
-                    effective_hearing = extracted["hearing_date"] or doc_meta["hearing_date"]
+                    effective_hearing = (
+                        extracted["hearing_date"] or doc_meta["hearing_date"]
+                    )
 
                     # For split documents, generate a synthetic content hash
                     # by incorporating the ruling index.  All split children
@@ -1531,7 +1570,9 @@ def reingest_batch(
                     # Resolve judge
                     judge_id = None
                     if extracted["judge_name"]:
-                        judge_id = resolve_judge(conn, extracted["judge_name"], court_id_str)
+                        judge_id = resolve_judge(
+                            conn, extracted["judge_name"], court_id_str
+                        )
 
                     # Truncate excessively long ruling text
                     ruling_text = extracted["ruling_text"]
@@ -1563,10 +1604,14 @@ def reingest_batch(
                     )
 
                     if judge_id:
-                        upsert_case_judge(conn, new_case_id, judge_id, effective_hearing)
+                        upsert_case_judge(
+                            conn, new_case_id, judge_id, effective_hearing
+                        )
 
                     # Parties
-                    batch_upsert_parties(conn, new_case_id, extracted.get("parties", []))
+                    batch_upsert_parties(
+                        conn, new_case_id, extracted.get("parties", [])
+                    )
 
                 # If the document was split, supersede the original
                 if any_split:
@@ -1873,7 +1918,8 @@ def run_reingest(
             logger.info("quality_metrics_after", **after_metrics)
         if before_metrics is not None and after_metrics is not None:
             metrics_delta = {
-                k: after_metrics.get(k, 0) - before_metrics.get(k, 0) for k in before_metrics
+                k: after_metrics.get(k, 0) - before_metrics.get(k, 0)
+                for k in before_metrics
             }
             logger.info("quality_metrics_delta", **metrics_delta)
 
@@ -1922,12 +1968,24 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Re-ingest documents from S3 with improved extraction.",
     )
-    parser.add_argument("--county", type=str, default=None, help="Scope to this county.")
-    parser.add_argument("--date-from", type=str, default=None, help="YYYY-MM-DD start date.")
-    parser.add_argument("--date-to", type=str, default=None, help="YYYY-MM-DD end date.")
-    parser.add_argument("--dry-run", action="store_true", help="Parse but don't update DB.")
-    parser.add_argument("--batch-size", type=int, default=25, help="Batch size (default: 25).")
-    parser.add_argument("--limit", type=int, default=None, help="Max documents to process.")
+    parser.add_argument(
+        "--county", type=str, default=None, help="Scope to this county."
+    )
+    parser.add_argument(
+        "--date-from", type=str, default=None, help="YYYY-MM-DD start date."
+    )
+    parser.add_argument(
+        "--date-to", type=str, default=None, help="YYYY-MM-DD end date."
+    )
+    parser.add_argument(
+        "--dry-run", action="store_true", help="Parse but don't update DB."
+    )
+    parser.add_argument(
+        "--batch-size", type=int, default=25, help="Batch size (default: 25)."
+    )
+    parser.add_argument(
+        "--limit", type=int, default=None, help="Max documents to process."
+    )
     parser.add_argument(
         "--concurrency",
         type=int,
