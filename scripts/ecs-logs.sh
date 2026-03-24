@@ -106,20 +106,25 @@ if [[ -z "$LOG_GROUP" ]]; then
     exit 1
 fi
 
+# ─── Validate a log stream is accessible ─────────────────────────────────
+
+validate_stream() {
+    # Try to fetch 1 event from the stream to confirm it's accessible.
+    # Returns 0 if the stream is readable, 1 if stale/inaccessible.
+    local stream_name="$1"
+    aws logs get-log-events \
+        --log-group-name "$LOG_GROUP" \
+        --log-stream-name "$stream_name" \
+        --region "$REGION" \
+        --limit 1 \
+        --no-start-from-head \
+        --output json \
+        --no-cli-pager > /dev/null 2>&1
+}
+
 # ─── Find the most recent log stream ──────────────────────────────────────
 
 find_stream() {
-    local query_args=(
-        logs describe-log-streams
-        --log-group-name "$LOG_GROUP"
-        --order-by LastEventTime
-        --descending
-        --region "$REGION"
-        --output text
-        --query "logStreams[0].logStreamName"
-        --no-cli-pager
-    )
-
     if [[ -n "$TASK_FILTER" ]]; then
         # Filter streams whose name contains the task ID.
         # ECS stream names follow patterns like:
@@ -180,19 +185,46 @@ find_stream() {
 
         echo "$match"
     else
-        local stream
-        stream=$(aws "${query_args[@]}" 2>/dev/null) || {
+        # Fetch the most recent streams ordered by last event time.
+        # We request several candidates so we can fall back if the top
+        # stream is stale or inaccessible (expired retention, etc.).
+        local raw_streams
+        raw_streams=$(aws logs describe-log-streams \
+            --log-group-name "$LOG_GROUP" \
+            --order-by LastEventTime \
+            --descending \
+            --max-items 5 \
+            --region "$REGION" \
+            --output text \
+            --query "logStreams[*].logStreamName" \
+            --no-cli-pager 2>/dev/null) || {
             echo "Error: failed to list log streams for '$LOG_GROUP'" >&2
             echo "Check that the log group exists and you have AWS credentials configured." >&2
             exit 1
         }
 
-        if [[ -z "$stream" || "$stream" == "None" ]]; then
+        if [[ -z "$raw_streams" || "$raw_streams" == "None" ]]; then
             echo "Error: no log streams found in '$LOG_GROUP'" >&2
             exit 1
         fi
 
-        echo "$stream"
+        # Split tab-separated stream names and try each one until we find
+        # one that is accessible (not stale/expired).
+        local candidate
+        while IFS=$'\t' read -r candidate; do
+            # Skip empty entries
+            if [[ -z "$candidate" || "$candidate" == "None" ]]; then
+                continue
+            fi
+            if validate_stream "$candidate"; then
+                echo "$candidate"
+                return 0
+            fi
+            echo "Warning: stream '$candidate' is stale/inaccessible, trying next..." >&2
+        done < <(echo "$raw_streams" | tr '\t' '\n')
+
+        echo "Error: all recent log streams in '$LOG_GROUP' are stale or inaccessible" >&2
+        exit 1
     fi
 }
 
