@@ -27,11 +27,6 @@ resource "aws_iam_role" "scraper" {
       }
     ]
   })
-
-  tags = {
-    project     = "judgemind"
-    environment = var.environment
-  }
 }
 
 # Read/write policy: s3:PutObject + s3:GetObject on archive objects.
@@ -58,11 +53,6 @@ resource "aws_iam_policy" "scraper_s3_write" {
       }
     ]
   })
-
-  tags = {
-    project     = "judgemind"
-    environment = var.environment
-  }
 }
 
 resource "aws_iam_role_policy_attachment" "scraper_s3_write" {
@@ -75,9 +65,4 @@ resource "aws_iam_role_policy_attachment" "scraper_s3_write" {
 resource "aws_iam_instance_profile" "scraper" {
   name = "judgemind-scraper-${var.environment}"
   role = aws_iam_role.scraper.name
-
-  tags = {
-    project     = "judgemind"
-    environment = var.environment
-  }
 }

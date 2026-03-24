@@ -14,11 +14,6 @@ resource "aws_ecr_repository" "scraper" {
   image_scanning_configuration {
     scan_on_push = true
   }
-
-  tags = {
-    project     = "judgemind"
-    environment = var.environment
-  }
 }
 
 # Lifecycle policy: keep the last 10 tagged images; purge untagged images
@@ -88,11 +83,6 @@ resource "aws_ecr_repository" "api" {
 
   image_scanning_configuration {
     scan_on_push = true
-  }
-
-  tags = {
-    project     = "judgemind"
-    environment = var.environment
   }
 }
 
