@@ -415,6 +415,74 @@ def _match_ruling(
     return llm_result.rulings[0]
 
 
+def _apply_regex_fallbacks(extracted: dict, text: str) -> None:
+    """Apply the regex fallback chain to fill any fields still missing.
+
+    Mutates *extracted* in place.  Expects ``extracted["extraction_methods"]``
+    to already exist as a ``dict``.
+
+    The fallback order is:
+      1. judge_name, outcome, motion_type, case_number, case_title, hearing_date
+         — each extracted from *text* via the corresponding ``extract_*`` helper.
+      2. case_type from case-number prefix (``extract_case_type_from_number``).
+      3. case_type from motion_type (``extract_case_type_from_motion_type``).
+
+    This function is called from both ``_reparse_document()`` (single-doc path)
+    and ``_full_reparse_document()`` (split-doc path) to keep the fallback
+    chains in sync — see #1763 / #1749.
+    """
+    methods = extracted["extraction_methods"]
+
+    if not extracted["judge_name"]:
+        val = extract_judge_name(text)
+        if val:
+            extracted["judge_name"] = val
+            methods.setdefault("judge_name", "regex")
+    if not extracted["outcome"]:
+        val = extract_outcome(text)
+        if val:
+            extracted["outcome"] = val
+            methods.setdefault("outcome", "regex")
+    if not extracted["motion_type"]:
+        val = extract_motion_type(text)
+        if val:
+            extracted["motion_type"] = val
+            methods.setdefault("motion_type", "regex")
+    if not extracted["case_number"]:
+        val = extract_case_number(text)
+        if val:
+            extracted["case_number"] = val
+            methods.setdefault("case_number", "regex")
+    if not extracted["case_title"]:
+        val = extract_case_title(text)
+        if val:
+            extracted["case_title"] = val
+            methods.setdefault("case_title", "regex")
+    if not extracted["hearing_date"]:
+        val = extract_hearing_date(text)
+        if val:
+            extracted["hearing_date"] = val
+            methods.setdefault("hearing_date", "regex")
+
+    # Fallback case_type from case number prefix (#706).
+    if not extracted["case_type"] and extracted["case_number"]:
+        val = extract_case_type_from_number(extracted["case_number"])
+        if val:
+            extracted["case_type"] = val
+            methods.setdefault("case_type", "regex")
+
+    # Fallback case_type from motion_type (#1731).
+    # Final fallback for cases where the case number has no embedded
+    # type code (e.g. Ventura's all-digit case numbers like
+    # 202300574258).  Many civil motion types unambiguously identify
+    # the case type.
+    if not extracted["case_type"] and extracted["motion_type"]:
+        val = extract_case_type_from_motion_type(extracted["motion_type"])
+        if val:
+            extracted["case_type"] = val
+            methods.setdefault("case_type", "motion_type")
+
+
 def _reparse_document(
     raw_content: bytes,
     scraper_id: str,
@@ -632,56 +700,8 @@ def _reparse_document(
     # ------------------------------------------------------------------
     # Regex fallback — fill any fields still missing after scraper + LLM
     # ------------------------------------------------------------------
-    # For PDF documents, ``text`` is pdfplumber-extracted text (not garbage
-    # UTF-8 decode), so regex patterns can match real content.
-    if not extracted["judge_name"]:
-        val = extract_judge_name(text)
-        if val:
-            extracted["judge_name"] = val
-            extraction_methods.setdefault("judge_name", "regex")
-    if not extracted["outcome"]:
-        val = extract_outcome(text)
-        if val:
-            extracted["outcome"] = val
-            extraction_methods.setdefault("outcome", "regex")
-    if not extracted["motion_type"]:
-        val = extract_motion_type(text)
-        if val:
-            extracted["motion_type"] = val
-            extraction_methods.setdefault("motion_type", "regex")
-    if not extracted["case_number"]:
-        val = extract_case_number(text)
-        if val:
-            extracted["case_number"] = val
-            extraction_methods.setdefault("case_number", "regex")
-    if not extracted["case_title"]:
-        val = extract_case_title(text)
-        if val:
-            extracted["case_title"] = val
-            extraction_methods.setdefault("case_title", "regex")
-    if not extracted["hearing_date"]:
-        val = extract_hearing_date(text)
-        if val:
-            extracted["hearing_date"] = val
-            extraction_methods.setdefault("hearing_date", "regex")
-
-    # Fallback case_type from case number prefix (#706).
-    if not extracted["case_type"] and extracted["case_number"]:
-        val = extract_case_type_from_number(extracted["case_number"])
-        if val:
-            extracted["case_type"] = val
-            extraction_methods.setdefault("case_type", "regex")
-
-    # Fallback case_type from motion_type (#1731).
-    # Final fallback for cases where the case number has no embedded
-    # type code (e.g. Ventura's all-digit case numbers like
-    # 202300574258).  Many civil motion types unambiguously identify
-    # the case type.
-    if not extracted["case_type"] and extracted["motion_type"]:
-        val = extract_case_type_from_motion_type(extracted["motion_type"])
-        if val:
-            extracted["case_type"] = val
-            extraction_methods.setdefault("case_type", "motion_type")
+    extracted["extraction_methods"] = extraction_methods
+    _apply_regex_fallbacks(extracted, text)
 
     if extraction_methods:
         logger.info(
@@ -690,7 +710,6 @@ def _reparse_document(
             methods=extraction_methods,
         )
 
-    extracted["extraction_methods"] = extraction_methods
     extracted["llm_skipped"] = llm_skipped
     extracted["llm_outcome"] = llm_outcome
     return extracted
@@ -882,53 +901,9 @@ def _full_reparse_document(
 
         # ------------------------------------------------------------------
         # Regex fallback — fill any fields still missing after split (#1749)
-        # Mirrors the fallback chain in _reparse_document().
+        # Uses the shared helper to stay in sync with _reparse_document().
         # ------------------------------------------------------------------
-        ruling_text = extracted["ruling_text"]
-        if not extracted["judge_name"]:
-            val = extract_judge_name(ruling_text)
-            if val:
-                extracted["judge_name"] = val
-                extracted["extraction_methods"].setdefault("judge_name", "regex")
-        if not extracted["outcome"]:
-            val = extract_outcome(ruling_text)
-            if val:
-                extracted["outcome"] = val
-                extracted["extraction_methods"].setdefault("outcome", "regex")
-        if not extracted["motion_type"]:
-            val = extract_motion_type(ruling_text)
-            if val:
-                extracted["motion_type"] = val
-                extracted["extraction_methods"].setdefault("motion_type", "regex")
-        if not extracted["case_number"]:
-            val = extract_case_number(ruling_text)
-            if val:
-                extracted["case_number"] = val
-                extracted["extraction_methods"].setdefault("case_number", "regex")
-        if not extracted["case_title"]:
-            val = extract_case_title(ruling_text)
-            if val:
-                extracted["case_title"] = val
-                extracted["extraction_methods"].setdefault("case_title", "regex")
-        if not extracted["hearing_date"]:
-            val = extract_hearing_date(ruling_text)
-            if val:
-                extracted["hearing_date"] = val
-                extracted["extraction_methods"].setdefault("hearing_date", "regex")
-
-        # Fallback case_type from case number prefix (#706).
-        if not extracted["case_type"] and extracted["case_number"]:
-            val = extract_case_type_from_number(extracted["case_number"])
-            if val:
-                extracted["case_type"] = val
-                extracted["extraction_methods"].setdefault("case_type", "regex")
-
-        # Fallback case_type from motion_type (#1731).
-        if not extracted["case_type"] and extracted["motion_type"]:
-            val = extract_case_type_from_motion_type(extracted["motion_type"])
-            if val:
-                extracted["case_type"] = val
-                extracted["extraction_methods"].setdefault("case_type", "motion_type")
+        _apply_regex_fallbacks(extracted, extracted["ruling_text"])
 
         results.append(extracted)
 
