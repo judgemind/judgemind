@@ -29,6 +29,7 @@ structlog.configure(
     processors=[
         structlog.processors.add_log_level,
         structlog.processors.TimeStamper(fmt="iso"),
+        structlog.processors.format_exc_info,
         structlog.dev.ConsoleRenderer()
         if sys.stderr.isatty()
         else structlog.processors.JSONRenderer(),
