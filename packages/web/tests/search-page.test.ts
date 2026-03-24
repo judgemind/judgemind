@@ -3,10 +3,9 @@ import {
   buildSearchParams,
   parseSearchParams,
   MOTION_TYPES,
-  MOTION_TYPE_LABELS,
   OUTCOMES,
 } from '../src/app/(main)/search/SearchPage';
-import { OUTCOME_LABELS } from '../src/lib/display-helpers';
+import { MOTION_TYPE_LABELS, OUTCOME_LABELS } from '../src/lib/display-helpers';
 
 describe('buildSearchParams', () => {
   it('returns empty params when all fields are empty', () => {

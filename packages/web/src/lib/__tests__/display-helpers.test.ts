@@ -14,6 +14,7 @@ import {
   getOutcomeBadgeListClass,
   getOutcomeBadgeVariant,
   groupParties,
+  MOTION_TYPE_LABELS,
   OUTCOME_LABELS,
   RULING_TEXT_TRUNCATE_LENGTH,
   stripBoilerplate,
@@ -201,6 +202,21 @@ describe('formatMotionType', () => {
 
   it('title-cases generic motion types', () => {
     expect(formatMotionType('summary_judgment')).toBe('Summary Judgment');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// MOTION_TYPE_LABELS — canonical motion type label map (#1918)
+// ---------------------------------------------------------------------------
+
+describe('MOTION_TYPE_LABELS', () => {
+  it('maps all standard motion type codes to human-readable labels', () => {
+    expect(MOTION_TYPE_LABELS['msj']).toBe('MSJ');
+    expect(MOTION_TYPE_LABELS['mtd']).toBe('MTD');
+    expect(MOTION_TYPE_LABELS['mil']).toBe('MIL');
+    expect(MOTION_TYPE_LABELS['demurrer']).toBe('Demurrer');
+    expect(MOTION_TYPE_LABELS['anti_slapp']).toBe('Anti-SLAPP');
+    expect(MOTION_TYPE_LABELS['other']).toBe('Other');
   });
 });
 

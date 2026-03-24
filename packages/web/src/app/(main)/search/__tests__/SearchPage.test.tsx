@@ -4,10 +4,9 @@ import {
   buildSearchParams,
   parseSearchParams,
   MOTION_TYPES,
-  MOTION_TYPE_LABELS,
   OUTCOMES,
 } from '../SearchPage';
-import { OUTCOME_LABELS } from '@/lib/display-helpers';
+import { MOTION_TYPE_LABELS, OUTCOME_LABELS } from '@/lib/display-helpers';
 
 // ---------------------------------------------------------------------------
 // buildSearchParams — URL encoding of filter state (#1105)
