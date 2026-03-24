@@ -281,10 +281,40 @@ Run this script with any available Python 3 interpreter (e.g. a venv python from
 
 ### 2e — Decision logic
 
-**All three reviewers must agree to SHIP:**
+**All three reviewers must agree to SHIP (with persistent-dissent override):**
 
 - If Claude says **SHIP** AND (Gemini standard says **SHIP** or **SKIPPED**) AND (Gemini adversarial says **SHIP** or **SKIPPED**): The loop is done. Continue to Step 3.
-- If ANY reviewer says **REVISE**: Increment iteration. If `iteration > max_iterations`, stop the loop and comment on the issue that the ralph loop hit its max iterations — block the issue with `scripts/block-issue.sh <issue> <blocker>` (if applicable) or add `status/blocked` manually, and return with failure. Otherwise:
+
+- **Persistent-dissent override:** If ANY reviewer says **REVISE**, first check whether this is a persistent solo-dissent pattern. Write and run a small Python script (`{worktree}/tmp/ralph/check_dissent.py`):
+
+  ```python
+  import sys
+  sys.path.insert(0, "<repo_root>/scripts")
+  from ralph_review_log import detect_persistent_dissent, log_dissent_override
+  from pathlib import Path
+  import json
+
+  state_dir = Path("<worktree>/tmp/ralph")
+  iteration = int(state_dir.joinpath("iteration.txt").read_text(encoding="utf-8").strip())
+
+  result = detect_persistent_dissent(state_dir, current_iteration=iteration)
+  if result:
+      log_dissent_override(
+          state_dir,
+          iteration=iteration,
+          dissenter=result["dissenter"],
+          consecutive_count=result["consecutive_count"],
+          dissent_iterations=result["iterations"],
+      )
+      print(json.dumps(result))
+  else:
+      print("NONE")
+  ```
+
+  - If the script outputs a JSON object (not "NONE"), a persistent solo-dissent was detected. **Treat the loop as SHIP** — the dissenter has been overriding the same concern for 2+ consecutive iterations while the other reviewers agreed to ship. The override has been logged to `review-log.jsonl` for audit. Continue to Step 3.
+  - If the script outputs "NONE", no persistent dissent was detected. Proceed with the normal REVISE logic below.
+
+- If ANY reviewer says **REVISE** (and no persistent-dissent override applies): Increment iteration. If `iteration > max_iterations`, stop the loop and comment on the issue that the ralph loop hit its max iterations — block the issue with `scripts/block-issue.sh <issue> <blocker>` (if applicable) or add `status/blocked` manually, and return with failure. Otherwise:
   - Consolidate feedback from ALL reviewers that said REVISE into `{worktree}/tmp/ralph/feedback.md`. Include feedback from `gemini-feedback.md`, `adversarial-feedback.md`, and/or `feedback.md` as appropriate.
   - Create new todos for the next iteration ("Ralph iteration N — worker", "Ralph iteration N — Gemini review", "Ralph iteration N — adversarial review", "Ralph iteration N — Claude review"), then return to 2a.
 
@@ -348,6 +378,7 @@ The code is ready for commit. Return control to the calling workflow (`/task` Pa
 - **Ralph is not task completion.** Ralph handles implementation and review only. The calling `/task` workflow handles process summary, commit, push, PR, CI, merge, deploy, and cleanup. Never exit after ralph without completing the full `/task` workflow.
 - **Unchecked test plan items are merge blockers.** Reviewers must flag unchecked test plan checkboxes as REVISE reasons. A PR with unchecked items is not ready to ship.
 - **Unmet acceptance criteria are always REVISE.** Reviewers must verify every acceptance criterion individually. Code quality alone is not sufficient for SHIP — all locally-verifiable acceptance criteria must be met.
+- **Persistent-dissent override.** If one reviewer says REVISE for 2+ consecutive iterations while the other two say SHIP, and the detection function (`detect_persistent_dissent`) confirms the pattern, the loop treats it as SHIP. This prevents a single reviewer from blocking convergence on theoretical grounds that the other reviewers have already evaluated and dismissed. The override is logged to `review-log.jsonl` with type `dissent_override` for audit. This override only applies when exactly one reviewer dissents — if two reviewers REVISE, that is a genuine concern and the override does not trigger.
 - **Do not use `run_in_background` anywhere in the ralph loop.** All commands — test suites, lint, format checks, git commands, reviewer invocations, and worker subagents — must run in the foreground. Subagents are already running as background tasks from the parent's perspective. Further backgrounding causes completion notifications to route to the wrong context, leading to confusion and lost results.
 
 ---
