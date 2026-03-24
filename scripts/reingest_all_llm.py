@@ -36,10 +36,8 @@ from __future__ import annotations
 
 import argparse
 import json
-import logging
 import os
 import sys
-from datetime import date
 
 # Ensure the scraper-framework source is importable
 sys.path.insert(
@@ -56,21 +54,9 @@ sys.path.insert(
 
 import structlog  # noqa: E402
 
-structlog.configure(
-    processors=[
-        structlog.contextvars.merge_contextvars,
-        structlog.processors.add_log_level,
-        structlog.processors.TimeStamper(fmt="iso"),
-        structlog.processors.format_exc_info,
-        structlog.dev.ConsoleRenderer()
-        if sys.stderr.isatty()
-        else structlog.processors.JSONRenderer(),
-    ],
-    wrapper_class=structlog.make_filtering_bound_logger(logging.INFO),
-    context_class=dict,
-    logger_factory=structlog.PrintLoggerFactory(),
-    cache_logger_on_first_use=True,
-)
+from framework.logging import configure_structlog  # noqa: E402
+
+configure_structlog(contextvars=True)
 logger = structlog.get_logger()
 
 # Import after structlog is configured so the reingest module uses it.

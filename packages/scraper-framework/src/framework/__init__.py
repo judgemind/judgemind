@@ -26,6 +26,7 @@ from .llm_schema import (
     ExtractionResult,
     FieldConfidence,
 )
+from .logging import configure_structlog
 from .models import (
     CapturedDocument,
     ContentFormat,
@@ -72,6 +73,7 @@ __all__ = [
     "EnrichmentResult",
     "build_s3_key",
     "compute_party_overlap",
+    "configure_structlog",
     "content_changed",
     "inline_css",
     "create_index",

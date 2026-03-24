@@ -49,7 +49,6 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-import logging
 import os
 import subprocess
 import sys
@@ -71,6 +70,7 @@ import boto3  # noqa: E402
 import psycopg  # noqa: E402
 import structlog  # noqa: E402
 
+from framework.logging import configure_structlog  # noqa: E402
 from framework.models import CapturedDocument, ContentFormat, ScraperConfig  # noqa: E402
 from ingestion.db import (  # noqa: E402
     batch_upsert_parties,
@@ -100,21 +100,7 @@ from ingestion.llm_extract import (  # noqa: E402
 from ingestion.llm_providers import create_client as create_llm_client  # noqa: E402
 from ingestion.split_ids import make_split_document_id  # noqa: E402
 
-structlog.configure(
-    processors=[
-        structlog.contextvars.merge_contextvars,
-        structlog.processors.add_log_level,
-        structlog.processors.TimeStamper(fmt="iso"),
-        structlog.processors.format_exc_info,
-        structlog.dev.ConsoleRenderer()
-        if sys.stderr.isatty()
-        else structlog.processors.JSONRenderer(),
-    ],
-    wrapper_class=structlog.make_filtering_bound_logger(logging.INFO),
-    context_class=dict,
-    logger_factory=structlog.PrintLoggerFactory(),
-    cache_logger_on_first_use=True,
-)
+configure_structlog(contextvars=True)
 logger = structlog.get_logger()
 
 
