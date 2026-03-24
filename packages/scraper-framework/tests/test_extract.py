@@ -2229,6 +2229,10 @@ class TestNormalizeMotionType:
     def test_paga_settlement_title_case(self) -> None:
         assert normalize_motion_type("PAGA Settlement") == "paga_settlement"
 
+    def test_paga_settlement_approval_of(self) -> None:
+        """AC from #1818: normalize 'Approval of PAGA Settlement'."""
+        assert normalize_motion_type("Approval of PAGA Settlement") == "paga_settlement"
+
     def test_paga_settlement_already_normalized(self) -> None:
         assert normalize_motion_type("paga_settlement") == "paga_settlement"
 
