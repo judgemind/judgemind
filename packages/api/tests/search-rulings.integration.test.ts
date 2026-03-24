@@ -8,6 +8,10 @@
  * The tests seed data into both PG (court, judge, case, ruling) and OpenSearch
  * (tentative_rulings index), then exercise the GraphQL query with various
  * combinations of full-text queries, metadata filters, and pagination.
+ *
+ * DATA ISOLATION: This file uses county "Los Angeles" with court_code "ca-la-search-test".
+ * Do NOT reuse this court_code in other integration test files.
+ * See tests/test-counties.ts for the full registry.
  */
 
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';

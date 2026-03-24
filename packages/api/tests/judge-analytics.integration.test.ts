@@ -4,6 +4,10 @@
  * Tests run against a real PostgreSQL database. Each test run inserts its own
  * seed rows and deletes them in afterAll, so they are safe to run against an
  * existing schema (local dev) or a fresh one (CI postgres service).
+ *
+ * DATA ISOLATION: This file uses county "San Francisco" with court_code "ca-sf-analytics-test".
+ * Do NOT reuse this court_code in other integration test files.
+ * See tests/test-counties.ts for the full registry.
  */
 
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
