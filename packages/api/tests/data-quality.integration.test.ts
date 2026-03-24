@@ -4,6 +4,15 @@
  * Tests both dataQualityMetrics and dataQualityOverview queries against a
  * real PostgreSQL database. Verifies admin-only access, filtering, pagination,
  * and health status computation.
+ *
+ * DATA ISOLATION: This file uses the following county names (see test-counties.ts):
+ *   - "Los Angeles"  — healthy metrics (green health status)
+ *   - "Orange"       — degraded metrics (yellow health status)
+ *   - "San Diego"    — unhealthy metrics (red health status)
+ *   - "Riverside"    — aggregation tests (4-hour / daily resolution)
+ *
+ * Do NOT add counties that overlap with other integration test files.
+ * See tests/test-counties.ts for the full registry.
  */
 
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';

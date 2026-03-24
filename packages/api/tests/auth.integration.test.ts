@@ -3,6 +3,10 @@
  * email verification, and Google OAuth exchange.
  *
  * Runs against a real PostgreSQL database (same as graphql.integration.test.ts).
+ *
+ * DATA ISOLATION: This file does not seed court/county data — only user rows
+ * with a timestamp-based email prefix to avoid collisions.
+ * See tests/test-counties.ts for the full registry.
  */
 
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';

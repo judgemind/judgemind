@@ -5,6 +5,10 @@
  * or a fresh one (CI postgres service).
  *
  * Migrations are applied via node-pg-migrate before tests run.
+ *
+ * DATA ISOLATION: This file uses county "Los Angeles" with court_code "ca-la-test".
+ * Do NOT reuse this court_code in other integration test files.
+ * See tests/test-counties.ts for the full registry.
  */
 
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';

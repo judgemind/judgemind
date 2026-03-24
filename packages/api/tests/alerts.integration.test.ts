@@ -5,6 +5,10 @@
  *
  * Runs against a real PostgreSQL database. Each test run inserts its
  * own seed rows and deletes them in afterAll.
+ *
+ * DATA ISOLATION: This file uses county "Test Alert County" with court_code "ca-alert-test".
+ * Do NOT reuse this court_code in other integration test files.
+ * See tests/test-counties.ts for the full registry.
  */
 
 import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest';
