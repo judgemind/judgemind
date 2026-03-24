@@ -1727,7 +1727,7 @@ class TestLlmExtractRulings:
         assert rulings[3].ruling_index == 4
 
     def test_llm_extract_outcome_mapping(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """LLM outcome values are mapped to the format used by the regex pipeline."""
+        """LLM outcome values are mapped to lowercase DB enum values (#1878)."""
         from ingestion.llm_providers import LLMResponse
 
         monkeypatch.setattr(
@@ -1743,14 +1743,14 @@ class TestLlmExtractRulings:
             rulings = _llm_extract_rulings("some pdf text")
 
         assert rulings is not None
-        # "denied" -> "Denied"
-        assert rulings[0].outcome == "Denied"
-        # "other" -> "No Tentative Ruling"
-        assert rulings[1].outcome == "No Tentative Ruling"
-        # "continued" -> "Continued"
-        assert rulings[2].outcome == "Continued"
-        # "denied" -> "Denied"
-        assert rulings[3].outcome == "Denied"
+        # "denied" -> "denied" (lowercase enum value)
+        assert rulings[0].outcome == "denied"
+        # "other" -> "other" (lowercase enum value)
+        assert rulings[1].outcome == "other"
+        # "continued" -> "continued" (lowercase enum value)
+        assert rulings[2].outcome == "continued"
+        # "denied" -> "denied" (lowercase enum value)
+        assert rulings[3].outcome == "denied"
 
     def test_llm_extract_unmapped_outcome_becomes_none(
         self, monkeypatch: pytest.MonkeyPatch
@@ -1839,7 +1839,7 @@ class TestLlmExtractRulings:
         assert rulings is not None
         assert len(rulings) == 1
         assert rulings[0].case_number == "CVPS2306157"
-        assert rulings[0].outcome == "Granted"
+        assert rulings[0].outcome == "granted"
 
     def test_llm_extract_strips_code_fences(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """_llm_extract_rulings strips markdown code fences from the response."""
@@ -1970,11 +1970,24 @@ class TestOutcomeMap:
         for outcome in llm_outcomes:
             assert outcome in _OUTCOME_MAP
 
-    def test_mapped_values_are_capitalized(self) -> None:
-        """All non-None mapped values start with an uppercase letter."""
+    def test_mapped_values_are_lowercase_enum(self) -> None:
+        """All non-None mapped values are lowercase DB enum values (#1878)."""
+        valid_outcomes = {
+            "granted",
+            "denied",
+            "granted_in_part",
+            "denied_in_part",
+            "moot",
+            "continued",
+            "off_calendar",
+            "submitted",
+            "other",
+        }
         for key, value in _OUTCOME_MAP.items():
             if value is not None:
-                assert value[0].isupper(), f"_OUTCOME_MAP[{key!r}] = {value!r} is not capitalized"
+                assert value in valid_outcomes, (
+                    f"_OUTCOME_MAP[{key!r}] = {value!r} is not a valid enum value"
+                )
 
 
 # ---------------------------------------------------------------------------

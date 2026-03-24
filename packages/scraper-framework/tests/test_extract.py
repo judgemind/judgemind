@@ -24,6 +24,7 @@ from ingestion.extract import (
     extract_parties_from_caption,
     is_valid_case_number,
     normalize_motion_type,
+    normalize_outcome,
 )
 
 # ---------------------------------------------------------------------------
@@ -74,6 +75,107 @@ class TestExtractOutcome:
         """'Granted in part' should match before plain 'granted'."""
         text = "The motion for summary judgment is granted in part and denied in part."
         assert extract_outcome(text) == "granted_in_part"
+
+
+# ---------------------------------------------------------------------------
+# Outcome normalization (#1878)
+# ---------------------------------------------------------------------------
+
+
+class TestNormalizeOutcome:
+    """Tests for normalize_outcome() — converts scraper-provided title-case
+    outcomes to valid ruling_outcome enum values."""
+
+    def test_granted_title_case(self) -> None:
+        assert normalize_outcome("Granted") == "granted"
+
+    def test_denied_title_case(self) -> None:
+        assert normalize_outcome("Denied") == "denied"
+
+    def test_granted_in_part(self) -> None:
+        assert normalize_outcome("Granted in Part") == "granted_in_part"
+
+    def test_denied_in_part(self) -> None:
+        assert normalize_outcome("Denied in Part") == "denied_in_part"
+
+    def test_moot_title_case(self) -> None:
+        assert normalize_outcome("Moot") == "moot"
+
+    def test_continued_title_case(self) -> None:
+        assert normalize_outcome("Continued") == "continued"
+
+    def test_off_calendar_spaced(self) -> None:
+        assert normalize_outcome("Off Calendar") == "off_calendar"
+
+    def test_submitted_title_case(self) -> None:
+        assert normalize_outcome("Submitted") == "submitted"
+
+    def test_no_tentative_ruling(self) -> None:
+        assert normalize_outcome("No Tentative Ruling") == "other"
+
+    def test_no_tentative(self) -> None:
+        assert normalize_outcome("No Tentative") == "other"
+
+    def test_no_appearance_required(self) -> None:
+        assert normalize_outcome("No Appearance Required") == "other"
+
+    def test_sustained_maps_to_granted(self) -> None:
+        """'Sustained' (demurrer context) maps to 'granted'."""
+        assert normalize_outcome("Sustained") == "granted"
+
+    def test_overruled_maps_to_denied(self) -> None:
+        """'Overruled' (demurrer context) maps to 'denied'."""
+        assert normalize_outcome("Overruled") == "denied"
+
+    def test_withdrawn_maps_to_off_calendar(self) -> None:
+        assert normalize_outcome("Withdrawn") == "off_calendar"
+
+    def test_vacated_maps_to_off_calendar(self) -> None:
+        assert normalize_outcome("Vacated") == "off_calendar"
+
+    def test_denied_without_prejudice(self) -> None:
+        assert normalize_outcome("Denied without Prejudice") == "denied"
+
+    def test_sustained_without_leave_to_amend(self) -> None:
+        assert normalize_outcome("Sustained without Leave to Amend") == "granted"
+
+    def test_sustained_with_leave_to_amend(self) -> None:
+        assert normalize_outcome("Sustained with Leave to Amend") == "granted"
+
+    def test_none_returns_none(self) -> None:
+        assert normalize_outcome(None) is None
+
+    def test_empty_string_returns_none(self) -> None:
+        assert normalize_outcome("") is None
+
+    def test_whitespace_only_returns_none(self) -> None:
+        assert normalize_outcome("   ") is None
+
+    def test_already_lowercase_passthrough(self) -> None:
+        assert normalize_outcome("granted") == "granted"
+
+    def test_already_normalized_underscore(self) -> None:
+        assert normalize_outcome("granted_in_part") == "granted_in_part"
+
+    def test_uppercase(self) -> None:
+        assert normalize_outcome("GRANTED") == "granted"
+
+    def test_unmapped_returns_none(self) -> None:
+        assert normalize_outcome("Something Unknown") is None
+
+    def test_other_passthrough(self) -> None:
+        assert normalize_outcome("other") == "other"
+
+    def test_leading_trailing_whitespace(self) -> None:
+        assert normalize_outcome("  Granted  ") == "granted"
+
+    def test_partial_match_granted_in_part_within_longer_string(self) -> None:
+        """Partial substring match for 'granted in part' in longer text."""
+        assert normalize_outcome("Motion was Granted in Part and Denied") == "granted_in_part"
+
+    def test_partial_match_denied_in_longer_string(self) -> None:
+        """Partial substring match for 'denied' in longer text."""
+        assert normalize_outcome("Motion is hereby Denied for cause") == "denied"
 
 
 # ---------------------------------------------------------------------------

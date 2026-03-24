@@ -246,6 +246,36 @@ def test_process_event_passes_outcome_and_motion_type_from_event(
 
 @patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
 @patch("ingestion.worker.psycopg")
+def test_process_event_normalizes_title_case_outcome(
+    mock_psycopg: MagicMock, mock_resolve_judge: MagicMock
+) -> None:
+    """Title-case scraper outcomes are normalized to lowercase before DB insert (#1878)."""
+    worker, os_mock = _make_worker()
+
+    mock_conn, mock_cur = _make_mock_conn()
+    mock_psycopg.connect.return_value = mock_conn
+    mock_cur.fetchone.side_effect = [
+        ("court-uuid-1",),  # upsert_court
+        ("case-uuid-1",),  # upsert_case
+        (True,),  # insert_document: RETURNING is_new = True
+    ]
+    mock_cur.rowcount = 1
+
+    # Pass title-case outcome as scrapers produce (e.g. Riverside, CC, Ventura)
+    event = _make_event(outcome="Granted", motion_type="demurrer")
+    worker.process_event(event)
+
+    # Find the INSERT INTO rulings call
+    ruling_calls = [c for c in mock_cur.execute.call_args_list if "INSERT INTO rulings" in str(c)]
+    assert len(ruling_calls) == 1
+    sql_args = ruling_calls[0][0][1]  # positional args tuple
+    # outcome should be normalized to lowercase (not title-case "Granted")
+    assert "granted" in sql_args
+    assert "Granted" not in sql_args
+
+
+@patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
+@patch("ingestion.worker.psycopg")
 def test_process_event_extracts_outcome_from_ruling_text(
     mock_psycopg: MagicMock, mock_resolve_judge: MagicMock
 ) -> None:

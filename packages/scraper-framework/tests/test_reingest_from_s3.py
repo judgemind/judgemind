@@ -4562,41 +4562,31 @@ class TestFullReparseDocument:
 
 
 # ---------------------------------------------------------------------------
-# _normalize_outcome tests
+# normalize_outcome tests — verifies reingest uses the shared function
+# from ingestion.extract (#1878)
 # ---------------------------------------------------------------------------
 
 
 class TestNormalizeOutcome:
-    """Tests for _normalize_outcome()."""
+    """Tests that reingest uses the shared normalize_outcome from ingestion.extract.
 
-    def test_none_returns_none(self) -> None:
-        assert reingest._normalize_outcome(None) is None
+    Comprehensive unit tests for normalize_outcome() live in test_extract.py.
+    These tests verify the reingest module correctly imports and uses the shared
+    function (not a local copy).
+    """
 
-    def test_empty_returns_none(self) -> None:
-        assert reingest._normalize_outcome("") is None
+    def test_reingest_uses_shared_normalize_outcome(self) -> None:
+        """reingest.normalize_outcome should be the same function as
+        ingestion.extract.normalize_outcome."""
+        from ingestion.extract import normalize_outcome
 
-    def test_lowercase_passes_through(self) -> None:
-        assert reingest._normalize_outcome("granted") == "granted"
-        assert reingest._normalize_outcome("denied") == "denied"
-        assert reingest._normalize_outcome("continued") == "continued"
+        assert reingest.normalize_outcome is normalize_outcome
 
-    def test_title_case_normalized(self) -> None:
-        assert reingest._normalize_outcome("Granted") == "granted"
-        assert reingest._normalize_outcome("Denied") == "denied"
-        assert reingest._normalize_outcome("Continued") == "continued"
-
-    def test_no_tentative_ruling_maps_to_other(self) -> None:
-        assert reingest._normalize_outcome("No Tentative Ruling") == "other"
-        assert reingest._normalize_outcome("no tentative ruling") == "other"
-
-    def test_granted_in_part(self) -> None:
-        assert reingest._normalize_outcome("Granted in Part") == "granted_in_part"
-
-    def test_withdrawn_maps_to_off_calendar(self) -> None:
-        assert reingest._normalize_outcome("Withdrawn") == "off_calendar"
-
-    def test_unknown_returns_none(self) -> None:
-        assert reingest._normalize_outcome("some random string") is None
+    def test_basic_normalization_via_reingest(self) -> None:
+        """Spot-check that the shared function works when called via reingest."""
+        assert reingest.normalize_outcome("Granted") == "granted"
+        assert reingest.normalize_outcome("No Tentative Ruling") == "other"
+        assert reingest.normalize_outcome(None) is None
 
 
 # ---------------------------------------------------------------------------
