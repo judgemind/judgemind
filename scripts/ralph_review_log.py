@@ -103,55 +103,28 @@ def log_summary(
     claude_only_catches: list[int] = []
     adversarial_only_catches: list[int] = []
 
-    # Group reviews by iteration
-    by_iteration: dict[int, dict[str, str]] = {}
-    for review in reviews:
-        it = review.get("iteration", 0)
-        model = review.get("model", "")
-        verdict = review.get("verdict", "")
-        if it not in by_iteration:
-            by_iteration[it] = {}
-        by_iteration[it][model] = verdict
+    by_iteration = _group_reviews_by_iteration(reviews)
 
-    for it, verdicts in sorted(by_iteration.items()):
-        gemini_v = verdicts.get("gemini-2.5-pro", verdicts.get("gemini", "SKIPPED"))
-        adversarial_v = verdicts.get(
-            "gemini-2.5-pro-adversarial",
-            verdicts.get("gemini-adversarial", "SKIPPED"),
-        )
-        # Find claude verdict (any key starting with "claude")
-        claude_v = "SKIPPED"
-        for k, v in verdicts.items():
-            if k.startswith("claude") or k == "claude":
-                claude_v = v
-                break
-
-        # Compare each non-SKIPPED reviewer pair for agreement stats
-        active_verdicts: list[tuple[str, str]] = []
-        if gemini_v != "SKIPPED":
-            active_verdicts.append(("gemini", gemini_v))
-        if adversarial_v != "SKIPPED":
-            active_verdicts.append(("adversarial", adversarial_v))
-        if claude_v != "SKIPPED":
-            active_verdicts.append(("claude", claude_v))
+    for it, raw_verdicts in sorted(by_iteration.items()):
+        normalized = _normalize_reviewer_verdicts(raw_verdicts)
 
         # Skip iterations with fewer than 2 active reviewers
-        if len(active_verdicts) < 2:
+        if len(normalized) < 2:
             continue
 
         # All active reviewers agree?
-        all_verdicts = [v for _, v in active_verdicts]
+        all_verdicts = list(normalized.values())
         if len(set(all_verdicts)) == 1:
             agreement_count += 1
         else:
             disagreement_count += 1
             # Track which reviewer(s) uniquely caught issues
-            revivers = {name for name, v in active_verdicts if v == "REVISE"}
-            if revivers == {"gemini"}:
+            revisers = {name for name, v in normalized.items() if v == "REVISE"}
+            if revisers == {"gemini"}:
                 gemini_only_catches.append(it)
-            elif revivers == {"claude"}:
+            elif revisers == {"claude"}:
                 claude_only_catches.append(it)
-            elif revivers == {"adversarial"}:
+            elif revisers == {"adversarial"}:
                 adversarial_only_catches.append(it)
 
     total_compared = agreement_count + disagreement_count
@@ -201,6 +174,176 @@ def read_reviews(state_dir: str | Path) -> list[dict[str, Any]]:
             continue
 
     return reviews
+
+
+def _normalize_reviewer_verdicts(
+    verdicts: dict[str, str],
+) -> dict[str, str]:
+    """Map raw model names to canonical reviewer names with their verdicts.
+
+    Returns a dict with keys from {"gemini", "adversarial", "claude"} mapped
+    to their verdict strings.  Only includes reviewers that are present and
+    not SKIPPED.
+    """
+    gemini_v = verdicts.get("gemini-2.5-pro", verdicts.get("gemini", "SKIPPED"))
+    adversarial_v = verdicts.get(
+        "gemini-2.5-pro-adversarial",
+        verdicts.get("gemini-adversarial", "SKIPPED"),
+    )
+    claude_v = "SKIPPED"
+    for k, v in verdicts.items():
+        if k.startswith("claude") or k == "claude":
+            claude_v = v
+            break
+
+    result: dict[str, str] = {}
+    if gemini_v != "SKIPPED":
+        result["gemini"] = gemini_v
+    if adversarial_v != "SKIPPED":
+        result["adversarial"] = adversarial_v
+    if claude_v != "SKIPPED":
+        result["claude"] = claude_v
+    return result
+
+
+def _group_reviews_by_iteration(
+    reviews: list[dict[str, Any]],
+) -> dict[int, dict[str, str]]:
+    """Group review records by iteration, mapping model -> verdict."""
+    by_iteration: dict[int, dict[str, str]] = {}
+    for review in reviews:
+        it = review.get("iteration", 0)
+        model = review.get("model", "")
+        verdict = review.get("verdict", "")
+        if it not in by_iteration:
+            by_iteration[it] = {}
+        by_iteration[it][model] = verdict
+    return by_iteration
+
+
+def detect_persistent_dissent(
+    state_dir: str | Path,
+    *,
+    current_iteration: int,
+    reviews: list[dict[str, Any]] | None = None,
+    min_consecutive: int = 2,
+) -> dict[str, Any] | None:
+    """Detect if exactly one reviewer has been solo-dissenting for N+ iterations.
+
+    Checks the review history for this pattern: one reviewer says REVISE for
+    ``min_consecutive`` or more consecutive recent iterations while the other
+    active reviewers all say SHIP.  Only triggers when exactly one reviewer
+    dissents — if two reviewers say REVISE, that is a genuine concern.
+
+    Args:
+        state_dir: Path to {worktree}/tmp/ralph/.
+        current_iteration: The iteration that just completed (1-based).
+        reviews: Optional pre-loaded review records.  If not provided, reads
+            from the log file.
+        min_consecutive: Minimum consecutive solo-REVISE iterations required
+            to trigger the override.  Default is 2.
+
+    Returns:
+        A dict describing the dissent if detected, with keys:
+            - ``dissenter``: canonical reviewer name ("gemini", "adversarial",
+              or "claude")
+            - ``consecutive_count``: number of consecutive solo-REVISE
+              iterations
+            - ``iterations``: list of iteration numbers where the dissent
+              occurred
+        Returns ``None`` if no persistent solo-dissent is detected.
+    """
+    if reviews is None:
+        reviews = read_reviews(state_dir)
+
+    by_iteration = _group_reviews_by_iteration(reviews)
+
+    # Walk backwards from current_iteration to find consecutive solo-dissent
+    # We need at least min_consecutive iterations of data
+    if current_iteration < min_consecutive:
+        return None
+
+    # For each iteration from current back, check if exactly one reviewer
+    # said REVISE while all others said SHIP
+    consecutive_dissenter: str | None = None
+    consecutive_count = 0
+    dissent_iterations: list[int] = []
+
+    for it in range(current_iteration, 0, -1):
+        if it not in by_iteration:
+            break
+
+        raw_verdicts = by_iteration[it]
+        normalized = _normalize_reviewer_verdicts(raw_verdicts)
+
+        # Need at least 2 active reviewers to detect dissent
+        if len(normalized) < 2:
+            break
+
+        # Find who said REVISE
+        revisers = {name for name, v in normalized.items() if v == "REVISE"}
+        shippers = {name for name, v in normalized.items() if v == "SHIP"}
+
+        # Must be exactly 1 dissenter with everyone else saying SHIP
+        if len(revisers) != 1 or len(shippers) < 1:
+            break
+
+        dissenter = next(iter(revisers))
+
+        # All non-REVISE active reviewers must be SHIP (not some other verdict)
+        non_revisers = {name for name, v in normalized.items() if name != dissenter}
+        if not all(normalized[name] == "SHIP" for name in non_revisers):
+            break
+
+        if consecutive_dissenter is None:
+            consecutive_dissenter = dissenter
+        elif consecutive_dissenter != dissenter:
+            # Different dissenter than previous iteration — streak broken
+            break
+
+        consecutive_count += 1
+        dissent_iterations.append(it)
+
+    if consecutive_count >= min_consecutive and consecutive_dissenter is not None:
+        return {
+            "dissenter": consecutive_dissenter,
+            "consecutive_count": consecutive_count,
+            "iterations": sorted(dissent_iterations),
+        }
+
+    return None
+
+
+def log_dissent_override(
+    state_dir: str | Path,
+    *,
+    iteration: int,
+    dissenter: str,
+    consecutive_count: int,
+    dissent_iterations: list[int],
+) -> None:
+    """Log a persistent-dissent override to the review log.
+
+    Records that the decision logic overrode a solo-dissenter's REVISE verdict
+    because they had been the only reviewer saying REVISE for multiple
+    consecutive iterations while all others said SHIP.
+
+    Args:
+        state_dir: Path to {worktree}/tmp/ralph/.
+        iteration: The current iteration number where the override was applied.
+        dissenter: Canonical reviewer name that was overridden.
+        consecutive_count: Number of consecutive solo-REVISE iterations.
+        dissent_iterations: List of iteration numbers where dissent occurred.
+    """
+    record: dict[str, Any] = {
+        "type": "dissent_override",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "iteration": iteration,
+        "dissenter": dissenter,
+        "consecutive_count": consecutive_count,
+        "dissent_iterations": dissent_iterations,
+    }
+    _append_record(state_dir, record)
 
 
 def compute_diff_stats(worktree_path: str | Path) -> dict[str, int]:

@@ -14,6 +14,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from ralph_review_log import (
     ReviewTimer,
     compute_diff_stats,
+    detect_persistent_dissent,
+    log_dissent_override,
     log_review,
     log_summary,
     read_reviews,
@@ -230,7 +232,11 @@ class TestLogSummary:
     def test_detects_adversarial_only_catches(self, state_dir: Path) -> None:
         reviews = [
             {"iteration": 1, "model": "gemini-2.5-pro", "verdict": "SHIP"},
-            {"iteration": 1, "model": "gemini-2.5-pro-adversarial", "verdict": "REVISE"},
+            {
+                "iteration": 1,
+                "model": "gemini-2.5-pro-adversarial",
+                "verdict": "REVISE",
+            },
             {"iteration": 1, "model": "claude", "verdict": "SHIP"},
         ]
         log_summary(
@@ -352,3 +358,388 @@ class TestComputeDiffStats:
         assert "files_changed" in result
         assert "insertions" in result
         assert "deletions" in result
+
+
+class TestDetectPersistentDissent:
+    """Tests for detect_persistent_dissent function."""
+
+    def test_no_dissent_when_all_agree(self, state_dir: Path) -> None:
+        """All reviewers agree to SHIP — no dissent detected."""
+        reviews = [
+            {"iteration": 1, "model": "gemini-2.5-pro", "verdict": "SHIP"},
+            {"iteration": 1, "model": "gemini-2.5-pro-adversarial", "verdict": "SHIP"},
+            {"iteration": 1, "model": "claude", "verdict": "SHIP"},
+            {"iteration": 2, "model": "gemini-2.5-pro", "verdict": "SHIP"},
+            {"iteration": 2, "model": "gemini-2.5-pro-adversarial", "verdict": "SHIP"},
+            {"iteration": 2, "model": "claude", "verdict": "SHIP"},
+        ]
+        result = detect_persistent_dissent(
+            state_dir, current_iteration=2, reviews=reviews
+        )
+        assert result is None
+
+    def test_detects_adversarial_solo_dissent(self, state_dir: Path) -> None:
+        """Adversarial says REVISE for 2 consecutive iterations, others SHIP."""
+        reviews = [
+            {"iteration": 1, "model": "gemini-2.5-pro", "verdict": "SHIP"},
+            {
+                "iteration": 1,
+                "model": "gemini-2.5-pro-adversarial",
+                "verdict": "REVISE",
+            },
+            {"iteration": 1, "model": "claude", "verdict": "SHIP"},
+            {"iteration": 2, "model": "gemini-2.5-pro", "verdict": "SHIP"},
+            {
+                "iteration": 2,
+                "model": "gemini-2.5-pro-adversarial",
+                "verdict": "REVISE",
+            },
+            {"iteration": 2, "model": "claude", "verdict": "SHIP"},
+        ]
+        result = detect_persistent_dissent(
+            state_dir, current_iteration=2, reviews=reviews
+        )
+        assert result is not None
+        assert result["dissenter"] == "adversarial"
+        assert result["consecutive_count"] == 2
+        assert result["iterations"] == [1, 2]
+
+    def test_detects_gemini_solo_dissent(self, state_dir: Path) -> None:
+        """Gemini standard says REVISE for 2 iterations, others SHIP."""
+        reviews = [
+            {"iteration": 1, "model": "gemini-2.5-pro", "verdict": "REVISE"},
+            {"iteration": 1, "model": "gemini-2.5-pro-adversarial", "verdict": "SHIP"},
+            {"iteration": 1, "model": "claude", "verdict": "SHIP"},
+            {"iteration": 2, "model": "gemini-2.5-pro", "verdict": "REVISE"},
+            {"iteration": 2, "model": "gemini-2.5-pro-adversarial", "verdict": "SHIP"},
+            {"iteration": 2, "model": "claude", "verdict": "SHIP"},
+        ]
+        result = detect_persistent_dissent(
+            state_dir, current_iteration=2, reviews=reviews
+        )
+        assert result is not None
+        assert result["dissenter"] == "gemini"
+        assert result["consecutive_count"] == 2
+
+    def test_detects_claude_solo_dissent(self, state_dir: Path) -> None:
+        """Claude says REVISE for 2 iterations, others SHIP."""
+        reviews = [
+            {"iteration": 1, "model": "gemini-2.5-pro", "verdict": "SHIP"},
+            {"iteration": 1, "model": "gemini-2.5-pro-adversarial", "verdict": "SHIP"},
+            {"iteration": 1, "model": "claude", "verdict": "REVISE"},
+            {"iteration": 2, "model": "gemini-2.5-pro", "verdict": "SHIP"},
+            {"iteration": 2, "model": "gemini-2.5-pro-adversarial", "verdict": "SHIP"},
+            {"iteration": 2, "model": "claude", "verdict": "REVISE"},
+        ]
+        result = detect_persistent_dissent(
+            state_dir, current_iteration=2, reviews=reviews
+        )
+        assert result is not None
+        assert result["dissenter"] == "claude"
+        assert result["consecutive_count"] == 2
+
+    def test_no_dissent_when_two_reviewers_revise(self, state_dir: Path) -> None:
+        """Two reviewers say REVISE — this is a genuine concern, not solo dissent."""
+        reviews = [
+            {"iteration": 1, "model": "gemini-2.5-pro", "verdict": "REVISE"},
+            {
+                "iteration": 1,
+                "model": "gemini-2.5-pro-adversarial",
+                "verdict": "REVISE",
+            },
+            {"iteration": 1, "model": "claude", "verdict": "SHIP"},
+            {"iteration": 2, "model": "gemini-2.5-pro", "verdict": "REVISE"},
+            {
+                "iteration": 2,
+                "model": "gemini-2.5-pro-adversarial",
+                "verdict": "REVISE",
+            },
+            {"iteration": 2, "model": "claude", "verdict": "SHIP"},
+        ]
+        result = detect_persistent_dissent(
+            state_dir, current_iteration=2, reviews=reviews
+        )
+        assert result is None
+
+    def test_no_dissent_with_only_one_iteration(self, state_dir: Path) -> None:
+        """Single iteration of solo dissent is not enough to trigger override."""
+        reviews = [
+            {"iteration": 1, "model": "gemini-2.5-pro", "verdict": "SHIP"},
+            {
+                "iteration": 1,
+                "model": "gemini-2.5-pro-adversarial",
+                "verdict": "REVISE",
+            },
+            {"iteration": 1, "model": "claude", "verdict": "SHIP"},
+        ]
+        result = detect_persistent_dissent(
+            state_dir, current_iteration=1, reviews=reviews
+        )
+        assert result is None
+
+    def test_dissent_broken_by_different_dissenter(self, state_dir: Path) -> None:
+        """Different dissenter each iteration — no consecutive pattern."""
+        reviews = [
+            {"iteration": 1, "model": "gemini-2.5-pro", "verdict": "SHIP"},
+            {
+                "iteration": 1,
+                "model": "gemini-2.5-pro-adversarial",
+                "verdict": "REVISE",
+            },
+            {"iteration": 1, "model": "claude", "verdict": "SHIP"},
+            {"iteration": 2, "model": "gemini-2.5-pro", "verdict": "SHIP"},
+            {"iteration": 2, "model": "gemini-2.5-pro-adversarial", "verdict": "SHIP"},
+            {"iteration": 2, "model": "claude", "verdict": "REVISE"},
+        ]
+        result = detect_persistent_dissent(
+            state_dir, current_iteration=2, reviews=reviews
+        )
+        assert result is None
+
+    def test_dissent_with_three_consecutive_iterations(self, state_dir: Path) -> None:
+        """Three consecutive iterations of solo dissent."""
+        reviews = [
+            {"iteration": 1, "model": "gemini-2.5-pro", "verdict": "SHIP"},
+            {
+                "iteration": 1,
+                "model": "gemini-2.5-pro-adversarial",
+                "verdict": "REVISE",
+            },
+            {"iteration": 1, "model": "claude", "verdict": "SHIP"},
+            {"iteration": 2, "model": "gemini-2.5-pro", "verdict": "SHIP"},
+            {
+                "iteration": 2,
+                "model": "gemini-2.5-pro-adversarial",
+                "verdict": "REVISE",
+            },
+            {"iteration": 2, "model": "claude", "verdict": "SHIP"},
+            {"iteration": 3, "model": "gemini-2.5-pro", "verdict": "SHIP"},
+            {
+                "iteration": 3,
+                "model": "gemini-2.5-pro-adversarial",
+                "verdict": "REVISE",
+            },
+            {"iteration": 3, "model": "claude", "verdict": "SHIP"},
+        ]
+        result = detect_persistent_dissent(
+            state_dir, current_iteration=3, reviews=reviews
+        )
+        assert result is not None
+        assert result["dissenter"] == "adversarial"
+        assert result["consecutive_count"] == 3
+        assert result["iterations"] == [1, 2, 3]
+
+    def test_reads_from_log_file(self, state_dir: Path) -> None:
+        """When reviews not passed, reads from the log file."""
+        log_review(
+            state_dir,
+            iteration=1,
+            model="gemini-2.5-pro",
+            verdict="SHIP",
+            feedback="OK",
+        )
+        log_review(
+            state_dir,
+            iteration=1,
+            model="gemini-2.5-pro-adversarial",
+            verdict="REVISE",
+            feedback="Nope",
+        )
+        log_review(
+            state_dir, iteration=1, model="claude", verdict="SHIP", feedback="OK"
+        )
+        log_review(
+            state_dir,
+            iteration=2,
+            model="gemini-2.5-pro",
+            verdict="SHIP",
+            feedback="OK",
+        )
+        log_review(
+            state_dir,
+            iteration=2,
+            model="gemini-2.5-pro-adversarial",
+            verdict="REVISE",
+            feedback="Still nope",
+        )
+        log_review(
+            state_dir, iteration=2, model="claude", verdict="SHIP", feedback="OK"
+        )
+
+        result = detect_persistent_dissent(state_dir, current_iteration=2)
+        assert result is not None
+        assert result["dissenter"] == "adversarial"
+
+    def test_dissent_with_skipped_reviewer(self, state_dir: Path) -> None:
+        """Solo dissent still detected when one reviewer is SKIPPED."""
+        reviews = [
+            {"iteration": 1, "model": "gemini-2.5-pro", "verdict": "SKIPPED"},
+            {
+                "iteration": 1,
+                "model": "gemini-2.5-pro-adversarial",
+                "verdict": "REVISE",
+            },
+            {"iteration": 1, "model": "claude", "verdict": "SHIP"},
+            {"iteration": 2, "model": "gemini-2.5-pro", "verdict": "SKIPPED"},
+            {
+                "iteration": 2,
+                "model": "gemini-2.5-pro-adversarial",
+                "verdict": "REVISE",
+            },
+            {"iteration": 2, "model": "claude", "verdict": "SHIP"},
+        ]
+        result = detect_persistent_dissent(
+            state_dir, current_iteration=2, reviews=reviews
+        )
+        assert result is not None
+        assert result["dissenter"] == "adversarial"
+        assert result["consecutive_count"] == 2
+
+    def test_no_dissent_with_all_skipped_except_one(self, state_dir: Path) -> None:
+        """Need at least 2 active reviewers to detect dissent."""
+        reviews = [
+            {"iteration": 1, "model": "gemini-2.5-pro", "verdict": "SKIPPED"},
+            {
+                "iteration": 1,
+                "model": "gemini-2.5-pro-adversarial",
+                "verdict": "SKIPPED",
+            },
+            {"iteration": 1, "model": "claude", "verdict": "REVISE"},
+            {"iteration": 2, "model": "gemini-2.5-pro", "verdict": "SKIPPED"},
+            {
+                "iteration": 2,
+                "model": "gemini-2.5-pro-adversarial",
+                "verdict": "SKIPPED",
+            },
+            {"iteration": 2, "model": "claude", "verdict": "REVISE"},
+        ]
+        result = detect_persistent_dissent(
+            state_dir, current_iteration=2, reviews=reviews
+        )
+        assert result is None
+
+    def test_dissent_uses_gemini_adversarial_model_name(self, state_dir: Path) -> None:
+        """Works with the alternate 'gemini-adversarial' model name."""
+        reviews = [
+            {"iteration": 1, "model": "gemini-2.5-pro", "verdict": "SHIP"},
+            {"iteration": 1, "model": "gemini-adversarial", "verdict": "REVISE"},
+            {"iteration": 1, "model": "claude", "verdict": "SHIP"},
+            {"iteration": 2, "model": "gemini-2.5-pro", "verdict": "SHIP"},
+            {"iteration": 2, "model": "gemini-adversarial", "verdict": "REVISE"},
+            {"iteration": 2, "model": "claude", "verdict": "SHIP"},
+        ]
+        result = detect_persistent_dissent(
+            state_dir, current_iteration=2, reviews=reviews
+        )
+        assert result is not None
+        assert result["dissenter"] == "adversarial"
+
+    def test_custom_min_consecutive(self, state_dir: Path) -> None:
+        """Custom min_consecutive=3 requires 3 consecutive iterations."""
+        reviews = [
+            {"iteration": 1, "model": "gemini-2.5-pro", "verdict": "SHIP"},
+            {
+                "iteration": 1,
+                "model": "gemini-2.5-pro-adversarial",
+                "verdict": "REVISE",
+            },
+            {"iteration": 1, "model": "claude", "verdict": "SHIP"},
+            {"iteration": 2, "model": "gemini-2.5-pro", "verdict": "SHIP"},
+            {
+                "iteration": 2,
+                "model": "gemini-2.5-pro-adversarial",
+                "verdict": "REVISE",
+            },
+            {"iteration": 2, "model": "claude", "verdict": "SHIP"},
+        ]
+        # Default min_consecutive=2 would detect it
+        result_default = detect_persistent_dissent(
+            state_dir, current_iteration=2, reviews=reviews
+        )
+        assert result_default is not None
+
+        # min_consecutive=3 should not detect it
+        result_strict = detect_persistent_dissent(
+            state_dir, current_iteration=2, reviews=reviews, min_consecutive=3
+        )
+        assert result_strict is None
+
+    def test_dissent_not_detected_when_streak_breaks_mid_history(
+        self, state_dir: Path
+    ) -> None:
+        """Streak broken in the middle: iter 1 adversarial REVISE, iter 2 all SHIP,
+        iter 3 adversarial REVISE — no 2-consecutive pattern from iter 3."""
+        reviews = [
+            {"iteration": 1, "model": "gemini-2.5-pro", "verdict": "SHIP"},
+            {
+                "iteration": 1,
+                "model": "gemini-2.5-pro-adversarial",
+                "verdict": "REVISE",
+            },
+            {"iteration": 1, "model": "claude", "verdict": "SHIP"},
+            {"iteration": 2, "model": "gemini-2.5-pro", "verdict": "SHIP"},
+            {"iteration": 2, "model": "gemini-2.5-pro-adversarial", "verdict": "SHIP"},
+            {"iteration": 2, "model": "claude", "verdict": "SHIP"},
+            {"iteration": 3, "model": "gemini-2.5-pro", "verdict": "SHIP"},
+            {
+                "iteration": 3,
+                "model": "gemini-2.5-pro-adversarial",
+                "verdict": "REVISE",
+            },
+            {"iteration": 3, "model": "claude", "verdict": "SHIP"},
+        ]
+        result = detect_persistent_dissent(
+            state_dir, current_iteration=3, reviews=reviews
+        )
+        assert result is None
+
+
+class TestLogDissentOverride:
+    """Tests for log_dissent_override function."""
+
+    def test_writes_override_record(self, state_dir: Path) -> None:
+        log_dissent_override(
+            state_dir,
+            iteration=3,
+            dissenter="adversarial",
+            consecutive_count=2,
+            dissent_iterations=[2, 3],
+        )
+        log_path = state_dir / "review-log.jsonl"
+        record = json.loads(log_path.read_text(encoding="utf-8").strip())
+        assert record["type"] == "dissent_override"
+        assert record["iteration"] == 3
+        assert record["dissenter"] == "adversarial"
+        assert record["consecutive_count"] == 2
+        assert record["dissent_iterations"] == [2, 3]
+        assert "timestamp" in record
+
+    def test_override_coexists_with_reviews(self, state_dir: Path) -> None:
+        """Override record is appended after review records."""
+        log_review(
+            state_dir,
+            iteration=1,
+            model="gemini-2.5-pro",
+            verdict="SHIP",
+            feedback="OK",
+        )
+        log_review(
+            state_dir,
+            iteration=1,
+            model="claude",
+            verdict="REVISE",
+            feedback="Nope",
+        )
+        log_dissent_override(
+            state_dir,
+            iteration=2,
+            dissenter="claude",
+            consecutive_count=2,
+            dissent_iterations=[1, 2],
+        )
+        log_path = state_dir / "review-log.jsonl"
+        lines = log_path.read_text(encoding="utf-8").strip().splitlines()
+        assert len(lines) == 3
+        assert json.loads(lines[0])["type"] == "review"
+        assert json.loads(lines[1])["type"] == "review"
+        assert json.loads(lines[2])["type"] == "dissent_override"
