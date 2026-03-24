@@ -360,15 +360,24 @@ def load_field_baselines(
 def save_field_baselines(
     current_completeness: dict[str, dict[str, float]],
     path: Path | None = None,
+    *,
+    totals: dict[str, int] | None = None,
 ) -> None:
     """Save field completeness baselines, ratcheting up only.
 
     Updates baselines only if current values are higher than existing ones
     or if no baseline exists for a county/field. Never lowers baselines.
 
+    When *totals* is provided, ``total_documents`` for each county is
+    overwritten (not ratcheted) because it represents the current expected
+    window size that changes naturally over time after backfills.
+
     Args:
         current_completeness: Dict of county -> field -> current percentage.
         path: Path to baselines JSON file. Defaults to repo root.
+        totals: Optional dict of county -> total document count in the
+            check window.  When provided, updates the ``total_documents``
+            baseline for each county.
     """
     baselines_path = path or DEFAULT_BASELINES_PATH
     if baselines_path.exists():
@@ -387,6 +396,13 @@ def save_field_baselines(
             # Ratchet: only update if current is higher or no baseline exists.
             if pct > old_pct:
                 existing[county][field] = round(pct, 1)
+
+    # Update total_documents (overwrite, not ratchet) when totals provided.
+    if totals is not None:
+        for county, doc_count in totals.items():
+            if county not in existing:
+                existing[county] = {}
+            existing[county]["total_documents"] = doc_count
 
     raw["field_completeness"] = existing
     with open(baselines_path, "w") as f:
@@ -1766,8 +1782,8 @@ def run_checks(
         alerts.extend(check_scraper_staleness(conn, now, baselines, county))
 
         if update_baselines:
-            current, _totals = _query_field_completeness(conn, now, county)
-            save_field_baselines(current, baselines_path)
+            current, totals = _query_field_completeness(conn, now, county)
+            save_field_baselines(current, baselines_path, totals=totals)
         else:
             alerts.extend(
                 check_field_completeness(conn, now, field_baselines, county, baselines)
@@ -1825,8 +1841,8 @@ def run_checks_full(
         alerts.extend(check_scraper_staleness(conn, now, baselines, county))
 
         if update_baselines:
-            current, _totals = _query_field_completeness(conn, now, county)
-            save_field_baselines(current, baselines_path)
+            current, totals = _query_field_completeness(conn, now, county)
+            save_field_baselines(current, baselines_path, totals=totals)
         else:
             alerts.extend(
                 check_field_completeness(conn, now, field_baselines, county, baselines)
