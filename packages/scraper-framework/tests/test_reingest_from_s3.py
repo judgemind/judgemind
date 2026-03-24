@@ -2383,6 +2383,392 @@ class TestReparseDocumentCaseTypeFromMotionType:
 
 
 # ---------------------------------------------------------------------------
+# case_type fallback from scraper_id (#1836)
+# ---------------------------------------------------------------------------
+
+
+class TestReparseDocumentCaseTypeFromScraperId:
+    """Tests for extract_case_type_from_scraper_id fallback in _apply_regex_fallbacks."""
+
+    def _doc_meta(
+        self,
+        case_number: str | None = None,
+        case_type: str | None = None,
+        scraper_id: str = "ca-oc-tentatives-civil",
+    ) -> dict:
+        return {
+            "document_id": str(_DOC_ID_1),
+            "state": "CA",
+            "county": "Orange",
+            "court_name": "Orange County Superior Court",
+            "source_url": "https://court.example.com/ruling",
+            "captured_at": _CAPTURED_AT_1,
+            "content_hash": "abc123",
+            "format": "html",
+            "case_number": case_number,
+            "case_title": None,
+            "hearing_date": None,
+            "court_id": str(_COURT_ID),
+            "scraper_id": scraper_id,
+            "s3_key": "docs/test.html",
+            "s3_bucket": "test-bucket",
+            "case_type": case_type,
+        }
+
+    @patch.object(reingest, "_load_scraper_registry")
+    def test_case_type_from_scraper_id_civil(
+        self,
+        mock_registry: MagicMock,
+    ) -> None:
+        """case_type derived from scraper_id suffix when case number has no type prefix."""
+        # No case number at all — scraper_id suffix 'civil' should yield case_type.
+        raw = b"<html>The motion is GRANTED</html>"
+        result = reingest._reparse_document(
+            raw,
+            "ca-oc-tentatives-civil",
+            self._doc_meta(case_number=None),
+        )
+
+        assert result["case_type"] == "civil"
+        assert result["extraction_methods"]["case_type"] == "scraper_id"
+
+    @patch.object(reingest, "_load_scraper_registry")
+    def test_case_type_from_scraper_id_probate(
+        self,
+        mock_registry: MagicMock,
+    ) -> None:
+        """Scraper IDs with 'probate' suffix yield probate case_type."""
+        raw = b"<html>Petition is GRANTED</html>"
+        result = reingest._reparse_document(
+            raw,
+            "ca-oc-tentatives-probate",
+            self._doc_meta(
+                case_number=None,
+                scraper_id="ca-oc-tentatives-probate",
+            ),
+        )
+
+        assert result["case_type"] == "probate"
+        assert result["extraction_methods"]["case_type"] == "scraper_id"
+
+    @patch.object(reingest, "_load_scraper_registry")
+    def test_case_number_prefix_takes_priority_over_scraper_id(
+        self,
+        mock_registry: MagicMock,
+    ) -> None:
+        """case_type from case number prefix is NOT overridden by scraper_id fallback."""
+        # CVPS prefix => "civil" from case number.
+        # scraper_id is also civil, but the extraction method should be "regex"
+        # (from case number), not "scraper_id".
+        raw = b"<html>The motion is GRANTED</html>"
+        result = reingest._reparse_document(
+            raw,
+            "ca-oc-tentatives-civil",
+            self._doc_meta(case_number="CVPS2306157"),
+        )
+
+        assert result["case_type"] == "civil"
+        assert result["extraction_methods"]["case_type"] == "regex"
+
+    @patch.object(reingest, "_load_scraper_registry")
+    def test_scraper_id_takes_priority_over_motion_type(
+        self,
+        mock_registry: MagicMock,
+    ) -> None:
+        """scraper_id fallback fires before motion_type fallback."""
+        # No case number, scraper_id suffix is "civil".
+        # The text also contains a motion that would resolve to "civil" via
+        # motion_type fallback — but scraper_id should fire first.
+        raw = b"<html>Motion to Compel is GRANTED</html>"
+        result = reingest._reparse_document(
+            raw,
+            "ca-oc-tentatives-civil",
+            self._doc_meta(case_number=None),
+        )
+
+        assert result["case_type"] == "civil"
+        # Should be "scraper_id", not "motion_type"
+        assert result["extraction_methods"]["case_type"] == "scraper_id"
+
+    @patch.object(reingest, "_load_scraper_registry")
+    def test_no_fallback_when_case_type_from_metadata(
+        self,
+        mock_registry: MagicMock,
+    ) -> None:
+        """case_type from doc metadata is NOT overridden by scraper_id fallback."""
+        raw = b"<html>The motion is GRANTED</html>"
+        result = reingest._reparse_document(
+            raw,
+            "ca-oc-tentatives-civil",
+            self._doc_meta(case_number=None, case_type="family"),
+        )
+
+        assert result["case_type"] == "family"
+        assert result["extraction_methods"].get("case_type") != "scraper_id"
+
+    @patch.object(reingest, "_load_scraper_registry")
+    def test_unknown_scraper_id_falls_through_to_motion_type(
+        self,
+        mock_registry: MagicMock,
+    ) -> None:
+        """Unknown scraper_id falls through to motion_type fallback."""
+        raw = b"<html>Motion to Compel is GRANTED</html>"
+        result = reingest._reparse_document(
+            raw,
+            "unknown-scraper",
+            self._doc_meta(
+                case_number="202300574258",
+                scraper_id="unknown-scraper",
+            ),
+        )
+
+        assert result["case_type"] == "civil"
+        assert result["extraction_methods"]["case_type"] == "motion_type"
+
+
+# ---------------------------------------------------------------------------
+# parties fallback from case title caption (#1836)
+# ---------------------------------------------------------------------------
+
+
+class TestReparseDocumentPartiesFromCaption:
+    """Tests for extract_parties_from_caption fallback in _apply_regex_fallbacks."""
+
+    def _doc_meta(
+        self,
+        case_title: str | None = None,
+        case_number: str | None = "24STCV12345",
+    ) -> dict:
+        return {
+            "document_id": str(_DOC_ID_1),
+            "state": "CA",
+            "county": "Los Angeles",
+            "court_name": "Los Angeles Superior Court",
+            "source_url": "https://court.example.com/ruling",
+            "captured_at": _CAPTURED_AT_1,
+            "content_hash": "abc123",
+            "format": "html",
+            "case_number": case_number,
+            "case_title": case_title,
+            "hearing_date": None,
+            "court_id": str(_COURT_ID),
+            "scraper_id": "ca-la-tentatives-civil",
+            "s3_key": "docs/test.html",
+            "s3_bucket": "test-bucket",
+        }
+
+    @patch.object(reingest, "_load_scraper_registry")
+    def test_parties_extracted_from_case_title(
+        self,
+        mock_registry: MagicMock,
+    ) -> None:
+        """Parties are extracted from case_title when none are provided."""
+        raw = b"<html>The motion is GRANTED</html>"
+        result = reingest._reparse_document(
+            raw,
+            "ca-la-tentatives-civil",
+            self._doc_meta(case_title="Smith v. Jones"),
+        )
+
+        assert len(result["parties"]) >= 2
+        names = {p["name"] for p in result["parties"]}
+        assert "Smith" in names
+        assert "Jones" in names
+        roles = {p["role"] for p in result["parties"]}
+        assert "plaintiff" in roles
+        assert "defendant" in roles
+        assert result["extraction_methods"]["parties"] == "regex"
+
+    @patch.object(reingest, "_load_scraper_registry")
+    def test_parties_not_extracted_when_already_present(
+        self,
+        mock_registry: MagicMock,
+    ) -> None:
+        """Parties from scraper are NOT overridden by caption fallback."""
+        raw = b"<html>The motion is GRANTED</html>"
+        meta = self._doc_meta(case_title="Smith v. Jones")
+
+        # Create a mock scraper that provides parties
+        mock_scraper_cls = MagicMock()
+        mock_parsed = MagicMock()
+        mock_parsed.ruling_text = "The motion is GRANTED"
+        mock_parsed.case_number = "24STCV12345"
+        mock_parsed.case_title = "Smith v. Jones"
+        mock_parsed.judge_name = None
+        mock_parsed.outcome = None
+        mock_parsed.motion_type = None
+        mock_parsed.department = None
+        mock_parsed.parties = [{"name": "Alpha Corp", "role": "plaintiff"}]
+        mock_parsed.hearing_date = None
+        mock_parsed.case_type = None
+        mock_scraper_cls.return_value.parse_document.return_value = mock_parsed
+        reingest._SCRAPER_REGISTRY["ca-la-tentatives-civil"] = mock_scraper_cls
+
+        try:
+            result = reingest._reparse_document(
+                raw,
+                "ca-la-tentatives-civil",
+                meta,
+            )
+            # Scraper-provided parties should be preserved
+            assert len(result["parties"]) == 1
+            assert result["parties"][0]["name"] == "Alpha Corp"
+        finally:
+            reingest._SCRAPER_REGISTRY.pop("ca-la-tentatives-civil", None)
+
+    @patch.object(reingest, "_load_scraper_registry")
+    def test_parties_not_extracted_when_no_case_title(
+        self,
+        mock_registry: MagicMock,
+    ) -> None:
+        """No parties are extracted when case_title is None."""
+        raw = b"<html>The motion is GRANTED</html>"
+        result = reingest._reparse_document(
+            raw,
+            "ca-la-tentatives-civil",
+            self._doc_meta(case_title=None),
+        )
+
+        assert result["parties"] == []
+
+    @patch.object(reingest, "_load_scraper_registry")
+    def test_parties_from_regex_extracted_case_title(
+        self,
+        mock_registry: MagicMock,
+    ) -> None:
+        """Parties are extracted even when case_title comes from regex fallback."""
+        # No case_title in metadata, but the text contains a parseable caption
+        raw = b"<html>Case No. 24STCV99999\nAlpha Corp v. Beta LLC\nThe motion is GRANTED</html>"
+        result = reingest._reparse_document(
+            raw,
+            "ca-la-tentatives-civil",
+            self._doc_meta(case_title=None, case_number=None),
+        )
+
+        # case_title must have been extracted by regex first
+        assert result["case_title"] is not None
+        assert "Alpha Corp v. Beta LLC" in result["case_title"]
+        assert result["extraction_methods"].get("case_title") == "regex"
+
+        # Then parties should have been extracted from that title
+        assert len(result["parties"]) >= 2
+        assert result["extraction_methods"].get("parties") == "regex"
+        names = {p["name"] for p in result["parties"]}
+        assert "Alpha Corp" in names
+        assert "Beta LLC" in names
+
+
+# ---------------------------------------------------------------------------
+# scraper_id fallback in split path (#1836)
+# ---------------------------------------------------------------------------
+
+
+class TestFullReparseDocumentScraperIdFallback:
+    """Tests for scraper_id fallback in _full_reparse_document split path."""
+
+    def _doc_meta(self, **overrides: Any) -> dict:
+        meta = {
+            "document_id": str(_DOC_ID_1),
+            "state": "CA",
+            "county": "Orange",
+            "court_name": "Orange County Superior Court",
+            "source_url": "https://court.example.com/ruling.pdf",
+            "captured_at": _CAPTURED_AT_1,
+            "content_hash": "abc123",
+            "format": "pdf",
+            "case_number": None,
+            "case_title": None,
+            "case_type": None,
+            "hearing_date": _HEARING_DATE,
+            "court_id": str(_COURT_ID),
+            "scraper_id": "ca-oc-tentatives-civil",
+            "s3_key": "docs/test.pdf",
+            "s3_bucket": "test-bucket",
+        }
+        meta.update(overrides)
+        return meta
+
+    @patch.object(reingest, "_load_scraper_registry")
+    @patch.object(reingest, "_extract_text_from_content")
+    def test_split_path_applies_case_type_from_scraper_id(
+        self,
+        mock_extract: MagicMock,
+        mock_registry: MagicMock,
+    ) -> None:
+        """Split rulings with no case number get case_type from scraper_id (#1836)."""
+        from courts.ca.riverside_tentatives import SplitRuling
+
+        # No case numbers at all — scraper_id suffix should provide case_type
+        rulings = [
+            SplitRuling(1, None, "Ruling text", "Smith v. Jones", "Demurrer", "Granted"),
+            SplitRuling(2, None, "Other ruling", "Doe v. Roe", None, None),
+        ]
+        mock_split = MagicMock(return_value=rulings)
+        reingest._SPLIT_REGISTRY["ca-oc-tentatives-civil"] = mock_split
+        reingest._SCRAPER_REGISTRY.pop("ca-oc-tentatives-civil", None)
+        mock_extract.return_value = "pdf text"
+
+        try:
+            result = reingest._full_reparse_document(
+                b"raw pdf",
+                "ca-oc-tentatives-civil",
+                self._doc_meta(),
+            )
+
+            assert len(result) == 2
+            # Both should get case_type from scraper_id
+            assert result[0]["case_type"] == "civil"
+            assert result[0]["extraction_methods"]["case_type"] == "scraper_id"
+            assert result[1]["case_type"] == "civil"
+            assert result[1]["extraction_methods"]["case_type"] == "scraper_id"
+        finally:
+            reingest._SPLIT_REGISTRY.pop("ca-oc-tentatives-civil", None)
+
+    @patch.object(reingest, "_load_scraper_registry")
+    @patch.object(reingest, "_extract_text_from_content")
+    def test_split_path_applies_parties_from_caption(
+        self,
+        mock_extract: MagicMock,
+        mock_registry: MagicMock,
+    ) -> None:
+        """Split rulings with case titles get parties from caption fallback (#1836)."""
+        from courts.ca.riverside_tentatives import SplitRuling
+
+        rulings = [
+            SplitRuling(1, "CVPS2306157", "Ruling text", "Smith v. Jones", "Demurrer", "Granted"),
+            SplitRuling(2, "FL2301234", "Family ruling", "Doe v. Roe", None, None),
+        ]
+        mock_split = MagicMock(return_value=rulings)
+        reingest._SPLIT_REGISTRY["test-parties-split"] = mock_split
+        reingest._SCRAPER_REGISTRY.pop("test-parties-split", None)
+        mock_extract.return_value = "pdf text"
+
+        try:
+            result = reingest._full_reparse_document(
+                b"raw pdf",
+                "test-parties-split",
+                self._doc_meta(scraper_id="test-parties-split"),
+            )
+
+            assert len(result) == 2
+            # First ruling: "Smith v. Jones" -> parties
+            assert len(result[0]["parties"]) >= 2
+            names_0 = {p["name"] for p in result[0]["parties"]}
+            assert "Smith" in names_0
+            assert "Jones" in names_0
+            assert result[0]["extraction_methods"]["parties"] == "regex"
+
+            # Second ruling: "Doe v. Roe" -> parties
+            assert len(result[1]["parties"]) >= 2
+            names_1 = {p["name"] for p in result[1]["parties"]}
+            assert "Doe" in names_1
+            assert "Roe" in names_1
+            assert result[1]["extraction_methods"]["parties"] == "regex"
+        finally:
+            reingest._SPLIT_REGISTRY.pop("test-parties-split", None)
+
+
+# ---------------------------------------------------------------------------
 # LLM extraction in reingest_batch — llm_client passthrough
 # ---------------------------------------------------------------------------
 

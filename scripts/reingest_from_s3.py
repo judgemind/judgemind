@@ -84,10 +84,12 @@ from ingestion.extract import (  # noqa: E402
     extract_case_title,
     extract_case_type_from_motion_type,
     extract_case_type_from_number,
+    extract_case_type_from_scraper_id,
     extract_hearing_date,
     extract_judge_name,
     extract_motion_type,
     extract_outcome,
+    extract_parties_from_caption,
 )
 from ingestion.llm_extract import (  # noqa: E402
     LLMExtractionResult,
@@ -415,21 +417,25 @@ def _match_ruling(
     return llm_result.rulings[0]
 
 
-def _apply_regex_fallbacks(extracted: dict, text: str) -> None:
+def _apply_regex_fallbacks(extracted: dict, text: str, scraper_id: str = "") -> None:
     """Apply the regex fallback chain to fill any fields still missing.
 
     Mutates *extracted* in place.  Expects ``extracted["extraction_methods"]``
     to already exist as a ``dict``.
 
-    The fallback order is:
+    The fallback order mirrors ``worker.py`` to ensure reingest produces the
+    same field completeness as live ingestion:
+
       1. judge_name, outcome, motion_type, case_number, case_title, hearing_date
          — each extracted from *text* via the corresponding ``extract_*`` helper.
-      2. case_type from case-number prefix (``extract_case_type_from_number``).
-      3. case_type from motion_type (``extract_case_type_from_motion_type``).
+      2. parties from case_title caption (``extract_parties_from_caption``).
+      3. case_type from case-number prefix (``extract_case_type_from_number``).
+      4. case_type from scraper_id suffix (``extract_case_type_from_scraper_id``).
+      5. case_type from motion_type (``extract_case_type_from_motion_type``).
 
     This function is called from both ``_reparse_document()`` (single-doc path)
     and ``_full_reparse_document()`` (split-doc path) to keep the fallback
-    chains in sync — see #1763 / #1749.
+    chains in sync — see #1763 / #1749 / #1836.
     """
     methods = extracted["extraction_methods"]
 
@@ -464,6 +470,15 @@ def _apply_regex_fallbacks(extracted: dict, text: str) -> None:
             extracted["hearing_date"] = val
             methods.setdefault("hearing_date", "regex")
 
+    # Fallback parties from case_title caption (#1836).
+    # When no parties were provided by the scraper or LLM, try to extract
+    # plaintiff/defendant from a "X v. Y" style case title.
+    if not extracted.get("parties") and extracted.get("case_title"):
+        parties = extract_parties_from_caption(extracted["case_title"])
+        if parties:
+            extracted["parties"] = parties
+            methods.setdefault("parties", "regex")
+
     # Fallback case_type from case number prefix (#706).
     if not extracted["case_type"] and extracted["case_number"]:
         val = extract_case_type_from_number(extracted["case_number"])
@@ -471,11 +486,21 @@ def _apply_regex_fallbacks(extracted: dict, text: str) -> None:
             extracted["case_type"] = val
             methods.setdefault("case_type", "regex")
 
+    # Fallback case_type from scraper_id (#1524 / #1836).
+    # When the case number is absent or doesn't encode a type prefix
+    # (e.g. OC North JC PDFs have no case numbers), infer from the
+    # scraper_id which encodes the case category in its suffix.
+    if not extracted["case_type"] and scraper_id:
+        val = extract_case_type_from_scraper_id(scraper_id)
+        if val:
+            extracted["case_type"] = val
+            methods.setdefault("case_type", "scraper_id")
+
     # Fallback case_type from motion_type (#1731).
     # Final fallback for cases where the case number has no embedded
-    # type code (e.g. Ventura's all-digit case numbers like
-    # 202300574258).  Many civil motion types unambiguously identify
-    # the case type.
+    # type code and the scraper_id is generic (e.g. Ventura's
+    # all-digit case numbers like 202300574258).  Many civil motion
+    # types unambiguously identify the case type.
     if not extracted["case_type"] and extracted["motion_type"]:
         val = extract_case_type_from_motion_type(extracted["motion_type"])
         if val:
@@ -701,7 +726,7 @@ def _reparse_document(
     # Regex fallback — fill any fields still missing after scraper + LLM
     # ------------------------------------------------------------------
     extracted["extraction_methods"] = extraction_methods
-    _apply_regex_fallbacks(extracted, text)
+    _apply_regex_fallbacks(extracted, text, scraper_id=scraper_id)
 
     if extraction_methods:
         logger.info(
@@ -903,7 +928,9 @@ def _full_reparse_document(
         # Regex fallback — fill any fields still missing after split (#1749)
         # Uses the shared helper to stay in sync with _reparse_document().
         # ------------------------------------------------------------------
-        _apply_regex_fallbacks(extracted, extracted["ruling_text"])
+        _apply_regex_fallbacks(
+            extracted, extracted["ruling_text"], scraper_id=scraper_id
+        )
 
         results.append(extracted)
 
