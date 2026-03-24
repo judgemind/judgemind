@@ -15,9 +15,7 @@ resource "aws_vpc" "main" {
   enable_dns_hostnames = true
 
   tags = {
-    Name        = "judgemind-${var.environment}"
-    project     = "judgemind"
-    environment = var.environment
+    Name = "judgemind-${var.environment}"
   }
 }
 
@@ -27,9 +25,7 @@ resource "aws_internet_gateway" "main" {
   vpc_id = aws_vpc.main.id
 
   tags = {
-    Name        = "judgemind-igw-${var.environment}"
-    project     = "judgemind"
-    environment = var.environment
+    Name = "judgemind-igw-${var.environment}"
   }
 }
 
@@ -46,10 +42,8 @@ resource "aws_subnet" "public" {
   map_public_ip_on_launch = false
 
   tags = {
-    Name        = "judgemind-public-${count.index + 1}-${var.environment}"
-    project     = "judgemind"
-    environment = var.environment
-    tier        = "public"
+    Name = "judgemind-public-${count.index + 1}-${var.environment}"
+    tier = "public"
   }
 }
 
@@ -63,9 +57,7 @@ resource "aws_route_table" "public" {
   }
 
   tags = {
-    Name        = "judgemind-public-rt-${var.environment}"
-    project     = "judgemind"
-    environment = var.environment
+    Name = "judgemind-public-rt-${var.environment}"
   }
 }
 
@@ -85,9 +77,7 @@ resource "aws_eip" "nat" {
   domain = "vpc"
 
   tags = {
-    Name        = "judgemind-nat-eip-${var.environment}"
-    project     = "judgemind"
-    environment = var.environment
+    Name = "judgemind-nat-eip-${var.environment}"
   }
 
   depends_on = [aws_internet_gateway.main]
@@ -98,9 +88,7 @@ resource "aws_nat_gateway" "main" {
   subnet_id     = aws_subnet.public[0].id
 
   tags = {
-    Name        = "judgemind-nat-${var.environment}"
-    project     = "judgemind"
-    environment = var.environment
+    Name = "judgemind-nat-${var.environment}"
   }
 
   depends_on = [aws_internet_gateway.main]
@@ -118,10 +106,8 @@ resource "aws_subnet" "private" {
   availability_zone = var.availability_zones[count.index]
 
   tags = {
-    Name        = "judgemind-private-${count.index + 1}-${var.environment}"
-    project     = "judgemind"
-    environment = var.environment
-    tier        = "private"
+    Name = "judgemind-private-${count.index + 1}-${var.environment}"
+    tier = "private"
   }
 }
 
@@ -135,9 +121,7 @@ resource "aws_route_table" "private" {
   }
 
   tags = {
-    Name        = "judgemind-private-rt-${var.environment}"
-    project     = "judgemind"
-    environment = var.environment
+    Name = "judgemind-private-rt-${var.environment}"
   }
 }
 

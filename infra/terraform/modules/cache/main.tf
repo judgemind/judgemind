@@ -38,11 +38,6 @@ resource "aws_security_group" "redis" {
     protocol    = "-1"
     cidr_blocks = ["0.0.0.0/0"]
   }
-
-  tags = {
-    project     = "judgemind"
-    environment = var.environment
-  }
 }
 
 # ─── ElastiCache Redis Cluster ─────────────────────────────────────────────
@@ -60,8 +55,6 @@ resource "aws_elasticache_cluster" "redis" {
   security_group_ids = [aws_security_group.redis.id]
 
   tags = {
-    Name        = "judgemind-${var.environment}"
-    project     = "judgemind"
-    environment = var.environment
+    Name = "judgemind-${var.environment}"
   }
 }

@@ -11,11 +11,6 @@ data "aws_region" "current" {}
 resource "aws_cloudwatch_log_group" "api" {
   name              = "/ecs/judgemind-api-${var.environment}"
   retention_in_days = var.log_retention_days
-
-  tags = {
-    project     = "judgemind"
-    environment = var.environment
-  }
 }
 
 # ─── ACM Certificate ────────────────────────────────────────────────────────
@@ -26,11 +21,6 @@ resource "aws_cloudwatch_log_group" "api" {
 resource "aws_acm_certificate" "api" {
   domain_name       = var.domain_name
   validation_method = "DNS"
-
-  tags = {
-    project     = "judgemind"
-    environment = var.environment
-  }
 
   lifecycle {
     create_before_destroy = true
@@ -66,11 +56,6 @@ resource "aws_security_group" "alb" {
     to_port     = var.container_port
     protocol    = "tcp"
     cidr_blocks = ["0.0.0.0/0"]
-  }
-
-  tags = {
-    project     = "judgemind"
-    environment = var.environment
   }
 }
 
@@ -112,11 +97,6 @@ resource "aws_security_group" "api_task" {
     protocol    = "tcp"
     cidr_blocks = ["0.0.0.0/0"]
   }
-
-  tags = {
-    project     = "judgemind"
-    environment = var.environment
-  }
 }
 
 # ─── Application Load Balancer ──────────────────────────────────────────────
@@ -127,11 +107,6 @@ resource "aws_lb" "api" {
   load_balancer_type = "application"
   security_groups    = [aws_security_group.alb.id]
   subnets            = var.public_subnet_ids
-
-  tags = {
-    project     = "judgemind"
-    environment = var.environment
-  }
 }
 
 resource "aws_lb_target_group" "api" {
@@ -151,11 +126,6 @@ resource "aws_lb_target_group" "api" {
     timeout             = 5
     interval            = 30
     matcher             = "200"
-  }
-
-  tags = {
-    project     = "judgemind"
-    environment = var.environment
   }
 }
 
@@ -349,11 +319,6 @@ resource "aws_ecs_task_definition" "api" {
       }
     }
   ])
-
-  tags = {
-    project     = "judgemind"
-    environment = var.environment
-  }
 }
 
 # ─── ECS Service ────────────────────────────────────────────────────────────
@@ -384,11 +349,6 @@ resource "aws_ecs_service" "api" {
   }
 
   depends_on = [aws_lb_listener.https]
-
-  tags = {
-    project     = "judgemind"
-    environment = var.environment
-  }
 }
 
 # ─── CloudWatch Alarms ────────────────────────────────────────────────────────

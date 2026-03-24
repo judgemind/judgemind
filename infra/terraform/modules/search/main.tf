@@ -41,9 +41,7 @@ resource "aws_security_group" "opensearch" {
   }
 
   tags = {
-    Name        = "judgemind-opensearch-${var.environment}"
-    project     = "judgemind"
-    environment = var.environment
+    Name = "judgemind-opensearch-${var.environment}"
   }
 }
 
@@ -107,9 +105,7 @@ resource "aws_opensearch_domain" "main" {
   })
 
   tags = {
-    Name        = "judgemind-opensearch-${var.environment}"
-    project     = "judgemind"
-    environment = var.environment
+    Name = "judgemind-opensearch-${var.environment}"
   }
 }
 
