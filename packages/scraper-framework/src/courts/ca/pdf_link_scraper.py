@@ -67,6 +67,12 @@ class PdfLinkConfig:
     # HTTP
     verify_ssl: bool = True
 
+    # When True (default), links whose text does not match link_text_re are
+    # skipped before fetching (#1845).  Set to False for courts where link
+    # text doesn't follow a predictable pattern (e.g. Fresno, where link
+    # text is a date and department is extracted from the URL filename).
+    filter_by_link_text: bool = True
+
     # Case number regex applied to extracted PDF text
     case_number_re: re.Pattern = field(default_factory=lambda: re.compile(r"\b\d{2}-\d{8}\b"))
 
@@ -124,6 +130,22 @@ class PdfLinkScraper(BaseScraper):
             self._log.info("Found PDF links", count=len(links))
 
             for href, link_text in links:
+                # Filter: skip links whose text does not match the expected
+                # pattern (#1845).  All legitimate ruling PDFs have link text
+                # matching link_text_re (e.g. "Department X - Honorable Y").
+                # Non-matching links are unrelated documents (escheat notices,
+                # admin orders, claim forms) that happen to be on the same page.
+                # Some courts (Fresno, CC) use link text that doesn't follow
+                # a predictable pattern — they opt out via filter_by_link_text=False.
+                if pc.filter_by_link_text and not pc.link_text_re.search(link_text):
+                    self._log.warning(
+                        "Skipping PDF link — text does not match expected pattern",
+                        link_text=link_text,
+                        url=href,
+                        pattern=pc.link_text_re.pattern,
+                    )
+                    continue
+
                 time.sleep(self.config.request_delay_seconds)
                 try:
                     doc = self._fetch_one_pdf(client, href, link_text)

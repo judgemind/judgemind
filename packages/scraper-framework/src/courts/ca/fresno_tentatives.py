@@ -462,6 +462,7 @@ class FresnoTentativeRulingsScraper(PdfLinkScraper):
             link_text_re=_LINK_TEXT_RE,
             courthouse_from_dept=_fresno_courthouse,
             verify_ssl=True,
+            filter_by_link_text=False,  # link text is a date, not dept/judge
             case_number_re=_CASE_NUMBER_RE,
         )
         super().__init__(config, pdf_config=pdf_config, **kwargs)

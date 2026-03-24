@@ -50,9 +50,11 @@ INDEX_URL = "https://www.occourts.org/online-services/tentative-rulings/civil-te
 BASE_URL = "https://www.occourts.org"
 
 # Link text: "LASTNAME, Firstname [I.] - Dept CX101"
+# Also matches "LASTNAME Firstname [I.] - Dept CX105" (comma optional — the
+# OC website is inconsistent; e.g. "McCORMICK Melissa R. - Dept CX105").
 # Captures last->first separately so we can reconstruct "Firstname Lastname"
 _LINK_TEXT_RE = re.compile(
-    r"^(?P<last>[A-Z][A-Z\s']+),\s*(?P<first>[^-]+?)\s*-\s*Dept\.?\s*(?P<department>\S+)",
+    r"^(?P<last>[A-Z][A-Z\s']+),?\s*(?P<first>[^-]+?)\s*-\s*Dept\.?\s*(?P<department>\S+)",
     re.IGNORECASE,
 )
 
@@ -62,8 +64,9 @@ def _oc_link_text_re() -> re.Pattern:
     # PdfLinkConfig expects 'judge_name' and 'department' groups.
     # We post-process in _oc_courthouse to derive judge_name from last+first.
     # Use a wrapper regex that captures all three groups.
+    # Comma is optional — the OC website is inconsistent (see #1845).
     return re.compile(
-        r"^(?P<judge_name>(?P<last>[A-Z][A-Z\s']+),\s*(?P<first>[^-]+?))\s*-\s*Dept\.?\s*(?P<department>\S+)",
+        r"^(?P<judge_name>(?P<last>[A-Z][A-Z\s']+),?\s*(?P<first>[^-]+?))\s*-\s*Dept\.?\s*(?P<department>\S+)",
         re.IGNORECASE,
     )
 
