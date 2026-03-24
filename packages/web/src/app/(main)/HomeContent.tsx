@@ -14,6 +14,7 @@ import {
   getOutcomeBadgeVariant,
   getOutcomeBadgeListClass,
 } from '@/lib/display-helpers';
+import { Wordmark } from '@/components/Wordmark';
 import { PAGE_TITLE, SECTION_HEADING } from '@/lib/typography';
 
 const PLATFORM_STATS_QUERY = gql`
@@ -297,7 +298,7 @@ export function HomeContent() {
           Free legal research for everyone
         </h1>
         <p className="mt-4 text-lg text-muted-foreground">
-          Judgemind captures California tentative rulings and judicial analytics — open source,
+          <Wordmark size="sm" className="font-normal" /> captures California tentative rulings and judicial analytics — open source,
           free forever.
         </p>
       </div>

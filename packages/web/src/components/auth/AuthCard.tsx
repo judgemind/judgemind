@@ -1,6 +1,7 @@
 'use client';
 
 import Link from 'next/link';
+import { Wordmark } from '@/components/Wordmark';
 import {
   Card,
   CardContent,
@@ -17,7 +18,7 @@ interface AuthCardProps {
 }
 
 /**
- * Shared wrapper for auth pages — centered card with the Judgemind logo.
+ * Shared wrapper for auth pages — centered card with the wordmark logo.
  * Uses shadcn Card for consistent styling and dark mode support.
  */
 export function AuthCard({ title, children }: AuthCardProps) {
@@ -27,9 +28,9 @@ export function AuthCard({ title, children }: AuthCardProps) {
         <div className="mb-8 text-center">
           <Link
             href="/"
-            className="rounded-md text-2xl font-bold text-brand-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 dark:text-brand-accent-light"
+            className="rounded-md focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
           >
-            Judgemind
+            <Wordmark size="lg" />
           </Link>
         </div>
         <Card>

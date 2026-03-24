@@ -58,10 +58,11 @@ describe('Header', () => {
     mockPathname = '/search';
   });
 
-  it('renders the Judgemind logo', () => {
+  it('renders the wordmark logo', () => {
     render(<Header />);
-    expect(screen.getByText('Judgemind')).toBeInTheDocument();
-    expect(screen.getByText('Judgemind').closest('a')).toHaveAttribute(
+    expect(screen.getByText('judge')).toBeInTheDocument();
+    expect(screen.getByText('mind')).toBeInTheDocument();
+    expect(screen.getByText('judge').closest('a')).toHaveAttribute(
       'href',
       '/',
     );

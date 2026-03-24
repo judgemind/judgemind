@@ -45,11 +45,11 @@ describe('AuthCard', () => {
     expect(screen.getByTestId('child')).toBeInTheDocument();
   });
 
-  it('renders the Judgemind logo link', () => {
+  it('renders the wordmark logo link', () => {
     render(<AuthCard title="Title">Content</AuthCard>);
-    const link = screen.getByText('Judgemind');
-    expect(link).toBeInTheDocument();
-    expect(link.closest('a')).toHaveAttribute('href', '/');
+    expect(screen.getByText('judge')).toBeInTheDocument();
+    expect(screen.getByText('mind')).toBeInTheDocument();
+    expect(screen.getByText('judge').closest('a')).toHaveAttribute('href', '/');
   });
 });
 

@@ -81,12 +81,15 @@ describe('HomePage', () => {
     ).toBeInTheDocument();
   });
 
-  it('renders the description', () => {
+  it('renders the description with wordmark', () => {
     mockUseQuery.mockReturnValue({ data: null, loading: true, error: null });
     render(<HomePage />);
     expect(
-      screen.getByText(/Judgemind captures California tentative rulings/),
+      screen.getByText(/captures California tentative rulings/),
     ).toBeInTheDocument();
+    // Wordmark renders "judge" and "mind" as separate spans
+    expect(screen.getByText('judge')).toBeInTheDocument();
+    expect(screen.getByText('mind')).toBeInTheDocument();
   });
 
   it('renders CTA buttons using Button component (no inline bg-brand-600)', () => {
