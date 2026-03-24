@@ -414,6 +414,51 @@ class TestExtractCaseTitleFromInfo:
         result = _extract_case_title_from_info("2024-01393434")
         assert result is None
 
+    def test_newlines_replaced_with_spaces(self) -> None:
+        """Embedded newlines in case_info are collapsed to spaces."""
+        result = _extract_case_title_from_info("Bevli vs.\nFirestone")
+        assert result == "Bevli vs. Firestone"
+
+    def test_case_number_fragments_removed(self) -> None:
+        """OC-style case number fragments are stripped from the title."""
+        result = _extract_case_title_from_info("Bevli vs.\nFirestone\n30-2024-\n-CU-\nOR-CJC")
+        assert result == "Bevli vs. Firestone"
+
+    def test_court_name_fragments_removed(self) -> None:
+        """Court name fragments are stripped from the title."""
+        result = _extract_case_title_from_info(
+            "Superior Court of the State of California\nSmith v. Jones"
+        )
+        assert result == "Smith v. Jones"
+
+    def test_county_name_fragments_removed(self) -> None:
+        """County name fragments are stripped from the title."""
+        result = _extract_case_title_from_info("County of Orange\nSmith v. Jones")
+        assert result == "Smith v. Jones"
+
+    def test_mixed_fragments_full_cleanup(self) -> None:
+        """Full cleanup of a real-world messy case_info string."""
+        result = _extract_case_title_from_info(
+            "30-2024-01393434\nBevli vs.\nFirestone\n30-2024-\n-CU-\nOR-CJC"
+        )
+        assert result == "Bevli vs. Firestone"
+
+    def test_case_number_suffix_fragments(self) -> None:
+        """Various OC case number suffix patterns are stripped."""
+        # -CL- (limited civil), -PR- (probate), -FL- (family law)
+        result = _extract_case_title_from_info("Smith v. Jones\n-CL-\nOR-CJC")
+        assert result == "Smith v. Jones"
+
+    def test_only_fragments_returns_none(self) -> None:
+        """Returns None when case_info contains only case number fragments."""
+        result = _extract_case_title_from_info("30-2024-\n-CU-\nOR-CJC")
+        assert result is None
+
+    def test_whitespace_collapsed(self) -> None:
+        """Multiple spaces from cleanup are collapsed to single space."""
+        result = _extract_case_title_from_info("Smith  v.   Jones")
+        assert result == "Smith v. Jones"
+
 
 # ---------------------------------------------------------------------------
 # _join_page_rows tests
