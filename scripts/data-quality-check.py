@@ -96,7 +96,7 @@ class Alert:
     """A single data quality alert."""
 
     county: str
-    metric: str  # ingest_rate, scraper_stale, zero_rulings, field_completeness, orphaned_documents
+    metric: str  # ingest_rate, scraper_stale, zero_rulings, field_completeness, orphaned_documents, ecs_service_health
     severity: str  # p1, p2
     expected: float | int | str
     actual: float | int | str
@@ -620,6 +620,183 @@ def check_orphaned_documents(
                     ),
                 )
             )
+
+    return alerts
+
+
+# ---------------------------------------------------------------------------
+# ECS service health check
+# ---------------------------------------------------------------------------
+
+# Default ECS services to monitor when no baselines config is available.
+DEFAULT_ECS_SERVICES: list[dict[str, str]] = [
+    {
+        "cluster": "judgemind-dev",
+        "service": "judgemind-ingestion-worker-dev",
+        "display_name": "Ingestion Worker (dev)",
+    },
+    {
+        "cluster": "judgemind-dev",
+        "service": "judgemind-api-dev",
+        "display_name": "API (dev)",
+    },
+]
+
+
+@dataclass
+class EcsServiceConfig:
+    """Configuration for an ECS service to health-check."""
+
+    cluster: str
+    service: str
+    display_name: str
+
+
+def load_ecs_service_configs(
+    raw: dict[str, Any] | None = None,
+    path: Path | None = None,
+) -> list[EcsServiceConfig]:
+    """Load ECS service monitoring config from baselines JSON.
+
+    Reads the ``ecs_services`` key from the baselines file.  Falls back to
+    ``DEFAULT_ECS_SERVICES`` when the key is absent or the file is unavailable.
+
+    Args:
+        raw: Pre-parsed baselines dict (takes priority over file path).
+        path: Path to baselines JSON file. Defaults to repo root.
+
+    Returns:
+        List of EcsServiceConfig to check.
+    """
+    if raw is None:
+        baselines_path = path or DEFAULT_BASELINES_PATH
+        if baselines_path.exists():
+            with open(baselines_path) as f:
+                raw = json.load(f)
+        else:
+            raw = {}
+
+    services_raw = raw.get("ecs_services", None)
+    if services_raw is None:
+        services_raw = DEFAULT_ECS_SERVICES
+
+    return [
+        EcsServiceConfig(
+            cluster=s["cluster"],
+            service=s["service"],
+            display_name=s.get("display_name", s["service"]),
+        )
+        for s in services_raw
+    ]
+
+
+def check_ecs_service_health(
+    ecs_configs: list[EcsServiceConfig] | None = None,
+    ecs_client: Any | None = None,
+) -> list[Alert]:
+    """Check ECS service health — alerts when runningCount < desiredCount.
+
+    This detects ingestion worker downtime caused by deployment cycling or
+    other ECS issues.  Each configured service is queried via the ECS
+    ``describe_services`` API.
+
+    Args:
+        ecs_configs: List of services to check.  Defaults to
+            ``DEFAULT_ECS_SERVICES`` converted to ``EcsServiceConfig``.
+        ecs_client: Optional pre-built boto3 ECS client (for testing).
+            When *None*, a client is created lazily via ``boto3.client('ecs')``.
+
+    Returns:
+        List of alerts for unhealthy ECS services.
+    """
+    if ecs_configs is None:
+        ecs_configs = [EcsServiceConfig(**s) for s in DEFAULT_ECS_SERVICES]
+
+    if not ecs_configs:
+        return []
+
+    if ecs_client is None:
+        try:
+            import boto3  # noqa: I001
+
+            ecs_client = boto3.client("ecs")
+        except ImportError:
+            logger.warning("boto3 not available — skipping ECS service health check")
+            return []
+        except Exception:
+            logger.warning(
+                "Failed to create ECS client — skipping ECS service health check",
+                exc_info=True,
+            )
+            return []
+
+    alerts: list[Alert] = []
+
+    # Group services by cluster for efficient batch API calls.
+    by_cluster: dict[str, list[EcsServiceConfig]] = {}
+    for cfg in ecs_configs:
+        by_cluster.setdefault(cfg.cluster, []).append(cfg)
+
+    for cluster, services in by_cluster.items():
+        service_names = [s.service for s in services]
+        display_map = {s.service: s.display_name for s in services}
+
+        try:
+            response = ecs_client.describe_services(
+                cluster=cluster,
+                services=service_names,
+            )
+        except Exception:
+            logger.warning(
+                "ECS describe_services failed for cluster %s — skipping",
+                cluster,
+                exc_info=True,
+            )
+            continue
+
+        for svc in response.get("services", []):
+            svc_name = svc.get("serviceName", "unknown")
+            running = svc.get("runningCount", 0)
+            desired = svc.get("desiredCount", 0)
+            display = display_map.get(svc_name, svc_name)
+
+            if desired == 0:
+                # Service is intentionally scaled to zero — skip.
+                continue
+
+            if running < desired:
+                severity = "p1" if running == 0 else "p2"
+                alerts.append(
+                    Alert(
+                        county="INFRASTRUCTURE",
+                        metric="ecs_service_health",
+                        severity=severity,
+                        expected=desired,
+                        actual=running,
+                        message=(
+                            f"{display}: runningCount={running}, "
+                            f"desiredCount={desired} — service is degraded"
+                        ),
+                    )
+                )
+
+        # Check for services that were not found in the response.
+        found_names = {s.get("serviceName") for s in response.get("services", [])}
+        for svc_name in service_names:
+            if svc_name not in found_names:
+                display = display_map.get(svc_name, svc_name)
+                alerts.append(
+                    Alert(
+                        county="INFRASTRUCTURE",
+                        metric="ecs_service_health",
+                        severity="p1",
+                        expected="exists",
+                        actual="not found",
+                        message=(
+                            f"{display}: ECS service not found in cluster {cluster}"
+                        ),
+                    )
+                )
 
     return alerts
 
@@ -1415,6 +1592,7 @@ def run_checks(
     baselines_raw: dict[str, Any] | None = None,
     now: datetime | None = None,
     update_baselines: bool = False,
+    check_ecs: bool = False,
 ) -> list[Alert]:
     """Run all data quality checks.
 
@@ -1426,6 +1604,7 @@ def run_checks(
         now: Override current time (for testing).
         update_baselines: If True, snapshot current field completeness
             as baselines (ratchet up only) and skip alerting.
+        check_ecs: If True, also check ECS service health via AWS API.
 
     Returns:
         List of all alerts found.
@@ -1451,6 +1630,10 @@ def run_checks(
 
         alerts.extend(check_orphaned_documents(conn, now, county))
 
+    if check_ecs:
+        ecs_configs = load_ecs_service_configs(raw=baselines_raw, path=baselines_path)
+        alerts.extend(check_ecs_service_health(ecs_configs))
+
     return alerts
 
 
@@ -1463,6 +1646,7 @@ def run_checks_full(
     now: datetime | None = None,
     update_baselines: bool = False,
     persist: bool = False,
+    check_ecs: bool = False,
 ) -> CheckResult:
     """Run all data quality checks and collect county metrics.
 
@@ -1479,6 +1663,7 @@ def run_checks_full(
         update_baselines: If True, snapshot current field completeness
             as baselines (ratchet up only) and skip alerting.
         persist: If True, write metrics to the data_quality_metrics table.
+        check_ecs: If True, also check ECS service health via AWS API.
 
     Returns:
         CheckResult with alerts and county metrics.
@@ -1511,6 +1696,10 @@ def run_checks_full(
 
         if persist:
             persist_metrics(conn, full_metrics, now)
+
+    if check_ecs:
+        ecs_configs = load_ecs_service_configs(raw=baselines_raw, path=baselines_path)
+        alerts.extend(check_ecs_service_health(ecs_configs))
 
     return CheckResult(alerts=alerts, county_metrics=county_metrics)
 
@@ -1563,6 +1752,7 @@ _METRIC_DISPLAY_NAMES: dict[str, str] = {
     "ingest_rate": "ingest rate drop",
     "scraper_stale": "scraper stale",
     "orphaned_documents": "orphaned documents",
+    "ecs_service_health": "ECS service unhealthy",
 }
 
 # Default GitHub repo for issue filing.
@@ -1903,6 +2093,12 @@ def main() -> None:
         default=False,
         help="Write per-county metrics to the data_quality_metrics table.",
     )
+    parser.add_argument(
+        "--check-ecs",
+        action="store_true",
+        default=False,
+        help="Also check ECS service health (runningCount vs desiredCount).",
+    )
     args = parser.parse_args()
 
     # Weekly summary mode: load snapshots from S3 and generate report.
@@ -1948,6 +2144,7 @@ def main() -> None:
             baselines_raw=baselines_raw,
             update_baselines=args.update_baselines,
             persist=args.persist_metrics,
+            check_ecs=args.check_ecs,
         )
         alerts = check_result.alerts
 
@@ -1984,6 +2181,7 @@ def main() -> None:
             baselines_path=baselines_path,
             baselines_raw=baselines_raw,
             update_baselines=args.update_baselines,
+            check_ecs=args.check_ecs,
         )
 
     if args.text:

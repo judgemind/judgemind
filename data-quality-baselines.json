@@ -45,6 +45,18 @@
       "posting_days": ["Tue", "Wed", "Thu", "Fri"]
     }
   },
+  "ecs_services": [
+    {
+      "cluster": "judgemind-dev",
+      "service": "judgemind-ingestion-worker-dev",
+      "display_name": "Ingestion Worker (dev)"
+    },
+    {
+      "cluster": "judgemind-dev",
+      "service": "judgemind-api-dev",
+      "display_name": "API (dev)"
+    }
+  ],
   "field_completeness": {
     "_updated": "2026-03-21",
     "_note": "OC baselines raised after backfill #1304 (parties 35->80%, case_type 30->97%). SC (low sample size), Riverside (outcome gap from old PDF backfill) unchanged.",

@@ -54,6 +54,10 @@ FIELD_COMPLETENESS_GRACE_MINUTES = dqc.FIELD_COMPLETENESS_GRACE_MINUTES
 FIELD_COMPLETENESS_WINDOW_DAYS = dqc.FIELD_COMPLETENESS_WINDOW_DAYS
 ORPHANED_DOCS_P1_THRESHOLD = dqc.ORPHANED_DOCS_P1_THRESHOLD
 ORPHANED_DOCS_P2_THRESHOLD = dqc.ORPHANED_DOCS_P2_THRESHOLD
+check_ecs_service_health = dqc.check_ecs_service_health
+EcsServiceConfig = dqc.EcsServiceConfig
+load_ecs_service_configs = dqc.load_ecs_service_configs
+DEFAULT_ECS_SERVICES = dqc.DEFAULT_ECS_SERVICES
 
 NOW = datetime(2026, 3, 11, 12, 0, 0, tzinfo=UTC)
 
@@ -4091,3 +4095,249 @@ class TestStalenessWithDedupedDocuments:
         )
         alerts = check_scraper_staleness(conn, NOW, baselines)
         assert len(alerts) == 0
+
+
+# ---------------------------------------------------------------------------
+# ECS service health check tests
+# ---------------------------------------------------------------------------
+
+
+class TestEcsServiceHealthCheck:
+    """Tests for check_ecs_service_health()."""
+
+    def _make_ecs_configs(self) -> list[EcsServiceConfig]:
+        """Create test ECS service configs."""
+        return [
+            EcsServiceConfig(
+                cluster="judgemind-dev",
+                service="judgemind-ingestion-worker-dev",
+                display_name="Ingestion Worker (dev)",
+            ),
+            EcsServiceConfig(
+                cluster="judgemind-dev",
+                service="judgemind-api-dev",
+                display_name="API (dev)",
+            ),
+        ]
+
+    def test_healthy_services_no_alerts(self) -> None:
+        """Healthy services (running == desired) produce no alerts."""
+        mock_client = MagicMock()
+        mock_client.describe_services.return_value = {
+            "services": [
+                {
+                    "serviceName": "judgemind-ingestion-worker-dev",
+                    "runningCount": 1,
+                    "desiredCount": 1,
+                },
+                {
+                    "serviceName": "judgemind-api-dev",
+                    "runningCount": 1,
+                    "desiredCount": 1,
+                },
+            ],
+        }
+        alerts = check_ecs_service_health(self._make_ecs_configs(), mock_client)
+        assert len(alerts) == 0
+
+    def test_zero_running_p1_alert(self) -> None:
+        """Service with runningCount=0 produces a P1 alert."""
+        mock_client = MagicMock()
+        mock_client.describe_services.return_value = {
+            "services": [
+                {
+                    "serviceName": "judgemind-ingestion-worker-dev",
+                    "runningCount": 0,
+                    "desiredCount": 1,
+                },
+                {
+                    "serviceName": "judgemind-api-dev",
+                    "runningCount": 1,
+                    "desiredCount": 1,
+                },
+            ],
+        }
+        alerts = check_ecs_service_health(self._make_ecs_configs(), mock_client)
+        assert len(alerts) == 1
+        alert = alerts[0]
+        assert alert.severity == "p1"
+        assert alert.metric == "ecs_service_health"
+        assert alert.county == "INFRASTRUCTURE"
+        assert alert.actual == 0
+        assert alert.expected == 1
+        assert "Ingestion Worker (dev)" in alert.message
+        assert "runningCount=0" in alert.message
+
+    def test_degraded_service_p2_alert(self) -> None:
+        """Service with 0 < running < desired produces a P2 alert."""
+        configs = [
+            EcsServiceConfig(
+                cluster="judgemind-dev",
+                service="judgemind-api-dev",
+                display_name="API (dev)",
+            ),
+        ]
+        mock_client = MagicMock()
+        mock_client.describe_services.return_value = {
+            "services": [
+                {
+                    "serviceName": "judgemind-api-dev",
+                    "runningCount": 1,
+                    "desiredCount": 2,
+                },
+            ],
+        }
+        alerts = check_ecs_service_health(configs, mock_client)
+        assert len(alerts) == 1
+        assert alerts[0].severity == "p2"
+
+    def test_service_not_found_p1_alert(self) -> None:
+        """Service not returned in describe_services produces a P1 alert."""
+        configs = [
+            EcsServiceConfig(
+                cluster="judgemind-dev",
+                service="judgemind-missing-service",
+                display_name="Missing Service",
+            ),
+        ]
+        mock_client = MagicMock()
+        mock_client.describe_services.return_value = {"services": []}
+        alerts = check_ecs_service_health(configs, mock_client)
+        assert len(alerts) == 1
+        assert alerts[0].severity == "p1"
+        assert "not found" in alerts[0].message
+
+    def test_desired_zero_skipped(self) -> None:
+        """Services with desiredCount=0 are intentionally scaled down — no alert."""
+        configs = [
+            EcsServiceConfig(
+                cluster="judgemind-dev",
+                service="judgemind-scaled-down",
+                display_name="Scaled Down",
+            ),
+        ]
+        mock_client = MagicMock()
+        mock_client.describe_services.return_value = {
+            "services": [
+                {
+                    "serviceName": "judgemind-scaled-down",
+                    "runningCount": 0,
+                    "desiredCount": 0,
+                },
+            ],
+        }
+        alerts = check_ecs_service_health(configs, mock_client)
+        assert len(alerts) == 0
+
+    def test_empty_configs_no_alerts(self) -> None:
+        """Empty ECS config list produces no alerts."""
+        mock_client = MagicMock()
+        alerts = check_ecs_service_health([], mock_client)
+        assert len(alerts) == 0
+        mock_client.describe_services.assert_not_called()
+
+    def test_api_exception_handled_gracefully(self) -> None:
+        """AWS API exception is caught and logged, not raised."""
+        mock_client = MagicMock()
+        mock_client.describe_services.side_effect = Exception("AccessDenied")
+        alerts = check_ecs_service_health(self._make_ecs_configs(), mock_client)
+        assert len(alerts) == 0
+
+    def test_multiple_clusters_batched(self) -> None:
+        """Services in different clusters trigger separate API calls."""
+        configs = [
+            EcsServiceConfig(
+                cluster="cluster-a",
+                service="svc-a",
+                display_name="Service A",
+            ),
+            EcsServiceConfig(
+                cluster="cluster-b",
+                service="svc-b",
+                display_name="Service B",
+            ),
+        ]
+        mock_client = MagicMock()
+        mock_client.describe_services.side_effect = [
+            {
+                "services": [
+                    {
+                        "serviceName": "svc-a",
+                        "runningCount": 1,
+                        "desiredCount": 1,
+                    },
+                ],
+            },
+            {
+                "services": [
+                    {
+                        "serviceName": "svc-b",
+                        "runningCount": 1,
+                        "desiredCount": 1,
+                    },
+                ],
+            },
+        ]
+        alerts = check_ecs_service_health(configs, mock_client)
+        assert len(alerts) == 0
+        assert mock_client.describe_services.call_count == 2
+
+
+class TestLoadEcsServiceConfigs:
+    """Tests for load_ecs_service_configs()."""
+
+    def test_loads_from_raw_dict(self) -> None:
+        """Loads ECS service configs from a raw baselines dict."""
+        raw: dict[str, Any] = {
+            "ecs_services": [
+                {
+                    "cluster": "test-cluster",
+                    "service": "test-svc",
+                    "display_name": "Test Service",
+                },
+            ],
+        }
+        configs = load_ecs_service_configs(raw=raw)
+        assert len(configs) == 1
+        assert configs[0].cluster == "test-cluster"
+        assert configs[0].service == "test-svc"
+        assert configs[0].display_name == "Test Service"
+
+    def test_defaults_when_key_missing(self) -> None:
+        """Falls back to DEFAULT_ECS_SERVICES when ecs_services key is absent."""
+        raw: dict[str, Any] = {"counties": {}}
+        configs = load_ecs_service_configs(raw=raw)
+        assert len(configs) == len(DEFAULT_ECS_SERVICES)
+
+    def test_display_name_defaults_to_service_name(self) -> None:
+        """display_name defaults to service name when omitted."""
+        raw: dict[str, Any] = {
+            "ecs_services": [
+                {"cluster": "test-cluster", "service": "my-svc"},
+            ],
+        }
+        configs = load_ecs_service_configs(raw=raw)
+        assert configs[0].display_name == "my-svc"
+
+    def test_loads_from_file(self, tmp_path: Path) -> None:
+        """Loads ECS configs from a baselines JSON file."""
+        baselines = {
+            "ecs_services": [
+                {
+                    "cluster": "file-cluster",
+                    "service": "file-svc",
+                    "display_name": "File Service",
+                },
+            ],
+        }
+        path = tmp_path / "baselines.json"
+        path.write_text(json.dumps(baselines))
+        configs = load_ecs_service_configs(path=path)
+        assert len(configs) == 1
+        assert configs[0].cluster == "file-cluster"
+
+    def test_missing_file_uses_defaults(self, tmp_path: Path) -> None:
+        """Falls back to defaults when baselines file doesn't exist."""
+        path = tmp_path / "nonexistent.json"
+        configs = load_ecs_service_configs(path=path)
+        assert len(configs) == len(DEFAULT_ECS_SERVICES)

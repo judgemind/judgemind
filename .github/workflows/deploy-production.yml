@@ -10,7 +10,7 @@ on:
 
 concurrency:
   group: deploy-scraper-production
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 env:
   AWS_REGION: us-west-2

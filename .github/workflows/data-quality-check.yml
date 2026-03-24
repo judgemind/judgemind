@@ -55,7 +55,7 @@ jobs:
       - name: Build script arguments
         id: args
         run: |
-          ARGS="--persist-metrics"
+          ARGS="--persist-metrics --check-ecs"
           if [ "${{ inputs.text_output }}" = "true" ]; then
             ARGS="$ARGS --text"
           fi
