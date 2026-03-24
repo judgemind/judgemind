@@ -737,10 +737,14 @@ def check_ingest_rates(
                         ),
                     )
                 )
-        # Ingest rate drop alert — suppress on non-posting days (weekends)
-        # just like zero_rulings above.  On non-posting days, low volume is
-        # expected because courts aren't publishing new rulings.
-        elif daily_avg > 0 and count_24h < daily_avg * INGEST_DROP_THRESHOLD:
+        # Ingest rate drop alert — suppress when expected_daily is zero
+        # (no active scraper, e.g. San Diego) and on non-posting days
+        # (weekends) just like zero_rulings above.
+        elif (
+            expected_daily > 0
+            and daily_avg > 0
+            and count_24h < daily_avg * INGEST_DROP_THRESHOLD
+        ):
             if _24h_overlaps_posting_day(now, posting_days):
                 alerts.append(
                     Alert(
