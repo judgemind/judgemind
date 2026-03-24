@@ -51,6 +51,10 @@ pytestmark = pytest.mark.regression
 
 FIXTURES = Path(__file__).parent.parent / "fixtures"
 
+# Expected number of PDF links processed from riv_page.html after filtering.
+# The fixture has 17 links; 1 is excluded by ``link_text_re`` (#1845), leaving 16.
+_RIV_EXPECTED_PROCESSED_PDFS = 16
+
 
 @pytest.fixture(autouse=True)
 def _disable_llm_extraction(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -491,9 +495,9 @@ def test_riv_run_splits_multi_ruling_pdfs() -> None:
     scraper = RiversideTentativeRulingsScraper(config=config)
 
     docs = scraper.fetch_documents()
-    # 16 matching PDF links on the index page (1 filtered by link_text_re, #1845),
-    # each mocked with the 4-ruling PS1 PDF
-    assert len(docs) == 16 * 4
+    # Each matching PDF link on the index page is mocked with the 4-ruling PS1 PDF.
+    # (1 of 17 links filtered by link_text_re, #1845)
+    assert len(docs) == _RIV_EXPECTED_PROCESSED_PDFS * 4
 
     # All split docs have pre_split flag
     assert all(d.extra.get("pre_split") for d in docs)
@@ -948,8 +952,8 @@ def test_riv_fetch_documents_pdf_extraction_failure() -> None:
 
     docs = scraper.fetch_documents()
     # Despite extraction failures, docs are still returned (unsplit)
-    # 16 matching links (1 filtered by link_text_re, #1845)
-    assert len(docs) == 16  # one per PDF link, no splitting
+    # (1 of 17 links filtered by link_text_re, #1845)
+    assert len(docs) == _RIV_EXPECTED_PROCESSED_PDFS  # one per PDF link, no splitting
 
 
 # ---------------------------------------------------------------------------
@@ -1039,9 +1043,9 @@ def test_riv_fetch_documents_single_ruling_not_split() -> None:
     ):
         docs = scraper.fetch_documents()
 
-    # Each of the 16 matching PDFs returns as a single doc (not split)
+    # Each matching PDF returns as a single doc (not split)
     # (1 of 17 links filtered by link_text_re, #1845)
-    assert len(docs) == 16
+    assert len(docs) == _RIV_EXPECTED_PROCESSED_PDFS
     # None should have pre_split flag
     assert all(not d.extra.get("pre_split") for d in docs)
 
@@ -2051,8 +2055,9 @@ def test_riv_fetch_documents_uses_llm_extraction(monkeypatch: pytest.MonkeyPatch
     scraper = RiversideTentativeRulingsScraper(config=config)
 
     docs = scraper.fetch_documents()
-    # 16 PDF links (1 of 17 skipped by link pattern), each returns 4 rulings from LLM
-    assert len(docs) == 16 * 4
+    # Each matching PDF link returns 4 rulings from LLM
+    # (1 of 17 links filtered by link_text_re, #1845)
+    assert len(docs) == _RIV_EXPECTED_PROCESSED_PDFS * 4
 
     # Check that per-ruling fields come from LLM output
     batch = docs[:4]
@@ -2087,8 +2092,9 @@ def test_riv_fetch_documents_falls_back_to_regex_on_llm_failure() -> None:
     scraper = RiversideTentativeRulingsScraper(config=config)
 
     docs = scraper.fetch_documents()
-    # Regex fallback produces 4 rulings per PDF, 16 PDFs total (1 skipped by link pattern)
-    assert len(docs) == 16 * 4
+    # Regex fallback produces 4 rulings per PDF
+    # (1 of 17 links filtered by link_text_re, #1845)
+    assert len(docs) == _RIV_EXPECTED_PROCESSED_PDFS * 4
 
     # Verify the regex extraction still works correctly
     batch = docs[:4]
@@ -2129,7 +2135,8 @@ def test_riv_fetch_documents_llm_single_ruling_not_split(
     scraper = RiversideTentativeRulingsScraper(config=config)
 
     docs = scraper.fetch_documents()
-    # Single ruling means each PDF returns 1 unsplit doc (16 PDFs, 1 skipped by link pattern)
-    assert len(docs) == 16
+    # Single ruling means each PDF returns 1 unsplit doc
+    # (1 of 17 links filtered by link_text_re, #1845)
+    assert len(docs) == _RIV_EXPECTED_PROCESSED_PDFS
     # Should NOT have pre_split flag
     assert all(not d.extra.get("pre_split") for d in docs)
