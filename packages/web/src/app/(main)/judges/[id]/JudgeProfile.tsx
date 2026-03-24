@@ -7,12 +7,9 @@ import {
   formatDate,
   formatLabel,
   formatMotionType,
-  formatOutcome,
-  getOutcomeBadgeVariant,
-  getOutcomeBadgeListClass,
 } from '@/lib/display-helpers';
+import { OutcomeBadge } from '@/components/OutcomeBadge';
 import { SECTION_HEADING, SECTION_LABEL } from '@/lib/typography';
-import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Skeleton } from '@/components/ui/skeleton';
@@ -440,12 +437,7 @@ export function JudgeProfile({ judgeId }: { judgeId: string }) {
                     )}
                   </div>
                 </div>
-                <Badge
-                  variant={getOutcomeBadgeVariant(node.outcome)}
-                  className={getOutcomeBadgeListClass(node.outcome)}
-                >
-                  {formatOutcome(node.outcome)}
-                </Badge>
+                <OutcomeBadge outcome={node.outcome} />
               </div>
             </div>
           ))}

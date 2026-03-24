@@ -10,13 +10,11 @@ import {
   FORMAT_LABELS,
   formatDate,
   formatLabel,
-  formatOutcome,
-  getOutcomeBadgeVariant,
-  getOutcomeBadgeListClass,
   groupParties,
   stripMetadataHeaderHtml,
   type RulingMetadata,
 } from '@/lib/display-helpers';
+import { OutcomeBadge } from '@/components/OutcomeBadge';
 import { sanitizeRulingHtml } from '@/lib/sanitize-html';
 import { SECTION_HEADING, SECTION_LABEL } from '@/lib/typography';
 import { Badge } from '@/components/ui/badge';
@@ -434,12 +432,7 @@ export function CaseDetail({ caseId }: { caseId: string }) {
                     {node.judge.canonicalName}
                   </span>
                 )}
-                <Badge
-                  variant={getOutcomeBadgeVariant(node.outcome)}
-                  className={getOutcomeBadgeListClass(node.outcome)}
-                >
-                  {formatOutcome(node.outcome)}
-                </Badge>
+                <OutcomeBadge outcome={node.outcome} />
                 <Badge variant={node.isTentative ? 'secondary' : 'outline'}>
                   {node.isTentative ? 'Tentative' : 'Final'}
                 </Badge>

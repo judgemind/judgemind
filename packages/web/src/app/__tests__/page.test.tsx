@@ -34,6 +34,12 @@ vi.mock('@/lib/display-helpers', () => ({
   getOutcomeBadgeListClass: () => '',
 }));
 
+vi.mock('@/components/OutcomeBadge', () => ({
+  OutcomeBadge: ({ outcome }: { outcome: string | null }) => (
+    <span data-testid="outcome-badge">{outcome ?? '\u2014'}</span>
+  ),
+}));
+
 import HomePage from '../(main)/page';
 
 const MOCK_STATS = {

@@ -5,10 +5,11 @@ import { useQuery, gql } from '@apollo/client';
 import { useRouter, useSearchParams } from 'next/navigation';
 import Link from 'next/link';
 import { Search, SlidersHorizontal, Calendar, Scale, Gavel } from 'lucide-react';
-import { formatDate, getOutcomeBadgeVariant, getOutcomeBadgeListClass } from '@/lib/display-helpers';
+import { formatDate } from '@/lib/display-helpers';
 import { PAGE_TITLE, SECTION_LABEL } from '@/lib/typography';
 import { sanitizeExcerptHtml } from '@/lib/sanitize-html';
 import { Autocomplete } from '@/components/Autocomplete';
+import { OutcomeBadge } from '@/components/OutcomeBadge';
 import { useCountyOptions, useJudgeNameOptions } from '@/lib/filter-options';
 import { Card, CardContent } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
@@ -96,11 +97,12 @@ export const OUTCOMES = [
   'other',
 ] as const;
 
-/** Human-readable labels for outcomes. */
+/** Human-readable labels for outcomes.
+ *  Labels must match formatOutcome() output for consistency with OutcomeBadge. */
 export const OUTCOME_LABELS: Record<string, string> = {
   granted: 'Granted',
   denied: 'Denied',
-  granted_in_part: 'Partial',
+  granted_in_part: 'Granted In Part',
   moot: 'Moot',
   continued: 'Continued',
   other: 'Other',
@@ -357,8 +359,6 @@ function FilterContent({
 /** A single search result row. */
 function ResultRow({ node }: { node: SearchHitNode }) {
   const motionLabel = node.motionType ? MOTION_TYPE_LABELS[node.motionType] ?? node.motionType : null;
-  const outcomeLabel = node.outcome ? OUTCOME_LABELS[node.outcome] ?? node.outcome : null;
-  const outcomeBadgeVariant = getOutcomeBadgeVariant(node.outcome);
 
   return (
     <Link href={`/rulings/${node.rulingId}`} className="block transition-colors hover:bg-accent/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2">
@@ -390,13 +390,13 @@ function ResultRow({ node }: { node: SearchHitNode }) {
         </p>
 
         {/* Badges for motion type and outcome */}
-        {(motionLabel || outcomeLabel) && (
+        {(motionLabel || node.outcome) && (
           <div className="mt-2 flex flex-wrap gap-1.5">
             {motionLabel && (
               <Badge variant="secondary">{motionLabel}</Badge>
             )}
-            {outcomeLabel && (
-              <Badge variant={outcomeBadgeVariant} className={getOutcomeBadgeListClass(node.outcome)}>{outcomeLabel}</Badge>
+            {node.outcome && (
+              <OutcomeBadge outcome={node.outcome} />
             )}
           </div>
         )}

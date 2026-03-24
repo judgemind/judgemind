@@ -6,13 +6,11 @@ import { useRouter, useSearchParams } from 'next/navigation';
 import Link from 'next/link';
 import {
   formatDate,
-  formatOutcome,
   formatMotionType,
   formatJudgeName,
-  getOutcomeBadgeVariant,
-  getOutcomeBadgeListClass,
 } from '@/lib/display-helpers';
 import { Autocomplete } from '@/components/Autocomplete';
+import { OutcomeBadge } from '@/components/OutcomeBadge';
 import { useCountyOptions } from '@/lib/filter-options';
 import { Badge } from '@/components/ui/badge';
 import { Input } from '@/components/ui/input';
@@ -280,12 +278,7 @@ export function RulingsFeed() {
                     </div>
 
                     <div className="mt-2 flex flex-wrap gap-2">
-                      <Badge
-                        variant={getOutcomeBadgeVariant(node.outcome)}
-                        className={getOutcomeBadgeListClass(node.outcome)}
-                      >
-                        {formatOutcome(node.outcome)}
-                      </Badge>
+                      <OutcomeBadge outcome={node.outcome} />
                       <Badge variant="outline" className="text-muted-foreground">
                         {formatMotionType(node.motionType)}
                       </Badge>
