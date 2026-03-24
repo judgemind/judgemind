@@ -26,18 +26,14 @@ import redis
 import structlog
 from opensearchpy import OpenSearch
 
+from framework.logging import configure_structlog
+
 from .worker import InfrastructureError, IngestionWorker
 
 # Configure structlog for its own loggers (structlog.get_logger()).
-structlog.configure(
-    wrapper_class=structlog.make_filtering_bound_logger(logging.INFO),
-    processors=[
-        structlog.processors.add_log_level,
-        structlog.processors.TimeStamper(fmt="iso"),
-        structlog.processors.format_exc_info,
-        structlog.processors.JSONRenderer(),
-    ],
-)
+# json=True forces JSON output regardless of terminal — the ingestion worker
+# always runs in ECS where CloudWatch needs structured JSON.
+configure_structlog(json=True)
 
 # Route standard-library logging (logging.getLogger()) through structlog so
 # that worker.py, db.py, and any other modules using stdlib logging produce
