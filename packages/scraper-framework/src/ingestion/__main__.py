@@ -17,7 +17,6 @@ Optional:
 
 from __future__ import annotations
 
-import logging
 import os
 import sys
 
@@ -30,32 +29,12 @@ from framework.logging import configure_structlog
 
 from .worker import InfrastructureError, IngestionWorker
 
-# Configure structlog for its own loggers (structlog.get_logger()).
+# Configure structlog for its own loggers (structlog.get_logger()) AND route
+# standard-library logging (logging.getLogger()) through structlog.
 # json=True forces JSON output regardless of terminal — the ingestion worker
 # always runs in ECS where CloudWatch needs structured JSON.
-configure_structlog(json=True)
-
-# Route standard-library logging (logging.getLogger()) through structlog so
-# that worker.py, db.py, and any other modules using stdlib logging produce
-# the same JSON output visible in CloudWatch.
-#
-# Note: the processor chain here uses structlog.stdlib variants (add_log_level,
-# ExtraAdder) instead of structlog.processors equivalents because stdlib
-# LogRecords carry level/extra data differently than native structlog events.
-_formatter = structlog.stdlib.ProcessorFormatter(
-    processors=[
-        structlog.stdlib.add_log_level,
-        structlog.stdlib.ExtraAdder(),
-        structlog.stdlib.ProcessorFormatter.remove_processors_meta,
-        structlog.processors.TimeStamper(fmt="iso"),
-        structlog.processors.format_exc_info,
-        structlog.processors.JSONRenderer(),
-    ],
-)
-_handler = logging.StreamHandler()
-_handler.setFormatter(_formatter)
-logging.root.addHandler(_handler)
-logging.root.setLevel(logging.INFO)
+# stdlib_bridge=True installs a ProcessorFormatter on the root stdlib logger.
+configure_structlog(json=True, stdlib_bridge=True)
 
 logger = structlog.get_logger(__name__)
 
