@@ -52,6 +52,8 @@ _compute_baseline_daily = dqc._compute_baseline_daily
 MIN_FIELD_CHECK_SAMPLE_SIZE = dqc.MIN_FIELD_CHECK_SAMPLE_SIZE
 FIELD_COMPLETENESS_GRACE_MINUTES = dqc.FIELD_COMPLETENESS_GRACE_MINUTES
 FIELD_COMPLETENESS_WINDOW_DAYS = dqc.FIELD_COMPLETENESS_WINDOW_DAYS
+BULK_INGEST_MULTIPLIER = dqc.BULK_INGEST_MULTIPLIER
+_is_bulk_ingest = dqc._is_bulk_ingest
 ORPHANED_DOCS_P1_THRESHOLD = dqc.ORPHANED_DOCS_P1_THRESHOLD
 ORPHANED_DOCS_P2_THRESHOLD = dqc.ORPHANED_DOCS_P2_THRESHOLD
 check_ecs_service_health = dqc.check_ecs_service_health
@@ -2578,9 +2580,9 @@ class TestQueryFieldCompleteness:
         assert params[0] == expected_cutoff
         assert params[1] == expected_grace
 
-    def test_grace_period_constant_is_30_minutes(self) -> None:
-        """Grace period constant is set to 30 minutes."""
-        assert FIELD_COMPLETENESS_GRACE_MINUTES == 30
+    def test_grace_period_constant_is_60_minutes(self) -> None:
+        """Grace period constant is set to 60 minutes (#1887)."""
+        assert FIELD_COMPLETENESS_GRACE_MINUTES == 60
 
 
 class TestCheckFieldCompleteness:
@@ -3122,6 +3124,337 @@ class TestLowVolumeCountySuppression:
         low_sample = [a for a in alerts if a.metric == "field_completeness_low_sample"]
         assert len(low_sample) == 1
         assert low_sample[0].county == "Unknown County"
+
+
+class TestIsBulkIngest:
+    """Tests for _is_bulk_ingest helper function."""
+
+    def test_detects_bulk_when_over_multiplier(self) -> None:
+        """Returns True when window count exceeds multiplier times baseline."""
+        field_baselines = {"Riverside": {"total_documents": 66}}
+        # 200 > 3.0 * 66 = 198
+        assert _is_bulk_ingest("Riverside", 200, field_baselines) is True
+
+    def test_no_bulk_when_under_multiplier(self) -> None:
+        """Returns False when window count is within multiplier range."""
+        field_baselines = {"Riverside": {"total_documents": 66}}
+        # 190 < 3.0 * 66 = 198
+        assert _is_bulk_ingest("Riverside", 190, field_baselines) is False
+
+    def test_exact_multiplier_not_bulk(self) -> None:
+        """Returns False when window count equals exactly multiplier times baseline."""
+        field_baselines = {"Riverside": {"total_documents": 100}}
+        # 300 is NOT > 3.0 * 100 = 300 (strictly greater than)
+        assert _is_bulk_ingest("Riverside", 300, field_baselines) is False
+
+    def test_no_baseline_returns_false(self) -> None:
+        """Returns False when county has no field baselines."""
+        assert _is_bulk_ingest("Unknown", 1000, {}) is False
+
+    def test_zero_baseline_returns_false(self) -> None:
+        """Returns False when total_documents baseline is 0."""
+        field_baselines = {"Riverside": {"total_documents": 0}}
+        assert _is_bulk_ingest("Riverside", 1000, field_baselines) is False
+
+    def test_missing_total_documents_returns_false(self) -> None:
+        """Returns False when total_documents key is missing."""
+        field_baselines = {"Riverside": {"ruling": 100.0}}
+        assert _is_bulk_ingest("Riverside", 1000, field_baselines) is False
+
+
+class TestBulkIngestFieldCompleteness:
+    """Tests for bulk-ingest detection in check_field_completeness (#1887)."""
+
+    def test_bulk_ingest_downgrades_to_p2(self) -> None:
+        """Bulk ingest emits P2 informational instead of P1 regression."""
+        # Simulate 2500 docs in window vs 66 baseline (>3x = bulk)
+        conn = FakeConnection(
+            {
+                "case_parties": [
+                    _make_field_completeness_row(
+                        "Riverside",
+                        total=2500,
+                        judge=1000,  # 40% vs 57.6% baseline = 17.6pp drop → P1 normally
+                    ),
+                ],
+            }
+        )
+        field_baselines = {
+            "Riverside": {
+                "total_documents": 66,
+                "ruling": 100.0,
+                "judge": 57.6,
+                "motion_type": 97.0,
+                "outcome": 90.0,
+                "case_title": 97.0,
+                "case_number": 97.0,
+                "parties": 97.0,
+                "hearing_date": 100.0,
+                "case_type": 97.0,
+            },
+        }
+        alerts = check_field_completeness(conn, NOW, field_baselines)
+        # Should NOT produce any P1 field_completeness alerts.
+        p1_alerts = [a for a in alerts if a.severity == "p1"]
+        assert len(p1_alerts) == 0
+        # Should produce exactly one P2 bulk_ingest informational alert.
+        bulk_alerts = [a for a in alerts if a.metric == "field_completeness_bulk_ingest"]
+        assert len(bulk_alerts) == 1
+        assert bulk_alerts[0].severity == "p2"
+        assert bulk_alerts[0].county == "Riverside"
+        assert "bulk ingest" in bulk_alerts[0].message.lower()
+        assert "2500" in bulk_alerts[0].message
+        assert "66" in bulk_alerts[0].message
+
+    def test_no_bulk_ingest_alerts_normally(self) -> None:
+        """Normal doc count still produces standard regression alerts."""
+        conn = FakeConnection(
+            {
+                "case_parties": [
+                    _make_field_completeness_row(
+                        "Los Angeles",
+                        total=100,
+                        judge=80,  # 80% vs 95% baseline = 15pp drop → P1
+                    ),
+                ],
+            }
+        )
+        field_baselines = {
+            "Los Angeles": {
+                "total_documents": 748,
+                "judge": 95.0,
+                "ruling": 100.0,
+                "motion_type": 90.0,
+                "outcome": 90.0,
+                "case_title": 100.0,
+                "case_number": 100.0,
+                "parties": 80.0,
+                "hearing_date": 100.0,
+                "case_type": 85.0,
+            },
+        }
+        alerts = check_field_completeness(conn, NOW, field_baselines)
+        # Normal doc count (100 < 3 * 748) → standard alerts.
+        bulk_alerts = [a for a in alerts if a.metric == "field_completeness_bulk_ingest"]
+        assert len(bulk_alerts) == 0
+        p1_alerts = [a for a in alerts if a.severity == "p1"]
+        assert len(p1_alerts) >= 1
+
+    def test_bulk_ingest_without_total_documents_alerts_normally(self) -> None:
+        """Counties without total_documents in baselines bypass bulk detection."""
+        conn = FakeConnection(
+            {
+                "case_parties": [
+                    _make_field_completeness_row(
+                        "New County",
+                        total=500,
+                        judge=200,  # 40% vs 95% = 55pp drop → P1 normally
+                    ),
+                ],
+            }
+        )
+        field_baselines = {
+            "New County": {
+                # No total_documents key
+                "judge": 95.0,
+                "ruling": 100.0,
+            },
+        }
+        alerts = check_field_completeness(conn, NOW, field_baselines)
+        # No bulk detection → normal P1 alert.
+        p1_alerts = [a for a in alerts if a.severity == "p1"]
+        assert len(p1_alerts) >= 1
+
+    def test_bulk_ingest_checked_before_per_field(self) -> None:
+        """Bulk ingest check prevents any per-field alerts from being emitted."""
+        # All fields have significant drops, but bulk ingest should suppress them all
+        conn = FakeConnection(
+            {
+                "case_parties": [
+                    _make_field_completeness_row(
+                        "Riverside",
+                        total=300,  # >3x of 66 baseline
+                        ruling=100,
+                        judge=50,
+                        motion_type=50,
+                        outcome=50,
+                        title=50,
+                        case_number=50,
+                        parties=50,
+                        hearing_date=50,
+                        case_type=50,
+                    ),
+                ],
+            }
+        )
+        field_baselines = {
+            "Riverside": {
+                "total_documents": 66,
+                "ruling": 100.0,
+                "judge": 57.6,
+                "motion_type": 97.0,
+                "outcome": 90.0,
+                "case_title": 97.0,
+                "case_number": 97.0,
+                "parties": 97.0,
+                "hearing_date": 100.0,
+                "case_type": 97.0,
+            },
+        }
+        alerts = check_field_completeness(conn, NOW, field_baselines)
+        # Only the single bulk_ingest alert, no per-field alerts.
+        assert len(alerts) == 1
+        assert alerts[0].metric == "field_completeness_bulk_ingest"
+
+    def test_mixed_counties_bulk_and_normal(self) -> None:
+        """Bulk county gets bulk alert, normal county gets standard alerts."""
+        conn = FakeConnection(
+            {
+                "case_parties": [
+                    _make_field_completeness_row(
+                        "Riverside",
+                        total=300,  # >3x of 66 = bulk
+                        judge=50,
+                    ),
+                    _make_field_completeness_row(
+                        "Los Angeles",
+                        total=100,  # <3x of 748 = normal
+                        judge=80,
+                    ),
+                ],
+            }
+        )
+        field_baselines = {
+            "Riverside": {
+                "total_documents": 66,
+                "judge": 57.6,
+                "ruling": 100.0,
+                "motion_type": 97.0,
+                "outcome": 90.0,
+                "case_title": 97.0,
+                "case_number": 97.0,
+                "parties": 97.0,
+                "hearing_date": 100.0,
+                "case_type": 97.0,
+            },
+            "Los Angeles": {
+                "total_documents": 748,
+                "judge": 95.0,
+                "ruling": 100.0,
+                "motion_type": 90.0,
+                "outcome": 90.0,
+                "case_title": 100.0,
+                "case_number": 100.0,
+                "parties": 80.0,
+                "hearing_date": 100.0,
+                "case_type": 85.0,
+            },
+        }
+        alerts = check_field_completeness(conn, NOW, field_baselines)
+        # Riverside: bulk ingest alert.
+        rv_alerts = [a for a in alerts if a.county == "Riverside"]
+        assert len(rv_alerts) == 1
+        assert rv_alerts[0].metric == "field_completeness_bulk_ingest"
+        # Los Angeles: standard regression alert.
+        la_alerts = [
+            a for a in alerts if a.county == "Los Angeles" and a.metric == "field_completeness"
+        ]
+        assert len(la_alerts) >= 1
+
+
+class TestBulkIngestOrphanedDocuments:
+    """Tests for bulk-ingest detection in check_orphaned_documents (#1887)."""
+
+    def test_bulk_ingest_downgrades_orphan_alert(self) -> None:
+        """Bulk ingest downgrades orphaned documents alert to P2."""
+        conn = FakeConnection(
+            {
+                "orphaned_docs": [
+                    _make_orphaned_docs_row("Riverside", total=300, orphaned=100),
+                ],
+            }
+        )
+        field_baselines = {
+            "Riverside": {"total_documents": 66},
+        }
+        alerts = check_orphaned_documents(conn, NOW, field_baselines=field_baselines)
+        # Should produce a P2 bulk_ingest alert instead of P1 orphaned.
+        assert len(alerts) == 1
+        assert alerts[0].metric == "orphaned_documents_bulk_ingest"
+        assert alerts[0].severity == "p2"
+        assert "bulk ingest" in alerts[0].message.lower()
+
+    def test_normal_orphan_alert_without_bulk(self) -> None:
+        """Normal doc count produces standard orphaned documents alert."""
+        conn = FakeConnection(
+            {
+                "orphaned_docs": [
+                    _make_orphaned_docs_row("Orange", total=100, orphaned=30),
+                ],
+            }
+        )
+        field_baselines = {
+            "Orange": {"total_documents": 1772},
+        }
+        alerts = check_orphaned_documents(conn, NOW, field_baselines=field_baselines)
+        assert len(alerts) == 1
+        assert alerts[0].metric == "orphaned_documents"
+        assert alerts[0].severity == "p1"
+
+    def test_orphan_backward_compatible_no_baselines(self) -> None:
+        """Without field_baselines, bulk detection is skipped."""
+        conn = FakeConnection(
+            {
+                "orphaned_docs": [
+                    _make_orphaned_docs_row("Riverside", total=300, orphaned=100),
+                ],
+            }
+        )
+        # No field_baselines → standard P1 alert.
+        alerts = check_orphaned_documents(conn, NOW)
+        assert len(alerts) == 1
+        assert alerts[0].metric == "orphaned_documents"
+        assert alerts[0].severity == "p1"
+
+    def test_orphan_bulk_mixed_counties(self) -> None:
+        """Bulk county gets downgraded, normal county gets standard alert."""
+        conn = FakeConnection(
+            {
+                "orphaned_docs": [
+                    _make_orphaned_docs_row("Riverside", total=300, orphaned=100),
+                    _make_orphaned_docs_row("Orange", total=100, orphaned=30),
+                ],
+            }
+        )
+        field_baselines = {
+            "Riverside": {"total_documents": 66},
+            "Orange": {"total_documents": 1772},
+        }
+        alerts = check_orphaned_documents(conn, NOW, field_baselines=field_baselines)
+        rv_alerts = [a for a in alerts if a.county == "Riverside"]
+        assert len(rv_alerts) == 1
+        assert rv_alerts[0].metric == "orphaned_documents_bulk_ingest"
+        assert rv_alerts[0].severity == "p2"
+        oc_alerts = [a for a in alerts if a.county == "Orange"]
+        assert len(oc_alerts) == 1
+        assert oc_alerts[0].metric == "orphaned_documents"
+        assert oc_alerts[0].severity == "p1"
+
+    def test_orphan_below_threshold_not_affected_by_bulk(self) -> None:
+        """Orphaned docs below threshold produce no alert even during bulk ingest."""
+        conn = FakeConnection(
+            {
+                "orphaned_docs": [
+                    _make_orphaned_docs_row("Riverside", total=300, orphaned=5),
+                ],
+            }
+        )
+        field_baselines = {
+            "Riverside": {"total_documents": 66},
+        }
+        # 5/300 = 1.7% → below both thresholds → no alert.
+        alerts = check_orphaned_documents(conn, NOW, field_baselines=field_baselines)
+        assert len(alerts) == 0
 
 
 class TestLoadBaselinesLowVolume:

@@ -83,12 +83,21 @@ FIELD_COMPLETENESS_WINDOW_DAYS = 7
 
 # Grace period (minutes) — exclude documents created this recently so the
 # ingestion pipeline has time to process them before they are evaluated.
-FIELD_COMPLETENESS_GRACE_MINUTES = 30
+# Increased from 30 to 60 (#1887) to handle bulk backfills that may take
+# longer than 30 minutes to complete enrichment.
+FIELD_COMPLETENESS_GRACE_MINUTES = 60
 
 # Minimum number of documents in the window for field completeness checks.
 # Counties with fewer than this many documents are skipped to avoid noisy
 # alerts from tiny sample sizes (e.g. 1 bad doc out of 3 total = 33% drop).
 MIN_FIELD_CHECK_SAMPLE_SIZE = 5
+
+# Bulk ingest detection — if the number of documents in the check window
+# exceeds this multiplier times the total_documents baseline, we assume a
+# bulk backfill or re-ingest occurred.  Field completeness and orphaned
+# document alerts are downgraded to P2 informational instead of triggering
+# false-positive regressions while enrichment catches up.  (#1887)
+BULK_INGEST_MULTIPLIER = 3.0
 
 
 @dataclass
@@ -459,6 +468,35 @@ def _query_field_completeness(
     return result, totals
 
 
+def _is_bulk_ingest(
+    county_name: str,
+    window_doc_count: int,
+    field_baselines: dict[str, dict[str, float]],
+) -> bool:
+    """Detect whether a county likely experienced a bulk ingest.
+
+    Compares the number of documents in the check window against the
+    ``total_documents`` baseline.  If the window count exceeds
+    ``BULK_INGEST_MULTIPLIER`` times the baseline, the county is
+    considered to be in a bulk-ingest state and field completeness /
+    orphaned document alerts should be downgraded.
+
+    Args:
+        county_name: Name of the county.
+        window_doc_count: Number of documents in the check window.
+        field_baselines: Per-county field baselines (contains
+            ``total_documents`` key).
+
+    Returns:
+        True if bulk ingest is detected, False otherwise.
+    """
+    county_fb = field_baselines.get(county_name, {})
+    baseline_total = county_fb.get("total_documents", 0)
+    if baseline_total <= 0:
+        return False
+    return window_doc_count > BULK_INGEST_MULTIPLIER * baseline_total
+
+
 def check_field_completeness(
     conn: psycopg.Connection,  # type: ignore[type-arg]
     now: datetime,
@@ -474,6 +512,11 @@ def check_field_completeness(
     ignored — unless the county is marked ``low_volume`` in the baselines,
     in which case the alert is suppressed (logged at DEBUG) since the low
     sample size is expected and permanent.
+
+    When a bulk ingest is detected (window doc count exceeds
+    ``BULK_INGEST_MULTIPLIER`` times the ``total_documents`` baseline),
+    field completeness alerts are downgraded to P2 informational with a
+    note that a bulk operation likely occurred (#1887).
 
     Args:
         conn: Database connection.
@@ -528,6 +571,38 @@ def check_field_completeness(
                 )
             continue
 
+        # Bulk ingest detection: if the window doc count far exceeds the
+        # baseline, enrichment is likely still catching up.  Downgrade all
+        # field completeness alerts for this county to a single P2
+        # informational alert instead of firing false-positive regressions.
+        if _is_bulk_ingest(county_name, total_docs, field_baselines):
+            baseline_total = county_field_baselines.get("total_documents", 0)
+            logger.info(
+                "%s: bulk ingest detected (%d docs in window vs %d baseline). "
+                "Downgrading field completeness alerts.",
+                county_name,
+                total_docs,
+                baseline_total,
+            )
+            alerts.append(
+                Alert(
+                    county=county_name,
+                    metric="field_completeness_bulk_ingest",
+                    severity="p2",
+                    expected=baseline_total,
+                    actual=total_docs,
+                    message=(
+                        f"{county_name}: {total_docs} documents in "
+                        f"{FIELD_COMPLETENESS_WINDOW_DAYS}-day window vs "
+                        f"{baseline_total} baseline "
+                        f"(>{BULK_INGEST_MULTIPLIER:.0f}x). "
+                        f"Likely bulk ingest — skipping field completeness "
+                        f"regression check while enrichment catches up."
+                    ),
+                )
+            )
+            continue
+
         for field, current_pct in fields.items():
             baseline_pct = county_field_baselines.get(field, 0.0)
 
@@ -566,6 +641,7 @@ def check_orphaned_documents(
     conn: psycopg.Connection,  # type: ignore[type-arg]
     now: datetime,
     county: str | None = None,
+    field_baselines: dict[str, dict[str, float]] | None = None,
 ) -> list[Alert]:
     """Check for orphaned documents (documents with no ruling reference).
 
@@ -574,10 +650,18 @@ def check_orphaned_documents(
     ruling rows.  This check surfaces the problem as a dedicated alert
     instead of letting it pollute field completeness metrics.
 
+    When a bulk ingest is detected (window doc count exceeds
+    ``BULK_INGEST_MULTIPLIER`` times the ``total_documents`` baseline),
+    orphaned document alerts are downgraded to P2 informational with a
+    note that a bulk operation likely occurred (#1887).
+
     Args:
         conn: Database connection.
         now: Current timestamp for time calculations.
         county: Optional county filter.
+        field_baselines: Per-county field baselines (used for bulk-ingest
+            detection via ``total_documents``). If *None*, bulk-ingest
+            detection is skipped (backward-compatible default).
 
     Returns:
         List of alerts for orphaned documents.
@@ -605,6 +689,40 @@ def check_orphaned_documents(
             elif orphaned_pct > ORPHANED_DOCS_P2_THRESHOLD:
                 severity = "p2"
             else:
+                continue
+
+            # Bulk ingest detection: downgrade to P2 informational if the
+            # window doc count far exceeds the baseline.
+            if field_baselines and _is_bulk_ingest(
+                county_name, total_docs, field_baselines
+            ):
+                baseline_total = field_baselines.get(county_name, {}).get(
+                    "total_documents", 0
+                )
+                logger.info(
+                    "%s: bulk ingest detected (%d docs in window vs %d baseline). "
+                    "Downgrading orphaned documents alert.",
+                    county_name,
+                    total_docs,
+                    baseline_total,
+                )
+                alerts.append(
+                    Alert(
+                        county=county_name,
+                        metric="orphaned_documents_bulk_ingest",
+                        severity="p2",
+                        expected=0,
+                        actual=orphaned_count,
+                        message=(
+                            f"{county_name}: {orphaned_count} of {total_docs} "
+                            f"documents ({orphaned_pct}%) have no ruling reference. "
+                            f"Likely bulk ingest ({total_docs} docs vs "
+                            f"{baseline_total} baseline, "
+                            f">{BULK_INGEST_MULTIPLIER:.0f}x) — "
+                            f"downgraded while enrichment catches up."
+                        ),
+                    )
+                )
                 continue
 
             alerts.append(
@@ -1655,7 +1773,7 @@ def run_checks(
                 check_field_completeness(conn, now, field_baselines, county, baselines)
             )
 
-        alerts.extend(check_orphaned_documents(conn, now, county))
+        alerts.extend(check_orphaned_documents(conn, now, county, field_baselines))
 
     if check_ecs:
         ecs_configs = load_ecs_service_configs(raw=baselines_raw, path=baselines_path)
@@ -1714,7 +1832,7 @@ def run_checks_full(
                 check_field_completeness(conn, now, field_baselines, county, baselines)
             )
 
-        alerts.extend(check_orphaned_documents(conn, now, county))
+        alerts.extend(check_orphaned_documents(conn, now, county, field_baselines))
 
         # Single metric collection pass — we derive the legacy snapshot
         # format from the full metrics to avoid duplicate queries.
