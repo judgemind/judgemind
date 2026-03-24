@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, time
+from datetime import UTC, datetime, time
 from enum import StrEnum
 from typing import Any
 
@@ -131,7 +131,7 @@ class EventEnvelope(BaseModel):
 
     event_type: str
     event_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
-    timestamp: datetime = Field(default_factory=datetime.utcnow)
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(UTC))
     producer_id: str
     correlation_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
 
@@ -172,4 +172,4 @@ class ScraperHealthEvent(EventEnvelope):
     records_captured: int
     response_time_seconds: float
     error_message: str | None = None
-    run_timestamp: datetime = Field(default_factory=datetime.utcnow)
+    run_timestamp: datetime = Field(default_factory=lambda: datetime.now(UTC))
