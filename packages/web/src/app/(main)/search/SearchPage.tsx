@@ -5,7 +5,7 @@ import { useQuery, gql } from '@apollo/client';
 import { useRouter, useSearchParams } from 'next/navigation';
 import Link from 'next/link';
 import { Search, SlidersHorizontal, Calendar, Scale, Gavel } from 'lucide-react';
-import { formatDate, OUTCOME_LABELS } from '@/lib/display-helpers';
+import { formatDate, MOTION_TYPE_LABELS, OUTCOME_LABELS } from '@/lib/display-helpers';
 import { PAGE_TITLE, SECTION_LABEL } from '@/lib/typography';
 import { sanitizeExcerptHtml } from '@/lib/sanitize-html';
 import { Autocomplete } from '@/components/Autocomplete';
@@ -77,16 +77,6 @@ export const MOTION_TYPES = [
   'anti_slapp',
   'other',
 ] as const;
-
-/** Human-readable labels for motion types. */
-export const MOTION_TYPE_LABELS: Record<string, string> = {
-  msj: 'MSJ',
-  mtd: 'MTD',
-  mil: 'MIL',
-  demurrer: 'Demurrer',
-  anti_slapp: 'Anti-SLAPP',
-  other: 'Other',
-};
 
 /** All outcome filter options. */
 export const OUTCOMES = [

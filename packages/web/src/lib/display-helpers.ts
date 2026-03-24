@@ -469,12 +469,17 @@ export function detectParagraphs(text: string): string {
 // ---------------------------------------------------------------------------
 
 /**
- * Known full motion type mappings (lowercased key -> display label).
- * Checked before the generic title-case logic so compound terms like
- * "anti_slapp" render correctly.
+ * Canonical human-readable labels for all known motion type codes.
+ * Every surface that displays motion type names (badges, filters, detail pages)
+ * must use this map — never define local motion type label constants.
  */
-const MOTION_TYPE_MAP: Record<string, string> = {
+export const MOTION_TYPE_LABELS: Record<string, string> = {
+  msj: 'MSJ',
+  mtd: 'MTD',
+  mil: 'MIL',
+  demurrer: 'Demurrer',
   anti_slapp: 'Anti-SLAPP',
+  other: 'Other',
 };
 
 /** Abbreviations that should stay fully uppercase. */
@@ -483,11 +488,12 @@ const UPPERCASE_MOTION_WORDS = new Set(['msj', 'mtd', 'mil']);
 /** Small words that stay lowercase unless they are the first word. */
 const LOWERCASE_WORDS = new Set(['to', 'for', 'of', 'in', 'on', 'the', 'a', 'an']);
 
-/** Format a motion type for display, returning a placeholder for null values. */
+/** Format a motion type for display, returning a placeholder for null values.
+ *  Uses the canonical MOTION_TYPE_LABELS map for known codes, falling back to generic title-casing. */
 export function formatMotionType(motionType: string | null): string {
   if (!motionType) return 'Not classified';
   const key = motionType.toLowerCase();
-  if (MOTION_TYPE_MAP[key]) return MOTION_TYPE_MAP[key];
+  if (MOTION_TYPE_LABELS[key]) return MOTION_TYPE_LABELS[key];
   return key
     .replace(/_/g, ' ')
     .split(' ')
