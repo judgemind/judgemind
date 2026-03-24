@@ -21,7 +21,7 @@ permissions:
 
 concurrency:
   group: deploy-api-${{ github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 env:
   AWS_REGION: us-west-2
