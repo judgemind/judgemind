@@ -420,6 +420,136 @@ class TestLlmExtractedFlag:
         # Per-field LLM extraction should NOT have been called.
         mock_extract_fields_llm.assert_not_called()
 
+    @patch("ingestion.worker.batch_upsert_parties")
+    @patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
+    @patch("ingestion.worker.extract_motion_type", return_value="demurrer")
+    @patch("ingestion.worker.extract_outcome", return_value="granted")
+    @patch("ingestion.worker.psycopg")
+    def test_llm_extracted_applies_regex_for_missing_motion_type_and_outcome(
+        self,
+        mock_psycopg: MagicMock,
+        mock_extract_outcome: MagicMock,
+        mock_extract_motion: MagicMock,
+        mock_resolve_judge: MagicMock,
+        mock_batch_upsert: MagicMock,
+    ) -> None:
+        """_llm_extracted events missing motion_type/outcome get regex fallback (#1770)."""
+        worker, _ = _make_worker()
+
+        mock_conn, mock_cur = _make_mock_conn()
+        mock_psycopg.connect.return_value = mock_conn
+        mock_cur.fetchone.side_effect = [
+            ("court-uuid-1",),
+            ("case-uuid-1",),
+            (True,),
+        ]
+
+        # Simulate multimodal extraction event: has ruling_text but no
+        # motion_type or outcome (transcription-only pipeline).
+        event = _make_event(
+            _split_processed=True,
+            _llm_extracted=True,
+            case_number="2024-01234567",
+            case_title="Smith v. Jones",
+            judge_name="Hon. Jane Doe",
+            ruling_text="The demurrer is GRANTED with leave to amend.",
+            outcome=None,
+            motion_type=None,
+        )
+
+        worker.process_event(event)
+
+        # Regex extractors SHOULD have been called for the missing fields.
+        mock_extract_outcome.assert_called_once()
+        mock_extract_motion.assert_called_once()
+
+    @patch("ingestion.worker.batch_upsert_parties")
+    @patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
+    @patch("ingestion.worker.extract_motion_type")
+    @patch("ingestion.worker.extract_outcome")
+    @patch("ingestion.worker.psycopg")
+    def test_llm_extracted_skips_regex_when_fields_populated(
+        self,
+        mock_psycopg: MagicMock,
+        mock_extract_outcome: MagicMock,
+        mock_extract_motion: MagicMock,
+        mock_resolve_judge: MagicMock,
+        mock_batch_upsert: MagicMock,
+    ) -> None:
+        """Events with _llm_extracted=True and populated fields skip regex post-LLM fallback."""
+        worker, _ = _make_worker()
+
+        mock_conn, mock_cur = _make_mock_conn()
+        mock_psycopg.connect.return_value = mock_conn
+        mock_cur.fetchone.side_effect = [
+            ("court-uuid-1",),
+            ("case-uuid-1",),
+            (True,),
+        ]
+
+        # Event has both motion_type and outcome already populated.
+        event = _make_event(
+            _split_processed=True,
+            _llm_extracted=True,
+            case_number="2024-01234567",
+            case_title="Smith v. Jones",
+            judge_name="Hon. Jane Doe",
+            outcome="granted",
+            motion_type="demurrer",
+        )
+
+        worker.process_event(event)
+
+        # Regex extractors should NOT have been called — fields are already populated.
+        mock_extract_outcome.assert_not_called()
+        mock_extract_motion.assert_not_called()
+
+    @patch("ingestion.worker.batch_upsert_parties")
+    @patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
+    @patch("ingestion.worker.extract_fields_llm")
+    @patch("ingestion.worker.extract_motion_type", return_value="msj")
+    @patch("ingestion.worker.extract_outcome", return_value="denied")
+    @patch("ingestion.worker.psycopg")
+    def test_llm_extracted_regex_post_llm_skips_per_field_llm(
+        self,
+        mock_psycopg: MagicMock,
+        mock_extract_outcome: MagicMock,
+        mock_extract_motion: MagicMock,
+        mock_extract_fields_llm: MagicMock,
+        mock_resolve_judge: MagicMock,
+        mock_batch_upsert: MagicMock,
+    ) -> None:
+        """Regex post-LLM runs but per-field LLM skipped for _llm_extracted."""
+        worker, _ = _make_worker()
+        worker._llm_client = MagicMock()  # Enable per-field LLM
+
+        mock_conn, mock_cur = _make_mock_conn()
+        mock_psycopg.connect.return_value = mock_conn
+        mock_cur.fetchone.side_effect = [
+            ("court-uuid-1",),
+            ("case-uuid-1",),
+            (True,),
+        ]
+
+        event = _make_event(
+            _split_processed=True,
+            _llm_extracted=True,
+            case_number="2024-01234567",
+            case_title="Smith v. Jones",
+            judge_name="Hon. Jane Doe",
+            ruling_text="The motion for summary judgment is DENIED.",
+            outcome=None,
+            motion_type=None,
+        )
+
+        worker.process_event(event)
+
+        # Per-field LLM extraction should NOT have been called.
+        mock_extract_fields_llm.assert_not_called()
+        # But regex extractors SHOULD have been called.
+        mock_extract_outcome.assert_called_once()
+        mock_extract_motion.assert_called_once()
+
 
 class TestFrameworkExtractorInit:
     """Tests for lazy initialization of the framework LlmExtractor."""

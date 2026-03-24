@@ -699,6 +699,29 @@ class IngestionWorker:
                 if motion_type is not None:
                     extraction_methods.setdefault("motion_type", "regex")
 
+        # ------------------------------------------------------------------
+        # Regex post-LLM fallback — for multimodal extraction events (#1770)
+        # ------------------------------------------------------------------
+        # The multimodal per-page pipeline (extract_from_pdf) is transcription-
+        # only: it produces ruling_text but does NOT extract structured fields
+        # like motion_type or outcome.  Events from this path have
+        # _llm_extracted=True (to skip redundant per-field LLM calls), but
+        # still need cheap regex extraction for fields the transcription
+        # pipeline does not populate.
+        if is_llm_extracted and ruling_text:
+            if outcome is None:
+                outcome = extract_outcome(ruling_text)
+                if outcome is not None:
+                    extraction_methods["outcome"] = "regex_post_llm"
+            if motion_type is None:
+                motion_type = extract_motion_type(ruling_text)
+                if motion_type is not None:
+                    extraction_methods["motion_type"] = "regex_post_llm"
+            if hearing_dt is None:
+                hearing_dt = extract_hearing_date(ruling_text)
+                if hearing_dt is not None:
+                    extraction_methods["hearing_date"] = "regex_post_llm"
+
         # Clean ruling text for display — extraction uses raw text above for
         # better regex matching; the cleaned version is stored in Postgres.
         cleaned_ruling_text = clean_ruling_text(ruling_text)
@@ -706,10 +729,11 @@ class IngestionWorker:
         court_name = f"{court}, County of {county}"
 
         # Fallback case number extraction (regex)
-        if not is_llm_extracted and not case_number and ruling_text:
+        if not case_number and ruling_text:
             extracted = extract_case_number(ruling_text)
             if extracted:
-                extraction_methods.setdefault("case_number", "regex")
+                method = "regex_post_llm" if is_llm_extracted else "regex"
+                extraction_methods.setdefault("case_number", method)
                 logger.info(
                     "Extracted case_number from ruling text (regex fallback)",
                     extra={"document_id": document_id, "case_number": extracted},
@@ -717,10 +741,11 @@ class IngestionWorker:
                 case_number = extracted
 
         # Fallback case_title extraction (regex)
-        if not is_llm_extracted and not case_title and ruling_text:
+        if not case_title and ruling_text:
             case_title = extract_case_title(ruling_text)
             if case_title:
-                extraction_methods.setdefault("case_title", "regex")
+                method = "regex_post_llm" if is_llm_extracted else "regex"
+                extraction_methods.setdefault("case_title", method)
 
         # Fallback judge_name extraction from ruling text (#401).
         if not is_llm_extracted and not judge_name and ruling_text:
