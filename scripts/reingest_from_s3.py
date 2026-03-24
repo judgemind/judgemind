@@ -36,6 +36,10 @@ Options:
                         backfill that set unmappable motion types to NULL —
                         re-ingestion lets the enrichment pipeline extract
                         motion_type from ruling text.
+    --orphaned-only     Only re-ingest documents that have no associated
+                        ruling records. Useful after a backfill that created
+                        document records but did not process them through
+                        transcription/enrichment.
     --no-llm            Disable LLM extraction, use regex-only mode.
     --llm-timeout N     Per-call LLM API timeout in seconds (default: 60).
     --force-llm         Force LLM even when all fields are already populated.
@@ -228,6 +232,7 @@ def _build_filters(
     date_to: date | None,
     case_title_regex: str | None = None,
     null_motion_type: bool = False,
+    orphaned_only: bool = False,
 ) -> tuple[str, list]:
     """Build WHERE clause fragments and params for the document query."""
     clauses = []
@@ -248,6 +253,10 @@ def _build_filters(
         clauses.append(
             "AND EXISTS (SELECT 1 FROM rulings r"
             " WHERE r.document_id = d.id AND r.motion_type IS NULL)"
+        )
+    if orphaned_only:
+        clauses.append(
+            "AND NOT EXISTS (SELECT 1 FROM rulings r WHERE r.document_id = d.id)"
         )
     return " ".join(clauses), params
 
@@ -1729,6 +1738,7 @@ def run_reingest(
     full_reparse: bool = False,
     case_title_regex: str | None = None,
     null_motion_type: bool = False,
+    orphaned_only: bool = False,
     report_metrics: bool = False,
     multimodal: bool = False,
 ) -> dict[str, Any]:
@@ -1739,6 +1749,7 @@ def run_reingest(
         date_to,
         case_title_regex=case_title_regex,
         null_motion_type=null_motion_type,
+        orphaned_only=orphaned_only,
     )
 
     s3_client = boto3.client("s3")
@@ -2016,6 +2027,16 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--orphaned-only",
+        action="store_true",
+        help=(
+            "Only re-ingest documents that have no associated ruling "
+            "records. Useful after a backfill that created document "
+            "records but did not process them through transcription "
+            "and enrichment."
+        ),
+    )
+    parser.add_argument(
         "--report-metrics",
         action="store_true",
         help=(
@@ -2063,6 +2084,7 @@ def main() -> None:
         full_reparse=args.full_reparse,
         case_title_regex=args.case_title_regex,
         null_motion_type=args.null_motion_type,
+        orphaned_only=args.orphaned_only,
         report_metrics=args.report_metrics,
         multimodal=args.multimodal,
     )

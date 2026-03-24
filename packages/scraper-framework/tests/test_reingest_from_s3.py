@@ -1555,6 +1555,34 @@ class TestRunReingest:
         assert "AND EXISTS" in filters_arg
         assert "r.motion_type IS NULL" in filters_arg
 
+    @patch("reingest_from_s3.boto3")
+    @patch("reingest_from_s3.psycopg")
+    @patch("reingest_from_s3.reingest_batch")
+    def test_orphaned_only_filter_passed_through(
+        self,
+        mock_batch: MagicMock,
+        mock_psycopg: MagicMock,
+        mock_boto3: MagicMock,
+    ) -> None:
+        mock_conn = MagicMock()
+        mock_conn.__enter__ = MagicMock(return_value=mock_conn)
+        mock_conn.__exit__ = MagicMock(return_value=False)
+        mock_psycopg.connect.return_value = mock_conn
+
+        mock_batch.return_value = _make_batch_result()
+
+        reingest.run_reingest(
+            "postgresql://test",
+            county="Riverside",
+            orphaned_only=True,
+        )
+
+        call_args = mock_batch.call_args_list[0]
+        filters_arg = call_args[0][4]
+        assert "AND ct.county = %s" in filters_arg
+        assert "AND NOT EXISTS" in filters_arg
+        assert "r.document_id = d.id" in filters_arg
+
 
 # ---------------------------------------------------------------------------
 # _build_filters
@@ -1616,6 +1644,36 @@ class TestBuildFilters:
         assert "AND EXISTS" in clauses
         assert "r.motion_type IS NULL" in clauses
         assert params == ["San Diego", regex]
+
+    def test_orphaned_only_adds_not_exists_subquery(self) -> None:
+        clauses, params = reingest._build_filters(None, None, None, orphaned_only=True)
+        assert "AND NOT EXISTS" in clauses
+        assert "r.document_id = d.id" in clauses
+        assert params == []
+
+    def test_orphaned_only_false_no_clause(self) -> None:
+        clauses, params = reingest._build_filters(None, None, None, orphaned_only=False)
+        assert clauses == ""
+        assert params == []
+
+    def test_orphaned_only_with_county(self) -> None:
+        clauses, params = reingest._build_filters("Riverside", None, None, orphaned_only=True)
+        assert "AND ct.county = %s" in clauses
+        assert "AND NOT EXISTS" in clauses
+        assert "r.document_id = d.id" in clauses
+        assert params == ["Riverside"]
+
+    def test_orphaned_only_and_null_motion_type_mutually_exclusive_in_practice(
+        self,
+    ) -> None:
+        """Both flags can be set but produce contradictory logic (no doc can
+        have no rulings AND have a ruling with NULL motion_type). Verify both
+        clauses are emitted so the query returns an empty set gracefully."""
+        clauses, params = reingest._build_filters(
+            None, None, None, null_motion_type=True, orphaned_only=True
+        )
+        assert "AND EXISTS" in clauses
+        assert "AND NOT EXISTS" in clauses
 
 
 # ---------------------------------------------------------------------------
