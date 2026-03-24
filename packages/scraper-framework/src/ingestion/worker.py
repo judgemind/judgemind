@@ -721,6 +721,10 @@ class IngestionWorker:
                 hearing_dt = extract_hearing_date(ruling_text)
                 if hearing_dt is not None:
                     extraction_methods["hearing_date"] = "regex_post_llm"
+            if judge_name is None:
+                judge_name = extract_judge_name(ruling_text)
+                if judge_name is not None:
+                    extraction_methods["judge_name"] = "regex_post_llm"
 
         # Clean ruling text for display — extraction uses raw text above for
         # better regex matching; the cleaned version is stored in Postgres.
