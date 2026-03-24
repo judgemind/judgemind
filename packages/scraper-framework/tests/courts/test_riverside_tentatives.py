@@ -16,6 +16,7 @@ Fixtures captured from live site 2026-03-02:
 
 from __future__ import annotations
 
+import json
 import re
 from datetime import datetime
 from pathlib import Path
@@ -29,13 +30,16 @@ import respx
 from courts.ca.pdf_link_scraper import PdfLinkScraper, _extract_pdf_text
 from courts.ca.riverside_tentatives import (
     _CASE_NUMBER_RE,
+    _OUTCOME_MAP,
     INDEX_URL,
     RiversideTentativeRulingsScraper,
+    SplitRuling,
     _extract_case_title_from_ruling,
     _extract_motion_type,
     _extract_outcome,
     _filter_entry_matches,
     _is_no_tentative_rulings,
+    _llm_extract_rulings,
     _riv_courthouse,
     _riv_hearing_date_from_text,
     _split_rulings,
@@ -46,6 +50,20 @@ from framework import CapturedDocument, ContentFormat
 pytestmark = pytest.mark.regression
 
 FIXTURES = Path(__file__).parent.parent / "fixtures"
+
+
+@pytest.fixture(autouse=True)
+def _disable_llm_extraction(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Disable LLM extraction in all tests by default.
+
+    Returns ``None`` so ``fetch_documents()`` falls back to the regex-based
+    ``_split_rulings()`` path.  Tests that explicitly exercise the LLM path
+    should override this via ``monkeypatch`` or ``unittest.mock.patch``.
+    """
+    monkeypatch.setattr(
+        "courts.ca.riverside_tentatives._llm_extract_rulings",
+        lambda text: None,
+    )
 
 
 def _load_html(name: str) -> str:
@@ -1631,3 +1649,474 @@ class TestFilterEntryMatchesDuplicatesWithCaseRefs:
         # The "2." should be the real entry (with "Tentative Ruling: See #1 Above")
         block_after_2 = text[result[1].end() : result[2].start()]
         assert "See #1 Above" in block_after_2
+
+
+# ---------------------------------------------------------------------------
+# LLM extraction — _llm_extract_rulings (#1855)
+# ---------------------------------------------------------------------------
+
+
+class TestLlmExtractRulings:
+    """Tests for the LLM-based extraction path in the Riverside scraper (#1855)."""
+
+    # Sample LLM response matching the RIVERSIDE_SYSTEM_PROMPT output format
+    _SAMPLE_LLM_RESPONSE = json.dumps(
+        {
+            "extracted_judge_name": "Arthur Hester III",
+            "hearing_date": "2026-03-02",
+            "department": "PS1",
+            "rulings": [
+                {
+                    "extracted_case_number": "CVPS2306157",
+                    "extracted_case_title": "Yeldell v. Henss",
+                    "case_type": "civil",
+                    "outcome": "denied",
+                    "motion_type": "demurrer",
+                    "ruling_text": "Demurrer is OVERRULED. Defendant to answer within 10 days.",
+                },
+                {
+                    "extracted_case_number": "CVPS2306202",
+                    "extracted_case_title": "Crump v. Irwin",
+                    "case_type": "civil",
+                    "outcome": "other",
+                    "motion_type": "terminating sanctions",
+                    "ruling_text": "No tentative ruling, a hearing will be conducted.",
+                },
+                {
+                    "extracted_case_number": "CVPS2403119",
+                    "extracted_case_title": "Garcia v. Fca Us, Llc",
+                    "case_type": "civil",
+                    "outcome": "continued",
+                    "motion_type": "motion to compel",
+                    "ruling_text": "No tentative ruling, matter is continued to 3.23.26.",
+                },
+                {
+                    "extracted_case_number": "CVPS2404518",
+                    "extracted_case_title": None,
+                    "case_type": "civil",
+                    "outcome": "denied",
+                    "motion_type": "motion for production of documents",
+                    "ruling_text": "Motion for Production DENIED.",
+                },
+            ],
+        }
+    )
+
+    def test_llm_extract_returns_split_rulings(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """_llm_extract_rulings converts LLM JSON to SplitRuling objects."""
+        from ingestion.llm_providers import LLMResponse
+
+        monkeypatch.setattr(
+            "courts.ca.riverside_tentatives._llm_extract_rulings",
+            _llm_extract_rulings,  # restore original
+        )
+        mock_response = LLMResponse(
+            text=self._SAMPLE_LLM_RESPONSE,
+            input_tokens=100,
+            output_tokens=200,
+        )
+        with patch("ingestion.llm_providers.call_llm", return_value=mock_response):
+            rulings = _llm_extract_rulings("some pdf text")
+
+        assert rulings is not None
+        assert len(rulings) == 4
+        assert rulings[0].case_number == "CVPS2306157"
+        assert rulings[0].case_title == "Yeldell v. Henss"
+        assert rulings[0].motion_type == "demurrer"
+        assert rulings[0].ruling_index == 1
+        assert rulings[3].ruling_index == 4
+
+    def test_llm_extract_outcome_mapping(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """LLM outcome values are mapped to the format used by the regex pipeline."""
+        from ingestion.llm_providers import LLMResponse
+
+        monkeypatch.setattr(
+            "courts.ca.riverside_tentatives._llm_extract_rulings",
+            _llm_extract_rulings,
+        )
+        mock_response = LLMResponse(
+            text=self._SAMPLE_LLM_RESPONSE,
+            input_tokens=100,
+            output_tokens=200,
+        )
+        with patch("ingestion.llm_providers.call_llm", return_value=mock_response):
+            rulings = _llm_extract_rulings("some pdf text")
+
+        assert rulings is not None
+        # "denied" -> "Denied"
+        assert rulings[0].outcome == "Denied"
+        # "other" -> "No Tentative Ruling"
+        assert rulings[1].outcome == "No Tentative Ruling"
+        # "continued" -> "Continued"
+        assert rulings[2].outcome == "Continued"
+        # "denied" -> "Denied"
+        assert rulings[3].outcome == "Denied"
+
+    def test_llm_extract_unmapped_outcome_becomes_none(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Unmapped LLM outcomes are returned as None, not passed through raw."""
+        from ingestion.llm_providers import LLMResponse
+
+        monkeypatch.setattr(
+            "courts.ca.riverside_tentatives._llm_extract_rulings",
+            _llm_extract_rulings,
+        )
+        response_data = json.dumps(
+            {
+                "rulings": [
+                    {
+                        "extracted_case_number": "CVPS2306157",
+                        "ruling_text": "Some ruling text.",
+                        "outcome": "rejected",  # not in _OUTCOME_MAP
+                    }
+                ]
+            }
+        )
+        mock_response = LLMResponse(text=response_data, input_tokens=50, output_tokens=50)
+        with patch("ingestion.llm_providers.call_llm", return_value=mock_response):
+            rulings = _llm_extract_rulings("some pdf text")
+
+        assert rulings is not None
+        assert len(rulings) == 1
+        # Unmapped outcome "rejected" should become None, not pass through as "rejected"
+        assert rulings[0].outcome is None
+
+    def test_llm_extract_returns_none_on_null_response(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """_llm_extract_rulings returns None when call_llm returns None."""
+        monkeypatch.setattr(
+            "courts.ca.riverside_tentatives._llm_extract_rulings",
+            _llm_extract_rulings,
+        )
+        with patch("ingestion.llm_providers.call_llm", return_value=None):
+            result = _llm_extract_rulings("some pdf text")
+        assert result is None
+
+    def test_llm_extract_returns_none_on_invalid_json(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """_llm_extract_rulings returns None when the LLM returns invalid JSON."""
+        from ingestion.llm_providers import LLMResponse
+
+        monkeypatch.setattr(
+            "courts.ca.riverside_tentatives._llm_extract_rulings",
+            _llm_extract_rulings,
+        )
+        mock_response = LLMResponse(
+            text="This is not valid JSON at all",
+            input_tokens=100,
+            output_tokens=50,
+        )
+        with patch("ingestion.llm_providers.call_llm", return_value=mock_response):
+            result = _llm_extract_rulings("some pdf text")
+        assert result is None
+
+    def test_llm_extract_handles_bare_list_response(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """_llm_extract_rulings handles a bare JSON list (no wrapping object)."""
+        from ingestion.llm_providers import LLMResponse
+
+        monkeypatch.setattr(
+            "courts.ca.riverside_tentatives._llm_extract_rulings",
+            _llm_extract_rulings,
+        )
+        bare_list = json.dumps(
+            [
+                {
+                    "extracted_case_number": "CVPS2306157",
+                    "extracted_case_title": "Yeldell v. Henss",
+                    "outcome": "granted",
+                    "motion_type": "demurrer",
+                    "ruling_text": "Demurrer sustained.",
+                }
+            ]
+        )
+        mock_response = LLMResponse(text=bare_list, input_tokens=50, output_tokens=100)
+        with patch("ingestion.llm_providers.call_llm", return_value=mock_response):
+            rulings = _llm_extract_rulings("some pdf text")
+
+        assert rulings is not None
+        assert len(rulings) == 1
+        assert rulings[0].case_number == "CVPS2306157"
+        assert rulings[0].outcome == "Granted"
+
+    def test_llm_extract_strips_code_fences(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """_llm_extract_rulings strips markdown code fences from the response."""
+        from ingestion.llm_providers import LLMResponse
+
+        monkeypatch.setattr(
+            "courts.ca.riverside_tentatives._llm_extract_rulings",
+            _llm_extract_rulings,
+        )
+        fenced = (
+            "```json\n"
+            + json.dumps(
+                {
+                    "rulings": [
+                        {
+                            "extracted_case_number": "CVPS2306157",
+                            "ruling_text": "Granted.",
+                            "outcome": "granted",
+                        }
+                    ]
+                }
+            )
+            + "\n```"
+        )
+        mock_response = LLMResponse(text=fenced, input_tokens=50, output_tokens=100)
+        with patch("ingestion.llm_providers.call_llm", return_value=mock_response):
+            rulings = _llm_extract_rulings("some pdf text")
+
+        assert rulings is not None
+        assert len(rulings) == 1
+
+    def test_llm_extract_handles_empty_rulings(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """_llm_extract_rulings handles an empty rulings array (no-tentative PDF)."""
+        from ingestion.llm_providers import LLMResponse
+
+        monkeypatch.setattr(
+            "courts.ca.riverside_tentatives._llm_extract_rulings",
+            _llm_extract_rulings,
+        )
+        empty_response = json.dumps({"rulings": []})
+        mock_response = LLMResponse(text=empty_response, input_tokens=50, output_tokens=20)
+        with patch("ingestion.llm_providers.call_llm", return_value=mock_response):
+            rulings = _llm_extract_rulings("No Tentative Rulings March 2, 2026")
+
+        assert rulings is not None
+        assert len(rulings) == 0
+
+    def test_llm_extract_returns_none_on_unexpected_shape(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """_llm_extract_rulings returns None when the LLM returns an unexpected JSON shape."""
+        from ingestion.llm_providers import LLMResponse
+
+        monkeypatch.setattr(
+            "courts.ca.riverside_tentatives._llm_extract_rulings",
+            _llm_extract_rulings,
+        )
+        # JSON string (not a dict or list)
+        mock_response = LLMResponse(text='"just a string"', input_tokens=10, output_tokens=5)
+        with patch("ingestion.llm_providers.call_llm", return_value=mock_response):
+            result = _llm_extract_rulings("some pdf text")
+        assert result is None
+
+    def test_llm_extract_returns_none_when_rulings_not_list(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """_llm_extract_rulings returns None when 'rulings' key is not a list."""
+        from ingestion.llm_providers import LLMResponse
+
+        monkeypatch.setattr(
+            "courts.ca.riverside_tentatives._llm_extract_rulings",
+            _llm_extract_rulings,
+        )
+        bad_rulings = json.dumps({"rulings": "not a list"})
+        mock_response = LLMResponse(text=bad_rulings, input_tokens=10, output_tokens=5)
+        with patch("ingestion.llm_providers.call_llm", return_value=mock_response):
+            result = _llm_extract_rulings("some pdf text")
+        assert result is None
+
+    def test_llm_extract_skips_non_dict_entries(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """_llm_extract_rulings skips non-dict entries in the rulings list."""
+        from ingestion.llm_providers import LLMResponse
+
+        monkeypatch.setattr(
+            "courts.ca.riverside_tentatives._llm_extract_rulings",
+            _llm_extract_rulings,
+        )
+        mixed_rulings = json.dumps(
+            {
+                "rulings": [
+                    {
+                        "extracted_case_number": "CVPS2306157",
+                        "ruling_text": "Granted.",
+                        "outcome": "granted",
+                    },
+                    "not a dict",
+                    42,
+                    None,
+                ]
+            }
+        )
+        mock_response = LLMResponse(text=mixed_rulings, input_tokens=50, output_tokens=50)
+        with patch("ingestion.llm_providers.call_llm", return_value=mock_response):
+            rulings = _llm_extract_rulings("some pdf text")
+
+        assert rulings is not None
+        assert len(rulings) == 1  # only the valid dict entry
+        assert rulings[0].case_number == "CVPS2306157"
+
+
+class TestOutcomeMap:
+    """Tests for the _OUTCOME_MAP used to translate LLM outcomes."""
+
+    def test_all_llm_outcomes_mapped(self) -> None:
+        """Every LLM outcome value in the prompt has a mapping."""
+        llm_outcomes = [
+            "granted",
+            "denied",
+            "granted_in_part",
+            "denied_in_part",
+            "moot",
+            "continued",
+            "off_calendar",
+            "submitted",
+            "other",
+            None,
+        ]
+        for outcome in llm_outcomes:
+            assert outcome in _OUTCOME_MAP
+
+    def test_mapped_values_are_capitalized(self) -> None:
+        """All non-None mapped values start with an uppercase letter."""
+        for key, value in _OUTCOME_MAP.items():
+            if value is not None:
+                assert value[0].isupper(), f"_OUTCOME_MAP[{key!r}] = {value!r} is not capitalized"
+
+
+# ---------------------------------------------------------------------------
+# Integration: LLM extraction path in fetch_documents (#1855)
+# ---------------------------------------------------------------------------
+
+
+@respx.mock
+def test_riv_fetch_documents_uses_llm_extraction(monkeypatch: pytest.MonkeyPatch) -> None:
+    """fetch_documents uses LLM extraction when _llm_extract_rulings succeeds."""
+    html = _load_html("riv_page.html")
+    pdf_bytes = _load_bytes("riv_ps1.pdf")
+
+    respx.get(INDEX_URL).mock(return_value=httpx.Response(200, text=html))
+    respx.get(url__regex=r"\.pdf$").mock(
+        return_value=httpx.Response(200, content=pdf_bytes),
+    )
+
+    # Create a deterministic LLM response for 4 rulings
+    llm_rulings = [
+        SplitRuling(
+            ruling_index=1,
+            case_number="CVPS2306157",
+            ruling_text="Demurrer OVERRULED.",
+            case_title="Yeldell v. Henss",
+            motion_type="demurrer",
+            outcome="Denied",
+        ),
+        SplitRuling(
+            ruling_index=2,
+            case_number="CVPS2306202",
+            ruling_text="No tentative ruling.",
+            case_title="Crump v. Irwin",
+            motion_type="terminating sanctions",
+            outcome="No Tentative Ruling",
+        ),
+        SplitRuling(
+            ruling_index=3,
+            case_number="CVPS2403119",
+            ruling_text="Continued to 3.23.26.",
+            case_title="Garcia v. Fca Us, Llc",
+            motion_type="motion to compel",
+            outcome="Continued",
+        ),
+        SplitRuling(
+            ruling_index=4,
+            case_number="CVPS2404518",
+            ruling_text="Motion DENIED.",
+            case_title=None,
+            motion_type="production of documents",
+            outcome="Denied",
+        ),
+    ]
+    monkeypatch.setattr(
+        "courts.ca.riverside_tentatives._llm_extract_rulings",
+        lambda text: llm_rulings,
+    )
+
+    config = riv_default_config()
+    config.request_delay_seconds = 0
+    scraper = RiversideTentativeRulingsScraper(config=config)
+
+    docs = scraper.fetch_documents()
+    # 17 PDF links, each returns 4 rulings from LLM
+    assert len(docs) == 17 * 4
+
+    # Check that per-ruling fields come from LLM output
+    batch = docs[:4]
+    assert batch[0].case_number == "CVPS2306157"
+    assert batch[0].ruling_text == "Demurrer OVERRULED."
+    assert batch[0].case_title == "Yeldell v. Henss"
+    assert batch[1].case_number == "CVPS2306202"
+    assert batch[2].case_number == "CVPS2403119"
+    assert batch[3].case_number == "CVPS2404518"
+
+    # All should be marked pre_split
+    assert all(d.extra.get("pre_split") for d in docs)
+
+
+@respx.mock
+def test_riv_fetch_documents_falls_back_to_regex_on_llm_failure() -> None:
+    """fetch_documents falls back to regex when _llm_extract_rulings returns None.
+
+    Note: This test uses the default autouse fixture that sets
+    _llm_extract_rulings to return None, so the regex fallback is tested.
+    """
+    html = _load_html("riv_page.html")
+    pdf_bytes = _load_bytes("riv_ps1.pdf")  # 4 rulings
+
+    respx.get(INDEX_URL).mock(return_value=httpx.Response(200, text=html))
+    respx.get(url__regex=r"\.pdf$").mock(
+        return_value=httpx.Response(200, content=pdf_bytes),
+    )
+
+    config = riv_default_config()
+    config.request_delay_seconds = 0
+    scraper = RiversideTentativeRulingsScraper(config=config)
+
+    docs = scraper.fetch_documents()
+    # Regex fallback produces 4 rulings per PDF, 17 PDFs total
+    assert len(docs) == 17 * 4
+
+    # Verify the regex extraction still works correctly
+    batch = docs[:4]
+    case_nums = [d.case_number for d in batch]
+    assert case_nums == ["CVPS2306157", "CVPS2306202", "CVPS2403119", "CVPS2404518"]
+
+
+@respx.mock
+def test_riv_fetch_documents_llm_single_ruling_not_split(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When LLM returns a single ruling, the document is not split."""
+    html = _load_html("riv_page.html")
+    pdf_bytes = _load_bytes("riv_ps1.pdf")
+
+    respx.get(INDEX_URL).mock(return_value=httpx.Response(200, text=html))
+    respx.get(url__regex=r"\.pdf$").mock(
+        return_value=httpx.Response(200, content=pdf_bytes),
+    )
+
+    single_ruling = [
+        SplitRuling(
+            ruling_index=1,
+            case_number="CVPS2306157",
+            ruling_text="Demurrer OVERRULED.",
+            case_title="Yeldell v. Henss",
+            motion_type="demurrer",
+            outcome="Denied",
+        ),
+    ]
+    monkeypatch.setattr(
+        "courts.ca.riverside_tentatives._llm_extract_rulings",
+        lambda text: single_ruling,
+    )
+
+    config = riv_default_config()
+    config.request_delay_seconds = 0
+    scraper = RiversideTentativeRulingsScraper(config=config)
+
+    docs = scraper.fetch_documents()
+    # Single ruling means each PDF returns 1 unsplit doc
+    assert len(docs) == 17
+    # Should NOT have pre_split flag
+    assert all(not d.extra.get("pre_split") for d in docs)

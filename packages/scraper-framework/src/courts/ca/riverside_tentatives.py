@@ -35,6 +35,7 @@ Courthouse mapping (best-effort — Riverside has many locations):
 
 from __future__ import annotations
 
+import json
 import re
 from collections import defaultdict
 from datetime import datetime
@@ -502,6 +503,187 @@ def _extract_outcome(text: str) -> str | None:
 
 
 # ---------------------------------------------------------------------------
+# LLM-based extraction (production path, regex fallback on failure)
+# ---------------------------------------------------------------------------
+
+# Riverside-specific prompt validated in eval (#1718, 100% accuracy on all fixtures).
+RIVERSIDE_SYSTEM_PROMPT = (
+    "You are a legal document parser for California court "
+    "tentative rulings from Riverside County Superior Court.\n\n"
+    "You will receive the full text extracted from a PDF containing "
+    "tentative rulings.  Your job is to identify EVERY individual "
+    "case ruling in the document and extract structured data for each.\n\n"
+    "## Riverside Document Format\n\n"
+    "Riverside PDFs have this structure:\n"
+    "1. **Header**: 'Tentative Rulings for [date]' followed by "
+    "department and judge information, plus standard boilerplate "
+    "about oral arguments and telephonic appearances.\n"
+    "2. **Numbered entries**: Each case starts with a number on its "
+    "own line (e.g., '1.', '2.', '3.'), followed by:\n"
+    "   - Case number (e.g., CVPS2306157, CVMV2507098, RIC1904113)\n"
+    "   - Party names (e.g., 'YELDELL vs HENSS')\n"
+    "   - Motion description (e.g., 'Hearing re: Demurrer on 1st "
+    "Amended Complaint')\n"
+    "   - 'Tentative Ruling:' followed by the ruling text\n"
+    "3. **Cross-references**: Some entries may reference another entry "
+    "with phrases like 'See #1 Above', 'See No. 3 above', or 'Same "
+    "as #2'. These are SEPARATE entries that must be counted "
+    "individually — they are distinct cases even though they share "
+    "ruling text.\n"
+    "4. **Page breaks**: Rulings may span multiple pages. 'Page N of M' "
+    "footers appear at the bottom of each page.\n"
+    "5. **No tentative rulings**: Some PDFs contain only 'No Tentative "
+    "Rulings for [date]' or 'No Tentative Rulings [date]' with "
+    "boilerplate text. These have zero cases.\n\n"
+    "## Case Number Formats\n\n"
+    "Riverside case numbers use these patterns:\n"
+    "- CV + location code + year + sequence: CVPS2306157, CVMV2507098, "
+    "CVRI2403055\n"
+    "- Location prefix + sequence: RIC1904113, MCC2012345, PSC2112345\n"
+    "- Location codes: PS=Palm Springs, MV=Moreno Valley, M=Murrieta, "
+    "RI=Riverside, C=Corona\n\n"
+    "## Rules\n\n"
+    "1. Count and return EVERY numbered entry as a separate ruling. "
+    "If the document has entries 1 through 4, return 4 rulings.\n"
+    "2. Cross-reference entries ('See #N Above') are their OWN rulings "
+    "with their OWN case number — do NOT skip them or merge them.\n"
+    "3. Extract the case number EXACTLY as it appears.\n"
+    "4. For case_title, use 'Plaintiff v. Defendant' format.\n"
+    "5. For ruling_text, include the FULL text of the ruling after "
+    "'Tentative Ruling:'. Preserve it VERBATIM.\n"
+    "6. Skip the header boilerplate (oral argument instructions, "
+    "phone numbers, URLs, etc.) — only extract from the numbered "
+    "entries.\n"
+    "7. 'No Tentative Rulings' documents have zero cases — return an "
+    "empty rulings array.\n"
+    "8. Strip 'Page N of M' footers from ruling text.\n\n"
+    "## Outcome taxonomy\n\n"
+    "Use EXACTLY one of these values:\n"
+    "- granted — motion was fully granted\n"
+    "- denied — motion was fully denied\n"
+    "- granted_in_part — partially granted and partially denied\n"
+    "- denied_in_part — partially denied\n"
+    "- moot — motion is moot\n"
+    "- continued — hearing was postponed\n"
+    "- off_calendar — hearing removed from calendar\n"
+    "- submitted — taken under submission\n"
+    "- other — none of the above fit\n\n"
+    "For 'overruled' (demurrers), map to 'denied'.\n"
+    "For 'sustained' (demurrers), map to 'granted'.\n"
+    "For 'No tentative ruling, a hearing will be conducted', use 'other'.\n\n"
+    "## Output format\n\n"
+    "Respond with ONLY a JSON object, no other text:\n\n"
+    "{\n"
+    '  "extracted_judge_name": "First M. Last" or null,\n'
+    '  "hearing_date": "YYYY-MM-DD" or null,\n'
+    '  "department": "PS1" or null,\n'
+    '  "rulings": [\n'
+    "    {\n"
+    '      "extracted_case_number": "CVPS2306157" or null,\n'
+    '      "extracted_case_title": "Yeldell v. Henss" or null,\n'
+    '      "case_type": "civil" or null,\n'
+    '      "outcome": "denied" or null,\n'
+    '      "motion_type": "demurrer" or null,\n'
+    '      "ruling_text": "Full verbatim text..." or null\n'
+    "    }\n"
+    "  ]\n"
+    "}"
+)
+
+# Default LLM provider and model for Riverside text extraction.
+_RIV_LLM_PROVIDER = "google"
+_RIV_LLM_MODEL = "gemini-2.5-flash-lite"
+
+# Map LLM outcome values to the format used by the existing regex pipeline.
+_OUTCOME_MAP: dict[str | None, str | None] = {
+    "granted": "Granted",
+    "denied": "Denied",
+    "granted_in_part": "Granted",
+    "denied_in_part": "Denied",
+    "moot": "Moot",
+    "continued": "Continued",
+    "off_calendar": "Off Calendar",
+    "submitted": "Submitted",
+    "other": "No Tentative Ruling",
+    None: None,
+}
+
+
+def _llm_extract_rulings(text: str) -> list[SplitRuling] | None:
+    """Extract rulings from PDF text using an LLM (gemini-2.5-flash-lite).
+
+    Returns a list of ``SplitRuling`` objects on success, or ``None`` if the
+    LLM call fails or the response cannot be parsed.  The caller should fall
+    back to ``_split_rulings()`` when ``None`` is returned.
+    """
+    from ingestion.llm_providers import call_llm
+
+    response = call_llm(
+        system_prompt=RIVERSIDE_SYSTEM_PROMPT,
+        user_message=text,
+        provider=_RIV_LLM_PROVIDER,
+        model=_RIV_LLM_MODEL,
+        max_tokens=8192,
+        timeout=30.0,
+    )
+
+    if response is None:
+        logger.warning("riverside.llm_extraction_failed", reason="null_response")
+        return None
+
+    try:
+        raw = response.text.strip()
+        # Strip markdown code fences if present
+        if raw.startswith("```"):
+            lines = raw.split("\n")
+            lines = [line for line in lines if not line.strip().startswith("```")]
+            raw = "\n".join(lines)
+
+        data = json.loads(raw)
+    except (json.JSONDecodeError, ValueError) as exc:
+        logger.warning("riverside.llm_parse_failed", error=str(exc))
+        return None
+
+    # Accept both {"rulings": [...]} and bare [...] responses.
+    if isinstance(data, list):
+        rulings_list = data
+    elif isinstance(data, dict):
+        rulings_list = data.get("rulings", [])
+    else:
+        logger.warning("riverside.llm_unexpected_shape", shape=type(data).__name__)
+        return None
+
+    if not isinstance(rulings_list, list):
+        logger.warning("riverside.llm_rulings_not_list")
+        return None
+
+    rulings: list[SplitRuling] = []
+    for idx, entry in enumerate(rulings_list):
+        if not isinstance(entry, dict):
+            continue
+        raw_outcome = entry.get("outcome")
+        outcome = _OUTCOME_MAP.get(raw_outcome)
+        rulings.append(
+            SplitRuling(
+                ruling_index=idx + 1,
+                case_number=entry.get("extracted_case_number"),
+                ruling_text=entry.get("ruling_text") or "",
+                case_title=entry.get("extracted_case_title"),
+                motion_type=entry.get("motion_type"),
+                outcome=outcome,
+            )
+        )
+
+    logger.info(
+        "riverside.llm_extraction_success",
+        ruling_count=len(rulings),
+        input_tokens=response.input_tokens,
+        output_tokens=response.output_tokens,
+    )
+    return rulings
+
+
+# ---------------------------------------------------------------------------
 # Courthouse mapping
 # ---------------------------------------------------------------------------
 
@@ -590,7 +772,14 @@ class RiversideTentativeRulingsScraper(PdfLinkScraper):
                         judge_name=mapped_name,
                     )
 
-            rulings = _split_rulings(text)
+            # Try LLM extraction first; fall back to regex on failure.
+            rulings = _llm_extract_rulings(text)
+            if rulings is None:
+                logger.warning(
+                    "LLM extraction failed, falling back to regex",
+                    department=doc.department,
+                )
+                rulings = _split_rulings(text)
             if len(rulings) <= 1:
                 # Single ruling or no rulings — keep original doc
                 split_docs.append(doc)
