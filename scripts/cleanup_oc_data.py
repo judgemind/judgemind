@@ -92,8 +92,20 @@ def _clean_title(title: str) -> str | None:
     if m:
         cleaned = m.group(1).strip().rstrip(".,;:() ")
         # Must have at least a "v." or "vs" separator to be a valid title
-        if re.search(r"\bvs?\.?\b", cleaned, re.IGNORECASE):
-            return cleaned
+        if not re.search(r"\bvs?\.?\b", cleaned, re.IGNORECASE):
+            return None
+        # Validate that the defendant part (after "v.") is a real name,
+        # not ruling text that leaked through the regex.
+        vs_match = re.search(r"\b(?:vs?\.?)\s+(.*)", cleaned, re.IGNORECASE)
+        if vs_match:
+            defendant = vs_match.group(1).strip()
+            # "Before the Court" is ruling text, not a defendant name
+            if re.search(r"(?i)^Before the", defendant):
+                return None
+            # Must have at least 2 chars of defendant name
+            if len(defendant) < 2:
+                return None
+        return cleaned
     return None
 
 
@@ -118,7 +130,9 @@ def _extract_title_from_ruling(ruling_text: str) -> str | None:
 
 FETCH_UNKNOWN_CASES = """
     SELECT c.id, c.case_number, c.case_title, c.court_id,
-           r.ruling_text
+           r.ruling_text,
+           (SELECT COUNT(*) FROM rulings r3 WHERE r3.case_id = c.id) AS ruling_count,
+           (SELECT COUNT(*) FROM documents d WHERE d.case_id = c.id) AS document_count
     FROM cases c
     LEFT JOIN LATERAL (
         SELECT r2.ruling_text
@@ -170,6 +184,7 @@ def _fix_unknown_case_numbers(
         "total": 0,
         "updated": 0,
         "merged": 0,
+        "deleted_orphans": 0,
         "no_number": 0,
         "errors": 0,
     }
@@ -180,7 +195,15 @@ def _fix_unknown_case_numbers(
 
     logger.info("Found %d cases with UNKNOWN case numbers", len(rows))
 
-    for case_id, old_case_number, case_title, court_id, ruling_text in rows:
+    for (
+        case_id,
+        old_case_number,
+        case_title,
+        court_id,
+        ruling_text,
+        ruling_count,
+        document_count,
+    ) in rows:
         stats["total"] += 1
 
         # Try to extract case number from ruling text first, then title
@@ -189,10 +212,26 @@ def _fix_unknown_case_numbers(
             case_number = _extract_case_number_from_text(case_title)
 
         if case_number is None:
+            # If this case has no rulings AND no documents, it's an orphan
+            # that can be safely deleted.
+            if ruling_count == 0 and document_count == 0:
+                logger.info(
+                    "DELETE ORPHAN: Case %s (%s) — no rulings, no documents",
+                    case_id,
+                    old_case_number,
+                )
+                if not dry_run:
+                    with conn.cursor() as cur:
+                        cur.execute(DELETE_DUPLICATE_CASE, (str(case_id),))
+                stats["deleted_orphans"] += 1
+                continue
+
             logger.debug(
-                "No case number found for %s (title: %s)",
+                "No case number found for %s (title: %s, rulings: %d, docs: %d)",
                 case_id,
                 case_title,
+                ruling_count,
+                document_count,
             )
             stats["no_number"] += 1
             continue
@@ -244,9 +283,10 @@ def _fix_unknown_case_numbers(
     else:
         conn.commit()
         logger.info(
-            "Phase 1 committed: %d updated, %d merged, %d no number found",
+            "Phase 1 committed: %d updated, %d merged, %d orphans deleted, %d no number found",
             stats["updated"],
             stats["merged"],
+            stats["deleted_orphans"],
             stats["no_number"],
         )
 
