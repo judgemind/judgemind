@@ -185,6 +185,37 @@ Labeled fields waste space. Reserve tabular layout for data that benefits from c
 - Muted icon (optional) + clear message + suggested action
 - Never compete with navigation or filter chrome
 
+### Pagination
+
+All list pages use infinite scroll powered by the shared `InfiniteScrollTrigger` component (`packages/web/src/components/InfiniteScrollTrigger.tsx`). Do **not** duplicate `IntersectionObserver` logic inline — always use this component.
+
+**Usage:**
+
+```tsx
+import { InfiniteScrollTrigger } from '@/components/InfiniteScrollTrigger';
+
+{/* Place after the last list row */}
+<InfiniteScrollTrigger
+  hasNextPage={pageInfo?.hasNextPage ?? false}
+  loading={loading}
+  onLoadMore={loadMore}
+/>
+```
+
+**Props:**
+
+| Prop | Type | Description |
+|------|------|-------------|
+| `hasNextPage` | `boolean` | Whether more data is available to load |
+| `loading` | `boolean` | Whether a fetch is currently in progress |
+| `onLoadMore` | `() => void` | Callback invoked when the sentinel enters the viewport |
+| `rootMargin` | `string` (optional) | `IntersectionObserver` rootMargin for pre-fetching (default: `'200px'`) |
+
+**Rules:**
+- Never use "Load more" buttons. Pagination is always automatic via scroll.
+- Place the `<InfiniteScrollTrigger>` immediately after the last rendered row, inside the same container.
+- The component renders an invisible 1px sentinel div and hides itself while loading to prevent duplicate fetches.
+
 ### Loading States
 
 - Skeleton loaders matching the shape of the content they replace
