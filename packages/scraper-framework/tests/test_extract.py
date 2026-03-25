@@ -2046,6 +2046,22 @@ class TestExtractFromInlinePartyRefs:
         """Returns None for empty text."""
         assert _extract_from_inline_party_refs("") is None
 
+    def test_rejects_compelling_to_respond(self) -> None:
+        """Does not extract 'to respond' as a name from compelling pattern."""
+        text = (
+            "The Court is granting Plaintiff's motions for orders "
+            "compelling Defendants to respond, without objections, "
+            "to Plaintiff's Requests for Production."
+        )
+        result = _extract_from_inline_party_refs(text)
+        assert result is None
+
+    def test_rejects_compelling_to_produce(self) -> None:
+        """Does not extract 'to produce all' as a name from compelling pattern."""
+        text = "The Court is ordering compelling Defendants to produce all responsive documents."
+        result = _extract_from_inline_party_refs(text)
+        assert result is None
+
     def test_returns_single_side_when_only_plaintiff(self) -> None:
         """Returns single-side title when only plaintiff is named."""
         text = "Plaintiff Martinez filed a motion to compel."
