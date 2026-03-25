@@ -1129,6 +1129,14 @@ describe('getOutcomeBadgeVariant', () => {
     expect(getOutcomeBadgeVariant('other')).toBe('outline');
   });
 
+  it('returns "outline" for off_calendar', () => {
+    expect(getOutcomeBadgeVariant('off_calendar')).toBe('outline');
+  });
+
+  it('returns "outline" for submitted', () => {
+    expect(getOutcomeBadgeVariant('submitted')).toBe('outline');
+  });
+
   it('returns "outline" for null', () => {
     expect(getOutcomeBadgeVariant(null)).toBe('outline');
   });
@@ -1217,6 +1225,11 @@ describe('getOutcomeBadgeListClass', () => {
     expect(getOutcomeBadgeListClass('off_calendar')).toContain('border-stone-300');
   });
 
+  it('returns stone tint classes for submitted (#1941)', () => {
+    expect(getOutcomeBadgeListClass('submitted')).toContain('text-stone-500');
+    expect(getOutcomeBadgeListClass('submitted')).toContain('border-stone-300');
+  });
+
   it('returns stone tint classes for other (#1740 — BRAND.md neutral outcomes)', () => {
     expect(getOutcomeBadgeListClass('other')).toContain('text-stone-500');
     expect(getOutcomeBadgeListClass('other')).toContain('border-stone-300');
@@ -1243,7 +1256,13 @@ describe('OUTCOME_LABELS', () => {
     expect(OUTCOME_LABELS['denied_in_part']).toBe('Denied In Part');
     expect(OUTCOME_LABELS['moot']).toBe('Moot');
     expect(OUTCOME_LABELS['continued']).toBe('Continued');
+    expect(OUTCOME_LABELS['off_calendar']).toBe('Off Calendar');
+    expect(OUTCOME_LABELS['submitted']).toBe('Submitted');
     expect(OUTCOME_LABELS['other']).toBe('Other');
+  });
+
+  it('contains exactly 9 entries for all ruling_outcome enum values', () => {
+    expect(Object.keys(OUTCOME_LABELS).length).toBe(9);
   });
 });
 
@@ -1263,6 +1282,8 @@ describe('formatOutcome', () => {
     expect(formatOutcome('denied_in_part')).toBe('Denied In Part');
     expect(formatOutcome('moot')).toBe('Moot');
     expect(formatOutcome('continued')).toBe('Continued');
+    expect(formatOutcome('off_calendar')).toBe('Off Calendar');
+    expect(formatOutcome('submitted')).toBe('Submitted');
     expect(formatOutcome('other')).toBe('Other');
   });
 

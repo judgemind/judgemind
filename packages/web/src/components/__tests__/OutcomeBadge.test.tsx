@@ -89,6 +89,13 @@ describe('OutcomeBadge', () => {
     expect(badge.className).toContain('border-stone-300');
   });
 
+  it('applies stone tint classes for submitted outcomes (#1941)', () => {
+    const { container } = render(<OutcomeBadge outcome="submitted" />);
+    const badge = container.firstChild as HTMLElement;
+    expect(badge.className).toContain('text-stone-500');
+    expect(badge.className).toContain('border-stone-300');
+  });
+
   it('applies stone tint classes for other outcomes', () => {
     const { container } = render(<OutcomeBadge outcome="other" />);
     const badge = container.firstChild as HTMLElement;
