@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useEffect, useRef, useCallback } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { useQuery, gql } from '@apollo/client';
 import { useRouter, useSearchParams } from 'next/navigation';
 import Link from 'next/link';
@@ -12,6 +12,7 @@ import {
 import { Autocomplete } from '@/components/Autocomplete';
 import { InfiniteScrollTrigger } from '@/components/InfiniteScrollTrigger';
 import { OutcomeBadge } from '@/components/OutcomeBadge';
+import { useInfiniteScroll } from '@/hooks/useInfiniteScroll';
 import { useCountyOptions } from '@/lib/filter-options';
 import { Badge } from '@/components/ui/badge';
 import { Input } from '@/components/ui/input';
@@ -150,26 +151,22 @@ export function RulingsFeed() {
 
   const edges = data?.rulings.edges ?? [];
   const pageInfo = data?.rulings.pageInfo;
-  const fetchingMore = useRef(false);
 
-  const handleLoadMore = useCallback(() => {
-    if (!pageInfo?.endCursor || loading || fetchingMore.current) return;
-    fetchingMore.current = true;
-    fetchMore({
-      variables: { after: pageInfo.endCursor },
-      updateQuery(prev, { fetchMoreResult }) {
-        if (!fetchMoreResult) return prev;
-        return {
-          rulings: {
-            ...fetchMoreResult.rulings,
-            edges: [...prev.rulings.edges, ...fetchMoreResult.rulings.edges],
-          },
-        };
-      },
-    }).finally(() => {
-      fetchingMore.current = false;
-    });
-  }, [pageInfo?.endCursor, loading, fetchMore]);
+  const { handleLoadMore } = useInfiniteScroll<RulingsData>({
+    hasNextPage: pageInfo?.hasNextPage,
+    endCursor: pageInfo?.endCursor,
+    loading,
+    fetchMore,
+    merge: useCallback(
+      (prev: RulingsData, incoming: RulingsData) => ({
+        rulings: {
+          ...incoming.rulings,
+          edges: [...prev.rulings.edges, ...incoming.rulings.edges],
+        },
+      }),
+      [],
+    ),
+  });
 
   return (
     <div className="space-y-6">

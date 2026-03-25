@@ -1,6 +1,6 @@
 'use client';
 
-import { useRef, useCallback } from 'react';
+import { useCallback } from 'react';
 import { useQuery, gql } from '@apollo/client';
 import Link from 'next/link';
 import { BarChart3, Scale } from 'lucide-react';
@@ -10,6 +10,7 @@ import {
   formatMotionType,
 } from '@/lib/display-helpers';
 import { InfiniteScrollTrigger } from '@/components/InfiniteScrollTrigger';
+import { useInfiniteScroll } from '@/hooks/useInfiniteScroll';
 import { OutcomeBadge } from '@/components/OutcomeBadge';
 import { SECTION_HEADING, SECTION_LABEL } from '@/lib/typography';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
@@ -227,31 +228,27 @@ export function JudgeProfile({ judgeId }: { judgeId: string }) {
   const analytics = analyticsData?.judgeAnalytics;
   const edges = rulingsData?.rulings.edges ?? [];
   const pageInfo = rulingsData?.rulings.pageInfo;
-  const fetchingMore = useRef(false);
 
   // Coordinate loading states: only show empty messages when both queries
   // have completed. If one returns empty while the other is still loading,
   // show a skeleton instead of the contradictory "No rulings captured" message.
   const bothLoaded = !analyticsLoading && !rulingsLoading;
 
-  const handleLoadMore = useCallback(() => {
-    if (!pageInfo?.endCursor || rulingsLoading || fetchingMore.current) return;
-    fetchingMore.current = true;
-    fetchMore({
-      variables: { after: pageInfo.endCursor },
-      updateQuery(prev, { fetchMoreResult }) {
-        if (!fetchMoreResult) return prev;
-        return {
-          rulings: {
-            ...fetchMoreResult.rulings,
-            edges: [...prev.rulings.edges, ...fetchMoreResult.rulings.edges],
-          },
-        };
-      },
-    }).finally(() => {
-      fetchingMore.current = false;
-    });
-  }, [pageInfo?.endCursor, rulingsLoading, fetchMore]);
+  const { handleLoadMore } = useInfiniteScroll<RulingsData>({
+    hasNextPage: pageInfo?.hasNextPage,
+    endCursor: pageInfo?.endCursor,
+    loading: rulingsLoading,
+    fetchMore,
+    merge: useCallback(
+      (prev: RulingsData, incoming: RulingsData) => ({
+        rulings: {
+          ...incoming.rulings,
+          edges: [...prev.rulings.edges, ...incoming.rulings.edges],
+        },
+      }),
+      [],
+    ),
+  });
 
   // -------------------------------------------------------------------------
   // Analytics section

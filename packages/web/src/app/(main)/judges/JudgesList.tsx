@@ -1,11 +1,12 @@
 'use client';
 
-import { useState, useCallback, useEffect, useRef } from 'react';
+import { useState, useCallback, useEffect } from 'react';
 import { useQuery, gql } from '@apollo/client';
 import { useRouter, useSearchParams } from 'next/navigation';
 import Link from 'next/link';
 import { Search } from 'lucide-react';
 import { InfiniteScrollTrigger } from '@/components/InfiniteScrollTrigger';
+import { useInfiniteScroll } from '@/hooks/useInfiniteScroll';
 import { Badge } from '@/components/ui/badge';
 import { Input } from '@/components/ui/input';
 import { Skeleton } from '@/components/ui/skeleton';
@@ -111,7 +112,22 @@ export function JudgesList() {
 
   const edges = data?.judges.edges ?? [];
   const pageInfo = data?.judges.pageInfo;
-  const fetchingMore = useRef(false);
+
+  const { handleLoadMore } = useInfiniteScroll<JudgesData>({
+    hasNextPage: pageInfo?.hasNextPage,
+    endCursor: pageInfo?.endCursor,
+    loading,
+    fetchMore,
+    merge: useCallback(
+      (prev: JudgesData, incoming: JudgesData) => ({
+        judges: {
+          ...incoming.judges,
+          edges: [...prev.judges.edges, ...incoming.judges.edges],
+        },
+      }),
+      [],
+    ),
+  });
 
   // Client-side name filter (the API doesn't support text search on judges)
   const filteredEdges = nameFilter
@@ -119,25 +135,6 @@ export function JudgesList() {
         node.canonicalName.toLowerCase().includes(nameFilter.toLowerCase()),
       )
     : edges;
-
-  const handleLoadMore = useCallback(() => {
-    if (!pageInfo?.endCursor || loading || fetchingMore.current) return;
-    fetchingMore.current = true;
-    fetchMore({
-      variables: { after: pageInfo.endCursor },
-      updateQuery(prev, { fetchMoreResult }) {
-        if (!fetchMoreResult) return prev;
-        return {
-          judges: {
-            ...fetchMoreResult.judges,
-            edges: [...prev.judges.edges, ...fetchMoreResult.judges.edges],
-          },
-        };
-      },
-    }).finally(() => {
-      fetchingMore.current = false;
-    });
-  }, [pageInfo?.endCursor, loading, fetchMore]);
 
   return (
     <div className="space-y-6">

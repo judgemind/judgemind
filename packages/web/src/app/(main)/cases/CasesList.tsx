@@ -1,11 +1,12 @@
 'use client';
 
-import { useState, useCallback, useEffect, useRef } from 'react';
+import { useState, useCallback, useEffect } from 'react';
 import { useQuery, gql } from '@apollo/client';
 import { useRouter, useSearchParams } from 'next/navigation';
 import Link from 'next/link';
 import { formatLabel } from '@/lib/display-helpers';
 import { InfiniteScrollTrigger } from '@/components/InfiniteScrollTrigger';
+import { useInfiniteScroll } from '@/hooks/useInfiniteScroll';
 import { Input } from '@/components/ui/input';
 import {
   Select,
@@ -127,14 +128,23 @@ export function CasesList() {
 
   const edges = data?.cases.edges ?? [];
   const pageInfo = data?.cases.pageInfo;
-  const fetchingMore = useRef(false);
-  const queryGeneration = useRef(0);
 
-  // Increment generation when a filter that refetches data changes,
-  // so in-flight fetchMore calls don't corrupt the new results.
-  useEffect(() => {
-    queryGeneration.current += 1;
-  }, [typeFilter]);
+  const { handleLoadMore } = useInfiniteScroll<CasesData>({
+    hasNextPage: pageInfo?.hasNextPage,
+    endCursor: pageInfo?.endCursor,
+    loading,
+    fetchMore,
+    merge: useCallback(
+      (prev: CasesData, incoming: CasesData) => ({
+        cases: {
+          ...incoming.cases,
+          edges: [...prev.cases.edges, ...incoming.cases.edges],
+        },
+      }),
+      [],
+    ),
+    filterDeps: [typeFilter],
+  });
 
   const filteredEdges = caseNumberFilter
     ? edges.filter(
@@ -143,28 +153,6 @@ export function CasesList() {
           (node.caseTitle?.toLowerCase().includes(caseNumberFilter.toLowerCase()) ?? false),
       )
     : edges;
-
-  const handleLoadMore = useCallback(() => {
-    if (!pageInfo?.endCursor || loading || fetchingMore.current) return;
-    fetchingMore.current = true;
-    const currentGeneration = queryGeneration.current;
-    fetchMore({
-      variables: { after: pageInfo.endCursor },
-      updateQuery(prev, { fetchMoreResult }) {
-        if (!fetchMoreResult) return prev;
-        // If filters changed since this fetch started, discard the stale results
-        if (queryGeneration.current !== currentGeneration) return prev;
-        return {
-          cases: {
-            ...fetchMoreResult.cases,
-            edges: [...prev.cases.edges, ...fetchMoreResult.cases.edges],
-          },
-        };
-      },
-    }).finally(() => {
-      fetchingMore.current = false;
-    });
-  }, [pageInfo?.endCursor, loading, fetchMore]);
 
   return (
     <div className="space-y-6">

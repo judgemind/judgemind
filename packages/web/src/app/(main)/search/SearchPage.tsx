@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useCallback, useEffect, useMemo, useRef } from 'react';
+import { useState, useCallback, useEffect, useMemo } from 'react';
 import { useQuery, gql } from '@apollo/client';
 import { useRouter, useSearchParams } from 'next/navigation';
 import Link from 'next/link';
@@ -10,6 +10,7 @@ import { PAGE_TITLE, SECTION_LABEL } from '@/lib/typography';
 import { sanitizeExcerptHtml } from '@/lib/sanitize-html';
 import { Autocomplete } from '@/components/Autocomplete';
 import { InfiniteScrollTrigger } from '@/components/InfiniteScrollTrigger';
+import { useInfiniteScroll } from '@/hooks/useInfiniteScroll';
 import { OutcomeBadge } from '@/components/OutcomeBadge';
 import { useCountyOptions, useJudgeNameOptions } from '@/lib/filter-options';
 import { Card, CardContent } from '@/components/ui/card';
@@ -465,14 +466,26 @@ export function SearchPage() {
   const edges = data?.searchRulings.edges ?? [];
   const pageInfo = data?.searchRulings.pageInfo;
   const totalHits = data?.searchRulings.totalHits ?? 0;
-  const fetchingMore = useRef(false);
-  const queryGeneration = useRef(0);
 
-  // Increment generation when filters that refetch data change,
-  // so in-flight fetchMore calls don't corrupt the new results.
-  useEffect(() => {
-    queryGeneration.current += 1;
-  }, [q, county, judgeName, dateFrom, dateTo, motionTypes, outcomes, hasSearched]);
+  const { handleLoadMore } = useInfiniteScroll<SearchData>({
+    hasNextPage: pageInfo?.hasNextPage,
+    endCursor: pageInfo?.endCursor,
+    loading,
+    fetchMore,
+    merge: useCallback(
+      (prev: SearchData, incoming: SearchData) => ({
+        searchRulings: {
+          ...incoming.searchRulings,
+          edges: [
+            ...prev.searchRulings.edges,
+            ...incoming.searchRulings.edges,
+          ],
+        },
+      }),
+      [],
+    ),
+    filterDeps: [q, county, judgeName, dateFrom, dateTo, motionTypes, outcomes, hasSearched],
+  });
 
   // Sync URL params when search is submitted
   const updateUrl = useCallback(
@@ -498,31 +511,6 @@ export function SearchPage() {
     setHasSearched(true);
     updateUrl();
   }
-
-  const handleLoadMore = useCallback(() => {
-    if (!pageInfo?.endCursor || loading || fetchingMore.current) return;
-    fetchingMore.current = true;
-    const currentGeneration = queryGeneration.current;
-    fetchMore({
-      variables: { after: pageInfo.endCursor },
-      updateQuery(prev, { fetchMoreResult }) {
-        if (!fetchMoreResult) return prev;
-        // If filters changed since this fetch started, discard the stale results
-        if (queryGeneration.current !== currentGeneration) return prev;
-        return {
-          searchRulings: {
-            ...fetchMoreResult.searchRulings,
-            edges: [
-              ...prev.searchRulings.edges,
-              ...fetchMoreResult.searchRulings.edges,
-            ],
-          },
-        };
-      },
-    }).finally(() => {
-      fetchingMore.current = false;
-    });
-  }, [pageInfo?.endCursor, loading, fetchMore]);
 
   function toggleMotionType(mt: string) {
     setMotionTypes((prev) =>
