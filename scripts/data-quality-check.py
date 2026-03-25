@@ -419,6 +419,11 @@ def save_field_baselines(
                 existing[county][field] = round(pct, 1)
 
     # Update total_documents (overwrite, not ratchet) when totals provided.
+    # NOTE: total_documents counts active documents that have at least one
+    # ruling record (from _query_field_completeness's JOIN rulings).  It does
+    # NOT include orphaned documents (those with no ruling).  This is the
+    # denominator for all field completeness percentages.  See also the
+    # _definitions key in data-quality-baselines.json.
     if totals is not None:
         for county, doc_count in totals.items():
             if county not in existing:
