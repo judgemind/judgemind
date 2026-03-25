@@ -52,12 +52,21 @@ Options:
                         Flash Lite, bypassing pdfplumber. Produces more
                         accurate results for OC tentative rulings.
                         Requires GOOGLE_API_KEY environment variable.
+    --checkpoint-file PATH
+                        Write cursor position and cumulative stats to this
+                        JSON file after each batch. Enables resumption on
+                        interruption via --resume.
+    --resume            Resume from the checkpoint saved by --checkpoint-file.
+                        Reads the saved cursor and stats, then continues from
+                        where the previous run left off. Requires
+                        --checkpoint-file to point to an existing file.
 """
 
 from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import os
 import subprocess
 import sys
@@ -65,6 +74,7 @@ import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime
+from pathlib import Path
 from typing import Any
 
 # Ensure the scraper-framework source is importable
@@ -224,6 +234,87 @@ FETCH_DOCUMENTS_QUERY = """
 # Minimum cursor values for the first batch
 _CURSOR_MIN_TIMESTAMP = datetime(1970, 1, 1)
 _CURSOR_MIN_UUID = "00000000-0000-0000-0000-000000000000"
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint / resume helpers
+# ---------------------------------------------------------------------------
+
+_CHECKPOINT_VERSION = 1
+
+
+def _write_checkpoint(
+    checkpoint_path: Path,
+    cursor: tuple[datetime, str],
+    stats: dict[str, Any],
+) -> None:
+    """Write a checkpoint file with the current cursor and cumulative stats.
+
+    The checkpoint is written atomically: first to a temporary sibling file,
+    then renamed into place.  This prevents a crash during write from leaving
+    a truncated (unreadable) checkpoint file.
+
+    Parameters
+    ----------
+    checkpoint_path:
+        Destination file path.
+    cursor:
+        Current ``(captured_at, document_id)`` keyset pagination cursor.
+    stats:
+        Cumulative processing stats to persist (processed, updated, etc.).
+    """
+    data = {
+        "version": _CHECKPOINT_VERSION,
+        "cursor": {
+            "captured_at": cursor[0].isoformat(),
+            "document_id": cursor[1],
+        },
+        "stats": stats,
+        "updated_at": datetime.now(tz=None).isoformat(),
+    }
+    tmp_path = checkpoint_path.with_suffix(".tmp")
+    tmp_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    tmp_path.rename(checkpoint_path)
+
+
+def _read_checkpoint(
+    checkpoint_path: Path,
+) -> tuple[tuple[datetime, str], dict[str, Any]]:
+    """Read a checkpoint file and return ``(cursor, stats)``.
+
+    Parameters
+    ----------
+    checkpoint_path:
+        Path to the checkpoint JSON file written by ``_write_checkpoint``.
+
+    Returns
+    -------
+    tuple
+        ``(cursor, stats)`` where *cursor* is ``(captured_at, document_id)``
+        and *stats* is the cumulative stats dict from the checkpoint.
+
+    Raises
+    ------
+    FileNotFoundError
+        If the checkpoint file does not exist.
+    ValueError
+        If the file is not valid checkpoint JSON or has an unsupported version.
+    """
+    raw = checkpoint_path.read_text(encoding="utf-8")
+    data = json.loads(raw)
+
+    if data.get("version") != _CHECKPOINT_VERSION:
+        msg = (
+            f"Unsupported checkpoint version {data.get('version')}; "
+            f"expected {_CHECKPOINT_VERSION}"
+        )
+        raise ValueError(msg)
+
+    cursor_data = data["cursor"]
+    captured_at = datetime.fromisoformat(cursor_data["captured_at"])
+    document_id = cursor_data["document_id"]
+    stats = data.get("stats", {})
+    return (captured_at, document_id), stats
 
 
 def _build_filters(
@@ -1754,8 +1845,22 @@ def run_reingest(
     orphaned_only: bool = False,
     report_metrics: bool = False,
     multimodal: bool = False,
+    checkpoint_file: str | None = None,
+    resume: bool = False,
 ) -> dict[str, Any]:
-    """Run the full reingest. Returns summary stats including cost."""
+    """Run the full reingest. Returns summary stats including cost.
+
+    Parameters
+    ----------
+    checkpoint_file:
+        If provided, the cursor position and cumulative stats are written to
+        this file after each batch.  On interruption, the run can be resumed
+        from the checkpoint by passing ``resume=True``.
+    resume:
+        When *True* **and** *checkpoint_file* points to an existing file,
+        the cursor and cumulative stats are restored from the checkpoint
+        instead of starting from the beginning.  Requires *checkpoint_file*.
+    """
     filters, filter_params = _build_filters(
         county,
         date_from,
@@ -1815,6 +1920,32 @@ def run_reingest(
     total_llm_success = 0
     total_llm_failure = 0
     cursor: tuple[datetime, str] = (_CURSOR_MIN_TIMESTAMP, _CURSOR_MIN_UUID)
+
+    # Resolve checkpoint path (if provided).
+    cp_path: Path | None = None
+    if checkpoint_file:
+        cp_path = Path(checkpoint_file)
+
+    # Resume from checkpoint if requested.
+    if resume and cp_path is not None and cp_path.exists():
+        restored_cursor, restored_stats = _read_checkpoint(cp_path)
+        cursor = restored_cursor
+        total_processed = restored_stats.get("total_processed", 0)
+        total_updated = restored_stats.get("total_updated", 0)
+        total_llm_skipped = restored_stats.get("total_llm_skipped", 0)
+        total_failed = restored_stats.get("total_failed", 0)
+        total_skipped = restored_stats.get("total_skipped", 0)
+        total_batches = restored_stats.get("total_batches", 0)
+        total_llm_success = restored_stats.get("total_llm_success", 0)
+        total_llm_failure = restored_stats.get("total_llm_failure", 0)
+        logger.info(
+            "Resumed from checkpoint",
+            checkpoint_file=str(cp_path),
+            cursor_captured_at=cursor[0].isoformat(),
+            cursor_document_id=cursor[1],
+            total_processed=total_processed,
+        )
+
     t0 = time.monotonic()
 
     # Collect quality metrics before reingest if requested.
@@ -1889,6 +2020,27 @@ def run_reingest(
                 total_llm_skipped=total_llm_skipped,
                 mode="dry-run" if dry_run else "committed",
             )
+
+            # Persist checkpoint after each batch so we can resume on
+            # interruption without re-processing already-finished documents.
+            # Skip checkpoint writes in dry-run mode — a dry run should not
+            # produce side effects that could cause a subsequent real run
+            # with --resume to skip documents (#1925).
+            if cp_path is not None and not dry_run:
+                _write_checkpoint(
+                    cp_path,
+                    cursor,
+                    {
+                        "total_processed": total_processed,
+                        "total_updated": total_updated,
+                        "total_llm_skipped": total_llm_skipped,
+                        "total_failed": total_failed,
+                        "total_skipped": total_skipped,
+                        "total_batches": total_batches,
+                        "total_llm_success": total_llm_success,
+                        "total_llm_failure": total_llm_failure,
+                    },
+                )
 
             if processed < effective_batch:
                 break
@@ -2070,7 +2222,30 @@ def main() -> None:
             "rulings. Requires GOOGLE_API_KEY environment variable."
         ),
     )
+    parser.add_argument(
+        "--checkpoint-file",
+        type=str,
+        default=None,
+        help=(
+            "Path to a JSON checkpoint file. After each batch, the current "
+            "cursor position and cumulative stats are written here. Use with "
+            "--resume to restart from the last checkpoint on interruption."
+        ),
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help=(
+            "Resume from the checkpoint file specified by --checkpoint-file. "
+            "Reads the saved cursor position and cumulative stats, then "
+            "continues processing from where the previous run left off. "
+            "Requires --checkpoint-file to point to an existing checkpoint."
+        ),
+    )
     args = parser.parse_args()
+
+    if args.resume and not args.checkpoint_file:
+        parser.error("--resume requires --checkpoint-file to be specified.")
 
     dsn = os.environ.get("DATABASE_URL")
     if not dsn:
@@ -2100,6 +2275,8 @@ def main() -> None:
         orphaned_only=args.orphaned_only,
         report_metrics=args.report_metrics,
         multimodal=args.multimodal,
+        checkpoint_file=args.checkpoint_file,
+        resume=args.resume,
     )
 
     logger.info(
