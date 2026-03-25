@@ -1252,6 +1252,248 @@ _IN_RE_PATTERNS: list[re.Pattern[str]] = [
 ]
 
 
+# ---------------------------------------------------------------------------
+# Strategy 6 — Inline party name references (#1930)
+# ---------------------------------------------------------------------------
+# Patterns that capture named parties from inline references in ruling text.
+# These are used as a last-resort fallback when no formal caption, Case Name
+# field, MOVING/RESPONDING PARTY, "X v. Y" pattern, or "In re" pattern is found.
+#
+# Examples of text matched:
+#   "Plaintiff Alfredo Duarte's Motion for Attorney's Fees"
+#   "compelling Defendants Nick Sotva and Michael Rahimi to provide"
+#   "Defendant/Cross-Complainant Shores, LLC's Motion"
+#   "Plaintiff Temogene Williams The court's tentative ruling"
+#
+# The patterns capture a role-prefixed proper noun (starts with uppercase)
+# followed by possessive 's, a comma, a newline, or a motion keyword.
+# We require at least 2 uppercase-starting words to avoid matching generic
+# text like "Plaintiff's motion" (no actual name).
+
+# Name pattern: 1-5 capitalized words, optionally with comma/hyphen/period
+# within them, followed by a boundary (possessive, comma, period, newline,
+# or motion-related keyword).
+_INLINE_NAME_PATTERN = (
+    r"(?P<name>"
+    r"[A-Z][A-Za-z'\-]+"  # First word must start uppercase
+    r"(?:"
+    r"\s+(?:and\s+)?[A-Z][A-Za-z'\-]+"  # Additional uppercase words
+    r"|,\s+[A-Z][A-Za-z'\-]+"  # Words after comma
+    r"|/[A-Z][A-Za-z\-]+"  # Slash-separated roles like "Defendant/Cross-Complainant"
+    r"){0,5}"  # Up to 5 additional name parts
+    r"(?:,?\s+(?:LLC|Inc\.|Corp\.|LP|LLP|Co\.))??"  # Optional entity suffix
+    r")"
+)
+
+# Optional slash-separated secondary role that may appear after the primary
+# role: e.g. "Defendant/Cross-Complainant" or "Plaintiff/Cross-Defendant".
+_INLINE_SLASH_ROLE = (
+    r"(?:/(?:Cross-Complainant|Cross-Defendant|Defendant|Plaintiff"
+    r"|Petitioner|Respondent)s?)?"
+)
+
+# Plaintiff-side patterns: "Plaintiff[s] NAME"
+# Uses negative lookbehind for "/" to avoid matching "Defendant/Cross-Complainant"
+# as a plaintiff-side pattern — "Cross-Complainant" in that context is a
+# secondary defendant role, not a plaintiff.
+_INLINE_PLAINTIFF_RE = re.compile(
+    r"(?<!/)"
+    r"(?:Plaintiff|Petitioner|Cross-Complainant)s?"
+    + _INLINE_SLASH_ROLE
+    + r"\s+"
+    + _INLINE_NAME_PATTERN
+    + r"(?:'s\b|\u2019s\b"
+    + r"|\s+(?:filed|moves?|seek|bring|ha[sv]e?"
+    + r"|is|are|wa[s]|were|allege|contend|the\b|to\b)"
+    + r"|\s*[,\n])",
+    re.MULTILINE,
+)
+
+# Defendant-side patterns: "Defendant[s] NAME"
+_INLINE_DEFENDANT_RE = re.compile(
+    r"(?<!/)"
+    r"(?:Defendant|Respondent|Cross-Defendant)s?"
+    + _INLINE_SLASH_ROLE
+    + r"\s+"
+    + _INLINE_NAME_PATTERN
+    + r"(?:'s\b|\u2019s\b"
+    + r"|\s+(?:filed|moves?|seek|bring|ha[sv]e?"
+    + r"|is|are|wa[s]|were|allege|contend|the\b|to\b)"
+    + r"|\s*[,\n])",
+    re.MULTILINE,
+)
+
+# Generic possessive-named patterns: "compelling Defendants NAME"
+_INLINE_COMPELLING_RE = re.compile(
+    r"(?:compelling|ordering|directing|requiring)\s+"
+    r"(?:Defendants?|Plaintiffs?|Petitioners?|Respondents?)\s+"
+    + _INLINE_NAME_PATTERN
+    + r"(?:\s+(?:to|and|from)|\s*[,\n])",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+# Words that should not be treated as party names — they are legal/procedural
+# terms that happen to start with uppercase at the beginning of a sentence.
+_INLINE_FALSE_POSITIVE_NAMES = frozenset(
+    {
+        "The",
+        "This",
+        "That",
+        "These",
+        "Those",
+        "Court",
+        "Motion",
+        "Notice",
+        "Order",
+        "Ruling",
+        "Hearing",
+        "Department",
+        "Case",
+        "However",
+        "Here",
+        "Further",
+        "Accordingly",
+        "Therefore",
+        "Additionally",
+        "Counsel",
+        "Jury",
+        "Judge",
+        "Attorney",
+        "Section",
+        "Code",
+        "Rule",
+        "Evidence",
+        "Declaration",
+        "Opposition",
+        "Reply",
+        "Response",
+        "Exhibit",
+        "Pursuant",
+        "Under",
+    }
+)
+
+
+def _extract_from_inline_party_refs(ruling_text: str) -> str | None:
+    """Extract a case title from inline party name references in ruling text.
+
+    Scans for patterns like "Plaintiff [Name]'s" and "Defendant [Name]'s"
+    to reconstruct a case title when no formal caption block exists.
+
+    This is a last-resort strategy (#1930) — it should only be called after
+    all other strategies have failed.
+
+    Returns a title like "Duarte v. Sotva", or None if no valid party
+    names can be extracted.
+    """
+    plaintiff_name = _find_inline_party_name(ruling_text, side="plaintiff")
+    defendant_name = _find_inline_party_name(ruling_text, side="defendant")
+
+    if not plaintiff_name or not defendant_name:
+        return None
+
+    # Don't create a title where both sides are the same
+    if plaintiff_name.lower() == defendant_name.lower():
+        return None
+
+    title = f"{plaintiff_name} v. {defendant_name}"
+
+    if len(title) > 150 or len(title) < 5:
+        return None
+
+    return title
+
+
+def _find_inline_party_name(ruling_text: str, *, side: str) -> str | None:
+    """Find a party name from inline references for one side of the case.
+
+    Args:
+        ruling_text: The ruling text to search.
+        side: "plaintiff" or "defendant".
+
+    Returns:
+        A cleaned, title-cased party name, or None.
+    """
+    if side == "plaintiff":
+        patterns = [_INLINE_PLAINTIFF_RE, _INLINE_COMPELLING_RE]
+    else:
+        patterns = [_INLINE_DEFENDANT_RE, _INLINE_COMPELLING_RE]
+
+    for pattern in patterns:
+        for m in pattern.finditer(ruling_text):
+            raw_name = m.group("name").strip()
+
+            # Reject false positives: names that are actually legal terms
+            first_word = raw_name.split()[0] if raw_name else ""
+            if first_word in _INLINE_FALSE_POSITIVE_NAMES:
+                continue
+
+            # Clean the name
+            cleaned = _clean_inline_party_name(raw_name)
+            if cleaned and len(cleaned) >= 3:
+                return cleaned
+
+    return None
+
+
+def _clean_inline_party_name(raw: str) -> str:
+    """Clean an inline party name reference.
+
+    Strips entity descriptors, role prefixes embedded in slash-separated
+    text (e.g. "Defendant/Cross-Complainant Shores" -> "Shores"),
+    trailing punctuation, and normalizes to title case.
+    """
+    name = raw.strip()
+
+    # Strip slash-separated role prefixes (e.g. "Cross-Complainant" in
+    # "Defendant/Cross-Complainant Shores, LLC")
+    name = re.sub(
+        r"(?:Defendant|Plaintiff|Petitioner|Respondent|Cross-Complainant"
+        r"|Cross-Defendant)/(?:Cross-Complainant|Cross-Defendant|"
+        r"Defendant|Plaintiff|Petitioner|Respondent)\s+",
+        "",
+        name,
+        flags=re.IGNORECASE,
+    )
+
+    # Strip entity descriptors
+    name = _DESCRIPTOR_RE.sub("", name).strip()
+
+    # Strip trailing "and" connector
+    name = re.sub(r"\s+[Aa]nd\s*$", "", name).strip()
+
+    # Strip trailing/leading punctuation
+    name = name.strip(")(,.; ")
+
+    # Title-case, then restore legal entity suffixes
+    if name:
+        name = name.title()
+        # Restore well-known legal entity suffixes that title() lowercases
+        _entity_fixes = {
+            "Llc": "LLC",
+            "Llp": "LLP",
+            "Inc.": "Inc.",
+            "Corp.": "Corp.",
+            "Lp": "LP",
+            "Co.": "Co.",
+            "Pc": "PC",
+            "Pa": "PA",
+        }
+        words = name.split()
+        restored = []
+        for w in words:
+            stripped = w.rstrip(",;")
+            trailing = w[len(stripped) :]
+            canonical = _entity_fixes.get(stripped)
+            if canonical is not None:
+                restored.append(canonical + trailing)
+            else:
+                restored.append(w)
+        name = " ".join(restored)
+
+    return name
+
+
 def extract_case_title(ruling_text: str) -> str | None:
     """Extract a case title from ruling text.
 
@@ -1262,6 +1504,7 @@ def extract_case_title(ruling_text: str) -> str | None:
     3. "MOVING PARTY:" / "RESPONDING PARTY:" fields — construct from party names
     4. Regex "X v. Y" patterns — broad fallback with boilerplate/motion filtering
     5. "In re:" / "In the Matter of" / "Petition of" — non-adversarial cases (#1378)
+    6. Inline party name references — "Plaintiff [Name]'s" / "Defendant [Name]" (#1930)
 
     Returns a title like ``"Buenaventura v. City Of Pasadena"``, or ``None``.
 
@@ -1326,6 +1569,15 @@ def extract_case_title(ruling_text: str) -> str | None:
             title = title.rstrip(".,;: ")
             if 5 <= len(title) <= 150:
                 return title
+
+    # Strategy 6: Inline party name references (#1930)
+    # Some rulings mention party names inline without a formal caption block,
+    # e.g. "Plaintiff Alfredo Duarte's Motion" or "compelling Defendants
+    # Nick Sotva and Michael Rahimi".  This strategy extracts named parties
+    # from these inline references when all prior strategies have failed.
+    title = _extract_from_inline_party_refs(ruling_text)
+    if title is not None:
+        return title
 
     return None
 
