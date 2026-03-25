@@ -8,6 +8,7 @@ from datetime import date
 import pytest
 
 from ingestion.extract import (
+    _extract_from_inline_party_refs,
     _is_name_fragment,
     _looks_like_motion_text,
     _looks_like_person_name,
@@ -1976,6 +1977,116 @@ class TestIsValidCaseNumber:
 
     def test_rejects_none_like(self) -> None:
         assert is_valid_case_number("   ") is False
+
+
+# ---------------------------------------------------------------------------
+# Inline party name extraction (#1930)
+# ---------------------------------------------------------------------------
+
+
+class TestExtractFromInlinePartyRefs:
+    """Tests for _extract_from_inline_party_refs() — Strategy 6."""
+
+    def test_plaintiff_defendant_named_in_text(self) -> None:
+        """Extracts title when both parties are named inline."""
+        text = (
+            "Case Number:\n22STCV26122\nHearing Date:\nMarch 12, 2026\nDept:\n57\n"
+            "The Court is granting Plaintiff Garcia's motions for orders "
+            "compelling Defendants Sotva to provide further responses."
+        )
+        result = _extract_from_inline_party_refs(text)
+        assert result is not None
+        assert "Garcia" in result
+        assert "Sotva" in result
+        assert "v." in result
+
+    def test_plaintiff_name_possessive(self) -> None:
+        """Extracts plaintiff name from possessive form."""
+        text = "Plaintiff Alfredo Duarte's Motion for Attorney's Fees is CONTINUED."
+        result = _extract_from_inline_party_refs(text)
+        # Only plaintiff found, no defendant — should return None
+        assert result is None
+
+    def test_both_parties_found(self) -> None:
+        """Extracts title when both plaintiff and defendant are named."""
+        text = (
+            "Plaintiff Alfredo Duarte's Motion for Attorney's Fees is CONTINUED. "
+            "Defendant City Of Pasadena filed opposition."
+        )
+        result = _extract_from_inline_party_refs(text)
+        assert result is not None
+        assert "Duarte" in result
+        assert "City Of Pasadena" in result
+
+    def test_cross_complainant_slash_format(self) -> None:
+        """Handles Defendant/Cross-Complainant slash format."""
+        text = (
+            "Defendant/Cross-Complainant Shores, LLC's Motion for Order is GRANTED. "
+            "Plaintiff Williams filed opposition."
+        )
+        result = _extract_from_inline_party_refs(text)
+        # Note: plaintiff side has "Williams", defendant side has "Shores"
+        # The slash-separated role should be stripped
+        assert result is not None
+
+    def test_rejects_generic_references(self) -> None:
+        """Does not extract from generic 'Plaintiff's motion' without a name."""
+        text = "Plaintiff's motion to compel is GRANTED. Defendant's demurrer is overruled."
+        result = _extract_from_inline_party_refs(text)
+        assert result is None
+
+    def test_rejects_the_court_as_name(self) -> None:
+        """Does not extract 'The Court' or 'This Court' as a party name."""
+        text = "Plaintiff The Court made its ruling. Defendant The People filed opposition."
+        result = _extract_from_inline_party_refs(text)
+        assert result is None
+
+    def test_returns_none_on_empty_text(self) -> None:
+        """Returns None for empty text."""
+        assert _extract_from_inline_party_refs("") is None
+
+    def test_returns_none_when_only_plaintiff(self) -> None:
+        """Returns None when only plaintiff is named (no defendant)."""
+        text = "Plaintiff Martinez filed a motion to compel."
+        result = _extract_from_inline_party_refs(text)
+        assert result is None
+
+    def test_returns_none_when_only_defendant(self) -> None:
+        """Returns None when only defendant is named (no plaintiff)."""
+        text = "Defendant Honda Motor Co. filed a demurrer."
+        result = _extract_from_inline_party_refs(text)
+        assert result is None
+
+    def test_does_not_create_same_name_title(self) -> None:
+        """Does not create a title when plaintiff and defendant name are the same."""
+        text = "Plaintiff Smith filed a motion. Defendant Smith filed opposition."
+        result = _extract_from_inline_party_refs(text)
+        assert result is None
+
+    def test_real_la_text_with_compel(self) -> None:
+        """Real-world LA ruling text with 'compelling Defendants' pattern."""
+        text = (
+            "Case Number:\n22STCV26122\nHearing Date:\nMarch 12, 2026\nDept:\n57\n"
+            "The Court is granting Plaintiff Lopez's motions for orders "
+            "compelling Defendants Nick Sotva and Michael Rahimi to provide "
+            "further responses to Plaintiff's Requests for Production."
+        )
+        result = _extract_from_inline_party_refs(text)
+        assert result is not None
+        assert "Lopez" in result
+
+    def test_through_extract_case_title_fallback(self) -> None:
+        """Strategy 6 is invoked as fallback through extract_case_title."""
+        # This text has no caption block, no Case Name field, no MOVING/RESPONDING
+        # PARTY, no "X v. Y" pattern, and no "In re" — only inline party refs.
+        text = (
+            "Case Number:\n25STCV00001\nHearing Date:\nMarch 12, 2026\nDept:\n57\n"
+            "The Court is granting Plaintiff Garcia's motions for orders "
+            "compelling Defendant Honda Motor Co. to provide further responses."
+        )
+        result = extract_case_title(text)
+        assert result is not None
+        assert "Garcia" in result
 
     def test_accepts_unknown_prefix(self) -> None:
         assert is_valid_case_number("UNKNOWN-abc123") is True
