@@ -1403,11 +1403,7 @@ def _extract_from_inline_party_refs(ruling_text: str) -> str | None:
         return title
 
     # Single side found — return the name alone (better than no title)
-    title = plaintiff_name or defendant_name
-    if title and 2 <= len(title) <= 150:  # noqa: PLR2004
-        return title
-
-    return None
+    return plaintiff_name or defendant_name
 
 
 def _find_inline_party_name(ruling_text: str, *, side: str) -> str | None:

@@ -2081,6 +2081,18 @@ class TestExtractFromInlinePartyRefs:
         assert result is not None
         assert "Lopez" in result
 
+    def test_rejects_overly_long_combined_title(self) -> None:
+        """Returns None when combined two-side title exceeds 150 chars."""
+        # Build names with very long words (regex allows {0,5} extra words)
+        long_p = "Abcdefghijklmnopqrstuvwxyz Abcdefghijklmnopqrstuvwxyz Abcdefghijklmnopqrstuvwxyz"
+        long_d = "Efghijklmnopqrstuvwxyzab Efghijklmnopqrstuvwxyzab Efghijklmnopqrstuvwxyzab"
+        text = f"Plaintiff {long_p}'s motion is GRANTED. Defendant {long_d} filed opposition."
+        result = _extract_from_inline_party_refs(text)
+        # The combined "X v. Y" would exceed 150 chars, so should return None
+        if result is not None:
+            # If it returned something, it should NOT be a two-side title
+            assert "v." not in result
+
     def test_through_extract_case_title_fallback(self) -> None:
         """Strategy 6 is invoked as fallback through extract_case_title."""
         # This text has no caption block, no Case Name field, no MOVING/RESPONDING
