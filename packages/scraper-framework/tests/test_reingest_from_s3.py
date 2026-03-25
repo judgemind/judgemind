@@ -8,6 +8,7 @@ error handling, and CLI flag behavior. All database and S3 access is mocked.
 from __future__ import annotations
 
 import importlib
+import json
 import os
 import sys
 import uuid
@@ -6149,3 +6150,330 @@ class TestStoredRulingTextPreservation:
 
         call_kwargs = mock_insert_doc_and_ruling.call_args[1]
         assert call_kwargs["ruling_text"] == stored_text
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint / Resume tests (#1925)
+# ---------------------------------------------------------------------------
+
+
+class TestWriteCheckpoint:
+    """Tests for _write_checkpoint()."""
+
+    def test_writes_valid_json(self, tmp_path: Any) -> None:
+        """Checkpoint file contains valid JSON with expected keys."""
+        import json as _json
+
+        cp_path = tmp_path / "checkpoint.json"
+        cursor = (datetime(2026, 3, 15, 10, 30, 0), "doc-uuid-123")
+        stats = {"total_processed": 50, "total_updated": 45}
+
+        reingest._write_checkpoint(cp_path, cursor, stats)
+
+        data = _json.loads(cp_path.read_text(encoding="utf-8"))
+        assert data["version"] == reingest._CHECKPOINT_VERSION
+        assert data["cursor"]["captured_at"] == "2026-03-15T10:30:00"
+        assert data["cursor"]["document_id"] == "doc-uuid-123"
+        assert data["stats"]["total_processed"] == 50
+        assert data["stats"]["total_updated"] == 45
+        assert "updated_at" in data
+
+    def test_atomic_write_via_rename(self, tmp_path: Any) -> None:
+        """Checkpoint overwrites previous file atomically (no .tmp left)."""
+        cp_path = tmp_path / "checkpoint.json"
+        cursor1 = (datetime(2026, 3, 1), "uuid-1")
+        cursor2 = (datetime(2026, 3, 2), "uuid-2")
+
+        reingest._write_checkpoint(cp_path, cursor1, {"total_processed": 10})
+        reingest._write_checkpoint(cp_path, cursor2, {"total_processed": 20})
+
+        data = json.loads(cp_path.read_text(encoding="utf-8"))
+        assert data["cursor"]["document_id"] == "uuid-2"
+        assert data["stats"]["total_processed"] == 20
+        # Temp file should not remain
+        assert not (tmp_path / "checkpoint.tmp").exists()
+
+
+class TestReadCheckpoint:
+    """Tests for _read_checkpoint()."""
+
+    def test_reads_valid_checkpoint(self, tmp_path: Any) -> None:
+        """Round-trip: write then read returns same cursor and stats."""
+        cp_path = tmp_path / "checkpoint.json"
+        original_cursor = (datetime(2026, 3, 15, 10, 30, 0), "doc-uuid-456")
+        original_stats = {
+            "total_processed": 100,
+            "total_updated": 90,
+            "total_batches": 4,
+        }
+
+        reingest._write_checkpoint(cp_path, original_cursor, original_stats)
+        cursor, stats = reingest._read_checkpoint(cp_path)
+
+        assert cursor[0] == original_cursor[0]
+        assert cursor[1] == original_cursor[1]
+        assert stats["total_processed"] == 100
+        assert stats["total_updated"] == 90
+        assert stats["total_batches"] == 4
+
+    def test_raises_on_missing_file(self, tmp_path: Any) -> None:
+        """FileNotFoundError when checkpoint file does not exist."""
+        import pytest
+
+        cp_path = tmp_path / "nonexistent.json"
+        with pytest.raises(FileNotFoundError):
+            reingest._read_checkpoint(cp_path)
+
+    def test_raises_on_bad_version(self, tmp_path: Any) -> None:
+        """ValueError when checkpoint file has unsupported version."""
+        import pytest
+
+        cp_path = tmp_path / "checkpoint.json"
+        cp_path.write_text(
+            json.dumps(
+                {
+                    "version": 999,
+                    "cursor": {
+                        "captured_at": "2026-03-01T00:00:00",
+                        "document_id": "x",
+                    },
+                    "stats": {},
+                }
+            ),
+            encoding="utf-8",
+        )
+        with pytest.raises(ValueError, match="Unsupported checkpoint version"):
+            reingest._read_checkpoint(cp_path)
+
+    def test_raises_on_invalid_json(self, tmp_path: Any) -> None:
+        """ValueError when file contains invalid JSON."""
+        import pytest
+
+        cp_path = tmp_path / "checkpoint.json"
+        cp_path.write_text("not json", encoding="utf-8")
+        with pytest.raises(json.JSONDecodeError):
+            reingest._read_checkpoint(cp_path)
+
+
+class TestRunReingestCheckpoint:
+    """Tests for checkpoint integration in run_reingest()."""
+
+    @patch("reingest_from_s3.reingest_batch")
+    @patch("reingest_from_s3.psycopg")
+    def test_checkpoint_written_after_each_batch(
+        self,
+        mock_psycopg: MagicMock,
+        mock_batch: MagicMock,
+        tmp_path: Any,
+    ) -> None:
+        """Checkpoint file is written after every batch when --checkpoint-file
+        is provided."""
+        cp_path = tmp_path / "cp.json"
+
+        mock_batch.side_effect = [
+            _make_batch_result(
+                processed=25,
+                updated=20,
+                next_cursor=(_CAPTURED_AT_1, str(_DOC_ID_1)),
+                batch_number=1,
+            ),
+            _make_batch_result(
+                processed=10,
+                updated=8,
+                next_cursor=(_CAPTURED_AT_2, str(_DOC_ID_2)),
+                batch_number=2,
+            ),
+        ]
+
+        reingest.run_reingest(
+            "postgresql://test",
+            batch_size=25,
+            checkpoint_file=str(cp_path),
+        )
+
+        assert cp_path.exists()
+        data = json.loads(cp_path.read_text(encoding="utf-8"))
+        # Should reflect cumulative stats from both batches
+        assert data["stats"]["total_processed"] == 35
+        assert data["stats"]["total_updated"] == 28
+        assert data["stats"]["total_batches"] == 2
+        assert data["cursor"]["document_id"] == str(_DOC_ID_2)
+
+    @patch("reingest_from_s3.reingest_batch")
+    @patch("reingest_from_s3.psycopg")
+    def test_no_checkpoint_without_flag(
+        self,
+        mock_psycopg: MagicMock,
+        mock_batch: MagicMock,
+        tmp_path: Any,
+    ) -> None:
+        """No checkpoint file is created when --checkpoint-file is not given."""
+        cp_path = tmp_path / "cp.json"
+
+        mock_batch.return_value = _make_batch_result(processed=0)
+
+        reingest.run_reingest("postgresql://test", batch_size=25)
+
+        assert not cp_path.exists()
+
+    @patch("reingest_from_s3.reingest_batch")
+    @patch("reingest_from_s3.psycopg")
+    def test_dry_run_does_not_write_checkpoint(
+        self,
+        mock_psycopg: MagicMock,
+        mock_batch: MagicMock,
+        tmp_path: Any,
+    ) -> None:
+        """Checkpoint file is NOT written during --dry-run, because a dry
+        run should not produce side effects that could cause a subsequent
+        real run with --resume to skip documents."""
+        cp_path = tmp_path / "cp.json"
+
+        mock_batch.side_effect = [
+            _make_batch_result(
+                processed=25,
+                updated=0,
+                next_cursor=(_CAPTURED_AT_1, str(_DOC_ID_1)),
+                batch_number=1,
+            ),
+            _make_batch_result(processed=0, batch_number=2),
+        ]
+
+        reingest.run_reingest(
+            "postgresql://test",
+            batch_size=25,
+            dry_run=True,
+            checkpoint_file=str(cp_path),
+        )
+
+        assert not cp_path.exists()
+
+    @patch("reingest_from_s3.reingest_batch")
+    @patch("reingest_from_s3.psycopg")
+    def test_resume_restores_cursor_and_stats(
+        self,
+        mock_psycopg: MagicMock,
+        mock_batch: MagicMock,
+        tmp_path: Any,
+    ) -> None:
+        """When --resume is used, the cursor and stats are restored from the
+        checkpoint file, and processing continues from the saved position."""
+        cp_path = tmp_path / "cp.json"
+
+        # Write a checkpoint as if 25 docs were already processed
+        saved_cursor = (_CAPTURED_AT_1, str(_DOC_ID_1))
+        reingest._write_checkpoint(
+            cp_path,
+            saved_cursor,
+            {
+                "total_processed": 25,
+                "total_updated": 20,
+                "total_llm_skipped": 5,
+                "total_failed": 0,
+                "total_skipped": 0,
+                "total_batches": 1,
+                "total_llm_success": 15,
+                "total_llm_failure": 0,
+            },
+        )
+
+        # The next batch returns 10 more docs, then no more
+        mock_batch.side_effect = [
+            _make_batch_result(
+                processed=10,
+                updated=8,
+                next_cursor=(_CAPTURED_AT_2, str(_DOC_ID_2)),
+                batch_number=2,
+            ),
+            _make_batch_result(processed=0, batch_number=3),
+        ]
+
+        stats = reingest.run_reingest(
+            "postgresql://test",
+            batch_size=25,
+            checkpoint_file=str(cp_path),
+            resume=True,
+        )
+
+        # reingest_batch should have been called with the restored cursor.
+        # cursor is the 4th positional arg (conn, s3, batch_size, cursor, ...)
+        first_call_args = mock_batch.call_args_list[0][0]
+        assert first_call_args[3] == saved_cursor
+
+        # Cumulative stats should include the restored stats + new batch
+        assert stats["total_processed"] == 35  # 25 restored + 10 new
+        assert stats["total_updated"] == 28  # 20 restored + 8 new
+
+    @patch("reingest_from_s3.reingest_batch")
+    @patch("reingest_from_s3.psycopg")
+    def test_resume_without_existing_checkpoint_starts_fresh(
+        self,
+        mock_psycopg: MagicMock,
+        mock_batch: MagicMock,
+        tmp_path: Any,
+    ) -> None:
+        """When --resume is used but no checkpoint file exists, processing
+        starts from the beginning (no error)."""
+        cp_path = tmp_path / "nonexistent.json"
+
+        mock_batch.return_value = _make_batch_result(processed=0)
+
+        reingest.run_reingest(
+            "postgresql://test",
+            batch_size=25,
+            checkpoint_file=str(cp_path),
+            resume=True,
+        )
+
+        # Should have been called with the default cursor (4th positional arg)
+        first_call_args = mock_batch.call_args_list[0][0]
+        assert first_call_args[3] == _DEFAULT_CURSOR
+
+    @patch("reingest_from_s3.reingest_batch")
+    @patch("reingest_from_s3.psycopg")
+    def test_checkpoint_updated_each_batch(
+        self,
+        mock_psycopg: MagicMock,
+        mock_batch: MagicMock,
+        tmp_path: Any,
+    ) -> None:
+        """Checkpoint is updated after each batch, not just at the end."""
+        cp_path = tmp_path / "cp.json"
+        checkpoint_snapshots: list[dict] = []
+
+        original_write = reingest._write_checkpoint
+
+        def capture_checkpoint(path: Any, cursor: Any, stats: Any) -> None:
+            original_write(path, cursor, stats)
+            data = json.loads(path.read_text(encoding="utf-8"))
+            checkpoint_snapshots.append(data)
+
+        mock_batch.side_effect = [
+            _make_batch_result(
+                processed=25,
+                updated=20,
+                next_cursor=(_CAPTURED_AT_1, str(_DOC_ID_1)),
+                batch_number=1,
+            ),
+            _make_batch_result(
+                processed=25,
+                updated=22,
+                next_cursor=(_CAPTURED_AT_2, str(_DOC_ID_2)),
+                batch_number=2,
+            ),
+            _make_batch_result(processed=0, batch_number=3),
+        ]
+
+        with patch.object(reingest, "_write_checkpoint", side_effect=capture_checkpoint):
+            reingest.run_reingest(
+                "postgresql://test",
+                batch_size=25,
+                checkpoint_file=str(cp_path),
+            )
+
+        # Two checkpoints should have been written (batch 3 processed=0 exits
+        # before checkpoint write because processed < effective_batch triggers
+        # break, but checkpoint IS written before the break check)
+        assert len(checkpoint_snapshots) >= 2
+        assert checkpoint_snapshots[0]["stats"]["total_processed"] == 25
+        assert checkpoint_snapshots[1]["stats"]["total_processed"] == 50
