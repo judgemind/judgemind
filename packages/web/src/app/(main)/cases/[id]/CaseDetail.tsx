@@ -15,6 +15,7 @@ import {
   type RulingMetadata,
 } from '@/lib/display-helpers';
 import { InfiniteScrollTrigger } from '@/components/InfiniteScrollTrigger';
+import { useInfiniteScroll } from '@/hooks/useInfiniteScroll';
 import { OutcomeBadge } from '@/components/OutcomeBadge';
 import { sanitizeRulingHtml } from '@/lib/sanitize-html';
 import { SECTION_HEADING, SECTION_LABEL } from '@/lib/typography';
@@ -312,26 +313,22 @@ export function CaseDetail({ caseId }: { caseId: string }) {
 
   const edges = rulingsData?.rulings.edges ?? [];
   const pageInfo = rulingsData?.rulings.pageInfo;
-  const fetchingMore = useRef(false);
 
-  const handleLoadMore = useCallback(() => {
-    if (!pageInfo?.endCursor || rulingsLoading || fetchingMore.current) return;
-    fetchingMore.current = true;
-    fetchMore({
-      variables: { after: pageInfo.endCursor },
-      updateQuery(prev, { fetchMoreResult }) {
-        if (!fetchMoreResult) return prev;
-        return {
-          rulings: {
-            ...fetchMoreResult.rulings,
-            edges: [...prev.rulings.edges, ...fetchMoreResult.rulings.edges],
-          },
-        };
-      },
-    }).finally(() => {
-      fetchingMore.current = false;
-    });
-  }, [pageInfo?.endCursor, rulingsLoading, fetchMore]);
+  const { handleLoadMore } = useInfiniteScroll<RulingsData>({
+    hasNextPage: pageInfo?.hasNextPage,
+    endCursor: pageInfo?.endCursor,
+    loading: rulingsLoading,
+    fetchMore,
+    merge: useCallback(
+      (prev: RulingsData, incoming: RulingsData) => ({
+        rulings: {
+          ...incoming.rulings,
+          edges: [...prev.rulings.edges, ...incoming.rulings.edges],
+        },
+      }),
+      [],
+    ),
+  });
 
   if (caseLoading) {
     return <SkeletonBlock />;

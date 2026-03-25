@@ -1,35 +1,6 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { renderHook, act } from '@testing-library/react';
 import { useInfiniteScroll } from '../useInfiniteScroll';
-
-// ---------------------------------------------------------------------------
-// IntersectionObserver mock
-// ---------------------------------------------------------------------------
-
-let intersectionCallback: IntersectionObserverCallback;
-let mockObserve: ReturnType<typeof vi.fn>;
-let mockDisconnect: ReturnType<typeof vi.fn>;
-
-beforeEach(() => {
-  mockObserve = vi.fn();
-  mockDisconnect = vi.fn();
-
-  vi.stubGlobal(
-    'IntersectionObserver',
-    vi.fn((callback: IntersectionObserverCallback) => {
-      intersectionCallback = callback;
-      return {
-        observe: mockObserve,
-        disconnect: mockDisconnect,
-        unobserve: vi.fn(),
-      };
-    }),
-  );
-});
-
-afterEach(() => {
-  vi.unstubAllGlobals();
-});
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -71,64 +42,32 @@ describe('useInfiniteScroll', () => {
     vi.clearAllMocks();
   });
 
-  it('returns sentinelRef and handleLoadMore', () => {
+  it('returns handleLoadMore', () => {
     const { result } = renderHook(() =>
       useInfiniteScroll<MockData>(createDefaultProps()),
     );
 
-    expect(result.current.sentinelRef).toBeTypeOf('function');
     expect(result.current.handleLoadMore).toBeTypeOf('function');
   });
 
-  it('sets up IntersectionObserver when sentinel ref is attached', () => {
+  it('does not return sentinelRef (observer logic removed)', () => {
     const { result } = renderHook(() =>
       useInfiniteScroll<MockData>(createDefaultProps()),
     );
 
-    const div = document.createElement('div');
-    act(() => {
-      result.current.sentinelRef(div);
-    });
-
-    expect(IntersectionObserver).toHaveBeenCalledWith(
-      expect.any(Function),
-      { rootMargin: '200px' },
-    );
-    expect(mockObserve).toHaveBeenCalledWith(div);
+    // The hook should only return handleLoadMore, not sentinelRef
+    expect(result.current).toEqual({ handleLoadMore: expect.any(Function) });
+    expect('sentinelRef' in result.current).toBe(false);
   });
 
-  it('uses custom rootMargin', () => {
-    const { result } = renderHook(() =>
-      useInfiniteScroll<MockData>(createDefaultProps({ rootMargin: '400px' })),
-    );
-
-    const div = document.createElement('div');
-    act(() => {
-      result.current.sentinelRef(div);
-    });
-
-    expect(IntersectionObserver).toHaveBeenCalledWith(
-      expect.any(Function),
-      { rootMargin: '400px' },
-    );
-  });
-
-  it('calls fetchMore when sentinel becomes visible', () => {
+  it('calls fetchMore with correct variables when handleLoadMore is invoked', () => {
     const fetchMore = vi.fn().mockResolvedValue({});
     const { result } = renderHook(() =>
       useInfiniteScroll<MockData>(createDefaultProps({ fetchMore })),
     );
 
-    const div = document.createElement('div');
     act(() => {
-      result.current.sentinelRef(div);
-    });
-
-    act(() => {
-      intersectionCallback(
-        [{ isIntersecting: true } as IntersectionObserverEntry],
-        {} as IntersectionObserver,
-      );
+      result.current.handleLoadMore();
     });
 
     expect(fetchMore).toHaveBeenCalledWith(
@@ -136,27 +75,6 @@ describe('useInfiniteScroll', () => {
         variables: { after: 'cursor-1' },
       }),
     );
-  });
-
-  it('does not call fetchMore when sentinel is not intersecting', () => {
-    const fetchMore = vi.fn().mockResolvedValue({});
-    const { result } = renderHook(() =>
-      useInfiniteScroll<MockData>(createDefaultProps({ fetchMore })),
-    );
-
-    const div = document.createElement('div');
-    act(() => {
-      result.current.sentinelRef(div);
-    });
-
-    act(() => {
-      intersectionCallback(
-        [{ isIntersecting: false } as IntersectionObserverEntry],
-        {} as IntersectionObserver,
-      );
-    });
-
-    expect(fetchMore).not.toHaveBeenCalled();
   });
 
   it('does not call fetchMore when loading', () => {
@@ -232,58 +150,6 @@ describe('useInfiniteScroll', () => {
       result.current.handleLoadMore();
     });
     expect(fetchMore).toHaveBeenCalledTimes(2);
-  });
-
-  it('disconnects observer on unmount', () => {
-    const { result, unmount } = renderHook(() =>
-      useInfiniteScroll<MockData>(createDefaultProps()),
-    );
-
-    const div = document.createElement('div');
-    act(() => {
-      result.current.sentinelRef(div);
-    });
-
-    unmount();
-    expect(mockDisconnect).toHaveBeenCalled();
-  });
-
-  it('disconnects previous observer when sentinel ref changes', () => {
-    const { result } = renderHook(() =>
-      useInfiniteScroll<MockData>(createDefaultProps()),
-    );
-
-    const div1 = document.createElement('div');
-    act(() => {
-      result.current.sentinelRef(div1);
-    });
-    expect(mockObserve).toHaveBeenCalledTimes(1);
-
-    const div2 = document.createElement('div');
-    act(() => {
-      result.current.sentinelRef(div2);
-    });
-
-    // Previous observer should have been disconnected
-    expect(mockDisconnect).toHaveBeenCalled();
-    expect(mockObserve).toHaveBeenCalledTimes(2);
-  });
-
-  it('disconnects observer when sentinel ref is set to null', () => {
-    const { result } = renderHook(() =>
-      useInfiniteScroll<MockData>(createDefaultProps()),
-    );
-
-    const div = document.createElement('div');
-    act(() => {
-      result.current.sentinelRef(div);
-    });
-
-    act(() => {
-      result.current.sentinelRef(null);
-    });
-
-    expect(mockDisconnect).toHaveBeenCalled();
   });
 
   it('passes merge function to updateQuery', () => {
