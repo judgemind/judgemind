@@ -1584,6 +1584,35 @@ class TestRunReingest:
         assert "AND NOT EXISTS" in filters_arg
         assert "r.document_id = d.id" in filters_arg
 
+    @patch("reingest_from_s3.boto3")
+    @patch("reingest_from_s3.psycopg")
+    @patch("reingest_from_s3.reingest_batch")
+    def test_case_number_like_filter_passed_through(
+        self,
+        mock_batch: MagicMock,
+        mock_psycopg: MagicMock,
+        mock_boto3: MagicMock,
+    ) -> None:
+        mock_conn = MagicMock()
+        mock_conn.__enter__ = MagicMock(return_value=mock_conn)
+        mock_conn.__exit__ = MagicMock(return_value=False)
+        mock_psycopg.connect.return_value = mock_conn
+
+        mock_batch.return_value = _make_batch_result()
+
+        pattern = "UNKNOWN-%"
+        reingest.run_reingest(
+            "postgresql://test",
+            county="Orange",
+            case_number_like=pattern,
+        )
+
+        call_args = mock_batch.call_args_list[0]
+        filters_arg = call_args[0][4]
+        filter_params_arg = call_args[0][5]
+        assert "AND c.case_number LIKE %s" in filters_arg
+        assert pattern in filter_params_arg
+
 
 # ---------------------------------------------------------------------------
 # _build_filters
@@ -1675,6 +1704,50 @@ class TestBuildFilters:
         )
         assert "AND EXISTS" in clauses
         assert "AND NOT EXISTS" in clauses
+
+    def test_case_number_like_adds_clause(self) -> None:
+        pattern = "UNKNOWN-%"
+        clauses, params = reingest._build_filters(None, None, None, case_number_like=pattern)
+        assert "AND c.case_number LIKE %s" in clauses
+        assert pattern in params
+
+    def test_case_number_like_none_no_clause(self) -> None:
+        clauses, params = reingest._build_filters(None, None, None, case_number_like=None)
+        assert clauses == ""
+        assert params == []
+
+    def test_case_number_like_with_county(self) -> None:
+        pattern = "UNKNOWN-%"
+        clauses, params = reingest._build_filters("Orange", None, None, case_number_like=pattern)
+        assert "AND ct.county = %s" in clauses
+        assert "AND c.case_number LIKE %s" in clauses
+        assert params == ["Orange", pattern]
+
+    def test_case_number_like_with_case_title_regex(self) -> None:
+        """Both case_number_like and case_title_regex can be combined."""
+        pattern = "UNKNOWN-%"
+        regex = r"(?i)Before the Court"
+        clauses, params = reingest._build_filters(
+            "Orange",
+            None,
+            None,
+            case_number_like=pattern,
+            case_title_regex=regex,
+        )
+        assert "AND ct.county = %s" in clauses
+        assert "AND c.case_number LIKE %s" in clauses
+        assert "AND c.case_title ~ %s" in clauses
+        assert params == ["Orange", pattern, regex]
+
+    def test_case_number_like_param_order_before_case_title_regex(self) -> None:
+        """case_number_like param appears before case_title_regex in the
+        param list, matching the clause order in the SQL query."""
+        pattern = "UNKNOWN-%"
+        regex = r"vs\.?\s*$"
+        clauses, params = reingest._build_filters(
+            None, None, None, case_number_like=pattern, case_title_regex=regex
+        )
+        assert params.index(pattern) < params.index(regex)
 
 
 # ---------------------------------------------------------------------------
