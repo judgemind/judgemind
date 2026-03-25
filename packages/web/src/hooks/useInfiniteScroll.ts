@@ -35,11 +35,6 @@ export interface UseInfiniteScrollOptions<TData> {
    * discard stale results (i.e., results fetched under old filters).
    */
   filterDeps?: DependencyList;
-  /**
-   * IntersectionObserver `rootMargin` for pre-fetching.
-   * @default '200px'
-   */
-  rootMargin?: string;
 }
 
 /**
@@ -47,30 +42,28 @@ export interface UseInfiniteScrollOptions<TData> {
  */
 export interface UseInfiniteScrollReturn {
   /**
-   * Ref callback to attach to the sentinel element. The hook manages
-   * the IntersectionObserver lifecycle and triggers `fetchMore` when
-   * the sentinel scrolls into view.
-   */
-  sentinelRef: (node: HTMLElement | null) => void;
-  /**
-   * The load-more handler, exposed for testing or manual triggering.
-   * Normally called automatically by the IntersectionObserver.
+   * The load-more handler. Pass this to `InfiniteScrollTrigger`'s
+   * `onLoadMore` prop. Includes concurrency protection (prevents
+   * duplicate in-flight requests) and generation tracking (discards
+   * stale results when filters change mid-flight).
    */
   handleLoadMore: () => void;
 }
 
 /**
- * A reusable hook that encapsulates the infinite scroll pattern:
+ * A reusable hook that encapsulates the data-fetching side of infinite scroll:
  *
  * 1. Manages a `fetchingMore` ref to prevent duplicate in-flight requests.
  * 2. Optionally tracks a query generation counter to discard stale results
  *    when filters change mid-flight.
- * 3. Sets up an IntersectionObserver on the sentinel element and calls
- *    `fetchMore` when it enters the viewport.
+ *
+ * This hook is the **data-fetching concern** of infinite scroll. Pair it with
+ * the `InfiniteScrollTrigger` component, which handles the **rendering concern**
+ * (IntersectionObserver lifecycle and sentinel element).
  *
  * Usage:
  * ```tsx
- * const { sentinelRef } = useInfiniteScroll({
+ * const { handleLoadMore } = useInfiniteScroll({
  *   hasNextPage: pageInfo?.hasNextPage,
  *   endCursor: pageInfo?.endCursor,
  *   loading,
@@ -84,9 +77,12 @@ export interface UseInfiniteScrollReturn {
  *   filterDeps: [county, dateFrom, dateTo],
  * });
  *
- * // In JSX — render the sentinel only when there are more pages and
- * // not currently loading:
- * {!loading && hasNextPage && <div ref={sentinelRef} className="h-1" />}
+ * // In JSX — pair with InfiniteScrollTrigger:
+ * <InfiniteScrollTrigger
+ *   hasNextPage={pageInfo?.hasNextPage ?? false}
+ *   loading={loading}
+ *   onLoadMore={handleLoadMore}
+ * />
  * ```
  */
 export function useInfiniteScroll<TData>({
@@ -96,10 +92,8 @@ export function useInfiniteScroll<TData>({
   fetchMore,
   merge,
   filterDeps,
-  rootMargin = '200px',
 }: UseInfiniteScrollOptions<TData>): UseInfiniteScrollReturn {
   const fetchingMore = useRef(false);
-  const observer = useRef<IntersectionObserver | null>(null);
   const queryGeneration = useRef(0);
 
   // Increment generation when filter deps change, so in-flight
@@ -126,29 +120,5 @@ export function useInfiniteScroll<TData>({
     });
   }, [endCursor, loading, fetchMore, merge]);
 
-  const sentinelRef = useCallback(
-    (node: HTMLElement | null) => {
-      if (observer.current) observer.current.disconnect();
-      if (!node) return;
-      observer.current = new IntersectionObserver(
-        (entries) => {
-          if (entries[0]?.isIntersecting) {
-            handleLoadMore();
-          }
-        },
-        { rootMargin },
-      );
-      observer.current.observe(node);
-    },
-    [handleLoadMore, rootMargin],
-  );
-
-  // Clean up observer on unmount.
-  useEffect(() => {
-    return () => {
-      if (observer.current) observer.current.disconnect();
-    };
-  }, []);
-
-  return { sentinelRef, handleLoadMore };
+  return { handleLoadMore };
 }

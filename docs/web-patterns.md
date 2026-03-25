@@ -187,22 +187,57 @@ Labeled fields waste space. Reserve tabular layout for data that benefits from c
 
 ### Pagination
 
-All list pages use infinite scroll powered by the shared `InfiniteScrollTrigger` component (`packages/web/src/components/InfiniteScrollTrigger.tsx`). Do **not** duplicate `IntersectionObserver` logic inline — always use this component.
+All list pages use infinite scroll with a two-part pattern:
+
+1. **`useInfiniteScroll` hook** (`packages/web/src/hooks/useInfiniteScroll.ts`) — handles the **data-fetching concern**: concurrency protection (prevents duplicate in-flight requests via a `fetchingMore` ref), generation tracking (discards stale results when filters change mid-flight), and the `fetchMore` call with merge logic.
+2. **`InfiniteScrollTrigger` component** (`packages/web/src/components/InfiniteScrollTrigger.tsx`) — handles the **rendering concern**: manages the `IntersectionObserver` lifecycle, renders an invisible sentinel div, and invokes `onLoadMore` when the sentinel scrolls into view.
+
+Do **not** duplicate `IntersectionObserver` logic inline or in hooks — always use `InfiniteScrollTrigger`. Do **not** write inline `fetchingMore` refs — always use `useInfiniteScroll`.
 
 **Usage:**
 
 ```tsx
+import { useInfiniteScroll } from '@/hooks/useInfiniteScroll';
 import { InfiniteScrollTrigger } from '@/components/InfiniteScrollTrigger';
 
-{/* Place after the last list row */}
+// In the component body:
+const { handleLoadMore } = useInfiniteScroll<MyData>({
+  hasNextPage: pageInfo?.hasNextPage,
+  endCursor: pageInfo?.endCursor,
+  loading,
+  fetchMore,
+  merge: useCallback(
+    (prev: MyData, incoming: MyData) => ({
+      items: {
+        ...incoming.items,
+        edges: [...prev.items.edges, ...incoming.items.edges],
+      },
+    }),
+    [],
+  ),
+  filterDeps: [county, dateFrom],  // optional — for filter-aware pages
+});
+
+// In JSX — place after the last list row:
 <InfiniteScrollTrigger
   hasNextPage={pageInfo?.hasNextPage ?? false}
   loading={loading}
-  onLoadMore={loadMore}
+  onLoadMore={handleLoadMore}
 />
 ```
 
-**Props:**
+**Hook options (`useInfiniteScroll`):**
+
+| Option | Type | Description |
+|--------|------|-------------|
+| `hasNextPage` | `boolean \| undefined` | Whether the server reports more pages available |
+| `endCursor` | `string \| null \| undefined` | The cursor to pass as `after` in the next `fetchMore` call |
+| `loading` | `boolean` | Whether a fetch is currently in progress (from `useQuery`) |
+| `fetchMore` | `(options) => Promise` | The `fetchMore` function from Apollo's `useQuery` |
+| `merge` | `(prev, incoming) => TData` | Merge function combining previous data with newly-fetched data |
+| `filterDeps` | `DependencyList` (optional) | Dependency list for filter values — discards in-flight results on change |
+
+**Component props (`InfiniteScrollTrigger`):**
 
 | Prop | Type | Description |
 |------|------|-------------|
@@ -213,6 +248,7 @@ import { InfiniteScrollTrigger } from '@/components/InfiniteScrollTrigger';
 
 **Rules:**
 - Never use "Load more" buttons. Pagination is always automatic via scroll.
+- Always pair `useInfiniteScroll` with `InfiniteScrollTrigger`. The hook provides `handleLoadMore`; the component provides the observer and sentinel.
 - Place the `<InfiniteScrollTrigger>` immediately after the last rendered row, inside the same container.
 - The component renders an invisible 1px sentinel div and hides itself while loading to prevent duplicate fetches.
 
