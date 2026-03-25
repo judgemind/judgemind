@@ -112,7 +112,7 @@ from ingestion.llm_extract import (  # noqa: E402
     extract_text_from_pdf,
 )
 from ingestion.llm_providers import create_client as create_llm_client  # noqa: E402
-from ingestion.split_ids import make_split_document_id  # noqa: E402
+from ingestion.split_ids import is_split_child_id, make_split_document_id  # noqa: E402
 
 configure_structlog(contextvars=True)
 logger = structlog.get_logger()
@@ -1308,6 +1308,19 @@ def reingest_batch(
         processed += 1
         doc_id_str = str(doc_id)
         next_cursor = (captured_at, doc_id_str)
+
+        # Guard: in full-reparse mode, skip documents that are already split
+        # children.  Split children have UUID v5 IDs (from
+        # make_split_document_id) and share their parent's S3 object.
+        # Re-processing them would re-split the parent PDF, creating N new
+        # children per child — an exponential/infinite loop.  See #1919.
+        if full_reparse and is_split_child_id(doc_id_str):
+            logger.info(
+                "Skipping split-child document in full-reparse mode",
+                document_id=doc_id_str,
+            )
+            skipped += 1
+            continue
 
         if not s3_key or not s3_bucket:
             logger.warning(
