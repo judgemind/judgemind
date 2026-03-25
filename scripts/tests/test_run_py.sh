@@ -58,6 +58,11 @@ setup_fake_repo() {
     local repo
     repo=$(make_temp_dir)
 
+    # Create repo root markers: .git directory (not file) + CLAUDE.md
+    # run-py.sh uses find_repo_root() which requires both.
+    mkdir -p "$repo/.git"
+    touch "$repo/CLAUDE.md"
+
     # Create the run-py.sh in the expected location
     mkdir -p "$repo/scripts"
     cp "$RUN_PY" "$repo/scripts/run-py.sh"
@@ -352,6 +357,65 @@ PYSCRIPT
     fi
 }
 
+# Test 11: run-py.sh resolves repo root correctly from inside a worktree
+test_worktree_repo_root_resolution() {
+    local repo
+    repo=$(make_temp_dir)
+
+    # Set up a fake main repo: .git directory + CLAUDE.md
+    mkdir -p "$repo/.git"
+    touch "$repo/CLAUDE.md"
+
+    # Create main repo package venv
+    local pkg_dir="$repo/packages/test-pkg"
+    local venv_dir="$pkg_dir/.venv"
+    mkdir -p "$venv_dir/bin"
+    mkdir -p "$venv_dir/lib/python3.12/site-packages/somelib-1.0.dist-info"
+    cat > "$venv_dir/bin/python3" << 'PYSHIM'
+#!/usr/bin/env bash
+exec python3 "$@"
+PYSHIM
+    chmod +x "$venv_dir/bin/python3"
+
+    # Set up main repo scripts
+    mkdir -p "$repo/scripts"
+    cp "$RUN_PY" "$repo/scripts/run-py.sh"
+    chmod +x "$repo/scripts/run-py.sh"
+
+    # Create a fake worktree nested under main repo
+    local worktree="$repo/.claude/worktrees/agent-abcd1234"
+    mkdir -p "$worktree/scripts"
+    touch "$worktree/CLAUDE.md"
+    # Worktrees have .git as a FILE, not a directory
+    echo "gitdir: $repo/.git/worktrees/agent-abcd1234" > "$worktree/.git"
+
+    # Copy run-py.sh into the worktree scripts dir (simulates symlink or copy)
+    cp "$RUN_PY" "$worktree/scripts/run-py.sh"
+    chmod +x "$worktree/scripts/run-py.sh"
+
+    # Create a test script in the worktree
+    cat > "$worktree/scripts/show_venv.py" << 'PYSCRIPT'
+#!/usr/bin/env python3
+# venv: test-pkg
+import sys
+print("worktree test works")
+PYSCRIPT
+
+    # Run the worktree's run-py.sh — it should resolve REPO_ROOT to $repo
+    # (the main repo), not to $worktree. The venv is at
+    # $repo/packages/test-pkg/.venv, not $worktree/packages/test-pkg/.venv.
+    local output
+    local exit_code=0
+    output=$("$worktree/scripts/run-py.sh" "$worktree/scripts/show_venv.py" 2>/dev/null) || exit_code=$?
+
+    if [[ "$exit_code" -eq 0 ]] && echo "$output" | grep -q "worktree test works"; then
+        pass "run-py.sh from worktree resolves to main repo root for venv lookup"
+    else
+        fail "run-py.sh from worktree resolves to main repo root for venv lookup" \
+            "exit code: $exit_code, output: $output"
+    fi
+}
+
 # ── Run all tests ──────────────────────────────────────────────────────────
 
 test_no_args
@@ -364,6 +428,7 @@ test_args_passthrough
 test_venv_header_in_docstring
 test_venv_header_too_deep
 test_exit_code_propagation
+test_worktree_repo_root_resolution
 
 echo ""
 echo "────────────────────────────────────────────"

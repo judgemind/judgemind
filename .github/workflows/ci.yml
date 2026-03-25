@@ -647,6 +647,10 @@ jobs:
         run: scripts/tests/test_ecs_task_logs.sh
       - name: Test write-claude-file.sh
         run: scripts/tests/test_write_claude_file.sh
+      - name: Test cleanup_worktree.sh
+        run: scripts/tests/test_cleanup_worktree.sh
+      - name: Test run-py.sh
+        run: scripts/tests/test_run_py.sh
 
   # ---------------------------------------------------------------
   # Coverage gates: diff coverage (new lines) + overall floor ratchet
