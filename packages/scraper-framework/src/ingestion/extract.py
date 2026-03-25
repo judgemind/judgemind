@@ -1329,7 +1329,7 @@ _INLINE_COMPELLING_RE = re.compile(
     r"(?:Defendants?|Plaintiffs?|Petitioners?|Respondents?)\s+"
     + _INLINE_NAME_PATTERN
     + r"(?:\s+(?:to|and|from)|\s*[,\n])",
-    re.IGNORECASE | re.MULTILINE,
+    re.MULTILINE,
 )
 
 # Words that should not be treated as party names — they are legal/procedural
@@ -1426,7 +1426,8 @@ def _find_inline_party_name(ruling_text: str, *, side: str) -> str | None:
             raw_name = m.group("name").strip()
 
             # Reject false positives: names that are actually legal terms
-            first_word = raw_name.split()[0] if raw_name else ""
+            # Use title-cased comparison since compelling regex is IGNORECASE
+            first_word = raw_name.split()[0].title() if raw_name else ""
             if first_word in _INLINE_FALSE_POSITIVE_NAMES:
                 continue
 
