@@ -43,12 +43,14 @@ find_repo_root() {
     # Walk up from this script's location to find the repo root.
     # We deliberately do NOT use "git rev-parse --show-toplevel" because
     # inside a worktree it returns the worktree path, not the main repo root.
-    # The script file itself always lives under the actual repo (or worktree),
-    # and CLAUDE.md exists at the root of both.
+    # We check for CLAUDE.md AND .git as a directory (not a file).  In the
+    # main repo .git is a directory; in worktrees .git is a file containing
+    # "gitdir: …".  This prevents stopping at a worktree root when the
+    # dispatcher's cwd has drifted into one.
     local dir
     dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
     while [[ "$dir" != "/" ]]; do
-        if [[ -f "$dir/CLAUDE.md" ]]; then
+        if [[ -f "$dir/CLAUDE.md" && -d "$dir/.git" ]]; then
             echo "$dir"
             return 0
         fi

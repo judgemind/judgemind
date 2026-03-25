@@ -19,10 +19,25 @@
 set -euo pipefail
 
 # ── Resolve repo root ────────────────────────────────────────────────────
-# Works in both the main repo and worktrees: follow symlinks on this script
-# (worktrees symlink scripts/) to find the real repo root.
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+# Walk up from this script's location looking for a directory that has both
+# CLAUDE.md and .git as a directory (not a file).  In the main repo .git is
+# a directory; in worktrees .git is a file containing "gitdir: …".  This
+# prevents stopping at a worktree root when the script is invoked from
+# inside one.
+find_repo_root() {
+    local dir
+    dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    while [[ "$dir" != "/" ]]; do
+        if [[ -f "$dir/CLAUDE.md" && -d "$dir/.git" ]]; then
+            echo "$dir"
+            return 0
+        fi
+        dir="$(dirname "$dir")"
+    done
+    echo "ERROR: cannot find repo root" >&2
+    return 1
+}
+REPO_ROOT="$(find_repo_root)"
 
 # ── Validate arguments ───────────────────────────────────────────────────
 
