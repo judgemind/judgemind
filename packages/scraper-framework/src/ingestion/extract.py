@@ -1383,25 +1383,27 @@ def _extract_from_inline_party_refs(ruling_text: str) -> str | None:
     This is a last-resort strategy (#1930) — it should only be called after
     all other strategies have failed.
 
-    Returns a title like "Duarte v. Sotva", or None if no valid party
-    names can be extracted.
+    Returns a title like "Duarte v. Sotva" when both sides are found,
+    or a single-side title like "Duarte" when only one party is named.
+    Returns None if no valid party names can be extracted.
     """
     plaintiff_name = _find_inline_party_name(ruling_text, side="plaintiff")
     defendant_name = _find_inline_party_name(ruling_text, side="defendant")
 
-    if not plaintiff_name or not defendant_name:
+    if not plaintiff_name and not defendant_name:
         return None
 
-    # Don't create a title where both sides are the same
-    if plaintiff_name.lower() == defendant_name.lower():
-        return None
+    # Both sides found — form "X v. Y" if names differ
+    if plaintiff_name and defendant_name:
+        if plaintiff_name.lower() == defendant_name.lower():
+            return plaintiff_name  # same name, just return one
+        title = f"{plaintiff_name} v. {defendant_name}"
+        if len(title) > 150 or len(title) < 5:
+            return None
+        return title
 
-    title = f"{plaintiff_name} v. {defendant_name}"
-
-    if len(title) > 150 or len(title) < 5:
-        return None
-
-    return title
+    # Single side found — return the name alone (better than no title)
+    return plaintiff_name or defendant_name
 
 
 def _find_inline_party_name(ruling_text: str, *, side: str) -> str | None:

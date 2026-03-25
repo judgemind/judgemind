@@ -2001,11 +2001,12 @@ class TestExtractFromInlinePartyRefs:
         assert "v." in result
 
     def test_plaintiff_name_possessive(self) -> None:
-        """Extracts plaintiff name from possessive form."""
+        """Extracts plaintiff name from possessive form (single side)."""
         text = "Plaintiff Alfredo Duarte's Motion for Attorney's Fees is CONTINUED."
         result = _extract_from_inline_party_refs(text)
-        # Only plaintiff found, no defendant — should return None
-        assert result is None
+        # Only plaintiff found, no defendant — returns single-side title
+        assert result is not None
+        assert "Duarte" in result
 
     def test_both_parties_found(self) -> None:
         """Extracts title when both plaintiff and defendant are named."""
@@ -2045,23 +2046,28 @@ class TestExtractFromInlinePartyRefs:
         """Returns None for empty text."""
         assert _extract_from_inline_party_refs("") is None
 
-    def test_returns_none_when_only_plaintiff(self) -> None:
-        """Returns None when only plaintiff is named (no defendant)."""
+    def test_returns_single_side_when_only_plaintiff(self) -> None:
+        """Returns single-side title when only plaintiff is named."""
         text = "Plaintiff Martinez filed a motion to compel."
         result = _extract_from_inline_party_refs(text)
-        assert result is None
+        assert result is not None
+        assert "Martinez" in result
+        assert "v." not in result
 
-    def test_returns_none_when_only_defendant(self) -> None:
-        """Returns None when only defendant is named (no plaintiff)."""
+    def test_returns_single_side_when_only_defendant(self) -> None:
+        """Returns single-side title when only defendant is named."""
         text = "Defendant Honda Motor Co. filed a demurrer."
         result = _extract_from_inline_party_refs(text)
-        assert result is None
+        assert result is not None
+        assert "Honda Motor" in result
+        assert "v." not in result
 
-    def test_does_not_create_same_name_title(self) -> None:
-        """Does not create a title when plaintiff and defendant name are the same."""
+    def test_same_name_returns_single_name(self) -> None:
+        """Returns single name when plaintiff and defendant are the same."""
         text = "Plaintiff Smith filed a motion. Defendant Smith filed opposition."
         result = _extract_from_inline_party_refs(text)
-        assert result is None
+        assert result is not None
+        assert result == "Smith"
 
     def test_real_la_text_with_compel(self) -> None:
         """Real-world LA ruling text with 'compelling Defendants' pattern."""
@@ -2074,6 +2080,18 @@ class TestExtractFromInlinePartyRefs:
         result = _extract_from_inline_party_refs(text)
         assert result is not None
         assert "Lopez" in result
+
+    def test_rejects_overly_long_combined_title(self) -> None:
+        """Returns None when combined two-side title exceeds 150 chars."""
+        # Build names with very long words (regex allows {0,5} extra words)
+        long_p = "Abcdefghijklmnopqrstuvwxyz Abcdefghijklmnopqrstuvwxyz Abcdefghijklmnopqrstuvwxyz"
+        long_d = "Efghijklmnopqrstuvwxyzab Efghijklmnopqrstuvwxyzab Efghijklmnopqrstuvwxyzab"
+        text = f"Plaintiff {long_p}'s motion is GRANTED. Defendant {long_d} filed opposition."
+        result = _extract_from_inline_party_refs(text)
+        # The combined "X v. Y" would exceed 150 chars, so should return None
+        if result is not None:
+            # If it returned something, it should NOT be a two-side title
+            assert "v." not in result
 
     def test_through_extract_case_title_fallback(self) -> None:
         """Strategy 6 is invoked as fallback through extract_case_title."""
