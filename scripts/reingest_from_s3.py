@@ -26,6 +26,11 @@ Options:
     --concurrency N     Number of parallel S3 fetch threads (default: 10).
     --parse-workers N   Number of parallel scraper parse threads (default: 4).
     --parse-timeout N   Per-document parse timeout in seconds (default: 60).
+    --case-number-like PATTERN
+                        Only re-ingest documents whose associated case_number
+                        matches this PostgreSQL LIKE pattern.  Useful for
+                        targeting placeholder case numbers, e.g.
+                        --case-number-like 'UNKNOWN-%%'
     --case-title-regex PATTERN
                         Only re-ingest documents whose current case_title
                         matches this PostgreSQL regex (~ operator).  Useful
@@ -324,6 +329,7 @@ def _build_filters(
     case_title_regex: str | None = None,
     null_motion_type: bool = False,
     orphaned_only: bool = False,
+    case_number_like: str | None = None,
 ) -> tuple[str, list]:
     """Build WHERE clause fragments and params for the document query."""
     clauses = []
@@ -337,6 +343,9 @@ def _build_filters(
     if date_to:
         clauses.append("AND d.captured_at <= %s")
         params.append(datetime.combine(date_to, datetime.max.time()))
+    if case_number_like:
+        clauses.append("AND c.case_number LIKE %s")
+        params.append(case_number_like)
     if case_title_regex:
         clauses.append("AND c.case_title ~ %s")
         params.append(case_title_regex)
@@ -1847,6 +1856,7 @@ def run_reingest(
     multimodal: bool = False,
     checkpoint_file: str | None = None,
     resume: bool = False,
+    case_number_like: str | None = None,
 ) -> dict[str, Any]:
     """Run the full reingest. Returns summary stats including cost.
 
@@ -1868,6 +1878,7 @@ def run_reingest(
         case_title_regex=case_title_regex,
         null_motion_type=null_motion_type,
         orphaned_only=orphaned_only,
+        case_number_like=case_number_like,
     )
 
     s3_client = boto3.client("s3")
@@ -2172,6 +2183,16 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--case-number-like",
+        type=str,
+        default=None,
+        help=(
+            "Only re-ingest documents whose associated case_number matches "
+            "this PostgreSQL LIKE pattern. Useful for targeting placeholder "
+            "case numbers, e.g. 'UNKNOWN-%%' to find UNKNOWN-UUID cases."
+        ),
+    )
+    parser.add_argument(
         "--case-title-regex",
         type=str,
         default=None,
@@ -2277,6 +2298,7 @@ def main() -> None:
         multimodal=args.multimodal,
         checkpoint_file=args.checkpoint_file,
         resume=args.resume,
+        case_number_like=args.case_number_like,
     )
 
     logger.info(
