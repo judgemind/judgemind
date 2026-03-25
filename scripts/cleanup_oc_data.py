@@ -120,7 +120,31 @@ def _extract_title_from_ruling(ruling_text: str) -> str | None:
         p = " ".join(m.group("plaintiff").split()).strip().rstrip(".,;:() ")
         d = " ".join(m.group("defendant").split()).strip().rstrip(".,;:() ")
         if p and d and len(p) < 80 and len(d) < 80:
+            # Reject if the defendant part is ruling text, not a real name
+            if re.search(r"(?i)^Before the", d):
+                return None
             return f"{p} vs. {d}"
+    return None
+
+
+def _extract_defendant_from_ruling(ruling_text: str) -> str | None:
+    """Extract defendant name from ruling text patterns like 'by defendant X'.
+
+    Used as a last-resort fallback when the title has a plaintiff name
+    but the defendant portion is garbled with ruling text.
+    """
+    if not ruling_text:
+        return None
+    m = re.search(
+        r"(?:filed by|by)\s+defendant\s+([A-Z][A-Za-z,.'&\-\s]{2,60}?)"
+        r"\s*(?:\(|on\b|against\b|,\s*(?:LLC|Inc|Corp))",
+        ruling_text[:600],
+        re.IGNORECASE,
+    )
+    if m:
+        defendant = " ".join(m.group(1).split()).strip().rstrip(".,;:() ")
+        if defendant and len(defendant) >= 2:
+            return defendant
     return None
 
 
@@ -153,13 +177,21 @@ CHECK_EXISTING_CASE = """
     LIMIT 1
 """
 
+DELETE_DUPLICATE_RULINGS = """
+    DELETE FROM rulings
+    WHERE case_id = %s
+      AND ruling_text_hash IN (
+          SELECT ruling_text_hash FROM rulings WHERE case_id = %s
+      )
+"""
+
 MERGE_RULINGS = """
     UPDATE rulings SET case_id = %s, updated_at = NOW()
     WHERE case_id = %s
 """
 
 MERGE_DOCUMENTS = """
-    UPDATE documents SET case_id = %s, updated_at = NOW()
+    UPDATE documents SET case_id = %s
     WHERE case_id = %s
 """
 
@@ -257,7 +289,13 @@ def _fix_unknown_case_numbers(
 
             if not dry_run:
                 with conn.cursor() as cur:
-                    # Move rulings and documents to the existing case
+                    # Delete rulings that already exist in the target case
+                    # (same ruling_text_hash) to avoid unique constraint violations
+                    cur.execute(
+                        DELETE_DUPLICATE_RULINGS,
+                        (str(case_id), str(existing_id)),
+                    )
+                    # Move remaining rulings and documents to the existing case
                     cur.execute(MERGE_RULINGS, (str(existing_id), str(case_id)))
                     cur.execute(MERGE_DOCUMENTS, (str(existing_id), str(case_id)))
                     cur.execute(DELETE_DUPLICATE_CASE, (str(case_id),))
@@ -350,6 +388,20 @@ def _fix_contaminated_titles(
             new_title = _extract_title_from_ruling(ruling_text)
             if new_title:
                 stats["from_ruling"] += 1
+
+        # Last resort: extract plaintiff from title + defendant from ruling
+        if new_title is None and ruling_text:
+            plaintiff_match = re.match(
+                r"^([A-Z][A-Za-z,.'&\-\s]{1,60}?)\s+(?:vs?\.?)\s",
+                case_title,
+                re.IGNORECASE,
+            )
+            if plaintiff_match:
+                plaintiff = plaintiff_match.group(1).strip()
+                defendant = _extract_defendant_from_ruling(ruling_text)
+                if defendant:
+                    new_title = f"{plaintiff} v. {defendant}"
+                    stats["from_ruling"] += 1
 
         if new_title is None:
             logger.warning(
