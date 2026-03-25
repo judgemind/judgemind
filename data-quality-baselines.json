@@ -63,6 +63,9 @@
   "field_completeness": {
     "_updated": "2026-03-24",
     "_note": "Ventura total_documents updated 13->145 after bulk ingest (#1908). OC judge baseline lowered 100->84.2% to reflect OC North JC structural gap (#1917). OC/Ventura field ratchets applied from 7-day window query.",
+    "_definitions": {
+      "total_documents": "Count of active documents that have at least one ruling record (JOIN documents d ... JOIN rulings r ON r.document_id = d.id) within the field completeness check window. This is the denominator for all field completeness percentages. It does NOT include orphaned documents (those with no ruling)."
+    },
     "Los Angeles": {
       "total_documents": 748,
       "ruling": 100.0,
