@@ -22,6 +22,8 @@ from typing import TYPE_CHECKING
 
 import psycopg.errors
 
+from framework.party_utils import is_contaminated_party_name
+
 if TYPE_CHECKING:
     import psycopg
 
@@ -1096,6 +1098,17 @@ def upsert_party(
     """
     raw_name = _strip_nul(raw_name) or raw_name
     raw_name = _truncate_party_name(raw_name)
+
+    # Safety net: reject contaminated party names (court headers, ruling text,
+    # motion descriptions) that slipped past upstream extraction.  Returns empty
+    # string so the caller can detect the skip.  See #1932.
+    if is_contaminated_party_name(raw_name):
+        logger.warning(
+            "upsert_party: skipping contaminated party name: %r",
+            raw_name[:80],
+        )
+        return ""
+
     canonical = normalize_party_name(raw_name)
 
     with conn.cursor() as cur:
@@ -1207,6 +1220,14 @@ def batch_upsert_parties(
         if not raw_name:
             continue
         raw_name = _truncate_party_name(raw_name)
+        # Safety net: skip contaminated party names (court headers, ruling
+        # text, motion descriptions).  See #1932.
+        if is_contaminated_party_name(raw_name):
+            logger.warning(
+                "batch_upsert_parties: skipping contaminated party name: %r",
+                raw_name[:80],
+            )
+            continue
         role = party_info.get("role", "")
         canonical = normalize_party_name(raw_name)
         key = raw_name.lower()

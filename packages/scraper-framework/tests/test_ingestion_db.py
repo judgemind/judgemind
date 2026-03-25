@@ -498,12 +498,11 @@ class TestBatchUpsertParties:
         assert "case_parties" in sql
         assert "ON CONFLICT DO NOTHING" in sql
 
-    def test_long_party_name_truncated(self) -> None:
-        """Party names exceeding _MAX_PARTY_NAME_LENGTH are truncated."""
+    def test_long_party_name_filtered_as_contaminated(self) -> None:
+        """Party names exceeding _MAX_PARTY_NAME_LENGTH are truncated, then
+        filtered out by the contamination check (names > 150 chars are not
+        legitimate party names).  See #1932."""
         conn, cur = _mock_conn_for_batch()
-        cur.fetchall.side_effect = [[]]
-        cur.fetchone.side_effect = [("pid-1",)]
-        cur.nextset.side_effect = [False]
 
         long_name = "A" * 9000
         batch_upsert_parties(
@@ -512,10 +511,8 @@ class TestBatchUpsertParties:
             [{"name": long_name, "role": "plaintiff"}],
         )
 
-        # The SELECT should use the truncated name
-        select_args = cur.execute.call_args_list[0][0][1]
-        raw_names_list = select_args[0]
-        assert len(raw_names_list[0]) == _MAX_PARTY_NAME_LENGTH
+        # The contaminated name should be filtered — no DB calls at all
+        cur.execute.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -553,23 +550,90 @@ class TestTruncatePartyName:
 class TestUpsertPartyTruncation:
     """Verify upsert_party truncates oversized party names."""
 
-    def test_long_name_truncated_before_insert(self) -> None:
+    def test_long_name_filtered_as_contaminated(self) -> None:
+        """Very long party names are truncated, then rejected by the
+        contamination filter (> 150 chars).  See #1932."""
         conn = _mock_conn()
-        cur = conn.cursor.return_value.__enter__.return_value
-        # First fetchone: no existing alias; second: new party id
-        cur.fetchone.side_effect = [None, ("party-uuid-1",)]
 
         long_name = "C" * 9000
-        upsert_party(conn, raw_name=long_name, party_type="plaintiff")
+        result = upsert_party(conn, raw_name=long_name, party_type="plaintiff")
 
-        # All execute calls should use truncated names
-        for c in cur.execute.call_args_list:
-            call_args = c[0][1]
-            for arg in call_args:
-                if isinstance(arg, str):
-                    assert len(arg) <= _MAX_PARTY_NAME_LENGTH, (
-                        f"Arg length {len(arg)} exceeds limit"
-                    )
+        # The contaminated name is rejected — returns empty string
+        assert result == ""
+
+
+# ---------------------------------------------------------------------------
+# Contaminated party name filtering (DB safety net) — #1932
+# ---------------------------------------------------------------------------
+
+
+class TestUpsertPartyContaminationFilter:
+    """Verify upsert_party rejects contaminated party names."""
+
+    def test_court_header_skipped(self) -> None:
+        conn = _mock_conn()
+        result = upsert_party(
+            conn,
+            raw_name="Department 50 Law And Motion Rulings Case Number: 20Stcv41848",
+        )
+        assert result == ""
+
+    def test_ruling_text_skipped(self) -> None:
+        conn = _mock_conn()
+        result = upsert_party(conn, raw_name="Before The Court Are The Following")
+        assert result == ""
+
+    def test_motion_description_skipped(self) -> None:
+        conn = _mock_conn()
+        result = upsert_party(conn, raw_name="Motion For Attorney")
+        assert result == ""
+
+    def test_valid_name_not_skipped(self) -> None:
+        conn = _mock_conn()
+        cur = conn.cursor.return_value.__enter__.return_value
+        cur.fetchone.side_effect = [None, ("party-uuid-1",)]
+
+        result = upsert_party(conn, raw_name="John Doe", party_type="plaintiff")
+        assert result == "party-uuid-1"
+
+
+class TestBatchUpsertPartiesContaminationFilter:
+    """Verify batch_upsert_parties skips contaminated party names."""
+
+    def test_contaminated_entries_filtered(self) -> None:
+        conn, cur = _mock_conn_for_batch()
+        cur.fetchall.side_effect = [[]]
+        cur.fetchone.side_effect = [("pid-1",)]
+        cur.nextset.side_effect = [False]
+
+        batch_upsert_parties(
+            conn,
+            "case-1",
+            [
+                {"name": "John Doe", "role": "plaintiff"},
+                {"name": "Law And Motion Rulings", "role": "defendant"},
+                {"name": "Before The Court", "role": "defendant"},
+            ],
+        )
+
+        # Only 1 party should be inserted (the other 2 are contaminated)
+        parties_params = cur.executemany.call_args_list[0][0][1]
+        assert len(parties_params) == 1
+
+    def test_all_contaminated_skips_entirely(self) -> None:
+        conn, cur = _mock_conn_for_batch()
+
+        batch_upsert_parties(
+            conn,
+            "case-1",
+            [
+                {"name": "Hearing Date: March 5, 2026", "role": "plaintiff"},
+                {"name": "Motion For Summary", "role": "defendant"},
+            ],
+        )
+
+        # No DB calls should happen when all entries are contaminated
+        cur.execute.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
