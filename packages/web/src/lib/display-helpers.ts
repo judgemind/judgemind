@@ -79,6 +79,8 @@ export const OUTCOME_LABELS: Record<string, string> = {
   denied_in_part: 'Denied In Part',
   moot: 'Moot',
   continued: 'Continued',
+  off_calendar: 'Off Calendar',
+  submitted: 'Submitted',
   other: 'Other',
 };
 
@@ -86,9 +88,9 @@ export const OUTCOME_LABELS: Record<string, string> = {
  *  Uses the canonical OUTCOME_LABELS map for known outcomes, falling back to generic title-casing. */
 export function formatOutcome(outcome: string | null): string {
   if (!outcome) return 'Not classified';
-  return OUTCOME_LABELS[outcome] ?? outcome
+  return OUTCOME_LABELS[outcome] ?? (outcome
     .replace(/_/g, ' ')
-    .replace(/\b\w/g, (c) => c.toUpperCase());
+    .replace(/\b\w/g, (c) => c.toUpperCase()));
 }
 
 // ---------------------------------------------------------------------------
@@ -110,6 +112,8 @@ const OUTCOME_VARIANT_MAP: Record<string, OutcomeBadgeVariant> = {
   denied_in_part: 'outline',
   moot: 'outline',
   continued: 'outline',
+  off_calendar: 'outline',
+  submitted: 'outline',
   other: 'outline',
 };
 
@@ -168,6 +172,8 @@ const OUTCOME_LIST_CLASS_MAP: Record<string, string> = {
   continued:
     'text-stone-500 border-stone-300 dark:text-stone-400 dark:border-stone-600',
   off_calendar:
+    'text-stone-500 border-stone-300 dark:text-stone-400 dark:border-stone-600',
+  submitted:
     'text-stone-500 border-stone-300 dark:text-stone-400 dark:border-stone-600',
   other:
     'text-stone-500 border-stone-300 dark:text-stone-400 dark:border-stone-600',
