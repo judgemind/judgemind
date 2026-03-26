@@ -50,6 +50,13 @@ _RULING_TEXT_PATTERNS: list[re.Pattern[str]] = [
 # "Motion" (e.g. "Ford Motor" is a valid party name).
 _MOTION_ONLY_RE = re.compile(r"^(?:.*\s)?Motion (?:For|To|Of|Re)\b", re.IGNORECASE)
 
+# Docket metadata patterns — filing dates, complaint types, etc. that leak
+# from docket entries into party names (e.g. "Et Al. Comp. Filed : 03-27-25").
+_DOCKET_METADATA_PATTERNS: list[re.Pattern[str]] = [
+    re.compile(r"\bFiled\s*:\s*\d{2}-\d{2}-\d{2}", re.IGNORECASE),
+    re.compile(r"\bComp\.\s*Filed\b", re.IGNORECASE),
+]
+
 # Maximum reasonable party name length.  Real party names are rarely > 100
 # characters.  Court headers and ruling text fragments are typically much
 # longer.
@@ -92,6 +99,12 @@ def is_contaminated_party_name(name: str) -> bool:
     # motion phrase.  "Ford Motor Company" is fine (no "Motion For/To/Of").
     if _MOTION_ONLY_RE.search(stripped):
         return True
+
+    # Docket metadata patterns (filing dates, complaint types leaked into
+    # party names)
+    for pattern in _DOCKET_METADATA_PATTERNS:
+        if pattern.search(stripped):
+            return True
 
     return False
 
