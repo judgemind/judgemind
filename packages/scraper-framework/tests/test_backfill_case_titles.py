@@ -622,3 +622,210 @@ class TestRunBackfill:
         """The query must use keyset pagination, not OFFSET."""
         assert "OFFSET" not in backfill.FETCH_QUERY
         assert "(c.created_at, c.id) > (%s, %s)" in backfill.FETCH_QUERY
+
+
+# ---------------------------------------------------------------------------
+# is_plausible_case_title tests (#1958)
+# ---------------------------------------------------------------------------
+
+
+class TestIsPlausibleCaseTitle:
+    """Tests for the is_plausible_case_title() validation function."""
+
+    # --- Valid titles (should pass) ---
+
+    def test_standard_adversarial_title(self) -> None:
+        """Normal 'X v. Y' title passes validation."""
+        assert backfill.is_plausible_case_title("Smith v. Jones") is True
+
+    def test_in_re_title(self) -> None:
+        """'In re: Estate of ...' is a legitimate title."""
+        assert backfill.is_plausible_case_title("In re: Estate of John Smith") is True
+
+    def test_in_re_marriage(self) -> None:
+        """'In re Marriage of ...' is a legitimate title."""
+        assert backfill.is_plausible_case_title("In re Marriage of Garcia") is True
+
+    def test_in_the_matter_of(self) -> None:
+        """'In the Matter of ...' is a legitimate title."""
+        assert backfill.is_plausible_case_title("In the Matter of the Estate of Williams") is True
+
+    def test_single_party_name(self) -> None:
+        """Single party name (from inline extraction) passes."""
+        assert backfill.is_plausible_case_title("Duarte") is True
+
+    def test_corporate_parties(self) -> None:
+        """Corporate entity names pass."""
+        assert backfill.is_plausible_case_title("Acme Corporation v. Widget LLC") is True
+
+    def test_title_at_max_length(self) -> None:
+        """Title at exactly 120 chars passes."""
+        title = "A" * 120
+        assert backfill.is_plausible_case_title(title) is True
+
+    def test_title_at_min_length(self) -> None:
+        """Title at exactly 3 chars passes."""
+        assert backfill.is_plausible_case_title("Doe") is True
+
+    # --- Invalid titles (should be rejected) ---
+
+    def test_rejects_to_respond(self) -> None:
+        """'To Respond, Without Objections' is motion text, not a title (#1958)."""
+        assert backfill.is_plausible_case_title("To Respond, Without Objections") is False
+
+    def test_rejects_to_produce_all(self) -> None:
+        """'To Produce All' is motion text, not a title (#1958)."""
+        assert backfill.is_plausible_case_title("To Produce All") is False
+
+    def test_rejects_for_summary_judgment(self) -> None:
+        """'For Summary Judgment' starts with 'For'."""
+        assert backfill.is_plausible_case_title("For Summary Judgment") is False
+
+    def test_rejects_by_the_court(self) -> None:
+        """'By the Court' starts with 'By'."""
+        assert backfill.is_plausible_case_title("By the Court") is False
+
+    def test_rejects_on_the_merits(self) -> None:
+        """'On the Merits' starts with 'On'."""
+        assert backfill.is_plausible_case_title("On the Merits") is False
+
+    def test_rejects_re_colon_motion(self) -> None:
+        """'Re: Motion to Compel' starts with 'Re:'."""
+        assert backfill.is_plausible_case_title("Re: Motion to Compel") is False
+
+    def test_rejects_granted_fragment(self) -> None:
+        """Title containing 'GRANTED' is ruling text."""
+        assert backfill.is_plausible_case_title("Motion is GRANTED") is False
+
+    def test_rejects_denied_fragment(self) -> None:
+        """Title containing 'DENIED' is ruling text."""
+        assert backfill.is_plausible_case_title("Request DENIED") is False
+
+    def test_rejects_continued_fragment(self) -> None:
+        """Title containing 'CONTINUED' is ruling text."""
+        assert backfill.is_plausible_case_title("Matter CONTINUED to April") is False
+
+    def test_rejects_tentative_ruling(self) -> None:
+        """Title containing 'TENTATIVE RULING' is ruling text."""
+        assert backfill.is_plausible_case_title("TENTATIVE RULING on the motion") is False
+
+    def test_rejects_motion_fragment(self) -> None:
+        """Title containing 'MOTION' is procedural text."""
+        assert backfill.is_plausible_case_title("MOTION to Compel Discovery") is False
+
+    def test_rejects_demurrer_fragment(self) -> None:
+        """Title containing 'DEMURRER' is procedural text."""
+        assert backfill.is_plausible_case_title("DEMURRER to Complaint") is False
+
+    def test_rejects_too_short(self) -> None:
+        """Titles shorter than 3 chars are rejected."""
+        assert backfill.is_plausible_case_title("AB") is False
+
+    def test_rejects_too_long(self) -> None:
+        """Titles longer than 120 chars are rejected."""
+        title = "A" * 121
+        assert backfill.is_plausible_case_title(title) is False
+
+    def test_rejects_empty_string(self) -> None:
+        """Empty string is rejected."""
+        assert backfill.is_plausible_case_title("") is False
+
+    def test_rejects_whitespace_only(self) -> None:
+        """Whitespace-only string is rejected."""
+        assert backfill.is_plausible_case_title("   ") is False
+
+    def test_rejects_in_the_something(self) -> None:
+        """'In the Superior Court' is not a case title."""
+        assert backfill.is_plausible_case_title("In the Superior Court") is False
+
+    def test_rejects_overruled(self) -> None:
+        """'Objection OVERRULED' is ruling text."""
+        assert backfill.is_plausible_case_title("Objection OVERRULED") is False
+
+    def test_rejects_sustained(self) -> None:
+        """'Demurrer SUSTAINED' is ruling text."""
+        assert backfill.is_plausible_case_title("Demurrer SUSTAINED") is False
+
+    def test_rejects_order(self) -> None:
+        """'ORDER granting relief' is procedural text."""
+        assert backfill.is_plausible_case_title("ORDER granting relief") is False
+
+    def test_case_insensitive_prefix_check(self) -> None:
+        """Prefix check is case insensitive."""
+        assert backfill.is_plausible_case_title("TO respond without objections") is False
+        assert backfill.is_plausible_case_title("FOR the court's review") is False
+
+    def test_case_insensitive_fragment_check(self) -> None:
+        """Fragment check is case insensitive."""
+        assert backfill.is_plausible_case_title("motion granted") is False
+        assert backfill.is_plausible_case_title("Tentative Ruling on X") is False
+
+
+# ---------------------------------------------------------------------------
+# backfill_batch with validation integration tests (#1958)
+# ---------------------------------------------------------------------------
+
+
+class TestBackfillBatchValidation:
+    """Tests that backfill_batch() rejects implausible titles."""
+
+    def test_implausible_title_skipped(self) -> None:
+        """A case whose extracted title is implausible is NOT written to DB."""
+        case_id = str(uuid.uuid4())
+        # This ruling text contains inline party refs that could extract
+        # "To Respond, Without Objections" as a false positive title.
+        # We mock extract_case_title to return the false positive directly.
+        row = (case_id, "dummy ruling text", _CREATED_AT)
+
+        conn = MagicMock()
+        cur_fetch = MagicMock()
+        cur_fetch.fetchall.return_value = [row]
+
+        ctx = MagicMock()
+        ctx.__enter__ = MagicMock(return_value=cur_fetch)
+        ctx.__exit__ = MagicMock(return_value=False)
+        conn.cursor.return_value = ctx
+
+        with patch.object(
+            backfill, "extract_case_title", return_value="To Respond, Without Objections"
+        ):
+            processed, updated, _cursor = backfill.backfill_batch(
+                conn, batch_size=10, cursor=_DEFAULT_CURSOR
+            )
+
+        assert processed == 1
+        assert updated == 0  # Title was rejected, no update
+
+    def test_plausible_title_written(self) -> None:
+        """A case whose extracted title is plausible IS written to DB."""
+        case_id = str(uuid.uuid4())
+        row = (case_id, "dummy ruling text", _CREATED_AT)
+
+        conn = MagicMock()
+        cur_fetch = MagicMock()
+        cur_fetch.fetchall.return_value = [row]
+        cur_update = MagicMock()
+
+        contexts = [cur_fetch, cur_update]
+        context_iter = iter(contexts)
+
+        def cursor_ctx() -> MagicMock:
+            ctx = MagicMock()
+            cur = next(context_iter)
+            ctx.__enter__ = MagicMock(return_value=cur)
+            ctx.__exit__ = MagicMock(return_value=False)
+            return ctx
+
+        conn.cursor.side_effect = cursor_ctx
+
+        with patch.object(backfill, "extract_case_title", return_value="Smith v. Jones"):
+            processed, updated, _cursor = backfill.backfill_batch(
+                conn, batch_size=10, cursor=_DEFAULT_CURSOR
+            )
+
+        assert processed == 1
+        assert updated == 1
+        # Verify UPDATE was called
+        update_args = cur_update.execute.call_args[0][1]
+        assert update_args[0] == "Smith v. Jones"
+        assert update_args[1] == case_id
