@@ -1,4 +1,6 @@
 """Tests for validation.schema — runtime schema validation for backfill scripts."""
+# sql-check:skip-file — this file intentionally contains invalid SQL to test
+# the schema validation system.
 
 from __future__ import annotations
 

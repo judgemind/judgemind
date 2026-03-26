@@ -970,6 +970,16 @@ jobs:
         run: python3 scripts/check-sql-conflicts.py
 
   # ---------------------------------------------------------------
+  # SQL column reference validation: verify column references match schema
+  # ---------------------------------------------------------------
+  sql-column-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Validate SQL column references against schema definitions
+        run: python3 scripts/check-sql-columns.py
+
+  # ---------------------------------------------------------------
   # Shard coverage guard: all court test files listed in shard config
   # ---------------------------------------------------------------
   shard-coverage-check:
@@ -1068,7 +1078,7 @@ jobs:
   # Always runs. Reports success only when every applicable job passed or was
   # skipped (path filter did not match). Branch protection requires this check.
   ci-passed:
-    needs: [scraper-framework-tests, scraper-court-tests, ingestion-tests, nlp-tests, api-tests, web-tests, telegram-bridge-tests, infra-validate, lambda-tests, scripts-tests, coverage-check, deprecated-models-check, hardcoded-models-check, hardcoded-colors-check, oneshot-imports-check, oneshot-repo-paths-check, duplicate-functions-check, schema-drift-check, dq-baselines-validate, ecs-oneshot-test, migration-files-check, sql-conflict-check, playwright-browser-check, shard-coverage-check, apollo-keyfields-check]
+    needs: [scraper-framework-tests, scraper-court-tests, ingestion-tests, nlp-tests, api-tests, web-tests, telegram-bridge-tests, infra-validate, lambda-tests, scripts-tests, coverage-check, deprecated-models-check, hardcoded-models-check, hardcoded-colors-check, oneshot-imports-check, oneshot-repo-paths-check, duplicate-functions-check, schema-drift-check, dq-baselines-validate, ecs-oneshot-test, migration-files-check, sql-conflict-check, sql-column-check, playwright-browser-check, shard-coverage-check, apollo-keyfields-check]
     if: always()
     runs-on: ubuntu-latest
     steps:

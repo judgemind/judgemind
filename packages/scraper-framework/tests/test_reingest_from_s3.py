@@ -5783,7 +5783,7 @@ class TestQualityQueriesSchemaValidation:
             JOIN courts ct ON ct.id = d.court_id
             LEFT JOIN parties p ON p.case_id = c.id
             WHERE p.id IS NULL
-        """
+        """  # sql-check:ignore — intentionally invalid SQL for testing validation
         aliases, col_refs = _parse_query_references(buggy_query)
 
         # The alias 'p' should map to 'parties'
