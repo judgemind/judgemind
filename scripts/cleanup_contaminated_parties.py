@@ -52,7 +52,9 @@ _CONTAMINATION_SQL_PATTERNS = [
     "%The Court Notes%",
     "%The Court Grants%",
     "%The Court Denies%",
-    # Motion-only patterns (motion description as entire party name)
+    # Motion-only patterns (motion description as entire party name).
+    # Need start-of-string, mid-string, and end-of-string variants because
+    # "Motion For" can appear anywhere (e.g. "Granting Motion For").
     "Motion For %",
     "Motion To %",
     "Motion Of %",
@@ -61,6 +63,15 @@ _CONTAMINATION_SQL_PATTERNS = [
     "% Motion To %",
     "% Motion Of %",
     "% Motion Re %",
+    "% Motion For",
+    "% Motion To",
+    "% Motion Of",
+    "% Motion Re",
+    # Docket metadata patterns (filing dates, complaint types leaked into
+    # party names, e.g. "Et Al. Comp. Filed : 03-27-25")
+    "%Comp. Filed%",
+    "%Filed : __-__-__%",
+    "%Filed: __-__-__%",
 ]
 
 
@@ -77,7 +88,9 @@ def build_contamination_where() -> str:
 def main() -> None:
     """Run the cleanup."""
     parser = argparse.ArgumentParser(description="Clean up contaminated party records")
-    parser.add_argument("--dry-run", action="store_true", help="Print without modifying")
+    parser.add_argument(
+        "--dry-run", action="store_true", help="Print without modifying"
+    )
     args = parser.parse_args()
 
     database_url = os.environ.get("DATABASE_URL")

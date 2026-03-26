@@ -123,6 +123,26 @@ class TestIsContaminatedPartyName:
     def test_motion_of(self) -> None:
         assert is_contaminated_party_name("The Continued Hearing On The Motion Of") is True
 
+    def test_granting_motion_for(self) -> None:
+        """Regression: 'Granting Motion For' survived cleanup — issue #1950."""
+        assert is_contaminated_party_name("Granting Motion For") is True
+
+    # -- Docket metadata patterns --
+
+    def test_docket_filing_date(self) -> None:
+        """'Et Al. Comp. Filed : 03-27-25' is docket metadata, not a party."""
+        assert is_contaminated_party_name("Et Al. Comp. Filed : 03-27-25") is True
+
+    def test_comp_filed(self) -> None:
+        assert is_contaminated_party_name("Comp. Filed something") is True
+
+    def test_filed_date_no_space(self) -> None:
+        assert is_contaminated_party_name("Filed: 01-15-26") is True
+
+    def test_filed_word_not_contaminated(self) -> None:
+        """The word 'filed' alone in a name should not trigger false positive."""
+        assert is_contaminated_party_name("Filed Insurance Group") is False
+
     # -- Length check --
 
     def test_very_long_name_is_contaminated(self) -> None:
