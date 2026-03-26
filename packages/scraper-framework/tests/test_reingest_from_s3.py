@@ -6789,3 +6789,179 @@ class TestRunReingestCheckpoint:
         assert len(checkpoint_snapshots) >= 2
         assert checkpoint_snapshots[0]["stats"]["total_processed"] == 25
         assert checkpoint_snapshots[1]["stats"]["total_processed"] == 50
+
+
+# ---------------------------------------------------------------------------
+# _LLM_SPLIT_REGISTRY and _full_reparse_document LLM split preference (#1969)
+# ---------------------------------------------------------------------------
+
+
+class TestLlmSplitRegistry:
+    """Tests for LLM-based split function registration and preference in
+    _full_reparse_document (#1969).
+
+    When a scraper module exports both _split_rulings (regex) and
+    _llm_extract_rulings (LLM), _full_reparse_document should prefer the
+    LLM-based function because it produces higher-quality ruling_text
+    (e.g. full legal analyses instead of disposition summaries).
+    """
+
+    def _doc_meta(self, **overrides: Any) -> dict:
+        meta = {
+            "document_id": "test-llm-split-doc",
+            "scraper_id": "test-llm-split",
+            "state": "CA",
+            "county": "TestCounty",
+            "court_name": "TestCounty Superior Court",
+            "source_url": "https://example.com/test.pdf",
+            "captured_at": datetime(2026, 3, 25, 12, 0, 0),
+            "hearing_date": date(2026, 3, 25),
+            "format": "pdf",
+            "content_hash": "abc123",
+            "case_number": "TEST001",
+            "case_title": "Smith v. Jones",
+            "case_type": "civil",
+            "stored_ruling_text": None,
+        }
+        meta.update(overrides)
+        return meta
+
+    @patch.object(reingest, "_load_scraper_registry")
+    @patch.object(reingest, "_extract_text_from_content")
+    def test_llm_split_preferred_over_regex(
+        self,
+        mock_extract: MagicMock,
+        mock_registry: MagicMock,
+    ) -> None:
+        """When LLM split is registered, it should be used instead of regex."""
+        from courts.ca.riverside_tentatives import SplitRuling
+
+        # LLM returns richer ruling_text
+        llm_rulings = [
+            SplitRuling(
+                1,
+                "TEST001",
+                "Full legal analysis with citations...",
+                "Smith v. Jones",
+                "msj",
+                "denied",
+            ),
+            SplitRuling(
+                2,
+                "TEST002",
+                "Detailed demurrer analysis...",
+                "Doe v. Roe",
+                "demurrer",
+                "granted",
+            ),
+        ]
+        # Regex returns truncated text
+        regex_rulings = [
+            SplitRuling(1, "TEST001", "DENY MSJ.", "Smith v. Jones", "msj", "denied"),
+            SplitRuling(2, "TEST002", "GRANT demurrer.", "Doe v. Roe", "demurrer", "granted"),
+        ]
+        mock_llm_split = MagicMock(return_value=llm_rulings)
+        mock_regex_split = MagicMock(return_value=regex_rulings)
+
+        reingest._SPLIT_REGISTRY["test-llm-split"] = mock_regex_split
+        reingest._LLM_SPLIT_REGISTRY["test-llm-split"] = mock_llm_split
+        reingest._SCRAPER_REGISTRY.pop("test-llm-split", None)
+        mock_extract.return_value = "full pdf text"
+
+        try:
+            result = reingest._full_reparse_document(b"raw pdf", "test-llm-split", self._doc_meta())
+            # LLM split should have been called
+            mock_llm_split.assert_called_once_with("full pdf text")
+            # Regex split should NOT have been called
+            mock_regex_split.assert_not_called()
+            # Ruling text should come from LLM (full analysis)
+            assert len(result) == 2
+            assert result[0]["ruling_text"] == "Full legal analysis with citations..."
+            assert result[1]["ruling_text"] == "Detailed demurrer analysis..."
+        finally:
+            reingest._SPLIT_REGISTRY.pop("test-llm-split", None)
+            reingest._LLM_SPLIT_REGISTRY.pop("test-llm-split", None)
+
+    @patch.object(reingest, "_load_scraper_registry")
+    @patch.object(reingest, "_extract_text_from_content")
+    def test_llm_split_failure_falls_back_to_regex(
+        self,
+        mock_extract: MagicMock,
+        mock_registry: MagicMock,
+    ) -> None:
+        """When LLM split returns None, regex split should be used as fallback."""
+        from courts.ca.riverside_tentatives import SplitRuling
+
+        regex_rulings = [
+            SplitRuling(1, "TEST001", "DENY MSJ.", "Smith v. Jones", "msj", "denied"),
+            SplitRuling(2, "TEST002", "GRANT demurrer.", "Doe v. Roe", "demurrer", "granted"),
+        ]
+        mock_llm_split = MagicMock(return_value=None)
+        mock_regex_split = MagicMock(return_value=regex_rulings)
+
+        reingest._SPLIT_REGISTRY["test-llm-split"] = mock_regex_split
+        reingest._LLM_SPLIT_REGISTRY["test-llm-split"] = mock_llm_split
+        reingest._SCRAPER_REGISTRY.pop("test-llm-split", None)
+        mock_extract.return_value = "full pdf text"
+
+        try:
+            result = reingest._full_reparse_document(b"raw pdf", "test-llm-split", self._doc_meta())
+            # Both should have been called (LLM first, then regex fallback)
+            mock_llm_split.assert_called_once()
+            mock_regex_split.assert_called_once()
+            # Result should come from regex fallback
+            assert len(result) == 2
+            assert result[0]["ruling_text"] == "DENY MSJ."
+        finally:
+            reingest._SPLIT_REGISTRY.pop("test-llm-split", None)
+            reingest._LLM_SPLIT_REGISTRY.pop("test-llm-split", None)
+
+    @patch.object(reingest, "_load_scraper_registry")
+    @patch.object(reingest, "_extract_text_from_content")
+    def test_no_llm_split_uses_regex_only(
+        self,
+        mock_extract: MagicMock,
+        mock_registry: MagicMock,
+    ) -> None:
+        """When no LLM split is registered, regex split should be used directly."""
+        from courts.ca.riverside_tentatives import SplitRuling
+
+        regex_rulings = [
+            SplitRuling(1, "TEST001", "DENY MSJ.", "Smith v. Jones", "msj", "denied"),
+            SplitRuling(2, "TEST002", "GRANT demurrer.", "Doe v. Roe", "demurrer", "granted"),
+        ]
+        mock_regex_split = MagicMock(return_value=regex_rulings)
+
+        reingest._SPLIT_REGISTRY["test-llm-split"] = mock_regex_split
+        reingest._LLM_SPLIT_REGISTRY.pop("test-llm-split", None)
+        reingest._SCRAPER_REGISTRY.pop("test-llm-split", None)
+        mock_extract.return_value = "full pdf text"
+
+        try:
+            result = reingest._full_reparse_document(b"raw pdf", "test-llm-split", self._doc_meta())
+            # Only regex should have been called
+            mock_regex_split.assert_called_once()
+            assert len(result) == 2
+            assert result[0]["ruling_text"] == "DENY MSJ."
+        finally:
+            reingest._SPLIT_REGISTRY.pop("test-llm-split", None)
+
+
+class TestLlmSplitRegistryAutoDiscovery:
+    """Tests that _load_scraper_registry() correctly discovers and registers
+    _llm_extract_rulings functions from scraper modules (#1969)."""
+
+    def test_riverside_llm_split_registered(self) -> None:
+        """Riverside scraper exports _llm_extract_rulings; it must be in _LLM_SPLIT_REGISTRY."""
+        reingest._SCRAPER_REGISTRY.clear()
+        reingest._LLM_SPLIT_REGISTRY.clear()
+        reingest._SPLIT_REGISTRY.clear()
+        reingest._load_scraper_registry()
+
+        assert "ca-riverside-tentatives-civil" in reingest._LLM_SPLIT_REGISTRY, (
+            "Riverside LLM split function should be registered in _LLM_SPLIT_REGISTRY"
+        )
+        # Also verify regex split is still registered
+        assert "ca-riverside-tentatives-civil" in reingest._SPLIT_REGISTRY, (
+            "Riverside regex split function should still be in _SPLIT_REGISTRY"
+        )
