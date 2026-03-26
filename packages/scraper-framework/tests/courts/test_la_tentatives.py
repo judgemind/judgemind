@@ -8,9 +8,10 @@ Fixtures captured from live site 2026-03-02:
 from __future__ import annotations
 
 import functools
+import json
 from datetime import datetime
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import httpx
 import pytest
@@ -18,6 +19,8 @@ import respx
 
 from courts.ca.la_tentatives import (
     CIVIL_URL,
+    LA_SYSTEM_PROMPT,
+    LASplitRuling,
     LATentativeRulingsScraper,
     _extract_aspnet_tokens,
     _extract_case_title,
@@ -27,6 +30,8 @@ from courts.ca.la_tentatives import (
     _is_dept_header_boilerplate,
     _is_name_fragment,
     _is_stale_viewstate_response,
+    _la_llm_enabled,
+    _llm_extract_rulings,
     _parse_dropdown_options,
     _parse_option,
     _sanitize_title,
@@ -1588,3 +1593,655 @@ def test_role_label_title_blocked_by_extract_not_sanitize() -> None:
     # This passes through _sanitize_title (it's a short, valid-looking string).
     # The actual blocking happens in _extract_title_from_parties_anchor.
     assert result is not None  # sanitize does not reject it
+
+
+# ---------------------------------------------------------------------------
+# LLM extraction tests (#1938)
+# ---------------------------------------------------------------------------
+
+
+class TestLaLlmEnabled:
+    """Tests for the _la_llm_enabled() feature flag."""
+
+    def test_disabled_by_default(self) -> None:
+        with patch.dict("os.environ", {}, clear=True):
+            assert _la_llm_enabled() is False
+
+    def test_enabled_with_true(self) -> None:
+        with patch.dict("os.environ", {"ENABLE_LA_LLM_EXTRACTION": "true"}):
+            assert _la_llm_enabled() is True
+
+    def test_enabled_with_1(self) -> None:
+        with patch.dict("os.environ", {"ENABLE_LA_LLM_EXTRACTION": "1"}):
+            assert _la_llm_enabled() is True
+
+    def test_enabled_with_yes(self) -> None:
+        with patch.dict("os.environ", {"ENABLE_LA_LLM_EXTRACTION": "yes"}):
+            assert _la_llm_enabled() is True
+
+    def test_enabled_case_insensitive(self) -> None:
+        with patch.dict("os.environ", {"ENABLE_LA_LLM_EXTRACTION": "TRUE"}):
+            assert _la_llm_enabled() is True
+
+    def test_disabled_with_false(self) -> None:
+        with patch.dict("os.environ", {"ENABLE_LA_LLM_EXTRACTION": "false"}):
+            assert _la_llm_enabled() is False
+
+    def test_disabled_with_empty_string(self) -> None:
+        with patch.dict("os.environ", {"ENABLE_LA_LLM_EXTRACTION": ""}):
+            assert _la_llm_enabled() is False
+
+
+def _make_llm_response(rulings_data: list[dict]) -> object:
+    """Create a mock LLMResponse with the given rulings data."""
+    from ingestion.llm_providers import LLMResponse
+
+    response_json = json.dumps({"rulings": rulings_data})
+    return LLMResponse(text=response_json, input_tokens=100, output_tokens=200)
+
+
+class TestLlmExtractRulings:
+    """Tests for _llm_extract_rulings()."""
+
+    def test_returns_none_on_api_failure(self) -> None:
+        """When call_llm returns None, _llm_extract_rulings returns None."""
+        test_html = "<html><body><div id='speechSynthesis'>test</div></body></html>"
+        with patch("ingestion.llm_providers.call_llm", return_value=None):
+            result = _llm_extract_rulings(test_html)
+        assert result is None
+
+    def test_returns_none_on_empty_html(self) -> None:
+        """Empty HTML should return None without calling the LLM."""
+        result = _llm_extract_rulings("")
+        assert result is None
+
+    def test_parses_single_ruling_response(self) -> None:
+        """A valid LLM response with one ruling should parse correctly."""
+        rulings_data = [
+            {
+                "extracted_case_number": "24NNCV02551",
+                "extracted_case_title": "Aasi v. American Honda Motor Co.",
+                "case_type": "civil",
+                "outcome": "granted",
+                "motion_type": "motion_to_compel",
+                "ruling_text": "The motion to compel is GRANTED.",
+                "parties": [
+                    {"name": "Sumayya Aasi", "role": "plaintiff"},
+                    {"name": "American Honda Motor Co., Inc.", "role": "defendant"},
+                ],
+            }
+        ]
+        mock_response = _make_llm_response(rulings_data)
+        with patch("ingestion.llm_providers.call_llm", return_value=mock_response):
+            result = _llm_extract_rulings(
+                "<html><body><div id='speechSynthesis'>Case Number: 24NNCV02551</div></body></html>"
+            )
+
+        assert result is not None
+        assert len(result) == 1
+        ruling = result[0]
+        assert ruling.case_number == "24NNCV02551"
+        assert ruling.case_title == "Aasi v. American Honda Motor Co."
+        assert ruling.outcome == "granted"
+        assert ruling.motion_type == "motion_to_compel"
+        assert ruling.ruling_text == "The motion to compel is GRANTED."
+        assert len(ruling.parties) == 2
+        assert ruling.parties[0]["name"] == "Sumayya Aasi"
+        assert ruling.parties[0]["role"] == "plaintiff"
+
+    def test_parses_multiple_rulings(self) -> None:
+        """A response with multiple rulings should return all of them."""
+        rulings_data = [
+            {
+                "extracted_case_number": "24NNCV02551",
+                "extracted_case_title": "Aasi v. Honda",
+                "outcome": "granted",
+                "ruling_text": "Ruling 1",
+                "parties": [],
+            },
+            {
+                "extracted_case_number": "26NNCP00062",
+                "extracted_case_title": "Mic-Bry8, LLC",
+                "outcome": "granted",
+                "ruling_text": "Ruling 2",
+                "parties": [],
+            },
+        ]
+        mock_response = _make_llm_response(rulings_data)
+        with patch("ingestion.llm_providers.call_llm", return_value=mock_response):
+            result = _llm_extract_rulings(
+                "<html><body><div id='speechSynthesis'>content</div></body></html>"
+            )
+
+        assert result is not None
+        assert len(result) == 2
+        assert result[0].case_number == "24NNCV02551"
+        assert result[0].ruling_index == 1
+        assert result[1].case_number == "26NNCP00062"
+        assert result[1].ruling_index == 2
+
+    def test_handles_invalid_json(self) -> None:
+        """Invalid JSON from LLM should return None."""
+        from ingestion.llm_providers import LLMResponse
+
+        mock_response = LLMResponse(text="not valid json", input_tokens=10, output_tokens=20)
+        with patch("ingestion.llm_providers.call_llm", return_value=mock_response):
+            result = _llm_extract_rulings(
+                "<html><body><div id='speechSynthesis'>test</div></body></html>"
+            )
+        assert result is None
+
+    def test_handles_markdown_code_fences(self) -> None:
+        """LLM responses wrapped in ```json fences should parse correctly."""
+        from ingestion.llm_providers import LLMResponse
+
+        rulings_json = json.dumps(
+            {
+                "rulings": [
+                    {
+                        "extracted_case_number": "24STCV01234",
+                        "ruling_text": "Granted.",
+                        "parties": [],
+                    }
+                ]
+            }
+        )
+        mock_response = LLMResponse(
+            text=f"```json\n{rulings_json}\n```",
+            input_tokens=10,
+            output_tokens=20,
+        )
+        with patch("ingestion.llm_providers.call_llm", return_value=mock_response):
+            result = _llm_extract_rulings(
+                "<html><body><div id='speechSynthesis'>test</div></body></html>"
+            )
+        assert result is not None
+        assert len(result) == 1
+        assert result[0].case_number == "24STCV01234"
+
+    def test_normalizes_outcome(self) -> None:
+        """Outcome values should be normalized to valid DB enum values."""
+        rulings_data = [
+            {
+                "extracted_case_number": "24STCV01234",
+                "outcome": "granted_in_part",
+                "ruling_text": "Partially granted.",
+                "parties": [],
+            }
+        ]
+        mock_response = _make_llm_response(rulings_data)
+        with patch("ingestion.llm_providers.call_llm", return_value=mock_response):
+            result = _llm_extract_rulings(
+                "<html><body><div id='speechSynthesis'>test</div></body></html>"
+            )
+        assert result is not None
+        assert result[0].outcome == "granted_in_part"
+
+    def test_unknown_outcome_maps_to_none(self) -> None:
+        """Unknown outcome values should map to None."""
+        rulings_data = [
+            {
+                "extracted_case_number": "24STCV01234",
+                "outcome": "reversed",
+                "ruling_text": "Some text.",
+                "parties": [],
+            }
+        ]
+        mock_response = _make_llm_response(rulings_data)
+        with patch("ingestion.llm_providers.call_llm", return_value=mock_response):
+            result = _llm_extract_rulings(
+                "<html><body><div id='speechSynthesis'>test</div></body></html>"
+            )
+        assert result is not None
+        assert result[0].outcome is None
+
+    def test_filters_invalid_party_names(self) -> None:
+        """Party names with newlines or >200 chars should be filtered out."""
+        rulings_data = [
+            {
+                "extracted_case_number": "24STCV01234",
+                "ruling_text": "Text",
+                "parties": [
+                    {"name": "Valid Name", "role": "plaintiff"},
+                    {"name": "Invalid\nName", "role": "defendant"},
+                    {"name": "X" * 201, "role": "defendant"},
+                ],
+            }
+        ]
+        mock_response = _make_llm_response(rulings_data)
+        with patch("ingestion.llm_providers.call_llm", return_value=mock_response):
+            result = _llm_extract_rulings(
+                "<html><body><div id='speechSynthesis'>test</div></body></html>"
+            )
+        assert result is not None
+        assert len(result[0].parties) == 1
+        assert result[0].parties[0]["name"] == "Valid Name"
+
+    def test_accepts_bare_list_response(self) -> None:
+        """LLM may return a bare JSON array instead of {rulings: [...]}."""
+        from ingestion.llm_providers import LLMResponse
+
+        rulings_list = [
+            {
+                "extracted_case_number": "24STCV01234",
+                "ruling_text": "Text",
+                "parties": [],
+            }
+        ]
+        mock_response = LLMResponse(
+            text=json.dumps(rulings_list),
+            input_tokens=10,
+            output_tokens=20,
+        )
+        with patch("ingestion.llm_providers.call_llm", return_value=mock_response):
+            result = _llm_extract_rulings(
+                "<html><body><div id='speechSynthesis'>test</div></body></html>"
+            )
+        assert result is not None
+        assert len(result) == 1
+
+    def test_empty_rulings_returns_empty_list(self) -> None:
+        """A response with an empty rulings array returns an empty list."""
+        mock_response = _make_llm_response([])
+        with patch("ingestion.llm_providers.call_llm", return_value=mock_response):
+            result = _llm_extract_rulings(
+                "<html><body><div id='speechSynthesis'>test</div></body></html>"
+            )
+        assert result is not None
+        assert result == []
+
+
+class TestLaSplitRuling:
+    """Tests for the LASplitRuling dataclass."""
+
+    def test_default_fields(self) -> None:
+        ruling = LASplitRuling(ruling_index=1, case_number="24STCV01234", ruling_text="Text")
+        assert ruling.case_title is None
+        assert ruling.motion_type is None
+        assert ruling.outcome is None
+        assert ruling.parties == []
+
+    def test_all_fields(self) -> None:
+        ruling = LASplitRuling(
+            ruling_index=1,
+            case_number="24STCV01234",
+            ruling_text="The motion is granted.",
+            case_title="Smith v. Jones",
+            motion_type="demurrer",
+            outcome="granted",
+            parties=[{"name": "Smith", "role": "plaintiff"}],
+        )
+        assert ruling.case_number == "24STCV01234"
+        assert ruling.case_title == "Smith v. Jones"
+        assert ruling.outcome == "granted"
+        assert len(ruling.parties) == 1
+
+
+class TestLaSystemPrompt:
+    """Tests for the LA_SYSTEM_PROMPT constant."""
+
+    def test_prompt_mentions_la_county(self) -> None:
+        assert "Los Angeles" in LA_SYSTEM_PROMPT
+
+    def test_prompt_includes_output_format(self) -> None:
+        assert "extracted_case_number" in LA_SYSTEM_PROMPT
+        assert "extracted_case_title" in LA_SYSTEM_PROMPT
+        assert "ruling_text" in LA_SYSTEM_PROMPT
+
+    def test_prompt_includes_outcome_taxonomy(self) -> None:
+        assert "granted" in LA_SYSTEM_PROMPT
+        assert "denied" in LA_SYSTEM_PROMPT
+        assert "granted_in_part" in LA_SYSTEM_PROMPT
+
+
+def _make_doc_with_fields(**kwargs: object) -> CapturedDocument:
+    """Helper to create a CapturedDocument with sensible defaults for tests."""
+    defaults: dict[str, object] = {
+        "scraper_id": "ca-la-tentatives-civil",
+        "state": "CA",
+        "county": "Los Angeles",
+        "court": "Superior Court",
+        "source_url": CIVIL_URL,
+        "capture_timestamp": datetime(2026, 3, 2, 18, 0, 0),
+        "content_format": ContentFormat.HTML,
+        "raw_content": b"<html><body><div id='speechSynthesis'>test</div></body></html>",
+        "content_hash": "",
+    }
+    defaults.update(kwargs)
+    return CapturedDocument(**defaults)
+
+
+class TestParseDocumentLlmPath:
+    """Tests for parse_document when LLM-extracted docs are passed."""
+
+    def test_preserves_all_llm_fields_when_all_populated(self) -> None:
+        """When _llm_extracted is True and all fields are populated,
+        parse_document should preserve LLM-populated fields without
+        overwriting them via regex."""
+        scraper = LATentativeRulingsScraper(default_config())
+        doc = _make_doc_with_fields(
+            case_number="24NNCV02551",
+            ruling_text="LLM ruling text",
+            case_title="LLM Title",
+            outcome="granted",
+            extra={"_llm_extracted": True},
+        )
+
+        result = scraper.parse_document(doc)
+
+        # Fields should be preserved from LLM extraction
+        assert result.case_number == "24NNCV02551"
+        assert result.ruling_text == "LLM ruling text"
+        assert result.case_title == "LLM Title"
+        assert result.outcome == "granted"
+
+    def test_regex_fallback_fills_null_case_title(self) -> None:
+        """When LLM returns null case_title for the first case on a
+        multi-case page, regex extraction should fill it from the
+        correct per-case HTML chunk."""
+        scraper = LATentativeRulingsScraper(default_config())
+        # Use full multi-case HTML (not pre-split) to match production
+        html = _load("la_ruling_response.html")
+
+        doc = _make_doc_with_fields(
+            raw_content=html.encode("utf-8"),
+            case_number="24NNCV02551",
+            ruling_text="LLM ruling text",
+            case_title=None,  # LLM didn't extract this
+            outcome="denied",
+            extra={"_llm_extracted": True, "ruling_index": 1},
+        )
+
+        result = scraper.parse_document(doc)
+
+        # LLM fields should be preserved
+        assert result.case_number == "24NNCV02551"
+        assert result.ruling_text == "LLM ruling text"
+        assert result.outcome == "denied"
+        # Regex should have filled case_title from the correct chunk
+        assert result.case_title is not None
+        assert "Aasi" in result.case_title
+
+    def test_regex_fallback_second_case_on_multi_case_page(self) -> None:
+        """When LLM returns null fields for the second case on a multi-case
+        page, regex fallback should use the correct HTML chunk, not the
+        first case's chunk."""
+        scraper = LATentativeRulingsScraper(default_config())
+        html = _load("la_ruling_response.html")
+
+        doc = _make_doc_with_fields(
+            raw_content=html.encode("utf-8"),
+            case_number="26NNCP00062",  # Second case
+            ruling_text="LLM ruling text for case 2",
+            case_title=None,  # Needs fallback
+            extra={"_llm_extracted": True, "ruling_index": 2},
+        )
+
+        result = scraper.parse_document(doc)
+
+        # LLM fields preserved
+        assert result.case_number == "26NNCP00062"
+        assert result.ruling_text == "LLM ruling text for case 2"
+        # The case_title from regex should be for the SECOND case, not first
+        if result.case_title is not None:
+            assert "Aasi" not in result.case_title
+
+    def test_regex_fallback_aborts_for_invalid_ruling_index(self) -> None:
+        """When ruling_index is out of bounds on a multi-case page,
+        the fallback should abort to prevent data corruption."""
+        scraper = LATentativeRulingsScraper(default_config())
+        html = _load("la_ruling_response.html")
+
+        doc = _make_doc_with_fields(
+            raw_content=html.encode("utf-8"),
+            case_number="24NNCV02551",
+            ruling_text="LLM text",
+            case_title=None,  # Needs fallback
+            extra={"_llm_extracted": True, "ruling_index": 99},  # Out of bounds
+        )
+
+        result = scraper.parse_document(doc)
+
+        # Fallback should have been aborted — case_title stays None
+        assert result.case_title is None
+        # LLM fields should be preserved
+        assert result.case_number == "24NNCV02551"
+        assert result.ruling_text == "LLM text"
+
+    def test_regex_fallback_does_not_overwrite_llm_fields(self) -> None:
+        """When LLM has populated fields, regex extraction should NOT
+        overwrite them, even if regex would produce a different result."""
+        scraper = LATentativeRulingsScraper(default_config())
+        # Use full multi-case HTML to match production
+        html = _load("la_ruling_response.html")
+
+        doc = _make_doc_with_fields(
+            raw_content=html.encode("utf-8"),
+            case_number="CUSTOM_NUMBER",  # Intentionally different from HTML
+            ruling_text="LLM ruling text keeps precedence",
+            case_title="LLM Custom Title",
+            judge_name=None,  # This should be filled by regex
+            extra={"_llm_extracted": True, "ruling_index": 1},
+        )
+
+        result = scraper.parse_document(doc)
+
+        # LLM values must take precedence
+        assert result.case_number == "CUSTOM_NUMBER"
+        assert result.ruling_text == "LLM ruling text keeps precedence"
+        assert result.case_title == "LLM Custom Title"
+        # Judge name should be filled by regex/dept fallback
+        assert result.judge_name is not None
+
+    def test_regex_path_still_works_for_non_llm_docs(self) -> None:
+        """Without _llm_extracted, parse_document should use regex extraction."""
+        scraper = LATentativeRulingsScraper(default_config())
+        html = _load("la_ruling_pas_p.html")
+        # Split to get per-case HTML
+        case_htmls = _split_cases_html(html)
+        assert len(case_htmls) == 1
+
+        doc = _make_doc_with_fields(
+            raw_content=case_htmls[0].encode("utf-8"),
+        )
+        result = scraper.parse_document(doc)
+
+        # Regex extraction should populate case_number
+        assert result.case_number == "25NNCV00140"
+
+    def test_judge_fallback_still_works_for_llm_docs(self) -> None:
+        """LLM-extracted docs with no judge_name should still try dept mapping."""
+        dept_map = {"P": "Test Judge Name"}
+        scraper = LATentativeRulingsScraper(default_config(), dept_judge_map=dept_map)
+        doc = _make_doc_with_fields(
+            case_number="25NNCV00140",
+            department="P",
+            extra={"_llm_extracted": True},
+        )
+
+        result = scraper.parse_document(doc)
+
+        assert result.judge_name == "Test Judge Name"
+
+    def test_skips_regex_fallback_when_all_fields_populated(self) -> None:
+        """When all fallback fields are populated (including parties),
+        the regex fallback should be skipped entirely."""
+        scraper = LATentativeRulingsScraper(default_config())
+        doc = _make_doc_with_fields(
+            case_number="24NNCV02551",
+            ruling_text="Full ruling text here",
+            case_title="Test Title",
+            judge_name="Test Judge",
+            parties=[{"name": "Alice", "role": "plaintiff"}],
+            extra={"_llm_extracted": True},
+        )
+
+        result = scraper.parse_document(doc)
+
+        # All fields should remain unchanged
+        assert result.case_number == "24NNCV02551"
+        assert result.ruling_text == "Full ruling text here"
+        assert result.case_title == "Test Title"
+        assert result.judge_name == "Test Judge"
+        assert result.parties == [{"name": "Alice", "role": "plaintiff"}]
+
+    def test_regex_fallback_preserves_parties_from_llm(self) -> None:
+        """When LLM provides parties but case_title is null, regex fallback
+        should fill case_title but preserve the LLM parties."""
+        scraper = LATentativeRulingsScraper(default_config())
+        html = _load("la_ruling_response.html")
+
+        llm_parties = [
+            {"name": "Sumayya Aasi", "role": "plaintiff"},
+            {"name": "American Honda", "role": "defendant"},
+        ]
+        doc = _make_doc_with_fields(
+            raw_content=html.encode("utf-8"),
+            case_number="24NNCV02551",
+            ruling_text="LLM ruling text",
+            case_title=None,  # Needs fallback
+            parties=llm_parties,  # Should be preserved
+            extra={"_llm_extracted": True, "ruling_index": 1},
+        )
+
+        result = scraper.parse_document(doc)
+
+        # LLM parties should be preserved
+        assert result.parties == llm_parties
+        # case_title should be filled by regex
+        assert result.case_title is not None
+
+    def test_regex_fallback_handles_extraction_error(self) -> None:
+        """When regex extraction raises an exception during fallback,
+        the document should be restored to its exact pre-call state —
+        including null fields staying null."""
+        scraper = LATentativeRulingsScraper(default_config())
+        # Use real HTML that _split_cases_html can parse
+        html = _load("la_ruling_response.html")
+        doc = _make_doc_with_fields(
+            raw_content=html.encode("utf-8"),
+            case_number="24NNCV02551",
+            ruling_text="LLM ruling text",
+            case_title=None,  # This was null before the error
+            extra={"_llm_extracted": True, "ruling_index": 1},
+        )
+
+        with patch(
+            "courts.ca.la_tentatives._extract_ruling_fields",
+            side_effect=RuntimeError("parse error"),
+        ):
+            result = scraper.parse_document(doc)
+
+        # LLM fields should be restored after the error
+        assert result.case_number == "24NNCV02551"
+        assert result.ruling_text == "LLM ruling text"
+        # Null fields should stay null (not set to partial values)
+        assert result.case_title is None
+
+
+class TestFetchDocumentsLlmPath:
+    """Tests for fetch_documents with LLM extraction enabled."""
+
+    @respx.mock
+    def test_llm_path_creates_docs_with_pre_populated_fields(self) -> None:
+        """When ENABLE_LA_LLM_EXTRACTION is set and LLM succeeds,
+        fetch_documents should create docs with fields from LLM."""
+        main_html = _load("la_main_page.html")
+        ruling_html = _load("la_ruling_pas_p.html")
+
+        # Mock HTTP
+        respx.get(CIVIL_URL).mock(return_value=httpx.Response(200, text=main_html))
+        respx.post(CIVIL_URL).mock(return_value=httpx.Response(200, text=ruling_html))
+
+        # Mock LLM to return a single ruling
+        llm_rulings = [
+            LASplitRuling(
+                ruling_index=1,
+                case_number="25NNCV00140",
+                ruling_text="Motion for reconsideration denied.",
+                case_title="Wu v. Pak",
+                motion_type="motion_for_reconsideration",
+                outcome="denied",
+                parties=[
+                    {"name": "Sai K. Wu", "role": "plaintiff"},
+                    {"name": "Shane S. Pak", "role": "defendant"},
+                ],
+            )
+        ]
+
+        config = default_config()
+        config.request_delay_seconds = 0.0
+        scraper = LATentativeRulingsScraper(config)
+
+        with (
+            patch.dict("os.environ", {"ENABLE_LA_LLM_EXTRACTION": "true"}),
+            patch(
+                "courts.ca.la_tentatives._llm_extract_rulings",
+                return_value=llm_rulings,
+            ),
+        ):
+            docs = scraper.fetch_documents()
+
+        # Should have 97 docs (one per dropdown option, each with 1 LLM ruling)
+        assert len(docs) > 0
+        # Check the first doc has LLM-populated fields
+        first = docs[0]
+        assert first.extra.get("_llm_extracted") is True
+        assert first.extra.get("pre_split") is True
+        assert first.case_number == "25NNCV00140"
+        assert first.case_title == "Wu v. Pak"
+        assert first.outcome == "denied"
+        assert first.ruling_text == "Motion for reconsideration denied."
+
+    @respx.mock
+    def test_llm_fallback_to_regex_on_failure(self) -> None:
+        """When LLM returns None, should fall back to regex splitting."""
+        main_html = _load("la_main_page.html")
+        ruling_html = _load("la_ruling_pas_p.html")
+
+        # Mock HTTP — only respond to first option
+        respx.get(CIVIL_URL).mock(return_value=httpx.Response(200, text=main_html))
+        respx.post(CIVIL_URL).mock(return_value=httpx.Response(200, text=ruling_html))
+
+        config = default_config()
+        config.request_delay_seconds = 0.0
+        scraper = LATentativeRulingsScraper(config)
+
+        with (
+            patch.dict("os.environ", {"ENABLE_LA_LLM_EXTRACTION": "true"}),
+            patch(
+                "courts.ca.la_tentatives._llm_extract_rulings",
+                return_value=None,
+            ),
+        ):
+            docs = scraper.fetch_documents()
+
+        # Should still get docs from regex fallback
+        assert len(docs) > 0
+        # Regex path does not set _llm_extracted
+        first = docs[0]
+        assert first.extra.get("_llm_extracted") is not True
+
+    @respx.mock
+    def test_disabled_flag_uses_regex_path(self) -> None:
+        """When ENABLE_LA_LLM_EXTRACTION is not set, uses regex path."""
+        main_html = _load("la_main_page.html")
+        ruling_html = _load("la_ruling_pas_p.html")
+
+        respx.get(CIVIL_URL).mock(return_value=httpx.Response(200, text=main_html))
+        respx.post(CIVIL_URL).mock(return_value=httpx.Response(200, text=ruling_html))
+
+        config = default_config()
+        config.request_delay_seconds = 0.0
+        scraper = LATentativeRulingsScraper(config)
+
+        with patch.dict("os.environ", {}, clear=False):
+            # Make sure the env var is not set
+            import os
+
+            os.environ.pop("ENABLE_LA_LLM_EXTRACTION", None)
+            docs = scraper.fetch_documents()
+
+        assert len(docs) > 0
+        first = docs[0]
+        assert first.extra.get("_llm_extracted") is not True
