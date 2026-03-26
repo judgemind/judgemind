@@ -196,3 +196,31 @@ class TestRegistryClassesInstantiable:
         scraper = scraper_cls(config=config)
         assert scraper is not None
         assert scraper.config.scraper_id == config.scraper_id
+
+
+class TestLlmSplitRegistryDiscovery:
+    """Verify that _load_scraper_registry() discovers _llm_extract_rulings functions (#1969)."""
+
+    def test_llm_split_registry_populated(self) -> None:
+        """Modules that export _llm_extract_rulings must be in _LLM_SPLIT_REGISTRY."""
+        reingest._SCRAPER_REGISTRY.clear()
+        reingest._LLM_SPLIT_REGISTRY.clear()
+        reingest._SPLIT_REGISTRY.clear()
+        reingest._load_scraper_registry()
+
+        # Discover which modules export _llm_extract_rulings
+        expected_llm_ids: set[str] = set()
+        for module_path, _class_name in _SCRAPER_MODULES:
+            mod = _load_module(module_path)
+            if hasattr(mod, "_llm_extract_rulings") and callable(mod._llm_extract_rulings):
+                config = mod.default_config()
+                expected_llm_ids.add(config.scraper_id)
+
+        if not expected_llm_ids:
+            pytest.skip("No scraper modules export _llm_extract_rulings")
+
+        actual_llm_ids = set(reingest._LLM_SPLIT_REGISTRY.keys())
+        missing = expected_llm_ids - actual_llm_ids
+        assert not missing, (
+            f"Scraper IDs with _llm_extract_rulings not in _LLM_SPLIT_REGISTRY: {missing}"
+        )

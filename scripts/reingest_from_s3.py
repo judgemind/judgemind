@@ -144,6 +144,14 @@ _SCRAPER_REGISTRY: dict[str, type] = {}
 # return value plus a "ruling_index" key.
 _SPLIT_REGISTRY: dict[str, Any] = {}
 
+# Registry mapping scraper_id to an LLM-based split function.  These are
+# preferred over the regex-based _SPLIT_REGISTRY entries in full-reparse
+# mode because they use LLM prompts to extract ruling_text (which may have
+# been improved, e.g. #1948/#1959).  The callable signature is:
+#   (text: str) -> list[SplitRuling] | None
+# Returns None on LLM failure, in which case the regex fallback is used.
+_LLM_SPLIT_REGISTRY: dict[str, Any] = {}
+
 
 def _load_scraper_registry() -> None:
     """Lazily populate the scraper registry by auto-discovering court modules.
@@ -209,6 +217,14 @@ def _load_scraper_registry() -> None:
             split_fn = getattr(mod, "_split_rulings", None)
             if split_fn is not None and callable(split_fn):
                 _SPLIT_REGISTRY[config.scraper_id] = split_fn
+
+            # Register LLM-based split function if available.
+            # Convention: a module-level ``_llm_extract_rulings`` callable
+            # indicates that the scraper has an LLM-based splitter that
+            # produces higher-quality ruling_text than regex splitting.
+            llm_split_fn = getattr(mod, "_llm_extract_rulings", None)
+            if llm_split_fn is not None and callable(llm_split_fn):
+                _LLM_SPLIT_REGISTRY[config.scraper_id] = llm_split_fn
         except Exception:
             logger.warning(
                 "default_config() failed, skipping", module=modname, exc_info=True
@@ -890,8 +906,21 @@ def _full_reparse_document(
         pdf_timeout=pdf_timeout,
     ).replace("\x00", "")
 
-    # Call the scraper-specific splitting function
-    split_results = split_fn(text)
+    # Prefer LLM-based splitting when available — it produces higher-quality
+    # ruling_text (e.g. full legal analyses instead of disposition summaries,
+    # see #1948/#1959).  Falls back to regex-based split on LLM failure.
+    llm_split_fn = _LLM_SPLIT_REGISTRY.get(scraper_id)
+    if llm_split_fn is not None:
+        split_results = llm_split_fn(text)
+        if split_results is None:
+            logger.warning(
+                "LLM split failed, falling back to regex split",
+                document_id=doc_meta["document_id"],
+                scraper_id=scraper_id,
+            )
+            split_results = split_fn(text)
+    else:
+        split_results = split_fn(text)
 
     if len(split_results) <= 1:
         # Single ruling or no rulings — fall back to standard reparse
