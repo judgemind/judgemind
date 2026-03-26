@@ -19,9 +19,12 @@ Verified against live site 2026-03-02:
 from __future__ import annotations
 
 import functools
+import json
+import os
 import re
 import time
 from dataclasses import dataclass
+from dataclasses import field as dataclass_field
 from datetime import datetime
 
 import httpx
@@ -133,6 +136,239 @@ _DEPT_HEADER_BOILERPLATE_RE = re.compile(
 # Maximum length for a cleaned case title.  Titles longer than this after
 # entity-descriptor stripping still contain too much caption noise.
 _MAX_TITLE_LENGTH = 120
+
+
+# ---------------------------------------------------------------------------
+# LLM extraction feature flag and configuration (#1938)
+# ---------------------------------------------------------------------------
+
+
+def _la_llm_enabled() -> bool:
+    """Return True when LLM-based extraction is enabled for LA rulings."""
+    return os.environ.get("ENABLE_LA_LLM_EXTRACTION", "").lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+
+
+# Default LLM provider and model for LA text extraction.
+_LA_LLM_PROVIDER = "google"
+_LA_LLM_MODEL = "gemini-2.5-flash-lite"
+
+# Map LLM outcome values to lowercase enum values matching the DB schema.
+_OUTCOME_MAP: dict[str | None, str | None] = {
+    "granted": "granted",
+    "denied": "denied",
+    "granted_in_part": "granted_in_part",
+    "denied_in_part": "denied_in_part",
+    "moot": "moot",
+    "continued": "continued",
+    "off_calendar": "off_calendar",
+    "submitted": "submitted",
+    "other": "other",
+    None: None,
+}
+
+
+@dataclass
+class LASplitRuling:
+    """A single ruling extracted from a multi-case LA department page via LLM."""
+
+    ruling_index: int
+    case_number: str | None
+    ruling_text: str
+    case_title: str | None = None
+    motion_type: str | None = None
+    outcome: str | None = None
+    parties: list[dict[str, str]] = dataclass_field(default_factory=list)
+
+
+LA_SYSTEM_PROMPT = (
+    "You are a legal document parser for California court "
+    "tentative rulings from Los Angeles County Superior Court.\n\n"
+    "You will receive the text content extracted from an HTML page "
+    "containing tentative rulings for one department.  Your job is to "
+    "identify EVERY individual case ruling in the document and extract "
+    "structured data for each.\n\n"
+    "## LA County Document Format\n\n"
+    "LA County tentative ruling pages have this structure:\n"
+    "1. **Department header**: 'DEPARTMENT {N} LAW AND MOTION RULINGS' "
+    "followed by the hearing date.\n"
+    "2. **Case entries**: Each case starts with 'Case Number: {NUMBER}' "
+    "followed by:\n"
+    "   - Party caption block (Plaintiff vs. Defendant with roles)\n"
+    "   - Motion description\n"
+    "   - The ruling text\n"
+    "   - Judge signature: '{Name} Judge of the Superior Court'\n"
+    "3. **Multiple cases**: Department pages may contain rulings for "
+    "multiple cases separated by horizontal rules.\n"
+    "4. **Party caption format**: Parties are listed in a formal block:\n"
+    "   'PLAINTIFF NAME, et al.,\\n  Plaintiff(s),\\n  vs.\\n  "
+    "DEFENDANT NAME,\\n  Defendant(s).'\n"
+    "5. **Moving/Responding parties**: Some rulings list "
+    "'MOVING PARTY:' and 'RESPONDING PARTY:' fields.\n\n"
+    "## Case Number Formats\n\n"
+    "LA case numbers use these patterns:\n"
+    "- Year + courthouse code + sequence: 24NNCV02551, 26NNCP00062, "
+    "24STCV02143\n"
+    "- Courthouse codes: NN=Northeast (Alhambra/Pasadena), "
+    "ST=Stanley Mosk, BH=Beverly Hills, CH=Chatsworth, "
+    "VE=Van Nuys, TO=Torrance, CO=Compton, EA=East LA\n"
+    "- Case type codes: CV=Civil, CP=Complex/Probate, LC=Limited Civil\n\n"
+    "## Rules\n\n"
+    "1. Count and return EVERY case as a separate ruling. If the document "
+    "has 3 'Case Number:' entries, return 3 rulings.\n"
+    "2. Extract the case number EXACTLY as it appears (including any "
+    "leading digits).\n"
+    "3. For case_title, use 'Plaintiff v. Defendant' format. Strip "
+    "legal entity descriptors like 'an individual', 'a corporation', "
+    "etc. Use title case.\n"
+    "4. For ruling_text, include the COMPLETE ruling text verbatim. "
+    "Include all legal analysis, citations, and reasoning. Do NOT "
+    "truncate or summarize.\n"
+    "5. For parties, extract each party with their role (plaintiff, "
+    "defendant, petitioner, respondent, cross-complainant, "
+    "cross-defendant, moving_party, responding_party).\n"
+    "6. Skip the department header boilerplate — only extract from "
+    "case entries.\n"
+    "7. Pages with only department headers and no 'Case Number:' "
+    "entries have zero cases — return an empty rulings array.\n"
+    "8. For pages that are error pages or contain 'We\\'re sorry', "
+    "return an empty rulings array.\n\n"
+    "## Outcome taxonomy\n\n"
+    "Use EXACTLY one of these values:\n"
+    "- granted — motion was fully granted\n"
+    "- denied — motion was fully denied\n"
+    "- granted_in_part — partially granted and partially denied\n"
+    "- denied_in_part — partially denied\n"
+    "- moot — motion is moot\n"
+    "- continued — hearing was postponed\n"
+    "- off_calendar — hearing removed from calendar\n"
+    "- submitted — taken under submission\n"
+    "- other — none of the above fit\n\n"
+    "For 'overruled' (demurrers), map to 'denied'.\n"
+    "For 'sustained' (demurrers), map to 'granted'.\n\n"
+    "## Output format\n\n"
+    "Respond with ONLY a JSON object, no other text:\n\n"
+    "{\n"
+    '  "extracted_judge_name": "First M. Last" or null,\n'
+    '  "hearing_date": "YYYY-MM-DD" or null,\n'
+    '  "department": "3" or null,\n'
+    '  "rulings": [\n'
+    "    {\n"
+    '      "extracted_case_number": "24NNCV02551" or null,\n'
+    '      "extracted_case_title": "Aasi v. American Honda Motor Co." '
+    "or null,\n"
+    '      "case_type": "civil" or null,\n'
+    '      "outcome": "granted" or null,\n'
+    '      "motion_type": "motion_to_compel" or null,\n'
+    '      "ruling_text": "Full verbatim text..." or null,\n'
+    '      "parties": [\n'
+    '        {"name": "Sumayya Aasi", "role": "plaintiff"},\n'
+    '        {"name": "American Honda Motor Co., Inc.", '
+    '"role": "defendant"}\n'
+    "      ]\n"
+    "    }\n"
+    "  ]\n"
+    "}"
+)
+
+
+def _llm_extract_rulings(ruling_html: str) -> list[LASplitRuling] | None:
+    """Extract rulings from LA department HTML using an LLM.
+
+    Preprocesses the HTML to plain text, sends it to the LLM with a
+    LA-specific system prompt, and parses the JSON response into
+    ``LASplitRuling`` objects.
+
+    Returns a list of ``LASplitRuling`` objects on success, or ``None``
+    if the LLM call fails or the response cannot be parsed.  The caller
+    should fall back to ``_split_cases_html()`` when ``None`` is returned.
+    """
+    from ingestion.llm_extract import preprocess_html
+    from ingestion.llm_providers import call_llm
+
+    text = preprocess_html(ruling_html)
+    if not text or not text.strip():
+        return None
+
+    response = call_llm(
+        system_prompt=LA_SYSTEM_PROMPT,
+        user_message=text,
+        provider=_LA_LLM_PROVIDER,
+        model=_LA_LLM_MODEL,
+        max_tokens=32768,
+        timeout=60.0,
+    )
+
+    if response is None:
+        logger.warning("la.llm_extraction_failed", reason="null_response")
+        return None
+
+    try:
+        raw = response.text.strip()
+        # Strip markdown code fences if present
+        if raw.startswith("```"):
+            lines = raw.split("\n")
+            lines = [line for line in lines if not line.strip().startswith("```")]
+            raw = "\n".join(lines)
+
+        data = json.loads(raw)
+    except (json.JSONDecodeError, ValueError) as exc:
+        logger.warning("la.llm_parse_failed", error=str(exc))
+        return None
+
+    # Accept both {"rulings": [...]} and bare [...] responses.
+    if isinstance(data, list):
+        rulings_list = data
+    elif isinstance(data, dict):
+        rulings_list = data.get("rulings", [])
+    else:
+        logger.warning("la.llm_unexpected_shape", shape=type(data).__name__)
+        return None
+
+    if not isinstance(rulings_list, list):
+        logger.warning("la.llm_rulings_not_list")
+        return None
+
+    rulings: list[LASplitRuling] = []
+    for idx, entry in enumerate(rulings_list):
+        if not isinstance(entry, dict):
+            continue
+        raw_outcome = entry.get("outcome")
+        outcome = _OUTCOME_MAP.get(raw_outcome)
+
+        # Parse parties list
+        raw_parties = entry.get("parties", [])
+        parties: list[dict[str, str]] = []
+        if isinstance(raw_parties, list):
+            for p in raw_parties:
+                if isinstance(p, dict) and p.get("name") and p.get("role"):
+                    name = str(p["name"]).strip()
+                    if len(name) > 200 or "\n" in name or "\r" in name:
+                        continue
+                    parties.append({"name": name, "role": str(p["role"])})
+
+        rulings.append(
+            LASplitRuling(
+                ruling_index=idx + 1,
+                case_number=entry.get("extracted_case_number"),
+                ruling_text=entry.get("ruling_text") or "",
+                case_title=entry.get("extracted_case_title"),
+                motion_type=entry.get("motion_type"),
+                outcome=outcome,
+                parties=parties,
+            )
+        )
+
+    logger.info(
+        "la.llm_extraction_success",
+        ruling_count=len(rulings),
+        input_tokens=response.input_tokens,
+        output_tokens=response.output_tokens,
+    )
+    return rulings
 
 
 def _truncate_party_list(party_side: str) -> str:
@@ -287,6 +523,10 @@ class LATentativeRulingsScraper(BaseScraper):
             options = _parse_dropdown_options(response.text)
             self._log.info("Found dropdown options", count=len(options))
 
+            use_llm = _la_llm_enabled()
+            if use_llm:
+                self._log.info("LA LLM extraction enabled")
+
             for opt in options:
                 time.sleep(self.config.request_delay_seconds)
                 try:
@@ -299,6 +539,50 @@ class LATentativeRulingsScraper(BaseScraper):
                             context="stale_viewstate",
                         )
                         continue
+
+                    # LLM extraction path: send full HTML to LLM,
+                    # get back structured rulings with all fields.
+                    if use_llm:
+                        llm_rulings = _llm_extract_rulings(ruling_html)
+                        if llm_rulings is not None:
+                            for ruling in llm_rulings:
+                                doc = self._make_base_doc(
+                                    source_url=CIVIL_URL,
+                                    raw_content=ruling_html.encode("utf-8"),
+                                    content_format=ContentFormat.HTML,
+                                )
+                                doc.courthouse = opt.courthouse
+                                doc.department = opt.department
+                                doc.hearing_date = opt.hearing_date
+                                doc.extra["courthouse_code"] = opt.courthouse_code
+                                doc.extra["dropdown_value"] = opt.value
+                                # Pre-populate fields from LLM extraction
+                                doc.case_number = ruling.case_number
+                                doc.ruling_text = ruling.ruling_text
+                                doc.case_title = ruling.case_title
+                                doc.motion_type = ruling.motion_type
+                                doc.outcome = ruling.outcome
+                                doc.parties = ruling.parties
+                                doc.extra["_llm_extracted"] = True
+                                doc.extra["pre_split"] = True
+                                doc.extra["ruling_index"] = ruling.ruling_index
+                                docs.append(doc)
+                            self._log.debug(
+                                "LLM extracted rulings",
+                                courthouse=opt.courthouse,
+                                dept=opt.department,
+                                date=str(opt.hearing_date),
+                                cases=len(llm_rulings),
+                            )
+                            continue
+                        # LLM failed — fall through to regex path
+                        self._log.warning(
+                            "LLM extraction failed, falling back to regex",
+                            courthouse=opt.courthouse,
+                            dept=opt.department,
+                        )
+
+                    # Regex extraction path (default, or LLM fallback)
                     case_htmls = _split_cases_html(ruling_html)
                     for case_html in case_htmls:
                         doc = self._make_base_doc(
@@ -329,11 +613,17 @@ class LATentativeRulingsScraper(BaseScraper):
         return docs
 
     def parse_document(self, doc: CapturedDocument) -> CapturedDocument:
-        try:
-            soup = BeautifulSoup(doc.raw_content, "lxml")
-            _extract_ruling_fields(soup, doc)
-        except Exception as exc:
-            self._log.warning("Parse error", error=str(exc))
+        if doc.extra.get("_llm_extracted"):
+            # LLM-extracted docs may have some fields as None.
+            # Run regex extraction as a fallback for null fields only,
+            # preserving any non-null LLM-extracted values (#1938).
+            _apply_regex_fallback_for_llm_doc(doc, self._log)
+        else:
+            try:
+                soup = BeautifulSoup(doc.raw_content, "lxml")
+                _extract_ruling_fields(soup, doc)
+            except Exception as exc:
+                self._log.warning("Parse error", error=str(exc))
 
         # Fallback: if ruling text didn't contain a judge name, try the
         # department-to-judge mapping from the judicial officer directory.
@@ -554,6 +844,103 @@ def _split_cases_html_cached(ruling_html: str) -> tuple[str, ...]:
         return ()
 
     return tuple(result)
+
+
+def _apply_regex_fallback_for_llm_doc(
+    doc: CapturedDocument,
+    log: structlog.stdlib.BoundLogger,
+) -> None:
+    """Apply regex extraction as fallback for null fields on LLM-extracted docs.
+
+    When the LLM extracts a ruling but leaves some fields as ``None``, we
+    run the regex-based ``_extract_ruling_fields()`` on the correct per-case
+    HTML chunk and use its results to fill in only the missing fields.
+    Non-null LLM values are always preserved.
+
+    For multi-case department pages, ``_split_cases_html()`` splits the full
+    HTML into per-case chunks, and the ``ruling_index`` stored in
+    ``doc.extra`` selects the correct chunk.  This prevents cross-case
+    contamination (e.g. extracting the first case's title for the second
+    case's document).  If the correct chunk cannot be identified, the
+    fallback is aborted to avoid data corruption.
+    """
+    fallback_fields = ("case_number", "case_title", "ruling_text", "judge_name")
+    needs_fallback = any(getattr(doc, f) is None for f in fallback_fields)
+    needs_party_fallback = not doc.parties
+
+    if not needs_fallback and not needs_party_fallback:
+        log.debug(
+            "LLM doc has all fields; skipping regex fallback",
+            case_number=doc.case_number,
+        )
+        return
+
+    # Determine the correct HTML chunk for this specific ruling.
+    # Always use _split_cases_html() to get clean per-case chunks,
+    # then select the right one via ruling_index.
+    case_htmls = _split_cases_html(doc.raw_content.decode("utf-8", "ignore"))
+
+    if not case_htmls:
+        log.warning(
+            "Cannot apply regex fallback: no case chunks found",
+            case_number=doc.case_number,
+        )
+        return
+
+    # Default to index 1 for single-case pages where ruling_index
+    # may not be explicitly set.
+    ruling_index = doc.extra.get("ruling_index", 1)
+    if not (isinstance(ruling_index, int) and 1 <= ruling_index <= len(case_htmls)):
+        log.warning(
+            "Cannot apply regex fallback: ruling_index out of bounds",
+            case_number=doc.case_number,
+            ruling_index=ruling_index,
+            num_chunks=len(case_htmls),
+        )
+        return
+
+    html_content = case_htmls[ruling_index - 1].encode("utf-8")
+    log.debug(
+        "Using ruling_index to select HTML chunk for fallback",
+        ruling_index=ruling_index,
+        num_chunks=len(case_htmls),
+    )
+
+    # Save the complete original state of all modifiable fields so we
+    # can restore to the exact pre-call state if regex extraction fails.
+    all_restorable = list(fallback_fields) + ["parties"]
+    original_state: dict[str, object] = {f: getattr(doc, f, None) for f in all_restorable}
+
+    # Also track which LLM-extracted values are non-null so we can
+    # restore them after a successful regex extraction (LLM takes precedence).
+    saved: dict[str, object] = {}
+    for f in fallback_fields:
+        val = getattr(doc, f)
+        if val is not None:
+            saved[f] = val
+    if doc.parties:
+        saved["parties"] = doc.parties
+
+    try:
+        soup = BeautifulSoup(html_content, "lxml")
+        _extract_ruling_fields(soup, doc)
+    except Exception as exc:
+        log.warning("Regex fallback for LLM doc failed", error=str(exc))
+        # Restore document to its exact pre-call state to avoid
+        # partial/corrupt data from a failed regex extraction.
+        for f, val in original_state.items():
+            setattr(doc, f, val)
+        return
+
+    # Restore non-null LLM values (they take precedence over regex).
+    for f, val in saved.items():
+        setattr(doc, f, val)
+
+    log.debug(
+        "Applied regex fallback for LLM doc",
+        case_number=doc.case_number,
+        backfilled=[f for f in fallback_fields if f not in saved],
+    )
 
 
 def _extract_ruling_fields(soup: BeautifulSoup, doc: CapturedDocument) -> None:
