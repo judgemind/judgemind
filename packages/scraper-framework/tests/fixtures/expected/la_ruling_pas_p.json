@@ -18,5 +18,17 @@
     "DEPARTMENT P LAW AND MOTION RULINGS",
     "DENIED"
   ],
+  "cases": [
+    {
+      "case_number": "25NNCV00140",
+      "case_title": "Wu v. Pak",
+      "outcome": "denied",
+      "motion_type": "other",
+      "parties": [
+        {"name": "Sai K. Wu", "role": "plaintiff"},
+        {"name": "Shane S. Pak", "role": "defendant"}
+      ]
+    }
+  ],
   "_notes": "Alphanumeric department code (letter only). Single case. Motion for Reconsideration denied."
 }

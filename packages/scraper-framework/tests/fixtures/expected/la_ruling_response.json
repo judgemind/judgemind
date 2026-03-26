@@ -20,5 +20,26 @@
     "GRANTED",
     "Case Number"
   ],
+  "cases": [
+    {
+      "case_number": "24NNCV02551",
+      "case_title": "Aasi v. American Honda Motor Co.",
+      "outcome": "granted",
+      "motion_type": "motion_to_compel",
+      "parties": [
+        {"name": "Sumayya Aasi", "role": "plaintiff"},
+        {"name": "American Honda Motor Co., Inc.", "role": "defendant"}
+      ]
+    },
+    {
+      "case_number": "26NNCP00062",
+      "case_title": "Mic-Bry8, LLC",
+      "outcome": "granted",
+      "motion_type": "petition",
+      "parties": [
+        {"name": "Mic-Bry8, LLC", "role": "petitioner"}
+      ]
+    }
+  ],
   "_notes": "Multi-case response. Both NNCV (civil) and NNCP (probate/complex?) case types present. Judge name in 'X Judge of the Superior Court' div."
 }

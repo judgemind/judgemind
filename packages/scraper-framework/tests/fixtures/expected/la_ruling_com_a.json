@@ -18,5 +18,17 @@
     "DEPARTMENT A LAW AND MOTION RULINGS",
     "submit on the tentative"
   ],
+  "cases": [
+    {
+      "case_number": "23CMCV01566",
+      "case_title": "Keichline v. Ashley Willowbrook LP",
+      "outcome": "denied",
+      "motion_type": "msj",
+      "parties": [
+        {"name": "David Keichline", "role": "plaintiff"},
+        {"name": "Ashley Willowbrook LP", "role": "defendant"}
+      ]
+    }
+  ],
   "_notes": "Compton courthouse. Department A (letter-only). Includes submission instructions."
 }

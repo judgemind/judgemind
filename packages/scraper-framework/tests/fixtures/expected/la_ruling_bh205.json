@@ -11,12 +11,34 @@
     "22SMCV01940",
     "25SMCV01132"
   ],
-  "judge_name": null,
+  "judge_name": "Edward B. Moreton, Jr.",
   "hearing_date": "2026-03-03",
   "courthouse": "Beverly Hills Courthouse",
   "department": "205",
   "ruling_text_contains": [
     "DEPARTMENT 205 LAW AND MOTION RULINGS"
   ],
-  "_notes": "Beverly Hills uses 'BH ' (with trailing space) as courthouse code. Judge name not in standard format for this dept. Future date (posted day before hearing)."
+  "cases": [
+    {
+      "case_number": "22SMCV01940",
+      "case_title": "Polone v. Shawmut Woodworking & Supply, Inc.",
+      "outcome": "denied",
+      "motion_type": "other",
+      "parties": [
+        {"name": "Gavin Polone", "role": "plaintiff"},
+        {"name": "Shawmut Woodworking & Supply, Inc.", "role": "defendant"}
+      ]
+    },
+    {
+      "case_number": "25SMCV01132",
+      "case_title": "Porsche Leasing Ltd. v. Mikia",
+      "outcome": "granted",
+      "motion_type": "default_judgment",
+      "parties": [
+        {"name": "Porsche Leasing Ltd.", "role": "plaintiff"},
+        {"name": "Tsisana Mikia", "role": "defendant"}
+      ]
+    }
+  ],
+  "_notes": "Beverly Hills uses 'BH ' (with trailing space) as courthouse code. Judge signature in text as 'Edward B. Moreton, Jr. Judge of the Superior Court'. Future date (posted day before hearing)."
 }
