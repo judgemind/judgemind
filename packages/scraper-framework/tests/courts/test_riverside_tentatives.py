@@ -2140,3 +2140,342 @@ def test_riv_fetch_documents_llm_single_ruling_not_split(
     assert len(docs) == _RIV_EXPECTED_PROCESSED_PDFS
     # Should NOT have pre_split flag
     assert all(not d.extra.get("pre_split") for d in docs)
+
+
+# ---------------------------------------------------------------------------
+# LLM extraction — full legal analysis capture (#1948)
+# ---------------------------------------------------------------------------
+
+
+class TestLlmExtractFullAnalysis:
+    """Verify the LLM extraction captures the FULL legal analysis, not just
+    the disposition summary line (#1948).
+
+    The root cause was that Riverside PDFs have a two-layer structure:
+    1. Calendar entry with a brief disposition ("DENY Defendant's MSJ")
+    2. Detailed legal analysis spanning multiple pages (legal standards,
+       case citations, evidence discussion, reasoning)
+
+    The LLM prompt must instruct the model to capture BOTH layers.
+    """
+
+    # Synthetic PDF text mimicking the two-layer structure described in #1948.
+    # Entry #1 is a short motion, entries #2-3 are short, entry #4 has a
+    # multi-page detailed analysis.
+    _MULTIPAGE_TEXT = (
+        "Tentative Rulings for March 25, 2026\n"
+        "Department 3\n"
+        "Honorable Jane Smith\n\n"
+        "Oral argument may be requested by emailing the clerk.\n"
+        "Page 1 of 5\n\n"
+        "1.\n"
+        "CVPS2305159 BRAVO vs BRAVO  Motion to Set Aside\n"
+        "Tentative Ruling: GRANT the Motion to Set Aside Default.\n\n"
+        "2.\n"
+        "CVRI2403055 HULL vs GENERAL MOTORS  Motion to Compel\n"
+        "Tentative Ruling: Motion is GRANTED. Defendant to respond "
+        "within 30 days.\n\n"
+        "3.\n"
+        "CVRI2404378 GARCIA vs MARTINEZ  Motion to Continue\n"
+        "Tentative Ruling: Motion is continued to April 15, 2026.\n\n"
+        "4.\n"
+        "CVRI2501693 JONES vs JONES  Motion for Summary Judgment\n"
+        "Tentative Ruling: DENY Defendant's Motion for Summary "
+        "Judgment/Adjudication.\n\n"
+        "Page 2 of 5\n\n"
+        "LEGAL STANDARD\n\n"
+        "A motion for summary judgment shall be granted if all the papers "
+        "submitted show that there is no triable issue as to any material "
+        "fact and that the moving party is entitled to a judgment as a "
+        "matter of law. (Code Civ. Proc., section 437c, subd. (c).) A "
+        "defendant moving for summary judgment bears the initial burden "
+        "of showing that a cause of action has no merit by showing that "
+        "one or more of the elements of the cause of action cannot be "
+        "established or that there is a complete defense to that cause "
+        "of action. (Code Civ. Proc., section 437c, subd. (p)(2).) "
+        "Once the defendant has met that burden, the burden shifts to "
+        "the plaintiff to show that a triable issue of one or more "
+        "material facts exists as to that cause of action or defense "
+        "thereto. (Aguilar v. Atlantic Richfield Co. (2001) 25 Cal.4th "
+        "826, 849.)\n\n"
+        "Page 3 of 5\n\n"
+        "ANALYSIS\n\n"
+        "I. Defendant's Burden of Proof\n\n"
+        "Defendant argues that Plaintiff cannot establish the existence "
+        "of a valid contract because the alleged agreement was oral and "
+        "therefore barred by the statute of frauds. However, Defendant "
+        "has failed to provide evidence negating the contract element. "
+        "A defendant cannot simply assert that plaintiff lacks evidence "
+        "without affirmatively demonstrating the absence of a triable "
+        "issue. (See Aguilar, supra, 25 Cal.4th at p. 850.)\n\n"
+        "II. Statute of Frauds Defense\n\n"
+        "Even assuming the statute of frauds applies, Defendant has not "
+        "addressed the doctrine of part performance, which takes an oral "
+        "agreement outside the statute. (See Byrne v. Laura (1997) "
+        "52 Cal.App.4th 1054, 1068.) Where a party has performed under "
+        "an oral contract and the other party has accepted the benefits, "
+        "the statute of frauds does not bar enforcement. (Monarco v. "
+        "Lo Greco (1950) 35 Cal.2d 621, 623.)\n\n"
+        "Page 4 of 5\n\n"
+        "III. Right of First Refusal Analysis\n\n"
+        "Plaintiff alleges a right of first refusal (ROFR) triggered by "
+        "Defendant's attempt to sell the property. The evidence shows:\n"
+        "- The parties discussed a ROFR during their February 2024 "
+        "meeting (Jones Decl., paragraph 12)\n"
+        "- Defendant listed the property for sale in October 2025 "
+        "without notifying Plaintiff (Exhibit D)\n"
+        "- Plaintiff tendered a matching offer within 10 days of "
+        "learning of the listing (Exhibit E)\n\n"
+        "Defendant has not met the burden of showing that the ROFR "
+        "was not triggered or that Plaintiff failed to exercise it "
+        "properly.\n\n"
+        "IV. Conclusion\n\n"
+        "Defendant has failed to carry the initial burden of proof on "
+        "summary judgment. The motion is DENIED in its entirety.\n\n"
+        "Page 5 of 5\n"
+    )
+
+    # The full analysis text that the LLM should capture for entry #4.
+    # This is everything from the "Tentative Ruling:" line through the
+    # conclusion, with Page footers stripped.
+    _FULL_ANALYSIS_TEXT = (
+        "DENY Defendant's Motion for Summary Judgment/Adjudication.\n\n"
+        "LEGAL STANDARD\n\n"
+        "A motion for summary judgment shall be granted if all the papers "
+        "submitted show that there is no triable issue as to any material "
+        "fact and that the moving party is entitled to a judgment as a "
+        "matter of law. (Code Civ. Proc., section 437c, subd. (c).) A "
+        "defendant moving for summary judgment bears the initial burden "
+        "of showing that a cause of action has no merit by showing that "
+        "one or more of the elements of the cause of action cannot be "
+        "established or that there is a complete defense to that cause "
+        "of action. (Code Civ. Proc., section 437c, subd. (p)(2).) "
+        "Once the defendant has met that burden, the burden shifts to "
+        "the plaintiff to show that a triable issue of one or more "
+        "material facts exists as to that cause of action or defense "
+        "thereto. (Aguilar v. Atlantic Richfield Co. (2001) 25 Cal.4th "
+        "826, 849.)\n\n"
+        "ANALYSIS\n\n"
+        "I. Defendant's Burden of Proof\n\n"
+        "Defendant argues that Plaintiff cannot establish the existence "
+        "of a valid contract because the alleged agreement was oral and "
+        "therefore barred by the statute of frauds. However, Defendant "
+        "has failed to provide evidence negating the contract element. "
+        "A defendant cannot simply assert that plaintiff lacks evidence "
+        "without affirmatively demonstrating the absence of a triable "
+        "issue. (See Aguilar, supra, 25 Cal.4th at p. 850.)\n\n"
+        "II. Statute of Frauds Defense\n\n"
+        "Even assuming the statute of frauds applies, Defendant has not "
+        "addressed the doctrine of part performance, which takes an oral "
+        "agreement outside the statute. (See Byrne v. Laura (1997) "
+        "52 Cal.App.4th 1054, 1068.) Where a party has performed under "
+        "an oral contract and the other party has accepted the benefits, "
+        "the statute of frauds does not bar enforcement. (Monarco v. "
+        "Lo Greco (1950) 35 Cal.2d 621, 623.)\n\n"
+        "III. Right of First Refusal Analysis\n\n"
+        "Plaintiff alleges a right of first refusal (ROFR) triggered by "
+        "Defendant's attempt to sell the property. The evidence shows:\n"
+        "- The parties discussed a ROFR during their February 2024 "
+        "meeting (Jones Decl., paragraph 12)\n"
+        "- Defendant listed the property for sale in October 2025 "
+        "without notifying Plaintiff (Exhibit D)\n"
+        "- Plaintiff tendered a matching offer within 10 days of "
+        "learning of the listing (Exhibit E)\n\n"
+        "Defendant has not met the burden of showing that the ROFR "
+        "was not triggered or that Plaintiff failed to exercise it "
+        "properly.\n\n"
+        "IV. Conclusion\n\n"
+        "Defendant has failed to carry the initial burden of proof on "
+        "summary judgment. The motion is DENIED in its entirety."
+    )
+
+    def test_llm_prompt_instructs_full_analysis_capture(self) -> None:
+        """The system prompt explicitly instructs capture of full legal analysis (#1948)."""
+        from courts.ca.riverside_tentatives import RIVERSIDE_SYSTEM_PROMPT
+
+        # Prompt must mention the two-layer structure
+        assert "two-layer" in RIVERSIDE_SYSTEM_PROMPT.lower()
+        assert "detailed analysis" in RIVERSIDE_SYSTEM_PROMPT.lower()
+        # Prompt must warn against truncation
+        assert "truncat" in RIVERSIDE_SYSTEM_PROMPT.lower()
+        # Prompt must mention that short ruling_text is wrong
+        assert "200 characters" in RIVERSIDE_SYSTEM_PROMPT.lower()
+
+    def test_llm_extract_full_analysis_not_just_disposition(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """_llm_extract_rulings returns full analysis text, not just disposition (#1948).
+
+        Simulates the LLM correctly returning the full analysis for a
+        multi-page MSJ ruling. Verifies the SplitRuling contains the
+        complete text including legal standards, case citations, and reasoning.
+        """
+        from ingestion.llm_providers import LLMResponse
+
+        monkeypatch.setattr(
+            "courts.ca.riverside_tentatives._llm_extract_rulings",
+            _llm_extract_rulings,
+        )
+
+        # LLM response includes the full analysis for entry #4
+        llm_response = json.dumps(
+            {
+                "extracted_judge_name": "Jane Smith",
+                "hearing_date": "2026-03-25",
+                "department": "3",
+                "rulings": [
+                    {
+                        "extracted_case_number": "CVPS2305159",
+                        "extracted_case_title": "Bravo v. Bravo",
+                        "case_type": "civil",
+                        "outcome": "granted",
+                        "motion_type": "motion to set aside",
+                        "ruling_text": "GRANT the Motion to Set Aside Default.",
+                    },
+                    {
+                        "extracted_case_number": "CVRI2403055",
+                        "extracted_case_title": "Hull v. General Motors",
+                        "case_type": "civil",
+                        "outcome": "granted",
+                        "motion_type": "motion to compel",
+                        "ruling_text": ("Motion is GRANTED. Defendant to respond within 30 days."),
+                    },
+                    {
+                        "extracted_case_number": "CVRI2404378",
+                        "extracted_case_title": "Garcia v. Martinez",
+                        "case_type": "civil",
+                        "outcome": "continued",
+                        "motion_type": "motion to continue",
+                        "ruling_text": "Motion is continued to April 15, 2026.",
+                    },
+                    {
+                        "extracted_case_number": "CVRI2501693",
+                        "extracted_case_title": "Jones v. Jones",
+                        "case_type": "civil",
+                        "outcome": "denied",
+                        "motion_type": "msj",
+                        "ruling_text": self._FULL_ANALYSIS_TEXT,
+                    },
+                ],
+            }
+        )
+
+        mock_response = LLMResponse(
+            text=llm_response,
+            input_tokens=2000,
+            output_tokens=3000,
+        )
+        with patch("ingestion.llm_providers.call_llm", return_value=mock_response):
+            rulings = _llm_extract_rulings(self._MULTIPAGE_TEXT)
+
+        assert rulings is not None
+        assert len(rulings) == 4
+
+        # Entry #1: short motion — correctly captured
+        assert rulings[0].case_number == "CVPS2305159"
+        assert rulings[0].ruling_text == "GRANT the Motion to Set Aside Default."
+
+        # Entry #4: MSJ with full analysis — the critical test
+        msj_ruling = rulings[3]
+        assert msj_ruling.case_number == "CVRI2501693"
+        assert msj_ruling.case_title == "Jones v. Jones"
+        assert msj_ruling.outcome == "denied"
+        assert msj_ruling.motion_type == "msj"
+
+        # Full analysis must be present, not just the disposition line
+        assert len(msj_ruling.ruling_text) > 2000  # full analysis, not 121 chars
+        assert "LEGAL STANDARD" in msj_ruling.ruling_text
+        assert "Code Civ. Proc., section 437c" in msj_ruling.ruling_text
+        assert "Aguilar v. Atlantic Richfield" in msj_ruling.ruling_text
+        assert "Byrne v. Laura" in msj_ruling.ruling_text
+        assert "Monarco v. Lo Greco" in msj_ruling.ruling_text
+        assert "right of first refusal" in msj_ruling.ruling_text.lower()
+        assert "DENIED in its entirety" in msj_ruling.ruling_text
+
+    def test_llm_extract_no_cross_contamination(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Each ruling's text belongs to the correct case, not another (#1948).
+
+        Verifies that entry #1's short ruling is not contaminated with
+        entry #4's multi-page analysis, and vice versa.
+        """
+        from ingestion.llm_providers import LLMResponse
+
+        monkeypatch.setattr(
+            "courts.ca.riverside_tentatives._llm_extract_rulings",
+            _llm_extract_rulings,
+        )
+
+        llm_response = json.dumps(
+            {
+                "rulings": [
+                    {
+                        "extracted_case_number": "CVPS2305159",
+                        "ruling_text": "GRANT the Motion to Set Aside Default.",
+                        "outcome": "granted",
+                    },
+                    {
+                        "extracted_case_number": "CVRI2501693",
+                        "ruling_text": self._FULL_ANALYSIS_TEXT,
+                        "outcome": "denied",
+                    },
+                ],
+            }
+        )
+
+        mock_response = LLMResponse(
+            text=llm_response,
+            input_tokens=1000,
+            output_tokens=2000,
+        )
+        with patch("ingestion.llm_providers.call_llm", return_value=mock_response):
+            rulings = _llm_extract_rulings("some pdf text")
+
+        assert rulings is not None
+        assert len(rulings) == 2
+
+        # Entry #1 (CVPS2305159) should NOT contain MSJ analysis text
+        assert "Aguilar" not in rulings[0].ruling_text
+        assert "summary judgment" not in rulings[0].ruling_text.lower()
+        assert "LEGAL STANDARD" not in rulings[0].ruling_text
+
+        # Entry #2 (CVRI2501693) should contain full analysis
+        assert "Aguilar" in rulings[1].ruling_text
+        assert "LEGAL STANDARD" in rulings[1].ruling_text
+        # And should NOT contain entry #1's text
+        assert "Set Aside Default" not in rulings[1].ruling_text
+
+    def test_regex_fallback_captures_full_analysis(self) -> None:
+        """The regex fallback (_split_rulings) also captures the full analysis (#1948).
+
+        When the LLM extraction fails, the regex splitter should still
+        capture the complete multi-page analysis for the last entry.
+        """
+        rulings = _split_rulings(self._MULTIPAGE_TEXT)
+        assert len(rulings) == 4
+
+        # Entry #1: short motion
+        assert rulings[0].case_number == "CVPS2305159"
+        assert "Set Aside" in rulings[0].ruling_text
+
+        # Entry #4: MSJ with full analysis
+        msj_ruling = rulings[3]
+        assert msj_ruling.case_number == "CVRI2501693"
+        assert len(msj_ruling.ruling_text) > 2000
+        assert "LEGAL STANDARD" in msj_ruling.ruling_text
+        assert "Aguilar v. Atlantic Richfield" in msj_ruling.ruling_text
+        assert "Byrne v. Laura" in msj_ruling.ruling_text
+        assert "DENIED in its entirety" in msj_ruling.ruling_text
+
+        # Entry #4's text should NOT contain text from other entries
+        assert "CVPS2305159" not in msj_ruling.ruling_text
+        assert "CVRI2403055" not in msj_ruling.ruling_text
+        assert "CVRI2404378" not in msj_ruling.ruling_text
+
+    def test_max_tokens_sufficient_for_long_analysis(self) -> None:
+        """The LLM call uses sufficient max_tokens for long analyses (#1948)."""
+        # Read the source to verify the max_tokens value
+        import inspect
+
+        source = inspect.getsource(_llm_extract_rulings)
+        # max_tokens should be at least 16384 to handle multi-page analyses
+        assert "max_tokens=32768" in source

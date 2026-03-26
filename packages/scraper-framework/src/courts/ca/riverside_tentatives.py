@@ -525,14 +525,32 @@ RIVERSIDE_SYSTEM_PROMPT = (
     "   - Motion description (e.g., 'Hearing re: Demurrer on 1st "
     "Amended Complaint')\n"
     "   - 'Tentative Ruling:' followed by the ruling text\n"
-    "3. **Cross-references**: Some entries may reference another entry "
+    "3. **IMPORTANT — Two-layer structure**: Riverside PDFs have a "
+    "TWO-LAYER structure for substantive motions (MSJ, demurrers, "
+    "motions to strike, etc.):\n"
+    "   - **Layer 1 (calendar table)**: A brief disposition summary "
+    "line after 'Tentative Ruling:', e.g., 'DENY Defendant's "
+    "Motion for Summary Judgment' — typically one sentence.\n"
+    "   - **Layer 2 (detailed analysis)**: The judge's FULL legal "
+    "analysis follows below the summary, often spanning MULTIPLE "
+    "PAGES. This includes: legal standards (e.g., CCP section "
+    "437c), analysis of burden of proof, discussion of evidence, "
+    "case law citations (e.g., Aguilar v. Atlantic Richfield, "
+    "Byrne v. Laura), and detailed reasoning.\n"
+    "   The ruling_text MUST include BOTH layers — the brief "
+    "disposition AND the full analysis. The detailed analysis is "
+    "the most valuable content. Capturing only the disposition "
+    "summary line is WRONG. A substantive ruling (MSJ, demurrer) "
+    "that is only one or two sentences long is almost certainly "
+    "truncated — look for the full analysis that follows.\n"
+    "4. **Cross-references**: Some entries may reference another entry "
     "with phrases like 'See #1 Above', 'See No. 3 above', or 'Same "
     "as #2'. These are SEPARATE entries that must be counted "
     "individually — they are distinct cases even though they share "
     "ruling text.\n"
-    "4. **Page breaks**: Rulings may span multiple pages. 'Page N of M' "
+    "5. **Page breaks**: Rulings may span multiple pages. 'Page N of M' "
     "footers appear at the bottom of each page.\n"
-    "5. **No tentative rulings**: Some PDFs contain only 'No Tentative "
+    "6. **No tentative rulings**: Some PDFs contain only 'No Tentative "
     "Rulings for [date]' or 'No Tentative Rulings [date]' with "
     "boilerplate text. These have zero cases.\n\n"
     "## Case Number Formats\n\n"
@@ -549,8 +567,13 @@ RIVERSIDE_SYSTEM_PROMPT = (
     "with their OWN case number — do NOT skip them or merge them.\n"
     "3. Extract the case number EXACTLY as it appears.\n"
     "4. For case_title, use 'Plaintiff v. Defendant' format.\n"
-    "5. For ruling_text, include the FULL text of the ruling after "
-    "'Tentative Ruling:'. Preserve it VERBATIM.\n"
+    "5. For ruling_text, include the COMPLETE ruling text — the "
+    "disposition summary AND the full legal analysis that follows "
+    "it. Include ALL pages of analysis, legal standards, case "
+    "citations, evidence discussion, and reasoning. Do NOT truncate "
+    "or summarize. Preserve the text VERBATIM. A ruling_text under "
+    "200 characters for a substantive motion (MSJ, demurrer, motion "
+    "to strike) is almost certainly incomplete.\n"
     "6. Skip the header boilerplate (oral argument instructions, "
     "phone numbers, URLs, etc.) — only extract from the numbered "
     "entries.\n"
@@ -626,8 +649,8 @@ def _llm_extract_rulings(text: str) -> list[SplitRuling] | None:
         user_message=text,
         provider=_RIV_LLM_PROVIDER,
         model=_RIV_LLM_MODEL,
-        max_tokens=8192,
-        timeout=30.0,
+        max_tokens=32768,
+        timeout=60.0,
     )
 
     if response is None:
