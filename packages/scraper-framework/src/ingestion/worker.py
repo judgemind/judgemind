@@ -19,6 +19,9 @@ Environment variables:
     HEARTBEAT_LOG_LEVEL — Log level for heartbeat messages: "DEBUG" or "INFO" (default: "INFO")
     ENABLE_RULING_FORMATTING — Enable LLM-powered ruling text formatting (default: disabled)
     ENABLE_RULING_SUMMARIZATION — Enable LLM-powered ruling summarization (default: disabled)
+    ENABLE_INGESTION_VALIDATION — Enable LLM-based validation gate (default: disabled)
+    GITHUB_TOKEN   — GitHub token for auto-filing validation issues (optional)
+    GITHUB_REPO    — GitHub repo for validation issues (default: judgemind/judgemind)
 """
 
 from __future__ import annotations
@@ -43,6 +46,8 @@ from framework.enrichment import EnrichmentEngine
 from framework.llm_extractor import LlmExtractor
 from framework.search.indexer import IndexingConsumer
 from framework.search.mapping import TENTATIVE_RULINGS_ALIAS
+from validation.gate import ValidationResult, insert_validation_result, validate_document
+from validation.issue_filer import file_validation_issue
 
 from .db import (
     batch_upsert_parties,
@@ -274,6 +279,28 @@ class IngestionWorker:
                     "summarization disabled"
                 )
 
+        # Ingestion validation gate — LLM-based quality checks between
+        # enrichment and DB write. Uses a dedicated Anthropic client (always
+        # Haiku), separate from extraction and formatting.
+        self._validation_enabled = os.environ.get("ENABLE_INGESTION_VALIDATION", "").lower() in (
+            "1",
+            "true",
+            "yes",
+        )
+        self._validation_client: object | None = None
+        if self._validation_enabled:
+            self._validation_client = create_llm_client(provider="anthropic")
+            if self._validation_client is None:
+                logger.warning(
+                    "Ingestion validation enabled but ANTHROPIC_API_KEY not set — "
+                    "validation disabled"
+                )
+                self._validation_enabled = False
+
+        # Reusable httpx client for GitHub issue filing (validation gate).
+        # Created lazily on first use; None means "not yet created".
+        self._github_client: object | None = None
+
         # Framework-level LLM extractor — lazy-initialized on first use.
         # Uses the Anthropic API (always Haiku) and is separate from the
         # per-field LLM client above.
@@ -329,6 +356,48 @@ class IngestionWorker:
                 )
         return self._multimodal_extractor
 
+    def _file_validation_issue(
+        self,
+        *,
+        result: str,
+        reason: str,
+        county: str,
+        case_number: str | None,
+        document_id: str,
+        s3_key: str | None,
+        ruling_text_excerpt: str | None,
+        extracted_fields: dict[str, Any] | None,
+    ) -> None:
+        """File a GitHub issue for a validation flag/fail result.
+
+        Creates the httpx client lazily on first use for connection reuse.
+        Never raises — issue filing failures are logged but do not block
+        ingestion.
+        """
+        import httpx as _httpx
+
+        if self._github_client is None:
+            self._github_client = _httpx.Client(timeout=30.0)
+
+        try:
+            file_validation_issue(
+                result=result,
+                reason=reason,
+                county=county,
+                case_number=case_number,
+                document_id=document_id,
+                s3_key=s3_key,
+                ruling_text_excerpt=ruling_text_excerpt,
+                extracted_fields=extracted_fields,
+                http_client=self._github_client,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Failed to file validation issue: %s",
+                exc,
+                extra={"document_id": document_id, "result": result},
+            )
+
     def _get_la_dept_map(self) -> dict[str, str]:
         """Return the LA County department-to-judge mapping, fetching lazily on first call.
 
@@ -369,7 +438,7 @@ class IngestionWorker:
         return self._conn
 
     def close(self) -> None:
-        """Close the persistent Postgres connection if open.
+        """Close the persistent Postgres connection and httpx client if open.
 
         Safe to call multiple times. Called automatically when the worker
         shuts down via ``run()``.
@@ -377,6 +446,12 @@ class IngestionWorker:
         if self._conn is not None and not self._conn.closed:
             self._conn.close()
             self._conn = None
+        if self._github_client is not None:
+            import httpx as _httpx
+
+            if isinstance(self._github_client, _httpx.Client):
+                self._github_client.close()
+            self._github_client = None
 
     def health_check(self) -> None:
         """Verify DB connectivity and that required tables exist.
@@ -941,6 +1016,102 @@ class IngestionWorker:
                 },
             )
 
+        # ------------------------------------------------------------------
+        # Validation gate — LLM-based quality check (opt-in via
+        # ENABLE_INGESTION_VALIDATION). Runs between enrichment and DB write.
+        # On fail: skip DB write entirely. On error: treat as pass.
+        # ------------------------------------------------------------------
+        validation_result: ValidationResult | None = None
+        if self._validation_enabled:
+            hearing_date_str = str(hearing_dt) if hearing_dt else None
+            validation_result = validate_document(
+                ruling_text=cleaned_ruling_text,
+                case_number=case_number,
+                case_title=case_title,
+                judge_name=judge_name,
+                motion_type=motion_type,
+                outcome=outcome,
+                hearing_date=hearing_date_str,
+                department=department,
+                county=county,
+                client=self._validation_client,
+                provider="anthropic",
+                timeout=self._llm_timeout,
+            )
+
+            logger.info(
+                "Validation gate result",
+                extra={
+                    "document_id": document_id,
+                    "validation_result": validation_result.result,
+                    "validation_reason": validation_result.reason,
+                    "validation_model": validation_result.model,
+                    "validation_latency_ms": validation_result.latency_ms,
+                    "validation_input_tokens": validation_result.input_tokens,
+                    "validation_output_tokens": validation_result.output_tokens,
+                },
+            )
+
+            # Auto-file GitHub issues for flag/fail results.
+            if validation_result.result in ("flag", "fail"):
+                extracted_fields = {
+                    "case_number": case_number,
+                    "case_title": case_title,
+                    "judge_name": judge_name,
+                    "motion_type": motion_type,
+                    "outcome": outcome,
+                    "hearing_date": hearing_date_str,
+                    "department": department,
+                }
+                try:
+                    self._file_validation_issue(
+                        result=validation_result.result,
+                        reason=validation_result.reason or "Unknown reason",
+                        county=county,
+                        case_number=case_number,
+                        document_id=document_id,
+                        s3_key=s3_key,
+                        ruling_text_excerpt=(
+                            cleaned_ruling_text[:200] if cleaned_ruling_text else None
+                        ),
+                        extracted_fields=extracted_fields,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Issue filing failed (outer catch): %s",
+                        exc,
+                        extra={"document_id": document_id},
+                    )
+
+            # On fail: skip DB write entirely. Log and return.
+            if validation_result.result == "fail":
+                logger.warning(
+                    "Validation FAIL — skipping DB write",
+                    extra={
+                        "document_id": document_id,
+                        "validation_reason": validation_result.reason,
+                        "county": county,
+                        "case_number": case_number,
+                    },
+                )
+                # Still log the validation result to the DB (validation_results
+                # table only — not the ruling itself).
+                try:
+                    conn = self._get_connection()
+                    insert_validation_result(
+                        conn,
+                        document_id=document_id,
+                        ruling_id=None,
+                        result=validation_result,
+                    )
+                    conn.commit()
+                except Exception as exc:
+                    logger.warning(
+                        "Failed to log validation result to DB: %s",
+                        exc,
+                    )
+                return
+
         # For split events, each split ruling gets its own document row keyed
         # by the synthetic split document_id.  This ensures the FK from
         # insert_ruling(document_id=...) is satisfied.  See #1775, PR #1755.
@@ -1090,6 +1261,15 @@ class IngestionWorker:
 
             # 6. Create party records and link to case (batched — O(1) queries)
             batch_upsert_parties(conn, case_id, parties_data)
+
+            # 7. Log validation result (if validation was run).
+            if validation_result is not None:
+                insert_validation_result(
+                    conn,
+                    document_id=document_id,
+                    ruling_id=None,
+                    result=validation_result,
+                )
 
             conn.commit()
         except Exception:

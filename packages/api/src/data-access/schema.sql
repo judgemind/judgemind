@@ -479,6 +479,33 @@ COMMENT ON COLUMN alert_events.digest_sent   IS 'FALSE = pending inclusion in ne
 
 
 -- =============================================================================
+-- INGESTION VALIDATION
+-- =============================================================================
+
+CREATE TABLE validation_results (
+    id              UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+    document_id     UUID        NOT NULL,
+    ruling_id       UUID,
+    result          TEXT        NOT NULL CHECK (result IN ('pass', 'flag', 'fail', 'error')),
+    reason          TEXT,
+    model           TEXT,
+    input_tokens    INTEGER,
+    output_tokens   INTEGER,
+    latency_ms      INTEGER,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_validation_results_result      ON validation_results(result);
+CREATE INDEX idx_validation_results_document_id ON validation_results(document_id);
+
+COMMENT ON TABLE  validation_results              IS 'LLM validation outcomes for ingested documents. One row per validation check.';
+COMMENT ON COLUMN validation_results.result       IS 'Validation outcome: pass (write normally), flag (write + review), fail (skip write), error (LLM call failed).';
+COMMENT ON COLUMN validation_results.reason       IS 'Human-readable reason for flag/fail results. NULL for pass results.';
+COMMENT ON COLUMN validation_results.model        IS 'LLM model used for validation (e.g. claude-haiku-4-5-20251001).';
+COMMENT ON COLUMN validation_results.latency_ms   IS 'Wall-clock time for the validation LLM call in milliseconds.';
+
+
+-- =============================================================================
 -- INDICES — optimized for common query patterns
 -- =============================================================================
 
