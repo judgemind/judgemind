@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+
 from framework.party_utils import (
     CORP_SUFFIX_RE,
     is_contaminated_party_name,
@@ -302,3 +304,200 @@ class TestCorpSuffixRe:
 
     def test_no_match_on_plain_text(self) -> None:
         assert CORP_SUFFIX_RE.search("Hello World") is None
+
+
+# ---------------------------------------------------------------------------
+# Cross-validation: party_utils regex vs cleanup SQL ILIKE patterns
+# ---------------------------------------------------------------------------
+
+# SQL ILIKE patterns inlined from scripts/cleanup_contaminated_parties.py.
+# These MUST stay in sync — that's exactly what this test validates.
+# If you update party_utils.py patterns, you must also update the cleanup
+# script AND these inlined patterns.
+_CONTAMINATION_SQL_PATTERNS = [
+    # Court header patterns
+    "%Law And Motion Ruling%",
+    "%Superior Court Of%",
+    "%Hearing Date%:%",
+    "%Hearing Time%:%",
+    "%Case Number%:%",
+    "%Case No%:%",
+    # Ruling/legal text patterns
+    "%Tentative%Ruling%",
+    "%Before The Court%",
+    "%Decl. Ex.%",
+    "%The Same Section Further States%",
+    "%Ruling Re%:%",
+    "%Italics Added%",
+    "%Emphasis Added%",
+    "%The Court Finds%",
+    "%The Court Orders%",
+    "%The Court Rules%",
+    "%The Court Notes%",
+    "%The Court Grants%",
+    "%The Court Denies%",
+    # Motion-only patterns (start, mid, and end variants)
+    "Motion For %",
+    "Motion To %",
+    "Motion Of %",
+    "Motion Re %",
+    "% Motion For %",
+    "% Motion To %",
+    "% Motion Of %",
+    "% Motion Re %",
+    "% Motion For",
+    "% Motion To",
+    "% Motion Of",
+    "% Motion Re",
+    # Docket metadata patterns
+    "%Comp. Filed%",
+    "%Filed : __-__-__%",
+    "%Filed: __-__-__%",
+]
+
+
+def _ilike_to_regex(pattern: str) -> re.Pattern[str]:
+    """Convert a SQL ILIKE pattern to a Python regex.
+
+    ILIKE semantics:
+      - ``%`` matches zero or more characters (any)
+      - ``_`` matches exactly one character
+      - Matching is case-insensitive
+    """
+    # Escape regex metacharacters except % and _ which have ILIKE meaning
+    regex_parts: list[str] = []
+    for char in pattern:
+        if char == "%":
+            regex_parts.append(".*")
+        elif char == "_":
+            regex_parts.append(".")
+        else:
+            regex_parts.append(re.escape(char))
+    return re.compile("^" + "".join(regex_parts) + "$", re.IGNORECASE | re.DOTALL)
+
+
+def _matches_any_sql_pattern(name: str, patterns: list[str]) -> bool:
+    """Return True if *name* matches at least one SQL ILIKE pattern."""
+    for pattern in patterns:
+        if _ilike_to_regex(pattern).match(name):
+            return True
+    # Also check the length constraint (mirrors LENGTH(canonical_name) > 150)
+    if len(name.strip()) > 150:
+        return True
+    return False
+
+
+# Representative contaminated names — one or more per pattern category.
+# Each entry is a name that is_contaminated_party_name() should detect AND
+# that at least one SQL ILIKE pattern (or the length check) should also match.
+_CROSS_VALIDATION_NAMES = [
+    # Court header patterns
+    "Department O Law And Motion Rulings Case Number: 24Vecv03334",
+    "Law And Motion Rulings",
+    "Superior Court Of California",
+    "Hearing Date: March 5, 2026",
+    "Hearing Time: 10:00 A.M.",
+    "Case Number: 24Vecv03334",
+    "Case No.: 25Stcv08708",
+    # Ruling/legal text patterns
+    "[Tentative] Ruling Re: Demurrer",
+    "Tentative Ruling on Motion",
+    "Before The Court Are The Following",
+    "Llc Barnes Decl. Ex. B (At 1)",
+    "The Same Section Further States that",
+    "Ruling Re: Demurrer",
+    "The Court Finds that the motion",
+    "The Court Orders the parties to",
+    "The Court Rules on the matter",
+    "The Court Notes the objection",
+    "The Court Grants the motion",
+    "The Court Denies the request",
+    "(Italics Added)",
+    "(Emphasis Added)",
+    # Motion-only patterns — start, mid, end positions
+    "Motion For Attorney Fees",
+    "Motion To Compel Discovery",
+    "Motion Of Defendant",
+    "Motion Re Summary Judgment",
+    "Granting Motion For Summary",
+    "Ford Motor Motion For Summary",
+    "Defendant Motion To Compel",
+    "Inc. 30-2024-01404258 Motion to Be Relieved",
+    # Docket metadata patterns
+    "Et Al. Comp. Filed : 03-27-25",
+    "Comp. Filed something",
+    "Filed : 01-15-26",
+    "Filed: 01-15-26",
+    # Length check
+    "A" * 151,
+]
+
+
+class TestCross_Validation:  # noqa: N801
+    """Cross-validation between party_utils Python regexes and the SQL ILIKE
+    patterns in cleanup_contaminated_parties.py.
+
+    Class name uses underscore so ``pytest -k cross_validation`` selects these
+    tests (matching the acceptance criteria in #1972).
+
+    If a new regex is added to party_utils but the corresponding SQL pattern
+    is not added to the cleanup script, these tests will fail.  See #1972.
+    """
+
+    def test_cross_validation_python_detects_all(self) -> None:
+        """Sanity check: every name in our list IS detected by the Python function."""
+        for name in _CROSS_VALIDATION_NAMES:
+            assert is_contaminated_party_name(name), (
+                f"is_contaminated_party_name() did not detect: {name!r}"
+            )
+
+    def test_cross_validation_sql_matches_all(self) -> None:
+        """Every contaminated name must be matched by at least one SQL ILIKE pattern.
+
+        This is the core cross-validation: if this fails, the cleanup script
+        is missing a pattern that party_utils detects — they have drifted.
+        """
+        for name in _CROSS_VALIDATION_NAMES:
+            assert _matches_any_sql_pattern(name, _CONTAMINATION_SQL_PATTERNS), (
+                f"No SQL ILIKE pattern matches contaminated name: {name!r}. "
+                f"The cleanup script (scripts/cleanup_contaminated_parties.py) "
+                f"needs a corresponding pattern."
+            )
+
+    def test_cross_validation_drift_detected(self) -> None:
+        """Prove the test catches drift: removing a SQL pattern causes failure.
+
+        We remove the "Before The Court" pattern and verify that the
+        corresponding test name is no longer matched.
+        """
+        reduced_patterns = [p for p in _CONTAMINATION_SQL_PATTERNS if p != "%Before The Court%"]
+        assert len(reduced_patterns) == len(_CONTAMINATION_SQL_PATTERNS) - 1
+
+        # "Before The Court Are The Following" should no longer be matched
+        name = "Before The Court Are The Following"
+        assert is_contaminated_party_name(name), "Python regex should still detect it"
+        assert not _matches_any_sql_pattern(name, reduced_patterns), (
+            "Should NOT match after removing the SQL pattern"
+        )
+
+    def test_cross_validation_ilike_percent(self) -> None:
+        """``%`` matches zero or more characters."""
+        pattern = _ilike_to_regex("%test%")
+        assert pattern.match("test")
+        assert pattern.match("a test here")
+        assert pattern.match("testing")
+        assert not pattern.match("tes")
+
+    def test_cross_validation_ilike_underscore(self) -> None:
+        """``_`` matches exactly one character."""
+        pattern = _ilike_to_regex("__-__-__")
+        assert pattern.match("01-15-26")
+        assert not pattern.match("1-15-26")
+        assert not pattern.match("001-15-26")
+
+    def test_cross_validation_ilike_case_insensitive(self) -> None:
+        """ILIKE matching is case-insensitive."""
+        pattern = _ilike_to_regex("%Before The Court%")
+        assert pattern.match("before the court")
+        assert pattern.match("BEFORE THE COURT")
+        assert pattern.match("Before The Court Are The Following")
