@@ -4695,7 +4695,7 @@ class TestSqlSchemaValidation:
             FROM documents d
             JOIN courts ct ON ct.id = d.court_id
             GROUP BY ct.county, d.doc_type
-        """
+        """  # sql-check:ignore — intentionally invalid SQL for testing validation
         alias_map = _extract_alias_to_table(bad_query)
         col_refs = _extract_column_references(bad_query)
 

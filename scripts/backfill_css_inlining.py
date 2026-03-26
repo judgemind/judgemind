@@ -62,9 +62,10 @@ FETCH_QUERY = """
 FETCH_QUERY_WITH_COUNTY = """
     SELECT d.id, d.s3_key, d.s3_bucket, d.source_url
     FROM documents d
+    JOIN courts ct ON ct.id = d.court_id
     WHERE d.format = 'html'
       AND d.s3_key IS NOT NULL
-      AND d.county = %s
+      AND ct.county = %s
       AND d.id > %s
     ORDER BY d.id
     LIMIT %s
@@ -80,9 +81,10 @@ COUNT_QUERY = """
 COUNT_QUERY_WITH_COUNTY = """
     SELECT COUNT(*)
     FROM documents d
+    JOIN courts ct ON ct.id = d.court_id
     WHERE d.format = 'html'
       AND d.s3_key IS NOT NULL
-      AND d.county = %s
+      AND ct.county = %s
 """
 
 
