@@ -18,5 +18,17 @@
     "DEPARTMENT F46 LAW AND MOTION RULINGS",
     "818-576-8430"
   ],
-  "_notes": "Department F46 — alphanumeric code (letter+number). Same case number appears twice: two different motions for same case. Case count=2 raw, unique_case_count=1."
+  "cases": [
+    {
+      "case_number": "21CHCV00539",
+      "case_title": "Wallis v. Rayne Dealership Corporation",
+      "outcome": "denied",
+      "motion_type": "motion_for_leave_to_amend",
+      "parties": [
+        {"name": "Daniel S. Wallis", "role": "plaintiff"},
+        {"name": "Rayne Dealership Corporation", "role": "defendant"}
+      ]
+    }
+  ],
+  "_notes": "Department F46 — alphanumeric code (letter+number). Same case number appears twice in HTML structure: two separate HTML sections for same case. From extraction standpoint, it is one ruling for one case."
 }
