@@ -650,6 +650,156 @@ class TestForceSplit:
 
 
 # ---------------------------------------------------------------------------
+# Custom system prompt support (#1728)
+# ---------------------------------------------------------------------------
+
+
+class TestCustomSystemPrompt:
+    """Verify the system_prompt parameter propagation (#1728)."""
+
+    def test_extract_passes_custom_system_prompt(self) -> None:
+        """extract() passes system_prompt through to the API call."""
+        response = _make_response(SINGLE_RULING_JSON)
+        mock_client = MagicMock()
+        mock_client.messages.create.return_value = response
+
+        with patch("framework.llm_extractor.anthropic.Anthropic", return_value=mock_client):
+            extractor = LlmExtractor(api_key="test-key")
+            rulings = extractor.extract(
+                "some text",
+                system_prompt="Custom prompt for county X",
+            )
+
+        # Verify the custom prompt was used
+        call_kwargs = mock_client.messages.create.call_args
+        assert call_kwargs.kwargs["system"] == "Custom prompt for county X"
+        assert len(rulings) == 1
+
+    def test_extract_uses_default_prompt_when_none(self) -> None:
+        """extract() uses EXTRACTION_SYSTEM_PROMPT when no custom prompt given."""
+        from framework.llm_schema import EXTRACTION_SYSTEM_PROMPT
+
+        response = _make_response(SINGLE_RULING_JSON)
+        mock_client = MagicMock()
+        mock_client.messages.create.return_value = response
+
+        with patch("framework.llm_extractor.anthropic.Anthropic", return_value=mock_client):
+            extractor = LlmExtractor(api_key="test-key")
+            extractor.extract("some text")
+
+        call_kwargs = mock_client.messages.create.call_args
+        assert call_kwargs.kwargs["system"] == EXTRACTION_SYSTEM_PROMPT
+
+
+# ---------------------------------------------------------------------------
+# Google provider support (#1728)
+# ---------------------------------------------------------------------------
+
+
+class TestGoogleProvider:
+    """Verify the Google provider path via _extract_chunk_google (#1728)."""
+
+    def test_google_provider_delegates_to_call_llm(self) -> None:
+        """Google provider path calls call_llm from ingestion.llm_providers."""
+        from ingestion.llm_providers import LLMResponse
+
+        mock_response = LLMResponse(
+            text=SINGLE_RULING_JSON,
+            input_tokens=100,
+            output_tokens=50,
+        )
+
+        with patch("framework.llm_extractor._create_google_client"):
+            extractor = LlmExtractor(provider="google", model="gemini-2.5-flash-lite")
+
+        with patch("ingestion.llm_providers.call_llm", return_value=mock_response):
+            rulings = extractor.extract("some text")
+
+        assert len(rulings) == 1
+        assert rulings[0].extracted_case_number == "2024-01393434"
+
+    def test_google_provider_returns_empty_on_api_failure(self) -> None:
+        """Google provider returns empty list when call_llm returns None."""
+        with patch("framework.llm_extractor._create_google_client"):
+            extractor = LlmExtractor(provider="google")
+
+        with patch("ingestion.llm_providers.call_llm", return_value=None):
+            rulings = extractor.extract("some text")
+
+        assert rulings == []
+
+    def test_google_provider_with_custom_system_prompt(self) -> None:
+        """Google provider passes custom system_prompt to call_llm (#1728)."""
+        from ingestion.llm_providers import LLMResponse
+
+        mock_response = LLMResponse(
+            text=SINGLE_RULING_JSON,
+            input_tokens=100,
+            output_tokens=50,
+        )
+
+        with patch("framework.llm_extractor._create_google_client"):
+            extractor = LlmExtractor(provider="google", model="gemini-2.5-flash-lite")
+
+        with patch("ingestion.llm_providers.call_llm", return_value=mock_response) as mock_call:
+            extractor.extract("some text", system_prompt="Custom Riverside prompt")
+
+        # Verify call_llm was called with the custom prompt
+        call_kwargs = mock_call.call_args
+        assert call_kwargs.kwargs["system_prompt"] == "Custom Riverside prompt"
+        assert call_kwargs.kwargs["provider"] == "google"
+        assert call_kwargs.kwargs["model"] == "gemini-2.5-flash-lite"
+
+    def test_google_provider_passes_metadata(self) -> None:
+        """Google provider passes metadata through to _parse_response (#1728)."""
+        from ingestion.llm_providers import LLMResponse
+
+        mock_response = LLMResponse(
+            text=SINGLE_RULING_JSON,
+            input_tokens=100,
+            output_tokens=50,
+        )
+
+        with patch("framework.llm_extractor._create_google_client"):
+            extractor = LlmExtractor(provider="google", model="gemini-2.5-flash-lite")
+
+        metadata = {"judge_name": "Authoritative Judge Name"}
+
+        with patch("ingestion.llm_providers.call_llm", return_value=mock_response):
+            with patch.object(extractor, "_parse_response", wraps=extractor._parse_response) as spy:
+                extractor.extract("some text", metadata=metadata)
+
+        # Verify _parse_response was called with the metadata
+        spy.assert_called_once()
+        call_args = spy.call_args
+        assert call_args[0][1] == metadata  # second positional arg is metadata
+
+    def test_google_provider_tracks_token_usage(self) -> None:
+        """Google provider updates token usage from LLMResponse."""
+        from ingestion.llm_providers import LLMResponse
+
+        mock_response = LLMResponse(
+            text=SINGLE_RULING_JSON,
+            input_tokens=500,
+            output_tokens=200,
+        )
+
+        with patch("framework.llm_extractor._create_google_client"):
+            extractor = LlmExtractor(provider="google")
+
+        with patch("ingestion.llm_providers.call_llm", return_value=mock_response):
+            with patch.object(extractor, "_log_usage") as mock_log:
+                extractor.extract("some text")
+
+        # Verify token usage was logged
+        mock_log.assert_called_once()
+        usage = mock_log.call_args[0][0]
+        assert usage.input_tokens == 500
+        assert usage.output_tokens == 200
+        assert usage.api_calls == 1
+
+
+# ---------------------------------------------------------------------------
 # Integration test placeholder (skipped without API key)
 # ---------------------------------------------------------------------------
 

@@ -306,6 +306,10 @@ class IngestionWorker:
         # per-field LLM client above.
         self._framework_extractor: LlmExtractor | None = None
 
+        # County-specific LLM extractors — keyed by (provider, model) tuple.
+        # Lazy-initialized on first use per county config.
+        self._county_extractors: dict[tuple[str, str], LlmExtractor] = {}
+
         # Multimodal LLM extractor for PDF page-image extraction (#1590).
         # Uses Google Gemini Flash Lite for cost-effective per-page extraction.
         # Lazy-initialized on first use; None means "not yet created".
@@ -355,6 +359,40 @@ class IngestionWorker:
                     exc,
                 )
         return self._multimodal_extractor
+
+    def _get_county_extractor(
+        self,
+        provider: str,
+        model: str | None,
+        max_output_tokens: int | None,
+    ) -> LlmExtractor | None:
+        """Return a county-specific LlmExtractor, creating lazily.
+
+        Caches by (provider, model) tuple so repeated calls for the same
+        county config reuse the same extractor instance.
+        """
+        cache_key = (provider, model or "")
+        if cache_key not in self._county_extractors:
+            try:
+                kwargs: dict[str, object] = {"provider": provider}
+                if model:
+                    kwargs["model"] = model
+                if max_output_tokens:
+                    kwargs["max_output_tokens"] = max_output_tokens
+                extractor = LlmExtractor(**kwargs)
+                self._county_extractors[cache_key] = extractor
+                logger.info(
+                    "Initialized county-specific LlmExtractor",
+                    extra={"provider": provider, "model": model},
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Failed to initialize county LlmExtractor: %s",
+                    exc,
+                    extra={"provider": provider, "model": model},
+                )
+                return None
+        return self._county_extractors.get(cache_key)
 
     def _file_validation_issue(
         self,
@@ -1411,11 +1449,37 @@ class IngestionWorker:
         # from multimodal extraction is authoritative — do not retry with text.
         if extracted_rulings is None and ruling_text:
             extraction_method = "llm"  # Falling back to text-based.
-            extractor = self._get_framework_extractor()
+
+            # Check for county-specific extraction config (#1728).
+            from framework.extraction_config import get_county_extraction_config
+
+            county_config = get_county_extraction_config(state, county)
+            county_prompt: str | None = None
+
+            if county_config and county_config.provider:
+                # County has a custom provider — use a dedicated extractor.
+                extractor = self._get_county_extractor(
+                    county_config.provider,
+                    county_config.model,
+                    county_config.max_output_tokens,
+                )
+                county_prompt = county_config.system_prompt
+                if county_prompt:
+                    extraction_method = "llm_county"
+            else:
+                extractor = self._get_framework_extractor()
+                if county_config and county_config.system_prompt:
+                    county_prompt = county_config.system_prompt
+                    extraction_method = "llm_county"
+
             if extractor is None:
                 return False
             try:
-                extracted_rulings = extractor.extract(ruling_text, metadata=metadata or None)
+                extracted_rulings = extractor.extract(
+                    ruling_text,
+                    metadata=metadata or None,
+                    system_prompt=county_prompt,
+                )
             except Exception as exc:
                 llm_latency_ms = round((time.monotonic() - t0) * 1000)
                 logger.error(
@@ -1424,7 +1488,7 @@ class IngestionWorker:
                         "document_id": document_id,
                         "error": str(exc),
                         "llm_latency_ms": llm_latency_ms,
-                        "extraction_method": "llm",
+                        "extraction_method": extraction_method,
                     },
                 )
                 return False

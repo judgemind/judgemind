@@ -396,8 +396,8 @@ def test_riv_full_run() -> None:
     health = scraper.run()
 
     assert health.success is True
-    # PS1 fixture has 4 rulings per PDF; all matching PDFs * 4 = total records
-    assert health.records_captured == _RIV_EXPECTED_PROCESSED_PDFS * 4
+    # Scraper returns one doc per PDF, no splitting (#1728)
+    assert health.records_captured == _RIV_EXPECTED_PROCESSED_PDFS
 
 
 @respx.mock
@@ -413,12 +413,12 @@ def test_riv_run_populates_judge_and_dept() -> None:
     scraper = RiversideTentativeRulingsScraper(config=config)
 
     docs = scraper.fetch_documents()
-    # PS1 fixture has 4 rulings per PDF; all matching PDFs * 4 = total after splitting
-    assert len(docs) == _RIV_EXPECTED_PROCESSED_PDFS * 4
+    # Scraper returns one doc per PDF, no splitting (#1728)
+    assert len(docs) == _RIV_EXPECTED_PROCESSED_PDFS
 
-    # PS1 docs should all have judge Hester (4 split rulings from PS1 PDF)
+    # PS1 docs should have judge Hester (one whole-PDF doc from PS1)
     ps1_docs = [d for d in docs if d.department == "PS1"]
-    assert len(ps1_docs) == 4
+    assert len(ps1_docs) == 1
     assert all("Hester" in (d.judge_name or "") for d in ps1_docs)
     assert all(d.courthouse == "Palm Springs Courthouse" for d in ps1_docs)
 
@@ -546,8 +546,8 @@ def test_riv_filters_non_matching_dept_260_link() -> None:
     scraper = RiversideTentativeRulingsScraper(config=config)
     docs = scraper.fetch_documents()
 
-    # Filtered links * 4 rulings per PDF = total docs
-    assert len(docs) == _RIV_EXPECTED_PROCESSED_PDFS * 4
+    # One document per PDF (no scraper-level splitting)
+    assert len(docs) == _RIV_EXPECTED_PROCESSED_PDFS
     # Verify no document has a null department (all matched the regex)
     assert all(d.department is not None for d in docs)
     assert all(d.department != "" for d in docs)
@@ -582,7 +582,7 @@ def test_riv_escheat_style_link_filtered() -> None:
     docs = scraper.fetch_documents()
 
     # Only the PS1 link should produce documents; escheat is filtered
-    assert len(docs) == 4  # PS1 has 4 split rulings
+    assert len(docs) == 1  # 1 doc per PDF (no scraper-level splitting)
     assert all(d.department == "PS1" for d in docs)
     assert all("Hester" in (d.judge_name or "") for d in docs)
 

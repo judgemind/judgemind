@@ -3213,12 +3213,12 @@ class TestFullReparseDocumentScraperIdFallback:
         mock_registry: MagicMock,
     ) -> None:
         """Split rulings with no case number get case_type from scraper_id (#1836)."""
-        from courts.ca.riverside_tentatives import SplitRuling
+        from courts.ca.fresno_tentatives import SplitRuling
 
         # No case numbers at all — scraper_id suffix should provide case_type
         rulings = [
-            SplitRuling(1, None, "Ruling text", "Smith v. Jones", "Demurrer", "Granted"),
-            SplitRuling(2, None, "Other ruling", "Doe v. Roe", None, None),
+            SplitRuling(1, None, "Ruling text", "Smith v. Jones", "Demurrer", "Granted", None),
+            SplitRuling(2, None, "Other ruling", "Doe v. Roe", None, None, None),
         ]
         mock_split = MagicMock(return_value=rulings)
         reingest._SPLIT_REGISTRY["ca-oc-tentatives-civil"] = mock_split
@@ -3249,11 +3249,13 @@ class TestFullReparseDocumentScraperIdFallback:
         mock_registry: MagicMock,
     ) -> None:
         """Split rulings with case titles get parties from caption fallback (#1836)."""
-        from courts.ca.riverside_tentatives import SplitRuling
+        from courts.ca.fresno_tentatives import SplitRuling
 
         rulings = [
-            SplitRuling(1, "CVPS2306157", "Ruling text", "Smith v. Jones", "Demurrer", "Granted"),
-            SplitRuling(2, "FL2301234", "Family ruling", "Doe v. Roe", None, None),
+            SplitRuling(
+                1, "CVPS2306157", "Ruling text", "Smith v. Jones", "Demurrer", "Granted", None
+            ),
+            SplitRuling(2, "FL2301234", "Family ruling", "Doe v. Roe", None, None, None),
         ]
         mock_split = MagicMock(return_value=rulings)
         reingest._SPLIT_REGISTRY["test-parties-split"] = mock_split
@@ -4387,7 +4389,7 @@ class TestFullReparseDocument:
         mock_registry: MagicMock,
     ) -> None:
         """When split function returns multiple rulings, creates one dict per ruling."""
-        from courts.ca.riverside_tentatives import SplitRuling
+        from courts.ca.fresno_tentatives import SplitRuling
 
         rulings = [
             SplitRuling(
@@ -4397,6 +4399,7 @@ class TestFullReparseDocument:
                 case_title="Yeldell V. Henss",
                 motion_type="Demurrer",
                 outcome="Granted",
+                hearing_date=None,
             ),
             SplitRuling(
                 ruling_index=2,
@@ -4405,6 +4408,7 @@ class TestFullReparseDocument:
                 case_title="Crump V. Irwin",
                 motion_type="Motion to Compel",
                 outcome="Denied",
+                hearing_date=None,
             ),
         ]
         mock_split = MagicMock(return_value=rulings)
@@ -4450,11 +4454,11 @@ class TestFullReparseDocument:
         mock_registry: MagicMock,
     ) -> None:
         """Running full-reparse twice produces the same split document IDs."""
-        from courts.ca.riverside_tentatives import SplitRuling
+        from courts.ca.fresno_tentatives import SplitRuling
 
         rulings = [
-            SplitRuling(1, "CVPS001", "text1", None, None, None),
-            SplitRuling(2, "CVPS002", "text2", None, None, None),
+            SplitRuling(1, "CVPS001", "text1", None, None, None, None),
+            SplitRuling(2, "CVPS002", "text2", None, None, None, None),
         ]
         mock_split = MagicMock(return_value=rulings)
         reingest._SPLIT_REGISTRY["test-idem"] = mock_split
@@ -4479,11 +4483,11 @@ class TestFullReparseDocument:
         mock_registry: MagicMock,
     ) -> None:
         """NUL bytes in split ruling text are removed."""
-        from courts.ca.riverside_tentatives import SplitRuling
+        from courts.ca.fresno_tentatives import SplitRuling
 
         rulings = [
-            SplitRuling(1, "CVPS001", "ruling\x00text", None, None, None),
-            SplitRuling(2, "CVPS002", "clean text", None, None, None),
+            SplitRuling(1, "CVPS001", "ruling\x00text", None, None, None, None),
+            SplitRuling(2, "CVPS002", "clean text", None, None, None, None),
         ]
         mock_split = MagicMock(return_value=rulings)
         reingest._SPLIT_REGISTRY["test-nul"] = mock_split
@@ -4507,12 +4511,14 @@ class TestFullReparseDocument:
         mock_registry: MagicMock,
     ) -> None:
         """Split rulings with recognisable case number prefix get case_type (#1749)."""
-        from courts.ca.riverside_tentatives import SplitRuling
+        from courts.ca.fresno_tentatives import SplitRuling
 
         # CVPS prefix => civil case type
         rulings = [
-            SplitRuling(1, "CVPS2306157", "Ruling text", "Smith v. Jones", "Demurrer", "Granted"),
-            SplitRuling(2, "FL2301234", "Family ruling", "Doe v. Doe", None, None),
+            SplitRuling(
+                1, "CVPS2306157", "Ruling text", "Smith v. Jones", "Demurrer", "Granted", None
+            ),
+            SplitRuling(2, "FL2301234", "Family ruling", "Doe v. Doe", None, None, None),
         ]
         mock_split = MagicMock(return_value=rulings)
         reingest._SPLIT_REGISTRY["test-ct-num"] = mock_split
@@ -4549,12 +4555,12 @@ class TestFullReparseDocument:
         ``202300574258``), the case_type should be derived from the
         motion_type via ``extract_case_type_from_motion_type()``.
         """
-        from courts.ca.riverside_tentatives import SplitRuling
+        from courts.ca.fresno_tentatives import SplitRuling
 
         # All-digit case numbers that won't match any prefix pattern
         rulings = [
-            SplitRuling(1, "202300574258", "Ruling text", "Smith v. Jones", "demurrer", None),
-            SplitRuling(2, "202300574259", "Other ruling", "Doe v. Roe", "petition", None),
+            SplitRuling(1, "202300574258", "Ruling text", "Smith v. Jones", "demurrer", None, None),
+            SplitRuling(2, "202300574259", "Other ruling", "Doe v. Roe", "petition", None, None),
         ]
         mock_split = MagicMock(return_value=rulings)
         reingest._SPLIT_REGISTRY["test-ct-mt"] = mock_split
@@ -4591,7 +4597,7 @@ class TestFullReparseDocument:
         fallbacks fire on the per-ruling text when the split result
         does not provide them.
         """
-        from courts.ca.riverside_tentatives import SplitRuling
+        from courts.ca.fresno_tentatives import SplitRuling
 
         ruling_text_with_fields = (
             "Case No. 24STCV99999\n"
@@ -4610,12 +4616,13 @@ class TestFullReparseDocument:
                 case_title=None,
                 motion_type=None,
                 outcome=None,
+                hearing_date=None,
             ),
         ]
         mock_split = MagicMock(
             return_value=[
                 rulings[0],
-                SplitRuling(2, "DUMMY", "dummy", None, None, None),
+                SplitRuling(2, "DUMMY", "dummy", None, None, None, None),
             ]
         )
         reingest._SPLIT_REGISTRY["test-regex"] = mock_split
@@ -4652,7 +4659,7 @@ class TestFullReparseDocument:
         mock_registry: MagicMock,
     ) -> None:
         """Regex fallback should NOT overwrite fields already set by split results (#1749)."""
-        from courts.ca.riverside_tentatives import SplitRuling
+        from courts.ca.fresno_tentatives import SplitRuling
 
         rulings = [
             SplitRuling(
@@ -4662,6 +4669,7 @@ class TestFullReparseDocument:
                 case_title="Yeldell V. Henss",
                 motion_type="Demurrer",
                 outcome="Granted",  # split says Granted, text says DENIED
+                hearing_date=None,
             ),
             SplitRuling(
                 ruling_index=2,
@@ -4670,6 +4678,7 @@ class TestFullReparseDocument:
                 case_title=None,
                 motion_type=None,
                 outcome=None,
+                hearing_date=None,
             ),
         ]
         mock_split = MagicMock(return_value=rulings)
@@ -5302,8 +5311,8 @@ class TestFullReparseSplitChildGuard:
 class TestSplitRegistry:
     """Tests for the split function registry."""
 
-    def test_split_registry_populated_for_riverside(self) -> None:
-        """Auto-discovery registers Riverside's _split_rulings in _SPLIT_REGISTRY."""
+    def test_split_registry_not_populated_for_riverside(self) -> None:
+        """Riverside no longer has _split_rulings — splitting moved to ingestion worker (#1728)."""
         # Clear registries to force re-discovery
         reingest._SCRAPER_REGISTRY.clear()
         reingest._SPLIT_REGISTRY.clear()
@@ -5312,8 +5321,7 @@ class TestSplitRegistry:
         reingest._load_scraper_registry()
 
         scraper_id = "ca-riverside-tentatives-civil"
-        assert scraper_id in reingest._SPLIT_REGISTRY
-        assert callable(reingest._SPLIT_REGISTRY[scraper_id])
+        assert scraper_id not in reingest._SPLIT_REGISTRY
 
 
 # ---------------------------------------------------------------------------
