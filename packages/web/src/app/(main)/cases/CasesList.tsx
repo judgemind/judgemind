@@ -13,7 +13,7 @@ import { Autocomplete } from '@/components/Autocomplete';
 import { InfiniteScrollTrigger } from '@/components/InfiniteScrollTrigger';
 import { OutcomeBadge } from '@/components/OutcomeBadge';
 import { useInfiniteScroll } from '@/hooks/useInfiniteScroll';
-import { useCountyOptions } from '@/lib/filter-options';
+import { CASE_TYPES, useCountyOptions } from '@/lib/filter-options';
 import { Input } from '@/components/ui/input';
 import {
   Select,
@@ -95,9 +95,6 @@ interface CasesData {
 }
 
 const PAGE_SIZE = 20;
-
-/** Known case type filter options. */
-const CASE_TYPES = ['civil', 'family', 'probate', 'small_claims', 'other'] as const;
 
 function SkeletonRow() {
   return (

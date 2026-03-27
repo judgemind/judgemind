@@ -16,7 +16,7 @@ import { Autocomplete } from '@/components/Autocomplete';
 import { InfiniteScrollTrigger } from '@/components/InfiniteScrollTrigger';
 import { OutcomeBadge } from '@/components/OutcomeBadge';
 import { useInfiniteScroll } from '@/hooks/useInfiniteScroll';
-import { useCountyOptions } from '@/lib/filter-options';
+import { CASE_TYPES, OUTCOMES, MOTION_TYPES, useCountyOptions } from '@/lib/filter-options';
 import { Badge } from '@/components/ui/badge';
 import { Input } from '@/components/ui/input';
 import {
@@ -109,16 +109,6 @@ interface RulingsData {
 }
 
 const PAGE_SIZE = 20;
-
-/** Known case type filter options (matches CasesList). */
-const CASE_TYPES = ['civil', 'family', 'probate', 'small_claims', 'other'] as const;
-
-/** Outcome filter options. */
-const OUTCOMES = ['granted', 'denied', 'granted_in_part', 'moot', 'continued', 'other'] as const;
-
-/** Motion type filter options. */
-const MOTION_TYPES = ['msj', 'mtd', 'mil', 'demurrer', 'anti_slapp', 'other'] as const;
-
 
 function SkeletonRow() {
   return (

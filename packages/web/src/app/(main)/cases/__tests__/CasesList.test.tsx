@@ -41,9 +41,13 @@ vi.mock('@/lib/display-helpers', () => ({
   getOutcomeBadgeListClass: () => '',
 }));
 
-vi.mock('@/lib/filter-options', () => ({
-  useCountyOptions: () => ['Los Angeles', 'Orange', 'San Bernardino'],
-}));
+vi.mock('@/lib/filter-options', async () => {
+  const actual = await vi.importActual('@/lib/filter-options');
+  return {
+    ...actual,
+    useCountyOptions: () => ['Los Angeles', 'Orange', 'San Bernardino'],
+  };
+});
 
 vi.mock('@/components/OutcomeBadge', () => ({
   OutcomeBadge: ({ outcome }: { outcome: string | null }) => (
