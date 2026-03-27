@@ -813,6 +813,11 @@ _CASE_TYPE_PREFIX_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"^(?:\d{2,4})?(?:[A-Z]{2})?PR", re.IGNORECASE), "probate"),
     (re.compile(r"^(?:\d{2,4})?(?:[A-Z]{2})?BP", re.IGNORECASE), "probate"),
     (re.compile(r"^(?:\d{2,4})?(?:[A-Z]{2})?CP", re.IGNORECASE), "probate"),
+    # Ventura old-format probate: long digit prefix + PR + 2-letter subtype
+    # e.g. 200800332092PRCP, 201200427520PRCE, 202200572082PRGE, 202200570571PRLP
+    (re.compile(r"^\d{8,}PR", re.IGNORECASE), "probate"),
+    # Old Ventura P-prefix probate: P + 5-6 digits (e.g. P057837, P080266)
+    (re.compile(r"^P\d{5,}$", re.IGNORECASE), "probate"),
     # Small claims
     (re.compile(r"^(?:\d{2,4})?(?:[A-Z]{2})?SC", re.IGNORECASE), "small_claims"),
     # Criminal prefixes
@@ -996,6 +1001,53 @@ def extract_case_type_from_number(case_number: str) -> str | None:
     for pattern, case_type in _CASE_TYPE_PREFIX_PATTERNS:
         if pattern.match(case_number):
             return case_type
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Case type extraction from case title (#2062)
+# ---------------------------------------------------------------------------
+
+# Patterns that strongly indicate probate cases when found in case titles.
+_PROBATE_TITLE_RE = re.compile(
+    r"(?:"
+    r"In\s+(?:the\s+)?(?:Matter|Re)\s+(?:of\b)"
+    r"|Conservatorship\s+(?:of\b)"
+    r"|Guardianship\s+(?:of\b)"
+    r"|Estate\s+(?:of\b)"
+    r"|Trust\s+(?:of\b)"
+    r"|Petition\s+(?:for\s+)?(?:Probate|Letters)"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def extract_case_type_from_title(case_title: str) -> str | None:
+    """Infer case type from a case title.
+
+    This is a final fallback when case number prefix, LLM extraction,
+    scraper_id, and motion type all fail to determine the case type.
+    Only unambiguous title patterns are matched — specifically, probate-style
+    titles like "In the Matter of...", "Conservatorship of...", etc.
+
+    Parameters
+    ----------
+    case_title : str
+        The case title to inspect.
+
+    Returns
+    -------
+    str | None
+        One of the case type strings, or ``None`` if the title is
+        ambiguous or not recognized.
+    """
+    if not case_title:
+        return None
+    case_title = case_title.strip()
+    if not case_title:
+        return None
+    if _PROBATE_TITLE_RE.search(case_title):
+        return "probate"
     return None
 
 
