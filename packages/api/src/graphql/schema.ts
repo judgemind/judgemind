@@ -37,6 +37,8 @@ export const typeDefs = `#graphql
     court: Court
     judges: [Judge!]!
     parties: [Party!]!
+    """The most recent ruling on this case (by hearing_date DESC). Excludes future hearing dates."""
+    latestRuling: Ruling
   }
 
   """A tentative or final ruling. isTentative=true is the primary data type."""
@@ -363,6 +365,12 @@ export const typeDefs = `#graphql
       courtId: ID
       caseStatus: String
       caseType: String
+      """Filter by county name, e.g. "Los Angeles"."""
+      county: String
+      """Only cases with a ruling on or after this date (ISO 8601), e.g. "2026-03-01"."""
+      dateFrom: String
+      """Only cases with a ruling on or before this date (ISO 8601), e.g. "2026-03-31"."""
+      dateTo: String
       """Max results (default 20, max 100)."""
       first: Int
       """Opaque cursor from a previous response's pageInfo.endCursor."""

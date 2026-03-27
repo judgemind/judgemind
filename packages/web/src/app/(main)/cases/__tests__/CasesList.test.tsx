@@ -32,6 +32,25 @@ vi.mock('next/link', () => ({
   ),
 }));
 
+vi.mock('@/lib/display-helpers', () => ({
+  formatDate: (d: string) => d,
+  formatLabel: (v: string | null) =>
+    v ? v.charAt(0).toUpperCase() + v.slice(1).replace(/_/g, ' ') : '\u2014',
+  formatMotionType: (m: string | null) => m ?? 'Not classified',
+  getOutcomeBadgeVariant: () => 'outline',
+  getOutcomeBadgeListClass: () => '',
+}));
+
+vi.mock('@/lib/filter-options', () => ({
+  useCountyOptions: () => ['Los Angeles', 'Orange', 'San Bernardino'],
+}));
+
+vi.mock('@/components/OutcomeBadge', () => ({
+  OutcomeBadge: ({ outcome }: { outcome: string | null }) => (
+    <span data-testid="outcome-badge">{outcome ?? '\u2014'}</span>
+  ),
+}));
+
 // IntersectionObserver mock
 let intersectionCallback: IntersectionObserverCallback;
 let mockObserve: ReturnType<typeof vi.fn>;
@@ -60,13 +79,56 @@ afterEach(() => {
 
 import { CasesList } from '../CasesList';
 
+const MOCK_CASE_NODE = {
+  id: 'case-1',
+  caseNumber: '24STCV01234',
+  caseTitle: 'Smith v. Jones',
+  caseType: 'civil',
+  caseStatus: 'active',
+  court: { courtName: 'Superior Court of California', county: 'Los Angeles' },
+  latestRuling: {
+    hearingDate: '2026-03-10',
+    outcome: 'granted',
+    motionType: 'msj',
+  },
+};
+
 const MOCK_CASES_DATA = {
   cases: {
     edges: [
-      { cursor: 'cursor-1', node: { id: 'case-1', caseNumber: '24STCV01234', caseTitle: 'Smith v. Jones', caseType: 'civil', caseStatus: 'active', court: { courtName: 'Superior Court of California', county: 'Los Angeles' } } },
-      { cursor: 'cursor-2', node: { id: 'case-2', caseNumber: '24NNCV05678', caseTitle: null, caseType: null, caseStatus: 'closed', court: { courtName: 'Superior Court of California', county: 'San Bernardino' } } },
+      { cursor: 'cursor-1', node: MOCK_CASE_NODE },
+      {
+        cursor: 'cursor-2',
+        node: {
+          ...MOCK_CASE_NODE,
+          id: 'case-2',
+          caseNumber: '24NNCV05678',
+          caseTitle: null,
+          caseType: null,
+          caseStatus: 'closed',
+          court: { courtName: 'Superior Court of California', county: 'San Bernardino' },
+          latestRuling: {
+            hearingDate: '2026-03-08',
+            outcome: 'denied',
+            motionType: 'mtd',
+          },
+        },
+      },
+      {
+        cursor: 'cursor-3',
+        node: {
+          ...MOCK_CASE_NODE,
+          id: 'case-3',
+          caseNumber: '24STCV99999',
+          caseTitle: 'No Ruling Case',
+          caseType: 'family',
+          caseStatus: 'active',
+          court: { courtName: 'Superior Court of California', county: 'Orange' },
+          latestRuling: null,
+        },
+      },
     ],
-    pageInfo: { hasNextPage: true, endCursor: 'cursor-2' },
+    pageInfo: { hasNextPage: true, endCursor: 'cursor-3' },
   },
 };
 
@@ -75,8 +137,9 @@ describe('CasesList', () => {
 
   it('renders skeleton rows while loading', () => {
     mockUseQuery.mockReturnValue({ data: undefined, loading: true, error: undefined, fetchMore: vi.fn() });
-    const { container } = render(<CasesList />);
-    expect(container.querySelectorAll('.animate-pulse').length).toBeGreaterThan(0);
+    render(<CasesList />);
+    const skeletons = screen.getAllByTestId('skeleton-row');
+    expect(skeletons.length).toBe(8);
   });
 
   it('renders error state', () => {
@@ -91,23 +154,50 @@ describe('CasesList', () => {
     expect(screen.getByText(/No cases found/)).toBeInTheDocument();
   });
 
-  it('renders case rows with county prefixed to case numbers and titles', () => {
+  it('renders case rows with case numbers and titles', () => {
     mockUseQuery.mockReturnValue({ data: MOCK_CASES_DATA, loading: false, error: undefined, fetchMore: vi.fn() });
     render(<CasesList />);
-    // County should be prefixed to case number
-    expect(screen.getByText(/Los Angeles .+ 24STCV01234/)).toBeInTheDocument();
-    expect(screen.getByText('Smith v. Jones')).toBeInTheDocument();
-    expect(screen.getByText(/San Bernardino .+ 24NNCV05678/)).toBeInTheDocument();
+    expect(screen.getByText(/24STCV01234/)).toBeInTheDocument();
+    expect(screen.getByText(/Smith v. Jones/)).toBeInTheDocument();
+    expect(screen.getByText(/24NNCV05678/)).toBeInTheDocument();
   });
 
-  it('renders county inline with case number (not in separate column)', () => {
+  it('renders latest ruling outcome badges', () => {
     mockUseQuery.mockReturnValue({ data: MOCK_CASES_DATA, loading: false, error: undefined, fetchMore: vi.fn() });
-    const { container } = render(<CasesList />);
-    // Only 2 column headers: Case and Type (no Court or Status columns)
-    const headers = container.querySelectorAll('th');
-    expect(headers.length).toBe(2);
-    expect(headers[0].textContent).toBe('Case');
-    expect(headers[1].textContent).toBe('Type');
+    render(<CasesList />);
+    const badges = screen.getAllByTestId('outcome-badge');
+    expect(badges.length).toBe(2); // case-1 and case-2 have rulings; case-3 does not
+    expect(badges[0]).toHaveTextContent('granted');
+    expect(badges[1]).toHaveTextContent('denied');
+  });
+
+  it('renders latest ruling hearing dates', () => {
+    mockUseQuery.mockReturnValue({ data: MOCK_CASES_DATA, loading: false, error: undefined, fetchMore: vi.fn() });
+    render(<CasesList />);
+    expect(screen.getByText('2026-03-10')).toBeInTheDocument();
+    expect(screen.getByText('2026-03-08')).toBeInTheDocument();
+  });
+
+  it('renders latest ruling motion types', () => {
+    mockUseQuery.mockReturnValue({ data: MOCK_CASES_DATA, loading: false, error: undefined, fetchMore: vi.fn() });
+    render(<CasesList />);
+    expect(screen.getByText('msj')).toBeInTheDocument();
+    expect(screen.getByText('mtd')).toBeInTheDocument();
+  });
+
+  it('renders em-dash for cases without a latest ruling date', () => {
+    mockUseQuery.mockReturnValue({ data: MOCK_CASES_DATA, loading: false, error: undefined, fetchMore: vi.fn() });
+    render(<CasesList />);
+    // Case-3 has no ruling, should show em-dash
+    const emDashes = screen.getAllByText('\u2014');
+    expect(emDashes.length).toBeGreaterThan(0);
+  });
+
+  it('renders county metadata in row', () => {
+    mockUseQuery.mockReturnValue({ data: MOCK_CASES_DATA, loading: false, error: undefined, fetchMore: vi.fn() });
+    render(<CasesList />);
+    expect(screen.getByText('Los Angeles')).toBeInTheDocument();
+    expect(screen.getByText('San Bernardino')).toBeInTheDocument();
   });
 
   it('renders case links pointing to detail pages', () => {
@@ -153,7 +243,6 @@ describe('CasesList', () => {
     mockUseQuery.mockReturnValue({ data: MOCK_CASES_DATA, loading: false, error: undefined, fetchMore: mockFetchMore });
     render(<CasesList />);
 
-    // Simulate the sentinel becoming visible
     intersectionCallback(
       [{ isIntersecting: true } as IntersectionObserverEntry],
       {} as IntersectionObserver,
@@ -161,7 +250,7 @@ describe('CasesList', () => {
 
     expect(mockFetchMore).toHaveBeenCalledWith(
       expect.objectContaining({
-        variables: { after: 'cursor-2' },
+        variables: { after: 'cursor-3' },
       }),
     );
   });
@@ -182,7 +271,6 @@ describe('CasesList', () => {
   it('does not render sentinel while loading more results', () => {
     mockUseQuery.mockReturnValue({ data: MOCK_CASES_DATA, loading: true, error: undefined, fetchMore: vi.fn() });
     render(<CasesList />);
-    // Sentinel hidden during loading to prevent duplicate fetches
     expect(screen.queryByTestId('scroll-sentinel')).not.toBeInTheDocument();
   });
 
@@ -199,26 +287,14 @@ describe('CasesList', () => {
     expect(screen.queryByText('Load more')).not.toBeInTheDocument();
   });
 
-  it('does not have a Status column', () => {
-    mockUseQuery.mockReturnValue({ data: MOCK_CASES_DATA, loading: false, error: undefined, fetchMore: vi.fn() });
-    const { container } = render(<CasesList />);
-    const headers = Array.from(container.querySelectorAll('th')).map((h) => h.textContent);
-    expect(headers).not.toContain('Status');
-  });
-
-  it('does not have a Court column', () => {
-    mockUseQuery.mockReturnValue({ data: MOCK_CASES_DATA, loading: false, error: undefined, fetchMore: vi.fn() });
-    const { container } = render(<CasesList />);
-    const headers = Array.from(container.querySelectorAll('th')).map((h) => h.textContent);
-    expect(headers).not.toContain('Court');
-  });
-
-  it('renders filter inputs with case type Select trigger', () => {
+  it('renders filter inputs including county, date range, and case type', () => {
     mockUseQuery.mockReturnValue({ data: MOCK_CASES_DATA, loading: false, error: undefined, fetchMore: vi.fn() });
     render(<CasesList />);
     expect(screen.getByPlaceholderText(/Case number or title/i)).toBeInTheDocument();
-    // shadcn Select renders as button triggers with aria-label
     expect(screen.getByLabelText(/Case type/i)).toBeInTheDocument();
+    expect(screen.getByPlaceholderText(/County/)).toBeInTheDocument();
+    expect(screen.getByLabelText(/Rulings from/)).toBeInTheDocument();
+    expect(screen.getByLabelText(/Rulings to/)).toBeInTheDocument();
   });
 
   it('filter inputs have aria-label attributes', () => {
@@ -226,15 +302,18 @@ describe('CasesList', () => {
     render(<CasesList />);
     const caseFilter = screen.getByLabelText('Case number or title');
     expect(caseFilter).toHaveAttribute('name', 'caseFilter');
-    // shadcn Select triggers are buttons with aria-label
     const typeTrigger = screen.getByLabelText('Case type');
     expect(typeTrigger.tagName.toLowerCase()).toBe('button');
+    const dateFrom = screen.getByLabelText('Rulings from');
+    expect(dateFrom).toHaveAttribute('name', 'dateFrom');
+    const dateTo = screen.getByLabelText('Rulings to');
+    expect(dateTo).toHaveAttribute('name', 'dateTo');
   });
 
   it('filters cases client-side by case number', () => {
     mockUseQuery.mockReturnValue({ data: MOCK_CASES_DATA, loading: false, error: undefined, fetchMore: vi.fn() });
     render(<CasesList />);
-    fireEvent.change(screen.getByPlaceholderText(/Case number or title/i), { target: { value: '24STCV' } });
+    fireEvent.change(screen.getByPlaceholderText(/Case number or title/i), { target: { value: '24STCV01234' } });
     expect(screen.getByText(/24STCV01234/)).toBeInTheDocument();
     expect(screen.queryByText(/24NNCV05678/)).not.toBeInTheDocument();
   });
@@ -248,7 +327,6 @@ describe('CasesList', () => {
   it('does not use raw select elements (uses shadcn Select)', () => {
     mockUseQuery.mockReturnValue({ data: MOCK_CASES_DATA, loading: false, error: undefined, fetchMore: vi.fn() });
     const { container } = render(<CasesList />);
-    // No native <select> elements should exist
     expect(container.querySelectorAll('select').length).toBe(0);
   });
 
@@ -256,10 +334,32 @@ describe('CasesList', () => {
     mockSearchParamsValue = new URLSearchParams('caseType=probate');
     mockUseQuery.mockReturnValue({ data: MOCK_CASES_DATA, loading: false, error: undefined, fetchMore: vi.fn() });
     render(<CasesList />);
-    // Verify the query is called with the correct caseType from URL
     expect(mockUseQuery.mock.calls[0][1].variables.caseType).toBe('probate');
-    // Verify the Select trigger shows the selected value (Probate)
     expect(screen.getByText('Probate')).toBeInTheDocument();
+  });
+
+  it('initializes county filter from URL params and passes to query', () => {
+    mockSearchParamsValue = new URLSearchParams('county=Los%20Angeles');
+    mockUseQuery.mockReturnValue({ data: MOCK_CASES_DATA, loading: false, error: undefined, fetchMore: vi.fn() });
+    render(<CasesList />);
+    const lastCall = mockUseQuery.mock.calls[mockUseQuery.mock.calls.length - 1];
+    expect(lastCall[1].variables.county).toBe('Los Angeles');
+  });
+
+  it('initializes dateFrom filter from URL params and passes to query', () => {
+    mockSearchParamsValue = new URLSearchParams('dateFrom=2026-01-01');
+    mockUseQuery.mockReturnValue({ data: MOCK_CASES_DATA, loading: false, error: undefined, fetchMore: vi.fn() });
+    render(<CasesList />);
+    const lastCall = mockUseQuery.mock.calls[mockUseQuery.mock.calls.length - 1];
+    expect(lastCall[1].variables.dateFrom).toBe('2026-01-01');
+  });
+
+  it('initializes dateTo filter from URL params and passes to query', () => {
+    mockSearchParamsValue = new URLSearchParams('dateTo=2026-12-31');
+    mockUseQuery.mockReturnValue({ data: MOCK_CASES_DATA, loading: false, error: undefined, fetchMore: vi.fn() });
+    render(<CasesList />);
+    const lastCall = mockUseQuery.mock.calls[mockUseQuery.mock.calls.length - 1];
+    expect(lastCall[1].variables.dateTo).toBe('2026-12-31');
   });
 
   it('updates URL when case type filter is set via URL params', () => {
@@ -269,32 +369,50 @@ describe('CasesList', () => {
     expect(mockReplace).toHaveBeenCalledWith(expect.stringContaining('caseType=family'));
   });
 
+  it('updates URL with all filter params', () => {
+    mockSearchParamsValue = new URLSearchParams('caseType=civil&county=Orange&dateFrom=2026-01-01&dateTo=2026-06-30');
+    mockUseQuery.mockReturnValue({ data: MOCK_CASES_DATA, loading: false, error: undefined, fetchMore: vi.fn() });
+    render(<CasesList />);
+    expect(mockReplace).toHaveBeenCalledWith(expect.stringContaining('caseType=civil'));
+    expect(mockReplace).toHaveBeenCalledWith(expect.stringContaining('county=Orange'));
+    expect(mockReplace).toHaveBeenCalledWith(expect.stringContaining('dateFrom=2026-01-01'));
+    expect(mockReplace).toHaveBeenCalledWith(expect.stringContaining('dateTo=2026-06-30'));
+  });
+
   it('does not pass caseType when "All types" is selected', () => {
     mockUseQuery.mockReturnValue({ data: MOCK_CASES_DATA, loading: false, error: undefined, fetchMore: vi.fn() });
     render(<CasesList />);
     expect(mockUseQuery.mock.calls[0][1].variables.caseType).toBeUndefined();
   });
 
-  it('uses shadcn Table component structure', () => {
+  it('does not pass county when empty', () => {
     mockUseQuery.mockReturnValue({ data: MOCK_CASES_DATA, loading: false, error: undefined, fetchMore: vi.fn() });
-    const { container } = render(<CasesList />);
-    expect(container.querySelector('table')).toBeInTheDocument();
-    expect(container.querySelector('thead')).toBeInTheDocument();
-    expect(container.querySelector('tbody')).toBeInTheDocument();
+    render(<CasesList />);
+    expect(mockUseQuery.mock.calls[0][1].variables.county).toBeUndefined();
   });
 
-  it('uses table-fixed to prevent horizontal overflow', () => {
+  it('does not pass dateFrom when empty', () => {
     mockUseQuery.mockReturnValue({ data: MOCK_CASES_DATA, loading: false, error: undefined, fetchMore: vi.fn() });
-    const { container } = render(<CasesList />);
-    const table = container.querySelector('table');
-    expect(table?.className).toContain('table-fixed');
+    render(<CasesList />);
+    expect(mockUseQuery.mock.calls[0][1].variables.dateFrom).toBeUndefined();
   });
 
-  it('wraps table in overflow-hidden container', () => {
+  it('uses borderless row layout (not table)', () => {
     mockUseQuery.mockReturnValue({ data: MOCK_CASES_DATA, loading: false, error: undefined, fetchMore: vi.fn() });
     const { container } = render(<CasesList />);
-    const tableWrapper = container.querySelector('table')?.closest('.overflow-hidden');
-    expect(tableWrapper).toBeInTheDocument();
+    // Should NOT have table elements
+    expect(container.querySelector('table')).not.toBeInTheDocument();
+    expect(container.querySelector('thead')).not.toBeInTheDocument();
+    // Should use divide-y rows (borderless row pattern)
+    expect(container.querySelector('.divide-y')).toBeInTheDocument();
+  });
+
+  it('search placeholder shows actual ellipsis character, not unicode escape', () => {
+    mockUseQuery.mockReturnValue({ data: MOCK_CASES_DATA, loading: false, error: undefined, fetchMore: vi.fn() });
+    render(<CasesList />);
+    const input = screen.getByPlaceholderText(/Case number or title/i);
+    expect(input.getAttribute('placeholder')).toContain('\u2026');
+    expect(input.getAttribute('placeholder')).not.toContain('\\u');
   });
 
   it('updates query variables when case type filter is changed via user interaction', async () => {
@@ -302,28 +420,19 @@ describe('CasesList', () => {
     mockUseQuery.mockReturnValue({ data: MOCK_CASES_DATA, loading: false, error: undefined, fetchMore: vi.fn() });
     render(<CasesList />);
 
-    // Click the case type select trigger to open the dropdown
     await user.click(screen.getByLabelText(/Case type/i));
-
-    // Click on the 'Family' option
     const familyOption = await screen.findByRole('option', { name: 'Family' });
     await user.click(familyOption);
 
-    // Assert query was re-run with new caseType variable
     const lastCall = mockUseQuery.mock.calls[mockUseQuery.mock.calls.length - 1];
     expect(lastCall[1].variables.caseType).toBe('family');
-
-    // Assert URL was updated
     expect(mockReplace).toHaveBeenCalledWith(expect.stringContaining('caseType=family'));
   });
 
-  it('search placeholder shows actual ellipsis character, not unicode escape', () => {
-    mockUseQuery.mockReturnValue({ data: MOCK_CASES_DATA, loading: false, error: undefined, fetchMore: vi.fn() });
+  it('shows skeleton cards while fetching more results', () => {
+    mockUseQuery.mockReturnValue({ data: MOCK_CASES_DATA, loading: true, error: undefined, fetchMore: vi.fn() });
     render(<CasesList />);
-    const input = screen.getByPlaceholderText(/Case number or title/i);
-    // The placeholder should contain the actual ellipsis character (U+2026)
-    expect(input.getAttribute('placeholder')).toContain('\u2026');
-    // And should NOT contain a literal backslash-u escape
-    expect(input.getAttribute('placeholder')).not.toContain('\\u');
+    const skeletons = screen.getAllByTestId('skeleton-row');
+    expect(skeletons.length).toBe(3);
   });
 });

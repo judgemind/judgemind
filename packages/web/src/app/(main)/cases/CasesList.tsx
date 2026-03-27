@@ -4,9 +4,16 @@ import { useState, useCallback, useEffect } from 'react';
 import { useQuery, gql } from '@apollo/client';
 import { useRouter, useSearchParams } from 'next/navigation';
 import Link from 'next/link';
-import { formatLabel } from '@/lib/display-helpers';
+import {
+  formatDate,
+  formatLabel,
+  formatMotionType,
+} from '@/lib/display-helpers';
+import { Autocomplete } from '@/components/Autocomplete';
 import { InfiniteScrollTrigger } from '@/components/InfiniteScrollTrigger';
+import { OutcomeBadge } from '@/components/OutcomeBadge';
 import { useInfiniteScroll } from '@/hooks/useInfiniteScroll';
+import { useCountyOptions } from '@/lib/filter-options';
 import { Input } from '@/components/ui/input';
 import {
   Select,
@@ -16,23 +23,21 @@ import {
   SelectValue,
 } from '@/components/ui/select';
 import { Skeleton } from '@/components/ui/skeleton';
-import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
-} from '@/components/ui/table';
 
 const CASES_QUERY = gql`
   query Cases(
     $caseType: String
+    $county: String
+    $dateFrom: String
+    $dateTo: String
     $first: Int!
     $after: String
   ) {
     cases(
       caseType: $caseType
+      county: $county
+      dateFrom: $dateFrom
+      dateTo: $dateTo
       first: $first
       after: $after
     ) {
@@ -48,6 +53,11 @@ const CASES_QUERY = gql`
             courtName
             county
           }
+          latestRuling {
+            hearingDate
+            outcome
+            motionType
+          }
         }
       }
       pageInfo {
@@ -57,6 +67,12 @@ const CASES_QUERY = gql`
     }
   }
 `;
+
+interface LatestRuling {
+  hearingDate: string;
+  outcome: string | null;
+  motionType: string | null;
+}
 
 interface CaseNode {
   id: string;
@@ -68,6 +84,7 @@ interface CaseNode {
     courtName: string;
     county: string;
   } | null;
+  latestRuling: LatestRuling | null;
 }
 
 interface CasesData {
@@ -84,15 +101,19 @@ const CASE_TYPES = ['civil', 'family', 'probate', 'small_claims', 'other'] as co
 
 function SkeletonRow() {
   return (
-    <TableRow>
-      <TableCell>
-        <div className="flex animate-pulse motion-reduce:animate-none flex-col gap-1">
-          <Skeleton className="h-4 w-32" />
-          <Skeleton className="h-3 w-48" />
+    <div data-testid="skeleton-row" className="px-4 py-3">
+      <div className="flex items-start justify-between gap-4">
+        <div className="min-w-0 flex-1 space-y-2">
+          <Skeleton className="h-4 w-2/3" />
+          <Skeleton className="h-3 w-1/2" />
+          <div className="flex gap-2 pt-1">
+            <Skeleton className="h-5 w-16 rounded-full" />
+            <Skeleton className="h-5 w-20 rounded-full" />
+          </div>
         </div>
-      </TableCell>
-      <TableCell><Skeleton className="h-3 w-16" /></TableCell>
-    </TableRow>
+        <Skeleton className="h-3 w-20 shrink-0" />
+      </div>
+    </div>
   );
 }
 
@@ -102,17 +123,27 @@ export function CasesList() {
 
   const [caseNumberFilter, setCaseNumberFilter] = useState('');
   const [typeFilter, setTypeFilter] = useState(searchParams.get('caseType') ?? '');
+  const [county, setCounty] = useState(searchParams.get('county') ?? '');
+  const [dateFrom, setDateFrom] = useState(searchParams.get('dateFrom') ?? '');
+  const [dateTo, setDateTo] = useState(searchParams.get('dateTo') ?? '');
+  const countyOptions = useCountyOptions();
 
   useEffect(() => {
     setTypeFilter(searchParams.get('caseType') ?? '');
+    setCounty(searchParams.get('county') ?? '');
+    setDateFrom(searchParams.get('dateFrom') ?? '');
+    setDateTo(searchParams.get('dateTo') ?? '');
   }, [searchParams]);
 
   const updateUrl = useCallback(() => {
     const params = new URLSearchParams();
     if (typeFilter) params.set('caseType', typeFilter);
+    if (county) params.set('county', county);
+    if (dateFrom) params.set('dateFrom', dateFrom);
+    if (dateTo) params.set('dateTo', dateTo);
     const search = params.toString();
     router.replace(search ? `/cases?${search}` : '/cases');
-  }, [typeFilter, router]);
+  }, [typeFilter, county, dateFrom, dateTo, router]);
 
   useEffect(() => {
     updateUrl();
@@ -121,6 +152,9 @@ export function CasesList() {
   const { data, loading, error, fetchMore } = useQuery<CasesData>(CASES_QUERY, {
     variables: {
       caseType: typeFilter || undefined,
+      county: county || undefined,
+      dateFrom: dateFrom || undefined,
+      dateTo: dateTo || undefined,
       first: PAGE_SIZE,
     },
     notifyOnNetworkStatusChange: true,
@@ -143,7 +177,7 @@ export function CasesList() {
       }),
       [],
     ),
-    filterDeps: [typeFilter],
+    filterDeps: [typeFilter, county, dateFrom, dateTo],
   });
 
   const filteredEdges = caseNumberFilter
@@ -156,11 +190,12 @@ export function CasesList() {
 
   return (
     <div className="space-y-6">
+      {/* Filters */}
       <div className="flex flex-wrap gap-3">
         <Input
           type="text"
           name="caseFilter"
-          placeholder="Case number or title…"
+          placeholder={"Case number or title\u2026"}
           value={caseNumberFilter}
           onChange={(e) => setCaseNumberFilter(e.target.value)}
           className="w-auto"
@@ -182,84 +217,119 @@ export function CasesList() {
             ))}
           </SelectContent>
         </Select>
-      </div>
-
-      <div className="overflow-hidden rounded-lg border">
-        <Table className="table-fixed">
-          <TableHeader>
-            <TableRow>
-              <TableHead>Case</TableHead>
-              <TableHead className="w-28">Type</TableHead>
-            </TableRow>
-          </TableHeader>
-          <TableBody>
-            {loading && edges.length === 0 && (
-              <>
-                {Array.from({ length: 8 }).map((_, i) => (
-                  <SkeletonRow key={i} />
-                ))}
-              </>
-            )}
-
-            {error && (
-              <TableRow>
-                <TableCell colSpan={2} className="text-center">
-                  <p className="py-4 text-sm text-destructive">
-                    Failed to load cases. Please try again.
-                  </p>
-                </TableCell>
-              </TableRow>
-            )}
-
-            {!loading && !error && filteredEdges.length === 0 && (
-              <TableRow>
-                <TableCell colSpan={2} className="text-center">
-                  <p className="py-4 text-muted-foreground">
-                    No cases found. Try adjusting your filters.
-                  </p>
-                </TableCell>
-              </TableRow>
-            )}
-
-            {filteredEdges.map(({ node }) => (
-              <TableRow key={node.id}>
-                <TableCell className="min-w-0">
-                  <Link
-                    href={`/cases/${node.id}`}
-                    className="block truncate rounded-sm font-medium text-foreground hover:text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                  >
-                    {node.court?.county ? `${node.court.county} – ` : ''}{node.caseNumber}
-                  </Link>
-                  {node.caseTitle && (
-                    <p className="truncate text-sm text-muted-foreground">
-                      {node.caseTitle}
-                    </p>
-                  )}
-                </TableCell>
-                <TableCell className="text-sm text-muted-foreground">
-                  {formatLabel(node.caseType)}
-                </TableCell>
-              </TableRow>
-            ))}
-
-            {/* Loading indicator for infinite scroll */}
-            {loading && edges.length > 0 && (
-              <>
-                {Array.from({ length: 3 }).map((_, i) => (
-                  <SkeletonRow key={`loading-${i}`} />
-                ))}
-              </>
-            )}
-          </TableBody>
-        </Table>
-
-        {/* Infinite scroll sentinel */}
-        <InfiniteScrollTrigger
-          hasNextPage={pageInfo?.hasNextPage ?? false}
-          loading={loading}
-          onLoadMore={handleLoadMore}
+        <Autocomplete
+          value={county}
+          onChange={setCounty}
+          options={countyOptions}
+          placeholder="County (e.g. Los Angeles)"
+          aria-label="County"
+          className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+        />
+        <Input
+          type="date"
+          name="dateFrom"
+          value={dateFrom}
+          onChange={(e) => setDateFrom(e.target.value)}
+          aria-label="Rulings from"
+          title="Rulings from"
+          className="w-auto"
+        />
+        <Input
+          type="date"
+          name="dateTo"
+          value={dateTo}
+          onChange={(e) => setDateTo(e.target.value)}
+          aria-label="Rulings to"
+          title="Rulings to"
+          className="w-auto"
         />
       </div>
+
+      {/* Skeleton loading state */}
+      {loading && edges.length === 0 && (
+        <div className="divide-y rounded-lg border">
+          {Array.from({ length: 8 }).map((_, i) => (
+            <SkeletonRow key={i} />
+          ))}
+        </div>
+      )}
+
+      {/* Error */}
+      {error && (
+        <p className="p-8 text-center text-sm text-red-500 dark:text-red-400">
+          Failed to load cases. Please try again.
+        </p>
+      )}
+
+      {/* Empty state */}
+      {!loading && !error && filteredEdges.length === 0 && (
+        <p className="p-8 text-center text-muted-foreground">
+          No cases found. Try adjusting your filters.
+        </p>
+      )}
+
+      {/* Case rows */}
+      {filteredEdges.length > 0 && (
+        <div>
+          <div className="divide-y rounded-lg border">
+            {filteredEdges.map(({ node }) => (
+              <div key={node.id} className="px-4 py-3 transition-colors hover:bg-accent/50">
+                <div className="flex items-start justify-between gap-4">
+                  {/* Left: case info, badges */}
+                  <div className="min-w-0 flex-1">
+                    <Link
+                      href={`/cases/${node.id}`}
+                      className="block truncate rounded-sm font-medium text-foreground hover:text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                    >
+                      {node.caseNumber}
+                      {node.caseTitle ? ` \u2014 ${node.caseTitle}` : ''}
+                    </Link>
+
+                    <div className="mt-0.5 flex flex-wrap items-center gap-x-2 text-xs text-muted-foreground">
+                      {node.court?.county && (
+                        <span>{node.court.county}</span>
+                      )}
+                      {node.caseType && (
+                        <span>{formatLabel(node.caseType)}</span>
+                      )}
+                      {node.latestRuling?.motionType && (
+                        <span>{formatMotionType(node.latestRuling.motionType)}</span>
+                      )}
+                    </div>
+
+                    {node.latestRuling && (
+                      <div className="mt-2 flex flex-wrap gap-2">
+                        <OutcomeBadge outcome={node.latestRuling.outcome} />
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Right: latest ruling date */}
+                  <span className="shrink-0 text-xs text-muted-foreground">
+                    {node.latestRuling ? formatDate(node.latestRuling.hearingDate) : '\u2014'}
+                  </span>
+                </div>
+              </div>
+            ))}
+          </div>
+
+          {/* Loading indicator for infinite scroll */}
+          {loading && edges.length > 0 && (
+            <div className="mt-3 divide-y rounded-lg border">
+              {Array.from({ length: 3 }).map((_, i) => (
+                <SkeletonRow key={`loading-${i}`} />
+              ))}
+            </div>
+          )}
+
+          {/* Infinite scroll sentinel */}
+          <InfiniteScrollTrigger
+            hasNextPage={pageInfo?.hasNextPage ?? false}
+            loading={loading}
+            onLoadMore={handleLoadMore}
+          />
+        </div>
+      )}
     </div>
   );
 }
