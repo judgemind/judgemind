@@ -116,6 +116,7 @@ from ingestion.extract import (  # noqa: E402
     extract_motion_type,
     extract_outcome,
     extract_parties_from_caption,
+    is_plausible_case_title,
     normalize_motion_type,
     normalize_outcome,
 )
@@ -542,7 +543,7 @@ def _apply_regex_fallbacks(extracted: dict, text: str, scraper_id: str = "") -> 
             methods.setdefault("case_number", "regex")
     if not extracted["case_title"]:
         val = extract_case_title(text)
-        if val:
+        if val and is_plausible_case_title(val):
             extracted["case_title"] = val
             methods.setdefault("case_title", "regex")
     if not extracted["hearing_date"]:

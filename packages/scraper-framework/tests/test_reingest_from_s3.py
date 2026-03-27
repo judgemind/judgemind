@@ -3176,6 +3176,81 @@ class TestReparseDocumentPartiesFromCaption:
 
 
 # ---------------------------------------------------------------------------
+# Title validation in _apply_regex_fallbacks (#1974)
+# ---------------------------------------------------------------------------
+
+
+class TestReparseDocumentTitleValidation:
+    """Tests for is_plausible_case_title() integration in _apply_regex_fallbacks."""
+
+    def _doc_meta(
+        self,
+        case_title: str | None = None,
+        case_number: str | None = "24STCV12345",
+    ) -> dict[str, Any]:
+        return {
+            "document_id": str(_DOC_ID_1),
+            "state": "CA",
+            "county": "Los Angeles",
+            "court_name": "Los Angeles Superior Court",
+            "source_url": "https://court.example.com/ruling",
+            "captured_at": _CAPTURED_AT_1,
+            "content_hash": "abc123",
+            "format": "html",
+            "case_number": case_number,
+            "case_title": case_title,
+            "hearing_date": None,
+            "court_id": str(_COURT_ID),
+            "scraper_id": "ca-la-tentatives-civil",
+            "s3_key": "docs/test.html",
+            "s3_bucket": "test-bucket",
+        }
+
+    @patch.object(reingest, "_load_scraper_registry")
+    def test_implausible_title_rejected(
+        self,
+        mock_registry: MagicMock,
+    ) -> None:
+        """Titles extracted by regex that fail is_plausible_case_title() are not written."""
+        mock_registry.return_value = {}
+        # Construct text where extract_case_title would match "To Respond v. Without"
+        # but is_plausible_case_title rejects it.  Use a mock to isolate.
+        raw = b"<html>RULING: The motion is GRANTED</html>"
+        meta = self._doc_meta(case_title=None)
+        with patch.object(
+            reingest, "extract_case_title", return_value="To Respond, Without Objections"
+        ):
+            result = reingest._reparse_document(raw, "ca-la-tentatives-civil", meta)
+        assert result["case_title"] is None
+
+    @patch.object(reingest, "_load_scraper_registry")
+    def test_plausible_title_accepted(
+        self,
+        mock_registry: MagicMock,
+    ) -> None:
+        """Titles that pass is_plausible_case_title() are written normally."""
+        mock_registry.return_value = {}
+        raw = b"<html>Smith v. Jones\nThe motion is GRANTED</html>"
+        meta = self._doc_meta(case_title=None)
+        with patch.object(reingest, "extract_case_title", return_value="Smith v. Jones"):
+            result = reingest._reparse_document(raw, "ca-la-tentatives-civil", meta)
+        assert result["case_title"] == "Smith v. Jones"
+
+    @patch.object(reingest, "_load_scraper_registry")
+    def test_scraper_provided_title_not_revalidated(
+        self,
+        mock_registry: MagicMock,
+    ) -> None:
+        """Titles from the scraper (already in metadata) bypass regex fallback."""
+        mock_registry.return_value = {}
+        raw = b"<html>The motion is GRANTED</html>"
+        # Scraper already set case_title — regex fallback should NOT overwrite it
+        meta = self._doc_meta(case_title="Existing Title")
+        result = reingest._reparse_document(raw, "ca-la-tentatives-civil", meta)
+        assert result["case_title"] == "Existing Title"
+
+
+# ---------------------------------------------------------------------------
 # scraper_id fallback in split path (#1836)
 # ---------------------------------------------------------------------------
 
