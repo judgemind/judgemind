@@ -1,0 +1,24 @@
+{
+  "_fixture": "ventura_ruling_html_strike.html",
+  "_description": "Ventura Dept 42 — Motion to Strike, granted in part. Single-case HTML ruling. Employment discrimination case.",
+  "_captured": "2026-03-11",
+  "_format": "html",
+  "department": "42",
+  "case_count": 1,
+  "case_number": "2023CUBC035012",
+  "motion_type": "Motion to Strike",
+  "hearing_date": "March 11, 2026",
+  "expected_cases": [
+    {
+      "case_number": "2023CUBC035012",
+      "case_title": "Ramirez v. City of Oxnard",
+      "outcome": "granted_in_part",
+      "parties": [
+        {"name": "Maria Ramirez", "role": "plaintiff"},
+        {"name": "City of Oxnard", "role": "defendant"}
+      ],
+      "ruling_text_contains": ["GRANTED WITHOUT LEAVE TO AMEND", "DENIED", "punitive damages", "attorney's fees"]
+    }
+  ],
+  "_notes": "Motion to strike granted as to punitive damages, denied as to attorney's fees. Outcome is granted_in_part."
+}

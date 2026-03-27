@@ -1,0 +1,23 @@
+{
+  "_fixture": "ventura_ruling_html_probate.html",
+  "_description": "Ventura Dept 43 — Petition for Probate, granted. Single-case HTML ruling. Estate matter.",
+  "_captured": "2026-03-11",
+  "_format": "html",
+  "department": "43",
+  "case_count": 1,
+  "case_number": "2025CUPR042345",
+  "motion_type": "Petition for Probate",
+  "hearing_date": "March 11, 2026",
+  "expected_cases": [
+    {
+      "case_number": "2025CUPR042345",
+      "case_title": "In the Matter of the Estate of Harold Jensen",
+      "outcome": "granted",
+      "parties": [
+        {"name": "Dorothy Jensen", "role": "petitioner"}
+      ],
+      "ruling_text_contains": ["GRANTED", "Letters Testamentary", "duly executed"]
+    }
+  ],
+  "_notes": "Probate petition granted. Single petitioner, no respondent. Title uses 'In the Matter of' format."
+}
