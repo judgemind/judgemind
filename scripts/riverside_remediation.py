@@ -101,7 +101,7 @@ WHERE co.county = 'Riverside'
       HAVING COUNT(*) > 1
   )
   AND r.id NOT IN (
-      SELECT DISTINCT ON (ruling_text_hash) id
+      SELECT DISTINCT ON (ruling_text_hash) r3.id
       FROM rulings r3
       JOIN courts co3 ON r3.court_id = co3.id
       WHERE co3.county = 'Riverside' AND r3.ruling_text_hash IS NOT NULL
@@ -125,7 +125,7 @@ WHERE id IN (
           HAVING COUNT(*) > 1
       )
       AND r.id NOT IN (
-          SELECT DISTINCT ON (ruling_text_hash) id
+          SELECT DISTINCT ON (ruling_text_hash) r3.id
           FROM rulings r3
           JOIN courts co3 ON r3.court_id = co3.id
           WHERE co3.county = 'Riverside' AND r3.ruling_text_hash IS NOT NULL
