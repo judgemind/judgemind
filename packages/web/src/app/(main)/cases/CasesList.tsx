@@ -10,6 +10,7 @@ import {
   formatMotionType,
 } from '@/lib/display-helpers';
 import { Autocomplete } from '@/components/Autocomplete';
+import { ErrorBanner } from '@/components/ErrorBanner';
 import { InfiniteScrollTrigger } from '@/components/InfiniteScrollTrigger';
 import { OutcomeBadge } from '@/components/OutcomeBadge';
 import { useInfiniteScroll } from '@/hooks/useInfiniteScroll';
@@ -253,9 +254,7 @@ export function CasesList() {
 
       {/* Error */}
       {error && (
-        <p className="p-8 text-center text-sm text-red-500 dark:text-red-400">
-          Failed to load cases. Please try again.
-        </p>
+        <ErrorBanner message="Failed to load cases." />
       )}
 
       {/* Empty state */}

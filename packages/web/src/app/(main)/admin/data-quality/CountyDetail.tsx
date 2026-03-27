@@ -2,6 +2,7 @@
 
 import { useMemo, useState } from 'react';
 import { useQuery } from '@apollo/client';
+import { ErrorBanner } from '@/components/ErrorBanner';
 import { MetricsChart } from './MetricsChart';
 import {
   DATA_QUALITY_METRICS_QUERY,
@@ -160,9 +161,7 @@ export function CountyDetail({ county, overview, onBack }: CountyDetailProps) {
       )}
 
       {error && (
-        <p className="text-center text-sm text-red-500 dark:text-red-400">
-          Failed to load metrics. Please try again.
-        </p>
+        <ErrorBanner message="Failed to load metrics." />
       )}
 
       {/* Charts */}

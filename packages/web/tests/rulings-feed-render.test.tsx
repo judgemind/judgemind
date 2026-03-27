@@ -117,7 +117,7 @@ describe('RulingsFeed (render)', () => {
     mockQueryResult.error = new Error('Network error');
     render(<RulingsFeed />);
     expect(
-      screen.getByText('Failed to load rulings. Please try again.'),
+      screen.getByText('Failed to load rulings.'),
     ).toBeInTheDocument();
   });
 

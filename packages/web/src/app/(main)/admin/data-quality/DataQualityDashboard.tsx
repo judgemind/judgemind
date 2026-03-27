@@ -3,6 +3,7 @@
 import { useMemo, useState } from 'react';
 import { useQuery } from '@apollo/client';
 import { useAuth } from '@/providers/AuthProvider';
+import { ErrorBanner } from '@/components/ErrorBanner';
 import { OverviewGrid } from './OverviewGrid';
 import { MetricsChart } from './MetricsChart';
 import { CountyDetail } from './CountyDetail';
@@ -117,11 +118,7 @@ export function DataQualityDashboard() {
 
   // Error state
   if (overviewError || metricsError) {
-    return (
-      <p className="text-center text-sm text-red-500 dark:text-red-400">
-        Failed to load data quality metrics. Please try again.
-      </p>
-    );
+    return <ErrorBanner message="Failed to load data quality metrics." />;
   }
 
   const overviewItems = overviewData?.dataQualityOverview ?? [];

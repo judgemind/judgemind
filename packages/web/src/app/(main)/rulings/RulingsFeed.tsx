@@ -13,6 +13,7 @@ import {
   MOTION_TYPE_LABELS,
 } from '@/lib/display-helpers';
 import { Autocomplete } from '@/components/Autocomplete';
+import { ErrorBanner } from '@/components/ErrorBanner';
 import { InfiniteScrollTrigger } from '@/components/InfiniteScrollTrigger';
 import { OutcomeBadge } from '@/components/OutcomeBadge';
 import { useInfiniteScroll } from '@/hooks/useInfiniteScroll';
@@ -288,9 +289,7 @@ export function RulingsFeed() {
 
       {/* Error */}
       {error && (
-        <p className="p-8 text-center text-sm text-red-500 dark:text-red-400">
-          Failed to load rulings. Please try again.
-        </p>
+        <ErrorBanner message="Failed to load rulings." />
       )}
 
       {/* Empty state */}
