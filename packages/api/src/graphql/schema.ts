@@ -387,6 +387,11 @@ export const typeDefs = `#graphql
     Returns null if the judge does not exist. Returns empty arrays if the judge has no classified rulings."""
     judgeAnalytics(judgeId: ID!): JudgeAnalytics
 
+    """Aggregated analytics for multiple judges, for side-by-side comparison.
+    Accepts up to 10 judge IDs. Returns analytics for each judge that exists (non-existent IDs are silently skipped).
+    Results are returned in the same order as the input IDs."""
+    compareJudges(judgeIds: [ID!]!): [JudgeAnalytics!]!
+
     """Fetch a single judge by ID."""
     judge(id: ID!): Judge
 

@@ -3,9 +3,11 @@ import {
   buildDocumentContentUrl,
   buildDownloadUrl,
   cleanSummary,
+  computeOverallGrantRate,
   detectParagraphs,
   FORMAT_LABELS,
   formatDate,
+  formatDateRange,
   formatJudgeName,
   formatLabel,
   formatMotionType,
@@ -1290,5 +1292,88 @@ describe('formatOutcome', () => {
   it('falls back to title-casing for unknown outcome codes', () => {
     expect(formatOutcome('sustained')).toBe('Sustained');
     expect(formatOutcome('overruled_in_part')).toBe('Overruled In Part');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// computeOverallGrantRate (#1753 — judge comparison helpers)
+// ---------------------------------------------------------------------------
+
+describe('computeOverallGrantRate', () => {
+  it('computes rate from granted, denied, and partial outcomes', () => {
+    const outcomes = [
+      { outcome: 'granted', count: 30 },
+      { outcome: 'denied', count: 15 },
+      { outcome: 'granted_in_part', count: 5 },
+    ];
+    // 30 / (30 + 15 + 5) = 0.6
+    expect(computeOverallGrantRate(outcomes)).toBeCloseTo(0.6, 5);
+  });
+
+  it('excludes procedural outcomes from denominator', () => {
+    const outcomes = [
+      { outcome: 'granted', count: 10 },
+      { outcome: 'denied', count: 10 },
+      { outcome: 'moot', count: 50 },
+      { outcome: 'continued', count: 30 },
+    ];
+    // 10 / (10 + 10) = 0.5 (moot and continued excluded)
+    expect(computeOverallGrantRate(outcomes)).toBeCloseTo(0.5, 5);
+  });
+
+  it('includes denied_in_part in denominator', () => {
+    const outcomes = [
+      { outcome: 'granted', count: 5 },
+      { outcome: 'denied_in_part', count: 5 },
+    ];
+    // 5 / (5 + 0 + 5) = 0.5
+    expect(computeOverallGrantRate(outcomes)).toBeCloseTo(0.5, 5);
+  });
+
+  it('returns null when no substantive outcomes exist', () => {
+    const outcomes = [
+      { outcome: 'moot', count: 10 },
+      { outcome: 'continued', count: 5 },
+    ];
+    expect(computeOverallGrantRate(outcomes)).toBeNull();
+  });
+
+  it('returns null for empty array', () => {
+    expect(computeOverallGrantRate([])).toBeNull();
+  });
+
+  it('returns 1 when all outcomes are granted', () => {
+    const outcomes = [{ outcome: 'granted', count: 20 }];
+    expect(computeOverallGrantRate(outcomes)).toBeCloseTo(1.0, 5);
+  });
+
+  it('returns 0 when all substantive outcomes are denied', () => {
+    const outcomes = [{ outcome: 'denied', count: 20 }];
+    expect(computeOverallGrantRate(outcomes)).toBeCloseTo(0, 5);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// formatDateRange (#1753 — judge comparison helpers)
+// ---------------------------------------------------------------------------
+
+describe('formatDateRange', () => {
+  it('formats a date range with en-dash separator', () => {
+    const result = formatDateRange('2025-01-15', '2026-03-01');
+    expect(result).toContain('Jan 15, 2025');
+    expect(result).toContain('Mar 1, 2026');
+    expect(result).toContain('\u2013'); // en-dash
+  });
+
+  it('returns empty string when earliest is null', () => {
+    expect(formatDateRange(null, '2026-03-01')).toBe('');
+  });
+
+  it('returns empty string when latest is null', () => {
+    expect(formatDateRange('2025-01-15', null)).toBe('');
+  });
+
+  it('returns empty string when both are null', () => {
+    expect(formatDateRange(null, null)).toBe('');
   });
 });

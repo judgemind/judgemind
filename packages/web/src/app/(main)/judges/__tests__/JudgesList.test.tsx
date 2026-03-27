@@ -9,10 +9,11 @@ vi.mock('@apollo/client', () => ({
 }));
 
 const mockReplace = vi.fn();
+const mockPush = vi.fn();
 let mockSearchParamsValue = new URLSearchParams();
 
 vi.mock('next/navigation', () => ({
-  useRouter: () => ({ push: vi.fn(), replace: mockReplace, back: vi.fn() }),
+  useRouter: () => ({ push: mockPush, replace: mockReplace, back: vi.fn() }),
   useSearchParams: () => mockSearchParamsValue,
 }));
 
@@ -39,6 +40,30 @@ vi.mock('lucide-react', () => ({
   ),
   Search: ({ className }: { className?: string }) => (
     <span data-testid="search-icon" className={className} />
+  ),
+  Scale: ({ className }: { className?: string }) => (
+    <span data-testid="scale-icon" className={className} />
+  ),
+}));
+
+// Mock Checkbox component
+vi.mock('@/components/ui/checkbox', () => ({
+  Checkbox: ({
+    checked,
+    onCheckedChange,
+    'aria-label': ariaLabel,
+  }: {
+    checked: boolean;
+    onCheckedChange: () => void;
+    'aria-label': string;
+  }) => (
+    <input
+      type="checkbox"
+      checked={checked}
+      onChange={onCheckedChange}
+      aria-label={ariaLabel}
+      data-testid="judge-checkbox"
+    />
   ),
 }));
 
@@ -432,7 +457,7 @@ describe('JudgesList', () => {
     expect(container.querySelector('table')).toBeInTheDocument();
   });
 
-  it('renders only Judge and County column headers', () => {
+  it('renders Select, Judge, and County column headers', () => {
     mockUseQuery.mockReturnValue({
       data: MOCK_JUDGES_DATA,
       loading: false,
@@ -505,5 +530,130 @@ describe('JudgesList', () => {
     const rows = container.querySelectorAll('tr.hover\\:bg-muted\\/50');
     // 2 data rows + 1 header row (header TableRow also has hover)
     expect(rows.length).toBeGreaterThanOrEqual(2);
+  });
+
+  // Selection and comparison tests (#1753)
+  it('renders checkboxes for each judge row', () => {
+    mockUseQuery.mockReturnValue({
+      data: MOCK_JUDGES_DATA,
+      loading: false,
+      error: undefined,
+      fetchMore: vi.fn(),
+    });
+
+    render(<JudgesList />);
+    const checkboxes = screen.getAllByTestId('judge-checkbox');
+    expect(checkboxes).toHaveLength(2);
+  });
+
+  it('does not show compare button when no judges selected', () => {
+    mockUseQuery.mockReturnValue({
+      data: MOCK_JUDGES_DATA,
+      loading: false,
+      error: undefined,
+      fetchMore: vi.fn(),
+    });
+
+    render(<JudgesList />);
+    expect(screen.queryByTestId('compare-button')).not.toBeInTheDocument();
+  });
+
+  it('shows compare button when a judge is selected', () => {
+    mockUseQuery.mockReturnValue({
+      data: MOCK_JUDGES_DATA,
+      loading: false,
+      error: undefined,
+      fetchMore: vi.fn(),
+    });
+
+    render(<JudgesList />);
+    const checkboxes = screen.getAllByTestId('judge-checkbox');
+    fireEvent.click(checkboxes[0]);
+    expect(screen.getByTestId('compare-button')).toBeInTheDocument();
+    expect(screen.getByTestId('compare-button')).toHaveTextContent('Compare (1)');
+  });
+
+  it('disables compare button when only 1 judge selected', () => {
+    mockUseQuery.mockReturnValue({
+      data: MOCK_JUDGES_DATA,
+      loading: false,
+      error: undefined,
+      fetchMore: vi.fn(),
+    });
+
+    render(<JudgesList />);
+    const checkboxes = screen.getAllByTestId('judge-checkbox');
+    fireEvent.click(checkboxes[0]);
+    expect(screen.getByTestId('compare-button')).toBeDisabled();
+  });
+
+  it('enables compare button when 2+ judges selected', () => {
+    mockUseQuery.mockReturnValue({
+      data: MOCK_JUDGES_DATA,
+      loading: false,
+      error: undefined,
+      fetchMore: vi.fn(),
+    });
+
+    render(<JudgesList />);
+    const checkboxes = screen.getAllByTestId('judge-checkbox');
+    fireEvent.click(checkboxes[0]);
+    fireEvent.click(checkboxes[1]);
+    expect(screen.getByTestId('compare-button')).not.toBeDisabled();
+    expect(screen.getByTestId('compare-button')).toHaveTextContent('Compare (2)');
+  });
+
+  it('navigates to compare page with selected judge IDs when compare button clicked', () => {
+    mockUseQuery.mockReturnValue({
+      data: MOCK_JUDGES_DATA,
+      loading: false,
+      error: undefined,
+      fetchMore: vi.fn(),
+    });
+
+    render(<JudgesList />);
+    const checkboxes = screen.getAllByTestId('judge-checkbox');
+    fireEvent.click(checkboxes[0]);
+    fireEvent.click(checkboxes[1]);
+    fireEvent.click(screen.getByTestId('compare-button'));
+    expect(mockPush).toHaveBeenCalledWith(
+      expect.stringContaining('/judges/compare?ids='),
+    );
+    // The URL should contain both judge IDs
+    const calledUrl = mockPush.mock.calls[0][0] as string;
+    expect(calledUrl).toContain('judge-1');
+    expect(calledUrl).toContain('judge-2');
+  });
+
+  it('deselects a judge when checkbox is clicked again', () => {
+    mockUseQuery.mockReturnValue({
+      data: MOCK_JUDGES_DATA,
+      loading: false,
+      error: undefined,
+      fetchMore: vi.fn(),
+    });
+
+    render(<JudgesList />);
+    const checkboxes = screen.getAllByTestId('judge-checkbox');
+    // Select both
+    fireEvent.click(checkboxes[0]);
+    fireEvent.click(checkboxes[1]);
+    expect(screen.getByTestId('compare-button')).toHaveTextContent('Compare (2)');
+    // Deselect first
+    fireEvent.click(checkboxes[0]);
+    expect(screen.getByTestId('compare-button')).toHaveTextContent('Compare (1)');
+  });
+
+  it('renders checkbox aria-label with judge name', () => {
+    mockUseQuery.mockReturnValue({
+      data: MOCK_JUDGES_DATA,
+      loading: false,
+      error: undefined,
+      fetchMore: vi.fn(),
+    });
+
+    render(<JudgesList />);
+    expect(screen.getByLabelText('Select Smith, John A. for comparison')).toBeInTheDocument();
+    expect(screen.getByLabelText('Select Johnson, Robert M. for comparison')).toBeInTheDocument();
   });
 });
