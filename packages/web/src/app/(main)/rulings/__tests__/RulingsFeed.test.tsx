@@ -618,6 +618,20 @@ describe('RulingsFeed', () => {
     expect(lastCall[1].variables.county).toBeUndefined();
   });
 
+  // Hover state tests (#1743)
+  it('renders hover highlight on ruling rows using muted design token', () => {
+    mockUseQuery.mockReturnValue({
+      data: MOCK_RULINGS_DATA,
+      loading: false,
+      error: undefined,
+      fetchMore: vi.fn(),
+    });
+
+    const { container } = render(<RulingsFeed />);
+    const rows = container.querySelectorAll('.hover\\:bg-muted\\/50');
+    expect(rows.length).toBeGreaterThanOrEqual(2);
+  });
+
   // Visual hierarchy tests (#1738)
   it('renders outcome badge on the same line as the case title', () => {
     mockUseQuery.mockReturnValue({

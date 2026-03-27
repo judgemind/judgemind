@@ -435,4 +435,12 @@ describe('CasesList', () => {
     const skeletons = screen.getAllByTestId('skeleton-row');
     expect(skeletons.length).toBe(3);
   });
+
+  // Hover state tests (#1743)
+  it('renders hover highlight on case rows using muted design token', () => {
+    mockUseQuery.mockReturnValue({ data: MOCK_CASES_DATA, loading: false, error: undefined, fetchMore: vi.fn() });
+    const { container } = render(<CasesList />);
+    const rows = container.querySelectorAll('.hover\\:bg-muted\\/50');
+    expect(rows.length).toBeGreaterThanOrEqual(3);
+  });
 });
