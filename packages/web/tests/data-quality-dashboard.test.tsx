@@ -165,7 +165,7 @@ describe('DataQualityDashboard', () => {
     mockOverviewQueryResult.error = new Error('Network error');
     render(<DataQualityDashboard />);
     expect(
-      screen.getByText('Failed to load data quality metrics. Please try again.'),
+      screen.getByText('Failed to load data quality metrics.'),
     ).toBeInTheDocument();
   });
 

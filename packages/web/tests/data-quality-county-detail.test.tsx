@@ -177,7 +177,7 @@ describe('CountyDetail', () => {
       <CountyDetail county="Los Angeles" overview={makeOverview()} onBack={onBack} />,
     );
     expect(
-      screen.getByText('Failed to load metrics. Please try again.'),
+      screen.getByText('Failed to load metrics.'),
     ).toBeInTheDocument();
   });
 

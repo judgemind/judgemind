@@ -4,11 +4,12 @@ import { useState, useCallback, useEffect, useMemo } from 'react';
 import { useQuery, gql } from '@apollo/client';
 import { useRouter, useSearchParams } from 'next/navigation';
 import Link from 'next/link';
-import { Search, SlidersHorizontal, Calendar, Scale, Gavel, Briefcase, AlertCircle } from 'lucide-react';
+import { Search, SlidersHorizontal, Calendar, Scale, Gavel, Briefcase } from 'lucide-react';
 import { formatDate, MOTION_TYPE_LABELS, OUTCOME_LABELS, CASE_TYPE_LABELS } from '@/lib/display-helpers';
 import { PAGE_TITLE, SECTION_LABEL } from '@/lib/typography';
 import { sanitizeExcerptHtml } from '@/lib/sanitize-html';
 import { Autocomplete } from '@/components/Autocomplete';
+import { ErrorBanner } from '@/components/ErrorBanner';
 import { InfiniteScrollTrigger } from '@/components/InfiniteScrollTrigger';
 import { useInfiniteScroll } from '@/hooks/useInfiniteScroll';
 import { OutcomeBadge } from '@/components/OutcomeBadge';
@@ -682,21 +683,7 @@ export function SearchPage() {
 
       {/* Error state — full width, centered, soft styling */}
       {hasSearched && error && (
-        <Card className="border bg-muted">
-          <CardContent className="flex flex-col items-center justify-center py-8">
-            <AlertCircle className="mb-3 h-8 w-8 text-red-700/70" aria-hidden="true" />
-            <p className="text-sm text-red-700">
-              Failed to load search results.
-            </p>
-            <button
-              type="button"
-              onClick={() => window.location.reload()}
-              className="mt-3 text-sm font-medium text-muted-foreground underline underline-offset-2 hover:text-foreground"
-            >
-              Try again
-            </button>
-          </CardContent>
-        </Card>
+        <ErrorBanner message="Failed to load search results." />
       )}
 
       {/* Empty results — full width, centered */}

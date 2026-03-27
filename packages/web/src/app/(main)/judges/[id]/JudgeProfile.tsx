@@ -3,7 +3,8 @@
 import { useCallback, useRef, useState } from 'react';
 import { useQuery, gql } from '@apollo/client';
 import Link from 'next/link';
-import { AlertCircle, BarChart3, Scale, X } from 'lucide-react';
+import { BarChart3, Scale, X } from 'lucide-react';
+import { ErrorBanner } from '@/components/ErrorBanner';
 import {
   formatDate,
   formatLabel,
@@ -279,23 +280,7 @@ export function JudgeProfile({ judgeId }: { judgeId: string }) {
     if (analyticsLoading) return <AnalyticsSkeleton />;
 
     if (analyticsError) {
-      return (
-        <Card className="border bg-muted">
-          <CardContent className="flex flex-col items-center justify-center py-8">
-            <AlertCircle className="mb-3 h-8 w-8 text-red-700/70" aria-hidden="true" />
-            <p className="text-sm text-red-700">
-              Failed to load analytics.
-            </p>
-            <button
-              type="button"
-              onClick={() => window.location.reload()}
-              className="mt-3 text-sm font-medium text-muted-foreground underline underline-offset-2 hover:text-foreground"
-            >
-              Try again
-            </button>
-          </CardContent>
-        </Card>
-      );
+      return <ErrorBanner message="Failed to load analytics." />;
     }
 
     if (!analytics || analytics.totalRulings === 0) {
@@ -428,23 +413,7 @@ export function JudgeProfile({ judgeId }: { judgeId: string }) {
     if (rulingsLoading && edges.length === 0) return <RulingsSkeleton />;
 
     if (rulingsError) {
-      return (
-        <Card className="border bg-muted">
-          <CardContent className="flex flex-col items-center justify-center py-8">
-            <AlertCircle className="mb-3 h-8 w-8 text-red-700/70" aria-hidden="true" />
-            <p className="text-sm text-red-700">
-              Failed to load rulings.
-            </p>
-            <button
-              type="button"
-              onClick={() => window.location.reload()}
-              className="mt-3 text-sm font-medium text-muted-foreground underline underline-offset-2 hover:text-foreground"
-            >
-              Try again
-            </button>
-          </CardContent>
-        </Card>
-      );
+      return <ErrorBanner message="Failed to load rulings." />;
     }
 
     if (!rulingsLoading && edges.length === 0) {
