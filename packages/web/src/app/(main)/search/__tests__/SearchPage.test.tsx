@@ -269,10 +269,14 @@ vi.mock('@/components/Autocomplete', () => ({
   ),
 }));
 
-vi.mock('@/lib/filter-options', () => ({
-  useCountyOptions: () => ['Los Angeles', 'Orange'],
-  useJudgeNameOptions: () => ['Smith, John'],
-}));
+vi.mock('@/lib/filter-options', async () => {
+  const actual = await vi.importActual('@/lib/filter-options');
+  return {
+    ...actual,
+    useCountyOptions: () => ['Los Angeles', 'Orange'],
+    useJudgeNameOptions: () => ['Smith, John'],
+  };
+});
 
 // IntersectionObserver mock
 let intersectionCallback: IntersectionObserverCallback;

@@ -1,5 +1,38 @@
 import { gql, useQuery } from '@apollo/client';
 
+// ---------------------------------------------------------------------------
+// Static filter option arrays (shared across SearchPage, RulingsFeed, CasesList)
+// ---------------------------------------------------------------------------
+
+/** All motion type filter options. */
+export const MOTION_TYPES = [
+  'msj',
+  'mtd',
+  'mil',
+  'demurrer',
+  'anti_slapp',
+  'other',
+] as const;
+
+/** All outcome filter options. */
+export const OUTCOMES = [
+  'granted',
+  'denied',
+  'granted_in_part',
+  'moot',
+  'continued',
+  'other',
+] as const;
+
+/** All case type filter options. */
+export const CASE_TYPES = [
+  'civil',
+  'family',
+  'probate',
+  'small_claims',
+  'other',
+] as const;
+
 /**
  * Query for distinct county names (used for autocomplete).
  * The dataset is small (~7 counties) so we fetch the full list.

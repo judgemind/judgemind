@@ -12,7 +12,7 @@ import { Autocomplete } from '@/components/Autocomplete';
 import { InfiniteScrollTrigger } from '@/components/InfiniteScrollTrigger';
 import { useInfiniteScroll } from '@/hooks/useInfiniteScroll';
 import { OutcomeBadge } from '@/components/OutcomeBadge';
-import { useCountyOptions, useJudgeNameOptions } from '@/lib/filter-options';
+import { MOTION_TYPES, OUTCOMES, CASE_TYPES, useCountyOptions, useJudgeNameOptions } from '@/lib/filter-options';
 import { Card, CardContent } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
@@ -69,34 +69,8 @@ const SEARCH_RULINGS_QUERY = gql`
   }
 `;
 
-/** All motion type filter options. */
-export const MOTION_TYPES = [
-  'msj',
-  'mtd',
-  'mil',
-  'demurrer',
-  'anti_slapp',
-  'other',
-] as const;
-
-/** All outcome filter options. */
-export const OUTCOMES = [
-  'granted',
-  'denied',
-  'granted_in_part',
-  'moot',
-  'continued',
-  'other',
-] as const;
-
-/** All case type filter options. */
-export const CASE_TYPES = [
-  'civil',
-  'family',
-  'probate',
-  'small_claims',
-  'other',
-] as const;
+// Re-export filter arrays so existing imports from this module keep working.
+export { MOTION_TYPES, OUTCOMES, CASE_TYPES } from '@/lib/filter-options';
 
 /** Build URL search params from the current filter state. */
 export function buildSearchParams(state: {
