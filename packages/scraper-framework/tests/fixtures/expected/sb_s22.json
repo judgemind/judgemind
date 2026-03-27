@@ -1,0 +1,28 @@
+{
+  "_fixture": "sb_s22_20260302_6849aa12.pdf",
+  "_description": "San Bernardino Dept S22 (Judge David Driscoll). 9-page PDF with 2 cases: GM MSJ and Ford reconsideration.",
+  "_captured": "2026-03-02",
+  "courthouse": "San Bernardino Justice Center",
+  "department": "S22",
+  "judge_name": "David Driscoll",
+  "page_count": 9,
+  "case_count": 2,
+  "primary_case_number": "CIVSB2419120",
+  "case_number_format": "CIV{LOCATION}{YYNNNNN}",
+  "hearing_date": "March 2, 2026",
+  "expected_cases": [
+    {
+      "case_number": "CIVSB2419120",
+      "case_title": "Solis v. General Motors LLC",
+      "motion_type": "summary judgment",
+      "outcome": "denied"
+    },
+    {
+      "case_number": "CIVSB2111992",
+      "case_title": "Chavez v. Ford Motor Company",
+      "motion_type": "reconsideration",
+      "outcome": "granted"
+    }
+  ],
+  "_notes": "Two-case PDF. Each case has its own header block with boilerplate repeated. MSJ denied without prejudice (3 sub-rulings). Reconsideration granted (arbitration order vacated)."
+}

@@ -1,0 +1,28 @@
+{
+  "_fixture": "sb_s24_20260304_a1f33a43.pdf",
+  "_description": "San Bernardino Dept S24 (Judge Carlos M. Cabrera). 5-page PDF with 2 cases: compel deposition and leave to amend.",
+  "_captured": "2026-03-04",
+  "courthouse": "San Bernardino Justice Center",
+  "department": "S24",
+  "judge_name": "Carlos M. Cabrera",
+  "page_count": 5,
+  "case_count": 2,
+  "primary_case_number": "CIVSB2416631",
+  "case_number_format": "CIV{LOCATION}{YYNNNNN}",
+  "hearing_date": "March 4, 2026",
+  "expected_cases": [
+    {
+      "case_number": "CIVSB2416631",
+      "case_title": "Golden State Environmental Justice Alliance v. Suraj Victorville, LLC",
+      "motion_type": "compel deposition",
+      "outcome": "denied"
+    },
+    {
+      "case_number": "CIVSB2426325",
+      "case_title": "Godinez v. Keating",
+      "motion_type": "leave to amend",
+      "outcome": "granted"
+    }
+  ],
+  "_notes": "Two-case PDF. Each case has its own header with 'TENTATIVE RULING FOR CIVSB...' format. Case titles in header line."
+}
