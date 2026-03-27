@@ -104,8 +104,11 @@ while IFS= read -r name; do
 
     # Check if this name was also ADDED (meaning it was moved/renamed, not just removed).
     # If it still exists in the codebase as a definition, it's not a removed export.
+    # Also check for import statements — if the diff adds "from ... import NAME", the
+    # name was consolidated (duplicate removed, canonical import added) not deleted.
+    # See #2091 for the false-positive scenario this addresses.
     ADDED_BACK=$(echo "$DIFF_OUTPUT" \
-        | grep -E '^\+def '"$name"'\(|^\+class '"$name"'[^a-zA-Z0-9_]|^\+'"$name"' =' \
+        | grep -E '^\+def '"$name"'\(|^\+class '"$name"'[^a-zA-Z0-9_]|^\+'"$name"' =|^\+from .+ import .*\b'"$name"'\b' \
         | head -1 || true)
     if [[ -n "$ADDED_BACK" ]]; then
         # Name was re-added (moved/renamed) — skip
