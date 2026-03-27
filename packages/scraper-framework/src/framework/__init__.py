@@ -14,6 +14,11 @@ from .enrichment import (
 )
 from .event_bus import RedisEventBus
 from .events import EventBus
+from .extraction_config import (
+    CountyExtractionConfig,
+    ExtractionMethod,
+    get_county_extraction_config,
+)
 from .hashing import content_changed, sha256_hex
 from .llm_extractor import LlmExtractor
 from .llm_schema import (
@@ -45,6 +50,8 @@ from .storage import S3Archiver, build_s3_key
 __all__ = [
     "BaseScraper",
     "ConfidenceLevel",
+    "CountyExtractionConfig",
+    "ExtractionMethod",
     "LlmExtractor",
     "CourtDirectory",
     "CourtPortalLookup",
@@ -79,6 +86,7 @@ __all__ = [
     "create_index",
     "levenshtein_distance",
     "normalize_case_number",
+    "get_county_extraction_config",
     "get_scraper_ids",
     "run_scrapers",
     "retry_async",

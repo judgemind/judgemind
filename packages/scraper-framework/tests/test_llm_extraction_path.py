@@ -933,6 +933,199 @@ class TestMultimodalExtractorInit:
             assert result is None
 
 
+class TestCountyExtractorInit:
+    """Tests for lazy initialization of the county-specific LlmExtractor (#1728)."""
+
+    def test_lazy_init_success(self) -> None:
+        """_get_county_extractor creates extractor on first call."""
+        worker, _ = _make_worker()
+
+        with patch("ingestion.worker.LlmExtractor") as mock_cls:
+            mock_instance = MagicMock()
+            mock_cls.return_value = mock_instance
+
+            result = worker._get_county_extractor("google", "gemini-2.5-flash-lite", 32768)
+            assert result is mock_instance
+            mock_cls.assert_called_once_with(
+                provider="google",
+                model="gemini-2.5-flash-lite",
+                max_output_tokens=32768,
+            )
+
+    def test_lazy_init_caches(self) -> None:
+        """_get_county_extractor returns cached instance on subsequent calls."""
+        worker, _ = _make_worker()
+
+        with patch("ingestion.worker.LlmExtractor") as mock_cls:
+            mock_instance = MagicMock()
+            mock_cls.return_value = mock_instance
+
+            result1 = worker._get_county_extractor("google", "gemini-2.5-flash-lite", 32768)
+            result2 = worker._get_county_extractor("google", "gemini-2.5-flash-lite", 32768)
+            assert result1 is result2
+            mock_cls.assert_called_once()
+
+    def test_lazy_init_failure_returns_none(self) -> None:
+        """_get_county_extractor returns None if init fails."""
+        worker, _ = _make_worker()
+
+        with patch(
+            "ingestion.worker.LlmExtractor",
+            side_effect=Exception("No Google API key"),
+        ):
+            result = worker._get_county_extractor("google", "gemini-2.5-flash-lite", 32768)
+            assert result is None
+
+    def test_different_providers_get_separate_instances(self) -> None:
+        """Different provider+model combos get separate cached instances."""
+        worker, _ = _make_worker()
+
+        with patch("ingestion.worker.LlmExtractor") as mock_cls:
+            mock_a = MagicMock()
+            mock_b = MagicMock()
+            mock_cls.side_effect = [mock_a, mock_b]
+
+            result_a = worker._get_county_extractor("google", "gemini-2.5-flash-lite", 32768)
+            result_b = worker._get_county_extractor("anthropic", "claude-sonnet", None)
+            assert result_a is not result_b
+            assert mock_cls.call_count == 2
+
+    def test_none_model_uses_empty_string_cache_key(self) -> None:
+        """When model is None, cache key uses empty string."""
+        worker, _ = _make_worker()
+
+        with patch("ingestion.worker.LlmExtractor") as mock_cls:
+            mock_instance = MagicMock()
+            mock_cls.return_value = mock_instance
+
+            result = worker._get_county_extractor("google", None, None)
+            assert result is mock_instance
+            # Should be called with only provider kwarg (no model/max_output_tokens)
+            mock_cls.assert_called_once_with(provider="google")
+
+
+class TestCountyExtractionPath:
+    """Tests for the county-specific LLM extraction path in _llm_split_document (#1728)."""
+
+    def test_riverside_uses_county_extractor(self) -> None:
+        """Riverside docs use a county-specific extractor with custom system prompt."""
+        worker, _ = _make_worker()
+
+        mock_county_extractor = MagicMock()
+        mock_county_extractor.extract.return_value = [
+            ExtractedRuling(
+                case_number="CVPS2400001",
+                case_title="Smith v. Jones",
+                ruling_text="Motion granted.",
+                outcome=ExtractionOutcome.GRANTED,
+                motion_type="Motion for Summary Judgment",
+                parties=[],
+            ),
+        ]
+
+        with (
+            patch("ingestion.worker.LlmExtractor") as mock_cls,
+            patch(
+                "framework.extraction_config.get_county_extraction_config",
+            ) as mock_get_config,
+            patch.object(worker, "process_event") as mock_process,
+        ):
+            from framework.extraction_config import CountyExtractionConfig, ExtractionMethod
+
+            mock_get_config.return_value = CountyExtractionConfig(
+                method=ExtractionMethod.LLM,
+                system_prompt="Custom Riverside prompt",
+                provider="google",
+                model="gemini-2.5-flash-lite",
+                max_output_tokens=32768,
+            )
+            mock_cls.return_value = mock_county_extractor
+
+            event = _make_event(
+                scraper_id="ca-riverside-tentatives-civil",
+                state="CA",
+                county="Riverside",
+                content_format="pdf",
+                ruling_text="Case No. CVPS2400001\nSmith v. Jones\nMotion granted.",
+            )
+            ruling_text = event["ruling_text"]
+            mock_conn, _ = _make_mock_conn()
+
+            result = worker._llm_split_document(
+                event, event["document_id"], ruling_text, "CA", "Riverside"
+            )
+
+            assert result is True
+            # County extractor was created with the right provider/model
+            mock_cls.assert_called_once_with(
+                provider="google",
+                model="gemini-2.5-flash-lite",
+                max_output_tokens=32768,
+            )
+            # extract was called with the county-specific system prompt
+            mock_county_extractor.extract.assert_called_once()
+            call_kwargs = mock_county_extractor.extract.call_args
+            assert call_kwargs.kwargs.get("system_prompt") == "Custom Riverside prompt"
+            # process_event was called for the extracted ruling
+            mock_process.assert_called_once()
+
+    def test_county_without_custom_provider_uses_framework_extractor(self) -> None:
+        """County config with no custom provider falls back to framework extractor."""
+        worker, _ = _make_worker()
+
+        mock_framework_extractor = MagicMock()
+        mock_framework_extractor.extract.return_value = [
+            ExtractedRuling(
+                case_number="2024-01234567",
+                case_title="Smith v. Jones",
+                ruling_text="Motion granted.",
+                outcome=ExtractionOutcome.GRANTED,
+                motion_type="Motion to Compel",
+                parties=[],
+            ),
+        ]
+
+        with (
+            patch(
+                "framework.extraction_config.get_county_extraction_config",
+            ) as mock_get_config,
+            patch("ingestion.worker.LlmExtractor") as mock_cls,
+            patch.object(worker, "process_event") as mock_process,
+        ):
+            from framework.extraction_config import CountyExtractionConfig, ExtractionMethod
+
+            mock_get_config.return_value = CountyExtractionConfig(
+                method=ExtractionMethod.LLM,
+                system_prompt="Custom prompt",
+                provider=None,
+                model=None,
+                max_output_tokens=None,
+            )
+            mock_cls.return_value = mock_framework_extractor
+
+            event = _make_event(
+                scraper_id="ca-example-tentatives",
+                state="CA",
+                county="Example",
+                content_format="text",
+                ruling_text="Case No. 2024-01234567\nSmith v. Jones\nMotion granted.",
+            )
+            ruling_text = event["ruling_text"]
+            mock_conn, _ = _make_mock_conn()
+
+            result = worker._llm_split_document(
+                event, event["document_id"], ruling_text, "CA", "Example"
+            )
+
+            assert result is True
+            # extract was called with the county system prompt
+            mock_framework_extractor.extract.assert_called_once()
+            call_kwargs = mock_framework_extractor.extract.call_args
+            assert call_kwargs.kwargs.get("system_prompt") == "Custom prompt"
+            # process_event was called for the extracted ruling
+            mock_process.assert_called_once()
+
+
 class TestMultimodalExtractionPath:
     """Tests for the multimodal extraction path in _llm_split_document."""
 

@@ -248,11 +248,12 @@ class LlmExtractor:
         text: str,
         *,
         metadata: dict[str, str] | None = None,
+        system_prompt: str | None = None,
     ) -> list[ExtractedRuling]:
         """Extract structured rulings from raw calendar page text.
 
         This is the main entry point.  It handles chunking for large
-        documents, calls the Anthropic API with the extraction prompt,
+        documents, calls the LLM API with the extraction prompt,
         parses the JSON response into ``ExtractedRuling`` models, and
         deduplicates rulings across chunks.
 
@@ -262,6 +263,9 @@ class LlmExtractor:
             metadata: Optional dict with authoritative scraper-provided
                 context.  Supported keys: ``judge_name``, ``department``,
                 ``hearing_date``.
+            system_prompt: Custom system prompt to use instead of the
+                default ``EXTRACTION_SYSTEM_PROMPT``.  Used for
+                county-specific prompts (e.g. Riverside).
 
         Returns:
             A list of ``ExtractedRuling`` instances.  Returns an empty list
@@ -274,7 +278,9 @@ class LlmExtractor:
         usage = TokenUsage()
 
         if len(chunks) == 1:
-            result = self._extract_chunk(chunks[0], metadata=metadata, usage=usage)
+            result = self._extract_chunk(
+                chunks[0], metadata=metadata, usage=usage, system_prompt=system_prompt
+            )
             self._log_usage(usage)
             return result.rulings if result else []
 
@@ -286,7 +292,13 @@ class LlmExtractor:
         )
         all_results: list[ExtractionResult] = []
         for i, chunk in enumerate(chunks):
-            result = self._extract_chunk(chunk, metadata=metadata, usage=usage, chunk_index=i)
+            result = self._extract_chunk(
+                chunk,
+                metadata=metadata,
+                usage=usage,
+                chunk_index=i,
+                system_prompt=system_prompt,
+            )
             if result:
                 all_results.append(result)
 
@@ -368,13 +380,30 @@ class LlmExtractor:
         metadata: dict[str, str] | None = None,
         usage: TokenUsage,
         chunk_index: int = 0,
+        system_prompt: str | None = None,
     ) -> ExtractionResult | None:
-        """Call the Anthropic API for a single text chunk and parse the result.
+        """Call the LLM API for a single text chunk and parse the result.
+
+        Supports both Anthropic and Google providers.  When the provider
+        is ``"google"``, delegates to ``call_llm`` from
+        ``ingestion.llm_providers`` which handles the Google GenAI SDK.
 
         Retries on transient errors (429, 500, 529) with exponential backoff.
         """
+        effective_prompt = system_prompt or EXTRACTION_SYSTEM_PROMPT
         user_message = self._build_user_message(text, metadata)
         delay = self._base_delay
+
+        # Google provider: delegate to the provider-agnostic call_llm helper
+        # which handles the Google GenAI SDK and retry logic.
+        if self._provider == "google":
+            return self._extract_chunk_google(
+                user_message,
+                effective_prompt,
+                usage=usage,
+                chunk_index=chunk_index,
+                metadata=metadata,
+            )
 
         for attempt in range(1, self._max_retries + 1):
             try:
@@ -382,7 +411,7 @@ class LlmExtractor:
                     model=self._model,
                     max_tokens=self._max_output_tokens,
                     temperature=0,
-                    system=EXTRACTION_SYSTEM_PROMPT,
+                    system=effective_prompt,
                     messages=[{"role": "user", "content": user_message}],
                 )
 
@@ -475,6 +504,44 @@ class LlmExtractor:
                 return None
 
         return None  # pragma: no cover — defensive
+
+    def _extract_chunk_google(
+        self,
+        user_message: str,
+        system_prompt: str,
+        *,
+        usage: TokenUsage,
+        chunk_index: int = 0,
+        metadata: dict[str, str] | None = None,
+    ) -> ExtractionResult | None:
+        """Call the Google GenAI API for a single text chunk.
+
+        Delegates to ``call_llm`` from ``ingestion.llm_providers`` which
+        handles the Google GenAI SDK, retry logic, and timeout.
+        """
+        from ingestion.llm_providers import call_llm
+
+        response = call_llm(
+            system_prompt=system_prompt,
+            user_message=user_message,
+            provider="google",
+            model=self._model,
+            max_tokens=self._max_output_tokens,
+            timeout=60.0,
+        )
+
+        if response is None:
+            logger.warning(
+                "llm_extractor.google_api_failure",
+                chunk_index=chunk_index,
+            )
+            return None
+
+        usage.input_tokens += response.input_tokens
+        usage.output_tokens += response.output_tokens
+        usage.api_calls += 1
+
+        return self._parse_response(response.text, metadata)
 
     def _extract_single_page(
         self,
