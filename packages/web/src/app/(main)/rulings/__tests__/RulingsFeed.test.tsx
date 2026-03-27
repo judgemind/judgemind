@@ -36,10 +36,30 @@ vi.mock('@/lib/display-helpers', () => ({
   formatDate: (d: string) => d,
   formatOutcome: (o: string | null) => o ?? '\u2014',
   formatMotionType: (m: string | null) => m ?? '\u2014',
+  formatLabel: (v: string | null) => {
+    if (!v) return '\u2014';
+    return v.replace(/_/g, ' ').replace(/\b\w/g, (c: string) => c.toUpperCase());
+  },
   formatJudgeName: (j: { canonicalName: string } | null) =>
     j?.canonicalName ?? '\u2014',
   getOutcomeBadgeVariant: () => 'outline',
   getOutcomeBadgeListClass: () => '',
+  OUTCOME_LABELS: {
+    granted: 'Granted',
+    denied: 'Denied',
+    granted_in_part: 'Granted In Part',
+    moot: 'Moot',
+    continued: 'Continued',
+    other: 'Other',
+  } as Record<string, string>,
+  MOTION_TYPE_LABELS: {
+    msj: 'MSJ',
+    mtd: 'MTD',
+    mil: 'MIL',
+    demurrer: 'Demurrer',
+    anti_slapp: 'Anti-SLAPP',
+    other: 'Other',
+  } as Record<string, string>,
 }));
 
 vi.mock('@/components/OutcomeBadge', () => ({
@@ -60,6 +80,7 @@ const MOCK_RULING_NODE = {
     id: 'case-1',
     caseNumber: '23STCV12345',
     caseTitle: 'Smith v. Jones',
+    caseType: 'civil',
     court: {
       county: 'Los Angeles',
       courtName: 'Superior Court of California',
@@ -85,6 +106,7 @@ const MOCK_RULINGS_DATA = {
             id: 'case-2',
             caseNumber: '23STCV67890',
             caseTitle: 'Doe v. Roe',
+            caseType: 'family',
           },
         },
       },
@@ -197,6 +219,52 @@ describe('RulingsFeed', () => {
     expect(screen.getByText('denied')).toBeInTheDocument();
     // Motion type badges
     expect(screen.getAllByText('Demurrer').length).toBe(2);
+  });
+
+  it('renders case type badges', () => {
+    mockUseQuery.mockReturnValue({
+      data: MOCK_RULINGS_DATA,
+      loading: false,
+      error: undefined,
+      fetchMore: vi.fn(),
+    });
+
+    render(<RulingsFeed />);
+    const badges = screen.getAllByTestId('case-type-badge');
+    expect(badges.length).toBe(2);
+    // formatLabel mock converts 'civil' -> 'Civil', 'family' -> 'Family'
+    expect(badges[0]).toHaveTextContent('Civil');
+    expect(badges[1]).toHaveTextContent('Family');
+  });
+
+  it('does not render case type badge when caseType is null', () => {
+    const dataWithNullCaseType = {
+      rulings: {
+        edges: [
+          {
+            cursor: 'cursor-1',
+            node: {
+              ...MOCK_RULING_NODE,
+              case: {
+                ...MOCK_RULING_NODE.case,
+                caseType: null,
+              },
+            },
+          },
+        ],
+        pageInfo: { hasNextPage: false, endCursor: null },
+      },
+    };
+
+    mockUseQuery.mockReturnValue({
+      data: dataWithNullCaseType,
+      loading: false,
+      error: undefined,
+      fetchMore: vi.fn(),
+    });
+
+    render(<RulingsFeed />);
+    expect(screen.queryByTestId('case-type-badge')).not.toBeInTheDocument();
   });
 
   it('renders sentinel element when hasNextPage is true', () => {
@@ -355,7 +423,7 @@ describe('RulingsFeed', () => {
     expect(link).toHaveAttribute('href', '/rulings/ruling-1');
   });
 
-  it('renders filter inputs', () => {
+  it('renders filter inputs including new dropdowns', () => {
     mockUseQuery.mockReturnValue({
       data: MOCK_RULINGS_DATA,
       loading: false,
@@ -364,9 +432,10 @@ describe('RulingsFeed', () => {
     });
 
     render(<RulingsFeed />);
-    expect(
-      screen.getByPlaceholderText(/County/),
-    ).toBeInTheDocument();
+    expect(screen.getByPlaceholderText(/County/)).toBeInTheDocument();
+    expect(screen.getByLabelText('Case type')).toBeInTheDocument();
+    expect(screen.getByLabelText('Outcome')).toBeInTheDocument();
+    expect(screen.getByLabelText('Motion type')).toBeInTheDocument();
   });
 
   it('date inputs have name and aria-label attributes', () => {
@@ -412,6 +481,48 @@ describe('RulingsFeed', () => {
     expect(lastCall[1].variables.county).toBe('Los Angeles');
   });
 
+  it('initializes caseType filter from URL params', () => {
+    mockSearchParamsValue = new URLSearchParams('caseType=civil');
+    mockUseQuery.mockReturnValue({
+      data: MOCK_RULINGS_DATA,
+      loading: false,
+      error: undefined,
+      fetchMore: vi.fn(),
+    });
+
+    render(<RulingsFeed />);
+    const lastCall = mockUseQuery.mock.calls[mockUseQuery.mock.calls.length - 1];
+    expect(lastCall[1].variables.caseType).toBe('civil');
+  });
+
+  it('initializes outcome filter from URL params', () => {
+    mockSearchParamsValue = new URLSearchParams('outcome=granted');
+    mockUseQuery.mockReturnValue({
+      data: MOCK_RULINGS_DATA,
+      loading: false,
+      error: undefined,
+      fetchMore: vi.fn(),
+    });
+
+    render(<RulingsFeed />);
+    const lastCall = mockUseQuery.mock.calls[mockUseQuery.mock.calls.length - 1];
+    expect(lastCall[1].variables.outcome).toBe('granted');
+  });
+
+  it('initializes motionType filter from URL params', () => {
+    mockSearchParamsValue = new URLSearchParams('motionType=msj');
+    mockUseQuery.mockReturnValue({
+      data: MOCK_RULINGS_DATA,
+      loading: false,
+      error: undefined,
+      fetchMore: vi.fn(),
+    });
+
+    render(<RulingsFeed />);
+    const lastCall = mockUseQuery.mock.calls[mockUseQuery.mock.calls.length - 1];
+    expect(lastCall[1].variables.motionType).toBe('msj');
+  });
+
   it('initializes dateFrom filter from URL params', () => {
     mockSearchParamsValue = new URLSearchParams('dateFrom=2026-01-01');
     mockUseQuery.mockReturnValue({
@@ -441,7 +552,9 @@ describe('RulingsFeed', () => {
   });
 
   it('updates URL with all filter params', () => {
-    mockSearchParamsValue = new URLSearchParams('county=Orange&dateFrom=2026-01-01&dateTo=2026-06-30');
+    mockSearchParamsValue = new URLSearchParams(
+      'county=Orange&caseType=civil&outcome=granted&motionType=msj&dateFrom=2026-01-01&dateTo=2026-06-30',
+    );
     mockUseQuery.mockReturnValue({
       data: MOCK_RULINGS_DATA,
       loading: false,
@@ -454,10 +567,54 @@ describe('RulingsFeed', () => {
       expect.stringContaining('county=Orange'),
     );
     expect(mockReplace).toHaveBeenCalledWith(
+      expect.stringContaining('caseType=civil'),
+    );
+    expect(mockReplace).toHaveBeenCalledWith(
+      expect.stringContaining('outcome=granted'),
+    );
+    expect(mockReplace).toHaveBeenCalledWith(
+      expect.stringContaining('motionType=msj'),
+    );
+    expect(mockReplace).toHaveBeenCalledWith(
       expect.stringContaining('dateFrom=2026-01-01'),
     );
     expect(mockReplace).toHaveBeenCalledWith(
       expect.stringContaining('dateTo=2026-06-30'),
     );
+  });
+
+  it('passes new filter variables to GraphQL query', () => {
+    mockSearchParamsValue = new URLSearchParams(
+      'caseType=family&outcome=denied&motionType=mtd',
+    );
+    mockUseQuery.mockReturnValue({
+      data: MOCK_RULINGS_DATA,
+      loading: false,
+      error: undefined,
+      fetchMore: vi.fn(),
+    });
+
+    render(<RulingsFeed />);
+    const lastCall = mockUseQuery.mock.calls[mockUseQuery.mock.calls.length - 1];
+    expect(lastCall[1].variables.caseType).toBe('family');
+    expect(lastCall[1].variables.outcome).toBe('denied');
+    expect(lastCall[1].variables.motionType).toBe('mtd');
+  });
+
+  it('sends undefined for empty filter values', () => {
+    mockSearchParamsValue = new URLSearchParams();
+    mockUseQuery.mockReturnValue({
+      data: MOCK_RULINGS_DATA,
+      loading: false,
+      error: undefined,
+      fetchMore: vi.fn(),
+    });
+
+    render(<RulingsFeed />);
+    const lastCall = mockUseQuery.mock.calls[mockUseQuery.mock.calls.length - 1];
+    expect(lastCall[1].variables.caseType).toBeUndefined();
+    expect(lastCall[1].variables.outcome).toBeUndefined();
+    expect(lastCall[1].variables.motionType).toBeUndefined();
+    expect(lastCall[1].variables.county).toBeUndefined();
   });
 });

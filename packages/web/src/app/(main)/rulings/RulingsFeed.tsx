@@ -6,8 +6,11 @@ import { useRouter, useSearchParams } from 'next/navigation';
 import Link from 'next/link';
 import {
   formatDate,
+  formatLabel,
   formatMotionType,
   formatJudgeName,
+  OUTCOME_LABELS,
+  MOTION_TYPE_LABELS,
 } from '@/lib/display-helpers';
 import { Autocomplete } from '@/components/Autocomplete';
 import { InfiniteScrollTrigger } from '@/components/InfiniteScrollTrigger';
@@ -16,11 +19,21 @@ import { useInfiniteScroll } from '@/hooks/useInfiniteScroll';
 import { useCountyOptions } from '@/lib/filter-options';
 import { Badge } from '@/components/ui/badge';
 import { Input } from '@/components/ui/input';
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select';
 import { Skeleton } from '@/components/ui/skeleton';
 
 const RULINGS_QUERY = gql`
   query Rulings(
     $county: String
+    $caseType: String
+    $outcome: String
+    $motionType: String
     $dateFrom: String
     $dateTo: String
     $first: Int!
@@ -28,6 +41,9 @@ const RULINGS_QUERY = gql`
   ) {
     rulings(
       county: $county
+      caseType: $caseType
+      outcome: $outcome
+      motionType: $motionType
       dateFrom: $dateFrom
       dateTo: $dateTo
       first: $first
@@ -45,6 +61,7 @@ const RULINGS_QUERY = gql`
             id
             caseNumber
             caseTitle
+            caseType
             court {
               county
               courtName
@@ -73,6 +90,7 @@ interface RulingNode {
     id: string;
     caseNumber: string;
     caseTitle: string | null;
+    caseType: string | null;
     court: {
       county: string;
       courtName: string;
@@ -91,6 +109,15 @@ interface RulingsData {
 }
 
 const PAGE_SIZE = 20;
+
+/** Known case type filter options (matches CasesList). */
+const CASE_TYPES = ['civil', 'family', 'probate', 'small_claims', 'other'] as const;
+
+/** Outcome filter options. */
+const OUTCOMES = ['granted', 'denied', 'granted_in_part', 'moot', 'continued', 'other'] as const;
+
+/** Motion type filter options. */
+const MOTION_TYPES = ['msj', 'mtd', 'mil', 'demurrer', 'anti_slapp', 'other'] as const;
 
 
 function SkeletonRow() {
@@ -116,12 +143,18 @@ export function RulingsFeed() {
   const searchParams = useSearchParams();
 
   const [county, setCounty] = useState(searchParams.get('county') ?? '');
+  const [caseType, setCaseType] = useState(searchParams.get('caseType') ?? '');
+  const [outcome, setOutcome] = useState(searchParams.get('outcome') ?? '');
+  const [motionType, setMotionType] = useState(searchParams.get('motionType') ?? '');
   const [dateFrom, setDateFrom] = useState(searchParams.get('dateFrom') ?? '');
   const [dateTo, setDateTo] = useState(searchParams.get('dateTo') ?? '');
   const countyOptions = useCountyOptions();
 
   useEffect(() => {
     setCounty(searchParams.get('county') ?? '');
+    setCaseType(searchParams.get('caseType') ?? '');
+    setOutcome(searchParams.get('outcome') ?? '');
+    setMotionType(searchParams.get('motionType') ?? '');
     setDateFrom(searchParams.get('dateFrom') ?? '');
     setDateTo(searchParams.get('dateTo') ?? '');
   }, [searchParams]);
@@ -129,11 +162,14 @@ export function RulingsFeed() {
   const updateUrl = useCallback(() => {
     const params = new URLSearchParams();
     if (county) params.set('county', county);
+    if (caseType) params.set('caseType', caseType);
+    if (outcome) params.set('outcome', outcome);
+    if (motionType) params.set('motionType', motionType);
     if (dateFrom) params.set('dateFrom', dateFrom);
     if (dateTo) params.set('dateTo', dateTo);
     const search = params.toString();
     router.replace(search ? `/rulings?${search}` : '/rulings');
-  }, [county, dateFrom, dateTo, router]);
+  }, [county, caseType, outcome, motionType, dateFrom, dateTo, router]);
 
   useEffect(() => {
     updateUrl();
@@ -142,6 +178,9 @@ export function RulingsFeed() {
   const { data, loading, error, fetchMore } = useQuery<RulingsData>(RULINGS_QUERY, {
     variables: {
       county: county || undefined,
+      caseType: caseType || undefined,
+      outcome: outcome || undefined,
+      motionType: motionType || undefined,
       dateFrom: dateFrom || undefined,
       dateTo: dateTo || undefined,
       first: PAGE_SIZE,
@@ -180,6 +219,54 @@ export function RulingsFeed() {
           aria-label="County"
           className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
         />
+        <Select
+          value={caseType || 'all'}
+          onValueChange={(v) => setCaseType(v === 'all' ? '' : v)}
+        >
+          <SelectTrigger className="w-auto min-w-[140px]" aria-label="Case type" name="caseType">
+            <SelectValue placeholder="All types" />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="all">All types</SelectItem>
+            {CASE_TYPES.map((ct) => (
+              <SelectItem key={ct} value={ct}>
+                {formatLabel(ct)}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+        <Select
+          value={outcome || 'all'}
+          onValueChange={(v) => setOutcome(v === 'all' ? '' : v)}
+        >
+          <SelectTrigger className="w-auto min-w-[140px]" aria-label="Outcome" name="outcome">
+            <SelectValue placeholder="All outcomes" />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="all">All outcomes</SelectItem>
+            {OUTCOMES.map((o) => (
+              <SelectItem key={o} value={o}>
+                {OUTCOME_LABELS[o] ?? o}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+        <Select
+          value={motionType || 'all'}
+          onValueChange={(v) => setMotionType(v === 'all' ? '' : v)}
+        >
+          <SelectTrigger className="w-auto min-w-[140px]" aria-label="Motion type" name="motionType">
+            <SelectValue placeholder="All motions" />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="all">All motions</SelectItem>
+            {MOTION_TYPES.map((mt) => (
+              <SelectItem key={mt} value={mt}>
+                {MOTION_TYPE_LABELS[mt] ?? mt}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
         <Input
           type="date"
           name="dateFrom"
@@ -256,6 +343,11 @@ export function RulingsFeed() {
                       <Badge variant="outline" className="text-muted-foreground">
                         {formatMotionType(node.motionType)}
                       </Badge>
+                      {node.case?.caseType && (
+                        <Badge variant="secondary" data-testid="case-type-badge">
+                          {formatLabel(node.case.caseType)}
+                        </Badge>
+                      )}
                     </div>
                   </div>
 

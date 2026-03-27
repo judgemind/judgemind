@@ -308,6 +308,8 @@ export const resolvers = {
         courtId,
         county,
         outcome,
+        motionType,
+        caseType,
         dateFrom,
         dateTo,
         caseNumber,
@@ -320,6 +322,8 @@ export const resolvers = {
         courtId?: string;
         county?: string;
         outcome?: string;
+        motionType?: string;
+        caseType?: string;
         dateFrom?: string;
         dateTo?: string;
         caseNumber?: string;
@@ -359,6 +363,14 @@ export const resolvers = {
         conditions.push(`r.outcome = $${i++}`);
         params.push(outcome);
       }
+      if (motionType) {
+        conditions.push(`r.motion_type = $${i++}`);
+        params.push(motionType);
+      }
+      if (caseType) {
+        conditions.push(`cs.case_type = $${i++}`);
+        params.push(caseType);
+      }
       if (dateFrom) {
         conditions.push(`r.hearing_date >= $${i++}`);
         params.push(dateFrom);
@@ -381,9 +393,10 @@ export const resolvers = {
       }
 
       // Only JOIN tables when their columns are used in filters
+      const needCasesJoin = caseNumber !== undefined || caseType !== undefined;
       const joins = [
         county !== undefined ? 'JOIN courts ct ON ct.id = r.court_id' : '',
-        caseNumber !== undefined ? 'JOIN cases cs ON cs.id = r.case_id' : '',
+        needCasesJoin ? 'JOIN cases cs ON cs.id = r.case_id' : '',
       ]
         .filter(Boolean)
         .join(' ');
