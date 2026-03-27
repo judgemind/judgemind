@@ -28,6 +28,7 @@ from ingestion.db import (
     insert_document,
     insert_document_and_ruling,
     insert_ruling,
+    lookup_existing_case_title,
     normalize_case_title,
     normalize_judge_name,
     normalize_party_name,
@@ -36,6 +37,7 @@ from ingestion.db import (
     upsert_case,
     upsert_case_judge,
     upsert_case_party,
+    upsert_case_returning_title,
     upsert_court,
     upsert_party,
 )
@@ -2111,3 +2113,114 @@ class TestInsertDocumentAndRuling:
         assert ruling_params[10] == "Motion was granted."  # summary
         assert ruling_params[11] == "gemini-2.0-flash"  # summary_model
         assert ruling_params[12] == summary_ts  # summary_generated_at
+
+
+# ---------------------------------------------------------------------------
+# lookup_existing_case_title (#2006)
+# ---------------------------------------------------------------------------
+
+
+class TestLookupExistingCaseTitle:
+    """Unit tests for the lookup_existing_case_title function."""
+
+    def test_returns_title_when_case_exists(self) -> None:
+        """Should return the case_title when a matching case exists in the DB."""
+        conn = _mock_conn()
+        cur = conn.cursor.return_value.__enter__.return_value
+        cur.fetchone.return_value = ("Smith v. Jones",)
+
+        result = lookup_existing_case_title(conn, "24STCV12345", "court-uuid-1")
+
+        assert result == "Smith v. Jones"
+        cur.execute.assert_called_once()
+        params = cur.execute.call_args[0][1]
+        assert params == ("court-uuid-1", "24STCV12345")
+
+    def test_returns_none_when_case_not_found(self) -> None:
+        """Should return None when no matching case exists in the DB."""
+        conn = _mock_conn()
+        cur = conn.cursor.return_value.__enter__.return_value
+        cur.fetchone.return_value = None
+
+        result = lookup_existing_case_title(conn, "NOSUCH123", "court-uuid-1")
+
+        assert result is None
+
+    def test_returns_none_when_title_is_null(self) -> None:
+        """Should return None when the case exists but has a null title."""
+        conn = _mock_conn()
+        cur = conn.cursor.return_value.__enter__.return_value
+        cur.fetchone.return_value = (None,)
+
+        result = lookup_existing_case_title(conn, "24STCV12345", "court-uuid-1")
+
+        assert result is None
+
+
+# ---------------------------------------------------------------------------
+# upsert_case_returning_title (#2006)
+# ---------------------------------------------------------------------------
+
+
+class TestUpsertCaseReturningTitle:
+    """Unit tests for the upsert_case_returning_title function."""
+
+    def test_returns_id_and_title(self) -> None:
+        """Should return both the case UUID and the effective case_title."""
+        conn = _mock_conn()
+        cur = conn.cursor.return_value.__enter__.return_value
+        cur.fetchone.return_value = ("case-uuid-1", "Smith v. Jones")
+
+        case_id, title = upsert_case_returning_title(
+            conn, "24STCV12345", "court-uuid-1", case_title="Smith v. Jones"
+        )
+
+        assert case_id == "case-uuid-1"
+        assert title == "Smith v. Jones"
+
+    def test_returns_existing_title_on_conflict(self) -> None:
+        """When inserting with null title, COALESCE preserves the existing title."""
+        conn = _mock_conn()
+        cur = conn.cursor.return_value.__enter__.return_value
+        # Simulate: inserted with null title, DB returned existing title
+        cur.fetchone.return_value = ("case-uuid-1", "Existing Title v. Defendant")
+
+        case_id, title = upsert_case_returning_title(
+            conn, "24STCV12345", "court-uuid-1", case_title=None
+        )
+
+        assert case_id == "case-uuid-1"
+        assert title == "Existing Title v. Defendant"
+
+    def test_returns_none_title_when_no_title_exists(self) -> None:
+        """When no title exists and none provided, effective_title is None."""
+        conn = _mock_conn()
+        cur = conn.cursor.return_value.__enter__.return_value
+        cur.fetchone.return_value = ("case-uuid-1", None)
+
+        case_id, title = upsert_case_returning_title(
+            conn, "24STCV12345", "court-uuid-1", case_title=None
+        )
+
+        assert case_id == "case-uuid-1"
+        assert title is None
+
+    def test_handles_single_column_return(self) -> None:
+        """Gracefully handles RETURNING with only one column (backwards compat)."""
+        conn = _mock_conn()
+        cur = conn.cursor.return_value.__enter__.return_value
+        cur.fetchone.return_value = ("case-uuid-1",)
+
+        case_id, title = upsert_case_returning_title(conn, "24STCV12345", "court-uuid-1")
+
+        assert case_id == "case-uuid-1"
+        assert title is None
+
+    def test_raises_on_no_row(self) -> None:
+        """Should raise RuntimeError when fetchone returns None."""
+        conn = _mock_conn()
+        cur = conn.cursor.return_value.__enter__.return_value
+        cur.fetchone.return_value = None
+
+        with pytest.raises(RuntimeError, match="could not retrieve case id"):
+            upsert_case_returning_title(conn, "24STCV12345", "court-uuid-1")

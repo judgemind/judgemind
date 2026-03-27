@@ -53,8 +53,8 @@ from .db import (
     batch_upsert_parties,
     insert_document_and_ruling,
     resolve_judge,
-    upsert_case,
     upsert_case_judge,
+    upsert_case_returning_title,
     upsert_court,
 )
 from .extract import (
@@ -1259,9 +1259,26 @@ class IngestionWorker:
                     "No case_number extractable for document — using synthetic UNKNOWN identifier",
                     extra={"document_id": document_id},
                 )
-            case_id = upsert_case(
+            # 2b. Cross-case title lookup via upsert (#2006).
+            # Use upsert_case_returning_title to get the effective title after
+            # COALESCE — if the DB already has a title from a prior ruling and
+            # this ingestion has no title, the existing title is preserved and
+            # returned.  This prevents future null-title warnings for cases
+            # that have already been titled.
+            case_id, effective_title = upsert_case_returning_title(
                 conn, effective_case_number, court_id, case_title=case_title, case_type=case_type
             )
+            if not case_title and effective_title:
+                case_title = effective_title
+                extraction_methods.setdefault("case_title", "db_lookup")
+                logger.info(
+                    "Populated case_title from existing DB record",
+                    extra={
+                        "document_id": document_id,
+                        "case_number": effective_case_number,
+                        "case_title": effective_title,
+                    },
+                )
 
             # 3. Resolve judge name to canonical judge record
             judge_id: str | None = None
