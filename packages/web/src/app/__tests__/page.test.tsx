@@ -1,7 +1,8 @@
 import { describe, it, expect, vi } from 'vitest';
-import { render, screen } from '@testing-library/react';
+import { render, screen, fireEvent } from '@testing-library/react';
 
 const mockUseQuery = vi.fn();
+const mockPush = vi.fn();
 
 vi.mock('@apollo/client', () => ({
   useQuery: (...args: unknown[]) => mockUseQuery(...args),
@@ -21,6 +22,16 @@ vi.mock('next/link', () => ({
     <a href={href} {...props}>
       {children}
     </a>
+  ),
+}));
+
+vi.mock('next/navigation', () => ({
+  useRouter: () => ({ push: mockPush, replace: vi.fn(), back: vi.fn() }),
+}));
+
+vi.mock('lucide-react', () => ({
+  Search: ({ className }: { className?: string }) => (
+    <span data-testid="search-icon" className={className} />
   ),
 }));
 
@@ -101,7 +112,7 @@ describe('HomePage', () => {
   it('renders CTA buttons using Button component (no inline bg-brand-600)', () => {
     mockUseQuery.mockReturnValue({ data: null, loading: true, error: null });
     render(<HomePage />);
-    const searchLink = screen.getByText('Search rulings').closest('a');
+    const searchLink = screen.getByText('Advanced search').closest('a');
     expect(searchLink).toHaveAttribute('href', '/search');
     // The link should NOT have bg-brand-600 inline styles
     expect(searchLink?.className).not.toContain('bg-brand-600');
@@ -216,5 +227,50 @@ describe('HomePage', () => {
     for (const el of allElements) {
       expect(el.className).not.toContain('bg-brand-600');
     }
+  });
+
+  it('renders a search bar in the hero area', () => {
+    mockUseQuery.mockReturnValue({ data: null, loading: true, error: null });
+    render(<HomePage />);
+    const searchForm = screen.getByTestId('hero-search');
+    expect(searchForm).toBeInTheDocument();
+    const searchInput = screen.getByLabelText('Search rulings');
+    expect(searchInput).toBeInTheDocument();
+    expect(searchInput).toHaveAttribute('type', 'search');
+    expect(searchInput).toHaveAttribute('name', 'q');
+  });
+
+  it('navigates to /search?q=<query> on form submission', () => {
+    mockUseQuery.mockReturnValue({ data: null, loading: true, error: null });
+    mockPush.mockClear();
+    render(<HomePage />);
+    const searchInput = screen.getByLabelText('Search rulings');
+    fireEvent.change(searchInput, { target: { value: 'summary judgment' } });
+    const form = screen.getByTestId('hero-search');
+    fireEvent.submit(form);
+    expect(mockPush).toHaveBeenCalledWith('/search?q=summary+judgment');
+  });
+
+  it('does not navigate on empty search submission', () => {
+    mockUseQuery.mockReturnValue({ data: null, loading: true, error: null });
+    mockPush.mockClear();
+    render(<HomePage />);
+    const form = screen.getByTestId('hero-search');
+    fireEvent.submit(form);
+    expect(mockPush).not.toHaveBeenCalled();
+  });
+
+  it('renders the search bar as the most prominent interactive element', () => {
+    mockUseQuery.mockReturnValue({ data: null, loading: true, error: null });
+    render(<HomePage />);
+    const searchInput = screen.getByLabelText('Search rulings');
+    // The search input should have h-12 class making it taller than standard inputs
+    expect(searchInput.className).toContain('h-12');
+    // The hero search form should appear before the CTA buttons in the DOM
+    const heroSearch = screen.getByTestId('hero-search');
+    const advancedSearchLink = screen.getByText('Advanced search').closest('a');
+    expect(heroSearch.compareDocumentPosition(advancedSearchLink!)).toBe(
+      Node.DOCUMENT_POSITION_FOLLOWING,
+    );
   });
 });
