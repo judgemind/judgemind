@@ -1,0 +1,94 @@
+{
+  "_fixture": "cc_dept14_031026.pdf",
+  "_description": "Contra Costa Dept 14 (Richmond) — civil/limited, 12 cases, 2026-03-10",
+  "judge_name": "Kirk Athanasiou",
+  "department": "14",
+  "hearing_date": "2026-03-10",
+  "case_count": 12,
+  "cases": [
+    {
+      "case_number": "L23-06679",
+      "case_title": "Discover Bank v. Gerald Gilchrist",
+      "case_type": "civil",
+      "motion_type": "motion_to_be_relieved_as_counsel",
+      "outcome": "other"
+    },
+    {
+      "case_number": "L24-02704",
+      "case_title": "LVNV Funding LLC v. Nicole Munoz",
+      "case_type": "civil",
+      "motion_type": "motion_to_vacate",
+      "outcome": "granted"
+    },
+    {
+      "case_number": "L24-07111",
+      "case_title": "Citibank, N.A. v. Diana Henderson",
+      "case_type": "civil",
+      "motion_type": "motion_to_enter_judgment",
+      "outcome": "granted"
+    },
+    {
+      "case_number": "L24-10336",
+      "case_title": "Discover Bank v. Lavon Britt, Jr.",
+      "case_type": "civil",
+      "motion_type": "motion_to_enter_judgment",
+      "outcome": "granted"
+    },
+    {
+      "case_number": "L25-01552",
+      "case_title": "Wells Fargo Bank, N.A. v. Bryan Manuel",
+      "case_type": "civil",
+      "motion_type": "msj",
+      "outcome": "granted"
+    },
+    {
+      "case_number": "L25-02009",
+      "case_title": "Discover Bank v. Leon Norford",
+      "case_type": "civil",
+      "motion_type": "motion_to_enter_judgment",
+      "outcome": "granted"
+    },
+    {
+      "case_number": "L25-04349",
+      "case_title": "Wells Fargo Bank, NA v. Pedro Garcia",
+      "case_type": "civil",
+      "motion_type": "motion_for_judgment_on_pleadings",
+      "outcome": "granted"
+    },
+    {
+      "case_number": "L25-05653",
+      "case_title": "Marcos Ramos Ventura v. Babushka Russian Deli & Cafe, Inc.",
+      "case_type": "civil",
+      "motion_type": "motion_to_strike",
+      "outcome": "granted"
+    },
+    {
+      "case_number": "L25-06986",
+      "case_title": "Bank of America N.A. v. Rafael Romero-Romero",
+      "case_type": "civil",
+      "motion_type": "motion_to_enter_judgment",
+      "outcome": "granted"
+    },
+    {
+      "case_number": "L25-07038",
+      "case_title": "Bank of America N.A. v. Rafael Romero-Romero",
+      "case_type": "civil",
+      "motion_type": "motion_to_enter_judgment",
+      "outcome": "granted"
+    },
+    {
+      "case_number": "N25-2474",
+      "case_title": "Betty Vetro v. Tampico Healthcare Center, LLC",
+      "case_type": "civil",
+      "motion_type": "petition",
+      "outcome": "granted"
+    },
+    {
+      "case_number": "RS24-0953",
+      "case_title": "BG Asset Management, Inc. v. Lisa Davidson",
+      "case_type": "civil",
+      "motion_type": "motion_for_leave_to_amend",
+      "outcome": "granted"
+    }
+  ]
+}
