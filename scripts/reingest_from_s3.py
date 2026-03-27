@@ -128,6 +128,7 @@ from ingestion.llm_extract import (  # noqa: E402
     extract_text_from_pdf,
 )
 from ingestion.llm_providers import create_client as create_llm_client  # noqa: E402
+from ingestion.ruling_guards import convert_extracted_rulings  # noqa: E402
 from ingestion.split_ids import is_split_child_id, make_split_document_id  # noqa: E402
 
 configure_structlog(contextvars=True)
@@ -1278,69 +1279,51 @@ def _reparse_document_multimodal(
     if not content_hash:
         content_hash = hashlib.sha256(raw_content).hexdigest()
 
-    is_multi = len(extracted_rulings) > 1
+    # Convert ExtractedRuling objects using the shared multi-ruling guard
+    # logic (#2084).  The cross-contamination guard and field conversion are
+    # now in ingestion.ruling_guards — both worker.py and this script call
+    # the same function.  Reingest-specific fields (hearing_date parsing,
+    # case_number UNKNOWN fallback, extraction_methods, etc.) are layered
+    # on top of the shared result.
+    converted = convert_extracted_rulings(
+        extracted_rulings,
+        doc_meta["document_id"],
+        fallback_text="",
+        normalize_motion=True,
+    )
+
     results: list[dict] = []
 
-    for idx, ruling in enumerate(extracted_rulings):
-        # Map outcome enum to string value.
-        outcome_str: str | None = None
-        if ruling.outcome is not None:
-            outcome_str = ruling.outcome.value
-
-        # Build parties list.
-        parties_data: list[dict[str, str]] = []
-        for party in ruling.extracted_parties:
-            parties_data.append({"name": party.name, "role": party.role})
-
+    for cr in converted:
         # Parse hearing_date from string to date if present.
         hearing_date_val = doc_meta.get("hearing_date")
-        if ruling.hearing_date:
+        if cr.hearing_date:
             try:
-                hearing_date_val = date.fromisoformat(ruling.hearing_date)
+                hearing_date_val = date.fromisoformat(cr.hearing_date)
             except (ValueError, TypeError):
                 pass
 
-        # Determine document ID for this ruling.
-        if is_multi:
-            split_doc_id = make_split_document_id(doc_meta["document_id"], idx)
-        else:
-            split_doc_id = doc_meta["document_id"]
-
-        # Guard against cross-contamination (#2078): when multiple rulings
-        # are extracted from a single PDF, an empty ruling_text must NOT
-        # fall back to the full document text.  This mirrors the guard in
-        # worker.py line 1579.  For single-ruling documents the empty
-        # string preserves backward compatibility.
-        ruling_text_value: str | None = ruling.ruling_text or (
-            "" if not is_multi else None
-        )
-
         extracted: dict = {
-            "ruling_text": ruling_text_value,
+            "ruling_text": cr.ruling_text,
             "case_number": (
-                ruling.extracted_case_number
+                cr.case_number
                 or doc_meta.get("case_number")
-                or f"UNKNOWN-{split_doc_id}"
+                or f"UNKNOWN-{cr.document_id}"
             ),
-            "case_title": ruling.extracted_case_title or doc_meta.get("case_title"),
-            "case_type": ruling.case_type.value if ruling.case_type else None,
-            "judge_name": ruling.extracted_judge_name or doc_judge_name,
-            "outcome": outcome_str,
-            # Normalize multimodal-provided motion_type to snake_case (#1849).
-            "motion_type": (
-                normalize_motion_type(ruling.motion_type)
-                if ruling.motion_type
-                else None
-            ),
-            "department": ruling.department or doc_department,
-            "parties": parties_data,
+            "case_title": cr.case_title or doc_meta.get("case_title"),
+            "case_type": cr.case_type,
+            "judge_name": cr.judge_name or doc_judge_name,
+            "outcome": cr.outcome,
+            "motion_type": cr.motion_type,
+            "department": cr.department or doc_department,
+            "parties": cr.parties,
             "hearing_date": hearing_date_val,
             "extraction_methods": {"_all": "multimodal"},
             "llm_skipped": False,
             "llm_outcome": "multimodal_success",
-            "ruling_index": idx,
-            "split_document_id": split_doc_id,
-            "is_split": is_multi,
+            "ruling_index": cr.split_index,
+            "split_document_id": cr.document_id,
+            "is_split": cr.is_multi,
         }
 
         # Apply regex fallbacks for any fields still missing.

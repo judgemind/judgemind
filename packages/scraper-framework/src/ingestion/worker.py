@@ -83,8 +83,8 @@ from .llm_extract import (
 )
 from .llm_providers import create_client as create_llm_client
 from .ruling_formatter import format_ruling_text
+from .ruling_guards import convert_extracted_rulings
 from .ruling_summarizer import summarize_ruling
-from .split_ids import make_split_document_id
 from .text_cleanup import clean_ruling_text
 
 if TYPE_CHECKING:
@@ -1550,41 +1550,35 @@ class IngestionWorker:
             },
         )
 
-        # Convert ExtractedRuling objects to split events. For single-ruling
-        # documents, keep the original document_id (no split prefix).
-        is_multi = len(extracted_rulings) > 1
+        # Convert ExtractedRuling objects to split events using the shared
+        # multi-ruling guard logic (#2084).  For single-ruling documents the
+        # full document text is the fallback; for multi-ruling documents the
+        # guard returns None to prevent cross-contamination (#2057, #2078).
+        converted = convert_extracted_rulings(
+            extracted_rulings,
+            document_id,
+            fallback_text=ruling_text,
+        )
 
-        for idx, ruling in enumerate(extracted_rulings):
-            split_doc_id = make_split_document_id(document_id, idx) if is_multi else document_id
-
-            # Build parties list in the format expected by batch_upsert_parties.
-            parties_data: list[dict[str, str]] = []
-            for party in ruling.extracted_parties:
-                parties_data.append({"name": party.name, "role": party.role})
-
-            # Map outcome enum to string value for the DB.
-            outcome_str: str | None = None
-            if ruling.outcome is not None:
-                outcome_str = ruling.outcome.value
-
+        for cr in converted:
             split_event: dict[str, Any] = {
                 **event_data,
-                "document_id": split_doc_id,
-                "_original_document_id": document_id,
+                "document_id": cr.document_id,
+                "_original_document_id": cr.original_document_id,
                 "_split_processed": True,
                 "_llm_extracted": True,
-                "_split_index": idx,
-                "_split_count": len(extracted_rulings),
-                # Fields from LLM extraction:
-                "ruling_text": ruling.ruling_text or (ruling_text if not is_multi else None),
-                "case_number": ruling.extracted_case_number or event_data.get("case_number"),
-                "case_title": ruling.extracted_case_title or event_data.get("case_title"),
-                "judge_name": ruling.extracted_judge_name or event_data.get("judge_name"),
-                "department": ruling.department or event_data.get("department"),
-                "motion_type": ruling.motion_type or event_data.get("motion_type"),
-                "outcome": outcome_str or event_data.get("outcome"),
-                "hearing_date": ruling.hearing_date or event_data.get("hearing_date"),
-                "parties": parties_data if parties_data else event_data.get("parties", []),
+                "_split_index": cr.split_index,
+                "_split_count": cr.split_count,
+                # Fields from LLM extraction (fall back to event_data):
+                "ruling_text": cr.ruling_text,
+                "case_number": cr.case_number or event_data.get("case_number"),
+                "case_title": cr.case_title or event_data.get("case_title"),
+                "judge_name": cr.judge_name or event_data.get("judge_name"),
+                "department": cr.department or event_data.get("department"),
+                "motion_type": cr.motion_type or event_data.get("motion_type"),
+                "outcome": cr.outcome or event_data.get("outcome"),
+                "hearing_date": cr.hearing_date or event_data.get("hearing_date"),
+                "parties": cr.parties if cr.parties else event_data.get("parties", []),
             }
 
             self.process_event(split_event)
