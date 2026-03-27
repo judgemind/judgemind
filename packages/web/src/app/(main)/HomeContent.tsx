@@ -1,10 +1,14 @@
 'use client';
 
+import { useState } from 'react';
 import Link from 'next/link';
+import { useRouter } from 'next/navigation';
 import { useQuery, gql } from '@apollo/client';
+import { Search } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
+import { Input } from '@/components/ui/input';
 import { Skeleton } from '@/components/ui/skeleton';
 import {
   formatDate,
@@ -283,6 +287,47 @@ function HowItWorks() {
   );
 }
 
+function HeroSearch() {
+  const router = useRouter();
+  const [query, setQuery] = useState('');
+
+  function handleSubmit(e: React.FormEvent) {
+    e.preventDefault();
+    const trimmed = query.trim();
+    if (!trimmed) return;
+    const params = new URLSearchParams();
+    params.set('q', trimmed);
+    router.push(`/search?${params.toString()}`);
+  }
+
+  return (
+    <form onSubmit={handleSubmit} data-testid="hero-search">
+      <div className="relative">
+        <Search
+          className="absolute left-4 top-1/2 h-5 w-5 -translate-y-1/2 text-muted-foreground"
+          aria-hidden="true"
+        />
+        <Input
+          type="search"
+          name="q"
+          value={query}
+          onChange={(e) => setQuery(e.target.value)}
+          placeholder="Search by keyword, case number, judge, or party\u2026"
+          className="h-12 pl-11 pr-24 text-base"
+          aria-label="Search rulings"
+        />
+        <Button
+          type="submit"
+          size="sm"
+          className="absolute right-2 top-1/2 -translate-y-1/2"
+        >
+          Search
+        </Button>
+      </div>
+    </form>
+  );
+}
+
 export function HomeContent() {
   return (
     <div className="mx-auto max-w-3xl space-y-8">
@@ -296,9 +341,11 @@ export function HomeContent() {
         </p>
       </div>
 
+      <HeroSearch />
+
       <div className="flex gap-3">
-        <Button asChild>
-          <Link href="/search">Search rulings</Link>
+        <Button variant="outline" asChild>
+          <Link href="/search">Advanced search</Link>
         </Button>
         <Button variant="outline" asChild>
           <Link href="/rulings">Latest rulings</Link>
