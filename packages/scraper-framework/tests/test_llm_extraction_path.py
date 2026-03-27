@@ -1425,7 +1425,7 @@ class TestCountyExtractionPath:
         mock_county_extractor.extract.return_value = [
             ExtractedRuling(
                 extracted_case_number="FPT-25-378624",
-                extracted_case_title="Graves v. Long",
+                extracted_case_title="Michael Edward Graves v. Ranjie Long",
                 ruling_text="The court grants the request for change of custody.",
                 outcome=ExtractionOutcome.GRANTED,
                 motion_type="Request for Order for Change of Child Custody",
@@ -1496,7 +1496,7 @@ class TestCountyExtractionPath:
             # Verify the split event has the LLM-extracted fields
             split_event = mock_process.call_args[0][0]
             assert split_event["case_number"] == "FPT-25-378624"
-            assert split_event["case_title"] == "Graves v. Long"
+            assert split_event["case_title"] == "Michael Edward Graves v. Ranjie Long"
             assert split_event["_llm_extracted"] is True
 
     def test_san_francisco_multi_case_split(self) -> None:
@@ -1507,7 +1507,7 @@ class TestCountyExtractionPath:
         mock_county_extractor.extract.return_value = [
             ExtractedRuling(
                 extracted_case_number="FPT-25-378624",
-                extracted_case_title="Graves v. Long",
+                extracted_case_title="Michael Edward Graves v. Ranjie Long",
                 ruling_text="The court grants the request for change of custody.",
                 outcome=ExtractionOutcome.GRANTED,
                 motion_type="Request for Order for Change of Child Custody",
