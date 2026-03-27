@@ -34,9 +34,11 @@ from courts.ca.la_tentatives import (
     _llm_extract_rulings,
     _parse_dropdown_options,
     _parse_option,
+    _replace_ruling_text_from_html,
     _sanitize_title,
     _split_cases_html,
     _split_party_names,
+    _split_rulings,
     _truncate_party_list,
     default_config,
 )
@@ -2245,3 +2247,172 @@ class TestFetchDocumentsLlmPath:
         assert len(docs) > 0
         first = docs[0]
         assert first.extra.get("_llm_extracted") is not True
+
+
+# ---------------------------------------------------------------------------
+# _split_rulings — regex-based splitting for reingest (#2007)
+# ---------------------------------------------------------------------------
+
+
+class TestSplitRulings:
+    """Tests for _split_rulings() — the regex-based splitting path."""
+
+    def test_multi_case_page_splits(self) -> None:
+        """Multi-case department page is split into individual rulings."""
+        html = _load("la_ruling_response.html")
+        rulings = _split_rulings(html)
+        assert len(rulings) == 2
+        # Each ruling should have a case number.
+        assert rulings[0].case_number == "24NNCV02551"
+        assert rulings[1].case_number == "26NNCP00062"
+        # ruling_index is 1-based.
+        assert rulings[0].ruling_index == 1
+        assert rulings[1].ruling_index == 2
+
+    def test_single_case_page(self) -> None:
+        """Single-case page produces one ruling."""
+        html = _load("la_ruling_com_a.html")
+        rulings = _split_rulings(html)
+        assert len(rulings) == 1
+        assert rulings[0].ruling_index == 1
+        assert rulings[0].case_number is not None
+
+    def test_ruling_text_is_html_extracted(self) -> None:
+        """Ruling text comes from BeautifulSoup, not LLM reproduction."""
+        html = _load("la_ruling_response.html")
+        rulings = _split_rulings(html)
+        for ruling in rulings:
+            # Text should be non-empty and not contain HTML tags.
+            assert len(ruling.ruling_text) > 100
+            assert "<div" not in ruling.ruling_text
+            assert "<b>" not in ruling.ruling_text.lower()
+
+    def test_dept_header_only_returns_empty(self) -> None:
+        """Department header boilerplate page returns empty list."""
+        html = _load("la_ruling_dept_header.html")
+        rulings = _split_rulings(html)
+        assert rulings == []
+
+    def test_returns_list_of_la_split_ruling(self) -> None:
+        """All items in returned list are LASplitRuling instances."""
+        html = _load("la_ruling_response.html")
+        rulings = _split_rulings(html)
+        for ruling in rulings:
+            assert isinstance(ruling, LASplitRuling)
+
+    def test_ruling_has_case_title(self) -> None:
+        """Rulings include case title when extractable."""
+        html = _load("la_ruling_response.html")
+        rulings = _split_rulings(html)
+        # At least one ruling should have a case title.
+        titles = [r.case_title for r in rulings if r.case_title]
+        assert len(titles) > 0
+
+    def test_empty_input_returns_empty(self) -> None:
+        """Empty or minimal HTML returns empty list."""
+        assert _split_rulings("") == []
+        assert _split_rulings("<html></html>") == []
+
+
+# ---------------------------------------------------------------------------
+# _replace_ruling_text_from_html — LLM text replacement (#2007)
+# ---------------------------------------------------------------------------
+
+
+class TestReplaceRulingTextFromHtml:
+    """Tests for _replace_ruling_text_from_html()."""
+
+    def test_replaces_truncated_text(self) -> None:
+        """LLM-generated ruling_text is replaced with HTML-extracted text."""
+        html = _load("la_ruling_response.html")
+        # Simulate LLM rulings with truncated text.
+        rulings = [
+            LASplitRuling(
+                ruling_index=1,
+                case_number="24NNCV02551",
+                ruling_text="TRUNCATED" * 5000,  # 45k chars
+            ),
+            LASplitRuling(
+                ruling_index=2,
+                case_number="26NNCP00062",
+                ruling_text="TRUNCATED" * 5000,
+            ),
+        ]
+        _replace_ruling_text_from_html(html, rulings)
+
+        # Both should have been replaced with HTML-extracted text.
+        for ruling in rulings:
+            assert "TRUNCATED" not in ruling.ruling_text
+            assert len(ruling.ruling_text) > 100
+
+    def test_matches_by_case_number(self) -> None:
+        """Rulings are matched to HTML chunks by case number."""
+        html = _load("la_ruling_response.html")
+        rulings = [
+            LASplitRuling(
+                ruling_index=1,
+                case_number="26NNCP00062",  # Second case in HTML
+                ruling_text="placeholder",
+            ),
+        ]
+        _replace_ruling_text_from_html(html, rulings)
+        # Should match the second chunk by case number.
+        assert "26NNCP00062" in rulings[0].ruling_text
+
+    def test_no_position_fallback_when_case_number_present(self) -> None:
+        """When case_number is present but doesn't match, no positional fallback."""
+        html = _load("la_ruling_response.html")
+        rulings = [
+            LASplitRuling(
+                ruling_index=1,
+                case_number="NONEXISTENT123",
+                ruling_text="placeholder",
+            ),
+        ]
+        _replace_ruling_text_from_html(html, rulings)
+        # Should NOT replace — case number didn't match and positional
+        # fallback is disabled when a case number is present.
+        assert rulings[0].ruling_text == "placeholder"
+
+    def test_position_fallback_when_no_case_number(self) -> None:
+        """When no case_number, falls back to positional match."""
+        html = _load("la_ruling_response.html")
+        rulings = [
+            LASplitRuling(
+                ruling_index=1,
+                case_number=None,
+                ruling_text="placeholder",
+            ),
+        ]
+        _replace_ruling_text_from_html(html, rulings)
+        # Should match the first chunk by position (ruling_index=1).
+        assert rulings[0].ruling_text != "placeholder"
+        assert len(rulings[0].ruling_text) > 100
+
+    def test_no_replacement_for_short_chunks(self) -> None:
+        """Chunks shorter than 100 chars don't replace existing text."""
+        # Build minimal HTML with a very short case section.
+        short_html = (
+            '<html><body><div id="speechSynthesis">'
+            "<HR><B> Case Number: </B> TEST123"
+            "<p>Short.</p>"
+            "</div></body></html>"
+        )
+        rulings = [
+            LASplitRuling(
+                ruling_index=1,
+                case_number="TEST123",
+                ruling_text="Original long text " * 100,
+            ),
+        ]
+        _replace_ruling_text_from_html(short_html, rulings)
+        # Should NOT be replaced because the chunk text is too short.
+        assert rulings[0].ruling_text.startswith("Original long text")
+
+    def test_no_split_sections_leaves_text_unchanged(self) -> None:
+        """If HTML has no case sections, ruling text is unchanged."""
+        no_cases_html = '<html><body><div id="speechSynthesis">Just some text</div></body></html>'
+        original = "Original text stays"
+        rulings = [LASplitRuling(ruling_index=1, case_number="X", ruling_text=original)]
+        _replace_ruling_text_from_html(no_cases_html, rulings)
+        assert rulings[0].ruling_text == original

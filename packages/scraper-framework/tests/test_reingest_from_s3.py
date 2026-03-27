@@ -7637,3 +7637,147 @@ class TestLlmSplitExceptionFallback:
         finally:
             reingest._SPLIT_REGISTRY.pop("test-llm-exception", None)
             reingest._LLM_SPLIT_REGISTRY.pop("test-llm-exception", None)
+
+
+# ---------------------------------------------------------------------------
+# LLM-only split registry — no regex fallback (#2007)
+# ---------------------------------------------------------------------------
+
+
+class TestLlmOnlySplitRegistry:
+    """Tests for scrapers that only have an LLM split function (no regex).
+
+    Before #2007, scrapers with entries only in _LLM_SPLIT_REGISTRY (and not
+    in _SPLIT_REGISTRY) were silently skipped by _full_reparse_document,
+    falling back to single-document reparse.  This meant multi-case LA
+    documents were never split during --full-reparse reingest.
+    """
+
+    def _doc_meta(self, **overrides: Any) -> dict:
+        meta = {
+            "document_id": "test-llm-only-doc",
+            "scraper_id": "test-llm-only",
+            "state": "CA",
+            "county": "LlmOnly",
+            "court_name": "LlmOnly Superior Court",
+            "source_url": "https://example.com/test.html",
+            "captured_at": datetime(2026, 3, 26, 12, 0, 0),
+            "hearing_date": date(2026, 3, 26),
+            "format": "html",
+            "content_hash": "def456",
+            "case_number": "TEST001",
+            "case_title": "Alpha v. Beta",
+            "case_type": "civil",
+            "stored_ruling_text": None,
+        }
+        meta.update(overrides)
+        return meta
+
+    @patch.object(reingest, "_load_scraper_registry")
+    @patch.object(reingest, "_extract_text_from_content")
+    def test_llm_only_split_is_invoked(
+        self,
+        mock_extract: MagicMock,
+        mock_registry: MagicMock,
+    ) -> None:
+        """Scraper with only LLM split (no regex) should have LLM invoked."""
+        from courts.ca.fresno_tentatives import SplitRuling
+
+        llm_rulings = [
+            SplitRuling(1, "TEST001", "First ruling text", "Alpha v. Beta", "msj", "denied", None),
+            SplitRuling(
+                2, "TEST002", "Second ruling text", "Gamma v. Delta", "demurrer", "granted", None
+            ),
+        ]
+        mock_llm_split = MagicMock(return_value=llm_rulings)
+
+        # Only register in LLM registry — no regex fallback.
+        reingest._SPLIT_REGISTRY.pop("test-llm-only", None)
+        reingest._LLM_SPLIT_REGISTRY["test-llm-only"] = mock_llm_split
+        reingest._SCRAPER_REGISTRY.pop("test-llm-only", None)
+        mock_extract.return_value = "full html text"
+
+        try:
+            result = reingest._full_reparse_document(b"raw html", "test-llm-only", self._doc_meta())
+            mock_llm_split.assert_called_once_with("full html text")
+            assert len(result) == 2
+            assert result[0]["ruling_text"] == "First ruling text"
+            assert result[1]["ruling_text"] == "Second ruling text"
+        finally:
+            reingest._LLM_SPLIT_REGISTRY.pop("test-llm-only", None)
+
+    @patch.object(reingest, "_load_scraper_registry")
+    @patch.object(reingest, "_extract_text_from_content")
+    @patch.object(reingest, "_reparse_document")
+    def test_llm_only_failure_falls_back_to_single_doc(
+        self,
+        mock_reparse: MagicMock,
+        mock_extract: MagicMock,
+        mock_registry: MagicMock,
+    ) -> None:
+        """When LLM split fails and no regex fallback, falls back to single doc."""
+        mock_llm_split = MagicMock(return_value=None)
+
+        reingest._SPLIT_REGISTRY.pop("test-llm-only", None)
+        reingest._LLM_SPLIT_REGISTRY["test-llm-only"] = mock_llm_split
+        reingest._SCRAPER_REGISTRY.pop("test-llm-only", None)
+        mock_extract.return_value = "full html text"
+
+        # When split_results is empty, _full_reparse_document falls back
+        # to _reparse_document for single-doc processing.
+        mock_reparse.return_value = {
+            "ruling_text": "single doc text",
+            "case_number": "TEST001",
+            "case_title": "Alpha v. Beta",
+            "hearing_date": None,
+            "judge_name": None,
+            "case_type": None,
+            "outcome": None,
+            "motion_type": None,
+        }
+
+        try:
+            result = reingest._full_reparse_document(b"raw html", "test-llm-only", self._doc_meta())
+            mock_llm_split.assert_called_once()
+            # Empty split_results -> len <= 1 -> standard reparse fallback.
+            assert len(result) == 1
+            assert result[0]["is_split"] is False
+        finally:
+            reingest._LLM_SPLIT_REGISTRY.pop("test-llm-only", None)
+
+    @patch.object(reingest, "_load_scraper_registry")
+    @patch.object(reingest, "_extract_text_from_content")
+    @patch.object(reingest, "_reparse_document")
+    def test_llm_only_exception_falls_back_to_single_doc(
+        self,
+        mock_reparse: MagicMock,
+        mock_extract: MagicMock,
+        mock_registry: MagicMock,
+    ) -> None:
+        """When LLM split raises and no regex fallback, falls back to single doc."""
+        mock_llm_split = MagicMock(side_effect=ValueError("LLM API error"))
+
+        reingest._SPLIT_REGISTRY.pop("test-llm-only", None)
+        reingest._LLM_SPLIT_REGISTRY["test-llm-only"] = mock_llm_split
+        reingest._SCRAPER_REGISTRY.pop("test-llm-only", None)
+        mock_extract.return_value = "full html text"
+
+        mock_reparse.return_value = {
+            "ruling_text": "single doc text",
+            "case_number": "TEST001",
+            "case_title": "Alpha v. Beta",
+            "hearing_date": None,
+            "judge_name": None,
+            "case_type": None,
+            "outcome": None,
+            "motion_type": None,
+        }
+
+        try:
+            result = reingest._full_reparse_document(b"raw html", "test-llm-only", self._doc_meta())
+            mock_llm_split.assert_called_once()
+            # Empty split_results -> len <= 1 -> standard reparse fallback.
+            assert len(result) == 1
+            assert result[0]["is_split"] is False
+        finally:
+            reingest._LLM_SPLIT_REGISTRY.pop("test-llm-only", None)
