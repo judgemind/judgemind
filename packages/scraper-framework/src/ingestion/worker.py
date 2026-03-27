@@ -63,6 +63,7 @@ from .extract import (
     extract_case_type_from_motion_type,
     extract_case_type_from_number,
     extract_case_type_from_scraper_id,
+    extract_case_type_from_title,
     extract_hearing_date,
     extract_judge_name,
     extract_motion_type,
@@ -963,6 +964,17 @@ class IngestionWorker:
             case_type = extract_case_type_from_motion_type(motion_type)
             if case_type:
                 extraction_methods.setdefault("case_type", "motion_type")
+
+        # Fallback case_type from case title (#2062).
+        # Final fallback for cases where no other signal determined the
+        # case type.  Probate-style titles ("In the Matter of...",
+        # "Conservatorship of...", "Guardianship of...") are unambiguous.
+        if case_type is None:
+            eff_title = case_title or event_data.get("case_title")
+            if eff_title:
+                case_type = extract_case_type_from_title(eff_title)
+                if case_type:
+                    extraction_methods.setdefault("case_type", "title")
 
         if extraction_methods:
             logger.info(

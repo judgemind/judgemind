@@ -18,6 +18,7 @@ from ingestion.extract import (
     extract_case_type_from_motion_type,
     extract_case_type_from_number,
     extract_case_type_from_scraper_id,
+    extract_case_type_from_title,
     extract_hearing_date,
     extract_judge_name,
     extract_motion_type,
@@ -1613,6 +1614,30 @@ class TestExtractCaseTypeFromNumber:
         """Ventura PR = Probate: 2025PRMA042345."""
         assert extract_case_type_from_number("2025PRMA042345") == "probate"
 
+    def test_ventura_old_probate_prcp(self) -> None:
+        """Ventura old-format probate PRCP (conservatorship): 200800332092PRCP."""
+        assert extract_case_type_from_number("200800332092PRCP") == "probate"
+
+    def test_ventura_old_probate_prce(self) -> None:
+        """Ventura old-format probate PRCE: 201200427520PRCE."""
+        assert extract_case_type_from_number("201200427520PRCE") == "probate"
+
+    def test_ventura_old_probate_prlp(self) -> None:
+        """Ventura old-format probate PRLP (LPS conservatorship): 202200570571PRLP."""
+        assert extract_case_type_from_number("202200570571PRLP") == "probate"
+
+    def test_ventura_old_probate_prge(self) -> None:
+        """Ventura old-format probate PRGE (guardianship): 202200572082PRGE."""
+        assert extract_case_type_from_number("202200572082PRGE") == "probate"
+
+    def test_ventura_p_prefix_probate(self) -> None:
+        """Ventura old P-prefix probate: P057837."""
+        assert extract_case_type_from_number("P057837") == "probate"
+
+    def test_ventura_p_prefix_probate_six_digits(self) -> None:
+        """Ventura old P-prefix probate: P080266."""
+        assert extract_case_type_from_number("P080266") == "probate"
+
     # --- Small claims ---
 
     def test_small_claims_sc(self) -> None:
@@ -2265,6 +2290,81 @@ class TestExtractCaseTypeFromMotionType:
 
     def test_unknown_motion_type(self) -> None:
         assert extract_case_type_from_motion_type("unknown_motion") is None
+
+
+# ---------------------------------------------------------------------------
+# extract_case_type_from_title
+# ---------------------------------------------------------------------------
+
+
+class TestExtractCaseTypeFromTitle:
+    """Tests for extract_case_type_from_title() — #2062."""
+
+    # --- Probate title patterns ---
+
+    def test_in_the_matter_of(self) -> None:
+        """Standard probate title: 'In the Matter of ...'"""
+        assert extract_case_type_from_title("In the Matter of Edrissa Bassey II") == "probate"
+
+    def test_in_re_of(self) -> None:
+        """Alternative probate title: 'In Re of ...'"""
+        assert extract_case_type_from_title("In Re of John Smith") == "probate"
+
+    def test_in_matter_of_no_the(self) -> None:
+        """Probate title without 'the': 'In Matter of ...'"""
+        assert extract_case_type_from_title("In Matter of Jane Doe") == "probate"
+
+    def test_conservatorship_of(self) -> None:
+        """Conservatorship probate title."""
+        assert extract_case_type_from_title("Conservatorship of Maria Hill") == "probate"
+
+    def test_conservatorship_of_mixed_case(self) -> None:
+        """Conservatorship title with mixed case."""
+        assert extract_case_type_from_title("Conservatorship Of Casey Evan Fell") == "probate"
+
+    def test_guardianship_of(self) -> None:
+        """Guardianship probate title."""
+        assert extract_case_type_from_title("Guardianship of Nathan Martinez-Cahue") == "probate"
+
+    def test_estate_of(self) -> None:
+        """Estate probate title."""
+        assert extract_case_type_from_title("Estate of Robert J. Williams") == "probate"
+
+    def test_trust_of(self) -> None:
+        """Trust probate title."""
+        assert extract_case_type_from_title("Trust of Alice M. Johnson") == "probate"
+
+    def test_petition_for_probate(self) -> None:
+        """Petition for Probate title."""
+        assert extract_case_type_from_title("Petition for Probate of Will") == "probate"
+
+    def test_petition_for_letters(self) -> None:
+        """Petition for Letters title."""
+        assert extract_case_type_from_title("Petition for Letters of Administration") == "probate"
+
+    def test_cnsvship_abbreviation(self) -> None:
+        """Abbreviated conservatorship: 'Cnsvship Of ...'"""
+        # This does NOT match — abbreviations need the full word
+        assert extract_case_type_from_title("Cnsvship Of Sara Beth Eleniak") is None
+
+    # --- Non-probate titles (should return None) ---
+
+    def test_civil_vs_title(self) -> None:
+        """Standard civil case title should not match."""
+        assert extract_case_type_from_title("Smith v. Jones") is None
+
+    def test_empty_string(self) -> None:
+        assert extract_case_type_from_title("") is None
+
+    def test_none(self) -> None:
+        assert extract_case_type_from_title(None) is None  # type: ignore[arg-type]
+
+    def test_whitespace_only(self) -> None:
+        assert extract_case_type_from_title("   ") is None
+
+    def test_generic_title(self) -> None:
+        """Generic title without probate indicators."""
+        assert extract_case_type_from_title("People of California v. Defendant") is None
 
 
 # ---------------------------------------------------------------------------
