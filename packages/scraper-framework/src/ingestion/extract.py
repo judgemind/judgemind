@@ -23,10 +23,29 @@ _OUTCOME_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"\bdenied\s+in\s+part\b", re.IGNORECASE), "denied_in_part"),
     (re.compile(r"\bgranted\b", re.IGNORECASE), "granted"),
     (re.compile(r"\bdenied\b", re.IGNORECASE), "denied"),
+    # --- Demurrer-specific outcomes (#2022) ---
+    # "SUSTAIN" / "Sustain" (present tense, common in Riverside demurrers).
+    # Must come after "granted" to avoid shadowing explicit grant language.
+    (re.compile(r"\bsustain(?:ed)?\b", re.IGNORECASE), "granted"),
+    # "OVERRULE" / "Overrule" (present tense, common in Riverside demurrers).
+    (re.compile(r"\boverrule[d]?\b", re.IGNORECASE), "denied"),
     (re.compile(r"\bmoot\b", re.IGNORECASE), "moot"),
-    (re.compile(r"\bcontinued\b", re.IGNORECASE), "continued"),
+    (re.compile(r"\bcontinued?\b", re.IGNORECASE), "continued"),
     (re.compile(r"\boff[\s-]?calendar\b", re.IGNORECASE), "off_calendar"),
     (re.compile(r"\bsubmitted\b", re.IGNORECASE), "submitted"),
+    # --- Riverside-specific patterns (#2022) ---
+    # "No tentative ruling" / "No tentative decision" / "Hearing Required"
+    # These appear at the start of brief Riverside ruling texts.
+    (re.compile(r"\bno\s+tentative\b", re.IGNORECASE), "other"),
+    (re.compile(r"\bhearing\s+required\b", re.IGNORECASE), "other"),
+    # "It is ordered" — common in stipulated judgment rulings.
+    # Treated as "granted" because the court is ordering the requested relief.
+    (re.compile(r"\bit\s+is\s+(?:so\s+)?ordered\b", re.IGNORECASE), "granted"),
+    # Bare "Grant" (verb form without -ed, e.g., "Grant $500 in fees").
+    # Must come after all more specific patterns to avoid false positives.
+    (re.compile(r"\bgrant\b", re.IGNORECASE), "granted"),
+    # Bare "Deny" (verb form without -ied).
+    (re.compile(r"\bdeny\b", re.IGNORECASE), "denied"),
 ]
 
 # ---------------------------------------------------------------------------
@@ -247,10 +266,128 @@ _MOTION_TYPE_PATTERNS: list[tuple[re.Pattern[str], str]] = [
         re.compile(r"\bmotion\s+to\s+deem\s+requests?\b", re.IGNORECASE),
         "deem_admissions_admitted",
     ),
+    # --- New patterns added for issue #2022 (Riverside enrichment gaps) ---
+    (
+        re.compile(
+            r"\bmotion\s+(?:for\s+|to\s+)?(?:enter\s+|entry\s+of\s+)?stipulated\s+judgment\b",
+            re.IGNORECASE,
+        ),
+        "motion_for_stipulated_judgment",
+    ),
+    (
+        re.compile(
+            r"\bmotion\s+(?:for\s+)?entry\s+of\s+judgment\b",
+            re.IGNORECASE,
+        ),
+        "motion_for_entry_of_judgment",
+    ),
+    (
+        re.compile(r"\bmotion\s+to\s+bifurcate\b", re.IGNORECASE),
+        "motion_to_bifurcate",
+    ),
+    (
+        re.compile(r"\bmotion\s+for\s+class\s+certification\b", re.IGNORECASE),
+        "motion_for_class_certification",
+    ),
+    (
+        re.compile(r"\bmotion\s+to\s+reclassify\b", re.IGNORECASE),
+        "motion_to_reclassify",
+    ),
+    (
+        re.compile(
+            r"\bmotion\s+for\s+(?:judicial\s+)?approval\b",
+            re.IGNORECASE,
+        ),
+        "motion_for_judicial_approval",
+    ),
+    (
+        re.compile(
+            r"\bmotion\s+for\s+(?:appointment\s+of\s+)?receiver\b",
+            re.IGNORECASE,
+        ),
+        "motion_for_appointment_of_receiver",
+    ),
+    (
+        re.compile(
+            r"\bright\s+to\s+attach\s+order\b",
+            re.IGNORECASE,
+        ),
+        "right_to_attach_order",
+    ),
+    (
+        re.compile(
+            r"\bmotion\s+for\s+order\b.*\badmissions?\s+(?:to\s+be\s+)?(?:deemed\s+)?admitted\b",
+            re.IGNORECASE,
+        ),
+        "deem_admissions_admitted",
+    ),
+    (
+        re.compile(
+            r"\bmotion\s+(?:for\s+)?(?:order\s+)?(?:for\s+|to\s+)?deem(?:ing)?\s+(?:matters?\s+)?admitted\b",
+            re.IGNORECASE,
+        ),
+        "deem_admissions_admitted",
+    ),
+    (
+        re.compile(
+            r"\badmissions?\s+(?:to\s+be\s+)?deemed\s+admitted\b",
+            re.IGNORECASE,
+        ),
+        "deem_admissions_admitted",
+    ),
+    (
+        re.compile(r"\bmotion\s+to\s+consolidate\b", re.IGNORECASE),
+        "motion_to_consolidate",
+    ),
+    (
+        re.compile(
+            r"\bmotion\s+for\s+(?:order\s+)?(?:authorizing\s+)?recordation\b",
+            re.IGNORECASE,
+        ),
+        "lis_pendens",
+    ),
+    (
+        re.compile(
+            r"\b(?:notice\s+of\s+)?(?:pendency\s+of\s+action|lis\s+pendens)\b",
+            re.IGNORECASE,
+        ),
+        "lis_pendens",
+    ),
+    (
+        re.compile(r"\bmotion\s+(?:for|to)\s+(?:transfer|change)\s+venue\b", re.IGNORECASE),
+        "motion_to_transfer_venue",
+    ),
+    (
+        re.compile(r"\bmotion\s+to\s+seal\b", re.IGNORECASE),
+        "motion_to_seal",
+    ),
+    (
+        re.compile(
+            r"\brequest\s+for\s+dismissal\b",
+            re.IGNORECASE,
+        ),
+        "request_for_dismissal",
+    ),
+    (
+        re.compile(
+            r"\bwrit\s+of\s+attachment\b",
+            re.IGNORECASE,
+        ),
+        "right_to_attach_order",
+    ),
     # Broad ex parte fallback — must come after specific ex_parte_application/motion
     (
         re.compile(r"\bex\s+parte\b", re.IGNORECASE),
         "ex_parte_application",
+    ),
+    # Broad "Hearing re:" pattern — extracts the motion type from Riverside's
+    # "Hearing re: Motion to/for X" format.  Must come last as a catch-all.
+    (
+        re.compile(
+            r"\bhearing\s+(?:re|on)[:\s]+(?:motion\s+(?:to|for)\s+)",
+            re.IGNORECASE,
+        ),
+        "other",
     ),
 ]
 
@@ -290,17 +427,23 @@ _VALID_OUTCOMES: frozenset[str] = frozenset(
 _OUTCOME_ALIAS: dict[str, str] = {
     "no tentative ruling": "other",
     "no tentative": "other",
+    "no tentative decision": "other",
     "no appearance required": "other",
+    "hearing required": "other",
     "withdrawn": "off_calendar",
     "vacated": "off_calendar",
     "sustained": "granted",
+    "sustain": "granted",
     "overruled": "denied",
+    "overrule": "denied",
     "off calendar": "off_calendar",
     "granted in part": "granted_in_part",
     "denied in part": "denied_in_part",
     "denied without prejudice": "denied",
     "sustained without leave to amend": "granted",
     "sustained with leave to amend": "granted",
+    "grant": "granted",
+    "deny": "denied",
 }
 
 # Ordered so more specific outcomes match first (e.g. "granted in part"
@@ -420,6 +563,29 @@ _PREFIX_LESS_PATTERNS: list[tuple[re.Pattern[str], str]] = [
         re.compile(r"\bsettlement\s+(?:agreement|approval|hearing)\b", re.IGNORECASE),
         "settlement_approval",
     ),
+    # --- New patterns added for issue #2022 (Riverside enrichment gaps) ---
+    (re.compile(r"\bstipulated\s+judgment\b", re.IGNORECASE), "motion_for_stipulated_judgment"),
+    (re.compile(r"\bentry\s+of\s+judgment\b", re.IGNORECASE), "motion_for_entry_of_judgment"),
+    (re.compile(r"\bbifurcate\b", re.IGNORECASE), "motion_to_bifurcate"),
+    (re.compile(r"\bclass\s+certification\b", re.IGNORECASE), "motion_for_class_certification"),
+    (re.compile(r"\breclassify\b", re.IGNORECASE), "motion_to_reclassify"),
+    (re.compile(r"\bjudicial\s+approval\b", re.IGNORECASE), "motion_for_judicial_approval"),
+    (
+        re.compile(r"\bappointment\s+of\s+receiver\b", re.IGNORECASE),
+        "motion_for_appointment_of_receiver",
+    ),
+    (
+        re.compile(r"\breceiver\b", re.IGNORECASE),
+        "motion_for_appointment_of_receiver",
+    ),
+    (re.compile(r"\bright\s+to\s+attach\b", re.IGNORECASE), "right_to_attach_order"),
+    (re.compile(r"\bconsolidate\b", re.IGNORECASE), "motion_to_consolidate"),
+    (re.compile(r"\blis\s+pendens\b", re.IGNORECASE), "lis_pendens"),
+    (re.compile(r"\bpendency\s+of\s+action\b", re.IGNORECASE), "lis_pendens"),
+    (re.compile(r"\btransfer\s+venue\b", re.IGNORECASE), "motion_to_transfer_venue"),
+    (re.compile(r"\bchange\s+(?:of\s+)?venue\b", re.IGNORECASE), "motion_to_transfer_venue"),
+    (re.compile(r"\bseal\b", re.IGNORECASE), "motion_to_seal"),
+    (re.compile(r"\bdismissal\b", re.IGNORECASE), "request_for_dismissal"),
     # Broad sanctions fallback — must come after more specific standalone patterns
     # to avoid shadowing "strike", "compel", "quash", etc. when the input
     # contains multiple keywords (e.g. "Strike and Sanctions").
@@ -1601,8 +1767,19 @@ _IMPLAUSIBLE_PREFIXES = (
 
 # Phrases that should never appear in a valid case title.
 _IMPLAUSIBLE_FRAGMENTS_RE = re.compile(
-    r"\b(?:GRANTED|DENIED|CONTINUED|TENTATIVE RULING|OVERRULED|SUSTAINED"
-    r"|MOOT|OFF CALENDAR|HEARING|MOTION|DEMURRER|ORDER)\b",
+    r"\b(?:GRANTED|DENIED|CONTINUED|TENTATIVE RULING|TENTATIVE RULINGS"
+    r"|OVERRULED|SUSTAINED|MOOT|OFF CALENDAR|HEARING|MOTION|DEMURRER"
+    r"|ORDER|Department\s+[A-Z0-9]+|Timekeeper|paralegal)\b",
+    re.IGNORECASE,
+)
+
+# Pattern to detect multiple case numbers in a title — strong indicator of
+# contaminated/unsplit data (#2022).  Looks for Riverside (CV...), OC
+# (30-...), SB (CIV...), and generic patterns.
+_MULTIPLE_CASE_NUMBERS_RE = re.compile(
+    r"(?:CV[A-Z]{2,4}\d{5,}|CIV[A-Z]{2}\d{5,}|\d{2,4}-\d{7,}|\d{2}[A-Z]{2}CV\d{5,})"
+    r".*"
+    r"(?:CV[A-Z]{2,4}\d{5,}|CIV[A-Z]{2}\d{5,}|\d{2,4}-\d{7,}|\d{2}[A-Z]{2}CV\d{5,})",
     re.IGNORECASE,
 )
 
@@ -1655,6 +1832,11 @@ def is_plausible_case_title(title: str) -> bool:
 
     # Reject titles containing ruling/procedural fragments
     if _IMPLAUSIBLE_FRAGMENTS_RE.search(stripped):
+        return False
+
+    # Reject titles containing multiple case numbers — strong indicator
+    # of unsplit/contaminated data from LLM extraction (#2022).
+    if _MULTIPLE_CASE_NUMBERS_RE.search(stripped):
         return False
 
     return True
