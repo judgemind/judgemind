@@ -61,6 +61,7 @@ class TestCreateIndex:
             "motion_type",
             "outcome",
             "case_title",
+            "case_type",
             "summary",
             "ruling_text",
             "document_id",
@@ -87,6 +88,7 @@ class TestCreateIndex:
             "motion_type",
             "outcome",
             "case_title",
+            "case_type",
         ]
         for field in keyword_fields:
             assert properties[field]["type"] == "keyword", f"{field} should be keyword"

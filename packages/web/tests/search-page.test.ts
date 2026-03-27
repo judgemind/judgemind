@@ -4,8 +4,9 @@ import {
   parseSearchParams,
   MOTION_TYPES,
   OUTCOMES,
+  CASE_TYPES,
 } from '../src/app/(main)/search/SearchPage';
-import { MOTION_TYPE_LABELS, OUTCOME_LABELS } from '../src/lib/display-helpers';
+import { MOTION_TYPE_LABELS, OUTCOME_LABELS, CASE_TYPE_LABELS } from '../src/lib/display-helpers';
 
 describe('buildSearchParams', () => {
   it('returns empty params when all fields are empty', () => {
@@ -17,6 +18,7 @@ describe('buildSearchParams', () => {
       dateTo: '',
       motionTypes: [],
       outcomes: [],
+      caseTypes: [],
     });
     expect(params.toString()).toBe('');
   });
@@ -30,6 +32,7 @@ describe('buildSearchParams', () => {
       dateTo: '',
       motionTypes: [],
       outcomes: [],
+      caseTypes: [],
     });
     expect(params.get('q')).toBe('summary judgment');
   });
@@ -43,6 +46,7 @@ describe('buildSearchParams', () => {
       dateTo: '',
       motionTypes: [],
       outcomes: [],
+      caseTypes: [],
     });
     expect(params.get('county')).toBe('Los Angeles');
   });
@@ -56,6 +60,7 @@ describe('buildSearchParams', () => {
       dateTo: '',
       motionTypes: [],
       outcomes: [],
+      caseTypes: [],
     });
     expect(params.get('judge')).toBe('Smith, John');
   });
@@ -69,6 +74,7 @@ describe('buildSearchParams', () => {
       dateTo: '2026-03-31',
       motionTypes: [],
       outcomes: [],
+      caseTypes: [],
     });
     expect(params.get('dateFrom')).toBe('2026-01-01');
     expect(params.get('dateTo')).toBe('2026-03-31');
@@ -83,6 +89,7 @@ describe('buildSearchParams', () => {
       dateTo: '',
       motionTypes: ['msj', 'mtd'],
       outcomes: [],
+      caseTypes: [],
     });
     expect(params.get('motion')).toBe('msj,mtd');
   });
@@ -96,8 +103,23 @@ describe('buildSearchParams', () => {
       dateTo: '',
       motionTypes: [],
       outcomes: ['granted', 'denied'],
+      caseTypes: [],
     });
     expect(params.get('outcome')).toBe('granted,denied');
+  });
+
+  it('sets case types as comma-separated', () => {
+    const params = buildSearchParams({
+      q: '',
+      county: '',
+      judgeName: '',
+      dateFrom: '',
+      dateTo: '',
+      motionTypes: [],
+      outcomes: [],
+      caseTypes: ['civil', 'family'],
+    });
+    expect(params.get('caseType')).toBe('civil,family');
   });
 
   it('sets all params when all fields are filled', () => {
@@ -109,6 +131,7 @@ describe('buildSearchParams', () => {
       dateTo: '2026-12-31',
       motionTypes: ['msj'],
       outcomes: ['granted'],
+      caseTypes: ['civil'],
     });
     expect(params.get('q')).toBe('motion');
     expect(params.get('county')).toBe('Orange');
@@ -117,6 +140,7 @@ describe('buildSearchParams', () => {
     expect(params.get('dateTo')).toBe('2026-12-31');
     expect(params.get('motion')).toBe('msj');
     expect(params.get('outcome')).toBe('granted');
+    expect(params.get('caseType')).toBe('civil');
   });
 });
 
@@ -131,6 +155,7 @@ describe('parseSearchParams', () => {
       dateTo: '',
       motionTypes: [],
       outcomes: [],
+      caseTypes: [],
     });
   });
 
@@ -173,10 +198,16 @@ describe('parseSearchParams', () => {
     expect(result.outcomes).toEqual(['granted', 'denied']);
   });
 
-  it('handles empty motion/outcome strings gracefully', () => {
-    const result = parseSearchParams(new URLSearchParams('motion=&outcome='));
+  it('parses case types from comma-separated string', () => {
+    const result = parseSearchParams(new URLSearchParams('caseType=civil,family'));
+    expect(result.caseTypes).toEqual(['civil', 'family']);
+  });
+
+  it('handles empty motion/outcome/caseType strings gracefully', () => {
+    const result = parseSearchParams(new URLSearchParams('motion=&outcome=&caseType='));
     expect(result.motionTypes).toEqual([]);
     expect(result.outcomes).toEqual([]);
+    expect(result.caseTypes).toEqual([]);
   });
 
   it('round-trips with buildSearchParams', () => {
@@ -188,6 +219,7 @@ describe('parseSearchParams', () => {
       dateTo: '2026-12-31',
       motionTypes: ['msj', 'demurrer'],
       outcomes: ['granted', 'denied'],
+      caseTypes: ['civil', 'family'],
     };
     const params = buildSearchParams(original);
     const parsed = parseSearchParams(params);
@@ -227,6 +259,22 @@ describe('constants', () => {
     for (const oc of OUTCOMES) {
       expect(OUTCOME_LABELS[oc]).toBeDefined();
       expect(typeof OUTCOME_LABELS[oc]).toBe('string');
+    }
+  });
+
+  it('CASE_TYPES has expected values', () => {
+    expect(CASE_TYPES).toContain('civil');
+    expect(CASE_TYPES).toContain('family');
+    expect(CASE_TYPES).toContain('probate');
+    expect(CASE_TYPES).toContain('small_claims');
+    expect(CASE_TYPES).toContain('other');
+    expect(CASE_TYPES.length).toBe(5);
+  });
+
+  it('every CASE_TYPE has a label', () => {
+    for (const ct of CASE_TYPES) {
+      expect(CASE_TYPE_LABELS[ct]).toBeDefined();
+      expect(typeof CASE_TYPE_LABELS[ct]).toBe('string');
     }
   });
 });

@@ -275,6 +275,7 @@ class IndexingConsumer:
             "motion_type": event.get("motion_type"),
             "outcome": event.get("outcome"),
             "case_title": event.get("case_title"),
+            "case_type": event.get("case_type"),
             "summary": event.get("summary"),
             "ruling_text": ruling_text,
             "document_id": document_id,

@@ -471,6 +471,23 @@ export function detectParagraphs(text: string): string {
 }
 
 // ---------------------------------------------------------------------------
+// Case type formatting
+// ---------------------------------------------------------------------------
+
+/**
+ * Canonical human-readable labels for all known case type codes.
+ * Every surface that displays case type names (badges, filters, detail pages)
+ * must use this map — never define local case type label constants.
+ */
+export const CASE_TYPE_LABELS: Record<string, string> = {
+  civil: 'Civil',
+  family: 'Family',
+  probate: 'Probate',
+  small_claims: 'Small Claims',
+  other: 'Other',
+};
+
+// ---------------------------------------------------------------------------
 // Motion type formatting
 // ---------------------------------------------------------------------------
 
