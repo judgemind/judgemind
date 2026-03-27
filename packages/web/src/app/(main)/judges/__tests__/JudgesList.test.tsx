@@ -178,7 +178,7 @@ describe('JudgesList', () => {
     expect(screen.getByText(/Orange/)).toBeInTheDocument();
   });
 
-  it('only renders badge for inactive judges, not active ones', () => {
+  it('does not render status badges in the list view', () => {
     mockUseQuery.mockReturnValue({
       data: MOCK_JUDGES_DATA,
       loading: false,
@@ -188,10 +188,10 @@ describe('JudgesList', () => {
 
     render(<JudgesList />);
     expect(screen.queryByText('Active')).not.toBeInTheDocument();
-    expect(screen.getByText('Inactive')).toBeInTheDocument();
+    expect(screen.queryByText('Inactive')).not.toBeInTheDocument();
   });
 
-  it('renders department info when available', () => {
+  it('renders department inline with judge name when available', () => {
     mockUseQuery.mockReturnValue({
       data: MOCK_JUDGES_DATA,
       loading: false,
@@ -200,7 +200,27 @@ describe('JudgesList', () => {
     });
 
     render(<JudgesList />);
+    // Department should appear inline next to the judge name
     expect(screen.getByText(/Dept\. 42/)).toBeInTheDocument();
+    // The department text should be in the same cell as the judge name
+    const judgeLink = screen.getByText('Smith, John A.');
+    const cell = judgeLink.closest('td');
+    expect(cell?.textContent).toContain('Dept. 42');
+  });
+
+  it('does not render department text when department is null', () => {
+    mockUseQuery.mockReturnValue({
+      data: MOCK_JUDGES_DATA,
+      loading: false,
+      error: undefined,
+      fetchMore: vi.fn(),
+    });
+
+    render(<JudgesList />);
+    // Johnson has no department — should not show "Dept." text near that judge
+    const johnsonLink = screen.getByText('Johnson, Robert M.');
+    const cell = johnsonLink.closest('td');
+    expect(cell?.textContent).not.toContain('Dept.');
   });
 
   it('renders judge links pointing to detail pages', () => {
@@ -397,7 +417,7 @@ describe('JudgesList', () => {
     expect(container.querySelector('table')).toBeInTheDocument();
   });
 
-  it('renders table column headers', () => {
+  it('renders only Judge and County column headers', () => {
     mockUseQuery.mockReturnValue({
       data: MOCK_JUDGES_DATA,
       loading: false,
@@ -408,8 +428,9 @@ describe('JudgesList', () => {
     render(<JudgesList />);
     expect(screen.getByText('Judge')).toBeInTheDocument();
     expect(screen.getByText('County')).toBeInTheDocument();
-    expect(screen.getByText('Dept.')).toBeInTheDocument();
-    expect(screen.getByText('Status')).toBeInTheDocument();
+    // Dept. and Status columns have been removed
+    expect(screen.queryByRole('columnheader', { name: 'Dept.' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('columnheader', { name: 'Status' })).not.toBeInTheDocument();
   });
 
   it('updates URL params when name filter changes', () => {

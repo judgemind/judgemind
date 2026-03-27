@@ -7,7 +7,6 @@ import Link from 'next/link';
 import { Search } from 'lucide-react';
 import { InfiniteScrollTrigger } from '@/components/InfiniteScrollTrigger';
 import { useInfiniteScroll } from '@/hooks/useInfiniteScroll';
-import { Badge } from '@/components/ui/badge';
 import { Input } from '@/components/ui/input';
 import { Skeleton } from '@/components/ui/skeleton';
 import {
@@ -67,16 +66,10 @@ function SkeletonRow() {
   return (
     <TableRow>
       <TableCell>
-        <Skeleton className="h-4 w-40" />
+        <Skeleton className="h-4 w-48" />
       </TableCell>
       <TableCell>
-        <Skeleton className="h-4 w-24" />
-      </TableCell>
-      <TableCell>
-        <Skeleton className="h-4 w-16" />
-      </TableCell>
-      <TableCell>
-        <Skeleton className="h-5 w-16 rounded-full" />
+        <Skeleton className="h-4 w-32" />
       </TableCell>
     </TableRow>
   );
@@ -161,8 +154,6 @@ export function JudgesList() {
             <TableRow>
               <TableHead>Judge</TableHead>
               <TableHead>County</TableHead>
-              <TableHead>Dept.</TableHead>
-              <TableHead>Status</TableHead>
             </TableRow>
           </TableHeader>
           <TableBody>
@@ -178,7 +169,7 @@ export function JudgesList() {
             {/* Error */}
             {error && (
               <TableRow>
-                <TableCell colSpan={4} className="text-center">
+                <TableCell colSpan={2} className="text-center">
                   <p className="py-4 text-sm text-destructive">
                     Failed to load judges. Please try again.
                   </p>
@@ -189,7 +180,7 @@ export function JudgesList() {
             {/* Empty state */}
             {!loading && !error && filteredEdges.length === 0 && (
               <TableRow>
-                <TableCell colSpan={4} className="text-center">
+                <TableCell colSpan={2} className="text-center">
                   <p className="py-4 text-sm text-muted-foreground">
                     No judges found. Try adjusting your filters.
                   </p>
@@ -207,17 +198,14 @@ export function JudgesList() {
                   >
                     {node.canonicalName}
                   </Link>
+                  {node.department && (
+                    <span className="ml-2 text-sm font-normal text-muted-foreground">
+                      &middot; Dept. {node.department}
+                    </span>
+                  )}
                 </TableCell>
                 <TableCell className="text-muted-foreground">
                   {node.court?.county ?? '\u2014'}
-                </TableCell>
-                <TableCell className="text-muted-foreground">
-                  {node.department ? `Dept. ${node.department}` : '\u2014'}
-                </TableCell>
-                <TableCell>
-                  {!node.isActive && (
-                    <Badge variant="secondary">Inactive</Badge>
-                  )}
                 </TableCell>
               </TableRow>
             ))}

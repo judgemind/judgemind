@@ -41,12 +41,13 @@ describe('JudgesLoading', () => {
     expect(screen.getByTestId('table')).toBeInTheDocument();
   });
 
-  it('renders table headers', () => {
+  it('renders only Judge and County table headers', () => {
     render(<JudgesLoading />);
     expect(screen.getByText('Judge')).toBeInTheDocument();
     expect(screen.getByText('County')).toBeInTheDocument();
-    expect(screen.getByText('Dept.')).toBeInTheDocument();
-    expect(screen.getByText('Status')).toBeInTheDocument();
+    // Dept. and Status columns have been removed
+    const headers = screen.getAllByRole('columnheader');
+    expect(headers).toHaveLength(2);
   });
 
   it('renders 8 skeleton rows plus 1 header row', () => {
