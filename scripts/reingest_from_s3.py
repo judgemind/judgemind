@@ -1204,6 +1204,68 @@ def _reparse_document_multimodal(
         result["llm_outcome"] = "multimodal_fallback"
         return [result]
 
+    # Extract doc-level judge_name and department from the full PDF text
+    # as a fallback for individual rulings where the LLM didn't extract
+    # these fields.  This mirrors _full_reparse_document() lines 971-1023
+    # and matches the worker's fallback at worker.py line 1570.  (#2063)
+    doc_judge_name: str | None = None
+    doc_department: str | None = None
+
+    scraper_cls = _SCRAPER_REGISTRY.get(scraper_id)
+    if scraper_cls:
+        try:
+            config = ScraperConfig(
+                scraper_id=scraper_id,
+                state=doc_meta["state"],
+                county=doc_meta["county"],
+                court=doc_meta["court_name"],
+                target_urls=[],
+            )
+            scraper = scraper_cls(config=config)
+            cap_doc = CapturedDocument(
+                document_id=doc_meta["document_id"],
+                scraper_id=scraper_id,
+                state=doc_meta["state"],
+                county=doc_meta["county"],
+                court=doc_meta["court_name"],
+                source_url=doc_meta["source_url"],
+                capture_timestamp=doc_meta["captured_at"],
+                content_format=ContentFormat(doc_meta["format"]),
+                raw_content=raw_content,
+                content_hash=doc_meta.get("content_hash", ""),
+            )
+            parsed = scraper.parse_document(cap_doc)
+            doc_judge_name = parsed.judge_name
+            doc_department = parsed.department
+        except Exception:
+            logger.warning(
+                "Scraper parse_document failed during multimodal reparse",
+                document_id=doc_meta["document_id"],
+                exc_info=True,
+            )
+
+    # Fall back to regex extraction from the full PDF text if the scraper
+    # didn't provide a judge name (e.g. OC scraper's parse_document is a no-op).
+    if not doc_judge_name:
+        try:
+            text = _extract_text_from_content(raw_content, "pdf", pdf_timeout)
+            if text:
+                doc_judge_name = extract_judge_name(text)
+                # Also try to extract department from the PDF header
+                # (e.g. "DEPT C25" in OC headers).
+                if not doc_department:
+                    import re as _re
+
+                    dept_m = _re.search(r"\bDEPT\.?\s+(\S+)", text, _re.IGNORECASE)
+                    if dept_m:
+                        doc_department = dept_m.group(1)
+        except Exception:
+            logger.warning(
+                "Text extraction failed during multimodal doc-level fallback",
+                document_id=doc_meta["document_id"],
+                exc_info=True,
+            )
+
     # Convert ExtractedRuling objects to the dict format used by reingest.
     content_hash = doc_meta.get("content_hash", "")
     if not content_hash:
@@ -1246,7 +1308,7 @@ def _reparse_document_multimodal(
             ),
             "case_title": ruling.extracted_case_title or doc_meta.get("case_title"),
             "case_type": ruling.case_type.value if ruling.case_type else None,
-            "judge_name": ruling.extracted_judge_name,
+            "judge_name": ruling.extracted_judge_name or doc_judge_name,
             "outcome": outcome_str,
             # Normalize multimodal-provided motion_type to snake_case (#1849).
             "motion_type": (
@@ -1254,7 +1316,7 @@ def _reparse_document_multimodal(
                 if ruling.motion_type
                 else None
             ),
-            "department": ruling.department,
+            "department": ruling.department or doc_department,
             "parties": parties_data,
             "hearing_date": hearing_date_val,
             "extraction_methods": {"_all": "multimodal"},

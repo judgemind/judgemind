@@ -94,7 +94,7 @@
       "hearing_date": 100.0,
       "case_type": 100.0,
       "_known_gaps": {
-        "judge": "Massive OC bulk ingest (441k+ orphaned docs) brought 1629 docs with rulings. Only 41% have judge — OC North JC PDFs structurally lack judge identification, and new bulk-ingested docs have not been fully enriched.",
+        "judge": "~41% baseline. Reingest multimodal path lost scraper-provided judge_name (#2063, fixed). Backfill script restores judge_id on existing rulings from PDF headers. OC North JC PDFs structurally lack judge identification.",
         "motion_type": "25% of OC rulings lack motion_type extraction. Post-bulk-ingest enrichment gaps.",
         "outcome": "17% of OC rulings lack outcome extraction. Post-bulk-ingest enrichment gaps.",
         "case_number": "33% of OC rulings have UNKNOWN case numbers. OC North JC PDFs structurally lack case numbers, compounded by bulk ingest.",
