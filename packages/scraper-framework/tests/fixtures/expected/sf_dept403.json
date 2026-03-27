@@ -1,0 +1,82 @@
+{
+  "_fixture": "sf_dept403_ruling.pdf",
+  "_description": "San Francisco Dept 403 (Judge Bobby P. Luna). 30-page PDF with 11 family law rulings. Hearing date March 3, 2026.",
+  "_captured": "2026-03-03",
+  "courthouse": "San Francisco Superior Court",
+  "department": "403",
+  "judge_name": "Bobby P. Luna",
+  "page_count": 30,
+  "case_count": 11,
+  "primary_case_number": "FPT-25-378624",
+  "case_number_format": "F{XX}-{YY}-{NNNNNN}",
+  "hearing_date": "March 3, 2026",
+  "expected_cases": [
+    {
+      "case_number": "FPT-25-378624",
+      "case_title": "Graves v. Long",
+      "motion_type": "Request for Order for Change of Child Custody",
+      "outcome": "granted_in_part"
+    },
+    {
+      "case_number": "FPT-25-378672",
+      "case_title": "Ramirez Hernandez v. Juarez Mejia",
+      "motion_type": "Request for Order: Child Custody, Visitation",
+      "outcome": "granted_in_part"
+    },
+    {
+      "case_number": "FMS-20-387302",
+      "case_title": "Ruiz v. Juarez III",
+      "motion_type": "Request for Order for Change of Visitation",
+      "outcome": "granted_in_part"
+    },
+    {
+      "case_number": "FDI-14-781786",
+      "case_title": "Propp v. Childers",
+      "motion_type": "Request for Order: Bifurcation",
+      "outcome": "continued"
+    },
+    {
+      "case_number": "FDI-16-786194",
+      "case_title": "Huang v. Yang",
+      "motion_type": "Request for Order: Enforcement of Judgment",
+      "outcome": "other"
+    },
+    {
+      "case_number": "FDI-17-787957",
+      "case_title": "Peck v. Peck",
+      "motion_type": "Request for Order for Change of Child Custody, Visitation",
+      "outcome": "granted_in_part"
+    },
+    {
+      "case_number": "FDI-20-794120",
+      "case_title": "Richardson v. Richardson",
+      "motion_type": "Motion to Set Aside Judgment",
+      "outcome": "continued"
+    },
+    {
+      "case_number": "FDI-25-800840",
+      "case_title": "Lamy v. DiMauro",
+      "motion_type": "Request for Attorneys Fees and Mediation",
+      "outcome": "granted_in_part"
+    },
+    {
+      "case_number": "FDI-25-801374",
+      "case_title": "Montecino v. Montecino",
+      "motion_type": "Request for Order: Spousal Support",
+      "outcome": "denied"
+    },
+    {
+      "case_number": "FDI-25-802212",
+      "case_title": "Sheckells v. Kayali",
+      "motion_type": "Request for Order: Child Custody, Visitation",
+      "outcome": "granted_in_part"
+    },
+    {
+      "case_number": "FDV-21-815942",
+      "case_title": "Laidlow v. Brown Jr",
+      "motion_type": "Request for Order: Child Custody, Visitation, Child Support",
+      "outcome": "continued"
+    }
+  ],
+  "_notes": "Multi-case PDF, 11 rulings in Dept 403 (Family Law). First 2 pages are cover/boilerplate. Each case starts with SUPERIOR COURT OF CALIFORNIA header and structured caption block. Case numbers use F{XX}-YY-NNNNNN format. All rulings presided by Bobby P. Luna. Family law: parties are petitioner/respondent, not plaintiff/defendant."
+}
