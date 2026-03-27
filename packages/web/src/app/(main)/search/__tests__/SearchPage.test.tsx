@@ -560,4 +560,19 @@ describe('SearchPage component — filter visibility', () => {
     expect(screen.queryByLabelText('Open filters')).not.toBeInTheDocument();
     expect(screen.getByText('Failed to load search results. Please try again.')).toBeInTheDocument();
   });
+
+  // Hover state tests (#1743)
+  it('renders hover highlight on search result rows using muted design token', () => {
+    mockSearchParamsValue = new URLSearchParams('q=test');
+    mockUseQuery.mockReturnValue({
+      data: MOCK_SEARCH_DATA,
+      loading: false,
+      error: undefined,
+      fetchMore: vi.fn(),
+    });
+
+    const { container } = render(<SearchPage />);
+    const rows = container.querySelectorAll('.hover\\:bg-muted\\/50');
+    expect(rows.length).toBeGreaterThanOrEqual(2);
+  });
 });

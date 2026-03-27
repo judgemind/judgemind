@@ -475,4 +475,20 @@ describe('JudgesList', () => {
     // Initially no name param
     expect(mockReplace).toHaveBeenCalledWith('/judges');
   });
+
+  // Hover state tests (#1743)
+  it('renders hover highlight on judge rows via TableRow component', () => {
+    mockUseQuery.mockReturnValue({
+      data: MOCK_JUDGES_DATA,
+      loading: false,
+      error: undefined,
+      fetchMore: vi.fn(),
+    });
+
+    const { container } = render(<JudgesList />);
+    // TableRow uses hover:bg-muted/50 in its className
+    const rows = container.querySelectorAll('tr.hover\\:bg-muted\\/50');
+    // 2 data rows + 1 header row (header TableRow also has hover)
+    expect(rows.length).toBeGreaterThanOrEqual(2);
+  });
 });

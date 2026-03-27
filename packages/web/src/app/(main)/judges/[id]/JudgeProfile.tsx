@@ -409,7 +409,7 @@ export function JudgeProfile({ judgeId }: { judgeId: string }) {
       <div>
         <div className="divide-y rounded-lg border">
           {edges.map(({ node }) => (
-            <div key={node.id} className="px-4 py-3 transition-colors hover:bg-accent/50">
+            <div key={node.id} className="px-4 py-3 transition-colors hover:bg-muted/50">
               <div className="flex items-start justify-between gap-3">
                 <div className="min-w-0 flex-1">
                   {node.case ? (

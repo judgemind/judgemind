@@ -708,6 +708,27 @@ describe('JudgeProfile', () => {
     expect(screen.queryByTestId('rulings-skeleton')).not.toBeInTheDocument();
   });
 
+  // Hover state tests (#1743)
+  it('renders hover highlight on ruling rows using muted design token', async () => {
+    const mocks = [
+      buildAnalyticsMock('judge-hover'),
+      buildRulingsMock('judge-hover'),
+    ];
+
+    const { container } = render(
+      <MockedProvider mocks={mocks}>
+        <JudgeProfile judgeId="judge-hover" />
+      </MockedProvider>,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByText('24STCV12345')).toBeInTheDocument();
+    });
+
+    const rows = container.querySelectorAll('.hover\\:bg-muted\\/50');
+    expect(rows.length).toBeGreaterThanOrEqual(1);
+  });
+
   it('does not show empty message for analytics when analytics has data regardless of rulings loading', async () => {
     // Analytics has data, rulings takes forever
     const mocks = [

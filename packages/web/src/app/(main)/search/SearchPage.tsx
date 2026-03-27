@@ -342,7 +342,7 @@ function ResultRow({ node }: { node: SearchHitNode }) {
   const motionLabel = node.motionType ? MOTION_TYPE_LABELS[node.motionType] ?? node.motionType : null;
 
   return (
-    <Link href={`/rulings/${node.rulingId}`} className="block transition-colors hover:bg-accent/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2">
+    <Link href={`/rulings/${node.rulingId}`} className="block transition-colors hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2">
       <div className="px-4 py-3">
         {/* Top row: case info + hearing date */}
         <div className="flex items-start justify-between gap-3">
