@@ -273,6 +273,9 @@ def upsert_case(
 
     ``case_title`` and ``case_type`` are set on INSERT and updated on conflict
     only when a non-NULL value is provided (COALESCE preserves existing values).
+
+    Returns the case UUID as a string.  To also retrieve the effective
+    case_title (after COALESCE), use ``upsert_case_returning_title()``.
     """
     normalized = case_number.strip().lower().replace(" ", "").replace("-", "")
     case_title = normalize_case_title(_strip_nul(case_title))
@@ -303,6 +306,83 @@ def upsert_case(
         case_id,
     )
     return case_id
+
+
+def upsert_case_returning_title(
+    conn: psycopg.Connection,
+    case_number: str,
+    court_id: str,
+    case_title: str | None = None,
+    case_type: str | None = None,
+) -> tuple[str, str | None]:
+    """Upsert a case row and return ``(case_id, effective_case_title)``.
+
+    Identical to ``upsert_case()`` but also returns the effective
+    ``case_title`` after the COALESCE.  This allows callers to discover
+    an existing title that was preserved from a prior ruling — useful for
+    the cross-case title lookup (#2006).
+    """
+    normalized = case_number.strip().lower().replace(" ", "").replace("-", "")
+    case_title = normalize_case_title(_strip_nul(case_title))
+    case_type = _strip_nul(case_type)
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO cases (case_number, case_number_normalized, court_id, case_title, case_type)
+            VALUES (%s, %s, %s::uuid, %s, %s)
+            ON CONFLICT (court_id, case_number) DO UPDATE
+                SET case_title = COALESCE(EXCLUDED.case_title, cases.case_title),
+                    case_type  = COALESCE(EXCLUDED.case_type, cases.case_type)
+            RETURNING id, case_title
+            """,
+            (case_number, normalized, court_id, case_title, case_type),
+        )
+        row = cur.fetchone()
+    if row is None:
+        raise RuntimeError(
+            f"upsert_case: could not retrieve case id for case_number={case_number!r}"
+        )
+    case_id: str = str(row[0])
+    effective_title: str | None = row[1] if len(row) > 1 else None
+    logger.debug(
+        "upsert_case_returning_title: case_number=%s case_title=%s effective_title=%s id=%s",
+        case_number,
+        case_title,
+        effective_title,
+        case_id,
+    )
+    return case_id, effective_title
+
+
+def lookup_existing_case_title(
+    conn: psycopg.Connection,
+    case_number: str,
+    court_id: str,
+) -> str | None:
+    """Look up an existing case_title for a (court_id, case_number) pair.
+
+    When a new ruling for the same case arrives without party information,
+    this allows re-using the title from a prior ruling.  Returns ``None``
+    if the case does not exist or has no title.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT case_title FROM cases
+            WHERE court_id = %s::uuid AND case_number = %s
+            """,
+            (court_id, case_number),
+        )
+        row = cur.fetchone()
+    if row is None or row[0] is None:
+        return None
+    title: str = str(row[0])
+    logger.debug(
+        "lookup_existing_case_title: case_number=%s title=%s",
+        case_number,
+        title,
+    )
+    return title
 
 
 def insert_document(

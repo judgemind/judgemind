@@ -3369,7 +3369,7 @@ def test_process_event_already_split_no_re_split(
 
 @patch("ingestion.worker.batch_upsert_parties")
 @patch("ingestion.worker.insert_document_and_ruling", return_value=True)
-@patch("ingestion.worker.upsert_case", return_value="case-uuid-1")
+@patch("ingestion.worker.upsert_case_returning_title", return_value=("case-uuid-1", None))
 @patch("ingestion.worker.upsert_court", return_value="court-uuid-1")
 @patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
 @patch("ingestion.worker.psycopg")
@@ -3419,7 +3419,7 @@ def test_split_event_insert_document_and_ruling_uses_split_id(
 
 @patch("ingestion.worker.batch_upsert_parties")
 @patch("ingestion.worker.insert_document_and_ruling", return_value=True)
-@patch("ingestion.worker.upsert_case", return_value="case-uuid-1")
+@patch("ingestion.worker.upsert_case_returning_title", return_value=("case-uuid-1", None))
 @patch("ingestion.worker.upsert_court", return_value="court-uuid-1")
 @patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
 @patch("ingestion.worker.psycopg")
@@ -3865,6 +3865,62 @@ def test_process_event_warns_on_raw_pdf_binary_with_empty_extraction(
         f"Expected warning about PDF with no ruling text after raw binary extraction, "
         f"got: {[r.getMessage() for r in caplog.records]}"  # type: ignore[attr-defined]
     )
+
+
+# ---------------------------------------------------------------------------
+# Cross-case title lookup (#2006)
+# ---------------------------------------------------------------------------
+
+
+@patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
+@patch(
+    "ingestion.worker.upsert_case_returning_title",
+    return_value=("case-uuid-1", "Smith v. Jones"),
+)
+@patch("ingestion.worker.psycopg")
+def test_process_event_cross_case_title_lookup(
+    mock_psycopg: MagicMock,
+    mock_upsert: MagicMock,
+    mock_resolve_judge: MagicMock,
+    caplog: object,
+) -> None:
+    """When event has no case_title but DB already has one for this case,
+    the worker populates case_title from the existing DB record (#2006)."""
+    worker, os_mock = _make_worker()
+
+    mock_conn, mock_cur = _make_mock_conn()
+    mock_psycopg.connect.return_value = mock_conn
+    mock_cur.fetchone.side_effect = [
+        ("court-uuid-1",),  # upsert_court
+        (True,),  # insert_document
+    ]
+    mock_cur.rowcount = 1
+
+    import logging as _logging
+
+    with caplog.at_level(_logging.INFO, logger="ingestion.worker"):  # type: ignore[attr-defined]
+        # Event with no case_title and no hearing_date (skips enrichment)
+        # — the DB already knows this case's title from a prior ruling
+        event = _make_event(
+            case_title=None, hearing_date=None, ruling_text="The motion is GRANTED."
+        )
+        worker.process_event(event)
+
+    # Verify upsert_case_returning_title was called
+    mock_upsert.assert_called_once()
+
+    # Check all log messages to understand flow
+    all_msgs = [(r.levelno, r.getMessage()) for r in caplog.records]  # type: ignore[attr-defined]
+
+    # The cross-case title lookup should fire since case_title=None and
+    # effective_title="Smith v. Jones"
+    info_records = [
+        r
+        for r in caplog.records  # type: ignore[attr-defined]
+        if r.levelno >= _logging.INFO
+        and "Populated case_title from existing DB record" in r.getMessage()
+    ]
+    assert len(info_records) >= 1, f"Expected info about cross-case title lookup, got: {all_msgs}"
 
 
 # ---------------------------------------------------------------------------
