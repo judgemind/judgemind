@@ -8,13 +8,15 @@ import {
   formatDate,
   formatLabel,
   formatMotionType,
+  OUTCOME_LABELS,
+  MOTION_TYPE_LABELS,
 } from '@/lib/display-helpers';
 import { Autocomplete } from '@/components/Autocomplete';
 import { ErrorBanner } from '@/components/ErrorBanner';
 import { InfiniteScrollTrigger } from '@/components/InfiniteScrollTrigger';
 import { OutcomeBadge } from '@/components/OutcomeBadge';
 import { useInfiniteScroll } from '@/hooks/useInfiniteScroll';
-import { CASE_TYPES, useCountyOptions } from '@/lib/filter-options';
+import { CASE_TYPES, OUTCOMES, MOTION_TYPES, useCountyOptions } from '@/lib/filter-options';
 import { Input } from '@/components/ui/input';
 import {
   Select,
@@ -31,6 +33,8 @@ const CASES_QUERY = gql`
     $county: String
     $dateFrom: String
     $dateTo: String
+    $outcome: String
+    $motionType: String
     $first: Int!
     $after: String
   ) {
@@ -39,6 +43,8 @@ const CASES_QUERY = gql`
       county: $county
       dateFrom: $dateFrom
       dateTo: $dateTo
+      outcome: $outcome
+      motionType: $motionType
       first: $first
       after: $after
     ) {
@@ -124,6 +130,8 @@ export function CasesList() {
   const [county, setCounty] = useState(searchParams.get('county') ?? '');
   const [dateFrom, setDateFrom] = useState(searchParams.get('dateFrom') ?? '');
   const [dateTo, setDateTo] = useState(searchParams.get('dateTo') ?? '');
+  const [outcome, setOutcome] = useState(searchParams.get('outcome') ?? '');
+  const [motionType, setMotionType] = useState(searchParams.get('motionType') ?? '');
   const countyOptions = useCountyOptions();
 
   useEffect(() => {
@@ -131,6 +139,8 @@ export function CasesList() {
     setCounty(searchParams.get('county') ?? '');
     setDateFrom(searchParams.get('dateFrom') ?? '');
     setDateTo(searchParams.get('dateTo') ?? '');
+    setOutcome(searchParams.get('outcome') ?? '');
+    setMotionType(searchParams.get('motionType') ?? '');
   }, [searchParams]);
 
   const updateUrl = useCallback(() => {
@@ -139,9 +149,11 @@ export function CasesList() {
     if (county) params.set('county', county);
     if (dateFrom) params.set('dateFrom', dateFrom);
     if (dateTo) params.set('dateTo', dateTo);
+    if (outcome) params.set('outcome', outcome);
+    if (motionType) params.set('motionType', motionType);
     const search = params.toString();
     router.replace(search ? `/cases?${search}` : '/cases');
-  }, [typeFilter, county, dateFrom, dateTo, router]);
+  }, [typeFilter, county, dateFrom, dateTo, outcome, motionType, router]);
 
   useEffect(() => {
     updateUrl();
@@ -153,6 +165,8 @@ export function CasesList() {
       county: county || undefined,
       dateFrom: dateFrom || undefined,
       dateTo: dateTo || undefined,
+      outcome: outcome || undefined,
+      motionType: motionType || undefined,
       first: PAGE_SIZE,
     },
     notifyOnNetworkStatusChange: true,
@@ -175,7 +189,7 @@ export function CasesList() {
       }),
       [],
     ),
-    filterDeps: [typeFilter, county, dateFrom, dateTo],
+    filterDeps: [typeFilter, county, dateFrom, dateTo, outcome, motionType],
   });
 
   const filteredEdges = caseNumberFilter
@@ -211,6 +225,38 @@ export function CasesList() {
             {CASE_TYPES.map((ct) => (
               <SelectItem key={ct} value={ct}>
                 {formatLabel(ct)}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+        <Select
+          value={outcome || 'all'}
+          onValueChange={(v) => setOutcome(v === 'all' ? '' : v)}
+        >
+          <SelectTrigger className="w-auto min-w-[140px]" aria-label="Outcome" name="outcome">
+            <SelectValue placeholder="All outcomes" />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="all">All outcomes</SelectItem>
+            {OUTCOMES.map((o) => (
+              <SelectItem key={o} value={o}>
+                {OUTCOME_LABELS[o] ?? o}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+        <Select
+          value={motionType || 'all'}
+          onValueChange={(v) => setMotionType(v === 'all' ? '' : v)}
+        >
+          <SelectTrigger className="w-auto min-w-[140px]" aria-label="Motion type" name="motionType">
+            <SelectValue placeholder="All motions" />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="all">All motions</SelectItem>
+            {MOTION_TYPES.map((mt) => (
+              <SelectItem key={mt} value={mt}>
+                {MOTION_TYPE_LABELS[mt] ?? mt}
               </SelectItem>
             ))}
           </SelectContent>

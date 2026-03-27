@@ -373,6 +373,10 @@ export const typeDefs = `#graphql
       dateFrom: String
       """Only cases with a ruling on or before this date (ISO 8601), e.g. "2026-03-31"."""
       dateTo: String
+      """Filter by ruling outcome, e.g. "granted"."""
+      outcome: String
+      """Filter by ruling motion type, e.g. "msj"."""
+      motionType: String
       """Max results (default 20, max 100)."""
       first: Int
       """Opaque cursor from a previous response's pageInfo.endCursor."""

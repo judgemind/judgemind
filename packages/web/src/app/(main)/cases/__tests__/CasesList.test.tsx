@@ -39,6 +39,22 @@ vi.mock('@/lib/display-helpers', () => ({
   formatMotionType: (m: string | null) => m ?? 'Not classified',
   getOutcomeBadgeVariant: () => 'outline',
   getOutcomeBadgeListClass: () => '',
+  OUTCOME_LABELS: {
+    granted: 'Granted',
+    denied: 'Denied',
+    granted_in_part: 'Granted In Part',
+    moot: 'Moot',
+    continued: 'Continued',
+    other: 'Other',
+  } as Record<string, string>,
+  MOTION_TYPE_LABELS: {
+    msj: 'MSJ',
+    mtd: 'MTD',
+    mil: 'MIL',
+    demurrer: 'Demurrer',
+    anti_slapp: 'Anti-SLAPP',
+    other: 'Other',
+  } as Record<string, string>,
 }));
 
 vi.mock('@/lib/filter-options', async () => {
@@ -446,5 +462,84 @@ describe('CasesList', () => {
     const { container } = render(<CasesList />);
     const rows = container.querySelectorAll('.hover\\:bg-muted\\/50');
     expect(rows.length).toBeGreaterThanOrEqual(3);
+  });
+
+  // Outcome and motion type filter tests (#1796)
+  it('renders outcome filter dropdown', () => {
+    mockUseQuery.mockReturnValue({ data: MOCK_CASES_DATA, loading: false, error: undefined, fetchMore: vi.fn() });
+    render(<CasesList />);
+    expect(screen.getByLabelText('Outcome')).toBeInTheDocument();
+    expect(screen.getByText('All outcomes')).toBeInTheDocument();
+  });
+
+  it('renders motion type filter dropdown', () => {
+    mockUseQuery.mockReturnValue({ data: MOCK_CASES_DATA, loading: false, error: undefined, fetchMore: vi.fn() });
+    render(<CasesList />);
+    expect(screen.getByLabelText('Motion type')).toBeInTheDocument();
+    expect(screen.getByText('All motions')).toBeInTheDocument();
+  });
+
+  it('initializes outcome filter from URL params and passes to query', () => {
+    mockSearchParamsValue = new URLSearchParams('outcome=granted');
+    mockUseQuery.mockReturnValue({ data: MOCK_CASES_DATA, loading: false, error: undefined, fetchMore: vi.fn() });
+    render(<CasesList />);
+    const lastCall = mockUseQuery.mock.calls[mockUseQuery.mock.calls.length - 1];
+    expect(lastCall[1].variables.outcome).toBe('granted');
+  });
+
+  it('initializes motionType filter from URL params and passes to query', () => {
+    mockSearchParamsValue = new URLSearchParams('motionType=msj');
+    mockUseQuery.mockReturnValue({ data: MOCK_CASES_DATA, loading: false, error: undefined, fetchMore: vi.fn() });
+    render(<CasesList />);
+    const lastCall = mockUseQuery.mock.calls[mockUseQuery.mock.calls.length - 1];
+    expect(lastCall[1].variables.motionType).toBe('msj');
+  });
+
+  it('does not pass outcome when "All outcomes" is selected', () => {
+    mockUseQuery.mockReturnValue({ data: MOCK_CASES_DATA, loading: false, error: undefined, fetchMore: vi.fn() });
+    render(<CasesList />);
+    expect(mockUseQuery.mock.calls[0][1].variables.outcome).toBeUndefined();
+  });
+
+  it('does not pass motionType when "All motions" is selected', () => {
+    mockUseQuery.mockReturnValue({ data: MOCK_CASES_DATA, loading: false, error: undefined, fetchMore: vi.fn() });
+    render(<CasesList />);
+    expect(mockUseQuery.mock.calls[0][1].variables.motionType).toBeUndefined();
+  });
+
+  it('updates URL with outcome and motionType params', () => {
+    mockSearchParamsValue = new URLSearchParams('outcome=denied&motionType=mtd');
+    mockUseQuery.mockReturnValue({ data: MOCK_CASES_DATA, loading: false, error: undefined, fetchMore: vi.fn() });
+    render(<CasesList />);
+    expect(mockReplace).toHaveBeenCalledWith(expect.stringContaining('outcome=denied'));
+    expect(mockReplace).toHaveBeenCalledWith(expect.stringContaining('motionType=mtd'));
+  });
+
+  it('updates query variables when outcome filter is changed via user interaction', async () => {
+    const user = userEvent.setup();
+    mockUseQuery.mockReturnValue({ data: MOCK_CASES_DATA, loading: false, error: undefined, fetchMore: vi.fn() });
+    render(<CasesList />);
+
+    await user.click(screen.getByLabelText('Outcome'));
+    const grantedOption = await screen.findByRole('option', { name: 'Granted' });
+    await user.click(grantedOption);
+
+    const lastCall = mockUseQuery.mock.calls[mockUseQuery.mock.calls.length - 1];
+    expect(lastCall[1].variables.outcome).toBe('granted');
+    expect(mockReplace).toHaveBeenCalledWith(expect.stringContaining('outcome=granted'));
+  });
+
+  it('updates query variables when motion type filter is changed via user interaction', async () => {
+    const user = userEvent.setup();
+    mockUseQuery.mockReturnValue({ data: MOCK_CASES_DATA, loading: false, error: undefined, fetchMore: vi.fn() });
+    render(<CasesList />);
+
+    await user.click(screen.getByLabelText('Motion type'));
+    const msjOption = await screen.findByRole('option', { name: 'MSJ' });
+    await user.click(msjOption);
+
+    const lastCall = mockUseQuery.mock.calls[mockUseQuery.mock.calls.length - 1];
+    expect(lastCall[1].variables.motionType).toBe('msj');
+    expect(mockReplace).toHaveBeenCalledWith(expect.stringContaining('motionType=msj'));
   });
 });
