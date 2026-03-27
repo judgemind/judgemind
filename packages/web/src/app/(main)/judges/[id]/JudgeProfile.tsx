@@ -1,9 +1,9 @@
 'use client';
 
-import { useCallback } from 'react';
+import { useCallback, useRef, useState } from 'react';
 import { useQuery, gql } from '@apollo/client';
 import Link from 'next/link';
-import { BarChart3, Scale } from 'lucide-react';
+import { BarChart3, Scale, X } from 'lucide-react';
 import {
   formatDate,
   formatLabel,
@@ -53,8 +53,8 @@ const JUDGE_ANALYTICS_QUERY = gql`
 `;
 
 const JUDGE_RULINGS_QUERY = gql`
-  query JudgeRulings($judgeId: ID!, $first: Int!, $after: String) {
-    rulings(judgeId: $judgeId, first: $first, after: $after) {
+  query JudgeRulings($judgeId: ID!, $first: Int!, $after: String, $motionType: String) {
+    rulings(judgeId: $judgeId, first: $first, after: $after, motionType: $motionType) {
       edges {
         cursor
         node {
@@ -207,6 +207,9 @@ function formatDateRange(earliest: string | null, latest: string | null): string
 // ---------------------------------------------------------------------------
 
 export function JudgeProfile({ judgeId }: { judgeId: string }) {
+  const [motionTypeFilter, setMotionTypeFilter] = useState<string | null>(null);
+  const rulingsSectionRef = useRef<HTMLElement>(null);
+
   const {
     data: analyticsData,
     loading: analyticsLoading,
@@ -221,7 +224,11 @@ export function JudgeProfile({ judgeId }: { judgeId: string }) {
     error: rulingsError,
     fetchMore,
   } = useQuery<RulingsData>(JUDGE_RULINGS_QUERY, {
-    variables: { judgeId, first: PAGE_SIZE },
+    variables: {
+      judgeId,
+      first: PAGE_SIZE,
+      ...(motionTypeFilter ? { motionType: motionTypeFilter } : {}),
+    },
     notifyOnNetworkStatusChange: true,
   });
 
@@ -233,6 +240,19 @@ export function JudgeProfile({ judgeId }: { judgeId: string }) {
   // have completed. If one returns empty while the other is still loading,
   // show a skeleton instead of the contradictory "No rulings captured" message.
   const bothLoaded = !analyticsLoading && !rulingsLoading;
+
+  function handleMotionTypeClick(motionType: string) {
+    setMotionTypeFilter((prev) => (prev === motionType ? null : motionType));
+    // Scroll the rulings section into view after a short delay to let the
+    // state update propagate
+    requestAnimationFrame(() => {
+      rulingsSectionRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    });
+  }
+
+  function clearMotionTypeFilter() {
+    setMotionTypeFilter(null);
+  }
 
   const { handleLoadMore } = useInfiniteScroll<RulingsData>({
     hasNextPage: pageInfo?.hasNextPage,
@@ -248,6 +268,7 @@ export function JudgeProfile({ judgeId }: { judgeId: string }) {
       }),
       [],
     ),
+    filterDeps: [motionTypeFilter],
   });
 
   // -------------------------------------------------------------------------
@@ -345,20 +366,36 @@ export function JudgeProfile({ judgeId }: { judgeId: string }) {
                   </TableRow>
                 </TableHeader>
                 <TableBody>
-                  {analytics.rulingsByMotionType.map((row) => (
-                    <TableRow key={row.motionType}>
-                      <TableCell className="font-medium">
-                        {formatMotionType(row.motionType)}
-                      </TableCell>
-                      <TableCell className="text-right tabular-nums">{row.total}</TableCell>
-                      <TableCell className="text-right tabular-nums">{row.granted}</TableCell>
-                      <TableCell className="text-right tabular-nums">{row.denied}</TableCell>
-                      <TableCell className="text-right tabular-nums">{row.grantedInPart}</TableCell>
-                      <TableCell className="text-right tabular-nums font-medium">
-                        {Math.round(row.grantRate * 100)}%
-                      </TableCell>
-                    </TableRow>
-                  ))}
+                  {analytics.rulingsByMotionType.map((row) => {
+                    const isActive = motionTypeFilter === row.motionType;
+                    return (
+                      <TableRow
+                        key={row.motionType}
+                        className={`cursor-pointer transition-colors ${isActive ? 'bg-accent' : 'hover:bg-accent/50'}`}
+                        onClick={() => handleMotionTypeClick(row.motionType)}
+                        role="button"
+                        tabIndex={0}
+                        aria-pressed={isActive}
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter' || e.key === ' ') {
+                            e.preventDefault();
+                            handleMotionTypeClick(row.motionType);
+                          }
+                        }}
+                      >
+                        <TableCell className="font-medium">
+                          {formatMotionType(row.motionType)}
+                        </TableCell>
+                        <TableCell className="text-right tabular-nums">{row.total}</TableCell>
+                        <TableCell className="text-right tabular-nums">{row.granted}</TableCell>
+                        <TableCell className="text-right tabular-nums">{row.denied}</TableCell>
+                        <TableCell className="text-right tabular-nums">{row.grantedInPart}</TableCell>
+                        <TableCell className="text-right tabular-nums font-medium">
+                          {Math.round(row.grantRate * 100)}%
+                        </TableCell>
+                      </TableRow>
+                    );
+                  })}
                 </TableBody>
               </Table>
             </CardContent>
@@ -398,6 +435,20 @@ export function JudgeProfile({ judgeId }: { judgeId: string }) {
       // If the other query is still loading, show skeleton instead of
       // the empty message to avoid contradictory UI states.
       if (!bothLoaded) return <RulingsSkeleton />;
+      if (motionTypeFilter) {
+        return (
+          <p className="py-8 text-center text-sm text-muted-foreground">
+            No {formatMotionType(motionTypeFilter)} rulings found.{' '}
+            <button
+              type="button"
+              onClick={clearMotionTypeFilter}
+              className="font-medium text-foreground underline underline-offset-2 hover:text-foreground/80 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            >
+              Clear filter
+            </button>
+          </p>
+        );
+      }
       return (
         <p className="py-8 text-center text-sm text-muted-foreground">
           No rulings captured for this judge yet. Check back after the next scrape.
@@ -488,10 +539,28 @@ export function JudgeProfile({ judgeId }: { judgeId: string }) {
       </section>
 
       {/* Recent rulings section */}
-      <section>
-        <h2 className={`mb-3 ${SECTION_LABEL}`}>
-          Recent Rulings
-        </h2>
+      <section ref={rulingsSectionRef}>
+        <div className="mb-3 flex items-center gap-3">
+          <h2 className={SECTION_LABEL}>
+            Recent Rulings
+          </h2>
+          {motionTypeFilter && (
+            <span
+              className="inline-flex items-center gap-1 rounded-full border border-border bg-accent px-2.5 py-0.5 text-xs font-medium text-foreground"
+              data-testid="motion-type-filter-pill"
+            >
+              {formatMotionType(motionTypeFilter)}
+              <button
+                type="button"
+                onClick={clearMotionTypeFilter}
+                className="ml-0.5 rounded-full p-0.5 transition-colors hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                aria-label={`Clear ${formatMotionType(motionTypeFilter)} filter`}
+              >
+                <X className="h-3 w-3" aria-hidden="true" />
+              </button>
+            </span>
+          )}
+        </div>
         {renderRulings()}
       </section>
     </div>
