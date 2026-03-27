@@ -66,11 +66,31 @@ describe('buildQuery', () => {
     }
   });
 
-  it('combines motionTypes and outcomes with other filters', () => {
+  it('adds a terms filter for caseTypes', () => {
+    const result = buildQuery(undefined, { caseTypes: ['civil', 'family'] }) as {
+      bool: { must: unknown[]; filter: unknown[] };
+    };
+    expect(result.bool.filter).toContainEqual({
+      terms: { case_type: ['civil', 'family'] },
+    });
+  });
+
+  it('does not add caseTypes filter when array is empty', () => {
+    const result = buildQuery(undefined, { caseTypes: [] }) as Record<string, unknown>;
+    const bool = result.bool as { filter?: unknown[] };
+    if (bool?.filter) {
+      for (const f of bool.filter) {
+        expect(f).not.toHaveProperty('terms.case_type');
+      }
+    }
+  });
+
+  it('combines motionTypes, outcomes, and caseTypes with other filters', () => {
     const result = buildQuery('test', {
       county: 'Los Angeles',
       motionTypes: ['msj'],
       outcomes: ['granted'],
+      caseTypes: ['civil'],
     }) as {
       bool: { must: unknown[]; filter: unknown[] };
     };
@@ -78,6 +98,7 @@ describe('buildQuery', () => {
     expect(result.bool.filter).toContainEqual({ term: { county: 'Los Angeles' } });
     expect(result.bool.filter).toContainEqual({ terms: { motion_type: ['msj'] } });
     expect(result.bool.filter).toContainEqual({ terms: { outcome: ['granted'] } });
+    expect(result.bool.filter).toContainEqual({ terms: { case_type: ['civil'] } });
   });
 
   it('adds date range filter for dateFrom and dateTo', () => {

@@ -5,8 +5,9 @@ import {
   parseSearchParams,
   MOTION_TYPES,
   OUTCOMES,
+  CASE_TYPES,
 } from '../SearchPage';
-import { MOTION_TYPE_LABELS, OUTCOME_LABELS } from '@/lib/display-helpers';
+import { MOTION_TYPE_LABELS, OUTCOME_LABELS, CASE_TYPE_LABELS } from '@/lib/display-helpers';
 
 // ---------------------------------------------------------------------------
 // buildSearchParams — URL encoding of filter state (#1105)
@@ -22,6 +23,7 @@ describe('buildSearchParams', () => {
       dateTo: '',
       motionTypes: ['demurrer', 'msj'],
       outcomes: [],
+      caseTypes: [],
     });
     expect(params.get('motion')).toBe('demurrer,msj');
   });
@@ -35,11 +37,26 @@ describe('buildSearchParams', () => {
       dateTo: '',
       motionTypes: [],
       outcomes: ['granted', 'denied'],
+      caseTypes: [],
     });
     expect(params.get('outcome')).toBe('granted,denied');
   });
 
-  it('omits motionTypes and outcomes when empty', () => {
+  it('includes caseTypes when non-empty', () => {
+    const params = buildSearchParams({
+      q: '',
+      county: '',
+      judgeName: '',
+      dateFrom: '',
+      dateTo: '',
+      motionTypes: [],
+      outcomes: [],
+      caseTypes: ['civil', 'family'],
+    });
+    expect(params.get('caseType')).toBe('civil,family');
+  });
+
+  it('omits motionTypes, outcomes, and caseTypes when empty', () => {
     const params = buildSearchParams({
       q: 'test',
       county: '',
@@ -48,9 +65,11 @@ describe('buildSearchParams', () => {
       dateTo: '',
       motionTypes: [],
       outcomes: [],
+      caseTypes: [],
     });
     expect(params.has('motion')).toBe(false);
     expect(params.has('outcome')).toBe(false);
+    expect(params.has('caseType')).toBe(false);
   });
 
   it('includes all filter fields when populated', () => {
@@ -62,6 +81,7 @@ describe('buildSearchParams', () => {
       dateTo: '2026-03-01',
       motionTypes: ['msj'],
       outcomes: ['granted'],
+      caseTypes: ['civil'],
     });
     expect(params.get('q')).toBe('summary judgment');
     expect(params.get('county')).toBe('Los Angeles');
@@ -70,6 +90,7 @@ describe('buildSearchParams', () => {
     expect(params.get('dateTo')).toBe('2026-03-01');
     expect(params.get('motion')).toBe('msj');
     expect(params.get('outcome')).toBe('granted');
+    expect(params.get('caseType')).toBe('civil');
   });
 });
 
@@ -90,11 +111,18 @@ describe('parseSearchParams', () => {
     expect(state.outcomes).toEqual(['granted', 'denied']);
   });
 
-  it('returns empty arrays when motion and outcome are absent', () => {
+  it('parses caseTypes from comma-separated string', () => {
+    const params = new URLSearchParams('caseType=civil,family');
+    const state = parseSearchParams(params);
+    expect(state.caseTypes).toEqual(['civil', 'family']);
+  });
+
+  it('returns empty arrays when motion, outcome, and caseType are absent', () => {
     const params = new URLSearchParams('q=test');
     const state = parseSearchParams(params);
     expect(state.motionTypes).toEqual([]);
     expect(state.outcomes).toEqual([]);
+    expect(state.caseTypes).toEqual([]);
   });
 
   it('round-trips through buildSearchParams', () => {
@@ -106,6 +134,7 @@ describe('parseSearchParams', () => {
       dateTo: '2026-03-01',
       motionTypes: ['demurrer', 'msj'],
       outcomes: ['granted'],
+      caseTypes: ['civil'],
     };
     const params = buildSearchParams(original);
     const parsed = parseSearchParams(params);
@@ -129,6 +158,14 @@ describe('OUTCOMES', () => {
   it('has labels for every outcome', () => {
     for (const oc of OUTCOMES) {
       expect(OUTCOME_LABELS[oc]).toBeDefined();
+    }
+  });
+});
+
+describe('CASE_TYPES', () => {
+  it('has labels for every case type', () => {
+    for (const ct of CASE_TYPES) {
+      expect(CASE_TYPE_LABELS[ct]).toBeDefined();
     }
   });
 });
@@ -188,6 +225,9 @@ vi.mock('lucide-react', async (importOriginal) => {
     ),
     Gavel: ({ className }: { className?: string }) => (
       <span data-testid="gavel-icon" className={className} />
+    ),
+    Briefcase: ({ className }: { className?: string }) => (
+      <span data-testid="briefcase-icon" className={className} />
     ),
     AlertCircle: ({ className }: { className?: string }) => (
       <span data-testid="alert-circle-icon" className={className} />

@@ -68,6 +68,9 @@ TENTATIVE_RULINGS_MAPPING: dict = {
             "case_title": {
                 "type": "keyword",
             },
+            "case_type": {
+                "type": "keyword",
+            },
             "summary": {
                 "type": "text",
                 "analyzer": "ruling_text_analyzer",

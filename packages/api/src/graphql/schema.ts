@@ -177,6 +177,8 @@ export const typeDefs = `#graphql
     motionTypes: [String!]
     """Outcomes to filter by, e.g. ["granted", "denied"]. Matches any of the provided values."""
     outcomes: [String!]
+    """Case types to filter by, e.g. ["civil", "family"]. Matches any of the provided values."""
+    caseTypes: [String!]
   }
 
   """A single search hit from the tentative ruling search."""

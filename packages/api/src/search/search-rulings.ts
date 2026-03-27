@@ -15,6 +15,7 @@ export interface RulingFilters {
   caseNumber?: string;
   motionTypes?: string[];
   outcomes?: string[];
+  caseTypes?: string[];
 }
 
 export interface SearchRulingsArgs {
@@ -86,6 +87,9 @@ export function buildQuery(
     }
     if (filters.outcomes && filters.outcomes.length > 0) {
       filter.push({ terms: { outcome: filters.outcomes } });
+    }
+    if (filters.caseTypes && filters.caseTypes.length > 0) {
+      filter.push({ terms: { case_type: filters.caseTypes } });
     }
   }
 

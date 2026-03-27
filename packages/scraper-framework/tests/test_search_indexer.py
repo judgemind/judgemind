@@ -57,6 +57,7 @@ def sample_event() -> dict:
         "motion_type": "Demurrer",
         "outcome": "granted",
         "case_title": "Smith v. Jones",
+        "case_type": "civil",
         "summary": "Motion for demurrer is granted.",
     }
 
@@ -77,10 +78,10 @@ class TestIndexDocument:
         assert call_kwargs["body"]["case_number"] == "BC123456"
         assert call_kwargs["body"]["ruling_text"] == "This is the ruling text from S3."
 
-    def test_indexes_motion_type_outcome_case_title_summary(
+    def test_indexes_motion_type_outcome_case_title_case_type_summary(
         self, consumer: IndexingConsumer, mock_opensearch: MagicMock, sample_event: dict
     ) -> None:
-        """New fields (motion_type, outcome, case_title, summary) are included in OS doc."""
+        """Fields (motion_type, outcome, case_title, case_type, summary) are included in OS doc."""
         mock_opensearch.get.side_effect = Exception("not found")
 
         consumer.index_document(sample_event)
@@ -90,6 +91,7 @@ class TestIndexDocument:
         assert body["motion_type"] == "Demurrer"
         assert body["outcome"] == "granted"
         assert body["case_title"] == "Smith v. Jones"
+        assert body["case_type"] == "civil"
         assert body["summary"] == "Motion for demurrer is granted."
 
     def test_indexes_with_missing_new_fields(
@@ -114,6 +116,7 @@ class TestIndexDocument:
         assert body["motion_type"] is None
         assert body["outcome"] is None
         assert body["case_title"] is None
+        assert body["case_type"] is None
         assert body["summary"] is None
 
     def test_skips_when_same_hash(

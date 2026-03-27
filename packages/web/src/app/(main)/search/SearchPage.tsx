@@ -4,8 +4,8 @@ import { useState, useCallback, useEffect, useMemo } from 'react';
 import { useQuery, gql } from '@apollo/client';
 import { useRouter, useSearchParams } from 'next/navigation';
 import Link from 'next/link';
-import { Search, SlidersHorizontal, Calendar, Scale, Gavel, AlertCircle } from 'lucide-react';
-import { formatDate, MOTION_TYPE_LABELS, OUTCOME_LABELS } from '@/lib/display-helpers';
+import { Search, SlidersHorizontal, Calendar, Scale, Gavel, Briefcase, AlertCircle } from 'lucide-react';
+import { formatDate, MOTION_TYPE_LABELS, OUTCOME_LABELS, CASE_TYPE_LABELS } from '@/lib/display-helpers';
 import { PAGE_TITLE, SECTION_LABEL } from '@/lib/typography';
 import { sanitizeExcerptHtml } from '@/lib/sanitize-html';
 import { Autocomplete } from '@/components/Autocomplete';
@@ -89,6 +89,14 @@ export const OUTCOMES = [
   'other',
 ] as const;
 
+/** All case type filter options. */
+export const CASE_TYPES = [
+  'civil',
+  'family',
+  'probate',
+  'small_claims',
+  'other',
+] as const;
 
 /** Build URL search params from the current filter state. */
 export function buildSearchParams(state: {
@@ -99,6 +107,7 @@ export function buildSearchParams(state: {
   dateTo: string;
   motionTypes: string[];
   outcomes: string[];
+  caseTypes: string[];
 }): URLSearchParams {
   const params = new URLSearchParams();
   if (state.q) params.set('q', state.q);
@@ -110,6 +119,8 @@ export function buildSearchParams(state: {
     params.set('motion', state.motionTypes.join(','));
   if (state.outcomes.length > 0)
     params.set('outcome', state.outcomes.join(','));
+  if (state.caseTypes.length > 0)
+    params.set('caseType', state.caseTypes.join(','));
   return params;
 }
 
@@ -122,6 +133,7 @@ export function parseSearchParams(params: URLSearchParams): {
   dateTo: string;
   motionTypes: string[];
   outcomes: string[];
+  caseTypes: string[];
 } {
   return {
     q: params.get('q') ?? '',
@@ -131,6 +143,7 @@ export function parseSearchParams(params: URLSearchParams): {
     dateTo: params.get('dateTo') ?? '',
     motionTypes: params.get('motion')?.split(',').filter(Boolean) ?? [],
     outcomes: params.get('outcome')?.split(',').filter(Boolean) ?? [],
+    caseTypes: params.get('caseType')?.split(',').filter(Boolean) ?? [],
   };
 }
 
@@ -195,6 +208,8 @@ function FilterContent({
   toggleMotionType,
   outcomes: outcomeValues,
   toggleOutcome,
+  caseTypes: caseTypeValues,
+  toggleCaseType,
   countyOptions,
   judgeNameOptions,
 }: {
@@ -210,6 +225,8 @@ function FilterContent({
   toggleMotionType: (mt: string) => void;
   outcomes: string[];
   toggleOutcome: (oc: string) => void;
+  caseTypes: string[];
+  toggleCaseType: (ct: string) => void;
   countyOptions: string[];
   judgeNameOptions: string[];
 }) {
@@ -300,6 +317,33 @@ function FilterContent({
                 className="text-sm font-normal text-foreground"
               >
                 {OUTCOME_LABELS[oc]}
+              </Label>
+            </div>
+          ))}
+        </div>
+      </fieldset>
+
+      <Separator />
+
+      {/* Case type */}
+      <fieldset className="space-y-2">
+        <legend className="flex items-center gap-2 text-sm font-medium">
+          <Briefcase className="h-4 w-4 text-muted-foreground" aria-hidden="true" />
+          Case Type
+        </legend>
+        <div className="space-y-2">
+          {CASE_TYPES.map((ct) => (
+            <div key={ct} className="flex items-center gap-2">
+              <Checkbox
+                id={`filter-ct-${ct}`}
+                checked={caseTypeValues.includes(ct)}
+                onCheckedChange={() => toggleCaseType(ct)}
+              />
+              <Label
+                htmlFor={`filter-ct-${ct}`}
+                className="text-sm font-normal text-foreground"
+              >
+                {CASE_TYPE_LABELS[ct]}
               </Label>
             </div>
           ))}
@@ -415,6 +459,7 @@ export function SearchPage() {
     initialState.motionTypes,
   );
   const [outcomes, setOutcomes] = useState<string[]>(initialState.outcomes);
+  const [caseTypes, setCaseTypes] = useState<string[]>(initialState.caseTypes);
   const [mobileFiltersOpen, setMobileFiltersOpen] = useState(false);
 
   // Track whether the user has submitted a search
@@ -425,7 +470,8 @@ export function SearchPage() {
       initialState.dateFrom !== '' ||
       initialState.dateTo !== '' ||
       initialState.motionTypes.length > 0 ||
-      initialState.outcomes.length > 0,
+      initialState.outcomes.length > 0 ||
+      initialState.caseTypes.length > 0,
   );
 
   // Build GraphQL variables
@@ -435,7 +481,8 @@ export function SearchPage() {
     dateFrom !== '' ||
     dateTo !== '' ||
     motionTypes.length > 0 ||
-    outcomes.length > 0;
+    outcomes.length > 0 ||
+    caseTypes.length > 0;
 
   const filters = useMemo(() => {
     const f: Record<string, string | string[]> = {};
@@ -445,8 +492,9 @@ export function SearchPage() {
     if (dateTo) f.dateTo = dateTo;
     if (motionTypes.length > 0) f.motionTypes = motionTypes;
     if (outcomes.length > 0) f.outcomes = outcomes;
+    if (caseTypes.length > 0) f.caseTypes = caseTypes;
     return Object.keys(f).length > 0 ? f : undefined;
-  }, [county, judgeName, dateFrom, dateTo, motionTypes, outcomes]);
+  }, [county, judgeName, dateFrom, dateTo, motionTypes, outcomes, caseTypes]);
 
   const shouldQuery = hasSearched && (q !== '' || hasFilters);
 
@@ -484,7 +532,7 @@ export function SearchPage() {
       }),
       [],
     ),
-    filterDeps: [q, county, judgeName, dateFrom, dateTo, motionTypes, outcomes, hasSearched],
+    filterDeps: [q, county, judgeName, dateFrom, dateTo, motionTypes, outcomes, caseTypes, hasSearched],
   });
 
   // Sync URL params when search is submitted
@@ -498,12 +546,13 @@ export function SearchPage() {
         dateTo: overrides?.dateTo ?? dateTo,
         motionTypes: overrides?.motionTypes ?? motionTypes,
         outcomes: overrides?.outcomes ?? outcomes,
+        caseTypes: overrides?.caseTypes ?? caseTypes,
       };
       const params = buildSearchParams(state);
       const search = params.toString();
       router.replace(search ? `/search?${search}` : '/search');
     },
-    [q, county, judgeName, dateFrom, dateTo, motionTypes, outcomes, router],
+    [q, county, judgeName, dateFrom, dateTo, motionTypes, outcomes, caseTypes, router],
   );
 
   function handleSubmit(e: React.FormEvent) {
@@ -524,13 +573,19 @@ export function SearchPage() {
     );
   }
 
+  function toggleCaseType(ct: string) {
+    setCaseTypes((prev) =>
+      prev.includes(ct) ? prev.filter((x) => x !== ct) : [...prev, ct],
+    );
+  }
+
   // Sync URL when filters change (after initial search)
   useEffect(() => {
     if (hasSearched) {
       updateUrl();
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [county, judgeName, dateFrom, dateTo, motionTypes, outcomes]);
+  }, [county, judgeName, dateFrom, dateTo, motionTypes, outcomes, caseTypes]);
 
   const filterProps = {
     county,
@@ -545,6 +600,8 @@ export function SearchPage() {
     toggleMotionType,
     outcomes,
     toggleOutcome,
+    caseTypes,
+    toggleCaseType,
     countyOptions,
     judgeNameOptions,
   };

@@ -100,6 +100,7 @@ export const resolvers = {
           caseNumber?: string;
           motionTypes?: string[];
           outcomes?: string[];
+          caseTypes?: string[];
         };
         first?: number;
         after?: string;
