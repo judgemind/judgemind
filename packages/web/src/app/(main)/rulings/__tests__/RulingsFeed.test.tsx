@@ -617,4 +617,53 @@ describe('RulingsFeed', () => {
     expect(lastCall[1].variables.motionType).toBeUndefined();
     expect(lastCall[1].variables.county).toBeUndefined();
   });
+
+  // Visual hierarchy tests (#1738)
+  it('renders outcome badge on the same line as the case title', () => {
+    mockUseQuery.mockReturnValue({
+      data: MOCK_RULINGS_DATA,
+      loading: false,
+      error: undefined,
+      fetchMore: vi.fn(),
+    });
+
+    render(<RulingsFeed />);
+    const titleLink = screen.getByText(/23STCV12345/);
+    const outcomeBadge = screen.getByText('granted');
+    // Both should share the same flex parent
+    const titleParent = titleLink.closest('div.flex');
+    expect(titleParent).not.toBeNull();
+    expect(titleParent!.contains(outcomeBadge)).toBe(true);
+  });
+
+  it('renders court/judge metadata with muted styling', () => {
+    mockUseQuery.mockReturnValue({
+      data: MOCK_RULINGS_DATA,
+      loading: false,
+      error: undefined,
+      fetchMore: vi.fn(),
+    });
+
+    render(<RulingsFeed />);
+    const countyTexts = screen.getAllByText(/Los Angeles/);
+    expect(countyTexts.length).toBeGreaterThan(0);
+    const metadataRow = countyTexts[0].closest('div');
+    expect(metadataRow).not.toBeNull();
+    // Should use reduced-opacity muted foreground
+    expect(metadataRow!.className).toContain('text-muted-foreground');
+  });
+
+  it('renders motion type badges with muted subordinate styling', () => {
+    mockUseQuery.mockReturnValue({
+      data: MOCK_RULINGS_DATA,
+      loading: false,
+      error: undefined,
+      fetchMore: vi.fn(),
+    });
+
+    render(<RulingsFeed />);
+    // Motion type badges should exist but be visually muted
+    const motionBadges = screen.getAllByText('Demurrer');
+    expect(motionBadges.length).toBe(2);
+  });
 });
