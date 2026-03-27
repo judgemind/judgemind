@@ -2829,3 +2829,243 @@ class TestIsPlausibleCaseTitle:
         """Fragment check is case insensitive."""
         assert is_plausible_case_title("motion granted") is False
         assert is_plausible_case_title("Tentative Ruling on X") is False
+
+    # --- Tests for issue #2022 (Riverside enrichment gaps) ---
+
+    def test_rejects_tentative_rulings_plural(self) -> None:
+        """'Tentative Rulings for March...' is calendar header text."""
+        assert is_plausible_case_title("Tentative Rulings for March 19, 2026") is False
+
+    def test_rejects_department_header(self) -> None:
+        """Department headers are not case titles."""
+        assert is_plausible_case_title("Department M205 Smith v. Jones") is False
+
+    def test_rejects_multiple_case_numbers(self) -> None:
+        """Titles with multiple case numbers are contaminated."""
+        title = "CVPS2600101 TOP VISION vs HONDA CVPS2600105 Tentative Ruling:"
+        assert is_plausible_case_title(title) is False
+
+    def test_rejects_multiple_riverside_case_numbers(self) -> None:
+        """Multiple Riverside-format case numbers indicate contamination."""
+        title = "CVME2504512 DISCOVER BANK VS JONES CVME2511105 WELLS FARGO"
+        assert is_plausible_case_title(title) is False
+
+    def test_rejects_timekeeper_billing(self) -> None:
+        """Billing/timekeeper entries are not case titles."""
+        assert is_plausible_case_title("DUBONT VS GENERAL MOTORS Timekeeper Nicolas") is False
+
+    def test_accepts_normal_riverside_title(self) -> None:
+        """Normal adversarial titles should pass."""
+        assert is_plausible_case_title("Yeldell v. Henss") is True
+
+    def test_accepts_corporation_title(self) -> None:
+        """Titles with corporate parties should pass."""
+        assert is_plausible_case_title("Discover Bank v. Jones") is True
+
+
+# ---------------------------------------------------------------------------
+# Outcome extraction — Riverside-specific patterns (#2022)
+# ---------------------------------------------------------------------------
+
+
+class TestExtractOutcomeRiverside:
+    """Tests for Riverside-specific outcome extraction patterns (#2022)."""
+
+    def test_sustain_without_ed(self) -> None:
+        """Riverside demurrers use 'SUSTAIN' without '-ed' suffix."""
+        assert extract_outcome("SUSTAIN, with 30 days leave to amend.") == "granted"
+
+    def test_sustain_uppercase(self) -> None:
+        assert extract_outcome("Tentative Ruling:\nSUSTAIN, with leave.") == "granted"
+
+    def test_sustained(self) -> None:
+        """Standard 'sustained' should still map to granted."""
+        assert extract_outcome("Demurrer is sustained.") == "granted"
+
+    def test_overrule_without_d(self) -> None:
+        """Riverside demurrers use 'OVERRULE' without '-d' suffix."""
+        assert extract_outcome("Tentative Ruling: OVERRULE.") == "denied"
+
+    def test_overruled(self) -> None:
+        """Standard 'overruled' should still map to denied."""
+        assert extract_outcome("Demurrer is overruled.") == "denied"
+
+    def test_grant_verb_form(self) -> None:
+        """Bare 'Grant' at start of ruling (no '-ed')."""
+        text = "Grant, with five days to file the Answer."
+        assert extract_outcome(text) == "granted"
+
+    def test_deny_verb_form(self) -> None:
+        """Bare 'Deny' (no '-ied')."""
+        text = "Tentative Ruling: Deny the motion."
+        assert extract_outcome(text) == "denied"
+
+    def test_no_tentative_ruling(self) -> None:
+        """'No tentative ruling' -> other."""
+        text = "Tentative Ruling: No tentative ruling, appearances requested."
+        assert extract_outcome(text) == "other"
+
+    def test_no_tentative_decision(self) -> None:
+        """'No tentative decision' -> other."""
+        text = "Tentative Ruling: No tentative decision"
+        assert extract_outcome(text) == "other"
+
+    def test_hearing_required(self) -> None:
+        """'Hearing Required' -> other."""
+        text = "HEARING ON PRELIMINARY INJUNCTION\nTentative Ruling: Hearing required."
+        assert extract_outcome(text) == "other"
+
+    def test_it_is_ordered(self) -> None:
+        """'It is ordered' -> granted (stipulated judgment)."""
+        text = "It is ordered: that (1) the Notice of Settlement is vacated"
+        assert extract_outcome(text) == "granted"
+
+    def test_it_is_so_ordered(self) -> None:
+        """'It is so ordered' -> granted."""
+        text = "The request is approved. It is so ordered."
+        assert extract_outcome(text) == "granted"
+
+    def test_continue_present_tense(self) -> None:
+        """Riverside uses 'Continue' in present tense."""
+        text = "Tentative Ruling: Continue the hearing to April 21, 2026."
+        assert extract_outcome(text) == "continued"
+
+
+# ---------------------------------------------------------------------------
+# Motion type extraction — Riverside-specific patterns (#2022)
+# ---------------------------------------------------------------------------
+
+
+class TestExtractMotionTypeRiverside:
+    """Tests for Riverside-specific motion type extraction patterns (#2022)."""
+
+    def test_motion_for_stipulated_judgment(self) -> None:
+        text = "MOTION FOR STIPULATED JUDGMENT\nTentative Ruling: No opposition."
+        assert extract_motion_type(text) == "motion_for_stipulated_judgment"
+
+    def test_motion_to_enter_stipulated_judgment(self) -> None:
+        text = "Hearing re: Motion to Enter Stipulated Judgment by CITIBANK"
+        assert extract_motion_type(text) == "motion_for_stipulated_judgment"
+
+    def test_motion_for_entry_of_judgment(self) -> None:
+        text = "Hearing re: Motion for Entry of Judgment Pursuant to Stipulation"
+        assert extract_motion_type(text) == "motion_for_entry_of_judgment"
+
+    def test_motion_to_bifurcate(self) -> None:
+        text = "Hearing re: Motion to Bifurcate on 3rd Amended Complaint"
+        assert extract_motion_type(text) == "motion_to_bifurcate"
+
+    def test_motion_for_class_certification(self) -> None:
+        text = "MOTION FOR CLASS CERTIFICATION\nTentative Ruling: No tentative ruling"
+        assert extract_motion_type(text) == "motion_for_class_certification"
+
+    def test_motion_to_reclassify(self) -> None:
+        text = "Hearing on Motion to Reclassify by MICHAEL GOLDMAN"
+        assert extract_motion_type(text) == "motion_to_reclassify"
+
+    def test_motion_for_judicial_approval(self) -> None:
+        text = "MOTION FOR JUDICIAL APPROVAL OF PENDENCY OF ACTION"
+        assert extract_motion_type(text) == "motion_for_judicial_approval"
+
+    def test_motion_for_appointment_of_receiver(self) -> None:
+        text = "MOTION FOR APPOINTMENT OF RECEIVER\nTentative Ruling:"
+        assert extract_motion_type(text) == "motion_for_appointment_of_receiver"
+
+    def test_right_to_attach_order(self) -> None:
+        text = "HEARING ON RIGHT TO ATTACH ORDER\nTentative Ruling: Grant"
+        assert extract_motion_type(text) == "right_to_attach_order"
+
+    def test_motion_for_order_admissions_admitted(self) -> None:
+        text = "MOTION FOR ORDER FOR ADMISSIONS TO BE DEEMED ADMITTED"
+        assert extract_motion_type(text) == "deem_admissions_admitted"
+
+    def test_motion_order_deem_matters_admitted(self) -> None:
+        text = "Hearing re: Motion for Order to Deem Matters Admitted"
+        assert extract_motion_type(text) == "deem_admissions_admitted"
+
+    def test_motion_to_consolidate(self) -> None:
+        text = "Motion to Consolidate with UD Complaint"
+        assert extract_motion_type(text) == "motion_to_consolidate"
+
+    def test_recordation_lis_pendens(self) -> None:
+        text = "MOTION FOR ORDER AUTHORIZING RECORDATION OF NOTICE OF PENDENCY"
+        assert extract_motion_type(text) == "lis_pendens"
+
+    def test_request_for_dismissal(self) -> None:
+        text = "HEARING RE REQUEST FOR DISMISSAL OF ACTION"
+        assert extract_motion_type(text) == "request_for_dismissal"
+
+    def test_writ_of_attachment(self) -> None:
+        text = "Hearing on Notice of Application for Writ of Possession"
+        assert extract_motion_type(text) == "writ_of_possession"
+
+    def test_motion_to_seal(self) -> None:
+        text = "Motion to Seal court records pursuant to CRC 2.550"
+        assert extract_motion_type(text) == "motion_to_seal"
+
+
+# ---------------------------------------------------------------------------
+# normalize_motion_type — Riverside prefix-less patterns (#2022)
+# ---------------------------------------------------------------------------
+
+
+class TestNormalizeMotionTypeRiverside:
+    """Tests for normalize_motion_type with Riverside prefix-less patterns (#2022)."""
+
+    def test_stipulated_judgment_prefixless(self) -> None:
+        assert normalize_motion_type("Stipulated Judgment") == "motion_for_stipulated_judgment"
+
+    def test_entry_of_judgment_prefixless(self) -> None:
+        assert normalize_motion_type("Entry of Judgment") == "motion_for_entry_of_judgment"
+
+    def test_bifurcate_prefixless(self) -> None:
+        assert normalize_motion_type("Bifurcate") == "motion_to_bifurcate"
+
+    def test_class_certification_prefixless(self) -> None:
+        assert normalize_motion_type("Class Certification") == "motion_for_class_certification"
+
+    def test_reclassify_prefixless(self) -> None:
+        assert normalize_motion_type("Reclassify") == "motion_to_reclassify"
+
+    def test_judicial_approval_prefixless(self) -> None:
+        assert normalize_motion_type("Judicial Approval") == "motion_for_judicial_approval"
+
+    def test_receiver_prefixless(self) -> None:
+        result = normalize_motion_type("Appointment of Receiver")
+        assert result == "motion_for_appointment_of_receiver"
+
+    def test_right_to_attach_prefixless(self) -> None:
+        assert normalize_motion_type("Right to Attach") == "right_to_attach_order"
+
+    def test_consolidate_prefixless(self) -> None:
+        assert normalize_motion_type("Consolidate") == "motion_to_consolidate"
+
+    def test_dismissal_prefixless(self) -> None:
+        assert normalize_motion_type("Dismissal") == "request_for_dismissal"
+
+
+# ---------------------------------------------------------------------------
+# normalize_outcome — Riverside aliases (#2022)
+# ---------------------------------------------------------------------------
+
+
+class TestNormalizeOutcomeRiverside:
+    """Tests for normalize_outcome with Riverside-specific aliases (#2022)."""
+
+    def test_sustain(self) -> None:
+        assert normalize_outcome("sustain") == "granted"
+
+    def test_overrule(self) -> None:
+        assert normalize_outcome("overrule") == "denied"
+
+    def test_grant_alias(self) -> None:
+        assert normalize_outcome("grant") == "granted"
+
+    def test_deny_alias(self) -> None:
+        assert normalize_outcome("deny") == "denied"
+
+    def test_hearing_required(self) -> None:
+        assert normalize_outcome("hearing required") == "other"
+
+    def test_no_tentative_decision(self) -> None:
+        assert normalize_outcome("no tentative decision") == "other"
