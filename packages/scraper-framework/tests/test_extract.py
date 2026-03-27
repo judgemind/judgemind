@@ -550,6 +550,162 @@ class TestExtractMotionType:
         text = "Deem admission admitted"
         assert extract_motion_type(text) is None
 
+    # --- New motion type patterns (issue #2061) ---
+
+    def test_good_faith_settlement(self) -> None:
+        text = "motion for determination of good faith settlement"
+        assert extract_motion_type(text) == "good_faith_settlement"
+
+    def test_good_faith_settlement_application(self) -> None:
+        text = "Application for Good Faith Settlement"
+        assert extract_motion_type(text) == "good_faith_settlement"
+
+    def test_good_faith_settlement_in_ruling_text(self) -> None:
+        text = (
+            "The unopposed motion for determination of good faith settlement "
+            "filed by cross-defendants is GRANTED."
+        )
+        assert extract_motion_type(text) == "good_faith_settlement"
+
+    def test_compel_arbitration(self) -> None:
+        text = "Motion to Compel Arbitration and Stay Proceedings"
+        assert extract_motion_type(text) == "motion_to_compel_arbitration"
+
+    def test_compel_arbitration_without_motion_prefix(self) -> None:
+        text = "Defendant moves this Court to compel arbitration"
+        assert extract_motion_type(text) == "motion_to_compel_arbitration"
+
+    def test_compel_further_responses_not_arbitration(self) -> None:
+        """Regular 'motion to compel' should still match as motion_to_compel."""
+        text = "Motion to Compel Further Responses"
+        assert extract_motion_type(text) == "motion_to_compel"
+
+    def test_motion_for_continuance(self) -> None:
+        text = "Motion for Continuance of Trial"
+        assert extract_motion_type(text) == "motion_for_continuance"
+
+    def test_motion_for_continuance_short(self) -> None:
+        text = "Defendant's motion for continuance"
+        assert extract_motion_type(text) == "motion_for_continuance"
+
+    def test_motion_to_continue_trial(self) -> None:
+        text = "motion to continue trial and all trial related dates"
+        assert extract_motion_type(text) == "motion_for_continuance"
+
+    def test_continuance_of_trial(self) -> None:
+        text = "Motion for Continuance of Trial"
+        assert extract_motion_type(text) == "motion_for_continuance"
+
+    def test_request_for_order(self) -> None:
+        text = "Petitioner's Request for Order (RFO) for exclusive custody"
+        assert extract_motion_type(text) == "request_for_order"
+
+    def test_request_for_order_respondent(self) -> None:
+        text = "Respondent's Request for Order filed on 9/25/25"
+        assert extract_motion_type(text) == "request_for_order"
+
+    def test_rfo_abbreviation(self) -> None:
+        text = "Petitioner's RFO for Change of Visitation"
+        assert extract_motion_type(text) == "request_for_order"
+
+    def test_claim_of_exemption(self) -> None:
+        text = "The Claim of Exemption by Cherisa Brahmer is GRANTED in part."
+        assert extract_motion_type(text) == "claim_of_exemption"
+
+    def test_vexatious_litigant(self) -> None:
+        text = "DEFENDANT'S MOTION TO DECLARE PLAINTIFF A VEXATIOUS LITIGANT"
+        assert extract_motion_type(text) == "motion_vexatious_litigant"
+
+    def test_vexatious_litigant_finding(self) -> None:
+        text = "The Court finds Mother meets the definition of a vexatious litigant"
+        assert extract_motion_type(text) == "motion_vexatious_litigant"
+
+    def test_trial_preference(self) -> None:
+        text = "Plaintiff's motion for trial preference is DENIED WITHOUT PREJUDICE."
+        assert extract_motion_type(text) == "motion_for_trial_preference"
+
+    def test_motion_to_disqualify(self) -> None:
+        text = "Motion to Disqualify Counsel"
+        assert extract_motion_type(text) == "motion_to_disqualify"
+
+    def test_disqualification_standalone(self) -> None:
+        text = "Ms. Friend raises two grounds for disqualification"
+        assert extract_motion_type(text) == "motion_to_disqualify"
+
+    def test_motion_for_mental_examination(self) -> None:
+        text = "motion for a mental examination of these Plaintiffs"
+        assert extract_motion_type(text) == "motion_for_examination"
+
+    def test_motion_for_examination(self) -> None:
+        text = "Motion for Examination under CCP 2032.310"
+        assert extract_motion_type(text) == "motion_for_examination"
+
+    def test_interlocutory_judgment(self) -> None:
+        text = "Motion For Default Interlocutory Judgment of Partition"
+        assert extract_motion_type(text) == "motion_for_interlocutory_judgment"
+
+    def test_judgment_of_partition(self) -> None:
+        text = "Application for Judgment of Partition"
+        assert extract_motion_type(text) == "motion_for_interlocutory_judgment"
+
+    def test_motion_to_reinstate(self) -> None:
+        text = "Motion to Reinstate Case"
+        assert extract_motion_type(text) == "motion_to_reinstate"
+
+    def test_notice_of_proposed_action(self) -> None:
+        text = "Notice of Proposed Action re selling the property"
+        assert extract_motion_type(text) == "notice_of_proposed_action"
+
+    def test_nopa_abbreviation(self) -> None:
+        text = "Administrator filed a NOPA re selling the property"
+        assert extract_motion_type(text) == "notice_of_proposed_action"
+
+    def test_common_identity_finding(self) -> None:
+        text = "the motion for common identity finding is GRANTED."
+        assert extract_motion_type(text) == "motion_for_common_identity"
+
+    def test_application_pro_hac_vice(self) -> None:
+        """Application to Appear Pro Hac Vice matches pro hac vice."""
+        text = "The Application to Appear Pro Hac Vice is GRANTED."
+        assert extract_motion_type(text) == "motion_pro_hac_vice"
+
+    def test_motion_to_permit_remote_testimony(self) -> None:
+        text = "Motion to Permit Remote Testimony at Trial"
+        assert extract_motion_type(text) == "motion_to_permit_remote_testimony"
+
+    def test_set_aside_dismissal(self) -> None:
+        text = "MOTION TO SET ASIDE DISMISSAL"
+        assert extract_motion_type(text) == "motion_to_set_aside_dismissal"
+
+    def test_set_aside_dismissal_grant(self) -> None:
+        text = "GRANT the Motion to Set Aside Dismissals of July 7, 2025"
+        assert extract_motion_type(text) == "motion_to_set_aside_dismissal"
+
+    def test_set_aside_vacate_default_slash(self) -> None:
+        """OC uses 'Set Aside/Vacate Default' slash notation."""
+        text = "Motion to Set Aside/Vacate Default"
+        assert extract_motion_type(text) == "motion_to_set_aside_default"
+
+    def test_moves_to_transfer_venue(self) -> None:
+        """Verb form 'moves to transfer venue' should match."""
+        text = "Defendant moves to transfer venue to Orange County."
+        assert extract_motion_type(text) == "motion_to_transfer_venue"
+
+    def test_moves_to_consolidate(self) -> None:
+        """Verb form 'moves to consolidate' should match."""
+        text = "Plaintiff moves to consolidate related cases."
+        assert extract_motion_type(text) == "motion_to_consolidate"
+
+    def test_moves_to_compel(self) -> None:
+        """Verb form 'moves to compel' should match motion_to_compel."""
+        text = "Plaintiff moves to compel responses from Defendant"
+        assert extract_motion_type(text) == "motion_to_compel"
+
+    def test_moves_for_order_compelling(self) -> None:
+        """Verb form 'moves for an order compelling' should match."""
+        text = "Plaintiff moves for an order compelling Defendant to respond"
+        assert extract_motion_type(text) == "motion_to_compel"
+
 
 # ---------------------------------------------------------------------------
 # Judge name extraction
@@ -2595,6 +2751,108 @@ class TestNormalizeMotionType:
 
     def test_settlement_approval_already_normalized(self) -> None:
         assert normalize_motion_type("settlement_approval") == "settlement_approval"
+
+    # --- New patterns for issue #2061 ---
+
+    def test_good_faith_settlement_title_case(self) -> None:
+        assert normalize_motion_type("Good Faith Settlement") == "good_faith_settlement"
+
+    def test_good_faith_settlement_already_normalized(self) -> None:
+        assert normalize_motion_type("good_faith_settlement") == "good_faith_settlement"
+
+    def test_compel_arbitration_title_case(self) -> None:
+        assert normalize_motion_type("Compel Arbitration") == "motion_to_compel_arbitration"
+
+    def test_compel_arbitration_already_normalized(self) -> None:
+        assert (
+            normalize_motion_type("motion_to_compel_arbitration") == "motion_to_compel_arbitration"
+        )
+
+    def test_continuance_title_case(self) -> None:
+        assert normalize_motion_type("Continuance") == "motion_for_continuance"
+
+    def test_continuance_already_normalized(self) -> None:
+        assert normalize_motion_type("motion_for_continuance") == "motion_for_continuance"
+
+    def test_request_for_order_title_case(self) -> None:
+        assert normalize_motion_type("Request for Order") == "request_for_order"
+
+    def test_request_for_order_already_normalized(self) -> None:
+        assert normalize_motion_type("request_for_order") == "request_for_order"
+
+    def test_claim_of_exemption_title_case(self) -> None:
+        assert normalize_motion_type("Claim of Exemption") == "claim_of_exemption"
+
+    def test_claim_of_exemption_already_normalized(self) -> None:
+        assert normalize_motion_type("claim_of_exemption") == "claim_of_exemption"
+
+    def test_vexatious_litigant_title_case(self) -> None:
+        assert normalize_motion_type("Vexatious Litigant") == "motion_vexatious_litigant"
+
+    def test_vexatious_litigant_already_normalized(self) -> None:
+        assert normalize_motion_type("motion_vexatious_litigant") == "motion_vexatious_litigant"
+
+    def test_trial_preference_title_case(self) -> None:
+        assert normalize_motion_type("Trial Preference") == "motion_for_trial_preference"
+
+    def test_trial_preference_already_normalized(self) -> None:
+        assert normalize_motion_type("motion_for_trial_preference") == "motion_for_trial_preference"
+
+    def test_disqualification_title_case(self) -> None:
+        assert normalize_motion_type("Disqualification") == "motion_to_disqualify"
+
+    def test_disqualify_title_case(self) -> None:
+        assert normalize_motion_type("Motion to Disqualify") == "motion_to_disqualify"
+
+    def test_disqualify_already_normalized(self) -> None:
+        assert normalize_motion_type("motion_to_disqualify") == "motion_to_disqualify"
+
+    def test_mental_examination_title_case(self) -> None:
+        assert normalize_motion_type("Mental Examination") == "motion_for_examination"
+
+    def test_examination_already_normalized(self) -> None:
+        assert normalize_motion_type("motion_for_examination") == "motion_for_examination"
+
+    def test_interlocutory_judgment_title_case(self) -> None:
+        assert (
+            normalize_motion_type("Interlocutory Judgment") == "motion_for_interlocutory_judgment"
+        )
+
+    def test_interlocutory_judgment_already_normalized(self) -> None:
+        assert (
+            normalize_motion_type("motion_for_interlocutory_judgment")
+            == "motion_for_interlocutory_judgment"
+        )
+
+    def test_reinstate_title_case(self) -> None:
+        assert normalize_motion_type("Motion to Reinstate") == "motion_to_reinstate"
+
+    def test_reinstate_already_normalized(self) -> None:
+        assert normalize_motion_type("motion_to_reinstate") == "motion_to_reinstate"
+
+    def test_set_aside_dismissal_prefix_less(self) -> None:
+        assert normalize_motion_type("Set Aside Dismissal") == "motion_to_set_aside_dismissal"
+
+    def test_set_aside_dismissal_already_normalized(self) -> None:
+        assert (
+            normalize_motion_type("motion_to_set_aside_dismissal")
+            == "motion_to_set_aside_dismissal"
+        )
+
+    def test_notice_of_proposed_action_title_case(self) -> None:
+        assert normalize_motion_type("Notice of Proposed Action") == "notice_of_proposed_action"
+
+    def test_notice_of_proposed_action_already_normalized(self) -> None:
+        assert normalize_motion_type("notice_of_proposed_action") == "notice_of_proposed_action"
+
+    def test_common_identity_already_normalized(self) -> None:
+        assert normalize_motion_type("motion_for_common_identity") == "motion_for_common_identity"
+
+    def test_permit_remote_testimony_already_normalized(self) -> None:
+        assert (
+            normalize_motion_type("motion_to_permit_remote_testimony")
+            == "motion_to_permit_remote_testimony"
+        )
 
 
 # ---------------------------------------------------------------------------

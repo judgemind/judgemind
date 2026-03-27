@@ -79,6 +79,14 @@ _MOTION_TYPE_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"\bmotion\s+to\s+dismiss\b", re.IGNORECASE), "mtd"),
     (re.compile(r"\bmotion\s+in\s+limine\b", re.IGNORECASE), "mil"),
     (re.compile(r"\bdemurrer\b", re.IGNORECASE), "demurrer"),
+    # "compel arbitration" must come before broad "motion to compel" (#2061)
+    (
+        re.compile(
+            r"\b(?:motions?\s+to\s+)?compel\s+arbitration\b",
+            re.IGNORECASE,
+        ),
+        "motion_to_compel_arbitration",
+    ),
     (re.compile(r"\bmotions?\s+to\s+compel\b", re.IGNORECASE), "motion_to_compel"),
     (
         re.compile(r"\banti[- ]?slapp\b", re.IGNORECASE),
@@ -197,6 +205,22 @@ _MOTION_TYPE_PATTERNS: list[tuple[re.Pattern[str], str]] = [
             re.IGNORECASE,
         ),
         "motion_to_set_aside_default",
+    ),
+    # "Set Aside/Vacate Default" — OC uses slash notation
+    (
+        re.compile(
+            r"\bset\s+aside\s*/\s*vacate\s+(?:the\s+)?default\b",
+            re.IGNORECASE,
+        ),
+        "motion_to_set_aside_default",
+    ),
+    # "Motion to Set Aside Dismissal" — Riverside, OC (distinct from default)
+    (
+        re.compile(
+            r"\bmotion\s+to\s+set\s+aside\s+(?:the\s+)?dismissals?\b",
+            re.IGNORECASE,
+        ),
+        "motion_to_set_aside_dismissal",
     ),
     (
         re.compile(r"\bmotion\s+to\s+vacate\b", re.IGNORECASE),
@@ -374,6 +398,182 @@ _MOTION_TYPE_PATTERNS: list[tuple[re.Pattern[str], str]] = [
             re.IGNORECASE,
         ),
         "right_to_attach_order",
+    ),
+    # --- New patterns added for issue #2061 (motion_type extraction gaps) ---
+    # "good faith settlement" / "determination of good faith settlement" — OC, SB
+    (
+        re.compile(
+            r"\b(?:determination\s+of\s+)?good\s+faith\s+settlement\b",
+            re.IGNORECASE,
+        ),
+        "good_faith_settlement",
+    ),
+    # "application for good faith settlement" — SB variant
+    (
+        re.compile(
+            r"\bapplication\s+for\s+good\s+faith\s+settlement\b",
+            re.IGNORECASE,
+        ),
+        "good_faith_settlement",
+    ),
+    # "motion for continuance" / "continue trial" / "continuance of trial" —
+    # OC, SC, LA, Ventura
+    (
+        re.compile(
+            r"\bmotion\s+(?:for\s+)?continuance\b",
+            re.IGNORECASE,
+        ),
+        "motion_for_continuance",
+    ),
+    (
+        re.compile(
+            r"\bmotion\s+to\s+continue\s+(?:the\s+)?trial\b",
+            re.IGNORECASE,
+        ),
+        "motion_for_continuance",
+    ),
+    (
+        re.compile(
+            r"\bcontinuance\s+of\s+trial\b",
+            re.IGNORECASE,
+        ),
+        "motion_for_continuance",
+    ),
+    # "request for order" / "RFO" — SF family law
+    (
+        re.compile(
+            r"\brequest\s+for\s+order\b",
+            re.IGNORECASE,
+        ),
+        "request_for_order",
+    ),
+    (
+        re.compile(r"\bRFO\b"),
+        "request_for_order",
+    ),
+    # "claim of exemption" — Ventura
+    (
+        re.compile(
+            r"\bclaim\s+of\s+exemption\b",
+            re.IGNORECASE,
+        ),
+        "claim_of_exemption",
+    ),
+    # "vexatious litigant" — LA, SF
+    (
+        re.compile(
+            r"\bvexatious\s+litigant\b",
+            re.IGNORECASE,
+        ),
+        "motion_vexatious_litigant",
+    ),
+    # "trial preference" — LA
+    (
+        re.compile(
+            r"\b(?:motion\s+for\s+)?trial\s+preference\b",
+            re.IGNORECASE,
+        ),
+        "motion_for_trial_preference",
+    ),
+    # "motion to disqualify" / "disqualification" — Ventura
+    (
+        re.compile(
+            r"\b(?:motion\s+to\s+)?disqualif(?:y|ication)\b",
+            re.IGNORECASE,
+        ),
+        "motion_to_disqualify",
+    ),
+    # "motion for mental examination" / "motion for examination" — SC
+    (
+        re.compile(
+            r"\bmotion\s+for\s+(?:a\s+)?(?:mental\s+)?examination\b",
+            re.IGNORECASE,
+        ),
+        "motion_for_examination",
+    ),
+    # "interlocutory judgment" / "judgment of partition" — SB
+    (
+        re.compile(
+            r"\binterlocutory\s+judgment\b",
+            re.IGNORECASE,
+        ),
+        "motion_for_interlocutory_judgment",
+    ),
+    (
+        re.compile(
+            r"\bjudgment\s+of\s+partition\b",
+            re.IGNORECASE,
+        ),
+        "motion_for_interlocutory_judgment",
+    ),
+    # "motion to reinstate" — LA
+    (
+        re.compile(
+            r"\bmotion\s+to\s+reinstate\b",
+            re.IGNORECASE,
+        ),
+        "motion_to_reinstate",
+    ),
+    # "notice of proposed action" / NOPA — Ventura probate
+    (
+        re.compile(
+            r"\bnotice\s+of\s+proposed\s+action\b",
+            re.IGNORECASE,
+        ),
+        "notice_of_proposed_action",
+    ),
+    (
+        re.compile(r"\bNOPA\b"),
+        "notice_of_proposed_action",
+    ),
+    # "common identity finding" — SC
+    (
+        re.compile(
+            r"\bcommon\s+identity\s+finding\b",
+            re.IGNORECASE,
+        ),
+        "motion_for_common_identity",
+    ),
+    # "application to appear pro hac vice" — OC variant (already have "motion
+    # for pro hac vice" above)
+    (
+        re.compile(
+            r"\bapplication\s+to\s+appear\s+pro\s+hac\s+vice\b",
+            re.IGNORECASE,
+        ),
+        "motion_pro_hac_vice",
+    ),
+    # "motion to permit remote testimony" — OC
+    (
+        re.compile(
+            r"\bmotion\s+to\s+permit\s+remote\s+testimony\b",
+            re.IGNORECASE,
+        ),
+        "motion_to_permit_remote_testimony",
+    ),
+    # "moves to transfer venue" — catch verb form without "motion" prefix
+    (
+        re.compile(
+            r"\bmoves?\s+to\s+transfer\s+venue\b",
+            re.IGNORECASE,
+        ),
+        "motion_to_transfer_venue",
+    ),
+    # "moves to consolidate" — catch verb form without "motion" prefix
+    (
+        re.compile(
+            r"\bmoves?\s+to\s+consolidate\b",
+            re.IGNORECASE,
+        ),
+        "motion_to_consolidate",
+    ),
+    # "moves to compel" — catch verb form without "motion" prefix
+    (
+        re.compile(
+            r"\bmoves?\s+(?:for\s+an\s+order\s+)?(?:to\s+)?compel(?:ling)?\b",
+            re.IGNORECASE,
+        ),
+        "motion_to_compel",
     ),
     # Broad ex parte fallback — must come after specific ex_parte_application/motion
     (
@@ -585,7 +785,32 @@ _PREFIX_LESS_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"\btransfer\s+venue\b", re.IGNORECASE), "motion_to_transfer_venue"),
     (re.compile(r"\bchange\s+(?:of\s+)?venue\b", re.IGNORECASE), "motion_to_transfer_venue"),
     (re.compile(r"\bseal\b", re.IGNORECASE), "motion_to_seal"),
+    # "set aside dismissal" must come before broad "dismissal" (#2061)
+    (
+        re.compile(r"\bset\s+aside\s+dismissals?\b", re.IGNORECASE),
+        "motion_to_set_aside_dismissal",
+    ),
     (re.compile(r"\bdismissal\b", re.IGNORECASE), "request_for_dismissal"),
+    # --- New prefix-less patterns added for issue #2061 ---
+    (re.compile(r"\bgood\s+faith\s+settlement\b", re.IGNORECASE), "good_faith_settlement"),
+    (
+        re.compile(r"\bcompel\s+arbitration\b", re.IGNORECASE),
+        "motion_to_compel_arbitration",
+    ),
+    (re.compile(r"\bcontinuance\b", re.IGNORECASE), "motion_for_continuance"),
+    (re.compile(r"\btrial\s+preference\b", re.IGNORECASE), "motion_for_trial_preference"),
+    (re.compile(r"\bvexatious\s+litigant\b", re.IGNORECASE), "motion_vexatious_litigant"),
+    (re.compile(r"\bclaim\s+of\s+exemption\b", re.IGNORECASE), "claim_of_exemption"),
+    (re.compile(r"\bdisqualif(?:y|ication)\b", re.IGNORECASE), "motion_to_disqualify"),
+    (
+        re.compile(r"\b(?:mental\s+)?examination\b", re.IGNORECASE),
+        "motion_for_examination",
+    ),
+    (
+        re.compile(r"\binterlocutory\s+judgment\b", re.IGNORECASE),
+        "motion_for_interlocutory_judgment",
+    ),
+    (re.compile(r"\breinstate\b", re.IGNORECASE), "motion_to_reinstate"),
     # Broad sanctions fallback — must come after more specific standalone patterns
     # to avoid shadowing "strike", "compel", "quash", etc. when the input
     # contains multiple keywords (e.g. "Strike and Sanctions").
@@ -947,11 +1172,41 @@ _MOTION_TYPE_CASE_TYPE_MAP: dict[str, str] = {
     "settlement_approval": "civil",
     "writ_of_possession": "civil",
     "mil": "civil",
+    # --- New civil motion types (#2061) ---
+    "good_faith_settlement": "civil",
+    "motion_to_compel_arbitration": "civil",
+    "motion_for_continuance": "civil",
+    "motion_for_trial_preference": "civil",
+    "motion_vexatious_litigant": "civil",
+    "motion_to_disqualify": "civil",
+    "motion_for_examination": "civil",
+    "motion_for_interlocutory_judgment": "civil",
+    "motion_to_reinstate": "civil",
+    "motion_to_set_aside_dismissal": "civil",
+    "motion_for_common_identity": "civil",
+    "motion_to_permit_remote_testimony": "civil",
+    "motion_to_consolidate": "civil",
+    "motion_to_transfer_venue": "civil",
+    "motion_to_seal": "civil",
+    "motion_to_bifurcate": "civil",
+    "motion_for_class_certification": "civil",
+    "motion_to_reclassify": "civil",
+    "motion_for_judicial_approval": "civil",
+    "motion_for_appointment_of_receiver": "civil",
+    "right_to_attach_order": "civil",
+    "motion_for_stipulated_judgment": "civil",
+    "motion_for_entry_of_judgment": "civil",
+    "lis_pendens": "civil",
+    "request_for_dismissal": "civil",
     # Probate-specific motion types
     "petition": "probate",
     "petition_for_probate": "probate",
     "guardianship_petition": "probate",
     "trust_petition": "probate",
+    "notice_of_proposed_action": "probate",
+    # Family law
+    "request_for_order": "family",
+    # Claim of exemption can appear in civil and family cases — excluded.
     # Accounting and show cause hearing can appear in multiple case types — excluded.
     # Ex parte and OSC can appear in multiple case types — excluded.
     # "petition_writ_of_mandate" and "petition_habeas_corpus" are civil/criminal
