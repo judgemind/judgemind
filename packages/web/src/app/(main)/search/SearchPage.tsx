@@ -391,9 +391,15 @@ function ResultRow({ node }: { node: SearchHitNode }) {
         {/* Top row: case info + hearing date */}
         <div className="flex items-start justify-between gap-3">
           <div className="min-w-0 flex-1">
-            <h3 className="truncate text-base font-semibold text-foreground">
-              {node.caseTitle ?? node.caseNumber ?? 'Unknown Case'}
-            </h3>
+            {/* Title + outcome badge on same line */}
+            <div className="flex items-center gap-2">
+              <h3 className="truncate text-base font-semibold text-foreground">
+                {node.caseTitle ?? node.caseNumber ?? 'Unknown Case'}
+              </h3>
+              {node.outcome && (
+                <OutcomeBadge outcome={node.outcome} className="shrink-0" />
+              )}
+            </div>
             {node.caseTitle && node.caseNumber && (
               <p className="mt-0.5 truncate text-xs text-muted-foreground">
                 {node.caseNumber}
@@ -414,15 +420,10 @@ function ResultRow({ node }: { node: SearchHitNode }) {
           {node.county ?? ''}
         </p>
 
-        {/* Badges for motion type and outcome */}
-        {(motionLabel || node.outcome) && (
-          <div className="mt-2 flex flex-wrap gap-1.5">
-            {motionLabel && (
-              <Badge variant="secondary">{motionLabel}</Badge>
-            )}
-            {node.outcome && (
-              <OutcomeBadge outcome={node.outcome} />
-            )}
+        {/* Supporting badges — muted so they don't compete with outcome */}
+        {motionLabel && (
+          <div className="mt-1.5 flex flex-wrap gap-1.5">
+            <Badge variant="outline" className="text-[11px] font-normal text-muted-foreground/70">{motionLabel}</Badge>
           </div>
         )}
 
