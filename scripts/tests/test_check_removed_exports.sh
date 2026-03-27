@@ -61,6 +61,8 @@ mkdir -p "$TEST_REPO/packages/mylib/src" "$TEST_REPO/packages/mylib/tests" "$TES
 
 cd "$TEST_REPO"
 git init --quiet
+git config user.email "test@test.com"
+git config user.name "Test Runner"
 git checkout -b main --quiet
 
 # Copy the check script into the test repo so it resolves REPO_ROOT correctly
