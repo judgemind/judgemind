@@ -23,6 +23,7 @@ from ingestion.extract import (
     extract_motion_type,
     extract_outcome,
     extract_parties_from_caption,
+    is_plausible_case_title,
     is_valid_case_number,
     normalize_motion_type,
     normalize_outcome,
@@ -2691,3 +2692,140 @@ class TestNormalizationIntegration:
         have no mapping — the integration samples are not a catch-all."""
         assert normalize_motion_type("Some Random Hearing Type") is None
         assert normalize_motion_type("Case Management Conference") is None
+
+
+# ---------------------------------------------------------------------------
+# is_plausible_case_title tests (#1974)
+# ---------------------------------------------------------------------------
+
+
+class TestIsPlausibleCaseTitle:
+    """Tests for the is_plausible_case_title() shared validation function."""
+
+    # --- Valid titles (should pass) ---
+
+    def test_standard_adversarial_title(self) -> None:
+        """Normal 'X v. Y' title passes validation."""
+        assert is_plausible_case_title("Smith v. Jones") is True
+
+    def test_in_re_title(self) -> None:
+        """'In re: Estate of ...' is a legitimate title."""
+        assert is_plausible_case_title("In re: Estate of John Smith") is True
+
+    def test_in_re_marriage(self) -> None:
+        """'In re Marriage of ...' is a legitimate title."""
+        assert is_plausible_case_title("In re Marriage of Garcia") is True
+
+    def test_in_the_matter_of(self) -> None:
+        """'In the Matter of ...' is a legitimate title."""
+        assert is_plausible_case_title("In the Matter of the Estate of Williams") is True
+
+    def test_single_party_name(self) -> None:
+        """Single party name (from inline extraction) passes."""
+        assert is_plausible_case_title("Duarte") is True
+
+    def test_corporate_parties(self) -> None:
+        """Corporate entity names pass."""
+        assert is_plausible_case_title("Acme Corporation v. Widget LLC") is True
+
+    def test_title_at_max_length(self) -> None:
+        """Title at exactly 120 chars passes."""
+        title = "A" * 120
+        assert is_plausible_case_title(title) is True
+
+    def test_title_at_min_length(self) -> None:
+        """Title at exactly 3 chars passes."""
+        assert is_plausible_case_title("Doe") is True
+
+    # --- Invalid titles (should be rejected) ---
+
+    def test_rejects_to_respond(self) -> None:
+        """'To Respond, Without Objections' is motion text, not a title (#1958)."""
+        assert is_plausible_case_title("To Respond, Without Objections") is False
+
+    def test_rejects_to_produce_all(self) -> None:
+        """'To Produce All' is motion text, not a title (#1958)."""
+        assert is_plausible_case_title("To Produce All") is False
+
+    def test_rejects_for_summary_judgment(self) -> None:
+        """'For Summary Judgment' starts with 'For'."""
+        assert is_plausible_case_title("For Summary Judgment") is False
+
+    def test_rejects_by_the_court(self) -> None:
+        """'By the Court' starts with 'By'."""
+        assert is_plausible_case_title("By the Court") is False
+
+    def test_rejects_on_the_merits(self) -> None:
+        """'On the Merits' starts with 'On'."""
+        assert is_plausible_case_title("On the Merits") is False
+
+    def test_rejects_re_colon_motion(self) -> None:
+        """'Re: Motion to Compel' starts with 'Re:'."""
+        assert is_plausible_case_title("Re: Motion to Compel") is False
+
+    def test_rejects_granted_fragment(self) -> None:
+        """Title containing 'GRANTED' is ruling text."""
+        assert is_plausible_case_title("Motion is GRANTED") is False
+
+    def test_rejects_denied_fragment(self) -> None:
+        """Title containing 'DENIED' is ruling text."""
+        assert is_plausible_case_title("Request DENIED") is False
+
+    def test_rejects_continued_fragment(self) -> None:
+        """Title containing 'CONTINUED' is ruling text."""
+        assert is_plausible_case_title("Matter CONTINUED to April") is False
+
+    def test_rejects_tentative_ruling(self) -> None:
+        """Title containing 'TENTATIVE RULING' is ruling text."""
+        assert is_plausible_case_title("TENTATIVE RULING on the motion") is False
+
+    def test_rejects_motion_fragment(self) -> None:
+        """Title containing 'MOTION' is procedural text."""
+        assert is_plausible_case_title("MOTION to Compel Discovery") is False
+
+    def test_rejects_demurrer_fragment(self) -> None:
+        """Title containing 'DEMURRER' is procedural text."""
+        assert is_plausible_case_title("DEMURRER to Complaint") is False
+
+    def test_rejects_too_short(self) -> None:
+        """Titles shorter than 3 chars are rejected."""
+        assert is_plausible_case_title("AB") is False
+
+    def test_rejects_too_long(self) -> None:
+        """Titles longer than 120 chars are rejected."""
+        title = "A" * 121
+        assert is_plausible_case_title(title) is False
+
+    def test_rejects_empty_string(self) -> None:
+        """Empty string is rejected."""
+        assert is_plausible_case_title("") is False
+
+    def test_rejects_whitespace_only(self) -> None:
+        """Whitespace-only string is rejected."""
+        assert is_plausible_case_title("   ") is False
+
+    def test_rejects_in_the_something(self) -> None:
+        """'In the Superior Court' is not a case title."""
+        assert is_plausible_case_title("In the Superior Court") is False
+
+    def test_rejects_overruled(self) -> None:
+        """'Objection OVERRULED' is ruling text."""
+        assert is_plausible_case_title("Objection OVERRULED") is False
+
+    def test_rejects_sustained(self) -> None:
+        """'Demurrer SUSTAINED' is ruling text."""
+        assert is_plausible_case_title("Demurrer SUSTAINED") is False
+
+    def test_rejects_order(self) -> None:
+        """'ORDER granting relief' is procedural text."""
+        assert is_plausible_case_title("ORDER granting relief") is False
+
+    def test_case_insensitive_prefix_check(self) -> None:
+        """Prefix check is case insensitive."""
+        assert is_plausible_case_title("TO respond without objections") is False
+        assert is_plausible_case_title("FOR the court's review") is False
+
+    def test_case_insensitive_fragment_check(self) -> None:
+        """Fragment check is case insensitive."""
+        assert is_plausible_case_title("motion granted") is False
+        assert is_plausible_case_title("Tentative Ruling on X") is False

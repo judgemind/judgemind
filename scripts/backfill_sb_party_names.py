@@ -47,6 +47,7 @@ from ingestion.extract import (  # noqa: E402
     _looks_like_motion_text,
     extract_case_title,
     extract_parties_from_caption,
+    is_plausible_case_title,
 )
 
 logging.basicConfig(
@@ -128,10 +129,18 @@ def _fix_case(
 
     Returns a dict with old_title, new_title, and action taken.
     """
-    # Re-extract case title from ruling text
+    # Re-extract case title from ruling text and validate (#1974)
     new_title = None
     if ruling_text:
-        new_title = extract_case_title(ruling_text)
+        candidate = extract_case_title(ruling_text)
+        if candidate and is_plausible_case_title(candidate):
+            new_title = candidate
+        elif candidate:
+            logger.warning(
+                "Rejected implausible title for case %s: %r",
+                case_id,
+                candidate,
+            )
 
     if dry_run:
         return {

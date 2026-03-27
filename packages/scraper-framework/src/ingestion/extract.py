@@ -1586,6 +1586,81 @@ def extract_case_title(ruling_text: str) -> str | None:
 
 
 # ---------------------------------------------------------------------------
+# Title validation — safety net between extraction and DB write (#1958)
+# ---------------------------------------------------------------------------
+
+# Common verb/preposition prefixes that indicate motion/procedural text,
+# not actual case titles.  Checked case-insensitively against the first word.
+_IMPLAUSIBLE_PREFIXES = (
+    "to",
+    "for",
+    "by",
+    "re:",
+    "on",
+)
+
+# Phrases that should never appear in a valid case title.
+_IMPLAUSIBLE_FRAGMENTS_RE = re.compile(
+    r"\b(?:GRANTED|DENIED|CONTINUED|TENTATIVE RULING|OVERRULED|SUSTAINED"
+    r"|MOOT|OFF CALENDAR|HEARING|MOTION|DEMURRER|ORDER)\b",
+    re.IGNORECASE,
+)
+
+# "In the" at the start — unless followed by "Matter of" (which is a
+# legitimate non-adversarial case title pattern).
+_IN_THE_NOT_MATTER_RE = re.compile(
+    r"^In\s+the\b(?!\s+Matter\s+of)",
+    re.IGNORECASE,
+)
+
+# Length bounds
+_MIN_TITLE_LENGTH = 3
+_MAX_TITLE_LENGTH = 120
+
+
+def is_plausible_case_title(title: str) -> bool:
+    """Return True if *title* looks like a real case title, not motion text.
+
+    This guards against false positives from ``extract_case_title()`` where
+    regex patterns match motion/procedural language (e.g.
+    ``"To Respond, Without Objections"``) instead of party names (#1958).
+
+    The function is intentionally conservative — it rejects obvious junk
+    while allowing legitimate edge cases through.
+    """
+    if not title or not title.strip():
+        return False
+
+    stripped = title.strip()
+
+    # Length check
+    if len(stripped) < _MIN_TITLE_LENGTH or len(stripped) > _MAX_TITLE_LENGTH:
+        return False
+
+    # Check first word against implausible prefixes
+    first_word = stripped.split()[0].rstrip(":,.")
+    if first_word.lower() in _IMPLAUSIBLE_PREFIXES:
+        # Allow "In the Matter of" — it's a legitimate case title pattern
+        if first_word.lower() == "in" and re.match(
+            r"^In\s+(?:re|the\s+Matter\s+of)\b",
+            stripped,
+            re.IGNORECASE,
+        ):
+            return True
+        return False
+
+    # Reject "In the <something>" unless it's "In the Matter of"
+    if _IN_THE_NOT_MATTER_RE.match(stripped):
+        return False
+
+    # Reject titles containing ruling/procedural fragments
+    if _IMPLAUSIBLE_FRAGMENTS_RE.search(stripped):
+        return False
+
+    return True
+
+
+# ---------------------------------------------------------------------------
 # Hearing date extraction
 # ---------------------------------------------------------------------------
 
