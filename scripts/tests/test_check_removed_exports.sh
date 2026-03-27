@@ -236,6 +236,133 @@ git commit -m "remove MY_CONSTANT" --quiet
 
 assert_fails "Detects stale import of removed constant" scripts/check-removed-exports.sh main
 
+# ─── Test 7: Remove constant definition, add import of same name — should pass (#2091)
+# This tests the false-positive scenario where a duplicate constant is removed
+# and replaced with an import from the canonical module.
+git checkout main --quiet
+git branch -D test-branch-6b --quiet 2>/dev/null || true
+git checkout -b test-branch-7 --quiet
+
+# Create a second module that has the canonical definition
+cat > packages/mylib/src/config.py << 'PYEOF'
+MY_CONSTANT = 42
+PYEOF
+
+# Create an eval script that has a DUPLICATE definition of MY_CONSTANT
+cat > scripts/eval_script.py << 'PYEOF'
+MY_CONSTANT = 42
+
+def run_eval():
+    return MY_CONSTANT
+PYEOF
+
+git add -A
+git commit -m "add config.py and eval_script with duplicate constant" --quiet
+
+# Merge into main so both files exist on main
+git checkout main --quiet
+git merge test-branch-7 --quiet
+git branch -D test-branch-7 --quiet 2>/dev/null || true
+git checkout -b test-branch-7b --quiet
+
+# Now remove the duplicate from the eval script and replace with an import
+cat > scripts/eval_script.py << 'PYEOF'
+from mylib.src.config import MY_CONSTANT
+
+def run_eval():
+    return MY_CONSTANT
+PYEOF
+
+git add scripts/eval_script.py
+git commit -m "replace duplicate constant with import from config" --quiet
+
+assert_passes "Passes when constant removed and re-imported (no false positive) (#2091)" scripts/check-removed-exports.sh main
+
+# ─── Test 8: Remove constant definition, NO import or re-definition — should fail
+# Confirms that truly removed constants are still caught even after the #2091 fix.
+git checkout main --quiet
+git branch -D test-branch-7b --quiet 2>/dev/null || true
+git checkout -b test-branch-8 --quiet
+
+# Remove MY_CONSTANT from config.py entirely, no import added
+cat > packages/mylib/src/config.py << 'PYEOF'
+OTHER_THING = "hello"
+PYEOF
+
+git add packages/mylib/src/config.py
+git commit -m "remove MY_CONSTANT entirely" --quiet
+
+# The eval_script still imports MY_CONSTANT from config — but since config no longer
+# defines it AND the diff doesn't add an import of it, this is a true stale import
+# scenario... except the eval_script itself was changed to import it in test-branch-7b.
+# We need a consumer that was NOT changed in this branch.
+# Let's add a consumer on main first.
+git checkout main --quiet
+git branch -D test-branch-8 --quiet 2>/dev/null || true
+
+# Add a consumer of MY_CONSTANT from config on main
+cat > packages/mylib/src/consumer_config.py << 'PYEOF'
+from mylib.src.config import MY_CONSTANT
+PYEOF
+
+git add packages/mylib/src/consumer_config.py
+git commit -m "add consumer of MY_CONSTANT from config" --quiet
+
+git checkout -b test-branch-8b --quiet
+
+# Remove MY_CONSTANT from config.py, no replacement
+cat > packages/mylib/src/config.py << 'PYEOF'
+OTHER_THING = "hello"
+PYEOF
+
+git add packages/mylib/src/config.py
+git commit -m "remove MY_CONSTANT from config" --quiet
+
+assert_fails "Detects stale import when constant truly removed (no re-import)" scripts/check-removed-exports.sh main
+
+# ─── Test 9: Remove function definition, add import of same name — should pass
+# Same as Test 7 but for functions, not constants.
+git checkout main --quiet
+git branch -D test-branch-8b --quiet 2>/dev/null || true
+git checkout -b test-branch-9 --quiet
+
+# Add a helper module with canonical definition of helper_function
+cat > packages/mylib/src/helpers.py << 'PYEOF'
+def helper_function():
+    return "help"
+PYEOF
+
+# Add a module that has a DUPLICATE definition
+cat > packages/mylib/src/dup_module.py << 'PYEOF'
+def helper_function():
+    return "help"
+
+def use_it():
+    return helper_function()
+PYEOF
+
+git add -A
+git commit -m "add helpers.py and dup_module with duplicate function" --quiet
+
+# Merge into main
+git checkout main --quiet
+git merge test-branch-9 --quiet
+git branch -D test-branch-9 --quiet 2>/dev/null || true
+git checkout -b test-branch-9b --quiet
+
+# Replace duplicate function with import
+cat > packages/mylib/src/dup_module.py << 'PYEOF'
+from mylib.src.helpers import helper_function
+
+def use_it():
+    return helper_function()
+PYEOF
+
+git add packages/mylib/src/dup_module.py
+git commit -m "replace duplicate function with import from helpers" --quiet
+
+assert_passes "Passes when function removed and re-imported (#2091 variant for functions)" scripts/check-removed-exports.sh main
+
 # ─── Summary ──────────────────────────────────────────────────────────────
 cd "$REPO_ROOT"
 echo ""
