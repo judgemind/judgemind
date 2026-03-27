@@ -2,8 +2,9 @@ import { gql } from '@apollo/client';
 import { notFound } from 'next/navigation';
 import Link from 'next/link';
 import { createApolloClient } from '@/lib/apollo-client';
-import { formatDate, formatLabel, formatOutcome, getOutcomeBadgeClass, groupParties } from '@/lib/display-helpers';
-import { PAGE_TITLE, SECTION_LABEL } from '@/lib/typography';
+import { formatDate, formatLabel, formatOutcome, getOutcomeBadgeClass } from '@/lib/display-helpers';
+import { PAGE_TITLE } from '@/lib/typography';
+import { PartiesSection } from '@/components/PartiesHeader';
 import { sanitizeRulingHtml } from '@/lib/sanitize-html';
 import { RulingDetail } from './RulingDetail';
 import { SiblingRulings } from './SiblingRulings';
@@ -85,63 +86,6 @@ interface RulingData {
   } | null;
 }
 
-
-/** Compact party list for a single role group (plaintiffs, defendants, etc.). */
-function PartyList({
-  label,
-  parties,
-}: {
-  label: string;
-  parties: Array<{ id: string; canonicalName: string; partyType: string | null; role: string | null }>;
-}) {
-  return (
-    <div>
-      <h3 className={SECTION_LABEL}>
-        {label}
-      </h3>
-      {parties.length === 0 ? (
-        <p className="mt-1 text-sm text-muted-foreground">
-          None listed
-        </p>
-      ) : (
-        <ul className="mt-1 space-y-1">
-          {parties.map((party) => (
-            <li key={party.id} className="text-sm text-foreground">
-              {party.canonicalName}
-              {party.partyType && (
-                <span className="ml-2 text-xs text-muted-foreground">
-                  ({formatLabel(party.partyType)})
-                </span>
-              )}
-            </li>
-          ))}
-        </ul>
-      )}
-    </div>
-  );
-}
-
-/** Parties header for the ruling detail page, matching the CaseDetail pattern. */
-function PartiesSection({
-  parties,
-}: {
-  parties: Array<{ id: string; canonicalName: string; partyType: string | null; role: string | null }>;
-}) {
-  const { plaintiffs, defendants, others } = groupParties(parties);
-  const hasParties = plaintiffs.length > 0 || defendants.length > 0 || others.length > 0;
-
-  if (!hasParties) return null;
-
-  return (
-    <div className="flex flex-wrap gap-x-8 gap-y-4" data-testid="parties-section">
-      <PartyList label="Plaintiffs" parties={plaintiffs} />
-      <PartyList label="Defendants" parties={defendants} />
-      {others.length > 0 && (
-        <PartyList label="Other Parties" parties={others} />
-      )}
-    </div>
-  );
-}
 
 type Props = { params: { id: string } };
 
