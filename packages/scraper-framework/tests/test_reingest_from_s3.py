@@ -6842,7 +6842,7 @@ class TestLlmSplitRegistry:
         mock_registry: MagicMock,
     ) -> None:
         """When LLM split is registered, it should be used instead of regex."""
-        from courts.ca.riverside_tentatives import SplitRuling
+        from courts.ca.fresno_tentatives import SplitRuling
 
         # LLM returns richer ruling_text
         llm_rulings = [
@@ -6853,6 +6853,7 @@ class TestLlmSplitRegistry:
                 "Smith v. Jones",
                 "msj",
                 "denied",
+                None,
             ),
             SplitRuling(
                 2,
@@ -6861,12 +6862,13 @@ class TestLlmSplitRegistry:
                 "Doe v. Roe",
                 "demurrer",
                 "granted",
+                None,
             ),
         ]
         # Regex returns truncated text
         regex_rulings = [
-            SplitRuling(1, "TEST001", "DENY MSJ.", "Smith v. Jones", "msj", "denied"),
-            SplitRuling(2, "TEST002", "GRANT demurrer.", "Doe v. Roe", "demurrer", "granted"),
+            SplitRuling(1, "TEST001", "DENY MSJ.", "Smith v. Jones", "msj", "denied", None),
+            SplitRuling(2, "TEST002", "GRANT demurrer.", "Doe v. Roe", "demurrer", "granted", None),
         ]
         mock_llm_split = MagicMock(return_value=llm_rulings)
         mock_regex_split = MagicMock(return_value=regex_rulings)
@@ -6898,11 +6900,11 @@ class TestLlmSplitRegistry:
         mock_registry: MagicMock,
     ) -> None:
         """When LLM split returns None, regex split should be used as fallback."""
-        from courts.ca.riverside_tentatives import SplitRuling
+        from courts.ca.fresno_tentatives import SplitRuling
 
         regex_rulings = [
-            SplitRuling(1, "TEST001", "DENY MSJ.", "Smith v. Jones", "msj", "denied"),
-            SplitRuling(2, "TEST002", "GRANT demurrer.", "Doe v. Roe", "demurrer", "granted"),
+            SplitRuling(1, "TEST001", "DENY MSJ.", "Smith v. Jones", "msj", "denied", None),
+            SplitRuling(2, "TEST002", "GRANT demurrer.", "Doe v. Roe", "demurrer", "granted", None),
         ]
         mock_llm_split = MagicMock(return_value=None)
         mock_regex_split = MagicMock(return_value=regex_rulings)
@@ -6932,11 +6934,11 @@ class TestLlmSplitRegistry:
         mock_registry: MagicMock,
     ) -> None:
         """When no LLM split is registered, regex split should be used directly."""
-        from courts.ca.riverside_tentatives import SplitRuling
+        from courts.ca.fresno_tentatives import SplitRuling
 
         regex_rulings = [
-            SplitRuling(1, "TEST001", "DENY MSJ.", "Smith v. Jones", "msj", "denied"),
-            SplitRuling(2, "TEST002", "GRANT demurrer.", "Doe v. Roe", "demurrer", "granted"),
+            SplitRuling(1, "TEST001", "DENY MSJ.", "Smith v. Jones", "msj", "denied", None),
+            SplitRuling(2, "TEST002", "GRANT demurrer.", "Doe v. Roe", "demurrer", "granted", None),
         ]
         mock_regex_split = MagicMock(return_value=regex_rulings)
 
@@ -6959,17 +6961,19 @@ class TestLlmSplitRegistryAutoDiscovery:
     """Tests that _load_scraper_registry() correctly discovers and registers
     _llm_extract_rulings functions from scraper modules (#1969)."""
 
-    def test_riverside_llm_split_registered(self) -> None:
-        """Riverside scraper exports _llm_extract_rulings; it must be in _LLM_SPLIT_REGISTRY."""
+    def test_riverside_not_in_split_registries(self) -> None:
+        """After #1728, Riverside LLM extraction moved to framework-level
+        LlmExtractor via extraction_config.py.  The scraper module no longer
+        exports _llm_extract_rulings or _split_rulings, so Riverside must NOT
+        appear in _LLM_SPLIT_REGISTRY or _SPLIT_REGISTRY."""
         reingest._SCRAPER_REGISTRY.clear()
         reingest._LLM_SPLIT_REGISTRY.clear()
         reingest._SPLIT_REGISTRY.clear()
         reingest._load_scraper_registry()
 
-        assert "ca-riverside-tentatives-civil" in reingest._LLM_SPLIT_REGISTRY, (
-            "Riverside LLM split function should be registered in _LLM_SPLIT_REGISTRY"
+        assert "ca-riverside-tentatives-civil" not in reingest._LLM_SPLIT_REGISTRY, (
+            "Riverside should not be in _LLM_SPLIT_REGISTRY (LLM extraction moved to framework)"
         )
-        # Also verify regex split is still registered
-        assert "ca-riverside-tentatives-civil" in reingest._SPLIT_REGISTRY, (
-            "Riverside regex split function should still be in _SPLIT_REGISTRY"
+        assert "ca-riverside-tentatives-civil" not in reingest._SPLIT_REGISTRY, (
+            "Riverside should not be in _SPLIT_REGISTRY (splitting moved to framework)"
         )
