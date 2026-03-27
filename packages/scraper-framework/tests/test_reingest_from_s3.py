@@ -7412,6 +7412,32 @@ class TestLlmSplitExceptionFallback:
         meta.update(overrides)
         return meta
 
+    @staticmethod
+    def _make_split_ruling(
+        ruling_index: int,
+        case_number: str | None,
+        ruling_text: str,
+        case_title: str | None,
+        motion_type: str | None,
+        outcome: str | None,
+    ) -> Any:
+        """Create a SplitRuling-like object without importing from courts module.
+
+        Uses types.SimpleNamespace to avoid transient CI import failures when
+        courts.ca.riverside_tentatives has unresolvable dependencies in some
+        test shards.
+        """
+        import types
+
+        return types.SimpleNamespace(
+            ruling_index=ruling_index,
+            case_number=case_number,
+            ruling_text=ruling_text,
+            case_title=case_title,
+            motion_type=motion_type,
+            outcome=outcome,
+        )
+
     @patch.object(reingest, "_load_scraper_registry")
     @patch.object(reingest, "_extract_text_from_content")
     def test_llm_split_exception_falls_back_to_regex(
@@ -7420,15 +7446,15 @@ class TestLlmSplitExceptionFallback:
         mock_registry: MagicMock,
     ) -> None:
         """LLM function that raises RuntimeError falls back to regex split."""
-        from courts.ca.riverside_tentatives import SplitRuling
-
         # LLM raises an exception
         mock_llm_split = MagicMock(side_effect=RuntimeError("LLM API error"))
 
         # Regex fallback returns valid results
         regex_rulings = [
-            SplitRuling(1, "TEST001", "DENY MSJ.", "Smith v. Jones", "msj", "denied"),
-            SplitRuling(2, "TEST002", "GRANT demurrer.", "Doe v. Roe", "demurrer", "granted"),
+            self._make_split_ruling(1, "TEST001", "DENY MSJ.", "Smith v. Jones", "msj", "denied"),
+            self._make_split_ruling(
+                2, "TEST002", "GRANT demurrer.", "Doe v. Roe", "demurrer", "granted"
+            ),
         ]
         mock_regex_split = MagicMock(return_value=regex_rulings)
 
@@ -7461,12 +7487,12 @@ class TestLlmSplitExceptionFallback:
         mock_registry: MagicMock,
     ) -> None:
         """Any exception type (ValueError, TypeError, etc.) triggers regex fallback."""
-        from courts.ca.riverside_tentatives import SplitRuling
-
         mock_llm_split = MagicMock(side_effect=ValueError("unexpected JSON"))
 
         regex_rulings = [
-            SplitRuling(1, "TEST001", "Ruling text.", "Smith v. Jones", "msj", "denied"),
+            self._make_split_ruling(
+                1, "TEST001", "Ruling text.", "Smith v. Jones", "msj", "denied"
+            ),
         ]
         mock_regex_split = MagicMock(return_value=regex_rulings)
 
@@ -7494,13 +7520,15 @@ class TestLlmSplitExceptionFallback:
         mock_registry: MagicMock,
     ) -> None:
         """When LLM succeeds with 2+ results, regex fallback is NOT called."""
-        from courts.ca.riverside_tentatives import SplitRuling
-
         # Need 2+ rulings to trigger the multi-ruling split path
         # (1 ruling falls through to _reparse_document)
         llm_rulings = [
-            SplitRuling(1, "TEST001", "Full analysis.", "Smith v. Jones", "msj", "denied"),
-            SplitRuling(2, "TEST002", "Detailed ruling.", "Doe v. Roe", "demurrer", "granted"),
+            self._make_split_ruling(
+                1, "TEST001", "Full analysis.", "Smith v. Jones", "msj", "denied"
+            ),
+            self._make_split_ruling(
+                2, "TEST002", "Detailed ruling.", "Doe v. Roe", "demurrer", "granted"
+            ),
         ]
         mock_llm_split = MagicMock(return_value=llm_rulings)
         mock_regex_split = MagicMock()
