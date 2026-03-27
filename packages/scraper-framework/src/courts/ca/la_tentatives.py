@@ -368,6 +368,139 @@ def _llm_extract_rulings(ruling_html: str) -> list[LASplitRuling] | None:
         input_tokens=response.input_tokens,
         output_tokens=response.output_tokens,
     )
+
+    # Replace LLM-generated ruling_text with BeautifulSoup-extracted text
+    # from per-case HTML chunks.  The LLM is asked to reproduce ruling text
+    # verbatim, but for long rulings it hits the output token limit (~50k
+    # chars), producing truncated text.  HTML-based extraction is lossless
+    # and avoids token-limit truncation entirely (#2007).
+    _replace_ruling_text_from_html(ruling_html, rulings)
+
+    return rulings
+
+
+def _replace_ruling_text_from_html(
+    ruling_html: str,
+    rulings: list[LASplitRuling],
+) -> None:
+    """Replace LLM-generated ruling_text with text extracted from HTML chunks.
+
+    Uses ``_split_cases_html()`` to get per-case HTML sections, then
+    ``BeautifulSoup.get_text()`` for lossless text extraction.  Matches
+    chunks to LLM rulings by case number or by position (index).
+
+    Modifies ``rulings`` in-place.  If chunking fails or produces no
+    results, leaves the LLM-generated text unchanged.
+    """
+    case_htmls = _split_cases_html(ruling_html)
+    if not case_htmls:
+        return
+
+    # Build a map from case number to HTML-extracted text.
+    chunk_texts: list[tuple[str | None, str]] = []
+    for html_chunk in case_htmls:
+        soup = BeautifulSoup(html_chunk, "lxml")
+        content = soup.find("div", id="speechSynthesis")
+        if content:
+            text = content.get_text(separator="\n", strip=True)
+        else:
+            text = soup.get_text(separator="\n", strip=True)
+        # Extract case number from this chunk for matching.
+        case_num_match = _CASE_NUMBER_RE.search(text)
+        case_num = case_num_match.group(1) if case_num_match else None
+        chunk_texts.append((case_num, text))
+
+    # Match each ruling to its HTML chunk.
+    for ruling in rulings:
+        matched_text: str | None = None
+
+        if ruling.case_number:
+            # Try case-number match.
+            for chunk_case_num, chunk_text in chunk_texts:
+                if chunk_case_num and chunk_case_num == ruling.case_number:
+                    matched_text = chunk_text
+                    break
+            # If case_number was present but didn't match any chunk, do NOT
+            # fall back to positional matching — that risks assigning text
+            # from the wrong case.  Leave the LLM text unchanged.
+            if matched_text is None:
+                logger.warning(
+                    "la_tentatives: LLM case number did not match any HTML chunk",
+                    llm_case_number=ruling.case_number,
+                    ruling_index=ruling.ruling_index,
+                )
+                continue
+        else:
+            # No case number from LLM — use positional match as last resort.
+            idx = ruling.ruling_index - 1
+            if 0 <= idx < len(chunk_texts):
+                matched_text = chunk_texts[idx][1]
+
+        if matched_text and len(matched_text) > 100:
+            ruling.ruling_text = matched_text
+
+
+def _split_rulings(text: str) -> list[LASplitRuling]:
+    """Split an LA department page into per-case rulings using regex + HTML parsing.
+
+    This is the non-LLM splitting path registered in ``_SPLIT_REGISTRY`` for
+    use by ``reingest_from_s3._full_reparse_document()``.  It provides a
+    reliable fallback when the LLM splitter is unavailable or fails.
+
+    The ``text`` parameter is the raw HTML content (for HTML documents,
+    ``_extract_text_from_content()`` returns the decoded HTML string).
+
+    Uses ``_split_cases_html()`` for splitting and ``_extract_ruling_fields()``
+    for per-case field extraction via BeautifulSoup.
+
+    Returns an empty list if no case sections are found.
+    """
+    case_htmls = _split_cases_html(text)
+    if not case_htmls:
+        return []
+
+    rulings: list[LASplitRuling] = []
+    for idx, case_html in enumerate(case_htmls):
+        # Create a minimal CapturedDocument for _extract_ruling_fields.
+        soup = BeautifulSoup(case_html, "lxml")
+        content = soup.find("div", id="speechSynthesis")
+        if content:
+            ruling_text = content.get_text(separator="\n", strip=True)
+        else:
+            ruling_text = soup.get_text(separator="\n", strip=True)
+
+        if not ruling_text or len(ruling_text) < 50:
+            continue
+
+        # Extract case number.
+        case_number: str | None = None
+        case_numbers = _CASE_NUMBER_RE.findall(ruling_text)
+        if case_numbers:
+            case_number = case_numbers[0]
+
+        # Extract case title.
+        case_title = _extract_case_title(content if content else soup)
+
+        # Extract parties for matching/display.
+        parties: list[dict[str, str]] = []
+        raw_parties = _extract_parties(content if content else soup)
+        if raw_parties:
+            for p in raw_parties:
+                if isinstance(p, dict) and p.get("name") and p.get("role"):
+                    parties.append({"name": str(p["name"]), "role": str(p["role"])})
+
+        rulings.append(
+            LASplitRuling(
+                ruling_index=idx + 1,
+                case_number=case_number,
+                ruling_text=ruling_text,
+                case_title=case_title,
+                motion_type=None,  # Filled by enrichment pipeline.
+                outcome=None,  # Filled by enrichment pipeline.
+                parties=parties,
+            )
+        )
+
     return rulings
 
 

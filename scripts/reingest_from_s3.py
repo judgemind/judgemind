@@ -880,8 +880,11 @@ def _full_reparse_document(
     _load_scraper_registry()
 
     split_fn = _SPLIT_REGISTRY.get(scraper_id)
-    if split_fn is None:
-        # No splitting logic — fall back to single-document reparse
+    llm_split_fn = _LLM_SPLIT_REGISTRY.get(scraper_id)
+
+    if split_fn is None and llm_split_fn is None:
+        # No splitting logic (neither regex nor LLM) — fall back to
+        # single-document reparse.
         result = _reparse_document(
             raw_content,
             scraper_id,
@@ -910,7 +913,8 @@ def _full_reparse_document(
     # Prefer LLM-based splitting when available — it produces higher-quality
     # ruling_text (e.g. full legal analyses instead of disposition summaries,
     # see #1948/#1959).  Falls back to regex-based split on LLM failure.
-    llm_split_fn = _LLM_SPLIT_REGISTRY.get(scraper_id)
+    # Note: some scrapers (e.g. LA) only have an LLM splitter without a
+    # regex fallback — previously these were skipped entirely (#2007).
     if llm_split_fn is not None:
         try:
             split_results = llm_split_fn(text)
@@ -923,12 +927,20 @@ def _full_reparse_document(
             )
             split_results = None
         if split_results is None:
-            logger.warning(
-                "LLM split failed, falling back to regex split",
-                document_id=doc_meta["document_id"],
-                scraper_id=scraper_id,
-            )
-            split_results = split_fn(text)
+            if split_fn is not None:
+                logger.warning(
+                    "LLM split failed, falling back to regex split",
+                    document_id=doc_meta["document_id"],
+                    scraper_id=scraper_id,
+                )
+                split_results = split_fn(text)
+            else:
+                logger.warning(
+                    "LLM split failed and no regex fallback available",
+                    document_id=doc_meta["document_id"],
+                    scraper_id=scraper_id,
+                )
+                split_results = []
     else:
         split_results = split_fn(text)
 
