@@ -1,7 +1,8 @@
 'use client';
 
-import { useCallback, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { useQuery, gql } from '@apollo/client';
+import { usePathname, useRouter, useSearchParams } from 'next/navigation';
 import Link from 'next/link';
 import { BarChart3, Scale, X } from 'lucide-react';
 import { ErrorBanner } from '@/components/ErrorBanner';
@@ -208,8 +209,18 @@ function formatDateRange(earliest: string | null, latest: string | null): string
 // ---------------------------------------------------------------------------
 
 export function JudgeProfile({ judgeId }: { judgeId: string }) {
-  const [motionTypeFilter, setMotionTypeFilter] = useState<string | null>(null);
+  const router = useRouter();
+  const pathname = usePathname();
+  const searchParams = useSearchParams();
+  const [motionTypeFilter, setMotionTypeFilter] = useState<string | null>(
+    searchParams.get('motion'),
+  );
   const rulingsSectionRef = useRef<HTMLElement>(null);
+
+  // Sync state from URL when search params change (e.g. browser back/forward)
+  useEffect(() => {
+    setMotionTypeFilter(searchParams.get('motion'));
+  }, [searchParams]);
 
   const {
     data: analyticsData,
@@ -242,8 +253,24 @@ export function JudgeProfile({ judgeId }: { judgeId: string }) {
   // show a skeleton instead of the contradictory "No rulings captured" message.
   const bothLoaded = !analyticsLoading && !rulingsLoading;
 
+  const updateUrl = useCallback(
+    (motionType: string | null) => {
+      const params = new URLSearchParams(searchParams.toString());
+      if (motionType) {
+        params.set('motion', motionType);
+      } else {
+        params.delete('motion');
+      }
+      const search = params.toString();
+      router.replace(search ? `${pathname}?${search}` : pathname);
+    },
+    [searchParams, router, pathname],
+  );
+
   function handleMotionTypeClick(motionType: string) {
-    setMotionTypeFilter((prev) => (prev === motionType ? null : motionType));
+    const newValue = motionTypeFilter === motionType ? null : motionType;
+    setMotionTypeFilter(newValue);
+    updateUrl(newValue);
     // Scroll the rulings section into view after a short delay to let the
     // state update propagate
     requestAnimationFrame(() => {
@@ -253,6 +280,7 @@ export function JudgeProfile({ judgeId }: { judgeId: string }) {
 
   function clearMotionTypeFilter() {
     setMotionTypeFilter(null);
+    updateUrl(null);
   }
 
   const { handleLoadMore } = useInfiniteScroll<RulingsData>({

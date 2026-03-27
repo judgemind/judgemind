@@ -15,6 +15,16 @@ vi.mock('next/link', () => ({
   ),
 }));
 
+// Mock next/navigation — useSearchParams, useRouter, usePathname
+const mockReplace = vi.fn();
+let mockSearchParams = new URLSearchParams();
+
+vi.mock('next/navigation', () => ({
+  useSearchParams: () => mockSearchParams,
+  useRouter: () => ({ replace: mockReplace, push: vi.fn(), back: vi.fn() }),
+  usePathname: () => '/judges/test-id',
+}));
+
 // Mock lucide-react icons
 vi.mock('lucide-react', () => ({
   AlertCircle: ({ className }: { className?: string }) => (
@@ -259,6 +269,7 @@ function buildRulingsMock(
 describe('JudgeProfile', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mockSearchParams = new URLSearchParams();
   });
 
   it('renders analytics summary with grant rate and total rulings', async () => {
@@ -1124,5 +1135,199 @@ describe('JudgeProfile', () => {
       expect(screen.getByTestId('motion-type-filter-pill')).toBeInTheDocument();
     });
     expect(screen.getByTestId('motion-type-filter-pill')).toHaveTextContent('MSJ');
+  });
+
+  // -------------------------------------------------------------------------
+  // URL param sync tests (#2018)
+  // -------------------------------------------------------------------------
+
+  it('updates URL with ?motion=<type> when a motion type row is clicked', async () => {
+    const user = userEvent.setup();
+    const mocks: MockedResponse[] = [
+      buildAnalyticsMock('judge-url-1'),
+      buildRulingsMock('judge-url-1'),
+      buildRulingsMock('judge-url-1', {
+        motionType: 'demurrer',
+        edges: [
+          {
+            cursor: 'cf1',
+            node: {
+              id: 'rf1',
+              hearingDate: '2026-02-15',
+              motionType: 'demurrer',
+              outcome: 'denied',
+              case: {
+                id: 'case-2',
+                caseNumber: '24STCV67890',
+                caseTitle: 'URL Test Case',
+              },
+            },
+          },
+        ],
+      }),
+    ];
+
+    render(
+      <MockedProvider mocks={mocks}>
+        <JudgeProfile judgeId="judge-url-1" />
+      </MockedProvider>,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByText('Motion Type Breakdown')).toBeInTheDocument();
+    });
+
+    // Click the "Demurrer" row
+    const demurrerCells = screen.getAllByText('Demurrer');
+    const demurrerRow = demurrerCells[0].closest('tr');
+    await user.click(demurrerRow!);
+
+    // URL should be updated with motion param
+    await waitFor(() => {
+      expect(mockReplace).toHaveBeenCalledWith(
+        '/judges/test-id?motion=demurrer',
+      );
+    });
+  });
+
+  it('pre-selects filter when ?motion= param is present in URL on load', async () => {
+    mockSearchParams = new URLSearchParams('motion=demurrer');
+    const mocks: MockedResponse[] = [
+      buildAnalyticsMock('judge-url-2'),
+      buildRulingsMock('judge-url-2', {
+        motionType: 'demurrer',
+        edges: [
+          {
+            cursor: 'cf1',
+            node: {
+              id: 'rf1',
+              hearingDate: '2026-02-15',
+              motionType: 'demurrer',
+              outcome: 'denied',
+              case: {
+                id: 'case-2',
+                caseNumber: '24STCV67890',
+                caseTitle: 'Preselected Case',
+              },
+            },
+          },
+        ],
+      }),
+    ];
+
+    render(
+      <MockedProvider mocks={mocks}>
+        <JudgeProfile judgeId="judge-url-2" />
+      </MockedProvider>,
+    );
+
+    // The filter pill should appear immediately (pre-selected from URL)
+    await waitFor(() => {
+      expect(screen.getByTestId('motion-type-filter-pill')).toBeInTheDocument();
+    });
+    expect(screen.getByTestId('motion-type-filter-pill')).toHaveTextContent('Demurrer');
+  });
+
+  it('removes the motion param from URL when filter is cleared', async () => {
+    mockSearchParams = new URLSearchParams('motion=demurrer');
+    const user = userEvent.setup();
+    const mocks: MockedResponse[] = [
+      buildAnalyticsMock('judge-url-3'),
+      buildRulingsMock('judge-url-3', {
+        motionType: 'demurrer',
+        edges: [
+          {
+            cursor: 'cf1',
+            node: {
+              id: 'rf1',
+              hearingDate: '2026-02-15',
+              motionType: 'demurrer',
+              outcome: 'denied',
+              case: {
+                id: 'case-2',
+                caseNumber: '24STCV67890',
+                caseTitle: 'Clear Test Case',
+              },
+            },
+          },
+        ],
+      }),
+      // Mock for unfiltered query after clear
+      buildRulingsMock('judge-url-3'),
+    ];
+
+    render(
+      <MockedProvider mocks={mocks}>
+        <JudgeProfile judgeId="judge-url-3" />
+      </MockedProvider>,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByTestId('motion-type-filter-pill')).toBeInTheDocument();
+    });
+
+    // Click the clear button in the filter pill
+    const clearButton = screen.getByLabelText('Clear Demurrer filter');
+    await user.click(clearButton);
+
+    // URL should be updated to remove the motion param
+    await waitFor(() => {
+      expect(mockReplace).toHaveBeenCalledWith('/judges/test-id');
+    });
+  });
+
+  it('removes motion param from URL when toggling the same row off', async () => {
+    const user = userEvent.setup();
+    const mocks: MockedResponse[] = [
+      buildAnalyticsMock('judge-url-4'),
+      buildRulingsMock('judge-url-4'),
+      buildRulingsMock('judge-url-4', {
+        motionType: 'msj',
+        edges: [
+          {
+            cursor: 'cf1',
+            node: {
+              id: 'rf1',
+              hearingDate: '2026-03-01',
+              motionType: 'msj',
+              outcome: 'granted',
+              case: {
+                id: 'case-1',
+                caseNumber: '24STCV12345',
+                caseTitle: 'Toggle Test',
+              },
+            },
+          },
+        ],
+      }),
+      buildRulingsMock('judge-url-4'),
+    ];
+
+    render(
+      <MockedProvider mocks={mocks}>
+        <JudgeProfile judgeId="judge-url-4" />
+      </MockedProvider>,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByText('Motion Type Breakdown')).toBeInTheDocument();
+    });
+
+    const msjCells = screen.getAllByText('MSJ');
+    const msjRow = msjCells[0].closest('tr');
+
+    // Click to activate
+    await user.click(msjRow!);
+    await waitFor(() => {
+      expect(mockReplace).toHaveBeenCalledWith('/judges/test-id?motion=msj');
+    });
+
+    mockReplace.mockClear();
+
+    // Click again to deactivate
+    await user.click(msjRow!);
+    await waitFor(() => {
+      expect(mockReplace).toHaveBeenCalledWith('/judges/test-id');
+    });
   });
 });
