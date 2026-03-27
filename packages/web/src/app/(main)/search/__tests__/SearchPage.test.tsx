@@ -189,6 +189,9 @@ vi.mock('lucide-react', async (importOriginal) => {
     Gavel: ({ className }: { className?: string }) => (
       <span data-testid="gavel-icon" className={className} />
     ),
+    AlertCircle: ({ className }: { className?: string }) => (
+      <span data-testid="alert-circle-icon" className={className} />
+    ),
   };
 });
 
@@ -558,7 +561,65 @@ describe('SearchPage component — filter visibility', () => {
     // Error state should take priority over stale results
     expect(screen.queryByLabelText('Search filters')).not.toBeInTheDocument();
     expect(screen.queryByLabelText('Open filters')).not.toBeInTheDocument();
-    expect(screen.getByText('Failed to load search results. Please try again.')).toBeInTheDocument();
+    expect(screen.getByText('Failed to load search results.')).toBeInTheDocument();
+    expect(screen.getByText('Try again')).toBeInTheDocument();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// SearchPage component — error state styling (#1744)
+// ---------------------------------------------------------------------------
+
+describe('SearchPage component — error state styling', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('uses soft warm-toned error styling, not destructive red banner', () => {
+    mockSearchParamsValue = new URLSearchParams('q=test');
+    mockUseQuery.mockReturnValue({
+      data: undefined,
+      loading: false,
+      error: new Error('Network error'),
+      fetchMore: vi.fn(),
+    });
+
+    const { container } = render(<SearchPage />);
+
+    // Should NOT use destructive (alarming) styling
+    expect(container.querySelector('.border-destructive')).not.toBeInTheDocument();
+    expect(container.querySelector('.text-destructive')).not.toBeInTheDocument();
+
+    // Should use soft semantic styling (bg-muted, border)
+    expect(container.querySelector('.bg-muted')).toBeInTheDocument();
+  });
+
+  it('renders a warning icon in the error state', () => {
+    mockSearchParamsValue = new URLSearchParams('q=test');
+    mockUseQuery.mockReturnValue({
+      data: undefined,
+      loading: false,
+      error: new Error('Network error'),
+      fetchMore: vi.fn(),
+    });
+
+    render(<SearchPage />);
+    expect(screen.getByTestId('alert-circle-icon')).toBeInTheDocument();
+  });
+
+  it('renders a Try again action in the error state', () => {
+    mockSearchParamsValue = new URLSearchParams('q=test');
+    mockUseQuery.mockReturnValue({
+      data: undefined,
+      loading: false,
+      error: new Error('Network error'),
+      fetchMore: vi.fn(),
+    });
+
+    render(<SearchPage />);
+    const tryAgainButton = screen.getByText('Try again');
+    expect(tryAgainButton).toBeInTheDocument();
+    expect(tryAgainButton.tagName).toBe('BUTTON');
   });
 
   // Hover state tests (#1743)
