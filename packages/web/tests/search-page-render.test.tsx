@@ -166,9 +166,10 @@ describe('SearchPage (render)', () => {
     mockQueryResult.error = new Error('Network error');
     render(<SearchPage />);
     expect(
-      screen.getByText(
-        'Failed to load search results. Please try again.',
-      ),
+      screen.getByText('Failed to load search results.'),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText('Try again'),
     ).toBeInTheDocument();
   });
 

@@ -4,7 +4,7 @@ import { useState, useCallback, useEffect, useMemo } from 'react';
 import { useQuery, gql } from '@apollo/client';
 import { useRouter, useSearchParams } from 'next/navigation';
 import Link from 'next/link';
-import { Search, SlidersHorizontal, Calendar, Scale, Gavel } from 'lucide-react';
+import { Search, SlidersHorizontal, Calendar, Scale, Gavel, AlertCircle } from 'lucide-react';
 import { formatDate, MOTION_TYPE_LABELS, OUTCOME_LABELS } from '@/lib/display-helpers';
 import { PAGE_TITLE, SECTION_LABEL } from '@/lib/typography';
 import { sanitizeExcerptHtml } from '@/lib/sanitize-html';
@@ -622,13 +622,21 @@ export function SearchPage() {
         </div>
       )}
 
-      {/* Error state — full width, centered */}
+      {/* Error state — full width, centered, soft styling */}
       {hasSearched && error && (
-        <Card className="border-destructive">
-          <CardContent className="py-6 text-center">
-            <p className="text-sm text-destructive">
-              Failed to load search results. Please try again.
+        <Card className="border-stone-200 bg-stone-50">
+          <CardContent className="flex flex-col items-center justify-center py-8">
+            <AlertCircle className="mb-3 h-8 w-8 text-red-700/70" aria-hidden="true" />
+            <p className="text-sm text-red-700">
+              Failed to load search results.
             </p>
+            <button
+              type="button"
+              onClick={() => window.location.reload()}
+              className="mt-3 text-sm font-medium text-stone-600 underline underline-offset-2 hover:text-stone-900"
+            >
+              Try again
+            </button>
           </CardContent>
         </Card>
       )}
