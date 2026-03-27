@@ -1,0 +1,164 @@
+{
+  "_fixture": "cc_dept16_031126.pdf",
+  "_description": "Contra Costa Dept 16 — civil unlimited, 22 entries, 2026-03-11",
+  "judge_name": "Benjamin T Reyes II",
+  "department": "16",
+  "hearing_date": "2026-03-11",
+  "case_count": 22,
+  "cases": [
+    {
+      "case_number": "C24-02490",
+      "case_title": "Scott Dinsdale v. Cardigan, Inc.",
+      "case_type": "civil",
+      "motion_type": "case_management_conference",
+      "outcome": "continued"
+    },
+    {
+      "case_number": "C25-00687",
+      "case_title": "Mihaela Crossman v. Greg Wallace",
+      "case_type": "civil",
+      "motion_type": "case_management_conference",
+      "outcome": "off_calendar"
+    },
+    {
+      "case_number": "C25-00711",
+      "case_title": "Robert Murley v. Robert Richie",
+      "case_type": "civil",
+      "motion_type": "case_management_conference",
+      "outcome": "continued"
+    },
+    {
+      "case_number": "C23-00908",
+      "case_title": "Abdo Nasser v. Does 1 to 50",
+      "case_type": "civil",
+      "motion_type": "motion_for_leave_to_file_cross_complaint",
+      "outcome": "granted"
+    },
+    {
+      "case_number": "C23-01845",
+      "case_title": "Raul Iniguez v. Fidencio Garcia",
+      "case_type": "civil",
+      "motion_type": "msj",
+      "outcome": "continued"
+    },
+    {
+      "case_number": "C23-02327",
+      "case_title": "Torsten Brune v. Ace Robey",
+      "case_type": "civil",
+      "motion_type": "motion_to_be_relieved_as_counsel",
+      "outcome": "granted"
+    },
+    {
+      "case_number": "C23-02436",
+      "case_title": "Dennis Wanken v. Nahla Droubi",
+      "case_type": "civil",
+      "motion_type": "motion_to_continue_trial",
+      "outcome": "granted"
+    },
+    {
+      "case_number": "C23-02436",
+      "case_title": "Dennis Wanken v. Nahla Droubi",
+      "case_type": "civil",
+      "motion_type": "motion_for_leave_to_amend",
+      "outcome": "granted"
+    },
+    {
+      "case_number": "C23-02436",
+      "case_title": "Dennis Wanken v. Nahla Droubi",
+      "case_type": "civil",
+      "motion_type": "motion_for_leave_to_amend",
+      "outcome": "continued"
+    },
+    {
+      "case_number": "C23-02445",
+      "case_title": "Darshan Singh v. Rudolph Sandoval",
+      "case_type": "civil",
+      "motion_type": "motion_for_protective_order",
+      "outcome": "off_calendar"
+    },
+    {
+      "case_number": "C23-02906",
+      "case_title": "Katelyn Schaefer v. Bryan Dove",
+      "case_type": "civil",
+      "motion_type": "motion_to_set_aside",
+      "outcome": "denied"
+    },
+    {
+      "case_number": "C23-02906",
+      "case_title": "Katelyn Schaefer v. Bryan Dove",
+      "case_type": "civil",
+      "motion_type": "motion_for_sanctions",
+      "outcome": "denied"
+    },
+    {
+      "case_number": "C24-01952",
+      "case_title": "Mujeebullah Amini v. General Motors, LLC",
+      "case_type": "civil",
+      "motion_type": "motion_for_attorney_fees",
+      "outcome": "granted"
+    },
+    {
+      "case_number": "C24-02919",
+      "case_title": "Nicole Little v. John Muir Health",
+      "case_type": "civil",
+      "motion_type": "msj",
+      "outcome": "continued"
+    },
+    {
+      "case_number": "C25-00687",
+      "case_title": "Mihaela Crossman v. Greg Wallace",
+      "case_type": "civil",
+      "motion_type": "motion_to_set_aside",
+      "outcome": "off_calendar"
+    },
+    {
+      "case_number": "C25-00711",
+      "case_title": "Robert Murley v. Robert Richie",
+      "case_type": "civil",
+      "motion_type": "motion_to_be_relieved_as_counsel",
+      "outcome": "moot"
+    },
+    {
+      "case_number": "C25-03466",
+      "case_title": "Tuned Imports B.V. v. All West Coast Shipping, Inc.",
+      "case_type": "civil",
+      "motion_type": "motion_to_be_relieved_as_counsel",
+      "outcome": "granted"
+    },
+    {
+      "case_number": "MS5031",
+      "case_title": "Petition of: Paraquat Cases",
+      "case_type": "civil",
+      "motion_type": "demurrer",
+      "outcome": "granted"
+    },
+    {
+      "case_number": "C24-03380",
+      "case_title": "Gregory Smith v. FCA US LLC",
+      "case_type": "civil",
+      "motion_type": "motion_to_compel",
+      "outcome": "off_calendar"
+    },
+    {
+      "case_number": "C24-02490",
+      "case_title": "Scott Dinsdale v. Cardigan, Inc.",
+      "case_type": "civil",
+      "motion_type": "motion_to_compel",
+      "outcome": "granted"
+    },
+    {
+      "case_number": "C24-01512",
+      "case_title": "Tina Dunaway v. Mechanics Bank",
+      "case_type": "civil",
+      "motion_type": "motion_to_compel",
+      "outcome": "continued"
+    },
+    {
+      "case_number": "C24-01512",
+      "case_title": "Tina Dunaway v. Mechanics Bank",
+      "case_type": "civil",
+      "motion_type": "motion_to_compel",
+      "outcome": "continued"
+    }
+  ]
+}

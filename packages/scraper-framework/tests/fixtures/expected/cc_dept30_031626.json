@@ -1,0 +1,178 @@
+{
+  "_fixture": "cc_dept30_031626.pdf",
+  "_description": "Contra Costa Dept 30 — probate, 24 entries (including sub-entries), 2026-03-16",
+  "judge_name": "Virginia M George",
+  "department": "30",
+  "hearing_date": "2026-03-16",
+  "case_count": 24,
+  "cases": [
+    {
+      "case_number": "N25-2307",
+      "case_title": "In the Matter of: Ajay Bhalla",
+      "case_type": "probate",
+      "motion_type": "petition",
+      "outcome": "granted"
+    },
+    {
+      "case_number": "N25-2308",
+      "case_title": "In the Matter of: Ethan Romick",
+      "case_type": "probate",
+      "motion_type": "petition",
+      "outcome": "granted"
+    },
+    {
+      "case_number": "N25-2316",
+      "case_title": "In the Matter of: Sandra Rodriguez",
+      "case_type": "probate",
+      "motion_type": "petition",
+      "outcome": "granted"
+    },
+    {
+      "case_number": "N25-2317",
+      "case_title": "In the Matter of: Karen Da Costa Laranjeira",
+      "case_type": "probate",
+      "motion_type": "petition",
+      "outcome": "granted"
+    },
+    {
+      "case_number": "MSP19-01440",
+      "case_title": "Cons. of Marie Rost",
+      "case_type": "probate",
+      "motion_type": "status_hearing",
+      "outcome": "other"
+    },
+    {
+      "case_number": "P23-01484",
+      "case_title": "Conservatorship of: Li Sene Yin Sun",
+      "case_type": "probate",
+      "motion_type": "petition",
+      "outcome": "other"
+    },
+    {
+      "case_number": "P24-00230",
+      "case_title": "Conservatorship of: June Stone",
+      "case_type": "probate",
+      "motion_type": "petition",
+      "outcome": "other"
+    },
+    {
+      "case_number": "P25-01774",
+      "case_title": "Limited Conservatorship of: Aiden John-Franklin Tcheong",
+      "case_type": "probate",
+      "motion_type": "petition",
+      "outcome": "granted"
+    },
+    {
+      "case_number": "P26-00018",
+      "case_title": "Conservatorship of: Sharon Cola",
+      "case_type": "probate",
+      "motion_type": "petition",
+      "outcome": "off_calendar"
+    },
+    {
+      "case_number": "P26-00022",
+      "case_title": "Conservatorship of: Helen Hudson",
+      "case_type": "probate",
+      "motion_type": "petition",
+      "outcome": "other"
+    },
+    {
+      "case_number": "MSP07-00161",
+      "case_title": "Est of Barbara C Bissell",
+      "case_type": "probate",
+      "motion_type": "petition",
+      "outcome": "other"
+    },
+    {
+      "case_number": "P26-00126",
+      "case_title": "Estate of: Sanders, James Ray",
+      "case_type": "probate",
+      "motion_type": "petition",
+      "outcome": "other"
+    },
+    {
+      "case_number": "P26-00169",
+      "case_title": "Estate of: David Campbell",
+      "case_type": "probate",
+      "motion_type": "petition",
+      "outcome": "other"
+    },
+    {
+      "case_number": "P26-00176",
+      "case_title": "Estate of: Kern Toy",
+      "case_type": "probate",
+      "motion_type": "petition",
+      "outcome": "other"
+    },
+    {
+      "case_number": "P26-00185",
+      "case_title": "Estate of: Palogan, Gloria",
+      "case_type": "probate",
+      "motion_type": "petition",
+      "outcome": "other"
+    },
+    {
+      "case_number": "MSP95-01301",
+      "case_title": "G'ship of Minors: Behre-Collier",
+      "case_type": "probate",
+      "motion_type": "petition",
+      "outcome": "other"
+    },
+    {
+      "case_number": "P25-02140",
+      "case_title": "Guardianship of: Sulia Juan Asencio",
+      "case_type": "probate",
+      "motion_type": "petition",
+      "outcome": "other"
+    },
+    {
+      "case_number": "P25-02140",
+      "case_title": "Guardianship of: Sulia Juan Asencio",
+      "case_type": "probate",
+      "motion_type": "petition",
+      "outcome": "other"
+    },
+    {
+      "case_number": "P25-01462",
+      "case_title": "Guardianship of: Brayden Phillips",
+      "case_type": "probate",
+      "motion_type": "petition",
+      "outcome": "other"
+    },
+    {
+      "case_number": "P25-01686",
+      "case_title": "Guardianship of: Leilanni Cunningham",
+      "case_type": "probate",
+      "motion_type": "petition",
+      "outcome": "other"
+    },
+    {
+      "case_number": "A26-00006",
+      "case_title": null,
+      "case_type": "probate",
+      "motion_type": "other",
+      "outcome": "other"
+    },
+    {
+      "case_number": "P24-01489",
+      "case_title": "Conservatorship of: Victoria Johnson",
+      "case_type": "probate",
+      "motion_type": "petition",
+      "outcome": "other"
+    },
+    {
+      "case_number": "P24-01489",
+      "case_title": "Conservatorship of: Victoria Johnson",
+      "case_type": "probate",
+      "motion_type": "petition",
+      "outcome": "other"
+    },
+    {
+      "case_number": "MSP20-01542",
+      "case_title": "Conservatorship of Lester Clarke",
+      "case_type": "probate",
+      "motion_type": "petition",
+      "outcome": "other"
+    }
+  ]
+}
