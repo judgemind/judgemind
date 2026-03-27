@@ -1,0 +1,82 @@
+{
+  "_fixture": "sc_dept16_wed.pdf",
+  "_description": "Santa Clara Dept 16 (Judge Vincent I. Parrett). 36-page PDF with 11 rulings across two time blocks (9:01 and 9:00).",
+  "_captured": "2026-03-04",
+  "courthouse": "Downtown Superior Court",
+  "department": "16",
+  "judge_name": "Vincent I. Parrett",
+  "page_count": 36,
+  "case_count": 11,
+  "primary_case_number": "23CV419582",
+  "case_number_format": "{YY}{CV|PR}{NNNNNN}",
+  "hearing_date": "March 4, 2026",
+  "expected_cases": [
+    {
+      "case_number": "23CV419582",
+      "case_title": "Virginia Riegos-Rangel, et al. v. Terry Ray Freeman, et al.",
+      "motion_type": "Compromise of Minor's Claim",
+      "outcome": "granted"
+    },
+    {
+      "case_number": "23CV427273",
+      "case_title": "America Naranjo, et al. v. Abbott Laboratories, et al.",
+      "motion_type": "Pro Hac Vice Application",
+      "outcome": "granted"
+    },
+    {
+      "case_number": "24CV454894",
+      "case_title": "Alejandro Alcocer, Jr. v. Marla Alcocer, et al.",
+      "motion_type": "Motion to be Relieved as Counsel",
+      "outcome": "granted"
+    },
+    {
+      "case_number": "25CV463473",
+      "case_title": "Christina Tamburrino v. David Tran, et al.",
+      "motion_type": "Motion to be Relieved as Counsel",
+      "outcome": "granted"
+    },
+    {
+      "case_number": "24CV448974",
+      "case_title": "Wells Fargo Bank, N.A. v. Peggy Bagdriwicz",
+      "motion_type": "Summary Judgment",
+      "outcome": "granted"
+    },
+    {
+      "case_number": "24CV445397",
+      "case_title": "Terry Kwong, et al. v. Elaine Yang, et al.",
+      "motion_type": "Motion to Compel",
+      "outcome": "denied"
+    },
+    {
+      "case_number": "24CV447738",
+      "case_title": "Heriberto Jara Jurado, et al. v. Ford Motor Company, et al.",
+      "motion_type": "Motion to Compel",
+      "outcome": "granted_in_part"
+    },
+    {
+      "case_number": "25CV464528",
+      "case_title": "Sunita Vora v. Sunnyvale Gardens Post Acute, et al.",
+      "motion_type": "Motion to Compel",
+      "outcome": "granted_in_part"
+    },
+    {
+      "case_number": "24CV439631",
+      "case_title": "Miriam Ben Abdallah, M.D. v. Stephen W. Fackler, et al.",
+      "motion_type": "Motion to Compel",
+      "outcome": "granted_in_part"
+    },
+    {
+      "case_number": "23CV413738",
+      "case_title": "Emerging Growth Staffing, LLC v. DFO Global Performance Commerce Limited",
+      "motion_type": "Motion to Amend Judgment",
+      "outcome": "granted"
+    },
+    {
+      "case_number": "25CV456254",
+      "case_title": "Lynley Kerr Hogan v. Rob Moore, et al.",
+      "motion_type": "Motion for Attorneys' Fees and Costs",
+      "outcome": "granted_in_part"
+    }
+  ],
+  "_notes": "Dept 16 has two time blocks: 9:01 (lines 1-5, summary+short rulings) and 9:00 (lines 1-15, detailed rulings). Lines 3-4 at 9:00 share case 24CV447738 (two motions). Lines 6-7 at 9:00 share case 24CV439631 (motion to compel + motion for relief). 23CV419582 appears on two LINE entries (two different minors, same case). Lines 10-15 at 9:00 have no detailed rulings."
+}
