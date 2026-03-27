@@ -17,6 +17,9 @@ vi.mock('next/link', () => ({
 
 // Mock lucide-react icons
 vi.mock('lucide-react', () => ({
+  AlertCircle: ({ className }: { className?: string }) => (
+    <span data-testid="alert-circle-icon" className={className} />
+  ),
   BarChart3: ({ className }: { className?: string }) => (
     <span data-testid="bar-chart-icon" className={className} />
   ),
@@ -373,7 +376,7 @@ describe('JudgeProfile', () => {
     expect(screen.getByTestId('rulings-skeleton')).toBeInTheDocument();
   });
 
-  it('renders analytics error state', async () => {
+  it('renders analytics error state with soft styling', async () => {
     const mocks: MockedResponse[] = [
       {
         request: {
@@ -385,15 +388,29 @@ describe('JudgeProfile', () => {
       buildRulingsMock('judge-err', { edges: [] }),
     ];
 
-    render(
+    const { container } = render(
       <MockedProvider mocks={mocks}>
         <JudgeProfile judgeId="judge-err" />
       </MockedProvider>,
     );
 
     await waitFor(() => {
-      expect(screen.getByText('Failed to load analytics. Please try again.')).toBeInTheDocument();
+      expect(screen.getByText('Failed to load analytics.')).toBeInTheDocument();
     });
+
+    // Should NOT use destructive styling
+    expect(container.querySelector('.border-destructive')).not.toBeInTheDocument();
+    expect(container.querySelector('.text-destructive')).not.toBeInTheDocument();
+
+    // Should use soft styling
+    expect(container.querySelector('.bg-muted')).toBeInTheDocument();
+    expect(container.querySelector('.text-red-700')).toBeInTheDocument();
+
+    // Should have AlertCircle icon
+    expect(screen.getByTestId('alert-circle-icon')).toBeInTheDocument();
+
+    // Should have a Try again action
+    expect(screen.getByText('Try again')).toBeInTheDocument();
   });
 
   it('renders sentinel element when hasNextPage is true (infinite scroll)', async () => {

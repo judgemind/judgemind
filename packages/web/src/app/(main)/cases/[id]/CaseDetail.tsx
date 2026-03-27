@@ -2,7 +2,7 @@
 
 import { useState, useCallback, useRef } from 'react';
 import { useQuery, gql } from '@apollo/client';
-import { ChevronDown } from 'lucide-react';
+import { AlertCircle, ChevronDown } from 'lucide-react';
 import {
   buildDocumentContentUrl,
   buildDownloadUrl,
@@ -260,11 +260,19 @@ export function CaseDetail({ caseId }: { caseId: string }) {
 
   if (caseError) {
     return (
-      <Card className="border-destructive">
-        <CardContent className="py-6 text-center">
-          <p className="text-sm text-destructive">
-            Failed to load case details. Please try again.
+      <Card className="border bg-muted">
+        <CardContent className="flex flex-col items-center justify-center py-8">
+          <AlertCircle className="mb-3 h-8 w-8 text-red-700/70" aria-hidden="true" />
+          <p className="text-sm text-red-700">
+            Failed to load case details.
           </p>
+          <button
+            type="button"
+            onClick={() => window.location.reload()}
+            className="mt-3 text-sm font-medium text-muted-foreground underline underline-offset-2 hover:text-foreground"
+          >
+            Try again
+          </button>
         </CardContent>
       </Card>
     );
@@ -308,11 +316,19 @@ export function CaseDetail({ caseId }: { caseId: string }) {
       )}
 
       {rulingsError && (
-        <Card className="border-destructive">
-          <CardContent className="py-6 text-center">
-            <p className="text-sm text-destructive">
-              Failed to load rulings. Please try again.
+        <Card className="border bg-muted">
+          <CardContent className="flex flex-col items-center justify-center py-8">
+            <AlertCircle className="mb-3 h-8 w-8 text-red-700/70" aria-hidden="true" />
+            <p className="text-sm text-red-700">
+              Failed to load rulings.
             </p>
+            <button
+              type="button"
+              onClick={() => window.location.reload()}
+              className="mt-3 text-sm font-medium text-muted-foreground underline underline-offset-2 hover:text-foreground"
+            >
+              Try again
+            </button>
           </CardContent>
         </Card>
       )}
@@ -444,9 +460,21 @@ export function CaseDetail({ caseId }: { caseId: string }) {
 
                         {/* Error state */}
                         {viewerState.status === 'error' && (
-                          <p className="mt-3 text-sm text-destructive" data-testid={`viewer-error-${node.id}`}>
-                            {viewerState.message}
-                          </p>
+                          <div className="mt-3" data-testid={`viewer-error-${node.id}`}>
+                            <div className="flex items-center gap-2">
+                              <AlertCircle className="h-4 w-4 shrink-0 text-red-700/70" aria-hidden="true" />
+                              <p className="text-sm text-red-700">
+                                {viewerState.message}
+                              </p>
+                            </div>
+                            <button
+                              type="button"
+                              onClick={() => handleViewOriginal(node.id, node.documentId!)}
+                              className="mt-2 text-sm font-medium text-muted-foreground underline underline-offset-2 hover:text-foreground"
+                            >
+                              Try again
+                            </button>
+                          </div>
                         )}
                       </div>
                     );

@@ -58,6 +58,15 @@ vi.mock('next/link', () => ({
   ),
 }));
 
+vi.mock('lucide-react', () => ({
+  AlertCircle: ({ className }: { className?: string }) => (
+    <span data-testid="alert-circle-icon" className={className} />
+  ),
+  ChevronDown: ({ className }: { className?: string }) => (
+    <span data-testid="chevron-down-icon" className={className} aria-hidden="true" />
+  ),
+}));
+
 vi.mock('@apollo/client', async () => {
   const actual = await vi.importActual<typeof import('@apollo/client')>(
     '@apollo/client',
@@ -159,12 +168,24 @@ describe('CaseDetail (render)', () => {
     expect(skeletons.length).toBeGreaterThan(0);
   });
 
-  it('shows error message when case query fails', () => {
+  it('shows error message when case query fails with soft styling', () => {
     mockCaseQueryResult.error = new Error('Network error');
-    render(<CaseDetail caseId="case-1" />);
+    const { container } = render(<CaseDetail caseId="case-1" />);
     expect(
-      screen.getByText('Failed to load case details. Please try again.'),
+      screen.getByText('Failed to load case details.'),
     ).toBeInTheDocument();
+
+    // Should NOT use destructive styling
+    expect(container.querySelector('.border-destructive')).not.toBeInTheDocument();
+    expect(container.querySelector('.text-destructive')).not.toBeInTheDocument();
+
+    // Should use soft styling
+    expect(container.querySelector('.bg-muted')).toBeInTheDocument();
+    expect(container.querySelector('.text-red-700')).toBeInTheDocument();
+
+    // Should have AlertCircle icon and Try again action
+    expect(screen.getByTestId('alert-circle-icon')).toBeInTheDocument();
+    expect(screen.getByText('Try again')).toBeInTheDocument();
   });
 
   it('shows not-found message when case is null', () => {
@@ -346,13 +367,25 @@ describe('CaseDetail (render)', () => {
     ).toBeInTheDocument();
   });
 
-  it('shows rulings error', () => {
+  it('shows rulings error with soft styling', () => {
     mockCaseQueryResult.data = makeCaseData();
     mockRulingsQueryResult.error = new Error('Rulings query failed');
-    render(<CaseDetail caseId="case-1" />);
+    const { container } = render(<CaseDetail caseId="case-1" />);
     expect(
-      screen.getByText('Failed to load rulings. Please try again.'),
+      screen.getByText('Failed to load rulings.'),
     ).toBeInTheDocument();
+
+    // Should NOT use destructive styling
+    expect(container.querySelector('.border-destructive')).not.toBeInTheDocument();
+    expect(container.querySelector('.text-destructive')).not.toBeInTheDocument();
+
+    // Should use soft styling
+    expect(container.querySelector('.bg-muted')).toBeInTheDocument();
+    expect(container.querySelector('.text-red-700')).toBeInTheDocument();
+
+    // Should have AlertCircle icon and Try again action
+    expect(screen.getByTestId('alert-circle-icon')).toBeInTheDocument();
+    expect(screen.getByText('Try again')).toBeInTheDocument();
   });
 
   it('renders infinite scroll sentinel when hasNextPage is true', () => {

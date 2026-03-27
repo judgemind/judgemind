@@ -3,7 +3,7 @@
 import { useCallback, useRef, useState } from 'react';
 import { useQuery, gql } from '@apollo/client';
 import Link from 'next/link';
-import { BarChart3, Scale, X } from 'lucide-react';
+import { AlertCircle, BarChart3, Scale, X } from 'lucide-react';
 import {
   formatDate,
   formatLabel,
@@ -280,11 +280,19 @@ export function JudgeProfile({ judgeId }: { judgeId: string }) {
 
     if (analyticsError) {
       return (
-        <Card className="border-destructive">
-          <CardContent className="py-6 text-center">
-            <p className="text-sm text-destructive">
-              Failed to load analytics. Please try again.
+        <Card className="border bg-muted">
+          <CardContent className="flex flex-col items-center justify-center py-8">
+            <AlertCircle className="mb-3 h-8 w-8 text-red-700/70" aria-hidden="true" />
+            <p className="text-sm text-red-700">
+              Failed to load analytics.
             </p>
+            <button
+              type="button"
+              onClick={() => window.location.reload()}
+              className="mt-3 text-sm font-medium text-muted-foreground underline underline-offset-2 hover:text-foreground"
+            >
+              Try again
+            </button>
           </CardContent>
         </Card>
       );
@@ -421,11 +429,19 @@ export function JudgeProfile({ judgeId }: { judgeId: string }) {
 
     if (rulingsError) {
       return (
-        <Card className="border-destructive">
-          <CardContent className="py-6 text-center">
-            <p className="text-sm text-destructive">
-              Failed to load rulings. Please try again.
+        <Card className="border bg-muted">
+          <CardContent className="flex flex-col items-center justify-center py-8">
+            <AlertCircle className="mb-3 h-8 w-8 text-red-700/70" aria-hidden="true" />
+            <p className="text-sm text-red-700">
+              Failed to load rulings.
             </p>
+            <button
+              type="button"
+              onClick={() => window.location.reload()}
+              className="mt-3 text-sm font-medium text-muted-foreground underline underline-offset-2 hover:text-foreground"
+            >
+              Try again
+            </button>
           </CardContent>
         </Card>
       );
