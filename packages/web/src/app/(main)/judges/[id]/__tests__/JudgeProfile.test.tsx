@@ -1330,4 +1330,358 @@ describe('JudgeProfile', () => {
       expect(mockReplace).toHaveBeenCalledWith('/judges/test-id');
     });
   });
+
+  // -------------------------------------------------------------------------
+  // Statistical confidence indicator tests (#1754)
+  // -------------------------------------------------------------------------
+
+  it('shows "Based on N rulings" annotation on overall grant rate card', async () => {
+    const mocks = [
+      buildAnalyticsMock('judge-conf-1'),
+      buildRulingsMock('judge-conf-1'),
+    ];
+
+    render(
+      <MockedProvider mocks={mocks}>
+        <JudgeProfile judgeId="judge-conf-1" />
+      </MockedProvider>,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByTestId('overall-sample-size')).toBeInTheDocument();
+    });
+
+    expect(screen.getByTestId('overall-sample-size')).toHaveTextContent('Based on 100 rulings');
+  });
+
+  it('shows "Limited data" indicator when total rulings < 10', async () => {
+    const mocks = [
+      buildAnalyticsMock('judge-conf-2', {
+        totalRulings: 5,
+        rulingsByOutcome: [
+          { outcome: 'granted', count: 3 },
+          { outcome: 'denied', count: 2 },
+        ],
+        rulingsByMotionType: [
+          {
+            motionType: 'msj',
+            total: 5,
+            granted: 3,
+            denied: 2,
+            grantedInPart: 0,
+            other: 0,
+            grantRate: 0.6,
+          },
+        ],
+      }),
+      buildRulingsMock('judge-conf-2'),
+    ];
+
+    render(
+      <MockedProvider mocks={mocks}>
+        <JudgeProfile judgeId="judge-conf-2" />
+      </MockedProvider>,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByTestId('low-confidence-indicator')).toBeInTheDocument();
+    });
+
+    expect(screen.getByTestId('overall-sample-size')).toHaveTextContent('Based on 5 rulings');
+    expect(screen.getByTestId('low-confidence-indicator')).toHaveTextContent('Limited data');
+  });
+
+  it('does not show "Limited data" indicator when total rulings >= 10', async () => {
+    const mocks = [
+      buildAnalyticsMock('judge-conf-3'),
+      buildRulingsMock('judge-conf-3'),
+    ];
+
+    render(
+      <MockedProvider mocks={mocks}>
+        <JudgeProfile judgeId="judge-conf-3" />
+      </MockedProvider>,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByTestId('overall-sample-size')).toBeInTheDocument();
+    });
+
+    expect(screen.queryByTestId('low-confidence-indicator')).not.toBeInTheDocument();
+  });
+
+  it('applies muted styling to overall grant rate when total rulings < 10', async () => {
+    const mocks = [
+      buildAnalyticsMock('judge-conf-4', {
+        totalRulings: 3,
+        rulingsByOutcome: [
+          { outcome: 'granted', count: 3 },
+        ],
+        rulingsByMotionType: [
+          {
+            motionType: 'msj',
+            total: 3,
+            granted: 3,
+            denied: 0,
+            grantedInPart: 0,
+            other: 0,
+            grantRate: 1.0,
+          },
+        ],
+      }),
+      buildRulingsMock('judge-conf-4'),
+    ];
+
+    render(
+      <MockedProvider mocks={mocks}>
+        <JudgeProfile judgeId="judge-conf-4" />
+      </MockedProvider>,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByTestId('overall-grant-rate')).toBeInTheDocument();
+    });
+
+    // Low sample should have muted text
+    expect(screen.getByTestId('overall-grant-rate').className).toContain('text-muted-foreground');
+  });
+
+  it('applies normal styling to overall grant rate when total rulings >= 10', async () => {
+    const mocks = [
+      buildAnalyticsMock('judge-conf-5'),
+      buildRulingsMock('judge-conf-5'),
+    ];
+
+    render(
+      <MockedProvider mocks={mocks}>
+        <JudgeProfile judgeId="judge-conf-5" />
+      </MockedProvider>,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByTestId('overall-grant-rate')).toBeInTheDocument();
+    });
+
+    // High sample should have foreground text
+    expect(screen.getByTestId('overall-grant-rate').className).toContain('text-foreground');
+    expect(screen.getByTestId('overall-grant-rate').className).not.toContain('text-muted-foreground');
+  });
+
+  it('shows "(limited data)" on motion type rows with < 10 rulings', async () => {
+    const mocks = [
+      buildAnalyticsMock('judge-conf-6', {
+        rulingsByMotionType: [
+          {
+            motionType: 'msj',
+            total: 42,
+            granted: 18,
+            denied: 21,
+            grantedInPart: 3,
+            other: 0,
+            grantRate: 0.4286,
+          },
+          {
+            motionType: 'demurrer',
+            total: 5,
+            granted: 3,
+            denied: 2,
+            grantedInPart: 0,
+            other: 0,
+            grantRate: 0.6,
+          },
+        ],
+      }),
+      buildRulingsMock('judge-conf-6'),
+    ];
+
+    render(
+      <MockedProvider mocks={mocks}>
+        <JudgeProfile judgeId="judge-conf-6" />
+      </MockedProvider>,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByText('Motion Type Breakdown')).toBeInTheDocument();
+    });
+
+    // Demurrer has only 5 rulings — should show "(limited data)"
+    expect(screen.getByTestId('limited-data-demurrer')).toBeInTheDocument();
+    expect(screen.getByTestId('limited-data-demurrer')).toHaveTextContent('(limited data)');
+
+    // MSJ has 42 rulings — should NOT show "(limited data)"
+    expect(screen.queryByTestId('limited-data-msj')).not.toBeInTheDocument();
+  });
+
+  it('applies muted styling to grant rate cell for low-sample motion types', async () => {
+    const mocks = [
+      buildAnalyticsMock('judge-conf-7', {
+        rulingsByMotionType: [
+          {
+            motionType: 'msj',
+            total: 42,
+            granted: 18,
+            denied: 21,
+            grantedInPart: 3,
+            other: 0,
+            grantRate: 0.4286,
+          },
+          {
+            motionType: 'demurrer',
+            total: 3,
+            granted: 2,
+            denied: 1,
+            grantedInPart: 0,
+            other: 0,
+            grantRate: 0.6667,
+          },
+        ],
+      }),
+      buildRulingsMock('judge-conf-7'),
+    ];
+
+    render(
+      <MockedProvider mocks={mocks}>
+        <JudgeProfile judgeId="judge-conf-7" />
+      </MockedProvider>,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByTestId('grant-rate-demurrer')).toBeInTheDocument();
+    });
+
+    // Demurrer (3 rulings) should have muted text and no bold
+    const demurrerCell = screen.getByTestId('grant-rate-demurrer');
+    expect(demurrerCell.className).toContain('text-muted-foreground');
+    expect(demurrerCell.className).not.toContain('font-medium');
+
+    // MSJ (42 rulings) should have bold text, not muted
+    const msjCell = screen.getByTestId('grant-rate-msj');
+    expect(msjCell.className).toContain('font-medium');
+    expect(msjCell.className).not.toContain('text-muted-foreground');
+  });
+
+  it('marks low-sample rows with data-low-sample attribute', async () => {
+    const mocks = [
+      buildAnalyticsMock('judge-conf-8', {
+        rulingsByMotionType: [
+          {
+            motionType: 'msj',
+            total: 50,
+            granted: 25,
+            denied: 20,
+            grantedInPart: 5,
+            other: 0,
+            grantRate: 0.5,
+          },
+          {
+            motionType: 'demurrer',
+            total: 7,
+            granted: 4,
+            denied: 3,
+            grantedInPart: 0,
+            other: 0,
+            grantRate: 0.5714,
+          },
+        ],
+      }),
+      buildRulingsMock('judge-conf-8'),
+    ];
+
+    render(
+      <MockedProvider mocks={mocks}>
+        <JudgeProfile judgeId="judge-conf-8" />
+      </MockedProvider>,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByText('Motion Type Breakdown')).toBeInTheDocument();
+    });
+
+    // Find demurrer row (low sample) — should have data-low-sample
+    const demurrerCells = screen.getAllByText('Demurrer');
+    const demurrerRow = demurrerCells[0].closest('tr');
+    expect(demurrerRow).toHaveAttribute('data-low-sample', 'true');
+
+    // MSJ row (high sample) — should NOT have data-low-sample
+    const msjCells = screen.getAllByText('MSJ');
+    const msjRow = msjCells[0].closest('tr');
+    expect(msjRow).not.toHaveAttribute('data-low-sample');
+  });
+
+  it('shows singular "ruling" for exactly 1 ruling', async () => {
+    const mocks = [
+      buildAnalyticsMock('judge-conf-9', {
+        totalRulings: 1,
+        rulingsByOutcome: [
+          { outcome: 'granted', count: 1 },
+        ],
+        rulingsByMotionType: [
+          {
+            motionType: 'msj',
+            total: 1,
+            granted: 1,
+            denied: 0,
+            grantedInPart: 0,
+            other: 0,
+            grantRate: 1.0,
+          },
+        ],
+      }),
+      buildRulingsMock('judge-conf-9'),
+    ];
+
+    render(
+      <MockedProvider mocks={mocks}>
+        <JudgeProfile judgeId="judge-conf-9" />
+      </MockedProvider>,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByTestId('overall-sample-size')).toBeInTheDocument();
+    });
+
+    expect(screen.getByTestId('overall-sample-size')).toHaveTextContent('Based on 1 ruling');
+    // Should not say "rulings" (plural)
+    expect(screen.getByTestId('overall-sample-size').textContent).not.toContain('rulings');
+  });
+
+  it('treats exactly 10 rulings as high confidence (boundary)', async () => {
+    const mocks = [
+      buildAnalyticsMock('judge-conf-10', {
+        totalRulings: 10,
+        rulingsByOutcome: [
+          { outcome: 'granted', count: 5 },
+          { outcome: 'denied', count: 5 },
+        ],
+        rulingsByMotionType: [
+          {
+            motionType: 'msj',
+            total: 10,
+            granted: 5,
+            denied: 5,
+            grantedInPart: 0,
+            other: 0,
+            grantRate: 0.5,
+          },
+        ],
+      }),
+      buildRulingsMock('judge-conf-10'),
+    ];
+
+    render(
+      <MockedProvider mocks={mocks}>
+        <JudgeProfile judgeId="judge-conf-10" />
+      </MockedProvider>,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByTestId('overall-grant-rate')).toBeInTheDocument();
+    });
+
+    // 10 rulings is the threshold — should be high confidence
+    expect(screen.getByTestId('overall-grant-rate').className).toContain('text-foreground');
+    expect(screen.queryByTestId('low-confidence-indicator')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('limited-data-msj')).not.toBeInTheDocument();
+  });
 });
+
