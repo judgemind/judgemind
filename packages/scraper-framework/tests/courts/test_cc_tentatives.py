@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 import httpx
 import pytest
@@ -19,6 +20,7 @@ import respx
 from courts.ca.cc_tentatives import (
     BASE_URL,
     INDEX_URL,
+    CCSplitRuling,
     CCTentativeRulingsScraper,
     _cc_courthouse,
     _cc_extract_links,
@@ -27,6 +29,8 @@ from courts.ca.cc_tentatives import (
     _cc_hearing_date_from_filename,
     _cc_hearing_date_from_pdf,
     _cc_judge_from_pdf,
+    _cc_llm_enabled,
+    _cc_llm_extract_rulings,
 )
 from courts.ca.cc_tentatives import default_config as cc_default_config
 from courts.ca.pdf_link_scraper import _extract_pdf_text
@@ -682,3 +686,430 @@ def test_cc_default_config() -> None:
     assert config.state == "CA"
     assert config.county == "Contra Costa"
     assert len(config.schedule_windows) == 2
+
+
+# ---------------------------------------------------------------------------
+# LLM extraction feature flag (#2053)
+# ---------------------------------------------------------------------------
+
+
+def test_cc_llm_enabled_default_false() -> None:
+    """LLM extraction should be disabled by default."""
+    with patch.dict("os.environ", {}, clear=False):
+        # Remove the env var if it exists
+        import os
+
+        os.environ.pop("ENABLE_CC_LLM_EXTRACTION", None)
+        assert _cc_llm_enabled() is False
+
+
+def test_cc_llm_enabled_true() -> None:
+    """LLM extraction enabled when env var is set."""
+    with patch.dict("os.environ", {"ENABLE_CC_LLM_EXTRACTION": "1"}):
+        assert _cc_llm_enabled() is True
+
+    with patch.dict("os.environ", {"ENABLE_CC_LLM_EXTRACTION": "true"}):
+        assert _cc_llm_enabled() is True
+
+    with patch.dict("os.environ", {"ENABLE_CC_LLM_EXTRACTION": "yes"}):
+        assert _cc_llm_enabled() is True
+
+
+def test_cc_llm_enabled_false_for_invalid() -> None:
+    """LLM extraction disabled for non-truthy values."""
+    with patch.dict("os.environ", {"ENABLE_CC_LLM_EXTRACTION": "0"}):
+        assert _cc_llm_enabled() is False
+
+    with patch.dict("os.environ", {"ENABLE_CC_LLM_EXTRACTION": "no"}):
+        assert _cc_llm_enabled() is False
+
+
+# ---------------------------------------------------------------------------
+# _cc_llm_extract_rulings — unit tests with mocked LLM (#2053)
+# ---------------------------------------------------------------------------
+
+# Sample LLM responses for testing
+_CIVIL_LLM_RESPONSE = (
+    '{"extracted_judge_name": "Kirk Athanasiou",'
+    '"hearing_date": "2026-03-10",'
+    '"department": "14",'
+    '"rulings": ['
+    '{"line_number": 1,'
+    '"extracted_case_number": "L23-06679",'
+    '"extracted_case_title": "Discover Bank v. Gerald Gilchrist",'
+    '"case_type": "civil",'
+    '"outcome": "other",'
+    '"motion_type": "motion_to_be_relieved_as_counsel",'
+    '"ruling_text": "The motion is taken off calendar.",'
+    '"extracted_parties": ['
+    '{"name": "Discover Bank", "role": "plaintiff", "confidence": "high"},'
+    '{"name": "Gerald Gilchrist", "role": "defendant", "confidence": "high"}'
+    "]},"
+    '{"line_number": 2,'
+    '"extracted_case_number": "L24-02704",'
+    '"extracted_case_title": "LVNV Funding LLC v. Nicole Munoz",'
+    '"case_type": "civil",'
+    '"outcome": "granted",'
+    '"motion_type": "motion_to_vacate",'
+    '"ruling_text": "The motion is granted.",'
+    '"extracted_parties": ['
+    '{"name": "LVNV Funding LLC", "role": "plaintiff", "confidence": "high"},'
+    '{"name": "Nicole Munoz", "role": "defendant", "confidence": "high"}'
+    "]}"
+    "]}"
+)
+
+_PROBATE_LLM_RESPONSE = (
+    '{"extracted_judge_name": "Virginia M. George",'
+    '"hearing_date": "2026-03-16",'
+    '"department": "30",'
+    '"rulings": ['
+    '{"line_number": 1,'
+    '"extracted_case_number": "N25-2307",'
+    '"extracted_case_title": "In the Matter of: Ajay Bhalla",'
+    '"case_type": "probate",'
+    '"outcome": "granted",'
+    '"motion_type": "petition",'
+    '"ruling_text": "Petition Approved. Proposed Order Submitted.",'
+    '"extracted_parties": ['
+    '{"name": "Ajay Bhalla", "role": "subject", "confidence": "high"}'
+    "]}"
+    "]}"
+)
+
+
+@patch("ingestion.llm_providers.call_llm")
+def test_cc_llm_extract_rulings_civil(mock_call_llm: MagicMock) -> None:
+    """Happy path: civil format returns list of CCSplitRuling."""
+    mock_response = MagicMock()
+    mock_response.text = _CIVIL_LLM_RESPONSE
+    mock_response.input_tokens = 1000
+    mock_response.output_tokens = 500
+    mock_call_llm.return_value = mock_response
+
+    result = _cc_llm_extract_rulings("Some PDF text content")
+    assert result is not None
+    assert len(result) == 2
+
+    # First ruling
+    assert result[0].case_number == "L23-06679"
+    assert result[0].case_title == "Discover Bank v. Gerald Gilchrist"
+    assert result[0].outcome == "other"
+    assert result[0].motion_type == "motion_to_be_relieved_as_counsel"
+    assert result[0].ruling_text == "The motion is taken off calendar."
+    assert len(result[0].parties) == 2
+    assert result[0].parties[0]["name"] == "Discover Bank"
+    assert result[0].parties[0]["role"] == "plaintiff"
+
+    # Second ruling
+    assert result[1].case_number == "L24-02704"
+    assert result[1].outcome == "granted"
+
+
+@patch("ingestion.llm_providers.call_llm")
+def test_cc_llm_extract_rulings_probate(mock_call_llm: MagicMock) -> None:
+    """Happy path: probate format returns list of CCSplitRuling."""
+    mock_response = MagicMock()
+    mock_response.text = _PROBATE_LLM_RESPONSE
+    mock_response.input_tokens = 800
+    mock_response.output_tokens = 300
+    mock_call_llm.return_value = mock_response
+
+    result = _cc_llm_extract_rulings("Some probate PDF text")
+    assert result is not None
+    assert len(result) == 1
+    assert result[0].case_number == "N25-2307"
+    assert result[0].case_title == "In the Matter of: Ajay Bhalla"
+    assert result[0].case_type == "probate"
+    assert result[0].outcome == "granted"
+    assert len(result[0].parties) == 1
+    assert result[0].parties[0]["role"] == "subject"
+
+
+@patch("ingestion.llm_providers.call_llm")
+def test_cc_llm_extract_rulings_null_response(mock_call_llm: MagicMock) -> None:
+    """LLM returns None -> function returns None."""
+    mock_call_llm.return_value = None
+
+    result = _cc_llm_extract_rulings("Some PDF text")
+    assert result is None
+
+
+@patch("ingestion.llm_providers.call_llm")
+def test_cc_llm_extract_rulings_json_parse_error(mock_call_llm: MagicMock) -> None:
+    """Invalid JSON in LLM response -> returns None."""
+    mock_response = MagicMock()
+    mock_response.text = "This is not valid JSON {{"
+    mock_call_llm.return_value = mock_response
+
+    result = _cc_llm_extract_rulings("Some PDF text")
+    assert result is None
+
+
+@patch("ingestion.llm_providers.call_llm")
+def test_cc_llm_extract_rulings_bare_list(mock_call_llm: MagicMock) -> None:
+    """Bare list response (not wrapped in {"rulings":[...]})."""
+    bare_list = (
+        '[{"line_number": 1,'
+        '"extracted_case_number": "C24-02490",'
+        '"extracted_case_title": "Smith v. Jones",'
+        '"case_type": "civil",'
+        '"outcome": "granted",'
+        '"motion_type": "msj",'
+        '"ruling_text": "Motion granted.",'
+        '"extracted_parties": []}]'
+    )
+    mock_response = MagicMock()
+    mock_response.text = bare_list
+    mock_response.input_tokens = 500
+    mock_response.output_tokens = 200
+    mock_call_llm.return_value = mock_response
+
+    result = _cc_llm_extract_rulings("Some PDF text")
+    assert result is not None
+    assert len(result) == 1
+    assert result[0].case_number == "C24-02490"
+
+
+@patch("ingestion.llm_providers.call_llm")
+def test_cc_llm_extract_rulings_code_fences(mock_call_llm: MagicMock) -> None:
+    """LLM response wrapped in markdown code fences is handled."""
+    fenced = (
+        '```json\n{"rulings": [{"line_number": 1,'
+        ' "extracted_case_number": "L25-01552",'
+        ' "ruling_text": "Granted.",'
+        ' "extracted_parties": []}]}\n```'
+    )
+    mock_response = MagicMock()
+    mock_response.text = fenced
+    mock_response.input_tokens = 500
+    mock_response.output_tokens = 200
+    mock_call_llm.return_value = mock_response
+
+    result = _cc_llm_extract_rulings("Some PDF text")
+    assert result is not None
+    assert len(result) == 1
+    assert result[0].case_number == "L25-01552"
+
+
+@patch("ingestion.llm_providers.call_llm")
+def test_cc_llm_extract_rulings_empty_text(mock_call_llm: MagicMock) -> None:
+    """Empty input text -> returns None without calling LLM."""
+    result = _cc_llm_extract_rulings("")
+    assert result is None
+    mock_call_llm.assert_not_called()
+
+    result = _cc_llm_extract_rulings("   ")
+    assert result is None
+    mock_call_llm.assert_not_called()
+
+
+@patch("ingestion.llm_providers.call_llm")
+def test_cc_llm_extract_rulings_outcome_mapping(mock_call_llm: MagicMock) -> None:
+    """Outcome values are mapped through _CC_OUTCOME_MAP."""
+    response_json = (
+        '{"rulings": ['
+        '{"line_number": 1, "extracted_case_number": "C24-00001",'
+        '"outcome": "granted_in_part", "ruling_text": "Partially granted.",'
+        '"extracted_parties": []},'
+        '{"line_number": 2, "extracted_case_number": "C24-00002",'
+        '"outcome": "off_calendar", "ruling_text": "Off calendar.",'
+        '"extracted_parties": []},'
+        '{"line_number": 3, "extracted_case_number": "C24-00003",'
+        '"outcome": "unknown_value", "ruling_text": "Unknown.",'
+        '"extracted_parties": []}'
+        "]}"
+    )
+    mock_response = MagicMock()
+    mock_response.text = response_json
+    mock_response.input_tokens = 500
+    mock_response.output_tokens = 300
+    mock_call_llm.return_value = mock_response
+
+    result = _cc_llm_extract_rulings("Some text")
+    assert result is not None
+    assert result[0].outcome == "granted_in_part"
+    assert result[1].outcome == "off_calendar"
+    # Unknown values not in the map -> None
+    assert result[2].outcome is None
+
+
+@patch("ingestion.llm_providers.call_llm")
+def test_cc_llm_extract_rulings_invalid_party_skipped(
+    mock_call_llm: MagicMock,
+) -> None:
+    """Parties with invalid names (too long, newlines) are skipped."""
+    long_name = "A" * 201
+    response_json = (
+        '{"rulings": [{"line_number": 1, "extracted_case_number": "C24-00001",'
+        '"ruling_text": "Granted.", "extracted_parties": ['
+        '{"name": "' + long_name + '", "role": "plaintiff"},'
+        '{"name": "Valid Name", "role": "defendant"}'
+        "]}]}"
+    )
+    mock_response = MagicMock()
+    mock_response.text = response_json
+    mock_response.input_tokens = 500
+    mock_response.output_tokens = 200
+    mock_call_llm.return_value = mock_response
+
+    result = _cc_llm_extract_rulings("Some text")
+    assert result is not None
+    assert len(result[0].parties) == 1
+    assert result[0].parties[0]["name"] == "Valid Name"
+
+
+# ---------------------------------------------------------------------------
+# Integration: fetch_documents with LLM enabled (#2053)
+# ---------------------------------------------------------------------------
+
+
+@respx.mock
+@patch("courts.ca.cc_tentatives._cc_llm_extract_rulings")
+@patch("courts.ca.cc_tentatives._cc_llm_enabled", return_value=True)
+def test_cc_fetch_with_llm_enabled(
+    mock_llm_enabled: MagicMock,
+    mock_extract: MagicMock,
+) -> None:
+    """When LLM is enabled, fetch_documents produces split docs with all fields."""
+    config = cc_default_config()
+    scraper = CCTentativeRulingsScraper(config)
+
+    # Mock index page with one department
+    index_html = (
+        "<html><body>"
+        '<a class="tentative-ruling" '
+        'href="TR\\Department 14 - Judge Athanasiou\\14_031026.pdf">Mar 10</a>'
+        "</body></html>"
+    )
+    respx.get(INDEX_URL).mock(return_value=httpx.Response(200, text=index_html))
+
+    # Mock PDF download
+    pdf_bytes = _load_bytes("cc_dept14_031026.pdf")
+    respx.route(method="GET", url__regex=r".*\.pdf$").mock(
+        return_value=httpx.Response(200, content=pdf_bytes)
+    )
+
+    # Mock LLM extraction — return 2 split rulings
+    mock_extract.return_value = [
+        CCSplitRuling(
+            ruling_index=1,
+            case_number="L23-06679",
+            ruling_text="The motion is taken off calendar.",
+            case_title="Discover Bank v. Gerald Gilchrist",
+            case_type="civil",
+            motion_type="motion_to_be_relieved_as_counsel",
+            outcome="other",
+            parties=[
+                {"name": "Discover Bank", "role": "plaintiff"},
+                {"name": "Gerald Gilchrist", "role": "defendant"},
+            ],
+        ),
+        CCSplitRuling(
+            ruling_index=2,
+            case_number="L24-02704",
+            ruling_text="The motion is granted.",
+            case_title="LVNV Funding LLC v. Nicole Munoz",
+            case_type="civil",
+            motion_type="motion_to_vacate",
+            outcome="granted",
+            parties=[],
+        ),
+    ]
+
+    docs = scraper.fetch_documents()
+
+    # Should have 2 docs (one per ruling, not one per PDF)
+    assert len(docs) == 2
+
+    # All docs should have LLM extraction markers
+    for doc in docs:
+        assert doc.extra.get("_llm_extracted") is True
+        assert doc.extra.get("pre_split") is True
+        assert doc.department == "14"
+        assert doc.courthouse == "Richmond Courthouse"
+
+    # Check first doc fields
+    assert docs[0].case_number == "L23-06679"
+    assert docs[0].case_title == "Discover Bank v. Gerald Gilchrist"
+    assert docs[0].ruling_text == "The motion is taken off calendar."
+    assert docs[0].motion_type == "motion_to_be_relieved_as_counsel"
+    assert docs[0].outcome == "other"
+    assert len(docs[0].parties) == 2
+    assert docs[0].extra["ruling_index"] == 1
+    assert docs[0].extra["case_type"] == "civil"
+
+    # Check second doc
+    assert docs[1].case_number == "L24-02704"
+    assert docs[1].outcome == "granted"
+    assert docs[1].extra["ruling_index"] == 2
+
+    # Judge name should be refined from PDF header (not URL path)
+    for doc in docs:
+        assert doc.judge_name is not None
+        assert "Athanasiou" in doc.judge_name
+
+
+@respx.mock
+@patch("courts.ca.cc_tentatives._cc_llm_extract_rulings")
+@patch("courts.ca.cc_tentatives._cc_llm_enabled", return_value=True)
+def test_cc_fetch_llm_fallback_on_failure(
+    mock_llm_enabled: MagicMock,
+    mock_extract: MagicMock,
+) -> None:
+    """When LLM extraction fails, falls back to single-doc regex path."""
+    config = cc_default_config()
+    scraper = CCTentativeRulingsScraper(config)
+
+    index_html = (
+        "<html><body>"
+        '<a class="tentative-ruling" '
+        'href="TR\\Department 16 - Judge Reyes\\16_031126.pdf">Mar 11</a>'
+        "</body></html>"
+    )
+    respx.get(INDEX_URL).mock(return_value=httpx.Response(200, text=index_html))
+
+    pdf_bytes = _load_bytes("cc_dept16_031126.pdf")
+    respx.route(method="GET", url__regex=r".*\.pdf$").mock(
+        return_value=httpx.Response(200, content=pdf_bytes)
+    )
+
+    # LLM extraction returns None (failure)
+    mock_extract.return_value = None
+
+    docs = scraper.fetch_documents()
+
+    # Should fall back to single doc per PDF
+    assert len(docs) == 1
+    assert docs[0].department == "16"
+    # Should NOT have LLM extraction markers
+    assert docs[0].extra.get("_llm_extracted") is not True
+    assert docs[0].extra.get("pre_split") is not True
+
+
+@respx.mock
+@patch("courts.ca.cc_tentatives._cc_llm_enabled", return_value=False)
+def test_cc_fetch_llm_disabled_uses_regex(mock_llm_enabled: MagicMock) -> None:
+    """When LLM is disabled, fetch_documents uses the single-doc regex path."""
+    config = cc_default_config()
+    scraper = CCTentativeRulingsScraper(config)
+
+    index_html = (
+        "<html><body>"
+        '<a class="tentative-ruling" '
+        'href="TR\\Department 14 - Judge Athanasiou\\14_031026.pdf">Mar 10</a>'
+        "</body></html>"
+    )
+    respx.get(INDEX_URL).mock(return_value=httpx.Response(200, text=index_html))
+
+    pdf_bytes = _load_bytes("cc_dept14_031026.pdf")
+    respx.route(method="GET", url__regex=r".*\.pdf$").mock(
+        return_value=httpx.Response(200, content=pdf_bytes)
+    )
+
+    docs = scraper.fetch_documents()
+
+    # Should produce a single doc (not split by LLM)
+    assert len(docs) == 1
+    assert docs[0].department == "14"
+    assert docs[0].extra.get("_llm_extracted") is not True
