@@ -1564,7 +1564,7 @@ class IngestionWorker:
                 "_split_index": idx,
                 "_split_count": len(extracted_rulings),
                 # Fields from LLM extraction:
-                "ruling_text": ruling.ruling_text or ruling_text,
+                "ruling_text": ruling.ruling_text or (ruling_text if not is_multi else None),
                 "case_number": ruling.extracted_case_number or event_data.get("case_number"),
                 "case_title": ruling.extracted_case_title or event_data.get("case_title"),
                 "judge_name": ruling.extracted_judge_name or event_data.get("judge_name"),
