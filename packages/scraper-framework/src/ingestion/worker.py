@@ -68,6 +68,7 @@ from .extract import (
     extract_motion_type,
     extract_outcome,
     extract_parties_from_caption,
+    is_plausible_case_title,
     is_valid_case_number,
     normalize_motion_type,
     normalize_outcome,
@@ -880,8 +881,9 @@ class IngestionWorker:
 
         # Fallback case_title extraction (regex)
         if not case_title and ruling_text:
-            case_title = extract_case_title(ruling_text)
-            if case_title:
+            candidate_title = extract_case_title(ruling_text)
+            if candidate_title and is_plausible_case_title(candidate_title):
+                case_title = candidate_title
                 method = "regex_post_llm" if is_llm_extracted else "regex"
                 extraction_methods.setdefault("case_title", method)
 
