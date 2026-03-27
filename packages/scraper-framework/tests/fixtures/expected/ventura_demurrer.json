@@ -1,0 +1,24 @@
+{
+  "_fixture": "ventura_ruling_html_demurrer.html",
+  "_description": "Ventura Dept 20 — Demurrer to Complaint. Single-case HTML ruling. Demurrer sustained in part, overruled in part.",
+  "_captured": "2026-03-11",
+  "_format": "html",
+  "department": "20",
+  "case_count": 1,
+  "case_number": "2025CUBC040123",
+  "motion_type": "Demurrer to Complaint",
+  "hearing_date": "March 11, 2026",
+  "expected_cases": [
+    {
+      "case_number": "2025CUBC040123",
+      "case_title": "Martinez Construction, Inc. v. Greenfield Properties, LLC",
+      "outcome": "granted_in_part",
+      "parties": [
+        {"name": "Martinez Construction, Inc.", "role": "plaintiff"},
+        {"name": "Greenfield Properties, LLC", "role": "defendant"}
+      ],
+      "ruling_text_contains": ["SUSTAINED WITH LEAVE TO AMEND", "OVERRULED", "breach of contract", "common count"]
+    }
+  ],
+  "_notes": "Demurrer sustained as to 1st COA with leave to amend, overruled as to 2nd COA. Outcome maps to granted_in_part since the motion succeeded on one count and failed on another."
+}

@@ -1,0 +1,25 @@
+{
+  "_fixture": "ventura_ruling_html_demurrer_fac.html",
+  "_description": "Ventura Dept 20 — Demurrer to First Amended Complaint, overruled. Single-case HTML ruling. CCPA class action.",
+  "_captured": "2026-03-11",
+  "_format": "html",
+  "department": "20",
+  "case_count": 1,
+  "case_number": "2024CUBC039678",
+  "motion_type": "Demurrer to First Amended Complaint",
+  "hearing_date": "March 11, 2026",
+  "expected_cases": [
+    {
+      "case_number": "2024CUBC039678",
+      "case_title": "O'Connor v. Ventura County Credit Union",
+      "outcome": "denied",
+      "parties": [
+        {"name": "Sean O'Connor", "role": "plaintiff"},
+        {"name": "Karen O'Connor", "role": "plaintiff"},
+        {"name": "Ventura County Credit Union", "role": "defendant"}
+      ],
+      "ruling_text_contains": ["OVERRULED", "CCPA", "unauthorized access", "data breach"]
+    }
+  ],
+  "_notes": "Demurrer overruled (maps to 'denied' in outcome taxonomy). Multiple plaintiffs (class action). Apostrophe in party name (O'Connor)."
+}
