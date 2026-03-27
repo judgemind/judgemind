@@ -15,6 +15,26 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from screenshot import fetch_credentials, perform_login, validate_url
 
 
+def _make_mock_playwright() -> tuple[MagicMock, MagicMock, MagicMock]:
+    """Create mock playwright modules and return (mock_sync_playwright, mock_page, mock_browser).
+
+    Injects mock modules into sys.modules so ``from playwright.sync_api import
+    sync_playwright`` succeeds even when playwright is not installed (e.g. in CI).
+    """
+    mock_page = MagicMock()
+    mock_browser = MagicMock()
+    mock_browser.new_page.return_value = mock_page
+
+    mock_pw_instance = MagicMock()
+    mock_pw_instance.chromium.launch.return_value = mock_browser
+
+    mock_sync_pw_fn = MagicMock()
+    mock_sync_pw_fn.return_value.__enter__ = MagicMock(return_value=mock_pw_instance)
+    mock_sync_pw_fn.return_value.__exit__ = MagicMock(return_value=False)
+
+    return mock_sync_pw_fn, mock_page, mock_browser
+
+
 class TestValidateUrl:
     """Tests for the existing validate_url function."""
 
@@ -118,20 +138,25 @@ class TestPerformLogin:
 
 
 class TestMainAuthIntegration:
-    """Tests for the --auth flag in the main function."""
+    """Tests for the --auth flag in the main function.
+
+    These tests inject mock playwright modules via ``sys.modules`` so the lazy
+    ``from playwright.sync_api import sync_playwright`` inside ``main()`` works
+    even when playwright is not installed (as in the CI scripts-tests job).
+    """
 
     def test_auth_flag_triggers_login(self) -> None:
         """Verify that --auth triggers credential fetch and login."""
         from screenshot import main
 
         test_args = ["screenshot.py", "--auth", "/admin/data-quality"]
+        mock_sync_pw_fn, mock_page, _mock_browser = _make_mock_playwright()
 
-        mock_page = MagicMock()
-        mock_browser = MagicMock()
-        mock_browser.new_page.return_value = mock_page
-
-        mock_pw_instance = MagicMock()
-        mock_pw_instance.chromium.launch.return_value = mock_browser
+        # Build the mock module tree that ``from playwright.sync_api import
+        # sync_playwright`` will resolve to.
+        mock_sync_api = MagicMock()
+        mock_sync_api.sync_playwright = mock_sync_pw_fn
+        mock_pw_pkg = MagicMock()
 
         with (
             patch("sys.argv", test_args),
@@ -139,17 +164,15 @@ class TestMainAuthIntegration:
                 "screenshot.fetch_credentials",
                 return_value=("a@b.com", "pw"),
             ) as mock_fetch,
-            patch(
-                "screenshot.perform_login",
-            ) as mock_login,
-            patch(
-                "playwright.sync_api.sync_playwright",
-            ) as mock_sync_pw,
+            patch("screenshot.perform_login") as mock_login,
+            patch.dict(
+                "sys.modules",
+                {
+                    "playwright": mock_pw_pkg,
+                    "playwright.sync_api": mock_sync_api,
+                },
+            ),
         ):
-            mock_sync_pw.return_value.__enter__ = MagicMock(
-                return_value=mock_pw_instance
-            )
-            mock_sync_pw.return_value.__exit__ = MagicMock(return_value=False)
             main()
 
         mock_fetch.assert_called_once()
@@ -160,30 +183,24 @@ class TestMainAuthIntegration:
         from screenshot import main
 
         test_args = ["screenshot.py", "/rulings"]
+        mock_sync_pw_fn, mock_page, _mock_browser = _make_mock_playwright()
 
-        mock_page = MagicMock()
-        mock_browser = MagicMock()
-        mock_browser.new_page.return_value = mock_page
-
-        mock_pw_instance = MagicMock()
-        mock_pw_instance.chromium.launch.return_value = mock_browser
+        mock_sync_api = MagicMock()
+        mock_sync_api.sync_playwright = mock_sync_pw_fn
+        mock_pw_pkg = MagicMock()
 
         with (
             patch("sys.argv", test_args),
-            patch(
-                "screenshot.fetch_credentials",
-            ) as mock_fetch,
-            patch(
-                "screenshot.perform_login",
-            ) as mock_login,
-            patch(
-                "playwright.sync_api.sync_playwright",
-            ) as mock_sync_pw,
+            patch("screenshot.fetch_credentials") as mock_fetch,
+            patch("screenshot.perform_login") as mock_login,
+            patch.dict(
+                "sys.modules",
+                {
+                    "playwright": mock_pw_pkg,
+                    "playwright.sync_api": mock_sync_api,
+                },
+            ),
         ):
-            mock_sync_pw.return_value.__enter__ = MagicMock(
-                return_value=mock_pw_instance
-            )
-            mock_sync_pw.return_value.__exit__ = MagicMock(return_value=False)
             main()
 
         mock_fetch.assert_not_called()
@@ -198,13 +215,11 @@ class TestMainAuthIntegration:
         from screenshot import main
 
         test_args = ["screenshot.py", "--auth", "/admin/data-quality"]
+        mock_sync_pw_fn, mock_page, _mock_browser = _make_mock_playwright()
 
-        mock_page = MagicMock()
-        mock_browser = MagicMock()
-        mock_browser.new_page.return_value = mock_page
-
-        mock_pw_instance = MagicMock()
-        mock_pw_instance.chromium.launch.return_value = mock_browser
+        mock_sync_api = MagicMock()
+        mock_sync_api.sync_playwright = mock_sync_pw_fn
+        mock_pw_pkg = MagicMock()
 
         with (
             patch("sys.argv", test_args),
@@ -213,14 +228,14 @@ class TestMainAuthIntegration:
                 return_value=("a@b.com", "pw"),
             ),
             patch("screenshot.perform_login"),
-            patch(
-                "playwright.sync_api.sync_playwright",
-            ) as mock_sync_pw,
+            patch.dict(
+                "sys.modules",
+                {
+                    "playwright": mock_pw_pkg,
+                    "playwright.sync_api": mock_sync_api,
+                },
+            ),
         ):
-            mock_sync_pw.return_value.__enter__ = MagicMock(
-                return_value=mock_pw_instance
-            )
-            mock_sync_pw.return_value.__exit__ = MagicMock(return_value=False)
             main()
 
         # The target URL navigation happens after login
