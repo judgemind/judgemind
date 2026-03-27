@@ -12,15 +12,8 @@ export default function SearchRoute() {
             <Skeleton className="mt-2 h-4 w-72" />
           </div>
           <Skeleton className="h-10 w-full" />
-          <div className="flex gap-6">
-            <div className="hidden w-64 shrink-0 lg:block">
-              <Skeleton className="h-96 w-full rounded-lg" />
-            </div>
-            <div className="flex-1 space-y-3">
-              {Array.from({ length: 5 }).map((_, i) => (
-                <Skeleton key={i} className="h-32 w-full rounded-lg" />
-              ))}
-            </div>
+          <div>
+            <Skeleton className="mx-auto h-48 w-full max-w-md rounded-lg" />
           </div>
         </div>
       }

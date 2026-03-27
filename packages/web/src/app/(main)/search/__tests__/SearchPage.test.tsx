@@ -447,3 +447,117 @@ describe('SearchPage component — infinite scroll', () => {
     expect(screen.getByText(/42 results found/)).toBeInTheDocument();
   });
 });
+
+// ---------------------------------------------------------------------------
+// SearchPage component — filter visibility (#1739)
+// ---------------------------------------------------------------------------
+
+describe('SearchPage component — filter visibility', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('hides filter sidebar when no search has been performed (empty state)', () => {
+    mockSearchParamsValue = new URLSearchParams('');
+    mockUseQuery.mockReturnValue({
+      data: undefined,
+      loading: false,
+      error: undefined,
+      fetchMore: vi.fn(),
+    });
+
+    render(<SearchPage />);
+    // Filter sidebar should not be present
+    expect(screen.queryByLabelText('Search filters')).not.toBeInTheDocument();
+    // But the empty state message should be visible and centered
+    expect(screen.getByText('Enter a search term to begin')).toBeInTheDocument();
+  });
+
+  it('hides filter sidebar when search returns no results', () => {
+    mockSearchParamsValue = new URLSearchParams('q=nonexistent');
+    mockUseQuery.mockReturnValue({
+      data: {
+        searchRulings: {
+          edges: [],
+          pageInfo: { hasNextPage: false, endCursor: null },
+          totalHits: 0,
+        },
+      },
+      loading: false,
+      error: undefined,
+      fetchMore: vi.fn(),
+    });
+
+    render(<SearchPage />);
+    expect(screen.queryByLabelText('Search filters')).not.toBeInTheDocument();
+    expect(screen.getByText('No results for your search')).toBeInTheDocument();
+  });
+
+  it('hides mobile filter button when no results are present', () => {
+    mockSearchParamsValue = new URLSearchParams('');
+    mockUseQuery.mockReturnValue({
+      data: undefined,
+      loading: false,
+      error: undefined,
+      fetchMore: vi.fn(),
+    });
+
+    render(<SearchPage />);
+    expect(screen.queryByLabelText('Open filters')).not.toBeInTheDocument();
+  });
+
+  it('shows filter sidebar when search results are present', () => {
+    mockSearchParamsValue = new URLSearchParams('q=test');
+    mockUseQuery.mockReturnValue({
+      data: MOCK_SEARCH_DATA,
+      loading: false,
+      error: undefined,
+      fetchMore: vi.fn(),
+    });
+
+    render(<SearchPage />);
+    expect(screen.getByLabelText('Search filters')).toBeInTheDocument();
+  });
+
+  it('shows mobile filter button when search results are present', () => {
+    mockSearchParamsValue = new URLSearchParams('q=test');
+    mockUseQuery.mockReturnValue({
+      data: MOCK_SEARCH_DATA,
+      loading: false,
+      error: undefined,
+      fetchMore: vi.fn(),
+    });
+
+    render(<SearchPage />);
+    expect(screen.getByLabelText('Open filters')).toBeInTheDocument();
+  });
+
+  it('hides filter sidebar on error state', () => {
+    mockSearchParamsValue = new URLSearchParams('q=test');
+    mockUseQuery.mockReturnValue({
+      data: undefined,
+      loading: false,
+      error: new Error('Network error'),
+      fetchMore: vi.fn(),
+    });
+
+    render(<SearchPage />);
+    expect(screen.queryByLabelText('Search filters')).not.toBeInTheDocument();
+  });
+
+  it('hides filter sidebar when error occurs with stale data (fetchMore failure)', () => {
+    mockSearchParamsValue = new URLSearchParams('q=test');
+    mockUseQuery.mockReturnValue({
+      data: MOCK_SEARCH_DATA,
+      loading: false,
+      error: new Error('fetchMore failed'),
+      fetchMore: vi.fn(),
+    });
+
+    render(<SearchPage />);
+    // Error state should take priority over stale results
+    expect(screen.queryByLabelText('Search filters')).not.toBeInTheDocument();
+    expect(screen.queryByLabelText('Open filters')).not.toBeInTheDocument();
+    expect(screen.getByText('Failed to load search results. Please try again.')).toBeInTheDocument();
+  });
+});
