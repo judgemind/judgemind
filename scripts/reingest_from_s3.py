@@ -911,7 +911,16 @@ def _full_reparse_document(
     # see #1948/#1959).  Falls back to regex-based split on LLM failure.
     llm_split_fn = _LLM_SPLIT_REGISTRY.get(scraper_id)
     if llm_split_fn is not None:
-        split_results = llm_split_fn(text)
+        try:
+            split_results = llm_split_fn(text)
+        except Exception:
+            logger.warning(
+                "LLM split raised exception, falling back to regex",
+                document_id=doc_meta["document_id"],
+                scraper_id=scraper_id,
+                exc_info=True,
+            )
+            split_results = None
         if split_results is None:
             logger.warning(
                 "LLM split failed, falling back to regex split",
@@ -1313,6 +1322,7 @@ def reingest_batch(
     llm_timeout: float | None = 60.0,
     force_llm: bool = False,
     full_reparse: bool = False,
+    processed_s3_keys: set[tuple[str, str]] | None = None,
     running_processed: int = 0,
     running_updated: int = 0,
     batch_number: int = 0,
@@ -1388,13 +1398,26 @@ def reingest_batch(
     # --- Prefetch S3 content in parallel -----------------------------------
     # Parallel S3 fetch — submit all rows with valid s3_key + s3_bucket,
     # then collect results keyed by row index.
+    # In full_reparse mode, deduplicate by (s3_key, s3_bucket) to avoid
+    # fetching the same PDF multiple times when multiple document rows
+    # share an S3 object (e.g. Riverside calendar PDFs).  See #1984.
     s3_results: dict[int, bytes] = {}
+    # Map (s3_key, s3_bucket) -> row index of the *first* row that uses
+    # this S3 object.  Only populated in full_reparse mode.
+    s3_pair_to_first_idx: dict[tuple[str, str], int] = {}
     with ThreadPoolExecutor(max_workers=concurrency) as pool:
         futures = {}
         for idx, row in enumerate(rows):
             s3_key = row[3]
             s3_bucket = row[4]
             if s3_key and s3_bucket:
+                if full_reparse:
+                    s3_pair = (s3_key, s3_bucket)
+                    if s3_pair in s3_pair_to_first_idx:
+                        # Another row already triggered a fetch for this
+                        # object; mark this row to reuse that result later.
+                        continue
+                    s3_pair_to_first_idx[s3_pair] = idx
                 future = pool.submit(_fetch_s3_content, s3_client, s3_bucket, s3_key)
                 futures[future] = idx
 
@@ -1402,13 +1425,28 @@ def reingest_batch(
             idx = futures[future]
             doc_id_str = str(rows[idx][0])
             try:
-                s3_results[idx] = future.result()
+                content = future.result()
+                s3_results[idx] = content
             except Exception:
                 logger.warning(
                     "Failed to fetch S3 content, skipping",
                     document_id=doc_id_str,
                     exc_info=True,
                 )
+
+    # In full_reparse mode, propagate fetched S3 content to rows that
+    # share the same S3 object.
+    if full_reparse:
+        for idx, row in enumerate(rows):
+            if idx in s3_results:
+                continue
+            s3_key = row[3]
+            s3_bucket = row[4]
+            if s3_key and s3_bucket:
+                s3_pair = (s3_key, s3_bucket)
+                first_idx = s3_pair_to_first_idx.get(s3_pair)
+                if first_idx is not None and first_idx in s3_results:
+                    s3_results[idx] = s3_results[first_idx]
 
     # --- Build doc_meta for rows with fetched content -----------------------
     parseable: list[tuple[int, dict, bytes]] = []  # (idx, doc_meta, raw_content)
@@ -1450,6 +1488,23 @@ def reingest_batch(
             )
             skipped += 1
             continue
+
+        # Guard: in full-reparse mode, skip documents whose S3 object has
+        # already been processed.  Multi-case calendar PDFs (e.g. Riverside)
+        # have one S3 object shared across N document rows — one per case.
+        # Without this guard, the same PDF would be split N times, producing
+        # N * R ruling records instead of R (a Cartesian product).  See #1984.
+        if full_reparse and processed_s3_keys is not None and s3_key and s3_bucket:
+            s3_pair = (s3_key, s3_bucket)
+            if s3_pair in processed_s3_keys:
+                logger.info(
+                    "Skipping duplicate S3 key in full-reparse mode",
+                    document_id=doc_id_str,
+                    s3_key=s3_key,
+                )
+                skipped += 1
+                continue
+            processed_s3_keys.add(s3_pair)
 
         if not s3_key or not s3_bucket:
             logger.warning(
@@ -1995,6 +2050,13 @@ def run_reingest(
             before_metrics = _run_quality_queries(metrics_conn, county)
             logger.info("quality_metrics_before", **before_metrics)
 
+    # Track processed S3 keys across batches to avoid Cartesian products
+    # in full-reparse mode.  Multi-case calendar PDFs (e.g. Riverside)
+    # share one S3 object across many document rows.  Without cross-batch
+    # dedup, the same PDF could be split multiple times if the document
+    # rows span batch boundaries.  See #1984.
+    s3_dedup: set[tuple[str, str]] | None = set() if full_reparse else None
+
     with psycopg.connect(dsn) as conn:
         while True:
             effective_batch = batch_size
@@ -2029,6 +2091,7 @@ def run_reingest(
                 llm_timeout=llm_timeout,
                 force_llm=force_llm,
                 full_reparse=full_reparse,
+                processed_s3_keys=s3_dedup,
                 running_processed=total_processed,
                 running_updated=total_updated,
                 batch_number=total_batches,
