@@ -12,6 +12,7 @@ import pytest
 from framework.extraction_config import (
     RIVERSIDE_SYSTEM_PROMPT,
     SAN_BERNARDINO_SYSTEM_PROMPT,
+    SAN_FRANCISCO_SYSTEM_PROMPT,
     CountyExtractionConfig,
     ExtractionMethod,
     get_county_extraction_config,
@@ -131,6 +132,22 @@ class TestGetCountyExtractionConfig:
         assert get_county_extraction_config("CA", "san bernardino") is not None
         assert get_county_extraction_config("CA", "SAN BERNARDINO") is not None
         assert get_county_extraction_config("CA", "San Bernardino") is not None
+
+    def test_san_francisco_registered(self) -> None:
+        """San Francisco County has a registered config (#2051)."""
+        config = get_county_extraction_config("CA", "San Francisco")
+        assert config is not None
+        assert config.method == ExtractionMethod.LLM
+        assert config.provider == "google"
+        assert config.model == "gemini-2.5-flash-lite"
+        assert config.max_output_tokens == 32768
+        assert config.system_prompt is not None
+
+    def test_case_insensitive_san_francisco(self) -> None:
+        """San Francisco lookup is case-insensitive."""
+        assert get_county_extraction_config("CA", "san francisco") is not None
+        assert get_county_extraction_config("CA", "SAN FRANCISCO") is not None
+        assert get_county_extraction_config("CA", "San Francisco") is not None
 
     def test_unknown_county_returns_none(self) -> None:
         """Unknown county returns None."""
@@ -266,3 +283,76 @@ class TestSanBernardinoSystemPrompt:
         """Prompt explains that multiple motions under one case number are one ruling."""
         assert "multiple motions" in SAN_BERNARDINO_SYSTEM_PROMPT.lower()
         assert "ONE ruling" in SAN_BERNARDINO_SYSTEM_PROMPT
+
+
+# ---------------------------------------------------------------------------
+# SAN_FRANCISCO_SYSTEM_PROMPT content validation (#2051)
+# ---------------------------------------------------------------------------
+
+
+class TestSanFranciscoSystemPrompt:
+    """Verify the San Francisco system prompt has required content."""
+
+    def test_mentions_san_francisco(self) -> None:
+        assert "san francisco" in SAN_FRANCISCO_SYSTEM_PROMPT.lower()
+
+    def test_mentions_family_court(self) -> None:
+        """Prompt identifies this as Family Court / Family Law."""
+        assert "family" in SAN_FRANCISCO_SYSTEM_PROMPT.lower()
+
+    def test_mentions_cover_pages(self) -> None:
+        """Prompt instructs skipping cover pages."""
+        assert "cover page" in SAN_FRANCISCO_SYSTEM_PROMPT.lower()
+
+    def test_mentions_petitioner_respondent(self) -> None:
+        """Prompt uses petitioner/respondent (not plaintiff/defendant for parties)."""
+        assert "petitioner" in SAN_FRANCISCO_SYSTEM_PROMPT.lower()
+        assert "respondent" in SAN_FRANCISCO_SYSTEM_PROMPT.lower()
+
+    def test_mentions_case_number_format(self) -> None:
+        """Prompt describes SF Family Law case number patterns."""
+        assert "FPT" in SAN_FRANCISCO_SYSTEM_PROMPT
+        assert "FMS" in SAN_FRANCISCO_SYSTEM_PROMPT
+        assert "FDI" in SAN_FRANCISCO_SYSTEM_PROMPT
+
+    def test_mentions_outcome_taxonomy(self) -> None:
+        """Prompt includes outcome taxonomy values."""
+        assert "granted" in SAN_FRANCISCO_SYSTEM_PROMPT.lower()
+        assert "denied" in SAN_FRANCISCO_SYSTEM_PROMPT.lower()
+        assert "continued" in SAN_FRANCISCO_SYSTEM_PROMPT.lower()
+        assert "off_calendar" in SAN_FRANCISCO_SYSTEM_PROMPT.lower()
+
+    def test_mentions_json_output(self) -> None:
+        """Prompt specifies JSON output format."""
+        assert "json" in SAN_FRANCISCO_SYSTEM_PROMPT.lower()
+        assert "rulings" in SAN_FRANCISCO_SYSTEM_PROMPT.lower()
+
+    def test_mentions_parties(self) -> None:
+        """Prompt instructs party extraction with correct roles."""
+        # SF uses petitioner/respondent in the extracted_parties format
+        prompt_lower = SAN_FRANCISCO_SYSTEM_PROMPT.lower()
+        assert '"role": "petitioner"' in prompt_lower
+        assert '"role": "respondent"' in prompt_lower
+
+    def test_mentions_ruling_text_completeness(self) -> None:
+        """Prompt instructs capturing complete ruling text."""
+        prompt_lower = SAN_FRANCISCO_SYSTEM_PROMPT.lower()
+        assert "procedural history" in prompt_lower
+        assert "findings and order" in prompt_lower
+        assert "truncat" in prompt_lower
+
+    def test_mentions_judge_extraction(self) -> None:
+        """Prompt instructs extracting judge from Presiding line."""
+        assert "Presiding" in SAN_FRANCISCO_SYSTEM_PROMPT
+
+    def test_mentions_motion_type_extraction(self) -> None:
+        """Prompt instructs extracting motion type from caption area."""
+        assert "motion_type" in SAN_FRANCISCO_SYSTEM_PROMPT.lower()
+
+    def test_mentions_multi_case_pdfs(self) -> None:
+        """Prompt describes multi-case PDF structure."""
+        assert "multi-case" in SAN_FRANCISCO_SYSTEM_PROMPT.lower()
+
+    def test_mentions_domestic_violence_prefix(self) -> None:
+        """Prompt includes FDV (domestic violence) case number prefix."""
+        assert "FDV" in SAN_FRANCISCO_SYSTEM_PROMPT
