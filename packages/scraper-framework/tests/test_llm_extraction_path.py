@@ -175,6 +175,139 @@ class TestLlmExtractionPath:
         assert mock_conn.commit.call_count == 2
 
     @patch("ingestion.worker.batch_upsert_parties")
+    @patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
+    @patch("ingestion.worker.psycopg")
+    def test_multi_ruling_empty_text_does_not_get_calendar_fallback(
+        self,
+        mock_psycopg: MagicMock,
+        mock_resolve_judge: MagicMock,
+        mock_batch_upsert: MagicMock,
+    ) -> None:
+        """Multi-ruling split: empty LLM ruling_text gets None, not the full calendar (#2057).
+
+        When the LLM correctly identifies multiple cases from a department calendar
+        PDF but fails to extract ruling_text for some, the fallback must NOT
+        substitute the entire pdfplumber text (the full calendar). Instead, the
+        ruling_text should be None for cases where the LLM returned no text.
+        """
+        worker, _ = _make_worker()
+
+        mock_conn, mock_cur = _make_mock_conn()
+        mock_psycopg.connect.return_value = mock_conn
+        # Each ruling needs: upsert_court, upsert_case, insert_document
+        mock_cur.fetchone.side_effect = [
+            ("court-uuid-1",),
+            ("case-uuid-1",),
+            (True,),
+            ("court-uuid-1",),
+            ("case-uuid-2",),
+            (True,),
+        ]
+
+        full_calendar_text = (
+            "TENTATIVE RULINGS DEPT C28 Judge Thomas S. McConville "
+            "February 23, 2026 at 2:00 p.m. Case 2024-00001 Alpha v. Beta "
+            "Motion GRANTED. Case 2024-00002 Gamma v. Delta The court rules..."
+        )
+
+        mock_extractor = MagicMock()
+        mock_extractor.extract.return_value = [
+            ExtractedRuling(
+                extracted_case_number="2024-00001",
+                extracted_case_title="Alpha v. Beta",
+                ruling_text="Motion GRANTED.",
+                outcome=ExtractionOutcome.GRANTED,
+            ),
+            ExtractedRuling(
+                extracted_case_number="2024-00002",
+                extracted_case_title="Gamma v. Delta",
+                # LLM failed to extract text for this case — empty/None ruling_text
+                ruling_text=None,
+                outcome=ExtractionOutcome.DENIED,
+            ),
+        ]
+        worker._framework_extractor = mock_extractor
+
+        # Track the ruling_text values passed to each recursive process_event call.
+        captured_ruling_texts: list[str | None] = []
+        original_process_event = worker.process_event
+
+        def spy_process_event(event_data: dict) -> None:
+            if event_data.get("_split_processed"):
+                captured_ruling_texts.append(event_data.get("ruling_text"))
+            original_process_event(event_data)
+
+        worker.process_event = spy_process_event  # type: ignore[assignment]
+
+        event = _make_event(ruling_text=full_calendar_text)
+        worker.process_event(event)
+
+        # The first ruling had LLM-extracted text — should use it.
+        assert captured_ruling_texts[0] == "Motion GRANTED."
+        # The second ruling had no LLM text — should be None, NOT the full calendar.
+        assert captured_ruling_texts[1] is None
+        # Specifically: must NOT contain the full calendar text.
+        for text in captured_ruling_texts:
+            if text is not None:
+                assert text != full_calendar_text
+
+    @patch("ingestion.worker.batch_upsert_parties")
+    @patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
+    @patch("ingestion.worker.psycopg")
+    def test_single_ruling_empty_text_gets_fallback(
+        self,
+        mock_psycopg: MagicMock,
+        mock_resolve_judge: MagicMock,
+        mock_batch_upsert: MagicMock,
+    ) -> None:
+        """Single-ruling document: empty LLM ruling_text falls back to pdfplumber text.
+
+        For single-ruling documents (not multi-case calendars), the pdfplumber
+        text fallback is correct — there is only one case so the full text
+        belongs to that case.
+        """
+        worker, _ = _make_worker()
+
+        mock_conn, mock_cur = _make_mock_conn()
+        mock_psycopg.connect.return_value = mock_conn
+        mock_cur.fetchone.side_effect = [
+            ("court-uuid-1",),
+            ("case-uuid-1",),
+            (True,),
+        ]
+
+        pdfplumber_text = "The motion for summary judgment is GRANTED."
+
+        mock_extractor = MagicMock()
+        mock_extractor.extract.return_value = [
+            ExtractedRuling(
+                extracted_case_number="2024-00001",
+                extracted_case_title="Alpha v. Beta",
+                # LLM didn't extract text, but there's only one ruling
+                ruling_text=None,
+                outcome=ExtractionOutcome.GRANTED,
+            ),
+        ]
+        worker._framework_extractor = mock_extractor
+
+        # Track the ruling_text passed to the recursive process_event call.
+        captured_ruling_texts: list[str | None] = []
+        original_process_event = worker.process_event
+
+        def spy_process_event(event_data: dict) -> None:
+            if event_data.get("_split_processed"):
+                captured_ruling_texts.append(event_data.get("ruling_text"))
+            original_process_event(event_data)
+
+        worker.process_event = spy_process_event  # type: ignore[assignment]
+
+        event = _make_event(ruling_text=pdfplumber_text)
+        worker.process_event(event)
+
+        # Single-ruling: should fall back to pdfplumber text.
+        assert captured_ruling_texts[0] == pdfplumber_text
+
+    @patch("ingestion.worker.batch_upsert_parties")
     @patch("ingestion.worker.resolve_judge", return_value=None)
     @patch("ingestion.worker.psycopg")
     def test_continues_on_llm_failure(
