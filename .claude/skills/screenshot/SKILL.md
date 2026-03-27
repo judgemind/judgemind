@@ -53,6 +53,14 @@ scripts/run-py.sh scripts/screenshot.py /rulings --width 375 --height 812 --outp
 scripts/run-py.sh scripts/screenshot.py /rulings --wait 5000 --output tmp/rulings.png
 ```
 
+**Screenshot an admin page (requires authentication):**
+```
+scripts/run-py.sh scripts/screenshot.py --auth /admin/data-quality --output tmp/dq.png
+```
+Then: `Read tmp/dq.png`
+
+The `--auth` flag fetches admin credentials from AWS Secrets Manager (`judgemind/dev/agent-admin`), logs in via the web login form, and then navigates to the target page. This is required for any page behind authentication (e.g. `/admin/*` routes).
+
 ### Options
 
 | Flag | Default | Description |
@@ -63,6 +71,7 @@ scripts/run-py.sh scripts/screenshot.py /rulings --wait 5000 --output tmp/ruling
 | `--width` | 1280 | Viewport width in pixels |
 | `--height` | 720 | Viewport height in pixels |
 | `--wait` | 3000 | Wait time in ms after page load for JS rendering |
+| `--auth` | off | Log in as admin before taking the screenshot. Fetches credentials from AWS Secrets Manager (`judgemind/dev/agent-admin`). Required for admin pages. |
 
 ---
 
