@@ -307,6 +307,34 @@ describe('GraphQL schema — integration', () => {
       edges.forEach((e) => expect(e.node.caseType).toBe('civil'));
     });
 
+    it('filters by outcome (EXISTS subquery on rulings)', async () => {
+      const body = await gql(`{ cases(outcome: "granted") { edges { node { id } } } }`);
+      expect(body.errors).toBeUndefined();
+      const edges = ((body.data?.cases as Record<string, unknown>).edges as Array<{ node: { id: string } }>);
+      expect(edges.some((e) => e.node.id === caseId)).toBe(true);
+    });
+
+    it('filters by motionType (EXISTS subquery on rulings)', async () => {
+      const body = await gql(`{ cases(motionType: "msj") { edges { node { id } } } }`);
+      expect(body.errors).toBeUndefined();
+      const edges = ((body.data?.cases as Record<string, unknown>).edges as Array<{ node: { id: string } }>);
+      expect(edges.some((e) => e.node.id === caseId)).toBe(true);
+    });
+
+    it('outcome filter excludes cases without matching rulings', async () => {
+      const body = await gql(`{ cases(outcome: "moot") { edges { node { id } } } }`);
+      expect(body.errors).toBeUndefined();
+      const edges = ((body.data?.cases as Record<string, unknown>).edges as Array<{ node: { id: string } }>);
+      expect(edges.every((e) => e.node.id !== caseId)).toBe(true);
+    });
+
+    it('motionType filter excludes cases without matching rulings', async () => {
+      const body = await gql(`{ cases(motionType: "demurrer") { edges { node { id } } } }`);
+      expect(body.errors).toBeUndefined();
+      const edges = ((body.data?.cases as Record<string, unknown>).edges as Array<{ node: { id: string } }>);
+      expect(edges.every((e) => e.node.id !== caseId)).toBe(true);
+    });
+
     it('cursor pagination: first=1 returns one edge with a cursor', async () => {
       const body = await gql(`{
         cases(first: 1) {

@@ -129,6 +129,8 @@ export const resolvers = {
         county,
         dateFrom,
         dateTo,
+        outcome,
+        motionType,
         first,
         after,
       }: {
@@ -138,6 +140,8 @@ export const resolvers = {
         county?: string;
         dateFrom?: string;
         dateTo?: string;
+        outcome?: string;
+        motionType?: string;
         first?: number;
         after?: string;
       },
@@ -165,21 +169,31 @@ export const resolvers = {
         params.push(county);
       }
 
-      // Use an EXISTS subquery for date filtering instead of JOIN + DISTINCT.
-      // This is more efficient: the DB stops checking each case as soon as it
-      // finds one matching ruling, avoiding a large intermediate result set.
-      if (dateFrom || dateTo) {
-        const dateConditions: string[] = [];
-        if (dateFrom) {
-          dateConditions.push(`r.hearing_date >= $${i++}`);
-          params.push(dateFrom);
-        }
-        if (dateTo) {
-          dateConditions.push(`r.hearing_date <= $${i++}`);
-          params.push(dateTo);
-        }
+      // Use an EXISTS subquery for ruling-level filters (dates, outcome, motion
+      // type) instead of JOIN + DISTINCT. This is more efficient: the DB stops
+      // checking each case as soon as it finds one matching ruling.
+      const rulingConditions: string[] = [];
+      if (dateFrom) {
+        rulingConditions.push(`r.hearing_date >= $${i++}`);
+        params.push(dateFrom);
+      }
+      if (dateTo) {
+        rulingConditions.push(`r.hearing_date <= $${i++}`);
+        params.push(dateTo);
+      }
+      if (outcome) {
+        rulingConditions.push(`r.outcome = $${i++}`);
+        params.push(outcome);
+      }
+      if (motionType) {
+        rulingConditions.push(`r.motion_type = $${i++}`);
+        params.push(motionType);
+      }
+      if (rulingConditions.length > 0) {
+        // Exclude future hearing dates by default for consistency with the
+        // rulings resolver (which also excludes them unless includeFuture is set).
         conditions.push(
-          `EXISTS (SELECT 1 FROM rulings r WHERE r.case_id = c.id AND ${dateConditions.join(' AND ')})`,
+          `EXISTS (SELECT 1 FROM rulings r WHERE r.case_id = c.id AND r.hearing_date <= CURRENT_DATE AND ${rulingConditions.join(' AND ')})`,
         );
       }
 
