@@ -1258,6 +1258,165 @@ class TestCountyExtractionPath:
             # process_event was called for the extracted ruling
             mock_process.assert_called_once()
 
+    def test_san_bernardino_uses_county_extractor(self) -> None:
+        """San Bernardino docs use a county-specific extractor with custom SB prompt (#2050)."""
+        worker, _ = _make_worker()
+
+        mock_county_extractor = MagicMock()
+        mock_county_extractor.extract.return_value = [
+            ExtractedRuling(
+                extracted_case_number="CIVRS2502080",
+                extracted_case_title="Carmell v. Genus-Robinson-Haywood",
+                ruling_text="All seven motions to compel are moot.",
+                outcome=ExtractionOutcome.OTHER,
+                motion_type="Motion to Compel",
+                extracted_parties=[
+                    ExtractedParty(name="Carmell", role="plaintiff"),
+                    ExtractedParty(name="Genus-Robinson-Haywood", role="defendant"),
+                ],
+            ),
+        ]
+
+        with (
+            patch("ingestion.worker.LlmExtractor") as mock_cls,
+            patch(
+                "framework.extraction_config.get_county_extraction_config",
+            ) as mock_get_config,
+            patch.object(worker, "process_event") as mock_process,
+        ):
+            from framework.extraction_config import (
+                SAN_BERNARDINO_SYSTEM_PROMPT,
+                CountyExtractionConfig,
+                ExtractionMethod,
+            )
+
+            mock_get_config.return_value = CountyExtractionConfig(
+                method=ExtractionMethod.LLM,
+                system_prompt=SAN_BERNARDINO_SYSTEM_PROMPT,
+                provider="google",
+                model="gemini-2.5-flash-lite",
+                max_output_tokens=32768,
+            )
+            mock_cls.return_value = mock_county_extractor
+
+            event = _make_event(
+                scraper_id="ca-sb-tentatives-civil",
+                state="CA",
+                county="San Bernardino",
+                content_format="pdf",
+                ruling_text=(
+                    "Department R12 - Judge Kory Mathewson\n"
+                    "CIVRS2502080\n"
+                    "Carmell v. Genus-Robinson-Haywood\n"
+                    "All seven motions to compel are moot."
+                ),
+            )
+            ruling_text = event["ruling_text"]
+
+            result = worker._llm_split_document(
+                event, event["document_id"], ruling_text, "CA", "San Bernardino"
+            )
+
+            assert result is True
+            # County extractor was created with the right provider/model
+            mock_cls.assert_called_once_with(
+                provider="google",
+                model="gemini-2.5-flash-lite",
+                max_output_tokens=32768,
+            )
+            # extract was called with the SB-specific system prompt
+            mock_county_extractor.extract.assert_called_once()
+            call_kwargs = mock_county_extractor.extract.call_args
+            assert call_kwargs.kwargs.get("system_prompt") == SAN_BERNARDINO_SYSTEM_PROMPT
+            # process_event was called for the extracted ruling
+            mock_process.assert_called_once()
+            # Verify the split event has the LLM-extracted fields
+            split_event = mock_process.call_args[0][0]
+            assert split_event["case_number"] == "CIVRS2502080"
+            assert split_event["case_title"] == "Carmell v. Genus-Robinson-Haywood"
+            assert split_event["_llm_extracted"] is True
+
+    def test_san_bernardino_multi_case_split(self) -> None:
+        """San Bernardino multi-case PDF is split into separate events (#2050)."""
+        worker, _ = _make_worker()
+
+        mock_county_extractor = MagicMock()
+        mock_county_extractor.extract.return_value = [
+            ExtractedRuling(
+                extracted_case_number="CIVSB2419120",
+                extracted_case_title="Solis v. General Motors",
+                ruling_text="Motion for summary adjudication is denied.",
+                outcome=ExtractionOutcome.DENIED,
+                motion_type="Motion for Summary Adjudication",
+                extracted_parties=[
+                    ExtractedParty(name="Solis", role="plaintiff"),
+                    ExtractedParty(name="General Motors", role="defendant"),
+                ],
+            ),
+            ExtractedRuling(
+                extracted_case_number="CIVSB2416631",
+                extracted_case_title="Smith v. Jones",
+                ruling_text="Demurrer is sustained.",
+                outcome=ExtractionOutcome.GRANTED,
+                motion_type="Demurrer",
+                extracted_parties=[
+                    ExtractedParty(name="Smith", role="plaintiff"),
+                    ExtractedParty(name="Jones", role="defendant"),
+                ],
+            ),
+        ]
+
+        with (
+            patch("ingestion.worker.LlmExtractor") as mock_cls,
+            patch(
+                "framework.extraction_config.get_county_extraction_config",
+            ) as mock_get_config,
+            patch.object(worker, "process_event") as mock_process,
+        ):
+            from framework.extraction_config import (
+                SAN_BERNARDINO_SYSTEM_PROMPT,
+                CountyExtractionConfig,
+                ExtractionMethod,
+            )
+
+            mock_get_config.return_value = CountyExtractionConfig(
+                method=ExtractionMethod.LLM,
+                system_prompt=SAN_BERNARDINO_SYSTEM_PROMPT,
+                provider="google",
+                model="gemini-2.5-flash-lite",
+                max_output_tokens=32768,
+            )
+            mock_cls.return_value = mock_county_extractor
+
+            event = _make_event(
+                scraper_id="ca-sb-tentatives-civil",
+                state="CA",
+                county="San Bernardino",
+                content_format="pdf",
+                ruling_text="Multi-case document with two cases.",
+            )
+            ruling_text = event["ruling_text"]
+
+            result = worker._llm_split_document(
+                event, event["document_id"], ruling_text, "CA", "San Bernardino"
+            )
+
+            assert result is True
+            # process_event called twice (once per case)
+            assert mock_process.call_count == 2
+
+            # First split event
+            first_event = mock_process.call_args_list[0][0][0]
+            assert first_event["case_number"] == "CIVSB2419120"
+            assert first_event["_split_index"] == 0
+            assert first_event["_split_count"] == 2
+
+            # Second split event
+            second_event = mock_process.call_args_list[1][0][0]
+            assert second_event["case_number"] == "CIVSB2416631"
+            assert second_event["_split_index"] == 1
+            assert second_event["_split_count"] == 2
+
 
 class TestMultimodalExtractionPath:
     """Tests for the multimodal extraction path in _llm_split_document."""

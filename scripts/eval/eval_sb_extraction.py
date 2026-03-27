@@ -55,6 +55,12 @@ FIXTURES_DIR = REPO_ROOT / "packages" / "scraper-framework" / "tests" / "fixture
 EXPECTED_DIR = FIXTURES_DIR / "expected"
 RESULTS_DIR = SCRIPT_DIR / "results"
 
+# Add scraper-framework src to sys.path so we can import the production prompt.
+# This ensures the eval always uses the same prompt as the production pipeline.
+_SCRAPER_SRC = str(REPO_ROOT / "packages" / "scraper-framework" / "src")
+if _SCRAPER_SRC not in sys.path:
+    sys.path.insert(0, _SCRAPER_SRC)
+
 # ---------------------------------------------------------------------------
 # Model configuration
 # ---------------------------------------------------------------------------
@@ -73,127 +79,12 @@ MODELS: dict[str, dict] = {
 }
 
 # ---------------------------------------------------------------------------
-# San Bernardino-specific extraction prompt
+# San Bernardino-specific extraction prompt — imported from production config
+# to ensure eval and production always use the same prompt (#2050).
 # ---------------------------------------------------------------------------
 
-SB_SYSTEM_PROMPT = (
-    "You are a legal document parser for California court "
-    "tentative rulings from San Bernardino County Superior Court.\n\n"
-    "You will receive the full text extracted from a PDF containing "
-    "tentative rulings.  Your job is to identify EVERY individual "
-    "case ruling in the document and extract structured data for each.\n\n"
-    "## San Bernardino Document Format\n\n"
-    "San Bernardino PDFs have this structure:\n"
-    "1. **Header**: One of two formats:\n"
-    "   - 'TENTATIVE RULING[S] FOR [date/case]' followed by "
-    "'Department {CODE} - Judge {Name}' and standard boilerplate.\n"
-    "   - 'TENTATIVE RULINGS FOR DEPT. {CODE} [DATE]' followed by "
-    "'BEFORE THE HONORABLE {NAME}' (all-caps format used by some "
-    "departments like S36).\n"
-    "2. **Case entries**: Unlike Riverside (numbered entries), "
-    "San Bernardino cases are separated by horizontal rules "
-    "(underscores ____________) or by repeated headers. Each case "
-    "contains:\n"
-    "   - Case number (e.g., CIVSB2419120, CIVRS2502080, "
-    "CIVSB 2600093)\n"
-    "   - Case title / party names (e.g., 'LORENZO SOLIS v. GENERAL "
-    "MOTORS LLC')\n"
-    "   - Motion description\n"
-    "   - Ruling text with legal analysis\n"
-    "3. **Multi-case PDFs**: Some PDFs contain multiple cases for "
-    "the same department and hearing date.  Each case starts with "
-    "its own case number and title, often preceded by a horizontal "
-    "rule or a repeated header block.  Count each distinct case "
-    "number as a separate ruling.\n"
-    "4. **Single-case PDFs with multiple motions**: Some cases "
-    "have multiple related motions (e.g., 7 motions to compel, "
-    "2 motions to set aside default).  These are ONE ruling because "
-    "they share the same case number.  The ruling_text should "
-    "include the full text covering ALL motions for that case.\n"
-    "5. **Two-layer structure for substantive motions**: Like "
-    "Riverside, San Bernardino PDFs may have:\n"
-    "   - A brief disposition summary (e.g., 'Motion for Summary "
-    "Adjudication is denied without prejudice')\n"
-    "   - A FULL legal analysis that follows, often spanning MULTIPLE "
-    "PAGES with legal standards, case citations, and detailed "
-    "reasoning.\n"
-    "   The ruling_text MUST include BOTH the disposition AND the "
-    "full analysis.  Do NOT truncate.\n"
-    "6. **Page footers**: Strip 'Page | N' and 'Page N of M' footers "
-    "from ruling text.\n\n"
-    "## Case Number Formats\n\n"
-    "San Bernardino case numbers use these patterns:\n"
-    "- CIV + location code + digits: CIVRS2502080, CIVSB2416631\n"
-    "- Location codes: RS=Rancho Cucamonga, SB=San Bernardino\n"
-    "- Some departments insert a space: 'CIVSB 2600093' — normalize "
-    "to 'CIVSB2600093' (remove internal spaces).\n\n"
-    "## Rules\n\n"
-    "1. Count and return one ruling per distinct case number.  "
-    "Multiple motions under the same case number are ONE ruling.\n"
-    "2. Extract the case number EXACTLY as it appears (but remove "
-    "any internal spaces — 'CIVSB 2600093' becomes 'CIVSB2600093').\n"
-    "3. For case_title, use 'Plaintiff v. Defendant' format.  "
-    "Convert ALL-CAPS titles to title case.\n"
-    "4. For ruling_text, include the COMPLETE ruling text — the "
-    "disposition AND the full legal analysis.  Include ALL pages "
-    "of analysis.  Do NOT truncate or summarize.  Preserve the text "
-    "VERBATIM (but strip page footers).\n"
-    "5. Skip the header boilerplate (appearance instructions, phone "
-    "numbers, URLs, pandemic notices, etc.) — only extract from "
-    "the case content.\n"
-    "6. For judge_name, extract the judge's full name.  If the "
-    "header uses ALL-CAPS ('BEFORE THE HONORABLE JOSEPH WIDMAN'), "
-    "convert to title case ('Joseph Widman').\n\n"
-    "## Parties\n\n"
-    "Extract plaintiff(s) and defendant(s) from the case caption. "
-    "Each party is "
-    '{"name": "...", "role": "plaintiff", "confidence": "high"} or '
-    '{"name": "...", "role": "defendant", "confidence": "high"}.\n\n'
-    "## Outcome taxonomy\n\n"
-    "Use EXACTLY one of these values:\n"
-    "- granted — motion was fully granted\n"
-    "- denied — motion was fully denied\n"
-    "- granted_in_part — partially granted and partially denied\n"
-    "- denied_in_part — partially denied\n"
-    "- moot — motion is moot\n"
-    "- continued — hearing was postponed\n"
-    "- off_calendar — hearing removed from calendar\n"
-    "- submitted — taken under submission\n"
-    "- other — none of the above fit\n\n"
-    "For 'overruled' (demurrers), map to 'denied'.\n"
-    "For 'sustained' (demurrers), map to 'granted'.\n"
-    "For 'denied without prejudice', map to 'denied'.\n"
-    "For cases where the motion is MOOT but sanctions are awarded, "
-    "use 'moot'.\n\n"
-    "## Output format\n\n"
-    "Respond with ONLY a JSON object, no other text:\n\n"
-    "{\n"
-    '  "extracted_judge_name": "First M. Last" or null,\n'
-    '  "hearing_date": "YYYY-MM-DD" or null,\n'
-    '  "department": "R12" or null,\n'
-    '  "rulings": [\n'
-    "    {\n"
-    '      "extracted_case_number": "CIVRS2502080" or null,\n'
-    '      "extracted_case_title": "Carmell v. Genus-Robinson-Haywood" or null,\n'
-    '      "case_type": "civil" or null,\n'
-    '      "outcome": "moot" or null,\n'
-    '      "motion_type": "compel" or null,\n'
-    '      "ruling_text": "Full verbatim text..." or null,\n'
-    '      "extracted_parties": [\n'
-    '        {"name": "Carmell", "role": "plaintiff", "confidence": "high"},\n'
-    '        {"name": "Genus-Robinson-Haywood", "role": "defendant", "confidence": "high"}\n'
-    "      ],\n"
-    '      "confidence": {\n'
-    '        "case_number": "high",\n'
-    '        "case_title": "high",\n'
-    '        "parties": "high",\n'
-    '        "judge": "high",\n'
-    '        "ruling_text": "high",\n'
-    '        "outcome": "high"\n'
-    "      }\n"
-    "    }\n"
-    "  ]\n"
-    "}"
+from framework.extraction_config import (
+    SAN_BERNARDINO_SYSTEM_PROMPT as SB_SYSTEM_PROMPT,
 )
 
 
@@ -328,7 +219,11 @@ def _call_with_retry(
             if attempt < max_retries - 1:
                 wait = 2**attempt
                 print(
-                    "TIMEOUT (" + str(timeout_s) + "s), retry " + str(attempt + 1) + "...",
+                    "TIMEOUT ("
+                    + str(timeout_s)
+                    + "s), retry "
+                    + str(attempt + 1)
+                    + "...",
                     end=" ",
                     flush=True,
                 )
@@ -502,10 +397,14 @@ def score_fixture(result: FixtureResult) -> dict:
         "empty_rulings": empty_count,
         "short_rulings": short_count,
         "ruling_lengths": ruling_lengths,
-        "avg_ruling_length": (total_text_len / len(result.rulings) if result.rulings else 0),
+        "avg_ruling_length": (
+            total_text_len / len(result.rulings) if result.rulings else 0
+        ),
         "fields_present": fields_present,
         "fields_total": fields_total,
-        "field_completeness_pct": (fields_present / fields_total * 100 if fields_total > 0 else 0),
+        "field_completeness_pct": (
+            fields_present / fields_total * 100 if fields_total > 0 else 0
+        ),
         "case_numbers_correct": cn_correct,
         "case_numbers_total": cn_total,
     }
@@ -560,7 +459,9 @@ def analyze_model(
     # Cost calculations
     avg_in = summary.total_input_tokens / len(valid) if valid else 0
     avg_out = summary.total_output_tokens / len(valid) if valid else 0
-    summary.cost_per_fixture = (avg_in * pricing["input"] + avg_out * pricing["output"]) / 1_000_000
+    summary.cost_per_fixture = (
+        avg_in * pricing["input"] + avg_out * pricing["output"]
+    ) / 1_000_000
     # Estimate: ~10 PDFs/day (5 departments x 2 scrapes)
     summary.estimated_monthly_cost = summary.cost_per_fixture * 10 * 30
 
@@ -580,7 +481,11 @@ def print_model_report(summary: ModelSummary) -> None:
     )
     print("Avg latency per fixture: " + f"{summary.avg_latency_ms:,.0f}" + "ms")
 
-    scorable = summary.case_count_correct + summary.case_count_off_by_one + summary.case_count_wrong
+    scorable = (
+        summary.case_count_correct
+        + summary.case_count_off_by_one
+        + summary.case_count_wrong
+    )
     if scorable == 0:
         print("\nNo scorable fixtures.")
         return
@@ -590,9 +495,15 @@ def print_model_report(summary: ModelSummary) -> None:
     print("  Off by 1:     " + str(summary.case_count_off_by_one) + "/" + str(scorable))
     print("  Wrong (>1):   " + str(summary.case_count_wrong) + "/" + str(scorable))
     exact_pct = summary.case_count_correct / scorable * 100
-    lenient_pct = (summary.case_count_correct + summary.case_count_off_by_one) / scorable * 100
+    lenient_pct = (
+        (summary.case_count_correct + summary.case_count_off_by_one) / scorable * 100
+    )
     print("  Exact accuracy:   " + f"{exact_pct:.1f}" + "%")
-    print("  Lenient accuracy: " + f"{lenient_pct:.1f}" + "% (off-by-1 counted as correct)")
+    print(
+        "  Lenient accuracy: "
+        + f"{lenient_pct:.1f}"
+        + "% (off-by-1 counted as correct)"
+    )
 
     print("\n## Case Number Accuracy")
     if summary.case_numbers_total > 0:
@@ -625,7 +536,9 @@ def print_model_report(summary: ModelSummary) -> None:
     print("  Empty rulings:           " + str(summary.empty_rulings))
     if summary.total_rulings > 0:
         non_empty_pct = (
-            (summary.total_rulings - summary.empty_rulings) / summary.total_rulings * 100
+            (summary.total_rulings - summary.empty_rulings)
+            / summary.total_rulings
+            * 100
         )
         print("  Non-empty rate:          " + f"{non_empty_pct:.1f}" + "%")
 
@@ -668,7 +581,11 @@ def print_model_report(summary: ModelSummary) -> None:
             tag = " ~1"
         else:
             tag = " ERR"
-        cn_str = str(detail["case_numbers_correct"]) + "/" + str(detail["case_numbers_total"])
+        cn_str = (
+            str(detail["case_numbers_correct"])
+            + "/"
+            + str(detail["case_numbers_total"])
+        )
         fc_str = f"{detail['field_completeness_pct']:.0f}%"
         print(
             "  "
@@ -725,7 +642,11 @@ def print_comparison_table(summaries: dict[str, ModelSummary]) -> None:
     row = f"{'Case number accuracy':<35}"
     for name in model_names:
         s = summaries[name]
-        pct = s.case_numbers_correct / s.case_numbers_total * 100 if s.case_numbers_total > 0 else 0
+        pct = (
+            s.case_numbers_correct / s.case_numbers_total * 100
+            if s.case_numbers_total > 0
+            else 0
+        )
         row += f"  {pct:>19.1f}%"
     print(row)
 
@@ -799,12 +720,20 @@ def main() -> int:
     google_models = [m for m in args.models if MODELS[m]["provider"] == "google"]
 
     if google_models and not google_key:
-        print("ERROR: GOOGLE_API_KEY not set (needed for: " + ", ".join(google_models) + ")")
+        print(
+            "ERROR: GOOGLE_API_KEY not set (needed for: "
+            + ", ".join(google_models)
+            + ")"
+        )
         return 1
 
     # Load fixtures
     fixtures = get_sb_fixtures()
-    print("Found " + str(len(fixtures)) + " San Bernardino PDF fixtures with ground truth\n")
+    print(
+        "Found "
+        + str(len(fixtures))
+        + " San Bernardino PDF fixtures with ground truth\n"
+    )
     for fp, exp in fixtures:
         desc = exp.get("_description", "")
         cc = exp.get("case_count", "?")
@@ -819,7 +748,15 @@ def main() -> int:
         fixture_texts[fp.name] = text
         line_count = len(text.split("\n"))
         char_count = len(text)
-        print("  " + fp.name + ": " + str(char_count) + " chars, " + str(line_count) + " lines")
+        print(
+            "  "
+            + fp.name
+            + ": "
+            + str(char_count)
+            + " chars, "
+            + str(line_count)
+            + " lines"
+        )
     print()
 
     # Regex baseline comparison
@@ -901,7 +838,11 @@ def main() -> int:
                 match_str = (
                     "EXACT"
                     if len(rulings) == expected_case_count
-                    else ("~1" if abs(len(rulings) - expected_case_count) == 1 else "WRONG")
+                    else (
+                        "~1"
+                        if abs(len(rulings) - expected_case_count) == 1
+                        else "WRONG"
+                    )
                 )
 
                 print(
@@ -972,7 +913,10 @@ def main() -> int:
                         llm_cns.add(cn.replace(" ", ""))
 
                 if regex_cns - llm_cns:
-                    print("    REGRESSION: regex found but LLM missed: " + str(regex_cns - llm_cns))
+                    print(
+                        "    REGRESSION: regex found but LLM missed: "
+                        + str(regex_cns - llm_cns)
+                    )
 
             except Exception as e:
                 print("ERROR: " + str(e))
@@ -1014,7 +958,9 @@ def main() -> int:
                     summary.case_count_correct / scorable * 100 if scorable > 0 else 0
                 ),
                 "case_count_lenient_pct": (
-                    (summary.case_count_correct + summary.case_count_off_by_one) / scorable * 100
+                    (summary.case_count_correct + summary.case_count_off_by_one)
+                    / scorable
+                    * 100
                     if scorable > 0
                     else 0
                 ),
@@ -1043,7 +989,9 @@ def main() -> int:
     all_pass = True
     for summary in all_summaries.values():
         scorable = (
-            summary.case_count_correct + summary.case_count_off_by_one + summary.case_count_wrong
+            summary.case_count_correct
+            + summary.case_count_off_by_one
+            + summary.case_count_wrong
         )
         if scorable > 0:
             if summary.case_count_correct < scorable:
