@@ -163,3 +163,18 @@ describe('DesktopSidebar', () => {
     expect(aside.className).toContain('w-56');
   });
 });
+
+describe('Sidebar and TabletSidebar unification', () => {
+  it('render links to the same hrefs', () => {
+    const { unmount: unmountSidebar } = render(<Sidebar />);
+    const sidebarLinks = screen.getAllByRole('link');
+    const sidebarHrefs = sidebarLinks.map((link) => link.getAttribute('href')).sort();
+    unmountSidebar();
+
+    render(<TabletSidebar />);
+    const tabletLinks = screen.getAllByRole('link');
+    const tabletHrefs = tabletLinks.map((link) => link.getAttribute('href')).sort();
+
+    expect(sidebarHrefs).toEqual(tabletHrefs);
+  });
+});
