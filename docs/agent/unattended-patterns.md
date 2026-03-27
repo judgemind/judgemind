@@ -17,7 +17,7 @@
     -d @{worktree}/tmp/query.json
   ```
 - **No quoted strings in compound shell commands:** a hook rejects commands that contain quoted characters combined with `&&` or `;`. Split into separate tool calls.
-- **Backgrounding long-running processes (daemons, watchers):** NEVER use shell `&`, `nohup`, `disown`, or multicommand tricks like `cmd 2>&1 & echo "done"`. These require compound commands that cannot be allowlisted and always trigger permission prompts. Use the Bash tool's `run_in_background: true` parameter instead — it runs the command as a background task natively, with no shell tricks needed. Example: `Bash(command="scripts/run-py.sh scripts/tg-responder.py", run_in_background=true)`.
+- **Backgrounding long-running processes (daemons, watchers):** NEVER use shell `&`, `nohup`, `disown`, or multicommand tricks like `cmd 2>&1 & echo "done"`. These require compound commands that cannot be allowlisted and always trigger permission prompts. Use the Bash tool's `run_in_background: true` parameter instead — it runs the command as a background task natively, with no shell tricks needed.
 - **Writing to `.claude/` directories (skills, hooks, settings):** The Claude Code platform has a built-in deny on the `.claude/` directory — the Edit and Write tools will fail on any path under `.claude/`. This is a CLI-level restriction, not a user permission setting. To modify files in `.claude/`:
   1. Write the content to `{worktree}/tmp/` using the Write tool.
   2. Copy it into place: `scripts/write-claude-file.sh {worktree}/tmp/file.md {worktree}/.claude/target/file.md`
@@ -34,7 +34,7 @@ When the dispatcher spawns subagents with `isolation: "worktree"`, the parent pr
 2. **Unconditionally `cd <repo_root>` after every agent completion.** Do not check `pwd` first — cwd drift is a known quirk, so just always re-anchor. The `cd` is a no-op if cwd is correct and essential if it has drifted.
 3. **Use `run_in_background: true` on the Bash tool** (not shell `&` or `2>&1 &`) when launching background processes like the Telegram responder daemon. Shell operators change the command string and break the `Bash(scripts/*)` permission glob match.
 
-These patterns apply to any long-running orchestrator agent that spawns subagents with worktree isolation — not just the dispatcher.
+These patterns apply to any long-running dispatcher agent that spawns subagents with worktree isolation.
 
 ## GitHub API Rate Limit Handling
 

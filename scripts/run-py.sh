@@ -11,7 +11,7 @@
 #
 # Examples:
 #   scripts/run-py.sh scripts/audit_field_completeness.py --json
-#   scripts/run-py.sh scripts/tg-notify.py "hello world"
+#   scripts/run-py.sh scripts/reingest_from_s3.py --all
 #
 # Exit codes:
 #   The exit code of the Python script, or 1 on setup errors.

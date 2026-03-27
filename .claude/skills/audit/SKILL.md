@@ -8,7 +8,7 @@ maxTurns: 200
 
 Perform a comprehensive codebase health audit, filing GitHub issues for every actionable finding. This skill is read-only — it analyzes and reports but never modifies source code.
 
-**Trigger:** The dispatcher spawns `/audit` every 20 merged PRs (tracked via `prs_since_last_audit` in `tmp/dispatcher_status.json`). It can also be invoked manually.
+**Trigger:** The dispatcher spawns `/audit` every 20 merged PRs (tracked via `prs_since_last_audit` in `tmp/dispatcher_state.json`). It can also be invoked manually.
 
 **Prerequisites:** Must be in a worktree. No special dependencies required — the audit uses Read, Grep, Glob, and `gh` CLI only.
 
@@ -282,13 +282,9 @@ Write a comprehensive summary to `{worktree}/tmp/audit/report.md`:
 
 ---
 
-## Step 5 — Send Telegram notification
+## Step 5 — Notify completion
 
-Send a summary notification via Telegram:
-
-```
-scripts/run-py.sh scripts/tg-notify.py notify "Audit complete: N findings, M issues filed. [critical: X, high: Y, medium: Z, low: W]"
-```
+The dispatcher will send a Telegram notification when the audit agent completes. No explicit notification step is needed — the report in `{worktree}/tmp/audit/report.md` and the filed issues are the deliverables.
 
 ---
 

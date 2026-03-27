@@ -193,7 +193,6 @@ fi
 #    Further backgrounding causes completion notifications to surface in the wrong
 #    context (the parent/dispatcher), leading to confusion and lost results.
 #    Detection: cwd contains ".claude/worktrees/" in its path.
-#    Exception: the tg-responder daemon runs from the main repo, not a worktree.
 if [ "$RUN_IN_BG" = "true" ]; then
     if echo "$EFFECTIVE_CWD" | grep -qE '\.claude/worktrees/' ; then
         echo "BLOCKED: run_in_background is not allowed inside worktree subagents. Use timeout: 1200000 instead. See CLAUDE.md §Critical Rules." >&2

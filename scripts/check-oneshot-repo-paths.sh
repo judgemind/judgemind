@@ -62,9 +62,7 @@ LOCAL_ONLY=(
     "check-aws-bool-flags.sh"
     "check-hardcoded-colors.sh"
     "check-migration-files.sh"
-    # Developer/orchestrator tooling — only run locally
-    "tg-responder.py"
-    "orchestrator-request.py"
+    # Developer/dispatcher tooling — only run locally
     "dispatcher-request.py"
     "phase_timer.py"
     "screenshot.py"

@@ -26,8 +26,6 @@ jobs:
       api: ${{ steps.changes.outputs.api }}
       web: ${{ steps.changes.outputs.web }}
       infra: ${{ steps.changes.outputs.infra }}
-      telegram: ${{ steps.changes.outputs.telegram }}
-      infra-lambda: ${{ steps.changes.outputs.infra-lambda }}
       scripts: ${{ steps.changes.outputs.scripts }}
       ecs-oneshot: ${{ steps.changes.outputs.ecs-oneshot }}
       dockerfile: ${{ steps.changes.outputs.dockerfile }}
@@ -67,11 +65,6 @@ jobs:
               - 'packages/web/**'
             infra:
               - 'infra/**'
-            telegram:
-              - 'packages/telegram-bridge/**'
-              - 'packages/judgemind-config/**'
-            infra-lambda:
-              - 'infra/telegram-bot/**'
             scripts:
               - 'scripts/**'
             ecs-oneshot:
@@ -91,9 +84,7 @@ jobs:
           if [ "${{ steps.changes.outputs.scraper }}" = "true" ] || \
              [ "${{ steps.changes.outputs.nlp }}" = "true" ] || \
              [ "${{ steps.changes.outputs.api }}" = "true" ] || \
-             [ "${{ steps.changes.outputs.web }}" = "true" ] || \
-             [ "${{ steps.changes.outputs.telegram }}" = "true" ] || \
-             [ "${{ steps.changes.outputs.infra-lambda }}" = "true" ]; then
+             [ "${{ steps.changes.outputs.web }}" = "true" ]; then
             echo "result=true" >> "$GITHUB_OUTPUT"
           else
             echo "result=false" >> "$GITHUB_OUTPUT"
@@ -460,59 +451,6 @@ jobs:
       - name: Build
         run: npm run build
 
-  telegram-bridge-tests:
-    needs: detect-changes
-    if: needs.detect-changes.outputs.telegram == 'true'
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: packages/telegram-bridge
-    steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-python@v6
-        id: setup-python
-        with:
-          python-version: '3.12'
-      - uses: actions/cache@v5
-        id: venv-cache
-        with:
-          path: packages/telegram-bridge/.venv
-          key: venv-telegram-${{ runner.os }}-py${{ steps.setup-python.outputs.python-version }}-${{ hashFiles('packages/telegram-bridge/pyproject.toml') }}
-      - name: Validate cached venv
-        if: steps.venv-cache.outputs.cache-hit == 'true'
-        run: |
-          if ! .venv/bin/python --version > /dev/null 2>&1; then
-            echo "Cached venv is invalid (Python version mismatch), recreating..."
-            rm -rf .venv
-            echo "venv-invalid=true" >> "$GITHUB_ENV"
-          fi
-      - name: Install dependencies
-        if: steps.venv-cache.outputs.cache-hit != 'true' || env.venv-invalid == 'true'
-        run: |
-          python -m venv .venv
-          .venv/bin/pip install -e ../../packages/judgemind-config
-          .venv/bin/pip install -e ".[dev]"
-      - name: Lint
-        run: .venv/bin/ruff check src/ tests/
-      - name: Format check
-        run: .venv/bin/ruff format --check src/ tests/
-      - name: Test
-        run: .venv/bin/pytest tests/ -v --tb=short
-      - name: Upload coverage
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: coverage-telegram
-          path: packages/telegram-bridge/coverage.xml
-      - name: Upload to Codecov
-        if: always() && hashFiles('packages/telegram-bridge/coverage.xml') != ''
-        uses: codecov/codecov-action@v5
-        with:
-          token: ${{ secrets.CODECOV_TOKEN }}
-          files: packages/telegram-bridge/coverage.xml
-          flags: telegram-bridge
-          fail_ci_if_error: false
-
   infra-validate:
     needs: detect-changes
     if: needs.detect-changes.outputs.infra == 'true'
@@ -549,62 +487,6 @@ jobs:
       - name: Terraform Plan (dev)
         if: env.AWS_ACCESS_KEY_ID != ''
         run: terraform -chdir=infra/terraform/environments/dev plan -no-color -input=false
-
-  lambda-tests:
-    needs: detect-changes
-    if: needs.detect-changes.outputs.infra-lambda == 'true'
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        lambda-dir:
-          - infra/telegram-bot
-    defaults:
-      run:
-        working-directory: ${{ matrix.lambda-dir }}
-    steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-python@v6
-        id: setup-python
-        with:
-          python-version: '3.12'
-      - uses: actions/cache@v5
-        id: venv-cache
-        with:
-          path: ${{ matrix.lambda-dir }}/.venv
-          key: venv-${{ matrix.lambda-dir }}-${{ runner.os }}-py${{ steps.setup-python.outputs.python-version }}-${{ hashFiles(format('{0}/pyproject.toml', matrix.lambda-dir)) }}
-      - name: Validate cached venv
-        if: steps.venv-cache.outputs.cache-hit == 'true'
-        run: |
-          if ! .venv/bin/python --version > /dev/null 2>&1; then
-            echo "Cached venv is invalid (Python version mismatch), recreating..."
-            rm -rf .venv
-            echo "venv-invalid=true" >> "$GITHUB_ENV"
-          fi
-      - name: Install dependencies
-        if: steps.venv-cache.outputs.cache-hit != 'true' || env.venv-invalid == 'true'
-        run: |
-          python -m venv .venv
-          .venv/bin/pip install -e ".[dev]"
-      - name: Lint
-        run: .venv/bin/ruff check .
-      - name: Format check
-        run: .venv/bin/ruff format --check .
-      - name: Test
-        run: .venv/bin/pytest tests/ -v --tb=short
-      - name: Upload coverage
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: coverage-lambda-telegram-bot
-          path: ${{ matrix.lambda-dir }}/coverage.xml
-      - name: Upload to Codecov
-        if: always() && hashFiles(format('{0}/coverage.xml', matrix.lambda-dir)) != ''
-        uses: codecov/codecov-action@v5
-        with:
-          token: ${{ secrets.CODECOV_TOKEN }}
-          files: ${{ matrix.lambda-dir }}/coverage.xml
-          flags: lambda-telegram-bot
-          fail_ci_if_error: false
 
   scripts-tests:
     needs: detect-changes
@@ -658,7 +540,7 @@ jobs:
   # Coverage gates: diff coverage (new lines) + overall floor ratchet
   # ---------------------------------------------------------------
   coverage-check:
-    needs: [detect-changes, scraper-framework-tests, scraper-court-tests, ingestion-tests, nlp-tests, api-tests, web-tests, telegram-bridge-tests, lambda-tests]
+    needs: [detect-changes, scraper-framework-tests, scraper-court-tests, ingestion-tests, nlp-tests, api-tests, web-tests]
     if: always() && github.event_name == 'pull_request' && needs.detect-changes.outputs.any-testable == 'true'
     runs-on: ubuntu-latest
     steps:
@@ -711,26 +593,6 @@ jobs:
             diff-cover "$COV_FILE" --compare-branch=origin/main --fail-under=90 --diff-range-notation='..'
           else
             echo "No coverage artifact for nlp-pipeline — skipping diff-cover"
-          fi
-
-      - name: Diff coverage — telegram-bridge
-        if: needs.detect-changes.outputs.telegram == 'true'
-        run: |
-          COV_FILE="coverage-artifacts/coverage-telegram/coverage.xml"
-          if [ -f "$COV_FILE" ]; then
-            diff-cover "$COV_FILE" --compare-branch=origin/main --fail-under=90 --diff-range-notation='..'
-          else
-            echo "No coverage artifact for telegram-bridge — skipping diff-cover"
-          fi
-
-      - name: Diff coverage — lambda-telegram-bot
-        if: needs.detect-changes.outputs.infra-lambda == 'true'
-        run: |
-          COV_FILE="coverage-artifacts/coverage-lambda-telegram-bot/coverage.xml"
-          if [ -f "$COV_FILE" ]; then
-            diff-cover "$COV_FILE" --compare-branch=origin/main --fail-under=90 --diff-range-notation='..'
-          else
-            echo "No coverage artifact for lambda-telegram-bot — skipping diff-cover"
           fi
 
       - name: Diff coverage — api
@@ -817,28 +679,6 @@ jobs:
           if [ -f "$COV_FILE" ]; then
             python scripts/update-coverage-baselines.py \
               --package packages/nlp-pipeline \
-              --coverage-file "$COV_FILE" \
-              --dry-run
-          fi
-
-      - name: Coverage floor ratchet — telegram-bridge
-        if: needs.detect-changes.outputs.telegram == 'true'
-        run: |
-          COV_FILE="coverage-artifacts/coverage-telegram/coverage.xml"
-          if [ -f "$COV_FILE" ]; then
-            python scripts/update-coverage-baselines.py \
-              --package packages/telegram-bridge \
-              --coverage-file "$COV_FILE" \
-              --dry-run
-          fi
-
-      - name: Coverage floor ratchet — lambda-telegram-bot
-        if: needs.detect-changes.outputs.infra-lambda == 'true'
-        run: |
-          COV_FILE="coverage-artifacts/coverage-lambda-telegram-bot/coverage.xml"
-          if [ -f "$COV_FILE" ]; then
-            python scripts/update-coverage-baselines.py \
-              --package infra/telegram-bot \
               --coverage-file "$COV_FILE" \
               --dry-run
           fi
@@ -1006,7 +846,7 @@ jobs:
   # ---------------------------------------------------------------
   removed-exports-check:
     needs: detect-changes
-    if: needs.detect-changes.outputs.scraper == 'true' || needs.detect-changes.outputs.nlp == 'true' || needs.detect-changes.outputs.api == 'true' || needs.detect-changes.outputs.scripts == 'true' || needs.detect-changes.outputs.telegram == 'true'
+    if: needs.detect-changes.outputs.scraper == 'true' || needs.detect-changes.outputs.nlp == 'true' || needs.detect-changes.outputs.api == 'true' || needs.detect-changes.outputs.scripts == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -1094,7 +934,7 @@ jobs:
   # Always runs. Reports success only when every applicable job passed or was
   # skipped (path filter did not match). Branch protection requires this check.
   ci-passed:
-    needs: [scraper-framework-tests, scraper-court-tests, ingestion-tests, nlp-tests, api-tests, web-tests, telegram-bridge-tests, infra-validate, lambda-tests, scripts-tests, coverage-check, deprecated-models-check, hardcoded-models-check, hardcoded-colors-check, oneshot-imports-check, oneshot-repo-paths-check, duplicate-functions-check, schema-drift-check, dq-baselines-validate, ecs-oneshot-test, migration-files-check, sql-conflict-check, sql-column-check, playwright-browser-check, shard-coverage-check, apollo-keyfields-check]
+    needs: [scraper-framework-tests, scraper-court-tests, ingestion-tests, nlp-tests, api-tests, web-tests, infra-validate, scripts-tests, coverage-check, deprecated-models-check, hardcoded-models-check, hardcoded-colors-check, oneshot-imports-check, oneshot-repo-paths-check, duplicate-functions-check, schema-drift-check, dq-baselines-validate, ecs-oneshot-test, migration-files-check, sql-conflict-check, sql-column-check, playwright-browser-check, shard-coverage-check, apollo-keyfields-check]
     if: always()
     runs-on: ubuntu-latest
     steps:

@@ -51,14 +51,6 @@ flags:
     paths:
       - packages/web/
     carryforward: true
-  telegram-bridge:
-    paths:
-      - packages/telegram-bridge/
-    carryforward: true
-  lambda-telegram-bot:
-    paths:
-      - infra/telegram-bot/
-    carryforward: true
 
 # Component definitions for dashboard grouping
 component_management:
@@ -79,11 +71,3 @@ component_management:
       name: Web Frontend
       paths:
         - packages/web/**
-    - component_id: telegram-bridge
-      name: Telegram Bridge
-      paths:
-        - packages/telegram-bridge/**
-    - component_id: lambda-telegram-bot
-      name: Lambda - Telegram Bot
-      paths:
-        - infra/telegram-bot/**

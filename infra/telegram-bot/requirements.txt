@@ -1,3 +1,0 @@
-# No extra dependencies required.
-# boto3 is provided by the Lambda runtime.
-# urllib is part of the Python standard library.

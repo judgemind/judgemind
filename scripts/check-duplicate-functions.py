@@ -32,8 +32,6 @@ _DEFAULT_DIRS = [
     "packages/nlp-pipeline/tests",
     "packages/judgemind-config/src",
     "packages/judgemind-config/tests",
-    "packages/telegram-bridge/src",
-    "packages/telegram-bridge/tests",
 ]
 
 

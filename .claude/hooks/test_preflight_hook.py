@@ -349,13 +349,6 @@ run_test(
 
 # Commands with run_in_background=true from main repo — should be ALLOWED
 run_test(
-    "run_in_background from main repo allowed (tg-responder use case)",
-    "scripts/tg-responder.sh",
-    0,
-    run_in_background=True,
-    cwd_override=MAIN_REPO_CWD,
-)
-run_test(
     "gh run watch with run_in_background from main repo allowed",
     "gh run watch 12345 --interval 60",
     0,

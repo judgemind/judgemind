@@ -162,11 +162,6 @@ module "ses" {
   sending_domain = "judgemind.org"
 }
 
-module "telegram_bot" {
-  source      = "../../modules/telegram-bot"
-  environment = "dev"
-}
-
 output "ecr_repository_url" {
   description = "Dev ECR repository URL for scraper images"
   value       = module.ecr.repository_url

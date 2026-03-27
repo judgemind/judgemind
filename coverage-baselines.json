@@ -3,8 +3,6 @@
   "packages/scraper-framework": 80.0,
   "packages/scraper-framework:framework-only": 50.0,
   "packages/nlp-pipeline": 100.0,
-  "packages/telegram-bridge": 94.9,
   "packages/api": 57.7,
-  "packages/web": 29.0,
-  "infra/telegram-bot": 95.0
+  "packages/web": 29.0
 }

@@ -2,15 +2,13 @@
 """Append an instruction to the dispatcher inbox file.
 
 Subagents use this script to request actions from the dispatcher, such as
-restarting the Telegram responder, applying Terraform, or sending
-notifications.
+applying Terraform, sending notifications, or filing issues.
 
 Usage::
 
-    scripts/dispatcher-request.py restart_responder --reason "telegram-bridge code updated"
     scripts/dispatcher-request.py notify --message "Found regression in OC scraper"
-    scripts/dispatcher-request.py terraform_apply --module telegram-bot
-    scripts/dispatcher-request.py run_script --script scripts/tg-set-webhook.sh
+    scripts/dispatcher-request.py terraform_apply --module ingestion-worker
+    scripts/dispatcher-request.py run_script --script scripts/some-script.sh
     scripts/dispatcher-request.py file_issue --title "Bug report" --description "Details..."
 
 The script is stdlib-only and does not require any venv.  It uses file
@@ -31,11 +29,8 @@ import os
 import sys
 from pathlib import Path
 
-# Allowed action types -- kept in sync with InstructionKind in
-# packages/telegram-bridge/src/telegram_bridge/dispatcher.py.
 ALLOWED_ACTIONS = frozenset(
     {
-        "restart_responder",
         "terraform_apply",
         "notify",
         "run_script",
@@ -100,11 +95,6 @@ def main() -> int:
         "action",
         choices=sorted(ALLOWED_ACTIONS),
         help="The action type to request.",
-    )
-    parser.add_argument(
-        "--reason",
-        default="",
-        help="Reason for the request (used by restart_responder).",
     )
     parser.add_argument(
         "--message",
@@ -178,8 +168,6 @@ def main() -> int:
     if args.from_issue is not None:
         entry["from_issue"] = args.from_issue
 
-    if args.reason:
-        entry["reason"] = args.reason
     if args.message:
         entry["message"] = args.message
     if args.module:

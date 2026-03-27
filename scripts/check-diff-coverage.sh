@@ -10,7 +10,7 @@
 #   scripts/check-diff-coverage.sh <package> --skip-tests  # skip pytest, use existing coverage.xml
 #
 # The <package> argument is the directory name inside packages/ (e.g. scraper-framework,
-# nlp-pipeline, telegram-bridge) or a path like infra/telegram-bot for infra packages.
+# nlp-pipeline) or a path for infra packages.
 #
 # Exit codes:
 #   0 — Diff coverage >= 90%.

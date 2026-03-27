@@ -121,9 +121,6 @@ The `nlp-pipeline` package (`packages/nlp-pipeline/`) contains modules for class
   - Vector embedding generation (stored in Qdrant for semantic search)
   - Version classification for revised documents (substantive vs. cosmetic)
 
-## Telegram Bridge (telegram-bridge) -- Operational Tooling
-
-The `telegram-bridge` package is not part of the data pipeline. It provides bidirectional communication between dispatcher agents and the maintainer via Telegram for operational notifications and commands. Fully opt-in.
 
 ## Reingestion
 

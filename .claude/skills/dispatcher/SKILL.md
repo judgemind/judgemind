@@ -21,34 +21,9 @@ Enable dispatcher mode for the current interactive session. This transforms the 
 
 ## Startup
 
-### 1. Telegram setup (if configured)
+### 1. Telegram notification (if configured)
 
-Initialize the Telegram bridge and start the responder daemon using the Bash tool with `run_in_background: true`:
-
-```
-Bash(command="scripts/run-py.sh scripts/tg-responder.py", run_in_background=true)
-```
-
-**NEVER use shell `&`, `nohup`, or multicommand patterns to background the responder.** The Bash tool's `run_in_background` parameter is the only supported way. Shell backgrounding requires compound commands that cannot be allowlisted and always trigger permission prompts.
-
-Send a `session_started` notification (this one runs synchronously — it exits immediately):
-
-```
-scripts/run-py.sh scripts/tg-notify.py session_started
-```
-
-If Telegram is not configured, both commands exit silently (exit 0) — all bridge calls are no-ops when unconfigured.
-
-
-### 1b. Prune stale local state files
-
-Local state files (`tmp/dispatcher_state.json`, `tmp/dispatcher_status.json`, `tmp/stop_requests.json`) accumulate stale entries across sessions. Prune them once at startup, **before any `tg-notify.py` lifecycle calls** (which load the state file and could write stale workers back to the status file).
-
-```
-scripts/run-py.sh scripts/tg-notify.py prune_state
-```
-
-This clears stale workers from `dispatcher_state.json`, resets `active_agents` in `dispatcher_status.json`, and truncates `stop_requests.json` to `[]`. Counters like `prs_since_last_audit` and `session_number` are preserved across sessions.
+If Telegram is available (the MCP Telegram plugin is active and a chat_id is known), send a session started notification using `telegram__reply`. If no chat_id is available yet, skip — the user will see notifications once they send a message.
 
 ### 2. Clean up stale issue assignments
 
@@ -81,10 +56,7 @@ When a previous dispatcher or agent session ends unexpectedly (context window ex
 
 5. Log each cleanup action. For example: `Cleaned up stale assignment: #107 "Fix OC scraper date parsing" (no open PR — unassigned)`
 
-6. After processing all stale issues, send a summary notification if any were cleaned up:
-   ```
-   scripts/run-py.sh scripts/tg-notify.py notify "Cleaned up N stale issue assignments: #X, #Y, #Z"
-   ```
+6. If Telegram is available and any stale assignments were cleaned up, send a summary notification via `telegram__reply`.
 
 **Edge cases:**
 - An issue has an open PR but CI is failing and no agent is working it — still unassign so a fresh agent can pick it up and adopt the PR.
@@ -120,13 +92,13 @@ Handle any in-flight PRs before launching new work (see "PR Merge Policy" below)
 
 ### 5. Initialize audit counter
 
-Read `tmp/dispatcher_status.json` to recover the `prs_since_last_audit` counter from a previous session. If the file does not exist or the field is missing, initialize the counter to 0.
+Read `tmp/dispatcher_state.json` to recover the `prs_since_last_audit` counter from a previous session. If the file does not exist or the field is missing, initialize the counter to 0.
 
 ### 6. Initialize context rotation counter
 
 Initialize `loop_iterations` to 0. This counter tracks how many main loop iterations have elapsed in this session. It is used to trigger a graceful exit before the context window fills up and causes compaction-related forgetfulness (see "Context-Aware Rotation" below).
 
-Also read `session_number` from `tmp/dispatcher_status.json` (default to 0 if missing). Increment it by 1 and persist it back — this tracks how many times the dispatcher has been restarted by the outer `while :; do` loop. The first invocation is session 1.
+Also read `session_number` from `tmp/dispatcher_state.json` (default to 0 if missing). Increment it by 1 and persist it back — this tracks how many times the dispatcher has been restarted by the outer `while :; do` loop. The first invocation is session 1.
 
 ### 7. Store max_slots for enforcement
 
@@ -138,7 +110,7 @@ Store the max slot count (from the argument, or 5 if not specified) in a variabl
 
 The dispatcher runs a continuous loop:
 
-1. **Refresh state** — check Telegram inbox, stop requests, and pause state
+1. **Refresh state** — check for Telegram messages and dispatcher inbox
 2. **Process dispatcher inbox** — read and execute subagent instructions (see "Subagent Instruction Channel" below)
 3. **Handle in-flight PRs** — merge any that are ready, fix any that are failing
 4. **Sync after merges** — pull latest main after each merge (see "Post-merge sync" in Rules)
@@ -210,20 +182,12 @@ as a background subagent. Before spawning each agent:
 
 1. **Re-count active agents** — do not rely on a count from a previous loop iteration. Count NOW.
 2. If `active_agent_count >= max_slots`: stop spawning. Do not spawn this agent or any more.
-3. Call `bridge.refresh_state()` to pick up external pause/resume changes
-4. Call `bridge.read_stop_requests()` to consume stop requests
-5. Call `bridge.read_dispatcher_inbox()` to process subagent instructions
-6. If `bridge.paused` is `True`, skip spawning
-7. If `bridge.is_issue_stopped(N)` is `True`, skip that issue
-8. Skip issues already being worked on by another slot
+3. Read `tmp/dispatcher_inbox.json` to process subagent instructions
+4. If the dispatcher is paused, skip spawning
+5. If the issue has been stopped, skip it
+6. Skip issues already being worked on by another slot
 
-**After spawning each agent**, send a `task_started` notification and update the status file:
-
-```
-scripts/run-py.sh scripts/tg-notify.py task_started <issue_number> "<title>" <agent_id>
-```
-
-This sends the Telegram message **and** updates `tmp/dispatcher_status.json` so the responder daemon has accurate context.
+**After spawning each agent**, send a `task_started` notification via `telegram__reply` (if Telegram is available).
 
 ### Filtering task notifications
 
@@ -232,7 +196,7 @@ Not all `<task-notification>` messages require dispatcher action. The platform f
 - **Respond to:** Agent completions — notifications where the `<summary>` starts with `"Agent"` (e.g. `"Agent for task #42 completed"`, `"Agent for task #42 failed"`). These represent `/task` or `/audit` subagent results that require slot bookkeeping, Telegram notification, and potential backfill.
 - **Ignore silently:** Background command completions — notifications where the `<summary>` starts with `"Background command"` (e.g. `"Background command completed"`, `"Background command failed"`). These are internal operations run by subagents (Gemini reviews, `gh run watch`, test suites, lint runs, etc.) and need no dispatcher action.
 
-**When a background command notification arrives, do nothing.** Do not acknowledge it, do not print a status message, do not send a Telegram notification. Simply continue the main loop. Responding to these creates noise in the conversation without adding value.
+**When a background command notification arrives, do nothing.** Do not acknowledge it, do not print a status message, simply continue the main loop. Responding to these creates noise in the conversation without adding value.
 
 ### Processing agent completions
 
@@ -240,17 +204,7 @@ When a `<task-notification>` arrives indicating an agent has completed:
 
 **Step 1 — Send Telegram notification:**
 
-**On success:**
-```
-scripts/run-py.sh scripts/tg-notify.py task_completed <issue_number> "<summary>" <worker_number>
-```
-
-**On failure:**
-```
-scripts/run-py.sh scripts/tg-notify.py task_failed <issue_number> "<error_summary>" <worker_number>
-```
-
-Both commands update the status file automatically. Always send a notification immediately when an agent completes or fails — do not batch them.
+Send a completion or failure notification via `telegram__reply` (if Telegram is available). Always send immediately when an agent completes or fails — do not batch them.
 
 **Step 2 — Clean up worktree and re-anchor cwd (MANDATORY):**
 
@@ -381,13 +335,9 @@ The threshold of 40 iterations is conservative — each iteration adds tool call
 3. **Continue processing Telegram commands.** Respond to `status`, `pause`, `resume`, `stop` commands as normal. For `start #N` commands, acknowledge receipt but note the dispatcher is about to restart and will pick it up in the next session.
 4. **Wait for all active agents to complete.** Check active agent count each iteration. Once all agents have finished (or reported back), proceed to exit.
 5. **Merge any remaining green PRs.** Do one final sweep.
-6. **Persist all state.** Ensure `tmp/dispatcher_status.json` and `tmp/dispatcher_state.json` are up to date with: `prs_since_last_audit`, `session_number`, paused state, stopped issues, and recently completed tasks.
-7. **Send a rotation notification:**
-   ```
-   scripts/run-py.sh scripts/tg-notify.py notify "Dispatcher rotating context (session N, M iterations). Restarting momentarily."
-   ```
-8. **Do NOT stop the responder daemon.** The outer loop will restart the dispatcher immediately, and the responder should keep running to avoid missing Telegram messages.
-9. **Do NOT send `session_ended`.** This is a rotation, not a shutdown. The next session will continue seamlessly.
+6. **Persist all state.** Ensure `tmp/dispatcher_state.json` is up to date with: `prs_since_last_audit`, `session_number`, paused state, stopped issues, and recently completed tasks.
+7. **Send a rotation notification** via `telegram__reply` (if Telegram is available): "Dispatcher rotating context (session N, M iterations). Restarting momentarily."
+8. **Do NOT send a session ended notification.** This is a rotation, not a shutdown. The next session will continue seamlessly.
 10. **Exit.** Print a summary of what was accomplished in this session, then stop. The outer `while :; do` loop will restart the dispatcher with a fresh context.
 
 ### State that persists across rotations
@@ -397,12 +347,9 @@ All of this state survives a rotation because it is file-backed:
 | State | File | Notes |
 |---|---|---|
 | Paused flag | `tmp/dispatcher_state.json` | New session reads on startup |
-| Active workers | `tmp/dispatcher_state.json` | Pruned on startup (step 1b); new session re-discovers running agents via worktree list + status files |
-| PRs since last audit | `tmp/dispatcher_status.json` | Counter continues from where it left off |
-| Session number | `tmp/dispatcher_status.json` | Incremented on each startup |
-| Stopped issues | `tmp/stop_requests.json` | Cleared on startup (step 1b); stop requests are session-scoped |
-| Responder daemon | PID file in `tmp/` | Keeps running across rotations |
-| Telegram inbox | `tmp/tg_inbox.json` | New session picks up unprocessed commands |
+| Active workers | `tmp/dispatcher_state.json` | New session re-discovers running agents via worktree list + status files |
+| PRs since last audit | `tmp/dispatcher_state.json` | Counter continues from where it left off |
+| Session number | `tmp/dispatcher_state.json` | Incremented on each startup |
 | Dispatcher checkpoint | `tmp/dispatcher_checkpoint.md` | Behavioral context for compaction recovery (see below) |
 
 ### State that does NOT persist (and that's OK)
@@ -410,8 +357,7 @@ All of this state survives a rotation because it is file-backed:
 | State | Why it's OK |
 |---|---|
 | `loop_iterations` counter | Resets to 0 — that's the point of rotation |
-| In-memory `_recently_completed` list | Status file has a snapshot; startup step 4 re-scans open PRs for current state |
-| Pending reply tracking | Responder daemon handles timeouts independently |
+| In-memory `_recently_completed` list | Startup step 4 re-scans open PRs for current state |
 
 ---
 
@@ -421,7 +367,7 @@ The dispatcher writes `tmp/dispatcher_checkpoint.md` at the end of every main lo
 
 ### Why a checkpoint file?
 
-The existing state files (`tmp/dispatcher_status.json`, `tmp/dispatcher_state.json`) track data: agent IDs, counters, pause flags. But they do not encode **what the dispatcher should be doing** — the behavioral rules that prevent degenerate patterns like sleep-and-poll loops, racing agents to merge, or burning context on redundant CI checks. After compaction, the LLM retains the data but loses the discipline. The checkpoint file closes that gap.
+The state file (`tmp/dispatcher_state.json`) tracks data: counters, pause flags. But they do not encode **what the dispatcher should be doing** — the behavioral rules that prevent degenerate patterns like sleep-and-poll loops, racing agents to merge, or burning context on redundant CI checks. After compaction, the LLM retains the data but loses the discipline. The checkpoint file closes that gap.
 
 ### Checkpoint format
 
@@ -457,7 +403,7 @@ The checkpoint is a Markdown file (human-readable, easy for the LLM to parse) wi
 - Process next task-notification -> cleanup worktree, re-anchor cwd, send Telegram, free slot
 - When slot opens -> fresh `gh issue list --label agent/ready` query, dispatch highest priority
 - If prs_since_last_audit >= 20 -> spawn /audit
-- Check Telegram inbox for user commands
+- Check for Telegram messages
 (adjust based on current state -- e.g., if winding down, note "waiting for agents to finish before exiting")
 ```
 
@@ -509,13 +455,13 @@ Read the "Do NOT" section of the checkpoint and **internalize every rule**. Thes
 - **Do NOT proactively check CI on agent PRs.** This burns context and API budget on redundant checks. Wait for task-notification events — they signal when an agent is done and its PR needs attention.
 - **Do NOT clean up worktrees proactively.** Only clean up after a specific agent completion notification confirms the agent is finished.
 - **Do NOT run code changes on main.** All code changes are delegated to `/task` subagents.
-- **Do NOT block on long-running operations.** Stay responsive to Telegram commands and task-notification events.
+- **Do NOT block on long-running operations.** Stay responsive to Telegram messages and task-notification events.
 
 ### Resume the main loop
 
 After reading the checkpoint and reconstructing state:
 
-1. **Check Telegram inbox** — messages may have accumulated during compaction. Process any pending commands.
+1. **Check for Telegram messages** — messages may have arrived during compaction.
 2. **Do NOT re-scan PRs or merge anything immediately.** Wait for the next task-notification event to arrive before taking action on PRs. Agents that are still running will manage their own PRs.
 3. **Do NOT launch new agents immediately** unless slots are empty and no agents are running. If agents from the previous context are still active (worktrees exist), wait for their completions first.
 4. **Continue the main loop from step 1.** The checkpoint has restored enough context to resume normal operation.
@@ -534,17 +480,16 @@ If you suspect compaction has occurred mid-session, **read the checkpoint file i
 
 ## Subagent Instruction Channel
 
-Subagents can request actions from the dispatcher by writing to `tmp/dispatcher_inbox.json`. This is a file-based instruction channel similar to `tmp/tg_inbox.json` (Telegram inbox), but for subagent-to-dispatcher communication.
+Subagents can request actions from the dispatcher by writing to `tmp/dispatcher_inbox.json`. This is a file-based instruction channel for subagent-to-dispatcher communication.
 
 ### How subagents write instructions
 
 Subagents use `scripts/dispatcher-request.py` to append entries:
 
 ```
-scripts/dispatcher-request.py restart_responder --reason "telegram-bridge code updated" --from-issue 733
 scripts/dispatcher-request.py notify --message "Found regression in OC scraper" --from-issue 600
-scripts/dispatcher-request.py terraform_apply --module telegram-bot --from-issue 712
-scripts/dispatcher-request.py run_script --script scripts/tg-set-webhook.sh --from-issue 725
+scripts/dispatcher-request.py terraform_apply --module ingestion-worker --from-issue 712
+scripts/dispatcher-request.py run_script --script scripts/some-script.sh --from-issue 725
 scripts/dispatcher-request.py file_issue --title "Bug report" --description "Details..." --priority p1 --labels area/scraping
 ```
 
@@ -556,17 +501,16 @@ In the main loop (step 2), call `bridge.read_dispatcher_inbox()` which returns a
 
 | Action | How to handle |
 |---|---|
-| `restart_responder` | Run `scripts/tg-stop-responder.sh`, reinstall telegram-bridge deps, restart responder via `Bash(command="scripts/run-py.sh scripts/tg-responder.py", run_in_background=true)` — **never** use shell `&` |
 | `terraform_apply` | Run dev terraform apply for the specified module (see "Auto-apply dev terraform" below) |
-| `notify` | Send a Telegram notification via `scripts/run-py.sh scripts/tg-notify.py notify "<message>"` |
+| `notify` | Send a Telegram notification via `telegram__reply` |
 | `run_script` | Execute the specified script (validate it starts with `scripts/` for safety) |
 | `file_issue` | Create a GitHub issue with `gh issue create` using the provided title, description, priority, and labels |
 
 **Safety rules:**
-- Only the pre-defined action types in `InstructionKind` are accepted — unknown actions are logged and skipped
+- Only the pre-defined action types are accepted — unknown actions are logged and skipped
 - `run_script` must validate the script path starts with `scripts/` to prevent arbitrary command execution
 - Log all instructions and their outcomes
-- Send a Telegram notification confirming each instruction was processed
+- Send a Telegram notification confirming each instruction was processed (via `telegram__reply`)
 
 ### Inbox file format
 
@@ -574,13 +518,12 @@ In the main loop (step 2), call `bridge.read_dispatcher_inbox()` which returns a
 
 ```json
 [
-  {"action": "restart_responder", "reason": "code updated", "from_issue": 733, "timestamp": "..."},
-  {"action": "terraform_apply", "module": "telegram-bot", "from_issue": 712, "timestamp": "..."},
+  {"action": "terraform_apply", "module": "ingestion-worker", "from_issue": 712, "timestamp": "..."},
   {"action": "notify", "message": "Found a regression", "from_issue": 600, "timestamp": "..."}
 ]
 ```
 
-The file is atomically read and truncated by `read_dispatcher_inbox()`, just like `read_inbox()` and `read_stop_requests()`.
+The dispatcher reads and truncates this file at each main loop iteration.
 
 ---
 
@@ -612,7 +555,7 @@ The hook is designed for minimal overhead:
 
 Send a message to a running subagent when:
 - A PR just merged that touches the same files the agent is modifying (suggest a rebase)
-- A user sends a Telegram command relevant to a running agent's work
+- A user sends a Telegram message relevant to a running agent's work
 - An issue's priority or scope changes while an agent is working on it
 - The dispatcher is winding down for context rotation and wants agents to wrap up
 - A dependency was unblocked or a new constraint was discovered that affects the agent's task
@@ -653,15 +596,11 @@ gh pr merge <N> --repo judgemind/judgemind --squash --delete-branch
 
 After merging:
 - **Immediately sync to latest main** (see "Post-merge sync" in Rules below) — this must happen before spawning any new agents
-- **Send a Telegram notification:**
-  ```
-  scripts/run-py.sh scripts/tg-notify.py pr_merged <pr_number> "<pr_title>"
-  ```
+- **Send a Telegram notification** via `telegram__reply` (if Telegram is available)
 - Check if the merged PR triggers a deploy workflow (see CLAUDE.md "Verify deployment")
 - For deployed services, watch the deploy workflow to completion
-- **If PR touches `packages/telegram-bridge/` or `scripts/tg-responder.py`** — restart the responder daemon (see "Auto-restart responder daemon" below)
 - **If PR touches `infra/terraform/`** — run dev terraform apply (see "Auto-apply dev terraform" below)
-- **Increment `prs_since_last_audit`** and persist it to `tmp/dispatcher_status.json`. When the counter reaches 20, the next main loop iteration will trigger an audit (see "Periodic Audit" below).
+- **Increment `prs_since_last_audit`** and persist it to `tmp/dispatcher_state.json`. When the counter reaches 20, the next main loop iteration will trigger an audit (see "Periodic Audit" below).
 
 **Do not merge PRs from external contributors or PRs you did not create** unless the user explicitly asks.
 
@@ -670,33 +609,15 @@ After merging:
 If a PR's CI is failing:
 - Check if the failure is in a check the agent could fix (lint, test, type error)
 - If so, the `/task` agent should already be handling it — check its status file
-- If the agent has exited and CI is still failing, log it and notify via Telegram:
-  ```
-  scripts/run-py.sh scripts/tg-notify.py notify "CI still failing on PR #<N> after agent exited — needs attention"
-  ```
+- If the agent has exited and CI is still failing, log it and notify via `telegram__reply`: "CI still failing on PR #<N> after agent exited — needs attention"
 - Do not attempt to fix another agent's PR from the dispatcher — spawn a new `/task` for it if needed
 
 ### Handling merge conflicts
 
 If a PR has merge conflicts:
 - The owning `/task` agent should handle rebasing
-- If the agent has exited, log it and notify via Telegram:
-  ```
-  scripts/run-py.sh scripts/tg-notify.py notify "PR #<N> has merge conflicts and agent has exited — needs attention"
-  ```
+- If the agent has exited, log it and notify via `telegram__reply`: "PR #<N> has merge conflicts and agent has exited — needs attention"
 - The dispatcher does not rebase other agents' branches
-
-### Auto-restart responder daemon
-
-When a merged PR modifies the responder code (`packages/telegram-bridge/` or `scripts/tg-responder.py`), restart the daemon to pick up the changes. This is quick and runs inline (not delegated to a subagent):
-
-1. Run `scripts/tg-stop-responder.sh` (sends SIGTERM, waits for exit, cleans up PID/stop files)
-2. Reinstall telegram-bridge deps if needed
-3. Launch the responder using the Bash tool with `run_in_background: true`: `Bash(command="scripts/run-py.sh scripts/tg-responder.py", run_in_background=true)`. **NEVER use shell `&` or multicommand patterns.**
-4. Verify new PID file exists
-5. Send Telegram notification: "Responder daemon restarted after PR #N merged"
-
-If the restart fails, file a p1 issue and notify via Telegram.
 
 ### Auto-apply dev terraform
 
@@ -761,18 +682,12 @@ For each environment that needs an apply:
 #### Success handling
 
 After a successful apply:
-- Send a Telegram notification with the environment and a brief summary:
-  ```
-  scripts/run-py.sh scripts/tg-notify.py notify "Terraform apply succeeded for dev after PR #<N> merged"
-  ```
+- Send a Telegram notification via `telegram__reply`: "Terraform apply succeeded for dev after PR #<N> merged"
 
 #### Failure handling
 
 If the apply fails:
-1. Send a Telegram notification immediately:
-   ```
-   scripts/run-py.sh scripts/tg-notify.py notify "Terraform apply FAILED for dev after PR #<N> — filing p1 issue"
-   ```
+1. Send a Telegram notification via `telegram__reply`: "Terraform apply FAILED for dev after PR #<N> — filing p1 issue"
 2. File a `priority/p1` issue describing the failure, referencing the merged PR, with `agent/ready` label so an agent can investigate.
 3. Do not retry automatically — the filed issue will be picked up by an agent.
 
@@ -791,7 +706,7 @@ The dispatcher triggers a codebase health audit every 20 merged PRs using the `/
 
 ### Counter management
 
-- Track `prs_since_last_audit` as an integer counter, persisted in `tmp/dispatcher_status.json`.
+- Track `prs_since_last_audit` as an integer counter, persisted in `tmp/dispatcher_state.json`.
 - After each PR merge, increment the counter by 1.
 - On startup, read the counter from the status file (default to 0 if missing).
 - The counter persists across dispatcher restarts via the status file.
@@ -803,11 +718,8 @@ In the main loop (step 5), after handling merges and syncing:
 1. Check if `prs_since_last_audit >= 20`.
 2. Check that no `/audit` agent is already running (avoid overlapping audits).
 3. If both conditions are met and a slot is available, spawn `/audit` as a background subagent.
-4. Reset `prs_since_last_audit` to 0 and persist to `tmp/dispatcher_status.json`.
-5. Send a Telegram notification:
-   ```
-   scripts/run-py.sh scripts/tg-notify.py notify "Launching periodic audit (20 PRs merged since last audit)"
-   ```
+4. Reset `prs_since_last_audit` to 0 and persist to `tmp/dispatcher_state.json`.
+5. Send a Telegram notification via `telegram__reply`: "Launching periodic audit (20 PRs merged since last audit)"
 
 ### Slot usage
 
@@ -845,39 +757,19 @@ The dispatcher proactively manages issues:
 
 ## Telegram Communication
 
-### Notification script
+Telegram integration uses the MCP Telegram plugin, which delivers messages directly into the conversation as `<channel source="telegram" ...>` tags and provides `telegram__reply` for sending messages.
 
-All outbound Telegram notifications MUST use the committed script `scripts/run-py.sh scripts/tg-notify.py`. This script wraps the `telegram_bridge` package and handles:
+### Outbound notifications
 
-- Sending the Telegram message via the bot API
-- Updating `tmp/dispatcher_status.json` so the responder daemon has accurate context
-- Persisting worker state to `tmp/dispatcher_state.json`
-- Exiting silently (exit 0) when Telegram is not configured
-
-**Available commands:**
-
-| Command | Arguments | When to use |
-|---|---|---|
-| `scripts/run-py.sh scripts/tg-notify.py session_started` | (none) | Dispatcher startup |
-| `scripts/run-py.sh scripts/tg-notify.py session_ended` | (none) | Dispatcher shutdown |
-| `scripts/run-py.sh scripts/tg-notify.py task_started` | `<issue> <title> <worker>` | After spawning a `/task` agent |
-| `scripts/run-py.sh scripts/tg-notify.py task_completed` | `<issue> <summary> <worker>` | Agent completed successfully |
-| `scripts/run-py.sh scripts/tg-notify.py task_failed` | `<issue> <error> <worker>` | Agent failed |
-| `scripts/run-py.sh scripts/tg-notify.py pr_merged` | `<pr_number> <title>` | After squash-merging a PR |
-| `scripts/run-py.sh scripts/tg-notify.py notify` | `<message>` | Free-form notification (blockers, CI issues, deploy status) |
-| `scripts/run-py.sh scripts/tg-notify.py prune_state` | (none) | Dispatcher startup (step 1b) — clears stale workers and stop requests |
-
-**IMPORTANT:** Always call `scripts/run-py.sh scripts/tg-notify.py` after every lifecycle event. Do not rely on remembering to send notifications manually — the script handles both the Telegram message and the status file update atomically. If you skip the notification, the responder daemon will have stale status and give incorrect answers to user queries.
-
-### Outbound notification checklist
+Use `telegram__reply` (with the `chat_id` from the most recent inbound Telegram message) to send notifications. If no Telegram messages have been received in this session, skip notifications — the user is not monitoring via Telegram.
 
 Send a notification for **every** lifecycle event:
 
 - [ ] **Session started** — at dispatcher startup
 - [ ] **Stale assignments cleaned** — after startup cleanup (if any were found)
-- [ ] **Agent launched** — after each `/task #N` spawn (include issue number, title, worker number)
-- [ ] **Agent completed** — when `<task-notification>` reports success (include issue number, summary, worker number)
-- [ ] **Agent failed** — when `<task-notification>` reports failure (include issue number, error, worker number)
+- [ ] **Agent launched** — after each `/task #N` spawn (include issue number, title, agent ID)
+- [ ] **Agent completed** — when `<task-notification>` reports success (include issue number, summary)
+- [ ] **Agent failed** — when `<task-notification>` reports failure (include issue number, error)
 - [ ] **PR merged** — after each `gh pr merge` (include PR number and title)
 - [ ] **Deploy succeeded/failed** — after watching deploy workflow
 - [ ] **Terraform apply succeeded/failed** — after applying dev terraform for infra PRs
@@ -888,39 +780,32 @@ Send a notification for **every** lifecycle event:
 
 ### Inbound commands
 
-Process commands from the Telegram inbox and responder daemon:
+Telegram messages arrive as `<channel source="telegram" chat_id="..." message_id="..." user="..." ts="...">` tags. The dispatcher interprets them directly (it IS the LLM) and responds via `telegram__reply`.
 
 | Command | Action |
 |---|---|
-| `status` | Handled by responder daemon directly |
+| `status` | Reply with a summary of running agents, open PRs, and queue |
 | `start #N` | Spawn `/task #N` in the next available slot |
 | `start audit` | Spawn `/audit` immediately, reset `prs_since_last_audit` to 0 |
 | `stop #N` | Stop spawning work for issue #N; if an agent is working on it, let it finish |
 | `pause` | Stop launching new agents; existing agents continue |
 | `resume` | Resume launching new agents |
-| `file_issue` | Create a GitHub issue from the user's description; confirm with issue URL via Telegram |
-| `discuss` | User wants to discuss something requiring codebase context; formulate a response using file access, code reading, etc. and reply via Telegram |
-| `do` | User wants an action performed (merge PR, check CI, etc.); execute the instruction and confirm via Telegram |
-| Free text | Interpret and reply via Telegram — check `result["needs_reply"]` |
+| Free text | Interpret the message and respond appropriately — the user may be asking questions, requesting actions, or providing context |
 
-The `file_issue`, `discuss`, and `do` commands are classified by the Opus interpreter in the responder daemon and written to the inbox as structured entries with an `action` key. The dispatcher reads these via `bridge.read_inbox()` which returns `Command` objects with the appropriate `CommandKind`. Each command's result dict includes the metadata needed to act on it:
+### State file
 
-- **`file_issue`**: `result["description"]`, `result["priority"]`, `result["labels"]`, `result["reply_to"]`
-- **`discuss`**: `result["message"]`, `result["reply_to"]`, `result["needs_reply"]`
-- **`do`**: `result["instruction"]`, `result["reply_to"]`, `result["needs_reply"]`
+The dispatcher maintains `tmp/dispatcher_state.json` for cross-rotation persistence:
 
-### State file integration
+```json
+{
+  "prs_since_last_audit": 15,
+  "session_number": 3,
+  "paused": false,
+  "stopped_issues": [42, 57]
+}
+```
 
-The responder daemon communicates via shared state files (see CLAUDE.md "Responder daemon and state files"):
-
-- Read `tmp/dispatcher_state.json` for pause/resume state
-- Read `tmp/stop_requests.json` for stop requests
-- Read `tmp/tg_inbox.json` for queued commands (start, file_issue, discuss, do, and free text)
-- Read `tmp/dispatcher_inbox.json` for subagent instructions (restart_responder, terraform_apply, notify, run_script, file_issue)
-
-**The dispatcher MUST update `tmp/dispatcher_status.json` after every state change.** The `scripts/run-py.sh scripts/tg-notify.py` script does this automatically for lifecycle events (`task_started`, `task_completed`, `task_failed`, `pr_merged`). For other state changes (pause, resume, slot changes), call `bridge.write_status()` directly or use `scripts/run-py.sh scripts/tg-notify.py notify` to trigger a status file update.
-
-The `tmp/dispatcher_status.json` file includes the `prs_since_last_audit` counter and `session_number` alongside the existing fields (`active_agents`, `open_prs`, `recently_completed`, `queue`, `paused`, `stopped_issues`, `updated_at`).
+Read this file on startup to recover counters and pause state. Write it after every state change. The `prs_since_last_audit` and `session_number` counters persist across rotations; `stopped_issues` are session-scoped and should be cleared on startup.
 
 ---
 
@@ -936,12 +821,8 @@ Shutdown triggers:
 1. Stop launching new agents
 2. Wait for all active agents to complete (do not kill them)
 3. Merge any remaining green PRs
-4. Send `session_ended` Telegram notification:
-   ```
-   scripts/run-py.sh scripts/tg-notify.py session_ended
-   ```
-5. Stop the responder daemon (`scripts/tg-stop-responder.sh`)
-6. Print a summary of what was accomplished:
+4. Send a session ended notification via `telegram__reply` (if Telegram is available)
+5. Print a summary of what was accomplished:
    - Issues completed
    - PRs merged
    - Issues filed
@@ -950,9 +831,8 @@ Shutdown triggers:
 ### Context rotation procedure (automatic)
 
 See "Context-Aware Rotation" above for the detailed wind-down steps. Key differences from full shutdown:
-- **Do NOT stop the responder daemon** — it keeps running for the next session
-- **Do NOT send `session_ended`** — this is a rotation, not an end
-- **DO send a rotation notification** via `scripts/run-py.sh scripts/tg-notify.py notify`
+- **Do NOT send a session ended notification** — this is a rotation, not an end
+- **DO send a rotation notification** via `telegram__reply`
 - **DO persist all state** to `tmp/` files so the next session picks up seamlessly
 
 ---
@@ -961,11 +841,11 @@ See "Context-Aware Rotation" above for the detailed wind-down steps. Key differe
 
 ### Responsiveness — the dispatcher's primary constraint
 
-The dispatcher must stay responsive to user interaction and Telegram commands at all times. A blocked dispatcher cannot process pause/resume commands, dispatch new work, merge PRs, or reply to Telegram messages.
+The dispatcher must stay responsive to user interaction and Telegram commands at all times. A blocked dispatcher cannot process commands, dispatch new work, merge PRs, or reply to Telegram messages.
 
 - **Never do long-running work in the main agent — delegate to subagents.** "Long-running" means anything that might take more than ~10 seconds: code changes, investigations, deep codebase exploration, issue body rewrites, running tests, large file analysis, or multi-step research.
 - **The dispatcher's job is: read messages, make quick decisions, dispatch work, send updates.** It is a dispatcher, not an implementer.
-- **Allowed in the main agent:** `gh` CLI calls, quick file reads, Telegram sends, short status checks, writing issue comments, updating labels, spawning subagents, terraform apply for dev environments.
+- **Allowed in the main agent:** `gh` CLI calls, quick file reads, `telegram__reply` sends, short status checks, writing issue comments, updating labels, spawning subagents, terraform apply for dev environments.
 - **Everything else = spawn a subagent.** If you are unsure whether something is "quick enough," it is not — delegate it.
 - **Never block on a single long operation.** If a `gh run watch` or similar command could take minutes, run it in a way that does not prevent processing other events in the main loop. Prefer polling with short timeouts over blocking waits.
 
@@ -996,5 +876,5 @@ Do this **immediately** after every `gh pr merge` call, before spawning new agen
 - **Never set `priority/p0`.** That priority is reserved for humans.
 - **Merge your own agents' PRs** when CI is green and ralph has approved.
 - **File issues proactively** for discovered problems — don't just observe them.
-- **Notify via Telegram** for all significant events, not just when asked. Use `scripts/run-py.sh scripts/tg-notify.py` for every lifecycle event.
+- **Notify via Telegram** for all significant events, not just when asked. Use `telegram__reply` for every lifecycle event.
 - **Default to action.** If a decision is clear and reversible, make it. Only ask for irreversible or ambiguous decisions.
