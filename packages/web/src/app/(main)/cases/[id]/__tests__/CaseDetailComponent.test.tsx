@@ -14,6 +14,16 @@ vi.mock('next/link', () => ({
   ),
 }));
 
+// Mock lucide-react icons
+vi.mock('lucide-react', () => ({
+  AlertCircle: ({ className }: { className?: string }) => (
+    <span data-testid="alert-circle-icon" className={className} />
+  ),
+  ChevronDown: ({ className }: { className?: string }) => (
+    <span data-testid="chevron-down-icon" className={className} aria-hidden="true" />
+  ),
+}));
+
 // ---------------------------------------------------------------------------
 // GraphQL queries (must match the component's queries exactly)
 // ---------------------------------------------------------------------------
@@ -702,7 +712,7 @@ describe('CaseDetail — View original document iframe', () => {
     fetchSpy.mockRestore();
   });
 
-  it('shows error message when document content fetch fails', async () => {
+  it('shows error message when document content fetch fails with soft styling', async () => {
     const node = buildRulingNode({
       documentId: 'doc-html-1',
       documentFormat: 'html',
@@ -716,7 +726,7 @@ describe('CaseDetail — View original document iframe', () => {
       }),
     );
 
-    renderWithProvider(mocks);
+    const { container } = renderWithProvider(mocks);
 
     // Expand the ruling
     await expandRuling(/Ruling from/);
@@ -731,10 +741,19 @@ describe('CaseDetail — View original document iframe', () => {
 
     expect(screen.getByTestId('viewer-error-ruling-1')).toHaveTextContent('Document not found');
 
+    // Should NOT use destructive styling
+    expect(container.querySelector('.text-destructive')).not.toBeInTheDocument();
+
+    // Should use soft styling with text-red-700
+    expect(container.querySelector('.text-red-700')).toBeInTheDocument();
+
+    // Should have a Try again action
+    expect(screen.getByText('Try again')).toBeInTheDocument();
+
     fetchSpy.mockRestore();
   });
 
-  it('shows error message on network failure', async () => {
+  it('shows error message on network failure with soft styling', async () => {
     const node = buildRulingNode({
       documentId: 'doc-html-1',
       documentFormat: 'html',
@@ -745,7 +764,7 @@ describe('CaseDetail — View original document iframe', () => {
       new Error('Network error'),
     );
 
-    renderWithProvider(mocks);
+    const { container } = renderWithProvider(mocks);
 
     // Expand the ruling
     await expandRuling(/Ruling from/);
@@ -759,6 +778,15 @@ describe('CaseDetail — View original document iframe', () => {
     });
 
     expect(screen.getByTestId('viewer-error-ruling-1')).toHaveTextContent('Failed to load document. Please try again.');
+
+    // Should NOT use destructive styling
+    expect(container.querySelector('.text-destructive')).not.toBeInTheDocument();
+
+    // Should use soft styling with text-red-700
+    expect(container.querySelector('.text-red-700')).toBeInTheDocument();
+
+    // Should have a Try again action
+    expect(screen.getByText('Try again')).toBeInTheDocument();
 
     fetchSpy.mockRestore();
   });

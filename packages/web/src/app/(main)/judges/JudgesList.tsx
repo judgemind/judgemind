@@ -4,7 +4,7 @@ import { useState, useCallback, useEffect } from 'react';
 import { useQuery, gql } from '@apollo/client';
 import { useRouter, useSearchParams } from 'next/navigation';
 import Link from 'next/link';
-import { Search } from 'lucide-react';
+import { AlertCircle, Search } from 'lucide-react';
 import { InfiniteScrollTrigger } from '@/components/InfiniteScrollTrigger';
 import { useInfiniteScroll } from '@/hooks/useInfiniteScroll';
 import { Input } from '@/components/ui/input';
@@ -170,9 +170,19 @@ export function JudgesList() {
             {error && (
               <TableRow>
                 <TableCell colSpan={2} className="text-center">
-                  <p className="py-4 text-sm text-destructive">
-                    Failed to load judges. Please try again.
-                  </p>
+                  <div className="flex flex-col items-center justify-center py-6">
+                    <AlertCircle className="mb-3 h-8 w-8 text-red-700/70" aria-hidden="true" />
+                    <p className="text-sm text-red-700">
+                      Failed to load judges.
+                    </p>
+                    <button
+                      type="button"
+                      onClick={() => window.location.reload()}
+                      className="mt-3 text-sm font-medium text-muted-foreground underline underline-offset-2 hover:text-foreground"
+                    >
+                      Try again
+                    </button>
+                  </div>
                 </TableCell>
               </TableRow>
             )}

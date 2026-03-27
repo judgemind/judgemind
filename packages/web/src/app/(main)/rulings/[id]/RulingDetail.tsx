@@ -1,6 +1,7 @@
 'use client';
 
 import { useState, useCallback, useRef } from 'react';
+import { AlertCircle } from 'lucide-react';
 import { buildDocumentContentUrl, buildDownloadUrl, cleanRulingText, cleanSummary, FORMAT_LABELS, stripMetadataHeaderHtml, type RulingMetadata } from '@/lib/display-helpers';
 import { SECTION_HEADING } from '@/lib/typography';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
@@ -178,9 +179,19 @@ export function RulingDetail({ ruling, sanitizedRulingTextHtml }: RulingProps) {
           {/* Error state */}
           {viewerState.status === 'error' && (
             <CardContent className="border-t pt-4">
-              <p className="text-sm text-destructive" data-testid="viewer-error">
-                {viewerState.message}
-              </p>
+              <div className="flex items-center gap-2" data-testid="viewer-error">
+                <AlertCircle className="h-4 w-4 shrink-0 text-red-700/70" aria-hidden="true" />
+                <p className="text-sm text-red-700">
+                  {viewerState.message}
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={handleViewOriginal}
+                className="mt-2 text-sm font-medium text-muted-foreground underline underline-offset-2 hover:text-foreground"
+              >
+                Try again
+              </button>
             </CardContent>
           )}
 
@@ -260,9 +271,21 @@ export function RulingDetail({ ruling, sanitizedRulingTextHtml }: RulingProps) {
 
           {/* Error state — standalone */}
           {viewerState.status === 'error' && (
-            <p className="mt-4 text-sm text-destructive" data-testid="viewer-error">
-              {viewerState.message}
-            </p>
+            <div className="mt-4" data-testid="viewer-error">
+              <div className="flex items-center gap-2">
+                <AlertCircle className="h-4 w-4 shrink-0 text-red-700/70" aria-hidden="true" />
+                <p className="text-sm text-red-700">
+                  {viewerState.message}
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={handleViewOriginal}
+                className="mt-2 text-sm font-medium text-muted-foreground underline underline-offset-2 hover:text-foreground"
+              >
+                Try again
+              </button>
+            </div>
           )}
         </section>
       )}

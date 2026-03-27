@@ -34,6 +34,9 @@ vi.mock('next/link', () => ({
 
 // Mock lucide-react icons
 vi.mock('lucide-react', () => ({
+  AlertCircle: ({ className }: { className?: string }) => (
+    <span data-testid="alert-circle-icon" className={className} />
+  ),
   Search: ({ className }: { className?: string }) => (
     <span data-testid="search-icon" className={className} />
   ),
@@ -123,7 +126,7 @@ describe('JudgesList', () => {
     expect(skeletons.length).toBeGreaterThan(0);
   });
 
-  it('renders error state', () => {
+  it('renders error state with soft styling', () => {
     mockUseQuery.mockReturnValue({
       data: undefined,
       loading: false,
@@ -131,8 +134,20 @@ describe('JudgesList', () => {
       fetchMore: vi.fn(),
     });
 
-    render(<JudgesList />);
+    const { container } = render(<JudgesList />);
     expect(screen.getByText(/Failed to load judges/)).toBeInTheDocument();
+
+    // Should NOT use destructive styling
+    expect(container.querySelector('.text-destructive')).not.toBeInTheDocument();
+
+    // Should use soft styling with text-red-700
+    expect(container.querySelector('.text-red-700')).toBeInTheDocument();
+
+    // Should have AlertCircle icon
+    expect(screen.getByTestId('alert-circle-icon')).toBeInTheDocument();
+
+    // Should have a Try again action
+    expect(screen.getByText('Try again')).toBeInTheDocument();
   });
 
   it('renders empty state when no judges found', () => {

@@ -5,6 +5,13 @@ import { sanitizeRulingHtml } from '@/lib/sanitize-html';
 
 // next/link mock removed — RulingDetail no longer uses Link (#1515)
 
+// Mock lucide-react icons
+vi.mock('lucide-react', () => ({
+  AlertCircle: ({ className }: { className?: string }) => (
+    <span data-testid="alert-circle-icon" className={className} />
+  ),
+}));
+
 // ---------------------------------------------------------------------------
 // Test data factories
 // ---------------------------------------------------------------------------
@@ -490,7 +497,7 @@ describe('RulingDetail', () => {
     fetchSpy.mockRestore();
   });
 
-  it('shows error message when document content fetch fails', async () => {
+  it('shows error message when document content fetch fails with soft styling', async () => {
     const ruling = buildFullRuling();
     ruling.documentFormat = 'html';
 
@@ -501,7 +508,7 @@ describe('RulingDetail', () => {
       }),
     );
 
-    render(<RulingDetail ruling={ruling} />);
+    const { container } = render(<RulingDetail ruling={ruling} />);
 
     fireEvent.click(screen.getByTestId('view-original-button'));
 
@@ -511,10 +518,22 @@ describe('RulingDetail', () => {
 
     expect(screen.getByTestId('viewer-error')).toHaveTextContent('Document not found');
 
+    // Should NOT use destructive styling
+    expect(container.querySelector('.text-destructive')).not.toBeInTheDocument();
+
+    // Should use soft styling with text-red-700
+    expect(container.querySelector('.text-red-700')).toBeInTheDocument();
+
+    // Should have AlertCircle icon
+    expect(screen.getByTestId('alert-circle-icon')).toBeInTheDocument();
+
+    // Should have a Try again action
+    expect(screen.getByText('Try again')).toBeInTheDocument();
+
     fetchSpy.mockRestore();
   });
 
-  it('shows error message on network failure', async () => {
+  it('shows error message on network failure with soft styling', async () => {
     const ruling = buildFullRuling();
     ruling.documentFormat = 'html';
 
@@ -522,7 +541,7 @@ describe('RulingDetail', () => {
       new Error('Network error'),
     );
 
-    render(<RulingDetail ruling={ruling} />);
+    const { container } = render(<RulingDetail ruling={ruling} />);
 
     fireEvent.click(screen.getByTestId('view-original-button'));
 
@@ -531,6 +550,18 @@ describe('RulingDetail', () => {
     });
 
     expect(screen.getByTestId('viewer-error')).toHaveTextContent('Failed to load document. Please try again.');
+
+    // Should NOT use destructive styling
+    expect(container.querySelector('.text-destructive')).not.toBeInTheDocument();
+
+    // Should use soft styling with text-red-700
+    expect(container.querySelector('.text-red-700')).toBeInTheDocument();
+
+    // Should have AlertCircle icon
+    expect(screen.getByTestId('alert-circle-icon')).toBeInTheDocument();
+
+    // Should have a Try again action
+    expect(screen.getByText('Try again')).toBeInTheDocument();
 
     fetchSpy.mockRestore();
   });
