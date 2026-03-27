@@ -215,7 +215,7 @@ describe('CaseDetail — parties header layout', () => {
     expect(screen.getByText('Jones')).toBeInTheDocument();
 
     // Parties header should exist (data-testid)
-    expect(container.querySelector('[data-testid="parties-header"]')).toBeInTheDocument();
+    expect(container.querySelector('[data-testid="parties-section"]')).toBeInTheDocument();
     // Old sidebar should NOT exist
     expect(container.querySelector('[data-testid="parties-sidebar"]')).not.toBeInTheDocument();
   });
@@ -260,7 +260,7 @@ describe('CaseDetail — parties header layout', () => {
     await screen.findByText('Rulings', {}, { timeout: 3000 });
 
     // Parties header should not exist since there are no parties or filed date
-    expect(container.querySelector('[data-testid="parties-header"]')).not.toBeInTheDocument();
+    expect(container.querySelector('[data-testid="parties-section"]')).not.toBeInTheDocument();
   });
 
   it('renders parties only once (no mobile/desktop duplication)', async () => {

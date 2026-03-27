@@ -10,15 +10,15 @@ import {
   FORMAT_LABELS,
   formatDate,
   formatLabel,
-  groupParties,
   stripMetadataHeaderHtml,
   type RulingMetadata,
 } from '@/lib/display-helpers';
 import { InfiniteScrollTrigger } from '@/components/InfiniteScrollTrigger';
 import { useInfiniteScroll } from '@/hooks/useInfiniteScroll';
 import { OutcomeBadge } from '@/components/OutcomeBadge';
+import { PartiesSection } from '@/components/PartiesHeader';
 import { sanitizeRulingHtml } from '@/lib/sanitize-html';
-import { SECTION_HEADING, SECTION_LABEL } from '@/lib/typography';
+import { SECTION_HEADING } from '@/lib/typography';
 import { Badge } from '@/components/ui/badge';
 import { Card, CardContent } from '@/components/ui/card';
 import { Skeleton } from '@/components/ui/skeleton';
@@ -154,82 +154,6 @@ function SkeletonBlock() {
   );
 }
 
-function PartyList({
-  label,
-  parties,
-}: {
-  label: string;
-  parties: Array<{ id: string; canonicalName: string; partyType: string | null; role: string | null }>;
-}) {
-  return (
-    <div>
-      <h3 className={SECTION_LABEL}>
-        {label}
-      </h3>
-      {parties.length === 0 ? (
-        <p className="mt-1 text-sm text-muted-foreground">
-          None listed
-        </p>
-      ) : (
-        <ul className="mt-1 space-y-1">
-          {parties.map((party) => (
-            <li key={party.id} className="text-sm text-foreground">
-              {party.canonicalName}
-              {party.partyType && (
-                <span className="ml-2 text-xs text-muted-foreground">
-                  ({formatLabel(party.partyType)})
-                </span>
-              )}
-            </li>
-          ))}
-        </ul>
-      )}
-    </div>
-  );
-}
-
-/**
- * Parties header: displays plaintiffs, defendants, other parties, and filed date
- * in the case header area (above rulings), not in a sidebar.
- */
-function PartiesHeader({
-  plaintiffs,
-  defendants,
-  others,
-  filedAt,
-}: {
-  plaintiffs: Array<{ id: string; canonicalName: string; partyType: string | null; role: string | null }>;
-  defendants: Array<{ id: string; canonicalName: string; partyType: string | null; role: string | null }>;
-  others: Array<{ id: string; canonicalName: string; partyType: string | null; role: string | null }>;
-  filedAt: string | null;
-}) {
-  const hasParties = plaintiffs.length > 0 || defendants.length > 0 || others.length > 0;
-
-  if (!hasParties && !filedAt) return null;
-
-  return (
-    <div className="flex flex-wrap gap-x-8 gap-y-4" data-testid="parties-header">
-      {hasParties && (
-        <>
-          <PartyList label="Plaintiffs" parties={plaintiffs} />
-          <PartyList label="Defendants" parties={defendants} />
-          {others.length > 0 && (
-            <PartyList label="Other Parties" parties={others} />
-          )}
-        </>
-      )}
-      {filedAt && (
-        <div>
-          <h3 className={SECTION_LABEL}>Filed Date</h3>
-          <p className="mt-1 text-sm text-foreground">
-            {formatDate(filedAt)}
-          </p>
-        </div>
-      )}
-    </div>
-  );
-}
-
 export function CaseDetail({ caseId }: { caseId: string }) {
   const {
     data: caseData,
@@ -359,7 +283,6 @@ export function CaseDetail({ caseId }: { caseId: string }) {
     );
   }
 
-  const { plaintiffs, defendants, others } = groupParties(caseRecord.parties);
   const caseJudgeNames = new Set((caseRecord.judges ?? []).map((j) => j.canonicalName));
 
   const rulingsSection = (
@@ -563,10 +486,8 @@ export function CaseDetail({ caseId }: { caseId: string }) {
 
   return (
     <div className="space-y-6">
-      <PartiesHeader
-        plaintiffs={plaintiffs}
-        defendants={defendants}
-        others={others}
+      <PartiesSection
+        parties={caseRecord.parties}
         filedAt={caseRecord.filedAt}
       />
       {rulingsSection}
