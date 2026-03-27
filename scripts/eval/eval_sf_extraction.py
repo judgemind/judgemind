@@ -138,8 +138,8 @@ SF_SYSTEM_PROMPT = (
     "ONE ruling — use the primary case number from the caption.\n"
     "2. Extract the case number EXACTLY as printed (including hyphens).\n"
     "3. For case_title, use 'Petitioner v. Respondent' format.  "
-    "Convert ALL-CAPS names to title case (e.g., 'MICHAEL EDWARD GRAVES' "
-    "becomes 'Graves' for the short title).\n"
+    "Convert ALL-CAPS names to title case.  Use full names "
+    "(e.g., 'MICHAEL EDWARD GRAVES' becomes 'Michael Edward Graves').\n"
     "4. For ruling_text, include the COMPLETE ruling text — both "
     "Procedural History and Findings and Order sections.  Include ALL "
     "pages of the ruling.  Do NOT truncate or summarize.  Preserve the "
@@ -185,7 +185,7 @@ SF_SYSTEM_PROMPT = (
     '  "rulings": [\n'
     "    {\n"
     '      "extracted_case_number": "FPT-25-378624" or null,\n'
-    '      "extracted_case_title": "Graves v. Long" or null,\n'
+    '      "extracted_case_title": "Michael Edward Graves v. Ranjie Long" or null,\n'
     '      "case_type": "family" or null,\n'
     '      "outcome": "granted_in_part" or null,\n'
     '      "motion_type": "Request for Order for Change of Child Custody" or null,\n'

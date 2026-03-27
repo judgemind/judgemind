@@ -13,67 +13,67 @@
   "expected_cases": [
     {
       "case_number": "FPT-25-378624",
-      "case_title": "Graves v. Long",
+      "case_title": "Michael Edward Graves v. Ranjie Long",
       "motion_type": "Request for Order for Change of Child Custody",
       "outcome": "granted_in_part"
     },
     {
       "case_number": "FPT-25-378672",
-      "case_title": "Ramirez Hernandez v. Juarez Mejia",
+      "case_title": "Maria De Los Angeles Ramirez Hernandez v. Edilzar Fernando Juarez Mejia",
       "motion_type": "Request for Order: Child Custody, Visitation",
       "outcome": "granted_in_part"
     },
     {
       "case_number": "FMS-20-387302",
-      "case_title": "Ruiz v. Juarez III",
+      "case_title": "Christina Ann Ruiz v. Eduardo Jose Juarez III",
       "motion_type": "Request for Order for Change of Visitation",
       "outcome": "granted_in_part"
     },
     {
       "case_number": "FDI-14-781786",
-      "case_title": "Propp v. Childers",
+      "case_title": "James Propp v. Denise Childers",
       "motion_type": "Request for Order: Bifurcation",
       "outcome": "continued"
     },
     {
       "case_number": "FDI-16-786194",
-      "case_title": "Huang v. Yang",
+      "case_title": "Anita Yuan Yun Huang v. Wen Hua Yang",
       "motion_type": "Request for Order: Enforcement of Judgment",
       "outcome": "other"
     },
     {
       "case_number": "FDI-17-787957",
-      "case_title": "Peck v. Peck",
+      "case_title": "Kristin S. Peck v. Simon E. Peck",
       "motion_type": "Request for Order for Change of Child Custody, Visitation",
       "outcome": "granted_in_part"
     },
     {
       "case_number": "FDI-20-794120",
-      "case_title": "Richardson v. Richardson",
+      "case_title": "Keith Richardson v. Lachon Richardson",
       "motion_type": "Motion to Set Aside Judgment",
       "outcome": "continued"
     },
     {
       "case_number": "FDI-25-800840",
-      "case_title": "Lamy v. DiMauro",
+      "case_title": "Brett Lamy v. Liana Dimauro",
       "motion_type": "Request for Attorneys Fees and Mediation",
       "outcome": "granted_in_part"
     },
     {
       "case_number": "FDI-25-801374",
-      "case_title": "Montecino v. Montecino",
+      "case_title": "Abigail Rodriguez Montecino v. Mark Yap Montecino",
       "motion_type": "Request for Order: Spousal Support",
       "outcome": "denied"
     },
     {
       "case_number": "FDI-25-802212",
-      "case_title": "Sheckells v. Kayali",
+      "case_title": "Makenzie Sheckells v. Molham Kayali",
       "motion_type": "Request for Order: Child Custody, Visitation",
       "outcome": "granted_in_part"
     },
     {
       "case_number": "FDV-21-815942",
-      "case_title": "Laidlow v. Brown Jr",
+      "case_title": "Jazmin Laidlow v. Michael B Brown Jr",
       "motion_type": "Request for Order: Child Custody, Visitation, Child Support",
       "outcome": "continued"
     }
