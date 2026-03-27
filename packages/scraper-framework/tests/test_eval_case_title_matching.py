@@ -214,7 +214,7 @@ class TestSBScoreFixtureCaseTitle:
                 "expected_cases": [
                     {
                         "case_number": "CIVRS2502080",
-                        "case_title": "Carmell v. Genus-Robinson-Haywood",
+                        "case_title": "Angela Carmell v. Kathleen Janet Genus-Robinson-Haywood",
                     },
                 ]
             },
@@ -223,7 +223,9 @@ class TestSBScoreFixtureCaseTitle:
             rulings=[
                 {
                     "extracted_case_number": "CIVRS2502080",
-                    "extracted_case_title": "Carmell v. Genus-Robinson-Haywood",
+                    "extracted_case_title": (
+                        "Angela Carmell v. Kathleen Janet Genus-Robinson-Haywood"
+                    ),
                     "outcome": "moot",
                     "motion_type": "compel",
                     "ruling_text": "Some ruling text.",
@@ -255,7 +257,7 @@ class TestRiversideScoreFixtureCaseTitle:
             model="test-model",
             expected={
                 "expected_cases": [
-                    {"case_number": "CVPS2306157", "case_title": "Yeldell v. Henss"},
+                    {"case_number": "CVPS2306157", "case_title": "Lachon Yeldell v. Henss"},
                 ]
             },
             expected_case_count=1,
@@ -263,7 +265,7 @@ class TestRiversideScoreFixtureCaseTitle:
             rulings=[
                 {
                     "extracted_case_number": "CVPS2306157",
-                    "extracted_case_title": "Yeldell v. Henss",
+                    "extracted_case_title": "Lachon Yeldell v. Henss",
                     "outcome": "denied",
                     "motion_type": "demurrer",
                     "ruling_text": "Ruling text here.",
@@ -303,7 +305,7 @@ class TestRiversideScoreFixtureCaseTitle:
             model="test-model",
             expected={
                 "expected_cases": [
-                    {"case_number": "CVPS2306157", "case_title": "Yeldell v. Henss"},
+                    {"case_number": "CVPS2306157", "case_title": "Lachon Yeldell v. Henss"},
                 ]
             },
             expected_case_count=1,
@@ -311,7 +313,7 @@ class TestRiversideScoreFixtureCaseTitle:
             rulings=[
                 {
                     "extracted_case_number": "CVPS2306157",
-                    "extracted_case_title": "Yeldell v. Henss",
+                    "extracted_case_title": "Lachon Yeldell v. Henss",
                     "outcome": "denied",
                     "motion_type": "demurrer",
                     "ruling_text": "Some text.",
@@ -374,7 +376,7 @@ class TestModelSummaryCaseTitleAggregation:
                 model="test",
                 expected={
                     "expected_cases": [
-                        {"case_number": "CVPS2306157", "case_title": "Yeldell v. Henss"},
+                        {"case_number": "CVPS2306157", "case_title": "Lachon Yeldell v. Henss"},
                     ]
                 },
                 expected_case_count=1,
@@ -382,7 +384,7 @@ class TestModelSummaryCaseTitleAggregation:
                 rulings=[
                     {
                         "extracted_case_number": "CVPS2306157",
-                        "extracted_case_title": "Yeldell v. Henss",
+                        "extracted_case_title": "Lachon Yeldell v. Henss",
                         "outcome": "denied",
                         "motion_type": "demurrer",
                         "ruling_text": "Text.",
@@ -404,7 +406,7 @@ class TestModelSummaryCaseTitleAggregation:
                 model="test",
                 expected={
                     "expected_cases": [
-                        {"case_number": "CIVRS2502080", "case_title": "Carmell v. Test"},
+                        {"case_number": "CIVRS2502080", "case_title": "Angela Carmell v. Test"},
                     ]
                 },
                 expected_case_count=1,
@@ -412,7 +414,7 @@ class TestModelSummaryCaseTitleAggregation:
                 rulings=[
                     {
                         "extracted_case_number": "CIVRS2502080",
-                        "extracted_case_title": "Carmell v. Test",
+                        "extracted_case_title": "Angela Carmell v. Test",
                         "outcome": "moot",
                         "motion_type": "compel",
                         "ruling_text": "Text.",

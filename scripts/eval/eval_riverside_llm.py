@@ -118,7 +118,12 @@ RIVERSIDE_SYSTEM_PROMPT = (
     "2. Cross-reference entries ('See #N Above') are their OWN rulings "
     "with their OWN case number — do NOT skip them or merge them.\n"
     "3. Extract the case number EXACTLY as it appears.\n"
-    "4. For case_title, use 'Plaintiff v. Defendant' format.\n"
+    "4. For case_title, use full party names in 'Plaintiff v. Defendant' "
+    "format.  Riverside captions only show last names (e.g., 'YELDELL vs "
+    "HENSS'), but the motion description often contains full names (e.g., "
+    "'of LACHON YELDELL', 'by JOHN W. IRWIN').  When a full name appears "
+    "anywhere in the entry, use it.  Convert ALL-CAPS to title case.  "
+    "If only a last name is available, use the last name.\n"
     "5. For ruling_text, include the FULL text of the ruling after "
     "'Tentative Ruling:'. Preserve it VERBATIM.\n"
     "6. Skip the header boilerplate (oral argument instructions, "
@@ -150,7 +155,7 @@ RIVERSIDE_SYSTEM_PROMPT = (
     '  "rulings": [\n'
     "    {\n"
     '      "extracted_case_number": "CVPS2306157" or null,\n'
-    '      "extracted_case_title": "Yeldell v. Henss" or null,\n'
+    '      "extracted_case_title": "Lachon Yeldell v. Henss" or null,\n'
     '      "case_type": "civil" or null,\n'
     '      "outcome": "denied" or null,\n'
     '      "motion_type": "demurrer" or null,\n'
