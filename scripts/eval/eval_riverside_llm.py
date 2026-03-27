@@ -51,6 +51,12 @@ FIXTURES_DIR = REPO_ROOT / "packages" / "scraper-framework" / "tests" / "fixture
 EXPECTED_DIR = FIXTURES_DIR / "expected"
 RESULTS_DIR = SCRIPT_DIR / "results"
 
+# Add scraper-framework src to sys.path so we can import the production prompt.
+# This ensures the eval always uses the same prompt as the production pipeline.
+_SCRAPER_SRC = str(REPO_ROOT / "packages" / "scraper-framework" / "src")
+if _SCRAPER_SRC not in sys.path:
+    sys.path.insert(0, _SCRAPER_SRC)
+
 # ---------------------------------------------------------------------------
 # Model configuration
 # ---------------------------------------------------------------------------
@@ -74,96 +80,11 @@ MODELS: dict[str, dict] = {
 }
 
 # ---------------------------------------------------------------------------
-# Riverside-specific extraction prompt
+# Riverside-specific extraction prompt — imported from production config
+# to ensure eval and production always use the same prompt (#2088).
 # ---------------------------------------------------------------------------
 
-RIVERSIDE_SYSTEM_PROMPT = (
-    "You are a legal document parser for California court "
-    "tentative rulings from Riverside County Superior Court.\n\n"
-    "You will receive the full text extracted from a PDF containing "
-    "tentative rulings.  Your job is to identify EVERY individual "
-    "case ruling in the document and extract structured data for each.\n\n"
-    "## Riverside Document Format\n\n"
-    "Riverside PDFs have this structure:\n"
-    "1. **Header**: 'Tentative Rulings for [date]' followed by "
-    "department and judge information, plus standard boilerplate "
-    "about oral arguments and telephonic appearances.\n"
-    "2. **Numbered entries**: Each case starts with a number on its "
-    "own line (e.g., '1.', '2.', '3.'), followed by:\n"
-    "   - Case number (e.g., CVPS2306157, CVMV2507098, RIC1904113)\n"
-    "   - Party names (e.g., 'YELDELL vs HENSS')\n"
-    "   - Motion description (e.g., 'Hearing re: Demurrer on 1st "
-    "Amended Complaint')\n"
-    "   - 'Tentative Ruling:' followed by the ruling text\n"
-    "3. **Cross-references**: Some entries may reference another entry "
-    "with phrases like 'See #1 Above', 'See No. 3 above', or 'Same "
-    "as #2'. These are SEPARATE entries that must be counted "
-    "individually — they are distinct cases even though they share "
-    "ruling text.\n"
-    "4. **Page breaks**: Rulings may span multiple pages. 'Page N of M' "
-    "footers appear at the bottom of each page.\n"
-    "5. **No tentative rulings**: Some PDFs contain only 'No Tentative "
-    "Rulings for [date]' or 'No Tentative Rulings [date]' with "
-    "boilerplate text. These have zero cases.\n\n"
-    "## Case Number Formats\n\n"
-    "Riverside case numbers use these patterns:\n"
-    "- CV + location code + year + sequence: CVPS2306157, CVMV2507098, "
-    "CVRI2403055\n"
-    "- Location prefix + sequence: RIC1904113, MCC2012345, PSC2112345\n"
-    "- Location codes: PS=Palm Springs, MV=Moreno Valley, M=Murrieta, "
-    "RI=Riverside, C=Corona\n\n"
-    "## Rules\n\n"
-    "1. Count and return EVERY numbered entry as a separate ruling. "
-    "If the document has entries 1 through 4, return 4 rulings.\n"
-    "2. Cross-reference entries ('See #N Above') are their OWN rulings "
-    "with their OWN case number — do NOT skip them or merge them.\n"
-    "3. Extract the case number EXACTLY as it appears.\n"
-    "4. For case_title, use full party names in 'Plaintiff v. Defendant' "
-    "format.  Riverside captions only show last names (e.g., 'YELDELL vs "
-    "HENSS'), but the motion description often contains full names (e.g., "
-    "'of LACHON YELDELL', 'by JOHN W. IRWIN').  When a full name appears "
-    "anywhere in the entry, use it.  Convert ALL-CAPS to title case.  "
-    "If only a last name is available, use the last name.\n"
-    "5. For ruling_text, include the FULL text of the ruling after "
-    "'Tentative Ruling:'. Preserve it VERBATIM.\n"
-    "6. Skip the header boilerplate (oral argument instructions, "
-    "phone numbers, URLs, etc.) — only extract from the numbered "
-    "entries.\n"
-    "7. 'No Tentative Rulings' documents have zero cases — return an "
-    "empty rulings array.\n"
-    "8. Strip 'Page N of M' footers from ruling text.\n\n"
-    "## Outcome taxonomy\n\n"
-    "Use EXACTLY one of these values:\n"
-    "- granted — motion was fully granted\n"
-    "- denied — motion was fully denied\n"
-    "- granted_in_part — partially granted and partially denied\n"
-    "- denied_in_part — partially denied\n"
-    "- moot — motion is moot\n"
-    "- continued — hearing was postponed\n"
-    "- off_calendar — hearing removed from calendar\n"
-    "- submitted — taken under submission\n"
-    "- other — none of the above fit\n\n"
-    "For 'overruled' (demurrers), map to 'denied'.\n"
-    "For 'sustained' (demurrers), map to 'granted'.\n"
-    "For 'No tentative ruling, a hearing will be conducted', use 'other'.\n\n"
-    "## Output format\n\n"
-    "Respond with ONLY a JSON object, no other text:\n\n"
-    "{\n"
-    '  "extracted_judge_name": "First M. Last" or null,\n'
-    '  "hearing_date": "YYYY-MM-DD" or null,\n'
-    '  "department": "PS1" or null,\n'
-    '  "rulings": [\n'
-    "    {\n"
-    '      "extracted_case_number": "CVPS2306157" or null,\n'
-    '      "extracted_case_title": "Lachon Yeldell v. Henss" or null,\n'
-    '      "case_type": "civil" or null,\n'
-    '      "outcome": "denied" or null,\n'
-    '      "motion_type": "demurrer" or null,\n'
-    '      "ruling_text": "Full verbatim text..." or null\n'
-    "    }\n"
-    "  ]\n"
-    "}"
-)
+from framework.extraction_config import RIVERSIDE_SYSTEM_PROMPT  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
