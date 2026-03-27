@@ -2862,6 +2862,99 @@ def test_process_event_regex_case_title_extraction(
 
 
 # ---------------------------------------------------------------------------
+# is_plausible_case_title validation in worker (#1991)
+# ---------------------------------------------------------------------------
+
+
+@patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
+@patch("ingestion.worker.extract_case_title")
+@patch("ingestion.worker.psycopg")
+def test_process_event_implausible_title_not_written(
+    mock_psycopg: MagicMock,
+    mock_extract_title: MagicMock,
+    mock_resolve_judge: MagicMock,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """When extract_case_title returns an implausible title, it is not used (#1991)."""
+    worker, os_mock = _make_worker()
+
+    mock_conn, mock_cur = _make_mock_conn()
+    mock_psycopg.connect.return_value = mock_conn
+    mock_cur.rowcount = 1
+
+    # Regex returns an implausible title (procedural text, not a case name)
+    mock_extract_title.return_value = "To Respond, Without Objections"
+
+    mock_cur.fetchone.side_effect = [
+        ("court-uuid-1",),  # upsert_court
+        ("case-uuid-1",),  # upsert_case
+        (True,),  # insert_document: RETURNING is_new = True
+    ]
+
+    event = _make_event(
+        case_title=None,
+        ruling_text="Case Name: To Respond, Without Objections\nThe motion is GRANTED.",
+    )
+    worker.process_event(event)
+
+    mock_extract_title.assert_called_once()
+    mock_conn.commit.assert_called_once()
+
+    # Verify case_title was NOT passed to upsert_case —
+    # the implausible title should have been rejected by is_plausible_case_title
+    upsert_case_call = None
+    for call in mock_cur.execute.call_args_list:
+        sql = call[0][0] if call[0] else ""
+        if "INSERT INTO cases" in sql:
+            upsert_case_call = call
+            break
+    assert upsert_case_call is not None, "Expected upsert_case SQL call"
+    # case_title is the 4th parameter in the upsert_case SQL args
+    sql_args = upsert_case_call[0][1]
+    # Find the case_title value — it should be None since the implausible title was rejected
+    # The args tuple is (case_number, court_id, court_code, case_title, ...)
+    assert sql_args[3] is None, (
+        f"Implausible title should not be written; got case_title={sql_args[3]!r}"
+    )
+
+
+@patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
+@patch("ingestion.worker.is_plausible_case_title", return_value=False)
+@patch("ingestion.worker.extract_case_title", return_value="For Summary Judgment")
+@patch("ingestion.worker.psycopg")
+def test_process_event_implausible_title_via_mock_rejected(
+    mock_psycopg: MagicMock,
+    mock_extract_title: MagicMock,
+    mock_is_plausible: MagicMock,
+    mock_resolve_judge: MagicMock,
+) -> None:
+    """Mocking is_plausible_case_title to return False prevents the title from being used."""
+    worker, os_mock = _make_worker()
+
+    mock_conn, mock_cur = _make_mock_conn()
+    mock_psycopg.connect.return_value = mock_conn
+    mock_cur.rowcount = 1
+
+    mock_cur.fetchone.side_effect = [
+        ("court-uuid-1",),  # upsert_court
+        ("case-uuid-1",),  # upsert_case
+        (True,),  # insert_document: RETURNING is_new = True
+    ]
+
+    event = _make_event(
+        case_title=None,
+        ruling_text="For Summary Judgment\nThe motion is GRANTED.",
+    )
+    worker.process_event(event)
+
+    # extract_case_title was called
+    mock_extract_title.assert_called_once()
+    # is_plausible_case_title was called with the extracted title
+    mock_is_plausible.assert_called_once_with("For Summary Judgment")
+    mock_conn.commit.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
 # Heartbeat logging tests
 # ---------------------------------------------------------------------------
 
