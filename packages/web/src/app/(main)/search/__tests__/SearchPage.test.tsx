@@ -590,9 +590,8 @@ describe('SearchPage component — error state styling', () => {
     expect(container.querySelector('.border-destructive')).not.toBeInTheDocument();
     expect(container.querySelector('.text-destructive')).not.toBeInTheDocument();
 
-    // Should use soft stone/red styling
-    expect(container.querySelector('.bg-stone-50')).toBeInTheDocument();
-    expect(container.querySelector('.border-stone-200')).toBeInTheDocument();
+    // Should use soft semantic styling (bg-muted, border)
+    expect(container.querySelector('.bg-muted')).toBeInTheDocument();
   });
 
   it('renders a warning icon in the error state', () => {

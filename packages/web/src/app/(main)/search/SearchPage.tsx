@@ -624,7 +624,7 @@ export function SearchPage() {
 
       {/* Error state — full width, centered, soft styling */}
       {hasSearched && error && (
-        <Card className="border-stone-200 bg-stone-50">
+        <Card className="border bg-muted">
           <CardContent className="flex flex-col items-center justify-center py-8">
             <AlertCircle className="mb-3 h-8 w-8 text-red-700/70" aria-hidden="true" />
             <p className="text-sm text-red-700">
@@ -633,7 +633,7 @@ export function SearchPage() {
             <button
               type="button"
               onClick={() => window.location.reload()}
-              className="mt-3 text-sm font-medium text-stone-600 underline underline-offset-2 hover:text-stone-900"
+              className="mt-3 text-sm font-medium text-muted-foreground underline underline-offset-2 hover:text-foreground"
             >
               Try again
             </button>
