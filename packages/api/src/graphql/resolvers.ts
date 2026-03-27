@@ -125,12 +125,18 @@ export const resolvers = {
         courtId,
         caseStatus,
         caseType,
+        county,
+        dateFrom,
+        dateTo,
         first,
         after,
       }: {
         courtId?: string;
         caseStatus?: string;
         caseType?: string;
+        county?: string;
+        dateFrom?: string;
+        dateTo?: string;
         first?: number;
         after?: string;
       },
@@ -142,30 +148,55 @@ export const resolvers = {
       let i = 1;
 
       if (courtId) {
-        conditions.push(`court_id = $${i++}`);
+        conditions.push(`c.court_id = $${i++}`);
         params.push(courtId);
       }
       if (caseStatus) {
-        conditions.push(`case_status = $${i++}`);
+        conditions.push(`c.case_status = $${i++}`);
         params.push(caseStatus);
       }
       if (caseType) {
-        conditions.push(`case_type = $${i++}`);
+        conditions.push(`c.case_type = $${i++}`);
         params.push(caseType);
+      }
+      if (county) {
+        conditions.push(`ct.county = $${i++}`);
+        params.push(county);
+      }
+
+      // Use an EXISTS subquery for date filtering instead of JOIN + DISTINCT.
+      // This is more efficient: the DB stops checking each case as soon as it
+      // finds one matching ruling, avoiding a large intermediate result set.
+      if (dateFrom || dateTo) {
+        const dateConditions: string[] = [];
+        if (dateFrom) {
+          dateConditions.push(`r.hearing_date >= $${i++}`);
+          params.push(dateFrom);
+        }
+        if (dateTo) {
+          dateConditions.push(`r.hearing_date <= $${i++}`);
+          params.push(dateTo);
+        }
+        conditions.push(
+          `EXISTS (SELECT 1 FROM rulings r WHERE r.case_id = c.id AND ${dateConditions.join(' AND ')})`,
+        );
       }
 
       // Keyset pagination — order by (created_at DESC, id DESC)
       // Cursor encodes [created_at, id]
       if (after) {
         const [createdAt, id] = decodeCursor(after);
-        conditions.push(`(created_at, id) < ($${i++}::timestamptz, $${i++}::uuid)`);
+        conditions.push(`(c.created_at, c.id) < ($${i++}::timestamptz, $${i++}::uuid)`);
         params.push(createdAt, id);
       }
+
+      // Only JOIN courts when county filter is active
+      const joins = county !== undefined ? 'JOIN courts ct ON ct.id = c.court_id' : '';
 
       const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
       params.push(limit + 1);
       const { rows } = await pool.query<Row>(
-        `SELECT * FROM cases ${where} ORDER BY created_at DESC, id DESC LIMIT $${i}`,
+        `SELECT c.* FROM cases c ${joins} ${where} ORDER BY c.created_at DESC, c.id DESC LIMIT $${i}`,
         params,
       );
 
@@ -402,6 +433,8 @@ export const resolvers = {
       loaders.caseJudgesLoader.load(row.id as string),
     parties: (row: Row, _: unknown, { loaders }: Context) =>
       loaders.casePartiesLoader.load(row.id as string),
+    latestRuling: (row: Row, _: unknown, { loaders }: Context) =>
+      loaders.latestRulingLoader.load(row.id as string),
   },
 
   Judge: {

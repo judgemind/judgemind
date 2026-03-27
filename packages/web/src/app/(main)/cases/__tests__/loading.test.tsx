@@ -7,27 +7,6 @@ vi.mock('@/components/ui/skeleton', () => ({
   ),
 }));
 
-vi.mock('@/components/ui/table', () => ({
-  Table: ({ children, className }: { children: React.ReactNode; className?: string }) => (
-    <table data-testid="table" className={className}>{children}</table>
-  ),
-  TableHeader: ({ children }: { children: React.ReactNode }) => (
-    <thead>{children}</thead>
-  ),
-  TableBody: ({ children }: { children: React.ReactNode }) => (
-    <tbody data-testid="table-body">{children}</tbody>
-  ),
-  TableRow: ({ children }: { children: React.ReactNode }) => (
-    <tr data-testid="table-row">{children}</tr>
-  ),
-  TableHead: ({ children, className }: { children: React.ReactNode; className?: string }) => (
-    <th className={className}>{children}</th>
-  ),
-  TableCell: ({ children }: { children: React.ReactNode }) => (
-    <td>{children}</td>
-  ),
-}));
-
 import CasesLoading from '../loading';
 
 describe('CasesLoading', () => {
@@ -36,24 +15,16 @@ describe('CasesLoading', () => {
     expect(container).toBeTruthy();
   });
 
-  it('renders a skeleton table', () => {
+  it('renders skeleton elements for the list layout', () => {
     render(<CasesLoading />);
-    expect(screen.getByTestId('table')).toBeInTheDocument();
+    const skeletons = screen.getAllByTestId('skeleton');
+    // Title, subtitle, 5 filter skeletons, plus 8 rows * 4 skeletons each = 39
+    expect(skeletons.length).toBeGreaterThan(8);
   });
 
-  it('renders table headers for Case and Type only', () => {
-    render(<CasesLoading />);
-    expect(screen.getByText('Case')).toBeInTheDocument();
-    expect(screen.getByText('Type')).toBeInTheDocument();
-    // Status and Court columns should not exist
-    expect(screen.queryByText('Court')).not.toBeInTheDocument();
-    expect(screen.queryByText('Status')).not.toBeInTheDocument();
-  });
-
-  it('renders 8 skeleton rows plus 1 header row', () => {
-    render(<CasesLoading />);
-    const rows = screen.getAllByTestId('table-row');
-    // 1 header row + 8 skeleton rows = 9
-    expect(rows).toHaveLength(9);
+  it('uses divide-y row layout (not table)', () => {
+    const { container } = render(<CasesLoading />);
+    expect(container.querySelector('table')).not.toBeInTheDocument();
+    expect(container.querySelector('.divide-y')).toBeInTheDocument();
   });
 });

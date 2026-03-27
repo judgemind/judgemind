@@ -129,6 +129,26 @@ export function createLoaders(pool: Pool) {
     return grouped;
   });
 
+  /** Batch-load the latest ruling for multiple cases.
+   *  Returns the most recent ruling (by hearing_date DESC, id DESC) per case,
+   *  excluding rulings with future hearing dates. */
+  const latestRulingLoader = new DataLoader<string, Row | null>(async (caseIds) => {
+    const { rows } = await pool.query<Row>(
+      `SELECT DISTINCT ON (case_id) *, case_id AS _loader_case_id
+       FROM rulings
+       WHERE case_id = ANY($1)
+         AND hearing_date <= CURRENT_DATE
+       ORDER BY case_id, hearing_date DESC, id DESC`,
+      [caseIds],
+    );
+    const byCase = new Map(rows.map((r) => {
+      const cid = r._loader_case_id as string;
+      delete r._loader_case_id;
+      return [cid, r];
+    }));
+    return caseIds.map((id) => byCase.get(id) ?? null);
+  });
+
   return {
     courtLoader,
     judgeLoader,
@@ -136,6 +156,7 @@ export function createLoaders(pool: Pool) {
     documentFormatLoader,
     caseJudgesLoader,
     casePartiesLoader,
+    latestRulingLoader,
   };
 }
 
