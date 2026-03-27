@@ -11,6 +11,7 @@ import pytest
 
 from framework.extraction_config import (
     RIVERSIDE_SYSTEM_PROMPT,
+    SAN_BERNARDINO_SYSTEM_PROMPT,
     CountyExtractionConfig,
     ExtractionMethod,
     get_county_extraction_config,
@@ -105,6 +106,16 @@ class TestGetCountyExtractionConfig:
         assert config is not None
         assert config.method == ExtractionMethod.MULTIMODAL
 
+    def test_san_bernardino_registered(self) -> None:
+        """San Bernardino County has a registered config (#2050)."""
+        config = get_county_extraction_config("CA", "San Bernardino")
+        assert config is not None
+        assert config.method == ExtractionMethod.LLM
+        assert config.provider == "google"
+        assert config.model == "gemini-2.5-flash-lite"
+        assert config.max_output_tokens == 32768
+        assert config.system_prompt is not None
+
     def test_case_insensitive_state(self) -> None:
         """State code lookup is case-insensitive."""
         assert get_county_extraction_config("ca", "Riverside") is not None
@@ -114,6 +125,12 @@ class TestGetCountyExtractionConfig:
         """County name lookup is case-insensitive."""
         assert get_county_extraction_config("CA", "riverside") is not None
         assert get_county_extraction_config("CA", "RIVERSIDE") is not None
+
+    def test_case_insensitive_san_bernardino(self) -> None:
+        """San Bernardino lookup is case-insensitive."""
+        assert get_county_extraction_config("CA", "san bernardino") is not None
+        assert get_county_extraction_config("CA", "SAN BERNARDINO") is not None
+        assert get_county_extraction_config("CA", "San Bernardino") is not None
 
     def test_unknown_county_returns_none(self) -> None:
         """Unknown county returns None."""
@@ -180,3 +197,72 @@ class TestRiversideSystemPrompt:
     def test_mentions_page_footers(self) -> None:
         """Prompt instructs stripping of page footers."""
         assert "Page N of M" in RIVERSIDE_SYSTEM_PROMPT
+
+
+# ---------------------------------------------------------------------------
+# SAN_BERNARDINO_SYSTEM_PROMPT content validation (#2050)
+# ---------------------------------------------------------------------------
+
+
+class TestSanBernardinoSystemPrompt:
+    """Verify the San Bernardino system prompt has required content."""
+
+    def test_mentions_san_bernardino(self) -> None:
+        assert "san bernardino" in SAN_BERNARDINO_SYSTEM_PROMPT.lower()
+
+    def test_mentions_two_layer_structure(self) -> None:
+        """Prompt instructs capture of two-layer structure."""
+        assert "two-layer" in SAN_BERNARDINO_SYSTEM_PROMPT.lower()
+
+    def test_mentions_full_analysis(self) -> None:
+        """Prompt instructs capture of full legal analysis."""
+        assert "full legal analysis" in SAN_BERNARDINO_SYSTEM_PROMPT.lower()
+
+    def test_warns_against_truncation(self) -> None:
+        """Prompt warns against truncation of ruling text."""
+        assert "truncat" in SAN_BERNARDINO_SYSTEM_PROMPT.lower()
+
+    def test_mentions_case_number_formats(self) -> None:
+        """Prompt describes San Bernardino case number patterns."""
+        assert "CIVSB" in SAN_BERNARDINO_SYSTEM_PROMPT
+        assert "CIVRS" in SAN_BERNARDINO_SYSTEM_PROMPT
+
+    def test_mentions_horizontal_rules(self) -> None:
+        """Prompt describes horizontal rule separators between cases."""
+        assert "horizontal rule" in SAN_BERNARDINO_SYSTEM_PROMPT.lower()
+
+    def test_mentions_two_header_formats(self) -> None:
+        """Prompt describes both header formats (Department-Judge and HONORABLE)."""
+        assert "Department" in SAN_BERNARDINO_SYSTEM_PROMPT
+        assert "HONORABLE" in SAN_BERNARDINO_SYSTEM_PROMPT
+
+    def test_mentions_outcome_taxonomy(self) -> None:
+        """Prompt includes outcome taxonomy values."""
+        assert "granted" in SAN_BERNARDINO_SYSTEM_PROMPT.lower()
+        assert "denied" in SAN_BERNARDINO_SYSTEM_PROMPT.lower()
+        assert "continued" in SAN_BERNARDINO_SYSTEM_PROMPT.lower()
+        assert "off_calendar" in SAN_BERNARDINO_SYSTEM_PROMPT.lower()
+
+    def test_mentions_json_output(self) -> None:
+        """Prompt specifies JSON output format."""
+        assert "json" in SAN_BERNARDINO_SYSTEM_PROMPT.lower()
+        assert "rulings" in SAN_BERNARDINO_SYSTEM_PROMPT.lower()
+
+    def test_mentions_parties(self) -> None:
+        """Prompt instructs party extraction."""
+        assert "plaintiff" in SAN_BERNARDINO_SYSTEM_PROMPT.lower()
+        assert "defendant" in SAN_BERNARDINO_SYSTEM_PROMPT.lower()
+
+    def test_mentions_page_footers(self) -> None:
+        """Prompt instructs stripping of page footers."""
+        assert "Page N of M" in SAN_BERNARDINO_SYSTEM_PROMPT
+
+    def test_mentions_space_normalization(self) -> None:
+        """Prompt instructs removing internal spaces from case numbers."""
+        assert "CIVSB 2600093" in SAN_BERNARDINO_SYSTEM_PROMPT
+        assert "CIVSB2600093" in SAN_BERNARDINO_SYSTEM_PROMPT
+
+    def test_mentions_single_case_multiple_motions(self) -> None:
+        """Prompt explains that multiple motions under one case number are one ruling."""
+        assert "multiple motions" in SAN_BERNARDINO_SYSTEM_PROMPT.lower()
+        assert "ONE ruling" in SAN_BERNARDINO_SYSTEM_PROMPT
