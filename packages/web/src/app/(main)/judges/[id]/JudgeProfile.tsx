@@ -132,6 +132,8 @@ interface RulingsData {
 // Constants
 // ---------------------------------------------------------------------------
 
+/** Minimum number of rulings before stats are considered high-confidence. */
+const LOW_SAMPLE_THRESHOLD = 10;
 
 const PAGE_SIZE = 20;
 
@@ -332,11 +334,25 @@ export function JudgeProfile({ judgeId }: { judgeId: string }) {
           {overallGrantRate !== null && (
             <Card>
               <CardContent className="p-6">
-                <p className="text-3xl font-bold text-foreground">
+                <p
+                  className={`text-3xl font-bold ${analytics.totalRulings < LOW_SAMPLE_THRESHOLD ? 'text-muted-foreground' : 'text-foreground'}`}
+                  data-testid="overall-grant-rate"
+                >
                   {Math.round(overallGrantRate * 100)}%
                 </p>
                 <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
                   Overall Grant Rate
+                </p>
+                <p
+                  className="mt-1 text-xs text-muted-foreground"
+                  data-testid="overall-sample-size"
+                >
+                  Based on {analytics.totalRulings.toLocaleString()} {analytics.totalRulings === 1 ? 'ruling' : 'rulings'}
+                  {analytics.totalRulings < LOW_SAMPLE_THRESHOLD && (
+                    <span className="ml-1" data-testid="low-confidence-indicator">
+                      &middot; Limited data
+                    </span>
+                  )}
                 </p>
               </CardContent>
             </Card>
@@ -389,6 +405,7 @@ export function JudgeProfile({ judgeId }: { judgeId: string }) {
                 <TableBody>
                   {analytics.rulingsByMotionType.map((row) => {
                     const isActive = motionTypeFilter === row.motionType;
+                    const isLowSample = row.total < LOW_SAMPLE_THRESHOLD;
                     return (
                       <TableRow
                         key={row.motionType}
@@ -397,6 +414,7 @@ export function JudgeProfile({ judgeId }: { judgeId: string }) {
                         role="button"
                         tabIndex={0}
                         aria-pressed={isActive}
+                        data-low-sample={isLowSample || undefined}
                         onKeyDown={(e) => {
                           if (e.key === 'Enter' || e.key === ' ') {
                             e.preventDefault();
@@ -411,8 +429,16 @@ export function JudgeProfile({ judgeId }: { judgeId: string }) {
                         <TableCell className="text-right tabular-nums">{row.granted}</TableCell>
                         <TableCell className="text-right tabular-nums">{row.denied}</TableCell>
                         <TableCell className="text-right tabular-nums">{row.grantedInPart}</TableCell>
-                        <TableCell className="text-right tabular-nums font-medium">
+                        <TableCell
+                          className={`text-right tabular-nums ${isLowSample ? 'text-muted-foreground' : 'font-medium'}`}
+                          data-testid={`grant-rate-${row.motionType}`}
+                        >
                           {Math.round(row.grantRate * 100)}%
+                          {isLowSample && (
+                            <span className="ml-1 text-xs font-normal" data-testid={`limited-data-${row.motionType}`}>
+                              (limited data)
+                            </span>
+                          )}
                         </TableCell>
                       </TableRow>
                     );
