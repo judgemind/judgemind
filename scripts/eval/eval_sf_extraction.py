@@ -247,6 +247,8 @@ class ModelSummary:
     fields_total: int = 0
     case_numbers_correct: int = 0
     case_numbers_total: int = 0
+    case_titles_correct: int = 0
+    case_titles_total: int = 0
     total_input_tokens: int = 0
     total_output_tokens: int = 0
     avg_latency_ms: float = 0.0
@@ -508,6 +510,74 @@ REQUIRED_FIELDS = [
 ]
 
 
+def match_case_title(
+    extracted: str | None,
+    expected: str | None,
+) -> bool:
+    """Fuzzy-match an extracted case title against expected ground truth.
+
+    Uses a two-tier strategy:
+    1. Normalize both strings (lowercase, normalize separators) and check
+       SequenceMatcher similarity (>0.8 threshold).
+    2. Fall back to last-name containment: extract the key name tokens from
+       the expected title and verify they all appear in the extracted title.
+    """
+    if extracted is None and expected is None:
+        return True
+    if extracted is None or expected is None:
+        return False
+
+    # Normalize
+    def _normalize(s: str) -> str:
+        s = s.strip().lower()
+        # Normalize "vs." / "vs " / "versus" to "v."
+        s = re.sub(r"\bvs\.?\s+", "v. ", s)
+        s = re.sub(r"\bversus\s+", "v. ", s)
+        # Collapse whitespace
+        s = re.sub(r"\s+", " ", s).strip()
+        return s
+
+    norm_ext = _normalize(extracted)
+    norm_exp = _normalize(expected)
+
+    if norm_ext == norm_exp:
+        return True
+
+    # Empty string handling
+    if not norm_ext and not norm_exp:
+        return True
+    if not norm_ext or not norm_exp:
+        return False
+
+    # Tier 1: SequenceMatcher similarity
+    from difflib import SequenceMatcher
+
+    if SequenceMatcher(None, norm_ext, norm_exp).ratio() > 0.8:
+        return True
+
+    # Tier 2: Last-name containment — extract key tokens from expected
+    # Split on " v. " to get party sides, then check each side's last
+    # significant token appears in extracted.
+    if " v. " in norm_exp:
+        parts = norm_exp.split(" v. ", 1)
+        for part in parts:
+            # Get the last word (last name) from each side, stripping
+            # common suffixes like "llc", "inc", "n.a."
+            tokens = part.strip().split()
+            if not tokens:
+                continue
+            # Use the whole part for containment check (handles
+            # corporate names better)
+            if part.strip() not in norm_ext:
+                # Try just the last significant token
+                last_token = tokens[-1].rstrip(".,")
+                if last_token not in norm_ext:
+                    return False
+        return True
+
+    return False
+
+
 def score_fixture(result: FixtureResult) -> dict:
     """Score a fixture result against expected values."""
     expected_count = result.expected_case_count
@@ -554,6 +624,24 @@ def score_fixture(result: FixtureResult) -> dict:
     cn_correct = len(expected_numbers & extracted_numbers)
     cn_total = len(expected_numbers)
 
+    # Case title accuracy — match by case_number, then compare case_title
+    ct_correct = 0
+    ct_total = 0
+    expected_by_cn: dict[str, str | None] = {}
+    for c in expected_cases:
+        expected_by_cn[c["case_number"]] = c.get("case_title")
+    extracted_by_cn: dict[str, str | None] = {}
+    for ruling in result.rulings:
+        cn = ruling.get("extracted_case_number")
+        if cn:
+            extracted_by_cn[cn] = ruling.get("extracted_case_title")
+    for cn, exp_title in expected_by_cn.items():
+        if exp_title is not None:
+            ct_total += 1
+            ext_title = extracted_by_cn.get(cn)
+            if ext_title is not None and match_case_title(ext_title, exp_title):
+                ct_correct += 1
+
     return {
         "fixture_name": result.fixture_name,
         "expected_case_count": expected_count,
@@ -571,6 +659,8 @@ def score_fixture(result: FixtureResult) -> dict:
         "field_completeness_pct": (fields_present / fields_total * 100 if fields_total > 0 else 0),
         "case_numbers_correct": cn_correct,
         "case_numbers_total": cn_total,
+        "case_titles_correct": ct_correct,
+        "case_titles_total": ct_total,
     }
 
 
@@ -612,6 +702,8 @@ def analyze_model(
         summary.fields_total += scores["fields_total"]
         summary.case_numbers_correct += scores["case_numbers_correct"]
         summary.case_numbers_total += scores["case_numbers_total"]
+        summary.case_titles_correct += scores["case_titles_correct"]
+        summary.case_titles_total += scores["case_titles_total"]
 
     for r in results:
         if r.error:
@@ -670,6 +762,21 @@ def print_model_report(summary: ModelSummary) -> None:
             + "%)"
         )
 
+    print("\n## Case Title Accuracy")
+    if summary.case_titles_total > 0:
+        ct_pct = summary.case_titles_correct / summary.case_titles_total * 100
+        print(
+            "  case_title_match: "
+            + str(summary.case_titles_correct)
+            + "/"
+            + str(summary.case_titles_total)
+            + " ("
+            + f"{ct_pct:.1f}"
+            + "%)"
+        )
+    else:
+        print("  No case titles to compare.")
+
     print("\n## Field Completeness")
     if summary.fields_total > 0:
         fc_pct = summary.fields_complete / summary.fields_total * 100
@@ -702,6 +809,7 @@ def print_model_report(summary: ModelSummary) -> None:
         + f"{'Match':>7}"
         + f"{'Empty':>7}"
         + f"{'CN':>7}"
+        + f"{'CT':>7}"
         + f"{'Flds':>7}"
     )
     print(
@@ -711,6 +819,8 @@ def print_model_report(summary: ModelSummary) -> None:
         + "-" * 5
         + " "
         + "-" * 5
+        + " "
+        + "-" * 7
         + " "
         + "-" * 7
         + " "
@@ -732,6 +842,7 @@ def print_model_report(summary: ModelSummary) -> None:
         else:
             tag = " ERR"
         cn_str = str(detail["case_numbers_correct"]) + "/" + str(detail["case_numbers_total"])
+        ct_str = str(detail["case_titles_correct"]) + "/" + str(detail["case_titles_total"])
         fc_str = f"{detail['field_completeness_pct']:.0f}%"
         print(
             "  "
@@ -741,6 +852,7 @@ def print_model_report(summary: ModelSummary) -> None:
             + f"{tag:>7}"
             + f"{detail['empty_rulings']:>7}"
             + f"{cn_str:>7}"
+            + f"{ct_str:>7}"
             + f"{fc_str:>7}"
         )
 
@@ -789,6 +901,18 @@ def print_comparison_table(summaries: dict[str, ModelSummary]) -> None:
     for name in model_names:
         s = summaries[name]
         pct = s.case_numbers_correct / s.case_numbers_total * 100 if s.case_numbers_total > 0 else 0
+        row += f"  {pct:>19.1f}%"
+    print(row)
+
+    # Case title accuracy
+    row = f"{'Case title accuracy':<35}"
+    for name in model_names:
+        s = summaries[name]
+        pct = (
+            s.case_titles_correct / s.case_titles_total * 100
+            if s.case_titles_total > 0
+            else 0
+        )
         row += f"  {pct:>19.1f}%"
     print(row)
 
@@ -1097,6 +1221,8 @@ def main() -> int:
                 ),
                 "case_numbers_correct": summary.case_numbers_correct,
                 "case_numbers_total": summary.case_numbers_total,
+                "case_titles_correct": summary.case_titles_correct,
+                "case_titles_total": summary.case_titles_total,
                 "fields_complete": summary.fields_complete,
                 "fields_total": summary.fields_total,
                 "total_rulings": summary.total_rulings,

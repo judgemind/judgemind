@@ -11,6 +11,26 @@
   "primary_case_number": "CVMV2507098",
   "case_number_format": "CV{LOCATION}{YY}{NNNNNN}",
   "hearing_date": "March 2, 2026",
+  "expected_cases": [
+    {
+      "case_number": "CVMV2507098",
+      "case_title": "Wells Fargo Bank, N.A. v. Perini",
+      "motion_type": "deem admissions admitted",
+      "outcome": "granted"
+    },
+    {
+      "case_number": "CVMV2510261",
+      "case_title": "Bank of America, N.A. v. Vargas",
+      "motion_type": "judgment on the pleadings",
+      "outcome": "granted"
+    },
+    {
+      "case_number": "CVMV2510403",
+      "case_title": "Bank of America, N.A. v. Vargas",
+      "motion_type": "judgment on the pleadings",
+      "outcome": "granted"
+    }
+  ],
   "ruling_text_contains": [
     "Tentative Rulings for March 2, 2026",
     "Department MV1"
