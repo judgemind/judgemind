@@ -1,0 +1,27 @@
+{
+  "_fixture": "sd_roa_case_detail.html",
+  "_description": "San Diego Dept C-60 -- Motion to Compel Further Responses. Single-case ROA HTML. Granted in part, denied in part.",
+  "_captured": "2026-03-12",
+  "_format": "html",
+  "department": "C-60",
+  "case_count": 1,
+  "case_number": "24CU016153C",
+  "motion_type": "Motion to Compel Further Responses to Requests for Production",
+  "hearing_date": "March 13, 2026",
+  "judge_name": "Matthew C. Braner",
+  "expected_cases": [
+    {
+      "case_number": "24CU016153C",
+      "case_title": "Aasi v. American Honda Motor Co Inc",
+      "outcome": "granted_in_part",
+      "motion_type": "Motion to Compel Further Responses to Requests for Production",
+      "parties": [
+        {"name": "Sumayya Aasi", "role": "plaintiff"},
+        {"name": "Mohammad Aasi", "role": "plaintiff"},
+        {"name": "American Honda Motor Co Inc", "role": "defendant"}
+      ],
+      "ruling_text_contains": ["GRANTED IN PART AND DENIED IN PART", "Requests Nos. 15-22", "Requests Nos. 23-28", "overbroad", "Sanctions are DENIED"]
+    }
+  ],
+  "_notes": "Motion to compel further responses granted as to Requests 15-22, denied as to 23-28. Sanctions denied."
+}
