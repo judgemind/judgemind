@@ -1034,10 +1034,16 @@ def _full_reparse_document(
         ruling_index = ruling.ruling_index
         split_doc_id = make_split_document_id(doc_meta["document_id"], ruling_index)
 
+        # Guard against cross-contamination (#2078): when splitting
+        # produces a ruling with no text, use None instead of empty
+        # string so the DB stores NULL rather than a misleading value.
+        # This matches the guard in _reparse_document_multimodal().
+        ruling_text_cleaned: str | None = (
+            ruling.ruling_text.replace("\x00", "") if ruling.ruling_text else None
+        )
+
         extracted: dict = {
-            "ruling_text": ruling.ruling_text.replace("\x00", "")
-            if ruling.ruling_text
-            else "",
+            "ruling_text": ruling_text_cleaned,
             "case_number": ruling.case_number or doc_meta.get("case_number"),
             "case_title": ruling.case_title or doc_meta.get("case_title"),
             "case_type": doc_meta.get("case_type"),
@@ -1075,9 +1081,10 @@ def _full_reparse_document(
         # Regex fallback — fill any fields still missing after split (#1749)
         # Uses the shared helper to stay in sync with _reparse_document().
         # ------------------------------------------------------------------
-        _apply_regex_fallbacks(
-            extracted, extracted["ruling_text"], scraper_id=scraper_id
-        )
+        if extracted["ruling_text"]:
+            _apply_regex_fallbacks(
+                extracted, extracted["ruling_text"], scraper_id=scraper_id
+            )
 
         results.append(extracted)
 
@@ -1299,8 +1306,17 @@ def _reparse_document_multimodal(
         else:
             split_doc_id = doc_meta["document_id"]
 
+        # Guard against cross-contamination (#2078): when multiple rulings
+        # are extracted from a single PDF, an empty ruling_text must NOT
+        # fall back to the full document text.  This mirrors the guard in
+        # worker.py line 1579.  For single-ruling documents the empty
+        # string preserves backward compatibility.
+        ruling_text_value: str | None = ruling.ruling_text or (
+            "" if not is_multi else None
+        )
+
         extracted: dict = {
-            "ruling_text": ruling.ruling_text or "",
+            "ruling_text": ruling_text_value,
             "case_number": (
                 ruling.extracted_case_number
                 or doc_meta.get("case_number")

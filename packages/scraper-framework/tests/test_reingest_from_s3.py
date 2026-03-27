@@ -4580,6 +4580,44 @@ class TestFullReparseDocument:
 
     @patch.object(reingest, "_load_scraper_registry")
     @patch.object(reingest, "_extract_text_from_content")
+    def test_split_path_empty_ruling_text_uses_none(
+        self,
+        mock_extract: MagicMock,
+        mock_registry: MagicMock,
+    ) -> None:
+        """Split rulings with empty/None ruling_text should get None, not full PDF text (#2078).
+
+        When a split function returns rulings with empty or None ruling_text,
+        the extracted dict should have ruling_text=None to prevent the full
+        PDF text from being stored for every case in the document.
+        """
+        from courts.ca.fresno_tentatives import SplitRuling
+
+        rulings = [
+            SplitRuling(1, "CVPS001", "", None, None, None, None),
+            SplitRuling(2, "CVPS002", "has actual text", None, None, None, None),
+        ]
+        mock_split = MagicMock(return_value=rulings)
+        reingest._SPLIT_REGISTRY["test-empty-text"] = mock_split
+        reingest._SCRAPER_REGISTRY.pop("test-empty-text", None)
+        mock_extract.return_value = "FULL PDF CALENDAR TEXT THAT SHOULD NOT APPEAR"
+
+        try:
+            result = reingest._full_reparse_document(
+                b"raw pdf",
+                "test-empty-text",
+                self._doc_meta(scraper_id="test-empty-text"),
+            )
+            assert len(result) == 2
+            # Empty ruling_text in split should become None, not the full PDF text
+            assert result[0]["ruling_text"] is None
+            # Ruling with actual text should keep it
+            assert result[1]["ruling_text"] == "has actual text"
+        finally:
+            reingest._SPLIT_REGISTRY.pop("test-empty-text", None)
+
+    @patch.object(reingest, "_load_scraper_registry")
+    @patch.object(reingest, "_extract_text_from_content")
     def test_split_path_applies_case_type_from_number_fallback(
         self,
         mock_extract: MagicMock,
@@ -6023,6 +6061,84 @@ class TestReparseDocumentMultimodal:
         assert results[1]["ruling_index"] == 1
         # Split documents should have different split_document_ids
         assert results[0]["split_document_id"] != results[1]["split_document_id"]
+
+    def test_pdf_multimodal_multi_ruling_empty_text_uses_none(self) -> None:
+        """Multi-ruling PDFs with empty ruling_text should get None, not full PDF text (#2078).
+
+        When multimodal extraction returns multiple rulings but some have
+        empty/None ruling_text, the code must NOT fall back to the full PDF
+        text.  This mirrors the guard in worker.py line 1579.
+        """
+        from framework.llm_schema import ExtractedRuling
+
+        doc_meta = self._make_doc_meta()
+        mock_extractor = MagicMock()
+        mock_extractor.extract_from_pdf.return_value = [
+            ExtractedRuling(
+                extracted_case_number="30-2024-00000001",
+                extracted_case_title="Ruling One",
+                ruling_text=None,  # Empty — multimodal didn't extract text
+            ),
+            ExtractedRuling(
+                extracted_case_number="30-2024-00000002",
+                extracted_case_title="Ruling Two",
+                ruling_text="Second ruling text.",
+            ),
+            ExtractedRuling(
+                extracted_case_number="30-2024-00000003",
+                extracted_case_title="Ruling Three",
+                ruling_text="",  # Empty string — also should get None
+            ),
+        ]
+
+        with patch.object(reingest, "_apply_regex_fallbacks"):
+            results = reingest._reparse_document_multimodal(
+                b"%PDF-1.4 fake pdf",
+                "ca-oc-tentatives-civil",
+                doc_meta,
+                mock_extractor,
+            )
+
+        assert len(results) == 3
+        # Ruling with None text should get None, not full PDF text
+        assert results[0]["ruling_text"] is None
+        # Ruling with actual text should keep its text
+        assert results[1]["ruling_text"] == "Second ruling text."
+        # Ruling with empty string should get None for multi-ruling docs
+        assert results[2]["ruling_text"] is None
+        # All should be marked as split
+        assert all(r["is_split"] is True for r in results)
+
+    def test_pdf_multimodal_single_ruling_empty_text_uses_empty_string(self) -> None:
+        """Single-ruling PDFs with empty ruling_text should get empty string (#2078).
+
+        For backward compatibility, single-ruling documents still fall back
+        to empty string when ruling_text is empty.
+        """
+        from framework.llm_schema import ExtractedRuling
+
+        doc_meta = self._make_doc_meta()
+        mock_extractor = MagicMock()
+        mock_extractor.extract_from_pdf.return_value = [
+            ExtractedRuling(
+                extracted_case_number="30-2024-00000001",
+                extracted_case_title="Single Ruling",
+                ruling_text=None,
+            ),
+        ]
+
+        with patch.object(reingest, "_apply_regex_fallbacks"):
+            results = reingest._reparse_document_multimodal(
+                b"%PDF-1.4 fake pdf",
+                "ca-oc-tentatives-civil",
+                doc_meta,
+                mock_extractor,
+            )
+
+        assert len(results) == 1
+        # Single ruling with None text should get empty string (backward compat)
+        assert results[0]["ruling_text"] == ""
+        assert results[0]["is_split"] is False
 
     def test_pdf_multimodal_failure_falls_back(self) -> None:
         """Multimodal extraction failure should fall back to text-based."""
