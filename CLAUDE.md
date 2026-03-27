@@ -302,6 +302,7 @@ Run scripts via `scripts/run-py.sh scripts/<name>.py` — it reads the header an
 - Never hardcode secrets, API keys, credentials, or URLs to live court sites in source code. Use environment variables.
 - Never commit large binary files. Use `.gitignore`.
 - Write clear docstrings/comments for non-obvious logic.
+- **When removing or renaming module-level exports** (functions, classes, constants), grep for all import sites across the entire codebase (`src/` and `tests/`) before committing. Update or remove every import — not just the test file matching the modified module. Broken imports in unrelated test files will not surface until CI runs the full suite, and may not surface at all if the tests are skipped or filtered.
 
 ### Performance awareness
 

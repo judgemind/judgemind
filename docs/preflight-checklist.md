@@ -60,6 +60,7 @@ Machine-readable checklist of rules extracted from CLAUDE.md. Agents should vali
 | PR-07 | TypeScript build (web) | `npm run build` (for `packages/web/` only) |
 | PR-08 | Terraform format | `terraform fmt -check -recursive` |
 | PR-09 | Terraform validate | `terraform init -backend=false && terraform validate` |
+| PR-10 | Check import sites when removing/renaming exports | Grep for removed/renamed symbol names across `src/` and `tests/`; update or remove every import site |
 
 ## Task Workflow Rules
 
