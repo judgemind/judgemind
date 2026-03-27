@@ -319,32 +319,37 @@ export function RulingsFeed() {
                 <div className="flex items-start justify-between gap-4">
                   {/* Left: case info, judge, badges */}
                   <div className="min-w-0 flex-1">
-                    {node.case ? (
-                      <Link
-                        href={`/rulings/${node.id}`}
-                        className="block truncate rounded-sm font-medium text-foreground hover:text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                      >
-                        {node.case.caseNumber}
-                        {node.case.caseTitle ? ` \u2014 ${node.case.caseTitle}` : ''}
-                      </Link>
-                    ) : (
-                      <span className="text-muted-foreground">{'\u2014'}</span>
-                    )}
+                    {/* Title + outcome badge on same line */}
+                    <div className="flex items-center gap-2">
+                      {node.case ? (
+                        <Link
+                          href={`/rulings/${node.id}`}
+                          className="truncate rounded-sm font-medium text-foreground hover:text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                        >
+                          {node.case.caseNumber}
+                          {node.case.caseTitle ? ` \u2014 ${node.case.caseTitle}` : ''}
+                        </Link>
+                      ) : (
+                        <span className="text-muted-foreground">{'\u2014'}</span>
+                      )}
+                      <OutcomeBadge outcome={node.outcome} className="shrink-0" />
+                    </div>
 
-                    <div className="mt-0.5 flex flex-wrap items-center gap-x-2 text-xs text-muted-foreground">
+                    {/* Court/judge metadata — subordinate */}
+                    <div className="mt-0.5 flex flex-wrap items-center gap-x-2 text-xs text-muted-foreground/70">
                       {node.case?.court && (
                         <span>{node.case.court.county} {node.department ? `\u00B7 Dept. ${node.department}` : ''}</span>
                       )}
                       <span>{formatJudgeName(node.judge)}</span>
                     </div>
 
-                    <div className="mt-2 flex flex-wrap gap-2">
-                      <OutcomeBadge outcome={node.outcome} />
-                      <Badge variant="outline" className="text-muted-foreground">
+                    {/* Supporting badges — muted so they don't compete with outcome */}
+                    <div className="mt-1.5 flex flex-wrap gap-1.5">
+                      <Badge variant="outline" className="text-[11px] font-normal text-muted-foreground/70">
                         {formatMotionType(node.motionType)}
                       </Badge>
                       {node.case?.caseType && (
-                        <Badge variant="secondary" data-testid="case-type-badge">
+                        <Badge variant="outline" className="text-[11px] font-normal text-muted-foreground/70" data-testid="case-type-badge">
                           {formatLabel(node.case.caseType)}
                         </Badge>
                       )}
