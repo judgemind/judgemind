@@ -403,7 +403,7 @@ This atomically: (1) adds `Blocked by #<blocker>` to the issue body's `## Depend
 
 **Implementation tasks (PRs):** dependent issues are unblocked automatically by the `unblock-issues` CI workflow when the PR merges. The PR body must include `Closes #N`.
 
-**Non-PR completions:** manually unblock dependent issues. Search for open issues with `Blocked by #<your-issue>`. For each, if all blockers are closed: remove `status/blocked`, add `agent/ready`, remove the `Blocked by` lines from the body.
+**Non-PR completions:** unblock dependent issues by running `scripts/unblock-dependents.sh <your-issue>`. The script searches for open issues with `Blocked by #<your-issue>`, checks if all blockers are closed, and if so removes `status/blocked`, adds `agent/ready`, and cleans the `Blocked by` lines from the body. Use `--dry-run` to preview changes first.
 
 ## Creating Sub-Tasks
 

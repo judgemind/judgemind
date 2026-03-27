@@ -490,17 +490,7 @@ If the investigation reveals no actionable follow-ups (everything is working as 
 
 Post a summary comment on the investigation issue listing the findings and linking all follow-up issues created. Add the `status/review` label.
 
-Then manually unblock any issues that were waiting on this one. Search for them:
-```
-gh issue list --repo judgemind/judgemind --state open \
-    --search "Blocked by #<your-issue>" \
-    --json number,title,body
-```
-For each result, check every `Blocked by #X` line. If **all** referenced issues are now closed:
-1. Remove the `status/blocked` label and add `agent/ready`.
-2. Remove the resolved `Blocked by #N` lines from the issue body (write to a temp file and use `gh issue edit <N> --body-file`).
-
-If any blocker is still open, leave the issue as blocked.
+Then unblock any issues that were waiting on this one by running `scripts/unblock-dependents.sh <your-issue>`. The script searches for open issues with `Blocked by #<your-issue>`, checks if all blockers are closed, and if so removes `status/blocked`, adds `agent/ready`, and cleans the `Blocked by` lines from the body. Use `--dry-run` to preview changes first.
 
 Continue to Step 5.
 
