@@ -128,7 +128,15 @@ describe('SearchPage (render)', () => {
     ).toBeInTheDocument();
   });
 
-  it('renders filter panel with county, judge, motion types, outcomes, and date inputs', () => {
+  it('renders filter panel with county, judge, motion types, outcomes, and date inputs when results are present', () => {
+    mockSearchParamsValue = new URLSearchParams('q=test');
+    mockQueryResult.data = {
+      searchRulings: {
+        edges: [{ cursor: 'c1', node: makeSearchHit() }],
+        pageInfo: { hasNextPage: false, endCursor: null },
+        totalHits: 1,
+      },
+    };
     render(<SearchPage />);
     expect(screen.getByLabelText('County')).toBeInTheDocument();
     expect(screen.getByLabelText('Judge')).toBeInTheDocument();
@@ -259,7 +267,15 @@ describe('SearchPage (render)', () => {
     expect(screen.queryByTestId('scroll-sentinel')).not.toBeInTheDocument();
   });
 
-  it('renders motion type filter checkboxes', () => {
+  it('renders motion type filter checkboxes when results are present', () => {
+    mockSearchParamsValue = new URLSearchParams('q=test');
+    mockQueryResult.data = {
+      searchRulings: {
+        edges: [{ cursor: 'c1', node: makeSearchHit() }],
+        pageInfo: { hasNextPage: false, endCursor: null },
+        totalHits: 1,
+      },
+    };
     render(<SearchPage />);
     expect(screen.getByText('MSJ')).toBeInTheDocument();
     expect(screen.getByText('MTD')).toBeInTheDocument();
@@ -268,7 +284,15 @@ describe('SearchPage (render)', () => {
     expect(screen.getByText('Anti-SLAPP')).toBeInTheDocument();
   });
 
-  it('renders outcome filter checkboxes', () => {
+  it('renders outcome filter checkboxes when results are present', () => {
+    mockSearchParamsValue = new URLSearchParams('q=test');
+    mockQueryResult.data = {
+      searchRulings: {
+        edges: [{ cursor: 'c1', node: makeSearchHit() }],
+        pageInfo: { hasNextPage: false, endCursor: null },
+        totalHits: 1,
+      },
+    };
     render(<SearchPage />);
     expect(screen.getByText('Granted')).toBeInTheDocument();
     expect(screen.getByText('Denied')).toBeInTheDocument();

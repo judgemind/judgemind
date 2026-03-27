@@ -576,103 +576,102 @@ export function SearchPage() {
             />
           </div>
           <Button type="submit">Search</Button>
-          {/* Mobile filter toggle */}
-          <Sheet open={mobileFiltersOpen} onOpenChange={setMobileFiltersOpen}>
-            <SheetTrigger asChild>
-              <Button variant="outline" size="icon" className="lg:hidden" aria-label="Open filters">
-                <SlidersHorizontal className="h-4 w-4" aria-hidden="true" />
-              </Button>
-            </SheetTrigger>
-            <SheetContent side="left" className="w-80 overflow-y-auto">
-              <SheetHeader>
-                <SheetTitle>Filters</SheetTitle>
-                <SheetDescription>Refine your search results</SheetDescription>
-              </SheetHeader>
-              <div className="mt-4">
-                <FilterContent {...filterProps} />
-              </div>
-            </SheetContent>
-          </Sheet>
+          {/* Mobile filter toggle — hidden when no results or on error */}
+          {edges.length > 0 && !error && (
+            <Sheet open={mobileFiltersOpen} onOpenChange={setMobileFiltersOpen}>
+              <SheetTrigger asChild>
+                <Button variant="outline" size="icon" className="lg:hidden" aria-label="Open filters">
+                  <SlidersHorizontal className="h-4 w-4" aria-hidden="true" />
+                </Button>
+              </SheetTrigger>
+              <SheetContent side="left" className="w-80 overflow-y-auto">
+                <SheetHeader>
+                  <SheetTitle>Filters</SheetTitle>
+                  <SheetDescription>Refine your search results</SheetDescription>
+                </SheetHeader>
+                <div className="mt-4">
+                  <FilterContent {...filterProps} />
+                </div>
+              </SheetContent>
+            </Sheet>
+          )}
         </div>
       </form>
 
-      {/* Main content: sidebar filters + results */}
-      <div className="flex gap-6">
-        {/* Desktop filter sidebar */}
-        <aside aria-label="Search filters" className="hidden w-64 shrink-0 lg:block">
-          <Card>
-            <CardContent className="p-4">
-              <FilterContent {...filterProps} />
+      {/* Before first search — full width, centered */}
+      {!hasSearched && (
+        <Card className="border-dashed">
+          <CardContent className="flex flex-col items-center justify-center py-16">
+            <Search className="mb-4 h-12 w-12 text-muted-foreground/50" aria-hidden="true" />
+            <p className="text-lg font-medium text-muted-foreground">
+              Enter a search term to begin
+            </p>
+            <p className="mt-1 text-sm text-muted-foreground">
+              Search by keyword, case number, judge name, or party
+            </p>
+          </CardContent>
+        </Card>
+      )}
+
+      {/* Loading state — full width, no sidebar */}
+      {hasSearched && loading && edges.length === 0 && (
+        <div className="divide-y rounded-lg border">
+          {Array.from({ length: 5 }).map((_, i) => (
+            <SkeletonRow key={i} />
+          ))}
+        </div>
+      )}
+
+      {/* Error state — full width, centered */}
+      {hasSearched && error && (
+        <Card className="border-destructive">
+          <CardContent className="py-6 text-center">
+            <p className="text-sm text-destructive">
+              Failed to load search results. Please try again.
+            </p>
+          </CardContent>
+        </Card>
+      )}
+
+      {/* Empty results — full width, centered */}
+      {hasSearched &&
+        !loading &&
+        !error &&
+        shouldQuery &&
+        edges.length === 0 && (
+          <Card className="border-dashed">
+            <CardContent className="flex flex-col items-center justify-center py-16">
+              <Search className="mb-4 h-12 w-12 text-muted-foreground/50" aria-hidden="true" />
+              <p className="text-lg font-medium text-muted-foreground">
+                No results for your search
+              </p>
+              <p className="mt-1 text-sm text-muted-foreground">
+                Try broadening your filters or using different keywords
+              </p>
             </CardContent>
           </Card>
-        </aside>
+        )}
 
-        {/* Results area */}
-        <div className="min-w-0 flex-1">
-          {/* Before first search */}
-          {!hasSearched && (
-            <Card className="border-dashed">
-              <CardContent className="flex flex-col items-center justify-center py-16">
-                <Search className="mb-4 h-12 w-12 text-muted-foreground/50" aria-hidden="true" />
-                <p className="text-lg font-medium text-muted-foreground">
-                  Enter a search term to begin
-                </p>
-                <p className="mt-1 text-sm text-muted-foreground">
-                  Search by keyword, case number, judge name, or party
-                </p>
+      {/* Main content: sidebar filters + results — only when results exist and no error */}
+      {edges.length > 0 && !error && (
+        <div className="flex gap-6">
+          {/* Desktop filter sidebar */}
+          <aside aria-label="Search filters" className="hidden w-64 shrink-0 lg:block">
+            <Card>
+              <CardContent className="p-4">
+                <FilterContent {...filterProps} />
               </CardContent>
             </Card>
-          )}
+          </aside>
 
-          {/* Loading state */}
-          {hasSearched && loading && edges.length === 0 && (
-            <div className="divide-y rounded-lg border">
-              {Array.from({ length: 5 }).map((_, i) => (
-                <SkeletonRow key={i} />
-              ))}
-            </div>
-          )}
-
-          {/* Error state */}
-          {hasSearched && error && (
-            <Card className="border-destructive">
-              <CardContent className="py-6 text-center">
-                <p className="text-sm text-destructive">
-                  Failed to load search results. Please try again.
-                </p>
-              </CardContent>
-            </Card>
-          )}
-
-          {/* Empty results */}
-          {hasSearched &&
-            !loading &&
-            !error &&
-            shouldQuery &&
-            edges.length === 0 && (
-              <Card className="border-dashed">
-                <CardContent className="flex flex-col items-center justify-center py-16">
-                  <Search className="mb-4 h-12 w-12 text-muted-foreground/50" aria-hidden="true" />
-                  <p className="text-lg font-medium text-muted-foreground">
-                    No results for your search
-                  </p>
-                  <p className="mt-1 text-sm text-muted-foreground">
-                    Try broadening your filters or using different keywords
-                  </p>
-                </CardContent>
-              </Card>
-            )}
-
-          {/* Results header */}
-          {hasSearched && edges.length > 0 && (
+          {/* Results area */}
+          <div className="min-w-0 flex-1">
+            {/* Results header */}
             <p className="mb-4 text-sm font-medium text-muted-foreground">
               {totalHits.toLocaleString()} result
               {totalHits !== 1 ? 's' : ''} found
             </p>
-          )}
 
-          {/* Result rows */}
-          {edges.length > 0 && (
             <div>
               <div className="divide-y rounded-lg border">
                 {edges.map(({ node }) => (
@@ -681,7 +680,7 @@ export function SearchPage() {
               </div>
 
               {/* Loading indicator for infinite scroll */}
-              {loading && edges.length > 0 && (
+              {loading && (
                 <div className="mt-3 divide-y rounded-lg border">
                   {Array.from({ length: 3 }).map((_, i) => (
                     <SkeletonRow key={`loading-${i}`} />
@@ -696,9 +695,9 @@ export function SearchPage() {
                 onLoadMore={handleLoadMore}
               />
             </div>
-          )}
+          </div>
         </div>
-      </div>
+      )}
     </div>
   );
 }
