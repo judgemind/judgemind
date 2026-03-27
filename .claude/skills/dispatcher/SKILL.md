@@ -336,7 +336,7 @@ The threshold of 40 iterations is conservative — each iteration adds tool call
 4. **Wait for all active agents to complete.** Check active agent count each iteration. Once all agents have finished (or reported back), proceed to exit.
 5. **Merge any remaining green PRs.** Do one final sweep.
 6. **Persist all state.** Ensure `tmp/dispatcher_state.json` is up to date with: `prs_since_last_audit`, `session_number`, paused state, stopped issues, and recently completed tasks.
-7. **Send a rotation notification** via `telegram__reply` (if Telegram is available): "Dispatcher rotating context (session N, M iterations). Restarting momentarily."
+7. **Send a rotation notification** using the **Context rotation** template from the Message Templates table (if Telegram is available)
 8. **Do NOT send a session ended notification.** This is a rotation, not a shutdown. The next session will continue seamlessly.
 10. **Exit.** Print a summary of what was accomplished in this session, then stop. The outer `while :; do` loop will restart the dispatcher with a fresh context.
 
@@ -609,14 +609,14 @@ After merging:
 If a PR's CI is failing:
 - Check if the failure is in a check the agent could fix (lint, test, type error)
 - If so, the `/task` agent should already be handling it — check its status file
-- If the agent has exited and CI is still failing, log it and notify via `telegram__reply`: "CI still failing on PR #<N> after agent exited — needs attention"
+- If the agent has exited and CI is still failing, log it and send a Telegram notification using the **CI failed (orphaned)** template from the Message Templates table
 - Do not attempt to fix another agent's PR from the dispatcher — spawn a new `/task` for it if needed
 
 ### Handling merge conflicts
 
 If a PR has merge conflicts:
 - The owning `/task` agent should handle rebasing
-- If the agent has exited, log it and notify via `telegram__reply`: "PR #<N> has merge conflicts and agent has exited — needs attention"
+- If the agent has exited, log it and send a Telegram notification using the **Merge conflict (orphaned)** template from the Message Templates table
 - The dispatcher does not rebase other agents' branches
 
 ### Auto-apply dev terraform
@@ -682,12 +682,12 @@ For each environment that needs an apply:
 #### Success handling
 
 After a successful apply:
-- Send a Telegram notification via `telegram__reply`: "Terraform apply succeeded for dev after PR #<N> merged"
+- Send a Telegram notification using the **Terraform apply succeeded** template from the Message Templates table
 
 #### Failure handling
 
 If the apply fails:
-1. Send a Telegram notification via `telegram__reply`: "Terraform apply FAILED for dev after PR #<N> — filing p1 issue"
+1. Send a Telegram notification using the **Terraform apply failed** template from the Message Templates table
 2. File a `priority/p1` issue describing the failure, referencing the merged PR, with `agent/ready` label so an agent can investigate.
 3. Do not retry automatically — the filed issue will be picked up by an agent.
 
@@ -719,7 +719,7 @@ In the main loop (step 5), after handling merges and syncing:
 2. Check that no `/audit` agent is already running (avoid overlapping audits).
 3. If both conditions are met and a slot is available, spawn `/audit` as a background subagent.
 4. Reset `prs_since_last_audit` to 0 and persist to `tmp/dispatcher_state.json`.
-5. Send a Telegram notification via `telegram__reply`: "Launching periodic audit (20 PRs merged since last audit)"
+5. Send a Telegram notification using the **Audit triggered** template from the Message Templates table
 
 ### Slot usage
 
@@ -763,20 +763,73 @@ Telegram integration uses the MCP Telegram plugin, which delivers messages direc
 
 Use `telegram__reply` (with the `chat_id` from the most recent inbound Telegram message) to send notifications. If no Telegram messages have been received in this session, skip notifications — the user is not monitoring via Telegram.
 
-Send a notification for **every** lifecycle event:
+Send a notification for **every** lifecycle event listed in the Message Templates table below.
 
-- [ ] **Session started** — at dispatcher startup
-- [ ] **Stale assignments cleaned** — after startup cleanup (if any were found)
-- [ ] **Agent launched** — after each `/task #N` spawn (include issue number, title, agent ID)
-- [ ] **Agent completed** — when `<task-notification>` reports success (include issue number, summary)
-- [ ] **Agent failed** — when `<task-notification>` reports failure (include issue number, error)
-- [ ] **PR merged** — after each `gh pr merge` (include PR number and title)
-- [ ] **Deploy succeeded/failed** — after watching deploy workflow
-- [ ] **Terraform apply succeeded/failed** — after applying dev terraform for infra PRs
-- [ ] **Blocker encountered** — when an issue needs human decision
-- [ ] **Audit triggered** — when `/audit` is spawned (include PR count since last audit)
-- [ ] **Context rotation** — when winding down for a context rotation (include session number and iteration count)
-- [ ] **Session ended** — at dispatcher shutdown
+### Message formatting rules
+
+**All outbound notifications MUST use `format: "markdownv2"` on `telegram__reply`.** This enables clickable hyperlinks, bold text, and inline code formatting.
+
+Key MarkdownV2 rules:
+- **Links:** `[visible text](url)` — use for all issue and PR references
+- **Bold:** `*bold text*`
+- **Inline code:** `` `monospace` ``
+- **Escape special characters** outside of links/bold/code: `_`, `*`, `[`, `]`, `(`, `)`, `~`, `` ` ``, `>`, `#`, `+`, `-`, `=`, `|`, `{`, `}`, `.`, `!`
+
+**Hyperlink format for issues and PRs:**
+- Issue: `[\#N](https://github.com/judgemind/judgemind/issues/N)`
+- PR: `[PR \#M](https://github.com/judgemind/judgemind/pull/M)`
+
+**Conciseness rule:** Messages are read on mobile. Lead with the emoji and key info. Keep the main line under 200 characters. Details (if any) go on a second line.
+
+### Message templates
+
+Use these exact templates for each event type. Replace placeholders (`<title>`, `<N>`, etc.) with actual values. Escape MarkdownV2 special characters in dynamic values (especially issue titles, which may contain `.`, `-`, `(`, `)`, etc.). Each template starts with a status emoji for instant visual scanning.
+
+| Event | Template |
+|-------|----------|
+| **Session started** | `🚀 Dispatcher started \(session <S>, <N> slots\)` |
+| **Stale assignments cleaned** | `🧹 Cleaned <N> stale assignments: <\#list>` |
+| **Agent launched** | `🚀 Started [\#N](url): <title>` |
+| **Agent completed** | `✅ Done [\#N](url): <title> — [PR \#M](url) merged` |
+| **Agent failed** | `❌ Failed [\#N](url): <title> — <reason>` |
+| **PR merged** | `✅ Merged [PR \#M](url): <title>` |
+| **CI failed (orphaned)** | `⚠️ CI failed on [PR \#M](url): <check\-name> — needs attention` |
+| **Merge conflict (orphaned)** | `⚠️ Merge conflict on [PR \#M](url) — agent exited, needs attention` |
+| **Deploy succeeded** | `✅ Deploy succeeded for [PR \#M](url)` |
+| **Deploy failed** | `❌ Deploy FAILED for [PR \#M](url) — filed [\#X](url)` |
+| **Terraform apply succeeded** | `✅ TF apply succeeded \(dev\) after [PR \#M](url)` |
+| **Terraform apply failed** | `❌ TF apply FAILED \(dev\) after [PR \#M](url) — filed [\#X](url)` |
+| **Blocker encountered** | `🛑 Blocked [\#N](url): <title> — needs human decision` |
+| **Audit triggered** | `📋 Launching audit \(<N> PRs since last\)` |
+| **Dispatch cycle summary** | `📋 Slots: <A>/<M> active — queue: <Q> ready` |
+| **Context rotation** | `🔄 Dispatcher rotating \(session <S>, <I> iterations\)\. Restarting\.` |
+| **Session ended** | `🏁 Dispatcher stopped\. <N> issues completed, <M> PRs merged\.` |
+
+**Full example** (agent launched):
+```
+telegram__reply with:
+  chat_id: "<chat_id>"
+  format: "markdownv2"
+  text: "🚀 Started [\#42](https://github.com/judgemind/judgemind/issues/42): Fix OC scraper date parsing"
+```
+
+**Full example** (agent completed):
+```
+telegram__reply with:
+  chat_id: "<chat_id>"
+  format: "markdownv2"
+  text: "✅ Done [\#42](https://github.com/judgemind/judgemind/issues/42): Fix OC scraper date parsing — [PR \#85](https://github.com/judgemind/judgemind/pull/85) merged"
+```
+
+### Escaping dynamic values
+
+Issue titles and error messages often contain MarkdownV2 special characters. Before inserting dynamic text into a template, escape these characters by prepending `\`:
+
+Characters to escape: `_`, `*`, `[`, `]`, `(`, `)`, `~`, `` ` ``, `>`, `#`, `+`, `-`, `=`, `|`, `{`, `}`, `.`, `!`
+
+For example, a title like "Fix OC scraper (v2.1)" becomes "Fix OC scraper \(v2\.1\)" in the message text.
+
+**Inside link URLs** (between `(` and `)` in `[text](url)`), no escaping is needed — Telegram parses the URL literally.
 
 ### Inbound commands
 
@@ -832,7 +885,7 @@ Shutdown triggers:
 
 See "Context-Aware Rotation" above for the detailed wind-down steps. Key differences from full shutdown:
 - **Do NOT send a session ended notification** — this is a rotation, not an end
-- **DO send a rotation notification** via `telegram__reply`
+- **DO send a rotation notification** using the **Context rotation** template from the Message Templates table
 - **DO persist all state** to `tmp/` files so the next session picks up seamlessly
 
 ---
