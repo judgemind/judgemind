@@ -14,13 +14,13 @@
   "expected_cases": [
     {
       "case_number": "CVPS2306157",
-      "case_title": "Yeldell v. Henss",
+      "case_title": "Lachon Yeldell v. Henss",
       "motion_type": "demurrer",
       "outcome": "denied"
     },
     {
       "case_number": "CVPS2306202",
-      "case_title": "Crump v. Irwin",
+      "case_title": "Crump v. John W. Irwin",
       "motion_type": "terminating sanctions",
       "outcome": "other"
     },
@@ -32,7 +32,7 @@
     },
     {
       "case_number": "CVPS2404518",
-      "case_title": "Nieto v. Creating A Legacy, Inc.",
+      "case_title": "Jennifer Nieto v. Creating A Legacy, Inc.",
       "motion_type": "motion for production of documents",
       "outcome": "denied"
     }

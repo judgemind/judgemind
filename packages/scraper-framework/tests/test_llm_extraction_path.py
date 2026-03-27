@@ -1266,13 +1266,13 @@ class TestCountyExtractionPath:
         mock_county_extractor.extract.return_value = [
             ExtractedRuling(
                 extracted_case_number="CIVRS2502080",
-                extracted_case_title="Carmell v. Genus-Robinson-Haywood",
+                extracted_case_title="Angela Carmell v. Kathleen Janet Genus-Robinson-Haywood",
                 ruling_text="All seven motions to compel are moot.",
                 outcome=ExtractionOutcome.OTHER,
                 motion_type="Motion to Compel",
                 extracted_parties=[
-                    ExtractedParty(name="Carmell", role="plaintiff"),
-                    ExtractedParty(name="Genus-Robinson-Haywood", role="defendant"),
+                    ExtractedParty(name="Angela Carmell", role="plaintiff"),
+                    ExtractedParty(name="Kathleen Janet Genus-Robinson-Haywood", role="defendant"),
                 ],
             ),
         ]
@@ -1333,7 +1333,8 @@ class TestCountyExtractionPath:
             # Verify the split event has the LLM-extracted fields
             split_event = mock_process.call_args[0][0]
             assert split_event["case_number"] == "CIVRS2502080"
-            assert split_event["case_title"] == "Carmell v. Genus-Robinson-Haywood"
+            expected_title = "Angela Carmell v. Kathleen Janet Genus-Robinson-Haywood"
+            assert split_event["case_title"] == expected_title
             assert split_event["_llm_extracted"] is True
 
     def test_san_bernardino_multi_case_split(self) -> None:
@@ -1344,12 +1345,12 @@ class TestCountyExtractionPath:
         mock_county_extractor.extract.return_value = [
             ExtractedRuling(
                 extracted_case_number="CIVSB2419120",
-                extracted_case_title="Solis v. General Motors",
+                extracted_case_title="Lorenzo Solis v. General Motors",
                 ruling_text="Motion for summary adjudication is denied.",
                 outcome=ExtractionOutcome.DENIED,
                 motion_type="Motion for Summary Adjudication",
                 extracted_parties=[
-                    ExtractedParty(name="Solis", role="plaintiff"),
+                    ExtractedParty(name="Lorenzo Solis", role="plaintiff"),
                     ExtractedParty(name="General Motors", role="defendant"),
                 ],
             ),
