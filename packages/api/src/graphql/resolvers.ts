@@ -7,7 +7,7 @@ import { authResolvers } from './auth-resolvers';
 import { alertResolvers } from './alert-resolvers';
 import { dataQualityResolvers } from './data-quality';
 import { searchRulings } from '../search/search-rulings';
-import { getJudgeAnalytics } from './judge-analytics';
+import { getJudgeAnalytics, getMultipleJudgeAnalytics } from './judge-analytics';
 import { getPlatformStats } from './platform-stats-cache';
 
 interface Context {
@@ -231,6 +231,16 @@ export const resolvers = {
       { pool }: Context,
     ) => {
       return getJudgeAnalytics(pool, judgeId);
+    },
+
+    compareJudges: async (
+      _: unknown,
+      { judgeIds }: { judgeIds: string[] },
+      { pool }: Context,
+    ) => {
+      const results = await getMultipleJudgeAnalytics(pool, judgeIds);
+      // Filter out null entries (non-existent judges)
+      return results.filter((r): r is NonNullable<typeof r> => r !== null);
     },
 
     // -----------------------------------------------------------------------

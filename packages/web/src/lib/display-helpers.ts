@@ -971,3 +971,43 @@ export function cleanRulingText(text: string, metadata?: RulingMetadata): string
 
   return paragraphs;
 }
+
+// ---------------------------------------------------------------------------
+// Judge analytics helpers (shared between JudgeProfile and JudgeComparison)
+// ---------------------------------------------------------------------------
+
+interface OutcomeCountInput {
+  outcome: string;
+  count: number;
+}
+
+/**
+ * Compute overall grant rate from an array of outcome counts.
+ * Formula: granted / (granted + denied + partial).
+ * Returns null when the denominator is zero (no substantive outcomes).
+ */
+export function computeOverallGrantRate(
+  rulingsByOutcome: OutcomeCountInput[],
+): number | null {
+  let granted = 0;
+  let denied = 0;
+  let partial = 0;
+  for (const { outcome, count } of rulingsByOutcome) {
+    if (outcome === 'granted') granted += count;
+    else if (outcome === 'denied') denied += count;
+    else if (outcome === 'granted_in_part' || outcome === 'denied_in_part')
+      partial += count;
+  }
+  const denominator = granted + denied + partial;
+  if (denominator === 0) return null;
+  return granted / denominator;
+}
+
+/**
+ * Format a date range string from ISO date strings.
+ * Returns an empty string if either date is null.
+ */
+export function formatDateRange(earliest: string | null, latest: string | null): string {
+  if (!earliest || !latest) return '';
+  return `${formatDate(earliest)} \u2013 ${formatDate(latest)}`;
+}

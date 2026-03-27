@@ -10,6 +10,8 @@ import {
   formatDate,
   formatLabel,
   formatMotionType,
+  computeOverallGrantRate,
+  formatDateRange,
 } from '@/lib/display-helpers';
 import { InfiniteScrollTrigger } from '@/components/InfiniteScrollTrigger';
 import { useInfiniteScroll } from '@/hooks/useInfiniteScroll';
@@ -172,36 +174,6 @@ function RulingsSkeleton() {
       </div>
     </div>
   );
-}
-
-// ---------------------------------------------------------------------------
-// Helper: compute overall grant rate from outcome counts
-// ---------------------------------------------------------------------------
-
-function computeOverallGrantRate(
-  rulingsByOutcome: OutcomeCount[],
-): number | null {
-  let granted = 0;
-  let denied = 0;
-  let partial = 0;
-  for (const { outcome, count } of rulingsByOutcome) {
-    if (outcome === 'granted') granted += count;
-    else if (outcome === 'denied') denied += count;
-    else if (outcome === 'granted_in_part' || outcome === 'denied_in_part')
-      partial += count;
-  }
-  const denominator = granted + denied + partial;
-  if (denominator === 0) return null;
-  return granted / denominator;
-}
-
-// ---------------------------------------------------------------------------
-// Helper: format date range string
-// ---------------------------------------------------------------------------
-
-function formatDateRange(earliest: string | null, latest: string | null): string {
-  if (!earliest || !latest) return '';
-  return `${formatDate(earliest)} \u2013 ${formatDate(latest)}`;
 }
 
 // ---------------------------------------------------------------------------

@@ -201,6 +201,22 @@ export async function getJudgeAnalytics(
 }
 
 /**
+ * Fetch analytics for multiple judges in parallel. Reuses getJudgeAnalytics
+ * per judge (including Redis caching). Returns an array in the same order
+ * as the input IDs. Non-existent judges produce null entries which are
+ * filtered out by the resolver.
+ *
+ * Capped at 10 judges to prevent abuse.
+ */
+export async function getMultipleJudgeAnalytics(
+  pool: Pool,
+  judgeIds: string[],
+): Promise<(JudgeAnalytics | null)[]> {
+  const capped = judgeIds.slice(0, 10);
+  return Promise.all(capped.map((id) => getJudgeAnalytics(pool, id)));
+}
+
+/**
  * Invalidate cached analytics for a judge (call when new ruling is indexed).
  */
 export async function invalidateJudgeAnalyticsCache(judgeId: string): Promise<void> {
