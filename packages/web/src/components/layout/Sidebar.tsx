@@ -14,12 +14,25 @@ import {
 } from '@/components/ui/tooltip';
 import { cn } from '@/lib/utils';
 
+/** Display label for each navigation group. */
+const GROUP_LABELS: Record<NavGroup, string> = {
+  explore: 'Explore',
+  research: 'Research',
+  admin: 'Admin',
+};
+
+/** Ordered list of groups — controls the section rendering order in all sidebar variants. */
+const GROUP_ORDER: NavGroup[] = ['explore', 'research', 'admin'];
+
+type NavGroup = 'explore' | 'research' | 'admin';
+
 /** Navigation item definition shared by all sidebar variants. */
 interface NavItem {
   href: string;
   icon: React.ReactNode;
   label: string;
   activeFn: (pathname: string) => boolean;
+  group: NavGroup;
   adminOnly?: boolean;
 }
 
@@ -34,24 +47,28 @@ function useNavItems(): NavItem[] {
       icon: <Search className="h-4 w-4" aria-hidden="true" />,
       label: 'Search Rulings',
       activeFn: (p) => p === '/search',
+      group: 'explore',
     },
     {
       href: '/rulings',
       icon: <FileText className="h-4 w-4" aria-hidden="true" />,
       label: 'Latest Rulings',
       activeFn: (p) => p === '/rulings',
+      group: 'explore',
     },
     {
       href: '/cases',
       icon: <FolderOpen className="h-4 w-4" aria-hidden="true" />,
       label: 'Cases',
       activeFn: (p) => p === '/cases',
+      group: 'research',
     },
     {
       href: '/judges',
       icon: <Gavel className="h-4 w-4" aria-hidden="true" />,
       label: 'Judges',
       activeFn: (p) => p === '/judges',
+      group: 'research',
     },
   ];
 
@@ -61,6 +78,7 @@ function useNavItems(): NavItem[] {
       icon: <BarChart3 className="h-4 w-4" aria-hidden="true" />,
       label: 'Data Health',
       activeFn: (p) => p.startsWith('/admin/data-quality'),
+      group: 'admin',
       adminOnly: true,
     });
   }
@@ -74,70 +92,39 @@ interface SidebarProps {
 }
 
 export function Sidebar({ onLinkClick }: SidebarProps) {
-  const { user, loading } = useAuth();
   const pathname = usePathname();
-  const isAdmin = !loading && user?.role === 'admin';
+  const navItems = useNavItems();
+
+  /** Group items by their `group` field, preserving insertion order within each group. */
+  const grouped = GROUP_ORDER.reduce<Record<string, NavItem[]>>((acc, group) => {
+    const items = navItems.filter((item) => item.group === group);
+    if (items.length > 0) acc[group] = items;
+    return acc;
+  }, {});
+
+  const groupKeys = Object.keys(grouped) as NavGroup[];
 
   return (
     <nav aria-label="Sidebar" className="flex flex-col gap-1 p-4 text-sm">
-      <h2 className="mb-1 px-3 text-xs font-semibold uppercase tracking-wider text-muted-foreground">
-        Explore
-      </h2>
-      <SidebarLink
-        href="/search"
-        icon={<Search className="h-4 w-4" aria-hidden="true" />}
-        active={pathname === '/search'}
-        onClick={onLinkClick}
-      >
-        Search Rulings
-      </SidebarLink>
-      <SidebarLink
-        href="/rulings"
-        icon={<FileText className="h-4 w-4" aria-hidden="true" />}
-        active={pathname === '/rulings'}
-        onClick={onLinkClick}
-      >
-        Latest Rulings
-      </SidebarLink>
-
-      <Separator className="my-3" />
-
-      <h2 className="mb-1 px-3 text-xs font-semibold uppercase tracking-wider text-muted-foreground">
-        Research
-      </h2>
-      <SidebarLink
-        href="/cases"
-        icon={<FolderOpen className="h-4 w-4" aria-hidden="true" />}
-        active={pathname === '/cases'}
-        onClick={onLinkClick}
-      >
-        Cases
-      </SidebarLink>
-      <SidebarLink
-        href="/judges"
-        icon={<Gavel className="h-4 w-4" aria-hidden="true" />}
-        active={pathname === '/judges'}
-        onClick={onLinkClick}
-      >
-        Judges
-      </SidebarLink>
-
-      {isAdmin && (
-        <>
-          <Separator className="my-3" />
+      {groupKeys.map((group, groupIdx) => (
+        <div key={group}>
+          {groupIdx > 0 && <Separator className="my-3" />}
           <h2 className="mb-1 px-3 text-xs font-semibold uppercase tracking-wider text-muted-foreground">
-            Admin
+            {GROUP_LABELS[group]}
           </h2>
-          <SidebarLink
-            href="/admin/data-quality/"
-            icon={<BarChart3 className="h-4 w-4" aria-hidden="true" />}
-            active={pathname.startsWith('/admin/data-quality')}
-            onClick={onLinkClick}
-          >
-            Data Health
-          </SidebarLink>
-        </>
-      )}
+          {grouped[group].map((item) => (
+            <SidebarLink
+              key={item.href}
+              href={item.href}
+              icon={item.icon}
+              active={item.activeFn(pathname)}
+              onClick={onLinkClick}
+            >
+              {item.label}
+            </SidebarLink>
+          ))}
+        </div>
+      ))}
     </nav>
   );
 }
@@ -151,15 +138,15 @@ export function DesktopSidebar() {
   );
 }
 
-/** Icon-only sidebar for tablet viewports (md to lg, 768px–1024px). */
+/** Icon-only sidebar for tablet viewports (md to lg, 768px-1024px). */
 export function TabletSidebar() {
   const pathname = usePathname();
   const navItems = useNavItems();
 
-  /** Index of the first admin-only item, used to insert a separator. */
-  const adminStartIdx = navItems.findIndex((item) => item.adminOnly);
-  /** Index where "Research" group starts (Cases). */
-  const researchStartIdx = navItems.findIndex((item) => item.href === '/cases');
+  /** Sort items by GROUP_ORDER so separators render correctly regardless of useNavItems() order. */
+  const sortedItems = [...navItems].sort(
+    (a, b) => GROUP_ORDER.indexOf(a.group) - GROUP_ORDER.indexOf(b.group),
+  );
 
   return (
     <aside
@@ -168,35 +155,38 @@ export function TabletSidebar() {
     >
       <TooltipProvider delayDuration={150}>
         <nav aria-label="Sidebar" className="flex flex-col items-center gap-1 py-4">
-          {navItems.map((item, idx) => (
-            <span key={item.href}>
-              {/* Insert separator before Research and Admin groups */}
-              {(idx === researchStartIdx || idx === adminStartIdx) && (
-                <Separator className="my-2 w-6" />
-              )}
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <Button
-                    variant={item.activeFn(pathname) ? 'secondary' : 'ghost'}
-                    size="icon"
-                    className={cn(
-                      'h-9 w-9',
-                      item.activeFn(pathname) &&
-                        'bg-accent text-accent-foreground border-l-2 border-primary',
-                    )}
-                    asChild
-                  >
-                    <Link href={item.href} aria-label={item.label}>
-                      {item.icon}
-                    </Link>
-                  </Button>
-                </TooltipTrigger>
-                <TooltipContent side="right" sideOffset={8}>
-                  {item.label}
-                </TooltipContent>
-              </Tooltip>
-            </span>
-          ))}
+          {sortedItems.map((item, idx) => {
+            /** Insert separator when the group changes from the previous item. */
+            const prevGroup = idx > 0 ? sortedItems[idx - 1].group : item.group;
+            const showSeparator = idx > 0 && item.group !== prevGroup;
+
+            return (
+              <span key={item.href}>
+                {showSeparator && <Separator className="my-2 w-6" />}
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <Button
+                      variant={item.activeFn(pathname) ? 'secondary' : 'ghost'}
+                      size="icon"
+                      className={cn(
+                        'h-9 w-9',
+                        item.activeFn(pathname) &&
+                          'bg-accent text-accent-foreground border-l-2 border-primary',
+                      )}
+                      asChild
+                    >
+                      <Link href={item.href} aria-label={item.label}>
+                        {item.icon}
+                      </Link>
+                    </Button>
+                  </TooltipTrigger>
+                  <TooltipContent side="right" sideOffset={8}>
+                    {item.label}
+                  </TooltipContent>
+                </Tooltip>
+              </span>
+            );
+          })}
         </nav>
       </TooltipProvider>
     </aside>

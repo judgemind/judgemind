@@ -163,3 +163,31 @@ describe('DesktopSidebar', () => {
     expect(aside.className).toContain('w-56');
   });
 });
+
+describe('Nav item consistency across sidebar variants', () => {
+  it('Sidebar and TabletSidebar render links to the same hrefs', () => {
+    const { unmount: unmountSidebar } = render(<Sidebar />);
+    const sidebarLinks = screen.getAllByRole('link');
+    const sidebarHrefs = sidebarLinks.map((link) => link.getAttribute('href')).sort();
+    unmountSidebar();
+
+    render(<TabletSidebar />);
+    const tabletLinks = screen.getAllByRole('link');
+    const tabletHrefs = tabletLinks.map((link) => link.getAttribute('href')).sort();
+
+    expect(sidebarHrefs).toEqual(tabletHrefs);
+    expect(sidebarHrefs.length).toBeGreaterThan(0);
+  });
+
+  it('Sidebar renders all expected navigation items', () => {
+    render(<Sidebar />);
+    const links = screen.getAllByRole('link');
+    const hrefs = links.map((link) => link.getAttribute('href'));
+
+    // All expected nav hrefs should be present
+    expect(hrefs).toContain('/search');
+    expect(hrefs).toContain('/rulings');
+    expect(hrefs).toContain('/cases');
+    expect(hrefs).toContain('/judges');
+  });
+});
