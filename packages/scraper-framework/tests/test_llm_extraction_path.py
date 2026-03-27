@@ -1417,6 +1417,169 @@ class TestCountyExtractionPath:
             assert second_event["_split_index"] == 1
             assert second_event["_split_count"] == 2
 
+    def test_san_francisco_uses_county_extractor(self) -> None:
+        """San Francisco docs use a county-specific extractor with custom SF prompt (#2051)."""
+        worker, _ = _make_worker()
+
+        mock_county_extractor = MagicMock()
+        mock_county_extractor.extract.return_value = [
+            ExtractedRuling(
+                extracted_case_number="FPT-25-378624",
+                extracted_case_title="Graves v. Long",
+                ruling_text="The court grants the request for change of custody.",
+                outcome=ExtractionOutcome.GRANTED,
+                motion_type="Request for Order for Change of Child Custody",
+                extracted_parties=[
+                    ExtractedParty(name="Michael Edward Graves", role="petitioner"),
+                    ExtractedParty(name="Ranjie Long", role="respondent"),
+                ],
+            ),
+        ]
+
+        with (
+            patch("ingestion.worker.LlmExtractor") as mock_cls,
+            patch(
+                "framework.extraction_config.get_county_extraction_config",
+            ) as mock_get_config,
+            patch.object(worker, "process_event") as mock_process,
+        ):
+            from framework.extraction_config import (
+                SAN_FRANCISCO_SYSTEM_PROMPT,
+                CountyExtractionConfig,
+                ExtractionMethod,
+            )
+
+            mock_get_config.return_value = CountyExtractionConfig(
+                method=ExtractionMethod.LLM,
+                system_prompt=SAN_FRANCISCO_SYSTEM_PROMPT,
+                provider="google",
+                model="gemini-2.5-flash-lite",
+                max_output_tokens=32768,
+            )
+            mock_cls.return_value = mock_county_extractor
+
+            event = _make_event(
+                scraper_id="ca-sf-tentatives-family-law",
+                state="CA",
+                county="San Francisco",
+                content_format="pdf",
+                ruling_text=(
+                    "SUPERIOR COURT OF CALIFORNIA\n"
+                    "COUNTY OF SAN FRANCISCO\n"
+                    "UNIFIED FAMILY COURT\n"
+                    "Case Number: FPT-25-378624\n"
+                    "Hearing Date: March 3, 2026\n"
+                    "Presiding: BOBBY P. LUNA\n"
+                    "TENTATIVE RULING\n"
+                    "The court grants the request for change of custody."
+                ),
+            )
+            ruling_text = event["ruling_text"]
+
+            result = worker._llm_split_document(
+                event, event["document_id"], ruling_text, "CA", "San Francisco"
+            )
+
+            assert result is True
+            # County extractor was created with the right provider/model
+            mock_cls.assert_called_once_with(
+                provider="google",
+                model="gemini-2.5-flash-lite",
+                max_output_tokens=32768,
+            )
+            # extract was called with the SF-specific system prompt
+            mock_county_extractor.extract.assert_called_once()
+            call_kwargs = mock_county_extractor.extract.call_args
+            assert call_kwargs.kwargs.get("system_prompt") == SAN_FRANCISCO_SYSTEM_PROMPT
+            # process_event was called for the extracted ruling
+            mock_process.assert_called_once()
+            # Verify the split event has the LLM-extracted fields
+            split_event = mock_process.call_args[0][0]
+            assert split_event["case_number"] == "FPT-25-378624"
+            assert split_event["case_title"] == "Graves v. Long"
+            assert split_event["_llm_extracted"] is True
+
+    def test_san_francisco_multi_case_split(self) -> None:
+        """San Francisco multi-case PDF is split into separate events (#2051)."""
+        worker, _ = _make_worker()
+
+        mock_county_extractor = MagicMock()
+        mock_county_extractor.extract.return_value = [
+            ExtractedRuling(
+                extracted_case_number="FPT-25-378624",
+                extracted_case_title="Graves v. Long",
+                ruling_text="The court grants the request for change of custody.",
+                outcome=ExtractionOutcome.GRANTED,
+                motion_type="Request for Order for Change of Child Custody",
+                extracted_parties=[
+                    ExtractedParty(name="Michael Edward Graves", role="petitioner"),
+                    ExtractedParty(name="Ranjie Long", role="respondent"),
+                ],
+            ),
+            ExtractedRuling(
+                extracted_case_number="FMS-20-387302",
+                extracted_case_title="Smith v. Doe",
+                ruling_text="The motion is continued to April 15, 2026.",
+                outcome=ExtractionOutcome.CONTINUED,
+                motion_type="Request for Order for Modification of Support",
+                extracted_parties=[
+                    ExtractedParty(name="Jane Smith", role="petitioner"),
+                    ExtractedParty(name="John Doe", role="respondent"),
+                ],
+            ),
+        ]
+
+        with (
+            patch("ingestion.worker.LlmExtractor") as mock_cls,
+            patch(
+                "framework.extraction_config.get_county_extraction_config",
+            ) as mock_get_config,
+            patch.object(worker, "process_event") as mock_process,
+        ):
+            from framework.extraction_config import (
+                SAN_FRANCISCO_SYSTEM_PROMPT,
+                CountyExtractionConfig,
+                ExtractionMethod,
+            )
+
+            mock_get_config.return_value = CountyExtractionConfig(
+                method=ExtractionMethod.LLM,
+                system_prompt=SAN_FRANCISCO_SYSTEM_PROMPT,
+                provider="google",
+                model="gemini-2.5-flash-lite",
+                max_output_tokens=32768,
+            )
+            mock_cls.return_value = mock_county_extractor
+
+            event = _make_event(
+                scraper_id="ca-sf-tentatives-family-law",
+                state="CA",
+                county="San Francisco",
+                content_format="pdf",
+                ruling_text="Multi-case SF Family Law calendar with two cases.",
+            )
+            ruling_text = event["ruling_text"]
+
+            result = worker._llm_split_document(
+                event, event["document_id"], ruling_text, "CA", "San Francisco"
+            )
+
+            assert result is True
+            # process_event called twice (once per case)
+            assert mock_process.call_count == 2
+
+            # First split event
+            first_event = mock_process.call_args_list[0][0][0]
+            assert first_event["case_number"] == "FPT-25-378624"
+            assert first_event["_split_index"] == 0
+            assert first_event["_split_count"] == 2
+
+            # Second split event
+            second_event = mock_process.call_args_list[1][0][0]
+            assert second_event["case_number"] == "FMS-20-387302"
+            assert second_event["_split_index"] == 1
+            assert second_event["_split_count"] == 2
+
 
 class TestMultimodalExtractionPath:
     """Tests for the multimodal extraction path in _llm_split_document."""
