@@ -1,0 +1,65 @@
+{
+  "_fixture": "fresno_403_20260310_d019042f.pdf",
+  "_description": "Fresno Dept 403, 21 pages, 8 rulings. Initials: lmg. Mix of civil and probate matters.",
+  "_captured": "2026-03-10",
+  "courthouse": "Fresno County Superior Court",
+  "department": "403",
+  "judge_name": null,
+  "judge_initials": "lmg",
+  "page_count": 21,
+  "case_count": 8,
+  "primary_case_number": "25CECG03271",
+  "case_number_format": "{YY}CEC{TYPE}{NNNNN}",
+  "hearing_date": "March 10, 2026",
+  "expected_cases": [
+    {
+      "case_number": "25CECG03271",
+      "case_title": "Lopez v. Fresno Unified School District",
+      "motion_type": "Demurrer to First Amended Complaint",
+      "outcome": "granted_in_part"
+    },
+    {
+      "case_number": "25CECG02662",
+      "case_title": "Ten-West Towing, Inc. v. Melvin Marbinec",
+      "motion_type": "Default Prove-Up",
+      "outcome": "granted"
+    },
+    {
+      "case_number": "26CECG00722",
+      "case_title": "In re: Graceson A. Vongsaly",
+      "motion_type": "Petition to Approve Compromise of Disputed Claim of Minor",
+      "outcome": "denied"
+    },
+    {
+      "case_number": "25CECG05102",
+      "case_title": "Garcia v. Farmers Direct Property and Casualty Insurance Company",
+      "motion_type": "By Petitioner for an Order Deeming Admissions Admitted",
+      "outcome": "granted_in_part"
+    },
+    {
+      "case_number": "23CECG00266",
+      "case_title": "Johnson v. World of Jeans & Tops",
+      "motion_type": "by Plaintiff for Approval of PAGA Settlement",
+      "outcome": "denied"
+    },
+    {
+      "case_number": "23CECG03612",
+      "case_title": "Koda v. Mehta Family Trust",
+      "motion_type": "Petition to Compromise Minors' Claims",
+      "outcome": "granted"
+    },
+    {
+      "case_number": "26CECG00642",
+      "case_title": "Brody Peterson",
+      "motion_type": "Petition to Compromise Minor's Claim",
+      "outcome": "granted"
+    },
+    {
+      "case_number": "22CECG01711",
+      "case_title": "Kelly Yost v. Derek Taggard, M.D.",
+      "motion_type": "Compel Attendance",
+      "outcome": "off_calendar"
+    }
+  ],
+  "_notes": "All rulings signed with initials 'lmg'. Ruling (20) Lopez has a long demurrer analysis spanning pages 3-6. Ruling (34) Johnson PAGA settlement denied without prejudice (pages 12-18). Case numbers use format YYCECGNNNNN."
+}

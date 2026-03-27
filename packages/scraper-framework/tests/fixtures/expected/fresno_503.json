@@ -1,0 +1,23 @@
+{
+  "_fixture": "fresno_503_20260311_03c051b7.pdf",
+  "_description": "Fresno Dept 503, 4 pages, 1 ruling. Initials: JS. Demurrer taken off calendar/stayed pending appeal.",
+  "_captured": "2026-03-11",
+  "courthouse": "Fresno County Superior Court",
+  "department": "503",
+  "judge_name": null,
+  "judge_initials": "JS",
+  "page_count": 4,
+  "case_count": 1,
+  "primary_case_number": "25CECG02564",
+  "case_number_format": "{YY}CEC{TYPE}{NNNNN}",
+  "hearing_date": "March 11, 2026",
+  "expected_cases": [
+    {
+      "case_number": "25CECG02564",
+      "case_title": "Vartanian v. Boyd",
+      "motion_type": "Cross-Defendant Sona Vartanian's Demurrer to the First Amended Cross-Complaint",
+      "outcome": "off_calendar"
+    }
+  ],
+  "_notes": "Single-ruling PDF. Motion taken off calendar and matter stayed pending appeal. Initials: JS."
+}
