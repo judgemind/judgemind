@@ -7052,3 +7052,588 @@ class TestLlmSplitRegistryAutoDiscovery:
         assert "ca-riverside-tentatives-civil" not in reingest._SPLIT_REGISTRY, (
             "Riverside should not be in _SPLIT_REGISTRY (splitting moved to framework)"
         )
+
+
+# ---------------------------------------------------------------------------
+# S3-key deduplication in full-reparse mode (#1984)
+# ---------------------------------------------------------------------------
+
+
+class TestFullReparseS3KeyDedup:
+    """Tests for S3-key-level deduplication in reingest_batch() full_reparse mode.
+
+    Riverside calendar PDFs contain rulings for ~6 cases.  The scraper creates
+    one document row per case, all pointing to the same S3 key.  Without dedup,
+    ``--full-reparse`` would process the same PDF N times (once per document
+    row), producing N * R ruling records instead of R — a Cartesian product.
+    See #1984.
+    """
+
+    @patch("reingest_from_s3._supersede_document")
+    @patch("reingest_from_s3.batch_upsert_parties")
+    @patch("reingest_from_s3.upsert_case_judge")
+    @patch("reingest_from_s3.resolve_judge")
+    @patch("reingest_from_s3.insert_document_and_ruling")
+    @patch("reingest_from_s3.upsert_case")
+    @patch("reingest_from_s3._full_reparse_document")
+    @patch("reingest_from_s3._fetch_s3_content")
+    def test_full_reparse_deduplicates_by_s3_key(
+        self,
+        mock_fetch_s3: MagicMock,
+        mock_full_reparse: MagicMock,
+        mock_upsert_case: MagicMock,
+        mock_insert_doc_and_ruling: MagicMock,
+        mock_resolve_judge: MagicMock,
+        mock_upsert_cj: MagicMock,
+        mock_batch_parties: MagicMock,
+        mock_supersede: MagicMock,
+    ) -> None:
+        """6 document rows sharing one S3 key produces N rulings, not 6*N."""
+        shared_s3_key = "ca/riverside/calendar/2026-03-05.pdf"
+        shared_s3_bucket = "judgemind-docs"
+
+        # Create 6 document rows sharing the same S3 key (different doc IDs,
+        # different case numbers, same PDF).
+        rows = []
+        for i in range(6):
+            rows.append(
+                _make_document_row(
+                    doc_id=uuid.uuid4(),
+                    scraper_id="ca-riverside-tentatives-civil",
+                    case_number=f"CVPS230600{i}",
+                    case_title=f"Case {i} v. Defendant {i}",
+                    s3_key=shared_s3_key,
+                    s3_bucket=shared_s3_bucket,
+                )
+            )
+
+        conn = _mock_conn_with_rows(rows)
+        mock_fetch_s3.return_value = b"shared pdf content"
+
+        # The PDF contains 3 rulings when split
+        mock_full_reparse.return_value = [
+            {
+                "ruling_text": f"Ruling {j}",
+                "case_number": f"CVPS230600{j}",
+                "case_title": f"Case {j} v. Defendant {j}",
+                "judge_name": "Arthur Hester III",
+                "outcome": "granted",
+                "motion_type": "demurrer",
+                "department": "PS1",
+                "parties": [],
+                "hearing_date": _HEARING_DATE,
+                "ruling_index": j,
+                "split_document_id": f"split-id-{j}",
+                "is_split": True,
+                "llm_skipped": True,
+                "llm_outcome": "not_attempted",
+            }
+            for j in range(1, 4)
+        ]
+        mock_upsert_case.return_value = "case-id"
+        mock_resolve_judge.return_value = "judge-id"
+
+        processed_keys: set[tuple[str, str]] = set()
+
+        result = reingest.reingest_batch(
+            conn,
+            MagicMock(),
+            batch_size=25,
+            cursor=_DEFAULT_CURSOR,
+            filters="",
+            filter_params=[],
+            full_reparse=True,
+            processed_s3_keys=processed_keys,
+        )
+
+        # Only 1 document should be parsed (the first one with that S3 key).
+        # The other 5 should be skipped as duplicates.
+        mock_full_reparse.assert_called_once()
+
+        # 3 rulings inserted (from the single parse), not 6*3 = 18
+        assert mock_insert_doc_and_ruling.call_count == 3
+
+        # All 6 rows are "processed" (iterated over), but 5 are skipped
+        assert result["processed"] == 6
+        assert result["skipped"] == 5
+        assert result["updated"] == 1
+
+        # The S3 key should be in the processed set
+        assert (shared_s3_key, shared_s3_bucket) in processed_keys
+
+    @patch("reingest_from_s3._supersede_document")
+    @patch("reingest_from_s3.batch_upsert_parties")
+    @patch("reingest_from_s3.upsert_case_judge")
+    @patch("reingest_from_s3.resolve_judge")
+    @patch("reingest_from_s3.insert_document_and_ruling")
+    @patch("reingest_from_s3.upsert_case")
+    @patch("reingest_from_s3._full_reparse_document")
+    @patch("reingest_from_s3._fetch_s3_content")
+    def test_s3_dedup_only_applies_in_full_reparse_mode(
+        self,
+        mock_fetch_s3: MagicMock,
+        mock_full_reparse: MagicMock,
+        mock_upsert_case: MagicMock,
+        mock_insert_doc_and_ruling: MagicMock,
+        mock_resolve_judge: MagicMock,
+        mock_upsert_cj: MagicMock,
+        mock_batch_parties: MagicMock,
+        mock_supersede: MagicMock,
+    ) -> None:
+        """Without full_reparse, S3 key dedup does NOT apply — all rows processed."""
+        shared_s3_key = "ca/riverside/calendar/2026-03-05.pdf"
+        shared_s3_bucket = "judgemind-docs"
+
+        rows = []
+        for i in range(3):
+            rows.append(
+                _make_document_row(
+                    doc_id=uuid.uuid4(),
+                    scraper_id="ca-riverside-tentatives-civil",
+                    case_number=f"CVPS230600{i}",
+                    s3_key=shared_s3_key,
+                    s3_bucket=shared_s3_bucket,
+                )
+            )
+
+        conn = _mock_conn_with_rows(rows)
+        mock_fetch_s3.return_value = b"shared pdf content"
+
+        with patch("reingest_from_s3._reparse_document") as mock_reparse:
+            mock_reparse.return_value = {
+                "ruling_text": "Ruling text",
+                "case_number": "CVPS2306000",
+                "case_title": "Case v. Defendant",
+                "judge_name": "Judge Name",
+                "outcome": "granted",
+                "motion_type": "demurrer",
+                "department": "PS1",
+                "parties": [],
+                "hearing_date": _HEARING_DATE,
+                "llm_skipped": True,
+                "llm_outcome": "not_attempted",
+            }
+            mock_upsert_case.return_value = "case-id"
+            mock_resolve_judge.return_value = "judge-id"
+
+            result = reingest.reingest_batch(
+                conn,
+                MagicMock(),
+                batch_size=25,
+                cursor=_DEFAULT_CURSOR,
+                filters="",
+                filter_params=[],
+                full_reparse=False,
+                processed_s3_keys=None,
+            )
+
+        # All 3 rows should be processed (no dedup in non-full-reparse mode)
+        assert mock_reparse.call_count == 3
+        assert result["processed"] == 3
+        assert result["updated"] == 3
+        assert result["skipped"] == 0
+
+    @patch("reingest_from_s3._supersede_document")
+    @patch("reingest_from_s3.batch_upsert_parties")
+    @patch("reingest_from_s3.upsert_case_judge")
+    @patch("reingest_from_s3.resolve_judge")
+    @patch("reingest_from_s3.insert_document_and_ruling")
+    @patch("reingest_from_s3.upsert_case")
+    @patch("reingest_from_s3._full_reparse_document")
+    @patch("reingest_from_s3._fetch_s3_content")
+    def test_s3_dedup_across_batches(
+        self,
+        mock_fetch_s3: MagicMock,
+        mock_full_reparse: MagicMock,
+        mock_upsert_case: MagicMock,
+        mock_insert_doc_and_ruling: MagicMock,
+        mock_resolve_judge: MagicMock,
+        mock_upsert_cj: MagicMock,
+        mock_batch_parties: MagicMock,
+        mock_supersede: MagicMock,
+    ) -> None:
+        """processed_s3_keys set carries dedup state across batch calls."""
+        shared_s3_key = "ca/riverside/calendar/2026-03-05.pdf"
+        shared_s3_bucket = "judgemind-docs"
+
+        # Batch 1: one row with the shared S3 key
+        row1 = _make_document_row(
+            doc_id=uuid.uuid4(),
+            scraper_id="ca-riverside-tentatives-civil",
+            case_number="CVPS2306001",
+            s3_key=shared_s3_key,
+            s3_bucket=shared_s3_bucket,
+        )
+        conn1 = _mock_conn_with_rows([row1])
+        mock_fetch_s3.return_value = b"shared pdf content"
+        mock_full_reparse.return_value = [
+            {
+                "ruling_text": "Ruling 1",
+                "case_number": "CVPS2306001",
+                "case_title": "Case 1 v. Defendant",
+                "judge_name": "Judge",
+                "outcome": "granted",
+                "motion_type": "demurrer",
+                "department": "PS1",
+                "parties": [],
+                "hearing_date": _HEARING_DATE,
+                "ruling_index": 1,
+                "split_document_id": "split-1",
+                "is_split": True,
+                "llm_skipped": True,
+                "llm_outcome": "not_attempted",
+            },
+        ]
+        mock_upsert_case.return_value = "case-id"
+        mock_resolve_judge.return_value = "judge-id"
+
+        processed_keys: set[tuple[str, str]] = set()
+
+        result1 = reingest.reingest_batch(
+            conn1,
+            MagicMock(),
+            batch_size=10,
+            cursor=_DEFAULT_CURSOR,
+            filters="",
+            filter_params=[],
+            full_reparse=True,
+            processed_s3_keys=processed_keys,
+        )
+
+        assert result1["processed"] == 1
+        assert result1["updated"] == 1
+        assert mock_full_reparse.call_count == 1
+
+        # Batch 2: another row with the same S3 key (from cursor pagination)
+        row2 = _make_document_row(
+            doc_id=uuid.uuid4(),
+            captured_at=_CAPTURED_AT_2,
+            scraper_id="ca-riverside-tentatives-civil",
+            case_number="CVPS2306002",
+            s3_key=shared_s3_key,
+            s3_bucket=shared_s3_bucket,
+        )
+        conn2 = _mock_conn_with_rows([row2])
+
+        result2 = reingest.reingest_batch(
+            conn2,
+            MagicMock(),
+            batch_size=10,
+            cursor=result1["next_cursor"],
+            filters="",
+            filter_params=[],
+            full_reparse=True,
+            processed_s3_keys=processed_keys,
+        )
+
+        # Second batch should skip the duplicate S3 key
+        assert result2["processed"] == 1
+        assert result2["skipped"] == 1
+        assert result2["updated"] == 0
+        # _full_reparse_document should NOT have been called again
+        assert mock_full_reparse.call_count == 1
+
+    @patch("reingest_from_s3._full_reparse_document")
+    @patch("reingest_from_s3._fetch_s3_content")
+    def test_s3_dedup_different_keys_still_processed(
+        self,
+        mock_fetch_s3: MagicMock,
+        mock_full_reparse: MagicMock,
+    ) -> None:
+        """Documents with different S3 keys are all processed normally."""
+        rows = [
+            _make_document_row(
+                doc_id=uuid.uuid4(),
+                scraper_id="ca-riverside-tentatives-civil",
+                case_number=f"CVPS230600{i}",
+                s3_key=f"ca/riverside/calendar/2026-03-0{i}.pdf",
+                s3_bucket="judgemind-docs",
+            )
+            for i in range(3)
+        ]
+
+        conn = _mock_conn_with_rows(rows)
+        mock_fetch_s3.return_value = b"pdf content"
+        mock_full_reparse.return_value = [
+            {
+                "ruling_text": "Ruling",
+                "case_number": "CVPS2306000",
+                "case_title": "Case v. Defendant",
+                "judge_name": "Judge",
+                "outcome": "granted",
+                "motion_type": "demurrer",
+                "department": "PS1",
+                "parties": [],
+                "hearing_date": _HEARING_DATE,
+                "ruling_index": 0,
+                "split_document_id": "doc-id",
+                "is_split": False,
+                "llm_skipped": True,
+                "llm_outcome": "not_attempted",
+            },
+        ]
+
+        processed_keys: set[tuple[str, str]] = set()
+
+        with (
+            patch("reingest_from_s3.upsert_case", return_value="case-id"),
+            patch("reingest_from_s3.insert_document_and_ruling"),
+            patch("reingest_from_s3.resolve_judge", return_value=None),
+            patch("reingest_from_s3.batch_upsert_parties"),
+        ):
+            result = reingest.reingest_batch(
+                conn,
+                MagicMock(),
+                batch_size=25,
+                cursor=_DEFAULT_CURSOR,
+                filters="",
+                filter_params=[],
+                full_reparse=True,
+                processed_s3_keys=processed_keys,
+            )
+
+        # All 3 rows have different S3 keys — all should be processed
+        assert mock_full_reparse.call_count == 3
+        assert result["processed"] == 3
+        assert result["skipped"] == 0
+        assert len(processed_keys) == 3
+
+    @patch("reingest_from_s3._fetch_s3_content")
+    def test_s3_prefetch_deduplicates_fetch_calls(
+        self,
+        mock_fetch_s3: MagicMock,
+    ) -> None:
+        """S3 prefetch only fetches each unique (s3_key, s3_bucket) once."""
+        shared_s3_key = "ca/riverside/calendar/2026-03-05.pdf"
+        shared_s3_bucket = "judgemind-docs"
+
+        rows = [
+            _make_document_row(
+                doc_id=uuid.uuid4(),
+                scraper_id="ca-riverside-tentatives-civil",
+                case_number=f"CVPS230600{i}",
+                s3_key=shared_s3_key,
+                s3_bucket=shared_s3_bucket,
+            )
+            for i in range(6)
+        ]
+
+        conn = _mock_conn_with_rows(rows)
+        mock_fetch_s3.return_value = b"pdf content"
+
+        processed_keys: set[tuple[str, str]] = set()
+
+        with (
+            patch("reingest_from_s3._full_reparse_document") as mock_reparse,
+        ):
+            mock_reparse.return_value = [
+                {
+                    "ruling_text": "Ruling",
+                    "case_number": "CVPS2306000",
+                    "case_title": "Case v. Defendant",
+                    "judge_name": "Judge",
+                    "outcome": "granted",
+                    "motion_type": "demurrer",
+                    "department": "PS1",
+                    "parties": [],
+                    "hearing_date": _HEARING_DATE,
+                    "ruling_index": 0,
+                    "split_document_id": "doc-id",
+                    "is_split": False,
+                    "llm_skipped": True,
+                    "llm_outcome": "not_attempted",
+                },
+            ]
+            with (
+                patch("reingest_from_s3.upsert_case", return_value="case-id"),
+                patch("reingest_from_s3.insert_document_and_ruling"),
+                patch("reingest_from_s3.resolve_judge", return_value=None),
+                patch("reingest_from_s3.batch_upsert_parties"),
+            ):
+                reingest.reingest_batch(
+                    conn,
+                    MagicMock(),
+                    batch_size=25,
+                    cursor=_DEFAULT_CURSOR,
+                    filters="",
+                    filter_params=[],
+                    full_reparse=True,
+                    processed_s3_keys=processed_keys,
+                )
+
+        # S3 fetch should only be called once despite 6 rows
+        mock_fetch_s3.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# LLM split exception handling (#1984)
+# ---------------------------------------------------------------------------
+
+
+class TestLlmSplitExceptionFallback:
+    """Tests that LLM split exceptions fall back to regex instead of failing.
+
+    When _LLM_SPLIT_REGISTRY contains a split function that raises an
+    exception, _full_reparse_document should catch the exception, log a
+    warning, and fall back to the regex-based _SPLIT_REGISTRY function.
+    See #1984.
+    """
+
+    def _doc_meta(self, **overrides: Any) -> dict:
+        meta = {
+            "document_id": "test-llm-exception-doc",
+            "scraper_id": "test-llm-exception",
+            "state": "CA",
+            "county": "TestCounty",
+            "court_name": "TestCounty Superior Court",
+            "source_url": "https://example.com/test.pdf",
+            "captured_at": datetime(2026, 3, 25, 12, 0, 0),
+            "hearing_date": date(2026, 3, 25),
+            "format": "pdf",
+            "content_hash": "abc123",
+            "case_number": "TEST001",
+            "case_title": "Smith v. Jones",
+            "case_type": "civil",
+            "stored_ruling_text": None,
+        }
+        meta.update(overrides)
+        return meta
+
+    @staticmethod
+    def _make_split_ruling(
+        ruling_index: int,
+        case_number: str | None,
+        ruling_text: str,
+        case_title: str | None,
+        motion_type: str | None,
+        outcome: str | None,
+    ) -> Any:
+        """Create a SplitRuling-like object without importing from courts module.
+
+        Uses types.SimpleNamespace to avoid transient CI import failures when
+        courts.ca.riverside_tentatives has unresolvable dependencies in some
+        test shards.
+        """
+        import types
+
+        return types.SimpleNamespace(
+            ruling_index=ruling_index,
+            case_number=case_number,
+            ruling_text=ruling_text,
+            case_title=case_title,
+            motion_type=motion_type,
+            outcome=outcome,
+        )
+
+    @patch.object(reingest, "_load_scraper_registry")
+    @patch.object(reingest, "_extract_text_from_content")
+    def test_llm_split_exception_falls_back_to_regex(
+        self,
+        mock_extract: MagicMock,
+        mock_registry: MagicMock,
+    ) -> None:
+        """LLM function that raises RuntimeError falls back to regex split."""
+        # LLM raises an exception
+        mock_llm_split = MagicMock(side_effect=RuntimeError("LLM API error"))
+
+        # Regex fallback returns valid results
+        regex_rulings = [
+            self._make_split_ruling(1, "TEST001", "DENY MSJ.", "Smith v. Jones", "msj", "denied"),
+            self._make_split_ruling(
+                2, "TEST002", "GRANT demurrer.", "Doe v. Roe", "demurrer", "granted"
+            ),
+        ]
+        mock_regex_split = MagicMock(return_value=regex_rulings)
+
+        reingest._SPLIT_REGISTRY["test-llm-exception"] = mock_regex_split
+        reingest._LLM_SPLIT_REGISTRY["test-llm-exception"] = mock_llm_split
+        reingest._SCRAPER_REGISTRY.pop("test-llm-exception", None)
+        mock_extract.return_value = "full pdf text"
+
+        try:
+            result = reingest._full_reparse_document(
+                b"raw pdf", "test-llm-exception", self._doc_meta()
+            )
+            # LLM was called but raised
+            mock_llm_split.assert_called_once_with("full pdf text")
+            # Regex fallback was called
+            mock_regex_split.assert_called_once_with("full pdf text")
+            # Results come from regex
+            assert len(result) == 2
+            assert result[0]["ruling_text"] == "DENY MSJ."
+            assert result[1]["ruling_text"] == "GRANT demurrer."
+        finally:
+            reingest._SPLIT_REGISTRY.pop("test-llm-exception", None)
+            reingest._LLM_SPLIT_REGISTRY.pop("test-llm-exception", None)
+
+    @patch.object(reingest, "_load_scraper_registry")
+    @patch.object(reingest, "_extract_text_from_content")
+    def test_llm_split_generic_exception_falls_back(
+        self,
+        mock_extract: MagicMock,
+        mock_registry: MagicMock,
+    ) -> None:
+        """Any exception type (ValueError, TypeError, etc.) triggers regex fallback."""
+        mock_llm_split = MagicMock(side_effect=ValueError("unexpected JSON"))
+
+        regex_rulings = [
+            self._make_split_ruling(
+                1, "TEST001", "Ruling text.", "Smith v. Jones", "msj", "denied"
+            ),
+        ]
+        mock_regex_split = MagicMock(return_value=regex_rulings)
+
+        reingest._SPLIT_REGISTRY["test-llm-exception"] = mock_regex_split
+        reingest._LLM_SPLIT_REGISTRY["test-llm-exception"] = mock_llm_split
+        reingest._SCRAPER_REGISTRY.pop("test-llm-exception", None)
+        mock_extract.return_value = "pdf text"
+
+        try:
+            result = reingest._full_reparse_document(
+                b"raw pdf", "test-llm-exception", self._doc_meta()
+            )
+            mock_llm_split.assert_called_once()
+            mock_regex_split.assert_called_once()
+            assert len(result) == 1
+        finally:
+            reingest._SPLIT_REGISTRY.pop("test-llm-exception", None)
+            reingest._LLM_SPLIT_REGISTRY.pop("test-llm-exception", None)
+
+    @patch.object(reingest, "_load_scraper_registry")
+    @patch.object(reingest, "_extract_text_from_content")
+    def test_llm_split_success_does_not_trigger_fallback(
+        self,
+        mock_extract: MagicMock,
+        mock_registry: MagicMock,
+    ) -> None:
+        """When LLM succeeds with 2+ results, regex fallback is NOT called."""
+        # Need 2+ rulings to trigger the multi-ruling split path
+        # (1 ruling falls through to _reparse_document)
+        llm_rulings = [
+            self._make_split_ruling(
+                1, "TEST001", "Full analysis.", "Smith v. Jones", "msj", "denied"
+            ),
+            self._make_split_ruling(
+                2, "TEST002", "Detailed ruling.", "Doe v. Roe", "demurrer", "granted"
+            ),
+        ]
+        mock_llm_split = MagicMock(return_value=llm_rulings)
+        mock_regex_split = MagicMock()
+
+        reingest._SPLIT_REGISTRY["test-llm-exception"] = mock_regex_split
+        reingest._LLM_SPLIT_REGISTRY["test-llm-exception"] = mock_llm_split
+        reingest._SCRAPER_REGISTRY.pop("test-llm-exception", None)
+        mock_extract.return_value = "pdf text"
+
+        try:
+            result = reingest._full_reparse_document(
+                b"raw pdf", "test-llm-exception", self._doc_meta()
+            )
+            mock_llm_split.assert_called_once()
+            mock_regex_split.assert_not_called()
+            assert len(result) == 2
+            assert result[0]["ruling_text"] == "Full analysis."
+            assert result[1]["ruling_text"] == "Detailed ruling."
+        finally:
+            reingest._SPLIT_REGISTRY.pop("test-llm-exception", None)
+            reingest._LLM_SPLIT_REGISTRY.pop("test-llm-exception", None)
