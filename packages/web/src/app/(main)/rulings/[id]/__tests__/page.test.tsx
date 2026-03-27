@@ -41,9 +41,13 @@ vi.mock('next/link', () => ({
   ),
 }));
 
-// Stub client-side component used inside the page
+// Stub client-side components used inside the page
 vi.mock('../RulingDetail', () => ({
   RulingDetail: () => null,
+}));
+
+vi.mock('../SiblingRulings', () => ({
+  SiblingRulings: () => null,
 }));
 
 // ---------------------------------------------------------------------------
@@ -73,6 +77,11 @@ const FULL_RULING = {
     id: 'case-1',
     caseNumber: '25STCV12345',
     caseTitle: 'Smith v. Jones',
+    caseType: 'civil',
+    parties: [
+      { id: 'p1', canonicalName: 'Smith, John', partyType: 'individual', role: 'plaintiff' },
+      { id: 'p2', canonicalName: 'Jones, Jane', partyType: 'individual', role: 'defendant' },
+    ],
   },
   judge: {
     id: 'judge-1',
@@ -388,5 +397,124 @@ describe('RulingDetailPage (SSR smoke)', () => {
     expect(screen.queryByText('Johnson, Robert M.')).not.toBeInTheDocument();
     expect(screen.queryByText(/25STCV12345/)).not.toBeInTheDocument();
     expect(screen.queryByText('Los Angeles Superior Court')).not.toBeInTheDocument();
+  });
+
+  // -------------------------------------------------------------------------
+  // Case type badge (#1988)
+  // -------------------------------------------------------------------------
+
+  it('renders case type badge when caseType is available', async () => {
+    mockQuery.mockResolvedValueOnce({
+      data: { ruling: FULL_RULING },
+    });
+
+    const jsx = await RulingDetailPage({ params: { id: 'ruling-1' } });
+    render(jsx);
+
+    const badge = screen.getByTestId('case-type-badge');
+    expect(badge).toBeInTheDocument();
+    expect(badge).toHaveTextContent('Civil');
+  });
+
+  it('does not render case type badge when caseType is null', async () => {
+    mockQuery.mockResolvedValueOnce({
+      data: {
+        ruling: {
+          ...FULL_RULING,
+          case: {
+            ...FULL_RULING.case,
+            caseType: null,
+          },
+        },
+      },
+    });
+
+    const jsx = await RulingDetailPage({ params: { id: 'ruling-1' } });
+    render(jsx);
+
+    expect(screen.queryByTestId('case-type-badge')).not.toBeInTheDocument();
+  });
+
+  it('does not render case type badge when case is null', async () => {
+    mockQuery.mockResolvedValueOnce({
+      data: {
+        ruling: {
+          ...FULL_RULING,
+          case: null,
+        },
+      },
+    });
+
+    const jsx = await RulingDetailPage({ params: { id: 'ruling-1' } });
+    render(jsx);
+
+    expect(screen.queryByTestId('case-type-badge')).not.toBeInTheDocument();
+  });
+
+  // -------------------------------------------------------------------------
+  // Parties section (#1988)
+  // -------------------------------------------------------------------------
+
+  it('renders parties section when parties are available', async () => {
+    mockQuery.mockResolvedValueOnce({
+      data: { ruling: FULL_RULING },
+    });
+
+    const jsx = await RulingDetailPage({ params: { id: 'ruling-1' } });
+    render(jsx);
+
+    const partiesSection = screen.getByTestId('parties-section');
+    expect(partiesSection).toBeInTheDocument();
+    expect(screen.getByText('Plaintiffs')).toBeInTheDocument();
+    expect(screen.getByText('Defendants')).toBeInTheDocument();
+    expect(screen.getByText('Smith, John')).toBeInTheDocument();
+    expect(screen.getByText('Jones, Jane')).toBeInTheDocument();
+  });
+
+  it('does not render parties section when parties array is empty', async () => {
+    mockQuery.mockResolvedValueOnce({
+      data: {
+        ruling: {
+          ...FULL_RULING,
+          case: {
+            ...FULL_RULING.case,
+            parties: [],
+          },
+        },
+      },
+    });
+
+    const jsx = await RulingDetailPage({ params: { id: 'ruling-1' } });
+    render(jsx);
+
+    expect(screen.queryByTestId('parties-section')).not.toBeInTheDocument();
+  });
+
+  it('does not render parties section when case is null', async () => {
+    mockQuery.mockResolvedValueOnce({
+      data: {
+        ruling: {
+          ...FULL_RULING,
+          case: null,
+        },
+      },
+    });
+
+    const jsx = await RulingDetailPage({ params: { id: 'ruling-1' } });
+    render(jsx);
+
+    expect(screen.queryByTestId('parties-section')).not.toBeInTheDocument();
+  });
+
+  it('shows party type when available', async () => {
+    mockQuery.mockResolvedValueOnce({
+      data: { ruling: FULL_RULING },
+    });
+
+    const jsx = await RulingDetailPage({ params: { id: 'ruling-1' } });
+    render(jsx);
+
+    // partyType "individual" should appear as "(Individual)" via formatLabel
+    expect(screen.getAllByText('(Individual)')).toHaveLength(2);
   });
 });
