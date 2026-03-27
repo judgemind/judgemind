@@ -14,6 +14,7 @@ from framework.extraction_config import (
     RIVERSIDE_SYSTEM_PROMPT,
     SAN_BERNARDINO_SYSTEM_PROMPT,
     SAN_FRANCISCO_SYSTEM_PROMPT,
+    SANTA_CLARA_SYSTEM_PROMPT,
     CountyExtractionConfig,
     ExtractionMethod,
     get_county_extraction_config,
@@ -165,6 +166,22 @@ class TestGetCountyExtractionConfig:
         assert get_county_extraction_config("CA", "fresno") is not None
         assert get_county_extraction_config("CA", "FRESNO") is not None
         assert get_county_extraction_config("CA", "Fresno") is not None
+
+    def test_santa_clara_registered(self) -> None:
+        """Santa Clara County has a registered config (#2054)."""
+        config = get_county_extraction_config("CA", "Santa Clara")
+        assert config is not None
+        assert config.method == ExtractionMethod.LLM
+        assert config.provider == "google"
+        assert config.model == "gemini-2.5-flash-lite"
+        assert config.max_output_tokens == 32768
+        assert config.system_prompt is not None
+
+    def test_case_insensitive_santa_clara(self) -> None:
+        """Santa Clara lookup is case-insensitive."""
+        assert get_county_extraction_config("CA", "santa clara") is not None
+        assert get_county_extraction_config("CA", "SANTA CLARA") is not None
+        assert get_county_extraction_config("CA", "Santa Clara") is not None
 
     def test_unknown_county_returns_none(self) -> None:
         """Unknown county returns None."""
@@ -454,3 +471,92 @@ class TestFresnoSystemPrompt:
         assert "extracted_case_number" in FRESNO_SYSTEM_PROMPT
         assert "extracted_case_title" in FRESNO_SYSTEM_PROMPT
         assert "extracted_parties" in FRESNO_SYSTEM_PROMPT
+
+
+# ---------------------------------------------------------------------------
+# SANTA_CLARA_SYSTEM_PROMPT content validation (#2054)
+# ---------------------------------------------------------------------------
+
+
+class TestSantaClaraSystemPrompt:
+    """Verify the Santa Clara system prompt has required content."""
+
+    def test_mentions_santa_clara(self) -> None:
+        assert "santa clara" in SANTA_CLARA_SYSTEM_PROMPT.lower()
+
+    def test_mentions_line_table_format(self) -> None:
+        """Prompt describes the LINE/CASE NO. summary table format."""
+        assert "LINE" in SANTA_CLARA_SYSTEM_PROMPT
+        assert "summary table" in SANTA_CLARA_SYSTEM_PROMPT.lower()
+
+    def test_mentions_case_splitting_rules(self) -> None:
+        """Prompt has critical case splitting rules (group by case number)."""
+        assert "Group by case number" in SANTA_CLARA_SYSTEM_PROMPT
+        assert "ONE ruling" in SANTA_CLARA_SYSTEM_PROMPT
+
+    def test_mentions_detailed_rulings(self) -> None:
+        """Prompt describes the detailed ruling sections below summary table."""
+        assert "detailed ruling" in SANTA_CLARA_SYSTEM_PROMPT.lower()
+
+    def test_mentions_case_number_formats(self) -> None:
+        """Prompt describes Santa Clara case number patterns."""
+        assert "24CV443183" in SANTA_CLARA_SYSTEM_PROMPT
+        assert "25PR199782" in SANTA_CLARA_SYSTEM_PROMPT
+
+    def test_mentions_time_blocks(self) -> None:
+        """Prompt describes handling of multiple time blocks (9:01 and 9:00)."""
+        assert "time block" in SANTA_CLARA_SYSTEM_PROMPT.lower()
+
+    def test_mentions_outcome_taxonomy(self) -> None:
+        """Prompt includes outcome taxonomy values."""
+        assert "granted" in SANTA_CLARA_SYSTEM_PROMPT.lower()
+        assert "denied" in SANTA_CLARA_SYSTEM_PROMPT.lower()
+        assert "continued" in SANTA_CLARA_SYSTEM_PROMPT.lower()
+        assert "off_calendar" in SANTA_CLARA_SYSTEM_PROMPT.lower()
+
+    def test_mentions_json_output(self) -> None:
+        """Prompt specifies JSON output format."""
+        assert "json" in SANTA_CLARA_SYSTEM_PROMPT.lower()
+        assert "rulings" in SANTA_CLARA_SYSTEM_PROMPT.lower()
+
+    def test_mentions_parties(self) -> None:
+        """Prompt instructs party extraction."""
+        assert "plaintiff" in SANTA_CLARA_SYSTEM_PROMPT.lower()
+        assert "defendant" in SANTA_CLARA_SYSTEM_PROMPT.lower()
+
+    def test_warns_against_truncation(self) -> None:
+        """Prompt warns against truncation of ruling text."""
+        assert "truncat" in SANTA_CLARA_SYSTEM_PROMPT.lower()
+
+    def test_mentions_judge_extraction(self) -> None:
+        """Prompt instructs extracting judge from Honorable line."""
+        assert "Honorable" in SANTA_CLARA_SYSTEM_PROMPT
+
+    def test_mentions_department_extraction(self) -> None:
+        """Prompt instructs extracting department number."""
+        assert "Department N" in SANTA_CLARA_SYSTEM_PROMPT
+
+    def test_mentions_hearing_date_extraction(self) -> None:
+        """Prompt instructs extracting hearing date."""
+        assert "DATE:" in SANTA_CLARA_SYSTEM_PROMPT
+
+    def test_mentions_motion_type_labels(self) -> None:
+        """Prompt lists common motion type labels."""
+        prompt_lower = SANTA_CLARA_SYSTEM_PROMPT.lower()
+        assert "demurrer" in prompt_lower
+        assert "msj" in prompt_lower
+        assert "motion_to_compel" in prompt_lower
+        assert "writ_of_attachment" in prompt_lower
+
+    def test_mentions_demurrer_mapping(self) -> None:
+        """Prompt maps sustained/overruled demurrers to granted/denied."""
+        prompt_lower = SANTA_CLARA_SYSTEM_PROMPT.lower()
+        assert "sustained" in prompt_lower
+        assert "overruled" in prompt_lower
+
+    def test_output_format_matches_framework_schema(self) -> None:
+        """Prompt output format uses framework field names (extracted_judge_name, etc.)."""
+        assert "extracted_judge_name" in SANTA_CLARA_SYSTEM_PROMPT
+        assert "extracted_case_number" in SANTA_CLARA_SYSTEM_PROMPT
+        assert "extracted_case_title" in SANTA_CLARA_SYSTEM_PROMPT
+        assert "extracted_parties" in SANTA_CLARA_SYSTEM_PROMPT
