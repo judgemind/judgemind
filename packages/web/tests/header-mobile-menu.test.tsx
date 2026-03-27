@@ -72,10 +72,10 @@ describe('Header mobile menu', () => {
     expect(button).toBeInTheDocument();
   });
 
-  it('hamburger button is hidden on large screens via CSS class', () => {
+  it('hamburger button is hidden on tablet and larger screens via CSS class', () => {
     render(<Header />);
     const button = screen.getByLabelText('Toggle menu');
-    expect(button.className).toContain('lg:hidden');
+    expect(button.className).toContain('md:hidden');
   });
 
   it('does not show mobile sidebar initially', () => {

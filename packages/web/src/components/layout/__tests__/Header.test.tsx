@@ -135,6 +135,13 @@ describe('Header', () => {
     expect(screen.getByLabelText('Toggle menu')).toBeInTheDocument();
   });
 
+  it('hamburger menu uses md:hidden for mobile-only visibility', () => {
+    mockPathname = '/rulings';
+    render(<Header />);
+    const hamburger = screen.getByLabelText('Toggle menu');
+    expect(hamburger.className).toContain('md:hidden');
+  });
+
   it('hides hamburger menu on auth pages', () => {
     mockPathname = '/auth/login';
     render(<Header />);

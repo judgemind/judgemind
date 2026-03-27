@@ -8,6 +8,7 @@ import { render, screen } from '@testing-library/react';
 vi.mock('@/components/layout/Sidebar', () => ({
   Sidebar: () => <aside data-testid="sidebar">Sidebar</aside>,
   DesktopSidebar: () => <aside data-testid="desktop-sidebar">Desktop Sidebar</aside>,
+  TabletSidebar: () => <aside data-testid="tablet-sidebar">Tablet Sidebar</aside>,
 }));
 
 import MainLayout from '../(main)/layout';
@@ -25,6 +26,11 @@ describe('MainLayout', () => {
   it('renders the DesktopSidebar', () => {
     render(<MainLayout>Content</MainLayout>);
     expect(screen.getByTestId('desktop-sidebar')).toBeInTheDocument();
+  });
+
+  it('renders the TabletSidebar', () => {
+    render(<MainLayout>Content</MainLayout>);
+    expect(screen.getByTestId('tablet-sidebar')).toBeInTheDocument();
   });
 
   it('wraps content in a main element with id main-content', () => {
