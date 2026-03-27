@@ -396,6 +396,10 @@ export const typeDefs = `#graphql
       county: String
       """Filter by outcome, e.g. "granted"."""
       outcome: String
+      """Filter by motion type, e.g. "msj", "demurrer"."""
+      motionType: String
+      """Filter by case type via the linked case, e.g. "civil", "family"."""
+      caseType: String
       """Hearings on or after this date (ISO 8601), e.g. "2026-03-01"."""
       dateFrom: String
       """Hearings on or before this date (ISO 8601), e.g. "2026-03-31"."""

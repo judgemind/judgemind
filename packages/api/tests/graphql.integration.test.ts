@@ -503,6 +503,35 @@ describe('GraphQL schema — integration', () => {
       expect(edges.some((e) => e.node.hearingDate === '2099-12-31')).toBe(true);
     });
 
+    it('filters by motionType', async () => {
+      const msj = await gql(`{ rulings(motionType: "msj") { edges { node { id motionType } } } }`);
+      expect(msj.errors).toBeUndefined();
+      const msjEdges = ((msj.data?.rulings as Record<string, unknown>).edges as Array<{ node: { id: string; motionType: string } }>);
+      expect(msjEdges.some((e) => e.node.id === rulingId)).toBe(true);
+      msjEdges.filter((e) => e.node.id === rulingId).forEach((e) => expect(e.node.motionType).toBe('msj'));
+
+      // motionType=mtd should not return the msj ruling
+      const mtd = await gql(`{ rulings(motionType: "mtd") { edges { node { id motionType } } } }`);
+      expect(mtd.errors).toBeUndefined();
+      const mtdEdges = ((mtd.data?.rulings as Record<string, unknown>).edges as Array<{ node: { id: string; motionType: string } }>);
+      expect(mtdEdges.some((e) => e.node.id === rulingId)).toBe(false);
+      mtdEdges.forEach((e) => expect(e.node.motionType).toBe('mtd'));
+    });
+
+    it('filters by caseType', async () => {
+      const civil = await gql(`{ rulings(caseType: "civil") { edges { node { id } } } }`);
+      expect(civil.errors).toBeUndefined();
+      const civilEdges = ((civil.data?.rulings as Record<string, unknown>).edges as Array<{ node: { id: string } }>);
+      // Our seeded case is 'civil', so the ruling should appear
+      expect(civilEdges.some((e) => e.node.id === rulingId)).toBe(true);
+
+      // caseType=family should not return rulings from our civil case
+      const family = await gql(`{ rulings(caseType: "family") { edges { node { id } } } }`);
+      expect(family.errors).toBeUndefined();
+      const familyEdges = ((family.data?.rulings as Record<string, unknown>).edges as Array<{ node: { id: string } }>);
+      expect(familyEdges.some((e) => e.node.id === rulingId)).toBe(false);
+    });
+
     it('cursor pagination: first=1 then after cursor gives next page', async () => {
       // We seeded 2 past rulings; first=1 must produce hasNextPage=true
       const page1 = await gql(`{
