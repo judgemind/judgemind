@@ -10,6 +10,7 @@ from __future__ import annotations
 import pytest
 
 from framework.extraction_config import (
+    FRESNO_SYSTEM_PROMPT,
     RIVERSIDE_SYSTEM_PROMPT,
     SAN_BERNARDINO_SYSTEM_PROMPT,
     SAN_FRANCISCO_SYSTEM_PROMPT,
@@ -148,6 +149,22 @@ class TestGetCountyExtractionConfig:
         assert get_county_extraction_config("CA", "san francisco") is not None
         assert get_county_extraction_config("CA", "SAN FRANCISCO") is not None
         assert get_county_extraction_config("CA", "San Francisco") is not None
+
+    def test_fresno_registered(self) -> None:
+        """Fresno County has a registered config (#2052)."""
+        config = get_county_extraction_config("CA", "Fresno")
+        assert config is not None
+        assert config.method == ExtractionMethod.LLM
+        assert config.provider == "google"
+        assert config.model == "gemini-2.5-flash-lite"
+        assert config.max_output_tokens == 32768
+        assert config.system_prompt is not None
+
+    def test_case_insensitive_fresno(self) -> None:
+        """Fresno lookup is case-insensitive."""
+        assert get_county_extraction_config("CA", "fresno") is not None
+        assert get_county_extraction_config("CA", "FRESNO") is not None
+        assert get_county_extraction_config("CA", "Fresno") is not None
 
     def test_unknown_county_returns_none(self) -> None:
         """Unknown county returns None."""
@@ -356,3 +373,84 @@ class TestSanFranciscoSystemPrompt:
     def test_mentions_domestic_violence_prefix(self) -> None:
         """Prompt includes FDV (domestic violence) case number prefix."""
         assert "FDV" in SAN_FRANCISCO_SYSTEM_PROMPT
+
+
+# ---------------------------------------------------------------------------
+# FRESNO_SYSTEM_PROMPT content validation (#2052)
+# ---------------------------------------------------------------------------
+
+
+class TestFresnoSystemPrompt:
+    """Verify the Fresno system prompt has required content."""
+
+    def test_mentions_fresno(self) -> None:
+        assert "fresno" in FRESNO_SYSTEM_PROMPT.lower()
+
+    def test_mentions_numbered_entries(self) -> None:
+        """Prompt describes Fresno's numbered entry format (N) Tentative Ruling."""
+        assert "(20)" in FRESNO_SYSTEM_PROMPT
+        assert "parentheses" in FRESNO_SYSTEM_PROMPT.lower()
+
+    def test_mentions_case_number_formats(self) -> None:
+        """Prompt describes Fresno CECG case number patterns."""
+        assert "CECG" in FRESNO_SYSTEM_PROMPT
+        assert "25CECG03271" in FRESNO_SYSTEM_PROMPT
+
+    def test_mentions_outcome_taxonomy(self) -> None:
+        """Prompt includes outcome taxonomy values."""
+        assert "granted" in FRESNO_SYSTEM_PROMPT.lower()
+        assert "denied" in FRESNO_SYSTEM_PROMPT.lower()
+        assert "continued" in FRESNO_SYSTEM_PROMPT.lower()
+        assert "off_calendar" in FRESNO_SYSTEM_PROMPT.lower()
+
+    def test_mentions_json_output(self) -> None:
+        """Prompt specifies JSON output format."""
+        assert "json" in FRESNO_SYSTEM_PROMPT.lower()
+        assert "rulings" in FRESNO_SYSTEM_PROMPT.lower()
+
+    def test_mentions_parties(self) -> None:
+        """Prompt instructs party extraction."""
+        assert "plaintiff" in FRESNO_SYSTEM_PROMPT.lower()
+        assert "defendant" in FRESNO_SYSTEM_PROMPT.lower()
+
+    def test_mentions_judge_initials_only(self) -> None:
+        """Prompt explains Fresno has only judge initials, not full names."""
+        prompt_lower = FRESNO_SYSTEM_PROMPT.lower()
+        assert "initials" in prompt_lower
+        assert "extracted_judge_name" in FRESNO_SYSTEM_PROMPT
+        assert "null" in prompt_lower
+
+    def test_mentions_multi_page_rulings(self) -> None:
+        """Prompt describes multi-page rulings (e.g. PAGA analyses)."""
+        assert "multi-page" in FRESNO_SYSTEM_PROMPT.lower()
+
+    def test_mentions_continued_cases(self) -> None:
+        """Prompt instructs skipping continued cases from cover page."""
+        assert "continued" in FRESNO_SYSTEM_PROMPT.lower()
+        assert "skip" in FRESNO_SYSTEM_PROMPT.lower()
+
+    def test_warns_against_truncation(self) -> None:
+        """Prompt warns against truncation of ruling text."""
+        assert "truncat" in FRESNO_SYSTEM_PROMPT.lower()
+
+    def test_mentions_signature_block(self) -> None:
+        """Prompt describes the 'Issued By' signature block format."""
+        assert "Issued By" in FRESNO_SYSTEM_PROMPT
+
+    def test_mentions_multiple_motions(self) -> None:
+        """Prompt explains that multiple motions under one entry are one ruling."""
+        assert "multiple motions" in FRESNO_SYSTEM_PROMPT.lower()
+        assert "ONE ruling" in FRESNO_SYSTEM_PROMPT
+
+    def test_mentions_demurrer_mapping(self) -> None:
+        """Prompt maps sustained/overruled demurrers to granted/denied."""
+        prompt_lower = FRESNO_SYSTEM_PROMPT.lower()
+        assert "sustained" in prompt_lower
+        assert "overruled" in prompt_lower
+
+    def test_output_format_matches_framework_schema(self) -> None:
+        """Prompt output format uses framework field names (extracted_judge_name, etc.)."""
+        assert "extracted_judge_name" in FRESNO_SYSTEM_PROMPT
+        assert "extracted_case_number" in FRESNO_SYSTEM_PROMPT
+        assert "extracted_case_title" in FRESNO_SYSTEM_PROMPT
+        assert "extracted_parties" in FRESNO_SYSTEM_PROMPT
