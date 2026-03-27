@@ -776,7 +776,7 @@ def test_riv_parse_document_dept_judge_fallback() -> None:
 
 
 def test_riverside_system_prompt_in_extraction_config() -> None:
-    """The Riverside system prompt is in extraction_config, not the scraper (#1728)."""
+    """The Riverside system prompt is in extraction_config, not the scraper (#1728, #2088)."""
     from framework.extraction_config import RIVERSIDE_SYSTEM_PROMPT
 
     # Prompt must mention the two-layer structure
