@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { render, screen, waitFor } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
 import { MockedProvider, MockedResponse } from '@apollo/client/testing';
 import { gql } from '@apollo/client';
 import { JudgeProfile } from '../JudgeProfile';
@@ -21,6 +22,9 @@ vi.mock('lucide-react', () => ({
   ),
   Scale: ({ className }: { className?: string }) => (
     <span data-testid="scale-icon" className={className} />
+  ),
+  X: ({ className }: { className?: string }) => (
+    <span data-testid="x-icon" className={className} aria-hidden="true" />
   ),
 }));
 
@@ -44,6 +48,9 @@ beforeEach(() => {
       };
     }),
   );
+
+  // Mock scrollIntoView for jsdom (not implemented in jsdom)
+  Element.prototype.scrollIntoView = vi.fn();
 });
 
 afterEach(() => {
@@ -79,8 +86,8 @@ const JUDGE_ANALYTICS_QUERY = gql`
 `;
 
 const JUDGE_RULINGS_QUERY = gql`
-  query JudgeRulings($judgeId: ID!, $first: Int!, $after: String) {
-    rulings(judgeId: $judgeId, first: $first, after: $after) {
+  query JudgeRulings($judgeId: ID!, $first: Int!, $after: String, $motionType: String) {
+    rulings(judgeId: $judgeId, first: $first, after: $after, motionType: $motionType) {
       edges {
         cursor
         node {
@@ -185,13 +192,18 @@ function buildRulingsMock(
     }>;
     hasNextPage: boolean;
     endCursor: string | null;
+    motionType: string;
   }> = {},
   options: { delay?: number } = {},
 ): MockedResponse {
+  const variables: Record<string, unknown> = { judgeId, first: 20 };
+  if (overrides.motionType) {
+    variables.motionType = overrides.motionType;
+  }
   return {
     request: {
       query: JUDGE_RULINGS_QUERY,
-      variables: { judgeId, first: 20 },
+      variables,
     },
     result: {
       data: {
@@ -749,5 +761,351 @@ describe('JudgeProfile', () => {
 
     // No empty message should be visible
     expect(screen.queryByText(/No rulings captured for this judge yet/)).not.toBeInTheDocument();
+  });
+
+  // -------------------------------------------------------------------------
+  // Motion type filter tests (#1750)
+  // -------------------------------------------------------------------------
+
+  it('makes motion type table rows clickable with role=button', async () => {
+    const mocks = [
+      buildAnalyticsMock('judge-filter-1'),
+      buildRulingsMock('judge-filter-1'),
+    ];
+
+    render(
+      <MockedProvider mocks={mocks}>
+        <JudgeProfile judgeId="judge-filter-1" />
+      </MockedProvider>,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByText('Motion Type Breakdown')).toBeInTheDocument();
+    });
+
+    // The row containing "MSJ" in the analytics table should have role=button
+    // Use getAllByText since "MSJ" may also appear in the rulings list
+    const msjCells = screen.getAllByText('MSJ');
+    // The first one is in the analytics table cell
+    const msjRow = msjCells[0].closest('tr');
+    expect(msjRow).toHaveAttribute('role', 'button');
+    expect(msjRow).toHaveAttribute('tabindex', '0');
+  });
+
+  it('shows filter pill when a motion type row is clicked', async () => {
+    const user = userEvent.setup();
+    const mocks: MockedResponse[] = [
+      buildAnalyticsMock('judge-filter-2'),
+      buildRulingsMock('judge-filter-2'),
+      // Mock for filtered query when "demurrer" is clicked
+      buildRulingsMock('judge-filter-2', {
+        motionType: 'demurrer',
+        edges: [
+          {
+            cursor: 'cf1',
+            node: {
+              id: 'rf1',
+              hearingDate: '2026-02-15',
+              motionType: 'demurrer',
+              outcome: 'denied',
+              case: {
+                id: 'case-2',
+                caseNumber: '24STCV67890',
+                caseTitle: 'Filtered Case',
+              },
+            },
+          },
+        ],
+      }),
+    ];
+
+    render(
+      <MockedProvider mocks={mocks}>
+        <JudgeProfile judgeId="judge-filter-2" />
+      </MockedProvider>,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByText('MSJ')).toBeInTheDocument();
+    });
+
+    // No filter pill should be visible initially
+    expect(screen.queryByTestId('motion-type-filter-pill')).not.toBeInTheDocument();
+
+    // Click on the "Demurrer" row in the analytics table
+    const demurrerCells = screen.getAllByText('Demurrer');
+    const demurrerRow = demurrerCells[0].closest('tr');
+    expect(demurrerRow).not.toBeNull();
+    await user.click(demurrerRow!);
+
+    // Filter pill should appear with the motion type label
+    await waitFor(() => {
+      expect(screen.getByTestId('motion-type-filter-pill')).toBeInTheDocument();
+    });
+    expect(screen.getByTestId('motion-type-filter-pill')).toHaveTextContent('Demurrer');
+  });
+
+  it('highlights active row in analytics table when filter is set', async () => {
+    const user = userEvent.setup();
+    const mocks: MockedResponse[] = [
+      buildAnalyticsMock('judge-filter-3'),
+      buildRulingsMock('judge-filter-3'),
+      buildRulingsMock('judge-filter-3', {
+        motionType: 'msj',
+        edges: [
+          {
+            cursor: 'cf1',
+            node: {
+              id: 'rf1',
+              hearingDate: '2026-03-01',
+              motionType: 'msj',
+              outcome: 'granted',
+              case: {
+                id: 'case-1',
+                caseNumber: '24STCV12345',
+                caseTitle: 'MSJ Case',
+              },
+            },
+          },
+        ],
+      }),
+    ];
+
+    render(
+      <MockedProvider mocks={mocks}>
+        <JudgeProfile judgeId="judge-filter-3" />
+      </MockedProvider>,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByText('Motion Type Breakdown')).toBeInTheDocument();
+    });
+
+    // Click the "MSJ" row (first match is in the analytics table)
+    const msjCells = screen.getAllByText('MSJ');
+    const msjRow = msjCells[0].closest('tr');
+    expect(msjRow).not.toBeNull();
+    await user.click(msjRow!);
+
+    // The clicked row should have aria-pressed=true
+    await waitFor(() => {
+      expect(msjRow).toHaveAttribute('aria-pressed', 'true');
+    });
+
+    // Other rows should have aria-pressed=false
+    const demurrerCells = screen.getAllByText('Demurrer');
+    // The Demurrer cell in the analytics table
+    const demurrerRow = demurrerCells[0].closest('tr');
+    expect(demurrerRow).toHaveAttribute('aria-pressed', 'false');
+  });
+
+  it('clears filter when clicking the same motion type row again (toggle)', async () => {
+    const user = userEvent.setup();
+    const mocks: MockedResponse[] = [
+      buildAnalyticsMock('judge-filter-4'),
+      buildRulingsMock('judge-filter-4'),
+      // Mock for filtered query
+      buildRulingsMock('judge-filter-4', {
+        motionType: 'msj',
+        edges: [
+          {
+            cursor: 'cf1',
+            node: {
+              id: 'rf1',
+              hearingDate: '2026-03-01',
+              motionType: 'msj',
+              outcome: 'granted',
+              case: {
+                id: 'case-1',
+                caseNumber: '24STCV12345',
+                caseTitle: 'MSJ Case',
+              },
+            },
+          },
+        ],
+      }),
+      // Mock for unfiltered query when toggled back
+      buildRulingsMock('judge-filter-4'),
+    ];
+
+    render(
+      <MockedProvider mocks={mocks}>
+        <JudgeProfile judgeId="judge-filter-4" />
+      </MockedProvider>,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByText('Motion Type Breakdown')).toBeInTheDocument();
+    });
+
+    // Use getAllByText since "MSJ" appears in both table and rulings
+    const msjCells = screen.getAllByText('MSJ');
+    const msjRow = msjCells[0].closest('tr');
+
+    // Click to activate filter
+    await user.click(msjRow!);
+    await waitFor(() => {
+      expect(screen.getByTestId('motion-type-filter-pill')).toBeInTheDocument();
+    });
+
+    // Click again to clear filter
+    await user.click(msjRow!);
+    await waitFor(() => {
+      expect(screen.queryByTestId('motion-type-filter-pill')).not.toBeInTheDocument();
+    });
+  });
+
+  it('clears filter when clicking the clear button in the filter pill', async () => {
+    const user = userEvent.setup();
+    const mocks: MockedResponse[] = [
+      buildAnalyticsMock('judge-filter-5'),
+      buildRulingsMock('judge-filter-5'),
+      buildRulingsMock('judge-filter-5', {
+        motionType: 'demurrer',
+        edges: [
+          {
+            cursor: 'cf1',
+            node: {
+              id: 'rf1',
+              hearingDate: '2026-02-15',
+              motionType: 'demurrer',
+              outcome: 'denied',
+              case: {
+                id: 'case-2',
+                caseNumber: '24STCV67890',
+                caseTitle: null,
+              },
+            },
+          },
+        ],
+      }),
+      // Mock for unfiltered query after clear
+      buildRulingsMock('judge-filter-5'),
+    ];
+
+    render(
+      <MockedProvider mocks={mocks}>
+        <JudgeProfile judgeId="judge-filter-5" />
+      </MockedProvider>,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByText('MSJ')).toBeInTheDocument();
+    });
+
+    // Click "Demurrer" to activate filter
+    const demurrerCells = screen.getAllByText('Demurrer');
+    const demurrerRow = demurrerCells[0].closest('tr');
+    await user.click(demurrerRow!);
+
+    await waitFor(() => {
+      expect(screen.getByTestId('motion-type-filter-pill')).toBeInTheDocument();
+    });
+
+    // Click the clear button (X) in the filter pill
+    const clearButton = screen.getByLabelText('Clear Demurrer filter');
+    await user.click(clearButton);
+
+    await waitFor(() => {
+      expect(screen.queryByTestId('motion-type-filter-pill')).not.toBeInTheDocument();
+    });
+  });
+
+  it('shows filtered empty state with clear link when filter returns no results', async () => {
+    const user = userEvent.setup();
+    const mocks: MockedResponse[] = [
+      buildAnalyticsMock('judge-filter-6'),
+      buildRulingsMock('judge-filter-6'),
+      // Filtered query returns empty
+      buildRulingsMock('judge-filter-6', {
+        motionType: 'demurrer',
+        edges: [],
+      }),
+      // Unfiltered query after clear
+      buildRulingsMock('judge-filter-6'),
+    ];
+
+    render(
+      <MockedProvider mocks={mocks}>
+        <JudgeProfile judgeId="judge-filter-6" />
+      </MockedProvider>,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByText('MSJ')).toBeInTheDocument();
+    });
+
+    // Click "Demurrer" row
+    const demurrerCells = screen.getAllByText('Demurrer');
+    const demurrerRow = demurrerCells[0].closest('tr');
+    await user.click(demurrerRow!);
+
+    // Should show filtered empty state
+    await waitFor(() => {
+      expect(screen.getByText(/No Demurrer rulings found/)).toBeInTheDocument();
+    });
+
+    // Should have a "Clear filter" link
+    const clearLink = screen.getByText('Clear filter');
+    expect(clearLink).toBeInTheDocument();
+
+    // Click it to clear the filter
+    await user.click(clearLink);
+
+    // Filter pill should disappear
+    await waitFor(() => {
+      expect(screen.queryByTestId('motion-type-filter-pill')).not.toBeInTheDocument();
+    });
+  });
+
+  it('supports keyboard activation with Enter key on motion type rows', async () => {
+    const user = userEvent.setup();
+    const mocks: MockedResponse[] = [
+      buildAnalyticsMock('judge-filter-7'),
+      buildRulingsMock('judge-filter-7'),
+      buildRulingsMock('judge-filter-7', {
+        motionType: 'msj',
+        edges: [
+          {
+            cursor: 'cf1',
+            node: {
+              id: 'rf1',
+              hearingDate: '2026-03-01',
+              motionType: 'msj',
+              outcome: 'granted',
+              case: {
+                id: 'case-1',
+                caseNumber: '24STCV12345',
+                caseTitle: 'MSJ Case',
+              },
+            },
+          },
+        ],
+      }),
+    ];
+
+    render(
+      <MockedProvider mocks={mocks}>
+        <JudgeProfile judgeId="judge-filter-7" />
+      </MockedProvider>,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByText('Motion Type Breakdown')).toBeInTheDocument();
+    });
+
+    const msjCells = screen.getAllByText('MSJ');
+    const msjRow = msjCells[0].closest('tr');
+    expect(msjRow).not.toBeNull();
+
+    // Focus the row and press Enter
+    msjRow!.focus();
+    await user.keyboard('{Enter}');
+
+    // Filter should be applied
+    await waitFor(() => {
+      expect(screen.getByTestId('motion-type-filter-pill')).toBeInTheDocument();
+    });
+    expect(screen.getByTestId('motion-type-filter-pill')).toHaveTextContent('MSJ');
   });
 });
