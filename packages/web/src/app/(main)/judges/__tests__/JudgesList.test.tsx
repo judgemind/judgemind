@@ -302,6 +302,16 @@ describe('JudgesList', () => {
     expect(mockPush).not.toHaveBeenCalled();
   });
 
+  it('does not double-navigate when clicking the name link', () => {
+    setupMocks();
+
+    render(<JudgesList />);
+    const link = screen.getByText('Alice Z. Anderson');
+    fireEvent.click(link);
+    // Link stopPropagation prevents row onClick from firing router.push
+    expect(mockPush).not.toHaveBeenCalled();
+  });
+
   it('renders sortable column headers', () => {
     setupMocks();
 

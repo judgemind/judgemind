@@ -294,23 +294,27 @@ export function JudgesList() {
       {/* Selection chips */}
       {selectionCount > 0 && (
         <div className="flex flex-wrap items-center gap-2" data-testid="selection-tray">
-          {[...selectedJudges.entries()].map(([id, name]) => (
-            <span
-              key={id}
-              className="inline-flex items-center gap-1 rounded-full border bg-muted/50 px-2.5 py-0.5 text-sm"
-              data-testid="selection-chip"
-            >
-              {surname(name).charAt(0).toUpperCase() + surname(name).slice(1)}
-              <button
-                type="button"
-                className="ml-0.5 rounded-full p-0.5 hover:bg-muted"
-                onClick={() => removeJudgeSelection(id)}
-                aria-label={`Remove ${name} from comparison`}
+          {[...selectedJudges.entries()].map(([id, name]) => {
+            const sn = surname(name);
+            const label = sn.charAt(0).toUpperCase() + sn.slice(1);
+            return (
+              <span
+                key={id}
+                className="inline-flex items-center gap-1 rounded-full border bg-muted/50 px-2.5 py-0.5 text-sm"
+                data-testid="selection-chip"
               >
-                <X className="h-3 w-3" />
-              </button>
-            </span>
-          ))}
+                {label}
+                <button
+                  type="button"
+                  className="ml-0.5 rounded-full p-0.5 transition-colors hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                  onClick={() => removeJudgeSelection(id)}
+                  aria-label={`Remove ${name} from comparison`}
+                >
+                  <X className="h-3 w-3" aria-hidden="true" />
+                </button>
+              </span>
+            );
+          })}
           <Button
             onClick={handleCompare}
             disabled={selectionCount < 2}
@@ -394,7 +398,9 @@ export function JudgesList() {
               </TableRow>
             )}
 
-            {/* Data rows */}
+            {/* Data rows — onClick on <tr> rather than <Link> wrapper
+               because table rows with checkboxes cannot wrap in <a>.
+               The name <Link> provides keyboard/right-click/cmd-click access. */}
             {displayedJudges.map((node) => {
               const isSelected = selectedJudges.has(node.id);
               return (
