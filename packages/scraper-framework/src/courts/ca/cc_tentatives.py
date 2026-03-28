@@ -127,23 +127,26 @@ _MOTION_TYPE_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Outcome patterns from tentative ruling text
+# Outcome patterns from tentative ruling text.
+# Values are lowercase DB ``ruling_outcome`` enum values so that
+# ``_cc_extract_outcome()`` returns DB-ready strings without needing
+# downstream ``normalize_outcome()`` (#2170).
 _OUTCOME_PATTERNS: list[tuple[re.Pattern, str]] = [
-    (re.compile(r"\bis\s+granted\b", re.IGNORECASE), "Granted"),
-    (re.compile(r"\bis\s+denied\b", re.IGNORECASE), "Denied"),
-    (re.compile(r"\bis\s+sustained\b", re.IGNORECASE), "Sustained"),
-    (re.compile(r"\bis\s+overruled\b", re.IGNORECASE), "Overruled"),
-    (re.compile(r"\bis\s+continued\b", re.IGNORECASE), "Continued"),
-    (re.compile(r"\bis\s+moot\b", re.IGNORECASE), "Moot"),
-    (re.compile(r"\bis\s+vacated\b", re.IGNORECASE), "Vacated"),
-    (re.compile(r"\bis\s+unopposed and is granted\b", re.IGNORECASE), "Granted"),
-    (re.compile(r"\bgranted as set forth\b", re.IGNORECASE), "Granted"),
-    (re.compile(r"\bdenied as set forth\b", re.IGNORECASE), "Denied"),
-    (re.compile(r"\bPetition Approved\b", re.IGNORECASE), "Granted"),
-    (re.compile(r"\bPetition Denied\b", re.IGNORECASE), "Denied"),
+    (re.compile(r"\bis\s+granted\b", re.IGNORECASE), "granted"),
+    (re.compile(r"\bis\s+denied\b", re.IGNORECASE), "denied"),
+    (re.compile(r"\bis\s+sustained\b", re.IGNORECASE), "granted"),
+    (re.compile(r"\bis\s+overruled\b", re.IGNORECASE), "denied"),
+    (re.compile(r"\bis\s+continued\b", re.IGNORECASE), "continued"),
+    (re.compile(r"\bis\s+moot\b", re.IGNORECASE), "moot"),
+    (re.compile(r"\bis\s+vacated\b", re.IGNORECASE), "off_calendar"),
+    (re.compile(r"\bis\s+unopposed and is granted\b", re.IGNORECASE), "granted"),
+    (re.compile(r"\bgranted as set forth\b", re.IGNORECASE), "granted"),
+    (re.compile(r"\bdenied as set forth\b", re.IGNORECASE), "denied"),
+    (re.compile(r"\bPetition Approved\b", re.IGNORECASE), "granted"),
+    (re.compile(r"\bPetition Denied\b", re.IGNORECASE), "denied"),
     (
         re.compile(r"\bno appearance\s+(?:is\s+)?required\b", re.IGNORECASE),
-        "No Appearance Required",
+        "other",
     ),
 ]
 
