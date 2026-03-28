@@ -20,6 +20,16 @@ from .extraction_config import (
     get_county_extraction_config,
 )
 from .hashing import content_changed, sha256_hex
+from .llm_enrichment import (
+    ENRICHMENT_SYSTEM_PROMPT,
+    VALID_MOTION_TYPES,
+    VALID_OUTCOMES,
+    EnrichmentParties,
+    LlmEnrichmentResult,
+    MotionType,
+    OutcomeType,
+    enrich_ruling,
+)
 from .llm_extractor import LlmExtractor
 from .llm_schema import (
     EXTRACTION_SYSTEM_PROMPT,
@@ -76,8 +86,16 @@ __all__ = [
     "ScraperPhase",
     "ScheduleWindow",
     "ValidationStatus",
+    "ENRICHMENT_SYSTEM_PROMPT",
     "EnrichmentEngine",
+    "EnrichmentParties",
     "EnrichmentResult",
+    "LlmEnrichmentResult",
+    "MotionType",
+    "OutcomeType",
+    "VALID_MOTION_TYPES",
+    "VALID_OUTCOMES",
+    "enrich_ruling",
     "build_s3_key",
     "compute_party_overlap",
     "configure_structlog",
