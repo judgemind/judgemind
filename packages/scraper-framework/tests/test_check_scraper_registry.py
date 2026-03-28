@@ -53,6 +53,7 @@ class TestFindScraperModules:
         expected_modules = [
             "courts.ca.cc_tentatives",
             "courts.ca.fresno_tentatives",
+            "courts.ca.governor_appointments",
             "courts.ca.la_tentatives",
             "courts.ca.oc_family_law_tentatives",
             "courts.ca.oc_probate_tentatives",
@@ -146,6 +147,7 @@ class TestFindRegisteredModules:
         expected = {
             "courts.ca.cc_tentatives",
             "courts.ca.fresno_tentatives",
+            "courts.ca.governor_appointments",
             "courts.ca.la_tentatives",
             "courts.ca.oc_family_law_tentatives",
             "courts.ca.oc_probate_tentatives",
