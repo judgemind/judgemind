@@ -225,6 +225,40 @@ class TestNormalizeDepartment:
         """Lowercase input prefix should preserve its casing."""
         assert _normalize_department("cm2") == "cm02"
 
+    # Hyphen removal (#2123)
+
+    def test_strips_hyphen_s17(self) -> None:
+        """LLM returns 'S-17' — hyphen should be stripped to 'S17'."""
+        assert _normalize_department("S-17") == "S17"
+
+    def test_strips_hyphen_r14(self) -> None:
+        """LLM returns 'R-14' — hyphen should be stripped to 'R14'."""
+        assert _normalize_department("R-14") == "R14"
+
+    def test_strips_hyphen_s22(self) -> None:
+        """LLM returns 'S-22' — hyphen should be stripped to 'S22'."""
+        assert _normalize_department("S-22") == "S22"
+
+    def test_strips_hyphen_with_whitespace(self) -> None:
+        """Hyphenated with surrounding whitespace should normalize."""
+        assert _normalize_department("  S-17  ") == "S17"
+
+    def test_strips_hyphen_then_zero_pads(self) -> None:
+        """'CM-2' should become 'CM02' (hyphen stripped, then zero-padded)."""
+        assert _normalize_department("CM-2") == "CM02"
+
+    def test_strips_hyphen_preserves_case(self) -> None:
+        """Lowercase 's-17' should become 's17' preserving original casing."""
+        assert _normalize_department("s-17") == "s17"
+
+    def test_no_hyphen_unchanged(self) -> None:
+        """Already non-hyphenated 'S17' should be unchanged."""
+        assert _normalize_department("S17") == "S17"
+
+    def test_multi_letter_prefix_hyphen(self) -> None:
+        """Multi-letter prefix with hyphen: 'CM-12' should become 'CM12'."""
+        assert _normalize_department("CM-12") == "CM12"
+
 
 # ---------------------------------------------------------------------------
 # _parse_response

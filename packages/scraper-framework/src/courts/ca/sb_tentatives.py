@@ -64,6 +64,22 @@ _HONORABLE_RE = re.compile(
 # both formats; extracted values are normalised (space removed) in parse_document.
 _CASE_NUMBER_RE = re.compile(r"\bCIV[A-Z]{2}\s*\d{5,8}\b")
 
+# Regex: letter prefix, optional hyphen, digits — matches both "S17" and "S-17".
+_SB_DEPT_HYPHEN_RE = re.compile(r"^([A-Za-z]+)-(\d+)$")
+
+
+def _normalize_sb_department(dept: str) -> str:
+    """Strip hyphens from SB department codes: ``S-17`` -> ``S17``, ``R-14`` -> ``R14``.
+
+    The canonical format is non-hyphenated (e.g. ``S17``, ``R14``).
+    Hyphenated variants sometimes appear in LLM extraction or PDF text.
+    This normalizes them to the canonical form.
+    """
+    m = _SB_DEPT_HYPHEN_RE.match(dept.strip())
+    if m:
+        return f"{m.group(1)}{m.group(2)}"
+    return dept.strip()
+
 
 # Filename date: CV{LOC}{DEPT}{MMDDYY}.pdf → extract MMDDYY
 _FILENAME_DATE_RE = re.compile(r"CV[A-Z]\d+(\d{6})\.pdf$", re.IGNORECASE)
@@ -128,6 +144,10 @@ class SBTentativeRulingsScraper(PdfLinkScraper):
     def parse_document(self, doc: CapturedDocument) -> CapturedDocument:
         """Extract case numbers (via super), judge name, and hearing date."""
         doc = super().parse_document(doc)
+
+        # Normalise department: strip hyphens (e.g. "S-17" → "S17") (#2123).
+        if doc.department:
+            doc.department = _normalize_sb_department(doc.department)
 
         # Normalise case numbers: remove any internal whitespace that the
         # broadened regex may have matched (e.g. "CIVSB 2600093" → "CIVSB2600093").
