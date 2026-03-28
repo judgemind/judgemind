@@ -1,8 +1,9 @@
 'use client';
 
-import { useState, useMemo } from 'react';
+import { useState, useMemo, useCallback, useEffect } from 'react';
 import { useQuery, gql } from '@apollo/client';
-import { useRouter } from 'next/navigation';
+import { useRouter, useSearchParams } from 'next/navigation';
+import { useCountyOptions } from '@/lib/filter-options';
 import Link from 'next/link';
 import { Search, ArrowUpDown, ArrowUp, ArrowDown, Scale, X } from 'lucide-react';
 import { ErrorBanner } from '@/components/ErrorBanner';
@@ -95,12 +96,6 @@ interface JudgesData {
   };
 }
 
-const COUNTIES_QUERY = gql`
-  query DistinctCounties {
-    distinctCounties
-  }
-`;
-
 type SortKey = 'name' | 'county' | 'rulingCount';
 type SortDir = 'asc' | 'desc';
 
@@ -174,47 +169,78 @@ function SortIcon({ column, activeColumn, direction }: {
 
 export function JudgesList() {
   const router = useRouter();
+  const searchParams = useSearchParams();
 
-  const [nameFilter, setNameFilter] = useState('');
-  const [countyFilter, setCountyFilter] = useState<string>('all');
-  const [sortKey, setSortKey] = useState<SortKey>('name');
-  const [sortDir, setSortDir] = useState<SortDir>('asc');
+  const [nameFilter, setNameFilter] = useState(searchParams.get('name') ?? '');
+  const [countyFilter, setCountyFilter] = useState<string>(searchParams.get('county') ?? 'all');
+  const [sortKey, setSortKey] = useState<SortKey>(
+    (searchParams.get('sort') as SortKey) || 'name',
+  );
+  const [sortDir, setSortDir] = useState<SortDir>(
+    (searchParams.get('dir') as SortDir) || 'asc',
+  );
   const [selectedJudges, setSelectedJudges] = useState<Map<string, string>>(new Map());
+
+  // Sync state from URL when searchParams change (e.g. browser back/forward)
+  useEffect(() => {
+    setNameFilter(searchParams.get('name') ?? '');
+    setCountyFilter(searchParams.get('county') ?? 'all');
+    setSortKey((searchParams.get('sort') as SortKey) || 'name');
+    setSortDir((searchParams.get('dir') as SortDir) || 'asc');
+  }, [searchParams]);
+
+  // Sync state to URL
+  const updateUrl = useCallback(() => {
+    const params = new URLSearchParams();
+    if (nameFilter) params.set('name', nameFilter);
+    if (countyFilter && countyFilter !== 'all') params.set('county', countyFilter);
+    if (sortKey && sortKey !== 'name') params.set('sort', sortKey);
+    if (sortDir && sortDir !== 'asc') params.set('dir', sortDir);
+    const search = params.toString();
+    router.replace(search ? `/judges?${search}` : '/judges');
+  }, [nameFilter, countyFilter, sortKey, sortDir, router]);
+
+  useEffect(() => {
+    updateUrl();
+  }, [updateUrl]);
 
   const countyArg = countyFilter !== 'all' ? countyFilter : undefined;
 
-  // Load judges in pages of 100 (dataset is ~264 total)
+  // TODO(perf): The judges list eagerly loads ALL judges in 3 sequential pages of
+  // 100 for client-side sort/filter. At ~264 judges this works, but won't scale
+  // past ~500. When the dataset grows, add server-side sortBy/sortDir parameters
+  // to the GraphQL query and use incremental pagination instead.
   const { data, loading, error } = useQuery<JudgesData>(JUDGES_QUERY, {
     variables: { first: 100, county: countyArg },
     notifyOnNetworkStatusChange: true,
   });
 
-  const { data: countiesData } = useQuery<{ distinctCounties: string[] }>(COUNTIES_QUERY);
-  const counties = countiesData?.distinctCounties ?? [];
+  const counties = useCountyOptions();
 
   const page1Info = data?.judges.pageInfo;
 
-  // Fetch page 2 if needed
-  const { data: page2Data } = useQuery<JudgesData>(JUDGES_PAGE2_QUERY, {
+  // Fetch page 2 if needed — skip while page 1 is loading to avoid stale cursors
+  const { data: page2Data, loading: page2Loading } = useQuery<JudgesData>(JUDGES_PAGE2_QUERY, {
     variables: { first: 100, after: page1Info?.endCursor ?? '', county: countyArg },
-    skip: !page1Info?.hasNextPage || !page1Info?.endCursor,
+    skip: loading || !page1Info?.hasNextPage || !page1Info?.endCursor,
   });
 
   const page2Info = page2Data?.judges.pageInfo;
 
-  // Fetch page 3 if needed
-  const { data: page3Data } = useQuery<JudgesData>(JUDGES_PAGE2_QUERY, {
+  // Fetch page 3 if needed — skip while pages 1 or 2 are loading to avoid stale cursors
+  const { data: page3Data, loading: page3Loading } = useQuery<JudgesData>(JUDGES_PAGE2_QUERY, {
     variables: { first: 100, after: page2Info?.endCursor ?? '', county: countyArg },
-    skip: !page2Info?.hasNextPage || !page2Info?.endCursor,
+    skip: loading || page2Loading || !page2Info?.hasNextPage || !page2Info?.endCursor,
   });
 
-  // Combine all pages
+  // Combine all pages — exclude stale data from pages still loading after a filter change
   const allEdges = useMemo(() => {
+    if (loading) return [];
     const p1 = data?.judges.edges ?? [];
-    const p2 = page2Data?.judges.edges ?? [];
-    const p3 = page3Data?.judges.edges ?? [];
+    const p2 = page2Loading ? [] : (page2Data?.judges.edges ?? []);
+    const p3 = page3Loading ? [] : (page3Data?.judges.edges ?? []);
     return [...p1, ...p2, ...p3];
-  }, [data, page2Data, page3Data]);
+  }, [data, page2Data, page3Data, loading, page2Loading, page3Loading]);
 
   // Apply client-side name filter and sort
   const displayedJudges = useMemo(() => {
