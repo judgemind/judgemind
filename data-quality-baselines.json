@@ -61,7 +61,7 @@
     }
   ],
   "field_completeness": {
-    "_updated": "2026-03-27",
+    "_updated": "2026-03-28",
     "_note": "Baselines updated from 7-day window query on 2026-03-27 (#1908). Multiple field completeness regressions resolved by lowering baselines to match current extraction reality. Follow-up issues filed for real extraction quality gaps.",
     "_definitions": {
       "total_documents": "Count of active documents that have at least one ruling record (JOIN documents d ... JOIN rulings r ON r.document_id = d.id) within the field completeness check window. This is the denominator for all field completeness percentages. It does NOT include orphaned documents (those with no ruling)."
@@ -120,10 +120,10 @@
       }
     },
     "San Bernardino": {
-      "total_documents": 96,
+      "total_documents": 201,
       "ruling": 100.0,
-      "judge": 83.0,
-      "motion_type": 94.0,
+      "judge": 100.0,
+      "motion_type": 100.0,
       "outcome": 100.0,
       "case_title": 100.0,
       "case_number": 97.0,
@@ -131,8 +131,7 @@
       "hearing_date": 100.0,
       "case_type": 100.0,
       "_known_gaps": {
-        "judge": "~17% of SB rulings lack judge extraction. Previously 100% — regression likely from new document formats or enrichment gaps in recent captures.",
-        "motion_type": "~6% of SB rulings lack motion_type extraction."
+        "_note": "All fields at 100% after LLM extraction backfill (#2109). 205 documents re-ingested with --force-llm. Previously had 17% judge gaps and 6% motion_type gaps."
       }
     },
     "San Diego": {
