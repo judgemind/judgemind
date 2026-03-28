@@ -268,7 +268,12 @@ export const resolvers = {
 
     judges: async (
       _: unknown,
-      { courtId, first, after }: { courtId?: string; first?: number; after?: string },
+      {
+        courtId,
+        county,
+        first,
+        after,
+      }: { courtId?: string; county?: string; first?: number; after?: string },
       { pool }: Context,
     ) => {
       const limit = pageSize(first);
@@ -277,22 +282,33 @@ export const resolvers = {
       let i = 1;
 
       if (courtId) {
-        conditions.push(`court_id = $${i++}`);
+        conditions.push(`j.court_id = $${i++}`);
         params.push(courtId);
+      }
+      if (county) {
+        conditions.push(`ct.county = $${i++}`);
+        params.push(county);
       }
 
       // Keyset — order by (canonical_name ASC, id ASC)
       // Cursor encodes [canonical_name, id]
       if (after) {
         const [name, id] = decodeCursor(after);
-        conditions.push(`(canonical_name, id) > ($${i++}, $${i++}::uuid)`);
+        conditions.push(`(j.canonical_name, j.id) > ($${i++}, $${i++}::uuid)`);
         params.push(name, id);
       }
 
+      const needCourtsJoin = county !== undefined;
+      const joins = needCourtsJoin ? 'JOIN courts ct ON ct.id = j.court_id' : '';
       const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
       params.push(limit + 1);
       const { rows } = await pool.query<Row>(
-        `SELECT * FROM judges ${where} ORDER BY canonical_name ASC, id ASC LIMIT $${i}`,
+        `SELECT j.*,
+                (SELECT COUNT(*)::int FROM rulings r WHERE r.judge_id = j.id) AS ruling_count
+         FROM judges j ${joins}
+         ${where}
+         ORDER BY j.canonical_name ASC, j.id ASC
+         LIMIT $${i}`,
         params,
       );
 
@@ -479,6 +495,10 @@ export const resolvers = {
     canonicalName: (row: Row) => row.canonical_name,
     isActive: (row: Row) => row.is_active,
     appointedAt: (row: Row) => row.appointed_at,
+    rulingCount: (row: Row, _: unknown, { loaders }: Context) =>
+      row.ruling_count !== undefined
+        ? row.ruling_count
+        : loaders.judgeRulingCountLoader.load(row.id as string),
     court: (row: Row, _: unknown, { loaders }: Context) =>
       row.court_id ? loaders.courtLoader.load(row.court_id as string) : null,
   },
