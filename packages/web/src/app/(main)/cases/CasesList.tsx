@@ -315,17 +315,18 @@ export function CasesList() {
         <div>
           <div className="divide-y rounded-lg border">
             {filteredEdges.map(({ node }) => (
-              <div key={node.id} className="px-4 py-3 transition-colors hover:bg-muted/50">
+              <Link
+                key={node.id}
+                href={`/cases/${node.id}`}
+                className="block cursor-pointer px-4 py-3 transition-colors hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+              >
                 <div className="flex items-start justify-between gap-4">
                   {/* Left: case info, badges */}
                   <div className="min-w-0 flex-1">
-                    <Link
-                      href={`/cases/${node.id}`}
-                      className="block truncate rounded-sm font-medium text-foreground hover:text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                    >
+                    <span className="block truncate font-medium text-foreground">
                       {node.caseNumber}
                       {node.caseTitle ? ` \u2014 ${node.caseTitle}` : ''}
-                    </Link>
+                    </span>
 
                     <div className="mt-0.5 flex flex-wrap items-center gap-x-2 text-xs text-muted-foreground">
                       {node.court?.county && (
@@ -351,7 +352,7 @@ export function CasesList() {
                     {node.latestRuling ? formatDate(node.latestRuling.hearingDate) : '\u2014'}
                   </span>
                 </div>
-              </div>
+              </Link>
             ))}
           </div>
 

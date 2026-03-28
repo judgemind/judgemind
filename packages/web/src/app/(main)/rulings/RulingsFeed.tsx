@@ -304,20 +304,21 @@ export function RulingsFeed() {
         <div>
           <div className="divide-y rounded-lg border">
             {edges.map(({ node }) => (
-              <div key={node.id} className="px-4 py-3 transition-colors hover:bg-muted/50">
+              <Link
+                key={node.id}
+                href={`/rulings/${node.id}`}
+                className="block cursor-pointer px-4 py-3 transition-colors hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+              >
                 <div className="flex items-start justify-between gap-4">
                   {/* Left: case info, judge, badges */}
                   <div className="min-w-0 flex-1">
                     {/* Title + outcome badge on same line */}
                     <div className="flex items-center gap-2">
                       {node.case ? (
-                        <Link
-                          href={`/rulings/${node.id}`}
-                          className="truncate rounded-sm font-medium text-foreground hover:text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                        >
+                        <span className="truncate font-medium text-foreground">
                           {node.case.caseNumber}
                           {node.case.caseTitle ? ` \u2014 ${node.case.caseTitle}` : ''}
-                        </Link>
+                        </span>
                       ) : (
                         <span className="text-muted-foreground">{'\u2014'}</span>
                       )}
@@ -350,7 +351,7 @@ export function RulingsFeed() {
                     {formatDate(node.hearingDate)}
                   </span>
                 </div>
-              </div>
+              </Link>
             ))}
           </div>
 

@@ -656,4 +656,62 @@ describe('JudgesList', () => {
     expect(screen.getByLabelText('Select Smith, John A. for comparison')).toBeInTheDocument();
     expect(screen.getByLabelText('Select Johnson, Robert M. for comparison')).toBeInTheDocument();
   });
+
+  // Full-row clickable tests (#2108)
+  it('renders data rows with cursor-pointer for row-level click', () => {
+    mockUseQuery.mockReturnValue({
+      data: MOCK_JUDGES_DATA,
+      loading: false,
+      error: undefined,
+      fetchMore: vi.fn(),
+    });
+
+    const { container } = render(<JudgesList />);
+    const clickableRows = container.querySelectorAll('tr.cursor-pointer');
+    expect(clickableRows.length).toBe(2);
+  });
+
+  it('navigates to judge detail when row is clicked', () => {
+    mockUseQuery.mockReturnValue({
+      data: MOCK_JUDGES_DATA,
+      loading: false,
+      error: undefined,
+      fetchMore: vi.fn(),
+    });
+
+    render(<JudgesList />);
+    // Click the county cell (not the link or checkbox) to test row-level click
+    const countyCells = screen.getAllByText(/Los Angeles|Orange/);
+    fireEvent.click(countyCells[0]);
+    expect(mockPush).toHaveBeenCalledWith('/judges/judge-1');
+  });
+
+  it('does not navigate when checkbox cell is clicked', () => {
+    mockUseQuery.mockReturnValue({
+      data: MOCK_JUDGES_DATA,
+      loading: false,
+      error: undefined,
+      fetchMore: vi.fn(),
+    });
+
+    render(<JudgesList />);
+    const checkboxes = screen.getAllByTestId('judge-checkbox');
+    mockPush.mockClear();
+    fireEvent.click(checkboxes[0]);
+    // Checkbox click should toggle selection, not navigate
+    expect(mockPush).not.toHaveBeenCalled();
+  });
+
+  it('preserves judge name as semantic link for right-click/new-tab', () => {
+    mockUseQuery.mockReturnValue({
+      data: MOCK_JUDGES_DATA,
+      loading: false,
+      error: undefined,
+      fetchMore: vi.fn(),
+    });
+
+    render(<JudgesList />);
+    const link = screen.getByText('Smith, John A.').closest('a');
+    expect(link).toHaveAttribute('href', '/judges/judge-1');
+  });
 });

@@ -542,4 +542,33 @@ describe('CasesList', () => {
     expect(lastCall[1].variables.motionType).toBe('msj');
     expect(mockReplace).toHaveBeenCalledWith(expect.stringContaining('motionType=msj'));
   });
+
+  // Full-row clickable tests (#2108)
+  it('makes entire row a clickable link wrapping all content', () => {
+    mockUseQuery.mockReturnValue({ data: MOCK_CASES_DATA, loading: false, error: undefined, fetchMore: vi.fn() });
+    const { container } = render(<CasesList />);
+    // Each case row should be an <a> element (Link renders as <a> in test mock)
+    const rowLinks = container.querySelectorAll('a[href^="/cases/"]');
+    expect(rowLinks.length).toBe(3);
+    expect(rowLinks[0]).toHaveAttribute('href', '/cases/case-1');
+    expect(rowLinks[1]).toHaveAttribute('href', '/cases/case-2');
+    expect(rowLinks[2]).toHaveAttribute('href', '/cases/case-3');
+  });
+
+  it('renders row links with cursor-pointer class', () => {
+    mockUseQuery.mockReturnValue({ data: MOCK_CASES_DATA, loading: false, error: undefined, fetchMore: vi.fn() });
+    const { container } = render(<CasesList />);
+    const rowLinks = container.querySelectorAll('.cursor-pointer');
+    expect(rowLinks.length).toBeGreaterThanOrEqual(3);
+  });
+
+  it('renders case title as span, not nested link', () => {
+    mockUseQuery.mockReturnValue({ data: MOCK_CASES_DATA, loading: false, error: undefined, fetchMore: vi.fn() });
+    render(<CasesList />);
+    const titleElement = screen.getByText(/24STCV01234/);
+    // Title should be a <span>, not an <a> (no nested links)
+    expect(titleElement.tagName.toLowerCase()).toBe('span');
+    // But it should be inside an <a> (the row link)
+    expect(titleElement.closest('a')).toHaveAttribute('href', '/cases/case-1');
+  });
 });

@@ -230,8 +230,13 @@ export function JudgesList() {
             {filteredEdges.map(({ node }) => {
               const isSelected = selectedJudgeIds.has(node.id);
               return (
-                <TableRow key={node.id}>
-                  <TableCell className="w-10">
+                <TableRow
+                  key={node.id}
+                  className="cursor-pointer"
+                  onClick={() => router.push(`/judges/${node.id}`)}
+                >
+                  {/* eslint-disable-next-line jsx-a11y/click-events-have-key-events, jsx-a11y/no-noninteractive-element-interactions */}
+                  <TableCell className="w-10" onClick={(e) => e.stopPropagation()}>
                     <Checkbox
                       checked={isSelected}
                       onCheckedChange={() => toggleJudgeSelection(node.id)}
@@ -242,6 +247,7 @@ export function JudgesList() {
                     <Link
                       href={`/judges/${node.id}`}
                       className="rounded-sm hover:text-primary hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                      onClick={(e) => e.stopPropagation()}
                     >
                       {node.canonicalName}
                     </Link>
