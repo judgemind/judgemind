@@ -314,28 +314,31 @@ def test_sc_case_numbers_case_insensitive() -> None:
 
 
 def test_sc_outcome_granted() -> None:
-    assert parse_outcome("Plaintiff's motion is GRANTED.") == "GRANTED"
+    # parse_outcome now returns DB-compatible lowercase enum values (#2113)
+    assert parse_outcome("Plaintiff's motion is GRANTED.") == "granted"
 
 
 def test_sc_outcome_denied() -> None:
-    assert parse_outcome("The motion is DENIED.") == "DENIED"
+    assert parse_outcome("The motion is DENIED.") == "denied"
 
 
 def test_sc_outcome_off_calendar() -> None:
-    assert parse_outcome("This matter is OFF calendar.") == "Off calendar"
-    assert parse_outcome("Case is off calendar.") == "Off calendar"
+    assert parse_outcome("This matter is OFF calendar.") == "off_calendar"
+    assert parse_outcome("Case is off calendar.") == "off_calendar"
 
 
 def test_sc_outcome_sustained() -> None:
-    assert parse_outcome("Defendant's demurrer is SUSTAINED.") == "SUSTAINED"
+    # SUSTAINED maps to "granted" in the ruling_outcome enum
+    assert parse_outcome("Defendant's demurrer is SUSTAINED.") == "granted"
 
 
 def test_sc_outcome_overruled() -> None:
-    assert parse_outcome("Demurrer is OVERRULED.") == "OVERRULED"
+    # OVERRULED maps to "denied" in the ruling_outcome enum
+    assert parse_outcome("Demurrer is OVERRULED.") == "denied"
 
 
 def test_sc_outcome_moot() -> None:
-    assert parse_outcome("The motion is rendered MOOT.") == "MOOT"
+    assert parse_outcome("The motion is rendered MOOT.") == "moot"
 
 
 def test_sc_outcome_none_for_empty() -> None:
@@ -347,7 +350,8 @@ def test_sc_outcome_from_real_pdf_dept6() -> None:
     text = extract_pdf_text(_load_bytes("sc_dept6_tues.pdf"))
     outcome = parse_outcome(text)
     assert outcome is not None
-    assert outcome in ("Off calendar", "GRANTED", "DENIED", "SUSTAINED", "OVERRULED", "MOOT")
+    # Values should now be valid ruling_outcome enum values (#2113)
+    assert outcome in ("off_calendar", "granted", "denied", "moot")
 
 
 # ---------------------------------------------------------------------------
