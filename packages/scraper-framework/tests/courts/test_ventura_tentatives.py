@@ -1060,12 +1060,14 @@ def test_ventura_llm_extract_outcome_case_insensitive(mock_call_llm: MagicMock) 
         ("Granted_In_Part", "Granted in Part"),
     ]:
         mock_response = MagicMock()
-        mock_response.text = json.dumps({
-            "outcome": llm_val,
-            "case_title": None,
-            "parties": [],
-            "ruling_text": "text",
-        })
+        mock_response.text = json.dumps(
+            {
+                "outcome": llm_val,
+                "case_title": None,
+                "parties": [],
+                "ruling_text": "text",
+            }
+        )
         mock_response.input_tokens = 100
         mock_response.output_tokens = 50
         mock_call_llm.return_value = mock_response
@@ -1079,7 +1081,9 @@ def test_ventura_llm_extract_outcome_case_insensitive(mock_call_llm: MagicMock) 
 def test_ventura_llm_extract_inline_code_fence(mock_call_llm: MagicMock) -> None:
     """JSON on same line as code fence should still be parsed correctly."""
     mock_response = MagicMock()
-    mock_response.text = '```json{"outcome": "granted", "case_title": null, "parties": [], "ruling_text": "text"}```'
+    mock_response.text = (
+        '```json{"outcome": "granted", "case_title": null, "parties": [], "ruling_text": "text"}```'
+    )
     mock_response.input_tokens = 100
     mock_response.output_tokens = 50
     mock_call_llm.return_value = mock_response
