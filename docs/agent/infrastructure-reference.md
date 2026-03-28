@@ -88,7 +88,7 @@ See `docs/terraform-checklist.md` for the full checklist.
 
 ```
 # Run a script and wait for completion (default)
-scripts/ecs-run-task.sh scripts/backfill_ruling_fields.py -- --dry-run
+scripts/ecs-run-task.sh scripts/backfill_ruling_html.py -- --dry-run
 
 # Long-running tasks: launch and detach, check logs later
 scripts/ecs-run-task.sh --detach scripts/reingest_from_s3.py -- --all
@@ -99,7 +99,7 @@ scripts/ecs-task-logs.sh <task-id>
 scripts/ecs-task-logs.sh <task-id> --follow
 
 # Override CPU/memory for heavy workloads
-scripts/ecs-run-task.sh --cpu 2048 --memory 4096 scripts/backfill_parties.py
+scripts/ecs-run-task.sh --cpu 2048 --memory 4096 scripts/backfill_summaries.py
 ```
 
 ## Secrets Retrieval

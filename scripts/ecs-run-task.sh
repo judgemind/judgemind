@@ -43,9 +43,9 @@
 #   --help              Show this help message
 #
 # Examples:
-#   scripts/ecs-run-task.sh scripts/backfill_ruling_fields.py -- --dry-run
-#   scripts/ecs-run-task.sh scripts/cleanup_no_tentative_rulings.py
-#   scripts/ecs-run-task.sh --timeout 3600 scripts/backfill_parties.py
+#   scripts/ecs-run-task.sh scripts/backfill_ruling_html.py -- --dry-run
+#   scripts/ecs-run-task.sh scripts/backfill_summaries.py
+#   scripts/ecs-run-task.sh --timeout 3600 scripts/backfill_summaries.py
 #   scripts/ecs-run-task.sh --detach scripts/reingest_from_s3.py -- --all
 #   scripts/ecs-run-task.sh --logs arn:aws:ecs:us-west-2:155326049300:task/judgemind-dev/abc123
 

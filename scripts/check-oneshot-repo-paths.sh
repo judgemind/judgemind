@@ -48,9 +48,6 @@ LOCAL_ONLY=(
     "log_ralph_summary.py"
     "update-coverage-baselines.py"
     "validate-dq-baselines.py"
-    "run_judge_cleanup.py"
-    "backfill_la_entity_descriptors.py"
-    "backfill_la_header_titles.py"
     "reingest_all_llm.py"
     # CI-only checker scripts — run in GitHub Actions, not ECS
     "check-oneshot-imports.sh"

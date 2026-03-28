@@ -31,13 +31,13 @@
 #
 # Examples:
 #   # Run a Python script on the ingestion worker
-#   scripts/ecs-run.sh python3 scripts/backfill_ruling_fields.py --dry-run
+#   scripts/ecs-run.sh python3 scripts/backfill_ruling_html.py --dry-run
 #
 #   # Transfer and run a local script on the container
-#   scripts/ecs-run.sh --script scripts/backfill_ruling_fields.py -- --dry-run
+#   scripts/ecs-run.sh --script scripts/backfill_ruling_html.py -- --dry-run
 #
 #   # Redeploy first to pick up latest code, then run
-#   scripts/ecs-run.sh --redeploy python3 scripts/backfill_ruling_fields.py
+#   scripts/ecs-run.sh --redeploy python3 scripts/backfill_ruling_html.py
 #
 #   # Run on a different service
 #   scripts/ecs-run.sh --service judgemind-api-dev python3 -c "print('hello')"
@@ -106,9 +106,9 @@ if [[ $# -eq 0 && -z "$SCRIPT_PATH" ]]; then
     echo "  --container <name>  Container name (default: ingestion-worker)" >&2
     echo "" >&2
     echo "Examples:" >&2
-    echo "  scripts/ecs-run.sh python3 scripts/backfill_ruling_fields.py --dry-run" >&2
-    echo "  scripts/ecs-run.sh --script scripts/backfill_ruling_fields.py -- --dry-run" >&2
-    echo "  scripts/ecs-run.sh --redeploy python3 scripts/backfill_ruling_fields.py" >&2
+    echo "  scripts/ecs-run.sh python3 scripts/backfill_ruling_html.py --dry-run" >&2
+    echo "  scripts/ecs-run.sh --script scripts/backfill_ruling_html.py -- --dry-run" >&2
+    echo "  scripts/ecs-run.sh --redeploy python3 scripts/backfill_ruling_html.py" >&2
     echo "  scripts/ecs-run.sh bash" >&2
     exit 1
 fi
