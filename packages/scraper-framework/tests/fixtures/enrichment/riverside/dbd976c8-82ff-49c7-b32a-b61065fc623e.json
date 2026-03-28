@@ -1,0 +1,18 @@
+{
+  "ruling_text": "MOTION FOR JUDICIAL APPROVAL\nOF PENDENCY OF ACTION\nTentative Ruling: Motion granted.",
+  "expected": {
+    "case_title": "Cvme2600134 Medina v. Phh Mortgage Corporation",
+    "motion_type": "motion_for_judicial_approval",
+    "outcome": "granted",
+    "parties": {
+      "plaintiffs": [
+        "Cvme2600134 Medina"
+      ],
+      "defendants": [
+        "Phh Mortgage Corporation"
+      ]
+    }
+  },
+  "source_doc": "s3://judgemind-document-archive-dev/ca/riverside/superior_court/raw/2026/03/24/0101c8cc-058f-53c0-b22f-020458c0761d.pdf",
+  "notes": "Very short ruling text"
+}

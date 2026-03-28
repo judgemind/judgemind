@@ -1,0 +1,18 @@
+{
+  "ruling_text": "The Court has read and considered the Motion For Partial Sealing\nand Redaction of Defendant's Identifying Information by Chantel\nThomas Nguyen (ROA 54).\n\nThe Court finds that it is clear the Legislature intends to protect the\nconfidential address of victims of domestic violence (see\nGovernment Code section 6205) and has set up procedures and\nsafeguards in order to not place domestic violence at additional\nrisk of harm or violence. On February 9, 2026, Ms. Thomas\nNguyen presented to the Court a domestic violence restraining\norder protecting Ms. Thomas Nguyen from William Ryan, aka\nWilliam Ryan III, a named defendant in this matter.\n\nThe Court finds there exists an overriding interest in protecting the\nsafety of a victim of domestic violence, which overcomes the right\nof the public to access the court records. The Court finds a\nsubstantial probability exists that the overriding interest will be\nprejudiced if the record is not sealed and there is no less restrictive\nmeans that exist to achieve the overriding interest. The Court will\nseal the Court's record of this case regarding all information\npertaining to Chantel Thomas Nguyen and her contact information\npursuant to California Rules of Court, Rule 2.550(d) - this includes\nMs. Thomas Nugyen's Answer (ROA 21), Order on Court Fee\nWaiver (ROA 24), Clerk's Certificate of Mailing/Electronic\nService (ROA 34), Proof of Service by Mail (ROA 35), Ex Parte\nApplication for Continuance of Trial (ROA 36), Clerk's Certificate\nof Mailing/Electronic Service (ROA 40), Clerk's Certificate of\nSealing and Redaction of Defendant's Identifying Information\n(ROA 54).\n\nThe Court orders Chantel Thomas Nguyen's information be sealed\nfrom the public index and online case search results, and her\naddress, phone number, and email address be redacted from all\ndocuments in the court file and from any and all\npublicly accessible records.\n\nThe Court orders that Ms. Thomas Nugyen's address, phone\nnumber, and email address are not to be disclosed to any other\nparty absent an order from this Court due to safety concerns related\nto domestic violence.\nThe Court Clerk is to be notified forthwith to comply with this\nCourt's order.\nThe Court Clerk is to provide notice.",
+  "expected": {
+    "case_title": "Camden Jamboree Development, L.P. vs. Nguyen",
+    "motion_type": "ex_parte_application",
+    "outcome": null,
+    "parties": {
+      "plaintiffs": [
+        "Camden Jamboree Development, L.P."
+      ],
+      "defendants": [
+        "Nguyen"
+      ]
+    }
+  },
+  "source_doc": "s3://judgemind-document-archive-dev/ca/orange/superior_court/raw/2026/03/07/71f49475-7a6f-469a-8397-71a3c5e4282c.pdf",
+  "notes": ""
+}

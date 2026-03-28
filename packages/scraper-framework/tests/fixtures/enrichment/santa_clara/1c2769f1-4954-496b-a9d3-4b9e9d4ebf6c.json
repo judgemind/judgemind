@@ -1,0 +1,18 @@
+{
+  "ruling_text": "Plaintiff’s attorney Jon-Paul Moorehead of Law Offices of Richard W. Meier moves under Code of Civil Procedure Section 284(2) and California Rule of Court 3.1362 to be relieved as counsel for Plaintiff Steve Corchero. Notice of Motion (the “Motion”) at ¶¶ 1-3 (filed: Oct. 29, 2025).\nAs the Motion complies with applicable law and is well supported and duly served, the Motion is hereby GRANTED.\nAfter this hearing, the Court will sign and file the Proposed Order that has already been prepared by Plaintiff’s counsel and filed with this Motion.\nSO ORDERED.",
+  "expected": {
+    "case_title": "Steve Corchero v. Gary Allen, et al.",
+    "motion_type": "motion_to_be_relieved_as_counsel",
+    "outcome": "granted",
+    "parties": {
+      "plaintiffs": [
+        "Steve Corchero"
+      ],
+      "defendants": [
+        "Gary Allen"
+      ]
+    }
+  },
+  "source_doc": "s3://judgemind-document-archive-dev/ca/santa_clara/superior_court/raw/2026/03/27/cf2e76d3-f0ce-52d3-b142-afb8d273fcab.pdf",
+  "notes": ""
+}

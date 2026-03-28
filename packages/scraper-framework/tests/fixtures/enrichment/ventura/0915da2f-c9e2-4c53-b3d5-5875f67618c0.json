@@ -1,0 +1,18 @@
+{
+  "ruling_text": "Moving Attorneys' motion to be relieved as counsel is GRANTED. Counsel's withdrawal will be effective as of the date of filing the proof of service of the signed Order upon defendants at their last known address. (Cal. Rules of Ct., rule 3.1362(e).) Moving party to give notice of this Court's ruling.",
+  "expected": {
+    "case_title": "RACHELLE LONGO, et al. vs RUPA SHARMA, et al.",
+    "motion_type": "motion_to_be_relieved_as_counsel",
+    "outcome": "granted",
+    "parties": {
+      "plaintiffs": [
+        "RACHELLE LONGO"
+      ],
+      "defendants": [
+        "RUPA SHARMA"
+      ]
+    }
+  },
+  "source_doc": "s3://judgemind-document-archive-dev/ca/ventura/superior_court/raw/2026/03/25/7715dfa8-04fb-5f68-ae5c-66f84fee8818.pdf",
+  "notes": ""
+}

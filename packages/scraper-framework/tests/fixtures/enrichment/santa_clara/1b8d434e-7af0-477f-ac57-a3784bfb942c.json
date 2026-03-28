@@ -1,0 +1,18 @@
+{
+  "ruling_text": "Continuation of: Return of Warrant / Order of Examination from 02/20/26",
+  "expected": {
+    "case_title": "Creditors Adjustment v. Campbell Dry Inc.",
+    "motion_type": "osc",
+    "outcome": "continued",
+    "parties": {
+      "plaintiffs": [
+        "Creditors Adjustment"
+      ],
+      "defendants": [
+        "Campbell Dry Inc."
+      ]
+    }
+  },
+  "source_doc": "s3://judgemind-document-archive-dev/ca/santa_clara/superior_court/raw/2026/03/27/37f4eb8c-687d-5861-9256-ee472496c20d.pdf",
+  "notes": "Very short ruling text"
+}

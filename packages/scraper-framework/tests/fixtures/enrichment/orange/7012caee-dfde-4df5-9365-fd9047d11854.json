@@ -1,0 +1,18 @@
+{
+  "ruling_text": "Plaintiff's Motion for Preliminary Approval of Class Settlement\nPlaintiff's motion for preliminary approval of class action settlement is\nCONTINUED to April 8, 2026 at 1:30 p.m. in Department CX101 to permit the\nparties to respond to the following item of concern. Any supplemental\nbriefing shall be filed on or before March 30, 2026. If a revised settlement\nagreement and/or class notice is submitted, a redline showing all changes,\ndeletions and additions must be submitted as well.\nThe Court previously noted that the operative 2AC, which added a PAGA\nclaim, was filed one day after Plaintiff notified the LWDA of her PAGA claim.\nThe Court questioned whether Plaintiff had adequately exhausted her PAGA\nclaim. In response, Plaintiff cites Woodworth v. Loma Linda University\nMedical Center (2023) 93 Cal.App.5th 1038 (erroneously cited as p. 1024) to\nargue that the LWDA's subsequent failure to respond to her notice cured any\ndefect in exhaustion. Woodworth so holds in part VII.B of the opinion. But\nper the introductory footnote, part VII isn't certified for publication. It\ntherefore may not be cited. (CRC 8.1110(c); 8.1115(a).) Plaintiff's subsequent\nstring-cite of non-binding federal district court cases appears to be copied\nfrom the unpublished portion of Woodworth.\nIs there published California authority holding that the LWDA's failure to\nrespond to a pre-filing PAGA notice cures any defect caused by the",
+  "expected": {
+    "case_title": "Dastjerdi vs. South Coast Medical Center for New Medicine, Inc.",
+    "motion_type": "class_action_settlement",
+    "outcome": "continued",
+    "parties": {
+      "plaintiffs": [
+        "Dastjerdi"
+      ],
+      "defendants": [
+        "South Coast Medical Center for New Medicine, Inc."
+      ]
+    }
+  },
+  "source_doc": "s3://judgemind-document-archive-dev/ca/orange/superior_court/raw/2026/03/13/05b21647-29d9-5f43-9028-3e772cad3508.pdf",
+  "notes": ""
+}

@@ -1,0 +1,18 @@
+{
+  "ruling_text": "There is no Proof of Service on file indicating service of Petitioner's Petition and Summons. The hearing on Husband's 12/18/2025 Request for Order is hereby continued to Thursday, 5/14/2026 at 9:00 AM in Dept. 404. By the deadlines set forth in the Code of Civil Procedure using a method of service authorized under California Rules of Court, rule 5.68, Husband shall have the Petition, Summons, and blank Response served on Wife. By the deadlines set forth in the Code of Civil Procedure using a method of service authorized under the Code of Civil Procedure, Husband shall have the following documents served on Wife: Tentative Ruling Instructions, Blank Income and Expense Declaration, Findings and Order After Hearing for the 3/12/2026 hearing date (which will be mailed to Husband). Husband is strongly encouraged to seek assistance from the ACCESS Center. Information for contacting the ACCESS Center can be found here: https://sf.courts.ca.gov/access-legal-self-help-center. The Court will prepare the Findings and Order After Hearing.",
+  "expected": {
+    "case_title": "Huey Fontenot v. Leia Dianne Harbour-Fontenot",
+    "motion_type": "petition",
+    "outcome": "continued",
+    "parties": {
+      "plaintiffs": [
+        "Huey Fontenot"
+      ],
+      "defendants": [
+        "Leia Dianne Harbour-Fontenot"
+      ]
+    }
+  },
+  "source_doc": "s3://judgemind-document-archive-dev/ca/san_francisco/superior_court/raw/2026/03/26/75eeea11-8815-5611-a81f-7ac6ff75d915.pdf",
+  "notes": ""
+}

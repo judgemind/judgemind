@@ -1,0 +1,18 @@
+{
+  "ruling_text": "MOTION FOR LEAVE TO FILE FIRST\nAMENDED COMPLAINT\nTentative Ruling: Grant with 5 days leave to file the amended complaint, and without any\nprejudice to defendant challenging the amended pleading once served.",
+  "expected": {
+    "case_title": "Cvme2510655 Anchelowitz v. Garcia, Ma.",
+    "motion_type": "motion_for_leave_to_amend",
+    "outcome": "granted",
+    "parties": {
+      "plaintiffs": [
+        "Cvme2510655 Anchelowitz"
+      ],
+      "defendants": [
+        "Garcia, Ma."
+      ]
+    }
+  },
+  "source_doc": "s3://judgemind-document-archive-dev/ca/riverside/superior_court/raw/2026/03/13/82194093-b43f-5a6b-bfc5-658f818b3c65.pdf",
+  "notes": ""
+}

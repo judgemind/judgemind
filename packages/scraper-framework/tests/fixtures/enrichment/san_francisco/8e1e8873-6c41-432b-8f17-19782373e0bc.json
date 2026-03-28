@@ -1,0 +1,18 @@
+{
+  "ruling_text": "Based upon Mother's unrefuted statements in her Request for Order, the Court finds that Father has failed to provide his Preliminary Declaration of Disclosure at multiple junctures: Father failed to provide his Preliminary Declaration of Disclosure within 30 days of filing his Response to the Petition on 6/7/2024, as required by Family Code section 2104(f). Father failed to respond to Mother's Demand for Production of Preliminary Declaration of Disclosure and Income and Expense Declaration served in April 2025. Father failed to serve written responses to Mother's Form Interrogatories, Set One or Request for Production of Documents, Set One, as ordered by Judge Gold in August 2025. The Court therefore finds good cause to issue an order under Family Code section 2107(b)(2). Father is hereby prohibited from presenting evidence on issues (including child and spousal support, attorney's fees, and property division) that should have been covered in his Declaration of Disclosure. The Court also hereby orders Father to pay to Mother mandatory attorney's fees sanctions under Family Code section 2107(c). Father shall pay to Mother $1,750 no later than 2/28/2026.",
+  "expected": {
+    "case_title": "Nadima Avakian v. Karo Charles Avakian",
+    "motion_type": "petition",
+    "outcome": "granted",
+    "parties": {
+      "plaintiffs": [
+        "Nadima Avakian"
+      ],
+      "defendants": [
+        "Karo Charles Avakian"
+      ]
+    }
+  },
+  "source_doc": "s3://judgemind-document-archive-dev/ca/san_francisco/superior_court/raw/2026/03/24/7020a9dc-6063-592e-98d5-4206c408fac5.pdf",
+  "notes": ""
+}

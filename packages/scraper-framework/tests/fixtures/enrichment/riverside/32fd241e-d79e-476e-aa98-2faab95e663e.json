@@ -1,0 +1,18 @@
+{
+  "ruling_text": "Hearing continued to Wednesday, April 1, 2026 at 8:30 a.m., Department PS2.\nNo further briefing will be permitted.",
+  "expected": {
+    "case_title": "Gonzalez v. The City of Palm Springs",
+    "motion_type": "petition",
+    "outcome": "continued",
+    "parties": {
+      "plaintiffs": [
+        "Gonzalez"
+      ],
+      "defendants": [
+        "The City of Palm Springs"
+      ]
+    }
+  },
+  "source_doc": "s3://judgemind-document-archive-dev/ca/riverside/superior_court/raw/2026/03/28/7c327f51-943b-56c0-a4ff-dc54ba500ada.pdf",
+  "notes": ""
+}
