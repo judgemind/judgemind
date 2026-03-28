@@ -14,15 +14,19 @@ Fixture files:
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from courts.ca.sd_tentatives import (
+    _SD_OUTCOME_MAP,
     PORTAL_BASE_URL,
     SDTentativeRulingsScraper,
+    _sd_llm_enabled,
+    _sd_llm_extract,
     default_config,
     is_cloudflare_challenge,
     parse_case_details,
@@ -993,3 +997,345 @@ class TestFetchDocumentsWithMockedPlaywright:
             docs = scraper.fetch_documents()
 
         assert len(docs) == 1
+
+
+# ---------------------------------------------------------------------------
+# LLM extraction tests (#2056)
+# ---------------------------------------------------------------------------
+
+
+class TestSdLlmEnabled:
+    """Feature flag tests for _sd_llm_enabled()."""
+
+    def test_enabled_when_env_true(self) -> None:
+        with patch.dict("os.environ", {"ENABLE_SD_LLM_EXTRACTION": "true"}):
+            assert _sd_llm_enabled() is True
+
+    def test_enabled_when_env_1(self) -> None:
+        with patch.dict("os.environ", {"ENABLE_SD_LLM_EXTRACTION": "1"}):
+            assert _sd_llm_enabled() is True
+
+    def test_enabled_when_env_yes(self) -> None:
+        with patch.dict("os.environ", {"ENABLE_SD_LLM_EXTRACTION": "yes"}):
+            assert _sd_llm_enabled() is True
+
+    def test_disabled_when_env_false(self) -> None:
+        with patch.dict("os.environ", {"ENABLE_SD_LLM_EXTRACTION": "false"}):
+            assert _sd_llm_enabled() is False
+
+    def test_disabled_when_env_empty(self) -> None:
+        with patch.dict("os.environ", {"ENABLE_SD_LLM_EXTRACTION": ""}):
+            assert _sd_llm_enabled() is False
+
+    def test_disabled_when_env_missing(self) -> None:
+        with patch.dict("os.environ", {}, clear=True):
+            assert _sd_llm_enabled() is False
+
+    def test_case_insensitive(self) -> None:
+        with patch.dict("os.environ", {"ENABLE_SD_LLM_EXTRACTION": "TRUE"}):
+            assert _sd_llm_enabled() is True
+
+
+class TestSdOutcomeMap:
+    """Verify the _SD_OUTCOME_MAP covers all expected mappings."""
+
+    def test_granted(self) -> None:
+        assert _SD_OUTCOME_MAP["granted"] == "granted"
+
+    def test_denied(self) -> None:
+        assert _SD_OUTCOME_MAP["denied"] == "denied"
+
+    def test_sustained_maps_to_granted(self) -> None:
+        assert _SD_OUTCOME_MAP["sustained"] == "granted"
+
+    def test_sustained_with_leave_maps_to_granted(self) -> None:
+        assert _SD_OUTCOME_MAP["sustained_with_leave"] == "granted"
+
+    def test_overruled_maps_to_denied(self) -> None:
+        assert _SD_OUTCOME_MAP["overruled"] == "denied"
+
+    def test_moot(self) -> None:
+        assert _SD_OUTCOME_MAP["moot"] == "moot"
+
+    def test_none_maps_to_none(self) -> None:
+        assert _SD_OUTCOME_MAP[None] is None
+
+    def test_granted_in_part(self) -> None:
+        assert _SD_OUTCOME_MAP["granted_in_part"] == "granted_in_part"
+
+
+@dataclass
+class _FakeLLMResponse:
+    """Minimal stand-in for an LLM provider response."""
+
+    text: str
+    input_tokens: int = 10
+    output_tokens: int = 5
+
+
+class TestSdLlmExtract:
+    """Unit tests for _sd_llm_extract() with mocked call_llm."""
+
+    def _patch_call_llm(self, response: _FakeLLMResponse | None) -> MagicMock:
+        mock = MagicMock(return_value=response)
+        return mock
+
+    def test_success_granted(self) -> None:
+        resp = _FakeLLMResponse(text='{"outcome": "granted", "motion_type": "Motion to Compel"}')
+        mock = self._patch_call_llm(resp)
+        with patch("ingestion.llm_providers.call_llm", mock):
+            result = _sd_llm_extract("The motion is GRANTED.")
+        assert result is not None
+        assert result["outcome"] == "granted"
+        assert result["motion_type"] == "Motion to Compel"
+
+    def test_sustained_maps_to_granted(self) -> None:
+        resp = _FakeLLMResponse(text='{"outcome": "sustained", "motion_type": "Demurrer"}')
+        mock = self._patch_call_llm(resp)
+        with patch("ingestion.llm_providers.call_llm", mock):
+            result = _sd_llm_extract("Demurrer is SUSTAINED.")
+        assert result is not None
+        assert result["outcome"] == "granted"
+
+    def test_overruled_maps_to_denied(self) -> None:
+        resp = _FakeLLMResponse(text='{"outcome": "overruled", "motion_type": "Demurrer"}')
+        mock = self._patch_call_llm(resp)
+        with patch("ingestion.llm_providers.call_llm", mock):
+            result = _sd_llm_extract("Demurrer is OVERRULED.")
+        assert result is not None
+        assert result["outcome"] == "denied"
+
+    def test_empty_ruling_text_returns_none(self) -> None:
+        assert _sd_llm_extract("") is None
+        assert _sd_llm_extract("   ") is None
+
+    def test_null_response_returns_none(self) -> None:
+        mock = self._patch_call_llm(None)
+        with patch("ingestion.llm_providers.call_llm", mock):
+            result = _sd_llm_extract("Some ruling text")
+        assert result is None
+
+    def test_invalid_json_returns_none(self) -> None:
+        resp = _FakeLLMResponse(text="not json at all")
+        mock = self._patch_call_llm(resp)
+        with patch("ingestion.llm_providers.call_llm", mock):
+            result = _sd_llm_extract("Some ruling text")
+        assert result is None
+
+    def test_markdown_fencing_stripped(self) -> None:
+        resp = _FakeLLMResponse(text='```json\n{"outcome": "denied", "motion_type": "MSJ"}\n```')
+        mock = self._patch_call_llm(resp)
+        with patch("ingestion.llm_providers.call_llm", mock):
+            result = _sd_llm_extract("Summary judgment is denied.")
+        assert result is not None
+        assert result["outcome"] == "denied"
+
+    def test_case_number_passed_as_metadata(self) -> None:
+        resp = _FakeLLMResponse(text='{"outcome": "granted", "motion_type": "MTC"}')
+        mock = self._patch_call_llm(resp)
+        with patch("ingestion.llm_providers.call_llm", mock):
+            _sd_llm_extract("Ruling text", case_number="24CU016153C")
+        call_args = mock.call_args
+        assert "24CU016153C" in call_args.kwargs["user_message"]
+
+    def test_unknown_outcome_maps_to_none(self) -> None:
+        resp = _FakeLLMResponse(text='{"outcome": "withdrawn", "motion_type": "MTC"}')
+        mock = self._patch_call_llm(resp)
+        with patch("ingestion.llm_providers.call_llm", mock):
+            result = _sd_llm_extract("Some text")
+        assert result is not None
+        assert result["outcome"] is None
+
+    def test_null_outcome_in_response(self) -> None:
+        resp = _FakeLLMResponse(text='{"outcome": null, "motion_type": "MTC"}')
+        mock = self._patch_call_llm(resp)
+        with patch("ingestion.llm_providers.call_llm", mock):
+            result = _sd_llm_extract("Some text")
+        assert result is not None
+        assert result["outcome"] is None
+
+    def test_non_dict_response_returns_none(self) -> None:
+        resp = _FakeLLMResponse(text='["not", "a", "dict"]')
+        mock = self._patch_call_llm(resp)
+        with patch("ingestion.llm_providers.call_llm", mock):
+            result = _sd_llm_extract("Some text")
+        assert result is None
+
+    def test_list_outcome_does_not_crash(self) -> None:
+        """LLM returns a list for outcome — should not raise TypeError."""
+        resp = _FakeLLMResponse(text='{"outcome": ["granted"], "motion_type": "MTC"}')
+        mock = self._patch_call_llm(resp)
+        with patch("ingestion.llm_providers.call_llm", mock):
+            result = _sd_llm_extract("Some text")
+        assert result is not None
+        assert result["outcome"] is None  # unhashable type maps to None
+
+    def test_dict_outcome_does_not_crash(self) -> None:
+        """LLM returns a dict for outcome — should not raise TypeError."""
+        resp = _FakeLLMResponse(text='{"outcome": {"value": "granted"}, "motion_type": "MTC"}')
+        mock = self._patch_call_llm(resp)
+        with patch("ingestion.llm_providers.call_llm", mock):
+            result = _sd_llm_extract("Some text")
+        assert result is not None
+        assert result["outcome"] is None
+
+    def test_int_outcome_does_not_crash(self) -> None:
+        """LLM returns an int for outcome — should not raise TypeError."""
+        resp = _FakeLLMResponse(text='{"outcome": 42, "motion_type": "MTC"}')
+        mock = self._patch_call_llm(resp)
+        with patch("ingestion.llm_providers.call_llm", mock):
+            result = _sd_llm_extract("Some text")
+        assert result is not None
+        assert result["outcome"] is None
+
+
+class TestParseDocumentWithLLM:
+    """Integration tests for parse_document with LLM extraction enabled/disabled."""
+
+    def _make_doc(self, fixture: str = "sd_roa_case_detail.html") -> CapturedDocument:
+        html = _load_html(fixture)
+        return CapturedDocument(
+            scraper_id="test",
+            source_url="https://odyroa.sdcourt.ca.gov/portal/Home/CaseDetail/123",
+            raw_content=html.encode("utf-8"),
+            content_format=ContentFormat.HTML,
+            state="CA",
+            county="San Diego",
+            court="Superior Court",
+            capture_timestamp=datetime(2026, 3, 12),
+            content_hash="abc123",
+            extra={},
+        )
+
+    def test_disabled_uses_regex(self) -> None:
+        config = _make_config()
+        scraper = SDTentativeRulingsScraper(config, case_numbers=["24CU016153C"])
+        doc = self._make_doc()
+        with patch.dict("os.environ", {"ENABLE_SD_LLM_EXTRACTION": "false"}):
+            result = scraper.parse_document(doc)
+        assert result.outcome is not None
+        assert "_llm_extracted" not in result.extra
+
+    def test_enabled_uses_llm(self) -> None:
+        config = _make_config()
+        scraper = SDTentativeRulingsScraper(config, case_numbers=["24CU016153C"])
+        doc = self._make_doc()
+        resp = _FakeLLMResponse(
+            text='{"outcome": "granted", "motion_type": "Motion to Compel Further Responses"}'
+        )
+        mock_llm = MagicMock(return_value=resp)
+        with (
+            patch.dict("os.environ", {"ENABLE_SD_LLM_EXTRACTION": "true"}),
+            patch("ingestion.llm_providers.call_llm", mock_llm),
+        ):
+            result = scraper.parse_document(doc)
+        assert result.outcome == "granted"
+        assert result.motion_type == "Motion to Compel Further Responses"
+        assert result.extra.get("_llm_extracted") is True
+
+    def test_demurrer_mapping(self) -> None:
+        config = _make_config()
+        scraper = SDTentativeRulingsScraper(config, case_numbers=["37-2024-00060876"])
+        doc = self._make_doc("sd_roa_demurrer.html")
+        resp = _FakeLLMResponse(
+            text='{"outcome": "sustained_with_leave", "motion_type": "Demurrer"}'
+        )
+        mock_llm = MagicMock(return_value=resp)
+        with (
+            patch.dict("os.environ", {"ENABLE_SD_LLM_EXTRACTION": "true"}),
+            patch("ingestion.llm_providers.call_llm", mock_llm),
+        ):
+            result = scraper.parse_document(doc)
+        assert result.outcome == "granted"
+
+    def test_llm_failure_falls_back_to_regex(self) -> None:
+        config = _make_config()
+        scraper = SDTentativeRulingsScraper(config, case_numbers=["24CU016153C"])
+        doc = self._make_doc()
+        mock_llm = MagicMock(return_value=None)
+        with (
+            patch.dict("os.environ", {"ENABLE_SD_LLM_EXTRACTION": "true"}),
+            patch("ingestion.llm_providers.call_llm", mock_llm),
+        ):
+            result = scraper.parse_document(doc)
+        assert result.outcome is not None
+        assert "_llm_extracted" not in result.extra
+
+    def test_partial_llm_result_falls_back_for_missing_field(self) -> None:
+        config = _make_config()
+        scraper = SDTentativeRulingsScraper(config, case_numbers=["24CU016153C"])
+        doc = self._make_doc()
+        resp = _FakeLLMResponse(text='{"outcome": "granted", "motion_type": null}')
+        mock_llm = MagicMock(return_value=resp)
+        with (
+            patch.dict("os.environ", {"ENABLE_SD_LLM_EXTRACTION": "true"}),
+            patch("ingestion.llm_providers.call_llm", mock_llm),
+        ):
+            result = scraper.parse_document(doc)
+        assert result.outcome == "granted"
+        assert result.motion_type is not None
+
+    def test_no_ruling_text_skips_llm(self) -> None:
+        config = _make_config()
+        scraper = SDTentativeRulingsScraper(config, case_numbers=["24CU016153C"])
+        doc = self._make_doc("sd_roa_no_ruling.html")
+        mock_llm = MagicMock()
+        with (
+            patch.dict("os.environ", {"ENABLE_SD_LLM_EXTRACTION": "true"}),
+            patch("ingestion.llm_providers.call_llm", mock_llm),
+        ):
+            scraper.parse_document(doc)
+        mock_llm.assert_not_called()
+
+    def test_other_fields_still_from_html(self) -> None:
+        config = _make_config()
+        scraper = SDTentativeRulingsScraper(config, case_numbers=["24CU016153C"])
+        doc = self._make_doc()
+        resp = _FakeLLMResponse(text='{"outcome": "granted", "motion_type": "MTC"}')
+        mock_llm = MagicMock(return_value=resp)
+        with (
+            patch.dict("os.environ", {"ENABLE_SD_LLM_EXTRACTION": "true"}),
+            patch("ingestion.llm_providers.call_llm", mock_llm),
+        ):
+            result = scraper.parse_document(doc)
+        assert result.case_number is not None
+        assert result.judge_name is not None
+        assert result.ruling_text is not None
+
+
+class TestSdExtractionConfig:
+    """Verify San Diego extraction config is registered."""
+
+    def test_sd_config_registered(self) -> None:
+        from framework.extraction_config import get_county_extraction_config
+
+        cfg = get_county_extraction_config("CA", "SAN DIEGO")
+        assert cfg is not None
+
+    def test_sd_config_method_is_llm(self) -> None:
+        from framework.extraction_config import ExtractionMethod, get_county_extraction_config
+
+        cfg = get_county_extraction_config("CA", "SAN DIEGO")
+        assert cfg is not None
+        assert cfg.method == ExtractionMethod.LLM
+
+    def test_sd_config_provider_is_google(self) -> None:
+        from framework.extraction_config import get_county_extraction_config
+
+        cfg = get_county_extraction_config("CA", "SAN DIEGO")
+        assert cfg is not None
+        assert cfg.provider == "google"
+
+    def test_sd_config_has_system_prompt(self) -> None:
+        from framework.extraction_config import get_county_extraction_config
+
+        cfg = get_county_extraction_config("CA", "SAN DIEGO")
+        assert cfg is not None
+        assert cfg.system_prompt is not None
+        assert len(cfg.system_prompt) > 100
+
+    def test_sd_config_case_insensitive(self) -> None:
+        from framework.extraction_config import get_county_extraction_config
+
+        cfg = get_county_extraction_config("ca", "san diego")
+        assert cfg is not None

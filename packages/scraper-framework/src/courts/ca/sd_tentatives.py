@@ -29,6 +29,7 @@ Report: docs/investigations/san-diego-scraper-2026-03.md
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import re
 from dataclasses import dataclass, field
@@ -55,6 +56,134 @@ CF_CHALLENGE_TIMEOUT = 30.0
 
 # Maximum time (seconds) to wait for page navigation.
 PAGE_LOAD_TIMEOUT = 30000  # Playwright uses milliseconds
+
+# ---------------------------------------------------------------------------
+# LLM extraction — feature flag and helpers (#2056)
+# ---------------------------------------------------------------------------
+
+# Default LLM provider and model for San Diego supplemental extraction.
+_SD_LLM_PROVIDER = "google"
+_SD_LLM_MODEL = "gemini-2.5-flash-lite"
+
+# Outcome mapping: LLM taxonomy -> DB enum values.
+# The SD LLM prompt uses fine-grained demurrer outcomes (sustained,
+# sustained_with_leave, overruled) that are not in the DB enum.
+# Map them to the standard enum values.
+_SD_OUTCOME_MAP: dict[str | None, str | None] = {
+    "granted": "granted",
+    "denied": "denied",
+    "granted_in_part": "granted_in_part",
+    "denied_in_part": "denied_in_part",
+    "sustained": "granted",
+    "sustained_with_leave": "granted",
+    "overruled": "denied",
+    "moot": "moot",
+    "continued": "continued",
+    "off_calendar": "off_calendar",
+    "submitted": "submitted",
+    "other": "other",
+    None: None,
+}
+
+
+def _sd_llm_enabled() -> bool:
+    """Return True when LLM-based extraction is enabled for San Diego rulings."""
+    return os.environ.get("ENABLE_SD_LLM_EXTRACTION", "").lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+
+
+def _sd_llm_extract(
+    ruling_text: str,
+    case_number: str | None = None,
+) -> dict[str, Any] | None:
+    """Extract outcome and motion_type from San Diego ruling text using an LLM.
+
+    Sends the ruling text (already extracted from the ROA HTML by BeautifulSoup)
+    plus known metadata (case_number) to the LLM with the San Diego-specific
+    system prompt.  Returns a dict with keys ``outcome`` and ``motion_type``
+    on success, or ``None`` if the LLM call fails or the response cannot be
+    parsed.
+
+    The LLM supplements the scraper's HTML-based extraction by providing more
+    accurate outcome classification (especially for mixed demurrer rulings)
+    and more specific motion_type descriptions than the regex keyword list.
+    """
+    from framework.extraction_config import SAN_DIEGO_SYSTEM_PROMPT
+    from ingestion.llm_providers import call_llm
+
+    if not ruling_text or not ruling_text.strip():
+        return None
+
+    # Build user message with known metadata context.
+    parts: list[str] = []
+    meta_lines: list[str] = []
+    if case_number:
+        meta_lines.append(f"Case number: {case_number}")
+    if meta_lines:
+        parts.append("Known metadata:\n" + "\n".join(meta_lines))
+    parts.append(f"Ruling text:\n\n{ruling_text}")
+    user_message = "\n\n".join(parts)
+
+    response = call_llm(
+        system_prompt=SAN_DIEGO_SYSTEM_PROMPT,
+        user_message=user_message,
+        provider=_SD_LLM_PROVIDER,
+        model=_SD_LLM_MODEL,
+        max_tokens=4096,
+        timeout=60.0,
+    )
+
+    if response is None:
+        logger.warning("sd.llm_extraction_failed", reason="null_response", case_number=case_number)
+        return None
+
+    try:
+        raw = response.text.strip()
+        # Extract JSON object by finding the first { and last }.
+        json_start = raw.find("{")
+        json_end = raw.rfind("}")
+        if json_start != -1 and json_end != -1 and json_end > json_start:
+            raw = raw[json_start : json_end + 1]
+
+        data = json.loads(raw)
+    except (json.JSONDecodeError, ValueError) as exc:
+        logger.warning("sd.llm_parse_failed", error=str(exc), case_number=case_number)
+        return None
+
+    if not isinstance(data, dict):
+        logger.warning(
+            "sd.llm_unexpected_shape",
+            shape=type(data).__name__,
+            case_number=case_number,
+        )
+        return None
+
+    # Normalize outcome using the mapping (case-insensitive).
+    # Only process string values; any other type (list, dict, int) maps to None.
+    raw_outcome = data.get("outcome")
+    outcome_key: str | None = None
+    if isinstance(raw_outcome, str):
+        outcome_key = raw_outcome.lower()
+    outcome = _SD_OUTCOME_MAP.get(outcome_key)
+
+    result: dict[str, Any] = {
+        "outcome": outcome,
+        "motion_type": data.get("motion_type"),
+    }
+
+    logger.info(
+        "sd.llm_extraction_success",
+        outcome=outcome,
+        motion_type=result["motion_type"],
+        input_tokens=response.input_tokens,
+        output_tokens=response.output_tokens,
+    )
+
+    return result
+
 
 # ---------------------------------------------------------------------------
 # ROA HTML parsing
@@ -630,6 +759,13 @@ class SDTentativeRulingsScraper(BaseScraper):
         This is called by the base class run() loop after fetch_documents().
         Since we already parse during fetch, this serves as a re-parse
         opportunity that can enrich fields from the raw content.
+
+        When ``ENABLE_SD_LLM_EXTRACTION`` is set, supplements outcome and
+        motion_type via an LLM call using the validated San Diego prompt
+        (#1967).  The LLM result takes priority over the regex fallback
+        because it handles nuanced outcomes (mixed demurrer rulings, partial
+        grants) more accurately.  Regex remains as a fallback when LLM is
+        disabled or fails.
         """
         try:
             html = doc.raw_content.decode("utf-8")
@@ -648,12 +784,42 @@ class SDTentativeRulingsScraper(BaseScraper):
                 doc.hearing_date = case_info.hearing_date
             if case_info.ruling_text and not doc.ruling_text:
                 doc.ruling_text = case_info.ruling_text
+            if case_info.parties and not doc.parties:
+                doc.parties = case_info.parties
+
+            # LLM extraction path (#2056): when enabled, extract outcome
+            # and motion_type via the validated San Diego prompt.  The LLM
+            # is more accurate for nuanced outcomes (mixed demurrer rulings,
+            # partial grants) and more specific motion_type descriptions
+            # than the regex keyword list.
+            llm_used = False
+            ruling_text = case_info.ruling_text or doc.ruling_text
+            if _sd_llm_enabled() and ruling_text:
+                llm_result = _sd_llm_extract(
+                    ruling_text,
+                    case_number=doc.case_number or case_info.case_number,
+                )
+                if llm_result is not None:
+                    llm_used = True
+                    doc.extra["_llm_extracted"] = True
+                    if llm_result.get("outcome"):
+                        doc.outcome = llm_result["outcome"]
+                    if llm_result.get("motion_type"):
+                        doc.motion_type = llm_result["motion_type"]
+
+            # Regex fallback: fill in outcome and motion_type from the
+            # HTML-parsed values when the LLM did not populate them
+            # (or when LLM was disabled/failed).
             if case_info.outcome and not doc.outcome:
                 doc.outcome = case_info.outcome
             if case_info.motion_type and not doc.motion_type:
                 doc.motion_type = case_info.motion_type
-            if case_info.parties and not doc.parties:
-                doc.parties = case_info.parties
+
+            if not llm_used:
+                self._log.debug(
+                    "sd.regex_extraction",
+                    case_number=doc.case_number,
+                )
 
         except Exception as exc:
             self._log.warning("ROA re-parse error", error=str(exc))
