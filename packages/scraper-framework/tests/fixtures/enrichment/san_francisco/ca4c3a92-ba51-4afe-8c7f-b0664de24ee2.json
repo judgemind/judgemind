@@ -1,0 +1,18 @@
+{
+  "ruling_text": "Based on the foregoing, Respondent's request is DENIED.",
+  "expected": {
+    "case_title": "Danielle Taylor v. Cheick Diarra",
+    "motion_type": "motion_for_sanctions",
+    "outcome": "denied",
+    "parties": {
+      "plaintiffs": [
+        "Danielle Taylor"
+      ],
+      "defendants": [
+        "Cheick Diarra"
+      ]
+    }
+  },
+  "source_doc": "s3://judgemind-document-archive-dev/ca/san_francisco/superior_court/raw/2026/03/24/0942d0c4-d4ee-51b6-8a81-d8f9fd8a00e0.pdf",
+  "notes": "Very short ruling text"
+}

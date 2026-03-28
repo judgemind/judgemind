@@ -1,0 +1,18 @@
+{
+  "ruling_text": "Plaintiff Yasuyoshi Kojima's Motion for Fees and Additional Costs is Continued to June 4, 2026 at 10:00 am in Department 26 in the Spring Street Courthouse. By May 7, 2026, Plaintiff is to file and serve a supplemental brief, not to exceed five pages, and any supporting declaration addressing the timeliness of the instant motion under Cal. Rules of Court, rule 3.1702. Opposition and reply papers are due per the Code of Civil Procedure.",
+  "expected": {
+    "case_title": "Yasuyoshi Kojima v. Nexxt Car Inc., et al.",
+    "motion_type": "motion_for_attorney_fees",
+    "outcome": "continued",
+    "parties": {
+      "plaintiffs": [
+        "Yasuyoshi Kojima"
+      ],
+      "defendants": [
+        "Nexxt Car Inc."
+      ]
+    }
+  },
+  "source_doc": "s3://judgemind-document-archive-dev/ca/los_angeles/superior_court/raw/2026/03/26/725fb8ca-5606-59e8-b42c-c7c9596b7d9f.html",
+  "notes": ""
+}

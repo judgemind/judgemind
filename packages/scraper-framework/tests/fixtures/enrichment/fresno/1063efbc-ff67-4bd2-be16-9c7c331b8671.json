@@ -1,0 +1,18 @@
+{
+  "ruling_text": "Tentative Ruling:\n\nThe motion is taken off calendar as it does not appear from the court’s record that\nmoving papers were timely filed.\n\nExplanation:\n\nAlthough this hearing was set almost two months ago, the moving papers were\nonly filed on March 4, which is only 15 calendar days before the hearing and therefore\nuntimely. (See Code CIv. Proc., § 1005. subd. (b) [motion papers “shall” be filed and\nserved 16 court days before the hearing.].)\nPursuant to California Rules of Court, rule 3.1312(a), and Code of Civil Procedure\nsection 1019.5, subdivision (a), no further written order is necessary. The minute order\nadopting this tentative ruling will serve as the order of the court and service by the clerk\nwill constitute notice of the order.\nTentative Ruling\nIssued By: lmg on 3-18-26 .",
+  "expected": {
+    "case_title": "Maria Llamas Valenzuela v. Jennie Arambula",
+    "motion_type": "motion_to_be_relieved_as_counsel",
+    "outcome": "denied",
+    "parties": {
+      "plaintiffs": [
+        "Maria Llamas Valenzuela"
+      ],
+      "defendants": [
+        "Jennie Arambula"
+      ]
+    }
+  },
+  "source_doc": "s3://judgemind-document-archive-dev/ca/fresno/superior_court/raw/2026/03/28/03caf599-da83-5153-a647-16ae10de7a3b.pdf",
+  "notes": ""
+}

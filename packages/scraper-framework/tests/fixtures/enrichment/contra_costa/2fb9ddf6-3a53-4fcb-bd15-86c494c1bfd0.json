@@ -1,0 +1,18 @@
+{
+  "ruling_text": "ATTACHMENT A\nLINE 14: RANDY GATEWOOD VS. CHANELL JACKSON (C25-02672)\nRhonda Kraeber (“Counsel”) filed a Motion to be Relieved as Counsel on January 29, 2026 (the “Motion\nto be Relieved as Counsel”). The matter was set for hearing on June 15, 2026. By the Court’s Order\nentered March 10, 2026, the Motion to be Relieved as Counsel was advanced for hearing to March 30,\n2026. Notice was duly given.\n\nBackground\nCounsel seeks to be relieved as attorneys for plaintiff Randy Gatewood (“Plaintiff”).\nThe supporting declaration filed by Counsel indicates that there has been a breakdown in the attorney-\nclient relationship due to a lack of communication and non-payment issues. See Declaration filed\nJanuary 29, 2025, ¶2. Defendant has been given notice of the Motion to be Relieved as Counsel. Id.\nat ¶3; see also Notice of Hearing filed February 26, 2026.\nAnalysis\nThe Motion to be Relieved as Counsel is unopposed.\nDisposition\nThe Court finds and rules as follows:\n1. The Motion to be Relieved as Counsel is GRANTED.\n2. The Court reviewed and rejects the lodged form of order (“Updated Order Granting Attorney’s\nMotion to be Relieved as Counsel—Civil” lodged February 26, 2026). Paragraphs 6 and 7 of the\nproposed form of order are incomplete. The information in Paragraph 8 should be in Paragraph\n7. Box 5.a. should be checked. Counsel is directed to correct and resubmit a further revised\nform of order.",
+  "expected": {
+    "case_title": "Randy Gatewood v. Chanell Jackson",
+    "motion_type": "motion_to_be_relieved_as_counsel",
+    "outcome": "granted",
+    "parties": {
+      "plaintiffs": [
+        "Randy Gatewood"
+      ],
+      "defendants": [
+        "Chanell Jackson"
+      ]
+    }
+  },
+  "source_doc": "s3://judgemind-document-archive-dev/ca/contra_costa/superior_court/raw/2026/03/28/fb12225c-623f-5adf-ba35-f1f2aab11a9b.pdf",
+  "notes": ""
+}

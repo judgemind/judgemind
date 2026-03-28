@@ -1,0 +1,14 @@
+{
+  "ruling_text": "SUPERIOR COURT OF CALIFORNIA,\n\nNOTICE OF CASE\n\nMANAGEMENT SYSTEM UPGRADE\nThe Superior Court of California, County of Fresno, will be transitioning to a new case\nmanagement system, entitled e-Court, effective April 1, 2026.\nImpact on Filings\nTo facilitate the conversion process, please be advised of the following important deadlines\nand filing requirements:\n Effective Sunday, March 1, 2026 at 11:59 PM – non-criminal electronic filings will no\nlonger be accepted via File & Serve.\n From Monday, March 2, 2026 through Tuesday, March 31, 2026, the Court will only\naccept paper filings for all non-criminal matters, which must be accompanied by the\nappropriate filing fees.\n Effective Wednesday, March 25, 2026 at 11:59 PM – criminal electronic filings will no\nlonger be accepted via File & Serve.\n From Thursday, March 26, 2026 through Tuesday, March 31, 2026, the Court will only\naccept paper filings for all criminal matters.\nAny questions regarding the status of specific filings, filing and calendaring timeframes, or\napplicable filing fees should be directed to the appropriate division directly.\nAll documents submitted for filing must conform to the California Rules of Court Title Two.\nImpact on Online Payments\nDue to a system upgrade that will occur from Thursday, March 26, 2026 at 5:00 PM through\nWednesday, April 1, 2026 at 8:00 AM, the online payment system will be unavailable during\nthat timeframe. During the system upgrade period, payments can be made at Court locations\nvia cash, check, money order, or credit card – or mail via check or money order.\nImpact on the Case Information Portal\nThe Court’s online case information portal will be unavailable from Friday, March 27, 2026 at\n5:00 PM through Wednesday, April 1, 2026 at 8:00 AM.\nThe Court appreciates the patience and cooperation of counsel, the public, and our justice\npartners as we complete the system conversion with minimal disruption.",
+  "expected": {
+    "case_title": "",
+    "motion_type": null,
+    "outcome": "submitted",
+    "parties": {
+      "plaintiffs": [],
+      "defendants": []
+    }
+  },
+  "source_doc": "s3://judgemind-document-archive-dev/ca/fresno/superior_court/raw/2026/03/28/2fead6f3-c1d7-5ddc-9284-8d1106fff6d4.pdf",
+  "notes": "Non-adversarial case - no plaintiff/defendant parties"
+}

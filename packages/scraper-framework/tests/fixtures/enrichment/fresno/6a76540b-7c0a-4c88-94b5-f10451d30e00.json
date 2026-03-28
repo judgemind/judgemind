@@ -1,0 +1,24 @@
+{
+  "ruling_text": "Tentative Ruling:\n\nTo grant the petition. Order Signed. No appearances necessary.\nPursuant to California Rules of Court, rule 3.1312(a), and Code of Civil Procedure\nsection 1019.5, subdivision (a), no further written order is necessary. The minute order\nadopting this tentative ruling will serve as the order of the court and service by the clerk\nwill constitute notice of the order.\nTentative Ruling",
+  "expected": {
+    "case_title": "Sanger Fence Company, Inc. v. Security Contractors Services, Inc.",
+    "motion_type": "demurrer",
+    "outcome": "off_calendar",
+    "parties": {
+      "plaintiffs": [
+        "Sanger Fence Company, Inc."
+      ],
+      "defendants": [
+        "Security Contractors Services, Inc."
+      ]
+    }
+  },
+  "source_doc": "s3://judgemind-document-archive-dev/ca/fresno/superior_court/raw/2026/03/28/7f92cc99-8213-593e-be85-194fae2e76c0.pdf",
+  "notes": "Motion type ambiguity: DB='demurrer', text='petition'",
+  "acceptable_alternatives": {
+    "motion_type": [
+      "demurrer",
+      "petition"
+    ]
+  }
+}

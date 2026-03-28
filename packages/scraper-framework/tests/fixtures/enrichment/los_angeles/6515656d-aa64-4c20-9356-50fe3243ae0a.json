@@ -1,0 +1,18 @@
+{
+  "ruling_text": "Case Number:\n25STCV14916\nHearing Date:\n\nMarch 17, 2026\nDept:\n\nMOTION FOR ORDER DEEMING SET ONE\n\nADMITTED\nThe Court tenders the following tentative decision in the\nmatter\nCasey Kuzdrowski v. Integon Preferred Insurance Co., et al.\n, Los\nAngeles County Superior Court case number 25STCV14916, set for hearing on March\n17, 2026. On July 31, 2025, Integon Preferred Insurance Co. (Defendant) received\nrequests for admissions (RFAs) propounded by Casey Kuzdrowski (Plaintiff) upon\nDirect Auto Insurance. (Austin Decl. ¶ 4.) Responses were due within 30 days on\nAugust 30. (Code Civ. Proc., § 2033.250.) Defendant indicated that the RFAs did\nnot name the proper party and never provided a response. (\nId.\n¶¶ 5–6.) Plaintiff\nfiled the present motion to deem RFAs admitted on February 17, 2026. Defendant\nopposes the motion. Plaintiff’s motion is denied.\n“If a party to whom requests for admission are directed\nfails to serve a timely response . . . [that] party waives any objection to the\nrequests.” (Code Civ. Proc., § 2033.280, subd. (a).) “The requesting party may\nmove for an order that the genuineness of any documents and the truth of any\nmatters specified in the requests be deemed admitted.” (\nId.\n, § 2033.280,\nsubd. (b).) The Court shall grant an order deeming RFAs admitted unless the responding\nparty serves substantially compliant responses before the hearing on the\nmotion. A finding of substantial compliance depends on “whether answers in a\nproposed response are ‘as complete and straightforward’ as reasonably possible,\nas explicitly required by section 2033.220.” (\nKatayama v. Continental\nInvestment Group\n(2024) 105 Cal.App.5th 898, 907.) A party not in\npossession of information or knowledge necessary to respond to a request for\nadmission must state in the answer that “a reasonable inquiry concerning the\nmatter in the particular request has been made, and that the information known\nor readily obtainable is insufficient to enable that party to admit the matter.”\n(Code Civ. Proc., § 2033.220, subd. (c).)\nHere, the Court must determine whether RFAs were directed to\nDefendant. Plaintiff’s email sent to Defendant allegedly propounding discovery\nstated that the discovery requests were directed to Direct Auto Insurance.\n(Austin Decl., Ex. B.) Defendant maintains that it does not do business as\nDirect Auto Insurance. (\nId.\n¶ 5.) Section 2033.060 mandates that the\nidentity of the responding party be listed in the first paragraph immediately\nbelow the title of the case. (Code Civ. Proc., § 2033.060.) The RFAs list the\nresponsive party in that location as Direct Auto Insurance. (Arrasmith Decl., Ex.\nA.) Because the RFAs listed the responding party as an unrelated entity,\nPlaintiff has not shown that she directed the RFAs at Defendant. Thus, relief\nis unavailable under section 2033.280. Accordingly, Plaintiff’s motion is\ndenied.\n\nConclusion:\n\nThe Court denies\nPlaintiff’s motion.",
+  "expected": {
+    "case_title": "Casey Kuzdrowski v. Integon Preferred Insurance Co., et al.",
+    "motion_type": "motion_to_deem_admissions",
+    "outcome": "denied",
+    "parties": {
+      "plaintiffs": [
+        "Casey Kuzdrowski"
+      ],
+      "defendants": [
+        "Integon Preferred Insurance Co."
+      ]
+    }
+  },
+  "source_doc": "s3://judgemind-document-archive-dev/ca/los_angeles/superior_court/raw/2026/03/17/c14ed857-39bb-5ae0-978b-986904394a0c.html",
+  "notes": ""
+}

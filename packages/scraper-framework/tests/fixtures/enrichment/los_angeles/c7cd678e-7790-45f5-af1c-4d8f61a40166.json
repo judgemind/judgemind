@@ -1,0 +1,18 @@
+{
+  "ruling_text": "Case Number:\n20STCV12113\nHearing Date:\nMarch 10, 2026\nDept:\n39\nTENTATIVE\nRULING\nDEPARTMENT\n39\nHEARING DATE\nMarch 10, 2026\nCASE NUMBER\n20STCV12113\nMOTIONS\nAmended Petition\n  to Confirm Arbitration Award\nMOVING\nPARTY\nPlaintiff Joaquin Del Cid\nOPPOSING PARTY\nNone\nMOTION\nPlaintiff Joaquin Del Cid (“Plaintiff”) petitions\nthe Court to confirm the arbitration award in his favor regarding Plaintiff’s individual\nwage and hour claims.\nPlaintiff served\nthis amended petition on Defendant Jonathan Club (“Defendant”) on February 13,\n2026 by mail, electronically, and personally.\n(See Proof of Service, filed February 13, 2026.)\nThe personal service is sufficient notice, as\nit was effectuated 16 court days before the hearing of this motion.\n(Code Civ. Proc., §§ 1290.4, subd. (c), 1005,\nsubd. (b).)\nDefendant has not objected\nto the notice given and has not filed an opposition to the motion to confirm\nPlaintiff’s arbitration award.\nAccordingly,\nthe Court confirms the arbitration award, which is attached as Exhibit A to the\nDeclaration of Edward W. Choi in Support of Plaintiff’s Petition to Confirm Arbitration\nAward. Pursuant to Code of Civil Procedure section 1287.4, Defendant is ordered\nto pay Plaintiff within 30 days of the issuance of the judgment confirming the arbitration\naward in this matter.\nThe stay of\nPlaintiff’s representative PAGA claims is lifted.\nPlaintiff is to\ngive notice of the Court’s ruling and to file proof of service of same.",
+  "expected": {
+    "case_title": "Del Cid v. Jonathan Club",
+    "motion_type": "petition",
+    "outcome": "granted",
+    "parties": {
+      "plaintiffs": [
+        "Del Cid"
+      ],
+      "defendants": [
+        "Jonathan Club"
+      ]
+    }
+  },
+  "source_doc": "s3://judgemind-document-archive-dev/ca/los_angeles/superior_court/raw/2026/03/10/ab9be197-8380-5f85-9a04-85a19874eb6b.html",
+  "notes": ""
+}

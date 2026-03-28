@@ -1,0 +1,18 @@
+{
+  "ruling_text": "Plaintiff's motion for leave to file the FAC is DENIED, without prejudice to re-file a motion for leave to amend that complies with California Rules of Court, rule 3.1324.",
+  "expected": {
+    "case_title": "OSVALDO MEDINA, INDIVIDUALLY, AND AS SUCCESSOR-IN-INTEREST OF THE ESTATE OF KAREEM MEDINA, DECEASED vs THE COLLECTION AT RIVERPARK, et al.",
+    "motion_type": "motion_for_leave_to_amend",
+    "outcome": "other",
+    "parties": {
+      "plaintiffs": [
+        "OSVALDO MEDINA, INDIVIDUALLY, AND AS SUCCESSOR-IN-INTEREST OF THE ESTATE OF KAREEM MEDINA, DECEASED"
+      ],
+      "defendants": [
+        "THE COLLECTION AT RIVERPARK"
+      ]
+    }
+  },
+  "source_doc": "s3://judgemind-document-archive-dev/ca/ventura/superior_court/raw/2026/03/26/1a53cd82-8902-5e5d-8fae-6aa804bfd7f5.pdf",
+  "notes": ""
+}
