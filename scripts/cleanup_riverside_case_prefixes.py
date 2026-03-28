@@ -40,9 +40,11 @@ logger = logging.getLogger(__name__)
 # Riverside case numbers:
 #   CV-prefixed: CV + 2-4 letter location code + 6-10 digits (e.g. CVPS2306157)
 #   Location-prefixed: RIC, MCC, PSC, SWC, INC + 0-4 letters + 6-10 digits
+#   Additional prefixes (#2192): CIV (civil), MVC (motor vehicle collision),
+#     TEC (Temecula), UDPS (unlawful detainer Palm Springs)
 # The prefix may appear in mixed case (e.g. Cvps2405799).
 _CASE_NUMBER_PREFIX_RE = re.compile(
-    r"^(?:CV[A-Za-z]{2,4}|(?:RIC|MCC|PSC|SWC|INC)[A-Za-z]{0,4})\d{6,10}\s+",
+    r"^(?:CV[A-Za-z]{2,4}|(?:RIC|MCC|PSC|SWC|INC|CIV|MVC|TEC|UDPS)[A-Za-z]{0,4})\d{6,10}\s+",
     re.IGNORECASE,
 )
 

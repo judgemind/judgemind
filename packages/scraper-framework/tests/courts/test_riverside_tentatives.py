@@ -246,6 +246,46 @@ class TestCaseNumberRegexExpanded:
         """INC (Indio) prefix matches."""
         assert _CASE_NUMBER_RE.match("INC2300001")
 
+    def test_civ_prefix(self) -> None:
+        """CIV (civil) prefix matches (#2192)."""
+        assert _CASE_NUMBER_RE.match("CIV208568")
+
+    def test_mvc_prefix(self) -> None:
+        """MVC (motor vehicle collision) prefix matches (#2192)."""
+        assert _CASE_NUMBER_RE.match("MVC1904273")
+
+    def test_tec_prefix(self) -> None:
+        """TEC (Temecula) prefix matches (#2192)."""
+        assert _CASE_NUMBER_RE.match("TEC1102057")
+
+    def test_udps_prefix(self) -> None:
+        """UDPS (unlawful detainer Palm Springs) prefix matches (#2192)."""
+        assert _CASE_NUMBER_RE.match("UDPS2500726")
+
+    def test_mixed_case_civ(self) -> None:
+        """Mixed-case CIV prefix matches (#2192)."""
+        assert _CASE_NUMBER_RE.match("Civ208568")
+
+    def test_mixed_case_mvc(self) -> None:
+        """Mixed-case MVC prefix matches (#2192)."""
+        assert _CASE_NUMBER_RE.match("Mvc1904273")
+
+    def test_mixed_case_tec(self) -> None:
+        """Mixed-case TEC prefix matches (#2192)."""
+        assert _CASE_NUMBER_RE.match("Tec1102057")
+
+    def test_mixed_case_udps(self) -> None:
+        """Mixed-case UDPS prefix matches (#2192)."""
+        assert _CASE_NUMBER_RE.match("Udps2500726")
+
+    def test_mixed_case_ric(self) -> None:
+        """Mixed-case existing prefix matches (case-insensitive)."""
+        assert _CASE_NUMBER_RE.match("ric1904113")
+
+    def test_mixed_case_cvps(self) -> None:
+        """Mixed-case CV-prefixed matches (case-insensitive)."""
+        assert _CASE_NUMBER_RE.match("Cvps2306157")
+
     def test_no_match_random_prefix(self) -> None:
         """Unknown prefixes do not match."""
         assert _CASE_NUMBER_RE.match("XYZ1234567") is None
