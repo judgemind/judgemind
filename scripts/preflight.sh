@@ -30,7 +30,7 @@ preflight_in_worktree() {
 
     echo "PREFLIGHT FAIL: Current directory is the main repo checkout, not a worktree." >&2
     echo "  pwd: $(pwd)" >&2
-    echo "  Run scripts/start-worker.sh to create a worktree first." >&2
+    echo "  Use the dispatcher's isolation: \"worktree\" mode to create a worktree." >&2
     return 1
 }
 
@@ -48,7 +48,7 @@ preflight_not_on_main() {
 
     if [[ "$branch" == "main" || "$branch" == "master" ]]; then
         echo "PREFLIGHT FAIL: On branch '$branch'. Task work must happen on a feature branch." >&2
-        echo "  Create a worktree with scripts/start-worker.sh, or checkout a feature branch." >&2
+        echo "  Use the dispatcher's isolation: \"worktree\" mode, or checkout a feature branch." >&2
         return 1
     fi
 

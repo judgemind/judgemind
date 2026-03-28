@@ -16,11 +16,7 @@ Pick up one issue from the Judgemind backlog and complete it autonomously. Do no
 
 When spawned by the dispatcher with `isolation: "worktree"`, Claude Code automatically creates a unique worktree at `.claude/worktrees/agent-<id>/`. The agent is already inside this worktree when it starts.
 
-**Verify you are in a worktree** by checking that your working directory contains `.claude/worktrees/` or `worktrees/worker-` in the path. If not, and you were launched interactively (not by the dispatcher), fall back to manual setup:
-
-```
-scripts/start-worker.sh
-```
+**Verify you are in a worktree** by checking that your working directory contains `.claude/worktrees/` in the path. If not, stop and report the error — all task work requires a worktree created by the dispatcher's `isolation: "worktree"` mode.
 
 **Record the working directory** — it is `{worktree}` for the rest of the session. All subsequent work happens inside `{worktree}`.
 
@@ -549,7 +545,7 @@ python3 {worktree}/scripts/phase_timer.py summarize {worktree} {repo_root} <issu
 ```
 This writes `{worktree}/tmp/timing.json` with the full phase breakdown and appends a one-line summary to `{repo_root}/tmp/task-timings.jsonl`. The dispatcher can aggregate these across tasks to identify systemic bottlenecks.
 
-Worktree cleanup is handled automatically by Claude Code (if spawned with `isolation: "worktree"`) when the agent exits. For manual worktrees, run `scripts/end-worker.sh {worktree}`.
+Worktree cleanup is handled automatically by Claude Code when the agent exits.
 
 ---
 
