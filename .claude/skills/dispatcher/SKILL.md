@@ -767,7 +767,7 @@ Send a notification for **every** lifecycle event listed in the Message Template
 
 ### Message formatting rules
 
-**All outbound notifications MUST use `format: "markdownv2"` on `telegram__reply`.** This enables clickable hyperlinks, bold text, and inline code formatting.
+**All outbound notifications MUST use `format: "markdownv2"` and `disable_web_page_preview: true` on `telegram__reply`.** This enables clickable hyperlinks, bold text, and inline code formatting while suppressing noisy link preview cards that push message content down on mobile.
 
 Key MarkdownV2 rules:
 - **Links:** `[visible text](url)` — use for all issue and PR references
@@ -810,6 +810,7 @@ Use these exact templates for each event type. Replace placeholders (`<title>`, 
 telegram__reply with:
   chat_id: "<chat_id>"
   format: "markdownv2"
+  disable_web_page_preview: true
   text: "🚀 Started [\#42](https://github.com/judgemind/judgemind/issues/42): Fix OC scraper date parsing"
 ```
 
@@ -818,6 +819,7 @@ telegram__reply with:
 telegram__reply with:
   chat_id: "<chat_id>"
   format: "markdownv2"
+  disable_web_page_preview: true
   text: "✅ Done [\#42](https://github.com/judgemind/judgemind/issues/42): Fix OC scraper date parsing — [PR \#85](https://github.com/judgemind/judgemind/pull/85) merged"
 ```
 
