@@ -9,9 +9,17 @@ vi.mock('@apollo/client', () => ({
 }));
 
 const mockPush = vi.fn();
+const mockReplace = vi.fn();
+let mockSearchParams = new URLSearchParams();
 
 vi.mock('next/navigation', () => ({
-  useRouter: () => ({ push: mockPush, replace: vi.fn(), back: vi.fn() }),
+  useRouter: () => ({ push: mockPush, replace: mockReplace, back: vi.fn() }),
+  useSearchParams: () => mockSearchParams,
+}));
+
+// Mock useCountyOptions from filter-options
+vi.mock('@/lib/filter-options', () => ({
+  useCountyOptions: () => ['Los Angeles', 'Orange', 'San Diego'],
 }));
 
 vi.mock('next/link', () => ({
@@ -161,26 +169,18 @@ const MOCK_JUDGES_DATA = {
   },
 };
 
-const MOCK_COUNTIES_DATA = {
-  distinctCounties: ['Los Angeles', 'Orange', 'San Diego'],
-};
-
 function setupMocks({
   judgesData = MOCK_JUDGES_DATA,
-  countiesData = MOCK_COUNTIES_DATA,
   loading = false,
   error,
 }: {
   judgesData?: typeof MOCK_JUDGES_DATA | { judges: { edges: []; pageInfo: { hasNextPage: false; endCursor: null } } };
-  countiesData?: typeof MOCK_COUNTIES_DATA;
   loading?: boolean;
   error?: Error;
 } = {}) {
   // useQuery is called with different queries — match on the query string content
+  // Counties are now provided by useCountyOptions (mocked above), not via useQuery
   mockUseQuery.mockImplementation((query: string) => {
-    if (typeof query === 'string' && query.includes('distinctCounties')) {
-      return { data: countiesData };
-    }
     if (typeof query === 'string' && query.includes('JudgesPage2')) {
       return { data: undefined };
     }
@@ -192,6 +192,7 @@ function setupMocks({
 describe('JudgesList', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mockSearchParams = new URLSearchParams();
   });
 
   it('renders skeleton rows while loading', () => {
@@ -337,13 +338,20 @@ describe('JudgesList', () => {
     setupMocks();
 
     render(<JudgesList />);
-    // Click Name twice — first click keeps asc (already active), second toggles to desc
+    // Default sort is name 'asc'. First click toggles to 'desc'.
     fireEvent.click(screen.getByRole('button', { name: /Name/ }));
 
-    const links = screen.getAllByRole('link');
-    const names = links.map((l) => l.textContent).filter(Boolean);
+    let links = screen.getAllByRole('link');
+    let names = links.map((l) => l.textContent).filter(Boolean);
     // Descending by surname: Smith > Johnson > Anderson
     expect(names).toEqual(['John A. Smith', 'Robert M. Johnson', 'Alice Z. Anderson']);
+
+    // Second click toggles back to 'asc'.
+    fireEvent.click(screen.getByRole('button', { name: /Name/ }));
+    links = screen.getAllByRole('link');
+    names = links.map((l) => l.textContent).filter(Boolean);
+    // Ascending by surname: Anderson < Johnson < Smith
+    expect(names).toEqual(['Alice Z. Anderson', 'Robert M. Johnson', 'John A. Smith']);
   });
 
   it('sorts by county when County column clicked', () => {
@@ -543,5 +551,117 @@ describe('JudgesList', () => {
     expect(chips).toHaveLength(2);
     expect(chips[0]).toHaveTextContent('Anderson');
     expect(chips[1]).toHaveTextContent('Johnson');
+  });
+
+  // URL param sync tests
+  describe('URL param sync', () => {
+    it('initializes name filter from URL search params', () => {
+      mockSearchParams = new URLSearchParams('name=Smith');
+      setupMocks();
+
+      render(<JudgesList />);
+      const input = screen.getByLabelText(/Judge name/i);
+      expect(input).toHaveValue('Smith');
+      // Only Smith should be visible
+      expect(screen.getByText('John A. Smith')).toBeInTheDocument();
+      expect(screen.queryByText('Robert M. Johnson')).not.toBeInTheDocument();
+    });
+
+    it('initializes county filter from URL search params', () => {
+      mockSearchParams = new URLSearchParams('county=Orange');
+      setupMocks();
+
+      render(<JudgesList />);
+      const select = screen.getByTestId('county-select');
+      expect(select).toHaveAttribute('data-value', 'Orange');
+    });
+
+    it('initializes sort key and direction from URL search params', () => {
+      mockSearchParams = new URLSearchParams('sort=rulingCount&dir=desc');
+      setupMocks();
+
+      render(<JudgesList />);
+      // With rulingCount desc: Anderson (100) > Smith (55) > Johnson (23)
+      const links = screen.getAllByRole('link');
+      const names = links.map((l) => l.textContent).filter(Boolean);
+      expect(names).toEqual(['Alice Z. Anderson', 'John A. Smith', 'Robert M. Johnson']);
+    });
+
+    it('updates URL when name filter changes', () => {
+      setupMocks();
+
+      render(<JudgesList />);
+      const input = screen.getByLabelText(/Judge name/i);
+      fireEvent.change(input, { target: { value: 'Anderson' } });
+
+      expect(mockReplace).toHaveBeenCalledWith(
+        expect.stringContaining('name=Anderson'),
+      );
+    });
+
+    it('updates URL when sort changes', () => {
+      setupMocks();
+
+      render(<JudgesList />);
+      fireEvent.click(screen.getByRole('button', { name: /Rulings/ }));
+
+      // rulingCount defaults to desc, so URL should include sort=rulingCount&dir=desc
+      expect(mockReplace).toHaveBeenCalledWith(
+        expect.stringContaining('sort=rulingCount'),
+      );
+      expect(mockReplace).toHaveBeenCalledWith(
+        expect.stringContaining('dir=desc'),
+      );
+    });
+
+    it('uses clean URL /judges when all filters are defaults', () => {
+      setupMocks();
+
+      render(<JudgesList />);
+      // Default state: no name, county=all, sort=name, dir=asc — should be clean URL
+      expect(mockReplace).toHaveBeenCalledWith('/judges');
+    });
+
+    it('combines multiple filters in URL', () => {
+      mockSearchParams = new URLSearchParams('name=Smith&sort=rulingCount&dir=desc');
+      setupMocks();
+
+      render(<JudgesList />);
+      // Should have both name and sort params in URL
+      expect(mockReplace).toHaveBeenCalledWith(
+        expect.stringMatching(/name=Smith.*sort=rulingCount|sort=rulingCount.*name=Smith/),
+      );
+    });
+  });
+
+  // County filter behavior tests
+  describe('county filter', () => {
+    it('passes county to GraphQL query when county filter is selected', () => {
+      mockSearchParams = new URLSearchParams('county=Orange');
+      setupMocks();
+
+      render(<JudgesList />);
+      // The JUDGES_QUERY should be called with county: 'Orange'
+      const judgesCall = mockUseQuery.mock.calls.find(
+        (call: unknown[]) => typeof call[0] === 'string' && call[0].includes('Judges') && !call[0].includes('JudgesPage2'),
+      );
+      expect(judgesCall).toBeDefined();
+      expect(judgesCall![1]).toMatchObject({
+        variables: expect.objectContaining({ county: 'Orange' }),
+      });
+    });
+
+    it('passes undefined county when "all" is selected', () => {
+      setupMocks();
+
+      render(<JudgesList />);
+      const judgesCall = mockUseQuery.mock.calls.find(
+        (call: unknown[]) => typeof call[0] === 'string' && call[0].includes('Judges') && !call[0].includes('JudgesPage2'),
+      );
+      expect(judgesCall).toBeDefined();
+      expect(judgesCall![1]).toMatchObject({
+        variables: expect.objectContaining({ county: undefined }),
+      });
+    });
   });
 });

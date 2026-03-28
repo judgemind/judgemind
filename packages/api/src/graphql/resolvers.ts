@@ -302,9 +302,10 @@ export const resolvers = {
       const joins = needCourtsJoin ? 'JOIN courts ct ON ct.id = j.court_id' : '';
       const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
       params.push(limit + 1);
+      // ruling_count is resolved by the Judge.rulingCount field resolver via
+      // judgeRulingCountLoader (batched), so we no longer need a correlated subquery here.
       const { rows } = await pool.query<Row>(
-        `SELECT j.*,
-                (SELECT COUNT(*)::int FROM rulings r WHERE r.judge_id = j.id) AS ruling_count
+        `SELECT j.*
          FROM judges j ${joins}
          ${where}
          ORDER BY j.canonical_name ASC, j.id ASC
