@@ -171,6 +171,8 @@ jobs:
               tests/courts/test_riverside_tentatives.py
               tests/courts/test_riverside_dept_judges.py
               tests/courts/test_sb_tentatives.py
+              tests/courts/test_sb_dept_judges.py
+              tests/courts/test_sf_dept_judges.py
           # Shard 2: HTML-based and other courts (CourtListener, LA, Santa Cruz,
           # San Diego, SF, Ventura, plus utility and roster tests).
           - shard: 2
