@@ -8,7 +8,7 @@ set -euo pipefail
 DB_URL="${1:-postgres://judgemind:localdev@localhost:5432/judgemind}"
 MIGRATIONS_DIR="packages/api/migrations"
 
-echo "Applying migrations to: $DB_URL"
+echo "Applying migrations to: $(echo "$DB_URL" | sed 's|://[^@]*@|://***@|')"
 
 # Sort migrations numerically by prefix
 for f in $(ls "$MIGRATIONS_DIR"/*.sql | sort -t/ -k3 -V); do
@@ -16,7 +16,7 @@ for f in $(ls "$MIGRATIONS_DIR"/*.sql | sort -t/ -k3 -V); do
     echo "  Applying $name ..."
 
     # Extract only the "Up Migration" section: everything before "-- Down Migration"
-    up_sql=$(sed '/^-- Down Migration/,$d' "$f")
+    up_sql=$(sed '/^-- [Dd]own [Mm]igration/,$d' "$f")
 
     echo "$up_sql" | psql "$DB_URL" -v ON_ERROR_STOP=1 --quiet 2>&1
     if [ $? -ne 0 ]; then

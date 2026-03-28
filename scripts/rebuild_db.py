@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Rebuild the entire database from S3 archived content.
 # venv: scraper-framework
+"""Rebuild the entire database from S3 archived content.
 #
 # Lists S3 objects (or local cache), derives courts from key prefixes,
 # and feeds each document through the ingestion pipeline.
@@ -16,6 +16,7 @@
 """
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import sys
@@ -255,6 +256,22 @@ def main() -> None:
             else:
                 response = s3.get_object(Bucket=BUCKET, Key=key)
                 content = response["Body"].read()
+
+            if not content:
+                logger.warning("Skipping empty document", key=key)
+                skipped += 1
+                continue
+
+            actual_hash = hashlib.sha256(content).hexdigest()
+            if actual_hash != parsed["content_hash"]:
+                logger.error(
+                    "Content hash mismatch",
+                    key=key,
+                    expected=parsed["content_hash"][:12],
+                    actual=actual_hash[:12],
+                )
+                errors += 1
+                continue
 
             event = build_event(key, content, parsed, BUCKET)
             worker.process_event(event)

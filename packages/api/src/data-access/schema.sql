@@ -3,8 +3,7 @@
 -- To modify the schema, add a migration in packages/api/migrations/
 -- then run: scripts/regenerate_schema.sh
 --
--- Generated from migrations 1-14
--- 2026-03-28 23:35 UTC
+-- Generated from 14 migrations.
 
 
 

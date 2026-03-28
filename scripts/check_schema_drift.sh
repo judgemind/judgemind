@@ -16,8 +16,8 @@ set -euo pipefail
 
 SCHEMA_FILE="packages/api/src/data-access/schema.sql"
 MIGRATIONS_DIR="packages/api/migrations"
-DB_FROM_SCHEMA="judgemind_check_schema"
-DB_FROM_MIGRATIONS="judgemind_check_migrations"
+DB_FROM_SCHEMA="judgemind_check_schema_$$"
+DB_FROM_MIGRATIONS="judgemind_check_migrations_$$"
 
 # In CI mode, start a dedicated postgres container
 if [[ "${1:-}" == "--ci" ]]; then
@@ -35,6 +35,11 @@ if [[ "${1:-}" == "--ci" ]]; then
         fi
         sleep 1
     done
+    if ! docker exec "$CONTAINER" pg_isready -U judgemind -q 2>/dev/null; then
+        echo "ERROR: postgres failed to start within 30 seconds"
+        docker rm -f "$CONTAINER" > /dev/null 2>&1
+        exit 1
+    fi
     trap "docker rm -f $CONTAINER > /dev/null 2>&1" EXIT
 else
     CONTAINER="judgemind-bootstrap-postgres-1"
@@ -78,7 +83,7 @@ run_psql -d "$DB_FROM_SCHEMA" -v ON_ERROR_STOP=1 -q < "$SCHEMA_FILE"
 # DB 2: Apply migrations (up sections only)
 echo "  Applying migrations..."
 for f in $(ls "$MIGRATIONS_DIR"/*.sql | sort -t/ -k3 -V); do
-    up_sql=$(sed '/^-- Down Migration/,$d' "$f")
+    up_sql=$(sed '/^-- [Dd]own [Mm]igration/,$d' "$f")
     echo "$up_sql" | run_psql -d "$DB_FROM_MIGRATIONS" -v ON_ERROR_STOP=1 -q 2>&1
 done
 
