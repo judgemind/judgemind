@@ -63,6 +63,11 @@ class CountyExtractionConfig:
         model: LLM model ID.  If ``None``, uses the provider default.
         max_output_tokens: Maximum tokens in the model response.
             If ``None``, uses the ``LlmExtractor`` default (4096).
+        max_chars_per_chunk: Per-chunk character limit for large
+            documents.  If ``None``, uses the ``LlmExtractor`` default
+            (80,000).  Counties with large multi-ruling PDFs (e.g. SF
+            family law) may need a smaller value to prevent output
+            truncation.
     """
 
     method: ExtractionMethod = ExtractionMethod.LLM
@@ -70,6 +75,7 @@ class CountyExtractionConfig:
     provider: str | None = None
     model: str | None = None
     max_output_tokens: int | None = None
+    max_chars_per_chunk: int | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -101,6 +107,7 @@ _COUNTY_CONFIGS: dict[tuple[str, str], CountyExtractionConfig] = {
         provider="google",
         model="gemini-2.5-flash-lite",
         max_output_tokens=32768,
+        max_chars_per_chunk=40_000,
     ),
     ("CA", "FRESNO"): CountyExtractionConfig(
         method=ExtractionMethod.LLM,

@@ -13,6 +13,8 @@ import anthropic
 import pytest
 
 from framework.llm_extractor import (
+    _MAX_RETRY_DEPTH,
+    _MIN_RETRY_CHUNK_CHARS,
     LlmExtractor,
     TokenUsage,
     _force_split,
@@ -797,6 +799,287 @@ class TestGoogleProvider:
         assert usage.input_tokens == 500
         assert usage.output_tokens == 200
         assert usage.api_calls == 1
+
+
+# ---------------------------------------------------------------------------
+# Retry with smaller chunks (#2136)
+# ---------------------------------------------------------------------------
+
+
+class TestRetryWithSmallerChunks:
+    """Tests for the retry-with-smaller-chunks feature (#2136).
+
+    When an LLM response is truncated (output exceeds max_output_tokens),
+    the JSON parse fails.  The extractor should retry by splitting the
+    chunk in half and extracting each sub-chunk independently.
+    """
+
+    def test_retry_on_json_parse_failure_succeeds(
+        self, extractor: LlmExtractor, mock_client: MagicMock
+    ) -> None:
+        """When first chunk fails (truncated JSON), retry with sub-chunks succeeds."""
+        # First call returns truncated JSON (parse fails).
+        # Next two calls (sub-chunks) return valid JSON.
+        truncated_json = '{"rulings": [{"extracted_case_number": "FPT-25-001", "ruling_text": "Trun'
+        valid_json_1 = json.dumps(
+            {
+                "extracted_judge_name": "Judge A",
+                "rulings": [
+                    {
+                        "extracted_case_number": "FPT-25-001",
+                        "extracted_case_title": "A v. B",
+                        "outcome": "granted",
+                        "ruling_text": "Granted.",
+                    }
+                ],
+            }
+        )
+        valid_json_2 = json.dumps(
+            {
+                "extracted_judge_name": "Judge A",
+                "rulings": [
+                    {
+                        "extracted_case_number": "FPT-25-002",
+                        "extracted_case_title": "C v. D",
+                        "outcome": "denied",
+                        "ruling_text": "Denied.",
+                    }
+                ],
+            }
+        )
+
+        mock_client.messages.create.side_effect = [
+            _make_response(truncated_json),
+            _make_response(valid_json_1),
+            _make_response(valid_json_2),
+        ]
+
+        # Text must be large enough to split (> _MIN_RETRY_CHUNK_CHARS).
+        text = "A" * 5000
+        rulings = extractor.extract(text)
+
+        # Should get rulings from both sub-chunks.
+        assert len(rulings) == 2
+        case_numbers = {r.extracted_case_number for r in rulings}
+        assert "FPT-25-001" in case_numbers
+        assert "FPT-25-002" in case_numbers
+
+    def test_retry_not_attempted_for_small_chunks(
+        self, extractor: LlmExtractor, mock_client: MagicMock
+    ) -> None:
+        """Small chunks (< _MIN_RETRY_CHUNK_CHARS) are not retried."""
+        truncated_json = '{"rulings": [{"extracted'
+        mock_client.messages.create.return_value = _make_response(truncated_json)
+
+        # Text smaller than _MIN_RETRY_CHUNK_CHARS.
+        text = "A" * 100
+        rulings = extractor.extract(text)
+
+        assert rulings == []
+        # Only one API call — no retry.
+        assert mock_client.messages.create.call_count == 1
+
+    def test_retry_depth_limited(self, extractor: LlmExtractor, mock_client: MagicMock) -> None:
+        """Retry does not exceed _MAX_RETRY_DEPTH levels."""
+        truncated_json = '{"rulings": [{"extracted_case_number": "truncated'
+
+        # All calls return truncated JSON — should fail at depth 0,
+        # retry sub-chunks at depth 1, then give up.
+        mock_client.messages.create.return_value = _make_response(truncated_json)
+
+        text = "A" * 10000
+        rulings = extractor.extract(text)
+
+        assert rulings == []
+        # Original call (1) + 2 sub-chunk retries (2) + no more = 3 total.
+        assert mock_client.messages.create.call_count == 3
+
+    def test_retry_one_subcchunk_fails_other_succeeds(
+        self, extractor: LlmExtractor, mock_client: MagicMock
+    ) -> None:
+        """If only one sub-chunk succeeds, we still get partial results."""
+        truncated_json = '{"rulings": [{"truncated'
+        valid_json = json.dumps(
+            {
+                "rulings": [
+                    {
+                        "extracted_case_number": "FPT-25-003",
+                        "extracted_case_title": "E v. F",
+                        "outcome": "granted",
+                        "ruling_text": "Granted.",
+                    }
+                ],
+            }
+        )
+
+        # First call: parse failure (triggers retry).
+        # Sub-chunk 1: parse failure (at depth 1, no further retry).
+        # Sub-chunk 2: success.
+        mock_client.messages.create.side_effect = [
+            _make_response(truncated_json),
+            _make_response(truncated_json),
+            _make_response(valid_json),
+        ]
+
+        text = "A" * 5000
+        rulings = extractor.extract(text)
+
+        assert len(rulings) == 1
+        assert rulings[0].extracted_case_number == "FPT-25-003"
+
+    def test_retry_with_google_provider(self) -> None:
+        """Retry works with Google provider path too."""
+        from ingestion.llm_providers import LLMResponse
+
+        truncated_json = '{"rulings": [{"truncated'
+        valid_json_1 = json.dumps(
+            {
+                "rulings": [
+                    {
+                        "extracted_case_number": "FPT-25-004",
+                        "ruling_text": "Granted.",
+                        "outcome": "granted",
+                    }
+                ],
+            }
+        )
+        valid_json_2 = json.dumps(
+            {
+                "rulings": [
+                    {
+                        "extracted_case_number": "FPT-25-005",
+                        "ruling_text": "Denied.",
+                        "outcome": "denied",
+                    }
+                ],
+            }
+        )
+
+        with patch("framework.llm_extractor._create_google_client"):
+            extractor = LlmExtractor(provider="google", model="gemini-2.5-flash-lite")
+
+        # First call: truncated, next two: succeed.
+        responses = [
+            LLMResponse(text=truncated_json, input_tokens=100, output_tokens=50),
+            LLMResponse(text=valid_json_1, input_tokens=80, output_tokens=40),
+            LLMResponse(text=valid_json_2, input_tokens=80, output_tokens=40),
+        ]
+
+        with patch("ingestion.llm_providers.call_llm", side_effect=responses):
+            text = "A" * 5000
+            rulings = extractor.extract(text)
+
+        assert len(rulings) == 2
+
+    def test_successful_extraction_no_retry(
+        self, extractor: LlmExtractor, mock_client: MagicMock
+    ) -> None:
+        """Normal successful extraction does not trigger retry logic."""
+        valid_json = json.dumps(
+            {
+                "rulings": [
+                    {
+                        "extracted_case_number": "FPT-25-006",
+                        "ruling_text": "Granted.",
+                        "outcome": "granted",
+                    }
+                ],
+            }
+        )
+        mock_client.messages.create.return_value = _make_response(valid_json)
+
+        text = "A" * 5000
+        rulings = extractor.extract(text)
+
+        assert len(rulings) == 1
+        # Only one API call — no retry needed.
+        assert mock_client.messages.create.call_count == 1
+
+
+class TestSplitChunkInHalf:
+    """Tests for LlmExtractor._split_chunk_in_half."""
+
+    def test_splits_at_paragraph_boundary(self) -> None:
+        """Prefers paragraph boundaries near the midpoint."""
+        extractor = LlmExtractor.__new__(LlmExtractor)
+        # Create text with a paragraph break near the middle.
+        text = "A" * 2000 + "\n\n" + "B" * 2000
+        halves = extractor._split_chunk_in_half(text)
+
+        assert len(halves) == 2
+        # First half should end at or near the paragraph break.
+        assert halves[0].rstrip().endswith("A" * 10)
+        # Second half should contain the B portion.
+        assert "B" * 10 in halves[1]
+
+    def test_splits_at_case_boundary(self) -> None:
+        """Prefers case boundaries (highest priority) near the midpoint."""
+        extractor = LlmExtractor.__new__(LlmExtractor)
+        # Place a case boundary pattern near the middle of the text.
+        text = "A" * 2000 + "\nCase Number: 12345678\n" + "B" * 2000
+        halves = extractor._split_chunk_in_half(text)
+
+        assert len(halves) == 2
+        # First half should end just before the case boundary.
+        assert halves[0].endswith("A" * 10)
+        # Second half should contain the case boundary and B portion.
+        assert "Case Number: 12345678" in halves[1]
+        assert "B" * 10 in halves[1]
+
+    def test_splits_at_page_break(self) -> None:
+        """Prefers page breaks when no case boundaries exist near midpoint."""
+        extractor = LlmExtractor.__new__(LlmExtractor)
+        # Place a form-feed (page break) near the middle — no case boundaries.
+        text = "A" * 2000 + "\f" + "B" * 2000
+        halves = extractor._split_chunk_in_half(text)
+
+        assert len(halves) == 2
+        # First half should end at or before the page break.
+        assert halves[0].rstrip("\f").endswith("A" * 10)
+        # Second half should contain the B portion.
+        assert "B" * 10 in halves[1]
+
+    def test_splits_at_midpoint_without_boundaries(self) -> None:
+        """Falls back to midpoint when no natural boundaries exist."""
+        extractor = LlmExtractor.__new__(LlmExtractor)
+        text = "A" * 4000  # No paragraph breaks, page breaks, or case boundaries.
+        halves = extractor._split_chunk_in_half(text)
+
+        assert len(halves) == 2
+        # Both halves should have content.
+        assert len(halves[0]) > 0
+        assert len(halves[1]) > 0
+        # First half should be roughly half (midpoint at 2000).
+        assert abs(len(halves[0]) - 2000) < 100
+
+    def test_overlap_between_halves(self) -> None:
+        """Second half overlaps with first half by _CHUNK_OVERLAP chars."""
+        from framework.llm_extractor import _CHUNK_OVERLAP
+
+        extractor = LlmExtractor.__new__(LlmExtractor)
+        text = "A" * 4000
+        halves = extractor._split_chunk_in_half(text)
+
+        # Second half starts _CHUNK_OVERLAP chars before the split point.
+        # Total characters across both halves should exceed the original
+        # by approximately _CHUNK_OVERLAP.
+        total_chars = len(halves[0]) + len(halves[1])
+        assert total_chars == len(text) + _CHUNK_OVERLAP
+
+
+# ---------------------------------------------------------------------------
+# Retry constants
+# ---------------------------------------------------------------------------
+
+
+class TestRetryConstants:
+    """Verify retry configuration constants are reasonable."""
+
+    def test_max_retry_depth(self) -> None:
+        assert _MAX_RETRY_DEPTH == 1
+
+    def test_min_retry_chunk_chars(self) -> None:
+        assert _MIN_RETRY_CHUNK_CHARS == 2000
 
 
 # ---------------------------------------------------------------------------

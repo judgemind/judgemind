@@ -367,13 +367,14 @@ class IngestionWorker:
         provider: str,
         model: str | None,
         max_output_tokens: int | None,
+        max_chars_per_chunk: int | None = None,
     ) -> LlmExtractor | None:
         """Return a county-specific LlmExtractor, creating lazily.
 
-        Caches by (provider, model) tuple so repeated calls for the same
-        county config reuse the same extractor instance.
+        Caches by (provider, model, max_chars_per_chunk) tuple so repeated
+        calls for the same county config reuse the same extractor instance.
         """
-        cache_key = (provider, model or "")
+        cache_key = (provider, model or "", max_chars_per_chunk or 0)
         if cache_key not in self._county_extractors:
             try:
                 kwargs: dict[str, object] = {"provider": provider}
@@ -381,6 +382,8 @@ class IngestionWorker:
                     kwargs["model"] = model
                 if max_output_tokens:
                     kwargs["max_output_tokens"] = max_output_tokens
+                if max_chars_per_chunk:
+                    kwargs["max_chars_per_chunk"] = max_chars_per_chunk
                 extractor = LlmExtractor(**kwargs)
                 self._county_extractors[cache_key] = extractor
                 logger.info(
@@ -1493,6 +1496,7 @@ class IngestionWorker:
                     county_config.provider,
                     county_config.model,
                     county_config.max_output_tokens,
+                    county_config.max_chars_per_chunk,
                 )
                 county_prompt = county_config.system_prompt
                 if county_prompt:
