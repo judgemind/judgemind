@@ -25,9 +25,11 @@ from courts.ca.sd_tentatives import (
     _SD_OUTCOME_MAP,
     PORTAL_BASE_URL,
     SDTentativeRulingsScraper,
+    _apply_stealth,
     _sd_llm_enabled,
     _sd_llm_extract,
     default_config,
+    has_cf_clearance,
     is_cloudflare_challenge,
     parse_case_details,
     parse_case_header,
@@ -89,6 +91,69 @@ class TestIsCloudflareChallenge:
     def test_detects_challenge_platform(self) -> None:
         html = '<script src="/cdn-cgi/challenge-platform/"></script>'
         assert is_cloudflare_challenge(html) is True
+
+
+# ---------------------------------------------------------------------------
+# has_cf_clearance — cookie detection
+# ---------------------------------------------------------------------------
+
+
+class TestHasCfClearance:
+    """Tests for cf_clearance cookie detection."""
+
+    @pytest.mark.asyncio
+    async def test_returns_true_when_cookie_present(self) -> None:
+        context = AsyncMock()
+        context.cookies = AsyncMock(
+            return_value=[
+                {"name": "__cf_bm", "value": "xyz"},
+                {"name": "cf_clearance", "value": "abc123"},
+            ]
+        )
+        assert await has_cf_clearance(context) is True
+
+    @pytest.mark.asyncio
+    async def test_returns_false_when_cookie_absent(self) -> None:
+        context = AsyncMock()
+        context.cookies = AsyncMock(return_value=[{"name": "__cf_bm", "value": "xyz"}])
+        assert await has_cf_clearance(context) is False
+
+    @pytest.mark.asyncio
+    async def test_returns_false_when_no_cookies(self) -> None:
+        context = AsyncMock()
+        context.cookies = AsyncMock(return_value=[])
+        assert await has_cf_clearance(context) is False
+
+
+# ---------------------------------------------------------------------------
+# _apply_stealth — stealth evasion application
+# ---------------------------------------------------------------------------
+
+
+class TestApplyStealth:
+    """Tests for stealth evasion application."""
+
+    @pytest.mark.asyncio
+    async def test_applies_stealth_when_available(self) -> None:
+        """Stealth().apply_stealth_async should be called when installed."""
+        page = AsyncMock()
+        mock_stealth_instance = MagicMock()
+        mock_stealth_instance.apply_stealth_async = AsyncMock()
+        mock_stealth_cls = MagicMock(return_value=mock_stealth_instance)
+
+        with patch("playwright_stealth.Stealth", mock_stealth_cls):
+            await _apply_stealth(page)
+
+        mock_stealth_cls.assert_called_once()
+        mock_stealth_instance.apply_stealth_async.assert_awaited_once_with(page)
+
+    @pytest.mark.asyncio
+    async def test_fallback_when_stealth_not_installed(self) -> None:
+        """Falls back to minimal webdriver override when stealth unavailable."""
+        page = AsyncMock()
+        with patch.dict("sys.modules", {"playwright_stealth": None}):
+            await _apply_stealth(page)
+        page.evaluate.assert_awaited_once()
 
 
 # ---------------------------------------------------------------------------
@@ -615,21 +680,41 @@ class TestDefaultConfig:
 
 def _make_mock_page(
     content_sequence: list[str],
+    cf_clearance: bool = False,
 ) -> AsyncMock:
     """Create a mock Playwright page that returns content_sequence on successive
-    content() calls."""
+    content() calls.
+
+    Parameters
+    ----------
+    content_sequence : list[str]
+        HTML strings returned by successive ``page.content()`` calls.
+    cf_clearance : bool
+        If True, the mock context's ``cookies()`` returns a ``cf_clearance``
+        cookie, simulating a solved Cloudflare challenge.
+    """
     page = AsyncMock()
     page.goto = AsyncMock()
     page.content = AsyncMock(side_effect=content_sequence)
     page.wait_for_url = AsyncMock()
+    page.evaluate = AsyncMock()
+
+    # Set up context with cookies support for cf_clearance checks
+    context = AsyncMock()
+    if cf_clearance:
+        context.cookies = AsyncMock(return_value=[{"name": "cf_clearance", "value": "abc123"}])
+    else:
+        context.cookies = AsyncMock(return_value=[])
+    page.context = context
+
     return page
 
 
 def _make_mock_browser(page: AsyncMock) -> AsyncMock:
     """Create a mock browser that yields the given page."""
-    context = AsyncMock()
+    context = page.context
+
     context.new_page = AsyncMock(return_value=page)
-    context.add_init_script = AsyncMock()
 
     browser = AsyncMock()
     browser.new_context = AsyncMock(return_value=context)
@@ -728,12 +813,13 @@ class TestFetchDocumentsWithMockedPlaywright:
         assert len(docs) == 0
 
     def test_fetch_cloudflare_challenge_blocks(self) -> None:
-        """Cloudflare challenge is not solved — returns empty."""
+        """Cloudflare challenge is not solved after all retries — returns empty."""
         cf_html = _load_html("sd_roa_cloudflare_challenge.html")
 
-        page = _make_mock_page([cf_html, cf_html])
-        # wait_for_url raises to simulate challenge not resolving
-        page.wait_for_url = AsyncMock(side_effect=TimeoutError("timeout"))
+        # Need enough cf_html entries for all retry attempts.
+        # Each attempt: 1 content() after goto + 1 content() after poll timeout
+        # = 2 per attempt, 3 attempts = 6 minimum.
+        page = _make_mock_page([cf_html] * 10)
         browser = _make_mock_browser(page)
 
         mock_pw = AsyncMock()
@@ -746,9 +832,14 @@ class TestFetchDocumentsWithMockedPlaywright:
         config = _make_config()
         scraper = SDTentativeRulingsScraper(config, case_numbers=["24CU016153C"])
 
-        with patch(
-            "playwright.async_api.async_playwright",
-            return_value=mock_pw_ctx,
+        # Patch timeouts to very small values so retries complete quickly
+        with (
+            patch(
+                "playwright.async_api.async_playwright",
+                return_value=mock_pw_ctx,
+            ),
+            patch("courts.ca.sd_tentatives.CF_CHALLENGE_TIMEOUT", 0.1),
+            patch("courts.ca.sd_tentatives.CF_POLL_INTERVAL", 0.05),
         ):
             docs = scraper.fetch_documents()
 
@@ -969,15 +1060,17 @@ class TestFetchDocumentsWithMockedPlaywright:
         # Browser should have been closed
         browser.close.assert_awaited_once()
 
-    def test_cloudflare_solved_after_wait(self) -> None:
-        """CF challenge detected then solved after wait_for_url."""
+    def test_cloudflare_solved_via_cookie(self) -> None:
+        """CF challenge detected, solved when cf_clearance cookie appears."""
         cf_html = _load_html("sd_roa_cloudflare_challenge.html")
         search_html = _load_html("sd_roa_search_results.html")
         detail_html = _load_html("sd_roa_case_detail.html")
 
-        page = _make_mock_page([cf_html, search_html, detail_html])
-        # wait_for_url succeeds (challenge resolved)
-        page.wait_for_url = AsyncMock()
+        # cf_clearance=True simulates the cookie appearing after challenge
+        page = _make_mock_page(
+            [cf_html, search_html, detail_html],
+            cf_clearance=True,
+        )
         browser = _make_mock_browser(page)
 
         mock_pw = AsyncMock()
@@ -997,6 +1090,210 @@ class TestFetchDocumentsWithMockedPlaywright:
             docs = scraper.fetch_documents()
 
         assert len(docs) == 1
+
+    def test_cloudflare_retry_succeeds_on_second_attempt(self) -> None:
+        """Challenge fails on first attempt, succeeds on second with cookie."""
+        cf_html = _load_html("sd_roa_cloudflare_challenge.html")
+        search_html = _load_html("sd_roa_search_results.html")
+        detail_html = _load_html("sd_roa_case_detail.html")
+
+        # Content sequence:
+        # Attempt 1: cf_html (challenge detected after goto)
+        #            cf_html (fallback check after poll timeout — still challenge)
+        # Attempt 2: cf_html (challenge detected after goto)
+        #            [cookie appears during polling — solved, no fallback needed]
+        # Case fetch: search_html (search page), detail_html (case detail)
+        page = _make_mock_page(
+            [cf_html, cf_html, cf_html, search_html, detail_html],
+        )
+
+        # Track how many times cookies() is polled to simulate the cookie
+        # appearing on the second retry attempt. With CF_CHALLENGE_TIMEOUT=0.1
+        # and CF_POLL_INTERVAL=0.05, each attempt polls ~2 times.
+        call_count = {"n": 0}
+
+        async def cookies_side_effect() -> list[dict[str, str]]:
+            call_count["n"] += 1
+            # First attempt: polls 1-2, no cookie
+            # Second attempt: cookie appears immediately on first poll
+            if call_count["n"] >= 3:
+                return [{"name": "cf_clearance", "value": "solved"}]
+            return []
+
+        page.context.cookies = AsyncMock(side_effect=cookies_side_effect)
+
+        browser = _make_mock_browser(page)
+
+        mock_pw = AsyncMock()
+        mock_pw.chromium.launch = AsyncMock(return_value=browser)
+
+        mock_pw_ctx = AsyncMock()
+        mock_pw_ctx.__aenter__ = AsyncMock(return_value=mock_pw)
+        mock_pw_ctx.__aexit__ = AsyncMock(return_value=False)
+
+        config = _make_config()
+        scraper = SDTentativeRulingsScraper(config, case_numbers=["24CU016153C"])
+
+        with (
+            patch(
+                "playwright.async_api.async_playwright",
+                return_value=mock_pw_ctx,
+            ),
+            patch("courts.ca.sd_tentatives.CF_CHALLENGE_TIMEOUT", 0.1),
+            patch("courts.ca.sd_tentatives.CF_POLL_INTERVAL", 0.05),
+        ):
+            docs = scraper.fetch_documents()
+
+        assert len(docs) == 1
+
+    def test_stealth_is_applied(self) -> None:
+        """Verify that _apply_stealth is called during browser setup."""
+        portal_html = "<html><body>Portal home</body></html>"
+        search_html = _load_html("sd_roa_search_results.html")
+        detail_html = _load_html("sd_roa_case_detail.html")
+
+        page = _make_mock_page([portal_html, search_html, detail_html])
+        browser = _make_mock_browser(page)
+
+        mock_pw = AsyncMock()
+        mock_pw.chromium.launch = AsyncMock(return_value=browser)
+
+        mock_pw_ctx = AsyncMock()
+        mock_pw_ctx.__aenter__ = AsyncMock(return_value=mock_pw)
+        mock_pw_ctx.__aexit__ = AsyncMock(return_value=False)
+
+        config = _make_config()
+        scraper = SDTentativeRulingsScraper(config, case_numbers=["24CU016153C"])
+
+        with (
+            patch(
+                "playwright.async_api.async_playwright",
+                return_value=mock_pw_ctx,
+            ),
+            patch(
+                "courts.ca.sd_tentatives._apply_stealth",
+                new_callable=AsyncMock,
+            ) as mock_stealth,
+        ):
+            docs = scraper.fetch_documents()
+
+        # Stealth should be applied to the page
+        mock_stealth.assert_awaited_once_with(page)
+        assert len(docs) == 1
+
+    def test_session_reuse_single_cf_solve(self) -> None:
+        """Single CF solve serves multiple case lookups without re-challenge."""
+        portal_html = "<html><body>Portal home</body></html>"
+        search1 = _load_html("sd_roa_search_results.html")
+        detail1 = _load_html("sd_roa_case_detail.html")
+        search2 = _load_html("sd_roa_search_results.html")
+        detail2 = _load_html("sd_roa_case_detail.html")
+
+        # Portal + 2 cases, each with search + detail (no re-challenge)
+        page = _make_mock_page([portal_html, search1, detail1, search2, detail2])
+        browser = _make_mock_browser(page)
+
+        mock_pw = AsyncMock()
+        mock_pw.chromium.launch = AsyncMock(return_value=browser)
+
+        mock_pw_ctx = AsyncMock()
+        mock_pw_ctx.__aenter__ = AsyncMock(return_value=mock_pw)
+        mock_pw_ctx.__aexit__ = AsyncMock(return_value=False)
+
+        config = _make_config()
+        scraper = SDTentativeRulingsScraper(
+            config,
+            case_numbers=["24CU016153C", "24CU016154C"],
+        )
+
+        with patch(
+            "playwright.async_api.async_playwright",
+            return_value=mock_pw_ctx,
+        ):
+            docs = scraper.fetch_documents()
+
+        # Both cases should be fetched using the same session
+        assert len(docs) == 2
+
+    def test_chromium_launch_args_include_stealth_flags(self) -> None:
+        """Browser is launched with anti-detection flags."""
+        portal_html = "<html><body>Portal</body></html>"
+        page = _make_mock_page([portal_html])
+        browser = _make_mock_browser(page)
+
+        mock_pw = AsyncMock()
+        mock_pw.chromium.launch = AsyncMock(return_value=browser)
+
+        mock_pw_ctx = AsyncMock()
+        mock_pw_ctx.__aenter__ = AsyncMock(return_value=mock_pw)
+        mock_pw_ctx.__aexit__ = AsyncMock(return_value=False)
+
+        config = _make_config()
+        scraper = SDTentativeRulingsScraper(config, case_numbers=["X"])
+
+        with patch(
+            "playwright.async_api.async_playwright",
+            return_value=mock_pw_ctx,
+        ):
+            scraper.fetch_documents()
+
+        launch_call = mock_pw.chromium.launch.call_args
+        args = launch_call.kwargs.get("args", [])
+        assert "--disable-blink-features=AutomationControlled" in args
+        assert "--no-sandbox" in args
+        assert "--disable-dev-shm-usage" in args
+
+    def test_context_has_locale_and_timezone(self) -> None:
+        """Browser context is created with locale and timezone for realism."""
+        portal_html = "<html><body>Portal</body></html>"
+        page = _make_mock_page([portal_html])
+        browser = _make_mock_browser(page)
+
+        mock_pw = AsyncMock()
+        mock_pw.chromium.launch = AsyncMock(return_value=browser)
+
+        mock_pw_ctx = AsyncMock()
+        mock_pw_ctx.__aenter__ = AsyncMock(return_value=mock_pw)
+        mock_pw_ctx.__aexit__ = AsyncMock(return_value=False)
+
+        config = _make_config()
+        scraper = SDTentativeRulingsScraper(config, case_numbers=["X"])
+
+        with patch(
+            "playwright.async_api.async_playwright",
+            return_value=mock_pw_ctx,
+        ):
+            scraper.fetch_documents()
+
+        context_call = browser.new_context.call_args
+        assert context_call.kwargs.get("locale") == "en-US"
+        assert context_call.kwargs.get("timezone_id") == "America/Los_Angeles"
+
+    def test_user_agent_is_recent_chrome(self) -> None:
+        """User-Agent string uses a recent Chrome version (not 120)."""
+        portal_html = "<html><body>Portal</body></html>"
+        page = _make_mock_page([portal_html])
+        browser = _make_mock_browser(page)
+
+        mock_pw = AsyncMock()
+        mock_pw.chromium.launch = AsyncMock(return_value=browser)
+
+        mock_pw_ctx = AsyncMock()
+        mock_pw_ctx.__aenter__ = AsyncMock(return_value=mock_pw)
+        mock_pw_ctx.__aexit__ = AsyncMock(return_value=False)
+
+        config = _make_config()
+        scraper = SDTentativeRulingsScraper(config, case_numbers=["X"])
+
+        with patch(
+            "playwright.async_api.async_playwright",
+            return_value=mock_pw_ctx,
+        ):
+            scraper.fetch_documents()
+
+        context_call = browser.new_context.call_args
+        ua = context_call.kwargs.get("user_agent", "")
+        assert "Chrome/131" in ua
 
 
 # ---------------------------------------------------------------------------
