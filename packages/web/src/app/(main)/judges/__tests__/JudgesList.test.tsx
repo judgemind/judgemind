@@ -50,6 +50,9 @@ vi.mock('lucide-react', () => ({
   ArrowDown: ({ className }: { className?: string }) => (
     <span data-testid="arrow-down-icon" className={className} />
   ),
+  X: ({ className }: { className?: string }) => (
+    <span data-testid="x-icon" className={className} />
+  ),
 }));
 
 // Mock Checkbox component
@@ -478,5 +481,57 @@ describe('JudgesList', () => {
 
     render(<JudgesList />);
     expect(screen.getByTestId('county-select')).toBeInTheDocument();
+  });
+
+  // Selection chips tests
+  it('shows selection chips with surname when judges are selected', () => {
+    setupMocks();
+
+    render(<JudgesList />);
+    const checkboxes = screen.getAllByTestId('judge-checkbox');
+    fireEvent.click(checkboxes[0]); // Anderson (first by surname sort)
+    fireEvent.click(checkboxes[2]); // Smith
+
+    expect(screen.getByTestId('selection-tray')).toBeInTheDocument();
+    const chips = screen.getAllByTestId('selection-chip');
+    expect(chips).toHaveLength(2);
+    expect(chips[0]).toHaveTextContent('Anderson');
+    expect(chips[1]).toHaveTextContent('Smith');
+  });
+
+  it('removes a chip when its dismiss button is clicked', () => {
+    setupMocks();
+
+    render(<JudgesList />);
+    const checkboxes = screen.getAllByTestId('judge-checkbox');
+    fireEvent.click(checkboxes[0]); // Anderson
+    fireEvent.click(checkboxes[2]); // Smith
+
+    const removeButtons = screen.getAllByLabelText(/Remove .* from comparison/);
+    fireEvent.click(removeButtons[0]); // remove Anderson
+
+    const chips = screen.getAllByTestId('selection-chip');
+    expect(chips).toHaveLength(1);
+    expect(chips[0]).toHaveTextContent('Smith');
+  });
+
+  it('keeps chips visible when judges are filtered out', () => {
+    setupMocks();
+
+    render(<JudgesList />);
+    // Select Anderson (LA) and Johnson (Orange)
+    const checkboxes = screen.getAllByTestId('judge-checkbox');
+    fireEvent.click(checkboxes[0]); // Anderson
+    fireEvent.click(checkboxes[1]); // Johnson
+
+    // Filter to only show Smith — Anderson and Johnson disappear from table
+    const input = screen.getByLabelText(/Judge name/i);
+    fireEvent.change(input, { target: { value: 'Smith' } });
+
+    // Chips should still be visible even though those judges are filtered out
+    const chips = screen.getAllByTestId('selection-chip');
+    expect(chips).toHaveLength(2);
+    expect(chips[0]).toHaveTextContent('Anderson');
+    expect(chips[1]).toHaveTextContent('Johnson');
   });
 });
