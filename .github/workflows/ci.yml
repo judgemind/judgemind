@@ -177,6 +177,7 @@ jobs:
           # San Diego, SF, Ventura, plus utility and roster tests).
           - shard: 2
             test-paths: >-
+              tests/courts/test_ballotpedia.py
               tests/courts/test_courtlistener.py
               tests/courts/test_fresno_dept_judges.py
               tests/courts/test_kern_dept_judges.py
