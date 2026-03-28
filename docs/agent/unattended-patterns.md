@@ -24,6 +24,30 @@
 
   The script uses Python's `shutil.copy2()` internally, which bypasses the platform restriction. **Do not use `cp` directly** — it may also be blocked. This pattern applies to skill definitions (`SKILL.md`), hook scripts, and any other file under `.claude/`.
 
+## `gh` jq Quoting (`-q` / `--jq`)
+
+The `gh` CLI accepts a `-q` / `--jq` flag to filter JSON output with a jq expression. When the jq expression contains mixed quote characters — e.g., `'"\(` or `)"'` — the consecutive `'"` or `"'` pattern at a word boundary triggers the platform's safety check for potential obfuscation. This causes a permission prompt that breaks unattended operation.
+
+**Problematic pattern (triggers prompt):**
+```
+gh issue view 123 --json state,title,stateReason -q '"\(.title): \(.state) (\(.stateReason))"'
+```
+The `-q '"\(` contains adjacent `'"` characters, which the platform flags.
+
+**Workaround — skip `-q` and return raw JSON:**
+```
+gh issue view 123 --json state,title,stateReason
+```
+This returns the full JSON object. Parse or extract fields in a subsequent step if needed (e.g., read the JSON output, extract the values you need).
+
+**Simple jq expressions are safe.** Expressions that use only single-quoted strings without embedded double quotes work fine:
+```
+gh run list --repo judgemind/judgemind --branch main --limit 1 --json databaseId -q '.[0].databaseId'
+gh issue view 123 --json state -q '.state'
+```
+
+**Rule of thumb:** if your `-q` expression would contain `"` inside `'...'` (i.e., `'..."...'`), drop the `-q` flag and use `--json` alone. The raw JSON output is almost always sufficient — agents can read JSON natively without needing jq string formatting.
+
 ## Dispatcher CWD Drift and `git -C`
 
 When the dispatcher spawns subagents with `isolation: "worktree"`, the parent process's working directory can drift into the agent's worktree (`.claude/worktrees/agent-<id>/`). After the agent completes and the worktree is removed, the parent's cwd becomes invalid, causing `getcwd` errors and broken git commands.
