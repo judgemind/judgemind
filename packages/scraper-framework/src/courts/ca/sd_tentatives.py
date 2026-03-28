@@ -51,11 +51,17 @@ SMART_SEARCH_URL = f"{PORTAL_BASE_URL}/portal/Home/SmartSearch"
 # Default delay between requests (seconds) to avoid triggering rate limits.
 DEFAULT_REQUEST_DELAY = 3.0
 
-# Maximum time (seconds) to wait for Cloudflare challenge to resolve.
-CF_CHALLENGE_TIMEOUT = 30.0
+# Maximum time (seconds) to wait for Cloudflare challenge to resolve per attempt.
+CF_CHALLENGE_TIMEOUT = 45.0
 
 # Maximum time (seconds) to wait for page navigation.
-PAGE_LOAD_TIMEOUT = 30000  # Playwright uses milliseconds
+PAGE_LOAD_TIMEOUT = 60000  # Playwright uses milliseconds
+
+# Number of retry attempts for Cloudflare challenge resolution.
+CF_MAX_RETRIES = 3
+
+# Seconds between cf_clearance cookie poll checks during challenge resolution.
+CF_POLL_INTERVAL = 2.0
 
 # ---------------------------------------------------------------------------
 # LLM extraction — feature flag and helpers (#2056)
@@ -276,6 +282,38 @@ def is_cloudflare_challenge(html: str) -> bool:
         "/cdn-cgi/challenge-platform/",
     ]
     return any(indicator in html for indicator in indicators)
+
+
+async def has_cf_clearance(context: Any) -> bool:
+    """Check whether the browser context has a valid cf_clearance cookie.
+
+    Cloudflare sets this cookie after a challenge is solved. Its presence
+    indicates the challenge has been passed and subsequent requests within
+    the same session will not be re-challenged (for ~30 minutes).
+    """
+    cookies = await context.cookies()
+    return any(c.get("name") == "cf_clearance" for c in cookies)
+
+
+async def _apply_stealth(page: Any) -> None:
+    """Apply playwright-stealth evasions to a page to avoid bot detection.
+
+    Uses the ``playwright-stealth`` library to mask browser automation
+    fingerprints (WebGL, navigator properties, plugins, etc.) that
+    Cloudflare uses for bot detection.
+
+    Falls back gracefully if playwright-stealth is not installed, applying
+    only the minimal webdriver override.
+    """
+    try:
+        from playwright_stealth import Stealth
+
+        stealth = Stealth()
+        await stealth.apply_stealth_async(page)
+    except ImportError:
+        logger.warning("playwright-stealth not installed, using minimal stealth only")
+        # Minimal fallback: remove webdriver flag
+        await page.evaluate("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
 
 
 def parse_case_header(soup: BeautifulSoup) -> tuple[str | None, str | None]:
@@ -569,6 +607,14 @@ class SDTentativeRulingsScraper(BaseScraper):
                 "args": [
                     "--disable-blink-features=AutomationControlled",
                     "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-infobars",
+                    "--disable-background-networking",
+                    "--disable-default-apps",
+                    "--disable-extensions",
+                    "--disable-sync",
+                    "--no-first-run",
+                    "--window-size=1920,1080",
                 ],
             }
 
@@ -582,18 +628,19 @@ class SDTentativeRulingsScraper(BaseScraper):
                     user_agent=(
                         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                         "AppleWebKit/537.36 (KHTML, like Gecko) "
-                        "Chrome/120.0.0.0 Safari/537.36"
+                        "Chrome/131.0.0.0 Safari/537.36"
                     ),
                     viewport={"width": 1920, "height": 1080},
                     java_script_enabled=True,
-                )
-
-                # Remove webdriver flag to avoid detection
-                await context.add_init_script(
-                    "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+                    locale="en-US",
+                    timezone_id="America/Los_Angeles",
                 )
 
                 page = await context.new_page()
+
+                # Apply stealth evasions (fingerprint masking, webdriver
+                # flag removal, etc.) to avoid Cloudflare bot detection.
+                await _apply_stealth(page)
 
                 # Step 1: Navigate to portal and solve Cloudflare challenge
                 cf_solved = await self._solve_cloudflare(page)
@@ -631,44 +678,104 @@ class SDTentativeRulingsScraper(BaseScraper):
     async def _solve_cloudflare(self, page: Any) -> bool:
         """Navigate to the portal and wait for Cloudflare challenge to resolve.
 
+        Uses a retry loop with ``cf_clearance`` cookie polling to reliably
+        detect when Cloudflare has been bypassed. The ``cf_clearance`` cookie
+        is the definitive signal that the challenge is solved — it is set by
+        Cloudflare's JavaScript after the challenge completes and is valid
+        for approximately 30 minutes.
+
         Returns True if the challenge was solved (or no challenge was present),
-        False if the challenge could not be solved within the timeout.
+        False if the challenge could not be solved after all retry attempts.
         """
-        try:
-            await page.goto(
-                f"{PORTAL_BASE_URL}/portal/",
-                timeout=PAGE_LOAD_TIMEOUT,
-                wait_until="domcontentloaded",
+        context = page.context
+
+        for attempt in range(1, CF_MAX_RETRIES + 1):
+            self._log.info(
+                "Cloudflare solve attempt",
+                attempt=attempt,
+                max_retries=CF_MAX_RETRIES,
             )
 
-            # Check if we hit a Cloudflare challenge
-            content = await page.content()
-            if is_cloudflare_challenge(content):
-                self._log.info("Cloudflare challenge detected, waiting for resolution")
+            try:
+                # Use wait_until="commit" so the goto returns as soon as
+                # the server responds, rather than waiting for DOM parsing
+                # which may time out on Cloudflare's challenge page.
+                await page.goto(
+                    f"{PORTAL_BASE_URL}/portal/",
+                    timeout=PAGE_LOAD_TIMEOUT,
+                    wait_until="commit",
+                )
 
-                # Wait for the challenge to resolve — the page will redirect
-                # when cf_clearance cookie is set
-                try:
-                    await page.wait_for_url(
-                        f"{PORTAL_BASE_URL}/portal/**",
-                        timeout=CF_CHALLENGE_TIMEOUT * 1000,
+                # Check if we hit a Cloudflare challenge
+                content = await page.content()
+                if not is_cloudflare_challenge(content):
+                    self._log.info("No Cloudflare challenge detected")
+                    return True
+
+                self._log.info("Cloudflare challenge detected, polling for cf_clearance cookie")
+
+                # Poll for cf_clearance cookie — the definitive signal that
+                # the challenge has been solved.  Cloudflare's JS executes
+                # the challenge in the background and sets this cookie when
+                # done.  Polling the cookie is more reliable than wait_for_url
+                # because the URL does not always change after challenge
+                # resolution.
+                solved = await self._poll_cf_clearance(context)
+
+                if solved:
+                    self._log.info(
+                        "Cloudflare challenge solved via cf_clearance cookie",
+                        attempt=attempt,
                     )
-                except Exception:
-                    # Check if we're still on a challenge page
-                    content = await page.content()
-                    if is_cloudflare_challenge(content):
-                        self._log.error(
-                            "Cloudflare challenge not resolved within timeout",
-                            timeout_seconds=CF_CHALLENGE_TIMEOUT,
-                        )
-                        return False
+                    return True
 
-            self._log.info("Cloudflare challenge solved or not present")
-            return True
+                # Cookie polling timed out — check if the page content
+                # changed even without the cookie (some Cloudflare configs
+                # don't set cf_clearance).
+                content = await page.content()
+                if not is_cloudflare_challenge(content):
+                    self._log.info(
+                        "Cloudflare challenge resolved (page content changed)",
+                        attempt=attempt,
+                    )
+                    return True
 
-        except Exception as exc:
-            self._log.error("Error during Cloudflare challenge", error=str(exc))
-            return False
+                self._log.warning(
+                    "Cloudflare challenge not resolved on this attempt",
+                    attempt=attempt,
+                    timeout_seconds=CF_CHALLENGE_TIMEOUT,
+                )
+
+            except Exception as exc:
+                self._log.warning(
+                    "Error during Cloudflare challenge attempt",
+                    attempt=attempt,
+                    error=str(exc),
+                )
+
+            # Brief pause before retrying to let Cloudflare state settle
+            if attempt < CF_MAX_RETRIES:
+                await asyncio.sleep(3.0)
+
+        self._log.error(
+            "Failed to solve Cloudflare challenge after all retries",
+            max_retries=CF_MAX_RETRIES,
+        )
+        return False
+
+    async def _poll_cf_clearance(self, context: Any) -> bool:
+        """Poll for the cf_clearance cookie until timeout.
+
+        Returns True if the cookie appears within ``CF_CHALLENGE_TIMEOUT``
+        seconds, False otherwise.
+        """
+        elapsed = 0.0
+        while elapsed < CF_CHALLENGE_TIMEOUT:
+            if await has_cf_clearance(context):
+                return True
+            await asyncio.sleep(CF_POLL_INTERVAL)
+            elapsed += CF_POLL_INTERVAL
+        return False
 
     async def _fetch_case_ruling(self, page: Any, case_number: str) -> CapturedDocument | None:
         """Search for a case by number and extract the tentative ruling.
