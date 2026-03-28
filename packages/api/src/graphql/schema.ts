@@ -193,6 +193,10 @@ export const typeDefs = `#graphql
     state: String
     judgeName: String
     hearingDate: String
+    """Motion type slug, e.g. "msj", "demurrer". May be null if not extracted."""
+    motionType: String
+    """Outcome slug, e.g. "granted", "denied". May be null if not extracted."""
+    outcome: String
     """Highlighted excerpt from the ruling text (HTML with <mark> tags), or summary fallback for filter-only queries."""
     excerpt: String
     """Relevance score (only present for full-text queries)."""

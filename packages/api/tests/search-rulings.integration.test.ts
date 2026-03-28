@@ -154,11 +154,14 @@ async function seedOpenSearch(): Promise<void> {
     mappings: {
       properties: {
         case_number: { type: 'keyword' },
+        case_title: { type: 'keyword' },
         court: { type: 'keyword' },
         county: { type: 'keyword' },
         state: { type: 'keyword' },
         judge_name: { type: 'keyword' },
         hearing_date: { type: 'date' },
+        motion_type: { type: 'keyword' },
+        outcome: { type: 'keyword' },
         ruling_text: { type: 'text', analyzer: 'ruling_text_analyzer' },
         document_id: { type: 'keyword' },
         s3_key: { type: 'keyword', index: false },
@@ -183,11 +186,14 @@ async function seedOpenSearch(): Promise<void> {
     {
       _id: docId1,
       case_number: '23STCV01234',
+      case_title: 'Doe v. Roe',
       court: `Superior Court of California, County of ${SEARCH_COUNTY}`,
       county: SEARCH_COUNTY,
       state: 'CA',
       judge_name: 'Johnson, Robert M.',
       hearing_date: '2026-02-10',
+      motion_type: 'msj',
+      outcome: 'granted',
       ruling_text:
         'TENTATIVE RULING: Defendant motion for summary judgment is GRANTED. The court finds no triable issue of material fact.',
       document_id: docId1,
@@ -198,11 +204,14 @@ async function seedOpenSearch(): Promise<void> {
     {
       _id: docId2,
       case_number: '23STCV01234',
+      case_title: 'Doe v. Roe',
       court: `Superior Court of California, County of ${SEARCH_COUNTY}`,
       county: SEARCH_COUNTY,
       state: 'CA',
       judge_name: 'Johnson, Robert M.',
       hearing_date: '2026-02-11',
+      motion_type: 'demurrer',
+      outcome: 'denied',
       ruling_text:
         'TENTATIVE RULING: Demurrer to the complaint is OVERRULED. Plaintiff has sufficiently alleged fraud with specificity.',
       document_id: docId2,
@@ -482,8 +491,8 @@ describe('searchRulings — integration', () => {
         searchRulings(filters: { county: "${SEARCH_COUNTY}" }) {
           edges {
             node {
-              rulingId caseNumber court county state
-              judgeName hearingDate excerpt score
+              rulingId caseNumber caseTitle court county state
+              judgeName hearingDate motionType outcome excerpt score
             }
             cursor
           }
@@ -502,13 +511,34 @@ describe('searchRulings — integration', () => {
       const node = edges[0].node;
       expect(node.rulingId).toBeDefined();
       expect(node.caseNumber).toBe('23STCV01234');
+      expect(node.caseTitle).toBe('Doe v. Roe');
       expect(node.county).toBe(SEARCH_COUNTY);
       expect(node.state).toBe('CA');
       expect(node.judgeName).toBe('Johnson, Robert M.');
       expect(node.hearingDate).toBeDefined();
+      // motionType and outcome are returned from OpenSearch (not null for seeded data)
+      expect(node.motionType).toBeDefined();
+      expect(node.outcome).toBeDefined();
       expect(typeof edges[0].cursor).toBe('string');
       expect(typeof (conn.pageInfo as Record<string, unknown>).hasNextPage).toBe('boolean');
       expect(typeof conn.totalHits).toBe('number');
+    });
+
+    it('returns motionType and outcome values from OpenSearch', async () => {
+      const body = await gql(`{
+        searchRulings(query: "summary judgment") {
+          edges { node { rulingId motionType outcome } }
+        }
+      }`);
+      expect(body.errors).toBeUndefined();
+      const conn = body.data?.searchRulings as Record<string, unknown>;
+      const edges = conn.edges as Array<{
+        node: { rulingId: string; motionType: string | null; outcome: string | null };
+      }>;
+      const hit = edges.find((e) => e.node.rulingId === rulingId1);
+      expect(hit).toBeDefined();
+      expect(hit!.node.motionType).toBe('msj');
+      expect(hit!.node.outcome).toBe('granted');
     });
 
     it('matches all results when no query or filters provided', async () => {

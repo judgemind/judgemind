@@ -35,6 +35,8 @@ export interface RulingSearchHit {
   state: string | null;
   judgeName: string | null;
   hearingDate: string | null;
+  motionType: string | null;
+  outcome: string | null;
   excerpt: string | null;
   score: number | null;
 }
@@ -140,7 +142,7 @@ export async function searchRulings(
     query: osQuery,
     sort,
     size: limit + 1, // fetch one extra to determine hasNextPage
-    _source: ['case_number', 'case_title', 'court', 'county', 'state', 'judge_name', 'hearing_date', 'document_id', 'summary'],
+    _source: ['case_number', 'case_title', 'court', 'county', 'state', 'judge_name', 'hearing_date', 'motion_type', 'outcome', 'document_id', 'summary'],
     track_total_hits: true,
   };
 
@@ -201,6 +203,8 @@ export async function searchRulings(
         state: (src.state as string) ?? null,
         judgeName: (src.judge_name as string) ?? null,
         hearingDate: (src.hearing_date as string) ?? null,
+        motionType: (src.motion_type as string) ?? null,
+        outcome: (src.outcome as string) ?? null,
         excerpt: hit.highlight?.ruling_text?.[0] ?? (src.summary as string) ?? null,
         score: hit._score ?? null,
       },
