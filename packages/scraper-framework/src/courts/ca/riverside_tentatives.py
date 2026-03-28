@@ -60,7 +60,12 @@ _LINK_TEXT_RE = re.compile(
 # Case numbers like "CVPS2306157", "CVRI2412345", "RIC1904113", "MCC2012345"
 # CV-prefixed: CV + 2-4 letter location code + 6-8 digits (e.g. CVPS2306157)
 # Location-prefixed: RIC, MCC, PSC, SWC, INC + 0-4 letters + 6-10 digits
-_CASE_NUMBER_RE = re.compile(r"\b(?:CV[A-Z]{2,4}|(?:RIC|MCC|PSC|SWC|INC)[A-Z]{0,4})\d{6,10}\b")
+# Additional prefixes (#2192): CIV (civil), MVC (motor vehicle collision),
+#   TEC (Temecula), UDPS (unlawful detainer Palm Springs)
+_CASE_NUMBER_RE = re.compile(
+    r"\b(?:CV[A-Z]{2,4}|(?:RIC|MCC|PSC|SWC|INC|CIV|MVC|TEC|UDPS)[A-Z]{0,4})\d{6,10}\b",
+    re.IGNORECASE,
+)
 
 
 # Hearing date from PDF text:
