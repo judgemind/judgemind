@@ -23,8 +23,10 @@ import pytest
 from framework.llm_extractor import (
     LlmExtractor,
     _create_google_client,
+    _deduplicate_ruling_texts,
     _extract_case_number_from_info,
     _extract_case_title_from_info,
+    _is_calendar_header,
     _is_new_case,
     _join_page_rows,
     _parse_page_rows,
@@ -604,6 +606,262 @@ class TestJoinPageRows:
         assert len(rulings) == 2
         assert "Department C25" not in (rulings[0].extracted_case_title or "")
         assert rulings[1].extracted_case_number == "2024-00002"
+
+
+# ---------------------------------------------------------------------------
+# Calendar header detection tests (#2096)
+# ---------------------------------------------------------------------------
+
+
+class TestIsCalendarHeader:
+    """Tests for _is_calendar_header function (#2096)."""
+
+    def test_oc_department_header(self) -> None:
+        """Standard OC calendar header with department info."""
+        text = (
+            "Superior Court of the State of California County of Orange "
+            "TENTATIVE RULINGS DEPARTMENT C27 Judge Thomas S. McConville "
+            "February 23, 2026 at 2:00 p.m."
+        )
+        assert _is_calendar_header(text) is True
+
+    def test_dept_abbreviation(self) -> None:
+        """Header using DEPT. abbreviation."""
+        text = "TENTATIVE RULINGS DEPT. C28 Judge Jane Smith March 1, 2026"
+        assert _is_calendar_header(text) is True
+
+    def test_dept_no_period(self) -> None:
+        """Header using DEPT without period."""
+        text = "TENTATIVE RULINGS DEPT C25 Hearing Date: March 1, 2026"
+        assert _is_calendar_header(text) is True
+
+    def test_ruling_singular(self) -> None:
+        """Header with singular RULING."""
+        text = "TENTATIVE RULING DEPARTMENT C10 Judge Bob Johnson"
+        assert _is_calendar_header(text) is True
+
+    def test_normal_ruling_text(self) -> None:
+        """Normal ruling text is not a calendar header."""
+        text = (
+            "The motion for summary adjudication is DENIED. "
+            "Defendant has not met their burden of proof."
+        )
+        assert _is_calendar_header(text) is False
+
+    def test_empty_text(self) -> None:
+        """Empty text is not a calendar header."""
+        assert _is_calendar_header("") is False
+        assert _is_calendar_header(None) is False
+
+    def test_text_mentioning_department_in_ruling(self) -> None:
+        """Ruling text that mentions a department in context is not a header."""
+        text = "The Court finds that Defendant's motion to transfer to Department C25 is DENIED."
+        assert _is_calendar_header(text) is False
+
+    def test_numeric_department(self) -> None:
+        """Header with purely numeric department (e.g., DEPARTMENT 12)."""
+        text = "TENTATIVE RULINGS DEPARTMENT 12 Judge Smith"
+        assert _is_calendar_header(text) is True
+
+
+class TestDeduplicateRulingTexts:
+    """Tests for _deduplicate_ruling_texts function (#2096)."""
+
+    def test_no_duplicates(self) -> None:
+        """Unique ruling texts are not changed."""
+        from framework.llm_schema import ExtractedRuling
+
+        rulings = [
+            ExtractedRuling(
+                extracted_case_number="2024-00001",
+                ruling_text="A" * 300,
+            ),
+            ExtractedRuling(
+                extracted_case_number="2024-00002",
+                ruling_text="B" * 300,
+            ),
+        ]
+        result = _deduplicate_ruling_texts(rulings)
+        assert result[0].ruling_text is not None
+        assert result[1].ruling_text is not None
+
+    def test_duplicate_texts_nulled(self) -> None:
+        """Duplicate ruling texts are nulled on subsequent occurrences."""
+        from framework.llm_schema import ExtractedRuling
+
+        same_text = "X" * 300
+        rulings = [
+            ExtractedRuling(
+                extracted_case_number="2024-00001",
+                ruling_text=same_text,
+            ),
+            ExtractedRuling(
+                extracted_case_number="2024-00002",
+                ruling_text=same_text,
+            ),
+            ExtractedRuling(
+                extracted_case_number="2024-00003",
+                ruling_text=same_text,
+            ),
+        ]
+        result = _deduplicate_ruling_texts(rulings)
+        assert result[0].ruling_text == same_text
+        assert result[1].ruling_text is None
+        assert result[2].ruling_text is None
+
+    def test_short_duplicates_exempt(self) -> None:
+        """Short duplicate texts (< 200 chars) are not deduplicated."""
+        from framework.llm_schema import ExtractedRuling
+
+        short_text = "GRANTED."
+        rulings = [
+            ExtractedRuling(
+                extracted_case_number="2024-00001",
+                ruling_text=short_text,
+            ),
+            ExtractedRuling(
+                extracted_case_number="2024-00002",
+                ruling_text=short_text,
+            ),
+        ]
+        result = _deduplicate_ruling_texts(rulings)
+        assert result[0].ruling_text == short_text
+        assert result[1].ruling_text == short_text
+
+    def test_none_texts_ignored(self) -> None:
+        """Rulings with None text are not considered for deduplication."""
+        from framework.llm_schema import ExtractedRuling
+
+        rulings = [
+            ExtractedRuling(
+                extracted_case_number="2024-00001",
+                ruling_text=None,
+            ),
+            ExtractedRuling(
+                extracted_case_number="2024-00002",
+                ruling_text="A" * 300,
+            ),
+        ]
+        result = _deduplicate_ruling_texts(rulings)
+        assert result[0].ruling_text is None
+        assert result[1].ruling_text is not None
+
+    def test_preserves_all_fields(self) -> None:
+        """Deduplication preserves ALL non-ruling_text fields including parties, outcome, etc."""
+        from framework.llm_schema import (
+            ExtractedParty,
+            ExtractedRuling,
+            ExtractionOutcome,
+            FieldConfidence,
+        )
+
+        same_text = "Y" * 300
+        parties = [ExtractedParty(name="Smith", role="plaintiff")]
+        confidence = FieldConfidence(case_number="high", ruling_text="high")
+        rulings = [
+            ExtractedRuling(
+                extracted_case_number="2024-00001",
+                extracted_case_title="Alpha v. Beta",
+                extracted_judge_name="Judge Smith",
+                department="C25",
+                hearing_date="2026-03-01",
+                ruling_text=same_text,
+                extracted_parties=parties,
+                motion_type="msj",
+                outcome=ExtractionOutcome.GRANTED,
+                case_type="civil",
+                confidence=confidence,
+            ),
+            ExtractedRuling(
+                extracted_case_number="2024-00002",
+                extracted_case_title="Gamma v. Delta",
+                extracted_judge_name="Judge Smith",
+                department="C25",
+                hearing_date="2026-03-01",
+                ruling_text=same_text,
+                extracted_parties=parties,
+                motion_type="demurrer",
+                outcome=ExtractionOutcome.DENIED,
+                case_type="civil",
+                confidence=confidence,
+            ),
+        ]
+        result = _deduplicate_ruling_texts(rulings)
+        # First keeps text.
+        assert result[0].ruling_text == same_text
+        assert result[0].extracted_case_number == "2024-00001"
+        assert result[0].extracted_case_title == "Alpha v. Beta"
+        # Second is nulled but keeps ALL other fields.
+        assert result[1].ruling_text is None
+        assert result[1].extracted_case_number == "2024-00002"
+        assert result[1].extracted_case_title == "Gamma v. Delta"
+        assert result[1].extracted_judge_name == "Judge Smith"
+        assert result[1].department == "C25"
+        assert result[1].extracted_parties == parties
+        assert result[1].motion_type == "demurrer"
+        assert result[1].outcome == ExtractionOutcome.DENIED
+        assert result[1].case_type == "civil"
+        assert result[1].confidence == confidence
+
+
+class TestJoinPageRowsContamination:
+    """Tests for _join_page_rows calendar header filtering and dedup (#2096)."""
+
+    def test_calendar_header_ruling_text_filtered(self) -> None:
+        """Ruling text that is actually a calendar header is set to None."""
+        rows = [
+            {
+                "entry_number": 1,
+                "case_info": "2024-00001 Smith v. Jones",
+                "ruling_text": (
+                    "Superior Court of the State of California "
+                    "County of Orange TENTATIVE RULINGS DEPARTMENT C27 "
+                    "Judge Thomas S. McConville February 23, 2026"
+                ),
+            },
+        ]
+        rulings = _join_page_rows(rows)
+        assert len(rulings) == 1
+        assert rulings[0].ruling_text is None
+
+    def test_duplicate_ruling_text_deduplicated(self) -> None:
+        """Duplicate ruling texts across cases are nulled after the first."""
+        long_text = ("The motion for summary judgment is hereby DENIED. " * 10).strip()
+        rows = [
+            {
+                "entry_number": 1,
+                "case_info": "2024-00001 Alpha v. Beta",
+                "ruling_text": long_text,
+            },
+            {
+                "entry_number": 2,
+                "case_info": "2024-00002 Gamma v. Delta",
+                "ruling_text": long_text,
+            },
+        ]
+        rulings = _join_page_rows(rows)
+        assert len(rulings) == 2
+        assert rulings[0].ruling_text == long_text
+        assert rulings[1].ruling_text is None
+
+    def test_non_contaminated_rulings_unchanged(self) -> None:
+        """Normal cases with unique, non-header text are not affected."""
+        rows = [
+            {
+                "entry_number": 1,
+                "case_info": "2024-00001 Alpha v. Beta",
+                "ruling_text": "The motion is GRANTED.",
+            },
+            {
+                "entry_number": 2,
+                "case_info": "2024-00002 Gamma v. Delta",
+                "ruling_text": "The demurrer is OVERRULED.",
+            },
+        ]
+        rulings = _join_page_rows(rows)
+        assert len(rulings) == 2
+        assert rulings[0].ruling_text == "The motion is GRANTED."
+        assert rulings[1].ruling_text == "The demurrer is OVERRULED."
 
 
 # ---------------------------------------------------------------------------

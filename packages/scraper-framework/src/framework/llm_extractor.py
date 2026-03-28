@@ -167,6 +167,73 @@ _COURT_NAME_RE = re.compile(
     re.IGNORECASE,
 )
 
+# ---------------------------------------------------------------------------
+# Post-processing: calendar header detection and deduplication (#2096)
+# ---------------------------------------------------------------------------
+
+# Pattern to detect calendar header / boilerplate text that the LLM sometimes
+# returns as ruling_text.  These contain the court name + "TENTATIVE RULINGS"
+# + department info, and are not actual case rulings.
+_CALENDAR_HEADER_RE = re.compile(
+    r"TENTATIVE\s+RULINGS?\s+"
+    r"(?:DEPARTMENT|DEPT\.?)\s+[A-Z]?\d+",
+    re.IGNORECASE,
+)
+
+# Minimum ruling text length to consider for deduplication.  Very short texts
+# (e.g. "GRANTED." or "DENIED.") may legitimately appear on multiple cases.
+_DEDUP_MIN_LENGTH = 200
+
+
+def _is_calendar_header(text: str | None) -> bool:
+    """Return True if ``text`` looks like a calendar header, not a ruling.
+
+    Calendar headers contain boilerplate like "TENTATIVE RULINGS DEPARTMENT C27"
+    and are not actual case ruling text.  The LLM sometimes assigns these as
+    ``ruling_text`` for individual cases (#2096).
+    """
+    if not text:
+        return False
+    return bool(_CALENDAR_HEADER_RE.search(text))
+
+
+def _deduplicate_ruling_texts(
+    rulings: list[ExtractedRuling],
+) -> list[ExtractedRuling]:
+    """Null out duplicate ruling_text across cases in the same PDF (#2096).
+
+    When the LLM produces the same ruling text for multiple different cases,
+    only the first occurrence keeps its text.  Subsequent duplicates get
+    ``ruling_text = None`` so they are not stored as cross-contaminated.
+
+    Short texts (< ``_DEDUP_MIN_LENGTH`` chars) are exempt because legitimate
+    identical rulings (e.g. "GRANTED." or "Motion is denied.") can appear
+    on multiple cases.
+    """
+    import hashlib
+
+    seen_hashes: dict[str, int] = {}  # hash -> index of first occurrence
+    for i, ruling in enumerate(rulings):
+        text = ruling.ruling_text
+        if not text or len(text) < _DEDUP_MIN_LENGTH:
+            continue
+        text_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        if text_hash in seen_hashes:
+            # Duplicate — null out the text on this ruling.
+            # Use model_copy to preserve all fields (extracted_parties,
+            # motion_type, outcome, case_type, confidence, etc.).
+            rulings[i] = ruling.model_copy(update={"ruling_text": None})
+            logger.warning(
+                "llm_extractor.dedup_ruling_text",
+                case_number=ruling.extracted_case_number,
+                duplicate_of_index=seen_hashes[text_hash],
+                text_length=len(text),
+            )
+        else:
+            seen_hashes[text_hash] = i
+
+    return rulings
+
 
 # ---------------------------------------------------------------------------
 # LlmExtractor
@@ -1146,6 +1213,17 @@ def _join_page_rows(
         case_title = _extract_case_title_from_info(case["case_info"])
         ruling_text = case["ruling_text"].strip() or None
 
+        # Post-processing: filter calendar header text (#2096).
+        # The LLM sometimes returns calendar header/boilerplate as the
+        # ruling_text for individual cases.  Detect and null it out.
+        if _is_calendar_header(ruling_text):
+            logger.warning(
+                "llm_extractor.calendar_header_filtered",
+                case_number=case_number,
+                text_preview=(ruling_text or "")[:100],
+            )
+            ruling_text = None
+
         # Apply metadata overrides for judge_name, department, hearing_date.
         judge_name: str | None = None
         department: str | None = None
@@ -1165,6 +1243,11 @@ def _join_page_rows(
                 ruling_text=ruling_text,
             )
         )
+
+    # Post-processing: deduplicate identical ruling texts (#2096).
+    # The LLM sometimes produces the same ruling text for multiple cases
+    # in the same PDF.  Keep only the first occurrence; null out duplicates.
+    rulings = _deduplicate_ruling_texts(rulings)
 
     return rulings
 
