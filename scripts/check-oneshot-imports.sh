@@ -35,9 +35,6 @@ LOCAL_ONLY=(
     "log_ralph_summary.py"      # Ralph loop summary — runs locally in worktree
     "update-coverage-baselines.py"  # CI-only — runs in GitHub Actions runner
     "validate-dq-baselines.py"      # CI-only — validates baselines JSON structure
-    "run_judge_cleanup.py"          # Orchestrator — runs sibling scripts via subprocess
-    "backfill_la_entity_descriptors.py"  # One-off backfill — imports from scraper-framework (#1397)
-    "backfill_la_header_titles.py"       # One-off backfill — imports from scraper-framework (#1397)
     "reingest_all_llm.py"               # Orchestrator — imports reingest_from_s3; on ECS use reingest_from_s3.py directly (#1474)
 )
 
