@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # venv: scraper-framework
+# one-off: true
 """Backfill ruling_text_html for existing rulings using LLM formatting.
 
 Connects to the database using the DATABASE_URL environment variable
