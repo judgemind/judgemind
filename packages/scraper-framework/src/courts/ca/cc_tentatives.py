@@ -61,6 +61,7 @@ import structlog
 from bs4 import BeautifulSoup
 
 from framework import CapturedDocument, ContentFormat, ScheduleWindow, ScraperConfig
+from framework.extraction_config import get_county_extraction_config
 
 from .pdf_link_scraper import PdfLinkScraper, _extract_pdf_text
 
@@ -161,10 +162,6 @@ def _cc_llm_enabled() -> bool:
     )
 
 
-# Default LLM provider and model for CC text extraction.
-_CC_LLM_PROVIDER = "google"
-_CC_LLM_MODEL = "gemini-2.5-flash-lite"
-
 # Map LLM outcome values to lowercase enum values matching the DB schema.
 _CC_OUTCOME_MAP: dict[str | None, str | None] = {
     "granted": "granted",
@@ -194,159 +191,12 @@ class CCSplitRuling:
     parties: list[dict[str, str]] = dataclass_field(default_factory=list)
 
 
-CC_SYSTEM_PROMPT = (
-    "You are a legal document parser for California court "
-    "tentative rulings from Contra Costa County Superior Court.\n\n"
-    "You will receive the full text extracted from a PDF containing "
-    "tentative rulings for one department.  Your job is to identify "
-    "EVERY individual case entry in the document and extract "
-    "structured data for each.\n\n"
-    "## Contra Costa Document Format\n\n"
-    "Contra Costa PDFs have two distinct formats:\n\n"
-    "### Format A: Civil departments (e.g., Dept 14, 16)\n"
-    "1. **Header**: Court name, location, department number, "
-    "judicial officer name, and hearing date, followed by "
-    "boilerplate instructions about contesting the tentative.\n"
-    "2. **Numbered case entries**: Each case starts with a numbered "
-    "line like:\n"
-    "   `1. 9:00 AM CASE NUMBER: L23-06679`\n"
-    "   followed by:\n"
-    "   - `CASE NAME: DISCOVER BANK VS. GERALD GILCHRIST`\n"
-    "   - `*HEARING ON MOTION IN RE: ...` (the motion description)\n"
-    "   - `FILED BY: ...`\n"
-    "   - `*TENTATIVE RULING:*` followed by the ruling text\n"
-    "3. **Sub-sections**: Some departments have section headers "
-    "like 'Law & Motion', 'Courtroom Clerk's Session', "
-    "'Discovery Law & Motion' that divide the calendar.\n"
-    "4. **Same case, multiple motions**: A single case number may "
-    "appear on multiple lines (e.g., lines 7, 8, 9 all for "
-    "C23-02436). Each line is a SEPARATE ruling entry because "
-    "each addresses a different motion.\n\n"
-    "### Format B: Probate departments (e.g., Dept 30)\n"
-    "1. **Header**: Court name, location (PR - MARTINEZ-WAKEFIELD "
-    "TAYLOR COURTHOUSE), calendar date, department, judicial "
-    "officer.\n"
-    "2. **Numbered entries**: Each case starts with:\n"
-    "   `1. N25-2307 IN THE MATTER OF: AJAY BHALLA`\n"
-    "   or `5. MSP19-01440 CONS. OF MARIE ROST`\n"
-    "   or `7. P24-00230 CONSERVATORSHIP OF: JUNE STONE`\n"
-    "   followed by:\n"
-    "   - Hearing time and type\n"
-    "   - Examiner notes / ruling text\n"
-    "3. **Sub-entries**: Some entries have A/B sub-entries "
-    "(e.g., 17A and 17B for the same case number with different "
-    "petitions, or 22A and 22B). Each sub-entry is a SEPARATE "
-    "ruling entry.\n"
-    "4. **Page headers repeat**: The court header block repeats "
-    "at the top of every page in probate PDFs. Ignore these "
-    "repeated headers.\n\n"
-    "## Case Number Formats\n\n"
-    "Contra Costa uses several case number formats:\n"
-    "- `C##-#####` -- civil unlimited (e.g., C24-02490, C23-00908)\n"
-    "- `L##-#####` -- limited civil (e.g., L23-06679, L25-01552)\n"
-    "- `N##-####` -- name change / probate (e.g., N25-2307)\n"
-    "- `P##-#####` -- probate (e.g., P23-01484, P26-00022)\n"
-    "- `RS##-####` -- Rossmoor/Richmond (e.g., RS24-0953)\n"
-    "- `A##-#####` -- adoption (e.g., A26-00006)\n"
-    "- `MS####` -- miscellaneous (e.g., MS5031)\n"
-    "- `MSP##-#####` -- miscellaneous probate (e.g., MSP19-01440)\n\n"
-    "## Rules\n\n"
-    "1. Return one ruling entry per numbered line item in the "
-    "document. If the same case number appears on multiple "
-    "lines with different motions, return each as a SEPARATE "
-    "ruling entry.\n"
-    "2. Extract the case number EXACTLY as it appears in the PDF.\n"
-    "3. For case_title:\n"
-    "   - Civil: construct 'Plaintiff v. Defendant' from the "
-    "CASE NAME line. Convert ALL-CAPS to title case.\n"
-    "   - Probate: use the name as given (e.g., 'In the Matter "
-    "of: Ajay Bhalla', 'Conservatorship of: June Stone'). "
-    "Convert ALL-CAPS to title case.\n"
-    "4. For ruling_text: include the COMPLETE text of the ruling "
-    "or examiner notes for that entry. Preserve it VERBATIM. "
-    "Do NOT include text from other entries.\n"
-    "5. Skip the department header boilerplate (appearance "
-    "instructions, Zoom links, email addresses, etc.) -- "
-    "only extract from the case entries.\n"
-    "6. For probate entries where the ruling is just procedural "
-    "notes (e.g., 'Need: 1. Appearances ...'), still extract "
-    "it as the ruling_text.\n"
-    "7. For entries with no case name (e.g., entry 21 in Dept 30 "
-    "with only 'A26-00006' and no title after it), set "
-    "case_title to null.\n\n"
-    "## Parties\n\n"
-    "For civil cases, extract plaintiff(s) and defendant(s) from "
-    "the CASE NAME. "
-    'Each party is {"name": "...", "role": "plaintiff", '
-    '"confidence": "high"} or '
-    '{"name": "...", "role": "defendant", '
-    '"confidence": "high"}.\n'
-    "For probate cases, extract the subject of the petition "
-    "as a party with role 'petitioner' or 'subject'.\n\n"
-    "## Outcome taxonomy\n\n"
-    "Use EXACTLY one of these values:\n"
-    "- granted -- motion/petition was fully granted (including "
-    "'petition approved')\n"
-    "- denied -- motion was fully denied\n"
-    "- granted_in_part -- partially granted\n"
-    "- denied_in_part -- partially denied\n"
-    "- moot -- motion is moot\n"
-    "- continued -- hearing was postponed/continued\n"
-    "- off_calendar -- hearing removed from calendar, vacated, "
-    "or dismissed\n"
-    "- submitted -- taken under submission\n"
-    "- other -- none of the above fit (use for procedural notes "
-    "like 'Need appearances', entries with examiner notes "
-    "listing required items, etc.)\n\n"
-    "For 'overruled' (demurrers), map to 'denied'.\n"
-    "For 'sustained' (demurrers), map to 'granted'.\n"
-    "For entries that say 'Drop, per Court approved Request for "
-    "Dismissal', map to 'off_calendar'.\n\n"
-    "## Motion type labels\n\n"
-    "Use a short descriptive label. Common values:\n"
-    "msj, msj_partial, demurrer, motion_to_compel, "
-    "motion_to_strike, motion_for_leave_to_amend, "
-    "motion_for_sanctions, motion_for_attorney_fees, "
-    "motion_to_be_relieved_as_counsel, motion_to_vacate, "
-    "motion_to_enter_judgment, motion_to_set_aside, "
-    "motion_to_continue_trial, motion_for_protective_order, "
-    "motion_for_leave_to_file_cross_complaint, "
-    "motion_for_judgment_on_pleadings, "
-    "case_management_conference, "
-    "petition, status_hearing, other.\n\n"
-    "## Output format\n\n"
-    "Respond with ONLY a JSON object, no other text:\n\n"
-    "{\n"
-    '  "extracted_judge_name": "First M. Last" or null,\n'
-    '  "hearing_date": "YYYY-MM-DD" or null,\n'
-    '  "department": "14" or "16" or "30" or null,\n'
-    '  "rulings": [\n'
-    "    {\n"
-    '      "line_number": 1,\n'
-    '      "extracted_case_number": "L23-06679" or null,\n'
-    '      "extracted_case_title": "Discover Bank v. Gerald '
-    'Gilchrist" or null,\n'
-    '      "case_type": "civil" or "probate" or null,\n'
-    '      "outcome": "granted" or null,\n'
-    '      "motion_type": "motion_to_compel" or null,\n'
-    '      "ruling_text": "Full verbatim text..." or null,\n'
-    '      "extracted_parties": [\n'
-    '        {"name": "Discover Bank", "role": "plaintiff", '
-    '"confidence": "high"},\n'
-    '        {"name": "Gerald Gilchrist", "role": "defendant", '
-    '"confidence": "high"}\n'
-    "      ]\n"
-    "    }\n"
-    "  ]\n"
-    "}"
-)
-
-
 def _cc_llm_extract_rulings(pdf_text: str) -> list[CCSplitRuling] | None:
     """Extract rulings from CC department PDF text using an LLM.
 
-    Sends pdfplumber-extracted text to the LLM with a CC-specific system
-    prompt, and parses the JSON response into ``CCSplitRuling`` objects.
+    Sends pdfplumber-extracted text to the LLM with the Contra Costa system
+    prompt from ``framework.extraction_config``, and parses the JSON response
+    into ``CCSplitRuling`` objects.
 
     Returns a list of ``CCSplitRuling`` objects on success, or ``None``
     if the LLM call fails or the response cannot be parsed.  The caller
@@ -357,12 +207,15 @@ def _cc_llm_extract_rulings(pdf_text: str) -> list[CCSplitRuling] | None:
     if not pdf_text or not pdf_text.strip():
         return None
 
+    cc_config = get_county_extraction_config("CA", "Contra Costa")
+    assert cc_config is not None, "Contra Costa must be registered in _COUNTY_CONFIGS"
+
     response = call_llm(
-        system_prompt=CC_SYSTEM_PROMPT,
+        system_prompt=cc_config.system_prompt,
         user_message=pdf_text,
-        provider=_CC_LLM_PROVIDER,
-        model=_CC_LLM_MODEL,
-        max_tokens=32768,
+        provider=cc_config.provider,
+        model=cc_config.model,
+        max_tokens=cc_config.max_output_tokens or 32768,
         timeout=60.0,
     )
 
