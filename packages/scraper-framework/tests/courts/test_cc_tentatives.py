@@ -251,23 +251,42 @@ def test_cc_courthouse_default() -> None:
 
 
 def test_cc_outcome_granted() -> None:
-    assert _cc_extract_outcome("The Motion is granted as set forth herein.") == "Granted"
+    assert _cc_extract_outcome("The Motion is granted as set forth herein.") == "granted"
 
 
 def test_cc_outcome_denied() -> None:
-    assert _cc_extract_outcome("The Motion is denied.") == "Denied"
+    assert _cc_extract_outcome("The Motion is denied.") == "denied"
 
 
 def test_cc_outcome_continued() -> None:
-    assert _cc_extract_outcome("The hearing is continued to April 1, 2026.") == "Continued"
+    assert _cc_extract_outcome("The hearing is continued to April 1, 2026.") == "continued"
+
+
+def test_cc_outcome_sustained() -> None:
+    """Sustained maps to 'granted' (demurrer sustained = motion granted)."""
+    assert _cc_extract_outcome("The demurrer is sustained.") == "granted"
+
+
+def test_cc_outcome_overruled() -> None:
+    """Overruled maps to 'denied' (demurrer overruled = motion denied)."""
+    assert _cc_extract_outcome("The demurrer is overruled.") == "denied"
+
+
+def test_cc_outcome_vacated() -> None:
+    """Vacated maps to 'off_calendar'."""
+    assert _cc_extract_outcome("The hearing is vacated.") == "off_calendar"
+
+
+def test_cc_outcome_moot() -> None:
+    assert _cc_extract_outcome("The motion is moot.") == "moot"
 
 
 def test_cc_outcome_petition_approved() -> None:
-    assert _cc_extract_outcome("Petition Approved\nProposed Order Submitted") == "Granted"
+    assert _cc_extract_outcome("Petition Approved\nProposed Order Submitted") == "granted"
 
 
 def test_cc_outcome_no_appearance() -> None:
-    assert _cc_extract_outcome("No Appearance Required") == "No Appearance Required"
+    assert _cc_extract_outcome("No Appearance Required") == "other"
 
 
 def test_cc_outcome_none() -> None:
