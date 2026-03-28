@@ -33,6 +33,8 @@ Parent: #155
 
 from __future__ import annotations
 
+import json
+import os
 import re
 import time
 from datetime import datetime
@@ -193,6 +195,139 @@ def parse_results_table(html: str) -> list[SearchResult]:
         )
 
     return results
+
+
+# ---------------------------------------------------------------------------
+# LLM extraction feature flag and configuration (#2055)
+# ---------------------------------------------------------------------------
+
+
+def _ventura_llm_enabled() -> bool:
+    """Return True when LLM-based extraction is enabled for Ventura rulings."""
+    return os.environ.get("ENABLE_VENTURA_LLM_EXTRACTION", "").lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+
+
+# Default LLM provider and model for Ventura text extraction.
+_VENTURA_LLM_PROVIDER = "google"
+_VENTURA_LLM_MODEL = "gemini-2.5-flash-lite"
+
+# Map LLM outcome values to normalized values matching the DB schema.
+_VENTURA_OUTCOME_MAP: dict[str | None, str | None] = {
+    "granted": "Granted",
+    "denied": "Denied",
+    "granted_in_part": "Granted in Part",
+    "denied_in_part": "Denied in Part",
+    "moot": "Moot",
+    "continued": "Continued",
+    "off_calendar": "Off Calendar",
+    "submitted": "Submitted",
+    "other": "Other",
+    None: None,
+}
+
+
+def _ventura_llm_extract(
+    text: str,
+    case_number: str | None = None,
+    motion_type: str | None = None,
+) -> dict[str, Any] | None:
+    """Extract structured fields from Ventura ruling document text using an LLM.
+
+    Sends the document text plus known metadata (case_number, motion_type)
+    to the LLM with the Ventura-specific system prompt, and parses the
+    flat JSON response into a dict.
+
+    Returns a dict with keys ``outcome``, ``case_title``, ``parties``,
+    ``ruling_text`` on success, or ``None`` if the LLM call fails or
+    the response cannot be parsed.
+    """
+    from framework.extraction_config import VENTURA_SYSTEM_PROMPT
+    from ingestion.llm_providers import call_llm
+
+    if not text or not text.strip():
+        return None
+
+    # Build user message with known metadata context.
+    parts: list[str] = []
+    meta_lines: list[str] = []
+    if case_number:
+        meta_lines.append(f"Case number: {case_number}")
+    if motion_type:
+        meta_lines.append(f"Motion type: {motion_type}")
+    if meta_lines:
+        parts.append("Known metadata:\n" + "\n".join(meta_lines))
+    parts.append(f"Document:\n\n{text}")
+    user_message = "\n\n".join(parts)
+
+    response = call_llm(
+        system_prompt=VENTURA_SYSTEM_PROMPT,
+        user_message=user_message,
+        provider=_VENTURA_LLM_PROVIDER,
+        model=_VENTURA_LLM_MODEL,
+        max_tokens=32768,
+        timeout=60.0,
+    )
+
+    if response is None:
+        logger.warning("ventura.llm_extraction_failed", reason="null_response")
+        return None
+
+    try:
+        raw = response.text.strip()
+        # Extract JSON object by finding the first { and last }.
+        # This is more robust than line-based fence stripping because
+        # it handles cases where fences and JSON share a line.
+        json_start = raw.find("{")
+        json_end = raw.rfind("}")
+        if json_start != -1 and json_end != -1 and json_end > json_start:
+            raw = raw[json_start : json_end + 1]
+
+        data = json.loads(raw)
+    except (json.JSONDecodeError, ValueError) as exc:
+        logger.warning("ventura.llm_parse_failed", error=str(exc))
+        return None
+
+    if not isinstance(data, dict):
+        logger.warning("ventura.llm_unexpected_shape", shape=type(data).__name__)
+        return None
+
+    # Normalize outcome using the mapping (case-insensitive).
+    raw_outcome = data.get("outcome")
+    outcome_key = raw_outcome.lower() if isinstance(raw_outcome, str) else raw_outcome
+    outcome = _VENTURA_OUTCOME_MAP.get(outcome_key)
+
+    # Parse parties list with validation.
+    raw_parties = data.get("parties", [])
+    parties: list[dict[str, str]] = []
+    if isinstance(raw_parties, list):
+        for p in raw_parties:
+            if isinstance(p, dict) and p.get("name") and p.get("role"):
+                name = str(p["name"]).strip()
+                if len(name) > 200 or "\n" in name or "\r" in name:
+                    continue
+                parties.append({"name": name, "role": str(p["role"])})
+
+    result: dict[str, Any] = {
+        "outcome": outcome,
+        "case_title": data.get("case_title"),
+        "parties": parties,
+        "ruling_text": data.get("ruling_text"),
+    }
+
+    logger.info(
+        "ventura.llm_extraction_success",
+        outcome=outcome,
+        parties_count=len(parties),
+        ruling_text_len=len(result["ruling_text"]) if result["ruling_text"] else 0,
+        input_tokens=response.input_tokens,
+        output_tokens=response.output_tokens,
+    )
+
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -384,10 +519,12 @@ class VenturaTentativeRulingsScraper(BaseScraper):
         """Parse additional fields from the downloaded document content.
 
         Most structured fields are already populated from the search results table.
-        This method attempts to extract ruling text, outcome, and case title from
-        the document content itself.  It also uses the department-to-judge mapping
-        (from ``dept_judge_map`` or ``court_directory``) to populate judge_name
-        when it is not already set.
+        This method attempts to extract ruling text, outcome, case title, and
+        parties from the document content — either via LLM extraction (when
+        enabled via ``ENABLE_VENTURA_LLM_EXTRACTION``) or regex fallbacks.
+
+        It also uses the department-to-judge mapping (from ``dept_judge_map``
+        or ``court_directory``) to populate judge_name when it is not already set.
         """
         if doc.raw_content:
             try:
@@ -397,11 +534,42 @@ class VenturaTentativeRulingsScraper(BaseScraper):
                     text = _extract_html_text(doc.raw_content)
 
                 if text:
-                    doc.ruling_text = text
+                    # LLM extraction path (#2055): when enabled, send
+                    # document text plus known metadata to the LLM.
+                    llm_used = False
+                    if _ventura_llm_enabled():
+                        llm_result = _ventura_llm_extract(
+                            text,
+                            case_number=doc.case_number,
+                            motion_type=doc.motion_type,
+                        )
+                        if llm_result is not None:
+                            llm_used = True
+                            doc.extra["_llm_extracted"] = True
+                            if llm_result.get("ruling_text"):
+                                doc.ruling_text = llm_result["ruling_text"]
+                            if llm_result.get("outcome"):
+                                doc.outcome = llm_result["outcome"]
+                            if llm_result.get("case_title"):
+                                doc.case_title = llm_result["case_title"]
+                            if llm_result.get("parties"):
+                                doc.parties = llm_result["parties"]
+
+                    # Regex fallback: fill in any fields that the LLM
+                    # did not populate (or if LLM was disabled/failed).
+                    if not doc.ruling_text:
+                        doc.ruling_text = text
                     if not doc.outcome:
                         doc.outcome = _extract_outcome(text)
                     if not doc.case_title:
                         doc.case_title = _extract_case_title(text)
+
+                    if not llm_used:
+                        # Log that regex path was used for debugging.
+                        self._log.debug(
+                            "ventura.regex_extraction",
+                            case_number=doc.case_number,
+                        )
             except Exception as exc:
                 self._log.warning(
                     "Document parse error",

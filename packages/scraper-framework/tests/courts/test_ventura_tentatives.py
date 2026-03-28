@@ -8,8 +8,10 @@ Fixtures:
 
 from __future__ import annotations
 
+import json
 from datetime import datetime
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 import httpx
 import pytest
@@ -21,6 +23,8 @@ from courts.ca.ventura_tentatives import (
     _extract_case_title,
     _extract_html_text,
     _extract_outcome,
+    _ventura_llm_enabled,
+    _ventura_llm_extract,
     extract_verification_token,
     parse_event_datetime,
     parse_results_table,
@@ -907,3 +911,476 @@ def test_ventura_default_search_dates_uses_pacific_timezone() -> None:
         assert str(tz_arg) == "America/Los_Angeles"
 
     assert len(docs) == 6
+
+
+# ---------------------------------------------------------------------------
+# LLM extraction feature flag (#2055)
+# ---------------------------------------------------------------------------
+
+
+def test_ventura_llm_disabled_by_default() -> None:
+    """LLM extraction is off when env var not set."""
+    with patch.dict("os.environ", {}, clear=True):
+        assert _ventura_llm_enabled() is False
+
+
+def test_ventura_llm_enabled_when_env_set() -> None:
+    """LLM extraction is on when ENABLE_VENTURA_LLM_EXTRACTION=1."""
+    with patch.dict("os.environ", {"ENABLE_VENTURA_LLM_EXTRACTION": "1"}):
+        assert _ventura_llm_enabled() is True
+
+
+def test_ventura_llm_enabled_true_value() -> None:
+    """LLM extraction is on when ENABLE_VENTURA_LLM_EXTRACTION=true."""
+    with patch.dict("os.environ", {"ENABLE_VENTURA_LLM_EXTRACTION": "true"}):
+        assert _ventura_llm_enabled() is True
+
+
+def test_ventura_llm_enabled_yes_value() -> None:
+    """LLM extraction is on when ENABLE_VENTURA_LLM_EXTRACTION=yes."""
+    with patch.dict("os.environ", {"ENABLE_VENTURA_LLM_EXTRACTION": "yes"}):
+        assert _ventura_llm_enabled() is True
+
+
+def test_ventura_llm_disabled_other_value() -> None:
+    """LLM extraction is off for non-truthy values."""
+    with patch.dict("os.environ", {"ENABLE_VENTURA_LLM_EXTRACTION": "0"}):
+        assert _ventura_llm_enabled() is False
+
+
+# ---------------------------------------------------------------------------
+# LLM extraction function (#2055)
+# ---------------------------------------------------------------------------
+
+
+def test_ventura_llm_extract_returns_none_on_empty_text() -> None:
+    """Empty text should return None without calling the LLM."""
+    assert _ventura_llm_extract("") is None
+    assert _ventura_llm_extract("   ") is None
+
+
+@patch("ingestion.llm_providers.call_llm")
+def test_ventura_llm_extract_parses_json(mock_call_llm: MagicMock) -> None:
+    """Valid JSON response should be parsed into a dict."""
+    mock_response = MagicMock()
+    mock_response.text = json.dumps(
+        {
+            "outcome": "granted",
+            "case_title": "Smith v. Jones",
+            "parties": [
+                {"name": "Smith", "role": "plaintiff", "confidence": "high"},
+                {"name": "Jones", "role": "defendant", "confidence": "high"},
+            ],
+            "ruling_text": "The motion is GRANTED.",
+        }
+    )
+    mock_response.input_tokens = 100
+    mock_response.output_tokens = 50
+    mock_call_llm.return_value = mock_response
+
+    result = _ventura_llm_extract("Some ruling text", case_number="2025CUBC040123")
+    assert result is not None
+    assert result["outcome"] == "Granted"
+    assert result["case_title"] == "Smith v. Jones"
+    assert len(result["parties"]) == 2
+    assert result["parties"][0]["name"] == "Smith"
+    assert result["ruling_text"] == "The motion is GRANTED."
+
+
+@patch("ingestion.llm_providers.call_llm")
+def test_ventura_llm_extract_returns_none_on_failure(mock_call_llm: MagicMock) -> None:
+    """None response from call_llm should return None."""
+    mock_call_llm.return_value = None
+    result = _ventura_llm_extract("Some ruling text")
+    assert result is None
+
+
+@patch("ingestion.llm_providers.call_llm")
+def test_ventura_llm_extract_returns_none_on_bad_json(mock_call_llm: MagicMock) -> None:
+    """Non-JSON response should return None."""
+    mock_response = MagicMock()
+    mock_response.text = "This is not JSON"
+    mock_call_llm.return_value = mock_response
+    result = _ventura_llm_extract("Some ruling text")
+    assert result is None
+
+
+@patch("ingestion.llm_providers.call_llm")
+def test_ventura_llm_extract_strips_code_fences(mock_call_llm: MagicMock) -> None:
+    """Markdown code fences should be stripped before parsing."""
+    mock_response = MagicMock()
+    mock_response.text = (
+        '```json\n{"outcome": "denied", "case_title": "A v. B",'
+        ' "parties": [], "ruling_text": "Denied."}\n```'
+    )
+    mock_response.input_tokens = 100
+    mock_response.output_tokens = 50
+    mock_call_llm.return_value = mock_response
+
+    result = _ventura_llm_extract("Some ruling text")
+    assert result is not None
+    assert result["outcome"] == "Denied"
+
+
+@patch("ingestion.llm_providers.call_llm")
+def test_ventura_llm_extract_maps_outcomes(mock_call_llm: MagicMock) -> None:
+    """LLM outcome values should be mapped to normalized display values."""
+    for llm_val, expected in [
+        ("granted", "Granted"),
+        ("denied", "Denied"),
+        ("granted_in_part", "Granted in Part"),
+        ("moot", "Moot"),
+        ("continued", "Continued"),
+        ("off_calendar", "Off Calendar"),
+    ]:
+        mock_response = MagicMock()
+        mock_response.text = json.dumps(
+            {
+                "outcome": llm_val,
+                "case_title": None,
+                "parties": [],
+                "ruling_text": "text",
+            }
+        )
+        mock_response.input_tokens = 100
+        mock_response.output_tokens = 50
+        mock_call_llm.return_value = mock_response
+
+        result = _ventura_llm_extract("Some text")
+        assert result is not None
+        assert result["outcome"] == expected, f"Expected {expected} for {llm_val}"
+
+
+@patch("ingestion.llm_providers.call_llm")
+def test_ventura_llm_extract_outcome_case_insensitive(mock_call_llm: MagicMock) -> None:
+    """Outcome mapping should be case-insensitive (handles title-cased LLM output)."""
+    for llm_val, expected in [
+        ("Granted", "Granted"),
+        ("DENIED", "Denied"),
+        ("Granted_In_Part", "Granted in Part"),
+    ]:
+        mock_response = MagicMock()
+        mock_response.text = json.dumps({
+            "outcome": llm_val,
+            "case_title": None,
+            "parties": [],
+            "ruling_text": "text",
+        })
+        mock_response.input_tokens = 100
+        mock_response.output_tokens = 50
+        mock_call_llm.return_value = mock_response
+
+        result = _ventura_llm_extract("Some text")
+        assert result is not None
+        assert result["outcome"] == expected, f"Expected {expected} for {llm_val}"
+
+
+@patch("ingestion.llm_providers.call_llm")
+def test_ventura_llm_extract_inline_code_fence(mock_call_llm: MagicMock) -> None:
+    """JSON on same line as code fence should still be parsed correctly."""
+    mock_response = MagicMock()
+    mock_response.text = '```json{"outcome": "granted", "case_title": null, "parties": [], "ruling_text": "text"}```'
+    mock_response.input_tokens = 100
+    mock_response.output_tokens = 50
+    mock_call_llm.return_value = mock_response
+
+    result = _ventura_llm_extract("Some text")
+    assert result is not None
+    assert result["outcome"] == "Granted"
+
+
+@patch("ingestion.llm_providers.call_llm")
+def test_ventura_llm_extract_filters_bad_parties(mock_call_llm: MagicMock) -> None:
+    """Parties with names > 200 chars or newlines should be filtered out."""
+    mock_response = MagicMock()
+    mock_response.text = json.dumps(
+        {
+            "outcome": "granted",
+            "case_title": "A v. B",
+            "parties": [
+                {"name": "Good Name", "role": "plaintiff"},
+                {"name": "A" * 201, "role": "defendant"},
+                {"name": "Has\nNewline", "role": "plaintiff"},
+                {"name": "", "role": "defendant"},
+            ],
+            "ruling_text": "text",
+        }
+    )
+    mock_response.input_tokens = 100
+    mock_response.output_tokens = 50
+    mock_call_llm.return_value = mock_response
+
+    result = _ventura_llm_extract("Some text")
+    assert result is not None
+    assert len(result["parties"]) == 1
+    assert result["parties"][0]["name"] == "Good Name"
+
+
+@patch("ingestion.llm_providers.call_llm")
+def test_ventura_llm_extract_returns_none_on_non_dict(mock_call_llm: MagicMock) -> None:
+    """A list response (not dict) should return None."""
+    mock_response = MagicMock()
+    mock_response.text = "[1, 2, 3]"
+    mock_call_llm.return_value = mock_response
+    result = _ventura_llm_extract("Some text")
+    assert result is None
+
+
+@patch("ingestion.llm_providers.call_llm")
+def test_ventura_llm_extract_passes_metadata(mock_call_llm: MagicMock) -> None:
+    """Known metadata should be included in the user message."""
+    mock_response = MagicMock()
+    mock_response.text = json.dumps(
+        {
+            "outcome": "granted",
+            "case_title": None,
+            "parties": [],
+            "ruling_text": "text",
+        }
+    )
+    mock_response.input_tokens = 100
+    mock_response.output_tokens = 50
+    mock_call_llm.return_value = mock_response
+
+    _ventura_llm_extract(
+        "doc text",
+        case_number="2025CUBC040123",
+        motion_type="Demurrer to Complaint",
+    )
+
+    # Verify call_llm was called with user_message containing metadata.
+    call_args = mock_call_llm.call_args
+    user_msg = call_args.kwargs.get("user_message") or call_args[1]
+    assert "Case number: 2025CUBC040123" in user_msg
+    assert "Motion type: Demurrer to Complaint" in user_msg
+
+
+# ---------------------------------------------------------------------------
+# LLM integration into parse_document (#2055)
+# ---------------------------------------------------------------------------
+
+
+@patch("courts.ca.ventura_tentatives._ventura_llm_extract")
+@patch("courts.ca.ventura_tentatives._ventura_llm_enabled", return_value=True)
+def test_ventura_parse_document_uses_llm_when_enabled(
+    _mock_enabled: MagicMock,
+    mock_extract: MagicMock,
+) -> None:
+    """When LLM is enabled, parse_document should call _ventura_llm_extract."""
+    from framework import CapturedDocument, ContentFormat
+
+    mock_extract.return_value = {
+        "outcome": "Granted",
+        "case_title": "Smith v. Jones",
+        "parties": [{"name": "Smith", "role": "plaintiff"}],
+        "ruling_text": "The motion is GRANTED.",
+    }
+
+    config = ventura_default_config()
+    scraper = VenturaTentativeRulingsScraper(config=config)
+
+    doc = CapturedDocument(
+        scraper_id=config.scraper_id,
+        state="CA",
+        county="Ventura",
+        court="Superior Court",
+        source_url="https://example.com",
+        capture_timestamp=datetime(2026, 3, 11),
+        content_format=ContentFormat.HTML,
+        raw_content=b"<html><body><p>The motion is GRANTED.</p></body></html>",
+        content_hash="abc123",
+    )
+    doc.case_number = "2025CUBC040123"
+    doc.motion_type = "Demurrer to Complaint"
+
+    result = scraper.parse_document(doc)
+
+    mock_extract.assert_called_once()
+    assert result.outcome == "Granted"
+    assert result.case_title == "Smith v. Jones"
+    assert result.ruling_text == "The motion is GRANTED."
+    assert result.parties == [{"name": "Smith", "role": "plaintiff"}]
+    assert result.extra.get("_llm_extracted") is True
+
+
+@patch("courts.ca.ventura_tentatives._ventura_llm_extract")
+@patch("courts.ca.ventura_tentatives._ventura_llm_enabled", return_value=True)
+def test_ventura_parse_document_falls_back_to_regex(
+    _mock_enabled: MagicMock,
+    mock_extract: MagicMock,
+) -> None:
+    """When LLM returns None, parse_document should fall back to regex."""
+    from framework import CapturedDocument, ContentFormat
+
+    mock_extract.return_value = None
+
+    config = ventura_default_config()
+    scraper = VenturaTentativeRulingsScraper(config=config)
+
+    doc = CapturedDocument(
+        scraper_id=config.scraper_id,
+        state="CA",
+        county="Ventura",
+        court="Superior Court",
+        source_url="https://example.com",
+        capture_timestamp=datetime(2026, 3, 11),
+        content_format=ContentFormat.HTML,
+        raw_content=b"<html><body><p>Smith v. Jones. The motion is GRANTED.</p></body></html>",
+        content_hash="abc123",
+    )
+
+    result = scraper.parse_document(doc)
+
+    assert result.ruling_text is not None
+    assert "GRANTED" in result.ruling_text
+    assert result.outcome == "Granted"
+    assert result.extra.get("_llm_extracted") is None
+
+
+@patch("courts.ca.ventura_tentatives._ventura_llm_extract")
+@patch("courts.ca.ventura_tentatives._ventura_llm_enabled", return_value=True)
+def test_ventura_parse_document_llm_partial_fills_regex_rest(
+    _mock_enabled: MagicMock,
+    mock_extract: MagicMock,
+) -> None:
+    """When LLM returns partial fields, regex fills the remaining ones."""
+    from framework import CapturedDocument, ContentFormat
+
+    mock_extract.return_value = {
+        "outcome": "Granted",
+        "case_title": None,
+        "parties": [{"name": "Smith", "role": "plaintiff"}],
+        "ruling_text": None,
+    }
+
+    config = ventura_default_config()
+    scraper = VenturaTentativeRulingsScraper(config=config)
+
+    doc = CapturedDocument(
+        scraper_id=config.scraper_id,
+        state="CA",
+        county="Ventura",
+        court="Superior Court",
+        source_url="https://example.com",
+        capture_timestamp=datetime(2026, 3, 11),
+        content_format=ContentFormat.HTML,
+        raw_content=b"<html><body><p>Smith v. Jones. The motion is GRANTED.</p></body></html>",
+        content_hash="abc123",
+    )
+
+    result = scraper.parse_document(doc)
+
+    assert result.outcome == "Granted"
+    assert result.parties == [{"name": "Smith", "role": "plaintiff"}]
+    assert result.ruling_text is not None
+    assert result.case_title is not None
+
+
+@patch("courts.ca.ventura_tentatives._ventura_llm_enabled", return_value=False)
+def test_ventura_parse_document_no_llm_when_disabled(
+    _mock_enabled: MagicMock,
+) -> None:
+    """When LLM is disabled, parse_document uses only regex."""
+    from framework import CapturedDocument, ContentFormat
+
+    config = ventura_default_config()
+    scraper = VenturaTentativeRulingsScraper(config=config)
+
+    doc = CapturedDocument(
+        scraper_id=config.scraper_id,
+        state="CA",
+        county="Ventura",
+        court="Superior Court",
+        source_url="https://example.com",
+        capture_timestamp=datetime(2026, 3, 11),
+        content_format=ContentFormat.HTML,
+        raw_content=b"<html><body><p>Smith v. Jones. The motion is GRANTED.</p></body></html>",
+        content_hash="abc123",
+    )
+
+    result = scraper.parse_document(doc)
+
+    assert result.ruling_text is not None
+    assert result.outcome == "Granted"
+    assert result.extra.get("_llm_extracted") is None
+
+
+@patch("ingestion.llm_providers.call_llm")
+def test_ventura_llm_extract_with_fixture(mock_call_llm: MagicMock) -> None:
+    """LLM extraction should work with real Ventura ruling HTML fixtures."""
+    fixture_html = _load_bytes("ventura_ruling_html_demurrer.html")
+    expected_json = json.loads(
+        (FIXTURES / "expected" / "ventura_demurrer.json").read_text(encoding="utf-8")
+    )
+    expected_case = expected_json["expected_cases"][0]
+
+    mock_response = MagicMock()
+    mock_response.text = json.dumps(
+        {
+            "outcome": expected_case["outcome"],
+            "case_title": expected_case["case_title"],
+            "parties": expected_case["parties"],
+            "ruling_text": "TENTATIVE RULING ... the demurrer is SUSTAINED WITH LEAVE TO AMEND ...",
+        }
+    )
+    mock_response.input_tokens = 500
+    mock_response.output_tokens = 200
+    mock_call_llm.return_value = mock_response
+
+    text = _extract_html_text(fixture_html)
+    result = _ventura_llm_extract(
+        text,
+        case_number=expected_json["case_number"],
+        motion_type=expected_json["motion_type"],
+    )
+
+    assert result is not None
+    assert result["outcome"] == "Granted in Part"
+    assert result["case_title"] == expected_case["case_title"]
+    assert len(result["parties"]) == 2
+    assert result["ruling_text"] is not None
+
+
+@respx.mock
+@patch("courts.ca.ventura_tentatives._ventura_llm_extract")
+@patch("courts.ca.ventura_tentatives._ventura_llm_enabled", return_value=True)
+def test_ventura_full_run_with_llm(
+    _mock_enabled: MagicMock,
+    mock_extract: MagicMock,
+) -> None:
+    """Full scraper run with LLM enabled should use LLM extraction path."""
+    search_html = _load_html("ventura_search_page.html")
+    results_html = _load_html("ventura_results_page.html")
+    doc_content = b"<html><body><p>The motion is GRANTED.</p></body></html>"
+
+    mock_extract.return_value = {
+        "outcome": "Granted",
+        "case_title": "Smith v. Jones",
+        "parties": [
+            {"name": "Smith", "role": "plaintiff"},
+            {"name": "Jones", "role": "defendant"},
+        ],
+        "ruling_text": "The motion is GRANTED.",
+    }
+
+    respx.get(SEARCH_URL).mock(return_value=httpx.Response(200, text=search_html))
+    respx.post(SEARCH_URL).mock(return_value=httpx.Response(200, text=results_html))
+    respx.get(url__regex=r"/CaseInquiry/ViewFile/\d+").mock(
+        return_value=httpx.Response(
+            200,
+            content=doc_content,
+            headers={"content-type": "text/html"},
+        )
+    )
+
+    config = ventura_default_config()
+    config.request_delay_seconds = 0
+    scraper = VenturaTentativeRulingsScraper(
+        config=config,
+        search_dates=[datetime(2026, 3, 11)],
+    )
+    health = scraper.run()
+
+    assert health.success is True
+    assert health.records_captured == 6
+    assert mock_extract.call_count == 6
