@@ -50,6 +50,9 @@ vi.mock('lucide-react', () => ({
   ArrowDown: ({ className }: { className?: string }) => (
     <span data-testid="arrow-down-icon" className={className} />
   ),
+  X: ({ className }: { className?: string }) => (
+    <span data-testid="x-icon" className={className} />
+  ),
 }));
 
 // Mock Checkbox component
@@ -279,6 +282,36 @@ describe('JudgesList', () => {
     expect(link).toHaveAttribute('href', '/judges/judge-1');
   });
 
+  it('navigates to judge detail when clicking anywhere on the row', () => {
+    setupMocks();
+
+    render(<JudgesList />);
+    // Click on the ruling count cell (not the name link) — should still navigate
+    // "100" belongs to Anderson (judge-3), sorted first by surname
+    fireEvent.click(screen.getByText('100'));
+    expect(mockPush).toHaveBeenCalledWith('/judges/judge-3');
+  });
+
+  it('does not navigate when clicking the checkbox', () => {
+    setupMocks();
+
+    render(<JudgesList />);
+    const checkboxes = screen.getAllByTestId('judge-checkbox');
+    fireEvent.click(checkboxes[0]);
+    // Checkbox click should toggle selection, not navigate
+    expect(mockPush).not.toHaveBeenCalled();
+  });
+
+  it('does not double-navigate when clicking the name link', () => {
+    setupMocks();
+
+    render(<JudgesList />);
+    const link = screen.getByText('Alice Z. Anderson');
+    fireEvent.click(link);
+    // Link stopPropagation prevents row onClick from firing router.push
+    expect(mockPush).not.toHaveBeenCalled();
+  });
+
   it('renders sortable column headers', () => {
     setupMocks();
 
@@ -458,5 +491,57 @@ describe('JudgesList', () => {
 
     render(<JudgesList />);
     expect(screen.getByTestId('county-select')).toBeInTheDocument();
+  });
+
+  // Selection chips tests
+  it('shows selection chips with surname when judges are selected', () => {
+    setupMocks();
+
+    render(<JudgesList />);
+    const checkboxes = screen.getAllByTestId('judge-checkbox');
+    fireEvent.click(checkboxes[0]); // Anderson (first by surname sort)
+    fireEvent.click(checkboxes[2]); // Smith
+
+    expect(screen.getByTestId('selection-tray')).toBeInTheDocument();
+    const chips = screen.getAllByTestId('selection-chip');
+    expect(chips).toHaveLength(2);
+    expect(chips[0]).toHaveTextContent('Anderson');
+    expect(chips[1]).toHaveTextContent('Smith');
+  });
+
+  it('removes a chip when its dismiss button is clicked', () => {
+    setupMocks();
+
+    render(<JudgesList />);
+    const checkboxes = screen.getAllByTestId('judge-checkbox');
+    fireEvent.click(checkboxes[0]); // Anderson
+    fireEvent.click(checkboxes[2]); // Smith
+
+    const removeButtons = screen.getAllByLabelText(/Remove .* from comparison/);
+    fireEvent.click(removeButtons[0]); // remove Anderson
+
+    const chips = screen.getAllByTestId('selection-chip');
+    expect(chips).toHaveLength(1);
+    expect(chips[0]).toHaveTextContent('Smith');
+  });
+
+  it('keeps chips visible when judges are filtered out', () => {
+    setupMocks();
+
+    render(<JudgesList />);
+    // Select Anderson (LA) and Johnson (Orange)
+    const checkboxes = screen.getAllByTestId('judge-checkbox');
+    fireEvent.click(checkboxes[0]); // Anderson
+    fireEvent.click(checkboxes[1]); // Johnson
+
+    // Filter to only show Smith — Anderson and Johnson disappear from table
+    const input = screen.getByLabelText(/Judge name/i);
+    fireEvent.change(input, { target: { value: 'Smith' } });
+
+    // Chips should still be visible even though those judges are filtered out
+    const chips = screen.getAllByTestId('selection-chip');
+    expect(chips).toHaveLength(2);
+    expect(chips[0]).toHaveTextContent('Anderson');
+    expect(chips[1]).toHaveTextContent('Johnson');
   });
 });

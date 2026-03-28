@@ -4,7 +4,7 @@ import { useState, useMemo } from 'react';
 import { useQuery, gql } from '@apollo/client';
 import { useRouter } from 'next/navigation';
 import Link from 'next/link';
-import { Search, ArrowUpDown, ArrowUp, ArrowDown, Scale } from 'lucide-react';
+import { Search, ArrowUpDown, ArrowUp, ArrowDown, Scale, X } from 'lucide-react';
 import { ErrorBanner } from '@/components/ErrorBanner';
 import { Button } from '@/components/ui/button';
 import { Checkbox } from '@/components/ui/checkbox';
@@ -179,7 +179,7 @@ export function JudgesList() {
   const [countyFilter, setCountyFilter] = useState<string>('all');
   const [sortKey, setSortKey] = useState<SortKey>('name');
   const [sortDir, setSortDir] = useState<SortDir>('asc');
-  const [selectedJudgeIds, setSelectedJudgeIds] = useState<Set<string>>(new Set());
+  const [selectedJudges, setSelectedJudges] = useState<Map<string, string>>(new Map());
 
   const countyArg = countyFilter !== 'all' ? countyFilter : undefined;
 
@@ -235,24 +235,32 @@ export function JudgesList() {
     }
   }
 
-  function toggleJudgeSelection(judgeId: string) {
-    setSelectedJudgeIds((prev) => {
-      const next = new Set(prev);
+  function toggleJudgeSelection(judgeId: string, judgeName: string) {
+    setSelectedJudges((prev) => {
+      const next = new Map(prev);
       if (next.has(judgeId)) {
         next.delete(judgeId);
       } else {
-        next.add(judgeId);
+        next.set(judgeId, judgeName);
       }
       return next;
     });
   }
 
+  function removeJudgeSelection(judgeId: string) {
+    setSelectedJudges((prev) => {
+      const next = new Map(prev);
+      next.delete(judgeId);
+      return next;
+    });
+  }
+
   function handleCompare() {
-    const ids = [...selectedJudgeIds].join(',');
+    const ids = [...selectedJudges.keys()].join(',');
     router.push(`/judges/compare?ids=${ids}`);
   }
 
-  const selectionCount = selectedJudgeIds.size;
+  const selectionCount = selectedJudges.size;
 
   return (
     <div className="space-y-4">
@@ -281,7 +289,32 @@ export function JudgesList() {
             ))}
           </SelectContent>
         </Select>
-        {selectionCount > 0 && (
+      </div>
+
+      {/* Selection chips */}
+      {selectionCount > 0 && (
+        <div className="flex flex-wrap items-center gap-2" data-testid="selection-tray">
+          {[...selectedJudges.entries()].map(([id, name]) => {
+            const sn = surname(name);
+            const label = sn.charAt(0).toUpperCase() + sn.slice(1);
+            return (
+              <span
+                key={id}
+                className="inline-flex items-center gap-1 rounded-full border bg-muted/50 px-2.5 py-0.5 text-sm"
+                data-testid="selection-chip"
+              >
+                {label}
+                <button
+                  type="button"
+                  className="ml-0.5 rounded-full p-0.5 transition-colors hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                  onClick={() => removeJudgeSelection(id)}
+                  aria-label={`Remove ${name} from comparison`}
+                >
+                  <X className="h-3 w-3" aria-hidden="true" />
+                </button>
+              </span>
+            );
+          })}
           <Button
             onClick={handleCompare}
             disabled={selectionCount < 2}
@@ -292,8 +325,8 @@ export function JudgesList() {
             <Scale className="mr-2 h-4 w-4" aria-hidden="true" />
             Compare ({selectionCount})
           </Button>
-        )}
-      </div>
+        </div>
+      )}
 
       {/* Table */}
       <div className="rounded-md border">
@@ -365,15 +398,21 @@ export function JudgesList() {
               </TableRow>
             )}
 
-            {/* Data rows */}
+            {/* Data rows — onClick on <tr> rather than <Link> wrapper
+               because table rows with checkboxes cannot wrap in <a>.
+               The name <Link> provides keyboard/right-click/cmd-click access. */}
             {displayedJudges.map((node) => {
-              const isSelected = selectedJudgeIds.has(node.id);
+              const isSelected = selectedJudges.has(node.id);
               return (
-                <TableRow key={node.id} className="hover:bg-muted/50">
+                <TableRow
+                  key={node.id}
+                  className="cursor-pointer"
+                  onClick={() => router.push(`/judges/${node.id}`)}
+                >
                   <TableCell className="w-10" onClick={(e) => e.stopPropagation()}>
                     <Checkbox
                       checked={isSelected}
-                      onCheckedChange={() => toggleJudgeSelection(node.id)}
+                      onCheckedChange={() => toggleJudgeSelection(node.id, node.canonicalName)}
                       aria-label={`Select ${node.canonicalName} for comparison`}
                     />
                   </TableCell>
@@ -381,6 +420,7 @@ export function JudgesList() {
                     <Link
                       href={`/judges/${node.id}`}
                       className="rounded-sm font-medium hover:text-primary hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                      onClick={(e) => e.stopPropagation()}
                     >
                       {node.canonicalName}
                     </Link>
