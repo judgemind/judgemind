@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # venv: scraper-framework
+# one-off: true
 """Backfill AI-generated summaries for existing rulings.
 
 Connects to the database using the DATABASE_URL environment variable
