@@ -1012,6 +1012,33 @@ class TestSplitChunkInHalf:
         # Second half should contain the B portion.
         assert "B" * 10 in halves[1]
 
+    def test_splits_at_case_boundary(self) -> None:
+        """Prefers case boundaries (highest priority) near the midpoint."""
+        extractor = LlmExtractor.__new__(LlmExtractor)
+        # Place a case boundary pattern near the middle of the text.
+        text = "A" * 2000 + "\nCase Number: 12345678\n" + "B" * 2000
+        halves = extractor._split_chunk_in_half(text)
+
+        assert len(halves) == 2
+        # First half should end just before the case boundary.
+        assert halves[0].endswith("A" * 10)
+        # Second half should contain the case boundary and B portion.
+        assert "Case Number: 12345678" in halves[1]
+        assert "B" * 10 in halves[1]
+
+    def test_splits_at_page_break(self) -> None:
+        """Prefers page breaks when no case boundaries exist near midpoint."""
+        extractor = LlmExtractor.__new__(LlmExtractor)
+        # Place a form-feed (page break) near the middle — no case boundaries.
+        text = "A" * 2000 + "\f" + "B" * 2000
+        halves = extractor._split_chunk_in_half(text)
+
+        assert len(halves) == 2
+        # First half should end at or before the page break.
+        assert halves[0].rstrip("\f").endswith("A" * 10)
+        # Second half should contain the B portion.
+        assert "B" * 10 in halves[1]
+
     def test_splits_at_midpoint_without_boundaries(self) -> None:
         """Falls back to midpoint when no natural boundaries exist."""
         extractor = LlmExtractor.__new__(LlmExtractor)
