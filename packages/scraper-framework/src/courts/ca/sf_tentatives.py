@@ -2,7 +2,8 @@
 
 Verified against fixture captured 2026-03-03:
   URL:  https://webapps.sftc.org/ufctr/ufctr.dll
-  19 PDF links found on index page (across Depts 403, 404, 416)
+  19 PDF links found on index page (across Depts 403, 404, 416;
+     site may also list 405, 405A, 406, 425)
   No CAPTCHA; httpx fetch works directly.
 
 Link text format: filename only — e.g. "403 Tentative Rulings 3.03.2026.pdf"
@@ -19,7 +20,7 @@ PDF structure (pages 3+):
 Case number format: F + 2 uppercase letters + hyphen + 2-digit year + hyphen + 6 digits
   e.g. FPT-25-378624, FMS-20-387302, FDI-14-781786
 
-Departments: 403, 404, 416
+Departments: 403, 404, 405, 405A, 406, 416, 425
 Calendar days: Tuesday and Thursday
 Previous rulings available for ~30 days, auto-deleted.
 
@@ -41,8 +42,8 @@ INDEX_URL = "https://webapps.sftc.org/ufctr/ufctr.dll"
 BASE_URL = "https://webapps.sftc.org/ufctr/"
 
 # Link text = filename: "403 Tentative Rulings 3.03.2026.pdf"
-# Extract department from leading digits.
-_LINK_TEXT_RE = re.compile(r"^(?P<department>\d{3})\s+Tentative\s+Rulings")
+# Extract department from leading digits, with optional letter suffix (e.g. 405A).
+_LINK_TEXT_RE = re.compile(r"^(?P<department>\d{3}[A-Z]?)\s+Tentative\s+Rulings")
 
 # Hearing date from filename: "403 Tentative Rulings 3.03.2026.pdf" → M.DD.YYYY or MM.DD.YYYY
 _FILENAME_DATE_RE = re.compile(r"(\d{1,2})\.(\d{2})\.(\d{4})\.pdf$")

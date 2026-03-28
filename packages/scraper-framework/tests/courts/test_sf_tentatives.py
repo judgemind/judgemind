@@ -1,8 +1,9 @@
 """Tests for San Francisco Family Law tentative rulings scraper.
 
-Fixtures captured from live site 2026-03-03:
+Fixtures captured from live site 2026-03-03 (augmented with synthetic entries
+for departments 405, 405A, 406, 425 per #2130):
   sf_family_law_page.html  — GET https://webapps.sftc.org/ufctr/ufctr.dll
-                              (19 PDF links across Depts 403, 404, 416)
+                              (23 PDF links across Depts 403, 404, 405, 405A, 406, 416, 425)
   sf_dept403_ruling.pdf    — 403 Tentative Rulings 3.03.2026.pdf
                               Dept 403, Judge Bobby P. Luna, 30 pages
 """
@@ -18,6 +19,7 @@ import respx
 
 from courts.ca.pdf_link_scraper import _extract_pdf_links, _extract_pdf_text
 from courts.ca.sf_tentatives import (
+    _LINK_TEXT_RE,
     BASE_URL,
     INDEX_URL,
     SFTentativeRulingsScraper,
@@ -49,7 +51,7 @@ def _load_bytes(name: str) -> bytes:
 def test_sf_extract_pdf_links_count() -> None:
     html = _load_html("sf_family_law_page.html")
     links = _extract_pdf_links(html, INDEX_URL, BASE_URL)
-    assert len(links) == 19
+    assert len(links) == 23
 
 
 def test_sf_extract_pdf_links_absolute_urls() -> None:
@@ -81,7 +83,106 @@ def test_sf_extract_pdf_links_all_departments_present() -> None:
     texts = [t for _, t in links]
     assert any("403" in t for t in texts)
     assert any("404" in t for t in texts)
+    assert any("405A" in t for t in texts)
+    assert any("406" in t for t in texts)
     assert any("416" in t for t in texts)
+    assert any("425" in t for t in texts)
+
+
+# ---------------------------------------------------------------------------
+# _LINK_TEXT_RE — department regex tests (#2130)
+# ---------------------------------------------------------------------------
+
+
+def test_sf_link_text_re_three_digit_dept() -> None:
+    """Standard 3-digit department like 403."""
+    m = _LINK_TEXT_RE.match("403 Tentative Rulings 3.03.2026.pdf")
+    assert m is not None
+    assert m.group("department") == "403"
+
+
+def test_sf_link_text_re_dept_with_letter_suffix() -> None:
+    """Department with letter suffix like 405A (#2130)."""
+    m = _LINK_TEXT_RE.match("405A Tentative Rulings 3.04.2026.pdf")
+    assert m is not None
+    assert m.group("department") == "405A"
+
+
+def test_sf_link_text_re_dept_405() -> None:
+    """Department 405 without suffix."""
+    m = _LINK_TEXT_RE.match("405 Tentative Rulings 3.04.2026.pdf")
+    assert m is not None
+    assert m.group("department") == "405"
+
+
+def test_sf_link_text_re_dept_425() -> None:
+    """Department 425."""
+    m = _LINK_TEXT_RE.match("425 Tentative Rulings 3.05.2026.pdf")
+    assert m is not None
+    assert m.group("department") == "425"
+
+
+def test_sf_link_text_re_dept_406() -> None:
+    """Department 406."""
+    m = _LINK_TEXT_RE.match("406 Tentative Rulings 3.05.2026.pdf")
+    assert m is not None
+    assert m.group("department") == "406"
+
+
+def test_sf_link_text_re_rejects_non_ruling() -> None:
+    """Non-ruling filename should not match."""
+    m = _LINK_TEXT_RE.match("some_other_document.pdf")
+    assert m is None
+
+
+# ---------------------------------------------------------------------------
+# Hearing date extraction for departments with letter suffixes
+# ---------------------------------------------------------------------------
+
+
+def test_sf_hearing_date_dept_with_letter_suffix() -> None:
+    """Hearing date extraction from 405A-style filename."""
+    dt = _sf_hearing_date_from_filename("405A Tentative Rulings 3.04.2026.pdf")
+    assert dt == datetime(2026, 3, 4)
+
+
+# ---------------------------------------------------------------------------
+# Courthouse mapping for new departments
+# ---------------------------------------------------------------------------
+
+
+def test_sf_courthouse_new_departments() -> None:
+    """Departments 405, 405A, 406, 425 all map to the same courthouse."""
+    assert _sf_courthouse("405") == "San Francisco Courthouse"
+    assert _sf_courthouse("405A") == "San Francisco Courthouse"
+    assert _sf_courthouse("406") == "San Francisco Courthouse"
+    assert _sf_courthouse("425") == "San Francisco Courthouse"
+
+
+# ---------------------------------------------------------------------------
+# Full scraper run — dept 405A captured in mocked run (#2130)
+# ---------------------------------------------------------------------------
+
+
+@respx.mock
+def test_sf_run_captures_dept_with_letter_suffix() -> None:
+    """Verify department 405A is captured from the index page (#2130)."""
+    html = _load_html("sf_family_law_page.html")
+    pdf_bytes = _load_bytes("sf_dept403_ruling.pdf")
+
+    respx.get(INDEX_URL).mock(return_value=httpx.Response(200, text=html))
+    respx.get(url__regex=r"\.pdf$").mock(return_value=httpx.Response(200, content=pdf_bytes))
+
+    config = sf_default_config()
+    config.request_delay_seconds = 0
+    scraper = SFTentativeRulingsScraper(config=config)
+
+    docs = scraper.fetch_documents()
+    departments = [d.department for d in docs]
+    assert "405A" in departments
+    assert "405" in departments
+    assert "406" in departments
+    assert "425" in departments
 
 
 # ---------------------------------------------------------------------------
@@ -329,7 +430,7 @@ def test_sf_run_populates_case_title() -> None:
     docs = scraper.fetch_documents()
     parsed = [scraper.parse_document(d) for d in docs]
     has_title = [d for d in parsed if d.case_title]
-    assert len(has_title) == 19
+    assert len(has_title) == 23
     assert "Graves" in has_title[0].case_title
     assert " v. " in has_title[0].case_title
 
@@ -353,7 +454,7 @@ def test_sf_full_run() -> None:
     health = scraper.run()
 
     assert health.success is True
-    assert health.records_captured == 19
+    assert health.records_captured == 23
 
 
 @respx.mock
@@ -369,7 +470,7 @@ def test_sf_run_populates_dept_from_filename() -> None:
     scraper = SFTentativeRulingsScraper(config=config)
 
     docs = scraper.fetch_documents()
-    assert len(docs) == 19
+    assert len(docs) == 23
 
     # First link is "403 Tentative Rulings 3.03.2026.pdf" → dept 403
     first = docs[0]
@@ -394,7 +495,7 @@ def test_sf_run_populates_judge_from_pdf_text() -> None:
 
     # Every doc should have judge name extracted from the PDF fixture
     has_judge = [d for d in parsed if d.judge_name]
-    assert len(has_judge) == 19
+    assert len(has_judge) == 23
     assert "Luna" in has_judge[0].judge_name
 
 
@@ -415,7 +516,7 @@ def test_sf_run_populates_hearing_date() -> None:
 
     # All docs should have hearing dates parsed from filename
     has_date = [d for d in parsed if d.hearing_date]
-    assert len(has_date) == 19
+    assert len(has_date) == 23
 
 
 @respx.mock
@@ -475,7 +576,7 @@ def test_sf_run_continues_when_pdf_fails() -> None:
     health = scraper.run()
 
     assert health.success is True
-    assert health.records_captured == 18  # 19 - 1 failed
+    assert health.records_captured == 22  # 23 - 1 failed
 
 
 # ---------------------------------------------------------------------------
