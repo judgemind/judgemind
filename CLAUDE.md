@@ -283,6 +283,16 @@ from __future__ import annotations
 
 Run scripts via `scripts/run-py.sh scripts/<name>.py` — it reads the header and activates the correct venv automatically.
 
+- **One-off scripts** (backfills, cleanups, fixups) must include a `# one-off: true` header comment in the first 10 lines. This marks them for automatic detection by the `/audit` skill so they can be archived when no longer needed. Example:
+
+```python
+#!/usr/bin/env python3
+"""Backfill missing party names for Santa Barbara rulings."""
+# venv: scraper-framework
+# one-off: true
+from __future__ import annotations
+```
+
 - Eval scripts (`scripts/eval/`) are excluded from this convention.
 - **ECS oneshot constraint:** Scripts run via `ecs-run-task.sh` are uploaded as single files — they **cannot import other `.py` files from `scripts/`**. Only stdlib and installed packages are available. If you need shared code, either inline it, use a lazy import inside a function (for optional features), or move the shared code into an installed package. CI enforces this via `scripts/check-oneshot-imports.sh`. Scripts that are never run as ECS oneshots can be added to the `LOCAL_ONLY` list in that script.
 

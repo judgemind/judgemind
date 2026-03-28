@@ -172,6 +172,33 @@ For each threshold violation or trend regression, file a `priority/p1` `type/dx`
 
 **Deduplication:** Before filing, check for existing open issues related to CI performance (e.g., #1243 tracks CI runner size / test splitting). If an existing issue covers the same job or concern, note it as "skipped — duplicate of #N" rather than filing a new one. Only file a new issue if the finding is distinct from existing tracked work.
 
+### 1.9 — Scripts directory hygiene
+
+Monitor the `scripts/` directory for one-off script accumulation. After #2095 archived 55 scripts, the directory was cleaned to ~29 `.py` files. This check prevents re-accumulation.
+
+#### Checks
+
+1. **Script count threshold.** Count `scripts/*.py` files (top-level only, not `scripts/archive/` or `scripts/eval/`):
+
+```
+Glob pattern: scripts/*.py
+```
+
+If the count exceeds **35**, flag a finding. The current baseline is ~29 permanent utility scripts — 35 gives headroom for a few new utilities while catching accumulation of unarchived one-off scripts.
+
+2. **Missing `# one-off: true` headers.** Scan all `scripts/*.py` files for scripts that look like one-off data operations (names containing `backfill`, `cleanup`, `fix`, `dedup`, `merge`, `migrate`, `remediat`) but lack a `# one-off: true` header in the first 10 lines. These should either be marked as one-off or confirmed as permanent utilities.
+
+3. **Stale one-off scripts.** For scripts that DO have `# one-off: true`, check their git log to see when they were last modified. If a one-off script has not been modified in more than 30 days, flag it as a candidate for archiving to `scripts/archive/`.
+
+#### Filing issues
+
+For script count threshold violations, file a `priority/p2` `type/chore` issue with:
+- Current count and the threshold (35).
+- List of scripts that appear to be one-off (by name pattern or `# one-off: true` header).
+- Suggested action: archive completed one-off scripts to `scripts/archive/`.
+
+For missing headers, file a single `priority/p3` `type/dx` issue listing the scripts that should be reviewed for the `# one-off: true` header.
+
 ---
 
 ## Step 2 — Deduplicate findings
@@ -275,9 +302,8 @@ Write a comprehensive summary to `{worktree}/tmp/audit/report.md`:
 ### 8. CI Health
 [List findings or "No issues found"]
 
-## Issues Filed
-- #N — title (severity, category)
-- ...
+### 9. Scripts Directory Hygiene
+[List findings or "No issues found"]
 ```
 
 ---

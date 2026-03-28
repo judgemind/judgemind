@@ -102,6 +102,17 @@ scripts/ecs-task-logs.sh <task-id> --follow
 scripts/ecs-run-task.sh --cpu 2048 --memory 4096 scripts/backfill_summaries.py
 ```
 
+### One-off script convention
+
+Scripts in `scripts/` that are one-off (backfills, cleanups, fixups — intended to run once or a few times and then be archived) must include a `# one-off: true` header comment in the first 10 lines. This makes them programmatically identifiable by the `/audit` skill, which monitors `scripts/*.py` count and flags when it exceeds 35. One-off scripts that have been run and verified should be moved to `scripts/archive/` to keep the directory manageable.
+
+```python
+#!/usr/bin/env python3
+"""Backfill missing party names for Santa Barbara rulings."""
+# venv: scraper-framework
+# one-off: true
+```
+
 ## Secrets Retrieval
 
 Use `scripts/with-secret.sh` — never run `aws secretsmanager get-secret-value` as a standalone command (the secret value will appear in chat output). Never write secrets to disk. Instead, use the wrapper script to inject secrets as env vars:
