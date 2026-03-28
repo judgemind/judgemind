@@ -105,6 +105,16 @@ _OUTCOME_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Map raw outcome keywords to valid ruling_outcome enum values (#2113).
+# SUSTAINED/OVERRULED are demurrer outcomes that map to granted/denied.
+_SC_OUTCOME_MAP: dict[str, str] = {
+    "granted": "granted",
+    "denied": "denied",
+    "sustained": "granted",
+    "overruled": "denied",
+    "moot": "moot",
+}
+
 # Motion type keywords (from the case line or ruling text)
 _MOTION_TYPE_RE = re.compile(
     r"\b(?P<motion_type>"
@@ -323,14 +333,21 @@ def parse_all_case_numbers(text: str) -> list[str]:
 
 
 def parse_outcome(text: str) -> str | None:
-    """Extract the primary outcome from ruling text."""
+    """Extract the primary outcome from ruling text.
+
+    Returns a value compatible with the ``ruling_outcome`` PostgreSQL enum
+    (lowercase snake_case).  The ingestion worker normalizes outcomes via
+    ``normalize_outcome()``, but returning DB-compatible values here avoids
+    relying on downstream normalization and prevents DB write failures if
+    the normalization step is accidentally skipped (see #2113).
+    """
     m = _OUTCOME_RE.search(text)
     if m:
-        raw = m.group("outcome").strip()
+        raw = m.group("outcome").strip().lower()
         # Normalize "off calendar" variants
-        if raw.lower().startswith("off"):
-            return "Off calendar"
-        return raw.upper()
+        if raw.startswith("off"):
+            return "off_calendar"
+        return _SC_OUTCOME_MAP.get(raw)
     return None
 
 

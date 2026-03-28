@@ -668,7 +668,14 @@ def _reparse_document(
             extracted["case_number"] = parsed.case_number or extracted["case_number"]
             extracted["case_title"] = parsed.case_title or extracted["case_title"]
             extracted["judge_name"] = parsed.judge_name
-            extracted["outcome"] = parsed.outcome
+            # Normalize scraper-provided outcome to lowercase enum value
+            # (#2113).  Mirrors the normalization in worker.py so reingest
+            # produces the same canonical values as live ingestion.
+            extracted["outcome"] = (
+                normalize_outcome(parsed.outcome)
+                if parsed.outcome
+                else None
+            )
             # Normalize scraper-provided motion_type to snake_case (#1849).
             # Mirrors the normalization in worker.py so reingest produces
             # the same canonical values as live ingestion.
@@ -785,8 +792,11 @@ def _reparse_document(
                         extracted["case_title"] = ruling.case_title
                         extraction_methods["case_title"] = "llm"
                     if not extracted["outcome"] and ruling.outcome:
-                        extracted["outcome"] = ruling.outcome
-                        extraction_methods["outcome"] = "llm"
+                        # Normalize LLM-provided outcome (#2113).
+                        normalized_out = normalize_outcome(ruling.outcome)
+                        if normalized_out:
+                            extracted["outcome"] = normalized_out
+                            extraction_methods["outcome"] = "llm"
                     if not extracted["motion_type"] and ruling.motion_type:
                         # Normalize LLM-provided motion_type (#1849).
                         normalized = normalize_motion_type(ruling.motion_type)
@@ -1844,7 +1854,11 @@ def reingest_batch(
                         ruling_text=ruling_text,
                         department=extracted["department"],
                         judge_id=judge_id,
-                        outcome=extracted["outcome"],
+                        # Safety net: normalize outcome to valid enum value
+                        # before writing to DB (#2113).  The upstream
+                        # extraction paths should already normalize, but
+                        # this guards against any missed code path.
+                        outcome=normalize_outcome(extracted["outcome"]),
                         motion_type=extracted["motion_type"],
                     )
 
