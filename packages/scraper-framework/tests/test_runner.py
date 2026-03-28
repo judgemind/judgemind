@@ -294,6 +294,8 @@ class TestBuildRegistry:
         assert len(registry) > 0
         # Check that known scraper IDs are present
         ids = [entry[0] for entry in registry]
+        assert "ca-cc-tentatives" in ids
+        assert "ca-fresno-tentatives-civil" in ids
         assert "ca-la-tentatives-civil" in ids
         assert "ca-oc-tentatives" in ids
         assert "ca-riverside-tentatives" in ids
