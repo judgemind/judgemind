@@ -4162,3 +4162,72 @@ def test_process_event_unmappable_motion_type_falls_back_to_regex(
     sql_args = ruling_calls[0][0][1]
     assert "msj" in sql_args
     assert "Motion Hearing" not in sql_args
+
+
+# ---------------------------------------------------------------------------
+# Scraper-provided ruling_text_html (#2179)
+# ---------------------------------------------------------------------------
+
+
+@patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
+@patch("ingestion.worker.format_ruling_text")
+@patch("ingestion.worker.psycopg")
+def test_process_event_uses_scraper_ruling_text_html(
+    mock_psycopg: MagicMock,
+    mock_format: MagicMock,
+    mock_resolve_judge: MagicMock,
+) -> None:
+    """When event has ruling_text_html, LLM formatting is skipped."""
+    worker, os_mock = _make_worker()
+    worker._formatting_enabled = True
+    worker._formatting_client = MagicMock()
+
+    mock_conn, mock_cur = _make_mock_conn()
+    mock_psycopg.connect.return_value = mock_conn
+    mock_cur.fetchone.side_effect = [
+        ("court-uuid-1",),  # upsert_court
+        ("case-uuid-1",),  # upsert_case
+        (True,),  # insert_document
+    ]
+
+    scraper_html = "<p>The motion is <strong>GRANTED</strong>.</p>"
+    event = _make_event(ruling_text_html=scraper_html)
+    worker.process_event(event)
+
+    # LLM format_ruling_text should NOT be called when scraper provides HTML
+    mock_format.assert_not_called()
+
+    # Verify insert_ruling received the scraper-provided HTML
+    ruling_calls = [c for c in mock_cur.execute.call_args_list if "INSERT INTO rulings" in str(c)]
+    assert len(ruling_calls) == 1
+    sql_args_str = str(ruling_calls[0])
+    assert "GRANTED" in sql_args_str
+
+
+@patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
+@patch("ingestion.worker.format_ruling_text")
+@patch("ingestion.worker.psycopg")
+def test_process_event_falls_back_to_llm_when_no_scraper_html(
+    mock_psycopg: MagicMock,
+    mock_format: MagicMock,
+    mock_resolve_judge: MagicMock,
+) -> None:
+    """When event has no ruling_text_html and formatting is enabled, LLM is used."""
+    worker, os_mock = _make_worker()
+    worker._formatting_enabled = True
+    worker._formatting_client = MagicMock()
+    mock_format.return_value = "<p>LLM formatted</p>"
+
+    mock_conn, mock_cur = _make_mock_conn()
+    mock_psycopg.connect.return_value = mock_conn
+    mock_cur.fetchone.side_effect = [
+        ("court-uuid-1",),  # upsert_court
+        ("case-uuid-1",),  # upsert_case
+        (True,),  # insert_document
+    ]
+
+    event = _make_event()  # No ruling_text_html
+    worker.process_event(event)
+
+    # LLM format_ruling_text should be called
+    mock_format.assert_called_once()

@@ -591,6 +591,7 @@ class IngestionWorker:
         department: str | None = event_data.get("department")
         judge_name: str | None = event_data.get("judge_name")
         ruling_text: str | None = event_data.get("ruling_text")
+        scraper_ruling_text_html: str | None = event_data.get("ruling_text_html")
         content_format: str = event_data.get("content_format", "html")
         content_hash: str = event_data.get("content_hash", "")
         s3_key: str | None = event_data.get("s3_key")
@@ -1017,10 +1018,19 @@ class IngestionWorker:
             )
 
         # ------------------------------------------------------------------
-        # LLM-powered ruling text formatting (opt-in via ENABLE_RULING_FORMATTING)
+        # Ruling text HTML: prefer scraper-provided sanitized HTML (#2179),
+        # fall back to LLM formatting (opt-in via ENABLE_RULING_FORMATTING).
         # ------------------------------------------------------------------
-        ruling_text_html: str | None = None
-        if self._formatting_enabled and cleaned_ruling_text:
+        ruling_text_html: str | None = scraper_ruling_text_html
+        if ruling_text_html is not None:
+            logger.info(
+                "Using scraper-provided ruling_text_html",
+                extra={
+                    "document_id": document_id,
+                    "html_length": len(ruling_text_html) if ruling_text_html else 0,
+                },
+            )
+        elif self._formatting_enabled and cleaned_ruling_text:
             t0_fmt = time.monotonic()
             ruling_text_html = format_ruling_text(
                 cleaned_ruling_text,

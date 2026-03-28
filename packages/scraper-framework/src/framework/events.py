@@ -53,6 +53,7 @@ class EventBus:
             s3_key=doc.s3_key,
             s3_bucket=doc.s3_bucket,
             ruling_text=doc.ruling_text,
+            ruling_text_html=doc.ruling_text_html,
             outcome=doc.outcome,
             motion_type=doc.motion_type,
             case_number=doc.case_number,

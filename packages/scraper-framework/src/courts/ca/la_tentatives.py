@@ -178,6 +178,7 @@ class LASplitRuling:
     ruling_index: int
     case_number: str | None
     ruling_text: str
+    ruling_text_html: str | None = None
     case_title: str | None = None
     motion_type: str | None = None
     outcome: str | None = None
@@ -396,29 +397,34 @@ def _replace_ruling_text_from_html(
     if not case_htmls:
         return
 
-    # Build a map from case number to HTML-extracted text.
-    chunk_texts: list[tuple[str | None, str]] = []
+    # Build a map from case number to (plain_text, sanitized_html).
+    chunk_data: list[tuple[str | None, str, str | None]] = []
     for html_chunk in case_htmls:
         soup = BeautifulSoup(html_chunk, "lxml")
         content = soup.find("div", id="speechSynthesis")
         if content:
             text = content.get_text(separator="\n", strip=True)
+            inner_html = content.decode_contents()
+            sanitized = sanitize_ruling_html(inner_html)
         else:
             text = soup.get_text(separator="\n", strip=True)
+            sanitized = None
         # Extract case number from this chunk for matching.
         case_num_match = _CASE_NUMBER_RE.search(text)
         case_num = case_num_match.group(1) if case_num_match else None
-        chunk_texts.append((case_num, text))
+        chunk_data.append((case_num, text, sanitized))
 
     # Match each ruling to its HTML chunk.
     for ruling in rulings:
         matched_text: str | None = None
+        matched_html: str | None = None
 
         if ruling.case_number:
             # Try case-number match.
-            for chunk_case_num, chunk_text in chunk_texts:
+            for chunk_case_num, chunk_text, chunk_html in chunk_data:
                 if chunk_case_num and chunk_case_num == ruling.case_number:
                     matched_text = chunk_text
+                    matched_html = chunk_html
                     break
             # If case_number was present but didn't match any chunk, do NOT
             # fall back to positional matching — that risks assigning text
@@ -433,11 +439,14 @@ def _replace_ruling_text_from_html(
         else:
             # No case number from LLM — use positional match as last resort.
             idx = ruling.ruling_index - 1
-            if 0 <= idx < len(chunk_texts):
-                matched_text = chunk_texts[idx][1]
+            if 0 <= idx < len(chunk_data):
+                matched_text = chunk_data[idx][1]
+                matched_html = chunk_data[idx][2]
 
         if matched_text and len(matched_text) > 100:
             ruling.ruling_text = matched_text
+        if matched_html:
+            ruling.ruling_text_html = matched_html
 
 
 def _split_rulings(text: str) -> list[LASplitRuling]:
@@ -466,8 +475,11 @@ def _split_rulings(text: str) -> list[LASplitRuling]:
         content = soup.find("div", id="speechSynthesis")
         if content:
             ruling_text = content.get_text(separator="\n", strip=True)
+            inner_html = content.decode_contents()
+            ruling_html = sanitize_ruling_html(inner_html)
         else:
             ruling_text = soup.get_text(separator="\n", strip=True)
+            ruling_html = None
 
         if not ruling_text or len(ruling_text) < 50:
             continue
@@ -494,6 +506,7 @@ def _split_rulings(text: str) -> list[LASplitRuling]:
                 ruling_index=idx + 1,
                 case_number=case_number,
                 ruling_text=ruling_text,
+                ruling_text_html=ruling_html or None,
                 case_title=case_title,
                 motion_type=None,  # Filled by enrichment pipeline.
                 outcome=None,  # Filled by enrichment pipeline.
@@ -692,6 +705,7 @@ class LATentativeRulingsScraper(BaseScraper):
                                 # Pre-populate fields from LLM extraction
                                 doc.case_number = ruling.case_number
                                 doc.ruling_text = ruling.ruling_text
+                                doc.ruling_text_html = ruling.ruling_text_html
                                 doc.case_title = ruling.case_title
                                 doc.motion_type = ruling.motion_type
                                 doc.outcome = ruling.outcome
@@ -979,6 +993,92 @@ def _split_cases_html_cached(ruling_html: str) -> tuple[str, ...]:
     return tuple(result)
 
 
+# ---------------------------------------------------------------------------
+# HTML sanitization for ruling_text_html (#2179)
+# ---------------------------------------------------------------------------
+
+# Allowlisted structural tags preserved in ruling_text_html.
+_ALLOWED_TAGS: frozenset[str] = frozenset(
+    {
+        "p",
+        "br",
+        "strong",
+        "em",
+        "b",
+        "i",
+        "ol",
+        "ul",
+        "li",
+        "h1",
+        "h2",
+        "h3",
+        "h4",
+        "h5",
+        "h6",
+        "table",
+        "thead",
+        "tbody",
+        "tr",
+        "td",
+        "th",
+        "span",
+        "a",
+        "div",
+        "hr",
+        "sup",
+        "sub",
+        "blockquote",
+        "pre",
+    }
+)
+
+# Allowlisted attributes — all others are stripped.
+_ALLOWED_ATTRS: frozenset[str] = frozenset({"class", "id", "href", "colspan", "rowspan"})
+
+
+def sanitize_ruling_html(html: str) -> str:
+    """Sanitize raw ruling HTML, keeping only structural formatting tags.
+
+    Strips ``<script>``, ``<style>`` tags and their content, removes all
+    ``on*=`` event handler attributes and ``style=`` attributes, and
+    drops any tags not in ``_ALLOWED_TAGS``.
+
+    Returns the inner HTML of the content (no outer ``<html>``/``<body>``
+    wrapper).  If the input cannot be parsed, returns an empty string.
+    """
+    soup = BeautifulSoup(html, "lxml")
+
+    # Remove script and style elements entirely (including content).
+    for tag in soup.find_all(["script", "style"]):
+        tag.decompose()
+
+    # Walk all remaining tags.
+    for tag in soup.find_all(True):
+        # Strip disallowed tags but keep their text content.
+        if tag.name not in _ALLOWED_TAGS:
+            tag.unwrap()
+            continue
+
+        # Remove disallowed attributes (on*, style, etc.).
+        attrs_to_remove = [attr for attr in list(tag.attrs) if attr not in _ALLOWED_ATTRS]
+        for attr in attrs_to_remove:
+            del tag[attr]
+
+        # Sanitize href values to prevent javascript:/data:/vbscript: XSS.
+        if tag.name == "a" and "href" in tag.attrs:
+            href_val = tag.get("href", "")
+            if isinstance(href_val, str):
+                normalized = href_val.strip().lower()
+                if normalized.startswith(("javascript:", "data:", "vbscript:")):
+                    del tag["href"]
+
+    # Extract the body content (lxml wraps in <html><body>).
+    body = soup.find("body")
+    if body:
+        return body.decode_contents().strip()
+    return soup.decode_contents().strip()
+
+
 def _apply_regex_fallback_for_llm_doc(
     doc: CapturedDocument,
     log: structlog.stdlib.BoundLogger,
@@ -1091,6 +1191,12 @@ def _extract_ruling_fields(soup: BeautifulSoup, doc: CapturedDocument) -> None:
 
     full_text = content.get_text(separator="\n", strip=True)
     doc.ruling_text = full_text
+
+    # Preserve formatted HTML for display (#2179).
+    inner_html = content.decode_contents()
+    sanitized = sanitize_ruling_html(inner_html)
+    if sanitized:
+        doc.ruling_text_html = sanitized
 
     # All case numbers in this response
     case_numbers = _CASE_NUMBER_RE.findall(full_text)

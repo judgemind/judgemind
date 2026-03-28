@@ -108,6 +108,7 @@ class CapturedDocument(BaseModel):
     judge_name: str | None = None
     hearing_date: datetime | None = None
     ruling_text: str | None = None
+    ruling_text_html: str | None = None
     outcome: str | None = None
     motion_type: str | None = None
     parties: list[dict[str, str]] = Field(default_factory=list)
@@ -151,6 +152,7 @@ class DocumentCapturedEvent(EventEnvelope):
     s3_key: str | None
     s3_bucket: str | None = None
     ruling_text: str | None = None
+    ruling_text_html: str | None = None
     outcome: str | None = None
     motion_type: str | None = None
     case_number: str | None
