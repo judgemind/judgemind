@@ -149,6 +149,19 @@ export function createLoaders(pool: Pool) {
     return caseIds.map((id) => byCase.get(id) ?? null);
   });
 
+  /** Batch-load ruling counts for judges. Returns 0 for judges with no rulings. */
+  const judgeRulingCountLoader = new DataLoader<string, number>(async (judgeIds) => {
+    const { rows } = await pool.query<{ judge_id: string; count: number }>(
+      `SELECT judge_id, COUNT(*)::int AS count
+       FROM rulings
+       WHERE judge_id = ANY($1)
+       GROUP BY judge_id`,
+      [judgeIds],
+    );
+    const byId = new Map(rows.map((r) => [r.judge_id, r.count]));
+    return judgeIds.map((id) => byId.get(id) ?? 0);
+  });
+
   return {
     courtLoader,
     judgeLoader,
@@ -157,6 +170,7 @@ export function createLoaders(pool: Pool) {
     caseJudgesLoader,
     casePartiesLoader,
     latestRulingLoader,
+    judgeRulingCountLoader,
   };
 }
 

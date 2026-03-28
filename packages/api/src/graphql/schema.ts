@@ -21,6 +21,8 @@ export const typeDefs = `#graphql
     isActive: Boolean!
     """Date of appointment, ISO 8601."""
     appointedAt: String
+    """Number of rulings associated with this judge."""
+    rulingCount: Int!
     court: Court
   }
 
@@ -402,6 +404,8 @@ export const typeDefs = `#graphql
     """List judges. Ordered by canonical_name ASC, id ASC."""
     judges(
       courtId: ID
+      """Filter by county name, e.g. "Los Angeles"."""
+      county: String
       first: Int
       after: String
     ): JudgeConnection!

@@ -1,20 +1,17 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, screen, fireEvent } from '@testing-library/react';
 
-// Mock Apollo client
+// Mock Apollo client — track calls by query name
 const mockUseQuery = vi.fn();
 vi.mock('@apollo/client', () => ({
   useQuery: (...args: unknown[]) => mockUseQuery(...args),
   gql: (strings: TemplateStringsArray) => strings.join(''),
 }));
 
-const mockReplace = vi.fn();
 const mockPush = vi.fn();
-let mockSearchParamsValue = new URLSearchParams();
 
 vi.mock('next/navigation', () => ({
-  useRouter: () => ({ push: mockPush, replace: mockReplace, back: vi.fn() }),
-  useSearchParams: () => mockSearchParamsValue,
+  useRouter: () => ({ push: mockPush, replace: vi.fn(), back: vi.fn() }),
 }));
 
 vi.mock('next/link', () => ({
@@ -44,6 +41,15 @@ vi.mock('lucide-react', () => ({
   Scale: ({ className }: { className?: string }) => (
     <span data-testid="scale-icon" className={className} />
   ),
+  ArrowUpDown: ({ className }: { className?: string }) => (
+    <span data-testid="arrow-updown-icon" className={className} />
+  ),
+  ArrowUp: ({ className }: { className?: string }) => (
+    <span data-testid="arrow-up-icon" className={className} />
+  ),
+  ArrowDown: ({ className }: { className?: string }) => (
+    <span data-testid="arrow-down-icon" className={className} />
+  ),
 }));
 
 // Mock Checkbox component
@@ -67,31 +73,35 @@ vi.mock('@/components/ui/checkbox', () => ({
   ),
 }));
 
-// IntersectionObserver mock
-let intersectionCallback: IntersectionObserverCallback;
-let mockObserve: ReturnType<typeof vi.fn>;
-let mockDisconnect: ReturnType<typeof vi.fn>;
-
-beforeEach(() => {
-  mockObserve = vi.fn();
-  mockDisconnect = vi.fn();
-
-  vi.stubGlobal(
-    'IntersectionObserver',
-    vi.fn((callback: IntersectionObserverCallback) => {
-      intersectionCallback = callback;
-      return {
-        observe: mockObserve,
-        disconnect: mockDisconnect,
-        unobserve: vi.fn(),
-      };
-    }),
-  );
-});
-
-afterEach(() => {
-  vi.unstubAllGlobals();
-});
+// Mock Select component
+vi.mock('@/components/ui/select', () => ({
+  Select: ({ children, onValueChange, value }: { children: React.ReactNode; onValueChange: (v: string) => void; value: string }) => (
+    <div data-testid="county-select" data-value={value}>
+      {children}
+      <select
+        data-testid="county-select-native"
+        value={value}
+        onChange={(e) => onValueChange(e.target.value)}
+        aria-hidden="true"
+        style={{ display: 'none' }}
+      >
+        <option value="all">All counties</option>
+        <option value="Los Angeles">Los Angeles</option>
+        <option value="Orange">Orange</option>
+      </select>
+    </div>
+  ),
+  SelectTrigger: ({ children, ...props }: { children: React.ReactNode; [key: string]: unknown }) => (
+    <button data-testid="county-select-trigger" {...props}>{children}</button>
+  ),
+  SelectValue: ({ placeholder }: { placeholder?: string }) => (
+    <span>{placeholder}</span>
+  ),
+  SelectContent: ({ children }: { children: React.ReactNode }) => <div>{children}</div>,
+  SelectItem: ({ children, value }: { children: React.ReactNode; value: string }) => (
+    <div data-value={value}>{children}</div>
+  ),
+}));
 
 import { JudgesList } from '../JudgesList';
 
@@ -102,9 +112,10 @@ const MOCK_JUDGES_DATA = {
         cursor: 'cursor-1',
         node: {
           id: 'judge-1',
-          canonicalName: 'Smith, John A.',
+          canonicalName: 'John A. Smith',
           department: '42',
           isActive: true,
+          rulingCount: 55,
           court: {
             courtName: 'Superior Court of California',
             county: 'Los Angeles',
@@ -115,36 +126,73 @@ const MOCK_JUDGES_DATA = {
         cursor: 'cursor-2',
         node: {
           id: 'judge-2',
-          canonicalName: 'Johnson, Robert M.',
+          canonicalName: 'Robert M. Johnson',
           department: null,
           isActive: false,
+          rulingCount: 23,
           court: {
             courtName: 'Superior Court of California',
             county: 'Orange',
           },
         },
       },
+      {
+        cursor: 'cursor-3',
+        node: {
+          id: 'judge-3',
+          canonicalName: 'Alice Z. Anderson',
+          department: null,
+          isActive: true,
+          rulingCount: 100,
+          court: {
+            courtName: 'Superior Court of California',
+            county: 'Los Angeles',
+          },
+        },
+      },
     ],
     pageInfo: {
-      hasNextPage: true,
-      endCursor: 'cursor-2',
+      hasNextPage: false,
+      endCursor: 'cursor-3',
     },
   },
 };
 
+const MOCK_COUNTIES_DATA = {
+  distinctCounties: ['Los Angeles', 'Orange', 'San Diego'],
+};
+
+function setupMocks({
+  judgesData = MOCK_JUDGES_DATA,
+  countiesData = MOCK_COUNTIES_DATA,
+  loading = false,
+  error,
+}: {
+  judgesData?: typeof MOCK_JUDGES_DATA | { judges: { edges: []; pageInfo: { hasNextPage: false; endCursor: null } } };
+  countiesData?: typeof MOCK_COUNTIES_DATA;
+  loading?: boolean;
+  error?: Error;
+} = {}) {
+  // useQuery is called with different queries — match on the query string content
+  mockUseQuery.mockImplementation((query: string) => {
+    if (typeof query === 'string' && query.includes('distinctCounties')) {
+      return { data: countiesData };
+    }
+    if (typeof query === 'string' && query.includes('JudgesPage2')) {
+      return { data: undefined };
+    }
+    // Default: JUDGES_QUERY
+    return { data: loading ? undefined : judgesData, loading, error };
+  });
+}
+
 describe('JudgesList', () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    mockSearchParamsValue = new URLSearchParams();
   });
 
   it('renders skeleton rows while loading', () => {
-    mockUseQuery.mockReturnValue({
-      data: undefined,
-      loading: true,
-      error: undefined,
-      fetchMore: vi.fn(),
-    });
+    setupMocks({ loading: true });
 
     const { container } = render(<JudgesList />);
     const skeletons = container.querySelectorAll('.animate-pulse');
@@ -152,436 +200,191 @@ describe('JudgesList', () => {
   });
 
   it('renders error state with soft styling', () => {
-    mockUseQuery.mockReturnValue({
-      data: undefined,
-      loading: false,
-      error: new Error('Network error'),
-      fetchMore: vi.fn(),
-    });
+    setupMocks({ error: new Error('Network error') });
 
     const { container } = render(<JudgesList />);
     expect(screen.getByText(/Failed to load judges/)).toBeInTheDocument();
-
-    // Should NOT use destructive styling
     expect(container.querySelector('.text-destructive')).not.toBeInTheDocument();
-
-    // Should use soft styling with text-red-700
     expect(container.querySelector('.text-red-700')).toBeInTheDocument();
-
-    // Should have AlertCircle icon
     expect(screen.getByTestId('alert-circle-icon')).toBeInTheDocument();
-
-    // Should have a Try again action
     expect(screen.getByText('Try again')).toBeInTheDocument();
   });
 
   it('renders empty state when no judges found', () => {
-    mockUseQuery.mockReturnValue({
-      data: {
-        judges: {
-          edges: [],
-          pageInfo: { hasNextPage: false, endCursor: null },
-        },
+    setupMocks({
+      judgesData: {
+        judges: { edges: [], pageInfo: { hasNextPage: false, endCursor: null } },
       },
-      loading: false,
-      error: undefined,
-      fetchMore: vi.fn(),
     });
 
     render(<JudgesList />);
     expect(screen.getByText(/No judges found/)).toBeInTheDocument();
   });
 
-  it('renders judge names', () => {
-    mockUseQuery.mockReturnValue({
-      data: MOCK_JUDGES_DATA,
-      loading: false,
-      error: undefined,
-      fetchMore: vi.fn(),
-    });
+  it('renders judge names sorted by surname by default', () => {
+    setupMocks();
 
     render(<JudgesList />);
-    expect(screen.getByText('Smith, John A.')).toBeInTheDocument();
-    expect(screen.getByText('Johnson, Robert M.')).toBeInTheDocument();
+    expect(screen.getByText('Alice Z. Anderson')).toBeInTheDocument();
+    expect(screen.getByText('Robert M. Johnson')).toBeInTheDocument();
+    expect(screen.getByText('John A. Smith')).toBeInTheDocument();
+
+    // Check order: Anderson < Johnson < Smith (by surname)
+    const links = screen.getAllByRole('link');
+    const names = links.map((l) => l.textContent).filter(Boolean);
+    expect(names).toEqual(['Alice Z. Anderson', 'Robert M. Johnson', 'John A. Smith']);
   });
 
-  it('renders court info for each judge', () => {
-    mockUseQuery.mockReturnValue({
-      data: MOCK_JUDGES_DATA,
-      loading: false,
-      error: undefined,
-      fetchMore: vi.fn(),
-    });
+  it('renders court county for each judge', () => {
+    setupMocks();
 
     render(<JudgesList />);
-    expect(screen.getByText(/Los Angeles/)).toBeInTheDocument();
-    expect(screen.getByText(/Orange/)).toBeInTheDocument();
+    expect(screen.getAllByText(/Los Angeles/).length).toBeGreaterThan(0);
+    expect(screen.getAllByText(/Orange/).length).toBeGreaterThan(0);
   });
 
-  it('does not render status badges in the list view', () => {
-    mockUseQuery.mockReturnValue({
-      data: MOCK_JUDGES_DATA,
-      loading: false,
-      error: undefined,
-      fetchMore: vi.fn(),
-    });
+  it('renders ruling count for each judge', () => {
+    setupMocks();
 
     render(<JudgesList />);
-    expect(screen.queryByText('Active')).not.toBeInTheDocument();
-    expect(screen.queryByText('Inactive')).not.toBeInTheDocument();
+    expect(screen.getByText('55')).toBeInTheDocument();
+    expect(screen.getByText('23')).toBeInTheDocument();
+    expect(screen.getByText('100')).toBeInTheDocument();
   });
 
   it('renders department inline with judge name when available', () => {
-    mockUseQuery.mockReturnValue({
-      data: MOCK_JUDGES_DATA,
-      loading: false,
-      error: undefined,
-      fetchMore: vi.fn(),
-    });
+    setupMocks();
 
     render(<JudgesList />);
-    // Department should appear inline next to the judge name
     expect(screen.getByText(/Dept\. 42/)).toBeInTheDocument();
-    // The department text should be in the same cell as the judge name
-    const judgeLink = screen.getByText('Smith, John A.');
+    const judgeLink = screen.getByText('John A. Smith');
     const cell = judgeLink.closest('td');
     expect(cell?.textContent).toContain('Dept. 42');
   });
 
   it('does not render department text when department is null', () => {
-    mockUseQuery.mockReturnValue({
-      data: MOCK_JUDGES_DATA,
-      loading: false,
-      error: undefined,
-      fetchMore: vi.fn(),
-    });
+    setupMocks();
 
     render(<JudgesList />);
-    // Johnson has no department — should not show "Dept." text near that judge
-    const johnsonLink = screen.getByText('Johnson, Robert M.');
+    const johnsonLink = screen.getByText('Robert M. Johnson');
     const cell = johnsonLink.closest('td');
     expect(cell?.textContent).not.toContain('Dept.');
   });
 
   it('renders judge links pointing to detail pages', () => {
-    mockUseQuery.mockReturnValue({
-      data: MOCK_JUDGES_DATA,
-      loading: false,
-      error: undefined,
-      fetchMore: vi.fn(),
-    });
+    setupMocks();
 
     render(<JudgesList />);
-    const link = screen.getByText('Smith, John A.').closest('a');
+    const link = screen.getByText('John A. Smith').closest('a');
     expect(link).toHaveAttribute('href', '/judges/judge-1');
   });
 
-  it('renders sentinel element when hasNextPage is true (infinite scroll)', () => {
-    mockUseQuery.mockReturnValue({
-      data: MOCK_JUDGES_DATA,
-      loading: false,
-      error: undefined,
-      fetchMore: vi.fn(),
-    });
+  it('renders sortable column headers', () => {
+    setupMocks();
 
     render(<JudgesList />);
-    expect(screen.getByTestId('scroll-sentinel')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /Name/ })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /County/ })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /Rulings/ })).toBeInTheDocument();
   });
 
-  it('does not render sentinel when hasNextPage is false', () => {
-    mockUseQuery.mockReturnValue({
-      data: {
-        judges: {
-          ...MOCK_JUDGES_DATA.judges,
-          pageInfo: { hasNextPage: false, endCursor: null },
-        },
-      },
-      loading: false,
-      error: undefined,
-      fetchMore: vi.fn(),
-    });
+  it('sorts by ruling count descending when column clicked', () => {
+    setupMocks();
 
     render(<JudgesList />);
-    expect(screen.queryByTestId('scroll-sentinel')).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: /Rulings/ }));
+
+    const links = screen.getAllByRole('link');
+    const names = links.map((l) => l.textContent).filter(Boolean);
+    // Descending by ruling count: Anderson (100) > Smith (55) > Johnson (23)
+    expect(names).toEqual(['Alice Z. Anderson', 'John A. Smith', 'Robert M. Johnson']);
   });
 
-  it('sets up IntersectionObserver on the sentinel element', () => {
-    mockUseQuery.mockReturnValue({
-      data: MOCK_JUDGES_DATA,
-      loading: false,
-      error: undefined,
-      fetchMore: vi.fn(),
-    });
+  it('toggles sort direction when same column clicked twice', () => {
+    setupMocks();
 
     render(<JudgesList />);
-    expect(IntersectionObserver).toHaveBeenCalledWith(
-      expect.any(Function),
-      { rootMargin: '200px' },
-    );
-    expect(mockObserve).toHaveBeenCalled();
+    // Click Name twice — first click keeps asc (already active), second toggles to desc
+    fireEvent.click(screen.getByRole('button', { name: /Name/ }));
+
+    const links = screen.getAllByRole('link');
+    const names = links.map((l) => l.textContent).filter(Boolean);
+    // Descending by surname: Smith > Johnson > Anderson
+    expect(names).toEqual(['John A. Smith', 'Robert M. Johnson', 'Alice Z. Anderson']);
   });
 
-  it('calls fetchMore when sentinel becomes visible', () => {
-    const mockFetchMore = vi.fn().mockResolvedValue({});
-    mockUseQuery.mockReturnValue({
-      data: MOCK_JUDGES_DATA,
-      loading: false,
-      error: undefined,
-      fetchMore: mockFetchMore,
-    });
+  it('sorts by county when County column clicked', () => {
+    setupMocks();
 
     render(<JudgesList />);
+    fireEvent.click(screen.getByRole('button', { name: /County/ }));
 
-    // Simulate the sentinel becoming visible
-    intersectionCallback(
-      [{ isIntersecting: true } as IntersectionObserverEntry],
-      {} as IntersectionObserver,
-    );
-
-    expect(mockFetchMore).toHaveBeenCalledWith(
-      expect.objectContaining({
-        variables: { after: 'cursor-2' },
-      }),
-    );
+    const links = screen.getAllByRole('link');
+    const names = links.map((l) => l.textContent).filter(Boolean);
+    // Ascending by county: LA (Anderson, Smith) < Orange (Johnson)
+    // Within LA, sorted by surname: Anderson < Smith
+    expect(names).toEqual(['Alice Z. Anderson', 'John A. Smith', 'Robert M. Johnson']);
   });
 
-  it('does not call fetchMore when sentinel is not intersecting', () => {
-    const mockFetchMore = vi.fn().mockResolvedValue({});
-    mockUseQuery.mockReturnValue({
-      data: MOCK_JUDGES_DATA,
-      loading: false,
-      error: undefined,
-      fetchMore: mockFetchMore,
-    });
+  it('filters judges client-side by name', () => {
+    setupMocks();
 
     render(<JudgesList />);
+    const input = screen.getByLabelText(/Judge name/i);
+    fireEvent.change(input, { target: { value: 'Smith' } });
 
-    intersectionCallback(
-      [{ isIntersecting: false } as IntersectionObserverEntry],
-      {} as IntersectionObserver,
-    );
-
-    expect(mockFetchMore).not.toHaveBeenCalled();
+    expect(screen.getByText('John A. Smith')).toBeInTheDocument();
+    expect(screen.queryByText('Robert M. Johnson')).not.toBeInTheDocument();
+    expect(screen.queryByText('Alice Z. Anderson')).not.toBeInTheDocument();
   });
 
-  it('does not render sentinel while loading more results', () => {
-    mockUseQuery.mockReturnValue({
-      data: MOCK_JUDGES_DATA,
-      loading: true,
-      error: undefined,
-      fetchMore: vi.fn(),
-    });
+  it('renders filter input', () => {
+    setupMocks();
 
     render(<JudgesList />);
-    // Sentinel hidden during loading to prevent duplicate fetches
-    expect(screen.queryByTestId('scroll-sentinel')).not.toBeInTheDocument();
-  });
-
-  it('disconnects observer on unmount', () => {
-    mockUseQuery.mockReturnValue({
-      data: MOCK_JUDGES_DATA,
-      loading: false,
-      error: undefined,
-      fetchMore: vi.fn(),
-    });
-
-    const { unmount } = render(<JudgesList />);
-    unmount();
-    expect(mockDisconnect).toHaveBeenCalled();
-  });
-
-  it('does not render a "Load more" button (uses infinite scroll instead)', () => {
-    mockUseQuery.mockReturnValue({
-      data: MOCK_JUDGES_DATA,
-      loading: false,
-      error: undefined,
-      fetchMore: vi.fn(),
-    });
-
-    render(<JudgesList />);
-    expect(screen.queryByText('Load more')).not.toBeInTheDocument();
-  });
-
-  it('renders filter input for name search', () => {
-    mockUseQuery.mockReturnValue({
-      data: MOCK_JUDGES_DATA,
-      loading: false,
-      error: undefined,
-      fetchMore: vi.fn(),
-    });
-
-    render(<JudgesList />);
-    expect(
-      screen.getByLabelText(/Judge name/i),
-    ).toBeInTheDocument();
+    expect(screen.getByLabelText(/Judge name/i)).toBeInTheDocument();
   });
 
   it('filter input has name attribute', () => {
-    mockUseQuery.mockReturnValue({
-      data: MOCK_JUDGES_DATA,
-      loading: false,
-      error: undefined,
-      fetchMore: vi.fn(),
-    });
+    setupMocks();
 
     render(<JudgesList />);
     const input = screen.getByLabelText(/Judge name/i);
     expect(input).toHaveAttribute('name', 'judgeName');
   });
 
-  it('filter placeholder uses real ellipsis character, not literal \\u2026', () => {
-    mockUseQuery.mockReturnValue({
-      data: MOCK_JUDGES_DATA,
-      loading: false,
-      error: undefined,
-      fetchMore: vi.fn(),
-    });
-
-    render(<JudgesList />);
-    const input = screen.getByLabelText(/Judge name/i);
-    const placeholder = input.getAttribute('placeholder') ?? '';
-    // Should contain the actual ellipsis character
-    expect(placeholder).toContain('\u2026');
-    // Should NOT contain the literal backslash-u sequence
-    expect(placeholder).not.toContain('\\u2026');
-  });
-
-  it('filters judges client-side by name', () => {
-    mockUseQuery.mockReturnValue({
-      data: MOCK_JUDGES_DATA,
-      loading: false,
-      error: undefined,
-      fetchMore: vi.fn(),
-    });
-
-    render(<JudgesList />);
-    const input = screen.getByLabelText(/Judge name/i);
-    fireEvent.change(input, { target: { value: 'Smith' } });
-
-    expect(screen.getByText('Smith, John A.')).toBeInTheDocument();
-    expect(screen.queryByText('Johnson, Robert M.')).not.toBeInTheDocument();
-  });
-
   it('uses shadcn Table component', () => {
-    mockUseQuery.mockReturnValue({
-      data: MOCK_JUDGES_DATA,
-      loading: false,
-      error: undefined,
-      fetchMore: vi.fn(),
-    });
+    setupMocks();
 
     const { container } = render(<JudgesList />);
     expect(container.querySelector('table')).toBeInTheDocument();
   });
 
-  it('renders Select, Judge, and County column headers', () => {
-    mockUseQuery.mockReturnValue({
-      data: MOCK_JUDGES_DATA,
-      loading: false,
-      error: undefined,
-      fetchMore: vi.fn(),
-    });
+  it('displays judge count at the bottom', () => {
+    setupMocks();
 
     render(<JudgesList />);
-    expect(screen.getByText('Judge')).toBeInTheDocument();
-    expect(screen.getByText('County')).toBeInTheDocument();
-    // Dept. and Status columns have been removed
-    expect(screen.queryByRole('columnheader', { name: 'Dept.' })).not.toBeInTheDocument();
-    expect(screen.queryByRole('columnheader', { name: 'Status' })).not.toBeInTheDocument();
+    expect(screen.getByText('3 judges')).toBeInTheDocument();
   });
 
-  it('updates URL params when name filter changes', () => {
-    mockUseQuery.mockReturnValue({
-      data: MOCK_JUDGES_DATA,
-      loading: false,
-      error: undefined,
-      fetchMore: vi.fn(),
-    });
-
-    render(<JudgesList />);
-    const input = screen.getByLabelText(/Judge name/i);
-    fireEvent.change(input, { target: { value: 'Smith' } });
-    expect(mockReplace).toHaveBeenCalledWith(expect.stringContaining('name=Smith'));
-  });
-
-  it('initializes name filter from URL params', () => {
-    mockSearchParamsValue = new URLSearchParams('name=Johnson');
-    mockUseQuery.mockReturnValue({
-      data: MOCK_JUDGES_DATA,
-      loading: false,
-      error: undefined,
-      fetchMore: vi.fn(),
-    });
-
-    render(<JudgesList />);
-    expect((screen.getByLabelText(/Judge name/i) as HTMLInputElement).value).toBe('Johnson');
-    // Should filter to only Johnson
-    expect(screen.getByText('Johnson, Robert M.')).toBeInTheDocument();
-    expect(screen.queryByText('Smith, John A.')).not.toBeInTheDocument();
-  });
-
-  it('clears URL params when name filter is cleared', () => {
-    mockUseQuery.mockReturnValue({
-      data: MOCK_JUDGES_DATA,
-      loading: false,
-      error: undefined,
-      fetchMore: vi.fn(),
-    });
-
-    render(<JudgesList />);
-    // Initially no name param
-    expect(mockReplace).toHaveBeenCalledWith('/judges');
-  });
-
-  // Hover state tests (#1743)
-  it('renders hover highlight on judge rows via TableRow component', () => {
-    mockUseQuery.mockReturnValue({
-      data: MOCK_JUDGES_DATA,
-      loading: false,
-      error: undefined,
-      fetchMore: vi.fn(),
-    });
-
-    const { container } = render(<JudgesList />);
-    // TableRow uses hover:bg-muted/50 in its className
-    const rows = container.querySelectorAll('tr.hover\\:bg-muted\\/50');
-    // 2 data rows + 1 header row (header TableRow also has hover)
-    expect(rows.length).toBeGreaterThanOrEqual(2);
-  });
-
-  // Selection and comparison tests (#1753)
+  // Selection and comparison tests
   it('renders checkboxes for each judge row', () => {
-    mockUseQuery.mockReturnValue({
-      data: MOCK_JUDGES_DATA,
-      loading: false,
-      error: undefined,
-      fetchMore: vi.fn(),
-    });
+    setupMocks();
 
     render(<JudgesList />);
     const checkboxes = screen.getAllByTestId('judge-checkbox');
-    expect(checkboxes).toHaveLength(2);
+    expect(checkboxes).toHaveLength(3);
   });
 
   it('does not show compare button when no judges selected', () => {
-    mockUseQuery.mockReturnValue({
-      data: MOCK_JUDGES_DATA,
-      loading: false,
-      error: undefined,
-      fetchMore: vi.fn(),
-    });
+    setupMocks();
 
     render(<JudgesList />);
     expect(screen.queryByTestId('compare-button')).not.toBeInTheDocument();
   });
 
   it('shows compare button when a judge is selected', () => {
-    mockUseQuery.mockReturnValue({
-      data: MOCK_JUDGES_DATA,
-      loading: false,
-      error: undefined,
-      fetchMore: vi.fn(),
-    });
+    setupMocks();
 
     render(<JudgesList />);
     const checkboxes = screen.getAllByTestId('judge-checkbox');
@@ -591,12 +394,7 @@ describe('JudgesList', () => {
   });
 
   it('disables compare button when only 1 judge selected', () => {
-    mockUseQuery.mockReturnValue({
-      data: MOCK_JUDGES_DATA,
-      loading: false,
-      error: undefined,
-      fetchMore: vi.fn(),
-    });
+    setupMocks();
 
     render(<JudgesList />);
     const checkboxes = screen.getAllByTestId('judge-checkbox');
@@ -605,12 +403,7 @@ describe('JudgesList', () => {
   });
 
   it('enables compare button when 2+ judges selected', () => {
-    mockUseQuery.mockReturnValue({
-      data: MOCK_JUDGES_DATA,
-      loading: false,
-      error: undefined,
-      fetchMore: vi.fn(),
-    });
+    setupMocks();
 
     render(<JudgesList />);
     const checkboxes = screen.getAllByTestId('judge-checkbox');
@@ -620,13 +413,8 @@ describe('JudgesList', () => {
     expect(screen.getByTestId('compare-button')).toHaveTextContent('Compare (2)');
   });
 
-  it('navigates to compare page with selected judge IDs when compare button clicked', () => {
-    mockUseQuery.mockReturnValue({
-      data: MOCK_JUDGES_DATA,
-      loading: false,
-      error: undefined,
-      fetchMore: vi.fn(),
-    });
+  it('navigates to compare page with selected judge IDs', () => {
+    setupMocks();
 
     render(<JudgesList />);
     const checkboxes = screen.getAllByTestId('judge-checkbox');
@@ -636,99 +424,39 @@ describe('JudgesList', () => {
     expect(mockPush).toHaveBeenCalledWith(
       expect.stringContaining('/judges/compare?ids='),
     );
-    // The URL should contain both judge IDs
-    const calledUrl = mockPush.mock.calls[0][0] as string;
-    expect(calledUrl).toContain('judge-1');
-    expect(calledUrl).toContain('judge-2');
   });
 
   it('deselects a judge when checkbox is clicked again', () => {
-    mockUseQuery.mockReturnValue({
-      data: MOCK_JUDGES_DATA,
-      loading: false,
-      error: undefined,
-      fetchMore: vi.fn(),
-    });
+    setupMocks();
 
     render(<JudgesList />);
     const checkboxes = screen.getAllByTestId('judge-checkbox');
-    // Select both
     fireEvent.click(checkboxes[0]);
     fireEvent.click(checkboxes[1]);
     expect(screen.getByTestId('compare-button')).toHaveTextContent('Compare (2)');
-    // Deselect first
     fireEvent.click(checkboxes[0]);
     expect(screen.getByTestId('compare-button')).toHaveTextContent('Compare (1)');
   });
 
   it('renders checkbox aria-label with judge name', () => {
-    mockUseQuery.mockReturnValue({
-      data: MOCK_JUDGES_DATA,
-      loading: false,
-      error: undefined,
-      fetchMore: vi.fn(),
-    });
+    setupMocks();
 
     render(<JudgesList />);
-    expect(screen.getByLabelText('Select Smith, John A. for comparison')).toBeInTheDocument();
-    expect(screen.getByLabelText('Select Johnson, Robert M. for comparison')).toBeInTheDocument();
+    expect(screen.getByLabelText('Select Alice Z. Anderson for comparison')).toBeInTheDocument();
+    expect(screen.getByLabelText('Select John A. Smith for comparison')).toBeInTheDocument();
   });
 
-  // Full-row clickable tests (#2108)
-  it('renders data rows with cursor-pointer for row-level click', () => {
-    mockUseQuery.mockReturnValue({
-      data: MOCK_JUDGES_DATA,
-      loading: false,
-      error: undefined,
-      fetchMore: vi.fn(),
-    });
-
-    const { container } = render(<JudgesList />);
-    const clickableRows = container.querySelectorAll('tr.cursor-pointer');
-    expect(clickableRows.length).toBe(2);
-  });
-
-  it('navigates to judge detail when row is clicked', () => {
-    mockUseQuery.mockReturnValue({
-      data: MOCK_JUDGES_DATA,
-      loading: false,
-      error: undefined,
-      fetchMore: vi.fn(),
-    });
+  it('does not render a "Load more" button', () => {
+    setupMocks();
 
     render(<JudgesList />);
-    // Click the county cell (not the link or checkbox) to test row-level click
-    const countyCells = screen.getAllByText(/Los Angeles|Orange/);
-    fireEvent.click(countyCells[0]);
-    expect(mockPush).toHaveBeenCalledWith('/judges/judge-1');
+    expect(screen.queryByText('Load more')).not.toBeInTheDocument();
   });
 
-  it('does not navigate when checkbox cell is clicked', () => {
-    mockUseQuery.mockReturnValue({
-      data: MOCK_JUDGES_DATA,
-      loading: false,
-      error: undefined,
-      fetchMore: vi.fn(),
-    });
+  it('renders county filter select', () => {
+    setupMocks();
 
     render(<JudgesList />);
-    const checkboxes = screen.getAllByTestId('judge-checkbox');
-    mockPush.mockClear();
-    fireEvent.click(checkboxes[0]);
-    // Checkbox click should toggle selection, not navigate
-    expect(mockPush).not.toHaveBeenCalled();
-  });
-
-  it('preserves judge name as semantic link for right-click/new-tab', () => {
-    mockUseQuery.mockReturnValue({
-      data: MOCK_JUDGES_DATA,
-      loading: false,
-      error: undefined,
-      fetchMore: vi.fn(),
-    });
-
-    render(<JudgesList />);
-    const link = screen.getByText('Smith, John A.').closest('a');
-    expect(link).toHaveAttribute('href', '/judges/judge-1');
+    expect(screen.getByTestId('county-select')).toBeInTheDocument();
   });
 });

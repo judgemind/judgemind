@@ -41,19 +41,19 @@ describe('JudgesLoading', () => {
     expect(screen.getByTestId('table')).toBeInTheDocument();
   });
 
-  it('renders only Judge and County table headers', () => {
+  it('renders Name, County, and Rulings table headers', () => {
     render(<JudgesLoading />);
-    expect(screen.getByText('Judge')).toBeInTheDocument();
+    expect(screen.getByText('Name')).toBeInTheDocument();
     expect(screen.getByText('County')).toBeInTheDocument();
-    // Dept. and Status columns have been removed
+    expect(screen.getByText('Rulings')).toBeInTheDocument();
     const headers = screen.getAllByRole('columnheader');
-    expect(headers).toHaveLength(2);
+    expect(headers).toHaveLength(3);
   });
 
-  it('renders 8 skeleton rows plus 1 header row', () => {
+  it('renders 10 skeleton rows plus 1 header row', () => {
     render(<JudgesLoading />);
     const rows = screen.getAllByTestId('table-row');
-    // 1 header row + 8 skeleton rows = 9
-    expect(rows).toHaveLength(9);
+    // 1 header row + 10 skeleton rows = 11
+    expect(rows).toHaveLength(11);
   });
 });
