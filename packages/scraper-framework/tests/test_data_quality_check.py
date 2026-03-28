@@ -1961,7 +1961,7 @@ class TestScheduleAwareStaleness:
         last_run = datetime(2026, 3, 12, 12, 0, 0, tzinfo=UTC)
         conn = FakeConnection(
             {
-                "scraper_runs": [("ca-sc-tentatives", "Santa Clara", last_run, "success")],
+                "scraper_runs": [("ca-sc-tentatives-civil", "Santa Clara", last_run, "success")],
                 "MAX(d.captured_at)": [],
             }
         )
@@ -1984,7 +1984,7 @@ class TestScheduleAwareStaleness:
         last_run = tuesday - timedelta(hours=27)
         conn = FakeConnection(
             {
-                "scraper_runs": [("ca-sc-tentatives", "Santa Clara", last_run, "success")],
+                "scraper_runs": [("ca-sc-tentatives-civil", "Santa Clara", last_run, "success")],
                 "MAX(d.captured_at)": [],
             }
         )
@@ -2021,7 +2021,7 @@ class TestScheduleAwareStaleness:
         last_run = NOW - timedelta(hours=40)
         conn = FakeConnection(
             {
-                "scraper_runs": [("ca-sc-tentatives", "Santa Clara", last_run, "success")],
+                "scraper_runs": [("ca-sc-tentatives-civil", "Santa Clara", last_run, "success")],
                 "MAX(d.captured_at)": [],
             }
         )

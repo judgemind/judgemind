@@ -180,10 +180,10 @@ assert_output_contains "--dry-run shows security group" "sg-ccc333" "$RUN_OUTPUT
 
 # ─── Test 6: Multiple scraper IDs in --dry-run ──────────────────────────────
 
-run_capturing_exit env PATH="$MOCK_BIN:$PATH" "$RUN_SCRAPER" --dry-run ca-la-tentatives-civil ca-oc-tentatives
+run_capturing_exit env PATH="$MOCK_BIN:$PATH" "$RUN_SCRAPER" --dry-run ca-la-tentatives-civil ca-oc-tentatives-civil
 assert_exit_code "Multiple IDs --dry-run exits 0" 0 "$RUN_EC"
 assert_output_contains "Multiple IDs shows first ID" "ca-la-tentatives-civil" "$RUN_OUTPUT"
-assert_output_contains "Multiple IDs shows second ID" "ca-oc-tentatives" "$RUN_OUTPUT"
+assert_output_contains "Multiple IDs shows second ID" "ca-oc-tentatives-civil" "$RUN_OUTPUT"
 
 # ─── Test 7: --env flag changes the environment ─────────────────────────────
 

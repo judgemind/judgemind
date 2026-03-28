@@ -27,7 +27,7 @@ def _make_event(**overrides: object) -> dict:
     """Return a minimal valid DocumentCapturedEvent payload."""
     base: dict = {
         "document_id": "aaaaaaaa-0000-0000-0000-000000000001",
-        "scraper_id": "ca-oc-tentatives",
+        "scraper_id": "ca-oc-tentatives-civil",
         "state": "CA",
         "county": "Orange",
         "court": "Superior Court",

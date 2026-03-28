@@ -297,8 +297,8 @@ class TestBuildRegistry:
         assert "ca-cc-tentatives" in ids
         assert "ca-fresno-tentatives-civil" in ids
         assert "ca-la-tentatives-civil" in ids
-        assert "ca-oc-tentatives" in ids
-        assert "ca-riverside-tentatives" in ids
+        assert "ca-oc-tentatives-civil" in ids
+        assert "ca-riverside-tentatives-civil" in ids
         assert "ca-sf-tentatives-family-law" in ids
 
     def test_build_registry_caches_result(self) -> None:
@@ -435,7 +435,7 @@ class TestRiversideDeptJudgeMapping:
 
         def riv_config(s3_bucket: str = "") -> ScraperConfig:
             return ScraperConfig(
-                scraper_id="ca-riverside-tentatives",
+                scraper_id="ca-riverside-tentatives-civil",
                 state="CA",
                 county="Riverside",
                 court="Superior Court",
@@ -443,7 +443,7 @@ class TestRiversideDeptJudgeMapping:
                 s3_bucket=s3_bucket,
             )
 
-        entries = [("ca-riverside-tentatives", CapturingStub, riv_config)]
+        entries = [("ca-riverside-tentatives-civil", CapturingStub, riv_config)]
         fake_map = {"Dept A": "Judge Johnson"}
 
         mock_module = MagicMock()
@@ -470,7 +470,7 @@ class TestRiversideDeptJudgeMapping:
 
         def riv_config(s3_bucket: str = "") -> ScraperConfig:
             return ScraperConfig(
-                scraper_id="ca-riverside-tentatives",
+                scraper_id="ca-riverside-tentatives-civil",
                 state="CA",
                 county="Riverside",
                 court="Superior Court",
@@ -478,7 +478,7 @@ class TestRiversideDeptJudgeMapping:
                 s3_bucket=s3_bucket,
             )
 
-        entries = [("ca-riverside-tentatives", TrackingStub, riv_config)]
+        entries = [("ca-riverside-tentatives-civil", TrackingStub, riv_config)]
 
         mock_module = MagicMock()
         mock_module.fetch_department_judge_mapping.side_effect = RuntimeError("network error")
@@ -490,7 +490,7 @@ class TestRiversideDeptJudgeMapping:
             exit_code = run_scrapers()
 
         assert exit_code == 0
-        assert "ca-riverside-tentatives" in ran
+        assert "ca-riverside-tentatives-civil" in ran
 
 
 # ---------------------------------------------------------------------------
@@ -696,13 +696,13 @@ class TestMainEntrypoint:
             patch.object(
                 sys,
                 "argv",
-                ["framework.runner", "ca-la-tentatives-civil", "ca-oc-tentatives"],
+                ["framework.runner", "ca-la-tentatives-civil", "ca-oc-tentatives-civil"],
             ),
             pytest.raises(SystemExit) as exc_info,
         ):
             main()
 
-        mock_run.assert_called_once_with(["ca-la-tentatives-civil", "ca-oc-tentatives"])
+        mock_run.assert_called_once_with(["ca-la-tentatives-civil", "ca-oc-tentatives-civil"])
         assert exc_info.value.code == 0
 
     def test_main_returns_failure_exit_code(self) -> None:

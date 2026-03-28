@@ -29,7 +29,7 @@
 #   scripts/run-scraper.sh ca-la-tentatives-civil
 #
 #   # Run multiple scrapers in one task
-#   scripts/run-scraper.sh ca-la-tentatives-civil ca-oc-tentatives
+#   scripts/run-scraper.sh ca-la-tentatives-civil ca-oc-tentatives-civil
 #
 #   # Launch and return immediately (for long-running scrapers)
 #   scripts/run-scraper.sh --detach federal-courtlistener-opinions

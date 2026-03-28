@@ -219,12 +219,12 @@ def _build_registry() -> list[tuple[str, type, callable]]:
             ("ca-cc-tentatives", CCTentativeRulingsScraper, cc_config),
             ("ca-fresno-tentatives-civil", FresnoTentativeRulingsScraper, fresno_config),
             ("ca-la-tentatives-civil", LATentativeRulingsScraper, la_config),
-            ("ca-oc-tentatives", OCTentativeRulingsScraper, oc_config),
+            ("ca-oc-tentatives-civil", OCTentativeRulingsScraper, oc_config),
             ("ca-oc-tentatives-family-law", OCFamilyLawTentativeRulingsScraper, oc_fl_config),
             ("ca-oc-tentatives-probate", OCProbateTentativeRulingsScraper, oc_probate_config),
-            ("ca-riverside-tentatives", RiversideTentativeRulingsScraper, riverside_config),
-            ("ca-sb-tentatives", SBTentativeRulingsScraper, sb_config),
-            ("ca-sc-tentatives", SCTentativeRulingsScraper, sc_config),
+            ("ca-riverside-tentatives-civil", RiversideTentativeRulingsScraper, riverside_config),
+            ("ca-sb-tentatives-civil", SBTentativeRulingsScraper, sb_config),
+            ("ca-sc-tentatives-civil", SCTentativeRulingsScraper, sc_config),
             ("ca-sd-calendar", SDCalendarScraper, sd_cal_config),
             ("ca-sd-pipeline", SDPipelineScraper, sd_pipeline_config),
             ("ca-sd-tentatives", SDTentativeRulingsScraper, sd_config),
@@ -310,7 +310,7 @@ def run_scrapers(scraper_ids: list[str] | None = None) -> int:
 
         # Pre-fetch the Riverside department-to-judge mapping (#585).
         riv_dept_judge_map: dict[str, str] = {}
-        riv_scraper_ids = {"ca-riverside-tentatives"}
+        riv_scraper_ids = {"ca-riverside-tentatives-civil"}
         if any(e[0] in riv_scraper_ids for e in entries):
             try:
                 from courts.ca.riverside_dept_judges import (

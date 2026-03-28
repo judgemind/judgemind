@@ -149,6 +149,18 @@ jobs:
           flags: scraper-framework
           fail_ci_if_error: false
 
+  scraper-registry-check:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.scraper == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Check scraper registry
+        run: python scripts/check_scraper_registry.py
+
   scraper-court-tests:
     needs: detect-changes
     if: needs.detect-changes.outputs.scraper-courts == 'true'
