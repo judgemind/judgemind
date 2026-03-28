@@ -535,27 +535,45 @@ _DEPT_ZERO_PAD: dict[str, int] = {
 # Regex: one or more ASCII letters, then one or more digits.
 _DEPT_SPLIT_RE = re.compile(r"^([A-Za-z]+)(\d+)$")
 
+# Regex: letter prefix, hyphen, digits — e.g. "S-17", "R-14".
+# Used to strip spurious hyphens that LLMs insert between the prefix
+# and numeric suffix (San Bernardino departments, etc.).
+_DEPT_HYPHEN_RE = re.compile(r"^([A-Za-z]+)-(\d+)$")
+
 
 def _normalize_department(raw: str) -> str:
-    """Restore leading zeros on department identifiers.
+    """Normalize department identifiers: strip hyphens, restore leading zeros.
 
-    LLMs (especially Haiku) tend to drop leading zeros from department
-    identifiers — e.g. returning ``"CM2"`` instead of ``"CM02"``.
+    Two normalizations are applied in order:
 
-    This function checks the prefix against ``_DEPT_ZERO_PAD`` and pads
-    the numeric suffix to the expected width.  Unknown prefixes are
-    returned unchanged.
+    1. **Hyphen removal** — LLMs sometimes insert a hyphen between a
+       letter prefix and numeric suffix (e.g. ``"S-17"`` instead of
+       ``"S17"``).  This is common for San Bernardino departments.
+       The hyphen is stripped so that ``"S-17"`` becomes ``"S17"``.
+
+    2. **Zero-padding** — LLMs (especially Haiku) tend to drop leading
+       zeros from department identifiers — e.g. returning ``"CM2"``
+       instead of ``"CM02"``.  Known prefixes in ``_DEPT_ZERO_PAD``
+       have their numeric suffix padded to the expected width.
     """
-    m = _DEPT_SPLIT_RE.match(raw.strip())
+    cleaned = raw.strip()
+
+    # Step 1: Strip hyphens between letter prefix and digits.
+    hm = _DEPT_HYPHEN_RE.match(cleaned)
+    if hm:
+        cleaned = f"{hm.group(1)}{hm.group(2)}"
+
+    # Step 2: Zero-pad known prefixes.
+    m = _DEPT_SPLIT_RE.match(cleaned)
     if not m:
-        return raw.strip()
+        return cleaned
 
     prefix = m.group(1).upper()
     digits = m.group(2)
 
     expected_width = _DEPT_ZERO_PAD.get(prefix)
     if expected_width is None:
-        return raw.strip()
+        return cleaned
 
     # Preserve original casing of the prefix from the input.
     original_prefix = m.group(1)

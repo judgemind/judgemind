@@ -23,6 +23,7 @@ from courts.ca.sb_tentatives import (
     BASE_URL,
     INDEX_URL,
     SBTentativeRulingsScraper,
+    _normalize_sb_department,
     _sb_courthouse,
     _sb_hearing_date_from_filename,
     _sb_judge_from_pdf_text,
@@ -430,6 +431,57 @@ def test_sb_run_continues_when_pdf_fails() -> None:
 
     assert health.success is True
     assert health.records_captured == 51  # 52 - 1 failed
+
+
+# ---------------------------------------------------------------------------
+# Department normalization (#2123)
+# ---------------------------------------------------------------------------
+
+
+def test_normalize_sb_department_strips_hyphen() -> None:
+    """S-17 → S17, R-14 → R14."""
+    assert _normalize_sb_department("S-17") == "S17"
+    assert _normalize_sb_department("R-14") == "R14"
+
+
+def test_normalize_sb_department_no_hyphen_unchanged() -> None:
+    """Already-correct S17, R12 should be unchanged."""
+    assert _normalize_sb_department("S17") == "S17"
+    assert _normalize_sb_department("R12") == "R12"
+
+
+def test_normalize_sb_department_strips_whitespace() -> None:
+    """Leading/trailing whitespace should be stripped."""
+    assert _normalize_sb_department("  S-17  ") == "S17"
+    assert _normalize_sb_department("  S17  ") == "S17"
+
+
+def test_normalize_sb_department_preserves_case() -> None:
+    """Lowercase input should preserve its casing."""
+    assert _normalize_sb_department("s-17") == "s17"
+
+
+@respx.mock
+def test_sb_parse_document_normalizes_hyphenated_dept() -> None:
+    """parse_document should normalize a hyphenated department to non-hyphenated."""
+    html = _load_html("sb_iframe_page.html")
+    pdf_bytes = _load_bytes("sb_r12_20260303_0df41117.pdf")
+
+    respx.get(INDEX_URL).mock(return_value=httpx.Response(200, text=html))
+    respx.get(url__regex=r"\.pdf$").mock(
+        return_value=httpx.Response(200, content=pdf_bytes),
+    )
+
+    config = sb_default_config()
+    config.request_delay_seconds = 0
+    scraper = SBTentativeRulingsScraper(config=config)
+
+    docs = scraper.fetch_documents()
+    # Manually set a hyphenated department on the first doc to simulate
+    # a case where the department came with a hyphen (e.g. from LLM or reingest).
+    docs[0].department = "S-24"
+    parsed = scraper.parse_document(docs[0])
+    assert parsed.department == "S24"
 
 
 # ---------------------------------------------------------------------------
