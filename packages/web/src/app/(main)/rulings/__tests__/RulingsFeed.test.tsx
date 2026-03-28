@@ -680,4 +680,51 @@ describe('RulingsFeed', () => {
     const motionBadges = screen.getAllByText('Demurrer');
     expect(motionBadges.length).toBe(2);
   });
+
+  // Full-row clickable tests (#2108)
+  it('makes entire row a clickable link wrapping all content', () => {
+    mockUseQuery.mockReturnValue({
+      data: MOCK_RULINGS_DATA,
+      loading: false,
+      error: undefined,
+      fetchMore: vi.fn(),
+    });
+
+    const { container } = render(<RulingsFeed />);
+    // Each ruling row should be an <a> element (Link renders as <a> in test mock)
+    const rowLinks = container.querySelectorAll('a[href^="/rulings/"]');
+    expect(rowLinks.length).toBe(2);
+    // First row should link to ruling-1
+    expect(rowLinks[0]).toHaveAttribute('href', '/rulings/ruling-1');
+    expect(rowLinks[1]).toHaveAttribute('href', '/rulings/ruling-2');
+  });
+
+  it('renders row links with cursor-pointer class', () => {
+    mockUseQuery.mockReturnValue({
+      data: MOCK_RULINGS_DATA,
+      loading: false,
+      error: undefined,
+      fetchMore: vi.fn(),
+    });
+
+    const { container } = render(<RulingsFeed />);
+    const rowLinks = container.querySelectorAll('.cursor-pointer');
+    expect(rowLinks.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it('renders case title as span, not nested link', () => {
+    mockUseQuery.mockReturnValue({
+      data: MOCK_RULINGS_DATA,
+      loading: false,
+      error: undefined,
+      fetchMore: vi.fn(),
+    });
+
+    render(<RulingsFeed />);
+    const titleElement = screen.getByText(/23STCV12345/);
+    // Title should be a <span>, not an <a> (no nested links)
+    expect(titleElement.tagName.toLowerCase()).toBe('span');
+    // But it should be inside an <a> (the row link)
+    expect(titleElement.closest('a')).toHaveAttribute('href', '/rulings/ruling-1');
+  });
 });
