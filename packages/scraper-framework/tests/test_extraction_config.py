@@ -10,6 +10,7 @@ from __future__ import annotations
 import pytest
 
 from framework.extraction_config import (
+    CONTRA_COSTA_SYSTEM_PROMPT,
     FRESNO_SYSTEM_PROMPT,
     RIVERSIDE_SYSTEM_PROMPT,
     SAN_BERNARDINO_SYSTEM_PROMPT,
@@ -183,6 +184,22 @@ class TestGetCountyExtractionConfig:
         assert get_county_extraction_config("CA", "santa clara") is not None
         assert get_county_extraction_config("CA", "SANTA CLARA") is not None
         assert get_county_extraction_config("CA", "Santa Clara") is not None
+
+    def test_contra_costa_registered(self) -> None:
+        """Contra Costa County has a registered config (#2093)."""
+        config = get_county_extraction_config("CA", "Contra Costa")
+        assert config is not None
+        assert config.method == ExtractionMethod.LLM
+        assert config.provider == "google"
+        assert config.model == "gemini-2.5-flash-lite"
+        assert config.max_output_tokens == 32768
+        assert config.system_prompt is not None
+
+    def test_case_insensitive_contra_costa(self) -> None:
+        """Contra Costa lookup is case-insensitive."""
+        assert get_county_extraction_config("CA", "contra costa") is not None
+        assert get_county_extraction_config("CA", "CONTRA COSTA") is not None
+        assert get_county_extraction_config("CA", "Contra Costa") is not None
 
     def test_unknown_county_returns_none(self) -> None:
         """Unknown county returns None."""
@@ -653,3 +670,84 @@ class TestVenturaSystemPrompt:
         assert "exclude" in prompt_lower
         assert "header" in prompt_lower
         assert "footer" in prompt_lower
+
+
+# ---------------------------------------------------------------------------
+# CONTRA_COSTA_SYSTEM_PROMPT content validation (#2093)
+# ---------------------------------------------------------------------------
+
+
+class TestContraCostaSystemPrompt:
+    """Verify the Contra Costa system prompt has required content."""
+
+    def test_mentions_contra_costa(self) -> None:
+        assert "contra costa" in CONTRA_COSTA_SYSTEM_PROMPT.lower()
+
+    def test_mentions_civil_format(self) -> None:
+        """Prompt describes the civil department format (Format A)."""
+        assert "Format A" in CONTRA_COSTA_SYSTEM_PROMPT
+        assert "civil" in CONTRA_COSTA_SYSTEM_PROMPT.lower()
+
+    def test_mentions_probate_format(self) -> None:
+        """Prompt describes the probate department format (Format B)."""
+        assert "Format B" in CONTRA_COSTA_SYSTEM_PROMPT
+        assert "probate" in CONTRA_COSTA_SYSTEM_PROMPT.lower()
+
+    def test_mentions_case_number_formats(self) -> None:
+        """Prompt describes CC case number patterns."""
+        assert "C24-02490" in CONTRA_COSTA_SYSTEM_PROMPT
+        assert "L23-06679" in CONTRA_COSTA_SYSTEM_PROMPT
+        assert "N25-2307" in CONTRA_COSTA_SYSTEM_PROMPT
+
+    def test_mentions_outcome_taxonomy(self) -> None:
+        """Prompt includes outcome taxonomy values."""
+        assert "granted" in CONTRA_COSTA_SYSTEM_PROMPT.lower()
+        assert "denied" in CONTRA_COSTA_SYSTEM_PROMPT.lower()
+        assert "continued" in CONTRA_COSTA_SYSTEM_PROMPT.lower()
+        assert "off_calendar" in CONTRA_COSTA_SYSTEM_PROMPT.lower()
+
+    def test_mentions_json_output(self) -> None:
+        """Prompt specifies JSON output format."""
+        assert "json" in CONTRA_COSTA_SYSTEM_PROMPT.lower()
+        assert "rulings" in CONTRA_COSTA_SYSTEM_PROMPT.lower()
+
+    def test_mentions_parties(self) -> None:
+        """Prompt instructs party extraction."""
+        assert "plaintiff" in CONTRA_COSTA_SYSTEM_PROMPT.lower()
+        assert "defendant" in CONTRA_COSTA_SYSTEM_PROMPT.lower()
+
+    def test_mentions_petitioner_for_probate(self) -> None:
+        """Prompt instructs extracting probate parties with petitioner/subject roles."""
+        assert "petitioner" in CONTRA_COSTA_SYSTEM_PROMPT.lower()
+
+    def test_mentions_motion_type_labels(self) -> None:
+        """Prompt lists common motion type labels."""
+        prompt_lower = CONTRA_COSTA_SYSTEM_PROMPT.lower()
+        assert "demurrer" in prompt_lower
+        assert "msj" in prompt_lower
+        assert "motion_to_compel" in prompt_lower
+
+    def test_mentions_demurrer_mapping(self) -> None:
+        """Prompt maps sustained/overruled demurrers to granted/denied."""
+        prompt_lower = CONTRA_COSTA_SYSTEM_PROMPT.lower()
+        assert "sustained" in prompt_lower
+        assert "overruled" in prompt_lower
+
+    def test_mentions_same_case_multiple_motions(self) -> None:
+        """Prompt explains that same case with multiple motions produces separate entries."""
+        assert "SEPARATE" in CONTRA_COSTA_SYSTEM_PROMPT
+
+    def test_mentions_sub_entries(self) -> None:
+        """Prompt describes sub-entries (17A, 17B) in probate format."""
+        assert "sub-entr" in CONTRA_COSTA_SYSTEM_PROMPT.lower()
+
+    def test_warns_against_duplicating_text(self) -> None:
+        """Prompt warns against including text from other entries."""
+        assert "Do NOT include text from other entries" in CONTRA_COSTA_SYSTEM_PROMPT
+
+    def test_output_format_matches_framework_schema(self) -> None:
+        """Prompt output format uses framework field names."""
+        assert "extracted_judge_name" in CONTRA_COSTA_SYSTEM_PROMPT
+        assert "extracted_case_number" in CONTRA_COSTA_SYSTEM_PROMPT
+        assert "extracted_case_title" in CONTRA_COSTA_SYSTEM_PROMPT
+        assert "extracted_parties" in CONTRA_COSTA_SYSTEM_PROMPT
