@@ -1136,6 +1136,54 @@ class TestCountyExtractorInit:
             # Should be called with only provider kwarg (no model/max_output_tokens)
             mock_cls.assert_called_once_with(provider="google")
 
+    def test_max_chars_per_chunk_passed_through(self) -> None:
+        """max_chars_per_chunk is passed to LlmExtractor when set (#2136)."""
+        worker, _ = _make_worker()
+
+        with patch("ingestion.worker.LlmExtractor") as mock_cls:
+            mock_instance = MagicMock()
+            mock_cls.return_value = mock_instance
+
+            result = worker._get_county_extractor("google", "gemini-2.5-flash-lite", 32768, 40000)
+            assert result is mock_instance
+            mock_cls.assert_called_once_with(
+                provider="google",
+                model="gemini-2.5-flash-lite",
+                max_output_tokens=32768,
+                max_chars_per_chunk=40000,
+            )
+
+    def test_max_chars_per_chunk_none_not_passed(self) -> None:
+        """max_chars_per_chunk=None omits kwarg from LlmExtractor (#2136)."""
+        worker, _ = _make_worker()
+
+        with patch("ingestion.worker.LlmExtractor") as mock_cls:
+            mock_instance = MagicMock()
+            mock_cls.return_value = mock_instance
+
+            result = worker._get_county_extractor("google", "gemini-2.5-flash-lite", 32768, None)
+            assert result is mock_instance
+            # max_chars_per_chunk should NOT appear in kwargs.
+            mock_cls.assert_called_once_with(
+                provider="google",
+                model="gemini-2.5-flash-lite",
+                max_output_tokens=32768,
+            )
+
+    def test_different_max_chars_per_chunk_gets_separate_instances(self) -> None:
+        """Different max_chars_per_chunk values get separate cached instances (#2136)."""
+        worker, _ = _make_worker()
+
+        with patch("ingestion.worker.LlmExtractor") as mock_cls:
+            mock_a = MagicMock()
+            mock_b = MagicMock()
+            mock_cls.side_effect = [mock_a, mock_b]
+
+            result_a = worker._get_county_extractor("google", "gemini-2.5-flash-lite", 32768, 40000)
+            result_b = worker._get_county_extractor("google", "gemini-2.5-flash-lite", 32768, 80000)
+            assert result_a is not result_b
+            assert mock_cls.call_count == 2
+
 
 class TestCountyExtractionPath:
     """Tests for the county-specific LLM extraction path in _llm_split_document (#1728)."""

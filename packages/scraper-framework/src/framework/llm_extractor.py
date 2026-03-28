@@ -85,6 +85,12 @@ _MAX_CHUNKS = 10
 # Overlap characters between consecutive chunks.
 _CHUNK_OVERLAP = 500
 
+# Retry-with-smaller-chunks limits (#2136).
+# Maximum recursion depth for splitting failed chunks.
+_MAX_RETRY_DEPTH = 1
+# Minimum chunk size (chars) to attempt a retry split.
+_MIN_RETRY_CHUNK_CHARS = 2000
+
 # Patterns for natural split boundaries.
 _PAGE_BREAK_RE = re.compile(r"\f")
 _CASE_BOUNDARY_RE = re.compile(
@@ -345,11 +351,14 @@ class LlmExtractor:
         usage = TokenUsage()
 
         if len(chunks) == 1:
-            result = self._extract_chunk(
+            results = self._extract_chunk_with_retry(
                 chunks[0], metadata=metadata, usage=usage, system_prompt=system_prompt
             )
             self._log_usage(usage)
-            return result.rulings if result else []
+            if not results:
+                return []
+            merged = self._merge_results(results)
+            return merged.rulings
 
         # Multiple chunks: extract each and merge.
         logger.info(
@@ -359,15 +368,14 @@ class LlmExtractor:
         )
         all_results: list[ExtractionResult] = []
         for i, chunk in enumerate(chunks):
-            result = self._extract_chunk(
+            results = self._extract_chunk_with_retry(
                 chunk,
                 metadata=metadata,
                 usage=usage,
                 chunk_index=i,
                 system_prompt=system_prompt,
             )
-            if result:
-                all_results.append(result)
+            all_results.extend(results)
 
         self._log_usage(usage)
 
@@ -609,6 +617,125 @@ class LlmExtractor:
         usage.api_calls += 1
 
         return self._parse_response(response.text, metadata)
+
+    def _extract_chunk_with_retry(
+        self,
+        text: str,
+        *,
+        metadata: dict[str, str] | None = None,
+        usage: TokenUsage,
+        chunk_index: int = 0,
+        system_prompt: str | None = None,
+        _depth: int = 0,
+    ) -> list[ExtractionResult]:
+        """Extract a chunk, retrying with smaller sub-chunks on parse failure.
+
+        When the LLM response is truncated (e.g. output exceeds
+        ``max_output_tokens``), ``_extract_chunk`` returns ``None``
+        because the truncated JSON cannot be parsed.  This method
+        catches that failure and retries by splitting the chunk in
+        half at a natural boundary, extracting each sub-chunk
+        independently.
+
+        Recursion is limited to one level (``_depth <= 1``).  At depth 0,
+        a failed chunk is split into two halves and each half is retried
+        (depth 1).  At depth 1, failures are final — no further splitting.
+
+        Returns a list of ``ExtractionResult`` (one per successful
+        sub-chunk, or one for the original chunk if it succeeds).  The
+        caller merges all results.
+        """
+        result = self._extract_chunk(
+            text,
+            metadata=metadata,
+            usage=usage,
+            chunk_index=chunk_index,
+            system_prompt=system_prompt,
+        )
+        if result is not None:
+            return [result]
+
+        # Extraction failed (likely truncated JSON).  If we have room to
+        # retry and the chunk is large enough to split meaningfully
+        # (> 2000 chars), split it in half and try each sub-chunk.
+        if _depth >= _MAX_RETRY_DEPTH or len(text) < _MIN_RETRY_CHUNK_CHARS:
+            logger.warning(
+                "llm_extractor.chunk_failed_no_retry",
+                chunk_index=chunk_index,
+                chunk_len=len(text),
+                depth=_depth,
+            )
+            return []
+
+        logger.info(
+            "llm_extractor.retry_with_smaller_chunks",
+            chunk_index=chunk_index,
+            chunk_len=len(text),
+            depth=_depth,
+        )
+
+        sub_chunks = self._split_chunk_in_half(text)
+        sub_results: list[ExtractionResult] = []
+        for i, sub_chunk in enumerate(sub_chunks):
+            sub_results.extend(
+                self._extract_chunk_with_retry(
+                    sub_chunk,
+                    metadata=metadata,
+                    usage=usage,
+                    chunk_index=chunk_index * 10 + i,
+                    system_prompt=system_prompt,
+                    _depth=_depth + 1,
+                )
+            )
+        return sub_results
+
+    @staticmethod
+    def _split_chunk_in_half(text: str) -> list[str]:
+        """Split a text chunk roughly in half at a natural boundary.
+
+        Prefers case boundaries (``SUPERIOR COURT``, ``Case Number``),
+        then page breaks, then paragraph breaks.  Falls back to the
+        midpoint if no natural boundary is found.
+        """
+        midpoint = len(text) // 2
+        search_start = midpoint - len(text) // 4
+        search_end = midpoint + len(text) // 4
+
+        # Search for natural boundaries near the midpoint.
+        best_split: int | None = None
+        best_distance = len(text)
+
+        # Case boundaries (SF family law: "SUPERIOR COURT" header).
+        for m in _CASE_BOUNDARY_RE.finditer(text, search_start, search_end):
+            dist = abs(m.start() - midpoint)
+            if dist < best_distance:
+                best_distance = dist
+                best_split = m.start()
+
+        # Page breaks.
+        if best_split is None:
+            for m in _PAGE_BREAK_RE.finditer(text, search_start, search_end):
+                dist = abs(m.start() - midpoint)
+                if dist < best_distance:
+                    best_distance = dist
+                    best_split = m.start()
+
+        # Paragraph breaks.
+        if best_split is None:
+            for m in re.finditer(r"\n\n", text[search_start:search_end]):
+                pos = search_start + m.start()
+                dist = abs(pos - midpoint)
+                if dist < best_distance:
+                    best_distance = dist
+                    best_split = pos
+
+        if best_split is None:
+            best_split = midpoint
+
+        first_half = text[:best_split]
+        second_half = text[max(best_split - _CHUNK_OVERLAP, 0) :]
+
+        return [first_half, second_half]
 
     def _extract_single_page(
         self,

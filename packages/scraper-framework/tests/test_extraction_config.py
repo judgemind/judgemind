@@ -64,6 +64,7 @@ class TestCountyExtractionConfig:
         assert config.provider is None
         assert config.model is None
         assert config.max_output_tokens is None
+        assert config.max_chars_per_chunk is None
 
     def test_custom_values(self) -> None:
         """Custom values are stored correctly."""
@@ -73,12 +74,14 @@ class TestCountyExtractionConfig:
             provider="google",
             model="gemini-2.5-flash-lite",
             max_output_tokens=16384,
+            max_chars_per_chunk=40000,
         )
         assert config.method == ExtractionMethod.MULTIMODAL
         assert config.system_prompt == "custom prompt"
         assert config.provider == "google"
         assert config.model == "gemini-2.5-flash-lite"
         assert config.max_output_tokens == 16384
+        assert config.max_chars_per_chunk == 40000
 
     def test_frozen(self) -> None:
         """CountyExtractionConfig is frozen (immutable)."""
@@ -145,6 +148,7 @@ class TestGetCountyExtractionConfig:
         assert config.provider == "google"
         assert config.model == "gemini-2.5-flash-lite"
         assert config.max_output_tokens == 32768
+        assert config.max_chars_per_chunk == 40_000
         assert config.system_prompt is not None
 
     def test_case_insensitive_san_francisco(self) -> None:
