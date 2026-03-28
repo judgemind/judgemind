@@ -7,15 +7,8 @@ import { useQuery, gql } from '@apollo/client';
 import { Search } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
-import { Badge } from '@/components/ui/badge';
 import { Input } from '@/components/ui/input';
 import { Skeleton } from '@/components/ui/skeleton';
-import {
-  formatDate,
-  formatMotionType,
-  formatJudgeName,
-} from '@/lib/display-helpers';
-import { OutcomeBadge } from '@/components/OutcomeBadge';
 import { Wordmark } from '@/components/Wordmark';
 import { PAGE_TITLE, SECTION_HEADING } from '@/lib/typography';
 
@@ -29,65 +22,11 @@ const PLATFORM_STATS_QUERY = gql`
   }
 `;
 
-const RECENT_RULINGS_QUERY = gql`
-  query RecentRulings {
-    rulings(first: 5) {
-      edges {
-        node {
-          id
-          hearingDate
-          outcome
-          motionType
-          department
-          case {
-            id
-            caseNumber
-            caseTitle
-            court {
-              county
-              courtName
-            }
-          }
-          judge {
-            canonicalName
-          }
-        }
-      }
-    }
-  }
-`;
-
 interface StatsData {
   platformStats: {
     countiesCount: number;
     rulingsCount: number;
     judgesCount: number;
-  };
-}
-
-interface RulingNode {
-  id: string;
-  hearingDate: string;
-  outcome: string | null;
-  motionType: string | null;
-  department: string | null;
-  case: {
-    id: string;
-    caseNumber: string;
-    caseTitle: string | null;
-    court: {
-      county: string;
-      courtName: string;
-    };
-  } | null;
-  judge: {
-    canonicalName: string;
-  } | null;
-}
-
-interface RecentRulingsData {
-  rulings: {
-    edges: Array<{ node: RulingNode }>;
   };
 }
 
@@ -153,97 +92,6 @@ function StatsBar() {
         </>
       )}
     </div>
-  );
-}
-
-function RecentRulings() {
-  const { data, loading, error } = useQuery<RecentRulingsData>(RECENT_RULINGS_QUERY);
-
-  const edges = data?.rulings.edges ?? [];
-
-  return (
-    <section data-testid="recent-rulings">
-      <div className="mb-3 flex items-center justify-between">
-        <h2 className={SECTION_HEADING}>Recent rulings</h2>
-        <Link
-          href="/rulings"
-          className="text-sm font-medium text-primary hover:underline"
-        >
-          View all
-        </Link>
-      </div>
-
-      {loading && edges.length === 0 && (
-        <div className="divide-y rounded-lg border">
-          {Array.from({ length: 3 }).map((_, i) => (
-            <div key={i} className="px-4 py-3">
-              <div className="space-y-2">
-                <Skeleton className="h-4 w-2/3" />
-                <Skeleton className="h-3 w-1/2" />
-                <div className="flex gap-2 pt-1">
-                  <Skeleton className="h-5 w-16 rounded-full" />
-                  <Skeleton className="h-5 w-20 rounded-full" />
-                </div>
-              </div>
-            </div>
-          ))}
-        </div>
-      )}
-
-      {error && (
-        <p className="p-4 text-center text-sm text-muted-foreground">
-          Could not load recent rulings.
-        </p>
-      )}
-
-      {!loading && !error && edges.length === 0 && (
-        <p className="p-4 text-center text-sm text-muted-foreground">
-          No rulings yet. Check back after scrapers have run.
-        </p>
-      )}
-
-      {edges.length > 0 && (
-        <div className="divide-y rounded-lg border">
-          {edges.map(({ node }) => (
-            <div key={node.id} className="px-4 py-3 transition-colors hover:bg-muted/50">
-              <div className="flex items-start justify-between gap-4">
-                <div className="min-w-0 flex-1">
-                  {node.case ? (
-                    <Link
-                      href={`/rulings/${node.id}`}
-                      className="block truncate rounded-sm font-medium text-foreground hover:text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                    >
-                      {node.case.caseNumber}
-                      {node.case.caseTitle ? ` \u2014 ${node.case.caseTitle}` : ''}
-                    </Link>
-                  ) : (
-                    <span className="text-muted-foreground">{'\u2014'}</span>
-                  )}
-
-                  <div className="mt-0.5 flex flex-wrap items-center gap-x-2 text-xs text-muted-foreground">
-                    {node.case?.court && (
-                      <span>{node.case.court.county} {node.department ? `\u00B7 Dept. ${node.department}` : ''}</span>
-                    )}
-                    <span>{formatJudgeName(node.judge)}</span>
-                  </div>
-
-                  <div className="mt-2 flex flex-wrap gap-2">
-                    <OutcomeBadge outcome={node.outcome} />
-                    <Badge variant="outline" className="text-muted-foreground">
-                      {formatMotionType(node.motionType)}
-                    </Badge>
-                  </div>
-                </div>
-
-                <span className="shrink-0 text-xs text-muted-foreground">
-                  {formatDate(node.hearingDate)}
-                </span>
-              </div>
-            </div>
-          ))}
-        </div>
-      )}
-    </section>
   );
 }
 
@@ -353,8 +201,6 @@ export function HomeContent() {
       </div>
 
       <StatsBar />
-
-      <RecentRulings />
 
       <HowItWorks />
     </div>

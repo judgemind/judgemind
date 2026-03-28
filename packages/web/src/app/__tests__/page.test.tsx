@@ -35,22 +35,6 @@ vi.mock('lucide-react', () => ({
   ),
 }));
 
-vi.mock('@/lib/display-helpers', () => ({
-  formatDate: (d: string) => d,
-  formatOutcome: (o: string | null) => o ?? '\u2014',
-  formatMotionType: (m: string | null) => m ?? '\u2014',
-  formatJudgeName: (j: { canonicalName: string } | null) =>
-    j?.canonicalName ?? '\u2014',
-  getOutcomeBadgeVariant: () => 'outline',
-  getOutcomeBadgeListClass: () => '',
-}));
-
-vi.mock('@/components/OutcomeBadge', () => ({
-  OutcomeBadge: ({ outcome }: { outcome: string | null }) => (
-    <span data-testid="outcome-badge">{outcome ?? '\u2014'}</span>
-  ),
-}));
-
 import HomePage from '../(main)/page';
 
 const MOCK_STATS = {
@@ -58,34 +42,6 @@ const MOCK_STATS = {
     countiesCount: 12,
     rulingsCount: 5432,
     judgesCount: 87,
-  },
-};
-
-const MOCK_RULINGS = {
-  rulings: {
-    edges: [
-      {
-        node: {
-          id: 'ruling-1',
-          hearingDate: '2026-03-10',
-          outcome: 'granted',
-          motionType: 'Demurrer',
-          department: '42',
-          case: {
-            id: 'case-1',
-            caseNumber: '23STCV12345',
-            caseTitle: 'Smith v. Jones',
-            court: {
-              county: 'Los Angeles',
-              courtName: 'Superior Court of California',
-            },
-          },
-          judge: {
-            canonicalName: 'Smith, John A.',
-          },
-        },
-      },
-    ],
   },
 };
 
@@ -122,12 +78,7 @@ describe('HomePage', () => {
   });
 
   it('renders the stats bar when data is loaded', () => {
-    mockUseQuery.mockImplementation((query: string) => {
-      if (query.includes('PlatformStats')) {
-        return { data: MOCK_STATS, loading: false, error: null };
-      }
-      return { data: MOCK_RULINGS, loading: false, error: null };
-    });
+    mockUseQuery.mockReturnValue({ data: MOCK_STATS, loading: false, error: null });
     render(<HomePage />);
     expect(screen.getByTestId('stats-bar')).toBeInTheDocument();
     expect(screen.getByText('Counties covered')).toBeInTheDocument();
@@ -136,12 +87,7 @@ describe('HomePage', () => {
   });
 
   it('renders stat values formatted correctly', () => {
-    mockUseQuery.mockImplementation((query: string) => {
-      if (query.includes('PlatformStats')) {
-        return { data: MOCK_STATS, loading: false, error: null };
-      }
-      return { data: MOCK_RULINGS, loading: false, error: null };
-    });
+    mockUseQuery.mockReturnValue({ data: MOCK_STATS, loading: false, error: null });
     render(<HomePage />);
     // 12 counties should show as "12"
     expect(screen.getByText('12')).toBeInTheDocument();
@@ -149,31 +95,6 @@ describe('HomePage', () => {
     expect(screen.getByText('5.4k')).toBeInTheDocument();
     // 87 judges should show as "87"
     expect(screen.getByText('87')).toBeInTheDocument();
-  });
-
-  it('renders recent rulings section', () => {
-    mockUseQuery.mockImplementation((query: string) => {
-      if (query.includes('PlatformStats')) {
-        return { data: MOCK_STATS, loading: false, error: null };
-      }
-      return { data: MOCK_RULINGS, loading: false, error: null };
-    });
-    render(<HomePage />);
-    expect(screen.getByTestId('recent-rulings')).toBeInTheDocument();
-    expect(screen.getByText('Recent rulings')).toBeInTheDocument();
-    expect(screen.getByText('View all')).toBeInTheDocument();
-  });
-
-  it('renders ruling cards with case info', () => {
-    mockUseQuery.mockImplementation((query: string) => {
-      if (query.includes('PlatformStats')) {
-        return { data: MOCK_STATS, loading: false, error: null };
-      }
-      return { data: MOCK_RULINGS, loading: false, error: null };
-    });
-    render(<HomePage />);
-    expect(screen.getByText(/23STCV12345/)).toBeInTheDocument();
-    expect(screen.getByText(/Smith v\. Jones/)).toBeInTheDocument();
   });
 
   it('renders the how it works section', () => {
@@ -193,30 +114,11 @@ describe('HomePage', () => {
     expect(screen.getByTestId('stats-bar')).toBeInTheDocument();
   });
 
-  it('shows error state for recent rulings', () => {
-    mockUseQuery.mockImplementation((query: string) => {
-      if (query.includes('PlatformStats')) {
-        return { data: MOCK_STATS, loading: false, error: null };
-      }
-      return { data: null, loading: false, error: new Error('Network error') };
-    });
+  it('does not render a recent rulings section', () => {
+    mockUseQuery.mockReturnValue({ data: MOCK_STATS, loading: false, error: null });
     render(<HomePage />);
-    expect(screen.getByText('Could not load recent rulings.')).toBeInTheDocument();
-  });
-
-  it('shows empty state for recent rulings', () => {
-    mockUseQuery.mockImplementation((query: string) => {
-      if (query.includes('PlatformStats')) {
-        return { data: MOCK_STATS, loading: false, error: null };
-      }
-      return {
-        data: { rulings: { edges: [] } },
-        loading: false,
-        error: null,
-      };
-    });
-    render(<HomePage />);
-    expect(screen.getByText(/No rulings yet/)).toBeInTheDocument();
+    expect(screen.queryByTestId('recent-rulings')).not.toBeInTheDocument();
+    expect(screen.queryByText('Recent rulings')).not.toBeInTheDocument();
   });
 
   it('does not contain bg-brand-600 in the rendered output', () => {
