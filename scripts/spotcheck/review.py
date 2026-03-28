@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# venv: scraper-framework
 """Spotcheck reviewer — run deterministic checks on fetched artifacts.
 
 Runs automated checks that do not require an LLM, flagging items that
@@ -21,8 +22,6 @@ Checks by entity type:
 
 Outputs findings.json in the spotcheck directory.
 """
-
-# venv: scraper-framework
 from __future__ import annotations
 
 import abc

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# venv: scraper-framework
 """Spotcheck sampler — randomly sample entities for quality review.
 
 Produces a manifest JSON listing entity IDs for subsequent fetching
@@ -15,8 +16,6 @@ Usage (originals — S3 only, can run locally):
 
 Output: manifest JSON to stdout (or to --output path).
 """
-
-# venv: scraper-framework
 from __future__ import annotations
 
 import argparse
@@ -73,10 +72,11 @@ def _sample_originals(county: str, n: int) -> list[str]:
     import boto3
 
     s3 = boto3.client("s3")
-    bucket = os.environ.get("S3_BUCKET", "judgemind-documents-dev")
+    bucket = os.environ.get("S3_BUCKET", "judgemind-document-archive-dev")
 
-    # Build the S3 prefix for the county (e.g., "CA/Los Angeles/")
-    prefix = f"CA/{county}/"
+    # Build the S3 prefix matching storage.py's build_s3_key convention:
+    # {state_lower}/{county_lower_underscored}/
+    prefix = f"ca/{county.lower().replace(' ', '_')}/"
 
     paginator = s3.get_paginator("list_objects_v2")
     keys: list[str] = []
