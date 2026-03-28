@@ -15,6 +15,7 @@ from framework.extraction_config import (
     SAN_BERNARDINO_SYSTEM_PROMPT,
     SAN_FRANCISCO_SYSTEM_PROMPT,
     SANTA_CLARA_SYSTEM_PROMPT,
+    VENTURA_SYSTEM_PROMPT,
     CountyExtractionConfig,
     ExtractionMethod,
     get_county_extraction_config,
@@ -560,3 +561,95 @@ class TestSantaClaraSystemPrompt:
         assert "extracted_case_number" in SANTA_CLARA_SYSTEM_PROMPT
         assert "extracted_case_title" in SANTA_CLARA_SYSTEM_PROMPT
         assert "extracted_parties" in SANTA_CLARA_SYSTEM_PROMPT
+
+
+# ---------------------------------------------------------------------------
+# Ventura registry and lookup tests (#2055)
+# ---------------------------------------------------------------------------
+
+
+class TestVenturaRegistered:
+    """Verify Ventura County is in the extraction config registry."""
+
+    def test_ventura_registered(self) -> None:
+        """Ventura County has a registered config (#2055)."""
+        config = get_county_extraction_config("CA", "Ventura")
+        assert config is not None
+        assert config.method == ExtractionMethod.LLM
+        assert config.provider == "google"
+        assert config.model == "gemini-2.5-flash-lite"
+        assert config.max_output_tokens == 32768
+        assert config.system_prompt is not None
+
+    def test_case_insensitive_ventura(self) -> None:
+        """Ventura lookup is case-insensitive."""
+        assert get_county_extraction_config("CA", "ventura") is not None
+        assert get_county_extraction_config("CA", "VENTURA") is not None
+        assert get_county_extraction_config("CA", "Ventura") is not None
+
+
+# ---------------------------------------------------------------------------
+# VENTURA_SYSTEM_PROMPT content validation (#2055)
+# ---------------------------------------------------------------------------
+
+
+class TestVenturaSystemPrompt:
+    """Verify the Ventura system prompt has required content."""
+
+    def test_mentions_ventura(self) -> None:
+        assert "ventura" in VENTURA_SYSTEM_PROMPT.lower()
+
+    def test_mentions_single_case(self) -> None:
+        """Prompt describes single-case document format."""
+        assert "single" in VENTURA_SYSTEM_PROMPT.lower()
+
+    def test_mentions_known_metadata(self) -> None:
+        """Prompt describes receiving case_number and motion_type as known context."""
+        assert "case_number" in VENTURA_SYSTEM_PROMPT.lower()
+        assert "motion_type" in VENTURA_SYSTEM_PROMPT.lower()
+
+    def test_mentions_outcome_taxonomy(self) -> None:
+        """Prompt includes outcome taxonomy values."""
+        assert "granted" in VENTURA_SYSTEM_PROMPT.lower()
+        assert "denied" in VENTURA_SYSTEM_PROMPT.lower()
+        assert "continued" in VENTURA_SYSTEM_PROMPT.lower()
+        assert "off_calendar" in VENTURA_SYSTEM_PROMPT.lower()
+
+    def test_mentions_parties(self) -> None:
+        """Prompt instructs party extraction."""
+        assert "plaintiff" in VENTURA_SYSTEM_PROMPT.lower()
+        assert "defendant" in VENTURA_SYSTEM_PROMPT.lower()
+
+    def test_mentions_ruling_text(self) -> None:
+        """Prompt instructs ruling text extraction."""
+        assert "ruling_text" in VENTURA_SYSTEM_PROMPT.lower()
+        assert "TENTATIVE RULING" in VENTURA_SYSTEM_PROMPT
+
+    def test_mentions_json_output(self) -> None:
+        """Prompt specifies JSON output format."""
+        assert "json" in VENTURA_SYSTEM_PROMPT.lower()
+
+    def test_flat_output_format(self) -> None:
+        """Ventura prompt uses flat JSON (not wrapped in 'rulings' array)."""
+        # The Ventura prompt outputs {outcome, case_title, parties, ...}
+        # directly, not {"rulings": [...]}.
+        assert '"outcome"' in VENTURA_SYSTEM_PROMPT
+        assert '"case_title"' in VENTURA_SYSTEM_PROMPT
+        assert '"parties"' in VENTURA_SYSTEM_PROMPT
+
+    def test_mentions_demurrer_mapping(self) -> None:
+        """Prompt maps sustained/overruled demurrers."""
+        prompt_lower = VENTURA_SYSTEM_PROMPT.lower()
+        assert "sustained" in prompt_lower
+        assert "overruled" in prompt_lower
+
+    def test_mentions_tentative_ruling_heading(self) -> None:
+        """Prompt references TENTATIVE RULING heading for text extraction."""
+        assert "TENTATIVE RULING" in VENTURA_SYSTEM_PROMPT
+
+    def test_excludes_boilerplate(self) -> None:
+        """Prompt instructs excluding header and footer boilerplate."""
+        prompt_lower = VENTURA_SYSTEM_PROMPT.lower()
+        assert "exclude" in prompt_lower
+        assert "header" in prompt_lower
+        assert "footer" in prompt_lower
