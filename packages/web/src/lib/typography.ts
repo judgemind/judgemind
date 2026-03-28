@@ -7,7 +7,7 @@
  *
  * Hierarchy (established in #1450):
  *   1. PAGE_TITLE  — primary page heading (e.g., "Latest Rulings", "Judges")
- *   2. SECTION_HEADING — secondary heading within a page (e.g., "Recent rulings", "How it works")
+ *   2. SECTION_HEADING — secondary heading within a page (e.g., "How it works", "Recent Rulings")
  *   3. SECTION_LABEL — small uppercase label for subsections (e.g., "Filters", field labels)
  */
 
