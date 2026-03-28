@@ -11,7 +11,7 @@ These are the most frequently violated rules. **A PreToolUse hook enforces the s
 - **NEVER** use heredocs (`<<EOF`) in Bash commands. Write content to a file with the Write tool, then pass via `--body-file` or `-F`.
 - **NEVER** use `python3 -c "..."` for inline scripts. Write to `{worktree}/tmp/script.py` and run the file.
 - **NEVER** combine quoted strings with `&&` or `;`. Split into separate tool calls.
-- **NEVER** prefix scripts with `bash` — run `scripts/start-worker.sh`, not `bash scripts/start-worker.sh`.
+- **NEVER** prefix scripts with `bash` — run `scripts/cleanup_worktree.sh`, not `bash scripts/cleanup_worktree.sh`.
 - **NEVER** use shell `&`, `nohup`, `disown`, or multicommand tricks to background a process. Use the Bash tool's `run_in_background: true` parameter instead. Shell backgrounding requires compound commands that cannot be allowlisted and always trigger permission prompts.
 - **NEVER** use Edit or Write tools on files inside `.claude/`. The CLI blocks these operations. Write content to `{worktree}/tmp/` first, then copy it into place with `scripts/write-claude-file.sh {worktree}/tmp/file.md {worktree}/.claude/target/file.md`.
 
@@ -97,8 +97,6 @@ Subagents do the implementation work: worktree setup, coding, testing, PR, and r
 ### Worktree setup
 
 **Automated (via dispatcher):** The dispatcher spawns `/task` agents with `isolation: "worktree"` on the Agent tool. Claude Code automatically creates a unique worktree at `.claude/worktrees/agent-<id>/`. No locking, no number contention, no races.
-
-**Manual (interactive sessions):** Use `scripts/start-worker.sh` for manual worktree setup when not using the dispatcher. This claims a worker number, creates the worktree, configures git hooks, and creates `tmp/`.
 
 Each worktree gets its own `.venv` per package:
 
@@ -230,11 +228,7 @@ After posting, update the PR test plan to check off the **Post-deploy verificati
 
 **Only remove the worktree after deployment verification passes** (or after confirming the change has no deployed component). Never clean up immediately after merge — the worktree is needed for debugging if verification fails.
 
-For agents spawned with `isolation: "worktree"`, Claude Code handles cleanup automatically when the agent exits. For manual worktrees, run:
-
-```
-scripts/end-worker.sh {worktree}
-```
+For agents spawned with `isolation: "worktree"`, Claude Code handles cleanup automatically when the agent exits.
 
 ## Tool Use Rules
 

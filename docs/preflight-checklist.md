@@ -21,7 +21,7 @@ Machine-readable checklist of rules extracted from CLAUDE.md. Agents should vali
 | SH-02 | No heredocs | `<<EOF`, `<<'EOF'`, `<<-EOF` | Write content to `{worktree}/tmp/file.txt` with Write tool, then pass via `--body-file` or `-F` |
 | SH-03 | No inline python `-c` | `python3 -c` or `python -c` | Write to `{worktree}/tmp/script.py`, then run the file |
 | SH-04 | No quoted strings with `&&` or `;` | `"..."` or `'...'` combined with `&&` or `;` | Split into separate tool calls, one command per call |
-| SH-05 | No `bash` prefix for scripts | `bash scripts/...` | Run directly: `scripts/start-worker.sh` |
+| SH-05 | No `bash` prefix for scripts | `bash scripts/...` | Run directly: `scripts/cleanup_worktree.sh` |
 | SH-06 | Use `git -C` for remote paths | `cd /path && git ...` | `git -C /absolute/path <subcommand>` |
 | SH-07 | Temp files in worktree only | `/tmp/` in file paths | Use `{worktree}/tmp/` instead |
 | SH-08 | No Edit/Write to `.claude/` | Edit or Write tool targeting `.claude/` paths | Write to `{worktree}/tmp/`, then `scripts/write-claude-file.sh` to copy into `.claude/` |
@@ -69,7 +69,7 @@ Machine-readable checklist of rules extracted from CLAUDE.md. Agents should vali
 | TW-01 | Single issue per PR | Do not combine unrelated changes |
 | TW-02 | Sync before implementing | `git fetch origin main && git rebase origin/main` |
 | TW-03 | Watch CI to completion | `gh run watch` must exit before doing anything else |
-| TW-04 | Clean up worktree when done | `scripts/end-worker.sh {worktree}` is the last step |
+| TW-04 | Clean up worktree when done | Worktree cleanup is automatic for `isolation: "worktree"` agents |
 | TW-05 | Never deploy to production | Production deploys are human-only |
 | TW-06 | Venv isolation per worktree | Never share venvs between worktrees |
 | TW-07 | Never exit after ralph without completing A.3-A.9 | Ralph = halfway done. Must commit, push, PR, CI, merge, deploy, retrospective. Verify with `git status` and `gh pr list` (#721) |

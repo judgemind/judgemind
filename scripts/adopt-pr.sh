@@ -11,8 +11,8 @@
 #
 # Prerequisites:
 #   - Must be run from inside a git worktree (not the main checkout)
-#   - The worktree should have been created by start-worker.sh or the
-#     dispatcher's isolation: "worktree" mode
+#   - The worktree should have been created by the dispatcher's
+#     isolation: "worktree" mode
 #   - gh CLI must be authenticated
 #
 # What it does:
@@ -55,7 +55,7 @@ GIT_DIR_PATH=$(git rev-parse --git-dir 2>/dev/null) || {
 
 if [[ "$GIT_DIR_PATH" != *"/worktrees/"* ]]; then
     echo "ERROR: Not inside a git worktree. Run this from a worktree created by" >&2
-    echo "  start-worker.sh or the dispatcher's isolation mode." >&2
+    echo "  the dispatcher's isolation: \"worktree\" mode." >&2
     echo "  Current git dir: $GIT_DIR_PATH" >&2
     exit 1
 fi
@@ -129,7 +129,7 @@ git fetch origin main --quiet
 # exists as a local branch (from a previous agent's worktree that's since
 # been removed), we need to delete it first, then create a fresh one.
 #
-# The old placeholder branch (created by start-worker.sh or the dispatcher)
+# The old placeholder branch (created by the dispatcher's isolation mode)
 # is deleted afterward.
 # ---------------------------------------------------------------------------
 
