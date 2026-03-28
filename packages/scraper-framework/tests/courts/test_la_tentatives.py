@@ -41,6 +41,7 @@ from courts.ca.la_tentatives import (
     _split_rulings,
     _truncate_party_list,
     default_config,
+    sanitize_ruling_html,
 )
 from framework import ContentFormat
 from framework.models import CapturedDocument
@@ -2416,3 +2417,320 @@ class TestReplaceRulingTextFromHtml:
         rulings = [LASplitRuling(ruling_index=1, case_number="X", ruling_text=original)]
         _replace_ruling_text_from_html(no_cases_html, rulings)
         assert rulings[0].ruling_text == original
+
+
+# ---------------------------------------------------------------------------
+# sanitize_ruling_html — HTML sanitization for ruling_text_html (#2179)
+# ---------------------------------------------------------------------------
+
+
+class TestSanitizeRulingHtml:
+    """Tests for the sanitize_ruling_html function."""
+
+    def test_preserves_structural_tags(self) -> None:
+        """Structural formatting tags are preserved."""
+        html = "<p>Paragraph</p><strong>Bold</strong><em>Italic</em>"
+        result = sanitize_ruling_html(html)
+        assert "<p>" in result
+        assert "<strong>" in result
+        assert "<em>" in result
+
+    def test_preserves_list_tags(self) -> None:
+        """Ordered and unordered lists are preserved."""
+        html = "<ol><li>First</li></ol><ul><li>Bullet</li></ul>"
+        result = sanitize_ruling_html(html)
+        assert "<ol>" in result
+        assert "<ul>" in result
+        assert "<li>" in result
+
+    def test_preserves_heading_tags(self) -> None:
+        """Heading tags h1-h6 are preserved."""
+        html = "<h1>Title</h1><h2>Subtitle</h2><h3>Section</h3>"
+        result = sanitize_ruling_html(html)
+        assert "<h1>" in result
+        assert "<h2>" in result
+        assert "<h3>" in result
+
+    def test_preserves_table_tags(self) -> None:
+        """Table elements are preserved."""
+        html = "<table><tr><td>Cell</td><th>Header</th></tr></table>"
+        result = sanitize_ruling_html(html)
+        assert "<table>" in result
+        assert "<tr>" in result
+        assert "<td>" in result
+        assert "<th>" in result
+
+    def test_strips_script_tags(self) -> None:
+        """Script tags and their content are completely removed."""
+        html = "<p>Before</p><script>alert('xss')</script><p>After</p>"
+        result = sanitize_ruling_html(html)
+        assert "<script>" not in result
+        assert "alert" not in result
+        assert "<p>Before</p>" in result
+        assert "<p>After</p>" in result
+
+    def test_strips_style_tags(self) -> None:
+        """Style tags and their content are completely removed."""
+        html = "<p>Text</p><style>.foo { color: red; }</style>"
+        result = sanitize_ruling_html(html)
+        assert "<style>" not in result
+        assert "color:" not in result
+        assert "<p>Text</p>" in result
+
+    def test_strips_event_handler_attributes(self) -> None:
+        """Event handler attributes (on*) are removed."""
+        html = '<p onclick="alert(1)" onmouseover="foo()">Text</p>'
+        result = sanitize_ruling_html(html)
+        assert "onclick" not in result
+        assert "onmouseover" not in result
+        assert "<p>" in result
+        assert "Text" in result
+
+    def test_strips_style_attributes(self) -> None:
+        """Style attributes are removed."""
+        html = '<p style="color: red; font-size: 14px;">Text</p>'
+        result = sanitize_ruling_html(html)
+        assert "style=" not in result
+        assert "<p>" in result
+
+    def test_preserves_class_and_id_attributes(self) -> None:
+        """Class and id attributes are preserved."""
+        html = '<div class="ruling-text" id="case-1">Content</div>'
+        result = sanitize_ruling_html(html)
+        assert 'class="ruling-text"' in result
+        assert 'id="case-1"' in result
+
+    def test_preserves_href_on_anchors(self) -> None:
+        """Href attribute on anchor tags is preserved."""
+        html = '<a href="http://example.com">Link</a>'
+        result = sanitize_ruling_html(html)
+        assert 'href="http://example.com"' in result
+
+    def test_unwraps_disallowed_tags(self) -> None:
+        """Disallowed tags are removed but their text content is preserved."""
+        html = "<font>Styled text</font>"
+        result = sanitize_ruling_html(html)
+        assert "<font>" not in result
+        assert "Styled text" in result
+
+    def test_empty_input(self) -> None:
+        """Empty input returns empty string."""
+        assert sanitize_ruling_html("") == ""
+
+    def test_plain_text_passthrough(self) -> None:
+        """Plain text with no tags is preserved."""
+        result = sanitize_ruling_html("Just plain text")
+        assert "Just plain text" in result
+
+    def test_br_tags_preserved(self) -> None:
+        """BR tags are preserved for line breaks."""
+        html = "Line one<br/>Line two<br>Line three"
+        result = sanitize_ruling_html(html)
+        assert "<br" in result
+
+    def test_strips_data_attributes(self) -> None:
+        """Data attributes are removed."""
+        html = '<div data-tooltip="info" data-id="123">Text</div>'
+        result = sanitize_ruling_html(html)
+        assert "data-tooltip" not in result
+        assert "data-id" not in result
+        assert "Text" in result
+
+    def test_strips_javascript_href(self) -> None:
+        """javascript: hrefs are removed to prevent XSS."""
+        html = "<a href=\"javascript:alert('XSS')\">Click me</a>"
+        result = sanitize_ruling_html(html)
+        assert "javascript:" not in result
+        assert "Click me" in result
+        assert "<a" in result  # tag is preserved, just href removed
+
+    def test_strips_data_uri_href(self) -> None:
+        """data: hrefs are removed to prevent XSS."""
+        html = '<a href="data:text/html,<script>alert(1)</script>">Link</a>'
+        result = sanitize_ruling_html(html)
+        assert "data:" not in result
+        assert "Link" in result
+
+    def test_strips_vbscript_href(self) -> None:
+        """vbscript: hrefs are removed."""
+        html = '<a href="vbscript:MsgBox(1)">Link</a>'
+        result = sanitize_ruling_html(html)
+        assert "vbscript:" not in result
+        assert "Link" in result
+
+    def test_preserves_safe_href(self) -> None:
+        """Normal http/https hrefs are preserved."""
+        html = '<a href="https://example.com">Safe link</a>'
+        result = sanitize_ruling_html(html)
+        assert 'href="https://example.com"' in result
+        assert "Safe link" in result
+
+    def test_strips_javascript_href_case_insensitive(self) -> None:
+        """javascript: check is case-insensitive."""
+        html = '<a href="JavaScript:alert(1)">XSS</a>'
+        result = sanitize_ruling_html(html)
+        assert "JavaScript:" not in result.lower() or "javascript:" not in result.lower()
+        # More directly: href should be gone
+        assert "href" not in result
+
+    def test_strips_javascript_href_with_whitespace(self) -> None:
+        """Leading whitespace before javascript: is handled."""
+        html = '<a href="  javascript:alert(1)">XSS</a>'
+        result = sanitize_ruling_html(html)
+        assert "javascript:" not in result
+
+
+# ---------------------------------------------------------------------------
+# ruling_text_html integration — _extract_ruling_fields populates it (#2179)
+# ---------------------------------------------------------------------------
+
+
+class TestRulingTextHtmlExtraction:
+    """Verify _extract_ruling_fields populates ruling_text_html."""
+
+    def test_extract_fields_populates_ruling_text_html(self) -> None:
+        """_extract_ruling_fields should set ruling_text_html with sanitized HTML."""
+        from bs4 import BeautifulSoup
+
+        html = _load("la_ruling_response.html")
+        sections = _split_cases_html(html)
+        assert len(sections) > 0
+
+        doc = CapturedDocument(
+            scraper_id="test",
+            state="CA",
+            county="Los Angeles",
+            court="Superior Court",
+            source_url=CIVIL_URL,
+            capture_timestamp=datetime(2026, 3, 2),
+            content_format=ContentFormat.HTML,
+            raw_content=sections[0].encode("utf-8"),
+            content_hash="",
+        )
+        soup = BeautifulSoup(doc.raw_content, "lxml")
+        _extract_ruling_fields(soup, doc)
+
+        # ruling_text should be plain text (no HTML tags)
+        assert doc.ruling_text is not None
+        assert "<p>" not in doc.ruling_text
+        assert "<strong>" not in doc.ruling_text
+
+        # ruling_text_html should contain HTML tags
+        assert doc.ruling_text_html is not None
+        assert len(doc.ruling_text_html) > 0
+        # Should not contain script/style
+        assert "<script>" not in doc.ruling_text_html
+        assert "<style>" not in doc.ruling_text_html
+
+    def test_ruling_text_html_no_event_handlers(self) -> None:
+        """ruling_text_html should not contain event handler attributes."""
+        from bs4 import BeautifulSoup
+
+        html = _load("la_ruling_response.html")
+        sections = _split_cases_html(html)
+        doc = CapturedDocument(
+            scraper_id="test",
+            state="CA",
+            county="Los Angeles",
+            court="Superior Court",
+            source_url=CIVIL_URL,
+            capture_timestamp=datetime(2026, 3, 2),
+            content_format=ContentFormat.HTML,
+            raw_content=sections[0].encode("utf-8"),
+            content_hash="",
+        )
+        soup = BeautifulSoup(doc.raw_content, "lxml")
+        _extract_ruling_fields(soup, doc)
+        assert doc.ruling_text_html is not None
+        assert "onclick" not in doc.ruling_text_html
+        assert "onload" not in doc.ruling_text_html
+
+    def test_all_fixture_files_produce_ruling_text_html(self) -> None:
+        """All LA ruling fixture files should produce non-empty ruling_text_html."""
+        from bs4 import BeautifulSoup
+
+        fixture_files = [
+            "la_ruling_response.html",
+            "la_ruling_bh205.html",
+            "la_ruling_smc1.html",
+            "la_ruling_smc49.html",
+            "la_ruling_smc56.html",
+            "la_ruling_tor_b.html",
+            "la_ruling_van_a.html",
+            "la_ruling_pas_p.html",
+            "la_ruling_cha_f46.html",
+            "la_ruling_com_a.html",
+            "la_ruling_ea_h.html",
+        ]
+
+        for fixture in fixture_files:
+            html = _load(fixture)
+            sections = _split_cases_html(html)
+            if not sections:
+                continue  # Skip dept header pages with no cases
+
+            doc = CapturedDocument(
+                scraper_id="test",
+                state="CA",
+                county="Los Angeles",
+                court="Superior Court",
+                source_url=CIVIL_URL,
+                capture_timestamp=datetime(2026, 3, 2),
+                content_format=ContentFormat.HTML,
+                raw_content=sections[0].encode("utf-8"),
+                content_hash="",
+            )
+            soup = BeautifulSoup(doc.raw_content, "lxml")
+            _extract_ruling_fields(soup, doc)
+
+            assert doc.ruling_text is not None, f"{fixture}: ruling_text is None"
+            assert doc.ruling_text_html is not None, f"{fixture}: ruling_text_html is None"
+            assert len(doc.ruling_text_html) > 0, f"{fixture}: ruling_text_html is empty"
+
+    def test_split_rulings_populates_ruling_text_html(self) -> None:
+        """_split_rulings should produce LASplitRuling objects with ruling_text_html."""
+        html = _load("la_ruling_response.html")
+        rulings = _split_rulings(html)
+        assert len(rulings) > 0
+        for ruling in rulings:
+            assert ruling.ruling_text is not None
+            assert ruling.ruling_text_html is not None
+            assert len(ruling.ruling_text_html) > 0
+            # Plain text should not have HTML tags
+            assert "<p>" not in ruling.ruling_text
+            # HTML should have structural tags
+            assert "<script>" not in ruling.ruling_text_html
+
+    def test_replace_ruling_text_from_html_sets_ruling_text_html(self) -> None:
+        """_replace_ruling_text_from_html should also set ruling_text_html."""
+        html = _load("la_ruling_response.html")
+        sections = _split_cases_html(html)
+        assert len(sections) >= 2
+
+        # Create rulings matching the fixture's case numbers
+        from bs4 import BeautifulSoup
+
+        case_numbers = []
+        for section in sections:
+            soup = BeautifulSoup(section, "lxml")
+            text = soup.get_text()
+            import re
+
+            m = re.search(r"Case Number:\s*(\w+)", text)
+            if m:
+                case_numbers.append(m.group(1))
+
+        rulings = [
+            LASplitRuling(
+                ruling_index=idx + 1,
+                case_number=cn,
+                ruling_text="placeholder",
+            )
+            for idx, cn in enumerate(case_numbers)
+        ]
+        _replace_ruling_text_from_html(html, rulings)
+        for ruling in rulings:
+            assert ruling.ruling_text_html is not None, (
+                f"ruling_text_html not set for {ruling.case_number}"
+            )
+            assert "<script>" not in ruling.ruling_text_html
