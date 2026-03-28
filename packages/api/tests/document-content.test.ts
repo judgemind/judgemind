@@ -49,7 +49,7 @@ function createMockPool(rows: Record<string, unknown>[] = []): Pool {
 
 const HTML_DOC = {
   id: '00000000-0000-0000-0000-000000000001',
-  s3_key: 'ca/la/lasc/raw/2026-01-01/ruling.html',
+  s3_key: 'ca/la/lasc/raw/abc123def456.html',
   s3_bucket: 'judgemind-document-archive-dev',
   format: 'html',
   status: 'active',
@@ -58,7 +58,7 @@ const HTML_DOC = {
 const PDF_DOC = {
   ...HTML_DOC,
   format: 'pdf',
-  s3_key: 'ca/la/lasc/raw/2026-01-01/ruling.pdf',
+  s3_key: 'ca/la/lasc/raw/abc123def456.pdf',
 };
 
 // ---------------------------------------------------------------------------

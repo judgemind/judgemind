@@ -33,7 +33,7 @@ _CASE_ID = str(uuid.uuid4())
 _RULING_ID = str(uuid.uuid4())
 _DOCUMENT_ID = str(uuid.uuid4())
 _HEARING_DATE = date(2026, 3, 5)
-_S3_KEY = "ca/los_angeles/superior_court/raw/2026/03/05/test-doc.html"
+_S3_KEY = "ca/los_angeles/superior_court/raw/test-doc-hash.html"
 _BUCKET = "judgemind-document-archive-dev"
 
 # Single-case ruling HTML (wraps content in speechSynthesis div)

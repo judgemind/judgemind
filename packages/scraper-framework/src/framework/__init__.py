@@ -54,6 +54,7 @@ from .models import (
 )
 from .retry import retry_async, retry_sync
 from .runner import get_scraper_ids, run_scrapers
+from .s3_cache import CachedS3Client, make_s3_client
 from .search import IndexingConsumer, create_index
 from .storage import S3Archiver, build_s3_key
 
@@ -96,7 +97,9 @@ __all__ = [
     "VALID_MOTION_TYPES",
     "VALID_OUTCOMES",
     "enrich_ruling",
+    "CachedS3Client",
     "build_s3_key",
+    "make_s3_client",
     "compute_party_overlap",
     "configure_structlog",
     "content_changed",

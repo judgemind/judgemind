@@ -20,12 +20,12 @@ from __future__ import annotations
 import os
 import sys
 
-import boto3
 import redis
 import structlog
 from opensearchpy import OpenSearch
 
 from framework.logging import configure_structlog
+from framework.s3_cache import make_s3_client
 
 from .worker import InfrastructureError, IngestionWorker
 
@@ -66,7 +66,7 @@ def main() -> None:
             os_kwargs["http_auth"] = (os_user, os_pass)
 
         opensearch_client = OpenSearch(**os_kwargs)
-        s3_client = boto3.client("s3")
+        s3_client = make_s3_client()
 
         worker = IngestionWorker(
             redis_client=redis_client,

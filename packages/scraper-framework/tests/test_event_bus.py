@@ -29,7 +29,7 @@ def _make_doc(**overrides: object) -> CapturedDocument:
         "content_format": ContentFormat.HTML,
         "raw_content": b"<html>tentative ruling</html>",
         "content_hash": "abc123",
-        "s3_key": "ca/los_angeles/superior_court/raw/2026/03/03/doc-1.html",
+        "s3_key": "ca/los_angeles/superior_court/raw/abc123.html",
     }
     defaults.update(overrides)
     return CapturedDocument(**defaults)

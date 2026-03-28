@@ -229,7 +229,7 @@ CREATE TABLE documents (
 );
 
 COMMENT ON TABLE  documents              IS 'Index of all captured documents. S3 object is the source of truth.';
-COMMENT ON COLUMN documents.s3_key       IS 'Path: /{state}/{county}/{court}/{case_id}/{doc_type}/{doc_id}.{ext}';
+COMMENT ON COLUMN documents.s3_key       IS 'Content-addressed path: {state}/{county}/{court}/raw/{content_hash}.{ext}';
 COMMENT ON COLUMN documents.content_hash IS 'SHA-256. Used for dedup and to detect revisions across scraper runs.';
 COMMENT ON COLUMN documents.change_type  IS 'LLM-classified when a new version is captured: substantive or cosmetic.';
 

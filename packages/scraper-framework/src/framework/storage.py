@@ -3,17 +3,17 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime
 
-import boto3
 from botocore.exceptions import BotoCoreError, ClientError
 
 from .models import CapturedDocument, ContentFormat
+from .s3_cache import make_s3_client
 
 logger = logging.getLogger(__name__)
 
-# S3 path convention: /{state}/{county}/{court}/{document_type}/{date}/{document_id}.{ext}
-# Per Architecture Spec §4.4
+# S3 path convention: /{state}/{county}/{court}/raw/{content_hash}.{ext}
+# Content-addressed keys — same content always produces the same key,
+# making S3 PutObject idempotent (no orphaned duplicates).
 _EXT_MAP = {
     ContentFormat.HTML: "html",
     ContentFormat.PDF: "pdf",
@@ -22,14 +22,12 @@ _EXT_MAP = {
 }
 
 
-def build_s3_key(doc: CapturedDocument, capture_date: datetime | None = None) -> str:
-    date = capture_date or doc.capture_timestamp
-    date_str = date.strftime("%Y/%m/%d")
+def build_s3_key(doc: CapturedDocument) -> str:
     ext = _EXT_MAP.get(doc.content_format, "bin")
     return (
         f"{doc.state.lower()}/{doc.county.lower().replace(' ', '_')}/"
         f"{doc.court.lower().replace(' ', '_')}/raw/"
-        f"{date_str}/{doc.document_id}.{ext}"
+        f"{doc.content_hash}.{ext}"
     )
 
 
@@ -38,11 +36,25 @@ class S3Archiver:
 
     def __init__(self, bucket: str, s3_client: object | None = None) -> None:
         self.bucket = bucket
-        self._client = s3_client or boto3.client("s3")
+        self._client = s3_client or make_s3_client()
 
     def archive(self, doc: CapturedDocument) -> str:
-        """Write raw_content to S3. Returns the S3 key. Raises on failure."""
+        """Write raw_content to S3 if not already present. Returns the S3 key.
+
+        With content-addressed keys, the same content always maps to the same
+        key. A HeadObject check avoids re-uploading unchanged documents,
+        saving bandwidth and S3 PUT costs on repeated scraper runs.
+        """
         key = build_s3_key(doc)
+        try:
+            self._client.head_object(Bucket=self.bucket, Key=key)
+            logger.debug("Already archived s3://%s/%s, skipping upload", self.bucket, key)
+            return key
+        except ClientError as exc:
+            if exc.response["Error"]["Code"] != "404":
+                logger.error("S3 HeadObject failed for %s: %s", key, exc)
+                raise
+
         content_type = _content_type(doc.content_format)
         try:
             self._client.put_object(

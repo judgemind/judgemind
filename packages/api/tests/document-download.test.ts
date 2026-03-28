@@ -45,7 +45,7 @@ function createMockPool(rows: Record<string, unknown>[] = []): Pool {
 
 const ACTIVE_DOC = {
   id: '00000000-0000-0000-0000-000000000001',
-  s3_key: 'ca/la/lasc/raw/2026-01-01/doc.pdf',
+  s3_key: 'ca/la/lasc/raw/abc123def456.pdf',
   s3_bucket: 'judgemind-document-archive-dev',
   format: 'pdf',
   status: 'active',

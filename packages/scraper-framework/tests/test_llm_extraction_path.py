@@ -34,7 +34,7 @@ def _make_event(**overrides: object) -> dict:
         "source_url": "https://www.occourts.org/tentativerulings/1",
         "content_format": "pdf",
         "content_hash": "abc123",
-        "s3_key": "ca/orange/superior_court/raw/2026/03/05/aaaaaaaa.pdf",
+        "s3_key": "ca/orange/superior_court/raw/abc123.pdf",
         "s3_bucket": "judgemind-document-archive-dev",
         "ruling_text": "Case No. 2024-01234567\nSmith v. Jones\nThe motion is GRANTED.",
         "hearing_date": "2026-03-05",

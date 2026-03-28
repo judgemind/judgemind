@@ -45,7 +45,7 @@ def consumer(mock_opensearch: MagicMock, mock_s3: MagicMock) -> IndexingConsumer
 def sample_event() -> dict:
     return {
         "document_id": "doc-001",
-        "s3_key": "ca/los_angeles/la_superior/raw/2026/03/01/doc-001.html",
+        "s3_key": "ca/los_angeles/la_superior/raw/abc123def456.html",
         "case_number": "BC123456",
         "court": "LA Superior Court",
         "county": "Los Angeles",

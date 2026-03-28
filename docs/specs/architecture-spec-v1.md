@@ -219,7 +219,7 @@ Immutable archival: Original captured documents are never modified or deleted. O
 
 Tiered storage: Hot storage for documents less than 90 days old or frequently accessed. Cold/archive storage for older documents. Lifecycle policies automate transitions.
 
-Path convention: /{state}/{county}/{court}/{case_id}/{document_type}/{document_id}.{ext} for predictable organization and efficient prefix-based listing.
+Path convention: /{state}/{county}/{court}/raw/{content_hash}.{ext} — content-addressed keys make S3 PutObject idempotent (same content = same key, no orphaned duplicates).
 
 # 5. AI/ML Layer
 

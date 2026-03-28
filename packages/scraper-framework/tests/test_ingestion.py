@@ -54,7 +54,7 @@ def _make_event(**overrides: object) -> dict:
         "source_url": "https://www.lacourt.org/tentativerulings/1",
         "content_format": "html",
         "content_hash": "abc123",
-        "s3_key": "ca/los_angeles/superior_court/raw/2026/03/05/aaaaaaaa.html",
+        "s3_key": "ca/los_angeles/superior_court/raw/abc123.html",
         "s3_bucket": "judgemind-document-archive-dev",
         "case_number": "23STCV12345",
         "department": "Dept. 1",
