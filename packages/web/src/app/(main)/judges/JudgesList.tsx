@@ -369,7 +369,11 @@ export function JudgesList() {
             {displayedJudges.map((node) => {
               const isSelected = selectedJudgeIds.has(node.id);
               return (
-                <TableRow key={node.id} className="hover:bg-muted/50">
+                <TableRow
+                  key={node.id}
+                  className="cursor-pointer"
+                  onClick={() => router.push(`/judges/${node.id}`)}
+                >
                   <TableCell className="w-10" onClick={(e) => e.stopPropagation()}>
                     <Checkbox
                       checked={isSelected}
@@ -381,6 +385,7 @@ export function JudgesList() {
                     <Link
                       href={`/judges/${node.id}`}
                       className="rounded-sm font-medium hover:text-primary hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                      onClick={(e) => e.stopPropagation()}
                     >
                       {node.canonicalName}
                     </Link>

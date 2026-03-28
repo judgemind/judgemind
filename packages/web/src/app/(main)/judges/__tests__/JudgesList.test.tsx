@@ -279,6 +279,26 @@ describe('JudgesList', () => {
     expect(link).toHaveAttribute('href', '/judges/judge-1');
   });
 
+  it('navigates to judge detail when clicking anywhere on the row', () => {
+    setupMocks();
+
+    render(<JudgesList />);
+    // Click on the ruling count cell (not the name link) — should still navigate
+    // "100" belongs to Anderson (judge-3), sorted first by surname
+    fireEvent.click(screen.getByText('100'));
+    expect(mockPush).toHaveBeenCalledWith('/judges/judge-3');
+  });
+
+  it('does not navigate when clicking the checkbox', () => {
+    setupMocks();
+
+    render(<JudgesList />);
+    const checkboxes = screen.getAllByTestId('judge-checkbox');
+    fireEvent.click(checkboxes[0]);
+    // Checkbox click should toggle selection, not navigate
+    expect(mockPush).not.toHaveBeenCalled();
+  });
+
   it('renders sortable column headers', () => {
     setupMocks();
 
