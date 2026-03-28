@@ -135,9 +135,26 @@ SCHEDULER_JSON=$(aws scheduler get-schedule \
     exit 1
 }
 
-NETWORK_CONFIG=$(echo "$SCHEDULER_JSON" | python3 -c "import sys,json; print(json.dumps(json.load(sys.stdin)['Target']['EcsParameters']['NetworkConfiguration']['AwsvpcConfiguration']))")
-SUBNETS=$(echo "$NETWORK_CONFIG" | python3 -c "import sys,json; d=json.load(sys.stdin); print(','.join(d['Subnets']))")
-SECURITY_GROUPS=$(echo "$NETWORK_CONFIG" | python3 -c "import sys,json; d=json.load(sys.stdin); print(','.join(d['SecurityGroups']))")
+NETWORK_CONFIG=$(echo "$SCHEDULER_JSON" | python3 -c "
+import sys, json
+nc = json.load(sys.stdin)['Target']['EcsParameters']['NetworkConfiguration']
+# AWS CLI may return 'AwsvpcConfiguration' or 'awsvpcConfiguration'
+cfg = nc.get('AwsvpcConfiguration') or nc.get('awsvpcConfiguration') or {}
+print(json.dumps(cfg))
+")
+SUBNETS=$(echo "$NETWORK_CONFIG" | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+# AWS CLI may capitalise keys differently
+subnets = d.get('Subnets') or d.get('subnets') or []
+print(','.join(subnets))
+")
+SECURITY_GROUPS=$(echo "$NETWORK_CONFIG" | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+sg = d.get('SecurityGroups') or d.get('securityGroups') or []
+print(','.join(sg))
+")
 
 echo "Subnets: ${SUBNETS}" >&2
 echo "Security groups: ${SECURITY_GROUPS}" >&2
