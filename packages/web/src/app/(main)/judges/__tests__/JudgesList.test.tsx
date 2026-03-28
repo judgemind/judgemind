@@ -429,6 +429,23 @@ describe('JudgesList', () => {
     expect(input).toHaveAttribute('name', 'judgeName');
   });
 
+  it('filter placeholder uses real ellipsis character, not literal \\u2026', () => {
+    mockUseQuery.mockReturnValue({
+      data: MOCK_JUDGES_DATA,
+      loading: false,
+      error: undefined,
+      fetchMore: vi.fn(),
+    });
+
+    render(<JudgesList />);
+    const input = screen.getByLabelText(/Judge name/i);
+    const placeholder = input.getAttribute('placeholder') ?? '';
+    // Should contain the actual ellipsis character
+    expect(placeholder).toContain('\u2026');
+    // Should NOT contain the literal backslash-u sequence
+    expect(placeholder).not.toContain('\\u2026');
+  });
+
   it('filters judges client-side by name', () => {
     mockUseQuery.mockReturnValue({
       data: MOCK_JUDGES_DATA,

@@ -160,7 +160,7 @@ function HeroSearch() {
           name="q"
           value={query}
           onChange={(e) => setQuery(e.target.value)}
-          placeholder="Search by keyword, case number, judge, or party\u2026"
+          placeholder="Search by keyword, case number, judge, or party…"
           className="h-12 pl-11 pr-24 text-base"
           aria-label="Search rulings"
         />
