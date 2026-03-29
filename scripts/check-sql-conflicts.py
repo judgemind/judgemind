@@ -121,9 +121,9 @@ def _extract_unique_constraints_from_sql(
 
     def _add(table: str, cols: frozenset[str]) -> None:
         table = table.lower().strip()
-        # Strip schema prefix (e.g. "public.users" → "users")
-        if "." in table:
-            table = table.split(".")[-1]
+        # Strip "public." prefix only. Preserve "staging." for separation.
+        if table.startswith("public."):
+            table = table[7:]
         lst = constraints.setdefault(table, [])
         if cols not in lst:
             lst.append(cols)
@@ -134,9 +134,9 @@ def _extract_unique_constraints_from_sql(
         r"create\s+table\s+(?:if\s+not\s+exists\s+)?"
         r"([a-z_]+(?:\.[a-z_]+)?)",
     )
-    # Regex: ALTER TABLE t ADD CONSTRAINT name UNIQUE (cols)
+    # Regex: ALTER TABLE [ONLY] t ADD CONSTRAINT name UNIQUE (cols)
     _alter_unique_re = re.compile(
-        r"alter\s+table\s+([a-z_]+(?:\.[a-z_]+)?)\s+"
+        r"alter\s+table\s+(?:only\s+)?([a-z_]+(?:\.[a-z_]+)?)\s+"
         r"add\s+constraint\s+\S+\s+unique\s*\(\s*([^)]+)\)",
     )
     # Regex: CREATE UNIQUE INDEX ... ON t (cols)
