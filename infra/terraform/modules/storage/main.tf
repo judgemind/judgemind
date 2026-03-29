@@ -107,6 +107,48 @@ resource "aws_s3_bucket_lifecycle_configuration" "document_archive" {
       days = 90
     }
   }
+
+  # Spotcheck results: regenerable anytime by re-running the spotcheck script.
+  rule {
+    id     = "spotcheck-ttl"
+    status = "Enabled"
+
+    filter {
+      prefix = "spotcheck/"
+    }
+
+    expiration {
+      days = 90
+    }
+  }
+
+  # Scratch/temp files: eval samples, ad-hoc uploads.
+  rule {
+    id     = "tmp-ttl"
+    status = "Enabled"
+
+    filter {
+      prefix = "tmp/"
+    }
+
+    expiration {
+      days = 30
+    }
+  }
+
+  # One-off migration scripts uploaded by ecs-run-task.sh.
+  rule {
+    id     = "migrations-ttl"
+    status = "Enabled"
+
+    filter {
+      prefix = "migrations/"
+    }
+
+    expiration {
+      days = 30
+    }
+  }
 }
 
 # Object lock (production only).
