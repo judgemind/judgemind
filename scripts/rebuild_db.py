@@ -229,60 +229,94 @@ def main() -> None:
         logger.info("OPENSEARCH_URL not set — skipping search indexing")
         opensearch_client = MagicMock()
 
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from threading import Lock
+
     from ingestion.worker import IngestionWorker
 
-    worker = IngestionWorker(
-        redis_client=redis_client,
-        pg_dsn=database_url,
-        opensearch_client=opensearch_client,
-        s3_client=s3,
-        archive_bucket=BUCKET,
-    )
+    concurrency = int(os.environ.get("REBUILD_CONCURRENCY", "8"))
+    logger.info("Processing documents", concurrency=concurrency, total=len(keys))
 
-    # Step 4: Process each document
+    # Each thread gets its own IngestionWorker (own DB connection).
+    def make_worker() -> IngestionWorker:
+        return IngestionWorker(
+            redis_client=redis_client,
+            pg_dsn=database_url,
+            opensearch_client=opensearch_client,
+            s3_client=s3,
+            archive_bucket=BUCKET,
+        )
+
+    # Step 4: Process documents concurrently
     processed = 0
     errors = 0
     skipped = 0
+    lock = Lock()
 
-    for i, key in enumerate(keys):
+    def process_one(key: str) -> str:
+        """Process a single document. Returns 'ok', 'skip', or 'error'."""
         parsed = parse_s3_key(key)
         if not parsed:
-            skipped += 1
-            continue
+            return "skip"
 
-        try:
-            if cache_dir:
-                content = (Path(cache_dir) / key).read_bytes()
-            else:
-                response = s3.get_object(Bucket=BUCKET, Key=key)
-                content = response["Body"].read()
+        if cache_dir:
+            content = (Path(cache_dir) / key).read_bytes()
+        else:
+            response = s3.get_object(Bucket=BUCKET, Key=key)
+            content = response["Body"].read()
 
-            if not content:
-                logger.warning("Skipping empty document", key=key)
-                skipped += 1
-                continue
+        if not content:
+            logger.warning("Skipping empty document", key=key)
+            return "skip"
 
-            actual_hash = hashlib.sha256(content).hexdigest()
-            if actual_hash != parsed["content_hash"]:
-                logger.error(
-                    "Content hash mismatch",
-                    key=key,
-                    expected=parsed["content_hash"][:12],
-                    actual=actual_hash[:12],
-                )
-                errors += 1
-                continue
+        actual_hash = hashlib.sha256(content).hexdigest()
+        if actual_hash != parsed["content_hash"]:
+            logger.error(
+                "Content hash mismatch",
+                key=key,
+                expected=parsed["content_hash"][:12],
+                actual=actual_hash[:12],
+            )
+            return "error"
 
-            event = build_event(key, content, parsed, BUCKET)
-            worker.process_event(event)
-            processed += 1
+        event = build_event(key, content, parsed, BUCKET)
+        worker = _thread_local.worker
+        worker.process_event(event)
+        return "ok"
 
-            if processed % 100 == 0:
-                logger.info("Progress", processed=processed, errors=errors, total=len(keys))
+    import threading
 
-        except Exception as exc:
-            errors += 1
-            logger.error("Failed to process", key=key, error=str(exc), exc_info=True)
+    _thread_local = threading.local()
+
+    def init_worker() -> None:
+        _thread_local.worker = make_worker()
+
+    with ThreadPoolExecutor(max_workers=concurrency, initializer=init_worker) as pool:
+        futures = {pool.submit(process_one, key): key for key in keys}
+        for future in as_completed(futures):
+            key = futures[future]
+            try:
+                result = future.result()
+                with lock:
+                    if result == "ok":
+                        processed += 1
+                    elif result == "skip":
+                        skipped += 1
+                    else:
+                        errors += 1
+                    total_done = processed + errors + skipped
+                    if processed > 0 and processed % 50 == 0:
+                        logger.info(
+                            "Progress",
+                            processed=processed,
+                            errors=errors,
+                            total=len(keys),
+                            pct=round(100 * total_done / len(keys), 1),
+                        )
+            except Exception as exc:
+                with lock:
+                    errors += 1
+                logger.error("Failed to process", key=key, error=str(exc))
 
     logger.info(
         "Rebuild complete",
