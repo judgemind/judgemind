@@ -20,6 +20,7 @@ import hashlib
 import os
 import re
 import sys
+import time
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
@@ -234,7 +235,7 @@ def main() -> None:
 
     from ingestion.worker import IngestionWorker
 
-    concurrency = int(os.environ.get("REBUILD_CONCURRENCY", "8"))
+    concurrency = int(os.environ.get("REBUILD_CONCURRENCY", "24"))
     logger.info("Processing documents", concurrency=concurrency, total=len(keys))
 
     # Each thread gets its own IngestionWorker (own DB connection).
@@ -291,6 +292,8 @@ def main() -> None:
     def init_worker() -> None:
         _thread_local.worker = make_worker()
 
+    t_start = time.monotonic()
+
     with ThreadPoolExecutor(max_workers=concurrency, initializer=init_worker) as pool:
         futures = {pool.submit(process_one, key): key for key in keys}
         for future in as_completed(futures):
@@ -306,12 +309,17 @@ def main() -> None:
                         errors += 1
                     total_done = processed + errors + skipped
                     if processed > 0 and processed % 50 == 0:
+                        elapsed = time.monotonic() - t_start
+                        rate = total_done / elapsed * 60
+                        remaining = (len(keys) - total_done) / (total_done / elapsed)
                         logger.info(
                             "Progress",
                             processed=processed,
                             errors=errors,
                             total=len(keys),
                             pct=round(100 * total_done / len(keys), 1),
+                            rate_per_min=round(rate, 1),
+                            eta_min=round(remaining / 60, 1),
                         )
             except Exception as exc:
                 with lock:
