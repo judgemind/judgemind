@@ -77,9 +77,7 @@ class TestLlmCache:
         def fake_get(**kwargs: object) -> dict:
             if kwargs["Key"] in stored:
                 return {"Body": io.BytesIO(stored[kwargs["Key"]])}
-            raise ClientError(
-                {"Error": {"Code": "NoSuchKey", "Message": ""}}, "GetObject"
-            )
+            raise ClientError({"Error": {"Code": "NoSuchKey", "Message": ""}}, "GetObject")
 
         mock_s3.put_object.side_effect = fake_put
         mock_s3.get_object.side_effect = fake_get

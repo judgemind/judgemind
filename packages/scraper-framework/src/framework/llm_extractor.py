@@ -398,9 +398,7 @@ class LlmExtractor:
             self._client = anthropic.Anthropic(**client_kwargs)
 
         # LLM result cache — stored in S3, served locally via CachedS3Client.
-        cache_bucket = os.environ.get(
-            "JUDGEMIND_ARCHIVE_BUCKET", "judgemind-document-archive-dev"
-        )
+        cache_bucket = os.environ.get("JUDGEMIND_ARCHIVE_BUCKET", "judgemind-document-archive-dev")
         self._cache: _LlmCache | None = (
             _LlmCache(
                 s3_client=self._get_cache_s3_client(),
