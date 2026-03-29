@@ -38,7 +38,7 @@ fi
 echo "  Docker: running"
 
 # Postgres
-if ! docker compose ps postgres 2>/dev/null | grep -q "running"; then
+if ! docker compose ps postgres 2>/dev/null | grep -qi "up\|running"; then
     echo "  Postgres not running — starting..."
     docker compose up -d postgres redis
     sleep 3
@@ -46,7 +46,7 @@ fi
 echo "  Postgres: running"
 
 # Redis
-if ! docker compose ps redis 2>/dev/null | grep -q "running"; then
+if ! docker compose ps redis 2>/dev/null | grep -qi "up\|running"; then
     echo "  Redis not running — starting..."
     docker compose up -d redis
     sleep 2
@@ -59,11 +59,6 @@ if [ ! -d "$CACHE_DIR/ca" ]; then
     echo "Run first: scripts/run-py.sh scripts/s3_cache.py sync"
     exit 1
 fi
-FILE_COUNT=$(find "$CACHE_DIR/ca" -type f -name "*.pdf" -o -name "*.html" | head -1 | wc -l)
-if [ "$FILE_COUNT" -eq 0 ]; then
-    echo "ERROR: No PDF/HTML files in $CACHE_DIR/ca"
-    exit 1
-fi
 echo "  S3 cache: $CACHE_DIR"
 
 # --- Reset database ---
@@ -71,9 +66,10 @@ echo "  S3 cache: $CACHE_DIR"
 if [ "$SKIP_RESET" = false ]; then
     echo ""
     echo "=== Resetting local database ==="
-    psql "$DB_URL/../postgres" -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname='judgemind' AND pid <> pg_backend_pid()" -q 2>/dev/null || true
-    psql "$DB_URL/../postgres" -c "DROP DATABASE IF EXISTS judgemind" -q
-    psql "$DB_URL/../postgres" -c "CREATE DATABASE judgemind OWNER judgemind" -q
+    PG_URL="postgres://judgemind:localdev@localhost:5432/postgres"
+    psql "$PG_URL" -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname='judgemind' AND pid <> pg_backend_pid()" -q 2>/dev/null || true
+    psql "$PG_URL" -c "DROP DATABASE IF EXISTS judgemind" -q
+    psql "$PG_URL" -c "CREATE DATABASE judgemind OWNER judgemind" -q
     scripts/apply_migrations.sh "$DB_URL"
     echo "  Database reset and migrations applied."
 else
