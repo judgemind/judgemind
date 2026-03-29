@@ -23,10 +23,13 @@ Design principles:
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import re
 import time
 from dataclasses import dataclass
+from pathlib import Path
 
 import anthropic
 import structlog
@@ -100,6 +103,81 @@ _CASE_BOUNDARY_RE = re.compile(
 
 # OC-style county prefix: "30-2024-01393434" -> "2024-01393434"
 _COUNTY_PREFIX_RE = re.compile(r"^\d{2,4}-(\d{4}-\d+)$")
+
+# ---------------------------------------------------------------------------
+# LLM result cache
+# ---------------------------------------------------------------------------
+
+# Enabled when S3_CACHE_DIR is set. Cache lives at {S3_CACHE_DIR}/llm-cache/.
+# Structure: llm-cache/{provider}-{model}/prompt-{hash}/{content_hash}.json
+
+
+def _prompt_hash(prompt: str) -> str:
+    """Short hash of the system prompt for cache key."""
+    return hashlib.sha256(prompt.encode()).hexdigest()
+
+
+def _content_hash_for_cache(
+    content: str | bytes, metadata: dict[str, str] | None = None
+) -> str:
+    """Hash content + metadata for cache lookup.
+
+    Metadata (judge_name, department, etc.) is included because the LLM
+    output may differ when metadata changes, even for the same content.
+    """
+    h = hashlib.sha256()
+    if isinstance(content, str):
+        h.update(content.encode())
+    else:
+        h.update(content)
+    if metadata:
+        h.update(json.dumps(metadata, sort_keys=True).encode())
+    return h.hexdigest()
+
+
+class _LlmCache:
+    """Filesystem cache for LLM extraction results.
+
+    Cache path: {base}/{provider}-{model}/prompt-{hash}/{content_hash}.json
+
+    When the prompt or model changes, the cache key changes and old
+    entries are naturally bypassed.
+    """
+
+    def __init__(self, base_dir: str, provider: str, model: str) -> None:
+        self._base = Path(base_dir)
+        self._provider = provider
+        self._model = model
+
+    def _path(self, prompt: str, content_key: str) -> Path:
+        return (
+            self._base
+            / f"{self._provider}-{self._model}"
+            / f"prompt-{_prompt_hash(prompt)}"
+            / f"{content_key}.json"
+        )
+
+    def get(self, prompt: str, content_key: str) -> list[dict] | None:
+        """Return cached extraction result, or None if not cached."""
+        p = self._path(prompt, content_key)
+        if not p.exists():
+            return None
+        try:
+            return json.loads(p.read_text())
+        except (json.JSONDecodeError, OSError):
+            return None
+
+    def put(self, prompt: str, content_key: str, rulings: list[dict]) -> None:
+        """Cache an extraction result. Atomic write via temp file + rename."""
+        p = self._path(prompt, content_key)
+        try:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            tmp = p.with_suffix(".tmp")
+            tmp.write_text(json.dumps(rulings, indent=2))
+            tmp.replace(p)  # atomic on POSIX
+        except OSError as exc:
+            logger.warning("llm_cache.write_failed", error=str(exc))
+
 
 # ---------------------------------------------------------------------------
 # Per-page PDF extraction prompt and join patterns (#1590)
@@ -319,6 +397,18 @@ class LlmExtractor:
                 client_kwargs["api_key"] = api_key
             self._client = anthropic.Anthropic(**client_kwargs)
 
+        # LLM result cache (enabled when S3_CACHE_DIR is set).
+        s3_cache_dir = os.environ.get("S3_CACHE_DIR", "")
+        self._cache: _LlmCache | None = (
+            _LlmCache(
+                str(Path(s3_cache_dir) / "llm-cache"),
+                self._provider,
+                self._model,
+            )
+            if s3_cache_dir
+            else None
+        )
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -354,6 +444,16 @@ class LlmExtractor:
         if not text or not text.strip():
             return []
 
+        effective_prompt = system_prompt or EXTRACTION_SYSTEM_PROMPT
+        content_key = _content_hash_for_cache(text, metadata)
+
+        # Check cache
+        if self._cache is not None:
+            cached = self._cache.get(effective_prompt, content_key)
+            if cached is not None:
+                logger.debug("llm_cache.hit", content_key=content_key[:12])
+                return [ExtractedRuling(**r) for r in cached]
+
         chunks = self._split_into_chunks(text)
         usage = TokenUsage()
 
@@ -365,32 +465,42 @@ class LlmExtractor:
             if not results:
                 return []
             merged = self._merge_results(results)
-            return self._propagate_document_fields(merged)
-
-        # Multiple chunks: extract each and merge.
-        logger.info(
-            "llm_extractor.chunked",
-            num_chunks=len(chunks),
-            chunk_sizes=[len(c) for c in chunks],
-        )
-        all_results: list[ExtractionResult] = []
-        for i, chunk in enumerate(chunks):
-            results = self._extract_chunk_with_retry(
-                chunk,
-                metadata=metadata,
-                usage=usage,
-                chunk_index=i,
-                system_prompt=system_prompt,
+            rulings = self._propagate_document_fields(merged)
+        else:
+            # Multiple chunks: extract each and merge.
+            logger.info(
+                "llm_extractor.chunked",
+                num_chunks=len(chunks),
+                chunk_sizes=[len(c) for c in chunks],
             )
-            all_results.extend(results)
+            all_results: list[ExtractionResult] = []
+            for i, chunk in enumerate(chunks):
+                results = self._extract_chunk_with_retry(
+                    chunk,
+                    metadata=metadata,
+                    usage=usage,
+                    chunk_index=i,
+                    system_prompt=system_prompt,
+                )
+                all_results.extend(results)
 
-        self._log_usage(usage)
+            self._log_usage(usage)
 
-        if not all_results:
-            return []
+            if not all_results:
+                return []
 
-        merged = self._merge_results(all_results)
-        return self._propagate_document_fields(merged)
+            merged = self._merge_results(all_results)
+            rulings = self._propagate_document_fields(merged)
+
+        # Write to cache
+        if self._cache is not None and rulings:
+            self._cache.put(
+                effective_prompt,
+                content_key,
+                [r.model_dump(mode="json") for r in rulings],
+            )
+
+        return rulings
 
     def extract_from_pdf(
         self,
@@ -427,6 +537,15 @@ class LlmExtractor:
         if not pdf_bytes:
             return []
 
+        content_key = _content_hash_for_cache(pdf_bytes, metadata)
+
+        # Check cache
+        if self._cache is not None:
+            cached = self._cache.get(PDF_PER_PAGE_PROMPT, content_key)
+            if cached is not None:
+                logger.debug("llm_cache.hit_pdf", content_key=content_key[:12])
+                return [ExtractedRuling(**r) for r in cached]
+
         page_images = _render_pdf_pages(pdf_bytes, max_pages)
         if not page_images:
             logger.warning("llm_extractor.no_pages_rendered")
@@ -449,7 +568,17 @@ class LlmExtractor:
             return []
 
         # Join rows into cases and convert to ExtractedRuling objects.
-        return _join_page_rows(all_rows, metadata=metadata)
+        rulings = _join_page_rows(all_rows, metadata=metadata)
+
+        # Write to cache
+        if self._cache is not None and rulings:
+            self._cache.put(
+                PDF_PER_PAGE_PROMPT,
+                content_key,
+                [r.model_dump(mode="json") for r in rulings],
+            )
+
+        return rulings
 
     # ------------------------------------------------------------------
     # Internal: API call with retries
