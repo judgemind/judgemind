@@ -91,6 +91,22 @@ resource "aws_s3_bucket_lifecycle_configuration" "document_archive" {
       storage_class   = "GLACIER"
     }
   }
+
+  # LLM extraction cache: expire after 90 days. These are derived results
+  # that can be regenerated from source content + current prompt. Prevents
+  # unbounded accumulation of stale cache entries as prompts evolve.
+  rule {
+    id     = "llm-cache-ttl"
+    status = "Enabled"
+
+    filter {
+      prefix = "llm-cache/"
+    }
+
+    expiration {
+      days = 90
+    }
+  }
 }
 
 # Object lock (production only).
