@@ -77,13 +77,12 @@ class TestRulingsStrategy:
     """Tests for the rulings expansion strategy."""
 
     def test_expand_creates_db_record(self, tmp_path: Path) -> None:
-        item_dir = tmp_path / "test-ruling-id"
+        item_dir = tmp_path / "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
         item_dir.mkdir()
 
-        db_response = json.dumps(
-            [
+        db_response = [
                 {
-                    "id": "test-ruling-id",
+                    "id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
                     "ruling_text": "The motion is GRANTED.",
                     "outcome": "granted",
                     "s3_key": "CA/LA/doc.pdf",
@@ -92,7 +91,6 @@ class TestRulingsStrategy:
                     "case_id": "test-case-id",
                 }
             ]
-        )
 
         strategy = RulingsStrategy()
         with (
@@ -100,26 +98,24 @@ class TestRulingsStrategy:
             patch("fetch._fetch_s3_object", return_value=True),
             patch("fetch._take_screenshot", return_value=True),
         ):
-            result = strategy.expand("test-ruling-id", item_dir)
+            result = strategy.expand("a1b2c3d4-e5f6-7890-abcd-ef1234567890", item_dir)
 
         assert "db_record.json" in result["artifacts"]
         assert (item_dir / "db_record.json").exists()
 
     def test_expand_fetches_s3_doc(self, tmp_path: Path) -> None:
-        item_dir = tmp_path / "test-ruling-id"
+        item_dir = tmp_path / "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
         item_dir.mkdir()
 
-        db_response = json.dumps(
-            [
+        db_response = [
                 {
-                    "id": "test-ruling-id",
+                    "id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
                     "s3_key": "CA/LA/doc.pdf",
                     "s3_bucket": "judgemind-documents-dev",
                     "doc_format": "pdf",
                     "case_id": "test-case-id",
                 }
             ]
-        )
 
         strategy = RulingsStrategy()
         with (
@@ -127,7 +123,7 @@ class TestRulingsStrategy:
             patch("fetch._fetch_s3_object", return_value=True) as mock_s3,
             patch("fetch._take_screenshot", return_value=True),
         ):
-            result = strategy.expand("test-ruling-id", item_dir)
+            result = strategy.expand("a1b2c3d4-e5f6-7890-abcd-ef1234567890", item_dir)
 
         assert "original.pdf" in result["artifacts"]
         mock_s3.assert_called_once()
@@ -136,20 +132,18 @@ class TestRulingsStrategy:
         assert call_args[0][1] == "judgemind-documents-dev"
 
     def test_expand_takes_screenshots(self, tmp_path: Path) -> None:
-        item_dir = tmp_path / "test-ruling-id"
+        item_dir = tmp_path / "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
         item_dir.mkdir()
 
-        db_response = json.dumps(
-            [
+        db_response = [
                 {
-                    "id": "test-ruling-id",
+                    "id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
                     "s3_key": "CA/LA/doc.pdf",
                     "s3_bucket": "judgemind-documents-dev",
                     "doc_format": "pdf",
                     "case_id": "test-case-id",
                 }
             ]
-        )
 
         strategy = RulingsStrategy()
         with (
@@ -157,7 +151,7 @@ class TestRulingsStrategy:
             patch("fetch._fetch_s3_object", return_value=True),
             patch("fetch._take_screenshot", return_value=True) as mock_screenshot,
         ):
-            result = strategy.expand("test-ruling-id", item_dir)
+            result = strategy.expand("a1b2c3d4-e5f6-7890-abcd-ef1234567890", item_dir)
 
         assert "ruling_screenshot.png" in result["artifacts"]
         assert "case_screenshot.png" in result["artifacts"]
@@ -165,35 +159,33 @@ class TestRulingsStrategy:
         assert mock_screenshot.call_count == 2
 
     def test_expand_handles_missing_db_record(self, tmp_path: Path) -> None:
-        item_dir = tmp_path / "missing-ruling"
+        item_dir = tmp_path / "00000000-0000-0000-0000-000000000000"
         item_dir.mkdir()
 
         strategy = RulingsStrategy()
         with (
-            patch("fetch._run_db_query", return_value="[]"),
+            patch("fetch._run_db_query", return_value=[]),
             patch("fetch._fetch_s3_object", return_value=False),
             patch("fetch._take_screenshot", return_value=False),
         ):
-            result = strategy.expand("missing-ruling", item_dir)
+            result = strategy.expand("00000000-0000-0000-0000-000000000000", item_dir)
 
-        assert result["id"] == "missing-ruling"
+        assert result["id"] == "00000000-0000-0000-0000-000000000000"
         assert "db_record.json" in result["artifacts"]
 
     def test_expand_html_format(self, tmp_path: Path) -> None:
-        item_dir = tmp_path / "html-ruling"
+        item_dir = tmp_path / "b2c3d4e5-f6a7-8901-bcde-f12345678901"
         item_dir.mkdir()
 
-        db_response = json.dumps(
-            [
+        db_response = [
                 {
-                    "id": "html-ruling",
+                    "id": "b2c3d4e5-f6a7-8901-bcde-f12345678901",
                     "s3_key": "CA/LA/doc.html",
                     "s3_bucket": "judgemind-documents-dev",
                     "doc_format": "html",
                     "case_id": "test-case-id",
                 }
             ]
-        )
 
         strategy = RulingsStrategy()
         with (
@@ -201,7 +193,7 @@ class TestRulingsStrategy:
             patch("fetch._fetch_s3_object", return_value=True),
             patch("fetch._take_screenshot", return_value=True),
         ):
-            result = strategy.expand("html-ruling", item_dir)
+            result = strategy.expand("b2c3d4e5-f6a7-8901-bcde-f12345678901", item_dir)
 
         assert "original.html" in result["artifacts"]
 
@@ -213,11 +205,9 @@ class TestOriginalsStrategy:
         item_dir = tmp_path / "test-doc"
         item_dir.mkdir()
 
-        derived_response = json.dumps(
-            [
+        derived_response = [
                 {"ruling_id": "ruling-1", "case_number": "BC123"},
             ]
-        )
 
         strategy = OriginalsStrategy()
         with (
@@ -234,12 +224,10 @@ class TestOriginalsStrategy:
         item_dir = tmp_path / "test-doc"
         item_dir.mkdir()
 
-        derived_response = json.dumps(
-            [
+        derived_response = [
                 {"ruling_id": "ruling-1", "case_number": "BC123"},
                 {"ruling_id": "ruling-2", "case_number": "BC456"},
             ]
-        )
 
         strategy = OriginalsStrategy()
         with (
@@ -256,12 +244,10 @@ class TestOriginalsStrategy:
         item_dir = tmp_path / "test-doc"
         item_dir.mkdir()
 
-        derived_response = json.dumps(
-            [
+        derived_response = [
                 {"ruling_id": "ruling-1", "case_number": "BC123"},
                 {"ruling_id": "ruling-2", "case_number": "BC456"},
             ]
-        )
 
         strategy = OriginalsStrategy()
         with (
@@ -283,7 +269,7 @@ class TestOriginalsStrategy:
         strategy = OriginalsStrategy()
         with (
             patch("fetch._fetch_s3_object", return_value=True),
-            patch("fetch._run_db_query", return_value="[]"),
+            patch("fetch._run_db_query", return_value=[]),
             patch("fetch._take_screenshot", return_value=True),
         ):
             result = strategy.expand("CA/LA/dept/doc.html", item_dir)

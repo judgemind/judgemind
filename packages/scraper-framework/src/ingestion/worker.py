@@ -30,6 +30,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import socket
 import time
 from datetime import UTC, date, datetime
@@ -92,6 +93,45 @@ if TYPE_CHECKING:
     from redis import Redis
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Markdown ↔ HTML/plain text for multimodal PDF extraction
+# ---------------------------------------------------------------------------
+
+_MD_BOLD_RE = re.compile(r"\*\*(.+?)\*\*")
+_MD_ITALIC_RE = re.compile(r"\*(.+?)\*")
+
+
+def _strip_markdown(text: str) -> str:
+    """Strip markdown formatting to produce plain text."""
+    text = _MD_BOLD_RE.sub(r"\1", text)
+    text = _MD_ITALIC_RE.sub(r"\1", text)
+    return text
+
+
+def _markdown_to_html(text: str) -> str:
+    """Convert simple markdown to HTML (bold, italic, paragraphs, lists)."""
+    # Escape HTML entities first
+    text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    # Bold and italic
+    text = _MD_BOLD_RE.sub(r"<strong>\1</strong>", text)
+    text = _MD_ITALIC_RE.sub(r"<em>\1</em>", text)
+    # Split into paragraphs on double newlines
+    paragraphs = re.split(r"\n{2,}", text)
+    html_parts = []
+    for p in paragraphs:
+        p = p.strip()
+        if not p:
+            continue
+        # Check if this is a numbered list
+        lines = p.split("\n")
+        if all(re.match(r"^\d+\.\s", line.strip()) for line in lines if line.strip()):
+            items = [re.sub(r"^\d+\.\s*", "", line.strip()) for line in lines if line.strip()]
+            html_parts.append("<ol>" + "".join(f"<li>{item}</li>" for item in items) + "</ol>")
+        else:
+            html_parts.append(f"<p>{p}</p>")
+    return "\n".join(html_parts)
+
 
 # Fields that LLM extraction can populate when missing from the scraper event.
 EXTRACTABLE_FIELDS = (
@@ -1575,6 +1615,14 @@ class IngestionWorker:
         )
 
         for cr in converted:
+            # For multimodal-extracted PDFs, ruling_text is markdown.
+            # Convert to HTML for ruling_text_html, strip for plain text.
+            ruling_text_for_event = cr.ruling_text
+            ruling_text_html_for_event = None
+            if extraction_method == "multimodal" and cr.ruling_text:
+                ruling_text_html_for_event = _markdown_to_html(cr.ruling_text)
+                ruling_text_for_event = _strip_markdown(cr.ruling_text)
+
             split_event: dict[str, Any] = {
                 **event_data,
                 "document_id": cr.document_id,
@@ -1584,7 +1632,8 @@ class IngestionWorker:
                 "_split_index": cr.split_index,
                 "_split_count": cr.split_count,
                 # Fields from LLM extraction (fall back to event_data):
-                "ruling_text": cr.ruling_text,
+                "ruling_text": ruling_text_for_event,
+                "ruling_text_html": ruling_text_html_for_event,
                 "case_number": cr.case_number or event_data.get("case_number"),
                 "case_title": cr.case_title or event_data.get("case_title"),
                 "judge_name": cr.judge_name or event_data.get("judge_name"),

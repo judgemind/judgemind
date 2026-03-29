@@ -34,14 +34,14 @@ def _make_env() -> dict[str, str]:
 
 
 @patch("ingestion.__main__.IngestionWorker")
-@patch("ingestion.__main__.boto3")
+@patch("ingestion.__main__.make_s3_client")
 @patch("ingestion.__main__.OpenSearch")
 @patch("ingestion.__main__.redis.Redis")
 @patch.dict("os.environ", _make_env(), clear=False)
 def test_main_logs_infrastructure_error_and_exits(
     mock_redis_cls: MagicMock,
     mock_opensearch_cls: MagicMock,
-    mock_boto3: MagicMock,
+    mock_make_s3: MagicMock,
     mock_worker_cls: MagicMock,
 ) -> None:
     """InfrastructureError from worker.run() is logged via structlog and exits with code 1."""
@@ -63,14 +63,14 @@ def test_main_logs_infrastructure_error_and_exits(
 
 
 @patch("ingestion.__main__.IngestionWorker")
-@patch("ingestion.__main__.boto3")
+@patch("ingestion.__main__.make_s3_client")
 @patch("ingestion.__main__.OpenSearch")
 @patch("ingestion.__main__.redis.Redis")
 @patch.dict("os.environ", _make_env(), clear=False)
 def test_main_logs_unhandled_exception_and_exits(
     mock_redis_cls: MagicMock,
     mock_opensearch_cls: MagicMock,
-    mock_boto3: MagicMock,
+    mock_make_s3: MagicMock,
     mock_worker_cls: MagicMock,
 ) -> None:
     """Unhandled exceptions from worker.run() are logged and exit with code 1."""
@@ -90,14 +90,14 @@ def test_main_logs_unhandled_exception_and_exits(
 
 
 @patch("ingestion.__main__.IngestionWorker")
-@patch("ingestion.__main__.boto3")
+@patch("ingestion.__main__.make_s3_client")
 @patch("ingestion.__main__.OpenSearch")
 @patch("ingestion.__main__.redis.Redis")
 @patch.dict("os.environ", _make_env(), clear=False)
 def test_main_infrastructure_error_includes_cause_in_log(
     mock_redis_cls: MagicMock,
     mock_opensearch_cls: MagicMock,
-    mock_boto3: MagicMock,
+    mock_make_s3: MagicMock,
     mock_worker_cls: MagicMock,
 ) -> None:
     """The logged InfrastructureError includes the underlying cause."""
@@ -126,14 +126,14 @@ def test_main_infrastructure_error_includes_cause_in_log(
 
 
 @patch("ingestion.__main__.IngestionWorker")
-@patch("ingestion.__main__.boto3")
+@patch("ingestion.__main__.make_s3_client")
 @patch("ingestion.__main__.OpenSearch")
 @patch("ingestion.__main__.redis.Redis")
 @patch.dict("os.environ", _make_env(), clear=False)
 def test_main_normal_run_does_not_exit(
     mock_redis_cls: MagicMock,
     mock_opensearch_cls: MagicMock,
-    mock_boto3: MagicMock,
+    mock_make_s3: MagicMock,
     mock_worker_cls: MagicMock,
 ) -> None:
     """When worker.run() returns normally, main() does not call sys.exit."""
@@ -153,14 +153,14 @@ def test_main_normal_run_does_not_exit(
 
 
 @patch("ingestion.__main__.IngestionWorker")
-@patch("ingestion.__main__.boto3")
+@patch("ingestion.__main__.make_s3_client")
 @patch("ingestion.__main__.OpenSearch")
 @patch("ingestion.__main__.redis.Redis")
 @patch.dict("os.environ", _make_env(), clear=False)
 def test_main_redis_connection_failure_exits(
     mock_redis_cls: MagicMock,
     mock_opensearch_cls: MagicMock,
-    mock_boto3: MagicMock,
+    mock_make_s3: MagicMock,
     mock_worker_cls: MagicMock,
 ) -> None:
     """Startup-time Redis connection failure is logged and exits with code 1."""

@@ -119,9 +119,7 @@ class CachedS3Client:
     def __getattr__(self, name: str) -> Any:
         """Pass through any other method to the underlying boto3 client."""
         if self._local_only:
-            raise AttributeError(
-                f"S3 method '{name}' not available in local-only mode"
-            )
+            raise AttributeError(f"S3 method '{name}' not available in local-only mode")
         return getattr(self._s3, name)
 
 
@@ -139,9 +137,7 @@ def make_s3_client(s3_client: Any | None = None) -> Any:
     local_only = os.environ.get("S3_LOCAL_ONLY", "") == "1"
     if cache_dir:
         inner = None if local_only else (s3_client or boto3.client("s3"))
-        return CachedS3Client(
-            cache_dir=Path(cache_dir), s3_client=inner, local_only=local_only
-        )
+        return CachedS3Client(cache_dir=Path(cache_dir), s3_client=inner, local_only=local_only)
     if local_only:
         logger.warning("S3_LOCAL_ONLY set but S3_CACHE_DIR not set — ignoring")
     return s3_client or boto3.client("s3")

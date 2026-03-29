@@ -23,10 +23,13 @@ Design principles:
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import re
 import time
 from dataclasses import dataclass
+from pathlib import Path
 
 import anthropic
 import structlog
@@ -102,6 +105,79 @@ _CASE_BOUNDARY_RE = re.compile(
 _COUNTY_PREFIX_RE = re.compile(r"^\d{2,4}-(\d{4}-\d+)$")
 
 # ---------------------------------------------------------------------------
+# LLM result cache
+# ---------------------------------------------------------------------------
+
+# Enabled when S3_CACHE_DIR is set. Cache lives at {S3_CACHE_DIR}/llm-cache/.
+# Structure: llm-cache/{provider}-{model}/prompt-{hash}/{content_hash}.json
+
+
+def _prompt_hash(prompt: str) -> str:
+    """Short hash of the system prompt for cache key."""
+    return hashlib.sha256(prompt.encode()).hexdigest()
+
+
+def _content_hash_for_cache(content: str | bytes, metadata: dict[str, str] | None = None) -> str:
+    """Hash content + metadata for cache lookup.
+
+    Metadata (judge_name, department, etc.) is included because the LLM
+    output may differ when metadata changes, even for the same content.
+    """
+    h = hashlib.sha256()
+    if isinstance(content, str):
+        h.update(content.encode())
+    else:
+        h.update(content)
+    if metadata:
+        h.update(json.dumps(metadata, sort_keys=True).encode())
+    return h.hexdigest()
+
+
+class _LlmCache:
+    """Filesystem cache for LLM extraction results.
+
+    Cache path: {base}/{provider}-{model}/prompt-{hash}/{content_hash}.json
+
+    When the prompt or model changes, the cache key changes and old
+    entries are naturally bypassed.
+    """
+
+    def __init__(self, base_dir: str, provider: str, model: str) -> None:
+        self._base = Path(base_dir)
+        self._provider = provider
+        self._model = model
+
+    def _path(self, prompt: str, content_key: str) -> Path:
+        return (
+            self._base
+            / f"{self._provider}-{self._model}"
+            / f"prompt-{_prompt_hash(prompt)}"
+            / f"{content_key}.json"
+        )
+
+    def get(self, prompt: str, content_key: str) -> list[dict] | None:
+        """Return cached extraction result, or None if not cached."""
+        p = self._path(prompt, content_key)
+        if not p.exists():
+            return None
+        try:
+            return json.loads(p.read_text())
+        except (json.JSONDecodeError, OSError):
+            return None
+
+    def put(self, prompt: str, content_key: str, rulings: list[dict]) -> None:
+        """Cache an extraction result. Atomic write via temp file + rename."""
+        p = self._path(prompt, content_key)
+        try:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            tmp = p.with_suffix(".tmp")
+            tmp.write_text(json.dumps(rulings, indent=2))
+            tmp.replace(p)  # atomic on POSIX
+        except OSError as exc:
+            logger.warning("llm_cache.write_failed", error=str(exc))
+
+
+# ---------------------------------------------------------------------------
 # Per-page PDF extraction prompt and join patterns (#1590)
 # ---------------------------------------------------------------------------
 
@@ -131,15 +207,22 @@ PDF_PER_PAGE_PROMPT = (
     "- Return ONE JSON object per ROW (between horizontal lines).\n"
     "- Read each column by its POSITION relative to the vertical "
     "lines.\n"
-    "- Transcribe text VERBATIM. Do not summarize or omit.\n"
+    "- Transcribe ruling_text as **Markdown** preserving formatting:\n"
+    "  - Use **bold** for bold text and headings\n"
+    "  - Use *italic* for italic/underlined text\n"
+    "  - Use numbered lists (1. 2. 3.) for numbered paragraphs\n"
+    "  - Use blank lines between paragraphs\n"
+    "  - Preserve ALL content — do not summarize or omit\n"
     "- If a column is blank in a row, set its value to empty string.\n"
     "- SKIP page headers, footers, and page numbers.\n\n"
     "{\n"
     '  "rulings": [\n'
     '    {"entry_number": "101", "case_info": "Smith vs Jones\\n'
     '25-01455183",\n'
-    '     "ruling_text": "Full text of the ruling including all '
-    'paragraphs and sub-sections..."},\n'
+    '     "ruling_text": "**MOTION FOR SUMMARY JUDGMENT**\\n\\n'
+    "Defendant's motion for summary judgment is **GRANTED**.\\n\\n"
+    "1. The moving party has met its initial burden...\\n"
+    '2. Plaintiff fails to raise a triable issue..."},\n'
     '    {"entry_number": "", "case_info": "",\n'
     '     "ruling_text": "continuation from previous page..."}\n'
     "  ]\n"
@@ -312,6 +395,18 @@ class LlmExtractor:
                 client_kwargs["api_key"] = api_key
             self._client = anthropic.Anthropic(**client_kwargs)
 
+        # LLM result cache (enabled when S3_CACHE_DIR is set).
+        s3_cache_dir = os.environ.get("S3_CACHE_DIR", "")
+        self._cache: _LlmCache | None = (
+            _LlmCache(
+                str(Path(s3_cache_dir) / "llm-cache"),
+                self._provider,
+                self._model,
+            )
+            if s3_cache_dir
+            else None
+        )
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -347,6 +442,16 @@ class LlmExtractor:
         if not text or not text.strip():
             return []
 
+        effective_prompt = system_prompt or EXTRACTION_SYSTEM_PROMPT
+        content_key = _content_hash_for_cache(text, metadata)
+
+        # Check cache
+        if self._cache is not None:
+            cached = self._cache.get(effective_prompt, content_key)
+            if cached is not None:
+                logger.debug("llm_cache.hit", content_key=content_key[:12])
+                return [ExtractedRuling(**r) for r in cached]
+
         chunks = self._split_into_chunks(text)
         usage = TokenUsage()
 
@@ -358,32 +463,42 @@ class LlmExtractor:
             if not results:
                 return []
             merged = self._merge_results(results)
-            return merged.rulings
-
-        # Multiple chunks: extract each and merge.
-        logger.info(
-            "llm_extractor.chunked",
-            num_chunks=len(chunks),
-            chunk_sizes=[len(c) for c in chunks],
-        )
-        all_results: list[ExtractionResult] = []
-        for i, chunk in enumerate(chunks):
-            results = self._extract_chunk_with_retry(
-                chunk,
-                metadata=metadata,
-                usage=usage,
-                chunk_index=i,
-                system_prompt=system_prompt,
+            rulings = self._propagate_document_fields(merged)
+        else:
+            # Multiple chunks: extract each and merge.
+            logger.info(
+                "llm_extractor.chunked",
+                num_chunks=len(chunks),
+                chunk_sizes=[len(c) for c in chunks],
             )
-            all_results.extend(results)
+            all_results: list[ExtractionResult] = []
+            for i, chunk in enumerate(chunks):
+                results = self._extract_chunk_with_retry(
+                    chunk,
+                    metadata=metadata,
+                    usage=usage,
+                    chunk_index=i,
+                    system_prompt=system_prompt,
+                )
+                all_results.extend(results)
 
-        self._log_usage(usage)
+            self._log_usage(usage)
 
-        if not all_results:
-            return []
+            if not all_results:
+                return []
 
-        merged = self._merge_results(all_results)
-        return merged.rulings
+            merged = self._merge_results(all_results)
+            rulings = self._propagate_document_fields(merged)
+
+        # Write to cache
+        if self._cache is not None and rulings:
+            self._cache.put(
+                effective_prompt,
+                content_key,
+                [r.model_dump(mode="json") for r in rulings],
+            )
+
+        return rulings
 
     def extract_from_pdf(
         self,
@@ -420,6 +535,15 @@ class LlmExtractor:
         if not pdf_bytes:
             return []
 
+        content_key = _content_hash_for_cache(pdf_bytes, metadata)
+
+        # Check cache
+        if self._cache is not None:
+            cached = self._cache.get(PDF_PER_PAGE_PROMPT, content_key)
+            if cached is not None:
+                logger.debug("llm_cache.hit_pdf", content_key=content_key[:12])
+                return [ExtractedRuling(**r) for r in cached]
+
         page_images = _render_pdf_pages(pdf_bytes, max_pages)
         if not page_images:
             logger.warning("llm_extractor.no_pages_rendered")
@@ -442,7 +566,17 @@ class LlmExtractor:
             return []
 
         # Join rows into cases and convert to ExtractedRuling objects.
-        return _join_page_rows(all_rows, metadata=metadata)
+        rulings = _join_page_rows(all_rows, metadata=metadata)
+
+        # Write to cache
+        if self._cache is not None and rulings:
+            self._cache.put(
+                PDF_PER_PAGE_PROMPT,
+                content_key,
+                [r.model_dump(mode="json") for r in rulings],
+            )
+
+        return rulings
 
     # ------------------------------------------------------------------
     # Internal: API call with retries
@@ -986,6 +1120,24 @@ class LlmExtractor:
     # ------------------------------------------------------------------
 
     @staticmethod
+    @staticmethod
+    def _propagate_document_fields(result: ExtractionResult) -> list[ExtractedRuling]:
+        """Propagate document-level judge/department to rulings missing them.
+
+        The LLM extracts judge_name and department at the document level
+        (from the PDF header). Per-ruling fields are often null because the
+        judge isn't repeated in each ruling's text. This fills in the gaps.
+        """
+        doc_judge = result.extracted_judge_name
+        doc_dept = result.department
+        for ruling in result.rulings:
+            if not ruling.extracted_judge_name and doc_judge:
+                ruling.extracted_judge_name = doc_judge
+            if not ruling.department and doc_dept:
+                ruling.department = doc_dept
+        return result.rulings
+
+    @staticmethod
     def _merge_results(results: list[ExtractionResult]) -> ExtractionResult:
         """Merge extraction results from multiple chunks.
 
@@ -1301,6 +1453,23 @@ def _join_page_rows(
     # Group rows into cases.
     cases: list[dict] = []  # Each: {case_info, ruling_text}
 
+    # Extract judge/department from header rows before skipping them.
+    # Header rows typically have entry_number=null, empty ruling_text,
+    # and case_info containing "JUDGE {Name}" or "Department {Code}".
+    header_judge: str | None = None
+    header_dept: str | None = None
+    for row in rows:
+        if row["entry_number"] is None and not row["ruling_text"] and row.get("case_info"):
+            info = row["case_info"]
+            # Extract judge from "JUDGE WILLIAM D. CLASTER" pattern
+            judge_match = re.search(r"JUDGE\s+(.+?)(?:\n|$)", info, re.IGNORECASE)
+            if judge_match and not header_judge:
+                header_judge = judge_match.group(1).strip()
+            # Extract department from "Department CX101" or "Dept. C25" pattern
+            dept_match = re.search(r"(?:Department|Dept\.?)\s+([A-Z0-9]+)", info, re.IGNORECASE)
+            if dept_match and not header_dept:
+                header_dept = dept_match.group(1).strip()
+
     for row in rows:
         # Skip header rows (e.g., department/judge headers) that the LLM
         # may include with entry_number=null and empty ruling_text.  These
@@ -1351,7 +1520,7 @@ def _join_page_rows(
             )
             ruling_text = None
 
-        # Apply metadata overrides for judge_name, department, hearing_date.
+        # Apply metadata overrides, then header extraction, for judge/dept/date.
         judge_name: str | None = None
         department: str | None = None
         hearing_date: str | None = None
@@ -1359,6 +1528,10 @@ def _join_page_rows(
             judge_name = metadata.get("judge_name")
             department = metadata.get("department")
             hearing_date = metadata.get("hearing_date")
+        if not judge_name:
+            judge_name = header_judge
+        if not department:
+            department = header_dept
 
         rulings.append(
             ExtractedRuling(

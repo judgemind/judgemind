@@ -498,7 +498,7 @@ jobs:
         run: terraform -chdir=infra/terraform/environments/dev init
       - name: Terraform Plan (dev)
         if: env.AWS_ACCESS_KEY_ID != ''
-        run: terraform -chdir=infra/terraform/environments/dev plan -no-color -input=false
+        run: terraform -chdir=infra/terraform/environments/dev plan -no-color -input=false -lock=false
 
   scripts-tests:
     needs: detect-changes
@@ -768,14 +768,16 @@ jobs:
         run: scripts/check-hardcoded-colors.sh
 
   # ---------------------------------------------------------------
-  # Schema drift guard: migration tables must exist in schema.sql
+  # Schema drift guard: schema.sql must match applied migrations
   # ---------------------------------------------------------------
   schema-drift-check:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.schema == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - name: Check for schema.sql and migration table drift
-        run: scripts/check-schema-drift.sh
+      - name: Check schema.sql matches migrations
+        run: scripts/check_schema_drift.sh --ci
 
   # ---------------------------------------------------------------
   # Migration file guard: validate naming and sequencing
@@ -788,18 +790,6 @@ jobs:
       - uses: actions/checkout@v6
       - name: Validate migration file naming and sequencing
         run: scripts/check-migration-files.sh
-
-  # ---------------------------------------------------------------
-  # Schema drift guard: schema.sql must match applied migrations
-  # ---------------------------------------------------------------
-  schema-drift-check:
-    needs: detect-changes
-    if: needs.detect-changes.outputs.schema == 'true'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-      - name: Check schema.sql matches migrations
-        run: scripts/check_schema_drift.sh --ci
 
   # ---------------------------------------------------------------
   # ECS oneshot import guard: prevent scripts/ from importing siblings
