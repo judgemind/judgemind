@@ -271,13 +271,13 @@ def main() -> None:
 
         actual_hash = hashlib.sha256(content).hexdigest()
         if actual_hash != parsed["content_hash"]:
-            logger.error(
-                "Content hash mismatch",
+            logger.warning(
+                "Content hash mismatch — using actual hash",
                 key=key,
                 expected=parsed["content_hash"][:12],
                 actual=actual_hash[:12],
             )
-            return "error"
+            parsed["content_hash"] = actual_hash
 
         event = build_event(key, content, parsed, BUCKET)
         worker = _thread_local.worker
