@@ -2,13 +2,11 @@
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
-from unittest.mock import MagicMock, patch
 
 from framework.llm_extractor import (
-    _LlmCache,
     _content_hash_for_cache,
+    _LlmCache,
     _prompt_hash,
 )
 
