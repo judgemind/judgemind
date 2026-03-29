@@ -2,7 +2,7 @@
 name: Task
 about: A unit of work for an agent or contributor
 title: "[AREA] "
-labels: agent/ready
+labels: status/triage
 assignees: ''
 ---
 

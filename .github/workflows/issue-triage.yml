@@ -1,0 +1,35 @@
+name: Triage new issues
+
+on:
+  issues:
+    types: [opened, labeled]
+
+jobs:
+  guard-agent-ready:
+    # Strip agent/ready from issues filed by non-collaborators.
+    # Collaborators (OWNER, MEMBER, COLLABORATOR) can label freely.
+    if: contains(github.event.issue.labels.*.name, 'agent/ready')
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - name: Check author association and remove label if untrusted
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          AUTHOR_ASSOC: ${{ github.event.issue.author_association }}
+          REPO: ${{ github.repository }}
+        run: |
+          TRUSTED="OWNER MEMBER COLLABORATOR"
+          if echo "$TRUSTED" | grep -qw "$AUTHOR_ASSOC"; then
+            echo "Author association '$AUTHOR_ASSOC' is trusted — keeping agent/ready."
+            exit 0
+          fi
+
+          echo "Author association '$AUTHOR_ASSOC' is NOT trusted — removing agent/ready."
+          gh issue edit "$ISSUE_NUMBER" --repo "$REPO" \
+            --remove-label "agent/ready" \
+            --add-label "status/triage"
+
+          gh issue comment "$ISSUE_NUMBER" --repo "$REPO" \
+            --body "Thanks for filing this issue! A maintainer will review and triage it shortly. (The \`agent/ready\` label is restricted to collaborators.)"
