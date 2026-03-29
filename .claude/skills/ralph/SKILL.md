@@ -14,6 +14,8 @@ Implement the current task using a ralph loop: an iterative work-then-review cyc
 
 **When NOT to use:** Terraform, DB migrations, CI/CD, docs, investigation tasks. For those, implement directly per CLAUDE.md.
 
+**Local dev iteration for ingestion/extraction tasks:** When the task involves the ingestion pipeline, scraper logic, LLM extraction, or enrichment, use the local dev stack for faster iteration. The local DB + S3 cache (`S3_CACHE_DIR=/tmp/judgemind-archive`) enables running the full pipeline locally. After implementing changes, run `scripts/rebuild_db.sh --skip-reset` to re-process documents and verify data correctness against source documents. The LLM result cache makes subsequent rebuilds near-instant. See CLAUDE.md §Local Development Stack. **Prioritize correctness over completeness** — verify extracted values match source documents.
+
 Do not ask for confirmation. Work autonomously through every step.
 
 **IMPORTANT — Ralph is NOT the end of the task.** When this skill completes, the calling `/task` workflow has 8 more mandatory steps remaining (A.2b through A.9: process summary, commit, push, PR, CI, merge, deploy, retrospective). Ralph completing means the code is ready — but the code has not been committed, pushed, reviewed by CI, or merged. Exiting after ralph is a known failure mode (#721).

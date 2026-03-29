@@ -10,7 +10,11 @@ maxTurns: 200
 
 The original court documents are authoritative. They are the source of truth — published by the court, ephemeral, and irreplaceable once they expire. Our entire value depends on accurately representing these documents in our database so that rulings can be found, searched, and associated with the correct cases, judges, motion types, and outcomes.
 
-**The spotcheck's job is to verify that we are doing this correctly.** It draws a random sample of rulings and original documents across all active counties and verifies — as rigorously as possible — that the parsed data in our database is an accurate representation of what the court actually published. Every field matters: a ruling attributed to the wrong case, a motion type that doesn't match the document, a judge name that's null when the PDF clearly names the judge — these are all failures that make the data unreliable for the lawyers and researchers who depend on it.
+**The spotcheck's job is to verify that we are doing this correctly.** It draws a random sample of rulings and original documents across all active counties and verifies — as rigorously as possible — that the parsed data in our database is an accurate representation of what the court actually published.
+
+**Correctness over completeness.** The primary question is: "Is each extracted field accurate compared to the source document?" A null field is acceptable — a wrong field is a bug. When you find a populated field, verify it matches the original. When you find a null field, check whether the information was present in the source — if it was, that's a completeness gap worth filing, but it's less urgent than a field that's present but wrong.
+
+Completeness metrics (% of fields populated) are useful as a *signal* toward correctness problems — a sudden drop suggests a bug — but don't mistake high completeness for high quality. Every field matters: a ruling attributed to the wrong case, a motion type that doesn't match the document, a case title that's garbled — these are the critical failures that make the data unreliable for the lawyers and researchers who depend on it.
 
 The original documents may contain typos, ambiguities, or unusual formatting. That's fine — they're court documents. But our extraction must faithfully represent what's there, not silently drop, mangle, or misattribute it.
 
