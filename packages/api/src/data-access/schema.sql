@@ -3,7 +3,7 @@
 -- To modify the schema, add a migration in packages/api/migrations/
 -- then run: scripts/regenerate_schema.sh
 --
--- Generated from 14 migrations.
+-- Generated from 15 migrations.
 
 
 
@@ -18,7 +18,13 @@ SET xmloption = content;
 SET client_min_messages = warning;
 SET row_security = off;
 
+CREATE SCHEMA derived;
+
+
 CREATE SCHEMA staging;
+
+
+CREATE SCHEMA telemetry;
 
 
 CREATE EXTENSION IF NOT EXISTS pgcrypto WITH SCHEMA public;
@@ -83,29 +89,7 @@ $$;
 
 SET default_table_access_method = heap;
 
-CREATE TABLE public.alert_events (
-    id uuid DEFAULT gen_random_uuid() NOT NULL,
-    subscription_id uuid NOT NULL,
-    document_id uuid,
-    ruling_id uuid,
-    triggered_at timestamp with time zone DEFAULT now() NOT NULL,
-    included_in_digest_at timestamp with time zone,
-    digest_sent boolean DEFAULT false NOT NULL
-);
-
-
-CREATE TABLE public.alert_subscriptions (
-    id uuid DEFAULT gen_random_uuid() NOT NULL,
-    user_id uuid NOT NULL,
-    alert_type public.alert_type NOT NULL,
-    filters jsonb DEFAULT '{}'::jsonb NOT NULL,
-    is_active boolean DEFAULT true NOT NULL,
-    created_at timestamp with time zone DEFAULT now() NOT NULL,
-    updated_at timestamp with time zone DEFAULT now() NOT NULL
-);
-
-
-CREATE TABLE public.attorney_aliases (
+CREATE TABLE derived.attorney_aliases (
     id uuid DEFAULT gen_random_uuid() NOT NULL,
     attorney_id uuid NOT NULL,
     raw_name text NOT NULL,
@@ -117,7 +101,7 @@ CREATE TABLE public.attorney_aliases (
 );
 
 
-CREATE TABLE public.attorneys (
+CREATE TABLE derived.attorneys (
     id uuid DEFAULT gen_random_uuid() NOT NULL,
     canonical_name text NOT NULL,
     bar_number text,
@@ -130,7 +114,7 @@ CREATE TABLE public.attorneys (
 );
 
 
-CREATE TABLE public.case_attorneys (
+CREATE TABLE derived.case_attorneys (
     id uuid DEFAULT gen_random_uuid() NOT NULL,
     case_id uuid NOT NULL,
     attorney_id uuid NOT NULL,
@@ -141,7 +125,7 @@ CREATE TABLE public.case_attorneys (
 );
 
 
-CREATE TABLE public.case_judges (
+CREATE TABLE derived.case_judges (
     case_id uuid NOT NULL,
     judge_id uuid NOT NULL,
     assigned_at date,
@@ -149,7 +133,7 @@ CREATE TABLE public.case_judges (
 );
 
 
-CREATE TABLE public.case_parties (
+CREATE TABLE derived.case_parties (
     id uuid DEFAULT gen_random_uuid() NOT NULL,
     case_id uuid NOT NULL,
     party_id uuid NOT NULL,
@@ -157,7 +141,7 @@ CREATE TABLE public.case_parties (
 );
 
 
-CREATE TABLE public.cases (
+CREATE TABLE derived.cases (
     id uuid DEFAULT gen_random_uuid() NOT NULL,
     case_number text NOT NULL,
     case_number_normalized text,
@@ -173,7 +157,7 @@ CREATE TABLE public.cases (
 );
 
 
-CREATE TABLE public.court_directory_snapshots (
+CREATE TABLE derived.court_directory_snapshots (
     id integer NOT NULL,
     court_id text NOT NULL,
     captured_at timestamp with time zone NOT NULL,
@@ -183,7 +167,7 @@ CREATE TABLE public.court_directory_snapshots (
 );
 
 
-CREATE SEQUENCE public.court_directory_snapshots_id_seq
+CREATE SEQUENCE derived.court_directory_snapshots_id_seq
     AS integer
     START WITH 1
     INCREMENT BY 1
@@ -192,10 +176,10 @@ CREATE SEQUENCE public.court_directory_snapshots_id_seq
     CACHE 1;
 
 
-ALTER SEQUENCE public.court_directory_snapshots_id_seq OWNED BY public.court_directory_snapshots.id;
+ALTER SEQUENCE derived.court_directory_snapshots_id_seq OWNED BY derived.court_directory_snapshots.id;
 
 
-CREATE TABLE public.courts (
+CREATE TABLE derived.courts (
     id uuid DEFAULT gen_random_uuid() NOT NULL,
     state character(2) NOT NULL,
     county text NOT NULL,
@@ -209,34 +193,13 @@ CREATE TABLE public.courts (
 );
 
 
-COMMENT ON TABLE public.courts IS 'Reference table for jurisdictions. One row per court.';
+COMMENT ON TABLE derived.courts IS 'Reference table for jurisdictions. One row per court.';
 
 
-COMMENT ON COLUMN public.courts.court_code IS 'Slug used in S3 key paths: /{state}/{county}/{court}/...';
+COMMENT ON COLUMN derived.courts.court_code IS 'Slug used in S3 key paths: /{state}/{county}/{court}/...';
 
 
-CREATE TABLE public.data_quality_metrics (
-    id bigint NOT NULL,
-    recorded_at timestamp with time zone DEFAULT now() NOT NULL,
-    county text NOT NULL,
-    metric_name text NOT NULL,
-    metric_value numeric NOT NULL,
-    metadata jsonb
-);
-
-
-CREATE SEQUENCE public.data_quality_metrics_id_seq
-    START WITH 1
-    INCREMENT BY 1
-    NO MINVALUE
-    NO MAXVALUE
-    CACHE 1;
-
-
-ALTER SEQUENCE public.data_quality_metrics_id_seq OWNED BY public.data_quality_metrics.id;
-
-
-CREATE TABLE public.documents (
+CREATE TABLE derived.documents (
     id uuid DEFAULT gen_random_uuid() NOT NULL,
     case_id uuid,
     court_id uuid NOT NULL,
@@ -259,13 +222,13 @@ CREATE TABLE public.documents (
 );
 
 
-COMMENT ON COLUMN public.documents.content_hash IS 'SHA-256. Used for dedup and to detect revisions across scraper runs.';
+COMMENT ON COLUMN derived.documents.content_hash IS 'SHA-256. Used for dedup and to detect revisions across scraper runs.';
 
 
-COMMENT ON COLUMN public.documents.change_type IS 'LLM-classified when a new version is captured: substantive or cosmetic.';
+COMMENT ON COLUMN derived.documents.change_type IS 'LLM-classified when a new version is captured: substantive or cosmetic.';
 
 
-CREATE TABLE public.judge_aliases (
+CREATE TABLE derived.judge_aliases (
     id uuid DEFAULT gen_random_uuid() NOT NULL,
     judge_id uuid NOT NULL,
     raw_name text NOT NULL,
@@ -277,7 +240,7 @@ CREATE TABLE public.judge_aliases (
 );
 
 
-CREATE TABLE public.judges (
+CREATE TABLE derived.judges (
     id uuid DEFAULT gen_random_uuid() NOT NULL,
     canonical_name text NOT NULL,
     court_id uuid NOT NULL,
@@ -291,7 +254,7 @@ CREATE TABLE public.judges (
 );
 
 
-CREATE TABLE public.parties (
+CREATE TABLE derived.parties (
     id uuid DEFAULT gen_random_uuid() NOT NULL,
     canonical_name text NOT NULL,
     party_type text,
@@ -300,7 +263,7 @@ CREATE TABLE public.parties (
 );
 
 
-CREATE TABLE public.party_aliases (
+CREATE TABLE derived.party_aliases (
     id uuid DEFAULT gen_random_uuid() NOT NULL,
     party_id uuid NOT NULL,
     raw_name text NOT NULL,
@@ -312,16 +275,7 @@ CREATE TABLE public.party_aliases (
 );
 
 
-CREATE TABLE public.refresh_tokens (
-    id uuid DEFAULT gen_random_uuid() NOT NULL,
-    user_id uuid NOT NULL,
-    token_hash text NOT NULL,
-    expires_at timestamp with time zone NOT NULL,
-    created_at timestamp with time zone DEFAULT now() NOT NULL
-);
-
-
-CREATE TABLE public.rulings (
+CREATE TABLE derived.rulings (
     id uuid DEFAULT gen_random_uuid() NOT NULL,
     document_id uuid NOT NULL,
     case_id uuid NOT NULL,
@@ -345,27 +299,42 @@ CREATE TABLE public.rulings (
 );
 
 
-COMMENT ON COLUMN public.rulings.judge_id IS 'Nullable: populated by entity resolution after initial capture.';
+COMMENT ON COLUMN derived.rulings.judge_id IS 'Nullable: populated by entity resolution after initial capture.';
 
 
-COMMENT ON COLUMN public.rulings.summary IS 'Cached AI summary. Served from cache on every request.';
+COMMENT ON COLUMN derived.rulings.summary IS 'Cached AI summary. Served from cache on every request.';
 
 
-COMMENT ON COLUMN public.rulings.ruling_text_hash IS 'SHA-256 of normalized (lowercased, whitespace-collapsed) ruling text. Used for content-based dedup.';
+COMMENT ON COLUMN derived.rulings.ruling_text_hash IS 'SHA-256 of normalized (lowercased, whitespace-collapsed) ruling text. Used for content-based dedup.';
 
 
-CREATE TABLE public.scraper_runs (
+CREATE TABLE public.alert_events (
     id uuid DEFAULT gen_random_uuid() NOT NULL,
-    scraper_id text NOT NULL,
-    court_id uuid,
-    started_at timestamp with time zone NOT NULL,
-    completed_at timestamp with time zone,
-    status text NOT NULL,
-    records_captured integer DEFAULT 0 NOT NULL,
-    records_failed integer DEFAULT 0 NOT NULL,
-    error_message text,
-    error_details jsonb,
-    response_time_ms integer,
+    subscription_id uuid NOT NULL,
+    document_id uuid,
+    ruling_id uuid,
+    triggered_at timestamp with time zone DEFAULT now() NOT NULL,
+    included_in_digest_at timestamp with time zone,
+    digest_sent boolean DEFAULT false NOT NULL
+);
+
+
+CREATE TABLE public.alert_subscriptions (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    user_id uuid NOT NULL,
+    alert_type public.alert_type NOT NULL,
+    filters jsonb DEFAULT '{}'::jsonb NOT NULL,
+    is_active boolean DEFAULT true NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+CREATE TABLE public.refresh_tokens (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    user_id uuid NOT NULL,
+    token_hash text NOT NULL,
+    expires_at timestamp with time zone NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL
 );
 
@@ -385,36 +354,6 @@ CREATE TABLE public.users (
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
     google_id text
 );
-
-
-CREATE TABLE public.validation_results (
-    id uuid DEFAULT gen_random_uuid() NOT NULL,
-    document_id uuid NOT NULL,
-    ruling_id uuid,
-    result text NOT NULL,
-    reason text,
-    model text,
-    input_tokens integer,
-    output_tokens integer,
-    latency_ms integer,
-    created_at timestamp with time zone DEFAULT now() NOT NULL,
-    CONSTRAINT validation_results_result_check CHECK ((result = ANY (ARRAY['pass'::text, 'flag'::text, 'fail'::text, 'error'::text])))
-);
-
-
-COMMENT ON TABLE public.validation_results IS 'LLM validation outcomes for ingested documents. One row per validation check.';
-
-
-COMMENT ON COLUMN public.validation_results.result IS 'Validation outcome: pass (write normally), flag (write + review), fail (skip write), error (LLM call failed).';
-
-
-COMMENT ON COLUMN public.validation_results.reason IS 'Human-readable reason for flag/fail results. NULL for pass results.';
-
-
-COMMENT ON COLUMN public.validation_results.model IS 'LLM model used for validation (e.g. claude-haiku-4-5-20251001).';
-
-
-COMMENT ON COLUMN public.validation_results.latency_ms IS 'Wall-clock time for the validation LLM call in milliseconds.';
 
 
 CREATE TABLE staging.captures (
@@ -458,10 +397,157 @@ CREATE TABLE staging.ruled_items (
 );
 
 
-ALTER TABLE ONLY public.court_directory_snapshots ALTER COLUMN id SET DEFAULT nextval('public.court_directory_snapshots_id_seq'::regclass);
+CREATE TABLE telemetry.data_quality_metrics (
+    id bigint NOT NULL,
+    recorded_at timestamp with time zone DEFAULT now() NOT NULL,
+    county text NOT NULL,
+    metric_name text NOT NULL,
+    metric_value numeric NOT NULL,
+    metadata jsonb
+);
 
 
-ALTER TABLE ONLY public.data_quality_metrics ALTER COLUMN id SET DEFAULT nextval('public.data_quality_metrics_id_seq'::regclass);
+CREATE SEQUENCE telemetry.data_quality_metrics_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+ALTER SEQUENCE telemetry.data_quality_metrics_id_seq OWNED BY telemetry.data_quality_metrics.id;
+
+
+CREATE TABLE telemetry.scraper_runs (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    scraper_id text NOT NULL,
+    court_id uuid,
+    started_at timestamp with time zone NOT NULL,
+    completed_at timestamp with time zone,
+    status text NOT NULL,
+    records_captured integer DEFAULT 0 NOT NULL,
+    records_failed integer DEFAULT 0 NOT NULL,
+    error_message text,
+    error_details jsonb,
+    response_time_ms integer,
+    created_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+CREATE TABLE telemetry.validation_results (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    document_id uuid NOT NULL,
+    ruling_id uuid,
+    result text NOT NULL,
+    reason text,
+    model text,
+    input_tokens integer,
+    output_tokens integer,
+    latency_ms integer,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT validation_results_result_check CHECK ((result = ANY (ARRAY['pass'::text, 'flag'::text, 'fail'::text, 'error'::text])))
+);
+
+
+COMMENT ON TABLE telemetry.validation_results IS 'LLM validation outcomes for ingested documents. One row per validation check.';
+
+
+COMMENT ON COLUMN telemetry.validation_results.result IS 'Validation outcome: pass (write normally), flag (write + review), fail (skip write), error (LLM call failed).';
+
+
+COMMENT ON COLUMN telemetry.validation_results.reason IS 'Human-readable reason for flag/fail results. NULL for pass results.';
+
+
+COMMENT ON COLUMN telemetry.validation_results.model IS 'LLM model used for validation (e.g. claude-haiku-4-5-20251001).';
+
+
+COMMENT ON COLUMN telemetry.validation_results.latency_ms IS 'Wall-clock time for the validation LLM call in milliseconds.';
+
+
+ALTER TABLE ONLY derived.court_directory_snapshots ALTER COLUMN id SET DEFAULT nextval('derived.court_directory_snapshots_id_seq'::regclass);
+
+
+ALTER TABLE ONLY telemetry.data_quality_metrics ALTER COLUMN id SET DEFAULT nextval('telemetry.data_quality_metrics_id_seq'::regclass);
+
+
+ALTER TABLE ONLY derived.attorney_aliases
+    ADD CONSTRAINT attorney_aliases_pkey PRIMARY KEY (id);
+
+
+ALTER TABLE ONLY derived.attorneys
+    ADD CONSTRAINT attorneys_pkey PRIMARY KEY (id);
+
+
+ALTER TABLE ONLY derived.case_attorneys
+    ADD CONSTRAINT case_attorneys_pkey PRIMARY KEY (id);
+
+
+ALTER TABLE ONLY derived.case_judges
+    ADD CONSTRAINT case_judges_pkey PRIMARY KEY (case_id, judge_id);
+
+
+ALTER TABLE ONLY derived.case_parties
+    ADD CONSTRAINT case_parties_pkey PRIMARY KEY (id);
+
+
+ALTER TABLE ONLY derived.cases
+    ADD CONSTRAINT cases_court_id_case_number_key UNIQUE (court_id, case_number);
+
+
+ALTER TABLE ONLY derived.cases
+    ADD CONSTRAINT cases_pkey PRIMARY KEY (id);
+
+
+ALTER TABLE ONLY derived.court_directory_snapshots
+    ADD CONSTRAINT court_directory_snapshots_pkey PRIMARY KEY (id);
+
+
+ALTER TABLE ONLY derived.courts
+    ADD CONSTRAINT courts_court_code_key UNIQUE (court_code);
+
+
+ALTER TABLE ONLY derived.courts
+    ADD CONSTRAINT courts_pkey PRIMARY KEY (id);
+
+
+ALTER TABLE ONLY derived.documents
+    ADD CONSTRAINT documents_pkey PRIMARY KEY (id);
+
+
+ALTER TABLE ONLY derived.judge_aliases
+    ADD CONSTRAINT judge_aliases_pkey PRIMARY KEY (id);
+
+
+ALTER TABLE ONLY derived.judges
+    ADD CONSTRAINT judges_canonical_name_court_id_key UNIQUE (canonical_name, court_id);
+
+
+ALTER TABLE ONLY derived.judges
+    ADD CONSTRAINT judges_pkey PRIMARY KEY (id);
+
+
+ALTER TABLE ONLY derived.parties
+    ADD CONSTRAINT parties_pkey PRIMARY KEY (id);
+
+
+ALTER TABLE ONLY derived.party_aliases
+    ADD CONSTRAINT party_aliases_pkey PRIMARY KEY (id);
+
+
+ALTER TABLE ONLY derived.rulings
+    ADD CONSTRAINT rulings_pkey PRIMARY KEY (id);
+
+
+ALTER TABLE ONLY derived.case_attorneys
+    ADD CONSTRAINT uq_case_attorneys_case_attorney_role UNIQUE (case_id, attorney_id, role);
+
+
+ALTER TABLE ONLY derived.case_parties
+    ADD CONSTRAINT uq_case_parties_case_party_role UNIQUE (case_id, party_id, role);
+
+
+ALTER TABLE ONLY derived.rulings
+    ADD CONSTRAINT uq_rulings_document_id UNIQUE (document_id);
 
 
 ALTER TABLE ONLY public.alert_events
@@ -472,100 +558,12 @@ ALTER TABLE ONLY public.alert_subscriptions
     ADD CONSTRAINT alert_subscriptions_pkey PRIMARY KEY (id);
 
 
-ALTER TABLE ONLY public.attorney_aliases
-    ADD CONSTRAINT attorney_aliases_pkey PRIMARY KEY (id);
-
-
-ALTER TABLE ONLY public.attorneys
-    ADD CONSTRAINT attorneys_pkey PRIMARY KEY (id);
-
-
-ALTER TABLE ONLY public.case_attorneys
-    ADD CONSTRAINT case_attorneys_pkey PRIMARY KEY (id);
-
-
-ALTER TABLE ONLY public.case_judges
-    ADD CONSTRAINT case_judges_pkey PRIMARY KEY (case_id, judge_id);
-
-
-ALTER TABLE ONLY public.case_parties
-    ADD CONSTRAINT case_parties_pkey PRIMARY KEY (id);
-
-
-ALTER TABLE ONLY public.cases
-    ADD CONSTRAINT cases_court_id_case_number_key UNIQUE (court_id, case_number);
-
-
-ALTER TABLE ONLY public.cases
-    ADD CONSTRAINT cases_pkey PRIMARY KEY (id);
-
-
-ALTER TABLE ONLY public.court_directory_snapshots
-    ADD CONSTRAINT court_directory_snapshots_pkey PRIMARY KEY (id);
-
-
-ALTER TABLE ONLY public.courts
-    ADD CONSTRAINT courts_court_code_key UNIQUE (court_code);
-
-
-ALTER TABLE ONLY public.courts
-    ADD CONSTRAINT courts_pkey PRIMARY KEY (id);
-
-
-ALTER TABLE ONLY public.data_quality_metrics
-    ADD CONSTRAINT data_quality_metrics_pkey PRIMARY KEY (id);
-
-
-ALTER TABLE ONLY public.documents
-    ADD CONSTRAINT documents_pkey PRIMARY KEY (id);
-
-
-ALTER TABLE ONLY public.judge_aliases
-    ADD CONSTRAINT judge_aliases_pkey PRIMARY KEY (id);
-
-
-ALTER TABLE ONLY public.judges
-    ADD CONSTRAINT judges_canonical_name_court_id_key UNIQUE (canonical_name, court_id);
-
-
-ALTER TABLE ONLY public.judges
-    ADD CONSTRAINT judges_pkey PRIMARY KEY (id);
-
-
-ALTER TABLE ONLY public.parties
-    ADD CONSTRAINT parties_pkey PRIMARY KEY (id);
-
-
-ALTER TABLE ONLY public.party_aliases
-    ADD CONSTRAINT party_aliases_pkey PRIMARY KEY (id);
-
-
 ALTER TABLE ONLY public.refresh_tokens
     ADD CONSTRAINT refresh_tokens_pkey PRIMARY KEY (id);
 
 
 ALTER TABLE ONLY public.refresh_tokens
     ADD CONSTRAINT refresh_tokens_token_hash_key UNIQUE (token_hash);
-
-
-ALTER TABLE ONLY public.rulings
-    ADD CONSTRAINT rulings_pkey PRIMARY KEY (id);
-
-
-ALTER TABLE ONLY public.scraper_runs
-    ADD CONSTRAINT scraper_runs_pkey PRIMARY KEY (id);
-
-
-ALTER TABLE ONLY public.case_attorneys
-    ADD CONSTRAINT uq_case_attorneys_case_attorney_role UNIQUE (case_id, attorney_id, role);
-
-
-ALTER TABLE ONLY public.case_parties
-    ADD CONSTRAINT uq_case_parties_case_party_role UNIQUE (case_id, party_id, role);
-
-
-ALTER TABLE ONLY public.rulings
-    ADD CONSTRAINT uq_rulings_document_id UNIQUE (document_id);
 
 
 ALTER TABLE ONLY public.users
@@ -584,10 +582,6 @@ ALTER TABLE ONLY public.users
     ADD CONSTRAINT users_pkey PRIMARY KEY (id);
 
 
-ALTER TABLE ONLY public.validation_results
-    ADD CONSTRAINT validation_results_pkey PRIMARY KEY (id);
-
-
 ALTER TABLE ONLY staging.captures
     ADD CONSTRAINT captures_pkey PRIMARY KEY (id);
 
@@ -596,133 +590,133 @@ ALTER TABLE ONLY staging.ruled_items
     ADD CONSTRAINT ruled_items_pkey PRIMARY KEY (id);
 
 
+ALTER TABLE ONLY telemetry.data_quality_metrics
+    ADD CONSTRAINT data_quality_metrics_pkey PRIMARY KEY (id);
+
+
+ALTER TABLE ONLY telemetry.scraper_runs
+    ADD CONSTRAINT scraper_runs_pkey PRIMARY KEY (id);
+
+
+ALTER TABLE ONLY telemetry.validation_results
+    ADD CONSTRAINT validation_results_pkey PRIMARY KEY (id);
+
+
+CREATE INDEX idx_attorney_aliases_raw_name ON derived.attorney_aliases USING btree (lower(raw_name));
+
+
+CREATE INDEX idx_attorneys_bar ON derived.attorneys USING btree (bar_state, bar_number) WHERE (bar_number IS NOT NULL);
+
+
+CREATE INDEX idx_case_attorneys_attorney_id ON derived.case_attorneys USING btree (attorney_id);
+
+
+CREATE INDEX idx_case_judges_judge_id ON derived.case_judges USING btree (judge_id);
+
+
+CREATE INDEX idx_case_parties_party_id ON derived.case_parties USING btree (party_id);
+
+
+CREATE INDEX idx_cases_case_number ON derived.cases USING btree (case_number);
+
+
+CREATE INDEX idx_cases_case_type ON derived.cases USING btree (case_type);
+
+
+CREATE INDEX idx_cases_court_id ON derived.cases USING btree (court_id);
+
+
+CREATE INDEX idx_cases_filed_at ON derived.cases USING btree (filed_at DESC);
+
+
+CREATE INDEX idx_cases_keyset_created ON derived.cases USING btree (created_at DESC, id DESC);
+
+
+CREATE INDEX idx_cases_number_norm ON derived.cases USING btree (case_number_normalized);
+
+
+CREATE INDEX idx_cases_status ON derived.cases USING btree (case_status) WHERE (case_status = 'active'::text);
+
+
+CREATE INDEX idx_court_dir_lookup ON derived.court_directory_snapshots USING btree (court_id, captured_at DESC);
+
+
+CREATE INDEX idx_courts_county ON derived.courts USING btree (county);
+
+
+CREATE INDEX idx_courts_state ON derived.courts USING btree (state);
+
+
+CREATE INDEX idx_documents_active ON derived.documents USING btree (status) WHERE (status = 'active'::public.document_status);
+
+
+CREATE INDEX idx_documents_captured_at ON derived.documents USING btree (captured_at DESC);
+
+
+CREATE INDEX idx_documents_case_id ON derived.documents USING btree (case_id);
+
+
+CREATE INDEX idx_documents_court_id ON derived.documents USING btree (court_id);
+
+
+CREATE INDEX idx_documents_hash ON derived.documents USING btree (content_hash);
+
+
+CREATE INDEX idx_documents_hearing_date ON derived.documents USING btree (hearing_date);
+
+
+CREATE INDEX idx_judge_aliases_raw_name ON derived.judge_aliases USING btree (lower(raw_name));
+
+
+CREATE INDEX idx_parties_canonical_name_lower ON derived.parties USING btree (lower(canonical_name));
+
+
+CREATE INDEX idx_party_aliases_raw_name ON derived.party_aliases USING btree (lower(raw_name));
+
+
+CREATE INDEX idx_rulings_case_id ON derived.rulings USING btree (case_id);
+
+
+CREATE INDEX idx_rulings_court_id ON derived.rulings USING btree (court_id);
+
+
+CREATE INDEX idx_rulings_hearing_date ON derived.rulings USING btree (hearing_date DESC);
+
+
+CREATE INDEX idx_rulings_judge_id ON derived.rulings USING btree (judge_id);
+
+
+CREATE INDEX idx_rulings_judge_motion ON derived.rulings USING btree (judge_id, motion_type, outcome);
+
+
+CREATE INDEX idx_rulings_judge_outcome ON derived.rulings USING btree (judge_id, outcome, hearing_date DESC);
+
+
+CREATE INDEX idx_rulings_keyset_hearing ON derived.rulings USING btree (hearing_date DESC, id DESC);
+
+
+CREATE INDEX idx_rulings_motion_type ON derived.rulings USING btree (motion_type);
+
+
+CREATE INDEX idx_rulings_outcome ON derived.rulings USING btree (outcome);
+
+
+CREATE INDEX idx_rulings_posted_at ON derived.rulings USING btree (posted_at DESC);
+
+
+CREATE UNIQUE INDEX uq_rulings_case_text_hash ON derived.rulings USING btree (case_id, ruling_text_hash) WHERE (ruling_text_hash IS NOT NULL);
+
+
 CREATE INDEX idx_alert_events_sub_id ON public.alert_events USING btree (subscription_id);
 
 
 CREATE INDEX idx_alert_events_unsent ON public.alert_events USING btree (digest_sent, triggered_at) WHERE (NOT digest_sent);
 
 
-CREATE INDEX idx_attorney_aliases_raw_name ON public.attorney_aliases USING btree (lower(raw_name));
-
-
-CREATE INDEX idx_attorneys_bar ON public.attorneys USING btree (bar_state, bar_number) WHERE (bar_number IS NOT NULL);
-
-
-CREATE INDEX idx_case_attorneys_attorney_id ON public.case_attorneys USING btree (attorney_id);
-
-
-CREATE INDEX idx_case_judges_judge_id ON public.case_judges USING btree (judge_id);
-
-
-CREATE INDEX idx_case_parties_party_id ON public.case_parties USING btree (party_id);
-
-
-CREATE INDEX idx_cases_case_number ON public.cases USING btree (case_number);
-
-
-CREATE INDEX idx_cases_case_type ON public.cases USING btree (case_type);
-
-
-CREATE INDEX idx_cases_court_id ON public.cases USING btree (court_id);
-
-
-CREATE INDEX idx_cases_filed_at ON public.cases USING btree (filed_at DESC);
-
-
-CREATE INDEX idx_cases_keyset_created ON public.cases USING btree (created_at DESC, id DESC);
-
-
-CREATE INDEX idx_cases_number_norm ON public.cases USING btree (case_number_normalized);
-
-
-CREATE INDEX idx_cases_status ON public.cases USING btree (case_status) WHERE (case_status = 'active'::text);
-
-
-CREATE INDEX idx_court_dir_lookup ON public.court_directory_snapshots USING btree (court_id, captured_at DESC);
-
-
-CREATE INDEX idx_courts_county ON public.courts USING btree (county);
-
-
-CREATE INDEX idx_courts_state ON public.courts USING btree (state);
-
-
-CREATE INDEX idx_documents_active ON public.documents USING btree (status) WHERE (status = 'active'::public.document_status);
-
-
-CREATE INDEX idx_documents_captured_at ON public.documents USING btree (captured_at DESC);
-
-
-CREATE INDEX idx_documents_case_id ON public.documents USING btree (case_id);
-
-
-CREATE INDEX idx_documents_court_id ON public.documents USING btree (court_id);
-
-
-CREATE INDEX idx_documents_hash ON public.documents USING btree (content_hash);
-
-
-CREATE INDEX idx_documents_hearing_date ON public.documents USING btree (hearing_date);
-
-
-CREATE INDEX idx_dqm_county_metric_time ON public.data_quality_metrics USING btree (county, metric_name, recorded_at DESC);
-
-
-CREATE INDEX idx_judge_aliases_raw_name ON public.judge_aliases USING btree (lower(raw_name));
-
-
-CREATE INDEX idx_parties_canonical_name_lower ON public.parties USING btree (lower(canonical_name));
-
-
-CREATE INDEX idx_party_aliases_raw_name ON public.party_aliases USING btree (lower(raw_name));
-
-
 CREATE INDEX idx_refresh_tokens_expires ON public.refresh_tokens USING btree (expires_at);
 
 
 CREATE INDEX idx_refresh_tokens_user_id ON public.refresh_tokens USING btree (user_id);
-
-
-CREATE INDEX idx_rulings_case_id ON public.rulings USING btree (case_id);
-
-
-CREATE INDEX idx_rulings_court_id ON public.rulings USING btree (court_id);
-
-
-CREATE INDEX idx_rulings_hearing_date ON public.rulings USING btree (hearing_date DESC);
-
-
-CREATE INDEX idx_rulings_judge_id ON public.rulings USING btree (judge_id);
-
-
-CREATE INDEX idx_rulings_judge_motion ON public.rulings USING btree (judge_id, motion_type, outcome);
-
-
-CREATE INDEX idx_rulings_judge_outcome ON public.rulings USING btree (judge_id, outcome, hearing_date DESC);
-
-
-CREATE INDEX idx_rulings_keyset_hearing ON public.rulings USING btree (hearing_date DESC, id DESC);
-
-
-CREATE INDEX idx_rulings_motion_type ON public.rulings USING btree (motion_type);
-
-
-CREATE INDEX idx_rulings_outcome ON public.rulings USING btree (outcome);
-
-
-CREATE INDEX idx_rulings_posted_at ON public.rulings USING btree (posted_at DESC);
-
-
-CREATE INDEX idx_scraper_runs_scraper_id ON public.scraper_runs USING btree (scraper_id, started_at DESC);
-
-
-CREATE INDEX idx_validation_results_document_id ON public.validation_results USING btree (document_id);
-
-
-CREATE INDEX idx_validation_results_result ON public.validation_results USING btree (result);
-
-
-CREATE UNIQUE INDEX uq_rulings_case_text_hash ON public.rulings USING btree (case_id, ruling_text_hash) WHERE (ruling_text_hash IS NOT NULL);
 
 
 CREATE INDEX idx_staging_captures_at ON staging.captures USING btree (captured_at DESC);
@@ -737,36 +731,124 @@ CREATE INDEX idx_staging_captures_status ON staging.captures USING btree (valida
 CREATE INDEX idx_staging_ruled_status ON staging.ruled_items USING btree (validation_status);
 
 
+CREATE INDEX idx_dqm_county_metric_time ON telemetry.data_quality_metrics USING btree (county, metric_name, recorded_at DESC);
+
+
+CREATE INDEX idx_scraper_runs_scraper_id ON telemetry.scraper_runs USING btree (scraper_id, started_at DESC);
+
+
+CREATE INDEX idx_validation_results_document_id ON telemetry.validation_results USING btree (document_id);
+
+
+CREATE INDEX idx_validation_results_result ON telemetry.validation_results USING btree (result);
+
+
+CREATE TRIGGER trg_attorneys_updated_at BEFORE UPDATE ON derived.attorneys FOR EACH ROW EXECUTE FUNCTION public.update_updated_at();
+
+
+CREATE TRIGGER trg_cases_updated_at BEFORE UPDATE ON derived.cases FOR EACH ROW EXECUTE FUNCTION public.update_updated_at();
+
+
+CREATE TRIGGER trg_courts_updated_at BEFORE UPDATE ON derived.courts FOR EACH ROW EXECUTE FUNCTION public.update_updated_at();
+
+
+CREATE TRIGGER trg_judges_updated_at BEFORE UPDATE ON derived.judges FOR EACH ROW EXECUTE FUNCTION public.update_updated_at();
+
+
+CREATE TRIGGER trg_parties_updated_at BEFORE UPDATE ON derived.parties FOR EACH ROW EXECUTE FUNCTION public.update_updated_at();
+
+
+CREATE TRIGGER trg_rulings_updated_at BEFORE UPDATE ON derived.rulings FOR EACH ROW EXECUTE FUNCTION public.update_updated_at();
+
+
 CREATE TRIGGER trg_alert_subscriptions_updated_at BEFORE UPDATE ON public.alert_subscriptions FOR EACH ROW EXECUTE FUNCTION public.update_updated_at();
-
-
-CREATE TRIGGER trg_attorneys_updated_at BEFORE UPDATE ON public.attorneys FOR EACH ROW EXECUTE FUNCTION public.update_updated_at();
-
-
-CREATE TRIGGER trg_cases_updated_at BEFORE UPDATE ON public.cases FOR EACH ROW EXECUTE FUNCTION public.update_updated_at();
-
-
-CREATE TRIGGER trg_courts_updated_at BEFORE UPDATE ON public.courts FOR EACH ROW EXECUTE FUNCTION public.update_updated_at();
-
-
-CREATE TRIGGER trg_judges_updated_at BEFORE UPDATE ON public.judges FOR EACH ROW EXECUTE FUNCTION public.update_updated_at();
-
-
-CREATE TRIGGER trg_parties_updated_at BEFORE UPDATE ON public.parties FOR EACH ROW EXECUTE FUNCTION public.update_updated_at();
-
-
-CREATE TRIGGER trg_rulings_updated_at BEFORE UPDATE ON public.rulings FOR EACH ROW EXECUTE FUNCTION public.update_updated_at();
 
 
 CREATE TRIGGER trg_users_updated_at BEFORE UPDATE ON public.users FOR EACH ROW EXECUTE FUNCTION public.update_updated_at();
 
 
-ALTER TABLE ONLY public.alert_events
-    ADD CONSTRAINT alert_events_document_id_fkey FOREIGN KEY (document_id) REFERENCES public.documents(id);
+ALTER TABLE ONLY derived.attorney_aliases
+    ADD CONSTRAINT attorney_aliases_attorney_id_fkey FOREIGN KEY (attorney_id) REFERENCES derived.attorneys(id) ON DELETE CASCADE;
+
+
+ALTER TABLE ONLY derived.case_attorneys
+    ADD CONSTRAINT case_attorneys_attorney_id_fkey FOREIGN KEY (attorney_id) REFERENCES derived.attorneys(id);
+
+
+ALTER TABLE ONLY derived.case_attorneys
+    ADD CONSTRAINT case_attorneys_case_id_fkey FOREIGN KEY (case_id) REFERENCES derived.cases(id) ON DELETE CASCADE;
+
+
+ALTER TABLE ONLY derived.case_attorneys
+    ADD CONSTRAINT case_attorneys_party_id_fkey FOREIGN KEY (party_id) REFERENCES derived.parties(id);
+
+
+ALTER TABLE ONLY derived.case_judges
+    ADD CONSTRAINT case_judges_case_id_fkey FOREIGN KEY (case_id) REFERENCES derived.cases(id) ON DELETE CASCADE;
+
+
+ALTER TABLE ONLY derived.case_judges
+    ADD CONSTRAINT case_judges_judge_id_fkey FOREIGN KEY (judge_id) REFERENCES derived.judges(id);
+
+
+ALTER TABLE ONLY derived.case_parties
+    ADD CONSTRAINT case_parties_case_id_fkey FOREIGN KEY (case_id) REFERENCES derived.cases(id) ON DELETE CASCADE;
+
+
+ALTER TABLE ONLY derived.case_parties
+    ADD CONSTRAINT case_parties_party_id_fkey FOREIGN KEY (party_id) REFERENCES derived.parties(id);
+
+
+ALTER TABLE ONLY derived.cases
+    ADD CONSTRAINT cases_court_id_fkey FOREIGN KEY (court_id) REFERENCES derived.courts(id);
+
+
+ALTER TABLE ONLY derived.documents
+    ADD CONSTRAINT documents_case_id_fkey FOREIGN KEY (case_id) REFERENCES derived.cases(id);
+
+
+ALTER TABLE ONLY derived.documents
+    ADD CONSTRAINT documents_court_id_fkey FOREIGN KEY (court_id) REFERENCES derived.courts(id);
+
+
+ALTER TABLE ONLY derived.documents
+    ADD CONSTRAINT documents_previous_version_id_fkey FOREIGN KEY (previous_version_id) REFERENCES derived.documents(id);
+
+
+ALTER TABLE ONLY derived.judge_aliases
+    ADD CONSTRAINT judge_aliases_judge_id_fkey FOREIGN KEY (judge_id) REFERENCES derived.judges(id) ON DELETE CASCADE;
+
+
+ALTER TABLE ONLY derived.judges
+    ADD CONSTRAINT judges_court_id_fkey FOREIGN KEY (court_id) REFERENCES derived.courts(id);
+
+
+ALTER TABLE ONLY derived.party_aliases
+    ADD CONSTRAINT party_aliases_party_id_fkey FOREIGN KEY (party_id) REFERENCES derived.parties(id) ON DELETE CASCADE;
+
+
+ALTER TABLE ONLY derived.rulings
+    ADD CONSTRAINT rulings_case_id_fkey FOREIGN KEY (case_id) REFERENCES derived.cases(id);
+
+
+ALTER TABLE ONLY derived.rulings
+    ADD CONSTRAINT rulings_court_id_fkey FOREIGN KEY (court_id) REFERENCES derived.courts(id);
+
+
+ALTER TABLE ONLY derived.rulings
+    ADD CONSTRAINT rulings_document_id_fkey FOREIGN KEY (document_id) REFERENCES derived.documents(id);
+
+
+ALTER TABLE ONLY derived.rulings
+    ADD CONSTRAINT rulings_judge_id_fkey FOREIGN KEY (judge_id) REFERENCES derived.judges(id);
 
 
 ALTER TABLE ONLY public.alert_events
-    ADD CONSTRAINT alert_events_ruling_id_fkey FOREIGN KEY (ruling_id) REFERENCES public.rulings(id);
+    ADD CONSTRAINT alert_events_document_id_fkey FOREIGN KEY (document_id) REFERENCES derived.documents(id);
+
+
+ALTER TABLE ONLY public.alert_events
+    ADD CONSTRAINT alert_events_ruling_id_fkey FOREIGN KEY (ruling_id) REFERENCES derived.rulings(id);
 
 
 ALTER TABLE ONLY public.alert_events
@@ -777,92 +859,16 @@ ALTER TABLE ONLY public.alert_subscriptions
     ADD CONSTRAINT alert_subscriptions_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE CASCADE;
 
 
-ALTER TABLE ONLY public.attorney_aliases
-    ADD CONSTRAINT attorney_aliases_attorney_id_fkey FOREIGN KEY (attorney_id) REFERENCES public.attorneys(id) ON DELETE CASCADE;
-
-
-ALTER TABLE ONLY public.case_attorneys
-    ADD CONSTRAINT case_attorneys_attorney_id_fkey FOREIGN KEY (attorney_id) REFERENCES public.attorneys(id);
-
-
-ALTER TABLE ONLY public.case_attorneys
-    ADD CONSTRAINT case_attorneys_case_id_fkey FOREIGN KEY (case_id) REFERENCES public.cases(id) ON DELETE CASCADE;
-
-
-ALTER TABLE ONLY public.case_attorneys
-    ADD CONSTRAINT case_attorneys_party_id_fkey FOREIGN KEY (party_id) REFERENCES public.parties(id);
-
-
-ALTER TABLE ONLY public.case_judges
-    ADD CONSTRAINT case_judges_case_id_fkey FOREIGN KEY (case_id) REFERENCES public.cases(id) ON DELETE CASCADE;
-
-
-ALTER TABLE ONLY public.case_judges
-    ADD CONSTRAINT case_judges_judge_id_fkey FOREIGN KEY (judge_id) REFERENCES public.judges(id);
-
-
-ALTER TABLE ONLY public.case_parties
-    ADD CONSTRAINT case_parties_case_id_fkey FOREIGN KEY (case_id) REFERENCES public.cases(id) ON DELETE CASCADE;
-
-
-ALTER TABLE ONLY public.case_parties
-    ADD CONSTRAINT case_parties_party_id_fkey FOREIGN KEY (party_id) REFERENCES public.parties(id);
-
-
-ALTER TABLE ONLY public.cases
-    ADD CONSTRAINT cases_court_id_fkey FOREIGN KEY (court_id) REFERENCES public.courts(id);
-
-
-ALTER TABLE ONLY public.documents
-    ADD CONSTRAINT documents_case_id_fkey FOREIGN KEY (case_id) REFERENCES public.cases(id);
-
-
-ALTER TABLE ONLY public.documents
-    ADD CONSTRAINT documents_court_id_fkey FOREIGN KEY (court_id) REFERENCES public.courts(id);
-
-
-ALTER TABLE ONLY public.documents
-    ADD CONSTRAINT documents_previous_version_id_fkey FOREIGN KEY (previous_version_id) REFERENCES public.documents(id);
-
-
-ALTER TABLE ONLY public.judge_aliases
-    ADD CONSTRAINT judge_aliases_judge_id_fkey FOREIGN KEY (judge_id) REFERENCES public.judges(id) ON DELETE CASCADE;
-
-
-ALTER TABLE ONLY public.judges
-    ADD CONSTRAINT judges_court_id_fkey FOREIGN KEY (court_id) REFERENCES public.courts(id);
-
-
-ALTER TABLE ONLY public.party_aliases
-    ADD CONSTRAINT party_aliases_party_id_fkey FOREIGN KEY (party_id) REFERENCES public.parties(id) ON DELETE CASCADE;
-
-
 ALTER TABLE ONLY public.refresh_tokens
     ADD CONSTRAINT refresh_tokens_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE CASCADE;
 
 
-ALTER TABLE ONLY public.rulings
-    ADD CONSTRAINT rulings_case_id_fkey FOREIGN KEY (case_id) REFERENCES public.cases(id);
-
-
-ALTER TABLE ONLY public.rulings
-    ADD CONSTRAINT rulings_court_id_fkey FOREIGN KEY (court_id) REFERENCES public.courts(id);
-
-
-ALTER TABLE ONLY public.rulings
-    ADD CONSTRAINT rulings_document_id_fkey FOREIGN KEY (document_id) REFERENCES public.documents(id);
-
-
-ALTER TABLE ONLY public.rulings
-    ADD CONSTRAINT rulings_judge_id_fkey FOREIGN KEY (judge_id) REFERENCES public.judges(id);
-
-
-ALTER TABLE ONLY public.scraper_runs
-    ADD CONSTRAINT scraper_runs_court_id_fkey FOREIGN KEY (court_id) REFERENCES public.courts(id);
-
-
 ALTER TABLE ONLY staging.ruled_items
     ADD CONSTRAINT ruled_items_capture_id_fkey FOREIGN KEY (capture_id) REFERENCES staging.captures(id);
+
+
+ALTER TABLE ONLY telemetry.scraper_runs
+    ADD CONSTRAINT scraper_runs_court_id_fkey FOREIGN KEY (court_id) REFERENCES derived.courts(id);
 
 
 
