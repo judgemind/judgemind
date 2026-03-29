@@ -498,7 +498,7 @@ jobs:
         run: terraform -chdir=infra/terraform/environments/dev init
       - name: Terraform Plan (dev)
         if: env.AWS_ACCESS_KEY_ID != ''
-        run: terraform -chdir=infra/terraform/environments/dev plan -no-color -input=false
+        run: terraform -chdir=infra/terraform/environments/dev plan -no-color -input=false -lock=false
 
   scripts-tests:
     needs: detect-changes
