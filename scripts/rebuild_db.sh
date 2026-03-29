@@ -81,10 +81,18 @@ else
     echo "=== Skipping database reset (--skip-reset) ==="
 fi
 
+# --- Fetch court rosters ---
+
+echo ""
+echo "=== Fetching court directory rosters ==="
+env DATABASE_URL="$DB_URL" JUDGEMIND_ARCHIVE_BUCKET=judgemind-document-archive-dev \
+    S3_CACHE_DIR="$CACHE_DIR" \
+    scripts/run-py.sh scripts/fetch_rosters.py
+
 # --- Run rebuild ---
 
 echo ""
-echo "=== Starting rebuild ==="
+echo "=== Starting document rebuild ==="
 
 ENV_VARS=(
     S3_CACHE_DIR="$CACHE_DIR"
