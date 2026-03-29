@@ -30,6 +30,7 @@ import structlog
 
 from .event_bus import RedisEventBus
 from .models import ScraperConfig, ScraperHealthEvent
+from .s3_cache import make_s3_client
 from .storage import S3Archiver
 
 logger = structlog.get_logger(__name__)
@@ -51,6 +52,47 @@ def _connect_db() -> psycopg.Connection | None:  # type: ignore[type-arg]
     except Exception as exc:
         logger.warning("Failed to connect to database — run recording disabled", error=str(exc))
         return None
+
+
+_ROSTER_DIRECTORIES = [
+    ("courts.ca.oc_dept_judges", "OCCourtDirectory"),
+    ("courts.ca.la_dept_judges", "LACourtDirectory"),
+    ("courts.ca.fresno_dept_judges", "FresnoCourtDirectory"),
+    ("courts.ca.kern_dept_judges", "KernCourtDirectory"),
+    ("courts.ca.sd_dept_judges", "SanDiegoCourtDirectory"),
+    ("courts.ca.sb_dept_judges", "SanBernardinoCourtDirectory"),
+    ("courts.ca.ventura_dept_judges", "VenturaCourtDirectory"),
+    ("courts.ca.sf_dept_judges", "SFCourtDirectory"),
+    ("courts.ca.sc_tentatives", "SantaClaraCourtDirectory"),
+]
+
+
+def _fetch_rosters(
+    s3_client: object,
+    bucket: str,
+    db_conn: psycopg.Connection,  # type: ignore[type-arg]
+) -> None:
+    """Fetch all court directory rosters before running scrapers."""
+    import importlib
+
+    for module_path, class_name in _ROSTER_DIRECTORIES:
+        try:
+            mod = importlib.import_module(module_path)
+            cls = getattr(mod, class_name)
+            directory = cls(s3_client=s3_client, s3_bucket=bucket, db_conn=db_conn)
+            mapping = directory.fetch_and_snapshot(cls.COURT_ID)
+            logger.info(
+                "Roster fetched",
+                court_id=cls.COURT_ID,
+                departments=len(mapping) if mapping else 0,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Roster fetch failed — continuing",
+                court_id=class_name,
+                error=str(exc),
+            )
+        time.sleep(1)
 
 
 def _resolve_court_id(
@@ -270,6 +312,11 @@ def run_scrapers(scraper_ids: list[str] | None = None) -> int:
         logger.info("Database recording enabled")
     else:
         logger.info("Database recording disabled (DATABASE_URL not set or connection failed)")
+
+    # Fetch court directory rosters before running scrapers.
+    # Fresh dept→judge mappings ensure accurate judge assignment.
+    if db_conn and bucket:
+        _fetch_rosters(make_s3_client(), bucket, db_conn)
 
     try:
         court_id_cache: dict[tuple[str, str], str | None] = {}
