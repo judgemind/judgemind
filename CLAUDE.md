@@ -474,7 +474,7 @@ Key paths: framework in `packages/scraper-framework/src/framework/`, California 
 - Raw content is always archived to object storage before processing.
 - Scraper configurations (URLs, selectors, schedules) are separate from scraper logic.
 - **Scrapers extract metadata from website structure only** — judge name from link text, department from URL parameters, etc. They do NOT parse PDF content or extract fields from unstructured text. Field extraction from document content happens downstream in enrichment.
-- **Field extraction completeness is a hard requirement.** Required fields: **judge name, motion type, case title, hearing date, outcome, parties**. These must be populated by the end of the enrichment pipeline (not necessarily by the scraper). Write regression tests against real fixtures for every field.
+- **Data correctness is the #1 priority. Completeness is secondary.** A missing field is acceptable; a wrong field is a bug. When evaluating data quality, always verify correctness first (is the extracted value accurate compared to the source document?), then completeness (is the field populated?). Completeness metrics are useful as a signal toward correctness problems — a sudden drop in judge match rate suggests a bug — but high completeness with low correctness is worse than low completeness with high correctness. Required fields: **judge name, motion type, case title, hearing date, outcome, parties**. Write regression tests against real fixtures for every field.
 
 ## Infrastructure Code
 
