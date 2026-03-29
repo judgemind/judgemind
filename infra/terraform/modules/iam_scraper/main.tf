@@ -40,16 +40,16 @@ resource "aws_iam_policy" "scraper_s3_write" {
     Version = "2012-10-17"
     Statement = [
       {
-        Sid      = "AllowPutObject"
+        Sid      = "AllowObjectOps"
         Effect   = "Allow"
-        Action   = "s3:PutObject"
+        Action   = ["s3:PutObject", "s3:GetObject", "s3:HeadObject"]
         Resource = "${var.document_archive_bucket_arn}/*"
       },
       {
-        Sid      = "AllowGetObject"
+        Sid      = "AllowListBucket"
         Effect   = "Allow"
-        Action   = "s3:GetObject"
-        Resource = "${var.document_archive_bucket_arn}/*"
+        Action   = "s3:ListBucket"
+        Resource = var.document_archive_bucket_arn
       }
     ]
   })
