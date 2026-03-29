@@ -29,7 +29,6 @@ import os
 import re
 import time
 from dataclasses import dataclass
-from pathlib import Path
 
 import anthropic
 import structlog
@@ -108,8 +107,9 @@ _COUNTY_PREFIX_RE = re.compile(r"^\d{2,4}-(\d{4}-\d+)$")
 # LLM result cache
 # ---------------------------------------------------------------------------
 
-# Enabled when S3_CACHE_DIR is set. Cache lives at {S3_CACHE_DIR}/llm-cache/.
-# Structure: llm-cache/{provider}-{model}/prompt-{hash}/{content_hash}.json
+# Cache lives in S3 at llm-cache/{provider}-{model}/prompt-{hash}/{content_hash}.json
+# Locally, flows through S3_CACHE_DIR via CachedS3Client for fast reads.
+# On ECS, reads/writes go directly to S3.
 
 
 def _prompt_hash(prompt: str) -> str:
@@ -134,46 +134,48 @@ def _content_hash_for_cache(content: str | bytes, metadata: dict[str, str] | Non
 
 
 class _LlmCache:
-    """Filesystem cache for LLM extraction results.
+    """S3-backed cache for LLM extraction results.
 
-    Cache path: {base}/{provider}-{model}/prompt-{hash}/{content_hash}.json
+    S3 key: llm-cache/{provider}-{model}/prompt-{hash}/{content_hash}.json
 
-    When the prompt or model changes, the cache key changes and old
-    entries are naturally bypassed.
+    When S3_CACHE_DIR is set locally, reads are served from local disk
+    via CachedS3Client (fast). On ECS, reads/writes go directly to S3.
+    Either way, the cache is shared across all environments.
     """
 
-    def __init__(self, base_dir: str, provider: str, model: str) -> None:
-        self._base = Path(base_dir)
+    def __init__(self, s3_client: object, bucket: str, provider: str, model: str) -> None:
+        self._s3 = s3_client
+        self._bucket = bucket
         self._provider = provider
         self._model = model
 
-    def _path(self, prompt: str, content_key: str) -> Path:
+    def _key(self, prompt: str, content_key: str) -> str:
         return (
-            self._base
-            / f"{self._provider}-{self._model}"
-            / f"prompt-{_prompt_hash(prompt)}"
-            / f"{content_key}.json"
+            f"llm-cache/{self._provider}-{self._model}"
+            f"/prompt-{_prompt_hash(prompt)}"
+            f"/{content_key}.json"
         )
 
     def get(self, prompt: str, content_key: str) -> list[dict] | None:
-        """Return cached extraction result, or None if not cached."""
-        p = self._path(prompt, content_key)
-        if not p.exists():
-            return None
+        """Return cached extraction result from S3, or None if not cached."""
+        key = self._key(prompt, content_key)
         try:
-            return json.loads(p.read_text())
-        except (json.JSONDecodeError, OSError):
+            response = self._s3.get_object(Bucket=self._bucket, Key=key)
+            return json.loads(response["Body"].read())
+        except Exception:
             return None
 
     def put(self, prompt: str, content_key: str, rulings: list[dict]) -> None:
-        """Cache an extraction result. Atomic write via temp file + rename."""
-        p = self._path(prompt, content_key)
+        """Cache an extraction result to S3."""
+        key = self._key(prompt, content_key)
         try:
-            p.parent.mkdir(parents=True, exist_ok=True)
-            tmp = p.with_suffix(".tmp")
-            tmp.write_text(json.dumps(rulings, indent=2))
-            tmp.replace(p)  # atomic on POSIX
-        except OSError as exc:
+            self._s3.put_object(
+                Bucket=self._bucket,
+                Key=key,
+                Body=json.dumps(rulings, indent=2).encode(),
+                ContentType="application/json",
+            )
+        except Exception as exc:
             logger.warning("llm_cache.write_failed", error=str(exc))
 
 
@@ -395,17 +397,29 @@ class LlmExtractor:
                 client_kwargs["api_key"] = api_key
             self._client = anthropic.Anthropic(**client_kwargs)
 
-        # LLM result cache (enabled when S3_CACHE_DIR is set).
-        s3_cache_dir = os.environ.get("S3_CACHE_DIR", "")
+        # LLM result cache — stored in S3, served locally via CachedS3Client.
+        cache_bucket = os.environ.get("JUDGEMIND_ARCHIVE_BUCKET", "judgemind-document-archive-dev")
         self._cache: _LlmCache | None = (
             _LlmCache(
-                str(Path(s3_cache_dir) / "llm-cache"),
-                self._provider,
-                self._model,
+                s3_client=self._get_cache_s3_client(),
+                bucket=cache_bucket,
+                provider=self._provider,
+                model=self._model,
             )
-            if s3_cache_dir
+            if cache_bucket
             else None
         )
+
+    @staticmethod
+    def _get_cache_s3_client() -> object:
+        """Return an S3 client for the LLM cache.
+
+        Uses make_s3_client() which returns a CachedS3Client when
+        S3_CACHE_DIR is set (local dev), or plain boto3 (ECS).
+        """
+        from .s3_cache import make_s3_client
+
+        return make_s3_client()
 
     # ------------------------------------------------------------------
     # Public API
