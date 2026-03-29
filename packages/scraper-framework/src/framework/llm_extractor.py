@@ -131,15 +131,22 @@ PDF_PER_PAGE_PROMPT = (
     "- Return ONE JSON object per ROW (between horizontal lines).\n"
     "- Read each column by its POSITION relative to the vertical "
     "lines.\n"
-    "- Transcribe text VERBATIM. Do not summarize or omit.\n"
+    "- Transcribe ruling_text as **Markdown** preserving formatting:\n"
+    "  - Use **bold** for bold text and headings\n"
+    "  - Use *italic* for italic/underlined text\n"
+    "  - Use numbered lists (1. 2. 3.) for numbered paragraphs\n"
+    "  - Use blank lines between paragraphs\n"
+    "  - Preserve ALL content — do not summarize or omit\n"
     "- If a column is blank in a row, set its value to empty string.\n"
     "- SKIP page headers, footers, and page numbers.\n\n"
     "{\n"
     '  "rulings": [\n'
     '    {"entry_number": "101", "case_info": "Smith vs Jones\\n'
     '25-01455183",\n'
-    '     "ruling_text": "Full text of the ruling including all '
-    'paragraphs and sub-sections..."},\n'
+    '     "ruling_text": "**MOTION FOR SUMMARY JUDGMENT**\\n\\n'
+    "Defendant's motion for summary judgment is **GRANTED**.\\n\\n"
+    "1. The moving party has met its initial burden...\\n"
+    '2. Plaintiff fails to raise a triable issue..."},\n'
     '    {"entry_number": "", "case_info": "",\n'
     '     "ruling_text": "continuation from previous page..."}\n'
     "  ]\n"

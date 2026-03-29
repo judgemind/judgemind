@@ -183,6 +183,74 @@ def build_event(
     return event
 
 
+def _process_one_document(
+    key: str,
+    cache_dir: str,
+    bucket: str,
+    database_url: str,
+    redis_url: str,
+    os_url: str,
+) -> str:
+    """Process a single document in a child process.
+
+    Creates its own DB connection, Redis client, and IngestionWorker.
+    Designed for ProcessPoolExecutor — each call is fully independent.
+    """
+    parsed = parse_s3_key(key)
+    if not parsed:
+        return "skip"
+
+    if cache_dir:
+        content = (Path(cache_dir) / key).read_bytes()
+    else:
+        from framework.s3_cache import make_s3_client as _make_s3
+
+        s3 = _make_s3()
+        response = s3.get_object(Bucket=bucket, Key=key)
+        content = response["Body"].read()
+
+    if not content:
+        return "skip"
+
+    actual_hash = hashlib.sha256(content).hexdigest()
+    if actual_hash != parsed["content_hash"]:
+        parsed["content_hash"] = actual_hash
+
+    event = build_event(key, content, parsed, bucket)
+
+    # Lazy per-process worker — cached on the function object.
+    worker = getattr(_process_one_document, "_worker", None)
+    if worker is None:
+        import redis as redis_lib
+        from unittest.mock import MagicMock
+
+        from framework.s3_cache import make_s3_client as _make_s3
+        from ingestion.worker import IngestionWorker
+
+        rc = redis_lib.Redis.from_url(redis_url, decode_responses=False)
+        if os_url:
+            from opensearchpy import OpenSearch
+
+            os_client = OpenSearch(hosts=[os_url])
+        else:
+            os_client = MagicMock()
+        s3 = _make_s3()
+        worker = IngestionWorker(
+            redis_client=rc,
+            pg_dsn=database_url,
+            opensearch_client=os_client,
+            s3_client=s3,
+            archive_bucket=bucket,
+        )
+        _process_one_document._worker = worker
+
+    try:
+        worker.process_event(event)
+        return "ok"
+    except Exception:
+        return "error"
+
+
 def main() -> None:
     database_url = os.environ.get("DATABASE_URL", "")
     if not database_url:
@@ -214,116 +282,66 @@ def main() -> None:
     court_ids = seed_courts(conn, courts)
     logger.info("Courts seeded", court_ids=court_ids)
 
-    # Step 3: Set up ingestion worker
-    import redis as redis_lib
-    from unittest.mock import MagicMock
-
-    redis_client = redis_lib.Redis.from_url(redis_url, decode_responses=False)
-
-    # OpenSearch is optional for rebuild — use a mock if not available.
-    # Search indexing can be done as a separate pass later.
+    # Step 3: Process documents using child processes.
+    # pdfplumber/pdfminer C extensions are not thread-safe — ProcessPoolExecutor
+    # gives each worker its own address space. Each child process lazily creates
+    # its own DB connection, Redis client, and IngestionWorker.
     os_url = os.environ.get("OPENSEARCH_URL", "")
-    if os_url:
-        from opensearchpy import OpenSearch
-        opensearch_client = OpenSearch(hosts=[os_url])
-    else:
+    if not os_url:
         logger.info("OPENSEARCH_URL not set — skipping search indexing")
-        opensearch_client = MagicMock()
 
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-    from threading import Lock
+    from concurrent.futures import ProcessPoolExecutor, as_completed
 
-    from ingestion.worker import IngestionWorker
-
-    concurrency = int(os.environ.get("REBUILD_CONCURRENCY", "24"))
+    concurrency = int(os.environ.get("REBUILD_CONCURRENCY", "64"))
     logger.info("Processing documents", concurrency=concurrency, total=len(keys))
 
-    # Each thread gets its own IngestionWorker (own DB connection).
-    def make_worker() -> IngestionWorker:
-        return IngestionWorker(
-            redis_client=redis_client,
-            pg_dsn=database_url,
-            opensearch_client=opensearch_client,
-            s3_client=s3,
-            archive_bucket=BUCKET,
-        )
-
-    # Step 4: Process documents concurrently
+    # Step 4: Process documents concurrently using processes (not threads).
+    # pdfplumber/pdfminer use C extensions that segfault under heavy threading.
+    # Each process gets its own address space — no shared-memory corruption.
+    t_start = time.monotonic()
     processed = 0
     errors = 0
     skipped = 0
-    lock = Lock()
 
-    def process_one(key: str) -> str:
-        """Process a single document. Returns 'ok', 'skip', or 'error'."""
-        parsed = parse_s3_key(key)
-        if not parsed:
-            return "skip"
-
-        if cache_dir:
-            content = (Path(cache_dir) / key).read_bytes()
-        else:
-            response = s3.get_object(Bucket=BUCKET, Key=key)
-            content = response["Body"].read()
-
-        if not content:
-            logger.warning("Skipping empty document", key=key)
-            return "skip"
-
-        actual_hash = hashlib.sha256(content).hexdigest()
-        if actual_hash != parsed["content_hash"]:
-            logger.warning(
-                "Content hash mismatch — using actual hash",
-                key=key,
-                expected=parsed["content_hash"][:12],
-                actual=actual_hash[:12],
-            )
-            parsed["content_hash"] = actual_hash
-
-        event = build_event(key, content, parsed, BUCKET)
-        worker = _thread_local.worker
-        worker.process_event(event)
-        return "ok"
-
-    import threading
-
-    _thread_local = threading.local()
-
-    def init_worker() -> None:
-        _thread_local.worker = make_worker()
-
-    t_start = time.monotonic()
-
-    with ThreadPoolExecutor(max_workers=concurrency, initializer=init_worker) as pool:
-        futures = {pool.submit(process_one, key): key for key in keys}
+    with ProcessPoolExecutor(max_workers=concurrency) as pool:
+        futures = {
+            pool.submit(
+                _process_one_document,
+                key,
+                cache_dir,
+                BUCKET,
+                database_url,
+                redis_url,
+                os_url,
+            ): key
+            for key in keys
+        }
         for future in as_completed(futures):
             key = futures[future]
             try:
                 result = future.result()
-                with lock:
-                    if result == "ok":
-                        processed += 1
-                    elif result == "skip":
-                        skipped += 1
-                    else:
-                        errors += 1
-                    total_done = processed + errors + skipped
-                    if processed > 0 and processed % 50 == 0:
-                        elapsed = time.monotonic() - t_start
-                        rate = total_done / elapsed * 60
-                        remaining = (len(keys) - total_done) / (total_done / elapsed)
-                        logger.info(
-                            "Progress",
-                            processed=processed,
-                            errors=errors,
-                            total=len(keys),
-                            pct=round(100 * total_done / len(keys), 1),
-                            rate_per_min=round(rate, 1),
-                            eta_min=round(remaining / 60, 1),
-                        )
-            except Exception as exc:
-                with lock:
+                if result == "ok":
+                    processed += 1
+                elif result == "skip":
+                    skipped += 1
+                else:
                     errors += 1
+                total_done = processed + errors + skipped
+                if processed > 0 and processed % 50 == 0:
+                    elapsed = time.monotonic() - t_start
+                    rate = total_done / elapsed * 60
+                    remaining = (len(keys) - total_done) / (total_done / elapsed)
+                    logger.info(
+                        "Progress",
+                        processed=processed,
+                        errors=errors,
+                        total=len(keys),
+                        pct=round(100 * total_done / len(keys), 1),
+                        rate_per_min=round(rate, 1),
+                        eta_min=round(remaining / 60, 1),
+                    )
+            except Exception as exc:
+                errors += 1
                 logger.error("Failed to process", key=key, error=str(exc))
 
     logger.info(
