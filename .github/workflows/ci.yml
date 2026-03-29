@@ -30,6 +30,7 @@ jobs:
       ecs-oneshot: ${{ steps.changes.outputs.ecs-oneshot }}
       dockerfile: ${{ steps.changes.outputs.dockerfile }}
       migrations: ${{ steps.changes.outputs.migrations }}
+      schema: ${{ steps.changes.outputs.schema }}
       any-testable: ${{ steps.any-testable.outputs.result }}
     steps:
       - uses: actions/checkout@v6
@@ -78,6 +79,9 @@ jobs:
               - '.github/playwright-browser-check/**'
             migrations:
               - 'packages/api/migrations/**'
+            schema:
+              - 'packages/api/migrations/**'
+              - 'packages/api/src/data-access/schema.sql'
       - name: Check if any coverage-producing package changed
         id: any-testable
         run: |
@@ -784,6 +788,18 @@ jobs:
       - uses: actions/checkout@v6
       - name: Validate migration file naming and sequencing
         run: scripts/check-migration-files.sh
+
+  # ---------------------------------------------------------------
+  # Schema drift guard: schema.sql must match applied migrations
+  # ---------------------------------------------------------------
+  schema-drift-check:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.schema == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Check schema.sql matches migrations
+        run: scripts/check_schema_drift.sh --ci
 
   # ---------------------------------------------------------------
   # ECS oneshot import guard: prevent scripts/ from importing siblings
