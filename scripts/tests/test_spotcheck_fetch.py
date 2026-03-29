@@ -80,8 +80,7 @@ class TestRulingsStrategy:
         item_dir = tmp_path / "test-ruling-id"
         item_dir.mkdir()
 
-        db_response = json.dumps(
-            [
+        db_response = [
                 {
                     "id": "test-ruling-id",
                     "ruling_text": "The motion is GRANTED.",
@@ -92,7 +91,6 @@ class TestRulingsStrategy:
                     "case_id": "test-case-id",
                 }
             ]
-        )
 
         strategy = RulingsStrategy()
         with (
@@ -109,8 +107,7 @@ class TestRulingsStrategy:
         item_dir = tmp_path / "test-ruling-id"
         item_dir.mkdir()
 
-        db_response = json.dumps(
-            [
+        db_response = [
                 {
                     "id": "test-ruling-id",
                     "s3_key": "CA/LA/doc.pdf",
@@ -119,7 +116,6 @@ class TestRulingsStrategy:
                     "case_id": "test-case-id",
                 }
             ]
-        )
 
         strategy = RulingsStrategy()
         with (
@@ -139,8 +135,7 @@ class TestRulingsStrategy:
         item_dir = tmp_path / "test-ruling-id"
         item_dir.mkdir()
 
-        db_response = json.dumps(
-            [
+        db_response = [
                 {
                     "id": "test-ruling-id",
                     "s3_key": "CA/LA/doc.pdf",
@@ -149,7 +144,6 @@ class TestRulingsStrategy:
                     "case_id": "test-case-id",
                 }
             ]
-        )
 
         strategy = RulingsStrategy()
         with (
@@ -170,7 +164,7 @@ class TestRulingsStrategy:
 
         strategy = RulingsStrategy()
         with (
-            patch("fetch._run_db_query", return_value="[]"),
+            patch("fetch._run_db_query", return_value=[]),
             patch("fetch._fetch_s3_object", return_value=False),
             patch("fetch._take_screenshot", return_value=False),
         ):
@@ -183,8 +177,7 @@ class TestRulingsStrategy:
         item_dir = tmp_path / "html-ruling"
         item_dir.mkdir()
 
-        db_response = json.dumps(
-            [
+        db_response = [
                 {
                     "id": "html-ruling",
                     "s3_key": "CA/LA/doc.html",
@@ -193,7 +186,6 @@ class TestRulingsStrategy:
                     "case_id": "test-case-id",
                 }
             ]
-        )
 
         strategy = RulingsStrategy()
         with (
@@ -213,11 +205,9 @@ class TestOriginalsStrategy:
         item_dir = tmp_path / "test-doc"
         item_dir.mkdir()
 
-        derived_response = json.dumps(
-            [
+        derived_response = [
                 {"ruling_id": "ruling-1", "case_number": "BC123"},
             ]
-        )
 
         strategy = OriginalsStrategy()
         with (
@@ -234,12 +224,10 @@ class TestOriginalsStrategy:
         item_dir = tmp_path / "test-doc"
         item_dir.mkdir()
 
-        derived_response = json.dumps(
-            [
+        derived_response = [
                 {"ruling_id": "ruling-1", "case_number": "BC123"},
                 {"ruling_id": "ruling-2", "case_number": "BC456"},
             ]
-        )
 
         strategy = OriginalsStrategy()
         with (
@@ -256,12 +244,10 @@ class TestOriginalsStrategy:
         item_dir = tmp_path / "test-doc"
         item_dir.mkdir()
 
-        derived_response = json.dumps(
-            [
+        derived_response = [
                 {"ruling_id": "ruling-1", "case_number": "BC123"},
                 {"ruling_id": "ruling-2", "case_number": "BC456"},
             ]
-        )
 
         strategy = OriginalsStrategy()
         with (
@@ -283,7 +269,7 @@ class TestOriginalsStrategy:
         strategy = OriginalsStrategy()
         with (
             patch("fetch._fetch_s3_object", return_value=True),
-            patch("fetch._run_db_query", return_value="[]"),
+            patch("fetch._run_db_query", return_value=[]),
             patch("fetch._take_screenshot", return_value=True),
         ):
             result = strategy.expand("CA/LA/dept/doc.html", item_dir)

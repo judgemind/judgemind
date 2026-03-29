@@ -117,9 +117,7 @@ def _prompt_hash(prompt: str) -> str:
     return hashlib.sha256(prompt.encode()).hexdigest()
 
 
-def _content_hash_for_cache(
-    content: str | bytes, metadata: dict[str, str] | None = None
-) -> str:
+def _content_hash_for_cache(content: str | bytes, metadata: dict[str, str] | None = None) -> str:
     """Hash content + metadata for cache lookup.
 
     Metadata (judge_name, department, etc.) is included because the LLM
@@ -1468,9 +1466,7 @@ def _join_page_rows(
             if judge_match and not header_judge:
                 header_judge = judge_match.group(1).strip()
             # Extract department from "Department CX101" or "Dept. C25" pattern
-            dept_match = re.search(
-                r"(?:Department|Dept\.?)\s+([A-Z0-9]+)", info, re.IGNORECASE
-            )
+            dept_match = re.search(r"(?:Department|Dept\.?)\s+([A-Z0-9]+)", info, re.IGNORECASE)
             if dept_match and not header_dept:
                 header_dept = dept_match.group(1).strip()
 

@@ -123,7 +123,10 @@ def _extract_table_columns_from_sql(
         # Detect entering a CREATE TABLE block
         m = _create_table_re.search(stripped)
         if m:
-            current_table = m.group(1)
+            # Strip schema prefix (e.g. "public.documents" → "documents")
+            # so references like "d.column" resolve against "documents".
+            raw_name = m.group(1)
+            current_table = raw_name.split(".")[-1] if "." in raw_name else raw_name
             columns.setdefault(current_table, set())
             paren_depth = stripped.count("(") - stripped.count(")")
             continue

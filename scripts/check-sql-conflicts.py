@@ -121,6 +121,9 @@ def _extract_unique_constraints_from_sql(
 
     def _add(table: str, cols: frozenset[str]) -> None:
         table = table.lower().strip()
+        # Strip schema prefix (e.g. "public.users" → "users")
+        if "." in table:
+            table = table.split(".")[-1]
         lst = constraints.setdefault(table, [])
         if cols not in lst:
             lst.append(cols)
