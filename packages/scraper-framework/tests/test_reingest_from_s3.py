@@ -5662,9 +5662,9 @@ def _parse_schema_tables(schema_path: str) -> dict[str, set[str]]:
 
     tables: dict[str, set[str]] = {}
 
-    # Match CREATE TABLE [public.]<name> ( ... );  — skip staging schema tables
+    # Match CREATE TABLE [schema.]<name> ( ... );  — skip staging schema tables
     create_re = re.compile(
-        r"CREATE\s+TABLE\s+(?!staging\.)(?:public\.)?(\w+)\s*\((.*?)\);",
+        r"CREATE\s+TABLE\s+(?!staging\.)(?:(?:public|derived|telemetry)\.)?(\w+)\s*\((.*?)\);",
         re.DOTALL | re.IGNORECASE,
     )
 

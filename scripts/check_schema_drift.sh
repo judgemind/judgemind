@@ -66,6 +66,7 @@ dump_schema() {
         "$db" \
         | grep -v '^\\\(restrict\|allow\|unrestrict\)' \
         | grep -v '^-- Dumped from\|^-- Dumped by\|^-- PostgreSQL database dump' \
+        | grep -v '^ALTER DATABASE' \
         | grep -v '^$' \
         | grep -v '^--$'
 }
@@ -83,7 +84,9 @@ run_psql -d "$DB_FROM_SCHEMA" -v ON_ERROR_STOP=1 -q < "$SCHEMA_FILE"
 # DB 2: Apply migrations (up sections only)
 echo "  Applying migrations..."
 for f in $(ls "$MIGRATIONS_DIR"/*.sql | sort -t/ -k3 -V); do
-    up_sql=$(sed '/^-- [Dd]own [Mm]igration/,$d' "$f")
+    # Replace "ALTER DATABASE judgemind" with the temp DB name so
+    # search_path changes apply to the temp DB, not a missing "judgemind".
+    up_sql=$(sed '/^-- [Dd]own [Mm]igration/,$d' "$f" | sed "s/ALTER DATABASE judgemind/ALTER DATABASE $DB_FROM_MIGRATIONS/g")
     echo "$up_sql" | run_psql -d "$DB_FROM_MIGRATIONS" -v ON_ERROR_STOP=1 -q 2>&1
 done
 

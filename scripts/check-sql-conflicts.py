@@ -121,9 +121,11 @@ def _extract_unique_constraints_from_sql(
 
     def _add(table: str, cols: frozenset[str]) -> None:
         table = table.lower().strip()
-        # Strip "public." prefix only. Preserve "staging." for separation.
-        if table.startswith("public."):
-            table = table[7:]
+        # Strip known schema prefixes. Preserve "staging." for separation.
+        for prefix in ("public.", "derived.", "telemetry."):
+            if table.startswith(prefix):
+                table = table[len(prefix):]
+                break
         lst = constraints.setdefault(table, [])
         if cols not in lst:
             lst.append(cols)

@@ -123,11 +123,15 @@ def _extract_table_columns_from_sql(
         # Detect entering a CREATE TABLE block
         m = _create_table_re.search(stripped)
         if m:
-            # Strip "public." prefix (e.g. "public.documents" → "documents")
-            # so references like "d.column" resolve against "documents".
-            # Preserve other prefixes like "staging." for proper separation.
+            # Strip schema prefix (public., derived., telemetry.) so
+            # references like "d.column" resolve against "documents".
+            # Preserve "staging." for proper separation.
             raw_name = m.group(1)
-            current_table = raw_name.removeprefix("public.")
+            for prefix in ("public.", "derived.", "telemetry."):
+                if raw_name.startswith(prefix):
+                    raw_name = raw_name[len(prefix):]
+                    break
+            current_table = raw_name
             columns.setdefault(current_table, set())
             paren_depth = stripped.count("(") - stripped.count(")")
             continue

@@ -35,6 +35,7 @@ echo "  Dumping schema..."
 docker exec "$CONTAINER" pg_dump -U judgemind --schema-only --no-owner --no-privileges --no-tablespaces "$TEMP_DB" \
     | grep -v '^\\\(restrict\|allow\|unrestrict\)' \
     | grep -v '^-- Dumped from\|^-- Dumped by' \
+    | grep -v '^ALTER DATABASE' \
     | sed '/^--$/{ N; /^--\n-- PostgreSQL database dump/,/^--$/d; }' \
     > "$SCHEMA_FILE"
 
