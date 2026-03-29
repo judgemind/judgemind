@@ -342,9 +342,7 @@ jobs:
 
             gh issue comment "$ISSUE_NUM" \
               --repo "${{ github.repository }}" \
-              --body "All smoke-tested pages are now returning healthy responses. Auto-closing this issue.
-
-**Passing workflow run:** ${RUN_URL}"
+              --body "All smoke-tested pages are now returning healthy responses. Auto-closing this issue. Passing workflow run: ${RUN_URL}"
 
             gh issue close "$ISSUE_NUM" \
               --repo "${{ github.repository }}" \

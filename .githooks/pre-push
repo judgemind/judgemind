@@ -376,6 +376,24 @@ while read -r local_ref local_sha remote_sha _rest; do
 done
 
 # -------------------------------------------------------------------
+# GitHub Actions workflow lint (actionlint)
+# -------------------------------------------------------------------
+changed_workflows=$(echo "$changed_files" | grep '^\.github/workflows/' || true)
+if [ -n "$changed_workflows" ]; then
+    echo "pre-push: checking GitHub Actions workflow files..." >&2
+    if command -v actionlint &>/dev/null; then
+        if ! actionlint -ignore 'SC2086' $changed_workflows 2>&1; then
+            echo "" >&2
+            echo "  FAILED: actionlint" >&2
+            echo "  Fix workflow syntax errors before pushing." >&2
+            failures=$((failures + 1))
+        fi
+    else
+        echo "  WARNING: actionlint not found — skipping workflow lint (brew install actionlint)" >&2
+    fi
+fi
+
+# -------------------------------------------------------------------
 # PR existence check (advisory — runs before push completes)
 # -------------------------------------------------------------------
 # Git has no native post-push hook. We check here as the closest
