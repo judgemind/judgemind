@@ -358,7 +358,7 @@ class LlmExtractor:
             if not results:
                 return []
             merged = self._merge_results(results)
-            return merged.rulings
+            return self._propagate_document_fields(merged)
 
         # Multiple chunks: extract each and merge.
         logger.info(
@@ -383,7 +383,7 @@ class LlmExtractor:
             return []
 
         merged = self._merge_results(all_results)
-        return merged.rulings
+        return self._propagate_document_fields(merged)
 
     def extract_from_pdf(
         self,
@@ -986,6 +986,24 @@ class LlmExtractor:
     # ------------------------------------------------------------------
 
     @staticmethod
+    @staticmethod
+    def _propagate_document_fields(result: ExtractionResult) -> list[ExtractedRuling]:
+        """Propagate document-level judge/department to rulings missing them.
+
+        The LLM extracts judge_name and department at the document level
+        (from the PDF header). Per-ruling fields are often null because the
+        judge isn't repeated in each ruling's text. This fills in the gaps.
+        """
+        doc_judge = result.extracted_judge_name
+        doc_dept = result.department
+        for ruling in result.rulings:
+            if not ruling.extracted_judge_name and doc_judge:
+                ruling.extracted_judge_name = doc_judge
+            if not ruling.department and doc_dept:
+                ruling.department = doc_dept
+        return result.rulings
+
+    @staticmethod
     def _merge_results(results: list[ExtractionResult]) -> ExtractionResult:
         """Merge extraction results from multiple chunks.
 
@@ -1301,6 +1319,25 @@ def _join_page_rows(
     # Group rows into cases.
     cases: list[dict] = []  # Each: {case_info, ruling_text}
 
+    # Extract judge/department from header rows before skipping them.
+    # Header rows typically have entry_number=null, empty ruling_text,
+    # and case_info containing "JUDGE {Name}" or "Department {Code}".
+    header_judge: str | None = None
+    header_dept: str | None = None
+    for row in rows:
+        if row["entry_number"] is None and not row["ruling_text"] and row.get("case_info"):
+            info = row["case_info"]
+            # Extract judge from "JUDGE WILLIAM D. CLASTER" pattern
+            judge_match = re.search(r"JUDGE\s+(.+?)(?:\n|$)", info, re.IGNORECASE)
+            if judge_match and not header_judge:
+                header_judge = judge_match.group(1).strip()
+            # Extract department from "Department CX101" or "Dept. C25" pattern
+            dept_match = re.search(
+                r"(?:Department|Dept\.?)\s+([A-Z0-9]+)", info, re.IGNORECASE
+            )
+            if dept_match and not header_dept:
+                header_dept = dept_match.group(1).strip()
+
     for row in rows:
         # Skip header rows (e.g., department/judge headers) that the LLM
         # may include with entry_number=null and empty ruling_text.  These
@@ -1351,7 +1388,7 @@ def _join_page_rows(
             )
             ruling_text = None
 
-        # Apply metadata overrides for judge_name, department, hearing_date.
+        # Apply metadata overrides, then header extraction, for judge/dept/date.
         judge_name: str | None = None
         department: str | None = None
         hearing_date: str | None = None
@@ -1359,6 +1396,10 @@ def _join_page_rows(
             judge_name = metadata.get("judge_name")
             department = metadata.get("department")
             hearing_date = metadata.get("hearing_date")
+        if not judge_name:
+            judge_name = header_judge
+        if not department:
+            department = header_dept
 
         rulings.append(
             ExtractedRuling(
