@@ -8,7 +8,7 @@ from unittest.mock import MagicMock
 import pytest
 from botocore.exceptions import ClientError
 
-from framework.s3_cache import CachedS3Client
+from framework.s3_cache import CachedS3Client, make_s3_client
 
 
 class TestCachedS3ClientLocalOnly:
@@ -99,3 +99,31 @@ class TestCachedS3ClientWriteThrough:
         result = client.head_object(Bucket="b", Key="doc.pdf")
         assert result["ContentLength"] == 100
         mock_s3.head_object.assert_not_called()
+
+
+class TestMakeS3Client:
+    """Tests for the make_s3_client factory function."""
+
+    def test_returns_cached_client_when_cache_dir_set(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("S3_CACHE_DIR", str(tmp_path))
+        monkeypatch.delenv("S3_LOCAL_ONLY", raising=False)
+        mock_s3 = MagicMock()
+        client = make_s3_client(s3_client=mock_s3)
+        assert isinstance(client, CachedS3Client)
+
+    def test_returns_plain_client_when_no_cache_dir(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("S3_CACHE_DIR", raising=False)
+        mock_s3 = MagicMock()
+        client = make_s3_client(s3_client=mock_s3)
+        assert client is mock_s3
+
+    def test_local_only_mode(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("S3_CACHE_DIR", str(tmp_path))
+        monkeypatch.setenv("S3_LOCAL_ONLY", "1")
+        client = make_s3_client()
+        assert isinstance(client, CachedS3Client)
+        # Should raise on passthrough methods
+        with pytest.raises(AttributeError):
+            client.get_paginator("list_objects_v2")
