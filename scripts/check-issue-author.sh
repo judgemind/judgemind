@@ -17,17 +17,39 @@ ISSUE="${1:?Usage: check-issue-author.sh <issue-number>}"
 REPO="judgemind/judgemind"
 TRUSTED_ASSOCIATIONS="OWNER MEMBER COLLABORATOR"
 
-# Fetch the issue's author_association via the REST API.
+# Bot accounts whose issues are trusted. github-actions[bot] creates issues
+# from CI workflows (data-quality-check, api-error-check, etc.) that need
+# autonomous handling. Only repo collaborators can define these workflows,
+# so the trust is transitive.
+TRUSTED_BOTS="github-actions[bot]"
+
+# Fetch the issue's author_association and login via the REST API (single call).
 # gh issue view doesn't expose author_association, so use the API directly.
-ASSOC=$(gh api "repos/${REPO}/issues/${ISSUE}" --jq '.author_association' 2>/dev/null) || {
+# Output format: "ASSOCIATION login_name" (space-separated).
+RESULT=$(gh api "repos/${REPO}/issues/${ISSUE}" --jq '"\(.author_association) \(.user.login)"') || {
     echo "ERROR: Failed to fetch issue #${ISSUE}" >&2
     exit 2
 }
 
+ASSOC="${RESULT%% *}"
+LOGIN="${RESULT#* }"
+
+# Guard against empty/null responses — fail closed.
+if [[ -z "$ASSOC" || "$ASSOC" == "null" ]]; then
+    echo "ERROR: author_association is empty or null for issue #${ISSUE}" >&2
+    exit 2
+fi
+
+# Check trusted bot accounts first.
+if [[ "$LOGIN" == *"[bot]" ]] && echo "$TRUSTED_BOTS" | grep -qwF "$LOGIN"; then
+    echo "TRUSTED: Issue #${ISSUE} author '${LOGIN}' is a trusted bot"
+    exit 0
+fi
+
 if echo "$TRUSTED_ASSOCIATIONS" | grep -qw "$ASSOC"; then
-    echo "TRUSTED: Issue #${ISSUE} author association is ${ASSOC}"
+    echo "TRUSTED: Issue #${ISSUE} author '${LOGIN}' association is ${ASSOC}"
     exit 0
 else
-    echo "UNTRUSTED: Issue #${ISSUE} author association is ${ASSOC}"
+    echo "UNTRUSTED: Issue #${ISSUE} author '${LOGIN}' association is ${ASSOC}"
     exit 1
 fi

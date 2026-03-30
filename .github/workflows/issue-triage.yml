@@ -18,15 +18,26 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           ISSUE_NUMBER: ${{ github.event.issue.number }}
           AUTHOR_ASSOC: ${{ github.event.issue.author_association }}
+          AUTHOR_LOGIN: ${{ github.event.issue.user.login }}
           REPO: ${{ github.repository }}
         run: |
           TRUSTED="OWNER MEMBER COLLABORATOR"
+          # CI workflows (data-quality-check, api-error-check, etc.) create
+          # issues via GITHUB_TOKEN as github-actions[bot]. These are trusted
+          # because only collaborators can define the workflows.
+          TRUSTED_BOTS="github-actions[bot]"
+
           if echo "$TRUSTED" | grep -qw "$AUTHOR_ASSOC"; then
             echo "Author association '$AUTHOR_ASSOC' is trusted — keeping agent/ready."
             exit 0
           fi
 
-          echo "Author association '$AUTHOR_ASSOC' is NOT trusted — removing agent/ready."
+          if echo "$TRUSTED_BOTS" | grep -qwF "$AUTHOR_LOGIN"; then
+            echo "Author '$AUTHOR_LOGIN' is a trusted bot — keeping agent/ready."
+            exit 0
+          fi
+
+          echo "Author '$AUTHOR_LOGIN' (association '$AUTHOR_ASSOC') is NOT trusted — removing agent/ready."
           gh issue edit "$ISSUE_NUMBER" --repo "$REPO" \
             --remove-label "agent/ready" \
             --add-label "status/triage"

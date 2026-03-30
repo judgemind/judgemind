@@ -74,7 +74,25 @@ jobs:
                   if not all_resolved:
                       continue
 
-                  print(f'All blockers resolved for #{n} — unblocking...')
+                  print(f'All blockers resolved for #{n} — checking author trust...')
+
+                  # Verify the issue author is trusted before adding agent/ready.
+                  # This prevents an attacker from filing an issue with "Blocked by #Y"
+                  # and having it auto-promoted when #Y closes.
+                  detail = gh_json('api', f'repos/{repo}/issues/{n}')
+                  if detail:
+                      assoc = detail.get('author_association', '')
+                      login = (detail.get('user') or {}).get('login', '')
+                      trusted_assocs = {'OWNER', 'MEMBER', 'COLLABORATOR'}
+                      trusted_bots = {'github-actions[bot]'}
+                      if assoc not in trusted_assocs and login not in trusted_bots:
+                          print(f'Issue #{n} author {login!r} ({assoc}) is not trusted — skipping unblock.')
+                          continue
+                  else:
+                      print(f'Could not verify author for #{n} — skipping unblock (fail-closed).')
+                      continue
+
+                  print(f'Author verified — unblocking #{n}...')
 
                   # Strip resolved "Blocked by #X" lines
                   lines = body.splitlines()
