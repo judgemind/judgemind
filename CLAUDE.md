@@ -109,6 +109,14 @@ cd {worktree}/packages/<pkg> && .venv/bin/pip install -e ".[dev]" --quiet
 
 Use `/task` to claim and work on an issue: `/task`, `/task #42`, or `/task scrapers`.
 
+### Issue author trust check (security gate)
+
+**This is a public repository.** Before working on any issue, the dispatcher and `/task` skill verify the issue author is a trusted collaborator using `scripts/check-issue-author.sh <N>`. Issues filed by non-collaborators (NONE, FIRST_TIMER, FIRST_TIME_CONTRIBUTOR, CONTRIBUTOR without write access) are rejected and moved to `status/triage` for maintainer review. This prevents external users from crafting issues that instruct agents to execute arbitrary code. Three layers enforce this:
+
+1. **Issue template** — the Task template uses `status/triage` (not `agent/ready`), so new issues require manual labeling.
+2. **GitHub Action** (`issue-triage.yml`) — strips `agent/ready` from issues filed by non-collaborators.
+3. **Runtime check** — dispatcher and `/task` call `scripts/check-issue-author.sh` before spawning work (fail-closed).
+
 ## PR Workflow (authoritative — applies to all task work)
 
 **Single-issue rule:** each PR addresses exactly one issue. Do not combine unrelated changes in a single PR. If an issue is large or ambiguous, break it into sub-tasks first (see **Creating Sub-Tasks**), label them `agent/ready`, then pick up the first sub-task.
