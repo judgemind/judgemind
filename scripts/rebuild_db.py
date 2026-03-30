@@ -329,16 +329,22 @@ def main() -> None:
                 total_done = processed + errors + skipped
                 if processed > 0 and processed % 50 == 0:
                     elapsed = time.monotonic() - t_start
-                    rate = total_done / elapsed * 60
-                    remaining = (len(keys) - total_done) / (total_done / elapsed)
+                    elapsed_min = elapsed / 60
+                    keys_per_min = total_done / elapsed * 60 if elapsed > 0 else 0
+                    eta_min = (
+                        (len(keys) - total_done) / (total_done / elapsed) / 60
+                        if total_done > 0 and elapsed > 0
+                        else 0
+                    )
                     logger.info(
                         "Progress",
-                        processed=processed,
-                        errors=errors,
-                        total=len(keys),
+                        keys_done=total_done,
+                        keys_total=len(keys),
                         pct=round(100 * total_done / len(keys), 1),
-                        rate_per_min=round(rate, 1),
-                        eta_min=round(remaining / 60, 1),
+                        keys_per_min=round(keys_per_min, 1),
+                        elapsed_min=round(elapsed_min, 1),
+                        eta_min=round(eta_min, 1),
+                        errors=errors,
                     )
             except Exception as exc:
                 errors += 1

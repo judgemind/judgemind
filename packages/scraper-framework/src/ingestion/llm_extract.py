@@ -14,13 +14,15 @@ extraction (``extract.py``).
 
 from __future__ import annotations
 
+import hashlib
 import html
 import io
 import json
+import os
 import re
 import threading
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import date
 
 import structlog
@@ -831,6 +833,15 @@ def extract_fields_llm(
     if not document_text or not document_text.strip():
         return None
 
+    # LLM result cache — check before doing any work.
+    cache = _get_llm_cache(provider, model)
+    cache_key = _compute_cache_key(document_text, metadata)
+    if cache is not None:
+        cached = cache.get(_SYSTEM_PROMPT, cache_key)
+        if cached is not None:
+            logger.debug("llm_extract.cache_hit", cache_key=cache_key[:12])
+            return _deserialize_result(cached)
+
     # Preprocess based on content format
     if content_format == "html":
         text = preprocess_html(document_text)
@@ -909,9 +920,79 @@ def extract_fields_llm(
         return None
 
     # Single chunk: return directly.  Multiple: merge.
-    if len(chunk_results) == 1:
-        return chunk_results[0]
-    return _merge_results(chunk_results)
+    result = chunk_results[0] if len(chunk_results) == 1 else _merge_results(chunk_results)
+
+    # Write to cache
+    if cache is not None and result is not None:
+        cache.put(_SYSTEM_PROMPT, cache_key, _serialize_result(result))
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# LLM result cache helpers (shared S3 cache via framework.llm_extractor._LlmCache)
+# ---------------------------------------------------------------------------
+
+_cache_instance: object | None = None
+_cache_lock = threading.Lock()
+
+
+def _get_llm_cache(provider: str | None, model: str | None) -> object | None:
+    """Return the shared _LlmCache instance, or None if no bucket configured."""
+    global _cache_instance  # noqa: PLW0603
+    if _cache_instance is not None:
+        return _cache_instance
+
+    bucket = os.environ.get("JUDGEMIND_ARCHIVE_BUCKET", "")
+    if not bucket:
+        return None
+
+    with _cache_lock:
+        if _cache_instance is not None:
+            return _cache_instance
+        from framework.llm_extractor import _LlmCache
+        from framework.s3_cache import make_s3_client
+
+        resolved_provider = provider or os.environ.get("LLM_PROVIDER", "google")
+        resolved_model = model or os.environ.get("LLM_MODEL", "gemini-2.5-flash-lite")
+        _cache_instance = _LlmCache(
+            s3_client=make_s3_client(),
+            bucket=bucket,
+            provider=resolved_provider,
+            model=resolved_model,
+        )
+        return _cache_instance
+
+
+def _compute_cache_key(text: str, metadata: dict[str, str] | None) -> str:
+    """Hash text + metadata for cache lookup."""
+    h = hashlib.sha256()
+    h.update(text.encode())
+    if metadata:
+        h.update(json.dumps(metadata, sort_keys=True).encode())
+    return h.hexdigest()
+
+
+def _serialize_result(result: LLMExtractionResult) -> list[dict]:
+    """Serialize LLMExtractionResult for cache storage."""
+    d = asdict(result)
+    # Convert date to string for JSON
+    if d.get("hearing_date") is not None:
+        d["hearing_date"] = d["hearing_date"].isoformat()
+    return [d]
+
+
+def _deserialize_result(cached: list[dict]) -> LLMExtractionResult | None:
+    """Deserialize cached data back to LLMExtractionResult."""
+    if not cached:
+        return None
+    d = cached[0]
+    # Convert hearing_date string back to date
+    if d.get("hearing_date") is not None:
+        d["hearing_date"] = date.fromisoformat(d["hearing_date"])
+    # Reconstruct nested dataclasses
+    rulings = [LLMRulingResult(**r) for r in d.pop("rulings", [])]
+    return LLMExtractionResult(**d, rulings=rulings)
 
 
 def _build_user_message(
