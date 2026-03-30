@@ -231,7 +231,12 @@ def _process_one_document(
         if os_url:
             from opensearchpy import OpenSearch
 
-            os_client = OpenSearch(hosts=[os_url])
+            os_kwargs: dict = {"hosts": [os_url]}
+            os_user = os.environ.get("OPENSEARCH_USERNAME", "")
+            os_pass = os.environ.get("OPENSEARCH_PASSWORD", "")
+            if os_user and os_pass:
+                os_kwargs["http_auth"] = (os_user, os_pass)
+            os_client = OpenSearch(**os_kwargs)
         else:
             os_client = MagicMock()
         s3 = _make_s3()
