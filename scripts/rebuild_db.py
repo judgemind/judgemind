@@ -257,6 +257,17 @@ def _process_one_document(
 
 
 def main() -> None:
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Rebuild DB from S3")
+    parser.add_argument(
+        "--concurrency",
+        type=int,
+        default=int(os.environ.get("REBUILD_CONCURRENCY", "64")),
+        help="Number of parallel processes (default: 64, or REBUILD_CONCURRENCY env)",
+    )
+    args = parser.parse_args()
+
     database_url = os.environ.get("DATABASE_URL", "")
     if not database_url:
         print("ERROR: DATABASE_URL not set.", file=sys.stderr)
@@ -297,7 +308,7 @@ def main() -> None:
 
     from concurrent.futures import ProcessPoolExecutor, as_completed
 
-    concurrency = int(os.environ.get("REBUILD_CONCURRENCY", "64"))
+    concurrency = args.concurrency
     logger.info("Processing documents", concurrency=concurrency, total=len(keys))
 
     # Step 4: Process documents concurrently using processes (not threads).
