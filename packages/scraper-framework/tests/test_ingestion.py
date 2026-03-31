@@ -1463,10 +1463,13 @@ def test_upsert_case_judge_inserts() -> None:
 # ---------------------------------------------------------------------------
 
 
+@patch("ingestion.worker.resolve_judge_from_department", return_value=None)
 @patch("ingestion.worker.fetch_department_judge_mapping", return_value={})
 @patch("ingestion.worker.psycopg")
 def test_process_event_no_judge_name_leaves_judge_id_null(
-    mock_psycopg: MagicMock, _mock_fetch_dept: MagicMock
+    mock_psycopg: MagicMock,
+    _mock_fetch_dept: MagicMock,
+    _mock_roster_dept: MagicMock,
 ) -> None:
     """Events without judge_name should not resolve a judge — judge_id stays NULL.
 
@@ -1477,7 +1480,8 @@ def test_process_event_no_judge_name_leaves_judge_id_null(
     mock_conn, mock_cur = _make_mock_conn()
     mock_psycopg.connect.return_value = mock_conn
     mock_cur.fetchone.side_effect = [
-        ("court-uuid-1",),  # upsert_court
+        ("court-uuid-1",),  # upsert_court (roster dept lookup)
+        ("court-uuid-1",),  # upsert_court (DB write section)
         ("case-uuid-1",),  # upsert_case
         (True,),  # insert_document: RETURNING is_new = True
     ]
@@ -2470,15 +2474,20 @@ def test_la_dept_lookup_skipped_when_judge_name_present(
     mock_fetch_dept.assert_not_called()
 
 
+@patch("ingestion.worker.resolve_judge_from_department", return_value=None)
 @patch("ingestion.worker.psycopg")
-def test_la_dept_lookup_skipped_for_non_la_county(mock_psycopg: MagicMock) -> None:
-    """Non-LA county events should not trigger the dept lookup."""
+def test_la_dept_lookup_skipped_for_non_la_county(
+    mock_psycopg: MagicMock,
+    _mock_roster_dept: MagicMock,
+) -> None:
+    """Non-LA county events should not trigger the LA-specific dept lookup."""
     worker, os_mock = _make_worker()
 
     mock_conn, mock_cur = _make_mock_conn()
     mock_psycopg.connect.return_value = mock_conn
     mock_cur.fetchone.side_effect = [
-        ("court-uuid-1",),  # upsert_court
+        ("court-uuid-1",),  # upsert_court (roster dept lookup)
+        ("court-uuid-1",),  # upsert_court (DB write section)
         ("case-uuid-1",),  # upsert_case
         (True,),  # insert_document: RETURNING is_new = True
     ]
@@ -2493,17 +2502,20 @@ def test_la_dept_lookup_skipped_for_non_la_county(mock_psycopg: MagicMock) -> No
     )
     worker.process_event(event)
 
-    # _la_dept_map should remain None (never fetched)
+    # _la_dept_map should remain None (LA-specific lookup never triggered)
     assert worker._la_dept_map is None
 
 
+@patch("ingestion.worker.resolve_judge_from_department", return_value=None)
 @patch(
     "ingestion.worker.fetch_department_judge_mapping",
     return_value={"1": "Jane Doe"},
 )
 @patch("ingestion.worker.psycopg")
 def test_la_dept_lookup_unmapped_dept_leaves_judge_null(
-    mock_psycopg: MagicMock, _mock_fetch_dept: MagicMock
+    mock_psycopg: MagicMock,
+    _mock_fetch_dept: MagicMock,
+    _mock_roster_dept: MagicMock,
 ) -> None:
     """LA event with department not in mapping — judge stays NULL."""
     worker, os_mock = _make_worker()
@@ -2511,7 +2523,8 @@ def test_la_dept_lookup_unmapped_dept_leaves_judge_null(
     mock_conn, mock_cur = _make_mock_conn()
     mock_psycopg.connect.return_value = mock_conn
     mock_cur.fetchone.side_effect = [
-        ("court-uuid-1",),  # upsert_court
+        ("court-uuid-1",),  # upsert_court (roster dept lookup)
+        ("court-uuid-1",),  # upsert_court (DB write section)
         ("case-uuid-1",),  # upsert_case
         (True,),  # insert_document: RETURNING is_new = True
     ]
@@ -2560,13 +2573,16 @@ def test_la_dept_map_cached_across_events(
     mock_fetch_dept.assert_called_once()
 
 
+@patch("ingestion.worker.resolve_judge_from_department", return_value=None)
 @patch(
     "ingestion.worker.fetch_department_judge_mapping",
     side_effect=Exception("Network error"),
 )
 @patch("ingestion.worker.psycopg")
 def test_la_dept_map_fetch_failure_degrades_gracefully(
-    mock_psycopg: MagicMock, _mock_fetch_dept: MagicMock
+    mock_psycopg: MagicMock,
+    _mock_fetch_dept: MagicMock,
+    _mock_roster_dept: MagicMock,
 ) -> None:
     """If dept map fetch fails, worker continues without dept lookup."""
     worker, os_mock = _make_worker()
@@ -2574,7 +2590,8 @@ def test_la_dept_map_fetch_failure_degrades_gracefully(
     mock_conn, mock_cur = _make_mock_conn()
     mock_psycopg.connect.return_value = mock_conn
     mock_cur.fetchone.side_effect = [
-        ("court-uuid-1",),  # upsert_court
+        ("court-uuid-1",),  # upsert_court (roster dept lookup)
+        ("court-uuid-1",),  # upsert_court (DB write section)
         ("case-uuid-1",),  # upsert_case
         (True,),  # insert_document: RETURNING is_new = True
     ]
@@ -2592,6 +2609,159 @@ def test_la_dept_map_fetch_failure_degrades_gracefully(
     # No judge resolution should happen
     all_sql = " ".join(str(c) for c in mock_cur.execute.call_args_list)
     assert "INSERT INTO judges" not in all_sql
+
+
+# ---------------------------------------------------------------------------
+# Universal dept-to-judge fallback via court directory snapshots (#2269)
+# ---------------------------------------------------------------------------
+
+
+@patch("ingestion.worker.resolve_judge", return_value="judge-uuid-dept")
+@patch("ingestion.worker.resolve_judge_from_department", return_value="Jane Doe")
+@patch(
+    "ingestion.worker.fetch_department_judge_mapping",
+    return_value={},
+)
+@patch("ingestion.worker.psycopg")
+def test_roster_dept_lookup_fires_for_llm_extracted_events(
+    mock_psycopg: MagicMock,
+    _mock_fetch_dept: MagicMock,
+    mock_roster_dept: MagicMock,
+    mock_resolve_judge: MagicMock,
+) -> None:
+    """LLM-extracted event with no judge_name should resolve via roster dept lookup (#2269)."""
+    worker, os_mock = _make_worker()
+
+    mock_conn, mock_cur = _make_mock_conn()
+    mock_psycopg.connect.return_value = mock_conn
+    mock_cur.fetchone.side_effect = [
+        ("court-uuid-1",),  # upsert_court (from roster dept lookup)
+        ("court-uuid-1",),  # upsert_court (from DB write section)
+        ("case-uuid-1",),  # upsert_case
+        (True,),  # insert_document: RETURNING is_new = True
+    ]
+    mock_cur.rowcount = 1
+
+    event = _make_event(
+        judge_name=None,
+        department="3",
+        _llm_extracted=True,
+        _split_processed=True,
+    )
+    worker.process_event(event)
+
+    # resolve_judge_from_department should have been called
+    mock_roster_dept.assert_called_once()
+
+    # resolve_judge should have been called with the roster-resolved name
+    mock_resolve_judge.assert_called_once()
+    assert mock_resolve_judge.call_args[0][1] == "Jane Doe"
+
+
+@patch("ingestion.worker.resolve_judge_from_department", return_value="John Smith")
+@patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
+@patch("ingestion.worker.psycopg")
+def test_roster_dept_lookup_fires_for_ventura(
+    mock_psycopg: MagicMock,
+    mock_resolve_judge: MagicMock,
+    mock_roster_dept: MagicMock,
+) -> None:
+    """Ventura event with no judge_name should resolve via roster dept lookup (#2269)."""
+    worker, os_mock = _make_worker()
+
+    mock_conn, mock_cur = _make_mock_conn()
+    mock_psycopg.connect.return_value = mock_conn
+    mock_cur.fetchone.side_effect = [
+        ("court-uuid-1",),  # upsert_court (from roster dept lookup)
+        ("court-uuid-1",),  # upsert_court (from DB write section)
+        ("case-uuid-1",),  # upsert_case
+        (True,),  # insert_document: RETURNING is_new = True
+    ]
+    mock_cur.rowcount = 1
+
+    event = _make_event(
+        judge_name=None,
+        department="J6",
+        state="CA",
+        county="Ventura",
+        ruling_text="Motion to compel is GRANTED.",
+        _llm_extracted=True,
+        _split_processed=True,
+    )
+    worker.process_event(event)
+
+    # resolve_judge_from_department should have been called
+    mock_roster_dept.assert_called_once()
+
+    # resolve_judge should have been called with the roster name
+    mock_resolve_judge.assert_called_once()
+    assert mock_resolve_judge.call_args[0][1] == "John Smith"
+
+
+@patch("ingestion.worker.resolve_judge_from_department", return_value=None)
+@patch("ingestion.worker.psycopg")
+def test_roster_dept_lookup_no_match_leaves_judge_null(
+    mock_psycopg: MagicMock,
+    mock_roster_dept: MagicMock,
+) -> None:
+    """When roster dept lookup returns None, judge stays NULL."""
+    worker, os_mock = _make_worker()
+
+    mock_conn, mock_cur = _make_mock_conn()
+    mock_psycopg.connect.return_value = mock_conn
+    mock_cur.fetchone.side_effect = [
+        ("court-uuid-1",),  # upsert_court (from roster dept lookup)
+        ("court-uuid-1",),  # upsert_court (from DB write section)
+        ("case-uuid-1",),  # upsert_case
+        (True,),  # insert_document: RETURNING is_new = True
+    ]
+    mock_cur.rowcount = 1
+
+    event = _make_event(
+        judge_name=None,
+        department="999",
+        _llm_extracted=True,
+        _split_processed=True,
+    )
+    worker.process_event(event)
+
+    mock_conn.commit.assert_called_once()
+
+    # No judge resolution should happen (no INSERT INTO judges)
+    all_sql = " ".join(str(c) for c in mock_cur.execute.call_args_list)
+    assert "INSERT INTO judges" not in all_sql
+
+
+@patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
+@patch("ingestion.worker.resolve_judge_from_department", return_value="Jane Doe")
+@patch("ingestion.worker.psycopg")
+def test_roster_dept_lookup_skipped_when_judge_already_set(
+    mock_psycopg: MagicMock,
+    mock_roster_dept: MagicMock,
+    mock_resolve_judge: MagicMock,
+) -> None:
+    """When judge_name is already set, roster dept lookup should not fire."""
+    worker, os_mock = _make_worker()
+
+    mock_conn, mock_cur = _make_mock_conn()
+    mock_psycopg.connect.return_value = mock_conn
+    mock_cur.fetchone.side_effect = [
+        ("court-uuid-1",),  # upsert_court
+        ("case-uuid-1",),  # upsert_case
+        (True,),  # insert_document
+    ]
+    mock_cur.rowcount = 1
+
+    event = _make_event(
+        judge_name="Already Known",
+        department="3",
+        _llm_extracted=True,
+        _split_processed=True,
+    )
+    worker.process_event(event)
+
+    # resolve_judge_from_department should NOT have been called
+    mock_roster_dept.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

@@ -373,6 +373,54 @@ def reset_opensearch_index(os_url: str) -> None:
         )
 
 
+def _fetch_rosters(
+    conn: psycopg.Connection,
+    s3_client: Any,
+    bucket: str,
+) -> None:
+    """Fetch court directory rosters and store snapshots in DB.
+
+    Imports and runs each CourtDirectory subclass to populate
+    court_directory_snapshots.  This ensures the ingestion worker's
+    dept-to-judge fallback has roster data available during rebuilds.
+    """
+    import importlib
+
+    DIRECTORIES = [
+        ("courts.ca.oc_dept_judges", "OCCourtDirectory", "ca_orange"),
+        ("courts.ca.la_dept_judges", "LACourtDirectory", "ca_los_angeles"),
+        ("courts.ca.fresno_dept_judges", "FresnoCourtDirectory", "ca_fresno"),
+        ("courts.ca.kern_dept_judges", "KernCourtDirectory", "ca_kern"),
+        ("courts.ca.sd_dept_judges", "SanDiegoCourtDirectory", "ca_san_diego"),
+        (
+            "courts.ca.sb_dept_judges",
+            "SanBernardinoCourtDirectory",
+            "ca_san_bernardino",
+        ),
+        ("courts.ca.ventura_dept_judges", "VenturaCourtDirectory", "ca_ventura"),
+        ("courts.ca.sf_dept_judges", "SFCourtDirectory", "ca_san_francisco"),
+    ]
+
+    fetched = 0
+    for module_path, class_name, court_id in DIRECTORIES:
+        try:
+            module = importlib.import_module(module_path)
+            directory_cls = getattr(module, class_name)
+            directory = directory_cls(s3_client, bucket, conn)
+            directory.fetch_and_snapshot(court_id)
+            fetched += 1
+            logger.info("Fetched roster", court_id=court_id)
+            time.sleep(1)  # Polite delay between fetches
+        except Exception:
+            logger.warning(
+                "Failed to fetch roster for %s — skipping",
+                court_id,
+                exc_info=True,
+            )
+
+    logger.info("Roster fetch complete", fetched=fetched, total=len(DIRECTORIES))
+
+
 def main() -> None:
     import argparse
 
@@ -422,6 +470,18 @@ def main() -> None:
             reset_opensearch_index(os_url)
         else:
             logger.info("OPENSEARCH_URL not set — skipping OpenSearch index reset")
+
+    # Step 0b: Fetch court directory rosters so that dept-to-judge lookups
+    # work during processing.  Without this, the universal dept-to-judge
+    # fallback (#2269) in the ingestion worker has no snapshot data and
+    # all counties drop to ~15-35% judge resolution.
+    logger.info("Fetching court directory rosters...")
+    try:
+        _fetch_rosters(conn, s3, BUCKET)
+    except Exception:
+        logger.warning(
+            "Roster fetch failed — continuing without roster data", exc_info=True
+        )
 
     # Step 1: Discover keys (local cache or S3)
     # Build S3 prefix — default "ca/", narrowed by --county if given.

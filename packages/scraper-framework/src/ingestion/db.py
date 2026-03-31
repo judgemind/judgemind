@@ -948,6 +948,107 @@ def _get_roster_names(
     return result
 
 
+def resolve_judge_from_department(
+    conn: psycopg.Connection,
+    court_id: str,
+    department: str,
+    hearing_date: date | None = None,
+) -> str | None:
+    """Look up a judge name from the court directory snapshot for a given department.
+
+    Uses the ``court_directory_snapshots`` table to find the judge assigned to
+    a department.  When ``hearing_date`` is provided, selects the snapshot
+    closest to (but not after) that date for historical accuracy.  Otherwise
+    uses the most recent snapshot.
+
+    This is the universal dept-to-judge fallback that works for ALL counties
+    with roster data, replacing the LA-specific hardcoded lookup.  It fires
+    during both normal ingestion and rebuilds, regardless of ``_llm_extracted``
+    status.
+
+    Parameters
+    ----------
+    conn : psycopg.Connection
+        Database connection.
+    court_id : str
+        The court UUID (from the courts table).
+    department : str
+        The department string to look up.
+    hearing_date : date | None
+        The hearing date for historical snapshot selection.
+
+    Returns
+    -------
+    str | None
+        The judge name from the roster, or ``None`` if no match found.
+    """
+    import json
+
+    # Get the court_code for this court UUID
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT court_code FROM courts WHERE id = %s::uuid LIMIT 1",
+            (court_id,),
+        )
+        row = cur.fetchone()
+    if row is None:
+        return None
+
+    court_code: str = row[0]
+    # Convert court_code format (ca-los-angeles) to snapshot format (ca_los_angeles)
+    snapshot_court_id = court_code.replace("-", "_")
+
+    # Get the appropriate snapshot
+    with conn.cursor() as cur:
+        if hearing_date is not None:
+            cur.execute(
+                """
+                SELECT mapping FROM court_directory_snapshots
+                WHERE court_id = %s AND captured_at <= %s
+                ORDER BY captured_at DESC
+                LIMIT 1
+                """,
+                (snapshot_court_id, hearing_date),
+            )
+        else:
+            cur.execute(
+                """
+                SELECT mapping FROM court_directory_snapshots
+                WHERE court_id = %s
+                ORDER BY captured_at DESC
+                LIMIT 1
+                """,
+                (snapshot_court_id,),
+            )
+        row = cur.fetchone()
+
+    if row is None or row[0] is None:
+        return None
+
+    mapping_data = row[0]
+    mapping: dict[str, str]
+    if isinstance(mapping_data, dict):
+        mapping = mapping_data
+    else:
+        try:
+            mapping = json.loads(mapping_data)
+        except (json.JSONDecodeError, TypeError):
+            logger.warning(
+                "Failed to parse court directory mapping for dept lookup",
+                extra={"court_id": court_id, "department": department},
+            )
+            return None
+
+    # Try exact department match first, then case-insensitive
+    if department in mapping:
+        return mapping[department]
+    dept_lower = department.lower().strip()
+    for key, value in mapping.items():
+        if key.lower().strip() == dept_lower:
+            return value
+    return None
+
+
 def resolve_judge(
     conn: psycopg.Connection,
     raw_name: str,

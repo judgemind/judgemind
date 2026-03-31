@@ -34,6 +34,7 @@ from ingestion.db import (
     normalize_party_name,
     normalize_ruling_text_hash,
     resolve_judge,
+    resolve_judge_from_department,
     upsert_case,
     upsert_case_judge,
     upsert_case_party,
@@ -2253,3 +2254,116 @@ class TestUpsertCaseReturningTitle:
 
         with pytest.raises(RuntimeError, match="could not retrieve case id"):
             upsert_case_returning_title(conn, "24STCV12345", "court-uuid-1")
+
+
+# ---------------------------------------------------------------------------
+# resolve_judge_from_department
+# ---------------------------------------------------------------------------
+
+
+class TestResolveJudgeFromDepartment:
+    """Tests for resolve_judge_from_department function (#2269)."""
+
+    def test_returns_judge_from_snapshot_exact_dept_match(self) -> None:
+        """Should return judge name when department matches exactly in snapshot."""
+        conn = _mock_conn()
+        cur = conn.cursor.return_value.__enter__.return_value
+        # First fetchone: court_code lookup
+        # Second fetchone: snapshot mapping lookup
+        mapping = {"3": "John Smith", "5": "Jane Doe"}
+        cur.fetchone.side_effect = [("ca-los-angeles",), (mapping,)]
+
+        result = resolve_judge_from_department(conn, "court-uuid-1", "3")
+        assert result == "John Smith"
+
+    def test_returns_judge_case_insensitive_dept_match(self) -> None:
+        """Should return judge name when department matches case-insensitively."""
+        conn = _mock_conn()
+        cur = conn.cursor.return_value.__enter__.return_value
+        mapping = {"Dept 3": "John Smith"}
+        cur.fetchone.side_effect = [("ca-los-angeles",), (mapping,)]
+
+        result = resolve_judge_from_department(conn, "court-uuid-1", "dept 3")
+        assert result == "John Smith"
+
+    def test_returns_none_when_no_court(self) -> None:
+        """Should return None when court_id doesn't exist."""
+        conn = _mock_conn()
+        cur = conn.cursor.return_value.__enter__.return_value
+        cur.fetchone.return_value = None
+
+        result = resolve_judge_from_department(conn, "nonexistent-court", "3")
+        assert result is None
+
+    def test_returns_none_when_no_snapshot(self) -> None:
+        """Should return None when no directory snapshot exists."""
+        conn = _mock_conn()
+        cur = conn.cursor.return_value.__enter__.return_value
+        # First: court_code, Second: no snapshot
+        cur.fetchone.side_effect = [("ca-los-angeles",), None]
+
+        result = resolve_judge_from_department(conn, "court-uuid-1", "3")
+        assert result is None
+
+    def test_returns_none_when_dept_not_in_mapping(self) -> None:
+        """Should return None when department is not in the mapping."""
+        conn = _mock_conn()
+        cur = conn.cursor.return_value.__enter__.return_value
+        mapping = {"5": "Jane Doe"}
+        cur.fetchone.side_effect = [("ca-los-angeles",), (mapping,)]
+
+        result = resolve_judge_from_department(conn, "court-uuid-1", "3")
+        assert result is None
+
+    def test_uses_hearing_date_for_historical_lookup(self) -> None:
+        """Should use hearing_date to select appropriate historical snapshot."""
+        conn = _mock_conn()
+        cur = conn.cursor.return_value.__enter__.return_value
+        mapping = {"3": "John Smith"}
+        cur.fetchone.side_effect = [("ca-ventura",), (mapping,)]
+        hearing_dt = date(2026, 1, 15)
+
+        result = resolve_judge_from_department(conn, "court-uuid-1", "3", hearing_date=hearing_dt)
+        assert result == "John Smith"
+
+        # Verify the snapshot query includes the hearing date
+        snapshot_query_call = cur.execute.call_args_list[1]
+        sql = snapshot_query_call[0][0]
+        assert "captured_at <=" in sql
+        params = snapshot_query_call[0][1]
+        assert hearing_dt in params
+
+    def test_converts_court_code_hyphens_to_underscores(self) -> None:
+        """Should convert court_code hyphens to underscores for snapshot lookup."""
+        conn = _mock_conn()
+        cur = conn.cursor.return_value.__enter__.return_value
+        mapping = {"3": "John Smith"}
+        cur.fetchone.side_effect = [("ca-los-angeles",), (mapping,)]
+
+        resolve_judge_from_department(conn, "court-uuid-1", "3")
+
+        # Verify the snapshot query uses underscored court_id
+        snapshot_query_call = cur.execute.call_args_list[1]
+        params = snapshot_query_call[0][1]
+        assert "ca_los_angeles" in params
+
+    def test_handles_json_string_mapping(self) -> None:
+        """Should handle mapping stored as JSON string (not dict)."""
+        import json
+
+        conn = _mock_conn()
+        cur = conn.cursor.return_value.__enter__.return_value
+        mapping_str = json.dumps({"3": "John Smith"})
+        cur.fetchone.side_effect = [("ca-ventura",), (mapping_str,)]
+
+        result = resolve_judge_from_department(conn, "court-uuid-1", "3")
+        assert result == "John Smith"
+
+    def test_handles_null_mapping_data(self) -> None:
+        """Should return None when snapshot mapping is NULL."""
+        conn = _mock_conn()
+        cur = conn.cursor.return_value.__enter__.return_value
+        cur.fetchone.side_effect = [("ca-los-angeles",), (None,)]
+
+        result = resolve_judge_from_department(conn, "court-uuid-1", "3")
+        assert result is None
