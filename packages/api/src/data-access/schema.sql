@@ -181,7 +181,7 @@ ALTER SEQUENCE derived.court_directory_snapshots_id_seq OWNED BY derived.court_d
 
 CREATE TABLE derived.courts (
     id uuid DEFAULT gen_random_uuid() NOT NULL,
-    state character(2) NOT NULL,
+    state character varying(20) NOT NULL,
     county text NOT NULL,
     court_name text NOT NULL,
     court_code text NOT NULL,

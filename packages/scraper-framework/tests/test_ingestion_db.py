@@ -697,6 +697,24 @@ class TestUpsertCourt:
         with pytest.raises(RuntimeError, match="upsert_court returned no row"):
             upsert_court(conn, "CA", "Orange", "OC Court")
 
+    def test_federal_state_passes_correct_params(self) -> None:
+        """Federal courts use state='Federal' which exceeds CHAR(2).
+
+        The DB schema was widened to VARCHAR(20) in migration 16 to
+        support non-state jurisdictions like 'Federal'. Verify that the
+        function passes the full state value through to the DB. (#2219)
+        """
+        conn = _mock_conn()
+        upsert_court(conn, "Federal", "Federal", "CourtListener")
+        args = _get_execute_args(conn)
+        assert args == (
+            "Federal",
+            "Federal",
+            "CourtListener",
+            "federal-federal",
+            "America/Los_Angeles",
+        )
+
 
 # ---------------------------------------------------------------------------
 # upsert_case — additional tests
