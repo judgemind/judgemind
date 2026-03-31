@@ -215,11 +215,59 @@ Qdrant is included in the docker-compose stack and declared as a dependency, but
 
 AWS S3 stores all original documents and archival copies (MinIO in docker-compose for local development).
 
-Immutable archival: Original captured documents are never modified or deleted. Object versioning enabled for an additional safety net.
+### 4.4.1 Archive-First Principle
+
+The S3 archive is the authoritative source of truth for all captured data. The PostgreSQL database is a derived, rebuildable index — every fact in the database must trace back to an archived source file in S3.
+
+This principle has three implications:
+
+1. **Archive before process.** Every external data source (court websites, court directories, and eventually third-party sources like Ballotpedia and state bar associations) archives raw fetched content to S3 before any extraction or transformation. If a downstream processing step fails, the raw content is preserved and can be reprocessed.
+
+2. **The database is rebuildable.** All extraction (LLM, regex, HTML parsing) can be re-run on archived content. `scripts/rebuild_db.py` demonstrates this: it discovers courts from S3 key prefixes, seeds the database, fetches court directory rosters, then processes every archived document through the full ingestion pipeline (transcription, enrichment, DB write). The result is a complete database rebuilt from S3 alone.
+
+3. **Immutable archival.** Original captured documents are never modified or deleted. Object versioning is enabled as an additional safety net. This is critical for tentative rulings, which are ephemeral — if the raw content is lost, it cannot be recaptured.
+
+### 4.4.2 Content-Addressed Key Scheme
+
+S3 keys for captured documents use content-addressed paths: the key includes a SHA-256 hash of the document content. This design has several advantages:
+
+- **Idempotent writes.** The same content always maps to the same key. A scraper that captures the same ruling twice produces the same key, so the second PutObject is a no-op. No orphaned duplicates, no wasted storage.
+- **Deduplication by construction.** When a content hash matches an existing key, the archiver skips the upload entirely (verified via HeadObject), saving bandwidth and S3 PUT costs.
+- **Cache-friendly.** Content-addressed keys never go stale — the content at a given key is immutable by definition. The local S3 cache (`S3_CACHE_DIR`) exploits this: cached files are valid forever with no invalidation logic needed.
+
+The archiver implementation is in `packages/scraper-framework/src/framework/storage.py`. The `build_s3_key` function constructs the key from document metadata and content hash.
+
+### 4.4.3 S3 Key Prefixes
+
+All S3 objects live in the `judgemind-document-archive-{env}` bucket. Key prefixes organize content by source type and purpose:
+
+| Prefix pattern | Purpose | Key scheme | Example |
+|---|---|---|---|
+| `{state}/{county}/{court}/raw/{content_hash}.{ext}` | Captured tentative rulings and court documents | Content-addressed (SHA-256 hash) | `ca/orange/orange_county_superior_court/raw/a1b2c3d4...f0.pdf` |
+| `directories/{court_id}/{timestamp}.{ext}` | Department-to-judge directory snapshots | Timestamped (`YYYYMMDDTHHMMSSz`) | `directories/ca_orange_oc_superior/20260315T080000Z.html` |
+| `llm-cache/{provider}-{model}/prompt-{prompt_hash}/{content_key}.json` | Cached LLM extraction results | Content-addressed (prompt hash + content hash) | `llm-cache/google-gemini-2.0-flash/prompt-ab12.../5f3e...json` |
+| `data-quality/{YYYY-MM-DD}/{HH}.json` | Hourly data quality check snapshots | Timestamped (date + hour) | `data-quality/2026-03-15/08.json` |
+
+**Ruling archives** use the content-addressed scheme described above. The scraper captures raw content, computes the SHA-256 hash, and archives to `{state}/{county}/{court}/raw/{hash}.{ext}`. The `rebuild_db.py` script discovers courts by parsing these prefixes — the S3 key structure itself encodes the court hierarchy.
+
+**Directory snapshots** archive raw HTML (or PDF for Santa Barbara and San Francisco) from court websites that map department numbers to judge names. These are timestamped rather than content-addressed because the same department page may change over time and we want to preserve the history. Fetched by `scripts/fetch_rosters.py` and the per-court directory scrapers in `packages/scraper-framework/src/framework/court_directory.py`.
+
+**LLM cache** stores extraction results keyed by both the prompt template hash and the document content hash. This means changing the prompt invalidates the cache (new results are computed), while unchanged prompts reuse cached results. The cache is shared across local and ECS environments via S3.
+
+**Data quality snapshots** store the output of the hourly `scripts/data-quality-check.py` run. These enable trend analysis — the `scripts/dq_trend_storage.py` module reads historical snapshots to detect regressions over time.
+
+### 4.4.4 Data Sources Not Yet Archive-First
+
+The following data sources are integrated but do not yet archive raw content to S3 before processing:
+
+- **Ballotpedia** (`packages/scraper-framework/src/courts/ca/ballotpedia.py`): fetches judge biographical data but does not archive raw HTML to S3. A future `external/ballotpedia/{content_hash}.html` prefix is planned.
+- **State bar associations**: not yet integrated. When added, raw responses should be archived under `external/{source}/{content_hash}.html`.
+
+The planned `external/{source}/{content_hash}.html` prefix will follow the same content-addressed scheme as ruling archives, ensuring idempotent archival for third-party data sources.
+
+### 4.4.5 Storage Tiers
 
 Tiered storage: Hot storage for documents less than 90 days old or frequently accessed. Cold/archive storage for older documents. Lifecycle policies automate transitions.
-
-Path convention: /{state}/{county}/{court}/raw/{content_hash}.{ext} — content-addressed keys make S3 PutObject idempotent (same content = same key, no orphaned duplicates).
 
 # 5. AI/ML Layer
 
