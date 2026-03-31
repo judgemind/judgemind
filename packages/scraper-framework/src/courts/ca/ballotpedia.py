@@ -24,6 +24,7 @@ Parent: https://github.com/judgemind/judgemind/issues/2144
 
 from __future__ import annotations
 
+import os
 import re
 import time
 from dataclasses import dataclass, field
@@ -31,7 +32,11 @@ from datetime import UTC, datetime
 
 import httpx
 import structlog
+from botocore.exceptions import BotoCoreError, ClientError
 from bs4 import BeautifulSoup, Tag
+
+from framework.hashing import sha256_hex
+from framework.s3_cache import make_s3_client
 
 logger = structlog.get_logger(__name__)
 
@@ -95,6 +100,7 @@ class BallotpediaBioEntry:
     career: list[CareerEntry] = field(default_factory=list)
     elections: list[ElectionEntry] = field(default_factory=list)
     raw_html: str | None = None
+    s3_key: str | None = None
 
     def to_bio_source_dict(self) -> dict[str, object]:
         """Convert to the ``judge_bio_sources`` jsonb format.
@@ -113,7 +119,7 @@ class BallotpediaBioEntry:
                 }
             }
         """
-        return {
+        result: dict[str, object] = {
             "source": "ballotpedia",
             "url": self.source_url,
             "fetched_at": self.fetched_at.isoformat(),
@@ -145,6 +151,9 @@ class BallotpediaBioEntry:
                 ],
             },
         }
+        if self.s3_key is not None:
+            result["s3_key"] = self.s3_key
+        return result
 
 
 def build_candidate_urls(
@@ -633,6 +642,187 @@ def is_article_not_found(html: str) -> bool:
     return False
 
 
+def build_external_s3_key(content_hash: str) -> str:
+    """Build S3 key for a Ballotpedia page in the external archive.
+
+    Uses the content-addressed key structure for external sources:
+    ``external/ballotpedia/{content_hash}.html``
+
+    Parameters
+    ----------
+    content_hash : str
+        SHA-256 hex digest of the raw HTML content.
+
+    Returns
+    -------
+    str
+        The S3 key for the archived page.
+    """
+    return f"external/ballotpedia/{content_hash}.html"
+
+
+def archive_to_s3(
+    html: str,
+    source_url: str,
+    fetched_at: datetime,
+    *,
+    s3_client: object | None = None,
+    bucket: str | None = None,
+) -> str | None:
+    """Archive raw Ballotpedia HTML to S3, returning the S3 key.
+
+    Uses a HeadObject check to skip upload for unchanged pages
+    (content-addressed keys make this idempotent).
+
+    Parameters
+    ----------
+    html : str
+        The raw HTML content to archive.
+    source_url : str
+        The URL the page was fetched from (stored as S3 metadata).
+    fetched_at : datetime
+        When the page was fetched (stored as S3 metadata for provenance).
+    s3_client : object | None
+        An S3 client (or ``CachedS3Client``). Defaults to ``make_s3_client()``.
+    bucket : str | None
+        The S3 bucket name. Defaults to ``JUDGEMIND_ARCHIVE_BUCKET`` env var.
+
+    Returns
+    -------
+    str | None
+        The S3 key if archival succeeded, or None if S3 is not configured
+        (no bucket set).
+    """
+    if bucket is None:
+        bucket = os.environ.get("JUDGEMIND_ARCHIVE_BUCKET", "")
+    if not bucket:
+        logger.debug("S3 archival disabled (JUDGEMIND_ARCHIVE_BUCKET not set)")
+        return None
+
+    if s3_client is None:
+        s3_client = make_s3_client()
+
+    content_bytes = html.encode("utf-8")
+    content_hash = sha256_hex(content_bytes)
+    key = build_external_s3_key(content_hash)
+
+    # HeadObject check: skip upload if content already archived
+    try:
+        s3_client.head_object(Bucket=bucket, Key=key)
+        logger.debug("Already archived s3://%s/%s, skipping upload", bucket, key)
+        return key
+    except ClientError as exc:
+        if exc.response["Error"]["Code"] != "404":
+            logger.error("S3 HeadObject failed for %s: %s", key, exc)
+            raise
+
+    # Upload the raw HTML
+    try:
+        s3_client.put_object(
+            Bucket=bucket,
+            Key=key,
+            Body=content_bytes,
+            ContentType="text/html",
+            Metadata={
+                "source": "ballotpedia",
+                "source-url": source_url,
+                "content-hash": content_hash,
+                "fetched-at": fetched_at.isoformat(),
+            },
+        )
+    except (BotoCoreError, ClientError) as exc:
+        logger.error("S3 archival failed for %s: %s", key, exc)
+        raise
+    logger.info("Archived %s bytes to s3://%s/%s", len(content_bytes), bucket, key)
+    return key
+
+
+def rebuild_bio_from_s3(
+    s3_key: str,
+    *,
+    source_url: str | None = None,
+    s3_client: object | None = None,
+    bucket: str | None = None,
+    fetched_at: datetime | None = None,
+) -> BallotpediaBioEntry:
+    """Re-extract bio data from an archived Ballotpedia page in S3.
+
+    This enables re-extraction when parsing logic improves, without
+    needing to re-scrape Ballotpedia. The S3 object metadata contains
+    the original ``source-url`` and ``fetched-at`` timestamps, making
+    the archive self-contained. These can be overridden via parameters.
+
+    Parameters
+    ----------
+    s3_key : str
+        The S3 key of the archived page (e.g., ``external/ballotpedia/{hash}.html``).
+    source_url : str | None
+        Override for the original URL. If None, read from S3 metadata.
+    s3_client : object | None
+        An S3 client. Defaults to ``make_s3_client()``.
+    bucket : str | None
+        The S3 bucket name. Defaults to ``JUDGEMIND_ARCHIVE_BUCKET`` env var.
+    fetched_at : datetime | None
+        Override for the original fetch time. If None, read from S3 metadata.
+        Falls back to now (UTC) if metadata is also unavailable.
+
+    Returns
+    -------
+    BallotpediaBioEntry
+        Structured bio data re-extracted from the archived page.
+
+    Raises
+    ------
+    ValueError
+        If the bucket is not configured, or if ``source_url`` is not
+        provided and not available in S3 metadata.
+    ClientError
+        If the S3 object cannot be fetched.
+    """
+    if bucket is None:
+        bucket = os.environ.get("JUDGEMIND_ARCHIVE_BUCKET", "")
+    if not bucket:
+        msg = "JUDGEMIND_ARCHIVE_BUCKET not set — cannot rebuild from S3"
+        raise ValueError(msg)
+
+    if s3_client is None:
+        s3_client = make_s3_client()
+
+    response = s3_client.get_object(Bucket=bucket, Key=s3_key)
+    html = response["Body"].read().decode("utf-8")
+
+    # Read provenance metadata from S3 object, with parameter overrides
+    metadata = response.get("Metadata", {})
+
+    if source_url is None:
+        source_url = metadata.get("source-url")
+    if source_url is None:
+        msg = "source_url not provided and not found in S3 metadata — cannot determine page origin"
+        raise ValueError(msg)
+
+    if fetched_at is None:
+        fetched_at_str = metadata.get("fetched-at")
+        if fetched_at_str:
+            fetched_at = datetime.fromisoformat(fetched_at_str)
+        elif "LastModified" in response:
+            # Fallback: use the S3 object's LastModified time as a proxy
+            # for the original fetch time when metadata is missing (e.g.,
+            # objects uploaded before fetched-at metadata was added).
+            fetched_at = response["LastModified"]
+
+    entry = parse_ballotpedia_page(html, source_url, fetched_at)
+    entry.s3_key = s3_key
+
+    logger.info(
+        "Rebuilt bio from S3",
+        s3_key=s3_key,
+        source_url=source_url,
+        education_count=len(entry.education),
+        career_count=len(entry.career),
+    )
+    return entry
+
+
 def fetch_judge_bio(
     first_name: str,
     last_name: str,
@@ -640,11 +830,14 @@ def fetch_judge_bio(
     *,
     timeout: float = 30.0,
     request_delay: float = DEFAULT_REQUEST_DELAY,
+    s3_client: object | None = None,
+    bucket: str | None = None,
 ) -> BallotpediaBioEntry | None:
-    """Fetch and parse a judge's Ballotpedia page.
+    """Fetch, archive, and parse a judge's Ballotpedia page.
 
     Tries candidate URLs in order (with middle initial first, then without).
-    Returns the first successful result, or None if no page is found.
+    Archives raw HTML to S3 before parsing (if ``JUDGEMIND_ARCHIVE_BUCKET``
+    is set). Returns the first successful result, or None if no page is found.
 
     Parameters
     ----------
@@ -658,6 +851,10 @@ def fetch_judge_bio(
         HTTP request timeout in seconds.
     request_delay : float
         Delay in seconds between requests (rate limiting).
+    s3_client : object | None
+        An S3 client for archival. Defaults to ``make_s3_client()``.
+    bucket : str | None
+        S3 bucket name for archival. Defaults to ``JUDGEMIND_ARCHIVE_BUCKET`` env var.
 
     Returns
     -------
@@ -694,10 +891,25 @@ def fetch_judge_bio(
                 continue
 
             if response.status_code == 200:
-                return parse_ballotpedia_page(
+                # Generate timestamp once for consistent provenance
+                fetched_at = datetime.now(UTC)
+
+                # Archive raw HTML to S3 before parsing
+                s3_key = archive_to_s3(
+                    response.text,
+                    source_url=url,
+                    fetched_at=fetched_at,
+                    s3_client=s3_client,
+                    bucket=bucket,
+                )
+
+                entry = parse_ballotpedia_page(
                     html=response.text,
                     source_url=url,
+                    fetched_at=fetched_at,
                 )
+                entry.s3_key = s3_key
+                return entry
 
             # Unexpected status code — log and continue to next URL
             logger.warning(
