@@ -1,16 +1,12 @@
 {
   "ruling_text": "Plaintiff's Proposed Special Jury Instructions Nos. 1, 3, 4, 6, 9 are APPROVED; No. 2 is APPROVED subject to modifications. The court will not instruct the jury with Plaintiff's Proposed Special Jury Instructions Nos. 11, 14. Defendant's Proposed Special Jury Instructions Nos. 12, 13, 15 are APROVED. The court will not instruct the jury with Defendant's Proposed Special Jury Instructions No. 17. The court will hear from the parties on Defendant's Proposed Special Jury Instruction No. 10. The court adopts Plaintiff's verdict form.",
   "expected": {
-    "case_title": "Ismael Rivera Ocampo v. Kia America, Inc.",
+    "case_title": null,
     "motion_type": null,
     "outcome": "granted_in_part",
     "parties": {
-      "plaintiffs": [
-        "Ismael Rivera Ocampo"
-      ],
-      "defendants": [
-        "Kia America, Inc."
-      ]
+      "plaintiffs": [],
+      "defendants": []
     }
   },
   "source_doc": "s3://judgemind-document-archive-dev/ca/los_angeles/superior_court/raw/2026/03/25/f9aad273-cee4-567e-85e0-745d292f8953.html",

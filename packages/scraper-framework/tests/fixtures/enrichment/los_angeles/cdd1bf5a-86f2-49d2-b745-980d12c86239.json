@@ -1,8 +1,8 @@
 {
   "ruling_text": "Case Number:\n24VECV04690\nHearing Date:\n\nMarch 13, 2026\nDept:\n\nB\nTentative Ruling\nGRM Information Management Services\nv. Prober & Raphael, Case no. 24VECV04690\nHearing date March 13, 2026\nPlaintiff\nGRM’s Motion to Deem RFAs Admitted - UNOPPOSED\nPlaintiff\nGRM Information Management Services, Inc. sues defendant Prober & Raphael,\nA Law Corporation for collections. Plaintiff served requests for admission on\n12/11/24 and granted an open extension to facilitate settlement talks. Plaintiff\nnow moves to deem RFAs admitted and for monetary sanctions. The motion is\nunopposed.\n\nIf\na party to whom requests for admission are directed fails to serve a timely\nresponse, the propounding party may move to deem the matters admitted. Code\nCiv. Proc. §2033.280(2)(b).\nPlaintiff\nserved requests for admission on defendant on 12/11/24. Decl. Goldman, para. 2.\nPlaintiff granted an open extension.\nId\n. at paras. 8-9. Plaintiff’s\nletter of 3/12/25 demanded responses to the RFAs.\nId\n. at para. 6. During\nmeet and confer efforts, defendant indicated it would likely be shutting down\nand liquidating.\n\nSee\n2/10/26 Meet and Confer Decl., para. 4. Defendant\nserved no responses to the RFAs. Decl. Goldman, para. 10. An ordering deeming\nRFAs admitted is appropriate.\nPlaintiff\nrequests $1,500 in sanctions. Decl. Goldman, para. 5. Defendant failed to serve\nresponses, despite extensions and meet and confer efforts, necessitating this\nmotion. Sanctions are warranted. However, plaintiff does not offer specific\nevidence as to the hourly rate sought, hours expended or costs incurred in\nrelation to this motion. The court cannot grant sanctions without being\nprovided evidence or facts supporting their imposition.\nMotion\nto deem RFAs admitted is GRANTED; the request for sanctions is DENIED for lack\nof evidence.",
   "expected": {
-    "case_title": "GRM Information Management Services v. Prober & Raphael, A Law Corporation",
-    "motion_type": "motion_to_deem_rfas_admitted",
+    "case_title": null,
+    "motion_type": "other",
     "outcome": "granted_in_part",
     "parties": {
       "plaintiffs": [

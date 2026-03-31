@@ -1,7 +1,7 @@
 {
   "ruling_text": "The Court, on its own motion, continues this matter to 5/5/26, 9:00 AM, Courtroom J6 due to staffing issues.",
   "expected": {
-    "case_title": "In The Matter Michele Nicole Gray",
+    "case_title": null,
     "motion_type": null,
     "outcome": "continued",
     "parties": {

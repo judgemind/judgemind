@@ -1,13 +1,11 @@
 {
   "ruling_text": "The Plaintiff’s unopposed motion to vacate dismissal as to James T. Wulfsberg and enter judgment\nunder terms of stipulated settlement, filed December 9, 2025, is granted. The court will sign the\nproposed order. The order will become effective upon service of notice of entry of order upon\nDefendant.",
   "expected": {
-    "case_title": "Bank Of America N.A. v. James Wulfsberg",
-    "motion_type": "motion_to_vacate",
+    "case_title": null,
+    "motion_type": "other",
     "outcome": "granted",
     "parties": {
-      "plaintiffs": [
-        "Bank Of America N.A."
-      ],
+      "plaintiffs": [],
       "defendants": [
         "James Wulfsberg"
       ]

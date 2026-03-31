@@ -1,13 +1,11 @@
 {
   "ruling_text": "Defendant Aaron Dunkel's Motion for Leave to File a Cross-Complaint is GRANTED. California courts have a liberal policy in favor of permitting amendments. (Mabie v. Hyatt (1998) 61 Cal.App.4th 581, 596.) The policy favoring amendments is so strong that denial of a request for leave to amend is rarely justified. (Id.) Requests for leave to amend will normally only be denied where the moving party has been dilatory in seeking leave to amend and where the delay in bringing the motion has resulted in prejudice to the opposing party. (Hirsa v. Sup. Ct. (1981) 118 Cal.App.3d 486, 490.) A mere showing of unreasonable delay by the plaintiff without any showing of resulting prejudice to defendants is an insufficient ground to justify denial of the plaintiff's motion. (Higgins v. Del Faro (1981) 123 Cal.App.3d 558, 564-565.) For good cause shown relief is proper per Code of Civil Procedure section 428.10. Cross-Complaint deemed filed this date. Defendant is ordered to serve the Cross-Complaint. Defendant Aaron Dunkel's Motion for Leave to File an Amended Answer is DENIED. Defendant has not complied with California Rule of Court 3.1324(a) and (b). Thus, on this ground alone the request for leave to amend the answer is denied. Defendant has NOT included a copy of his proposed First Amended Answer with the moving papers. Accordingly, Defendant has not complied with California Rule of Court, Rule 3.1324subdivision (a)(1). Further, Defendant has also not complied with subdivisions (a)(2) and (a)(3) of Rule 3.1324. Specifically, the declaration does not adequately describe the effect of the amendment, why the amendment is necessary/proper, facts giving rise to the amended allegations and when they were discovered, and the reason why the motion was not filed earlier. (See Dunkel Decl., ¶¶ 2-6.)",
   "expected": {
-    "case_title": "Cavalry Spv I, LLC As Assignee Of Citibank, N.A. v. Aaron M Dunkel",
-    "motion_type": "motion_for_leave_to_amend",
+    "case_title": null,
+    "motion_type": "other",
     "outcome": "granted_in_part",
     "parties": {
-      "plaintiffs": [
-        "Cavalry Spv I, LLC As Assignee Of Citibank, N.A."
-      ],
+      "plaintiffs": [],
       "defendants": [
         "Aaron M Dunkel"
       ]

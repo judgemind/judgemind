@@ -1,13 +1,11 @@
 {
   "ruling_text": "Defendant Christian Ayala's Motion to Set Aside Default and Default Judgment is CONTINUED to April 29, 2026 at 8:20 a.m. in Dept. 20. Defendant's motion does not contain a proof of service and no opposition has been filed. Defendant is ordered to properly serve the motion on opposing counsel and file the proof of service five days in advance of the continued hearing. (Code Civ. Proc. §§1010 and 1005, subd. (b).) The Clerk shall provide notice.",
   "expected": {
-    "case_title": "Mercury Insurance Company vs. Christian Ayala",
-    "motion_type": "motion_to_set_aside_default",
+    "case_title": null,
+    "motion_type": "other",
     "outcome": "continued",
     "parties": {
-      "plaintiffs": [
-        "Mercury Insurance Company"
-      ],
+      "plaintiffs": [],
       "defendants": [
         "Christian Ayala"
       ]

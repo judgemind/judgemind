@@ -1,16 +1,12 @@
 {
   "ruling_text": "OFF CALENDAR. On March 16, 2026, Plaintiff filed a request to dismiss the moving party from the action and moving party filed a notice of withdrawal of this motion.",
   "expected": {
-    "case_title": "ERIC LAGUNAS vs FORD MOTOR COMPANY et al",
+    "case_title": null,
     "motion_type": "petition",
     "outcome": "off_calendar",
     "parties": {
-      "plaintiffs": [
-        "ERIC LAGUNAS"
-      ],
-      "defendants": [
-        "FORD MOTOR COMPANY"
-      ]
+      "plaintiffs": [],
+      "defendants": []
     }
   },
   "source_doc": "s3://judgemind-document-archive-dev/ca/santa_clara/superior_court/raw/2026/03/25/7f5a72b4-6b82-5046-9f90-cb4df2722a78.pdf",

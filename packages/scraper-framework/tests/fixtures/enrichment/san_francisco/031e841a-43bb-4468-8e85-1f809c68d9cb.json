@@ -1,16 +1,12 @@
 {
   "ruling_text": "The matter is on calendar for Respondent's remaining requests in her Request for Order filed on 8/18/25. The Court has read and considered the pleadings, declarations, and other evidence submitted in this matter. For good cause shown, the Court makes the following findings and orders: A. PROCEDURAL HISTORY... B. FINDINGS AND ORDER 1) Mother's request for modification of child support is granted as the Court finds a material change in circumstances exists given that the prior child support order is calculated based on Father having 50% parenting time, and Father currently has approximately 1% parenting time. 2) Effective 10/25/25 (i.e. the date on which Father's parenting time decreased), Father shall pay Mother the amount of $1,463 per month as and for guideline child support. 3) A printout of the XSpouse report is attached and incorporated into this order... 4) The Court maintains the prior 11/21/23 order that Father pay temporary spousal support to Mother in the amount of $500 per month. 5) Therefore, Father is ordered to pay the amount of $1,963 as and for combined monthly guideline child support and temporary spousal support to Mother payable as one-half ($981.50) on the 1st and one-half ($981.50) on the 15th of the month. These payments shall commence on 1/1/26. 6) After accounting for the $1,357 Father already paid to Mother in support each month (including December 2025), the Court finds Father owes Mother $1,329 in child support arrears for the period of 10/25/25 - 12/31/25 ($117 for October + $606 for November + $606 for December). Father shall pay Mother an additional $250 per month, payable on the 1st of each month, until this balance is paid in full. 7) The Court maintains the prior order regarding Father's sole decision-making over the child's education, including school choice. Mother's request for expenses to transport the child to school in Orinda is GRANTED in the amount of 70 cents per mile (IRS Standard Mileage Rate for 2025) to and from Mother's home to the child's school. Mother's invoices supporting her request are not attached to her declaration filed on 12/1/25. 8) Mother's request for reimbursement of lost work time and meal costs incurred between 8/12/25 - 12/19/25 as a result of Mother driving Kristina to school in Walnut Creek three times per week is DENIED. 9) Mother's request for attorney's fees is DENIED as beyond the scope of her RFO.",
   "expected": {
-    "case_title": "Ken Ericson v. Arlene Ericson",
-    "motion_type": "accounting",
+    "case_title": null,
+    "motion_type": "other",
     "outcome": "granted_in_part",
     "parties": {
-      "plaintiffs": [
-        "Ken Ericson"
-      ],
-      "defendants": [
-        "Arlene Ericson"
-      ]
+      "plaintiffs": [],
+      "defendants": []
     }
   },
   "source_doc": "s3://judgemind-document-archive-dev/ca/san_francisco/superior_court/raw/2026/03/24/c65f69ef-e2ad-525b-9f81-fbb4d72ea61b.pdf",

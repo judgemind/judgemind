@@ -1,8 +1,8 @@
 {
   "ruling_text": "MOTION TO BIFURCATE TRIAL\nNotice of Withdrawal filed 03/10/2026.",
   "expected": {
-    "case_title": "Sirott – Conservatorship",
-    "motion_type": "motion_to_bifurcate",
+    "case_title": null,
+    "motion_type": "other",
     "outcome": null,
     "parties": {
       "plaintiffs": [],

@@ -1,13 +1,11 @@
 {
   "ruling_text": "MOTION TO BE RELIEVED AS\nCOUNSEL FOR KURT K. HARRIS,\nESQ. PC\nTentative Ruling: Hearing required. No proof of service filed.",
   "expected": {
-    "case_title": "Cvme2405886 Cummins v. Harris",
+    "case_title": null,
     "motion_type": "motion_to_be_relieved_as_counsel",
     "outcome": "other",
     "parties": {
-      "plaintiffs": [
-        "Cvme2405886 Cummins"
-      ],
+      "plaintiffs": [],
       "defendants": [
         "Harris"
       ]

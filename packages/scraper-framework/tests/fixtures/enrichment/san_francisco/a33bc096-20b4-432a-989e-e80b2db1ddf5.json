@@ -1,16 +1,14 @@
 {
   "ruling_text": "Having read and considered the pleadings, declarations, and other evidence submitted in this matter, the Court makes the following findings and orders:\n\n1) Petitioner Tracey Bolton's Request for Order (RFO) for exclusive custody, control, and possession of Wicket (aged 9.5) filed on August 5, 2025, is denied.\n2) The Court finds based upon the evidence submitted that it is in Wicket's best interest for Respondent Nathaniel Bolton to maintain full legal and physical custody pursuant to Family code section 2605(a) and 2605(b). Respondent is in the best position to monitor and ensure Wicket's long-term health and stability. Respondent shall be responsible for all costs and expenses related to Wicket's health, safety, and welfare.\n3) Beginning November 8, 2025, Petitioner shall be entitled to visitation every other weekend from Friday at 6:00 p.m. to Sunday at 6:00 p.m. Petitioner will also be allowed the right of first refusal for all vacations or business-related travel Respondent takes that exceeds 48 hours. Respondent shall provide 72 hours' notice to Petitioner of dates of travel and Petitioner will have 24 hours to confirm she will exercise the option to have Wicket stay with her during Respondent's travel. Respondent will be responsible for dropping off and picking Wicket up from the Petitioner's home or mutually agreed upon exchange location. Any additional visitation shall be by mutual agreement of the parties and memorialized in writing.\n4) Respondent shall notify Petitioner of any illness within 12 hours and if Wicket is taken to a veterinary hospital, shall also provide the name and location of the hospital.\n5) The custodial party shall provide death notification to the other party within 2 hours of Wicket's death. Wicket's ashes shall be equally divided and given to both Respondent and Petitioner. Respondent shall be solely responsible for any cremation and/or burial expenses.\n6) Petitioner's attorney shall prepare the Findings and Order After Hearing.\n7) Preparation of Order: If you are directed by the court to prepare the order after hearing – within 10 calendar days of the hearing you must either: (a) Serve the proposed order to the other party/counsel for approval, and follow the procedures set forth in CA Rules of Court, Rule 5.125(c), or (b) If the other party did not appear or the matter was uncontested, submit the proposed order after hearing directly to the court. Failure to submit the order after hearing within 10 days may allow the other party to prepare a proposed order and submit it to the court in accordance with CA Rules of Court, Rule 5.125(d).",
   "expected": {
-    "case_title": "Tracey Bolton v. Nathaniel Orson Bolton",
+    "case_title": null,
     "motion_type": "petition",
     "outcome": "denied",
     "parties": {
       "plaintiffs": [
         "Tracey Bolton"
       ],
-      "defendants": [
-        "Nathaniel Orson Bolton"
-      ]
+      "defendants": []
     }
   },
   "source_doc": "s3://judgemind-document-archive-dev/ca/san_francisco/superior_court/raw/2026/03/24/23e49898-94f2-5c8e-bc7b-8fd7a2f153ec.pdf",

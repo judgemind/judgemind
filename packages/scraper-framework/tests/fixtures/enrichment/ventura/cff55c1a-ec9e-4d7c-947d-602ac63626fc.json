@@ -1,16 +1,12 @@
 {
   "ruling_text": "SJHC's motion to strike is GRANTED, with leave to amend.",
   "expected": {
-    "case_title": "CECILIA FABIAN GONZALEZ, et al. vs DIGNITY HEALTH, et al.",
+    "case_title": null,
     "motion_type": "motion_to_strike",
     "outcome": "granted",
     "parties": {
-      "plaintiffs": [
-        "CECILIA FABIAN GONZALEZ"
-      ],
-      "defendants": [
-        "DIGNITY HEALTH"
-      ]
+      "plaintiffs": [],
+      "defendants": []
     }
   },
   "source_doc": "s3://judgemind-document-archive-dev/ca/ventura/superior_court/raw/2026/03/24/5968b1db-95f5-5094-b84f-0ef53a99f884.pdf",

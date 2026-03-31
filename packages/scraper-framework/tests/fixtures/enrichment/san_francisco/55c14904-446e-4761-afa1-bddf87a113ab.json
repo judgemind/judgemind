@@ -1,16 +1,12 @@
 {
   "ruling_text": "When a matter is pending in two California counties, the court first to acquire jurisdiction by service of process has the right to retain the case exclusively. On proper motion, the other action must be dismissed. (Mungia v. Superior Court (1964) 225 Cal.App.2d 280, 283). The Court finds that Los Angeles County first acquired jurisdiction over the parties with respect to the claims in their divorce matter. The Court finds good cause to dismiss the instant action. Father's request is granted.",
   "expected": {
-    "case_title": "County of San Francisco v. Kennethan Baird",
+    "case_title": null,
     "motion_type": "other",
     "outcome": "granted",
     "parties": {
-      "plaintiffs": [
-        "County of San Francisco"
-      ],
-      "defendants": [
-        "Kennethan Baird"
-      ]
+      "plaintiffs": [],
+      "defendants": []
     }
   },
   "source_doc": "s3://judgemind-document-archive-dev/ca/san_francisco/superior_court/raw/2026/03/17/7f1e75fc-eea6-5351-98cd-3a82461ccbd2.pdf",

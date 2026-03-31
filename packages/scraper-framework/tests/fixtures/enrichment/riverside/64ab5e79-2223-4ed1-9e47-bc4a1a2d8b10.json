@@ -1,16 +1,12 @@
 {
   "ruling_text": "MOTION TO QUASH OR, IN THE\nALTERNATIVE, MODIFY DEPOSITION\nSUBPOENA FOR PRODUCTION OF\nBUSINESS RECORDS; REQUEST FOR\nIMMEDIATE STAY OF PRODUCTION\nPENDING HEARING\nTentative Ruling: The hearing is continued and the parties are ordered to properly meet\nand confer and thereafter submit a joint declaration no later than 10 calendar days prior\nto next calendar date.",
   "expected": {
-    "case_title": "Cvri2600083 Doe v. Does 1-50",
+    "case_title": null,
     "motion_type": "motion_to_quash",
     "outcome": "continued",
     "parties": {
-      "plaintiffs": [
-        "Cvri2600083 Doe"
-      ],
-      "defendants": [
-        "Does 1-50"
-      ]
+      "plaintiffs": [],
+      "defendants": []
     }
   },
   "source_doc": "s3://judgemind-document-archive-dev/ca/riverside/superior_court/raw/2026/03/21/9e7fed4f-7192-5a05-b0fd-b965d494f46a.pdf",

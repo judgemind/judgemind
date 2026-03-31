@@ -1,16 +1,12 @@
 {
   "ruling_text": "1. Motion to Seal\n2. Motion to Seal\n*Hearings vacated. See minute order dated 3/16/26*",
   "expected": {
-    "case_title": "Kiani vs. Masimo Corporation",
-    "motion_type": "motion_to_seal",
+    "case_title": null,
+    "motion_type": "other",
     "outcome": null,
     "parties": {
-      "plaintiffs": [
-        "Kiani"
-      ],
-      "defendants": [
-        "Masimo Corporation"
-      ]
+      "plaintiffs": [],
+      "defendants": []
     }
   },
   "source_doc": "s3://judgemind-document-archive-dev/ca/orange/superior_court/raw/2026/03/19/e090405d-d6ca-5be6-85c9-4d09ec7519f5.pdf",

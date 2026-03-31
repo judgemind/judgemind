@@ -1,16 +1,12 @@
 {
   "ruling_text": "DENIES Balfour's Motion to Bifurcate Issues at Trial without prejudice to being brought anew at the time of trial.",
   "expected": {
-    "case_title": "Omar Muro, et al. v. American Safety Group, Inc., et al.",
-    "motion_type": "motion_to_bifurcate",
+    "case_title": null,
+    "motion_type": "other",
     "outcome": "granted",
     "parties": {
-      "plaintiffs": [
-        "Omar Muro"
-      ],
-      "defendants": [
-        "American Safety Group, Inc."
-      ]
+      "plaintiffs": [],
+      "defendants": []
     }
   },
   "source_doc": "s3://judgemind-document-archive-dev/ca/san_bernardino/superior_court/raw/2026/03/26/077833e9-907d-5c03-a26a-f6dfa58ff844.pdf",

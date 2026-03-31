@@ -1,16 +1,12 @@
 {
   "ruling_text": "MOTION TO BE RELIEVED AS\nCOUNSEL FOR JESSICA HUERTA\nTentative Ruling:\nGRANT",
   "expected": {
-    "case_title": "Cvsw2310278 Rambo v. Ford Motor Company",
+    "case_title": null,
     "motion_type": "motion_to_be_relieved_as_counsel",
     "outcome": "granted",
     "parties": {
-      "plaintiffs": [
-        "Cvsw2310278 Rambo"
-      ],
-      "defendants": [
-        "Ford Motor Company"
-      ]
+      "plaintiffs": [],
+      "defendants": []
     }
   },
   "source_doc": "s3://judgemind-document-archive-dev/ca/riverside/superior_court/raw/2026/03/07/fe2332be-34db-42ea-831f-e9878961c539.pdf",
