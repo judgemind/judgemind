@@ -59,6 +59,7 @@ from .db import (
     upsert_court,
 )
 from .extract import (
+    clean_case_title,
     extract_case_number,
     extract_case_title,
     extract_case_type_from_motion_type,
@@ -923,6 +924,67 @@ class IngestionWorker:
                     extra={"document_id": document_id, "case_number": extracted},
                 )
                 case_number = extracted
+
+        # ------------------------------------------------------------------
+        # Deterministic case_title enrichment (#2212)
+        # ------------------------------------------------------------------
+        # For multimodal events, the LLM-provided case_title from
+        # _extract_case_title_from_info can be messy (motion descriptions,
+        # case citations, multiple parties).  Apply deterministic cleanup:
+        #   1. Try extract_case_title(ruling_text) — fresh extraction
+        #      from the ruling text is the most reliable.
+        #   2. Try clean_case_title(case_title) — extractive cleanup of
+        #      the raw LLM title catches patterns that extract_case_title
+        #      may miss when ruling_text is sparse.
+        #   3. Keep the original only if neither produces a plausible
+        #      result.
+        if is_llm_extracted and ruling_text and case_title:
+            # Only override when the LLM title is implausible or the new
+            # title is shorter (i.e. cleaner — truncated junk removed).
+            llm_title_ok = is_plausible_case_title(case_title)
+
+            # Strategy 1: extract from ruling text (preferred — clean source).
+            text_title = extract_case_title(ruling_text)
+            if text_title and is_plausible_case_title(text_title):
+                # Override if the LLM title is bad OR the text extraction
+                # produced a shorter (cleaner) result.
+                if not llm_title_ok or len(text_title) <= len(case_title):
+                    if text_title != case_title:
+                        logger.info(
+                            "Deterministic case_title overrides LLM title (ruling_text)",
+                            extra={
+                                "document_id": document_id,
+                                "old_title": case_title[:80],
+                                "new_title": text_title[:80],
+                            },
+                        )
+                    case_title = text_title
+                    extraction_methods["case_title"] = "deterministic_ruling_text"
+            elif not llm_title_ok:
+                # Strategy 2: clean the raw LLM title (only when LLM
+                # title fails plausibility).
+                cleaned_title = clean_case_title(case_title)
+                if cleaned_title and is_plausible_case_title(cleaned_title):
+                    if cleaned_title != case_title:
+                        logger.info(
+                            "Deterministic case_title overrides LLM title (cleaned)",
+                            extra={
+                                "document_id": document_id,
+                                "old_title": case_title[:80],
+                                "new_title": cleaned_title[:80],
+                            },
+                        )
+                    case_title = cleaned_title
+                    extraction_methods["case_title"] = "deterministic_cleaned"
+                # else: keep original LLM title as-is (best effort).
+        elif is_llm_extracted and case_title and not ruling_text:
+            # No ruling text available — try cleaning the raw LLM title
+            # only if it's implausible.
+            if not is_plausible_case_title(case_title):
+                cleaned_title = clean_case_title(case_title)
+                if cleaned_title and is_plausible_case_title(cleaned_title):
+                    case_title = cleaned_title
+                    extraction_methods["case_title"] = "deterministic_cleaned"
 
         # Fallback case_title extraction (regex)
         if not case_title and ruling_text:

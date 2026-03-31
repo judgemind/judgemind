@@ -509,9 +509,12 @@ class TestLlmExtractedFlag:
 
         worker.process_event(event)
 
-        # None of the regex extractors should have been called.
+        # Regex extractors should NOT have been called, EXCEPT:
+        # extract_case_title is now called by the deterministic case_title
+        # enrichment (#2212) which always runs for _llm_extracted events
+        # to clean up messy LLM-provided titles.
         mock_extract_judge.assert_not_called()
-        mock_extract_title.assert_not_called()
+        # mock_extract_title IS called by deterministic enrichment (#2212)
         mock_extract_number.assert_not_called()
         mock_extract_motion.assert_not_called()
         mock_extract_outcome.assert_not_called()

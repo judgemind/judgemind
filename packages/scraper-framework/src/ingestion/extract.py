@@ -2150,6 +2150,338 @@ def is_plausible_case_title(title: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Deterministic case_title cleanup (#2212)
+# ---------------------------------------------------------------------------
+
+# Case citation pattern: "(YYYY) NNN Cal.App..." or "(YYYY) NNN Cal...."
+_CASE_CITATION_RE = re.compile(
+    r"\s*\(?\d{4}\)?\s+\d+\s+Cal\.(?:App)?",
+    re.IGNORECASE,
+)
+
+# Case number pattern embedded in a title — Riverside (CVPS..., CVME...),
+# OC (30-2024-...), SB (CIVSB...), LA (24STCV...), generic (MSC21-...).
+_EMBEDDED_CASE_NUMBER_RE = re.compile(
+    r"\b(?:"
+    r"CV[A-Z]{2,4}\d{5,}"
+    r"|CIV[A-Z]{2}\d{5,}"
+    r"|\d{2,4}-\d{5,}"
+    r"|\d{2}[A-Z]{2}CV\d{5,}"
+    r"|[A-Z]{3}\d{2}-\d{4,}"
+    r"|\d{2}[A-Z]{4}\d{4,}"
+    r")\b",
+)
+
+# Motion / procedural keywords that should terminate a case title.
+_TITLE_TERMINATOR_RE = re.compile(
+    r"\b(?:"
+    r"REQUEST\s+FOR|HEARING\s+ON|MOTION\s+(?:TO|FOR|IN|RE)"
+    r"|PETITION\s+(?:TO|FOR|OF|RE)"
+    r"|DEMURRER|ORDER\s+(?:TO|RE|ON)"
+    r"|FORM\s+INTERROGATOR"
+    r"|SPECIAL\s+INTERROGATOR"
+    r"|REQUEST\s+FOR\s+(?:PRODUCTION|ADMISSION)"
+    r"|NOTICE\s+OF"
+    r"|by\s+and\s+through\s+(?:his|her|its|their)\s+Guardian"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def clean_case_title(raw_title: str) -> str | None:
+    """Clean a raw LLM-extracted case_title using extractive parsing (#2212).
+
+    Takes a messy title that may contain motion descriptions, case citations,
+    multiple parties from different cases, or embedded case numbers, and
+    extracts just the first ``Plaintiff v. Defendant`` (or probate-style)
+    title.
+
+    Strategy:
+      1. Find the first ``v./vs./V.`` separator.
+      2. Walk backward from the separator for the plaintiff — stop at case
+         numbers, start of string, or known delimiters.
+      3. Walk forward from the separator for the defendant — stop at the
+         next case number, second ``v./vs.``, motion keyword, case citation,
+         or end of reasonable name.
+      4. For probate titles (no ``v.``): extract
+         ``IN THE MATTER OF: {name}``, ``ESTATE OF: {name}``,
+         ``CONSERVATORSHIP OF: {name}``, ``GUARDIANSHIP OF: {name}``
+         up to the next pattern or case number.
+      5. Normalize casing and clean up artifacts.
+
+    Returns the cleaned title, or ``None`` if the raw title cannot be
+    meaningfully cleaned (e.g., empty or contains only case numbers).
+    """
+    if not raw_title or not raw_title.strip():
+        return None
+
+    # Collapse whitespace and newlines.
+    cleaned = " ".join(raw_title.split())
+
+    # --- Probate / estate / conservatorship / guardianship titles ---
+    probate_m = re.match(
+        r"(?:IN\s+(?:THE\s+)?MATTER\s+OF"
+        r"|ESTATE\s+OF"
+        r"|CONSERVATORSHIP\s+OF"
+        r"|GUARDIANSHIP\s+OF"
+        r")\s*:?\s*",
+        cleaned,
+        re.IGNORECASE,
+    )
+    if probate_m:
+        # Extract the name portion after the probate keyword.
+        prefix = cleaned[: probate_m.end()]
+        remainder = cleaned[probate_m.end() :]
+        # Truncate at next case number, another probate keyword, or
+        # motion keyword.
+        end_pos = len(remainder)
+        for pattern in [_EMBEDDED_CASE_NUMBER_RE, _TITLE_TERMINATOR_RE]:
+            m = pattern.search(remainder)
+            if m and m.start() < end_pos:
+                end_pos = m.start()
+        # Also truncate at a second probate keyword.  Skip matches that
+        # look like they are part of the current title's subject
+        # (e.g., "IN THE MATTER OF: The Estate of Williams" should not
+        # truncate at "Estate of" because it's describing the subject).
+        # A genuine second case starts after at least one name token.
+        for second_probate in re.finditer(
+            r"\b(?:CONSERVATORSHIP|ESTATE|GUARDIANSHIP|IN\s+THE\s+MATTER)\s+OF\b",
+            remainder,
+            re.IGNORECASE,
+        ):
+            # Only truncate if there's at least one name word before
+            # this match (not just "The" or "of").
+            before = remainder[: second_probate.start()].strip()
+            # Require at least one word that is not a function word
+            name_words = [
+                w for w in before.split() if w.lower() not in ("the", "of", "a", "an", "and")
+            ]
+            if name_words and second_probate.start() < end_pos:
+                end_pos = second_probate.start()
+                break
+        name = remainder[:end_pos].strip().rstrip(".,;: ")
+        if name:
+            result = prefix.strip() + " " + name
+            result = result.strip()
+            if len(result) <= _MAX_TITLE_LENGTH:
+                return result
+            # Hard-truncate at a word boundary if still too long.
+            space_idx = result.rfind(" ", 0, _MAX_TITLE_LENGTH)
+            if space_idx > 20:
+                return result[:space_idx].rstrip(".,;: ")
+        return None
+
+    # --- Adversarial titles (v./vs.) ---
+    vs_match = re.search(r"\s+[Vv][Ss]?\.?\s+", cleaned)
+    if vs_match is None:
+        # No "v." separator — return None (can't extract a proper title).
+        return None
+
+    # Walk backward for the plaintiff.
+    before_vs = cleaned[: vs_match.start()]
+    # Find where the plaintiff name starts — strip leading case numbers,
+    # court names, and other non-name content.
+    plaintiff_start = 0
+    # Trim leading case numbers.
+    leading_cn = _EMBEDDED_CASE_NUMBER_RE.match(before_vs)
+    if leading_cn:
+        plaintiff_start = leading_cn.end()
+    plaintiff = before_vs[plaintiff_start:].strip()
+
+    # Walk forward for the defendant.
+    after_vs = cleaned[vs_match.end() :]
+
+    # Find where the defendant name ends — truncate at:
+    # 1. A second "v./vs." (multiple cases jammed together)
+    # 2. An embedded case number
+    # 3. A motion keyword / procedural text
+    # 4. A case citation
+    defendant_end = len(after_vs)
+
+    # Check for second vs. separator (multiple cases jammed together).
+    second_vs = re.search(r"\s+[Vv][Ss]?\.?\s+", after_vs)
+    if second_vs:
+        # The text before the second "vs." contains the first defendant
+        # AND the second case's plaintiff.  We need to find where the
+        # first defendant ends and the second plaintiff begins.
+        pre_second_vs = after_vs[: second_vs.start()]
+        # Strategy 1: entity ending (LLC, Inc., etc.)
+        name_boundary = _find_second_case_boundary(pre_second_vs)
+        if name_boundary is not None and name_boundary < defendant_end:
+            defendant_end = name_boundary
+        else:
+            # Strategy 2: walk backward from the second "vs." to strip
+            # the second plaintiff's name.  Find the last sequence of
+            # capitalized words before the second "vs." that looks like
+            # a person's name (2+ words starting with uppercase).
+            second_plaintiff_start = _find_name_start_before_vs(pre_second_vs)
+            if (
+                second_plaintiff_start is not None
+                and second_plaintiff_start < defendant_end
+                and second_plaintiff_start > 3  # keep at least something
+            ):
+                defendant_end = second_plaintiff_start
+
+    # Check for embedded case number.
+    cn_match = _EMBEDDED_CASE_NUMBER_RE.search(after_vs)
+    if cn_match and cn_match.start() < defendant_end:
+        defendant_end = cn_match.start()
+
+    # Check for motion/procedural keyword.
+    term_match = _TITLE_TERMINATOR_RE.search(after_vs)
+    if term_match and term_match.start() < defendant_end:
+        defendant_end = term_match.start()
+
+    # Check for case citation.
+    cite_match = _CASE_CITATION_RE.search(after_vs)
+    if cite_match and cite_match.start() < defendant_end:
+        defendant_end = cite_match.start()
+
+    defendant = after_vs[:defendant_end].strip().rstrip(".,;: ")
+
+    if not plaintiff or not defendant:
+        return None
+
+    # Detect all-caps before normalizing.
+    plaintiff_upper = plaintiff == plaintiff.upper() and plaintiff.strip()
+    defendant_upper = defendant == defendant.upper() and defendant.strip()
+    is_all_caps = plaintiff_upper and defendant_upper
+
+    # Normalize the "v." separator.
+    title = f"{plaintiff} v. {defendant}"
+
+    # Title-case if all-caps.
+    if is_all_caps:
+        parts = title.split(" v. ")
+        title = " v. ".join(p.title() for p in parts)
+
+    # Clean trailing punctuation.
+    title = title.rstrip(".,;: ")
+
+    # Strip trailing "et al" that may have been left with trailing junk.
+    title = re.sub(r"\s+et\s+al\.?\s*$", " et al.", title, flags=re.IGNORECASE)
+
+    # Validate length.
+    if len(title) > _MAX_TITLE_LENGTH:
+        # Try truncating defendant at a word boundary.
+        parts = title.split(" v. ", 1)
+        if len(parts) == 2:
+            max_def_len = _MAX_TITLE_LENGTH - len(parts[0]) - 4  # " v. "
+            if max_def_len > 10:
+                space_idx = parts[1].rfind(" ", 0, max_def_len)
+                if space_idx > 5:
+                    title = parts[0] + " v. " + parts[1][:space_idx].rstrip(".,;: ")
+        if len(title) > _MAX_TITLE_LENGTH:
+            return None
+
+    if len(title) < _MIN_TITLE_LENGTH:
+        return None
+
+    return title
+
+
+def _find_second_case_boundary(text: str) -> int | None:
+    """Find where a second case's party name starts within defendant text.
+
+    When multiple cases are jammed together like:
+    ``GENERAL MOTORS LLC Dustin A Brazil``
+    This finds the position where "Dustin A Brazil" starts (the second
+    case's plaintiff).
+
+    Heuristic: look for the last sequence of capitalized words that
+    appears to be a person's name (2+ capitalized words in a row) before
+    the text ends.  If we find such a sequence and there's preceding text
+    that looks like a complete party name (LLC, Inc., etc. or just a
+    name), return the start of the second name.
+    """
+    if not text.strip():
+        return None
+
+    # Split into words.
+    words = text.split()
+    if len(words) <= 2:
+        return None
+
+    # Look for a transition point where a new party name starts.
+    # Indicators of a name boundary:
+    # - Previous word ends an entity (LLC, Inc., Corp., etc.) or "al."
+    # - There's a case number before the new name
+    entity_endings = {
+        "LLC",
+        "INC",
+        "INC.",
+        "CORP",
+        "CORP.",
+        "CORPORATION",
+        "LTD",
+        "LTD.",
+        "LP",
+        "L.P.",
+        "CO",
+        "CO.",
+        "AL.",
+        "AL",
+    }
+
+    # Reconstruct positions for each word in the original text.
+    positions: list[int] = []
+    idx = 0
+    for word in words:
+        pos = text.index(word, idx)
+        positions.append(pos)
+        idx = pos + len(word)
+
+    for i in range(1, len(words)):
+        prev_word_upper = words[i - 1].upper().rstrip(",.")
+        if prev_word_upper in entity_endings:
+            return positions[i]
+
+    return None
+
+
+def _find_name_start_before_vs(text: str) -> int | None:
+    """Find where the second case's plaintiff name starts in text before "vs.".
+
+    Given text like ``LAKERIDGE ATHLETIC CLUB Nazir``, this finds the position
+    where ``Nazir`` starts.  It works by walking backward from the end of the
+    text to find where a new name begins — indicated by a transition from
+    all-caps words to mixed-case, or by finding a name-like word sequence
+    at the end that is clearly separate from the preceding entity name.
+
+    Returns the character position where the second plaintiff's name starts,
+    or ``None`` if no clear boundary is found.
+    """
+    if not text.strip():
+        return None
+
+    words = text.split()
+    if len(words) <= 2:
+        return None
+
+    # Reconstruct positions for each word in the original text.
+    positions: list[int] = []
+    idx = 0
+    for word in words:
+        pos = text.index(word, idx)
+        positions.append(pos)
+        idx = pos + len(word)
+
+    # Look for casing transition: preceding words all-caps, trailing words
+    # mixed-case (e.g. "LAKERIDGE ATHLETIC CLUB Nazir").
+    for i in range(len(words) - 1, 0, -1):
+        word = words[i].rstrip(",.")
+        prev_word = words[i - 1].rstrip(",.")
+        # Transition: previous word is all-caps, current is not
+        if prev_word == prev_word.upper() and word != word.upper() and word[0].isupper():
+            # Verify that ALL preceding words are uppercase
+            all_upper = all(w.rstrip(",.") == w.rstrip(",.").upper() for w in words[:i])
+            if all_upper:
+                return positions[i]
+
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Hearing date extraction
 # ---------------------------------------------------------------------------
 
