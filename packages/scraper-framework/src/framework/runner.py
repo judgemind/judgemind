@@ -251,6 +251,8 @@ def _build_registry() -> list[tuple[str, type, callable]]:
     from courts.ca.sd_pipeline import default_config as sd_pipeline_config
     from courts.ca.sd_tentatives import SDTentativeRulingsScraper
     from courts.ca.sd_tentatives import default_config as sd_config
+    from courts.ca.sf_civil_tentatives import SFCivilTentativeRulingsScraper
+    from courts.ca.sf_civil_tentatives import default_config as sf_civil_config
     from courts.ca.sf_tentatives import SFTentativeRulingsScraper
     from courts.ca.sf_tentatives import default_config as sf_config
     from courts.ca.ventura_tentatives import VenturaTentativeRulingsScraper
@@ -273,6 +275,7 @@ def _build_registry() -> list[tuple[str, type, callable]]:
             ("ca-sd-calendar", SDCalendarScraper, sd_cal_config),
             ("ca-sd-pipeline", SDPipelineScraper, sd_pipeline_config),
             ("ca-sd-tentatives", SDTentativeRulingsScraper, sd_config),
+            ("ca-sf-tentatives-civil", SFCivilTentativeRulingsScraper, sf_civil_config),
             ("ca-sf-tentatives-family-law", SFTentativeRulingsScraper, sf_config),
             ("ca-ventura-tentatives", VenturaTentativeRulingsScraper, ventura_config),
             ("federal-courtlistener-opinions", CourtListenerScraper, cl_config),
@@ -400,13 +403,34 @@ def run_scrapers(scraper_ids: list[str] | None = None) -> int:
                     error=str(exc),
                 )
 
+        # Pre-fetch the SF department-to-judge mapping for the civil scraper.
+        sf_dept_judge_map: dict[str, str] = {}
+        sf_civil_scraper_ids = {"ca-sf-tentatives-civil"}
+        if any(e[0] in sf_civil_scraper_ids for e in entries):
+            try:
+                from courts.ca.sf_dept_judges import (
+                    fetch_department_judge_mapping as fetch_sf_mapping,
+                )
+
+                sf_dept_judge_map = fetch_sf_mapping()
+                logger.info(
+                    "Loaded SF dept-judge mapping",
+                    departments=len(sf_dept_judge_map),
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Failed to fetch SF dept-judge mapping — judge names from "
+                    "department lookup will be unavailable this run",
+                    error=str(exc),
+                )
+
         for scraper_id, scraper_cls, config_factory in entries:
             log = logger.bind(scraper_id=scraper_id)
             log.info("Running scraper")
 
             config: ScraperConfig = config_factory(s3_bucket=bucket)
 
-            # Pass dept-judge mapping to LA, Riverside, and Ventura scrapers
+            # Pass dept-judge mapping to LA, Riverside, Ventura, and SF scrapers
             extra_kwargs: dict[str, object] = {}
             if scraper_id in la_scraper_ids and la_dept_judge_map:
                 extra_kwargs["dept_judge_map"] = la_dept_judge_map
@@ -414,6 +438,8 @@ def run_scrapers(scraper_ids: list[str] | None = None) -> int:
                 extra_kwargs["dept_judge_map"] = riv_dept_judge_map
             if scraper_id in ventura_scraper_ids and ventura_dept_judge_map:
                 extra_kwargs["dept_judge_map"] = ventura_dept_judge_map
+            if scraper_id in sf_civil_scraper_ids and sf_dept_judge_map:
+                extra_kwargs["dept_judge_map"] = sf_dept_judge_map
 
             scraper = scraper_cls(
                 config=config, archiver=archiver, event_bus=event_bus, **extra_kwargs
