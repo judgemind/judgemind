@@ -4361,3 +4361,130 @@ def test_process_event_falls_back_to_llm_when_no_scraper_html(
 
     # LLM format_ruling_text should be called
     mock_format.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Deterministic case_title enrichment (#2212)
+# ---------------------------------------------------------------------------
+
+
+@patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
+@patch("ingestion.worker.psycopg")
+def test_deterministic_case_title_overrides_messy_llm_title(
+    mock_psycopg: MagicMock,
+    mock_resolve_judge: MagicMock,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """When _llm_extracted is True and case_title is messy, extract_case_title
+    from ruling_text should override the raw LLM title (#2212)."""
+    worker, os_mock = _make_worker()
+
+    mock_conn, mock_cur = _make_mock_conn()
+    mock_psycopg.connect.return_value = mock_conn
+    mock_cur.rowcount = 1
+    mock_cur.fetchone.side_effect = [
+        ("court-uuid-1",),  # upsert_court
+        ("case-uuid-1",),  # upsert_case
+        (True,),  # insert_document
+        # Party upserts for extracted parties
+        ("party-uuid-1",),
+        ("party-uuid-2",),
+    ]
+    mock_cur.fetchall.return_value = []
+    mock_cur.nextset.side_effect = [True, False]
+
+    event = _make_event(
+        _llm_extracted=True,
+        _split_processed=True,
+        case_title=("SMITH VS. JONES REQUEST FOR FORM INTERROGATORY NO. 12.1"),
+        ruling_text=(
+            "Smith v. Jones\nCase Number: 23STCV12345\nThe motion for summary judgment is GRANTED."
+        ),
+    )
+
+    import logging
+
+    with caplog.at_level(logging.INFO):
+        worker.process_event(event)
+
+    # The deterministic extractor should have cleaned the title
+    assert any("Deterministic case_title overrides" in r.message for r in caplog.records)
+
+
+@patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
+@patch("ingestion.worker.psycopg")
+def test_deterministic_case_title_cleans_implausible_raw_title(
+    mock_psycopg: MagicMock,
+    mock_resolve_judge: MagicMock,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """When the LLM title is implausible and extract_case_title(ruling_text)
+    yields nothing, clean_case_title is used as fallback (#2212)."""
+    worker, os_mock = _make_worker()
+
+    mock_conn, mock_cur = _make_mock_conn()
+    mock_psycopg.connect.return_value = mock_conn
+    mock_cur.rowcount = 1
+    mock_cur.fetchone.side_effect = [
+        ("court-uuid-1",),  # upsert_court
+        ("case-uuid-1",),  # upsert_case
+        (True,),  # insert_document
+        # Party upserts
+        ("party-uuid-1",),
+        ("party-uuid-2",),
+    ]
+    mock_cur.fetchall.return_value = []
+    mock_cur.nextset.side_effect = [True, False]
+
+    # Implausible LLM title (contains MOTION keyword, fails is_plausible)
+    event = _make_event(
+        _llm_extracted=True,
+        _split_processed=True,
+        case_title="TAYLOR VS. AMAZON MOTION TO COMPEL Discovery Responses",
+        ruling_text="The motion is GRANTED.",
+    )
+
+    import logging
+
+    with caplog.at_level(logging.INFO):
+        worker.process_event(event)
+
+    # The clean_case_title should have removed the MOTION keyword
+    assert any("Deterministic case_title overrides" in r.message for r in caplog.records)
+
+
+@patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
+@patch("ingestion.worker.psycopg")
+def test_deterministic_case_title_keeps_good_llm_title(
+    mock_psycopg: MagicMock,
+    mock_resolve_judge: MagicMock,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """When the LLM title is already clean and plausible, it is preserved (#2212)."""
+    worker, os_mock = _make_worker()
+
+    mock_conn, mock_cur = _make_mock_conn()
+    mock_psycopg.connect.return_value = mock_conn
+    mock_cur.rowcount = 1
+    mock_cur.fetchone.side_effect = [
+        ("court-uuid-1",),  # upsert_court
+        ("case-uuid-1",),  # upsert_case
+        (True,),  # insert_document
+    ]
+
+    # Good LLM title -- should NOT be overridden.
+    # Use a title that won't trigger party extraction (no "v.").
+    event = _make_event(
+        _llm_extracted=True,
+        _split_processed=True,
+        case_title="In the Matter of the Estate of Williams",
+        ruling_text="The motion is GRANTED.",
+    )
+
+    import logging
+
+    with caplog.at_level(logging.INFO):
+        worker.process_event(event)
+
+    # No override should have happened
+    assert not any("Deterministic case_title overrides" in r.message for r in caplog.records)

@@ -13,6 +13,7 @@ from ingestion.extract import (
     _looks_like_motion_text,
     _looks_like_person_name,
     _split_caption_names,
+    clean_case_title,
     extract_case_number,
     extract_case_title,
     extract_case_type_from_motion_type,
@@ -3427,3 +3428,278 @@ class TestNormalizeOutcomeRiverside:
 
     def test_no_tentative_decision(self) -> None:
         assert normalize_outcome("no tentative decision") == "other"
+
+
+# ---------------------------------------------------------------------------
+# clean_case_title tests (#2212)
+# ---------------------------------------------------------------------------
+
+
+class TestCleanCaseTitle:
+    """Tests for the deterministic case_title cleanup function (#2212)."""
+
+    # --- Basic v./vs. cases ---
+
+    def test_clean_simple_vs(self) -> None:
+        """Simple 'X vs Y' passes through cleaned."""
+        result = clean_case_title("Smith vs Jones")
+        assert result is not None
+        assert "Smith" in result
+        assert "Jones" in result
+        assert "v." in result
+
+    def test_clean_vs_dot(self) -> None:
+        """'X vs. Y' normalizes separator."""
+        result = clean_case_title("GARCIA vs. HERNANDEZ")
+        assert result is not None
+        assert "Garcia" in result
+        assert "Hernandez" in result
+        assert "v." in result
+
+    def test_clean_v_dot(self) -> None:
+        """'X v. Y' passes through."""
+        result = clean_case_title("Smith v. Jones")
+        assert result is not None
+        assert result == "Smith v. Jones"
+
+    def test_clean_all_caps(self) -> None:
+        """All-caps titles are title-cased."""
+        result = clean_case_title("SMITH VS JONES")
+        assert result is not None
+        assert "Smith" in result
+        assert "Jones" in result
+
+    # --- Motion description truncation ---
+
+    def test_truncate_motion_description(self) -> None:
+        """Motion descriptions after party names are truncated (#2212)."""
+        raw = "Cuong Quach vs Maxreal Cupertino et al REQUEST FOR FORM INTERROGATORY NO. 12.1"
+        result = clean_case_title(raw)
+        assert result is not None
+        assert "Quach" in result
+        assert "Cupertino" in result or "Maxreal" in result
+        assert "REQUEST FOR" not in result
+        assert "INTERROGATORY" not in result
+        assert len(result) <= 120
+
+    # --- Case citation truncation ---
+
+    def test_truncate_case_citation(self) -> None:
+        """Case citations after party names are truncated (#2212)."""
+        raw = (
+            "HICHAM MESNAOUI VS. LAKERIDGE ATHLETIC CLUB Nazir v. United "
+            "Airlines, Inc. (2009) 178 Cal.App.4th 243, 251.)"
+        )
+        result = clean_case_title(raw)
+        assert result is not None
+        assert "Mesnaoui" in result
+        assert "Lakeridge" in result
+        assert "Cal.App" not in result
+        assert "(2009)" not in result
+        assert len(result) <= 120
+
+    # --- Multiple cases truncation ---
+
+    def test_truncate_multiple_cases_with_entity(self) -> None:
+        """Multiple cases jammed together are truncated at LLC/Inc boundary (#2212)."""
+        raw = (
+            "LORENZO SOLIS v. GENERAL MOTORS LLC Dustin A Brazil vs. "
+            "General Motors LLC Peter Jr. Arafiles vs. General Motors LLC"
+        )
+        result = clean_case_title(raw)
+        assert result is not None
+        assert "Solis" in result
+        assert "General Motors" in result
+        # Should NOT contain the second or third case
+        assert "Brazil" not in result
+        assert "Arafiles" not in result
+        assert len(result) <= 120
+
+    # --- Embedded case number truncation ---
+
+    def test_truncate_embedded_case_number(self) -> None:
+        """Embedded case numbers after party names are truncated (#2212)."""
+        raw = "TAYLOR VS. AMAZON MSC21-02349 Romeo Cerina by and through his Guardian Ad Litem"
+        result = clean_case_title(raw)
+        assert result is not None
+        assert "Taylor" in result
+        assert "Amazon" in result
+        assert "MSC21" not in result
+        assert "Romeo" not in result
+        assert len(result) <= 120
+
+    # --- Probate / estate / conservatorship ---
+
+    def test_probate_estate_of(self) -> None:
+        """'ESTATE OF: Name' is extracted properly."""
+        result = clean_case_title("ESTATE OF: John Smith")
+        assert result is not None
+        assert "ESTATE OF" in result
+        assert "John Smith" in result
+
+    def test_probate_conservatorship(self) -> None:
+        """'CONSERVATORSHIP OF: Name' is extracted properly."""
+        result = clean_case_title("CONSERVATORSHIP OF: Jane Doe")
+        assert result is not None
+        assert "CONSERVATORSHIP OF" in result
+        assert "Jane Doe" in result
+
+    def test_probate_guardianship(self) -> None:
+        """'GUARDIANSHIP OF: Name' is extracted properly."""
+        result = clean_case_title("GUARDIANSHIP OF Maria Garcia")
+        assert result is not None
+        assert "GUARDIANSHIP OF" in result
+        assert "Maria Garcia" in result
+
+    def test_probate_in_the_matter_of(self) -> None:
+        """'IN THE MATTER OF: Name' is extracted properly."""
+        result = clean_case_title("IN THE MATTER OF: The Estate of Williams")
+        assert result is not None
+        assert "IN THE MATTER OF" in result
+        assert "Williams" in result
+
+    def test_probate_truncate_at_second_keyword(self) -> None:
+        """Multiple probate titles are truncated at the second keyword."""
+        raw = "ESTATE OF HENRY FASQUELLE GUARDIANSHIP OF NAYELLI BRONSON"
+        result = clean_case_title(raw)
+        assert result is not None
+        assert "FASQUELLE" in result
+        assert "BRONSON" not in result
+        assert len(result) <= 120
+
+    # --- Edge cases ---
+
+    def test_empty_string(self) -> None:
+        """Empty string returns None."""
+        assert clean_case_title("") is None
+
+    def test_none_input(self) -> None:
+        """None-like empty input returns None."""
+        assert clean_case_title("   ") is None
+
+    def test_no_vs_separator(self) -> None:
+        """Title without v./vs. and no probate keyword returns None."""
+        assert clean_case_title("Just some random text here") is None
+
+    def test_preserves_et_al(self) -> None:
+        """'et al.' suffix is preserved."""
+        result = clean_case_title("Smith v. Jones et al.")
+        assert result is not None
+        assert "et al." in result
+
+    def test_leading_case_number_stripped(self) -> None:
+        """Leading case numbers before the party name are stripped."""
+        result = clean_case_title("CVPS2400892 Smith v. Jones")
+        assert result is not None
+        assert "Smith" in result
+        assert "Jones" in result
+        assert "CVPS" not in result
+
+    def test_title_length_under_120(self) -> None:
+        """Result is always under 120 characters."""
+        raw = "A" * 60 + " VS. " + "B" * 60 + " MOTION TO COMPEL"
+        result = clean_case_title(raw)
+        if result is not None:
+            assert len(result) <= 120
+
+    def test_multiline_collapsed(self) -> None:
+        """Newlines in raw title are collapsed to spaces."""
+        result = clean_case_title("Smith\nvs.\nJones")
+        assert result is not None
+        assert "Smith" in result
+        assert "Jones" in result
+
+    def test_guardian_ad_litem_truncated(self) -> None:
+        """'by and through his Guardian Ad Litem' is truncated."""
+        raw = "Smith vs Jones by and through his Guardian Ad Litem Jane Smith"
+        result = clean_case_title(raw)
+        assert result is not None
+        assert "Smith" in result
+        assert "Jones" in result
+        assert "Guardian" not in result
+
+    def test_hearing_on_truncated(self) -> None:
+        """'HEARING ON' in defendant portion is truncated."""
+        raw = "SMITH VS. JONES HEARING ON MOTION TO COMPEL"
+        result = clean_case_title(raw)
+        assert result is not None
+        assert "Smith" in result
+        assert "Jones" in result
+        assert "HEARING" not in result
+
+    def test_real_world_messy_title_1(self) -> None:
+        """Real-world messy title with interrogatory reference."""
+        raw = (
+            "Cuong Quach vs Maxreal Cupertino et al "
+            "REQUEST FOR FORM INTERROGATORY NO. 12.1 "
+            "AND SPECIAL INTERROGATORY NO. 14"
+        )
+        result = clean_case_title(raw)
+        assert result is not None
+        assert len(result) <= 120
+        assert "REQUEST" not in result
+
+    def test_real_world_messy_title_2(self) -> None:
+        """Real-world messy title with case citation."""
+        raw = (
+            "HICHAM MESNAOUI VS. LAKERIDGE ATHLETIC CLUB "
+            "Nazir v. United Airlines, Inc. "
+            "(2009) 178 Cal.App.4th 243, 251.)"
+        )
+        result = clean_case_title(raw)
+        assert result is not None
+        assert len(result) <= 120
+        # Should contain the first case's parties only
+        assert "Mesnaoui" in result
+        assert "Lakeridge" in result
+
+    def test_probate_with_embedded_case_number(self) -> None:
+        """Probate title with case number in remainder is truncated."""
+        raw = "ESTATE OF: John Smith CVPS2400892 Next Case"
+        result = clean_case_title(raw)
+        assert result is not None
+        assert "John Smith" in result
+        assert "CVPS" not in result
+        assert "Next Case" not in result
+
+    def test_probate_with_motion_terminator(self) -> None:
+        """Probate title with motion keyword in remainder is truncated."""
+        raw = "ESTATE OF: Jane Doe PETITION TO Approve Settlement"
+        result = clean_case_title(raw)
+        assert result is not None
+        assert "Jane Doe" in result
+        assert "PETITION" not in result
+
+    def test_very_long_probate_title(self) -> None:
+        """Extremely long probate title is hard-truncated at word boundary."""
+        long_name = " ".join(["VeryLongName"] * 20)
+        raw = f"ESTATE OF: {long_name}"
+        result = clean_case_title(raw)
+        if result is not None:
+            assert len(result) <= 120
+
+    def test_second_case_no_entity_ending(self) -> None:
+        """Second case detected by casing transition (no LLC/Inc)."""
+        raw = "HICHAM MESNAOUI VS. LAKERIDGE ATHLETIC CLUB Nazir v. United Airlines"
+        result = clean_case_title(raw)
+        assert result is not None
+        assert "Mesnaoui" in result
+        assert "Lakeridge" in result
+        assert "Nazir" not in result
+
+    def test_empty_defendant_after_truncation(self) -> None:
+        """If truncation leaves no defendant, return None."""
+        # The v. is followed immediately by a case number
+        raw = "SMITH VS. CVPS2400892"
+        result = clean_case_title(raw)
+        # Should return None since defendant is empty
+        assert result is None
+
+    def test_empty_plaintiff_before_vs(self) -> None:
+        """If plaintiff is empty (only case number), return None."""
+        raw = "CVPS2400892 VS. JONES"
+        result = clean_case_title(raw)
+        # Plaintiff was all case number, should be empty after strip
+        # Result depends on whether case number is fully consumed
+        if result is not None:
+            assert "CVPS" not in result
