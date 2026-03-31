@@ -10,5 +10,6 @@
     }
   },
   "source_doc": "s3://judgemind-document-archive-dev/ca/orange/superior_court/raw/2026/03/17/3f11b33b-4540-57ce-9aff-92040d12d3b0.pdf",
-  "notes": "Non-adversarial case - no plaintiff/defendant parties"
+  "notes": "Non-adversarial case - no plaintiff/defendant parties",
+  "case_title_in_text": false
 }

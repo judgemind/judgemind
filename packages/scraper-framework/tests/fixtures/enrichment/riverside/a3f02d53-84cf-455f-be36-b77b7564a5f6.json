@@ -10,5 +10,6 @@
     }
   },
   "source_doc": "s3://judgemind-document-archive-dev/ca/riverside/superior_court/raw/2026/03/19/1cc7e4db-0e9b-597f-9b1c-0de9252ad934.pdf",
-  "notes": "Non-adversarial case - no plaintiff/defendant parties"
+  "notes": "Non-adversarial case - no plaintiff/defendant parties",
+  "case_title_in_text": false
 }

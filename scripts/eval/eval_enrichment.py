@@ -66,6 +66,10 @@ def load_fixtures(
     - ``source_doc``: optional S3 URI for provenance
     - ``notes``: optional notes
     - ``acceptable_alternatives``: optional dict of field -> list[str]
+    - ``case_title_in_text``: bool indicating if case title info is present
+      in the ruling text (default True).  When False, case_title and parties
+      scoring are skipped because those values cannot be extracted from the
+      ruling text alone.
     """
     fixtures: list[dict] = []
 
@@ -92,6 +96,7 @@ def load_fixtures(
                         "source_doc": data.get("source_doc", ""),
                         "notes": data.get("notes", ""),
                         "acceptable_alternatives": data.get("acceptable_alternatives"),
+                        "case_title_in_text": data.get("case_title_in_text", True),
                     }
                 )
             except (json.JSONDecodeError, OSError) as e:
@@ -216,10 +221,14 @@ def score_results(
     # Build lookups by fixture_id
     expected_by_id: dict[str, dict] = {}
     alternatives_by_id: dict[str, dict | None] = {}
+    title_in_text_by_id: dict[str, bool] = {}
     for fixture in fixtures:
         expected_by_id[fixture["fixture_id"]] = fixture["expected"]
         alternatives_by_id[fixture["fixture_id"]] = fixture.get(
             "acceptable_alternatives"
+        )
+        title_in_text_by_id[fixture["fixture_id"]] = fixture.get(
+            "case_title_in_text", True
         )
 
     fixture_scores: list[FixtureScore] = []
@@ -230,6 +239,7 @@ def score_results(
         expected = expected_by_id.get(fixture_id, {})
         alternatives = alternatives_by_id.get(fixture_id)
         extraction = result.get("extraction_result")
+        case_title_in_text = title_in_text_by_id.get(fixture_id, True)
 
         if extraction is None:
             fs = FixtureScore(
@@ -244,6 +254,7 @@ def score_results(
                 expected,
                 extraction,
                 acceptable_alternatives=alternatives,
+                case_title_in_text=case_title_in_text,
             )
 
         fixture_scores.append(fs)

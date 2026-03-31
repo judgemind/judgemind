@@ -465,6 +465,55 @@ class TestScoreFixture:
         title_score = next(f for f in score.field_scores if f.field_name == "case_title")
         assert title_score.match is True
 
+    def test_case_title_in_text_false_skips_case_title(self) -> None:
+        """When case_title_in_text=False, case_title should not be scored."""
+        expected = {
+            "motion_type": "msj",
+            "outcome": "granted",
+            "case_title": "Smith v. Jones",
+            "parties": {"plaintiffs": ["Smith"], "defendants": ["Jones"]},
+        }
+        extraction = {
+            "motion_type": "msj",
+            "outcome": "granted",
+            "case_title": None,  # LLM couldn't extract — but that's expected
+            "parties": {"plaintiffs": [], "defendants": []},
+        }
+        score = score_fixture(
+            "la/test-1",
+            "la",
+            expected,
+            extraction,
+            case_title_in_text=False,
+        )
+        # case_title should NOT appear in field_scores
+        field_names = [f.field_name for f in score.field_scores]
+        assert "case_title" not in field_names
+        # parties should also be skipped
+        assert score.party_score is None
+        # motion_type and outcome should still be scored
+        assert "motion_type" in field_names
+        assert "outcome" in field_names
+
+    def test_case_title_in_text_true_default_scores_normally(self) -> None:
+        """Default behavior (case_title_in_text=True) scores case_title normally."""
+        expected = {
+            "motion_type": "msj",
+            "outcome": "granted",
+            "case_title": "Smith v. Jones",
+            "parties": {"plaintiffs": ["Smith"], "defendants": ["Jones"]},
+        }
+        extraction = {
+            "motion_type": "msj",
+            "outcome": "granted",
+            "case_title": "Smith v. Jones",
+            "parties": {"plaintiffs": ["Smith"], "defendants": ["Jones"]},
+        }
+        score = score_fixture("la/test-1", "la", expected, extraction)
+        field_names = [f.field_name for f in score.field_scores]
+        assert "case_title" in field_names
+        assert score.party_score is not None
+
 
 # ---------------------------------------------------------------------------
 # aggregate_scores tests
@@ -801,3 +850,72 @@ class TestFixtureLoading:
         # At least some fixtures should have acceptable_alternatives
         with_alts = [f for f in fixtures if f.get("acceptable_alternatives")]
         assert len(with_alts) >= 1, "Expected at least 1 fixture with acceptable_alternatives"
+
+    def test_load_fixtures_includes_case_title_in_text(self) -> None:
+        """Verify that case_title_in_text flag is loaded from fixture JSON."""
+        fixtures_dir = Path(__file__).resolve().parent / "fixtures" / "enrichment"
+        if not fixtures_dir.exists():
+            pytest.skip("Enrichment fixtures not found")
+
+        sys.path.insert(0, str(SCRIPTS_EVAL_DIR))
+        from eval_enrichment import load_fixtures
+
+        fixtures = load_fixtures(fixtures_dir)
+        # All fixtures should have the case_title_in_text key
+        for f in fixtures:
+            assert "case_title_in_text" in f, (
+                f"Fixture {f['fixture_id']} missing case_title_in_text"
+            )
+            assert isinstance(f["case_title_in_text"], bool)
+
+        # At least some fixtures should have case_title_in_text=False
+        # (the 4 annotated fixtures)
+        without_title = [f for f in fixtures if not f["case_title_in_text"]]
+        assert len(without_title) >= 4, (
+            f"Expected at least 4 fixtures with case_title_in_text=False, "
+            f"found {len(without_title)}"
+        )
+
+    def test_score_results_passes_case_title_in_text(self) -> None:
+        """Verify that score_results passes case_title_in_text to score_fixture."""
+        fixtures = [
+            {
+                "fixture_id": "test/1",
+                "county": "test",
+                "ruling_text": "some text",
+                "expected": {
+                    "motion_type": "msj",
+                    "outcome": "granted",
+                    "case_title": "Smith v. Jones",
+                    "parties": {"plaintiffs": ["Smith"], "defendants": ["Jones"]},
+                },
+                "source_doc": "",
+                "notes": "",
+                "acceptable_alternatives": None,
+                "case_title_in_text": False,
+            },
+        ]
+        results = [
+            {
+                "fixture_id": "test/1",
+                "county": "test",
+                "extraction_result": {
+                    "motion_type": "msj",
+                    "outcome": "granted",
+                    "case_title": None,
+                    "parties": {"plaintiffs": [], "defendants": []},
+                },
+                "latency_ms": 100,
+                "error": None,
+            },
+        ]
+
+        sys.path.insert(0, str(SCRIPTS_EVAL_DIR))
+        from eval_enrichment import score_results
+
+        fixture_scores = score_results(results, fixtures)
+        assert len(fixture_scores) == 1
+        # case_title should be skipped due to case_title_in_text=False
+        field_names = [f.field_name for f in fixture_scores[0].field_scores]
+        assert "case_title" not in field_names
+        assert fixture_scores[0].party_score is None
