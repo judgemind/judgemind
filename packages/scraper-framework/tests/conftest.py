@@ -180,16 +180,18 @@ def _disable_llm_s3_cache() -> Generator[None, None, None]:
     (e.g. for local rebuilds), tests that call ``extract_from_pdf`` can
     hit stale cached results instead of exercising the mocked code paths.
 
-    Patching ``_get_cache_s3_client`` to return ``None`` disables the cache
-    at construction time — the ``LlmExtractor.__init__`` sets
-    ``self._cache = None`` when the S3 client is ``None``.
+    We patch the ``_get_cache_s3_client`` to return a mock whose get/put
+    methods always raise, so the ``_LlmCache.get()`` returns ``None``
+    (its except branch) and ``_LlmCache.put()`` logs a warning.  The
+    ``_LlmCache`` class is NOT replaced, preserving coverage measurement.
     """
-    # Patch the _LlmCache class to be a no-op that always returns None
-    # from get() and does nothing on put(). This prevents any S3 cache
-    # interaction during tests.
-    mock_cache_cls = MagicMock()
-    mock_cache_cls.return_value.get.return_value = None
-    with patch("framework.llm_extractor._LlmCache", mock_cache_cls):
+    broken_s3 = MagicMock()
+    broken_s3.get_object.side_effect = Exception("no S3 in tests")
+    broken_s3.put_object.side_effect = Exception("no S3 in tests")
+    with patch(
+        "framework.llm_extractor.LlmExtractor._get_cache_s3_client",
+        staticmethod(lambda: broken_s3),
+    ):
         yield
 
 
