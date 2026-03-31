@@ -1992,8 +1992,12 @@ class TestInsertDocumentAndRuling:
         assert insert_doc_params[0] == "doc-456"
         assert insert_ruling_params[0] == "doc-456"
 
-    def test_skips_ruling_when_hearing_date_is_none(self) -> None:
-        """When hearing_date is None, only insert_document is called."""
+    def test_inserts_ruling_even_when_hearing_date_is_none(self) -> None:
+        """When hearing_date is None, both document and ruling are inserted (#2215).
+
+        Prior to #2215, the ruling was silently skipped when hearing_date was
+        None.  Now the ruling is always inserted, with hearing_date=NULL.
+        """
         conn = _mock_conn()
         cur = conn.cursor.return_value.__enter__.return_value
         cur.fetchone.return_value = (True,)
@@ -2015,9 +2019,10 @@ class TestInsertDocumentAndRuling:
         )
 
         assert result is True
-        # Only insert_document should have been called (1 execute with params).
-        calls_with_params = [c for c in cur.execute.call_args_list if len(c[0]) > 1]
-        assert len(calls_with_params) == 1
+        # Both insert_document AND insert_ruling should have been called.
+        all_sql = " ".join(str(c) for c in cur.execute.call_args_list)
+        assert "INSERT INTO documents" in all_sql
+        assert "INSERT INTO rulings" in all_sql
 
     def test_returns_is_new_true_for_new_document(self) -> None:
         conn = _mock_conn()

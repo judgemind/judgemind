@@ -1233,11 +1233,11 @@ class IngestionWorker:
             court_id = upsert_court(conn, state, county, court_name)
 
             # 1b. Enrichment — resolve extracted fields against DB data (#1576).
-            # Skip enrichment when case_number is empty/synthetic or hearing_date
-            # is missing, as there is insufficient data for meaningful matching.
-            _skip_enrichment = (
-                not case_number or case_number.startswith("UNKNOWN-") or hearing_dt is None
-            )
+            # Skip enrichment when case_number is empty/synthetic, as there is
+            # insufficient data for meaningful matching.  hearing_date being
+            # None does NOT skip enrichment — the case_number is the primary
+            # lookup key (#2215).
+            _skip_enrichment = not case_number or case_number.startswith("UNKNOWN-")
             if not _skip_enrichment:
                 enrichment_engine = EnrichmentEngine(conn)
                 party_names = [p.get("name") for p in parties_data if p.get("name")]

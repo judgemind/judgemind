@@ -838,7 +838,7 @@ class TestReingestBatchDBWrites:
     @patch("reingest_from_s3.upsert_case")
     @patch("reingest_from_s3._reparse_document")
     @patch("reingest_from_s3._fetch_s3_content")
-    def test_null_doc_and_ruling_hearing_date_skips_ruling(
+    def test_null_doc_and_ruling_hearing_date_inserts_ruling_with_null(
         self,
         mock_fetch_s3: MagicMock,
         mock_reparse: MagicMock,
@@ -848,7 +848,11 @@ class TestReingestBatchDBWrites:
         mock_upsert_cj: MagicMock,
         mock_batch_parties: MagicMock,
     ) -> None:
-        """When both document and ruling hearing_dates are NULL, ruling is still skipped."""
+        """When both document and ruling hearing_dates are NULL, ruling is still inserted (#2215).
+
+        A missing hearing_date should never cause a ruling to be dropped.
+        The ruling is inserted with NULL hearing_date instead.
+        """
         row = _make_document_row(hearing_date=None, ruling_hearing_date=None)
         conn = _mock_conn_with_rows([row])
 
@@ -878,7 +882,7 @@ class TestReingestBatchDBWrites:
         assert result["updated"] == 1
         mock_insert_doc_and_ruling.assert_called_once()
         call_kwargs = mock_insert_doc_and_ruling.call_args[1]
-        # Both are None — insert_document_and_ruling will skip the ruling insert
+        # hearing_date is None but ruling should still be inserted (#2215)
         assert call_kwargs["hearing_date"] is None
 
 

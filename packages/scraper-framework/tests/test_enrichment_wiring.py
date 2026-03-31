@@ -383,17 +383,20 @@ def test_enrichment_skipped_when_no_case_number(
 @patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
 @patch("ingestion.worker.EnrichmentEngine")
 @patch("ingestion.worker.psycopg")
-def test_enrichment_skipped_when_no_hearing_date(
+def test_enrichment_runs_when_no_hearing_date(
     mock_psycopg: MagicMock,
     mock_engine_cls: MagicMock,
     mock_resolve_judge: MagicMock,
 ) -> None:
-    """Enrichment is skipped when hearing_date is None."""
+    """Enrichment runs even when hearing_date is None, as long as case_number is present (#2215).
+
+    Prior to #2215, enrichment was skipped when hearing_date was None.  Now
+    enrichment proceeds using case_number as the primary lookup key.
+    """
     worker, _ = _make_worker()
     mock_conn, mock_cur = _make_mock_conn()
     mock_psycopg.connect.return_value = mock_conn
 
-    # No hearing_date -> no ruling row -> need fewer fetchone results
     mock_cur.fetchone.side_effect = [
         ("court-uuid-1",),  # upsert_court
         ("case-uuid-1",),  # upsert_case
@@ -401,11 +404,30 @@ def test_enrichment_skipped_when_no_hearing_date(
     ]
     mock_cur.rowcount = 1
 
+    # Configure mock enrichment engine
+    mock_engine = MagicMock()
+    mock_engine_cls.return_value = mock_engine
+    from framework.enrichment import CaseMatch, EnrichmentResult
+
+    mock_engine.enrich.return_value = EnrichmentResult(
+        case_match=CaseMatch(
+            case_id="case-uuid-1",
+            case_number="23STCV12345",
+            match_type="exact",
+            confidence=1.0,
+        ),
+    )
+
     event = _make_event(hearing_date=None)
     worker.process_event(event)
 
-    # EnrichmentEngine should NOT be instantiated
-    mock_engine_cls.assert_not_called()
+    # EnrichmentEngine SHOULD be instantiated — hearing_date=None no longer
+    # skips enrichment when case_number is present (#2215)
+    mock_engine_cls.assert_called_once()
+    mock_engine.enrich.assert_called_once()
+    enrich_kwargs = mock_engine.enrich.call_args.kwargs
+    assert enrich_kwargs["hearing_date"] is None
+    assert enrich_kwargs["case_number"] == "23STCV12345"
 
 
 @patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")

@@ -18,6 +18,7 @@ import pytest
 from ingestion.db import (
     _derive_court_code,
     insert_document,
+    insert_document_and_ruling,
     insert_ruling,
     normalize_judge_name,
     normalize_party_name,
@@ -430,10 +431,14 @@ def test_process_event_extracts_judge_name_from_ruling_text(
 
 @patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
 @patch("ingestion.worker.psycopg")
-def test_process_event_no_hearing_date_skips_ruling(
+def test_process_event_no_hearing_date_inserts_ruling_with_null_date(
     mock_psycopg: MagicMock, mock_resolve_judge: MagicMock
 ) -> None:
-    """Events without hearing_date should still insert document but skip ruling."""
+    """Events without hearing_date should insert both document and ruling (#2215).
+
+    A missing hearing_date should never cause a ruling to be silently dropped.
+    The ruling is inserted with NULL hearing_date instead.
+    """
     worker, os_mock = _make_worker()
 
     mock_conn, mock_cur = _make_mock_conn()
@@ -450,15 +455,77 @@ def test_process_event_no_hearing_date_skips_ruling(
 
     mock_conn.commit.assert_called_once()
 
-    # insert_ruling uses a specific SQL pattern — check it was NOT called
+    # insert_ruling SHOULD be called even without hearing_date (#2215)
     ruling_calls = [c for c in mock_cur.execute.call_args_list if "INSERT INTO rulings" in str(c)]
-    assert len(ruling_calls) == 0
+    assert len(ruling_calls) == 1
 
-    # But case_judges should still be populated since judge was resolved
+    # The hearing_date parameter should be None
+    ruling_args = ruling_calls[0][0][1]  # positional args tuple
+    # hearing_date is the 5th positional arg in the INSERT INTO rulings call
+    # (document_id, case_id, court_id, judge_id, hearing_date, ...)
+    assert ruling_args[4] is None
+
+    # case_judges should still be populated since judge was resolved
     case_judge_calls = [
         c for c in mock_cur.execute.call_args_list if "INSERT INTO case_judges" in str(c)
     ]
     assert len(case_judge_calls) == 1
+
+
+@patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
+@patch("ingestion.worker.EnrichmentEngine")
+@patch("ingestion.worker.psycopg")
+def test_process_event_enrichment_runs_without_hearing_date(
+    mock_psycopg: MagicMock,
+    mock_enrichment_cls: MagicMock,
+    mock_resolve_judge: MagicMock,
+) -> None:
+    """Enrichment should run when case_number is present, even if hearing_date is None (#2215).
+
+    Prior to #2215, enrichment was skipped when hearing_date was None.  This
+    caused rulings with valid case_numbers but no hearing_date to miss judge
+    resolution and case matching.
+    """
+    worker, os_mock = _make_worker()
+
+    # Set up the mock enrichment engine
+    mock_engine = MagicMock()
+    mock_enrichment_cls.return_value = mock_engine
+    # Return a result with no corrections (exact match)
+    from framework.enrichment import CaseMatch, EnrichmentResult, JudgeResolution
+
+    mock_engine.enrich.return_value = EnrichmentResult(
+        case_match=CaseMatch(
+            case_id="case-uuid-1",
+            case_number="23STCV12345",
+            match_type="exact",
+            confidence=1.0,
+        ),
+        judge_resolution=JudgeResolution(
+            judge_id="judge-uuid-1",
+            canonical_name="Smith, John A.",
+            match_type="alias",
+            confidence=1.0,
+        ),
+    )
+
+    mock_conn, mock_cur = _make_mock_conn()
+    mock_psycopg.connect.return_value = mock_conn
+    mock_cur.fetchone.side_effect = [
+        ("court-uuid-1",),  # upsert_court
+        ("case-uuid-1",),  # upsert_case_returning_title
+        (True,),  # insert_document: RETURNING is_new = True
+    ]
+    mock_cur.rowcount = 1
+
+    event = _make_event(hearing_date=None)
+    worker.process_event(event)
+
+    # Enrichment should have been called despite hearing_date=None
+    mock_engine.enrich.assert_called_once()
+    enrich_kwargs = mock_engine.enrich.call_args.kwargs
+    assert enrich_kwargs["case_number"] == "23STCV12345"
+    assert enrich_kwargs["hearing_date"] is None
 
 
 @patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
@@ -3121,6 +3188,68 @@ def test_insert_ruling_with_ruling_text_html_none() -> None:
     assert mock_cur.execute.call_count == 3
 
 
+def test_insert_document_and_ruling_always_inserts_ruling() -> None:
+    """insert_document_and_ruling inserts ruling even when hearing_date is None (#2215).
+
+    Before #2215, the function silently skipped the ruling when hearing_date
+    was None.  Now it always inserts the ruling, passing hearing_date through
+    (which may be None).
+    """
+    mock_conn = MagicMock()
+    mock_cur = MagicMock()
+    mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cur)
+    mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+    mock_cur.fetchone.return_value = (True,)  # insert_document: is_new = True
+    mock_cur.rowcount = 1
+
+    insert_document_and_ruling(
+        mock_conn,
+        document_id="doc-uuid-1",
+        case_id="case-uuid-1",
+        court_id="court-uuid-1",
+        content_format="html",
+        content_hash="abc123",
+        s3_key="s3/key",
+        s3_bucket="bucket",
+        source_url="https://example.com",
+        scraper_id="test-scraper",
+        captured_at=datetime(2026, 3, 5),
+        hearing_date=None,
+        ruling_text="Motion GRANTED.",
+    )
+
+    # Both INSERT INTO documents AND INSERT INTO rulings should be present
+    all_sql = " ".join(str(c) for c in mock_cur.execute.call_args_list)
+    assert "INSERT INTO documents" in all_sql
+    assert "INSERT INTO rulings" in all_sql
+
+
+def test_insert_ruling_with_null_hearing_date() -> None:
+    """insert_ruling accepts None hearing_date after #2215 schema change."""
+    mock_conn = MagicMock()
+    mock_cur = MagicMock()
+    mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cur)
+    mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+
+    insert_ruling(
+        mock_conn,
+        document_id="doc-uuid-1",
+        case_id="case-uuid-1",
+        court_id="court-uuid-1",
+        hearing_date=None,
+        ruling_text="Motion GRANTED.",
+        department="Dept. 1",
+    )
+
+    # The INSERT INTO rulings call should contain None for hearing_date
+    insert_calls = [c for c in mock_cur.execute.call_args_list if "INSERT INTO rulings" in str(c)]
+    assert len(insert_calls) == 1
+    sql_args = insert_calls[0][0][1]
+    # hearing_date is the 5th positional arg
+    # (document_id, case_id, court_id, judge_id, hearing_date)
+    assert sql_args[4] is None
+
+
 # ---------------------------------------------------------------------------
 # Ruling formatting integration tests
 # ---------------------------------------------------------------------------
@@ -3899,8 +4028,9 @@ def test_process_event_cross_case_title_lookup(
     import logging as _logging
 
     with caplog.at_level(_logging.INFO, logger="ingestion.worker"):  # type: ignore[attr-defined]
-        # Event with no case_title and no hearing_date (skips enrichment)
-        # — the DB already knows this case's title from a prior ruling
+        # Event with no case_title and no hearing_date — enrichment still
+        # runs (#2215) but the DB already knows this case's title from
+        # a prior ruling
         event = _make_event(
             case_title=None, hearing_date=None, ruling_text="The motion is GRANTED."
         )
