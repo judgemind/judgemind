@@ -33,6 +33,10 @@
 #   --env <env>         Environment (default: dev)
 #   --cpu <units>       CPU units for the task (default: 1024). Valid: 256, 512, 1024, 2048, 4096.
 #   --memory <mb>       Memory in MB for the task (default: 2048). Must be valid for the CPU value.
+#   --role <name>       Override the ECS task role. Resolves the IAM role ARN
+#                       from the given role name (e.g. judgemind-maintenance-dev).
+#                       Useful for maintenance scripts that need permissions
+#                       beyond the default scraper role (e.g. s3:DeleteObject).
 #   --latest-image      Use the latest image from ECR (this is now the default when
 #                       the service image differs from the latest; kept for compatibility)
 #   --service-image     Use the running service's image even if it differs from
@@ -49,6 +53,7 @@
 #   scripts/ecs-run-task.sh scripts/backfill_ruling_html.py -- --dry-run
 #   scripts/ecs-run-task.sh scripts/backfill_summaries.py
 #   scripts/ecs-run-task.sh --timeout 3600 scripts/backfill_summaries.py
+#   scripts/ecs-run-task.sh --role judgemind-maintenance-dev scripts/migrate_s3_keys.py -- --cleanup-orphans
 #   scripts/ecs-run-task.sh --detach scripts/reingest_from_s3.py -- --all
 #   scripts/ecs-run-task.sh --logs arn:aws:ecs:us-west-2:155326049300:task/judgemind-dev/abc123
 
@@ -68,6 +73,7 @@ REGION="us-west-2"
 SCRIPT_ARGS=()
 USE_LATEST_IMAGE=false
 USE_SERVICE_IMAGE=false
+ROLE_OVERRIDE=""
 
 # Track resources for cleanup
 ONESHOT_TASK_DEF_ARN=""
@@ -89,6 +95,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --memory)
             MEMORY_OVERRIDE="$2"
+            shift 2
+            ;;
+        --role)
+            ROLE_OVERRIDE="$2"
             shift 2
             ;;
         --latest-image)
@@ -437,6 +447,25 @@ else
     echo "Falling back to the service's image." >&2
 fi
 
+# ─── Step 1c: Resolve task role override ─────────────────────────────────────
+
+OVERRIDE_ROLE_ARN=""
+
+if [[ -n "$ROLE_OVERRIDE" ]]; then
+    echo "Resolving IAM role '${ROLE_OVERRIDE}'..." >&2
+    OVERRIDE_ROLE_ARN=$(aws iam get-role \
+        --role-name "$ROLE_OVERRIDE" \
+        --region "$REGION" \
+        --query 'Role.Arn' \
+        --output text \
+        --no-cli-pager 2>/dev/null) || {
+        echo "Error: could not resolve IAM role '${ROLE_OVERRIDE}'." >&2
+        echo "Check the role name and your AWS credentials." >&2
+        exit 1
+    }
+    echo "Task role override: ${OVERRIDE_ROLE_ARN}" >&2
+fi
+
 # ─── Step 2: Prepare the script payload ──────────────────────────────────────
 
 SCRIPT_SIZE=$(wc -c < "$SCRIPT_PATH" | tr -d ' ')
@@ -504,6 +533,9 @@ fi
 echo "Script: ${SCRIPT_PATH} (${SCRIPT_SIZE} bytes)" >&2
 echo "Interpreter: ${INTERPRETER}" >&2
 echo "Resources: ${CPU} CPU / ${MEMORY} MB memory" >&2
+if [[ -n "$OVERRIDE_ROLE_ARN" ]]; then
+    echo "Task role: ${ROLE_OVERRIDE} (override)" >&2
+fi
 if [[ -n "$OVERRIDE_IMAGE" ]]; then
     echo "Image: ${OVERRIDE_IMAGE} (--latest-image)" >&2
 else
@@ -532,6 +564,7 @@ family = os.environ["ONESHOT_FAMILY"]
 cpu = os.environ["ONESHOT_CPU"]
 memory = os.environ["ONESHOT_MEMORY"]
 override_image = os.environ.get("OVERRIDE_IMAGE", "")
+override_role_arn = os.environ.get("OVERRIDE_ROLE_ARN", "")
 
 # Get the first container definition as a template
 source_container = source_td["containerDefinitions"][0]
@@ -568,7 +601,7 @@ task_def = {
     "cpu": cpu,
     "memory": memory,
     "executionRoleArn": source_td["executionRoleArn"],
-    "taskRoleArn": source_td.get("taskRoleArn", ""),
+    "taskRoleArn": override_role_arn if override_role_arn else source_td.get("taskRoleArn", ""),
     "containerDefinitions": [container],
 }
 
@@ -587,6 +620,7 @@ TASK_DEF_JSON=$(echo "$SOURCE_TASK_DEF" | \
     ONESHOT_CPU="$CPU" \
     ONESHOT_MEMORY="$MEMORY" \
     OVERRIDE_IMAGE="${OVERRIDE_IMAGE}" \
+    OVERRIDE_ROLE_ARN="${OVERRIDE_ROLE_ARN}" \
     python3 "${TMP_DIR}/_build_task_def.py")
 
 if [[ "$DRY_RUN" == "true" ]]; then
