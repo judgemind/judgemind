@@ -416,6 +416,80 @@ class TestParsePageRows:
 # ---------------------------------------------------------------------------
 
 
+    def test_json_object_in_text(self) -> None:
+        """JSON object embedded in non-JSON text is extracted."""
+        raw = 'Here is the result: {"rulings": [{"entry_number": "1", "case_info": "test v. case", "ruling_text": "t"}]} end'
+        rows = _parse_page_rows(raw, page_index=0)
+        assert len(rows) == 1
+        assert rows[0]["entry_number"] == 1
+
+    def test_json_object_bad_content(self) -> None:
+        """JSON object with invalid content returns empty."""
+        raw = "Some text {not valid json} more text"
+        rows = _parse_page_rows(raw, page_index=0)
+        assert rows == []
+
+
+class TestExtractCaseTitleTruncation:
+    """Tests for case_title truncation in _extract_case_title_from_info."""
+
+    def test_long_title_with_vs_and_case_number(self) -> None:
+        """Titles with v. followed by a second case number are truncated."""
+        info = "Smith v. Jones 26CV484550 David Rome v. Other Party 23CV417411"
+        title = _extract_case_title_from_info(info)
+        assert title is not None
+        assert len(title) < 150
+        assert "Smith v. Jones" in title
+
+    def test_probate_title_with_multiple_cases(self) -> None:
+        """Probate titles with multiple CONSERVATORSHIP/ESTATE patterns are truncated."""
+        info = (
+            "IN THE MATTER OF: CHARLENE DOWNS "
+            "CONSERVATORSHIP OF KENNETH CARLSON MSP12-00793 "
+            "ESTATE OF HENRY FASQUELLE GUARDIANSHIP OF NAYELLI BRONSON"
+        )
+        title = _extract_case_title_from_info(info)
+        assert title is not None
+        assert len(title) <= 150
+
+    def test_hard_truncation_fallback(self) -> None:
+        """Titles over 150 chars without v. or probate pattern are hard-truncated."""
+        info = "A " * 100  # 200 chars, no v. or probate pattern
+        title = _extract_case_title_from_info(info)
+        assert title is not None
+        assert len(title) <= 150
+
+    def test_trailing_county_prefix_stripped(self) -> None:
+        """Trailing C or N from case number prefix is stripped."""
+        info = "SMITH VS. JONES C\n22-01971"
+        title = _extract_case_title_from_info(info)
+        assert title is not None
+        assert not title.endswith(" C")
+
+    def test_none_artifact_removed(self) -> None:
+        """'None' text artifacts from null JSON fields are removed."""
+        info = "None None SMITH VS. JONES\n24-378499"
+        title = _extract_case_title_from_info(info)
+        assert title is not None
+        assert "None" not in title
+
+
+class TestJoinPageRowsHeaderDate:
+    """Tests for hearing_date extraction from page_header rows."""
+
+    def test_hearing_date_from_header(self) -> None:
+        """hearing_date is extracted from synthetic header rows."""
+        rows = [
+            {"entry_number": None, "case_info": "Department 16\nJUDGE Test\nHearing Date: 2026-03-25", "ruling_text": ""},
+            {"entry_number": 1, "case_info": "Smith v. Jones\nC22-01971", "ruling_text": "Granted."},
+        ]
+        rulings = _join_page_rows(rows)
+        assert len(rulings) == 1
+        assert rulings[0].hearing_date == "2026-03-25"
+        assert rulings[0].extracted_judge_name == "Test"
+        assert rulings[0].department == "16"
+
+
 class TestCaseNumberRegex:
     """Tests for the expanded _CASE_NUMBER_RE pattern."""
 
