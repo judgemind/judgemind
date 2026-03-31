@@ -23,6 +23,7 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 import structlog
+from botocore.exceptions import ClientError
 
 from .hashing import sha256_hex
 
@@ -87,9 +88,13 @@ class CourtDirectory(abc.ABC):
     ) -> bool:
         """Archive a directory snapshot to S3 and DB.
 
+        Uses content-addressed S3 keys (``directories/{court_id}/{content_hash}.html``)
+        so the same directory content always maps to the same key, making
+        uploads idempotent. A HeadObject check skips the upload when the
+        content is already archived.
+
         Skips the DB insert if the content hash matches the most recent
-        snapshot for this court (dedup). The S3 upload always happens
-        so we have a complete timeline of raw responses.
+        snapshot for this court (dedup).
 
         Parameters
         ----------
@@ -107,26 +112,38 @@ class CourtDirectory(abc.ABC):
         """
         content_hash = sha256_hex(raw)
         now = datetime.now(UTC)
-        s3_key = f"directories/{court_id}/{now.strftime('%Y%m%dT%H%M%SZ')}.html"
+        s3_key = f"directories/{court_id}/{content_hash}.html"
 
-        # Always archive raw to S3
-        self._s3.put_object(
-            Bucket=self._bucket,
-            Key=s3_key,
-            Body=raw,
-            ContentType="text/html",
-            Metadata={
-                "court-id": court_id,
-                "content-hash": content_hash,
-                "captured-at": now.isoformat(),
-            },
-        )
-        logger.info(
-            "Archived directory to S3",
-            court_id=court_id,
-            s3_key=s3_key,
-            size=len(raw),
-        )
+        # Archive raw to S3 only if not already present (content-addressed).
+        try:
+            self._s3.head_object(Bucket=self._bucket, Key=s3_key)
+            logger.debug(
+                "Directory already archived in S3, skipping upload",
+                court_id=court_id,
+                s3_key=s3_key,
+            )
+        except ClientError as exc:
+            if exc.response["Error"]["Code"] != "404":
+                logger.error("S3 HeadObject failed for %s: %s", s3_key, exc)
+                raise
+            # Object doesn't exist — upload it.
+            self._s3.put_object(
+                Bucket=self._bucket,
+                Key=s3_key,
+                Body=raw,
+                ContentType="text/html",
+                Metadata={
+                    "court-id": court_id,
+                    "content-hash": content_hash,
+                    "captured-at": now.isoformat(),
+                },
+            )
+            logger.info(
+                "Archived directory to S3",
+                court_id=court_id,
+                s3_key=s3_key,
+                size=len(raw),
+            )
 
         # Check if the most recent snapshot has the same content hash
         if self._is_duplicate(court_id, content_hash):
