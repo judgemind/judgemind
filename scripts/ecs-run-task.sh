@@ -33,7 +33,10 @@
 #   --env <env>         Environment (default: dev)
 #   --cpu <units>       CPU units for the task (default: 1024). Valid: 256, 512, 1024, 2048, 4096.
 #   --memory <mb>       Memory in MB for the task (default: 2048). Must be valid for the CPU value.
-#   --latest-image      Use the latest image from ECR instead of the running service's image
+#   --latest-image      Use the latest image from ECR (this is now the default when
+#                       the service image differs from the latest; kept for compatibility)
+#   --service-image     Use the running service's image even if it differs from
+#                       the latest ECR image (opt-in to old behavior)
 #   --detach            Launch the task and exit immediately. Prints the task ARN
 #                       to stdout for later use with --logs.
 #   --logs <task-arn>   Retrieve logs and status for a previously launched task.
@@ -64,6 +67,7 @@ SCRIPT_PATH=""
 REGION="us-west-2"
 SCRIPT_ARGS=()
 USE_LATEST_IMAGE=false
+USE_SERVICE_IMAGE=false
 
 # Track resources for cleanup
 ONESHOT_TASK_DEF_ARN=""
@@ -91,6 +95,10 @@ while [[ $# -gt 0 ]]; do
             USE_LATEST_IMAGE=true
             shift
             ;;
+        --service-image)
+            USE_SERVICE_IMAGE=true
+            shift
+            ;;
         --detach)
             DETACH=true
             shift
@@ -108,7 +116,7 @@ while [[ $# -gt 0 ]]; do
             shift 2
             ;;
         --help|-h)
-            head -n 51 "$0" | tail -n +2 | sed 's/^# \?//'
+            head -n 54 "$0" | tail -n +2 | sed 's/^# \?//'
             exit 0
             ;;
         --)
@@ -385,49 +393,48 @@ LATEST_ECR_INFO=$(aws ecr describe-images \
     --output json \
     --no-cli-pager 2>/dev/null) || LATEST_ECR_INFO=""
 
+# Decide which image to use. The default is now to prefer the latest ECR
+# image when it differs from the service image, avoiding stale-code runs.
+# --service-image overrides this to opt into the old behavior.
+# --latest-image is kept for compatibility but is now effectively a no-op.
+OVERRIDE_IMAGE=""
+
 if [[ -n "$LATEST_ECR_INFO" && "$LATEST_ECR_INFO" != "null" ]]; then
     LATEST_DIGEST=$(echo "$LATEST_ECR_INFO" | python3 -c "import sys,json; print(json.load(sys.stdin)['digest'])")
     LATEST_PUSHED=$(echo "$LATEST_ECR_INFO" | python3 -c "import sys,json; print(json.load(sys.stdin)['pushed'])")
 
     if [[ -n "$SERVICE_DIGEST" && "$SERVICE_DIGEST" != "$LATEST_DIGEST" ]]; then
-        if [[ "$USE_LATEST_IMAGE" == "true" ]]; then
-            echo "Using latest ECR image (pushed ${LATEST_PUSHED})." >&2
-            echo "Service image (tag=${SERVICE_IMAGE_TAG}) has a different digest — overriding." >&2
-        else
+        if [[ "$USE_SERVICE_IMAGE" == "true" ]]; then
+            # Explicitly opted into the service image despite mismatch
             echo "" >&2
-            echo "WARNING: The running service's image differs from the latest in ECR." >&2
+            echo "NOTE: Service image differs from latest ECR image, but --service-image was specified." >&2
             echo "  Service image tag: ${SERVICE_IMAGE_TAG}" >&2
             echo "  Service digest:    ${SERVICE_DIGEST}" >&2
             echo "  Latest digest:     ${LATEST_DIGEST}" >&2
             echo "  Latest pushed:     ${LATEST_PUSHED}" >&2
+            echo "Using the service image as requested." >&2
             echo "" >&2
-            echo "The oneshot task may run with stale code. To use the latest image:" >&2
-            echo "  scripts/ecs-run-task.sh --latest-image <script-path> [-- args...]" >&2
+        else
+            # Default behavior: use the latest ECR image to avoid stale code
+            echo "Service image differs from latest ECR image — using latest (pushed ${LATEST_PUSHED})." >&2
+            echo "  Service image tag: ${SERVICE_IMAGE_TAG}" >&2
+            echo "  Service digest:    ${SERVICE_DIGEST}" >&2
+            echo "  Latest digest:     ${LATEST_DIGEST}" >&2
+            echo "To use the service's (possibly stale) image instead:" >&2
+            echo "  scripts/ecs-run-task.sh --service-image <script-path> [-- args...]" >&2
             echo "" >&2
+            OVERRIDE_IMAGE="${ECR_REPO_URI}:latest"
         fi
     else
-        # Digests match — service is up to date
-        if [[ "$USE_LATEST_IMAGE" == "true" ]]; then
+        # Digests match — service is up to date, nothing to override
+        if [[ "$USE_LATEST_IMAGE" == "true" || "$USE_SERVICE_IMAGE" == "true" ]]; then
             echo "Service image already matches the latest ECR image — no override needed." >&2
         fi
     fi
 else
-    # Could not resolve latest ECR image — skip the check
-    if [[ "$USE_LATEST_IMAGE" == "true" ]]; then
-        echo "WARNING: Could not resolve latest image from ECR repository '${ECR_REPO_NAME}'." >&2
-        echo "Falling back to the service's image." >&2
-    fi
-    # Reset the flag so we don't try to override below
-    USE_LATEST_IMAGE=false
-fi
-
-# If --latest-image was requested and digests differ, override the image in the
-# task definition. We do this by setting an env var that the Python task-def
-# builder (Step 3) will pick up.
-if [[ "$USE_LATEST_IMAGE" == "true" && -n "$LATEST_DIGEST" && "$SERVICE_DIGEST" != "$LATEST_DIGEST" ]]; then
-    OVERRIDE_IMAGE="${ECR_REPO_URI}:latest"
-else
-    OVERRIDE_IMAGE=""
+    # Could not resolve latest ECR image — fall back to service image
+    echo "WARNING: Could not resolve latest image from ECR repository '${ECR_REPO_NAME}'." >&2
+    echo "Falling back to the service's image." >&2
 fi
 
 # ─── Step 2: Prepare the script payload ──────────────────────────────────────
