@@ -9,7 +9,10 @@ Verifies that:
 
 from __future__ import annotations
 
+from datetime import date
 from unittest.mock import MagicMock, patch
+
+import pytest
 
 from framework.llm_schema import (
     ExtractedParty,
@@ -1083,6 +1086,187 @@ class TestLlmExtractedFlag:
         worker.process_event(event)
 
         mock_extract_case_type.assert_called_once_with("23STCV12345")
+
+
+# Post-LLM fallback matrix parameters (#2291).
+# Each tuple: (field_name, mock_target, mock_return_value, is_text_dependent)
+# is_text_dependent: True = gated on `ruling_text`, False = runs even when None
+_POST_LLM_FALLBACK_FIELDS: list[tuple[str, str, object, bool]] = [
+    ("outcome", "ingestion.worker.extract_outcome", "granted", True),
+    ("motion_type", "ingestion.worker.extract_motion_type", "demurrer", True),
+    (
+        "hearing_date",
+        "ingestion.worker.extract_hearing_date",
+        date(2026, 3, 21),
+        True,
+    ),
+    ("judge_name", "ingestion.worker.extract_judge_name", "Hon. John Smith", True),
+    (
+        "parties",
+        "ingestion.worker.extract_parties_from_caption",
+        [{"name": "Smith", "role": "plaintiff"}],
+        False,
+    ),
+    (
+        "case_type",
+        "ingestion.worker.extract_case_type_from_number",
+        "civil",
+        False,
+    ),
+]
+
+_POST_LLM_FIELD_IDS = [f[0] for f in _POST_LLM_FALLBACK_FIELDS]
+_RULING_TEXT_IDS = ["ruling_text_present", "ruling_text_none"]
+
+
+class TestPostLlmFallbackMatrix:
+    """Parameterized matrix: post-LLM fallbacks x ruling_text presence (#2291).
+
+    The post-LLM fallback block runs for _llm_extracted events.  Some fallbacks
+    (outcome, motion_type, hearing_date, judge_name) depend on ruling_text and
+    must NOT fire when ruling_text is None.  Others (parties from caption,
+    case_type from case_number) do NOT depend on ruling_text and must fire
+    regardless.  This matrix ensures no field accidentally regresses (cf. #2270).
+    """
+
+    @pytest.mark.parametrize(
+        "field_name, mock_target, mock_return, is_text_dependent",
+        _POST_LLM_FALLBACK_FIELDS,
+        ids=_POST_LLM_FIELD_IDS,
+    )
+    @pytest.mark.parametrize(
+        "ruling_text",
+        [
+            "The demurrer is GRANTED with leave to amend. March 21, 2026. HON. JOHN SMITH",
+            None,
+        ],
+        ids=_RULING_TEXT_IDS,
+    )
+    @patch("ingestion.worker.batch_upsert_parties")
+    @patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
+    @patch("ingestion.worker.psycopg")
+    def test_post_llm_fallback_matrix_field_absent(
+        self,
+        mock_psycopg: MagicMock,
+        mock_resolve_judge: MagicMock,
+        mock_batch_upsert: MagicMock,
+        field_name: str,
+        mock_target: str,
+        mock_return: object,
+        is_text_dependent: bool,
+        ruling_text: str | None,
+    ) -> None:
+        """Fallback fires when field is absent — only if ruling_text allows it.
+
+        Text-dependent fields (outcome, motion_type, hearing_date, judge_name)
+        should only have their fallback called when ruling_text is present.
+        Text-independent fields (parties, case_type) should always have their
+        fallback called, regardless of ruling_text.
+        """
+        worker, _ = _make_worker()
+
+        mock_conn, mock_cur = _make_mock_conn()
+        mock_psycopg.connect.return_value = mock_conn
+        mock_cur.fetchone.side_effect = [
+            ("court-uuid-1",),
+            ("case-uuid-1",),
+            (True,),
+        ]
+
+        # Build an event where ALL fields are populated, then clear only the
+        # field under test.  This ensures no unrelated fallbacks fire during a
+        # given parameterization.
+        event = _make_event(
+            _split_processed=True,
+            _llm_extracted=True,
+            case_number="23STCV12345",
+            case_title="Smith v. Jones",
+            judge_name="Hon. Jane Doe",
+            ruling_text=ruling_text,
+            outcome="granted",
+            motion_type="demurrer",
+            hearing_date="2026-03-21",
+            parties=[{"name": "Test Party", "role": "plaintiff"}],
+            case_type="civil",
+        )
+        # Clear the specific field under test so the fallback has a chance to fire.
+        if field_name == "parties":
+            event["parties"] = []
+        elif field_name == "hearing_date":
+            event["hearing_date"] = None
+        else:
+            event[field_name] = None
+
+        with patch(mock_target, return_value=mock_return) as mock_extractor:
+            worker.process_event(event)
+
+            should_call = (not is_text_dependent) or (ruling_text is not None)
+            if should_call:
+                mock_extractor.assert_called_once()
+            else:
+                mock_extractor.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "field_name, mock_target, mock_return, is_text_dependent",
+        _POST_LLM_FALLBACK_FIELDS,
+        ids=_POST_LLM_FIELD_IDS,
+    )
+    @pytest.mark.parametrize(
+        "ruling_text",
+        [
+            "The demurrer is GRANTED with leave to amend.",
+            None,
+        ],
+        ids=_RULING_TEXT_IDS,
+    )
+    @patch("ingestion.worker.batch_upsert_parties")
+    @patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
+    @patch("ingestion.worker.psycopg")
+    def test_post_llm_fallback_matrix_field_present(
+        self,
+        mock_psycopg: MagicMock,
+        mock_resolve_judge: MagicMock,
+        mock_batch_upsert: MagicMock,
+        field_name: str,
+        mock_target: str,
+        mock_return: object,
+        is_text_dependent: bool,
+        ruling_text: str | None,
+    ) -> None:
+        """Fallback does NOT fire when the field is already populated.
+
+        Regardless of ruling_text, if the LLM already extracted the field,
+        the regex fallback must not be called.
+        """
+        worker, _ = _make_worker()
+
+        mock_conn, mock_cur = _make_mock_conn()
+        mock_psycopg.connect.return_value = mock_conn
+        mock_cur.fetchone.side_effect = [
+            ("court-uuid-1",),
+            ("case-uuid-1",),
+            (True,),
+        ]
+
+        # Build an event where ALL fields are populated.
+        event = _make_event(
+            _split_processed=True,
+            _llm_extracted=True,
+            case_number="23STCV12345",
+            case_title="Smith v. Jones",
+            judge_name="Hon. Jane Doe",
+            ruling_text=ruling_text,
+            outcome="granted",
+            motion_type="demurrer",
+            hearing_date="2026-03-21",
+            case_type="civil",
+            parties=[{"name": "Smith", "role": "plaintiff"}],
+        )
+
+        with patch(mock_target, return_value=mock_return) as mock_extractor:
+            worker.process_event(event)
+            # Field already present — fallback should never fire.
+            mock_extractor.assert_not_called()
 
 
 class TestFrameworkExtractorInit:
