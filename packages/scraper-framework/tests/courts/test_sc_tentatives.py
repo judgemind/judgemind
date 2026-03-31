@@ -14,11 +14,13 @@ from __future__ import annotations
 
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 from unittest.mock import MagicMock
 
 import httpx
 import pytest
 import respx
+from botocore.exceptions import ClientError
 
 from courts.ca.sc_tentatives import (
     COURT_ID,
@@ -649,6 +651,18 @@ def test_sc_default_config() -> None:
 # ---------------------------------------------------------------------------
 
 
+def _head_object_404(**kwargs: Any) -> None:
+    """Simulate S3 HeadObject returning 404 (object not found)."""
+    raise ClientError({"Error": {"Code": "404", "Message": "Not Found"}}, "HeadObject")
+
+
+def _mock_s3() -> MagicMock:
+    """Create a mock S3 client with HeadObject returning 404 (not found)."""
+    mock = MagicMock()
+    mock.head_object.side_effect = _head_object_404
+    return mock
+
+
 def _mock_db_conn(existing_hash: str | None = None) -> MagicMock:
     """Create a mock psycopg connection with cursor context manager."""
     conn = MagicMock()
@@ -672,7 +686,7 @@ class TestSantaClaraCourtDirectory:
         landing_html = _load_html("sc_landing_page.html")
         respx.get(LANDING_URL).mock(return_value=httpx.Response(200, text=landing_html))
 
-        s3 = MagicMock()
+        s3 = _mock_s3()
         db = _mock_db_conn()
         directory = SantaClaraCourtDirectory(s3_client=s3, s3_bucket="test-bucket", db_conn=db)
 
@@ -692,7 +706,7 @@ class TestSantaClaraCourtDirectory:
         landing_html = _load_html("sc_landing_page.html")
         respx.get(LANDING_URL).mock(return_value=httpx.Response(200, text=landing_html))
 
-        s3 = MagicMock()
+        s3 = _mock_s3()
         db = _mock_db_conn()
         directory = SantaClaraCourtDirectory(s3_client=s3, s3_bucket="test-bucket", db_conn=db)
 
@@ -711,7 +725,7 @@ class TestSantaClaraCourtDirectory:
         landing_html = _load_html("sc_landing_page.html")
         respx.get(LANDING_URL).mock(return_value=httpx.Response(200, text=landing_html))
 
-        s3 = MagicMock()
+        s3 = _mock_s3()
         db = _mock_db_conn()
         directory = SantaClaraCourtDirectory(s3_client=s3, s3_bucket="test-bucket", db_conn=db)
 
@@ -731,7 +745,7 @@ class TestSantaClaraCourtDirectory:
         landing_html = _load_html("sc_landing_page.html")
         respx.get(LANDING_URL).mock(return_value=httpx.Response(200, text=landing_html))
 
-        s3 = MagicMock()
+        s3 = _mock_s3()
 
         # First, get the actual raw bytes the directory will return
         dir_probe = SantaClaraCourtDirectory(s3_client=s3, s3_bucket="b", db_conn=_mock_db_conn())
@@ -740,13 +754,13 @@ class TestSantaClaraCourtDirectory:
 
         # Now create the real directory with the existing hash matching
         respx.get(LANDING_URL).mock(return_value=httpx.Response(200, text=landing_html))
-        s3_real = MagicMock()
+        s3_real = _mock_s3()
         db = _mock_db_conn(existing_hash=content_hash)
         directory = SantaClaraCourtDirectory(s3_client=s3_real, s3_bucket="test-bucket", db_conn=db)
 
         mapping = directory.fetch_and_snapshot(COURT_ID)
 
-        # S3 upload should still happen (always archive)
+        # S3 upload happens because HeadObject returns 404 (content-addressed key not yet in S3)
         s3_real.put_object.assert_called_once()
         # But DB commit should NOT happen (dedup)
         db.commit.assert_not_called()
@@ -759,7 +773,7 @@ class TestSantaClaraCourtDirectory:
         landing_html = _load_html("sc_landing_page.html")
         respx.get(LANDING_URL).mock(return_value=httpx.Response(200, text=landing_html))
 
-        s3 = MagicMock()
+        s3 = _mock_s3()
         db = _mock_db_conn()
         directory = SantaClaraCourtDirectory(s3_client=s3, s3_bucket="test-bucket", db_conn=db)
 
@@ -787,7 +801,7 @@ class TestSCScraperWithDirectory:
         )
         respx.get(url__regex=r"\.pdf$").mock(return_value=httpx.Response(200, content=dept1_pdf))
 
-        s3 = MagicMock()
+        s3 = _mock_s3()
         db = _mock_db_conn()
         directory = SantaClaraCourtDirectory(s3_client=s3, s3_bucket="test-bucket", db_conn=db)
 
@@ -837,7 +851,7 @@ class TestSCScraperWithDirectory:
         )
         respx.get(url__regex=r"\.pdf$").mock(return_value=httpx.Response(200, content=dept1_pdf))
 
-        s3 = MagicMock()
+        s3 = _mock_s3()
         db = _mock_db_conn()
         directory = SantaClaraCourtDirectory(s3_client=s3, s3_bucket="test-bucket", db_conn=db)
 

@@ -8,11 +8,13 @@ Fixtures:
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 from unittest.mock import MagicMock
 
 import httpx
 import pytest
 import respx
+from botocore.exceptions import ClientError
 
 from courts.ca.la_dept_judges import (
     JUDICIAL_OFFICERS_URL,
@@ -304,6 +306,11 @@ def test_fetch_mapping_http_error_raises() -> None:
 # ---------------------------------------------------------------------------
 
 
+def _head_object_404(**kwargs: Any) -> None:
+    """Simulate S3 HeadObject returning 404 (object not found)."""
+    raise ClientError({"Error": {"Code": "404", "Message": "Not Found"}}, "HeadObject")
+
+
 class TestLACourtDirectory:
     """Tests for the LACourtDirectory subclass of CourtDirectory."""
 
@@ -317,8 +324,10 @@ class TestLACourtDirectory:
         return mock_conn
 
     def _make_mock_s3(self) -> MagicMock:
-        """Create a mock S3 client."""
-        return MagicMock()
+        """Create a mock S3 client with HeadObject returning 404 (not found)."""
+        mock = MagicMock()
+        mock.head_object.side_effect = _head_object_404
+        return mock
 
     @respx.mock
     def test_fetch_current_returns_raw_and_mapping(self) -> None:
@@ -419,10 +428,10 @@ class TestLACourtDirectory:
         mapping = directory.fetch_and_snapshot()
         assert len(mapping) == 14
 
-        # S3 upload should still happen (always archive raw)
+        # S3 upload happens because HeadObject returns 404 (content-addressed key not yet in S3)
         mock_s3.put_object.assert_called_once()
 
-        # But commit should NOT be called (duplicate detected)
+        # But commit should NOT be called (duplicate detected in DB)
         mock_db.commit.assert_not_called()
 
     @respx.mock
@@ -482,6 +491,7 @@ class TestScraperCourtDirectoryIntegration:
         respx.get(JUDICIAL_OFFICERS_URL).mock(return_value=httpx.Response(200, text=html))
 
         mock_s3 = MagicMock()
+        mock_s3.head_object.side_effect = _head_object_404
         mock_db = MagicMock()
         mock_cursor = MagicMock()
         mock_cursor.fetchone.return_value = None
