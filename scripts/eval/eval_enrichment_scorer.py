@@ -368,6 +368,8 @@ def score_fixture(
     expected: dict,
     extraction_result: dict | None,
     acceptable_alternatives: dict | None = None,
+    *,
+    case_title_in_text: bool = True,
 ) -> FixtureScore:
     """Score a single enrichment fixture against expected values.
 
@@ -385,6 +387,11 @@ def score_fixture(
     acceptable_alternatives : dict | None
         Optional dict of field_name -> list[str] with acceptable
         alternative values for ambiguous fixtures.
+    case_title_in_text : bool
+        Whether the case title is present in the ruling text.  When
+        ``False``, case_title and parties scoring are skipped for this
+        fixture because the expected values cannot be extracted from
+        the ruling text alone.  Default ``True``.
 
     Returns
     -------
@@ -432,28 +439,34 @@ def score_fixture(
         )
 
     # Score case_title (fuzzy match + alternatives)
-    exp_title = expected.get("case_title")
-    ext_title = extraction_result.get("case_title")
-    title_alts = alternatives.get("case_title")
-    title_match = compare_case_title(exp_title, ext_title)
-    if not title_match and title_alts:
-        for alt in title_alts:
-            if compare_case_title(alt, ext_title):
-                title_match = True
-                break
-    score.field_scores.append(
-        FieldScore(
-            field_name="case_title",
-            expected=exp_title,
-            extracted=ext_title,
-            match=title_match,
+    # Skip if case_title is not present in the ruling text — the expected
+    # value was derived from scraper metadata and cannot be extracted from
+    # the ruling text alone.
+    if case_title_in_text:
+        exp_title = expected.get("case_title")
+        ext_title = extraction_result.get("case_title")
+        title_alts = alternatives.get("case_title")
+        title_match = compare_case_title(exp_title, ext_title)
+        if not title_match and title_alts:
+            for alt in title_alts:
+                if compare_case_title(alt, ext_title):
+                    title_match = True
+                    break
+        score.field_scores.append(
+            FieldScore(
+                field_name="case_title",
+                expected=exp_title,
+                extracted=ext_title,
+                match=title_match,
+            )
         )
-    )
 
-    # Score parties (recall)
-    exp_parties = expected.get("parties", {})
-    ext_parties = extraction_result.get("parties", {})
-    score.party_score = compute_party_recall(exp_parties, ext_parties)
+    # Score parties (recall) — skip if case_title is not in text, since
+    # party names are derived from the same case caption metadata
+    if case_title_in_text:
+        exp_parties = expected.get("parties", {})
+        ext_parties = extraction_result.get("parties", {})
+        score.party_score = compute_party_recall(exp_parties, ext_parties)
 
     return score
 

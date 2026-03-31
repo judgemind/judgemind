@@ -1,5 +1,5 @@
 {
-  "ruling_text": "1. Motion to Seal\n2. Motion to Seal\n*Hearings vacated. See minute order dated 3/16/26*",
+  "ruling_text": "Kiani vs. Masimo Corporation\n\n1. Motion to Seal\n2. Motion to Seal\n*Hearings vacated. See minute order dated 3/16/26*",
   "expected": {
     "case_title": "Kiani vs. Masimo Corporation",
     "motion_type": "motion_to_seal",

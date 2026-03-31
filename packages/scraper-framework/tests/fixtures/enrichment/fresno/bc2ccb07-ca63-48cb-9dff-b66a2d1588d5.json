@@ -10,5 +10,6 @@
     }
   },
   "source_doc": "s3://judgemind-document-archive-dev/ca/fresno/superior_court/raw/2026/03/28/2fead6f3-c1d7-5ddc-9284-8d1106fff6d4.pdf",
-  "notes": "Non-adversarial case - no plaintiff/defendant parties"
+  "notes": "Non-adversarial case - no plaintiff/defendant parties",
+  "case_title_in_text": false
 }

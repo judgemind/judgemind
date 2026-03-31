@@ -1,5 +1,5 @@
 {
-  "ruling_text": "Granted.\n\nThe judgment is set aside, and the action is dismissed without prejudice.",
+  "ruling_text": "Discover Bank v. Whisner\n\nGranted.\n\nThe judgment is set aside, and the action is dismissed without prejudice.",
   "expected": {
     "case_title": "Discover Bank v. Whisner",
     "motion_type": "motion_to_vacate",

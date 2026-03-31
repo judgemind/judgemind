@@ -1,5 +1,5 @@
 {
-  "ruling_text": "The matter is moot due to the filing of the amended complaint.",
+  "ruling_text": "Karina Bautista v. Hillside Community Church, Inc., et al.\n\nThe matter is moot due to the filing of the amended complaint.",
   "expected": {
     "case_title": "Karina Bautista v. Hillside Community Church, Inc., et al.",
     "motion_type": "motion_to_quash",
