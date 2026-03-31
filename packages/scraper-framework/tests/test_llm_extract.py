@@ -13,17 +13,20 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from framework.llm_schema import ConfidenceLevel, FieldConfidence
 from ingestion.llm_extract import (
     _SYSTEM_PROMPT,
     CASE_TYPE_VALUES,
     LLMExtractionResult,
     LLMRulingResult,
     TokenTracker,
+    _deserialize_result,
     _merge_results,
     _normalize_case_number,
     _normalize_department,
     _parse_confidence,
     _parse_response,
+    _serialize_result,
     _split_text_into_chunks,
     extract_fields_llm,
     preprocess_html,
@@ -2203,3 +2206,187 @@ class TestTokenTrackerIntegration:
         assert tracker.input_tokens == 0
         assert tracker.output_tokens == 0
         assert tracker.api_calls == 0
+
+
+# ---------------------------------------------------------------------------
+# _serialize_result / _deserialize_result round-trip tests (#2217)
+# ---------------------------------------------------------------------------
+
+
+class TestSerializeDeserializeRoundTrip:
+    """Round-trip tests for cache serialization of LLMExtractionResult."""
+
+    def test_roundtrip_minimal_result(self) -> None:
+        """Minimal result with no rulings round-trips correctly."""
+        result = LLMExtractionResult()
+        deserialized = _deserialize_result(_serialize_result(result))
+        assert deserialized is not None
+        assert deserialized.judge_name is None
+        assert deserialized.hearing_date is None
+        assert deserialized.department is None
+        assert deserialized.case_count == 0
+        assert deserialized.rulings == []
+
+    def test_roundtrip_with_hearing_date(self) -> None:
+        """Result with hearing_date round-trips correctly (date <-> str)."""
+        result = LLMExtractionResult(
+            judge_name="Smith",
+            hearing_date=date(2025, 6, 15),
+            department="C10",
+            case_count=1,
+        )
+        deserialized = _deserialize_result(_serialize_result(result))
+        assert deserialized is not None
+        assert deserialized.judge_name == "Smith"
+        assert deserialized.hearing_date == date(2025, 6, 15)
+        assert deserialized.department == "C10"
+        assert deserialized.case_count == 1
+
+    def test_roundtrip_with_default_confidence(self) -> None:
+        """Result with rulings using default FieldConfidence round-trips."""
+        ruling = LLMRulingResult(
+            case_number="23CV001",
+            case_title="Doe v. Roe",
+            outcome="granted",
+        )
+        result = LLMExtractionResult(rulings=[ruling], case_count=1)
+        deserialized = _deserialize_result(_serialize_result(result))
+        assert deserialized is not None
+        assert len(deserialized.rulings) == 1
+        r = deserialized.rulings[0]
+        assert r.case_number == "23CV001"
+        assert r.case_title == "Doe v. Roe"
+        assert r.outcome == "granted"
+        assert isinstance(r.confidence, FieldConfidence)
+        assert r.confidence.case_number == ConfidenceLevel.HIGH
+        assert r.confidence.outcome == ConfidenceLevel.HIGH
+
+    def test_roundtrip_with_non_default_confidence(self) -> None:
+        """Result with non-default confidence levels round-trips correctly."""
+        confidence = FieldConfidence(
+            case_number=ConfidenceLevel.LOW,
+            case_title=ConfidenceLevel.MEDIUM,
+            parties=ConfidenceLevel.LOW,
+            judge=ConfidenceLevel.HIGH,
+            ruling_text=ConfidenceLevel.MEDIUM,
+            outcome=ConfidenceLevel.LOW,
+        )
+        ruling = LLMRulingResult(
+            case_number="24FAM100",
+            confidence=confidence,
+        )
+        result = LLMExtractionResult(rulings=[ruling], case_count=1)
+        deserialized = _deserialize_result(_serialize_result(result))
+        assert deserialized is not None
+        r = deserialized.rulings[0]
+        assert r.confidence.case_number == ConfidenceLevel.LOW
+        assert r.confidence.case_title == ConfidenceLevel.MEDIUM
+        assert r.confidence.parties == ConfidenceLevel.LOW
+        assert r.confidence.judge == ConfidenceLevel.HIGH
+        assert r.confidence.ruling_text == ConfidenceLevel.MEDIUM
+        assert r.confidence.outcome == ConfidenceLevel.LOW
+
+    def test_roundtrip_with_parties(self) -> None:
+        """Result with parties round-trips correctly."""
+        ruling = LLMRulingResult(
+            case_number="23CV001",
+            parties=[
+                {"name": "Alice", "role": "plaintiff"},
+                {"name": "Bob", "role": "defendant"},
+            ],
+        )
+        result = LLMExtractionResult(rulings=[ruling], case_count=1)
+        deserialized = _deserialize_result(_serialize_result(result))
+        assert deserialized is not None
+        r = deserialized.rulings[0]
+        assert len(r.parties) == 2
+        assert r.parties[0] == {"name": "Alice", "role": "plaintiff"}
+        assert r.parties[1] == {"name": "Bob", "role": "defendant"}
+
+    def test_roundtrip_multiple_rulings(self) -> None:
+        """Result with multiple rulings round-trips correctly."""
+        rulings = [
+            LLMRulingResult(case_number="23CV001", outcome="granted"),
+            LLMRulingResult(
+                case_number="23CV002",
+                outcome="denied",
+                confidence=FieldConfidence(outcome=ConfidenceLevel.MEDIUM),
+            ),
+        ]
+        result = LLMExtractionResult(
+            judge_name="Jones",
+            hearing_date=date(2025, 1, 10),
+            rulings=rulings,
+            case_count=2,
+        )
+        deserialized = _deserialize_result(_serialize_result(result))
+        assert deserialized is not None
+        assert len(deserialized.rulings) == 2
+        assert deserialized.rulings[0].case_number == "23CV001"
+        assert deserialized.rulings[1].case_number == "23CV002"
+        assert deserialized.rulings[1].confidence.outcome == ConfidenceLevel.MEDIUM
+
+    def test_roundtrip_empty_rulings_list(self) -> None:
+        """Result with explicit empty rulings list round-trips correctly."""
+        result = LLMExtractionResult(
+            judge_name="Brown",
+            rulings=[],
+            case_count=0,
+        )
+        deserialized = _deserialize_result(_serialize_result(result))
+        assert deserialized is not None
+        assert deserialized.rulings == []
+        assert deserialized.judge_name == "Brown"
+
+    def test_deserialize_empty_list_returns_none(self) -> None:
+        """Deserializing an empty list returns None."""
+        assert _deserialize_result([]) is None
+
+    def test_serialize_result_is_json_serializable(self) -> None:
+        """Serialized result can be passed to json.dumps without error.
+
+        This is the actual failure mode of the bug -- FieldConfidence
+        objects are not JSON-serializable, causing cache.put() to fail.
+        """
+        ruling = LLMRulingResult(
+            case_number="23CV001",
+            case_title="Doe v. Roe",
+            confidence=FieldConfidence(
+                case_number=ConfidenceLevel.LOW,
+                outcome=ConfidenceLevel.MEDIUM,
+            ),
+            parties=[{"name": "Doe", "role": "plaintiff"}],
+        )
+        result = LLMExtractionResult(
+            judge_name="Smith",
+            hearing_date=date(2025, 3, 1),
+            department="C10",
+            case_count=1,
+            rulings=[ruling],
+        )
+        serialized = _serialize_result(result)
+        # This must not raise TypeError
+        json_str = json.dumps(serialized, indent=2)
+        # Verify it can be parsed back
+        parsed = json.loads(json_str)
+        assert isinstance(parsed, list)
+        assert len(parsed) == 1
+
+    def test_cache_put_succeeds_with_serialized_result(self) -> None:
+        """Cache put() succeeds when given serialized result (no TypeError).
+
+        Simulates the cache write path in extract_fields_llm().
+        """
+        ruling = LLMRulingResult(
+            case_number="23CV001",
+            confidence=FieldConfidence(outcome=ConfidenceLevel.LOW),
+        )
+        result = LLMExtractionResult(rulings=[ruling], case_count=1)
+        serialized = _serialize_result(result)
+
+        # Simulate what _LlmCache.put() does
+        body = json.dumps(serialized, indent=2).encode()
+        assert isinstance(body, bytes)
+        # Verify it round-trips through JSON
+        loaded = json.loads(body)
+        assert loaded[0]["rulings"][0]["confidence"]["outcome"] == "low"

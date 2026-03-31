@@ -974,11 +974,23 @@ def _compute_cache_key(text: str, metadata: dict[str, str] | None) -> str:
 
 
 def _serialize_result(result: LLMExtractionResult) -> list[dict]:
-    """Serialize LLMExtractionResult for cache storage."""
+    """Serialize LLMExtractionResult for cache storage.
+
+    ``dataclasses.asdict()`` recursively converts dataclass fields to dicts,
+    but it does **not** convert Pydantic ``BaseModel`` instances (like
+    ``FieldConfidence``).  We explicitly call ``model_dump()`` on each
+    ruling's confidence so the result is fully JSON-serializable.
+    """
     d = asdict(result)
     # Convert date to string for JSON
     if d.get("hearing_date") is not None:
         d["hearing_date"] = d["hearing_date"].isoformat()
+    # Convert FieldConfidence (Pydantic BaseModel) to plain dicts.
+    # asdict() leaves Pydantic models as-is, which breaks json.dumps().
+    for ruling_dict in d.get("rulings", []):
+        conf = ruling_dict.get("confidence")
+        if conf is not None and isinstance(conf, FieldConfidence):
+            ruling_dict["confidence"] = conf.model_dump(mode="json")
     return [d]
 
 
@@ -990,8 +1002,13 @@ def _deserialize_result(cached: list[dict]) -> LLMExtractionResult | None:
     # Convert hearing_date string back to date
     if d.get("hearing_date") is not None:
         d["hearing_date"] = date.fromisoformat(d["hearing_date"])
-    # Reconstruct nested dataclasses
-    rulings = [LLMRulingResult(**r) for r in d.pop("rulings", [])]
+    # Reconstruct nested dataclasses, including FieldConfidence from dict.
+    raw_rulings = d.pop("rulings", [])
+    rulings: list[LLMRulingResult] = []
+    for r in raw_rulings:
+        conf_data = r.pop("confidence", None)
+        confidence = FieldConfidence(**conf_data) if conf_data else FieldConfidence()
+        rulings.append(LLMRulingResult(**r, confidence=confidence))
     return LLMExtractionResult(**d, rulings=rulings)
 
 
