@@ -12,8 +12,6 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock
 
-import pytest
-
 from ingestion.db import (
     _get_roster_names,
     _levenshtein_distance,
@@ -23,13 +21,6 @@ from ingestion.db import (
     normalize_judge_name,
     resolve_judge,
 )
-
-
-@pytest.fixture(autouse=True)
-def _clear_roster_cache() -> None:
-    """Clear the roster name cache before every test to prevent cross-test pollution."""
-    clear_roster_cache()
-
 
 # ---------------------------------------------------------------------------
 # _levenshtein_distance

@@ -209,6 +209,21 @@ def _fast_retry_sleeps() -> Generator[None, None, None]:
 
 
 @pytest.fixture(autouse=True)
+def _clear_roster_cache() -> None:
+    """Clear the roster name cache before every test.
+
+    ``_get_roster_names()`` caches results per court_id in a module-level
+    dict.  Without this fixture, a test that calls ``resolve_judge()`` can
+    pollute the cache for later tests running in the same process (or xdist
+    worker), causing ``fetchone`` side-effect sequences to be consumed in
+    an unexpected order.
+    """
+    from ingestion.db import clear_roster_cache
+
+    clear_roster_cache()
+
+
+@pytest.fixture(autouse=True)
 def _mock_enrichment_engine() -> Generator[None, None, None]:
     """Auto-mock ``EnrichmentEngine`` in the ingestion worker for all tests.
 
