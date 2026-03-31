@@ -35,7 +35,6 @@ LOCAL_ONLY=(
     "log_ralph_summary.py"      # Ralph loop summary — runs locally in worktree
     "update-coverage-baselines.py"  # CI-only — runs in GitHub Actions runner
     "validate-dq-baselines.py"      # CI-only — validates baselines JSON structure
-    "reingest_all_llm.py"               # Orchestrator — imports reingest_from_s3; on ECS use reingest_from_s3.py directly (#1474)
 )
 
 # ─── Discover sibling module names ─────────────────────────────────────────

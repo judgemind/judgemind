@@ -82,11 +82,11 @@ class TestSampleRulings:
         assert "random" in sql_arg.lower()
 
     def test_exits_without_database_url(self) -> None:
-        with patch.dict("os.environ", {}, clear=True):
-            # Remove DATABASE_URL
-            import os
-
-            os.environ.pop("DATABASE_URL", None)
+        mock_psycopg = MagicMock()
+        with (
+            patch.dict("sys.modules", {"psycopg": mock_psycopg}),
+            patch.dict("os.environ", {}, clear=True),
+        ):
             with pytest.raises(SystemExit):
                 SAMPLERS["rulings"]("Los Angeles", 5)
 
