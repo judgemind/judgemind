@@ -926,16 +926,23 @@ class IngestionWorker:
                 judge_name = extract_judge_name(ruling_text)
                 if judge_name is not None:
                     extraction_methods["judge_name"] = "regex_post_llm"
-            if not parties_data:
-                eff_title = case_title or event_data.get("case_title")
-                if eff_title:
-                    parties_data = extract_parties_from_caption(eff_title)
-                    if parties_data:
-                        extraction_methods["parties"] = "regex_post_llm"
-            if case_type is None and case_number:
-                case_type = extract_case_type_from_number(case_number)
-                if case_type:
-                    extraction_methods["case_type"] = "regex_post_llm"
+
+        # Party extraction from caption and case_type from case number do NOT
+        # require ruling_text — they use case_title and case_number respectively.
+        # Separated from the ruling_text-dependent block above so they run even
+        # when ruling_text is None (e.g. multi-ruling PDFs where individual
+        # split rulings may lack extracted text due to the cross-contamination
+        # guard).  See #2270.
+        if is_llm_extracted and not parties_data:
+            eff_title = case_title or event_data.get("case_title")
+            if eff_title:
+                parties_data = extract_parties_from_caption(eff_title)
+                if parties_data:
+                    extraction_methods["parties"] = "regex_post_llm"
+        if is_llm_extracted and case_type is None and case_number:
+            case_type = extract_case_type_from_number(case_number)
+            if case_type:
+                extraction_methods["case_type"] = "regex_post_llm"
 
         # Clean ruling text for display — extraction uses raw text above for
         # better regex matching; the cleaned version is stored in Postgres.
