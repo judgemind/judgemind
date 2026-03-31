@@ -167,6 +167,13 @@ class CourtDirectory(abc.ABC):
             )
         self._conn.commit()
 
+        # Invalidate the roster name cache so that resolve_judge() picks up
+        # the new snapshot immediately instead of waiting for TTL expiry.
+        # Lazy import to avoid circular dependency (framework -> ingestion).
+        from ingestion.db import clear_roster_cache
+
+        clear_roster_cache()
+
         logger.info(
             "Saved directory snapshot",
             court_id=court_id,

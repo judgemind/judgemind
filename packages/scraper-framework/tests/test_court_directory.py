@@ -242,6 +242,44 @@ class TestSaveSnapshot:
         s3_client.put_object.assert_not_called()  # skip upload
         directory._conn.commit.assert_called_once()  # still insert into DB
 
+    def test_clears_roster_cache_on_new_snapshot(self, directory: _StubDirectory) -> None:
+        """Saving a new snapshot should clear the roster name cache."""
+        from ingestion.db import _roster_cache, clear_roster_cache
+
+        # Pre-populate the cache with a fake entry
+        _roster_cache["some-court-uuid"] = (0.0, ["Judge Cached"])
+
+        cursor = directory._conn.cursor.return_value.__enter__.return_value
+        cursor.fetchone.return_value = None  # not a duplicate
+
+        directory.save_snapshot(RAW_HTML, MAPPING, COURT_ID)
+
+        # The cache should have been cleared
+        assert "some-court-uuid" not in _roster_cache
+
+        # Clean up
+        clear_roster_cache()
+
+    def test_does_not_clear_roster_cache_on_duplicate(self, directory: _StubDirectory) -> None:
+        """When content is a duplicate (no DB insert), cache is NOT cleared."""
+        from ingestion.db import _roster_cache, clear_roster_cache
+
+        # Pre-populate the cache
+        _roster_cache["some-court-uuid"] = (0.0, ["Judge Cached"])
+
+        cursor = directory._conn.cursor.return_value.__enter__.return_value
+        # _is_duplicate check: return the same content_hash -> is duplicate
+        cursor.fetchone.return_value = (sha256_hex(RAW_HTML),)
+
+        result = directory.save_snapshot(RAW_HTML, MAPPING, COURT_ID)
+
+        assert result is False
+        # Cache should NOT have been cleared (no new snapshot was inserted)
+        assert "some-court-uuid" in _roster_cache
+
+        # Clean up
+        clear_roster_cache()
+
 
 # ---------------------------------------------------------------------------
 # get_snapshot tests

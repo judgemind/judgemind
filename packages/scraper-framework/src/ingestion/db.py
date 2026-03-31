@@ -17,6 +17,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import re
+import time
 from datetime import date, datetime
 from typing import TYPE_CHECKING
 
@@ -840,11 +841,39 @@ def fuzzy_match_roster_name(
     return best_match
 
 
+# In-memory cache for roster name lookups.  Keyed by court UUID, values are
+# ``(monotonic_timestamp, names_list)`` tuples.  Roster data changes at most
+# daily (via ``fetch_rosters.py``), so a 5-minute TTL eliminates 20,000+
+# redundant queries during a full rebuild while keeping the window for stale
+# data acceptably short.
+_roster_cache: dict[str, tuple[float, list[str]]] = {}
+_ROSTER_CACHE_TTL = 300  # seconds (5 minutes)
+
+
+def clear_roster_cache(court_id: str | None = None) -> None:
+    """Clear the roster name cache.
+
+    Parameters
+    ----------
+    court_id : str or None
+        If provided, clear only the entry for this court UUID.
+        If ``None``, clear the entire cache.
+    """
+    if court_id is None:
+        _roster_cache.clear()
+    else:
+        _roster_cache.pop(court_id, None)
+
+
 def _get_roster_names(
     conn: psycopg.Connection,
     court_id: str,
 ) -> list[str]:
     """Get unique judge names from the latest court directory snapshot.
+
+    Results are cached per *court_id* with a short TTL to avoid redundant
+    queries when ``resolve_judge()`` is called once per document event during
+    bulk processing.
 
     Parameters
     ----------
@@ -859,6 +888,11 @@ def _get_roster_names(
         List of unique judge names from the roster. Empty list if no
         snapshot exists or the court_code cannot be determined.
     """
+    now = time.monotonic()
+    cached = _roster_cache.get(court_id)
+    if cached is not None and now - cached[0] < _ROSTER_CACHE_TTL:
+        return cached[1]
+
     # Get the court_code for this court UUID, then convert to snapshot format
     with conn.cursor() as cur:
         cur.execute(
@@ -867,6 +901,7 @@ def _get_roster_names(
         )
         row = cur.fetchone()
     if row is None:
+        _roster_cache[court_id] = (now, [])
         return []
 
     court_code: str = row[0]
@@ -887,6 +922,7 @@ def _get_roster_names(
         row = cur.fetchone()
 
     if row is None or row[0] is None:
+        _roster_cache[court_id] = (now, [])
         return []
 
     import json
@@ -903,10 +939,13 @@ def _get_roster_names(
                 "Failed to parse court directory mapping for roster lookup",
                 extra={"court_id": court_id},
             )
+            _roster_cache[court_id] = (now, [])
             return []
 
     # Return unique judge names from the mapping values
-    return list(set(mapping.values()))
+    result = list(set(mapping.values()))
+    _roster_cache[court_id] = (now, result)
+    return result
 
 
 def resolve_judge(

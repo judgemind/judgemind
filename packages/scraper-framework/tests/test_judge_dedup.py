@@ -12,14 +12,24 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock
 
+import pytest
+
 from ingestion.db import (
     _get_roster_names,
     _levenshtein_distance,
     _normalize_for_comparison,
+    clear_roster_cache,
     fuzzy_match_roster_name,
     normalize_judge_name,
     resolve_judge,
 )
+
+
+@pytest.fixture(autouse=True)
+def _clear_roster_cache() -> None:
+    """Clear the roster name cache before every test to prevent cross-test pollution."""
+    clear_roster_cache()
+
 
 # ---------------------------------------------------------------------------
 # _levenshtein_distance
@@ -278,6 +288,176 @@ class TestGetRosterNames:
 
         result = _get_roster_names(mock_conn, "court-uuid-1")
         assert result == ["Judge Alpha"]
+
+
+# ---------------------------------------------------------------------------
+# _get_roster_names — caching
+# ---------------------------------------------------------------------------
+
+
+class TestGetRosterNamesCache:
+    """Tests for the TTL cache in _get_roster_names."""
+
+    def test_second_call_uses_cache(self) -> None:
+        """Second call for the same court_id does not hit the database."""
+        mock_conn = MagicMock()
+        mock_cur = MagicMock()
+        mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cur)
+        mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+
+        mock_cur.fetchone.side_effect = [
+            ("ca-orange",),
+            ({"D1": "John Smith"},),
+        ]
+
+        # First call populates the cache
+        result1 = _get_roster_names(mock_conn, "court-uuid-cache")
+        assert result1 == ["John Smith"]
+        assert mock_cur.execute.call_count == 2
+
+        # Second call should use the cache (no additional queries)
+        result2 = _get_roster_names(mock_conn, "court-uuid-cache")
+        assert result2 == ["John Smith"]
+        assert mock_cur.execute.call_count == 2  # unchanged
+
+    def test_different_court_ids_cached_separately(self) -> None:
+        """Each court_id has its own cache entry."""
+        mock_conn = MagicMock()
+        mock_cur = MagicMock()
+        mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cur)
+        mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+
+        mock_cur.fetchone.side_effect = [
+            ("ca-orange",),
+            ({"D1": "Judge A"},),
+            ("ca-la",),
+            ({"D1": "Judge B"},),
+        ]
+
+        result_a = _get_roster_names(mock_conn, "court-a")
+        result_b = _get_roster_names(mock_conn, "court-b")
+
+        assert result_a == ["Judge A"]
+        assert result_b == ["Judge B"]
+        assert mock_cur.execute.call_count == 4  # 2 queries per court
+
+    def test_clear_roster_cache_all(self) -> None:
+        """clear_roster_cache() without args clears the entire cache."""
+        mock_conn = MagicMock()
+        mock_cur = MagicMock()
+        mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cur)
+        mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+
+        mock_cur.fetchone.side_effect = [
+            ("ca-orange",),
+            ({"D1": "Judge A"},),
+        ]
+
+        _get_roster_names(mock_conn, "court-clear-all")
+        assert mock_cur.execute.call_count == 2
+
+        # Clear the cache
+        clear_roster_cache()
+
+        # Re-populate mock for the next call
+        mock_cur.fetchone.side_effect = [
+            ("ca-orange",),
+            ({"D1": "Judge A"},),
+        ]
+
+        # Should hit the DB again
+        _get_roster_names(mock_conn, "court-clear-all")
+        assert mock_cur.execute.call_count == 4
+
+    def test_clear_roster_cache_single_court(self) -> None:
+        """clear_roster_cache(court_id) clears only that entry."""
+        mock_conn = MagicMock()
+        mock_cur = MagicMock()
+        mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cur)
+        mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+
+        mock_cur.fetchone.side_effect = [
+            ("ca-orange",),
+            ({"D1": "Judge A"},),
+            ("ca-la",),
+            ({"D1": "Judge B"},),
+        ]
+
+        _get_roster_names(mock_conn, "court-x")
+        _get_roster_names(mock_conn, "court-y")
+        assert mock_cur.execute.call_count == 4
+
+        # Clear only court-x
+        clear_roster_cache("court-x")
+
+        mock_cur.fetchone.side_effect = [
+            ("ca-orange",),
+            ({"D1": "Judge A Updated"},),
+        ]
+
+        # court-x should re-query
+        result_x = _get_roster_names(mock_conn, "court-x")
+        assert result_x == ["Judge A Updated"]
+        assert mock_cur.execute.call_count == 6
+
+        # court-y should still be cached
+        result_y = _get_roster_names(mock_conn, "court-y")
+        assert result_y == ["Judge B"]
+        assert mock_cur.execute.call_count == 6  # unchanged
+
+    def test_cache_expires_after_ttl(self) -> None:
+        """Cached values are refreshed after the TTL expires."""
+        import time
+
+        from ingestion.db import _roster_cache
+
+        mock_conn = MagicMock()
+        mock_cur = MagicMock()
+        mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cur)
+        mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+
+        mock_cur.fetchone.side_effect = [
+            ("ca-orange",),
+            ({"D1": "Judge Old"},),
+        ]
+
+        result1 = _get_roster_names(mock_conn, "court-ttl")
+        assert result1 == ["Judge Old"]
+        assert mock_cur.execute.call_count == 2
+
+        # Backdate the cache entry so it appears expired
+        _roster_cache["court-ttl"] = (
+            time.monotonic() - 400,  # 400 seconds ago, well past 300s TTL
+            ["Judge Old"],
+        )
+
+        mock_cur.fetchone.side_effect = [
+            ("ca-orange",),
+            ({"D1": "Judge New"},),
+        ]
+
+        result2 = _get_roster_names(mock_conn, "court-ttl")
+        assert result2 == ["Judge New"]
+        assert mock_cur.execute.call_count == 4
+
+    def test_empty_result_is_cached(self) -> None:
+        """Empty results (no court or no snapshot) are also cached."""
+        mock_conn = MagicMock()
+        mock_cur = MagicMock()
+        mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cur)
+        mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+
+        # No court found
+        mock_cur.fetchone.return_value = None
+
+        result1 = _get_roster_names(mock_conn, "court-empty")
+        assert result1 == []
+        assert mock_cur.execute.call_count == 1
+
+        # Second call should use cache
+        result2 = _get_roster_names(mock_conn, "court-empty")
+        assert result2 == []
+        assert mock_cur.execute.call_count == 1  # unchanged
 
 
 # ---------------------------------------------------------------------------
