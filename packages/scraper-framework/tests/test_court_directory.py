@@ -8,6 +8,7 @@ from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
+from botocore.exceptions import ClientError
 
 from framework.court_directory import CourtDirectory
 from framework.hashing import sha256_hex
@@ -45,9 +46,17 @@ RAW_HTML = b"<html><table><tr><td>Judge Smith</td><td>Dept 1</td></tr></table></
 MAPPING = {"1": "Judge Smith", "2": "Judge Jones"}
 
 
+def _head_object_404(**kwargs: Any) -> None:
+    """Simulate S3 HeadObject returning 404 (object not found)."""
+    raise ClientError({"Error": {"Code": "404", "Message": "Not Found"}}, "HeadObject")
+
+
 @pytest.fixture()
 def s3_client() -> MagicMock:
-    return MagicMock()
+    mock = MagicMock()
+    # Default: HeadObject returns 404 (object doesn't exist).
+    mock.head_object.side_effect = _head_object_404
+    return mock
 
 
 @pytest.fixture()
@@ -79,21 +88,64 @@ def directory(s3_client: MagicMock, db_conn: MagicMock) -> _StubDirectory:
 class TestSaveSnapshot:
     """Tests for CourtDirectory.save_snapshot()."""
 
-    def test_archives_to_s3(self, directory: _StubDirectory, s3_client: MagicMock) -> None:
-        """Raw bytes should be uploaded to S3 with correct key pattern."""
-        # No existing snapshot -> not a duplicate
+    def test_uses_content_addressed_s3_key(
+        self, directory: _StubDirectory, s3_client: MagicMock
+    ) -> None:
+        """S3 key should use content hash, not timestamp."""
         cursor = directory._conn.cursor.return_value.__enter__.return_value
         cursor.fetchone.return_value = None
 
         directory.save_snapshot(RAW_HTML, MAPPING, COURT_ID)
 
+        expected_hash = sha256_hex(RAW_HTML)
+        expected_key = f"directories/{COURT_ID}/{expected_hash}.html"
+        call_kwargs = s3_client.put_object.call_args.kwargs
+        assert call_kwargs["Key"] == expected_key
+
+    def test_archives_to_s3_when_not_exists(
+        self, directory: _StubDirectory, s3_client: MagicMock
+    ) -> None:
+        """Raw bytes should be uploaded to S3 when HeadObject returns 404."""
+        cursor = directory._conn.cursor.return_value.__enter__.return_value
+        cursor.fetchone.return_value = None
+
+        directory.save_snapshot(RAW_HTML, MAPPING, COURT_ID)
+
+        s3_client.head_object.assert_called_once()
         s3_client.put_object.assert_called_once()
         call_kwargs = s3_client.put_object.call_args.kwargs
         assert call_kwargs["Bucket"] == "test-bucket"
-        assert call_kwargs["Key"].startswith(f"directories/{COURT_ID}/")
-        assert call_kwargs["Key"].endswith(".html")
         assert call_kwargs["Body"] == RAW_HTML
         assert call_kwargs["ContentType"] == "text/html"
+
+    def test_skips_s3_upload_when_already_exists(
+        self, directory: _StubDirectory, s3_client: MagicMock
+    ) -> None:
+        """When HeadObject succeeds (object exists), skip the upload."""
+        s3_client.head_object.side_effect = None
+        s3_client.head_object.return_value = {}
+        cursor = directory._conn.cursor.return_value.__enter__.return_value
+        cursor.fetchone.return_value = None
+
+        directory.save_snapshot(RAW_HTML, MAPPING, COURT_ID)
+
+        s3_client.head_object.assert_called_once()
+        s3_client.put_object.assert_not_called()
+
+    def test_reraises_non_404_head_object_error(
+        self, directory: _StubDirectory, s3_client: MagicMock
+    ) -> None:
+        """Non-404 HeadObject errors should be re-raised."""
+        s3_client.head_object.side_effect = ClientError(
+            {"Error": {"Code": "403", "Message": "Forbidden"}}, "HeadObject"
+        )
+        cursor = directory._conn.cursor.return_value.__enter__.return_value
+        cursor.fetchone.return_value = None
+
+        with pytest.raises(ClientError) as exc_info:
+            directory.save_snapshot(RAW_HTML, MAPPING, COURT_ID)
+
+        assert exc_info.value.response["Error"]["Code"] == "403"
 
     def test_inserts_into_db_when_new(self, directory: _StubDirectory) -> None:
         """A new snapshot should be inserted into the DB."""
@@ -144,6 +196,51 @@ class TestSaveSnapshot:
         # The mapping JSON is the 4th parameter (index 3)
         stored_json = insert_params[3]
         assert stored_json == json.dumps(MAPPING, sort_keys=True)
+
+    def test_s3_key_uses_content_hash_not_timestamp(
+        self, directory: _StubDirectory, s3_client: MagicMock
+    ) -> None:
+        """S3 key format should be directories/{court_id}/{content_hash}.html."""
+        cursor = directory._conn.cursor.return_value.__enter__.return_value
+        cursor.fetchone.return_value = None
+
+        directory.save_snapshot(RAW_HTML, MAPPING, COURT_ID)
+
+        expected_hash = sha256_hex(RAW_HTML)
+        head_call_kwargs = s3_client.head_object.call_args.kwargs
+        assert head_call_kwargs["Key"] == f"directories/{COURT_ID}/{expected_hash}.html"
+        assert head_call_kwargs["Bucket"] == "test-bucket"
+
+    def test_db_insert_uses_content_addressed_s3_key(self, directory: _StubDirectory) -> None:
+        """The s3_key stored in DB should be the content-addressed key."""
+        cursor = directory._conn.cursor.return_value.__enter__.return_value
+        cursor.fetchone.return_value = None
+
+        directory.save_snapshot(RAW_HTML, MAPPING, COURT_ID)
+
+        expected_hash = sha256_hex(RAW_HTML)
+        expected_key = f"directories/{COURT_ID}/{expected_hash}.html"
+        calls = cursor.execute.call_args_list
+        insert_params = calls[1].args[1]
+        # s3_key is the 3rd parameter (index 2)
+        assert insert_params[2] == expected_key
+
+    def test_s3_already_exists_but_db_insert_still_happens(
+        self, directory: _StubDirectory, s3_client: MagicMock
+    ) -> None:
+        """When S3 already has the object but DB doesn't, still insert into DB."""
+        # HeadObject succeeds — content already in S3
+        s3_client.head_object.side_effect = None
+        s3_client.head_object.return_value = {}
+        cursor = directory._conn.cursor.return_value.__enter__.return_value
+        # _is_duplicate returns None (no existing DB row) — not a duplicate
+        cursor.fetchone.return_value = None
+
+        result = directory.save_snapshot(RAW_HTML, MAPPING, COURT_ID)
+
+        assert result is True
+        s3_client.put_object.assert_not_called()  # skip upload
+        directory._conn.commit.assert_called_once()  # still insert into DB
 
 
 # ---------------------------------------------------------------------------
@@ -213,7 +310,7 @@ class TestFetchAndSnapshot:
         result = directory.fetch_and_snapshot(COURT_ID)
 
         assert result == MAPPING
-        # Verify S3 upload happened
+        # Verify S3 upload happened (HeadObject returns 404 by default)
         directory._s3.put_object.assert_called_once()
 
     def test_returns_mapping_from_fetch(self, directory: _StubDirectory) -> None:
