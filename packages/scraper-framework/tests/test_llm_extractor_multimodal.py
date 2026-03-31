@@ -314,6 +314,226 @@ class TestParsePageRows:
         rows = _parse_page_rows('"just a string"', page_index=0)
         assert rows == []
 
+    # --- New 4-field format tests ---
+
+    def test_new_format_case_number_and_case_title(self) -> None:
+        """New 4-field format with separate case_number and case_title."""
+        raw = json.dumps(
+            {
+                "page_header": None,
+                "rulings": [
+                    {
+                        "entry_number": "1",
+                        "case_number": "C22-01971",
+                        "case_title": "Marquez vs. Kohl's Department Stores, Inc.",
+                        "ruling_text": "The motion is denied as moot.",
+                    }
+                ],
+            }
+        )
+        rows = _parse_page_rows(raw, page_index=0)
+        assert len(rows) == 1
+        assert rows[0]["entry_number"] == 1
+        assert "C22-01971" in rows[0]["case_info"]
+        assert "Marquez" in rows[0]["case_info"]
+        assert "denied" in rows[0]["ruling_text"]
+
+    def test_new_format_null_case_number(self) -> None:
+        """Null case_number should not produce 'None' in case_info."""
+        raw = json.dumps(
+            {
+                "page_header": None,
+                "rulings": [
+                    {
+                        "entry_number": "1",
+                        "case_number": None,
+                        "case_title": "Smith vs. Jones",
+                        "ruling_text": "Granted.",
+                    }
+                ],
+            }
+        )
+        rows = _parse_page_rows(raw, page_index=0)
+        assert "None" not in rows[0]["case_info"]
+        assert "Smith vs. Jones" in rows[0]["case_info"]
+
+    def test_page_header_emits_synthetic_row(self) -> None:
+        """page_header produces a synthetic header row for _join_page_rows."""
+        raw = json.dumps(
+            {
+                "page_header": {
+                    "department": "16",
+                    "judge_name": "Benjamin T Reyes II",
+                    "hearing_date": "2026-03-25",
+                },
+                "rulings": [],
+            }
+        )
+        rows = _parse_page_rows(raw, page_index=0)
+        assert len(rows) == 1
+        assert rows[0]["entry_number"] is None
+        assert rows[0]["ruling_text"] == ""
+        assert "Department 16" in rows[0]["case_info"]
+        assert "JUDGE Benjamin T Reyes II" in rows[0]["case_info"]
+        assert "Hearing Date: 2026-03-25" in rows[0]["case_info"]
+
+    def test_line_number_entry_number(self) -> None:
+        """'Line 2' style entry numbers should extract the numeric portion."""
+        raw = json.dumps(
+            [{"entry_number": "Line 2", "case_info": "test v. test", "ruling_text": "t"}]
+        )
+        rows = _parse_page_rows(raw, page_index=0)
+        assert rows[0]["entry_number"] == 2
+
+    def test_parenthesized_entry_number(self) -> None:
+        """'(47)' style entry numbers should be parsed."""
+        raw = json.dumps(
+            [{"entry_number": "(47)", "case_info": "test v. test", "ruling_text": "t"}]
+        )
+        rows = _parse_page_rows(raw, page_index=0)
+        assert rows[0]["entry_number"] == 47
+
+    def test_trailing_county_prefix_stripped(self) -> None:
+        """Trailing single-letter county prefix is stripped from case_title."""
+        raw = json.dumps(
+            {
+                "rulings": [
+                    {
+                        "entry_number": "1",
+                        "case_number": "22-01971",
+                        "case_title": "SMITH VS. JONES C",
+                        "ruling_text": "Denied.",
+                    }
+                ]
+            }
+        )
+        rows = _parse_page_rows(raw, page_index=0)
+        assert not rows[0]["case_info"].endswith(" C")
+
+    # ---------------------------------------------------------------------------
+    # _CASE_NUMBER_RE tests
+    # ---------------------------------------------------------------------------
+
+    def test_json_object_in_text(self) -> None:
+        """JSON object embedded in non-JSON text is extracted."""
+        raw = (
+            "Here is the result: "
+            '{"rulings": [{"entry_number": "1",'
+            ' "case_info": "test v. case",'
+            ' "ruling_text": "t"}]} end'
+        )
+        rows = _parse_page_rows(raw, page_index=0)
+        assert len(rows) == 1
+        assert rows[0]["entry_number"] == 1
+
+    def test_json_object_bad_content(self) -> None:
+        """JSON object with invalid content returns empty."""
+        raw = "Some text {not valid json} more text"
+        rows = _parse_page_rows(raw, page_index=0)
+        assert rows == []
+
+
+class TestExtractCaseTitleTruncation:
+    """Tests for case_title truncation in _extract_case_title_from_info."""
+
+    def test_long_title_with_vs_and_case_number(self) -> None:
+        """Titles with v. followed by a second case number are truncated."""
+        info = "Smith v. Jones 26CV484550 David Rome v. Other Party 23CV417411"
+        title = _extract_case_title_from_info(info)
+        assert title is not None
+        assert len(title) < 150
+        assert "Smith v. Jones" in title
+
+    def test_probate_title_with_multiple_cases(self) -> None:
+        """Probate titles with multiple CONSERVATORSHIP/ESTATE patterns are truncated."""
+        info = (
+            "IN THE MATTER OF: CHARLENE DOWNS "
+            "CONSERVATORSHIP OF KENNETH CARLSON MSP12-00793 "
+            "ESTATE OF HENRY FASQUELLE GUARDIANSHIP OF NAYELLI BRONSON"
+        )
+        title = _extract_case_title_from_info(info)
+        assert title is not None
+        assert len(title) <= 150
+
+    def test_hard_truncation_fallback(self) -> None:
+        """Titles over 150 chars without v. or probate pattern are hard-truncated."""
+        info = "A " * 100  # 200 chars, no v. or probate pattern
+        title = _extract_case_title_from_info(info)
+        assert title is not None
+        assert len(title) <= 150
+
+    def test_trailing_county_prefix_stripped(self) -> None:
+        """Trailing C or N from case number prefix is stripped."""
+        info = "SMITH VS. JONES C\n22-01971"
+        title = _extract_case_title_from_info(info)
+        assert title is not None
+        assert not title.endswith(" C")
+
+    def test_none_artifact_removed(self) -> None:
+        """'None' text artifacts from null JSON fields are removed."""
+        info = "None None SMITH VS. JONES\n24-378499"
+        title = _extract_case_title_from_info(info)
+        assert title is not None
+        assert "None" not in title
+
+
+class TestJoinPageRowsHeaderDate:
+    """Tests for hearing_date extraction from page_header rows."""
+
+    def test_hearing_date_from_header(self) -> None:
+        """hearing_date is extracted from synthetic header rows."""
+        rows = [
+            {
+                "entry_number": None,
+                "case_info": "Department 16\nJUDGE Test\nHearing Date: 2026-03-25",
+                "ruling_text": "",
+            },
+            {
+                "entry_number": 1,
+                "case_info": "Smith v. Jones\nC22-01971",
+                "ruling_text": "Granted.",
+            },
+        ]
+        rulings = _join_page_rows(rows)
+        assert len(rulings) == 1
+        assert rulings[0].hearing_date == "2026-03-25"
+        assert rulings[0].extracted_judge_name == "Test"
+        assert rulings[0].department == "16"
+
+
+class TestCaseNumberRegex:
+    """Tests for the expanded _CASE_NUMBER_RE pattern."""
+
+    def test_oc_dash_format(self) -> None:
+        assert _extract_case_number_from_info("2024-01393434 Martinez") is not None
+
+    def test_oc_family_format(self) -> None:
+        assert _extract_case_number_from_info("25D006297 BAEZ V. BAEZ") is not None
+
+    def test_riverside_format(self) -> None:
+        assert _extract_case_number_from_info("CVRI2401570 SMITH VS DOE") is not None
+
+    def test_santa_clara_format(self) -> None:
+        assert _extract_case_number_from_info("26CV484550 City v. Feil") is not None
+
+    def test_fresno_format(self) -> None:
+        assert _extract_case_number_from_info("18CECG00898 Alarcon v. Monroe") is not None
+
+    def test_sf_format(self) -> None:
+        assert _extract_case_number_from_info("FPT-24-378499 Fuller v. Robinson") is not None
+
+    def test_cc_format(self) -> None:
+        assert _extract_case_number_from_info("C22-01971 Marquez v. Kohl's") is not None
+
+    def test_sb_format(self) -> None:
+        assert _extract_case_number_from_info("CIVSB2116995 Muro v. Safety") is not None
+
+    def test_ventura_format(self) -> None:
+        assert _extract_case_number_from_info("2024CUOR027466 Williams v. Paseo") is not None
+
+    def test_no_false_positive_on_word(self) -> None:
+        assert _extract_case_number_from_info("HEARING ON MOTION") is None
+
 
 # ---------------------------------------------------------------------------
 # _is_new_case tests
@@ -900,7 +1120,7 @@ class TestExtractFromPdf:
         ):
             ext.extract_from_pdf(sample_pdf_bytes)
 
-        mock_render.assert_called_once_with(sample_pdf_bytes, 20)
+        mock_render.assert_called_once_with(sample_pdf_bytes, 50)
         # One call per page = 2 calls for 2 pages.
         assert mock_call.call_count == 2
         # Each call should have exactly one image.
@@ -1402,7 +1622,7 @@ class TestBuildUserMessageForPage:
     def test_no_metadata(self) -> None:
         """Without metadata, produces a generic extraction message."""
         msg = LlmExtractor._build_user_message_for_page(None)
-        assert "Transcribe all rows" in msg
+        assert "Extract all tentative rulings" in msg
 
     def test_with_all_metadata(self) -> None:
         """With all metadata keys, includes them in the message."""
@@ -1489,13 +1709,15 @@ class TestPerPagePrompt:
         assert isinstance(PDF_PER_PAGE_PROMPT, str)
         assert len(PDF_PER_PAGE_PROMPT) > 100
 
-    def test_per_page_prompt_describes_three_columns(self) -> None:
-        """The per-page prompt describes the three-column table format."""
+    def test_per_page_prompt_describes_output_fields(self) -> None:
+        """The per-page prompt describes all output fields."""
         from framework.llm_extractor import PDF_PER_PAGE_PROMPT
 
         assert "entry_number" in PDF_PER_PAGE_PROMPT
-        assert "case_info" in PDF_PER_PAGE_PROMPT
+        assert "case_number" in PDF_PER_PAGE_PROMPT
+        assert "case_title" in PDF_PER_PAGE_PROMPT
         assert "ruling_text" in PDF_PER_PAGE_PROMPT
+        assert "page_header" in PDF_PER_PAGE_PROMPT
 
     def test_per_page_prompt_requests_json_output(self) -> None:
         """The per-page prompt asks for JSON output with rulings key."""
@@ -1503,11 +1725,13 @@ class TestPerPagePrompt:
 
         assert "rulings" in PDF_PER_PAGE_PROMPT
 
-    def test_per_page_prompt_uses_visual_structure(self) -> None:
-        """The per-page prompt describes visual position relative to ruled lines."""
+    def test_per_page_prompt_handles_multiple_layouts(self) -> None:
+        """The per-page prompt describes handling for various PDF layouts."""
         from framework.llm_extractor import PDF_PER_PAGE_PROMPT
 
-        assert "VERTICAL RULED LINES" in PDF_PER_PAGE_PROMPT
-        assert "VISUAL POSITION" in PDF_PER_PAGE_PROMPT
-        assert "WIDEST column" in PDF_PER_PAGE_PROMPT
-        assert "When in doubt" in PDF_PER_PAGE_PROMPT
+        assert "Tables" in PDF_PER_PAGE_PROMPT
+        assert "Bordered boxes" in PDF_PER_PAGE_PROMPT
+        assert "Free-form prose" in PDF_PER_PAGE_PROMPT
+        assert "Label-value forms" in PDF_PER_PAGE_PROMPT
+        assert "Continuation pages" in PDF_PER_PAGE_PROMPT
+        assert "Boilerplate-only pages" in PDF_PER_PAGE_PROMPT

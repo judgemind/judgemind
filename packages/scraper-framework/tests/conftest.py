@@ -35,7 +35,7 @@ import hashlib
 import os
 from collections.abc import Callable, Generator
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -169,6 +169,30 @@ def _cache_pdf_text_extraction(
     yield
     for p in reversed(patches):
         p.stop()
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _disable_llm_s3_cache() -> Generator[None, None, None]:
+    """Prevent LLM extraction cache from hitting real S3 during tests.
+
+    The ``_LlmCache`` in ``llm_extractor.py`` uses ``S3_CACHE_DIR`` to
+    locate cached results.  If this env var is set in the developer's shell
+    (e.g. for local rebuilds), tests that call ``extract_from_pdf`` can
+    hit stale cached results instead of exercising the mocked code paths.
+
+    We patch the ``_get_cache_s3_client`` to return a mock whose get/put
+    methods always raise, so the ``_LlmCache.get()`` returns ``None``
+    (its except branch) and ``_LlmCache.put()`` logs a warning.  The
+    ``_LlmCache`` class is NOT replaced, preserving coverage measurement.
+    """
+    broken_s3 = MagicMock()
+    broken_s3.get_object.side_effect = Exception("no S3 in tests")
+    broken_s3.put_object.side_effect = Exception("no S3 in tests")
+    with patch(
+        "framework.llm_extractor.LlmExtractor._get_cache_s3_client",
+        staticmethod(lambda: broken_s3),
+    ):
+        yield
 
 
 @pytest.fixture(autouse=True, scope="session")

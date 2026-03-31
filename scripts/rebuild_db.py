@@ -14,6 +14,7 @@
 # Usage (ECS, against dev):
 #   scripts/ecs-run-task.sh scripts/rebuild_db.py
 """
+
 from __future__ import annotations
 
 import hashlib
@@ -83,17 +84,21 @@ def discover_courts(keys: list[str]) -> list[dict[str, str]]:
         if court_code in seen:
             continue
         seen.add(court_code)
-        courts.append({
-            "state": unsluggify(parsed["state"]),
-            "county": unsluggify(parsed["county"]),
-            "court_name": unsluggify(parsed["court"]),
-            "court_code": court_code,
-            "timezone": STATE_TIMEZONES.get(parsed["state"], "America/Los_Angeles"),
-        })
+        courts.append(
+            {
+                "state": unsluggify(parsed["state"]),
+                "county": unsluggify(parsed["county"]),
+                "court_name": unsluggify(parsed["court"]),
+                "court_code": court_code,
+                "timezone": STATE_TIMEZONES.get(parsed["state"], "America/Los_Angeles"),
+            }
+        )
     return courts
 
 
-def seed_courts(conn: psycopg.Connection, courts: list[dict[str, str]]) -> dict[str, str]:
+def seed_courts(
+    conn: psycopg.Connection, courts: list[dict[str, str]]
+) -> dict[str, str]:
     """Insert courts and return {court_code: court_id} mapping."""
     court_ids: dict[str, str] = {}
     with conn.cursor() as cur:
@@ -256,6 +261,45 @@ def _process_one_document(
         return "error"
 
 
+def reset_derived_tables(conn: psycopg.Connection) -> None:
+    """Truncate all tables in the derived schema, preserving public/telemetry data."""
+    logger.info("Resetting derived schema — truncating all derived tables...")
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT tablename FROM pg_tables WHERE schemaname = 'derived' ORDER BY tablename"
+        )
+        tables = [row[0] for row in cur.fetchall()]
+    if not tables:
+        logger.warning("No tables found in derived schema")
+        return
+    qualified = ", ".join(f"derived.{t}" for t in tables)
+    with conn.cursor() as cur:
+        cur.execute(f"TRUNCATE {qualified} CASCADE")
+    conn.commit()
+    logger.info("Truncated derived tables", tables=tables)
+
+
+def reset_opensearch_index(os_url: str) -> None:
+    """Delete the OpenSearch tentative_rulings index so it's rebuilt from scratch."""
+    from opensearchpy import OpenSearch
+
+    os_kwargs: dict = {"hosts": [os_url]}
+    os_user = os.environ.get("OPENSEARCH_USERNAME", "")
+    os_pass = os.environ.get("OPENSEARCH_PASSWORD", "")
+    if os_user and os_pass:
+        os_kwargs["http_auth"] = (os_user, os_pass)
+    client = OpenSearch(**os_kwargs)
+
+    index_name = "tentative_rulings_v1"
+    if client.indices.exists(index=index_name):
+        client.indices.delete(index=index_name)
+        logger.info("Deleted OpenSearch index", index=index_name)
+    else:
+        logger.info(
+            "OpenSearch index does not exist, nothing to delete", index=index_name
+        )
+
+
 def main() -> None:
     import argparse
 
@@ -265,6 +309,11 @@ def main() -> None:
         type=int,
         default=int(os.environ.get("REBUILD_CONCURRENCY", "64")),
         help="Number of parallel processes (default: 64, or REBUILD_CONCURRENCY env)",
+    )
+    parser.add_argument(
+        "--reset",
+        action="store_true",
+        help="Truncate all derived tables and delete OpenSearch index before rebuilding",
     )
     args = parser.parse_args()
 
@@ -278,6 +327,16 @@ def main() -> None:
 
     s3 = make_s3_client()
     conn = psycopg.connect(database_url, autocommit=False)
+
+    os_url = os.environ.get("OPENSEARCH_URL", "")
+
+    # Step 0 (optional): Reset derived data for a clean rebuild
+    if args.reset:
+        reset_derived_tables(conn)
+        if os_url:
+            reset_opensearch_index(os_url)
+        else:
+            logger.info("OPENSEARCH_URL not set — skipping OpenSearch index reset")
 
     # Step 1: Discover keys (local cache or S3)
     logger.info("Discovering S3 objects...")
@@ -294,7 +353,9 @@ def main() -> None:
 
     # Step 2: Seed courts from key prefixes
     courts = discover_courts(keys)
-    logger.info("Discovered courts", count=len(courts), courts=[c["court_code"] for c in courts])
+    logger.info(
+        "Discovered courts", count=len(courts), courts=[c["court_code"] for c in courts]
+    )
     court_ids = seed_courts(conn, courts)
     logger.info("Courts seeded", court_ids=court_ids)
 
@@ -302,7 +363,6 @@ def main() -> None:
     # pdfplumber/pdfminer C extensions are not thread-safe — ProcessPoolExecutor
     # gives each worker its own address space. Each child process lazily creates
     # its own DB connection, Redis client, and IngestionWorker.
-    os_url = os.environ.get("OPENSEARCH_URL", "")
     if not os_url:
         logger.info("OPENSEARCH_URL not set — skipping search indexing")
 

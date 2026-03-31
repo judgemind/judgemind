@@ -183,56 +183,145 @@ class _LlmCache:
 # Per-page PDF extraction prompt and join patterns (#1590)
 # ---------------------------------------------------------------------------
 
-# System prompt for per-page extraction from OC-style 3-column PDF tables.
-# Each page is sent individually.  The LLM returns a JSON array of table rows.
-# This is the visual-structure prompt validated in PR #1692 (eval achieved 100%
-# lenient accuracy across all OC fixtures).
+# System prompt for per-page multimodal extraction from court ruling PDFs.
+# Each page is sent individually.  The LLM returns a JSON object with
+# per-case entries and optional page-level header info.  Supports all
+# California court PDF layouts: OC 3-column tables, Riverside mini-tables,
+# Santa Clara 4-column tables, Contra Costa bordered boxes, San Bernardino/
+# Ventura/San Francisco free-form prose, Fresno label-value forms, etc.
+#
+# Note: page_header extraction (department, judge, hearing_date) straddles
+# the transcription/enrichment boundary — it extracts metadata from page
+# visual structure rather than from ruling text content.  This is pragmatic:
+# the data is visible on the page image and avoids a second pass.  The
+# authoritative case_title should come from enrichment (#2212).
 PDF_PER_PAGE_PROMPT = (
     "You are a court ruling transcriber. You will receive a single page "
     "image from a California court tentative ruling PDF.\n\n"
-    "The page contains a TABLE with THREE COLUMNS separated by TWO "
-    "VERTICAL RULED LINES that run the full height of the page. ROWS "
-    "are separated by HORIZONTAL RULED LINES.\n\n"
-    "Use the VISUAL POSITION of text relative to the ruled lines to "
-    "determine which column it belongs to:\n\n"
-    "- Column 1 (entry_number): VERY NARROW column at the far left, "
-    "LEFT of the first vertical line. Usually blank.\n"
-    "- Column 2 (case_info): MEDIUM column BETWEEN the two vertical "
-    "lines. Contains case name and case number.\n"
-    "- Column 3 (ruling_text): the WIDEST column, taking up most "
-    "of the page width, RIGHT of the second vertical line. Contains "
-    "the full ruling text including all paragraphs, headings, and "
-    "numbered sections.\n\n"
-    "Most text on the page is in column 3. When in doubt about "
-    "column membership, the text is in column 3.\n\n"
-    "## Rules\n\n"
-    "- Return ONE JSON object per ROW (between horizontal lines).\n"
-    "- Read each column by its POSITION relative to the vertical "
-    "lines.\n"
+    "## Your task\n\n"
+    "Extract every tentative ruling on this page into a JSON object.\n\n"
+    "## Output format\n\n"
+    "Return a JSON object with two keys:\n\n"
+    '**"page_header"** (object or null): If this page has a document '
+    "header with the department, judge name, or hearing date, extract "
+    "them here. Return null if none are visible on this page.\n"
+    "  - **department**: The department NUMBER or CODE only (e.g. '16', "
+    "'C25', 'PS1', 'R17'), NOT the word 'Department'.\n"
+    "  - **judge_name**: The judge's full name WITHOUT titles like "
+    "'Hon.', 'Judge', 'Honorable', or 'Commissioner'.\n"
+    "  - **hearing_date**: In ISO format 'YYYY-MM-DD'.\n\n"
+    '**"rulings"** (array): One object per case ruling on this page. '
+    "Each object has these fields:\n\n"
+    "- **entry_number** (string): Calendar line number, item number, "
+    "or sequence number (e.g. '1', '101', '(47)', 'Line 2'). "
+    "Empty string if none.\n"
+    "- **case_number** (string): The FULL case number exactly as "
+    "printed, including any letter prefix (e.g. 'C22-01971', "
+    "'2024-01393434', 'CVRI2401570', '22SMCV01940', 'N25-2112'). "
+    "The letter prefix (C, N, etc.) is part of the case number, not "
+    "part of the case title. Empty string if not visible.\n"
+    "- **case_title** (string): ONLY the party names from the case "
+    "caption (e.g. 'Constantina Marquez vs. Kohl\\'s Department "
+    "Stores, Inc.'). This is JUST the names — plaintiff vs. "
+    "defendant. Do NOT include case numbers, letter prefixes (C, N), "
+    "hearing times, motion descriptions, 'HEARING ON...', "
+    "'PETITION OF...', cause of action descriptions, or any other "
+    "text. Empty string if not visible.\n"
+    "- **ruling_text** (string): The COMPLETE text the judge wrote "
+    "about this case. Include EVERYTHING — motion type/description, "
+    "procedural background, legal standard, analysis, discussion, "
+    "conclusion, disposition, orders, and any other content the "
+    "judge wrote about this case. Do not summarize or omit anything. "
+    "Empty string if not visible.\n\n"
+    "## How to handle different page layouts\n\n"
+    "California courts use many different PDF formats. Identify which "
+    "layout this page uses and extract accordingly:\n\n"
+    "**Tables** (columns separated by vertical lines): "
+    "Return one object per table row. The narrow column(s) have the "
+    "entry number and/or case info; the wide column has the ruling "
+    "text.\n\n"
+    "**Bordered boxes** (each case in a rectangular border): "
+    "Return one object per box. The box header has the item number, "
+    "time, case number, and case name. The ruling text is everything "
+    "the judge wrote — typically everything after '*TENTATIVE "
+    "RULING:*' or similar marker, but also include any motion "
+    "description header that precedes the marker.\n\n"
+    "**Free-form prose** (no table, no boxes — plain document text): "
+    "Identify case boundaries by case number headers, bold case "
+    "captions, centered titles, horizontal rules, or signature blocks. "
+    "Return one object per case.\n\n"
+    "**Label-value forms** (fields like 'Re:', 'Motion:', "
+    "'Tentative Ruling:', 'Explanation:'): The case_number and "
+    "case_title come from the Re: and case number fields. The "
+    "ruling_text is EVERYTHING from the tentative ruling/explanation "
+    "onward, including the explanation.\n\n"
+    "**Continuation pages** (no new case header — just ongoing text "
+    "from a previous page): Return one object with empty entry_number, "
+    "empty case_number, empty case_title, and the continuation text "
+    "in ruling_text.\n\n"
+    "**Boilerplate-only pages** (instructions about contesting "
+    "rulings, Zoom links, court reporter notices, appearance "
+    "procedures — no actual case rulings): Return an empty rulings "
+    "array. Still extract page_header if the department, judge, or "
+    "hearing date is visible.\n\n"
+    "## Formatting rules\n\n"
     "- Transcribe ruling_text as **Markdown** preserving formatting:\n"
     "  - Use **bold** for bold text and headings\n"
-    "  - Use *italic* for italic/underlined text\n"
+    "  - Use *italic* for italic text\n"
     "  - Use numbered lists (1. 2. 3.) for numbered paragraphs\n"
     "  - Use blank lines between paragraphs\n"
     "  - Preserve ALL content — do not summarize or omit\n"
-    "- If a column is blank in a row, set its value to empty string.\n"
-    "- SKIP page headers, footers, and page numbers.\n\n"
+    "- SKIP page headers/footers, page numbers, and watermarks.\n"
+    "- SKIP boilerplate (instructions for contesting rulings, Zoom "
+    "info, court reporter notices, appearance procedures).\n"
+    "- If a field is blank or not applicable, use empty string.\n\n"
+    "## Example output\n\n"
     "{\n"
+    '  "page_header": {\n'
+    '    "department": "C25",\n'
+    '    "judge_name": "Gassia Apkarian",\n'
+    '    "hearing_date": "2026-03-25"\n'
+    "  },\n"
     '  "rulings": [\n'
-    '    {"entry_number": "101", "case_info": "Smith vs Jones\\n'
-    '25-01455183",\n'
-    '     "ruling_text": "**MOTION FOR SUMMARY JUDGMENT**\\n\\n'
-    "Defendant's motion for summary judgment is **GRANTED**.\\n\\n"
+    "    {\n"
+    '      "entry_number": "101",\n'
+    '      "case_number": "2024-01393434",\n'
+    '      "case_title": "Smith vs Jones",\n'
+    '      "ruling_text": "**MOTION FOR SUMMARY JUDGMENT**\\n\\n'
+    "**Background**\\n\\nThis is a personal injury action arising from "
+    "a slip and fall at defendant's commercial property.\\n\\n"
+    "**Analysis**\\n\\nDefendant's motion for summary judgment is "
+    "**GRANTED**.\\n\\n"
     "1. The moving party has met its initial burden...\\n"
-    '2. Plaintiff fails to raise a triable issue..."},\n'
-    '    {"entry_number": "", "case_info": "",\n'
-    '     "ruling_text": "continuation from previous page..."}\n'
+    '2. Plaintiff fails to raise a triable issue..."\n'
+    "    },\n"
+    "    {\n"
+    '      "entry_number": "",\n'
+    '      "case_number": "",\n'
+    '      "case_title": "",\n'
+    '      "ruling_text": "continuation from previous page..."\n'
+    "    }\n"
     "  ]\n"
     "}"
 )
 
-# Pattern to detect case numbers in OC format.
-_CASE_NUMBER_RE = re.compile(r"\d{2,4}-\d{5,8}|\b\d{7,8}\b")
+# Pattern to detect case numbers across all California county formats:
+#   OC:          2024-01393434, 25D006297
+#   Riverside:   CVRI2401570, CVPS2305159, CVSW2303829
+#   Santa Clara: 26CV484550, 22CV407249, 2010-1-CV-163328
+#   Fresno:      18CECG00898, 24CECG04476
+#   SF:          FPT-24-378499, FDI-22-796758, FMS-15-386703
+#   CC:          C22-01971, N25-2112
+#   SB:          CIVSB2116995, CIVRS2510003
+_CASE_NUMBER_RE = re.compile(
+    r"\b[A-Z]{0,4}\d{2,4}-\d{1,2}-[A-Z]{2}-\d{5,8}\b"  # 2010-1-CV-163328
+    r"|\b[A-Z]{1,4}-\d{2,4}-\d{5,8}\b"  # FPT-24-378499
+    r"|\b[A-Z]{1,2}\d{2,4}-\d{4,8}\b"  # C22-01971, N25-2112
+    r"|\b\d{2,4}-\d{5,8}\b"  # 2024-01393434, 22-02520
+    r"|\b[A-Z]{2,6}\d{7,10}\b"  # CVRI2401570, CIVSB2116995, 18CECG00898
+    r"|\b\d{2,4}[A-Z]{1,4}\d{5,8}\b"  # 26CV484550, 25D006297, 2024CUOR027466
+    r"|\b\d{7,8}\b"  # bare 7-8 digit numbers
+)
 
 # Pattern to detect case titles (vs / v.).
 _VS_RE = re.compile(r"\bv(?:s)?\.?\s", re.IGNORECASE)
@@ -519,7 +608,7 @@ class LlmExtractor:
         pdf_bytes: bytes,
         *,
         metadata: dict[str, str] | None = None,
-        max_pages: int = 20,
+        max_pages: int = 50,
     ) -> list[ExtractedRuling]:
         """Extract structured rulings from PDF page images (multimodal).
 
@@ -1012,8 +1101,8 @@ class LlmExtractor:
                 parts.append("Context:\n" + "\n".join(meta_lines))
 
         parts.append(
-            "Transcribe all rows of the ruling table on this page. "
-            "One entry per row. Skip page headers and footers."
+            "Extract all tentative rulings from this page. "
+            "One entry per case. Skip page headers and footers."
         )
         return "\n\n".join(parts)
 
@@ -1329,7 +1418,15 @@ def _parse_page_rows(raw_text: str, page_index: int) -> list[dict]:
     """Parse LLM response for a single page into a list of row dicts.
 
     Each row has ``entry_number`` (int or None), ``case_info`` (str),
-    and ``ruling_text`` (str).  Invalid entries are filtered out.
+    and ``ruling_text`` (str).  Supports both the legacy 3-field format
+    (entry_number/case_info/ruling_text) and the newer 4-field format
+    (entry_number/case_number/case_title/ruling_text).
+
+    When the newer format is detected (``case_number`` or ``case_title``
+    present), these are combined into ``case_info`` for downstream
+    compatibility with ``_join_page_rows``.
+
+    Also extracts ``page_header`` metadata if present.
     """
     cleaned = raw_text.strip()
     if cleaned.startswith("```"):
@@ -1339,20 +1436,31 @@ def _parse_page_rows(raw_text: str, page_index: int) -> list[dict]:
     try:
         parsed = json.loads(cleaned)
     except json.JSONDecodeError:
-        # Try to find a JSON array in the response.
-        start_idx = cleaned.find("[")
-        end_idx = cleaned.rfind("]") + 1
-        if start_idx >= 0 and end_idx > start_idx:
-            try:
-                parsed = json.loads(cleaned[start_idx:end_idx])
-            except json.JSONDecodeError:
-                logger.warning(
-                    "llm_extractor.page_parse_error",
-                    page_index=page_index,
-                    raw_preview=raw_text[:200],
-                )
-                return []
+        # Try to find a JSON object or array in the response.
+        obj_start = cleaned.find("{")
+        arr_start = cleaned.find("[")
+        if obj_start >= 0 and (arr_start < 0 or obj_start < arr_start):
+            obj_end = cleaned.rfind("}") + 1
+            if obj_end > obj_start:
+                try:
+                    parsed = json.loads(cleaned[obj_start:obj_end])
+                except json.JSONDecodeError:
+                    parsed = None
+            else:
+                parsed = None
+        elif arr_start >= 0:
+            arr_end = cleaned.rfind("]") + 1
+            if arr_end > arr_start:
+                try:
+                    parsed = json.loads(cleaned[arr_start:arr_end])
+                except json.JSONDecodeError:
+                    parsed = None
+            else:
+                parsed = None
         else:
+            parsed = None
+
+        if parsed is None:
             logger.warning(
                 "llm_extractor.page_parse_error",
                 page_index=page_index,
@@ -1361,8 +1469,11 @@ def _parse_page_rows(raw_text: str, page_index: int) -> list[dict]:
             return []
 
     # Handle both list and dict responses.
+    page_header: dict | None = None
     if isinstance(parsed, dict):
-        # Some models wrap the array in a dict (keys: "rulings", "rows", "entries").
+        # Extract page_header if present.
+        page_header = parsed.get("page_header")
+        # Get the rulings array.
         rows_raw = parsed.get("rulings", parsed.get("rows", parsed.get("entries", [parsed])))
     elif isinstance(parsed, list):
         rows_raw = parsed
@@ -1370,20 +1481,71 @@ def _parse_page_rows(raw_text: str, page_index: int) -> list[dict]:
         return []
 
     rows: list[dict] = []
+
+    # If page_header contains metadata, emit a synthetic header row so
+    # _join_page_rows can extract judge/department/hearing_date.
+    if page_header and isinstance(page_header, dict):
+        header_parts: list[str] = []
+        if page_header.get("department"):
+            header_parts.append(f"Department {page_header['department']}")
+        if page_header.get("judge_name"):
+            header_parts.append(f"JUDGE {page_header['judge_name']}")
+        if page_header.get("hearing_date"):
+            header_parts.append(f"Hearing Date: {page_header['hearing_date']}")
+        if header_parts:
+            rows.append(
+                {
+                    "entry_number": None,
+                    "case_info": "\n".join(header_parts),
+                    "ruling_text": "",
+                }
+            )
+
     for item in rows_raw:
         if not isinstance(item, dict):
             continue
         entry_number = item.get("entry_number")
         if entry_number is not None:
-            # Normalize: strip trailing period, convert to int.
+            entry_str = str(entry_number).rstrip(".").strip()
+            # Strip parentheses from Fresno-style "(47)" numbers.
+            entry_str = entry_str.strip("()")
             try:
-                entry_number = int(str(entry_number).rstrip(".").strip())
+                entry_number = int(entry_str)
             except (ValueError, TypeError):
-                entry_number = None
+                # Extract numeric portion from "Line 2", "Item 3", etc.
+                num_match = re.search(r"\d+", entry_str)
+                entry_number = int(num_match.group()) if num_match else None
+
+        # Support both legacy (case_info) and new (case_number + case_title)
+        # formats.  Combine new-format fields into case_info for downstream
+        # compatibility with _join_page_rows.
+        if "case_number" in item or "case_title" in item:
+            case_number = str(item.get("case_number") or "").strip()
+            case_title = str(item.get("case_title") or "").strip()
+            # Post-process: strip trailing artifacts from case_title.
+            # The LLM sometimes appends county prefix letters, motion
+            # descriptions, or cause of action text to the case title.
+            # Strip trailing single-letter county prefixes (C, N, etc.)
+            case_title = re.sub(r"\s+[A-Z]$", "", case_title)
+            # Strip anything after common artifact patterns.
+            # These are specific enough to avoid truncating legitimate
+            # party names like "Johnson C Smith".
+            for pattern in [
+                r"\s+[A-Z]\s+(?:HEARING|PETITION|FURTHER|MOTION)",
+                r"\s+[A-Z]\s+(?:Third|Fourth|Fifth|Sixth|Seventh|First|Second)",
+                r"\s*\*HEARING",
+                r"\s+PETITION OF:",
+            ]:
+                case_title = re.sub(pattern, "", case_title)
+            parts = [p for p in [case_title, case_number] if p]
+            case_info = "\n".join(parts)
+        else:
+            case_info = str(item.get("case_info", "")).strip()
+
         rows.append(
             {
                 "entry_number": entry_number,
-                "case_info": str(item.get("case_info", "")).strip(),
+                "case_info": case_info,
                 "ruling_text": str(item.get("ruling_text", "")).strip(),
             }
         )
@@ -1441,10 +1603,59 @@ def _extract_case_title_from_info(case_info: str) -> str | None:
     cleaned = _CASE_NUMBER_FRAGMENT_RE.sub("", cleaned)
     # 4. Remove court / county name fragments.
     cleaned = _COURT_NAME_RE.sub("", cleaned)
-    # 5. Collapse multiple whitespace to single space.
+    # 5. Remove trailing case-number county prefix letters (e.g. "C" from
+    #    "C22-01971" where the numeric part was already stripped in step 2).
+    #    Also strip trailing artifacts like "C Fraud" or "C PETITION OF:".
+    cleaned = re.sub(r"\s+[CN]\s*$", "", cleaned)
+    cleaned = re.sub(
+        r"\s+[CN]\s+(?:HEARING|PETITION|MOTION|FURTHER"
+        r"|Third|Fourth|Fifth|Sixth|Seventh|First|Second|Fraud).*$",
+        "",
+        cleaned,
+    )
+    # 6. Remove other non-title artifacts.
+    cleaned = re.sub(r"\s*\*?HEARING ON\b.*$", "", cleaned)
+    cleaned = re.sub(r"\s+PETITION OF:.*$", "", cleaned)
+    # 7. Collapse multiple whitespace to single space.
     cleaned = re.sub(r"\s{2,}", " ", cleaned)
-    # 6. Remove leading/trailing punctuation and whitespace.
+    # 8. Remove "None" artifacts from null fields being stringified.
+    cleaned = re.sub(r"\bNone\b", "", cleaned)
+    # 9. Collapse multiple whitespace to single space (again after removals).
+    cleaned = re.sub(r"\s{2,}", " ", cleaned)
+    # 10. Remove leading/trailing punctuation and whitespace.
     cleaned = cleaned.strip(" -;,\t")
+    # 11. Truncate overly long titles.  Titles over 150 chars typically
+    #     contain multiple case names or full court caption text jammed
+    #     together.
+    if len(cleaned) > 150:
+        # For "v./vs." titles, try to truncate after the first party clause.
+        vs_match = _VS_RE.search(cleaned)
+        if vs_match:
+            after_vs = cleaned[vs_match.end() :]
+            term_match = re.search(
+                r"\b(?:[A-Z]{2,6}\d{5,}|\d{2,4}[A-Z]{1,4}\d{5,}"
+                r"|\d{2,4}-\d{5,}|[A-Z]{1,4}-\d{2,4}-\d{5,})\b"
+                r"|" + _VS_RE.pattern,
+                after_vs,
+                re.IGNORECASE,
+            )
+            if term_match:
+                cleaned = cleaned[: vs_match.end() + term_match.start()].strip(" ,;")
+        # For probate/estate/conservatorship titles (no "v."), truncate
+        # at the start of the next case pattern.
+        if len(cleaned) > 150:
+            next_case = re.search(
+                r"\s(?:CONSERVATORSHIP|ESTATE|GUARDIANSHIP|IN THE MATTER)"
+                r"\s+OF[:.]",
+                cleaned[30:],  # skip past the first one
+            )
+            if next_case:
+                cleaned = cleaned[: 30 + next_case.start()].strip(" ,;")
+        # Hard-truncate at a word boundary if still too long.
+        if len(cleaned) > 150:
+            space_idx = cleaned.rfind(" ", 0, 150)
+            if space_idx > 50:
+                cleaned = cleaned[:space_idx].rstrip(" ,;")
     if cleaned:
         return cleaned
     return None
@@ -1467,11 +1678,13 @@ def _join_page_rows(
     # Group rows into cases.
     cases: list[dict] = []  # Each: {case_info, ruling_text}
 
-    # Extract judge/department from header rows before skipping them.
-    # Header rows typically have entry_number=null, empty ruling_text,
-    # and case_info containing "JUDGE {Name}" or "Department {Code}".
+    # Extract judge/department/hearing_date from header rows before
+    # skipping them.  Header rows typically have entry_number=null,
+    # empty ruling_text, and case_info containing metadata.  These
+    # are emitted by _parse_page_rows when it encounters a page_header.
     header_judge: str | None = None
     header_dept: str | None = None
+    header_date: str | None = None
     for row in rows:
         if row["entry_number"] is None and not row["ruling_text"] and row.get("case_info"):
             info = row["case_info"]
@@ -1483,6 +1696,10 @@ def _join_page_rows(
             dept_match = re.search(r"(?:Department|Dept\.?)\s+([A-Z0-9]+)", info, re.IGNORECASE)
             if dept_match and not header_dept:
                 header_dept = dept_match.group(1).strip()
+            # Extract hearing date from "Hearing Date: YYYY-MM-DD" pattern
+            date_match = re.search(r"Hearing Date:\s*(\d{4}-\d{2}-\d{2})", info)
+            if date_match and not header_date:
+                header_date = date_match.group(1)
 
     for row in rows:
         # Skip header rows (e.g., department/judge headers) that the LLM
@@ -1546,6 +1763,8 @@ def _join_page_rows(
             judge_name = header_judge
         if not department:
             department = header_dept
+        if not hearing_date:
+            hearing_date = header_date
 
         rulings.append(
             ExtractedRuling(
