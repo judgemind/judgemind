@@ -73,6 +73,13 @@ Options:
                         Reads the saved cursor and stats, then continues from
                         where the previous run left off. Requires
                         --checkpoint-file to point to an existing file.
+    --prefix PREFIX     Scan S3 directly by key prefix instead of querying the
+                        database.  Useful for ingesting documents that were
+                        never written to the DB (e.g. dead-lettered events).
+                        Lists S3 objects under the prefix, seeds court records,
+                        and processes each document through the ingestion
+                        pipeline via IngestionWorker.process_event().
+                        Example: --prefix federal/
 """
 
 from __future__ import annotations
@@ -81,12 +88,14 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import date, datetime
+import uuid
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
 
@@ -680,9 +689,7 @@ def _reparse_document(
             # (#2113).  Mirrors the normalization in worker.py so reingest
             # produces the same canonical values as live ingestion.
             extracted["outcome"] = (
-                normalize_outcome(parsed.outcome)
-                if parsed.outcome
-                else None
+                normalize_outcome(parsed.outcome) if parsed.outcome else None
             )
             # Normalize scraper-provided motion_type to snake_case (#1849).
             # Mirrors the normalization in worker.py so reingest produces
@@ -2013,6 +2020,399 @@ def _run_quality_queries(
     return results
 
 
+# ---------------------------------------------------------------------------
+# Prefix mode — scan S3 directly for documents not in the DB
+# ---------------------------------------------------------------------------
+
+# S3 content-addressed key pattern: {state}/{county}/{court}/raw/{content_hash}.{ext}
+_S3_KEY_PATTERN = re.compile(
+    r"^(?P<state>[^/]+)/(?P<county>[^/]+)/(?P<court>[^/]+)/raw/"
+    r"(?P<content_hash>[0-9a-f]+)\.(?P<ext>\w+)$"
+)
+
+_EXT_TO_FORMAT = {"html": "html", "pdf": "pdf", "docx": "docx", "txt": "txt"}
+
+# Timezone lookup by state (expand as states are added)
+_STATE_TIMEZONES = {
+    "ca": "America/Los_Angeles",
+    "tx": "America/Chicago",
+    "ny": "America/New_York",
+}
+
+
+def _unsluggify(s: str) -> str:
+    """Convert slug to display name: 'los_angeles' -> 'Los Angeles', 'ca' -> 'CA'."""
+    if len(s) <= 2:
+        return s.upper()
+    return s.replace("_", " ").title()
+
+
+def _parse_s3_key(key: str) -> dict[str, str] | None:
+    """Extract metadata from a content-addressed S3 key.
+
+    Returns a dict with keys ``state``, ``county``, ``court``,
+    ``content_hash``, and ``ext``, or ``None`` if the key doesn't
+    match the expected pattern.
+    """
+    m = _S3_KEY_PATTERN.match(key)
+    if not m:
+        return None
+    return m.groupdict()
+
+
+def _list_s3_keys(s3_client: object, bucket: str, prefix: str) -> list[str]:
+    """List all content-addressed S3 keys under *prefix*."""
+    paginator = s3_client.get_paginator("list_objects_v2")  # type: ignore[union-attr]
+    keys: list[str] = []
+    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+        for obj in page.get("Contents", []):
+            key = obj["Key"]
+            if _S3_KEY_PATTERN.match(key):
+                keys.append(key)
+    return keys
+
+
+def _discover_courts(keys: list[str]) -> list[dict[str, str]]:
+    """Derive unique courts from S3 key prefixes."""
+    seen: set[str] = set()
+    courts: list[dict[str, str]] = []
+    for key in keys:
+        parsed = _parse_s3_key(key)
+        if not parsed:
+            continue
+        court_code = f"{parsed['state']}_{parsed['county']}_{parsed['court']}"
+        if court_code in seen:
+            continue
+        seen.add(court_code)
+        courts.append(
+            {
+                "state": _unsluggify(parsed["state"]),
+                "county": _unsluggify(parsed["county"]),
+                "court_name": _unsluggify(parsed["court"]),
+                "court_code": court_code,
+                "timezone": _STATE_TIMEZONES.get(
+                    parsed["state"], "America/Los_Angeles"
+                ),
+            }
+        )
+    return courts
+
+
+def _seed_courts(
+    conn: psycopg.Connection, courts: list[dict[str, str]]
+) -> dict[str, str]:
+    """Insert or update court records. Returns ``{court_code: court_id}``."""
+    court_ids: dict[str, str] = {}
+    with conn.cursor() as cur:
+        for court in courts:
+            cur.execute(
+                """
+                INSERT INTO courts (state, county, court_name, court_code, timezone)
+                VALUES (%s, %s, %s, %s, %s)
+                ON CONFLICT (court_code) DO UPDATE
+                    SET state = EXCLUDED.state,
+                        county = EXCLUDED.county,
+                        court_name = EXCLUDED.court_name
+                RETURNING id
+                """,
+                (
+                    court["state"],
+                    court["county"],
+                    court["court_name"],
+                    court["court_code"],
+                    court["timezone"],
+                ),
+            )
+            row = cur.fetchone()
+            court_ids[court["court_code"]] = str(row[0])
+    conn.commit()
+    return court_ids
+
+
+def _build_prefix_event(
+    key: str,
+    content: bytes,
+    parsed: dict[str, str],
+    bucket: str,
+) -> dict[str, Any]:
+    """Construct an ingestion event dict from an S3 object for prefix mode."""
+    content_hash = parsed["content_hash"]
+    document_id = str(uuid.uuid5(uuid.NAMESPACE_URL, content_hash))
+    content_format = _EXT_TO_FORMAT.get(parsed["ext"], "bin")
+
+    event: dict[str, Any] = {
+        "document_id": document_id,
+        "state": _unsluggify(parsed["state"]),
+        "county": _unsluggify(parsed["county"]),
+        "court": _unsluggify(parsed["court"]),
+        "content_format": content_format,
+        "content_hash": content_hash,
+        "s3_key": key,
+        "s3_bucket": bucket,
+        "scraper_id": f"reingest-{parsed['state']}-{parsed['county']}",
+        "source_url": "",
+        "capture_timestamp": datetime.now(UTC).isoformat(),
+    }
+
+    # For text-based formats (HTML, TXT), pass content as ruling_text.
+    # For binary formats (PDF, DOCX), pass raw bytes as latin-1 string
+    # (the worker handles extraction from binary formats).
+    if content_format in ("html", "txt"):
+        event["ruling_text"] = content.decode("utf-8", errors="replace")
+    elif content_format in ("pdf", "docx"):
+        event["ruling_text"] = content.decode("latin-1")
+
+    return event
+
+
+def _process_prefix_document(
+    key: str,
+    bucket: str,
+    database_url: str,
+    redis_url: str,
+    os_url: str,
+) -> str:
+    """Process a single S3 object through the ingestion pipeline.
+
+    Creates its own DB connection, Redis client, and IngestionWorker.
+    Designed for ProcessPoolExecutor — each call is fully independent.
+    """
+    parsed = _parse_s3_key(key)
+    if not parsed:
+        return "skip"
+
+    from framework.s3_cache import make_s3_client as _make_s3
+
+    s3 = _make_s3()
+    try:
+        response = s3.get_object(Bucket=bucket, Key=key)
+        content = response["Body"].read()
+    except Exception:
+        logger.warning("Failed to fetch S3 object, skipping", s3_key=key, exc_info=True)
+        return "error"
+
+    if not content:
+        return "skip"
+
+    actual_hash = hashlib.sha256(content).hexdigest()
+    if actual_hash != parsed["content_hash"]:
+        logger.error(
+            "S3 content hash mismatch, skipping document",
+            s3_key=key,
+            key_hash=parsed["content_hash"],
+            content_hash=actual_hash,
+        )
+        return "error"
+
+    event = _build_prefix_event(key, content, parsed, bucket)
+
+    # Lazy per-process worker — cached on the function object.
+    worker = getattr(_process_prefix_document, "_worker", None)
+    if worker is None:
+        import redis as redis_lib
+        from unittest.mock import MagicMock
+
+        from ingestion.worker import IngestionWorker
+
+        rc = redis_lib.Redis.from_url(redis_url, decode_responses=False)
+        if os_url:
+            from opensearchpy import OpenSearch
+
+            os_kwargs: dict = {"hosts": [os_url]}
+            os_user = os.environ.get("OPENSEARCH_USERNAME", "")
+            os_pass = os.environ.get("OPENSEARCH_PASSWORD", "")
+            if os_user and os_pass:
+                os_kwargs["http_auth"] = (os_user, os_pass)
+            os_client = OpenSearch(**os_kwargs)
+        else:
+            os_client = MagicMock()
+        s3_for_worker = _make_s3()
+        worker = IngestionWorker(
+            redis_client=rc,
+            pg_dsn=database_url,
+            opensearch_client=os_client,
+            s3_client=s3_for_worker,
+            archive_bucket=bucket,
+        )
+        _process_prefix_document._worker = worker  # type: ignore[attr-defined]
+
+    try:
+        worker.process_event(event)
+        return "ok"
+    except Exception:
+        logger.warning("Failed to process document", s3_key=key, exc_info=True)
+        return "error"
+
+
+def run_reingest_from_prefix(
+    dsn: str,
+    *,
+    prefix: str,
+    concurrency: int = 10,
+    limit: int | None = None,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    """Scan S3 by key prefix and ingest documents not in the DB.
+
+    Unlike :func:`run_reingest`, which queries existing DB records for
+    re-processing, this function lists S3 objects directly and feeds each
+    one through ``IngestionWorker.process_event()``.  This is the correct
+    approach when documents were captured and archived to S3 but never
+    written to the database (e.g. dead-lettered events).
+
+    Parameters
+    ----------
+    dsn:
+        PostgreSQL connection string.
+    prefix:
+        S3 key prefix to scan (e.g. ``"federal/"``).
+    concurrency:
+        Number of parallel worker processes.
+    limit:
+        Maximum number of documents to process.
+    dry_run:
+        If True, list keys and seed courts but skip document processing.
+
+    Returns
+    -------
+    dict with keys: ``total_keys``, ``processed``, ``errors``, ``skipped``.
+    """
+    bucket = os.environ.get(
+        "JUDGEMIND_ARCHIVE_BUCKET", "judgemind-document-archive-dev"
+    )
+    redis_url = os.environ.get("REDIS_URL", "redis://localhost:6379")
+    os_url = os.environ.get("OPENSEARCH_URL", "")
+
+    s3_client = boto3.client("s3")
+
+    # Step 1: List S3 keys matching the prefix.
+    logger.info("Listing S3 objects...", prefix=prefix, bucket=bucket)
+    keys = _list_s3_keys(s3_client, bucket, prefix)
+    logger.info("Found S3 objects", count=len(keys), prefix=prefix)
+
+    if not keys:
+        logger.warning("No content-addressed keys found under prefix", prefix=prefix)
+        return {
+            "total_keys": 0,
+            "processed": 0,
+            "errors": 0,
+            "skipped": 0,
+        }
+
+    if limit is not None:
+        total_available = len(keys)
+        keys = keys[:limit]
+        logger.info(
+            "Limited to first N keys", limit=limit, total_available=total_available
+        )
+
+    # Step 2: Discover and seed courts from key prefixes.
+    courts = _discover_courts(keys)
+    logger.info(
+        "Discovered courts from S3 keys",
+        count=len(courts),
+        courts=[c["court_code"] for c in courts],
+    )
+
+    with psycopg.connect(dsn) as conn:
+        court_ids = _seed_courts(conn, courts)
+    logger.info("Courts seeded", court_ids=court_ids)
+
+    if dry_run:
+        logger.info(
+            "Dry run — skipping document processing",
+            total_keys=len(keys),
+            courts_seeded=len(court_ids),
+        )
+        return {
+            "total_keys": len(keys),
+            "processed": 0,
+            "errors": 0,
+            "skipped": 0,
+        }
+
+    # Step 3: Process documents using child processes.
+    # Uses ProcessPoolExecutor (like rebuild_db.py) because pdfplumber/pdfminer
+    # C extensions are not thread-safe.
+    database_url = dsn
+    if not os_url:
+        logger.info("OPENSEARCH_URL not set — skipping search indexing")
+
+    t_start = time.monotonic()
+    processed = 0
+    errors = 0
+    skipped = 0
+
+    logger.info(
+        "Processing documents from S3",
+        concurrency=concurrency,
+        total=len(keys),
+    )
+
+    with ProcessPoolExecutor(max_workers=concurrency) as pool:
+        futures = {
+            pool.submit(
+                _process_prefix_document,
+                key,
+                bucket,
+                database_url,
+                redis_url,
+                os_url,
+            ): key
+            for key in keys
+        }
+        for future in as_completed(futures):
+            key = futures[future]
+            try:
+                result = future.result()
+                if result == "ok":
+                    processed += 1
+                elif result == "skip":
+                    skipped += 1
+                else:
+                    errors += 1
+                total_done = processed + errors + skipped
+                if processed > 0 and processed % 50 == 0:
+                    elapsed = time.monotonic() - t_start
+                    elapsed_min = elapsed / 60
+                    keys_per_min = total_done / elapsed * 60 if elapsed > 0 else 0
+                    eta_min = (
+                        (len(keys) - total_done) / (total_done / elapsed) / 60
+                        if total_done > 0 and elapsed > 0
+                        else 0
+                    )
+                    logger.info(
+                        "Progress",
+                        keys_done=total_done,
+                        keys_total=len(keys),
+                        pct=round(100 * total_done / len(keys), 1),
+                        keys_per_min=round(keys_per_min, 1),
+                        elapsed_min=round(elapsed_min, 1),
+                        eta_min=round(eta_min, 1),
+                        errors=errors,
+                    )
+            except Exception as exc:
+                errors += 1
+                logger.error("Failed to process", key=key, error=str(exc))
+
+    wall_time = round(time.monotonic() - t_start, 2)
+
+    stats: dict[str, Any] = {
+        "total_keys": len(keys),
+        "processed": processed,
+        "errors": errors,
+        "skipped": skipped,
+        "wall_time_seconds": wall_time,
+    }
+
+    logger.info(
+        "Prefix reingest complete",
+        **stats,
+    )
+
+    return stats
+
+
 def run_reingest(
     dsn: str,
     *,
@@ -2451,6 +2851,19 @@ def main() -> None:
             "Requires --checkpoint-file to point to an existing checkpoint."
         ),
     )
+    parser.add_argument(
+        "--prefix",
+        type=str,
+        default=None,
+        help=(
+            "Scan S3 directly by key prefix instead of querying the database. "
+            "Useful for ingesting documents that were never written to the DB "
+            "(e.g. dead-lettered events). Lists S3 objects under the prefix, "
+            "seeds court records, and processes each document through the "
+            "ingestion pipeline via IngestionWorker.process_event(). "
+            "Example: --prefix federal/"
+        ),
+    )
     args = parser.parse_args()
 
     if args.resume and not args.checkpoint_file:
@@ -2461,6 +2874,25 @@ def main() -> None:
         logger.error("DATABASE_URL environment variable is required")
         sys.exit(1)
 
+    # Prefix mode: scan S3 directly for documents not in the DB.
+    if args.prefix:
+        stats = run_reingest_from_prefix(
+            dsn,
+            prefix=args.prefix,
+            concurrency=args.concurrency,
+            limit=args.limit,
+            dry_run=args.dry_run,
+        )
+        logger.info(
+            "Prefix reingest complete",
+            total_keys=stats["total_keys"],
+            processed=stats["processed"],
+            errors=stats["errors"],
+            skipped=stats["skipped"],
+        )
+        return
+
+    # Standard mode: query the database for existing document records.
     date_from = date.fromisoformat(args.date_from) if args.date_from else None
     date_to = date.fromisoformat(args.date_to) if args.date_to else None
 
