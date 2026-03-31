@@ -410,15 +410,18 @@ class TestParsePageRows:
         rows = _parse_page_rows(raw, page_index=0)
         assert not rows[0]["case_info"].endswith(" C")
 
-
-# ---------------------------------------------------------------------------
-# _CASE_NUMBER_RE tests
-# ---------------------------------------------------------------------------
-
+    # ---------------------------------------------------------------------------
+    # _CASE_NUMBER_RE tests
+    # ---------------------------------------------------------------------------
 
     def test_json_object_in_text(self) -> None:
         """JSON object embedded in non-JSON text is extracted."""
-        raw = 'Here is the result: {"rulings": [{"entry_number": "1", "case_info": "test v. case", "ruling_text": "t"}]} end'
+        raw = (
+            "Here is the result: "
+            '{"rulings": [{"entry_number": "1",'
+            ' "case_info": "test v. case",'
+            ' "ruling_text": "t"}]} end'
+        )
         rows = _parse_page_rows(raw, page_index=0)
         assert len(rows) == 1
         assert rows[0]["entry_number"] == 1
@@ -480,8 +483,16 @@ class TestJoinPageRowsHeaderDate:
     def test_hearing_date_from_header(self) -> None:
         """hearing_date is extracted from synthetic header rows."""
         rows = [
-            {"entry_number": None, "case_info": "Department 16\nJUDGE Test\nHearing Date: 2026-03-25", "ruling_text": ""},
-            {"entry_number": 1, "case_info": "Smith v. Jones\nC22-01971", "ruling_text": "Granted."},
+            {
+                "entry_number": None,
+                "case_info": "Department 16\nJUDGE Test\nHearing Date: 2026-03-25",
+                "ruling_text": "",
+            },
+            {
+                "entry_number": 1,
+                "case_info": "Smith v. Jones\nC22-01971",
+                "ruling_text": "Granted.",
+            },
         ]
         rulings = _join_page_rows(rows)
         assert len(rulings) == 1
