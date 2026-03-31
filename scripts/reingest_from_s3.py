@@ -119,6 +119,7 @@ from ingestion.db import (  # noqa: E402
     batch_upsert_parties,
     insert_document_and_ruling,
     resolve_judge,
+    resolve_judge_from_department,
     upsert_case,
     upsert_case_judge,
 )
@@ -1852,12 +1853,35 @@ def reingest_batch(
                     else:
                         split_hash = doc_meta["content_hash"]
 
-                    # Resolve judge
-                    judge_id = None
-                    if extracted["judge_name"]:
-                        judge_id = resolve_judge(
-                            conn, extracted["judge_name"], court_id_str
+                    # Resolve judge.  When LLM/regex extraction didn't
+                    # find a judge_name but a department is available,
+                    # fall back to the court directory snapshot (#2269).
+                    judge_name = extracted["judge_name"]
+                    if (
+                        not judge_name
+                        and extracted.get("department")
+                        and doc_meta.get("state", "").upper() == "CA"
+                    ):
+                        hearing_dt = extracted.get("hearing_date")
+                        judge_name = resolve_judge_from_department(
+                            conn,
+                            court_id_str,
+                            extracted["department"],
+                            hearing_date=hearing_dt,
                         )
+                        if judge_name:
+                            extracted["extraction_methods"]["judge_name"] = (
+                                "roster_dept_lookup"
+                            )
+                            logger.info(
+                                "Resolved judge from court directory snapshot",
+                                department=extracted["department"],
+                                judge_name=judge_name,
+                                county=doc_meta.get("county"),
+                            )
+                    judge_id = None
+                    if judge_name:
+                        judge_id = resolve_judge(conn, judge_name, court_id_str)
 
                     # Truncate excessively long ruling text
                     ruling_text = extracted["ruling_text"]
