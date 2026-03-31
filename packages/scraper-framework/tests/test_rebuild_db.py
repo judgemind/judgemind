@@ -382,18 +382,13 @@ class TestDiscoverCourts:
 class TestMainSummary:
     """Tests that main() reports hearing_date skip counts in the summary."""
 
-    def test_summary_includes_no_hearing_date_warning(self, tmp_path: Any, capsys: Any) -> None:
+    def test_summary_includes_no_hearing_date_warning(self, tmp_path: Any) -> None:
         """When documents lack hearing_date, the summary should warn about it."""
-        # This test verifies the main() function logs a warning about
-        # hearing_date skips.  We mock the ProcessPoolExecutor to avoid
-        # real multiprocessing and control the results.
-        import structlog
-
-        log_messages: list[dict[str, Any]] = []
-
-        def capture_log(_logger: Any, _method: str, event_dict: dict[str, Any]) -> dict[str, Any]:
-            log_messages.append(event_dict)
-            return event_dict
+        # Mock the ProcessPoolExecutor to avoid real multiprocessing and
+        # control the results.  We patch rebuild_db.logger directly instead
+        # of using structlog.configure() which is global state and breaks
+        # under pytest-xdist parallel execution.
+        mock_logger = MagicMock()
 
         # Create a local cache with one HTML file (with date) and one PDF (no date)
         cache_dir = str(tmp_path / "cache")
@@ -451,29 +446,18 @@ class TestMainSummary:
                 },
             ),
             patch("sys.argv", ["rebuild_db.py"]),
+            patch.object(rebuild_db, "logger", mock_logger),
         ):
-            # Reconfigure structlog to capture messages
-            structlog.configure(
-                processors=[capture_log, structlog.dev.ConsoleRenderer()],
-            )
-            try:
-                rebuild_db.main()
-            finally:
-                # Restore structlog config
-                structlog.configure(
-                    processors=[
-                        structlog.stdlib.add_log_level,
-                        structlog.dev.ConsoleRenderer(),
-                    ],
-                )
+            rebuild_db.main()
 
-        # Check that a warning about missing hearing_date was logged.
-        # The structlog event dict has a `no_hearing_date` key when the
-        # warning fires.
-        skip_warnings = [msg for msg in log_messages if "no_hearing_date" in msg]
+        # Check that logger.warning was called with no_hearing_date=1.
+        # The call signature is: logger.warning(msg, count, no_hearing_date=N, ...)
+        warning_calls = mock_logger.warning.call_args_list
+        skip_warnings = [
+            call for call in warning_calls if call.kwargs.get("no_hearing_date") is not None
+        ]
         assert len(skip_warnings) > 0, (
-            f"Expected a warning about hearing_date skips. Got log messages: {log_messages}"
+            f"Expected a warning about hearing_date skips. Got warning calls: {warning_calls}"
         )
         # The warning should mention 1 skip (the PDF document)
-        skip_msg = skip_warnings[0]
-        assert skip_msg["no_hearing_date"] == 1
+        assert skip_warnings[0].kwargs["no_hearing_date"] == 1
