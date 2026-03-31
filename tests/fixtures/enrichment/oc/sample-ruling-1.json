@@ -1,0 +1,14 @@
+{
+  "ruling_text": "Garcia v. State Farm Insurance\nMotion to Compel Further Discovery Responses\nThe motion is GRANTED IN PART. Defendant shall provide further responses to interrogatories 5, 7, and 12 within 20 days. The motion is denied as to interrogatories 3 and 9.",
+  "expected": {
+    "case_title": "Garcia v. State Farm Insurance",
+    "motion_type": "motion_to_compel",
+    "outcome": "granted_in_part",
+    "parties": {
+      "plaintiffs": ["Garcia"],
+      "defendants": ["State Farm Insurance"]
+    }
+  },
+  "source_doc": "s3://judgemind-archives-dev/ca/oc/2026/03/sample3.pdf",
+  "notes": "Motion to compel, granted in part"
+}
