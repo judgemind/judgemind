@@ -2090,6 +2090,22 @@ _MULTIPLE_CASE_NUMBERS_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Single embedded case number in a title — a tighter version of
+# _EMBEDDED_CASE_NUMBER_RE (defined below) for use as a hard rejection
+# gate in is_plausible_case_title().  The numeric-dash-numeric sub-pattern
+# uses \d{7,} (not \d{5,}) to avoid false positives on non-case-number
+# identifiers like parcel or contract numbers (#2242).
+_PLAUSIBILITY_CASE_NUMBER_RE = re.compile(
+    r"\b(?:"
+    r"CV[A-Z]{2,4}\d{5,}"
+    r"|CIV[A-Z]{2}\d{5,}"
+    r"|\d{2,4}-\d{7,}"
+    r"|\d{2}[A-Z]{2}CV\d{5,}"
+    r"|[A-Z]{3}\d{2}-\d{4,}"
+    r"|\d{2}[A-Z]{4}\d{4,}"
+    r")\b",
+)
+
 # "In the" at the start — unless followed by "Matter of" (which is a
 # legitimate non-adversarial case title pattern).
 _IN_THE_NOT_MATTER_RE = re.compile(
@@ -2144,6 +2160,13 @@ def is_plausible_case_title(title: str) -> bool:
     # Reject titles containing multiple case numbers — strong indicator
     # of unsplit/contaminated data from LLM extraction (#2022).
     if _MULTIPLE_CASE_NUMBERS_RE.search(stripped):
+        return False
+
+    # Reject titles containing an embedded case number — legitimate case
+    # titles are party names only, never case numbers.  Catches
+    # contamination like "TAYLOR VS. AMAZON MSC21-02349 Romeo Cerina"
+    # (#2242).
+    if _PLAUSIBILITY_CASE_NUMBER_RE.search(stripped):
         return False
 
     return True
