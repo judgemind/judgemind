@@ -56,6 +56,8 @@ BULK_INGEST_MULTIPLIER = dqc.BULK_INGEST_MULTIPLIER
 _is_bulk_ingest = dqc._is_bulk_ingest
 ORPHANED_DOCS_P1_THRESHOLD = dqc.ORPHANED_DOCS_P1_THRESHOLD
 ORPHANED_DOCS_P2_THRESHOLD = dqc.ORPHANED_DOCS_P2_THRESHOLD
+check_ruling_document_ratio = dqc.check_ruling_document_ratio
+RULING_DOC_RATIO_THRESHOLD = dqc.RULING_DOC_RATIO_THRESHOLD
 check_ecs_service_health = dqc.check_ecs_service_health
 EcsServiceConfig = dqc.EcsServiceConfig
 load_ecs_service_configs = dqc.load_ecs_service_configs
@@ -5246,3 +5248,269 @@ class TestLoadEcsServiceConfigs:
         path = tmp_path / "nonexistent.json"
         configs = load_ecs_service_configs(path=path)
         assert len(configs) == len(DEFAULT_ECS_SERVICES)
+
+
+# ---------------------------------------------------------------------------
+# Ruling-to-document ratio check (#2230)
+# ---------------------------------------------------------------------------
+
+
+def _make_ratio_row(
+    county: str,
+    total_docs: int = 100,
+    total_rulings: int = 100,
+) -> tuple[Any, ...]:
+    """Create a row matching the RULING_DOC_RATIO_QUERY result shape."""
+    return (county, total_docs, total_rulings)
+
+
+class TestCheckRulingDocumentRatio:
+    """Tests for check_ruling_document_ratio function."""
+
+    def test_healthy_ratio_no_alert(self) -> None:
+        """No alerts when ruling-to-document ratio is at or above threshold."""
+        conn = FakeConnection(
+            {"total_rulings": [_make_ratio_row("Los Angeles", total_docs=100, total_rulings=98)]}
+        )
+        alerts = check_ruling_document_ratio(conn, NOW)
+        assert len(alerts) == 0
+
+    def test_ratio_exactly_at_threshold_no_alert(self) -> None:
+        """No alert when ratio is exactly at the threshold."""
+        conn = FakeConnection(
+            {"total_rulings": [_make_ratio_row("Orange", total_docs=100, total_rulings=50)]}
+        )
+        alerts = check_ruling_document_ratio(conn, NOW)
+        assert len(alerts) == 0
+
+    def test_ratio_above_one_no_alert(self) -> None:
+        """No alert when ratio exceeds 1.0 (multi-ruling documents)."""
+        conn = FakeConnection(
+            {"total_rulings": [_make_ratio_row("Fresno", total_docs=50, total_rulings=75)]}
+        )
+        alerts = check_ruling_document_ratio(conn, NOW)
+        assert len(alerts) == 0
+
+    def test_low_ratio_triggers_p1_alert(self) -> None:
+        """P1 alert when ratio drops below threshold."""
+        conn = FakeConnection(
+            {"total_rulings": [_make_ratio_row("Orange", total_docs=100, total_rulings=30)]}
+        )
+        alerts = check_ruling_document_ratio(conn, NOW)
+        assert len(alerts) == 1
+        assert alerts[0].county == "Orange"
+        assert alerts[0].metric == "ruling_document_ratio"
+        assert alerts[0].severity == "p1"
+        assert alerts[0].expected == RULING_DOC_RATIO_THRESHOLD
+        assert alerts[0].actual == 0.3
+        assert "0.300" in alerts[0].message
+        assert "30 rulings / 100 documents" in alerts[0].message
+        assert "silently dropped" in alerts[0].message
+
+    def test_zero_rulings_triggers_alert(self) -> None:
+        """Alert when there are zero rulings for documents."""
+        conn = FakeConnection(
+            {"total_rulings": [_make_ratio_row("Riverside", total_docs=50, total_rulings=0)]}
+        )
+        alerts = check_ruling_document_ratio(conn, NOW)
+        assert len(alerts) == 1
+        assert alerts[0].actual == 0.0
+
+    def test_zero_documents_no_alert(self) -> None:
+        """No alert when a county has zero documents."""
+        conn = FakeConnection(
+            {"total_rulings": [_make_ratio_row("Empty", total_docs=0, total_rulings=0)]}
+        )
+        alerts = check_ruling_document_ratio(conn, NOW)
+        assert len(alerts) == 0
+
+    def test_multiple_counties_independent(self) -> None:
+        """Alerts generated for multiple counties independently."""
+        conn = FakeConnection(
+            {
+                "total_rulings": [
+                    _make_ratio_row("Los Angeles", total_docs=100, total_rulings=95),
+                    _make_ratio_row("Orange", total_docs=100, total_rulings=20),
+                    _make_ratio_row("San Bernardino", total_docs=100, total_rulings=40),
+                ],
+            }
+        )
+        alerts = check_ruling_document_ratio(conn, NOW)
+        assert len(alerts) == 2
+        counties = {a.county for a in alerts}
+        assert counties == {"Orange", "San Bernardino"}
+
+    def test_passes_time_window_params(self) -> None:
+        """Passes window cutoff and grace period cutoff as query params."""
+        conn = FakeConnection(
+            {"total_rulings": [_make_ratio_row("Los Angeles", total_docs=100, total_rulings=100)]}
+        )
+        check_ruling_document_ratio(conn, NOW)
+        assert len(conn.cursors) == 1
+        captured = conn.cursors[0].captured_calls
+        assert len(captured) == 1
+        _query, params = captured[0]
+        cutoff = NOW - timedelta(days=FIELD_COMPLETENESS_WINDOW_DAYS)
+        grace = NOW - timedelta(minutes=FIELD_COMPLETENESS_GRACE_MINUTES)
+        assert params[0] == cutoff
+        assert params[1] == grace
+
+    def test_county_filter_passed(self) -> None:
+        """County filter is passed to the query."""
+        conn = FakeConnection(
+            {"total_rulings": [_make_ratio_row("Orange", total_docs=100, total_rulings=100)]}
+        )
+        check_ruling_document_ratio(conn, NOW, county="Orange")
+        captured = conn.cursors[0].captured_calls
+        _query, params = captured[0]
+        assert params[-1] == "Orange"
+
+
+class TestBulkIngestRulingDocRatio:
+    """Tests for bulk-ingest detection in check_ruling_document_ratio (#2230)."""
+
+    def test_bulk_ingest_downgrades_ratio_alert(self) -> None:
+        """Bulk ingest downgrades ruling-to-document ratio alert to P2."""
+        conn = FakeConnection(
+            {
+                "total_rulings": [
+                    _make_ratio_row("Riverside", total_docs=300, total_rulings=50),
+                ],
+            }
+        )
+        field_baselines = {
+            "Riverside": {"total_documents": 66},
+        }
+        alerts = check_ruling_document_ratio(conn, NOW, field_baselines=field_baselines)
+        assert len(alerts) == 1
+        assert alerts[0].metric == "ruling_document_ratio_bulk_ingest"
+        assert alerts[0].severity == "p2"
+        assert "bulk ingest" in alerts[0].message.lower()
+
+    def test_normal_ratio_alert_without_bulk(self) -> None:
+        """Normal doc count produces standard ratio alert."""
+        conn = FakeConnection(
+            {
+                "total_rulings": [
+                    _make_ratio_row("Orange", total_docs=100, total_rulings=30),
+                ],
+            }
+        )
+        field_baselines = {
+            "Orange": {"total_documents": 1772},
+        }
+        alerts = check_ruling_document_ratio(conn, NOW, field_baselines=field_baselines)
+        assert len(alerts) == 1
+        assert alerts[0].metric == "ruling_document_ratio"
+        assert alerts[0].severity == "p1"
+
+    def test_ratio_backward_compatible_no_baselines(self) -> None:
+        """Without field_baselines, bulk detection is skipped."""
+        conn = FakeConnection(
+            {
+                "total_rulings": [
+                    _make_ratio_row("Riverside", total_docs=300, total_rulings=50),
+                ],
+            }
+        )
+        alerts = check_ruling_document_ratio(conn, NOW)
+        assert len(alerts) == 1
+        assert alerts[0].metric == "ruling_document_ratio"
+        assert alerts[0].severity == "p1"
+
+    def test_ratio_above_threshold_no_alert_during_bulk(self) -> None:
+        """Ratio above threshold produces no alert even during bulk ingest."""
+        conn = FakeConnection(
+            {
+                "total_rulings": [
+                    _make_ratio_row("Riverside", total_docs=300, total_rulings=200),
+                ],
+            }
+        )
+        field_baselines = {
+            "Riverside": {"total_documents": 66},
+        }
+        alerts = check_ruling_document_ratio(conn, NOW, field_baselines=field_baselines)
+        assert len(alerts) == 0
+
+
+class TestCollectFullMetricsRulingDocRatio:
+    """Tests that ruling_document_ratio appears in _collect_full_metrics."""
+
+    def test_ratio_metric_collected(self) -> None:
+        """Ruling-document ratio is collected in full metrics."""
+        conn = FakeConnection(
+            {
+                # Keys match substrings in each SQL query used by _collect_full_metrics.
+                "AT TIME ZONE": [],
+                "captured_at < %s": [],
+                "AS ruling_count": [],
+                "d.document_type": [],
+                "has_ruling": [],
+                "r.judge_id IS NULL": [],
+                "ranked_runs": [],
+                "success_count": [],
+                # RULING_DOC_RATIO_QUERY
+                "total_rulings": [
+                    _make_ratio_row("Los Angeles", total_docs=100, total_rulings=95),
+                ],
+            }
+        )
+        metrics = _collect_full_metrics(conn, NOW)
+        assert "Los Angeles" in metrics
+        assert "ruling_document_ratio" in metrics["Los Angeles"]
+        metric = metrics["Los Angeles"]["ruling_document_ratio"]
+        assert metric["value"] == 0.95
+        assert metric["metadata"]["total_documents"] == 100
+        assert metric["metadata"]["total_rulings"] == 95
+
+    def test_ratio_zero_docs_skipped(self) -> None:
+        """Counties with zero documents are skipped in metrics collection."""
+        conn = FakeConnection(
+            {
+                "AT TIME ZONE": [],
+                "captured_at < %s": [],
+                "AS ruling_count": [],
+                "d.document_type": [],
+                "has_ruling": [],
+                "r.judge_id IS NULL": [],
+                "ranked_runs": [],
+                "success_count": [],
+                "total_rulings": [
+                    _make_ratio_row("Empty", total_docs=0, total_rulings=0),
+                ],
+            }
+        )
+        metrics = _collect_full_metrics(conn, NOW)
+        # If "Empty" exists at all, it should not have ruling_document_ratio.
+        if "Empty" in metrics:
+            assert "ruling_document_ratio" not in metrics["Empty"]
+
+
+class TestFormatMetricsSnapshotRulingDocRatio:
+    """Tests that ruling_document_ratio appears in snapshot format."""
+
+    def test_ratio_in_snapshot(self) -> None:
+        """Ruling-document ratio is included in the snapshot format."""
+        full_metrics = {
+            "Los Angeles": {
+                "ruling_count_24h": {"value": 50, "metadata": None},
+                "ruling_document_ratio": {
+                    "value": 0.95,
+                    "metadata": {"total_documents": 100, "total_rulings": 95},
+                },
+            },
+        }
+        snapshot = _format_metrics_for_snapshot(full_metrics)
+        assert "Los Angeles" in snapshot
+        assert snapshot["Los Angeles"]["ruling_document_ratio"] == 0.95
+
+    def test_snapshot_without_ratio(self) -> None:
+        """Snapshot works when ratio metric is absent."""
+        full_metrics = {
+            "Los Angeles": {
+                "ruling_count_24h": {"value": 50, "metadata": None},
+            },
+        }
+        snapshot = _format_metrics_for_snapshot(full_metrics)
+        assert "ruling_document_ratio" not in snapshot["Los Angeles"]

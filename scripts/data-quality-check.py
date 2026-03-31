@@ -339,11 +339,32 @@ FIELD_COMPLETENESS_QUERY = """
 ORPHANED_DOCS_P1_THRESHOLD = 20.0  # >20% orphaned = p1
 ORPHANED_DOCS_P2_THRESHOLD = 5.0  # 5-20% orphaned = p2
 
+# Threshold for ruling-to-document ratio alerts (#2230).
+# A ratio below this value indicates rulings are being silently dropped.
+# Normal ratio is ~1.0 (one ruling per document); some counties may be >1.0
+# when multi-ruling documents exist.
+RULING_DOC_RATIO_THRESHOLD = 0.5
+
 ORPHANED_DOCUMENTS_QUERY = """
     SELECT
         ct.county,
         COUNT(d.id) AS total_docs,
         COUNT(CASE WHEN r.id IS NULL THEN 1 END) AS orphaned_docs
+    FROM documents d
+    JOIN courts ct ON ct.id = d.court_id
+    LEFT JOIN rulings r ON r.document_id = d.id
+    WHERE d.status = 'active'
+      AND d.created_at >= %s
+      AND d.created_at <= %s
+    {county_filter}
+    GROUP BY ct.county ORDER BY ct.county
+"""
+
+RULING_DOC_RATIO_QUERY = """
+    SELECT
+        ct.county,
+        COUNT(DISTINCT d.id) AS total_docs,
+        COUNT(DISTINCT r.id) AS total_rulings
     FROM documents d
     JOIN courts ct ON ct.id = d.court_id
     LEFT JOIN rulings r ON r.document_id = d.id
@@ -777,6 +798,115 @@ def check_orphaned_documents(
                     message=(
                         f"{county_name}: {orphaned_count} of {total_docs} "
                         f"documents ({orphaned_pct}%) have no ruling reference"
+                    ),
+                )
+            )
+
+    return alerts
+
+
+def check_ruling_document_ratio(
+    conn: psycopg.Connection,  # type: ignore[type-arg]
+    now: datetime,
+    county: str | None = None,
+    field_baselines: dict[str, dict[str, float]] | None = None,
+) -> list[Alert]:
+    """Check ruling-to-document ratio per county (#2230).
+
+    Computes ``COUNT(rulings) / COUNT(documents)`` per county in the recent
+    time window.  A ratio below ``RULING_DOC_RATIO_THRESHOLD`` (default 0.5)
+    signals that rulings are being silently dropped during ingestion — e.g.
+    when ``insert_document_and_ruling`` skips ruling insertion due to a
+    missing required field.
+
+    Normal ratio is ~1.0 (one ruling per document).  Counties with
+    multi-ruling documents may exceed 1.0.
+
+    When a bulk ingest is detected, the alert is downgraded to P2
+    informational (same pattern as ``check_orphaned_documents``).
+
+    Args:
+        conn: Database connection.
+        now: Current timestamp for time calculations.
+        county: Optional county filter.
+        field_baselines: Per-county field baselines (used for bulk-ingest
+            detection via ``total_documents``).  If *None*, bulk-ingest
+            detection is skipped (backward-compatible default).
+
+    Returns:
+        List of alerts for low ruling-to-document ratios.
+    """
+    alerts: list[Alert] = []
+    county_filter, county_params = _build_county_filter(county)
+    cutoff = now - timedelta(days=FIELD_COMPLETENESS_WINDOW_DAYS)
+    grace_cutoff = now - timedelta(minutes=FIELD_COMPLETENESS_GRACE_MINUTES)
+
+    with conn.cursor() as cur:
+        cur.execute(
+            RULING_DOC_RATIO_QUERY.format(county_filter=county_filter),
+            (cutoff, grace_cutoff, *county_params),
+        )
+        for row in cur.fetchall():
+            county_name, total_docs, total_rulings = row
+
+            if total_docs == 0:
+                continue
+
+            raw_ratio = total_rulings / total_docs
+            if raw_ratio >= RULING_DOC_RATIO_THRESHOLD:
+                continue
+
+            # Round only for display — comparison uses the raw value above.
+            ratio = round(raw_ratio, 3)
+            severity = "p1"
+
+            # Bulk ingest detection: downgrade to P2 informational if the
+            # window doc count far exceeds the baseline.
+            if field_baselines and _is_bulk_ingest(
+                county_name, total_docs, field_baselines
+            ):
+                baseline_total = field_baselines.get(county_name, {}).get(
+                    "total_documents", 0
+                )
+                logger.info(
+                    "%s: bulk ingest detected (%d docs in window vs %d baseline). "
+                    "Downgrading ruling-document ratio alert.",
+                    county_name,
+                    total_docs,
+                    baseline_total,
+                )
+                alerts.append(
+                    Alert(
+                        county=county_name,
+                        metric="ruling_document_ratio_bulk_ingest",
+                        severity="p2",
+                        expected=RULING_DOC_RATIO_THRESHOLD,
+                        actual=ratio,
+                        message=(
+                            f"{county_name}: ruling-to-document ratio is {ratio:.3f} "
+                            f"({total_rulings} rulings / {total_docs} documents), "
+                            f"below threshold {RULING_DOC_RATIO_THRESHOLD}. "
+                            f"Likely bulk ingest ({total_docs} docs vs "
+                            f"{baseline_total} baseline, "
+                            f">{BULK_INGEST_MULTIPLIER:.0f}x) — "
+                            f"downgraded while enrichment catches up."
+                        ),
+                    )
+                )
+                continue
+
+            alerts.append(
+                Alert(
+                    county=county_name,
+                    metric="ruling_document_ratio",
+                    severity=severity,
+                    expected=RULING_DOC_RATIO_THRESHOLD,
+                    actual=ratio,
+                    message=(
+                        f"{county_name}: ruling-to-document ratio is {ratio:.3f} "
+                        f"({total_rulings} rulings / {total_docs} documents), "
+                        f"below threshold {RULING_DOC_RATIO_THRESHOLD}. "
+                        f"Rulings may be silently dropped during ingestion."
                     ),
                 )
             )
@@ -1732,6 +1862,27 @@ def _collect_full_metrics(
                 "metadata": error_metadata,
             }
 
+    # --- Ruling-to-document ratio (#2230) ---
+    cutoff_fc = now - timedelta(days=FIELD_COMPLETENESS_WINDOW_DAYS)
+    grace_fc = now - timedelta(minutes=FIELD_COMPLETENESS_GRACE_MINUTES)
+    with conn.cursor() as cur:
+        cur.execute(
+            RULING_DOC_RATIO_QUERY.format(county_filter=county_filter),
+            (cutoff_fc, grace_fc, *county_params),
+        )
+        for row in cur.fetchall():
+            county_name, total_docs, total_rulings = row
+            if total_docs == 0:
+                continue
+            ratio = round(total_rulings / total_docs, 3)
+            _ensure(county_name)["ruling_document_ratio"] = {
+                "value": ratio,
+                "metadata": {
+                    "total_documents": total_docs,
+                    "total_rulings": total_rulings,
+                },
+            }
+
     return result
 
 
@@ -1766,6 +1917,11 @@ def _format_metrics_for_snapshot(
         }
         if fc_data:
             county_data["field_completeness"] = fc_data
+
+        if "ruling_document_ratio" in metrics:
+            county_data["ruling_document_ratio"] = metrics["ruling_document_ratio"][
+                "value"
+            ]
 
         if county_data:
             snapshot_data[county_name] = county_data
@@ -1881,6 +2037,7 @@ def run_checks(
             )
 
         alerts.extend(check_orphaned_documents(conn, now, county, field_baselines))
+        alerts.extend(check_ruling_document_ratio(conn, now, county, field_baselines))
 
     if check_ecs:
         ecs_configs = load_ecs_service_configs(raw=baselines_raw, path=baselines_path)
@@ -1940,6 +2097,7 @@ def run_checks_full(
             )
 
         alerts.extend(check_orphaned_documents(conn, now, county, field_baselines))
+        alerts.extend(check_ruling_document_ratio(conn, now, county, field_baselines))
 
         # Single metric collection pass — we derive the legacy snapshot
         # format from the full metrics to avoid duplicate queries.
@@ -2004,6 +2162,7 @@ _METRIC_DISPLAY_NAMES: dict[str, str] = {
     "ingest_rate": "ingest rate drop",
     "scraper_stale": "scraper stale",
     "orphaned_documents": "orphaned documents",
+    "ruling_document_ratio": "low ruling-to-document ratio",
     "ecs_service_health": "ECS service unhealthy",
 }
 
