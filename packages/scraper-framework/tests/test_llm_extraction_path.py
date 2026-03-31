@@ -1630,6 +1630,181 @@ class TestCountyExtractionPath:
             assert second_event["_split_count"] == 2
 
 
+class TestMultiCasePdfAttribution:
+    """Regression tests for #2195: multi-case PDF rulings must get distinct cases.
+
+    Before the fix in #2202, all rulings from a multi-case PDF were linked to
+    a single case row because the ingestion worker used the same case_number
+    (from the parent document's scraper event) for every split ruling.  After
+    the fix, each split ruling carries its own LLM-extracted case_number, and
+    ``upsert_case_returning_title`` is called once per ruling with that
+    ruling's case_number — producing a distinct case row for each.
+    """
+
+    @patch("ingestion.worker.batch_upsert_parties")
+    @patch("ingestion.worker.insert_document_and_ruling", return_value=True)
+    @patch(
+        "ingestion.worker.upsert_case_returning_title",
+        side_effect=[
+            ("case-uuid-1", "Alpha v. Beta"),
+            ("case-uuid-2", "Gamma v. Delta"),
+            ("case-uuid-3", "Epsilon v. Zeta"),
+        ],
+    )
+    @patch("ingestion.worker.upsert_court", return_value="court-uuid-1")
+    @patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
+    @patch("ingestion.worker.psycopg")
+    def test_each_split_ruling_gets_distinct_case_id(
+        self,
+        mock_psycopg: MagicMock,
+        mock_resolve_judge: MagicMock,
+        mock_upsert_court: MagicMock,
+        mock_upsert_case: MagicMock,
+        mock_insert_doc_and_ruling: MagicMock,
+        mock_batch_upsert: MagicMock,
+    ) -> None:
+        """Each ruling from a multi-case PDF gets its own case row (#2195).
+
+        This is the primary regression test: when the LLM extractor splits a
+        multi-case document into 3 rulings, each with a different case_number,
+        the worker must call ``upsert_case_returning_title`` with different
+        case numbers and pass the resulting case_ids to
+        ``insert_document_and_ruling``.
+        """
+        worker, _ = _make_worker()
+
+        mock_conn, _ = _make_mock_conn()
+        mock_psycopg.connect.return_value = mock_conn
+
+        mock_extractor = MagicMock()
+        mock_extractor.extract.return_value = [
+            ExtractedRuling(
+                extracted_case_number="30-2024-01380242",
+                extracted_case_title="Alpha v. Beta",
+                ruling_text="Motion for summary judgment is GRANTED.",
+                outcome=ExtractionOutcome.GRANTED,
+                motion_type="Motion for Summary Judgment",
+            ),
+            ExtractedRuling(
+                extracted_case_number="30-2024-01399001",
+                extracted_case_title="Gamma v. Delta",
+                ruling_text="Demurrer is OVERRULED.",
+                outcome=ExtractionOutcome.DENIED,
+                motion_type="Demurrer",
+            ),
+            ExtractedRuling(
+                extracted_case_number="30-2025-01450123",
+                extracted_case_title="Epsilon v. Zeta",
+                ruling_text="Motion to compel is GRANTED.",
+                outcome=ExtractionOutcome.GRANTED,
+                motion_type="Motion to Compel",
+            ),
+        ]
+        worker._framework_extractor = mock_extractor
+
+        event = _make_event(
+            ruling_text=(
+                "TENTATIVE RULINGS DEPT C24 March 10, 2026\n"
+                "Case 30-2024-01380242 Alpha v. Beta...\n"
+                "Case 30-2024-01399001 Gamma v. Delta...\n"
+                "Case 30-2025-01450123 Epsilon v. Zeta...\n"
+            ),
+        )
+        worker.process_event(event)
+
+        # --- upsert_case_returning_title called 3 times with different case numbers ---
+        assert mock_upsert_case.call_count == 3
+        case_numbers_used = [call.args[1] for call in mock_upsert_case.call_args_list]
+        assert case_numbers_used == [
+            "30-2024-01380242",
+            "30-2024-01399001",
+            "30-2025-01450123",
+        ]
+
+        # --- insert_document_and_ruling called 3 times with different case_ids ---
+        assert mock_insert_doc_and_ruling.call_count == 3
+        case_ids_used = [
+            call.kwargs["case_id"] for call in mock_insert_doc_and_ruling.call_args_list
+        ]
+        assert case_ids_used == ["case-uuid-1", "case-uuid-2", "case-uuid-3"]
+
+        # --- Each ruling has a unique document_id (split IDs are deterministic) ---
+        doc_ids_used = [
+            call.kwargs["document_id"] for call in mock_insert_doc_and_ruling.call_args_list
+        ]
+        assert len(set(doc_ids_used)) == 3, f"Expected 3 unique document_ids, got {doc_ids_used}"
+
+        # --- The document_ids should all be different from the original ---
+        original_doc_id = event["document_id"]
+        for doc_id in doc_ids_used:
+            assert doc_id != original_doc_id, "Split document_id should not match original"
+
+    @patch("ingestion.worker.batch_upsert_parties")
+    @patch("ingestion.worker.insert_document_and_ruling", return_value=True)
+    @patch(
+        "ingestion.worker.upsert_case_returning_title",
+        side_effect=[
+            ("case-uuid-1", "Alpha v. Beta"),
+            ("case-uuid-1", "Alpha v. Beta"),
+        ],
+    )
+    @patch("ingestion.worker.upsert_court", return_value="court-uuid-1")
+    @patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
+    @patch("ingestion.worker.psycopg")
+    def test_same_case_number_reuses_case_row(
+        self,
+        mock_psycopg: MagicMock,
+        mock_resolve_judge: MagicMock,
+        mock_upsert_court: MagicMock,
+        mock_upsert_case: MagicMock,
+        mock_insert_doc_and_ruling: MagicMock,
+        mock_batch_upsert: MagicMock,
+    ) -> None:
+        """Two rulings with the same case_number share one case row.
+
+        When a case has multiple motions heard on the same day, the LLM
+        returns two rulings with the same case_number.  They should both
+        be linked to the same case_id via upsert.
+        """
+        worker, _ = _make_worker()
+
+        mock_conn, _ = _make_mock_conn()
+        mock_psycopg.connect.return_value = mock_conn
+
+        mock_extractor = MagicMock()
+        mock_extractor.extract.return_value = [
+            ExtractedRuling(
+                extracted_case_number="30-2024-01380242",
+                extracted_case_title="Alpha v. Beta",
+                ruling_text="Motion for summary judgment is GRANTED.",
+                outcome=ExtractionOutcome.GRANTED,
+            ),
+            ExtractedRuling(
+                extracted_case_number="30-2024-01380242",
+                extracted_case_title="Alpha v. Beta",
+                ruling_text="Motion to compel is DENIED.",
+                outcome=ExtractionOutcome.DENIED,
+            ),
+        ]
+        worker._framework_extractor = mock_extractor
+
+        event = _make_event(ruling_text="Two motions for the same case...")
+        worker.process_event(event)
+
+        # Both rulings should use the same case_number
+        assert mock_upsert_case.call_count == 2
+        case_numbers = [call.args[1] for call in mock_upsert_case.call_args_list]
+        assert case_numbers == ["30-2024-01380242", "30-2024-01380242"]
+
+        # Both rulings should get the same case_id
+        case_ids = [call.kwargs["case_id"] for call in mock_insert_doc_and_ruling.call_args_list]
+        assert case_ids == ["case-uuid-1", "case-uuid-1"]
+
+        # But they should still have different document_ids (split IDs)
+        doc_ids = [call.kwargs["document_id"] for call in mock_insert_doc_and_ruling.call_args_list]
+        assert len(set(doc_ids)) == 2
+
+
 class TestMultimodalExtractionPath:
     """Tests for the multimodal extraction path in _llm_split_document."""
 
