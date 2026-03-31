@@ -3,7 +3,7 @@
 -- To modify the schema, add a migration in packages/api/migrations/
 -- then run: scripts/regenerate_schema.sh
 --
--- Generated from 15 migrations.
+-- Generated from 16 migrations.
 
 
 
@@ -285,7 +285,7 @@ CREATE TABLE derived.rulings (
     ruling_text_html text,
     outcome public.ruling_outcome,
     motion_type text,
-    hearing_date date NOT NULL,
+    hearing_date date,
     posted_at timestamp with time zone,
     summary text,
     summary_model text,
