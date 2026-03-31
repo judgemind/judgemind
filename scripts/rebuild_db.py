@@ -196,26 +196,30 @@ def build_event(
         "capture_timestamp": datetime.now(UTC).isoformat(),
     }
 
-    # For HTML, pass content as ruling_text. For PDF, pass raw bytes
-    # (the worker handles PDF text extraction).
-    if content_format == "html":
+    # For text-based formats (HTML, TXT), pass content as ruling_text.
+    # For binary formats (PDF, DOCX), pass raw bytes as latin-1 string
+    # (the worker handles extraction from binary formats).
+    if content_format in ("html", "txt"):
         text = content.decode("utf-8", errors="replace")
         event["ruling_text"] = text
 
         # Try to extract hearing_date from HTML text using the ingestion
         # regex patterns.  This is cheap and reliable for HTML counties
-        # (LA, CC, Fresno).  Lazy import to avoid top-level dependency on the
-        # ingestion package (which is only available in the scraper-framework
-        # venv, not in the main process for all callers).
-        try:
-            from ingestion.extract import extract_hearing_date
+        # (LA, CC, Fresno).  Only applied to HTML — the regex patterns are
+        # tuned for HTML structure and may produce false positives on plain
+        # text.  Lazy import to avoid top-level dependency on the ingestion
+        # package (which is only available in the scraper-framework venv,
+        # not in the main process for all callers).
+        if content_format == "html":
+            try:
+                from ingestion.extract import extract_hearing_date
 
-            hearing_dt = extract_hearing_date(text)
-            if hearing_dt is not None:
-                event["hearing_date"] = str(hearing_dt)
-        except ImportError:
-            pass
-    elif content_format == "pdf":
+                hearing_dt = extract_hearing_date(text)
+                if hearing_dt is not None:
+                    event["hearing_date"] = str(hearing_dt)
+            except ImportError:
+                pass
+    elif content_format in ("pdf", "docx"):
         event["ruling_text"] = content.decode("latin-1")
 
     return event
@@ -263,7 +267,17 @@ def _process_one_document(
 
     actual_hash = hashlib.sha256(content).hexdigest()
     if actual_hash != parsed["content_hash"]:
-        parsed["content_hash"] = actual_hash
+        logger.error(
+            "S3 content hash mismatch, skipping document",
+            s3_key=key,
+            key_hash=parsed["content_hash"],
+            content_hash=actual_hash,
+        )
+        return {
+            "status": "error",
+            "content_format": content_format,
+            "had_hearing_date": False,
+        }
 
     event = build_event(key, content, parsed, bucket)
     had_hearing_date = bool(event.get("hearing_date"))
