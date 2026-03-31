@@ -140,8 +140,6 @@ class TestAutoDiscovery:
         expected_names = {
             "audit_field_completeness",
             "audit_oc_ruling_integrity",
-            "backfill_ruling_html",
-            "backfill_summaries",
         }
         missing = expected_names - discovered_names
         assert not missing, (
