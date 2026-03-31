@@ -7901,3 +7901,473 @@ class TestLlmOnlySplitRegistry:
             assert result[0]["is_split"] is False
         finally:
             reingest._LLM_SPLIT_REGISTRY.pop("test-llm-only", None)
+
+
+# ---------------------------------------------------------------------------
+# Prefix-mode tests
+# ---------------------------------------------------------------------------
+
+
+class TestParseS3Key:
+    """Tests for _parse_s3_key."""
+
+    def test_valid_key(self) -> None:
+        key = "federal/federal/courtlistener/raw/abc123def456.html"
+        result = reingest._parse_s3_key(key)
+        assert result is not None
+        assert result["state"] == "federal"
+        assert result["county"] == "federal"
+        assert result["court"] == "courtlistener"
+        assert result["content_hash"] == "abc123def456"
+        assert result["ext"] == "html"
+
+    def test_valid_key_with_underscores(self) -> None:
+        key = "ca/los_angeles/los_angeles_superior_court/raw/deadbeef.pdf"
+        result = reingest._parse_s3_key(key)
+        assert result is not None
+        assert result["state"] == "ca"
+        assert result["county"] == "los_angeles"
+        assert result["court"] == "los_angeles_superior_court"
+        assert result["ext"] == "pdf"
+
+    def test_invalid_key_returns_none(self) -> None:
+        assert reingest._parse_s3_key("not/a/valid/key") is None
+        assert reingest._parse_s3_key("") is None
+        assert reingest._parse_s3_key("federal/federal/raw/abc.html") is None
+
+    def test_non_hex_hash_rejected(self) -> None:
+        """Content hash must be hex digits only."""
+        assert reingest._parse_s3_key("ca/la/court/raw/NOTAHEX.html") is None
+
+
+class TestUnsluggify:
+    """Tests for _unsluggify."""
+
+    def test_short_code_uppercased(self) -> None:
+        assert reingest._unsluggify("ca") == "CA"
+        assert reingest._unsluggify("ny") == "NY"
+
+    def test_slug_to_title_case(self) -> None:
+        assert reingest._unsluggify("los_angeles") == "Los Angeles"
+        assert reingest._unsluggify("federal") == "Federal"
+
+    def test_single_char(self) -> None:
+        assert reingest._unsluggify("a") == "A"
+
+
+class TestDiscoverCourts:
+    """Tests for _discover_courts."""
+
+    def test_discovers_unique_courts(self) -> None:
+        keys = [
+            "federal/federal/courtlistener/raw/aaa111.html",
+            "federal/federal/courtlistener/raw/bbb222.html",
+            "ca/los_angeles/superior/raw/ccc333.pdf",
+        ]
+        courts = reingest._discover_courts(keys)
+        assert len(courts) == 2
+        codes = {c["court_code"] for c in courts}
+        assert "federal_federal_courtlistener" in codes
+        assert "ca_los_angeles_superior" in codes
+
+    def test_deduplicates_by_court_code(self) -> None:
+        keys = [
+            "federal/federal/courtlistener/raw/aaa111.html",
+            "federal/federal/courtlistener/raw/bbb222.html",
+        ]
+        courts = reingest._discover_courts(keys)
+        assert len(courts) == 1
+        assert courts[0]["court_code"] == "federal_federal_courtlistener"
+        assert courts[0]["state"] == "Federal"
+        assert courts[0]["county"] == "Federal"
+        assert courts[0]["court_name"] == "Courtlistener"
+
+    def test_skips_invalid_keys(self) -> None:
+        keys = [
+            "invalid/key",
+            "federal/federal/courtlistener/raw/aaa111.html",
+        ]
+        courts = reingest._discover_courts(keys)
+        assert len(courts) == 1
+
+    def test_empty_keys(self) -> None:
+        assert reingest._discover_courts([]) == []
+
+
+class TestListS3Keys:
+    """Tests for _list_s3_keys."""
+
+    def test_lists_matching_keys(self) -> None:
+        s3 = MagicMock()
+        paginator = MagicMock()
+        s3.get_paginator.return_value = paginator
+        paginator.paginate.return_value = [
+            {
+                "Contents": [
+                    {"Key": "federal/federal/courtlistener/raw/aaa111.html"},
+                    {"Key": "federal/federal/courtlistener/raw/bbb222.pdf"},
+                    {"Key": "federal/federal/courtlistener/metadata.json"},  # non-matching
+                ]
+            }
+        ]
+        keys = reingest._list_s3_keys(s3, "test-bucket", "federal/")
+        assert len(keys) == 2
+        s3.get_paginator.assert_called_once_with("list_objects_v2")
+        paginator.paginate.assert_called_once_with(Bucket="test-bucket", Prefix="federal/")
+
+    def test_handles_empty_pages(self) -> None:
+        s3 = MagicMock()
+        paginator = MagicMock()
+        s3.get_paginator.return_value = paginator
+        paginator.paginate.return_value = [{}]
+        keys = reingest._list_s3_keys(s3, "test-bucket", "federal/")
+        assert keys == []
+
+    def test_handles_multiple_pages(self) -> None:
+        s3 = MagicMock()
+        paginator = MagicMock()
+        s3.get_paginator.return_value = paginator
+        paginator.paginate.return_value = [
+            {"Contents": [{"Key": "federal/federal/courtlistener/raw/aaa111.html"}]},
+            {"Contents": [{"Key": "federal/federal/courtlistener/raw/bbb222.pdf"}]},
+        ]
+        keys = reingest._list_s3_keys(s3, "test-bucket", "federal/")
+        assert len(keys) == 2
+
+
+class TestBuildPrefixEvent:
+    """Tests for _build_prefix_event."""
+
+    def test_builds_event_for_html(self) -> None:
+        parsed = {
+            "state": "federal",
+            "county": "federal",
+            "court": "courtlistener",
+            "content_hash": "abc123",
+            "ext": "html",
+        }
+        content = b"<html>ruling text</html>"
+        event = reingest._build_prefix_event(
+            "federal/federal/courtlistener/raw/abc123.html",
+            content,
+            parsed,
+            "test-bucket",
+        )
+        assert event["state"] == "Federal"
+        assert event["county"] == "Federal"
+        assert event["court"] == "Courtlistener"
+        assert event["content_format"] == "html"
+        assert event["content_hash"] == "abc123"
+        assert event["s3_bucket"] == "test-bucket"
+        assert event["scraper_id"] == "reingest-federal-federal"
+        assert event["ruling_text"] == "<html>ruling text</html>"
+        # Document ID is deterministic (uuid5 from content_hash)
+        expected_id = str(uuid.uuid5(uuid.NAMESPACE_URL, "abc123"))
+        assert event["document_id"] == expected_id
+
+    def test_builds_event_for_pdf(self) -> None:
+        parsed = {
+            "state": "ca",
+            "county": "los_angeles",
+            "court": "superior",
+            "content_hash": "def456",
+            "ext": "pdf",
+        }
+        content = b"%PDF-1.4 some binary"
+        event = reingest._build_prefix_event(
+            "ca/los_angeles/superior/raw/def456.pdf",
+            content,
+            parsed,
+            "test-bucket",
+        )
+        assert event["content_format"] == "pdf"
+        assert event["state"] == "CA"
+        assert event["county"] == "Los Angeles"
+        assert event["court"] == "Superior"
+        # PDF content is decoded as latin-1
+        assert event["ruling_text"] == content.decode("latin-1")
+
+    def test_builds_event_for_txt(self) -> None:
+        parsed = {
+            "state": "federal",
+            "county": "federal",
+            "court": "courtlistener",
+            "content_hash": "aaa111",
+            "ext": "txt",
+        }
+        content = b"Plain text ruling content"
+        event = reingest._build_prefix_event(
+            "federal/federal/courtlistener/raw/aaa111.txt",
+            content,
+            parsed,
+            "test-bucket",
+        )
+        assert event["content_format"] == "txt"
+        assert event["ruling_text"] == "Plain text ruling content"
+
+    def test_builds_event_for_docx(self) -> None:
+        parsed = {
+            "state": "federal",
+            "county": "federal",
+            "court": "courtlistener",
+            "content_hash": "bbb222",
+            "ext": "docx",
+        }
+        content = b"PK\x03\x04 docx binary"
+        event = reingest._build_prefix_event(
+            "federal/federal/courtlistener/raw/bbb222.docx",
+            content,
+            parsed,
+            "test-bucket",
+        )
+        assert event["content_format"] == "docx"
+        assert event["ruling_text"] == content.decode("latin-1")
+
+
+class TestSeedCourts:
+    """Tests for _seed_courts."""
+
+    def test_seeds_courts_and_returns_ids(self) -> None:
+        court_id = uuid.uuid4()
+        conn = MagicMock()
+        cur = MagicMock()
+        cur.fetchone.return_value = (court_id,)
+        ctx = MagicMock()
+        ctx.__enter__ = MagicMock(return_value=cur)
+        ctx.__exit__ = MagicMock(return_value=False)
+        conn.cursor.return_value = ctx
+
+        courts = [
+            {
+                "state": "Federal",
+                "county": "Federal",
+                "court_name": "Courtlistener",
+                "court_code": "federal_federal_courtlistener",
+                "timezone": "America/Los_Angeles",
+            }
+        ]
+        result = reingest._seed_courts(conn, courts)
+        assert result == {"federal_federal_courtlistener": str(court_id)}
+        cur.execute.assert_called_once()
+        conn.commit.assert_called_once()
+
+
+class TestRunReingestFromPrefix:
+    """Tests for run_reingest_from_prefix."""
+
+    @patch.dict(
+        os.environ,
+        {
+            "JUDGEMIND_ARCHIVE_BUCKET": "test-bucket",
+            "REDIS_URL": "redis://localhost:6379",
+            "OPENSEARCH_URL": "",
+        },
+    )
+    @patch("reingest_from_s3.boto3")
+    @patch("reingest_from_s3._list_s3_keys")
+    @patch("reingest_from_s3._seed_courts")
+    @patch("reingest_from_s3.psycopg")
+    def test_empty_prefix_returns_zeros(
+        self,
+        mock_psycopg: MagicMock,
+        mock_seed: MagicMock,
+        mock_list: MagicMock,
+        mock_boto3: MagicMock,
+    ) -> None:
+        mock_list.return_value = []
+        stats = reingest.run_reingest_from_prefix(
+            "postgresql://test",
+            prefix="nonexistent/",
+        )
+        assert stats["total_keys"] == 0
+        assert stats["processed"] == 0
+        assert stats["errors"] == 0
+        assert stats["skipped"] == 0
+
+    @patch.dict(
+        os.environ,
+        {
+            "JUDGEMIND_ARCHIVE_BUCKET": "test-bucket",
+            "REDIS_URL": "redis://localhost:6379",
+            "OPENSEARCH_URL": "",
+        },
+    )
+    @patch("reingest_from_s3.boto3")
+    @patch("reingest_from_s3._list_s3_keys")
+    @patch("reingest_from_s3._seed_courts")
+    @patch("reingest_from_s3._discover_courts")
+    @patch("reingest_from_s3.psycopg")
+    def test_dry_run_skips_processing(
+        self,
+        mock_psycopg: MagicMock,
+        mock_discover: MagicMock,
+        mock_seed: MagicMock,
+        mock_list: MagicMock,
+        mock_boto3: MagicMock,
+    ) -> None:
+        mock_list.return_value = [
+            "federal/federal/courtlistener/raw/aaa111.html",
+        ]
+        mock_discover.return_value = [
+            {
+                "state": "Federal",
+                "county": "Federal",
+                "court_name": "Courtlistener",
+                "court_code": "federal_federal_courtlistener",
+                "timezone": "America/Los_Angeles",
+            }
+        ]
+        conn_mock = MagicMock()
+        mock_psycopg.connect.return_value.__enter__ = MagicMock(return_value=conn_mock)
+        mock_psycopg.connect.return_value.__exit__ = MagicMock(return_value=False)
+        mock_seed.return_value = {"federal_federal_courtlistener": "court-id-1"}
+
+        stats = reingest.run_reingest_from_prefix(
+            "postgresql://test",
+            prefix="federal/",
+            dry_run=True,
+        )
+        assert stats["total_keys"] == 1
+        assert stats["processed"] == 0
+        # Courts should still be seeded in dry-run mode
+        mock_seed.assert_called_once()
+
+    @patch.dict(
+        os.environ,
+        {
+            "JUDGEMIND_ARCHIVE_BUCKET": "test-bucket",
+            "REDIS_URL": "redis://localhost:6379",
+            "OPENSEARCH_URL": "",
+        },
+    )
+    @patch("reingest_from_s3.boto3")
+    @patch("reingest_from_s3._list_s3_keys")
+    @patch("reingest_from_s3._seed_courts")
+    @patch("reingest_from_s3._discover_courts")
+    @patch("reingest_from_s3.psycopg")
+    @patch("reingest_from_s3.ProcessPoolExecutor")
+    def test_processes_documents_with_pool(
+        self,
+        mock_pool_cls: MagicMock,
+        mock_psycopg: MagicMock,
+        mock_discover: MagicMock,
+        mock_seed: MagicMock,
+        mock_list: MagicMock,
+        mock_boto3: MagicMock,
+    ) -> None:
+        keys = [
+            "federal/federal/courtlistener/raw/aaa111.html",
+            "federal/federal/courtlistener/raw/bbb222.html",
+        ]
+        mock_list.return_value = keys
+        mock_discover.return_value = [
+            {
+                "state": "Federal",
+                "county": "Federal",
+                "court_name": "Courtlistener",
+                "court_code": "federal_federal_courtlistener",
+                "timezone": "America/Los_Angeles",
+            }
+        ]
+        conn_mock = MagicMock()
+        mock_psycopg.connect.return_value.__enter__ = MagicMock(return_value=conn_mock)
+        mock_psycopg.connect.return_value.__exit__ = MagicMock(return_value=False)
+        mock_seed.return_value = {"federal_federal_courtlistener": "court-id-1"}
+
+        # Mock ProcessPoolExecutor and its futures
+        pool = MagicMock()
+        mock_pool_cls.return_value.__enter__ = MagicMock(return_value=pool)
+        mock_pool_cls.return_value.__exit__ = MagicMock(return_value=False)
+
+        future1 = MagicMock()
+        future1.result.return_value = "ok"
+        future2 = MagicMock()
+        future2.result.return_value = "ok"
+        pool.submit.side_effect = [future1, future2]
+
+        # Mock as_completed to return both futures
+        with patch("reingest_from_s3.as_completed", return_value=[future1, future2]):
+            stats = reingest.run_reingest_from_prefix(
+                "postgresql://test",
+                prefix="federal/",
+                concurrency=4,
+            )
+
+        assert stats["total_keys"] == 2
+        assert stats["processed"] == 2
+        assert stats["errors"] == 0
+        assert pool.submit.call_count == 2
+
+    @patch.dict(
+        os.environ,
+        {
+            "JUDGEMIND_ARCHIVE_BUCKET": "test-bucket",
+            "REDIS_URL": "redis://localhost:6379",
+            "OPENSEARCH_URL": "",
+        },
+    )
+    @patch("reingest_from_s3.boto3")
+    @patch("reingest_from_s3._list_s3_keys")
+    @patch("reingest_from_s3._seed_courts")
+    @patch("reingest_from_s3._discover_courts")
+    @patch("reingest_from_s3.psycopg")
+    def test_limit_caps_keys(
+        self,
+        mock_psycopg: MagicMock,
+        mock_discover: MagicMock,
+        mock_seed: MagicMock,
+        mock_list: MagicMock,
+        mock_boto3: MagicMock,
+    ) -> None:
+        mock_list.return_value = [
+            "federal/federal/courtlistener/raw/aaa111.html",
+            "federal/federal/courtlistener/raw/bbb222.html",
+            "federal/federal/courtlistener/raw/ccc333.html",
+        ]
+        mock_discover.return_value = []
+        conn_mock = MagicMock()
+        mock_psycopg.connect.return_value.__enter__ = MagicMock(return_value=conn_mock)
+        mock_psycopg.connect.return_value.__exit__ = MagicMock(return_value=False)
+        mock_seed.return_value = {}
+
+        stats = reingest.run_reingest_from_prefix(
+            "postgresql://test",
+            prefix="federal/",
+            limit=2,
+            dry_run=True,
+        )
+        # Limit should have capped to 2 keys
+        assert stats["total_keys"] == 2
+
+
+class TestProcessPrefixDocument:
+    """Tests for _process_prefix_document."""
+
+    @patch("reingest_from_s3.hashlib")
+    def test_skips_invalid_key(self, mock_hashlib: MagicMock) -> None:
+        result = reingest._process_prefix_document(
+            "invalid/key",
+            "test-bucket",
+            "postgresql://test",
+            "redis://localhost:6379",
+            "",
+        )
+        assert result == "skip"
+
+    def test_hash_mismatch_returns_error(self) -> None:
+        """When the S3 content hash doesn't match the key hash, return error."""
+        mock_s3 = MagicMock()
+        body = MagicMock()
+        body.read.return_value = b"<html>content</html>"
+        mock_s3.get_object.return_value = {"Body": body}
+
+        with patch("framework.s3_cache.make_s3_client", return_value=mock_s3):
+            result = reingest._process_prefix_document(
+                "federal/federal/courtlistener/raw/abc123.html",
+                "test-bucket",
+                "postgresql://test",
+                "redis://localhost:6379",
+                "",
+            )
+        # abc123 doesn't match the SHA256 of b"<html>content</html>"
+        assert result == "error"
