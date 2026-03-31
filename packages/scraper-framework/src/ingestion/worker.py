@@ -58,6 +58,7 @@ from .db import (
     upsert_case_returning_title,
     upsert_court,
 )
+from .department_normalize import normalize_department
 from .extract import (
     clean_case_title,
     extract_case_number,
@@ -1119,6 +1120,11 @@ class IngestionWorker:
                     "extraction_methods": extraction_methods,
                 },
             )
+
+        # Normalize department name before it's used for lookups or DB
+        # writes (#2141).  Placed here so the LA dept-to-judge lookup
+        # below sees the canonical department name.
+        department = normalize_department(county, department)
 
         # ------------------------------------------------------------------
         # Warn when a PDF document has no ruling text after all extraction
