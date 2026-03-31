@@ -155,6 +155,11 @@ export function createApolloClient(): ApolloClient<unknown> {
           keyFields: ['motionType'],
         },
 
+        // JudgeAssignment is embedded within the Judge type as an array.
+        // Uses keyFields: false since department alone isn't unique (a judge
+        // could theoretically return to the same department).
+        JudgeAssignment: { keyFields: false },
+
         // RulingSearchHit uses `rulingId` instead of `id` as its unique key.
         RulingSearchHit: {
           keyFields: ['rulingId'],

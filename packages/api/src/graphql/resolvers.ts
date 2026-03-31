@@ -502,6 +502,8 @@ export const resolvers = {
         : loaders.judgeRulingCountLoader.load(row.id as string),
     court: (row: Row, _: unknown, { loaders }: Context) =>
       row.court_id ? loaders.courtLoader.load(row.court_id as string) : null,
+    assignments: (row: Row, _: unknown, { loaders }: Context) =>
+      loaders.judgeAssignmentsLoader.load(row.id as string),
   },
 
   Court: {

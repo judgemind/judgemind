@@ -1011,3 +1011,21 @@ export function formatDateRange(earliest: string | null, latest: string | null):
   if (!earliest || !latest) return '';
   return `${formatDate(earliest)} \u2013 ${formatDate(latest)}`;
 }
+
+/**
+ * Format a date range for judge department assignments using "Mon YYYY" format.
+ * Returns null if either date is null or unparseable.
+ * Examples: "Mar 2024 \u2013 Jan 2026", "Jan 2025 \u2013 Mar 2026"
+ */
+export function formatAssignmentDateRange(
+  firstSeen: string | null,
+  lastSeen: string | null,
+): string | null {
+  if (!firstSeen || !lastSeen) return null;
+  const start = new Date(firstSeen + 'T00:00:00Z');
+  const end = new Date(lastSeen + 'T00:00:00Z');
+  if (isNaN(start.getTime()) || isNaN(end.getTime())) return null;
+  const fmt = (d: Date) =>
+    d.toLocaleDateString('en-US', { month: 'short', year: 'numeric', timeZone: 'UTC' });
+  return `${fmt(start)} \u2013 ${fmt(end)}`;
+}

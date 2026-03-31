@@ -24,6 +24,22 @@ export const typeDefs = `#graphql
     """Number of rulings associated with this judge."""
     rulingCount: Int!
     court: Court
+    """Department assignment history derived from rulings, ordered by most recent first."""
+    assignments: [JudgeAssignment!]!
+  }
+
+  """A time period when a judge sat in a particular department."""
+  type JudgeAssignment {
+    """Department identifier, e.g. "C24", "51"."""
+    department: String!
+    """Predominant case type for rulings in this department, e.g. "civil", "family"."""
+    caseType: String
+    """Courthouse name derived from department-to-courthouse mapping."""
+    courthouse: String
+    """ISO 8601 date of the earliest ruling in this department."""
+    firstSeen: String!
+    """ISO 8601 date of the latest ruling in this department."""
+    lastSeen: String!
   }
 
   """A court case. case_number + court_id is the unique key."""
