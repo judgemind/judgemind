@@ -132,6 +132,29 @@ class TestBuildEvent:
         assert event["scraper_id"] == "rebuild-ca-orange"
         assert event["capture_timestamp"]
 
+    def test_txt_content_decoded_as_utf8(self) -> None:
+        """TXT content should be decoded as utf-8 and set as ruling_text."""
+        txt_content = b"This is a plain text ruling document."
+        parsed = _make_parsed(ext="txt")
+        key = _make_key(parsed)
+
+        event = rebuild_db.build_event(key, txt_content, parsed, "test-bucket")
+
+        assert event["content_format"] == "txt"
+        assert event["ruling_text"] == txt_content.decode("utf-8")
+
+    def test_docx_content_decoded_as_latin1(self) -> None:
+        """DOCX content should be decoded as latin-1 and set as ruling_text."""
+        docx_content = b"PK\x03\x04 fake docx binary content"
+        parsed = _make_parsed(ext="docx")
+        key = _make_key(parsed)
+
+        event = rebuild_db.build_event(key, docx_content, parsed, "test-bucket")
+
+        assert event["content_format"] == "docx"
+        assert event["ruling_text"] == docx_content.decode("latin-1")
+        assert "hearing_date" not in event
+
     def test_html_hearing_date_extraction_import_error(self) -> None:
         """If ingestion.extract is not importable, build_event still works."""
         html_content = b"<html>Hearing Date: March 15, 2026</html>"
@@ -157,12 +180,17 @@ class TestProcessOneDocument:
 
     def test_returns_dict_with_status_ok(self, tmp_path: Any) -> None:
         """Successful processing should return a dict with status='ok'."""
-        # Create a local cache file
-        key = "ca/orange/superior_court/raw/abc123.html"
+        # Create a local cache file — use the real SHA256 of the content
+        # so the hash check passes.
+        content = b"<html>Date: 03/15/2026 ruling text</html>"
+        import hashlib
+
+        content_hash = hashlib.sha256(content).hexdigest()
+        key = f"ca/orange/superior_court/raw/{content_hash}.html"
         cache_dir = str(tmp_path)
         key_path = tmp_path / "ca" / "orange" / "superior_court" / "raw"
         key_path.mkdir(parents=True)
-        (key_path / "abc123.html").write_bytes(b"<html>Date: 03/15/2026 ruling text</html>")
+        (key_path / f"{content_hash}.html").write_bytes(content)
 
         mock_worker = MagicMock()
         mock_worker.process_event = MagicMock()
@@ -206,6 +234,31 @@ class TestProcessOneDocument:
         assert result["content_format"] == "html"
         assert result["had_hearing_date"] is True
 
+    def test_returns_error_on_hash_mismatch(self, tmp_path: Any) -> None:
+        """Hash mismatch should return status='error' and not proceed."""
+        # The key says the hash is "abc123" but the actual content hashes
+        # to something different.
+        key = "ca/orange/superior_court/raw/abc123.html"
+        cache_dir = str(tmp_path)
+        key_path = tmp_path / "ca" / "orange" / "superior_court" / "raw"
+        key_path.mkdir(parents=True)
+        # Write content whose SHA256 will NOT match "abc123"
+        (key_path / "abc123.html").write_bytes(b"<html>content with wrong hash</html>")
+
+        result = rebuild_db._process_one_document(
+            key,
+            cache_dir,
+            "test-bucket",
+            "postgres://test",
+            "redis://test",
+            "",
+        )
+
+        assert isinstance(result, dict)
+        assert result["status"] == "error"
+        assert result["content_format"] == "html"
+        assert result["had_hearing_date"] is False
+
     def test_returns_dict_with_status_skip_for_bad_key(self) -> None:
         """Unparseable keys should return status='skip'."""
         result = rebuild_db._process_one_document(
@@ -222,11 +275,15 @@ class TestProcessOneDocument:
 
     def test_returns_dict_with_no_hearing_date_for_pdf(self, tmp_path: Any) -> None:
         """PDF documents should report had_hearing_date=False."""
-        key = "ca/orange/superior_court/raw/abc456.pdf"
+        content = b"%PDF-1.4 binary content here"
+        import hashlib
+
+        content_hash = hashlib.sha256(content).hexdigest()
+        key = f"ca/orange/superior_court/raw/{content_hash}.pdf"
         cache_dir = str(tmp_path)
         key_path = tmp_path / "ca" / "orange" / "superior_court" / "raw"
         key_path.mkdir(parents=True)
-        (key_path / "abc456.pdf").write_bytes(b"%PDF-1.4 binary content here")
+        (key_path / f"{content_hash}.pdf").write_bytes(content)
 
         mock_worker = MagicMock()
 
@@ -264,11 +321,15 @@ class TestProcessOneDocument:
 
     def test_returns_error_on_worker_exception(self, tmp_path: Any) -> None:
         """Worker exceptions should return status='error'."""
-        key = "ca/orange/superior_court/raw/abc789.html"
+        content = b"<html>some content</html>"
+        import hashlib
+
+        content_hash = hashlib.sha256(content).hexdigest()
+        key = f"ca/orange/superior_court/raw/{content_hash}.html"
         cache_dir = str(tmp_path)
         key_path = tmp_path / "ca" / "orange" / "superior_court" / "raw"
         key_path.mkdir(parents=True)
-        (key_path / "abc789.html").write_bytes(b"<html>some content</html>")
+        (key_path / f"{content_hash}.html").write_bytes(content)
 
         mock_worker = MagicMock()
         mock_worker.process_event.side_effect = RuntimeError("boom")
