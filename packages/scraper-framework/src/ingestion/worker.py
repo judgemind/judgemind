@@ -57,6 +57,7 @@ from .db import (
     batch_upsert_parties,
     insert_document_and_ruling,
     resolve_judge,
+    resolve_judge_from_department,
     upsert_case_judge,
     upsert_case_returning_title,
     upsert_court,
@@ -1302,9 +1303,39 @@ class IngestionWorker:
             )
 
         # Normalize department name before it's used for lookups or DB
-        # writes (#2141).  Placed here so the LA dept-to-judge lookup
-        # below sees the canonical department name.
+        # writes (#2141).  Placed here so the dept-to-judge lookup below
+        # sees the canonical department name.
         department = normalize_department(county, department)
+
+        # ------------------------------------------------------------------
+        # Universal dept-to-judge fallback via court directory snapshots (#2269).
+        # When all extraction methods (LLM, regex, scraper) have failed to
+        # provide a judge name but a department is available, look up the
+        # judge from the court directory snapshot (roster data).
+        #
+        # This fires for ALL counties and regardless of _llm_extracted status,
+        # fixing the regression where rebuilds (which use the LLM split path
+        # with _llm_extracted=True) skipped the old LA-specific fallback and
+        # had no fallback at all for other counties.
+        # ------------------------------------------------------------------
+        if not judge_name and department and state == "CA":
+            conn = self._get_connection()
+            court_id_for_dept = upsert_court(conn, state, county, court_name)
+            dept_judge = resolve_judge_from_department(
+                conn, court_id_for_dept, department, hearing_date=hearing_dt
+            )
+            if dept_judge:
+                judge_name = dept_judge
+                extraction_methods["judge_name"] = "roster_dept_lookup"
+                logger.info(
+                    "Resolved judge_name from court directory snapshot",
+                    extra={
+                        "document_id": document_id,
+                        "department": department,
+                        "judge_name": judge_name,
+                        "county": county,
+                    },
+                )
 
         # ------------------------------------------------------------------
         # Warn when a PDF document has no ruling text after all extraction
