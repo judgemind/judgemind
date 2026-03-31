@@ -3221,6 +3221,41 @@ class TestIsPlausibleCaseTitle:
         """Titles with corporate parties should pass."""
         assert is_plausible_case_title("Discover Bank v. Jones") is True
 
+    # --- Tests for issue #2242 (embedded case number detection) ---
+
+    def test_rejects_embedded_generic_case_number(self) -> None:
+        """Title with embedded MSC-format case number is contaminated."""
+        assert is_plausible_case_title("TAYLOR VS. AMAZON MSC21-02349 Romeo Cerina") is False
+
+    def test_rejects_embedded_riverside_case_number(self) -> None:
+        """Title with embedded Riverside-format case number is contaminated."""
+        assert is_plausible_case_title("Smith v. Jones CVPS2400892") is False
+
+    def test_rejects_embedded_oc_case_number(self) -> None:
+        """Title with OC-format case number is contaminated."""
+        assert is_plausible_case_title("Doe v. Roe 30-2024-01234567") is False
+
+    def test_rejects_embedded_la_case_number(self) -> None:
+        """Title with LA-format case number is contaminated."""
+        assert is_plausible_case_title("Garcia v. Lopez 24STCV01234") is False
+
+    def test_rejects_embedded_sb_case_number(self) -> None:
+        """Title with SB-format case number is contaminated."""
+        assert is_plausible_case_title("Adams v. Baker CIVSB2100123") is False
+
+    def test_accepts_clean_adversarial_title(self) -> None:
+        """Normal adversarial titles without case numbers still pass."""
+        assert is_plausible_case_title("Taylor v. Amazon") is True
+        assert is_plausible_case_title("SMITH VS JONES") is True
+
+    def test_accepts_single_party_name_no_case_number(self) -> None:
+        """Single party names without case numbers still pass."""
+        assert is_plausible_case_title("Williams") is True
+
+    def test_accepts_probate_title_no_case_number(self) -> None:
+        """Probate/estate titles without case numbers still pass."""
+        assert is_plausible_case_title("In the Matter of the Estate of Davis") is True
+
 
 # ---------------------------------------------------------------------------
 # Outcome extraction — Riverside-specific patterns (#2022)
