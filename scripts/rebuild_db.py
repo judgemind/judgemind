@@ -13,6 +13,12 @@
 #
 # Usage (ECS, against dev):
 #   scripts/ecs-run-task.sh scripts/rebuild_db.py
+#
+# Options:
+#   --county NAME     Only process documents from this county (e.g. Ventura)
+#   --state CODE      State code for --county filtering (default: ca)
+#   --concurrency N   Number of parallel processes (default: 64)
+#   --reset           Truncate derived tables before rebuilding
 """
 
 from __future__ import annotations
@@ -62,6 +68,11 @@ def unsluggify(s: str) -> str:
     if len(s) <= 2:
         return s.upper()
     return s.replace("_", " ").title()
+
+
+def sluggify(s: str) -> str:
+    """Convert 'Los Angeles' → 'los_angeles', 'CA' → 'ca'."""
+    return s.lower().replace(" ", "_")
 
 
 def parse_s3_key(key: str) -> dict[str, str] | None:
@@ -315,6 +326,18 @@ def main() -> None:
         action="store_true",
         help="Truncate all derived tables and delete OpenSearch index before rebuilding",
     )
+    parser.add_argument(
+        "--county",
+        type=str,
+        default=None,
+        help="Only process documents from this county (e.g. 'Ventura', 'Los Angeles')",
+    )
+    parser.add_argument(
+        "--state",
+        type=str,
+        default="ca",
+        help="State code for --county filtering (default: ca)",
+    )
     args = parser.parse_args()
 
     database_url = os.environ.get("DATABASE_URL", "")
@@ -339,12 +362,16 @@ def main() -> None:
             logger.info("OPENSEARCH_URL not set — skipping OpenSearch index reset")
 
     # Step 1: Discover keys (local cache or S3)
-    logger.info("Discovering S3 objects...")
+    # Build S3 prefix — default "ca/", narrowed by --county if given.
+    s3_prefix = f"{sluggify(args.state)}/"
+    if args.county:
+        s3_prefix = f"{sluggify(args.state)}/{sluggify(args.county)}/"
+    logger.info("Discovering S3 objects...", prefix=s3_prefix)
     if cache_dir:
-        keys = list_local_keys(Path(cache_dir))
+        keys = list_local_keys(Path(cache_dir), prefix=s3_prefix)
         logger.info("Found keys from local cache", count=len(keys), cache_dir=cache_dir)
     else:
-        keys = list_s3_keys(s3, BUCKET)
+        keys = list_s3_keys(s3, BUCKET, prefix=s3_prefix)
         logger.info("Found keys from S3", count=len(keys))
 
     if not keys:
