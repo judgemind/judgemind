@@ -1419,8 +1419,11 @@ def test_resolve_judge_creates_new() -> None:
     mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cur)
     mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
 
-    # No existing alias, no canonical match, then INSERT returns new judge id
-    mock_cur.fetchone.side_effect = [None, None, ("new-judge-uuid",)]
+    # No existing alias, no canonical match, no roster match,
+    # then INSERT returns new judge id.
+    # Calls: (1) alias lookup, (2) canonical match, (3) roster court_code
+    # (returns None — no court found, skips roster), (4) INSERT judge.
+    mock_cur.fetchone.side_effect = [None, None, None, ("new-judge-uuid",)]
     mock_cur.fetchall.return_value = []  # no near-duplicates
 
     result = resolve_judge(mock_conn, "Luna, Bobby P.", "court-uuid-1")
@@ -3821,6 +3824,7 @@ def test_process_event_opensearch_falls_back_to_truncated_text_without_summary(
         ("case-uuid-1",),  # upsert_case
         None,  # resolve_judge: no existing alias
         None,  # resolve_judge: no canonical name match
+        None,  # resolve_judge: roster court_code lookup (no court found)
         ("judge-uuid-1",),  # resolve_judge: INSERT INTO judges
         (True,),  # insert_document (via insert_document_and_ruling)
     ]
