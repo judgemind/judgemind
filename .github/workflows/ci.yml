@@ -512,9 +512,9 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v6
         with:
-          node-version: '20'
+          node-version: '24'
       - name: Install test dependencies
         run: pip install pytest boto3 -e packages/judgemind-config
       - name: Install Node.js test dependencies
@@ -870,9 +870,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v6
         with:
-          node-version: '20'
+          node-version: '24'
       - name: Install graphql package
         run: npm install --no-save graphql@^16.8
       - name: Validate frontend GraphQL queries against API schema
