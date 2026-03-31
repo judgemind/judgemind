@@ -1360,6 +1360,21 @@ def _reparse_document_multimodal(
             _apply_regex_fallbacks(
                 extracted, extracted["ruling_text"], scraper_id=scraper_id
             )
+        else:
+            # Even without ruling_text (e.g. multi-ruling PDFs where the
+            # cross-contamination guard nulled out the text), we can still
+            # extract parties from case_title and case_type from
+            # case_number.  See #2270.
+            if not extracted.get("parties") and extracted.get("case_title"):
+                parties = extract_parties_from_caption(extracted["case_title"])
+                if parties:
+                    extracted["parties"] = parties
+                    extracted["extraction_methods"].setdefault("parties", "regex")
+            if not extracted["case_type"] and extracted["case_number"]:
+                val = extract_case_type_from_number(extracted["case_number"])
+                if val:
+                    extracted["case_type"] = val
+                    extracted["extraction_methods"].setdefault("case_type", "regex")
 
         results.append(extracted)
 

@@ -6113,6 +6113,56 @@ class TestReparseDocumentMultimodal:
         # All should be marked as split
         assert all(r["is_split"] is True for r in results)
 
+    def test_pdf_multimodal_multi_ruling_parties_extracted_without_text(self) -> None:
+        """Multi-ruling PDFs with None ruling_text still extract parties from case_title.
+
+        Regression test for #2270: when the cross-contamination guard sets
+        ruling_text to None for individual rulings in a multi-ruling PDF,
+        party extraction from case_title must still happen.
+        """
+        from framework.llm_schema import ExtractedRuling
+
+        doc_meta = self._make_doc_meta()
+        mock_extractor = MagicMock()
+        mock_extractor.extract_from_pdf.return_value = [
+            ExtractedRuling(
+                extracted_case_number="CVRI2304741",
+                extracted_case_title="Pelayo vs. Stretch Forming Corporation",
+                ruling_text=None,  # Empty — multimodal didn't extract text
+            ),
+            ExtractedRuling(
+                extracted_case_number="CVRI2304742",
+                extracted_case_title="Smith v. Jones",
+                ruling_text="The motion is GRANTED.",
+            ),
+        ]
+
+        results = reingest._reparse_document_multimodal(
+            b"%PDF-1.4 fake pdf",
+            "ca-riverside-tentatives-civil",
+            doc_meta,
+            mock_extractor,
+        )
+
+        assert len(results) == 2
+        # Ruling without ruling_text should still extract parties
+        assert results[0]["ruling_text"] is None
+        parties_0 = results[0].get("parties", [])
+        assert len(parties_0) >= 2, (
+            f"Expected parties extracted from 'Pelayo vs. Stretch Forming Corporation', "
+            f"got {parties_0!r}"
+        )
+        names_0 = {p["name"] for p in parties_0}
+        assert "Pelayo" in names_0
+        assert "Stretch Forming Corporation" in names_0
+
+        # Ruling with ruling_text should also have parties
+        parties_1 = results[1].get("parties", [])
+        assert len(parties_1) >= 2
+        names_1 = {p["name"] for p in parties_1}
+        assert "Smith" in names_1
+        assert "Jones" in names_1
+
     def test_pdf_multimodal_single_ruling_empty_text_uses_empty_string(self) -> None:
         """Single-ruling PDFs with empty ruling_text should get empty string (#2078).
 

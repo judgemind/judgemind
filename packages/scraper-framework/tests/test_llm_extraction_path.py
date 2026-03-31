@@ -985,6 +985,105 @@ class TestLlmExtractedFlag:
         # in the post-LLM fallback block.
         mock_extract_case_type.assert_not_called()
 
+    @patch("ingestion.worker.batch_upsert_parties")
+    @patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
+    @patch(
+        "ingestion.worker.extract_parties_from_caption",
+        return_value=[
+            {"name": "Smith", "role": "plaintiff"},
+            {"name": "Jones", "role": "defendant"},
+        ],
+    )
+    @patch("ingestion.worker.psycopg")
+    def test_llm_extracted_extracts_parties_when_ruling_text_is_none(
+        self,
+        mock_psycopg: MagicMock,
+        mock_extract_parties: MagicMock,
+        mock_resolve_judge: MagicMock,
+        mock_batch_upsert: MagicMock,
+    ) -> None:
+        """_llm_extracted events extract parties from caption even without ruling_text.
+
+        Regression test for #2270: in multi-ruling PDFs, the cross-contamination
+        guard sets ruling_text to None for individual split rulings.  Party
+        extraction from case_title must still run because it does not depend on
+        ruling_text.
+        """
+        worker, _ = _make_worker()
+
+        mock_conn, mock_cur = _make_mock_conn()
+        mock_psycopg.connect.return_value = mock_conn
+        mock_cur.fetchone.side_effect = [
+            ("court-uuid-1",),
+            ("case-uuid-1",),
+            (True,),
+        ]
+
+        # Simulate multimodal split event with ruling_text=None.
+        # This happens when the cross-contamination guard nulls out text
+        # for individual rulings in a multi-ruling document.
+        event = _make_event(
+            _split_processed=True,
+            _llm_extracted=True,
+            case_number="CVRI2304741",
+            case_title="Pelayo v. Stretch Forming Corporation",
+            judge_name="Hon. Jane Doe",
+            ruling_text=None,
+            outcome="granted",
+            motion_type="demurrer",
+        )
+
+        worker.process_event(event)
+
+        # extract_parties_from_caption should still be called despite
+        # ruling_text being None.
+        mock_extract_parties.assert_called_once_with("Pelayo v. Stretch Forming Corporation")
+
+    @patch("ingestion.worker.batch_upsert_parties")
+    @patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
+    @patch(
+        "ingestion.worker.extract_case_type_from_number",
+        return_value="civil",
+    )
+    @patch("ingestion.worker.psycopg")
+    def test_llm_extracted_extracts_case_type_when_ruling_text_is_none(
+        self,
+        mock_psycopg: MagicMock,
+        mock_extract_case_type: MagicMock,
+        mock_resolve_judge: MagicMock,
+        mock_batch_upsert: MagicMock,
+    ) -> None:
+        """_llm_extracted events extract case_type even without ruling_text.
+
+        Regression test for #2270: case_type extraction from case_number
+        does not depend on ruling_text and must run even when ruling_text
+        is None (multi-ruling split documents).
+        """
+        worker, _ = _make_worker()
+
+        mock_conn, mock_cur = _make_mock_conn()
+        mock_psycopg.connect.return_value = mock_conn
+        mock_cur.fetchone.side_effect = [
+            ("court-uuid-1",),
+            ("case-uuid-1",),
+            (True,),
+        ]
+
+        event = _make_event(
+            _split_processed=True,
+            _llm_extracted=True,
+            case_number="23STCV12345",
+            case_title="Smith v. Jones",
+            judge_name="Hon. Jane Doe",
+            ruling_text=None,
+            outcome="granted",
+            motion_type="demurrer",
+        )
+
+        worker.process_event(event)
+
+        mock_extract_case_type.assert_called_once_with("23STCV12345")
+
 
 class TestFrameworkExtractorInit:
     """Tests for lazy initialization of the framework LlmExtractor."""
