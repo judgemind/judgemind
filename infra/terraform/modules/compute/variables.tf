@@ -152,3 +152,9 @@ variable "proxy_port" {
   type        = number
   default     = 33335
 }
+
+variable "ingestion_idle_threshold_seconds" {
+  description = "Maximum idle time (seconds) before the ingestion worker idle alarm fires. Default 90000 (25 hours) provides a 1-hour buffer past the daily scraper schedule. Lower this if scrapers run more frequently (e.g. 7200 for every-2-hour schedules)."
+  type        = number
+  default     = 90000
+}

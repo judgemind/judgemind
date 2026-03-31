@@ -676,3 +676,52 @@ resource "aws_cloudwatch_metric_alarm" "ingestion_worker_crash_loop" {
   alarm_actions = [aws_sns_topic.scraper_alerts[0].arn]
   ok_actions    = [aws_sns_topic.scraper_alerts[0].arn]
 }
+
+# ─── Ingestion Worker Idle Alerts ────────────────────────────────────────────
+# CloudWatch alarm that fires when the ingestion worker has been idle (no
+# messages processed) for longer than the configured threshold. The worker
+# emits a periodic heartbeat log with an `idle_seconds` field every ~5 minutes
+# when no messages arrive. A sustained high idle_seconds value during expected
+# scraper run windows indicates the worker is alive but not receiving work —
+# likely because scraper output is not reaching the Redis stream.
+#
+# See: #2220 where the worker was idle for 48+ hours without any alert.
+
+resource "aws_cloudwatch_log_metric_filter" "ingestion_worker_idle" {
+  count = var.enable_alerts && local.deploy_ingestion ? 1 : 0
+
+  name           = "judgemind-ingestion-worker-idle-${var.environment}"
+  pattern        = "{ $.event = \"Heartbeat: idle for *\" && $.idle_seconds = * }"
+  log_group_name = aws_cloudwatch_log_group.ingestion_worker[0].name
+
+  metric_transformation {
+    name          = "IngestionWorkerIdleSeconds"
+    namespace     = "Judgemind/Ingestion"
+    value         = "$.idle_seconds"
+    default_value = "0"
+  }
+}
+
+resource "aws_cloudwatch_metric_alarm" "ingestion_worker_idle" {
+  count = var.enable_alerts && local.deploy_ingestion ? 1 : 0
+
+  alarm_name        = "judgemind-ingestion-worker-idle-${var.environment}"
+  alarm_description = "Ingestion worker has been idle for > ${var.ingestion_idle_threshold_seconds} seconds (${var.environment}). The worker is alive but not receiving messages — check that scrapers are running and publishing to the Redis stream."
+
+  namespace   = "Judgemind/Ingestion"
+  metric_name = "IngestionWorkerIdleSeconds"
+  statistic   = "Maximum"
+
+  comparison_operator = "GreaterThanThreshold"
+  threshold           = var.ingestion_idle_threshold_seconds
+  # Evaluate over 1 hour.  The heartbeat fires every ~5 minutes, so each
+  # evaluation period contains ~12 data points.  Using Maximum ensures a
+  # single heartbeat reporting a high idle value triggers the alarm.
+  period              = 3600
+  evaluation_periods  = 1
+  datapoints_to_alarm = 1
+  treat_missing_data  = "breaching"
+
+  alarm_actions = [aws_sns_topic.scraper_alerts[0].arn]
+  ok_actions    = [aws_sns_topic.scraper_alerts[0].arn]
+}
