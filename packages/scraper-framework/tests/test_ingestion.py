@@ -37,6 +37,7 @@ from ingestion.worker import (
     _parse_date,
     _parse_datetime,
     is_infrastructure_error,
+    is_schema_constraint_error,
 )
 
 # ---------------------------------------------------------------------------
@@ -658,6 +659,59 @@ def test_is_infrastructure_error_interface_error() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Schema constraint error classification tests
+# ---------------------------------------------------------------------------
+
+
+def test_is_schema_constraint_error_string_data_right_truncation() -> None:
+    """StringDataRightTruncation (value too long) is a schema constraint error."""
+    exc = psycopg.errors.StringDataRightTruncation("value too long for type character(2)")
+    assert is_schema_constraint_error(exc) is True
+
+
+def test_is_schema_constraint_error_numeric_value_out_of_range() -> None:
+    """NumericValueOutOfRange is a schema constraint error."""
+    exc = psycopg.errors.NumericValueOutOfRange("numeric value out of range")
+    assert is_schema_constraint_error(exc) is True
+
+
+def test_is_schema_constraint_error_check_violation() -> None:
+    """CheckViolation is a schema constraint error."""
+    exc = psycopg.errors.CheckViolation("check constraint violated")
+    assert is_schema_constraint_error(exc) is True
+
+
+def test_is_schema_constraint_error_not_null_violation() -> None:
+    """NotNullViolation is a schema constraint error."""
+    exc = psycopg.errors.NotNullViolation("null value in column")
+    assert is_schema_constraint_error(exc) is True
+
+
+def test_is_schema_constraint_error_not_infra() -> None:
+    """Schema constraint errors should NOT be classified as infrastructure errors."""
+    exc = psycopg.errors.StringDataRightTruncation("value too long for type character(2)")
+    assert is_infrastructure_error(exc) is False
+
+
+def test_is_schema_constraint_error_not_value_error() -> None:
+    """ValueError is not a schema constraint error."""
+    exc = ValueError("bad data")
+    assert is_schema_constraint_error(exc) is False
+
+
+def test_is_schema_constraint_error_not_operational_error() -> None:
+    """OperationalError (infra) is not a schema constraint error."""
+    exc = psycopg.OperationalError("connection refused")
+    assert is_schema_constraint_error(exc) is False
+
+
+def test_is_schema_constraint_error_not_unique_violation() -> None:
+    """UniqueViolation is not a schema constraint error (it's handled separately)."""
+    exc = psycopg.errors.UniqueViolation("duplicate key")
+    assert is_schema_constraint_error(exc) is False
+
+
+# ---------------------------------------------------------------------------
 # InfrastructureError wrapping
 # ---------------------------------------------------------------------------
 
@@ -733,6 +787,93 @@ def test_process_message_infra_error_on_first_attempt_raises_immediately(
     # Should only attempt once for infra errors (no point retrying immediately)
     assert worker.process_event.call_count == 1
     worker._redis.xack.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Schema constraint error dead-letter (no retry)
+# ---------------------------------------------------------------------------
+
+
+@patch("ingestion.worker.psycopg")
+def test_process_message_schema_error_dead_letters_immediately(
+    mock_psycopg: MagicMock,
+) -> None:
+    """Schema constraint errors should dead-letter immediately without retry."""
+    worker, _ = _make_worker()
+    worker._max_retries = 5
+    worker.process_event = MagicMock(
+        side_effect=psycopg.errors.StringDataRightTruncation(
+            "value too long for type character(2)"
+        ),
+    )
+
+    msg_id = b"schema-0"
+    data = {b"data": json.dumps(_make_event()).encode()}
+    worker._process_message(msg_id, data)
+
+    # Should only attempt once — no retry for deterministic schema errors
+    assert worker.process_event.call_count == 1
+    # Message SHOULD be acknowledged (dead-lettered)
+    worker._redis.xack.assert_called_once()
+
+
+@patch("ingestion.worker.psycopg")
+def test_process_message_schema_error_does_not_raise(
+    mock_psycopg: MagicMock,
+) -> None:
+    """Schema constraint errors should NOT raise InfrastructureError (worker stays up)."""
+    worker, _ = _make_worker()
+    worker._max_retries = 3
+    worker.process_event = MagicMock(
+        side_effect=psycopg.errors.NumericValueOutOfRange("numeric value out of range"),
+    )
+
+    msg_id = b"schema-1"
+    data = {b"data": json.dumps(_make_event()).encode()}
+
+    # Should NOT raise — the worker continues processing other messages
+    worker._process_message(msg_id, data)
+
+    assert worker.process_event.call_count == 1
+    worker._redis.xack.assert_called_once()
+
+
+@patch("ingestion.worker.psycopg")
+def test_process_message_schema_error_not_null_violation(
+    mock_psycopg: MagicMock,
+) -> None:
+    """NotNullViolation dead-letters immediately without retry."""
+    worker, _ = _make_worker()
+    worker._max_retries = 3
+    worker.process_event = MagicMock(
+        side_effect=psycopg.errors.NotNullViolation("null value in column 'state_code'"),
+    )
+
+    msg_id = b"schema-2"
+    data = {b"data": json.dumps(_make_event()).encode()}
+    worker._process_message(msg_id, data)
+
+    assert worker.process_event.call_count == 1
+    worker._redis.xack.assert_called_once()
+
+
+@patch("ingestion.worker.psycopg")
+def test_process_message_schema_error_check_violation(
+    mock_psycopg: MagicMock,
+) -> None:
+    """CheckViolation dead-letters immediately without retry."""
+    worker, _ = _make_worker()
+    worker._max_retries = 3
+    worker.process_event = MagicMock(
+        side_effect=psycopg.errors.CheckViolation("check constraint failed"),
+    )
+
+    msg_id = b"schema-3"
+    data = {b"data": json.dumps(_make_event()).encode()}
+    worker._process_message(msg_id, data)
+
+    assert worker.process_event.call_count == 1
+    worker._redis.xack.assert_called_once()
 
 
 # ---------------------------------------------------------------------------

@@ -172,6 +172,17 @@ _INFRA_GENERIC_ERRORS: tuple[type[Exception], ...] = (
     OSError,
 )
 
+# psycopg error classes that indicate deterministic schema/data-shape mismatches.
+# These errors mean the data violates a DB constraint and will NEVER succeed on
+# retry — retrying just wastes LLM API calls (the extraction succeeds but the
+# insert fails every time).  Dead-letter immediately on first attempt.
+_SCHEMA_CONSTRAINT_ERRORS: tuple[type[Exception], ...] = (
+    psycopg.errors.StringDataRightTruncation,  # value too long for type character(N)
+    psycopg.errors.NumericValueOutOfRange,  # numeric value out of range
+    psycopg.errors.CheckViolation,  # CHECK constraint failed
+    psycopg.errors.NotNullViolation,  # NOT NULL constraint violated by data
+)
+
 
 class InfrastructureError(Exception):
     """Raised when a message processing failure is caused by infrastructure,
@@ -195,6 +206,18 @@ def is_infrastructure_error(exc: Exception) -> bool:
     should NOT cause dead-lettering.
     """
     return isinstance(exc, (*_INFRA_PG_ERRORS, *_INFRA_GENERIC_ERRORS))
+
+
+def is_schema_constraint_error(exc: Exception) -> bool:
+    """Return True if the exception is a deterministic schema constraint violation.
+
+    Schema constraint errors indicate a data/schema mismatch that will never
+    succeed on retry (e.g. value too long, numeric overflow, CHECK violation).
+    These should be dead-lettered immediately on first attempt — retrying wastes
+    resources (especially LLM API calls that succeed but whose results can't be
+    inserted into the DB).
+    """
+    return isinstance(exc, _SCHEMA_CONSTRAINT_ERRORS)
 
 
 STREAM_DOCUMENT_CAPTURED = "document.captured"
@@ -232,14 +255,20 @@ class IngestionWorker:
       3. Indexes the document in OpenSearch via IndexingConsumer.
       4. Acknowledges the message (XACK) only after both writes succeed.
 
-    Error handling distinguishes two categories:
+    Error handling distinguishes three categories:
 
     **Infrastructure errors** (DB down, missing tables, connection failures):
       Raised as InfrastructureError without acknowledging the message. The
       worker process exits with non-zero status so ECS restarts it. Messages
       remain in the stream and will be reprocessed after recovery.
 
-    **Message-level errors** (bad data, validation failures, constraint violations):
+    **Schema constraint errors** (value too long, numeric overflow, CHECK/NOT NULL
+    violations): Dead-lettered immediately on first attempt — no retries.
+      These are deterministic data/schema mismatches that will never succeed
+      on retry. Retrying wastes LLM API calls (extraction succeeds but DB
+      insert fails every time).
+
+    **Message-level errors** (bad data, validation failures, transient issues):
       Retried up to max_retries times. After exhaustion, the message is
       acknowledged (dead-letter pattern) and logged as CRITICAL for alerting.
     """
@@ -1844,6 +1873,18 @@ class IngestionWorker:
                         exc,
                     )
                     raise InfrastructureError(exc) from exc
+                if is_schema_constraint_error(exc):
+                    # Deterministic schema/data mismatch — retrying will never
+                    # succeed. Dead-letter immediately to avoid wasting LLM API
+                    # calls on futile retries. See #2233.
+                    logger.critical(
+                        "Schema constraint error processing message %s: %s — "
+                        "dead-lettering immediately (no retry)",
+                        msg_id,
+                        exc,
+                    )
+                    self._redis.xack(STREAM_DOCUMENT_CAPTURED, CONSUMER_GROUP, msg_id)
+                    return
                 attempt += 1
                 last_exc = exc
                 logger.warning(
