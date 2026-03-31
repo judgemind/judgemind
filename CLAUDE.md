@@ -517,6 +517,16 @@ scripts/ecs-run-task.sh --detach scripts/reingest_from_s3.py -- --all
 scripts/ecs-run-task.sh --logs <task-arn>
 ```
 
+**Reingest vs Rebuild — choosing the right script:**
+
+| Scenario | Script | Why |
+|---|---|---|
+| Re-process existing records after extraction logic changes | `reingest_from_s3.py --county <name>` | Queries the `documents` table — only works when records already exist |
+| Initial population of a county that has S3 data but no DB records | `rebuild_db.py --county <name>` | Discovers documents directly from S3 keys — does not require pre-existing DB records |
+| Full database rebuild from scratch | `rebuild_db.py` (no `--skip-reset`) | Truncates derived tables and re-processes everything from S3 |
+
+`reingest_from_s3.py` operates on **existing database records only**. If you run it for a county with no records in the `documents` table, it will process 0 documents silently. Use `rebuild_db.py --county <name>` for initial population.
+
 For full details and options, see `docs/agent/infrastructure-reference.md` §ECS Script Execution.
 
 ### Local Development Stack

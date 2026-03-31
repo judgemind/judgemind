@@ -2,6 +2,14 @@
 # venv: scraper-framework
 """Re-ingest existing documents from S3 through the (now-idempotent) pipeline.
 
+**This script operates on existing database records only.** It queries the
+``documents`` table for matching rows, then re-processes each one through the
+current extraction logic.  If the county/court has no records in the database
+yet (e.g. a newly added county with S3 data but no prior ingestion), this
+script will process 0 documents.  For initial population from S3, use
+``rebuild_db.py --county <name>`` instead — it discovers documents directly
+from S3 keys and does not require pre-existing database records.
+
 For each document in the database, fetches the raw content from S3, re-runs
 the scraper's parse_document() to extract fields with the current (improved)
 extraction logic, and pushes a synthetic DocumentCapturedEvent through the
