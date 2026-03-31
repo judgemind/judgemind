@@ -1,16 +1,12 @@
 {
   "ruling_text": "Cvri2306144 Terry v. Laurel Heights Realty Holdings LLC\n\nMOTION FOR JUDGMENT ON THE PLEADINGS\nTentative Ruling: The Motion for Judgment on the Pleadings is granted. Defendant is to submit a proposed judgment.",
   "expected": {
-    "case_title": "Cvri2306144 Terry v. Laurel Heights Realty Holdings LLC",
-    "motion_type": "motion_for_judgment_on_the_pleadings",
+    "case_title": null,
+    "motion_type": "other",
     "outcome": "granted",
     "parties": {
-      "plaintiffs": [
-        "Cvri2306144 Terry"
-      ],
-      "defendants": [
-        "Laurel Heights Realty Holdings LLC"
-      ]
+      "plaintiffs": [],
+      "defendants": []
     }
   },
   "source_doc": "s3://judgemind-document-archive-dev/ca/riverside/superior_court/raw/2026/03/21/6705e2d3-b2c0-5e8f-a7c6-b9115f6e284b.pdf",

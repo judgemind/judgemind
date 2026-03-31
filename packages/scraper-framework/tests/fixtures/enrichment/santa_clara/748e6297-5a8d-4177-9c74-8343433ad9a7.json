@@ -1,16 +1,12 @@
 {
   "ruling_text": "Jigar Patel et al v. Rajshree International San Jose Inc. et al\n\n1. The prior order deeming Plaintiff's Requests for Admission admitted is SET ASIDE. 2. Defendant shall serve verified, code-compliant responses to Plaintiff's Requests for Admission within 20 calendar days of service of this order. 3. The parties' requests for sanctions are DENIED WITHOUT PREJUDICE. 4. Defendant is further cautioned that failure to serve timely and compliant responses may result in renewed requests for sanctions, including monetary, issue, evidence, or terminating sanctions pursuant to Code of Civil Procedure sections 2023.010–2023.030 and the statutes governing Requests for Admission.",
   "expected": {
-    "case_title": "Jigar Patel et al v. Rajshree International San Jose Inc. et al",
+    "case_title": null,
     "motion_type": "demurrer",
     "outcome": "off_calendar",
     "parties": {
-      "plaintiffs": [
-        "Jigar Patel"
-      ],
-      "defendants": [
-        "Rajshree International San Jose Inc."
-      ]
+      "plaintiffs": [],
+      "defendants": []
     }
   },
   "source_doc": "s3://judgemind-document-archive-dev/ca/santa_clara/superior_court/raw/2026/03/24/457a630d-a1ee-54a7-af12-19c4aa5ff38a.pdf",

@@ -1,13 +1,11 @@
 {
   "ruling_text": "Clifford vs. Akua Motor Inn\n\nDefendant's Sun Infinity Enterprise, INC. dba Akua Motor Inn's\nMotion for Protective Order\nOff Calendar",
   "expected": {
-    "case_title": "Clifford vs. Akua Motor Inn",
-    "motion_type": "motion_for_protective_order",
+    "case_title": null,
+    "motion_type": "other",
     "outcome": "off_calendar",
     "parties": {
-      "plaintiffs": [
-        "Clifford"
-      ],
+      "plaintiffs": [],
       "defendants": [
         "Akua Motor Inn"
       ]

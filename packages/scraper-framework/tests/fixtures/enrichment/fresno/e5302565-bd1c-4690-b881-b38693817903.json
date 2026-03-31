@@ -1,16 +1,12 @@
 {
   "ruling_text": "Kalos Specialized Services, Inc v Charis Wallace\n\nTentative Ruling:\n\nTo deny, without prejudice.\n\nIf oral argument is timely requested, such argument will be entertained on Friday,\nMarch 27, 2026, at 9:00 a.m., in Department 501.\nExplanation:\n\nPlaintiff Ray Thacker (“plaintiff”) moves the court for an order verifying the current\nand actual military status of defendant Jose D. Anguiano (“defendant”). Plaintiff brings\nthis motion under California Military and Veterans Code section 401 and the\nServicemembers Civil Relief Act (“SCRA”), 50 U.S.C. section 3931. However, the court is\nunaware how each of these code sections confers the authority to “verify” a party’s\nmilitary status, nor how they allow the court to make the orders and directives requested\nby plaintiff. Plaintiff refers to these laws, but fails to cite to the portions authorizing the\ncourt to grant the relief requested.\n\nFurther, plaintiff offers no evidence to support granting the motion. Plaintiff merely\ncontends that there is “uncertainty” that defendant is actively serving in the military, but\nfails to provide any supporting evidence. The entirety of plaintiff’s motion appears to be\nbased in speculation.\n\nDue to the lack of authority and evidence, the court intends to deny the motion,\nwithout prejudice.\n\nPursuant to California Rules of Court, rule 3.1312(a), and Code of Civil Procedure\nsection 1019.5, subdivision (a), no further written order is necessary. The minute order\nadopting this tentative ruling will serve as the order of the court and service by the clerk\nwill constitute notice of the order.",
   "expected": {
-    "case_title": "Kalos Specialized Services, Inc v Charis Wallace",
-    "motion_type": "motion_for_leave_to_amend",
+    "case_title": null,
+    "motion_type": "other",
     "outcome": "granted",
     "parties": {
-      "plaintiffs": [
-        "Kalos Specialized Services, Inc"
-      ],
-      "defendants": [
-        "Charis Wallace"
-      ]
+      "plaintiffs": [],
+      "defendants": []
     }
   },
   "source_doc": "s3://judgemind-document-archive-dev/ca/fresno/superior_court/raw/2026/03/28/ab03d3bd-d0c7-5159-a867-97c24c20603a.pdf",

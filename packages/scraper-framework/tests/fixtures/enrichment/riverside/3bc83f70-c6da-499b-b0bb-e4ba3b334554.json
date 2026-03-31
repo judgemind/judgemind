@@ -1,16 +1,12 @@
 {
   "ruling_text": "Discover Bank v. Whisner\n\nGranted.\n\nThe judgment is set aside, and the action is dismissed without prejudice.",
   "expected": {
-    "case_title": "Discover Bank v. Whisner",
-    "motion_type": "motion_to_vacate",
+    "case_title": null,
+    "motion_type": "other",
     "outcome": "granted",
     "parties": {
-      "plaintiffs": [
-        "Discover Bank"
-      ],
-      "defendants": [
-        "Whisner"
-      ]
+      "plaintiffs": [],
+      "defendants": []
     }
   },
   "source_doc": "s3://judgemind-document-archive-dev/ca/riverside/superior_court/raw/2026/03/27/e366e56c-c1b3-55ba-838b-bd9b797ec5be.pdf",

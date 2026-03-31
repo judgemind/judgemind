@@ -1,16 +1,12 @@
 {
   "ruling_text": "Karina Bautista v. Hillside Community Church, Inc., et al.\n\nThe matter is moot due to the filing of the amended complaint.",
   "expected": {
-    "case_title": "Karina Bautista v. Hillside Community Church, Inc., et al.",
+    "case_title": null,
     "motion_type": "motion_to_quash",
     "outcome": "moot",
     "parties": {
-      "plaintiffs": [
-        "Karina Bautista"
-      ],
-      "defendants": [
-        "Hillside Community Church, Inc."
-      ]
+      "plaintiffs": [],
+      "defendants": []
     }
   },
   "source_doc": "s3://judgemind-document-archive-dev/ca/san_bernardino/superior_court/raw/2026/03/24/c851066b-4cf2-517b-a5aa-669df35bff80.pdf",

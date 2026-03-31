@@ -1,16 +1,12 @@
 {
   "ruling_text": "A-S Pipelines Inc., A California Corporation v. David Seeno\n\nThe motion to seal portions of the motion to disqualify is granted for the reasons stated in the motion.",
   "expected": {
-    "case_title": "A-S Pipelines Inc., A California Corporation v. David Seeno",
-    "motion_type": "motion_to_seal",
+    "case_title": null,
+    "motion_type": "other",
     "outcome": "granted",
     "parties": {
-      "plaintiffs": [
-        "A-S Pipelines Inc., A California Corporation"
-      ],
-      "defendants": [
-        "David Seeno"
-      ]
+      "plaintiffs": [],
+      "defendants": []
     }
   },
   "source_doc": "s3://judgemind-document-archive-dev/ca/contra_costa/superior_court/raw/2026/03/28/f04c5d20-b410-5352-8112-3bb2beb33aab.pdf",

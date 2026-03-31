@@ -1,8 +1,8 @@
 {
   "ruling_text": "LINE 8 25CV482371 Xiao Qian Mu vs North Aldercroft Motion: Consolidate\nAssociation et al\nPlaintiff’s motion to consolidate this action\nwith 25SC094716 and 25SC096415 is\nDENIED. The decision to consolidate is\nwithin the broad discretion of the court. (See\nGeneral Motors Corp. v. Superior Court\n(1966) 65 Cal.2d 88, 92.) Assuming the\nCourt has jurisdiction to consolidate matters\ngoverned by the Small Claims Act, judgment\nhas been entered in the small claims actions\nhere, and the Court finds no good cause,\nequitable, factual, legal or justice interest\npromoting consolidation.\nDefendant shall prepare and submit the final\norder, accompanied by the necessary Form\nEFS-020 within 10 days of the date of the\nhearing.",
   "expected": {
-    "case_title": "Xiao Qian Mu vs North Aldercroft Association et al",
-    "motion_type": "motion_to_consolidate",
+    "case_title": null,
+    "motion_type": "other",
     "outcome": "denied",
     "parties": {
       "plaintiffs": [

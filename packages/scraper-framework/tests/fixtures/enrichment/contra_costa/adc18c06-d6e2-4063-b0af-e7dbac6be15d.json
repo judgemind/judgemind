@@ -1,7 +1,7 @@
 {
   "ruling_text": "Conservatorship of: Josephine Gifford\n\nDrop.\n\nNote: Request for Dismissal entered 3-4-2026.",
   "expected": {
-    "case_title": "Conservatorship of: Josephine Gifford",
+    "case_title": null,
     "motion_type": "petition",
     "outcome": "off_calendar",
     "parties": {

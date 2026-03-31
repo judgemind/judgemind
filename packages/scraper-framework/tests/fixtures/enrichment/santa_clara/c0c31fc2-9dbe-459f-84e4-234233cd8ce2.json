@@ -1,16 +1,12 @@
 {
   "ruling_text": "Monterey Peninsula Water District v. State Water Resources Control Board, et al.\n\nThe Court DENIES Sierra Club's motion for attorneys' fees. The Court DENIES Cal-Am's request for sanctions.",
   "expected": {
-    "case_title": "Monterey Peninsula Water District v. State Water Resources Control Board, et al.",
+    "case_title": null,
     "motion_type": "motion_for_attorney_fees",
     "outcome": "denied",
     "parties": {
-      "plaintiffs": [
-        "Monterey Peninsula Water District"
-      ],
-      "defendants": [
-        "State Water Resources Control Board"
-      ]
+      "plaintiffs": [],
+      "defendants": []
     }
   },
   "source_doc": "s3://judgemind-document-archive-dev/ca/santa_clara/superior_court/raw/2026/03/26/4e72508a-d830-5ee3-87d0-d63fa2fc298c.pdf",

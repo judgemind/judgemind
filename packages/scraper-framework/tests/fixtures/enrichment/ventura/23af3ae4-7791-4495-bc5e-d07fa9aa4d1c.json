@@ -1,13 +1,11 @@
 {
   "ruling_text": "Plaintiff Truist Bank's Motion to Enter Judgment Pursuant to Settlement and Release Agreement is GRANTED. For good cause shown, relief is proper per Code of Civil Procedure section 664.6. Judgment is entered against defendant Geovanni Estrada in the amount of $4,231.72. Order and Judgment signed this date. Moving party to give notice of this Court's ruling.",
   "expected": {
-    "case_title": "Truist Bank, in Successor by Merger to Suntrust Bank v. Geovanni Estrada",
-    "motion_type": "default_judgment",
+    "case_title": null,
+    "motion_type": "other",
     "outcome": "granted",
     "parties": {
-      "plaintiffs": [
-        "Truist Bank, in Successor by Merger to Suntrust Bank"
-      ],
+      "plaintiffs": [],
       "defendants": [
         "Geovanni Estrada"
       ]

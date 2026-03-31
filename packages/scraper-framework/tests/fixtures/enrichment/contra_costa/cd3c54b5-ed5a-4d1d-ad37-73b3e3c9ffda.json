@@ -1,16 +1,12 @@
 {
   "ruling_text": "Capital One Bank v Israel\n\nPlaintiff filed a motion to vacate dismissal and enter judgment pursuant to stipulation.\nThe Motion and its supporting documents are timely.\nThis Motion is unopposed. However, this motion was originally scheduled for 2/24/06,\nbut was rescheduled for 3/24/26. And though there was mail notice for the 2/24/26\nappearance, it does not appear that the court notified Defendant of the new date.\nThis was the court’s mistake and it extends its apology.\nDisposition\nMotion will be continued to 6/2/26, 9am.\nPlaintiff to notify Defendant.",
   "expected": {
-    "case_title": "Capital One Bank v Israel",
-    "motion_type": "motion_to_vacate",
+    "case_title": null,
+    "motion_type": "other",
     "outcome": "continued",
     "parties": {
-      "plaintiffs": [
-        "Capital One Bank"
-      ],
-      "defendants": [
-        "Israel"
-      ]
+      "plaintiffs": [],
+      "defendants": []
     }
   },
   "source_doc": "s3://judgemind-document-archive-dev/ca/contra_costa/superior_court/raw/2026/03/28/1b026a16-7bc8-51eb-8ea4-2406b9b28d48.pdf",

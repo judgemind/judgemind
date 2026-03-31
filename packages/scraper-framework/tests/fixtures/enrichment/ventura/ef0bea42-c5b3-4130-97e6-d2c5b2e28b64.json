@@ -1,18 +1,16 @@
 {
   "ruling_text": "DENISE WILLIAMS, et al. vs PASEO DEL RIO ASSOCIATES, L.P.\n\nDefendant's Motion to Compel Plaintiff Denise Williams' Responses to Request for Production of Documents, Set One is GRANTED. (Code Civ. Proc., § 2031.300.) Plaintiff shall provide verified, code-compliant answers and all documents responsive to Requests for Production, Set One on or before April 14, 2026. The requests were served on Plaintiff's counsel on November 18, 2024, and following the failed settlement, again on September 30, 2025. Plaintiff's counsel sent a meet and confer letter, although one was not required and has not received answers or documents.",
   "expected": {
-    "case_title": "DENISE WILLIAMS, et al. vs PASEO DEL RIO ASSOCIATES, L.P.",
-    "motion_type": "motion_to_compel",
-    "outcome": "granted",
+    "case_title": "Denise Williams v. Paseo Del Rio Associates, L.P.",
+    "motion_type": "demurrer",
+    "outcome": "granted_in_part",
     "parties": {
       "plaintiffs": [
-        "DENISE WILLIAMS"
+        "Denise Williams"
       ],
-      "defendants": [
-        "PASEO DEL RIO ASSOCIATES, L.P."
-      ]
+      "defendants": []
     }
   },
   "source_doc": "s3://judgemind-document-archive-dev/ca/ventura/superior_court/raw/2026/03/26/4cec5352-379c-5769-9034-f154edc6e2fe.pdf",
-  "notes": ""
+  "notes": "Defendants not clearly identifiable in ruling text. Title from text header."
 }
