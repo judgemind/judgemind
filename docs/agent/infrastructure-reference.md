@@ -94,6 +94,9 @@ scripts/ecs-run-task.sh scripts/backfill_normalize_departments.py -- --dry-run
 scripts/ecs-run-task.sh --detach scripts/reingest_from_s3.py -- --all
 scripts/ecs-run-task.sh --logs <task-arn>
 
+# Initial population of a county with S3 data but no DB records
+scripts/ecs-run-task.sh scripts/rebuild_db.py -- --county "Orange" --skip-reset
+
 # Tail logs for a task by ID (printed when the task launches)
 scripts/ecs-task-logs.sh <task-id>
 scripts/ecs-task-logs.sh <task-id> --follow
@@ -101,6 +104,16 @@ scripts/ecs-task-logs.sh <task-id> --follow
 # Override CPU/memory for heavy workloads
 scripts/ecs-run-task.sh --cpu 2048 --memory 4096 scripts/dedup_judges.py
 ```
+
+### Reingest vs Rebuild
+
+`reingest_from_s3.py` operates on **existing database records only** — it queries the `documents` table to find S3 keys to reprocess. If you run it for a county with no records in the `documents` table, it will process 0 documents silently.
+
+| Scenario | Script | Why |
+|---|---|---|
+| Re-process existing records after extraction logic changes | `reingest_from_s3.py --county <name>` | Queries `documents` table — only works when records already exist |
+| Initial population of a county that has S3 data but no DB records | `rebuild_db.py --county <name> --skip-reset` | Discovers documents directly from S3 keys — does not require pre-existing DB records |
+| Full database rebuild from scratch | `rebuild_db.py` (no `--skip-reset`) | Truncates derived tables and re-processes everything from S3 |
 
 ### One-off script convention
 

@@ -125,3 +125,5 @@ The `nlp-pipeline` package (`packages/nlp-pipeline/`) contains modules for class
 ## Reingestion
 
 Historical documents can be reprocessed through the full three-tier extraction pipeline using `scripts/reingest_from_s3.py`. This reads archived documents from S3, reconstructs ingestion events, and pushes them through the same extraction pipeline. Used after extraction logic improvements or to backfill fields for documents ingested before LLM extraction was available.
+
+**Important:** `reingest_from_s3.py` operates on **existing database records only** — it queries the `documents` table to find S3 keys to reprocess. If you run it for a county with no records in the `documents` table, it will process 0 documents silently. For initial population of a county that has S3 data but no DB records, use `scripts/rebuild_db.py --county <name>` instead, which discovers documents directly from S3 keys without requiring pre-existing database records.
