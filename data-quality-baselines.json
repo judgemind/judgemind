@@ -46,6 +46,24 @@
       "expected_daily_rulings": 5,
       "schedule_type": "daily",
       "posting_days": ["Tue", "Wed", "Thu", "Fri"]
+    },
+    "Contra Costa": {
+      "expected_daily_rulings": 15,
+      "schedule_type": "daily",
+      "posting_days": ["Mon", "Tue", "Wed", "Thu", "Fri"]
+    },
+    "Fresno": {
+      "expected_daily_rulings": 3,
+      "schedule_type": "daily",
+      "posting_days": ["Tue", "Wed", "Thu"],
+      "low_volume": true,
+      "min_days_zero_before_alert": 2
+    },
+    "Federal": {
+      "expected_daily_rulings": 10,
+      "schedule_type": "daily",
+      "posting_days": ["Mon", "Tue", "Wed", "Thu", "Fri"],
+      "_note": "CourtListener data (federal court opinions). Different court type from CA state courts but uses same ingestion pipeline. Sat rulings are rare (<2%) so not included in posting_days."
     }
   },
   "ecs_services": [
@@ -202,6 +220,59 @@
         "outcome": "~47% of Ventura rulings lack outcome extraction. Significant gap — likely Ventura's PDF formats are not well-handled by the outcome extraction pipeline.",
         "parties": "~67% of Ventura rulings lack party extraction. Ventura PDFs have complex party name formats.",
         "case_number": "~26% of Ventura rulings lack case_number extraction."
+      }
+    },
+    "Contra Costa": {
+      "total_documents": 207,
+      "ruling": 100.0,
+      "judge": 99.0,
+      "motion_type": 90.0,
+      "outcome": 84.0,
+      "case_title": 99.0,
+      "case_number": 99.0,
+      "parties": 81.0,
+      "hearing_date": 99.0,
+      "case_type": 87.0,
+      "_known_gaps": {
+        "parties": "~19% of Contra Costa rulings lack party extraction. Probate cases have non-standard party formats.",
+        "outcome": "~16% of rulings lack outcome extraction.",
+        "motion_type": "~10% of rulings lack motion_type extraction.",
+        "case_type": "~13% of rulings lack case_type extraction."
+      }
+    },
+    "Fresno": {
+      "total_documents": 35,
+      "ruling": 100.0,
+      "judge": 0.0,
+      "motion_type": 94.0,
+      "outcome": 100.0,
+      "case_title": 94.0,
+      "case_number": 94.0,
+      "parties": 94.0,
+      "hearing_date": 100.0,
+      "case_type": 97.0,
+      "_known_gaps": {
+        "judge": "0% judge extraction — Fresno PDFs contain only judge initials (e.g. 'lmg', 'DTT') in the 'Issued By:' line, not full names. No judge resolution possible without a dept-to-judge roster.",
+        "_note": "Low volume county (35 docs across 4 departments). Baselines set with margin for small sample size."
+      }
+    },
+    "Federal": {
+      "total_documents": 205,
+      "ruling": 100.0,
+      "judge": 48.0,
+      "motion_type": 96.0,
+      "outcome": 100.0,
+      "case_title": 91.0,
+      "case_number": 80.0,
+      "parties": 94.0,
+      "hearing_date": 86.0,
+      "case_type": 65.0,
+      "_known_gaps": {
+        "judge": "~52% of federal rulings lack judge extraction. CourtListener data has different metadata structure from CA state courts.",
+        "hearing_date": "~14% of federal rulings lack hearing_date. Federal opinions may not always have associated hearing dates.",
+        "case_number": "~20% of rulings lack case_number extraction.",
+        "case_type": "~35% of rulings lack case_type. Federal case type taxonomy differs from CA state courts.",
+        "_note": "Federal data sourced from CourtListener (Free Law Project API). Different court type from CA state courts — field completeness patterns differ due to distinct data structure and metadata availability."
       }
     }
   }
