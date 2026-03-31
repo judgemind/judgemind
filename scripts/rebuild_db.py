@@ -170,7 +170,14 @@ def build_event(
     parsed: dict[str, str],
     bucket: str,
 ) -> dict[str, Any]:
-    """Construct an ingestion event dict from an S3 object."""
+    """Construct an ingestion event dict from an S3 object.
+
+    For HTML documents, attempts to extract ``hearing_date`` from the text
+    using the same regex patterns the ingestion worker uses.  This gives the
+    worker a head-start so ruling rows can be created even when LLM extraction
+    is unavailable.  For PDFs the regex rarely works on raw binary content, so
+    the worker's LLM extraction path handles hearing_date for those formats.
+    """
     content_hash = parsed["content_hash"]
     document_id = str(uuid.uuid5(uuid.NAMESPACE_URL, content_hash))
     content_format = EXT_TO_FORMAT.get(parsed["ext"], "bin")
@@ -192,7 +199,22 @@ def build_event(
     # For HTML, pass content as ruling_text. For PDF, pass raw bytes
     # (the worker handles PDF text extraction).
     if content_format == "html":
-        event["ruling_text"] = content.decode("utf-8", errors="replace")
+        text = content.decode("utf-8", errors="replace")
+        event["ruling_text"] = text
+
+        # Try to extract hearing_date from HTML text using the ingestion
+        # regex patterns.  This is cheap and reliable for HTML counties
+        # (LA, CC, Fresno).  Lazy import to avoid top-level dependency on the
+        # ingestion package (which is only available in the scraper-framework
+        # venv, not in the main process for all callers).
+        try:
+            from ingestion.extract import extract_hearing_date
+
+            hearing_dt = extract_hearing_date(text)
+            if hearing_dt is not None:
+                event["hearing_date"] = str(hearing_dt)
+        except ImportError:
+            pass
     elif content_format == "pdf":
         event["ruling_text"] = content.decode("latin-1")
 
@@ -206,15 +228,22 @@ def _process_one_document(
     database_url: str,
     redis_url: str,
     os_url: str,
-) -> str:
+) -> dict[str, Any]:
     """Process a single document in a child process.
 
     Creates its own DB connection, Redis client, and IngestionWorker.
     Designed for ProcessPoolExecutor — each call is fully independent.
+
+    Returns a dict with:
+      - ``status``: ``"ok"``, ``"skip"``, or ``"error"``
+      - ``content_format``: the document format (``"html"``, ``"pdf"``, etc.)
+      - ``had_hearing_date``: whether ``hearing_date`` was present in the event
     """
     parsed = parse_s3_key(key)
     if not parsed:
-        return "skip"
+        return {"status": "skip", "content_format": "", "had_hearing_date": False}
+
+    content_format = EXT_TO_FORMAT.get(parsed["ext"], "bin")
 
     if cache_dir:
         content = (Path(cache_dir) / key).read_bytes()
@@ -226,13 +255,18 @@ def _process_one_document(
         content = response["Body"].read()
 
     if not content:
-        return "skip"
+        return {
+            "status": "skip",
+            "content_format": content_format,
+            "had_hearing_date": False,
+        }
 
     actual_hash = hashlib.sha256(content).hexdigest()
     if actual_hash != parsed["content_hash"]:
         parsed["content_hash"] = actual_hash
 
     event = build_event(key, content, parsed, bucket)
+    had_hearing_date = bool(event.get("hearing_date"))
 
     # Lazy per-process worker — cached on the function object.
     worker = getattr(_process_one_document, "_worker", None)
@@ -267,9 +301,23 @@ def _process_one_document(
 
     try:
         worker.process_event(event)
-        return "ok"
+        return {
+            "status": "ok",
+            "content_format": content_format,
+            "had_hearing_date": had_hearing_date,
+        }
     except Exception:
-        return "error"
+        logger.error(
+            "Error processing document",
+            key=key,
+            document_id=event.get("document_id"),
+            exc_info=True,
+        )
+        return {
+            "status": "error",
+            "content_format": content_format,
+            "had_hearing_date": had_hearing_date,
+        }
 
 
 def reset_derived_tables(conn: psycopg.Connection) -> None:
@@ -405,6 +453,13 @@ def main() -> None:
     processed = 0
     errors = 0
     skipped = 0
+    # Track documents where hearing_date was NOT available in the event.
+    # The worker may still extract it via LLM or regex, but when that also
+    # fails, the ruling row is skipped.  This counter helps diagnose
+    # missing-ruling issues for PDF counties.
+    no_hearing_date = 0
+    # Per-format counters for the summary.
+    format_counts: dict[str, int] = {}
 
     with ProcessPoolExecutor(max_workers=concurrency) as pool:
         futures = {
@@ -423,12 +478,34 @@ def main() -> None:
             key = futures[future]
             try:
                 result = future.result()
-                if result == "ok":
+                status = (
+                    result.get("status", "error")
+                    if isinstance(result, dict)
+                    else result
+                )
+                content_format = (
+                    result.get("content_format", "") if isinstance(result, dict) else ""
+                )
+                had_hearing_date = (
+                    result.get("had_hearing_date", False)
+                    if isinstance(result, dict)
+                    else False
+                )
+
+                if status == "ok":
                     processed += 1
-                elif result == "skip":
+                elif status == "skip":
                     skipped += 1
                 else:
                     errors += 1
+
+                if content_format:
+                    format_counts[content_format] = (
+                        format_counts.get(content_format, 0) + 1
+                    )
+                if status == "ok" and not had_hearing_date:
+                    no_hearing_date += 1
+
                 total_done = processed + errors + skipped
                 if processed > 0 and processed % 50 == 0:
                     elapsed = time.monotonic() - t_start
@@ -459,7 +536,18 @@ def main() -> None:
         errors=errors,
         skipped=skipped,
         total=len(keys),
+        format_counts=format_counts,
     )
+
+    if no_hearing_date > 0:
+        logger.warning(
+            "%d documents had no pre-extracted hearing_date — rulings may have "
+            "been skipped if worker-side extraction (LLM/regex) also failed",
+            no_hearing_date,
+            no_hearing_date=no_hearing_date,
+            processed=processed,
+        )
+
     conn.close()
 
 
