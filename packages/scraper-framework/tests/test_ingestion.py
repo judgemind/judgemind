@@ -4633,3 +4633,444 @@ def test_deterministic_case_title_keeps_good_llm_title(
 
     # No override should have happened
     assert not any("Deterministic case_title overrides" in r.message for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# LLM enrichment integration (#2176)
+# ---------------------------------------------------------------------------
+
+
+@patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
+@patch("framework.llm_enrichment.enrich_ruling")
+@patch("ingestion.worker.psycopg")
+def test_llm_enrichment_fills_missing_fields(
+    mock_psycopg: MagicMock,
+    mock_enrich_ruling: MagicMock,
+    mock_resolve_judge: MagicMock,
+) -> None:
+    """LLM enrichment populates outcome, motion_type, case_title, and parties."""
+    from framework.llm_enrichment import EnrichmentParties, LlmEnrichmentResult
+
+    mock_enrich_ruling.return_value = LlmEnrichmentResult(
+        case_title="Garcia v. State Farm",
+        motion_type="motion_to_compel",
+        outcome="granted_in_part",
+        parties=EnrichmentParties(
+            plaintiffs=["Garcia"],
+            defendants=["State Farm"],
+        ),
+    )
+
+    worker, os_mock = _make_worker()
+    # Enable enrichment (default is enabled)
+    worker._llm_enrichment_enabled = True
+    worker._enrichment_client = MagicMock()
+
+    mock_conn, mock_cur = _make_mock_conn()
+    mock_psycopg.connect.return_value = mock_conn
+    mock_cur.rowcount = 1
+    mock_cur.fetchone.side_effect = [
+        ("court-uuid-1",),  # upsert_court
+        ("case-uuid-1",),  # upsert_case
+        (True,),  # insert_document: RETURNING is_new = True
+        # batch_upsert_parties: RETURNING ids for extracted parties
+        ("party-uuid-1",),
+        ("party-uuid-2",),
+    ]
+    mock_cur.fetchall.return_value = []
+    mock_cur.nextset.side_effect = [True, False]
+
+    event = _make_event(
+        outcome=None,
+        motion_type=None,
+        case_title=None,
+        ruling_text="The motion to compel further discovery is GRANTED IN PART.",
+    )
+    # Remove parties from event
+    event.pop("parties", None)
+
+    worker.process_event(event)
+
+    mock_enrich_ruling.assert_called_once()
+    mock_conn.commit.assert_called_once()
+
+
+@patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
+@patch("framework.llm_enrichment.enrich_ruling")
+@patch("ingestion.worker.psycopg")
+def test_llm_enrichment_disabled_falls_through_to_regex(
+    mock_psycopg: MagicMock,
+    mock_enrich_ruling: MagicMock,
+    mock_resolve_judge: MagicMock,
+) -> None:
+    """When USE_LLM_ENRICHMENT=false, enrichment is skipped and regex runs."""
+    worker, os_mock = _make_worker()
+    worker._llm_enrichment_enabled = False
+
+    mock_conn, mock_cur = _make_mock_conn()
+    mock_psycopg.connect.return_value = mock_conn
+    mock_cur.rowcount = 1
+    mock_cur.fetchone.side_effect = [
+        ("court-uuid-1",),  # upsert_court
+        ("case-uuid-1",),  # upsert_case
+        (True,),  # insert_document
+    ]
+
+    event = _make_event(
+        outcome=None,
+        motion_type=None,
+        ruling_text="The motion for summary judgment is GRANTED.",
+    )
+
+    worker.process_event(event)
+
+    # enrich_ruling should NOT have been called
+    mock_enrich_ruling.assert_not_called()
+    mock_conn.commit.assert_called_once()
+
+
+@patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
+@patch("framework.llm_enrichment.enrich_ruling")
+@patch("ingestion.worker.psycopg")
+def test_llm_enrichment_does_not_override_existing_fields(
+    mock_psycopg: MagicMock,
+    mock_enrich_ruling: MagicMock,
+    mock_resolve_judge: MagicMock,
+) -> None:
+    """LLM enrichment does not overwrite fields already provided by the scraper."""
+    from framework.llm_enrichment import EnrichmentParties, LlmEnrichmentResult
+
+    mock_enrich_ruling.return_value = LlmEnrichmentResult(
+        case_title="Different Title",
+        motion_type="demurrer",
+        outcome="denied",
+        parties=EnrichmentParties(
+            plaintiffs=["Different Plaintiff"],
+            defendants=["Different Defendant"],
+        ),
+    )
+
+    worker, os_mock = _make_worker()
+    worker._llm_enrichment_enabled = True
+    worker._enrichment_client = MagicMock()
+
+    mock_conn, mock_cur = _make_mock_conn()
+    mock_psycopg.connect.return_value = mock_conn
+    mock_cur.rowcount = 1
+    mock_cur.fetchone.side_effect = [
+        ("court-uuid-1",),  # upsert_court
+        ("case-uuid-1",),  # upsert_case
+        (True,),  # insert_document
+        # batch_upsert_parties: RETURNING id for the party
+        ("party-uuid-1",),
+    ]
+    mock_cur.fetchall.return_value = []
+    mock_cur.nextset.side_effect = [False]
+
+    # All enrichment fields are already provided
+    event = _make_event(
+        outcome="granted",
+        motion_type="msj",
+        case_title="Original Title",
+        ruling_text="The motion for summary judgment is GRANTED.",
+        parties=[{"name": "Original Plaintiff", "role": "plaintiff"}],
+    )
+
+    worker.process_event(event)
+
+    # enrich_ruling should NOT have been called since all fields are present
+    mock_enrich_ruling.assert_not_called()
+    mock_conn.commit.assert_called_once()
+
+
+@patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
+@patch("framework.llm_enrichment.enrich_ruling")
+@patch("ingestion.worker.psycopg")
+def test_llm_enrichment_failure_falls_back_to_regex(
+    mock_psycopg: MagicMock,
+    mock_enrich_ruling: MagicMock,
+    mock_resolve_judge: MagicMock,
+) -> None:
+    """When LLM enrichment returns empty result, regex fallback still runs."""
+    from framework.llm_enrichment import LlmEnrichmentResult
+
+    # LLM enrichment returns empty result (all fields None)
+    mock_enrich_ruling.return_value = LlmEnrichmentResult()
+
+    worker, os_mock = _make_worker()
+    worker._llm_enrichment_enabled = True
+    worker._enrichment_client = MagicMock()
+
+    mock_conn, mock_cur = _make_mock_conn()
+    mock_psycopg.connect.return_value = mock_conn
+    mock_cur.rowcount = 1
+    mock_cur.fetchone.side_effect = [
+        ("court-uuid-1",),  # upsert_court
+        ("case-uuid-1",),  # upsert_case
+        (True,),  # insert_document
+    ]
+
+    event = _make_event(
+        outcome=None,
+        motion_type=None,
+        ruling_text="The motion for summary judgment is GRANTED.",
+    )
+
+    worker.process_event(event)
+
+    # enrich_ruling was called but returned empty — regex should fill the gaps
+    mock_enrich_ruling.assert_called_once()
+    mock_conn.commit.assert_called_once()
+
+
+@patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
+@patch("framework.llm_enrichment.enrich_ruling")
+@patch("ingestion.worker.psycopg")
+def test_llm_enrichment_skipped_for_llm_extracted_events_with_fields(
+    mock_psycopg: MagicMock,
+    mock_enrich_ruling: MagicMock,
+    mock_resolve_judge: MagicMock,
+) -> None:
+    """Events from the LLM split path with all fields populated skip enrichment."""
+    worker, os_mock = _make_worker()
+    worker._llm_enrichment_enabled = True
+    worker._enrichment_client = MagicMock()
+
+    mock_conn, mock_cur = _make_mock_conn()
+    mock_psycopg.connect.return_value = mock_conn
+    mock_cur.rowcount = 1
+    mock_cur.fetchone.side_effect = [
+        ("court-uuid-1",),  # upsert_court
+        ("case-uuid-1",),  # upsert_case
+        (True,),  # insert_document
+        # batch_upsert_parties: RETURNING id for the party
+        ("party-uuid-1",),
+    ]
+    mock_cur.fetchall.return_value = []
+    mock_cur.nextset.side_effect = [False]
+
+    event = _make_event(
+        _llm_extracted=True,
+        _split_processed=True,
+        outcome="granted",
+        motion_type="msj",
+        case_title="Smith v. Jones",
+        ruling_text="The motion is GRANTED.",
+        parties=[{"name": "Smith", "role": "plaintiff"}],
+    )
+
+    worker.process_event(event)
+
+    # Should NOT call enrichment — all fields are already populated
+    mock_enrich_ruling.assert_not_called()
+    mock_conn.commit.assert_called_once()
+
+
+@patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
+@patch("framework.llm_enrichment.enrich_ruling")
+@patch("ingestion.worker.psycopg")
+def test_llm_enrichment_runs_for_multimodal_events_missing_fields(
+    mock_psycopg: MagicMock,
+    mock_enrich_ruling: MagicMock,
+    mock_resolve_judge: MagicMock,
+) -> None:
+    """Multimodal events missing enrichment fields get LLM enrichment."""
+    from framework.llm_enrichment import EnrichmentParties, LlmEnrichmentResult
+
+    mock_enrich_ruling.return_value = LlmEnrichmentResult(
+        case_title="Davis v. Metro",
+        motion_type="msj",
+        outcome="denied",
+        parties=EnrichmentParties(
+            plaintiffs=["Davis"],
+            defendants=["Metro"],
+        ),
+    )
+
+    worker, os_mock = _make_worker()
+    worker._llm_enrichment_enabled = True
+    worker._enrichment_client = MagicMock()
+
+    mock_conn, mock_cur = _make_mock_conn()
+    mock_psycopg.connect.return_value = mock_conn
+    mock_cur.rowcount = 1
+    mock_cur.fetchone.side_effect = [
+        ("court-uuid-1",),  # upsert_court
+        ("case-uuid-1",),  # upsert_case
+        (True,),  # insert_document
+        # batch_upsert_parties
+        ("party-uuid-1",),
+        ("party-uuid-2",),
+    ]
+    mock_cur.fetchall.return_value = []
+    mock_cur.nextset.side_effect = [True, False]
+
+    event = _make_event(
+        _llm_extracted=True,
+        _split_processed=True,
+        outcome=None,
+        motion_type=None,
+        case_title=None,
+        ruling_text="The motion for summary judgment filed by defendant is DENIED.",
+    )
+    event.pop("parties", None)
+
+    worker.process_event(event)
+
+    mock_enrich_ruling.assert_called_once()
+    mock_conn.commit.assert_called_once()
+
+
+@patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
+@patch("framework.llm_enrichment.enrich_ruling")
+@patch("ingestion.worker.psycopg")
+def test_llm_enrichment_parties_converted_to_dicts(
+    mock_psycopg: MagicMock,
+    mock_enrich_ruling: MagicMock,
+    mock_resolve_judge: MagicMock,
+) -> None:
+    """Enrichment party names are converted to list[dict] format."""
+    from framework.llm_enrichment import EnrichmentParties, LlmEnrichmentResult
+
+    mock_enrich_ruling.return_value = LlmEnrichmentResult(
+        case_title="Alpha v. Beta Corp",
+        motion_type="mtd",
+        outcome="granted",
+        parties=EnrichmentParties(
+            plaintiffs=["Alpha LLC"],
+            defendants=["Beta Corp", "Gamma Inc"],
+        ),
+    )
+
+    worker, os_mock = _make_worker()
+    worker._llm_enrichment_enabled = True
+    worker._enrichment_client = MagicMock()
+
+    mock_conn, mock_cur = _make_mock_conn()
+    mock_psycopg.connect.return_value = mock_conn
+    mock_cur.rowcount = 1
+    mock_cur.fetchone.side_effect = [
+        ("court-uuid-1",),  # upsert_court
+        ("case-uuid-1",),  # upsert_case
+        (True,),  # insert_document
+        # batch_upsert_parties: 3 parties
+        ("party-uuid-1",),
+        ("party-uuid-2",),
+        ("party-uuid-3",),
+    ]
+    mock_cur.fetchall.return_value = []
+    mock_cur.nextset.side_effect = [True, True, False]
+
+    event = _make_event(
+        outcome=None,
+        motion_type=None,
+        case_title=None,
+        ruling_text="The motion to dismiss is GRANTED.",
+    )
+    event.pop("parties", None)
+
+    worker.process_event(event)
+
+    mock_enrich_ruling.assert_called_once()
+    mock_conn.commit.assert_called_once()
+
+
+def test_llm_enrich_fields_returns_none_when_disabled() -> None:
+    """_llm_enrich_fields returns None when enrichment is disabled."""
+    worker, _ = _make_worker()
+    worker._llm_enrichment_enabled = False
+
+    result = worker._llm_enrich_fields("Some ruling text.", "doc-1")
+    assert result is None
+
+
+def test_llm_enrich_fields_returns_none_when_no_client() -> None:
+    """_llm_enrich_fields returns None when no client is available."""
+    worker, _ = _make_worker()
+    worker._llm_enrichment_enabled = True
+    worker._enrichment_client = None
+
+    result = worker._llm_enrich_fields("Some ruling text.", "doc-1")
+    assert result is None
+
+
+def test_llm_enrich_fields_returns_none_for_empty_text() -> None:
+    """_llm_enrich_fields returns None for empty ruling text."""
+    worker, _ = _make_worker()
+    worker._llm_enrichment_enabled = True
+    worker._enrichment_client = MagicMock()
+
+    result = worker._llm_enrich_fields("", "doc-1")
+    assert result is None
+
+    result = worker._llm_enrich_fields("   \n  ", "doc-1")
+    assert result is None
+
+
+@patch("framework.llm_enrichment.enrich_ruling")
+def test_llm_enrich_fields_returns_result_with_data(
+    mock_enrich_ruling: MagicMock,
+) -> None:
+    """_llm_enrich_fields returns the result when enrichment produces data."""
+    from framework.llm_enrichment import EnrichmentParties, LlmEnrichmentResult
+
+    mock_enrich_ruling.return_value = LlmEnrichmentResult(
+        case_title="Test v. Case",
+        motion_type="msj",
+        outcome="granted",
+        parties=EnrichmentParties(plaintiffs=["Test"], defendants=["Case"]),
+    )
+
+    worker, _ = _make_worker()
+    worker._llm_enrichment_enabled = True
+    worker._enrichment_client = MagicMock()
+
+    result = worker._llm_enrich_fields("The motion is GRANTED.", "doc-1")
+    assert result is not None
+    assert result.case_title == "Test v. Case"
+    assert result.motion_type == "msj"
+    assert result.outcome == "granted"
+
+
+@patch("framework.llm_enrichment.enrich_ruling")
+def test_llm_enrich_fields_returns_none_for_empty_result(
+    mock_enrich_ruling: MagicMock,
+) -> None:
+    """_llm_enrich_fields returns None when enrichment produces empty result."""
+    from framework.llm_enrichment import LlmEnrichmentResult
+
+    mock_enrich_ruling.return_value = LlmEnrichmentResult()
+
+    worker, _ = _make_worker()
+    worker._llm_enrichment_enabled = True
+    worker._enrichment_client = MagicMock()
+
+    result = worker._llm_enrich_fields("Some ruling text.", "doc-1")
+    assert result is None
+
+
+def test_enrichment_enabled_by_default() -> None:
+    """LLM enrichment is enabled by default when no env var is set."""
+    worker, _ = _make_worker()
+    assert worker._llm_enrichment_enabled is True
+
+
+@patch.dict("os.environ", {"USE_LLM_ENRICHMENT": "false"})
+def test_enrichment_disabled_via_env_var() -> None:
+    """USE_LLM_ENRICHMENT=false disables LLM enrichment."""
+    worker, _ = _make_worker()
+    assert worker._llm_enrichment_enabled is False
+
+
+@patch.dict("os.environ", {"USE_LLM_ENRICHMENT": "0"})
+def test_enrichment_disabled_via_env_var_zero() -> None:
+    """USE_LLM_ENRICHMENT=0 disables LLM enrichment."""
+    worker, _ = _make_worker()
+    assert worker._llm_enrichment_enabled is False
+
+
+@patch.dict("os.environ", {"USE_LLM_ENRICHMENT": "true"})
+def test_enrichment_enabled_via_env_var() -> None:
+    """USE_LLM_ENRICHMENT=true enables LLM enrichment."""
+    worker, _ = _make_worker()
+    assert worker._llm_enrichment_enabled is True
