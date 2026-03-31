@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # venv: scraper-framework
+# one-off: true
 """Re-ingest all historical documents via LLM extraction with quality metrics.
 
 Orchestrates a full LLM-based re-ingestion of all archived documents from S3,
