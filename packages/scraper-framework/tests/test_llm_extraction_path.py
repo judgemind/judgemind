@@ -2076,3 +2076,58 @@ class TestMultimodalExtractionPath:
         mock_multimodal.extract_from_pdf.assert_called_once()
         # Text extractor should NOT have been called.
         mock_text.extract.assert_not_called()
+
+    @patch("ingestion.worker.batch_upsert_parties")
+    @patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
+    @patch("ingestion.worker.psycopg")
+    def test_extraction_none_skips_all_framework_extraction(
+        self,
+        mock_psycopg: MagicMock,
+        mock_resolve_judge: MagicMock,
+        mock_batch_upsert: MagicMock,
+    ) -> None:
+        """ExtractionMethod.NONE skips all framework extraction (#2271)."""
+        worker, _ = _make_worker()
+
+        mock_conn, mock_cur = _make_mock_conn()
+        mock_psycopg.connect.return_value = mock_conn
+        mock_cur.fetchone.side_effect = [
+            ("court-uuid-1",),
+            ("case-uuid-1",),
+            (True,),
+        ]
+
+        # Set up both extractors — neither should be called.
+        mock_multimodal = MagicMock()
+        worker._multimodal_extractor = mock_multimodal
+        mock_text = MagicMock()
+        worker._framework_extractor = mock_text
+
+        # Patch the county config to return NONE for this test county.
+        from framework.extraction_config import CountyExtractionConfig, ExtractionMethod
+
+        none_config = CountyExtractionConfig(method=ExtractionMethod.NONE)
+
+        event = _make_event(
+            state="CA",
+            county="TestNone",
+            content_format="pdf",
+            ruling_text="PDF content",
+            scraper_id="test-none",
+        )
+        with (
+            patch("ingestion.worker.is_pdf_binary", return_value=True),
+            patch(
+                "ingestion.worker.extract_text_from_pdf",
+                return_value="Case No. 123\nSmith v. Jones\nGranted.",
+            ),
+            patch(
+                "framework.extraction_config.get_county_extraction_config",
+                return_value=none_config,
+            ),
+        ):
+            worker.process_event(event)
+
+        # Neither extractor should have been called.
+        mock_multimodal.extract_from_pdf.assert_not_called()
+        mock_text.extract.assert_not_called()
