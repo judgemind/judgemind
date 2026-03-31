@@ -261,8 +261,19 @@ EXTRACTION_SYSTEM_PROMPT = (
     '   - "high" — clearly present and unambiguous\n'
     '   - "medium" — present but partially obscured or abbreviated\n'
     '   - "low" — inferred or uncertain\n\n'
-    "13. **Ruling text:** Preserve ruling text VERBATIM from "
-    "the source document. Do not summarize or rephrase.\n\n"
+    "13. **Ruling text:** The ruling_text field must contain "
+    "the COMPLETE text of the tentative ruling for this case. "
+    "Include EVERY section verbatim — procedural background, "
+    "legal standard, analysis, discussion, conclusion, "
+    "disposition, and any other content the judge wrote about this case. "
+    "Do not summarize, rephrase, or omit "
+    "anything. When in doubt, include it. This is the primary "
+    "field attorneys will read — missing text means lost data.\n\n"
+    "14. **Case title:** The extracted_case_title field must "
+    "contain ONLY the party names from the case caption, "
+    "e.g. 'Marquez v. Kohl\\'s Department Stores, Inc.' — "
+    "do NOT include hearing times, case numbers, motion "
+    "descriptions, or ruling text in this field.\n\n"
     "## Output format\n\n"
     "Respond with ONLY a JSON object, no other text:\n\n"
     "{\n"
@@ -300,11 +311,27 @@ EXTRACTION_SYSTEM_PROMPT = (
     "Hernandez v. Pacific Coast Properties LLC\n"
     "Hearing Date: March 3, 2026\n"
     "Motion: Motion for Summary Judgment\n"
-    "The motion for summary judgment is GRANTED...\n\n"
+    "Background\n"
+    "This is a personal injury action arising from a slip and fall "
+    "at defendant's commercial property on January 15, 2020. "
+    "Plaintiff alleges that defendant failed to maintain the "
+    "parking lot in a safe condition.\n"
+    "Legal Standard\n"
+    "A party may move for summary judgment when there is no "
+    "triable issue of material fact. (Code Civ. Proc. § 437c.)\n"
+    "Analysis\n"
+    "The motion for summary judgment is GRANTED. Defendant has "
+    "met its burden of showing that plaintiff cannot establish "
+    "the element of notice. The undisputed evidence shows "
+    "defendant inspected the lot 30 minutes before the incident "
+    "and the hazard was not present.\n\n"
     "Case Number: 25SMCV01132\n"
     "Kim v. Westfield Group\n"
     "Motion: Demurrer to First Amended Complaint\n"
-    "The demurrer is SUSTAINED with 20 days leave to amend...\n\n"
+    "The demurrer is SUSTAINED with 20 days leave to amend "
+    "as to the second cause of action for fraud. The FAC "
+    "fails to plead fraud with the specificity required "
+    "under the heightened pleading standard.\n\n"
     "Expected output:\n"
     "{\n"
     '  "extracted_judge_name": null,\n'
@@ -317,6 +344,16 @@ EXTRACTION_SYSTEM_PROMPT = (
     '      "case_type": "civil",\n'
     '      "outcome": "granted",\n'
     '      "motion_type": "msj",\n'
+    '      "ruling_text": "Background\\nThis is a personal injury action '
+    "arising from a slip and fall at defendant's commercial property on "
+    "January 15, 2020. Plaintiff alleges that defendant failed to maintain "
+    "the parking lot in a safe condition.\\nLegal Standard\\nA party may "
+    "move for summary judgment when there is no triable issue of material "
+    "fact. (Code Civ. Proc. § 437c.)\\nAnalysis\\nThe motion for summary "
+    "judgment is GRANTED. Defendant has met its burden of showing that "
+    "plaintiff cannot establish the element of notice. The undisputed "
+    "evidence shows defendant inspected the lot 30 minutes before the "
+    'incident and the hazard was not present.",\n'
     '      "extracted_parties": [\n'
     '        {"name": "Hernandez", "role": "plaintiff", "confidence": "high"},\n'
     '        {"name": "Pacific Coast Properties LLC", "role": "defendant", '
@@ -337,6 +374,10 @@ EXTRACTION_SYSTEM_PROMPT = (
     '      "case_type": "civil",\n'
     '      "outcome": "granted",\n'
     '      "motion_type": "demurrer",\n'
+    '      "ruling_text": "The demurrer is SUSTAINED with 20 days leave '
+    "to amend as to the second cause of action for fraud. The FAC fails "
+    "to plead fraud with the specificity required under the heightened "
+    'pleading standard.",\n'
     '      "extracted_parties": [\n'
     '        {"name": "Kim", "role": "plaintiff", "confidence": "high"},\n'
     '        {"name": "Westfield Group", "role": "defendant", "confidence": "high"}\n'
@@ -361,7 +402,14 @@ EXTRACTION_SYSTEM_PROMPT = (
     "Case No. 2024-01393434\n"
     "Martinez v. ABC Manufacturing Inc.\n"
     "Motion for Summary Adjudication\n"
-    "The motion for summary adjudication is DENIED...\n\n"
+    "Procedural History\n"
+    "Plaintiff filed this products liability action on "
+    "March 10, 2024. Defendant moves for summary adjudication "
+    "of the strict liability cause of action.\n"
+    "Discussion\n"
+    "The motion for summary adjudication is DENIED. Defendant "
+    "has not met its initial burden as the declaration of its "
+    "expert fails to address the design defect theory.\n\n"
     "Expected output:\n"
     "{\n"
     '  "extracted_judge_name": "Gassia Apkarian",\n'
@@ -374,6 +422,12 @@ EXTRACTION_SYSTEM_PROMPT = (
     '      "case_type": "civil",\n'
     '      "outcome": "denied",\n'
     '      "motion_type": "msj_partial",\n'
+    '      "ruling_text": "Procedural History\\nPlaintiff filed this products '
+    "liability action on March 10, 2024. Defendant moves for summary "
+    "adjudication of the strict liability cause of action.\\n"
+    "Discussion\\nThe motion for summary adjudication is DENIED. "
+    "Defendant has not met its initial burden as the declaration of its "
+    'expert fails to address the design defect theory.",\n'
     '      "extracted_parties": [\n'
     '        {"name": "Martinez", "role": "plaintiff", "confidence": "high"},\n'
     '        {"name": "ABC Manufacturing Inc.", "role": "defendant", '
@@ -398,11 +452,19 @@ EXTRACTION_SYSTEM_PROMPT = (
     "#1 CVPS2306157\n"
     "Garcia v. State Farm Insurance\n"
     "Motion to Compel Further Discovery Responses\n"
-    "The motion is GRANTED. Defendant shall provide...\n\n"
+    "The motion is GRANTED. Defendant shall provide "
+    "further responses to Form Interrogatories Nos. 15.1 "
+    "and 17.1 within 20 days. The responses provided were "
+    "evasive and incomplete. Sanctions of $1,500 are imposed "
+    "against defendant and defense counsel, jointly and "
+    "severally, payable within 30 days.\n\n"
     "#2 CVPS2400892\n"
     "Thompson v. City of Palm Springs\n"
     "Demurrer to Second Amended Complaint\n"
-    "The demurrer is OVERRULED...\n\n"
+    "The demurrer is OVERRULED. The SAC adequately pleads "
+    "a dangerous condition of public property under "
+    "Government Code section 835. Defendant shall file "
+    "its answer within 10 days.\n\n"
     "Expected output:\n"
     "{\n"
     '  "extracted_judge_name": "Arthur Hester III",\n'
@@ -415,6 +477,11 @@ EXTRACTION_SYSTEM_PROMPT = (
     '      "case_type": "civil",\n'
     '      "outcome": "granted",\n'
     '      "motion_type": "motion_to_compel",\n'
+    '      "ruling_text": "The motion is GRANTED. Defendant shall provide '
+    "further responses to Form Interrogatories Nos. 15.1 and 17.1 within "
+    "20 days. The responses provided were evasive and incomplete. Sanctions "
+    "of $1,500 are imposed against defendant and defense counsel, jointly "
+    'and severally, payable within 30 days.",\n'
     '      "extracted_parties": [\n'
     '        {"name": "Garcia", "role": "plaintiff", "confidence": "high"},\n'
     '        {"name": "State Farm Insurance", "role": "defendant", '
@@ -435,6 +502,9 @@ EXTRACTION_SYSTEM_PROMPT = (
     '      "case_type": "civil",\n'
     '      "outcome": "denied",\n'
     '      "motion_type": "demurrer",\n'
+    '      "ruling_text": "The demurrer is OVERRULED. The SAC adequately '
+    "pleads a dangerous condition of public property under Government Code "
+    'section 835. Defendant shall file its answer within 10 days.",\n'
     '      "extracted_parties": [\n'
     '        {"name": "Thompson", "role": "plaintiff", "confidence": "high"},\n'
     '        {"name": "City of Palm Springs", "role": "defendant", '
