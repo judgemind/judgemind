@@ -1077,14 +1077,16 @@ class TestResolveJudge:
     def test_creates_new_judge_when_no_alias(self) -> None:
         conn = _mock_conn()
         cur = conn.cursor.return_value.__enter__.return_value
-        # fetchone: alias lookup -> None, canonical lookup -> None, INSERT -> new id
-        cur.fetchone.side_effect = [None, None, ("new-judge-id",)]
+        # fetchone: alias lookup -> None, canonical lookup -> None,
+        # roster court_code -> None (no court), INSERT -> new id
+        cur.fetchone.side_effect = [None, None, None, ("new-judge-id",)]
         cur.fetchall.return_value = []  # no near-duplicates
         result = resolve_judge(conn, "Hon. John Smith", "court-1")
         assert result == "new-judge-id"
-        # Should have 5 execute calls:
-        # SELECT alias, SELECT canonical, SELECT near-dup, INSERT judge, INSERT alias
-        assert cur.execute.call_count == 5
+        # Should have 6 execute calls:
+        # SELECT alias, SELECT canonical, SELECT near-dup,
+        # SELECT court_code (roster), INSERT judge, INSERT alias
+        assert cur.execute.call_count == 6
 
     def test_returns_none_for_garbage_name(self) -> None:
         conn = _mock_conn()
@@ -1114,8 +1116,9 @@ class TestResolveJudge:
     def test_raises_on_insert_returning_none(self) -> None:
         conn = _mock_conn()
         cur = conn.cursor.return_value.__enter__.return_value
-        # fetchone: alias lookup -> None, canonical lookup -> None, INSERT -> None
-        cur.fetchone.side_effect = [None, None, None]
+        # fetchone: alias lookup -> None, canonical lookup -> None,
+        # roster court_code -> None (no court), INSERT -> None
+        cur.fetchone.side_effect = [None, None, None, None]
         cur.fetchall.return_value = []  # no near-duplicates
         with pytest.raises(RuntimeError, match="resolve_judge"):
             resolve_judge(conn, "John Smith", "court-1")
@@ -1473,14 +1476,15 @@ class TestResolveJudgeNearDuplicate:
         assert "0.9" in alias_calls[0][0][0]
 
     def test_creates_new_judge_when_no_match(self) -> None:
-        """When no alias, canonical, or near-dup match exists, create new judge."""
+        """When no alias, canonical, near-dup, or roster match exists, create new judge."""
         conn = _mock_conn()
         cur = conn.cursor.return_value.__enter__.return_value
         # fetchone sequence:
         # 1. alias lookup -> None
         # 2. canonical lookup -> None
-        # 3. INSERT judges -> new id
-        cur.fetchone.side_effect = [None, None, ("new-judge-id",)]
+        # 3. roster court_code -> None (no court)
+        # 4. INSERT judges -> new id
+        cur.fetchone.side_effect = [None, None, None, ("new-judge-id",)]
         cur.fetchall.return_value = []  # no existing judges at court
         result = resolve_judge(conn, "John Smith", "court-1")
         assert result == "new-judge-id"
@@ -1489,7 +1493,9 @@ class TestResolveJudgeNearDuplicate:
         """The INSERT INTO judges uses ON CONFLICT for race condition safety."""
         conn = _mock_conn()
         cur = conn.cursor.return_value.__enter__.return_value
-        cur.fetchone.side_effect = [None, None, ("new-judge-id",)]
+        # fetchone: alias -> None, canonical -> None,
+        # roster court_code -> None, INSERT -> new id
+        cur.fetchone.side_effect = [None, None, None, ("new-judge-id",)]
         cur.fetchall.return_value = []
         resolve_judge(conn, "John Smith", "court-1")
         # Find the INSERT INTO judges call

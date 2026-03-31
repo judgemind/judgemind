@@ -701,6 +701,214 @@ def _strip_middle_initials(name: str) -> str:
     return " ".join([words[0], *kept, words[-1]])
 
 
+# ---------------------------------------------------------------------------
+# Roster-based judge name matching
+# ---------------------------------------------------------------------------
+
+# Maximum Levenshtein distance for fuzzy name matching against the roster.
+_MAX_ROSTER_LEVENSHTEIN = 3
+
+# Minimum confidence for a roster match to be used in resolve_judge.
+# Matches below this threshold are ignored to prevent merging distinct
+# judges with similar names (e.g. "Jane Smythe" != "Jane Smith").
+_ROSTER_MATCH_CONFIDENCE_THRESHOLD = 0.85
+
+
+def _levenshtein_distance(s1: str, s2: str) -> int:
+    """Compute the Levenshtein edit distance between two strings.
+
+    Uses a simple dynamic-programming implementation (O(n*m)).
+    """
+    if len(s1) < len(s2):
+        return _levenshtein_distance(s2, s1)
+    if len(s2) == 0:
+        return len(s1)
+    prev_row = list(range(len(s2) + 1))
+    for i, c1 in enumerate(s1):
+        curr_row = [i + 1]
+        for j, c2 in enumerate(s2):
+            insertions = prev_row[j + 1] + 1
+            deletions = curr_row[j] + 1
+            substitutions = prev_row[j] + (c1 != c2)
+            curr_row.append(min(insertions, deletions, substitutions))
+        prev_row = curr_row
+    return prev_row[-1]
+
+
+def _normalize_for_comparison(name: str) -> str:
+    """Normalize a judge name for fuzzy comparison.
+
+    Strips ALL single-letter initials (not just middle ones), lowercases,
+    removes periods/punctuation, and sorts words alphabetically so initial
+    placement doesn't matter.
+
+    Examples:
+      "H. Shaina Colover"  -> "colover shaina"
+      "Shaina H. Colover"  -> "colover shaina"
+      "Jennifer Mccarthey" -> "jennifer mccarthey"
+      "Andre De La Cruz"   -> "andre cruz de la"
+      "De La Cruz"         -> "cruz de la"
+    """
+    # Lowercase and remove periods first
+    cleaned = name.lower().replace(".", "")
+    # Split into words, remove all single-letter words (initials)
+    words = [w for w in cleaned.split() if len(w) > 1]
+    # Sort for position-invariant comparison
+    words.sort()
+    return " ".join(words)
+
+
+def fuzzy_match_roster_name(
+    candidate_name: str,
+    roster_names: list[str],
+    *,
+    max_distance: int = _MAX_ROSTER_LEVENSHTEIN,
+) -> tuple[str, float] | None:
+    """Match a judge name against a list of roster names using fuzzy matching.
+
+    Uses a multi-strategy approach:
+      1. Exact match (after normalization)
+      2. Sorted-word match (catches initial placement variants)
+      3. Levenshtein distance on normalized forms (catches typos)
+      4. Subset matching (catches partial names like "De La Cruz")
+
+    Parameters
+    ----------
+    candidate_name : str
+        The judge name to match (already normalized via normalize_judge_name).
+    roster_names : list[str]
+        List of canonical judge names from the roster.
+    max_distance : int
+        Maximum Levenshtein distance for fuzzy matching. Default is 3.
+
+    Returns
+    -------
+    tuple[str, float] | None
+        A tuple of (matched_roster_name, confidence) if a match is found,
+        or None if no match. Confidence ranges from 0.0 to 1.0.
+    """
+    if not candidate_name or not roster_names:
+        return None
+
+    candidate_lower = candidate_name.lower().strip()
+    candidate_normalized = _normalize_for_comparison(candidate_name)
+    candidate_words = set(candidate_normalized.split())
+
+    best_match: tuple[str, float] | None = None
+
+    for roster_name in roster_names:
+        roster_lower = roster_name.lower().strip()
+
+        # Strategy 1: Exact match (case-insensitive)
+        if candidate_lower == roster_lower:
+            return (roster_name, 1.0)
+
+        roster_normalized = _normalize_for_comparison(roster_name)
+        roster_words = set(roster_normalized.split())
+
+        # Strategy 2: Sorted-word match (catches "H. Shaina Colover" vs "Shaina H. Colover")
+        if candidate_normalized == roster_normalized:
+            confidence = 0.95
+            if best_match is None or confidence > best_match[1]:
+                best_match = (roster_name, confidence)
+
+        # Strategy 3: Levenshtein distance on normalized forms (catches typos)
+        dist = _levenshtein_distance(candidate_normalized, roster_normalized)
+        if dist <= max_distance:
+            # Scale confidence inversely with distance
+            # dist=1 -> 0.85, dist=2 -> 0.75, dist=3 -> 0.65
+            confidence = max(0.5, 0.95 - dist * 0.1)
+            if best_match is None or confidence > best_match[1]:
+                best_match = (roster_name, confidence)
+
+        # Strategy 4: Subset matching (catches partial names)
+        # If one name's words are a proper subset of the other's,
+        # and the subset has at least 2 words (to avoid false positives
+        # on single common last names), treat as a match.
+        if len(candidate_words) >= 2 and len(roster_words) >= 2:
+            if candidate_words < roster_words:
+                # candidate is a subset of roster (e.g. "De La Cruz" vs "Andre De La Cruz")
+                confidence = 0.8 * (len(candidate_words) / len(roster_words))
+                if best_match is None or confidence > best_match[1]:
+                    best_match = (roster_name, confidence)
+            elif roster_words < candidate_words:
+                # roster is a subset of candidate (rare but possible)
+                confidence = 0.8 * (len(roster_words) / len(candidate_words))
+                if best_match is None or confidence > best_match[1]:
+                    best_match = (roster_name, confidence)
+
+    return best_match
+
+
+def _get_roster_names(
+    conn: psycopg.Connection,
+    court_id: str,
+) -> list[str]:
+    """Get unique judge names from the latest court directory snapshot.
+
+    Parameters
+    ----------
+    conn : psycopg.Connection
+        Database connection.
+    court_id : str
+        The court UUID (from the judges table).
+
+    Returns
+    -------
+    list[str]
+        List of unique judge names from the roster. Empty list if no
+        snapshot exists or the court_code cannot be determined.
+    """
+    # Get the court_code for this court UUID, then convert to snapshot format
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT court_code FROM courts WHERE id = %s::uuid LIMIT 1",
+            (court_id,),
+        )
+        row = cur.fetchone()
+    if row is None:
+        return []
+
+    court_code: str = row[0]
+    # Convert court_code format (ca-los-angeles) to snapshot format (ca_los_angeles)
+    snapshot_court_id = court_code.replace("-", "_")
+
+    # Get the latest snapshot mapping for this court
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT mapping FROM court_directory_snapshots
+            WHERE court_id = %s
+            ORDER BY captured_at DESC
+            LIMIT 1
+            """,
+            (snapshot_court_id,),
+        )
+        row = cur.fetchone()
+
+    if row is None or row[0] is None:
+        return []
+
+    import json
+
+    mapping_data = row[0]
+    mapping: dict[str, str]
+    if isinstance(mapping_data, dict):
+        mapping = mapping_data
+    else:
+        try:
+            mapping = json.loads(mapping_data)
+        except (json.JSONDecodeError, TypeError):
+            logger.warning(
+                "Failed to parse court directory mapping for roster lookup",
+                extra={"court_id": court_id},
+            )
+            return []
+
+    # Return unique judge names from the mapping values
+    return list(set(mapping.values()))
+
+
 def resolve_judge(
     conn: psycopg.Connection,
     raw_name: str,
@@ -719,7 +927,11 @@ def resolve_judge(
       5. If found, create an alias and return the existing judge_id.
       6. Check for near-duplicates (missing middle initial) at the same court.
       7. If near-match found, link to existing judge (prefer more complete name).
-      8. If no match at all, create a new judge with ON CONFLICT handling.
+      8. Fuzzy-match against court directory roster names (#2140).
+         If a roster match is found AND a judge with that canonical name exists,
+         link via alias. If no existing judge, use the roster canonical name
+         for the new record.
+      9. If no match at all, create a new judge with ON CONFLICT handling.
     """
     raw_name = _strip_nul(raw_name) or raw_name
     canonical = normalize_judge_name(raw_name)
@@ -831,6 +1043,74 @@ def resolve_judge(
                     judge_id,
                 )
                 return judge_id
+
+        # Step 3b: Roster-based matching — check the court directory
+        # snapshot for a fuzzy match against official judge names (#2140).
+        # This catches typos, initial placement variants, and partial names
+        # that steps 2-3 miss.
+        roster_names = _get_roster_names(conn, court_id)
+        if roster_names:
+            roster_match = fuzzy_match_roster_name(canonical, roster_names)
+            if roster_match is not None:
+                roster_canonical, confidence = roster_match
+                # Only use high-confidence matches to avoid merging
+                # distinct judges with similar names (#2140)
+                if confidence < _ROSTER_MATCH_CONFIDENCE_THRESHOLD:
+                    logger.info(
+                        "resolve_judge: roster match %r -> %r has low "
+                        "confidence %.2f (threshold=%.2f), skipping",
+                        canonical,
+                        roster_canonical,
+                        confidence,
+                        _ROSTER_MATCH_CONFIDENCE_THRESHOLD,
+                    )
+                    roster_match = None
+            if roster_match is not None:
+                roster_canonical, confidence = roster_match
+                # Normalize the roster name through the same pipeline
+                roster_normalized = normalize_judge_name(roster_canonical)
+                if roster_normalized is not None:
+                    # Check if a judge with the roster's canonical name exists
+                    cur.execute(
+                        """
+                        SELECT id FROM judges
+                        WHERE canonical_name = %s AND court_id = %s::uuid
+                        LIMIT 1
+                        """,
+                        (roster_normalized, court_id),
+                    )
+                    row = cur.fetchone()
+                    if row is not None:
+                        judge_id = str(row[0])
+                        # Link this raw name as an alias of the roster-matched judge
+                        cur.execute(
+                            """
+                            INSERT INTO judge_aliases
+                                (judge_id, raw_name, source, confidence, is_verified)
+                            VALUES (%s::uuid, %s, 'roster_match', %s, FALSE)
+                            ON CONFLICT DO NOTHING
+                            """,
+                            (judge_id, raw_name, confidence),
+                        )
+                        logger.info(
+                            "resolve_judge: roster match %r -> %r (confidence=%.2f) -> %s",
+                            canonical,
+                            roster_normalized,
+                            confidence,
+                            judge_id,
+                        )
+                        return judge_id
+                    else:
+                        # No existing judge with the roster name — use roster name
+                        # as the canonical name instead of the raw-derived name.
+                        canonical = roster_normalized
+                        logger.info(
+                            "resolve_judge: using roster canonical name %r "
+                            "instead of %r (confidence=%.2f)",
+                            roster_normalized,
+                            normalize_judge_name(raw_name),
+                            confidence,
+                        )
 
         # Step 4: No match found — create new judge with ON CONFLICT
         # handling for the UNIQUE constraint (race condition safety net).
