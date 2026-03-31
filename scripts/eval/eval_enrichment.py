@@ -32,6 +32,7 @@ DEFAULT_FIXTURES_DIR = (
     REPO_ROOT / "packages" / "scraper-framework" / "tests" / "fixtures" / "enrichment"
 )
 RESULTS_DIR = SCRIPT_DIR / "results" / "enrichment"
+MIN_TOTAL_FIXTURES = 100  # Minimum expected fixture count for --live mode
 
 # Add repo to path for imports
 sys.path.insert(0, str(REPO_ROOT / "packages" / "scraper-framework" / "src"))
@@ -316,6 +317,14 @@ def main() -> int:
     fixtures = load_fixtures(fixtures_dir, county_filter=args.county)
 
     if args.live:
+        if not args.county and len(fixtures) < MIN_TOTAL_FIXTURES:
+            print(
+                f"ERROR: Only {len(fixtures)} fixtures found in {fixtures_dir}, "
+                f"expected at least {MIN_TOTAL_FIXTURES}. "
+                f"Check that --fixtures points to the correct directory.",
+                file=sys.stderr,
+            )
+            return 1
         results = run_live_extraction(fixtures, args.model)
         cache_path = save_cached_results(results, args.model)
         print(f"\nCached results saved to: {cache_path}")

@@ -919,3 +919,195 @@ class TestFixtureLoading:
         field_names = [f.field_name for f in fixture_scores[0].field_scores]
         assert "case_title" not in field_names
         assert fixture_scores[0].party_score is None
+
+
+# ---------------------------------------------------------------------------
+# Default path and minimum fixture count validation tests
+# ---------------------------------------------------------------------------
+
+
+class TestDefaultFixturesPathValidation:
+    """Tests that DEFAULT_FIXTURES_DIR resolves to a valid fixtures directory."""
+
+    def test_default_fixtures_dir_exists(self) -> None:
+        """DEFAULT_FIXTURES_DIR must point to an existing directory."""
+        from eval_enrichment import DEFAULT_FIXTURES_DIR
+
+        assert DEFAULT_FIXTURES_DIR.exists(), (
+            f"DEFAULT_FIXTURES_DIR does not exist: {DEFAULT_FIXTURES_DIR}"
+        )
+        assert DEFAULT_FIXTURES_DIR.is_dir(), (
+            f"DEFAULT_FIXTURES_DIR is not a directory: {DEFAULT_FIXTURES_DIR}"
+        )
+
+    def test_default_fixtures_dir_has_minimum_fixtures(self) -> None:
+        """DEFAULT_FIXTURES_DIR must contain at least MIN_TOTAL_FIXTURES fixtures."""
+        from eval_enrichment import DEFAULT_FIXTURES_DIR, MIN_TOTAL_FIXTURES, load_fixtures
+
+        if not DEFAULT_FIXTURES_DIR.is_dir():
+            pytest.skip("DEFAULT_FIXTURES_DIR does not exist or is not a directory")
+
+        fixtures = load_fixtures(DEFAULT_FIXTURES_DIR)
+        assert len(fixtures) >= MIN_TOTAL_FIXTURES, (
+            f"Expected at least {MIN_TOTAL_FIXTURES} fixtures in "
+            f"{DEFAULT_FIXTURES_DIR}, found {len(fixtures)}. "
+            f"This may indicate DEFAULT_FIXTURES_DIR points to the wrong directory."
+        )
+
+    def test_default_fixtures_dir_has_expected_county_subdirs(self) -> None:
+        """DEFAULT_FIXTURES_DIR must contain county subdirectories."""
+        from eval_enrichment import DEFAULT_FIXTURES_DIR
+
+        if not DEFAULT_FIXTURES_DIR.is_dir():
+            pytest.skip("DEFAULT_FIXTURES_DIR does not exist or is not a directory")
+
+        county_dirs = [d.name for d in sorted(DEFAULT_FIXTURES_DIR.iterdir()) if d.is_dir()]
+        assert len(county_dirs) >= 5, (
+            f"Expected at least 5 county subdirectories in {DEFAULT_FIXTURES_DIR}, "
+            f"found {len(county_dirs)}: {county_dirs}"
+        )
+
+
+class TestMinFixtureCountValidation:
+    """Tests for the runtime minimum fixture count validation in --live mode."""
+
+    def test_live_mode_fails_with_too_few_fixtures(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """--live mode should exit with error when fixture count < MIN_TOTAL_FIXTURES."""
+        # Create a fixtures dir with only 3 fixtures (below MIN_TOTAL_FIXTURES)
+        county_dir = tmp_path / "test_county"
+        county_dir.mkdir()
+        for i in range(3):
+            fixture = {
+                "ruling_text": f"Test ruling {i}",
+                "expected": {
+                    "case_title": "Test v. Case",
+                    "motion_type": "msj",
+                    "outcome": "granted",
+                    "parties": {"plaintiffs": [], "defendants": []},
+                },
+            }
+            (county_dir / f"fixture-{i}.json").write_text(__import__("json").dumps(fixture))
+
+        from eval_enrichment import main
+
+        monkeypatch.setattr(
+            "sys.argv",
+            ["eval_enrichment", "--live", "--fixtures", str(tmp_path)],
+        )
+        exit_code = main()
+        assert exit_code == 1
+
+    def test_live_mode_accepts_sufficient_fixtures(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """--live mode should not fail the fixture count check when count >= MIN_TOTAL_FIXTURES.
+
+        Note: This test does not actually run extraction (it mocks enrich_ruling).
+        It only validates that the fixture count gate passes.
+        """
+        # Create a fixtures dir with exactly MIN_TOTAL_FIXTURES fixtures
+        from eval_enrichment import MIN_TOTAL_FIXTURES
+
+        county_dir = tmp_path / "test_county"
+        county_dir.mkdir()
+        for i in range(MIN_TOTAL_FIXTURES):
+            fixture = {
+                "ruling_text": f"Test ruling {i}",
+                "expected": {
+                    "case_title": "Test v. Case",
+                    "motion_type": "msj",
+                    "outcome": "granted",
+                    "parties": {"plaintiffs": [], "defendants": []},
+                },
+            }
+            (county_dir / f"fixture-{i}.json").write_text(__import__("json").dumps(fixture))
+
+        # Mock run_live_extraction to avoid needing an API key
+        monkeypatch.setattr(
+            "eval_enrichment.run_live_extraction",
+            lambda fixtures, model: [
+                {
+                    "fixture_id": f["fixture_id"],
+                    "county": f["county"],
+                    "extraction_result": {
+                        "case_title": "Test v. Case",
+                        "motion_type": "msj",
+                        "outcome": "granted",
+                        "parties": {"plaintiffs": [], "defendants": []},
+                    },
+                    "latency_ms": 100,
+                    "error": None,
+                }
+                for f in fixtures
+            ],
+        )
+
+        from eval_enrichment import main
+
+        monkeypatch.setattr(
+            "sys.argv",
+            ["eval_enrichment", "--live", "--fixtures", str(tmp_path)],
+        )
+        exit_code = main()
+        assert exit_code == 0
+
+    def test_live_mode_skips_count_check_with_county_filter(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """--live --county should skip the minimum fixture count check.
+
+        Individual counties have fewer than MIN_TOTAL_FIXTURES fixtures,
+        so the count check must not apply when a county filter is active.
+        """
+        # Create a fixtures dir with only 3 fixtures in one county
+        county_dir = tmp_path / "test_county"
+        county_dir.mkdir()
+        for i in range(3):
+            fixture = {
+                "ruling_text": f"Test ruling {i}",
+                "expected": {
+                    "case_title": "Test v. Case",
+                    "motion_type": "msj",
+                    "outcome": "granted",
+                    "parties": {"plaintiffs": [], "defendants": []},
+                },
+            }
+            (county_dir / f"fixture-{i}.json").write_text(__import__("json").dumps(fixture))
+
+        # Mock run_live_extraction to avoid needing an API key
+        monkeypatch.setattr(
+            "eval_enrichment.run_live_extraction",
+            lambda fixtures, model: [
+                {
+                    "fixture_id": f["fixture_id"],
+                    "county": f["county"],
+                    "extraction_result": {
+                        "case_title": "Test v. Case",
+                        "motion_type": "msj",
+                        "outcome": "granted",
+                        "parties": {"plaintiffs": [], "defendants": []},
+                    },
+                    "latency_ms": 100,
+                    "error": None,
+                }
+                for f in fixtures
+            ],
+        )
+
+        from eval_enrichment import main
+
+        monkeypatch.setattr(
+            "sys.argv",
+            [
+                "eval_enrichment",
+                "--live",
+                "--county",
+                "test_county",
+                "--fixtures",
+                str(tmp_path),
+            ],
+        )
+        exit_code = main()
+        assert exit_code == 0
