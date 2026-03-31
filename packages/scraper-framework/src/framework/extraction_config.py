@@ -38,6 +38,7 @@ from .prompts import (  # noqa: F401
     SAN_DIEGO_SYSTEM_PROMPT,
     SAN_FRANCISCO_SYSTEM_PROMPT,
     SANTA_CLARA_SYSTEM_PROMPT,
+    VENTURA_FRAMEWORK_PROMPT,
     VENTURA_SYSTEM_PROMPT,
 )
 
@@ -125,7 +126,7 @@ _COUNTY_CONFIGS: dict[tuple[str, str], CountyExtractionConfig] = {
     ),
     ("CA", "VENTURA"): CountyExtractionConfig(
         method=ExtractionMethod.LLM,
-        system_prompt=VENTURA_SYSTEM_PROMPT,
+        system_prompt=VENTURA_FRAMEWORK_PROMPT,
         provider="google",
         model="gemini-2.5-flash-lite",
         max_output_tokens=32768,

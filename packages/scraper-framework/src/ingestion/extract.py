@@ -22,7 +22,9 @@ _OUTCOME_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"\bgranted\s+in\s+part\b", re.IGNORECASE), "granted_in_part"),
     (re.compile(r"\bdenied\s+in\s+part\b", re.IGNORECASE), "denied_in_part"),
     (re.compile(r"\bgranted\b", re.IGNORECASE), "granted"),
+    (re.compile(r"\bgrants\b", re.IGNORECASE), "granted"),
     (re.compile(r"\bdenied\b", re.IGNORECASE), "denied"),
+    (re.compile(r"\bdenies\b", re.IGNORECASE), "denied"),
     # --- Demurrer-specific outcomes (#2022) ---
     # "SUSTAIN" / "Sustain" (present tense, common in Riverside demurrers).
     # Must come after "granted" to avoid shadowing explicit grant language.
@@ -30,7 +32,7 @@ _OUTCOME_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     # "OVERRULE" / "Overrule" (present tense, common in Riverside demurrers).
     (re.compile(r"\boverrule[d]?\b", re.IGNORECASE), "denied"),
     (re.compile(r"\bmoot\b", re.IGNORECASE), "moot"),
-    (re.compile(r"\bcontinued?\b", re.IGNORECASE), "continued"),
+    (re.compile(r"\bcontinue[ds]?\b", re.IGNORECASE), "continued"),
     (re.compile(r"\boff[\s-]?calendar\b", re.IGNORECASE), "off_calendar"),
     (re.compile(r"\bsubmitted\b", re.IGNORECASE), "submitted"),
     # --- Riverside-specific patterns (#2022) ---

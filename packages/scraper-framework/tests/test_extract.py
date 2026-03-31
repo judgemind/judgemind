@@ -80,6 +80,25 @@ class TestExtractOutcome:
         text = "The motion for summary judgment is granted in part and denied in part."
         assert extract_outcome(text) == "granted_in_part"
 
+    # --- Present-tense verb forms (#2271) ---
+
+    def test_grants_present_tense(self) -> None:
+        """'GRANTS' should match as 'granted' (#2271)."""
+        assert extract_outcome("The Court GRANTS the motion.") == "granted"
+
+    def test_denies_present_tense(self) -> None:
+        """'denies' should match as 'denied' (#2271)."""
+        assert extract_outcome("The Court denies the petition.") == "denied"
+
+    def test_continues_present_tense(self) -> None:
+        """'continues' should match as 'continued' (#2271)."""
+        text = "The Court, on its own motion, continues this matter to 5/5/26."
+        assert extract_outcome(text) == "continued"
+
+    def test_continue_base_form(self) -> None:
+        """'continue' (base form) should still match as 'continued'."""
+        assert extract_outcome("The Court will continue this matter.") == "continued"
+
 
 # ---------------------------------------------------------------------------
 # Outcome normalization (#1878)

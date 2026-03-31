@@ -1595,8 +1595,34 @@ class IngestionWorker:
         extracted_rulings = None
         extraction_method = "llm"  # Track which path was used for logging.
 
+        # Check if the county has a configured extraction method (#2271).
+        # Counties with ExtractionMethod.LLM (e.g. Ventura) have custom
+        # text-based prompts that extract structured fields including outcome.
+        # The multimodal per-page extraction does NOT extract outcome or
+        # motion_type, so using it for LLM-configured counties causes field
+        # regressions.  Only use multimodal for counties explicitly configured
+        # as ExtractionMethod.MULTIMODAL (e.g. Orange County).
+        # Counties with ExtractionMethod.NONE skip framework extraction entirely.
+        from framework.extraction_config import ExtractionMethod, get_county_extraction_config
+
+        county_config = get_county_extraction_config(state, county)
+
+        # NONE means the scraper handles everything — no framework extraction.
+        if county_config is not None and county_config.method == ExtractionMethod.NONE:
+            logger.debug(
+                "Skipping framework extraction — county uses ExtractionMethod.NONE",
+                extra={"document_id": document_id, "county": county},
+            )
+            return False
+
+        use_multimodal = (
+            county_config is not None and county_config.method == ExtractionMethod.MULTIMODAL
+        ) or county_config is None  # Default: allow multimodal for unconfigured counties
+
         # Multimodal path: per-page image extraction from raw PDF (#1590).
-        if raw_pdf_bytes is not None:
+        # Only used when the county is configured for multimodal extraction
+        # or has no specific config (default behavior).
+        if raw_pdf_bytes is not None and use_multimodal:
             multimodal_extractor = self._get_multimodal_extractor()
             if multimodal_extractor is not None:
                 try:
@@ -1623,6 +1649,15 @@ class IngestionWorker:
                         },
                     )
                     extracted_rulings = None
+        elif raw_pdf_bytes is not None and not use_multimodal:
+            logger.debug(
+                "Skipping multimodal extraction — county uses text-based LLM",
+                extra={
+                    "document_id": document_id,
+                    "county": county,
+                    "state": state,
+                },
+            )
 
         # Text-based fallback (or primary path when no raw PDF available).
         # Use `is None` to distinguish between failed extraction (None) and

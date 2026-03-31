@@ -16,7 +16,7 @@ from .san_bernardino import SAN_BERNARDINO_SYSTEM_PROMPT
 from .san_diego import SAN_DIEGO_SYSTEM_PROMPT
 from .san_francisco import SAN_FRANCISCO_SYSTEM_PROMPT
 from .santa_clara import SANTA_CLARA_SYSTEM_PROMPT
-from .ventura import VENTURA_SYSTEM_PROMPT
+from .ventura import VENTURA_FRAMEWORK_PROMPT, VENTURA_SYSTEM_PROMPT
 
 __all__ = [
     "CONTRA_COSTA_SYSTEM_PROMPT",
@@ -26,5 +26,6 @@ __all__ = [
     "SAN_DIEGO_SYSTEM_PROMPT",
     "SAN_FRANCISCO_SYSTEM_PROMPT",
     "SANTA_CLARA_SYSTEM_PROMPT",
+    "VENTURA_FRAMEWORK_PROMPT",
     "VENTURA_SYSTEM_PROMPT",
 ]

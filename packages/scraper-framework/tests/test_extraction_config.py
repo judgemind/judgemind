@@ -16,6 +16,7 @@ from framework.extraction_config import (
     SAN_BERNARDINO_SYSTEM_PROMPT,
     SAN_FRANCISCO_SYSTEM_PROMPT,
     SANTA_CLARA_SYSTEM_PROMPT,
+    VENTURA_FRAMEWORK_PROMPT,
     VENTURA_SYSTEM_PROMPT,
     CountyExtractionConfig,
     ExtractionMethod,
@@ -674,6 +675,95 @@ class TestVenturaSystemPrompt:
         assert "exclude" in prompt_lower
         assert "header" in prompt_lower
         assert "footer" in prompt_lower
+
+
+# ---------------------------------------------------------------------------
+# VENTURA_FRAMEWORK_PROMPT content validation (#2271)
+# ---------------------------------------------------------------------------
+
+
+class TestVenturaFrameworkPrompt:
+    """Verify the Ventura framework prompt produces the correct format."""
+
+    def test_mentions_ventura(self) -> None:
+        assert "ventura" in VENTURA_FRAMEWORK_PROMPT.lower()
+
+    def test_uses_rulings_array_format(self) -> None:
+        """Framework prompt must output {"rulings": [...]} format (#2271)."""
+        assert '"rulings"' in VENTURA_FRAMEWORK_PROMPT
+        assert "extracted_case_number" in VENTURA_FRAMEWORK_PROMPT
+        assert "extracted_case_title" in VENTURA_FRAMEWORK_PROMPT
+        assert "extracted_parties" in VENTURA_FRAMEWORK_PROMPT
+
+    def test_extracts_outcome(self) -> None:
+        """Framework prompt must extract outcome (the field missing in #2271)."""
+        assert '"outcome"' in VENTURA_FRAMEWORK_PROMPT
+
+    def test_extracts_motion_type(self) -> None:
+        """Framework prompt must extract motion_type."""
+        assert '"motion_type"' in VENTURA_FRAMEWORK_PROMPT
+
+    def test_extracts_judge_name(self) -> None:
+        """Framework prompt must extract judge name at document level."""
+        assert "extracted_judge_name" in VENTURA_FRAMEWORK_PROMPT
+
+    def test_extracts_hearing_date(self) -> None:
+        """Framework prompt must extract hearing date."""
+        assert '"hearing_date"' in VENTURA_FRAMEWORK_PROMPT
+
+    def test_extracts_department(self) -> None:
+        """Framework prompt must extract department."""
+        assert '"department"' in VENTURA_FRAMEWORK_PROMPT
+
+    def test_mentions_outcome_taxonomy(self) -> None:
+        """Framework prompt includes outcome taxonomy values."""
+        prompt_lower = VENTURA_FRAMEWORK_PROMPT.lower()
+        assert "granted" in prompt_lower
+        assert "denied" in prompt_lower
+        assert "continued" in prompt_lower
+        assert "off_calendar" in prompt_lower
+
+    def test_mentions_parties(self) -> None:
+        """Framework prompt instructs party extraction."""
+        prompt_lower = VENTURA_FRAMEWORK_PROMPT.lower()
+        assert "plaintiff" in prompt_lower
+        assert "defendant" in prompt_lower
+
+    def test_mentions_case_number_format(self) -> None:
+        """Framework prompt describes Ventura case number patterns."""
+        assert "2024CUBC038456" in VENTURA_FRAMEWORK_PROMPT
+
+    def test_mentions_probate_handling(self) -> None:
+        """Framework prompt handles probate/conservatorship documents."""
+        prompt_lower = VENTURA_FRAMEWORK_PROMPT.lower()
+        assert "probate" in prompt_lower
+
+    def test_mentions_json_output(self) -> None:
+        """Framework prompt specifies JSON output format."""
+        assert "json" in VENTURA_FRAMEWORK_PROMPT.lower()
+
+    def test_different_from_scraper_prompt(self) -> None:
+        """Framework prompt is different from scraper prompt (different format)."""
+        # Scraper uses flat JSON, framework uses rulings array
+        assert VENTURA_FRAMEWORK_PROMPT != VENTURA_SYSTEM_PROMPT
+        # Framework has rulings array, scraper does not
+        assert '"rulings"' in VENTURA_FRAMEWORK_PROMPT
+        # Both share outcome taxonomy content
+        assert "granted_in_part" in VENTURA_FRAMEWORK_PROMPT
+        assert "granted_in_part" in VENTURA_SYSTEM_PROMPT
+
+
+class TestVenturaConfigUsesFrameworkPrompt:
+    """Verify the Ventura extraction config uses the framework prompt (#2271)."""
+
+    def test_ventura_config_uses_framework_prompt(self) -> None:
+        """Ventura config must use VENTURA_FRAMEWORK_PROMPT, not VENTURA_SYSTEM_PROMPT."""
+        config = get_county_extraction_config("CA", "Ventura")
+        assert config is not None
+        # The config must use the framework prompt that produces {"rulings": [...]}
+        assert config.system_prompt is VENTURA_FRAMEWORK_PROMPT
+        # It must NOT use the scraper's flat JSON prompt
+        assert config.system_prompt is not VENTURA_SYSTEM_PROMPT
 
 
 # ---------------------------------------------------------------------------
