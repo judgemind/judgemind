@@ -12,6 +12,50 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 
+# ---------------------------------------------------------------------------
+# Taxonomy constants — mirror llm_enrichment.py's MotionType/OutcomeType
+# ---------------------------------------------------------------------------
+# Fixtures may contain motion_type values outside the enrichment taxonomy
+# (e.g. "anti_slapp", "motion_to_consolidate").  The LLM enrichment module
+# maps these to "other".  The scorer must do the same normalization before
+# comparing so that a correct "other" extraction is not penalized.
+
+VALID_MOTION_TYPES: frozenset[str] = frozenset(
+    {
+        "msj",
+        "mtd",
+        "demurrer",
+        "mil",
+        "motion_to_compel",
+        "motion_to_strike",
+        "motion_for_attorney_fees",
+        "motion_to_quash",
+        "motion_for_summary_adjudication",
+        "motion_to_compel_arbitration",
+        "motion_for_new_trial",
+        "motion_to_tax_costs",
+        "motion_for_reconsideration",
+        "motion_to_be_relieved_as_counsel",
+        "motion_pro_hac_vice",
+        "petition",
+        "other",
+    }
+)
+
+VALID_OUTCOMES: frozenset[str] = frozenset(
+    {
+        "granted",
+        "denied",
+        "granted_in_part",
+        "denied_in_part",
+        "moot",
+        "continued",
+        "off_calendar",
+        "submitted",
+        "other",
+    }
+)
+
 
 # ---------------------------------------------------------------------------
 # Data classes
@@ -110,6 +154,25 @@ def _strip_et_al(val: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+def normalize_to_taxonomy(
+    value: str | None,
+    valid_values: frozenset[str],
+) -> str | None:
+    """Normalize a value to the enrichment taxonomy.
+
+    If ``value`` is not in the taxonomy, map it to ``"other"``.
+    This ensures that fixtures with non-taxonomy expected values
+    (e.g. ``"anti_slapp"``) are correctly compared against LLM output
+    (which always returns taxonomy values like ``"other"``).
+    """
+    if value is None:
+        return None
+    v_lower = value.strip().lower()
+    if v_lower in valid_values:
+        return v_lower
+    return "other"
+
+
 def compare_exact(expected: str | None, extracted: str | None) -> bool:
     """Case-insensitive exact match for motion_type and outcome."""
     if expected is None and extracted is None:
@@ -117,6 +180,47 @@ def compare_exact(expected: str | None, extracted: str | None) -> bool:
     if expected is None or extracted is None:
         return False
     return expected.strip().lower() == extracted.strip().lower()
+
+
+def compare_with_alternatives(
+    expected: str | None,
+    extracted: str | None,
+    alternatives: list[str] | None,
+    valid_values: frozenset[str] | None = None,
+) -> bool:
+    """Compare with taxonomy normalization and acceptable alternatives.
+
+    Steps:
+    1. Normalize ``expected`` and ``extracted`` to the taxonomy (if
+       ``valid_values`` is provided).
+    2. Check exact match.
+    3. Check if ``extracted`` matches any of the ``alternatives``
+       (also normalized to the taxonomy).
+    """
+    # Normalize to taxonomy
+    if valid_values is not None:
+        expected = normalize_to_taxonomy(expected, valid_values)
+        extracted_norm = normalize_to_taxonomy(extracted, valid_values)
+    else:
+        expected = expected.strip().lower() if expected else expected
+        extracted_norm = extracted.strip().lower() if extracted else extracted
+
+    # Direct match
+    if compare_exact(expected, extracted_norm):
+        return True
+
+    # Check alternatives
+    if alternatives:
+        for alt in alternatives:
+            alt_norm = (
+                normalize_to_taxonomy(alt, valid_values)
+                if valid_values
+                else alt.strip().lower()
+            )
+            if compare_exact(alt_norm, extracted_norm):
+                return True
+
+    return False
 
 
 def _levenshtein_ratio(s1: str, s2: str) -> float:
@@ -263,6 +367,7 @@ def score_fixture(
     county: str,
     expected: dict,
     extraction_result: dict | None,
+    acceptable_alternatives: dict | None = None,
 ) -> FixtureScore:
     """Score a single enrichment fixture against expected values.
 
@@ -277,35 +382,65 @@ def score_fixture(
     extraction_result : dict | None
         The enrichment extraction result dict with keys:
         ``case_title``, ``motion_type``, ``outcome``, ``parties``.
+    acceptable_alternatives : dict | None
+        Optional dict of field_name -> list[str] with acceptable
+        alternative values for ambiguous fixtures.
 
     Returns
     -------
     FixtureScore
     """
     score = FixtureScore(fixture_id=fixture_id, county=county)
+    alternatives = acceptable_alternatives or {}
 
     if extraction_result is None:
         score.error = "No extraction result"
         return score
 
-    # Score exact-match fields
+    # Map fields to their taxonomy sets for normalization
+    _FIELD_TAXONOMY: dict[str, frozenset[str]] = {
+        "motion_type": VALID_MOTION_TYPES,
+        "outcome": VALID_OUTCOMES,
+    }
+
+    # Score exact-match fields with taxonomy normalization
     for fld in _EXACT_FIELDS:
         exp_val = expected.get(fld)
         ext_val = extraction_result.get(fld)
-        match = compare_exact(exp_val, ext_val)
+        field_alts = alternatives.get(fld)
+        taxonomy = _FIELD_TAXONOMY.get(fld)
+
+        match = compare_with_alternatives(
+            exp_val,
+            ext_val,
+            field_alts,
+            valid_values=taxonomy,
+        )
+        # Show the normalized expected value in the score for clarity
+        display_expected = exp_val
+        if taxonomy and exp_val is not None:
+            normalized = normalize_to_taxonomy(exp_val, taxonomy)
+            if normalized != exp_val:
+                display_expected = f"{exp_val} (normalized: {normalized})"
         score.field_scores.append(
             FieldScore(
                 field_name=fld,
-                expected=exp_val,
+                expected=display_expected,
                 extracted=ext_val,
                 match=match,
             )
         )
 
-    # Score case_title (fuzzy match)
+    # Score case_title (fuzzy match + alternatives)
     exp_title = expected.get("case_title")
     ext_title = extraction_result.get("case_title")
+    title_alts = alternatives.get("case_title")
     title_match = compare_case_title(exp_title, ext_title)
+    if not title_match and title_alts:
+        for alt in title_alts:
+            if compare_case_title(alt, ext_title):
+                title_match = True
+                break
     score.field_scores.append(
         FieldScore(
             field_name="case_title",

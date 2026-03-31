@@ -28,7 +28,9 @@ from pathlib import Path
 # Resolve paths relative to repo root
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent.parent
-DEFAULT_FIXTURES_DIR = REPO_ROOT / "tests" / "fixtures" / "enrichment"
+DEFAULT_FIXTURES_DIR = (
+    REPO_ROOT / "packages" / "scraper-framework" / "tests" / "fixtures" / "enrichment"
+)
 RESULTS_DIR = SCRIPT_DIR / "results" / "enrichment"
 
 # Add repo to path for imports
@@ -63,6 +65,7 @@ def load_fixtures(
     - ``expected``: the expected extraction result
     - ``source_doc``: optional S3 URI for provenance
     - ``notes``: optional notes
+    - ``acceptable_alternatives``: optional dict of field -> list[str]
     """
     fixtures: list[dict] = []
 
@@ -88,6 +91,7 @@ def load_fixtures(
                         "expected": data.get("expected", {}),
                         "source_doc": data.get("source_doc", ""),
                         "notes": data.get("notes", ""),
+                        "acceptable_alternatives": data.get("acceptable_alternatives"),
                     }
                 )
             except (json.JSONDecodeError, OSError) as e:
@@ -209,10 +213,14 @@ def score_results(
     fixtures: list[dict],
 ) -> list[FixtureScore]:
     """Score extraction results against expected fixtures."""
-    # Build a lookup for expected values by fixture_id
+    # Build lookups by fixture_id
     expected_by_id: dict[str, dict] = {}
+    alternatives_by_id: dict[str, dict | None] = {}
     for fixture in fixtures:
         expected_by_id[fixture["fixture_id"]] = fixture["expected"]
+        alternatives_by_id[fixture["fixture_id"]] = fixture.get(
+            "acceptable_alternatives"
+        )
 
     fixture_scores: list[FixtureScore] = []
 
@@ -220,6 +228,7 @@ def score_results(
         fixture_id = result["fixture_id"]
         county = result["county"]
         expected = expected_by_id.get(fixture_id, {})
+        alternatives = alternatives_by_id.get(fixture_id)
         extraction = result.get("extraction_result")
 
         if extraction is None:
@@ -229,7 +238,13 @@ def score_results(
                 error=result.get("error", "No extraction result"),
             )
         else:
-            fs = score_fixture(fixture_id, county, expected, extraction)
+            fs = score_fixture(
+                fixture_id,
+                county,
+                expected,
+                extraction,
+                acceptable_alternatives=alternatives,
+            )
 
         fixture_scores.append(fs)
 

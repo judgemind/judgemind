@@ -16,6 +16,8 @@ SCRIPTS_EVAL_DIR = Path(__file__).resolve().parent.parent.parent.parent / "scrip
 sys.path.insert(0, str(SCRIPTS_EVAL_DIR))
 
 from eval_enrichment_scorer import (  # noqa: E402
+    VALID_MOTION_TYPES,
+    VALID_OUTCOMES,
     EnrichmentEvalSummary,
     FieldScore,
     FixtureScore,
@@ -23,9 +25,11 @@ from eval_enrichment_scorer import (  # noqa: E402
     aggregate_scores,
     compare_case_title,
     compare_exact,
+    compare_with_alternatives,
     compute_party_recall,
     format_json_report,
     format_text_report,
+    normalize_to_taxonomy,
     score_fixture,
 )
 
@@ -57,6 +61,104 @@ class TestCompareExact:
     def test_exact_none_one(self) -> None:
         assert compare_exact("msj", None) is False
         assert compare_exact(None, "msj") is False
+
+
+# ---------------------------------------------------------------------------
+# normalize_to_taxonomy tests
+# ---------------------------------------------------------------------------
+
+
+class TestNormalizeToTaxonomy:
+    """Tests for taxonomy normalization."""
+
+    def test_valid_motion_type_unchanged(self) -> None:
+        assert normalize_to_taxonomy("msj", VALID_MOTION_TYPES) == "msj"
+        assert normalize_to_taxonomy("demurrer", VALID_MOTION_TYPES) == "demurrer"
+        assert normalize_to_taxonomy("other", VALID_MOTION_TYPES) == "other"
+
+    def test_invalid_motion_type_maps_to_other(self) -> None:
+        assert normalize_to_taxonomy("anti_slapp", VALID_MOTION_TYPES) == "other"
+        assert normalize_to_taxonomy("motion_to_consolidate", VALID_MOTION_TYPES) == "other"
+        assert normalize_to_taxonomy("default_judgment", VALID_MOTION_TYPES) == "other"
+        assert normalize_to_taxonomy("ex_parte_application", VALID_MOTION_TYPES) == "other"
+
+    def test_case_insensitive(self) -> None:
+        assert normalize_to_taxonomy("MSJ", VALID_MOTION_TYPES) == "msj"
+        assert normalize_to_taxonomy("Demurrer", VALID_MOTION_TYPES) == "demurrer"
+
+    def test_whitespace_stripped(self) -> None:
+        assert normalize_to_taxonomy("  msj  ", VALID_MOTION_TYPES) == "msj"
+
+    def test_none_returns_none(self) -> None:
+        assert normalize_to_taxonomy(None, VALID_MOTION_TYPES) is None
+
+    def test_valid_outcome_unchanged(self) -> None:
+        assert normalize_to_taxonomy("granted", VALID_OUTCOMES) == "granted"
+        assert normalize_to_taxonomy("denied", VALID_OUTCOMES) == "denied"
+        assert normalize_to_taxonomy("off_calendar", VALID_OUTCOMES) == "off_calendar"
+
+    def test_invalid_outcome_maps_to_other(self) -> None:
+        assert normalize_to_taxonomy("sustained", VALID_OUTCOMES) == "other"
+        assert normalize_to_taxonomy("overruled", VALID_OUTCOMES) == "other"
+
+
+# ---------------------------------------------------------------------------
+# compare_with_alternatives tests
+# ---------------------------------------------------------------------------
+
+
+class TestCompareWithAlternatives:
+    """Tests for comparison with taxonomy normalization and alternatives."""
+
+    def test_direct_match(self) -> None:
+        assert compare_with_alternatives("msj", "msj", None, VALID_MOTION_TYPES) is True
+
+    def test_non_taxonomy_expected_matches_other(self) -> None:
+        """If expected is 'anti_slapp' (not in taxonomy), LLM returning 'other' is correct."""
+        assert compare_with_alternatives("anti_slapp", "other", None, VALID_MOTION_TYPES) is True
+
+    def test_non_taxonomy_expected_vs_taxonomy_mismatch(self) -> None:
+        """If expected is 'anti_slapp' (-> other) but LLM returns 'msj', it's wrong."""
+        assert compare_with_alternatives("anti_slapp", "msj", None, VALID_MOTION_TYPES) is False
+
+    def test_alternative_match(self) -> None:
+        """If expected is 'msj' but LLM returns 'motion_for_summary_adjudication',
+        and alternatives include it, it should match."""
+        assert (
+            compare_with_alternatives(
+                "msj",
+                "motion_for_summary_adjudication",
+                ["motion_for_summary_adjudication"],
+                VALID_MOTION_TYPES,
+            )
+            is True
+        )
+
+    def test_alternative_with_taxonomy_normalization(self) -> None:
+        """Alternatives that are outside taxonomy should be normalized to 'other'."""
+        # expected='msj', alternatives=['default_judgment'] (-> other)
+        # LLM returns 'other' -> matches the normalized alternative
+        assert (
+            compare_with_alternatives(
+                "msj",
+                "other",
+                ["default_judgment"],
+                VALID_MOTION_TYPES,
+            )
+            is True
+        )
+
+    def test_no_match_without_alternatives(self) -> None:
+        assert compare_with_alternatives("msj", "mtd", None, VALID_MOTION_TYPES) is False
+
+    def test_none_values(self) -> None:
+        assert compare_with_alternatives(None, None, None, VALID_MOTION_TYPES) is True
+        assert compare_with_alternatives("msj", None, None, VALID_MOTION_TYPES) is False
+
+    def test_without_taxonomy(self) -> None:
+        """When no valid_values provided, does plain lowercase comparison."""
+        assert compare_with_alternatives("abc", "abc", None) is True
+        assert compare_with_alternatives("abc", "def", ["def"]) is True
 
 
 # ---------------------------------------------------------------------------
@@ -294,6 +396,74 @@ class TestScoreFixture:
         score = score_fixture("la/test-1", "la", expected, extraction)
         motion_score = next(f for f in score.field_scores if f.field_name == "motion_type")
         assert motion_score.match is False
+
+    def test_non_taxonomy_motion_type_normalized_to_other(self) -> None:
+        """If fixture expects 'anti_slapp' and LLM returns 'other', it matches."""
+        expected = {
+            "motion_type": "anti_slapp",
+            "outcome": "granted",
+            "case_title": "Test v. Case",
+            "parties": {"plaintiffs": [], "defendants": []},
+        }
+        extraction = {
+            "motion_type": "other",
+            "outcome": "granted",
+            "case_title": "Test v. Case",
+            "parties": {"plaintiffs": [], "defendants": []},
+        }
+        score = score_fixture("la/test-1", "la", expected, extraction)
+        motion_score = next(f for f in score.field_scores if f.field_name == "motion_type")
+        assert motion_score.match is True
+
+    def test_acceptable_alternatives_used(self) -> None:
+        """Acceptable alternatives should be checked when primary doesn't match."""
+        expected = {
+            "motion_type": "msj",
+            "outcome": "granted",
+            "case_title": "Test v. Case",
+            "parties": {"plaintiffs": [], "defendants": []},
+        }
+        extraction = {
+            "motion_type": "motion_for_summary_adjudication",
+            "outcome": "granted",
+            "case_title": "Test v. Case",
+            "parties": {"plaintiffs": [], "defendants": []},
+        }
+        alternatives = {"motion_type": ["motion_for_summary_adjudication"]}
+        score = score_fixture(
+            "la/test-1",
+            "la",
+            expected,
+            extraction,
+            acceptable_alternatives=alternatives,
+        )
+        motion_score = next(f for f in score.field_scores if f.field_name == "motion_type")
+        assert motion_score.match is True
+
+    def test_case_title_alternatives(self) -> None:
+        """Case title alternatives should be checked with fuzzy matching."""
+        expected = {
+            "motion_type": "msj",
+            "outcome": "granted",
+            "case_title": "Smith v. Jones",
+            "parties": {"plaintiffs": [], "defendants": []},
+        }
+        extraction = {
+            "motion_type": "msj",
+            "outcome": "granted",
+            "case_title": "Jane Smith v. Robert Jones",
+            "parties": {"plaintiffs": [], "defendants": []},
+        }
+        alternatives = {"case_title": ["Jane Smith v. Robert Jones"]}
+        score = score_fixture(
+            "la/test-1",
+            "la",
+            expected,
+            extraction,
+            acceptable_alternatives=alternatives,
+        )
+        title_score = next(f for f in score.field_scores if f.field_name == "case_title")
+        assert title_score.match is True
 
 
 # ---------------------------------------------------------------------------
@@ -540,23 +710,18 @@ class TestFormatJsonReport:
 class TestFixtureLoading:
     """Tests for loading and scoring enrichment fixtures end-to-end."""
 
-    def test_load_and_score_sample_fixtures(self) -> None:
-        """Integration test: load sample fixtures and score them."""
-        fixtures_dir = (
-            Path(__file__).resolve().parent.parent.parent.parent
-            / "tests"
-            / "fixtures"
-            / "enrichment"
-        )
+    def test_load_and_score_real_fixtures(self) -> None:
+        """Integration test: load real fixtures and score a perfect extraction."""
+        fixtures_dir = Path(__file__).resolve().parent / "fixtures" / "enrichment"
         if not fixtures_dir.exists():
-            pytest.skip("Sample fixtures not found")
+            pytest.skip("Enrichment fixtures not found")
 
         # Import the CLI module's load function
         sys.path.insert(0, str(SCRIPTS_EVAL_DIR))
         from eval_enrichment import load_fixtures
 
         fixtures = load_fixtures(fixtures_dir)
-        assert len(fixtures) > 0, "Should find at least one fixture"
+        assert len(fixtures) >= 100, f"Expected 100+ fixtures, found {len(fixtures)}"
 
         # Each fixture should have the required keys
         for f in fixtures:
@@ -564,15 +729,35 @@ class TestFixtureLoading:
             assert "county" in f
             assert "ruling_text" in f
             assert "expected" in f
+            # acceptable_alternatives may or may not be present
+            assert "acceptable_alternatives" in f  # key exists (may be None)
 
-        # Simulate extraction results (perfect match) and score
+        # Simulate extraction results (perfect match) and score.
+        # When expected values are outside the taxonomy, the "perfect"
+        # extraction should return the normalized value ("other").
+        from eval_enrichment_scorer import VALID_MOTION_TYPES, VALID_OUTCOMES
+
         results = []
         for f in fixtures:
+            # Build a "perfect" extraction by normalizing expected values
+            expected = f["expected"]
+            mt = expected.get("motion_type")
+            if mt and mt.strip().lower() not in VALID_MOTION_TYPES:
+                mt = "other"
+            oc = expected.get("outcome")
+            if oc and oc.strip().lower() not in VALID_OUTCOMES:
+                oc = "other"
+            perfect_extraction = {
+                "case_title": expected.get("case_title"),
+                "motion_type": mt,
+                "outcome": oc,
+                "parties": expected.get("parties", {}),
+            }
             results.append(
                 {
                     "fixture_id": f["fixture_id"],
                     "county": f["county"],
-                    "extraction_result": f["expected"],
+                    "extraction_result": perfect_extraction,
                     "latency_ms": 100,
                     "error": None,
                 }
@@ -588,22 +773,31 @@ class TestFixtureLoading:
 
     def test_load_fixtures_county_filter(self) -> None:
         """Test that county filter works."""
-        fixtures_dir = (
-            Path(__file__).resolve().parent.parent.parent.parent
-            / "tests"
-            / "fixtures"
-            / "enrichment"
-        )
+        fixtures_dir = Path(__file__).resolve().parent / "fixtures" / "enrichment"
         if not fixtures_dir.exists():
-            pytest.skip("Sample fixtures not found")
+            pytest.skip("Enrichment fixtures not found")
 
         sys.path.insert(0, str(SCRIPTS_EVAL_DIR))
         from eval_enrichment import load_fixtures
 
-        la_fixtures = load_fixtures(fixtures_dir, county_filter="la")
+        la_fixtures = load_fixtures(fixtures_dir, county_filter="los_angeles")
         for f in la_fixtures:
-            assert f["county"] == "la"
+            assert f["county"] == "los_angeles"
 
-        oc_fixtures = load_fixtures(fixtures_dir, county_filter="oc")
+        oc_fixtures = load_fixtures(fixtures_dir, county_filter="orange")
         for f in oc_fixtures:
-            assert f["county"] == "oc"
+            assert f["county"] == "orange"
+
+    def test_load_fixtures_includes_acceptable_alternatives(self) -> None:
+        """Verify that acceptable_alternatives are loaded from fixture JSON."""
+        fixtures_dir = Path(__file__).resolve().parent / "fixtures" / "enrichment"
+        if not fixtures_dir.exists():
+            pytest.skip("Enrichment fixtures not found")
+
+        sys.path.insert(0, str(SCRIPTS_EVAL_DIR))
+        from eval_enrichment import load_fixtures
+
+        fixtures = load_fixtures(fixtures_dir)
+        # At least some fixtures should have acceptable_alternatives
+        with_alts = [f for f in fixtures if f.get("acceptable_alternatives")]
+        assert len(with_alts) >= 1, "Expected at least 1 fixture with acceptable_alternatives"
