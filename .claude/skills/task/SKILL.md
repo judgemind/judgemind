@@ -6,7 +6,7 @@ maxTurns: 200
 
 # /task skill
 
-Pick up one issue from the Judgemind backlog and complete it autonomously. Do not ask for confirmation at any point — work through every step and stop only when the PR is green and review has been requested (or when an investigation task has posted its findings and unblocked any dependents).
+Pick up one issue from the Judgemind backlog and complete it autonomously. Do not ask for confirmation at any point — work through every step and stop only when the PR is green and review has been requested (or when an investigation task has posted its findings, closed the issue, and unblocked any dependents).
 
 **IMPORTANT — No backgrounding.** Do not use `run_in_background` on any Bash command, Agent tool call, or any other operation anywhere in a `/task` agent. All work runs synchronously in the foreground. The `/task` agent is already a background subagent from the dispatcher's perspective — further backgrounding causes completion notifications to surface in the wrong context (the dispatcher), leading to confusion and lost results.
 
@@ -157,7 +157,7 @@ After claiming the issue, create todos using `TaskCreate` to track your major wo
 **For investigation tasks (Path B):**
 1. "Investigate and document findings"
 2. "File follow-up issues"
-3. "Post summary and request review"
+3. "Post summary and close issue"
 4. "Unblock dependent issues"
 5. "Retrospective" — identify workflow efficiencies and preventative measures
 
@@ -504,11 +504,27 @@ Do not just list recommendations — **create GitHub issues** for each concrete 
 
 If the investigation reveals no actionable follow-ups (everything is working as expected), state that explicitly in the findings.
 
-#### B.2 — Post summary and request review
+#### B.2 — Post summary and close the issue
 
-Post a summary comment on the investigation issue listing the findings and linking all follow-up issues created. Add the `status/review` label.
+Post a summary comment on the investigation issue listing the findings and linking all follow-up issues created.
 
-Then unblock any issues that were waiting on this one by running `scripts/unblock-dependents.sh <your-issue>`. The script searches for open issues with `Blocked by #<your-issue>`, checks if all blockers are closed, and if so removes `status/blocked`, adds `agent/ready`, and cleans the `Blocked by` lines from the body. Use `--dry-run` to preview changes first.
+**Close the investigation issue after posting findings.** Investigation issues are fully resolved once findings are documented and follow-up issues are filed. Leaving them open causes duplicate agent work — another agent will pick up the still-open issue and re-investigate.
+
+Write the close comment to `{worktree}/tmp/close_comment.txt`, then post and close:
+```
+gh issue comment <N> --repo judgemind/judgemind --body-file {worktree}/tmp/close_comment.txt
+gh issue close <N> --repo judgemind/judgemind --reason completed
+```
+
+**Special handling for `data-quality-failure` issues:** These are auto-created by the `data-quality-check.yml` workflow when health checks fail. The workflow also auto-closes them when all checks pass. However, during long rebuilds or ongoing remediation, checks may keep failing even after the root cause has been identified and follow-ups filed. The agent MUST close these issues after investigation — the workflow will create a new issue if problems genuinely persist after the follow-ups are resolved. Include in the close comment:
+
+> Investigation complete. Follow-up issues filed: #X, #Y, #Z. Closing this issue — the data quality check workflow will file a new issue if problems persist after remediation.
+
+**For all other investigation issues:** Close with a standard summary comment. Only leave an investigation issue open if it genuinely requires human judgment that cannot be captured in a follow-up issue.
+
+#### B.3 — Unblock dependent issues
+
+Unblock any issues that were waiting on this one by running `scripts/unblock-dependents.sh <your-issue>`. The script searches for open issues with `Blocked by #<your-issue>`, checks if all blockers are closed, and if so removes `status/blocked`, adds `agent/ready`, and cleans the `Blocked by` lines from the body. Use `--dry-run` to preview changes first.
 
 Continue to Step 5.
 
