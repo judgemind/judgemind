@@ -1,5 +1,6 @@
 import DataLoader from 'dataloader';
 import type { Pool } from 'pg';
+import { getJudgeAssignmentsBatch, type JudgeAssignment } from './judge-assignments';
 
 type Row = Record<string, unknown>;
 
@@ -162,6 +163,36 @@ export function createLoaders(pool: Pool) {
     return judgeIds.map((id) => byId.get(id) ?? 0);
   });
 
+  /** Batch-load department assignments for judges.
+   *  Derives assignment history from rulings, with courthouse mapping via county. */
+  const judgeAssignmentsLoader = new DataLoader<string, JudgeAssignment[]>(async (judgeIds) => {
+    // Look up counties for courthouse mapping — reuse the court loader
+    const countyByJudge = new Map<string, string | null>();
+    // First, get judge court_ids
+    const { rows: judgeRows } = await pool.query<{ id: string; court_id: string | null }>(
+      'SELECT id, court_id FROM judges WHERE id = ANY($1)',
+      [judgeIds],
+    );
+    // Batch-load courts for county info
+    const courtIds = [...new Set(judgeRows.filter((j) => j.court_id).map((j) => j.court_id as string))];
+    const courtMap = new Map<string, string>();
+    if (courtIds.length > 0) {
+      const { rows: courtRows } = await pool.query<{ id: string; county: string }>(
+        'SELECT id, county FROM courts WHERE id = ANY($1)',
+        [courtIds],
+      );
+      for (const row of courtRows) {
+        courtMap.set(row.id, row.county);
+      }
+    }
+    for (const judge of judgeRows) {
+      const county = judge.court_id ? (courtMap.get(judge.court_id) ?? null) : null;
+      countyByJudge.set(judge.id, county);
+    }
+
+    return getJudgeAssignmentsBatch(pool, judgeIds, countyByJudge);
+  });
+
   return {
     courtLoader,
     judgeLoader,
@@ -171,6 +202,7 @@ export function createLoaders(pool: Pool) {
     casePartiesLoader,
     latestRulingLoader,
     judgeRulingCountLoader,
+    judgeAssignmentsLoader,
   };
 }
 

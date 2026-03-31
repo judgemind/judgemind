@@ -6,6 +6,7 @@ import {
   computeOverallGrantRate,
   detectParagraphs,
   FORMAT_LABELS,
+  formatAssignmentDateRange,
   formatDate,
   formatDateRange,
   formatJudgeName,
@@ -1375,5 +1376,35 @@ describe('formatDateRange', () => {
 
   it('returns empty string when both are null', () => {
     expect(formatDateRange(null, null)).toBe('');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// formatAssignmentDateRange (#2142 — judge profile assignment history)
+// ---------------------------------------------------------------------------
+
+describe('formatAssignmentDateRange', () => {
+  it('formats a date range with Mon YYYY format and en-dash', () => {
+    const result = formatAssignmentDateRange('2024-03-15', '2026-01-20');
+    expect(result).toContain('Mar 2024');
+    expect(result).toContain('Jan 2026');
+    expect(result).toContain('\u2013'); // en-dash
+  });
+
+  it('returns null when firstSeen is null', () => {
+    expect(formatAssignmentDateRange(null, '2026-03-01')).toBeNull();
+  });
+
+  it('returns null when lastSeen is null', () => {
+    expect(formatAssignmentDateRange('2025-01-15', null)).toBeNull();
+  });
+
+  it('returns null when both are null', () => {
+    expect(formatAssignmentDateRange(null, null)).toBeNull();
+  });
+
+  it('handles same month start and end dates', () => {
+    const result = formatAssignmentDateRange('2025-06-01', '2025-06-30');
+    expect(result).toContain('Jun 2025');
   });
 });
