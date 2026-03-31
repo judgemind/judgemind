@@ -2049,3 +2049,184 @@ class TestMultimodalExtractionPath:
         # Text extractor should NOT have been called — empty list
         # from multimodal is authoritative.
         mock_text.extract.assert_not_called()
+
+    @patch("ingestion.worker.batch_upsert_parties")
+    @patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
+    @patch("ingestion.worker.psycopg")
+    def test_multimodal_skipped_for_llm_configured_county(
+        self,
+        mock_psycopg: MagicMock,
+        mock_resolve_judge: MagicMock,
+        mock_batch_upsert: MagicMock,
+    ) -> None:
+        """When a county is configured for ExtractionMethod.LLM, multimodal is skipped (#2271).
+
+        Ventura and other LLM-configured counties have custom text-based prompts
+        that extract outcome and motion_type. The multimodal per-page prompt does
+        NOT extract these fields, causing field regressions when multimodal is
+        used instead.
+        """
+        worker, _ = _make_worker()
+
+        mock_conn, mock_cur = _make_mock_conn()
+        mock_psycopg.connect.return_value = mock_conn
+        mock_cur.fetchone.side_effect = [
+            ("court-uuid-1",),
+            ("case-uuid-1",),
+            (True,),
+        ]
+
+        # Set up multimodal extractor (should NOT be called for Ventura).
+        mock_multimodal = MagicMock()
+        mock_multimodal.extract_from_pdf.return_value = [
+            ExtractedRuling(
+                extracted_case_number="2024CUBC038456",
+                extracted_case_title="Thompson v. Anderson",
+                ruling_text="The motion is GRANTED.",
+                # Note: no outcome set — this is what multimodal produces
+            ),
+        ]
+        worker._multimodal_extractor = mock_multimodal
+
+        # Set up text extractor (SHOULD be called since county is LLM-configured).
+        mock_text = MagicMock()
+        mock_text.extract.return_value = [
+            ExtractedRuling(
+                extracted_case_number="2024CUBC038456",
+                extracted_case_title="Thompson v. Anderson",
+                ruling_text="The motion is GRANTED.",
+                outcome=ExtractionOutcome.GRANTED,
+            ),
+        ]
+
+        # Use the county-specific extractor cache for Ventura.
+        # Cache key is (provider, model or "", max_chars_per_chunk or 0).
+        worker._county_extractors = {("google", "gemini-2.5-flash-lite", 0): mock_text}
+
+        # Ventura event with raw PDF bytes
+        event = _make_event(
+            state="CA",
+            county="Ventura",
+            content_format="pdf",
+            ruling_text="PDF binary content",
+            scraper_id="rebuild-ca-ventura",
+        )
+        with (
+            patch("ingestion.worker.is_pdf_binary", return_value=True),
+            patch(
+                "ingestion.worker.extract_text_from_pdf",
+                return_value=(
+                    "Case No. 2024CUBC038456\nThompson v. Anderson\nThe motion is GRANTED."
+                ),
+            ),
+        ):
+            worker.process_event(event)
+
+        # Multimodal extractor should NOT have been called.
+        mock_multimodal.extract_from_pdf.assert_not_called()
+        # Text extractor should have been called with the Ventura prompt.
+        mock_text.extract.assert_called_once()
+
+    @patch("ingestion.worker.batch_upsert_parties")
+    @patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
+    @patch("ingestion.worker.psycopg")
+    def test_multimodal_still_used_for_multimodal_configured_county(
+        self,
+        mock_psycopg: MagicMock,
+        mock_resolve_judge: MagicMock,
+        mock_batch_upsert: MagicMock,
+    ) -> None:
+        """Orange County (ExtractionMethod.MULTIMODAL) still uses multimodal (#2271)."""
+        worker, _ = _make_worker()
+
+        mock_conn, mock_cur = _make_mock_conn()
+        mock_psycopg.connect.return_value = mock_conn
+        mock_cur.fetchone.side_effect = [
+            ("court-uuid-1",),
+            ("case-uuid-1",),
+            (True,),
+        ]
+
+        # Set up multimodal extractor (should be called for Orange County).
+        mock_multimodal = MagicMock()
+        mock_multimodal.extract_from_pdf.return_value = [
+            ExtractedRuling(
+                extracted_case_number="2024-01234567",
+                extracted_case_title="Smith v. Jones",
+                ruling_text="The motion is GRANTED.",
+                outcome=ExtractionOutcome.GRANTED,
+            ),
+        ]
+        worker._multimodal_extractor = mock_multimodal
+
+        # Text extractor should NOT be called.
+        mock_text = MagicMock()
+        worker._framework_extractor = mock_text
+
+        # Orange County event (default _make_event uses Orange County)
+        event = _make_event(
+            content_format="pdf",
+            ruling_text="PDF binary content here",
+        )
+        with patch("ingestion.worker.is_pdf_binary", return_value=True):
+            worker.process_event(event)
+
+        # Multimodal extractor should have been called for Orange County.
+        mock_multimodal.extract_from_pdf.assert_called_once()
+        # Text extractor should NOT have been called.
+        mock_text.extract.assert_not_called()
+
+    @patch("ingestion.worker.batch_upsert_parties")
+    @patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
+    @patch("ingestion.worker.psycopg")
+    def test_extraction_none_skips_all_framework_extraction(
+        self,
+        mock_psycopg: MagicMock,
+        mock_resolve_judge: MagicMock,
+        mock_batch_upsert: MagicMock,
+    ) -> None:
+        """ExtractionMethod.NONE skips all framework extraction (#2271)."""
+        worker, _ = _make_worker()
+
+        mock_conn, mock_cur = _make_mock_conn()
+        mock_psycopg.connect.return_value = mock_conn
+        mock_cur.fetchone.side_effect = [
+            ("court-uuid-1",),
+            ("case-uuid-1",),
+            (True,),
+        ]
+
+        # Set up both extractors — neither should be called.
+        mock_multimodal = MagicMock()
+        worker._multimodal_extractor = mock_multimodal
+        mock_text = MagicMock()
+        worker._framework_extractor = mock_text
+
+        # Patch the county config to return NONE for this test county.
+        from framework.extraction_config import CountyExtractionConfig, ExtractionMethod
+
+        none_config = CountyExtractionConfig(method=ExtractionMethod.NONE)
+
+        event = _make_event(
+            state="CA",
+            county="TestNone",
+            content_format="pdf",
+            ruling_text="PDF content",
+            scraper_id="test-none",
+        )
+        with (
+            patch("ingestion.worker.is_pdf_binary", return_value=True),
+            patch(
+                "ingestion.worker.extract_text_from_pdf",
+                return_value="Case No. 123\nSmith v. Jones\nGranted.",
+            ),
+            patch(
+                "framework.extraction_config.get_county_extraction_config",
+                return_value=none_config,
+            ),
+        ):
+            worker.process_event(event)
+
+        # Neither extractor should have been called.
+        mock_multimodal.extract_from_pdf.assert_not_called()
+        mock_text.extract.assert_not_called()

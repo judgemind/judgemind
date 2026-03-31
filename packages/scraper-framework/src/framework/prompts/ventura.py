@@ -1,19 +1,29 @@
-"""Ventura County LLM extraction prompt (validated in eval #1966)."""
+"""Ventura County LLM extraction prompts.
+
+Two prompts are maintained:
+
+- ``VENTURA_SYSTEM_PROMPT`` — used by the Ventura scraper's own
+  ``_ventura_llm_extract`` function (flat JSON output, no ``rulings``
+  array).  Kept for backward compatibility with the live scraper path.
+- ``VENTURA_FRAMEWORK_PROMPT`` — used by the framework ``LlmExtractor``
+  via ``extraction_config.py`` during rebuilds and reingests.  Produces
+  the ``{"rulings": [...]}`` format expected by
+  ``LlmExtractor._parse_response()``.
+
+The prompts share the same domain knowledge (Ventura document format,
+outcome taxonomy, party extraction rules) but differ in output format.
+
+Fix for #2271: the original ``VENTURA_SYSTEM_PROMPT`` produced a flat
+JSON object that ``_parse_response()`` could not parse (it expects a
+``"rulings"`` array), causing all Ventura outcomes to be lost during
+rebuilds.
+"""
 
 from __future__ import annotations
 
-VENTURA_SYSTEM_PROMPT = (
-    "You are a legal document parser for California court "
-    "tentative rulings from Ventura County Superior Court.\n\n"
-    "You will receive the text of a SINGLE ruling document for one case.  "
-    "Unlike multi-case PDFs, each Ventura document covers exactly one case.  "
-    "You also receive the case_number and motion_type as known context "
-    "(already extracted from the court's search results table).\n\n"
-    "Your job is to extract three fields that are NOT yet available from "
-    "the table:\n"
-    "  1. outcome\n"
-    "  2. parties (with roles)\n"
-    "  3. ruling_text (trimmed to the substantive ruling content)\n\n"
+# --- Shared domain knowledge for both prompts ---
+
+_VENTURA_DOC_FORMAT = (
     "## Ventura Document Format\n\n"
     "Ventura ruling documents (HTML or PDF) typically have this structure:\n"
     "1. **Header**: Court name, county, department number\n"
@@ -27,6 +37,13 @@ VENTURA_SYSTEM_PROMPT = (
     "5. **ANALYSIS section**: Legal reasoning\n"
     "6. **Standard footer**: 'If this tentative ruling is not contested, "
     "it shall become the order of the court.'\n\n"
+    "Some Ventura documents are probate/conservatorship proceedings that "
+    "may not follow this structure. These may contain status reports, "
+    "continuances, or administrative orders without a clear TENTATIVE "
+    "RULING heading.\n\n"
+)
+
+_VENTURA_PARTY_RULES = (
     "## Party Extraction\n\n"
     "Party names appear in the case info block, typically in ALL-CAPS.  "
     "Convert to title case.  Determine roles from context:\n"
@@ -37,6 +54,9 @@ VENTURA_SYSTEM_PROMPT = (
     "- 'et al.' indicates additional parties -- extract the named party "
     "and note 'et al.' in the name if present\n"
     "- Use the FULL party name from the document (company names, etc.)\n\n"
+)
+
+_VENTURA_OUTCOME_TAXONOMY = (
     "## Outcome Taxonomy\n\n"
     "Use EXACTLY one of these values:\n"
     "- granted -- motion/petition was fully granted\n"
@@ -58,7 +78,13 @@ VENTURA_SYSTEM_PROMPT = (
     "- 'SUSTAINED in part, OVERRULED in part' or mixed rulings on "
     "multiple causes of action maps to 'granted_in_part'\n"
     "- 'GRANTED WITHOUT LEAVE TO AMEND' on some parts and 'DENIED' on "
-    "others maps to 'granted_in_part'\n\n"
+    "others maps to 'granted_in_part'\n"
+    "- 'continues this matter' or 'is continued' maps to 'continued'\n"
+    "- Status reports, conservatorship reviews, and administrative "
+    "orders without a clear motion outcome: use 'other'\n\n"
+)
+
+_VENTURA_RULING_TEXT_RULES = (
     "## Ruling Text\n\n"
     "For ruling_text, include the substantive ruling content starting "
     "from the TENTATIVE RULING heading through the end of the analysis.  "
@@ -66,8 +92,30 @@ VENTURA_SYSTEM_PROMPT = (
     "- The court header (court name, county, department)\n"
     "- The case info block (case number, hearing date, party names line)\n"
     "- The standard footer ('If this tentative ruling is not contested...')\n"
-    "Include the ruling disposition, background, analysis, and any orders.\n\n"
-    "## Output Format\n\n"
+    "Include the ruling disposition, background, analysis, and any orders.\n"
+    "For probate/conservatorship documents without a TENTATIVE RULING "
+    "heading, include the full substantive content.\n\n"
+)
+
+# --- Scraper prompt (flat JSON, used by _ventura_llm_extract) ---
+
+VENTURA_SYSTEM_PROMPT = (
+    "You are a legal document parser for California court "
+    "tentative rulings from Ventura County Superior Court.\n\n"
+    "You will receive the text of a SINGLE ruling document for one case.  "
+    "Unlike multi-case PDFs, each Ventura document covers exactly one case.  "
+    "You also receive the case_number and motion_type as known context "
+    "(already extracted from the court's search results table).\n\n"
+    "Your job is to extract three fields that are NOT yet available from "
+    "the table:\n"
+    "  1. outcome\n"
+    "  2. parties (with roles)\n"
+    "  3. ruling_text (trimmed to the substantive ruling content)\n\n"
+    + _VENTURA_DOC_FORMAT
+    + _VENTURA_PARTY_RULES
+    + _VENTURA_OUTCOME_TAXONOMY
+    + _VENTURA_RULING_TEXT_RULES
+    + "## Output Format\n\n"
     "Respond with ONLY a JSON object, no other text:\n\n"
     "{\n"
     '  "outcome": "granted" or "denied" or "granted_in_part" or null,\n'
@@ -85,5 +133,64 @@ VENTURA_SYSTEM_PROMPT = (
     '    "parties": "high",\n'
     '    "ruling_text": "high"\n'
     "  }\n"
+    "}"
+)
+
+
+# --- Framework prompt ({"rulings": [...]} format for LlmExtractor) ---
+
+VENTURA_FRAMEWORK_PROMPT = (
+    "You are a legal document parser for California court "
+    "tentative rulings from Ventura County Superior Court.\n\n"
+    "You will receive the text of a Ventura ruling document.  Each "
+    "document typically covers exactly one case.  Extract ALL structured "
+    "fields from the document.\n\n" + _VENTURA_DOC_FORMAT + "## Case Number Formats\n\n"
+    "Ventura case numbers follow this pattern: 4-digit year + "
+    "4-letter type code + 6-digit sequence number.\n"
+    "Examples: 2024CUBC038456, 2025CUBC040123, 2025CUPR042345\n"
+    "Type codes: CUBC (civil business), CUBT (civil breach of "
+    "trust), CUPR (probate), etc.\n\n"
+    + _VENTURA_PARTY_RULES
+    + _VENTURA_OUTCOME_TAXONOMY
+    + "## Motion Type\n\n"
+    "Extract the motion type from the 'Nature of Proceedings' line "
+    "or from the ruling text.  Common types:\n"
+    "- demurrer\n"
+    "- motion_to_compel\n"
+    "- msj (motion for summary judgment)\n"
+    "- motion_to_strike\n"
+    "- petition (for probate matters)\n"
+    "- motion_to_be_relieved_as_counsel\n"
+    "Use the most specific type that applies.  Use null if unclear.\n\n"
+    + _VENTURA_RULING_TEXT_RULES
+    + "## Output Format\n\n"
+    "Respond with ONLY a JSON object, no other text:\n\n"
+    "{\n"
+    '  "extracted_judge_name": "First M. Last" or null,\n'
+    '  "hearing_date": "YYYY-MM-DD" or null,\n'
+    '  "department": "20" or null,\n'
+    '  "rulings": [\n'
+    "    {\n"
+    '      "extracted_case_number": "2024CUBC038456" or null,\n'
+    '      "extracted_case_title": "Plaintiff v. Defendant" or null,\n'
+    '      "case_type": "civil" or "probate" or null,\n'
+    '      "outcome": "granted" or "denied" or null,\n'
+    '      "motion_type": "demurrer" or null,\n'
+    '      "ruling_text": "Full ruling text..." or null,\n'
+    '      "extracted_parties": [\n'
+    '        {"name": "Full Name", "role": "plaintiff", '
+    '"confidence": "high"},\n'
+    '        {"name": "Full Name", "role": "defendant", '
+    '"confidence": "high"}\n'
+    "      ],\n"
+    '      "confidence": {\n'
+    '        "case_number": "high",\n'
+    '        "case_title": "high",\n'
+    '        "parties": "high",\n'
+    '        "outcome": "high",\n'
+    '        "ruling_text": "high"\n'
+    "      }\n"
+    "    }\n"
+    "  ]\n"
     "}"
 )
