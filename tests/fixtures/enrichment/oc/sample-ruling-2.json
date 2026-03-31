@@ -1,0 +1,14 @@
+{
+  "ruling_text": "Lee v. Sunrise Medical Group\nMotion for Summary Judgment\nThe motion is taken OFF CALENDAR per stipulation of the parties.",
+  "expected": {
+    "case_title": "Lee v. Sunrise Medical Group",
+    "motion_type": "msj",
+    "outcome": "off_calendar",
+    "parties": {
+      "plaintiffs": ["Lee"],
+      "defendants": ["Sunrise Medical Group"]
+    }
+  },
+  "source_doc": "s3://judgemind-archives-dev/ca/oc/2026/03/sample4.pdf",
+  "notes": "Off calendar"
+}

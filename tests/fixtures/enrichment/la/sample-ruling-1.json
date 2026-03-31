@@ -1,0 +1,14 @@
+{
+  "ruling_text": "Case Number: 22SMCV01940\nHernandez v. Pacific Coast Properties LLC\nMotion for Summary Judgment\nThe motion for summary judgment filed by defendant Pacific Coast Properties LLC is GRANTED. Plaintiff Hernandez has failed to raise a triable issue of material fact regarding the negligence claim.",
+  "expected": {
+    "case_title": "Hernandez v. Pacific Coast Properties LLC",
+    "motion_type": "msj",
+    "outcome": "granted",
+    "parties": {
+      "plaintiffs": ["Hernandez"],
+      "defendants": ["Pacific Coast Properties LLC"]
+    }
+  },
+  "source_doc": "s3://judgemind-archives-dev/ca/la/2026/03/sample1.pdf",
+  "notes": "Sample fixture for eval harness testing"
+}
