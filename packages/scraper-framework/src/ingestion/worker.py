@@ -20,6 +20,9 @@ Environment variables:
     ENABLE_RULING_FORMATTING — Enable LLM-powered ruling text formatting (default: disabled)
     ENABLE_RULING_SUMMARIZATION — Enable LLM-powered ruling summarization (default: disabled)
     ENABLE_INGESTION_VALIDATION — Enable LLM-based validation gate (default: disabled)
+    USE_LLM_ENRICHMENT — Enable LLM-based enrichment for motion_type, outcome,
+        case_title, and parties (default: enabled). Set to "false" to fall back
+        to regex extraction only.
     GITHUB_TOKEN   — GitHub token for auto-filing validation issues (optional)
     GITHUB_REPO    — GitHub repo for validation issues (default: judgemind/judgemind)
 """
@@ -370,6 +373,25 @@ class IngestionWorker:
                 )
                 self._validation_enabled = False
 
+        # LLM enrichment — uses enrich_ruling() for motion_type, outcome,
+        # case_title, and parties. Enabled by default; disable with
+        # USE_LLM_ENRICHMENT=false. Uses the same LLM provider/client as
+        # per-field extraction for connection reuse.
+        use_enrichment_env = os.environ.get("USE_LLM_ENRICHMENT", "true").lower()
+        self._llm_enrichment_enabled: bool = use_enrichment_env not in (
+            "0",
+            "false",
+            "no",
+        )
+        # Reuse the existing LLM client for enrichment to avoid creating a
+        # separate connection. The enrichment module accepts a client kwarg.
+        self._enrichment_client: object | None = self._llm_client
+        if self._llm_enrichment_enabled and self._enrichment_client is None:
+            logger.warning(
+                "LLM enrichment enabled but no LLM client available — "
+                "enrichment will fall back to regex"
+            )
+
         # Reusable httpx client for GitHub issue filing (validation gate).
         # Created lazily on first use; None means "not yet created".
         self._github_client: object | None = None
@@ -469,6 +491,90 @@ class IngestionWorker:
                 )
                 return None
         return self._county_extractors.get(cache_key)
+
+    def _llm_enrich_fields(
+        self,
+        ruling_text: str,
+        document_id: str,
+    ) -> object | None:
+        """Run LLM enrichment on ruling text to extract structured fields.
+
+        Calls ``enrich_ruling()`` from ``framework.llm_enrichment`` to extract
+        ``motion_type``, ``outcome``, ``case_title``, and ``parties`` from the
+        ruling text in a single LLM call.
+
+        The import is deferred (lazy) to avoid a circular import between
+        ``framework`` and ``ingestion`` packages.
+
+        Parameters
+        ----------
+        ruling_text : str
+            The plain text of the ruling (already transcribed).
+        document_id : str
+            The document ID for logging.
+
+        Returns
+        -------
+        LlmEnrichmentResult | None
+            The enrichment result, or ``None`` if enrichment is disabled,
+            the client is unavailable, or the LLM call failed.
+        """
+        if not self._llm_enrichment_enabled:
+            return None
+
+        if not self._enrichment_client:
+            return None
+
+        if not ruling_text or not ruling_text.strip():
+            return None
+
+        from framework.llm_enrichment import enrich_ruling
+
+        t0 = time.monotonic()
+        try:
+            result = enrich_ruling(
+                ruling_text,
+                provider=self._llm_provider or "google",
+                model=self._llm_model,
+                client=self._enrichment_client,
+            )
+        except Exception as exc:
+            latency_ms = round((time.monotonic() - t0) * 1000)
+            logger.warning(
+                "LLM enrichment failed — falling back to regex",
+                extra={
+                    "document_id": document_id,
+                    "enrichment_latency_ms": latency_ms,
+                    "error": str(exc),
+                },
+            )
+            return None
+        latency_ms = round((time.monotonic() - t0) * 1000)
+
+        # Check if the result is empty (all fields None / empty)
+        has_data = (
+            result.case_title is not None
+            or result.motion_type is not None
+            or result.outcome is not None
+            or result.parties.plaintiffs
+            or result.parties.defendants
+        )
+
+        logger.info(
+            "LLM enrichment completed",
+            extra={
+                "document_id": document_id,
+                "enrichment_latency_ms": latency_ms,
+                "has_data": has_data,
+                "case_title": result.case_title[:80] if result.case_title else None,
+                "motion_type": result.motion_type,
+                "outcome": result.outcome,
+                "plaintiff_count": len(result.parties.plaintiffs),
+                "defendant_count": len(result.parties.defendants),
+            },
+        )
+
+        return result if has_data else None
 
     def _file_validation_issue(
         self,
@@ -877,6 +983,41 @@ class IngestionWorker:
                 )
 
         # ------------------------------------------------------------------
+        # LLM enrichment — dedicated enrichment call for motion_type,
+        # outcome, case_title, and parties (#2176).  Runs after per-field
+        # LLM extraction and before regex fallback.  Only for non-split
+        # events where the 4 enrichment fields are still missing.
+        # ------------------------------------------------------------------
+        enrichment_fields_missing = (
+            not is_llm_extracted
+            and ruling_text
+            and (outcome is None or motion_type is None or not case_title or not parties_data)
+        )
+        if enrichment_fields_missing:
+            enrichment_result = self._llm_enrich_fields(ruling_text, document_id)
+            if enrichment_result is not None:
+                if outcome is None and enrichment_result.outcome is not None:
+                    outcome = enrichment_result.outcome
+                    extraction_methods["outcome"] = "llm_enrichment"
+                if motion_type is None and enrichment_result.motion_type is not None:
+                    motion_type = enrichment_result.motion_type
+                    extraction_methods["motion_type"] = "llm_enrichment"
+                if not case_title and enrichment_result.case_title is not None:
+                    case_title = enrichment_result.case_title
+                    extraction_methods["case_title"] = "llm_enrichment"
+                if not parties_data and (
+                    enrichment_result.parties.plaintiffs or enrichment_result.parties.defendants
+                ):
+                    # Convert from EnrichmentParties to the parties_data
+                    # list[dict] format used by the rest of the pipeline.
+                    parties_data = []
+                    for name in enrichment_result.parties.plaintiffs:
+                        parties_data.append({"name": name, "role": "plaintiff"})
+                    for name in enrichment_result.parties.defendants:
+                        parties_data.append({"name": name, "role": "defendant"})
+                    extraction_methods["parties"] = "llm_enrichment"
+
+        # ------------------------------------------------------------------
         # Regex fallback — fill any fields still missing after LLM
         # ------------------------------------------------------------------
         # Skip regex fallback when the event was pre-populated by the
@@ -899,6 +1040,38 @@ class IngestionWorker:
                 motion_type = extract_motion_type(ruling_text)
                 if motion_type is not None:
                     extraction_methods.setdefault("motion_type", "regex")
+
+        # ------------------------------------------------------------------
+        # LLM enrichment for multimodal events (#2176)
+        # ------------------------------------------------------------------
+        # Multimodal events (_llm_extracted=True) have ruling_text from
+        # transcription but may lack structured fields.  Try LLM enrichment
+        # before falling back to regex.
+        if (
+            is_llm_extracted
+            and ruling_text
+            and (outcome is None or motion_type is None or not case_title or not parties_data)
+        ):
+            enrichment_result = self._llm_enrich_fields(ruling_text, document_id)
+            if enrichment_result is not None:
+                if outcome is None and enrichment_result.outcome is not None:
+                    outcome = enrichment_result.outcome
+                    extraction_methods["outcome"] = "llm_enrichment"
+                if motion_type is None and enrichment_result.motion_type is not None:
+                    motion_type = enrichment_result.motion_type
+                    extraction_methods["motion_type"] = "llm_enrichment"
+                if not case_title and enrichment_result.case_title is not None:
+                    case_title = enrichment_result.case_title
+                    extraction_methods["case_title"] = "llm_enrichment"
+                if not parties_data and (
+                    enrichment_result.parties.plaintiffs or enrichment_result.parties.defendants
+                ):
+                    parties_data = []
+                    for name in enrichment_result.parties.plaintiffs:
+                        parties_data.append({"name": name, "role": "plaintiff"})
+                    for name in enrichment_result.parties.defendants:
+                        parties_data.append({"name": name, "role": "defendant"})
+                    extraction_methods["parties"] = "llm_enrichment"
 
         # ------------------------------------------------------------------
         # Regex post-LLM fallback — for multimodal extraction events (#1770)
