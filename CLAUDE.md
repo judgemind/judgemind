@@ -306,6 +306,7 @@ from __future__ import annotations
 - ESLint + Prettier
 - In `packages/web/src/app/`, use `@/` path aliases instead of deep relative imports (`../../` or deeper). The `local/prefer-path-alias` ESLint rule enforces this. Deep relative imports break when route groups are reorganised.
 - **Follow `docs/web-patterns.md`** for all page layout, component usage, and consistency decisions. This is mandatory for frontend work.
+- **Apollo cache keyFields:** Any new GraphQL type without an `id` field needs a `keyFields` entry in `packages/web/src/lib/apollo-client.ts` `typePolicies`. Without this, Apollo may collapse distinct items into a single cache entry. Options: `keyFields: ['fieldName']` for types with a natural unique key, or `keyFields: false` for embedded/non-normalized types (edges, etc.). Run `scripts/check-apollo-keyfields.sh` locally to verify before pushing. See #1779.
 - Jest or Vitest for testing
 
 ### General
