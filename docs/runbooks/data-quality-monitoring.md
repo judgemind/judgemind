@@ -93,6 +93,43 @@ To add a new county, add an entry to the `counties` object. To disable
 monitoring for a county, remove its entry (the script falls back to the 7-day
 rolling average).
 
+### Expected Null Rates
+
+Some counties have irreducible null rates for specific fields because the
+source data structurally lacks the information. For example, Orange County
+calendar-list PDFs contain only motion titles with no ruling text, so the
+LLM correctly returns no outcome.
+
+Configure these in the `expected_null_rates` section of
+`data-quality-baselines.json`:
+
+```json
+{
+  "expected_null_rates": {
+    "Orange": {
+      "outcome": 17.0,
+      "_note": "Calendar-list PDFs have no ruling text."
+    }
+  }
+}
+```
+
+When an expected null rate is configured for a county+field, the field
+completeness check caps the effective baseline at `100 - expected_null_rate`.
+This prevents false-positive alerts for known irreducible gaps while still
+detecting genuine regressions below the expected floor.
+
+**Current per-county ceilings (as of 2026-04-01):**
+
+| County | Field | Expected null rate | Root cause |
+|--------|-------|--------------------|------------|
+| Orange | outcome | 17% | Calendar-list PDFs (motion titles only, no ruling text) |
+| Orange | motion_type | 15% | Calendar-list PDFs (same root cause) |
+| Santa Clara | outcome | 2% | Cross-reference entries ("See Line N") |
+| Santa Clara | motion_type | 10% | Cross-reference entries |
+
+See investigation #2304 for detailed findings.
+
 ---
 
 ## Running Manually

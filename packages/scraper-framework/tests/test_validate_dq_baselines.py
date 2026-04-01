@@ -22,6 +22,7 @@ validate_county_consistency = vdqb.validate_county_consistency
 validate_reasonable_expectations = vdqb.validate_reasonable_expectations
 validate_required_fc_fields = vdqb.validate_required_fc_fields
 validate_county_config = vdqb.validate_county_config
+validate_expected_null_rates = vdqb.validate_expected_null_rates
 load_baselines_json = vdqb.load_baselines_json
 main = vdqb.main
 
@@ -349,6 +350,107 @@ class TestValidateCountyConfig:
         messages = " ".join(errors)
         assert "posting_days" in messages
         assert "weekly" in messages
+
+
+class TestValidateExpectedNullRates:
+    """Tests for expected_null_rates section validation (#2318)."""
+
+    def test_valid_expected_null_rates_no_errors(self) -> None:
+        counties = {
+            "Orange": {"expected_daily_rulings": 20, "schedule_type": "daily"},
+        }
+        enr = {
+            "_note": "Expected null rates",
+            "Orange": {
+                "outcome": 17.0,
+                "_note": "Calendar-list PDFs",
+            },
+        }
+        errors = validate_expected_null_rates(enr, counties)
+        assert errors == []
+
+    def test_unknown_county_flagged(self) -> None:
+        counties = {
+            "Orange": {"expected_daily_rulings": 20, "schedule_type": "daily"},
+        }
+        enr = {
+            "Phantom": {"outcome": 5.0},
+        }
+        errors = validate_expected_null_rates(enr, counties)
+        assert len(errors) == 1
+        assert "Phantom" in errors[0]
+        assert "not in 'counties'" in errors[0]
+
+    def test_unknown_field_flagged(self) -> None:
+        counties = {
+            "Orange": {"expected_daily_rulings": 20, "schedule_type": "daily"},
+        }
+        enr = {
+            "Orange": {"outcome": 17.0, "bogus_field": 5.0},
+        }
+        errors = validate_expected_null_rates(enr, counties)
+        assert len(errors) == 1
+        assert "bogus_field" in errors[0]
+
+    def test_non_numeric_value_flagged(self) -> None:
+        counties = {
+            "Orange": {"expected_daily_rulings": 20, "schedule_type": "daily"},
+        }
+        enr = {
+            "Orange": {"outcome": "not a number"},
+        }
+        errors = validate_expected_null_rates(enr, counties)
+        assert len(errors) == 1
+        assert "numeric" in errors[0]
+
+    def test_out_of_range_value_flagged(self) -> None:
+        counties = {
+            "Orange": {"expected_daily_rulings": 20, "schedule_type": "daily"},
+        }
+        enr = {
+            "Orange": {"outcome": 150.0},
+        }
+        errors = validate_expected_null_rates(enr, counties)
+        assert len(errors) == 1
+        assert "out of range" in errors[0]
+
+    def test_negative_value_flagged(self) -> None:
+        counties = {
+            "Orange": {"expected_daily_rulings": 20, "schedule_type": "daily"},
+        }
+        enr = {
+            "Orange": {"outcome": -5.0},
+        }
+        errors = validate_expected_null_rates(enr, counties)
+        assert len(errors) == 1
+        assert "out of range" in errors[0]
+
+    def test_non_dict_county_flagged(self) -> None:
+        counties = {
+            "Orange": {"expected_daily_rulings": 20, "schedule_type": "daily"},
+        }
+        enr = {
+            "Orange": "not a dict",
+        }
+        errors = validate_expected_null_rates(enr, counties)
+        assert len(errors) == 1
+        assert "must be a dict" in errors[0]
+
+    def test_empty_section_no_errors(self) -> None:
+        errors = validate_expected_null_rates({}, {})
+        assert errors == []
+
+    def test_metadata_keys_skipped(self) -> None:
+        """Keys starting with _ (metadata) are skipped entirely."""
+        counties = {
+            "Orange": {"expected_daily_rulings": 20, "schedule_type": "daily"},
+        }
+        enr = {
+            "_updated": "2026-04-01",
+            "_note": "Per-county expected null rates",
+        }
+        errors = validate_expected_null_rates(enr, counties)
+        assert errors == []
 
 
 class TestValidateIntegration:

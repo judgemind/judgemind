@@ -28,6 +28,7 @@ Baselines = dqc.Baselines
 FileIssuesResult = dqc.FileIssuesResult
 load_baselines = dqc.load_baselines
 load_field_baselines = dqc.load_field_baselines
+load_expected_null_rates = dqc.load_expected_null_rates
 save_field_baselines = dqc.save_field_baselines
 check_ingest_rates = dqc.check_ingest_rates
 check_scraper_staleness = dqc.check_scraper_staleness
@@ -2130,6 +2131,8 @@ class TestRunChecks:
         dqc.load_baselines = MagicMock(return_value=baselines)
         original_field_load = dqc.load_field_baselines
         dqc.load_field_baselines = MagicMock(return_value={})
+        original_enr_load = dqc.load_expected_null_rates
+        dqc.load_expected_null_rates = MagicMock(return_value={})
         try:
             alerts = dqc.run_checks("fake://dsn", now=NOW)
             metrics = {a.metric for a in alerts}
@@ -2139,6 +2142,7 @@ class TestRunChecks:
             dqc.psycopg.connect = original_connect
             dqc.load_baselines = original_load
             dqc.load_field_baselines = original_field_load
+            dqc.load_expected_null_rates = original_enr_load
 
     def test_run_checks_healthy(self) -> None:
         """run_checks returns empty list when everything is healthy."""
@@ -2170,6 +2174,8 @@ class TestRunChecks:
         dqc.load_baselines = MagicMock(return_value=baselines)
         original_field_load = dqc.load_field_baselines
         dqc.load_field_baselines = MagicMock(return_value={})
+        original_enr_load = dqc.load_expected_null_rates
+        dqc.load_expected_null_rates = MagicMock(return_value={})
         try:
             alerts = dqc.run_checks("fake://dsn", now=NOW)
             assert len(alerts) == 0
@@ -2177,6 +2183,7 @@ class TestRunChecks:
             dqc.psycopg.connect = original_connect
             dqc.load_baselines = original_load
             dqc.load_field_baselines = original_field_load
+            dqc.load_expected_null_rates = original_enr_load
 
 
 # ---------------------------------------------------------------------------
@@ -3475,6 +3482,399 @@ class TestLowVolumeCountySuppression:
         low_sample = [a for a in alerts if a.metric == "field_completeness_low_sample"]
         assert len(low_sample) == 1
         assert low_sample[0].county == "Unknown County"
+
+
+class TestLoadExpectedNullRates:
+    """Tests for load_expected_null_rates function."""
+
+    def test_load_from_file(self, tmp_path: Path) -> None:
+        """Loads expected null rates from a JSON file."""
+        baselines_file = tmp_path / "baselines.json"
+        baselines_file.write_text(
+            json.dumps(
+                {
+                    "counties": {},
+                    "expected_null_rates": {
+                        "Orange": {
+                            "outcome": 17.0,
+                            "motion_type": 15.0,
+                            "_note": "Calendar-list PDFs",
+                        },
+                    },
+                }
+            )
+        )
+        result = load_expected_null_rates(baselines_file)
+        assert "Orange" in result
+        assert result["Orange"]["outcome"] == 17.0
+        assert result["Orange"]["motion_type"] == 15.0
+        # _note should be excluded (starts with _).
+        assert "_note" not in result["Orange"]
+
+    def test_load_from_raw_dict(self) -> None:
+        """Loads expected null rates from a pre-parsed dict."""
+        raw = {
+            "expected_null_rates": {
+                "Santa Clara": {
+                    "outcome": 2.0,
+                    "_note": "Cross-references",
+                },
+            }
+        }
+        result = load_expected_null_rates(raw=raw)
+        assert "Santa Clara" in result
+        assert result["Santa Clara"]["outcome"] == 2.0
+
+    def test_empty_when_missing(self) -> None:
+        """Returns empty dict when expected_null_rates section is absent."""
+        raw: dict[str, Any] = {"counties": {}}
+        result = load_expected_null_rates(raw=raw)
+        assert result == {}
+
+    def test_empty_when_file_missing(self, tmp_path: Path) -> None:
+        """Returns empty dict when baselines file does not exist."""
+        result = load_expected_null_rates(tmp_path / "nonexistent.json")
+        assert result == {}
+
+    def test_skips_non_numeric_values(self) -> None:
+        """Skips non-numeric values (except _-prefixed metadata)."""
+        raw = {
+            "expected_null_rates": {
+                "Orange": {
+                    "outcome": 17.0,
+                    "judge": "not a number",
+                },
+            }
+        }
+        result = load_expected_null_rates(raw=raw)
+        assert result["Orange"]["outcome"] == 17.0
+        assert "judge" not in result["Orange"]
+
+    def test_integer_values_converted_to_float(self) -> None:
+        """Integer values are converted to float."""
+        raw = {
+            "expected_null_rates": {
+                "Orange": {"outcome": 17},
+            }
+        }
+        result = load_expected_null_rates(raw=raw)
+        assert result["Orange"]["outcome"] == 17.0
+        assert isinstance(result["Orange"]["outcome"], float)
+
+
+class TestExpectedNullRateFieldCompleteness:
+    """Tests for expected null rate adjustments in check_field_completeness (#2318)."""
+
+    def _all_fields_baselines(self, **overrides: float) -> dict[str, float]:
+        """Create a full field baselines dict with reasonable defaults."""
+        defaults = {
+            "ruling": 100.0,
+            "judge": 95.0,
+            "motion_type": 90.0,
+            "outcome": 90.0,
+            "case_title": 100.0,
+            "case_number": 100.0,
+            "parties": 80.0,
+            "hearing_date": 100.0,
+            "case_type": 85.0,
+        }
+        defaults.update(overrides)
+        return defaults
+
+    def test_no_alert_when_within_expected_null_rate(self) -> None:
+        """No alert when field is within the expected null rate ceiling.
+
+        OC outcome baseline is 90%, expected null rate is 17%.
+        Effective baseline = min(90, 100-17) = min(90, 83) = 83%.
+        Current is 83% → drop = 0pp → no alert.
+        """
+        conn = FakeConnection(
+            {
+                "case_parties": [
+                    _make_field_completeness_row(
+                        "Orange",
+                        total=100,
+                        outcome=83,
+                    ),
+                ],
+            }
+        )
+        field_baselines = {
+            "Orange": self._all_fields_baselines(outcome=90.0),
+        }
+        expected_null_rates = {
+            "Orange": {"outcome": 17.0},
+        }
+        alerts = check_field_completeness(
+            conn, NOW, field_baselines, expected_null_rates=expected_null_rates
+        )
+        outcome_alerts = [a for a in alerts if "outcome" in a.message]
+        assert len(outcome_alerts) == 0
+
+    def test_alert_when_below_expected_null_rate_ceiling(self) -> None:
+        """P1 alert when field drops significantly below the null rate ceiling.
+
+        OC outcome baseline is 90%, expected null rate is 17%.
+        Effective baseline = min(90, 83) = 83%.
+        Current is 70% → drop = 13pp → P1 alert.
+        """
+        conn = FakeConnection(
+            {
+                "case_parties": [
+                    _make_field_completeness_row(
+                        "Orange",
+                        total=100,
+                        outcome=70,
+                    ),
+                ],
+            }
+        )
+        field_baselines = {
+            "Orange": self._all_fields_baselines(outcome=90.0),
+        }
+        expected_null_rates = {
+            "Orange": {"outcome": 17.0},
+        }
+        alerts = check_field_completeness(
+            conn, NOW, field_baselines, expected_null_rates=expected_null_rates
+        )
+        outcome_alerts = [a for a in alerts if "outcome" in a.message]
+        assert len(outcome_alerts) == 1
+        assert outcome_alerts[0].severity == "p1"
+        # Effective baseline should be 83.0, not 90.0.
+        assert outcome_alerts[0].expected == 83.0
+
+    def test_p2_alert_for_moderate_drop_below_ceiling(self) -> None:
+        """P2 alert when field drops 5-10pp below the null rate ceiling.
+
+        OC outcome baseline is 90%, expected null rate is 17%.
+        Effective baseline = 83%. Current is 77% → drop = 6pp → P2.
+        """
+        conn = FakeConnection(
+            {
+                "case_parties": [
+                    _make_field_completeness_row(
+                        "Orange",
+                        total=100,
+                        outcome=77,
+                    ),
+                ],
+            }
+        )
+        field_baselines = {
+            "Orange": self._all_fields_baselines(outcome=90.0),
+        }
+        expected_null_rates = {
+            "Orange": {"outcome": 17.0},
+        }
+        alerts = check_field_completeness(
+            conn, NOW, field_baselines, expected_null_rates=expected_null_rates
+        )
+        outcome_alerts = [a for a in alerts if "outcome" in a.message]
+        assert len(outcome_alerts) == 1
+        assert outcome_alerts[0].severity == "p2"
+
+    def test_ceiling_does_not_raise_baseline(self) -> None:
+        """Expected null rate does not raise the effective baseline.
+
+        If baseline is 80% and expected null rate is 10%,
+        effective baseline = min(80, 90) = 80% (no change).
+        """
+        conn = FakeConnection(
+            {
+                "case_parties": [
+                    _make_field_completeness_row(
+                        "Orange",
+                        total=100,
+                        outcome=74,  # 6pp below 80% baseline → P2
+                    ),
+                ],
+            }
+        )
+        field_baselines = {
+            "Orange": self._all_fields_baselines(outcome=80.0),
+        }
+        expected_null_rates = {
+            "Orange": {"outcome": 10.0},
+        }
+        alerts = check_field_completeness(
+            conn, NOW, field_baselines, expected_null_rates=expected_null_rates
+        )
+        outcome_alerts = [a for a in alerts if "outcome" in a.message]
+        assert len(outcome_alerts) == 1
+        # The effective baseline should be 80.0 (baseline is lower than ceiling).
+        assert outcome_alerts[0].expected == 80.0
+
+    def test_no_expected_null_rates_backward_compatible(self) -> None:
+        """check_field_completeness works normally when expected_null_rates is None."""
+        conn = FakeConnection(
+            {
+                "case_parties": [
+                    _make_field_completeness_row(
+                        "Orange",
+                        total=100,
+                        outcome=83,  # 7pp below 90% baseline → P2
+                    ),
+                ],
+            }
+        )
+        field_baselines = {
+            "Orange": self._all_fields_baselines(outcome=90.0),
+        }
+        # No expected_null_rates passed (backward compatibility).
+        alerts = check_field_completeness(conn, NOW, field_baselines)
+        outcome_alerts = [a for a in alerts if "outcome" in a.message]
+        assert len(outcome_alerts) == 1
+        assert outcome_alerts[0].severity == "p2"
+        assert outcome_alerts[0].expected == 90.0
+
+    def test_empty_expected_null_rates_backward_compatible(self) -> None:
+        """check_field_completeness works normally when expected_null_rates is empty dict."""
+        conn = FakeConnection(
+            {
+                "case_parties": [
+                    _make_field_completeness_row(
+                        "Orange",
+                        total=100,
+                        outcome=83,
+                    ),
+                ],
+            }
+        )
+        field_baselines = {
+            "Orange": self._all_fields_baselines(outcome=90.0),
+        }
+        alerts = check_field_completeness(conn, NOW, field_baselines, expected_null_rates={})
+        outcome_alerts = [a for a in alerts if "outcome" in a.message]
+        assert len(outcome_alerts) == 1
+        assert outcome_alerts[0].expected == 90.0
+
+    def test_only_configured_fields_adjusted(self) -> None:
+        """Only fields listed in expected_null_rates are adjusted.
+
+        If OC has outcome null rate configured but not judge,
+        judge still uses the raw baseline.
+        """
+        conn = FakeConnection(
+            {
+                "case_parties": [
+                    _make_field_completeness_row(
+                        "Orange",
+                        total=100,
+                        outcome=83,  # Within ceiling: 100-17=83
+                        judge=80,  # 15pp below 95% baseline → P1
+                    ),
+                ],
+            }
+        )
+        field_baselines = {
+            "Orange": self._all_fields_baselines(outcome=90.0, judge=95.0),
+        }
+        expected_null_rates = {
+            "Orange": {"outcome": 17.0},
+        }
+        alerts = check_field_completeness(
+            conn, NOW, field_baselines, expected_null_rates=expected_null_rates
+        )
+        outcome_alerts = [a for a in alerts if "outcome" in a.message]
+        judge_alerts = [a for a in alerts if "judge" in a.message]
+        # Outcome: no alert (within ceiling).
+        assert len(outcome_alerts) == 0
+        # Judge: P1 alert (no null rate configured, raw baseline used).
+        assert len(judge_alerts) == 1
+        assert judge_alerts[0].severity == "p1"
+        assert judge_alerts[0].expected == 95.0
+
+    def test_multiple_counties_independent(self) -> None:
+        """Expected null rates apply per-county independently."""
+        conn = FakeConnection(
+            {
+                "case_parties": [
+                    _make_field_completeness_row(
+                        "Orange",
+                        total=100,
+                        outcome=83,
+                    ),
+                    _make_field_completeness_row(
+                        "Santa Clara",
+                        total=100,
+                        outcome=83,  # 7pp below 90% baseline → P2 (no null rate configured)
+                    ),
+                ],
+            }
+        )
+        field_baselines = {
+            "Orange": self._all_fields_baselines(outcome=90.0),
+            "Santa Clara": self._all_fields_baselines(outcome=90.0),
+        }
+        expected_null_rates = {
+            "Orange": {"outcome": 17.0},
+            # Santa Clara has no expected null rate for outcome.
+        }
+        alerts = check_field_completeness(
+            conn, NOW, field_baselines, expected_null_rates=expected_null_rates
+        )
+        oc_outcome = [a for a in alerts if a.county == "Orange" and "outcome" in a.message]
+        sc_outcome = [a for a in alerts if a.county == "Santa Clara" and "outcome" in a.message]
+        # Orange: no alert (within ceiling).
+        assert len(oc_outcome) == 0
+        # Santa Clara: P2 alert (no null rate configured).
+        assert len(sc_outcome) == 1
+        assert sc_outcome[0].severity == "p2"
+
+    def test_zero_null_rate_has_no_effect(self) -> None:
+        """A zero expected null rate does not change the effective baseline."""
+        conn = FakeConnection(
+            {
+                "case_parties": [
+                    _make_field_completeness_row(
+                        "Orange",
+                        total=100,
+                        outcome=83,
+                    ),
+                ],
+            }
+        )
+        field_baselines = {
+            "Orange": self._all_fields_baselines(outcome=90.0),
+        }
+        expected_null_rates = {
+            "Orange": {"outcome": 0.0},
+        }
+        alerts = check_field_completeness(
+            conn, NOW, field_baselines, expected_null_rates=expected_null_rates
+        )
+        outcome_alerts = [a for a in alerts if "outcome" in a.message]
+        assert len(outcome_alerts) == 1
+        assert outcome_alerts[0].expected == 90.0
+
+    def test_message_uses_effective_baseline(self) -> None:
+        """Alert message shows the effective (capped) baseline, not the raw one."""
+        conn = FakeConnection(
+            {
+                "case_parties": [
+                    _make_field_completeness_row(
+                        "Orange",
+                        total=100,
+                        outcome=70,
+                    ),
+                ],
+            }
+        )
+        field_baselines = {
+            "Orange": self._all_fields_baselines(outcome=90.0),
+        }
+        expected_null_rates = {
+            "Orange": {"outcome": 17.0},
+        }
+        alerts = check_field_completeness(
+            conn, NOW, field_baselines, expected_null_rates=expected_null_rates
+        )
+        outcome_alerts = [a for a in alerts if "outcome" in a.message]
+        assert len(outcome_alerts) == 1
+        assert "83.0%" in outcome_alerts[0].message
+        assert "70.0%" in outcome_alerts[0].message
+        assert "13.0pp drop" in outcome_alerts[0].message
 
 
 class TestIsBulkIngest:
