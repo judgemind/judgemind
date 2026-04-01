@@ -11,6 +11,8 @@ Validations:
   4. ``schedule_type`` values are valid ("daily" or "frequent").
   5. ``expected_daily_rulings`` is non-negative.
   6. ``posting_days`` is present and contains valid day abbreviations.
+  7. ``expected_null_rates`` counties exist in ``counties`` section.
+  8. ``expected_null_rates`` field names and values are valid.
 
 Usage:
     scripts/validate-dq-baselines.py                      # default path
@@ -247,6 +249,85 @@ def validate_county_config(counties: dict[str, Any]) -> list[str]:
     return errors
 
 
+# Valid field names that can appear in expected_null_rates entries.
+VALID_NULL_RATE_FIELDS = {
+    "ruling",
+    "judge",
+    "motion_type",
+    "outcome",
+    "case_title",
+    "case_number",
+    "parties",
+    "hearing_date",
+    "case_type",
+}
+
+
+def validate_expected_null_rates(
+    enr_section: dict[str, Any],
+    counties: dict[str, Any],
+) -> list[str]:
+    """Validate the ``expected_null_rates`` section structure.
+
+    Checks:
+    - Counties referenced in expected_null_rates exist in ``counties``
+    - Field names are valid (match VALID_NULL_RATE_FIELDS)
+    - Values are numeric and in range [0, 100]
+    - Non-numeric keys start with ``_`` (metadata convention)
+
+    Args:
+        enr_section: The ``expected_null_rates`` section of baselines.
+        counties: The ``counties`` section of baselines.
+
+    Returns:
+        List of error messages (empty if valid).
+    """
+    errors: list[str] = []
+    county_names = set(counties.keys())
+
+    for key, value in enr_section.items():
+        # Skip metadata keys (e.g. _note, _updated).
+        if key.startswith("_"):
+            continue
+
+        # The key should be a county name.
+        if key not in county_names:
+            errors.append(
+                f"County '{key}' in 'expected_null_rates' is not in 'counties'"
+            )
+
+        if not isinstance(value, dict):
+            errors.append(
+                f"County '{key}' in 'expected_null_rates' must be a dict, "
+                f"got {type(value).__name__}"
+            )
+            continue
+
+        for field, rate in value.items():
+            if field.startswith("_"):
+                continue
+
+            if field not in VALID_NULL_RATE_FIELDS:
+                errors.append(
+                    f"County '{key}' in 'expected_null_rates' has unknown "
+                    f"field '{field}' (valid: {', '.join(sorted(VALID_NULL_RATE_FIELDS))})"
+                )
+                continue
+
+            if not isinstance(rate, (int, float)):
+                errors.append(
+                    f"County '{key}' expected_null_rates.{field} must be "
+                    f"numeric, got {type(rate).__name__}"
+                )
+            elif rate < 0 or rate > 100:
+                errors.append(
+                    f"County '{key}' expected_null_rates.{field}={rate} "
+                    f"is out of range [0, 100]"
+                )
+
+    return errors
+
+
 def validate(baselines: dict[str, Any]) -> list[str]:
     """Run all validation checks on the baselines data.
 
@@ -260,11 +341,13 @@ def validate(baselines: dict[str, Any]) -> list[str]:
 
     counties = baselines.get("counties") or {}
     fc_section = baselines.get("field_completeness") or {}
+    enr_section = baselines.get("expected_null_rates") or {}
 
     errors.extend(validate_county_consistency(counties, fc_section))
     errors.extend(validate_reasonable_expectations(counties, fc_section))
     errors.extend(validate_required_fc_fields(fc_section))
     errors.extend(validate_county_config(counties))
+    errors.extend(validate_expected_null_rates(enr_section, counties))
 
     return errors
 

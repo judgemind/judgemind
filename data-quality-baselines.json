@@ -78,6 +78,20 @@
       "display_name": "API (dev)"
     }
   ],
+  "expected_null_rates": {
+    "_updated": "2026-04-01",
+    "_note": "Per-county expected null rates for fields where the source data structurally lacks extractable information. These are irreducible: no extraction improvement will lower them. The check_field_completeness function caps the effective baseline at (100 - expected_null_rate) to prevent false-positive alerts. See #2304 investigation and #2318.",
+    "Orange": {
+      "outcome": 17.0,
+      "motion_type": 15.0,
+      "_note": "Calendar-list PDFs contain only motion titles with no ruling text. ~66 of 113 null-outcome rulings have ruling_text < 100 chars. Residual null rate excluding stub-text: ~0.5%."
+    },
+    "Santa Clara": {
+      "outcome": 2.0,
+      "motion_type": 10.0,
+      "_note": "Cross-reference entries ('See Line N for tentative ruling') share rulings across calendar lines. Resolution tracked in #2317."
+    }
+  },
   "field_completeness": {
     "_updated": "2026-03-31",
     "_note": "Baselines reset after full database rebuild on 2026-03-31 (#2264). All documents re-ingested from S3 archive with fresh created_at timestamps, bringing the entire corpus into the 7-day check window. Numbers reflect current extraction pipeline reality post-rebuild.",

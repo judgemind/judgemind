@@ -399,6 +399,50 @@ def load_field_baselines(
     return raw.get("field_completeness", {})
 
 
+def load_expected_null_rates(
+    path: Path | None = None,
+    raw: dict[str, Any] | None = None,
+) -> dict[str, dict[str, float]]:
+    """Load per-county expected null rates from JSON config file or dict.
+
+    Expected null rates document the irreducible null-field rates per county
+    caused by structural limitations in the source data (e.g., OC calendar-list
+    PDFs that contain only motion titles with no ruling text).
+
+    When configured, ``check_field_completeness`` caps the effective baseline
+    for a county+field at ``100 - expected_null_rate``, preventing false-positive
+    alerts for known irreducible gaps.
+
+    Args:
+        path: Path to baselines JSON file. Defaults to repo root.
+        raw: Pre-parsed baselines dict (takes priority over file path).
+            Useful when running as an ECS oneshot where the file is unavailable.
+
+    Returns:
+        Dict mapping county name to dict of field name -> expected null rate
+        percentage (0-100).  Only numeric entries are returned; keys starting
+        with ``_`` (e.g., ``_note``) are excluded.
+    """
+    if raw is None:
+        baselines_path = path or DEFAULT_BASELINES_PATH
+        if not baselines_path.exists():
+            return {}
+        with open(baselines_path) as f:
+            raw = json.load(f)
+
+    result: dict[str, dict[str, float]] = {}
+    for county, fields in raw.get("expected_null_rates", {}).items():
+        county_rates: dict[str, float] = {}
+        for field, value in fields.items():
+            if field.startswith("_"):
+                continue
+            if isinstance(value, (int, float)):
+                county_rates[field] = float(value)
+        if county_rates:
+            result[county] = county_rates
+    return result
+
+
 def save_field_baselines(
     current_completeness: dict[str, dict[str, float]],
     path: Path | None = None,
@@ -566,6 +610,7 @@ def check_field_completeness(
     field_baselines: dict[str, dict[str, float]],
     county: str | None = None,
     baselines: dict[str, Baselines] | None = None,
+    expected_null_rates: dict[str, dict[str, float]] | None = None,
 ) -> list[Alert]:
     """Check field completeness against baselines and flag regressions.
 
@@ -581,6 +626,12 @@ def check_field_completeness(
     field completeness alerts are downgraded to P2 informational with a
     note that a bulk operation likely occurred (#1887).
 
+    When *expected_null_rates* is provided, the effective baseline for a
+    county+field is capped at ``100 - expected_null_rate``.  This accounts
+    for irreducible null rates caused by structural limitations in the source
+    data (e.g., OC calendar-list PDFs that contain only motion titles with
+    no ruling text).  See #2318.
+
     Args:
         conn: Database connection.
         now: Current timestamp for time calculations.
@@ -589,6 +640,10 @@ def check_field_completeness(
         baselines: Per-county baseline configurations (used to check the
             ``low_volume`` flag). If *None*, all counties emit the
             informational alert (backward-compatible default).
+        expected_null_rates: Per-county, per-field expected null rate
+            percentages (0-100).  When configured, the effective baseline
+            for a county+field is ``min(baseline, 100 - null_rate)``.
+            If *None*, no adjustment is applied (backward-compatible default).
 
     Returns:
         List of alerts for field completeness regressions.
@@ -666,6 +721,11 @@ def check_field_completeness(
             )
             continue
 
+        # Load expected null rates for this county (if configured).
+        county_null_rates = (
+            expected_null_rates.get(county_name, {}) if expected_null_rates else {}
+        )
+
         for field, current_pct in fields.items():
             baseline_pct = county_field_baselines.get(field, 0.0)
 
@@ -673,7 +733,17 @@ def check_field_completeness(
             if baseline_pct == 0.0:
                 continue
 
-            drop = baseline_pct - current_pct
+            # Cap the effective baseline at (100 - expected_null_rate) when
+            # an expected null rate is configured for this county+field.
+            # This prevents false-positive alerts for irreducible null rates
+            # caused by structural limitations in the source data (#2318).
+            effective_baseline = baseline_pct
+            null_rate = county_null_rates.get(field)
+            if null_rate is not None and null_rate > 0:
+                ceiling = 100.0 - null_rate
+                effective_baseline = min(baseline_pct, ceiling)
+
+            drop = effective_baseline - current_pct
 
             if drop > FIELD_DROP_P1_THRESHOLD:
                 severity = "p1"
@@ -687,11 +757,11 @@ def check_field_completeness(
                     county=county_name,
                     metric="field_completeness",
                     severity=severity,
-                    expected=baseline_pct,
+                    expected=effective_baseline,
                     actual=current_pct,
                     message=(
                         f"{county_name}: {field} completeness dropped from "
-                        f"{baseline_pct:.1f}% to {current_pct:.1f}% "
+                        f"{effective_baseline:.1f}% to {current_pct:.1f}% "
                         f"({drop:.1f}pp drop)"
                     ),
                 )
@@ -2022,6 +2092,7 @@ def run_checks(
 
     baselines = load_baselines(baselines_path, raw=baselines_raw)
     field_baselines = load_field_baselines(baselines_path, raw=baselines_raw)
+    exp_null_rates = load_expected_null_rates(baselines_path, raw=baselines_raw)
     alerts: list[Alert] = []
 
     with psycopg.connect(dsn) as conn:
@@ -2033,7 +2104,14 @@ def run_checks(
             save_field_baselines(current, baselines_path, totals=totals)
         else:
             alerts.extend(
-                check_field_completeness(conn, now, field_baselines, county, baselines)
+                check_field_completeness(
+                    conn,
+                    now,
+                    field_baselines,
+                    county,
+                    baselines,
+                    expected_null_rates=exp_null_rates,
+                )
             )
 
         alerts.extend(check_orphaned_documents(conn, now, county, field_baselines))
@@ -2082,6 +2160,7 @@ def run_checks_full(
 
     baselines = load_baselines(baselines_path, raw=baselines_raw)
     field_baselines = load_field_baselines(baselines_path, raw=baselines_raw)
+    exp_null_rates = load_expected_null_rates(baselines_path, raw=baselines_raw)
     alerts: list[Alert] = []
 
     with psycopg.connect(dsn) as conn:
@@ -2093,7 +2172,14 @@ def run_checks_full(
             save_field_baselines(current, baselines_path, totals=totals)
         else:
             alerts.extend(
-                check_field_completeness(conn, now, field_baselines, county, baselines)
+                check_field_completeness(
+                    conn,
+                    now,
+                    field_baselines,
+                    county,
+                    baselines,
+                    expected_null_rates=exp_null_rates,
+                )
             )
 
         alerts.extend(check_orphaned_documents(conn, now, county, field_baselines))
