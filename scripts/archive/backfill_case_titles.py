@@ -35,7 +35,8 @@ import psycopg
 # Title extraction and validation are delegated to shared functions in the
 # scraper framework's ingestion package.  This avoids duplicating logic
 # across files (#1405, #1974).
-from ingestion.extract import extract_case_title, is_plausible_case_title
+# NOTE: extract_case_title was removed in #2178.  # noqa: E402
+from ingestion.extract import is_plausible_case_title
 
 logging.basicConfig(
     level=logging.INFO,

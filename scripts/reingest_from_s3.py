@@ -125,16 +125,11 @@ from ingestion.db import (  # noqa: E402
 )
 from ingestion.extract import (  # noqa: E402
     extract_case_number,
-    extract_case_title,
     extract_case_type_from_motion_type,
     extract_case_type_from_number,
     extract_case_type_from_scraper_id,
     extract_hearing_date,
     extract_judge_name,
-    extract_motion_type,
-    extract_outcome,
-    extract_parties_from_caption,
-    is_plausible_case_title,
     normalize_motion_type,
     normalize_outcome,
 )
@@ -524,15 +519,10 @@ def _apply_regex_fallbacks(extracted: dict, text: str, scraper_id: str = "") -> 
     Mutates *extracted* in place.  Expects ``extracted["extraction_methods"]``
     to already exist as a ``dict``.
 
-    The fallback order mirrors ``worker.py`` to ensure reingest produces the
-    same field completeness as live ingestion:
-
-      1. judge_name, outcome, motion_type, case_number, case_title, hearing_date
-         — each extracted from *text* via the corresponding ``extract_*`` helper.
-      2. parties from case_title caption (``extract_parties_from_caption``).
-      3. case_type from case-number prefix (``extract_case_type_from_number``).
-      4. case_type from scraper_id suffix (``extract_case_type_from_scraper_id``).
-      5. case_type from motion_type (``extract_case_type_from_motion_type``).
+    The fallback chain covers fields NOT handled by LLM enrichment:
+    judge_name, case_number, hearing_date, and case_type.  The enrichment
+    fields (outcome, motion_type, case_title, parties) are handled
+    exclusively by LLM enrichment (#2178).
 
     This function is called from both ``_reparse_document()`` (single-doc path)
     and ``_full_reparse_document()`` (split-doc path) to keep the fallback
@@ -545,40 +535,16 @@ def _apply_regex_fallbacks(extracted: dict, text: str, scraper_id: str = "") -> 
         if val:
             extracted["judge_name"] = val
             methods.setdefault("judge_name", "regex")
-    if not extracted["outcome"]:
-        val = extract_outcome(text)
-        if val:
-            extracted["outcome"] = val
-            methods.setdefault("outcome", "regex")
-    if not extracted["motion_type"]:
-        val = extract_motion_type(text)
-        if val:
-            extracted["motion_type"] = val
-            methods.setdefault("motion_type", "regex")
     if not extracted["case_number"]:
         val = extract_case_number(text)
         if val:
             extracted["case_number"] = val
             methods.setdefault("case_number", "regex")
-    if not extracted["case_title"]:
-        val = extract_case_title(text)
-        if val and is_plausible_case_title(val):
-            extracted["case_title"] = val
-            methods.setdefault("case_title", "regex")
     if not extracted["hearing_date"]:
         val = extract_hearing_date(text)
         if val:
             extracted["hearing_date"] = val
             methods.setdefault("hearing_date", "regex")
-
-    # Fallback parties from case_title caption (#1836).
-    # When no parties were provided by the scraper or LLM, try to extract
-    # plaintiff/defendant from a "X v. Y" style case title.
-    if not extracted.get("parties") and extracted.get("case_title"):
-        parties = extract_parties_from_caption(extracted["case_title"])
-        if parties:
-            extracted["parties"] = parties
-            methods.setdefault("parties", "regex")
 
     # Fallback case_type from case number prefix (#706).
     if not extracted["case_type"] and extracted["case_number"]:
@@ -1364,13 +1330,9 @@ def _reparse_document_multimodal(
         else:
             # Even without ruling_text (e.g. multi-ruling PDFs where the
             # cross-contamination guard nulled out the text), we can still
-            # extract parties from case_title and case_type from
-            # case_number.  See #2270.
-            if not extracted.get("parties") and extracted.get("case_title"):
-                parties = extract_parties_from_caption(extracted["case_title"])
-                if parties:
-                    extracted["parties"] = parties
-                    extracted["extraction_methods"].setdefault("parties", "regex")
+            # extract case_type from case_number.  See #2270.
+            # Party extraction from captions was removed in #2178 — LLM
+            # enrichment handles party extraction.
             if not extracted["case_type"] and extracted["case_number"]:
                 val = extract_case_type_from_number(extracted["case_number"])
                 if val:

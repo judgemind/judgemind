@@ -63,7 +63,8 @@ from ingestion.db import (  # noqa: E402
     upsert_case_party,
     upsert_party,
 )
-from ingestion.extract import extract_motion_type, extract_outcome  # noqa: E402
+# NOTE: extract_motion_type and extract_outcome were removed in #2178.
+# This archived script is no longer functional.  # noqa: E402
 from ingestion.text_cleanup import clean_ruling_text  # noqa: E402
 
 logging.basicConfig(

@@ -466,7 +466,7 @@ The ingestion pipeline has three stages. **Each stage does one job. Do not mix r
 |---|---|---|
 | **Capture** (scraper) | Fetch raw content, extract metadata from website structure (link text, HTML headers, URL params), archive to S3 | Parse PDF content, extract fields from unstructured text |
 | **Transcription** | Convert raw content to clean text per case, split multi-case documents, mark cross-page continuations | Extract structured fields (case_number, outcome, etc.) |
-| **Enrichment** | Extract structured fields from text using three-tier strategy (scraper metadata > LLM > regex) | Fetch content, parse PDFs |
+| **Enrichment** | Extract structured fields from text using two-tier strategy (scraper metadata > LLM) | Fetch content, parse PDFs |
 
 **Transcription** varies by format:
 - **HTML** (e.g., LA): BeautifulSoup parsing, no LLM needed.

@@ -54,7 +54,7 @@ from framework.la_parser_utils import (  # noqa: E402
     ROLE_PREFIX_RE as _ROLE_PREFIX_RE,
     SKIP_RESPONDING_PHRASES as _SKIP_RESPONDING_PHRASES,
 )
-from framework.party_utils import is_name_fragment as _is_name_fragment  # noqa: E402, F401 — re-exported for tests
+from framework.party_utils import is_name_fragment  # noqa: E402, F401 — re-exported for tests
 from framework.party_utils import split_party_names as _split_party_names  # noqa: E402
 from ingestion.db import batch_upsert_parties  # noqa: E402
 

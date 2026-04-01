@@ -42,7 +42,7 @@ sys.path.insert(
 
 import psycopg  # noqa: E402
 
-from ingestion.extract import extract_motion_type  # noqa: E402
+# NOTE: extract_motion_type was removed in #2178.  # noqa: E402
 
 logging.basicConfig(
     level=logging.INFO,
