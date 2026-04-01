@@ -17,6 +17,7 @@ from courts.ca.la_dept_judges import normalize_department
 from courts.ca.riverside_dept_judges import (
     INDEX_URL,
     DepartmentJudge,
+    RiversideCourtDirectory,
     build_department_judge_map,
     fetch_department_judge_mapping,
     lookup_judge_for_department,
@@ -290,3 +291,63 @@ def test_mapping_covers_investigation_departments() -> None:
     for dept in expected_depts:
         norm = normalize_department(dept)
         assert norm in dept_map, f"Department {dept} (normalized: {norm}) not in mapping"
+
+
+# ---------------------------------------------------------------------------
+# RiversideCourtDirectory — fetch_current and snapshotting
+# ---------------------------------------------------------------------------
+
+
+class TestRiversideCourtDirectory:
+    @respx.mock
+    def test_fetch_current_returns_raw_and_mapping(self) -> None:
+        """fetch_current returns raw HTML bytes and a valid mapping."""
+        from unittest.mock import MagicMock
+
+        html = _load("riv_page.html")
+        respx.get(INDEX_URL).mock(return_value=httpx.Response(200, text=html))
+
+        directory = RiversideCourtDirectory(
+            s3_client=MagicMock(),
+            s3_bucket="test-bucket",
+            db_conn=MagicMock(),
+        )
+
+        raw, mapping = directory.fetch_current()
+
+        assert isinstance(raw, bytes)
+        assert len(raw) > 0
+        assert len(mapping) >= 16
+        assert mapping["PS1"] == "Arthur Hester III"
+        assert mapping["1"] == "Harold Hopp"
+        assert mapping["MV1"] == "David E. Gregory"
+
+    def test_court_id(self) -> None:
+        """RiversideCourtDirectory has the correct COURT_ID."""
+        assert RiversideCourtDirectory.COURT_ID == "ca_riverside"
+
+    @respx.mock
+    def test_fetch_and_snapshot_defaults_court_id(self) -> None:
+        """fetch_and_snapshot uses COURT_ID by default."""
+        from unittest.mock import MagicMock
+
+        html = _load("riv_page.html")
+        respx.get(INDEX_URL).mock(return_value=httpx.Response(200, text=html))
+
+        mock_conn = MagicMock()
+        mock_cursor = MagicMock()
+        mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cursor)
+        mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+        # No existing snapshot (not a duplicate)
+        mock_cursor.fetchone.return_value = None
+
+        directory = RiversideCourtDirectory(
+            s3_client=MagicMock(),
+            s3_bucket="test-bucket",
+            db_conn=mock_conn,
+        )
+
+        mapping = directory.fetch_and_snapshot()
+
+        assert len(mapping) >= 16
+        assert mapping["PS1"] == "Arthur Hester III"

@@ -14,6 +14,7 @@ Usage (local):
 Usage (ECS):
   scripts/ecs-run-task.sh scripts/fetch_rosters.py
 """
+
 from __future__ import annotations
 
 import os
@@ -42,6 +43,7 @@ DIRECTORIES = [
     ("courts.ca.kern_dept_judges", "KernCourtDirectory", "ca_kern"),
     ("courts.ca.sd_dept_judges", "SanDiegoCourtDirectory", "ca_san_diego"),
     ("courts.ca.sb_dept_judges", "SanBernardinoCourtDirectory", "ca_san_bernardino"),
+    ("courts.ca.riverside_dept_judges", "RiversideCourtDirectory", "ca_riverside"),
     ("courts.ca.ventura_dept_judges", "VenturaCourtDirectory", "ca_ventura"),
     ("courts.ca.sf_dept_judges", "SFCourtDirectory", "ca_san_francisco"),
     ("courts.ca.sc_tentatives", "SantaClaraCourtDirectory", "ca_santa_clara"),
@@ -57,7 +59,9 @@ def main() -> None:
         print("ERROR: DATABASE_URL not set.", file=sys.stderr)
         sys.exit(1)
 
-    bucket = os.environ.get("JUDGEMIND_ARCHIVE_BUCKET", "judgemind-document-archive-dev")
+    bucket = os.environ.get(
+        "JUDGEMIND_ARCHIVE_BUCKET", "judgemind-document-archive-dev"
+    )
     s3 = make_s3_client()
     conn = psycopg.connect(database_url, autocommit=False)
 
