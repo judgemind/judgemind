@@ -744,6 +744,28 @@ def _reparse_document(
             # (#2311 — SD calendar pages contain 30+ cases; sending the
             # full page to the LLM causes output truncation).
             llm_text = extracted.get("ruling_text") or text
+
+            # Direct narrowing for SD calendar pages that weren't handled
+            # by parse_document (e.g. rebuild-ca-san_diego scraper IDs
+            # that have no registered scraper class).
+            case_num = extracted.get("case_number")
+            if (
+                case_num
+                and llm_text == text  # Not already narrowed by parse_document
+                and doc_meta.get("county", "").lower() == "san diego"
+                and doc_format == "html"
+            ):
+                try:
+                    from courts.ca.sd_calendar import extract_case_section
+
+                    section = extract_case_section(
+                        raw_content.decode("utf-8", errors="replace"),
+                        case_num,
+                    )
+                    if section:
+                        llm_text = section
+                except Exception:
+                    pass  # Fall through to full-text extraction
             t0 = time.monotonic()
             llm_result = extract_fields_llm(
                 document_text=llm_text,
