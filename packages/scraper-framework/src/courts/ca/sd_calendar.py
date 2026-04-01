@@ -310,6 +310,98 @@ def parse_calendar_page(html: str) -> list[CalendarHearing]:
     return hearings
 
 
+def extract_case_section(html: str, case_number: str) -> str | None:
+    """Extract a focused text section for a specific case from calendar HTML.
+
+    San Diego calendar pages contain 30+ cases across multiple departments.
+    When the LLM processes the full page, it tries to extract ALL cases,
+    producing JSON output that exceeds the model's output token limit and
+    causes truncated-JSON parse errors (#2311).
+
+    This function narrows the HTML to just the department header and the
+    single table row matching ``case_number``, reducing input from 60-100KB
+    to ~1KB.  The focused text lets the LLM produce a single-ruling JSON
+    response that fits within output limits.
+
+    Args:
+        html: Full calendar page HTML.
+        case_number: Case number to extract (e.g. ``"24CU016153C"``).
+
+    Returns:
+        A plain-text excerpt containing the department header and the
+        matching case's hearing row, or ``None`` if the case is not found.
+    """
+    soup = BeautifulSoup(html, "lxml")
+
+    # Extract the date from the page header for context.
+    hearing_date = _parse_calendar_date(html)
+    date_str = hearing_date.strftime("%m/%d/%Y") if hearing_date else "unknown"
+
+    for dept_div in soup.find_all("div", class_="department"):
+        h2 = dept_div.find("h2")
+        if not h2:
+            continue
+        dept_text = h2.get_text(strip=True)
+        dept_match = _DEPARTMENT_RE.search(dept_text)
+        department = dept_match.group("dept") if dept_match else "Unknown"
+
+        table = dept_div.find("table", class_="tables")
+        if not table:
+            continue
+
+        tbody = table.find("tbody")
+        if not tbody:
+            continue
+
+        for row in tbody.find_all("tr"):
+            tds = row.find_all("td")
+            if len(tds) < 7:
+                continue
+
+            row_case_number = tds[1].get_text(strip=True)
+            if row_case_number != case_number:
+                continue
+
+            # Found the matching row.  Build a focused text excerpt
+            # with department context and all fields from this row.
+            hearing_time = tds[0].get_text(strip=True)
+            case_title = _clean_case_title(tds[2].get_text(strip=True))
+            event_type = tds[3].get_text(strip=True)
+            judge_raw = tds[4].get_text(strip=True)
+
+            # Parties
+            party_lines: list[str] = []
+            for p_tag in tds[5].find_all("p"):
+                text = p_tag.get_text(strip=True)
+                if text:
+                    party_lines.append(text)
+
+            # Attorneys
+            attorney_lines: list[str] = []
+            for p_tag in tds[6].find_all("p"):
+                text = p_tag.get_text(strip=True)
+                if text:
+                    attorney_lines.append(text)
+
+            parts: list[str] = [
+                f"San Diego Superior Court Civil Calendar - {date_str}",
+                f"Department: {department}",
+                f"Hearing Time: {hearing_time}",
+                f"Case Number: {case_number}",
+                f"Case Title: {case_title}",
+                f"Event Type: {event_type}",
+                f"Hearing Officer: {judge_raw}",
+            ]
+            if party_lines:
+                parts.append("Parties: " + "; ".join(party_lines))
+            if attorney_lines:
+                parts.append("Attorneys: " + "; ".join(attorney_lines))
+
+            return "\n".join(parts)
+
+    return None
+
+
 class SDCalendarScraper(BaseScraper):
     """Enumerates San Diego civil calendar hearings and filters for motion events.
 
@@ -399,7 +491,33 @@ class SDCalendarScraper(BaseScraper):
         return docs
 
     def parse_document(self, doc: CapturedDocument) -> CapturedDocument:
-        """No additional parsing needed — fields are populated in fetch_documents."""
+        """Re-parse a calendar document, narrowing ruling_text to the specific case.
+
+        During reingest, each document has the full calendar page as
+        ``raw_content`` but only represents a single case.  When
+        ``doc.case_number`` is set, this method extracts just that case's
+        row from the HTML, producing a focused ``ruling_text`` that the
+        LLM can process without output truncation (#2311).
+
+        Fields already populated on the document (from the original
+        ``fetch_documents`` call) are preserved — this only fills in
+        ``ruling_text`` when it is not already set.
+        """
+        if doc.ruling_text or not doc.case_number:
+            return doc
+
+        try:
+            html = doc.raw_content.decode("utf-8")
+            section = extract_case_section(html, doc.case_number)
+            if section:
+                doc.ruling_text = section
+        except Exception as exc:
+            logger.warning(
+                "Failed to extract case section from calendar HTML",
+                case_number=doc.case_number,
+                error=str(exc),
+            )
+
         return doc
 
 

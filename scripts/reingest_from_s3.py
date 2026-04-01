@@ -680,6 +680,11 @@ def _reparse_document(
                 raw_content=raw_content,
                 content_hash=doc_meta["content_hash"],
             )
+            # Set case_number from DB metadata so parse_document can
+            # narrow multi-case calendar pages to the specific case
+            # (#2311 — SD calendar LLM extraction failures).
+            if doc_meta.get("case_number"):
+                cap_doc.case_number = doc_meta["case_number"]
             parsed = scraper.parse_document(cap_doc)
             ruling = parsed.ruling_text or text
             extracted["ruling_text"] = ruling.replace("\x00", "") if ruling else text
@@ -769,9 +774,13 @@ def _reparse_document(
             llm_skipped = True
             llm_outcome = "skipped"
         elif (missing_fields or force_llm) and text.strip():
+            # Use narrowed ruling_text from parse_document when available
+            # (#2311 — SD calendar pages contain 30+ cases; sending the
+            # full page to the LLM causes output truncation).
+            llm_text = extracted.get("ruling_text") or text
             t0 = time.monotonic()
             llm_result = extract_fields_llm(
-                document_text=text,
+                document_text=llm_text,
                 content_format=doc_format,
                 metadata=None,
                 client=llm_client,

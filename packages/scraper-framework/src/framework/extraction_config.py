@@ -144,6 +144,7 @@ _COUNTY_CONFIGS: dict[tuple[str, str], CountyExtractionConfig] = {
         system_prompt=SAN_DIEGO_FRAMEWORK_PROMPT,
         provider="google",
         model="gemini-2.5-flash-lite",
+        max_output_tokens=32768,
     ),
 }
 

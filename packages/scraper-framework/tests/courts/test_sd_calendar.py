@@ -29,9 +29,10 @@ from courts.ca.sd_calendar import (
     _parse_calendar_date,
     _parse_judge_name,
     default_config,
+    extract_case_section,
     parse_calendar_page,
 )
-from framework.models import ScraperConfig
+from framework.models import ContentFormat, ScraperConfig
 
 pytestmark = pytest.mark.regression
 
@@ -488,12 +489,12 @@ class TestSDCalendarScraper:
         # Central has 7 motion events, fetched twice = 14
         assert len(docs) == 14
 
-    def test_parse_document_passthrough(self) -> None:
-        """parse_document should return the doc unchanged."""
+    def test_parse_document_passthrough_with_ruling_text(self) -> None:
+        """parse_document should not overwrite existing ruling_text."""
         config = _make_config()
         scraper = SDCalendarScraper(config)
 
-        from framework.models import CapturedDocument, ContentFormat
+        from framework.models import CapturedDocument
 
         doc = CapturedDocument(
             scraper_id="test",
@@ -506,9 +507,59 @@ class TestSDCalendarScraper:
             raw_content=b"<html></html>",
             content_hash="abc123",
             case_number="24CU016153C",
+            ruling_text="existing ruling text",
         )
         result = scraper.parse_document(doc)
-        assert result.case_number == "24CU016153C"
+        assert result.ruling_text == "existing ruling text"
+
+    def test_parse_document_passthrough_no_case_number(self) -> None:
+        """parse_document should return doc unchanged when case_number is None."""
+        config = _make_config()
+        scraper = SDCalendarScraper(config)
+
+        from framework.models import CapturedDocument
+
+        doc = CapturedDocument(
+            scraper_id="test",
+            state="CA",
+            county="San Diego",
+            court="Superior Court",
+            source_url="http://example.com",
+            capture_timestamp=datetime(2026, 3, 13),
+            content_format=ContentFormat.HTML,
+            raw_content=b"<html></html>",
+            content_hash="abc123",
+        )
+        result = scraper.parse_document(doc)
+        assert result.ruling_text is None
+
+    def test_parse_document_extracts_case_section(self) -> None:
+        """parse_document narrows ruling_text to the specific case (#2311)."""
+        config = _make_config()
+        scraper = SDCalendarScraper(config)
+
+        from framework.models import CapturedDocument
+
+        html = _load_html("sd_calendar_central.html")
+        doc = CapturedDocument(
+            scraper_id="test",
+            state="CA",
+            county="San Diego",
+            court="Superior Court",
+            source_url="http://example.com",
+            capture_timestamp=datetime(2026, 3, 13),
+            content_format=ContentFormat.HTML,
+            raw_content=html.encode("utf-8"),
+            content_hash="abc123",
+            case_number="24CU016153C",
+        )
+        result = scraper.parse_document(doc)
+        assert result.ruling_text is not None
+        assert "24CU016153C" in result.ruling_text
+        assert "Department: C-60" in result.ruling_text
+        # Should NOT contain other cases from the same page
+        assert "25CU003887C" not in result.ruling_text
+        assert "23CU005421C" not in result.ruling_text
 
     @respx.mock
     def test_run_returns_health_event(self) -> None:
@@ -537,6 +588,87 @@ class TestSDCalendarScraper:
         assert health.records_captured == 7
         assert health.scraper_id == "ca-sd-calendar-test"
         assert health.response_time_seconds > 0
+
+
+# ---------------------------------------------------------------------------
+# extract_case_section — unit tests (#2311)
+# ---------------------------------------------------------------------------
+
+
+class TestExtractCaseSection:
+    """Tests for extracting a single case section from calendar HTML."""
+
+    def test_extracts_first_case_from_central(self) -> None:
+        html = _load_html("sd_calendar_central.html")
+        section = extract_case_section(html, "24CU016153C")
+        assert section is not None
+        assert "24CU016153C" in section
+        assert "Department: C-60" in section
+        assert "Motion Hearing" in section
+        assert "Aasi et al vs American Honda Motor Co Inc" in section
+
+    def test_extracts_judge_name(self) -> None:
+        html = _load_html("sd_calendar_central.html")
+        section = extract_case_section(html, "24CU016153C")
+        assert section is not None
+        assert "Judge MATTHEW C. BRANER" in section
+
+    def test_extracts_parties(self) -> None:
+        html = _load_html("sd_calendar_central.html")
+        section = extract_case_section(html, "24CU016153C")
+        assert section is not None
+        assert "(PL) Sumayya Aasi" in section
+        assert "(DF) - American Honda Motor Co Inc" in section
+
+    def test_extracts_attorneys(self) -> None:
+        html = _load_html("sd_calendar_central.html")
+        section = extract_case_section(html, "24CU016153C")
+        assert section is not None
+        assert "Robert M. Moss" in section
+
+    def test_includes_hearing_date(self) -> None:
+        html = _load_html("sd_calendar_central.html")
+        section = extract_case_section(html, "24CU016153C")
+        assert section is not None
+        assert "03/13/2026" in section
+
+    def test_extracts_case_from_different_department(self) -> None:
+        """Should find a case in C-65 department."""
+        html = _load_html("sd_calendar_central.html")
+        section = extract_case_section(html, "25CU008912C")
+        assert section is not None
+        assert "Department: C-65" in section
+        assert "Discovery Hearing" in section
+        assert "Thompson" in section
+
+    def test_does_not_include_other_cases(self) -> None:
+        """Extracted section should only contain the requested case."""
+        html = _load_html("sd_calendar_central.html")
+        section = extract_case_section(html, "24CU016153C")
+        assert section is not None
+        # Other case numbers from the same page should NOT appear
+        assert "25CU003887C" not in section
+        assert "23CU005421C" not in section
+        assert "26CL011234C" not in section
+
+    def test_returns_none_for_missing_case(self) -> None:
+        html = _load_html("sd_calendar_central.html")
+        section = extract_case_section(html, "NONEXISTENT123")
+        assert section is None
+
+    def test_returns_none_for_empty_html(self) -> None:
+        html = _load_html("sd_calendar_empty.html")
+        section = extract_case_section(html, "24CU016153C")
+        assert section is None
+
+    def test_section_is_small(self) -> None:
+        """Extracted section should be much smaller than the full page."""
+        html = _load_html("sd_calendar_central.html")
+        section = extract_case_section(html, "24CU016153C")
+        assert section is not None
+        # The full page is ~7KB; the section should be well under 1KB
+        assert len(section) < 1000
+        assert len(section) < len(html) / 3
 
 
 # ---------------------------------------------------------------------------
