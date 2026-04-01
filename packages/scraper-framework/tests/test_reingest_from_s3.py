@@ -2886,20 +2886,23 @@ class TestReparseDocumentCaseTypeFromScraperId:
 
 
 class TestFullReparseDocumentScraperIdFallback:
-    """Tests for case_type derivation from scraper_id in full-reparse path."""
+    """Tests for scraper_id fallback in _full_reparse_document split path."""
 
-    _HEARING_DATE = "2026-03-15"
-    _COURT_ID = "00000000-0000-0000-0000-000000000001"
-
-    def _doc_meta(self, **overrides: object) -> dict:
+    def _doc_meta(self, **overrides: Any) -> dict:
         meta = {
+            "document_id": str(_DOC_ID_1),
+            "state": "CA",
+            "county": "Orange",
+            "court_name": "Orange County Superior Court",
+            "source_url": "https://court.example.com/ruling.pdf",
+            "captured_at": _CAPTURED_AT_1,
             "content_hash": "abc123",
             "format": "pdf",
             "case_number": None,
             "case_title": None,
             "case_type": None,
-            "hearing_date": self._HEARING_DATE,
-            "court_id": str(self._COURT_ID),
+            "hearing_date": _HEARING_DATE,
+            "court_id": str(_COURT_ID),
             "scraper_id": "ca-oc-tentatives-civil",
             "s3_key": "docs/test.pdf",
             "s3_bucket": "test-bucket",
@@ -4334,7 +4337,7 @@ class TestNormalizeOutcome:
     def test_reingest_uses_shared_normalize_outcome(self) -> None:
         """reingest.normalize_outcome should be the same function as
         ingestion.extract.normalize_outcome."""
-        # normalize_outcome import removed — tested in test_extract.py
+        from ingestion.extract import normalize_outcome
 
         assert reingest.normalize_outcome is normalize_outcome
 
