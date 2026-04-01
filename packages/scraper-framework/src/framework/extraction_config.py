@@ -35,6 +35,7 @@ from .prompts import (  # noqa: F401
     FRESNO_SYSTEM_PROMPT,
     RIVERSIDE_SYSTEM_PROMPT,
     SAN_BERNARDINO_SYSTEM_PROMPT,
+    SAN_DIEGO_FRAMEWORK_PROMPT,
     SAN_DIEGO_SYSTEM_PROMPT,
     SAN_FRANCISCO_SYSTEM_PROMPT,
     SANTA_CLARA_SYSTEM_PROMPT,
@@ -140,7 +141,7 @@ _COUNTY_CONFIGS: dict[tuple[str, str], CountyExtractionConfig] = {
     ),
     ("CA", "SAN DIEGO"): CountyExtractionConfig(
         method=ExtractionMethod.LLM,
-        system_prompt=SAN_DIEGO_SYSTEM_PROMPT,
+        system_prompt=SAN_DIEGO_FRAMEWORK_PROMPT,
         provider="google",
         model="gemini-2.5-flash-lite",
     ),
