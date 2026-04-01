@@ -50,6 +50,11 @@ RUN pip install --no-cache-dir playwright \
 # having both installed breaks client.models.generate_content().
 RUN ! pip show google-generativeai >/dev/null 2>&1
 
+# Embed data-quality baselines so ECS oneshot tasks (which only upload the
+# script, not the repo) can still find the baselines file.  The build
+# context is the repo root, so this file is accessible.  See #2323.
+COPY data-quality-baselines.json /app/data-quality-baselines.json
+
 # Own everything by the non-root user
 RUN chown -R scraper:scraper /app
 

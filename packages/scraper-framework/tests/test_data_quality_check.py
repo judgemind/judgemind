@@ -66,6 +66,9 @@ DEFAULT_ECS_SERVICES = dqc.DEFAULT_ECS_SERVICES
 is_rebuild_in_progress = dqc.is_rebuild_in_progress
 _downgrade_p1_alerts_for_rebuild = dqc._downgrade_p1_alerts_for_rebuild
 REBUILD_MARKER_TTL_HOURS = dqc.REBUILD_MARKER_TTL_HOURS
+_resolve_baselines_path = dqc._resolve_baselines_path
+DEFAULT_BASELINES_PATH = dqc.DEFAULT_BASELINES_PATH
+DOCKER_BASELINES_PATH = dqc.DOCKER_BASELINES_PATH
 
 NOW = datetime(2026, 3, 11, 12, 0, 0, tzinfo=UTC)
 
@@ -401,6 +404,147 @@ class TestLoadBaselines:
         raw = {"counties": {}}
         result = load_baselines(raw=raw)
         assert result == {}
+
+
+class TestResolveBaselinesPath:
+    """Tests for _resolve_baselines_path fallback logic (#2323)."""
+
+    def test_returns_repo_path_when_exists(self, tmp_path: Path) -> None:
+        """Prefers the repo-relative path when the file exists."""
+        repo_path = tmp_path / "repo" / "data-quality-baselines.json"
+        repo_path.parent.mkdir(parents=True)
+        repo_path.write_text("{}")
+        docker_path = tmp_path / "docker" / "data-quality-baselines.json"
+        # Docker path does not exist
+
+        with (
+            patch.object(dqc, "DEFAULT_BASELINES_PATH", repo_path),
+            patch.object(dqc, "DOCKER_BASELINES_PATH", docker_path),
+        ):
+            result = _resolve_baselines_path()
+        assert result == repo_path
+
+    def test_falls_back_to_docker_path(self, tmp_path: Path) -> None:
+        """Falls back to Docker image path when repo path does not exist."""
+        repo_path = tmp_path / "nonexistent" / "data-quality-baselines.json"
+        docker_path = tmp_path / "docker" / "data-quality-baselines.json"
+        docker_path.parent.mkdir(parents=True)
+        docker_path.write_text("{}")
+
+        with (
+            patch.object(dqc, "DEFAULT_BASELINES_PATH", repo_path),
+            patch.object(dqc, "DOCKER_BASELINES_PATH", docker_path),
+        ):
+            result = _resolve_baselines_path()
+        assert result == docker_path
+
+    def test_returns_default_when_neither_exists(self, tmp_path: Path) -> None:
+        """Returns repo-relative path when neither path exists."""
+        repo_path = tmp_path / "nonexistent1" / "data-quality-baselines.json"
+        docker_path = tmp_path / "nonexistent2" / "data-quality-baselines.json"
+
+        with (
+            patch.object(dqc, "DEFAULT_BASELINES_PATH", repo_path),
+            patch.object(dqc, "DOCKER_BASELINES_PATH", docker_path),
+        ):
+            result = _resolve_baselines_path()
+        assert result == repo_path
+
+    def test_prefers_repo_path_over_docker_when_both_exist(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Repo path wins when both repo and Docker paths exist."""
+        repo_path = tmp_path / "repo" / "data-quality-baselines.json"
+        repo_path.parent.mkdir(parents=True)
+        repo_path.write_text('{"source": "repo"}')
+        docker_path = tmp_path / "docker" / "data-quality-baselines.json"
+        docker_path.parent.mkdir(parents=True)
+        docker_path.write_text('{"source": "docker"}')
+
+        with (
+            patch.object(dqc, "DEFAULT_BASELINES_PATH", repo_path),
+            patch.object(dqc, "DOCKER_BASELINES_PATH", docker_path),
+        ):
+            result = _resolve_baselines_path()
+        assert result == repo_path
+
+    def test_load_baselines_uses_docker_fallback(self, tmp_path: Path) -> None:
+        """load_baselines loads from Docker path when repo path is missing."""
+        repo_path = tmp_path / "nonexistent" / "data-quality-baselines.json"
+        docker_path = tmp_path / "docker" / "data-quality-baselines.json"
+        docker_path.parent.mkdir(parents=True)
+        docker_path.write_text(
+            json.dumps(
+                {
+                    "counties": {
+                        "Los Angeles": {
+                            "expected_daily_rulings": 50,
+                            "schedule_type": "daily",
+                        }
+                    }
+                }
+            )
+        )
+
+        with (
+            patch.object(dqc, "DEFAULT_BASELINES_PATH", repo_path),
+            patch.object(dqc, "DOCKER_BASELINES_PATH", docker_path),
+        ):
+            result = load_baselines()
+        assert "Los Angeles" in result
+        assert result["Los Angeles"].expected_daily_rulings == 50
+
+    def test_load_field_baselines_uses_docker_fallback(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """load_field_baselines loads from Docker path when repo path missing."""
+        repo_path = tmp_path / "nonexistent" / "data-quality-baselines.json"
+        docker_path = tmp_path / "docker" / "data-quality-baselines.json"
+        docker_path.parent.mkdir(parents=True)
+        docker_path.write_text(
+            json.dumps({"field_completeness": {"Orange": {"ruling": 99.0, "judge": 95.0}}})
+        )
+
+        with (
+            patch.object(dqc, "DEFAULT_BASELINES_PATH", repo_path),
+            patch.object(dqc, "DOCKER_BASELINES_PATH", docker_path),
+        ):
+            result = load_field_baselines()
+        assert "Orange" in result
+        assert result["Orange"]["ruling"] == 99.0
+
+    def test_load_ecs_service_configs_uses_docker_fallback(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """load_ecs_service_configs reads Docker path when repo path missing."""
+        repo_path = tmp_path / "nonexistent" / "data-quality-baselines.json"
+        docker_path = tmp_path / "docker" / "data-quality-baselines.json"
+        docker_path.parent.mkdir(parents=True)
+        docker_path.write_text(
+            json.dumps(
+                {
+                    "ecs_services": [
+                        {
+                            "cluster": "test-cluster",
+                            "service": "test-service",
+                            "display_name": "Test Service",
+                        }
+                    ]
+                }
+            )
+        )
+
+        with (
+            patch.object(dqc, "DEFAULT_BASELINES_PATH", repo_path),
+            patch.object(dqc, "DOCKER_BASELINES_PATH", docker_path),
+        ):
+            result = load_ecs_service_configs()
+        assert len(result) == 1
+        assert result[0].cluster == "test-cluster"
+        assert result[0].service == "test-service"
 
 
 class TestCheckIngestRates:

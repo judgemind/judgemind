@@ -67,6 +67,29 @@ _REPO_ROOT = _SCRIPT_DIR.parent
 
 DEFAULT_BASELINES_PATH = _REPO_ROOT / "data-quality-baselines.json"
 
+# Fallback path inside the Docker image.  When running as an ECS oneshot
+# (uploaded to /tmp/_oneshot_script), the repo root is not available.
+# The Docker build copies baselines into the image at this path.  See #2323.
+DOCKER_BASELINES_PATH = Path("/app/data-quality-baselines.json")
+
+
+def _resolve_baselines_path() -> Path:
+    """Return the best available baselines file path.
+
+    Priority:
+      1. Repo-relative path (works in local dev and CI).
+      2. Docker image path (works in ECS oneshot tasks).
+      3. Repo-relative path (returned even if missing — caller handles absence).
+    """
+    if DEFAULT_BASELINES_PATH.exists():
+        return DEFAULT_BASELINES_PATH
+    if DOCKER_BASELINES_PATH.exists():
+        return DOCKER_BASELINES_PATH
+    # Neither exists — return the default so callers produce the usual
+    # "file not found" warning with a recognisable path.
+    return DEFAULT_BASELINES_PATH
+
+
 # Thresholds
 INGEST_DROP_THRESHOLD = 0.5  # Flag if below 50% of 7-day average
 DAILY_SCRAPER_STALE_HOURS = (
@@ -157,7 +180,7 @@ def load_baselines(
         Dict mapping county name to Baselines.
     """
     if raw is None:
-        baselines_path = path or DEFAULT_BASELINES_PATH
+        baselines_path = path or _resolve_baselines_path()
         if not baselines_path.exists():
             logger.warning(
                 "Baselines file not found at %s, using empty baselines",
@@ -409,7 +432,7 @@ def load_field_baselines(
         Dict mapping county name to dict of field name -> baseline percentage.
     """
     if raw is None:
-        baselines_path = path or DEFAULT_BASELINES_PATH
+        baselines_path = path or _resolve_baselines_path()
         if not baselines_path.exists():
             return {}
         with open(baselines_path) as f:
@@ -1047,7 +1070,7 @@ def load_ecs_service_configs(
         List of EcsServiceConfig to check.
     """
     if raw is None:
-        baselines_path = path or DEFAULT_BASELINES_PATH
+        baselines_path = path or _resolve_baselines_path()
         if baselines_path.exists():
             with open(baselines_path) as f:
                 raw = json.load(f)
