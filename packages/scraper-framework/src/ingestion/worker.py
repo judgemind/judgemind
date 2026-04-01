@@ -290,6 +290,8 @@ class IngestionWorker:
         self._pg_dsn = pg_dsn
         self._max_retries = max_retries
         self._conn: psycopg.Connection | None = None
+        self._s3_client = s3_client
+        self._archive_bucket = archive_bucket
         self._indexer = IndexingConsumer(
             opensearch_client=opensearch_client,
             s3_client=s3_client,
@@ -444,6 +446,56 @@ class IngestionWorker:
                     exc,
                 )
         return self._multimodal_extractor
+
+    def _fetch_raw_pdf_from_s3(
+        self,
+        s3_key: str | None,
+        s3_bucket: str | None,
+        document_id: str,
+    ) -> bytes | None:
+        """Download raw PDF bytes from S3 for multimodal extraction (#2312).
+
+        When a scraper pre-extracts PDF text in ``parse_document()`` (e.g.
+        Santa Clara), the event's ``ruling_text`` is pdfplumber-extracted text
+        rather than raw binary.  This means ``is_pdf_binary()`` returns False
+        and ``raw_pdf_bytes`` is None, so multimodal extraction cannot run.
+
+        This method downloads the original PDF from S3 using the event's
+        ``s3_key`` so the multimodal path can send page images to the LLM.
+
+        Returns the raw PDF bytes, or ``None`` if the download fails or the
+        S3 key is not available.
+        """
+        if not s3_key:
+            logger.debug(
+                "Cannot fetch raw PDF from S3 — no s3_key in event",
+                extra={"document_id": document_id},
+            )
+            return None
+
+        bucket = s3_bucket or self._archive_bucket
+        try:
+            response = self._s3_client.get_object(Bucket=bucket, Key=s3_key)
+            raw_bytes: bytes = response["Body"].read()
+            logger.info(
+                "Fetched raw PDF from S3 for multimodal extraction",
+                extra={
+                    "document_id": document_id,
+                    "s3_key": s3_key,
+                    "pdf_size": len(raw_bytes),
+                },
+            )
+            return raw_bytes
+        except Exception as exc:
+            logger.warning(
+                "Failed to fetch raw PDF from S3",
+                extra={
+                    "document_id": document_id,
+                    "s3_key": s3_key,
+                    "error": str(exc),
+                },
+            )
+            return None
 
     def _get_county_extractor(
         self,
@@ -800,6 +852,27 @@ class IngestionWorker:
                 # existing behavior is preserved.
                 if extracted_pdf_text is not None:
                     ruling_text = ""
+
+        # ------------------------------------------------------------------
+        # S3 PDF download for multimodal extraction (#2312)
+        # ------------------------------------------------------------------
+        # When a scraper pre-extracts PDF text in parse_document() (e.g.
+        # Santa Clara), ruling_text is pdfplumber text, not raw binary.
+        # is_pdf_binary() returns False, so raw_pdf_bytes stays None.
+        # For MULTIMODAL counties, download the original PDF from S3 so
+        # the multimodal path can send page images to the LLM.
+        if raw_pdf_bytes is None and content_format == "pdf" and s3_key:
+            from framework.extraction_config import (
+                ExtractionMethod,
+                get_county_extraction_config,
+            )
+
+            county_config = get_county_extraction_config(state, county)
+            needs_multimodal = (
+                county_config is not None and county_config.method == ExtractionMethod.MULTIMODAL
+            ) or county_config is None  # unconfigured counties default to multimodal
+            if needs_multimodal:
+                raw_pdf_bytes = self._fetch_raw_pdf_from_s3(s3_key, s3_bucket, document_id)
 
         # ------------------------------------------------------------------
         # Document splitting — detect multi-case calendar pages (#1475)

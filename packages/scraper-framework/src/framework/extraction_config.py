@@ -119,11 +119,7 @@ _COUNTY_CONFIGS: dict[tuple[str, str], CountyExtractionConfig] = {
         max_output_tokens=32768,
     ),
     ("CA", "SANTA CLARA"): CountyExtractionConfig(
-        method=ExtractionMethod.LLM,
-        system_prompt=SANTA_CLARA_SYSTEM_PROMPT,
-        provider="google",
-        model="gemini-2.5-flash-lite",
-        max_output_tokens=32768,
+        method=ExtractionMethod.MULTIMODAL,
     ),
     ("CA", "VENTURA"): CountyExtractionConfig(
         method=ExtractionMethod.LLM,
