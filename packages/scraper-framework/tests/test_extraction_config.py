@@ -15,6 +15,8 @@ from framework.extraction_config import (
     FRESNO_SYSTEM_PROMPT,
     RIVERSIDE_SYSTEM_PROMPT,
     SAN_BERNARDINO_SYSTEM_PROMPT,
+    SAN_DIEGO_FRAMEWORK_PROMPT,
+    SAN_DIEGO_SYSTEM_PROMPT,
     SAN_FRANCISCO_SYSTEM_PROMPT,
     SANTA_CLARA_SYSTEM_PROMPT,
     VENTURA_FRAMEWORK_PROMPT,
@@ -768,6 +770,94 @@ class TestVenturaConfigUsesFrameworkPrompt:
 
 
 # ---------------------------------------------------------------------------
+# SAN_DIEGO_FRAMEWORK_PROMPT content validation (#2303)
+# ---------------------------------------------------------------------------
+
+
+class TestSanDiegoFrameworkPrompt:
+    """Verify the San Diego framework prompt produces the correct format."""
+
+    def test_mentions_san_diego(self) -> None:
+        assert "san diego" in SAN_DIEGO_FRAMEWORK_PROMPT.lower()
+
+    def test_uses_rulings_array_format(self) -> None:
+        """Framework prompt must output {"rulings": [...]} format (#2303)."""
+        assert '"rulings"' in SAN_DIEGO_FRAMEWORK_PROMPT
+        assert "extracted_case_number" in SAN_DIEGO_FRAMEWORK_PROMPT
+        assert "extracted_case_title" in SAN_DIEGO_FRAMEWORK_PROMPT
+        assert "extracted_parties" in SAN_DIEGO_FRAMEWORK_PROMPT
+
+    def test_extracts_outcome(self) -> None:
+        """Framework prompt must extract outcome."""
+        assert '"outcome"' in SAN_DIEGO_FRAMEWORK_PROMPT
+
+    def test_extracts_motion_type(self) -> None:
+        """Framework prompt must extract motion_type."""
+        assert '"motion_type"' in SAN_DIEGO_FRAMEWORK_PROMPT
+
+    def test_extracts_judge_name(self) -> None:
+        """Framework prompt must extract judge name at document level."""
+        assert "extracted_judge_name" in SAN_DIEGO_FRAMEWORK_PROMPT
+
+    def test_extracts_hearing_date(self) -> None:
+        """Framework prompt must extract hearing date."""
+        assert '"hearing_date"' in SAN_DIEGO_FRAMEWORK_PROMPT
+
+    def test_extracts_department(self) -> None:
+        """Framework prompt must extract department."""
+        assert '"department"' in SAN_DIEGO_FRAMEWORK_PROMPT
+
+    def test_mentions_outcome_taxonomy(self) -> None:
+        """Framework prompt includes outcome taxonomy values."""
+        prompt_lower = SAN_DIEGO_FRAMEWORK_PROMPT.lower()
+        assert "granted" in prompt_lower
+        assert "denied" in prompt_lower
+        assert "continued" in prompt_lower
+        assert "off_calendar" in prompt_lower
+
+    def test_mentions_parties(self) -> None:
+        """Framework prompt instructs party extraction."""
+        prompt_lower = SAN_DIEGO_FRAMEWORK_PROMPT.lower()
+        assert "plaintiff" in prompt_lower
+        assert "defendant" in prompt_lower
+
+    def test_mentions_motion_types(self) -> None:
+        """Framework prompt lists common San Diego motion types."""
+        prompt_lower = SAN_DIEGO_FRAMEWORK_PROMPT.lower()
+        assert "demurrer" in prompt_lower
+        assert "motion to compel" in prompt_lower
+        assert "motion for summary judgment" in prompt_lower
+
+    def test_mentions_json_output(self) -> None:
+        """Framework prompt specifies JSON output format."""
+        assert "json" in SAN_DIEGO_FRAMEWORK_PROMPT.lower()
+
+    def test_different_from_scraper_prompt(self) -> None:
+        """Framework prompt is different from scraper prompt (different format)."""
+        # Scraper uses flat JSON, framework uses rulings array
+        assert SAN_DIEGO_FRAMEWORK_PROMPT != SAN_DIEGO_SYSTEM_PROMPT
+        # Framework has rulings array, scraper does not
+        assert '"rulings"' in SAN_DIEGO_FRAMEWORK_PROMPT
+        assert '"rulings"' not in SAN_DIEGO_SYSTEM_PROMPT
+        # Both share outcome taxonomy content
+        assert "granted_in_part" in SAN_DIEGO_FRAMEWORK_PROMPT
+        assert "granted_in_part" in SAN_DIEGO_SYSTEM_PROMPT
+
+
+class TestSanDiegoConfigUsesFrameworkPrompt:
+    """Verify the San Diego extraction config uses the framework prompt (#2303)."""
+
+    def test_san_diego_config_uses_framework_prompt(self) -> None:
+        """San Diego config must use SAN_DIEGO_FRAMEWORK_PROMPT, not SAN_DIEGO_SYSTEM_PROMPT."""
+        config = get_county_extraction_config("CA", "San Diego")
+        assert config is not None
+        # The config must use the framework prompt that produces {"rulings": [...]}
+        assert config.system_prompt is SAN_DIEGO_FRAMEWORK_PROMPT
+        # It must NOT use the scraper's flat JSON prompt
+        assert config.system_prompt is not SAN_DIEGO_SYSTEM_PROMPT
+
+
+# ---------------------------------------------------------------------------
 # CONTRA_COSTA_SYSTEM_PROMPT content validation (#2093)
 # ---------------------------------------------------------------------------
 
@@ -870,22 +960,7 @@ class TestPromptFormatValidation:
     @pytest.mark.parametrize(
         "key,config",
         [
-            pytest.param(
-                key,
-                config,
-                id=f"{key[0]}-{key[1]}",
-                marks=pytest.mark.xfail(
-                    reason=(
-                        "San Diego uses a flat JSON prompt for its scraper-level "
-                        "_sd_llm_extract() function, not the framework's "
-                        "LlmExtractor._parse_response().  The prompt is registered "
-                        "in _COUNTY_CONFIGS but is not framework-compatible."
-                    ),
-                    strict=True,
-                ),
-            )
-            if key == ("CA", "SAN DIEGO")
-            else pytest.param(key, config, id=f"{key[0]}-{key[1]}")
+            pytest.param(key, config, id=f"{key[0]}-{key[1]}")
             for key, config in _COUNTY_CONFIGS.items()
         ],
     )
