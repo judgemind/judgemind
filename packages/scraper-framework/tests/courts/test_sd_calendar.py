@@ -533,6 +533,30 @@ class TestSDCalendarScraper:
         result = scraper.parse_document(doc)
         assert result.ruling_text is None
 
+    def test_parse_document_handles_decode_error(self) -> None:
+        """parse_document handles non-UTF-8 raw_content gracefully."""
+        config = _make_config()
+        scraper = SDCalendarScraper(config)
+
+        from framework.models import CapturedDocument
+
+        # Invalid UTF-8 bytes that will cause a decode error
+        doc = CapturedDocument(
+            scraper_id="test",
+            state="CA",
+            county="San Diego",
+            court="Superior Court",
+            source_url="http://example.com",
+            capture_timestamp=datetime(2026, 3, 13),
+            content_format=ContentFormat.HTML,
+            raw_content=b"\xff\xfe",
+            content_hash="abc123",
+            case_number="24CU016153C",
+        )
+        # Should not raise — logs warning and returns doc unchanged
+        result = scraper.parse_document(doc)
+        assert result.ruling_text is None
+
     def test_parse_document_extracts_case_section(self) -> None:
         """parse_document narrows ruling_text to the specific case (#2311)."""
         config = _make_config()
@@ -669,6 +693,29 @@ class TestExtractCaseSection:
         # The full page is ~7KB; the section should be well under 1KB
         assert len(section) < 1000
         assert len(section) < len(html) / 3
+
+    def test_handles_dept_without_h2(self) -> None:
+        """Department div without h2 is skipped gracefully."""
+        html = '<div class="department"><table class="tables"><tbody><tr><td>x</td></tr></tbody></table></div>'
+        assert extract_case_section(html, "ANY") is None
+
+    def test_handles_dept_without_table(self) -> None:
+        """Department div without table is skipped gracefully."""
+        html = '<div class="department"><h2>Department: C-60</h2></div>'
+        assert extract_case_section(html, "ANY") is None
+
+    def test_handles_dept_without_tbody(self) -> None:
+        """Department div without tbody is skipped gracefully."""
+        html = '<div class="department"><h2>Department: C-60</h2><table class="tables"></table></div>'
+        assert extract_case_section(html, "ANY") is None
+
+    def test_handles_row_with_few_columns(self) -> None:
+        """Rows with fewer than 7 columns are skipped."""
+        html = (
+            '<div class="department"><h2>Department: C-60</h2>'
+            '<table class="tables"><tbody><tr><td>1</td><td>2</td></tr></tbody></table></div>'
+        )
+        assert extract_case_section(html, "ANY") is None
 
 
 # ---------------------------------------------------------------------------
