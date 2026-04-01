@@ -6,14 +6,17 @@
 set -uo pipefail
 
 # -------------------------------------------------------------------
-# 1. Ensure git hooks path points to .githooks/
+# 1. Ensure pre-push hook is reachable from .git/hooks/
 # -------------------------------------------------------------------
-# The pre-push hook lives in .githooks/ (committed to repo), not .git/hooks/.
-# Without this, pre-push checks never run and broken code reaches CI.
-CURRENT_HOOKS_PATH=$(git config core.hooksPath 2>/dev/null || true)
-if [ "$CURRENT_HOOKS_PATH" != ".githooks" ]; then
-    git config core.hooksPath .githooks
-    echo "session-start hook: configured core.hooksPath → .githooks" >&2
+# The pre-push hook source is .githooks/pre-push (committed to repo).
+# Claude Code sets core.hooksPath to .git/hooks/ (absolute) when creating
+# worktrees, so we symlink .git/hooks/pre-push → .githooks/pre-push to
+# make the hook reachable regardless of what core.hooksPath is set to.
+GIT_DIR=$(git rev-parse --git-common-dir 2>/dev/null || echo ".git")
+HOOKS_DIR="$GIT_DIR/hooks"
+if [ -d "$HOOKS_DIR" ] && [ ! -e "$HOOKS_DIR/pre-push" ]; then
+    ln -sf ../../.githooks/pre-push "$HOOKS_DIR/pre-push"
+    echo "session-start hook: symlinked $HOOKS_DIR/pre-push → .githooks/pre-push" >&2
 fi
 
 # -------------------------------------------------------------------
