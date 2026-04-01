@@ -24,6 +24,36 @@ from judgemind_config import DEFAULT_HAIKU_MODEL
 logger = structlog.get_logger(__name__)
 
 # ---------------------------------------------------------------------------
+# Retryable Google API error helpers
+# ---------------------------------------------------------------------------
+
+_RETRYABLE_GOOGLE_ERROR_SUBSTRINGS: tuple[str, ...] = (
+    "ResourceExhausted",  # 429 — rate limit
+    "ServiceUnavailable",  # 503 — capacity issues
+    "Unavailable",  # gRPC UNAVAILABLE status
+)
+
+
+def _is_retryable_google_error(exc: Exception) -> bool:
+    """Check if a Google API exception is transient and retryable.
+
+    Uses substring matching on the exception class name because
+    ``google.api_core.exceptions`` class names may vary across SDK
+    versions (e.g. ``ResourceExhausted`` vs ``ResourceExhaustedError``).
+    """
+    exc_name = type(exc).__name__
+    return any(sub in exc_name for sub in _RETRYABLE_GOOGLE_ERROR_SUBSTRINGS)
+
+
+def _google_retry_log_event(exc: Exception) -> str:
+    """Return the appropriate structlog event name for a retryable error."""
+    exc_name = type(exc).__name__
+    if "ResourceExhausted" in exc_name:
+        return "llm_providers.google_rate_limit"
+    return "llm_providers.google_unavailable"
+
+
+# ---------------------------------------------------------------------------
 # Response dataclass
 # ---------------------------------------------------------------------------
 
@@ -127,7 +157,7 @@ def _call_google(
     model: str,
     *,
     client: object | None = None,
-    max_retries: int = 1,
+    max_retries: int = 2,
     timeout: float | None = None,
     max_tokens: int = 4096,
 ) -> LLMResponse | None:
@@ -140,7 +170,8 @@ def _call_google(
         client: Optional pre-created ``google.genai.Client`` instance for
             connection reuse.  If ``None``, creates one from the
             ``GOOGLE_API_KEY`` env var.
-        max_retries: Number of retries on resource-exhausted errors.
+        max_retries: Number of retries on transient errors (rate limit,
+            503 unavailable).  Uses exponential backoff (1s, 2s, 4s, ...).
         timeout: Per-call timeout in seconds.  If ``None``, no timeout
             is applied.  On timeout, returns ``None``.
 
@@ -209,9 +240,10 @@ def _call_google(
                     error=str(exc),
                 )
                 return None
-            if "ResourceExhausted" in exc_name and attempt < max_retries:
-                logger.warning("llm_providers.google_rate_limit", attempt=attempt + 1)
-                time.sleep(1)
+            if _is_retryable_google_error(exc) and attempt < max_retries:
+                log_event = _google_retry_log_event(exc)
+                logger.warning(log_event, attempt=attempt + 1)
+                time.sleep(2**attempt)
                 continue
             logger.warning("llm_providers.google_api_error", error=str(exc))
             return None
@@ -230,7 +262,7 @@ def call_llm(
     provider: str | None = None,
     model: str | None = None,
     client: object | None = None,
-    max_retries: int = 1,
+    max_retries: int = 2,
     timeout: float | None = None,
     max_tokens: int = 4096,
 ) -> LLMResponse | None:
@@ -248,7 +280,9 @@ def call_llm(
         model: Model ID.  Falls back to ``LLM_MODEL`` env var, then a
             per-provider default.
         client: Optional pre-created provider client for connection reuse.
-        max_retries: Number of retries on rate-limit errors.
+        max_retries: Number of retries on transient errors.  For Google,
+            this includes rate limits (429) and service unavailable (503).
+            For Anthropic, retries are limited to rate-limit errors.
         timeout: Per-call timeout in seconds.  If ``None``, no timeout
             is applied.  On timeout, returns ``None`` so the caller can
             fall back to the next extraction tier (e.g. regex).
@@ -297,7 +331,7 @@ def call_llm_with_images(
     provider: str | None = None,
     model: str | None = None,
     client: object | None = None,
-    max_retries: int = 1,
+    max_retries: int = 2,
     timeout: float | None = None,
     max_tokens: int = 4096,
 ) -> LLMResponse | None:
@@ -315,7 +349,9 @@ def call_llm_with_images(
         provider: Provider name — ``"google"`` or ``"anthropic"``.
         model: Model ID.
         client: Optional pre-created provider client.
-        max_retries: Number of retries on rate-limit errors.
+        max_retries: Number of retries on transient errors.  For Google,
+            this includes rate limits (429) and service unavailable (503).
+            For Anthropic, retries are limited to rate-limit errors.
         timeout: Per-call timeout in seconds.
         max_tokens: Maximum output tokens.
 
@@ -448,7 +484,7 @@ def _call_google_with_images(
     model: str,
     *,
     client: object | None = None,
-    max_retries: int = 1,
+    max_retries: int = 2,
     timeout: float | None = None,
     max_tokens: int = 4096,
 ) -> LLMResponse | None:
@@ -512,12 +548,18 @@ def _call_google_with_images(
                     error=str(exc),
                 )
                 return None
-            if "ResourceExhausted" in exc_name and attempt < max_retries:
+            if _is_retryable_google_error(exc) and attempt < max_retries:
+                log_event = _google_retry_log_event(exc)
+                # Use vision-specific log event prefix
+                vision_event = log_event.replace(
+                    "llm_providers.google_",
+                    "llm_providers.google_vision_",
+                )
                 logger.warning(
-                    "llm_providers.google_vision_rate_limit",
+                    vision_event,
                     attempt=attempt + 1,
                 )
-                time.sleep(1)
+                time.sleep(2**attempt)
                 continue
             logger.warning("llm_providers.google_vision_api_error", error=str(exc))
             return None

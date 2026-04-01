@@ -16,11 +16,16 @@ from google import genai
 from judgemind_config import DEFAULT_HAIKU_MODEL
 
 from ingestion.llm_providers import (
+    _RETRYABLE_GOOGLE_ERROR_SUBSTRINGS,
     LLMResponse,
     _call_anthropic,
     _call_google,
+    _call_google_with_images,
+    _google_retry_log_event,
+    _is_retryable_google_error,
     _try_create,
     call_llm,
+    call_llm_with_images,
     create_client,
 )
 
@@ -228,7 +233,7 @@ class TestCallGoogle:
         assert result is None
 
     def test_resource_exhausted_retries(self) -> None:
-        """ResourceExhausted error triggers retry."""
+        """ResourceExhausted error triggers retry with exponential backoff."""
         mock_response = self._make_mock_response(text="ok")
 
         # Create a custom exception class to simulate ResourceExhausted
@@ -252,6 +257,7 @@ class TestCallGoogle:
 
         assert result is not None
         assert result.text == "ok"
+        # Exponential backoff: 2**0 = 1 for first attempt
         mock_sleep.assert_called_once_with(1)
 
     def test_missing_api_key_returns_none(self) -> None:
@@ -285,6 +291,322 @@ class TestCallGoogle:
         assert result is not None
         assert result.input_tokens == 0
         assert result.output_tokens == 0
+
+    def test_service_unavailable_retries(self) -> None:
+        """ServiceUnavailable (503) error triggers retry with exponential backoff."""
+        mock_response = self._make_mock_response(text="recovered")
+
+        class ServiceUnavailableError(Exception):
+            pass
+
+        client = MagicMock()
+        client.models.generate_content.side_effect = [
+            ServiceUnavailableError("503 UNAVAILABLE"),
+            mock_response,
+        ]
+
+        with patch("ingestion.llm_providers.time.sleep") as mock_sleep:
+            result = _call_google(
+                system_prompt="sys",
+                user_message="user",
+                model="test-model",
+                client=client,
+                max_retries=1,
+            )
+
+        assert result is not None
+        assert result.text == "recovered"
+        mock_sleep.assert_called_once_with(1)
+        assert client.models.generate_content.call_count == 2
+
+    def test_unavailable_retries(self) -> None:
+        """Unavailable (gRPC status) error triggers retry."""
+        mock_response = self._make_mock_response(text="recovered")
+
+        class UnavailableError(Exception):
+            pass
+
+        client = MagicMock()
+        client.models.generate_content.side_effect = [
+            UnavailableError("UNAVAILABLE"),
+            mock_response,
+        ]
+
+        with patch("ingestion.llm_providers.time.sleep") as mock_sleep:
+            result = _call_google(
+                system_prompt="sys",
+                user_message="user",
+                model="test-model",
+                client=client,
+                max_retries=1,
+            )
+
+        assert result is not None
+        assert result.text == "recovered"
+        mock_sleep.assert_called_once_with(1)
+
+    def test_503_exponential_backoff(self) -> None:
+        """Multiple 503 retries use exponential backoff (1s, 2s, 4s)."""
+        mock_response = self._make_mock_response(text="ok")
+
+        class ServiceUnavailableError(Exception):
+            pass
+
+        client = MagicMock()
+        client.models.generate_content.side_effect = [
+            ServiceUnavailableError("503"),
+            ServiceUnavailableError("503"),
+            mock_response,
+        ]
+
+        with patch("ingestion.llm_providers.time.sleep") as mock_sleep:
+            result = _call_google(
+                system_prompt="sys",
+                user_message="user",
+                model="test-model",
+                client=client,
+                max_retries=2,
+            )
+
+        assert result is not None
+        assert result.text == "ok"
+        assert mock_sleep.call_count == 2
+        # Exponential backoff: 2**0=1, 2**1=2
+        mock_sleep.assert_any_call(1)
+        mock_sleep.assert_any_call(2)
+
+    def test_503_exhausted_returns_none(self) -> None:
+        """503 errors exhaust retries and return None."""
+
+        class ServiceUnavailableError(Exception):
+            pass
+
+        client = MagicMock()
+        client.models.generate_content.side_effect = ServiceUnavailableError("503")
+
+        with patch("ingestion.llm_providers.time.sleep"):
+            result = _call_google(
+                system_prompt="sys",
+                user_message="user",
+                model="test-model",
+                client=client,
+                max_retries=2,
+            )
+
+        assert result is None
+        # 1 initial + 2 retries = 3 calls
+        assert client.models.generate_content.call_count == 3
+
+    def test_default_max_retries_is_2(self) -> None:
+        """Default max_retries for _call_google is 2."""
+        import inspect
+
+        sig = inspect.signature(_call_google)
+        assert sig.parameters["max_retries"].default == 2
+
+
+# ---------------------------------------------------------------------------
+# Google with images 503 retry tests
+# ---------------------------------------------------------------------------
+
+
+class TestCallGoogleWithImages503:
+    """Tests for 503 UNAVAILABLE retry behavior in _call_google_with_images."""
+
+    def _make_mock_response(
+        self,
+        text: str = '{"judge_name": "Test"}',
+        input_tokens: int = 100,
+        output_tokens: int = 50,
+    ) -> MagicMock:
+        usage = MagicMock()
+        usage.prompt_token_count = input_tokens
+        usage.candidates_token_count = output_tokens
+
+        response = MagicMock()
+        response.text = text
+        response.usage_metadata = usage
+        return response
+
+    def test_service_unavailable_retries(self) -> None:
+        """ServiceUnavailable (503) in vision call triggers retry."""
+        mock_response = self._make_mock_response(text="recovered")
+
+        class ServiceUnavailableError(Exception):
+            pass
+
+        client = MagicMock()
+        client.models.generate_content.side_effect = [
+            ServiceUnavailableError("503 UNAVAILABLE"),
+            mock_response,
+        ]
+
+        with patch("ingestion.llm_providers.time.sleep") as mock_sleep:
+            result = _call_google_with_images(
+                system_prompt="sys",
+                text_message="user",
+                images=[(b"fake-image", "image/png")],
+                model="test-model",
+                client=client,
+                max_retries=1,
+            )
+
+        assert result is not None
+        assert result.text == "recovered"
+        mock_sleep.assert_called_once_with(1)
+        assert client.models.generate_content.call_count == 2
+
+    def test_503_exponential_backoff(self) -> None:
+        """Multiple 503 retries in vision use exponential backoff."""
+        mock_response = self._make_mock_response(text="ok")
+
+        class ServiceUnavailableError(Exception):
+            pass
+
+        client = MagicMock()
+        client.models.generate_content.side_effect = [
+            ServiceUnavailableError("503"),
+            ServiceUnavailableError("503"),
+            mock_response,
+        ]
+
+        with patch("ingestion.llm_providers.time.sleep") as mock_sleep:
+            result = _call_google_with_images(
+                system_prompt="sys",
+                text_message="user",
+                images=[(b"fake-image", "image/png")],
+                model="test-model",
+                client=client,
+                max_retries=2,
+            )
+
+        assert result is not None
+        assert result.text == "ok"
+        assert mock_sleep.call_count == 2
+        mock_sleep.assert_any_call(1)
+        mock_sleep.assert_any_call(2)
+
+    def test_503_exhausted_returns_none(self) -> None:
+        """503 errors exhaust retries in vision and return None."""
+
+        class ServiceUnavailableError(Exception):
+            pass
+
+        client = MagicMock()
+        client.models.generate_content.side_effect = ServiceUnavailableError("503")
+
+        with patch("ingestion.llm_providers.time.sleep"):
+            result = _call_google_with_images(
+                system_prompt="sys",
+                text_message="user",
+                images=[(b"fake-image", "image/png")],
+                model="test-model",
+                client=client,
+                max_retries=2,
+            )
+
+        assert result is None
+        assert client.models.generate_content.call_count == 3
+
+    def test_default_max_retries_is_2(self) -> None:
+        """Default max_retries for _call_google_with_images is 2."""
+        import inspect
+
+        sig = inspect.signature(_call_google_with_images)
+        assert sig.parameters["max_retries"].default == 2
+
+
+# ---------------------------------------------------------------------------
+# Retryable error helper tests
+# ---------------------------------------------------------------------------
+
+
+class TestRetryableGoogleErrors:
+    """Tests for the retryable error detection helpers."""
+
+    def test_is_retryable_resource_exhausted(self) -> None:
+        """ResourceExhausted is retryable."""
+
+        class ResourceExhaustedError(Exception):
+            pass
+
+        assert _is_retryable_google_error(ResourceExhaustedError("429"))
+
+    def test_is_retryable_service_unavailable(self) -> None:
+        """ServiceUnavailable is retryable."""
+
+        class ServiceUnavailableError(Exception):
+            pass
+
+        assert _is_retryable_google_error(ServiceUnavailableError("503"))
+
+    def test_is_retryable_unavailable(self) -> None:
+        """Unavailable (gRPC) is retryable."""
+
+        class UnavailableError(Exception):
+            pass
+
+        assert _is_retryable_google_error(UnavailableError("UNAVAILABLE"))
+
+    def test_not_retryable_generic_error(self) -> None:
+        """Generic RuntimeError is not retryable."""
+        assert not _is_retryable_google_error(RuntimeError("something broke"))
+
+    def test_not_retryable_deadline_exceeded(self) -> None:
+        """DeadlineExceeded is not retryable (handled separately as timeout)."""
+
+        class DeadlineExceededError(Exception):
+            pass
+
+        assert not _is_retryable_google_error(DeadlineExceededError("timeout"))
+
+    def test_retry_log_event_rate_limit(self) -> None:
+        """ResourceExhausted uses rate_limit log event."""
+
+        class ResourceExhaustedError(Exception):
+            pass
+
+        event = _google_retry_log_event(ResourceExhaustedError("429"))
+        assert event == "llm_providers.google_rate_limit"
+
+    def test_retry_log_event_unavailable(self) -> None:
+        """ServiceUnavailable uses unavailable log event."""
+
+        class ServiceUnavailableError(Exception):
+            pass
+
+        event = _google_retry_log_event(ServiceUnavailableError("503"))
+        assert event == "llm_providers.google_unavailable"
+
+    def test_retryable_error_substrings(self) -> None:
+        """_RETRYABLE_GOOGLE_ERROR_SUBSTRINGS contains expected substrings."""
+        assert "ResourceExhausted" in _RETRYABLE_GOOGLE_ERROR_SUBSTRINGS
+        assert "ServiceUnavailable" in _RETRYABLE_GOOGLE_ERROR_SUBSTRINGS
+        assert "Unavailable" in _RETRYABLE_GOOGLE_ERROR_SUBSTRINGS
+        assert len(_RETRYABLE_GOOGLE_ERROR_SUBSTRINGS) == 3
+
+
+# ---------------------------------------------------------------------------
+# call_llm and call_llm_with_images default max_retries tests
+# ---------------------------------------------------------------------------
+
+
+class TestDefaultMaxRetries:
+    """Verify that public API functions default to max_retries=2."""
+
+    def test_call_llm_default_max_retries(self) -> None:
+        """call_llm defaults to max_retries=2."""
+        import inspect
+
+        sig = inspect.signature(call_llm)
+        assert sig.parameters["max_retries"].default == 2
+
+    def test_call_llm_with_images_default_max_retries(self) -> None:
+        """call_llm_with_images defaults to max_retries=2."""
+        import inspect
+
+        sig = inspect.signature(call_llm_with_images)
+        assert sig.parameters["max_retries"].default == 2
 
 
 # ---------------------------------------------------------------------------
