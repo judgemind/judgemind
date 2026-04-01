@@ -24,6 +24,7 @@ from courts.ca.la_tentatives import (
     LATentativeRulingsScraper,
     _extract_aspnet_tokens,
     _extract_case_title,
+    _extract_header_fields,
     _extract_parties,
     _extract_parties_from_anchor,
     _extract_ruling_fields,
@@ -2011,16 +2012,19 @@ class TestParseDocumentLlmPath:
         assert result.case_number == "24NNCV02551"
         assert result.ruling_text == "LLM text"
 
-    def test_regex_fallback_does_not_overwrite_llm_fields(self) -> None:
-        """When LLM has populated fields, regex extraction should NOT
-        overwrite them, even if regex would produce a different result."""
+    def test_regex_fallback_does_not_overwrite_non_header_llm_fields(self) -> None:
+        """Non-header LLM fields (ruling_text, case_title) keep precedence.
+
+        Deterministic header fields (case_number, hearing_date, department) are
+        overridden by header extraction (#2330), but other LLM fields are preserved.
+        """
         scraper = LATentativeRulingsScraper(default_config())
         # Use full multi-case HTML to match production
         html = _load("la_ruling_response.html")
 
         doc = _make_doc_with_fields(
             raw_content=html.encode("utf-8"),
-            case_number="CUSTOM_NUMBER",  # Intentionally different from HTML
+            case_number="CUSTOM_NUMBER",  # Will be overridden by header extraction
             ruling_text="LLM ruling text keeps precedence",
             case_title="LLM Custom Title",
             judge_name=None,  # This should be filled by regex
@@ -2029,8 +2033,9 @@ class TestParseDocumentLlmPath:
 
         result = scraper.parse_document(doc)
 
-        # LLM values must take precedence
-        assert result.case_number == "CUSTOM_NUMBER"
+        # Deterministic header fields override LLM values (#2330)
+        assert result.case_number == "24NNCV02551"
+        # Non-header LLM values must still take precedence
         assert result.ruling_text == "LLM ruling text keeps precedence"
         assert result.case_title == "LLM Custom Title"
         # Judge name should be filled by regex/dept fallback
@@ -2140,6 +2145,56 @@ class TestParseDocumentLlmPath:
         assert result.ruling_text == "LLM ruling text"
         # Null fields should stay null (not set to partial values)
         assert result.case_title is None
+
+    def test_deterministic_header_overrides_llm_hearing_date(self) -> None:
+        """Deterministic header extraction overrides incorrect LLM hearing_date.
+
+        The LLM may pick up wrong dates (filing dates, reference dates) from
+        body text.  The HTML header date is authoritative (#2330).
+        """
+        scraper = LATentativeRulingsScraper(default_config())
+        html = _load("la_ruling_response.html")
+
+        doc = _make_doc_with_fields(
+            raw_content=html.encode("utf-8"),
+            case_number="24NNCV02551",
+            ruling_text="LLM ruling text",
+            case_title="Aasi v. Tesla",
+            # LLM extracted wrong hearing_date (a filing date, not hearing date)
+            hearing_date=datetime(2025, 6, 24),
+            department="99",  # LLM got department wrong too
+            extra={"_llm_extracted": True, "ruling_index": 1},
+        )
+
+        result = scraper.parse_document(doc)
+
+        # Deterministic header extraction should override LLM values
+        assert result.hearing_date == datetime(2026, 3, 2), (
+            "Header hearing_date should override LLM hearing_date"
+        )
+        assert result.department == "3", "Header department should override LLM department"
+        # LLM case_title should still be preserved (not a header field)
+        assert result.case_title == "Aasi v. Tesla"
+
+    def test_deterministic_header_overrides_llm_case_number(self) -> None:
+        """Deterministic header extraction overrides incorrect LLM case_number."""
+        scraper = LATentativeRulingsScraper(default_config())
+        html = _load("la_ruling_response.html")
+
+        doc = _make_doc_with_fields(
+            raw_content=html.encode("utf-8"),
+            case_number="WRONG123",  # LLM got case number wrong
+            ruling_text="LLM ruling text",
+            hearing_date=datetime(2025, 1, 1),  # Wrong date too
+            extra={"_llm_extracted": True, "ruling_index": 1},
+        )
+
+        result = scraper.parse_document(doc)
+
+        # Header case_number should override LLM value
+        assert result.case_number == "24NNCV02551"
+        # Header hearing_date should override LLM value
+        assert result.hearing_date == datetime(2026, 3, 2)
 
 
 class TestFetchDocumentsLlmPath:
@@ -2734,3 +2789,390 @@ class TestRulingTextHtmlExtraction:
                 f"ruling_text_html not set for {ruling.case_number}"
             )
             assert "<script>" not in ruling.ruling_text_html
+
+
+# ---------------------------------------------------------------------------
+# _extract_header_fields — LA HTML <b> header tag extraction (#2330)
+# ---------------------------------------------------------------------------
+
+
+def test_extract_header_fields_from_ruling_response() -> None:
+    """Extract hearing_date, department, case_number from la_ruling_response.html."""
+    from bs4 import BeautifulSoup
+
+    html = _load("la_ruling_response.html")
+    sections = _split_cases_html(html)
+    assert len(sections) == 2
+
+    # First case section: 24NNCV02551, March 2, 2026, Dept 3
+    soup1 = BeautifulSoup(sections[0], "lxml")
+    content1 = soup1.find("div", id="speechSynthesis")
+    header1 = _extract_header_fields(content1)
+    assert header1.case_number == "24NNCV02551"
+    assert header1.hearing_date == datetime(2026, 3, 2)
+    assert header1.department == "3"
+
+    # Second case section: 26NNCP00062, March 2, 2026, Dept 3
+    soup2 = BeautifulSoup(sections[1], "lxml")
+    content2 = soup2.find("div", id="speechSynthesis")
+    header2 = _extract_header_fields(content2)
+    assert header2.case_number == "26NNCP00062"
+    assert header2.hearing_date == datetime(2026, 3, 2)
+    assert header2.department == "3"
+
+
+def test_extract_header_fields_alphanumeric_dept() -> None:
+    """Extract department F46 from la_ruling_cha_f46.html."""
+    from bs4 import BeautifulSoup
+
+    html = _load("la_ruling_cha_f46.html")
+    sections = _split_cases_html(html)
+    assert len(sections) >= 1
+
+    soup = BeautifulSoup(sections[0], "lxml")
+    content = soup.find("div", id="speechSynthesis")
+    header = _extract_header_fields(content)
+    assert header.case_number == "21CHCV00539"
+    assert header.hearing_date == datetime(2026, 3, 2)
+    assert header.department == "F46"
+
+
+def test_extract_header_fields_letter_dept() -> None:
+    """Extract department P from la_ruling_pas_p.html."""
+    from bs4 import BeautifulSoup
+
+    html = _load("la_ruling_pas_p.html")
+    sections = _split_cases_html(html)
+    assert len(sections) >= 1
+
+    soup = BeautifulSoup(sections[0], "lxml")
+    content = soup.find("div", id="speechSynthesis")
+    header = _extract_header_fields(content)
+    assert header.case_number == "25NNCV00140"
+    assert header.hearing_date == datetime(2026, 3, 2)
+    assert header.department == "P"
+
+
+def test_extract_header_fields_dept_i() -> None:
+    """Extract department I from la_ruling_dept_i_header_in_title.html."""
+    from bs4 import BeautifulSoup
+
+    html = _load("la_ruling_dept_i_header_in_title.html")
+    sections = _split_cases_html(html)
+    assert len(sections) >= 1
+
+    soup = BeautifulSoup(sections[0], "lxml")
+    content = soup.find("div", id="speechSynthesis")
+    header = _extract_header_fields(content)
+    assert header.case_number == "24VECV05649"
+    assert header.hearing_date == datetime(2026, 3, 6)
+    assert header.department == "I"
+
+
+def test_extract_header_fields_bh205() -> None:
+    """Extract department 205 from la_ruling_bh205.html."""
+    from bs4 import BeautifulSoup
+
+    html = _load("la_ruling_bh205.html")
+    sections = _split_cases_html(html)
+    assert len(sections) >= 1
+
+    soup = BeautifulSoup(sections[0], "lxml")
+    content = soup.find("div", id="speechSynthesis")
+    header = _extract_header_fields(content)
+    assert header.hearing_date == datetime(2026, 3, 3)
+    assert header.department == "205"
+
+
+def test_extract_header_fields_no_header_returns_none() -> None:
+    """HTML without header tags returns all-None _HeaderFields."""
+    from bs4 import BeautifulSoup
+
+    html = '<html><body><div id="speechSynthesis"><p>No header here.</p></div></body></html>'
+    soup = BeautifulSoup(html, "lxml")
+    content = soup.find("div", id="speechSynthesis")
+    header = _extract_header_fields(content)
+    assert header.case_number is None
+    assert header.hearing_date is None
+    assert header.department is None
+
+
+# ---------------------------------------------------------------------------
+# _extract_ruling_fields — hearing_date and department extraction (#2330)
+# ---------------------------------------------------------------------------
+
+
+def test_extract_fields_hearing_date_from_header() -> None:
+    """_extract_ruling_fields populates hearing_date from HTML header tags."""
+    from bs4 import BeautifulSoup
+
+    html = _load("la_ruling_response.html")
+    sections = _split_cases_html(html)
+    doc = CapturedDocument(
+        scraper_id="test",
+        state="CA",
+        county="Los Angeles",
+        court="Superior Court",
+        source_url=CIVIL_URL,
+        capture_timestamp=datetime(2026, 3, 2),
+        content_format=ContentFormat.HTML,
+        raw_content=sections[0].encode("utf-8"),
+        content_hash="",
+    )
+    soup = BeautifulSoup(doc.raw_content, "lxml")
+    _extract_ruling_fields(soup, doc)
+    assert doc.hearing_date == datetime(2026, 3, 2)
+
+
+def test_extract_fields_department_from_header() -> None:
+    """_extract_ruling_fields populates department from HTML header tags."""
+    from bs4 import BeautifulSoup
+
+    html = _load("la_ruling_response.html")
+    sections = _split_cases_html(html)
+    doc = CapturedDocument(
+        scraper_id="test",
+        state="CA",
+        county="Los Angeles",
+        court="Superior Court",
+        source_url=CIVIL_URL,
+        capture_timestamp=datetime(2026, 3, 2),
+        content_format=ContentFormat.HTML,
+        raw_content=sections[0].encode("utf-8"),
+        content_hash="",
+    )
+    soup = BeautifulSoup(doc.raw_content, "lxml")
+    _extract_ruling_fields(soup, doc)
+    assert doc.department == "3"
+
+
+def test_extract_fields_alphanumeric_department() -> None:
+    """_extract_ruling_fields extracts alphanumeric department from header."""
+    from bs4 import BeautifulSoup
+
+    html = _load("la_ruling_cha_f46.html")
+    sections = _split_cases_html(html)
+    doc = CapturedDocument(
+        scraper_id="test",
+        state="CA",
+        county="Los Angeles",
+        court="Superior Court",
+        source_url=CIVIL_URL,
+        capture_timestamp=datetime(2026, 3, 2),
+        content_format=ContentFormat.HTML,
+        raw_content=sections[0].encode("utf-8"),
+        content_hash="",
+    )
+    soup = BeautifulSoup(doc.raw_content, "lxml")
+    _extract_ruling_fields(soup, doc)
+    assert doc.department == "F46"
+
+
+def test_extract_fields_ruling_text_is_not_raw_html() -> None:
+    """All LA fixtures produce plain text ruling_text, never raw HTML."""
+    from bs4 import BeautifulSoup
+
+    for fixture_name in (
+        "la_ruling_response.html",
+        "la_ruling_cha_f46.html",
+        "la_ruling_pas_p.html",
+        "la_ruling_com_a.html",
+        "la_ruling_bh205.html",
+        "la_ruling_dept_i_header_in_title.html",
+    ):
+        html = _load(fixture_name)
+        sections = _split_cases_html(html)
+        for section in sections:
+            doc = CapturedDocument(
+                scraper_id="test",
+                state="CA",
+                county="Los Angeles",
+                court="Superior Court",
+                source_url=CIVIL_URL,
+                capture_timestamp=datetime(2026, 3, 2),
+                content_format=ContentFormat.HTML,
+                raw_content=section.encode("utf-8"),
+                content_hash="",
+            )
+            soup = BeautifulSoup(doc.raw_content, "lxml")
+            _extract_ruling_fields(soup, doc)
+            assert doc.ruling_text is not None, f"ruling_text is None for {fixture_name}"
+            # ruling_text should not start with < (raw HTML)
+            assert not doc.ruling_text.strip().startswith("<"), (
+                f"ruling_text is raw HTML for {fixture_name}: {doc.ruling_text[:100]}"
+            )
+
+
+# ---------------------------------------------------------------------------
+# _split_rulings — hearing_date and department in LASplitRuling (#2330)
+# ---------------------------------------------------------------------------
+
+
+def test_split_rulings_populates_hearing_date() -> None:
+    """_split_rulings sets hearing_date on each LASplitRuling."""
+    html = _load("la_ruling_response.html")
+    rulings = _split_rulings(html)
+    assert len(rulings) == 2
+    for ruling in rulings:
+        assert ruling.hearing_date == datetime(2026, 3, 2)
+
+
+def test_split_rulings_populates_department() -> None:
+    """_split_rulings sets department on each LASplitRuling."""
+    html = _load("la_ruling_response.html")
+    rulings = _split_rulings(html)
+    assert len(rulings) == 2
+    for ruling in rulings:
+        assert ruling.department == "3"
+
+
+def test_split_rulings_alphanumeric_department() -> None:
+    """_split_rulings extracts alphanumeric department F46."""
+    html = _load("la_ruling_cha_f46.html")
+    rulings = _split_rulings(html)
+    assert len(rulings) >= 1
+    assert rulings[0].department == "F46"
+    assert rulings[0].hearing_date == datetime(2026, 3, 2)
+
+
+def test_split_rulings_across_fixtures() -> None:
+    """_split_rulings extracts hearing_date and department from all main fixtures."""
+    test_cases = [
+        ("la_ruling_response.html", datetime(2026, 3, 2), "3"),
+        ("la_ruling_cha_f46.html", datetime(2026, 3, 2), "F46"),
+        ("la_ruling_pas_p.html", datetime(2026, 3, 2), "P"),
+        ("la_ruling_dept_i_header_in_title.html", datetime(2026, 3, 6), "I"),
+    ]
+    for fixture_name, expected_date, expected_dept in test_cases:
+        html = _load(fixture_name)
+        rulings = _split_rulings(html)
+        assert len(rulings) >= 1, f"No rulings from {fixture_name}"
+        assert rulings[0].hearing_date == expected_date, (
+            f"Wrong hearing_date from {fixture_name}: "
+            f"expected {expected_date}, got {rulings[0].hearing_date}"
+        )
+        assert rulings[0].department == expected_dept, (
+            f"Wrong department from {fixture_name}: "
+            f"expected {expected_dept}, got {rulings[0].department}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Edge cases — header extraction fallbacks (#2330)
+# ---------------------------------------------------------------------------
+
+
+def test_extract_header_fields_invalid_date_returns_none() -> None:
+    """Invalid date string in header tag results in hearing_date=None."""
+    from bs4 import BeautifulSoup
+
+    html = (
+        '<html><body><div id="speechSynthesis">'
+        "<B> Case Number: </B> 24NNCV02551"
+        "&nbsp;&nbsp;&nbsp;"
+        "<B> Hearing Date: </B> Zeptember 99, 2026"
+        "&nbsp;&nbsp;&nbsp;"
+        "<B> Dept: </B> 3"
+        "</div></body></html>"
+    )
+    soup = BeautifulSoup(html, "lxml")
+    content = soup.find("div", id="speechSynthesis")
+    header = _extract_header_fields(content)
+    assert header.case_number == "24NNCV02551"
+    assert header.hearing_date is None  # Invalid month/day
+    assert header.department == "3"
+
+
+def test_extract_ruling_fields_fallback_case_number_no_header() -> None:
+    """Body-text regex fallback when header has no case number."""
+    from unittest.mock import patch as _patch
+
+    from bs4 import BeautifulSoup
+
+    from courts.ca.la_tentatives import _HeaderFields
+
+    # HTML with a case number that header extraction can find
+    html = (
+        '<html><body><div id="speechSynthesis">'
+        "<p>Case Number: 24NNCV02551</p>"
+        "<p>The motion is GRANTED. This is a test ruling that has enough text "
+        "to pass the minimum length check for splitting purposes.</p>"
+        "</div></body></html>"
+    )
+    doc = CapturedDocument(
+        scraper_id="test",
+        state="CA",
+        county="Los Angeles",
+        court="Superior Court",
+        source_url=CIVIL_URL,
+        capture_timestamp=datetime(2026, 3, 2),
+        content_format=ContentFormat.HTML,
+        raw_content=html.encode("utf-8"),
+        content_hash="",
+    )
+    # Mock _extract_header_fields to return no case_number, forcing the
+    # body-text regex fallback path.
+    with _patch(
+        "courts.ca.la_tentatives._extract_header_fields",
+        return_value=_HeaderFields(case_number=None, hearing_date=None, department=None),
+    ):
+        soup = BeautifulSoup(doc.raw_content, "lxml")
+        _extract_ruling_fields(soup, doc)
+    assert doc.case_number == "24NNCV02551"
+
+
+def test_extract_ruling_fields_fallback_multiple_case_numbers() -> None:
+    """When header returns no case_number but text has multiple, all_case_numbers is set."""
+    from unittest.mock import patch as _patch
+
+    from bs4 import BeautifulSoup
+
+    from courts.ca.la_tentatives import _HeaderFields
+
+    html = (
+        '<html><body><div id="speechSynthesis">'
+        "<p>Case Number: 24NNCV02551</p>"
+        "<p>Related to Case Number: 24NNCV02552</p>"
+        "<p>The motion is GRANTED. This is sufficient body text.</p>"
+        "</div></body></html>"
+    )
+    doc = CapturedDocument(
+        scraper_id="test",
+        state="CA",
+        county="Los Angeles",
+        court="Superior Court",
+        source_url=CIVIL_URL,
+        capture_timestamp=datetime(2026, 3, 2),
+        content_format=ContentFormat.HTML,
+        raw_content=html.encode("utf-8"),
+        content_hash="",
+    )
+    with _patch(
+        "courts.ca.la_tentatives._extract_header_fields",
+        return_value=_HeaderFields(case_number=None, hearing_date=None, department=None),
+    ):
+        soup = BeautifulSoup(doc.raw_content, "lxml")
+        _extract_ruling_fields(soup, doc)
+    assert doc.case_number == "24NNCV02551"
+    assert doc.extra.get("all_case_numbers") == ["24NNCV02551", "24NNCV02552"]
+
+
+def test_split_rulings_fallback_case_number_no_header() -> None:
+    """When header case_number is absent, _split_rulings uses body-text regex."""
+    from unittest.mock import patch as _patch
+
+    from courts.ca.la_tentatives import _HeaderFields
+
+    # Use a real fixture so _split_cases_html produces valid sections
+    html = _load("la_ruling_response.html")
+
+    # Mock _extract_header_fields to return no case_number
+    with _patch(
+        "courts.ca.la_tentatives._extract_header_fields",
+        return_value=_HeaderFields(case_number=None, hearing_date=None, department=None),
+    ):
+        rulings = _split_rulings(html)
+    # The body-text regex fallback should still find case numbers
+    assert len(rulings) == 2
+    assert rulings[0].case_number == "24NNCV02551"
+    assert rulings[1].case_number == "26NNCP00062"

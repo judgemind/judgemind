@@ -137,6 +137,87 @@ _DEPT_HEADER_BOILERPLATE_RE = re.compile(
 # entity-descriptor stripping still contain too much caption noise.
 _MAX_TITLE_LENGTH = 120
 
+# ---------------------------------------------------------------------------
+# Structured header extraction from LA HTML <b> tags (#2330)
+# ---------------------------------------------------------------------------
+# LA Court HTML pages embed structured metadata in <b> header tags:
+#   <B> Case Number: </B> 24NNCV02551&nbsp;&nbsp;&nbsp;
+#   <B> Hearing Date: </B>  March 2, 2026&nbsp;&nbsp;&nbsp;
+#   <B> Dept: </B> 3
+#
+# These must be extracted deterministically (not via LLM) to avoid
+# picking up wrong dates from the ruling body text.
+
+# Regex for hearing date in "Month DD, YYYY" format from the <b> header tags.
+# Extracts from the BeautifulSoup text (after tags are stripped), where the
+# pattern appears as "Hearing Date:  March 2, 2026".
+_HEADER_HEARING_DATE_RE = re.compile(
+    r"Hearing\s+Date:\s+([A-Z][a-z]+\s+\d{1,2},?\s+\d{4})",
+)
+
+# Regex for department from the <b> header tags.
+# Appears as "Dept:  3" or "Dept:  F46" or "Dept:  P".
+_HEADER_DEPT_RE = re.compile(
+    r"Dept:\s+(\S+)",
+)
+
+# Recognized month names for parsing "Month DD, YYYY" dates.
+_MONTH_FORMATS = ("%B %d, %Y", "%B %d %Y")
+
+
+@dataclass
+class _HeaderFields:
+    """Structured fields extracted from LA HTML <b> header tags."""
+
+    case_number: str | None = None
+    hearing_date: datetime | None = None
+    department: str | None = None
+
+
+def _extract_header_fields(content: BeautifulSoup) -> _HeaderFields:
+    """Extract case_number, hearing_date, and department from LA HTML headers.
+
+    LA Court HTML places structured metadata in ``<b>`` tags at the top of each
+    case section inside the ``div#speechSynthesis`` div.  These fields are
+    deterministic and should take priority over LLM enrichment.
+
+    Args:
+        content: A BeautifulSoup element (typically the speechSynthesis div
+            or a single case section's soup) to search for header fields.
+
+    Returns:
+        A ``_HeaderFields`` dataclass with the extracted values (any may be None).
+    """
+    result = _HeaderFields()
+
+    # Get the text content for regex matching.  The <b> tags become part of
+    # the text structure: "Case Number:  24NNCV02551   Hearing Date:  March 2, 2026   Dept:  3"
+    text = content.get_text(separator=" ", strip=False)
+
+    # Case number from header (more reliable than body-text regex because
+    # the header is always present and correctly formatted).
+    case_num_match = _CASE_NUMBER_RE.search(text)
+    if case_num_match:
+        result.case_number = case_num_match.group(1)
+
+    # Hearing date from header.
+    date_match = _HEADER_HEARING_DATE_RE.search(text)
+    if date_match:
+        date_str = date_match.group(1).strip()
+        for fmt in _MONTH_FORMATS:
+            try:
+                result.hearing_date = datetime.strptime(date_str, fmt)
+                break
+            except ValueError:
+                continue
+
+    # Department from header.
+    dept_match = _HEADER_DEPT_RE.search(text)
+    if dept_match:
+        result.department = dept_match.group(1).strip()
+
+    return result
+
 
 # ---------------------------------------------------------------------------
 # LLM extraction feature flag and configuration (#1938)
@@ -182,6 +263,8 @@ class LASplitRuling:
     case_title: str | None = None
     motion_type: str | None = None
     outcome: str | None = None
+    hearing_date: datetime | None = None
+    department: str | None = None
     parties: list[dict[str, str]] = dataclass_field(default_factory=list)
 
 
@@ -484,11 +567,15 @@ def _split_rulings(text: str) -> list[LASplitRuling]:
         if not ruling_text or len(ruling_text) < 50:
             continue
 
-        # Extract case number.
-        case_number: str | None = None
-        case_numbers = _CASE_NUMBER_RE.findall(ruling_text)
-        if case_numbers:
-            case_number = case_numbers[0]
+        # Extract structured header fields deterministically (#2330).
+        header = _extract_header_fields(content if content else soup)
+
+        # Case number: prefer header extraction, fall back to body-text regex.
+        case_number = header.case_number
+        if not case_number:
+            case_numbers = _CASE_NUMBER_RE.findall(ruling_text)
+            if case_numbers:
+                case_number = case_numbers[0]
 
         # Extract case title.
         case_title = _extract_case_title(content if content else soup)
@@ -510,6 +597,8 @@ def _split_rulings(text: str) -> list[LASplitRuling]:
                 case_title=case_title,
                 motion_type=None,  # Filled by enrichment pipeline.
                 outcome=None,  # Filled by enrichment pipeline.
+                hearing_date=header.hearing_date,
+                department=header.department,
                 parties=parties,
             )
         )
@@ -1097,7 +1186,14 @@ def _apply_regex_fallback_for_llm_doc(
     case's document).  If the correct chunk cannot be identified, the
     fallback is aborted to avoid data corruption.
     """
-    fallback_fields = ("case_number", "case_title", "ruling_text", "judge_name")
+    fallback_fields = (
+        "case_number",
+        "case_title",
+        "ruling_text",
+        "judge_name",
+        "hearing_date",
+        "department",
+    )
     needs_fallback = any(getattr(doc, f) is None for f in fallback_fields)
     needs_party_fallback = not doc.parties
 
@@ -1165,9 +1261,19 @@ def _apply_regex_fallback_for_llm_doc(
             setattr(doc, f, val)
         return
 
-    # Restore non-null LLM values (they take precedence over regex).
+    # Fields where deterministic header extraction takes priority over LLM
+    # values (#2330).  The LLM frequently picks wrong dates from ruling body
+    # text (filing dates, reference dates) instead of the actual hearing date
+    # from the HTML header.  For these fields, the header extraction result
+    # is more reliable and must not be overwritten by LLM output.
+    _deterministic_header_fields = {"hearing_date", "department", "case_number"}
+
+    # Restore non-null LLM values for fields where LLM takes precedence
+    # (case_title, ruling_text, judge_name, parties).  Deterministic header
+    # fields are NOT restored — the header extraction result is authoritative.
     for f, val in saved.items():
-        setattr(doc, f, val)
+        if f not in _deterministic_header_fields:
+            setattr(doc, f, val)
 
     log.debug(
         "Applied regex fallback for LLM doc",
@@ -1182,6 +1288,10 @@ def _extract_ruling_fields(soup: BeautifulSoup, doc: CapturedDocument) -> None:
     The ruling content lives in div#speechSynthesis.  Multi-case department
     responses are split into individual sections by ``_split_cases_html``
     before this function is called, so each invocation handles exactly one case.
+
+    Extracts hearing_date, department, and case_number deterministically from
+    the ``<b>`` header tags (#2330), plus case_title, parties, and judge_name
+    from the ruling body.
     """
     content = soup.find("div", id="speechSynthesis")
     if not content:
@@ -1198,12 +1308,24 @@ def _extract_ruling_fields(soup: BeautifulSoup, doc: CapturedDocument) -> None:
     if sanitized:
         doc.ruling_text_html = sanitized
 
-    # All case numbers in this response
-    case_numbers = _CASE_NUMBER_RE.findall(full_text)
-    if case_numbers:
-        doc.case_number = case_numbers[0]
-        if len(case_numbers) > 1:
-            doc.extra["all_case_numbers"] = case_numbers
+    # Extract structured header fields deterministically (#2330).
+    # These take priority over LLM enrichment per the two-tier strategy.
+    header = _extract_header_fields(content)
+    if header.hearing_date is not None:
+        doc.hearing_date = header.hearing_date
+    if header.department is not None:
+        doc.department = header.department
+
+    # Case number: prefer header extraction over body-text regex.
+    if header.case_number:
+        doc.case_number = header.case_number
+    else:
+        # Fallback to body-text regex for case numbers.
+        case_numbers = _CASE_NUMBER_RE.findall(full_text)
+        if case_numbers:
+            doc.case_number = case_numbers[0]
+            if len(case_numbers) > 1:
+                doc.extra["all_case_numbers"] = case_numbers
 
     # Case title from the party caption block
     doc.case_title = _extract_case_title(content)
