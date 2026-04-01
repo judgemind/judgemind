@@ -63,6 +63,9 @@ check_ecs_service_health = dqc.check_ecs_service_health
 EcsServiceConfig = dqc.EcsServiceConfig
 load_ecs_service_configs = dqc.load_ecs_service_configs
 DEFAULT_ECS_SERVICES = dqc.DEFAULT_ECS_SERVICES
+is_rebuild_in_progress = dqc.is_rebuild_in_progress
+_downgrade_p1_alerts_for_rebuild = dqc._downgrade_p1_alerts_for_rebuild
+REBUILD_MARKER_TTL_HOURS = dqc.REBUILD_MARKER_TTL_HOURS
 
 NOW = datetime(2026, 3, 11, 12, 0, 0, tzinfo=UTC)
 
@@ -5914,3 +5917,291 @@ class TestFormatMetricsSnapshotRulingDocRatio:
         }
         snapshot = _format_metrics_for_snapshot(full_metrics)
         assert "ruling_document_ratio" not in snapshot["Los Angeles"]
+
+
+# ---------------------------------------------------------------------------
+# Rebuild marker tests (#2222)
+# ---------------------------------------------------------------------------
+
+
+class TestIsRebuildInProgress:
+    """Tests for is_rebuild_in_progress() — detecting active DB rebuilds."""
+
+    def test_no_marker_rows(self) -> None:
+        """Returns False when no marker rows exist in data_quality_metrics."""
+        mock_conn = MagicMock()
+        mock_cur = MagicMock()
+        mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cur)
+        mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+        mock_cur.fetchone.return_value = None
+
+        result = is_rebuild_in_progress(mock_conn, now=NOW)
+        assert result is False
+
+    def test_marker_active(self) -> None:
+        """Returns True when most recent marker has value 1.0 and is fresh."""
+        mock_conn = MagicMock()
+        mock_cur = MagicMock()
+        mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cur)
+        mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+        # Marker written 30 minutes ago, value = 1.0 (in progress)
+        marker_time = NOW - timedelta(minutes=30)
+        mock_cur.fetchone.return_value = (1.0, marker_time)
+
+        result = is_rebuild_in_progress(mock_conn, now=NOW)
+        assert result is True
+
+    def test_marker_completed(self) -> None:
+        """Returns False when most recent marker has value 0.0 (completed)."""
+        mock_conn = MagicMock()
+        mock_cur = MagicMock()
+        mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cur)
+        mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+        # Marker written 5 minutes ago, value = 0.0 (completed)
+        marker_time = NOW - timedelta(minutes=5)
+        mock_cur.fetchone.return_value = (0.0, marker_time)
+
+        result = is_rebuild_in_progress(mock_conn, now=NOW)
+        assert result is False
+
+    def test_marker_stale_ttl_expired(self) -> None:
+        """Returns False when marker is active but older than TTL (safety valve)."""
+        mock_conn = MagicMock()
+        mock_cur = MagicMock()
+        mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cur)
+        mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+        # Marker written 5 hours ago (TTL is 4 hours), value = 1.0
+        marker_time = NOW - timedelta(hours=5)
+        mock_cur.fetchone.return_value = (1.0, marker_time)
+
+        result = is_rebuild_in_progress(mock_conn, now=NOW)
+        assert result is False
+
+    def test_marker_at_ttl_boundary(self) -> None:
+        """Returns True when marker age exactly equals TTL (> not >=)."""
+        mock_conn = MagicMock()
+        mock_cur = MagicMock()
+        mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cur)
+        mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+        # Marker written exactly REBUILD_MARKER_TTL_HOURS ago
+        marker_time = NOW - timedelta(hours=REBUILD_MARKER_TTL_HOURS)
+        mock_cur.fetchone.return_value = (1.0, marker_time)
+
+        # At exactly the TTL boundary, age == TTL so `>` is False,
+        # meaning the marker is still considered active.
+        result = is_rebuild_in_progress(mock_conn, now=NOW)
+        assert result is True
+
+    def test_marker_just_within_ttl(self) -> None:
+        """Returns True when marker is just under the TTL."""
+        mock_conn = MagicMock()
+        mock_cur = MagicMock()
+        mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cur)
+        mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+        # Marker written 3 hours 59 minutes ago (TTL is 4 hours)
+        marker_time = NOW - timedelta(hours=3, minutes=59)
+        mock_cur.fetchone.return_value = (1.0, marker_time)
+
+        result = is_rebuild_in_progress(mock_conn, now=NOW)
+        assert result is True
+
+    def test_db_error_returns_false(self) -> None:
+        """Returns False when DB query fails (fail-open for alerting)."""
+        mock_conn = MagicMock()
+        mock_cur = MagicMock()
+        mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cur)
+        mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+        mock_cur.execute.side_effect = Exception("connection lost")
+
+        result = is_rebuild_in_progress(mock_conn, now=NOW)
+        assert result is False
+
+    def test_defaults_to_utc_now_when_no_now_arg(self) -> None:
+        """Uses datetime.now(UTC) when now is not provided."""
+        mock_conn = MagicMock()
+        mock_cur = MagicMock()
+        mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cur)
+        mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+        mock_cur.fetchone.return_value = None
+
+        # Call without the now argument — should not raise.
+        result = is_rebuild_in_progress(mock_conn)
+        assert result is False
+
+
+class TestDowngradeP1AlertsForRebuild:
+    """Tests for _downgrade_p1_alerts_for_rebuild()."""
+
+    def test_p1_alerts_downgraded_to_p2(self) -> None:
+        """P1 alerts are downgraded to P2 with rebuild note."""
+        alerts = [
+            Alert(
+                county="Los Angeles",
+                metric="zero_rulings",
+                severity="p1",
+                expected=50,
+                actual=0,
+                message="Los Angeles: zero new rulings in 24h (expected ~50.0/day)",
+            ),
+        ]
+        result = _downgrade_p1_alerts_for_rebuild(alerts)
+        assert len(result) == 1
+        assert result[0].severity == "p2"
+        assert "rebuild in progress" in result[0].message
+        assert "downgraded from P1" in result[0].message
+
+    def test_p2_alerts_unchanged(self) -> None:
+        """P2 alerts are not modified during rebuild."""
+        alerts = [
+            Alert(
+                county="Orange",
+                metric="ingest_rate",
+                severity="p2",
+                expected=20,
+                actual=5,
+                message="Orange: 5 rulings in 24h, baseline 20.0/day",
+            ),
+        ]
+        result = _downgrade_p1_alerts_for_rebuild(alerts)
+        assert len(result) == 1
+        assert result[0].severity == "p2"
+        assert "rebuild in progress" not in result[0].message
+
+    def test_mixed_p1_and_p2(self) -> None:
+        """Only P1 alerts are downgraded; P2 alerts remain unchanged."""
+        alerts = [
+            Alert(
+                county="Los Angeles",
+                metric="zero_rulings",
+                severity="p1",
+                expected=50,
+                actual=0,
+                message="LA: zero rulings",
+            ),
+            Alert(
+                county="Orange",
+                metric="ingest_rate",
+                severity="p2",
+                expected=20,
+                actual=5,
+                message="OC: low ingest",
+            ),
+            Alert(
+                county="Fresno",
+                metric="scraper_stale",
+                severity="p1",
+                expected="<26h",
+                actual="100h",
+                message="Fresno: scraper stale",
+            ),
+        ]
+        result = _downgrade_p1_alerts_for_rebuild(alerts)
+        assert len(result) == 3
+        # First alert (was P1) -> P2
+        assert result[0].severity == "p2"
+        assert "rebuild in progress" in result[0].message
+        # Second alert (was P2) -> unchanged
+        assert result[1].severity == "p2"
+        assert "rebuild in progress" not in result[1].message
+        # Third alert (was P1) -> P2
+        assert result[2].severity == "p2"
+        assert "rebuild in progress" in result[2].message
+
+    def test_empty_alerts(self) -> None:
+        """Returns empty list when no alerts."""
+        result = _downgrade_p1_alerts_for_rebuild([])
+        assert result == []
+
+    def test_preserves_other_fields(self) -> None:
+        """Downgraded alerts preserve county, metric, expected, actual."""
+        original = Alert(
+            county="Kern",
+            metric="field_completeness",
+            severity="p1",
+            expected=95.0,
+            actual=80.0,
+            message="Kern: judge completeness dropped",
+        )
+        result = _downgrade_p1_alerts_for_rebuild([original])
+        assert result[0].county == "Kern"
+        assert result[0].metric == "field_completeness"
+        assert result[0].expected == 95.0
+        assert result[0].actual == 80.0
+
+
+class TestRunChecksRebuildIntegration:
+    """Integration tests: run_checks downgrades P1 alerts during active rebuild."""
+
+    def test_run_checks_downgrades_p1_during_rebuild(self) -> None:
+        """When rebuild is active, P1 alerts from all checks are downgraded to P2."""
+        mock_conn = MagicMock()
+        mock_psycopg = MagicMock()
+        mock_psycopg.connect.return_value.__enter__ = MagicMock(return_value=mock_conn)
+        mock_psycopg.connect.return_value.__exit__ = MagicMock(return_value=False)
+
+        with (
+            patch.object(dqc, "psycopg", mock_psycopg),
+            patch.object(dqc, "is_rebuild_in_progress", return_value=True),
+            patch.object(
+                dqc,
+                "check_ingest_rates",
+                return_value=[
+                    Alert(
+                        county="Los Angeles",
+                        metric="zero_rulings",
+                        severity="p1",
+                        expected=50,
+                        actual=0,
+                        message="LA: zero rulings",
+                    ),
+                ],
+            ),
+            patch.object(dqc, "check_scraper_staleness", return_value=[]),
+            patch.object(dqc, "check_field_completeness", return_value=[]),
+            patch.object(dqc, "check_orphaned_documents", return_value=[]),
+            patch.object(dqc, "check_ruling_document_ratio", return_value=[]),
+            patch.object(dqc, "load_baselines", return_value={}),
+            patch.object(dqc, "load_field_baselines", return_value={}),
+        ):
+            alerts = dqc.run_checks("postgresql://fake", now=NOW)
+
+        assert len(alerts) == 1
+        assert alerts[0].severity == "p2"
+        assert "rebuild in progress" in alerts[0].message
+
+    def test_run_checks_no_downgrade_when_no_rebuild(self) -> None:
+        """When no rebuild is active, P1 alerts remain P1."""
+        mock_conn = MagicMock()
+        mock_psycopg = MagicMock()
+        mock_psycopg.connect.return_value.__enter__ = MagicMock(return_value=mock_conn)
+        mock_psycopg.connect.return_value.__exit__ = MagicMock(return_value=False)
+
+        with (
+            patch.object(dqc, "psycopg", mock_psycopg),
+            patch.object(dqc, "is_rebuild_in_progress", return_value=False),
+            patch.object(
+                dqc,
+                "check_ingest_rates",
+                return_value=[
+                    Alert(
+                        county="Los Angeles",
+                        metric="zero_rulings",
+                        severity="p1",
+                        expected=50,
+                        actual=0,
+                        message="LA: zero rulings",
+                    ),
+                ],
+            ),
+            patch.object(dqc, "check_scraper_staleness", return_value=[]),
+            patch.object(dqc, "check_field_completeness", return_value=[]),
+            patch.object(dqc, "check_orphaned_documents", return_value=[]),
+            patch.object(dqc, "check_ruling_document_ratio", return_value=[]),
+            patch.object(dqc, "load_baselines", return_value={}),
+            patch.object(dqc, "load_field_baselines", return_value={}),
+        ):
+            alerts = dqc.run_checks("postgresql://fake", now=NOW)
+
+        assert len(alerts) == 1
+        assert alerts[0].severity == "p1"
+        assert "rebuild in progress" not in alerts[0].message

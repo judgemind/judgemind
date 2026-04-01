@@ -99,6 +99,24 @@ MIN_FIELD_CHECK_SAMPLE_SIZE = 5
 # false-positive regressions while enrichment catches up.  (#1887)
 BULK_INGEST_MULTIPLIER = 3.0
 
+# Rebuild-in-progress detection — when rebuild_db.py --reset runs, it writes
+# a marker row to data_quality_metrics.  The data quality check reads this
+# marker and downgrades P1 alerts to P2 informational while a rebuild is
+# active.  This prevents noisy P1 alerts from masking real issues during
+# the multi-hour rebuild window.  (#2222)
+REBUILD_MARKER_COUNTY = "_system"
+REBUILD_MARKER_METRIC = "rebuild_in_progress"
+REBUILD_MARKER_TTL_HOURS = 4.0  # Safety valve: stale markers are ignored
+
+REBUILD_MARKER_QUERY = """
+    SELECT metric_value, recorded_at
+    FROM data_quality_metrics
+    WHERE county = %s
+      AND metric_name = %s
+    ORDER BY recorded_at DESC
+    LIMIT 1
+"""
+
 
 @dataclass
 class Alert:
@@ -1175,6 +1193,104 @@ def _build_county_filter(county: str | None) -> tuple[str, tuple[str, ...]]:
     return "", ()
 
 
+def is_rebuild_in_progress(
+    conn: psycopg.Connection,  # type: ignore[type-arg]
+    now: datetime | None = None,
+) -> bool:
+    """Check whether a database rebuild is currently in progress.
+
+    Queries the ``data_quality_metrics`` table for the most recent
+    ``rebuild_in_progress`` marker written by ``rebuild_db.py``.  The
+    marker is considered active when:
+
+    1. The most recent row has ``metric_value = 1.0`` (rebuild started,
+       not yet completed).
+    2. The row's ``recorded_at`` is within ``REBUILD_MARKER_TTL_HOURS``
+       of *now* (safety valve against stale markers from crashed rebuilds).
+
+    Args:
+        conn: Database connection.
+        now: Override current time (for testing).
+
+    Returns:
+        True if a rebuild is actively in progress, False otherwise.
+    """
+    if now is None:
+        now = datetime.now(UTC)
+
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                REBUILD_MARKER_QUERY,
+                (REBUILD_MARKER_COUNTY, REBUILD_MARKER_METRIC),
+            )
+            row = cur.fetchone()
+    except Exception:
+        logger.warning(
+            "Failed to check rebuild marker — assuming no rebuild in progress",
+            exc_info=True,
+        )
+        return False
+
+    if row is None:
+        return False
+
+    metric_value, recorded_at = row
+
+    # metric_value == 1.0 means rebuild started; 0.0 means completed.
+    if float(metric_value) != 1.0:
+        return False
+
+    # Safety valve: ignore stale markers (e.g. rebuild process crashed).
+    age_hours = (now - recorded_at).total_seconds() / 3600
+    if age_hours > REBUILD_MARKER_TTL_HOURS:
+        logger.info(
+            "Rebuild marker is stale (%.1fh old, TTL: %.1fh) — "
+            "ignoring and resuming normal alerting.",
+            age_hours,
+            REBUILD_MARKER_TTL_HOURS,
+        )
+        return False
+
+    logger.info(
+        "Active rebuild detected (marker %.1fh old). "
+        "P1 alerts will be downgraded to P2.",
+        age_hours,
+    )
+    return True
+
+
+def _downgrade_p1_alerts_for_rebuild(alerts: list[Alert]) -> list[Alert]:
+    """Downgrade all P1 alerts to P2 with a rebuild-in-progress note.
+
+    Called when ``is_rebuild_in_progress()`` returns True.  Preserves
+    the original alert information but changes severity from ``p1`` to
+    ``p2`` and appends a note to the message.
+
+    Args:
+        alerts: List of alerts from all check functions.
+
+    Returns:
+        New list with P1 alerts downgraded to P2.
+    """
+    result: list[Alert] = []
+    for alert in alerts:
+        if alert.severity == "p1":
+            result.append(
+                Alert(
+                    county=alert.county,
+                    metric=alert.metric,
+                    severity="p2",
+                    expected=alert.expected,
+                    actual=alert.actual,
+                    message=f"{alert.message} (rebuild in progress — downgraded from P1)",
+                )
+            )
+        else:
+            result.append(alert)
+    return result
+
+
 def _24h_overlaps_posting_day(
     now: datetime,
     posting_days: list[str] | None,
@@ -2096,6 +2212,8 @@ def run_checks(
     alerts: list[Alert] = []
 
     with psycopg.connect(dsn) as conn:
+        rebuild_active = is_rebuild_in_progress(conn, now)
+
         alerts.extend(check_ingest_rates(conn, now, baselines, county))
         alerts.extend(check_scraper_staleness(conn, now, baselines, county))
 
@@ -2120,6 +2238,10 @@ def run_checks(
     if check_ecs:
         ecs_configs = load_ecs_service_configs(raw=baselines_raw, path=baselines_path)
         alerts.extend(check_ecs_service_health(ecs_configs))
+
+    # Downgrade P1 alerts during active rebuilds (#2222).
+    if rebuild_active:
+        alerts = _downgrade_p1_alerts_for_rebuild(alerts)
 
     return alerts
 
@@ -2164,6 +2286,8 @@ def run_checks_full(
     alerts: list[Alert] = []
 
     with psycopg.connect(dsn) as conn:
+        rebuild_active = is_rebuild_in_progress(conn, now)
+
         alerts.extend(check_ingest_rates(conn, now, baselines, county))
         alerts.extend(check_scraper_staleness(conn, now, baselines, county))
 
@@ -2196,6 +2320,10 @@ def run_checks_full(
     if check_ecs:
         ecs_configs = load_ecs_service_configs(raw=baselines_raw, path=baselines_path)
         alerts.extend(check_ecs_service_health(ecs_configs))
+
+    # Downgrade P1 alerts during active rebuilds (#2222).
+    if rebuild_active:
+        alerts = _downgrade_p1_alerts_for_rebuild(alerts)
 
     return CheckResult(alerts=alerts, county_metrics=county_metrics)
 
