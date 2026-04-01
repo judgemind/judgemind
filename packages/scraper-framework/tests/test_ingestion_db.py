@@ -25,6 +25,7 @@ from ingestion.db import (
     _strip_nul,
     _truncate_party_name,
     batch_upsert_parties,
+    delete_stale_split_children,
     insert_document,
     insert_document_and_ruling,
     insert_ruling,
@@ -2367,3 +2368,97 @@ class TestResolveJudgeFromDepartment:
 
         result = resolve_judge_from_department(conn, "court-uuid-1", "3")
         assert result is None
+
+
+# ---------------------------------------------------------------------------
+# delete_stale_split_children
+# ---------------------------------------------------------------------------
+
+
+class TestDeleteStaleSplitChildren:
+    """Unit tests for delete_stale_split_children (#2295)."""
+
+    def test_deletes_stale_split_children(self) -> None:
+        """Should delete UUID v5 documents with the same s3_key not in valid set."""
+        conn = _mock_conn()
+        cur = conn.cursor.return_value.__enter__.return_value
+        # First query returns stale document IDs
+        stale_id = "aaaaaaaa-5555-5555-5555-aaaaaaaaaaaa"
+        cur.fetchall.return_value = [(stale_id,)]
+        # Second batch: rowcount for the DELETE FROM documents
+        cur.rowcount = 1
+
+        result = delete_stale_split_children(
+            conn,
+            s3_key="ca/orange/superior_court/raw/abc123.pdf",
+            valid_document_ids=["bbbbbbbb-5555-5555-5555-bbbbbbbbbbbb"],
+        )
+        assert result == 1
+
+        # Should have executed queries: SELECT stale, DELETE alert_events,
+        # DELETE validation_results, DELETE rulings, DELETE documents
+        assert cur.execute.call_count == 5
+
+    def test_no_stale_children_returns_zero(self) -> None:
+        """Should return 0 and not delete when no stale children found."""
+        conn = _mock_conn()
+        cur = conn.cursor.return_value.__enter__.return_value
+        cur.fetchall.return_value = []
+
+        result = delete_stale_split_children(
+            conn,
+            s3_key="ca/orange/superior_court/raw/abc123.pdf",
+            valid_document_ids=["bbbbbbbb-5555-5555-5555-bbbbbbbbbbbb"],
+        )
+        assert result == 0
+        # Only the SELECT query should have run
+        assert cur.execute.call_count == 1
+
+    def test_empty_s3_key_returns_zero(self) -> None:
+        """Should return 0 immediately when s3_key is empty."""
+        conn = _mock_conn()
+        cur = conn.cursor.return_value.__enter__.return_value
+
+        result = delete_stale_split_children(
+            conn,
+            s3_key="",
+            valid_document_ids=["bbbbbbbb-5555-5555-5555-bbbbbbbbbbbb"],
+        )
+        assert result == 0
+        cur.execute.assert_not_called()
+
+    def test_none_s3_key_returns_zero(self) -> None:
+        """Should return 0 immediately when s3_key is None."""
+        conn = _mock_conn()
+        cur = conn.cursor.return_value.__enter__.return_value
+
+        # Type annotation says str, but runtime callers may pass None
+        result = delete_stale_split_children(
+            conn,
+            s3_key=None,  # type: ignore[arg-type]
+            valid_document_ids=[],
+        )
+        assert result == 0
+        cur.execute.assert_not_called()
+
+    def test_cascades_to_dependent_tables(self) -> None:
+        """Should delete from alert_events, validation_results, rulings before documents."""
+        conn = _mock_conn()
+        cur = conn.cursor.return_value.__enter__.return_value
+        stale_id = "cccccccc-5555-5555-5555-cccccccccccc"
+        cur.fetchall.return_value = [(stale_id,)]
+        cur.rowcount = 1
+
+        delete_stale_split_children(
+            conn,
+            s3_key="ca/orange/superior_court/raw/abc123.pdf",
+            valid_document_ids=[],
+        )
+
+        # Extract SQL from execute calls (after the SELECT)
+        sql_calls = [call[0][0].strip() for call in cur.execute.call_args_list[1:]]
+        assert len(sql_calls) == 4
+        assert "alert_events" in sql_calls[0]
+        assert "validation_results" in sql_calls[1]
+        assert "rulings" in sql_calls[2]
+        assert "DELETE FROM documents" in sql_calls[3]
