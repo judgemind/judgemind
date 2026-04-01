@@ -696,7 +696,12 @@ class TestExtractCaseSection:
 
     def test_handles_dept_without_h2(self) -> None:
         """Department div without h2 is skipped gracefully."""
-        html = '<div class="department"><table class="tables"><tbody><tr><td>x</td></tr></tbody></table></div>'
+        html = (
+            '<div class="department">'
+            '<table class="tables"><tbody>'
+            "<tr><td>x</td></tr>"
+            "</tbody></table></div>"
+        )
         assert extract_case_section(html, "ANY") is None
 
     def test_handles_dept_without_table(self) -> None:
@@ -706,14 +711,19 @@ class TestExtractCaseSection:
 
     def test_handles_dept_without_tbody(self) -> None:
         """Department div without tbody is skipped gracefully."""
-        html = '<div class="department"><h2>Department: C-60</h2><table class="tables"></table></div>'
+        html = (
+            '<div class="department"><h2>Department: C-60</h2><table class="tables"></table></div>'
+        )
         assert extract_case_section(html, "ANY") is None
 
     def test_handles_row_with_few_columns(self) -> None:
         """Rows with fewer than 7 columns are skipped."""
         html = (
-            '<div class="department"><h2>Department: C-60</h2>'
-            '<table class="tables"><tbody><tr><td>1</td><td>2</td></tr></tbody></table></div>'
+            '<div class="department">'
+            "<h2>Department: C-60</h2>"
+            '<table class="tables"><tbody>'
+            "<tr><td>1</td><td>2</td></tr>"
+            "</tbody></table></div>"
         )
         assert extract_case_section(html, "ANY") is None
 
