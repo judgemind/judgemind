@@ -389,6 +389,9 @@ def _deduplicate_ruling_texts(
     Short texts (< ``_DEDUP_MIN_LENGTH`` chars) are exempt because legitimate
     identical rulings (e.g. "GRANTED." or "Motion is denied.") can appear
     on multiple cases.
+
+    Entries with ``cross_reference_source`` set are exempt because they
+    intentionally share ruling text via cross-reference resolution (#2317).
     """
     import hashlib
 
@@ -396,6 +399,9 @@ def _deduplicate_ruling_texts(
     for i, ruling in enumerate(rulings):
         text = ruling.ruling_text
         if not text or len(text) < _DEDUP_MIN_LENGTH:
+            continue
+        # Skip cross-reference entries — they share text by design (#2317).
+        if ruling.cross_reference_source is not None:
             continue
         text_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
         if text_hash in seen_hashes:
@@ -411,6 +417,124 @@ def _deduplicate_ruling_texts(
             )
         else:
             seen_hashes[text_hash] = i
+
+    return rulings
+
+
+# ---------------------------------------------------------------------------
+# Post-processing: cross-reference resolution (#2317)
+# ---------------------------------------------------------------------------
+
+# Santa Clara PDFs use calendar line numbers.  When multiple motions share
+# one ruling, the PDF lists the full ruling under one line number and uses
+# cross-references for the others.  These patterns match the stub text.
+
+# Patterns that contain an explicit line number reference.
+_XREF_LINE_RE = re.compile(
+    r"(?:See\s+Line\s+(\d+))"
+    r"|(?:[Ss]croll\s+down\s+to\s+Lines?\s+(\d+))"
+    r"|(?:Ctrl\s+Click\b.*?\bon\s+Line\s+(\d+))"
+    r"|(?:Click\s+on\s+Line\s+(\d+))"
+    r"|(?:\[The\s+Court\s+addressed\b.*?\bat\s+Line\s+(\d+)\s+above\])",
+    re.IGNORECASE,
+)
+
+# Pattern for implicit "previous entry" references (no explicit line number).
+_XREF_ORDER_ABOVE_RE = re.compile(
+    r"\[Order\s+above\]",
+    re.IGNORECASE,
+)
+
+# Minimum ruling_text length to consider "substantial" (non-stub).
+_XREF_MIN_TEXT_LENGTH = 100
+
+
+def _resolve_cross_references(
+    rulings: list[ExtractedRuling],
+    entry_number_to_index: dict[int, int],
+) -> list[ExtractedRuling]:
+    """Resolve cross-reference entries by copying ruling_text from the referenced entry (#2317).
+
+    Santa Clara tentative ruling PDFs use calendar line numbers.  When multiple
+    cases share one ruling, the PDF lists the full ruling under one line number
+    and uses cross-reference text for the others (e.g., "See Line 4 for
+    tentative ruling").  These entries end up with only the referral text as
+    their ``ruling_text``, resulting in null outcome after enrichment.
+
+    This function:
+    1. Detects cross-reference patterns in ``ruling_text``.
+    2. Extracts the referenced line number (or uses the previous entry for
+       ``[Order above]``).
+    3. Copies ``ruling_text`` from the referenced entry if it is substantial
+       (> 100 chars).
+    4. Sets ``cross_reference_source`` to the referenced entry_number.
+
+    Parameters
+    ----------
+    rulings:
+        List of ``ExtractedRuling`` objects from ``_join_page_rows``.
+    entry_number_to_index:
+        Mapping from calendar line entry_number to index in ``rulings``.
+    """
+    # Build reverse map: index -> entry_number (for "order above" lookups).
+    index_to_entry: dict[int, int] = {v: k for k, v in entry_number_to_index.items()}
+
+    for i, ruling in enumerate(rulings):
+        text = ruling.ruling_text
+        if not text:
+            continue
+
+        # Already substantial text — not a cross-reference stub.
+        if len(text) > _XREF_MIN_TEXT_LENGTH:
+            continue
+
+        # Try explicit line number patterns.
+        m = _XREF_LINE_RE.search(text)
+        if m:
+            # Extract the first non-None group (the line number).
+            ref_line = next((int(g) for g in m.groups() if g is not None), None)
+            if ref_line is not None:
+                ref_idx = entry_number_to_index.get(ref_line)
+                if ref_idx is not None and ref_idx != i:
+                    ref_ruling = rulings[ref_idx]
+                    ref_text = ref_ruling.ruling_text
+                    if ref_text and len(ref_text) > _XREF_MIN_TEXT_LENGTH:
+                        rulings[i] = ruling.model_copy(
+                            update={
+                                "ruling_text": ref_ruling.ruling_text,
+                                "cross_reference_source": ref_line,
+                            }
+                        )
+                        logger.info(
+                            "llm_extractor.xref_resolved",
+                            case_number=ruling.extracted_case_number,
+                            ref_line=ref_line,
+                            text_length=len(ref_ruling.ruling_text),
+                        )
+                continue
+
+        # Try implicit "order above" pattern.
+        if _XREF_ORDER_ABOVE_RE.search(text):
+            # Find the immediately preceding entry in the calendar.
+            prev_idx: int | None = None
+            if i > 0:
+                prev_idx = i - 1
+            if prev_idx is not None:
+                ref_ruling = rulings[prev_idx]
+                ref_entry = index_to_entry.get(prev_idx)
+                if ref_ruling.ruling_text and len(ref_ruling.ruling_text) > _XREF_MIN_TEXT_LENGTH:
+                    rulings[i] = ruling.model_copy(
+                        update={
+                            "ruling_text": ref_ruling.ruling_text,
+                            "cross_reference_source": ref_entry,
+                        }
+                    )
+                    logger.info(
+                        "llm_extractor.xref_resolved_order_above",
+                        case_number=ruling.extracted_case_number,
+                        prev_entry=ref_entry,
+                        text_length=len(ref_ruling.ruling_text),
+                    )
 
     return rulings
 
@@ -1701,6 +1825,9 @@ def _join_page_rows(
             if date_match and not header_date:
                 header_date = date_match.group(1)
 
+    # Track entry_number -> case_index for cross-reference resolution (#2317).
+    entry_number_to_index: dict[int, int] = {}
+
     for row in rows:
         # Skip header rows (e.g., department/judge headers) that the LLM
         # may include with entry_number=null and empty ruling_text.  These
@@ -1715,6 +1842,9 @@ def _join_page_rows(
                     "ruling_text": row["ruling_text"],
                 }
             )
+            # Record entry_number -> case index for cross-reference lookups.
+            if row["entry_number"] is not None:
+                entry_number_to_index[row["entry_number"]] = len(cases) - 1
         elif cases:
             # Continuation: merge into previous case.
             if row["case_info"]:
@@ -1776,6 +1906,13 @@ def _join_page_rows(
                 ruling_text=ruling_text,
             )
         )
+
+    # Post-processing: resolve cross-reference entries (#2317).
+    # Santa Clara PDFs use cross-references like "See Line 4 for tentative
+    # ruling" when multiple motions share one ruling.  Copy the ruling text
+    # from the referenced entry so enrichment can extract an outcome.
+    if entry_number_to_index:
+        rulings = _resolve_cross_references(rulings, entry_number_to_index)
 
     # Post-processing: deduplicate identical ruling texts (#2096).
     # The LLM sometimes produces the same ruling text for multiple cases

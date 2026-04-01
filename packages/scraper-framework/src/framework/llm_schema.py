@@ -120,6 +120,7 @@ class ExtractedRuling(BaseModel):
     hearing_date: str | None = None  # ISO format "YYYY-MM-DD"
     case_type: ExtractionCaseType | None = None
     confidence: FieldConfidence = Field(default_factory=FieldConfidence)
+    cross_reference_source: int | None = None  # entry_number ruling_text was copied from
 
 
 # ---------------------------------------------------------------------------

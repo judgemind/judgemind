@@ -31,7 +31,9 @@ from framework.llm_extractor import (
     _join_page_rows,
     _parse_page_rows,
     _render_pdf_pages,
+    _resolve_cross_references,
 )
+from framework.llm_schema import ExtractedRuling
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -1735,3 +1737,309 @@ class TestPerPagePrompt:
         assert "Label-value forms" in PDF_PER_PAGE_PROMPT
         assert "Continuation pages" in PDF_PER_PAGE_PROMPT
         assert "Boilerplate-only pages" in PDF_PER_PAGE_PROMPT
+
+
+# ---------------------------------------------------------------------------
+# Cross-reference resolution tests (#2317)
+# ---------------------------------------------------------------------------
+
+
+class TestResolveCrossReferences:
+    """Tests for the _resolve_cross_references function."""
+
+    def _make_ruling(
+        self,
+        case_number: str | None = None,
+        ruling_text: str | None = None,
+        cross_reference_source: int | None = None,
+    ) -> ExtractedRuling:
+        """Helper to create an ExtractedRuling with minimal fields."""
+        return ExtractedRuling(
+            extracted_case_number=case_number,
+            ruling_text=ruling_text,
+            cross_reference_source=cross_reference_source,
+        )
+
+    def test_see_line_pattern(self) -> None:
+        """'See Line N for tentative ruling' resolves to referenced entry."""
+        long_text = "The motion is GRANTED. " * 10  # > 100 chars
+        rulings = [
+            self._make_ruling("2024-00001", long_text),
+            self._make_ruling("2024-00002", "See Line 1 for tentative ruling."),
+        ]
+        entry_map = {1: 0, 2: 1}
+        result = _resolve_cross_references(rulings, entry_map)
+        assert result[1].ruling_text == long_text
+        assert result[1].cross_reference_source == 1
+
+    def test_scroll_down_to_line_pattern(self) -> None:
+        """'scroll down to Line N' resolves to referenced entry."""
+        long_text = "The demurrer is OVERRULED. " * 10
+        rulings = [
+            self._make_ruling("2024-00001", long_text),
+            self._make_ruling("2024-00002", "scroll down to Line 1 for ruling"),
+        ]
+        entry_map = {1: 0, 2: 1}
+        result = _resolve_cross_references(rulings, entry_map)
+        assert result[1].ruling_text == long_text
+        assert result[1].cross_reference_source == 1
+
+    def test_scroll_down_to_lines_plural(self) -> None:
+        """'Scroll down to Lines N' (plural) resolves to referenced entry."""
+        long_text = "Detailed ruling text here. " * 10
+        rulings = [
+            self._make_ruling("2024-00001", long_text),
+            self._make_ruling("2024-00002", "Scroll down to Lines 1"),
+        ]
+        entry_map = {1: 0, 2: 1}
+        result = _resolve_cross_references(rulings, entry_map)
+        assert result[1].ruling_text == long_text
+        assert result[1].cross_reference_source == 1
+
+    def test_ctrl_click_pattern(self) -> None:
+        """'Ctrl Click here on Line N' resolves to referenced entry."""
+        long_text = "The Court orders as follows: " * 10
+        rulings = [
+            self._make_ruling("2024-00001", long_text),
+            self._make_ruling("2024-00002", "Ctrl Click here on Line 1"),
+        ]
+        entry_map = {1: 0, 2: 1}
+        result = _resolve_cross_references(rulings, entry_map)
+        assert result[1].ruling_text == long_text
+        assert result[1].cross_reference_source == 1
+
+    def test_click_on_line_pattern(self) -> None:
+        """'Click on Line N' resolves to referenced entry."""
+        long_text = "Motion for summary judgment is DENIED. " * 10
+        rulings = [
+            self._make_ruling("2024-00001", long_text),
+            self._make_ruling("2024-00002", "Click on Line 1 for ruling"),
+        ]
+        entry_map = {1: 0, 2: 1}
+        result = _resolve_cross_references(rulings, entry_map)
+        assert result[1].ruling_text == long_text
+        assert result[1].cross_reference_source == 1
+
+    def test_court_addressed_pattern(self) -> None:
+        """'[The Court addressed ... at Line N above]' resolves."""
+        long_text = "The petition is GRANTED. " * 10
+        rulings = [
+            self._make_ruling("2024-00001", long_text),
+            self._make_ruling(
+                "2024-00002",
+                "[The Court addressed this matter at Line 1 above]",
+            ),
+        ]
+        entry_map = {1: 0, 2: 1}
+        result = _resolve_cross_references(rulings, entry_map)
+        assert result[1].ruling_text == long_text
+        assert result[1].cross_reference_source == 1
+
+    def test_order_above_uses_previous_entry(self) -> None:
+        """'[Order above]' resolves to the immediately preceding entry."""
+        long_text = "The motion to compel is GRANTED. " * 10
+        rulings = [
+            self._make_ruling("2024-00001", long_text),
+            self._make_ruling("2024-00002", "[Order above]"),
+        ]
+        entry_map = {1: 0, 2: 1}
+        result = _resolve_cross_references(rulings, entry_map)
+        assert result[1].ruling_text == long_text
+        assert result[1].cross_reference_source == 1
+
+    def test_order_above_first_entry_no_crash(self) -> None:
+        """'[Order above]' on the first entry doesn't crash (no previous)."""
+        rulings = [
+            self._make_ruling("2024-00001", "[Order above]"),
+        ]
+        entry_map = {1: 0}
+        result = _resolve_cross_references(rulings, entry_map)
+        # No previous entry, so text should remain unchanged.
+        assert result[0].ruling_text == "[Order above]"
+        assert result[0].cross_reference_source is None
+
+    def test_no_resolution_for_substantial_text(self) -> None:
+        """Entries with substantial ruling_text (> 100 chars) are not resolved."""
+        long_text_1 = "The first motion is GRANTED. " * 10
+        long_text_2 = "See Line 1. But also this is a real ruling. " * 5
+        rulings = [
+            self._make_ruling("2024-00001", long_text_1),
+            self._make_ruling("2024-00002", long_text_2),
+        ]
+        entry_map = {1: 0, 2: 1}
+        result = _resolve_cross_references(rulings, entry_map)
+        # Second entry is substantial, so should NOT be resolved.
+        assert result[1].ruling_text == long_text_2
+        assert result[1].cross_reference_source is None
+
+    def test_no_resolution_when_ref_not_found(self) -> None:
+        """Cross-reference to non-existent line number leaves text unchanged."""
+        rulings = [
+            self._make_ruling("2024-00001", "See Line 99 for tentative ruling."),
+        ]
+        entry_map = {1: 0}
+        result = _resolve_cross_references(rulings, entry_map)
+        assert result[0].ruling_text == "See Line 99 for tentative ruling."
+        assert result[0].cross_reference_source is None
+
+    def test_no_resolution_when_ref_text_too_short(self) -> None:
+        """Cross-reference to entry with short ruling_text leaves text unchanged."""
+        rulings = [
+            self._make_ruling("2024-00001", "GRANTED."),
+            self._make_ruling("2024-00002", "See Line 1 for tentative ruling."),
+        ]
+        entry_map = {1: 0, 2: 1}
+        result = _resolve_cross_references(rulings, entry_map)
+        # Referenced entry text is too short (< 100 chars), so no resolution.
+        assert result[1].ruling_text == "See Line 1 for tentative ruling."
+        assert result[1].cross_reference_source is None
+
+    def test_multiple_cross_references(self) -> None:
+        """Multiple entries referencing the same line all get resolved."""
+        long_text = "The motion is GRANTED. " * 10
+        rulings = [
+            self._make_ruling("2024-00001", long_text),
+            self._make_ruling("2024-00002", "See Line 1 for tentative ruling."),
+            self._make_ruling("2024-00003", "See Line 1 for tentative ruling."),
+        ]
+        entry_map = {1: 0, 2: 1, 3: 2}
+        result = _resolve_cross_references(rulings, entry_map)
+        assert result[1].ruling_text == long_text
+        assert result[1].cross_reference_source == 1
+        assert result[2].ruling_text == long_text
+        assert result[2].cross_reference_source == 1
+
+    def test_no_xref_plain_text(self) -> None:
+        """Short text that is NOT a cross-reference is left alone."""
+        rulings = [
+            self._make_ruling("2024-00001", "GRANTED."),
+        ]
+        entry_map = {1: 0}
+        result = _resolve_cross_references(rulings, entry_map)
+        assert result[0].ruling_text == "GRANTED."
+        assert result[0].cross_reference_source is None
+
+    def test_none_ruling_text_skipped(self) -> None:
+        """Entries with None ruling_text are skipped."""
+        rulings = [
+            self._make_ruling("2024-00001", None),
+        ]
+        entry_map = {1: 0}
+        result = _resolve_cross_references(rulings, entry_map)
+        assert result[0].ruling_text is None
+
+    def test_self_reference_not_resolved(self) -> None:
+        """Entry referencing itself does not create an infinite copy."""
+        rulings = [
+            self._make_ruling("2024-00001", "See Line 1 for tentative ruling."),
+        ]
+        entry_map = {1: 0}
+        result = _resolve_cross_references(rulings, entry_map)
+        assert result[0].ruling_text == "See Line 1 for tentative ruling."
+        assert result[0].cross_reference_source is None
+
+
+class TestCrossReferenceIntegration:
+    """Integration tests: cross-reference resolution through _join_page_rows."""
+
+    def test_see_line_resolved_via_join_page_rows(self) -> None:
+        """Cross-reference entries are resolved when going through _join_page_rows."""
+        long_text = ("The motion is GRANTED. The Court finds good cause. " * 5).strip()
+        rows = [
+            {
+                "entry_number": 1,
+                "case_info": "20CV374597 Regional Medical v. County of SC",
+                "ruling_text": long_text,
+            },
+            {
+                "entry_number": 2,
+                "case_info": "20CV374597 Regional Medical v. County of SC",
+                "ruling_text": "See Line 1 for tentative ruling.",
+            },
+            {
+                "entry_number": 3,
+                "case_info": "20CV374597 Regional Medical v. County of SC",
+                "ruling_text": "See Line 1 for tentative ruling.",
+            },
+            {
+                "entry_number": 4,
+                "case_info": "21CV378378 Wong-Mikhail v. Sutter Bay",
+                "ruling_text": "DENIED without prejudice.",
+            },
+        ]
+        rulings = _join_page_rows(rows)
+        assert len(rulings) == 4
+        # Lines 2 and 3 should have Line 1's ruling text.
+        assert rulings[1].ruling_text == long_text
+        assert rulings[1].cross_reference_source == 1
+        assert rulings[2].ruling_text == long_text
+        assert rulings[2].cross_reference_source == 1
+        # Line 1 should keep its own text.
+        assert rulings[0].ruling_text == long_text
+        assert rulings[0].cross_reference_source is None
+        # Line 4 should be untouched.
+        assert rulings[3].ruling_text == "DENIED without prejudice."
+        assert rulings[3].cross_reference_source is None
+
+    def test_order_above_resolved_via_join_page_rows(self) -> None:
+        """'[Order above]' entries are resolved through _join_page_rows."""
+        long_text = ("The petition is GRANTED with modifications. " * 5).strip()
+        rows = [
+            {
+                "entry_number": 5,
+                "case_info": "24PR196490 In re the Klein Trust",
+                "ruling_text": long_text,
+            },
+            {
+                "entry_number": 6,
+                "case_info": "24PR196491 In re the Smith Trust",
+                "ruling_text": "[Order above]",
+            },
+        ]
+        rulings = _join_page_rows(rows)
+        assert len(rulings) == 2
+        assert rulings[1].ruling_text == long_text
+        assert rulings[1].cross_reference_source == 5
+
+    def test_xref_not_deduped(self) -> None:
+        """Cross-referenced ruling text is NOT nulled by deduplication."""
+        long_text = ("The motion for summary adjudication is DENIED. " * 10).strip()
+        rows = [
+            {
+                "entry_number": 1,
+                "case_info": "20CV374597 Regional Medical v. County",
+                "ruling_text": long_text,
+            },
+            {
+                "entry_number": 2,
+                "case_info": "20CV374598 Other Medical v. County",
+                "ruling_text": "See Line 1 for tentative ruling.",
+            },
+        ]
+        rulings = _join_page_rows(rows)
+        assert len(rulings) == 2
+        # Both should have the ruling text — dedup should NOT null the xref.
+        assert rulings[0].ruling_text == long_text
+        assert rulings[1].ruling_text == long_text
+        assert rulings[1].cross_reference_source == 1
+
+    def test_existing_rulings_not_affected(self) -> None:
+        """Existing rulings with real text are not affected by xref resolution."""
+        rows = [
+            {
+                "entry_number": 1,
+                "case_info": "2024-00001 Smith v. Jones",
+                "ruling_text": "The motion is GRANTED.",
+            },
+            {
+                "entry_number": 2,
+                "case_info": "2024-00002 Alpha v. Beta",
+                "ruling_text": "The demurrer is OVERRULED.",
+            },
+        ]
+        rulings = _join_page_rows(rows)
+        assert len(rulings) == 2
+        assert rulings[0].ruling_text == "The motion is GRANTED."
+        assert rulings[0].cross_reference_source is None
+        assert rulings[1].ruling_text == "The demurrer is OVERRULED."
+        assert rulings[1].cross_reference_source is None
