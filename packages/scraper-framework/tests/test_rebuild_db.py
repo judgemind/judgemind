@@ -522,3 +522,55 @@ class TestMainSummary:
         )
         # The warning should mention 1 skip (the PDF document)
         assert skip_warnings[0].kwargs["no_hearing_date"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Rebuild marker tests (#2222)
+# ---------------------------------------------------------------------------
+
+
+class TestWriteRebuildMarker:
+    """Tests for _write_rebuild_marker in rebuild_db.py."""
+
+    def test_writes_start_marker(self) -> None:
+        """Writes metric_value=1.0 when in_progress=True."""
+        mock_conn = MagicMock()
+        mock_cur = MagicMock()
+        mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cur)
+        mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+
+        rebuild_db._write_rebuild_marker(mock_conn, in_progress=True)
+
+        mock_cur.execute.assert_called_once()
+        params = mock_cur.execute.call_args[0][1]
+        # params: (now, county, metric_name, metric_value, metadata)
+        assert params[1] == "_system"
+        assert params[2] == "rebuild_in_progress"
+        assert params[3] == 1.0
+        mock_conn.commit.assert_called_once()
+
+    def test_writes_completion_marker(self) -> None:
+        """Writes metric_value=0.0 when in_progress=False."""
+        mock_conn = MagicMock()
+        mock_cur = MagicMock()
+        mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cur)
+        mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+
+        rebuild_db._write_rebuild_marker(mock_conn, in_progress=False)
+
+        mock_cur.execute.assert_called_once()
+        params = mock_cur.execute.call_args[0][1]
+        assert params[3] == 0.0
+        mock_conn.commit.assert_called_once()
+
+    def test_db_error_does_not_raise(self) -> None:
+        """DB errors are caught and logged, not propagated."""
+        mock_conn = MagicMock()
+        mock_cur = MagicMock()
+        mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cur)
+        mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+        mock_cur.execute.side_effect = Exception("connection lost")
+
+        # Should not raise
+        rebuild_db._write_rebuild_marker(mock_conn, in_progress=True)
+        mock_conn.rollback.assert_called_once()

@@ -421,6 +421,47 @@ def _fetch_rosters(
     logger.info("Roster fetch complete", fetched=fetched, total=len(DIRECTORIES))
 
 
+def _write_rebuild_marker(
+    conn: psycopg.Connection,
+    *,
+    in_progress: bool,
+) -> None:
+    """Write a rebuild-in-progress marker to the data_quality_metrics table.
+
+    The data quality check reads this marker to suppress P1 alerts during
+    rebuilds.  See #2222.
+
+    Args:
+        conn: Database connection.
+        in_progress: True when rebuild starts, False when it completes.
+    """
+    metric_value = 1.0 if in_progress else 0.0
+    now = datetime.now(UTC)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO data_quality_metrics
+                    (recorded_at, county, metric_name, metric_value, metadata)
+                VALUES (%s, %s, %s, %s, %s)
+                """,
+                (now, "_system", "rebuild_in_progress", metric_value, None),
+            )
+        conn.commit()
+        status = "started" if in_progress else "completed"
+        logger.info("Rebuild marker written: %s", status)
+    except Exception:
+        logger.warning(
+            "Failed to write rebuild marker — data quality alerts may fire "
+            "during rebuild",
+            exc_info=True,
+        )
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+
+
 def main() -> None:
     import argparse
 
@@ -471,156 +512,175 @@ def main() -> None:
         else:
             logger.info("OPENSEARCH_URL not set — skipping OpenSearch index reset")
 
-    # Step 0b: Fetch court directory rosters so that dept-to-judge lookups
-    # work during processing.  Without this, the universal dept-to-judge
-    # fallback (#2269) in the ingestion worker has no snapshot data and
-    # all counties drop to ~15-35% judge resolution.
-    logger.info("Fetching court directory rosters...")
+        # Write rebuild-in-progress marker so the data quality check
+        # downgrades P1 alerts during the rebuild window (#2222).
+        _write_rebuild_marker(conn, in_progress=True)
+
+    # Wrap the rebuild in try/finally so the completion marker is always
+    # written when --reset was used, even if the rebuild fails partway (#2222).
     try:
-        _fetch_rosters(conn, s3, BUCKET)
-    except Exception:
-        logger.warning(
-            "Roster fetch failed — continuing without roster data", exc_info=True
+        # Step 0b: Fetch court directory rosters so that dept-to-judge lookups
+        # work during processing.  Without this, the universal dept-to-judge
+        # fallback (#2269) in the ingestion worker has no snapshot data and
+        # all counties drop to ~15-35% judge resolution.
+        logger.info("Fetching court directory rosters...")
+        try:
+            _fetch_rosters(conn, s3, BUCKET)
+        except Exception:
+            logger.warning(
+                "Roster fetch failed — continuing without roster data", exc_info=True
+            )
+
+        # Step 1: Discover keys (local cache or S3)
+        # Build S3 prefix — default "ca/", narrowed by --county if given.
+        s3_prefix = f"{sluggify(args.state)}/"
+        if args.county:
+            s3_prefix = f"{sluggify(args.state)}/{sluggify(args.county)}/"
+        logger.info("Discovering S3 objects...", prefix=s3_prefix)
+        if cache_dir:
+            keys = list_local_keys(Path(cache_dir), prefix=s3_prefix)
+            logger.info(
+                "Found keys from local cache", count=len(keys), cache_dir=cache_dir
+            )
+        else:
+            keys = list_s3_keys(s3, BUCKET, prefix=s3_prefix)
+            logger.info("Found keys from S3", count=len(keys))
+
+        if not keys:
+            logger.error("No content-addressed keys found.")
+            sys.exit(1)
+
+        # Step 2: Seed courts from key prefixes
+        courts = discover_courts(keys)
+        logger.info(
+            "Discovered courts",
+            count=len(courts),
+            courts=[c["court_code"] for c in courts],
         )
+        court_ids = seed_courts(conn, courts)
+        logger.info("Courts seeded", court_ids=court_ids)
 
-    # Step 1: Discover keys (local cache or S3)
-    # Build S3 prefix — default "ca/", narrowed by --county if given.
-    s3_prefix = f"{sluggify(args.state)}/"
-    if args.county:
-        s3_prefix = f"{sluggify(args.state)}/{sluggify(args.county)}/"
-    logger.info("Discovering S3 objects...", prefix=s3_prefix)
-    if cache_dir:
-        keys = list_local_keys(Path(cache_dir), prefix=s3_prefix)
-        logger.info("Found keys from local cache", count=len(keys), cache_dir=cache_dir)
-    else:
-        keys = list_s3_keys(s3, BUCKET, prefix=s3_prefix)
-        logger.info("Found keys from S3", count=len(keys))
+        # Step 3: Process documents using child processes.
+        # pdfplumber/pdfminer C extensions are not thread-safe — ProcessPoolExecutor
+        # gives each worker its own address space. Each child process lazily creates
+        # its own DB connection, Redis client, and IngestionWorker.
+        if not os_url:
+            logger.info("OPENSEARCH_URL not set — skipping search indexing")
 
-    if not keys:
-        logger.error("No content-addressed keys found.")
-        sys.exit(1)
+        from concurrent.futures import ProcessPoolExecutor, as_completed
 
-    # Step 2: Seed courts from key prefixes
-    courts = discover_courts(keys)
-    logger.info(
-        "Discovered courts", count=len(courts), courts=[c["court_code"] for c in courts]
-    )
-    court_ids = seed_courts(conn, courts)
-    logger.info("Courts seeded", court_ids=court_ids)
+        concurrency = args.concurrency
+        logger.info("Processing documents", concurrency=concurrency, total=len(keys))
 
-    # Step 3: Process documents using child processes.
-    # pdfplumber/pdfminer C extensions are not thread-safe — ProcessPoolExecutor
-    # gives each worker its own address space. Each child process lazily creates
-    # its own DB connection, Redis client, and IngestionWorker.
-    if not os_url:
-        logger.info("OPENSEARCH_URL not set — skipping search indexing")
+        # Step 4: Process documents concurrently using processes (not threads).
+        # pdfplumber/pdfminer use C extensions that segfault under heavy threading.
+        # Each process gets its own address space — no shared-memory corruption.
+        t_start = time.monotonic()
+        processed = 0
+        errors = 0
+        skipped = 0
+        # Track documents where hearing_date was NOT available in the event.
+        # The worker may still extract it via LLM or regex, but when that also
+        # fails, the ruling row is skipped.  This counter helps diagnose
+        # missing-ruling issues for PDF counties.
+        no_hearing_date = 0
+        # Per-format counters for the summary.
+        format_counts: dict[str, int] = {}
 
-    from concurrent.futures import ProcessPoolExecutor, as_completed
+        with ProcessPoolExecutor(max_workers=concurrency) as pool:
+            futures = {
+                pool.submit(
+                    _process_one_document,
+                    key,
+                    cache_dir,
+                    BUCKET,
+                    database_url,
+                    redis_url,
+                    os_url,
+                ): key
+                for key in keys
+            }
+            for future in as_completed(futures):
+                key = futures[future]
+                try:
+                    result = future.result()
+                    status = (
+                        result.get("status", "error")
+                        if isinstance(result, dict)
+                        else result
+                    )
+                    content_format = (
+                        result.get("content_format", "")
+                        if isinstance(result, dict)
+                        else ""
+                    )
+                    had_hearing_date = (
+                        result.get("had_hearing_date", False)
+                        if isinstance(result, dict)
+                        else False
+                    )
 
-    concurrency = args.concurrency
-    logger.info("Processing documents", concurrency=concurrency, total=len(keys))
+                    if status == "ok":
+                        processed += 1
+                    elif status == "skip":
+                        skipped += 1
+                    else:
+                        errors += 1
 
-    # Step 4: Process documents concurrently using processes (not threads).
-    # pdfplumber/pdfminer use C extensions that segfault under heavy threading.
-    # Each process gets its own address space — no shared-memory corruption.
-    t_start = time.monotonic()
-    processed = 0
-    errors = 0
-    skipped = 0
-    # Track documents where hearing_date was NOT available in the event.
-    # The worker may still extract it via LLM or regex, but when that also
-    # fails, the ruling row is skipped.  This counter helps diagnose
-    # missing-ruling issues for PDF counties.
-    no_hearing_date = 0
-    # Per-format counters for the summary.
-    format_counts: dict[str, int] = {}
+                    if content_format:
+                        format_counts[content_format] = (
+                            format_counts.get(content_format, 0) + 1
+                        )
+                    if status == "ok" and not had_hearing_date:
+                        no_hearing_date += 1
 
-    with ProcessPoolExecutor(max_workers=concurrency) as pool:
-        futures = {
-            pool.submit(
-                _process_one_document,
-                key,
-                cache_dir,
-                BUCKET,
-                database_url,
-                redis_url,
-                os_url,
-            ): key
-            for key in keys
-        }
-        for future in as_completed(futures):
-            key = futures[future]
-            try:
-                result = future.result()
-                status = (
-                    result.get("status", "error")
-                    if isinstance(result, dict)
-                    else result
-                )
-                content_format = (
-                    result.get("content_format", "") if isinstance(result, dict) else ""
-                )
-                had_hearing_date = (
-                    result.get("had_hearing_date", False)
-                    if isinstance(result, dict)
-                    else False
-                )
-
-                if status == "ok":
-                    processed += 1
-                elif status == "skip":
-                    skipped += 1
-                else:
+                    total_done = processed + errors + skipped
+                    if processed > 0 and processed % 50 == 0:
+                        elapsed = time.monotonic() - t_start
+                        elapsed_min = elapsed / 60
+                        keys_per_min = total_done / elapsed * 60 if elapsed > 0 else 0
+                        eta_min = (
+                            (len(keys) - total_done) / (total_done / elapsed) / 60
+                            if total_done > 0 and elapsed > 0
+                            else 0
+                        )
+                        logger.info(
+                            "Progress",
+                            keys_done=total_done,
+                            keys_total=len(keys),
+                            pct=round(100 * total_done / len(keys), 1),
+                            keys_per_min=round(keys_per_min, 1),
+                            elapsed_min=round(elapsed_min, 1),
+                            eta_min=round(eta_min, 1),
+                            errors=errors,
+                        )
+                except Exception as exc:
                     errors += 1
+                    logger.error("Failed to process", key=key, error=str(exc))
 
-                if content_format:
-                    format_counts[content_format] = (
-                        format_counts.get(content_format, 0) + 1
-                    )
-                if status == "ok" and not had_hearing_date:
-                    no_hearing_date += 1
-
-                total_done = processed + errors + skipped
-                if processed > 0 and processed % 50 == 0:
-                    elapsed = time.monotonic() - t_start
-                    elapsed_min = elapsed / 60
-                    keys_per_min = total_done / elapsed * 60 if elapsed > 0 else 0
-                    eta_min = (
-                        (len(keys) - total_done) / (total_done / elapsed) / 60
-                        if total_done > 0 and elapsed > 0
-                        else 0
-                    )
-                    logger.info(
-                        "Progress",
-                        keys_done=total_done,
-                        keys_total=len(keys),
-                        pct=round(100 * total_done / len(keys), 1),
-                        keys_per_min=round(keys_per_min, 1),
-                        elapsed_min=round(elapsed_min, 1),
-                        eta_min=round(eta_min, 1),
-                        errors=errors,
-                    )
-            except Exception as exc:
-                errors += 1
-                logger.error("Failed to process", key=key, error=str(exc))
-
-    logger.info(
-        "Rebuild complete",
-        processed=processed,
-        errors=errors,
-        skipped=skipped,
-        total=len(keys),
-        format_counts=format_counts,
-    )
-
-    if no_hearing_date > 0:
-        logger.warning(
-            "%d documents had no pre-extracted hearing_date — rulings may have "
-            "been skipped if worker-side extraction (LLM/regex) also failed",
-            no_hearing_date,
-            no_hearing_date=no_hearing_date,
+        logger.info(
+            "Rebuild complete",
             processed=processed,
+            errors=errors,
+            skipped=skipped,
+            total=len(keys),
+            format_counts=format_counts,
         )
+
+        if no_hearing_date > 0:
+            logger.warning(
+                "%d documents had no pre-extracted hearing_date — rulings may have "
+                "been skipped if worker-side extraction (LLM/regex) also failed",
+                no_hearing_date,
+                no_hearing_date=no_hearing_date,
+                processed=processed,
+            )
+    finally:
+        # Clear the rebuild-in-progress marker so the data quality check
+        # resumes normal P1 alerting.  Runs even if the rebuild fails
+        # partway through (#2222).
+        if args.reset:
+            _write_rebuild_marker(conn, in_progress=False)
 
     conn.close()
 
