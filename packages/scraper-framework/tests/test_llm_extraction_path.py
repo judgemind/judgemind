@@ -1817,3 +1817,198 @@ class TestStaleSplitChildCleanup:
 
         # delete_stale_split_children should NOT have been called
         mock_delete_stale.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Tests: S3 PDF download for multimodal extraction (#2312)
+# ---------------------------------------------------------------------------
+
+
+class TestFetchRawPdfFromS3:
+    """Tests for IngestionWorker._fetch_raw_pdf_from_s3."""
+
+    def test_downloads_pdf_from_s3(self) -> None:
+        """S3 get_object is called and bytes returned."""
+        worker, _ = _make_worker()
+        pdf_bytes = b"%PDF-1.4 fake content"
+        body_mock = MagicMock()
+        body_mock.read.return_value = pdf_bytes
+        worker._s3_client.get_object.return_value = {"Body": body_mock}
+
+        result = worker._fetch_raw_pdf_from_s3("ca/orange/raw/abc.pdf", "test-bucket", "doc-1")
+        assert result == pdf_bytes
+        worker._s3_client.get_object.assert_called_once_with(
+            Bucket="test-bucket", Key="ca/orange/raw/abc.pdf"
+        )
+
+    def test_returns_none_when_no_s3_key(self) -> None:
+        """Returns None when s3_key is None."""
+        worker, _ = _make_worker()
+        result = worker._fetch_raw_pdf_from_s3(None, "test-bucket", "doc-1")
+        assert result is None
+        worker._s3_client.get_object.assert_not_called()
+
+    def test_returns_none_on_s3_error(self) -> None:
+        """Returns None when S3 raises an exception."""
+        worker, _ = _make_worker()
+        worker._s3_client.get_object.side_effect = Exception("NoSuchKey")
+
+        result = worker._fetch_raw_pdf_from_s3("ca/orange/raw/abc.pdf", "test-bucket", "doc-1")
+        assert result is None
+
+    def test_uses_archive_bucket_when_s3_bucket_is_none(self) -> None:
+        """Falls back to self._archive_bucket when s3_bucket is None."""
+        worker, _ = _make_worker()
+        body_mock = MagicMock()
+        body_mock.read.return_value = b"%PDF-1.4"
+        worker._s3_client.get_object.return_value = {"Body": body_mock}
+
+        worker._fetch_raw_pdf_from_s3("key.pdf", None, "doc-1")
+        worker._s3_client.get_object.assert_called_once_with(Bucket="test-bucket", Key="key.pdf")
+
+
+class TestS3PdfDownloadInProcessEvent:
+    """Tests for the S3 PDF download logic in process_event (#2312).
+
+    These tests patch ``_llm_split_document`` to return True so the test
+    can focus on whether S3 PDF download logic fires correctly without
+    needing the full DB mock chain for split-event processing.
+    """
+
+    @patch.object(IngestionWorker, "_llm_split_document", return_value=True)
+    @patch("ingestion.worker.psycopg")
+    def test_multimodal_county_downloads_pdf_from_s3(
+        self,
+        mock_psycopg: MagicMock,
+        mock_llm_split: MagicMock,
+    ) -> None:
+        """For a MULTIMODAL county (e.g. Santa Clara), the worker downloads
+        raw PDF bytes from S3 when ruling_text is not raw binary."""
+        worker, _ = _make_worker()
+        mock_conn, mock_cur = _make_mock_conn()
+        mock_psycopg.connect.return_value = mock_conn
+        mock_cur.fetchone.side_effect = [
+            ("court-uuid-1",),  # find_or_create_court
+            None,  # find_existing_document
+        ]
+
+        # Mock S3 download
+        pdf_bytes = b"%PDF-1.4 fake santa clara pdf"
+        body_mock = MagicMock()
+        body_mock.read.return_value = pdf_bytes
+        worker._s3_client.get_object.return_value = {"Body": body_mock}
+
+        # Event for Santa Clara with pre-extracted text (not raw binary)
+        event = _make_event(
+            scraper_id="ca-sc-tentatives-civil",
+            state="CA",
+            county="Santa Clara",
+            content_format="pdf",
+            ruling_text="Motion: Compel\n\nCtrl Click on Line 7",
+            s3_key="ca/santa_clara/raw/abc.pdf",
+        )
+        worker.process_event(event)
+
+        # S3 should have been called to download the PDF
+        worker._s3_client.get_object.assert_called_once()
+        # _llm_split_document should have received the downloaded PDF bytes
+        call_kwargs = mock_llm_split.call_args[1]
+        assert call_kwargs["raw_pdf_bytes"] == pdf_bytes
+
+    @patch.object(IngestionWorker, "_llm_split_document", return_value=True)
+    @patch("ingestion.worker.psycopg")
+    def test_non_multimodal_county_skips_s3_download(
+        self,
+        mock_psycopg: MagicMock,
+        mock_llm_split: MagicMock,
+    ) -> None:
+        """For a non-MULTIMODAL county (e.g. Ventura), the worker does NOT
+        download raw PDF bytes from S3."""
+        worker, _ = _make_worker()
+        mock_conn, mock_cur = _make_mock_conn()
+        mock_psycopg.connect.return_value = mock_conn
+        mock_cur.fetchone.side_effect = [
+            ("court-uuid-1",),  # find_or_create_court
+            None,  # find_existing_document
+        ]
+
+        # Event for Ventura (LLM method, not MULTIMODAL)
+        event = _make_event(
+            scraper_id="ca-ventura-tentatives",
+            state="CA",
+            county="Ventura",
+            content_format="pdf",
+            ruling_text="Some extracted text from pdfplumber",
+            s3_key="ca/ventura/raw/abc.pdf",
+        )
+        worker.process_event(event)
+
+        # S3 should NOT have been called to download the PDF
+        worker._s3_client.get_object.assert_not_called()
+        # raw_pdf_bytes passed to _llm_split_document should be None
+        call_kwargs = mock_llm_split.call_args[1]
+        assert call_kwargs["raw_pdf_bytes"] is None
+
+    @patch.object(IngestionWorker, "_llm_split_document", return_value=True)
+    @patch("ingestion.worker.psycopg")
+    def test_raw_binary_pdf_skips_s3_download(
+        self,
+        mock_psycopg: MagicMock,
+        mock_llm_split: MagicMock,
+    ) -> None:
+        """When ruling_text IS raw PDF binary, skip S3 download (already have bytes)."""
+        worker, _ = _make_worker()
+        mock_conn, mock_cur = _make_mock_conn()
+        mock_psycopg.connect.return_value = mock_conn
+        mock_cur.fetchone.side_effect = [
+            ("court-uuid-1",),  # find_or_create_court
+            None,  # find_existing_document
+        ]
+
+        # Event for OC with raw PDF binary in ruling_text
+        pdf_binary = b"%PDF-1.4 raw binary content here"
+        event = _make_event(
+            scraper_id="ca-oc-tentatives-civil",
+            state="CA",
+            county="Orange",
+            content_format="pdf",
+            ruling_text=pdf_binary.decode("latin-1"),
+            s3_key="ca/orange/raw/abc.pdf",
+        )
+
+        with patch("ingestion.worker.extract_text_from_pdf", return_value="extracted text"):
+            worker.process_event(event)
+
+        # S3 should NOT have been called — raw_pdf_bytes came from ruling_text
+        worker._s3_client.get_object.assert_not_called()
+        # raw_pdf_bytes passed to _llm_split_document should be the decoded binary
+        call_kwargs = mock_llm_split.call_args[1]
+        assert call_kwargs["raw_pdf_bytes"] == pdf_binary
+
+    @patch.object(IngestionWorker, "_llm_split_document", return_value=True)
+    @patch("ingestion.worker.psycopg")
+    def test_html_content_skips_s3_download(
+        self,
+        mock_psycopg: MagicMock,
+        mock_llm_split: MagicMock,
+    ) -> None:
+        """HTML documents should never trigger S3 PDF download."""
+        worker, _ = _make_worker()
+        mock_conn, mock_cur = _make_mock_conn()
+        mock_psycopg.connect.return_value = mock_conn
+        mock_cur.fetchone.side_effect = [
+            ("court-uuid-1",),  # find_or_create_court
+            None,  # find_existing_document
+        ]
+
+        event = _make_event(
+            state="CA",
+            county="Los Angeles",
+            content_format="html",
+            ruling_text="<p>The motion is GRANTED.</p>",
+            s3_key="ca/la/raw/abc.html",
+        )
+        worker.process_event(event)
+
+        # S3 should NOT be called for HTML content
+        worker._s3_client.get_object.assert_not_called()

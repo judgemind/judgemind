@@ -178,14 +178,10 @@ class TestGetCountyExtractionConfig:
         assert get_county_extraction_config("CA", "Fresno") is not None
 
     def test_santa_clara_registered(self) -> None:
-        """Santa Clara County has a registered config (#2054)."""
+        """Santa Clara County has a registered config (#2054, #2312)."""
         config = get_county_extraction_config("CA", "Santa Clara")
         assert config is not None
-        assert config.method == ExtractionMethod.LLM
-        assert config.provider == "google"
-        assert config.model == "gemini-2.5-flash-lite"
-        assert config.max_output_tokens == 32768
-        assert config.system_prompt is not None
+        assert config.method == ExtractionMethod.MULTIMODAL
 
     def test_case_insensitive_santa_clara(self) -> None:
         """Santa Clara lookup is case-insensitive."""
