@@ -6162,6 +6162,7 @@ class TestRunChecksRebuildIntegration:
             patch.object(dqc, "check_ruling_document_ratio", return_value=[]),
             patch.object(dqc, "load_baselines", return_value={}),
             patch.object(dqc, "load_field_baselines", return_value={}),
+            patch.object(dqc, "load_expected_null_rates", return_value={}),
         ):
             alerts = dqc.run_checks("postgresql://fake", now=NOW)
 
@@ -6199,6 +6200,7 @@ class TestRunChecksRebuildIntegration:
             patch.object(dqc, "check_ruling_document_ratio", return_value=[]),
             patch.object(dqc, "load_baselines", return_value={}),
             patch.object(dqc, "load_field_baselines", return_value={}),
+            patch.object(dqc, "load_expected_null_rates", return_value={}),
         ):
             alerts = dqc.run_checks("postgresql://fake", now=NOW)
 
