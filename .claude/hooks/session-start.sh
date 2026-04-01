@@ -1,20 +1,23 @@
 #!/usr/bin/env bash
-# SessionStart hook: ensure Python 3.12 is available for local test runs.
+# SessionStart hook: ensure development environment is properly configured.
 #
-# The codebase uses PEP 695 type parameter syntax which requires Python 3.12+.
-# Many CI environments and dev machines ship with 3.11 by default, causing
-# agents to fail when they try to run pytest locally.
-#
-# This script is idempotent — safe to run every session. If python3.12 is
-# already on PATH it exits immediately.  If installation fails the session
-# continues with a warning (non-blocking).
-#
-# Ref: https://github.com/judgemind/judgemind/issues/80
+# This script is idempotent — safe to run every session.
 
 set -uo pipefail
 
 # -------------------------------------------------------------------
-# 1. Check if python3.12 is already available
+# 1. Ensure git hooks path points to .githooks/
+# -------------------------------------------------------------------
+# The pre-push hook lives in .githooks/ (committed to repo), not .git/hooks/.
+# Without this, pre-push checks never run and broken code reaches CI.
+CURRENT_HOOKS_PATH=$(git config core.hooksPath 2>/dev/null || true)
+if [ "$CURRENT_HOOKS_PATH" != ".githooks" ]; then
+    git config core.hooksPath .githooks
+    echo "session-start hook: configured core.hooksPath → .githooks" >&2
+fi
+
+# -------------------------------------------------------------------
+# 2. Check if python3.12 is already available
 # -------------------------------------------------------------------
 if command -v python3.12 &>/dev/null; then
     echo "session-start hook: python3.12 is available ($(python3.12 --version))" >&2
@@ -24,7 +27,7 @@ fi
 echo "session-start hook: python3.12 not found on PATH — attempting install..." >&2
 
 # -------------------------------------------------------------------
-# 2. Install via deadsnakes PPA (Ubuntu/Debian)
+# 3. Install via deadsnakes PPA (Ubuntu/Debian)
 # -------------------------------------------------------------------
 install_deadsnakes() {
     if ! command -v apt-get &>/dev/null; then
@@ -51,7 +54,7 @@ if install_deadsnakes; then
 fi
 
 # -------------------------------------------------------------------
-# 3. Graceful fallback — warn but don't block the session
+# 4. Graceful fallback — warn but don't block the session
 # -------------------------------------------------------------------
 echo "session-start hook: WARNING — could not install python3.12." >&2
 echo "  You may need to install it manually before running tests." >&2
