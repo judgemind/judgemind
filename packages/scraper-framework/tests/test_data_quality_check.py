@@ -3658,6 +3658,36 @@ class TestLoadExpectedNullRates:
         # _note should be excluded (starts with _).
         assert "_note" not in result["Orange"]
 
+    def test_load_from_file_with_metadata_keys(self, tmp_path: Path) -> None:
+        """Regression: file with _updated/_note at top level does not crash (#2333)."""
+        baselines_file = tmp_path / "baselines.json"
+        baselines_file.write_text(
+            json.dumps(
+                {
+                    "counties": {},
+                    "expected_null_rates": {
+                        "_updated": "2026-04-01",
+                        "_note": "Per-county expected null rates ...",
+                        "Orange": {
+                            "outcome": 17.0,
+                            "motion_type": 15.0,
+                        },
+                        "Santa Clara": {
+                            "outcome": 2.0,
+                            "motion_type": 10.0,
+                        },
+                    },
+                }
+            )
+        )
+        result = load_expected_null_rates(baselines_file)
+        assert "Orange" in result
+        assert "Santa Clara" in result
+        assert result["Orange"]["outcome"] == 17.0
+        assert result["Santa Clara"]["outcome"] == 2.0
+        assert "_updated" not in result
+        assert "_note" not in result
+
     def test_load_from_raw_dict(self) -> None:
         """Loads expected null rates from a pre-parsed dict."""
         raw = {
@@ -3707,6 +3737,45 @@ class TestLoadExpectedNullRates:
         result = load_expected_null_rates(raw=raw)
         assert result["Orange"]["outcome"] == 17.0
         assert isinstance(result["Orange"]["outcome"], float)
+
+    def test_skips_top_level_metadata_keys(self) -> None:
+        """Top-level _-prefixed keys (e.g., _updated, _note) are skipped (#2333).
+
+        The baselines JSON uses _updated and _note at the top level of
+        expected_null_rates for human documentation.  These are strings,
+        not county dicts, so iterating them with .items() would crash.
+        """
+        raw = {
+            "expected_null_rates": {
+                "_updated": "2026-04-01",
+                "_note": "Per-county expected null rates ...",
+                "Orange": {
+                    "outcome": 17.0,
+                    "motion_type": 15.0,
+                },
+            }
+        }
+        result = load_expected_null_rates(raw=raw)
+        assert "Orange" in result
+        assert result["Orange"]["outcome"] == 17.0
+        assert "_updated" not in result
+        assert "_note" not in result
+
+    def test_skips_non_dict_county_values(self) -> None:
+        """Non-dict values at the top level are skipped gracefully."""
+        raw = {
+            "expected_null_rates": {
+                "Orange": {
+                    "outcome": 17.0,
+                },
+                "bad_entry": "some string value",
+                "another_bad": 42,
+            }
+        }
+        result = load_expected_null_rates(raw=raw)
+        assert "Orange" in result
+        assert "bad_entry" not in result
+        assert "another_bad" not in result
 
 
 class TestExpectedNullRateFieldCompleteness:

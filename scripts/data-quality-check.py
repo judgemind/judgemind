@@ -473,6 +473,10 @@ def load_expected_null_rates(
 
     result: dict[str, dict[str, float]] = {}
     for county, fields in raw.get("expected_null_rates", {}).items():
+        if county.startswith("_"):
+            continue
+        if not isinstance(fields, dict):
+            continue
         county_rates: dict[str, float] = {}
         for field, value in fields.items():
             if field.startswith("_"):
