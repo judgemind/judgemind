@@ -2946,6 +2946,17 @@ class TestFullReparseDocumentScraperIdFallback:
         finally:
             reingest._SPLIT_REGISTRY.pop("ca-oc-tentatives-civil", None)
 
+
+# ---------------------------------------------------------------------------
+# LLM extraction in reingest_batch — llm_client passthrough
+# ---------------------------------------------------------------------------
+
+
+class TestReingestBatchLLM:
+    """Tests that reingest_batch passes llm_client through to parsing."""
+
+    @patch("reingest_from_s3._reparse_document")
+    @patch("reingest_from_s3._fetch_s3_content")
     def test_llm_client_passed_to_reparse(
         self,
         mock_fetch_s3: MagicMock,
@@ -4271,6 +4282,8 @@ class TestFullReparseDocument:
         finally:
             reingest._SPLIT_REGISTRY.pop("test-ct-mt", None)
 
+    @patch.object(reingest, "_load_scraper_registry")
+    @patch.object(reingest, "_extract_text_from_content")
     def test_split_path_does_not_overwrite_existing_fields_with_regex(
         self,
         mock_extract: MagicMock,
