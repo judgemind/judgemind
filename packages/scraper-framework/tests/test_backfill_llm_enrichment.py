@@ -114,9 +114,8 @@ class TestEnrichOneRuling:
             ruling, provider="google", model=None, client=MagicMock(), force=False
         )
 
-        # All fields populated, nothing to update (but parties may still update)
-        # The function should return None since no fields need updating
-        assert result is None
+        # All fields populated, nothing to update
+        assert result == backfill._SKIPPED_NO_UPDATE
         mock_enrich.assert_not_called()
 
     @patch("backfill_llm_enrichment.enrich_ruling")
@@ -142,8 +141,20 @@ class TestEnrichOneRuling:
         mock_enrich.assert_called_once()
 
     @patch("backfill_llm_enrichment.enrich_ruling")
-    def test_llm_failure_returns_none(self, mock_enrich: MagicMock) -> None:
-        """LLM failure returns None (empty LlmEnrichmentResult)."""
+    def test_llm_api_failure_returns_sentinel(self, mock_enrich: MagicMock) -> None:
+        """LLM API failure (enrich_ruling returns None) returns llm_api_failure."""
+        mock_enrich.return_value = None
+        ruling = _make_ruling()
+
+        result = backfill.enrich_one_ruling(
+            ruling, provider="google", model=None, client=MagicMock(), force=False
+        )
+
+        assert result == backfill._LLM_API_FAILURE
+
+    @patch("backfill_llm_enrichment.enrich_ruling")
+    def test_no_update_returns_sentinel(self, mock_enrich: MagicMock) -> None:
+        """LLM success but no extractable fields returns skipped_no_update."""
         mock_enrich.return_value = LlmEnrichmentResult()
         ruling = _make_ruling()
 
@@ -151,8 +162,7 @@ class TestEnrichOneRuling:
             ruling, provider="google", model=None, client=MagicMock(), force=False
         )
 
-        # No fields extracted, nothing to update
-        assert result is None
+        assert result == backfill._SKIPPED_NO_UPDATE
 
     @patch("backfill_llm_enrichment.enrich_ruling")
     def test_partial_enrichment(self, mock_enrich: MagicMock) -> None:
@@ -282,24 +292,28 @@ class TestStats:
         cs = backfill.CountyStats(county="Test")
         assert cs.total_rulings == 0
         assert cs.processed == 0
-        assert cs.llm_failures == 0
+        assert cs.llm_api_failures == 0
+        assert cs.skipped_no_update == 0
 
     def test_backfill_stats_totals(self) -> None:
         stats = backfill.BackfillStats()
         c1 = stats.get_county("Riverside")
         c1.processed = 10
         c1.updated_motion_type = 5
-        c1.llm_failures = 2
+        c1.llm_api_failures = 2
+        c1.skipped_no_update = 3
 
         c2 = stats.get_county("Orange")
         c2.processed = 20
         c2.updated_motion_type = 8
-        c2.llm_failures = 1
+        c2.llm_api_failures = 1
+        c2.skipped_no_update = 5
 
         totals = stats.totals()
         assert totals["processed"] == 30
         assert totals["updated_motion_type"] == 13
-        assert totals["llm_failures"] == 3
+        assert totals["llm_api_failures"] == 3
+        assert totals["skipped_no_update"] == 8
 
 
 # ---------------------------------------------------------------------------

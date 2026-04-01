@@ -4732,6 +4732,21 @@ def test_llm_enrich_fields_returns_none_for_empty_result(
     assert result is None
 
 
+@patch("framework.llm_enrichment.enrich_ruling")
+def test_llm_enrich_fields_returns_none_for_api_failure(
+    mock_enrich_ruling: MagicMock,
+) -> None:
+    """_llm_enrich_fields returns None when LLM API call fails (returns None)."""
+    mock_enrich_ruling.return_value = None
+
+    worker, _ = _make_worker()
+    worker._llm_enrichment_enabled = True
+    worker._enrichment_client = MagicMock()
+
+    result = worker._llm_enrich_fields("Some ruling text.", "doc-1")
+    assert result is None
+
+
 def test_enrichment_enabled_by_default() -> None:
     """LLM enrichment is enabled by default when no env var is set."""
     worker, _ = _make_worker()

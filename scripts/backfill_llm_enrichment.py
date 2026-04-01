@@ -74,7 +74,8 @@ class CountyStats:
     processed: int = 0
     skipped_no_text: int = 0
     skipped_already_populated: int = 0
-    llm_failures: int = 0
+    llm_api_failures: int = 0
+    skipped_no_update: int = 0
     updated_motion_type: int = 0
     updated_outcome: int = 0
     updated_case_title: int = 0
@@ -112,7 +113,10 @@ class BackfillStats:
             "skipped_already_populated": sum(
                 c.skipped_already_populated for c in self.counties.values()
             ),
-            "llm_failures": sum(c.llm_failures for c in self.counties.values()),
+            "llm_api_failures": sum(c.llm_api_failures for c in self.counties.values()),
+            "skipped_no_update": sum(
+                c.skipped_no_update for c in self.counties.values()
+            ),
             "updated_motion_type": sum(
                 c.updated_motion_type for c in self.counties.values()
             ),
@@ -231,6 +235,10 @@ def fetch_rulings_batch(
 # ---------------------------------------------------------------------------
 
 
+_SKIPPED_NO_UPDATE = "skipped_no_update"
+_LLM_API_FAILURE = "llm_api_failure"
+
+
 def enrich_one_ruling(
     ruling: dict[str, Any],
     *,
@@ -238,11 +246,17 @@ def enrich_one_ruling(
     model: str | None,
     client: object | None,
     force: bool,
-) -> dict[str, Any] | None:
+) -> dict[str, Any] | str:
     """Enrich a single ruling via the LLM.
 
-    Returns a dict with the ruling_id, case_id, and extracted fields,
-    or None if the LLM call failed or nothing changed.
+    Returns one of:
+    - A dict with the ruling_id, case_id, and extracted fields (success
+      with updates).
+    - ``"skipped_no_update"`` if the LLM responded successfully but no
+      fields were updated (text too short, or extracted values were all
+      None).
+    - ``"llm_api_failure"`` if the LLM call itself failed (503, timeout,
+      auth error, etc.).
     """
     ruling_text = ruling["ruling_text"]
     ruling_id = ruling["ruling_id"]
@@ -254,7 +268,7 @@ def enrich_one_ruling(
     needs_case_title = force or not ruling["case_title"]
 
     if not needs_motion_type and not needs_outcome and not needs_case_title:
-        return None
+        return _SKIPPED_NO_UPDATE
 
     result = enrich_ruling(
         ruling_text,
@@ -264,7 +278,7 @@ def enrich_one_ruling(
     )
 
     if result is None:
-        return None
+        return _LLM_API_FAILURE
 
     # Check if the result has any useful data
     has_updates = False
@@ -294,7 +308,7 @@ def enrich_one_ruling(
             updates["new_parties"].append({"name": name, "role": "defendant"})
         has_updates = True
 
-    return updates if has_updates else None
+    return updates if has_updates else _SKIPPED_NO_UPDATE
 
 
 # ---------------------------------------------------------------------------
@@ -455,8 +469,10 @@ def process_county(
 
                 try:
                     result = future.result()
-                    if result is None:
-                        county_stats.llm_failures += 1
+                    if result == _LLM_API_FAILURE:
+                        county_stats.llm_api_failures += 1
+                    elif result == _SKIPPED_NO_UPDATE:
+                        county_stats.skipped_no_update += 1
                     else:
                         updates.append(result)
                 except Exception:
@@ -517,7 +533,8 @@ def process_county(
         updated_outcome=county_stats.updated_outcome,
         updated_case_title=county_stats.updated_case_title,
         updated_parties=county_stats.updated_parties,
-        llm_failures=county_stats.llm_failures,
+        llm_api_failures=county_stats.llm_api_failures,
+        skipped_no_update=county_stats.skipped_no_update,
         errors=county_stats.errors,
     )
 
@@ -537,7 +554,8 @@ def print_report(stats: BackfillStats) -> None:
     print("=" * 70)
     print(f"Elapsed:    {elapsed:.1f}s")
     print(f"Processed:  {totals['processed']}")
-    print(f"LLM fails:  {totals['llm_failures']}")
+    print(f"API fails:  {totals['llm_api_failures']}")
+    print(f"No-update:  {totals['skipped_no_update']}")
     print(f"Errors:     {totals['errors']}")
     print()
 

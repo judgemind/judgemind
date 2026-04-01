@@ -333,16 +333,12 @@ class TestEnrichRuling:
 
     @patch("framework.llm_enrichment.call_llm")
     def test_llm_returns_none(self, mock_call_llm: MagicMock) -> None:
-        """LLM failure (None response) returns empty result."""
+        """LLM API failure (None response) returns None."""
         mock_call_llm.return_value = None
 
         result = enrich_ruling("Some ruling text.")
 
-        assert result.case_title is None
-        assert result.motion_type is None
-        assert result.outcome is None
-        assert result.parties.plaintiffs == []
-        assert result.parties.defendants == []
+        assert result is None
 
     @patch("framework.llm_enrichment.call_llm")
     def test_empty_ruling_text(self, mock_call_llm: MagicMock) -> None:
@@ -387,13 +383,13 @@ class TestEnrichRuling:
 
     @patch("framework.llm_enrichment.call_llm")
     def test_retry_llm_call_fails(self, mock_call_llm: MagicMock) -> None:
-        """First response is malformed, retry LLM call returns None."""
+        """First response is malformed, retry LLM call returns None (API failure)."""
         bad_response = _make_llm_response("not json")
         mock_call_llm.side_effect = [bad_response, None]
 
         result = enrich_ruling("Some ruling text.")
 
-        assert result.case_title is None
+        assert result is None
         assert mock_call_llm.call_count == 2
 
     @patch("framework.llm_enrichment.call_llm")

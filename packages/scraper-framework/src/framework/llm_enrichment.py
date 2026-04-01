@@ -311,7 +311,7 @@ def enrich_ruling(
     provider: str = "google",
     model: str | None = None,
     client: object | None = None,
-) -> LlmEnrichmentResult:
+) -> LlmEnrichmentResult | None:
     """Extract structured fields from ruling text via an LLM.
 
     Sends the ruling text to the configured LLM provider and parses the
@@ -332,8 +332,12 @@ def enrich_ruling(
 
     Returns
     -------
-    LlmEnrichmentResult
-        Extracted fields. Fields are ``None`` if extraction failed.
+    LlmEnrichmentResult | None
+        Extracted fields, or ``None`` if the LLM API call failed
+        (timeout, rate limit, auth error, etc.).  A result with all
+        ``None`` fields indicates the LLM responded successfully but
+        could not extract data from the text (e.g. text too short,
+        JSON parse failure after retry).
     """
     if not ruling_text or not ruling_text.strip():
         logger.warning("llm_enrichment.empty_ruling_text")
@@ -351,7 +355,7 @@ def enrich_ruling(
 
     if response is None:
         logger.warning("llm_enrichment.llm_call_failed")
-        return LlmEnrichmentResult()
+        return None
 
     _log_token_usage(response)
 
@@ -373,7 +377,7 @@ def enrich_ruling(
 
     if retry_response is None:
         logger.warning("llm_enrichment.retry_llm_call_failed")
-        return LlmEnrichmentResult()
+        return None
 
     _log_token_usage(retry_response)
 

@@ -593,6 +593,16 @@ class IngestionWorker:
             return None
         latency_ms = round((time.monotonic() - t0) * 1000)
 
+        if result is None:
+            logger.warning(
+                "LLM enrichment API call failed",
+                extra={
+                    "document_id": document_id,
+                    "enrichment_latency_ms": latency_ms,
+                },
+            )
+            return None
+
         # Check if the result is empty (all fields None / empty)
         has_data = (
             result.case_title is not None
