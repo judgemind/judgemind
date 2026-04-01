@@ -149,6 +149,19 @@ def run_live_extraction(
             result = enrich_ruling(ruling_text, model=model_name)
             latency = (time.monotonic() - start) * 1000
 
+            if result is None:
+                print("API FAILURE")
+                results.append(
+                    {
+                        "fixture_id": fixture_id,
+                        "county": fixture["county"],
+                        "extraction_result": None,
+                        "latency_ms": latency,
+                        "error": "LLM API failure",
+                    }
+                )
+                continue
+
             extraction_dict = {
                 "case_title": result.case_title,
                 "motion_type": result.motion_type,
