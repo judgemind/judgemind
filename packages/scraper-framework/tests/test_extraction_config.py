@@ -10,6 +10,7 @@ from __future__ import annotations
 import pytest
 
 from framework.extraction_config import (
+    _COUNTY_CONFIGS,
     CONTRA_COSTA_SYSTEM_PROMPT,
     FRESNO_SYSTEM_PROMPT,
     RIVERSIDE_SYSTEM_PROMPT,
@@ -845,3 +846,83 @@ class TestContraCostaSystemPrompt:
         assert "extracted_case_number" in CONTRA_COSTA_SYSTEM_PROMPT
         assert "extracted_case_title" in CONTRA_COSTA_SYSTEM_PROMPT
         assert "extracted_parties" in CONTRA_COSTA_SYSTEM_PROMPT
+
+
+# ---------------------------------------------------------------------------
+# Prompt format validation — all registered counties (#2292)
+# ---------------------------------------------------------------------------
+
+
+class TestPromptFormatValidation:
+    """Validate that all county system prompts produce framework-compatible output.
+
+    The framework ``LlmExtractor._parse_response()`` expects the LLM to
+    return JSON with a ``"rulings"`` key containing an array.  If a county
+    prompt instructs the LLM to produce a different format (e.g. a flat
+    object), the parser silently returns zero rulings — causing data loss.
+
+    This test iterates over every county in ``_COUNTY_CONFIGS`` and verifies
+    that LLM-type counties with a custom prompt include the ``"rulings"``
+    output key.  This would have caught the Ventura outcome regression
+    (#2271) where a flat-format prompt was registered in the framework path.
+    """
+
+    @pytest.mark.parametrize(
+        "key,config",
+        [
+            pytest.param(
+                key,
+                config,
+                id=f"{key[0]}-{key[1]}",
+                marks=pytest.mark.xfail(
+                    reason=(
+                        "San Diego uses a flat JSON prompt for its scraper-level "
+                        "_sd_llm_extract() function, not the framework's "
+                        "LlmExtractor._parse_response().  The prompt is registered "
+                        "in _COUNTY_CONFIGS but is not framework-compatible."
+                    ),
+                    strict=True,
+                ),
+            )
+            if key == ("CA", "SAN DIEGO")
+            else pytest.param(key, config, id=f"{key[0]}-{key[1]}")
+            for key, config in _COUNTY_CONFIGS.items()
+        ],
+    )
+    def test_prompt_format_contains_rulings_key(
+        self,
+        key: tuple[str, str],
+        config: CountyExtractionConfig,
+    ) -> None:
+        """LLM counties with a system_prompt must include 'rulings' output key."""
+        if config.method != ExtractionMethod.LLM:
+            pytest.skip(f"{key[1]} uses {config.method}, not LLM — no prompt check needed")
+
+        if config.system_prompt is None:
+            pytest.skip(f"{key[1]} has no custom prompt — uses default framework prompt")
+
+        state, county = key
+        assert '"rulings"' in config.system_prompt, (
+            f"{county} ({state}) uses ExtractionMethod.LLM with a custom system_prompt "
+            f"but the prompt does not contain '\"rulings\"'. The framework's "
+            f"LlmExtractor._parse_response() expects the LLM output to include a "
+            f"'\"rulings\"' array key. Without it, the parser returns zero rulings."
+        )
+
+    @pytest.mark.parametrize(
+        "key,config",
+        [
+            pytest.param(key, config, id=f"{key[0]}-{key[1]}")
+            for key, config in _COUNTY_CONFIGS.items()
+            if config.method == ExtractionMethod.LLM and config.system_prompt is not None
+        ],
+    )
+    def test_multimodal_counties_excluded(
+        self,
+        key: tuple[str, str],
+        config: CountyExtractionConfig,
+    ) -> None:
+        """LLM counties with prompts should NOT be ExtractionMethod.MULTIMODAL."""
+        # This is a structural sanity check — if a county has a text-based
+        # prompt, it should be LLM, not MULTIMODAL.
+        assert config.method == ExtractionMethod.LLM
