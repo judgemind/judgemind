@@ -55,6 +55,7 @@ from validation.issue_filer import file_validation_issue
 
 from .db import (
     batch_upsert_parties,
+    delete_stale_split_children,
     insert_document_and_ruling,
     resolve_judge,
     resolve_judge_from_department,
@@ -1956,6 +1957,43 @@ class IngestionWorker:
             document_id,
             fallback_text=ruling_text,
         )
+
+        # Clean up stale split-child documents from a previous processing run
+        # that produced more rulings than this run (#2295).  The new split IDs
+        # will be upserted cleanly; any old IDs beyond the new count are
+        # orphans.  This must happen before the split events are dispatched
+        # so the DELETE does not race with the INSERT/UPSERT.
+        #
+        # This also handles the case where a previous multi-ruling run is
+        # re-processed as a single ruling — all old UUID v5 split children
+        # are cleaned up because the single-ruling's document_id is the
+        # original UUID v4 ID, not a UUID v5 split ID.
+        s3_key = event_data.get("s3_key")
+        if s3_key:
+            valid_ids = [cr.document_id for cr in converted]
+            try:
+                conn = self._get_connection()
+                deleted = delete_stale_split_children(conn, s3_key, valid_ids)
+                if deleted:
+                    conn.commit()
+                    logger.info(
+                        "Cleaned up %d stale split-child document(s)",
+                        deleted,
+                        extra={
+                            "document_id": document_id,
+                            "s3_key": s3_key,
+                            "new_split_count": len(converted),
+                        },
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "Failed to clean up stale split children — continuing",
+                    extra={
+                        "document_id": document_id,
+                        "s3_key": s3_key,
+                        "error": str(exc),
+                    },
+                )
 
         for cr in converted:
             # For multimodal-extracted PDFs, ruling_text is markdown.

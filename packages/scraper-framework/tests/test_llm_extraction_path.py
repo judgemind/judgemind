@@ -2414,3 +2414,243 @@ class TestMultimodalExtractionPath:
         # Neither extractor should have been called.
         mock_multimodal.extract_from_pdf.assert_not_called()
         mock_text.extract.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Stale split-child cleanup (#2295)
+# ---------------------------------------------------------------------------
+
+
+class TestStaleSplitChildCleanup:
+    """Regression tests for stale split-child document cleanup (#2295).
+
+    When a multi-case PDF is re-processed and the LLM extracts fewer rulings
+    than a previous run, old split-child documents must be cleaned up to
+    prevent orphans in the documents table.
+    """
+
+    @patch("ingestion.worker.delete_stale_split_children", return_value=2)
+    @patch("ingestion.worker.batch_upsert_parties")
+    @patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
+    @patch("ingestion.worker.psycopg")
+    def test_stale_split_children_cleaned_before_insert(
+        self,
+        mock_psycopg: MagicMock,
+        mock_resolve_judge: MagicMock,
+        mock_batch_upsert: MagicMock,
+        mock_delete_stale: MagicMock,
+    ) -> None:
+        """Re-processing a multi-case PDF calls delete_stale_split_children.
+
+        When the LLM produces 2 rulings from a document that previously
+        produced 4, the cleanup function should be called with the 2 new
+        valid split document IDs before dispatching the split events.
+        """
+        worker, _ = _make_worker()
+
+        mock_conn, mock_cur = _make_mock_conn()
+        mock_psycopg.connect.return_value = mock_conn
+        # Each ruling needs: upsert_court, upsert_case, insert_document_and_ruling
+        mock_cur.fetchone.side_effect = [
+            ("court-uuid-1",),
+            ("case-uuid-1",),
+            (True,),
+            ("court-uuid-1",),
+            ("case-uuid-2",),
+            (True,),
+        ]
+
+        mock_extractor = MagicMock()
+        mock_extractor.extract.return_value = [
+            ExtractedRuling(
+                extracted_case_number="2024-00001",
+                extracted_case_title="Alpha v. Beta",
+                ruling_text="Motion GRANTED.",
+                outcome=ExtractionOutcome.GRANTED,
+            ),
+            ExtractedRuling(
+                extracted_case_number="2024-00002",
+                extracted_case_title="Gamma v. Delta",
+                ruling_text="Motion DENIED.",
+                outcome=ExtractionOutcome.DENIED,
+            ),
+        ]
+        worker._framework_extractor = mock_extractor
+
+        event = _make_event(
+            ruling_text="Calendar with multiple rulings...",
+            s3_key="ca/orange/superior_court/raw/abc123.pdf",
+        )
+        worker.process_event(event)
+
+        # delete_stale_split_children should have been called once
+        mock_delete_stale.assert_called_once()
+        call_args = mock_delete_stale.call_args
+        # First arg is the connection
+        assert call_args[0][0] is mock_conn
+        # s3_key should match the event
+        assert call_args[0][1] == "ca/orange/superior_court/raw/abc123.pdf"
+        # valid_document_ids should have 2 entries (one per ruling)
+        valid_ids = call_args[0][2]
+        assert len(valid_ids) == 2
+        # IDs should be deterministic split IDs
+        from ingestion.split_ids import make_split_document_id
+
+        expected_id_0 = make_split_document_id("aaaaaaaa-0000-0000-0000-000000000001", 0)
+        expected_id_1 = make_split_document_id("aaaaaaaa-0000-0000-0000-000000000001", 1)
+        assert valid_ids[0] == expected_id_0
+        assert valid_ids[1] == expected_id_1
+
+    @patch("ingestion.worker.delete_stale_split_children", return_value=0)
+    @patch("ingestion.worker.batch_upsert_parties")
+    @patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
+    @patch("ingestion.worker.psycopg")
+    def test_single_ruling_still_cleans_stale_children(
+        self,
+        mock_psycopg: MagicMock,
+        mock_resolve_judge: MagicMock,
+        mock_batch_upsert: MagicMock,
+        mock_delete_stale: MagicMock,
+    ) -> None:
+        """A single-ruling extraction still cleans up stale split children.
+
+        If a document was previously split into 3 rulings but is now extracted
+        as a single ruling, all old UUID v5 split children should be cleaned up.
+        """
+        worker, _ = _make_worker()
+
+        mock_conn, mock_cur = _make_mock_conn()
+        mock_psycopg.connect.return_value = mock_conn
+        mock_cur.fetchone.side_effect = [
+            ("court-uuid-1",),
+            ("case-uuid-1",),
+            (True,),
+        ]
+
+        mock_extractor = MagicMock()
+        mock_extractor.extract.return_value = [
+            ExtractedRuling(
+                extracted_case_number="2024-00001",
+                extracted_case_title="Alpha v. Beta",
+                ruling_text="Motion GRANTED.",
+                outcome=ExtractionOutcome.GRANTED,
+            ),
+        ]
+        worker._framework_extractor = mock_extractor
+
+        event = _make_event(
+            ruling_text="Single ruling document...",
+            s3_key="ca/orange/superior_court/raw/abc123.pdf",
+        )
+        worker.process_event(event)
+
+        # delete_stale_split_children should have been called even for
+        # single-ruling documents (to clean up any old multi-ruling splits)
+        mock_delete_stale.assert_called_once()
+        call_args = mock_delete_stale.call_args
+        assert call_args[0][1] == "ca/orange/superior_court/raw/abc123.pdf"
+        # For a single ruling, the valid ID is the original document_id
+        # (not a split ID), so all UUID v5 split children will be deleted.
+        valid_ids = call_args[0][2]
+        assert len(valid_ids) == 1
+        assert valid_ids[0] == "aaaaaaaa-0000-0000-0000-000000000001"
+
+    @patch("ingestion.worker.delete_stale_split_children")
+    @patch("ingestion.worker.batch_upsert_parties")
+    @patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
+    @patch("ingestion.worker.psycopg")
+    def test_cleanup_failure_does_not_block_processing(
+        self,
+        mock_psycopg: MagicMock,
+        mock_resolve_judge: MagicMock,
+        mock_batch_upsert: MagicMock,
+        mock_delete_stale: MagicMock,
+    ) -> None:
+        """If cleanup fails, processing should continue normally.
+
+        The cleanup is a best-effort operation — a failure should not prevent
+        the new rulings from being inserted.
+        """
+        worker, _ = _make_worker()
+
+        mock_conn, mock_cur = _make_mock_conn()
+        mock_psycopg.connect.return_value = mock_conn
+        mock_cur.fetchone.side_effect = [
+            ("court-uuid-1",),
+            ("case-uuid-1",),
+            (True,),
+            ("court-uuid-1",),
+            ("case-uuid-2",),
+            (True,),
+        ]
+
+        # Make the cleanup function raise an exception
+        mock_delete_stale.side_effect = Exception("DB connection error")
+
+        mock_extractor = MagicMock()
+        mock_extractor.extract.return_value = [
+            ExtractedRuling(
+                extracted_case_number="2024-00001",
+                extracted_case_title="Alpha v. Beta",
+                ruling_text="Motion GRANTED.",
+                outcome=ExtractionOutcome.GRANTED,
+            ),
+            ExtractedRuling(
+                extracted_case_number="2024-00002",
+                extracted_case_title="Gamma v. Delta",
+                ruling_text="Motion DENIED.",
+                outcome=ExtractionOutcome.DENIED,
+            ),
+        ]
+        worker._framework_extractor = mock_extractor
+
+        event = _make_event(
+            ruling_text="Calendar with multiple rulings...",
+            s3_key="ca/orange/superior_court/raw/abc123.pdf",
+        )
+        # Should not raise — cleanup failure is caught and logged
+        worker.process_event(event)
+
+        # Despite cleanup failure, the split events should still be processed
+        assert mock_conn.commit.call_count == 2
+
+    @patch("ingestion.worker.delete_stale_split_children", return_value=0)
+    @patch("ingestion.worker.batch_upsert_parties")
+    @patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
+    @patch("ingestion.worker.psycopg")
+    def test_no_cleanup_when_s3_key_missing(
+        self,
+        mock_psycopg: MagicMock,
+        mock_resolve_judge: MagicMock,
+        mock_batch_upsert: MagicMock,
+        mock_delete_stale: MagicMock,
+    ) -> None:
+        """No cleanup attempt when s3_key is not in event data."""
+        worker, _ = _make_worker()
+
+        mock_conn, mock_cur = _make_mock_conn()
+        mock_psycopg.connect.return_value = mock_conn
+        mock_cur.fetchone.side_effect = [
+            ("court-uuid-1",),
+            ("case-uuid-1",),
+            (True,),
+        ]
+
+        mock_extractor = MagicMock()
+        mock_extractor.extract.return_value = [
+            ExtractedRuling(
+                extracted_case_number="2024-00001",
+                extracted_case_title="Alpha v. Beta",
+                ruling_text="Motion GRANTED.",
+                outcome=ExtractionOutcome.GRANTED,
+            ),
+        ]
+        worker._framework_extractor = mock_extractor
+
+        # Event with no s3_key
+        event = _make_event(ruling_text="Single ruling...")
+        del event["s3_key"]
+        worker.process_event(event)
+
+        # delete_stale_split_children should NOT have been called
+        mock_delete_stale.assert_not_called()

@@ -1564,6 +1564,93 @@ def insert_document_and_ruling(
     return is_new
 
 
+def delete_stale_split_children(
+    conn: psycopg.Connection,
+    s3_key: str,
+    valid_document_ids: list[str],
+) -> int:
+    """Delete split-child document records that are no longer valid.
+
+    When a multi-case PDF is re-processed and the LLM extracts a different
+    number of rulings, old split-child documents beyond the new split count
+    become orphans.  This function proactively removes them before the new
+    split events are inserted.
+
+    A document is eligible for deletion when:
+      1. It shares the same ``s3_key`` as the document being re-processed.
+      2. Its ``id`` is a UUID version 5 (deterministic split child ID).
+      3. Its ``id`` is NOT in the ``valid_document_ids`` list (the new set
+         of split IDs that will be created/upserted by this processing run).
+
+    Cascade-deletes dependent rows in: ``rulings``, ``alert_events``,
+    ``validation_results``.
+
+    Args:
+        conn: Active database connection (caller manages transaction).
+        s3_key: The S3 key shared by the original document and its split
+            children.
+        valid_document_ids: The document IDs that will be created/upserted
+            in this processing run.  These are NOT deleted.
+
+    Returns:
+        The number of document rows deleted.
+    """
+    if not s3_key:
+        return 0
+
+    with conn.cursor() as cur:
+        # Find all split-child documents for this S3 key that are NOT in the
+        # new valid set.  UUID v5 documents have version byte = 5; we filter
+        # for that to avoid accidentally deleting the original parent document
+        # (which is UUID v4).
+        #
+        # The version nibble sits at position 13 of the hex representation
+        # (the first nibble of the 3rd group in the standard UUID format).
+        # PostgreSQL's uuid type supports substring extraction on the text
+        # representation.
+        cur.execute(
+            """
+            SELECT id FROM documents
+            WHERE s3_key = %s
+              AND substring(id::text, 15, 1) = '5'
+              AND id != ALL(%s::uuid[])
+            """,
+            (s3_key, valid_document_ids),
+        )
+        stale_ids = [str(row[0]) for row in cur.fetchall()]
+
+    if not stale_ids:
+        return 0
+
+    with conn.cursor() as cur:
+        # Cascade-delete dependent rows first.
+        cur.execute(
+            "DELETE FROM alert_events WHERE document_id = ANY(%s::uuid[])",
+            (stale_ids,),
+        )
+        cur.execute(
+            "DELETE FROM validation_results WHERE document_id = ANY(%s::uuid[])",
+            (stale_ids,),
+        )
+        cur.execute(
+            "DELETE FROM rulings WHERE document_id = ANY(%s::uuid[])",
+            (stale_ids,),
+        )
+        # Delete the stale document records.
+        cur.execute(
+            "DELETE FROM documents WHERE id = ANY(%s::uuid[])",
+            (stale_ids,),
+        )
+        deleted = cur.rowcount
+
+    logger.info(
+        "delete_stale_split_children: removed %d stale split-child document(s)",
+        deleted,
+        extra={"s3_key": s3_key, "stale_ids": stale_ids},
+    )
+    return deleted
+
+
 def normalize_party_name(raw_name: str) -> str:
     """Normalize a raw party name string to a canonical form.
 
