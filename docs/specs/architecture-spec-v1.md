@@ -330,7 +330,9 @@ The worker tracks which tier populated each field in an `extraction_methods` dic
 
 ### 5.2.3 Reingestion
 
-Historical documents already in S3 can be reprocessed through the full three-tier pipeline using `scripts/reingest_from_s3.py`. This script reads archived documents from the S3 bucket, reconstructs ingestion events, and pushes them through the same extraction pipeline. This is used to backfill fields for documents that were ingested before LLM extraction was available, or after extraction logic improvements.
+Historical documents already in S3 can be reprocessed through the full three-tier pipeline using `scripts/reingest_from_s3.py`. This script queries the `documents` table to find existing records, reads their archived content from S3, reconstructs ingestion events, and pushes them through the same extraction pipeline. This is used to backfill fields for documents that were ingested before LLM extraction was available, or after extraction logic improvements.
+
+**Important:** `reingest_from_s3.py` operates on **existing database records only**. If you run it for a county with no records in the `documents` table, it will process 0 documents silently. For initial population of a county that has S3 data but no DB records, use `scripts/rebuild_db.py --county <name>` instead — it discovers documents directly from S3 keys and does not require pre-existing database records.
 
 ### 5.2.4 Additional Tier 1 Capabilities
 
