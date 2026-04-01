@@ -42,7 +42,8 @@ sys.path.insert(
 import psycopg  # noqa: E402
 
 from ingestion.db import resolve_judge, upsert_case_judge  # noqa: E402
-from ingestion.extract import extract_judge_name, extract_motion_type, extract_outcome  # noqa: E402
+# NOTE: extract_motion_type and extract_outcome were removed in #2178.  # noqa: E402
+from ingestion.extract import extract_judge_name  # noqa: E402
 from validation.schema import add_validate_schema_flag, validate_script_queries  # noqa: E402
 
 logging.basicConfig(

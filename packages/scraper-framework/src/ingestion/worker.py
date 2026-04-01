@@ -20,9 +20,6 @@ Environment variables:
     ENABLE_RULING_FORMATTING — Enable LLM-powered ruling text formatting (default: disabled)
     ENABLE_RULING_SUMMARIZATION — Enable LLM-powered ruling summarization (default: disabled)
     ENABLE_INGESTION_VALIDATION — Enable LLM-based validation gate (default: disabled)
-    USE_LLM_ENRICHMENT — Enable LLM-based enrichment for motion_type, outcome,
-        case_title, and parties (default: enabled). Set to "false" to fall back
-        to regex extraction only.
     GITHUB_TOKEN   — GitHub token for auto-filing validation issues (optional)
     GITHUB_REPO    — GitHub repo for validation issues (default: judgemind/judgemind)
 """
@@ -67,16 +64,12 @@ from .department_normalize import normalize_department
 from .extract import (
     clean_case_title,
     extract_case_number,
-    extract_case_title,
     extract_case_type_from_motion_type,
     extract_case_type_from_number,
     extract_case_type_from_scraper_id,
     extract_case_type_from_title,
     extract_hearing_date,
     extract_judge_name,
-    extract_motion_type,
-    extract_outcome,
-    extract_parties_from_caption,
     is_plausible_case_title,
     is_valid_case_number,
     normalize_motion_type,
@@ -376,22 +369,17 @@ class IngestionWorker:
                 self._validation_enabled = False
 
         # LLM enrichment — uses enrich_ruling() for motion_type, outcome,
-        # case_title, and parties. Enabled by default; disable with
-        # USE_LLM_ENRICHMENT=false. Uses the same LLM provider/client as
-        # per-field extraction for connection reuse.
-        use_enrichment_env = os.environ.get("USE_LLM_ENRICHMENT", "true").lower()
-        self._llm_enrichment_enabled: bool = use_enrichment_env not in (
-            "0",
-            "false",
-            "no",
-        )
+        # case_title, and parties. Always enabled (regex fallback removed
+        # in #2178). Uses the same LLM provider/client as per-field
+        # extraction for connection reuse.
+        self._llm_enrichment_enabled: bool = True
         # Reuse the existing LLM client for enrichment to avoid creating a
         # separate connection. The enrichment module accepts a client kwarg.
         self._enrichment_client: object | None = self._llm_client
-        if self._llm_enrichment_enabled and self._enrichment_client is None:
+        if self._enrichment_client is None:
             logger.warning(
                 "LLM enrichment enabled but no LLM client available — "
-                "enrichment will fall back to regex"
+                "enrichment fields may be missing"
             )
 
         # Reusable httpx client for GitHub issue filing (validation gate).
@@ -543,7 +531,7 @@ class IngestionWorker:
         except Exception as exc:
             latency_ms = round((time.monotonic() - t0) * 1000)
             logger.warning(
-                "LLM enrichment failed — falling back to regex",
+                "LLM enrichment failed — enrichment fields may be missing",
                 extra={
                     "document_id": document_id,
                     "enrichment_latency_ms": latency_ms,
@@ -977,7 +965,7 @@ class IngestionWorker:
                 )
             else:
                 logger.info(
-                    "LLM extraction returned None — falling back to regex",
+                    "LLM extraction returned None — enrichment fields may be missing",
                     extra={
                         "document_id": document_id,
                         "llm_latency_ms": llm_latency_ms,
@@ -987,13 +975,11 @@ class IngestionWorker:
         # ------------------------------------------------------------------
         # LLM enrichment — dedicated enrichment call for motion_type,
         # outcome, case_title, and parties (#2176).  Runs after per-field
-        # LLM extraction and before regex fallback.  Only for non-split
-        # events where the 4 enrichment fields are still missing.
+        # LLM extraction.  Regex fallback removed in #2178 — LLM is now
+        # the only enrichment path for these four fields.
         # ------------------------------------------------------------------
-        enrichment_fields_missing = (
-            not is_llm_extracted
-            and ruling_text
-            and (outcome is None or motion_type is None or not case_title or not parties_data)
+        enrichment_fields_missing = ruling_text and (
+            outcome is None or motion_type is None or not case_title or not parties_data
         )
         if enrichment_fields_missing:
             enrichment_result = self._llm_enrich_fields(ruling_text, document_id)
@@ -1020,11 +1006,12 @@ class IngestionWorker:
                     extraction_methods["parties"] = "llm_enrichment"
 
         # ------------------------------------------------------------------
-        # Regex fallback — fill any fields still missing after LLM
+        # Remaining regex fallbacks — hearing_date, judge_name, case_number,
+        # and case_type are still extracted via regex when missing.  The
+        # enrichment fields (outcome, motion_type, case_title, parties)
+        # are handled exclusively by LLM enrichment above (#2178).
         # ------------------------------------------------------------------
-        # Skip regex fallback when the event was pre-populated by the
-        # framework LlmExtractor (_llm_extracted=True).
-        if not is_llm_extracted and hearing_dt is None and ruling_text:
+        if hearing_dt is None and ruling_text:
             hearing_dt = extract_hearing_date(ruling_text)
             if hearing_dt is not None:
                 extraction_methods.setdefault("hearing_date", "regex")
@@ -1033,94 +1020,20 @@ class IngestionWorker:
                     extra={"document_id": document_id, "hearing_date": str(hearing_dt)},
                 )
 
-        if not is_llm_extracted and ruling_text and (outcome is None or motion_type is None):
-            if outcome is None:
-                outcome = extract_outcome(ruling_text)
-                if outcome is not None:
-                    extraction_methods.setdefault("outcome", "regex")
-            if motion_type is None:
-                motion_type = extract_motion_type(ruling_text)
-                if motion_type is not None:
-                    extraction_methods.setdefault("motion_type", "regex")
-
-        # ------------------------------------------------------------------
-        # LLM enrichment for multimodal events (#2176)
-        # ------------------------------------------------------------------
-        # Multimodal events (_llm_extracted=True) have ruling_text from
-        # transcription but may lack structured fields.  Try LLM enrichment
-        # before falling back to regex.
-        if (
-            is_llm_extracted
-            and ruling_text
-            and (outcome is None or motion_type is None or not case_title or not parties_data)
-        ):
-            enrichment_result = self._llm_enrich_fields(ruling_text, document_id)
-            if enrichment_result is not None:
-                if outcome is None and enrichment_result.outcome is not None:
-                    outcome = enrichment_result.outcome
-                    extraction_methods["outcome"] = "llm_enrichment"
-                if motion_type is None and enrichment_result.motion_type is not None:
-                    motion_type = enrichment_result.motion_type
-                    extraction_methods["motion_type"] = "llm_enrichment"
-                if not case_title and enrichment_result.case_title is not None:
-                    case_title = enrichment_result.case_title
-                    extraction_methods["case_title"] = "llm_enrichment"
-                if not parties_data and (
-                    enrichment_result.parties.plaintiffs or enrichment_result.parties.defendants
-                ):
-                    parties_data = []
-                    for name in enrichment_result.parties.plaintiffs:
-                        parties_data.append({"name": name, "role": "plaintiff"})
-                    for name in enrichment_result.parties.defendants:
-                        parties_data.append({"name": name, "role": "defendant"})
-                    extraction_methods["parties"] = "llm_enrichment"
-
-        # ------------------------------------------------------------------
-        # Regex post-LLM fallback — for multimodal extraction events (#1770)
-        # ------------------------------------------------------------------
-        # The multimodal per-page pipeline (extract_from_pdf) is transcription-
-        # only: it produces ruling_text but does NOT extract structured fields
-        # like motion_type or outcome.  Events from this path have
-        # _llm_extracted=True (to skip redundant per-field LLM calls), but
-        # still need cheap regex extraction for fields the transcription
-        # pipeline does not populate.
         if is_llm_extracted and ruling_text:
-            if outcome is None:
-                outcome = extract_outcome(ruling_text)
-                if outcome is not None:
-                    extraction_methods["outcome"] = "regex_post_llm"
-            if motion_type is None:
-                motion_type = extract_motion_type(ruling_text)
-                if motion_type is not None:
-                    extraction_methods["motion_type"] = "regex_post_llm"
-            if hearing_dt is None:
-                hearing_dt = extract_hearing_date(ruling_text)
-                if hearing_dt is not None:
-                    extraction_methods["hearing_date"] = "regex_post_llm"
             if judge_name is None:
                 judge_name = extract_judge_name(ruling_text)
                 if judge_name is not None:
                     extraction_methods["judge_name"] = "regex_post_llm"
 
-        # Party extraction from caption and case_type from case number do NOT
-        # require ruling_text — they use case_title and case_number respectively.
-        # Separated from the ruling_text-dependent block above so they run even
-        # when ruling_text is None (e.g. multi-ruling PDFs where individual
-        # split rulings may lack extracted text due to the cross-contamination
-        # guard).  See #2270.
-        if is_llm_extracted and not parties_data:
-            eff_title = case_title or event_data.get("case_title")
-            if eff_title:
-                parties_data = extract_parties_from_caption(eff_title)
-                if parties_data:
-                    extraction_methods["parties"] = "regex_post_llm"
-        if is_llm_extracted and case_type is None and case_number:
+        # case_type from case number — does not require ruling_text.
+        if case_type is None and case_number:
             case_type = extract_case_type_from_number(case_number)
             if case_type:
-                extraction_methods["case_type"] = "regex_post_llm"
+                extraction_methods.setdefault("case_type", "regex")
 
-        # Clean ruling text for display — extraction uses raw text above for
-        # better regex matching; the cleaned version is stored in Postgres.
+        # Clean ruling text for display — the cleaned version is stored
+        # in Postgres.
         cleaned_ruling_text = clean_ruling_text(ruling_text)
 
         court_name = f"{court}, County of {county}"
@@ -1138,73 +1051,25 @@ class IngestionWorker:
                 case_number = extracted
 
         # ------------------------------------------------------------------
-        # Deterministic case_title enrichment (#2212)
+        # Deterministic case_title cleanup (#2212)
         # ------------------------------------------------------------------
-        # For multimodal events, the LLM-provided case_title from
-        # _extract_case_title_from_info can be messy (motion descriptions,
-        # case citations, multiple parties).  Apply deterministic cleanup:
-        #   1. Try extract_case_title(ruling_text) — fresh extraction
-        #      from the ruling text is the most reliable.
-        #   2. Try clean_case_title(case_title) — extractive cleanup of
-        #      the raw LLM title catches patterns that extract_case_title
-        #      may miss when ruling_text is sparse.
-        #   3. Keep the original only if neither produces a plausible
-        #      result.
-        if is_llm_extracted and ruling_text and case_title:
-            # Only override when the LLM title is implausible or the new
-            # title is shorter (i.e. cleaner — truncated junk removed).
-            llm_title_ok = is_plausible_case_title(case_title)
-
-            # Strategy 1: extract from ruling text (preferred — clean source).
-            text_title = extract_case_title(ruling_text)
-            if text_title and is_plausible_case_title(text_title):
-                # Override if the LLM title is bad OR the text extraction
-                # produced a shorter (cleaner) result.
-                if not llm_title_ok or len(text_title) <= len(case_title):
-                    if text_title != case_title:
-                        logger.info(
-                            "Deterministic case_title overrides LLM title (ruling_text)",
-                            extra={
-                                "document_id": document_id,
-                                "old_title": case_title[:80],
-                                "new_title": text_title[:80],
-                            },
-                        )
-                    case_title = text_title
-                    extraction_methods["case_title"] = "deterministic_ruling_text"
-            elif not llm_title_ok:
-                # Strategy 2: clean the raw LLM title (only when LLM
-                # title fails plausibility).
-                cleaned_title = clean_case_title(case_title)
-                if cleaned_title and is_plausible_case_title(cleaned_title):
-                    if cleaned_title != case_title:
-                        logger.info(
-                            "Deterministic case_title overrides LLM title (cleaned)",
-                            extra={
-                                "document_id": document_id,
-                                "old_title": case_title[:80],
-                                "new_title": cleaned_title[:80],
-                            },
-                        )
-                    case_title = cleaned_title
-                    extraction_methods["case_title"] = "deterministic_cleaned"
-                # else: keep original LLM title as-is (best effort).
-        elif is_llm_extracted and case_title and not ruling_text:
-            # No ruling text available — try cleaning the raw LLM title
-            # only if it's implausible.
-            if not is_plausible_case_title(case_title):
-                cleaned_title = clean_case_title(case_title)
-                if cleaned_title and is_plausible_case_title(cleaned_title):
-                    case_title = cleaned_title
-                    extraction_methods["case_title"] = "deterministic_cleaned"
-
-        # Fallback case_title extraction (regex)
-        if not case_title and ruling_text:
-            candidate_title = extract_case_title(ruling_text)
-            if candidate_title and is_plausible_case_title(candidate_title):
-                case_title = candidate_title
-                method = "regex_post_llm" if is_llm_extracted else "regex"
-                extraction_methods.setdefault("case_title", method)
+        # For LLM-extracted events, the LLM-provided case_title can be
+        # messy (motion descriptions, case citations, multiple parties).
+        # Apply deterministic cleanup via clean_case_title().
+        if case_title and not is_plausible_case_title(case_title):
+            cleaned_title = clean_case_title(case_title)
+            if cleaned_title and is_plausible_case_title(cleaned_title):
+                if cleaned_title != case_title:
+                    logger.info(
+                        "Deterministic case_title cleanup applied",
+                        extra={
+                            "document_id": document_id,
+                            "old_title": case_title[:80],
+                            "new_title": cleaned_title[:80],
+                        },
+                    )
+                case_title = cleaned_title
+                extraction_methods["case_title"] = "deterministic_cleaned"
 
         # Fallback judge_name extraction from ruling text (#401).
         if not is_llm_extracted and not judge_name and ruling_text:
@@ -1219,8 +1084,7 @@ class IngestionWorker:
         # LA County department-to-judge lookup (#584).
         # When LLM and regex extraction both fail to find a judge name but a
         # department is available, look up the judge via the LA judicial officer
-        # directory mapping. This handles rulings where the judge name isn't
-        # present in the text but the department is known.
+        # directory mapping.
         la_dept_eligible = (
             not is_llm_extracted
             and not judge_name
@@ -1243,23 +1107,8 @@ class IngestionWorker:
                     },
                 )
 
-        # Fallback: if no parties yet but we have a case title with "v.",
-        # extract plaintiff/defendant from the caption.
-        effective_title = case_title or event_data.get("case_title")
-        if not is_llm_extracted and not parties_data and effective_title:
-            parties_data = extract_parties_from_caption(effective_title)
-            if parties_data:
-                extraction_methods.setdefault("parties", "regex")
-                logger.info(
-                    "Extracted parties from case caption (regex fallback)",
-                    extra={
-                        "document_id": document_id,
-                        "party_count": len(parties_data),
-                    },
-                )
-
         # Fallback case_type from case number prefix (#706).
-        if not is_llm_extracted and case_type is None and case_number:
+        if case_type is None and case_number:
             case_type = extract_case_type_from_number(case_number)
             if case_type:
                 extraction_methods.setdefault("case_type", "regex")

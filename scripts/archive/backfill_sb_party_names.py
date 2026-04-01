@@ -43,12 +43,10 @@ _FRAMEWORK_SRC = os.path.join(
 )
 sys.path.insert(0, os.path.normpath(_FRAMEWORK_SRC))
 
-from ingestion.extract import (  # noqa: E402
-    _looks_like_motion_text,
-    extract_case_title,
-    extract_parties_from_caption,
-    is_plausible_case_title,
-)
+# NOTE: extract_case_title, extract_parties_from_caption, and
+# _looks_like_motion_text were removed in #2178.
+# This archived script is no longer functional.  # noqa: E402
+from ingestion.extract import is_plausible_case_title  # noqa: E402
 
 logging.basicConfig(
     level=logging.INFO,

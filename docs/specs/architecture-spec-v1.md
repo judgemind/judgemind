@@ -86,7 +86,7 @@ Execution: Fetch data, parse response (HTML, PDF, or DOCX), extract structured f
 
 Field extraction completeness: A scraper is not considered complete until it correctly extracts 100% of the structured fields present in the source data obtained during development. Required fields: judge name, motion type, case title, hearing date, outcome, and parties. If a field is present in the source, the scraper must extract it — do not ship scrapers that leave extractable fields empty and rely on post-hoc backfills. Regression tests against real fixtures must cover every extracted field. "Unknown" or "Not classified" values are acceptable only when the source data genuinely does not contain the information.
 
-Output: Emit standardized ingestion events to the message queue. Events include raw content, parsed content, content hash, source metadata, and capture timestamp. Scrapers populate as many structured fields as possible (judge name, case number, hearing date, etc.) from the court website's own structured data. Any fields the scraper cannot populate are filled downstream by the three-tier extraction pipeline (see Section 5.2).
+Output: Emit standardized ingestion events to the message queue. Events include raw content, parsed content, content hash, source metadata, and capture timestamp. Scrapers populate as many structured fields as possible (judge name, case number, hearing date, etc.) from the court website's own structured data. Any fields the scraper cannot populate are filled downstream by the LLM extraction pipeline (see Section 5.2).
 
 Error handling: Retry with exponential backoff. Alert on repeated failures. Log all errors with enough context for debugging (URL, response status, partial content).
 
@@ -197,7 +197,7 @@ The data model centers on six primary entities. The entity-relationship design m
 
 Court data is entered by humans with no enforced consistency. The same judge may appear as "Johnson, Robert M.", "Robert Johnson", "Hon. R.M. Johnson", or "Judge Johnson" across different courts, clerks, and document types.
 
-The schema supports canonical records with aliases (`judges`/`judge_aliases`, `attorneys`/`attorney_aliases`). Currently, entity resolution is handled by the enrichment tier's regex extraction — normalized name matching links rulings to canonical judge records. Fuzzy matching and embedding-based resolution are not yet implemented.
+The schema supports canonical records with aliases (`judges`/`judge_aliases`, `attorneys`/`attorney_aliases`). Currently, entity resolution is handled by the enrichment tier — normalized name matching links rulings to canonical judge records. Fuzzy matching and embedding-based resolution are not yet implemented.
 
 ## 4.2 OpenSearch — Full-Text Search
 
@@ -310,11 +310,14 @@ Each county's prompt is validated through an iterative eval loop before producti
 
 The transcription LLM does NOT extract case numbers, titles, outcomes, or other structured fields. That is enrichment's job.
 
-**Enrichment** applies a three-tier extraction strategy to each ruling's text:
+**Enrichment** applies a two-tier extraction strategy to each ruling's text:
 
 **Tier 1 — Scraper-provided fields (highest priority).** Values the scraper extracted from website structure (not from document content). These are authoritative — e.g., a judge name from link text, a department from a URL parameter. Used as-is, never overwritten by later tiers.
 
-**Tier 2 — LLM extraction.** For fields not provided by the scraper, the ingestion worker calls a configurable LLM to extract them from the ruling text. The LLM receives a structured JSON extraction prompt with the text and any Tier 1 metadata as context. Returns structured JSON with all extractable fields, applied only to fields still missing after Tier 1. On API failure, falls through to Tier 3.
+**Tier 2 — LLM extraction.** For fields not provided by the scraper, the ingestion worker uses LLM-based extraction. Two LLM extraction paths cover different field sets:
+
+- **Per-field LLM extraction** (`packages/scraper-framework/src/framework/llm_extractor.py`): configurable per-county extraction using structured prompts. Handles transcription-level fields (ruling_text, case_number, etc.) for counties with custom extraction configs.
+- **LLM enrichment** (`packages/scraper-framework/src/framework/llm_enrichment.py`): universal enrichment module that extracts motion_type, outcome, case_title, and parties from ruling text in a single LLM call. Taxonomy-constrained and stateless. This replaced per-county regex extraction patterns in #2178.
 
 Key implementation details:
 - **Provider-agnostic adapter** (`packages/scraper-framework/src/ingestion/llm_providers.py`): supports Anthropic and Google GenAI via `LLM_PROVIDER` and `LLM_MODEL` environment variables. Default: Claude Haiku (defined centrally in `packages/judgemind-config/src/judgemind_config/models.py`, overridable via `HAIKU_MODEL` env var).
@@ -322,15 +325,15 @@ Key implementation details:
 - **Rate-limit retry:** each provider adapter retries once on rate-limit errors (HTTP 429 / ResourceExhausted) with a 1-second backoff.
 - **Cost:** approximately $47/month on Anthropic Haiku at current ingestion volume (~1,000 documents/day).
 
-**Tier 3 — Regex fallback.** For fields still missing after LLM extraction (or when the LLM API is unavailable), the worker applies court-specific regex patterns (`packages/scraper-framework/src/ingestion/extract.py`). These cover outcome classification, motion type identification, case number extraction, case title parsing, judge name extraction, hearing date extraction, and party extraction from case captions. The regex patterns are drawn from real California court formatting and are ordered by specificity to minimize false positives.
+**Regex utilities.** A small set of regex-based extraction functions remain in `packages/scraper-framework/src/ingestion/extract.py` for fields not covered by LLM enrichment: case number extraction, hearing date extraction, judge name extraction, and case type inference from case number prefixes, scraper IDs, or motion types. These are lightweight fallbacks that supplement LLM extraction. Normalization functions for outcome and motion_type values are also in this module.
 
 ### 5.2.2 Enrichment Logging
 
-The worker tracks which tier populated each field in an `extraction_methods` dict (values: `"scraper"`, `"llm"`, `"regex"`) and logs a summary for every document. This enables monitoring of extraction quality and identifying courts where scrapers should be improved to reduce LLM dependency.
+The worker tracks which tier populated each field in an `extraction_methods` dict (values: `"scraper"`, `"llm"`, `"llm_enrichment"`, `"regex"`) and logs a summary for every document. This enables monitoring of extraction quality and identifying courts where scrapers should be improved to reduce LLM dependency.
 
 ### 5.2.3 Reingestion
 
-Historical documents already in S3 can be reprocessed through the full three-tier pipeline using `scripts/reingest_from_s3.py`. This script queries the `documents` table to find existing records, reads their archived content from S3, reconstructs ingestion events, and pushes them through the same extraction pipeline. This is used to backfill fields for documents that were ingested before LLM extraction was available, or after extraction logic improvements.
+Historical documents already in S3 can be reprocessed through the full pipeline using `scripts/reingest_from_s3.py`. This script queries the `documents` table to find existing records, reads their archived content from S3, reconstructs ingestion events, and pushes them through the same extraction pipeline. This is used to backfill fields for documents that were ingested before LLM extraction was available, or after extraction logic improvements.
 
 **Important:** `reingest_from_s3.py` operates on **existing database records only**. If you run it for a county with no records in the `documents` table, it will process 0 documents silently. For initial population of a county that has S3 data but no DB records, use `scripts/rebuild_db.py --county <name>` instead — it discovers documents directly from S3 keys and does not require pre-existing database records.
 

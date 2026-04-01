@@ -41,7 +41,7 @@ from framework.la_parser_utils import (
     SKIP_RESPONDING_PHRASES as _SKIP_RESPONDING_PHRASES,
     VS_RE as _VS_RE,
 )
-from framework.party_utils import is_name_fragment as _is_name_fragment
+from framework.party_utils import is_name_fragment
 from framework.party_utils import split_party_names as _split_party_names
 
 logging.basicConfig(
