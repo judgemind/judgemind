@@ -1742,6 +1742,34 @@ class TestRunReingest:
         assert "AND c.case_number LIKE %s" in filters_arg
         assert pattern in filter_params_arg
 
+    @patch("reingest_from_s3.boto3")
+    @patch("reingest_from_s3.psycopg")
+    @patch("reingest_from_s3.reingest_batch")
+    def test_filter_null_outcome_passed_through(
+        self,
+        mock_batch: MagicMock,
+        mock_psycopg: MagicMock,
+        mock_boto3: MagicMock,
+    ) -> None:
+        mock_conn = MagicMock()
+        mock_conn.__enter__ = MagicMock(return_value=mock_conn)
+        mock_conn.__exit__ = MagicMock(return_value=False)
+        mock_psycopg.connect.return_value = mock_conn
+
+        mock_batch.return_value = _make_batch_result()
+
+        reingest.run_reingest(
+            "postgresql://test",
+            county="Santa Clara",
+            filter_null_outcome=True,
+        )
+
+        call_args = mock_batch.call_args_list[0]
+        filters_arg = call_args[0][4]
+        assert "AND ct.county = %s" in filters_arg
+        assert "AND EXISTS" in filters_arg
+        assert "r.outcome IS NULL" in filters_arg
+
 
 # ---------------------------------------------------------------------------
 # _build_filters
@@ -1877,6 +1905,48 @@ class TestBuildFilters:
             None, None, None, case_number_like=pattern, case_title_regex=regex
         )
         assert params.index(pattern) < params.index(regex)
+
+    def test_filter_null_outcome_adds_exists_subquery(self) -> None:
+        clauses, params = reingest._build_filters(None, None, None, filter_null_outcome=True)
+        assert "AND EXISTS" in clauses
+        assert "r.outcome IS NULL" in clauses
+        # No additional params needed for this filter
+        assert params == []
+
+    def test_filter_null_outcome_false_no_clause(self) -> None:
+        clauses, params = reingest._build_filters(None, None, None, filter_null_outcome=False)
+        assert clauses == ""
+        assert params == []
+
+    def test_filter_null_outcome_with_county(self) -> None:
+        clauses, params = reingest._build_filters(
+            "Santa Clara", None, None, filter_null_outcome=True
+        )
+        assert "AND ct.county = %s" in clauses
+        assert "AND EXISTS" in clauses
+        assert "r.outcome IS NULL" in clauses
+        assert params == ["Santa Clara"]
+
+    def test_filter_null_outcome_and_orphaned_only_contradictory(self) -> None:
+        """Both flags can be set but produce contradictory logic (no doc can
+        have no rulings AND have a ruling with NULL outcome). Verify both
+        clauses are emitted so the query returns an empty set gracefully."""
+        clauses, params = reingest._build_filters(
+            None, None, None, filter_null_outcome=True, orphaned_only=True
+        )
+        assert "AND EXISTS" in clauses
+        assert "r.outcome IS NULL" in clauses
+        assert "AND NOT EXISTS" in clauses
+
+    def test_filter_null_outcome_with_null_motion_type(self) -> None:
+        """Both null-outcome and null-motion-type can be combined to target
+        documents that have rulings with both NULL outcome and NULL motion_type."""
+        clauses, params = reingest._build_filters(
+            None, None, None, filter_null_outcome=True, null_motion_type=True
+        )
+        assert "r.outcome IS NULL" in clauses
+        assert "r.motion_type IS NULL" in clauses
+        assert params == []
 
 
 # ---------------------------------------------------------------------------
