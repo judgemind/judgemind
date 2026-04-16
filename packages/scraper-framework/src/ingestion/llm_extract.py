@@ -784,6 +784,7 @@ def extract_fields_llm(
     timeout: float | None = None,
     max_total_chars: int | None = None,
     token_tracker: TokenTracker | None = None,
+    max_tokens: int = 4096,
 ) -> LLMExtractionResult | None:
     """Extract structured fields from a court ruling via a configurable LLM.
 
@@ -825,6 +826,10 @@ def extract_fields_llm(
         token_tracker: Optional ``TokenTracker`` to accumulate token usage
             across multiple calls.  Thread-safe — can be shared across
             concurrent ``extract_fields_llm()`` invocations.
+        max_tokens: Maximum output tokens for each LLM API call.  Defaults
+            to 4096.  Counties with large documents (e.g. Santa Clara,
+            130K+ chars) need a higher value (e.g. 32768) to avoid
+            truncated JSON responses.
 
     Returns:
         An ``LLMExtractionResult`` with extracted fields, or ``None`` if
@@ -895,6 +900,7 @@ def extract_fields_llm(
             model=model,
             client=client,
             timeout=timeout,
+            max_tokens=max_tokens,
         )
         if llm_response is None:
             logger.warning("llm_extract.chunk_api_failure", chunk_index=i)

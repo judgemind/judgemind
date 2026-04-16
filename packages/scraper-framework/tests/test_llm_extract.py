@@ -1734,6 +1734,105 @@ class TestChunkedExtraction:
 
 
 # ---------------------------------------------------------------------------
+# max_tokens passthrough (#2355)
+# ---------------------------------------------------------------------------
+
+
+class TestMaxTokensPassthrough:
+    """Verify extract_fields_llm passes max_tokens through to call_llm (#2355).
+
+    Large-document counties (e.g. Santa Clara, 130K+ chars) need a higher
+    max_tokens value to avoid truncated JSON responses.
+    """
+
+    def test_default_max_tokens_is_4096(self) -> None:
+        """When max_tokens is not specified, call_llm receives 4096."""
+        response_json = json.dumps(
+            {
+                "judge_name": "Test Judge",
+                "hearing_date": "2026-03-09",
+                "department": "1",
+                "rulings": [],
+            }
+        )
+        mock_fn = _mock_call_llm(response_json)
+        with patch("ingestion.llm_extract.call_llm", mock_fn):
+            extract_fields_llm(
+                document_text="Some ruling text",
+                content_format="pdf",
+            )
+        assert mock_fn.call_count == 1
+        call_kwargs = mock_fn.call_args[1]
+        assert call_kwargs["max_tokens"] == 4096
+
+    def test_custom_max_tokens_passed_through(self) -> None:
+        """When max_tokens is specified, call_llm receives that value."""
+        response_json = json.dumps(
+            {
+                "judge_name": "Test Judge",
+                "hearing_date": "2026-03-09",
+                "department": "1",
+                "rulings": [],
+            }
+        )
+        mock_fn = _mock_call_llm(response_json)
+        with patch("ingestion.llm_extract.call_llm", mock_fn):
+            extract_fields_llm(
+                document_text="Some ruling text",
+                content_format="pdf",
+                max_tokens=32768,
+            )
+        assert mock_fn.call_count == 1
+        call_kwargs = mock_fn.call_args[1]
+        assert call_kwargs["max_tokens"] == 32768
+
+    def test_max_tokens_passed_to_all_chunks(self) -> None:
+        """When document is chunked, max_tokens is passed to every chunk call."""
+        page1 = "Page 1 content. " * 5000  # ~80K chars
+        page2 = "Page 2 content. " * 5000  # ~80K chars
+        text = f"{page1}\f{page2}"
+
+        response_json = json.dumps(
+            {
+                "judge_name": "Chunk Judge",
+                "hearing_date": "2026-03-09",
+                "department": "1",
+                "rulings": [
+                    {
+                        "case_number": None,
+                        "case_title": "Test",
+                        "outcome": "granted",
+                        "motion_type": "msj",
+                        "parties": [],
+                    }
+                ],
+            }
+        )
+
+        _lock = threading.Lock()
+        _calls: list[dict] = []
+
+        def mock_side_effect(**kwargs: object) -> LLMResponse:
+            with _lock:
+                _calls.append(dict(kwargs))
+            return LLMResponse(text=response_json, input_tokens=100, output_tokens=50)
+
+        mock_fn = MagicMock(side_effect=mock_side_effect)
+        with patch("ingestion.llm_extract.call_llm", mock_fn):
+            extract_fields_llm(
+                document_text=text,
+                content_format="pdf",
+                max_chars=80_000,
+                max_tokens=32768,
+            )
+        # Multiple chunks should have been processed
+        assert mock_fn.call_count >= 2
+        # Every call should have max_tokens=32768
+        for call_kwargs in _calls:
+            assert call_kwargs["max_tokens"] == 32768
+
+
+# ---------------------------------------------------------------------------
 # Outcome taxonomy clarity (#635)
 # ---------------------------------------------------------------------------
 

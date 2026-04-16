@@ -507,10 +507,13 @@ class IngestionWorker:
     ) -> LlmExtractor | None:
         """Return a county-specific LlmExtractor, creating lazily.
 
-        Caches by (provider, model, max_chars_per_chunk) tuple so repeated
-        calls for the same county config reuse the same extractor instance.
+        Caches by (provider, model, max_chars_per_chunk, max_output_tokens)
+        tuple so repeated calls for the same county config reuse the same
+        extractor instance.  The max_output_tokens dimension was added in
+        #2355 to prevent counties with different token limits from sharing
+        an extractor.
         """
-        cache_key = (provider, model or "", max_chars_per_chunk or 0)
+        cache_key = (provider, model or "", max_chars_per_chunk or 0, max_output_tokens or 0)
         if cache_key not in self._county_extractors:
             try:
                 kwargs: dict[str, object] = {"provider": provider}
@@ -975,6 +978,14 @@ class IngestionWorker:
                 "judge_name": event_data.get("judge_name"),
                 "department": event_data.get("department"),
             }
+            # Look up county-specific max_output_tokens (#2355).
+            # Large-document counties (e.g. Santa Clara, 130K+ chars) need
+            # more than the default 4096 output tokens to avoid truncated JSON.
+            from framework.extraction_config import get_county_extraction_config as _get_cc
+
+            _cc = _get_cc(state, county)
+            _llm_max_tokens = _cc.max_output_tokens if _cc and _cc.max_output_tokens else 4096
+
             t0 = time.monotonic()
             llm_result = extract_fields_llm(
                 document_text=ruling_text,
@@ -984,6 +995,7 @@ class IngestionWorker:
                 provider=self._llm_provider,
                 model=self._llm_model,
                 timeout=self._llm_timeout,
+                max_tokens=_llm_max_tokens,
             )
             llm_latency_ms = round((time.monotonic() - t0) * 1000)
 
