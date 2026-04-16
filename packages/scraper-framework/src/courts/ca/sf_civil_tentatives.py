@@ -1,13 +1,12 @@
 """San Francisco Superior Court — Civil Tentative Rulings Scraper.
 
-Scrapes civil tentative rulings from the SF court's tr.dll AJAX API.
+Scrapes civil tentative rulings from the SF court's tr.dll REST API.
 This is separate from the family law scraper (sf_tentatives.py) which
 uses the ufctr.dll endpoint.
 
-Data source:
-  POST https://webapps.sftc.org/tr/tr.dll
-  Content-Type: application/x-www-form-urlencoded
-  Body: RulingID=<N>&SearchBy=CourtDate&DatePick=<MM/DD/YYYY>&CaseNum=
+Data source (after Turnstile session acquisition):
+  GET https://webapps.sftc.org/tr/tr.dll/datasnap/rest/
+      TServerMethods1/GetRulings/{CaseNum}/{DatePick}/{SeshID}/{RulingID}
 
 Response: {"result": [<count>, "<html_table>"]}
 
@@ -23,24 +22,29 @@ The HTML table contains structured <tr> rows with headers:
    9 → Dept 210 (Real Property Housing Court Motions)
    3 → Dept 501 (Real Property Housing Court Motions)
 
-The site is behind Cloudflare Turnstile CAPTCHA. If blocked (302
-redirect to captcha.dll), the scraper logs a warning and returns
-empty results. A future task will address CAPTCHA bypass.
+The site is behind Cloudflare Turnstile CAPTCHA. The scraper uses
+Playwright with stealth to navigate the CAPTCHA page, which auto-solves
+for legitimate browsers. After the CAPTCHA resolves, the page contains
+a session ID (seshID) that is extracted and used for REST API calls
+via httpx (no browser needed per ruling).
 
 No LLM extraction needed — all fields are deterministically parseable
 from the structured HTML response.
 
 Investigation: #2129
+Fix: #2348
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 import structlog
@@ -57,6 +61,27 @@ logger = structlog.get_logger(__name__)
 # ---------------------------------------------------------------------------
 
 CIVIL_API_URL = "https://webapps.sftc.org/tr/tr.dll"
+
+# REST API endpoint for fetching rulings (used with session ID).
+# URL pattern: {CIVIL_API_URL}/datasnap/rest/TServerMethods1/GetRulings/
+#              {CaseNum}/{DatePick}/{SeshID}/{RulingID}
+CIVIL_REST_BASE = f"{CIVIL_API_URL}/datasnap/rest/TServerMethods1/GetRulings"
+
+# CAPTCHA gateway URL — Turnstile challenge page with referrer to tr.dll.
+CAPTCHA_GATEWAY_URL = "https://webapps.sftc.org/captcha/captcha.dll"
+
+# Turnstile challenge timeout (seconds) — how long to wait for auto-solve.
+TURNSTILE_TIMEOUT = 45.0
+
+# Turnstile poll interval (seconds) — how often to check for page navigation.
+TURNSTILE_POLL_INTERVAL = 2.0
+
+# Maximum session acquisition retries.
+SESSION_MAX_RETRIES = 3
+
+# Regex to extract seshID from the page JavaScript.
+# Matches: var seshID="<hex_string>";
+_SESH_ID_RE = re.compile(r'var\s+seshID\s*=\s*"([A-Fa-f0-9]+)"')
 
 # RulingID → department mapping.
 # Each entry defines the department and a description of the motion types.
@@ -403,23 +428,75 @@ def normalize_case_title(raw_title: str | None) -> str | None:
 
 
 # ---------------------------------------------------------------------------
+# Stealth helpers (shared with sd_tentatives.py)
+# ---------------------------------------------------------------------------
+
+
+async def _apply_stealth(page: Any) -> None:
+    """Apply playwright-stealth evasions to avoid Turnstile bot detection.
+
+    Uses the ``playwright-stealth`` library to mask browser automation
+    fingerprints (WebGL, navigator properties, plugins, etc.).
+
+    Falls back gracefully if playwright-stealth is not installed, applying
+    only the minimal webdriver override.
+
+    Args:
+        page: The Playwright page object.
+    """
+    try:
+        from playwright_stealth import Stealth
+
+        stealth = Stealth()
+        await stealth.apply_stealth_async(page)
+    except ImportError:
+        logger.warning("playwright-stealth not installed, using minimal stealth only")
+        await page.evaluate("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+
+
+def extract_session_id(html: str) -> str | None:
+    """Extract the seshID from tr.dll page HTML.
+
+    The page JavaScript contains ``var seshID="<hex>";``. This function
+    extracts the hex string.
+
+    Args:
+        html: The full HTML content of the tr.dll page.
+
+    Returns:
+        The session ID string, or None if not found.
+    """
+    match = _SESH_ID_RE.search(html)
+    return match.group(1) if match else None
+
+
+# ---------------------------------------------------------------------------
 # Scraper class
 # ---------------------------------------------------------------------------
 
 
 class SFCivilTentativeRulingsScraper(BaseScraper):
-    """San Francisco civil tentative rulings — AJAX API pattern.
+    """San Francisco civil tentative rulings — REST API with Turnstile CAPTCHA.
 
-    Fetches rulings from the tr.dll endpoint for all 7 RulingIDs
-    (5 departments). Each ruling is emitted as a separate CapturedDocument.
+    Uses Playwright to solve the Cloudflare Turnstile CAPTCHA and obtain a
+    session ID. Then fetches rulings from the REST API endpoint for all 7
+    RulingIDs (5 departments). Each ruling is emitted as a separate
+    CapturedDocument.
 
-    The site is behind Cloudflare Turnstile. If the API returns a redirect
-    (302) to captcha.dll, the scraper logs a warning and skips that request.
+    Session acquisition flow:
+      1. Navigate to captcha.dll gateway with Playwright + stealth
+      2. Turnstile auto-solves for legitimate browsers
+      3. Page redirects to tr.dll with session ID in page JavaScript
+      4. Extract seshID from ``var seshID="..."`` in the page source
+      5. Use seshID with REST API for fast httpx-based data fetching
 
-    An optional ``dept_judge_map`` (department → judge name) can be passed
+    An optional ``dept_judge_map`` (department -> judge name) can be passed
     to populate judge names from the SF court roster. When provided, the
     judge name is looked up by department number. When absent, the
     judge_name field is left empty (to be resolved downstream by enrichment).
+
+    An optional ``session_id`` can be injected directly (for testing) to
+    skip Playwright-based session acquisition.
     """
 
     def __init__(
@@ -428,29 +505,67 @@ class SFCivilTentativeRulingsScraper(BaseScraper):
         archiver: S3Archiver | None = None,
         event_bus: EventBus | None = None,
         dept_judge_map: dict[str, str] | None = None,
+        session_id: str | None = None,
+        headless: bool = True,
         **kwargs: Any,
     ) -> None:
         super().__init__(config=config, archiver=archiver, event_bus=event_bus)
         self._dept_judge_map: dict[str, str] = dept_judge_map or {}
+        self._session_id: str | None = session_id
+        self._headless: bool = headless
 
     def fetch_documents(self) -> list[CapturedDocument]:
-        """Fetch civil tentative rulings from the tr.dll AJAX API.
+        """Fetch civil tentative rulings from the REST API.
 
-        For each RulingID, sends a POST request with today's date.
-        Parses the JSON response and creates one CapturedDocument
-        per ruling entry.
+        First acquires a session ID via Playwright (if not already set),
+        then fetches rulings for each RulingID using httpx GET requests
+        to the REST API endpoint.
 
         Returns:
             A list of CapturedDocument objects, one per ruling.
         """
+        # Step 1: Acquire session if needed
+        if not self._session_id:
+            self._session_id = asyncio.run(self._acquire_session())
+
+        if not self._session_id:
+            self._log.error("Failed to acquire session — cannot fetch rulings")
+            return []
+
+        self._log.info("Session acquired", session_id_prefix=self._session_id[:8])
+
+        # Step 2: Fetch rulings via REST API
+        return self._fetch_with_session(self._session_id)
+
+    def _fetch_with_session(self, session_id: str) -> list[CapturedDocument]:
+        """Fetch rulings for all RulingIDs using an authenticated session.
+
+        Uses httpx GET requests to the REST API endpoint with the session ID
+        as a path parameter. This is much faster than browser-based fetching
+        since it only needs the browser for initial session acquisition.
+
+        Args:
+            session_id: The session ID obtained from the Turnstile CAPTCHA flow.
+
+        Returns:
+            A list of CapturedDocument objects.
+        """
         docs: list[CapturedDocument] = []
         today = datetime.now(UTC)
         date_str = today.strftime("%m/%d/%Y")
+        # URL-encode the date (slashes become %2F)
+        date_encoded = quote(date_str, safe="")
 
         with httpx.Client(
             timeout=self.config.request_timeout_seconds,
-            follow_redirects=False,  # Detect CAPTCHA redirects
-            headers={"User-Agent": "Judgemind/1.0 (+https://judgemind.org/scraper)"},
+            follow_redirects=False,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/131.0.0.0 Safari/537.36"
+                ),
+            },
         ) as client:
             for ruling_id in RULING_IDS:
                 time.sleep(self.config.request_delay_seconds)
@@ -458,31 +573,18 @@ class SFCivilTentativeRulingsScraper(BaseScraper):
                 dept_info = RULING_ID_MAP[ruling_id]
                 department = dept_info["department"]
 
-                try:
-                    response = client.post(
-                        CIVIL_API_URL,
-                        data={
-                            "RulingID": str(ruling_id),
-                            "SearchBy": "CourtDate",
-                            "DatePick": date_str,
-                            "CaseNum": "",
-                        },
-                        headers={"Content-Type": "application/x-www-form-urlencoded"},
-                    )
+                # REST API URL: .../GetRulings/{CaseNum}/{DatePick}/{SeshID}/{RulingID}
+                # Empty case number searches by date only.
+                api_url = f"{CIVIL_REST_BASE}//{date_encoded}/{session_id}/{ruling_id}"
 
-                    # Check for CAPTCHA redirect
+                try:
+                    response = client.get(api_url)
+
+                    # Check for session expiry or redirect
                     if response.status_code in (301, 302, 303, 307):
                         location = response.headers.get("location", "")
-                        if "captcha" in location.lower():
-                            self._log.warning(
-                                "CAPTCHA redirect detected",
-                                ruling_id=ruling_id,
-                                department=department,
-                                redirect_url=location,
-                            )
-                            continue
                         self._log.warning(
-                            "Unexpected redirect",
+                            "Redirect during REST fetch — session may be expired",
                             ruling_id=ruling_id,
                             status=response.status_code,
                             location=location,
@@ -506,6 +608,19 @@ class SFCivilTentativeRulingsScraper(BaseScraper):
                         error=str(exc),
                     )
                     continue
+
+                # Check for session expiry in response (-1 result)
+                try:
+                    data = json.loads(response.text)
+                    result = data.get("result", [])
+                    if isinstance(result, list) and result and result[0] == -1:
+                        self._log.warning(
+                            "Session expired during fetch",
+                            ruling_id=ruling_id,
+                        )
+                        continue
+                except (json.JSONDecodeError, ValueError):
+                    pass
 
                 # Parse the response
                 rulings = parse_api_response(response.text)
@@ -534,6 +649,161 @@ class SFCivilTentativeRulingsScraper(BaseScraper):
                     docs.append(doc)
 
         return docs
+
+    async def _acquire_session(self) -> str | None:
+        """Acquire a session ID by solving the Cloudflare Turnstile CAPTCHA.
+
+        Uses Playwright to navigate to the CAPTCHA gateway, waits for the
+        Turnstile widget to auto-solve, and extracts the seshID from the
+        resulting page's JavaScript.
+
+        Returns:
+            The session ID string, or None if acquisition failed.
+        """
+        from playwright.async_api import async_playwright
+
+        for attempt in range(1, SESSION_MAX_RETRIES + 1):
+            self._log.info(
+                "Session acquisition attempt",
+                attempt=attempt,
+                max_retries=SESSION_MAX_RETRIES,
+            )
+
+            try:
+                session_id = await self._try_acquire_session(async_playwright)
+                if session_id:
+                    return session_id
+            except Exception as exc:
+                self._log.warning(
+                    "Session acquisition error",
+                    attempt=attempt,
+                    error=str(exc),
+                )
+
+            if attempt < SESSION_MAX_RETRIES:
+                await asyncio.sleep(3.0)
+
+        self._log.error(
+            "Failed to acquire session after all retries",
+            max_retries=SESSION_MAX_RETRIES,
+        )
+        return None
+
+    async def _try_acquire_session(self, async_playwright: Any) -> str | None:
+        """Single attempt to acquire a session via Playwright.
+
+        Args:
+            async_playwright: The async_playwright context manager factory.
+
+        Returns:
+            The session ID string, or None if this attempt failed.
+        """
+        async with async_playwright() as pw:
+            browser = await pw.chromium.launch(
+                headless=self._headless,
+                args=[
+                    "--disable-blink-features=AutomationControlled",
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-infobars",
+                    "--disable-background-networking",
+                    "--disable-default-apps",
+                    "--disable-extensions",
+                    "--disable-sync",
+                    "--no-first-run",
+                    "--window-size=1920,1080",
+                ],
+            )
+
+            try:
+                context = await browser.new_context(
+                    user_agent=(
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/131.0.0.0 Safari/537.36"
+                    ),
+                    viewport={"width": 1920, "height": 1080},
+                    java_script_enabled=True,
+                    locale="en-US",
+                    timezone_id="America/Los_Angeles",
+                )
+
+                page = await context.new_page()
+
+                # Apply stealth evasions to pass Turnstile
+                await _apply_stealth(page)
+
+                # Use the first RulingID as the CAPTCHA referrer — all
+                # RulingIDs share the same session.
+                first_rid = RULING_IDS[0]
+                captcha_url = f"{CAPTCHA_GATEWAY_URL}?referrer={CIVIL_API_URL}?RulingID={first_rid}"
+
+                self._log.debug("Navigating to CAPTCHA gateway", url=captcha_url)
+
+                await page.goto(
+                    captcha_url,
+                    timeout=60000,
+                    wait_until="domcontentloaded",
+                )
+
+                # Wait for Turnstile to auto-solve and redirect to tr.dll page.
+                # The CAPTCHA page redirects to tr.dll?RulingID=N after solving.
+                session_id = await self._wait_for_session(page)
+                return session_id
+
+            finally:
+                await browser.close()
+
+    async def _wait_for_session(self, page: Any) -> str | None:
+        """Wait for the Turnstile CAPTCHA to solve and extract the session ID.
+
+        Polls the page URL and content until the page navigates away from the
+        CAPTCHA gateway to the tr.dll page. Then extracts ``var seshID="..."``
+        from the page JavaScript.
+
+        Args:
+            page: The Playwright page object.
+
+        Returns:
+            The session ID, or None if the CAPTCHA did not solve in time.
+        """
+        elapsed = 0.0
+        while elapsed < TURNSTILE_TIMEOUT:
+            current_url = page.url
+
+            # Check if we've navigated away from the CAPTCHA page
+            if "captcha" not in current_url.lower():
+                # We might be on the tr.dll page now — check for seshID
+                content = await page.content()
+                match = _SESH_ID_RE.search(content)
+                if match:
+                    session_id = match.group(1)
+                    self._log.info(
+                        "Session ID extracted",
+                        session_id_prefix=session_id[:8],
+                    )
+                    return session_id
+
+                self._log.debug(
+                    "Navigated away from CAPTCHA but no seshID found",
+                    url=current_url,
+                )
+
+            await asyncio.sleep(TURNSTILE_POLL_INTERVAL)
+            elapsed += TURNSTILE_POLL_INTERVAL
+
+        # Final check — sometimes the page navigates right at the timeout
+        content = await page.content()
+        match = _SESH_ID_RE.search(content)
+        if match:
+            return match.group(1)
+
+        self._log.warning(
+            "Turnstile CAPTCHA did not resolve in time",
+            timeout_seconds=TURNSTILE_TIMEOUT,
+            final_url=page.url,
+        )
+        return None
 
     def _ruling_to_document(
         self,

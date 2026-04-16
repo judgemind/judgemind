@@ -14,24 +14,29 @@ Other RulingIDs use the same response format.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import httpx
 import pytest
 import respx
 
 from courts.ca.sf_civil_tentatives import (
-    CIVIL_API_URL,
+    CIVIL_REST_BASE,
     RULING_ID_MAP,
     RULING_IDS,
     SFCivilTentativeRulingsScraper,
     _clean_party_name,
     extract_outcome,
     extract_parties_from_title,
+    extract_session_id,
     normalize_case_title,
     parse_api_response,
     parse_hearing_date,
 )
 from courts.ca.sf_civil_tentatives import default_config as sf_civil_default_config
+
+# Fake session ID for tests — bypasses Playwright session acquisition.
+TEST_SESSION_ID = "AABBCCDD1122334455667788AABBCCDD11223344"
 
 pytestmark = pytest.mark.regression
 
@@ -404,24 +409,73 @@ class TestDefaultConfig:
 
 
 # ---------------------------------------------------------------------------
+# extract_session_id
+# ---------------------------------------------------------------------------
+
+
+class TestExtractSessionId:
+    """Tests for extracting session ID from tr.dll page HTML."""
+
+    def test_extracts_from_page_html(self) -> None:
+        """Session ID should be extracted from tr.dll page HTML."""
+        html = (
+            "<html><body><script>"
+            "var rulingID=10;"
+            'var seshID="AA5F410B692A25800E3D6799BA32CDF1E3AB4D5B";'
+            "</script></body></html>"
+        )
+        session_id = extract_session_id(html)
+        assert session_id == "AA5F410B692A25800E3D6799BA32CDF1E3AB4D5B"
+
+    def test_extracts_hex_string(self) -> None:
+        html = 'var seshID="DEADBEEF1234567890ABCDEF";'
+        assert extract_session_id(html) == "DEADBEEF1234567890ABCDEF"
+
+    def test_returns_none_for_missing(self) -> None:
+        html = "<html><body>no session here</body></html>"
+        assert extract_session_id(html) is None
+
+    def test_returns_none_for_empty(self) -> None:
+        assert extract_session_id("") is None
+
+
+# ---------------------------------------------------------------------------
 # Full scraper — mocked HTTP using real fixtures
 # ---------------------------------------------------------------------------
 
 
+def _mock_rest_api(json_text: str) -> None:
+    """Mock the REST API endpoint for all RulingIDs.
+
+    The REST API URL pattern is:
+      {CIVIL_REST_BASE}//{date}/{session_id}/{ruling_id}
+
+    We use a broad URL pattern match since the date and session ID vary.
+    """
+    respx.get(url__startswith=CIVIL_REST_BASE).mock(
+        return_value=httpx.Response(200, text=json_text),
+    )
+
+
 class TestSFCivilScraperRun:
-    """Integration tests for the full scraper run with mocked HTTP."""
+    """Integration tests for the full scraper run with mocked HTTP.
+
+    All tests inject ``session_id`` to bypass Playwright session acquisition
+    and mock the REST API GET endpoint instead of the old POST endpoint.
+    """
 
     @respx.mock
     def test_full_run_success(self) -> None:
         """Full run with one RulingID returning data — should succeed."""
         json_text = _load_fixture("sf-civil-api-response-rid10-2026-03-23.json")
-
-        # Mock all POST requests to return the same fixture
-        respx.post(CIVIL_API_URL).mock(return_value=httpx.Response(200, text=json_text))
+        _mock_rest_api(json_text)
 
         config = sf_civil_default_config()
         config.request_delay_seconds = 0
-        scraper = SFCivilTentativeRulingsScraper(config=config)
+        scraper = SFCivilTentativeRulingsScraper(
+            config=config,
+            session_id=TEST_SESSION_ID,
+        )
 
         health = scraper.run()
         assert health.success is True
@@ -432,12 +486,14 @@ class TestSFCivilScraperRun:
     def test_fetch_documents_populates_fields(self) -> None:
         """Verify all required fields are populated on fetched documents."""
         json_text = _load_fixture("sf-civil-api-response-rid10-2026-03-23.json")
-
-        respx.post(CIVIL_API_URL).mock(return_value=httpx.Response(200, text=json_text))
+        _mock_rest_api(json_text)
 
         config = sf_civil_default_config()
         config.request_delay_seconds = 0
-        scraper = SFCivilTentativeRulingsScraper(config=config)
+        scraper = SFCivilTentativeRulingsScraper(
+            config=config,
+            session_id=TEST_SESSION_ID,
+        )
 
         docs = scraper.fetch_documents()
         assert len(docs) > 0
@@ -455,12 +511,14 @@ class TestSFCivilScraperRun:
     def test_fetch_documents_sets_department(self) -> None:
         """Each document should have the correct department from RULING_ID_MAP."""
         json_text = _load_fixture("sf-civil-api-response-rid10-2026-03-23.json")
-
-        respx.post(CIVIL_API_URL).mock(return_value=httpx.Response(200, text=json_text))
+        _mock_rest_api(json_text)
 
         config = sf_civil_default_config()
         config.request_delay_seconds = 0
-        scraper = SFCivilTentativeRulingsScraper(config=config)
+        scraper = SFCivilTentativeRulingsScraper(
+            config=config,
+            session_id=TEST_SESSION_ID,
+        )
 
         docs = scraper.fetch_documents()
         departments = {d.department for d in docs}
@@ -471,8 +529,7 @@ class TestSFCivilScraperRun:
     def test_fetch_documents_sets_judge_name_from_dept_map(self) -> None:
         """Judge name should be populated from dept_judge_map when provided."""
         json_text = _load_fixture("sf-civil-api-response-rid10-2026-03-23.json")
-
-        respx.post(CIVIL_API_URL).mock(return_value=httpx.Response(200, text=json_text))
+        _mock_rest_api(json_text)
 
         dept_judge_map = {
             "301": "Curtis E.A. Karnow",
@@ -483,13 +540,17 @@ class TestSFCivilScraperRun:
         }
         config = sf_civil_default_config()
         config.request_delay_seconds = 0
-        scraper = SFCivilTentativeRulingsScraper(config=config, dept_judge_map=dept_judge_map)
+        scraper = SFCivilTentativeRulingsScraper(
+            config=config,
+            dept_judge_map=dept_judge_map,
+            session_id=TEST_SESSION_ID,
+        )
 
         docs = scraper.fetch_documents()
         # All documents should have judge names
         has_judge = [d for d in docs if d.judge_name]
         assert len(has_judge) == len(docs)
-        # Check specific department → judge mapping
+        # Check specific department -> judge mapping
         dept_301_docs = [d for d in docs if d.department == "301"]
         assert dept_301_docs[0].judge_name == "Curtis E.A. Karnow"
 
@@ -497,12 +558,14 @@ class TestSFCivilScraperRun:
     def test_fetch_documents_without_dept_map(self) -> None:
         """Judge name should be None when no dept_judge_map is provided."""
         json_text = _load_fixture("sf-civil-api-response-rid10-2026-03-23.json")
-
-        respx.post(CIVIL_API_URL).mock(return_value=httpx.Response(200, text=json_text))
+        _mock_rest_api(json_text)
 
         config = sf_civil_default_config()
         config.request_delay_seconds = 0
-        scraper = SFCivilTentativeRulingsScraper(config=config)
+        scraper = SFCivilTentativeRulingsScraper(
+            config=config,
+            session_id=TEST_SESSION_ID,
+        )
 
         docs = scraper.fetch_documents()
         # Without dept_judge_map, judge_name should be None
@@ -513,12 +576,14 @@ class TestSFCivilScraperRun:
     def test_fetch_documents_sets_parties(self) -> None:
         """Documents with 'VS.' in title should have parties extracted."""
         json_text = _load_fixture("sf-civil-api-response-rid10-2026-03-23.json")
-
-        respx.post(CIVIL_API_URL).mock(return_value=httpx.Response(200, text=json_text))
+        _mock_rest_api(json_text)
 
         config = sf_civil_default_config()
         config.request_delay_seconds = 0
-        scraper = SFCivilTentativeRulingsScraper(config=config)
+        scraper = SFCivilTentativeRulingsScraper(
+            config=config,
+            session_id=TEST_SESSION_ID,
+        )
 
         docs = scraper.fetch_documents()
         # Most SF civil rulings have VS. in the title
@@ -533,12 +598,14 @@ class TestSFCivilScraperRun:
     def test_fetch_documents_sets_motion_type(self) -> None:
         """Calendar matter should be stored as motion_type."""
         json_text = _load_fixture("sf-civil-api-response-rid10-2026-03-23.json")
-
-        respx.post(CIVIL_API_URL).mock(return_value=httpx.Response(200, text=json_text))
+        _mock_rest_api(json_text)
 
         config = sf_civil_default_config()
         config.request_delay_seconds = 0
-        scraper = SFCivilTentativeRulingsScraper(config=config)
+        scraper = SFCivilTentativeRulingsScraper(
+            config=config,
+            session_id=TEST_SESSION_ID,
+        )
 
         docs = scraper.fetch_documents()
         has_motion = [d for d in docs if d.motion_type]
@@ -548,12 +615,14 @@ class TestSFCivilScraperRun:
     def test_fetch_documents_sets_ruling_text_html(self) -> None:
         """ruling_text_html should contain HTML formatting."""
         json_text = _load_fixture("sf-civil-api-response-rid10-2026-03-23.json")
-
-        respx.post(CIVIL_API_URL).mock(return_value=httpx.Response(200, text=json_text))
+        _mock_rest_api(json_text)
 
         config = sf_civil_default_config()
         config.request_delay_seconds = 0
-        scraper = SFCivilTentativeRulingsScraper(config=config)
+        scraper = SFCivilTentativeRulingsScraper(
+            config=config,
+            session_id=TEST_SESSION_ID,
+        )
 
         docs = scraper.fetch_documents()
         has_html = [d for d in docs if d.ruling_text_html]
@@ -563,12 +632,14 @@ class TestSFCivilScraperRun:
     def test_fetch_documents_stores_ruling_id_in_extra(self) -> None:
         """Extra metadata should include ruling_id and dept_type."""
         json_text = _load_fixture("sf-civil-api-response-rid10-2026-03-23.json")
-
-        respx.post(CIVIL_API_URL).mock(return_value=httpx.Response(200, text=json_text))
+        _mock_rest_api(json_text)
 
         config = sf_civil_default_config()
         config.request_delay_seconds = 0
-        scraper = SFCivilTentativeRulingsScraper(config=config)
+        scraper = SFCivilTentativeRulingsScraper(
+            config=config,
+            session_id=TEST_SESSION_ID,
+        )
 
         docs = scraper.fetch_documents()
         first = docs[0]
@@ -576,9 +647,9 @@ class TestSFCivilScraperRun:
         assert "dept_type" in first.extra
 
     @respx.mock
-    def test_handles_captcha_redirect(self) -> None:
-        """CAPTCHA redirect (302 to captcha.dll) should be handled gracefully."""
-        respx.post(CIVIL_API_URL).mock(
+    def test_handles_redirect_gracefully(self) -> None:
+        """Redirect during REST fetch should be handled gracefully."""
+        respx.get(url__startswith=CIVIL_REST_BASE).mock(
             return_value=httpx.Response(
                 302,
                 headers={"Location": "https://webapps.sftc.org/tr/captcha.dll"},
@@ -587,7 +658,10 @@ class TestSFCivilScraperRun:
 
         config = sf_civil_default_config()
         config.request_delay_seconds = 0
-        scraper = SFCivilTentativeRulingsScraper(config=config)
+        scraper = SFCivilTentativeRulingsScraper(
+            config=config,
+            session_id=TEST_SESSION_ID,
+        )
 
         docs = scraper.fetch_documents()
         assert docs == []
@@ -599,11 +673,16 @@ class TestSFCivilScraperRun:
         The scraper catches per-RulingID errors and continues to the next.
         The overall run succeeds with 0 records (no unhandled exception).
         """
-        respx.post(CIVIL_API_URL).mock(return_value=httpx.Response(500))
+        respx.get(url__startswith=CIVIL_REST_BASE).mock(
+            return_value=httpx.Response(500),
+        )
 
         config = sf_civil_default_config()
         config.request_delay_seconds = 0
-        scraper = SFCivilTentativeRulingsScraper(config=config)
+        scraper = SFCivilTentativeRulingsScraper(
+            config=config,
+            session_id=TEST_SESSION_ID,
+        )
 
         health = scraper.run()
         # Per-RulingID errors are caught — the run itself succeeds
@@ -613,11 +692,52 @@ class TestSFCivilScraperRun:
     @respx.mock
     def test_handles_empty_results(self) -> None:
         """Empty result set should succeed with 0 records."""
-        respx.post(CIVIL_API_URL).mock(return_value=httpx.Response(200, text='{"result": [0, ""]}'))
+        respx.get(url__startswith=CIVIL_REST_BASE).mock(
+            return_value=httpx.Response(200, text='{"result": [0, ""]}'),
+        )
 
         config = sf_civil_default_config()
         config.request_delay_seconds = 0
-        scraper = SFCivilTentativeRulingsScraper(config=config)
+        scraper = SFCivilTentativeRulingsScraper(
+            config=config,
+            session_id=TEST_SESSION_ID,
+        )
+
+        health = scraper.run()
+        assert health.success is True
+        assert health.records_captured == 0
+
+    @respx.mock
+    def test_handles_non_json_response(self) -> None:
+        """Non-JSON response should be handled gracefully (no crash)."""
+        respx.get(url__startswith=CIVIL_REST_BASE).mock(
+            return_value=httpx.Response(200, text="<html>Not JSON</html>"),
+        )
+
+        config = sf_civil_default_config()
+        config.request_delay_seconds = 0
+        scraper = SFCivilTentativeRulingsScraper(
+            config=config,
+            session_id=TEST_SESSION_ID,
+        )
+
+        health = scraper.run()
+        assert health.success is True
+        assert health.records_captured == 0
+
+    @respx.mock
+    def test_handles_session_expiry(self) -> None:
+        """Session expiry (result=[−1]) should be handled gracefully."""
+        respx.get(url__startswith=CIVIL_REST_BASE).mock(
+            return_value=httpx.Response(200, text='{"result": [-1]}'),
+        )
+
+        config = sf_civil_default_config()
+        config.request_delay_seconds = 0
+        scraper = SFCivilTentativeRulingsScraper(
+            config=config,
+            session_id=TEST_SESSION_ID,
+        )
 
         health = scraper.run()
         assert health.success is True
@@ -627,16 +747,255 @@ class TestSFCivilScraperRun:
     def test_content_format_is_html(self) -> None:
         """Documents should have HTML content format."""
         json_text = _load_fixture("sf-civil-api-response-rid10-2026-03-23.json")
-
-        respx.post(CIVIL_API_URL).mock(return_value=httpx.Response(200, text=json_text))
+        _mock_rest_api(json_text)
 
         config = sf_civil_default_config()
         config.request_delay_seconds = 0
-        scraper = SFCivilTentativeRulingsScraper(config=config)
+        scraper = SFCivilTentativeRulingsScraper(
+            config=config,
+            session_id=TEST_SESSION_ID,
+        )
 
         docs = scraper.fetch_documents()
         for doc in docs:
             assert doc.content_format.value == "html"
+
+    def test_no_session_returns_empty(self) -> None:
+        """Without a session (and no Playwright), scraper returns empty."""
+        import unittest.mock
+
+        config = sf_civil_default_config()
+        config.request_delay_seconds = 0
+        scraper = SFCivilTentativeRulingsScraper(
+            config=config,
+            session_id=None,
+        )
+
+        # Patch asyncio.run to return None (simulating failed session acquisition)
+        with unittest.mock.patch(
+            "asyncio.run",
+            return_value=None,
+        ):
+            docs = scraper.fetch_documents()
+            assert docs == []
+
+
+# ---------------------------------------------------------------------------
+# Session acquisition — mocked Playwright
+# ---------------------------------------------------------------------------
+
+
+class TestSessionAcquisition:
+    """Tests for Playwright-based session acquisition with mocks."""
+
+    def test_acquire_session_returns_id_on_success(self) -> None:
+        """_acquire_session should return session ID when Turnstile resolves."""
+        import asyncio
+
+        config = sf_civil_default_config()
+        scraper = SFCivilTentativeRulingsScraper(config=config)
+
+        async def _mock_try_acquire(_pw: Any) -> str | None:
+            return "DEADBEEF1234567890ABCDEF1234567890ABCDEF"
+
+        scraper._try_acquire_session = _mock_try_acquire  # type: ignore[assignment]
+        result = asyncio.run(scraper._acquire_session())
+        assert result == "DEADBEEF1234567890ABCDEF1234567890ABCDEF"
+
+    def test_acquire_session_retries_on_failure(self) -> None:
+        """_acquire_session should retry and return None after all attempts fail."""
+        import asyncio
+
+        config = sf_civil_default_config()
+        scraper = SFCivilTentativeRulingsScraper(config=config)
+
+        call_count = 0
+
+        async def _mock_try_acquire(_pw: Any) -> str | None:
+            nonlocal call_count
+            call_count += 1
+            return None
+
+        scraper._try_acquire_session = _mock_try_acquire  # type: ignore[assignment]
+        result = asyncio.run(scraper._acquire_session())
+        assert result is None
+        assert call_count == 3  # SESSION_MAX_RETRIES
+
+    def test_acquire_session_retries_on_exception(self) -> None:
+        """_acquire_session should retry on exceptions and return None."""
+        import asyncio
+
+        config = sf_civil_default_config()
+        scraper = SFCivilTentativeRulingsScraper(config=config)
+
+        async def _mock_try_acquire(_pw: Any) -> str | None:
+            msg = "Browser crashed"
+            raise RuntimeError(msg)
+
+        scraper._try_acquire_session = _mock_try_acquire  # type: ignore[assignment]
+        result = asyncio.run(scraper._acquire_session())
+        assert result is None
+
+    def test_wait_for_session_extracts_id(self) -> None:
+        """_wait_for_session should extract seshID from page content."""
+        import asyncio
+        import unittest.mock
+
+        config = sf_civil_default_config()
+        scraper = SFCivilTentativeRulingsScraper(config=config)
+
+        mock_page = unittest.mock.AsyncMock()
+        # Page URL is not captcha (already redirected)
+        mock_page.url = "https://webapps.sftc.org/tr/tr.dll/?RulingID=10"
+        # Page content has the seshID
+        mock_page.content.return_value = (
+            "<script>var rulingID=10;"
+            'var seshID="AA5F410B692A25800E3D6799BA32CDF1E3AB4D5B";'
+            "</script>"
+        )
+
+        result = asyncio.run(scraper._wait_for_session(mock_page))
+        assert result == "AA5F410B692A25800E3D6799BA32CDF1E3AB4D5B"
+
+    def test_wait_for_session_returns_none_on_timeout(self) -> None:
+        """_wait_for_session should return None when CAPTCHA doesn't resolve."""
+        import asyncio
+        import unittest.mock
+
+        from courts.ca import sf_civil_tentatives
+
+        # Temporarily reduce timeout for test speed
+        original_timeout = sf_civil_tentatives.TURNSTILE_TIMEOUT
+        sf_civil_tentatives.TURNSTILE_TIMEOUT = 0.1
+        sf_civil_tentatives.TURNSTILE_POLL_INTERVAL = 0.05
+
+        try:
+            config = sf_civil_default_config()
+            scraper = SFCivilTentativeRulingsScraper(config=config)
+
+            mock_page = unittest.mock.AsyncMock()
+            # Page URL is still on captcha (never resolves)
+            mock_page.url = "https://webapps.sftc.org/captcha/captcha.dll?referrer=..."
+            # Page content has no seshID
+            mock_page.content.return_value = "<html>CAPTCHA page</html>"
+
+            result = asyncio.run(scraper._wait_for_session(mock_page))
+            assert result is None
+        finally:
+            sf_civil_tentatives.TURNSTILE_TIMEOUT = original_timeout
+            sf_civil_tentatives.TURNSTILE_POLL_INTERVAL = 2.0
+
+    def test_wait_for_session_navigated_but_no_sesh_id(self) -> None:
+        """_wait_for_session should poll when page navigates but has no seshID."""
+        import asyncio
+        import unittest.mock
+
+        from courts.ca import sf_civil_tentatives
+
+        original_timeout = sf_civil_tentatives.TURNSTILE_TIMEOUT
+        sf_civil_tentatives.TURNSTILE_TIMEOUT = 0.1
+        sf_civil_tentatives.TURNSTILE_POLL_INTERVAL = 0.05
+
+        try:
+            config = sf_civil_default_config()
+            scraper = SFCivilTentativeRulingsScraper(config=config)
+
+            mock_page = unittest.mock.AsyncMock()
+            # URL is NOT captcha (navigated away) but no seshID in content
+            mock_page.url = "https://webapps.sftc.org/tr/tr.dll/?RulingID=10"
+            mock_page.content.return_value = "<html>No session here</html>"
+
+            result = asyncio.run(scraper._wait_for_session(mock_page))
+            assert result is None
+        finally:
+            sf_civil_tentatives.TURNSTILE_TIMEOUT = original_timeout
+            sf_civil_tentatives.TURNSTILE_POLL_INTERVAL = 2.0
+
+    def test_try_acquire_session_with_mocked_playwright(self) -> None:
+        """_try_acquire_session should orchestrate browser, context, page, and CAPTCHA."""
+        import asyncio
+        import unittest.mock
+
+        config = sf_civil_default_config()
+        scraper = SFCivilTentativeRulingsScraper(config=config)
+
+        # Build a mock Playwright chain:
+        # async_playwright() -> pw -> pw.chromium.launch() -> browser
+        #   -> browser.new_context() -> context -> context.new_page() -> page
+        mock_page = unittest.mock.AsyncMock()
+        mock_page.url = "https://webapps.sftc.org/tr/tr.dll/?RulingID=2"
+        mock_page.content.return_value = (
+            '<script>var rulingID=2;var seshID="CAFE0123456789ABCDEF0123456789ABCAFE0123";</script>'
+        )
+
+        mock_context = unittest.mock.AsyncMock()
+        mock_context.new_page.return_value = mock_page
+
+        mock_browser = unittest.mock.AsyncMock()
+        mock_browser.new_context.return_value = mock_context
+
+        mock_pw = unittest.mock.AsyncMock()
+        mock_pw.chromium.launch.return_value = mock_browser
+
+        # The async_playwright context manager
+        mock_pw_cm = unittest.mock.AsyncMock()
+        mock_pw_cm.__aenter__.return_value = mock_pw
+        mock_pw_factory = unittest.mock.MagicMock(return_value=mock_pw_cm)
+
+        result = asyncio.run(scraper._try_acquire_session(mock_pw_factory))
+        assert result == "CAFE0123456789ABCDEF0123456789ABCAFE0123"
+        mock_browser.close.assert_awaited_once()
+
+    def test_fetch_documents_uses_injected_session(self) -> None:
+        """fetch_documents should skip Playwright when session_id is provided."""
+        import unittest.mock
+
+        json_text = _load_fixture("sf-civil-api-response-rid10-2026-03-23.json")
+
+        with respx.mock:
+            _mock_rest_api(json_text)
+
+            config = sf_civil_default_config()
+            config.request_delay_seconds = 0
+            scraper = SFCivilTentativeRulingsScraper(
+                config=config,
+                session_id=TEST_SESSION_ID,
+            )
+
+            # asyncio.run should NOT be called when session_id is provided
+            with unittest.mock.patch("asyncio.run") as mock_run:
+                docs = scraper.fetch_documents()
+                mock_run.assert_not_called()
+                assert len(docs) > 0
+
+
+class TestApplyStealth:
+    """Tests for the _apply_stealth helper."""
+
+    def test_apply_stealth_with_library(self) -> None:
+        """_apply_stealth should use playwright-stealth when available."""
+        import asyncio
+        import unittest.mock
+
+        from courts.ca.sf_civil_tentatives import _apply_stealth
+
+        mock_page = unittest.mock.AsyncMock()
+        # playwright-stealth is installed in the dev environment
+        asyncio.run(_apply_stealth(mock_page))
+        # Should not raise; stealth was applied
+
+    def test_apply_stealth_does_not_raise(self) -> None:
+        """_apply_stealth should handle mock page without raising."""
+        import asyncio
+        import unittest.mock
+
+        from courts.ca.sf_civil_tentatives import _apply_stealth
+
+        # A fresh mock page — stealth applies without error
+        mock_page = unittest.mock.AsyncMock()
+        mock_page.evaluate = unittest.mock.AsyncMock()
+        asyncio.run(_apply_stealth(mock_page))
+        # Should complete without raising
 
 
 # ---------------------------------------------------------------------------
