@@ -29,7 +29,7 @@ Options:
 """
 
 # venv: scraper-framework
-# one-off: true
+# permanent utility -- ongoing LLM enrichment backfill tool
 from __future__ import annotations
 
 import argparse
