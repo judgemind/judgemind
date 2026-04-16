@@ -587,6 +587,7 @@ def _reparse_document(
     llm_timeout: float | None = 60.0,
     force_llm: bool = False,
     token_tracker: TokenTracker | None = None,
+    force_retranscribe: bool = False,
 ) -> dict:
     """Re-parse a document using a three-tier extraction strategy.
 
@@ -861,8 +862,14 @@ def _reparse_document(
     # Using the full PDF for regex extraction produces wrong matches
     # (motion_type from a different case) and overwrites the scoped
     # ruling_text in the DB via the ON CONFLICT upsert.  See #1848.
+    #
+    # However, for HTML documents the scraper's parse_document() produces
+    # correct clean text via BeautifulSoup.  Preserving stored_ruling_text
+    # for HTML docs prevents re-transcription when the stored value IS the
+    # problem (e.g. raw HTML instead of clean text).  See #2360.
     stored = doc_meta.get("stored_ruling_text")
-    if stored:
+    use_stored = stored and not force_retranscribe and doc_format != "html"
+    if use_stored:
         extracted["ruling_text"] = stored.replace("\x00", "") if stored else stored
         regex_text = extracted["ruling_text"]
     else:
@@ -897,6 +904,7 @@ def _full_reparse_document(
     llm_timeout: float | None = 60.0,
     force_llm: bool = False,
     token_tracker: TokenTracker | None = None,
+    force_retranscribe: bool = False,
 ) -> list[dict]:
     """Re-parse a document with full splitting logic.
 
@@ -934,6 +942,7 @@ def _full_reparse_document(
             llm_timeout=llm_timeout,
             force_llm=force_llm,
             token_tracker=token_tracker,
+            force_retranscribe=force_retranscribe,
         )
         result["ruling_index"] = 0
         result["split_document_id"] = doc_meta["document_id"]
@@ -995,6 +1004,7 @@ def _full_reparse_document(
             llm_timeout=llm_timeout,
             force_llm=force_llm,
             token_tracker=token_tracker,
+            force_retranscribe=force_retranscribe,
         )
         result["ruling_index"] = 0
         result["split_document_id"] = doc_meta["document_id"]
@@ -1141,6 +1151,7 @@ def _reparse_document_multimodal(
     llm_timeout: float | None = 60.0,
     force_llm: bool = False,
     token_tracker: TokenTracker | None = None,
+    force_retranscribe: bool = False,
 ) -> list[dict]:
     """Re-parse a PDF document using multimodal per-page extraction.
 
@@ -1196,6 +1207,7 @@ def _reparse_document_multimodal(
             llm_timeout=llm_timeout,
             force_llm=force_llm,
             token_tracker=token_tracker,
+            force_retranscribe=force_retranscribe,
         )
         result["ruling_index"] = 0
         result["split_document_id"] = doc_meta["document_id"]
@@ -1242,6 +1254,7 @@ def _reparse_document_multimodal(
             llm_timeout=llm_timeout,
             force_llm=force_llm,
             token_tracker=token_tracker,
+            force_retranscribe=force_retranscribe,
         )
         result["ruling_index"] = 0
         result["split_document_id"] = doc_meta["document_id"]
@@ -1450,6 +1463,7 @@ def reingest_batch(
     batch_number: int = 0,
     token_tracker: TokenTracker | None = None,
     multimodal_extractor: LlmExtractor | None = None,
+    force_retranscribe: bool = False,
 ) -> dict[str, Any]:
     """Process one batch. Returns a dict of batch stats.
 
@@ -1721,6 +1735,7 @@ def reingest_batch(
                     llm_timeout,
                     force_llm,
                     token_tracker,
+                    force_retranscribe,
                 )
             else:
                 future = pool.submit(
@@ -1735,6 +1750,7 @@ def reingest_batch(
                     llm_timeout,
                     force_llm,
                     token_tracker,
+                    force_retranscribe,
                 )
             parse_futures[future] = (idx, doc_meta)
 
@@ -2483,6 +2499,7 @@ def run_reingest(
     checkpoint_file: str | None = None,
     resume: bool = False,
     case_number_like: str | None = None,
+    force_retranscribe: bool = False,
 ) -> dict[str, Any]:
     """Run the full reingest. Returns summary stats including cost.
 
@@ -2639,6 +2656,7 @@ def run_reingest(
                 batch_number=total_batches,
                 token_tracker=tracker,
                 multimodal_extractor=multimodal_extractor,
+                force_retranscribe=force_retranscribe,
             )
             processed = batch_result["processed"]
             updated = batch_result["updated"]
@@ -2910,6 +2928,21 @@ def main() -> None:
             "Example: --prefix federal/"
         ),
     )
+    parser.add_argument(
+        "--force-retranscribe",
+        action="store_true",
+        help=(
+            "Skip stored_ruling_text preservation for ALL document formats. "
+            "Normally, stored ruling_text from prior LLM transcriptions is "
+            "preserved for PDF documents to avoid overwriting scoped text "
+            "with the full multi-ruling PDF text. This flag forces "
+            "re-transcription from raw content for every document, "
+            "regardless of format. Useful when the stored ruling_text "
+            "itself is the problem (e.g. stale LLM output). "
+            "Note: HTML documents always use freshly-parsed text even "
+            "without this flag — it only affects PDF documents."
+        ),
+    )
     args = parser.parse_args()
 
     if args.resume and not args.checkpoint_file:
@@ -2965,6 +2998,7 @@ def main() -> None:
         checkpoint_file=args.checkpoint_file,
         resume=args.resume,
         case_number_like=args.case_number_like,
+        force_retranscribe=args.force_retranscribe,
     )
 
     logger.info(
