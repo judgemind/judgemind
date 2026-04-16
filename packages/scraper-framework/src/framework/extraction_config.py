@@ -95,6 +95,7 @@ _COUNTY_CONFIGS: dict[tuple[str, str], CountyExtractionConfig] = {
     ),
     ("CA", "ORANGE"): CountyExtractionConfig(
         method=ExtractionMethod.MULTIMODAL,
+        max_output_tokens=32768,
     ),
     ("CA", "SAN BERNARDINO"): CountyExtractionConfig(
         method=ExtractionMethod.LLM,

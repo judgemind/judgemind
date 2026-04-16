@@ -6290,6 +6290,72 @@ class TestReingestBatchMultimodal:
         mock_reparse.assert_called_once()
 
 
+class TestRunReingestMultimodalTokens:
+    """Verify the multimodal extractor uses the higher token limit (#2369)."""
+
+    @patch("reingest_from_s3.boto3")
+    @patch("reingest_from_s3.psycopg")
+    @patch("reingest_from_s3.reingest_batch")
+    @patch("reingest_from_s3.LlmExtractor")
+    def test_multimodal_extractor_uses_32768_tokens(
+        self,
+        mock_extractor_cls: MagicMock,
+        mock_batch: MagicMock,
+        mock_psycopg: MagicMock,
+        mock_boto3: MagicMock,
+    ) -> None:
+        """When --multimodal is set, LlmExtractor is created with max_output_tokens=32768.
+
+        The default 4,096-token output cap causes dense multi-case
+        department-calendar pages to truncate their JSON response, leaving
+        ruling_text empty for later cases and blocking outcome/motion_type
+        enrichment (#2369).
+        """
+        mock_conn = MagicMock()
+        mock_conn.__enter__ = MagicMock(return_value=mock_conn)
+        mock_conn.__exit__ = MagicMock(return_value=False)
+        mock_psycopg.connect.return_value = mock_conn
+        mock_batch.return_value = _make_batch_result()
+
+        fake_extractor = MagicMock()
+        fake_extractor._model = "gemini-2.5-flash-lite"
+        mock_extractor_cls.return_value = fake_extractor
+
+        reingest.run_reingest("postgresql://test", multimodal=True, no_llm=True)
+
+        mock_extractor_cls.assert_called_once_with(
+            provider="google",
+            max_output_tokens=32768,
+        )
+        # The extractor is threaded through to reingest_batch.
+        batch_call = mock_batch.call_args_list[0]
+        assert batch_call.kwargs.get("multimodal_extractor") is fake_extractor
+
+    @patch("reingest_from_s3.boto3")
+    @patch("reingest_from_s3.psycopg")
+    @patch("reingest_from_s3.reingest_batch")
+    @patch("reingest_from_s3.LlmExtractor")
+    def test_no_multimodal_flag_does_not_create_extractor(
+        self,
+        mock_extractor_cls: MagicMock,
+        mock_batch: MagicMock,
+        mock_psycopg: MagicMock,
+        mock_boto3: MagicMock,
+    ) -> None:
+        """Without --multimodal, the multimodal LlmExtractor is not created."""
+        mock_conn = MagicMock()
+        mock_conn.__enter__ = MagicMock(return_value=mock_conn)
+        mock_conn.__exit__ = MagicMock(return_value=False)
+        mock_psycopg.connect.return_value = mock_conn
+        mock_batch.return_value = _make_batch_result()
+
+        reingest.run_reingest("postgresql://test", multimodal=False, no_llm=True)
+
+        mock_extractor_cls.assert_not_called()
+        batch_call = mock_batch.call_args_list[0]
+        assert batch_call.kwargs.get("multimodal_extractor") is None
+
+
 class TestCLIMultimodalFlag:
     """Verify --multimodal CLI flag is parsed correctly."""
 

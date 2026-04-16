@@ -2590,13 +2590,25 @@ def run_reingest(
         logger.info("LLM extraction disabled, using regex-only mode", reason=reason)
 
     # Create multimodal extractor for per-page PDF extraction (#1719).
+    #
+    # The default ``LlmExtractor.max_output_tokens`` of 4,096 truncates the
+    # per-page JSON response on dense multi-case department-calendar PDFs
+    # (e.g. Orange County), which leaves ruling_text empty for later cases
+    # and blocks downstream outcome/motion_type enrichment.  Matching the
+    # text-based county configs, the multimodal extractor is created with
+    # ``max_output_tokens=32768`` so per-page responses fit comfortably
+    # (#2369).  All multimodal counties today benefit from the higher limit.
     multimodal_extractor: LlmExtractor | None = None
     if multimodal:
         try:
-            multimodal_extractor = LlmExtractor(provider="google")
+            multimodal_extractor = LlmExtractor(
+                provider="google",
+                max_output_tokens=32768,
+            )
             logger.info(
                 "Multimodal extraction enabled (Google Flash Lite)",
                 model=multimodal_extractor._model,
+                max_output_tokens=32768,
             )
         except Exception:
             logger.error(

@@ -1743,6 +1743,34 @@ def _extract_case_title_from_info(case_info: str) -> str | None:
     cleaned = re.sub(r"\s{2,}", " ", cleaned)
     # 10. Remove leading/trailing punctuation and whitespace.
     cleaned = cleaned.strip(" -;,\t")
+    # 10b. Dual-"vs." contamination guard (#2369).  When adjacent cases on
+    #     a multimodal PDF page bleed into each other, the LLM sometimes
+    #     returns a case_info containing TWO "vs."/"v." clauses with the
+    #     first plaintiff's name repeating at the start of the second
+    #     case, e.g. "Anh-Vu Nguyen vs. Freedom Medical Group, LLC
+    #     Anh-Vu Nguyen vs. Seed4Planet, LLC".  When that pattern is
+    #     detected, keep only the first plaintiff-vs-defendant pair by
+    #     truncating at the whitespace immediately before the repeated
+    #     plaintiff name.  Cases where the plaintiff does NOT repeat
+    #     (genuinely unusual titles with two "vs." clauses) are left
+    #     untouched to avoid mistruncation.
+    vs_iter = list(_VS_RE.finditer(cleaned))
+    if len(vs_iter) >= 2:
+        first_vs_start = vs_iter[0].start()
+        first_vs_end = vs_iter[0].end()
+        second_vs_start = vs_iter[1].start()
+        # First plaintiff text — everything before the first "vs.".
+        first_plaintiff = cleaned[:first_vs_start].strip(" ,;-")
+        # First word of the first plaintiff.  The heuristic: if this word
+        # reappears between the end of the first "vs." clause and the
+        # start of the second "vs.", we're seeing the repeated plaintiff
+        # contamination pattern.
+        first_word = first_plaintiff.split(" ", 1)[0] if first_plaintiff else ""
+        if first_word:
+            needle = " " + first_word
+            candidate = cleaned.find(needle, first_vs_end, second_vs_start)
+            if candidate > first_vs_end:
+                cleaned = cleaned[:candidate].rstrip(" ,;-")
     # 11. Truncate overly long titles.  Titles over 150 chars typically
     #     contain multiple case names or full court caption text jammed
     #     together.

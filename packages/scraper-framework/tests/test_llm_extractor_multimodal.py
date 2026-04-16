@@ -14,6 +14,7 @@ Validates:
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -682,6 +683,42 @@ class TestExtractCaseTitleFromInfo:
         """Multiple spaces from cleanup are collapsed to single space."""
         result = _extract_case_title_from_info("Smith  v.   Jones")
         assert result == "Smith v. Jones"
+
+    def test_dual_vs_contamination_truncated_short(self) -> None:
+        """Dual-"vs." contamination is truncated at the first pair (#2369).
+
+        When the multimodal LLM's JSON response leaks an adjacent case into
+        ``case_info``, the result contains TWO "vs." clauses.  The cleanup
+        keeps only the first plaintiff-vs-defendant pair.
+        """
+        contaminated = (
+            "Anh-Vu Nguyen vs. Freedom Medical Group, LLC Anh-Vu Nguyen vs. Seed4Planet, LLC"
+        )
+        result = _extract_case_title_from_info(contaminated)
+        assert result is not None
+        # Only the first plaintiff-vs-defendant pair survives.
+        assert result == "Anh-Vu Nguyen vs. Freedom Medical Group, LLC"
+        # Exactly one "vs." or "v." remains in the cleaned title.
+        vs_count = len(re.findall(r"\bv(?:s)?\.?\s", result, re.IGNORECASE))
+        assert vs_count == 1
+
+    def test_dual_vs_contamination_truncated_v_variant(self) -> None:
+        """Dual-"v." pattern is also detected and truncated (#2369).
+
+        The common OC contamination pattern repeats the first plaintiff's
+        name when adjacent cases bleed together.  The cut point is the
+        whitespace before the second occurrence of the plaintiff's first
+        word.
+        """
+        contaminated = "Smith v. Jones Smith v. Roberts"
+        result = _extract_case_title_from_info(contaminated)
+        assert result is not None
+        assert result == "Smith v. Jones"
+
+    def test_single_vs_pattern_preserved(self) -> None:
+        """A single "vs." pair is left untouched (regression for #2369)."""
+        result = _extract_case_title_from_info("Anh-Vu Nguyen vs. Freedom Medical Group, LLC")
+        assert result == "Anh-Vu Nguyen vs. Freedom Medical Group, LLC"
 
 
 # ---------------------------------------------------------------------------
