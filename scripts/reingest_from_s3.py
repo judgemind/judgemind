@@ -1102,6 +1102,11 @@ def _full_reparse_document(
             ruling.ruling_text.replace("\x00", "") if ruling.ruling_text else None
         )
 
+        # Prefer per-ruling department when the split provides one
+        # (e.g. Fresno extracts it from each ruling's "(Dept. NNN)"
+        # header).  Fall back to the doc-level department otherwise.
+        ruling_department = getattr(ruling, "department", None) or doc_department
+
         extracted: dict = {
             "ruling_text": ruling_text_cleaned,
             "case_number": ruling.case_number or doc_meta.get("case_number"),
@@ -1115,7 +1120,7 @@ def _full_reparse_document(
                 if ruling.motion_type
                 else None
             ),
-            "department": doc_department,
+            "department": ruling_department,
             "parties": [],
             "hearing_date": doc_hearing_date,
             "ruling_index": ruling_index,
@@ -1134,8 +1139,10 @@ def _full_reparse_document(
             extracted["extraction_methods"]["judge_name"] = "scraper"
         if doc_hearing_date:
             extracted["extraction_methods"]["hearing_date"] = "scraper"
-        if doc_department:
-            extracted["extraction_methods"]["department"] = "scraper"
+        if ruling_department:
+            extracted["extraction_methods"]["department"] = (
+                "split" if getattr(ruling, "department", None) else "scraper"
+            )
 
         # ------------------------------------------------------------------
         # Regex fallback — fill any fields still missing after split (#1749)

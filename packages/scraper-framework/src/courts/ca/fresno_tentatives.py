@@ -129,6 +129,14 @@ _RULING_HEARING_DATE_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Per-ruling department from the "(Dept. NNN)" trailing the hearing date
+# in each ruling header, e.g. "Hearing Date: March 10, 2026 (Dept. 403)".
+# Also tolerates "Dept 403", "Department 403" without surrounding parens.
+_RULING_DEPT_RE = re.compile(
+    r"\(?\s*(?:Dept\.?|Department)\s+(?P<department>\d{2,3})\s*\)?",
+    re.IGNORECASE,
+)
+
 # Motion type from "Motion: ..." line (may span multiple lines until next field)
 _MOTION_RE = re.compile(
     r"^Motion(?:s?\s*\(x\d+\))?:\s*(?P<motion>.+?)$",
@@ -166,6 +174,7 @@ class SplitRuling:
         "motion_type",
         "outcome",
         "hearing_date",
+        "department",
     )
 
     def __init__(
@@ -177,6 +186,7 @@ class SplitRuling:
         motion_type: str | None,
         outcome: str | None,
         hearing_date: datetime | None,
+        department: str | None = None,
     ) -> None:
         self.ruling_index = ruling_index
         self.case_number = case_number
@@ -185,6 +195,7 @@ class SplitRuling:
         self.motion_type = motion_type
         self.outcome = outcome
         self.hearing_date = hearing_date
+        self.department = department
 
 
 def _fresno_dept_from_filename(filename: str) -> str | None:
@@ -335,6 +346,23 @@ def _extract_outcome(text: str) -> str | None:
     return None
 
 
+def _extract_department(text: str) -> str | None:
+    """Extract department code from the ruling header.
+
+    Fresno rulings include the department in the 'Hearing Date' line, e.g.
+    'Hearing Date: March 10, 2026 (Dept. 403)'.  Extract the department
+    number from the first matching '(Dept. NNN)' / 'Department NNN'
+    occurrence in the header region (first 500 chars).
+
+    Returns the department code as a string (e.g. '403') or None if not
+    found.  Used by :func:`_split_rulings` to set ``SplitRuling.department``
+    so each split child carries the correct department even when multiple
+    departments appear in the same PDF.
+    """
+    m = _RULING_DEPT_RE.search(text[:500])
+    return m.group("department") if m else None
+
+
 def _normalize_outcome(raw: str) -> str:
     """Normalize a 'To ...' outcome string to a canonical form."""
     lower = raw.lower()
@@ -422,6 +450,7 @@ def _split_rulings(text: str) -> list[SplitRuling]:
         motion_type = _extract_motion_type(ruling_text)
         outcome = _extract_outcome(ruling_text)
         hearing_date = _fresno_hearing_date_from_text(ruling_text)
+        department = _extract_department(ruling_text)
 
         rulings.append(
             SplitRuling(
@@ -432,6 +461,7 @@ def _split_rulings(text: str) -> list[SplitRuling]:
                 motion_type=motion_type,
                 outcome=outcome,
                 hearing_date=hearing_date,
+                department=department,
             )
         )
 
@@ -521,6 +551,10 @@ class FresnoTentativeRulingsScraper(PdfLinkScraper):
                     doc.outcome = r.outcome
                     doc.ruling_text = r.ruling_text
                     doc.hearing_date = r.hearing_date
+                    # Prefer per-ruling department if the PDF header
+                    # disagrees with the filename (e.g. a re-posted PDF).
+                    if r.department:
+                        doc.department = r.department
                 split_docs.append(doc)
                 continue
 
@@ -538,8 +572,12 @@ class FresnoTentativeRulingsScraper(PdfLinkScraper):
                     raw_content=doc.raw_content,
                     content_format=ContentFormat.PDF,
                 )
-                # Preserve parent metadata
-                child.department = doc.department
+                # Preserve parent metadata; prefer the per-ruling department
+                # extracted from the ruling header (the PDF may contain
+                # rulings from multiple departments even though the filename
+                # encodes only one).  Fall back to the filename-derived
+                # department when the per-ruling regex doesn't match.
+                child.department = ruling.department or doc.department
                 child.courthouse = doc.courthouse
                 child.extra = {**doc.extra}
                 # Set per-ruling fields
