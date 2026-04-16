@@ -133,6 +133,14 @@ Review dependency freshness and hygiene:
 
 Monitor CI pipeline performance to detect slow jobs before they bottleneck agent throughput. Every `/task` agent blocks on `gh run watch` during the PR cycle, so slow CI directly impacts overall velocity.
 
+**Use the helper script — do not compute trend means by hand.** `scripts/audit_ci_health.py` implements the correct methodology, avoiding the common pitfalls described below. The script exits 0 with no findings or 1 with findings; use it both during the audit and to verify any hand-filed CI perf issue before escalating.
+
+```
+scripts/audit_ci_health.py            # sample last 10 CI runs, print summary + findings
+scripts/audit_ci_health.py --limit 20 # larger sample window
+scripts/audit_ci_health.py --json     # machine-readable output for issue bodies
+```
+
 #### Data collection
 
 1. Fetch the last 10 successful CI runs on `main`:
@@ -151,23 +159,31 @@ gh run view <id> --repo judgemind/judgemind --json jobs
 
 3. For each job, compute:
    - **Job duration** — `completedAt - startedAt` for each job.
-   - **Total wall clock** — time from the earliest job `startedAt` to the `ci-passed` job `completedAt` (or the latest `completedAt` if no `ci-passed` job exists).
+   - **Total wall clock** — earliest non-skipped `startedAt` → latest non-skipped `completedAt`.
 
 #### Threshold checks
 
 Flag a finding if any of the following are true:
 
-- **Single job exceeds 10 minutes.** Any individual job taking longer than 10 minutes is a threshold violation.
+- **Single job exceeds 10 minutes.** Any individual non-skipped job taking longer than 10 minutes is a threshold violation.
 - **Total wall clock exceeds 15 minutes.** The end-to-end CI time from first job start to final completion exceeds 15 minutes.
-- **Upward trend detected.** Split the 10 runs into two groups: the 5 most recent vs. the 5 before that. If the mean duration for any job increased by more than 20% between groups, flag it as a trend regression.
+- **Upward trend detected.** Split the ran-samples into halves (oldest vs. newest) and compute mean duration. Flag if **both** criteria are met:
+  - mean increased by at least **20%** between halves, AND
+  - the absolute increase is at least **15 seconds** (prevents false positives on trivially short jobs going 3s → 4s).
+
+#### Pitfalls — do not make the following mistakes
+
+- **Do NOT treat skipped jobs as duration = 0.** GitHub path filters (`dorny/paths-filter`) skip conditional jobs such as `ingestion-tests`, `scraper-framework-tests`, and `scraper-registry-check` when the PR did not modify matching paths. If skipped runs are averaged in as zeros, the sample mean for a window that happens to contain many skipped runs will be artificially low — producing massive false-positive "trend regressions" the next time a window contains mostly ran samples. This was the root cause of issue #2401, where the audit reported +145% regressions for jobs whose actual duration had been flat for weeks. **Exclude skipped runs entirely from per-job trend computation.**
+- **Do NOT report trend regressions with fewer than 3 ran-samples in each half.** Tiny samples produce noisy means; the `audit_ci_health.py` script enforces a minimum of 3 samples per half before emitting a trend finding.
+- **Do NOT rely on percentage alone for small-duration jobs.** A 3-second check going to 4 seconds is +33% but not an actionable regression. The script requires BOTH a ≥20% delta AND a ≥15-second absolute delta.
 
 #### Filing issues
 
 For each threshold violation or trend regression, file a `priority/p1` `type/dx` issue with:
 
-- Which job(s) are slow and their current duration (mean and max over the sampled runs).
-- Historical comparison — what the duration was in the older group vs. the recent group.
-- The specific run IDs and timestamps so the issue is traceable.
+- Which job(s) are slow and their current duration (mean and max over the sampled runs, **counting only runs where the job executed**).
+- Historical comparison — what the duration was in the older half vs. the recent half, with sample sizes.
+- The specific run IDs and timestamps so the issue is traceable. Paste the output of `scripts/audit_ci_health.py --json` into the issue body.
 - Suggested investigation steps: check for new heavy test files, fixture bloat, missing parallelism, runner size, or unnecessary sequential steps.
 
 **Deduplication:** Before filing, check for existing open issues related to CI performance (e.g., #1243 tracks CI runner size / test splitting). If an existing issue covers the same job or concern, note it as "skipped — duplicate of #N" rather than filing a new one. Only file a new issue if the finding is distinct from existing tracked work.
