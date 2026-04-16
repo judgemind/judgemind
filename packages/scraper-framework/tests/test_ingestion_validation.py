@@ -543,3 +543,45 @@ def test_validation_fail_db_write_error_still_returns(
     # Rollback must be called after the insert failure so that any aborted
     # transaction state is cleared on the shared DB connection (#2385).
     mock_conn.rollback.assert_called()
+
+
+@patch("ingestion.worker.insert_validation_result")
+@patch("ingestion.worker.IngestionWorker._file_validation_issue")
+@patch("ingestion.worker.validate_document")
+@patch(_EXTRACT_LLM_MOCK, return_value=None)
+@patch(_SPLIT_MOCK, return_value=False)
+@patch("ingestion.worker.psycopg")
+def test_validation_fail_rollback_error_still_returns(
+    mock_psycopg: MagicMock,
+    mock_split: MagicMock,
+    mock_extract_llm: MagicMock,
+    mock_validate: MagicMock,
+    mock_file_issue: MagicMock,
+    mock_insert_validation: MagicMock,
+) -> None:
+    """If rollback() itself raises after the validation insert fails, still returns (#2385)."""
+    mock_validate.return_value = ValidationResult(
+        result="fail",
+        reason="Wrong content",
+        model="test-model",
+        input_tokens=100,
+        output_tokens=30,
+        latency_ms=75,
+    )
+    # Make both the insert AND the defensive rollback raise
+    mock_insert_validation.side_effect = RuntimeError("DB connection lost")
+
+    worker, os_mock = _make_worker(validation_enabled=True)
+
+    mock_conn, mock_cur = _make_mock_conn()
+    mock_conn.rollback.side_effect = RuntimeError("connection already closed")
+    mock_psycopg.connect.return_value = mock_conn
+
+    event = _make_event()
+    # Should not raise even if both the insert AND the defensive rollback fail.
+    worker.process_event(event)
+
+    # OpenSearch indexing should NOT have happened (fail path)
+    os_mock.index.assert_not_called()
+    # rollback was attempted (and failed — but the defensive except swallowed it)
+    mock_conn.rollback.assert_called()
