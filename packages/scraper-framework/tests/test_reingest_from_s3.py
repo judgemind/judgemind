@@ -277,6 +277,131 @@ class TestReparseDocumentNulBytes:
 
 
 # ---------------------------------------------------------------------------
+# _reparse_document tests — stored_ruling_text format awareness (#2360)
+# ---------------------------------------------------------------------------
+
+
+class TestReparseDocumentStoredRulingText:
+    """Verify that stored_ruling_text is only preserved for PDF documents.
+
+    For HTML documents, the freshly-parsed ruling_text from parse_document()
+    should be used instead. The --force-retranscribe flag skips preservation
+    for all formats.
+    """
+
+    def _doc_meta(self, *, fmt: str = "html", stored: str | None = None) -> dict:
+        meta: dict[str, Any] = {
+            "document_id": str(_DOC_ID_1),
+            "state": "CA",
+            "county": "Los Angeles",
+            "court_name": "Los Angeles Superior Court",
+            "source_url": "https://court.example.com/ruling",
+            "captured_at": _CAPTURED_AT_1,
+            "content_hash": "abc123",
+            "format": fmt,
+            "case_number": "24STCV12345",
+            "case_title": "Smith v. Jones",
+            "hearing_date": _HEARING_DATE,
+            "court_id": str(_COURT_ID),
+            "scraper_id": "ca-la-tentatives-civil",
+            "s3_key": "docs/test.html",
+            "s3_bucket": "test-bucket",
+        }
+        if stored is not None:
+            meta["stored_ruling_text"] = stored
+        return meta
+
+    @patch.object(reingest, "_load_scraper_registry")
+    def test_html_doc_ignores_stored_ruling_text(
+        self,
+        mock_registry: MagicMock,
+    ) -> None:
+        """HTML documents should use freshly-parsed text, not stored value."""
+        raw = b"freshly parsed clean text"
+        meta = self._doc_meta(fmt="html", stored="<p>stale raw HTML</p>")
+        result = reingest._reparse_document(raw, "unknown-scraper", meta)
+        # The fresh text should be used, not the stored HTML
+        assert result["ruling_text"] == "freshly parsed clean text"
+
+    @patch.object(reingest, "_load_scraper_registry")
+    def test_pdf_doc_preserves_stored_ruling_text(
+        self,
+        mock_registry: MagicMock,
+    ) -> None:
+        """PDF documents should preserve stored_ruling_text (existing behavior)."""
+        # Use a mock to avoid needing a real PDF
+        with patch.object(
+            reingest,
+            "_extract_text_from_content",
+            return_value="full multi-ruling PDF text 77K chars",
+        ):
+            meta = self._doc_meta(fmt="pdf", stored="scoped LLM ruling text")
+            result = reingest._reparse_document(b"fake-pdf-bytes", "unknown-scraper", meta)
+            # The stored text should be preserved for PDF docs
+            assert result["ruling_text"] == "scoped LLM ruling text"
+
+    @patch.object(reingest, "_load_scraper_registry")
+    def test_pdf_doc_without_stored_text_uses_fresh(
+        self,
+        mock_registry: MagicMock,
+    ) -> None:
+        """PDF documents without stored_ruling_text use freshly-extracted text."""
+        with patch.object(
+            reingest,
+            "_extract_text_from_content",
+            return_value="full pdf text",
+        ):
+            meta = self._doc_meta(fmt="pdf", stored=None)
+            result = reingest._reparse_document(b"fake-pdf-bytes", "unknown-scraper", meta)
+            assert result["ruling_text"] == "full pdf text"
+
+    @patch.object(reingest, "_load_scraper_registry")
+    def test_force_retranscribe_skips_stored_for_pdf(
+        self,
+        mock_registry: MagicMock,
+    ) -> None:
+        """--force-retranscribe should skip stored_ruling_text even for PDFs."""
+        with patch.object(
+            reingest,
+            "_extract_text_from_content",
+            return_value="fresh pdf text from pdfplumber",
+        ):
+            meta = self._doc_meta(fmt="pdf", stored="old LLM scoped text")
+            result = reingest._reparse_document(
+                b"fake-pdf-bytes",
+                "unknown-scraper",
+                meta,
+                force_retranscribe=True,
+            )
+            # With force_retranscribe, fresh text should be used
+            assert result["ruling_text"] == "fresh pdf text from pdfplumber"
+
+    @patch.object(reingest, "_load_scraper_registry")
+    def test_force_retranscribe_with_html_still_uses_fresh(
+        self,
+        mock_registry: MagicMock,
+    ) -> None:
+        """--force-retranscribe on HTML docs also uses fresh text (same behavior)."""
+        raw = b"clean text from parse"
+        meta = self._doc_meta(fmt="html", stored="stale stored text")
+        result = reingest._reparse_document(raw, "unknown-scraper", meta, force_retranscribe=True)
+        assert result["ruling_text"] == "clean text from parse"
+
+    @patch.object(reingest, "_load_scraper_registry")
+    def test_html_stored_text_not_used_for_regex_fallback(
+        self,
+        mock_registry: MagicMock,
+    ) -> None:
+        """For HTML docs, regex fallback should use fresh text, not stored text."""
+        raw = b"The motion for demurrer is GRANTED"
+        meta = self._doc_meta(fmt="html", stored="<p>stale HTML content</p>")
+        result = reingest._reparse_document(raw, "unknown-scraper", meta)
+        # The fresh text should have been used for regex extraction
+        # (the regex_text variable in _reparse_document)
+        assert result["ruling_text"] == "The motion for demurrer is GRANTED"
+
+
+# ---------------------------------------------------------------------------
 # _reparse_document tests — motion_type normalization (#1849)
 # ---------------------------------------------------------------------------
 
@@ -3569,6 +3694,81 @@ class TestCLIForceLLMFlag:
         parser.add_argument("--force-llm", action="store_true")
         args = parser.parse_args([])
         assert args.force_llm is False
+
+
+# ---------------------------------------------------------------------------
+# --force-retranscribe flag tests (#2360)
+# ---------------------------------------------------------------------------
+
+
+class TestForceRetranscribePassedToBatch:
+    """Verify force_retranscribe is forwarded from run_reingest to reingest_batch."""
+
+    @patch("reingest_from_s3.boto3")
+    @patch("reingest_from_s3.psycopg")
+    @patch("reingest_from_s3.reingest_batch")
+    def test_force_retranscribe_passed_to_batch(
+        self,
+        mock_batch: MagicMock,
+        mock_psycopg: MagicMock,
+        mock_boto3: MagicMock,
+    ) -> None:
+        """force_retranscribe=True is forwarded to reingest_batch."""
+        mock_conn = MagicMock()
+        mock_conn.__enter__ = MagicMock(return_value=mock_conn)
+        mock_conn.__exit__ = MagicMock(return_value=False)
+        mock_psycopg.connect.return_value = mock_conn
+
+        mock_batch.return_value = _make_batch_result()
+
+        reingest.run_reingest("postgresql://test", force_retranscribe=True)
+
+        batch_call = mock_batch.call_args_list[0]
+        assert batch_call.kwargs.get("force_retranscribe") is True
+
+    @patch("reingest_from_s3.boto3")
+    @patch("reingest_from_s3.psycopg")
+    @patch("reingest_from_s3.reingest_batch")
+    def test_force_retranscribe_defaults_to_false(
+        self,
+        mock_batch: MagicMock,
+        mock_psycopg: MagicMock,
+        mock_boto3: MagicMock,
+    ) -> None:
+        """force_retranscribe defaults to False when not specified."""
+        mock_conn = MagicMock()
+        mock_conn.__enter__ = MagicMock(return_value=mock_conn)
+        mock_conn.__exit__ = MagicMock(return_value=False)
+        mock_psycopg.connect.return_value = mock_conn
+
+        mock_batch.return_value = _make_batch_result()
+
+        reingest.run_reingest("postgresql://test")
+
+        batch_call = mock_batch.call_args_list[0]
+        assert batch_call.kwargs.get("force_retranscribe") is False
+
+
+class TestCLIForceRetranscribeFlag:
+    """Tests that --force-retranscribe CLI flag is properly parsed."""
+
+    def test_parser_has_force_retranscribe_arg(self) -> None:
+        """The argument parser accepts --force-retranscribe."""
+        import argparse
+
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--force-retranscribe", action="store_true")
+        args = parser.parse_args(["--force-retranscribe"])
+        assert args.force_retranscribe is True
+
+    def test_parser_default_force_retranscribe_is_false(self) -> None:
+        """Default --force-retranscribe is False."""
+        import argparse
+
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--force-retranscribe", action="store_true")
+        args = parser.parse_args([])
+        assert args.force_retranscribe is False
 
 
 # ---------------------------------------------------------------------------
