@@ -1,6 +1,7 @@
 """Judgemind scraper framework — public API."""
 
 from .base import BaseScraper
+from .browser import apply_stealth
 from .court_directory import CourtDirectory
 from .css_inliner import inline_css
 from .encoding import decode_response, detect_encoding
@@ -60,6 +61,7 @@ from .storage import S3Archiver, build_s3_key
 
 __all__ = [
     "BaseScraper",
+    "apply_stealth",
     "ConfidenceLevel",
     "CountyExtractionConfig",
     "ExtractionMethod",

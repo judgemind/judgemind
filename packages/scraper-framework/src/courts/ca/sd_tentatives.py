@@ -40,6 +40,7 @@ import structlog
 from bs4 import BeautifulSoup
 
 from framework import BaseScraper, CapturedDocument, ContentFormat, ScraperConfig
+from framework.browser import apply_stealth as _apply_stealth
 from framework.events import EventBus
 from framework.storage import S3Archiver
 
@@ -293,27 +294,6 @@ async def has_cf_clearance(context: Any) -> bool:
     """
     cookies = await context.cookies()
     return any(c.get("name") == "cf_clearance" for c in cookies)
-
-
-async def _apply_stealth(page: Any) -> None:
-    """Apply playwright-stealth evasions to a page to avoid bot detection.
-
-    Uses the ``playwright-stealth`` library to mask browser automation
-    fingerprints (WebGL, navigator properties, plugins, etc.) that
-    Cloudflare uses for bot detection.
-
-    Falls back gracefully if playwright-stealth is not installed, applying
-    only the minimal webdriver override.
-    """
-    try:
-        from playwright_stealth import Stealth
-
-        stealth = Stealth()
-        await stealth.apply_stealth_async(page)
-    except ImportError:
-        logger.warning("playwright-stealth not installed, using minimal stealth only")
-        # Minimal fallback: remove webdriver flag
-        await page.evaluate("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
 
 
 def parse_case_header(soup: BeautifulSoup) -> tuple[str | None, str | None]:
