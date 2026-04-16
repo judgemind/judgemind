@@ -1444,7 +1444,9 @@ _CASE_CITATION_RE = re.compile(
 )
 
 # Case number pattern embedded in a title — Riverside (CVPS..., CVME...),
-# OC (30-2024-...), SB (CIVSB...), LA (24STCV...), generic (MSC21-...).
+# OC (30-2024-...), SB (CIVSB...), LA (24STCV...), generic (MSC21-...),
+# Ventura new (2025CUBC040123 / 2025CUPR042345), Ventura old-format probate
+# (202200570654PRLP, 201500471558PRCE — year+6digits+PR+2letters, 16 chars).
 _EMBEDDED_CASE_NUMBER_RE = re.compile(
     r"\b(?:"
     r"CV[A-Z]{2,4}\d{5,}"
@@ -1453,6 +1455,11 @@ _EMBEDDED_CASE_NUMBER_RE = re.compile(
     r"|\d{2}[A-Z]{2}CV\d{5,}"
     r"|[A-Z]{3}\d{2}-\d{4,}"
     r"|\d{2}[A-Z]{4}\d{4,}"
+    # Ventura new format: 4-digit year + 4-letter type + 6-digit sequence
+    r"|\d{4}[A-Z]{4}\d{6}"
+    # Ventura old-format probate: 4-digit year + 6-digit sequence + PR + 2 letters
+    # Also match partial/truncated variants (PRL) that appear in some docs.
+    r"|\d{10,12}PR[A-Z]{1,3}"
     r")\b",
 )
 
@@ -1501,6 +1508,17 @@ def clean_case_title(raw_title: str) -> str | None:
 
     # Collapse whitespace and newlines.
     cleaned = " ".join(raw_title.split())
+
+    # Dedupe repeated title segments (#2370) — Ventura LLM sometimes
+    # returns the same title 2-3x concatenated.
+    deduped = dedupe_repeated_title(cleaned)
+    if deduped:
+        cleaned = deduped
+
+    # Strip trailing case numbers appended to the title (#2370).
+    without_cn = strip_trailing_case_number(cleaned)
+    if without_cn:
+        cleaned = without_cn
 
     # --- Probate / estate / conservatorship / guardianship titles ---
     probate_m = re.match(
@@ -1847,3 +1865,280 @@ def extract_judge_name(ruling_text: str) -> str | None:
             if name and _looks_like_person_name(name):
                 return name
     return None
+
+
+# ---------------------------------------------------------------------------
+# Ventura-specific extraction fixes (#2370)
+# ---------------------------------------------------------------------------
+
+# Trailing case number pattern — matches case numbers that appear at the
+# end of a title string.  Used to strip case numbers that the LLM or
+# scraper accidentally appends to the title.  Covers Ventura formats
+# (new and old probate) plus common short fragments.
+_TRAILING_CASE_NUMBER_RE = re.compile(
+    r"\s+(?:"
+    # Ventura new format: 4-digit year + 4-letter type + 6-digit sequence
+    r"\d{4}[A-Z]{4}\d{6}"
+    # Ventura old-format probate (plus truncated PRL variants).
+    r"|\d{10,12}PR[A-Z]{1,3}"
+    # Generic CV... / CIV... / dash-separated formats
+    r"|CV[A-Z]{2,4}\d{5,}"
+    r"|CIV[A-Z]{2}\d{5,}"
+    r"|\d{2,4}-\d{5,}"
+    r"|\d{2}[A-Z]{2}CV\d{5,}"
+    r")\s*$",
+)
+
+
+def strip_trailing_case_number(title: str | None) -> str | None:
+    """Strip a trailing case number from a case title (#2370).
+
+    Observed bug: Ventura probate titles often end with the case number,
+    e.g. ``"In the Matter of Denise Guadalupe Mejia 202200570654PRLP"``.
+    This helper removes the trailing case number so the title contains
+    only the party/decedent name.
+
+    Parameters
+    ----------
+    title : str | None
+        The raw title that may have a trailing case number.
+
+    Returns
+    -------
+    str | None
+        The title with the trailing case number stripped, or the original
+        input if no trailing case number was detected.  Returns ``None``
+        if the input is ``None``.  Returns an empty string unchanged.
+    """
+    if title is None:
+        return None
+    if not title:
+        return title
+    stripped = _TRAILING_CASE_NUMBER_RE.sub("", title).rstrip(" .,;:")
+    return stripped if stripped else title
+
+
+def dedupe_repeated_title(title: str | None) -> str | None:
+    """Collapse exact repeated substrings in a case title (#2370).
+
+    Observed bug: Ventura LLM returns titles like
+    ``"CITY OF THOUSAND OAKS vs GLENN R PACKARD, et al. CITY OF THOUSAND
+    OAKS vs GLENN R PACKARD, et al."`` where the full title is repeated
+    2-3 times.
+
+    The algorithm:
+      - Tries increasing prefix lengths (>= 15 chars) and checks whether
+        the rest of the string consists of one or more repetitions of
+        the prefix (ignoring whitespace differences).
+      - Returns the shortest prefix for which the rest matches.
+      - If no repetition detected, returns the input (stripped of
+        leading/trailing whitespace) unchanged.
+
+    Short titles (< 15 chars of meaningful content) are returned unchanged
+    to avoid false positives on legitimate short repeated tokens.
+
+    Parameters
+    ----------
+    title : str | None
+        The candidate title to deduplicate.
+
+    Returns
+    -------
+    str | None
+        The deduplicated title.  ``None`` input returns ``None``.  Empty
+        strings return empty.
+    """
+    if title is None:
+        return None
+    if not title:
+        return title
+
+    # Collapse whitespace and strip
+    normalized = " ".join(title.split())
+    if not normalized:
+        return title
+
+    # Too short for dedup to be meaningful
+    min_prefix_len = 10
+    if len(normalized) < 2 * min_prefix_len:
+        return normalized
+
+    total_len = len(normalized)
+
+    # Try each candidate prefix length (shortest to longest).
+    # The prefix must end either at the end of the string, or immediately
+    # before a space (word boundary).
+    for prefix_len in range(min_prefix_len, total_len // 2 + 1):
+        # Word boundary check: the char AT position prefix_len must be a
+        # space (or we're at EOS).  This ensures we don't cut mid-word.
+        if prefix_len < total_len and normalized[prefix_len] != " ":
+            continue
+
+        prefix = normalized[:prefix_len].strip()
+        if len(prefix) < min_prefix_len:
+            continue
+
+        # Check whether the rest of the string is one or more repeats
+        # of this prefix (whitespace-tolerant).
+        rest = normalized[prefix_len:].lstrip()
+        if not rest:
+            continue
+
+        # Walk through the rest matching repeated copies of prefix.
+        # Each repetition is prefix followed by optional whitespace.
+        cursor = 0
+        rest_len = len(rest)
+        all_match = True
+        while cursor < rest_len:
+            # The next candidate copy occupies exactly len(prefix) chars
+            # (since we already stripped whitespace).
+            candidate = rest[cursor : cursor + len(prefix)]
+            if candidate != prefix:
+                all_match = False
+                break
+            cursor += len(prefix)
+            # Skip any whitespace between copies
+            while cursor < rest_len and rest[cursor] == " ":
+                cursor += 1
+        if all_match and cursor >= rest_len:
+            return prefix
+
+    return normalized
+
+
+# Regex that matches probate caption prefixes used to detect cases where
+# the decedent/conservatee name is prominent in the title.
+_PROBATE_PARTY_TITLE_RE = re.compile(
+    r"(?:"
+    r"In\s+(?:the\s+)?(?:Matter|Re)\s+of"
+    r"|Estate\s+of"
+    r"|Conservatorship\s+of"
+    r"|Guardianship\s+of"
+    r"|Petition\s+(?:for\s+)?(?:Probate|Letters)"
+    # Also match "XYZ Trust" pattern (party name followed by "Trust")
+    r"|\bTrust\b"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def is_probate_decedent_name(
+    candidate: str | None,
+    case_title: str | None,
+) -> bool:
+    """Return True if *candidate* looks like the decedent/conservatee name
+    from the probate case title, not a real judge name (#2370).
+
+    Ventura probate cases (Dept J6) have captions like "Estate of Delbert
+    L. Webb" where the decedent's name is very prominent.  The LLM can
+    mistake this for the judge's name.
+
+    This guard checks whether:
+    1. The case title looks probate-shaped (contains "Estate of",
+       "In the Matter of", "Conservatorship of", "Trust", etc.), AND
+    2. The candidate name appears within the case title (case-insensitive
+       substring match on normalized tokens).
+
+    When both conditions hold, the candidate is almost certainly the
+    decedent/conservatee/trustor name — not the judge.
+
+    Parameters
+    ----------
+    candidate : str | None
+        The candidate judge name (e.g. from LLM extraction).
+    case_title : str | None
+        The case title for this ruling.
+
+    Returns
+    -------
+    bool
+        True if the candidate is likely a probate party name (and should
+        therefore be rejected as a judge name).  False if the candidate
+        looks like a real judge name or the title is not probate-shaped.
+    """
+    if not candidate or not case_title:
+        return False
+
+    if not _PROBATE_PARTY_TITLE_RE.search(case_title):
+        return False
+
+    # Normalize both for comparison: lowercase, strip periods, collapse
+    # whitespace.
+    def _normalize(s: str) -> str:
+        return re.sub(r"[.,]", "", s).lower().strip()
+
+    norm_candidate = _normalize(candidate)
+    norm_title = _normalize(case_title)
+
+    if not norm_candidate or len(norm_candidate) < 3:
+        return False
+
+    # Direct substring match
+    if norm_candidate in norm_title:
+        return True
+
+    # Token-level match — all candidate tokens must appear in the title
+    # in order, allowing other tokens between them.
+    candidate_tokens = [t for t in norm_candidate.split() if t]
+    if len(candidate_tokens) < 2:
+        return False
+
+    title_tokens = norm_title.split()
+    idx = 0
+    for ct in candidate_tokens:
+        # Find ct in title_tokens starting at idx
+        found = -1
+        for j in range(idx, len(title_tokens)):
+            if title_tokens[j] == ct:
+                found = j
+                break
+        if found < 0:
+            return False
+        idx = found + 1
+    return True
+
+
+def is_plausible_hearing_date(
+    hearing_date: date | None,
+    capture_timestamp: datetime | None,
+    *,
+    past_days: int = 14,
+    future_days: int = 14,
+) -> bool:
+    """Return True if *hearing_date* is plausible given *capture_timestamp*
+    (#2370).
+
+    Tentative rulings are captured on or near the hearing day.  A value
+    more than ``past_days`` before capture or ``future_days`` after capture
+    is almost certainly a continuance or referenced minute-order date,
+    not the actual hearing date.
+
+    Parameters
+    ----------
+    hearing_date : date | None
+        The candidate hearing date.
+    capture_timestamp : datetime | None
+        The document capture timestamp (when the scraper archived the
+        ruling).  When ``None``, plausibility cannot be checked and the
+        function returns ``True`` (permissive — don't drop data we can't
+        verify).
+    past_days : int
+        Maximum number of days *before* capture allowed.  Default 14.
+    future_days : int
+        Maximum number of days *after* capture allowed.  Default 14.
+        Tentative rulings are sometimes posted up to a week before the
+        hearing; allow a bit of slack.
+
+    Returns
+    -------
+    bool
+        True if plausible, False otherwise.
+    """
+    if hearing_date is None:
+        return False
+    if capture_timestamp is None:
+        # Can't verify — default to plausible.
+        return True
+    capture_date = capture_timestamp.date()
+    delta = (hearing_date - capture_date).days
+    return -past_days <= delta <= future_days

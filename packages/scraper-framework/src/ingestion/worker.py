@@ -64,6 +64,7 @@ from .db import (
 from .department_normalize import normalize_department
 from .extract import (
     clean_case_title,
+    dedupe_repeated_title,
     extract_case_number,
     extract_case_type_from_motion_type,
     extract_case_type_from_number,
@@ -72,9 +73,12 @@ from .extract import (
     extract_hearing_date,
     extract_judge_name,
     is_plausible_case_title,
+    is_plausible_hearing_date,
+    is_probate_decedent_name,
     is_valid_case_number,
     normalize_motion_type,
     normalize_outcome,
+    strip_trailing_case_number,
 )
 from .llm_extract import (
     LLMExtractionResult,
@@ -1019,10 +1023,25 @@ class IngestionWorker:
                 # Find the matching ruling by case_number if available
                 ruling = _match_ruling(llm_result, case_number)
 
-                # Apply document-level fields from LLM
+                # Apply document-level fields from LLM.  Guard against
+                # implausible hearing dates (#2370): the LLM sometimes
+                # picks up continuance dates from ruling body text.  A
+                # hearing date far outside the capture window is almost
+                # certainly wrong — skip it and let regex/capture-date
+                # fallbacks run.
                 if hearing_dt is None and llm_result.hearing_date is not None:
-                    hearing_dt = llm_result.hearing_date
-                    extraction_methods["hearing_date"] = "llm"
+                    if is_plausible_hearing_date(llm_result.hearing_date, capture_ts):
+                        hearing_dt = llm_result.hearing_date
+                        extraction_methods["hearing_date"] = "llm"
+                    else:
+                        logger.info(
+                            "Rejected LLM hearing_date as implausible",
+                            extra={
+                                "document_id": document_id,
+                                "llm_hearing_date": str(llm_result.hearing_date),
+                                "capture_timestamp": str(capture_ts) if capture_ts else None,
+                            },
+                        )
                 if not judge_name and llm_result.judge_name:
                     judge_name = llm_result.judge_name
                     extraction_methods["judge_name"] = "llm"
@@ -1165,8 +1184,35 @@ class IngestionWorker:
                 case_number = extracted
 
         # ------------------------------------------------------------------
-        # Deterministic case_title cleanup (#2212)
+        # Deterministic case_title cleanup (#2212, #2370)
         # ------------------------------------------------------------------
+        # First: strip repeated segments and trailing case numbers that the
+        # LLM sometimes appends (#2370).  These are cheap checks that
+        # always run; they leave well-formed titles unchanged.
+        if case_title:
+            deduped = dedupe_repeated_title(case_title)
+            if deduped and deduped != case_title:
+                logger.info(
+                    "Removed repeated title segments",
+                    extra={
+                        "document_id": document_id,
+                        "old_title": case_title[:120],
+                        "new_title": deduped[:120],
+                    },
+                )
+                case_title = deduped
+            without_cn = strip_trailing_case_number(case_title)
+            if without_cn and without_cn != case_title:
+                logger.info(
+                    "Stripped trailing case number from title",
+                    extra={
+                        "document_id": document_id,
+                        "old_title": case_title[:120],
+                        "new_title": without_cn[:120],
+                    },
+                )
+                case_title = without_cn
+
         # For LLM-extracted events, the LLM-provided case_title can be
         # messy (motion descriptions, case citations, multiple parties).
         # Apply deterministic cleanup via clean_case_title().
@@ -1184,6 +1230,23 @@ class IngestionWorker:
                     )
                 case_title = cleaned_title
                 extraction_methods["case_title"] = "deterministic_cleaned"
+
+        # Probate decedent-as-judge guard (#2370): for probate cases the
+        # decedent/conservatee name is prominently printed in the caption
+        # and the LLM can mistake it for the judge.  If the extracted
+        # judge_name matches the probate party name, discard it so the
+        # dept-to-judge mapping fallback can take over.
+        if judge_name and case_title and is_probate_decedent_name(judge_name, case_title):
+            logger.info(
+                "Rejected LLM judge_name as probate decedent",
+                extra={
+                    "document_id": document_id,
+                    "rejected_judge": judge_name,
+                    "case_title": case_title[:80],
+                },
+            )
+            judge_name = None
+            extraction_methods.pop("judge_name", None)
 
         # Fallback judge_name extraction from ruling text (#401).
         if not is_llm_extracted and not judge_name and ruling_text:

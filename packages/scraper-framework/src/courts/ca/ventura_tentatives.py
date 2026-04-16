@@ -564,6 +564,21 @@ class VenturaTentativeRulingsScraper(BaseScraper):
                     if not doc.case_title:
                         doc.case_title = _extract_case_title(text)
 
+                    # Post-process case_title: dedupe repeated segments and
+                    # strip trailing case numbers (#2370).
+                    if doc.case_title:
+                        from ingestion.extract import (
+                            dedupe_repeated_title,
+                            strip_trailing_case_number,
+                        )
+
+                        deduped = dedupe_repeated_title(doc.case_title)
+                        if deduped:
+                            doc.case_title = deduped
+                        without_cn = strip_trailing_case_number(doc.case_title)
+                        if without_cn:
+                            doc.case_title = without_cn
+
                     if not llm_used:
                         # Log that regex path was used for debugging.
                         self._log.debug(
@@ -576,6 +591,23 @@ class VenturaTentativeRulingsScraper(BaseScraper):
                     case_number=doc.case_number,
                     error=str(exc),
                 )
+
+        # Probate decedent-as-judge guard (#2370): for probate cases the
+        # decedent/conservatee name is prominently printed in the caption
+        # and the LLM can mistakenly return it as the judge.  If the
+        # extracted judge_name matches the probate party name in the title,
+        # discard it so the dept-to-judge mapping fallback can take over.
+        if doc.judge_name and doc.case_title:
+            from ingestion.extract import is_probate_decedent_name
+
+            if is_probate_decedent_name(doc.judge_name, doc.case_title):
+                self._log.debug(
+                    "ventura.probate_decedent_as_judge_rejected",
+                    case_number=doc.case_number,
+                    rejected_judge=doc.judge_name,
+                    case_title=doc.case_title,
+                )
+                doc.judge_name = None
 
         # Use department-to-judge mapping as fallback for judge_name.
         # When a court directory is available and the doc has a hearing
