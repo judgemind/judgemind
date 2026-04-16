@@ -331,6 +331,10 @@ def test_det_validation_fail_db_error_does_not_crash(
     # OpenSearch indexing should NOT have happened (fail path)
     os_mock.index.assert_not_called()
 
+    # Rollback must be called after the insert failure so that any aborted
+    # transaction state is cleared on the shared DB connection (#2385).
+    mock_conn.rollback.assert_called()
+
 
 # ---------------------------------------------------------------------------
 # Tests: deterministic validation — flag DB logging error does not crash
@@ -367,6 +371,85 @@ def test_det_validation_flag_db_error_does_not_crash(
     event = _make_event(ruling_text="")  # triggers flag for empty text
     # Should not raise despite DB error during flag logging
     worker.process_event(event)
+
+    # Rollback must be called after the insert failure so that any aborted
+    # transaction state is cleared before the main DB write proceeds (#2385).
+    mock_conn.rollback.assert_called()
+
+
+# ---------------------------------------------------------------------------
+# Tests: deterministic validation — rollback() itself raising does not crash
+# ---------------------------------------------------------------------------
+
+
+@patch("ingestion.worker.insert_validation_result")
+@patch(_EXTRACT_LLM_MOCK, return_value=None)
+@patch(_SPLIT_MOCK, return_value=False)
+@patch("ingestion.worker.psycopg")
+def test_det_validation_fail_rollback_error_does_not_crash(
+    mock_psycopg: MagicMock,
+    mock_split: MagicMock,
+    mock_extract_llm: MagicMock,
+    mock_insert_validation: MagicMock,
+) -> None:
+    """If rollback() itself raises after an insert failure on fail, still returns (#2385)."""
+    mock_insert_validation.side_effect = RuntimeError("DB connection lost")
+
+    worker, os_mock = _make_worker()
+
+    mock_conn, mock_cur = _make_mock_conn()
+    mock_conn.rollback.side_effect = RuntimeError("connection already closed")
+    mock_psycopg.connect.return_value = mock_conn
+
+    event = _make_event(
+        ruling_text="<html><body>raw html</body></html>",
+    )
+    # Should not raise even if both the insert AND the defensive rollback fail.
+    worker.process_event(event)
+
+    # OpenSearch indexing should NOT have happened (fail path)
+    os_mock.index.assert_not_called()
+    # rollback was attempted (and failed — but the defensive except swallowed it)
+    mock_conn.rollback.assert_called()
+
+
+@patch("ingestion.worker.insert_validation_result")
+@patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
+@patch(_EXTRACT_LLM_MOCK, return_value=None)
+@patch(_SPLIT_MOCK, return_value=False)
+@patch("ingestion.worker.psycopg")
+def test_det_validation_flag_rollback_error_does_not_crash(
+    mock_psycopg: MagicMock,
+    mock_split: MagicMock,
+    mock_extract_llm: MagicMock,
+    mock_resolve_judge: MagicMock,
+    mock_insert_validation: MagicMock,
+) -> None:
+    """If rollback() itself raises after an insert failure on flag, still continues (#2385)."""
+    mock_insert_validation.side_effect = RuntimeError("DB connection lost")
+
+    worker, os_mock = _make_worker()
+
+    mock_conn, mock_cur = _make_mock_conn()
+    # rollback() for the flag-logging handler will raise the first time, then
+    # succeed on subsequent calls (the main DB write's except: conn.rollback()
+    # re-raises if it also fails, which is undesirable for this test).
+    mock_conn.rollback.side_effect = [RuntimeError("connection already closed"), None]
+    mock_psycopg.connect.return_value = mock_conn
+    mock_cur.fetchone.side_effect = [
+        ("court-uuid-1",),  # upsert_court (flag logging attempt — fails)
+        ("court-uuid-1",),  # upsert_court (main flow)
+        ("case-uuid-1",),  # upsert_case
+        (True,),  # insert_document: is_new = True
+    ]
+    mock_cur.rowcount = 1
+
+    event = _make_event(ruling_text="")  # triggers flag for empty text
+    # Should not raise even if both the insert AND the defensive rollback fail.
+    worker.process_event(event)
+
+    # rollback was attempted (and failed — but the defensive except swallowed it)
+    mock_conn.rollback.assert_called()
 
 
 # ---------------------------------------------------------------------------
