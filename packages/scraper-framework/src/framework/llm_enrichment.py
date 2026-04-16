@@ -24,6 +24,7 @@ See: https://github.com/judgemind/judgemind/issues/2175
 from __future__ import annotations
 
 import json
+import re
 from enum import StrEnum
 
 import structlog
@@ -397,11 +398,20 @@ def enrich_ruling(
 def _parse_response(text: str) -> LlmEnrichmentResult | None:
     """Parse an LLM response string into an ``LlmEnrichmentResult``.
 
+    Handles markdown code fences (e.g. ````` ```json ... ``` `````) that
+    newer Claude models sometimes wrap around JSON output, even when
+    instructed to respond with JSON only.
+
     Returns ``None`` if the response is not valid JSON or does not match
     the expected schema.
     """
     try:
-        data = json.loads(text)
+        cleaned = text.strip()
+        # Strip markdown code fences if present (e.g. ```json ... ```)
+        if cleaned.startswith("```"):
+            cleaned = re.sub(r"^```\w*\n?", "", cleaned)
+            cleaned = re.sub(r"\n?```$", "", cleaned)
+        data = json.loads(cleaned)
     except json.JSONDecodeError:
         logger.debug("llm_enrichment.json_decode_error", text_preview=text[:200])
         return None
