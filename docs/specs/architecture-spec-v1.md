@@ -491,9 +491,9 @@ Two GitHub Actions workflows run hourly and provide application-level monitoring
 **Data quality check** (`.github/workflows/data-quality-check.yml`, every hour at :15):
 - Runs `scripts/data-quality-check.py` on dev via ECS
 - Checks ingest rate drops, scraper staleness, zero rulings, field completeness regressions, orphaned documents
-- Auto-creates GitHub issues labeled `data-quality-failure` on regressions
-- Auto-closes issues when checks pass
-- Sends Telegram notifications to ops channel on failures
+- Persists per-county metrics to the `data_quality_metrics` DB table for dashboard display
+- Sends Telegram notification only for P1 alerts (persistent, unresolvable conditions)
+- All alert details visible on `/admin/data-quality` dashboard (no GitHub issues filed)
 
 **Site quality check** (`.github/workflows/site-quality-check.yml`, every hour at :30):
 - Validates `dev.judgemind.org` pages load with expected content

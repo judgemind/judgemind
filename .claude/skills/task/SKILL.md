@@ -516,11 +516,7 @@ gh issue comment <N> --repo judgemind/judgemind --body-file {worktree}/tmp/close
 gh issue close <N> --repo judgemind/judgemind --reason completed
 ```
 
-**Special handling for `data-quality-failure` issues:** These are auto-created by the `data-quality-check.yml` workflow when health checks fail. The workflow also auto-closes them when all checks pass. However, during long rebuilds or ongoing remediation, checks may keep failing even after the root cause has been identified and follow-ups filed. The agent MUST close these issues after investigation — the workflow will create a new issue if problems genuinely persist after the follow-ups are resolved. Include in the close comment:
-
-> Investigation complete. Follow-up issues filed: #X, #Y, #Z. Closing this issue — the data quality check workflow will file a new issue if problems persist after remediation.
-
-**For all other investigation issues:** Close with a standard summary comment. Only leave an investigation issue open if it genuinely requires human judgment that cannot be captured in a follow-up issue.
+**Close with a standard summary comment.** Only leave an investigation issue open if it genuinely requires human judgment that cannot be captured in a follow-up issue.
 
 #### B.3 — Unblock dependent issues
 
