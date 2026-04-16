@@ -12,10 +12,10 @@ from datetime import date
 from validation.deterministic import (
     check_case_number_not_unknown,
     check_hearing_date_in_range,
-    check_no_concatenated_titles,
     check_no_cross_case_ruling_text,
     check_no_duplicate_ruling_text,
     check_no_html_in_ruling_text,
+    check_no_multiple_adversarial_patterns,
     check_ruling_text_not_empty,
     check_ruling_text_reasonable_length,
     run_deterministic_rules,
@@ -140,49 +140,100 @@ class TestHearingDateInRange:
 
 
 # ---------------------------------------------------------------------------
-# no_concatenated_titles
+# no_multiple_adversarial_patterns
 # ---------------------------------------------------------------------------
 
 
-class TestNoConcatenatedTitles:
-    """Tests for the no_concatenated_titles rule."""
+class TestNoMultipleAdversarialPatterns:
+    """Tests for the no_multiple_adversarial_patterns rule (#2398).
+
+    Previously named ``check_no_concatenated_titles``; renamed to reflect what
+    the rule detects (multiple adversarial ``v.``/``vs.`` patterns in a title)
+    rather than the underlying defect (concatenation).
+    """
 
     def test_pass_normal_title(self) -> None:
-        result = check_no_concatenated_titles("Smith v. Jones")
+        result = check_no_multiple_adversarial_patterns("Smith v. Jones")
         assert result.result == "pass"
+        assert result.rule == "no_multiple_adversarial_patterns"
 
     def test_pass_vs_dot(self) -> None:
-        result = check_no_concatenated_titles("Smith vs. Jones")
+        result = check_no_multiple_adversarial_patterns("Smith vs. Jones")
         assert result.result == "pass"
 
     def test_pass_none(self) -> None:
-        result = check_no_concatenated_titles(None)
+        result = check_no_multiple_adversarial_patterns(None)
         assert result.result == "pass"
 
     def test_pass_empty(self) -> None:
-        result = check_no_concatenated_titles("")
+        result = check_no_multiple_adversarial_patterns("")
         assert result.result == "pass"
 
     def test_flag_two_v_dots(self) -> None:
-        result = check_no_concatenated_titles("Smith v. Jones; Doe v. Roe")
+        result = check_no_multiple_adversarial_patterns("Smith v. Jones; Doe v. Roe")
         assert result.result == "flag"
         assert "2" in (result.reason or "")
 
     def test_flag_five_concatenated(self) -> None:
         """Fresno ruling 4647a509 — 5 concatenated titles."""
         title = "Alpha v. Beta; Gamma v. Delta; Epsilon v. Zeta; Eta v. Theta; Iota v. Kappa"
-        result = check_no_concatenated_titles(title)
+        result = check_no_multiple_adversarial_patterns(title)
         assert result.result == "flag"
         assert "5" in (result.reason or "")
 
     def test_pass_no_separator(self) -> None:
-        result = check_no_concatenated_titles("In re Marriage of Smith")
+        result = check_no_multiple_adversarial_patterns("In re Marriage of Smith")
         assert result.result == "pass"
 
     def test_flag_mixed_vs(self) -> None:
         """Mix of v. and vs. separators."""
-        result = check_no_concatenated_titles("Smith v. Jones; Doe vs. Roe")
+        result = check_no_multiple_adversarial_patterns("Smith v. Jones; Doe vs. Roe")
         assert result.result == "flag"
+
+    def test_flag_case_insensitive_vs_upper(self) -> None:
+        """Case-insensitive matching — uppercase ``VS.`` must still be detected."""
+        result = check_no_multiple_adversarial_patterns("SMITH VS. JONES; DOE V. ROE")
+        assert result.result == "flag"
+        assert "2" in (result.reason or "")
+
+    def test_flag_three_or_more(self) -> None:
+        """Three or more adversarial patterns should flag."""
+        result = check_no_multiple_adversarial_patterns("A v. B C v. D E vs. F")
+        assert result.result == "flag"
+        assert "3" in (result.reason or "")
+
+    def test_flag_taylor_amazon_example(self) -> None:
+        """Issue #2398 example — mixed ``VS.`` and ``v.`` in a single title.
+
+        Exact title from the issue body:
+        ``TAYLOR VS. AMAZON MSC21-02349 Amazon.com, Inc. v. Damien Sean Lamont Ross``
+
+        Contains ``VS.`` after TAYLOR and ``v.`` after ``Amazon.com, Inc.``,
+        yielding 2 matches → flag.
+        """
+        title = "TAYLOR VS. AMAZON MSC21-02349 Amazon.com, Inc. v. Damien Sean Lamont Ross"
+        result = check_no_multiple_adversarial_patterns(title)
+        assert result.result == "flag"
+        assert "2" in (result.reason or "")
+        assert "multi-case contamination" in (result.reason or "")
+
+    def test_flag_wang_netease_example(self) -> None:
+        """Issue #2398 example — three cases concatenated in a single title.
+
+        Exact title from the issue body:
+        ``Liangbei Wang v. NetEase, Inc., et al. Manuel Panilag v. Armando Contreras
+        et al. Jin Yin, et al vs Xiaoxiao Lu, et al.``
+
+        The first two ``v.`` separators match; the trailing ``vs`` (no dot) does
+        not match the pattern.  Two matches is still sufficient to flag.
+        """
+        title = (
+            "Liangbei Wang v. NetEase, Inc., et al. Manuel Panilag v. Armando Contreras "
+            "et al. Jin Yin, et al vs Xiaoxiao Lu, et al."
+        )
+        result = check_no_multiple_adversarial_patterns(title)
+        assert result.result == "flag"
+        assert "multi-case contamination" in (result.reason or "")
 
 
 # ---------------------------------------------------------------------------
@@ -640,7 +691,10 @@ class TestRunDeterministicRules:
             captured_at=date(2026, 3, 4),
         )
         assert result.overall == "flag"
-        assert any(r.rule == "no_concatenated_titles" and r.result == "flag" for r in result.rules)
+        assert any(
+            r.rule == "no_multiple_adversarial_patterns" and r.result == "flag"
+            for r in result.rules
+        )
 
     def test_reasons_property(self) -> None:
         """The reasons property should return only non-pass reasons."""
