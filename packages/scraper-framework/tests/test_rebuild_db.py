@@ -414,6 +414,25 @@ class TestSlugConversions:
 # ---------------------------------------------------------------------------
 
 
+class TestDeriveCourtCode:
+    """Tests for _derive_court_code() — must match ingestion.db._derive_court_code."""
+
+    def test_basic_county(self) -> None:
+        assert rebuild_db._derive_court_code("CA", "Orange") == "ca-orange"
+
+    def test_multi_word_county(self) -> None:
+        assert rebuild_db._derive_court_code("CA", "Los Angeles") == "ca-los-angeles"
+
+    def test_multi_word_county_three_words(self) -> None:
+        assert rebuild_db._derive_court_code("CA", "San Bernardino") == "ca-san-bernardino"
+
+    def test_lowercase_state(self) -> None:
+        assert rebuild_db._derive_court_code("ca", "Orange") == "ca-orange"
+
+    def test_federal(self) -> None:
+        assert rebuild_db._derive_court_code("Federal", "Federal") == "federal-federal"
+
+
 class TestDiscoverCourts:
     """Tests for discover_courts()."""
 
@@ -426,13 +445,36 @@ class TestDiscoverCourts:
         courts = rebuild_db.discover_courts(keys)
         assert len(courts) == 2
         codes = {c["court_code"] for c in courts}
-        assert "ca_orange_superior_court" in codes
-        assert "ca_los_angeles_superior_court" in codes
+        assert "ca-orange" in codes
+        assert "ca-los-angeles" in codes
+
+    def test_court_code_matches_ingestion_format(self) -> None:
+        """court_code must use {state}-{county} format to match ingestion.db."""
+        keys = ["ca/santa_clara/superior_court/raw/abc123.html"]
+        courts = rebuild_db.discover_courts(keys)
+        assert len(courts) == 1
+        assert courts[0]["court_code"] == "ca-santa-clara"
+
+    def test_court_name_includes_county(self) -> None:
+        """court_name should include 'County of' to match ingestion format."""
+        keys = ["ca/orange/superior_court/raw/abc123.html"]
+        courts = rebuild_db.discover_courts(keys)
+        assert courts[0]["court_name"] == "Superior Court, County of Orange"
 
     def test_skips_invalid_keys(self) -> None:
         keys = ["invalid/key", "also/not/valid"]
         courts = rebuild_db.discover_courts(keys)
         assert len(courts) == 0
+
+    def test_deduplicates_by_court_code(self) -> None:
+        """Multiple keys for the same state/county should produce one court."""
+        keys = [
+            "ca/orange/superior_court/raw/abc123.pdf",
+            "ca/orange/superior_court/raw/def456.html",
+        ]
+        courts = rebuild_db.discover_courts(keys)
+        assert len(courts) == 1
+        assert courts[0]["court_code"] == "ca-orange"
 
 
 # ---------------------------------------------------------------------------

@@ -7238,6 +7238,19 @@ class TestUnsluggify:
         assert reingest._unsluggify("a") == "A"
 
 
+class TestDeriveCourtCode:
+    """Tests for _derive_court_code — must match ingestion.db._derive_court_code."""
+
+    def test_basic(self) -> None:
+        assert reingest._derive_court_code("CA", "Orange") == "ca-orange"
+
+    def test_multi_word(self) -> None:
+        assert reingest._derive_court_code("CA", "Los Angeles") == "ca-los-angeles"
+
+    def test_federal(self) -> None:
+        assert reingest._derive_court_code("Federal", "Federal") == "federal-federal"
+
+
 class TestDiscoverCourts:
     """Tests for _discover_courts."""
 
@@ -7250,8 +7263,8 @@ class TestDiscoverCourts:
         courts = reingest._discover_courts(keys)
         assert len(courts) == 2
         codes = {c["court_code"] for c in courts}
-        assert "federal_federal_courtlistener" in codes
-        assert "ca_los_angeles_superior" in codes
+        assert "federal-federal" in codes
+        assert "ca-los-angeles" in codes
 
     def test_deduplicates_by_court_code(self) -> None:
         keys = [
@@ -7260,10 +7273,23 @@ class TestDiscoverCourts:
         ]
         courts = reingest._discover_courts(keys)
         assert len(courts) == 1
-        assert courts[0]["court_code"] == "federal_federal_courtlistener"
+        assert courts[0]["court_code"] == "federal-federal"
         assert courts[0]["state"] == "Federal"
         assert courts[0]["county"] == "Federal"
-        assert courts[0]["court_name"] == "Courtlistener"
+        assert courts[0]["court_name"] == "Courtlistener, County of Federal"
+
+    def test_court_code_matches_ingestion_format(self) -> None:
+        """court_code must use {state}-{county} format, not {state}_{county}_{court}."""
+        keys = ["ca/santa_clara/superior_court/raw/abc123.html"]
+        courts = reingest._discover_courts(keys)
+        assert len(courts) == 1
+        assert courts[0]["court_code"] == "ca-santa-clara"
+
+    def test_court_name_includes_county(self) -> None:
+        """court_name should include 'County of' to match ingestion format."""
+        keys = ["ca/orange/superior_court/raw/abc123.html"]
+        courts = reingest._discover_courts(keys)
+        assert courts[0]["court_name"] == "Superior Court, County of Orange"
 
     def test_skips_invalid_keys(self) -> None:
         keys = [
@@ -7424,13 +7450,13 @@ class TestSeedCourts:
             {
                 "state": "Federal",
                 "county": "Federal",
-                "court_name": "Courtlistener",
-                "court_code": "federal_federal_courtlistener",
+                "court_name": "Courtlistener, County of Federal",
+                "court_code": "federal-federal",
                 "timezone": "America/Los_Angeles",
             }
         ]
         result = reingest._seed_courts(conn, courts)
-        assert result == {"federal_federal_courtlistener": str(court_id)}
+        assert result == {"federal-federal": str(court_id)}
         cur.execute.assert_called_once()
         conn.commit.assert_called_once()
 
@@ -7495,15 +7521,15 @@ class TestRunReingestFromPrefix:
             {
                 "state": "Federal",
                 "county": "Federal",
-                "court_name": "Courtlistener",
-                "court_code": "federal_federal_courtlistener",
+                "court_name": "Courtlistener, County of Federal",
+                "court_code": "federal-federal",
                 "timezone": "America/Los_Angeles",
             }
         ]
         conn_mock = MagicMock()
         mock_psycopg.connect.return_value.__enter__ = MagicMock(return_value=conn_mock)
         mock_psycopg.connect.return_value.__exit__ = MagicMock(return_value=False)
-        mock_seed.return_value = {"federal_federal_courtlistener": "court-id-1"}
+        mock_seed.return_value = {"federal-federal": "court-id-1"}
 
         stats = reingest.run_reingest_from_prefix(
             "postgresql://test",
@@ -7547,15 +7573,15 @@ class TestRunReingestFromPrefix:
             {
                 "state": "Federal",
                 "county": "Federal",
-                "court_name": "Courtlistener",
-                "court_code": "federal_federal_courtlistener",
+                "court_name": "Courtlistener, County of Federal",
+                "court_code": "federal-federal",
                 "timezone": "America/Los_Angeles",
             }
         ]
         conn_mock = MagicMock()
         mock_psycopg.connect.return_value.__enter__ = MagicMock(return_value=conn_mock)
         mock_psycopg.connect.return_value.__exit__ = MagicMock(return_value=False)
-        mock_seed.return_value = {"federal_federal_courtlistener": "court-id-1"}
+        mock_seed.return_value = {"federal-federal": "court-id-1"}
 
         # Mock ProcessPoolExecutor and its futures
         pool = MagicMock()
