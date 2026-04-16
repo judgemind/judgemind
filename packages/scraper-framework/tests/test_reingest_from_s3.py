@@ -277,6 +277,135 @@ class TestReparseDocumentNulBytes:
 
 
 # ---------------------------------------------------------------------------
+# _reparse_document tests — stored_ruling_text override (#2364)
+# ---------------------------------------------------------------------------
+
+
+class TestReparseDocumentStoredRulingTextOverride:
+    """Verify that stored_ruling_text does NOT override scraper-produced
+    ruling_text (#2364).
+
+    When the scraper's parse_document() produces a fresh ruling_text from
+    the raw content (e.g. SD calendar HTML -> clean plain text), the
+    stored_ruling_text from the DB (which may contain stale/incorrect data
+    like raw HTML) should be ignored.
+    """
+
+    def _doc_meta(
+        self,
+        *,
+        stored_ruling_text: str | None = None,
+        county: str = "San Diego",
+        scraper_id: str = "ca-sd-calendar",
+    ) -> dict:
+        return {
+            "document_id": str(_DOC_ID_1),
+            "state": "CA",
+            "county": county,
+            "court_name": f"{county} Superior Court",
+            "source_url": "https://court.example.com/ruling",
+            "captured_at": _CAPTURED_AT_1,
+            "content_hash": "abc123",
+            "format": "html",
+            "case_number": "24CU016153C",
+            "case_title": "Smith v. Jones",
+            "hearing_date": _HEARING_DATE,
+            "court_id": str(_COURT_ID),
+            "scraper_id": scraper_id,
+            "s3_key": "docs/test.html",
+            "s3_bucket": "test-bucket",
+            "stored_ruling_text": stored_ruling_text,
+        }
+
+    @patch.object(reingest, "_load_scraper_registry")
+    def test_scraper_ruling_text_not_overridden_by_stored(
+        self,
+        mock_registry: MagicMock,
+    ) -> None:
+        """When scraper produces ruling_text, stored_ruling_text is ignored."""
+        raw = b"<html>calendar page</html>"
+        clean_text = "San Diego Superior Court - Case 24CU016153C"
+        stale_html = "<!DOCTYPE html><html><head>...</head><body>...</body></html>"
+
+        mock_scraper_cls = MagicMock()
+        mock_parsed = MagicMock()
+        mock_parsed.ruling_text = clean_text
+        mock_parsed.case_number = "24CU016153C"
+        mock_parsed.case_title = "Smith v. Jones"
+        mock_parsed.judge_name = "Judge Test"
+        mock_parsed.outcome = None
+        mock_parsed.motion_type = "motion_hearing"
+        mock_parsed.department = "C-60"
+        mock_parsed.parties = []
+        mock_parsed.hearing_date = None
+        mock_scraper_cls.return_value.parse_document.return_value = mock_parsed
+        reingest._SCRAPER_REGISTRY["test-sd-scraper"] = mock_scraper_cls
+
+        try:
+            meta = self._doc_meta(
+                stored_ruling_text=stale_html,
+                scraper_id="test-sd-scraper",
+            )
+            result = reingest._reparse_document(raw, "test-sd-scraper", meta)
+            # Scraper's clean text should win, not the stale HTML
+            assert result["ruling_text"] == clean_text
+            assert "<!DOCTYPE" not in result["ruling_text"]
+        finally:
+            reingest._SCRAPER_REGISTRY.pop("test-sd-scraper", None)
+
+    @patch.object(reingest, "_load_scraper_registry")
+    def test_stored_ruling_text_used_when_no_scraper(
+        self,
+        mock_registry: MagicMock,
+    ) -> None:
+        """Without a registered scraper, stored_ruling_text still applies."""
+        raw = b"full document text with many cases"
+        stored = "scoped ruling text for one case"
+
+        meta = self._doc_meta(
+            stored_ruling_text=stored,
+            scraper_id="unknown-scraper",
+            county="Los Angeles",
+        )
+        result = reingest._reparse_document(raw, "unknown-scraper", meta)
+        assert result["ruling_text"] == stored
+
+    @patch.object(reingest, "_load_scraper_registry")
+    def test_stored_ruling_text_used_when_scraper_produces_none(
+        self,
+        mock_registry: MagicMock,
+    ) -> None:
+        """When scraper returns ruling_text=None, stored_ruling_text applies."""
+        raw = b"<html>page content</html>"
+        stored = "previously scoped ruling text"
+
+        mock_scraper_cls = MagicMock()
+        mock_parsed = MagicMock()
+        mock_parsed.ruling_text = None  # Scraper did not produce ruling_text
+        mock_parsed.case_number = "24CU016153C"
+        mock_parsed.case_title = None
+        mock_parsed.judge_name = None
+        mock_parsed.outcome = None
+        mock_parsed.motion_type = None
+        mock_parsed.department = None
+        mock_parsed.parties = []
+        mock_parsed.hearing_date = None
+        mock_scraper_cls.return_value.parse_document.return_value = mock_parsed
+        reingest._SCRAPER_REGISTRY["test-no-ruling"] = mock_scraper_cls
+
+        try:
+            meta = self._doc_meta(
+                stored_ruling_text=stored,
+                scraper_id="test-no-ruling",
+            )
+            result = reingest._reparse_document(raw, "test-no-ruling", meta)
+            # Stored should be used since scraper didn't produce ruling_text
+            assert result["ruling_text"] == stored
+        finally:
+            reingest._SCRAPER_REGISTRY.pop("test-no-ruling", None)
+
+
+# ---------------------------------------------------------------------------
 # _reparse_document tests — motion_type normalization (#1849)
 # ---------------------------------------------------------------------------
 

@@ -623,6 +623,7 @@ def _reparse_document(
         "hearing_date": doc_meta.get("hearing_date"),
     }
 
+    scraper_ruling_text = False  # True when parse_document produced ruling_text
     scraper_cls = _SCRAPER_REGISTRY.get(scraper_id)
     if scraper_cls:
         # Create a CapturedDocument and run parse_document
@@ -655,6 +656,13 @@ def _reparse_document(
             parsed = scraper.parse_document(cap_doc)
             ruling = parsed.ruling_text or text
             extracted["ruling_text"] = ruling.replace("\x00", "") if ruling else text
+            # Track whether parse_document produced a fresh ruling_text.
+            # When it did, the scraper has re-extracted the text from raw
+            # content and it should NOT be overridden by stored_ruling_text
+            # (which may contain stale/incorrect data like raw HTML).
+            # See #2364.
+            if parsed.ruling_text:
+                scraper_ruling_text = True
             extracted["case_number"] = parsed.case_number or extracted["case_number"]
             extracted["case_title"] = parsed.case_title or extracted["case_title"]
             extracted["judge_name"] = parsed.judge_name
@@ -765,6 +773,11 @@ def _reparse_document(
                     )
                     if section:
                         llm_text = section
+                        # Also update extracted ruling_text so the DB gets
+                        # the clean per-case text instead of the full
+                        # calendar page HTML.  See #2364.
+                        extracted["ruling_text"] = section
+                        scraper_ruling_text = True
                 except Exception:
                     pass  # Fall through to full-text extraction
             # Look up county-specific max_output_tokens (#2355).
@@ -861,12 +874,18 @@ def _reparse_document(
     # Using the full PDF for regex extraction produces wrong matches
     # (motion_type from a different case) and overwrites the scoped
     # ruling_text in the DB via the ON CONFLICT upsert.  See #1848.
+    #
+    # Exception: when the scraper's parse_document() produced a fresh
+    # ruling_text (scraper_ruling_text=True), the scraper has re-extracted
+    # the text from raw content.  The stored value may be stale or
+    # incorrect (e.g. raw HTML from a prior ingestion bug).  In that case,
+    # keep the scraper's freshly-extracted ruling_text.  See #2364.
     stored = doc_meta.get("stored_ruling_text")
-    if stored:
+    if stored and not scraper_ruling_text:
         extracted["ruling_text"] = stored.replace("\x00", "") if stored else stored
         regex_text = extracted["ruling_text"]
     else:
-        regex_text = text
+        regex_text = extracted.get("ruling_text") or text
 
     # ------------------------------------------------------------------
     # Regex fallback — fill any fields still missing after scraper + LLM
