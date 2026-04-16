@@ -32,7 +32,7 @@
 # Options:
 #   --env <env>         Environment (default: dev)
 #   --cpu <units>       CPU units for the task (default: 1024). Valid: 256, 512, 1024, 2048, 4096.
-#   --memory <mb>       Memory in MB for the task (default: 2048). Must be valid for the CPU value.
+#   --memory <mb>       Memory in MB for the task (default: 4096). Must be valid for the CPU value.
 #   --role <name>       Override the ECS task role. Resolves the IAM role ARN
 #                       from the given role name (e.g. judgemind-maintenance-dev).
 #                       Useful for maintenance scripts that need permissions
@@ -270,10 +270,11 @@ fi
 S3_BUCKET="judgemind-assets-${ENVIRONMENT}"
 
 # ─── Resolve CPU and memory ────────────────────────────────────────────────
-# Defaults: 1024 CPU / 2048 MB — enough for batch processing and PDF extraction.
-# These override whatever the source task definition uses.
+# Defaults: 1024 CPU / 4096 MB — enough for batch processing, PDF extraction,
+# and LLM enrichment of large documents (e.g. Santa Clara 130K+ char PDFs).
+# Previously 2048 MB, but counties with large documents caused OOM (exit 137).
 CPU="${CPU_OVERRIDE:-1024}"
-MEMORY="${MEMORY_OVERRIDE:-2048}"
+MEMORY="${MEMORY_OVERRIDE:-4096}"
 
 # Validate Fargate CPU/memory combinations
 # https://docs.aws.amazon.com/AmazonECS/latest/developerguide/task-cpu-memory-error.html

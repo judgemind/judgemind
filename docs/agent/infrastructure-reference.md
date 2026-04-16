@@ -101,8 +101,8 @@ scripts/ecs-run-task.sh scripts/rebuild_db.py -- --county "Orange" --skip-reset
 scripts/ecs-task-logs.sh <task-id>
 scripts/ecs-task-logs.sh <task-id> --follow
 
-# Override CPU/memory for heavy workloads
-scripts/ecs-run-task.sh --cpu 2048 --memory 4096 scripts/dedup_judges.py
+# Override CPU/memory (default: 1024 CPU / 4096 MB)
+scripts/ecs-run-task.sh --cpu 2048 --memory 8192 scripts/dedup_judges.py
 ```
 
 ### Reingest vs Rebuild
