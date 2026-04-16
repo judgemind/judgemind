@@ -243,6 +243,7 @@ For agents spawned with `isolation: "worktree"`, Claude Code handles cleanup aut
 - **Use dedicated tools for file operations** — never use Bash for `cat`, `ls`, `grep`, `find`. Use Read, Glob, and Grep instead.
 - **Always Read before Write** — the Write tool requires this for existing files.
 - **Use Bash only for shell-only operations** — git, gh CLI, running tests, pip install, terraform, etc.
+- **Parallelize independent Bash calls** — when multiple Bash commands have no dependencies between them (e.g., fetching multiple issue details, running lint + format check), make all calls in a single message rather than sequentially. This significantly reduces wall-clock time for multi-step workflows.
 - `sudo` and `rm` always prompt; split commands to avoid triggering prompts.
 
 For detailed patterns to avoid permission prompts, see `docs/agent/unattended-patterns.md`.
