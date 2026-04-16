@@ -401,7 +401,20 @@ class IngestionWorker:
         # Multimodal LLM extractor for PDF page-image extraction (#1590).
         # Uses Google Gemini Flash Lite for cost-effective per-page extraction.
         # Lazy-initialized on first use; None means "not yet created".
+        #
+        # Legacy single-slot cache (preserved for backward compatibility with
+        # tests that directly assign ``worker._multimodal_extractor``).  Used
+        # only when ``_get_multimodal_extractor()`` is called with the default
+        # ``max_output_tokens=None``.
         self._multimodal_extractor: LlmExtractor | None = None
+
+        # Per-token-limit cache for multimodal extractors (#2369).  Counties
+        # with different multimodal ``max_output_tokens`` configurations get
+        # separate ``LlmExtractor`` instances so that Orange County's
+        # 32,768-token limit does not bleed into extractors created with
+        # different limits.  Key is the ``max_output_tokens`` int (or ``0``
+        # when unspecified).
+        self._multimodal_extractors: dict[int, LlmExtractor] = {}
 
         # LA County department-to-judge mapping — lazy-loaded on first LA event.
         # None means "not yet fetched"; empty dict means "fetch failed or empty".
@@ -428,13 +441,43 @@ class IngestionWorker:
                 )
         return self._framework_extractor
 
-    def _get_multimodal_extractor(self) -> LlmExtractor | None:
+    def _get_multimodal_extractor(
+        self,
+        max_output_tokens: int | None = None,
+    ) -> LlmExtractor | None:
         """Return the multimodal LlmExtractor for PDF extraction, creating lazily.
 
         Uses Google Gemini Flash Lite for cost-effective per-page image
         extraction.  Returns None if the Google API key is not available.
+
+        Parameters
+        ----------
+        max_output_tokens : int | None
+            Optional per-call response token cap.  When the county config
+            specifies a larger limit (e.g. Orange County at 32,768 tokens),
+            the caller passes it through so dense multi-case pages do not
+            truncate the LLM JSON response (#2369).  When ``None``, the
+            ``LlmExtractor`` default of 4,096 is used.
+
+        Notes
+        -----
+        Extractors are cached per ``max_output_tokens`` value, so two
+        counties with different multimodal token limits get separate
+        ``LlmExtractor`` instances.  For backward compatibility with tests
+        that pre-populate ``self._multimodal_extractor``, that legacy slot
+        is returned whenever it is already set — regardless of the requested
+        ``max_output_tokens``.  Production code paths always call with
+        ``max_output_tokens`` set, so this fallback only matters in tests.
         """
-        if self._multimodal_extractor is None:
+        # Backward-compat: if the legacy single-slot cache is already
+        # populated (e.g. by a test or by a prior call without a token
+        # limit), return it without reinitializing.
+        if self._multimodal_extractor is not None:
+            return self._multimodal_extractor
+
+        if max_output_tokens is None:
+            # No county-specific token limit — use the legacy single-slot
+            # cache, created with the LlmExtractor default of 4,096 tokens.
             try:
                 self._multimodal_extractor = LlmExtractor(
                     provider="google",
@@ -446,7 +489,30 @@ class IngestionWorker:
                     "Failed to initialize multimodal LlmExtractor — PDF extraction unavailable: %s",
                     exc,
                 )
-        return self._multimodal_extractor
+            return self._multimodal_extractor
+
+        # Per-token-limit cache (#2369).
+        cache_key = max_output_tokens
+        if cache_key not in self._multimodal_extractors:
+            try:
+                extractor = LlmExtractor(
+                    provider="google",
+                    model="gemini-2.5-flash-lite",
+                    max_output_tokens=max_output_tokens,
+                )
+                self._multimodal_extractors[cache_key] = extractor
+                logger.info(
+                    "Initialized multimodal LlmExtractor (Google Flash Lite)",
+                    extra={"max_output_tokens": max_output_tokens},
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Failed to initialize multimodal LlmExtractor — PDF extraction unavailable: %s",
+                    exc,
+                    extra={"max_output_tokens": max_output_tokens},
+                )
+                return None
+        return self._multimodal_extractors.get(cache_key)
 
     def _fetch_raw_pdf_from_s3(
         self,
@@ -1894,7 +1960,15 @@ class IngestionWorker:
         # Only used when the county is configured for multimodal extraction
         # or has no specific config (default behavior).
         if raw_pdf_bytes is not None and use_multimodal:
-            multimodal_extractor = self._get_multimodal_extractor()
+            # Pass the county's multimodal max_output_tokens (if configured)
+            # so dense multi-case pages don't truncate the LLM JSON response
+            # at the default 4,096 tokens (#2369).
+            mm_max_output_tokens: int | None = (
+                county_config.max_output_tokens if county_config is not None else None
+            )
+            multimodal_extractor = self._get_multimodal_extractor(
+                max_output_tokens=mm_max_output_tokens,
+            )
             if multimodal_extractor is not None:
                 try:
                     extracted_rulings = multimodal_extractor.extract_from_pdf(

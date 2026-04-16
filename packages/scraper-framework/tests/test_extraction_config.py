@@ -114,10 +114,16 @@ class TestGetCountyExtractionConfig:
         assert config.system_prompt is not None
 
     def test_orange_registered(self) -> None:
-        """Orange County has a registered config (multimodal)."""
+        """Orange County has a registered config (multimodal).
+
+        The ``max_output_tokens=32768`` setting is required (#2369) so that
+        dense multi-case department-calendar pages don't truncate the
+        per-page multimodal JSON response at the default 4,096-token limit.
+        """
         config = get_county_extraction_config("CA", "Orange")
         assert config is not None
         assert config.method == ExtractionMethod.MULTIMODAL
+        assert config.max_output_tokens == 32768
 
     def test_san_bernardino_registered(self) -> None:
         """San Bernardino County has a registered config (#2050)."""

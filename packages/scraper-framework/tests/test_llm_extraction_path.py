@@ -514,6 +514,64 @@ class TestMultimodalExtractorInit:
             result = worker._get_multimodal_extractor()
             assert result is None
 
+    def test_max_output_tokens_passed_through(self) -> None:
+        """max_output_tokens is forwarded to LlmExtractor when set (#2369).
+
+        Dense multi-case department-calendar pages truncate at the default
+        4,096-token cap; Orange County's config bumps this to 32,768.
+        """
+        worker, _ = _make_worker()
+
+        with patch("ingestion.worker.LlmExtractor") as mock_cls:
+            mock_instance = MagicMock()
+            mock_cls.return_value = mock_instance
+
+            result = worker._get_multimodal_extractor(max_output_tokens=32768)
+            assert result is mock_instance
+            mock_cls.assert_called_once_with(
+                provider="google",
+                model="gemini-2.5-flash-lite",
+                max_output_tokens=32768,
+            )
+
+    def test_different_max_output_tokens_gets_separate_instances(self) -> None:
+        """Different max_output_tokens values get separate cached instances (#2369)."""
+        worker, _ = _make_worker()
+
+        with patch("ingestion.worker.LlmExtractor") as mock_cls:
+            mock_a = MagicMock()
+            mock_b = MagicMock()
+            mock_cls.side_effect = [mock_a, mock_b]
+
+            result_a = worker._get_multimodal_extractor(max_output_tokens=4096)
+            result_b = worker._get_multimodal_extractor(max_output_tokens=32768)
+            assert result_a is not result_b
+            assert mock_cls.call_count == 2
+
+    def test_same_max_output_tokens_reuses_instance(self) -> None:
+        """Calling with the same max_output_tokens reuses the cached extractor (#2369)."""
+        worker, _ = _make_worker()
+
+        with patch("ingestion.worker.LlmExtractor") as mock_cls:
+            mock_instance = MagicMock()
+            mock_cls.return_value = mock_instance
+
+            result1 = worker._get_multimodal_extractor(max_output_tokens=32768)
+            result2 = worker._get_multimodal_extractor(max_output_tokens=32768)
+            assert result1 is result2
+            mock_cls.assert_called_once()
+
+    def test_max_output_tokens_failure_returns_none(self) -> None:
+        """If init fails for a specific token limit, returns None (#2369)."""
+        worker, _ = _make_worker()
+
+        with patch(
+            "ingestion.worker.LlmExtractor",
+            side_effect=Exception("No Google API key"),
+        ):
+            result = worker._get_multimodal_extractor(max_output_tokens=32768)
+            assert result is None
+
 
 class TestCountyExtractorInit:
     """Tests for lazy initialization of the county-specific LlmExtractor (#1728)."""
