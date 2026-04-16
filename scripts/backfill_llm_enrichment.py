@@ -75,6 +75,7 @@ class CountyStats:
     skipped_no_text: int = 0
     skipped_already_populated: int = 0
     llm_api_failures: int = 0
+    no_extractable_data: int = 0
     skipped_no_update: int = 0
     updated_motion_type: int = 0
     updated_outcome: int = 0
@@ -114,6 +115,9 @@ class BackfillStats:
                 c.skipped_already_populated for c in self.counties.values()
             ),
             "llm_api_failures": sum(c.llm_api_failures for c in self.counties.values()),
+            "no_extractable_data": sum(
+                c.no_extractable_data for c in self.counties.values()
+            ),
             "skipped_no_update": sum(
                 c.skipped_no_update for c in self.counties.values()
             ),
@@ -237,6 +241,7 @@ def fetch_rulings_batch(
 
 _SKIPPED_NO_UPDATE = "skipped_no_update"
 _LLM_API_FAILURE = "llm_api_failure"
+_NO_EXTRACTABLE_DATA = "no_extractable_data"
 
 
 def enrich_one_ruling(
@@ -252,9 +257,10 @@ def enrich_one_ruling(
     Returns one of:
     - A dict with the ruling_id, case_id, and extracted fields (success
       with updates).
-    - ``"skipped_no_update"`` if the LLM responded successfully but no
-      fields were updated (text too short, or extracted values were all
-      None).
+    - ``"skipped_no_update"`` if all enrichment fields are already
+      populated (no LLM call was made).
+    - ``"no_extractable_data"`` if the LLM call succeeded but returned
+      null for all needed fields (e.g. ruling text too short).
     - ``"llm_api_failure"`` if the LLM call itself failed (503, timeout,
       auth error, etc.).
     """
@@ -308,7 +314,7 @@ def enrich_one_ruling(
             updates["new_parties"].append({"name": name, "role": "defendant"})
         has_updates = True
 
-    return updates if has_updates else _SKIPPED_NO_UPDATE
+    return updates if has_updates else _NO_EXTRACTABLE_DATA
 
 
 # ---------------------------------------------------------------------------
@@ -471,6 +477,8 @@ def process_county(
                     result = future.result()
                     if result == _LLM_API_FAILURE:
                         county_stats.llm_api_failures += 1
+                    elif result == _NO_EXTRACTABLE_DATA:
+                        county_stats.no_extractable_data += 1
                     elif result == _SKIPPED_NO_UPDATE:
                         county_stats.skipped_no_update += 1
                     else:
@@ -534,6 +542,7 @@ def process_county(
         updated_case_title=county_stats.updated_case_title,
         updated_parties=county_stats.updated_parties,
         llm_api_failures=county_stats.llm_api_failures,
+        no_extractable_data=county_stats.no_extractable_data,
         skipped_no_update=county_stats.skipped_no_update,
         errors=county_stats.errors,
     )
@@ -555,6 +564,7 @@ def print_report(stats: BackfillStats) -> None:
     print(f"Elapsed:    {elapsed:.1f}s")
     print(f"Processed:  {totals['processed']}")
     print(f"API fails:  {totals['llm_api_failures']}")
+    print(f"No data:    {totals['no_extractable_data']}")
     print(f"No-update:  {totals['skipped_no_update']}")
     print(f"Errors:     {totals['errors']}")
     print()

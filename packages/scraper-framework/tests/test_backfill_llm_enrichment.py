@@ -153,8 +153,8 @@ class TestEnrichOneRuling:
         assert result == backfill._LLM_API_FAILURE
 
     @patch("backfill_llm_enrichment.enrich_ruling")
-    def test_no_update_returns_sentinel(self, mock_enrich: MagicMock) -> None:
-        """LLM success but no extractable fields returns skipped_no_update."""
+    def test_no_extractable_data_returns_sentinel(self, mock_enrich: MagicMock) -> None:
+        """LLM success but no extractable fields returns no_extractable_data."""
         mock_enrich.return_value = LlmEnrichmentResult()
         ruling = _make_ruling()
 
@@ -162,7 +162,7 @@ class TestEnrichOneRuling:
             ruling, provider="google", model=None, client=MagicMock(), force=False
         )
 
-        assert result == backfill._SKIPPED_NO_UPDATE
+        assert result == backfill._NO_EXTRACTABLE_DATA
 
     @patch("backfill_llm_enrichment.enrich_ruling")
     def test_partial_enrichment(self, mock_enrich: MagicMock) -> None:
@@ -293,6 +293,7 @@ class TestStats:
         assert cs.total_rulings == 0
         assert cs.processed == 0
         assert cs.llm_api_failures == 0
+        assert cs.no_extractable_data == 0
         assert cs.skipped_no_update == 0
 
     def test_backfill_stats_totals(self) -> None:
@@ -301,18 +302,21 @@ class TestStats:
         c1.processed = 10
         c1.updated_motion_type = 5
         c1.llm_api_failures = 2
+        c1.no_extractable_data = 1
         c1.skipped_no_update = 3
 
         c2 = stats.get_county("Orange")
         c2.processed = 20
         c2.updated_motion_type = 8
         c2.llm_api_failures = 1
+        c2.no_extractable_data = 4
         c2.skipped_no_update = 5
 
         totals = stats.totals()
         assert totals["processed"] == 30
         assert totals["updated_motion_type"] == 13
         assert totals["llm_api_failures"] == 3
+        assert totals["no_extractable_data"] == 5
         assert totals["skipped_no_update"] == 8
 
 
@@ -490,3 +494,93 @@ class TestProcessCounty:
         assert len(updates_arg) == 2
         # Verify LLM was called for each ruling
         assert mock_enrich.call_count == 2
+
+    @patch("backfill_llm_enrichment.apply_updates")
+    @patch("backfill_llm_enrichment.fetch_rulings_batch")
+    @patch("backfill_llm_enrichment.fetch_before_stats")
+    @patch("backfill_llm_enrichment.enrich_ruling")
+    def test_tracks_no_extractable_data_separately(
+        self,
+        mock_enrich: MagicMock,
+        mock_before_stats: MagicMock,
+        mock_fetch_batch: MagicMock,
+        mock_apply: MagicMock,
+    ) -> None:
+        """LLM success with no data vs API failure tracked separately."""
+        # First ruling: LLM succeeds but returns nothing extractable
+        # Second ruling: LLM API fails (returns None)
+        mock_enrich.side_effect = [LlmEnrichmentResult(), None]
+
+        mock_before_stats.return_value = {
+            "total": 100,
+            "null_motion_type": 30,
+            "null_outcome": 25,
+            "null_case_title": 10,
+        }
+
+        rulings = [
+            _make_ruling(ruling_id=_RULING_ID_1, case_id=_CASE_ID_1),
+            _make_ruling(ruling_id=_RULING_ID_2, case_id=_CASE_ID_2),
+        ]
+        mock_fetch_batch.side_effect = [rulings, []]
+
+        conn = MagicMock()
+        stats = backfill.BackfillStats(start_time=0)
+
+        backfill.process_county(
+            conn,
+            "Orange",
+            stats,
+            provider="google",
+            model=None,
+            client=MagicMock(),
+            force=False,
+            dry_run=True,
+            batch_size=50,
+            concurrency=1,
+            limit=None,
+        )
+
+        county_stats = stats.get_county("Orange")
+        assert county_stats.processed == 2
+        assert county_stats.llm_api_failures == 1
+        assert county_stats.no_extractable_data == 1
+        assert county_stats.skipped_no_update == 0
+
+
+# ---------------------------------------------------------------------------
+# print_report tests
+# ---------------------------------------------------------------------------
+
+
+class TestPrintReport:
+    """Tests for the print_report function."""
+
+    def test_report_shows_separate_failure_categories(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Verify that print_report shows API failures and extraction gaps separately."""
+        stats = backfill.BackfillStats(start_time=0.0)
+        county = stats.get_county("Riverside")
+        county.total_rulings = 100
+        county.processed = 50
+        county.llm_api_failures = 3
+        county.no_extractable_data = 10
+        county.skipped_no_update = 5
+        county.errors = 1
+        county.updated_motion_type = 20
+        county.updated_outcome = 15
+        county.updated_case_title = 10
+        county.updated_parties = 8
+        county.before_null_motion_type = 30
+        county.after_null_motion_type = 10
+        county.before_null_outcome = 25
+        county.after_null_outcome = 10
+
+        backfill.print_report(stats)
+        captured = capsys.readouterr()
+
+        assert "API fails:  3" in captured.out
+        assert "No data:    10" in captured.out
+        assert "No-update:  5" in captured.out
+        assert "Errors:     1" in captured.out
