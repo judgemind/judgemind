@@ -83,23 +83,46 @@ def parse_s3_key(key: str) -> dict[str, str] | None:
     return m.groupdict()
 
 
+def _derive_court_code(state: str, county: str) -> str:
+    """Derive a URL-safe court code from state + county.
+
+    Must match the canonical format in ``ingestion.db._derive_court_code``
+    so that ``ON CONFLICT (court_code)`` upserts hit the same row the
+    ingestion worker creates.  See #2373.
+
+    Examples:
+        "CA", "Los Angeles"  -> "ca-los-angeles"
+        "CA", "Orange"       -> "ca-orange"
+    """
+    return f"{state.lower()}-{county.lower().replace(' ', '-')}"
+
+
 def discover_courts(keys: list[str]) -> list[dict[str, str]]:
-    """Derive unique courts from S3 key prefixes."""
+    """Derive unique courts from S3 key prefixes.
+
+    Uses the same ``{state}-{county}`` court_code format as the ingestion
+    worker (``ingestion.db._derive_court_code``) so that the ``ON CONFLICT
+    (court_code)`` upsert in ``seed_courts`` merges with existing rows
+    instead of creating duplicates.  See #2373.
+    """
     seen: set[str] = set()
     courts: list[dict[str, str]] = []
     for key in keys:
         parsed = parse_s3_key(key)
         if not parsed:
             continue
-        court_code = f"{parsed['state']}_{parsed['county']}_{parsed['court']}"
+        state = unsluggify(parsed["state"])
+        county = unsluggify(parsed["county"])
+        court_name = unsluggify(parsed["court"])
+        court_code = _derive_court_code(state, county)
         if court_code in seen:
             continue
         seen.add(court_code)
         courts.append(
             {
-                "state": unsluggify(parsed["state"]),
-                "county": unsluggify(parsed["county"]),
-                "court_name": unsluggify(parsed["court"]),
+                "state": state,
+                "county": county,
+                "court_name": f"{court_name}, County of {county}",
                 "court_code": court_code,
                 "timezone": STATE_TIMEZONES.get(parsed["state"], "America/Los_Angeles"),
             }
