@@ -331,6 +331,10 @@ def test_det_validation_fail_db_error_does_not_crash(
     # OpenSearch indexing should NOT have happened (fail path)
     os_mock.index.assert_not_called()
 
+    # Rollback must be called after the insert failure so that any aborted
+    # transaction state is cleared on the shared DB connection (#2385).
+    mock_conn.rollback.assert_called()
+
 
 # ---------------------------------------------------------------------------
 # Tests: deterministic validation — flag DB logging error does not crash
@@ -367,6 +371,10 @@ def test_det_validation_flag_db_error_does_not_crash(
     event = _make_event(ruling_text="")  # triggers flag for empty text
     # Should not raise despite DB error during flag logging
     worker.process_event(event)
+
+    # Rollback must be called after the insert failure so that any aborted
+    # transaction state is cleared before the main DB write proceeds (#2385).
+    mock_conn.rollback.assert_called()
 
 
 # ---------------------------------------------------------------------------

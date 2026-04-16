@@ -1455,6 +1455,13 @@ class IngestionWorker:
                     "Failed to log deterministic validation result to DB: %s",
                     exc,
                 )
+                # Rollback to clear any aborted transaction state so
+                # subsequent DB operations on the shared connection can
+                # proceed (#2385).
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
             return
 
         if det_result.overall == "flag":
@@ -1481,6 +1488,13 @@ class IngestionWorker:
                     "Failed to log deterministic validation flag to DB: %s",
                     exc,
                 )
+                # Rollback to clear any aborted transaction state so
+                # subsequent DB operations on the shared connection can
+                # proceed (#2385).
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
             # Continue to DB write — flag does not block.
 
         # ------------------------------------------------------------------
@@ -1577,6 +1591,13 @@ class IngestionWorker:
                         "Failed to log validation result to DB: %s",
                         exc,
                     )
+                    # Rollback to clear any aborted transaction state so
+                    # subsequent DB operations on the shared connection can
+                    # proceed (#2385).
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
                 return
 
         # For split events, each split ruling gets its own document row keyed

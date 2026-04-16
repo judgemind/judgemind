@@ -539,3 +539,7 @@ def test_validation_fail_db_write_error_still_returns(
 
     # OpenSearch indexing should NOT have happened (fail path)
     os_mock.index.assert_not_called()
+
+    # Rollback must be called after the insert failure so that any aborted
+    # transaction state is cleared on the shared DB connection (#2385).
+    mock_conn.rollback.assert_called()
