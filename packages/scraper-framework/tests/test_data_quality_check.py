@@ -3777,6 +3777,34 @@ class TestLoadExpectedNullRates:
         assert "bad_entry" not in result
         assert "another_bad" not in result
 
+    def test_load_real_baselines_file(self) -> None:
+        """load_expected_null_rates works against the real data-quality-baselines.json.
+
+        Regression test for #2333: the real baselines file may contain
+        top-level metadata keys (e.g., ``_updated``, ``_note``) that the
+        loader must skip.  Using synthetic data missed this mismatch.
+        """
+        baselines_path = _REPO_ROOT / "data-quality-baselines.json"
+        if not baselines_path.exists():
+            return  # Skip if running outside repo context
+
+        result = load_expected_null_rates(baselines_path)
+
+        # Should return a non-empty dict without raising.
+        assert isinstance(result, dict)
+        assert len(result) > 0, "Expected at least one county in expected_null_rates"
+
+        # No _-prefixed keys should appear anywhere in the result.
+        for county, fields in result.items():
+            assert not county.startswith("_"), (
+                f"Top-level _-prefixed key '{county}' leaked into result"
+            )
+            for field_name in fields:
+                assert not field_name.startswith("_"), (
+                    f"Field-level _-prefixed key '{field_name}' leaked into "
+                    f"result for county '{county}'"
+                )
+
 
 class TestExpectedNullRateFieldCompleteness:
     """Tests for expected null rate adjustments in check_field_completeness (#2318)."""
