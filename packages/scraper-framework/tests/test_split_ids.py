@@ -12,7 +12,11 @@ from __future__ import annotations
 
 import uuid
 
-from ingestion.split_ids import is_split_child_id, make_split_document_id
+from ingestion.split_ids import (
+    derive_parent_document_id,
+    is_split_child_id,
+    make_split_document_id,
+)
 
 
 class TestMakeSplitDocumentId:
@@ -113,3 +117,54 @@ class TestIsSplitChildId:
                     f"is_split_child_id failed for child_id={child_id} "
                     f"(parent={parent_id}, idx={idx})"
                 )
+
+    def test_scraper_v5_id_with_content_hash_is_parent(self) -> None:
+        """Scraper-generated UUID v5 IDs (from uuid5(NAMESPACE_URL, content_hash))
+        are NOT split children when content_hash is supplied.
+
+        This is the #2367 regression: since #302, scraper IDs are derived via
+        uuid5(NAMESPACE_URL, content_hash).  Both scraper IDs and split-child
+        IDs are UUID v5, so a pure version-check mis-classifies scraper IDs
+        as split children.  The content_hash parameter fixes this.
+        """
+        content_hash = "a" * 64  # fake sha256
+        scraper_id = derive_parent_document_id(content_hash)
+        # Without content_hash (legacy path): v5 → misclassified as split child.
+        assert is_split_child_id(scraper_id) is True
+        # With content_hash: recognized as the parent.
+        assert is_split_child_id(scraper_id, content_hash) is False
+
+    def test_split_child_with_content_hash_still_detected(self) -> None:
+        """Split-child IDs are still detected as split children when the
+        parent's content_hash is supplied (they don't match the parent-style
+        derivation)."""
+        content_hash = "b" * 64
+        parent_id = derive_parent_document_id(content_hash)
+        child = make_split_document_id(parent_id, 0)
+        assert is_split_child_id(child, content_hash) is True
+
+    def test_content_hash_none_preserves_legacy_behavior(self) -> None:
+        """When content_hash is None, falls back to the UUID-version check."""
+        content_hash = "c" * 64
+        scraper_id = derive_parent_document_id(content_hash)
+        assert is_split_child_id(scraper_id, None) is True
+        assert is_split_child_id(scraper_id) is True  # default arg
+
+
+class TestDeriveParentDocumentId:
+    """Tests for derive_parent_document_id()."""
+
+    def test_deterministic(self) -> None:
+        """Same content hash always produces the same ID."""
+        content_hash = "d" * 64
+        assert derive_parent_document_id(content_hash) == derive_parent_document_id(content_hash)
+
+    def test_matches_base_scraper_derivation(self) -> None:
+        """Matches the exact UUID derivation used by BaseScraper._process_document."""
+        content_hash = "e" * 64
+        expected = str(uuid.uuid5(uuid.NAMESPACE_URL, content_hash))
+        assert derive_parent_document_id(content_hash) == expected
+
+    def test_different_hashes_produce_different_ids(self) -> None:
+        """Different content hashes produce different IDs."""
+        assert derive_parent_document_id("a" * 64) != derive_parent_document_id("b" * 64)
