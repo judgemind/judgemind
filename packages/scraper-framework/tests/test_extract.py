@@ -611,6 +611,30 @@ class TestExtractCaseNumber:
         """OC family law: 2-digit year + D + 6 digits."""
         assert extract_case_type_from_number("24D006789") == "family"
 
+    # SF Unified Family Court prefixes — FDI (dissolution), FMS (family
+    # motion), FPT (parentage), FDV (domestic violence), FCS (child
+    # support). See #2368.
+
+    def test_sf_family_fdi_dissolution(self) -> None:
+        """SF family dissolution: FDI-25-801091."""
+        assert extract_case_type_from_number("FDI-25-801091") == "family"
+
+    def test_sf_family_fms_motion(self) -> None:
+        """SF family motion: FMS-15-386703."""
+        assert extract_case_type_from_number("FMS-15-386703") == "family"
+
+    def test_sf_family_fpt_parentage(self) -> None:
+        """SF family parentage: FPT-23-378175."""
+        assert extract_case_type_from_number("FPT-23-378175") == "family"
+
+    def test_sf_family_fdv_domestic_violence(self) -> None:
+        """SF family domestic violence restraining order: FDV-25-818599."""
+        assert extract_case_type_from_number("FDV-25-818599") == "family"
+
+    def test_sf_family_fcs_child_support(self) -> None:
+        """SF family child support: FCS-25-400123."""
+        assert extract_case_type_from_number("FCS-25-400123") == "family"
+
     # --- Probate prefixes ---
 
     def test_probate_pr(self) -> None:
@@ -664,16 +688,6 @@ class TestExtractCaseNumber:
     def test_felony_f_digit(self) -> None:
         """Felony docket format: F + digits."""
         assert extract_case_type_from_number("F2301234") == "criminal"
-
-    def test_sf_felony_fpt(self) -> None:
-        """SF felony: FPT-25-378624."""
-        assert extract_case_type_from_number("FPT-25-378624") == "criminal"
-
-    def test_sf_felony_fms(self) -> None:
-        assert extract_case_type_from_number("FMS-20-387302") == "criminal"
-
-    def test_sf_felony_fdi(self) -> None:
-        assert extract_case_type_from_number("FDI-14-781786") == "criminal"
 
     # --- Juvenile ---
 

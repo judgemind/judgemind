@@ -975,6 +975,11 @@ _CASE_TYPE_PREFIX_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"^(?:\d{2,4})?FL", re.IGNORECASE), "family"),
     (re.compile(r"^(?:\d{2,4})?DV", re.IGNORECASE), "family"),
     (re.compile(r"^(?:\d{2,4})?D\d", re.IGNORECASE), "family"),
+    # SF Unified Family Court: FDI (dissolution), FMS (family motion),
+    # FPT (parentage), FDV (domestic violence), FCS (child support).
+    # Must be ordered BEFORE any generic ^F patterns (e.g. ^F\d criminal)
+    # so these more specific SF family prefixes win.
+    (re.compile(r"^F(?:DI|MS|PT|DV|CS)-", re.IGNORECASE), "family"),
     # Probate prefixes
     (re.compile(r"^(?:\d{2,4})?(?:[A-Z]{2})?PR", re.IGNORECASE), "probate"),
     (re.compile(r"^(?:\d{2,4})?(?:[A-Z]{2})?BP", re.IGNORECASE), "probate"),
@@ -990,8 +995,9 @@ _CASE_TYPE_PREFIX_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"^(?:\d{2,4})?(?:[A-Z]{2})?CR", re.IGNORECASE), "criminal"),
     # Felony docket format: F + digit (e.g. F2301234)
     (re.compile(r"^F\d", re.IGNORECASE), "criminal"),
-    # SF felony: FPT, FMS, FDI, etc. — F + 2 letters + hyphen
-    (re.compile(r"^F[A-Z]{2}-", re.IGNORECASE), "criminal"),
+    # Note: SF's F[A-Z]{2}- prefixes (FDI, FMS, FPT, FDV, FCS) are family
+    # law, not criminal (see SF family patterns above). Do NOT add a generic
+    # ^F[A-Z]{2}- -> criminal pattern here — it would misclassify those.
     # Juvenile
     (re.compile(r"^(?:\d{2,4})?(?:[A-Z]{2})?JV", re.IGNORECASE), "juvenile"),
     # Traffic
