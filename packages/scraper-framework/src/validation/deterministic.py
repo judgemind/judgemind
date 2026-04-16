@@ -54,6 +54,39 @@ _MULTI_VS_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+# Broad California court case-number pattern used to scan ruling_text for
+# candidate case-number tokens.  This intentionally over-matches — the
+# actual contamination check is driven by comparing normalised candidates
+# against the caller-supplied ``other_case_numbers`` list, not by the
+# pattern's precision.
+#
+# Covers (case-insensitive, examples):
+#   23STCV12345, 24CECG12345, 23CV123456, 24PR123456        (LA, Fresno, Santa Clara)
+#   37-2023-12345                                            (San Diego)
+#   CGC12345678, RIC1234567, CIV1234567                      (SF civil, Riverside)
+#   2024CUBC123456                                           (Ventura)
+#   C21-01234                                                (Contra Costa)
+#   FAM-23-123456                                            (SF family)
+#   CIVSB12345                                               (Santa Barbara)
+#   01234567 (leading-0 7-digit)                             (OC probate)
+#   23D123456                                                (OC family)
+_CASE_NUMBER_CANDIDATE_PATTERN = re.compile(
+    r"""
+    \b(?:
+        \d{2,4}-\d{2,4}-\d{5,10}        # dashed: 37-2023-12345, FAM-23-123456 variants
+        | [A-Z]{3,4}-\d{2}-\d{6}        # dashed: FAM-23-123456 (letters-first)
+        | [CLNP]\d{2}-\d{4,5}           # Contra Costa: C21-01234
+        | \d{4}[A-Z]{3,5}\d{5,8}        # Ventura: 2024CUBC123456
+        | \d{2}[A-Z]{2,6}\d{4,10}       # LA/Fresno/SC: 23STCV12345
+        | \d{2}D\d{6}                   # OC family: 23D123456
+        | CIV[A-Z]{2}\s?\d{5,8}         # Santa Barbara: CIVSB12345
+        | [A-Z]{3,4}\d{6,10}            # SF civil/Riverside: CGC12345678
+        | 0\d{7}                        # OC probate: 7-digit with leading 0
+    )\b
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
 
 # ---------------------------------------------------------------------------
 # Data types
@@ -249,6 +282,99 @@ def check_no_duplicate_ruling_text(
     return DeterministicRuleResult(rule="no_duplicate_ruling_text", result="pass")
 
 
+def _normalize_case_number(raw: str | None) -> str:
+    """Return an uppercase canonical form of a case number for comparison.
+
+    Strips whitespace, uppercases, and removes internal spaces and hyphens
+    so that format variations (``"37-2023-12345"`` vs ``"372023 12345"`` vs
+    ``"37202312345"``) all compare equal.  Returns an empty string for
+    ``None`` or all-whitespace input.
+    """
+    if raw is None:
+        return ""
+    stripped = raw.strip()
+    if not stripped:
+        return ""
+    # Remove internal whitespace and hyphens, then uppercase.
+    return re.sub(r"[\s\-]+", "", stripped).upper()
+
+
+def check_no_cross_case_ruling_text(
+    ruling_text: str | None,
+    own_case_number: str | None,
+    other_case_numbers: list[str],
+) -> DeterministicRuleResult:
+    """Check that ruling_text does not reference a sibling case's number.
+
+    On multi-case calendar documents, the transcription/split step may
+    associate one case's ruling text with another case's metadata.  This
+    rule scans ``ruling_text`` for California court case-number tokens and
+    flags the ruling when any candidate token normalises to one of the
+    caller-supplied ``other_case_numbers`` (which should be the case
+    numbers from sibling rulings on the same document) **without** also
+    matching ``own_case_number``.
+
+    Parameters
+    ----------
+    ruling_text:
+        The ruling text to scan.
+    own_case_number:
+        The extracted case number of this ruling.  May be ``None`` or a
+        synthetic ``UNKNOWN-`` placeholder.
+    other_case_numbers:
+        Case numbers from sibling rulings on the same document.  Caller is
+        responsible for excluding ``own_case_number`` from this list;
+        defensive filtering is applied anyway.
+
+    Returns
+    -------
+    DeterministicRuleResult
+        ``flag`` if a sibling case number is referenced in the text;
+        ``pass`` otherwise.  Always passes on empty/None inputs.
+    """
+    if not ruling_text or not other_case_numbers:
+        return DeterministicRuleResult(rule="no_cross_case_ruling_text", result="pass")
+
+    own_norm = _normalize_case_number(own_case_number)
+
+    # Normalise and de-duplicate sibling case numbers.  Exclude any that
+    # match own_case_number after normalisation (defensive), and drop empties.
+    other_norm: set[str] = set()
+    for other in other_case_numbers:
+        norm = _normalize_case_number(other)
+        if norm and norm != own_norm:
+            other_norm.add(norm)
+
+    if not other_norm:
+        return DeterministicRuleResult(rule="no_cross_case_ruling_text", result="pass")
+
+    # Scan ruling_text for candidate case-number tokens and normalise each.
+    # Track which sibling case numbers are referenced.
+    matched: set[str] = set()
+    for match in _CASE_NUMBER_CANDIDATE_PATTERN.finditer(ruling_text):
+        candidate_norm = _normalize_case_number(match.group(0))
+        if not candidate_norm:
+            continue
+        if candidate_norm == own_norm:
+            # Own case number in own ruling text — expected, ignore.
+            continue
+        if candidate_norm in other_norm:
+            matched.add(candidate_norm)
+
+    if matched:
+        # Sort for stable message ordering; show raw normalised forms.
+        matched_sorted = sorted(matched)
+        return DeterministicRuleResult(
+            rule="no_cross_case_ruling_text",
+            result="flag",
+            reason=f"ruling_text references {len(matched_sorted)} other case "
+            f"number(s) from the same document ({', '.join(matched_sorted)}) — "
+            "likely cross-case ruling text misattribution",
+        )
+
+    return DeterministicRuleResult(rule="no_cross_case_ruling_text", result="pass")
+
+
 def check_ruling_text_reasonable_length(ruling_text: str | None) -> DeterministicRuleResult:
     """Check that ruling_text length is not exactly the truncation sentinel.
 
@@ -277,6 +403,7 @@ def run_deterministic_rules(
     case_title: str | None,
     hearing_date: date | None,
     captured_at: date | None,
+    other_case_numbers: list[str] | None = None,
 ) -> DeterministicValidationResult:
     """Run all deterministic validation rules on a ruling.
 
@@ -292,6 +419,12 @@ def run_deterministic_rules(
         The extracted hearing date.
     captured_at : date | None
         The document's capture timestamp (as date).
+    other_case_numbers : list[str] | None
+        Case numbers from sibling rulings on the same multi-case document.
+        When provided and non-empty, enables the
+        ``no_cross_case_ruling_text`` rule which flags rulings whose text
+        references another case's number (#2371).  Existing callers that
+        omit this kwarg keep their previous behaviour.
 
     Returns
     -------
@@ -306,6 +439,17 @@ def run_deterministic_rules(
         check_case_number_not_unknown(case_number),
         check_ruling_text_reasonable_length(ruling_text),
     ]
+
+    # Cross-case contamination check only runs when the caller supplies
+    # sibling case numbers (i.e. document-level context is available).
+    if other_case_numbers:
+        results.append(
+            check_no_cross_case_ruling_text(
+                ruling_text=ruling_text,
+                own_case_number=case_number,
+                other_case_numbers=other_case_numbers,
+            )
+        )
 
     # Determine overall result: fail > flag > pass
     has_fail = any(r.result == "fail" for r in results)
