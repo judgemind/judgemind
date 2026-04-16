@@ -30,9 +30,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # To add a script here, append its filename (basename only) and add a comment
 # explaining why it is local-only.
 LOCAL_ONLY=(
-    "gemini_review.py"          # Ralph loop reviewer — runs locally in worktree
-    "log_ralph_review.py"       # Ralph loop logger — runs locally in worktree
-    "log_ralph_summary.py"      # Ralph loop summary — runs locally in worktree
+    "gemini_review.py"              # Ralph loop reviewer — runs locally in worktree
+    "log_ralph_review.py"           # Ralph loop logger — runs locally in worktree
+    "log_ralph_summary.py"          # Ralph loop summary — runs locally in worktree
+    "remove_test_functions.py"      # DX utility — runs locally for refactoring
     "update-coverage-baselines.py"  # CI-only — runs in GitHub Actions runner
     "validate-dq-baselines.py"      # CI-only — validates baselines JSON structure
 )
