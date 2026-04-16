@@ -53,6 +53,12 @@ Options:
                         ruling records. Useful after a backfill that created
                         document records but did not process them through
                         transcription/enrichment.
+    --filter-null-outcome
+                        Only re-ingest documents that have at least one
+                        ruling with a NULL outcome.  Useful for targeted
+                        reprocessing after extraction improvements — avoids
+                        re-ingesting the entire county when only a small
+                        subset of documents need outcome extraction.
     --no-llm            Disable LLM extraction, use regex-only mode.
     --llm-timeout N     Per-call LLM API timeout in seconds (default: 60).
     --force-llm         Force LLM even when all fields are already populated.
@@ -362,6 +368,7 @@ def _build_filters(
     null_motion_type: bool = False,
     orphaned_only: bool = False,
     case_number_like: str | None = None,
+    filter_null_outcome: bool = False,
 ) -> tuple[str, list]:
     """Build WHERE clause fragments and params for the document query."""
     clauses = []
@@ -385,6 +392,11 @@ def _build_filters(
         clauses.append(
             "AND EXISTS (SELECT 1 FROM rulings r"
             " WHERE r.document_id = d.id AND r.motion_type IS NULL)"
+        )
+    if filter_null_outcome:
+        clauses.append(
+            "AND EXISTS (SELECT 1 FROM rulings r"
+            " WHERE r.document_id = d.id AND r.outcome IS NULL)"
         )
     if orphaned_only:
         clauses.append(
@@ -2525,6 +2537,7 @@ def run_reingest(
     resume: bool = False,
     case_number_like: str | None = None,
     force_retranscribe: bool = False,
+    filter_null_outcome: bool = False,
 ) -> dict[str, Any]:
     """Run the full reingest. Returns summary stats including cost.
 
@@ -2538,6 +2551,10 @@ def run_reingest(
         When *True* **and** *checkpoint_file* points to an existing file,
         the cursor and cumulative stats are restored from the checkpoint
         instead of starting from the beginning.  Requires *checkpoint_file*.
+    filter_null_outcome:
+        When *True*, only re-ingest documents that have at least one ruling
+        with a NULL outcome.  Useful for targeted reprocessing when only a
+        subset of documents need outcome extraction.
     """
     filters, filter_params = _build_filters(
         county,
@@ -2547,6 +2564,7 @@ def run_reingest(
         null_motion_type=null_motion_type,
         orphaned_only=orphaned_only,
         case_number_like=case_number_like,
+        filter_null_outcome=filter_null_outcome,
     )
 
     s3_client = boto3.client("s3")
@@ -2890,6 +2908,17 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--filter-null-outcome",
+        action="store_true",
+        help=(
+            "Only re-ingest documents that have at least one ruling "
+            "with a NULL outcome. Useful for targeted reprocessing "
+            "after extraction improvements — avoids re-ingesting an "
+            "entire county when only a small subset of documents need "
+            "outcome extraction."
+        ),
+    )
+    parser.add_argument(
         "--orphaned-only",
         action="store_true",
         help=(
@@ -3024,6 +3053,7 @@ def main() -> None:
         resume=args.resume,
         case_number_like=args.case_number_like,
         force_retranscribe=args.force_retranscribe,
+        filter_null_outcome=args.filter_null_outcome,
     )
 
     logger.info(
