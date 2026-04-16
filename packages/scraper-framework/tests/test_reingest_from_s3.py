@@ -4496,6 +4496,95 @@ class TestReingestBatchFullReparse:
     @patch("reingest_from_s3.upsert_case")
     @patch("reingest_from_s3._full_reparse_document")
     @patch("reingest_from_s3._fetch_s3_content")
+    def test_supersede_runs_before_insert_for_split_docs(
+        self,
+        mock_fetch_s3: MagicMock,
+        mock_full_reparse: MagicMock,
+        mock_upsert_case: MagicMock,
+        mock_insert_doc_and_ruling: MagicMock,
+        mock_resolve_judge: MagicMock,
+        mock_upsert_cj: MagicMock,
+        mock_batch_parties: MagicMock,
+        mock_supersede: MagicMock,
+    ) -> None:
+        """_supersede_document runs BEFORE insert_document_and_ruling (#2365).
+
+        Without this ordering, insert_ruling's content-hash dedup matches
+        the old ruling (still linked to the parent document), updating it
+        in place.  _supersede_document then deletes those same rulings,
+        leaving split children with no ruling rows.
+        """
+        call_order: list[str] = []
+        mock_supersede.side_effect = lambda *a, **kw: call_order.append("supersede")
+        mock_insert_doc_and_ruling.side_effect = lambda *a, **kw: call_order.append("insert")
+
+        row = _make_document_row(
+            scraper_id="ca-riverside-tentatives-civil",
+            case_number="CVPS2306157",
+        )
+        conn = _mock_conn_with_rows([row])
+
+        mock_fetch_s3.return_value = b"pdf content"
+        mock_full_reparse.return_value = [
+            {
+                "ruling_text": "Ruling 1",
+                "case_number": "CVPS2306157",
+                "case_title": "Yeldell v. Henss",
+                "judge_name": "Arthur Hester III",
+                "outcome": "granted",
+                "motion_type": "demurrer",
+                "department": "PS1",
+                "parties": [],
+                "hearing_date": _HEARING_DATE,
+                "ruling_index": 1,
+                "split_document_id": "split-id-1",
+                "is_split": True,
+                "llm_skipped": True,
+                "llm_outcome": "not_attempted",
+            },
+            {
+                "ruling_text": "Ruling 2",
+                "case_number": "CVPS2306202",
+                "case_title": "Crump v. Irwin",
+                "judge_name": "Arthur Hester III",
+                "outcome": "denied",
+                "motion_type": "motion_to_compel",
+                "department": "PS1",
+                "parties": [],
+                "hearing_date": _HEARING_DATE,
+                "ruling_index": 2,
+                "split_document_id": "split-id-2",
+                "is_split": True,
+                "llm_skipped": True,
+                "llm_outcome": "not_attempted",
+            },
+        ]
+        mock_upsert_case.return_value = "case-id"
+        mock_resolve_judge.return_value = "judge-id"
+
+        reingest.reingest_batch(
+            conn,
+            MagicMock(),
+            batch_size=10,
+            cursor=_DEFAULT_CURSOR,
+            filters="",
+            filter_params=[],
+            full_reparse=True,
+        )
+
+        # Supersede must happen first, then both inserts
+        assert call_order == ["supersede", "insert", "insert"], (
+            f"Expected supersede before inserts, got: {call_order}"
+        )
+
+    @patch("reingest_from_s3._supersede_document")
+    @patch("reingest_from_s3.batch_upsert_parties")
+    @patch("reingest_from_s3.upsert_case_judge")
+    @patch("reingest_from_s3.resolve_judge")
+    @patch("reingest_from_s3.insert_document_and_ruling")
+    @patch("reingest_from_s3.upsert_case")
+    @patch("reingest_from_s3._full_reparse_document")
+    @patch("reingest_from_s3._fetch_s3_content")
     def test_full_reparse_no_split_does_not_supersede(
         self,
         mock_fetch_s3: MagicMock,

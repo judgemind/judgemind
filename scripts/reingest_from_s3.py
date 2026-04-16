@@ -1824,6 +1824,17 @@ def reingest_batch(
                 # Check if this document was split into multiple rulings
                 any_split = any(e.get("is_split") for e in extracted_list)
 
+                # If the document was split, supersede the original BEFORE
+                # inserting split children (#2365).  This must happen first
+                # because insert_ruling's content-hash dedup would otherwise
+                # match the old ruling (still linked to the parent document),
+                # updating it in place instead of creating a new row for the
+                # split child.  When _supersede_document then runs AFTER the
+                # loop, it deletes those same rulings — leaving split children
+                # with no ruling rows at all.
+                if any_split:
+                    _supersede_document(conn, doc_id_str)
+
                 for extracted in extracted_list:
                     # For rulings, use split_document_id if available;
                     # for documents, always use original document_id
@@ -1932,10 +1943,6 @@ def reingest_batch(
                     batch_upsert_parties(
                         conn, new_case_id, extracted.get("parties", [])
                     )
-
-                # If the document was split, supersede the original
-                if any_split:
-                    _supersede_document(conn, doc_id_str)
 
             conn.commit()
             updated += 1
