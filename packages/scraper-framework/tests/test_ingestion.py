@@ -1986,6 +1986,82 @@ def test_process_event_llm_extraction_populates_missing_fields(
     assert "case_parties" in all_executemany_sql
 
 
+@patch("ingestion.worker.extract_fields_llm")
+@patch("ingestion.worker.psycopg")
+def test_process_event_passes_county_max_output_tokens_to_llm(
+    mock_psycopg: MagicMock,
+    mock_llm: MagicMock,
+) -> None:
+    """Worker passes county-configured max_output_tokens to extract_fields_llm (#2355).
+
+    Santa Clara is configured with max_output_tokens=32768.  Verify that the
+    worker looks up the county config and passes max_tokens to the LLM call.
+    """
+    worker, _os_mock = _make_worker()
+    worker._llm_client = MagicMock()
+
+    mock_conn, mock_cur = _make_mock_conn()
+    mock_psycopg.connect.return_value = mock_conn
+    # Return enough values for the full processing pipeline
+    mock_cur.fetchone.return_value = ("uuid-1",)
+    mock_cur.fetchall.return_value = []
+    mock_cur.rowcount = 1
+
+    # Mock _llm_split_document to return False so we reach extract_fields_llm
+    with patch.object(worker, "_llm_split_document", return_value=False):
+        mock_llm.return_value = None
+
+        # Event for Santa Clara — should get max_tokens=32768
+        event = _make_event(
+            scraper_id="ca-sc-tentatives-civil",
+            state="CA",
+            county="Santa Clara",
+            ruling_text="Some ruling text",
+            case_number="24CV443183",
+        )
+        worker.process_event(event)
+
+        # Verify extract_fields_llm was called with max_tokens=32768
+        mock_llm.assert_called_once()
+        call_kwargs = mock_llm.call_args[1]
+        assert call_kwargs["max_tokens"] == 32768
+
+
+@patch("ingestion.worker.extract_fields_llm")
+@patch("ingestion.worker.psycopg")
+def test_process_event_default_max_tokens_for_unconfigured_county(
+    mock_psycopg: MagicMock,
+    mock_llm: MagicMock,
+) -> None:
+    """Worker uses default max_tokens=4096 for counties without config (#2355)."""
+    worker, _os_mock = _make_worker()
+    worker._llm_client = MagicMock()
+
+    mock_conn, mock_cur = _make_mock_conn()
+    mock_psycopg.connect.return_value = mock_conn
+    # Return enough values for the full processing pipeline
+    mock_cur.fetchone.return_value = ("uuid-1",)
+    mock_cur.fetchall.return_value = []
+    mock_cur.rowcount = 1
+
+    # Mock _llm_split_document to return False so we reach extract_fields_llm
+    with patch.object(worker, "_llm_split_document", return_value=False):
+        mock_llm.return_value = None
+
+        # Event for an unconfigured county — should get default max_tokens=4096
+        event = _make_event(
+            state="CA",
+            county="Unknown County",
+            ruling_text="Some ruling text",
+        )
+        worker.process_event(event)
+
+        # Verify extract_fields_llm was called with max_tokens=4096
+        mock_llm.assert_called_once()
+        call_kwargs = mock_llm.call_args[1]
+        assert call_kwargs["max_tokens"] == 4096
+
+
 @patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
 @patch("ingestion.worker.extract_fields_llm")
 @patch("ingestion.worker.psycopg")

@@ -633,6 +633,20 @@ class TestCountyExtractorInit:
             assert result_a is not result_b
             assert mock_cls.call_count == 2
 
+    def test_different_max_output_tokens_gets_separate_instances(self) -> None:
+        """Different max_output_tokens values get separate cached instances (#2355)."""
+        worker, _ = _make_worker()
+
+        with patch("ingestion.worker.LlmExtractor") as mock_cls:
+            mock_a = MagicMock()
+            mock_b = MagicMock()
+            mock_cls.side_effect = [mock_a, mock_b]
+
+            result_a = worker._get_county_extractor("google", "gemini-2.5-flash-lite", 4096)
+            result_b = worker._get_county_extractor("google", "gemini-2.5-flash-lite", 32768)
+            assert result_a is not result_b
+            assert mock_cls.call_count == 2
+
 
 class TestCountyExtractionPath:
     """Tests for the county-specific LLM extraction path in _llm_split_document (#1728)."""
@@ -1447,8 +1461,8 @@ class TestMultimodalExtractionPath:
         ]
 
         # Use the county-specific extractor cache for Ventura.
-        # Cache key is (provider, model or "", max_chars_per_chunk or 0).
-        worker._county_extractors = {("google", "gemini-2.5-flash-lite", 0): mock_text}
+        # Cache key is (provider, model, max_chars_per_chunk, max_output_tokens).
+        worker._county_extractors = {("google", "gemini-2.5-flash-lite", 0, 32768): mock_text}
 
         # Ventura event with raw PDF bytes
         event = _make_event(
@@ -1882,7 +1896,7 @@ class TestS3PdfDownloadInProcessEvent:
         mock_psycopg: MagicMock,
         mock_llm_split: MagicMock,
     ) -> None:
-        """For a MULTIMODAL county (e.g. Santa Clara), the worker downloads
+        """For a MULTIMODAL county (e.g. Orange), the worker downloads
         raw PDF bytes from S3 when ruling_text is not raw binary."""
         worker, _ = _make_worker()
         mock_conn, mock_cur = _make_mock_conn()
@@ -1893,19 +1907,19 @@ class TestS3PdfDownloadInProcessEvent:
         ]
 
         # Mock S3 download
-        pdf_bytes = b"%PDF-1.4 fake santa clara pdf"
+        pdf_bytes = b"%PDF-1.4 fake orange county pdf"
         body_mock = MagicMock()
         body_mock.read.return_value = pdf_bytes
         worker._s3_client.get_object.return_value = {"Body": body_mock}
 
-        # Event for Santa Clara with pre-extracted text (not raw binary)
+        # Event for Orange County with pre-extracted text (not raw binary)
         event = _make_event(
-            scraper_id="ca-sc-tentatives-civil",
+            scraper_id="ca-oc-tentatives",
             state="CA",
-            county="Santa Clara",
+            county="Orange",
             content_format="pdf",
             ruling_text="Motion: Compel\n\nCtrl Click on Line 7",
-            s3_key="ca/santa_clara/raw/abc.pdf",
+            s3_key="ca/orange/raw/abc.pdf",
         )
         worker.process_event(event)
 

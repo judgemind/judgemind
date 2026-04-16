@@ -111,6 +111,7 @@ import boto3  # noqa: E402
 import psycopg  # noqa: E402
 import structlog  # noqa: E402
 
+from framework.extraction_config import get_county_extraction_config  # noqa: E402
 from framework.llm_extractor import LlmExtractor  # noqa: E402
 from framework.llm_schema import ExtractedRuling  # noqa: E402
 from framework.logging import configure_structlog  # noqa: E402
@@ -766,6 +767,18 @@ def _reparse_document(
                         llm_text = section
                 except Exception:
                     pass  # Fall through to full-text extraction
+            # Look up county-specific max_output_tokens (#2355).
+            # Large-document counties (e.g. Santa Clara, 130K+ chars)
+            # need more than the default 4096 output tokens to avoid
+            # truncated JSON responses.
+            _cc = get_county_extraction_config(
+                doc_meta.get("state", ""),
+                doc_meta.get("county", ""),
+            )
+            _llm_max_tokens = (
+                _cc.max_output_tokens if _cc and _cc.max_output_tokens else 4096
+            )
+
             t0 = time.monotonic()
             llm_result = extract_fields_llm(
                 document_text=llm_text,
@@ -776,6 +789,7 @@ def _reparse_document(
                 model=llm_model,
                 timeout=llm_timeout,
                 token_tracker=token_tracker,
+                max_tokens=_llm_max_tokens,
             )
             llm_latency_ms = round((time.monotonic() - t0) * 1000)
 
