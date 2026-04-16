@@ -32,6 +32,7 @@ from framework.llm_schema import (
     ConfidenceLevel,
     FieldConfidence,
 )
+from framework.llm_utils import strip_llm_json_fences
 
 from .llm_providers import call_llm, call_llm_with_images
 
@@ -1068,13 +1069,7 @@ def _parse_response(
 ) -> LLMExtractionResult | None:
     """Parse the JSON response from the model into an ``LLMExtractionResult``."""
     try:
-        # Strip markdown code fences if present
-        cleaned = raw_text.strip()
-        if cleaned.startswith("```"):
-            # Remove opening fence (```json or ```)
-            cleaned = re.sub(r"^```\w*\n?", "", cleaned)
-            cleaned = re.sub(r"\n?```$", "", cleaned)
-
+        cleaned = strip_llm_json_fences(raw_text)
         parsed = json.loads(cleaned)
     except json.JSONDecodeError as exc:
         logger.warning("llm_extract.json_parse_error", error=str(exc), raw=raw_text[:200])

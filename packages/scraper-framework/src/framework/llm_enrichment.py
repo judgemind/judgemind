@@ -24,13 +24,14 @@ See: https://github.com/judgemind/judgemind/issues/2175
 from __future__ import annotations
 
 import json
-import re
 from enum import StrEnum
 
 import structlog
 from pydantic import BaseModel, Field, field_validator
 
 from ingestion.llm_providers import LLMResponse, call_llm
+
+from .llm_utils import strip_llm_json_fences
 
 logger = structlog.get_logger(__name__)
 
@@ -406,11 +407,7 @@ def _parse_response(text: str) -> LlmEnrichmentResult | None:
     the expected schema.
     """
     try:
-        cleaned = text.strip()
-        # Strip markdown code fences if present (e.g. ```json ... ```)
-        if cleaned.startswith("```"):
-            cleaned = re.sub(r"^```\w*\n?", "", cleaned)
-            cleaned = re.sub(r"\n?```$", "", cleaned)
+        cleaned = strip_llm_json_fences(text)
         data = json.loads(cleaned)
     except json.JSONDecodeError:
         logger.debug("llm_enrichment.json_decode_error", text_preview=text[:200])
