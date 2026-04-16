@@ -47,7 +47,11 @@ from framework.enrichment import EnrichmentEngine
 from framework.llm_extractor import LlmExtractor
 from framework.search.indexer import IndexingConsumer
 from framework.search.mapping import TENTATIVE_RULINGS_ALIAS
-from validation.deterministic import check_no_duplicate_ruling_text, run_deterministic_rules
+from validation.deterministic import (
+    check_no_cross_case_ruling_text,
+    check_no_duplicate_ruling_text,
+    run_deterministic_rules,
+)
 from validation.gate import ValidationResult, insert_validation_result, validate_document
 from validation.issue_filer import file_validation_issue
 
@@ -2124,6 +2128,73 @@ class IngestionWorker:
                 except Exception:
                     pass
             # Continue — flag does not block split event dispatch.
+
+        # ------------------------------------------------------------------
+        # Document-level deterministic validation: cross-case ruling text
+        # misattribution (#2371).  For each split ruling, scan its text for
+        # sibling case numbers.  A hit indicates the transcription step
+        # likely assigned one case's ruling text to another case's metadata.
+        # ------------------------------------------------------------------
+        all_sibling_case_numbers: list[str] = [cr.case_number for cr in converted if cr.case_number]
+        # Only run when we have 2+ sibling case numbers — otherwise there
+        # is nothing to cross-reference.
+        if len(all_sibling_case_numbers) >= 2:
+            for cr in converted:
+                # Siblings = all-except-self (by reference identity).
+                sibling_nums = [
+                    other.case_number
+                    for other in converted
+                    if other is not cr and other.case_number
+                ]
+                if not sibling_nums:
+                    continue
+                cross_result = check_no_cross_case_ruling_text(
+                    ruling_text=cr.ruling_text,
+                    own_case_number=cr.case_number,
+                    other_case_numbers=sibling_nums,
+                )
+                if cross_result.result != "flag":
+                    continue
+                logger.info(
+                    "Deterministic validation flag: cross-case ruling text",
+                    extra={
+                        "document_id": document_id,
+                        "split_document_id": cr.document_id,
+                        "own_case_number": cr.case_number,
+                        "sibling_case_numbers": sibling_nums,
+                        "reason": cross_result.reason,
+                        "county": county,
+                        "state": state,
+                    },
+                )
+                try:
+                    conn = self._get_connection()
+                    insert_validation_result(
+                        conn,
+                        document_id=cr.document_id,
+                        ruling_id=None,
+                        result=ValidationResult(
+                            result="flag",
+                            reason=cross_result.reason or "",
+                            model="deterministic",
+                            input_tokens=0,
+                            output_tokens=0,
+                            latency_ms=0,
+                        ),
+                    )
+                    conn.commit()
+                except Exception as exc:
+                    logger.warning(
+                        "Failed to log cross-case ruling text validation flag to DB: %s",
+                        exc,
+                    )
+                    # Rollback to clear any aborted transaction state so
+                    # subsequent split-event DB writes can proceed (#2371).
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
+                # Continue — flag does not block split event dispatch.
 
         for cr in converted:
             # For multimodal-extracted PDFs, ruling_text is markdown.

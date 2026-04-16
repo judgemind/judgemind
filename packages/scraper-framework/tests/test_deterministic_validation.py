@@ -13,6 +13,7 @@ from validation.deterministic import (
     check_case_number_not_unknown,
     check_hearing_date_in_range,
     check_no_concatenated_titles,
+    check_no_cross_case_ruling_text,
     check_no_duplicate_ruling_text,
     check_no_html_in_ruling_text,
     check_ruling_text_not_empty,
@@ -343,6 +344,220 @@ class TestNoDuplicateRulingText:
 
 
 # ---------------------------------------------------------------------------
+# no_cross_case_ruling_text
+# ---------------------------------------------------------------------------
+
+
+class TestNoCrossCaseRulingText:
+    """Tests for the no_cross_case_ruling_text rule (#2371)."""
+
+    def test_pass_none_ruling_text(self) -> None:
+        result = check_no_cross_case_ruling_text(
+            ruling_text=None,
+            own_case_number="23STCV12345",
+            other_case_numbers=["23STCV99999"],
+        )
+        assert result.result == "pass"
+        assert result.rule == "no_cross_case_ruling_text"
+
+    def test_pass_empty_ruling_text(self) -> None:
+        result = check_no_cross_case_ruling_text(
+            ruling_text="",
+            own_case_number="23STCV12345",
+            other_case_numbers=["23STCV99999"],
+        )
+        assert result.result == "pass"
+
+    def test_pass_empty_other_list(self) -> None:
+        result = check_no_cross_case_ruling_text(
+            ruling_text="The motion in 23STCV99999 is granted.",
+            own_case_number="23STCV12345",
+            other_case_numbers=[],
+        )
+        assert result.result == "pass"
+
+    def test_pass_no_case_numbers_in_text(self) -> None:
+        """Ruling text with no case-number-like tokens should pass."""
+        result = check_no_cross_case_ruling_text(
+            ruling_text="The motion for summary judgment is GRANTED.",
+            own_case_number="23STCV12345",
+            other_case_numbers=["23STCV99999"],
+        )
+        assert result.result == "pass"
+
+    def test_pass_only_own_case_number(self) -> None:
+        """Ruling text that only references its own case number should pass."""
+        result = check_no_cross_case_ruling_text(
+            ruling_text="Case 23STCV12345: motion granted. See 23STCV12345.",
+            own_case_number="23STCV12345",
+            other_case_numbers=["23STCV99999", "23STCV88888"],
+        )
+        assert result.result == "pass"
+
+    def test_flag_other_case_la_format(self) -> None:
+        """LA ruling text that references a sibling LA case — flag."""
+        result = check_no_cross_case_ruling_text(
+            ruling_text=(
+                "In the matter of 23STCV99999, the court finds that the motion "
+                "for summary judgment should be granted."
+            ),
+            own_case_number="23STCV12345",
+            other_case_numbers=["23STCV99999"],
+        )
+        assert result.result == "flag"
+        assert "cross-case ruling text misattribution" in (result.reason or "")
+        assert "23STCV99999" in (result.reason or "")
+
+    def test_flag_other_case_sd_dashed(self) -> None:
+        """SD-style dashed case number referenced in text — flag."""
+        result = check_no_cross_case_ruling_text(
+            ruling_text="Please see ruling in case 37-2023-99999 for prior context.",
+            own_case_number="37-2023-12345",
+            other_case_numbers=["37-2023-99999"],
+        )
+        assert result.result == "flag"
+
+    def test_flag_other_case_fresno(self) -> None:
+        """Fresno-format case number referenced — flag."""
+        result = check_no_cross_case_ruling_text(
+            ruling_text="Demurrer in 24CECG99999 is sustained with leave to amend.",
+            own_case_number="24CECG12345",
+            other_case_numbers=["24CECG99999"],
+        )
+        assert result.result == "flag"
+
+    def test_flag_other_case_oc_civil(self) -> None:
+        """OC civil format in text — flag."""
+        result = check_no_cross_case_ruling_text(
+            ruling_text="The matter in 30-2024-12345678 is continued to next month.",
+            own_case_number="30-2024-00001111",
+            other_case_numbers=["30-2024-12345678"],
+        )
+        assert result.result == "flag"
+
+    def test_flag_other_case_ventura(self) -> None:
+        """Ventura-format case number in text — flag."""
+        result = check_no_cross_case_ruling_text(
+            ruling_text="The court adopts the tentative ruling in 2024CUBC999999.",
+            own_case_number="2024CUBC123456",
+            other_case_numbers=["2024CUBC999999"],
+        )
+        assert result.result == "flag"
+
+    def test_flag_other_case_contra_costa(self) -> None:
+        """Contra Costa case number format in text — flag."""
+        result = check_no_cross_case_ruling_text(
+            ruling_text="See related matter C21-09999 for additional background.",
+            own_case_number="C21-01234",
+            other_case_numbers=["C21-09999"],
+        )
+        assert result.result == "flag"
+
+    def test_flag_other_case_sf_civil(self) -> None:
+        """SF civil format in text — flag."""
+        result = check_no_cross_case_ruling_text(
+            ruling_text="Prior order in CGC22999999 controls here.",
+            own_case_number="CGC22123456",
+            other_case_numbers=["CGC22999999"],
+        )
+        assert result.result == "flag"
+
+    def test_flag_other_case_riverside(self) -> None:
+        """Riverside RIC-format in text — flag."""
+        result = check_no_cross_case_ruling_text(
+            ruling_text="Motion in RIC9999999 is denied.",
+            own_case_number="RIC1234567",
+            other_case_numbers=["RIC9999999"],
+        )
+        assert result.result == "flag"
+
+    def test_flag_case_insensitive_match(self) -> None:
+        """Case-insensitive matching — lowercase in text should still flag."""
+        result = check_no_cross_case_ruling_text(
+            ruling_text="The motion in 23stcv99999 is granted.",
+            own_case_number="23STCV12345",
+            other_case_numbers=["23STCV99999"],
+        )
+        assert result.result == "flag"
+
+    def test_flag_format_tolerant(self) -> None:
+        """Different formatting (hyphens removed / spacing) must still flag.
+
+        The normalisation layer strips spaces and hyphens and uppercases, so
+        ``"37 2023 99999"`` in text should match ``"37-2023-99999"`` in the
+        other-cases list once both normalise to ``"37202399999"``.  The
+        regex itself requires a dashed form to recognise the candidate, so
+        we use a dashed form in the text and a non-dashed form in the list.
+        """
+        result = check_no_cross_case_ruling_text(
+            ruling_text="See case 37-2023-99999 for prior order.",
+            own_case_number="37-2023-12345",
+            other_case_numbers=["37202399999"],
+        )
+        assert result.result == "flag"
+
+    def test_pass_substring_of_own(self) -> None:
+        """If an "other" number is a substring of own (weird edge), must not false-flag.
+
+        This can happen when case-number lists are constructed sloppily.
+        The rule deliberately filters out any sibling entry that normalises
+        to the own number; it should also not flag pure substrings in the
+        text (regex uses word boundaries, so this is mostly a sanity check).
+        """
+        result = check_no_cross_case_ruling_text(
+            ruling_text="Case 30-2024-12345678 is continued.",
+            own_case_number="30-2024-12345678",
+            # Deliberately sloppy: sibling list contains own number.
+            other_case_numbers=["30-2024-12345678"],
+        )
+        assert result.result == "pass"
+
+    def test_pass_other_number_not_in_text(self) -> None:
+        """Other list has entries but none appear in the text — pass."""
+        result = check_no_cross_case_ruling_text(
+            ruling_text="Case 23STCV12345: motion granted.",
+            own_case_number="23STCV12345",
+            other_case_numbers=["23STCV99999", "24STCV88888"],
+        )
+        assert result.result == "pass"
+
+    def test_flag_multiple_other_cases(self) -> None:
+        """Two siblings referenced — reason should mention count and both numbers."""
+        result = check_no_cross_case_ruling_text(
+            ruling_text="See 23STCV99999 and also 24STCV88888 for related.",
+            own_case_number="23STCV12345",
+            other_case_numbers=["23STCV99999", "24STCV88888"],
+        )
+        assert result.result == "flag"
+        reason = result.reason or ""
+        assert "2 other case" in reason
+        assert "23STCV99999" in reason
+        assert "24STCV88888" in reason
+
+    def test_pass_none_own_case_number(self) -> None:
+        """If own case number is None but text cleanly contains a sibling — flag.
+
+        None own_case_number is not a blocker; the check still scans for
+        sibling numbers.  This guards against defensive callers.
+        """
+        result = check_no_cross_case_ruling_text(
+            ruling_text="The motion in 23STCV99999 is granted.",
+            own_case_number=None,
+            other_case_numbers=["23STCV99999"],
+        )
+        assert result.result == "flag"
+
+    def test_pass_other_with_empty_and_none(self) -> None:
+        """Other list containing empty strings is handled gracefully."""
+        result = check_no_cross_case_ruling_text(
+            ruling_text="Case 23STCV12345 matter resolved.",
+            own_case_number="23STCV12345",
+            other_case_numbers=["", "   "],
+        )
+        assert result.result == "pass"
+
+
+# ---------------------------------------------------------------------------
 # run_deterministic_rules (aggregation)
 # ---------------------------------------------------------------------------
 
@@ -439,3 +654,66 @@ class TestRunDeterministicRules:
         reasons = result.reasons
         assert len(reasons) >= 2
         assert all(isinstance(r, str) for r in reasons)
+
+    def test_cross_case_kwarg_omitted_backward_compat(self) -> None:
+        """Existing callers that omit other_case_numbers must still pass (#2371).
+
+        The default count of rules is 6 without the cross-case check.
+        """
+        result = run_deterministic_rules(
+            ruling_text="The motion in 23STCV99999 is granted.",
+            case_number="23STCV12345",
+            case_title="Smith v. Jones",
+            hearing_date=date(2026, 3, 5),
+            captured_at=date(2026, 3, 4),
+        )
+        # Without other_case_numbers, no cross-case rule added.
+        assert len(result.rules) == 6
+        assert not any(r.rule == "no_cross_case_ruling_text" for r in result.rules)
+        assert result.overall == "pass"
+
+    def test_cross_case_kwarg_empty_list_backward_compat(self) -> None:
+        """Empty other_case_numbers list is treated the same as omission (#2371)."""
+        result = run_deterministic_rules(
+            ruling_text="The motion in 23STCV99999 is granted.",
+            case_number="23STCV12345",
+            case_title="Smith v. Jones",
+            hearing_date=date(2026, 3, 5),
+            captured_at=date(2026, 3, 4),
+            other_case_numbers=[],
+        )
+        assert len(result.rules) == 6
+        assert not any(r.rule == "no_cross_case_ruling_text" for r in result.rules)
+        assert result.overall == "pass"
+
+    def test_cross_case_flag_via_aggregated_runner(self) -> None:
+        """run_deterministic_rules flags cross-case contamination when siblings given (#2371)."""
+        result = run_deterministic_rules(
+            ruling_text="The motion in 23STCV99999 is granted.",
+            case_number="23STCV12345",
+            case_title="Smith v. Jones",
+            hearing_date=date(2026, 3, 5),
+            captured_at=date(2026, 3, 4),
+            other_case_numbers=["23STCV99999", "23STCV88888"],
+        )
+        assert len(result.rules) == 7
+        assert result.overall == "flag"
+        cross_rules = [r for r in result.rules if r.rule == "no_cross_case_ruling_text"]
+        assert len(cross_rules) == 1
+        assert cross_rules[0].result == "flag"
+        assert "23STCV99999" in (cross_rules[0].reason or "")
+
+    def test_cross_case_pass_own_case_only_in_text(self) -> None:
+        """run_deterministic_rules passes when ruling text only mentions its own case (#2371)."""
+        result = run_deterministic_rules(
+            ruling_text="Case 23STCV12345: motion granted.",
+            case_number="23STCV12345",
+            case_title="Smith v. Jones",
+            hearing_date=date(2026, 3, 5),
+            captured_at=date(2026, 3, 4),
+            other_case_numbers=["23STCV99999"],
+        )
+        assert len(result.rules) == 7
+        assert result.overall == "pass"
+        cross_rules = [r for r in result.rules if r.rule == "no_cross_case_ruling_text"]
+        assert cross_rules[0].result == "pass"

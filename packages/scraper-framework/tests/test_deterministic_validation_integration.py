@@ -689,3 +689,258 @@ def test_det_validation_duplicate_flag_db_error_does_not_crash(
             )
             # Should not raise despite DB error during flag logging
             worker.process_event(event)
+
+
+# ---------------------------------------------------------------------------
+# Tests: document-level deterministic validation — cross-case ruling text
+# misattribution (#2371)
+# ---------------------------------------------------------------------------
+
+
+@patch("ingestion.worker.insert_validation_result")
+@patch(_DELETE_STALE_MOCK, return_value=0)
+@patch("ingestion.worker.psycopg")
+def test_det_validation_flag_cross_case_ruling_text(
+    mock_psycopg: MagicMock,
+    mock_delete_stale: MagicMock,
+    mock_insert_validation: MagicMock,
+) -> None:
+    """A split ruling whose text references a sibling case number should flag (#2371)."""
+    from ingestion.ruling_guards import ConvertedRuling
+
+    worker, os_mock = _make_worker()
+
+    mock_conn, mock_cur = _make_mock_conn()
+    mock_psycopg.connect.return_value = mock_conn
+    # Two splits x (court + case + document) = 6 fetchone calls on the
+    # happy path for split event processing.
+    mock_cur.fetchone.side_effect = [
+        ("court-uuid-1",),  # upsert_court (split 0)
+        ("case-uuid-1",),  # upsert_case (split 0)
+        (True,),  # insert_document (split 0)
+        ("court-uuid-1",),  # upsert_court (split 1)
+        ("case-uuid-2",),  # upsert_case (split 1)
+        (True,),  # insert_document (split 1)
+    ]
+    mock_cur.rowcount = 1
+
+    # Split 0: ruling text correctly mentions its own case number only.
+    # Split 1: ruling text mentions split 0's case number (misattribution).
+    converted = [
+        ConvertedRuling(
+            document_id="split-uuid-0",
+            original_document_id="parent-uuid-1",
+            split_index=0,
+            split_count=2,
+            is_multi=True,
+            ruling_text="Case 23STCV10000: the motion is granted.",
+            case_number="23STCV10000",
+            case_title="Smith v. Jones",
+            judge_name="Smith, John A.",
+            department="Dept. 1",
+            motion_type="Motion for Summary Judgment",
+            outcome="granted",
+            hearing_date="2026-03-05",
+        ),
+        ConvertedRuling(
+            document_id="split-uuid-1",
+            original_document_id="parent-uuid-1",
+            split_index=1,
+            split_count=2,
+            is_multi=True,
+            # BUG: this text references the first case's number.
+            ruling_text="See ruling in 23STCV10000 for prior order details.",
+            case_number="23STCV20000",
+            case_title="Doe v. Roe",
+            judge_name="Smith, John A.",
+            department="Dept. 1",
+            motion_type="Demurrer",
+            outcome="denied",
+            hearing_date="2026-03-05",
+        ),
+    ]
+
+    with patch(_CONVERT_MOCK, return_value=converted):
+        with patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1"):
+            extractor_mock = MagicMock()
+            extractor_mock.extract.return_value = MagicMock(rulings=[MagicMock()] * 2)
+            worker._framework_extractor = extractor_mock
+
+            event = _make_event(
+                ruling_text="Full document text here " * 20,
+            )
+            worker.process_event(event)
+
+    # Cross-case flag should have been logged for split-uuid-1.
+    cross_calls = [
+        c
+        for c in mock_insert_validation.call_args_list
+        if c.kwargs.get("result")
+        and c.kwargs["result"].model == "deterministic"
+        and "cross-case ruling text misattribution" in (c.kwargs["result"].reason or "")
+    ]
+    assert len(cross_calls) == 1, (
+        f"Expected exactly one cross-case flag, got: "
+        f"{[c.kwargs.get('result') for c in mock_insert_validation.call_args_list]}"
+    )
+    cross_result = cross_calls[0].kwargs["result"]
+    assert cross_result.result == "flag"
+    assert "23STCV10000" in cross_result.reason
+    # Flag logged against the contaminated ruling's document_id.
+    assert cross_calls[0].kwargs.get("document_id") == "split-uuid-1"
+
+
+@patch("ingestion.worker.insert_validation_result")
+@patch(_DELETE_STALE_MOCK, return_value=0)
+@patch("ingestion.worker.psycopg")
+def test_det_validation_pass_no_cross_case_references(
+    mock_psycopg: MagicMock,
+    mock_delete_stale: MagicMock,
+    mock_insert_validation: MagicMock,
+) -> None:
+    """Clean split rulings with no cross-case references should not flag (#2371)."""
+    from ingestion.ruling_guards import ConvertedRuling
+
+    worker, os_mock = _make_worker()
+
+    mock_conn, mock_cur = _make_mock_conn()
+    mock_psycopg.connect.return_value = mock_conn
+    mock_cur.fetchone.side_effect = [
+        ("court-uuid-1",),
+        ("case-uuid-1",),
+        (True,),
+        ("court-uuid-1",),
+        ("case-uuid-2",),
+        (True,),
+    ]
+    mock_cur.rowcount = 1
+
+    converted = [
+        ConvertedRuling(
+            document_id="split-uuid-0",
+            original_document_id="parent-uuid-1",
+            split_index=0,
+            split_count=2,
+            is_multi=True,
+            ruling_text="Case 23STCV10000: the motion is granted.",
+            case_number="23STCV10000",
+            case_title="Smith v. Jones",
+            judge_name="Smith, John A.",
+            department="Dept. 1",
+            motion_type="Motion for Summary Judgment",
+            outcome="granted",
+            hearing_date="2026-03-05",
+        ),
+        ConvertedRuling(
+            document_id="split-uuid-1",
+            original_document_id="parent-uuid-1",
+            split_index=1,
+            split_count=2,
+            is_multi=True,
+            ruling_text="Case 23STCV20000: the demurrer is sustained.",
+            case_number="23STCV20000",
+            case_title="Doe v. Roe",
+            judge_name="Smith, John A.",
+            department="Dept. 1",
+            motion_type="Demurrer",
+            outcome="denied",
+            hearing_date="2026-03-05",
+        ),
+    ]
+
+    with patch(_CONVERT_MOCK, return_value=converted):
+        with patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1"):
+            extractor_mock = MagicMock()
+            extractor_mock.extract.return_value = MagicMock(rulings=[MagicMock()] * 2)
+            worker._framework_extractor = extractor_mock
+
+            event = _make_event(
+                ruling_text="Full document text here " * 20,
+            )
+            worker.process_event(event)
+
+    # No cross-case flag should have been logged.
+    cross_calls = [
+        c
+        for c in mock_insert_validation.call_args_list
+        if c.kwargs.get("result")
+        and c.kwargs["result"].model == "deterministic"
+        and "cross-case ruling text misattribution" in (c.kwargs["result"].reason or "")
+    ]
+    assert len(cross_calls) == 0, (
+        f"Unexpected cross-case flag: "
+        f"{[c.kwargs.get('result') for c in mock_insert_validation.call_args_list]}"
+    )
+
+
+@patch("ingestion.worker.insert_validation_result")
+@patch(_DELETE_STALE_MOCK, return_value=0)
+@patch("ingestion.worker.psycopg")
+def test_det_validation_cross_case_db_error_does_not_crash(
+    mock_psycopg: MagicMock,
+    mock_delete_stale: MagicMock,
+    mock_insert_validation: MagicMock,
+) -> None:
+    """If DB logging fails for a cross-case flag, the worker continues (#2371)."""
+    from ingestion.ruling_guards import ConvertedRuling
+
+    mock_insert_validation.side_effect = RuntimeError("DB connection lost")
+
+    worker, os_mock = _make_worker()
+
+    mock_conn, mock_cur = _make_mock_conn()
+    mock_psycopg.connect.return_value = mock_conn
+    mock_cur.fetchone.side_effect = [
+        ("court-uuid-1",),
+        ("case-uuid-1",),
+        (True,),
+        ("court-uuid-1",),
+        ("case-uuid-2",),
+        (True,),
+    ]
+    mock_cur.rowcount = 1
+
+    converted = [
+        ConvertedRuling(
+            document_id="split-uuid-0",
+            original_document_id="parent-uuid-1",
+            split_index=0,
+            split_count=2,
+            is_multi=True,
+            ruling_text="Case 23STCV10000: motion granted.",
+            case_number="23STCV10000",
+            case_title="Smith v. Jones",
+            judge_name="Smith, John A.",
+            department="Dept. 1",
+            motion_type=None,
+            outcome=None,
+            hearing_date="2026-03-05",
+        ),
+        ConvertedRuling(
+            document_id="split-uuid-1",
+            original_document_id="parent-uuid-1",
+            split_index=1,
+            split_count=2,
+            is_multi=True,
+            ruling_text="See ruling in 23STCV10000 for prior order details.",
+            case_number="23STCV20000",
+            case_title="Doe v. Roe",
+            judge_name="Smith, John A.",
+            department="Dept. 1",
+            motion_type=None,
+            outcome=None,
+            hearing_date="2026-03-05",
+        ),
+    ]
+
+    with patch(_CONVERT_MOCK, return_value=converted):
+        with patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1"):
+            extractor_mock = MagicMock()
+            extractor_mock.extract.return_value = MagicMock(rulings=[MagicMock()] * 2)
+            worker._framework_extractor = extractor_mock
+
+            event = _make_event(
+                ruling_text="Full document text here " * 20,
+            )
+            # Should not raise despite DB error during flag logging.
+            worker.process_event(event)
