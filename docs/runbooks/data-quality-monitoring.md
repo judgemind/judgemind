@@ -6,7 +6,16 @@ Operational procedures for the Judgemind data quality monitoring system.
 
 The data quality check runs hourly via a GitHub Actions scheduled workflow. It
 launches an ECS Fargate task that queries the dev database and compares ruling
-ingest rates and scraper activity against baselines.
+ingest rates and scraper activity against baselines. Results are persisted to
+the `data_quality_metrics` database table and displayed on the
+`/admin/data-quality` web dashboard.
+
+**Alert philosophy:** The hourly check collects metrics and detects anomalies.
+Transient conditions (zero rulings, ingest rate drops, field completeness
+fluctuations) are dashboard-only -- they historically self-resolve within hours
+and do not warrant GitHub issues or human notifications. Only persistent,
+unresolvable conditions (scraper stale >24h on a business day) trigger a
+Telegram notification to the human.
 
 | Component             | Resource                                              |
 | --------------------- | ----------------------------------------------------- |
@@ -16,6 +25,7 @@ ingest rates and scraper activity against baselines.
 | Schedule              | Hourly at :15 (cron `15 * * * *`)                     |
 | ECS Execution         | Via `scripts/ecs-run-task.sh` (oneshot Fargate task)   |
 | CloudWatch Logs       | `/ecs/judgemind-ingestion-worker-dev` (oneshot prefix) |
+| Dashboard             | `https://dev.judgemind.org/admin/data-quality`        |
 
 ---
 
@@ -28,8 +38,13 @@ ingest rates and scraper activity against baselines.
    - Creates a one-off Fargate task with the script
    - The task connects to the dev database via `DATABASE_URL` from Secrets Manager
    - Runs SQL queries to check ruling ingest rates and scraper staleness
-4. If alerts are found (exit code 1), the workflow files a GitHub issue.
-5. If all checks pass and an open `data-quality-failure` issue exists, it auto-closes.
+   - Persists per-county metrics to the `data_quality_metrics` table
+4. If P1 alerts are found, a Telegram notification is sent to the human.
+5. All alert details are visible on the `/admin/data-quality` dashboard.
+
+**No GitHub issues are filed.** Transient conditions that historically
+auto-resolve within hours are displayed on the dashboard only. This eliminates
+the ~1.8 issues/day of noise from the old design.
 
 ---
 
@@ -49,6 +64,35 @@ ingest rates and scraper activity against baselines.
 - Flags daily scrapers stale after 26 hours (24h cycle + 2h buffer), frequent scrapers after 2 hours.
 - Severity: **p1** if stale for >4x the threshold, **p2** otherwise.
 
+### Field Completeness
+- Checks per-county field completeness against baselines.
+- Flags regressions that exceed the configured thresholds.
+- Dashboard metric only -- does not trigger notifications.
+
+### Orphaned Documents
+- Checks for documents with no associated rulings.
+- Dashboard metric only -- tracked for trend analysis.
+
+### ECS Service Health
+- Checks running vs desired count for ECS services.
+- Severity: **p1** if running count is zero, **p2** otherwise.
+
+---
+
+## Alerting Behavior
+
+| Signal | Severity | Behavior |
+|--------|----------|----------|
+| Scraper stale (>26h) | p1 | Telegram notification + dashboard |
+| Zero rulings (24h) | p1 | Dashboard only |
+| ECS service unhealthy | p1/p2 | Telegram notification (if P1) + dashboard |
+| Ingest rate drop (>50%) | p2 | Dashboard only |
+| Field completeness drop | p1/p2 | Dashboard only |
+| Orphaned documents | p2 | Dashboard only |
+
+Telegram notifications are sent only for P1 alerts. All alert details are
+always available on the dashboard regardless of severity.
+
 ---
 
 ## Modifying the Schedule
@@ -62,9 +106,9 @@ on:
 ```
 
 The schedule uses UTC. Common patterns:
-- `15 * * * *` — every hour at :15
-- `15 */2 * * *` — every 2 hours at :15
-- `15 6 * * *` — once daily at 6:15 AM UTC
+- `15 * * * *` -- every hour at :15
+- `15 */2 * * *` -- every 2 hours at :15
+- `15 6 * * *` -- once daily at 6:15 AM UTC
 
 ---
 
@@ -86,7 +130,7 @@ Edit `data-quality-baselines.json` in the repo root:
 Fields:
 - `expected_daily_rulings`: Expected number of rulings per day. Used for
   zero-ruling detection (if expected > 0 but actual = 0, it's a p1 alert).
-- `schedule_type`: Either `"daily"` (6h stale threshold) or `"frequent"` (2h
+- `schedule_type`: Either `"daily"` (26h stale threshold) or `"frequent"` (2h
   stale threshold).
 
 To add a new county, add an entry to the `counties` object. To disable
@@ -140,7 +184,7 @@ county name or enable text output.
 
 ### From the command line
 ```bash
-# Run via ECS (recommended — uses the same path as the scheduled check)
+# Run via ECS (recommended -- uses the same path as the scheduled check)
 scripts/ecs-run-task.sh scripts/data-quality-check.py -- --text
 
 # Check a single county
@@ -162,14 +206,14 @@ scripts/with-secret.sh \
 - Check the ECS cluster is healthy: `aws ecs describe-clusters --clusters judgemind-dev`.
 
 ### Check runs but reports false positives
-- Review baselines in `data-quality-baselines.json` — expected values may need updating.
+- Review baselines in `data-quality-baselines.json` -- expected values may need updating.
 - Run manually with `--text` for human-readable output.
 - Check if the database has recent data: `scripts/dev-db-query.sh "SELECT county, COUNT(*) FROM documents d JOIN courts ct ON ct.id = d.court_id WHERE d.created_at > NOW() - INTERVAL '24 hours' GROUP BY county"`.
 
-### Auto-filed issues are noisy
-- Adjust thresholds in `scripts/data-quality-check.py` (constants at the top of the file).
-- The `INGEST_DROP_THRESHOLD` (default 0.5) controls how much drop triggers an alert.
-- `DAILY_SCRAPER_STALE_HOURS` (default 6) and `FREQUENT_SCRAPER_STALE_HOURS` (default 2) control staleness thresholds.
+### Dashboard shows unexpected values
+- Check the `data_quality_metrics` table for the most recent records.
+- Verify the hourly workflow is still running in the Actions tab.
+- Run the check manually with `--text` to compare with dashboard values.
 
 ### Workflow not running on schedule
 - GitHub Actions scheduled workflows may be disabled after 60 days of repo inactivity.

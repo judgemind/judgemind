@@ -248,6 +248,35 @@ def get_max_severity(data: dict[str, Any]) -> str:
     return "p2"
 
 
+# Metrics that indicate persistent, unresolvable conditions warranting
+# human notification.  Transient metrics (zero_rulings, ingest_rate,
+# field_completeness, orphaned_documents) historically auto-resolve
+# within hours and are dashboard-only.
+_PERSISTENT_ALERT_METRICS = {"scraper_stale", "ecs_service_health"}
+
+
+def has_persistent_alerts(data: dict[str, Any]) -> bool:
+    """Check if the alert data contains P1 alerts for persistent conditions.
+
+    Only ``scraper_stale`` and ``ecs_service_health`` P1 alerts are considered
+    persistent.  Other P1 alerts (e.g. zero_rulings) are transient and should
+    not trigger human notifications.
+
+    Args:
+        data: Parsed JSON alert data with 'alerts' list.
+
+    Returns:
+        True if at least one P1 alert for a persistent metric exists.
+    """
+    for alert in data.get("alerts", []):
+        if (
+            alert.get("severity") == "p1"
+            and alert.get("metric") in _PERSISTENT_ALERT_METRICS
+        ):
+            return True
+    return False
+
+
 def format_telegram_summary(data: dict[str, Any]) -> str:
     """Format alert data as a concise one-line Telegram summary.
 
@@ -278,12 +307,13 @@ def main() -> None:
     """CLI entry point."""
     telegram_mode = "--telegram" in sys.argv
     max_severity_mode = "--max-severity" in sys.argv
-    flags = {"--telegram", "--max-severity"}
+    persistent_mode = "--has-persistent-alerts" in sys.argv
+    flags = {"--telegram", "--max-severity", "--has-persistent-alerts"}
     args = [a for a in sys.argv[1:] if a not in flags]
 
     if not args:
         print(
-            "Usage: format-dq-summary.py [--telegram|--max-severity] <file|->",
+            "Usage: format-dq-summary.py [--telegram|--max-severity|--has-persistent-alerts] <file|->",
             file=sys.stderr,
         )
         sys.exit(1)
@@ -300,7 +330,11 @@ def main() -> None:
         print("Could not extract alert data from output.", file=sys.stderr)
         sys.exit(1)
 
-    if max_severity_mode:
+    if persistent_mode:
+        # Exit 0 if persistent alerts exist (truthy), 1 otherwise.
+        # This makes it easy to use in shell conditionals.
+        print("true" if has_persistent_alerts(data) else "false")
+    elif max_severity_mode:
         print(get_max_severity(data))
     elif telegram_mode:
         print(format_telegram_summary(data))

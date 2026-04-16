@@ -23,7 +23,6 @@ concurrency:
   cancel-in-progress: true
 
 permissions:
-  issues: write
   contents: read
 
 env:
@@ -90,11 +89,6 @@ jobs:
 
           echo "exit_code=$EXIT_CODE" >> "$GITHUB_OUTPUT"
 
-          # Extract the ECS task ID from the captured output so downstream
-          # steps can fetch logs directly from CloudWatch if needed.
-          TASK_ID=$(grep 'Task ID:' /tmp/check_output.txt | tail -1 | awk '{print $NF}' || true)
-          echo "task_id=$TASK_ID" >> "$GITHUB_OUTPUT"
-
           if [ "$EXIT_CODE" -eq 0 ]; then
             echo "healthy=true" >> "$GITHUB_OUTPUT"
             echo "Data quality check passed: all counties healthy."
@@ -103,265 +97,44 @@ jobs:
             echo "Data quality check found alerts (exit code $EXIT_CODE)."
           fi
 
-      - name: Extract alert summary
+      # Alerts are dashboard-only. No GitHub issues are filed.
+      # Telegram notification is sent only for persistent, unresolvable
+      # conditions (scraper stale >24h on a business day). Transient
+      # conditions (zero rulings, field completeness drops, ingest rate
+      # drops) historically auto-resolve within hours and are visible
+      # on the /admin/data-quality dashboard.
+      - name: Extract alert summary for Telegram
         if: steps.check.outputs.healthy == 'false'
         id: summary
         run: |
-          # Extract a markdown summary, a Telegram one-liner, and the max
-          # severity from the captured ECS task output. format-dq-summary.py
-          # parses the JSON alert payload emitted by data-quality-check.py.
-          MARKDOWN=$(python3 scripts/format-dq-summary.py /tmp/check_output.txt 2>/dev/null || echo "Could not extract alert details from check output.")
           TELEGRAM=$(python3 scripts/format-dq-summary.py --telegram /tmp/check_output.txt 2>/dev/null || echo "Alert details unavailable.")
-          MAX_SEVERITY=$(python3 scripts/format-dq-summary.py --max-severity /tmp/check_output.txt 2>/dev/null || echo "p1")
-
-          # Write to files for downstream steps (avoids quoting issues in
-          # GITHUB_OUTPUT for multi-line content).
-          echo "$MARKDOWN" > /tmp/alert_summary.md
           echo "$TELEGRAM" > /tmp/alert_telegram.txt
 
-          echo "max_severity=$MAX_SEVERITY" >> "$GITHUB_OUTPUT"
+          # Check if any P1 alerts are for persistent conditions (scraper_stale,
+          # ecs_service_health). Transient P1 alerts (zero_rulings) are
+          # dashboard-only and do not trigger Telegram notifications.
+          HAS_PERSISTENT=$(python3 scripts/format-dq-summary.py --has-persistent-alerts /tmp/check_output.txt 2>/dev/null || echo "false")
+          echo "has_persistent_alerts=$HAS_PERSISTENT" >> "$GITHUB_OUTPUT"
 
-          echo "Alert summary extracted (max severity: $MAX_SEVERITY):"
-          cat /tmp/alert_summary.md
+          echo "Alert summary (persistent alerts: $HAS_PERSISTENT): $TELEGRAM"
 
-      - name: Retry alert extraction from CloudWatch logs
-        id: retry-extraction
+      - name: Send Telegram notification for persistent P1 alerts
         if: >-
           steps.check.outputs.healthy == 'false' &&
-          steps.check.outputs.task_id != ''
-        env:
-          TASK_ID: ${{ steps.check.outputs.task_id }}
-          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-        run: |
-          # If the initial extraction produced the fallback message, it means
-          # format-dq-summary.py could not parse the captured ECS output.
-          # This typically happens when CloudWatch log delivery is delayed —
-          # ecs-run-task.sh streams logs in real-time but may miss the final
-          # output lines.
-          #
-          # Defense-in-depth: independently retrieve logs from CloudWatch
-          # post-hoc and re-run the extraction.
-          if ! grep -q "Could not extract alert details" /tmp/alert_summary.md 2>/dev/null; then
-            echo "Initial extraction succeeded — no retry needed."
-            exit 0
-          fi
-
-          echo "Initial extraction failed — retrying via CloudWatch logs."
-          LOG_GROUP="/ecs/judgemind-ingestion-worker-dev"
-          MAX_RETRIES=3
-          RETRY=0
-          EXTRACTED=false
-
-          while [ "$RETRY" -lt "$MAX_RETRIES" ]; do
-            RETRY=$((RETRY + 1))
-            # Exponential backoff: 15s, 30s, 60s
-            WAIT=$((15 * (1 << (RETRY - 1))))
-            echo "Retry $RETRY/$MAX_RETRIES: waiting ${WAIT}s for CloudWatch log delivery..."
-            sleep "$WAIT"
-
-            # Fetch logs directly from CloudWatch using the task ID
-            if scripts/ecs-logs.sh "$LOG_GROUP" --task "$TASK_ID" --lines 200 > /tmp/retry_output.txt 2>/dev/null; then
-              echo "Retrieved $(wc -l < /tmp/retry_output.txt) lines from CloudWatch."
-
-              # Re-run format-dq-summary.py on the fresh output
-              RETRY_MARKDOWN=$(python3 scripts/format-dq-summary.py /tmp/retry_output.txt 2>/dev/null || true)
-              if [ -n "$RETRY_MARKDOWN" ]; then
-                echo "Retry $RETRY: extraction succeeded."
-                echo "$RETRY_MARKDOWN" > /tmp/alert_summary.md
-
-                RETRY_TELEGRAM=$(python3 scripts/format-dq-summary.py --telegram /tmp/retry_output.txt 2>/dev/null || echo "Alert details unavailable.")
-                echo "$RETRY_TELEGRAM" > /tmp/alert_telegram.txt
-
-                RETRY_SEVERITY=$(python3 scripts/format-dq-summary.py --max-severity /tmp/retry_output.txt 2>/dev/null || echo "p1")
-                echo "max_severity=$RETRY_SEVERITY" >> "$GITHUB_OUTPUT"
-
-                EXTRACTED=true
-                break
-              else
-                echo "Retry $RETRY: extraction still failed — log content may be incomplete."
-              fi
-            else
-              echo "Retry $RETRY: could not retrieve logs from CloudWatch."
-            fi
-          done
-
-          if [ "$EXTRACTED" = "false" ]; then
-            echo "All $MAX_RETRIES retries failed. Adding extraction failure note."
-            {
-              echo "**Warning:** Could not extract alert details from check output."
-              echo "CloudWatch log retrieval failed after $MAX_RETRIES retries."
-              echo ""
-              echo "Inspect the workflow run logs manually for alert details:"
-              echo "${RUN_URL}"
-            } > /tmp/alert_summary.md
-
-            echo "Alert details unavailable — see workflow run logs." > /tmp/alert_telegram.txt
-          fi
-
-      - name: Check for existing open issue
-        if: steps.check.outputs.healthy == 'false'
-        id: existing
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          EXISTING=$(gh issue list \
-            --repo "${{ github.repository }}" \
-            --state open \
-            --label "data-quality-failure" \
-            --json number \
-            --limit 1 \
-            -q '.[0].number // empty')
-
-          if [ -n "$EXISTING" ]; then
-            echo "exists=true" >> "$GITHUB_OUTPUT"
-            echo "number=$EXISTING" >> "$GITHUB_OUTPUT"
-            echo "Open data-quality issue already exists: #${EXISTING}"
-          else
-            echo "exists=false" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Create failure issue
-        id: create-issue
-        if: >-
-          steps.check.outputs.healthy == 'false' &&
-          steps.existing.outputs.exists == 'false'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-          MAX_SEVERITY_SUMMARY: ${{ steps.summary.outputs.max_severity }}
-          MAX_SEVERITY_RETRY: ${{ steps.retry-extraction.outputs.max_severity }}
-        run: |
-          TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-
-          # Use the retry step's severity if available (it ran after the initial
-          # extraction and may have updated the value). Fall back to the initial
-          # extraction's severity, then default to p1.
-          MAX_SEVERITY="${MAX_SEVERITY_RETRY:-${MAX_SEVERITY_SUMMARY:-p1}}"
-
-          # Use the max alert severity to set the issue priority label.
-          # p1 alerts (zero rulings, very stale) -> priority/p1
-          # p2-only alerts (ingest rate drops, moderately stale) -> priority/p2
-          PRIORITY_LABEL="priority/${MAX_SEVERITY}"
-
-          {
-            echo "## Data Quality Check Failure"
-            echo ""
-            echo "The hourly data quality check detected collection health issues in the dev database."
-            echo ""
-            echo "### Alert Summary"
-            echo ""
-            cat /tmp/alert_summary.md
-            echo ""
-            echo ""
-            echo "### Context"
-            echo ""
-            echo "- **Workflow run:** ${RUN_URL}"
-            echo "- **Timestamp:** ${TIMESTAMP}"
-            echo "- **Max alert severity:** ${MAX_SEVERITY:-p1}"
-            echo "- **Check script:** \`scripts/data-quality-check.py\`"
-            echo "- **Baselines:** \`data-quality-baselines.json\`"
-            echo ""
-            echo "### Possible Causes"
-            echo ""
-            echo "- Scraper failure or court site change (zero rulings, stale scraper)"
-            echo "- Ingest rate drop (>50% below 7-day average)"
-            echo "- Database connectivity issues"
-            echo ""
-            echo "### Next Steps"
-            echo ""
-            echo "1. Review the alert details above to understand what failed"
-            echo "2. Run manually: \`scripts/ecs-run-task.sh scripts/data-quality-check.py -- --text\`"
-            echo "3. Check scraper logs: \`scripts/ecs-logs.sh /ecs/judgemind-scraper-dev --lines 100\`"
-            echo "4. Review recent scraper deployments"
-            echo ""
-            echo "This issue was created automatically by the data quality check workflow."
-            echo "It will not create duplicates while this issue is open."
-          } > /tmp/issue_body.md
-
-          ISSUE_URL=$(gh issue create \
-            --repo "${{ github.repository }}" \
-            --title "Data quality regression: collection health alerts on dev" \
-            --body-file /tmp/issue_body.md \
-            --label "${PRIORITY_LABEL},area/scraping,data-quality-failure,agent/ready")
-
-          echo "issue_url=$ISSUE_URL" >> "$GITHUB_OUTPUT"
-          echo "created=true" >> "$GITHUB_OUTPUT"
-
-      - name: Send Telegram notification
-        if: steps.create-issue.outputs.created == 'true'
+          steps.summary.outputs.has_persistent_alerts == 'true'
         continue-on-error: true
+        env:
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
-          ISSUE_URL="${{ steps.create-issue.outputs.issue_url }}"
-          ISSUE_NUM="${ISSUE_URL##*/}"
           TG_SUMMARY=$(cat /tmp/alert_telegram.txt 2>/dev/null || echo "Alert details unavailable.")
 
           {
-            echo "<b>Data Quality Alert</b>"
+            echo "<b>Data Quality Alert (P1)</b>"
             echo ""
             echo "${TG_SUMMARY}"
             echo ""
-            echo "Issue #${ISSUE_NUM}: ${ISSUE_URL}"
+            echo "Dashboard: https://dev.judgemind.org/admin/data-quality"
+            echo "Workflow: ${RUN_URL}"
           } > /tmp/tg_message.txt
 
           scripts/notify-telegram.sh --message-file /tmp/tg_message.txt
-
-      - name: Update existing issue with new failures
-        if: >-
-          steps.check.outputs.healthy == 'false' &&
-          steps.existing.outputs.exists == 'true'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          ISSUE_NUM: ${{ steps.existing.outputs.number }}
-          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-        run: |
-          TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-
-          {
-            echo "### Update: Still failing at ${TIMESTAMP}"
-            echo ""
-            cat /tmp/alert_summary.md
-            echo ""
-            echo ""
-            echo "**Workflow run:** ${RUN_URL}"
-          } > /tmp/comment_body.md
-
-          gh issue comment "$ISSUE_NUM" \
-            --repo "${{ github.repository }}" \
-            --body-file /tmp/comment_body.md
-
-      - name: Auto-close resolved quality issues
-        if: steps.check.outputs.healthy == 'true'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-        run: |
-          # Find all open issues with the data-quality-failure label
-          ISSUES=$(gh issue list \
-            --repo "${{ github.repository }}" \
-            --state open \
-            --label "data-quality-failure" \
-            --json number \
-            -q '.[].number')
-
-          if [ -z "$ISSUES" ]; then
-            echo "No open data-quality-failure issues to close."
-            exit 0
-          fi
-
-          for ISSUE_NUM in $ISSUES; do
-            echo "Closing data-quality issue #${ISSUE_NUM} — all checks are passing."
-
-            {
-              echo "All data quality checks are now passing. Auto-closing this issue."
-              echo ""
-              echo "**Passing workflow run:** ${RUN_URL}"
-            } > /tmp/close_comment.md
-
-            gh issue comment "$ISSUE_NUM" \
-              --repo "${{ github.repository }}" \
-              --body-file /tmp/close_comment.md
-
-            gh issue close "$ISSUE_NUM" \
-              --repo "${{ github.repository }}" \
-              --reason completed
-          done

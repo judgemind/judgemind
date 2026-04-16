@@ -18,6 +18,7 @@ extract_json_from_output = fds.extract_json_from_output
 format_markdown_summary = fds.format_markdown_summary
 format_telegram_summary = fds.format_telegram_summary
 get_max_severity = fds.get_max_severity
+has_persistent_alerts = fds.has_persistent_alerts
 
 
 class TestExtractJsonFromOutput:
@@ -349,3 +350,88 @@ class TestFormatTelegramSummary:
         assert "1 P2" in result
         assert "Los Angeles" in result
         assert "Orange" in result
+
+
+class TestHasPersistentAlerts:
+    """Tests for has_persistent_alerts — filters P1 alerts by metric type."""
+
+    def test_empty_alerts(self) -> None:
+        """Returns False when no alerts exist."""
+        assert has_persistent_alerts({"alerts": []}) is False
+
+    def test_no_p1_alerts(self) -> None:
+        """Returns False when all alerts are P2."""
+        data = {
+            "alerts": [
+                {"severity": "p2", "metric": "scraper_stale"},
+                {"severity": "p2", "metric": "ingest_rate"},
+            ]
+        }
+        assert has_persistent_alerts(data) is False
+
+    def test_p1_zero_rulings_not_persistent(self) -> None:
+        """Returns False for P1 zero_rulings (transient condition)."""
+        data = {
+            "alerts": [
+                {"severity": "p1", "metric": "zero_rulings"},
+            ]
+        }
+        assert has_persistent_alerts(data) is False
+
+    def test_p1_ingest_rate_not_persistent(self) -> None:
+        """Returns False for P1 ingest_rate (transient condition)."""
+        data = {
+            "alerts": [
+                {"severity": "p1", "metric": "ingest_rate"},
+            ]
+        }
+        assert has_persistent_alerts(data) is False
+
+    def test_p1_field_completeness_not_persistent(self) -> None:
+        """Returns False for P1 field_completeness (transient condition)."""
+        data = {
+            "alerts": [
+                {"severity": "p1", "metric": "field_completeness"},
+            ]
+        }
+        assert has_persistent_alerts(data) is False
+
+    def test_p1_scraper_stale_is_persistent(self) -> None:
+        """Returns True for P1 scraper_stale alert."""
+        data = {
+            "alerts": [
+                {"severity": "p1", "metric": "scraper_stale"},
+            ]
+        }
+        assert has_persistent_alerts(data) is True
+
+    def test_p1_ecs_service_health_is_persistent(self) -> None:
+        """Returns True for P1 ecs_service_health alert."""
+        data = {
+            "alerts": [
+                {"severity": "p1", "metric": "ecs_service_health"},
+            ]
+        }
+        assert has_persistent_alerts(data) is True
+
+    def test_mixed_with_one_persistent(self) -> None:
+        """Returns True when at least one P1 persistent alert exists."""
+        data = {
+            "alerts": [
+                {"severity": "p1", "metric": "zero_rulings"},
+                {"severity": "p2", "metric": "ingest_rate"},
+                {"severity": "p1", "metric": "scraper_stale"},
+            ]
+        }
+        assert has_persistent_alerts(data) is True
+
+    def test_mixed_all_transient(self) -> None:
+        """Returns False when all P1 alerts are transient."""
+        data = {
+            "alerts": [
+                {"severity": "p1", "metric": "zero_rulings"},
+                {"severity": "p1", "metric": "ingest_rate"},
+                {"severity": "p2", "metric": "scraper_stale"},
+            ]
+        }
+        assert has_persistent_alerts(data) is False
