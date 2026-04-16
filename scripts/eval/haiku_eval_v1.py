@@ -57,7 +57,7 @@ RESULTS_DIR = Path(__file__).resolve().parent / "results"
 MODELS = {
     "haiku": _HAIKU_MODEL,
     "sonnet": "claude-sonnet-4-6",
-    "opus": "claude-opus-4-6",
+    "opus": "claude-opus-4-7",
 }
 
 # Fields we want to extract
