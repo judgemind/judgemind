@@ -8,6 +8,9 @@ Covers the three spotcheck findings from issue #2329:
 - LA ruling with raw HTML (no_html_in_ruling_text -> fail)
 - SD ruling with wrong hearing date (hearing_date_in_range -> fail)
 - Fresno ruling with concatenated titles (no_concatenated_titles -> flag)
+
+Also covers document-level validation (#2350):
+- Duplicate ruling text lengths across split events (no_duplicate_ruling_text -> flag)
 """
 
 from __future__ import annotations
@@ -364,3 +367,242 @@ def test_det_validation_flag_db_error_does_not_crash(
     event = _make_event(ruling_text="")  # triggers flag for empty text
     # Should not raise despite DB error during flag logging
     worker.process_event(event)
+
+
+# ---------------------------------------------------------------------------
+# Tests: document-level deterministic validation — duplicate ruling text (#2350)
+# ---------------------------------------------------------------------------
+
+_CONVERT_MOCK = "ingestion.worker.convert_extracted_rulings"
+_DELETE_STALE_MOCK = "ingestion.worker.delete_stale_split_children"
+
+
+@patch("ingestion.worker.insert_validation_result")
+@patch(_DELETE_STALE_MOCK, return_value=0)
+@patch("ingestion.worker.psycopg")
+def test_det_validation_flag_duplicate_ruling_text_lengths(
+    mock_psycopg: MagicMock,
+    mock_delete_stale: MagicMock,
+    mock_insert_validation: MagicMock,
+) -> None:
+    """Three split rulings with identical text lengths should flag for review (#2350)."""
+    from ingestion.ruling_guards import ConvertedRuling
+
+    worker, os_mock = _make_worker()
+
+    mock_conn, mock_cur = _make_mock_conn()
+    mock_psycopg.connect.return_value = mock_conn
+    # Each split event goes through process_event, which needs DB results.
+    # 3 rulings x (court + case + document) = 9 fetchone calls.
+    mock_cur.fetchone.side_effect = [
+        ("court-uuid-1",),  # upsert_court (split 0)
+        ("case-uuid-1",),  # upsert_case (split 0)
+        (True,),  # insert_document (split 0)
+        ("court-uuid-1",),  # upsert_court (split 1)
+        ("case-uuid-2",),  # upsert_case (split 1)
+        (True,),  # insert_document (split 1)
+        ("court-uuid-1",),  # upsert_court (split 2)
+        ("case-uuid-3",),  # upsert_case (split 2)
+        (True,),  # insert_document (split 2)
+    ]
+    mock_cur.rowcount = 1
+
+    # Create 3 ConvertedRuling objects with identical ruling_text lengths.
+    same_length_text = "The motion is GRANTED." * 10  # 220 chars
+    converted = [
+        ConvertedRuling(
+            document_id=f"split-uuid-{i}",
+            original_document_id="parent-uuid-1",
+            split_index=i,
+            split_count=3,
+            is_multi=True,
+            ruling_text=same_length_text,
+            case_number=f"23STCV1234{i}",
+            case_title=f"Smith{i} v. Jones{i}",
+            judge_name="Smith, John A.",
+            department="Dept. 1",
+            motion_type="Motion for Summary Judgment",
+            outcome="granted",
+            hearing_date="2026-03-05",
+        )
+        for i in range(3)
+    ]
+
+    # Mock _llm_split_document internals: skip the LLM call, jump straight
+    # to the conversion + validation + dispatch logic.  We patch
+    # convert_extracted_rulings to return our prepared ConvertedRuling list.
+    with patch(_CONVERT_MOCK, return_value=converted):
+        with patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1"):
+            # Create a minimal extractor mock so _llm_split_document proceeds.
+            extractor_mock = MagicMock()
+            extractor_mock.extract.return_value = MagicMock(rulings=[MagicMock()] * 3)
+            worker._framework_extractor = extractor_mock
+
+            event = _make_event(
+                ruling_text="Full document text here " * 20,
+            )
+            worker.process_event(event)
+
+    # insert_validation_result should be called with a flag for duplicate lengths.
+    # Filter for the duplicate-text deterministic call.
+    dup_calls = [
+        c
+        for c in mock_insert_validation.call_args_list
+        if c.kwargs.get("result")
+        and c.kwargs["result"].model == "deterministic"
+        and "duplicate ruling_text lengths" in (c.kwargs["result"].reason or "")
+    ]
+    assert len(dup_calls) >= 1, (
+        f"Expected a duplicate ruling text flag, got calls: "
+        f"{[c.kwargs.get('result') for c in mock_insert_validation.call_args_list]}"
+    )
+    dup_result = dup_calls[0].kwargs["result"]
+    assert dup_result.result == "flag"
+    assert f"length {len(same_length_text)} appears 3 times" in dup_result.reason
+
+
+@patch("ingestion.worker.insert_validation_result")
+@patch(_DELETE_STALE_MOCK, return_value=0)
+@patch("ingestion.worker.psycopg")
+def test_det_validation_pass_distinct_ruling_text_lengths(
+    mock_psycopg: MagicMock,
+    mock_delete_stale: MagicMock,
+    mock_insert_validation: MagicMock,
+) -> None:
+    """Split rulings with distinct text lengths should not flag (#2350)."""
+    from ingestion.ruling_guards import ConvertedRuling
+
+    worker, os_mock = _make_worker()
+
+    mock_conn, mock_cur = _make_mock_conn()
+    mock_psycopg.connect.return_value = mock_conn
+    mock_cur.fetchone.side_effect = [
+        ("court-uuid-1",),
+        ("case-uuid-1",),
+        (True,),
+        ("court-uuid-1",),
+        ("case-uuid-2",),
+        (True,),
+    ]
+    mock_cur.rowcount = 1
+
+    # Create 2 ConvertedRuling objects with different ruling_text lengths.
+    converted = [
+        ConvertedRuling(
+            document_id="split-uuid-0",
+            original_document_id="parent-uuid-1",
+            split_index=0,
+            split_count=2,
+            is_multi=True,
+            ruling_text="Short ruling text.",
+            case_number="23STCV12340",
+            case_title="Smith v. Jones",
+            judge_name="Smith, John A.",
+            department="Dept. 1",
+            motion_type="Motion for Summary Judgment",
+            outcome="granted",
+            hearing_date="2026-03-05",
+        ),
+        ConvertedRuling(
+            document_id="split-uuid-1",
+            original_document_id="parent-uuid-1",
+            split_index=1,
+            split_count=2,
+            is_multi=True,
+            ruling_text="A much longer ruling text that discusses the merits in great detail.",
+            case_number="23STCV12341",
+            case_title="Doe v. Roe",
+            judge_name="Smith, John A.",
+            department="Dept. 1",
+            motion_type="Demurrer",
+            outcome="denied",
+            hearing_date="2026-03-05",
+        ),
+    ]
+
+    with patch(_CONVERT_MOCK, return_value=converted):
+        with patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1"):
+            extractor_mock = MagicMock()
+            extractor_mock.extract.return_value = MagicMock(rulings=[MagicMock()] * 2)
+            worker._framework_extractor = extractor_mock
+
+            event = _make_event(
+                ruling_text="Full document text here " * 20,
+            )
+            worker.process_event(event)
+
+    # No duplicate ruling text flag should have been logged.
+    dup_calls = [
+        c
+        for c in mock_insert_validation.call_args_list
+        if c.kwargs.get("result")
+        and c.kwargs["result"].model == "deterministic"
+        and "duplicate ruling_text lengths" in (c.kwargs["result"].reason or "")
+    ]
+    assert len(dup_calls) == 0, (
+        f"Unexpected duplicate ruling text flag: "
+        f"{[c.kwargs.get('result') for c in mock_insert_validation.call_args_list]}"
+    )
+
+
+@patch("ingestion.worker.insert_validation_result")
+@patch(_DELETE_STALE_MOCK, return_value=0)
+@patch("ingestion.worker.psycopg")
+def test_det_validation_duplicate_flag_db_error_does_not_crash(
+    mock_psycopg: MagicMock,
+    mock_delete_stale: MagicMock,
+    mock_insert_validation: MagicMock,
+) -> None:
+    """If DB logging fails for a duplicate ruling text flag, the worker continues (#2350)."""
+    from ingestion.ruling_guards import ConvertedRuling
+
+    mock_insert_validation.side_effect = RuntimeError("DB connection lost")
+
+    worker, os_mock = _make_worker()
+
+    mock_conn, mock_cur = _make_mock_conn()
+    mock_psycopg.connect.return_value = mock_conn
+    mock_cur.fetchone.side_effect = [
+        ("court-uuid-1",),
+        ("case-uuid-1",),
+        (True,),
+        ("court-uuid-1",),
+        ("case-uuid-2",),
+        (True,),
+        ("court-uuid-1",),
+        ("case-uuid-3",),
+        (True,),
+    ]
+    mock_cur.rowcount = 1
+
+    same_length_text = "Identical ruling text." * 5
+    converted = [
+        ConvertedRuling(
+            document_id=f"split-uuid-{i}",
+            original_document_id="parent-uuid-1",
+            split_index=i,
+            split_count=3,
+            is_multi=True,
+            ruling_text=same_length_text,
+            case_number=f"23STCV1234{i}",
+            case_title=f"Case{i} v. Other{i}",
+            judge_name="Smith, John A.",
+            department="Dept. 1",
+            motion_type=None,
+            outcome=None,
+            hearing_date="2026-03-05",
+        )
+        for i in range(3)
+    ]
+
+    with patch(_CONVERT_MOCK, return_value=converted):
+        with patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1"):
+            extractor_mock = MagicMock()
+            extractor_mock.extract.return_value = MagicMock(rulings=[MagicMock()] * 3)
+            worker._framework_extractor = extractor_mock
+
+            event = _make_event(
+                ruling_text="Full document text here " * 20,
+            )
+            # Should not raise despite DB error during flag logging
+            worker.process_event(event)
