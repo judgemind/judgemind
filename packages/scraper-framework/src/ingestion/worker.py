@@ -47,6 +47,7 @@ from framework.enrichment import EnrichmentEngine
 from framework.llm_extractor import LlmExtractor
 from framework.search.indexer import IndexingConsumer
 from framework.search.mapping import TENTATIVE_RULINGS_ALIAS
+from validation.deterministic import run_deterministic_rules
 from validation.gate import ValidationResult, insert_validation_result, validate_document
 from validation.issue_filer import file_validation_issue
 
@@ -1361,6 +1362,96 @@ class IngestionWorker:
                     "summary_length": len(summary) if summary else 0,
                 },
             )
+
+        # ------------------------------------------------------------------
+        # Deterministic validation rules — cheap, rule-based checks that
+        # run on every document (#2329).  These catch obvious structural
+        # failures (raw HTML, wrong dates, concatenated titles) without
+        # requiring an LLM call.  Runs before the LLM validation gate.
+        # ------------------------------------------------------------------
+        captured_at_date: date | None = capture_ts.date() if capture_ts else None
+        det_result = run_deterministic_rules(
+            ruling_text=cleaned_ruling_text,
+            case_number=case_number or f"UNKNOWN-{document_id}",
+            case_title=case_title,
+            hearing_date=hearing_dt,
+            captured_at=captured_at_date,
+        )
+
+        if det_result.overall != "pass":
+            logger.info(
+                "Deterministic validation result",
+                extra={
+                    "document_id": document_id,
+                    "det_overall": det_result.overall,
+                    "det_failed_rules": [r.rule for r in det_result.failed_rules],
+                    "det_flagged_rules": [r.rule for r in det_result.flagged_rules],
+                    "det_reasons": det_result.reasons,
+                    "county": county,
+                    "case_number": case_number,
+                },
+            )
+
+        if det_result.overall == "fail":
+            # Convert to a ValidationResult for DB logging.
+            det_validation_result = ValidationResult(
+                result="fail",
+                reason="; ".join(det_result.reasons),
+                model="deterministic",
+                input_tokens=0,
+                output_tokens=0,
+                latency_ms=0,
+            )
+            logger.warning(
+                "Deterministic validation FAIL — skipping DB write",
+                extra={
+                    "document_id": document_id,
+                    "det_reasons": det_result.reasons,
+                    "county": county,
+                    "case_number": case_number,
+                },
+            )
+            try:
+                conn = self._get_connection()
+                insert_validation_result(
+                    conn,
+                    document_id=document_id,
+                    ruling_id=None,
+                    result=det_validation_result,
+                )
+                conn.commit()
+            except Exception as exc:
+                logger.warning(
+                    "Failed to log deterministic validation result to DB: %s",
+                    exc,
+                )
+            return
+
+        if det_result.overall == "flag":
+            # Log flag results as ValidationResult for monitoring.
+            det_validation_result = ValidationResult(
+                result="flag",
+                reason="; ".join(det_result.reasons),
+                model="deterministic",
+                input_tokens=0,
+                output_tokens=0,
+                latency_ms=0,
+            )
+            try:
+                conn = self._get_connection()
+                insert_validation_result(
+                    conn,
+                    document_id=document_id,
+                    ruling_id=None,
+                    result=det_validation_result,
+                )
+                conn.commit()
+            except Exception as exc:
+                logger.warning(
+                    "Failed to log deterministic validation flag to DB: %s",
+                    exc,
+                )
+            # Continue to DB write — flag does not block.
 
         # ------------------------------------------------------------------
         # Validation gate — LLM-based quality check (opt-in via
