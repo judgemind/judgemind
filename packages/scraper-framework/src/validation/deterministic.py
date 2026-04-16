@@ -47,10 +47,20 @@ _HTML_START_MARKERS = (
     "<div",
 )
 
-# Pattern to detect multiple v./vs. separators in a case title,
-# indicating multi-case contamination.
+# Pattern to detect multiple v./vs./vs separators in a case title,
+# indicating multi-case contamination.  Matches (case-insensitive):
+#
+#   - ``v.`` followed by whitespace        (e.g. "Smith v. Jones")
+#   - ``vs.`` followed by whitespace       (e.g. "TAYLOR VS. AMAZON")
+#   - ``vs`` (no period) with whitespace on both sides  (e.g. "Yin vs Lu")
+#
+# The bare ``vs`` form requires whitespace on BOTH sides (``\bvs\b`` plus
+# explicit leading/trailing whitespace) to avoid false positives from words
+# containing "vs" (e.g. "Versus" → the ``\b`` handles this, but being strict
+# also excludes tokens like "vs.Anything" that are covered by the ``vs.``
+# branch above).  #2398.
 _MULTI_VS_PATTERN = re.compile(
-    r"(?:\bv\.\s|\bvs\.\s)",
+    r"(?:\bv\.\s|\bvs\.\s|\s+vs\s+)",
     re.IGNORECASE,
 )
 
@@ -176,24 +186,37 @@ def check_hearing_date_in_range(
     return DeterministicRuleResult(rule="hearing_date_in_range", result="pass")
 
 
-def check_no_concatenated_titles(case_title: str | None) -> DeterministicRuleResult:
-    """Check that case_title does not contain multiple v./vs. separators.
+def check_no_multiple_adversarial_patterns(case_title: str | None) -> DeterministicRuleResult:
+    """Check that case_title does not contain multiple adversarial (v./vs./vs) patterns.
 
-    A case title with multiple ``v.`` or ``vs.`` separators usually indicates
-    multi-case contamination where titles from several cases were concatenated.
+    A case title with two or more ``v.``, ``vs.``, or ``vs`` separators usually
+    indicates multi-case contamination where titles from several cases were
+    concatenated during LLM extraction from a multi-case document (#2371, #2398).
+
+    Examples of contaminated titles this rule flags:
+
+    - ``"TAYLOR VS. AMAZON MSC21-02349 Amazon.com, Inc. v. Damien Sean Lamont Ross"``
+      (``VS.`` and ``v.`` both present → 2 matches).
+    - ``"Liangbei Wang v. NetEase, Inc., et al. Manuel Panilag v. Armando Contreras
+      et al. Jin Yin, et al vs Xiaoxiao Lu, et al."`` (three separators: two
+      ``v.`` and one bare ``vs`` → 3 matches).
+
+    Matches ``v.``, ``vs.``, and bare ``vs`` tokens followed by whitespace,
+    case-insensitive, using word boundaries (``\\b``) to avoid matching ``v.``
+    or ``vs`` in the middle of words.  Threshold: 2 or more matches → ``flag``.
     """
     if not case_title:
-        return DeterministicRuleResult(rule="no_concatenated_titles", result="pass")
+        return DeterministicRuleResult(rule="no_multiple_adversarial_patterns", result="pass")
 
     matches = _MULTI_VS_PATTERN.findall(case_title)
-    if len(matches) > 1:
+    if len(matches) >= 2:
         return DeterministicRuleResult(
-            rule="no_concatenated_titles",
+            rule="no_multiple_adversarial_patterns",
             result="flag",
             reason=f"case_title contains {len(matches)} 'v.'/'vs.' separators — "
             "likely multi-case contamination",
         )
-    return DeterministicRuleResult(rule="no_concatenated_titles", result="pass")
+    return DeterministicRuleResult(rule="no_multiple_adversarial_patterns", result="pass")
 
 
 def check_ruling_text_not_empty(ruling_text: str | None) -> DeterministicRuleResult:
@@ -434,7 +457,7 @@ def run_deterministic_rules(
     results: list[DeterministicRuleResult] = [
         check_no_html_in_ruling_text(ruling_text),
         check_hearing_date_in_range(hearing_date, captured_at),
-        check_no_concatenated_titles(case_title),
+        check_no_multiple_adversarial_patterns(case_title),
         check_ruling_text_not_empty(ruling_text),
         check_case_number_not_unknown(case_number),
         check_ruling_text_reasonable_length(ruling_text),

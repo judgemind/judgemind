@@ -7,7 +7,7 @@ and logs validation results to the DB.
 Covers the three spotcheck findings from issue #2329:
 - LA ruling with raw HTML (no_html_in_ruling_text -> fail)
 - SD ruling with wrong hearing date (hearing_date_in_range -> fail)
-- Fresno ruling with concatenated titles (no_concatenated_titles -> flag)
+- Fresno ruling with concatenated titles (no_multiple_adversarial_patterns -> flag)
 
 Also covers document-level validation (#2350):
 - Duplicate ruling text lengths across split events (no_duplicate_ruling_text -> flag)
@@ -260,6 +260,80 @@ def test_det_validation_flag_concatenated_title_still_writes(
     det_result = det_calls[0].kwargs["result"]
     assert det_result.result == "flag"
     assert "multi-case contamination" in (det_result.reason or "")
+
+
+# ---------------------------------------------------------------------------
+# Tests: deterministic validation — flag (multiple adversarial patterns, #2398)
+# ---------------------------------------------------------------------------
+
+
+@patch("ingestion.worker.insert_validation_result")
+@patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
+@patch(_EXTRACT_LLM_MOCK, return_value=None)
+@patch(_SPLIT_MOCK, return_value=False)
+@patch("ingestion.worker.psycopg")
+def test_det_validation_flag_multiple_adversarial_patterns_issue_2398_example(
+    mock_psycopg: MagicMock,
+    mock_split: MagicMock,
+    mock_extract_llm: MagicMock,
+    mock_resolve_judge: MagicMock,
+    mock_insert_validation: MagicMock,
+) -> None:
+    """Issue #2398 example title triggers the per-ruling adversarial-pattern flag.
+
+    Uses the Wang/NetEase example cited in the issue body:
+    ``"Liangbei Wang v. NetEase, Inc., et al. Manuel Panilag v. Armando Contreras
+    et al. Jin Yin, et al vs Xiaoxiao Lu, et al."`` (three ``v.``/``vs`` tokens).
+
+    The issue's other cited title (TAYLOR VS. AMAZON with embedded case number
+    ``MSC21-02349``) is intentionally not used here because ``clean_case_title``
+    in ``extract.py`` reduces it to a single ``Plaintiff v. Defendant`` pair
+    upstream of the deterministic rule — defense-in-depth catches that variant
+    before the rule runs. The Wang title has no embedded case number, passes
+    ``is_plausible_case_title``, and survives to the deterministic rule intact.
+
+    Acceptance criterion: the rule fires in the worker's per-ruling validation
+    pass with an ``insert_validation_result`` call, and the document is still
+    committed to the DB (flag does not block writes).
+    """
+    worker, os_mock = _make_worker()
+
+    mock_conn, mock_cur = _make_mock_conn()
+    mock_psycopg.connect.return_value = mock_conn
+    mock_cur.fetchone.side_effect = [
+        ("court-uuid-1",),  # upsert_court (deterministic flag logging)
+        ("court-uuid-1",),  # upsert_court (main flow)
+        ("case-uuid-1",),  # upsert_case
+        (True,),  # insert_document: is_new = True
+    ]
+    mock_cur.rowcount = 1
+
+    contaminated_title = (
+        "Liangbei Wang v. NetEase, Inc., et al. Manuel Panilag v. Armando Contreras "
+        "et al. Jin Yin, et al vs Xiaoxiao Lu, et al."
+    )
+    event = _make_event(
+        county="Contra Costa",
+        case_title=contaminated_title,
+    )
+    worker.process_event(event)
+
+    # Document was still committed to DB (flag doesn't block)
+    assert mock_conn.commit.call_count >= 1
+
+    # insert_validation_result should have been called for the deterministic flag.
+    mock_insert_validation.assert_called()
+    det_calls = [
+        c
+        for c in mock_insert_validation.call_args_list
+        if c.kwargs.get("result") and c.kwargs["result"].model == "deterministic"
+    ]
+    assert len(det_calls) >= 1
+    det_result = det_calls[0].kwargs["result"]
+    assert det_result.result == "flag"
+    assert "multi-case contamination" in (det_result.reason or "")
+    # The reason should report 3 adversarial patterns for this Wang/NetEase title.
+    assert "3" in (det_result.reason or "")
 
 
 # ---------------------------------------------------------------------------
