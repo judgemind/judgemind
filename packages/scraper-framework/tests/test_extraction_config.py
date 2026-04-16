@@ -11,6 +11,7 @@ import pytest
 
 from framework.extraction_config import (
     _COUNTY_CONFIGS,
+    _SCRAPER_CONFIGS,
     CONTRA_COSTA_SYSTEM_PROMPT,
     FRESNO_SYSTEM_PROMPT,
     RIVERSIDE_SYSTEM_PROMPT,
@@ -997,3 +998,62 @@ class TestPromptFormatValidation:
         # This is a structural sanity check — if a county has a text-based
         # prompt, it should be LLM, not MULTIMODAL.
         assert config.method == ExtractionMethod.LLM
+
+
+# ---------------------------------------------------------------------------
+# Scraper-level extraction overrides (#2331)
+# ---------------------------------------------------------------------------
+
+
+class TestScraperLevelOverrides:
+    """Tests for scraper-level extraction config overrides."""
+
+    def test_sd_calendar_uses_none(self) -> None:
+        """SD calendar scraper uses ExtractionMethod.NONE — no LLM extraction."""
+        config = get_county_extraction_config("CA", "San Diego", scraper_id="ca-sd-calendar")
+        assert config is not None
+        assert config.method == ExtractionMethod.NONE
+
+    def test_sd_tentatives_uses_county_default(self) -> None:
+        """SD tentatives scraper falls through to the county LLM config."""
+        config = get_county_extraction_config("CA", "San Diego", scraper_id="ca-sd-tentatives")
+        assert config is not None
+        assert config.method == ExtractionMethod.LLM
+        assert config.system_prompt is SAN_DIEGO_FRAMEWORK_PROMPT
+
+    def test_sd_pipeline_uses_county_default(self) -> None:
+        """SD pipeline scraper falls through to the county LLM config."""
+        config = get_county_extraction_config("CA", "San Diego", scraper_id="ca-sd-pipeline")
+        assert config is not None
+        assert config.method == ExtractionMethod.LLM
+
+    def test_scraper_override_takes_priority(self) -> None:
+        """Scraper-level config takes priority over county-level config."""
+        # Without scraper_id: returns the county LLM config
+        county_config = get_county_extraction_config("CA", "San Diego")
+        assert county_config is not None
+        assert county_config.method == ExtractionMethod.LLM
+
+        # With scraper_id: returns the scraper NONE config
+        scraper_config = get_county_extraction_config(
+            "CA", "San Diego", scraper_id="ca-sd-calendar"
+        )
+        assert scraper_config is not None
+        assert scraper_config.method == ExtractionMethod.NONE
+
+    def test_unknown_scraper_id_falls_through(self) -> None:
+        """An unregistered scraper_id falls through to the county config."""
+        config = get_county_extraction_config("CA", "San Diego", scraper_id="ca-sd-unknown")
+        assert config is not None
+        assert config.method == ExtractionMethod.LLM
+
+    def test_scraper_id_none_falls_through(self) -> None:
+        """scraper_id=None falls through to the county config."""
+        config = get_county_extraction_config("CA", "San Diego", scraper_id=None)
+        assert config is not None
+        assert config.method == ExtractionMethod.LLM
+
+    def test_scraper_configs_registry_has_sd_calendar(self) -> None:
+        """The _SCRAPER_CONFIGS registry contains the SD calendar entry."""
+        assert "ca-sd-calendar" in _SCRAPER_CONFIGS
+        assert _SCRAPER_CONFIGS["ca-sd-calendar"].method == ExtractionMethod.NONE

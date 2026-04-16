@@ -878,7 +878,7 @@ class IngestionWorker:
                 get_county_extraction_config,
             )
 
-            county_config = get_county_extraction_config(state, county)
+            county_config = get_county_extraction_config(state, county, scraper_id=scraper_id)
             needs_multimodal = (
                 county_config is not None and county_config.method == ExtractionMethod.MULTIMODAL
             ) or county_config is None  # unconfigured counties default to multimodal
@@ -963,11 +963,27 @@ class IngestionWorker:
                 if event_data.get(field):
                     extraction_methods[field] = "llm_extractor"
 
+        # When the scraper/county uses ExtractionMethod.NONE, all fields are
+        # already populated by the scraper — skip per-field LLM extraction.
+        # This handles scrapers like SD calendar where structured HTML is
+        # fully parsed and the LLM would produce wrong results (#2331).
+        is_extraction_none = False
+        if not is_llm_extracted:
+            from framework.extraction_config import ExtractionMethod, get_county_extraction_config
+
+            _ext_config = get_county_extraction_config(state, county, scraper_id=scraper_id)
+            if _ext_config is not None and _ext_config.method == ExtractionMethod.NONE:
+                is_extraction_none = True
+                for field in EXTRACTABLE_FIELDS:
+                    if event_data.get(field):
+                        extraction_methods[field] = "scraper"
+
         # ------------------------------------------------------------------
         # LLM extraction — primary method for missing fields
         # ------------------------------------------------------------------
         llm_result: LLMExtractionResult | None = None
-        if not is_llm_extracted and missing_fields and ruling_text and self._llm_client is not None:
+        skip_llm = is_llm_extracted or is_extraction_none
+        if not skip_llm and missing_fields and ruling_text and self._llm_client is not None:
             metadata = {
                 "link_text": event_data.get("extra", {}).get("link_text")
                 if isinstance(event_data.get("extra"), dict)
@@ -1062,8 +1078,10 @@ class IngestionWorker:
         # LLM extraction.  Regex fallback removed in #2178 — LLM is now
         # the only enrichment path for these four fields.
         # ------------------------------------------------------------------
-        enrichment_fields_missing = ruling_text and (
-            outcome is None or motion_type is None or not case_title or not parties_data
+        enrichment_fields_missing = (
+            ruling_text
+            and not is_extraction_none
+            and (outcome is None or motion_type is None or not case_title or not parties_data)
         )
         if enrichment_fields_missing:
             enrichment_result = self._llm_enrich_fields(ruling_text, document_id)
@@ -1830,23 +1848,29 @@ class IngestionWorker:
         extracted_rulings = None
         extraction_method = "llm"  # Track which path was used for logging.
 
-        # Check if the county has a configured extraction method (#2271).
+        # Check if the county/scraper has a configured extraction method (#2271, #2331).
         # Counties with ExtractionMethod.LLM (e.g. Ventura) have custom
         # text-based prompts that extract structured fields including outcome.
         # The multimodal per-page extraction does NOT extract outcome or
         # motion_type, so using it for LLM-configured counties causes field
         # regressions.  Only use multimodal for counties explicitly configured
         # as ExtractionMethod.MULTIMODAL (e.g. Orange County).
-        # Counties with ExtractionMethod.NONE skip framework extraction entirely.
+        # Counties/scrapers with ExtractionMethod.NONE skip framework extraction
+        # entirely (e.g. SD calendar — structured HTML already fully parsed).
         from framework.extraction_config import ExtractionMethod, get_county_extraction_config
 
-        county_config = get_county_extraction_config(state, county)
+        event_scraper_id: str = event_data.get("scraper_id", "")
+        county_config = get_county_extraction_config(state, county, scraper_id=event_scraper_id)
 
         # NONE means the scraper handles everything — no framework extraction.
         if county_config is not None and county_config.method == ExtractionMethod.NONE:
             logger.debug(
-                "Skipping framework extraction — county uses ExtractionMethod.NONE",
-                extra={"document_id": document_id, "county": county},
+                "Skipping framework extraction — scraper/county uses ExtractionMethod.NONE",
+                extra={
+                    "document_id": document_id,
+                    "county": county,
+                    "scraper_id": event_scraper_id,
+                },
             )
             return False
 
@@ -1901,10 +1925,10 @@ class IngestionWorker:
         if extracted_rulings is None and ruling_text:
             extraction_method = "llm"  # Falling back to text-based.
 
-            # Check for county-specific extraction config (#1728).
+            # Check for county/scraper-specific extraction config (#1728, #2331).
             from framework.extraction_config import get_county_extraction_config
 
-            county_config = get_county_extraction_config(state, county)
+            county_config = get_county_extraction_config(state, county, scraper_id=event_scraper_id)
             county_prompt: str | None = None
 
             if county_config and county_config.provider:
