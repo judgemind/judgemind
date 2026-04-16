@@ -51,6 +51,7 @@ import structlog
 from bs4 import BeautifulSoup
 
 from framework import BaseScraper, CapturedDocument, ContentFormat, ScheduleWindow, ScraperConfig
+from framework.browser import apply_stealth as _apply_stealth
 from framework.events import EventBus
 from framework.storage import S3Archiver
 
@@ -425,33 +426,6 @@ def normalize_case_title(raw_title: str | None) -> str | None:
     # Normalize whitespace
     title = " ".join(title.split())
     return title
-
-
-# ---------------------------------------------------------------------------
-# Stealth helpers (shared with sd_tentatives.py)
-# ---------------------------------------------------------------------------
-
-
-async def _apply_stealth(page: Any) -> None:
-    """Apply playwright-stealth evasions to avoid Turnstile bot detection.
-
-    Uses the ``playwright-stealth`` library to mask browser automation
-    fingerprints (WebGL, navigator properties, plugins, etc.).
-
-    Falls back gracefully if playwright-stealth is not installed, applying
-    only the minimal webdriver override.
-
-    Args:
-        page: The Playwright page object.
-    """
-    try:
-        from playwright_stealth import Stealth
-
-        stealth = Stealth()
-        await stealth.apply_stealth_async(page)
-    except ImportError:
-        logger.warning("playwright-stealth not installed, using minimal stealth only")
-        await page.evaluate("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
 
 
 def extract_session_id(html: str) -> str | None:
