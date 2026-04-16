@@ -140,6 +140,12 @@ resource "aws_ecs_task_definition" "scraper" {
       image     = "${var.ecr_repository_url}:${var.scraper_image_tag}"
       essential = true
 
+      # Give the scraper 2 minutes to finish the current scraper and exit
+      # gracefully when ECS sends SIGTERM (default is only 30 seconds).
+      # The full 17-scraper run takes ~25-35 minutes; this prevents data
+      # loss if a stop signal arrives mid-scrape.  See #2349.
+      stopTimeout = 120
+
       environment = concat(
         [{ name = "ENVIRONMENT", value = var.environment }],
         var.redis_url != "" ? [{ name = "REDIS_URL", value = var.redis_url }] : [],
