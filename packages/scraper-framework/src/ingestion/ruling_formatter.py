@@ -26,6 +26,8 @@ import re
 import structlog
 from judgemind_config import DEFAULT_HAIKU_MODEL
 
+from framework.llm_utils import strip_llm_json_fences
+
 from .llm_providers import LLMResponse, call_llm
 
 logger = structlog.get_logger(__name__)
@@ -353,9 +355,7 @@ def format_ruling_text(
         return _pre_wrap_fallback(ruling_text)
 
     # Strip markdown code fences if present
-    if formatted_html.startswith("```"):
-        formatted_html = re.sub(r"^```\w*\n?", "", formatted_html)
-        formatted_html = re.sub(r"\n?```$", "", formatted_html)
+    formatted_html = strip_llm_json_fences(formatted_html)
 
     # Sanitize HTML — strip dangerous tags/attributes
     sanitized_html = _sanitize_html(formatted_html)

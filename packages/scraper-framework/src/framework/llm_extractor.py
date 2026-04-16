@@ -44,6 +44,7 @@ from .llm_schema import (
     ExtractionResult,
     FieldConfidence,
 )
+from .llm_utils import strip_llm_json_fences
 
 logger = structlog.get_logger(__name__)
 
@@ -1245,10 +1246,7 @@ class LlmExtractor:
         case numbers, and applies authoritative metadata overrides.
         """
         try:
-            cleaned = raw_text.strip()
-            if cleaned.startswith("```"):
-                cleaned = re.sub(r"^```\w*\n?", "", cleaned)
-                cleaned = re.sub(r"\n?```$", "", cleaned)
+            cleaned = strip_llm_json_fences(raw_text)
             parsed = json.loads(cleaned)
         except json.JSONDecodeError as exc:
             logger.warning(
@@ -1552,10 +1550,7 @@ def _parse_page_rows(raw_text: str, page_index: int) -> list[dict]:
 
     Also extracts ``page_header`` metadata if present.
     """
-    cleaned = raw_text.strip()
-    if cleaned.startswith("```"):
-        cleaned = re.sub(r"^```\w*\n?", "", cleaned)
-        cleaned = re.sub(r"\n?```$", "", cleaned)
+    cleaned = strip_llm_json_fences(raw_text)
 
     try:
         parsed = json.loads(cleaned)

@@ -61,6 +61,7 @@ from framework.la_parser_utils import (
 from framework.la_parser_utils import (
     SKIP_RESPONDING_PHRASES as _SKIP_RESPONDING_PHRASES,
 )
+from framework.llm_utils import strip_llm_json_fences
 from framework.party_utils import (
     is_name_fragment as _is_name_fragment,  # noqa: F401 — re-exported for tests
 )
@@ -391,13 +392,7 @@ def _llm_extract_rulings(ruling_html: str) -> list[LASplitRuling] | None:
         return None
 
     try:
-        raw = response.text.strip()
-        # Strip markdown code fences if present
-        if raw.startswith("```"):
-            lines = raw.split("\n")
-            lines = [line for line in lines if not line.strip().startswith("```")]
-            raw = "\n".join(lines)
-
+        raw = strip_llm_json_fences(response.text)
         data = json.loads(raw)
     except (json.JSONDecodeError, ValueError) as exc:
         logger.warning("la.llm_parse_failed", error=str(exc))
