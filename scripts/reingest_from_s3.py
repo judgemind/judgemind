@@ -1636,7 +1636,13 @@ def reingest_batch(
         # make_split_document_id) and share their parent's S3 object.
         # Re-processing them would re-split the parent PDF, creating N new
         # children per child — an exponential/infinite loop.  See #1919.
-        if full_reparse and is_split_child_id(doc_id_str):
+        #
+        # We pass content_hash to is_split_child_id so it can distinguish
+        # scraper-generated v5 IDs (from uuid5(NAMESPACE_URL, content_hash))
+        # from true split-child v5 IDs.  Without the content_hash, the
+        # version-check alone mis-classifies regular scraper docs as split
+        # children (#2367 follow-up).
+        if full_reparse and is_split_child_id(doc_id_str, content_hash):
             logger.info(
                 "Skipping split-child document in full-reparse mode",
                 document_id=doc_id_str,
