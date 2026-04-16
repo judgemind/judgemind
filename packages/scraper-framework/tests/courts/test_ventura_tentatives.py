@@ -866,6 +866,66 @@ def test_ventura_parse_document_preserves_existing_judge_name() -> None:
     assert result.judge_name == "Pre-existing Name"
 
 
+def test_ventura_parse_document_rejects_decedent_as_judge() -> None:
+    """Probate decedent-as-judge guard (#2370): if the judge_name matches
+    the decedent name in the probate title, discard it and fall back to
+    the dept-to-judge mapping."""
+    from framework import CapturedDocument, ContentFormat
+
+    config = ventura_default_config()
+    # Dept J6 -> real probate judge
+    dept_map = {"J6": "Gilbert A. Romero"}
+    scraper = VenturaTentativeRulingsScraper(config=config, dept_judge_map=dept_map)
+
+    doc = CapturedDocument(
+        scraper_id=config.scraper_id,
+        state="CA",
+        county="Ventura",
+        court="Superior Court",
+        source_url="https://example.com",
+        capture_timestamp=datetime(2026, 3, 11),
+        content_format=ContentFormat.HTML,
+        raw_content=b"<html><body><p>The matter is continued.</p></body></html>",
+        content_hash="abc123",
+    )
+    doc.department = "J6"
+    doc.case_title = "Estate of Delbert L. Webb"
+    # The LLM mistakenly returned the decedent name as judge
+    doc.judge_name = "Delbert L. Webb"
+
+    result = scraper.parse_document(doc)
+    # Decedent name rejected; dept_map fallback populates real judge
+    assert result.judge_name == "Gilbert A. Romero"
+
+
+def test_ventura_parse_document_keeps_real_judge_even_for_probate() -> None:
+    """When the LLM returns a real judge name (different from the decedent),
+    the probate guard should NOT discard it."""
+    from framework import CapturedDocument, ContentFormat
+
+    config = ventura_default_config()
+    scraper = VenturaTentativeRulingsScraper(config=config)
+
+    doc = CapturedDocument(
+        scraper_id=config.scraper_id,
+        state="CA",
+        county="Ventura",
+        court="Superior Court",
+        source_url="https://example.com",
+        capture_timestamp=datetime(2026, 3, 11),
+        content_format=ContentFormat.HTML,
+        raw_content=b"<html><body><p>The matter is continued.</p></body></html>",
+        content_hash="abc123",
+    )
+    doc.department = "J6"
+    doc.case_title = "Estate of Delbert L. Webb"
+    # A real judge name, not matching the decedent
+    doc.judge_name = "Gilbert A. Romero"
+
+    result = scraper.parse_document(doc)
+    assert result.judge_name == "Gilbert A. Romero"
+
+
 # ---------------------------------------------------------------------------
 # Default search_dates uses timezone-aware datetime (Pacific)
 # ---------------------------------------------------------------------------

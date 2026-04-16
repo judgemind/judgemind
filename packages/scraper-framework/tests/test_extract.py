@@ -2463,3 +2463,89 @@ class TestIsPlausibleHearingDate:
 
         hearing = date(2026, 5, 14)
         assert is_plausible_hearing_date(hearing, None) is True
+
+
+class TestDedupeRepeatedTitleEdgeCases:
+    """Branch coverage for dedupe_repeated_title() edge cases (#2370)."""
+
+    def test_whitespace_only_returns_input(self) -> None:
+        """Whitespace-only after collapse returns the original input."""
+        from ingestion.extract import dedupe_repeated_title
+
+        # A string of only whitespace: after .split() returns empty list,
+        # " ".join([]) == "", which hits the "not normalized" branch.
+        result = dedupe_repeated_title("   \t  \n  ")
+        # Should return the original input (not None, not stripped)
+        assert result == "   \t  \n  "
+
+    def test_prefix_mid_word_candidates_fall_through(self) -> None:
+        """Candidates that would split mid-word are skipped; no dedup detected.
+
+        A title with no repeated structure exercises many loop iterations
+        where `normalized[prefix_len] != " "` skips via `continue`, and
+        ultimately falls through to `return normalized`.
+        """
+        from ingestion.extract import dedupe_repeated_title
+
+        # Plain non-repeating sentence long enough to iterate many prefixes
+        raw = "The quick brown fox jumps over the lazy dog and runs away"
+        result = dedupe_repeated_title(raw)
+        # No valid dedup possible → returns normalized input unchanged
+        assert result == raw
+
+    def test_no_rest_after_prefix_skip(self) -> None:
+        """When the prefix consumes everything but trailing whitespace,
+        `rest` is empty and the loop should skip this prefix length."""
+        from ingestion.extract import dedupe_repeated_title
+
+        # No rest after prefix: no repetition detected — returns normalized.
+        raw = "Unique Non-Repeating Title XYZ"
+        result = dedupe_repeated_title(raw)
+        assert result == raw
+
+
+class TestIsProbateDecedentNameEdgeCases:
+    """Branch coverage for is_probate_decedent_name() edge cases (#2370)."""
+
+    def test_empty_normalized_candidate(self) -> None:
+        """When candidate normalizes to an empty/tiny string, return False."""
+        from ingestion.extract import is_probate_decedent_name
+
+        # Candidate of only punctuation normalizes to empty
+        assert is_probate_decedent_name(".,", "Estate of Smith") is False
+        # Very short candidate (< 3 chars) returns False
+        assert is_probate_decedent_name("Jo", "Estate of Smith") is False
+
+    def test_single_token_candidate_no_substring(self) -> None:
+        """Single-token candidate that is not a substring of the title returns False."""
+        from ingestion.extract import is_probate_decedent_name
+
+        # "Romero" is a single token not in the title — returns False
+        # without entering the multi-token matching branch.
+        assert is_probate_decedent_name("Romero", "Estate of Smith") is False
+
+    def test_token_match_all_tokens_found(self) -> None:
+        """Multi-token candidate where all tokens appear in order — True path."""
+        from ingestion.extract import is_probate_decedent_name
+
+        # "Jane Smith" appears as tokens inside "In the Matter of Jane M Smith"
+        assert (
+            is_probate_decedent_name(
+                "Jane Smith",
+                "In the Matter of Jane M Smith",
+            )
+            is True
+        )
+
+    def test_token_match_missing_token_returns_false(self) -> None:
+        """Multi-token candidate where a token is absent — False."""
+        from ingestion.extract import is_probate_decedent_name
+
+        # "Jane Williams" — Williams not in title
+        assert (
+            is_probate_decedent_name(
+                "Jane Williams",
+                "In the Matter of Jane M Smith",
+            )
+            is False
+        )
