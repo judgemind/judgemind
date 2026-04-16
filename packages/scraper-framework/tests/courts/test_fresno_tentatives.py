@@ -27,6 +27,7 @@ from courts.ca.fresno_tentatives import (
     SplitRuling,
     _extract_case_number,
     _extract_case_title,
+    _extract_department,
     _extract_motion_type,
     _extract_outcome,
     _fresno_courthouse,
@@ -1086,3 +1087,306 @@ def test_fresno_fetch_documents_zero_rulings() -> None:
 
     # All 20 PDFs produce 1 doc each (no splitting since no rulings found)
     assert len(docs) == 20
+
+
+# ---------------------------------------------------------------------------
+# Per-ruling department extraction (#2367)
+# ---------------------------------------------------------------------------
+
+
+def test_fresno_extract_department_from_hearing_line() -> None:
+    """Extract department from '(Dept. 403)' suffix on the hearing date line."""
+    text = (
+        "Re: Smith v. Jones\n"
+        "Case No. 25CECG03271\n"
+        "Hearing Date: March 10, 2026 (Dept. 403)\n"
+        "Motion: Demurrer\n"
+        "Tentative Ruling:\nTo grant.\n"
+    )
+    assert _extract_department(text) == "403"
+
+
+def test_fresno_extract_department_501() -> None:
+    text = "Hearing Date: March 10, 2026 (Dept. 501)\n"
+    assert _extract_department(text) == "501"
+
+
+def test_fresno_extract_department_no_parens() -> None:
+    """Tolerate 'Dept 403' without parentheses."""
+    text = "Hearing Date: March 10, 2026 Dept 502\n"
+    assert _extract_department(text) == "502"
+
+
+def test_fresno_extract_department_word_department() -> None:
+    """Tolerate full word 'Department 403'."""
+    text = "Hearing Date: March 10, 2026 Department 503\n"
+    assert _extract_department(text) == "503"
+
+
+def test_fresno_extract_department_missing() -> None:
+    text = "Re: Smith v. Jones\nNo department here.\n"
+    assert _extract_department(text) is None
+
+
+def test_fresno_extract_department_from_403_fixture() -> None:
+    """Real Dept 403 PDF — every ruling should extract department '403'."""
+    text = _extract_pdf_text(_load_bytes("fresno_403_20260310_d019042f.pdf"))
+    rulings = _split_rulings(text)
+    assert len(rulings) == 8
+    for r in rulings:
+        assert r.department == "403", (
+            f"Ruling {r.ruling_index} got dept {r.department!r}, expected '403'"
+        )
+
+
+def test_fresno_extract_department_from_501_fixture() -> None:
+    text = _extract_pdf_text(_load_bytes("fresno_501_20260310_10fe3c7f.pdf"))
+    rulings = _split_rulings(text)
+    assert len(rulings) >= 2
+    for r in rulings:
+        assert r.department == "501"
+
+
+def test_fresno_extract_department_from_502_fixture() -> None:
+    text = _extract_pdf_text(_load_bytes("fresno_502_20260311_eef66c41.pdf"))
+    rulings = _split_rulings(text)
+    assert len(rulings) >= 3
+    for r in rulings:
+        assert r.department == "502"
+
+
+def test_fresno_extract_department_from_503_fixture() -> None:
+    text = _extract_pdf_text(_load_bytes("fresno_503_20260311_03c051b7.pdf"))
+    rulings = _split_rulings(text)
+    assert len(rulings) >= 1
+    for r in rulings:
+        assert r.department == "503"
+
+
+def test_fresno_split_ruling_has_department_field() -> None:
+    """SplitRuling exposes a department attribute (default None)."""
+    r = SplitRuling(
+        ruling_index=1,
+        case_number="25CECG03271",
+        ruling_text="Tentative Ruling body",
+        case_title="Smith v. Jones",
+        motion_type="Demurrer",
+        outcome="Granted",
+        hearing_date=datetime(2026, 3, 10),
+    )
+    # Default when not passed
+    assert r.department is None
+    # Explicitly set
+    r2 = SplitRuling(
+        ruling_index=2,
+        case_number=None,
+        ruling_text="",
+        case_title=None,
+        motion_type=None,
+        outcome=None,
+        hearing_date=None,
+        department="403",
+    )
+    assert r2.department == "403"
+
+
+# ---------------------------------------------------------------------------
+# fetch_documents threads per-ruling department into pre-split children
+# ---------------------------------------------------------------------------
+
+
+@respx.mock
+def test_fresno_fetch_documents_preserves_per_ruling_department() -> None:
+    """Each pre-split child must carry the department from its ruling header."""
+    from unittest.mock import patch
+
+    html = _load_html("fresno_index_page.html")
+
+    respx.get(INDEX_URL).mock(return_value=httpx.Response(200, text=html))
+    respx.get(url__regex=r"\.pdf").mock(return_value=httpx.Response(200, content=b"fake-pdf-bytes"))
+
+    # Simulate a mixed-department PDF: items from 403 and 501 in one file.
+    # The filename encodes 403 but an individual ruling carries 501 — the
+    # per-ruling header must win.
+    mixed_text = (
+        "(20) Tentative Ruling\n"
+        "Re: Lopez v. Fresno Unified School District\n"
+        "Superior Court Case No. 25CECG03271\n"
+        "Hearing Date: March 10, 2026 (Dept. 403)\n"
+        "Motion: Demurrer to FAC\n"
+        "Tentative Ruling:\n"
+        "To sustain the demurrer.\n\n"
+        "(46) Tentative Ruling\n"
+        "Re: Blevens v. Medrano\n"
+        "Superior Court Case No. 25CECG04177\n"
+        "Hearing Date: March 10, 2026 (Dept. 501)\n"
+        "Motion: Motion to Set Aside Default\n"
+        "Tentative Ruling:\n"
+        "To take the motion off calendar.\n"
+    )
+
+    with patch(
+        "courts.ca.fresno_tentatives._extract_pdf_text",
+        return_value=mixed_text,
+    ):
+        config = fresno_default_config()
+        config.request_delay_seconds = 0
+        scraper = FresnoTentativeRulingsScraper(config=config)
+        docs = scraper.fetch_documents()
+
+    # 20 PDFs each split into 2 rulings = 40 pre-split children
+    pre_split = [d for d in docs if d.extra.get("pre_split")]
+    assert len(pre_split) == 40
+    depts = {d.extra["ruling_index"]: d.department for d in pre_split[:2]}
+    # Ruling 20 → Dept 403, Ruling 46 → Dept 501
+    assert depts == {20: "403", 46: "501"}
+
+
+@respx.mock
+def test_fresno_fetch_documents_pre_split_children_are_unique_by_base_hash() -> None:
+    """Pre-split children share raw_content but must get unique document_ids via base.py salting.
+
+    This is a regression test for #2367: before the fix, all children shared the
+    same content-hash-derived document_id, so only the first child landed in
+    rulings due to the UNIQUE(document_id) constraint.  The fix is in
+    framework.base.BaseScraper._process_document which now salts the
+    document_id with ruling_index for pre_split children.
+    """
+    from unittest.mock import patch
+
+    from framework.base import BaseScraper
+
+    html = _load_html("fresno_index_page.html")
+
+    respx.get(INDEX_URL).mock(return_value=httpx.Response(200, text=html))
+    respx.get(url__regex=r"\.pdf").mock(return_value=httpx.Response(200, content=b"fake-pdf-bytes"))
+
+    split_text = (
+        "(20) Tentative Ruling\n"
+        "Re: Case A\n"
+        "Superior Court Case No. 25CECG00001\n"
+        "Hearing Date: March 10, 2026 (Dept. 403)\n"
+        "Motion: A\n"
+        "Tentative Ruling:\n"
+        "To grant.\n\n"
+        "(30) Tentative Ruling\n"
+        "Re: Case B\n"
+        "Superior Court Case No. 25CECG00002\n"
+        "Hearing Date: March 10, 2026 (Dept. 403)\n"
+        "Motion: B\n"
+        "Tentative Ruling:\n"
+        "To deny.\n\n"
+        "(40) Tentative Ruling\n"
+        "Re: Case C\n"
+        "Superior Court Case No. 25CECG00003\n"
+        "Hearing Date: March 10, 2026 (Dept. 403)\n"
+        "Motion: C\n"
+        "Tentative Ruling:\n"
+        "To continue.\n"
+    )
+
+    with patch(
+        "courts.ca.fresno_tentatives._extract_pdf_text",
+        return_value=split_text,
+    ):
+        config = fresno_default_config()
+        config.request_delay_seconds = 0
+        scraper = FresnoTentativeRulingsScraper(config=config)
+        pre_children = [d for d in scraper.fetch_documents() if d.extra.get("pre_split")]
+
+    # Take only the 3 children from one PDF to check uniqueness cleanly.
+    first_pdf_children = pre_children[:3]
+    assert len(first_pdf_children) == 3
+    # Before processing, each child has the same raw_content and empty document_id.
+    assert len({id(c) for c in first_pdf_children}) == 3
+    assert all(c.raw_content == first_pdf_children[0].raw_content for c in first_pdf_children)
+
+    # Process through base — this assigns document_id via the salted path.
+    # Skip the archive by setting scraper._archiver to None.
+    scraper._archiver = None
+    scraper._event_bus = None
+    for child in first_pdf_children:
+        BaseScraper._process_document(scraper, child)
+
+    ids = [c.document_id for c in first_pdf_children]
+    # All must be non-empty and unique.
+    assert all(ids)
+    assert len(set(ids)) == 3, f"Expected 3 unique IDs, got {ids}"
+    # All must be valid UUIDs.
+    import uuid as _uuid
+
+    for i in ids:
+        _uuid.UUID(i)
+
+
+# ---------------------------------------------------------------------------
+# Base scraper _process_document deterministic ID for non-pre-split docs (#2367)
+# ---------------------------------------------------------------------------
+
+
+def test_base_process_document_unsalted_id_for_non_pre_split() -> None:
+    """Non-pre-split docs keep the original content-hash-derived document_id."""
+    import uuid as _uuid
+    from unittest.mock import patch
+
+    from framework.base import BaseScraper
+    from framework.hashing import sha256_hex
+
+    config = fresno_default_config()
+    config.request_delay_seconds = 0
+    scraper = FresnoTentativeRulingsScraper(config=config)
+    scraper._archiver = None
+    scraper._event_bus = None
+
+    from framework import ContentFormat
+
+    doc = scraper._make_base_doc(
+        source_url="https://example.com/x.pdf",
+        raw_content=b"hello world",
+        content_format=ContentFormat.PDF,
+    )
+    # No pre_split flag
+    with patch.object(scraper, "parse_document", side_effect=lambda d: d):
+        BaseScraper._process_document(scraper, doc)
+    expected = str(_uuid.uuid5(_uuid.NAMESPACE_URL, sha256_hex(b"hello world")))
+    assert doc.document_id == expected
+
+
+def test_base_process_document_salted_id_for_pre_split() -> None:
+    """Pre-split children get a deterministic salted document_id per ruling_index."""
+    from unittest.mock import patch
+
+    from framework.base import BaseScraper
+    from ingestion.split_ids import make_split_document_id
+
+    config = fresno_default_config()
+    config.request_delay_seconds = 0
+    scraper = FresnoTentativeRulingsScraper(config=config)
+    scraper._archiver = None
+    scraper._event_bus = None
+
+    from framework import ContentFormat
+
+    ids_observed: list[str] = []
+    for idx in (3, 20, 47):
+        doc = scraper._make_base_doc(
+            source_url="https://example.com/shared.pdf",
+            raw_content=b"shared-bytes-for-all-children",
+            content_format=ContentFormat.PDF,
+        )
+        doc.extra["pre_split"] = True
+        doc.extra["ruling_index"] = idx
+        with patch.object(scraper, "parse_document", side_effect=lambda d: d):
+            BaseScraper._process_document(scraper, doc)
+        ids_observed.append(doc.document_id)
+
+    # All three must be distinct
+    assert len(set(ids_observed)) == 3, f"expected unique IDs, got {ids_observed}"
+    # And deterministic: re-running should yield the same IDs
+    import uuid as _uuid
+
+    from framework.hashing import sha256_hex
+
+    parent_id = str(_uuid.uuid5(_uuid.NAMESPACE_URL, sha256_hex(b"shared-bytes-for-all-children")))
+    for idx, observed in zip((3, 20, 47), ids_observed, strict=True):
+        assert observed == make_split_document_id(parent_id, idx)

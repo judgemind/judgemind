@@ -150,6 +150,14 @@ class BaseScraper(abc.ABC):
         insert_document (ON CONFLICT DO NOTHING on documents.id) and
         insert_ruling (WHERE NOT EXISTS on document_id) idempotent across
         scraper runs — the same raw content always maps to the same document.
+
+        For pre-split child documents (``doc.extra["pre_split"] == True``)
+        that share the same ``raw_content`` as their siblings (e.g. a
+        multi-ruling PDF split into per-ruling children), the document_id
+        is further salted with ``ruling_index`` so each child gets a unique
+        ``document_id``.  Without this, all split children would collide on
+        ``rulings.document_id`` UNIQUE, causing only the first child to
+        land in the DB (#2367).
         """
         # Inline CSS for HTML documents (makes archived HTML self-contained).
         # TODO(perf): If a scraper produces many HTML docs per run, consider
@@ -168,7 +176,19 @@ class BaseScraper(abc.ABC):
         # Deterministic document_id: same content → same UUID → dedup works.
         # uuid5 with NAMESPACE_URL is a standard way to derive reproducible
         # UUIDs from a string key (here, the SHA-256 hex digest).
-        doc.document_id = str(uuid.uuid5(uuid.NAMESPACE_URL, doc.content_hash))
+        parent_document_id = str(uuid.uuid5(uuid.NAMESPACE_URL, doc.content_hash))
+
+        # Pre-split children share the same raw_content but represent
+        # different rulings extracted from it.  Salt the document_id with
+        # the ruling_index so each child gets a unique UUID that still
+        # round-trips deterministically.  See ingestion.split_ids for the
+        # same helper used by the reingest path (#2367).
+        if doc.extra.get("pre_split") and "ruling_index" in doc.extra:
+            from ingestion.split_ids import make_split_document_id
+
+            doc.document_id = make_split_document_id(parent_document_id, doc.extra["ruling_index"])
+        else:
+            doc.document_id = parent_document_id
         doc = self.parse_document(doc)
 
         # Warn when a non-empty PDF yields no extracted text — likely an
