@@ -4828,3 +4828,254 @@ def test_enrichment_enabled_by_default() -> None:
     worker, _ = _make_worker()
     assert worker._llm_enrichment_enabled is True
     assert worker._llm_enrichment_enabled is True
+
+
+# ---------------------------------------------------------------------------
+# Worker-level guards for Ventura (#2370): implausible hearing date, repeated
+# title segments, trailing case number, probate decedent as judge.
+# ---------------------------------------------------------------------------
+
+
+@patch("ingestion.worker.resolve_judge", return_value=None)
+@patch("ingestion.worker.extract_fields_llm")
+@patch("ingestion.worker.psycopg")
+def test_process_event_rejects_implausible_llm_hearing_date(
+    mock_psycopg: MagicMock,
+    mock_llm: MagicMock,
+    mock_resolve_judge: MagicMock,
+) -> None:
+    """Worker rejects LLM-returned hearing_date that is far from capture_ts (#2370).
+
+    Covers worker.py line 1037 — the "Rejected LLM hearing_date as implausible"
+    log branch of the plausibility guard.
+    """
+    from ingestion.llm_extract import LLMExtractionResult, LLMRulingResult
+
+    worker, _ = _make_worker()
+    worker._llm_client = MagicMock()
+
+    mock_conn, mock_cur = _make_mock_conn()
+    mock_psycopg.connect.return_value = mock_conn
+    mock_cur.fetchone.side_effect = [
+        ("court-uuid-1",),
+        ("case-uuid-1",),
+        (True,),
+    ]
+    mock_cur.fetchall.return_value = []
+    mock_cur.nextset.side_effect = [True, False]
+    mock_cur.rowcount = 1
+
+    # Capture timestamp March 4 2026; LLM returns hearing_date 6 months later.
+    mock_llm.return_value = LLMExtractionResult(
+        hearing_date=date(2026, 9, 15),
+        case_count=1,
+        rulings=[
+            LLMRulingResult(
+                case_number="24NNCV02551",
+                case_title="Smith v. Jones",
+                outcome="granted",
+            )
+        ],
+    )
+
+    event = _make_event(
+        case_number=None,
+        case_title=None,
+        hearing_date=None,
+        ruling_text="Some ruling text",
+        capture_timestamp="2026-03-04T23:00:00",
+    )
+    # Skip the multi-ruling split path so we reach the single-doc per-field
+    # extraction path where the guards live.
+    with patch.object(worker, "_llm_split_document", return_value=False):
+        worker.process_event(event)
+
+    mock_llm.assert_called_once()
+    # The ruling INSERT should NOT contain 2026-09-15 (rejected as implausible).
+    ruling_calls = [c for c in mock_cur.execute.call_args_list if "INSERT INTO rulings" in str(c)]
+    assert len(ruling_calls) == 1
+    sql_args = ruling_calls[0][0][1]
+    # No hearing_date 2026-09-15 should appear in bound args
+    for arg in sql_args:
+        assert arg != date(2026, 9, 15)
+
+
+@patch("ingestion.worker.resolve_judge", return_value=None)
+@patch("ingestion.worker.extract_fields_llm")
+@patch("ingestion.worker.psycopg")
+def test_process_event_dedupes_repeated_title_segments(
+    mock_psycopg: MagicMock,
+    mock_llm: MagicMock,
+    mock_resolve_judge: MagicMock,
+) -> None:
+    """Worker dedupes repeated case_title segments (#2370).
+
+    Covers worker.py lines 1195, 1203 — the "Removed repeated title segments"
+    log and `case_title = deduped` assignment.
+    """
+    from ingestion.llm_extract import LLMExtractionResult, LLMRulingResult
+
+    worker, _ = _make_worker()
+    worker._llm_client = MagicMock()
+
+    mock_conn, mock_cur = _make_mock_conn()
+    mock_psycopg.connect.return_value = mock_conn
+    mock_cur.fetchone.side_effect = [
+        ("court-uuid-1",),
+        ("case-uuid-1",),
+        (True,),
+    ]
+    mock_cur.fetchall.return_value = []
+    mock_cur.nextset.side_effect = [True, False]
+    mock_cur.rowcount = 1
+
+    # LLM returns a title with the same 30-char segment repeated twice
+    mock_llm.return_value = LLMExtractionResult(
+        case_count=1,
+        rulings=[
+            LLMRulingResult(
+                case_number="56-2024-00123456-CU-BC-VTA",
+                case_title=("CITY OF THOUSAND OAKS vs PACKARD CITY OF THOUSAND OAKS vs PACKARD"),
+                outcome="granted",
+            )
+        ],
+    )
+
+    event = _make_event(
+        case_number=None,
+        case_title=None,
+        hearing_date=None,
+        ruling_text="Some ruling text",
+    )
+    with patch.object(worker, "_llm_split_document", return_value=False):
+        worker.process_event(event)
+
+    mock_llm.assert_called_once()
+    # The title stored must NOT be the doubled/repeated one.
+    all_sql_args = []
+    for call in mock_cur.execute.call_args_list:
+        args = call[0]
+        if len(args) > 1 and args[1] is not None:
+            all_sql_args.extend(args[1] if isinstance(args[1], (list, tuple)) else [])
+    # None of the bound args should contain the doubled sequence.
+    doubled_fragment = "PACKARD CITY OF THOUSAND OAKS"
+    for a in all_sql_args:
+        if isinstance(a, str):
+            assert doubled_fragment not in a, f"Doubled title leaked into SQL: {a!r}"
+
+
+@patch("ingestion.worker.resolve_judge", return_value=None)
+@patch("ingestion.worker.extract_fields_llm")
+@patch("ingestion.worker.psycopg")
+def test_process_event_strips_trailing_case_number_from_title(
+    mock_psycopg: MagicMock,
+    mock_llm: MagicMock,
+    mock_resolve_judge: MagicMock,
+) -> None:
+    """Worker strips trailing case numbers from case_title (#2370).
+
+    Covers worker.py lines 1206, 1214 — the "Stripped trailing case number
+    from title" log and `case_title = without_cn` assignment.
+    """
+    from ingestion.llm_extract import LLMExtractionResult, LLMRulingResult
+
+    worker, _ = _make_worker()
+    worker._llm_client = MagicMock()
+
+    mock_conn, mock_cur = _make_mock_conn()
+    mock_psycopg.connect.return_value = mock_conn
+    mock_cur.fetchone.side_effect = [
+        ("court-uuid-1",),
+        ("case-uuid-1",),
+        (True,),
+    ]
+    mock_cur.fetchall.return_value = []
+    mock_cur.nextset.side_effect = [True, False]
+    mock_cur.rowcount = 1
+
+    # LLM returns a title with a Ventura probate case number appended.
+    mock_llm.return_value = LLMExtractionResult(
+        case_count=1,
+        rulings=[
+            LLMRulingResult(
+                case_number="202200570654PRLP",
+                case_title="In the Matter of Denise Guadalupe Mejia 202200570654PRL",
+                outcome="granted",
+            )
+        ],
+    )
+
+    event = _make_event(
+        case_number=None,
+        case_title=None,
+        hearing_date=None,
+        ruling_text="Some ruling text",
+    )
+    with patch.object(worker, "_llm_split_document", return_value=False):
+        worker.process_event(event)
+
+    mock_llm.assert_called_once()
+    # Gather all bound args
+    all_sql_args = []
+    for call in mock_cur.execute.call_args_list:
+        args = call[0]
+        if len(args) > 1 and args[1] is not None:
+            all_sql_args.extend(args[1] if isinstance(args[1], (list, tuple)) else [])
+    # The title without the trailing case number should appear
+    assert "In the Matter of Denise Guadalupe Mejia" in all_sql_args
+
+
+@patch("ingestion.worker.resolve_judge", return_value=None)
+@patch("ingestion.worker.extract_fields_llm")
+@patch("ingestion.worker.psycopg")
+def test_process_event_rejects_probate_decedent_as_judge(
+    mock_psycopg: MagicMock,
+    mock_llm: MagicMock,
+    mock_resolve_judge: MagicMock,
+) -> None:
+    """Worker rejects LLM judge_name that matches the probate decedent (#2370).
+
+    Covers worker.py lines 1240, 1248-1249 — the "Rejected LLM judge_name as
+    probate decedent" log, ``judge_name = None``, and the
+    ``extraction_methods.pop("judge_name", None)`` cleanup.
+    """
+    from ingestion.llm_extract import LLMExtractionResult, LLMRulingResult
+
+    worker, _ = _make_worker()
+    worker._llm_client = MagicMock()
+
+    mock_conn, mock_cur = _make_mock_conn()
+    mock_psycopg.connect.return_value = mock_conn
+    # Use return_value rather than limited side_effect so extra fetchone calls
+    # (e.g. dept-judge fallback lookups after judge_name is discarded) don't
+    # raise StopIteration.
+    mock_cur.fetchone.return_value = ("uuid-1",)
+    mock_cur.fetchall.return_value = []
+    mock_cur.rowcount = 1
+
+    # LLM returns the decedent's name as the judge_name
+    mock_llm.return_value = LLMExtractionResult(
+        judge_name="Delbert L. Webb",
+        case_count=1,
+        rulings=[
+            LLMRulingResult(
+                case_number="202200570654PRLP",
+                case_title="Estate of Delbert L. Webb",
+                outcome="granted",
+            )
+        ],
+    )
+
+    event = _make_event(
+        case_number=None,
+        case_title=None,
+        judge_name=None,
+        hearing_date=None,
+        ruling_text="Some ruling text",
+    )
+    with patch.object(worker, "_llm_split_document", return_value=False):
+        worker.process_event(event)
+
+    mock_llm.assert_called_once()
+    # resolve_judge should NOT be called because the decedent name was rejected.
+    mock_resolve_judge.assert_not_called()

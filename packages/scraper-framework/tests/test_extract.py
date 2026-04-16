@@ -2144,3 +2144,408 @@ class TestCleanCaseTitle:
         # Result depends on whether case number is fully consumed
         if result is not None:
             assert "CVPS" not in result
+
+
+# ---------------------------------------------------------------------------
+# Ventura-specific fixes (#2370)
+# ---------------------------------------------------------------------------
+
+
+class TestVenturaCaseNumberValidation:
+    """Tests for is_valid_case_number with Ventura case number formats (#2370).
+
+    Ventura uses two probate case number formats:
+      - New: 4-digit year + 4-letter type code + 6-digit sequence (e.g. 2025CUPR042345)
+      - Old: 4-digit year + 6-digit sequence + "PR" + 2-letter subtype
+             (e.g. 202200570654PRLP, 201500471558PRCE, 202200572564PRLP)
+
+    Both formats must be accepted by the validator.
+    """
+
+    def test_ventura_new_format_probate(self) -> None:
+        assert is_valid_case_number("2025CUPR042345") is True
+
+    def test_ventura_new_format_civil(self) -> None:
+        assert is_valid_case_number("2024CUBC038456") is True
+
+    def test_ventura_old_format_probate_prlp(self) -> None:
+        """Old-format Ventura probate: 202200570654PRLP (16 chars)."""
+        assert is_valid_case_number("202200570654PRLP") is True
+
+    def test_ventura_old_format_probate_prce(self) -> None:
+        """Old-format Ventura probate: 201500471558PRCE."""
+        assert is_valid_case_number("201500471558PRCE") is True
+
+    def test_ventura_old_format_probate_short_subtype(self) -> None:
+        """Old-format Ventura probate with short 2-letter subtype."""
+        assert is_valid_case_number("202200572564PRLP") is True
+
+
+class TestDedupeRepeatedTitle:
+    """Tests for dedupe_repeated_title() — strips exact repeated substrings
+    from case titles (#2370).
+
+    Observed Ventura bug: LLM returns titles like
+      "CITY OF THOUSAND OAKS vs GLENN R PACKARD, et al. CITY OF THOUSAND OAKS
+      vs GLENN R PACKARD, et al."
+    where the full title is repeated 2-3x.
+    """
+
+    def test_repeated_twice(self) -> None:
+        from ingestion.extract import dedupe_repeated_title
+
+        raw = (
+            "CITY OF THOUSAND OAKS vs GLENN R PACKARD, et al. "
+            "CITY OF THOUSAND OAKS vs GLENN R PACKARD, et al."
+        )
+        result = dedupe_repeated_title(raw)
+        assert result == "CITY OF THOUSAND OAKS vs GLENN R PACKARD, et al."
+
+    def test_repeated_three_times(self) -> None:
+        from ingestion.extract import dedupe_repeated_title
+
+        raw = "Smith v. Jones Smith v. Jones Smith v. Jones"
+        result = dedupe_repeated_title(raw)
+        assert result == "Smith v. Jones"
+
+    def test_no_repetition(self) -> None:
+        from ingestion.extract import dedupe_repeated_title
+
+        raw = "Smith v. Jones"
+        assert dedupe_repeated_title(raw) == "Smith v. Jones"
+
+    def test_none_input(self) -> None:
+        from ingestion.extract import dedupe_repeated_title
+
+        assert dedupe_repeated_title(None) is None
+
+    def test_empty_string(self) -> None:
+        from ingestion.extract import dedupe_repeated_title
+
+        assert dedupe_repeated_title("") == ""
+
+    def test_short_string_no_dedup(self) -> None:
+        """Short strings (under 15 chars) should not be deduplicated to
+        avoid false positives on short repeated phrases."""
+        from ingestion.extract import dedupe_repeated_title
+
+        raw = "JOE JOE"
+        # Too short — should pass through unchanged
+        assert dedupe_repeated_title(raw) == raw
+
+    def test_preserves_leading_whitespace_trim(self) -> None:
+        from ingestion.extract import dedupe_repeated_title
+
+        raw = "  Smith v. Jones Smith v. Jones  "
+        result = dedupe_repeated_title(raw)
+        assert result == "Smith v. Jones"
+
+    def test_repeated_with_whitespace_variation(self) -> None:
+        """Repetition detection should be whitespace-tolerant."""
+        from ingestion.extract import dedupe_repeated_title
+
+        raw = (
+            "CITY OF THOUSAND OAKS vs GLENN R PACKARD, et al.  "
+            "CITY OF THOUSAND OAKS vs GLENN R PACKARD, et al."
+        )
+        result = dedupe_repeated_title(raw)
+        assert result == "CITY OF THOUSAND OAKS vs GLENN R PACKARD, et al."
+
+    def test_dedup_applied_via_clean_case_title(self) -> None:
+        """clean_case_title() should apply dedupe_repeated_title internally."""
+        raw = (
+            "CITY OF THOUSAND OAKS vs GLENN R PACKARD, et al. "
+            "CITY OF THOUSAND OAKS vs GLENN R PACKARD, et al."
+        )
+        cleaned = clean_case_title(raw)
+        assert cleaned is not None
+        # After dedupe, we have "CITY OF THOUSAND OAKS v. GLENN R PACKARD, et al."
+        # The cleaner converts all-caps to title case.
+        # Key assertion: the repetition is gone.
+        assert cleaned.lower().count("thousand oaks") == 1
+
+
+class TestStripTrailingCaseNumber:
+    """Tests for strip_trailing_case_number() — removes case numbers
+    appended to the end of a title (#2370).
+
+    Observed Ventura bug: probate titles end with the case number,
+    e.g. "In the Matter of Denise Guadalupe Mejia 202200570654PRL".
+    """
+
+    def test_strips_ventura_old_probate_number(self) -> None:
+        from ingestion.extract import strip_trailing_case_number
+
+        raw = "In the Matter of Denise Guadalupe Mejia 202200570654PRLP"
+        assert strip_trailing_case_number(raw) == "In the Matter of Denise Guadalupe Mejia"
+
+    def test_strips_ventura_new_probate_number(self) -> None:
+        from ingestion.extract import strip_trailing_case_number
+
+        raw = "Estate of Harold Jensen 2025CUPR042345"
+        assert strip_trailing_case_number(raw) == "Estate of Harold Jensen"
+
+    def test_preserves_title_without_trailing_number(self) -> None:
+        from ingestion.extract import strip_trailing_case_number
+
+        raw = "In the Matter of Denise Guadalupe Mejia"
+        assert strip_trailing_case_number(raw) == raw
+
+    def test_does_not_strip_leading_number(self) -> None:
+        """Only strips TRAILING case numbers — internal numbers stay."""
+        from ingestion.extract import strip_trailing_case_number
+
+        raw = "Case 2024CUBC038456 is Smith v. Jones"
+        # No trailing case number — title preserved
+        assert strip_trailing_case_number(raw) == raw
+
+    def test_none_input(self) -> None:
+        from ingestion.extract import strip_trailing_case_number
+
+        assert strip_trailing_case_number(None) is None
+
+    def test_empty_string(self) -> None:
+        from ingestion.extract import strip_trailing_case_number
+
+        assert strip_trailing_case_number("") == ""
+
+    def test_strips_trailing_partial_ventura_number(self) -> None:
+        """Handle partial old-format numbers (e.g. truncated to PRL)."""
+        from ingestion.extract import strip_trailing_case_number
+
+        raw = "In the Matter of Denise Guadalupe Mejia 202200570654PRL"
+        # Should strip the malformed case number from the end
+        assert strip_trailing_case_number(raw) == "In the Matter of Denise Guadalupe Mejia"
+
+
+class TestIsProbateDecedentName:
+    """Tests for is_probate_decedent_name() — checks whether a candidate
+    judge name matches a probate party name in the case title (#2370).
+
+    Observed Ventura bug: for probate cases, the LLM extracts the decedent's
+    name (prominent in the caption) as the judge_name.
+    """
+
+    def test_decedent_name_matches_title(self) -> None:
+        from ingestion.extract import is_probate_decedent_name
+
+        case_title = "Estate of Delbert L. Webb"
+        assert is_probate_decedent_name("Delbert L. Webb", case_title) is True
+
+    def test_decedent_name_matches_in_the_matter_of(self) -> None:
+        from ingestion.extract import is_probate_decedent_name
+
+        case_title = "In the Matter of Denise Guadalupe Mejia"
+        assert is_probate_decedent_name("Denise Guadalupe Mejia", case_title) is True
+
+    def test_conservatorship_of_matches(self) -> None:
+        from ingestion.extract import is_probate_decedent_name
+
+        case_title = "Conservatorship of Mary Smith"
+        assert is_probate_decedent_name("Mary Smith", case_title) is True
+
+    def test_trust_of_matches(self) -> None:
+        from ingestion.extract import is_probate_decedent_name
+
+        case_title = "Benjamin King Trust"
+        assert is_probate_decedent_name("Benjamin King", case_title) is True
+
+    def test_non_probate_title_returns_false(self) -> None:
+        """Adversarial (civil) titles should not trigger the guard."""
+        from ingestion.extract import is_probate_decedent_name
+
+        case_title = "Smith v. Jones"
+        assert is_probate_decedent_name("John Doe", case_title) is False
+
+    def test_judge_name_different_from_party(self) -> None:
+        """Real judge name (not matching the party) returns False."""
+        from ingestion.extract import is_probate_decedent_name
+
+        case_title = "Estate of Delbert L. Webb"
+        # Real judge for probate dept J6
+        assert is_probate_decedent_name("Gilbert A. Romero", case_title) is False
+
+    def test_none_inputs(self) -> None:
+        from ingestion.extract import is_probate_decedent_name
+
+        assert is_probate_decedent_name(None, "Estate of Smith") is False
+        assert is_probate_decedent_name("Smith", None) is False
+        assert is_probate_decedent_name(None, None) is False
+
+    def test_partial_match_case_insensitive(self) -> None:
+        from ingestion.extract import is_probate_decedent_name
+
+        case_title = "ESTATE OF HAROLD JENSEN, DECEASED"
+        assert is_probate_decedent_name("Harold Jensen", case_title) is True
+
+
+class TestIsPlausibleHearingDate:
+    """Tests for is_plausible_hearing_date() — validates a candidate
+    hearing_date against the document capture timestamp (#2370).
+
+    Observed Ventura bug: LLM picks up future continuance dates from ruling
+    body text as hearing_date. The actual hearing is typically on or near
+    the capture day.
+    """
+
+    def test_capture_day_is_plausible(self) -> None:
+        from datetime import datetime
+
+        from ingestion.extract import is_plausible_hearing_date
+
+        capture = datetime(2026, 3, 25, 12, 0, 0)
+        hearing = date(2026, 3, 25)
+        assert is_plausible_hearing_date(hearing, capture) is True
+
+    def test_day_before_capture_is_plausible(self) -> None:
+        """Agencies sometimes capture the day after the hearing."""
+        from datetime import datetime
+
+        from ingestion.extract import is_plausible_hearing_date
+
+        capture = datetime(2026, 3, 26, 9, 0, 0)
+        hearing = date(2026, 3, 25)
+        assert is_plausible_hearing_date(hearing, capture) is True
+
+    def test_future_date_within_window_is_plausible(self) -> None:
+        """A hearing up to 7 days after capture is plausible (tentative rulings
+        are typically posted a day or so before the hearing)."""
+        from datetime import datetime
+
+        from ingestion.extract import is_plausible_hearing_date
+
+        capture = datetime(2026, 3, 25, 12, 0, 0)
+        hearing = date(2026, 3, 28)
+        assert is_plausible_hearing_date(hearing, capture) is True
+
+    def test_far_future_date_not_plausible(self) -> None:
+        """A continuance date months in the future is NOT the hearing date."""
+        from datetime import datetime
+
+        from ingestion.extract import is_plausible_hearing_date
+
+        capture = datetime(2026, 3, 25, 12, 0, 0)
+        hearing = date(2026, 5, 14)  # 50 days later — classic continuance
+        assert is_plausible_hearing_date(hearing, capture) is False
+
+    def test_december_far_future_not_plausible(self) -> None:
+        from datetime import datetime
+
+        from ingestion.extract import is_plausible_hearing_date
+
+        capture = datetime(2026, 3, 23, 12, 0, 0)
+        hearing = date(2026, 12, 11)
+        assert is_plausible_hearing_date(hearing, capture) is False
+
+    def test_far_past_date_not_plausible(self) -> None:
+        """A date months before capture is likely a referenced minute order,
+        not the actual hearing."""
+        from datetime import datetime
+
+        from ingestion.extract import is_plausible_hearing_date
+
+        capture = datetime(2026, 3, 30, 12, 0, 0)
+        hearing = date(2025, 12, 4)
+        assert is_plausible_hearing_date(hearing, capture) is False
+
+    def test_none_hearing_is_not_plausible(self) -> None:
+        from datetime import datetime
+
+        from ingestion.extract import is_plausible_hearing_date
+
+        capture = datetime(2026, 3, 25, 12, 0, 0)
+        assert is_plausible_hearing_date(None, capture) is False
+
+    def test_none_capture_is_plausible(self) -> None:
+        """Without a capture timestamp we can't validate — default to
+        plausible (be permissive, don't drop data we can't verify)."""
+        from ingestion.extract import is_plausible_hearing_date
+
+        hearing = date(2026, 5, 14)
+        assert is_plausible_hearing_date(hearing, None) is True
+
+
+class TestDedupeRepeatedTitleEdgeCases:
+    """Branch coverage for dedupe_repeated_title() edge cases (#2370)."""
+
+    def test_whitespace_only_returns_input(self) -> None:
+        """Whitespace-only after collapse returns the original input."""
+        from ingestion.extract import dedupe_repeated_title
+
+        # A string of only whitespace: after .split() returns empty list,
+        # " ".join([]) == "", which hits the "not normalized" branch.
+        result = dedupe_repeated_title("   \t  \n  ")
+        # Should return the original input (not None, not stripped)
+        assert result == "   \t  \n  "
+
+    def test_prefix_mid_word_candidates_fall_through(self) -> None:
+        """Candidates that would split mid-word are skipped; no dedup detected.
+
+        A title with no repeated structure exercises many loop iterations
+        where `normalized[prefix_len] != " "` skips via `continue`, and
+        ultimately falls through to `return normalized`.
+        """
+        from ingestion.extract import dedupe_repeated_title
+
+        # Plain non-repeating sentence long enough to iterate many prefixes
+        raw = "The quick brown fox jumps over the lazy dog and runs away"
+        result = dedupe_repeated_title(raw)
+        # No valid dedup possible → returns normalized input unchanged
+        assert result == raw
+
+    def test_no_rest_after_prefix_skip(self) -> None:
+        """When the prefix consumes everything but trailing whitespace,
+        `rest` is empty and the loop should skip this prefix length."""
+        from ingestion.extract import dedupe_repeated_title
+
+        # No rest after prefix: no repetition detected — returns normalized.
+        raw = "Unique Non-Repeating Title XYZ"
+        result = dedupe_repeated_title(raw)
+        assert result == raw
+
+
+class TestIsProbateDecedentNameEdgeCases:
+    """Branch coverage for is_probate_decedent_name() edge cases (#2370)."""
+
+    def test_empty_normalized_candidate(self) -> None:
+        """When candidate normalizes to an empty/tiny string, return False."""
+        from ingestion.extract import is_probate_decedent_name
+
+        # Candidate of only punctuation normalizes to empty
+        assert is_probate_decedent_name(".,", "Estate of Smith") is False
+        # Very short candidate (< 3 chars) returns False
+        assert is_probate_decedent_name("Jo", "Estate of Smith") is False
+
+    def test_single_token_candidate_no_substring(self) -> None:
+        """Single-token candidate that is not a substring of the title returns False."""
+        from ingestion.extract import is_probate_decedent_name
+
+        # "Romero" is a single token not in the title — returns False
+        # without entering the multi-token matching branch.
+        assert is_probate_decedent_name("Romero", "Estate of Smith") is False
+
+    def test_token_match_all_tokens_found(self) -> None:
+        """Multi-token candidate where all tokens appear in order — True path."""
+        from ingestion.extract import is_probate_decedent_name
+
+        # "Jane Smith" appears as tokens inside "In the Matter of Jane M Smith"
+        assert (
+            is_probate_decedent_name(
+                "Jane Smith",
+                "In the Matter of Jane M Smith",
+            )
+            is True
+        )
+
+    def test_token_match_missing_token_returns_false(self) -> None:
+        """Multi-token candidate where a token is absent — False."""
+        from ingestion.extract import is_probate_decedent_name
+
+        # "Jane Williams" — Williams not in title
+        assert (
+            is_probate_decedent_name(
+                "Jane Williams",
+                "In the Matter of Jane M Smith",
+            )
+            is False
+        )
