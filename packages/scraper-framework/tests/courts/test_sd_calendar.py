@@ -729,6 +729,224 @@ class TestExtractCaseSection:
 
 
 # ---------------------------------------------------------------------------
+# parse_document — metadata extraction (#2331)
+# ---------------------------------------------------------------------------
+
+
+class TestParseDocumentMetadata:
+    """Tests for parse_document re-extracting metadata from calendar HTML (#2331)."""
+
+    def test_extracts_department(self) -> None:
+        """parse_document extracts department from HTML when not already set."""
+        config = _make_config()
+        scraper = SDCalendarScraper(config)
+
+        from framework.models import CapturedDocument
+
+        html = _load_html("sd_calendar_central.html")
+        doc = CapturedDocument(
+            scraper_id="ca-sd-calendar",
+            state="CA",
+            county="San Diego",
+            court="Superior Court",
+            source_url="http://example.com",
+            capture_timestamp=datetime(2026, 3, 13),
+            content_format=ContentFormat.HTML,
+            raw_content=html.encode("utf-8"),
+            content_hash="abc123",
+            case_number="24CU016153C",
+        )
+        result = scraper.parse_document(doc)
+        assert result.department == "C-60"
+
+    def test_extracts_judge_name(self) -> None:
+        """parse_document extracts judge name from HTML when not already set."""
+        config = _make_config()
+        scraper = SDCalendarScraper(config)
+
+        from framework.models import CapturedDocument
+
+        html = _load_html("sd_calendar_central.html")
+        doc = CapturedDocument(
+            scraper_id="ca-sd-calendar",
+            state="CA",
+            county="San Diego",
+            court="Superior Court",
+            source_url="http://example.com",
+            capture_timestamp=datetime(2026, 3, 13),
+            content_format=ContentFormat.HTML,
+            raw_content=html.encode("utf-8"),
+            content_hash="abc123",
+            case_number="24CU016153C",
+        )
+        result = scraper.parse_document(doc)
+        assert result.judge_name == "Matthew C. Braner"
+
+    def test_extracts_hearing_date(self) -> None:
+        """parse_document extracts hearing date from HTML when not already set."""
+        config = _make_config()
+        scraper = SDCalendarScraper(config)
+
+        from framework.models import CapturedDocument
+
+        html = _load_html("sd_calendar_central.html")
+        doc = CapturedDocument(
+            scraper_id="ca-sd-calendar",
+            state="CA",
+            county="San Diego",
+            court="Superior Court",
+            source_url="http://example.com",
+            capture_timestamp=datetime(2026, 3, 13),
+            content_format=ContentFormat.HTML,
+            raw_content=html.encode("utf-8"),
+            content_hash="abc123",
+            case_number="24CU016153C",
+        )
+        result = scraper.parse_document(doc)
+        assert result.hearing_date == datetime(2026, 3, 13)
+
+    def test_extracts_case_title(self) -> None:
+        """parse_document extracts case title from HTML when not already set."""
+        config = _make_config()
+        scraper = SDCalendarScraper(config)
+
+        from framework.models import CapturedDocument
+
+        html = _load_html("sd_calendar_central.html")
+        doc = CapturedDocument(
+            scraper_id="ca-sd-calendar",
+            state="CA",
+            county="San Diego",
+            court="Superior Court",
+            source_url="http://example.com",
+            capture_timestamp=datetime(2026, 3, 13),
+            content_format=ContentFormat.HTML,
+            raw_content=html.encode("utf-8"),
+            content_hash="abc123",
+            case_number="24CU016153C",
+        )
+        result = scraper.parse_document(doc)
+        assert result.case_title == "Aasi et al vs American Honda Motor Co Inc"
+
+    def test_extracts_parties(self) -> None:
+        """parse_document extracts parties from HTML when not already set."""
+        config = _make_config()
+        scraper = SDCalendarScraper(config)
+
+        from framework.models import CapturedDocument
+
+        html = _load_html("sd_calendar_central.html")
+        doc = CapturedDocument(
+            scraper_id="ca-sd-calendar",
+            state="CA",
+            county="San Diego",
+            court="Superior Court",
+            source_url="http://example.com",
+            capture_timestamp=datetime(2026, 3, 13),
+            content_format=ContentFormat.HTML,
+            raw_content=html.encode("utf-8"),
+            content_hash="abc123",
+            case_number="24CU016153C",
+        )
+        result = scraper.parse_document(doc)
+        assert len(result.parties) == 3
+        names = {p["name"] for p in result.parties}
+        assert "Sumayya Aasi" in names
+
+    def test_extracts_motion_type(self) -> None:
+        """parse_document extracts motion type (event_type) from HTML."""
+        config = _make_config()
+        scraper = SDCalendarScraper(config)
+
+        from framework.models import CapturedDocument
+
+        html = _load_html("sd_calendar_central.html")
+        doc = CapturedDocument(
+            scraper_id="ca-sd-calendar",
+            state="CA",
+            county="San Diego",
+            court="Superior Court",
+            source_url="http://example.com",
+            capture_timestamp=datetime(2026, 3, 13),
+            content_format=ContentFormat.HTML,
+            raw_content=html.encode("utf-8"),
+            content_hash="abc123",
+            case_number="24CU016153C",
+        )
+        result = scraper.parse_document(doc)
+        assert result.motion_type == "Motion Hearing"
+
+    def test_preserves_existing_fields(self) -> None:
+        """parse_document does not overwrite fields that are already populated."""
+        config = _make_config()
+        scraper = SDCalendarScraper(config)
+
+        from framework.models import CapturedDocument
+
+        html = _load_html("sd_calendar_central.html")
+        doc = CapturedDocument(
+            scraper_id="ca-sd-calendar",
+            state="CA",
+            county="San Diego",
+            court="Superior Court",
+            source_url="http://example.com",
+            capture_timestamp=datetime(2026, 3, 13),
+            content_format=ContentFormat.HTML,
+            raw_content=html.encode("utf-8"),
+            content_hash="abc123",
+            case_number="24CU016153C",
+            department="PRESET-DEPT",
+            judge_name="Preset Judge",
+            ruling_text="preset ruling text",
+        )
+        result = scraper.parse_document(doc)
+        # Existing fields should NOT be overwritten
+        assert result.department == "PRESET-DEPT"
+        assert result.judge_name == "Preset Judge"
+        assert result.ruling_text == "preset ruling text"
+        # But missing fields should be populated
+        assert result.case_title == "Aasi et al vs American Honda Motor Co Inc"
+        assert result.hearing_date == datetime(2026, 3, 13)
+
+    def test_ruling_text_has_no_raw_html(self) -> None:
+        """ruling_text should be plain text, not raw HTML (#2331)."""
+        config = _make_config()
+        scraper = SDCalendarScraper(config)
+
+        from framework.models import CapturedDocument
+
+        html = _load_html("sd_calendar_central.html")
+        doc = CapturedDocument(
+            scraper_id="ca-sd-calendar",
+            state="CA",
+            county="San Diego",
+            court="Superior Court",
+            source_url="http://example.com",
+            capture_timestamp=datetime(2026, 3, 13),
+            content_format=ContentFormat.HTML,
+            raw_content=html.encode("utf-8"),
+            content_hash="abc123",
+            case_number="24CU016153C",
+        )
+        result = scraper.parse_document(doc)
+        assert result.ruling_text is not None
+        # Must NOT contain raw HTML tags
+        assert "<" not in result.ruling_text
+        assert ">" not in result.ruling_text
+        # Must contain structured case information
+        assert "24CU016153C" in result.ruling_text
+        assert "Department: C-60" in result.ruling_text
+
+    def test_extraction_config_is_none_for_calendar(self) -> None:
+        """SD calendar scraper uses ExtractionMethod.NONE (#2331)."""
+        from framework.extraction_config import ExtractionMethod, get_county_extraction_config
+
+        config = get_county_extraction_config("CA", "San Diego", scraper_id="ca-sd-calendar")
+        assert config is not None
+        assert config.method == ExtractionMethod.NONE
+
+
+# ---------------------------------------------------------------------------
 # default_config — factory test
 # ---------------------------------------------------------------------------
 

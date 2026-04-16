@@ -491,32 +491,62 @@ class SDCalendarScraper(BaseScraper):
         return docs
 
     def parse_document(self, doc: CapturedDocument) -> CapturedDocument:
-        """Re-parse a calendar document, narrowing ruling_text to the specific case.
+        """Re-parse a calendar document, extracting per-case metadata and text.
 
         During reingest, each document has the full calendar page as
         ``raw_content`` but only represents a single case.  When
-        ``doc.case_number`` is set, this method extracts just that case's
-        row from the HTML, producing a focused ``ruling_text`` that the
-        LLM can process without output truncation (#2311).
+        ``doc.case_number`` is set, this method:
+
+        1. Extracts a focused ``ruling_text`` for just that case's row
+           (no raw HTML — plain text with structured fields).
+        2. Re-populates metadata fields (department, judge, hearing_date,
+           case_title, parties, motion_type) from the HTML structure.
+
+        Since the SD calendar uses ``ExtractionMethod.NONE`` (#2331),
+        the ingestion worker will NOT run any LLM extraction — all fields
+        must be populated here from the structured HTML.
 
         Fields already populated on the document (from the original
-        ``fetch_documents`` call) are preserved — this only fills in
-        ``ruling_text`` when it is not already set.
+        ``fetch_documents`` call) are preserved.
         """
-        if doc.ruling_text or not doc.case_number:
+        if not doc.case_number:
             return doc
 
         try:
             html = doc.raw_content.decode("utf-8")
-            section = extract_case_section(html, doc.case_number)
-            if section:
-                doc.ruling_text = section
         except Exception as exc:
             logger.warning(
-                "Failed to extract case section from calendar HTML",
+                "Failed to decode calendar HTML",
                 case_number=doc.case_number,
                 error=str(exc),
             )
+            return doc
+
+        # Parse the full page and find the matching hearing.
+        hearings = parse_calendar_page(html)
+        matching = [h for h in hearings if h.case_number == doc.case_number]
+
+        if matching:
+            hearing = matching[0]
+            # Populate metadata fields that are not already set.
+            if not doc.department:
+                doc.department = hearing.department
+            if not doc.judge_name:
+                doc.judge_name = hearing.judge_name
+            if not doc.hearing_date:
+                doc.hearing_date = hearing.hearing_date
+            if not doc.case_title:
+                doc.case_title = hearing.case_title
+            if not doc.motion_type:
+                doc.motion_type = hearing.event_type
+            if not doc.parties:
+                doc.parties = hearing.parties
+
+        # Set ruling_text to a focused per-case excerpt (no raw HTML).
+        if not doc.ruling_text:
+            section = extract_case_section(html, doc.case_number)
+            if section:
+                doc.ruling_text = section
 
         return doc
 

@@ -145,11 +145,42 @@ _COUNTY_CONFIGS: dict[tuple[str, str], CountyExtractionConfig] = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Scraper-level extraction overrides
+# ---------------------------------------------------------------------------
+# Some scrapers within a county need a different extraction method than the
+# county default.  For example, San Diego has two scraper paths:
+#   - ca-sd-calendar:    structured HTML calendar, fully parsed by the scraper
+#   - ca-sd-tentatives:  ROA ruling text, needs LLM for outcome/motion_type
+#
+# The county default is LLM (for tentative rulings), but the calendar scraper
+# should use NONE because its structured HTML is already fully parsed — the
+# scraper extracts all metadata (judge, department, hearing date, case number,
+# case title, parties, motion type) directly from the HTML table structure.
+# Running the LLM on calendar HTML is wasteful and produces wrong results
+# (wrong dates from body text, truncated multi-case output, raw HTML stored
+# as ruling_text).  See #2331.
+#
+# Key: scraper_id string.
+_SCRAPER_CONFIGS: dict[str, CountyExtractionConfig] = {
+    "ca-sd-calendar": CountyExtractionConfig(
+        method=ExtractionMethod.NONE,
+    ),
+}
+
+
 def get_county_extraction_config(
     state: str,
     county: str,
+    *,
+    scraper_id: str | None = None,
 ) -> CountyExtractionConfig | None:
     """Look up the extraction config for a (state, county) pair.
+
+    When *scraper_id* is provided, checks for a scraper-level override
+    first.  This allows scrapers within the same county to use different
+    extraction methods (e.g., San Diego calendar uses ``NONE`` while
+    San Diego tentative rulings uses ``LLM``).
 
     Returns ``None`` if no custom configuration exists — the caller
     should fall back to the default framework extraction behaviour.
@@ -160,10 +191,16 @@ def get_county_extraction_config(
         Two-letter state code (e.g. ``"CA"``).
     county : str
         County name (e.g. ``"Riverside"``).
+    scraper_id : str | None
+        Optional scraper ID for scraper-level overrides.
 
     Returns
     -------
     CountyExtractionConfig | None
-        The county-specific config, or ``None`` if not registered.
+        The scraper-specific or county-specific config, or ``None``
+        if not registered.
     """
+    # Check scraper-level override first.
+    if scraper_id and scraper_id in _SCRAPER_CONFIGS:
+        return _SCRAPER_CONFIGS[scraper_id]
     return _COUNTY_CONFIGS.get((state.upper(), county.upper()))
