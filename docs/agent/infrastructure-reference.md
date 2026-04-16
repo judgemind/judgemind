@@ -88,7 +88,7 @@ See `docs/terraform-checklist.md` for the full checklist.
 
 ```
 # Run a script and wait for completion (default)
-scripts/ecs-run-task.sh scripts/backfill_normalize_departments.py -- --dry-run
+scripts/ecs-run-task.sh scripts/backfill_llm_enrichment.py -- --dry-run
 
 # Long-running tasks: launch and detach, check logs later
 scripts/ecs-run-task.sh --detach scripts/reingest_from_s3.py -- --all
@@ -102,7 +102,7 @@ scripts/ecs-task-logs.sh <task-id>
 scripts/ecs-task-logs.sh <task-id> --follow
 
 # Override CPU/memory (default: 1024 CPU / 4096 MB)
-scripts/ecs-run-task.sh --cpu 2048 --memory 8192 scripts/dedup_judges.py
+scripts/ecs-run-task.sh --cpu 2048 --memory 8192 scripts/audit_field_completeness.py
 ```
 
 ### Reingest vs Rebuild
