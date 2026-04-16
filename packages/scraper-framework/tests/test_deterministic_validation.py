@@ -13,6 +13,7 @@ from validation.deterministic import (
     check_case_number_not_unknown,
     check_hearing_date_in_range,
     check_no_concatenated_titles,
+    check_no_duplicate_ruling_text,
     check_no_html_in_ruling_text,
     check_ruling_text_not_empty,
     check_ruling_text_reasonable_length,
@@ -261,6 +262,84 @@ class TestRulingTextReasonableLength:
         """Length above 50000 should pass (only exact sentinel is flagged)."""
         result = check_ruling_text_reasonable_length("x" * 50_001)
         assert result.result == "pass"
+
+
+# ---------------------------------------------------------------------------
+# no_duplicate_ruling_text
+# ---------------------------------------------------------------------------
+
+
+class TestNoDuplicateRulingText:
+    """Tests for the no_duplicate_ruling_text rule."""
+
+    def test_pass_single_ruling(self) -> None:
+        """Single-ruling documents cannot have duplicates."""
+        result = check_no_duplicate_ruling_text([500])
+        assert result.result == "pass"
+        assert result.rule == "no_duplicate_ruling_text"
+
+    def test_pass_empty_list(self) -> None:
+        """Empty list should pass (no rulings to compare)."""
+        result = check_no_duplicate_ruling_text([])
+        assert result.result == "pass"
+
+    def test_pass_distinct_lengths(self) -> None:
+        """Two rulings with different lengths should pass."""
+        result = check_no_duplicate_ruling_text([500, 1200])
+        assert result.result == "pass"
+
+    def test_pass_three_distinct_lengths(self) -> None:
+        """Three rulings with all-different lengths should pass."""
+        result = check_no_duplicate_ruling_text([500, 1200, 800])
+        assert result.result == "pass"
+
+    def test_flag_two_same_length(self) -> None:
+        """Two rulings with the same length should flag."""
+        result = check_no_duplicate_ruling_text([500, 500])
+        assert result.result == "flag"
+        assert "duplicate ruling_text lengths" in (result.reason or "")
+        assert "length 500 appears 2 times" in (result.reason or "")
+
+    def test_flag_three_same_length(self) -> None:
+        """Three rulings with the same length should flag — acceptance criterion #3."""
+        result = check_no_duplicate_ruling_text([1234, 1234, 1234])
+        assert result.result == "flag"
+        assert "length 1234 appears 3 times" in (result.reason or "")
+
+    def test_flag_four_same_length(self) -> None:
+        """Four rulings with the same length should flag."""
+        result = check_no_duplicate_ruling_text([7500, 7500, 7500, 7500])
+        assert result.result == "flag"
+        assert "length 7500 appears 4 times" in (result.reason or "")
+
+    def test_flag_mixed_some_duplicate(self) -> None:
+        """Mix of distinct and duplicate lengths — only duplicates flagged."""
+        result = check_no_duplicate_ruling_text([500, 1200, 500, 800])
+        assert result.result == "flag"
+        assert "length 500 appears 2 times" in (result.reason or "")
+
+    def test_pass_all_none(self) -> None:
+        """All None lengths (no text) should pass — handled by ruling_text_not_empty."""
+        result = check_no_duplicate_ruling_text([None, None, None])
+        assert result.result == "pass"
+
+    def test_pass_one_non_none(self) -> None:
+        """Only one non-None length — need 2+ to compare."""
+        result = check_no_duplicate_ruling_text([500, None, None])
+        assert result.result == "pass"
+
+    def test_flag_ignores_none_values(self) -> None:
+        """None values are excluded; duplicates among non-None still flagged."""
+        result = check_no_duplicate_ruling_text([500, None, 500])
+        assert result.result == "flag"
+        assert "length 500 appears 2 times" in (result.reason or "")
+
+    def test_flag_multiple_duplicate_groups(self) -> None:
+        """Multiple groups of duplicates should all be reported."""
+        result = check_no_duplicate_ruling_text([500, 1200, 500, 1200])
+        assert result.result == "flag"
+        assert "length 500 appears 2 times" in (result.reason or "")
+        assert "length 1200 appears 2 times" in (result.reason or "")
 
 
 # ---------------------------------------------------------------------------

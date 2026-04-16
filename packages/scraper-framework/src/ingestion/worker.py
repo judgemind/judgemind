@@ -47,7 +47,7 @@ from framework.enrichment import EnrichmentEngine
 from framework.llm_extractor import LlmExtractor
 from framework.search.indexer import IndexingConsumer
 from framework.search.mapping import TENTATIVE_RULINGS_ALIAS
-from validation.deterministic import run_deterministic_rules
+from validation.deterministic import check_no_duplicate_ruling_text, run_deterministic_rules
 from validation.gate import ValidationResult, insert_validation_result, validate_document
 from validation.issue_filer import file_validation_issue
 
@@ -2053,6 +2053,56 @@ class IngestionWorker:
                         "error": str(exc),
                     },
                 )
+
+        # ------------------------------------------------------------------
+        # Document-level deterministic validation: duplicate ruling text
+        # lengths (#2350).  This check runs across all split rulings from
+        # the same document before they are dispatched individually.
+        # ------------------------------------------------------------------
+        ruling_text_lengths: list[int | None] = [
+            len(cr.ruling_text) if cr.ruling_text is not None else None for cr in converted
+        ]
+        dup_result = check_no_duplicate_ruling_text(ruling_text_lengths)
+        if dup_result.result == "flag":
+            logger.info(
+                "Deterministic validation flag: duplicate ruling text lengths",
+                extra={
+                    "document_id": document_id,
+                    "ruling_count": len(converted),
+                    "ruling_text_lengths": ruling_text_lengths,
+                    "reason": dup_result.reason,
+                    "county": county,
+                    "state": state,
+                },
+            )
+            try:
+                conn = self._get_connection()
+                insert_validation_result(
+                    conn,
+                    document_id=document_id,
+                    ruling_id=None,
+                    result=ValidationResult(
+                        result="flag",
+                        reason=dup_result.reason or "",
+                        model="deterministic",
+                        input_tokens=0,
+                        output_tokens=0,
+                        latency_ms=0,
+                    ),
+                )
+                conn.commit()
+            except Exception as exc:
+                logger.warning(
+                    "Failed to log duplicate ruling text validation flag to DB: %s",
+                    exc,
+                )
+                # Rollback to clear any aborted transaction state so
+                # subsequent split-event DB writes can proceed (#2350).
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+            # Continue — flag does not block split event dispatch.
 
         for cr in converted:
             # For multimodal-extracted PDFs, ruling_text is markdown.

@@ -193,6 +193,62 @@ def check_case_number_not_unknown(case_number: str | None) -> DeterministicRuleR
     return DeterministicRuleResult(rule="case_number_not_unknown", result="pass")
 
 
+def check_no_duplicate_ruling_text(
+    ruling_text_lengths: list[int | None],
+) -> DeterministicRuleResult:
+    """Check that split rulings from the same document have distinct text lengths.
+
+    When a multi-ruling document is split, each ruling should have a different
+    ``ruling_text`` length.  If multiple rulings share the same length, it
+    usually means the entire page was stored N times instead of individual
+    rulings being split out.
+
+    This rule operates at the **document level** (across all rulings from one
+    document) rather than per-ruling.  It is called from the worker's
+    ``_llm_split_document()`` method after conversion, not from
+    ``run_deterministic_rules()`` (which runs per-ruling).
+
+    Parameters
+    ----------
+    ruling_text_lengths:
+        List of ``len(ruling_text)`` for each ruling in the document, or
+        ``None`` for rulings with no text.  Must contain at least 2 entries
+        for the check to be meaningful.
+    """
+    # Need at least 2 rulings to detect duplicates.
+    if len(ruling_text_lengths) < 2:
+        return DeterministicRuleResult(rule="no_duplicate_ruling_text", result="pass")
+
+    # Filter out None values — rulings with no text are handled by
+    # ruling_text_not_empty.
+    non_none_lengths = [length for length in ruling_text_lengths if length is not None]
+
+    if len(non_none_lengths) < 2:
+        return DeterministicRuleResult(rule="no_duplicate_ruling_text", result="pass")
+
+    # Count occurrences of each length.
+    length_counts: dict[int, int] = {}
+    for length in non_none_lengths:
+        length_counts[length] = length_counts.get(length, 0) + 1
+
+    # Find lengths that appear more than once.
+    duplicates = {length: count for length, count in length_counts.items() if count > 1}
+
+    if duplicates:
+        # Build a human-readable summary of the duplicates.
+        parts = [f"length {length} appears {count} times" for length, count in duplicates.items()]
+        detail = "; ".join(parts)
+        return DeterministicRuleResult(
+            rule="no_duplicate_ruling_text",
+            result="flag",
+            reason=f"{len(non_none_lengths)} rulings from the same document have "
+            f"duplicate ruling_text lengths ({detail}) — "
+            "likely storing entire page N times instead of individual rulings",
+        )
+
+    return DeterministicRuleResult(rule="no_duplicate_ruling_text", result="pass")
+
+
 def check_ruling_text_reasonable_length(ruling_text: str | None) -> DeterministicRuleResult:
     """Check that ruling_text length is not exactly the truncation sentinel.
 
