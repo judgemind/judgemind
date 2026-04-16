@@ -1,7 +1,10 @@
-"""Tests for the ingestion worker — Postgres and OpenSearch writes.
+"""Tests for the ingestion worker -- Postgres and OpenSearch writes.
 
 All external dependencies (Postgres, Redis, OpenSearch, S3) are mocked so
 these tests run offline in CI without any infrastructure.
+
+Note: _match_ruling tests below import from ingestion.worker (not
+reingest_from_s3 which was refactored in #2289 to delegate to the worker).
 """
 
 from __future__ import annotations
