@@ -405,6 +405,32 @@ if [ -n "$changed_workflows" ]; then
 fi
 
 # -------------------------------------------------------------------
+# CI job-skipped check — run whenever .github/workflows/ci.yml changes
+# -------------------------------------------------------------------
+# Catches the #2505 / #2410 footgun: a PR modifies a job body in ci.yml
+# whose if-gate paths-filter doesn't match anything in the diff, so the
+# job would be SKIPPED on that PR's CI run and the modification is never
+# actually exercised. Mirrors the CI `ci-job-skipped-check` job so the
+# failure is caught before the push even reaches CI (#2527).
+changed_ci_yml=$(echo "$changed_files" | grep -E '^\.github/workflows/ci\.yml$' || true)
+if [ -n "$changed_ci_yml" ]; then
+    echo "pre-push: checking for modified-but-skipped CI jobs..." >&2
+    if [ -x scripts/check-ci-job-skipped.sh ]; then
+        if ! scripts/check-ci-job-skipped.sh 2>&1; then
+            echo "" >&2
+            echo "  FAILED: scripts/check-ci-job-skipped.sh" >&2
+            echo "  A job body in ci.yml was modified but its paths-filter" >&2
+            echo "  gate doesn't match anything in the diff — the job will" >&2
+            echo "  be SKIPPED on this PR's CI run and the change won't be" >&2
+            echo "  exercised. See issue #2527 for background." >&2
+            failures=$((failures + 1))
+        fi
+    else
+        echo "  WARNING: scripts/check-ci-job-skipped.sh not found or not executable — skipping" >&2
+    fi
+fi
+
+# -------------------------------------------------------------------
 # Markdown link check — run whenever any .md file is in the push
 # -------------------------------------------------------------------
 # Mirrors the CI `markdown-links-check` job so broken internal pointers
