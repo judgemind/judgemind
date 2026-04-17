@@ -413,6 +413,54 @@ test_timeout() {
     fi
 }
 
+# Test 6a: COMPLETED with desiredCount=0 and runningCount=0 exits 0.
+# Mirrors the scale-to-zero deployment case from #2585 — the dev ingestion
+# worker is kept at desiredCount=0, and ECS marks new deployments COMPLETED
+# immediately. The script used to require runningCount>0 and timed out in
+# this case; now it treats running==desired==0 as a valid success state.
+test_scale_to_zero_completed() {
+    local tmpdir
+    tmpdir=$(make_temp_dir)
+    mkdir -p "$tmpdir/responses"
+    write_response "$tmpdir/responses/01.json" "COMPLETED" 0 0 0
+
+    local output exit_code
+    output=$(run_script "$tmpdir" 2>&1) || exit_code=$?
+    exit_code="${exit_code:-0}"
+
+    if [[ "$exit_code" -eq 0 ]]; then
+        pass "scale-to-zero COMPLETED (desired=0, running=0) exits 0"
+    else
+        fail "scale-to-zero COMPLETED (desired=0, running=0) exits 0" "exit=$exit_code output=$output"
+    fi
+
+    if echo "$output" | grep -qi "success"; then
+        pass "scale-to-zero COMPLETED emits a success message"
+    else
+        fail "scale-to-zero COMPLETED emits a success message" "output=$output"
+    fi
+}
+
+# Test 6b: deployment-id selector also accepts scale-to-zero COMPLETED.
+# Covers the operator --force-new-deployment redeploy path (scripts/ecs-redeploy.sh)
+# when the service is scaled to desiredCount=0.
+test_deployment_id_scale_to_zero_completed() {
+    local tmpdir
+    tmpdir=$(make_temp_dir)
+    mkdir -p "$tmpdir/responses"
+    write_response_redeploy "$tmpdir/responses/01.json" "COMPLETED" 0 0 0
+
+    local output exit_code
+    output=$(run_script_by_deployment_id "$tmpdir" "ecs-svc/new-redeploy" 2>&1) || exit_code=$?
+    exit_code="${exit_code:-0}"
+
+    if [[ "$exit_code" -eq 0 ]]; then
+        pass "deployment-id scale-to-zero COMPLETED exits 0"
+    else
+        fail "deployment-id scale-to-zero COMPLETED exits 0" "exit=$exit_code output=$output"
+    fi
+}
+
 # Test 6: COMPLETED with running!=desired keeps polling until real completion.
 test_completed_but_running_not_yet_matching() {
     local tmpdir
@@ -648,6 +696,8 @@ test_in_progress_then_completed
 test_deployment_missing_then_appears
 test_failed_rollout
 test_timeout
+test_scale_to_zero_completed
+test_deployment_id_scale_to_zero_completed
 test_completed_but_running_not_yet_matching
 test_aws_cli_failure
 test_missing_required_env

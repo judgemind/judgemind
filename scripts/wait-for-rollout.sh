@@ -33,7 +33,11 @@
 #
 # Exit codes:
 #   0 — Target deployment reached rolloutState=COMPLETED with runningCount==
-#       desiredCount (and desiredCount > 0).
+#       desiredCount. This includes the scale-to-zero case (desired=0,
+#       running=0): when a service is kept at desiredCount=0 (e.g. dev
+#       ingestion worker runs only on-demand), ECS marks the new deployment
+#       COMPLETED immediately with no tasks to launch, and we treat that as
+#       a successful rollout (#2585).
 #   1 — rolloutState=FAILED, or the timeout elapsed, or the aws CLI failed,
 #       or the env-var contract was violated.
 
@@ -108,8 +112,19 @@ while true; do
 
     case "$ROLLOUT_STATE" in
       COMPLETED)
-        if [ "$RUNNING_COUNT" = "$DESIRED_COUNT" ] && [ "$RUNNING_COUNT" != "0" ]; then
-          echo "Service updated successfully after ${ELAPSED}s."
+        # Treat COMPLETED as success when runningCount == desiredCount. This
+        # includes the scale-to-zero case (desired=0, running=0) — see #2585.
+        # Earlier revisions required runningCount!=0 to guard against a race
+        # where COMPLETED is briefly reported with running=0 during a normal
+        # rollout (desired>0); the `running==desired` check preserves that
+        # guard for desired>0 while accepting the legitimate desired=0
+        # terminal state.
+        if [ "$RUNNING_COUNT" = "$DESIRED_COUNT" ]; then
+          if [ "$DESIRED_COUNT" = "0" ]; then
+            echo "Service updated successfully after ${ELAPSED}s (scale-to-zero: running=0 desired=0)."
+          else
+            echo "Service updated successfully after ${ELAPSED}s."
+          fi
           exit 0
         fi
         ;;
