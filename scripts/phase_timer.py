@@ -21,6 +21,7 @@ Usage from agent skill files:
     # Generate timing.json and append to task-timings.jsonl:
     python3 scripts/phase_timer.py summarize <worktree> <repo_root> <issue_number>
 """
+# permanent: true
 
 from __future__ import annotations
 

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # venv: scraper-framework
+# permanent: true
 """Gemini 2.5 Pro cross-model reviewer for the /ralph loop.
 
 Reads task context and a git diff, sends them to Gemini for review,

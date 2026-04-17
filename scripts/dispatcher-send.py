@@ -14,6 +14,7 @@ The script is stdlib-only and does not require any venv.  It uses file
 locking (``fcntl.flock``) to safely append entries even when the subagent's
 hook is reading from the same file concurrently.
 """
+# permanent: true
 
 from __future__ import annotations
 

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # venv: none
+# permanent: true
 """
 check-ci-job-skipped.py — Detect CI jobs whose body was modified in a diff
 but would be SKIPPED on that diff's CI run because the paths-filter gate

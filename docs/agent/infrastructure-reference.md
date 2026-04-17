@@ -170,9 +170,16 @@ Best practices:
 | Initial population of a county that has S3 data but no DB records | `rebuild_db.py --county <name> --skip-reset` | Discovers documents directly from S3 keys — does not require pre-existing DB records |
 | Full database rebuild from scratch | `rebuild_db.py` (no `--skip-reset`) | Truncates derived tables and re-processes everything from S3 |
 
-### One-off script convention
+### One-off / permanent script convention
 
-Scripts in `scripts/` that are one-off (backfills, cleanups, fixups — intended to run once or a few times and then be archived) must include a `# one-off: true` header comment in the first 50 lines. This makes them programmatically identifiable by the `/audit` skill, which monitors `scripts/*.py` count and flags when it exceeds 42 (the threshold tracks the permanent utility baseline plus a few slots for transient one-offs; see `.claude/skills/audit/SKILL.md` §1.9 and #2537). One-off scripts that have been run and verified should be moved to `scripts/archive/` to keep the directory manageable.
+Every top-level `scripts/*.py` file (excluding the `archive/`, `eval/`, `tests/`, and `spotcheck/` subdirectories) must carry exactly one of these headers in the first 50 lines:
+
+- `# one-off: true` — finite-lifetime script (backfill, cleanup, migration, fixup). Candidate for archival to `scripts/archive/` once its work is done.
+- `# permanent: true` — re-runnable utility (parameterizable, idempotent, intended to be invoked repeatedly). Exempt from one-off nagging and staleness checks.
+
+The marker makes scripts programmatically classifiable. The `/audit` skill (§1.9) computes a self-adjusting threshold of `permanent_count + 5` from `scripts/check-script-headers.py --count` output — a new permanent utility landing raises the ceiling automatically, while a new one-off consumes a slot of headroom. When the total exceeds that threshold, the audit files a chore issue listing the unarchived one-off scripts as archival candidates. See #2533 (original convention) and #2547 (extension to all scripts + self-adjusting threshold) for background.
+
+One-off scripts that have been run and verified should be moved to `scripts/archive/` to keep the directory manageable.
 
 ```python
 #!/usr/bin/env python3
@@ -180,6 +187,15 @@ Scripts in `scripts/` that are one-off (backfills, cleanups, fixups — intended
 # venv: scraper-framework
 # one-off: true
 ```
+
+```python
+#!/usr/bin/env python3
+"""Query the dev DB and print row counts per table."""
+# venv: scraper-framework
+# permanent: true
+```
+
+The CI `script-headers-check` job and `.githooks/pre-push` both run `scripts/check-script-headers.sh`, which fails closed on any unmarked top-level script. Check marker counts locally with `scripts/check-script-headers.py --count`.
 
 ## Secrets Retrieval
 

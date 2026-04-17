@@ -24,6 +24,7 @@ Options:
 
 Exit code: 0 if all healthy, 1 if alerts found.
 """
+# permanent: true
 
 from __future__ import annotations
 

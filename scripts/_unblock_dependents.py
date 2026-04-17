@@ -4,6 +4,8 @@
 Not meant to be run directly. Called by unblock-dependents.sh with environment
 variables: REPO, CLOSED_ISSUE, DRY_RUN, BLOCKED_ISSUES, WORK_TMPDIR.
 """
+
+# permanent: true
 from __future__ import annotations
 
 import json

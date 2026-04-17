@@ -18,6 +18,7 @@ Exit codes:
     0 -- No invalid ON CONFLICT targets found.
     1 -- One or more invalid ON CONFLICT targets detected.
 """
+# permanent: true
 
 from __future__ import annotations
 

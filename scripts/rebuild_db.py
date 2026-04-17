@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # venv: scraper-framework
+# permanent: true
 """Rebuild the entire database from S3 archived content.
 #
 # Lists S3 objects (or local cache), derives courts from key prefixes,

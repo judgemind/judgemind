@@ -20,6 +20,7 @@ Usage:
 
 Exit code: 0 if valid, 1 if validation errors found.
 """
+# permanent: true
 
 from __future__ import annotations
 

@@ -194,13 +194,25 @@ Monitor the `scripts/` directory for one-off script accumulation. After #2095 ar
 
 #### Checks
 
-1. **Script count threshold.** Count `scripts/*.py` files (top-level only, not `scripts/archive/` or `scripts/eval/`):
+1. **Script count threshold — self-adjusting based on `# permanent: true` markers.** The threshold is computed from the marker counts, not a fixed literal, so adding a new permanent utility automatically raises the ceiling while adding a new one-off consumes a slot of headroom. Get the current marker counts:
 
 ```
-Glob pattern: scripts/*.py
+scripts/check-script-headers.py --count
 ```
 
-If the count exceeds **42**, flag a finding. The permanent utility baseline has grown from ~29 (when the threshold was initially set at 35) to ~37 as new permanent checkers and tooling were added (e.g., `check-ci-job-skipped.py` from #2527, `check-script-headers.py` from #2533, plus the `phase_timer.py`, `ralph_review_log.py`, `log_ralph_review.py`, and `log_ralph_summary.py` utilities that support the task workflow). 42 gives ~5 slots of headroom above the current permanent baseline to absorb legitimately-blocked one-off scripts (e.g., `cleanup_sc_aborted_reingest_2416.py` and `cleanup_sc_failed_reingest.py`, waiting on #2454 / #2419; `patch-telegram-link-preview.py`, waiting on the upstream plugin to land `disable_web_page_preview`) without triggering a false-positive audit finding. When `#2454` and similar blockers clear, the count will drift back toward 37 and headroom is restored. Revisit this number whenever permanent utilities cross 38 — the threshold should track the real permanent baseline plus a few slots for transient one-offs. See #2537 for the rationale.
+This emits JSON with four keys: `total` (candidate scripts, excluding exempt/archive), `permanent` (scripts carrying `# permanent: true`), `one_off` (scripts carrying `# one-off: true`), and `unmarked` (no marker). The enforcement check (§1.9 check 2 below) guarantees `unmarked == 0` on the repo baseline, so in normal operation `total == permanent + one_off`.
+
+Compute the threshold as:
+
+```
+threshold = permanent + HEADROOM   # HEADROOM = 5
+```
+
+`HEADROOM = 5` absorbs legitimately-blocked one-off scripts (e.g., cleanup scripts waiting on upstream issues, patch scripts awaiting a library fix) without triggering a false-positive audit finding. When blockers clear and the one-offs archive, the count drifts back toward `permanent` and headroom is restored.
+
+**Flag a finding when `total > threshold`.** Include the current `permanent`, `one_off`, `total`, and computed threshold in the issue body, plus the list of unarchived `# one-off: true` scripts (these are the archival candidates — permanent utilities are intentionally at baseline).
+
+The formula is self-adjusting: a new permanent utility landing bumps `permanent`, which bumps `threshold`, so the next audit does not raise a false-positive ratchet issue (see #2547 for the rationale). Conversely, a new one-off script consumes a headroom slot — if too many one-offs accumulate without being archived, the check correctly flags them.
 
 2. **Missing `# one-off: true` or `# permanent: true` headers.** Use the machine-verifiable check — do not eyeball line numbers:
 
@@ -208,13 +220,15 @@ If the count exceeds **42**, flag a finding. The permanent utility baseline has 
 scripts/check-script-headers.sh   # exit 0 = all good, exit 1 = missing markers
 ```
 
-The script scans top-level `scripts/*.py` whose filename contains `backfill`, `cleanup`, `fix`, `dedup`, `merge`, `migrate`, or `remediat` and requires EITHER `# one-off: true` OR `# permanent: true` anywhere in the first 50 lines (the script's header comment block — the marker sits adjacent to the `# venv:` header, typically just before or after the module docstring). The 50-line window replaces the old "first 10 lines" rule-of-thumb that routinely flagged correctly-marked scripts whose docstrings pushed the marker to line 15, 20, or 32 (see #2533 for the historical context).
+The script scans **every** top-level `scripts/*.py` (excluding the check script itself and the `archive`/`eval`/`tests`/`spotcheck` subdirectories) and requires EITHER `# one-off: true` OR `# permanent: true` anywhere in the first 50 lines (the script's header comment block — the marker sits adjacent to the `# venv:` header, typically just before or after the module docstring). The 50-line window replaces the old "first 10 lines" rule-of-thumb that routinely flagged correctly-marked scripts whose docstrings pushed the marker to line 15, 20, or 32 (see #2533 for the historical context).
+
+Historical note: the original (#2533) convention only required a marker on scripts whose filename matched a set of name fragments (`backfill`, `cleanup`, `fix`, `dedup`, `merge`, `migrate`, `remediat`). #2547 extended the requirement to ALL top-level scripts so check 1 above can use `permanent_count + HEADROOM` as a self-adjusting threshold — a new permanent utility raises the threshold automatically, while a new one-off consumes a slot of headroom. The narrow (#2533) behaviour is still available via `scripts/check-script-headers.py --narrow` for callers that want the historical scan.
 
 A script should carry exactly one marker:
    - `# one-off: true` — finite-lifetime script (tied to a specific bug fix or migration). Candidate for archival once its work is done.
    - `# permanent: true` — re-runnable utility (parameterizable, idempotent, intended to be invoked repeatedly). Exempt from one-off nagging and staleness checks.
 
-Scripts previously confirmed as permanent in issue comments should carry the canonical `# permanent: true` marker so the check is machine-readable and does not re-flag them each audit cycle (see #2530). The audit treats either marker as sufficient — only unmarked scripts matching the name pattern are flagged.
+Scripts previously confirmed as permanent in issue comments should carry the canonical `# permanent: true` marker so the check is machine-readable and does not re-flag them each audit cycle (see #2530). The audit treats either marker as sufficient — only unmarked scripts are flagged.
 
 The same check runs in CI as the `script-headers-check` job and in `.githooks/pre-push`, so the repo baseline should always be green; audit findings here should be rare and typically represent newly-added unmarked scripts.
 
@@ -223,8 +237,8 @@ The same check runs in CI as the `script-headers-check` job and in `.githooks/pr
 #### Filing issues
 
 For script count threshold violations, file a `priority/p2` `type/chore` issue with:
-- Current count and the threshold (42).
-- List of scripts that appear to be one-off (by name pattern or `# one-off: true` header).
+- Current `total`, `permanent`, `one_off` counts and the computed threshold (`permanent + 5`).
+- List of scripts carrying `# one-off: true` — these are the archival candidates. Permanent utilities are at baseline by design; they should NOT be listed as candidates.
 - Suggested action: archive completed one-off scripts to `scripts/archive/`.
 
 For missing headers, file a single `priority/p3` `type/dx` issue listing the scripts that should be reviewed. Include the verbatim output of `scripts/check-script-headers.sh` in the body so the fix is mechanical. Each listed script should get either `# one-off: true` (if finite-lifetime) or `# permanent: true` (if re-runnable utility).
