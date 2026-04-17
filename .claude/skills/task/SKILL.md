@@ -194,14 +194,12 @@ Follow the full PR Workflow defined in CLAUDE.md. **All commits must be on the w
 Write status: `phase: setup`, `summary: Installing dependencies for <packages>`.
 Also start the phase timer: `python3 {worktree}/scripts/phase_timer.py start {worktree} setup`
 
-For Python packages you will touch, create a venv:
+For Python packages you will touch, run the helper (use `timeout: 1200000` since the first install can exceed 2 minutes):
 ```
-python3.12 -m venv {worktree}/packages/<pkg>/.venv
+{worktree}/scripts/install-package-venv.sh <pkg>     # e.g. scraper-framework, nlp-pipeline
 ```
-Then install (use `timeout: 1200000` as pip install may exceed 2 minutes):
-```
-.venv/bin/pip install -e ".[dev]" --quiet
-```
+
+The helper creates `packages/<pkg>/.venv`, installs the local `judgemind-config` sibling first when required, then installs the target package with `[dev]` extras. Plain `pip install -e ".[dev]"` **fails** for `scraper-framework` and `nlp-pipeline` because `judgemind-config` is an unpublished local dependency (see #2491). The helper is idempotent — re-running it is a no-op when the venv is already populated.
 
 For TypeScript packages (use `timeout: 1200000` as npm install may exceed 2 minutes):
 ```
