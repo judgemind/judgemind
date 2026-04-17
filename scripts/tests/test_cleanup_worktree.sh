@@ -279,6 +279,108 @@ test_main_resolves_correct_path_from_worktree() {
     fi
 }
 
+# Test 6: cleanup_worktree.sh heals stale git metadata when the on-disk
+# worktree dir is already gone but .git/worktrees/<name>/ still exists
+# (with a `locked` file, as observed in the wild — #2388).
+test_cleanup_heals_stale_metadata() {
+    local repo
+    repo=$(make_temp_dir)
+
+    # Set up a real git repo
+    git -C "$repo" init --initial-branch main -q
+    git -C "$repo" config user.email "test@example.com"
+    git -C "$repo" config user.name "Test"
+    touch "$repo/CLAUDE.md"
+    git -C "$repo" add CLAUDE.md
+    git -C "$repo" commit -m "init" -q
+
+    # Create a real worktree so git records its metadata, then remove the
+    # on-disk dir manually to simulate a crashed mid-cleanup.
+    local worktree_rel=".claude/worktrees/agent-stale001"
+    local worktree="$repo/$worktree_rel"
+    mkdir -p "$(dirname "$worktree")"
+    git -C "$repo" worktree add -q "$worktree" -b stale-branch-001
+    rm -rf "$worktree"
+    # Simulate the `locked` marker file that blocks a normal prune.
+    local metadata_dir="$repo/.git/worktrees/agent-stale001"
+    touch "$metadata_dir/locked"
+
+    if [[ ! -d "$metadata_dir" ]]; then
+        fail "cleanup heals stale metadata" "metadata setup failed: $metadata_dir not present"
+        return
+    fi
+
+    # Drop a working copy of the cleanup script into the repo so it can
+    # find the repo root via its own location.
+    mkdir -p "$repo/scripts"
+    cp "$CLEANUP_SCRIPT" "$repo/scripts/cleanup_worktree.sh"
+    chmod +x "$repo/scripts/cleanup_worktree.sh"
+
+    # Create a stub session log so safety check 2 would pass — but note
+    # the stale-metadata branch should return 0 *before* the session-log
+    # check ever runs. We don't need to create one.
+
+    local output
+    local exit_code=0
+    output=$("$repo/scripts/cleanup_worktree.sh" "$worktree_rel" 2>&1) || exit_code=$?
+
+    if [[ "$exit_code" -ne 0 ]]; then
+        fail "cleanup heals stale metadata (exit code)" \
+            "expected 0, got $exit_code; output: $output"
+        return
+    fi
+
+    if [[ -d "$metadata_dir" ]]; then
+        fail "cleanup heals stale metadata (metadata removed)" \
+            "metadata dir still exists: $metadata_dir; output: $output"
+        return
+    fi
+
+    # And sanity: `git worktree list` should no longer reference it.
+    local list_output
+    list_output=$(git -C "$repo" worktree list 2>&1)
+    if echo "$list_output" | grep -q "agent-stale001"; then
+        fail "cleanup heals stale metadata (git worktree list)" \
+            "entry still listed: $list_output"
+        return
+    fi
+
+    pass "cleanup heals stale metadata when on-disk dir is already gone"
+}
+
+# Test 7: cleanup_worktree.sh is a no-op on the stale-metadata branch
+# when there is no metadata dir either — it should just return 0 without
+# touching anything.
+test_cleanup_no_metadata_is_noop() {
+    local repo
+    repo=$(make_temp_dir)
+
+    git -C "$repo" init --initial-branch main -q
+    git -C "$repo" config user.email "test@example.com"
+    git -C "$repo" config user.name "Test"
+    touch "$repo/CLAUDE.md"
+    git -C "$repo" add CLAUDE.md
+    git -C "$repo" commit -m "init" -q
+
+    mkdir -p "$repo/scripts"
+    cp "$CLEANUP_SCRIPT" "$repo/scripts/cleanup_worktree.sh"
+    chmod +x "$repo/scripts/cleanup_worktree.sh"
+
+    # Ensure no .git/worktrees directory exists at all.
+    rm -rf "$repo/.git/worktrees"
+
+    local exit_code=0
+    local output
+    output=$("$repo/scripts/cleanup_worktree.sh" ".claude/worktrees/agent-missing1" 2>&1) || exit_code=$?
+
+    if [[ "$exit_code" -eq 0 ]]; then
+        pass "cleanup is a no-op when dir gone and no metadata"
+    else
+        fail "cleanup is a no-op when dir gone and no metadata" \
+            "expected 0, got $exit_code; output: $output"
+    fi
+}
+
 # ── Run all tests ──────────────────────────────────────────────────────────
 
 test_find_repo_root_main_repo
@@ -286,6 +388,8 @@ test_find_repo_root_skips_worktree
 test_find_repo_root_no_repo
 test_find_repo_root_worktree_only
 test_main_resolves_correct_path_from_worktree
+test_cleanup_heals_stale_metadata
+test_cleanup_no_metadata_is_noop
 
 echo ""
 echo "────────────────────────────────────────────"
