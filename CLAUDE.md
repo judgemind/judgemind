@@ -361,7 +361,7 @@ See `docs/agent/infrastructure-reference.md` §ECS Script Execution for full pat
 | Cleanup orphaned/corrupted `derived.*` state (failed run, bad IDs, partial mutation) | `rebuild_db.py --county <name>` | `derived.*` is fully rebuildable from S3. Rebuild is idempotent, validates the real ingestion/enrichment path (fixing inbound data, not just existing rows), and handles edge cases surgical scripts miss. Surgical one-offs often introduce bugs of their own — only write one if rebuild cost is prohibitive at the affected scale. |
 | Re-process existing records after extraction logic changes | `reingest_from_s3.py --county <name>` | Queries the `documents` table — only works when records already exist |
 | Initial population of a county that has S3 data but no DB records | `rebuild_db.py --county <name>` | Discovers documents directly from S3 keys — does not require pre-existing DB records |
-| Full database rebuild from scratch | `rebuild_db.py` (no `--skip-reset`) | Truncates derived tables and re-processes everything from S3 |
+| Full database rebuild from scratch | `rebuild_db.py --reset` | `--reset` is opt-in and truncates derived tables before re-processing everything from S3. |
 
 `reingest_from_s3.py` operates on **existing database records only**. If you run it for a county with no records in the `documents` table, it will process 0 documents silently.
 

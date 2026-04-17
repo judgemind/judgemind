@@ -111,7 +111,7 @@ scripts/ecs-run-task.sh --detach scripts/reingest_from_s3.py -- --all
 scripts/ecs-run-task.sh --logs <task-arn>
 
 # Initial population of a county with S3 data but no DB records
-scripts/ecs-run-task.sh scripts/rebuild_db.py -- --county "Orange" --skip-reset
+scripts/ecs-run-task.sh scripts/rebuild_db.py -- --county "Orange"
 
 # Tail logs for a task by ID (printed when the task launches)
 scripts/ecs-task-logs.sh <task-id>
@@ -124,9 +124,9 @@ scripts/ecs-run-task.sh --cpu 2048 --memory 8192 scripts/audit_field_completenes
 **Large-county rebuilds need memory override.** `rebuild_db.py --county <name>` holds per-worker OpenSearch/Postgres clients and LLM batch state for every document in the county. At the default 4096 MB, counties with thousands of documents (Los Angeles, Santa Clara, Orange) can exit 137 (OOM). Use `--cpu 2048 --memory 8192` for these rebuilds (see #2481):
 
 ```
-scripts/ecs-run-task.sh --cpu 2048 --memory 8192 scripts/rebuild_db.py -- --county "Los Angeles" --skip-reset
-scripts/ecs-run-task.sh --cpu 2048 --memory 8192 scripts/rebuild_db.py -- --county "Santa Clara" --skip-reset
-scripts/ecs-run-task.sh --cpu 2048 --memory 8192 scripts/rebuild_db.py -- --county "Orange" --skip-reset
+scripts/ecs-run-task.sh --cpu 2048 --memory 8192 scripts/rebuild_db.py -- --county "Los Angeles"
+scripts/ecs-run-task.sh --cpu 2048 --memory 8192 scripts/rebuild_db.py -- --county "Santa Clara"
+scripts/ecs-run-task.sh --cpu 2048 --memory 8192 scripts/rebuild_db.py -- --county "Orange"
 ```
 
 Smaller counties (a few hundred documents or fewer) run fine at the 1024/4096 default.
@@ -195,7 +195,7 @@ Best practices:
    ```
    # Cap a rebuild at 2 hours even if it hangs on something not covered by --max-retry-*
    scripts/ecs-run-task.sh --max-runtime 7200 --cpu 2048 --memory 8192 \
-       scripts/rebuild_db.py -- --county "Los Angeles" --skip-reset
+       scripts/rebuild_db.py -- --county "Los Angeles"
    ```
 
    `timeout` sends `SIGTERM` at the deadline, giving Python's atexit handlers and `psycopg` a chance to close connections cleanly, and escalates to `SIGKILL` 30 seconds later if the script ignores the signal.  The container then exits with the script's own exit code (on clean termination) or `137` (SIGKILL).  Requires coreutils, which is present in the `python:3.12-slim` base image used by the ingestion worker task definition.
@@ -218,8 +218,8 @@ Best practices:
 |---|---|---|
 | Cleanup orphaned/corrupted `derived.*` state (failed run, bad IDs, partial mutation) | `rebuild_db.py --county <name>` | `derived.*` is fully rebuildable from S3. Rebuild is idempotent, validates the real ingestion/enrichment path (fixing inbound data, not just existing rows), and handles edge cases surgical scripts miss. Surgical one-offs often introduce bugs of their own — only write one if rebuild cost is prohibitive at the affected scale. |
 | Re-process existing records after extraction logic changes | `reingest_from_s3.py --county <name>` | Queries `documents` table — only works when records already exist |
-| Initial population of a county that has S3 data but no DB records | `rebuild_db.py --county <name> --skip-reset` | Discovers documents directly from S3 keys — does not require pre-existing DB records |
-| Full database rebuild from scratch | `rebuild_db.py` (no `--skip-reset`) | Truncates derived tables and re-processes everything from S3 |
+| Initial population of a county that has S3 data but no DB records | `rebuild_db.py --county <name>` | Discovers documents directly from S3 keys — does not require pre-existing DB records. The Python script's default already preserves existing data; no flag is needed. |
+| Full database rebuild from scratch | `rebuild_db.py --reset` | `--reset` is opt-in and truncates derived tables before re-processing everything from S3. |
 
 ### One-off / permanent script convention
 
