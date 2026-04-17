@@ -27,6 +27,37 @@ if TYPE_CHECKING:
 
 
 @dataclass(frozen=True, slots=True)
+class OrphanCheckResult:
+    """Result of the post-extraction orphan integrity check (#1337).
+
+    A document is "orphan" when it produces zero ruling records after LLM
+    extraction.  When ``is_orphan`` is ``True``, ``reason`` contains a short
+    human-readable explanation suitable for structured log fields.
+    """
+
+    is_orphan: bool
+    reason: str | None
+
+
+def check_no_orphan_rulings(ruling_count: int) -> OrphanCheckResult:
+    """Return a result indicating whether a document yielded zero rulings.
+
+    A document that produces zero ruling records after LLM extraction is an
+    "orphan" -- the parent document will either (a) skip insertion entirely
+    (multi-case split path) or (b) fall through to single-doc processing with
+    an empty/unreliable ``ruling_text``.  Either way, this is a signal that
+    downstream data quality will be impacted (#1337).
+
+    This guard is intentionally side-effect-free: it only inspects the count
+    and returns a result.  Callers are responsible for logging or taking
+    further action based on the returned ``OrphanCheckResult``.
+    """
+    if ruling_count == 0:
+        return OrphanCheckResult(is_orphan=True, reason="No rulings extracted by LLM")
+    return OrphanCheckResult(is_orphan=False, reason=None)
+
+
+@dataclass(frozen=True, slots=True)
 class ConvertedRuling:
     """One ruling converted from ``ExtractedRuling`` to flat fields.
 

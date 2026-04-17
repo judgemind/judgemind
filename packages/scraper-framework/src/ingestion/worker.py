@@ -93,7 +93,7 @@ from .llm_extract import (
 )
 from .llm_providers import create_client as create_llm_client
 from .ruling_formatter import format_ruling_text
-from .ruling_guards import convert_extracted_rulings
+from .ruling_guards import check_no_orphan_rulings, convert_extracted_rulings
 from .ruling_summarizer import summarize_ruling
 from .text_cleanup import clean_ruling_text
 
@@ -2146,14 +2146,26 @@ class IngestionWorker:
         llm_latency_ms = round((time.monotonic() - t0) * 1000)
 
         if not extracted_rulings:
-            logger.warning(
-                "LLM extraction returned no rulings",
-                extra={
-                    "document_id": document_id,
-                    "llm_latency_ms": llm_latency_ms,
-                    "extraction_method": extraction_method,
-                },
-            )
+            # Post-extraction integrity check (#1337): surface orphan documents
+            # (those that produce zero ruling records) via a structured, easily
+            # searchable warning so operators can detect when probate PDFs or
+            # other problematic content fail extraction.
+            orphan_result = check_no_orphan_rulings(0)
+            if orphan_result.is_orphan:
+                logger.warning(
+                    "Orphan document: no rulings extracted",
+                    extra={
+                        "document_id": document_id,
+                        "original_document_id": document_id,
+                        "s3_key": event_data.get("s3_key"),
+                        "county": county,
+                        "state": state,
+                        "scraper_id": event_data.get("scraper_id"),
+                        "llm_latency_ms": llm_latency_ms,
+                        "extraction_method": extraction_method,
+                        "reason": orphan_result.reason,
+                    },
+                )
             return False
 
         logger.info(
