@@ -574,6 +574,183 @@ def _deduplicate_ruling_texts(
 
 
 # ---------------------------------------------------------------------------
+# Post-processing: calendar-listing-only detection (#2446)
+# ---------------------------------------------------------------------------
+
+# Some Orange County department PDFs (W8, C10, N14, etc.) are *calendar
+# listings* rather than published tentative rulings.  They are titled
+# "TENTATIVE RULINGS" but the per-case table cells contain only the motion
+# type heading (e.g. "Motion to Strike") or an "OFF-CALENDAR" marker — the
+# actual ruling body is not published for that date.  Upstream, the
+# multimodal LLM still emits one row per listed case, producing "rulings"
+# whose ruling_text is a motion-type label or "OFF-CALENDAR".  These rows
+# are not substantive rulings and should be dropped so they do not appear in
+# search results or corrupt motion-type analytics.
+#
+# The filter is a *deterministic* post-processor: it only drops a row when
+# the text is unambiguously a non-ruling (OFF-CALENDAR marker, or
+# motion-type-only text with no disposition verb), so real short rulings
+# (e.g. "Motion to strike is GRANTED.") are preserved.
+
+# OFF-CALENDAR markers — very common on OC department calendars for cases
+# where no tentative was actually posted.  Covers variations in hyphenation,
+# spacing, casing, and trailing punctuation.
+_OFF_CALENDAR_RE = re.compile(
+    r"\bOFF[\s\-\u2013\u2014]*CALENDAR\b",
+    re.IGNORECASE,
+)
+
+# "NO TENTATIVE" markers — OC calendar listings for cases where the court
+# did not post a tentative ruling.  Like OFF-CALENDAR, these are not real
+# rulings and should be dropped.  Covers "NO TENTATIVE", "NO TENTATIVE
+# POSTED", and trivial whitespace variations.
+_NO_TENTATIVE_RE = re.compile(
+    r"\bNO\s+TENTATIVE\b",
+    re.IGNORECASE,
+)
+
+# Disposition verbs — if any of these appear, the text is a real ruling,
+# not a bare calendar listing.  Limited to *past-participle* forms so that
+# motion labels like "Motion to Continue" or "Petition to Approve" (which
+# use infinitive/present-tense verbs) are NOT misclassified as rulings.
+# Matches whole words, case-insensitive.
+_RULING_VERB_RE = re.compile(
+    r"\b("
+    r"GRANTED|"
+    r"DENIED|"
+    r"SUSTAINED|"
+    r"OVERRULED|"
+    r"CONTINUED|"
+    r"TRAILED|"
+    r"MOOTED|"
+    r"WITHDRAWN|"
+    r"DROPPED|"
+    r"SETTLED|"
+    r"DISMISSED|"
+    r"VACATED|"
+    r"STAYED|"
+    r"APPROVED|"
+    r"TAKEN\s+OFF[\s\-]*CALENDAR"
+    r")\b",
+    re.IGNORECASE,
+)
+
+# Lines that look like motion-type labels — used in OC calendar cells to
+# show which motions are scheduled, without providing a tentative body.
+# Plural forms (Motions, Demurrers, Hearings, Applications, Petitions) are
+# handled via the ``s?`` suffix so a cell like "Demurrers" does not bypass
+# the filter.  The trailing ``.*`` allows periods in motion-type labels
+# (e.g. trailing punctuation, acronyms like "N.O.V.") — safe because
+# ``_is_calendar_listing_only`` short-circuits on any disposition verb
+# before reaching this regex, so real rulings are never misclassified.
+_MOTION_TYPE_LINE_RE = re.compile(
+    r"^\s*("
+    r"Motions?\s+(?:to|for|in)\b.*|"
+    r"Demurrers?(?:\s+to\b.*)?|"
+    r"Petitions?\s+(?:to|for)\b.*|"
+    r"Hearings?(?:\s+on\b.*)?|"
+    r"Ex\s+Parte\b.*|"
+    r"Applications?\s+(?:to|for)\b.*|"
+    r"Case\s+Management\s+Conference\b.*|"
+    r"Status\s+Conference\b.*|"
+    r"Trial\s+Setting\s+Conference\b.*|"
+    r"Order\s+to\s+Show\s+Cause\b.*|"
+    r"OSC\b.*"
+    r")\s*$",
+    re.IGNORECASE,
+)
+
+# Upper bound on length for "calendar-listing-only" classification.  Beyond
+# this, even motion-type-only text is likely to contain real content we
+# should not drop.  Calendar listings are generally very short — a handful
+# of words per cell.
+_CALENDAR_LISTING_MAX_LENGTH = 100
+
+
+def _is_calendar_listing_only(text: str | None) -> bool:
+    """Return True if ``text`` looks like a calendar listing, not a ruling.
+
+    A "calendar listing" is a per-case cell from an Orange County department
+    calendar PDF that contains only the motion-type heading or an
+    "OFF-CALENDAR" marker — no actual tentative ruling body.  Examples::
+
+        "OFF-CALENDAR"
+        "Motion to Strike"
+        "Demurrer\nMotion to Strike"
+        "Motion for Attorneys' Fees"
+
+    These are distinguishable from real short rulings because real rulings
+    contain a disposition verb (GRANTED/DENIED/SUSTAINED/etc.).  The filter
+    is deliberately conservative — if any disposition verb is present, the
+    text is treated as a real ruling and not dropped.
+
+    Returns ``False`` for ``None`` or empty text so callers preserve those
+    entries (they may be metadata-only rows handled by other filters).
+    """
+    if not text:
+        return False
+    stripped = text.strip()
+    if not stripped:
+        return False
+    # Too long to be a calendar listing.
+    if len(stripped) > _CALENDAR_LISTING_MAX_LENGTH:
+        return False
+    # Any disposition verb means this is a real ruling — never drop.
+    if _RULING_VERB_RE.search(stripped):
+        return False
+    # OFF-CALENDAR or "NO TENTATIVE" markers are calendar listings, not
+    # real rulings (OC department calendars use these for cases where no
+    # tentative was posted).
+    if _OFF_CALENDAR_RE.search(stripped) or _NO_TENTATIVE_RE.search(stripped):
+        return True
+    # Otherwise, the text must consist entirely of motion-type-style lines.
+    lines = [ln.strip() for ln in stripped.splitlines() if ln.strip()]
+    return all(_MOTION_TYPE_LINE_RE.match(ln) for ln in lines)
+
+
+def _drop_calendar_listing_rulings(
+    rulings: list[ExtractedRuling],
+) -> list[ExtractedRuling]:
+    """Filter out rulings whose ruling_text is a bare calendar listing (#2446).
+
+    Orange County department calendar PDFs sometimes list cases with only
+    the motion type heading or "OFF-CALENDAR" in place of an actual tentative
+    ruling body.  Those rows are emitted by the multimodal LLM as "rulings"
+    with very short, non-substantive ``ruling_text``.  Drop them entirely so
+    they do not pollute search results or motion-type analytics.
+
+    Rules:
+
+    - Entries with ``cross_reference_source`` set are exempt — they share
+      text intentionally via cross-reference resolution (#2317) and are the
+      referent's responsibility.
+    - Entries with ``ruling_text`` of ``None`` or empty are preserved.
+      They carry metadata (case_number, case_title) but no text; dropping
+      them is the job of other filters, not this one.
+    - Otherwise, ``_is_calendar_listing_only(ruling_text)`` decides.
+    """
+    kept: list[ExtractedRuling] = []
+    for ruling in rulings:
+        if ruling.cross_reference_source is not None:
+            kept.append(ruling)
+            continue
+        if not ruling.ruling_text:
+            kept.append(ruling)
+            continue
+        if _is_calendar_listing_only(ruling.ruling_text):
+            logger.warning(
+                "llm_extractor.calendar_listing_dropped",
+                case_number=ruling.extracted_case_number,
+                case_title=ruling.extracted_case_title,
+                text_preview=ruling.ruling_text[:100],
+                text_length=len(ruling.ruling_text),
+            )
+            continue
+        kept.append(ruling)
+    return kept
+
+
+# ---------------------------------------------------------------------------
 # Post-processing: cross-reference resolution (#2317)
 # ---------------------------------------------------------------------------
 
@@ -2148,6 +2325,14 @@ def _join_page_rows(
     # from the referenced entry so enrichment can extract an outcome.
     if entry_number_to_index:
         rulings = _resolve_cross_references(rulings, entry_number_to_index)
+
+    # Post-processing: drop calendar-listing-only rows (#2446).
+    # Orange County department calendar PDFs sometimes list cases with only
+    # the motion-type heading or "OFF-CALENDAR" marker in place of an actual
+    # tentative ruling body.  These rows are not substantive rulings.  Run
+    # this AFTER cross-reference resolution so legitimate shared text is
+    # not accidentally classified as calendar-only.
+    rulings = _drop_calendar_listing_rulings(rulings)
 
     # Post-processing: deduplicate identical ruling texts (#2096).
     # The LLM sometimes produces the same ruling text for multiple cases
