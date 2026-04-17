@@ -5179,7 +5179,15 @@ def test_llm_split_logs_orphan_warning_when_no_rulings_extracted(
 def test_llm_split_does_not_log_orphan_warning_when_rulings_extracted(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """No orphan warning should fire when the LLM extractor returns >=1 ruling (#1337)."""
+    """No orphan warning should fire when the LLM extractor returns >=1 ruling (#1337).
+
+    DB dependencies (``psycopg``, ``delete_stale_split_children``) and the
+    recursive ``process_event`` call for each split are all mocked so
+    ``_llm_split_document`` completes cleanly end-to-end.  This makes the
+    assertion stronger: if a future change causes the function to raise
+    before reaching the post-extraction branch, the test fails — rather
+    than silently asserting on log records that were never emitted (#2443).
+    """
     from framework.llm_schema import ExtractedRuling
 
     worker, _ = _make_worker()
@@ -5204,24 +5212,34 @@ def test_llm_split_does_not_log_orphan_warning_when_rulings_extracted(
 
     event = _make_event(ruling_text="Some ruling text")
 
+    mock_conn, _ = _make_mock_conn()
+
     with (
         patch.object(worker, "_get_framework_extractor", return_value=mock_extractor),
         patch.object(worker, "_get_multimodal_extractor", return_value=None),
+        # Mock DB writes so the happy path completes without broad try/except.
+        patch("ingestion.worker.psycopg") as mock_psycopg,
+        patch("ingestion.worker.delete_stale_split_children", return_value=0),
+        # Stub the recursive dispatch of the per-ruling split event so we
+        # don't drag in the entire process_event code path (which would
+        # require many more mocks and is covered by other tests).
+        patch.object(worker, "process_event") as mock_process_event,
         caplog.at_level("WARNING", logger="ingestion.worker"),
     ):
-        # Execution may raise downstream (DB writes are not mocked for this
-        # focused test); we only care about the absence of the orphan warning.
-        try:
-            worker._llm_split_document(
-                event,
-                event["document_id"],
-                event["ruling_text"],
-                event["state"],
-                event["county"],
-                raw_pdf_bytes=None,
-            )
-        except Exception:
-            pass
+        mock_psycopg.connect.return_value = mock_conn
+        result = worker._llm_split_document(
+            event,
+            event["document_id"],
+            event["ruling_text"],
+            event["state"],
+            event["county"],
+            raw_pdf_bytes=None,
+        )
+
+    # Sanity check: the method reached the split-dispatch step and
+    # returned True — i.e. the orphan branch was not taken.
+    assert result is True
+    assert mock_process_event.call_count == 1
 
     orphan_records = [
         r for r in caplog.records if r.message == "Orphan document: no rulings extracted"
