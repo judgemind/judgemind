@@ -341,6 +341,7 @@ Key paths: framework in `packages/scraper-framework/src/framework/`, California 
 - Terraform for all AWS resources. Every resource must be in a module.
 - **Do NOT add `tags` blocks to individual resources** — the AWS provider's `default_tags` handles this.
 - Never commit AWS credentials or state files.
+- **Always run `terraform init` with `-lockfile=readonly`** for agent-side validation — without this, `init` will silently prune provider hashes the current environment doesn't reference (e.g. `hashicorp/archive` in `environments/dev/`), causing unrelated `.terraform.lock.hcl` churn in `git status` that either pollutes the PR diff or breaks other environments' hashes. Only omit the flag when you are intentionally adding or upgrading a provider alongside a `main.tf` / `terraform.tf` change. See `docs/agent/code-standards.md` §Terraform for full details (#2582).
 - **Dev terraform apply is automated.** After a PR that touches `infra/terraform/` merges to main, the dispatcher automatically runs `terraform apply` for the dev environment. Production applies remain human-only. See `.claude/skills/dispatcher/SKILL.md` and `docs/agent/infrastructure-reference.md` for the full procedure.
 
 ### Running Data Scripts on Dev
