@@ -616,3 +616,437 @@ class TestWriteRebuildMarker:
         # Should not raise
         rebuild_db._write_rebuild_marker(mock_conn, in_progress=True)
         mock_conn.rollback.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Per-county reset tests (#2465)
+# ---------------------------------------------------------------------------
+
+
+def _build_per_county_mock_conn(
+    court_ids: list[str],
+    counts: dict[str, int] | None = None,
+) -> tuple[MagicMock, MagicMock]:
+    """Build a mock psycopg connection + cursor for per-county reset tests.
+
+    The cursor is driven by a scripted ``execute``/``fetchone``/``fetchall``
+    sequence so each DELETE/COUNT call returns deterministic data.  Returns
+    ``(mock_conn, mock_cur)`` so tests can inspect call history.
+    """
+    counts = counts or {}
+    mock_conn = MagicMock()
+    mock_cur = MagicMock()
+    mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cur)
+    mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+
+    # First call: _resolve_county_court_ids → SELECT id FROM derived.courts ...
+    # fetchall() for that should return a list of (uuid,) tuples.
+    court_id_rows = [(cid,) for cid in court_ids]
+    mock_cur.fetchall.return_value = court_id_rows
+
+    # Subsequent fetchone() calls are COUNT(*) results.
+    # Order: join tables (case_judges, case_parties, case_attorneys), then
+    # court-id tables (documents, rulings, cases, judges).
+    count_sequence = [
+        (counts.get("case_judges", 0),),
+        (counts.get("case_parties", 0),),
+        (counts.get("case_attorneys", 0),),
+        (counts.get("documents", 0),),
+        (counts.get("rulings", 0),),
+        (counts.get("cases", 0),),
+        (counts.get("judges", 0),),
+    ]
+    mock_cur.fetchone.side_effect = count_sequence
+    return mock_conn, mock_cur
+
+
+class TestResolveCountyCourtIds:
+    """Tests for _resolve_county_court_ids()."""
+
+    def test_returns_list_of_court_ids(self) -> None:
+        """Returns string UUIDs from derived.courts matching state/county."""
+        mock_conn = MagicMock()
+        mock_cur = MagicMock()
+        mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cur)
+        mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+        mock_cur.fetchall.return_value = [
+            ("00000000-0000-0000-0000-000000000001",),
+            ("00000000-0000-0000-0000-000000000002",),
+        ]
+
+        result = rebuild_db._resolve_county_court_ids(mock_conn, "CA", "Santa Clara")
+
+        assert result == [
+            "00000000-0000-0000-0000-000000000001",
+            "00000000-0000-0000-0000-000000000002",
+        ]
+        # Verify the query filters by state AND county, case-insensitive.
+        sql, params = mock_cur.execute.call_args[0]
+        assert "LOWER(state)" in sql
+        assert "LOWER(county)" in sql
+        assert params == ("CA", "Santa Clara")
+
+    def test_returns_empty_list_when_no_match(self) -> None:
+        """Returns [] when no courts match — caller must raise."""
+        mock_conn = MagicMock()
+        mock_cur = MagicMock()
+        mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cur)
+        mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+        mock_cur.fetchall.return_value = []
+
+        result = rebuild_db._resolve_county_court_ids(mock_conn, "CA", "Nonexistent")
+        assert result == []
+
+
+class TestResetDerivedTablesForCounty:
+    """Tests for reset_derived_tables_for_county()."""
+
+    def test_raises_when_county_not_found(self) -> None:
+        """Unknown county should raise ValueError, not silently no-op."""
+        mock_conn = MagicMock()
+        mock_cur = MagicMock()
+        mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cur)
+        mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+        mock_cur.fetchall.return_value = []
+
+        try:
+            rebuild_db.reset_derived_tables_for_county(mock_conn, "CA", "Atlantis")
+        except ValueError as exc:
+            assert "Atlantis" in str(exc)
+        else:
+            raise AssertionError("expected ValueError")
+
+        # Must not commit when the lookup fails.
+        mock_conn.commit.assert_not_called()
+
+    def test_deletes_per_county_and_returns_counts(self) -> None:
+        """Resolves courts, deletes in order, returns row-count summary."""
+        counts = {
+            "case_judges": 100,
+            "case_parties": 200,
+            "case_attorneys": 50,
+            "documents": 5000,
+            "rulings": 400,
+            "cases": 600,
+            "judges": 25,
+        }
+        court_ids = ["00000000-0000-0000-0000-000000000001"]
+        mock_conn, mock_cur = _build_per_county_mock_conn(court_ids, counts)
+
+        result = rebuild_db.reset_derived_tables_for_county(mock_conn, "CA", "Santa Clara")
+
+        assert result == counts
+        mock_conn.commit.assert_called_once()
+
+        # Collect all SQL emitted.
+        all_sql = [call[0][0] for call in mock_cur.execute.call_args_list]
+
+        # Must have issued DELETEs for the join tables and court-id tables.
+        joined = "\n".join(all_sql)
+        for table in (
+            "case_judges",
+            "case_parties",
+            "case_attorneys",
+            "documents",
+            "rulings",
+            "cases",
+            "judges",
+        ):
+            assert f"DELETE FROM derived.{table}" in joined, (
+                f"expected DELETE FROM derived.{table} in emitted SQL"
+            )
+
+        # Must NOT truncate anything or delete courts/attorneys/parties/aliases.
+        assert "TRUNCATE" not in joined
+        assert "DELETE FROM derived.courts" not in joined
+        assert "DELETE FROM derived.attorneys" not in joined
+        assert "DELETE FROM derived.parties" not in joined
+        assert "DELETE FROM derived.judge_aliases" not in joined
+        assert "DELETE FROM derived.attorney_aliases" not in joined
+        assert "DELETE FROM derived.party_aliases" not in joined
+
+    def test_delete_order_rulings_before_cases(self) -> None:
+        """Must delete rulings before cases to avoid FK constraint violations.
+
+        rulings.case_id → cases.id is NOT NULL, so cases must be deleted last
+        among the court-id-keyed tables.
+        """
+        court_ids = ["00000000-0000-0000-0000-000000000001"]
+        counts = {
+            "case_judges": 1,
+            "case_parties": 1,
+            "case_attorneys": 1,
+            "documents": 1,
+            "rulings": 1,
+            "cases": 1,
+            "judges": 1,
+        }
+        mock_conn, mock_cur = _build_per_county_mock_conn(court_ids, counts)
+
+        rebuild_db.reset_derived_tables_for_county(mock_conn, "CA", "Santa Clara")
+
+        # Index only DELETE statements in order of emission.
+        delete_sql = [
+            call[0][0]
+            for call in mock_cur.execute.call_args_list
+            if call[0][0].lstrip().startswith(("DELETE", "\n                DELETE"))
+            or "DELETE FROM derived." in call[0][0]
+        ]
+
+        # Find positions of the court-id-table DELETEs.
+        def _find(sub: str) -> int:
+            for i, s in enumerate(delete_sql):
+                if f"DELETE FROM derived.{sub}" in s and ("case_id IN" not in s):
+                    return i
+            return -1
+
+        rulings_idx = _find("rulings")
+        cases_idx = _find("cases")
+        documents_idx = _find("documents")
+        judges_idx = _find("judges")
+
+        assert rulings_idx != -1, "rulings DELETE not emitted"
+        assert cases_idx != -1, "cases DELETE not emitted"
+        assert documents_idx != -1, "documents DELETE not emitted"
+        assert judges_idx != -1, "judges DELETE not emitted"
+        # rulings must be deleted before cases (rulings.case_id FK).
+        assert rulings_idx < cases_idx
+        # documents must be deleted before cases (documents.case_id FK).
+        assert documents_idx < cases_idx
+        # judges must be deleted after rulings (rulings.judge_id FK).
+        assert rulings_idx < judges_idx
+
+    def test_logs_row_counts_before_delete(self) -> None:
+        """Must log a COUNT(*) per table before issuing DELETE — operators
+        can eyeball the scope.
+        """
+        counts = {
+            "case_judges": 10,
+            "case_parties": 20,
+            "case_attorneys": 5,
+            "documents": 500,
+            "rulings": 400,
+            "cases": 60,
+            "judges": 3,
+        }
+        court_ids = ["00000000-0000-0000-0000-000000000001"]
+        mock_conn, mock_cur = _build_per_county_mock_conn(court_ids, counts)
+
+        mock_logger = MagicMock()
+        with patch.object(rebuild_db, "logger", mock_logger):
+            rebuild_db.reset_derived_tables_for_county(mock_conn, "CA", "Santa Clara")
+
+        info_calls = mock_logger.info.call_args_list
+        pre_delete_logs = [
+            call for call in info_calls if call.args and call.args[0] == "Pre-delete row count"
+        ]
+        # One per derived table we touch (7 total).
+        assert len(pre_delete_logs) == 7
+        # At least one log records the actual row count.
+        seen_tables = {call.kwargs.get("table") for call in pre_delete_logs}
+        assert "derived.documents" in seen_tables
+        assert "derived.rulings" in seen_tables
+        assert "derived.cases" in seen_tables
+
+    def test_uses_court_ids_from_resolved_lookup(self) -> None:
+        """Resolved court UUIDs must be passed as parameters to every DELETE /
+        COUNT query, not interpolated as SQL.
+        """
+        court_ids = [
+            "00000000-0000-0000-0000-000000000001",
+            "00000000-0000-0000-0000-000000000002",
+        ]
+        counts = dict.fromkeys(
+            (
+                "case_judges",
+                "case_parties",
+                "case_attorneys",
+                "documents",
+                "rulings",
+                "cases",
+                "judges",
+            ),
+            0,
+        )
+        mock_conn, mock_cur = _build_per_county_mock_conn(court_ids, counts)
+
+        rebuild_db.reset_derived_tables_for_county(mock_conn, "CA", "Santa Clara")
+
+        # Every DELETE / COUNT after the initial resolve should receive
+        # court_ids as its parameter list, never string-interpolated.
+        # The first call is the resolve SELECT.
+        calls_after_resolve = mock_cur.execute.call_args_list[1:]
+        for call in calls_after_resolve:
+            params = call[0][1] if len(call[0]) > 1 else None
+            # Params must carry the court_ids list/tuple.
+            assert params is not None, f"missing params for {call[0][0]!r}"
+            # The first positional is always the court_ids tuple.
+            first = params[0]
+            assert list(first) == court_ids, f"expected court_ids={court_ids}, got {first}"
+
+
+class TestMainPerCountyResetDispatch:
+    """Tests for main()'s dispatch between global and per-county reset."""
+
+    def _common_patches(
+        self,
+        tmp_path: Any,
+        argv: list[str],
+    ) -> dict[str, Any]:
+        """Set up common patches used by both dispatch tests."""
+        cache_dir = str(tmp_path / "cache")
+        (tmp_path / "cache").mkdir()
+        # Create one dummy key so list_local_keys returns a non-empty list.
+        key_dir = tmp_path / "cache" / "ca" / "santa_clara" / "superior_court" / "raw"
+        key_dir.mkdir(parents=True)
+        (key_dir / "abc123.html").write_bytes(b"<html>x</html>")
+
+        mock_pool = MagicMock()
+        mock_pool.__enter__ = MagicMock(return_value=mock_pool)
+        mock_pool.__exit__ = MagicMock(return_value=False)
+        mock_future = MagicMock()
+        mock_future.result.return_value = {
+            "status": "ok",
+            "content_format": "html",
+            "had_hearing_date": False,
+        }
+        mock_pool.submit.return_value = mock_future
+
+        return {
+            "cache_dir": cache_dir,
+            "argv": argv,
+            "mock_pool": mock_pool,
+            "mock_future": mock_future,
+        }
+
+    def test_reset_without_county_truncates_globally(self, tmp_path: Any) -> None:
+        """``--reset`` without ``--county`` → global TRUNCATE."""
+        ctx = self._common_patches(tmp_path, ["rebuild_db.py", "--reset"])
+        with (
+            patch("rebuild_db.make_s3_client", return_value=MagicMock()),
+            patch("psycopg.connect", return_value=MagicMock()),
+            patch(
+                "rebuild_db.list_local_keys",
+                return_value=["ca/santa_clara/superior_court/raw/abc123.html"],
+            ),
+            patch("rebuild_db.seed_courts", return_value={}),
+            patch("rebuild_db.reset_derived_tables") as mock_global_reset,
+            patch("rebuild_db.reset_derived_tables_for_county") as mock_per_county_reset,
+            patch("rebuild_db._fetch_rosters"),
+            patch("rebuild_db._write_rebuild_marker"),
+            patch(
+                "concurrent.futures.ProcessPoolExecutor",
+                return_value=ctx["mock_pool"],
+            ),
+            patch(
+                "concurrent.futures.as_completed",
+                return_value=iter([ctx["mock_future"]]),
+            ),
+            patch.dict(
+                os.environ,
+                {
+                    "DATABASE_URL": "postgres://test",
+                    "S3_CACHE_DIR": ctx["cache_dir"],
+                },
+                clear=False,
+            ),
+            patch("sys.argv", ctx["argv"]),
+        ):
+            rebuild_db.main()
+
+        mock_global_reset.assert_called_once()
+        mock_per_county_reset.assert_not_called()
+
+    def test_reset_with_county_uses_per_county_reset(self, tmp_path: Any) -> None:
+        """``--reset --county X`` → per-county DELETE, not global TRUNCATE.
+
+        Also verifies OpenSearch index reset is skipped (global index
+        self-heals, we don't rebuild non-target counties).
+        """
+        ctx = self._common_patches(
+            tmp_path, ["rebuild_db.py", "--reset", "--county", "Santa Clara"]
+        )
+        with (
+            patch("rebuild_db.make_s3_client", return_value=MagicMock()),
+            patch("psycopg.connect", return_value=MagicMock()),
+            patch(
+                "rebuild_db.list_local_keys",
+                return_value=["ca/santa_clara/superior_court/raw/abc123.html"],
+            ),
+            patch("rebuild_db.seed_courts", return_value={}),
+            patch("rebuild_db.reset_derived_tables") as mock_global_reset,
+            patch("rebuild_db.reset_derived_tables_for_county") as mock_per_county_reset,
+            patch("rebuild_db.reset_opensearch_index") as mock_os_reset,
+            patch("rebuild_db._fetch_rosters"),
+            patch("rebuild_db._write_rebuild_marker"),
+            patch(
+                "concurrent.futures.ProcessPoolExecutor",
+                return_value=ctx["mock_pool"],
+            ),
+            patch(
+                "concurrent.futures.as_completed",
+                return_value=iter([ctx["mock_future"]]),
+            ),
+            patch.dict(
+                os.environ,
+                {
+                    "DATABASE_URL": "postgres://test",
+                    "S3_CACHE_DIR": ctx["cache_dir"],
+                    "OPENSEARCH_URL": "http://opensearch:9200",
+                },
+                clear=False,
+            ),
+            patch("sys.argv", ctx["argv"]),
+        ):
+            rebuild_db.main()
+
+        mock_global_reset.assert_not_called()
+        mock_per_county_reset.assert_called_once()
+        # Args: (conn, state, county).  State defaults to "ca".
+        call_args = mock_per_county_reset.call_args
+        assert call_args[0][1] == "ca"
+        assert call_args[0][2] == "Santa Clara"
+        # Must skip OpenSearch index reset under per-county mode.
+        mock_os_reset.assert_not_called()
+
+    def test_no_reset_does_not_touch_derived_tables(self, tmp_path: Any) -> None:
+        """Without ``--reset``, neither reset function is called — existing
+        incremental behavior preserved.
+        """
+        ctx = self._common_patches(tmp_path, ["rebuild_db.py", "--county", "Santa Clara"])
+        with (
+            patch("rebuild_db.make_s3_client", return_value=MagicMock()),
+            patch("psycopg.connect", return_value=MagicMock()),
+            patch(
+                "rebuild_db.list_local_keys",
+                return_value=["ca/santa_clara/superior_court/raw/abc123.html"],
+            ),
+            patch("rebuild_db.seed_courts", return_value={}),
+            patch("rebuild_db.reset_derived_tables") as mock_global_reset,
+            patch("rebuild_db.reset_derived_tables_for_county") as mock_per_county_reset,
+            patch("rebuild_db._fetch_rosters"),
+            patch("rebuild_db._write_rebuild_marker") as mock_marker,
+            patch(
+                "concurrent.futures.ProcessPoolExecutor",
+                return_value=ctx["mock_pool"],
+            ),
+            patch(
+                "concurrent.futures.as_completed",
+                return_value=iter([ctx["mock_future"]]),
+            ),
+            patch.dict(
+                os.environ,
+                {
+                    "DATABASE_URL": "postgres://test",
+                    "S3_CACHE_DIR": ctx["cache_dir"],
+                },
+                clear=False,
+            ),
+            patch("sys.argv", ctx["argv"]),
+        ):
+            rebuild_db.main()
+
+        mock_global_reset.assert_not_called()
+        mock_per_county_reset.assert_not_called()
+        # No marker writes either — that's reserved for --reset runs.
+        mock_marker.assert_not_called()
