@@ -511,7 +511,7 @@ An investigation frequently invalidates claims made in source-file docstrings, i
 
 **Required actions:**
 
-1. **Grep the codebase for any claims contradicted by the investigation's findings.** Search source-file docstrings, inline comments, and nearby `README.md` files (including `tests/fixtures/README.md`) for statements the investigation has shown to be wrong. For a scraper investigation, grep the scraper module's docstring and comments; for an ingestion investigation, grep the relevant `enrichment/` or `transcription/` modules. Example patterns to grep: specific regex claims, format descriptions, "case number format", "always", "never", field-availability claims, etc.
+1. **Grep the codebase for any claims contradicted by the investigation's findings.** Search source-file docstrings, inline comments, and nearby README files (including the per-fixture readmes under `tests/fixtures/`) for statements the investigation has shown to be wrong. For a scraper investigation, grep the scraper module's docstring and comments; for an ingestion investigation, grep the relevant `enrichment/` or `transcription/` modules. Example patterns to grep: specific regex claims, format descriptions, "case number format", "always", "never", field-availability claims, etc.
 2. **List each stale location you find** in the investigation's findings document, with file path + line numbers + the incorrect text + the corrected text.
 3. **Either update them in the same PR as the investigation, or file a follow-up issue** (via B.1) that lists the specific locations and the corrected text verbatim. Do not file a vague "update docstrings" issue — the follow-up must be concrete enough that an agent can pick it up and mechanically apply the edits.
 
