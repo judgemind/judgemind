@@ -609,15 +609,37 @@ def is_la_html(text: str | None) -> bool:
     :mod:`scripts.rebuild_db`) through the same deterministic splitter as
     live ``ca-la-tentatives-civil`` captures.
 
-    The check is a cheap substring test on the first 4 KB of the content —
-    the ``<div id="speechSynthesis">`` marker appears near the top of every
-    LA department response (it wraps the ruling content area).
+    Detection strategy:
+
+    1. **Fast head scan** for ``id="speechSynthesis"`` in the first 4 KB.
+       Hits the common case — per-case fragments stored by the live
+       scraper wrap each section in its own ``<html><body><div
+       id="speechSynthesis">`` shell, so the marker sits at offset ~17.
+    2. **Full-document scan** for the same marker anywhere in the text.
+       Required for full-page LA captures stored by the
+       ``ENABLE_LA_LLM_EXTRACTION`` path: the ASP.NET page wrapper pushes
+       ``div#speechSynthesis`` well past the 4 KB head (offsets observed
+       in production: 60 KB, 109 KB, 403 KB — see #2480).
+       ``str.__contains__`` is a C-level Boyer-Moore-style search, so
+       scanning a 700 KB page takes microseconds and runs at most once
+       per document.
+
+    Both tiers look for the same substring; the tiered form exists
+    purely so callers processing large non-LA payloads pay only the
+    cheap head scan when the document obviously is not an LA page.
     """
     if not text:
         return False
-    # Only scan the head of the document to keep the check cheap.
-    head = text[:4096]
-    return 'id="speechSynthesis"' in head
+    marker = 'id="speechSynthesis"'
+    # Tier 1: fast head check (covers per-case fragment captures).
+    if marker in text[:4096]:
+        return True
+    # Short inputs were fully covered by Tier 1 — avoid a redundant re-scan
+    # of the entire string for small non-LA payloads on the hot path.
+    if len(text) <= 4096:
+        return False
+    # Tier 2: full-document scan (covers full-page LA captures — #2480).
+    return marker in text
 
 
 def _truncate_party_list(party_side: str) -> str:

@@ -3219,9 +3219,95 @@ def test_is_la_html_rejects_empty_and_none() -> None:
     assert is_la_html(None) is False
 
 
-def test_is_la_html_only_scans_head() -> None:
-    """Only the first 4 KB is scanned for the marker (cheap check)."""
-    # Marker appears after the 4 KB boundary — should not match.
-    padding = "<!-- " + ("x" * 4200) + " -->"
+def test_is_la_html_detects_marker_beyond_head() -> None:
+    """Full-page LA captures (ASP.NET wrapper pushes speechSynthesis past
+    the first 4 KB) are still detected — regression for #2480."""
+    # Marker appears well after the 4 KB boundary — must still match.
+    padding = "<!-- " + ("x" * 8000) + " -->"
     html_with_late_marker = padding + '<div id="speechSynthesis">content</div>'
-    assert is_la_html(html_with_late_marker) is False
+    assert is_la_html(html_with_late_marker) is True
+
+
+# ---------------------------------------------------------------------------
+# #2480 regression — full-page LA captures produced UNKNOWN case_numbers.
+# Three S3 objects stored by the ENABLE_LA_LLM_EXTRACTION path contain the
+# full ASP.NET page HTML; div#speechSynthesis appears at offsets 60-403 KB,
+# well beyond the is_la_html 4 KB head scan window that predated #2480.
+# Before the fix, is_la_html returned False for these fixtures and the
+# worker synthesized UNKNOWN-<document_id> case_numbers.  These tests
+# pin both the detection (is_la_html True) and the splitter output
+# (real case_numbers extracted).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("fixture_name", "marker_min_offset"),
+    [
+        (
+            "la_ruling_fullpage_smc205.html",
+            60_000,  # Santa Monica Dept 205 — marker at ~403 KB in source
+        ),
+        (
+            "la_ruling_fullpage_stanley54.html",
+            60_000,  # Stanley Mosk Dept 54 — marker at ~61 KB in source
+        ),
+        (
+            "la_ruling_fullpage_torrance_m.html",
+            60_000,  # Torrance Dept M — marker at ~109 KB in source
+        ),
+    ],
+)
+def test_is_la_html_full_page_capture_detected(
+    fixture_name: str,
+    marker_min_offset: int,
+) -> None:
+    """The three #2480 fixtures are detected as LA HTML despite the
+    div#speechSynthesis marker sitting beyond the 4 KB head window."""
+    html = _load(fixture_name)
+    # Sanity check the fixture: the marker must sit past the head boundary
+    # for this test to exercise the Tier-2 scan.  If a fixture is replaced
+    # with one that no longer triggers Tier-2, this assertion catches that.
+    assert html.find('id="speechSynthesis"') >= marker_min_offset, (
+        f"{fixture_name} has speechSynthesis in the first {marker_min_offset} "
+        f"bytes — fixture no longer exercises the Tier-2 full-document scan"
+    )
+    assert is_la_html(html) is True
+
+
+@pytest.mark.parametrize(
+    ("fixture_name", "expected_case_numbers"),
+    [
+        (
+            "la_ruling_fullpage_smc205.html",
+            ["24SMCV01804", "25SMCV06383"],
+        ),
+        (
+            "la_ruling_fullpage_stanley54.html",
+            ["21STCV34143"],
+        ),
+        (
+            "la_ruling_fullpage_torrance_m.html",
+            ["22TRCV01133", "24TRCV00284"],
+        ),
+    ],
+)
+def test_split_rulings_extracts_real_case_numbers_from_full_page(
+    fixture_name: str,
+    expected_case_numbers: list[str],
+) -> None:
+    """_split_rulings extracts real case_numbers (not UNKNOWN) from the
+    #2480 full-page fixtures — regression for the issue.
+
+    The underlying splitter already worked on these fixtures; the bug was
+    upstream in the routing (is_la_html rejected them, so _split_rulings
+    was never called).  This test pins the splitter output so a future
+    regex change cannot silently regress case_number extraction.
+    """
+    html = _load(fixture_name)
+    rulings = _split_rulings(html)
+    extracted = [r.case_number for r in rulings]
+    assert extracted == expected_case_numbers
+    # No ruling should have a None or UNKNOWN-prefixed case_number.
+    for r in rulings:
+        assert r.case_number is not None
+        assert not r.case_number.startswith("UNKNOWN-")
