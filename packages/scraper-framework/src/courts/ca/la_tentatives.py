@@ -1,9 +1,18 @@
-"""LA County Superior Court — Civil Tentative Rulings Scraper (Pattern 1).
+"""LA County Superior Court — Civil and Appellate Tentative Rulings Scrapers.
 
-Strategy: enumerate all (courthouse, department, date) combinations from the
-ASP.NET dropdown, POST for each, archive the raw HTML per-department response.
+LA Court publishes tentative rulings for two divisions through the *same*
+ASP.NET portal at different ``casetype`` query-string values:
 
-Verified against live site 2026-03-02:
+- ``casetype=civil`` (main.aspx) — every courthouse × department × date triple
+  has its own dropdown option; see :data:`CIVIL_URL`.
+- ``casetype=appellate`` (main.aspx) — a single Appellate Division (Stanley
+  Mosk Courthouse, Room 607) with only *hearing dates* in the dropdown; see
+  :data:`APPELLATE_URL`.
+
+Strategy for both: enumerate every dropdown option, POST the ASP.NET form for
+each, archive the raw HTML per-option response.
+
+Verified against live civil site 2026-03-02:
 - URL: https://www.lacourt.ca.gov/tentativeRulingNet/ui/main.aspx?casetype=civil
 - Select name: ctl00$ctl00$siteMasterHolder$basicBodyHolder$List2DeptDate
 - Select id:   siteMasterHolder_basicBodyHolder_List2DeptDate
@@ -14,6 +23,20 @@ Verified against live site 2026-03-02:
 - Judge name in: <div>...Name Judge of the Superior Court</div>
 - No CAPTCHA on civil tentatives; simple HTTP sufficient (no Playwright needed)
 - Recommended schedule: 6 PM primary, 2 AM catch-up
+
+Verified against live appellate site 2026-04-17:
+- URL: https://www.lacourt.ca.gov/tentativeRulingNet/ui/main.aspx?casetype=appellate
+- Select (when populated): ctl00$ctl00$siteMasterHolder$basicBodyHolder$List1DeptDate
+- Empty-state marker: a ``#siteMasterHolder_basicBodyHolder_NoRuling`` table
+  with the text "No rulings have been published at this time." — the dropdown
+  is absent in that case, and scraping yields zero documents.  LA Court's own
+  page comment confirms the format difference::
+      appellate division does not include the location and department
+      in the drop down box since there's only only location and department.
+      The drop down box displays Hearing date only.
+- Division metadata is static: courthouse="Stanley Mosk Courthouse",
+  department="Appellate Division" — stamped onto every captured doc so
+  downstream ranking/search can filter appellate separately from civil.
 """
 
 from __future__ import annotations
@@ -85,6 +108,32 @@ _OPTION_VALUE_RE = re.compile(
 _OPTION_TEXT_RE = re.compile(
     r"\((?P<courthouse>[^:]+):\s+Dept\.\s+(?P<dept>[^)]+)\)\s+(?P<date>.+)"
 )
+
+# ---------------------------------------------------------------------------
+# Appellate Division constants (#2599)
+# ---------------------------------------------------------------------------
+APPELLATE_URL = "https://www.lacourt.ca.gov/tentativeRulingNet/ui/main.aspx?casetype=appellate"
+
+# Appellate dropdown uses a different named ASP.NET control (List1DeptDate vs
+# civil's List2DeptDate).  Verified from the live page's JS/HTML on 2026-04-17.
+APPELLATE_SELECT_NAME = "ctl00$ctl00$siteMasterHolder$basicBodyHolder$List1DeptDate"
+APPELLATE_SELECT_ID = "siteMasterHolder_basicBodyHolder_List1DeptDate"
+
+# LA Appellate Division is a single physical department — static metadata.
+APPELLATE_COURTHOUSE = "Stanley Mosk Courthouse"
+APPELLATE_DEPARTMENT = "Appellate Division"
+
+# Appellate option value format: "MM/DD/YYYY" (hearing date only — no
+# courthouse/dept, per LA Court's own HTML comment "appellate division does
+# not include the location and department in the drop down box").
+_APPELLATE_OPTION_VALUE_RE = re.compile(r"^(?P<date>\d{2}/\d{2}/\d{4})$")
+
+# Empty-state marker on the appellate main page.  When no rulings are
+# published the page renders a #siteMasterHolder_basicBodyHolder_NoRuling
+# table with the text "No rulings have been published at this time.".  In
+# that state the dropdown is absent and scraping correctly yields zero docs.
+_APPELLATE_NO_RULING_TABLE_ID = "siteMasterHolder_basicBodyHolder_NoRuling"
+_APPELLATE_NO_RULING_MARKER = "No rulings have been published at this time."
 
 # Case numbers in ruling text: "Case Number:24NNCV02551" (no space)
 _CASE_NUMBER_RE = re.compile(r"Case Number:\s*(\w+)")
@@ -927,6 +976,126 @@ class LATentativeRulingsScraper(BaseScraper):
         return doc
 
 
+class LAAppellateTentativeRulingsScraper(BaseScraper):
+    """Scrapes LA County **Appellate Division** tentative rulings (#2599).
+
+    The Appellate Division shares the same ASP.NET portal as civil but at
+    ``casetype=appellate``.  Differences from civil:
+
+    - Dropdown name is ``List1DeptDate`` (not ``List2DeptDate``).
+    - Each option's value is a hearing date only (``MM/DD/YYYY``) — no
+      courthouse or department encoded, per LA Court's own HTML comment.
+    - Metadata is static: courthouse="Stanley Mosk Courthouse",
+      department="Appellate Division".
+    - Empty state ("No rulings have been published at this time.") is the
+      common case; the dropdown is absent and scraping yields 0 docs
+      without raising.
+
+    Shares per-case HTML parsing helpers (``_split_cases_html``,
+    ``_extract_ruling_fields``, etc.) with the civil scraper, since both
+    use the same ``speechSynthesis`` ruling format once a POST response
+    arrives.
+    """
+
+    def __init__(
+        self,
+        config: ScraperConfig,
+        archiver: S3Archiver | None = None,
+        event_bus: EventBus | None = None,
+    ) -> None:
+        super().__init__(config, archiver=archiver, event_bus=event_bus)
+
+    def fetch_documents(self) -> list[CapturedDocument]:
+        docs: list[CapturedDocument] = []
+        with httpx.Client(
+            timeout=self.config.request_timeout_seconds,
+            follow_redirects=True,
+            headers={"User-Agent": "Judgemind/1.0 (+https://judgemind.org/scraper)"},
+        ) as client:
+            self._log.info("Fetching appellate main page", url=APPELLATE_URL)
+            response = client.get(APPELLATE_URL)
+            response.raise_for_status()
+
+            if _has_no_rulings_appellate(response.text):
+                self._log.info(
+                    "Appellate division has no published rulings",
+                    context="empty_state",
+                )
+                return docs
+
+            tokens = _extract_aspnet_tokens(response.text)
+            options = _parse_appellate_dropdown_options(response.text)
+            self._log.info("Found appellate dropdown options", count=len(options))
+
+            for opt in options:
+                time.sleep(self.config.request_delay_seconds)
+                try:
+                    ruling_html = _post_for_ruling_appellate(client, tokens, opt)
+                    if _is_stale_viewstate_response(ruling_html):
+                        self._log.warning(
+                            "Stale ViewState error page; skipping",
+                            dept=opt.department,
+                            date=str(opt.hearing_date),
+                            context="stale_viewstate",
+                        )
+                        continue
+
+                    case_htmls = _split_cases_html(ruling_html)
+                    for case_html in case_htmls:
+                        doc = self._make_base_doc(
+                            source_url=APPELLATE_URL,
+                            raw_content=case_html.encode("utf-8"),
+                            content_format=ContentFormat.HTML,
+                        )
+                        doc.courthouse = opt.courthouse
+                        doc.department = opt.department
+                        doc.hearing_date = opt.hearing_date
+                        doc.extra["courthouse_code"] = opt.courthouse_code
+                        doc.extra["dropdown_value"] = opt.value
+                        doc.extra["casetype"] = "appellate"
+                        docs.append(doc)
+                    self._log.debug(
+                        "Fetched appellate ruling",
+                        dept=opt.department,
+                        date=str(opt.hearing_date),
+                        cases=len(case_htmls),
+                    )
+                except Exception as exc:
+                    self._log.error(
+                        "Failed to fetch appellate ruling",
+                        dept=opt.department,
+                        date=str(opt.hearing_date),
+                        error=str(exc),
+                    )
+        return docs
+
+    def parse_document(self, doc: CapturedDocument) -> CapturedDocument:
+        # Guard against re-parsing LLM-pre-split documents (#2469, #2484).
+        # The shared module-level ``_llm_extract_rulings`` is registered in
+        # ``_LLM_SPLIT_REGISTRY``; if a future run marks appellate docs with
+        # ``pre_split`` or ``_llm_extracted`` we must not clobber their
+        # LLM-populated fields by re-running regex over the full HTML.
+        if doc.extra.get("pre_split") or doc.extra.get("_llm_extracted"):
+            doc.courthouse = doc.courthouse or APPELLATE_COURTHOUSE
+            doc.department = doc.department or APPELLATE_DEPARTMENT
+            return doc
+
+        # Appellate uses the same per-case HTML format as civil, so reuse
+        # the civil regex extractor.  LLM extraction is not yet enabled
+        # for appellate — appellate rulings are low volume, and regex
+        # handles the deterministic <b>-tag headers reliably (#2599).
+        try:
+            soup = BeautifulSoup(doc.raw_content, "lxml")
+            _extract_ruling_fields(soup, doc)
+        except Exception as exc:
+            self._log.warning("Parse error", error=str(exc))
+
+        # Stamp static appellate metadata in case it was cleared during parse.
+        doc.courthouse = doc.courthouse or APPELLATE_COURTHOUSE
+        doc.department = doc.department or APPELLATE_DEPARTMENT
+        return doc
+
+
 # ---------------------------------------------------------------------------
 # ASP.NET helpers
 # ---------------------------------------------------------------------------
@@ -1014,6 +1183,89 @@ def _post_for_ruling(
         "submit2": "Search",
     }
     response = client.post(CIVIL_URL, data=form_data)
+    response.raise_for_status()
+    return response.text
+
+
+# ---------------------------------------------------------------------------
+# Appellate helpers (#2599)
+# ---------------------------------------------------------------------------
+
+
+def _has_no_rulings_appellate(html: str) -> bool:
+    """Return True if the appellate page is in its empty state.
+
+    The LA Court appellate portal renders a
+    ``#siteMasterHolder_basicBodyHolder_NoRuling`` table with the text
+    "No rulings have been published at this time." when no rulings are
+    published.  The dropdown is absent in that case and scraping correctly
+    yields zero documents (without raising).
+    """
+    if _APPELLATE_NO_RULING_TABLE_ID in html and _APPELLATE_NO_RULING_MARKER in html:
+        return True
+    # Fallback: strict marker check even if the table id is renamed.
+    return _APPELLATE_NO_RULING_MARKER in html
+
+
+def _parse_appellate_dropdown_options(html: str) -> list[DropdownOption]:
+    """Parse the appellate-division dropdown options.
+
+    Appellate options carry only a hearing date (e.g. value
+    ``04/17/2026``).  Static courthouse and department metadata is
+    stamped from :data:`APPELLATE_COURTHOUSE` / :data:`APPELLATE_DEPARTMENT`
+    since the Appellate Division is a single physical department.
+
+    Returns an empty list if the dropdown is absent (e.g. the page is in
+    its "No rulings have been published at this time." empty state).
+    """
+    soup = BeautifulSoup(html, "lxml")
+    select = soup.find("select", {"id": APPELLATE_SELECT_ID}) or soup.find(
+        "select", {"name": APPELLATE_SELECT_NAME}
+    )
+    if not select:
+        return []
+
+    options: list[DropdownOption] = []
+    for opt_el in select.find_all("option"):
+        value = opt_el.get("value", "").strip()
+        if not value:
+            continue
+        vm = _APPELLATE_OPTION_VALUE_RE.match(value)
+        if not vm:
+            logger.debug("Unparseable appellate option value", value=value)
+            continue
+        date_str = vm.group("date")
+        hearing_date: datetime | None = None
+        try:
+            hearing_date = datetime.strptime(date_str, "%m/%d/%Y")
+        except ValueError:
+            pass
+        options.append(
+            DropdownOption(
+                value=value,
+                courthouse_code="APPELLATE",
+                courthouse=APPELLATE_COURTHOUSE,
+                department=APPELLATE_DEPARTMENT,
+                hearing_date=hearing_date,
+            )
+        )
+    return options
+
+
+def _post_for_ruling_appellate(
+    client: httpx.Client,
+    tokens: dict[str, str],
+    option: DropdownOption,
+) -> str:
+    """POST the ASP.NET form for one appellate dropdown selection."""
+    form_data = {
+        "__VIEWSTATE": tokens.get("__VIEWSTATE", ""),
+        "__VIEWSTATEGENERATOR": tokens.get("__VIEWSTATEGENERATOR", ""),
+        "__EVENTVALIDATION": tokens.get("__EVENTVALIDATION", ""),
+        APPELLATE_SELECT_NAME: option.value,
+        "submit2": "Search",
+    }
+    response = client.post(APPELLATE_URL, data=form_data)
     response.raise_for_status()
     return response.text
 
@@ -1680,3 +1932,47 @@ def default_config(s3_bucket: str = "") -> ScraperConfig:
         max_retries=3,
         s3_bucket=s3_bucket,
     )
+
+
+def default_config_appellate(s3_bucket: str = "") -> ScraperConfig:
+    """Default config for the LA Appellate Division tentative rulings scraper (#2599).
+
+    Shares the civil scraper's twice-daily cadence (6 PM primary, 2 AM
+    catch-up) since appellate rulings post on the same portal.  The
+    Appellate Division is low-volume (empty state is the common case)
+    but the capture-to-S3 step is still critical on the rare days when
+    rulings are posted.
+    """
+    from datetime import time as dtime
+
+    from framework import ScheduleWindow
+
+    return ScraperConfig(
+        scraper_id="ca-la-tentatives-appellate",
+        state="CA",
+        county="Los Angeles",
+        court="Superior Court",
+        target_urls=[APPELLATE_URL],
+        poll_interval_seconds=43200,  # twice daily
+        schedule_windows=[
+            ScheduleWindow(start=dtime(18, 0), end=dtime(19, 0)),  # 6 PM sweep
+            ScheduleWindow(start=dtime(2, 0), end=dtime(3, 0)),  # 2 AM catch-up
+        ],
+        request_delay_seconds=1.5,
+        request_timeout_seconds=30.0,
+        max_retries=3,
+        s3_bucket=s3_bucket,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Multi-scraper module registry hint (#2599)
+# ---------------------------------------------------------------------------
+# This module exposes two scrapers; the ``_load_scraper_registry`` discovery
+# in ``scripts/reingest_from_s3.py`` uses this mapping to pair each
+# ``scraper_id`` with its concrete class.  Without it, alphabetical class
+# iteration picks the wrong class for ``ca-la-tentatives-civil``.
+_SCRAPER_CLASS_BY_ID: dict[str, type] = {
+    "ca-la-tentatives-civil": LATentativeRulingsScraper,
+    "ca-la-tentatives-appellate": LAAppellateTentativeRulingsScraper,
+}
