@@ -2267,12 +2267,23 @@ def reingest_batch(
                         or doc_meta["case_number"]
                         or f"UNKNOWN-{effective_doc_id}"
                     )
+                    # ``force_update=True`` overrides the default preserve-
+                    # existing COALESCE order (#2468) so reingest can correct
+                    # previously-stuck ``case_type`` / ``case_title`` values
+                    # after an extraction fix (e.g. the #2368 SF family-court
+                    # regex correction that left ``cases.case_type``
+                    # stuck on ``criminal``).  A NULL incoming value still
+                    # falls through to the preserved ``cases.*`` column —
+                    # we never erase a good existing value with an incoming
+                    # NULL.  Mirrors the ``force_update`` flag already
+                    # passed to ``insert_document_and_ruling`` below (#2431).
                     new_case_id = upsert_case(
                         conn,
                         effective_case_number,
                         court_id_str,
                         case_title=extracted["case_title"],
                         case_type=extracted.get("case_type"),
+                        force_update=True,
                     )
 
                     effective_hearing = (
