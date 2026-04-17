@@ -142,6 +142,95 @@ def _markdown_to_html(text: str) -> str:
     return "\n".join(html_parts)
 
 
+def _try_sd_calendar_split(
+    event_data: dict[str, Any],
+    document_id: str,
+    ruling_text: str,
+    dispatch: Any,
+) -> bool:
+    """If *ruling_text* is a San Diego calendar HTML page, deterministically
+    split it into per-case rulings and dispatch one synthetic split event per
+    case via *dispatch*.  Returns True if the split ran, False otherwise.
+
+    This path bypasses the LLM entirely — calendar HTML pages carry 30+
+    fully-structured cases that are cheap to parse with BeautifulSoup.
+    Sending them through the LLM produced two severe correctness bugs
+    (#2447):
+
+    1. The full 60-100KB HTML was stored as ``ruling_text`` for a single
+       "ruling" record, hitting the 50000-char truncation cap.
+    2. The LLM's first-case extraction was joined onto a DB row whose
+       ``case_number`` came from another case, producing cross-case
+       contamination.
+
+    The function first checks whether the content looks like a SD calendar
+    page.  If not, it returns False and the caller continues with the
+    normal extraction flow.
+    """
+    # Lazy import to avoid a circular dependency between the worker and
+    # the courts package at module load time.
+    from courts.ca.sd_calendar import _split_rulings, is_sd_calendar_html
+
+    if not is_sd_calendar_html(ruling_text):
+        return False
+
+    split_rulings = _split_rulings(ruling_text)
+    if not split_rulings:
+        logger.warning(
+            "SD calendar HTML detected but splitter returned no rulings — falling through",
+            extra={"document_id": document_id},
+        )
+        return False
+
+    logger.info(
+        "SD calendar deterministic split dispatching %d ruling(s)",
+        len(split_rulings),
+        extra={
+            "document_id": document_id,
+            "ruling_count": len(split_rulings),
+            "scraper_id": event_data.get("scraper_id"),
+            "extraction_method": "sd_calendar_deterministic",
+        },
+    )
+
+    # Import here so we don't create a new top-level dependency.
+    from .split_ids import make_split_document_id
+
+    is_multi = len(split_rulings) > 1
+    for idx, sr in enumerate(split_rulings):
+        split_doc_id = make_split_document_id(document_id, idx) if is_multi else document_id
+        hearing_date_value: str | None = None
+        if sr.hearing_date is not None:
+            hearing_date_value = (
+                sr.hearing_date.date().isoformat()
+                if isinstance(sr.hearing_date, datetime)
+                else str(sr.hearing_date)
+            )
+
+        split_event: dict[str, Any] = {
+            **event_data,
+            "document_id": split_doc_id,
+            "_original_document_id": document_id,
+            "_split_processed": True,
+            "_llm_extracted": True,  # Skip further LLM attempts.
+            "_split_index": idx,
+            "_split_count": len(split_rulings),
+            "ruling_text": sr.ruling_text,
+            "ruling_text_html": None,
+            "case_number": sr.case_number or event_data.get("case_number"),
+            "case_title": sr.case_title or event_data.get("case_title"),
+            "judge_name": sr.judge_name or event_data.get("judge_name"),
+            "department": sr.department or event_data.get("department"),
+            "motion_type": sr.motion_type or event_data.get("motion_type"),
+            "outcome": sr.outcome or event_data.get("outcome"),
+            "hearing_date": hearing_date_value or event_data.get("hearing_date"),
+            "parties": sr.parties if sr.parties else event_data.get("parties", []),
+        }
+        dispatch(split_event)
+
+    return True
+
+
 # Fields that LLM extraction can populate when missing from the scraper event.
 EXTRACTABLE_FIELDS = (
     "hearing_date",
@@ -2000,6 +2089,24 @@ class IngestionWorker:
         """
         if not ruling_text and not raw_pdf_bytes:
             return False
+
+        # ------------------------------------------------------------------
+        # San Diego calendar HTML deterministic split (#2447)
+        # ------------------------------------------------------------------
+        # SD calendar pages contain 30+ cases in one HTML document.  Sending
+        # the full page to an LLM produces raw-HTML dumps and cross-case
+        # contamination — even with the NONE scraper override, events
+        # emitted by ``scripts/rebuild_db.py`` with the synthetic scraper_id
+        # ``rebuild-ca-san_diego`` previously fell through to the county
+        # LLM default and corrupted ~40% of the SD sample.  Detect the
+        # calendar HTML by content and dispatch one split event per case
+        # using the deterministic ``_split_rulings`` in ``sd_calendar``.
+        # This path is taken regardless of scraper_id so any future SD
+        # calendar capture paths stay correct by default.
+        if ruling_text and _try_sd_calendar_split(
+            event_data, document_id, ruling_text, self.process_event
+        ):
+            return True
 
         # Build metadata from scraper-provided fields.
         metadata: dict[str, str] = {}

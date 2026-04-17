@@ -19,7 +19,10 @@ from framework.llm_schema import (
     ExtractionCaseType,
     ExtractionOutcome,
 )
-from ingestion.ruling_guards import convert_extracted_rulings
+from ingestion.ruling_guards import (
+    _looks_like_raw_html,
+    convert_extracted_rulings,
+)
 from ingestion.split_ids import make_split_document_id
 
 # ---------------------------------------------------------------------------
@@ -480,3 +483,143 @@ class TestEdgeCases:
         # because we explicitly passed it. But since ruling_text is None
         # and "" is falsy, the guard should return fallback_text which is "".
         assert results[0].ruling_text == ""
+
+
+# ---------------------------------------------------------------------------
+# Raw-HTML safety net (#2447)
+# ---------------------------------------------------------------------------
+
+
+class TestLooksLikeRawHtml:
+    """Unit tests for the raw-HTML detector used by the fallback guard."""
+
+    def test_empty_string_is_not_html(self) -> None:
+        assert _looks_like_raw_html("") is False
+
+    def test_whitespace_only_is_not_html(self) -> None:
+        assert _looks_like_raw_html("   \n\t  ") is False
+
+    def test_plain_ruling_text_is_not_html(self) -> None:
+        assert _looks_like_raw_html("The motion is GRANTED.") is False
+
+    def test_ruling_text_with_inline_lt_is_not_html(self) -> None:
+        """Real ruling text sometimes contains bare ``<`` — don't false-trigger."""
+        assert _looks_like_raw_html("Plaintiff (PL) < age 18 at time of filing") is False
+        assert _looks_like_raw_html("<Name> (PL) appears pro per") is False
+
+    def test_doctype_lowercase_is_html(self) -> None:
+        assert _looks_like_raw_html("<!doctype html><html><body>x</body></html>") is True
+
+    def test_doctype_uppercase_is_html(self) -> None:
+        assert _looks_like_raw_html("<!DOCTYPE html><html><body>x</body></html>") is True
+
+    def test_html_open_tag_lowercase(self) -> None:
+        assert _looks_like_raw_html("<html><head></head><body>x</body></html>") is True
+
+    def test_html_open_tag_uppercase(self) -> None:
+        assert _looks_like_raw_html("<HTML><BODY>x</BODY></HTML>") is True
+
+    def test_xml_prolog_is_html(self) -> None:
+        assert _looks_like_raw_html("<?xml version='1.0'?><root/>") is True
+
+    def test_leading_whitespace_stripped(self) -> None:
+        """A BOM / leading whitespace does not disguise raw HTML."""
+        assert _looks_like_raw_html("\n  <!DOCTYPE html>\n<html></html>") is True
+
+    def test_body_tag_within_first_2kb(self) -> None:
+        """Fragments without a <html> opener but with <body> are still HTML."""
+        text = "some header\n" + "x" * 100 + "<body>content</body>"
+        assert _looks_like_raw_html(text) is True
+
+    def test_body_tag_past_2kb_is_not_detected(self) -> None:
+        """The body-tag scan only covers the first 2 KB."""
+        padding = "x" * 3000
+        text = padding + "<body>late body</body>"
+        # No <html> / <!doctype> prefix and <body> is past 2 KB → not flagged.
+        assert _looks_like_raw_html(text) is False
+
+    def test_sd_calendar_page_is_detected(self) -> None:
+        """A real SD calendar page (the actual #2447 payload) is raw HTML."""
+        text = (
+            "<!DOCTYPE html>\n"
+            "<html>\n<head><title>Civil Calendar</title></head>\n"
+            "<body>\n<h1>CIVIL CALENDAR For Friday, 03/13/2026</h1>\n"
+            "...\n</body></html>"
+        )
+        assert _looks_like_raw_html(text) is True
+
+
+class TestRawHtmlGuardInConvertExtractedRulings:
+    """Integration: ``convert_extracted_rulings`` refuses raw-HTML fallback.
+
+    Regression for #2447: when LLM extraction returned a single ruling with
+    empty ``ruling_text`` and the caller passed the full document text as
+    ``fallback_text``, the worker previously stored the raw HTML as
+    ``ruling_text``.  That produced 50000-char dumps with stray
+    ``<!doctype>`` boilerplate polluting the DB and the search index.
+    The guard must return ``None`` instead so downstream consumers treat
+    it as missing.
+    """
+
+    _CALENDAR_HTML = (
+        "<!DOCTYPE html>\n"
+        "<html>\n<head><title>SD Civil Calendar</title></head>\n"
+        "<body>\n<h1>CIVIL CALENDAR For Friday, 03/13/2026</h1>\n"
+        "<div class='department'><h2>Department: C-60</h2>"
+        "<table><tr><td>9:00 AM</td><td>24CU016153C</td></tr></table>"
+        "</div>\n</body></html>\n"
+    )
+
+    def test_single_ruling_raw_html_fallback_becomes_none(self) -> None:
+        """Raw-HTML fallback returns None (not the HTML)."""
+        results = convert_extracted_rulings(
+            [_RULING_WITHOUT_TEXT],
+            _DOC_ID,
+            fallback_text=self._CALENDAR_HTML,
+        )
+        assert len(results) == 1
+        assert results[0].ruling_text is None
+
+    def test_single_ruling_plain_text_fallback_still_used(self) -> None:
+        """Plain-text fallback is preserved (guard only targets raw HTML)."""
+        results = convert_extracted_rulings(
+            [_RULING_WITHOUT_TEXT],
+            _DOC_ID,
+            fallback_text="Plain ruling text from a PDF.",
+        )
+        assert results[0].ruling_text == "Plain ruling text from a PDF."
+
+    def test_ruling_text_preferred_over_raw_html_fallback(self) -> None:
+        """When the ruling itself has text, fallback is never consulted."""
+        results = convert_extracted_rulings(
+            [_RULING_WITH_TEXT],
+            _DOC_ID,
+            fallback_text=self._CALENDAR_HTML,
+        )
+        assert results[0].ruling_text == "The motion is GRANTED."
+
+    def test_guard_does_not_apply_to_multi_ruling_path(self) -> None:
+        """Multi-ruling documents already return None for missing text —
+        the guard is a no-op there (no regression)."""
+        results = convert_extracted_rulings(
+            [_RULING_WITH_TEXT, _RULING_WITHOUT_TEXT],
+            _DOC_ID,
+            fallback_text=self._CALENDAR_HTML,
+        )
+        assert len(results) == 2
+        # The one with text keeps it.
+        assert results[0].ruling_text == "The motion is GRANTED."
+        # The one without text returns None (cross-contamination guard),
+        # not the raw HTML.
+        assert results[1].ruling_text is None
+
+    def test_no_50000_char_raw_html_stored(self) -> None:
+        """Direct regression: a 60KB calendar-like HTML page never becomes
+        ruling_text (Bug B in #2447)."""
+        huge_html = self._CALENDAR_HTML + ("x" * 60_000)
+        results = convert_extracted_rulings(
+            [_RULING_WITHOUT_TEXT],
+            _DOC_ID,
+            fallback_text=huge_html,
+        )
+        assert results[0].ruling_text is None

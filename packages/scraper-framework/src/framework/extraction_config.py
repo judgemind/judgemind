@@ -167,8 +167,22 @@ _COUNTY_CONFIGS: dict[tuple[str, str], CountyExtractionConfig] = {
 # as ruling_text).  See #2331.
 #
 # Key: scraper_id string.
+#
+# ``rebuild-ca-san_diego`` is a synthetic scraper_id emitted by
+# ``scripts/rebuild_db.py`` when seeding the local DB from S3.  The S3
+# payload for San Diego is an entire calendar HTML page (60-100KB, 30+
+# cases), identical to what ``ca-sd-calendar`` captures.  Without an
+# override, the (CA, SAN DIEGO) county default (LLM) fires and the
+# whole HTML is shipped to the model with a prompt assuming a single
+# case, producing 50000-char raw-HTML dumps and swapped identifiers
+# (#2447).  Registering the synthetic scraper_id with NONE forces the
+# worker to route the document through the deterministic SD splitter
+# (``courts.ca.sd_calendar._split_rulings``) instead.
 _SCRAPER_CONFIGS: dict[str, CountyExtractionConfig] = {
     "ca-sd-calendar": CountyExtractionConfig(
+        method=ExtractionMethod.NONE,
+    ),
+    "rebuild-ca-san_diego": CountyExtractionConfig(
         method=ExtractionMethod.NONE,
     ),
 }
