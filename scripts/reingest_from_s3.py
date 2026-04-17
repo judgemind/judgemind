@@ -2156,6 +2156,26 @@ def reingest_batch(
                     effective_hearing = (
                         extracted["hearing_date"] or doc_meta["hearing_date"]
                     )
+                    # #2432: the guard above cleared extracted["hearing_date"]
+                    # if it was implausible, but the fallback to
+                    # doc_meta["hearing_date"] bypasses that check — in
+                    # rebuilds where both columns were populated from the
+                    # same bad LLM output, the implausible value still wins
+                    # and reingest writes it back via force_update.  Re-run
+                    # the plausibility check on the effective fallback
+                    # result so a bad doc_meta value is also rejected.
+                    if effective_hearing is not None and not is_plausible_hearing_date(
+                        effective_hearing,
+                        doc_meta.get("captured_at"),
+                    ):
+                        logger.info(
+                            "post-extraction guard: rejected implausible "
+                            "doc_meta hearing_date fallback",
+                            hearing_date=effective_hearing,
+                            capture_timestamp=doc_meta.get("captured_at"),
+                            document_id=doc_id_str,
+                        )
+                        effective_hearing = None
 
                     # For split documents, generate a synthetic content hash
                     # by incorporating the ruling index.  All split children
