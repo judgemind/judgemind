@@ -8696,3 +8696,261 @@ class TestProcessPrefixDocument:
             )
         # abc123 doesn't match the SHA256 of b"<html>content</html>"
         assert result == "error"
+
+
+# ---------------------------------------------------------------------------
+# #2405 — apply_post_extraction_guards and force_update wiring.  The reingest
+# path historically bypassed ``IngestionWorker.process_event``'s guard
+# pipeline, so bad LLM extractions (probate decedents as judges, repeated
+# case titles, implausible hearing dates) survived reingest.  These tests
+# verify the guards run in the reingest DB-write path and that
+# insert_document_and_ruling is called with force_update=True so cleared
+# fields actually reach the DB.
+# ---------------------------------------------------------------------------
+
+
+class TestApplyPostExtractionGuards:
+    """Unit tests for apply_post_extraction_guards helper (#2405)."""
+
+    def test_dedupes_repeated_title(self) -> None:
+        extracted: dict = {
+            "case_title": "Smith v. Jones\nSmith v. Jones",
+            "judge_name": "Hon. Jane Doe",
+            "hearing_date": None,
+            "extraction_methods": {"case_title": "llm"},
+        }
+        reingest.apply_post_extraction_guards(extracted, datetime(2026, 4, 1, 12, 0))
+        assert extracted["case_title"] == "Smith v. Jones"
+
+    def test_strips_trailing_case_number(self) -> None:
+        # Use a real Ventura probate format that matches the strip regex.
+        extracted: dict = {
+            "case_title": "In the Matter of Denise Mejia 202200570654PRLP",
+            "judge_name": None,
+            "hearing_date": None,
+            "extraction_methods": {},
+        }
+        reingest.apply_post_extraction_guards(extracted, datetime(2026, 4, 1, 12, 0))
+        assert extracted["case_title"] == "In the Matter of Denise Mejia"
+
+    def test_rejects_probate_decedent_as_judge(self) -> None:
+        """When judge_name matches the probate decedent pattern, clear it."""
+        extracted: dict = {
+            "case_title": "Estate of John Smith",
+            "judge_name": "John Smith",
+            "hearing_date": None,
+            "extraction_methods": {"judge_name": "llm", "case_title": "llm"},
+        }
+        reingest.apply_post_extraction_guards(extracted, datetime(2026, 4, 1, 12, 0))
+        assert extracted["judge_name"] is None
+        assert "judge_name" not in extracted["extraction_methods"]
+
+    def test_rejects_implausible_hearing_date(self) -> None:
+        """Hearing dates >30 days before capture are cleared."""
+        extracted: dict = {
+            "case_title": "Smith v. Jones",
+            "judge_name": "Hon. Jane Doe",
+            "hearing_date": date(2024, 1, 1),  # long before capture
+            "extraction_methods": {
+                "hearing_date": "llm",
+                "judge_name": "llm",
+            },
+        }
+        reingest.apply_post_extraction_guards(extracted, datetime(2026, 4, 1, 12, 0))
+        assert extracted["hearing_date"] is None
+        assert "hearing_date" not in extracted["extraction_methods"]
+
+    def test_keeps_plausible_values(self) -> None:
+        """A clean extraction passes through unchanged."""
+        extracted: dict = {
+            "case_title": "Smith v. Jones",
+            "judge_name": "Hon. Jane Doe",
+            "hearing_date": date(2026, 4, 15),  # plausible vs capture 2026-04-01
+            "extraction_methods": {
+                "case_title": "llm",
+                "judge_name": "llm",
+                "hearing_date": "llm",
+            },
+        }
+        reingest.apply_post_extraction_guards(extracted, datetime(2026, 4, 1, 12, 0))
+        assert extracted["case_title"] == "Smith v. Jones"
+        assert extracted["judge_name"] == "Hon. Jane Doe"
+        assert extracted["hearing_date"] == date(2026, 4, 15)
+        assert extracted["extraction_methods"] == {
+            "case_title": "llm",
+            "judge_name": "llm",
+            "hearing_date": "llm",
+        }
+
+    def test_handles_missing_extraction_methods(self) -> None:
+        """Helper tolerates absent extraction_methods dict."""
+        extracted: dict = {
+            "case_title": "Smith v. Jones\nSmith v. Jones",
+            "judge_name": None,
+            "hearing_date": None,
+        }
+        reingest.apply_post_extraction_guards(extracted, datetime(2026, 4, 1, 12, 0))
+        assert extracted["case_title"] == "Smith v. Jones"
+        assert extracted["extraction_methods"] == {}
+
+    def test_permissive_when_capture_timestamp_is_none(self) -> None:
+        """When capture_timestamp is None, hearing_date plausibility is skipped."""
+        extracted: dict = {
+            "case_title": "Smith v. Jones",
+            "judge_name": "Hon. Jane Doe",
+            "hearing_date": date(1999, 1, 1),  # would be implausible if we knew capture ts
+            "extraction_methods": {"hearing_date": "llm"},
+        }
+        reingest.apply_post_extraction_guards(extracted, None)
+        # Date preserved because we can't prove it is implausible.
+        assert extracted["hearing_date"] == date(1999, 1, 1)
+        assert extracted["extraction_methods"] == {"hearing_date": "llm"}
+
+
+class TestReingestAppliesGuardsAndForceUpdate:
+    """End-to-end: reingest DB-write loop applies guards + force_update (#2405)."""
+
+    def _make_extracted(self, **overrides: Any) -> dict:
+        base: dict = {
+            "case_number": "24STCV12345",
+            "case_title": "Smith v. Jones",
+            "case_type": None,
+            "judge_name": "Hon. Jane Doe",
+            "hearing_date": date(2026, 3, 5),
+            "ruling_text": "Motion granted.",
+            "department": "C-10",
+            "outcome": "granted",
+            "motion_type": "Motion to Compel",
+            "parties": [],
+            "extraction_methods": {"case_title": "llm", "judge_name": "llm"},
+        }
+        base.update(overrides)
+        return base
+
+    @patch("reingest_from_s3.batch_upsert_parties")
+    @patch("reingest_from_s3.upsert_case_judge")
+    @patch("reingest_from_s3.resolve_judge")
+    @patch("reingest_from_s3.insert_document_and_ruling")
+    @patch("reingest_from_s3.upsert_case")
+    @patch("reingest_from_s3._reparse_document")
+    @patch("reingest_from_s3._fetch_s3_content")
+    def test_calls_insert_with_force_update_true(
+        self,
+        mock_fetch_s3: MagicMock,
+        mock_reparse: MagicMock,
+        mock_upsert_case: MagicMock,
+        mock_insert: MagicMock,
+        mock_resolve_judge: MagicMock,
+        _mock_upsert_cj: MagicMock,
+        _mock_batch_parties: MagicMock,
+    ) -> None:
+        """The reingest DB-write loop passes force_update=True."""
+        row = _make_document_row()
+        conn = _mock_conn_with_rows([row])
+        mock_fetch_s3.return_value = b"<html>content</html>"
+        mock_reparse.return_value = self._make_extracted()
+        mock_upsert_case.return_value = "new-case-id"
+        mock_resolve_judge.return_value = "judge-id"
+
+        reingest.reingest_batch(
+            conn,
+            MagicMock(),
+            batch_size=10,
+            cursor=_DEFAULT_CURSOR,
+            filters="",
+            filter_params=[],
+        )
+
+        assert mock_insert.called, "insert_document_and_ruling must be called"
+        for call in mock_insert.call_args_list:
+            assert call.kwargs.get("force_update") is True, (
+                f"reingest must pass force_update=True; got {call.kwargs.get('force_update')!r}"
+            )
+
+    @patch("reingest_from_s3.batch_upsert_parties")
+    @patch("reingest_from_s3.upsert_case_judge")
+    @patch("reingest_from_s3.resolve_judge")
+    @patch("reingest_from_s3.insert_document_and_ruling")
+    @patch("reingest_from_s3.upsert_case")
+    @patch("reingest_from_s3._reparse_document")
+    @patch("reingest_from_s3._fetch_s3_content")
+    def test_guards_are_applied_before_db_write(
+        self,
+        mock_fetch_s3: MagicMock,
+        mock_reparse: MagicMock,
+        mock_upsert_case: MagicMock,
+        mock_insert: MagicMock,
+        mock_resolve_judge: MagicMock,
+        _mock_upsert_cj: MagicMock,
+        _mock_batch_parties: MagicMock,
+    ) -> None:
+        """A probate decedent as judge is cleared before insert."""
+        row = _make_document_row(case_title="Estate of John Smith")
+        conn = _mock_conn_with_rows([row])
+        mock_fetch_s3.return_value = b"<html>content</html>"
+        # LLM hallucinated the decedent's name as the judge.
+        mock_reparse.return_value = self._make_extracted(
+            case_title="Estate of John Smith",
+            judge_name="John Smith",
+        )
+        mock_upsert_case.return_value = "new-case-id"
+
+        reingest.reingest_batch(
+            conn,
+            MagicMock(),
+            batch_size=10,
+            cursor=_DEFAULT_CURSOR,
+            filters="",
+            filter_params=[],
+        )
+
+        assert mock_insert.called
+        assert mock_insert.call_args.kwargs.get("judge_id") is None, (
+            "Probate decedent guard should have cleared judge_name, "
+            "so resolve_judge should not be called and judge_id should be None."
+        )
+        assert not mock_resolve_judge.called, (
+            "resolve_judge should not be called after the guard clears judge_name"
+        )
+
+    @patch("reingest_from_s3.batch_upsert_parties")
+    @patch("reingest_from_s3.upsert_case_judge")
+    @patch("reingest_from_s3.resolve_judge")
+    @patch("reingest_from_s3.insert_document_and_ruling")
+    @patch("reingest_from_s3.upsert_case")
+    @patch("reingest_from_s3._reparse_document")
+    @patch("reingest_from_s3._fetch_s3_content")
+    def test_implausible_hearing_date_cleared_before_write(
+        self,
+        mock_fetch_s3: MagicMock,
+        mock_reparse: MagicMock,
+        mock_upsert_case: MagicMock,
+        mock_insert: MagicMock,
+        mock_resolve_judge: MagicMock,
+        _mock_upsert_cj: MagicMock,
+        _mock_batch_parties: MagicMock,
+    ) -> None:
+        """A pre-capture hearing_date is cleared by the guard before insert."""
+        # Both row-level hearing_date columns are None so doc_meta["hearing_date"]
+        # falls through to the guard-cleared extracted["hearing_date"].
+        row = _make_document_row(hearing_date=None, ruling_hearing_date=None)
+        conn = _mock_conn_with_rows([row])
+        mock_fetch_s3.return_value = b"<html>content</html>"
+        # Hearing date long before capture (2026-03-01).
+        mock_reparse.return_value = self._make_extracted(hearing_date=date(1999, 1, 1))
+        mock_upsert_case.return_value = "new-case-id"
+        mock_resolve_judge.return_value = "judge-id"
+
+        reingest.reingest_batch(
+            conn,
+            MagicMock(),
+            batch_size=10,
+            cursor=_DEFAULT_CURSOR,
+            filters="",
+            filter_params=[],
+        )
+
+        assert mock_insert.called
+        assert mock_insert.call_args.kwargs.get("hearing_date") is None, (
+            "Implausible hearing_date should be cleared to None by the guard."
+        )

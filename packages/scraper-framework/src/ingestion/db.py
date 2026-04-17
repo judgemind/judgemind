@@ -399,6 +399,8 @@ def insert_document(
     scraper_id: str,
     captured_at: datetime,
     hearing_date: date | None,
+    *,
+    force_update: bool = False,
 ) -> bool:
     """Upsert a document row using the scraper-assigned document_id as the PK.
 
@@ -412,34 +414,50 @@ def insert_document(
 
     The scraper's document_id UUID is used as documents.id so that OpenSearch
     document IDs and rulings.document_id references all converge on the same key.
+
+    When ``force_update`` is True, the ON CONFLICT clause overwrites
+    ``hearing_date`` with the new value unconditionally (instead of using
+    ``COALESCE``).  This is the "force update" path used by
+    ``reingest_from_s3.py`` to correct bad historical data — live ingestion
+    uses the default ``force_update=False`` to preserve good existing dates
+    when a new extraction happens to miss them (#2405).
     """
     # Map ContentFormat string to PostgreSQL document_format enum value
     format_map = {"html": "html", "pdf": "pdf", "docx": "docx", "text": "txt"}
     pg_format = format_map.get(content_format.lower(), "html")
 
+    if force_update:
+        hearing_date_clause = "hearing_date = EXCLUDED.hearing_date"
+    else:
+        hearing_date_clause = (
+            "hearing_date = COALESCE(EXCLUDED.hearing_date, documents.hearing_date)"
+        )
+
+    sql = f"""
+        INSERT INTO documents (
+            id, case_id, court_id,
+            document_type, format,
+            s3_key, s3_bucket,
+            content_hash, source_url, scraper_id,
+            captured_at, last_seen_at, hearing_date, status
+        )
+        VALUES (
+            %s::uuid, %s::uuid, %s::uuid,
+            'ruling', %s::document_format,
+            %s, %s,
+            %s, %s, %s,
+            %s, NOW(), %s, 'active'
+        )
+        ON CONFLICT (id) DO UPDATE SET
+            {hearing_date_clause},
+            case_id = EXCLUDED.case_id,
+            last_seen_at = NOW()
+        RETURNING (xmax = 0) AS is_new
+    """
+
     with conn.cursor() as cur:
         cur.execute(
-            """
-            INSERT INTO documents (
-                id, case_id, court_id,
-                document_type, format,
-                s3_key, s3_bucket,
-                content_hash, source_url, scraper_id,
-                captured_at, last_seen_at, hearing_date, status
-            )
-            VALUES (
-                %s::uuid, %s::uuid, %s::uuid,
-                'ruling', %s::document_format,
-                %s, %s,
-                %s, %s, %s,
-                %s, NOW(), %s, 'active'
-            )
-            ON CONFLICT (id) DO UPDATE SET
-                hearing_date = COALESCE(EXCLUDED.hearing_date, documents.hearing_date),
-                case_id = EXCLUDED.case_id,
-                last_seen_at = NOW()
-            RETURNING (xmax = 0) AS is_new
-            """,
+            sql,
             (
                 document_id,
                 case_id,
@@ -1322,6 +1340,8 @@ def insert_ruling(
     summary: str | None = None,
     summary_model: str | None = None,
     summary_generated_at: datetime | None = None,
+    *,
+    force_update: bool = False,
 ) -> None:
     """Upsert a ruling row linked to the document, with content-based dedup.
 
@@ -1352,6 +1372,19 @@ def insert_ruling(
     ``summary``, ``summary_model``, and ``summary_generated_at`` are
     AI-generated plain-English summaries produced at ingestion time
     (gated behind ``ENABLE_RULING_SUMMARIZATION``).
+
+    **force_update (keyword-only, default False):**
+    Controls COALESCE vs direct-overwrite semantics on conflict.  When False
+    (live-ingestion default), the ON CONFLICT clause uses
+    ``COALESCE(EXCLUDED.col, rulings.col)`` so a re-ingest that happens to
+    miss a field does not erase the previously-good value.  When True
+    (reingest path), the ON CONFLICT clause overwrites ``case_id``,
+    ``judge_id``, ``hearing_date``, ``outcome``, ``motion_type``, and
+    ``department`` with ``EXCLUDED.*`` unconditionally — including NULL —
+    so reingest can correct bad historical data (#2405).  Text fields
+    (``ruling_text``, ``ruling_text_html``, ``summary``) always use
+    COALESCE regardless of force_update: we never erase a good ruling text
+    just because a re-extraction happened to miss it.
     """
     ruling_text = _strip_nul(ruling_text)
     ruling_text_html = _strip_nul(ruling_text_html)
@@ -1361,6 +1394,66 @@ def insert_ruling(
     summary = _strip_nul(summary)
 
     text_hash = normalize_ruling_text_hash(ruling_text)
+
+    # Build ON CONFLICT set clauses based on force_update mode.  In the default
+    # (live-ingestion) mode, structured fields use COALESCE so a miss during
+    # re-extraction does not erase the previously-good value.  In force_update
+    # mode (reingest), case_id / judge_id / hearing_date / outcome /
+    # motion_type / department are overwritten with EXCLUDED.* unconditionally
+    # so reingest can correct bad historical data (#2405).  Text and summary
+    # fields always use COALESCE — we never erase good ruling text just
+    # because a re-extraction happened to miss it.
+    if force_update:
+        conflict_case_id = "case_id = EXCLUDED.case_id"
+        conflict_judge_id = "judge_id = EXCLUDED.judge_id"
+        conflict_hearing_date = "hearing_date = EXCLUDED.hearing_date"
+        conflict_outcome = "outcome = EXCLUDED.outcome"
+        conflict_motion_type = "motion_type = EXCLUDED.motion_type"
+        conflict_department = "department = EXCLUDED.department"
+    else:
+        conflict_case_id = "case_id = COALESCE(EXCLUDED.case_id, rulings.case_id)"
+        conflict_judge_id = "judge_id = COALESCE(EXCLUDED.judge_id, rulings.judge_id)"
+        conflict_hearing_date = (
+            "hearing_date = COALESCE(EXCLUDED.hearing_date, rulings.hearing_date)"
+        )
+        conflict_outcome = "outcome = COALESCE(EXCLUDED.outcome, rulings.outcome)"
+        conflict_motion_type = "motion_type = COALESCE(EXCLUDED.motion_type, rulings.motion_type)"
+        conflict_department = "department = COALESCE(EXCLUDED.department, rulings.department)"
+
+    insert_sql = f"""
+        INSERT INTO rulings (
+            document_id, case_id, court_id, judge_id,
+            hearing_date, ruling_text, ruling_text_html,
+            department, is_tentative,
+            outcome, motion_type,
+            summary, summary_model, summary_generated_at,
+            ruling_text_hash
+        )
+        VALUES (
+            %s::uuid, %s::uuid, %s::uuid, %s::uuid, %s::date, %s, %s,
+            %s, TRUE,
+            %s::ruling_outcome, %s,
+            %s, %s, %s,
+            %s
+        )
+        ON CONFLICT (document_id) DO UPDATE SET
+            {conflict_case_id},
+            {conflict_judge_id},
+            {conflict_hearing_date},
+            {conflict_outcome},
+            {conflict_motion_type},
+            {conflict_department},
+            ruling_text = COALESCE(EXCLUDED.ruling_text, rulings.ruling_text),
+            ruling_text_html = COALESCE(
+                EXCLUDED.ruling_text_html, rulings.ruling_text_html
+            ),
+            summary = COALESCE(EXCLUDED.summary, rulings.summary),
+            summary_model = COALESCE(EXCLUDED.summary_model, rulings.summary_model),
+            summary_generated_at = COALESCE(
+                EXCLUDED.summary_generated_at, rulings.summary_generated_at
+            ),
+            ruling_text_hash = COALESCE(EXCLUDED.ruling_text_hash, rulings.ruling_text_hash)
+    """
 
     # Attempt the INSERT inside a savepoint so that a UniqueViolation from the
     # content-hash index (uq_rulings_case_text_hash) does not abort the
@@ -1372,38 +1465,7 @@ def insert_ruling(
         with conn.cursor() as cur:
             cur.execute("SAVEPOINT ruling_insert")
             cur.execute(
-                """
-                INSERT INTO rulings (
-                    document_id, case_id, court_id, judge_id,
-                    hearing_date, ruling_text, ruling_text_html,
-                    department, is_tentative,
-                    outcome, motion_type,
-                    summary, summary_model, summary_generated_at,
-                    ruling_text_hash
-                )
-                VALUES (
-                    %s::uuid, %s::uuid, %s::uuid, %s::uuid, %s::date, %s, %s,
-                    %s, TRUE,
-                    %s::ruling_outcome, %s,
-                    %s, %s, %s,
-                    %s
-                )
-                ON CONFLICT (document_id) DO UPDATE SET
-                    judge_id = COALESCE(EXCLUDED.judge_id, rulings.judge_id),
-                    outcome = COALESCE(EXCLUDED.outcome, rulings.outcome),
-                    motion_type = COALESCE(EXCLUDED.motion_type, rulings.motion_type),
-                    ruling_text = COALESCE(EXCLUDED.ruling_text, rulings.ruling_text),
-                    ruling_text_html = COALESCE(
-                        EXCLUDED.ruling_text_html, rulings.ruling_text_html
-                    ),
-                    department = COALESCE(EXCLUDED.department, rulings.department),
-                    summary = COALESCE(EXCLUDED.summary, rulings.summary),
-                    summary_model = COALESCE(EXCLUDED.summary_model, rulings.summary_model),
-                    summary_generated_at = COALESCE(
-                        EXCLUDED.summary_generated_at, rulings.summary_generated_at
-                    ),
-                    ruling_text_hash = COALESCE(EXCLUDED.ruling_text_hash, rulings.ruling_text_hash)
-                """,
+                insert_sql,
                 (
                     document_id,
                     case_id,
@@ -1443,24 +1505,45 @@ def insert_ruling(
 
     # Fallback: update the existing ruling that has the same content hash.
     if text_hash is not None:
+        # Mirror the force_update semantics on the fallback UPDATE so reingest
+        # can correct bad judge_id / hearing_date / outcome / motion_type /
+        # department on rulings that matched by content hash rather than by
+        # document_id.  Text/summary fields always keep COALESCE.
+        if force_update:
+            judge_id_clause = "judge_id = %s::uuid"
+            hearing_date_clause = "hearing_date = %s::date"
+            outcome_clause = "outcome = %s::ruling_outcome"
+            motion_type_clause = "motion_type = %s"
+            department_clause = "department = %s"
+        else:
+            judge_id_clause = "judge_id = COALESCE(%s::uuid, judge_id)"
+            hearing_date_clause = "hearing_date = COALESCE(%s::date, hearing_date)"
+            outcome_clause = "outcome = COALESCE(%s::ruling_outcome, outcome)"
+            motion_type_clause = "motion_type = COALESCE(%s, motion_type)"
+            department_clause = "department = COALESCE(%s, department)"
+
+        update_sql = f"""
+            UPDATE rulings SET
+                {judge_id_clause},
+                {hearing_date_clause},
+                {outcome_clause},
+                {motion_type_clause},
+                ruling_text = COALESCE(%s, ruling_text),
+                ruling_text_html = COALESCE(%s, ruling_text_html),
+                {department_clause},
+                summary = COALESCE(%s, summary),
+                summary_model = COALESCE(%s, summary_model),
+                summary_generated_at = COALESCE(%s, summary_generated_at),
+                updated_at = NOW()
+            WHERE case_id = %s::uuid AND ruling_text_hash = %s
+        """
+
         with conn.cursor() as cur:
             cur.execute(
-                """
-                UPDATE rulings SET
-                    judge_id = COALESCE(%s::uuid, judge_id),
-                    outcome = COALESCE(%s::ruling_outcome, outcome),
-                    motion_type = COALESCE(%s, motion_type),
-                    ruling_text = COALESCE(%s, ruling_text),
-                    ruling_text_html = COALESCE(%s, ruling_text_html),
-                    department = COALESCE(%s, department),
-                    summary = COALESCE(%s, summary),
-                    summary_model = COALESCE(%s, summary_model),
-                    summary_generated_at = COALESCE(%s, summary_generated_at),
-                    updated_at = NOW()
-                WHERE case_id = %s::uuid AND ruling_text_hash = %s
-                """,
+                update_sql,
                 (
                     judge_id,
+                    hearing_date,
                     outcome,
                     motion_type,
                     ruling_text,
@@ -1513,6 +1596,7 @@ def insert_document_and_ruling(
     summary: str | None = None,
     summary_model: str | None = None,
     summary_generated_at: datetime | None = None,
+    force_update: bool = False,
 ) -> bool:
     """Insert a document and its associated ruling in a single call.
 
@@ -1525,6 +1609,13 @@ def insert_document_and_ruling(
     ``hearing_date`` may be ``None`` — the ruling is still inserted with a
     NULL hearing_date.  A missing date is preferable to a missing ruling
     (#2215).
+
+    ``force_update`` (default False) is threaded through to both
+    ``insert_document`` and ``insert_ruling``.  When True, ON CONFLICT
+    clauses overwrite ``case_id``, ``judge_id``, ``hearing_date``,
+    ``outcome``, ``motion_type``, and ``department`` with ``EXCLUDED.*``
+    unconditionally (including NULL) so reingest can correct bad historical
+    data (#2405).  Text and summary fields always keep COALESCE.
 
     Returns ``True`` if the document row was newly inserted, ``False`` if it
     already existed (same semantics as ``insert_document``).
@@ -1542,6 +1633,7 @@ def insert_document_and_ruling(
         scraper_id=scraper_id,
         captured_at=captured_at,
         hearing_date=hearing_date,
+        force_update=force_update,
     )
 
     insert_ruling(
@@ -1559,6 +1651,7 @@ def insert_document_and_ruling(
         summary=summary,
         summary_model=summary_model,
         summary_generated_at=summary_generated_at,
+        force_update=force_update,
     )
 
     return is_new

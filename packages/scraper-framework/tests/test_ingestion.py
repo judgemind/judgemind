@@ -5227,3 +5227,338 @@ def test_llm_split_does_not_log_orphan_warning_when_rulings_extracted(
         r for r in caplog.records if r.message == "Orphan document: no rulings extracted"
     ]
     assert len(orphan_records) == 0, "Orphan warning should not fire when rulings are extracted"
+
+
+# ---------------------------------------------------------------------------
+# #2405 — force_update path on insert_ruling / insert_document /
+# insert_document_and_ruling.  Reingest needs to overwrite bad historical
+# values (case_id, judge_id, hearing_date, outcome, motion_type,
+# department) with EXCLUDED.* unconditionally — including NULL — so
+# post-extraction guards can actually clear bad data.  Live ingestion
+# keeps the default COALESCE semantics so a missed re-extraction does
+# not erase a previously-good value.
+# ---------------------------------------------------------------------------
+
+
+def _make_ruling_upsert_conn() -> MagicMock:
+    """Return a MagicMock psycopg.Connection for insert_ruling tests."""
+    conn = MagicMock(spec=psycopg.Connection)
+    cur = MagicMock()
+    cur.__enter__ = MagicMock(return_value=cur)
+    cur.__exit__ = MagicMock(return_value=False)
+    conn.cursor.return_value = cur
+    return conn
+
+
+def _rulings_insert_sql(conn: MagicMock) -> str:
+    """Return the SQL text of the INSERT INTO rulings call made on *conn*."""
+    cur = conn.cursor.return_value
+    for call in cur.execute.call_args_list:
+        sql = call.args[0] if call.args else ""
+        if "INSERT INTO rulings" in sql:
+            return sql
+    raise AssertionError("No INSERT INTO rulings call was made on this cursor")
+
+
+def test_insert_ruling_default_is_coalesce() -> None:
+    """Default insert_ruling keeps COALESCE — does not erase existing values."""
+    conn = _make_ruling_upsert_conn()
+
+    insert_ruling(
+        conn,
+        document_id="11111111-1111-1111-1111-111111111111",
+        case_id="22222222-2222-2222-2222-222222222222",
+        court_id="33333333-3333-3333-3333-333333333333",
+        hearing_date=date(2026, 4, 1),
+        ruling_text="Motion granted",
+        department="C-10",
+        judge_id="44444444-4444-4444-4444-444444444444",
+        outcome="granted",
+        motion_type="Motion to Compel",
+    )
+
+    sql = _rulings_insert_sql(conn)
+    # ON CONFLICT SET clauses use COALESCE for structured fields.
+    assert "case_id = COALESCE(EXCLUDED.case_id, rulings.case_id)" in sql
+    assert "judge_id = COALESCE(EXCLUDED.judge_id, rulings.judge_id)" in sql
+    assert "hearing_date = COALESCE(EXCLUDED.hearing_date, rulings.hearing_date)" in sql
+    assert "outcome = COALESCE(EXCLUDED.outcome, rulings.outcome)" in sql
+    assert "motion_type = COALESCE(EXCLUDED.motion_type, rulings.motion_type)" in sql
+    assert "department = COALESCE(EXCLUDED.department, rulings.department)" in sql
+
+
+def test_insert_ruling_force_update_overrides_coalesce() -> None:
+    """force_update=True switches structured fields to direct EXCLUDED.* overwrite."""
+    conn = _make_ruling_upsert_conn()
+
+    insert_ruling(
+        conn,
+        document_id="11111111-1111-1111-1111-111111111111",
+        case_id="22222222-2222-2222-2222-222222222222",
+        court_id="33333333-3333-3333-3333-333333333333",
+        hearing_date=None,  # reingest wants to clear a bad hearing_date
+        ruling_text="Motion granted",
+        department=None,
+        judge_id=None,  # reingest wants to clear a hallucinated judge
+        outcome="granted",
+        motion_type="Motion to Compel",
+        force_update=True,
+    )
+
+    sql = _rulings_insert_sql(conn)
+    # Structured fields use direct EXCLUDED.* (no COALESCE wrapper).
+    assert "case_id = EXCLUDED.case_id" in sql
+    assert "COALESCE(EXCLUDED.case_id" not in sql
+    assert "judge_id = EXCLUDED.judge_id" in sql
+    assert "COALESCE(EXCLUDED.judge_id" not in sql
+    assert "hearing_date = EXCLUDED.hearing_date" in sql
+    assert "COALESCE(EXCLUDED.hearing_date" not in sql
+    assert "outcome = EXCLUDED.outcome" in sql
+    assert "COALESCE(EXCLUDED.outcome" not in sql
+    assert "motion_type = EXCLUDED.motion_type" in sql
+    assert "COALESCE(EXCLUDED.motion_type" not in sql
+    assert "department = EXCLUDED.department" in sql
+    assert "COALESCE(EXCLUDED.department" not in sql
+
+
+def test_insert_ruling_force_update_preserves_ruling_text_coalesce() -> None:
+    """Even under force_update, ruling_text/html/summary keep COALESCE.
+
+    A failed re-extraction must never erase a good ruling text — that
+    would be destructive without any way to recover.  force_update only
+    overrides structured fields (case_id, judge_id, hearing_date,
+    outcome, motion_type, department).
+    """
+    conn = _make_ruling_upsert_conn()
+
+    insert_ruling(
+        conn,
+        document_id="11111111-1111-1111-1111-111111111111",
+        case_id="22222222-2222-2222-2222-222222222222",
+        court_id="33333333-3333-3333-3333-333333333333",
+        hearing_date=None,
+        ruling_text=None,
+        department=None,
+        force_update=True,
+    )
+
+    sql = _rulings_insert_sql(conn)
+    assert "ruling_text = COALESCE(EXCLUDED.ruling_text, rulings.ruling_text)" in sql
+    assert "ruling_text_html = COALESCE(" in sql
+    assert "summary = COALESCE(EXCLUDED.summary, rulings.summary)" in sql
+
+
+def test_insert_document_default_hearing_date_uses_coalesce() -> None:
+    """Default insert_document keeps COALESCE on hearing_date."""
+    conn = MagicMock(spec=psycopg.Connection)
+    cur = MagicMock()
+    cur.__enter__ = MagicMock(return_value=cur)
+    cur.__exit__ = MagicMock(return_value=False)
+    cur.fetchone.return_value = (True,)
+    conn.cursor.return_value = cur
+
+    insert_document(
+        conn,
+        document_id="11111111-1111-1111-1111-111111111111",
+        case_id="22222222-2222-2222-2222-222222222222",
+        court_id="33333333-3333-3333-3333-333333333333",
+        content_format="pdf",
+        content_hash="abc123",
+        s3_key="s3/key.pdf",
+        s3_bucket="bucket",
+        source_url="https://example.com/doc.pdf",
+        scraper_id="test.scraper",
+        captured_at=datetime(2026, 4, 1, 12, 0, 0),
+        hearing_date=date(2026, 4, 15),
+    )
+
+    sql = cur.execute.call_args.args[0]
+    assert "INSERT INTO documents" in sql
+    assert "hearing_date = COALESCE(EXCLUDED.hearing_date, documents.hearing_date)" in sql
+
+
+def test_insert_document_force_update_overrides_hearing_date_coalesce() -> None:
+    """force_update=True switches hearing_date to direct EXCLUDED assignment."""
+    conn = MagicMock(spec=psycopg.Connection)
+    cur = MagicMock()
+    cur.__enter__ = MagicMock(return_value=cur)
+    cur.__exit__ = MagicMock(return_value=False)
+    cur.fetchone.return_value = (True,)
+    conn.cursor.return_value = cur
+
+    insert_document(
+        conn,
+        document_id="11111111-1111-1111-1111-111111111111",
+        case_id="22222222-2222-2222-2222-222222222222",
+        court_id="33333333-3333-3333-3333-333333333333",
+        content_format="pdf",
+        content_hash="abc123",
+        s3_key="s3/key.pdf",
+        s3_bucket="bucket",
+        source_url="https://example.com/doc.pdf",
+        scraper_id="test.scraper",
+        captured_at=datetime(2026, 4, 1, 12, 0, 0),
+        hearing_date=None,  # reingest wants to clear a bad hearing_date
+        force_update=True,
+    )
+
+    sql = cur.execute.call_args.args[0]
+    assert "INSERT INTO documents" in sql
+    assert "hearing_date = EXCLUDED.hearing_date" in sql
+    assert "COALESCE(EXCLUDED.hearing_date" not in sql
+
+
+def test_insert_document_and_ruling_force_update_threads_through() -> None:
+    """force_update=True passed to insert_document_and_ruling threads to both calls."""
+    with (
+        patch("ingestion.db.insert_document") as mock_doc,
+        patch("ingestion.db.insert_ruling") as mock_ruling,
+    ):
+        mock_doc.return_value = True
+        conn = MagicMock(spec=psycopg.Connection)
+        insert_document_and_ruling(
+            conn,
+            document_id="11111111-1111-1111-1111-111111111111",
+            case_id="22222222-2222-2222-2222-222222222222",
+            court_id="33333333-3333-3333-3333-333333333333",
+            content_format="pdf",
+            content_hash="abc123",
+            s3_key="s3/key.pdf",
+            s3_bucket="bucket",
+            source_url="https://example.com/doc.pdf",
+            scraper_id="test.scraper",
+            captured_at=datetime(2026, 4, 1, 12, 0, 0),
+            hearing_date=None,
+            force_update=True,
+        )
+
+    doc_kwargs = mock_doc.call_args.kwargs
+    ruling_kwargs = mock_ruling.call_args.kwargs
+    assert doc_kwargs.get("force_update") is True
+    assert ruling_kwargs.get("force_update") is True
+
+
+def test_insert_document_and_ruling_default_keeps_coalesce() -> None:
+    """Default insert_document_and_ruling passes force_update=False to both."""
+    with (
+        patch("ingestion.db.insert_document") as mock_doc,
+        patch("ingestion.db.insert_ruling") as mock_ruling,
+    ):
+        mock_doc.return_value = True
+        conn = MagicMock(spec=psycopg.Connection)
+        insert_document_and_ruling(
+            conn,
+            document_id="11111111-1111-1111-1111-111111111111",
+            case_id="22222222-2222-2222-2222-222222222222",
+            court_id="33333333-3333-3333-3333-333333333333",
+            content_format="pdf",
+            content_hash="abc123",
+            s3_key="s3/key.pdf",
+            s3_bucket="bucket",
+            source_url="https://example.com/doc.pdf",
+            scraper_id="test.scraper",
+            captured_at=datetime(2026, 4, 1, 12, 0, 0),
+            hearing_date=date(2026, 4, 15),
+        )
+
+    doc_kwargs = mock_doc.call_args.kwargs
+    ruling_kwargs = mock_ruling.call_args.kwargs
+    assert doc_kwargs.get("force_update") is False
+    assert ruling_kwargs.get("force_update") is False
+
+
+def _make_content_hash_fallback_conn() -> tuple[MagicMock, MagicMock]:
+    """Return a (conn, cursor) mock that raises UniqueViolation on the INSERT.
+
+    The raised UniqueViolation mimics the ``uq_rulings_case_text_hash``
+    constraint violation that triggers the fallback UPDATE path.
+    """
+    conn = MagicMock(spec=psycopg.Connection)
+    cur = MagicMock()
+    cur.__enter__ = MagicMock(return_value=cur)
+    cur.__exit__ = MagicMock(return_value=False)
+
+    # Raise UniqueViolation on the INSERT (second execute — first is SAVEPOINT).
+    call_index = [0]
+
+    def execute_side_effect(sql: str, *args: object, **kwargs: object) -> None:
+        call_index[0] += 1
+        # SAVEPOINT -> INSERT -> ROLLBACK -> UPDATE
+        if call_index[0] == 2 and "INSERT INTO rulings" in sql:
+            exc = psycopg.errors.UniqueViolation("duplicate key")
+            raise exc
+
+    cur.execute.side_effect = execute_side_effect
+    cur.rowcount = 1
+    conn.cursor.return_value = cur
+    return conn, cur
+
+
+def _fallback_update_sql(cur: MagicMock) -> str:
+    for call in cur.execute.call_args_list:
+        sql = call.args[0] if call.args else ""
+        if "UPDATE rulings SET" in sql:
+            return sql
+    raise AssertionError("No UPDATE rulings SET call was made on this cursor")
+
+
+def test_insert_ruling_content_hash_fallback_default_uses_coalesce() -> None:
+    """Default fallback UPDATE path uses COALESCE for structured fields."""
+    conn, cur = _make_content_hash_fallback_conn()
+
+    insert_ruling(
+        conn,
+        document_id="11111111-1111-1111-1111-111111111111",
+        case_id="22222222-2222-2222-2222-222222222222",
+        court_id="33333333-3333-3333-3333-333333333333",
+        hearing_date=date(2026, 4, 1),
+        ruling_text="Motion granted.",
+        department="C-10",
+        judge_id="44444444-4444-4444-4444-444444444444",
+        outcome="granted",
+        motion_type="Motion to Compel",
+    )
+
+    update_sql = _fallback_update_sql(cur)
+    assert "judge_id = COALESCE(%s::uuid, judge_id)" in update_sql
+    assert "hearing_date = COALESCE(%s::date, hearing_date)" in update_sql
+    assert "outcome = COALESCE(%s::ruling_outcome, outcome)" in update_sql
+    assert "motion_type = COALESCE(%s, motion_type)" in update_sql
+    assert "department = COALESCE(%s, department)" in update_sql
+
+
+def test_insert_ruling_content_hash_fallback_force_update_overrides() -> None:
+    """force_update=True fallback UPDATE uses direct %s assignment (no COALESCE)."""
+    conn, cur = _make_content_hash_fallback_conn()
+
+    insert_ruling(
+        conn,
+        document_id="11111111-1111-1111-1111-111111111111",
+        case_id="22222222-2222-2222-2222-222222222222",
+        court_id="33333333-3333-3333-3333-333333333333",
+        hearing_date=None,
+        ruling_text="Motion granted.",
+        department=None,
+        judge_id=None,
+        outcome="granted",
+        motion_type="Motion to Compel",
+        force_update=True,
+    )
+
+    update_sql = _fallback_update_sql(cur)
+    # Structured fields: direct %s assignment (no COALESCE wrapper).
+    assert "judge_id = %s::uuid" in update_sql
+    assert "COALESCE(%s::uuid, judge_id)" not in update_sql
+    assert "hearing_date = %s::date" in update_sql
+    assert "COALESCE(%s::date, hearing_date)" not in update_sql
+    assert "outcome = %s::ruling_outcome" in update_sql
+    assert "COALESCE(%s::ruling_outcome, outcome)" not in update_sql
+    # motion_type/department are bare %s (the raw %s without cast) —
+    # use surrounding context to avoid matching the COALESCE variant.
+    assert "motion_type = %s,\n" in update_sql
+    assert "department = %s,\n" in update_sql
+    assert "COALESCE(%s, motion_type)" not in update_sql
+    assert "COALESCE(%s, department)" not in update_sql
+    # Text/summary fields always keep COALESCE.
+    assert "ruling_text = COALESCE(%s, ruling_text)" in update_sql
+    assert "summary = COALESCE(%s, summary)" in update_sql
