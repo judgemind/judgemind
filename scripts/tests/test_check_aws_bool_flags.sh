@@ -144,6 +144,23 @@ printf '%s\n' 'aws logs get-log-events --start-from-head false' > "$TMPDIR_TEST/
 assert_passes "Non-.sh files are ignored"
 rm -f "$TMPDIR_TEST/bad.py"
 
+# ─── Test 18: No self-match on ci.yml step name ──────────────────────────
+# The step name in .github/workflows/ci.yml that runs this guard must
+# not itself contain the forbidden pattern.  See issue #2542 for the
+# class of failure (originally observed on PR #2541 with a different
+# guard).  A tempting misname for this guard would be e.g.:
+#
+#   - name: Check aws ec2 run-instances --dry-run false misuse
+#
+# which would trip the guard on every CI run.  This guard only scans
+# *.sh files, so we write the extracted step names into a .sh tmpfile
+# to give the guard something it will actually look at.  See
+# scripts/tests/_guard_self_match_helpers.sh for the shared helper.
+# shellcheck source=./_guard_self_match_helpers.sh
+source "$SCRIPT_DIR/tests/_guard_self_match_helpers.sh"
+assert_no_self_match_on_ci_step_name \
+    "scripts/check-aws-bool-flags.sh" "sh"
+
 # ─── Summary ──────────────────────────────────────────────────────────────
 echo ""
 echo "Results: $((TESTS - FAILURES))/$TESTS passed"

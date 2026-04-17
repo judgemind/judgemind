@@ -183,6 +183,24 @@ echo "$SCRIPT"'
 assert_passes "Hyphenated lookalike identifier does not trigger the check"
 reset_tmpdir
 
+# ─── Test 18: No self-match on ci.yml step name ──────────────────────────
+# The step name in .github/workflows/ci.yml that runs this guard must
+# not itself contain the forbidden pattern.  If it does, the guard
+# fails on its first CI run — which is exactly what happened on PR
+# #2541 when the step was originally named:
+#
+#   - name: Check for forbidden 'aws ecs wait services-stable' usage
+#
+# The quoted pattern inside the step name tripped the guard.  Issue
+# #2542 tracks the class of failure and this assertion is the Option 2
+# fix.  See scripts/tests/_guard_self_match_helpers.sh for the shared
+# helper and scripts/tests/_extract_guard_step_names.awk for the
+# extractor.
+# shellcheck source=./_guard_self_match_helpers.sh
+source "$SCRIPT_DIR/tests/_guard_self_match_helpers.sh"
+assert_no_self_match_on_ci_step_name \
+    "scripts/check-no-ecs-wait-services-stable.sh" "yml"
+
 # ─── Summary ──────────────────────────────────────────────────────────────
 echo ""
 echo "Results: $((TESTS - FAILURES))/$TESTS passed"
