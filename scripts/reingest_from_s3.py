@@ -634,6 +634,61 @@ def apply_post_extraction_guards(
             methods.pop("hearing_date", None)
 
 
+def finalize_hearing_date(
+    *,
+    extracted_hearing: date | None,
+    doc_meta_hearing: date | None,
+    capture_timestamp: datetime | None,
+) -> date | None:
+    """Return the final hearing_date to write, or None if no plausible value.
+
+    Owns the entire "pick the final hearing_date" decision end-to-end for
+    the reingest DB-write path.  Runs the #2370 plausibility guard on each
+    candidate in the fallback chain — the first plausible value wins,
+    implausible values are skipped.
+
+    This centralizes the logic that three successive point patches chased
+    around the codebase:
+
+    -   #2370 — original plausibility guard on ``extracted["hearing_date"]``.
+    -   #2405 / PR #2422 — reingest bypassed the guard; added
+        ``apply_post_extraction_guards`` to fix.
+    -   #2432 — ``effective = extracted or doc_meta`` bypassed the guard
+        again when ``doc_meta`` held the same bad value.
+
+    Making the fallback chain go through a single plausibility-checking
+    helper makes it structurally impossible for a fallback branch to
+    introduce an implausible hearing_date.  New fallback sources (e.g.
+    ruling row column, regex re-extraction) are added inside this helper
+    and automatically inherit the guard.
+
+    Parameters
+    ----------
+    extracted_hearing : date | None
+        Preferred candidate — the hearing_date produced by the extraction
+        pipeline (LLM / regex / scraper metadata).
+    doc_meta_hearing : date | None
+        Fallback candidate — the hearing_date surfaced from
+        ``documents.hearing_date`` via ``doc_meta``.
+    capture_timestamp : datetime | None
+        The document capture timestamp passed through to
+        ``is_plausible_hearing_date``.  When ``None``, plausibility cannot
+        be checked and the first non-None candidate wins (permissive —
+        don't drop data we can't verify).
+
+    Returns
+    -------
+    date | None
+        The chosen hearing_date, or ``None`` if no candidate is plausible.
+    """
+    for candidate in (extracted_hearing, doc_meta_hearing):
+        if candidate is None:
+            continue
+        if is_plausible_hearing_date(candidate, capture_timestamp):
+            return candidate
+    return None
+
+
 def _apply_regex_fallbacks(extracted: dict, text: str, scraper_id: str = "") -> None:
     """Apply the regex fallback chain to fill any fields still missing.
 
@@ -2321,29 +2376,15 @@ def reingest_batch(
                         force_update=True,
                     )
 
-                    effective_hearing = (
-                        extracted["hearing_date"] or doc_meta["hearing_date"]
+                    # #2456: single chokepoint owns the fallback chain +
+                    # plausibility check so no fallback branch can bypass
+                    # the #2370 guard.  See ``finalize_hearing_date`` for
+                    # the full rationale (#2370 / #2405 / #2432).
+                    effective_hearing = finalize_hearing_date(
+                        extracted_hearing=extracted["hearing_date"],
+                        doc_meta_hearing=doc_meta["hearing_date"],
+                        capture_timestamp=doc_meta.get("captured_at"),
                     )
-                    # #2432: the guard above cleared extracted["hearing_date"]
-                    # if it was implausible, but the fallback to
-                    # doc_meta["hearing_date"] bypasses that check — in
-                    # rebuilds where both columns were populated from the
-                    # same bad LLM output, the implausible value still wins
-                    # and reingest writes it back via force_update.  Re-run
-                    # the plausibility check on the effective fallback
-                    # result so a bad doc_meta value is also rejected.
-                    if effective_hearing is not None and not is_plausible_hearing_date(
-                        effective_hearing,
-                        doc_meta.get("captured_at"),
-                    ):
-                        logger.info(
-                            "post-extraction guard: rejected implausible "
-                            "doc_meta hearing_date fallback",
-                            hearing_date=effective_hearing,
-                            capture_timestamp=doc_meta.get("captured_at"),
-                            document_id=doc_id_str,
-                        )
-                        effective_hearing = None
 
                     # For split documents, generate a synthetic content hash
                     # by incorporating the ruling index.  All split children
