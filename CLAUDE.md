@@ -362,7 +362,7 @@ See `docs/agent/infrastructure-reference.md` §ECS Script Execution for full pat
 
 `reingest_from_s3.py` operates on **existing database records only**. If you run it for a county with no records in the `documents` table, it will process 0 documents silently.
 
-**Split-child caveat for `rebuild_db.py --reset --county <name>`.** On counties whose scrapers split multi-case PDFs into multiple `derived.documents` rows per raw S3 object (Santa Clara, Orange, Riverside, Fresno, and any other multi-case-PDF county), a `--reset --county` followed by rebuild will silently destroy the split-children: the reset deletes every row, but rebuild only recreates one row per raw PDF because of the `content_hash`/`key_hash` mismatch in the rebuild path (see #2494). A preflight guard in `rebuild_db.py` compares the S3 key count against the `derived.documents` row count and refuses to reset when the ratio indicates fanout (≥1.5x); operators who accept the loss can pass `--force-split-child-loss`. Prefer `reingest_from_s3.py --county <name>` for re-processing multi-case-PDF counties until #2494 lands and rebuild can re-derive split-children end-to-end.
+**Split-children on rebuild (#2494).** Multi-case-PDF counties (Santa Clara, Orange, Riverside, Fresno) store N `derived.documents` rows per raw S3 object — one per extracted case. `rebuild_db.py --reset --county <name>` is safe on these counties: rebuild feeds each raw PDF back through the ingestion worker's LLM split path, which re-derives all N split-children from the raw content. The `--force-split-child-loss` CLI flag is a deprecated no-op kept only for tooling compatibility.
 
 ### Local Development
 
