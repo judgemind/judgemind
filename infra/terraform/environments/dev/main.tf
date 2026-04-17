@@ -59,10 +59,17 @@ module "iam_scraper" {
 module "database" {
   source = "../../modules/database"
 
-  environment    = "dev"
-  vpc_id         = module.networking.vpc_id
-  subnet_ids     = module.networking.private_subnet_ids
-  instance_class = "db.t4g.micro"
+  environment = "dev"
+  vpc_id      = module.networking.vpc_id
+  subnet_ids  = module.networking.private_subnet_ids
+  # db.t4g.small: 2 GB RAM → max_connections ≈ 170. Previously db.t4g.micro
+  # yielded only ≈ 84 connections, which was exhausted by
+  # ``rebuild_db.py --concurrency 64`` (each ProcessPoolExecutor worker opens
+  # its own psycopg connection) plus the ingestion worker, API, and any
+  # concurrent backfill task, producing the ``rds_reserved`` FATAL errors
+  # documented in #2549. See docs/agent/infrastructure-reference.md
+  # §Dev DB Connection Budget.
+  instance_class = "db.t4g.small"
 }
 
 module "cache" {
