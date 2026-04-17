@@ -1675,7 +1675,20 @@ class TestMainPoolBreakHandling:
                     "S3_CACHE_DIR": cache_dir,
                 },
             ),
-            patch("sys.argv", ["rebuild_db.py"]),
+            # Disable the retry-abort gate so the pool-break test can
+            # exercise its serial-retry path.  The 100% crash ratio in this
+            # scenario would otherwise trip the #2572 abort and sys.exit(2)
+            # before the rebuild summary is logged.
+            patch(
+                "sys.argv",
+                [
+                    "rebuild_db.py",
+                    "--max-retry-count",
+                    "0",
+                    "--max-retry-ratio",
+                    "0",
+                ],
+            ),
             patch.object(rebuild_db, "logger", mock_logger),
         ):
             rebuild_db.main()
@@ -1761,7 +1774,20 @@ class TestMainPoolBreakHandling:
                     "S3_CACHE_DIR": cache_dir,
                 },
             ),
-            patch("sys.argv", ["rebuild_db.py"]),
+            # Disable the retry-abort gate so the serial-retry recovery
+            # path runs.  The 100% crash ratio in this scenario would
+            # otherwise trip the #2572 abort and sys.exit(2) before the
+            # rebuild summary is logged.
+            patch(
+                "sys.argv",
+                [
+                    "rebuild_db.py",
+                    "--max-retry-count",
+                    "0",
+                    "--max-retry-ratio",
+                    "0",
+                ],
+            ),
             patch.object(rebuild_db, "logger", mock_logger),
         ):
             rebuild_db.main()
