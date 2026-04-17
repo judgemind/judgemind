@@ -141,12 +141,20 @@ runs:
           --query 'service.serviceName' \
           --output text
 
-        echo "Waiting for service to stabilize..."
-        aws ecs wait services-stable \
-          --cluster "$ECS_CLUSTER" \
-          --services "$ECS_SERVICE"
-
-        echo "Service updated successfully."
+        # Wait for OUR task definition's deployment to reach a terminal state.
+        #
+        # This replaces `aws ecs wait services-stable`, which:
+        #   - polls every 15s for 40 attempts (10 min) with no way to customize;
+        #   - emits no progress output, making it hard to distinguish a real
+        #     timeout from a workflow cancellation (e.g. concurrency.cancel-in-
+        #     progress firing on a rapid follow-up merge, see #1867); and
+        #   - waits on "service stable" rather than on our specific deployment,
+        #     which can report steady state on an old deployment before the new
+        #     one begins rolling.
+        #
+        # See issue #2519 for the full motivation. The logic lives in a separate
+        # script so it can be shellchecked and unit-tested with a mock AWS CLI.
+        "${GITHUB_ACTION_PATH}/wait-for-rollout.sh"
 
     - name: Update EventBridge Scheduler target
       if: inputs.deploy-mode == 'scheduler'

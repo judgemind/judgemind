@@ -70,6 +70,11 @@ jobs:
               - 'infra/**'
             scripts:
               - 'scripts/**'
+              # wait-for-rollout.sh is consumed by the ecs-deploy composite
+              # action. Running scripts-tests on ecs-deploy changes ensures
+              # test_wait_for_rollout.sh fires on PRs that touch only the
+              # composite action.
+              - '.github/actions/ecs-deploy/**'
             ecs-oneshot:
               - 'scripts/*.py'
               - 'scripts/ecs-run-task.sh'
@@ -575,6 +580,8 @@ jobs:
         run: scripts/tests/test_check_graphql_queries.sh
       - name: Test install-package-venv.sh
         run: scripts/tests/test_install_package_venv.sh
+      - name: Test wait-for-rollout.sh
+        run: scripts/tests/test_wait_for_rollout.sh
 
   # ---------------------------------------------------------------
   # Coverage gates: diff coverage (new lines) + overall floor ratchet
