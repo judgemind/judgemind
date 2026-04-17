@@ -5079,3 +5079,151 @@ def test_process_event_rejects_probate_decedent_as_judge(
     mock_llm.assert_called_once()
     # resolve_judge should NOT be called because the decedent name was rejected.
     mock_resolve_judge.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Ruling guards — orphan check (#1337)
+# ---------------------------------------------------------------------------
+
+
+def test_check_no_orphan_rulings_zero_count_returns_orphan() -> None:
+    """Zero rulings => OrphanCheckResult(is_orphan=True, reason=<non-empty>)."""
+    from ingestion.ruling_guards import check_no_orphan_rulings
+
+    result = check_no_orphan_rulings(0)
+    assert result.is_orphan is True
+    assert result.reason is not None
+    assert result.reason  # non-empty
+
+
+def test_check_no_orphan_rulings_one_count_not_orphan() -> None:
+    """One ruling => OrphanCheckResult(is_orphan=False, reason=None)."""
+    from ingestion.ruling_guards import check_no_orphan_rulings
+
+    result = check_no_orphan_rulings(1)
+    assert result.is_orphan is False
+    assert result.reason is None
+
+
+def test_check_no_orphan_rulings_many_count_not_orphan() -> None:
+    """Five rulings => OrphanCheckResult(is_orphan=False, reason=None)."""
+    from ingestion.ruling_guards import check_no_orphan_rulings
+
+    result = check_no_orphan_rulings(5)
+    assert result.is_orphan is False
+    assert result.reason is None
+
+
+def test_llm_split_logs_orphan_warning_when_no_rulings_extracted(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Orphan integrity check logs structured warning when LLM returns empty list (#1337).
+
+    When ``_llm_split_document`` invokes the LLM extractor and it returns
+    an empty list of rulings (successful extraction, zero cases found), the
+    worker must emit a structured warning ``"Orphan document: no rulings
+    extracted"`` with ``document_id`` in ``extra`` so operators can surface
+    probate PDFs and other problematic content in the log stream.
+    """
+    worker, _ = _make_worker()
+    worker._llm_client = MagicMock()
+
+    # Mock the framework text-based extractor so we stay on the text path
+    # and skip multimodal initialization entirely.
+    mock_extractor = MagicMock()
+    mock_extractor.extract.return_value = []  # LLM returns NO rulings (orphan case).
+
+    event = _make_event(
+        document_id="orphan-doc-id-0000-0000-000000000001",
+        scraper_id="ca-oc-tentatives-probate",
+        state="CA",
+        county="Orange",
+        s3_key="ca/orange/superior_court/raw/probate-orphan.pdf",
+        ruling_text="Some text that the LLM cannot classify as a ruling",
+    )
+
+    with (
+        patch.object(worker, "_get_framework_extractor", return_value=mock_extractor),
+        patch.object(worker, "_get_multimodal_extractor", return_value=None),
+        caplog.at_level("WARNING", logger="ingestion.worker"),
+    ):
+        result = worker._llm_split_document(
+            event,
+            event["document_id"],
+            event["ruling_text"],
+            event["state"],
+            event["county"],
+            raw_pdf_bytes=None,
+        )
+
+    assert result is False
+    orphan_records = [
+        r for r in caplog.records if r.message == "Orphan document: no rulings extracted"
+    ]
+    assert len(orphan_records) == 1, (
+        f"Expected exactly one orphan warning; got {len(orphan_records)}: "
+        f"{[r.message for r in caplog.records]}"
+    )
+    record = orphan_records[0]
+    assert record.levelname == "WARNING"
+    # Verify the structured extra fields are attached to the LogRecord.
+    assert getattr(record, "document_id", None) == "orphan-doc-id-0000-0000-000000000001"
+    assert getattr(record, "original_document_id", None) == ("orphan-doc-id-0000-0000-000000000001")
+    assert getattr(record, "s3_key", None) == ("ca/orange/superior_court/raw/probate-orphan.pdf")
+    assert getattr(record, "county", None) == "Orange"
+    assert getattr(record, "state", None) == "CA"
+    assert getattr(record, "scraper_id", None) == "ca-oc-tentatives-probate"
+    assert getattr(record, "reason", None)  # non-empty
+
+
+def test_llm_split_does_not_log_orphan_warning_when_rulings_extracted(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """No orphan warning should fire when the LLM extractor returns >=1 ruling (#1337)."""
+    from framework.llm_schema import ExtractedRuling
+
+    worker, _ = _make_worker()
+    worker._llm_client = MagicMock()
+
+    # Mock the framework text-based extractor returning one ruling.
+    mock_extractor = MagicMock()
+    mock_extractor.extract.return_value = [
+        ExtractedRuling(
+            extracted_case_number="24STCV00001",
+            extracted_case_title="Foo v. Bar",
+            extracted_judge_name="Smith, John",
+            department="Dept. 1",
+            motion_type="demurrer",
+            outcome=None,
+            hearing_date="2026-03-05",
+            extracted_parties=[],
+            ruling_text="The motion is GRANTED.",
+            case_type=None,
+        )
+    ]
+
+    event = _make_event(ruling_text="Some ruling text")
+
+    with (
+        patch.object(worker, "_get_framework_extractor", return_value=mock_extractor),
+        patch.object(worker, "_get_multimodal_extractor", return_value=None),
+        caplog.at_level("WARNING", logger="ingestion.worker"),
+    ):
+        # Execution may raise downstream (DB writes are not mocked for this
+        # focused test); we only care about the absence of the orphan warning.
+        try:
+            worker._llm_split_document(
+                event,
+                event["document_id"],
+                event["ruling_text"],
+                event["state"],
+                event["county"],
+                raw_pdf_bytes=None,
+            )
+        except Exception:
+            pass
+
+    orphan_records = [
+        r for r in caplog.records if r.message == "Orphan document: no rulings extracted"
+    ]
+    assert len(orphan_records) == 0, "Orphan warning should not fire when rulings are extracted"
