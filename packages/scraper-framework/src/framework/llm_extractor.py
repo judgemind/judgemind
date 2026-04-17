@@ -627,6 +627,7 @@ class LlmExtractor:
         max_delay: float = _DEFAULT_MAX_DELAY,
         max_output_tokens: int = 4096,
         max_chars_per_chunk: int = _DEFAULT_MAX_CHARS,
+        bust_cache: bool = False,
     ) -> None:
         self._provider = provider
         self._model = model or self._PROVIDER_DEFAULT_MODELS.get(provider, DEFAULT_HAIKU_MODEL)
@@ -635,6 +636,12 @@ class LlmExtractor:
         self._max_delay = max_delay
         self._max_output_tokens = max_output_tokens
         self._max_chars_per_chunk = max_chars_per_chunk
+        # Instance-level default for cache-bust mode (#2424).  When True,
+        # all ``extract()`` / ``extract_from_pdf()`` calls on this
+        # instance skip cache reads unless explicitly overridden.  Cache
+        # writes still happen so subsequent runs without bust_cache
+        # benefit from the fresh extraction.
+        self._bust_cache = bust_cache
 
         # Create provider-specific client.
         if provider == "google":
@@ -680,6 +687,7 @@ class LlmExtractor:
         *,
         metadata: dict[str, str] | None = None,
         system_prompt: str | None = None,
+        bust_cache: bool = False,
     ) -> list[ExtractedRuling]:
         """Extract structured rulings from raw calendar page text.
 
@@ -697,6 +705,11 @@ class LlmExtractor:
             system_prompt: Custom system prompt to use instead of the
                 default ``EXTRACTION_SYSTEM_PROMPT``.  Used for
                 county-specific prompts (e.g. Riverside).
+            bust_cache: When ``True``, skip the cache read on this call.
+                Cache writes still happen so subsequent calls benefit
+                from the fresh result.  See ``self._bust_cache`` for a
+                persistent instance-level default.  Used by the
+                ``--bust-llm-cache`` reingest flag (#2424).
 
         Returns:
             A list of ``ExtractedRuling`` instances.  Returns an empty list
@@ -707,9 +720,10 @@ class LlmExtractor:
 
         effective_prompt = system_prompt or EXTRACTION_SYSTEM_PROMPT
         content_key = _content_hash_for_cache(text, metadata)
+        effective_bust = bust_cache or self._bust_cache
 
         # Check cache
-        if self._cache is not None:
+        if self._cache is not None and not effective_bust:
             cached = self._cache.get(effective_prompt, content_key)
             if cached is not None:
                 logger.debug("llm_cache.hit", content_key=content_key[:12])
@@ -769,6 +783,7 @@ class LlmExtractor:
         *,
         metadata: dict[str, str] | None = None,
         max_pages: int = 50,
+        bust_cache: bool = False,
     ) -> list[ExtractedRuling]:
         """Extract structured rulings from PDF page images (multimodal).
 
@@ -789,6 +804,11 @@ class LlmExtractor:
                 ``hearing_date``.
             max_pages: Maximum number of PDF pages to render.  Pages beyond
                 this limit are silently skipped.
+            bust_cache: When ``True``, skip the cache read on this call.
+                Cache writes still happen so subsequent calls benefit
+                from the fresh result.  See ``self._bust_cache`` for a
+                persistent instance-level default.  Used by the
+                ``--bust-llm-cache`` reingest flag (#2424).
 
         Returns:
             A list of ``ExtractedRuling`` instances.  Returns an empty list
@@ -799,9 +819,10 @@ class LlmExtractor:
             return []
 
         content_key = _content_hash_for_cache(pdf_bytes, metadata)
+        effective_bust = bust_cache or self._bust_cache
 
         # Check cache
-        if self._cache is not None:
+        if self._cache is not None and not effective_bust:
             cached = self._cache.get(PDF_PER_PAGE_PROMPT, content_key)
             if cached is not None:
                 logger.debug("llm_cache.hit_pdf", content_key=content_key[:12])

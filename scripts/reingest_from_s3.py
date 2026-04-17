@@ -86,6 +86,12 @@ Options:
                         and processes each document through the ingestion
                         pipeline via IngestionWorker.process_event().
                         Example: --prefix federal/
+    --bust-llm-cache    Skip LLM cache reads for the duration of this reingest
+                        run.  Cache writes still happen so subsequent runs
+                        without the flag benefit from the fresh results.
+                        Useful when the LLM prompt has been updated and the
+                        existing cache entries store stale outputs keyed by
+                        the old prompt hash.  See #2424.
 """
 
 from __future__ import annotations
@@ -155,6 +161,8 @@ from ingestion.llm_extract import (  # noqa: E402
 from ingestion.llm_providers import create_client as create_llm_client  # noqa: E402
 from ingestion.ruling_guards import convert_extracted_rulings  # noqa: E402
 from ingestion.split_ids import is_split_child_id, make_split_document_id  # noqa: E402
+from validation.deterministic import run_deterministic_rules  # noqa: E402
+from validation.gate import ValidationResult, insert_validation_result  # noqa: E402
 
 configure_structlog(contextvars=True)
 logger = structlog.get_logger()
@@ -674,6 +682,7 @@ def _reparse_document(
     force_llm: bool = False,
     token_tracker: TokenTracker | None = None,
     force_retranscribe: bool = False,
+    bust_llm_cache: bool = False,
 ) -> dict:
     """Re-parse a document using a three-tier extraction strategy.
 
@@ -885,6 +894,7 @@ def _reparse_document(
                 timeout=llm_timeout,
                 token_tracker=token_tracker,
                 max_tokens=_llm_max_tokens,
+                bust_cache=bust_llm_cache,
             )
             llm_latency_ms = round((time.monotonic() - t0) * 1000)
 
@@ -999,6 +1009,7 @@ def _full_reparse_document(
     force_llm: bool = False,
     token_tracker: TokenTracker | None = None,
     force_retranscribe: bool = False,
+    bust_llm_cache: bool = False,
 ) -> list[dict]:
     """Re-parse a document with full splitting logic.
 
@@ -1037,6 +1048,7 @@ def _full_reparse_document(
             force_llm=force_llm,
             token_tracker=token_tracker,
             force_retranscribe=force_retranscribe,
+            bust_llm_cache=bust_llm_cache,
         )
         result["ruling_index"] = 0
         result["split_document_id"] = doc_meta["document_id"]
@@ -1099,6 +1111,7 @@ def _full_reparse_document(
             force_llm=force_llm,
             token_tracker=token_tracker,
             force_retranscribe=force_retranscribe,
+            bust_llm_cache=bust_llm_cache,
         )
         result["ruling_index"] = 0
         result["split_document_id"] = doc_meta["document_id"]
@@ -1374,6 +1387,7 @@ def _reparse_document_multimodal(
     force_llm: bool = False,
     token_tracker: TokenTracker | None = None,
     force_retranscribe: bool = False,
+    bust_llm_cache: bool = False,
 ) -> list[dict]:
     """Re-parse a PDF document using multimodal per-page extraction.
 
@@ -1440,6 +1454,7 @@ def _reparse_document_multimodal(
             force_llm=force_llm,
             token_tracker=token_tracker,
             force_retranscribe=force_retranscribe,
+            bust_llm_cache=bust_llm_cache,
         )
         result["ruling_index"] = 0
         result["split_document_id"] = doc_meta["document_id"]
@@ -1460,7 +1475,9 @@ def _reparse_document_multimodal(
     extracted_rulings: list[ExtractedRuling] = []
     try:
         extracted_rulings = multimodal_extractor.extract_from_pdf(
-            raw_content, metadata=metadata or None
+            raw_content,
+            metadata=metadata or None,
+            bust_cache=bust_llm_cache,
         )
     except Exception:
         logger.warning(
@@ -1487,6 +1504,7 @@ def _reparse_document_multimodal(
             force_llm=force_llm,
             token_tracker=token_tracker,
             force_retranscribe=force_retranscribe,
+            bust_llm_cache=bust_llm_cache,
         )
         result["ruling_index"] = 0
         result["split_document_id"] = doc_meta["document_id"]
@@ -1721,6 +1739,7 @@ def reingest_batch(
     token_tracker: TokenTracker | None = None,
     multimodal_extractor: LlmExtractor | None = None,
     force_retranscribe: bool = False,
+    bust_llm_cache: bool = False,
 ) -> dict[str, Any]:
     """Process one batch. Returns a dict of batch stats.
 
@@ -2008,6 +2027,7 @@ def reingest_batch(
                     force_llm,
                     token_tracker,
                     force_retranscribe,
+                    bust_llm_cache,
                 )
             else:
                 future = pool.submit(
@@ -2023,6 +2043,7 @@ def reingest_batch(
                     force_llm,
                     token_tracker,
                     force_retranscribe,
+                    bust_llm_cache,
                 )
             parse_futures[future] = (idx, doc_meta)
 
@@ -2123,6 +2144,15 @@ def reingest_batch(
                 if any_split:
                     _supersede_document(conn, doc_id_str)
 
+                # Sibling case numbers — used by the deterministic
+                # cross-case contamination check (#2371) to flag rulings
+                # whose text references another case number from the
+                # same multi-ruling document.  Only relevant when the
+                # document split into 2+ rulings.
+                sibling_case_numbers: list[str] = [
+                    e.get("case_number") for e in extracted_list if e.get("case_number")
+                ]
+
                 for extracted in extracted_list:
                     # Apply #2370 post-extraction guards before any DB
                     # write: dedupe_repeated_title, strip_trailing_case_number,
@@ -2141,6 +2171,97 @@ def reingest_batch(
                     # (matching ingestion worker behavior — one PDF = one
                     # document row).
                     effective_doc_id = extracted.get("split_document_id", doc_id_str)
+
+                    # ------------------------------------------------------
+                    # Deterministic validation (#2424).  Reingest's extract
+                    # path bypasses ``IngestionWorker.process_event``, so
+                    # the #2402 validator only fires on live ingestion.
+                    # Run it here so reingest produces ``validation_results``
+                    # rows for any bad rulings and skips DB writes on fail.
+                    #
+                    # For multi-ruling documents we pass sibling case
+                    # numbers (all-except-self) so the cross-case
+                    # contamination check fires.  Mirrors worker.py
+                    # lines 2287-2303.
+                    # ------------------------------------------------------
+                    own_case_number = (
+                        extracted.get("case_number")
+                        or doc_meta.get("case_number")
+                        or f"UNKNOWN-{effective_doc_id}"
+                    )
+                    det_hearing = extracted.get("hearing_date")
+                    captured_ts = doc_meta.get("captured_at")
+                    captured_at_date = (
+                        captured_ts.date()
+                        if isinstance(captured_ts, datetime)
+                        else captured_ts
+                    )
+                    other_nums = [
+                        num
+                        for num in sibling_case_numbers
+                        if num and num != own_case_number
+                    ]
+                    det_result = run_deterministic_rules(
+                        ruling_text=extracted.get("ruling_text"),
+                        case_number=own_case_number,
+                        case_title=extracted.get("case_title"),
+                        hearing_date=det_hearing,
+                        captured_at=captured_at_date,
+                        other_case_numbers=other_nums or None,
+                    )
+                    if det_result.overall != "pass":
+                        logger.info(
+                            "Deterministic validation result (reingest)",
+                            document_id=effective_doc_id,
+                            det_overall=det_result.overall,
+                            det_failed_rules=[r.rule for r in det_result.failed_rules],
+                            det_flagged_rules=[
+                                r.rule for r in det_result.flagged_rules
+                            ],
+                            det_reasons=det_result.reasons,
+                            county=doc_meta.get("county"),
+                            case_number=own_case_number,
+                        )
+                    if det_result.overall in ("fail", "flag"):
+                        det_validation_result = ValidationResult(
+                            result=det_result.overall,
+                            reason="; ".join(det_result.reasons),
+                            model="deterministic",
+                            input_tokens=0,
+                            output_tokens=0,
+                            latency_ms=0,
+                        )
+                        # Logging the validation result should never abort
+                        # the document's transaction — wrap the insert in
+                        # a nested savepoint so a logging failure rolls
+                        # back only the validation insert and subsequent
+                        # siblings can still be written (mirrors worker.py
+                        # #2385).
+                        try:
+                            with conn.transaction():
+                                insert_validation_result(
+                                    conn,
+                                    document_id=effective_doc_id,
+                                    ruling_id=None,
+                                    result=det_validation_result,
+                                )
+                        except Exception as exc:
+                            logger.warning(
+                                "Failed to log deterministic validation result "
+                                "to DB: %s",
+                                exc,
+                            )
+                    if det_result.overall == "fail":
+                        logger.warning(
+                            "Deterministic validation FAIL — skipping DB write",
+                            document_id=effective_doc_id,
+                            det_reasons=det_result.reasons,
+                            county=doc_meta.get("county"),
+                            case_number=own_case_number,
+                        )
+                        # Skip this ruling's DB write but continue with
+                        # sibling rulings from the same document.
+                        continue
                     effective_case_number = (
                         extracted["case_number"]
                         or doc_meta["case_number"]
@@ -2839,6 +2960,7 @@ def run_reingest(
     case_number_like: str | None = None,
     force_retranscribe: bool = False,
     filter_null_outcome: bool = False,
+    bust_llm_cache: bool = False,
 ) -> dict[str, Any]:
     """Run the full reingest. Returns summary stats including cost.
 
@@ -2905,11 +3027,13 @@ def run_reingest(
             multimodal_extractor = LlmExtractor(
                 provider="google",
                 max_output_tokens=32768,
+                bust_cache=bust_llm_cache,
             )
             logger.info(
                 "Multimodal extraction enabled (Google Flash Lite)",
                 model=multimodal_extractor._model,
                 max_output_tokens=32768,
+                bust_cache=bust_llm_cache,
             )
         except Exception:
             logger.error(
@@ -3013,6 +3137,7 @@ def run_reingest(
                 token_tracker=tracker,
                 multimodal_extractor=multimodal_extractor,
                 force_retranscribe=force_retranscribe,
+                bust_llm_cache=bust_llm_cache,
             )
             processed = batch_result["processed"]
             updated = batch_result["updated"]
@@ -3296,6 +3421,19 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--bust-llm-cache",
+        action="store_true",
+        help=(
+            "Skip LLM cache reads for this run (#2424). Every document "
+            "re-runs through the LLM regardless of cached results, which "
+            "is required after prompt updates or extraction-logic changes. "
+            "Cache *writes* still happen, so subsequent runs without this "
+            "flag benefit from the fresh extraction. Use this when you "
+            "need to pick up the latest prompt without invalidating the "
+            "entire cache namespace."
+        ),
+    )
+    parser.add_argument(
         "--force-retranscribe",
         action="store_true",
         help=(
@@ -3367,6 +3505,7 @@ def main() -> None:
         case_number_like=args.case_number_like,
         force_retranscribe=args.force_retranscribe,
         filter_null_outcome=args.filter_null_outcome,
+        bust_llm_cache=args.bust_llm_cache,
     )
 
     logger.info(

@@ -7240,6 +7240,7 @@ class TestRunReingestMultimodalTokens:
         mock_extractor_cls.assert_called_once_with(
             provider="google",
             max_output_tokens=32768,
+            bust_cache=False,
         )
         # The extractor is threaded through to reingest_batch.
         batch_call = mock_batch.call_args_list[0]
@@ -9332,3 +9333,665 @@ class TestReingestAppliesGuardsAndForceUpdate:
             "Implausible doc_meta['hearing_date'] fallback must also be "
             "rejected — otherwise the guard is bypassed (#2432)."
         )
+
+
+# ---------------------------------------------------------------------------
+# #2424: deterministic validation + LLM cache bust
+# ---------------------------------------------------------------------------
+
+
+def _make_det_result(
+    overall: str = "pass",
+    reasons: list[str] | None = None,
+) -> Any:
+    """Create a ``DeterministicValidationResult``-shaped mock."""
+    from validation.deterministic import (
+        DeterministicRuleResult,
+        DeterministicValidationResult,
+    )
+
+    rules: list[DeterministicRuleResult] = []
+    for reason in reasons or []:
+        rules.append(
+            DeterministicRuleResult(
+                rule="test_rule",
+                result=overall,
+                reason=reason,
+            )
+        )
+    if not rules and overall != "pass":
+        # Ensure reasons list isn't empty for non-pass outcomes.
+        rules.append(
+            DeterministicRuleResult(
+                rule="test_rule",
+                result=overall,
+                reason=f"synthetic {overall} reason",
+            )
+        )
+    return DeterministicValidationResult(overall=overall, rules=rules)
+
+
+class TestReingestDeterministicValidationFail:
+    """#2424: deterministic validation fail → skip DB write + log row."""
+
+    @patch("reingest_from_s3.insert_validation_result")
+    @patch("reingest_from_s3.run_deterministic_rules")
+    @patch("reingest_from_s3.batch_upsert_parties")
+    @patch("reingest_from_s3.upsert_case_judge")
+    @patch("reingest_from_s3.resolve_judge")
+    @patch("reingest_from_s3.insert_document_and_ruling")
+    @patch("reingest_from_s3.upsert_case")
+    @patch("reingest_from_s3._reparse_document")
+    @patch("reingest_from_s3._fetch_s3_content")
+    def test_fail_skips_db_write_and_inserts_validation_row(
+        self,
+        mock_fetch_s3: MagicMock,
+        mock_reparse: MagicMock,
+        mock_upsert_case: MagicMock,
+        mock_insert_doc_and_ruling: MagicMock,
+        mock_resolve_judge: MagicMock,
+        mock_upsert_cj: MagicMock,
+        mock_batch_parties: MagicMock,
+        mock_run_det: MagicMock,
+        mock_insert_val: MagicMock,
+    ) -> None:
+        """A fail verdict skips the ruling's DB write + logs a
+        validation_results row with result='fail'."""
+        row = _make_document_row()
+        conn = _mock_conn_with_rows([row])
+
+        mock_fetch_s3.return_value = b"<html>text</html>"
+        mock_reparse.return_value = {
+            "ruling_text": "motion is granted",
+            "case_number": "23STCV01234",
+            "case_title": "Smith v. Jones",
+            "judge_name": "Judge Doe",
+            "outcome": "granted",
+            "motion_type": "msj",
+            "department": "1",
+            "parties": [],
+            "hearing_date": _HEARING_DATE,
+        }
+        mock_run_det.return_value = _make_det_result(
+            overall="fail",
+            reasons=["ruling_text references a different case"],
+        )
+
+        result = reingest.reingest_batch(
+            conn,
+            MagicMock(),
+            batch_size=10,
+            cursor=_DEFAULT_CURSOR,
+            filters="",
+            filter_params=[],
+        )
+
+        assert result["processed"] == 1
+        # DB upsert must NOT happen — validation said fail.
+        mock_upsert_case.assert_not_called()
+        mock_insert_doc_and_ruling.assert_not_called()
+        # validation_results row WAS logged.
+        mock_insert_val.assert_called_once()
+        insert_kwargs = mock_insert_val.call_args.kwargs
+        assert insert_kwargs["result"].result == "fail"
+        assert "ruling_text references" in insert_kwargs["result"].reason
+        assert insert_kwargs["result"].model == "deterministic"
+
+
+class TestReingestDeterministicValidationFlag:
+    """#2424: deterministic validation flag → write DB + log row."""
+
+    @patch("reingest_from_s3.insert_validation_result")
+    @patch("reingest_from_s3.run_deterministic_rules")
+    @patch("reingest_from_s3.batch_upsert_parties")
+    @patch("reingest_from_s3.upsert_case_judge")
+    @patch("reingest_from_s3.resolve_judge")
+    @patch("reingest_from_s3.insert_document_and_ruling")
+    @patch("reingest_from_s3.upsert_case")
+    @patch("reingest_from_s3._reparse_document")
+    @patch("reingest_from_s3._fetch_s3_content")
+    def test_flag_writes_db_and_inserts_validation_row(
+        self,
+        mock_fetch_s3: MagicMock,
+        mock_reparse: MagicMock,
+        mock_upsert_case: MagicMock,
+        mock_insert_doc_and_ruling: MagicMock,
+        mock_resolve_judge: MagicMock,
+        mock_upsert_cj: MagicMock,
+        mock_batch_parties: MagicMock,
+        mock_run_det: MagicMock,
+        mock_insert_val: MagicMock,
+    ) -> None:
+        """A flag verdict proceeds with DB write AND logs a
+        validation_results row with result='flag'."""
+        row = _make_document_row()
+        conn = _mock_conn_with_rows([row])
+
+        mock_fetch_s3.return_value = b"<html>text</html>"
+        mock_reparse.return_value = {
+            "ruling_text": "motion is granted",
+            "case_number": "23STCV01234",
+            "case_title": "Smith v. Jones",
+            "judge_name": "Judge Doe",
+            "outcome": "granted",
+            "motion_type": "msj",
+            "department": "1",
+            "parties": [],
+            "hearing_date": _HEARING_DATE,
+        }
+        mock_upsert_case.return_value = "case-id"
+        mock_resolve_judge.return_value = "judge-id"
+        mock_run_det.return_value = _make_det_result(
+            overall="flag",
+            reasons=["hearing_date far from captured_at"],
+        )
+
+        result = reingest.reingest_batch(
+            conn,
+            MagicMock(),
+            batch_size=10,
+            cursor=_DEFAULT_CURSOR,
+            filters="",
+            filter_params=[],
+        )
+
+        assert result["processed"] == 1
+        assert result["updated"] == 1
+        # DB upsert HAPPENED — flag does not block writes.
+        mock_upsert_case.assert_called_once()
+        mock_insert_doc_and_ruling.assert_called_once()
+        # validation_results row was logged with result='flag'.
+        mock_insert_val.assert_called_once()
+        assert mock_insert_val.call_args.kwargs["result"].result == "flag"
+
+
+class TestReingestDeterministicValidationPass:
+    """#2424: deterministic validation pass → write DB, no validation row."""
+
+    @patch("reingest_from_s3.insert_validation_result")
+    @patch("reingest_from_s3.run_deterministic_rules")
+    @patch("reingest_from_s3.batch_upsert_parties")
+    @patch("reingest_from_s3.upsert_case_judge")
+    @patch("reingest_from_s3.resolve_judge")
+    @patch("reingest_from_s3.insert_document_and_ruling")
+    @patch("reingest_from_s3.upsert_case")
+    @patch("reingest_from_s3._reparse_document")
+    @patch("reingest_from_s3._fetch_s3_content")
+    def test_pass_writes_db_and_no_validation_row(
+        self,
+        mock_fetch_s3: MagicMock,
+        mock_reparse: MagicMock,
+        mock_upsert_case: MagicMock,
+        mock_insert_doc_and_ruling: MagicMock,
+        mock_resolve_judge: MagicMock,
+        mock_upsert_cj: MagicMock,
+        mock_batch_parties: MagicMock,
+        mock_run_det: MagicMock,
+        mock_insert_val: MagicMock,
+    ) -> None:
+        """A pass verdict writes DB and logs no validation_results row."""
+        row = _make_document_row()
+        conn = _mock_conn_with_rows([row])
+
+        mock_fetch_s3.return_value = b"<html>text</html>"
+        mock_reparse.return_value = {
+            "ruling_text": "motion is granted",
+            "case_number": "23STCV01234",
+            "case_title": "Smith v. Jones",
+            "judge_name": "Judge Doe",
+            "outcome": "granted",
+            "motion_type": "msj",
+            "department": "1",
+            "parties": [],
+            "hearing_date": _HEARING_DATE,
+        }
+        mock_upsert_case.return_value = "case-id"
+        mock_resolve_judge.return_value = "judge-id"
+        mock_run_det.return_value = _make_det_result(overall="pass")
+
+        result = reingest.reingest_batch(
+            conn,
+            MagicMock(),
+            batch_size=10,
+            cursor=_DEFAULT_CURSOR,
+            filters="",
+            filter_params=[],
+        )
+
+        assert result["processed"] == 1
+        assert result["updated"] == 1
+        mock_insert_doc_and_ruling.assert_called_once()
+        # No validation_results row logged when verdict is pass.
+        mock_insert_val.assert_not_called()
+
+
+class TestReingestValidationSiblingCaseNumbers:
+    """#2424: sibling case numbers flow to run_deterministic_rules."""
+
+    @patch("reingest_from_s3.insert_validation_result")
+    @patch("reingest_from_s3.run_deterministic_rules")
+    @patch("reingest_from_s3.batch_upsert_parties")
+    @patch("reingest_from_s3.upsert_case_judge")
+    @patch("reingest_from_s3.resolve_judge")
+    @patch("reingest_from_s3.insert_document_and_ruling")
+    @patch("reingest_from_s3.upsert_case")
+    @patch("reingest_from_s3._full_reparse_document")
+    @patch("reingest_from_s3._fetch_s3_content")
+    def test_multi_ruling_passes_siblings_as_other_case_numbers(
+        self,
+        mock_fetch_s3: MagicMock,
+        mock_full_reparse: MagicMock,
+        mock_upsert_case: MagicMock,
+        mock_insert_doc_and_ruling: MagicMock,
+        mock_resolve_judge: MagicMock,
+        mock_upsert_cj: MagicMock,
+        mock_batch_parties: MagicMock,
+        mock_run_det: MagicMock,
+        mock_insert_val: MagicMock,
+    ) -> None:
+        """For a split doc with 2 rulings, each call to
+        run_deterministic_rules receives the OTHER ruling's case_number
+        via other_case_numbers."""
+        row = _make_document_row(scraper_id="ca-fresno-tentatives-civil")
+        conn = _mock_conn_with_rows([row])
+
+        mock_fetch_s3.return_value = b"%PDF-1.4\nfake"
+        mock_full_reparse.return_value = [
+            {
+                "ruling_text": "ruling 1 text",
+                "case_number": "23CECG00001",
+                "case_title": "A v. B",
+                "judge_name": "Judge Doe",
+                "outcome": "granted",
+                "motion_type": "msj",
+                "department": "1",
+                "parties": [],
+                "hearing_date": _HEARING_DATE,
+                "ruling_index": 1,
+                "split_document_id": "split-1",
+                "is_split": True,
+                "extraction_methods": {},
+            },
+            {
+                "ruling_text": "ruling 2 text",
+                "case_number": "23CECG00002",
+                "case_title": "C v. D",
+                "judge_name": "Judge Doe",
+                "outcome": "denied",
+                "motion_type": "msj",
+                "department": "1",
+                "parties": [],
+                "hearing_date": _HEARING_DATE,
+                "ruling_index": 2,
+                "split_document_id": "split-2",
+                "is_split": True,
+                "extraction_methods": {},
+            },
+        ]
+        mock_upsert_case.return_value = "case-id"
+        mock_resolve_judge.return_value = "judge-id"
+        mock_run_det.return_value = _make_det_result(overall="pass")
+
+        reingest.reingest_batch(
+            conn,
+            MagicMock(),
+            batch_size=10,
+            cursor=_DEFAULT_CURSOR,
+            filters="",
+            filter_params=[],
+            full_reparse=True,
+        )
+
+        # run_deterministic_rules called twice (once per ruling).
+        assert mock_run_det.call_count == 2
+        calls = mock_run_det.call_args_list
+        call1_others = calls[0].kwargs.get("other_case_numbers")
+        call2_others = calls[1].kwargs.get("other_case_numbers")
+        # Each call's "other" numbers == all siblings minus self.
+        assert call1_others == ["23CECG00002"]
+        assert call2_others == ["23CECG00001"]
+
+
+class TestReingestValidationInsertException:
+    """#2424: insert_validation_result exception does not abort DB write."""
+
+    @patch("reingest_from_s3.insert_validation_result")
+    @patch("reingest_from_s3.run_deterministic_rules")
+    @patch("reingest_from_s3.batch_upsert_parties")
+    @patch("reingest_from_s3.upsert_case_judge")
+    @patch("reingest_from_s3.resolve_judge")
+    @patch("reingest_from_s3.insert_document_and_ruling")
+    @patch("reingest_from_s3.upsert_case")
+    @patch("reingest_from_s3._reparse_document")
+    @patch("reingest_from_s3._fetch_s3_content")
+    def test_insert_exception_swallowed_processing_continues(
+        self,
+        mock_fetch_s3: MagicMock,
+        mock_reparse: MagicMock,
+        mock_upsert_case: MagicMock,
+        mock_insert_doc_and_ruling: MagicMock,
+        mock_resolve_judge: MagicMock,
+        mock_upsert_cj: MagicMock,
+        mock_batch_parties: MagicMock,
+        mock_run_det: MagicMock,
+        mock_insert_val: MagicMock,
+    ) -> None:
+        """When insert_validation_result raises, the ruling still writes
+        (for a flag verdict) and processing continues."""
+        row = _make_document_row()
+        conn = _mock_conn_with_rows([row])
+
+        mock_fetch_s3.return_value = b"<html>text</html>"
+        mock_reparse.return_value = {
+            "ruling_text": "motion is granted",
+            "case_number": "23STCV01234",
+            "case_title": "Smith v. Jones",
+            "judge_name": "Judge Doe",
+            "outcome": "granted",
+            "motion_type": "msj",
+            "department": "1",
+            "parties": [],
+            "hearing_date": _HEARING_DATE,
+        }
+        mock_upsert_case.return_value = "case-id"
+        mock_resolve_judge.return_value = "judge-id"
+        mock_run_det.return_value = _make_det_result(
+            overall="flag",
+            reasons=["flagged"],
+        )
+        mock_insert_val.side_effect = Exception("boom")
+
+        # Must not raise — the outer reingest_batch swallows insert errors.
+        result = reingest.reingest_batch(
+            conn,
+            MagicMock(),
+            batch_size=10,
+            cursor=_DEFAULT_CURSOR,
+            filters="",
+            filter_params=[],
+        )
+
+        assert result["processed"] == 1
+        assert result["updated"] == 1
+        # DB write happened despite the logging failure.
+        mock_insert_doc_and_ruling.assert_called_once()
+
+
+class TestCLIBustLlmCacheFlag:
+    """#2424: --bust-llm-cache CLI flag parsing (exercises the real main() argparse)."""
+
+    @patch.dict(os.environ, {"DATABASE_URL": "postgres://test:test@test/test"})
+    @patch("reingest_from_s3.run_reingest")
+    def test_main_passes_bust_llm_cache_true(
+        self,
+        mock_run: MagicMock,
+    ) -> None:
+        """`--bust-llm-cache` on the command line forwards bust_llm_cache=True
+        to run_reingest."""
+        argv = ["reingest_from_s3", "--county", "Fresno", "--bust-llm-cache"]
+        with patch("sys.argv", argv):
+            reingest.main()
+        mock_run.assert_called_once()
+        assert mock_run.call_args.kwargs["bust_llm_cache"] is True
+
+    @patch.dict(os.environ, {"DATABASE_URL": "postgres://test:test@test/test"})
+    @patch("reingest_from_s3.run_reingest")
+    def test_main_default_bust_llm_cache_is_false(
+        self,
+        mock_run: MagicMock,
+    ) -> None:
+        """Default (no flag) forwards bust_llm_cache=False to run_reingest."""
+        argv = ["reingest_from_s3", "--county", "Fresno"]
+        with patch("sys.argv", argv):
+            reingest.main()
+        mock_run.assert_called_once()
+        assert mock_run.call_args.kwargs["bust_llm_cache"] is False
+
+
+class TestBustLlmCachePassedThrough:
+    """#2424: bust_llm_cache flows from run_reingest → reingest_batch → parse."""
+
+    @patch("reingest_from_s3.boto3")
+    @patch("reingest_from_s3.psycopg")
+    @patch("reingest_from_s3.reingest_batch")
+    def test_bust_llm_cache_passed_to_batch(
+        self,
+        mock_batch: MagicMock,
+        mock_psycopg: MagicMock,
+        mock_boto3: MagicMock,
+    ) -> None:
+        """bust_llm_cache=True is forwarded to reingest_batch."""
+        mock_conn = MagicMock()
+        mock_conn.__enter__ = MagicMock(return_value=mock_conn)
+        mock_conn.__exit__ = MagicMock(return_value=False)
+        mock_psycopg.connect.return_value = mock_conn
+        mock_batch.return_value = _make_batch_result()
+
+        reingest.run_reingest("postgresql://test", bust_llm_cache=True)
+
+        batch_call = mock_batch.call_args_list[0]
+        assert batch_call.kwargs.get("bust_llm_cache") is True
+
+    @patch("reingest_from_s3.boto3")
+    @patch("reingest_from_s3.psycopg")
+    @patch("reingest_from_s3.reingest_batch")
+    def test_bust_llm_cache_defaults_false(
+        self,
+        mock_batch: MagicMock,
+        mock_psycopg: MagicMock,
+        mock_boto3: MagicMock,
+    ) -> None:
+        """bust_llm_cache defaults to False when not specified."""
+        mock_conn = MagicMock()
+        mock_conn.__enter__ = MagicMock(return_value=mock_conn)
+        mock_conn.__exit__ = MagicMock(return_value=False)
+        mock_psycopg.connect.return_value = mock_conn
+        mock_batch.return_value = _make_batch_result()
+
+        reingest.run_reingest("postgresql://test")
+
+        batch_call = mock_batch.call_args_list[0]
+        assert batch_call.kwargs.get("bust_llm_cache") is False
+
+
+class TestBustLlmCacheFlowsToExtractFieldsLlm:
+    """#2424: bust_llm_cache reaches extract_fields_llm."""
+
+    @patch("reingest_from_s3.extract_fields_llm")
+    @patch("reingest_from_s3._load_scraper_registry")
+    def test_bust_llm_cache_flag_forwarded_to_extract_fields_llm(
+        self,
+        mock_load_registry: MagicMock,
+        mock_extract_llm: MagicMock,
+    ) -> None:
+        """_reparse_document forwards bust_llm_cache to extract_fields_llm."""
+        mock_extract_llm.return_value = None  # Don't actually apply LLM result.
+
+        doc_meta: dict[str, Any] = {
+            "document_id": "doc-1",
+            "state": "CA",
+            "county": "Los Angeles",
+            "format": "html",
+            "case_number": "23STCV01234",
+            "case_title": "Smith v. Jones",
+            "judge_name": None,
+            "hearing_date": _HEARING_DATE,
+            "department": None,
+        }
+        # A non-HTML starting body with plenty of chars to trigger the
+        # LLM branch (fields missing → LLM called).
+        raw_content = b"<html>Some ruling text here, nothing structured.</html>"
+
+        reingest._reparse_document(
+            raw_content,
+            "ca-la-tentatives-civil",
+            doc_meta,
+            llm_client=MagicMock(),
+            llm_provider="google",
+            llm_model="flash-lite",
+            force_llm=True,
+            bust_llm_cache=True,
+        )
+
+        assert mock_extract_llm.called, "extract_fields_llm should be invoked under force_llm=True"
+        assert mock_extract_llm.call_args.kwargs.get("bust_cache") is True
+
+
+class TestLlmExtractorBustCachePlumbing:
+    """#2424: LlmExtractor(bust_cache=True) skips cache reads, keeps writes."""
+
+    def test_bust_cache_skips_cache_read_keeps_write(self) -> None:
+        """With bust_cache=True, cache.get is NOT called; cache.put IS
+        (provided the extraction returned at least one ruling)."""
+        from framework.llm_extractor import LlmExtractor
+        from framework.llm_schema import ExtractedRuling
+
+        cache = MagicMock()
+        # If get WERE called, it would short-circuit with this payload.
+        cache.get.return_value = [{"extracted_case_number": "SHOULD-NOT-USE"}]
+
+        extractor = LlmExtractor.__new__(LlmExtractor)
+        extractor._cache = cache
+        extractor._bust_cache = True
+        extractor._provider = "google"
+        extractor._model = "test"
+        extractor._client = MagicMock()
+        extractor._max_retries = 1
+        extractor._base_delay = 0.0
+        extractor._max_delay = 0.0
+        extractor._max_output_tokens = 4096
+        extractor._max_chars_per_chunk = 1_000_000
+
+        extracted = ExtractedRuling(extracted_case_number="FRESH-1")
+        with (
+            patch.object(
+                extractor,
+                "_extract_chunk_with_retry",
+                return_value=[extracted],
+            ),
+            patch.object(extractor, "_log_usage"),
+            patch.object(extractor, "_merge_results", return_value=[extracted]),
+            patch.object(extractor, "_propagate_document_fields", return_value=[extracted]),
+        ):
+            result = extractor.extract("sample text")
+
+        cache.get.assert_not_called()
+        cache.put.assert_called_once()
+        assert result
+        assert result[0].extracted_case_number == "FRESH-1"
+
+    def test_cache_hit_honored_without_bust_cache(self) -> None:
+        """With bust_cache=False (default), cache.get SHORT-CIRCUITS and
+        the LLM is NOT invoked."""
+        from framework.llm_extractor import LlmExtractor
+
+        cache = MagicMock()
+        cache.get.return_value = [{"extracted_case_number": "CACHED-123"}]
+
+        extractor = LlmExtractor.__new__(LlmExtractor)
+        extractor._cache = cache
+        extractor._bust_cache = False
+        extractor._provider = "google"
+        extractor._model = "test"
+        extractor._client = MagicMock()
+        extractor._max_retries = 1
+        extractor._base_delay = 0.0
+        extractor._max_delay = 0.0
+        extractor._max_output_tokens = 4096
+        extractor._max_chars_per_chunk = 1_000_000
+
+        with patch.object(extractor, "_extract_chunk_with_retry") as mock_call:
+            result = extractor.extract("sample text")
+
+        cache.get.assert_called_once()
+        mock_call.assert_not_called()
+        cache.put.assert_not_called()
+        assert result
+        assert result[0].extracted_case_number == "CACHED-123"
+
+
+class TestLlmExtractorExtractFromPdfBustCache:
+    """#2424: extract_from_pdf honors bust_cache like extract() does."""
+
+    def test_extract_from_pdf_bust_cache_skips_cache_read(self) -> None:
+        """extract_from_pdf(bust_cache=True) does NOT call cache.get — even
+        if a cache hit would otherwise short-circuit the extraction."""
+        from framework.llm_extractor import LlmExtractor
+
+        cache = MagicMock()
+        # If get WERE called, this would short-circuit extraction.
+        cache.get.return_value = [{"extracted_case_number": "SHOULD-NOT-USE"}]
+
+        extractor = LlmExtractor.__new__(LlmExtractor)
+        extractor._cache = cache
+        extractor._bust_cache = False
+        extractor._provider = "google"
+        extractor._model = "test"
+        extractor._client = MagicMock()
+        extractor._max_retries = 1
+        extractor._base_delay = 0.0
+        extractor._max_delay = 0.0
+        extractor._max_output_tokens = 4096
+        extractor._max_chars_per_chunk = 1_000_000
+
+        with (
+            patch(
+                "framework.llm_extractor._render_pdf_pages",
+                return_value=[],
+            ),
+        ):
+            result = extractor.extract_from_pdf(
+                b"%PDF-1.4 minimal",
+                bust_cache=True,
+            )
+
+        cache.get.assert_not_called()
+        assert result == []
+
+    def test_extract_from_pdf_instance_bust_cache_skips_read(self) -> None:
+        """Instance-level self._bust_cache=True also skips the cache read."""
+        from framework.llm_extractor import LlmExtractor
+
+        cache = MagicMock()
+        cache.get.return_value = [{"extracted_case_number": "SHOULD-NOT-USE"}]
+
+        extractor = LlmExtractor.__new__(LlmExtractor)
+        extractor._cache = cache
+        extractor._bust_cache = True
+        extractor._provider = "google"
+        extractor._model = "test"
+        extractor._client = MagicMock()
+        extractor._max_retries = 1
+        extractor._base_delay = 0.0
+        extractor._max_delay = 0.0
+        extractor._max_output_tokens = 4096
+        extractor._max_chars_per_chunk = 1_000_000
+
+        with patch(
+            "framework.llm_extractor._render_pdf_pages",
+            return_value=[],
+        ):
+            result = extractor.extract_from_pdf(b"%PDF-1.4 minimal")
+
+        cache.get.assert_not_called()
+        assert result == []
+
+    def test_extract_from_pdf_cache_hit_honored_without_bust(self) -> None:
+        """extract_from_pdf(bust_cache=False) honors cache hits."""
+        from framework.llm_extractor import LlmExtractor
+
+        cache = MagicMock()
+        cache.get.return_value = [{"extracted_case_number": "CACHED-PDF"}]
+
+        extractor = LlmExtractor.__new__(LlmExtractor)
+        extractor._cache = cache
+        extractor._bust_cache = False
+        extractor._provider = "google"
+        extractor._model = "test"
+        extractor._client = MagicMock()
+
+        result = extractor.extract_from_pdf(b"%PDF-1.4 minimal")
+
+        cache.get.assert_called_once()
+        assert result
+        assert result[0].extracted_case_number == "CACHED-PDF"
