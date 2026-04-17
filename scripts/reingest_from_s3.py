@@ -2918,11 +2918,18 @@ def _process_prefix_document(
 
     # Byte-integrity check.  A mismatch used to short-circuit with
     # ``status="error"``, but that caused the ~4% flat-hash orphan rate on
-    # Santa Clara (#2628): raws captured under a wrong content-hash filename
+    # Santa Clara (#2628): raws stored under a wrong content-hash filename
     # were permanently unreingestable.  Now we log a warning and let the
     # worker process the raw; the LLM split path derives split-children from
     # the content and stores them with hashes derived from the canonical key
     # hash.  Matches ``rebuild_db._process_one_document`` (#2494).
+    #
+    # Root cause of the mislabeled filenames: the 2026-03-28 one-time
+    # migration script ``scripts/archive/migrate_s3_keys.py`` used DB
+    # ``content_hash`` values to build new S3 keys, but for multi-case-PDF
+    # split-child rows that value is synthetic (not the hash of any bytes).
+    # Live scraper writes are correct.  See #2638 and
+    # ``docs/investigations/mislabeled-s3-writes-2026-04.md``.
     actual_hash = hashlib.sha256(content).hexdigest()
     hash_mismatch = actual_hash != parsed["content_hash"]
     if hash_mismatch:

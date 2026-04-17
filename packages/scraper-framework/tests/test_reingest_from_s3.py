@@ -9796,12 +9796,14 @@ class TestProcessPrefixDocument:
         result flags ``hash_mismatch=True`` (see #2494, #2628).
 
         Previously a mismatch short-circuited with ``status="error"``, which
-        is the mechanism producing the ~4% flat-hash orphan rate on Santa
-        Clara: raws captured under a wrong content-hash filename were
+        is the mechanism that produced the ~4% flat-hash orphan rate on
+        Santa Clara: raws stored under a wrong content-hash filename were
         permanently unreingestable.  Now we log a warning, let the worker
         process the raw, and the LLM split path re-derives split-children
         from the raw content.  Mirrors the behavior already in
-        ``rebuild_db._process_one_document`` (see #2494).
+        ``rebuild_db._process_one_document`` (see #2494).  Root cause of
+        the mislabeled filenames is the 2026-03-28 one-time migration; see
+        #2638 and ``docs/investigations/mislabeled-s3-writes-2026-04.md``.
         """
         # The key claims hash "abc123" but the actual content hashes
         # elsewhere — _build_prefix_event will still use "abc123" as the
