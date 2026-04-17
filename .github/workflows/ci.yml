@@ -548,6 +548,8 @@ jobs:
         run: scripts/check-aws-bool-flags.sh
       - name: Check for forbidden ECS services-stable waiter usage
         run: scripts/check-no-ecs-wait-services-stable.sh
+      - name: Check workflows use the extracted ECS post-deploy healthcheck
+        run: scripts/check-no-inline-ecs-healthcheck.sh
       - name: Check docs describe the actual rebuild_db.py CLI
         run: scripts/check-no-rebuild-db-skip-reset.sh
       # Auto-discover and run every executable shell test under
