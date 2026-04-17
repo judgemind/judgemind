@@ -195,7 +195,7 @@ class CCSplitRuling:
     parties: list[dict[str, str]] = dataclass_field(default_factory=list)
 
 
-def _cc_llm_extract_rulings(pdf_text: str) -> list[CCSplitRuling] | None:
+def _llm_extract_rulings(pdf_text: str) -> list[CCSplitRuling] | None:
     """Extract rulings from CC department PDF text using an LLM.
 
     Sends pdfplumber-extracted text to the LLM with the Contra Costa system
@@ -205,6 +205,10 @@ def _cc_llm_extract_rulings(pdf_text: str) -> list[CCSplitRuling] | None:
     Returns a list of ``CCSplitRuling`` objects on success, or ``None``
     if the LLM call fails or the response cannot be parsed.  The caller
     should fall back to the single-doc regex path when ``None`` is returned.
+
+    The name is deliberately ``_llm_extract_rulings`` (no ``_cc_`` prefix)
+    so that ``scripts/reingest_from_s3.py`` discovers it via the
+    ``_LLM_SPLIT_REGISTRY`` attribute-name scan (#2469).
     """
     from ingestion.llm_providers import call_llm
 
@@ -560,7 +564,7 @@ class CCTentativeRulingsScraper(PdfLinkScraper):
                         pdf_judge = _cc_judge_from_pdf(text)
                         effective_judge = pdf_judge or judge_name
 
-                        llm_rulings = _cc_llm_extract_rulings(text)
+                        llm_rulings = _llm_extract_rulings(text)
                         if llm_rulings is not None:
                             for ruling in llm_rulings:
                                 doc = self._make_base_doc(
@@ -634,7 +638,20 @@ class CCTentativeRulingsScraper(PdfLinkScraper):
         return docs
 
     def parse_document(self, doc: CapturedDocument) -> CapturedDocument:
-        """Extract structured fields from CC PDF text."""
+        """Extract structured fields from CC PDF text.
+
+        If the document was pre-split by ``fetch_documents`` (via the LLM
+        extraction path), skip regex extraction — the per-ruling fields
+        (``case_number``, ``case_title``, ``ruling_text``, ``motion_type``,
+        ``outcome``, ``parties``) have already been populated from the LLM
+        response, and re-running regex over the full PDF text would
+        overwrite them with whatever matches first in the multi-case PDF.
+
+        This mirrors the Fresno and LA guards (#2469).
+        """
+        if doc.extra.get("pre_split") or doc.extra.get("_llm_extracted"):
+            return doc
+
         try:
             text = _extract_pdf_text(doc.raw_content)
             doc.ruling_text = text
