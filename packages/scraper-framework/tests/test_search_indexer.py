@@ -7,6 +7,8 @@ from io import BytesIO
 from unittest.mock import MagicMock, patch
 
 import pytest
+from opensearchpy.exceptions import ConnectionError as OSConnectionError
+from opensearchpy.exceptions import ConnectionTimeout
 
 from framework.search.indexer import (
     CONSUMER_GROUP,
@@ -733,3 +735,136 @@ class TestAlreadyIndexed:
         assert result is True
         # get() should not be called when hash is empty
         mock_opensearch.get.assert_not_called()
+
+
+class TestTransientConnectionErrors:
+    """Tests for best-effort handling of OpenSearch ConnectionTimeout / ConnectionError.
+
+    See #2481 — transient search-indexing failures must not fail the document's
+    Postgres write. OpenSearch is fully derivable from ``derived.*`` and will
+    self-heal on re-index, so these errors are logged as warnings and swallowed.
+    """
+
+    def test_index_document_returns_false_on_connection_timeout(
+        self, consumer: IndexingConsumer, mock_opensearch: MagicMock, sample_event: dict
+    ) -> None:
+        """index_document returns False (does not raise) when OpenSearch times out."""
+        mock_opensearch.get.side_effect = Exception("not found")
+        mock_opensearch.index.side_effect = ConnectionTimeout(
+            408, "read_timeout=10", "HTTPSConnectionPool timed out"
+        )
+
+        # Must not raise
+        result = consumer.index_document(sample_event)
+
+        assert result is False
+        mock_opensearch.index.assert_called_once()
+
+    def test_index_document_returns_false_on_connection_error(
+        self, consumer: IndexingConsumer, mock_opensearch: MagicMock, sample_event: dict
+    ) -> None:
+        """index_document returns False (does not raise) on ConnectionError."""
+        mock_opensearch.get.side_effect = Exception("not found")
+        mock_opensearch.index.side_effect = OSConnectionError(
+            503, "connection_error", "Unable to connect to OpenSearch"
+        )
+
+        result = consumer.index_document(sample_event)
+
+        assert result is False
+        mock_opensearch.index.assert_called_once()
+
+    def test_index_document_propagates_non_transient_error(
+        self, consumer: IndexingConsumer, mock_opensearch: MagicMock, sample_event: dict
+    ) -> None:
+        """Non-transient errors (e.g. auth, 4xx, invalid index) still propagate."""
+        mock_opensearch.get.side_effect = Exception("not found")
+        mock_opensearch.index.side_effect = ValueError("invalid index name")
+
+        with pytest.raises(ValueError, match="invalid index name"):
+            consumer.index_document(sample_event)
+
+    @patch("framework.search.indexer.helpers.bulk")
+    def test_index_batch_returns_zero_on_connection_timeout(
+        self,
+        mock_bulk: MagicMock,
+        consumer: IndexingConsumer,
+        mock_opensearch: MagicMock,
+    ) -> None:
+        """index_batch returns 0 (does not raise) when bulk times out."""
+        mock_opensearch.get.side_effect = Exception("not found")
+        mock_bulk.side_effect = ConnectionTimeout(
+            408, "read_timeout=10", "HTTPSConnectionPool timed out"
+        )
+
+        events = [
+            {
+                "document_id": f"doc-{i}",
+                "case_number": f"BC{i}",
+                "court": "Test",
+                "county": "Test",
+                "state": "CA",
+                "content_hash": f"hash{i}",
+            }
+            for i in range(3)
+        ]
+
+        # Must not raise
+        count = consumer.index_batch(events)
+
+        assert count == 0
+        mock_bulk.assert_called_once()
+
+    @patch("framework.search.indexer.helpers.bulk")
+    def test_index_batch_returns_zero_on_connection_error(
+        self,
+        mock_bulk: MagicMock,
+        consumer: IndexingConsumer,
+        mock_opensearch: MagicMock,
+    ) -> None:
+        """index_batch returns 0 (does not raise) on ConnectionError from bulk."""
+        mock_opensearch.get.side_effect = Exception("not found")
+        mock_bulk.side_effect = OSConnectionError(
+            503, "connection_error", "Unable to connect to OpenSearch"
+        )
+
+        events = [
+            {
+                "document_id": "doc-1",
+                "case_number": "BC1",
+                "court": "Test",
+                "county": "Test",
+                "state": "CA",
+                "content_hash": "h1",
+            },
+        ]
+
+        count = consumer.index_batch(events)
+
+        assert count == 0
+        mock_bulk.assert_called_once()
+
+    @patch("framework.search.indexer.helpers.bulk")
+    def test_index_batch_propagates_non_transient_error(
+        self,
+        mock_bulk: MagicMock,
+        consumer: IndexingConsumer,
+        mock_opensearch: MagicMock,
+    ) -> None:
+        """Non-transient errors from bulk (e.g. auth, 4xx) still propagate."""
+        mock_opensearch.get.side_effect = Exception("not found")
+        mock_bulk.side_effect = ValueError("invalid bulk payload")
+
+        events = [
+            {
+                "document_id": "doc-1",
+                "case_number": "BC1",
+                "court": "Test",
+                "county": "Test",
+                "state": "CA",
+                "content_hash": "h1",
+            },
+        ]
+
+        with pytest.raises(ValueError, match="invalid bulk payload"):
+            consumer.index_batch(events)

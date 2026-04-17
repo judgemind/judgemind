@@ -2889,7 +2889,17 @@ def _process_prefix_document(
         if os_url:
             from opensearchpy import OpenSearch
 
-            os_kwargs: dict = {"hosts": [os_url]}
+            # 30s timeout + 3 retries: opensearchpy defaults to 10s and no
+            # retries, which produces sporadic ``ConnectionTimeout`` entries
+            # under load (#2481).  ``IndexingConsumer`` also swallows
+            # terminal timeouts as a warning so a missed index never fails
+            # document processing.
+            os_kwargs: dict = {
+                "hosts": [os_url],
+                "timeout": 30,
+                "max_retries": 3,
+                "retry_on_timeout": True,
+            }
             os_user = os.environ.get("OPENSEARCH_USERNAME", "")
             os_pass = os.environ.get("OPENSEARCH_PASSWORD", "")
             if os_user and os_pass:

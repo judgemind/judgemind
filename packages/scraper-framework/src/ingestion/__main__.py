@@ -59,7 +59,19 @@ def main() -> None:
         redis_client = redis.Redis.from_url(redis_url, decode_responses=False)
         redis_client.ping()  # Fail fast on bad URL
 
-        os_kwargs: dict = {"hosts": [opensearch_url]}
+        # timeout/max_retries/retry_on_timeout: opensearchpy defaults to a
+        # 10s read_timeout and no retries, which produces sporadic
+        # ``ConnectionTimeout`` failures during rebuilds under load.  Bumping
+        # the timeout to 30s and enabling retries makes transient network
+        # blips self-healing; ``IndexingConsumer`` also swallows terminal
+        # timeouts as a warning so a Postgres write never gates on a flaky
+        # search backend.  See #2481.
+        os_kwargs: dict = {
+            "hosts": [opensearch_url],
+            "timeout": 30,
+            "max_retries": 3,
+            "retry_on_timeout": True,
+        }
         os_user = os.environ.get("OPENSEARCH_USERNAME", "")
         os_pass = os.environ.get("OPENSEARCH_PASSWORD", "")
         if os_user and os_pass:

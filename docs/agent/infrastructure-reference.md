@@ -105,6 +105,16 @@ scripts/ecs-task-logs.sh <task-id> --follow
 scripts/ecs-run-task.sh --cpu 2048 --memory 8192 scripts/audit_field_completeness.py
 ```
 
+**Large-county rebuilds need memory override.** `rebuild_db.py --county <name>` holds per-worker OpenSearch/Postgres clients and LLM batch state for every document in the county. At the default 4096 MB, counties with thousands of documents (Los Angeles, Santa Clara, Orange) can exit 137 (OOM). Use `--cpu 2048 --memory 8192` for these rebuilds (see #2481):
+
+```
+scripts/ecs-run-task.sh --cpu 2048 --memory 8192 scripts/rebuild_db.py -- --county "Los Angeles" --skip-reset
+scripts/ecs-run-task.sh --cpu 2048 --memory 8192 scripts/rebuild_db.py -- --county "Santa Clara" --skip-reset
+scripts/ecs-run-task.sh --cpu 2048 --memory 8192 scripts/rebuild_db.py -- --county "Orange" --skip-reset
+```
+
+Smaller counties (a few hundred documents or fewer) run fine at the 1024/4096 default.
+
 ### Reingest vs Rebuild
 
 `reingest_from_s3.py` operates on **existing database records only** — it queries the `documents` table to find S3 keys to reprocess. If you run it for a county with no records in the `documents` table, it will process 0 documents silently.
