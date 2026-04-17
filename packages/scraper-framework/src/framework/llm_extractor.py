@@ -365,6 +365,157 @@ _CALENDAR_HEADER_RE = re.compile(
 # (e.g. "GRANTED." or "DENIED.") may legitimately appear on multiple cases.
 _DEDUP_MIN_LENGTH = 200
 
+# Minimum substantive ruling text length for a ruling to be considered real
+# when its case title matches a citation pattern.  Real tentative rulings are
+# multi-paragraph analyses; citation artifacts are short blurbs summarising
+# the cited order's outcome.  See #2448.
+_CITATION_MIN_RULING_LENGTH = 400
+
+# Signals that an ``extracted_case_title`` is a legal citation to another
+# court's order rather than a primary case on the calendar.  Matches anywhere
+# in the title because the LLM sometimes prepends or interleaves citator
+# tokens with the caption.  See #2448.
+_CITATION_TITLE_SUFFIX_RE = re.compile(
+    r"("
+    # Federal district-court reporters: C.D. Cal., N.D. Cal., E.D. Cal., S.D. Cal.
+    r"\b[CNES]\.?\s*D\.?\s*Cal\.?\b"
+    # California appellate reporter: "Cal.App.5th", "Cal. App. 4th", etc.
+    r"|\bCal\.?\s*App\b"
+    # California supreme-court reporter: "9 Cal.5th 1", "123 Cal.4th 456".
+    r"|\b\d{1,3}\s+Cal\.?\s*\d+(?:st|nd|rd|th)?\b"
+    # Federal supplement reporter: "F.Supp", "F. Supp. 2d", "F.Supp.3d".
+    r"|\bF\.?\s*Supp\b"
+    # Federal reporter volumes: "F.2d", "F.3d", "F.4th".
+    r"|\bF\.\s*\d+(?:d|th)?\b"
+    # California reporter: "Cal.Rptr.", "Cal. Rptr. 3d".
+    r"|\bCal\.?\s*Rptr\b"
+    # Federal case-number form: "8:22-cv-01092", "5:21-cv-01346".
+    r"|\b\d+:\d{2}-cv-\d+"
+    # LA Superior Court old-format BC number (e.g. BC722351).
+    r"|\bBC\d{6,}\b"
+    # San Diego Superior Court compact form: "18CV475JM(BGS)".
+    r"|\b\d{2}CV\d{3,}[A-Z]{2,3}\s*\([A-Z]{2,3}\)"
+    r")",
+    re.IGNORECASE,
+)
+
+# Signals that an ``extracted_case_number`` is a citation to another
+# court's case rather than a primary case on the calendar.  When the LLM
+# enumerates cited orders, the case-number field often reveals the other
+# county even when the title is clean.  These patterns match LA Superior
+# Court formats — LASC is the single most common source of cited cases in
+# Song-Beverly Act attorney-fee orders.  Other counties' formats are
+# intentionally not enumerated here to keep the filter conservative;
+# title-based detection will catch most of them.  See #2448.
+_CITATION_CASE_NUMBER_RE = re.compile(
+    r"("
+    # LASC modern form: 21STCV23811, 22VECV01398, 18LBCV04321, etc.
+    # Two-digit year + LASC district code + 5-6 digit serial.
+    # LASC cases are never primary on the non-LA scrapers that run through
+    # this LLM path (LA uses REGEX extraction), so filtering these never
+    # drops legitimate primary cases.
+    r"\b\d{2}(?:STCV|STCP|STLC|STPB|STPR|VECV|VECP|LBCV|LBCP|"
+    r"SMCV|SMCP|CMCV|CMCP|NWCV|NWCP|PSCV|PSCP|BBCV|BBCP|CHCV|CHCP|"
+    r"GDCV|GDCP|TRCV|TRCP|AVCV|AVCP)\d{4,6}\b"
+    # LASC old format: BC\d{6,}, BS\d{6,}, SC\d{6,}, VC\d{6,}, PC\d{6,}, LC\d{6,}.
+    r"|\b(?:BC|BS|SC|VC|PC|LC|KC|NC|GC|MC|EC|YC)\d{6,}\b"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def _is_citation_artifact(ruling: ExtractedRuling) -> bool:
+    """Return True if ``ruling`` looks like a citation to another court's order.
+
+    The LLM occasionally misinterprets inline citations inside a Request for
+    Judicial Notice (common in Song-Beverly attorney-fee orders) as separate
+    cases on the calendar, producing 10-24 "rulings" for a PDF that has only
+    one primary case.  See #2448.
+
+    A ruling is flagged as a citation artifact when BOTH signals fire:
+
+    1. Either its ``extracted_case_title`` contains a citator pattern
+       (``_CITATION_TITLE_SUFFIX_RE``) OR its ``extracted_case_number``
+       matches an out-of-county LASC pattern (``_CITATION_CASE_NUMBER_RE``).
+    2. Its ``ruling_text`` is shorter than ``_CITATION_MIN_RULING_LENGTH``
+       (or is ``None``).
+
+    The length conjunction is deliberately conservative — legitimate short
+    rulings (e.g. ``outcome=off_calendar`` with a one-sentence disposition)
+    have clean case captions without citator suffixes and are not filtered.
+    Legitimate long rulings with an unusually-formatted title are also
+    exempted to avoid false positives on real cases.
+    """
+    title = ruling.extracted_case_title
+    case_number = ruling.extracted_case_number
+
+    title_hit = bool(title and _CITATION_TITLE_SUFFIX_RE.search(title))
+    case_number_hit = bool(case_number and _CITATION_CASE_NUMBER_RE.search(case_number))
+    if not title_hit and not case_number_hit:
+        return False
+
+    text = ruling.ruling_text
+    if text is None:
+        return True
+    return len(text) < _CITATION_MIN_RULING_LENGTH
+
+
+def _filter_citation_artifacts(
+    rulings: list[ExtractedRuling],
+) -> list[ExtractedRuling]:
+    """Remove citation artifacts from a list of extracted rulings (#2448).
+
+    Applies :func:`_is_citation_artifact` to each ruling.  Preserves the
+    relative order of kept rulings.
+
+    Safeguards:
+
+    * If the input has 0 or 1 entries, return it unchanged.  A single-ruling
+      document is never filtered down to zero — even if the one ruling
+      happens to match the citation pattern, emitting zero rulings would
+      produce an orphan document downstream.
+    * If every ruling in a multi-entry list is flagged as a citation
+      artifact, keep the single longest-text candidate as a fallback.  This
+      prevents ambiguous signals from emptying out a document.
+
+    Emits one ``llm_extractor.citation_filtered`` structured log per
+    removed ruling, plus a ``llm_extractor.citation_filter_fallback`` log
+    when the fallback path fires.
+    """
+    if len(rulings) <= 1:
+        return rulings
+
+    kept: list[ExtractedRuling] = []
+    removed: list[ExtractedRuling] = []
+    for ruling in rulings:
+        if _is_citation_artifact(ruling):
+            removed.append(ruling)
+            logger.info(
+                "llm_extractor.citation_filtered",
+                case_title=ruling.extracted_case_title,
+                case_number=ruling.extracted_case_number,
+                text_length=len(ruling.ruling_text) if ruling.ruling_text else 0,
+            )
+        else:
+            kept.append(ruling)
+
+    if not kept:
+        # Fallback: every candidate looked like a citation.  Keep the one
+        # with the longest ruling_text — it's the most likely real ruling.
+        longest = max(
+            removed,
+            key=lambda r: len(r.ruling_text) if r.ruling_text else 0,
+        )
+        logger.warning(
+            "llm_extractor.citation_filter_fallback",
+            original_count=len(rulings),
+            kept_case_title=longest.extracted_case_title,
+            kept_text_length=len(longest.ruling_text) if longest.ruling_text else 0,
+        )
+        return [longest]
+
+    return kept
+
 
 def _is_calendar_header(text: str | None) -> bool:
     """Return True if ``text`` looks like a calendar header, not a ruling.
@@ -766,6 +917,11 @@ class LlmExtractor:
 
             merged = self._merge_results(all_results)
             rulings = self._propagate_document_fields(merged)
+
+        # Post-processing: remove citation artifacts produced by LLM
+        # misinterpreting inline citations (Requests for Judicial Notice)
+        # as separate rulings.  See #2448.
+        rulings = _filter_citation_artifacts(rulings)
 
         # Write to cache
         if self._cache is not None and rulings:
@@ -1997,6 +2153,12 @@ def _join_page_rows(
     # The LLM sometimes produces the same ruling text for multiple cases
     # in the same PDF.  Keep only the first occurrence; null out duplicates.
     rulings = _deduplicate_ruling_texts(rulings)
+
+    # Post-processing: remove citation artifacts (#2448).
+    # When a PDF contains a Request for Judicial Notice citing many other
+    # courts' orders, the LLM may return each citation as a separate ruling.
+    # Filter those out using title+length heuristics.
+    rulings = _filter_citation_artifacts(rulings)
 
     return rulings
 
