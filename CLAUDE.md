@@ -436,6 +436,7 @@ When filing issues, acceptance criteria must be concrete and machine-checkable w
 - **Frontend changes**: include the URL and what should be visible (element, text, layout).
 - **API changes**: include the endpoint, request, and expected response shape.
 - **Behavior changes**: include the specific trigger and expected outcome.
+- **External-integration changes** (issues proposing to query a third-party website or API — court case-search endpoints, public records APIs, etc.): include a one-line HTTP feasibility note confirming the endpoint is actually usable before labeling the issue `agent/ready`. Example: `Feasibility: curl https://example.court.gov/api/search?case=123 returns JSON, no reCAPTCHA/WAF, anonymous access works`. At minimum, verify: (1) the endpoint responds to an anonymous request, (2) there is no reCAPTCHA / Cloudflare challenge / login wall on the query path, (3) the expected data is actually returned for a realistic sample. Issues without a feasibility note risk premising acceptance criteria on integrations that cannot work — see #1979 for a case where ~a day of agent time was spent on an infeasible premise.
 
 **Example — vague (bad):**
 ```

@@ -30,6 +30,17 @@ One clear sentence: what does "done" look like?
 - Cost considerations:
 - Decisions requiring human approval:
 
+<!--
+## Feasibility check (external-integration issues only)
+
+Required if this task proposes querying a third-party website or API (court case-search endpoints, public records APIs, etc.). Complete before labeling `agent/ready` — see CLAUDE.md §Writing Acceptance Criteria.
+
+- Endpoint: `https://...`
+- Anonymous access confirmed: yes/no (how verified)
+- No reCAPTCHA / Cloudflare / login wall on query path: yes/no
+- Returns expected data for a realistic sample: yes/no (sample response snippet)
+-->
+
 ## Relevant Specs
 
 - [ ] Product Spec (`docs/specs/product-spec-v3.md`) — Section:
