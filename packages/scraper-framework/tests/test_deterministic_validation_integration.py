@@ -1018,3 +1018,286 @@ def test_det_validation_cross_case_db_error_does_not_crash(
             )
             # Should not raise despite DB error during flag logging.
             worker.process_event(event)
+
+
+# ---------------------------------------------------------------------------
+# Tests: document-level deterministic validation — ruling_text case number
+# marker mismatch (#2402)
+# ---------------------------------------------------------------------------
+
+
+@patch("ingestion.worker.insert_validation_result")
+@patch(_DELETE_STALE_MOCK, return_value=0)
+@patch("ingestion.worker.psycopg")
+def test_det_validation_flag_case_number_marker_mismatch(
+    mock_psycopg: MagicMock,
+    mock_delete_stale: MagicMock,
+    mock_insert_validation: MagicMock,
+) -> None:
+    """Fresno-style ruling whose text embeds a DIFFERENT 'Superior Court Case
+    No.' marker than its own case_number should flag even when the referenced
+    number is not on the sibling list (#2402)."""
+    from ingestion.ruling_guards import ConvertedRuling
+
+    worker, os_mock = _make_worker()
+
+    mock_conn, mock_cur = _make_mock_conn()
+    mock_psycopg.connect.return_value = mock_conn
+    mock_cur.fetchone.side_effect = [
+        ("court-uuid-1",),  # upsert_court (split 0)
+        ("case-uuid-1",),  # upsert_case (split 0)
+        (True,),  # insert_document (split 0)
+        ("court-uuid-1",),  # upsert_court (split 1)
+        ("case-uuid-2",),  # upsert_case (split 1)
+        (True,),  # insert_document (split 1)
+    ]
+    mock_cur.rowcount = 1
+
+    # Split 0 is clean.  Split 1 has case_number 22CECG00930 but its
+    # ruling_text embeds "Superior Court Case No. 24CECG03313" — a case
+    # number that is NOT on the sibling list (split 0 is 25CECG01111), which
+    # makes the existing cross-case rule miss it.  The new marker-mismatch
+    # rule catches it.
+    converted = [
+        ConvertedRuling(
+            document_id="split-uuid-0",
+            original_document_id="parent-uuid-1",
+            split_index=0,
+            split_count=2,
+            is_multi=True,
+            ruling_text="Lopez v. Fresno USD: the motion is granted.",
+            case_number="25CECG01111",
+            case_title="Lopez v. Fresno USD",
+            judge_name=None,
+            department="403",
+            motion_type="Demurrer",
+            outcome="granted",
+            hearing_date="2026-03-10",
+        ),
+        ConvertedRuling(
+            document_id="split-uuid-1",
+            original_document_id="parent-uuid-1",
+            split_index=1,
+            split_count=2,
+            is_multi=True,
+            ruling_text=(
+                "Re: Tarango v. Jackson et al.\n"
+                "Superior Court Case No. 24CECG03313\n"
+                "Tentative Ruling: To deny the motion."
+            ),
+            case_number="22CECG00930",
+            case_title="Candler, Jr. v. Callender",
+            judge_name=None,
+            department="403",
+            motion_type="Demurrer",
+            outcome="denied",
+            hearing_date="2026-03-10",
+        ),
+    ]
+
+    with patch(_CONVERT_MOCK, return_value=converted):
+        with patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1"):
+            extractor_mock = MagicMock()
+            extractor_mock.extract.return_value = MagicMock(rulings=[MagicMock()] * 2)
+            worker._framework_extractor = extractor_mock
+
+            # Use the default LA county in the event so the worker's
+            # ``_llm_split_document`` uses the framework extractor (which we
+            # pre-populate above) instead of a county-specific Google extractor
+            # that needs a live API key.  The marker rule itself is
+            # county-agnostic — it operates only on ruling_text and
+            # case_number — so the county used to reach the code path does
+            # not affect what is being asserted.
+            event = _make_event(
+                ruling_text="Full document text here " * 20,
+            )
+            worker.process_event(event)
+
+    # Marker-mismatch flag should be logged exactly once, against the
+    # misattributed ruling's document_id.  Guard against duplicate hits
+    # from the cross-case rule by matching on the new reason substring.
+    marker_calls = [
+        c
+        for c in mock_insert_validation.call_args_list
+        if c.kwargs.get("result")
+        and c.kwargs["result"].model == "deterministic"
+        and "Superior Court Case No." in (c.kwargs["result"].reason or "")
+    ]
+    assert len(marker_calls) == 1, (
+        f"Expected exactly one marker-mismatch flag, got: "
+        f"{[c.kwargs.get('result') for c in mock_insert_validation.call_args_list]}"
+    )
+    marker_result = marker_calls[0].kwargs["result"]
+    assert marker_result.result == "flag"
+    assert "24CECG03313" in marker_result.reason
+    assert "22CECG00930" in marker_result.reason
+    # Flag logged against the contaminated ruling's document_id.
+    assert marker_calls[0].kwargs.get("document_id") == "split-uuid-1"
+
+
+@patch("ingestion.worker.insert_validation_result")
+@patch(_DELETE_STALE_MOCK, return_value=0)
+@patch("ingestion.worker.psycopg")
+def test_det_validation_pass_case_number_marker_matches(
+    mock_psycopg: MagicMock,
+    mock_delete_stale: MagicMock,
+    mock_insert_validation: MagicMock,
+) -> None:
+    """Ruling whose 'Superior Court Case No.' marker matches its own case
+    number should NOT flag (#2402)."""
+    from ingestion.ruling_guards import ConvertedRuling
+
+    worker, os_mock = _make_worker()
+
+    mock_conn, mock_cur = _make_mock_conn()
+    mock_psycopg.connect.return_value = mock_conn
+    mock_cur.fetchone.side_effect = [
+        ("court-uuid-1",),
+        ("case-uuid-1",),
+        (True,),
+        ("court-uuid-1",),
+        ("case-uuid-2",),
+        (True,),
+    ]
+    mock_cur.rowcount = 1
+
+    # Both rulings are clean: marker matches own case_number.
+    converted = [
+        ConvertedRuling(
+            document_id="split-uuid-0",
+            original_document_id="parent-uuid-1",
+            split_index=0,
+            split_count=2,
+            is_multi=True,
+            ruling_text=(
+                "Re: Lopez v. Fresno USD\n"
+                "Superior Court Case No. 25CECG03271\n"
+                "Tentative Ruling: To sustain."
+            ),
+            case_number="25CECG03271",
+            case_title="Lopez v. Fresno USD",
+            judge_name=None,
+            department="403",
+            motion_type="Demurrer",
+            outcome="granted",
+            hearing_date="2026-03-10",
+        ),
+        ConvertedRuling(
+            document_id="split-uuid-1",
+            original_document_id="parent-uuid-1",
+            split_index=1,
+            split_count=2,
+            is_multi=True,
+            ruling_text=(
+                "Re: Johnson v. World of Jeans\n"
+                "Superior Court Case No. 23CECG00266\n"
+                "Tentative Ruling: To deny."
+            ),
+            case_number="23CECG00266",
+            case_title="Johnson v. World of Jeans",
+            judge_name=None,
+            department="403",
+            motion_type="Motion",
+            outcome="denied",
+            hearing_date="2026-03-10",
+        ),
+    ]
+
+    with patch(_CONVERT_MOCK, return_value=converted):
+        with patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1"):
+            extractor_mock = MagicMock()
+            extractor_mock.extract.return_value = MagicMock(rulings=[MagicMock()] * 2)
+            worker._framework_extractor = extractor_mock
+
+            # Use default LA county so the framework extractor path runs.
+            event = _make_event(
+                ruling_text="Full document text here " * 20,
+            )
+            worker.process_event(event)
+
+    # No marker-mismatch flag should have been logged.
+    marker_calls = [
+        c
+        for c in mock_insert_validation.call_args_list
+        if c.kwargs.get("result")
+        and c.kwargs["result"].model == "deterministic"
+        and "Superior Court Case No." in (c.kwargs["result"].reason or "")
+    ]
+    assert len(marker_calls) == 0, (
+        f"Unexpected marker-mismatch flag: "
+        f"{[c.kwargs.get('result') for c in mock_insert_validation.call_args_list]}"
+    )
+
+
+@patch("ingestion.worker.insert_validation_result")
+@patch(_DELETE_STALE_MOCK, return_value=0)
+@patch("ingestion.worker.psycopg")
+def test_det_validation_case_number_marker_db_error_does_not_crash(
+    mock_psycopg: MagicMock,
+    mock_delete_stale: MagicMock,
+    mock_insert_validation: MagicMock,
+) -> None:
+    """If DB logging fails for a marker-mismatch flag, the worker continues (#2402)."""
+    from ingestion.ruling_guards import ConvertedRuling
+
+    mock_insert_validation.side_effect = RuntimeError("DB connection lost")
+
+    worker, os_mock = _make_worker()
+
+    mock_conn, mock_cur = _make_mock_conn()
+    mock_psycopg.connect.return_value = mock_conn
+    mock_cur.fetchone.side_effect = [
+        ("court-uuid-1",),
+        ("case-uuid-1",),
+        (True,),
+        ("court-uuid-1",),
+        ("case-uuid-2",),
+        (True,),
+    ]
+    mock_cur.rowcount = 1
+
+    converted = [
+        ConvertedRuling(
+            document_id="split-uuid-0",
+            original_document_id="parent-uuid-1",
+            split_index=0,
+            split_count=2,
+            is_multi=True,
+            ruling_text="Lopez v. Fresno USD: motion granted.",
+            case_number="25CECG01111",
+            case_title="Lopez v. Fresno USD",
+            judge_name=None,
+            department="403",
+            motion_type=None,
+            outcome=None,
+            hearing_date="2026-03-10",
+        ),
+        ConvertedRuling(
+            document_id="split-uuid-1",
+            original_document_id="parent-uuid-1",
+            split_index=1,
+            split_count=2,
+            is_multi=True,
+            ruling_text=("Superior Court Case No. 24CECG03313\nTentative Ruling: To deny."),
+            case_number="22CECG00930",
+            case_title="Candler, Jr. v. Callender",
+            judge_name=None,
+            department="403",
+            motion_type=None,
+            outcome=None,
+            hearing_date="2026-03-10",
+        ),
+    ]
+
+    with patch(_CONVERT_MOCK, return_value=converted):
+        with patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1"):
+            extractor_mock = MagicMock()
+            extractor_mock.extract.return_value = MagicMock(rulings=[MagicMock()] * 2)
+            worker._framework_extractor = extractor_mock
+
+            # Use default LA county so the framework extractor path runs.
+            event = _make_event(
+                ruling_text="Full document text here " * 20,
+            )
+            # Should not raise despite DB error during flag logging.
+            worker.process_event(event)

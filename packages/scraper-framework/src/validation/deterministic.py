@@ -97,6 +97,24 @@ _CASE_NUMBER_CANDIDATE_PATTERN = re.compile(
     re.IGNORECASE | re.VERBOSE,
 )
 
+# Pattern for the "Superior Court Case No." marker commonly present in Fresno
+# (and some other CA county) ruling header blocks.  Used by
+# ``check_ruling_text_case_number_marker`` (#2402) to flag rulings whose text
+# embeds a DIFFERENT case number than the ruling's own ``case_number`` —
+# strong evidence of LLM cross-case misattribution even when the referenced
+# number is not a known sibling (e.g. when the LLM dropped an entry entirely
+# so the "wrong" number never reaches the sibling list).
+#
+# Matches (case-insensitive): "Superior Court Case No.", "Superior Court Case
+# No ", "Superior Court Case Nos.", "Court Case No.", with optional trailing
+# period and flexible whitespace before the case number.  The captured group
+# is the raw case-number token (uppercase letters, digits, hyphens); the
+# caller normalises via ``_normalize_case_number`` before comparison.
+_SUPERIOR_COURT_CASE_NO_PATTERN = re.compile(
+    r"(?:Superior\s+)?Court\s+Case\s+Nos?\.?\s+([A-Z0-9][A-Z0-9\-]{3,})",
+    re.IGNORECASE,
+)
+
 
 # ---------------------------------------------------------------------------
 # Data types
@@ -398,6 +416,75 @@ def check_no_cross_case_ruling_text(
     return DeterministicRuleResult(rule="no_cross_case_ruling_text", result="pass")
 
 
+def check_ruling_text_case_number_marker(
+    ruling_text: str | None,
+    own_case_number: str | None,
+) -> DeterministicRuleResult:
+    """Check that any "Superior Court Case No." marker matches own case number.
+
+    Fresno (and similar CA county) ruling PDFs embed a case-number marker
+    directly in the header block of each ruling, e.g.::
+
+        Re:  Lopez v. Fresno Unified School District
+             Superior Court Case No. 25CECG03271
+
+    When the LLM extracts ruling_text, the marker travels with the body.  If
+    the LLM then attaches that body to a DIFFERENT case's metadata, the
+    embedded marker no longer matches the ruling's ``case_number``.  This is
+    a strong signal of cross-case misattribution even when the referenced
+    number does not appear on the sibling list (e.g. when the LLM dropped an
+    entry entirely — #2402).
+
+    Unlike ``check_no_cross_case_ruling_text``, this rule does **not** require
+    a sibling context.  It only needs the ruling's own case number.
+
+    Parameters
+    ----------
+    ruling_text:
+        The ruling text to scan for ``Superior Court Case No. XXXXX`` markers.
+    own_case_number:
+        The ruling's extracted case number.  Must be non-empty for the rule
+        to flag — without an own number, there is nothing to compare against.
+
+    Returns
+    -------
+    DeterministicRuleResult
+        ``flag`` if any marker references a case number that normalises to a
+        different value than ``own_case_number``; ``pass`` otherwise.
+    """
+    if not ruling_text:
+        return DeterministicRuleResult(rule="ruling_text_case_number_marker", result="pass")
+
+    own_norm = _normalize_case_number(own_case_number)
+    if not own_norm:
+        # Without a reliable own case number, we cannot compare.
+        return DeterministicRuleResult(rule="ruling_text_case_number_marker", result="pass")
+
+    mismatched: set[str] = set()
+    for match in _SUPERIOR_COURT_CASE_NO_PATTERN.finditer(ruling_text):
+        marker_raw = match.group(1)
+        marker_norm = _normalize_case_number(marker_raw)
+        if not marker_norm:
+            continue
+        if marker_norm != own_norm:
+            mismatched.add(marker_norm)
+
+    if mismatched:
+        mismatched_sorted = sorted(mismatched)
+        own_display = _normalize_case_number(own_case_number) or "<none>"
+        return DeterministicRuleResult(
+            rule="ruling_text_case_number_marker",
+            result="flag",
+            reason=f"ruling_text contains 'Superior Court Case No.' marker(s) "
+            f"for {len(mismatched_sorted)} different case number(s) "
+            f"({', '.join(mismatched_sorted)}) but the ruling's own "
+            f"case_number is {own_display} — likely cross-case ruling text "
+            "misattribution",
+        )
+
+    return DeterministicRuleResult(rule="ruling_text_case_number_marker", result="pass")
+
+
 def check_ruling_text_reasonable_length(ruling_text: str | None) -> DeterministicRuleResult:
     """Check that ruling_text length is not exactly the truncation sentinel.
 
@@ -461,6 +548,7 @@ def run_deterministic_rules(
         check_ruling_text_not_empty(ruling_text),
         check_case_number_not_unknown(case_number),
         check_ruling_text_reasonable_length(ruling_text),
+        check_ruling_text_case_number_marker(ruling_text, case_number),
     ]
 
     # Cross-case contamination check only runs when the caller supplies
