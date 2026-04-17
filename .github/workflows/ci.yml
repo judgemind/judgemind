@@ -546,6 +546,8 @@ jobs:
         run: pytest scripts/tests/ -v --tb=short
       - name: Check AWS CLI boolean flag usage
         run: scripts/check-aws-bool-flags.sh
+      - name: Check for forbidden 'aws ecs wait services-stable' usage
+        run: scripts/check-no-ecs-wait-services-stable.sh
       # Auto-discover and run every executable shell test under
       # scripts/tests/*.sh. Replaces the old per-script listing (#2505) so
       # that adding a new shell test is just `touch + chmod +x` — no
