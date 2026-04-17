@@ -85,6 +85,26 @@ If lint fails: `.venv/bin/ruff check --fix src/ tests/` then `.venv/bin/ruff for
 
 Common ruff pitfalls: **I001** (unsorted imports, `--fix` resolves), **F401** (unused imports, remove them), **UP017** (use `datetime.now(datetime.UTC)`). Format and lint are **separate commands** — run BOTH.
 
+### Test assertion hygiene (enforced in CI)
+
+Blind exception swallows inside test files hide bugs: if the call under test raises, the test silently passes on a never-executed code path (see #2443). CI enforces this via `scripts/check-test-except-pass.sh`, which forbids the following patterns inside any file under a `tests/` directory:
+
+- `try: ... except: pass`
+- `try: ... except Exception: pass`
+- `try: ... except BaseException: pass`
+- `try: ... except (Exception, ...): pass`
+
+**Escape hatch.** If a swallow is truly necessary (e.g. best-effort teardown cleanup where the exception is irrelevant to the test), append `# noqa: BLE001` to the `except` line:
+
+```python
+try:
+    shutil.rmtree(tmp)
+except Exception:  # noqa: BLE001
+    pass
+```
+
+Prefer narrowing the handler (`except FileNotFoundError:`) or logging the exception over the escape hatch — the goal is to keep blind swallows out of assertion paths.
+
 ### Coverage gates (enforced in CI)
 
 - **Diff coverage:** new/changed lines must have >= 90% test coverage. CI runs `diff-cover` against `coverage.xml` (Python) or `lcov.info` (TypeScript).
