@@ -28,6 +28,10 @@ data "aws_secretsmanager_secret" "courtlistener_api_token" {
   name = "judgemind/courtlistener/api-token"
 }
 
+data "aws_secretsmanager_secret" "capsolver_api_key" {
+  name = "judgemind/capsolver/api-key"
+}
+
 module "networking" {
   source      = "../../modules/networking"
   environment = "dev"
@@ -112,6 +116,7 @@ module "compute" {
   google_api_key_secret_arn          = data.aws_secretsmanager_secret.google_api_key.arn
   proxy_secret_arn                   = data.aws_secretsmanager_secret.residential_proxy.arn
   courtlistener_api_token_secret_arn = data.aws_secretsmanager_secret.courtlistener_api_token.arn
+  capsolver_api_key_secret_arn       = data.aws_secretsmanager_secret.capsolver_api_key.arn
 
   # Dev: 1 vCPU, 2 GB RAM, daily schedule at 6 AM PT
   # Matches production to prevent OOM kills during the full 17-scraper run.

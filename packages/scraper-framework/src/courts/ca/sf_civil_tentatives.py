@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
 import time
 from dataclasses import dataclass
@@ -55,6 +56,7 @@ from framework import BaseScraper, CapturedDocument, ContentFormat, ScheduleWind
 from framework.browser import apply_stealth as _apply_stealth
 from framework.events import EventBus
 from framework.storage import S3Archiver
+from framework.turnstile_solver import solve_turnstile
 
 logger = structlog.get_logger(__name__)
 
@@ -72,6 +74,18 @@ CIVIL_REST_BASE = f"{CIVIL_API_URL}/datasnap/rest/TServerMethods1/GetRulings"
 # CAPTCHA gateway URL — Turnstile challenge page with referrer to tr.dll.
 CAPTCHA_GATEWAY_URL = "https://webapps.sftc.org/captcha/captcha.dll"
 
+# Cloudflare Turnstile sitekey embedded in the CAPTCHA gateway page's
+# ``data-sitekey`` attribute. Used for CAPSolver-assisted session
+# acquisition (see ``_try_acquire_session_with_solver``).
+TURNSTILE_SITEKEY = "0x4AAAAAAAhseTmUbrk0U5ab"
+
+# Environment variable name for the CAPSolver API key. When set, the
+# scraper uses CAPSolver to deterministically solve the Turnstile
+# challenge. When unset, the scraper falls back to stealth-only auto-solve
+# polling (the legacy path — useful for local dev/tests that don't want
+# to hit CAPSolver).
+CAPSOLVER_API_KEY_ENV_VAR = "CAPSOLVER_API_KEY"
+
 # Turnstile challenge timeout (seconds) — how long to wait for auto-solve.
 TURNSTILE_TIMEOUT = 45.0
 
@@ -84,6 +98,56 @@ SESSION_MAX_RETRIES = 3
 # Regex to extract seshID from the page JavaScript.
 # Matches: var seshID="<hex_string>";
 _SESH_ID_RE = re.compile(r'var\s+seshID\s*=\s*"([A-Fa-f0-9]+)"')
+
+# JavaScript injected into the CAPTCHA page after CAPSolver returns a
+# Turnstile response token. Populates the reCAPTCHA-style hidden input
+# used by Turnstile's compat=recaptcha mode, then invokes the site's
+# ``recaptchaCallBack`` function which submits the form. Also tries the
+# Turnstile-native response input name as a defensive fallback in case
+# the widget renders in non-compat mode on some future deploy. Returns
+# a boolean indicating whether the callback was invoked.
+_TURNSTILE_INJECTION_JS = """
+(token) => {
+    // Populate reCAPTCHA-compat hidden input (primary).
+    let inputs = document.querySelectorAll(
+        'textarea[name="g-recaptcha-response"], input[name="g-recaptcha-response"]'
+    );
+    if (inputs.length === 0) {
+        // Defensive: create the hidden input inside the form if Turnstile
+        // hasn't rendered one yet.
+        const form = document.querySelector('form#WebForm') || document.forms[0];
+        if (form) {
+            const ta = document.createElement('textarea');
+            ta.name = 'g-recaptcha-response';
+            ta.style.display = 'none';
+            form.appendChild(ta);
+            inputs = [ta];
+        }
+    }
+    inputs.forEach((el) => { el.value = token; });
+
+    // Also populate Turnstile-native response input if present
+    // (covers non-compat-recaptcha mode).
+    const cfInputs = document.querySelectorAll(
+        'input[name="cf-turnstile-response"], textarea[name="cf-turnstile-response"]'
+    );
+    cfInputs.forEach((el) => { el.value = token; });
+
+    // Invoke the page's callback, which submits the form.
+    if (typeof window.recaptchaCallBack === 'function') {
+        window.recaptchaCallBack(token);
+        return true;
+    }
+
+    // Fallback: submit the form directly.
+    const form = document.querySelector('form#WebForm') || document.forms[0];
+    if (form) {
+        form.submit();
+        return true;
+    }
+    return false;
+}
+"""
 
 # RulingID → department mapping.
 # Each entry defines the department and a description of the motion types.
@@ -668,6 +732,23 @@ class SFCivilTentativeRulingsScraper(BaseScraper):
     async def _try_acquire_session(self, async_playwright: Any) -> str | None:
         """Single attempt to acquire a session via Playwright.
 
+        The flow has two branches:
+
+        1. **CAPSolver-assisted (preferred, deterministic)**: when the
+           ``CAPSOLVER_API_KEY`` env var is set, call the CAPSolver API to
+           obtain a Turnstile response token, inject it into the hidden
+           ``g-recaptcha-response`` input, and invoke the site's
+           ``recaptchaCallBack`` JavaScript callback, which submits the
+           form and redirects to ``tr.dll?RulingID=N`` where seshID lives.
+
+        2. **Stealth fallback (legacy)**: when the env var is absent,
+           apply stealth evasions and poll for the CAPTCHA to
+           auto-resolve. This worked historically but became unreliable
+           in interactive mode (see #2619).
+
+        Both branches end by calling ``_wait_for_session`` to extract the
+        seshID from the post-CAPTCHA page.
+
         Args:
             async_playwright: The async_playwright context manager factory.
 
@@ -706,7 +787,9 @@ class SFCivilTentativeRulingsScraper(BaseScraper):
 
                 page = await context.new_page()
 
-                # Apply stealth evasions to pass Turnstile
+                # Apply stealth evasions. These still help even with
+                # CAPSolver because the post-CAPTCHA tr.dll page also
+                # performs bot checks.
                 await _apply_stealth(page)
 
                 # Use the first RulingID as the CAPTCHA referrer — all
@@ -722,13 +805,94 @@ class SFCivilTentativeRulingsScraper(BaseScraper):
                     wait_until="domcontentloaded",
                 )
 
-                # Wait for Turnstile to auto-solve and redirect to tr.dll page.
-                # The CAPTCHA page redirects to tr.dll?RulingID=N after solving.
+                # Branch on CAPSolver availability.
+                api_key = os.environ.get(CAPSOLVER_API_KEY_ENV_VAR, "")
+                if api_key:
+                    submitted = await self._submit_captcha_with_solver(
+                        page=page,
+                        captcha_url=captcha_url,
+                        api_key=api_key,
+                    )
+                    if not submitted:
+                        # Solver failed — fall back to stealth polling to
+                        # give auto-solve a chance before declaring defeat.
+                        self._log.info(
+                            "Falling back to stealth polling after solver failure",
+                        )
+
+                # Wait for the page to navigate to tr.dll and extract seshID.
+                # Works for both branches: CAPSolver-triggered redirect or
+                # stealth auto-solve.
                 session_id = await self._wait_for_session(page)
                 return session_id
 
             finally:
                 await browser.close()
+
+    async def _submit_captcha_with_solver(
+        self,
+        page: Any,
+        captcha_url: str,
+        api_key: str,
+    ) -> bool:
+        """Solve the Turnstile CAPTCHA via CAPSolver and submit the form.
+
+        Calls the CAPSolver API for a Turnstile response token, injects it
+        into the hidden ``g-recaptcha-response`` input, and invokes the
+        page's ``recaptchaCallBack(token)`` JavaScript callback (the SF
+        CAPTCHA page uses Turnstile in ``compat=recaptcha`` mode, so the
+        form uses the reCAPTCHA-style hidden input + callback). The
+        callback submits the form and triggers the redirect to tr.dll.
+
+        Args:
+            page: The Playwright page object (already on the CAPTCHA URL).
+            captcha_url: The CAPTCHA gateway URL, passed to CAPSolver as
+                ``websiteURL`` so Turnstile's server-side validation
+                matches the sitekey/origin pair.
+            api_key: The CAPSolver API key.
+
+        Returns:
+            True if the solver returned a token and injection succeeded;
+            False on any failure (solver returned None, JS injection
+            raised, etc.). Caller should fall back to stealth polling.
+        """
+        self._log.info(
+            "Requesting Turnstile solve from CAPSolver",
+            sitekey=TURNSTILE_SITEKEY,
+        )
+
+        token = await solve_turnstile(
+            sitekey=TURNSTILE_SITEKEY,
+            page_url=captcha_url,
+            api_key=api_key,
+        )
+
+        if not token:
+            self._log.warning(
+                "CAPSolver returned no token — falling back to stealth polling",
+            )
+            return False
+
+        # Inject the token and submit the form. The SF gateway page uses
+        # Turnstile in compat=recaptcha mode, so the widget renders a
+        # hidden input named ``g-recaptcha-response`` (some pages also
+        # have ``cf-turnstile-response``), and defines a global
+        # ``recaptchaCallBack`` function that submits the form.
+        js = _TURNSTILE_INJECTION_JS
+        try:
+            await page.evaluate(js, token)
+        except Exception as exc:  # noqa: BLE001 — any JS error is non-fatal
+            self._log.warning(
+                "Failed to inject Turnstile token into page",
+                error=str(exc),
+            )
+            return False
+
+        self._log.info(
+            "Submitted CAPSolver token to page, awaiting redirect",
+            token_prefix=token[:16] if len(token) >= 16 else token,
+        )
+        return True
 
     async def _wait_for_session(self, page: Any) -> str | None:
         """Wait for the Turnstile CAPTCHA to solve and extract the session ID.

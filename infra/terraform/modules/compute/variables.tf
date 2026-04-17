@@ -141,6 +141,12 @@ variable "courtlistener_api_token_secret_arn" {
   default     = ""
 }
 
+variable "capsolver_api_key_secret_arn" {
+  description = "ARN of the Secrets Manager secret holding the CAPSolver API key (plain string). When set, CAPSOLVER_API_KEY is injected into the scraper container, enabling deterministic Cloudflare Turnstile solves (e.g. SF civil tentatives). When unset, scrapers fall back to stealth-only Turnstile auto-solve."
+  type        = string
+  default     = ""
+}
+
 variable "proxy_secret_arn" {
   description = "ARN of the Secrets Manager secret holding the residential proxy URL (plain string). When set, SD_PROXY_URL is injected into the scraper container."
   type        = string

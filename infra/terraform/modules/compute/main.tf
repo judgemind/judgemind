@@ -165,6 +165,12 @@ resource "aws_ecs_task_definition" "scraper" {
             valueFrom = var.courtlistener_api_token_secret_arn
           }
         ] : [],
+        var.capsolver_api_key_secret_arn != "" ? [
+          {
+            name      = "CAPSOLVER_API_KEY"
+            valueFrom = var.capsolver_api_key_secret_arn
+          }
+        ] : [],
         var.proxy_secret_arn != "" ? [
           {
             name      = "SD_PROXY_URL"
@@ -348,6 +354,29 @@ resource "aws_iam_role_policy" "ecs_task_execution_courtlistener_secret" {
         Effect   = "Allow"
         Action   = "secretsmanager:GetSecretValue"
         Resource = var.courtlistener_api_token_secret_arn
+      }
+    ]
+  })
+}
+
+# Allow the task execution role to fetch the CAPSolver API key secret
+# so ECS can inject CAPSOLVER_API_KEY into the scraper container.
+# Used by scrapers that need deterministic Cloudflare Turnstile solves
+# (e.g. SF civil tentatives on webapps.sftc.org). See #2623.
+resource "aws_iam_role_policy" "ecs_task_execution_capsolver_secret" {
+  count = var.capsolver_api_key_secret_arn != "" ? 1 : 0
+
+  name = "judgemind-ecs-execution-capsolver-secret-${var.environment}"
+  role = aws_iam_role.ecs_task_execution.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid      = "ReadCAPSolverSecret"
+        Effect   = "Allow"
+        Action   = "secretsmanager:GetSecretValue"
+        Resource = var.capsolver_api_key_secret_arn
       }
     ]
   })
