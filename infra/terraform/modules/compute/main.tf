@@ -175,6 +175,13 @@ resource "aws_ecs_task_definition" "scraper" {
           {
             name      = "SD_PROXY_URL"
             valueFrom = var.proxy_secret_arn
+          },
+          {
+            # SF civil scraper reads the same residential proxy secret
+            # under a scraper-specific env var. Both scrapers share the
+            # secret in dev (see #2622); no secret re-provisioning needed.
+            name      = "SF_PROXY_URL"
+            valueFrom = var.proxy_secret_arn
           }
         ] : []
       )
@@ -318,7 +325,8 @@ resource "aws_iam_role_policy" "ecs_task_execution_secrets" {
 }
 
 # Allow the task execution role to fetch the residential proxy secret so ECS
-# can inject SD_PROXY_URL into the scraper container at launch.
+# can inject SD_PROXY_URL and SF_PROXY_URL into the scraper container at launch
+# (both env vars resolve to the same secret value — see #2622).
 resource "aws_iam_role_policy" "ecs_task_execution_proxy_secret" {
   count = var.proxy_secret_arn != "" ? 1 : 0
 

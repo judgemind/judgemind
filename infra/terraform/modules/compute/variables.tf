@@ -148,7 +148,7 @@ variable "capsolver_api_key_secret_arn" {
 }
 
 variable "proxy_secret_arn" {
-  description = "ARN of the Secrets Manager secret holding the residential proxy URL (plain string). When set, SD_PROXY_URL is injected into the scraper container."
+  description = "ARN of the Secrets Manager secret holding the residential proxy URL (plain string). When set, SD_PROXY_URL and SF_PROXY_URL are both injected into the scraper container from the same secret (SD scraper uses the former, SF civil scraper uses the latter per #2622)."
   type        = string
   default     = ""
 }

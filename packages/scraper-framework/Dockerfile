@@ -45,6 +45,16 @@ RUN pip install --no-cache-dir playwright \
     && playwright install chromium --with-deps \
     && chmod -R o+rx /opt/playwright-browsers
 
+# Install Patchright's Chromium into the same shared path. Patchright is
+# a stealth-optimized Playwright fork used by the SF civil scraper (see
+# #2622); it respects ``PLAYWRIGHT_BROWSERS_PATH`` for browser lookup, so
+# installing here puts its bundled Chrome channel alongside the stock
+# chromium build. ``--with-deps`` is a no-op when the system libs are
+# already present (they were installed for playwright above) but is
+# harmless to re-run.
+RUN patchright install chromium --with-deps \
+    && chmod -R o+rx /opt/playwright-browsers
+
 # Fail the build if the conflicting old Google AI SDK crept back in.
 # google-generativeai and google-genai share the google.genai namespace;
 # having both installed breaks client.models.generate_content().
