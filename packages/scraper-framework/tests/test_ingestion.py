@@ -310,34 +310,48 @@ def test_process_event_event_fields_override_regex(
 
 @patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
 @patch("ingestion.worker.psycopg")
-def test_process_event_no_case_number_falls_back_to_unknown(
+def test_process_event_no_case_number_and_no_title_is_rejected(
     mock_psycopg: MagicMock, mock_resolve_judge: MagicMock
 ) -> None:
-    """Events without case_number AND no extractable case number in ruling_text
-    use a synthetic UNKNOWN- case number."""
+    """#2571 — events missing BOTH case_number and case_title are rejected.
+
+    Previously, events with no extractable case_number fell back to a
+    synthetic UNKNOWN- placeholder and were written to the DB (flag-only
+    behaviour).  The #2571 Layer 3 deterministic rule now rejects rulings
+    where both case_number is UNKNOWN- AND case_title is null/empty —
+    the hallmark of a bad LLM-split fragment.  The rejection is logged as
+    a deterministic fail in validation_results; no case/document row is
+    inserted.
+    """
     worker, _ = _make_worker()
 
     mock_conn, mock_cur = _make_mock_conn()
     mock_psycopg.connect.return_value = mock_conn
-    mock_cur.fetchone.side_effect = [
-        ("court-uuid-1",),  # upsert_court
-        ("case-uuid-1",),  # upsert_case
-        (True,),  # insert_document: RETURNING is_new = True
-    ]
+    # Only the validation_results insert will run — not upsert_case/insert_document.
     mock_cur.rowcount = 1
 
     doc_id = "bbbbbbbb-0000-0000-0000-000000000002"
-    # ruling_text has no case number patterns — should fall back to UNKNOWN
+    # ruling_text has no case number patterns — no case_title either.
     event = _make_event(
         case_number=None,
         document_id=doc_id,
         ruling_text="The motion for summary judgment is GRANTED.",
     )
+    # Remove case_title from event to ensure it's None at worker entry
+    event.pop("case_title", None)
     worker.process_event(event)
 
-    # Verify that a synthetic case number was upserted
+    # Verify that the deterministic fail was logged with the UNKNOWN case
+    # number recorded in the reason (i.e. the validation layer saw it),
+    # but no case/document row was written.
     all_sql = " ".join(str(c) for c in mock_cur.execute.call_args_list)
-    assert f"UNKNOWN-{doc_id}" in all_sql
+    # The deterministic validation entry for the rejected row is logged.
+    assert "deterministic" in all_sql
+    assert "INSERT INTO validation_results" in all_sql
+    # No case/document row is inserted because the row was rejected before
+    # the DB write path.
+    assert "INSERT INTO cases" not in all_sql
+    assert "INSERT INTO documents" not in all_sql
 
 
 @patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
@@ -4452,6 +4466,115 @@ def test_llm_enrichment_fills_missing_fields(
 
     mock_enrich_ruling.assert_called_once()
     mock_conn.commit.assert_called_once()
+
+
+@patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
+@patch("framework.llm_enrichment.enrich_ruling")
+@patch("ingestion.worker.psycopg")
+def test_llm_enrichment_skipped_for_bad_split_fragment(
+    mock_psycopg: MagicMock,
+    mock_enrich_ruling: MagicMock,
+    mock_resolve_judge: MagicMock,
+) -> None:
+    """#2571 — LLM enrichment must NOT run when both case_number and case_title are empty.
+
+    When a CC LLM splitter over-splits a multi-Issue MSJ/MSA ruling into
+    per-Issue fragments, each fragment lacks both case_number and case_title.
+    Running the enrichment LLM on such fragments pollutes motion_type with
+    'motion_for_summary_adjudication' because the fragment text mentions
+    'summary adjudication'.  The worker must skip enrichment in this case
+    and leave motion_type=None so the Layer 3 deterministic rule can reject
+    the row before DB write.
+    """
+    worker, os_mock = _make_worker()
+    worker._llm_enrichment_enabled = True
+    worker._enrichment_client = MagicMock()
+
+    mock_conn, mock_cur = _make_mock_conn()
+    mock_psycopg.connect.return_value = mock_conn
+    mock_cur.rowcount = 1
+    # Only the first two fetchones are needed because the row will be
+    # rejected by the Layer 3 deterministic validation fail — no document
+    # insert or party batch will occur.
+    mock_cur.fetchone.side_effect = [
+        ("court-uuid-1",),  # upsert_court
+        ("case-uuid-1",),  # upsert_case (called before det rules run)
+    ]
+
+    # Event with no case_number and no case_title — simulating a bad-split
+    # fragment from the CC LLM over-splitter.  Ruling text references
+    # "summary adjudication" which would normally trigger the enrichment
+    # LLM to return motion_type=motion_for_summary_adjudication.
+    event = _make_event(
+        case_number=None,
+        case_title=None,
+        outcome=None,
+        motion_type=None,
+        ruling_text=(
+            "Issue Three: The Court finds that defendant has established "
+            "entitlement to summary adjudication of the breach of contract "
+            "claim in the cross-complaint.  Accordingly, summary "
+            "adjudication is GRANTED as to Issue Three."
+        ),
+    )
+    event.pop("parties", None)
+
+    worker.process_event(event)
+
+    # CRITICAL: enrich_ruling must NOT be called for bad-split fragments.
+    mock_enrich_ruling.assert_not_called()
+
+
+@patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
+@patch("framework.llm_enrichment.enrich_ruling")
+@patch("ingestion.worker.psycopg")
+def test_llm_enrichment_still_runs_when_only_case_number_missing(
+    mock_psycopg: MagicMock,
+    mock_enrich_ruling: MagicMock,
+    mock_resolve_judge: MagicMock,
+) -> None:
+    """#2571 — enrichment still runs when only ONE of case_number/case_title is missing.
+
+    The skip condition is narrow: BOTH must be empty.  A ruling with a
+    case_title but no case_number is NOT a bad-split fragment — it may
+    just be a ruling where the case_number extraction missed, which can
+    be healed later by cross-case title lookup.
+    """
+    from framework.llm_enrichment import LlmEnrichmentResult
+
+    mock_enrich_ruling.return_value = LlmEnrichmentResult(
+        motion_type="demurrer",
+        outcome="granted",
+    )
+
+    worker, os_mock = _make_worker()
+    worker._llm_enrichment_enabled = True
+    worker._enrichment_client = MagicMock()
+
+    mock_conn, mock_cur = _make_mock_conn()
+    mock_psycopg.connect.return_value = mock_conn
+    mock_cur.rowcount = 1
+    mock_cur.fetchone.side_effect = [
+        ("court-uuid-1",),
+        ("case-uuid-1",),
+        (True,),
+    ]
+    mock_cur.fetchall.return_value = []
+    mock_cur.nextset.side_effect = [False]
+
+    # case_title present, case_number missing — should still enrich.
+    event = _make_event(
+        case_number=None,
+        case_title="Smith v. Jones",
+        outcome=None,
+        motion_type=None,
+        ruling_text="The demurrer is SUSTAINED.",
+    )
+
+    worker.process_event(event)
+
+    # Enrichment must be called — only one of the two fields was missing.
+    mock_enrich_ruling.assert_called_once()
 
 
 @patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")

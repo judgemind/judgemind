@@ -267,6 +267,45 @@ def check_case_number_not_unknown(case_number: str | None) -> DeterministicRuleR
     return DeterministicRuleResult(rule="case_number_not_unknown", result="pass")
 
 
+def check_unknown_and_null_title_fail(
+    case_number: str | None,
+    case_title: str | None,
+) -> DeterministicRuleResult:
+    """Reject rulings with BOTH a synthetic UNKNOWN- case_number AND a null/empty title.
+
+    This is a narrow, high-confidence rejection rule (#2571).  When both the
+    case number and the case title are missing after all extraction and
+    enrichment paths have run, the ruling is almost certainly an orphaned
+    fragment of a bad LLM split — for example, a multi-Issue MSJ/MSA ruling
+    that was over-split into per-Issue fragments, each of which lacks case
+    metadata because that only appears at the top of the parent entry.
+
+    Storing such fragments pollutes the DB with UNKNOWN-prefixed cases and
+    wrong motion types.  This rule returns ``fail`` (not ``flag``) so the
+    caller skips the DB write entirely, ensuring that the 3-way extraction
+    failure (UNKNOWN case_number + NULL title + wrong motion_type) described
+    in #2571 cannot reach ``derived.rulings``.
+
+    The sibling rule ``check_case_number_not_unknown`` keeps its ``flag``
+    behaviour for rulings that have a title but no case_number — those can
+    still be healed later by cross-case title lookup and are safer to keep.
+    """
+    has_unknown_case_number = case_number is not None and case_number.startswith("UNKNOWN-")
+    has_empty_title = case_title is None or not case_title.strip()
+
+    if has_unknown_case_number and has_empty_title:
+        return DeterministicRuleResult(
+            rule="unknown_and_null_title_fail",
+            result="fail",
+            reason=(
+                "case_number starts with 'UNKNOWN-' AND case_title is "
+                "null/empty — ruling is almost certainly a bad-split "
+                "fragment (see #2571); rejecting to protect DB integrity"
+            ),
+        )
+    return DeterministicRuleResult(rule="unknown_and_null_title_fail", result="pass")
+
+
 def check_no_duplicate_ruling_text(
     ruling_text_lengths: list[int | None],
 ) -> DeterministicRuleResult:
@@ -547,6 +586,7 @@ def run_deterministic_rules(
         check_no_multiple_adversarial_patterns(case_title),
         check_ruling_text_not_empty(ruling_text),
         check_case_number_not_unknown(case_number),
+        check_unknown_and_null_title_fail(case_number, case_title),
         check_ruling_text_reasonable_length(ruling_text),
         check_ruling_text_case_number_marker(ruling_text, case_number),
     ]

@@ -19,6 +19,7 @@ from validation.deterministic import (
     check_ruling_text_case_number_marker,
     check_ruling_text_not_empty,
     check_ruling_text_reasonable_length,
+    check_unknown_and_null_title_fail,
     run_deterministic_rules,
 )
 
@@ -283,6 +284,60 @@ class TestCaseNumberNotUnknown:
         result = check_case_number_not_unknown("UNKNOWN-abc123")
         assert result.result == "flag"
         assert "UNKNOWN-" in (result.reason or "")
+
+
+# ---------------------------------------------------------------------------
+# unknown_and_null_title_fail (#2571)
+# ---------------------------------------------------------------------------
+
+
+class TestUnknownAndNullTitleFail:
+    """Tests for the unknown_and_null_title_fail rule (#2571).
+
+    This rule returns ``fail`` (not ``flag``) for the narrow combination
+    of UNKNOWN- case_number AND null/empty case_title — the classic
+    signature of a bad LLM-split fragment (e.g. a multi-Issue MSJ/MSA
+    ruling that got over-split into per-Issue fragments).
+    """
+
+    def test_fail_unknown_case_number_and_null_title(self) -> None:
+        result = check_unknown_and_null_title_fail("UNKNOWN-abc123", None)
+        assert result.result == "fail"
+        assert "UNKNOWN-" in (result.reason or "")
+        assert "null" in (result.reason or "").lower() or "empty" in (result.reason or "").lower()
+
+    def test_fail_unknown_case_number_and_empty_string_title(self) -> None:
+        result = check_unknown_and_null_title_fail("UNKNOWN-abc123", "")
+        assert result.result == "fail"
+
+    def test_fail_unknown_case_number_and_whitespace_title(self) -> None:
+        result = check_unknown_and_null_title_fail("UNKNOWN-abc123", "   ")
+        assert result.result == "fail"
+
+    def test_pass_unknown_case_number_with_title(self) -> None:
+        """UNKNOWN case_number WITH a title stays a flag at the sibling rule,
+        but this fail-rule does not trigger — the title gives us a heal path.
+        """
+        result = check_unknown_and_null_title_fail("UNKNOWN-abc123", "Smith v. Jones")
+        assert result.result == "pass"
+
+    def test_pass_real_case_number_and_null_title(self) -> None:
+        """A real case_number with a null title is not automatically a bad
+        fragment — the case can still be enriched later.
+        """
+        result = check_unknown_and_null_title_fail("C24-01160", None)
+        assert result.result == "pass"
+
+    def test_pass_both_none(self) -> None:
+        """Both None does not trigger the fail — only a synthetic
+        UNKNOWN- prefix signals the bad-split pattern.
+        """
+        result = check_unknown_and_null_title_fail(None, None)
+        assert result.result == "pass"
+
+    def test_pass_both_present(self) -> None:
+        result = check_unknown_and_null_title_fail("C24-01160", "Smith v. Jones")
+        assert result.result == "pass"
 
 
 # ---------------------------------------------------------------------------
@@ -822,7 +877,7 @@ class TestRunDeterministicRules:
             captured_at=date(2026, 3, 4),
         )
         assert result.overall == "pass"
-        assert len(result.rules) == 7
+        assert len(result.rules) == 8
         assert all(r.result == "pass" for r in result.rules)
         assert result.failed_rules == []
         assert result.flagged_rules == []
@@ -841,12 +896,51 @@ class TestRunDeterministicRules:
         assert len(result.failed_rules) >= 1
         assert any(r.rule == "no_html_in_ruling_text" for r in result.failed_rules)
 
+    def test_unknown_and_null_title_rejected_via_aggregator(self) -> None:
+        """#2571 — ruling with UNKNOWN case_number AND null title must fail aggregator."""
+        result = run_deterministic_rules(
+            ruling_text="The motion for summary adjudication is granted.",
+            case_number="UNKNOWN-abc123",
+            case_title=None,
+            hearing_date=date(2026, 3, 30),
+            captured_at=date(2026, 3, 29),
+        )
+        assert result.overall == "fail"
+        assert any(
+            r.rule == "unknown_and_null_title_fail" and r.result == "fail" for r in result.rules
+        )
+
+    def test_unknown_with_title_still_only_flags(self) -> None:
+        """#2571 — UNKNOWN case_number with a real title stays a flag (not fail).
+
+        This preserves the heal-by-title path — we don't want to reject
+        rulings that have a title but are missing the case number, because
+        those can be cross-referenced later.
+        """
+        result = run_deterministic_rules(
+            ruling_text="The motion is granted.",
+            case_number="UNKNOWN-abc123",
+            case_title="Smith v. Jones",
+            hearing_date=date(2026, 3, 30),
+            captured_at=date(2026, 3, 29),
+        )
+        assert result.overall == "flag"
+        # The flag rule still fires:
+        assert any(r.rule == "case_number_not_unknown" and r.result == "flag" for r in result.rules)
+        # The new fail rule does NOT fire:
+        unknown_null = [r for r in result.rules if r.rule == "unknown_and_null_title_fail"]
+        assert len(unknown_null) == 1
+        assert unknown_null[0].result == "pass"
+
     def test_flag_only(self) -> None:
         """When only flag rules fire, overall is flag."""
+        # Note: UNKNOWN case_number WITH a real title keeps this test in the
+        # flag-only regime.  UNKNOWN + NULL title now triggers the new #2571
+        # fail rule, so we pass a title here to stay in flag-only territory.
         result = run_deterministic_rules(
             ruling_text=None,  # triggers ruling_text_not_empty flag
             case_number="UNKNOWN-abc",  # triggers case_number_not_unknown flag
-            case_title=None,
+            case_title="Smith v. Jones",
             hearing_date=None,
             captured_at=None,
         )
@@ -919,7 +1013,7 @@ class TestRunDeterministicRules:
             captured_at=date(2026, 3, 4),
         )
         # Without other_case_numbers, no cross-case rule added.
-        assert len(result.rules) == 7
+        assert len(result.rules) == 8
         assert not any(r.rule == "no_cross_case_ruling_text" for r in result.rules)
         assert result.overall == "pass"
 
@@ -933,7 +1027,7 @@ class TestRunDeterministicRules:
             captured_at=date(2026, 3, 4),
             other_case_numbers=[],
         )
-        assert len(result.rules) == 7
+        assert len(result.rules) == 8
         assert not any(r.rule == "no_cross_case_ruling_text" for r in result.rules)
         assert result.overall == "pass"
 
@@ -947,7 +1041,7 @@ class TestRunDeterministicRules:
             captured_at=date(2026, 3, 4),
             other_case_numbers=["23STCV99999", "23STCV88888"],
         )
-        assert len(result.rules) == 8
+        assert len(result.rules) == 9
         assert result.overall == "flag"
         cross_rules = [r for r in result.rules if r.rule == "no_cross_case_ruling_text"]
         assert len(cross_rules) == 1
@@ -964,7 +1058,7 @@ class TestRunDeterministicRules:
             captured_at=date(2026, 3, 4),
             other_case_numbers=["23STCV99999"],
         )
-        assert len(result.rules) == 8
+        assert len(result.rules) == 9
         assert result.overall == "pass"
         cross_rules = [r for r in result.rules if r.rule == "no_cross_case_ruling_text"]
         assert cross_rules[0].result == "pass"
@@ -993,8 +1087,8 @@ class TestRunDeterministicRules:
             hearing_date=date(2026, 3, 5),
             captured_at=date(2026, 3, 4),
         )
-        # No siblings given, so cross-case rule not present; base 7 rules.
-        assert len(result.rules) == 7
+        # No siblings given, so cross-case rule not present; base 8 rules.
+        assert len(result.rules) == 8
         assert result.overall == "flag"
         marker_rules = [r for r in result.rules if r.rule == "ruling_text_case_number_marker"]
         assert len(marker_rules) == 1

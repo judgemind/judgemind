@@ -944,6 +944,56 @@ class TestContraCostaSystemPrompt:
         assert "extracted_case_title" in CONTRA_COSTA_SYSTEM_PROMPT
         assert "extracted_parties" in CONTRA_COSTA_SYSTEM_PROMPT
 
+    def test_warns_against_splitting_on_internal_issue_headings(self) -> None:
+        """#2571 — prompt must warn LLM not to treat 'Issue N' sub-headings
+        inside a multi-Issue MSJ/MSA ruling as separate calendar items.
+
+        The over-splitting bug (#2571) turned one C24-00605 MSJ/MSA ruling
+        into 11 Issue-level fragments.  The prompt fix explicitly tells the
+        LLM that 'Issue One'/'Issue Two' etc are discussion headings, not
+        separate numbered line items.
+        """
+        assert "Issue One" in CONTRA_COSTA_SYSTEM_PROMPT
+        assert "Issue Two" in CONTRA_COSTA_SYSTEM_PROMPT
+        assert "top-level" in CONTRA_COSTA_SYSTEM_PROMPT.lower()
+
+    def test_defines_top_level_numbered_item(self) -> None:
+        """#2571 — prompt must define what a top-level numbered item is,
+        not just say 'return one entry per numbered line item'.
+        """
+        prompt_lower = CONTRA_COSTA_SYSTEM_PROMPT.lower()
+        assert "top-level numbered" in prompt_lower
+
+    def test_warns_against_splitting_on_section_headings(self) -> None:
+        """#2571 — prompt must list common internal-heading patterns that
+        should NOT be treated as separate entries (letter/numeric sub-headings,
+        topic headings like 'Meet and Confer', 'Analysis').
+        """
+        # Section headings commonly misinterpreted as sub-entries
+        prompt = CONTRA_COSTA_SYSTEM_PROMPT
+        # At least one section-heading example must be present
+        section_markers = [
+            "Meet and Confer",
+            "Procedural",
+            "Analysis",
+            "Legal Standard",
+            "Background",
+            "Conclusion",
+        ]
+        assert any(marker in prompt for marker in section_markers), (
+            f"Prompt must mention at least one topic-heading example ({section_markers})"
+        )
+
+    def test_includes_msj_multi_issue_negative_example(self) -> None:
+        """#2571 — prompt must include a concrete negative example showing
+        that an MSJ/MSA with multiple Issues stays as ONE entry.
+        """
+        prompt_lower = CONTRA_COSTA_SYSTEM_PROMPT.lower()
+        # Negative example mentions MSJ or MSA
+        assert "msj" in prompt_lower or "msa" in prompt_lower
+        # Uses the word "negative" or "do NOT" explicitly
+        assert "negative example" in prompt_lower or "do not" in prompt_lower
+
 
 # ---------------------------------------------------------------------------
 # Prompt format validation — all registered counties (#2292)

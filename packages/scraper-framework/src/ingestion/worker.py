@@ -1446,12 +1446,39 @@ class IngestionWorker:
         # outcome, case_title, and parties (#2176).  Runs after per-field
         # LLM extraction.  Regex fallback removed in #2178 — LLM is now
         # the only enrichment path for these four fields.
+        #
+        # Skip enrichment when both case_number and case_title are empty
+        # (#2571).  When BOTH are missing after per-field LLM extraction,
+        # the ruling is almost certainly a fragment of a bad split — e.g.
+        # a CC LLM splitter over-split a single multi-Issue MSJ/MSA
+        # ruling into N Issue-level fragments, each of which lacks case
+        # metadata because that only appears once at the top of the
+        # parent entry.  Running enrichment on such fragments is
+        # counter-productive: the fragment text mentions "summary
+        # adjudication" so the enrichment LLM confidently returns
+        # motion_type="motion_for_summary_adjudication", polluting the
+        # DB with wrong classifications.  Leaving motion_type=None (and
+        # letting the Layer 3 deterministic rule reject the row) is the
+        # correct behaviour.
         # ------------------------------------------------------------------
+        is_bad_split_fragment = not case_number and not case_title
         enrichment_fields_missing = (
             ruling_text
             and not is_extraction_none
+            and not is_bad_split_fragment
             and (outcome is None or motion_type is None or not case_title or not parties_data)
         )
+        if is_bad_split_fragment and ruling_text and not is_extraction_none:
+            logger.info(
+                "Skipping LLM enrichment — ruling looks like a bad-split "
+                "fragment (case_number and case_title both empty); "
+                "leaving motion_type=None",
+                extra={
+                    "document_id": document_id,
+                    "county": county,
+                },
+            )
+            extraction_methods.setdefault("motion_type", "skipped_bad_split_fragment")
         if enrichment_fields_missing:
             enrichment_result = self._llm_enrich_fields(ruling_text, document_id)
             (

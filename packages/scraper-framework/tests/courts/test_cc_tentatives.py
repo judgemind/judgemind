@@ -1334,6 +1334,99 @@ def test_cc_llm_extract_rulings_empty_text(mock_call_llm: MagicMock) -> None:
 
 
 @patch("ingestion.llm_providers.call_llm")
+def test_cc_llm_extract_rulings_multi_issue_msj_stays_one_ruling(
+    mock_call_llm: MagicMock,
+) -> None:
+    """#2571 regression — a multi-Issue MSJ/MSA ruling must remain ONE entry.
+
+    Simulates the corrected LLM behaviour for the Dept 34 03/30/2026
+    fixture (S3 key 406574e2..., case #20 C24-00605 VIKAS PRAKASH v.
+    WILSON AQUINO).  The original bug over-split this single MSJ/MSA
+    ruling into 11 per-Issue fragments with null case_number/case_title.
+
+    This test asserts that when the LLM returns the CORRECT single-entry
+    response, the extractor round-trips it unchanged — preserving the full
+    ruling_text (including all 11 Issue discussions) in one CCSplitRuling.
+    """
+    ruling_text = (
+        "The motion for summary judgment, or in the alternative, summary "
+        "adjudication is DENIED as to the complaint, and GRANTED IN PART as "
+        "to the cross-complaint.\n\n"
+        "Issue One: Breach of Contract — The Court finds ...\n\n"
+        "Issue Two: Fraud — The Court finds ...\n\n"
+        "Issue Three: Breach of the Implied Covenant — ...\n\n"
+        "Issue Four: Unjust Enrichment — ...\n\n"
+        "Issue Five: Declaratory Relief — ...\n\n"
+        "Issue Six: Affirmative Defense of Statute of Limitations — ...\n\n"
+        "Issue Seven: Affirmative Defense of Laches — ...\n\n"
+        "Issue Eight: Affirmative Defense of Unclean Hands — ...\n\n"
+        "Issue Nine: Affirmative Defense of Waiver — ...\n\n"
+        "Issue Ten: Affirmative Defense of Estoppel — ...\n\n"
+        "Issue Eleven: Affirmative Defense of Failure to Mitigate — ..."
+    )
+    response_json = (
+        '{"rulings": [{'
+        '"line_number": 20,'
+        '"extracted_case_number": "C24-00605",'
+        '"extracted_case_title": "Vikas Prakash v. Wilson Aquino",'
+        '"case_type": "civil",'
+        '"outcome": "granted_in_part",'
+        '"motion_type": "msj_partial",'
+        '"ruling_text": ' + _json_escape(ruling_text) + ","
+        '"extracted_parties": ['
+        '{"name": "Vikas Prakash", "role": "plaintiff", "confidence": "high"},'
+        '{"name": "Wilson Aquino", "role": "defendant", "confidence": "high"}'
+        "]}]}"
+    )
+    mock_response = MagicMock()
+    mock_response.text = response_json
+    mock_response.input_tokens = 2000
+    mock_response.output_tokens = 1500
+    mock_call_llm.return_value = mock_response
+
+    result = _llm_extract_rulings("Some PDF text content")
+
+    # CRITICAL: exactly ONE ruling, not 11.
+    assert result is not None
+    assert len(result) == 1, (
+        f"Expected 1 ruling for multi-Issue MSJ/MSA, got {len(result)} "
+        "— over-splitting regression (see #2571)"
+    )
+
+    only = result[0]
+    # All 11 Issue discussions must be preserved verbatim in ruling_text.
+    for issue_label in (
+        "Issue One",
+        "Issue Two",
+        "Issue Three",
+        "Issue Four",
+        "Issue Five",
+        "Issue Six",
+        "Issue Seven",
+        "Issue Eight",
+        "Issue Nine",
+        "Issue Ten",
+        "Issue Eleven",
+    ):
+        assert issue_label in (only.ruling_text or ""), (
+            f"'{issue_label}' missing from ruling_text — over-splitting regression"
+        )
+
+    # Case metadata must be present (case_number + case_title).
+    assert only.case_number == "C24-00605"
+    assert only.case_title == "Vikas Prakash v. Wilson Aquino"
+    # Motion type should be an MSJ-family label, not generic adjudication.
+    assert only.motion_type in ("msj", "msj_partial", "motion_for_summary_adjudication")
+
+
+def _json_escape(text: str) -> str:
+    """Minimal JSON-string escape for inline test fixtures."""
+    import json
+
+    return json.dumps(text)
+
+
+@patch("ingestion.llm_providers.call_llm")
 def test_cc_llm_extract_rulings_outcome_mapping(mock_call_llm: MagicMock) -> None:
     """Outcome values are mapped through _CC_OUTCOME_MAP."""
     response_json = (
