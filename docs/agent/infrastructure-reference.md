@@ -70,6 +70,22 @@ scripts/with-secret.sh -e CLOUDFLARE_API_TOKEN=judgemind/cloudflare/api-token --
 
 **Important:** The root `infra/terraform/` directory does not track deployed resources. Each environment has its own state backend under `infra/terraform/environments/<env>/`. Running apply from the root creates duplicate resources that collide with the real ones. Always use the environment-specific path. Production applies (`environments/production/`) are human-only. **The PreToolUse hook (`preflight-bash.sh`) blocks `terraform apply` and `terraform destroy` commands that target the root path.** The `preflight_tf_not_root` function in `scripts/preflight.sh` provides the same check for scripts.
 
+### Dev maintenance-window hazard
+
+AWS resources that have a weekly maintenance window default to deferring some configuration changes (instance class, engine version, parameter groups) to that window rather than applying them on the next terraform apply. When the dispatcher auto-applies infra PRs on dev, this silent deferral causes the expected diff to show "applied successfully" but the actual change to land days later — forcing a manual reboot or `aws` CLI workaround.
+
+**Rule:** dev modules with maintenance windows should set `apply_immediately = true` (or the module's equivalent) so dispatcher-driven applies land changes on the next apply. Production keeps the default (`false`) so reboots happen during the scheduled window, not during business hours.
+
+Current coverage:
+
+| Resource | Terraform arg | Dev override | Notes |
+|---|---|---|---|
+| RDS (`aws_db_instance`) | `apply_immediately` | `true` (#2573) | `modules/database` exposes `var.apply_immediately` |
+| ElastiCache (`aws_elasticache_cluster`) | `apply_immediately` | `true` (#2581) | `modules/cache` exposes `var.apply_immediately` |
+| OpenSearch (`aws_opensearch_domain`) | _(no equivalent)_ | n/a | User-initiated changes run via blue/green deploy that starts immediately; `software_update_options` / Auto-Tune `maintenance_schedule` only govern AWS-initiated updates, not terraform changes. See the comment in `modules/search/main.tf`. |
+
+When adding a new module that wraps a resource with a maintenance window, check the provider docs for `apply_immediately` (or the equivalent) and wire it through with a dev override. See `modules/database/main.tf` and `modules/cache/main.tf` for the canonical pattern.
+
 ### Pre-PR Checklist for Terraform Tasks
 
 See `docs/terraform-checklist.md` for the full checklist.
