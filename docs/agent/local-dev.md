@@ -28,6 +28,18 @@ Set `S3_CACHE_DIR=/tmp/judgemind-archive` to cache S3 objects on local disk. All
 - `S3_LOCAL_ONLY=1` — fully offline mode, no S3 contact at all.
 - Content-addressed keys mean cached files never go stale.
 
+### LLM extraction cache — gotcha when testing post-processing changes
+
+The `_LlmCache` stores final `ExtractedRuling` objects, not raw per-page LLM responses. A cache hit returns a pre-built object that **skips all post-processing** (e.g. `_extract_case_title_from_info`, `_join_page_rows`). Changing downstream parsing logic therefore has zero effect on cached results, and deleting local cache files does not help — `CachedS3Client` silently re-fetches from S3.
+
+When testing post-processing changes, set **both** env vars:
+
+```
+S3_LOCAL_ONLY=1 S3_CACHE_DIR=/tmp/judgemind-archive
+```
+
+When prompt text changes, the cache auto-invalidates via prompt-hash, but old entries persist on S3 as dead weight. The `tests/conftest.py` fixture handles this for pytest; ad-hoc test scripts need it set manually.
+
 ## Full local DB rebuild from S3
 
 ```

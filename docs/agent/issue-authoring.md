@@ -31,6 +31,21 @@ Acceptance criteria must be concrete and machine-checkable wherever possible. Va
 
 Each criterion should have at least one `Verify:` line that an agent can execute to confirm the criterion is met. This applies to issues filed by both humans and agents. If a verification command is not possible (e.g., requires subjective judgment), note that explicitly so reviewers know it requires manual verification.
 
+## Priority Framework
+
+Assign priority by urgency and workflow impact, not by user-visibility.
+
+| Priority | Principle | Categories |
+|---|---|---|
+| **p0** | Human-only; agents set only when explicitly told | Production outages, data loss |
+| **p1** | Time-sensitive or workflow accelerators | Scraper failures, data quality bugs, DX improvements, process fixes |
+| **p2** | Everything else | User-facing bugs, backfills, refactoring, docs, data prevention |
+| **p3** | Large slower units of work | Missing features, UI/UX redesign |
+
+**Rationale:** Scraper data is ephemeral (lost forever if not captured). DX issues directly affect agent throughput — a broken workflow wastes entire agent sessions. Process improvements prevent repeated failures. These justify p1 even though they are not user-facing. Large feature work and redesigns are important but not urgent — p3.
+
+Default DX to p1, not p3. Default features to p3, not p2. Reserve p0 for human-assigned true emergencies.
+
 ## Creating Sub-Tasks
 
 If a task naturally breaks into 2+ independent pieces of work, create child issues:

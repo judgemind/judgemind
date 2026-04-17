@@ -432,6 +432,10 @@ The checkpoint is a Markdown file (human-readable, easy for the LLM to parse) wi
 - task-notification events from the <N> active agents above
 (or "Nothing -- no agents running, ready to dispatch" if slots are empty)
 
+## Recently Completed (cap at 10, drop oldest)
+- #<issue> -> PR #<N> merged + deployed -- <one-line note>
+(keep only the most recent 10 entries; older ones are dead weight and can be dropped)
+
 ## Do NOT
 - Sleep-and-poll for PR CI status -- agents manage their own PRs
 - Merge PRs while agents are still running -- only merge orphaned PRs
@@ -911,6 +915,10 @@ Shutdown triggers:
 - User types `/stop` or asks to stop
 - All issues in the queue are complete and no agents are running
 - **Context rotation threshold reached** (see "Context-Aware Rotation" above) — this is a **rotation**, not a full shutdown
+
+### Queue low or empty → spawn /spotcheck instead of idling
+
+When `gh issue list --label agent/ready` returns fewer issues than available `/task` slots and there are no in-flight agents with follow-ups pending, the correct idle behavior (especially overnight) is to spawn `/spotcheck` as a subagent (`isolation: worktree`) rather than winding down. /spotcheck samples across counties, compares DB records to source PDFs, and files per-pattern data-quality issues — which refills the queue with concrete work the dispatcher picks up in the next cycle. Treat this as standing instruction; do not ask permission when operating autonomously. Only move to full shutdown when /spotcheck itself produces no new work AND the queue is genuinely empty.
 
 ### Full shutdown procedure (user-initiated or queue empty)
 
