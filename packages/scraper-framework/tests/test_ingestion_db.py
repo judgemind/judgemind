@@ -1681,11 +1681,15 @@ class TestInsertRulingContentDedup:
         )
 
         doc_update_calls = [
-            c for c in execute_calls if "UPDATE documents SET status = 'superseded'" in c[0][0]
+            c for c in execute_calls if "UPDATE documents" in c[0][0] and "superseded" in c[0][0]
         ]
         assert len(doc_update_calls) == 1
-        assert doc_update_calls[0][0][1] == ("losing-doc",), (
-            "UPDATE documents must target the losing document_id."
+        # The loser's document_id is always the LAST positional param
+        # (after #2569, the UPDATE also carries the winner_id in earlier
+        # positions when a winner is resolved).
+        update_params = doc_update_calls[0][0][1]
+        assert update_params[-1] == "losing-doc", (
+            f"UPDATE documents must target the losing document_id (got params={update_params!r})."
         )
 
     def test_unique_violation_supersede_in_force_update_mode(self) -> None:
@@ -1726,6 +1730,284 @@ class TestInsertRulingContentDedup:
         assert any("UPDATE documents SET status = 'superseded'" in s for s in sql_stmts)
         # Under no mode should the old fallback UPDATE run.
         assert not any("UPDATE rulings SET" in s and "ruling_text_hash" in s for s in sql_stmts)
+
+    def test_supersede_populates_previous_version_id(self) -> None:
+        """Loser doc's ``previous_version_id`` is set to the winner's id (#2569).
+
+        Without this link, loser docs look like "zero derived rulings" to
+        naive spotcheck queries that filter on ``documents.s3_key``.  The
+        link lets downstream tooling trace the loser back to the
+        canonical rulings on the winner.
+        """
+        import psycopg.errors
+
+        conn = _mock_conn()
+        cur = conn.cursor.return_value.__enter__.return_value
+        exc = psycopg.errors.UniqueViolation("duplicate key value violates unique constraint")
+
+        def side_effect_execute(sql: str, params: tuple | None = None) -> None:
+            if "INSERT INTO rulings" in sql:
+                raise exc
+
+        cur.execute = MagicMock(side_effect=side_effect_execute)
+        # First fetchone() — winner lookup — returns the winner id.
+        # Second fetchone() — county/s3_key — returns a 1-tuple (mock
+        # default); the except clause in db.py swallows the resulting
+        # IndexError, which is fine for this test.
+        cur.fetchone = MagicMock(return_value=("winner-doc-id",))
+
+        insert_ruling(
+            conn,
+            document_id="losing-doc",
+            case_id="case-1",
+            court_id="court-1",
+            hearing_date=date(2026, 3, 5),
+            ruling_text="Motion GRANTED",
+            department="Dept. 1",
+        )
+
+        execute_calls = cur.execute.call_args_list
+        # The UPDATE documents statement should set previous_version_id.
+        doc_update_calls = [
+            c for c in execute_calls if "UPDATE documents" in c[0][0] and "superseded" in c[0][0]
+        ]
+        assert len(doc_update_calls) == 1
+        update_sql = doc_update_calls[0][0][0]
+        assert "previous_version_id = %s::uuid" in update_sql, (
+            "Supersede UPDATE must set previous_version_id to the winner's id."
+        )
+        assert "change_type = 'duplicate_content'" in update_sql, (
+            "Supersede UPDATE must set change_type='duplicate_content' "
+            "for downstream classification."
+        )
+        # Params are (winner_id, loser_id).
+        update_params = doc_update_calls[0][0][1]
+        assert update_params == ("winner-doc-id", "losing-doc"), (
+            f"UPDATE params must be (winner_id, loser_id); got {update_params!r}"
+        )
+
+    def test_supersede_queries_winner_document_id(self) -> None:
+        """The supersede path first queries the winner's document_id.
+
+        It joins on (case_id, ruling_text_hash) — the same pair that
+        triggered the UniqueViolation.
+        """
+        import psycopg.errors
+
+        conn = _mock_conn()
+        cur = conn.cursor.return_value.__enter__.return_value
+        exc = psycopg.errors.UniqueViolation("duplicate key value violates unique constraint")
+
+        def side_effect_execute(sql: str, params: tuple | None = None) -> None:
+            if "INSERT INTO rulings" in sql:
+                raise exc
+
+        cur.execute = MagicMock(side_effect=side_effect_execute)
+        cur.fetchone = MagicMock(return_value=("winner-doc-id",))
+
+        insert_ruling(
+            conn,
+            document_id="losing-doc",
+            case_id="case-1",
+            court_id="court-1",
+            hearing_date=date(2026, 3, 5),
+            ruling_text="Motion GRANTED",
+            department="Dept. 1",
+        )
+
+        execute_calls = cur.execute.call_args_list
+        winner_lookup_calls = [
+            c
+            for c in execute_calls
+            if "SELECT document_id" in c[0][0] and "FROM rulings" in c[0][0]
+        ]
+        assert len(winner_lookup_calls) >= 1, (
+            "Supersede path must query the winner's document_id before the UPDATE."
+        )
+
+    def test_supersede_falls_back_when_winner_not_found(self) -> None:
+        """If the winner lookup returns no row, still supersede the loser.
+
+        Defensive branch — the UniqueViolation means a winner SHOULD
+        exist, but if the mock/fetchone returns None the supersede path
+        must still run and mark the loser with change_type so reporting
+        is not silent.
+        """
+        import psycopg.errors
+
+        conn = _mock_conn()
+        cur = conn.cursor.return_value.__enter__.return_value
+        exc = psycopg.errors.UniqueViolation("duplicate key value violates unique constraint")
+
+        def side_effect_execute(sql: str, params: tuple | None = None) -> None:
+            if "INSERT INTO rulings" in sql:
+                raise exc
+
+        cur.execute = MagicMock(side_effect=side_effect_execute)
+        cur.fetchone = MagicMock(return_value=None)
+
+        insert_ruling(
+            conn,
+            document_id="losing-doc",
+            case_id="case-1",
+            court_id="court-1",
+            hearing_date=date(2026, 3, 5),
+            ruling_text="Motion GRANTED",
+            department="Dept. 1",
+        )
+
+        execute_calls = cur.execute.call_args_list
+        doc_update_calls = [
+            c for c in execute_calls if "UPDATE documents" in c[0][0] and "superseded" in c[0][0]
+        ]
+        assert len(doc_update_calls) == 1
+        update_sql = doc_update_calls[0][0][0]
+        # Fallback UPDATE: status + change_type but NO previous_version_id.
+        assert "change_type = 'duplicate_content'" in update_sql
+        assert "previous_version_id" not in update_sql, (
+            "Fallback UPDATE (no winner found) must omit previous_version_id."
+        )
+
+    def test_supersede_logs_warning_with_structured_fields(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The supersede path emits a WARN-level log with structured fields (#2569).
+
+        Promoted from info to warning so operators can alert on this
+        class of dedup event.
+        """
+        import logging
+
+        import psycopg.errors
+
+        conn = _mock_conn()
+        cur = conn.cursor.return_value.__enter__.return_value
+        exc = psycopg.errors.UniqueViolation("duplicate key value violates unique constraint")
+
+        def side_effect_execute(sql: str, params: tuple | None = None) -> None:
+            if "INSERT INTO rulings" in sql:
+                raise exc
+
+        cur.execute = MagicMock(side_effect=side_effect_execute)
+        cur.fetchone = MagicMock(return_value=("winner-doc-id",))
+
+        caplog.set_level(logging.WARNING, logger="ingestion.db")
+        insert_ruling(
+            conn,
+            document_id="losing-doc",
+            case_id="case-1",
+            court_id="court-1",
+            hearing_date=date(2026, 3, 5),
+            ruling_text="Motion GRANTED",
+            department="Dept. 1",
+        )
+
+        warning_records = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert warning_records, (
+            "Supersede path must emit at least one WARN-level log (promoted from info in #2569)."
+        )
+        rec = warning_records[0]
+        assert "content-hash dedup" in rec.getMessage().lower()
+        # Structured fields available via ``extra``.
+        assert getattr(rec, "loser_document_id", None) == "losing-doc"
+        assert getattr(rec, "winner_document_id", None) == "winner-doc-id"
+        assert getattr(rec, "event", None) == "content_hash_dedup_supersede"
+
+    def test_supersede_writes_data_quality_metric(self) -> None:
+        """The supersede path emits a ``content_hash_dedup_supersede`` metric (#2569).
+
+        This gives the previously-silent dedup path a dashboard-queryable
+        observability signal so the 50%+ content-hash dedup rate in
+        multi-case-PDF counties is visible.
+        """
+        import psycopg.errors
+
+        conn = _mock_conn()
+        cur = conn.cursor.return_value.__enter__.return_value
+        exc = psycopg.errors.UniqueViolation("duplicate key value violates unique constraint")
+
+        def side_effect_execute(sql: str, params: tuple | None = None) -> None:
+            if "INSERT INTO rulings" in sql:
+                raise exc
+
+        cur.execute = MagicMock(side_effect=side_effect_execute)
+        # fetchone() returns values for (a) winner lookup, (b) county/s3
+        # lookup.  Two-tuple on the second call so county branch is taken.
+        cur.fetchone = MagicMock(
+            side_effect=[
+                ("winner-doc-id",),
+                ("Contra Costa", "ca-contra_costa/some.pdf"),
+            ]
+        )
+
+        insert_ruling(
+            conn,
+            document_id="losing-doc",
+            case_id="case-1",
+            court_id="court-1",
+            hearing_date=date(2026, 3, 5),
+            ruling_text="Motion GRANTED",
+            department="Dept. 1",
+        )
+
+        execute_calls = cur.execute.call_args_list
+        metric_calls = [c for c in execute_calls if "INSERT INTO data_quality_metrics" in c[0][0]]
+        assert len(metric_calls) == 1, (
+            "Supersede path must write exactly one data_quality_metrics "
+            "row when the county is resolvable."
+        )
+        metric_params = metric_calls[0][0][1]
+        # (county, metric_name, metric_value, metadata_json)
+        assert metric_params[0] == "Contra Costa"
+        assert metric_params[1] == "content_hash_dedup_supersede"
+        assert metric_params[2] == 1
+        # metadata is a JSON string containing loser/winner/case/s3 fields
+        import json as _json
+
+        meta = _json.loads(metric_params[3])
+        assert meta["loser_document_id"] == "losing-doc"
+        assert meta["winner_document_id"] == "winner-doc-id"
+        assert meta["case_id"] == "case-1"
+        assert meta["s3_key"] == "ca-contra_costa/some.pdf"
+
+    def test_supersede_skips_metric_when_county_unresolvable(self) -> None:
+        """If the context lookup fails, the primary supersede still succeeds.
+
+        The metric write is skipped — we never let a best-effort
+        telemetry write break the primary supersede path (#2569).
+        """
+        import psycopg.errors
+
+        conn = _mock_conn()
+        cur = conn.cursor.return_value.__enter__.return_value
+        exc = psycopg.errors.UniqueViolation("duplicate key value violates unique constraint")
+
+        def side_effect_execute(sql: str, params: tuple | None = None) -> None:
+            if "INSERT INTO rulings" in sql:
+                raise exc
+
+        cur.execute = MagicMock(side_effect=side_effect_execute)
+        # Winner lookup returns a row; county lookup returns None.
+        cur.fetchone = MagicMock(side_effect=[("winner-doc-id",), None])
+
+        insert_ruling(
+            conn,
+            document_id="losing-doc",
+            case_id="case-1",
+            court_id="court-1",
+            hearing_date=date(2026, 3, 5),
+            ruling_text="Motion GRANTED",
+            department="Dept. 1",
+        )
+
+        execute_calls = cur.execute.call_args_list
+        sql_stmts = [call[0][0] for call in execute_calls]
+        # Supersede still ran.
+        assert any("UPDATE documents" in s and "superseded" in s for s in sql_stmts)
+        # Metric was skipped.
+        assert not any("INSERT INTO data_quality_metrics" in s for s in sql_stmts), (
+            "Metric write must be skipped when county is unresolvable."
+        )
 
     def test_unknown_constraint_violation_is_reraised(self) -> None:
         """UniqueViolation from an unrelated constraint should be re-raised.
@@ -3243,10 +3525,14 @@ class TestInsertRulingContentHashSupersede:
         assert delete_calls[0][0][1] == ("losing-doc-id",)
 
         doc_update_calls = [
-            c for c in execute_calls if "UPDATE documents SET status = 'superseded'" in c[0][0]
+            c for c in execute_calls if "UPDATE documents" in c[0][0] and "superseded" in c[0][0]
         ]
         assert doc_update_calls
-        assert doc_update_calls[0][0][1] == ("losing-doc-id",)
+        # The loser's document_id is always the LAST positional param
+        # (after #2569, the UPDATE also carries the winner_id in earlier
+        # positions when a winner is resolved).
+        update_params = doc_update_calls[0][0][1]
+        assert update_params[-1] == "losing-doc-id"
 
     def test_supersede_does_not_run_legacy_fallback_update(self) -> None:
         """The legacy ``UPDATE rulings SET ... WHERE case_id = ? AND
