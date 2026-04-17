@@ -67,6 +67,66 @@ class TestNormalizeDepartment:
     def test_whitespace_stripped(self) -> None:
         assert normalize_department(" F46 ") == "F46"
 
+    # ---------------------------------------------------------------------
+    # Alphanumeric dept codes — locked in for #2602
+    # ---------------------------------------------------------------------
+    # Ventura (J6), SB (S*), Riverside (M*, PS*, C*, MV*), OC (CX*, CM*, N*,
+    # W*, L*) all share this helper via import.  The helper only strips zeros
+    # from *purely numeric* strings (isdigit() check), so alphanumerics pass
+    # through unchanged — which is what the dept-to-judge map keys expect.
+    # Do not add letter-stripping here; LA County's letter+digits ->
+    # letter-only normalization lives in ingestion.department_normalize and
+    # must stay out of this helper (see the Ventura import site in
+    # ``courts/ca/ventura_dept_judges.py``).
+
+    def test_issue_2602_j6(self) -> None:
+        """Exact case from #2602 — Ventura J6 must pass through."""
+        assert normalize_department("J6") == "J6"
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            "J6",
+            "S1",
+            "M4",
+            "M205",
+            "M301",
+            "M302",
+            "MV1",
+            "C1",
+            "C3",
+            "N1",
+            "N15",
+            "W5",
+            "CM01",
+            "CM7",
+            "L10",
+            "PS1",
+            "PS2",
+            "PS4",
+            "CX02",
+            "T1",
+        ],
+    )
+    def test_alphanumeric_codes_preserved(self, raw: str) -> None:
+        """All alphanumeric codes from non-LA counties pass through
+        unchanged."""
+        assert normalize_department(raw) == raw
+
+    @pytest.mark.parametrize(
+        "raw,expected",
+        [
+            ("020", "20"),
+            ("007", "7"),
+            ("001", "1"),
+            ("0", "0"),
+            ("00", "0"),
+        ],
+    )
+    def test_numeric_zero_stripping_still_works(self, raw: str, expected: str) -> None:
+        """AC #4: numeric zero-stripping still works for numeric-only codes."""
+        assert normalize_department(raw) == expected
+
 
 # ---------------------------------------------------------------------------
 # _parse_combined_name — unit tests

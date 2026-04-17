@@ -2803,6 +2803,77 @@ class TestResolveJudgeFromDepartment:
         result = resolve_judge_from_department(conn, "court-uuid-1", "3")
         assert result is None
 
+    def test_falls_back_to_earliest_snapshot_when_hearing_date_predates_all(
+        self,
+    ) -> None:
+        """When hearing_date predates all snapshots, fall back to earliest snapshot.
+
+        Regression: #2602 — Ventura J6 probate rulings (and numeric depts) were
+        NULL-judge because their hearing_date predated the oldest court directory
+        snapshot (2026-03-31). The <= hearing_date query returned no row, and
+        the function returned None with no fallback.
+
+        Judicial assignments change infrequently, so the earliest snapshot is
+        the best available approximation for pre-snapshot-window hearings.
+        """
+        conn = _mock_conn()
+        cur = conn.cursor.return_value.__enter__.return_value
+        # Call sequence:
+        #   1. court_code lookup -> ("ca-ventura",)
+        #   2. historical snapshot (<= hearing_date) -> None (no row)
+        #   3. earliest snapshot fallback (ASC LIMIT 1) -> ({"J6": "..."},)
+        earliest_mapping = {"J6": "Gilbert A. Romero", "20": "Ronda J. McKaig"}
+        cur.fetchone.side_effect = [
+            ("ca-ventura",),
+            None,
+            (earliest_mapping,),
+        ]
+        hearing_dt = date(2026, 3, 17)
+
+        result = resolve_judge_from_department(conn, "court-uuid-1", "J6", hearing_date=hearing_dt)
+        assert result == "Gilbert A. Romero"
+
+        # Verify the fallback query is ORDER BY captured_at ASC LIMIT 1
+        assert len(cur.execute.call_args_list) == 3
+        fallback_call = cur.execute.call_args_list[2]
+        fallback_sql = fallback_call[0][0]
+        assert "ORDER BY captured_at ASC" in fallback_sql
+        assert "LIMIT 1" in fallback_sql
+        fallback_params = fallback_call[0][1]
+        assert "ca_ventura" in fallback_params
+
+    def test_returns_none_when_no_snapshots_at_all_with_hearing_date(self) -> None:
+        """When hearing_date is set and no snapshots exist at all, return None.
+
+        The historical-snapshot query returns None, the earliest-snapshot
+        fallback also returns None, and the function returns None.
+        """
+        conn = _mock_conn()
+        cur = conn.cursor.return_value.__enter__.return_value
+        cur.fetchone.side_effect = [
+            ("ca-ventura",),
+            None,  # historical snapshot: no row
+            None,  # earliest snapshot fallback: no row either
+        ]
+        hearing_dt = date(2026, 3, 17)
+
+        result = resolve_judge_from_department(conn, "court-uuid-1", "J6", hearing_date=hearing_dt)
+        assert result is None
+
+    def test_no_fallback_needed_when_historical_snapshot_exists(self) -> None:
+        """When a snapshot predates hearing_date, use it and do NOT run the fallback."""
+        conn = _mock_conn()
+        cur = conn.cursor.return_value.__enter__.return_value
+        mapping = {"J6": "Gilbert A. Romero"}
+        cur.fetchone.side_effect = [("ca-ventura",), (mapping,)]
+        hearing_dt = date(2026, 4, 16)
+
+        result = resolve_judge_from_department(conn, "court-uuid-1", "J6", hearing_date=hearing_dt)
+        assert result == "Gilbert A. Romero"
+
+        # Only two execute calls: court_code + historical snapshot — no fallback
+        assert len(cur.execute.call_args_list) == 2
+
 
 # ---------------------------------------------------------------------------
 # delete_stale_split_children

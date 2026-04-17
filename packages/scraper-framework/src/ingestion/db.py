@@ -1081,6 +1081,16 @@ def resolve_judge_from_department(
     closest to (but not after) that date for historical accuracy.  Otherwise
     uses the most recent snapshot.
 
+    When ``hearing_date`` predates every snapshot for this court (i.e. the
+    hearing happened before we started snapshotting the judicial assignments
+    directory), the function falls back to the **earliest** snapshot on record.
+    Judicial assignments change infrequently, so the earliest snapshot is the
+    best available approximation for pre-snapshot-window hearings — better
+    than returning ``None`` and leaving the ruling's judge unresolved
+    (regression: #2602 Ventura J6 probate rulings had NULL judge because
+    every hearing in the affected window predated the first snapshot by a
+    few days).
+
     This is the universal dept-to-judge fallback that works for ALL counties
     with roster data, replacing the LA-specific hardcoded lookup.  It fires
     during both normal ingestion and rebuilds, regardless of ``_llm_extracted``
@@ -1130,6 +1140,22 @@ def resolve_judge_from_department(
                 """,
                 (snapshot_court_id, hearing_date),
             )
+            row = cur.fetchone()
+            if row is None:
+                # Hearing predates every snapshot for this court.  Fall back to
+                # the earliest snapshot on record — judicial assignments change
+                # infrequently, so this is the best available approximation
+                # for pre-snapshot-window hearings (#2602).
+                cur.execute(
+                    """
+                    SELECT mapping FROM court_directory_snapshots
+                    WHERE court_id = %s
+                    ORDER BY captured_at ASC
+                    LIMIT 1
+                    """,
+                    (snapshot_court_id,),
+                )
+                row = cur.fetchone()
         else:
             cur.execute(
                 """
@@ -1140,7 +1166,7 @@ def resolve_judge_from_department(
                 """,
                 (snapshot_court_id,),
             )
-        row = cur.fetchone()
+            row = cur.fetchone()
 
     if row is None or row[0] is None:
         return None
