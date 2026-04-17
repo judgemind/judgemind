@@ -12,6 +12,7 @@ and field completeness percentages).
 This module is designed to be imported by ``data-quality-check.py`` and
 tested independently with mocked S3 clients.
 """
+# permanent: true
 
 from __future__ import annotations
 

@@ -26,6 +26,7 @@ Exit codes:
     0   Success
     1   Usage error or connection failure
 """
+# permanent: true
 
 from __future__ import annotations
 

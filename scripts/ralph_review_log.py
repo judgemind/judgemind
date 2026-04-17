@@ -6,6 +6,7 @@ verdicts, feedback, agreement patterns, and token usage can be analyzed.
 This module is intentionally dependency-free (stdlib only) to avoid requiring
 a venv for the scripts/ directory.
 """
+# permanent: true
 
 from __future__ import annotations
 

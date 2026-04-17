@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # venv: scraper-framework
+# permanent: true
 """Data quality monitoring — collection health and field completeness checks.
 
 Queries the database and flags counties with unhealthy ruling ingest

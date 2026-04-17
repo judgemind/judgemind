@@ -9,6 +9,7 @@ signal and presents it compactly.
 Usage:
     python3 scripts/agent_status.py <agent-id-or-path> [--last N] [--full]
 """
+# permanent: true
 
 from __future__ import annotations
 

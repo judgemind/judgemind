@@ -18,6 +18,7 @@ Exit codes:
     0 -- No invalid column references found.
     1 -- One or more invalid column references detected.
 """
+# permanent: true
 
 from __future__ import annotations
 

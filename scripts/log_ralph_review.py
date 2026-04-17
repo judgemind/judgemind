@@ -16,6 +16,7 @@ The script reads:
 It appends a record to:
   {worktree}/tmp/ralph/review-log.jsonl
 """
+# permanent: true
 
 from __future__ import annotations
 

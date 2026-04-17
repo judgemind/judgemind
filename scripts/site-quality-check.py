@@ -15,6 +15,7 @@ Environment variables:
   BASELINES_FILE - Path to baselines JSON (default: site-quality-baselines.json)
   GITHUB_OUTPUT  - GitHub Actions output file (optional, for CI integration)
 """
+# permanent: true
 
 from __future__ import annotations
 

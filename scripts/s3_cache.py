@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Local S3 cache — bulk sync and CLI utilities."""
 # venv: scraper-framework
+# permanent: true
 #
 # Content-addressed keys mean a local file is always correct if it exists.
 # Cache dir: /tmp/judgemind-archive/ (mirrors S3 key structure)

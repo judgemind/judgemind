@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # venv: scraper-framework
+# permanent: true
 """Spot-check case detail pages for data quality issues.
 
 Takes screenshots of multiple case detail pages from the rulings feed

@@ -1,9 +1,10 @@
 # venv: none
-"""Unit tests for check-script-headers.py (#2533)."""
+"""Unit tests for check-script-headers.py (#2533, #2547)."""
 
 from __future__ import annotations
 
 import importlib.util
+import json
 import subprocess
 import sys
 import textwrap
@@ -21,8 +22,12 @@ spec.loader.exec_module(check_script_headers)
 
 matches_one_off_pattern = check_script_headers.matches_one_off_pattern
 has_marker = check_script_headers.has_marker
+has_permanent_marker = check_script_headers.has_permanent_marker
+has_one_off_marker = check_script_headers.has_one_off_marker
 iter_candidate_files = check_script_headers.iter_candidate_files
 find_unmarked_scripts = check_script_headers.find_unmarked_scripts
+find_unmarked_all_scripts = check_script_headers.find_unmarked_all_scripts
+count_markers = check_script_headers.count_markers
 ONE_OFF_NAME_PATTERNS = check_script_headers.ONE_OFF_NAME_PATTERNS
 
 
@@ -206,6 +211,31 @@ class TestHasMarker:
 
 
 # ---------------------------------------------------------------------------
+# has_permanent_marker / has_one_off_marker (#2547)
+# ---------------------------------------------------------------------------
+
+
+class TestMarkerKindPredicates:
+    def test_permanent_only_matches_permanent(self, tmp_path: Path) -> None:
+        path = tmp_path / "utility.py"
+        path.write_text('"""Perma."""\n# permanent: true\n')
+        assert has_permanent_marker(path)
+        assert not has_one_off_marker(path)
+
+    def test_one_off_only_matches_one_off(self, tmp_path: Path) -> None:
+        path = tmp_path / "backfill_x.py"
+        path.write_text('"""Transient."""\n# one-off: true\n')
+        assert has_one_off_marker(path)
+        assert not has_permanent_marker(path)
+
+    def test_no_marker(self, tmp_path: Path) -> None:
+        path = tmp_path / "plain.py"
+        path.write_text('"""Nothing."""\n')
+        assert not has_permanent_marker(path)
+        assert not has_one_off_marker(path)
+
+
+# ---------------------------------------------------------------------------
 # iter_candidate_files
 # ---------------------------------------------------------------------------
 
@@ -264,7 +294,7 @@ class TestIterCandidateFiles:
 
 
 # ---------------------------------------------------------------------------
-# find_unmarked_scripts
+# find_unmarked_scripts (historical narrow behaviour, #2533)
 # ---------------------------------------------------------------------------
 
 
@@ -281,6 +311,7 @@ class TestFindUnmarkedScripts:
         assert find_unmarked_scripts([tmp_path]) == []
 
     def test_non_matching_name_not_flagged(self, tmp_path: Path) -> None:
+        # Narrow mode: only name-pattern scripts are flagged.
         (tmp_path / "utility.py").write_text('"""Not a one-off name."""\n')
         assert find_unmarked_scripts([tmp_path]) == []
 
@@ -307,18 +338,152 @@ class TestFindUnmarkedScripts:
 
 
 # ---------------------------------------------------------------------------
+# find_unmarked_all_scripts (new default behaviour, #2547)
+# ---------------------------------------------------------------------------
+
+
+class TestFindUnmarkedAllScripts:
+    def test_unmarked_name_pattern_flagged(self, tmp_path: Path) -> None:
+        (tmp_path / "backfill_missing.py").write_text('"""Missing marker."""\n')
+        result = find_unmarked_all_scripts([tmp_path])
+        assert [p.name for p in result] == ["backfill_missing.py"]
+
+    def test_unmarked_non_pattern_also_flagged(self, tmp_path: Path) -> None:
+        # New behaviour: scripts NOT matching the name pattern are ALSO
+        # required to carry a marker. This is the central change in #2547.
+        (tmp_path / "utility.py").write_text('"""Not a one-off name."""\n')
+        result = find_unmarked_all_scripts([tmp_path])
+        assert [p.name for p in result] == ["utility.py"]
+
+    def test_permanent_marked_script_is_ok(self, tmp_path: Path) -> None:
+        (tmp_path / "utility.py").write_text(
+            '"""Permanent utility."""\n# permanent: true\n'
+        )
+        assert find_unmarked_all_scripts([tmp_path]) == []
+
+    def test_one_off_marked_script_is_ok(self, tmp_path: Path) -> None:
+        (tmp_path / "utility.py").write_text('"""Finite."""\n# one-off: true\n')
+        assert find_unmarked_all_scripts([tmp_path]) == []
+
+    def test_archive_subdir_still_excluded(self, tmp_path: Path) -> None:
+        archive = tmp_path / "archive"
+        archive.mkdir()
+        (archive / "utility_old.py").write_text('"""No marker."""\n')
+        assert find_unmarked_all_scripts([tmp_path]) == []
+
+    def test_check_script_itself_exempt(self, tmp_path: Path) -> None:
+        # The check script itself is in _ALWAYS_EXEMPT_BASENAMES — it
+        # has no need to declare itself since it IS the convention.
+        (tmp_path / "check-script-headers.py").write_text('"""Check."""\n')
+        assert find_unmarked_all_scripts([tmp_path]) == []
+
+
+# ---------------------------------------------------------------------------
+# count_markers (#2547)
+# ---------------------------------------------------------------------------
+
+
+class TestCountMarkers:
+    def test_counts_empty_dir(self, tmp_path: Path) -> None:
+        assert count_markers([tmp_path]) == {
+            "total": 0,
+            "permanent": 0,
+            "one_off": 0,
+            "unmarked": 0,
+        }
+
+    def test_counts_mixed(self, tmp_path: Path) -> None:
+        (tmp_path / "p1.py").write_text('"""p."""\n# permanent: true\n')
+        (tmp_path / "p2.py").write_text('"""p."""\n# permanent: true\n')
+        (tmp_path / "o1.py").write_text('"""o."""\n# one-off: true\n')
+        (tmp_path / "u1.py").write_text('"""u."""\n')
+        result = count_markers([tmp_path])
+        assert result == {
+            "total": 4,
+            "permanent": 2,
+            "one_off": 1,
+            "unmarked": 1,
+        }
+
+    def test_counts_exclude_archive(self, tmp_path: Path) -> None:
+        (tmp_path / "p.py").write_text('"""p."""\n# permanent: true\n')
+        archive = tmp_path / "archive"
+        archive.mkdir()
+        (archive / "archived.py").write_text('"""old."""\n')
+        result = count_markers([tmp_path])
+        # Only the top-level p.py counts — archive/ is excluded.
+        assert result == {
+            "total": 1,
+            "permanent": 1,
+            "one_off": 0,
+            "unmarked": 0,
+        }
+
+    def test_sum_equals_total(self, tmp_path: Path) -> None:
+        # Property: permanent + one_off + unmarked == total.
+        (tmp_path / "a.py").write_text('"""a."""\n# permanent: true\n')
+        (tmp_path / "b.py").write_text('"""b."""\n# one-off: true\n')
+        (tmp_path / "c.py").write_text('"""c."""\n')
+        (tmp_path / "d.py").write_text('"""d."""\n# permanent: true\n')
+        result = count_markers([tmp_path])
+        assert (
+            result["permanent"] + result["one_off"] + result["unmarked"]
+            == result["total"]
+        )
+
+    def test_counts_exempt_check_script(self, tmp_path: Path) -> None:
+        # The check script itself is exempt — it must not appear in counts.
+        (tmp_path / "check-script-headers.py").write_text('"""Check script."""\n')
+        (tmp_path / "utility.py").write_text('"""u."""\n# permanent: true\n')
+        result = count_markers([tmp_path])
+        assert result == {
+            "total": 1,
+            "permanent": 1,
+            "one_off": 0,
+            "unmarked": 0,
+        }
+
+    def test_real_scripts_dir_marker_counts(self) -> None:
+        # The repo's real scripts/ directory: confirm the counts are
+        # populated as expected. The specific numbers drift, but the
+        # invariant must hold: unmarked == 0 (every script is marked)
+        # and total matches len(glob("*.py")) - 1 (exempt check script).
+        scripts_dir = SCRIPT_PATH.parent
+        counts = count_markers([scripts_dir])
+        all_top_py = [
+            p for p in scripts_dir.glob("*.py") if p.name != "check-script-headers.py"
+        ]
+        assert counts["total"] == len(all_top_py)
+        assert counts["unmarked"] == 0, (
+            "Unmarked scripts found — baseline broken. Run "
+            "scripts/check-script-headers.py to list."
+        )
+        assert (
+            counts["permanent"] + counts["one_off"] + counts["unmarked"]
+            == counts["total"]
+        )
+
+
+# ---------------------------------------------------------------------------
 # End-to-end: real scripts/ directory should pass.
 # ---------------------------------------------------------------------------
 
 
 class TestAgainstRealScriptsDir:
-    def test_real_scripts_dir_passes(self) -> None:
-        # The repo's own scripts/ must pass this check at all times;
-        # otherwise the baseline is broken and a human should add the
-        # missing markers.
+    def test_real_scripts_dir_passes_narrow(self) -> None:
+        # Historical narrow check: name-pattern scripts must carry a marker.
         scripts_dir = SCRIPT_PATH.parent
         unmarked = find_unmarked_scripts([scripts_dir])
         assert unmarked == [], "Unmarked one-off scripts detected:\n" + "\n".join(
+            f"  {p}" for p in unmarked
+        )
+
+    def test_real_scripts_dir_passes_all(self) -> None:
+        # New (#2547) default check: every top-level script must carry a
+        # marker. Baseline must be green at all times.
+        scripts_dir = SCRIPT_PATH.parent
+        unmarked = find_unmarked_all_scripts([scripts_dir])
+        assert unmarked == [], "Unmarked top-level scripts detected:\n" + "\n".join(
             f"  {p}" for p in unmarked
         )
 
@@ -330,7 +495,7 @@ class TestAgainstRealScriptsDir:
 
 class TestCli:
     def test_cli_exits_zero_on_clean_dir(self, tmp_path: Path) -> None:
-        (tmp_path / "utility.py").write_text('"""Fine."""\n')
+        (tmp_path / "utility.py").write_text('"""Fine."""\n# permanent: true\n')
         result = subprocess.run(
             [sys.executable, str(SCRIPT_PATH), str(tmp_path)],
             capture_output=True,
@@ -339,7 +504,7 @@ class TestCli:
         )
         assert result.returncode == 0, result.stderr
 
-    def test_cli_exits_one_on_violation(self, tmp_path: Path) -> None:
+    def test_cli_exits_one_on_violation_name_pattern(self, tmp_path: Path) -> None:
         (tmp_path / "backfill_missing.py").write_text('"""No marker."""\n')
         result = subprocess.run(
             [sys.executable, str(SCRIPT_PATH), str(tmp_path)],
@@ -349,6 +514,31 @@ class TestCli:
         )
         assert result.returncode == 1
         assert "backfill_missing.py" in result.stderr
+
+    def test_cli_exits_one_on_violation_non_pattern(self, tmp_path: Path) -> None:
+        # #2547: scripts NOT matching the one-off name pattern are ALSO
+        # required to carry a marker under the default (broad) check.
+        (tmp_path / "utility.py").write_text('"""No marker."""\n')
+        result = subprocess.run(
+            [sys.executable, str(SCRIPT_PATH), str(tmp_path)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode == 1
+        assert "utility.py" in result.stderr
+
+    def test_cli_narrow_mode_skips_non_pattern(self, tmp_path: Path) -> None:
+        # --narrow falls back to the historical (#2533) behaviour: only
+        # name-pattern scripts are flagged; plain utility.py is ignored.
+        (tmp_path / "utility.py").write_text('"""No marker."""\n')
+        result = subprocess.run(
+            [sys.executable, str(SCRIPT_PATH), "--narrow", str(tmp_path)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode == 0, result.stderr
 
     def test_cli_default_scans_repo_scripts(self) -> None:
         # No args -> scans the scripts/ directory where the check lives.
@@ -360,3 +550,39 @@ class TestCli:
         )
         # The real scripts/ directory should pass.
         assert result.returncode == 0, result.stderr
+
+    def test_cli_count_mode_emits_json(self, tmp_path: Path) -> None:
+        (tmp_path / "p.py").write_text('"""p."""\n# permanent: true\n')
+        (tmp_path / "o.py").write_text('"""o."""\n# one-off: true\n')
+        (tmp_path / "u.py").write_text('"""u."""\n')
+        result = subprocess.run(
+            [sys.executable, str(SCRIPT_PATH), "--count", str(tmp_path)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode == 0, result.stderr
+        counts = json.loads(result.stdout)
+        assert counts == {
+            "total": 3,
+            "permanent": 1,
+            "one_off": 1,
+            "unmarked": 1,
+        }
+
+    def test_cli_count_mode_no_paths_scans_repo(self) -> None:
+        # --count with no paths scans the real scripts/ directory.
+        result = subprocess.run(
+            [sys.executable, str(SCRIPT_PATH), "--count"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode == 0, result.stderr
+        counts = json.loads(result.stdout)
+        assert counts["unmarked"] == 0
+        assert counts["total"] > 0
+        assert (
+            counts["permanent"] + counts["one_off"] + counts["unmarked"]
+            == counts["total"]
+        )

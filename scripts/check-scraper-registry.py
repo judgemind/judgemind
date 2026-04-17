@@ -16,6 +16,7 @@ Exit codes:
 
 See https://github.com/judgemind/judgemind/issues/2132 for context.
 """
+# permanent: true
 
 from __future__ import annotations
 

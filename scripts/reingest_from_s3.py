@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # venv: scraper-framework
+# permanent: true
 """Re-ingest existing documents from S3 through the pipeline.
 
 **This script operates on existing database records only.** It queries the

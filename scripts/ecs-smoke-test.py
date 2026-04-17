@@ -16,6 +16,7 @@ or state changes.
 Exit code 0 means the environment is healthy.
 Exit code 1 means one or more checks failed.
 """
+# permanent: true
 
 from __future__ import annotations
 

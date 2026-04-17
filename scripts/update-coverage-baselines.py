@@ -35,6 +35,7 @@ Example:
         --coverage-file coverage-artifacts/coverage-scraper-framework/coverage.xml \
         --coverage-file coverage-artifacts/coverage-scraper-ingestion/coverage.xml
 """
+# permanent: true
 
 import argparse
 import json

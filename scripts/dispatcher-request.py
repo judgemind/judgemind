@@ -18,6 +18,7 @@ dispatcher is reading from the same file concurrently.
 The default inbox file is ``tmp/dispatcher_inbox.json`` relative to the
 repo root.  Override with ``--inbox-file``.
 """
+# permanent: true
 
 from __future__ import annotations
 

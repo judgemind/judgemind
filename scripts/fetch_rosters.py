@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # venv: scraper-framework
+# permanent: true
 """Fetch all court directory snapshots and archive to S3 + DB.
 
 Runs every CourtDirectory subclass, archives raw HTML to S3, and stores

@@ -278,7 +278,7 @@ For detailed infrastructure reference (Vercel, Terraform state, ECS, secrets), s
 
 See **`docs/agent/code-standards.md`** for the full reference (Python/TypeScript/Terraform style, one-off script conventions, pre-PR commands, coverage gates). Highlights every agent must internalize:
 
-- **Python:** 3.12+, `.venv` per package, ruff + pytest. Scripts in `scripts/` need a `# venv:` header; one-off scripts also need `# one-off: true`. ECS oneshot scripts cannot import from other `scripts/*.py` files.
+- **Python:** 3.12+, `.venv` per package, ruff + pytest. Scripts in `scripts/` need a `# venv:` header, plus exactly one of `# one-off: true` or `# permanent: true` (see `docs/agent/code-standards.md` §Python scripts). ECS oneshot scripts cannot import from other `scripts/*.py` files.
 - **TypeScript:** strict mode, Node 20+. In `packages/web/`, use `@/` path aliases; any new GraphQL type without `id` needs a `keyFields` entry in `apollo-client.ts`.
 - **General:** all code has tests. Never hardcode secrets. When removing/renaming exports, grep every import site across `src/` and `tests/` before committing.
 - **Perf:** watch for sequential I/O, `LIMIT/OFFSET` pagination, unbatched DB writes, missing connection reuse.

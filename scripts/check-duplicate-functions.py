@@ -18,6 +18,7 @@ Exit codes:
 
 Ref: https://github.com/judgemind/judgemind/issues/1300
 """
+# permanent: true
 from __future__ import annotations
 
 import ast

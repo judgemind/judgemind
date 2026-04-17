@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # venv: scraper-framework
+# permanent: true
 """Audit field completeness across all counties.
 
 Queries the database and produces a per-county report showing what

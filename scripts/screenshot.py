@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # venv: scraper-framework
+# permanent: true
 """Take a screenshot of a page on dev.judgemind.org.
 
 Usage:

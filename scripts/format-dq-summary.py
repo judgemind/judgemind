@@ -22,6 +22,7 @@ Options:
 
 Exit code: 0 on success, 1 if no alert data could be extracted.
 """
+# permanent: true
 
 from __future__ import annotations
 

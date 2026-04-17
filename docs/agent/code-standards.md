@@ -25,7 +25,7 @@ from __future__ import annotations
 
 Run scripts via `scripts/run-py.sh scripts/<name>.py` — it reads the header and activates the correct venv automatically.
 
-**One-off and permanent markers.** Top-level scripts whose filename contains `backfill`, `cleanup`, `fix`, `dedup`, `merge`, `migrate`, or `remediat` must carry exactly one of the following markers, as a standalone top-level comment anywhere in the **first 50 lines** of the file (the header comment block — the marker sits adjacent to the `# venv:` header, typically just before or after the module docstring):
+**One-off and permanent markers.** **Every** top-level script must carry exactly one of the following markers, as a standalone top-level comment anywhere in the **first 50 lines** of the file (the header comment block — the marker sits adjacent to the `# venv:` header, typically just before or after the module docstring):
 
 - `# one-off: true` — finite-lifetime script (backfills, cleanups, fixups) tied to a specific bug fix or migration. Candidate for archival to `scripts/archive/` once its work is done.
 - `# permanent: true` — re-runnable utility (parameterizable, idempotent, intended to be invoked repeatedly). Exempt from one-off staleness checks.
@@ -40,7 +40,9 @@ from __future__ import annotations
 
 The 50-line window is enforced by `scripts/check-script-headers.py` (CI job `script-headers-check`, and `.githooks/pre-push`). The window accommodates long module docstrings — e.g. `scripts/backfill_llm_enrichment.py` has a 29-line docstring and carries `# permanent: true` on line 32, which the old "first 10 lines" rule-of-thumb incorrectly flagged (see #2533). If a marker would otherwise land past line 50, shorten the docstring rather than expanding the window.
 
-Eval scripts (`scripts/eval/`) and archived scripts (`scripts/archive/`) are excluded from this convention.
+Historical note: the original (#2533) convention only required a marker on scripts whose filename matched `backfill`, `cleanup`, `fix`, `dedup`, `merge`, `migrate`, or `remediat`. #2547 extended the requirement to ALL top-level scripts so the `/audit` skill (§1.9) can use `permanent_count + 5` as a self-adjusting `scripts/*.py` count threshold — a new permanent utility raises the ceiling automatically; a new one-off consumes a slot of headroom. Run `scripts/check-script-headers.py --count` to see the current marker breakdown. The historical narrow scan is still available via `scripts/check-script-headers.py --narrow` for callers that want the #2533 behaviour.
+
+The `archive/`, `eval/`, `tests/`, and `spotcheck/` subdirectories under `scripts/` are excluded from the scan.
 
 **ECS oneshot constraint:** Scripts run via `ecs-run-task.sh` are uploaded as single files — they **cannot import other `.py` files from `scripts/`**. Only stdlib and installed packages are available. If you need shared code, either inline it, use a lazy import inside a function (for optional features), or move the shared code into an installed package. CI enforces this via `scripts/check-oneshot-imports.sh`. Scripts that are never run as ECS oneshots can be added to the `LOCAL_ONLY` list in that script.
 

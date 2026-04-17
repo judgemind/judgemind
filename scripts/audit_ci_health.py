@@ -31,6 +31,7 @@ Exit codes:
     1 — at least one threshold violation or trend regression detected
     2 — error (network, auth, malformed data)
 """
+# permanent: true
 
 from __future__ import annotations
 
