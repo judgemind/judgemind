@@ -92,7 +92,7 @@ jobs:
               - '.github/workflows/ci.yml'
             githooks:
               - '.githooks/**'
-              - 'scripts/tests/test_pre_push_hook.sh'
+              - 'scripts/tests/test_pre_push.sh'
               - '.github/workflows/ci.yml'
       - name: Check if any coverage-producing package changed
         id: any-testable
@@ -968,7 +968,11 @@ jobs:
           echo "All ${#tests[@]} hook test suite(s) passed."
 
   # ---------------------------------------------------------------
-  # Git pre-push hook test: regression guard for stdin field parsing (#2487)
+  # Git pre-push hook integration tests (#2488).
+  # Originally a regression guard for the #2487 stdin field-order bug;
+  # #2488 expanded it into a full scenario suite (clean push, new/existing
+  # branch detection, delete push, markdown-link rejection, WARNING paths
+  # for missing ruff/actionlint/terraform).
   # ---------------------------------------------------------------
   githooks-pre-push-test:
     needs: detect-changes
@@ -976,8 +980,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - name: Run pre-push hook regression test
-        run: scripts/tests/test_pre_push_hook.sh
+      - name: Run pre-push hook integration tests
+        run: scripts/tests/test_pre_push.sh
 
   # ---------------------------------------------------------------
   # ECS oneshot Docker integration test: run scripts in a container
