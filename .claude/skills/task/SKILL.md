@@ -10,6 +10,8 @@ Pick up one issue from the Judgemind backlog and complete it autonomously. Do no
 
 **IMPORTANT — No backgrounding.** Do not use `run_in_background` on any Bash command, Agent tool call, or any other operation anywhere in a `/task` agent. All work runs synchronously in the foreground. The `/task` agent is already a background subagent from the dispatcher's perspective — further backgrounding causes completion notifications to surface in the wrong context (the dispatcher), leading to confusion and lost results.
 
+**IMPORTANT — Post-compaction recovery.** If your context was just autocompacted (your summary references "previous conversation"), you are NOT done with the task. Autocompaction preserves *what was done* but not the procedural imperative *what still needs to happen next* (see #2545). Before emitting any final report or `end_turn`, run the status-file-driven recovery check described in §A.0 (implementation tasks) or §B.0 (investigation tasks). The status file at `{repo_root}/tmp/agent-status/<agent-id>.txt` is your authoritative "where am I" anchor — re-read this SKILL.md from the section named by your current `phase` and continue. Only `phase=done`, `phase=verified`, or `phase=blocked` means stop.
+
 ---
 
 ## Step 0 — Verify worktree exists
@@ -28,7 +30,7 @@ mkdir -p {worktree}/tmp
 
 ### Status file setup
 
-After confirming the worktree, set up the agent status file so the dispatcher can monitor progress. Derive an identifier from the worktree path (e.g. `agent-ab4722a2` from `.claude/worktrees/agent-ab4722a2`, or `worker-2` from `worktrees/worker-2`).
+After confirming the worktree, set up the agent status file so the dispatcher can monitor progress **and so you can recover from autocompact**. Derive an identifier from the worktree path (e.g. `agent-ab4722a2` from `.claude/worktrees/agent-ab4722a2`, or `worker-2` from `worktrees/worker-2`).
 
 The status file lives at `{repo_root}/tmp/agent-status/{agent-id}.txt` (in the **repo root's** `tmp/`, not the worktree's `tmp/`). Create the directory if needed:
 
@@ -43,11 +45,15 @@ issue: #<N>
 phase: <phase>
 updated: <ISO-8601 timestamp>
 summary: <one-line description of current activity>
+autocompact_count: <integer, optional — increment on each post-compaction recovery>
+final_phase: <phase, optional — written only when the task ends>
 ```
 
 Phases (in typical order): `claiming`, `setup`, `ralph-worker (iteration N)`, `ralph-reviewer (iteration N)`, `pushing`, `ci-watch`, `ci-fix`, `merging`, `deploying`, `verifying`, `retrospective`, `done`, `blocked`.
 
-**Write a status update at every major step transition** — use the Write tool to overwrite the status file. The first update should be written immediately after worktree setup with phase `claiming`.
+**Terminal phases** (the task is actually finished): `done`, `verified`, `blocked`. Any other phase means work remains — you MUST continue.
+
+**Write a status update at every major step transition** — use the Write tool to overwrite the status file. The first update should be written immediately after worktree setup with phase `claiming`. The status file is your post-compaction recovery anchor — see §A.0 and §B.0 below.
 
 ### Phase timing instrumentation
 
@@ -190,6 +196,28 @@ Follow the full PR Workflow defined in CLAUDE.md. **All commits must be on the w
 
 **IMPORTANT — Completion contract:** This task is NOT done after implementation or after ralph says SHIP. The task requires completing ALL substeps A.1 through A.9. After ralph returns, you MUST continue with A.2b (process summary), A.3 (commit/push), A.4 (merge conflicts), A.5 (CI), A.6 (PR update), A.7 (merge), A.8 (deploy verification), and A.9 (retrospective). Stopping after ralph is a bug — see issue #721.
 
+#### A.0 — Post-compaction recovery (READ FIRST after any context reset)
+
+**When this applies:** Your context just went through autocompaction (the conversation summary references "previous conversation"), or you are otherwise starting a turn without a clear memory of which A.x phase you are in. Autocompaction preserves implementation details but elides procedural imperatives, so the summary alone cannot tell you whether the task is complete — the **status file** is authoritative (see #2545).
+
+**What to do — mechanical procedure:**
+
+1. **Run the recovery check:**
+   ```
+   {worktree}/scripts/check-task-recovery.sh {worktree}
+   ```
+   - **Exit 0 (`DONE`):** the status file shows a terminal phase (`done`, `verified`, `blocked`). The task is actually complete. You may emit your final report and end the turn.
+   - **Exit 1 (`RESUME`):** work remains. The script prints the next required step (e.g. `A.2b — post process summary on issue`). Continue from that step — do NOT emit `end_turn`, do NOT produce a final report.
+   - **Exit 2 (`UNKNOWN`):** the status file is missing or malformed. Assume work remains. Re-read this SKILL.md from the top and reconstruct phase from git state (uncommitted changes? PR open? CI green?) before proceeding.
+
+2. **Increment `autocompact_count`** in the status file so the dispatcher can track the pattern. If the file currently has no `autocompact_count` field, add one initialized to `1`. Otherwise increment the existing value.
+
+3. **Re-read this SKILL.md** from the step named in the `RESUME` output — e.g. if the script says "next step: A.2b", read A.2b and onward before taking any further action.
+
+4. **Do NOT emit `end_turn`** until `check-task-recovery.sh` returns exit 0 (`DONE`). This is the same completion contract as the normal flow, but made explicit because the compacted summary may have dropped it.
+
+**Why this section exists:** Two confirmed incidents (#2500, #2502) showed /task agents emitting `end_turn` after autocompact with `phase=ralph-worker (1)` in the status file — i.e. still mid-implementation, with uncommitted changes, no PR, and no merge. The agents read their own "iteration 1 COMPLETE" artifact as a done-signal and stopped. The recovery script is the mechanical self-check that prevents this failure mode.
+
 #### A.1 — Set up dependencies
 Write status: `phase: setup`, `summary: Installing dependencies for <packages>`.
 Also start the phase timer: `python3 {worktree}/scripts/phase_timer.py start {worktree} setup`
@@ -223,8 +251,9 @@ Skip this for Terraform-only or docs-only tasks.
 1. Run `git -C {worktree} status` to confirm there are uncommitted changes (there should be — ralph implements but does not commit).
 2. Run `git -C {worktree} log --oneline -1` to see the latest commit — it should NOT contain the current issue number (the implementation hasn't been committed yet).
 3. Check whether a PR already exists for this branch: `gh pr list --repo judgemind/judgemind --head <branch-name> --json number --limit 1`. It should return an empty list (no PR yet).
+4. Run the authoritative recovery check: `{worktree}/scripts/check-task-recovery.sh {worktree}`. It must return exit 1 (`RESUME`). If it returns 0 (`DONE`), that means the status file shows a terminal phase you did not intend — update the status file to reflect the actual phase and re-run the check.
 
-If any of these checks show that work remains (uncommitted changes exist, no PR yet), you MUST continue to A.2b. Do not exit. Do not return. Do not consider the task done. Exiting at this point is a critical workflow failure (#721).
+If any of these checks show that work remains (uncommitted changes exist, no PR yet), you MUST continue to A.2b. Do not exit. Do not return. Do not consider the task done. Exiting at this point is a critical workflow failure (#721, #2545).
 
 #### A.2b — Post process summary on issue (MANDATORY)
 
@@ -492,6 +521,26 @@ Continue to Step 5.
 
 Write findings to `docs/investigations/<slug>-<YYYY-MM>.md` and/or into the issue body.
 
+#### B.0 — Post-compaction recovery (READ FIRST after any context reset)
+
+**When this applies:** Same as §A.0 — your context just went through autocompaction, or you are otherwise starting a turn without a clear memory of which B.x phase you are in.
+
+**What to do:**
+
+1. **Run the recovery check:**
+   ```
+   {worktree}/scripts/check-task-recovery.sh {worktree}
+   ```
+   - **Exit 0 (`DONE`):** the status file shows `done`, `verified`, or `blocked`. Stop.
+   - **Exit 1 (`RESUME`):** work remains. Continue from the step after the phase in the status file. Investigation-task phases commonly end at `done` only after B.3 (unblock dependents) runs; a phase like `implementing` or `retrospective` still means there is more to do.
+   - **Exit 2 (`UNKNOWN`):** re-read this SKILL.md and determine phase from git / GitHub state.
+
+2. **Increment `autocompact_count`** in the status file.
+
+3. **Re-read this SKILL.md** from the step named in the `RESUME` output (B.1, B.1.5, B.2, B.3, or Step 5).
+
+4. **Do NOT emit `end_turn`** until the recovery check returns exit 0.
+
 #### B.1 — File follow-up issues for every actionable finding
 
 Do not just list recommendations — **create GitHub issues** for each concrete next step so the work is tracked and can be picked up by agents. For each follow-up:
@@ -584,13 +633,19 @@ If the task was trivial and there are genuinely no improvements to make, that's 
 
 ### 5d — Generate timing summary
 
-Write status: `phase: done`, `summary: Task complete.`
+Write status: `phase: done`, `summary: Task complete.`, and add a `final_phase: done` line so the dispatcher's post-mortem tooling can distinguish a properly-ended agent from one that emitted `end_turn` mid-workflow (see #2545).
 
 **Generate the timing summary before the agent exits:**
 ```
 python3 {worktree}/scripts/phase_timer.py summarize {worktree} {repo_root} <issue_number>
 ```
 This writes `{worktree}/tmp/timing.json` with the full phase breakdown and appends a one-line summary to `{repo_root}/tmp/task-timings.jsonl`. The dispatcher can aggregate these across tasks to identify systemic bottlenecks.
+
+**Final recovery self-check** (sanity gate before exit):
+```
+{worktree}/scripts/check-task-recovery.sh {worktree}
+```
+This must return exit 0 (`DONE`). If it returns 1 (`RESUME`), the status file was not updated to `done` — fix the status file and re-run. This guards against the #2545 failure mode where an agent writes a retrospective-looking final message while the status file still shows a non-terminal phase.
 
 Worktree cleanup is handled automatically by Claude Code when the agent exits.
 
@@ -604,4 +659,5 @@ Worktree cleanup is handled automatically by Claude Code when the agent exits.
 - **Multi-line Python always goes in a `.py` file**, never `-c '...'`.
 - **No `run_in_background`.** All commands — CI watches, test suites, deploy watches, and reviewer invocations — must run in the foreground. Subagents are already background tasks from the parent's perspective. Further backgrounding causes `<task-notification>` messages to surface in the wrong context, leading to confusion and lost results.
 - **Use `timeout: 1200000`** on Bash commands that may exceed 2 minutes: `pytest`, `gh run watch`, `pip install`, `npm install`, `npm run build`, `terraform apply`, `ruff check` on large codebases, and any data-processing script.
+- **After any context reset, run §A.0 / §B.0 recovery** — `{worktree}/scripts/check-task-recovery.sh {worktree}` is the authoritative "am I done?" check.
 - See CLAUDE.md §Unattended Operation Patterns for the full list.
