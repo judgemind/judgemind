@@ -132,14 +132,18 @@ from ingestion.db import (  # noqa: E402
     upsert_case_judge,
 )
 from ingestion.extract import (  # noqa: E402
+    dedupe_repeated_title,
     extract_case_number,
     extract_case_type_from_motion_type,
     extract_case_type_from_number,
     extract_case_type_from_scraper_id,
     extract_hearing_date,
     extract_judge_name,
+    is_plausible_hearing_date,
+    is_probate_decedent_name,
     normalize_motion_type,
     normalize_outcome,
+    strip_trailing_case_number,
 )
 from ingestion.llm_extract import (  # noqa: E402
     LLMExtractionResult,
@@ -525,6 +529,75 @@ def _match_ruling(
         if matching:
             return matching[0]
     return llm_result.rulings[0]
+
+
+def apply_post_extraction_guards(
+    extracted: dict,
+    capture_timestamp: datetime | None,
+) -> None:
+    """Apply the #2370 post-extraction guards to a reingested ruling.
+
+    Mirrors the guard pipeline that ``IngestionWorker.process_event`` runs
+    after LLM/regex extraction, so reingest cannot produce rulings that
+    violate the guards.  The guards are (in order):
+
+    1. ``dedupe_repeated_title``: collapse "Foo v Bar\\nFoo v Bar" headers.
+    2. ``strip_trailing_case_number``: strip "Foo v Bar 30-2024-..." suffixes.
+    3. ``is_probate_decedent_name``: reject probate decedent names that the
+       LLM hallucinated as the judge.  Clears ``judge_name`` to ``None``
+       when the heuristic matches.
+    4. ``is_plausible_hearing_date``: reject hearing_dates more than 30
+       days before capture or more than 2 years after capture.  Clears
+       ``hearing_date`` to ``None`` when implausible.
+
+    Mutates ``extracted`` in place.  Expects
+    ``extracted["extraction_methods"]`` to exist as a ``dict`` — if a
+    guard clears a field, the corresponding ``extraction_methods`` entry
+    is popped so the caller cannot later re-use a stale provenance.
+
+    ``capture_timestamp`` may be ``None`` (e.g. when the fixture lacks a
+    timestamp, or the document was captured before the ``captured_at``
+    column was populated).  When ``None``, the ``is_plausible_hearing_date``
+    check is skipped — we cannot compare an unknown capture time against
+    a candidate hearing_date (#2405).
+    """
+    methods = extracted.setdefault("extraction_methods", {})
+
+    # Title guards (dedupe + trailing case number)
+    original_title = extracted.get("case_title")
+    cleaned_title = dedupe_repeated_title(original_title)
+    cleaned_title = strip_trailing_case_number(cleaned_title)
+    if cleaned_title != original_title:
+        logger.info(
+            "post-extraction guard: cleaned case_title",
+            original=original_title,
+            cleaned=cleaned_title,
+        )
+        extracted["case_title"] = cleaned_title
+
+    # Probate decedent guard — judge_name must not be the decedent
+    judge_name = extracted.get("judge_name")
+    case_title = extracted.get("case_title")
+    if judge_name and case_title and is_probate_decedent_name(judge_name, case_title):
+        logger.info(
+            "post-extraction guard: rejected probate decedent as judge",
+            judge_name=judge_name,
+            case_title=case_title,
+        )
+        extracted["judge_name"] = None
+        methods.pop("judge_name", None)
+
+    # Hearing date plausibility guard
+    hearing_date_value = extracted.get("hearing_date")
+    if hearing_date_value is not None and capture_timestamp is not None:
+        if not is_plausible_hearing_date(hearing_date_value, capture_timestamp):
+            logger.info(
+                "post-extraction guard: rejected implausible hearing_date",
+                hearing_date=hearing_date_value,
+                capture_timestamp=capture_timestamp,
+            )
+            extracted["hearing_date"] = None
+            methods.pop("hearing_date", None)
 
 
 def _apply_regex_fallbacks(extracted: dict, text: str, scraper_id: str = "") -> None:
@@ -2034,6 +2107,18 @@ def reingest_batch(
                     _supersede_document(conn, doc_id_str)
 
                 for extracted in extracted_list:
+                    # Apply #2370 post-extraction guards before any DB
+                    # write: dedupe_repeated_title, strip_trailing_case_number,
+                    # probate decedent rejection, hearing_date plausibility.
+                    # Reingest's own extraction path bypassed
+                    # ``IngestionWorker.process_event`` entirely, so this
+                    # call is the only place the guards run on reingested
+                    # rulings (#2405).
+                    apply_post_extraction_guards(
+                        extracted,
+                        doc_meta.get("captured_at"),
+                    )
+
                     # For rulings, use split_document_id if available;
                     # for documents, always use original document_id
                     # (matching ingestion worker behavior — one PDF = one
@@ -2108,6 +2193,14 @@ def reingest_batch(
                     # The helper guarantees the same document_id is passed
                     # to both insert_document and insert_ruling, preventing
                     # FK divergence (#1775).
+                    #
+                    # ``force_update=True`` overrides the default COALESCE
+                    # upsert semantics so reingest can overwrite bad
+                    # historical case_id / judge_id / hearing_date /
+                    # outcome / motion_type / department with the new
+                    # values (including NULL when a guard cleared the
+                    # field).  Text / summary fields always keep COALESCE —
+                    # see ``db.insert_ruling`` docstring (#2405).
                     insert_document_and_ruling(
                         conn,
                         document_id=effective_doc_id,
@@ -2130,6 +2223,7 @@ def reingest_batch(
                         # this guards against any missed code path.
                         outcome=normalize_outcome(extracted["outcome"]),
                         motion_type=extracted["motion_type"],
+                        force_update=True,
                     )
 
                     if judge_id:
