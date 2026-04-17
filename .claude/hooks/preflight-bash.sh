@@ -222,5 +222,51 @@ if echo "$COMMAND" | grep -qE '\bgit\b(\s+-C\s+\S+)?\s+worktree\s+add\b' ; then
     fi
 fi
 
+# 11. Cross-worktree writes via Bash (cp/mv/tar/redirection).
+#     Extends worktree-write-guard.sh (which covers Edit/Write) to the Bash tool.
+#     When a worktree subagent runs a command that writes into the main repo
+#     checkout but outside its own worktree, block — that bypasses the PR
+#     workflow the same way Edit/Write would. See issue #2455.
+#
+#     Detection (only active when cwd is inside .claude/worktrees/<id>/):
+#       - cp / mv: any positional argument that is an absolute path inside
+#         $REPO_ROOT/ (conservative — cp/mv both have a destination as the
+#         last arg, but checking all absolute-path args catches unusual shapes).
+#       - tar with -C <dir> or --directory=<dir>: <dir> is the destination.
+#       - Shell redirection > <path> / >> <path>: <path> is the destination.
+#
+#     Only absolute paths are checked. Relative paths resolve against CWD
+#     (the worktree), so they can't escape into the main repo.
+#
+#     Allowed absolute destinations:
+#       - inside $WORKTREE_ROOT/
+#       - inside $REPO_ROOT/tmp/ (cross-worktree status files, etc.)
+#       - outside $REPO_ROOT/ entirely (e.g. /tmp, /var, /Users/x/other-repo)
+#
+#     Blocked: inside $REPO_ROOT/ but outside the above allowlists.
+#
+#     Delegates command parsing to preflight_cross_worktree.py for
+#     maintainability — the parsing is non-trivial and easier to test in
+#     isolation.
+case "$EFFECTIVE_CWD" in
+    */.claude/worktrees/*)
+        CROSS_WT_REPO_ROOT="${EFFECTIVE_CWD%%/.claude/worktrees/*}"
+        CROSS_WT_REST="${EFFECTIVE_CWD#"$CROSS_WT_REPO_ROOT"/.claude/worktrees/}"
+        CROSS_WT_ID="${CROSS_WT_REST%%/*}"
+        CROSS_WT_ROOT="$CROSS_WT_REPO_ROOT/.claude/worktrees/$CROSS_WT_ID"
+        HOOK_DIR="$(dirname "$0")"
+        CROSS_WT_MSG=$(
+            COMMAND="$COMMAND" \
+            REPO_ROOT="$CROSS_WT_REPO_ROOT" \
+            WORKTREE_ROOT="$CROSS_WT_ROOT" \
+            python3 "$HOOK_DIR/preflight_cross_worktree.py" 2>/dev/null
+        )
+        if [ -n "$CROSS_WT_MSG" ]; then
+            echo "$CROSS_WT_MSG" >&2
+            exit 2
+        fi
+        ;;
+esac
+
 # All checks passed
 exit 0
