@@ -2,6 +2,30 @@
 
 Tests for standalone scripts in `scripts/`.
 
+## CI Execution
+
+The `scripts-tests` CI job auto-discovers and runs every executable
+`scripts/tests/*.sh` under a single loop (see `.github/workflows/ci.yml`,
+job `scripts-tests`, step `Run all scripts/tests shell tests`). Adding a
+new shell test is just `touch + chmod +x` — no ci.yml edit required.
+
+### Deferred tests (dedicated CI jobs)
+
+A small set of tests are intentionally **skipped** by the scripts-tests
+auto-discovery loop because they already run in a dedicated CI job with a
+narrower path filter. Running them in both places is wasted CI minutes.
+
+The skip list is maintained via the `SKIP_TESTS` env var on the
+`Run all scripts/tests shell tests` step. Current entries:
+
+| Test | Dedicated job | Trigger | Rationale |
+|---|---|---|---|
+| `test_pre_push.sh` | `githooks-pre-push-test` | `.githooks/**`, `scripts/tests/test_pre_push.sh`, `.github/workflows/ci.yml` | ~32s. Originally added to scripts-tests via #2505 auto-discovery; caused a +112% duration regression (#2536). |
+
+When adding a new "deferred" entry, make sure the dedicated job's path
+filter covers every file that the test exercises — otherwise relevant
+changes will no longer run the test in any job.
+
 ## CI Environment
 
 The `scripts-tests` CI job runs in a **minimal environment** with only these
