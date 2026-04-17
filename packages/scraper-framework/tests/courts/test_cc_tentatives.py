@@ -30,7 +30,7 @@ from courts.ca.cc_tentatives import (
     _cc_hearing_date_from_pdf,
     _cc_judge_from_pdf,
     _cc_llm_enabled,
-    _cc_llm_extract_rulings,
+    _llm_extract_rulings,
 )
 from courts.ca.cc_tentatives import default_config as cc_default_config
 from courts.ca.pdf_link_scraper import _extract_pdf_text
@@ -558,6 +558,84 @@ def test_cc_parse_document_no_hearing_date_extracts_from_pdf() -> None:
 
 
 # ---------------------------------------------------------------------------
+# parse_document guard against overwriting pre_split / LLM-extracted fields
+# (#2469)
+# ---------------------------------------------------------------------------
+
+
+@respx.mock
+def test_cc_parse_document_pre_split_preserves_fields() -> None:
+    """When doc.extra['pre_split'] is True, parse_document must not overwrite fields.
+
+    Regression test for #2469: the CC scraper's LLM path populates per-ruling
+    fields on each split child doc, but parse_document() used to run regex
+    extraction over the full PDF text and clobber those fields.  With the
+    guard in place, pre_split docs are returned unchanged.
+    """
+    config = cc_default_config()
+    scraper = CCTentativeRulingsScraper(config)
+
+    # Use a real multi-case PDF so regex WOULD find different values if run.
+    pdf_bytes = _load_bytes("cc_dept16_031126.pdf")
+    doc = scraper._make_base_doc(
+        source_url="https://example.com/test.pdf",
+        raw_content=pdf_bytes,
+        content_format="pdf",
+    )
+    # Simulate fields that the scraper-side LLM path would have populated.
+    doc.extra = {"pre_split": True}
+    doc.case_number = "P25-02117"
+    doc.case_title = "Cianci"
+    doc.ruling_text = "some ruling"
+    doc.motion_type = "motion_to_approve"
+    doc.outcome = "granted"
+    doc.parties = [{"name": "Jane Cianci", "role": "petitioner"}]
+
+    parsed = scraper.parse_document(doc)
+
+    # All pre-populated fields must survive parse_document unchanged.
+    assert parsed.case_number == "P25-02117"
+    assert parsed.case_title == "Cianci"
+    assert parsed.ruling_text == "some ruling"
+    assert parsed.motion_type == "motion_to_approve"
+    assert parsed.outcome == "granted"
+    assert parsed.parties == [{"name": "Jane Cianci", "role": "petitioner"}]
+    # And the extra flag is still set so downstream stages know the doc
+    # came from the pre_split path.
+    assert parsed.extra.get("pre_split") is True
+
+
+@respx.mock
+def test_cc_parse_document_llm_extracted_preserves_fields() -> None:
+    """When doc.extra['_llm_extracted'] is True, parse_document must not overwrite fields.
+
+    Belt-and-suspenders companion to the pre_split guard — LA's parse_document
+    guards on ``_llm_extracted`` rather than ``pre_split``, so CC guards on
+    both to stay consistent with either upstream convention (#2469).
+    """
+    config = cc_default_config()
+    scraper = CCTentativeRulingsScraper(config)
+
+    pdf_bytes = _load_bytes("cc_dept16_031126.pdf")
+    doc = scraper._make_base_doc(
+        source_url="https://example.com/test.pdf",
+        raw_content=pdf_bytes,
+        content_format="pdf",
+    )
+    doc.extra = {"_llm_extracted": True}
+    doc.case_number = "P25-02117"
+    doc.case_title = "Cianci"
+    doc.ruling_text = "some ruling"
+
+    parsed = scraper.parse_document(doc)
+
+    assert parsed.case_number == "P25-02117"
+    assert parsed.case_title == "Cianci"
+    assert parsed.ruling_text == "some ruling"
+    assert parsed.extra.get("_llm_extracted") is True
+
+
+# ---------------------------------------------------------------------------
 # Full scraper integration test — using respx to mock HTTP
 # ---------------------------------------------------------------------------
 
@@ -806,7 +884,7 @@ def test_cc_llm_extract_rulings_civil(mock_call_llm: MagicMock) -> None:
     mock_response.output_tokens = 500
     mock_call_llm.return_value = mock_response
 
-    result = _cc_llm_extract_rulings("Some PDF text content")
+    result = _llm_extract_rulings("Some PDF text content")
     assert result is not None
     assert len(result) == 2
 
@@ -834,7 +912,7 @@ def test_cc_llm_extract_rulings_probate(mock_call_llm: MagicMock) -> None:
     mock_response.output_tokens = 300
     mock_call_llm.return_value = mock_response
 
-    result = _cc_llm_extract_rulings("Some probate PDF text")
+    result = _llm_extract_rulings("Some probate PDF text")
     assert result is not None
     assert len(result) == 1
     assert result[0].case_number == "N25-2307"
@@ -850,7 +928,7 @@ def test_cc_llm_extract_rulings_null_response(mock_call_llm: MagicMock) -> None:
     """LLM returns None -> function returns None."""
     mock_call_llm.return_value = None
 
-    result = _cc_llm_extract_rulings("Some PDF text")
+    result = _llm_extract_rulings("Some PDF text")
     assert result is None
 
 
@@ -861,7 +939,7 @@ def test_cc_llm_extract_rulings_json_parse_error(mock_call_llm: MagicMock) -> No
     mock_response.text = "This is not valid JSON {{"
     mock_call_llm.return_value = mock_response
 
-    result = _cc_llm_extract_rulings("Some PDF text")
+    result = _llm_extract_rulings("Some PDF text")
     assert result is None
 
 
@@ -884,7 +962,7 @@ def test_cc_llm_extract_rulings_bare_list(mock_call_llm: MagicMock) -> None:
     mock_response.output_tokens = 200
     mock_call_llm.return_value = mock_response
 
-    result = _cc_llm_extract_rulings("Some PDF text")
+    result = _llm_extract_rulings("Some PDF text")
     assert result is not None
     assert len(result) == 1
     assert result[0].case_number == "C24-02490"
@@ -905,7 +983,7 @@ def test_cc_llm_extract_rulings_code_fences(mock_call_llm: MagicMock) -> None:
     mock_response.output_tokens = 200
     mock_call_llm.return_value = mock_response
 
-    result = _cc_llm_extract_rulings("Some PDF text")
+    result = _llm_extract_rulings("Some PDF text")
     assert result is not None
     assert len(result) == 1
     assert result[0].case_number == "L25-01552"
@@ -914,11 +992,11 @@ def test_cc_llm_extract_rulings_code_fences(mock_call_llm: MagicMock) -> None:
 @patch("ingestion.llm_providers.call_llm")
 def test_cc_llm_extract_rulings_empty_text(mock_call_llm: MagicMock) -> None:
     """Empty input text -> returns None without calling LLM."""
-    result = _cc_llm_extract_rulings("")
+    result = _llm_extract_rulings("")
     assert result is None
     mock_call_llm.assert_not_called()
 
-    result = _cc_llm_extract_rulings("   ")
+    result = _llm_extract_rulings("   ")
     assert result is None
     mock_call_llm.assert_not_called()
 
@@ -945,7 +1023,7 @@ def test_cc_llm_extract_rulings_outcome_mapping(mock_call_llm: MagicMock) -> Non
     mock_response.output_tokens = 300
     mock_call_llm.return_value = mock_response
 
-    result = _cc_llm_extract_rulings("Some text")
+    result = _llm_extract_rulings("Some text")
     assert result is not None
     assert result[0].outcome == "granted_in_part"
     assert result[1].outcome == "off_calendar"
@@ -972,7 +1050,7 @@ def test_cc_llm_extract_rulings_invalid_party_skipped(
     mock_response.output_tokens = 200
     mock_call_llm.return_value = mock_response
 
-    result = _cc_llm_extract_rulings("Some text")
+    result = _llm_extract_rulings("Some text")
     assert result is not None
     assert len(result[0].parties) == 1
     assert result[0].parties[0]["name"] == "Valid Name"
@@ -984,7 +1062,7 @@ def test_cc_llm_extract_rulings_invalid_party_skipped(
 
 
 @respx.mock
-@patch("courts.ca.cc_tentatives._cc_llm_extract_rulings")
+@patch("courts.ca.cc_tentatives._llm_extract_rulings")
 @patch("courts.ca.cc_tentatives._cc_llm_enabled", return_value=True)
 def test_cc_fetch_with_llm_enabled(
     mock_llm_enabled: MagicMock,
@@ -1070,7 +1148,7 @@ def test_cc_fetch_with_llm_enabled(
 
 
 @respx.mock
-@patch("courts.ca.cc_tentatives._cc_llm_extract_rulings")
+@patch("courts.ca.cc_tentatives._llm_extract_rulings")
 @patch("courts.ca.cc_tentatives._cc_llm_enabled", return_value=True)
 def test_cc_fetch_llm_fallback_on_failure(
     mock_llm_enabled: MagicMock,
