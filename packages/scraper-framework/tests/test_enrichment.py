@@ -287,7 +287,11 @@ class TestMatchCaseNumber:
         # No party overlap -> rejected
         assert result.match_type == "new"
 
-    def test_fuzzy_match_accepted_without_parties(self) -> None:
+    def test_fuzzy_match_accepted_with_none_parties_is_legacy(self) -> None:
+        """Legacy caller contract (#2467): ``extracted_parties=None`` means
+        the caller has no party data available at all — fall back to
+        distance-only acceptance for backwards compatibility.
+        """
         conn = _make_mock_conn()
         cursor = conn.cursor().__enter__()
         cursor.fetchone.return_value = None
@@ -299,12 +303,62 @@ class TestMatchCaseNumber:
         result = engine.match_case_number(
             "CIV-2024-001",
             "court-uuid",
+            extracted_parties=None,
+        )
+
+        # No party data provided at all -> fuzzy match accepted on distance alone.
+        assert result.match_type == "fuzzy"
+        assert result.levenshtein_distance == 1
+
+    def test_fuzzy_match_rejected_when_extracted_parties_empty_list(self) -> None:
+        """#2467 Scenario B: caller provides ``extracted_parties=[]`` (LLM
+        ran but extracted no parties for this ruling).  Even though the
+        candidate has parties, the absence of extracted parties means
+        we cannot validate the match via party identity — reject it.
+        """
+        conn = _make_mock_conn()
+        cursor = conn.cursor().__enter__()
+        cursor.fetchone.return_value = None
+        cursor.fetchall.return_value = [
+            ("case-uuid-456", "CIV2024002", ["alice", "bob"]),
+        ]
+
+        engine = EnrichmentEngine(conn)
+        result = engine.match_case_number(
+            "CIV-2024-001",
+            "court-uuid",
             extracted_parties=[],
         )
 
-        # No parties to compare -> fuzzy match accepted on distance alone
-        assert result.match_type == "fuzzy"
-        assert result.levenshtein_distance == 1
+        # Parties list explicitly empty -> cannot validate -> reject.
+        assert result.match_type == "new"
+        assert result.case_id == ""
+
+    def test_fuzzy_match_rejected_when_candidate_has_empty_parties(self) -> None:
+        """#2467 Scenario A (AC #1): the LLM returned a case_number with
+        extracted parties, but the Levenshtein-close candidate in the DB
+        has empty parties (e.g., because parties haven't been written yet
+        in the same batch).  The candidate MUST be rejected — we have no
+        way to validate that the two case_numbers refer to the same case.
+        """
+        conn = _make_mock_conn()
+        cursor = conn.cursor().__enter__()
+        cursor.fetchone.return_value = None
+        # DB fixture: existing case P25-02101 with NO parties yet.
+        cursor.fetchall.return_value = [
+            ("case-uuid-p25-02101", "P25-02101", []),
+        ]
+
+        engine = EnrichmentEngine(conn)
+        result = engine.match_case_number(
+            "P25-02118",
+            "court-uuid",
+            extracted_parties=["Vincent Trust"],
+        )
+
+        # Candidate has empty parties -> cannot validate identity -> reject.
+        assert result.match_type == "new"
+        assert result.case_id == ""
 
     def test_fuzzy_match_too_distant_rejected(self) -> None:
         conn = _make_mock_conn()
@@ -344,6 +398,100 @@ class TestMatchCaseNumber:
         # The closer candidate (distance=1) should win
         assert result.case_id == "case-uuid-b"
         assert result.confidence > 0.5
+
+
+# ---------------------------------------------------------------------------
+# EnrichmentEngine — Contra Costa probate regression (#2467)
+# ---------------------------------------------------------------------------
+
+
+class TestMatchCaseNumberProbateRegression:
+    """Regression tests for the Contra Costa probate calendar bug (#2467).
+
+    The original bug: when the LLM correctly returned three distinct
+    case_numbers (P25-02101 Csicsery, P25-02117 Cianci, P25-02118 Vincent)
+    for a single probate calendar PDF, the fuzzy-match layer silently
+    rewrote the latter two to P25-02101 because they were within
+    Levenshtein distance 2 and the existing DB row's parties had not yet
+    been written.  All three rulings collapsed onto one ``derived.cases``
+    row, overwriting the case_title to "Vincent Trust" in the process.
+
+    After the fix, each of the three distinct LLM-returned case_numbers
+    must remain distinct (``match_type="new"``) when parties on either
+    side are missing from the fuzzy-match candidate.
+    """
+
+    def test_three_distinct_probate_case_numbers_remain_distinct(self) -> None:
+        """AC #2 (unit-level): two distinct P25-0211x case numbers that
+        are Levenshtein-close to an earlier P25-02101 (whose DB row has
+        empty parties) must NOT fuzzy-match to it.
+
+        The third real ruling in the observed bug — P25-02101 itself —
+        is not exercised here because in production it would take the
+        exact-match path, not the fuzzy-match path.  This regression
+        test focuses on the only scenario that actually triggered the
+        bug: distinct case numbers within Levenshtein distance 2 of an
+        existing partyless row.
+        """
+        # Simulate the batch scenario from the CC probate PDF: P25-02101
+        # has been upserted with parties=[] (parties are written in a
+        # later step of the batch).  The following two LLM-returned
+        # case_numbers (both within Levenshtein distance 2 of P25-02101)
+        # should each become new cases, not collapse onto P25-02101.
+        llm_extractions = [
+            ("P25-02117", ["Cianci Family 1997 Revocable Trust"]),
+            ("P25-02118", ["George R. Vincent and Christie J. Vincent Revocable Trust"]),
+        ]
+
+        for case_number, parties in llm_extractions:
+            conn = _make_mock_conn()
+            cursor = conn.cursor().__enter__()
+            # Simulate DB state: P25-02101 exists with empty parties and
+            # no exact match for the raw_case_number being looked up.
+            cursor.fetchone.return_value = None
+            cursor.fetchall.return_value = [
+                ("case-uuid-p25-02101", "P25-02101", []),
+            ]
+
+            engine = EnrichmentEngine(conn)
+            result = engine.match_case_number(
+                case_number,
+                "court-uuid",
+                extracted_parties=parties,
+            )
+
+            # Each case_number must become a new case — never rewritten
+            # to P25-02101 via fuzzy match.
+            assert result.match_type == "new", (
+                f"case_number={case_number} was unexpectedly fuzzy-matched "
+                f"to {result.case_number!r} (#2467 regression)"
+            )
+            assert result.case_id == ""
+
+    def test_probate_fuzzy_match_still_accepted_when_parties_present(self) -> None:
+        """Sanity check: the fix only suppresses fuzzy matching when
+        party data is missing on either side.  When both sides have
+        overlapping parties, the fuzzy match still fires as before.
+        """
+        conn = _make_mock_conn()
+        cursor = conn.cursor().__enter__()
+        cursor.fetchone.return_value = None
+        cursor.fetchall.return_value = [
+            # Candidate has matching parties — this is a legitimate fuzzy
+            # match (e.g., typo correction).
+            ("case-uuid-p25-02101", "P25-02101", ["Csicsery Family Trust"]),
+        ]
+
+        engine = EnrichmentEngine(conn)
+        result = engine.match_case_number(
+            "P25-02102",  # typo: last digit off by one
+            "court-uuid",
+            extracted_parties=["Csicsery Family Trust"],
+        )
+
+        assert result.match_type == "fuzzy"
+        assert result.case_id == "case-uuid-p25-02101"
+        assert result.party_overlap == 1.0
 
 
 # ---------------------------------------------------------------------------

@@ -280,6 +280,15 @@ class EnrichmentEngine:
     min_party_overlap : float
         Minimum party overlap (Jaccard similarity) required for a fuzzy
         case number match to be accepted. Default is 0.3 (30%).
+
+        When party data is missing on either side (empty ``extracted_parties``
+        or empty candidate parties) and the caller has explicitly provided
+        a parties list (even an empty one), the fuzzy match is rejected —
+        there is no way to validate the match against party identity, and
+        silent acceptance collapses distinct rulings onto the same case
+        (see #2467).  Callers that have no party information at all should
+        pass ``extracted_parties=None`` to preserve the legacy
+        distance-only acceptance behavior.
     max_fuzzy_candidates : int
         Maximum number of candidate rows returned by the fuzzy case
         query.  Acts as a safety cap to prevent fetching thousands of
@@ -318,9 +327,15 @@ class EnrichmentEngine:
           2. Exact match on (court_id, case_number).
           3. If no exact match, fuzzy match against all cases in the court
              with Levenshtein distance <= max_levenshtein.
-          4. Among fuzzy candidates, check party overlap if parties provided.
-          5. If a good fuzzy match exists (distance <= threshold AND party
-             overlap >= threshold), use the existing case.
+          4. Among fuzzy candidates, require party-identity validation:
+             if the caller provided a parties list (``extracted_parties``
+             is not None), BOTH sides must have non-empty parties AND
+             overlap must be >= ``min_party_overlap``.  When party data
+             is missing on either side the candidate is rejected — we
+             cannot safely rewrite a case_number based on Levenshtein
+             distance alone when there is no party-identity evidence to
+             confirm the match (see #2467).
+          5. If a good fuzzy match exists, use the existing case.
           6. Otherwise, signal that a new case should be created.
 
         Parameters
@@ -332,6 +347,15 @@ class EnrichmentEngine:
         extracted_parties : list[str] | None
             Party names extracted from the same ruling, used for overlap
             checking during fuzzy matching.
+
+            - ``None`` (legacy contract) — caller has no party data at all;
+              fuzzy match is accepted on Levenshtein distance alone.
+            - ``[]`` (empty list) — the LLM / scraper ran and produced
+              no parties.  Fuzzy match is REJECTED because the absence
+              of parties cannot distinguish between near-duplicate case
+              numbers that belong to different cases (#2467).
+            - non-empty list — used for Jaccard-overlap validation
+              against candidate parties.
 
         Returns
         -------
@@ -361,6 +385,17 @@ class EnrichmentEngine:
             )
 
         # Step 2: Fuzzy match
+        #
+        # Party-identity validation (#2467): track whether the caller has
+        # party information available for this ruling.  ``extracted_parties
+        # is None`` means "no party data known" (legacy caller contract) —
+        # accept on distance alone.  An empty or non-empty list means the
+        # caller DOES have a notion of the ruling's parties — require
+        # non-empty parties on both sides AND Jaccard overlap >= threshold
+        # to accept the fuzzy match.  Silent acceptance without party
+        # validation collapses distinct rulings onto the same case_number
+        # when near-duplicate numbers exist in the court.
+        _parties_known = extracted_parties is not None
         if extracted_parties is None:
             extracted_parties = []
 
@@ -372,14 +407,18 @@ class EnrichmentEngine:
             if dist > self._max_levenshtein:
                 continue
 
-            overlap = 0.0
-            if extracted_parties and cand_parties:
+            if _parties_known:
+                # Reject when either side lacks parties — cannot validate
+                # identity without cross-check evidence (#2467).
+                if not extracted_parties or not cand_parties:
+                    continue
                 overlap = compute_party_overlap(extracted_parties, cand_parties)
-
-            # Score: lower distance and higher overlap = better match
-            # Require party overlap if parties are available
-            if extracted_parties and overlap < self._min_party_overlap:
-                continue
+                if overlap < self._min_party_overlap:
+                    continue
+            else:
+                # Legacy contract: no party data at all — accept on
+                # distance alone.
+                overlap = 0.0
 
             confidence = max(0.0, 1.0 - (dist / 5.0))
             if overlap > 0:
