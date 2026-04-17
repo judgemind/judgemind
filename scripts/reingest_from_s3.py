@@ -118,6 +118,7 @@ import psycopg  # noqa: E402
 import structlog  # noqa: E402
 
 from framework.extraction_config import get_county_extraction_config  # noqa: E402
+from framework.llm_enrichment import enrich_ruling  # noqa: E402
 from framework.llm_extractor import LlmExtractor  # noqa: E402
 from framework.llm_schema import ExtractedRuling  # noqa: E402
 from framework.logging import configure_structlog  # noqa: E402
@@ -1158,6 +1159,127 @@ def _full_reparse_document(
     return results
 
 
+def _apply_llm_enrichment(
+    extracted: dict,
+    *,
+    llm_client: object | None,
+    llm_provider: str | None,
+    llm_model: str | None,
+    document_id: str,
+) -> None:
+    """Fill missing enrichment fields (outcome, motion_type, case_title, parties).
+
+    The multimodal transcription pipeline only extracts ``ruling_text`` and
+    identifying metadata.  Enrichment fields (``outcome``, ``motion_type``,
+    ``case_title``, ``parties``) are the responsibility of a separate
+    enrichment stage -- see ``docs/specs/architecture-spec-v1.md`` §5.2.1
+    and ``framework.llm_enrichment``.
+
+    This helper mirrors the live worker's ``_llm_enrich_fields`` call at
+    ``worker.py`` line 1188: for any ruling with ``ruling_text`` but at
+    least one missing enrichment field, it calls ``enrich_ruling()`` and
+    merges the returned fields in place.
+
+    Behaviour
+    ---------
+    * No-op when ``ruling_text`` is empty/``None`` (cross-contamination
+      guard result) -- enrichment cannot extract from nothing.
+    * No-op when all enrichment fields are already populated.
+    * No-op when ``llm_client`` is ``None`` (regex-only mode).
+    * Never raises.  LLM failures are logged and the ``extracted`` dict
+      is left unchanged for those fields.
+    * Only fills fields that are currently missing -- never overwrites
+      existing values, matching the worker's precedence behaviour.
+    * Sets ``extraction_methods[field] = "llm_enrichment"`` for each
+      field it populates, matching worker.py line 1192.
+
+    Parameters
+    ----------
+    extracted : dict
+        A single ruling's extracted-field dict produced by
+        ``convert_extracted_rulings``.  Modified in place.
+    llm_client : object | None
+        Pre-created LLM provider client for connection reuse.  If
+        ``None``, enrichment is skipped (regex-only mode).
+    llm_provider : str | None
+        LLM provider name ("google" or "anthropic").  Defaults to
+        ``"google"`` when ``None``.
+    llm_model : str | None
+        Model override.  ``None`` uses the provider default.
+    document_id : str
+        Original document ID, used for log correlation.
+    """
+    # Regex-only mode: no enrichment possible.
+    if llm_client is None:
+        return
+
+    ruling_text = extracted.get("ruling_text")
+    if not ruling_text or not ruling_text.strip():
+        return
+
+    # Skip if all enrichment fields are already populated.
+    has_case_title = bool(extracted.get("case_title"))
+    has_motion_type = bool(extracted.get("motion_type"))
+    has_outcome = bool(extracted.get("outcome"))
+    has_parties = bool(extracted.get("parties"))
+    if has_case_title and has_motion_type and has_outcome and has_parties:
+        return
+
+    try:
+        result = enrich_ruling(
+            ruling_text,
+            provider=llm_provider or "google",
+            model=llm_model,
+            client=llm_client,
+        )
+    except Exception:
+        logger.warning(
+            "LLM enrichment raised — enrichment fields may remain missing",
+            document_id=document_id,
+            exc_info=True,
+        )
+        return
+
+    if result is None:
+        logger.warning(
+            "LLM enrichment API call failed",
+            document_id=document_id,
+        )
+        return
+
+    extraction_methods = extracted.setdefault("extraction_methods", {})
+
+    if not has_outcome and result.outcome is not None:
+        extracted["outcome"] = result.outcome
+        extraction_methods["outcome"] = "llm_enrichment"
+    if not has_motion_type and result.motion_type is not None:
+        extracted["motion_type"] = result.motion_type
+        extraction_methods["motion_type"] = "llm_enrichment"
+    if not has_case_title and result.case_title is not None:
+        extracted["case_title"] = result.case_title
+        extraction_methods["case_title"] = "llm_enrichment"
+    if not has_parties and (result.parties.plaintiffs or result.parties.defendants):
+        # Convert from EnrichmentParties to the list[dict] format used by
+        # the rest of the reingest pipeline.  Matches worker.py lines
+        # 1204-1208.
+        parties_data: list[dict[str, str]] = []
+        for name in result.parties.plaintiffs:
+            parties_data.append({"name": name, "role": "plaintiff"})
+        for name in result.parties.defendants:
+            parties_data.append({"name": name, "role": "defendant"})
+        extracted["parties"] = parties_data
+        extraction_methods["parties"] = "llm_enrichment"
+
+    logger.info(
+        "LLM enrichment applied",
+        document_id=document_id,
+        outcome=extracted.get("outcome"),
+        motion_type=extracted.get("motion_type"),
+        case_title=(extracted.get("case_title") or "")[:80] or None,
+        parties_count=len(extracted.get("parties") or []),
+    )
+
+
 def _reparse_document_multimodal(
     raw_content: bytes,
     scraper_id: str,
@@ -1182,6 +1304,14 @@ def _reparse_document_multimodal(
     Falls back to ``_reparse_document()`` if the document format is not
     PDF or if multimodal extraction returns no results.
 
+    After successful multimodal transcription, each extracted ruling is
+    passed through ``_apply_llm_enrichment`` to populate the enrichment
+    fields (``outcome``, ``motion_type``, ``case_title``, ``parties``)
+    that multimodal transcription deliberately omits -- see
+    ``architecture-spec-v1.md`` §5.2.1 for the stage split.  Without this
+    step the reingest multimodal path would leave those fields NULL for
+    Orange County (#2406).
+
     Returns a list of extracted-field dicts (one per ruling), in the same
     format as ``_full_reparse_document()``.
 
@@ -1199,11 +1329,13 @@ def _reparse_document_multimodal(
     pdf_timeout : float
         Timeout for pdfplumber subprocess (used in text fallback).
     llm_client : object | None
-        LLM client for text-based fallback extraction.
+        LLM client for text-based fallback extraction AND post-transcription
+        enrichment.  When ``None`` (regex-only mode), the enrichment step is
+        skipped.
     llm_provider : str | None
-        LLM provider name for text-based fallback.
+        LLM provider name for text-based fallback and enrichment.
     llm_model : str | None
-        LLM model name for text-based fallback.
+        LLM model name for text-based fallback and enrichment.
     llm_timeout : float | None
         Per-call LLM timeout for text-based fallback.
     force_llm : bool
@@ -1415,6 +1547,31 @@ def _reparse_document_multimodal(
                 if val:
                     extracted["case_type"] = val
                     extracted["extraction_methods"].setdefault("case_type", "regex")
+
+        # LLM enrichment — fills outcome, motion_type, case_title, parties.
+        # The multimodal transcription pipeline deliberately does NOT extract
+        # these enrichment-stage fields (see architecture-spec-v1.md §5.2.1);
+        # without this call they would remain null on OC rulings re-ingested
+        # via --multimodal.  The live worker has an equivalent call at
+        # worker.py line 1188.  See #2406.
+        #
+        # Prefer the multimodal extractor's own client/provider/model for
+        # connection reuse and to keep transcription and enrichment on the
+        # same LLM family (issue #2406 requirement).  Fall back to the
+        # shared text-path client if the multimodal extractor did not
+        # initialize one.
+        enrichment_client = getattr(multimodal_extractor, "_client", None) or llm_client
+        enrichment_provider = (
+            getattr(multimodal_extractor, "_provider", None) or llm_provider
+        )
+        enrichment_model = getattr(multimodal_extractor, "_model", None) or llm_model
+        _apply_llm_enrichment(
+            extracted,
+            llm_client=enrichment_client,
+            llm_provider=enrichment_provider,
+            llm_model=enrichment_model,
+            document_id=doc_meta["document_id"],
+        )
 
         results.append(extracted)
 
