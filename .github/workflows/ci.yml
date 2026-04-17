@@ -70,10 +70,11 @@ jobs:
               - 'infra/**'
             scripts:
               - 'scripts/**'
-              # wait-for-rollout.sh is consumed by the ecs-deploy composite
-              # action. Running scripts-tests on ecs-deploy changes ensures
+              # scripts/wait-for-rollout.sh is shared by the ecs-deploy
+              # composite action AND scripts/ecs-redeploy.sh (see #2523).
+              # Running scripts-tests on ecs-deploy changes ensures
               # test_wait_for_rollout.sh fires on PRs that touch only the
-              # composite action.
+              # composite action (which still calls the shared script).
               - '.github/actions/ecs-deploy/**'
               # Also trigger when the scripts-tests job itself changes, so
               # regressions in the auto-discovery loop are caught on the

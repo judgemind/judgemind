@@ -1,16 +1,29 @@
 #!/usr/bin/env bash
-# wait-for-rollout.sh — Poll an ECS service deployment until the specified task
-# definition's rollout reaches a terminal state (COMPLETED or FAILED), or until
-# the configured timeout elapses.
+# wait-for-rollout.sh — Poll an ECS service deployment until a specific
+# deployment reaches a terminal state (COMPLETED or FAILED) with
+# runningCount == desiredCount, or until the configured timeout elapses.
 #
-# Called from .github/actions/ecs-deploy/action.yml's "Update ECS service" step.
-# Extracted into a standalone script so it can be shellchecked and unit-tested
-# with a mock aws CLI. See issue #2519.
+# Shared between two callers:
+#   1. .github/actions/ecs-deploy/action.yml — waits for a newly registered
+#      task-definition ARN to roll out (CI deploy path, see #2519).
+#   2. scripts/ecs-redeploy.sh — waits for a newly triggered
+#      --force-new-deployment deployment to roll out (operator manual
+#      redeploy path, see #2523). Same task-def ARN as before, but a new
+#      deployment ID.
+#
+# Identifying the deployment:
+#   - CI path knows the new task-def ARN up front.
+#   - Operator redeploy path does not change the task-def ARN; only a new
+#     deployment ID is created. So we support selecting the deployment by
+#     either ARN or deployment ID — exactly one must be provided.
 #
 # Required environment variables:
-#   ECS_CLUSTER        — ECS cluster name
-#   ECS_SERVICE        — ECS service name
-#   NEW_TASK_DEF_ARN   — Task definition ARN we are waiting to roll out
+#   ECS_CLUSTER          — ECS cluster name
+#   ECS_SERVICE          — ECS service name
+#
+# One of:
+#   NEW_TASK_DEF_ARN     — Task definition ARN to select the deployment by
+#   NEW_DEPLOYMENT_ID    — Deployment ID to select the deployment by
 #
 # Optional environment variables:
 #   ROLLOUT_TIMEOUT_SECS   — overall timeout in seconds (default: 900)
@@ -21,19 +34,41 @@
 # Exit codes:
 #   0 — Target deployment reached rolloutState=COMPLETED with runningCount==
 #       desiredCount (and desiredCount > 0).
-#   1 — rolloutState=FAILED, or the timeout elapsed, or the aws CLI failed.
+#   1 — rolloutState=FAILED, or the timeout elapsed, or the aws CLI failed,
+#       or the env-var contract was violated.
 
 set -euo pipefail
 
 : "${ECS_CLUSTER:?ECS_CLUSTER is required}"
 : "${ECS_SERVICE:?ECS_SERVICE is required}"
-: "${NEW_TASK_DEF_ARN:?NEW_TASK_DEF_ARN is required}"
+
+NEW_TASK_DEF_ARN="${NEW_TASK_DEF_ARN:-}"
+NEW_DEPLOYMENT_ID="${NEW_DEPLOYMENT_ID:-}"
+
+if [ -z "$NEW_TASK_DEF_ARN" ] && [ -z "$NEW_DEPLOYMENT_ID" ]; then
+  echo "ERROR: one of NEW_TASK_DEF_ARN or NEW_DEPLOYMENT_ID is required." >&2
+  exit 1
+fi
+if [ -n "$NEW_TASK_DEF_ARN" ] && [ -n "$NEW_DEPLOYMENT_ID" ]; then
+  echo "ERROR: set only one of NEW_TASK_DEF_ARN or NEW_DEPLOYMENT_ID, not both." >&2
+  exit 1
+fi
 
 ROLLOUT_TIMEOUT_SECS="${ROLLOUT_TIMEOUT_SECS:-900}"
 ROLLOUT_POLL_INTERVAL="${ROLLOUT_POLL_INTERVAL:-10}"
 AWS_CLI="${AWS_CLI:-aws}"
 
-echo "Waiting for task definition $NEW_TASK_DEF_ARN to roll out on ${ECS_CLUSTER}/${ECS_SERVICE} (timeout: ${ROLLOUT_TIMEOUT_SECS}s, poll every ${ROLLOUT_POLL_INTERVAL}s)..."
+if [ -n "$NEW_TASK_DEF_ARN" ]; then
+  SELECTOR_DESC="task definition $NEW_TASK_DEF_ARN"
+  JQ_SELECT_FILTER='.services[0].deployments[] | select(.taskDefinition == $sel)'
+  JQ_SELECT_ARG="$NEW_TASK_DEF_ARN"
+else
+  SELECTOR_DESC="deployment $NEW_DEPLOYMENT_ID"
+  JQ_SELECT_FILTER='.services[0].deployments[] | select(.id == $sel)'
+  JQ_SELECT_ARG="$NEW_DEPLOYMENT_ID"
+fi
+
+echo "Waiting for $SELECTOR_DESC to roll out on ${ECS_CLUSTER}/${ECS_SERVICE} (timeout: ${ROLLOUT_TIMEOUT_SECS}s, poll every ${ROLLOUT_POLL_INTERVAL}s)..."
 
 START_TS=$(date +%s)
 DEADLINE=$((START_TS + ROLLOUT_TIMEOUT_SECS))
@@ -52,13 +87,13 @@ while true; do
     exit 1
   fi
 
-  DEPLOYMENT=$(echo "$SERVICE_JSON" | jq --arg arn "$NEW_TASK_DEF_ARN" \
-    '.services[0].deployments[] | select(.taskDefinition == $arn)')
+  DEPLOYMENT=$(echo "$SERVICE_JSON" | jq --arg sel "$JQ_SELECT_ARG" \
+    "$JQ_SELECT_FILTER")
 
   if [ -z "$DEPLOYMENT" ]; then
     # Our deployment has not yet been registered in the deployments list.
     # Give ECS a moment — retry.
-    echo "[${ELAPSED}s] Deployment for new task def not yet visible, retrying..."
+    echo "[${ELAPSED}s] Deployment for $SELECTOR_DESC not yet visible, retrying..."
   else
     ROLLOUT_STATE=$(echo "$DEPLOYMENT" | jq -r '.rolloutState // "UNKNOWN"')
     ROLLOUT_REASON=$(echo "$DEPLOYMENT" | jq -r '.rolloutStateReason // ""')
@@ -79,7 +114,7 @@ while true; do
         fi
         ;;
       FAILED)
-        echo "ERROR: ECS reported rolloutState=FAILED for $NEW_TASK_DEF_ARN after ${ELAPSED}s."
+        echo "ERROR: ECS reported rolloutState=FAILED for $SELECTOR_DESC after ${ELAPSED}s."
         echo "Reason: $ROLLOUT_REASON"
         echo "Full deployment JSON:"
         echo "$DEPLOYMENT" | jq '.'
@@ -93,7 +128,7 @@ while true; do
   fi
 
   if [ "$NOW_TS" -ge "$DEADLINE" ]; then
-    echo "ERROR: Timed out after ${ROLLOUT_TIMEOUT_SECS}s waiting for $NEW_TASK_DEF_ARN to stabilize."
+    echo "ERROR: Timed out after ${ROLLOUT_TIMEOUT_SECS}s waiting for $SELECTOR_DESC to stabilize."
     echo "Last observed state: ${LAST_STATE:-<none>} (${LAST_COUNTS:-<no counts>})"
     echo "Full service JSON snapshot:"
     echo "$SERVICE_JSON" | jq '.services[0] | {serviceName, desiredCount, runningCount, pendingCount, deployments, events: (.events[:5])}'

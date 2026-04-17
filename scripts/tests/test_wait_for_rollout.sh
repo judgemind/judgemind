@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
-# test_wait_for_rollout.sh — Unit tests for .github/actions/ecs-deploy/wait-for-rollout.sh
+# test_wait_for_rollout.sh — Unit tests for scripts/wait-for-rollout.sh
 #
 # Exercises the ECS rollout polling loop against a mock aws CLI that emits a
 # sequence of pre-canned describe-services responses. Verifies the success,
-# failure, and timeout paths.
+# failure, and timeout paths — both for task-def-ARN selection (used by the
+# CI composite action, see #2519) and for deployment-id selection (used by
+# scripts/ecs-redeploy.sh for operator manual redeploys, see #2523).
 #
 # Usage:
 #   scripts/tests/test_wait_for_rollout.sh
@@ -15,7 +17,7 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-SCRIPT_UNDER_TEST="$REPO_ROOT/.github/actions/ecs-deploy/wait-for-rollout.sh"
+SCRIPT_UNDER_TEST="$REPO_ROOT/scripts/wait-for-rollout.sh"
 
 if [[ ! -x "$SCRIPT_UNDER_TEST" ]]; then
     echo "FATAL: $SCRIPT_UNDER_TEST is not executable." >&2
@@ -129,7 +131,7 @@ MOCK
 }
 
 # Write a describe-services response with the given deployment state.
-# Usage: write_response <file> <rollout_state> <running> <desired> <pending> [task_def_arn]
+# Usage: write_response <file> <rollout_state> <running> <desired> <pending> [task_def_arn] [deployment_id]
 write_response() {
     local file="$1"
     local rollout_state="$2"
@@ -137,6 +139,7 @@ write_response() {
     local desired="$4"
     local pending="$5"
     local task_def_arn="${6:-arn:test:new}"
+    local deployment_id="${7:-ecs-svc/new}"
 
     cat > "$file" << JSON
 {
@@ -148,13 +151,59 @@ write_response() {
       "pendingCount": $pending,
       "deployments": [
         {
-          "id": "ecs-svc/new",
+          "id": "$deployment_id",
           "taskDefinition": "$task_def_arn",
           "rolloutState": "$rollout_state",
           "rolloutStateReason": "test reason",
           "runningCount": $running,
           "desiredCount": $desired,
           "pendingCount": $pending
+        }
+      ],
+      "events": []
+    }
+  ]
+}
+JSON
+}
+
+# Write a response representing a --force-new-deployment redeploy: two
+# deployments sharing the same task-def ARN but with distinct deployment
+# IDs (the old primary being replaced + the new primary we're tracking).
+# Usage: write_response_redeploy <file> <rollout_state> <running> <desired> <pending>
+write_response_redeploy() {
+    local file="$1"
+    local rollout_state="$2"
+    local running="$3"
+    local desired="$4"
+    local pending="$5"
+
+    cat > "$file" << JSON
+{
+  "services": [
+    {
+      "serviceName": "test-svc",
+      "desiredCount": $desired,
+      "runningCount": $running,
+      "pendingCount": $pending,
+      "deployments": [
+        {
+          "id": "ecs-svc/new-redeploy",
+          "taskDefinition": "arn:test:shared",
+          "rolloutState": "$rollout_state",
+          "rolloutStateReason": "redeploy test reason",
+          "runningCount": $running,
+          "desiredCount": $desired,
+          "pendingCount": $pending
+        },
+        {
+          "id": "ecs-svc/old-primary",
+          "taskDefinition": "arn:test:shared",
+          "rolloutState": "COMPLETED",
+          "rolloutStateReason": "old",
+          "runningCount": 1,
+          "desiredCount": 1,
+          "pendingCount": 0
         }
       ],
       "events": []
@@ -193,7 +242,7 @@ write_response_missing_deployment() {
 JSON
 }
 
-# Run the script under test with mocks wired up.
+# Run the script under test with mocks wired up (task-def-ARN selector).
 run_script() {
     local tmpdir="$1"
     shift
@@ -207,6 +256,26 @@ run_script() {
     ECS_CLUSTER="test-cluster" \
     ECS_SERVICE="test-svc" \
     NEW_TASK_DEF_ARN="arn:test:new" \
+    ROLLOUT_POLL_INTERVAL="${ROLLOUT_POLL_INTERVAL:-0}" \
+    ROLLOUT_TIMEOUT_SECS="${ROLLOUT_TIMEOUT_SECS:-5}" \
+        "$SCRIPT_UNDER_TEST" "$@"
+}
+
+# Run the script under test with mocks wired up (deployment-id selector).
+run_script_by_deployment_id() {
+    local tmpdir="$1"
+    local deployment_id="${2:-ecs-svc/new-redeploy}"
+    shift 2 || shift $#
+    local mock_aws
+    mock_aws=$(setup_mock_aws "$tmpdir")
+
+    AWS_CLI="$mock_aws" \
+    RESPONSES_DIR="$tmpdir/responses" \
+    CALL_LOG="$tmpdir/calls.log" \
+    CALL_COUNTER_FILE="$tmpdir/counter" \
+    ECS_CLUSTER="test-cluster" \
+    ECS_SERVICE="test-svc" \
+    NEW_DEPLOYMENT_ID="$deployment_id" \
     ROLLOUT_POLL_INTERVAL="${ROLLOUT_POLL_INTERVAL:-0}" \
     ROLLOUT_TIMEOUT_SECS="${ROLLOUT_TIMEOUT_SECS:-5}" \
         "$SCRIPT_UNDER_TEST" "$@"
@@ -413,6 +482,165 @@ test_missing_required_env() {
     fi
 }
 
+# Test 9: Neither NEW_TASK_DEF_ARN nor NEW_DEPLOYMENT_ID set exits 1 with
+# a clear error. Guards the env-var contract for the dual selector.
+test_missing_selector_env() {
+    local output exit_code
+    exit_code=0
+    output=$(env -i PATH="$PATH" \
+        ECS_CLUSTER="c" ECS_SERVICE="s" \
+        bash "$SCRIPT_UNDER_TEST" 2>&1) || exit_code=$?
+
+    if [[ "$exit_code" -eq 1 ]]; then
+        pass "missing both selectors exits 1"
+    else
+        fail "missing both selectors exits 1" "exit=$exit_code output=$output"
+    fi
+
+    if echo "$output" | grep -q "one of NEW_TASK_DEF_ARN or NEW_DEPLOYMENT_ID"; then
+        pass "missing both selectors emits clear error"
+    else
+        fail "missing both selectors emits clear error" "output=$output"
+    fi
+}
+
+# Test 10: Setting both NEW_TASK_DEF_ARN and NEW_DEPLOYMENT_ID exits 1.
+# The caller must pick exactly one selector to avoid ambiguity.
+test_both_selectors_set() {
+    local output exit_code
+    exit_code=0
+    output=$(env -i PATH="$PATH" \
+        ECS_CLUSTER="c" ECS_SERVICE="s" \
+        NEW_TASK_DEF_ARN="arn:x" NEW_DEPLOYMENT_ID="ecs-svc/y" \
+        bash "$SCRIPT_UNDER_TEST" 2>&1) || exit_code=$?
+
+    if [[ "$exit_code" -eq 1 ]]; then
+        pass "both selectors set exits 1"
+    else
+        fail "both selectors set exits 1" "exit=$exit_code output=$output"
+    fi
+
+    if echo "$output" | grep -q "set only one of"; then
+        pass "both selectors set emits clear error"
+    else
+        fail "both selectors set emits clear error" "output=$output"
+    fi
+}
+
+# Test 11: Deployment-id selector succeeds on immediate COMPLETED.
+# Mirrors the operator `--force-new-deployment` path where task-def ARN
+# is ambiguous but deployment ID is unique.
+test_deployment_id_immediate_completed() {
+    local tmpdir
+    tmpdir=$(make_temp_dir)
+    mkdir -p "$tmpdir/responses"
+    write_response_redeploy "$tmpdir/responses/01.json" "COMPLETED" 1 1 0
+
+    local output exit_code
+    output=$(run_script_by_deployment_id "$tmpdir" "ecs-svc/new-redeploy" 2>&1) || exit_code=$?
+    exit_code="${exit_code:-0}"
+
+    if [[ "$exit_code" -eq 0 ]]; then
+        pass "deployment-id immediate COMPLETED exits 0"
+    else
+        fail "deployment-id immediate COMPLETED exits 0" "exit=$exit_code output=$output"
+    fi
+
+    if echo "$output" | grep -q "Waiting for deployment ecs-svc/new-redeploy"; then
+        pass "deployment-id selector names the deployment in log output"
+    else
+        fail "deployment-id selector names the deployment in log output" "output=$output"
+    fi
+}
+
+# Test 12: Deployment-id selector picks OUR deployment even when another
+# deployment shares the same task-def ARN. This is the motivating case
+# for the deployment-id selector — force-new-deployment redeploys leave
+# multiple deployments with the same task-def ARN briefly.
+test_deployment_id_disambiguates_shared_taskdef() {
+    local tmpdir
+    tmpdir=$(make_temp_dir)
+    mkdir -p "$tmpdir/responses"
+    # Both deployments share arn:test:shared. Our new one is IN_PROGRESS,
+    # the old one is already COMPLETED. Selecting by task-def ARN would
+    # match BOTH ambiguously (jq would emit two objects). Selecting by
+    # deployment ID picks the IN_PROGRESS one — we should NOT exit 0.
+    # Second response: our new deployment completes.
+    write_response_redeploy "$tmpdir/responses/01.json" "IN_PROGRESS" 0 1 1
+    write_response_redeploy "$tmpdir/responses/02.json" "COMPLETED" 1 1 0
+
+    local output exit_code
+    output=$(run_script_by_deployment_id "$tmpdir" "ecs-svc/new-redeploy" 2>&1) || exit_code=$?
+    exit_code="${exit_code:-0}"
+
+    if [[ "$exit_code" -eq 0 ]]; then
+        pass "deployment-id disambiguates across shared-taskdef deployments"
+    else
+        fail "deployment-id disambiguates across shared-taskdef deployments" "exit=$exit_code output=$output"
+    fi
+
+    if echo "$output" | grep -q "rolloutState=IN_PROGRESS"; then
+        pass "deployment-id selector reported IN_PROGRESS before COMPLETED"
+    else
+        fail "deployment-id selector reported IN_PROGRESS before COMPLETED" "output=$output"
+    fi
+}
+
+# Test 13: Deployment-id selector reports FAILED and exits 1.
+test_deployment_id_failed_rollout() {
+    local tmpdir
+    tmpdir=$(make_temp_dir)
+    mkdir -p "$tmpdir/responses"
+    write_response_redeploy "$tmpdir/responses/01.json" "FAILED" 0 1 0
+
+    local output exit_code
+    exit_code=0
+    output=$(run_script_by_deployment_id "$tmpdir" "ecs-svc/new-redeploy" 2>&1) || exit_code=$?
+
+    if [[ "$exit_code" -eq 1 ]]; then
+        pass "deployment-id FAILED rollout exits 1"
+    else
+        fail "deployment-id FAILED rollout exits 1" "exit=$exit_code output=$output"
+    fi
+
+    if echo "$output" | grep -q "rolloutState=FAILED for deployment ecs-svc/new-redeploy"; then
+        pass "deployment-id FAILED emits clear error naming the deployment"
+    else
+        fail "deployment-id FAILED emits clear error naming the deployment" "output=$output"
+    fi
+}
+
+# Test 14: Deployment-id selector times out when rollout never completes.
+test_deployment_id_timeout() {
+    local tmpdir
+    tmpdir=$(make_temp_dir)
+    mkdir -p "$tmpdir/responses"
+    write_response_redeploy "$tmpdir/responses/01.json" "IN_PROGRESS" 0 1 1
+
+    local output exit_code
+    exit_code=0
+    output=$(ROLLOUT_TIMEOUT_SECS=1 ROLLOUT_POLL_INTERVAL=0 \
+        run_script_by_deployment_id "$tmpdir" "ecs-svc/new-redeploy" 2>&1) || exit_code=$?
+
+    if [[ "$exit_code" -eq 1 ]]; then
+        pass "deployment-id timeout exits 1"
+    else
+        fail "deployment-id timeout exits 1" "exit=$exit_code output=$output"
+    fi
+
+    if echo "$output" | grep -q "Timed out after"; then
+        pass "deployment-id timeout emits clear error"
+    else
+        fail "deployment-id timeout emits clear error" "output=$output"
+    fi
+
+    if echo "$output" | grep -q "Full service JSON snapshot"; then
+        pass "deployment-id timeout includes diagnostic JSON snapshot"
+    else
+        fail "deployment-id timeout includes diagnostic JSON snapshot" "output=$output"
+    fi
+}
+
 # ── Run all tests ──────────────────────────────────────────────────────────
 
 test_immediate_completed
@@ -423,6 +651,12 @@ test_timeout
 test_completed_but_running_not_yet_matching
 test_aws_cli_failure
 test_missing_required_env
+test_missing_selector_env
+test_both_selectors_set
+test_deployment_id_immediate_completed
+test_deployment_id_disambiguates_shared_taskdef
+test_deployment_id_failed_rollout
+test_deployment_id_timeout
 
 echo ""
 echo "────────────────────────────────────────────"
