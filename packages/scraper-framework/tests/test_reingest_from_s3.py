@@ -9126,3 +9126,58 @@ class TestReingestAppliesGuardsAndForceUpdate:
         assert mock_insert.call_args.kwargs.get("hearing_date") is None, (
             "Implausible hearing_date should be cleared to None by the guard."
         )
+
+    @patch("reingest_from_s3.batch_upsert_parties")
+    @patch("reingest_from_s3.upsert_case_judge")
+    @patch("reingest_from_s3.resolve_judge")
+    @patch("reingest_from_s3.insert_document_and_ruling")
+    @patch("reingest_from_s3.upsert_case")
+    @patch("reingest_from_s3._reparse_document")
+    @patch("reingest_from_s3._fetch_s3_content")
+    def test_implausible_doc_meta_fallback_rejected_after_guard(
+        self,
+        mock_fetch_s3: MagicMock,
+        mock_reparse: MagicMock,
+        mock_upsert_case: MagicMock,
+        mock_insert: MagicMock,
+        mock_resolve_judge: MagicMock,
+        _mock_upsert_cj: MagicMock,
+        _mock_batch_parties: MagicMock,
+    ) -> None:
+        """Regression for #2432: when both extracted and doc_meta hearing_date
+        are implausible, the fallback must not override the guard.
+
+        Scenario: the guard clears ``extracted["hearing_date"]`` because it's
+        implausible, but the DB row's ``documents.hearing_date`` (surfaced
+        via ``doc_meta["hearing_date"]``) holds the SAME bad value — common
+        in rebuilds where the doc and ruling hearing_date were both
+        populated from the same LLM mistake.  The fallback chain
+        ``extracted["hearing_date"] or doc_meta["hearing_date"]`` picks the
+        bad doc_meta value and writes it back through force_update,
+        silently bypassing the guard.
+        """
+        # doc_meta["hearing_date"] is the SAME implausible value the guard
+        # will clear from extracted.  captured_at defaults to 2026-03-01,
+        # so a 2099-01-01 hearing_date is ~73 years after capture.
+        implausible = date(2099, 1, 1)
+        row = _make_document_row(hearing_date=implausible, ruling_hearing_date=implausible)
+        conn = _mock_conn_with_rows([row])
+        mock_fetch_s3.return_value = b"<html>content</html>"
+        mock_reparse.return_value = self._make_extracted(hearing_date=implausible)
+        mock_upsert_case.return_value = "new-case-id"
+        mock_resolve_judge.return_value = "judge-id"
+
+        reingest.reingest_batch(
+            conn,
+            MagicMock(),
+            batch_size=10,
+            cursor=_DEFAULT_CURSOR,
+            filters="",
+            filter_params=[],
+        )
+
+        assert mock_insert.called
+        assert mock_insert.call_args.kwargs.get("hearing_date") is None, (
+            "Implausible doc_meta['hearing_date'] fallback must also be "
+            "rejected — otherwise the guard is bypassed (#2432)."
+        )
