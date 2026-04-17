@@ -3524,3 +3524,131 @@ def test_appellate_scraper_registered_in_runner() -> None:
     assert "ca-la-tentatives-appellate" in ids
     # Civil is still registered separately.
     assert "ca-la-tentatives-civil" in ids
+
+
+def test_parse_appellate_dropdown_options_skips_empty_value_option() -> None:
+    """Options with empty ``value`` attribute (e.g. a placeholder) are skipped."""
+    html = """
+<html><body>
+<select name="ctl00$ctl00$siteMasterHolder$basicBodyHolder$List1DeptDate"
+        id="siteMasterHolder_basicBodyHolder_List1DeptDate">
+<option value="">-- select a date --</option>
+<option value="04/17/2026">04/17/2026</option>
+</select>
+</body></html>
+"""
+    options = _parse_appellate_dropdown_options(html)
+    assert len(options) == 1
+    assert options[0].value == "04/17/2026"
+
+
+def test_parse_appellate_dropdown_options_skips_invalid_calendar_date() -> None:
+    """Values matching the regex but not a real calendar date (e.g. 02/30/2026)
+    parse with ``hearing_date=None`` rather than raising."""
+    # 02/30/2026 matches the MM/DD/YYYY regex but is not a valid date —
+    # datetime.strptime raises ValueError, which the parser swallows.
+    html = _synthetic_appellate_main_with_dropdown(["02/30/2026"])
+    options = _parse_appellate_dropdown_options(html)
+    assert len(options) == 1
+    assert options[0].value == "02/30/2026"
+    assert options[0].hearing_date is None
+
+
+@respx.mock
+def test_appellate_fetch_documents_logs_and_continues_on_per_date_fetch_error() -> None:
+    """If the POST for one dropdown date raises, the scraper logs and moves on.
+
+    Covers the ``except Exception`` branch inside the per-option loop in
+    ``fetch_documents()`` (#2599).
+    """
+    main_html = _synthetic_appellate_main_with_dropdown(["04/17/2026", "04/24/2026"])
+    ruling_html = _synthetic_appellate_ruling_response()
+
+    respx.get(APPELLATE_URL).mock(return_value=httpx.Response(200, text=main_html))
+    # First POST raises a network error, second POST succeeds.
+    respx.post(APPELLATE_URL).mock(
+        side_effect=[
+            httpx.ConnectError("simulated network failure"),
+            httpx.Response(200, text=ruling_html),
+        ]
+    )
+
+    config = default_config_appellate()
+    config.request_delay_seconds = 0
+    scraper = LAAppellateTentativeRulingsScraper(config=config)
+    docs = scraper.fetch_documents()
+
+    # First date errored, second date produced one doc.
+    assert len(docs) == 1
+
+
+def _make_appellate_ruling_doc(
+    raw_content: bytes = b"<html>no speechSynthesis div here</html>",
+    **overrides: object,
+) -> CapturedDocument:
+    """Build a bare CapturedDocument for appellate parse_document tests."""
+    kwargs: dict[str, object] = {
+        "scraper_id": "ca-la-tentatives-appellate",
+        "state": "CA",
+        "county": "Los Angeles",
+        "court": "Superior Court",
+        "source_url": APPELLATE_URL,
+        "capture_timestamp": datetime(2026, 4, 17, 18, 0, 0),
+        "content_format": ContentFormat.HTML,
+        "raw_content": raw_content,
+        "content_hash": "",
+    }
+    kwargs.update(overrides)
+    return CapturedDocument(**kwargs)  # type: ignore[arg-type]
+
+
+def test_appellate_parse_document_respects_pre_split_guard() -> None:
+    """parse_document must not re-run regex on docs already LLM-pre-split.
+
+    Covers the ``pre_split``/``_llm_extracted`` early-return in
+    ``parse_document()`` (#2469, #2484, #2599).
+    """
+    config = default_config_appellate()
+    scraper = LAAppellateTentativeRulingsScraper(config=config)
+
+    # Construct a doc that has already been LLM-pre-split: fields already
+    # populated by the LLM path, and the pre_split marker set.  The method
+    # must return it unchanged (except for default courthouse/department
+    # fallbacks if either was cleared).
+    doc = _make_appellate_ruling_doc(
+        raw_content=b"<html>ignored - guard short-circuits before parse</html>",
+        case_number="BV999999",
+        ruling_text="Pre-populated by LLM",
+        extra={"pre_split": True, "_llm_extracted": True},
+    )
+    result = scraper.parse_document(doc)
+
+    # Guard kicked in: the raw HTML was NOT re-parsed (case_number would
+    # have been cleared if it had been).
+    assert result.case_number == "BV999999"
+    assert result.ruling_text == "Pre-populated by LLM"
+    # Static appellate metadata fallbacks applied.
+    assert result.courthouse == APPELLATE_COURTHOUSE
+    assert result.department == APPELLATE_DEPARTMENT
+
+
+def test_appellate_parse_document_swallows_parse_errors() -> None:
+    """Malformed HTML must not raise — parse errors are logged and skipped.
+
+    Covers the ``except Exception`` branch around ``_extract_ruling_fields``
+    in ``parse_document()`` (#2599).
+    """
+    config = default_config_appellate()
+    scraper = LAAppellateTentativeRulingsScraper(config=config)
+
+    doc = _make_appellate_ruling_doc()
+    # Force the extractor to raise so we hit the except branch.
+    with patch(
+        "courts.ca.la_tentatives._extract_ruling_fields",
+        side_effect=RuntimeError("boom"),
+    ):
+        result = scraper.parse_document(doc)
+
+    # No exception bubbled up; static appellate metadata is still stamped.
+    assert result.courthouse == APPELLATE_COURTHOUSE
+    assert result.department == APPELLATE_DEPARTMENT
