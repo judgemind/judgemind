@@ -30,11 +30,13 @@ The classification and entity extraction modules are implemented. Summarization,
 
 ## Install, Test, and Run Locally
 
-```bash
-python3.12 -m venv .venv
-.venv/bin/pip install -e ".[dev]"
+This package depends on the local sibling `judgemind-config`, which is not published to PyPI. Use the helper script — it creates the venv and installs `judgemind-config` first, then this package with `[dev]` extras:
 
-# Lint and format
+```bash
+# From the repo root:
+scripts/install-package-venv.sh nlp-pipeline
+
+# Lint and format (run from packages/nlp-pipeline)
 .venv/bin/ruff check src/ tests/
 .venv/bin/ruff format --check src/ tests/
 

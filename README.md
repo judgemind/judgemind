@@ -40,10 +40,11 @@ See `docs/specs/` for the full product spec, architecture spec, and investigatio
 # Start local services (PostgreSQL, Redis, OpenSearch, Qdrant, MinIO)
 docker compose up -d
 
-# Scraper framework
+# Scraper framework (use helper — plain `pip install -e ".[dev]"` fails because
+# judgemind-config is an unpublished local sibling; see #2491)
+scripts/install-package-venv.sh scraper-framework
 cd packages/scraper-framework
-pip install -e ".[dev]"
-pytest tests/
+.venv/bin/pytest tests/
 
 # API
 cd packages/api

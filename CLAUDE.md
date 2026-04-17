@@ -110,12 +110,13 @@ Subagents do the implementation work: worktree setup, coding, testing, PR, and r
 
 **Automated (via dispatcher):** The dispatcher spawns `/task` agents with `isolation: "worktree"` on the Agent tool. Claude Code automatically creates a unique worktree at `.claude/worktrees/agent-<id>/`. No locking, no number contention, no races.
 
-Each worktree gets its own `.venv` per package:
+Each worktree gets its own `.venv` per package. Use `scripts/install-package-venv.sh` — it creates the venv and installs local sibling dependencies (e.g. `judgemind-config`) in the right order:
 
 ```
-python3.12 -m venv {worktree}/packages/<pkg>/.venv
-cd {worktree}/packages/<pkg> && .venv/bin/pip install -e ".[dev]" --quiet
+scripts/install-package-venv.sh <pkg>     # e.g. scraper-framework, nlp-pipeline
 ```
+
+The raw equivalent (what the helper does): `python3.12 -m venv packages/<pkg>/.venv`, install `packages/judgemind-config` into it first if `<pkg>` depends on it, then `pip install -e "packages/<pkg>[dev]"`. Plain `pip install -e ".[dev]"` **fails** for `scraper-framework` and `nlp-pipeline` because `judgemind-config` is an unpublished local sibling (see #2491).
 
 ### Step 3 — Pick up a task
 

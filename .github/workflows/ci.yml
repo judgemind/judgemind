@@ -573,6 +573,8 @@ jobs:
         run: scripts/tests/test_check_removed_exports.sh
       - name: Test GraphQL query checker
         run: scripts/tests/test_check_graphql_queries.sh
+      - name: Test install-package-venv.sh
+        run: scripts/tests/test_install_package_venv.sh
 
   # ---------------------------------------------------------------
   # Coverage gates: diff coverage (new lines) + overall floor ratchet
