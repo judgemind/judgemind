@@ -159,6 +159,41 @@ Best practices:
 
 **History.** The instance was bumped from `db.t4g.micro` (max_connections ≈ 84) to `db.t4g.small` in #2549 after rebuild + backfill contention reliably triggered connection-slot exhaustion.
 
+### Zombie oneshot prevention (retry cap + lifetime cap)
+
+**Problem.** A `rebuild_db.py` run against a dev database that is already near its connection limit can hit `BrokenProcessPool` in every worker, then enter the serial-retry pass.  The serial pass re-runs each crashed key in its own `max_workers=1` subprocess — fine for a handful of bad PDFs, catastrophic when *every* key crashed because of a systemic cause (DB exhaustion, OOM, network partition).  A 1,694-key rebuild then tries to serially retry all 1,694 keys at roughly one every few minutes, turning a 10-minute rebuild into a 12+ hour zombie task while the exhausted resources never recover (#2572, #2549).
+
+**Defense in depth.** Two independent caps now prevent this pattern:
+
+1. **In-script retry cap — `scripts/rebuild_db.py`.**  Before entering the serial retry pass, the script checks whether the crash count exceeds a configurable threshold.  If it does, the pass is aborted with a terminal error that names the systemic cause (pool exhaustion, OOM) and exits non-zero so the orchestrator surfaces the failure.
+
+   | Flag | Default | Env var | Purpose |
+   |---|---|---|---|
+   | `--max-retry-count` | `200` | `REBUILD_MAX_RETRY_COUNT` | Absolute ceiling on crashed keys eligible for serial retry.  Set to `0` to disable. |
+   | `--max-retry-ratio` | `0.10` | `REBUILD_MAX_RETRY_RATIO` | Fraction of total keys that crashed.  A high ratio (e.g. 15%) signals systemic failure.  Set to `0` to disable. |
+
+   Strict `>` comparisons on both thresholds: `--max-retry-count 200` means "up to and including 200 retries, abort above that."  The abort also logs a sample of 20 crashed keys so operators have a starting point for manual diagnosis.  Exit code is `2` (distinct from the normal `0`/`1`) so alerting can distinguish retry-cap aborts from per-doc failures.
+
+2. **Container-level lifetime cap — `scripts/ecs-run-task.sh --max-runtime <secs>`.**  Independently of what the script does, ECS oneshot tasks can be wrapped with `timeout --preserve-status --signal=TERM --kill-after=30 <secs>` so the container self-terminates after a bounded wall-clock deadline.  This is opt-in (no default) to preserve behavior for existing callers — pass it explicitly for long-running jobs:
+
+   ```
+   # Cap a rebuild at 2 hours even if it hangs on something not covered by --max-retry-*
+   scripts/ecs-run-task.sh --max-runtime 7200 --cpu 2048 --memory 8192 \
+       scripts/rebuild_db.py -- --county "Los Angeles" --skip-reset
+   ```
+
+   `timeout` sends `SIGTERM` at the deadline, giving Python's atexit handlers and `psycopg` a chance to close connections cleanly, and escalates to `SIGKILL` 30 seconds later if the script ignores the signal.  The container then exits with the script's own exit code (on clean termination) or `137` (SIGKILL).  Requires coreutils, which is present in the `python:3.12-slim` base image used by the ingestion worker task definition.
+
+**When to use which.**  The in-script cap is always-on for `rebuild_db.py` and handles the specific pool-break-storm pattern surgically.  The lifetime cap is a blanket backstop for any oneshot that could hang for reasons the script doesn't know about (slow network, LLM API outage, stuck DB query).  Use both together for rebuilds on dev.
+
+**Manual stop runbook.**  If you spot a zombie oneshot already running (ECS task that has been `RUNNING` far longer than expected, or dev DB showing `rds_reserved` errors):
+
+1. `aws ecs list-tasks --cluster judgemind-dev --desired-status RUNNING --region us-west-2` — find the task ARN.
+2. `aws ecs describe-tasks --cluster judgemind-dev --tasks <arn> --region us-west-2` — confirm it's the oneshot and check `startedAt` vs now.
+3. `aws ecs stop-task --cluster judgemind-dev --task <arn> --reason "zombie retry-loop (#2572)" --region us-west-2` — sends SIGTERM then SIGKILL.
+4. Wait for the task to fully STOP (connection slots release as psycopg closes).  Verify with `scripts/dev-db-query.sh "SELECT count(*) FROM pg_stat_activity WHERE application_name LIKE '%rebuild%'"`.
+5. Diagnose the root cause before re-running — if connection exhaustion, confirm no other rebuild is running; if OOM, bump `--memory`; if the retry cap was tripped, consult the crashed-key sample in the CloudWatch logs.
+
 ### Reingest vs Rebuild
 
 `reingest_from_s3.py` operates on **existing database records only** — it queries the `documents` table to find S3 keys to reprocess. If you run it for a county with no records in the `documents` table, it will process 0 documents silently.
