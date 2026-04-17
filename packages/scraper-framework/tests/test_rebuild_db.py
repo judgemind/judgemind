@@ -977,6 +977,10 @@ class TestMainPerCountyResetDispatch:
             patch("rebuild_db.reset_derived_tables") as mock_global_reset,
             patch("rebuild_db.reset_derived_tables_for_county") as mock_per_county_reset,
             patch("rebuild_db.reset_opensearch_index") as mock_os_reset,
+            # Preflight is covered separately; neutralise it here so the
+            # --reset --county flow doesn't hit the DB lookups on the
+            # MagicMock connection.  See #2496.
+            patch("rebuild_db.preflight_split_child_guard"),
             patch("rebuild_db._fetch_rosters"),
             patch("rebuild_db._write_rebuild_marker"),
             patch(
@@ -1050,3 +1054,466 @@ class TestMainPerCountyResetDispatch:
         mock_per_county_reset.assert_not_called()
         # No marker writes either — that's reserved for --reset runs.
         mock_marker.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Split-child preflight guard tests (#2496)
+# ---------------------------------------------------------------------------
+
+
+def _build_preflight_mock_conn(
+    court_ids: list[str],
+    db_doc_count: int,
+) -> tuple[MagicMock, MagicMock]:
+    """Build a mock psycopg connection for the split-child preflight.
+
+    The preflight issues:
+      1. ``SELECT id FROM derived.courts WHERE ...`` (via _resolve_county_court_ids)
+      2. ``SELECT COUNT(*) FROM derived.documents WHERE court_id = ANY(...)``
+
+    Returns ``(mock_conn, mock_cur)``.
+    """
+    mock_conn = MagicMock()
+    mock_cur = MagicMock()
+    mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cur)
+    mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+    mock_cur.fetchall.return_value = [(cid,) for cid in court_ids]
+    mock_cur.fetchone.return_value = (db_doc_count,)
+    return mock_conn, mock_cur
+
+
+class TestSplitChildDataLossError:
+    """The guard raises a dedicated exception so callers can distinguish it."""
+
+    def test_exception_type_is_exported(self) -> None:
+        """``SplitChildDataLossError`` must exist and be a subclass of RuntimeError."""
+        assert hasattr(rebuild_db, "SplitChildDataLossError")
+        assert issubclass(rebuild_db.SplitChildDataLossError, RuntimeError)
+
+
+class TestPreflightSplitChildGuard:
+    """Tests for preflight_split_child_guard()."""
+
+    def test_passes_when_db_count_matches_s3(self) -> None:
+        """Equal counts → no fanout → preflight allows reset to proceed."""
+        court_ids = ["00000000-0000-0000-0000-000000000001"]
+        mock_conn, _ = _build_preflight_mock_conn(court_ids, db_doc_count=260)
+
+        # Should not raise.
+        rebuild_db.preflight_split_child_guard(
+            mock_conn,
+            state="ca",
+            county="Santa Clara",
+            s3_key_count=260,
+            force=False,
+        )
+
+    def test_passes_when_db_count_is_lower_than_s3(self) -> None:
+        """DB < S3 (common when some raw PDFs have no rows yet) → allowed."""
+        court_ids = ["00000000-0000-0000-0000-000000000001"]
+        mock_conn, _ = _build_preflight_mock_conn(court_ids, db_doc_count=100)
+
+        # Should not raise.
+        rebuild_db.preflight_split_child_guard(
+            mock_conn,
+            state="ca",
+            county="Santa Clara",
+            s3_key_count=260,
+            force=False,
+        )
+
+    def test_passes_within_fanout_tolerance(self) -> None:
+        """Small overhead (<=1.5x) is not treated as fanout — the ratio
+        threshold leaves headroom for normal drift (staging rows, dupes, etc.).
+        """
+        court_ids = ["00000000-0000-0000-0000-000000000001"]
+        # 260 keys → allow up to 390 rows.
+        mock_conn, _ = _build_preflight_mock_conn(court_ids, db_doc_count=380)
+
+        # Should not raise — under threshold.
+        rebuild_db.preflight_split_child_guard(
+            mock_conn,
+            state="ca",
+            county="Santa Clara",
+            s3_key_count=260,
+            force=False,
+        )
+
+    def test_raises_on_fanout_pattern(self) -> None:
+        """DB rows >> S3 keys → split-child fanout → refuse to proceed."""
+        court_ids = ["00000000-0000-0000-0000-000000000001"]
+        # Santa Clara pre-reset baseline: 5239 docs from 260 raw PDFs (~20x).
+        mock_conn, _ = _build_preflight_mock_conn(court_ids, db_doc_count=5239)
+
+        try:
+            rebuild_db.preflight_split_child_guard(
+                mock_conn,
+                state="ca",
+                county="Santa Clara",
+                s3_key_count=260,
+                force=False,
+            )
+        except rebuild_db.SplitChildDataLossError as exc:
+            # Error must name the numbers so operators see the hazard clearly.
+            msg = str(exc)
+            assert "5239" in msg
+            assert "260" in msg
+            # And must mention the override flag + the root-cause issue.
+            assert "--force-split-child-loss" in msg
+            assert "#2494" in msg
+        else:
+            raise AssertionError("expected SplitChildDataLossError")
+
+    def test_force_flag_overrides_guard(self) -> None:
+        """``force=True`` lets operators proceed at their own risk."""
+        court_ids = ["00000000-0000-0000-0000-000000000001"]
+        mock_conn, _ = _build_preflight_mock_conn(court_ids, db_doc_count=5239)
+
+        # Should not raise even with heavy fanout.
+        rebuild_db.preflight_split_child_guard(
+            mock_conn,
+            state="ca",
+            county="Santa Clara",
+            s3_key_count=260,
+            force=True,
+        )
+
+    def test_force_logs_warning(self) -> None:
+        """``force=True`` must still log a loud warning so the override shows
+        up in logs alongside the eventual data loss.
+        """
+        court_ids = ["00000000-0000-0000-0000-000000000001"]
+        mock_conn, _ = _build_preflight_mock_conn(court_ids, db_doc_count=5239)
+
+        mock_logger = MagicMock()
+        with patch.object(rebuild_db, "logger", mock_logger):
+            rebuild_db.preflight_split_child_guard(
+                mock_conn,
+                state="ca",
+                county="Santa Clara",
+                s3_key_count=260,
+                force=True,
+            )
+
+        # At least one warning log mentioning --force-split-child-loss.
+        warn_calls = mock_logger.warning.call_args_list
+        assert any(
+            "--force-split-child-loss" in str(call) or "force_split_child_loss" in str(call)
+            for call in warn_calls
+        ), f"expected force-override warning in {warn_calls!r}"
+
+    def test_raises_when_county_not_found(self) -> None:
+        """Mirrors reset_derived_tables_for_county: unknown county → ValueError."""
+        mock_conn = MagicMock()
+        mock_cur = MagicMock()
+        mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cur)
+        mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+        mock_cur.fetchall.return_value = []  # No courts match
+
+        try:
+            rebuild_db.preflight_split_child_guard(
+                mock_conn,
+                state="ca",
+                county="Atlantis",
+                s3_key_count=10,
+                force=False,
+            )
+        except ValueError as exc:
+            assert "Atlantis" in str(exc)
+        else:
+            raise AssertionError("expected ValueError")
+
+    def test_passes_when_zero_s3_keys_and_zero_db(self) -> None:
+        """Empty county (no S3 keys, no DB rows) must not trip the guard.
+
+        Edge case: initial population of a county where neither S3 nor the DB
+        has anything yet.
+        """
+        court_ids = ["00000000-0000-0000-0000-000000000001"]
+        mock_conn, _ = _build_preflight_mock_conn(court_ids, db_doc_count=0)
+
+        # Should not raise — ratio is undefined but there's no data loss risk.
+        rebuild_db.preflight_split_child_guard(
+            mock_conn,
+            state="ca",
+            county="Santa Clara",
+            s3_key_count=0,
+            force=False,
+        )
+
+    def test_raises_when_db_has_rows_but_s3_is_empty(self) -> None:
+        """DB rows exist but S3 has none → rebuild would nuke everything.
+
+        This is the worst case — the reset would delete every row and the
+        rebuild would recreate nothing.
+        """
+        court_ids = ["00000000-0000-0000-0000-000000000001"]
+        mock_conn, _ = _build_preflight_mock_conn(court_ids, db_doc_count=500)
+
+        try:
+            rebuild_db.preflight_split_child_guard(
+                mock_conn,
+                state="ca",
+                county="Santa Clara",
+                s3_key_count=0,
+                force=False,
+            )
+        except rebuild_db.SplitChildDataLossError as exc:
+            msg = str(exc)
+            assert "500" in msg
+            assert "--force-split-child-loss" in msg
+        else:
+            raise AssertionError("expected SplitChildDataLossError")
+
+    def test_logs_comparison_even_on_pass(self) -> None:
+        """The preflight always logs the comparison so operators have a
+        paper trail of what was about to be deleted, even on the happy path.
+        """
+        court_ids = ["00000000-0000-0000-0000-000000000001"]
+        mock_conn, _ = _build_preflight_mock_conn(court_ids, db_doc_count=260)
+
+        mock_logger = MagicMock()
+        with patch.object(rebuild_db, "logger", mock_logger):
+            rebuild_db.preflight_split_child_guard(
+                mock_conn,
+                state="ca",
+                county="Santa Clara",
+                s3_key_count=260,
+                force=False,
+            )
+
+        info_calls = mock_logger.info.call_args_list
+        # At least one info log summarising the counts.
+        assert any(
+            "s3_key_count" in str(call) and "db_doc_count" in str(call) for call in info_calls
+        ), f"expected count summary in info logs: {info_calls!r}"
+
+
+class TestMainPerCountyResetPreflight:
+    """Main() integration: preflight runs before reset on --reset --county."""
+
+    def _common_patches(
+        self,
+        tmp_path: Any,
+        argv: list[str],
+        db_doc_count: int = 0,
+    ) -> dict[str, Any]:
+        """Set up common patches used by preflight integration tests."""
+        cache_dir = str(tmp_path / "cache")
+        (tmp_path / "cache").mkdir()
+        key_dir = tmp_path / "cache" / "ca" / "santa_clara" / "superior_court" / "raw"
+        key_dir.mkdir(parents=True)
+        (key_dir / "abc123.html").write_bytes(b"<html>x</html>")
+
+        mock_pool = MagicMock()
+        mock_pool.__enter__ = MagicMock(return_value=mock_pool)
+        mock_pool.__exit__ = MagicMock(return_value=False)
+        mock_future = MagicMock()
+        mock_future.result.return_value = {
+            "status": "ok",
+            "content_format": "html",
+            "had_hearing_date": False,
+        }
+        mock_pool.submit.return_value = mock_future
+
+        return {
+            "cache_dir": cache_dir,
+            "argv": argv,
+            "mock_pool": mock_pool,
+            "mock_future": mock_future,
+            "db_doc_count": db_doc_count,
+        }
+
+    def test_preflight_blocks_reset_on_fanout(self, tmp_path: Any) -> None:
+        """Main exits non-zero when the preflight detects fanout without --force."""
+        ctx = self._common_patches(
+            tmp_path,
+            ["rebuild_db.py", "--reset", "--county", "Santa Clara"],
+        )
+        with (
+            patch("rebuild_db.make_s3_client", return_value=MagicMock()),
+            patch("psycopg.connect", return_value=MagicMock()),
+            patch(
+                "rebuild_db.list_local_keys",
+                return_value=["ca/santa_clara/superior_court/raw/abc123.html"],
+            ),
+            patch("rebuild_db.seed_courts", return_value={}),
+            patch("rebuild_db.reset_derived_tables") as mock_global_reset,
+            patch("rebuild_db.reset_derived_tables_for_county") as mock_per_county_reset,
+            patch("rebuild_db.preflight_split_child_guard") as mock_preflight,
+            patch("rebuild_db._fetch_rosters"),
+            patch("rebuild_db._write_rebuild_marker"),
+            patch(
+                "concurrent.futures.ProcessPoolExecutor",
+                return_value=ctx["mock_pool"],
+            ),
+            patch(
+                "concurrent.futures.as_completed",
+                return_value=iter([ctx["mock_future"]]),
+            ),
+            patch.dict(
+                os.environ,
+                {
+                    "DATABASE_URL": "postgres://test",
+                    "S3_CACHE_DIR": ctx["cache_dir"],
+                },
+                clear=False,
+            ),
+            patch("sys.argv", ctx["argv"]),
+        ):
+            mock_preflight.side_effect = rebuild_db.SplitChildDataLossError("fanout detected")
+            try:
+                rebuild_db.main()
+            except SystemExit as exc:
+                # sys.exit(non-zero) on guard failure.
+                assert exc.code != 0
+            else:
+                raise AssertionError("expected SystemExit on guard failure")
+
+        # Preflight ran; reset did NOT run.
+        mock_preflight.assert_called_once()
+        mock_per_county_reset.assert_not_called()
+        mock_global_reset.assert_not_called()
+
+    def test_preflight_runs_before_reset_on_per_county(self, tmp_path: Any) -> None:
+        """On the happy path, preflight runs and then reset proceeds."""
+        ctx = self._common_patches(
+            tmp_path,
+            ["rebuild_db.py", "--reset", "--county", "Santa Clara"],
+        )
+        with (
+            patch("rebuild_db.make_s3_client", return_value=MagicMock()),
+            patch("psycopg.connect", return_value=MagicMock()),
+            patch(
+                "rebuild_db.list_local_keys",
+                return_value=["ca/santa_clara/superior_court/raw/abc123.html"],
+            ),
+            patch("rebuild_db.seed_courts", return_value={}),
+            patch("rebuild_db.reset_derived_tables_for_county") as mock_per_county_reset,
+            patch("rebuild_db.preflight_split_child_guard") as mock_preflight,
+            patch("rebuild_db._fetch_rosters"),
+            patch("rebuild_db._write_rebuild_marker"),
+            patch(
+                "concurrent.futures.ProcessPoolExecutor",
+                return_value=ctx["mock_pool"],
+            ),
+            patch(
+                "concurrent.futures.as_completed",
+                return_value=iter([ctx["mock_future"]]),
+            ),
+            patch.dict(
+                os.environ,
+                {
+                    "DATABASE_URL": "postgres://test",
+                    "S3_CACHE_DIR": ctx["cache_dir"],
+                },
+                clear=False,
+            ),
+            patch("sys.argv", ctx["argv"]),
+        ):
+            rebuild_db.main()
+
+        # Preflight called exactly once with force=False.
+        mock_preflight.assert_called_once()
+        pf_kwargs = mock_preflight.call_args.kwargs
+        pf_args = mock_preflight.call_args.args
+        # Accept either calling style; force kwarg must be False.
+        force = pf_kwargs.get("force")
+        if force is None and len(pf_args) >= 5:
+            force = pf_args[4]
+        assert force is False
+        # Per-county reset runs after the preflight.
+        mock_per_county_reset.assert_called_once()
+
+    def test_preflight_skipped_on_global_reset(self, tmp_path: Any) -> None:
+        """``--reset`` without ``--county`` must not call the preflight.
+
+        The global truncate is a conscious nuclear option; the split-child
+        hazard is a per-county concern.
+        """
+        ctx = self._common_patches(tmp_path, ["rebuild_db.py", "--reset"])
+        with (
+            patch("rebuild_db.make_s3_client", return_value=MagicMock()),
+            patch("psycopg.connect", return_value=MagicMock()),
+            patch(
+                "rebuild_db.list_local_keys",
+                return_value=["ca/santa_clara/superior_court/raw/abc123.html"],
+            ),
+            patch("rebuild_db.seed_courts", return_value={}),
+            patch("rebuild_db.reset_derived_tables"),
+            patch("rebuild_db.preflight_split_child_guard") as mock_preflight,
+            patch("rebuild_db._fetch_rosters"),
+            patch("rebuild_db._write_rebuild_marker"),
+            patch(
+                "concurrent.futures.ProcessPoolExecutor",
+                return_value=ctx["mock_pool"],
+            ),
+            patch(
+                "concurrent.futures.as_completed",
+                return_value=iter([ctx["mock_future"]]),
+            ),
+            patch.dict(
+                os.environ,
+                {
+                    "DATABASE_URL": "postgres://test",
+                    "S3_CACHE_DIR": ctx["cache_dir"],
+                },
+                clear=False,
+            ),
+            patch("sys.argv", ctx["argv"]),
+        ):
+            rebuild_db.main()
+
+        mock_preflight.assert_not_called()
+
+    def test_force_flag_passes_through_to_preflight(self, tmp_path: Any) -> None:
+        """``--force-split-child-loss`` must propagate to the preflight call."""
+        ctx = self._common_patches(
+            tmp_path,
+            [
+                "rebuild_db.py",
+                "--reset",
+                "--county",
+                "Santa Clara",
+                "--force-split-child-loss",
+            ],
+        )
+        with (
+            patch("rebuild_db.make_s3_client", return_value=MagicMock()),
+            patch("psycopg.connect", return_value=MagicMock()),
+            patch(
+                "rebuild_db.list_local_keys",
+                return_value=["ca/santa_clara/superior_court/raw/abc123.html"],
+            ),
+            patch("rebuild_db.seed_courts", return_value={}),
+            patch("rebuild_db.reset_derived_tables_for_county"),
+            patch("rebuild_db.preflight_split_child_guard") as mock_preflight,
+            patch("rebuild_db._fetch_rosters"),
+            patch("rebuild_db._write_rebuild_marker"),
+            patch(
+                "concurrent.futures.ProcessPoolExecutor",
+                return_value=ctx["mock_pool"],
+            ),
+            patch(
+                "concurrent.futures.as_completed",
+                return_value=iter([ctx["mock_future"]]),
+            ),
+            patch.dict(
+                os.environ,
+                {
+                    "DATABASE_URL": "postgres://test",
+                    "S3_CACHE_DIR": ctx["cache_dir"],
+                },
+                clear=False,
+            ),
+            patch("sys.argv", ctx["argv"]),
+        ):
+            rebuild_db.main()
+
+        mock_preflight.assert_called_once()
+        pf_kwargs = mock_preflight.call_args.kwargs
+        pf_args = mock_preflight.call_args.args
+        force = pf_kwargs.get("force")
+        if force is None and len(pf_args) >= 5:
+            force = pf_args[4]
+        assert force is True

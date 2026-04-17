@@ -22,6 +22,11 @@
 #                     with --county, the reset is scoped to just that county's
 #                     rows (per-county reset); otherwise it truncates the
 #                     derived schema globally.
+#   --force-split-child-loss
+#                     Override the split-child preflight guard (see #2494,
+#                     #2496) and proceed with --reset --county even when the
+#                     rebuild cannot restore all deleted rows.  Expect data
+#                     loss on multi-case-PDF counties.
 """
 
 from __future__ import annotations
@@ -457,6 +462,20 @@ def reset_derived_tables_for_county(
     * Does **not** touch OpenSearch — the global index self-heals as new
       rulings are indexed.
 
+    .. note::
+        **Split-child hazard.** Counties whose scrapers split multi-case PDFs
+        into multiple ``derived.documents`` rows per raw S3 object (currently
+        Santa Clara, and any other county whose raws are multi-case PDFs —
+        Orange, Riverside, Fresno) fan out N:1 at ingest time.  On rebuild,
+        each raw PDF re-derives **only one** row, not N, because of the
+        ``content_hash`` / ``key_hash`` mismatch in the rebuild pipeline
+        (see #2494).  Running ``--reset --county`` on such a county will
+        therefore delete all the split-children and the rebuild cannot
+        restore them — the county ends up with only the raw-aligned subset.
+        Callers must clear ``preflight_split_child_guard`` (or pass
+        ``--force-split-child-loss`` on the CLI) before invoking this
+        function on a multi-case-PDF county.
+
     Raises:
         ValueError: if no courts match ``(state, county)``.  Silently
             matching zero rows would let a typo nuke nothing and rebuild
@@ -567,6 +586,149 @@ def reset_derived_tables_for_county(
         deleted=deleted,
     )
     return deleted
+
+
+# Fanout ratio at or above which the split-child guard fires.  Chosen to
+# leave headroom for normal drift (staging rows, accidental dupes, edits
+# that add a handful of rows per raw) while still catching the N:1 pattern
+# (Santa Clara pre-reset was ~20x).
+_SPLIT_CHILD_FANOUT_RATIO = 1.5
+
+
+class SplitChildDataLossError(RuntimeError):
+    """Raised when ``--reset --county`` would delete more rows than rebuild
+    can restore from S3 — the split-child data-loss hazard from #2494.
+
+    See ``preflight_split_child_guard`` for details and the override
+    mechanism (``--force-split-child-loss``).
+    """
+
+
+def preflight_split_child_guard(
+    conn: psycopg.Connection,
+    state: str,
+    county: str,
+    s3_key_count: int,
+    force: bool,
+) -> None:
+    """Refuse per-county reset when rebuild cannot restore what reset deletes.
+
+    Background (#2494, #2496): when the ingestion pipeline splits a single
+    multi-case raw PDF into N ``derived.documents`` rows (one per extracted
+    case), the rows share the raw's S3 key but carry different content
+    hashes.  The rebuild path hashes the raw bytes and tries to match against
+    the S3 key filename — that only reproduces **one** row per raw PDF, not
+    N.  So a ``--reset --county`` on a multi-case-PDF county (e.g. Santa
+    Clara, Orange, Riverside, Fresno) will delete all N split-children and
+    rebuild will only recreate the 1 raw-aligned row.  Result: silent data
+    loss equal to ``(N-1) * raw_count`` per county on every run.
+
+    The guard compares the DB's ``derived.documents`` count for the county
+    against the raw-object count in S3.  If the DB has meaningfully more
+    rows than S3 (ratio >= ``_SPLIT_CHILD_FANOUT_RATIO``), the fanout
+    pattern is present and the reset is refused unless ``force`` is True.
+
+    Edge cases:
+    * Both counts zero → no data to lose, allow.
+    * DB count lower than S3 count → no fanout, allow (this is the initial-
+      population path before the worker has caught up).
+    * S3 count zero but DB has rows → worst case, reset would nuke everything
+      with no rebuild capacity to restore; refuse unless forced.
+
+    Args:
+        conn: Open DB connection (used to resolve court ids and count rows).
+        state: Two-letter state code (case-insensitive).
+        county: County name (case-insensitive, unnormalised).
+        s3_key_count: Number of content-addressed raw objects under
+            ``{state}/{county}/`` in S3 (or the local cache) — caller is
+            responsible for counting these.
+        force: Caller opted into the data loss (``--force-split-child-loss``).
+
+    Raises:
+        ValueError: no courts match ``(state, county)`` (typo guard — mirrors
+            ``reset_derived_tables_for_county``).
+        SplitChildDataLossError: fanout detected and ``force`` is False.
+    """
+    court_ids = _resolve_county_court_ids(conn, state, county)
+    if not court_ids:
+        raise ValueError(
+            f"No courts found in derived.courts for state={state!r}, county={county!r}. "
+            "Refusing to run split-child preflight against a nonexistent county."
+        )
+
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT COUNT(*) FROM derived.documents WHERE court_id = ANY(%s::uuid[])",
+            (court_ids,),
+        )
+        db_doc_count = int(cur.fetchone()[0])
+
+    # Ratio is undefined if s3_key_count == 0 but db_doc_count > 0.  That's
+    # the worst case (reset would nuke everything, rebuild restores nothing)
+    # so treat it as an unconditional fanout violation.
+    if s3_key_count == 0 and db_doc_count == 0:
+        ratio: float = 0.0
+    elif s3_key_count == 0:
+        ratio = float("inf")
+    else:
+        ratio = db_doc_count / s3_key_count
+
+    logger.info(
+        "Split-child preflight",
+        state=state,
+        county=county,
+        s3_key_count=s3_key_count,
+        db_doc_count=db_doc_count,
+        fanout_ratio=round(ratio, 2) if ratio != float("inf") else "inf",
+        threshold=_SPLIT_CHILD_FANOUT_RATIO,
+        force_split_child_loss=force,
+    )
+
+    fanout_detected = ratio >= _SPLIT_CHILD_FANOUT_RATIO
+
+    if not fanout_detected:
+        logger.info(
+            "Split-child preflight passed — DB row count within fanout tolerance",
+            state=state,
+            county=county,
+            db_doc_count=db_doc_count,
+            s3_key_count=s3_key_count,
+        )
+        return
+
+    # Fanout detected.  Either refuse, or warn and proceed under --force.
+    msg = (
+        f"Split-child data-loss hazard detected for {state}/{county}: "
+        f"derived.documents has {db_doc_count} rows but S3 has only "
+        f"{s3_key_count} raw objects (fanout ratio "
+        f"{'inf' if ratio == float('inf') else f'{ratio:.2f}x'} "
+        f">= {_SPLIT_CHILD_FANOUT_RATIO}x threshold). "
+        "Running --reset --county will delete the split-children and the "
+        "rebuild cannot restore them (see #2494). Pass "
+        "--force-split-child-loss to proceed anyway."
+    )
+
+    if not force:
+        logger.error(
+            "Split-child preflight FAILED — refusing to reset",
+            state=state,
+            county=county,
+            db_doc_count=db_doc_count,
+            s3_key_count=s3_key_count,
+            fanout_ratio=round(ratio, 2) if ratio != float("inf") else "inf",
+        )
+        raise SplitChildDataLossError(msg)
+
+    logger.warning(
+        "Split-child preflight overridden by --force-split-child-loss — "
+        "proceeding with reset. Expected data loss: approximately "
+        "%d rows that rebuild cannot restore.",
+        max(0, db_doc_count - s3_key_count),
+        state=state,
+        county=county,
+        db_doc_count=db_doc_count,
+        s3_key_count=s3_key_count,
+    )
 
 
 def reset_opensearch_index(os_url: str) -> None:
@@ -706,6 +868,15 @@ def main() -> None:
         default="ca",
         help="State code for --county filtering (default: ca)",
     )
+    parser.add_argument(
+        "--force-split-child-loss",
+        action="store_true",
+        help=(
+            "Override the split-child preflight guard on --reset --county. "
+            "Proceed with reset even when the rebuild cannot restore all "
+            "deleted rows (see #2494, #2496).  Expect data loss."
+        ),
+    )
     args = parser.parse_args()
 
     database_url = os.environ.get("DATABASE_URL", "")
@@ -725,6 +896,37 @@ def main() -> None:
     if args.reset:
         if args.county:
             # Per-county reset: only delete rows belonging to this county.
+            # Before deleting, run the split-child preflight so we don't
+            # destroy rows that rebuild cannot restore (see #2494, #2496).
+            # We need an S3 key count for the preflight — this is the same
+            # list that step 1 builds later, but we need it up front here.
+            preflight_prefix = f"{sluggify(args.state)}/{sluggify(args.county)}/"
+            if cache_dir:
+                preflight_s3_key_count = len(
+                    list_local_keys(Path(cache_dir), prefix=preflight_prefix)
+                )
+            else:
+                preflight_s3_key_count = len(
+                    list_s3_keys(s3, BUCKET, prefix=preflight_prefix)
+                )
+
+            try:
+                preflight_split_child_guard(
+                    conn,
+                    state=args.state,
+                    county=args.county,
+                    s3_key_count=preflight_s3_key_count,
+                    force=args.force_split_child_loss,
+                )
+            except SplitChildDataLossError as exc:
+                logger.error(
+                    "Aborting per-county reset — pass --force-split-child-loss "
+                    "to override: %s",
+                    exc,
+                )
+                conn.close()
+                sys.exit(2)
+
             # Skip the OpenSearch index reset — the global index self-heals
             # as new rulings are indexed during the rebuild.  See #2465.
             reset_derived_tables_for_county(conn, args.state, args.county)
