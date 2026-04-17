@@ -115,6 +115,50 @@ scripts/ecs-run-task.sh --cpu 2048 --memory 8192 scripts/rebuild_db.py -- --coun
 
 Smaller counties (a few hundred documents or fewer) run fine at the 1024/4096 default.
 
+### Dev DB Connection Budget
+
+The dev RDS instance (`judgemind-dev`) runs on **`db.t4g.small`** (2 GB RAM).  PostgreSQL 16's `max_connections` is derived from the instance-class memory via the formula `LEAST({DBInstanceClassMemory/9531392}, 5000)` — on `db.t4g.small` this resolves to roughly **~170 connections**.  Reserved slots:
+
+- `rds.rds_reserved_connections = 4`
+- `superuser_reserved_connections = 3`
+- `reserved_connections = 2`
+
+So usable budget is **~161 concurrent application connections**.
+
+Long-lived steady-state consumers:
+
+| Consumer | Typical connections | Notes |
+|---|---|---|
+| `judgemind-ingestion-worker-dev` | 1 | Persistent `psycopg.connect` in `ingestion/worker.py::_get_connection`, reused across events |
+| `judgemind-api-dev` | 1-2 per task | Short-lived per-request connections plus minor overhead |
+| CloudWatch / Performance Insights | 1-2 | RDS management connections |
+| Subtotal | **~5** | Baseline even with no scripts running |
+
+Burst consumers — watch these when launching oneshot tasks:
+
+| Consumer | Max connections | Notes |
+|---|---|---|
+| `rebuild_db.py --concurrency N` | **N + 1** | One per `ProcessPoolExecutor` worker, plus the main process's reset connection (default `--concurrency 64` → 65 connections; `--concurrency 16` → 17) |
+| `reingest_from_s3.py` | 1-2 | Single-process script |
+| `enrich_all_rulings.py` | 1-2 | Single-process script, but holds a long-running transaction |
+| `scripts/dev-db-query.sh` | 1 | One-shot query per invocation |
+
+**Why this matters.** Launching a second `rebuild_db.py` while one is already running (`2 × 65 = 130 connections`), or letting an old `rebuild` hang around retrying failed connections while you start a new one, can push total past the ~161 usable ceiling.  The first script to get refused logs:
+
+```
+psycopg.OperationalError: connection failed: … FATAL:
+remaining connection slots are reserved for roles with privileges of the "rds_reserved" role
+```
+
+Best practices:
+
+1. Never launch a rebuild while another rebuild or large backfill is already running against dev.  Check with `aws ecs list-tasks --cluster judgemind-dev --desired-status RUNNING` before starting anything that opens many connections.
+2. If you see `rds_reserved` errors, first check for runaway oneshot tasks (`aws ecs list-tasks`, then `aws ecs describe-tasks`) and stop any that are stuck retrying — each zombie task holds N connections until it exits.
+3. When iterating locally, prefer `scripts/rebuild_db.sh` against the Docker Compose Postgres rather than dev.
+4. If you *must* run rebuild with aggressive concurrency on dev, drop `--concurrency` to match the headroom (e.g. `--concurrency 32` leaves ~100 connections free for other callers).
+
+**History.** The instance was bumped from `db.t4g.micro` (max_connections ≈ 84) to `db.t4g.small` in #2549 after rebuild + backfill contention reliably triggered connection-slot exhaustion.
+
 ### Reingest vs Rebuild
 
 `reingest_from_s3.py` operates on **existing database records only** — it queries the `documents` table to find S3 keys to reprocess. If you run it for a county with no records in the `documents` table, it will process 0 documents silently.
