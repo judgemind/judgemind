@@ -1673,6 +1673,12 @@ class TestMainPoolBreakHandling:
                 {
                     "DATABASE_URL": "postgres://test",
                     "S3_CACHE_DIR": cache_dir,
+                    # Disable retry-cap gates (#2572) so this test exercises
+                    # the retry path even when crashed/total > 10%.  Without
+                    # this, main() aborts with sys.exit(2) before the
+                    # pool-break summary is logged.  See #2567.
+                    "REBUILD_MAX_RETRY_COUNT": "0",
+                    "REBUILD_MAX_RETRY_RATIO": "0",
                 },
             ),
             patch("sys.argv", ["rebuild_db.py"]),
@@ -1759,6 +1765,12 @@ class TestMainPoolBreakHandling:
                 {
                     "DATABASE_URL": "postgres://test",
                     "S3_CACHE_DIR": cache_dir,
+                    # Disable retry-cap gates (#2572) so this test exercises
+                    # the retry path even when crashed/total > 10%.  Without
+                    # this, main() aborts with sys.exit(2) before the
+                    # pool-break summary is logged.  See #2567.
+                    "REBUILD_MAX_RETRY_COUNT": "0",
+                    "REBUILD_MAX_RETRY_RATIO": "0",
                 },
             ),
             patch("sys.argv", ["rebuild_db.py"]),
