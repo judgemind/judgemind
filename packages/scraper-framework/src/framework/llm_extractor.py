@@ -327,6 +327,19 @@ _CASE_NUMBER_RE = re.compile(
 # Pattern to detect case titles (vs / v.).
 _VS_RE = re.compile(r"\bv(?:s)?\.?\s", re.IGNORECASE)
 
+# Pattern matching corporate-entity suffixes that typically terminate a
+# defendant party name, e.g. "Orthodontics, Inc.", "Ellis & Son Trucking,
+# Inc.", "Acme LLC".  Used to detect fusion boundaries between two adjacent
+# cases in multimodal PDF extraction (#2500).  The suffix must be followed
+# by a word boundary (whitespace, punctuation, or end of string) so we do
+# not match mid-word substrings.  Trailing period is optional since the
+# LLM occasionally drops it.
+_ENTITY_SUFFIX_RE = re.compile(
+    r"\b(?:Inc|LLC|L\.L\.C|Corp|Corporation|Ltd|L\.P|LP|P\.C|PC|Co"
+    r"|N\.A|N\.V|LLP|L\.L\.P)\.?(?=$|[\s,;.])",
+    re.IGNORECASE,
+)
+
 # Patterns for cleaning case title fragments from multimodal extraction.
 # OC case numbers follow the format: {county}-{year}-{seq}-{type}-{division}
 # e.g., 30-2024-01393434-CU-OR-CJC.  The LLM sometimes splits these across
@@ -2335,6 +2348,239 @@ def _extract_case_title_from_info(case_info: str) -> str | None:
     return None
 
 
+def _split_fused_case_info(case_info: str | None) -> list[str]:
+    """Split a possibly-fused ``case_info`` into one or more sub-case strings.
+
+    When the multimodal LLM extracts a single PDF page that visually groups
+    several cases together, it sometimes concatenates two adjacent cases
+    into one row's ``case_info`` (#2500).  The classic pattern is:
+
+        "Gu v. Family Orthodontics & Oral Surgery "
+        "Clarke, Inc. v. Ellis & Son Trucking, Inc."
+
+    There are two "v."/"vs." clauses, the first plaintiff's first word
+    ("Gu") does NOT repeat, and there is no explicit separator — so the
+    existing repeating-plaintiff guard in ``_extract_case_title_from_info``
+    fails to detect it and the whole blob is collapsed into one
+    ``ExtractedRuling`` (dropping the second case entirely).
+
+    This helper detects fusion and splits the ``case_info`` into a list of
+    sub-cases by looking for a boundary signal BETWEEN the first and
+    second "v." clauses, in this order of precedence:
+
+    1. **Case number** — a case-number pattern (e.g. "24-12345") between
+       the two "v." clauses almost certainly marks the boundary.  The
+       case number belongs to the SECOND sub-case.
+    2. **Entry number** — a bare standalone integer (e.g. "2") between
+       the clauses is treated as a numbering boundary (the PDF row is
+       "Entry 1 ... Entry 2 ...").  The integer is discarded.
+    3. **Entity suffix** — a corporate-entity suffix (``Inc.``, ``LLC``,
+       ``Corp.`` etc.) between the clauses indicates the first defendant
+       ended; split immediately after the suffix and any trailing
+       punctuation/whitespace.
+    4. **Repeating plaintiff** — if the first plaintiff's first word
+       reappears before the second "v.", split at that repeat.  (This
+       mirrors the existing dual-"vs." guard in
+       ``_extract_case_title_from_info`` but returns two sub-cases
+       instead of silently dropping the second.)
+    5. **No split** — if none of the above matches, return
+       ``[case_info]`` unchanged.  Speculative splitting risks fragmenting
+       legitimate single-case titles (e.g. titles with embedded phrases
+       resembling "v.").
+
+    Triple+ fusion is handled by recursing on the tail sub-case.
+
+    Args:
+        case_info: The raw ``case_info`` string from ``_parse_page_rows``.
+            May be ``None`` or empty.
+
+    Returns:
+        A list of sub-case strings.  Always non-empty for non-empty
+        input; returns ``[case_info]`` when no fusion is detected.  For
+        ``None`` / empty input returns ``[case_info]`` to preserve the
+        caller's expected shape (callers should handle empty strings
+        themselves).
+    """
+    if not case_info:
+        return [case_info or ""]
+
+    # Normalize: replace newlines with spaces so multi-line case_info
+    # joins cleanly when we search for boundaries.  We keep a reference
+    # back to the original case_info so sub-strings preserve punctuation
+    # and whitespace that matter downstream (e.g. _extract_case_number).
+    flat = case_info.replace("\n", " ")
+
+    vs_iter = list(_VS_RE.finditer(flat))
+    if len(vs_iter) < 2:
+        return [case_info]
+
+    first_vs_end = vs_iter[0].end()
+    second_vs_start = vs_iter[1].start()
+
+    # Search between the END of the first "v." clause and the START of
+    # the second "v." clause for a boundary signal.
+    between = flat[first_vs_end:second_vs_start]
+    between_offset = first_vs_end  # absolute offset for slicing back
+
+    split_abs_start: int | None = None  # slice [:split_abs_start] = sub1
+    split_abs_end: int | None = None  # slice [split_abs_end:] = sub2
+
+    # 1. Case number boundary — case number belongs to the SECOND sub-case.
+    case_num_match = _CASE_NUMBER_RE.search(between)
+    if case_num_match:
+        split_abs_start = between_offset + case_num_match.start()
+        split_abs_end = between_offset + case_num_match.start()
+    else:
+        # 2. Entry number boundary — a standalone bare integer that is
+        #    NOT part of a case number (we already ruled those out above).
+        #    We look for a short digit run (1-3 digits) that is
+        #    surrounded by non-word characters (whitespace OR
+        #    punctuation like ``.`` ``,`` ``;``).  ``\b`` is a word
+        #    boundary so it matches ``"2 "``, ``"2."``, and ``"2,"``
+        #    but not a digit embedded inside a word (``"word2go"``).
+        #    Longer digit runs are suspicious and would have matched
+        #    ``_CASE_NUMBER_RE`` above if valid.
+        entry_match = re.search(r"(?<=\s)\d{1,3}\b", between)
+        if not entry_match:
+            # The entry number may sit at the very start of `between`
+            # (no preceding whitespace inside the slice because
+            # ``_VS_RE`` already consumed the separating whitespace).
+            # Example: ``"Gu v. 1 Clarke, Inc. v. Ellis..."`` yields
+            # ``between == "1 Clarke, Inc. "``, where the leading ``1``
+            # has no space before it in the slice but is still a valid
+            # entry-number boundary.
+            start_match = re.match(r"\d{1,3}\b", between)
+            if start_match:
+                entry_match = start_match
+        if entry_match:
+            # First sub-case ends just before the entry number; second
+            # sub-case starts just after it.
+            split_abs_start = between_offset + entry_match.start()
+            split_abs_end = between_offset + entry_match.end()
+        else:
+            # 3. Entity suffix boundary — find the FIRST entity suffix
+            #    in the between-slice and split just after it.  The
+            #    first suffix marks the END of the first defendant's
+            #    name (which starts immediately after the first
+            #    "v. ").  Using the LAST suffix instead would
+            #    over-consume when the second plaintiff's name also
+            #    contains an entity suffix — e.g. on input
+            #    ``"Alpha v. Beta Inc. Gamma LLC v. Delta"`` the
+            #    last-suffix variant would split at ``LLC`` and
+            #    leave sub2 = ``"v. Delta"`` with no plaintiff.
+            suffix_matches = list(_ENTITY_SUFFIX_RE.finditer(between))
+            if suffix_matches:
+                first_suffix = suffix_matches[0]
+                suffix_end = first_suffix.end()
+                # Also consume any trailing comma/semicolon/period
+                # and whitespace so the second sub-case starts clean.
+                tail = between[suffix_end:]
+                trim = re.match(r"[\s,;.\-]*", tail)
+                extra = trim.end() if trim else 0
+                split_abs_start = between_offset + suffix_end
+                split_abs_end = between_offset + suffix_end + extra
+            else:
+                # 4. Repeating-plaintiff boundary — mirrors the existing
+                #    dual-"vs." guard, but yields a SPLIT instead of a
+                #    truncation.  Compute the first plaintiff (everything
+                #    before the first "v.").
+                first_plaintiff = flat[: vs_iter[0].start()].strip(" ,;-")
+                first_word = first_plaintiff.split(" ", 1)[0] if first_plaintiff else ""
+                # Require at least 2 chars to avoid false positives on
+                # single-letter initials (which routinely recur in case
+                # titles).
+                if first_word and len(first_word) >= 2:
+                    # Look for the first occurrence of the first word as
+                    # a standalone token in the between-slice.
+                    repeat = re.search(
+                        r"\b" + re.escape(first_word) + r"\b",
+                        between,
+                    )
+                    if repeat:
+                        split_abs_start = between_offset + repeat.start()
+                        split_abs_end = between_offset + repeat.start()
+
+    if split_abs_start is None or split_abs_end is None:
+        # 5. No boundary signal found — do not speculate.
+        return [case_info]
+
+    # Slice back into the ORIGINAL case_info (with newlines preserved).
+    # The offsets were computed against ``flat`` where each "\n" was
+    # replaced by a single " "; offsets into ``flat`` map 1:1 to the
+    # original because lengths are preserved.  Verify the invariant.
+    assert len(flat) == len(case_info)
+
+    sub1 = case_info[:split_abs_start].strip(" \n\t,;-")
+    sub2_raw = case_info[split_abs_end:].strip(" \n\t,;-")
+
+    # If either side is empty after trimming, the boundary was degenerate;
+    # fall back to no split to avoid losing content.
+    if not sub1 or not sub2_raw:
+        return [case_info]
+
+    # Recurse on the tail to handle triple+ fusion.
+    tail_parts = _split_fused_case_info(sub2_raw)
+    return [sub1, *tail_parts]
+
+
+def _append_ruling_from_case(
+    rulings: list[ExtractedRuling],
+    case_info: str,
+    ruling_text: str | None,
+    *,
+    metadata: dict[str, str] | None,
+    header_judge: str | None,
+    header_dept: str | None,
+    header_date: str | None,
+) -> None:
+    """Append one ``ExtractedRuling`` built from a single case_info string.
+
+    Applies metadata / header fallbacks and the calendar-header guard.
+    Extracted from the main conversion loop in ``_join_page_rows`` so the
+    fused-row splitter (#2500) can emit one ruling per sub-case while
+    reusing the same post-processing.
+    """
+    case_number = _extract_case_number_from_info(case_info)
+    case_title = _extract_case_title_from_info(case_info)
+    text = ruling_text.strip() if ruling_text else None
+    text = text or None
+
+    # Post-processing: filter calendar header text (#2096).
+    if _is_calendar_header(text):
+        logger.warning(
+            "llm_extractor.calendar_header_filtered",
+            case_number=case_number,
+            text_preview=(text or "")[:100],
+        )
+        text = None
+
+    # Apply metadata overrides, then header extraction, for judge/dept/date.
+    judge_name: str | None = None
+    department: str | None = None
+    hearing_date: str | None = None
+    if metadata:
+        judge_name = metadata.get("judge_name")
+        department = metadata.get("department")
+        hearing_date = metadata.get("hearing_date")
+    if not judge_name:
+        judge_name = header_judge
+    if not department:
+        department = header_dept
+    if not hearing_date:
+        hearing_date = header_date
+
+    rulings.append(
+        ExtractedRuling(
+            extracted_case_number=case_number,
+            extracted_case_title=case_title,
+            extracted_judge_name=judge_name,
+            department=department,
+            hearing_date=hearing_date,
+            ruling_text=text,
+        )
+    )
+
+
 def _join_page_rows(
     rows: list[dict],
     *,
@@ -2413,49 +2659,46 @@ def _join_page_rows(
                     }
                 )
 
-    # Convert to ExtractedRuling objects.
+    # Convert to ExtractedRuling objects.  Each grouped case may be a
+    # FUSED row that the LLM concatenated from two (or more) adjacent
+    # cases — split it with _split_fused_case_info (#2500) and emit one
+    # ExtractedRuling per sub-case.  The first sub-case keeps the
+    # ruling_text (the body almost certainly belongs to the case whose
+    # title appears first in the fused string); subsequent sub-cases
+    # get ruling_text=None so they do not silently claim the first
+    # case's ruling body.
+    #
+    # When fusion splits a case into N>1 rulings, any entry_number that
+    # originally pointed to this case index needs to be remapped to the
+    # new index of the FIRST sub-case in ``rulings``.  Build a
+    # case_index -> ruling_index map as we go, then rewrite
+    # entry_number_to_index after the loop.
     rulings: list[ExtractedRuling] = []
-    for case in cases:
-        case_number = _extract_case_number_from_info(case["case_info"])
-        case_title = _extract_case_title_from_info(case["case_info"])
-        ruling_text = case["ruling_text"].strip() or None
-
-        # Post-processing: filter calendar header text (#2096).
-        # The LLM sometimes returns calendar header/boilerplate as the
-        # ruling_text for individual cases.  Detect and null it out.
-        if _is_calendar_header(ruling_text):
-            logger.warning(
-                "llm_extractor.calendar_header_filtered",
-                case_number=case_number,
-                text_preview=(ruling_text or "")[:100],
+    case_index_to_ruling_index: dict[int, int] = {}
+    for case_idx, case in enumerate(cases):
+        case_index_to_ruling_index[case_idx] = len(rulings)
+        sub_case_infos = _split_fused_case_info(case["case_info"])
+        for idx, sub_info in enumerate(sub_case_infos):
+            sub_text = case["ruling_text"] if idx == 0 else None
+            _append_ruling_from_case(
+                rulings,
+                sub_info,
+                sub_text,
+                metadata=metadata,
+                header_judge=header_judge,
+                header_dept=header_dept,
+                header_date=header_date,
             )
-            ruling_text = None
 
-        # Apply metadata overrides, then header extraction, for judge/dept/date.
-        judge_name: str | None = None
-        department: str | None = None
-        hearing_date: str | None = None
-        if metadata:
-            judge_name = metadata.get("judge_name")
-            department = metadata.get("department")
-            hearing_date = metadata.get("hearing_date")
-        if not judge_name:
-            judge_name = header_judge
-        if not department:
-            department = header_dept
-        if not hearing_date:
-            hearing_date = header_date
-
-        rulings.append(
-            ExtractedRuling(
-                extracted_case_number=case_number,
-                extracted_case_title=case_title,
-                extracted_judge_name=judge_name,
-                department=department,
-                hearing_date=hearing_date,
-                ruling_text=ruling_text,
-            )
-        )
+    # Remap entry_number_to_index to point at the first sub-case's ruling
+    # index so cross-reference resolution in _resolve_cross_references
+    # continues to find the right ExtractedRuling after any fusion
+    # splits.
+    entry_number_to_index = {
+        entry_num: case_index_to_ruling_index[case_idx]
+        for entry_num, case_idx in entry_number_to_index.items()
+        if case_idx in case_index_to_ruling_index
+    }
 
     # Post-processing: resolve cross-reference entries (#2317).
     # Santa Clara PDFs use cross-references like "See Line 4 for tentative
