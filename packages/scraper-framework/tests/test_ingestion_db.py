@@ -1603,8 +1603,10 @@ class TestInsertRulingContentDedup:
         # text_hash (last arg) should be None
         assert args[-1] is None
 
-    def test_unique_violation_triggers_update_fallback(self) -> None:
-        """When UniqueViolation fires (content-hash conflict), fall back to UPDATE.
+    def test_unique_violation_triggers_supersede(self) -> None:
+        """When UniqueViolation fires on ``uq_rulings_case_text_hash``,
+        supersede the losing document instead of falling back to a
+        content-hash UPDATE (#2458).
 
         In tests without a real PG connection, diag.constraint_name is None.
         The code treats None as the expected constraint (see db.py comment).
@@ -1631,16 +1633,24 @@ class TestInsertRulingContentDedup:
             department="Dept. 1",
         )
 
-        # Verify: SAVEPOINT, INSERT (which raises), ROLLBACK TO SAVEPOINT, UPDATE
         execute_calls = cur.execute.call_args_list
         sql_stmts = [call[0][0] for call in execute_calls]
+        # Savepoint-rollback path still runs.
         assert any("SAVEPOINT" in s for s in sql_stmts)
         assert any("INSERT INTO rulings" in s for s in sql_stmts)
         assert any("ROLLBACK TO SAVEPOINT" in s for s in sql_stmts)
-        assert any("UPDATE rulings SET" in s for s in sql_stmts)
+        # New behavior: supersede the losing document.  No content-hash UPDATE.
+        assert any("DELETE FROM rulings WHERE document_id" in s for s in sql_stmts)
+        assert any("UPDATE documents SET status = 'superseded'" in s for s in sql_stmts)
+        # The old buggy fallback UPDATE targeting (case_id, ruling_text_hash)
+        # must NOT run — that was the #2458 bug.
+        assert not any("UPDATE rulings SET" in s and "ruling_text_hash" in s for s in sql_stmts), (
+            "Old fallback UPDATE-by-content-hash must not run — it silently "
+            "mutated the winner's row with the loser's fields (#2458)."
+        )
 
-    def test_unique_violation_update_uses_coalesce(self) -> None:
-        """Fallback UPDATE uses COALESCE to preserve existing non-NULL fields."""
+    def test_unique_violation_supersede_uses_losing_document_id(self) -> None:
+        """The DELETE and UPDATE target the current (losing) document_id."""
         import psycopg.errors
 
         conn = _mock_conn()
@@ -1655,7 +1665,52 @@ class TestInsertRulingContentDedup:
 
         insert_ruling(
             conn,
-            document_id="new-doc-1",
+            document_id="losing-doc",
+            case_id="case-1",
+            court_id="court-1",
+            hearing_date=date(2026, 3, 5),
+            ruling_text="Motion GRANTED",
+            department="Dept. 1",
+        )
+
+        execute_calls = cur.execute.call_args_list
+        delete_calls = [c for c in execute_calls if "DELETE FROM rulings" in c[0][0]]
+        assert len(delete_calls) == 1
+        assert delete_calls[0][0][1] == ("losing-doc",), (
+            "DELETE must target the losing document_id, not the winner's."
+        )
+
+        doc_update_calls = [
+            c for c in execute_calls if "UPDATE documents SET status = 'superseded'" in c[0][0]
+        ]
+        assert len(doc_update_calls) == 1
+        assert doc_update_calls[0][0][1] == ("losing-doc",), (
+            "UPDATE documents must target the losing document_id."
+        )
+
+    def test_unique_violation_supersede_in_force_update_mode(self) -> None:
+        """``force_update=True`` (reingest path) still supersedes the loser.
+
+        Supersede semantics do not depend on ``force_update`` — if the
+        (case_id, ruling_text_hash) constraint fires, the incoming document's
+        text is by definition identical to the winner's, so the loser must
+        drop out regardless of whether we are in live-ingestion or reingest.
+        """
+        import psycopg.errors
+
+        conn = _mock_conn()
+        cur = conn.cursor.return_value.__enter__.return_value
+        exc = psycopg.errors.UniqueViolation("duplicate key value violates unique constraint")
+
+        def side_effect_execute(sql: str, params: tuple | None = None) -> None:
+            if "INSERT INTO rulings" in sql:
+                raise exc
+
+        cur.execute = MagicMock(side_effect=side_effect_execute)
+
+        insert_ruling(
+            conn,
+            document_id="losing-doc",
             case_id="case-1",
             court_id="court-1",
             hearing_date=date(2026, 3, 5),
@@ -1663,13 +1718,14 @@ class TestInsertRulingContentDedup:
             department="Dept. 1",
             judge_id="judge-1",
             outcome="granted",
+            force_update=True,
         )
 
-        # Find the UPDATE call and verify COALESCE is used
-        update_calls = [c for c in cur.execute.call_args_list if "UPDATE rulings SET" in c[0][0]]
-        assert len(update_calls) == 1
-        sql = update_calls[0][0][0]
-        assert "COALESCE" in sql
+        sql_stmts = [call[0][0] for call in cur.execute.call_args_list]
+        assert any("DELETE FROM rulings WHERE document_id" in s for s in sql_stmts)
+        assert any("UPDATE documents SET status = 'superseded'" in s for s in sql_stmts)
+        # Under no mode should the old fallback UPDATE run.
+        assert not any("UPDATE rulings SET" in s and "ruling_text_hash" in s for s in sql_stmts)
 
     def test_unknown_constraint_violation_is_reraised(self) -> None:
         """UniqueViolation from an unrelated constraint should be re-raised.
@@ -1706,34 +1762,6 @@ class TestInsertRulingContentDedup:
                 ruling_text="Motion GRANTED",
                 department="Dept. 1",
             )
-
-    def test_fallback_update_logs_warning_on_zero_rowcount(self) -> None:
-        """When fallback UPDATE matches 0 rows, a warning should be logged."""
-        import psycopg.errors
-
-        conn = _mock_conn()
-        cur = conn.cursor.return_value.__enter__.return_value
-        exc = psycopg.errors.UniqueViolation("duplicate key value violates unique constraint")
-
-        # Track which SQL statement we're on to set rowcount on UPDATE
-        def side_effect_execute(sql: str, params: tuple | None = None) -> None:
-            if "INSERT INTO rulings" in sql:
-                raise exc
-            if "UPDATE rulings SET" in sql:
-                cur.rowcount = 0
-
-        cur.execute = MagicMock(side_effect=side_effect_execute)
-
-        # Should not raise — just log a warning
-        insert_ruling(
-            conn,
-            document_id="new-doc-1",
-            case_id="case-1",
-            court_id="court-1",
-            hearing_date=date(2026, 3, 5),
-            ruling_text="Motion GRANTED",
-            department="Dept. 1",
-        )
 
     def test_on_conflict_document_id_preserves_ruling_text_hash(self) -> None:
         """ON CONFLICT (document_id) DO UPDATE should preserve ruling_text_hash via COALESCE."""
@@ -3050,18 +3078,27 @@ class TestInsertRulingForceUpdateIdentityAnchors:
         assert "COALESCE(rulings.judge_id" not in sql
 
 
-class TestInsertRulingContentHashFallbackPreservesJudgeId:
-    """Regression tests for #2475 — the content-hash fallback UPDATE path
-    must also preserve an established ``judge_id`` in default mode.
+class TestInsertRulingContentHashSupersede:
+    """Regression tests for #2458 — the content-hash fallback must supersede
+    the losing document rather than running a stale-UPDATE-by-hash.
 
-    ``case_id`` is fixed by the WHERE clause (``WHERE case_id = %s::uuid AND
-    ruling_text_hash = %s``) so it cannot be silently re-routed there.  But
-    ``judge_id`` is an assignment and was previously written as
-    ``judge_id = COALESCE(%s::uuid, judge_id)`` — incoming wins.  Flipped to
-    preserve-first: ``judge_id = COALESCE(judge_id, %s::uuid)``.
+    Before #2458, a ``uq_rulings_case_text_hash`` UniqueViolation triggered
+    ``UPDATE rulings SET ... WHERE case_id = %s AND ruling_text_hash = %s``.
+    That WHERE clause matched the *winner*'s row (already present under a
+    different document_id), so the winner's fields were silently overwritten
+    with the loser's fields and the loser's document was left with stale
+    ``ruling_text`` from before reingest — the exact bug reported in #2458.
+
+    The fix supersedes the losing document (marks ``status = 'superseded'``
+    and deletes any stale ruling keyed on its document_id).  The winner's
+    ruling row is untouched: its text is identical by definition (the hashes
+    matched), and its fields were populated by whichever document was
+    processed first.
     """
 
-    def test_fallback_update_default_preserves_judge_id(self) -> None:
+    def test_supersede_sequence_deletes_then_marks_status(self) -> None:
+        """DELETE FROM rulings runs before UPDATE documents so the losing
+        document leaves no orphan ruling row behind."""
         import psycopg.errors
 
         conn = _mock_conn()
@@ -3076,30 +3113,36 @@ class TestInsertRulingContentHashFallbackPreservesJudgeId:
 
         insert_ruling(
             conn,
-            document_id="new-doc-1",
+            document_id="losing-doc",
             case_id="case-1",
             court_id="court-1",
             hearing_date=date(2026, 3, 5),
             ruling_text="Motion GRANTED",
             department="Dept. 1",
-            judge_id="judge-different",
         )
 
-        update_calls = [c for c in cur.execute.call_args_list if "UPDATE rulings SET" in c[0][0]]
-        assert len(update_calls) == 1
-        sql = update_calls[0][0][0]
-        assert "judge_id = COALESCE(judge_id, %s::uuid)" in sql, (
-            f"Expected preserve-first COALESCE for judge_id in fallback UPDATE, got SQL:\n{sql}"
+        execute_calls = cur.execute.call_args_list
+        # Locate the DELETE and the UPDATE documents call indices.
+        delete_idx = next(
+            i
+            for i, c in enumerate(execute_calls)
+            if "DELETE FROM rulings WHERE document_id" in c[0][0]
         )
-        # The old buggy order (incoming wins) must not appear.
-        assert "judge_id = COALESCE(%s::uuid, judge_id)" not in sql, (
-            f"Legacy incoming-wins COALESCE order found for judge_id in the "
-            f"content-hash fallback UPDATE. SQL:\n{sql}"
+        update_idx = next(
+            i
+            for i, c in enumerate(execute_calls)
+            if "UPDATE documents SET status = 'superseded'" in c[0][0]
+        )
+        assert delete_idx < update_idx, (
+            "DELETE FROM rulings must run before UPDATE documents so the "
+            "superseded document leaves no orphaned ruling row."
         )
 
-    def test_fallback_update_force_update_overwrites_judge_id(self) -> None:
-        """``force_update=True`` in the fallback UPDATE path still overwrites
-        judge_id unconditionally — this is the reingest / correction path.
+    def test_supersede_targets_losing_not_winning_document_id(self) -> None:
+        """The supersede DELETE/UPDATE must target the losing document_id
+        (the one currently being inserted), NOT the winner's row.  This is
+        the core #2458 regression — the old fallback UPDATE used the
+        winner's WHERE clause and mutated the wrong row.
         """
         import psycopg.errors
 
@@ -3115,22 +3158,66 @@ class TestInsertRulingContentHashFallbackPreservesJudgeId:
 
         insert_ruling(
             conn,
-            document_id="new-doc-1",
+            document_id="losing-doc-id",
             case_id="case-1",
             court_id="court-1",
             hearing_date=date(2026, 3, 5),
             ruling_text="Motion GRANTED",
             department="Dept. 1",
-            judge_id="judge-corrected",
-            force_update=True,
         )
 
-        update_calls = [c for c in cur.execute.call_args_list if "UPDATE rulings SET" in c[0][0]]
-        assert len(update_calls) == 1
-        sql = update_calls[0][0][0]
-        assert "judge_id = %s::uuid" in sql
-        # In force_update mode the default preserve-first clause must not appear.
-        assert "judge_id = COALESCE(judge_id, %s::uuid)" not in sql
+        execute_calls = cur.execute.call_args_list
+        delete_calls = [c for c in execute_calls if "DELETE FROM rulings" in c[0][0]]
+        assert delete_calls
+        assert delete_calls[0][0][1] == ("losing-doc-id",)
+
+        doc_update_calls = [
+            c for c in execute_calls if "UPDATE documents SET status = 'superseded'" in c[0][0]
+        ]
+        assert doc_update_calls
+        assert doc_update_calls[0][0][1] == ("losing-doc-id",)
+
+    def test_supersede_does_not_run_legacy_fallback_update(self) -> None:
+        """The legacy ``UPDATE rulings SET ... WHERE case_id = ? AND
+        ruling_text_hash = ?`` fallback must not run — that path was the
+        #2458 bug."""
+        import psycopg.errors
+
+        conn = _mock_conn()
+        cur = conn.cursor.return_value.__enter__.return_value
+        exc = psycopg.errors.UniqueViolation("duplicate key value violates unique constraint")
+
+        def side_effect_execute(sql: str, params: tuple | None = None) -> None:
+            if "INSERT INTO rulings" in sql:
+                raise exc
+
+        cur.execute = MagicMock(side_effect=side_effect_execute)
+
+        insert_ruling(
+            conn,
+            document_id="losing-doc",
+            case_id="case-1",
+            court_id="court-1",
+            hearing_date=date(2026, 3, 5),
+            ruling_text="Motion GRANTED",
+            department="Dept. 1",
+            judge_id="judge-different",
+            outcome="denied",
+        )
+
+        sql_stmts = [call[0][0] for call in cur.execute.call_args_list]
+        assert not any("UPDATE rulings SET" in s and "ruling_text_hash" in s for s in sql_stmts), (
+            "Content-hash-based UPDATE rulings must not run on supersede — "
+            "it was the #2458 bug that mutated the winner's row with the "
+            "loser's fields."
+        )
+        # And the loser's (judge_id / outcome / department / etc.) fields
+        # must not appear in any UPDATE rulings statement, because the
+        # winner's row must not be touched.
+        update_rulings_calls = [
+            c for c in cur.execute.call_args_list if "UPDATE rulings SET" in c[0][0]
+        ]
+        assert update_rulings_calls == [], "No UPDATE rulings SET must run in the supersede path."
 
 
 class TestInsertRulingReRouteScenario:
