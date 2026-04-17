@@ -18,7 +18,10 @@
 #   --county NAME     Only process documents from this county (e.g. Ventura)
 #   --state CODE      State code for --county filtering (default: ca)
 #   --concurrency N   Number of parallel processes (default: 64)
-#   --reset           Truncate derived tables before rebuilding
+#   --reset           Truncate derived tables before rebuilding.  When combined
+#                     with --county, the reset is scoped to just that county's
+#                     rows (per-county reset); otherwise it truncates the
+#                     derived schema globally.
 """
 
 from __future__ import annotations
@@ -375,6 +378,197 @@ def reset_derived_tables(conn: psycopg.Connection) -> None:
     logger.info("Truncated derived tables", tables=tables)
 
 
+# Derived tables keyed directly by ``court_id`` (UUID → derived.courts.id).
+# These are deleted scope-down via ``WHERE court_id IN (...)``.
+#
+# ``derived.courts`` itself is intentionally absent — we leave the court rows
+# intact so the rebuild's ``ON CONFLICT (court_code)`` upsert re-uses the same
+# UUIDs.  Dropping them would re-issue UUIDs and orphan rows in
+# ``telemetry.scraper_runs`` which FKs to ``derived.courts(id)``.  See #2465.
+_PER_COUNTY_COURT_ID_TABLES: tuple[str, ...] = (
+    "documents",
+    "rulings",
+    "cases",
+    "judges",
+)
+
+# Join tables that have no ``court_id`` column — scoped via ``case_id``.
+# Deleting the cases themselves cascades into these via ON DELETE CASCADE,
+# but we delete them first so the ``cases`` DELETE can report its own count
+# without surprising cascades.  (Explicit > implicit in a one-shot tool.)
+_PER_COUNTY_CASE_JOIN_TABLES: tuple[str, ...] = (
+    "case_judges",
+    "case_parties",
+    "case_attorneys",
+)
+
+
+def _resolve_county_court_ids(
+    conn: psycopg.Connection,
+    state: str,
+    county: str,
+) -> list[str]:
+    """Look up ``derived.courts.id`` values for a given state + county.
+
+    A single county may have more than one court row (e.g. a superior court
+    plus an appellate court) and the per-county reset must delete rows for
+    all of them.  Match is case-insensitive on the stored ``state`` / ``county``
+    columns so "Santa Clara" and "santa clara" both resolve.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT id
+              FROM derived.courts
+             WHERE LOWER(state) = LOWER(%s)
+               AND LOWER(county) = LOWER(%s)
+            """,
+            (state, county),
+        )
+        return [str(row[0]) for row in cur.fetchall()]
+
+
+def reset_derived_tables_for_county(
+    conn: psycopg.Connection,
+    state: str,
+    county: str,
+) -> dict[str, int]:
+    """Delete per-county rows from derived tables without touching other counties.
+
+    Scoped reset used when ``--reset`` is combined with ``--county <name>``.
+    See #2465.
+
+    Behaviour:
+    * Resolves all ``derived.courts.id`` values for ``(state, county)``.
+    * Logs a pre-delete row count for every affected table so operators can
+      eyeball the scope before DELETEs fire.
+    * Deletes in one transaction.  Join tables (``case_judges``,
+      ``case_parties``, ``case_attorneys``) are deleted first via
+      ``case_id IN (SELECT id FROM cases WHERE court_id IN (...))`` so their
+      parent ``cases`` rows can be removed without relying on cascade.
+    * Then deletes rows keyed directly by ``court_id`` from ``documents``,
+      ``rulings``, ``cases``, and ``judges``.
+    * Does **not** touch ``derived.courts`` — the rebuild reseeds on
+      ``ON CONFLICT (court_code)`` and preserving these rows keeps UUIDs
+      stable for cross-schema references like ``telemetry.scraper_runs``.
+    * Does **not** touch county-agnostic entity tables (``attorneys``,
+      ``parties``, ``judge_aliases``, ``attorney_aliases``, ``party_aliases``).
+      These are reseeded by the ingestion pipeline during rebuild.
+    * Does **not** touch OpenSearch — the global index self-heals as new
+      rulings are indexed.
+
+    Raises:
+        ValueError: if no courts match ``(state, county)``.  Silently
+            matching zero rows would let a typo nuke nothing and rebuild
+            nothing, which is worse than a hard error.
+
+    Returns:
+        ``{table_name: rows_deleted}`` for logging / test assertions.
+    """
+    court_ids = _resolve_county_court_ids(conn, state, county)
+    if not court_ids:
+        raise ValueError(
+            f"No courts found in derived.courts for state={state!r}, county={county!r}. "
+            "Refusing to reset to avoid silently deleting nothing."
+        )
+
+    logger.info(
+        "Per-county reset — resolved courts",
+        state=state,
+        county=county,
+        court_ids=court_ids,
+    )
+
+    deleted: dict[str, int] = {}
+    # Wrap the reset in a single transaction: psycopg with ``autocommit=False``
+    # treats the whole block as one transaction and commits at the end.  A
+    # mid-DELETE failure rolls everything back so we can't land in a
+    # half-reset state.
+    with conn.cursor() as cur:
+        # Pre-delete row counts (what we're about to remove).
+        for table in _PER_COUNTY_CASE_JOIN_TABLES:
+            cur.execute(
+                f"""
+                SELECT COUNT(*)
+                  FROM derived.{table} jt
+                  JOIN derived.cases c ON jt.case_id = c.id
+                 WHERE c.court_id = ANY(%s::uuid[])
+                """,
+                (court_ids,),
+            )
+            count = cur.fetchone()[0]
+            deleted[table] = count
+            logger.info(
+                "Pre-delete row count",
+                table=f"derived.{table}",
+                rows=count,
+                court_ids=court_ids,
+            )
+
+        for table in _PER_COUNTY_COURT_ID_TABLES:
+            cur.execute(
+                f"SELECT COUNT(*) FROM derived.{table} WHERE court_id = ANY(%s::uuid[])",
+                (court_ids,),
+            )
+            count = cur.fetchone()[0]
+            deleted[table] = count
+            logger.info(
+                "Pre-delete row count",
+                table=f"derived.{table}",
+                rows=count,
+                court_ids=court_ids,
+            )
+
+        # Actual deletes.  Order: join tables first (case-scoped), then
+        # court-scoped tables from most dependent to least dependent.
+        # ``rulings`` references ``documents`` AND ``cases`` AND ``judges``,
+        # so it must be deleted before any of those.
+        for table in _PER_COUNTY_CASE_JOIN_TABLES:
+            logger.info(
+                "Deleting rows",
+                table=f"derived.{table}",
+                rows=deleted[table],
+                court_ids=court_ids,
+            )
+            cur.execute(
+                f"""
+                DELETE FROM derived.{table}
+                 WHERE case_id IN (
+                    SELECT id FROM derived.cases WHERE court_id = ANY(%s::uuid[])
+                 )
+                """,
+                (court_ids,),
+            )
+
+        # Order among the court-id-keyed tables:
+        #   rulings  → references documents, cases, judges
+        #   documents → references cases
+        #   cases    → referenced by rulings, documents, join tables
+        #   judges   → referenced by rulings (nullable FK) and case_judges
+        # We delete rulings first, then documents, then cases, then judges.
+        for table in ("rulings", "documents", "cases", "judges"):
+            logger.info(
+                "Deleting rows",
+                table=f"derived.{table}",
+                rows=deleted[table],
+                court_ids=court_ids,
+            )
+            cur.execute(
+                f"DELETE FROM derived.{table} WHERE court_id = ANY(%s::uuid[])",
+                (court_ids,),
+            )
+
+    conn.commit()
+    logger.info(
+        "Per-county reset complete",
+        state=state,
+        county=county,
+        court_ids=court_ids,
+        deleted=deleted,
+    )
+    return deleted
+
+
 def reset_opensearch_index(os_url: str) -> None:
     """Delete the OpenSearch tentative_rulings index so it's rebuilt from scratch."""
     from opensearchpy import OpenSearch
@@ -529,11 +723,21 @@ def main() -> None:
 
     # Step 0 (optional): Reset derived data for a clean rebuild
     if args.reset:
-        reset_derived_tables(conn)
-        if os_url:
-            reset_opensearch_index(os_url)
+        if args.county:
+            # Per-county reset: only delete rows belonging to this county.
+            # Skip the OpenSearch index reset — the global index self-heals
+            # as new rulings are indexed during the rebuild.  See #2465.
+            reset_derived_tables_for_county(conn, args.state, args.county)
+            logger.info(
+                "Per-county reset — skipping OpenSearch index reset "
+                "(global index self-heals on re-index)"
+            )
         else:
-            logger.info("OPENSEARCH_URL not set — skipping OpenSearch index reset")
+            reset_derived_tables(conn)
+            if os_url:
+                reset_opensearch_index(os_url)
+            else:
+                logger.info("OPENSEARCH_URL not set — skipping OpenSearch index reset")
 
         # Write rebuild-in-progress marker so the data quality check
         # downgrades P1 alerts during the rebuild window (#2222).
