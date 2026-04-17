@@ -7,6 +7,7 @@ error handling, and CLI flag behavior. All database and S3 access is mocked.
 
 from __future__ import annotations
 
+import hashlib
 import importlib
 import json
 import os
@@ -9609,6 +9610,170 @@ class TestRunReingestFromPrefix:
         # Limit should have capped to 2 keys
         assert stats["total_keys"] == 2
 
+    @patch.dict(
+        os.environ,
+        {
+            "JUDGEMIND_ARCHIVE_BUCKET": "test-bucket",
+            "REDIS_URL": "redis://localhost:6379",
+            "OPENSEARCH_URL": "",
+        },
+    )
+    @patch("reingest_from_s3.boto3")
+    @patch("reingest_from_s3._list_s3_keys")
+    @patch("reingest_from_s3._seed_courts")
+    @patch("reingest_from_s3._discover_courts")
+    @patch("reingest_from_s3.psycopg")
+    @patch("reingest_from_s3.ProcessPoolExecutor")
+    def test_summary_reports_hash_mismatch_warnings(
+        self,
+        mock_pool_cls: MagicMock,
+        mock_psycopg: MagicMock,
+        mock_discover: MagicMock,
+        mock_seed: MagicMock,
+        mock_list: MagicMock,
+        mock_boto3: MagicMock,
+    ) -> None:
+        """The prefix-reingest summary must aggregate ``hash_mismatch`` flags
+        from ``_process_prefix_document`` dict results and surface the count
+        as ``hash_mismatch_warnings`` in the stats.  See #2628."""
+        keys = [
+            "federal/federal/courtlistener/raw/aaa111.html",
+            "federal/federal/courtlistener/raw/bbb222.html",
+            "federal/federal/courtlistener/raw/ccc333.html",
+        ]
+        mock_list.return_value = keys
+        mock_discover.return_value = [
+            {
+                "state": "Federal",
+                "county": "Federal",
+                "court_name": "Courtlistener, County of Federal",
+                "court_code": "federal-federal",
+                "timezone": "America/Los_Angeles",
+            }
+        ]
+        conn_mock = MagicMock()
+        mock_psycopg.connect.return_value.__enter__ = MagicMock(return_value=conn_mock)
+        mock_psycopg.connect.return_value.__exit__ = MagicMock(return_value=False)
+        mock_seed.return_value = {"federal-federal": "court-id-1"}
+
+        pool = MagicMock()
+        mock_pool_cls.return_value.__enter__ = MagicMock(return_value=pool)
+        mock_pool_cls.return_value.__exit__ = MagicMock(return_value=False)
+
+        # Two successful docs flag hash_mismatch, one is clean.
+        future1 = MagicMock()
+        future1.result.return_value = {"status": "ok", "hash_mismatch": True}
+        future2 = MagicMock()
+        future2.result.return_value = {"status": "ok", "hash_mismatch": True}
+        future3 = MagicMock()
+        future3.result.return_value = {"status": "ok", "hash_mismatch": False}
+        pool.submit.side_effect = [future1, future2, future3]
+
+        mock_logger = MagicMock()
+        with (
+            patch(
+                "reingest_from_s3.as_completed",
+                return_value=[future1, future2, future3],
+            ),
+            patch.object(reingest, "logger", mock_logger),
+        ):
+            stats = reingest.run_reingest_from_prefix(
+                "postgresql://test",
+                prefix="federal/",
+                concurrency=4,
+            )
+
+        assert stats["total_keys"] == 3
+        assert stats["processed"] == 3
+        assert stats["errors"] == 0
+        assert stats["hash_mismatch_warnings"] == 2
+
+        # Aggregate summary warning is emitted at the end of the run.
+        warn_calls = mock_logger.warning.call_args_list
+        aggregate_warnings = [
+            call for call in warn_calls if call.kwargs.get("hash_mismatch_warnings") is not None
+        ]
+        assert aggregate_warnings, (
+            f"Expected aggregate hash_mismatch_warnings warning. Got warning calls: {warn_calls!r}"
+        )
+        assert aggregate_warnings[0].kwargs["hash_mismatch_warnings"] == 2
+
+    @patch.dict(
+        os.environ,
+        {
+            "JUDGEMIND_ARCHIVE_BUCKET": "test-bucket",
+            "REDIS_URL": "redis://localhost:6379",
+            "OPENSEARCH_URL": "",
+        },
+    )
+    @patch("reingest_from_s3.boto3")
+    @patch("reingest_from_s3._list_s3_keys")
+    @patch("reingest_from_s3._seed_courts")
+    @patch("reingest_from_s3._discover_courts")
+    @patch("reingest_from_s3.psycopg")
+    @patch("reingest_from_s3.ProcessPoolExecutor")
+    def test_summary_no_warning_when_all_hashes_match(
+        self,
+        mock_pool_cls: MagicMock,
+        mock_psycopg: MagicMock,
+        mock_discover: MagicMock,
+        mock_seed: MagicMock,
+        mock_list: MagicMock,
+        mock_boto3: MagicMock,
+    ) -> None:
+        """When no documents have hash mismatches, ``hash_mismatch_warnings``
+        is zero and no aggregate warning is emitted.  See #2628."""
+        keys = [
+            "federal/federal/courtlistener/raw/aaa111.html",
+            "federal/federal/courtlistener/raw/bbb222.html",
+        ]
+        mock_list.return_value = keys
+        mock_discover.return_value = [
+            {
+                "state": "Federal",
+                "county": "Federal",
+                "court_name": "Courtlistener, County of Federal",
+                "court_code": "federal-federal",
+                "timezone": "America/Los_Angeles",
+            }
+        ]
+        conn_mock = MagicMock()
+        mock_psycopg.connect.return_value.__enter__ = MagicMock(return_value=conn_mock)
+        mock_psycopg.connect.return_value.__exit__ = MagicMock(return_value=False)
+        mock_seed.return_value = {"federal-federal": "court-id-1"}
+
+        pool = MagicMock()
+        mock_pool_cls.return_value.__enter__ = MagicMock(return_value=pool)
+        mock_pool_cls.return_value.__exit__ = MagicMock(return_value=False)
+
+        future1 = MagicMock()
+        future1.result.return_value = {"status": "ok", "hash_mismatch": False}
+        future2 = MagicMock()
+        future2.result.return_value = {"status": "ok", "hash_mismatch": False}
+        pool.submit.side_effect = [future1, future2]
+
+        mock_logger = MagicMock()
+        with (
+            patch(
+                "reingest_from_s3.as_completed",
+                return_value=[future1, future2],
+            ),
+            patch.object(reingest, "logger", mock_logger),
+        ):
+            stats = reingest.run_reingest_from_prefix(
+                "postgresql://test",
+                prefix="federal/",
+                concurrency=4,
+            )
+
+        assert stats["hash_mismatch_warnings"] == 0
+        # No aggregate warning emitted when count is zero.
+        warn_calls = mock_logger.warning.call_args_list
+        for call in warn_calls:
+            assert call.kwargs.get("hash_mismatch_warnings") is None, (
+                f"unexpected hash_mismatch_warnings warning: {call!r}"
+            )
+
 
 class TestProcessPrefixDocument:
     """Tests for _process_prefix_document."""
@@ -9622,25 +9787,117 @@ class TestProcessPrefixDocument:
             "redis://localhost:6379",
             "",
         )
-        assert result == "skip"
+        assert isinstance(result, dict)
+        assert result["status"] == "skip"
+        assert result["hash_mismatch"] is False
 
-    def test_hash_mismatch_returns_error(self) -> None:
-        """When the S3 content hash doesn't match the key hash, return error."""
+    def test_hash_mismatch_logs_warning_and_continues(self) -> None:
+        """Hash mismatch must be non-fatal — reingest proceeds and the
+        result flags ``hash_mismatch=True`` (see #2494, #2628).
+
+        Previously a mismatch short-circuited with ``status="error"``, which
+        is the mechanism producing the ~4% flat-hash orphan rate on Santa
+        Clara: raws captured under a wrong content-hash filename were
+        permanently unreingestable.  Now we log a warning, let the worker
+        process the raw, and the LLM split path re-derives split-children
+        from the raw content.  Mirrors the behavior already in
+        ``rebuild_db._process_one_document`` (see #2494).
+        """
+        # The key claims hash "abc123" but the actual content hashes
+        # elsewhere — _build_prefix_event will still use "abc123" as the
+        # canonical content_hash.
+        key = "federal/federal/courtlistener/raw/abc123.html"
+
         mock_s3 = MagicMock()
         body = MagicMock()
-        body.read.return_value = b"<html>content</html>"
+        body.read.return_value = b"<html>content with wrong hash</html>"
         mock_s3.get_object.return_value = {"Body": body}
 
-        with patch("framework.s3_cache.make_s3_client", return_value=mock_s3):
+        mock_worker = MagicMock()
+        mock_worker.process_event = MagicMock()
+
+        # Clear cached worker to force re-creation.
+        if hasattr(reingest._process_prefix_document, "_worker"):
+            delattr(reingest._process_prefix_document, "_worker")
+
+        mock_logger = MagicMock()
+        with (
+            patch("framework.s3_cache.make_s3_client", return_value=mock_s3),
+            patch("ingestion.worker.IngestionWorker", return_value=mock_worker),
+            patch("redis.Redis.from_url", return_value=MagicMock()),
+            patch.object(reingest, "logger", mock_logger),
+        ):
             result = reingest._process_prefix_document(
-                "federal/federal/courtlistener/raw/abc123.html",
+                key,
                 "test-bucket",
                 "postgresql://test",
                 "redis://localhost:6379",
                 "",
             )
-        # abc123 doesn't match the SHA256 of b"<html>content</html>"
-        assert result == "error"
+
+        # Proceeds to the worker — does NOT return early with status="error".
+        assert isinstance(result, dict)
+        assert result["status"] == "ok"
+        assert result["hash_mismatch"] is True
+        mock_worker.process_event.assert_called_once()
+        # Event passed to the worker must carry the key-hash as canonical
+        # content_hash — the worker's LLM split path derives split-child
+        # hashes from that value.
+        event = mock_worker.process_event.call_args[0][0]
+        assert event["content_hash"] == "abc123"
+        # Warning logged (not error) so ops see the integrity signal but the
+        # reingest proceeds.
+        warn_calls = mock_logger.warning.call_args_list
+        assert any("S3 content hash mismatch" in str(call) for call in warn_calls), (
+            f"expected hash mismatch warning in {warn_calls!r}"
+        )
+        # No logger.error call for the mismatch itself.
+        for call in mock_logger.error.call_args_list:
+            assert "hash mismatch" not in str(call).lower(), (
+                f"hash mismatch must not produce logger.error: {call!r}"
+            )
+
+    def test_matching_hash_returns_ok_without_mismatch_flag(self) -> None:
+        """When the S3 content hash matches the key hash, the result flags
+        ``hash_mismatch=False`` and no mismatch warning is emitted."""
+        content = b"<html>ok</html>"
+        key_hash = hashlib.sha256(content).hexdigest()
+        key = f"federal/federal/courtlistener/raw/{key_hash}.html"
+
+        mock_s3 = MagicMock()
+        body = MagicMock()
+        body.read.return_value = content
+        mock_s3.get_object.return_value = {"Body": body}
+
+        mock_worker = MagicMock()
+        mock_worker.process_event = MagicMock()
+
+        if hasattr(reingest._process_prefix_document, "_worker"):
+            delattr(reingest._process_prefix_document, "_worker")
+
+        mock_logger = MagicMock()
+        with (
+            patch("framework.s3_cache.make_s3_client", return_value=mock_s3),
+            patch("ingestion.worker.IngestionWorker", return_value=mock_worker),
+            patch("redis.Redis.from_url", return_value=MagicMock()),
+            patch.object(reingest, "logger", mock_logger),
+        ):
+            result = reingest._process_prefix_document(
+                key,
+                "test-bucket",
+                "postgresql://test",
+                "redis://localhost:6379",
+                "",
+            )
+
+        assert isinstance(result, dict)
+        assert result["status"] == "ok"
+        assert result["hash_mismatch"] is False
+        # No mismatch warning on a matching hash.
+        for call in mock_logger.warning.call_args_list:
+            assert "S3 content hash mismatch" not in str(call), (
+                f"unexpected hash mismatch warning on matching hash: {call!r}"
+            )
 
 
 # ---------------------------------------------------------------------------
