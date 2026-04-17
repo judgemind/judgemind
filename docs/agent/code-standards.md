@@ -131,9 +131,15 @@ For `packages/web/`, also run `npm run build`. The same diff coverage and floor 
 
 ```
 terraform fmt -check -recursive
-terraform init -backend=false
+terraform init -backend=false -lockfile=readonly
 terraform validate
 ```
+
+**`.terraform.lock.hcl` churn hazard — always use `-lockfile=readonly` for agent-side validation.** `terraform init` (with or without `-backend=false`) will silently rewrite the environment's `.terraform.lock.hcl` to match the providers the current module set references. If the lock file contains providers that the environment does not currently reference (for example `hashicorp/archive` in `environments/dev/` when no `.tf` in that environment uses the `archive` provider), `init` "helpfully" **prunes** those provider hash blocks from the lock file. The pruned lock file then appears as an unrelated modification in `git status`, and if committed can either (a) pollute the PR with unrelated diff noise or (b) cause a hash mismatch when a different environment that does reference the provider runs `init`. See #2582.
+
+The `-lockfile=readonly` flag tells `terraform init` to fail fast if it would modify the lock file, rather than silently rewriting it. Use it for every pre-PR validation. Only omit the flag when you are intentionally adding or upgrading a provider in the current environment — in that case the lock-file change is the point, and it should be staged and committed together with the corresponding `main.tf` / `terraform.tf` change.
+
+If you run `terraform init` without the flag by mistake and see `.terraform.lock.hcl` in `git status`, revert it with `git checkout -- infra/terraform/environments/<env>/.terraform.lock.hcl` before committing anything else.
 
 ### Docs / Markdown
 

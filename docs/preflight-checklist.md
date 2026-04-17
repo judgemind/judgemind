@@ -59,7 +59,7 @@ Machine-readable checklist of rules extracted from CLAUDE.md. Agents should vali
 | PR-06b | TypeScript diff coverage | `scripts/check-diff-coverage.sh <package> --skip-tests` (after PR-06) |
 | PR-07 | TypeScript build (web) | `npm run build` (for `packages/web/` only) |
 | PR-08 | Terraform format | `terraform fmt -check -recursive` |
-| PR-09 | Terraform validate | `terraform init -backend=false && terraform validate` |
+| PR-09 | Terraform validate | `terraform init -backend=false -lockfile=readonly && terraform validate` (readonly flag prevents `.terraform.lock.hcl` churn, see #2582) |
 | PR-10 | Check import sites when removing/renaming exports | Grep for removed/renamed symbol names across `src/` and `tests/`; update or remove every import site |
 
 ## Task Workflow Rules
