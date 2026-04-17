@@ -310,6 +310,52 @@ def parse_calendar_page(html: str) -> list[CalendarHearing]:
     return hearings
 
 
+def _case_numbers_match(stored: str, row: str) -> bool:
+    """Return True if the stored case number matches the calendar row's case number.
+
+    San Diego has two case-number formats in circulation:
+
+    - **Calendar (short) form**: ``24CU016153C``, ``25CU003887C`` — used by
+      the civil calendar HTML tables in the current scraper.
+    - **Odyssey (long) form**: ``37-2024-00021082-CL-CL-CTL`` — used by
+      the Odyssey ROA portal. Some ``rebuild-ca-san_diego`` documents were
+      created with the short Odyssey fragment (``2024-00021082``) as the
+      stored ``case_number`` while the calendar HTML for the same hearing
+      uses the long form.
+
+    Matching strategy:
+
+    1. Exact string match (both trimmed).
+    2. Stored is a substring of the row, anchored by non-alphanumeric
+       boundaries (start/end of string or a ``-`` delimiter). This
+       matches e.g. ``2024-00021082`` within ``37-2024-00021082-CL-CL-CTL``
+       but refuses naive overlaps like ``24-00021082`` inside
+       ``37-2024-00021082-CL-CL-CTL``.
+
+    The substring check is boundary-anchored to avoid false positives where
+    a shorter numeric fragment happens to appear inside a longer row value.
+    """
+    stored = (stored or "").strip()
+    row = (row or "").strip()
+    if not stored or not row:
+        return False
+    if stored == row:
+        return True
+    if stored not in row:
+        return False
+    # Require boundary anchors (start/end of string or `-` delimiter) on
+    # both sides of the substring match.
+    idx = row.find(stored)
+    while idx != -1:
+        before_ok = idx == 0 or not row[idx - 1].isalnum()
+        end = idx + len(stored)
+        after_ok = end == len(row) or not row[end].isalnum()
+        if before_ok and after_ok:
+            return True
+        idx = row.find(stored, idx + 1)
+    return False
+
+
 def extract_case_section(html: str, case_number: str) -> str | None:
     """Extract a focused text section for a specific case from calendar HTML.
 
@@ -323,9 +369,18 @@ def extract_case_section(html: str, case_number: str) -> str | None:
     to ~1KB.  The focused text lets the LLM produce a single-ruling JSON
     response that fits within output limits.
 
+    Case-number matching uses a two-tier strategy (see
+    :func:`_case_numbers_match`): an exact match is preferred, with a
+    boundary-anchored substring match as a fallback. The substring
+    fallback handles documents where the stored ``case_number`` is an
+    Odyssey-format fragment (e.g. ``"2024-00021082"``) while the calendar
+    HTML uses the full Odyssey form (``"37-2024-00021082-CL-CL-CTL"``)
+    — see #2381.
+
     Args:
         html: Full calendar page HTML.
-        case_number: Case number to extract (e.g. ``"24CU016153C"``).
+        case_number: Case number to extract (e.g. ``"24CU016153C"`` or
+            the Odyssey short form ``"2024-00021082"``).
 
     Returns:
         A plain-text excerpt containing the department header and the
@@ -336,6 +391,12 @@ def extract_case_section(html: str, case_number: str) -> str | None:
     # Extract the date from the page header for context.
     hearing_date = _parse_calendar_date(html)
     date_str = hearing_date.strftime("%m/%d/%Y") if hearing_date else "unknown"
+
+    # Collect candidate matches in two tiers: exact first, then boundary-
+    # anchored substring matches.  We pick exact if any exists; otherwise
+    # fall back to the first substring match.
+    exact_match: tuple[str, str, list[Tag]] | None = None
+    substring_match: tuple[str, str, list[Tag]] | None = None
 
     for dept_div in soup.find_all("div", class_="department"):
         h2 = dept_div.find("h2")
@@ -359,47 +420,60 @@ def extract_case_section(html: str, case_number: str) -> str | None:
                 continue
 
             row_case_number = tds[1].get_text(strip=True)
-            if row_case_number != case_number:
-                continue
+            if row_case_number == case_number:
+                exact_match = (department, row_case_number, tds)
+                break
+            if substring_match is None and _case_numbers_match(case_number, row_case_number):
+                substring_match = (department, row_case_number, tds)
 
-            # Found the matching row.  Build a focused text excerpt
-            # with department context and all fields from this row.
-            hearing_time = tds[0].get_text(strip=True)
-            case_title = _clean_case_title(tds[2].get_text(strip=True))
-            event_type = tds[3].get_text(strip=True)
-            judge_raw = tds[4].get_text(strip=True)
+        if exact_match is not None:
+            break
 
-            # Parties
-            party_lines: list[str] = []
-            for p_tag in tds[5].find_all("p"):
-                text = p_tag.get_text(strip=True)
-                if text:
-                    party_lines.append(text)
+    chosen = exact_match or substring_match
+    if chosen is None:
+        return None
 
-            # Attorneys
-            attorney_lines: list[str] = []
-            for p_tag in tds[6].find_all("p"):
-                text = p_tag.get_text(strip=True)
-                if text:
-                    attorney_lines.append(text)
+    department, row_case_number, tds = chosen
 
-            parts: list[str] = [
-                f"San Diego Superior Court Civil Calendar - {date_str}",
-                f"Department: {department}",
-                f"Hearing Time: {hearing_time}",
-                f"Case Number: {case_number}",
-                f"Case Title: {case_title}",
-                f"Event Type: {event_type}",
-                f"Hearing Officer: {judge_raw}",
-            ]
-            if party_lines:
-                parts.append("Parties: " + "; ".join(party_lines))
-            if attorney_lines:
-                parts.append("Attorneys: " + "; ".join(attorney_lines))
+    # Build a focused text excerpt with department context and all fields
+    # from this row.  Prefer the row's own case-number string when it's
+    # the more informative long form (i.e. when it differs from the
+    # caller-supplied short form).
+    display_case_number = row_case_number if row_case_number != case_number else case_number
+    hearing_time = tds[0].get_text(strip=True)
+    case_title = _clean_case_title(tds[2].get_text(strip=True))
+    event_type = tds[3].get_text(strip=True)
+    judge_raw = tds[4].get_text(strip=True)
 
-            return "\n".join(parts)
+    # Parties
+    party_lines: list[str] = []
+    for p_tag in tds[5].find_all("p"):
+        text = p_tag.get_text(strip=True)
+        if text:
+            party_lines.append(text)
 
-    return None
+    # Attorneys
+    attorney_lines: list[str] = []
+    for p_tag in tds[6].find_all("p"):
+        text = p_tag.get_text(strip=True)
+        if text:
+            attorney_lines.append(text)
+
+    parts: list[str] = [
+        f"San Diego Superior Court Civil Calendar - {date_str}",
+        f"Department: {department}",
+        f"Hearing Time: {hearing_time}",
+        f"Case Number: {display_case_number}",
+        f"Case Title: {case_title}",
+        f"Event Type: {event_type}",
+        f"Hearing Officer: {judge_raw}",
+    ]
+    if party_lines:
+        parts.append("Parties: " + "; ".join(party_lines))
+    if attorney_lines:
+        parts.append("Attorneys: " + "; ".join(attorney_lines))
+
+    return "\n".join(parts)
 
 
 class SDCalendarScraper(BaseScraper):
@@ -522,9 +596,14 @@ class SDCalendarScraper(BaseScraper):
             )
             return doc
 
-        # Parse the full page and find the matching hearing.
+        # Parse the full page and find the matching hearing.  Use the
+        # same two-tier match strategy as ``extract_case_section`` so
+        # Odyssey-format short-form case numbers match their long-form
+        # calendar rows (#2381).
         hearings = parse_calendar_page(html)
         matching = [h for h in hearings if h.case_number == doc.case_number]
+        if not matching:
+            matching = [h for h in hearings if _case_numbers_match(doc.case_number, h.case_number)]
 
         if matching:
             hearing = matching[0]

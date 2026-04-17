@@ -2960,6 +2960,128 @@ class TestReparseDocumentLLM:
 
 
 # ---------------------------------------------------------------------------
+class TestReparseDocumentSanDiegoCalendarNarrowing:
+    """San Diego calendar HTML narrowing path for unregistered scraper IDs (#2381).
+
+    When a ``rebuild-ca-san_diego`` (or any other unregistered) scraper_id
+    reingests a San Diego calendar HTML document, ``parse_document`` cannot
+    be called — the scraper class is not in ``_SCRAPER_REGISTRY``.  The
+    reingest fallback at :func:`reingest_from_s3._reparse_document` calls
+    :func:`courts.ca.sd_calendar.extract_case_section` directly to narrow
+    the full HTML page to a single-case plain-text excerpt.  Previously
+    the narrowed section was only used for the LLM call — the stored
+    ``ruling_text`` remained the full raw HTML (50KB+).  This test class
+    verifies that the narrowed excerpt also replaces ``ruling_text``.
+    """
+
+    _SD_CALENDAR_HTML = """<html><head></head><body>
+<h1>CIVIL CALENDAR For Monday, 03/23/2026</h1>
+<h3>CENTRAL DIVISION, CENTRAL COURTHOUSE</h3>
+<div class="department">
+<h2><a name='C-60'></a>Department: C-60</h2>
+<table class="tables">
+<thead><tr><th>Time</th><th>Case#</th><th>Title</th><th>Event</th><th>Officer</th><th>Party</th><th>Attorney</th></tr></thead>
+<tbody>
+<tr>
+<td>9:00 AM</td>
+<td>37-2024-00021082-CL-CL-CTL</td>
+<td>Doe v Smith</td>
+<td>Motion Hearing</td>
+<td>Judge MATTHEW C. BRANER</td>
+<td><p>(PL) Jane Doe</p><p>(DF) John Smith</p></td>
+<td><p>Alice Attorney</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+</body></html>
+"""
+
+    def _sd_doc_meta(self, case_number: str) -> dict:
+        return {
+            "document_id": str(_DOC_ID_1),
+            "state": "CA",
+            "county": "San Diego",
+            "court_name": "Superior Court",
+            "source_url": "",
+            "captured_at": _CAPTURED_AT_1,
+            "content_hash": "sd123",
+            "format": "html",
+            "case_number": case_number,
+            "case_title": None,
+            "hearing_date": None,
+            "court_id": str(_COURT_ID),
+            "scraper_id": "rebuild-ca-san_diego",
+            "s3_key": "ca/san_diego/superior_court/raw/abc.html",
+            "s3_bucket": "test-bucket",
+        }
+
+    @patch.object(reingest, "_load_scraper_registry")
+    @patch("reingest_from_s3.extract_fields_llm")
+    def test_odyssey_short_form_narrowing_updates_ruling_text(
+        self,
+        mock_llm: MagicMock,
+        mock_registry: MagicMock,
+    ) -> None:
+        """rebuild-ca-san_diego with Odyssey short-form case_number gets
+        ruling_text set to the narrowed plain-text excerpt, not raw HTML."""
+        mock_llm.return_value = None  # Force regex fallback path.
+        # Ensure the rebuild scraper_id is NOT in the registry.
+        reingest._SCRAPER_REGISTRY.pop("rebuild-ca-san_diego", None)
+
+        raw = self._SD_CALENDAR_HTML.encode("utf-8")
+        client = MagicMock()
+        result = reingest._reparse_document(
+            raw,
+            "rebuild-ca-san_diego",
+            self._sd_doc_meta(case_number="2024-00021082"),
+            llm_client=client,
+        )
+
+        ruling_text = result["ruling_text"]
+        assert ruling_text is not None
+        # Must NOT be raw HTML.
+        assert not ruling_text.lstrip().startswith("<")
+        assert "<!DOCTYPE" not in ruling_text
+        assert "<html" not in ruling_text.lower()
+        # Must contain the narrowed case details.
+        assert "Department: C-60" in ruling_text
+        assert "37-2024-00021082-CL-CL-CTL" in ruling_text
+        assert "Motion Hearing" in ruling_text
+        # Narrowed text should be much shorter than the full page.
+        assert len(ruling_text) < 1000
+
+    @patch.object(reingest, "_load_scraper_registry")
+    @patch("reingest_from_s3.extract_fields_llm")
+    def test_ruling_text_is_raw_html_when_case_not_in_calendar(
+        self,
+        mock_llm: MagicMock,
+        mock_registry: MagicMock,
+    ) -> None:
+        """If the case isn't in the calendar HTML at all, narrowing is a no-op.
+
+        This establishes that the narrowing is what caused ruling_text to be
+        updated — when it fails, the fallback behavior (raw HTML) still
+        applies.  It is retained here as a regression guard so a future
+        change that always overrides ruling_text would fail.
+        """
+        mock_llm.return_value = None
+        reingest._SCRAPER_REGISTRY.pop("rebuild-ca-san_diego", None)
+
+        raw = self._SD_CALENDAR_HTML.encode("utf-8")
+        client = MagicMock()
+        result = reingest._reparse_document(
+            raw,
+            "rebuild-ca-san_diego",
+            self._sd_doc_meta(case_number="9999-99999999"),  # not in HTML
+            llm_client=client,
+        )
+
+        # No match — ruling_text stays as the full raw HTML fallback.
+        assert result["ruling_text"].lstrip().startswith("<")
+
+
+# ---------------------------------------------------------------------------
 class TestReparseDocumentCaseTypeFromScraperId:
     """Tests for extract_case_type_from_scraper_id fallback in _apply_regex_fallbacks."""
 

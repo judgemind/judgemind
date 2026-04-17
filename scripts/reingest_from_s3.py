@@ -852,6 +852,13 @@ def _reparse_document(
                     )
                     if section:
                         llm_text = section
+                        # Also replace the stored ruling_text so the DB
+                        # receives the narrowed plain-text excerpt instead
+                        # of the full raw HTML page (#2381).  Without this,
+                        # ``rebuild-ca-san_diego`` documents — which have no
+                        # scraper class to call ``parse_document`` — end up
+                        # with 50KB of raw HTML as ``ruling_text``.
+                        extracted["ruling_text"] = section
                 except Exception:
                     pass  # Fall through to full-text extraction
             # Look up county-specific max_output_tokens (#2355).

@@ -24,6 +24,7 @@ import respx
 from courts.ca.sd_calendar import (
     CALENDAR_BASE_URL,
     SDCalendarScraper,
+    _case_numbers_match,
     _clean_case_title,
     _is_motion_event,
     _parse_calendar_date,
@@ -726,6 +727,155 @@ class TestExtractCaseSection:
             "</tbody></table></div>"
         )
         assert extract_case_section(html, "ANY") is None
+
+
+# ---------------------------------------------------------------------------
+# _case_numbers_match — Odyssey short-form matching (#2381)
+# ---------------------------------------------------------------------------
+
+
+class TestCaseNumbersMatch:
+    """Tests for matching stored case numbers against calendar row case numbers.
+
+    San Diego documents created by ``rebuild_db.py`` can have Odyssey
+    short-form case numbers (e.g. ``2024-00021082``) while the calendar
+    HTML uses the full Odyssey form (``37-2024-00021082-CL-CL-CTL``).
+    """
+
+    def test_exact_match(self) -> None:
+        assert _case_numbers_match("24CU016153C", "24CU016153C") is True
+
+    def test_exact_match_with_whitespace(self) -> None:
+        assert _case_numbers_match(" 24CU016153C ", "24CU016153C") is True
+
+    def test_substring_match_anchored_by_dashes(self) -> None:
+        assert _case_numbers_match("2024-00021082", "37-2024-00021082-CL-CL-CTL") is True
+
+    def test_substring_match_at_start(self) -> None:
+        assert _case_numbers_match("2024-00021082", "2024-00021082-CL") is True
+
+    def test_substring_match_at_end(self) -> None:
+        assert _case_numbers_match("2024-00021082", "37-2024-00021082") is True
+
+    def test_no_boundary_before_substring(self) -> None:
+        """Reject match where the stored value starts mid-digit-run."""
+        # '24-00021082' is inside '37-2024-00021082-CL-CL-CTL' but the
+        # character before ('0') is alphanumeric, so not a real match.
+        assert _case_numbers_match("24-00021082", "37-2024-00021082-CL-CL-CTL") is False
+
+    def test_no_boundary_after_substring(self) -> None:
+        """Reject match where the stored value ends mid-digit-run."""
+        # '2024-0002' is inside '37-2024-00021082-CL-CL-CTL' but '1' after
+        # is alphanumeric, so not a real match.
+        assert _case_numbers_match("2024-0002", "37-2024-00021082-CL-CL-CTL") is False
+
+    def test_empty_stored(self) -> None:
+        assert _case_numbers_match("", "37-2024-00021082-CL-CL-CTL") is False
+
+    def test_empty_row(self) -> None:
+        assert _case_numbers_match("2024-00021082", "") is False
+
+    def test_both_empty(self) -> None:
+        assert _case_numbers_match("", "") is False
+
+    def test_none_safe(self) -> None:
+        # Defensive: code paths may pass None — the helper should not raise.
+        assert _case_numbers_match(None, "x") is False  # type: ignore[arg-type]
+        assert _case_numbers_match("x", None) is False  # type: ignore[arg-type]
+
+    def test_different_numbers_no_match(self) -> None:
+        assert _case_numbers_match("24CU016153C", "24CU016154C") is False
+
+    def test_substring_with_alpha_boundary_rejected(self) -> None:
+        """A substring match must have non-alphanumeric boundaries.
+
+        '016153' is inside '24CU016153C' but both sides are alphanumeric.
+        """
+        assert _case_numbers_match("016153", "24CU016153C") is False
+
+
+# ---------------------------------------------------------------------------
+# extract_case_section — Odyssey short-form substring matching (#2381)
+# ---------------------------------------------------------------------------
+
+
+class TestExtractCaseSectionOdyssey:
+    """Tests that extract_case_section tolerates Odyssey short-form case numbers."""
+
+    _BASE_HTML_TEMPLATE = """<html><head></head><body>
+<h1>CIVIL CALENDAR For Friday, 03/21/2026</h1>
+<h3>CENTRAL DIVISION, CENTRAL COURTHOUSE</h3>
+<div class="department">
+<h2><a name='C-60'></a>Department: C-60</h2>
+<table class="tables">
+<thead><tr><th>Time</th><th>Case#</th><th>Title</th><th>Event</th><th>Officer</th><th>Party</th><th>Attorney</th></tr></thead>
+<tbody>
+{rows}
+</tbody>
+</table>
+</div>
+</body></html>
+"""
+
+    @staticmethod
+    def _make_row(
+        case_number: str,
+        case_title: str = "Smith v Jones",
+        event_type: str = "Motion Hearing",
+        judge: str = "Judge MATTHEW C. BRANER",
+    ) -> str:
+        return (
+            "<tr>"
+            "<td>9:00 AM</td>"
+            f"<td>{case_number}</td>"
+            f"<td>{case_title}</td>"
+            f"<td>{event_type}</td>"
+            f"<td>{judge}</td>"
+            "<td><p>(PL) John Smith</p><p>(DF) Robert Jones</p></td>"
+            "<td><p>Jane Doe</p></td>"
+            "</tr>"
+        )
+
+    @classmethod
+    def _build_html(cls, *rows: str) -> str:
+        return cls._BASE_HTML_TEMPLATE.format(rows="\n".join(rows))
+
+    def test_matches_odyssey_short_form_within_long_form(self) -> None:
+        """Stored short-form ``2024-00021082`` matches row ``37-2024-00021082-CL-CL-CTL``."""
+        html = self._build_html(self._make_row("37-2024-00021082-CL-CL-CTL"))
+        section = extract_case_section(html, "2024-00021082")
+        assert section is not None
+        assert "Department: C-60" in section
+        # Display the full row case number (more informative).
+        assert "Case Number: 37-2024-00021082-CL-CL-CTL" in section
+        assert "Motion Hearing" in section
+        # Should NOT be raw HTML.
+        assert not section.startswith("<")
+
+    def test_prefers_exact_match_over_substring(self) -> None:
+        """If both exact and substring matches exist, exact wins."""
+        html = self._build_html(
+            self._make_row(
+                "37-2024-00021082-CL-CL-CTL",
+                case_title="Long-form case",
+            ),
+            self._make_row("2024-00021082", case_title="Exact match case"),
+        )
+        section = extract_case_section(html, "2024-00021082")
+        assert section is not None
+        assert "Case Number: 2024-00021082" in section
+        assert "Exact match case" in section
+        assert "Long-form case" not in section
+
+    def test_no_substring_match_when_boundary_invalid(self) -> None:
+        """``24-00021082`` should NOT match ``37-2024-00021082-CL-CL-CTL``."""
+        html = self._build_html(self._make_row("37-2024-00021082-CL-CL-CTL"))
+        section = extract_case_section(html, "24-00021082")
+        assert section is None
+
+    def test_returns_none_when_case_absent(self) -> None:
+        html = self._build_html(self._make_row("37-2023-00099999-CL-CL-CTL"))
+        assert extract_case_section(html, "2024-00021082") is None
 
 
 # ---------------------------------------------------------------------------
