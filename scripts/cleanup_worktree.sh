@@ -199,6 +199,19 @@ main() {
     # Check if worktree still exists
     if [[ ! -d "$worktree_path" ]]; then
         echo "Worktree already removed: $worktree_path" >&2
+        # Heal stale git metadata. If the on-disk dir is gone but
+        # .git/worktrees/<dir_name>/ still exists (e.g., an earlier
+        # cleanup crashed mid-way, or something rm -rf'd the dir
+        # without pruning), the metadata will accumulate and show up
+        # in `git worktree list` forever. Remove the metadata dir
+        # directly so we don't affect any other agent's worktree that
+        # may be in a transient state — do NOT use `git worktree prune`
+        # without scope here, since it is global.
+        local metadata_dir="$repo_root/.git/worktrees/$dir_name"
+        if [[ -d "$metadata_dir" ]]; then
+            rm -rf "$metadata_dir"
+            echo "Cleaned up stale metadata: $metadata_dir" >&2
+        fi
         return 0
     fi
 
