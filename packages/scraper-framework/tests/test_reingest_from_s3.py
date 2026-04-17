@@ -6704,6 +6704,126 @@ class TestReparseDocumentMultimodal:
         assert results[0]["parties"][0] == {"name": "Smith", "role": "plaintiff"}
         assert results[0]["parties"][1] == {"name": "Jones", "role": "defendant"}
 
+    def test_case_title_null_when_llm_returns_none_no_db_fallback(self) -> None:
+        """When the multimodal LLM returns no case_title, the reingest dict
+        must have case_title=None — NOT the stale DB title from doc_meta (#2502).
+
+        Previously, the code used ``cr.case_title or doc_meta.get("case_title")``
+        which pulled the existing DB title (carried via the LEFT JOIN in
+        FETCH_DOCUMENTS_QUERY) into the result when the LLM produced nothing.
+        Combined with ``upsert_case(force_update=True)``, that created a
+        self-sustaining fixed point for wrong titles.  The fix removes the
+        fallback so None flows through to upsert_case, where the COALESCE
+        semantic at db.py:316 preserves the existing (non-null) title.
+        """
+        from framework.llm_schema import ExtractedRuling
+
+        doc_meta = self._make_doc_meta()
+        doc_meta["case_title"] = "Stale DB Title"  # existing DB title
+        mock_extractor = MagicMock()
+        mock_extractor.extract_from_pdf.return_value = [
+            ExtractedRuling(
+                extracted_case_number="30-2024-01234567",
+                extracted_case_title=None,  # LLM did not extract a title
+                ruling_text="The motion is GRANTED.",
+            ),
+        ]
+
+        with patch.object(reingest, "_apply_regex_fallbacks"):
+            results = reingest._reparse_document_multimodal(
+                b"%PDF-1.4 fake pdf",
+                "ca-oc-tentatives-civil",
+                doc_meta,
+                mock_extractor,
+            )
+
+        assert len(results) == 1
+        # Must be None — not "Stale DB Title" (no fallback to doc_meta)
+        assert results[0]["case_title"] is None
+
+    def test_case_title_from_llm_wins_over_db_title(self) -> None:
+        """When the multimodal LLM returns a case_title, it wins over any
+        existing doc_meta title (#2502).
+        """
+        from framework.llm_schema import ExtractedRuling
+
+        doc_meta = self._make_doc_meta()
+        doc_meta["case_title"] = "Old DB Title"
+        mock_extractor = MagicMock()
+        mock_extractor.extract_from_pdf.return_value = [
+            ExtractedRuling(
+                extracted_case_number="30-2024-01234567",
+                extracted_case_title="Fresh LLM Title",
+                ruling_text="The motion is GRANTED.",
+            ),
+        ]
+
+        with patch.object(reingest, "_apply_regex_fallbacks"):
+            results = reingest._reparse_document_multimodal(
+                b"%PDF-1.4 fake pdf",
+                "ca-oc-tentatives-civil",
+                doc_meta,
+                mock_extractor,
+            )
+
+        assert len(results) == 1
+        assert results[0]["case_title"] == "Fresh LLM Title"
+
+    def test_multi_ruling_no_title_swap_when_some_rulings_miss_title(self) -> None:
+        """Multi-ruling PDFs: rulings whose LLM extraction returned no title
+        must keep case_title=None — they must NOT pick up doc_meta's title and
+        must NOT pick up a sibling ruling's title (#2502).
+
+        This is the canonical repro for the #2490 Palacios-v.-Vallejo bug:
+        a multi-case PDF where one or more splits come back without a title,
+        and any fallback causes them to converge on the same wrong title
+        across reingest cycles.
+        """
+        from framework.llm_schema import ExtractedRuling
+
+        doc_meta = self._make_doc_meta()
+        doc_meta["case_title"] = "Palacios v. Vallejo"  # stale per-doc title
+        mock_extractor = MagicMock()
+        mock_extractor.extract_from_pdf.return_value = [
+            ExtractedRuling(
+                extracted_case_number="30-2024-00000001",
+                extracted_case_title="Gu v. Smith",  # LLM extracted this one
+                ruling_text="First ruling text.",
+            ),
+            ExtractedRuling(
+                extracted_case_number="30-2024-00000002",
+                extracted_case_title=None,  # LLM did NOT extract
+                ruling_text="Second ruling text.",
+            ),
+            ExtractedRuling(
+                extracted_case_number="30-2024-00000003",
+                extracted_case_title="Clarke v. Jones",
+                ruling_text="Third ruling text.",
+            ),
+            ExtractedRuling(
+                extracted_case_number="30-2024-00000004",
+                extracted_case_title=None,  # LLM did NOT extract
+                ruling_text="Fourth ruling text.",
+            ),
+        ]
+
+        with patch.object(reingest, "_apply_regex_fallbacks"):
+            results = reingest._reparse_document_multimodal(
+                b"%PDF-1.4 fake pdf",
+                "ca-oc-tentatives-civil",
+                doc_meta,
+                mock_extractor,
+            )
+
+        assert len(results) == 4
+        # Rulings with LLM titles keep them
+        assert results[0]["case_title"] == "Gu v. Smith"
+        assert results[2]["case_title"] == "Clarke v. Jones"
+        # Rulings without LLM titles must be None — NOT doc_meta's stale
+        # "Palacios v. Vallejo", NOT a sibling ruling's title.
+        assert results[1]["case_title"] is None
+        assert results[3]["case_title"] is None
+
 
 # ---------------------------------------------------------------------------
 # LLM enrichment tests (#2406)
