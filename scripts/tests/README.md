@@ -5,9 +5,19 @@ Tests for standalone scripts in `scripts/`.
 ## CI Execution
 
 The `scripts-tests` CI job auto-discovers and runs every executable
-`scripts/tests/*.sh` under a single loop (see `.github/workflows/ci.yml`,
+`scripts/tests/*.sh` under a single loop. The runner logic lives in
+`scripts/run-scripts-tests.sh` (called from `.github/workflows/ci.yml`,
 job `scripts-tests`, step `Run all scripts/tests shell tests`). Adding a
 new shell test is just `touch + chmod +x` — no ci.yml edit required.
+
+### Shared helpers (underscore-prefixed files)
+
+Files whose basename starts with `_` (e.g.
+`_guard_self_match_helpers.sh`) are treated as **shared helpers** that
+peer tests `source` — they are never executed as tests by the runner.
+Use this naming convention for any sourced library file under
+`scripts/tests/`. See `scripts/run-scripts-tests.sh` and the unit test
+`test_scripts_tests_runner.sh` for the enforced behavior (#2559).
 
 ### Deferred tests (dedicated CI jobs)
 
