@@ -16,6 +16,7 @@ from validation.deterministic import (
     check_no_duplicate_ruling_text,
     check_no_html_in_ruling_text,
     check_no_multiple_adversarial_patterns,
+    check_ruling_text_case_number_marker,
     check_ruling_text_not_empty,
     check_ruling_text_reasonable_length,
     run_deterministic_rules,
@@ -609,6 +610,202 @@ class TestNoCrossCaseRulingText:
 
 
 # ---------------------------------------------------------------------------
+# ruling_text_case_number_marker
+# ---------------------------------------------------------------------------
+
+
+class TestRulingTextCaseNumberMarker:
+    """Tests for the ruling_text_case_number_marker rule (#2402).
+
+    Fresno multi-ruling PDFs embed a "Superior Court Case No. XXXXX" marker
+    in each ruling's header block.  When the LLM misattributes a ruling body
+    to the wrong case, that marker remains in ruling_text and no longer
+    matches the ruling's own case_number — this rule catches that pattern
+    even when the mis-referenced number is not a known sibling.
+    """
+
+    def test_pass_no_marker_in_text(self) -> None:
+        result = check_ruling_text_case_number_marker(
+            ruling_text="The motion for summary judgment is GRANTED.",
+            own_case_number="22CECG00930",
+        )
+        assert result.result == "pass"
+        assert result.rule == "ruling_text_case_number_marker"
+
+    def test_pass_none_ruling_text(self) -> None:
+        result = check_ruling_text_case_number_marker(
+            ruling_text=None,
+            own_case_number="22CECG00930",
+        )
+        assert result.result == "pass"
+
+    def test_pass_empty_ruling_text(self) -> None:
+        result = check_ruling_text_case_number_marker(
+            ruling_text="",
+            own_case_number="22CECG00930",
+        )
+        assert result.result == "pass"
+
+    def test_pass_none_own_case_number(self) -> None:
+        """Without a reliable own case number, cannot compare — pass."""
+        result = check_ruling_text_case_number_marker(
+            ruling_text="Superior Court Case No. 24CECG03313 matter granted.",
+            own_case_number=None,
+        )
+        assert result.result == "pass"
+
+    def test_pass_empty_own_case_number(self) -> None:
+        result = check_ruling_text_case_number_marker(
+            ruling_text="Superior Court Case No. 24CECG03313 matter granted.",
+            own_case_number="",
+        )
+        assert result.result == "pass"
+
+    def test_pass_whitespace_own_case_number(self) -> None:
+        result = check_ruling_text_case_number_marker(
+            ruling_text="Superior Court Case No. 24CECG03313 matter granted.",
+            own_case_number="   ",
+        )
+        assert result.result == "pass"
+
+    def test_pass_marker_matches_own(self) -> None:
+        """Self-reference to own case number is expected — pass."""
+        result = check_ruling_text_case_number_marker(
+            ruling_text=(
+                "Re: Lopez v. Fresno USD\n"
+                "Superior Court Case No. 25CECG03271\n"
+                "Tentative Ruling: To sustain the demurrer."
+            ),
+            own_case_number="25CECG03271",
+        )
+        assert result.result == "pass"
+
+    def test_pass_marker_matches_own_case_insensitive(self) -> None:
+        """Lowercase / mixed case marker text still matches — pass."""
+        result = check_ruling_text_case_number_marker(
+            ruling_text="superior court case no. 25CECG03271 matter.",
+            own_case_number="25CECG03271",
+        )
+        assert result.result == "pass"
+
+    def test_pass_marker_matches_own_with_whitespace_normalisation(self) -> None:
+        """Own case number with extra whitespace normalises to marker — pass."""
+        result = check_ruling_text_case_number_marker(
+            ruling_text="Superior Court Case No. 25CECG03271 matter.",
+            own_case_number="  25CECG03271  ",
+        )
+        assert result.result == "pass"
+
+    def test_flag_fresno_real_case_1(self) -> None:
+        """Issue #2402 example 1: ruling attached to 22CECG00930 but text
+        says 24CECG03313 — flag."""
+        result = check_ruling_text_case_number_marker(
+            ruling_text=(
+                "Re: Tarango v. Jackson et al.\n"
+                "Superior Court Case No. 24CECG03313\n"
+                "Tentative Ruling: To deny the motion."
+            ),
+            own_case_number="22CECG00930",
+        )
+        assert result.result == "flag"
+        reason = result.reason or ""
+        assert "24CECG03313" in reason
+        assert "22CECG00930" in reason
+        assert "cross-case" in reason
+
+    def test_flag_fresno_real_case_2(self) -> None:
+        """Issue #2402 example 2: ruling attached to 25CECG04363 but text
+        says 25CECG01023 — flag."""
+        result = check_ruling_text_case_number_marker(
+            ruling_text=(
+                "Superior Court Case No. 25CECG01023\nTentative Ruling: To sustain the demurrer."
+            ),
+            own_case_number="25CECG04363",
+        )
+        assert result.result == "flag"
+        reason = result.reason or ""
+        assert "25CECG01023" in reason
+
+    def test_flag_case_insensitive_marker_keyword(self) -> None:
+        """Lowercase marker keyword with different case number — flag."""
+        result = check_ruling_text_case_number_marker(
+            ruling_text="superior court case no. 24CECG03313 matter granted.",
+            own_case_number="22CECG00930",
+        )
+        assert result.result == "flag"
+
+    def test_flag_multiple_markers_some_differ(self) -> None:
+        """Several markers, at least one differs from own — flag."""
+        result = check_ruling_text_case_number_marker(
+            ruling_text=(
+                "Superior Court Case No. 22CECG00930 matter.\n"
+                "See also Superior Court Case No. 24CECG03313 for context."
+            ),
+            own_case_number="22CECG00930",
+        )
+        assert result.result == "flag"
+        reason = result.reason or ""
+        assert "24CECG03313" in reason
+
+    def test_pass_multiple_markers_all_match_own(self) -> None:
+        """Several markers, all match own case — pass (legitimate self-reference)."""
+        result = check_ruling_text_case_number_marker(
+            ruling_text=(
+                "Superior Court Case No. 22CECG00930 matter.\n"
+                "See ruling in Superior Court Case No. 22CECG00930 above."
+            ),
+            own_case_number="22CECG00930",
+        )
+        assert result.result == "pass"
+
+    def test_flag_multiple_distinct_mismatches(self) -> None:
+        """Two different non-own numbers — reason mentions count."""
+        result = check_ruling_text_case_number_marker(
+            ruling_text=(
+                "Superior Court Case No. 24CECG03313 and\n"
+                "also Superior Court Case No. 25CECG01023 are referenced."
+            ),
+            own_case_number="22CECG00930",
+        )
+        assert result.result == "flag"
+        reason = result.reason or ""
+        assert "24CECG03313" in reason
+        assert "25CECG01023" in reason
+        # Count is "2 different case number(s)".
+        assert "2" in reason
+
+    def test_pass_court_case_no_without_superior(self) -> None:
+        """Short 'Court Case No.' prefix (no 'Superior') is also matched and flagged."""
+        result = check_ruling_text_case_number_marker(
+            ruling_text="Court Case No. 24CECG03313 matter granted.",
+            own_case_number="22CECG00930",
+        )
+        # The pattern optionally matches Superior; short form should still flag.
+        assert result.result == "flag"
+
+    def test_pass_marker_with_trailing_period_variations(self) -> None:
+        """Variations in punctuation still recognised by pattern."""
+        # Pattern: 'Superior Court Case No' with no period — still matches.
+        result = check_ruling_text_case_number_marker(
+            ruling_text="Superior Court Case No 25CECG03271 matter.",
+            own_case_number="25CECG03271",
+        )
+        assert result.result == "pass"
+
+    def test_pass_ruling_text_no_case_number_at_all(self) -> None:
+        """Ruling text with prose only and no case-number markers — pass."""
+        result = check_ruling_text_case_number_marker(
+            ruling_text=(
+                "Tentative Ruling: To sustain the demurrer with 20 days' leave "
+                "to amend. The court finds the complaint does not state a cause "
+                "of action for breach of contract."
+            ),
+            own_case_number="25CECG03271",
+        )
+        assert result.result == "pass"
+
+
+# ---------------------------------------------------------------------------
 # run_deterministic_rules (aggregation)
 # ---------------------------------------------------------------------------
 
@@ -625,7 +822,7 @@ class TestRunDeterministicRules:
             captured_at=date(2026, 3, 4),
         )
         assert result.overall == "pass"
-        assert len(result.rules) == 6
+        assert len(result.rules) == 7
         assert all(r.result == "pass" for r in result.rules)
         assert result.failed_rules == []
         assert result.flagged_rules == []
@@ -722,7 +919,7 @@ class TestRunDeterministicRules:
             captured_at=date(2026, 3, 4),
         )
         # Without other_case_numbers, no cross-case rule added.
-        assert len(result.rules) == 6
+        assert len(result.rules) == 7
         assert not any(r.rule == "no_cross_case_ruling_text" for r in result.rules)
         assert result.overall == "pass"
 
@@ -736,7 +933,7 @@ class TestRunDeterministicRules:
             captured_at=date(2026, 3, 4),
             other_case_numbers=[],
         )
-        assert len(result.rules) == 6
+        assert len(result.rules) == 7
         assert not any(r.rule == "no_cross_case_ruling_text" for r in result.rules)
         assert result.overall == "pass"
 
@@ -750,7 +947,7 @@ class TestRunDeterministicRules:
             captured_at=date(2026, 3, 4),
             other_case_numbers=["23STCV99999", "23STCV88888"],
         )
-        assert len(result.rules) == 7
+        assert len(result.rules) == 8
         assert result.overall == "flag"
         cross_rules = [r for r in result.rules if r.rule == "no_cross_case_ruling_text"]
         assert len(cross_rules) == 1
@@ -767,7 +964,54 @@ class TestRunDeterministicRules:
             captured_at=date(2026, 3, 4),
             other_case_numbers=["23STCV99999"],
         )
-        assert len(result.rules) == 7
+        assert len(result.rules) == 8
         assert result.overall == "pass"
         cross_rules = [r for r in result.rules if r.rule == "no_cross_case_ruling_text"]
         assert cross_rules[0].result == "pass"
+
+    def test_case_number_marker_rule_included_by_default(self) -> None:
+        """The new #2402 rule runs unconditionally, not gated on siblings."""
+        result = run_deterministic_rules(
+            ruling_text="The motion is granted.",
+            case_number="22CECG00930",
+            case_title="Candler v. Callender",
+            hearing_date=date(2026, 3, 5),
+            captured_at=date(2026, 3, 4),
+        )
+        assert any(r.rule == "ruling_text_case_number_marker" for r in result.rules)
+
+    def test_case_number_marker_flag_via_aggregated_runner(self) -> None:
+        """run_deterministic_rules flags marker mismatch even without siblings (#2402)."""
+        result = run_deterministic_rules(
+            ruling_text=(
+                "Re: Tarango v. Jackson\n"
+                "Superior Court Case No. 24CECG03313\n"
+                "Tentative Ruling: To deny the motion."
+            ),
+            case_number="22CECG00930",
+            case_title="Candler v. Callender",
+            hearing_date=date(2026, 3, 5),
+            captured_at=date(2026, 3, 4),
+        )
+        # No siblings given, so cross-case rule not present; base 7 rules.
+        assert len(result.rules) == 7
+        assert result.overall == "flag"
+        marker_rules = [r for r in result.rules if r.rule == "ruling_text_case_number_marker"]
+        assert len(marker_rules) == 1
+        assert marker_rules[0].result == "flag"
+        assert "24CECG03313" in (marker_rules[0].reason or "")
+
+    def test_case_number_marker_pass_when_text_only_mentions_own(self) -> None:
+        """Marker matching own number does not flag even via aggregator."""
+        result = run_deterministic_rules(
+            ruling_text=(
+                "Superior Court Case No. 25CECG03271 matter.\nTentative Ruling: To sustain."
+            ),
+            case_number="25CECG03271",
+            case_title="Lopez v. Fresno USD",
+            hearing_date=date(2026, 3, 5),
+            captured_at=date(2026, 3, 4),
+        )
+        assert result.overall == "pass"
+        marker_rules = [r for r in result.rules if r.rule == "ruling_text_case_number_marker"]
+        assert marker_rules[0].result == "pass"

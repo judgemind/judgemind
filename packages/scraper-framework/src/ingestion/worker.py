@@ -2333,6 +2333,15 @@ class IngestionWorker:
                         pass
                 # Continue — flag does not block split event dispatch.
 
+        # NOTE: The per-ruling ``ruling_text_case_number_marker`` check (#2402)
+        # lives inside ``run_deterministic_rules`` and runs during each split
+        # event's recursive ``process_event`` call (see the deterministic
+        # validation block earlier in this method).  It does not need a
+        # document-level block here because it operates on a single ruling's
+        # own text + case_number — no sibling context is required.  Keeping
+        # it in the aggregated per-ruling path avoids double-flagging the
+        # same ruling (once here and once in the split recursion).
+
         for cr in converted:
             # For multimodal-extracted PDFs, ruling_text is markdown.
             # Convert to HTML for ruling_text_html, strip for plain text.
