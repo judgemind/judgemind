@@ -5279,7 +5279,17 @@ def _rulings_insert_sql(conn: MagicMock) -> str:
 
 
 def test_insert_ruling_default_is_coalesce() -> None:
-    """Default insert_ruling keeps COALESCE — does not erase existing values."""
+    """Default insert_ruling uses COALESCE — does not erase existing values.
+
+    Identity anchors (case_id, judge_id) use PRESERVE-FIRST COALESCE
+    ``COALESCE(rulings.col, EXCLUDED.col)`` so a live re-ingest cannot
+    silently relink the ruling to a different case or judge (#2475 /
+    sibling of #2468).  Correctable facts (hearing_date, outcome,
+    motion_type, department) keep INCOMING-WINS COALESCE
+    ``COALESCE(EXCLUDED.col, rulings.col)`` so a later, higher-quality
+    extraction legitimately replaces them while an incoming NULL preserves
+    the good existing value (#2405 semantics).
+    """
     conn = _make_ruling_upsert_conn()
 
     insert_ruling(
@@ -5296,9 +5306,14 @@ def test_insert_ruling_default_is_coalesce() -> None:
     )
 
     sql = _rulings_insert_sql(conn)
-    # ON CONFLICT SET clauses use COALESCE for structured fields.
-    assert "case_id = COALESCE(EXCLUDED.case_id, rulings.case_id)" in sql
-    assert "judge_id = COALESCE(EXCLUDED.judge_id, rulings.judge_id)" in sql
+    # Identity anchors: preserve-first COALESCE.  The existing column wins
+    # when it is non-NULL; EXCLUDED only wins when the existing column is
+    # NULL (e.g. first-time judge fill-in).
+    assert "case_id = COALESCE(rulings.case_id, EXCLUDED.case_id)" in sql
+    assert "judge_id = COALESCE(rulings.judge_id, EXCLUDED.judge_id)" in sql
+    # Correctable facts: incoming-wins COALESCE.  A non-NULL incoming value
+    # legitimately replaces the stored value, but an incoming NULL
+    # preserves what's there.
     assert "hearing_date = COALESCE(EXCLUDED.hearing_date, rulings.hearing_date)" in sql
     assert "outcome = COALESCE(EXCLUDED.outcome, rulings.outcome)" in sql
     assert "motion_type = COALESCE(EXCLUDED.motion_type, rulings.motion_type)" in sql
@@ -5521,7 +5536,13 @@ def _fallback_update_sql(cur: MagicMock) -> str:
 
 
 def test_insert_ruling_content_hash_fallback_default_uses_coalesce() -> None:
-    """Default fallback UPDATE path uses COALESCE for structured fields."""
+    """Default fallback UPDATE path uses COALESCE for structured fields.
+
+    Per #2475, ``judge_id`` is an identity anchor: preserve-first in the default
+    path so a re-matching LLM extraction cannot silently overwrite an existing
+    non-NULL judge. Other fields (hearing_date, outcome, motion_type,
+    department) are correctable facts — incoming-wins when non-NULL.
+    """
     conn, cur = _make_content_hash_fallback_conn()
 
     insert_ruling(
@@ -5538,7 +5559,9 @@ def test_insert_ruling_content_hash_fallback_default_uses_coalesce() -> None:
     )
 
     update_sql = _fallback_update_sql(cur)
-    assert "judge_id = COALESCE(%s::uuid, judge_id)" in update_sql
+    # Identity anchor: preserve-first COALESCE.
+    assert "judge_id = COALESCE(judge_id, %s::uuid)" in update_sql
+    # Correctable facts: incoming-wins COALESCE.
     assert "hearing_date = COALESCE(%s::date, hearing_date)" in update_sql
     assert "outcome = COALESCE(%s::ruling_outcome, outcome)" in update_sql
     assert "motion_type = COALESCE(%s, motion_type)" in update_sql
