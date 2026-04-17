@@ -902,6 +902,91 @@ def _drop_calendar_listing_rulings(
 
 
 # ---------------------------------------------------------------------------
+# Post-processing: cache-hit filter re-application (#2513)
+# ---------------------------------------------------------------------------
+#
+# The LLM cache stores post-filter rulings keyed by content hash.  Returning
+# cached rulings directly means any filter changes made AFTER the cache entry
+# was written are not applied — leaving stale rows in the database.  See
+# #2489 for the Orange County calendar-listing filter widening that motivated
+# this fix.
+#
+# Both helpers re-apply the subset of post-processing filters that operate
+# purely on the final ``ExtractedRuling[]`` list.  They are idempotent: if
+# the cached rulings already passed the current filters, re-applying them is
+# a no-op.  If the filters have been updated since the cache entry was
+# written, the new logic takes effect on cache read — avoiding an expensive
+# cache-busting reingest.
+#
+# ``_resolve_cross_references`` and ``_propagate_document_fields`` are NOT
+# re-applied here because they need the pre-join row state (entry numbers
+# and metadata that are discarded once we have ``ExtractedRuling`` objects).
+
+
+def _apply_pdf_cache_hit_filters(
+    rulings: list[ExtractedRuling],
+    *,
+    content_key: str,
+) -> list[ExtractedRuling]:
+    """Re-apply post-processing filters on the PDF cache-hit path (#2513).
+
+    Mirrors the subset of filters in :func:`_join_page_rows` that operate
+    purely on the final ``ExtractedRuling[]`` list.  Order matches
+    ``_join_page_rows`` so the cache-hit output is equivalent to what a
+    fresh extraction would produce (for rulings that do not rely on
+    cross-reference resolution, which requires pre-join row state).
+
+    Logs ``llm_extractor.cache_hit_filters_dropped`` at info level if the
+    filters dropped rows — useful for observing the effect of filter
+    widening in production without re-running LLM calls.
+    """
+    original_count = len(rulings)
+    rulings = _drop_calendar_listing_rulings(rulings)
+    rulings = _deduplicate_ruling_texts(rulings)
+    rulings = _filter_citation_artifacts(rulings)
+    if len(rulings) != original_count:
+        logger.info(
+            "llm_extractor.cache_hit_filters_dropped",
+            content_key=content_key[:12],
+            path="pdf",
+            original_count=original_count,
+            kept_count=len(rulings),
+        )
+    return rulings
+
+
+def _apply_text_cache_hit_filters(
+    rulings: list[ExtractedRuling],
+    *,
+    content_key: str,
+) -> list[ExtractedRuling]:
+    """Re-apply post-processing filters on the text cache-hit path (#2513).
+
+    Applies ``_filter_citation_artifacts`` (matching the fresh text path in
+    :meth:`LlmExtractor.extract`) plus ``_deduplicate_ruling_texts`` so
+    the cache-hit path catches filter updates made after the cache entry
+    was written.  Calendar-listing filtering is not applied here because
+    the text path is used primarily for HTML-originated content where
+    those patterns do not appear.
+
+    Logs ``llm_extractor.cache_hit_filters_dropped`` at info level if the
+    filters dropped rows.
+    """
+    original_count = len(rulings)
+    rulings = _filter_citation_artifacts(rulings)
+    rulings = _deduplicate_ruling_texts(rulings)
+    if len(rulings) != original_count:
+        logger.info(
+            "llm_extractor.cache_hit_filters_dropped",
+            content_key=content_key[:12],
+            path="text",
+            original_count=original_count,
+            kept_count=len(rulings),
+        )
+    return rulings
+
+
+# ---------------------------------------------------------------------------
 # Post-processing: cross-reference resolution (#2317)
 # ---------------------------------------------------------------------------
 
@@ -1206,7 +1291,8 @@ class LlmExtractor:
             cached = self._cache.get(effective_prompt, content_key)
             if cached is not None:
                 logger.debug("llm_cache.hit", content_key=content_key[:12])
-                return [ExtractedRuling(**r) for r in cached]
+                rulings = [ExtractedRuling(**r) for r in cached]
+                return _apply_text_cache_hit_filters(rulings, content_key=content_key)
 
         chunks = self._split_into_chunks(text)
         usage = TokenUsage()
@@ -1310,7 +1396,8 @@ class LlmExtractor:
             cached = self._cache.get(PDF_PER_PAGE_PROMPT, content_key)
             if cached is not None:
                 logger.debug("llm_cache.hit_pdf", content_key=content_key[:12])
-                return [ExtractedRuling(**r) for r in cached]
+                rulings = [ExtractedRuling(**r) for r in cached]
+                return _apply_pdf_cache_hit_filters(rulings, content_key=content_key)
 
         page_images = _render_pdf_pages(pdf_bytes, max_pages)
         if not page_images:
