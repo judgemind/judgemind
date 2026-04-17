@@ -10,14 +10,8 @@ script will process 0 documents.  For initial population from S3, use
 ``rebuild_db.py --county <name>`` instead — it discovers documents directly
 from S3 keys and does not require pre-existing database records.
 
-**Known non-idempotency (#2490):** This script is NOT a drop-in idempotent
-counterpart of the live worker path.  One divergence remains:
-
-1. The multimodal branch falls back to ``doc_meta.get("case_title")`` when
-   the LLM returns no title — this lets stale DB state propagate forward
-   instead of resetting to NULL, and combined with ``force_update=True``
-   on ``upsert_case`` creates a self-sustaining fixed point for wrong
-   titles (#2502).
+**Idempotency (#2490):** This script is a drop-in idempotent counterpart of
+the live worker path — known divergences have been resolved.
 
 **Resolved divergences:**
 
@@ -27,9 +21,21 @@ counterpart of the live worker path.  One divergence remains:
     the LLM-cache metadata footprint matches the worker path for the same
     raw PDF (#2501).
 
+-   The multimodal branch no longer falls back to
+    ``doc_meta.get("case_title")`` when the LLM returns no title (#2502).
+    Previously, this fallback pulled the existing DB title (carried via
+    the LEFT JOIN in ``FETCH_DOCUMENTS_QUERY``) into the result, and
+    combined with ``force_update=True`` on ``upsert_case`` created a
+    self-sustaining fixed point for wrong titles: once a bad title was
+    stored for a case, every reingest where the LLM returned no title
+    re-wrote that same wrong title back.  Now ``case_title`` is ``None``
+    when the LLM returns nothing, and the ``COALESCE(EXCLUDED.case_title,
+    cases.case_title)`` semantic at ``db.py:316`` preserves the existing
+    non-null title instead of erasing it.
+
 For cleanup of corrupted ``derived.*`` state, prefer ``rebuild_db.py
 --county <name>`` over reingest — rebuild walks S3 directly and does not
-participate in the remaining divergence above.
+touch existing ``cases.*`` rows when the split set changes across runs.
 
 For each document in the database, fetches the raw content from S3, re-runs
 the scraper's parse_document() to extract fields with the current (improved)
@@ -1636,7 +1642,19 @@ def _reparse_document_multimodal(
                 or doc_meta.get("case_number")
                 or f"UNKNOWN-{cr.document_id}"
             ),
-            "case_title": cr.case_title or doc_meta.get("case_title"),
+            # #2502: Do NOT fall back to ``doc_meta.get("case_title")`` here —
+            # ``doc_meta`` carries the *existing* DB ``case_title`` (via the
+            # LEFT JOIN in ``FETCH_DOCUMENTS_QUERY``).  Falling back would
+            # create a self-sustaining fixed point for wrong titles: once a
+            # bad title is stored for a case, every reingest where the LLM
+            # returns no title re-writes that same wrong title back (because
+            # the reingest path uses ``upsert_case(force_update=True)``).
+            # Letting ``None`` flow through is SAFE: ``upsert_case``'s
+            # ``force_update=True`` branch at ``db.py:316`` uses
+            # ``COALESCE(EXCLUDED.case_title, cases.case_title)``, so an
+            # incoming ``NULL`` preserves the existing non-null title
+            # instead of erasing it.
+            "case_title": cr.case_title,
             "case_type": cr.case_type,
             "judge_name": cr.judge_name or doc_judge_name,
             "outcome": cr.outcome,
