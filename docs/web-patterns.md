@@ -252,6 +252,48 @@ const { handleLoadMore } = useInfiniteScroll<MyData>({
 - Place the `<InfiniteScrollTrigger>` immediately after the last rendered row, inside the same container.
 - The component renders an invisible 1px sentinel div and hides itself while loading to prevent duplicate fetches.
 
+### Clickable Table Rows
+
+Shadcn's `TableRow` component applies `hover:bg-muted/50` by default, which makes every row *look* clickable on hover. This is a misleading affordance unless the row itself is actually navigable. The same UX bug has been fixed reactively on the cases, rulings, and judges tables — this pattern prevents future regressions.
+
+**Rule:** if a `TableRow` contains a navigation `<Link>` or `<a>`, the entire row must be clickable.
+
+- Put `onClick={() => router.push(...)}` on the `TableRow`, with `cursor-pointer`.
+- Put `onClick={(e) => e.stopPropagation()}` on any interactive elements inside the row — checkboxes, buttons, and the nested link itself (so cmd+click / right-click still open the link in a new tab without triggering the row's navigation).
+- Header rows (`<TableRow>` inside `<TableHeader>`, i.e. rows containing only `<TableHead>` children) are not expected to be clickable — they can safely contain `<Link>` without a row-level `onClick`.
+
+**Pattern (from `JudgesList.tsx`):**
+
+```tsx
+<TableRow
+  key={node.id}
+  className="cursor-pointer"
+  onClick={() => router.push(`/judges/${node.id}`)}
+>
+  <TableCell className="w-10" onClick={(e) => e.stopPropagation()}>
+    <Checkbox
+      checked={isSelected}
+      onCheckedChange={() => toggleSelection(node.id)}
+      aria-label={`Select ${node.canonicalName}`}
+    />
+  </TableCell>
+  <TableCell>
+    <Link
+      href={`/judges/${node.id}`}
+      className="rounded-sm font-medium hover:text-primary hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+      onClick={(e) => e.stopPropagation()}
+    >
+      {node.canonicalName}
+    </Link>
+  </TableCell>
+  {/* ... */}
+</TableRow>
+```
+
+**Enforcement:** an ESLint rule (`local/clickable-table-row`) flags any `<TableRow>` that contains a nested `<Link>` or `<a>` without an `onClick` handler on the row itself. See `packages/web/eslint-rules/clickable-table-row.js`.
+
+**Alternative:** for list pages where every column is informational (no checkboxes, no inline buttons), prefer the `<Link>`-wrapped row pattern used in `CasesList` and `RulingsFeed` — the entire row is a `<Link>` with `className="block ..."`. This gives native right-click / cmd-click behavior without needing `stopPropagation` plumbing. The `TableRow` + `onClick` pattern is appropriate when the row contains selection checkboxes or other interactive controls that cannot live inside an `<a>` tag.
+
 ### Loading States
 
 - Skeleton loaders matching the shape of the content they replace

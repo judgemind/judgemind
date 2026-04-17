@@ -18,6 +18,12 @@
       }
     },
     {
+      "files": ["src/app/**/*.{ts,tsx}", "src/components/**/*.{ts,tsx}"],
+      "rules": {
+        "local/clickable-table-row": "error"
+      }
+    },
+    {
       "files": ["**/__tests__/**", "**/*.test.ts", "**/*.test.tsx", "tests/**"],
       "rules": {
         "local/no-client-utility-import": "off"
