@@ -1861,21 +1861,30 @@ def reingest_batch(
         doc_id_str = str(doc_id)
         next_cursor = (captured_at, doc_id_str)
 
-        # Guard: in full-reparse mode, skip documents that are already split
-        # children.  Split children have UUID v5 IDs (from
-        # make_split_document_id) and share their parent's S3 object.
+        # Guard: in any mode that re-splits the parent PDF, skip documents
+        # that are already split children.  Split children have UUID v5 IDs
+        # (from make_split_document_id) and share their parent's S3 object.
         # Re-processing them would re-split the parent PDF, creating N new
-        # children per child — an exponential/infinite loop.  See #1919.
+        # grandchildren per child — an exponential/infinite loop.  See #1919.
+        #
+        # Both ``full_reparse`` and ``multimodal`` modes re-split the parent
+        # PDF: ``full_reparse`` via the scraper's ``_split_rulings()`` and
+        # ``multimodal`` via ``convert_extracted_rulings`` over the per-page
+        # extraction results.  Without this guard in multimodal mode, the
+        # Santa Clara reingest on 2026-04-16 inflated the ruling count from
+        # 808 to 1,615 by creating ~10k grandchildren rows.  See #2416.
         #
         # We pass content_hash to is_split_child_id so it can distinguish
         # scraper-generated v5 IDs (from uuid5(NAMESPACE_URL, content_hash))
         # from true split-child v5 IDs.  Without the content_hash, the
         # version-check alone mis-classifies regular scraper docs as split
         # children (#2367 follow-up).
-        if full_reparse and is_split_child_id(doc_id_str, content_hash):
+        re_split_mode = full_reparse or multimodal_extractor is not None
+        if re_split_mode and is_split_child_id(doc_id_str, content_hash):
             logger.info(
-                "Skipping split-child document in full-reparse mode",
+                "Skipping split-child document in re-split mode",
                 document_id=doc_id_str,
+                mode="full_reparse" if full_reparse else "multimodal",
             )
             skipped += 1
             continue
