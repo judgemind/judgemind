@@ -88,6 +88,11 @@
             "type": "command",
             "command": "bash .claude/hooks/dispatcher-guard.sh",
             "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "bash .claude/hooks/worktree-write-guard.sh",
+            "timeout": 5
           }
         ]
       },
