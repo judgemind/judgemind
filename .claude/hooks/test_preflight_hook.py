@@ -483,6 +483,224 @@ run_test(
     cwd_override=WORKTREE_CWD,
 )
 
+# --- Check 11: cross-worktree writes via Bash (cp/mv/tar/redirection) ---
+# Extends the Edit/Write-focused worktree-write-guard.sh (#2440) to the Bash
+# tool. See issue #2455.
+print("\nCheck 11: Cross-worktree writes via Bash")
+
+# cp: destination inside main repo but outside worktree — should be BLOCKED
+run_test(
+    "cp to main repo CLAUDE.md from worktree blocked (#2455 AC1)",
+    f"cp tmp/x.txt {SYNTHETIC_MAIN_REPO}/CLAUDE.md",
+    2,
+    cwd_override=WORKTREE_CWD,
+)
+run_test(
+    "cp -r to main repo docs/ from worktree blocked",
+    f"cp -r tmp/out {SYNTHETIC_MAIN_REPO}/docs",
+    2,
+    cwd_override=WORKTREE_CWD,
+)
+run_test(
+    "cp to main repo nested path from worktree blocked",
+    f"cp tmp/x.txt {SYNTHETIC_MAIN_REPO}/packages/api/src/foo.py",
+    2,
+    cwd_override=WORKTREE_CWD,
+)
+
+# cp: destination inside current worktree — should be ALLOWED
+run_test(
+    "cp to within worktree allowed (#2455 AC2)",
+    f"cp tmp/x.txt {WORKTREE_CWD}/CLAUDE.md",
+    0,
+    cwd_override=WORKTREE_CWD,
+)
+run_test(
+    "cp to deep path inside worktree allowed",
+    f"cp tmp/x.txt {WORKTREE_CWD}/packages/api/src/foo.py",
+    0,
+    cwd_override=WORKTREE_CWD,
+)
+run_test(
+    "cp with relative destination from worktree allowed",
+    "cp tmp/x.txt docs/x.txt",
+    0,
+    cwd_override=WORKTREE_CWD,
+)
+
+# cp: destination inside {repo_root}/tmp/ — should be ALLOWED
+run_test(
+    "cp to repo_root/tmp/agent-status/ from worktree allowed (#2455 AC3)",
+    f"cp tmp/x.txt {SYNTHETIC_MAIN_REPO}/tmp/agent-status/foo.txt",
+    0,
+    cwd_override=WORKTREE_CWD,
+)
+run_test(
+    "cp to repo_root/tmp/task-timings.jsonl from worktree allowed",
+    f"cp tmp/x.txt {SYNTHETIC_MAIN_REPO}/tmp/task-timings.jsonl",
+    0,
+    cwd_override=WORKTREE_CWD,
+)
+
+# cp: destination outside repo entirely — should be ALLOWED
+run_test(
+    "cp to /tmp/foo.txt from worktree allowed",
+    "cp src.txt /tmp/foo.txt",
+    0,
+    cwd_override=WORKTREE_CWD,
+)
+
+# cp: interactive session (cwd NOT in a worktree) — should be ALLOWED
+run_test(
+    "cp to main repo CLAUDE.md from main repo cwd allowed (#2455 AC4)",
+    f"cp tmp/x.txt {SYNTHETIC_MAIN_REPO}/CLAUDE.md",
+    0,
+    cwd_override=MAIN_REPO_CWD,
+)
+run_test(
+    "cp to main repo CLAUDE.md from /tmp cwd allowed",
+    f"cp src {SYNTHETIC_MAIN_REPO}/CLAUDE.md",
+    0,
+    cwd_override="/tmp",
+)
+
+# mv: same rules as cp (#2455 AC5)
+run_test(
+    "mv to main repo from worktree blocked (#2455 AC5)",
+    f"mv foo.txt {SYNTHETIC_MAIN_REPO}/foo.txt",
+    2,
+    cwd_override=WORKTREE_CWD,
+)
+run_test(
+    "mv to within worktree allowed",
+    f"mv foo.txt {WORKTREE_CWD}/foo.txt",
+    0,
+    cwd_override=WORKTREE_CWD,
+)
+run_test(
+    "mv to repo_root/tmp allowed",
+    f"mv foo.txt {SYNTHETIC_MAIN_REPO}/tmp/foo.txt",
+    0,
+    cwd_override=WORKTREE_CWD,
+)
+run_test(
+    "mv to main repo from main repo cwd allowed",
+    f"mv foo.txt {SYNTHETIC_MAIN_REPO}/foo.txt",
+    0,
+    cwd_override=MAIN_REPO_CWD,
+)
+
+# tar -C / --directory=: destination directory inside main repo — BLOCKED
+run_test(
+    "tar -xf -C into main repo from worktree blocked",
+    f"tar -xf archive.tgz -C {SYNTHETIC_MAIN_REPO}",
+    2,
+    cwd_override=WORKTREE_CWD,
+)
+run_test(
+    "tar -xf -C into main repo subdir from worktree blocked",
+    f"tar -xf archive.tgz -C {SYNTHETIC_MAIN_REPO}/docs",
+    2,
+    cwd_override=WORKTREE_CWD,
+)
+run_test(
+    "tar -xf --directory= into main repo from worktree blocked",
+    f"tar -xf archive.tgz --directory={SYNTHETIC_MAIN_REPO}",
+    2,
+    cwd_override=WORKTREE_CWD,
+)
+run_test(
+    "tar -xf -C into worktree allowed",
+    f"tar -xf archive.tgz -C {WORKTREE_CWD}/out",
+    0,
+    cwd_override=WORKTREE_CWD,
+)
+run_test(
+    "tar -xf -C into /tmp allowed (outside repo)",
+    "tar -xf archive.tgz -C /tmp",
+    0,
+    cwd_override=WORKTREE_CWD,
+)
+run_test(
+    "tar -xf -C into main repo from main repo cwd allowed",
+    f"tar -xf archive.tgz -C {SYNTHETIC_MAIN_REPO}/docs",
+    0,
+    cwd_override=MAIN_REPO_CWD,
+)
+
+# Shell redirection > and >>: destination inside main repo — BLOCKED (#2455 AC5)
+run_test(
+    "echo > main repo file from worktree blocked (#2455 AC5)",
+    f"echo content > {SYNTHETIC_MAIN_REPO}/CLAUDE.md",
+    2,
+    cwd_override=WORKTREE_CWD,
+)
+run_test(
+    "echo >> main repo file from worktree blocked (#2455 AC5)",
+    f"echo content >> {SYNTHETIC_MAIN_REPO}/CHANGELOG.md",
+    2,
+    cwd_override=WORKTREE_CWD,
+)
+run_test(
+    "echo > worktree file allowed",
+    f"echo content > {WORKTREE_CWD}/tmp/file.txt",
+    0,
+    cwd_override=WORKTREE_CWD,
+)
+run_test(
+    "echo > /tmp file allowed (outside repo)",
+    "echo content > /tmp/file.txt",
+    0,
+    cwd_override=WORKTREE_CWD,
+)
+run_test(
+    "echo > repo_root/tmp file allowed",
+    f"echo content > {SYNTHETIC_MAIN_REPO}/tmp/agent-status/s.txt",
+    0,
+    cwd_override=WORKTREE_CWD,
+)
+run_test(
+    "echo > main repo from main repo cwd allowed",
+    f"echo content > {SYNTHETIC_MAIN_REPO}/CLAUDE.md",
+    0,
+    cwd_override=MAIN_REPO_CWD,
+)
+
+# Cross-worktree writes (into another worktree) — should be BLOCKED
+run_test(
+    "cp to another worktree's file from current worktree blocked",
+    f"cp tmp/x.txt {SYNTHETIC_MAIN_REPO}/.claude/worktrees/agent-other/CLAUDE.md",
+    2,
+    cwd_override=WORKTREE_CWD,
+)
+run_test(
+    "echo > another worktree's file from current worktree blocked",
+    f"echo x > {SYNTHETIC_MAIN_REPO}/.claude/worktrees/agent-other/file",
+    2,
+    cwd_override=WORKTREE_CWD,
+)
+
+# Read-only / non-write commands that include main repo paths — should be ALLOWED
+# (Check 11 must not block these — they are not write verbs.)
+run_test(
+    "ls main repo file from worktree allowed (not a write verb)",
+    f"ls {SYNTHETIC_MAIN_REPO}/CLAUDE.md",
+    0,
+    cwd_override=WORKTREE_CWD,
+)
+run_test(
+    "cat main repo file from worktree allowed (not a write verb)",
+    f"cat {SYNTHETIC_MAIN_REPO}/CLAUDE.md",
+    0,
+    cwd_override=WORKTREE_CWD,
+)
+run_test(
+    "git log with main repo path allowed",
+    f"git log {SYNTHETIC_MAIN_REPO}/CLAUDE.md",
+    0,
+    cwd_override=WORKTREE_CWD,
+)
+
 # --- Summary ---
 print(f"\n{'='*50}")
 print(f"Results: {passed} passed, {failed} failed")
