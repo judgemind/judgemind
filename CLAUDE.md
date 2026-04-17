@@ -282,6 +282,7 @@ See **`docs/agent/code-standards.md`** for the full reference (Python/TypeScript
 - **General:** all code has tests. Never hardcode secrets. When removing/renaming exports, grep every import site across `src/` and `tests/` before committing.
 - **Perf:** watch for sequential I/O, `LIMIT/OFFSET` pagination, unbatched DB writes, missing connection reuse.
 - **Pre-PR (MANDATORY, `.githooks/pre-push` enforces):** from each touched package, run `ruff check`, `ruff format --check`, and `pytest` (Python) or `lint`/`typecheck`/`test` + `build` for `packages/web/` (TS). Diff coverage ≥ 90% on changed lines; package floor ratchet in `coverage-baselines.json`. Subagents run the same checks; never push on red.
+- **Docs / Markdown:** when any `.md` file changes, run `scripts/check-markdown-links.sh` to verify internal markdown pointers (both Markdown-link and backtick-ref styles) resolve. CI runs this in the `markdown-links-check` job; `.githooks/pre-push` runs it on any `.md` file being pushed so failures are caught before CI.
 
 ### Subagent Responsibilities
 
