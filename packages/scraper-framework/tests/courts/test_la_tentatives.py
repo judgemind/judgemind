@@ -42,6 +42,7 @@ from courts.ca.la_tentatives import (
     _split_rulings,
     _truncate_party_list,
     default_config,
+    is_la_html,
     sanitize_ruling_html,
 )
 from framework import ContentFormat
@@ -3176,3 +3177,51 @@ def test_split_rulings_fallback_case_number_no_header() -> None:
     assert len(rulings) == 2
     assert rulings[0].case_number == "24NNCV02551"
     assert rulings[1].case_number == "26NNCP00062"
+
+
+# ---------------------------------------------------------------------------
+# is_la_html — content-based LA HTML detection (#2450)
+# ---------------------------------------------------------------------------
+
+
+def test_is_la_html_detects_speech_synthesis_marker() -> None:
+    """Standard LA HTML with div#speechSynthesis is detected."""
+    html = (
+        '<html><body><div id="speechSynthesis" class="Print">'
+        "<b>Case Number:</b> 24STCV01234</div></body></html>"
+    )
+    assert is_la_html(html) is True
+
+
+def test_is_la_html_detects_word_pasted_variant() -> None:
+    """Word-pasted LA HTML (the #2450 failure mode) is also detected."""
+    html = _load("la_ruling_25stcv31489_word_paste.html")
+    assert is_la_html(html) is True
+
+
+def test_is_la_html_rejects_sd_calendar_html() -> None:
+    """SD calendar HTML has no div#speechSynthesis marker."""
+    sd_html = (
+        "<html><body><h1>CIVIL CALENDAR For Friday, 03/13/2026</h1>"
+        "<table><tr><td>24CU016153C</td></tr></table></body></html>"
+    )
+    assert is_la_html(sd_html) is False
+
+
+def test_is_la_html_rejects_plain_text() -> None:
+    """Plain text (OC PDF text content) is rejected."""
+    assert is_la_html("Case No. 2024-01234567\nMotion granted.") is False
+
+
+def test_is_la_html_rejects_empty_and_none() -> None:
+    """Empty strings and None are safely rejected."""
+    assert is_la_html("") is False
+    assert is_la_html(None) is False
+
+
+def test_is_la_html_only_scans_head() -> None:
+    """Only the first 4 KB is scanned for the marker (cheap check)."""
+    # Marker appears after the 4 KB boundary — should not match.
+    padding = "<!-- " + ("x" * 4200) + " -->"
+    html_with_late_marker = padding + '<div id="speechSynthesis">content</div>'
+    assert is_la_html(html_with_late_marker) is False

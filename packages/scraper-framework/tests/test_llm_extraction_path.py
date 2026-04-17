@@ -2448,3 +2448,204 @@ class TestSDCalendarDeterministicSplit:
         # Normal LLM path — extractor called, one ruling dispatched.
         mock_extractor.extract.assert_called_once()
         assert mock_process.call_count == 1
+
+
+class TestLADeterministicSplit:
+    """The worker routes LA tentative-ruling HTML through the deterministic
+    splitter BEFORE invoking the LLM, regardless of ``scraper_id``.
+
+    This closes #2450: events emitted by ``scripts/rebuild_db.py`` with
+    ``scraper_id='rebuild-ca-los_angeles'`` previously fell through to the
+    county LLM default.  On Word-pasted HTML variants (lacking the standard
+    ``DEPARTMENT N LAW AND MOTION RULINGS`` header), the LLM failed to
+    extract ``case_number``, and the worker synthesized
+    ``UNKNOWN-<uuid>`` — producing ~12% UNKNOWN rate among LA rulings.
+
+    The fix — routing through ``_try_la_html_split`` at the top of
+    ``_llm_split_document`` — bypasses the LLM entirely for LA HTML
+    content.  These tests verify the routing, not the splitter itself
+    (covered in tests/courts/test_la_tentatives.py).
+    """
+
+    def _load_fixture(self) -> str:
+        from pathlib import Path
+
+        fixture_path = Path(__file__).parent / "fixtures" / "la_ruling_25stcv31489_word_paste.html"
+        return fixture_path.read_text(encoding="utf-8", errors="replace")
+
+    def test_rebuild_scraper_id_triggers_deterministic_split(self) -> None:
+        """Synthetic rebuild events route through ``_try_la_html_split``.
+
+        This is the specific failure mode from #2450: ``rebuild_db.py`` emits
+        events with ``scraper_id='rebuild-ca-los_angeles'`` that previously
+        fell through to the county LLM default and produced UNKNOWN-<uuid>
+        case numbers.
+        """
+        la_html = self._load_fixture()
+        worker, _ = _make_worker()
+
+        with patch.object(worker, "process_event") as mock_process:
+            event = _make_event(
+                scraper_id="rebuild-ca-los_angeles",
+                state="CA",
+                county="Los Angeles",
+                content_format="html",
+                ruling_text=la_html,
+            )
+            result = worker._llm_split_document(
+                event,
+                event["document_id"],
+                la_html,
+                "CA",
+                "Los Angeles",
+            )
+
+        assert result is True, (
+            "_llm_split_document must return True when the deterministic "
+            "LA splitter dispatches synthetic split events."
+        )
+        assert mock_process.call_count == 1
+
+        dispatched = mock_process.call_args_list[0].args[0]
+        # The fixture's explicit Case Number header must produce the real
+        # case number — no UNKNOWN-<uuid> fallback.
+        assert dispatched["case_number"] == "25STCV31489"
+        assert not dispatched["case_number"].startswith("UNKNOWN-")
+
+    def test_live_ca_la_tentatives_scraper_id_triggers_deterministic_split(
+        self,
+    ) -> None:
+        """Live ``ca-la-tentatives-civil`` captures also route through the
+        splitter — the detection is content-based, not scraper_id-based."""
+        la_html = self._load_fixture()
+        worker, _ = _make_worker()
+
+        with patch.object(worker, "process_event") as mock_process:
+            event = _make_event(
+                scraper_id="ca-la-tentatives-civil",
+                state="CA",
+                county="Los Angeles",
+                content_format="html",
+                ruling_text=la_html,
+            )
+            result = worker._llm_split_document(
+                event,
+                event["document_id"],
+                la_html,
+                "CA",
+                "Los Angeles",
+            )
+
+        assert result is True
+        assert mock_process.call_count == 1
+        dispatched = mock_process.call_args_list[0].args[0]
+        assert dispatched["case_number"] == "25STCV31489"
+
+    def test_la_split_events_carry_expected_fields(self) -> None:
+        """Dispatched synthetic events carry the _llm_extracted marker and
+        the fields extracted from the LA HTML (hearing_date, department)."""
+        la_html = self._load_fixture()
+        worker, _ = _make_worker()
+
+        with patch.object(worker, "process_event") as mock_process:
+            event = _make_event(
+                scraper_id="rebuild-ca-los_angeles",
+                state="CA",
+                county="Los Angeles",
+                content_format="html",
+                ruling_text=la_html,
+            )
+            worker._llm_split_document(
+                event,
+                event["document_id"],
+                la_html,
+                "CA",
+                "Los Angeles",
+            )
+
+        dispatched = mock_process.call_args_list[0].args[0]
+        assert dispatched["_split_processed"] is True
+        assert dispatched["_llm_extracted"] is True
+        assert dispatched["_original_document_id"] == event["document_id"]
+        # Fixture header: "Hearing Date: March 10, 2026" and "Dept: 55".
+        assert dispatched["hearing_date"] == "2026-03-10"
+        assert dispatched["department"] == "55"
+
+    def test_la_split_dispatched_ruling_text_is_focused(self) -> None:
+        """The dispatched ruling_text must be a focused per-case excerpt,
+        not the full raw HTML page.  (Avoids #2447-style 50000-char dumps.)"""
+        la_html = self._load_fixture()
+        worker, _ = _make_worker()
+
+        with patch.object(worker, "process_event") as mock_process:
+            event = _make_event(
+                scraper_id="rebuild-ca-los_angeles",
+                state="CA",
+                county="Los Angeles",
+                content_format="html",
+                ruling_text=la_html,
+            )
+            worker._llm_split_document(
+                event,
+                event["document_id"],
+                la_html,
+                "CA",
+                "Los Angeles",
+            )
+
+        dispatched = mock_process.call_args_list[0].args[0]
+        rt = dispatched["ruling_text"]
+        assert rt is not None
+        # Fixture references the case number inside the ruling text.
+        assert "25STCV31489" in rt
+        # Text should be well below the 50000-char cap.
+        assert len(rt) < 50_000
+
+    def test_non_la_content_does_not_trigger_split(self) -> None:
+        """Non-LA content (no div#speechSynthesis marker) falls through to
+        the normal LLM extraction flow (the splitter returns False)."""
+        worker, _ = _make_worker()
+
+        # Plain-text OC PDF content — no LA HTML marker.
+        plain_text = "Case No. 2024-01234567\nSmith v. Jones\nThe motion is GRANTED."
+
+        mock_extractor = MagicMock()
+        mock_extractor.extract.return_value = [
+            ExtractedRuling(
+                extracted_case_number="2024-01234567",
+                extracted_case_title="Smith v. Jones",
+                ruling_text="The motion is GRANTED.",
+                outcome=ExtractionOutcome.GRANTED,
+                motion_type="Motion for Summary Judgment",
+                extracted_parties=[],
+            ),
+        ]
+
+        with (
+            patch("ingestion.worker.LlmExtractor") as mock_cls,
+            patch(
+                "framework.extraction_config.get_county_extraction_config",
+                return_value=None,
+            ),
+            patch.object(worker, "process_event") as mock_process,
+        ):
+            mock_cls.return_value = mock_extractor
+            event = _make_event(
+                scraper_id="ca-oc-tentatives",
+                state="CA",
+                county="Orange",
+                content_format="pdf",
+                ruling_text=plain_text,
+            )
+            result = worker._llm_split_document(
+                event,
+                event["document_id"],
+                plain_text,
+                "CA",
+                "Orange",
+            )
+
+        assert result is True
+        # LA splitter skipped → normal LLM path invoked.
+        mock_extractor.extract.assert_called_once()
+        assert mock_process.call_count == 1
