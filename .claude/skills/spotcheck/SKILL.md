@@ -124,7 +124,7 @@ The originals sampled in Step 2 come from the documents table, so they always ha
 scripts/run-py.sh scripts/spotcheck/sample.py --from originals --county "<County>" --n 10 --output {worktree}/tmp/spotcheck/s3_sample_<county>.json
 ```
 
-Compare the sampled S3 keys against the `originals_by_county` data. Any S3 key not in the documents table is an orphan — note the count per county. This is a known issue (#2193) but tracking the orphan rate over time helps measure progress.
+Compare the sampled S3 keys against the `originals_by_county` data. Any S3 key not in the documents table is an orphan — note the count per county. Tracking the orphan rate over time helps measure progress (see #2583).
 
 ---
 
@@ -167,19 +167,17 @@ Write each issue body to `{worktree}/tmp/spotcheck/issue_N.txt`. Include:
 - **Affected counties** with example ruling IDs
 - **Acceptance criteria** with `Verify:` lines
 
+**File spotcheck issues with `agent/ready` by default.** The dispatcher should be able to pick them up immediately — spotcheck findings are concrete, evidence-backed, and per-pattern, so they meet the bar. Only omit `agent/ready` when there's a specific reason:
+- **Blocked by an open dependency** — use `scripts/block-issue.sh <new-issue> <blocker>` instead. This adds `status/blocked` and a `Blocked by #N` line that auto-unblocks when the blocker closes.
+- **Acceptance criteria not yet concrete** — e.g. "investigate X" with no clear success condition. Tighten the AC before filing, or file with `status/triage` for human review.
+- **Needs a maintainer decision** — scope/priority ambiguity that an agent can't resolve.
+
 ```
 gh issue create --repo judgemind/judgemind \
     --title "fix(scraping): <description>" \
-    --label "type/bug,priority/<p1|p2>,area/scraping" \
+    --label "type/bug,priority/<p1|p2>,area/scraping,agent/ready" \
     --body-file {worktree}/tmp/spotcheck/issue_N.txt
 ```
-
-Check if #2193 (S3 restructure) is still open. If so, block new issues on it:
-```
-scripts/block-issue.sh <new-issue> 2193
-```
-
-Do NOT add `agent/ready` while #2193 is open.
 
 ---
 
